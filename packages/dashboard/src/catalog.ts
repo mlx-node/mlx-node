@@ -180,7 +180,7 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     // Matching the other platform's build too would be actively harmful, and not
     // hypothetically: the catalog recommended the nvfp4 builds to every platform
     // before this became platform-conditional, so an existing macOS install of
-    // e.g. `Qwen-AgentWorld-35B-A3B-nvfp4-mlx` is exactly the CUDA alias. Counting
+    // an `…-nvfp4-mlx` build is exactly the CUDA alias. Counting
     // it would render the card "Installed" with `installed` false — no Install
     // button, and no update affordance either — permanently stranding the very
     // users this change exists to move onto the mxfp4 build.

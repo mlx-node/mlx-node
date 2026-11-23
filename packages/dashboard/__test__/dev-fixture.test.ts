@@ -276,10 +276,12 @@ describe('dev fixture home', () => {
     const models = discoverLocalModels(paths.modelsDir);
     expect(models.models).toHaveLength(8);
     expect(models.companions).toHaveLength(2);
-    expect([...models.warnings].sort()).toEqual([
-      'partial-download: no readable config.json; skipped',
-      `${CATALOG_BLOCKED.slug}: no readable config.json; skipped`,
-    ]);
+    expect([...models.warnings].sort()).toEqual(
+      [
+        'partial-download: no readable config.json; skipped',
+        `${CATALOG_BLOCKED.slug}: no readable config.json; skipped`,
+      ].sort(),
+    );
     const cache = scanColdCache(paths.cacheRoot);
     expect(cache.entryCount + cache.sidecarCount).toBe(140);
     expect(cache.sidecarCount).toBeGreaterThan(0);

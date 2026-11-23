@@ -321,12 +321,32 @@ Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
 the repo's dozens) plus the base-model tokenizer sidecars fetched from the
 entry's `assetsRepo`; the download runner glob-filters the manifest and stages
 the sidecars before publishing. Hy4-flash installs the `Q4_K_M` build of
-`AngelSlim/Hy4-flash-GGUF` instead. An entry with `minMemoryGb` is offered
-on Models and on Onboarding only once the host reading is in and the Mac's
-physical RAM reaches it (`offeredOnHost`); Hy4-flash needs 39 GiB. The setup
-wizard filters the same way (`visibleCatalog`). No current entry carries a `draft` companion —
-Qwen3.8-27B ships its MTP speculative weights inside the same repo and the
-native loader auto-detects them. The catalog still renders a draft companion
+`AngelSlim/Hy4-flash-GGUF` instead. Inkling-2-Mini's weight glob is
+`*UD-Q4_K_XL.gguf` (the repo also holds a `Mainline_Support/…gguf_file` copy of
+the same weights), and its install also takes `mmproj-BF16.gguf` and the root
+`dspark-Inkling-2-Mini-Q8_0.gguf`, which the loader pairs from the folder.
+Qwen3.8-Flash-Next keeps its four shards in the repo folder `UD-Q4_K_XL/`, and
+downloads keep repo paths, so they land in `<slug>/UD-Q4_K_XL/` with the
+sidecars at the root. A card reads present (`isModelPresent`) for a folder with
+a root `config.json` and a loadable weight at the root, or with a GGUF in a
+variant folder one level down, by discovery's folder walk for a GGUF repository
+folder (which folders, which companions, split sets): only when the root holds
+no primary safetensors; never a folder whose name starts with `.`, nor one that
+holds primary safetensors; links to folders and files followed; the GGUF a
+regular file, not a companion (`mmproj`, `imatrix`, `dflash`, `dspark`,
+`draft`, `mtp`), and a split set counted from its first part only with every
+part beside it. Nothing deeper is read. Discovery's family name, header and
+sibling-asset checks are not applied. An entry with `minMemoryGb` is offered on
+Models and on Onboarding only once the host reading is in and the Mac's
+physical RAM reaches it (`offeredOnHost`); Qwen3.8-Flash-Next and Hy4-flash
+need 96 GiB, which a 96 GB Mac reports. The setup wizard filters the same way
+(`visibleCatalog`). Below the floor the page hides the card, its palette
+commands (Install, Update) and its share of the "N of M installed" count. An
+installed copy on a smaller Mac stays in the local list, and loads where its
+load admission accepts the RAM (Hy4-flash from 39 GiB). Qwen3.8-27B carries the
+optional DFlash2 `draft` companion, which is never auto-installed; its MTP
+speculative weights ship inside the same repo and the native loader
+auto-detects them. The catalog renders a draft companion
 (with its own install button, progress, cancel, and update controls)
 whenever a catalog entry carries one, for example a manually installed
 **DFlash2** draft: the roughly 3.85 GB checkpoint lives at
@@ -336,6 +356,20 @@ chat model. Draft-only checkpoints are excluded from the local-model table and
 model counts. Their bytes still count toward disk use on Models and Overview.
 Expand **Companion weights** in the local models panel to inspect or delete them;
 deleting a separate companion leaves the target model in place.
+
+The local-model table's **Quant** column reads the weights. For a folder whose
+weights are GGUF (at the root, else in a variant folder one level down, by the
+`isModelPresent` rule; companions never count, and a split set counts from
+its first part with every part beside it) it is the build the GGUF file
+name states (`UD-Q4_K_XL`, `Q4_K_M`, `BF16`; else the variant folder's name),
+parsed by the engine's `ggufVariant` (`@mlx-node/lm/model-variant`). The
+`config.json` beside a GGUF install is the base model's, so its quant block is
+never read. A folder with several builds shows `GGUF`, as does a name that
+states none; each build is still served under its own id. A safetensors folder
+shows its `config.json` quant block, or "full precision" without one. The
+**Context** column is `max_position_embeddings` (root, then `text_config`),
+else `model_max_length` (`text_config`, then root) when it is a positive safe
+integer, else empty.
 
 A delete, from a row, a companion line or the drawer, takes the entry off the table, the tiles and the disk-use bar
 as soon as the runtime answers ok (`useJson(...).patch`); the full `/models` refetch that follows replaces that

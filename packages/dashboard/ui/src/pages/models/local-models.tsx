@@ -255,7 +255,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
     {
       id: 'quant',
       header: 'Quant',
-      width: 104,
+      width: 124,
       sortValue: (model) => model.quant ?? '',
       cell: (model) =>
         model.quant === null ? (
@@ -270,7 +270,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
       id: 'context',
       header: 'Context',
       align: 'end',
-      width: 84,
+      width: 96,
       minTableWidth: 800,
       sortValue: (model) => model.contextWindow,
       cell: (model) => (

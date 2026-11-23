@@ -54,6 +54,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
+import { MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { ApiResponse } from '../src/api/errors.js';
 import type { DownloadEvent } from '../src/download.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
@@ -962,7 +963,7 @@ describe('Models page — the Install affordance', () => {
       slug: 'hy4-flash-gguf',
       sizeGb: 168.3,
       description: '512-expert MoE streamed from SSD',
-      minMemoryGb: 39,
+      minMemoryGb: 96,
     };
     routes['/catalog'] = { items: [...catalog.items, streamed] };
     routes['/models'] = {
@@ -973,14 +974,14 @@ describe('Models page — the Install affordance', () => {
   }
 
   it('leaves out a recommended model whose memory floor this Mac misses', async () => {
-    await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(36), LABEL);
+    await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(64), LABEL);
     await settle();
     expect(mounted!.container.querySelector(`[data-model="${SLUG}"]`)).not.toBeNull();
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).toBeNull();
   });
 
   it('offers a streamed model at its memory floor, with no weights-larger-than-memory note', async () => {
-    const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(39), 'Hy4-flash');
+    const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(96), 'Hy4-flash');
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).not.toBeNull();
     expect(text).toContain(LABEL);
     expect(text).not.toContain("larger than this Mac's memory");
@@ -993,7 +994,15 @@ describe('Models page — the Install affordance', () => {
   it('hostNote keeps the weights note for entries without a memory floor only', () => {
     const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null };
     expect(hostNote({ sizeGb: 168.3, present: false }, host)).toContain("larger than this Mac's memory");
-    expect(hostNote({ sizeGb: 168.3, present: false, minMemoryGb: 39 }, host)).toBeNull();
+    expect(hostNote({ sizeGb: 168.3, present: false, minMemoryGb: 96 }, host)).toBeNull();
+  });
+
+  it.each([96, 128])('hostNote gives Qwen3.8-Flash-Next and Hy4-flash no note on a %i GiB Mac', (gib) => {
+    const host = { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null };
+    for (const label of ['Qwen3.8-Flash-Next', 'Hy4-flash']) {
+      const entry = MODEL_CATALOG.find((item) => item.label === label)!;
+      expect(hostNote({ ...entry, present: false }, host), label).toBeNull();
+    }
   });
 
   function draftItem(present = false): NonNullable<CatalogItem['draft']> {

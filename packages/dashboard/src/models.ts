@@ -5,7 +5,9 @@
  * Model metadata (family label, quantization, context window) is parsed from
  * each checkpoint's `config.json`; the family label runs the registry's own
  * `matchFamily`, reached through the native-free `@mlx-node/agent/catalog`
- * subpath.
+ * subpath. A folder whose weights are GGUF takes its quantization from the
+ * GGUF file name instead, by the engine's name parser
+ * (`@mlx-node/lm/model-variant`, native-free).
  */
 
 import {
@@ -28,7 +30,8 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { matchFamily } from '@mlx-node/agent/catalog';
-import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
+import { ggufSplitPartNames, isGgufCompanionName } from '@mlx-node/lm/model-discovery';
+import { ggufNames, ggufVariant } from '@mlx-node/lm/model-variant';
 
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
@@ -37,9 +40,13 @@ export interface LocalModel {
   path: string;
   /** Family label from `config.json` (`qwen3`, `qwen3_5`, `gemma4`, …). */
   modelType: string;
-  /** Quantization label (`mxfp4`, `affine-4bit`, …), or `null` for full-precision. */
+  /**
+   * Quantization label. For GGUF weights ({@link ggufBuildLabel}) the build the file name states (`UD-Q4_K_XL`,
+   * `Q4_K_M`, `BF16`), or `GGUF` when the folder holds several builds or the name states none. Otherwise from the
+   * `config.json` quant block (`mxfp4`, `affine-4bit`, …), or `null` for full-precision.
+   */
   quant: string | null;
-  /** Trained context window from `max_position_embeddings`, or `null` if absent. */
+  /** Trained context window from `config.json` ({@link detectContextWindow}), or `null` if absent. */
   contextWindow: number | null;
   /** Total size on disk of the checkpoint directory, recursively. */
   sizeBytes: number;
@@ -175,7 +182,8 @@ export function isModelInstalled(modelDir: string): boolean {
 
 /**
  * Whether `modelDir` holds a loadable checkpoint ON DISK — a `config.json` plus at
- * least one weight file — regardless of the dashboard completion marker. Unlike
+ * least one weight file, at the root or as a GGUF in a variant folder one level
+ * down ({@link variantFolderGgufs}) — regardless of the dashboard completion marker. Unlike
  * {@link isModelInstalled} (downloader-OWNED, marker-gated) this also recognizes a
  * checkpoint installed by the agent wizard or an older `mlx download` CLI, which
  * did not write the marker (the current CLI writes the shared marker, making its
@@ -220,16 +228,110 @@ export function isModelPresent(modelDir: string): boolean {
   // A companion `.gguf` (mmproj/imatrix/dflash/draft) is NOT a loadable model:
   // counting one as present disables Install on the card for a directory the
   // loader never lists.
-  if (
-    entries.some((file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)))
-  ) {
-    return true;
-  }
+  if (rootGgufNames(modelDir, entries).length > 0) return true;
+  if (variantFolderGgufs(modelDir, entries).length > 0) return true;
   // Sharded safetensors: every shard the index references must exist on disk —
   // otherwise an interrupted download that landed the index + only the first
   // shard would falsely read as present (matches the CLI's completeness check,
   // `isModelAlreadyDownloaded`). A lone shard without its index is not complete.
   return shardsComplete(modelDir);
+}
+
+/**
+ * A primary safetensors name of the native loaders, the same set discovery reads (`PRIMARY_SAFETENSORS` in
+ * `packages/lm/src/model-discovery.ts`): `model.safetensors`, `weights.safetensors`, or `model-…-of-….safetensors` /
+ * `model.safetensors-…-of-….safetensors`.
+ */
+function isPrimarySafetensorsName(name: string): boolean {
+  if (name === 'model.safetensors' || name === 'weights.safetensors') return true;
+  const suffix = '.safetensors';
+  if (!name.endsWith(suffix)) return false;
+  let prefix: string;
+  if (name.startsWith('model.safetensors-')) prefix = 'model.safetensors-';
+  else if (name.startsWith('model-')) prefix = 'model-';
+  else return false;
+  const middle = name.slice(prefix.length, name.length - suffix.length);
+  const of = middle.indexOf('-of-', 1);
+  return of > 0 && of + '-of-'.length < middle.length;
+}
+
+/** Whether any of `names` in `dir` is a primary safetensors name on a regular file. */
+function holdsPrimarySafetensors(dir: string, names: readonly string[]): boolean {
+  return names.some((name) => isPrimarySafetensorsName(name) && isRegularFile(join(dir, name)));
+}
+
+/** The target GGUFs at the root of `modelDir` among its `entries`: regular files (links followed) ending in `.gguf` in any case, not companions. */
+function rootGgufNames(modelDir: string, entries: readonly string[]): string[] {
+  return entries.filter(
+    (file) => file.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)),
+  );
+}
+
+/**
+ * The loadable GGUFs one level down in `modelDir`, in variant folders such as `UD-Q4_K_XL/`, which is how downloads
+ * lay out a GGUF repository that keeps each build in its own folder. The walk is discovery's for a GGUF repository
+ * folder (`appendVariantGguf` in `packages/lm/src/model-discovery.ts`: which folders, which companions, split sets);
+ * its family name, header and sibling-asset checks are not applied. Only when the root holds no primary safetensors;
+ * never a folder whose name starts with `.`; a folder, or a link to one, that holds primary safetensors is skipped;
+ * nothing deeper is read. A target is a regular file (links followed) whose name ends in `.gguf` in any case and is
+ * not a companion, and that the loader can open: a split set counts from its first part, and only with every part
+ * beside it ({@link ggufSplitPartNames}).
+ */
+function variantFolderGgufs(modelDir: string, rootEntries: readonly string[]): { folder: string; name: string }[] {
+  const found: { folder: string; name: string }[] = [];
+  if (holdsPrimarySafetensors(modelDir, rootEntries)) return found;
+  for (const folder of rootEntries) {
+    if (folder.startsWith('.')) continue;
+    const variantDir = join(modelDir, folder);
+    let names: string[];
+    try {
+      if (!statSync(variantDir).isDirectory()) continue;
+      names = readdirSync(variantDir);
+    } catch {
+      continue;
+    }
+    if (holdsPrimarySafetensors(variantDir, names)) continue;
+    for (const name of names) {
+      if (!name.toLowerCase().endsWith('.gguf') || isGgufCompanionName(name)) continue;
+      const parts = ggufSplitPartNames(name, names);
+      if (parts !== undefined && parts.every((part) => isRegularFile(join(variantDir, part))))
+        found.push({ folder, name });
+    }
+  }
+  return found;
+}
+
+/**
+ * The quant label of `modelDir` (listed as `folderName`) when its weights are GGUF, or `undefined` when they are not:
+ * the root holds primary safetensors, or no GGUF counts by the rule of {@link isModelPresent} (the root GGUFs, else
+ * the variant-folder ones). A root file is a build only by the variant walk's split rule ({@link ggufSplitPartNames}:
+ * a first part with every part beside it). Each file's build is the one discovery names it by (`ggufVariant`: the
+ * file name's quant tag, else its variant folder's). One build gives that build; several give `GGUF`, because the
+ * folder is one row that serves each build under its own id. A `config.json` beside GGUF weights is the base model's,
+ * so its quant block never applies.
+ */
+function ggufBuildLabel(modelDir: string, folderName: string): string | undefined {
+  let entries: string[];
+  try {
+    entries = readdirSync(modelDir);
+  } catch {
+    return undefined;
+  }
+  if (holdsPrimarySafetensors(modelDir, entries)) return undefined;
+  const root = rootGgufNames(modelDir, entries);
+  const files: { folder: string | undefined; name: string }[] =
+    root.length > 0
+      ? root
+          .filter((name) => ggufSplitPartNames(name, entries) !== undefined)
+          .map((name) => ({ folder: undefined, name }))
+      : variantFolderGgufs(modelDir, entries);
+  const builds = new Set<string>();
+  for (const { folder, name } of files) {
+    const names = ggufNames(name, folderName, folder);
+    builds.add(ggufVariant(names.stem, folderName, folder, names.id).variant);
+  }
+  if (builds.size === 0) return undefined;
+  return builds.size === 1 ? [...builds][0]! : 'GGUF';
 }
 
 /** Entries {@link holdsModelFiles} reads before it gives up and answers "holds model files". */
@@ -624,16 +726,24 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }
 
-/** Root `max_position_embeddings` first, then the `text_config` nesting, else `null`. */
+/** `value` when it is a positive safe integer: the `int(1e30)` "no limit" sentinel of tokenizer configs is not one. */
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * `max_position_embeddings` at the root, then in `text_config`; without either, `model_max_length` in `text_config`
+ * (Inkling-2 states its window only there), then at the root; else `null`.
+ */
 function detectContextWindow(config: Record<string, unknown>): number | null {
-  const root = positiveInteger(config.max_position_embeddings);
-  if (root !== undefined) return root;
   const textConfig = asObject(config.text_config);
-  if (textConfig !== undefined) {
-    const nested = positiveInteger(textConfig.max_position_embeddings);
-    if (nested !== undefined) return nested;
-  }
-  return null;
+  return (
+    positiveInteger(config.max_position_embeddings) ??
+    positiveInteger(textConfig?.max_position_embeddings) ??
+    positiveSafeInteger(textConfig?.model_max_length) ??
+    positiveSafeInteger(config.model_max_length) ??
+    null
+  );
 }
 
 /**
@@ -915,7 +1025,7 @@ export function discoverLocalModels(
           name: entry.name,
           path: full,
           modelType: 'clairic',
-          quant: null,
+          quant: ggufBuildLabel(full, entry.name) ?? null,
           contextWindow: null,
           sizeBytes,
           fileCount,
@@ -941,7 +1051,7 @@ export function discoverLocalModels(
       name: entry.name,
       path: full,
       modelType: detectModelTypeLabel(full, config),
-      quant: detectQuantLabel(config),
+      quant: ggufBuildLabel(full, entry.name) ?? detectQuantLabel(config),
       contextWindow: detectContextWindow(config),
       sizeBytes,
       fileCount,

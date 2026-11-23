@@ -970,18 +970,29 @@ On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the
 
 When no local model exists, an interactive terminal shows a first-run wizard over a curated catalog and downloads the choice via `mlx download model`. In a non-interactive shell it prints the equivalent `mlx download model` commands instead. The catalog:
 
-| Model                 | HuggingFace repo                       | Size   | Notes                        |
-| --------------------- | -------------------------------------- | ------ | ---------------------------- |
-| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`             | ~18 GB | Best tool use — recommended  |
-| Qwen-AgentWorld-35B   | `unsloth/Qwen-AgentWorld-35B-A3B-GGUF` | ~22 GB | Agent-tuned MoE, fast decode |
-| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF`      | ~19 GB | MoE, fast decode             |
+| Model                 | HuggingFace repo                  | Size    | Notes                                                |
+| --------------------- | --------------------------------- | ------- | ---------------------------------------------------- |
+| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`        | ~18 GB  | Best tool use — recommended                          |
+| Inkling-2-Mini        | `unsloth/Inkling-2-Mini-GGUF`     | ~19 GB  | Looped MoE with vision and DSpark drafts, 1M context |
+| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF` | ~19 GB  | MoE, fast decode                                     |
+| Qwen3.8-Flash-Next    | `unsloth/Qwen3.8-Flash-Next-GGUF` | ~111 GB | 125B MoE, 512 experts streamed from SSD              |
+| Hy4-flash             | `AngelSlim/Hy4-flash-GGUF`        | ~168 GB | 512-expert MoE streamed from SSD, 256K context       |
 
-Each entry installs its Unsloth **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`, plus
-Gemma's `mmproj` projector), one variant out of the dozens
-the repos carry. The same repo serves every platform — Apple Silicon and Linux
-NVIDIA CUDA alike — and the wizard passes each entry's `--assets-repo`
-(`Qwen/Qwen3.8-27B`, `Qwen/Qwen-AgentWorld-35B-A3B`,
-`unsloth/gemma-4-26B-A4B-it`) so the tokenizer sidecars land beside the weights.
+The Unsloth entries install the **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`), one
+variant out of the dozens the repos carry. Inkling-2-Mini uses
+`-g "*UD-Q4_K_XL.gguf"`, because `*UD-Q4_K_XL*` also matches
+`Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB copy;
+it also takes `mmproj-BF16.gguf` and `dspark-Inkling-2-Mini-Q8_0.gguf`, which
+the loader pairs from the model folder. Gemma takes its `mmproj-BF16.gguf`
+projector. Qwen3.8-Flash-Next's four shards keep their repo folder and land in
+`<slug>/UD-Q4_K_XL/`; its GGUF load is text-only. Hy4-flash installs the
+`Q4_K_M` build. Qwen3.8-Flash-Next and Hy4-flash are offered only on a Mac
+with at least 96 GiB of RAM. The
+same repo serves every platform — Apple Silicon and Linux NVIDIA CUDA alike —
+and the wizard passes each entry's `--assets-repo` (`Qwen/Qwen3.8-27B`,
+`thinkingmachines/Inkling-2-Mini`, `unsloth/gemma-4-26B-A4B-it`,
+`Qwen/Qwen3.8-Flash-Next`, `tencent/Hy4-flash`) so the tokenizer sidecars land
+in the model folder.
 K-quants are read directly and repacked losslessly into MLX layout in memory on
 every load; only small config/tokenizer assets are cached, not another packed
 checkpoint. Qwen3.8-27B's MTP layer is imported inline from its final GGUF

@@ -892,7 +892,7 @@ describe('catalogWithState — a recommended model is identified by download pro
     });
     writeModel(modelsDir, 'qwen3.6-35b-a3b-nvfp4-mlx', MOE_NVFP4, 2048);
     writeCompletion('qwen3.6-35b-a3b-nvfp4-mlx', 'Brooooooklyn/Qwen3.6-35B-A3B-nvfp4-mlx');
-    expect(catalogItem('Qwen-AgentWorld-35B-A3B').present).toBe(false);
+    expect(catalogWithState(modelsDir).filter((item) => item.present)).toEqual([]);
   });
 
   it('reports the marker revision as localRevision for an owned canonical install', () => {
@@ -1102,6 +1102,282 @@ describe('isModelPresent — a companion GGUF is not a loadable checkpoint', () 
     // The real target beside it still counts.
     writeFileSync(join(dir, 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'), Buffer.alloc(64));
     expect(isModelPresent(dir)).toBe(true);
+  });
+});
+
+describe('isModelPresent — a GGUF in a variant folder one level down', () => {
+  const QWEN35 = JSON.stringify({ model_type: 'qwen3_5' });
+  const TARGET = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+  const shard = (part: number): string => `Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`;
+
+  function plant(name: string, files: Record<string, string | Buffer>): string {
+    const dir = join(modelsDir, name);
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+    return dir;
+  }
+
+  it('is present with config.json at the root and a target GGUF in the variant folder', () => {
+    expect(isModelPresent(plant('single', { 'config.json': QWEN35, [`UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(true);
+    const split = plant('split', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([1, 2, 3, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(split)).toBe(true);
+  });
+
+  it('is not present without the root config.json', () => {
+    expect(isModelPresent(plant('no-config', { [`UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(false);
+  });
+
+  it('is not present when the variant folder holds only companion files', () => {
+    const dir = plant('companions', {
+      'config.json': QWEN35,
+      'UD-Q4_K_XL/mmproj-BF16.gguf': 'x',
+      'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf': 'x',
+      'UD-Q4_K_XL/imatrix_unsloth.gguf_file': 'x',
+      'dspark/dspark-Inkling-2-Mini-BF16.gguf': 'x',
+    });
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('counts a split set only from its first part and only with every part beside it', () => {
+    const missing = plant('missing-part', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([1, 2, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(missing)).toBe(false);
+    const noFirst = plant('no-first-part', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([2, 3, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(noFirst)).toBe(false);
+    mkdirSync(join(missing, 'UD-Q4_K_XL', shard(3)));
+    expect(isModelPresent(missing)).toBe(false);
+  });
+
+  it('follows a link to a variant folder, like the top level, and never a dangling one', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-variant-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    const dir = plant('linked', { 'config.json': QWEN35 });
+    symlinkSync(join(external, 'gone'), join(dir, 'UD-Q4_K_XL'));
+    expect(isModelPresent(dir)).toBe(false);
+    rmSync(join(dir, 'UD-Q4_K_XL'));
+    symlinkSync(external, join(dir, 'UD-Q4_K_XL'));
+    expect(isModelPresent(dir)).toBe(false);
+    writeFileSync(join(external, TARGET), 'w');
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('follows a link to a GGUF file in the variant folder', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-variant-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, 'blob'), 'w');
+    const dir = plant('linked-file', { 'config.json': QWEN35 });
+    mkdirSync(join(dir, 'UD-Q4_K_XL'));
+    symlinkSync(join(external, 'blob'), join(dir, 'UD-Q4_K_XL', TARGET));
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('reads types, never names: a file named like a folder, a folder named like a GGUF', () => {
+    expect(isModelPresent(plant('file-folder', { 'config.json': QWEN35, 'UD-Q4_K_XL': 'w' }))).toBe(false);
+    const dir = plant('folder-gguf', { 'config.json': QWEN35 });
+    mkdirSync(join(dir, 'UD-Q4_K_XL', TARGET), { recursive: true });
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('never reads two folders down or a dot-folder', () => {
+    expect(isModelPresent(plant('deep', { 'config.json': QWEN35, [`a/UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(false);
+    expect(isModelPresent(plant('dot', { 'config.json': QWEN35, [`.cache/${TARGET}`]: 'w' }))).toBe(false);
+  });
+
+  it('never reads variant folders beside primary safetensors, nor a variant folder that holds them', () => {
+    const root = plant('root-shards', {
+      'config.json': QWEN35,
+      'model-00001-of-00002.safetensors': 'w',
+      [`UD-Q4_K_XL/${TARGET}`]: 'w',
+    });
+    expect(isModelPresent(root)).toBe(false);
+    const converted = plant('converted-variant', {
+      'config.json': QWEN35,
+      'mlx/model.safetensors': 'w',
+      [`mlx/${TARGET}`]: 'w',
+    });
+    expect(isModelPresent(converted)).toBe(false);
+  });
+
+  it.each<[string, Record<string, string | Buffer>]>([
+    ['a target GGUF in a variant folder', { [`UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a GGUF two folders down', { [`a/UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a GGUF in a dot-folder', { [`.cache/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a projector in a variant folder', { 'UD-Q4_K_XL/mmproj-BF16.gguf': ggufHeader('clip') }],
+    [
+      'a GGUF in a variant folder beside root primary safetensors',
+      { 'model-00001-of-00002.safetensors': 'w', [`UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') },
+    ],
+  ])('agrees with discovery on %s', async (_name, files) => {
+    const home = mkdtempSync(join(tmpdir(), 'dash-variant-home-'));
+    onTestFinished(() => rmSync(home, { recursive: true, force: true }));
+    const entry = join(home, 'entry');
+    for (const [file, body] of Object.entries({ 'config.json': QWEN35, 'tokenizer.json': '{}', ...files })) {
+      mkdirSync(dirname(join(entry, file)), { recursive: true });
+      writeFileSync(join(entry, file), body);
+    }
+    const listsGguf = (await discoverLocalChatModels(home)).some((model) => model.format === 'gguf');
+    expect(isModelPresent(entry)).toBe(listsGguf);
+  });
+});
+
+describe('discoverLocalModels — GGUF weights take their quant label from the GGUF file name', () => {
+  /** The fields of `thinkingmachines/Inkling-2-Mini`'s config.json this list reads: a quant block, no position limit. */
+  const INKLING_BASE = JSON.stringify({
+    model_type: 'inkling2_loop',
+    quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' },
+    mtp_config: { max_position_embeddings: 1048576 },
+    text_config: { model_type: 'inkling2_loop_text', model_max_length: 1048576 },
+  });
+  const QWEN38 = JSON.stringify({ model_type: 'qwen3_5', text_config: { max_position_embeddings: 262144 } });
+
+  function plant(name: string, files: Record<string, string | Buffer>): void {
+    const dir = join(modelsDir, name);
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+  }
+
+  function listed(name: string): { quant: string | null; contextWindow: number | null } {
+    const model = discoverLocalModels(modelsDir, { includeStats: false }).models.find((m) => m.name === name);
+    if (model === undefined) throw new Error(`${name} is not listed`);
+    return { quant: model.quant, contextWindow: model.contextWindow };
+  }
+
+  it('a root GGUF beside a base config with a quant block takes the build of the file, never the block', () => {
+    plant('inkling-2-mini-gguf', {
+      'config.json': INKLING_BASE,
+      'Inkling-2-Mini-UD-Q4_K_XL.gguf': ggufHeader('inkling2'),
+      'mmproj-BF16.gguf': '',
+      'dspark-Inkling-2-Mini-Q8_0.gguf': '',
+    });
+    expect(listed('inkling-2-mini-gguf')).toEqual({ quant: 'UD-Q4_K_XL', contextWindow: 1048576 });
+  });
+
+  it('a root GGUF beside a base config with no quant block is not full precision', () => {
+    plant('qwen3.8-27b-gguf', { 'config.json': QWEN38, 'Qwen3.8-27B-UD-Q4_K_XL.gguf': '' });
+    expect(listed('qwen3.8-27b-gguf')).toEqual({ quant: 'UD-Q4_K_XL', contextWindow: 262144 });
+  });
+
+  it('a root GGUF whose extension is upper case counts like one in a variant folder', () => {
+    plant('upper-root', { 'config.json': QWEN38, 'Qwen3.8-27B-UD-Q4_K_XL.GGUF': '' });
+    expect(listed('upper-root').quant).toBe('UD-Q4_K_XL');
+    expect(isModelPresent(join(modelsDir, 'upper-root'))).toBe(true);
+  });
+
+  it('a root GGUF that is a later split part is no build', () => {
+    plant('stray-part', {
+      'config.json': QWEN38,
+      'Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+      'Qwen3.8-27B-Q8_0-00002-of-00002.gguf': '',
+    });
+    expect(listed('stray-part').quant).toBe('UD-Q4_K_XL');
+  });
+
+  it('a split set in a variant folder takes its build, from the file name or else the folder name', () => {
+    plant('qwen3.8-flash-next-gguf', {
+      'config.json': QWEN38,
+      ...Object.fromEntries(
+        [1, 2, 3, 4].map((part) => [`UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`, '']),
+      ),
+    });
+    expect(listed('qwen3.8-flash-next-gguf').quant).toBe('UD-Q4_K_XL');
+    plant('tag-only-file', { 'config.json': QWEN38, 'BF16/model-00001-of-00001.gguf': '' });
+    expect(listed('tag-only-file').quant).toBe('BF16');
+  });
+
+  it('companion GGUFs never give the label', () => {
+    plant('hy4-flash-gguf', {
+      'config.json': JSON.stringify({ model_type: 'hy_v4_flash', quantization_config: { quant_method: 'fp8' } }),
+      'Hy4-flash-Q4_K_M-00001-of-00002.gguf': '',
+      'Hy4-flash-Q4_K_M-00002-of-00002.gguf': '',
+      'mmproj-Hy4-flash-bf16.gguf': '',
+      'mtp-Hy4-flash-Q8_0.gguf': '',
+    });
+    expect(listed('hy4-flash-gguf').quant).toBe('Q4_K_M');
+    // Companions alone are no GGUF weights: the config's label stays.
+    plant('projector-only', {
+      'config.json': JSON.stringify({ model_type: 'gemma4', quantization: { mode: 'mxfp4', bits: 4 } }),
+      'mmproj-BF16.gguf': '',
+      'UD-Q4_K_XL/mmproj-F16.gguf': '',
+    });
+    expect(listed('projector-only').quant).toBe('mxfp4');
+  });
+
+  it('a folder whose weights are safetensors keeps the config label, a GGUF beside them included', () => {
+    expect(listed('model-a').quant).toBeNull();
+    expect(listed('model-b').quant).toBe('affine-4bit');
+    plant('converted', {
+      'config.json': JSON.stringify({ model_type: 'qwen3_5', quantization: { mode: 'mxfp4', bits: 4 } }),
+      'model-00001-of-00002.safetensors': '',
+      'Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+      'UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+    });
+    expect(listed('converted').quant).toBe('mxfp4');
+  });
+
+  it('a folder with two builds names none of them, at the root or in variant folders', () => {
+    plant('two-root', { 'config.json': QWEN38, 'Qwen3.8-27B-Q4_K_M.gguf': '', 'Qwen3.8-27B-Q8_0.gguf': '' });
+    expect(listed('two-root').quant).toBe('GGUF');
+    plant('two-variants', {
+      'config.json': QWEN38,
+      'Q4_K_M/Qwen3.8-27B-Q4_K_M.gguf': '',
+      'Q8_0/Qwen3.8-27B-Q8_0.gguf': '',
+    });
+    expect(listed('two-variants').quant).toBe('GGUF');
+    // A variant folder whose split set misses a part is not a build.
+    plant('one-whole-variant', {
+      'config.json': QWEN38,
+      'Q4_K_M/Qwen3.8-27B-Q4_K_M.gguf': '',
+      'Q8_0/Qwen3.8-27B-Q8_0-00001-of-00002.gguf': '',
+    });
+    expect(listed('one-whole-variant').quant).toBe('Q4_K_M');
+    // A name that states no build.
+    plant('unnamed', { 'config.json': QWEN38, 'model.gguf': '' });
+    expect(listed('unnamed').quant).toBe('GGUF');
+  });
+
+  it.each<[string, Record<string, unknown>, number | null]>([
+    [
+      'root max_position_embeddings over everything',
+      {
+        max_position_embeddings: 40960,
+        model_max_length: 8192,
+        text_config: { max_position_embeddings: 1, model_max_length: 2 },
+      },
+      40960,
+    ],
+    [
+      'text_config max_position_embeddings over both model_max_length',
+      { model_max_length: 8192, text_config: { max_position_embeddings: 262144, model_max_length: 2 } },
+      262144,
+    ],
+    [
+      'text_config model_max_length over the root one',
+      { model_max_length: 8192, text_config: { model_max_length: 1048576 } },
+      1048576,
+    ],
+    ['root model_max_length last', { model_max_length: 8192 }, 8192],
+    [
+      'a model_max_length that is not a positive safe integer',
+      { model_max_length: 1e30, text_config: { model_max_length: 4096.5 } },
+      null,
+    ],
+    ['a zero or negative model_max_length', { model_max_length: 0, text_config: { model_max_length: -1 } }, null],
+    ['nothing stated', {}, null],
+  ])('context window: %s', (_name, fields, window) => {
+    writeModel(modelsDir, 'ctx', JSON.stringify({ model_type: 'qwen3', ...fields }), 8);
+    expect(listed('ctx').contextWindow).toBe(window);
   });
 });
 

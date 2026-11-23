@@ -36,7 +36,7 @@ import {
   proveInPlace,
   type ReplaceBlocker,
 } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled } from '../src/models.js';
+import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -386,8 +386,8 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
 // refused on a CUDA host.
 const REPO = catalogRepo(MODEL_CATALOG[0]!);
 const SLUG = REPO.split('/').pop()!.toLowerCase();
-/** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. */
-const REPO_OTHER = catalogRepo(MODEL_CATALOG[1]!);
+/** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. Its `*UD-Q4_K_XL*` glob takes {@link WEIGHT}. */
+const REPO_OTHER = catalogRepo(MODEL_CATALOG.find((entry) => entry.label === 'Gemma-4-26B-A4B')!);
 /**
  * The `Qwen/Qwen3.8-27B` base-model repo `MODEL_CATALOG[0].assetsRepo` names for
  * the tokenizer/config sidecars a GGUF quantization repo does not ship.
@@ -1008,6 +1008,45 @@ describe('DownloadManager', () => {
     // Catalog must NOT report the aborted download as installed.
     const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
     expect(item.installed).toBe(false);
+  });
+
+  it('installs a repo that keeps its weights in a variant folder, and the catalog reads it installed and present', async () => {
+    const entry = MODEL_CATALOG.find((candidate) => candidate.label === 'Qwen3.8-Flash-Next')!;
+    const repo = catalogRepo(entry);
+    const assetsRepo = entry.assetsRepo!;
+    const shards = [1, 2, 3, 4].map((part) => `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`);
+    hub.manifests[repo] = [
+      { type: 'directory', path: 'UD-Q4_K_XL', size: 0 },
+      ...shards.map((path) => ({ type: 'file' as const, path, size: 100 })),
+      { type: 'file', path: 'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf', size: 100 },
+      { type: 'file', path: 'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf', size: 100 },
+      { type: 'file', path: 'mmproj-BF16.gguf', size: 100 },
+      { type: 'file', path: 'README.md', size: 10 },
+    ];
+    hub.manifests[assetsRepo] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({
+        ...Object.fromEntries(shards.map((path) => [path, 100])),
+        'config.json': 12,
+        'tokenizer.json': 20,
+      }),
+    });
+    const id = manager.start(repo);
+    await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
+    expect(manager.jobs().find((job) => job.id === id)?.state).toBe('done');
+    expect([...hub.downloadedFrom].sort()).toEqual(
+      [...shards.map((path) => `${repo}/${path}`), `${assetsRepo}/config.json`, `${assetsRepo}/tokenizer.json`].sort(),
+    );
+    const item = catalogWithState(modelsDir).find((candidate) => candidate.label === 'Qwen3.8-Flash-Next')!;
+    for (const shard of shards) expect(existsSync(join(modelsDir, item.slug, shard)), shard).toBe(true);
+    expect(existsSync(join(modelsDir, item.slug, 'config.json'))).toBe(true);
+    expect(item).toMatchObject({ installed: true, present: true, blockedByForeignDir: false, blocker: null });
+    await manager.shutdown();
   });
 
   it('errors on an empty manifest instead of publishing a hollow dir', async () => {
@@ -1651,7 +1690,7 @@ describe('DownloadManager', () => {
   );
 
   it('refuses to prune away the last config, leaving the install intact', async () => {
-    // The primary GGUF repo ships no config.json (AgentWorld's doesn't): the
+    // The primary GGUF repo ships no config.json here: the
     // sidecar is the ONLY one. Upstream dropping it must not delete the live
     // install into an unloadable shape — the refresh fails instead, marker and
     // files untouched.
@@ -3609,7 +3648,9 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     if (withConfig) writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
     const served = (await discoverLocalChatModels(modelsDir)).map((model) => model.path);
     expect(served).toEqual([join(finalDir(), gguf)]);
-    const blocker = slugItem().blocker!;
+    // With its config.json the entry is a present model, so the card names no blocker; a request still carries one.
+    expect(slugItem()).toMatchObject({ present: withConfig, blockedByForeignDir: !withConfig });
+    const blocker = summarizeForeignEntry(finalDir())!;
     expect(blocker).toMatchObject({ holdsModel: true, listed: withConfig });
     const m = manager();
     expect(() => m.start(REPO, { replaceBlocker: blocker })).toThrow(

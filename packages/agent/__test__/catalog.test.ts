@@ -18,11 +18,17 @@ import {
 const GIB = 2 ** 30;
 /** A 128 GB Mac: every entry's memory floor is met. */
 const BIG_MAC = 128 * GIB;
-/** A 36 GB Mac: below Hy4-flash's admission floor. */
+/** A 96 GB Mac: macOS reports exactly 96 GiB, the floor of the SSD-streaming entries. */
+const MAC_96 = 96 * GIB;
+/** A 36 GB Mac: below every memory floor. */
 const SMALL_MAC = 36 * GIB;
+/** The entries the catalog offers only from 96 GiB. */
+const FLOORED = ['Qwen3.8-Flash-Next', 'Hy4-flash'];
 
-/** `mlx download model --glob` matching for `*`-only globs. */
-function globMatches(glob: string, name: string): boolean {
+/** `mlx download model --glob` matching for `*`-only globs: anchored, case-insensitive. */
+function globMatches(pattern: string, text: string): boolean {
+  const glob = pattern.toLowerCase();
+  const name = text.toLowerCase();
   const parts = glob.split('*');
   if (parts.length === 1) return name === glob;
   const head = parts[0]!;
@@ -38,11 +44,31 @@ function globMatches(glob: string, name: string): boolean {
   return true;
 }
 
+/** Repo files the downloader always takes beside a glob selection. */
+const CORE_FILES = new Set([
+  'config.json',
+  'tokenizer.json',
+  'tokenizer_config.json',
+  'special_tokens_map.json',
+  'vocab.json',
+  'merges.txt',
+]);
+
+/** The files a glob-filtered install takes: a glob matches the basename or the full repo path, plus the core files. */
+function selectedFiles(entry: CatalogEntry, files: readonly string[]): string[] {
+  return files.filter(
+    (file) =>
+      CORE_FILES.has(file) ||
+      entry.globs!.some((glob) => globMatches(glob, file) || globMatches(glob, file.split('/').pop()!)),
+  );
+}
+
 /** Expected weight variant per visible entry; every unsloth repo ships UD-Q4_K_XL, AngelSlim ships no UD quants. */
 const VARIANT: Record<string, string> = {
   'Qwen3.8-27B': 'UD-Q4_K_XL',
-  'Qwen-AgentWorld-35B-A3B': 'UD-Q4_K_XL',
+  'Inkling-2-Mini': 'UD-Q4_K_XL',
   'Gemma-4-26B-A4B': 'UD-Q4_K_XL',
+  'Qwen3.8-Flash-Next': 'UD-Q4_K_XL',
   'Hy4-flash': 'Q4_K_M',
 };
 
@@ -65,6 +91,124 @@ const HY4_REPO_FILES = [
   'mmproj-Hy4-flash-bf16.gguf',
   'patch/hy4-flash-mac-minimal.patch',
   'patch/hy4-flash-spark.patch',
+];
+
+/** `unsloth/Inkling-2-Mini-GGUF` files on Hugging Face (2026-11-23, main 800c946d7b9c). */
+const INKLING_REPO_FILES = [
+  '.gitattributes',
+  'Inkling-2-Mini-UD-IQ1_M.gguf',
+  'Inkling-2-Mini-UD-IQ1_S.gguf',
+  'Inkling-2-Mini-UD-IQ2_XXS.gguf',
+  'Inkling-2-Mini-UD-IQ3_XXS.gguf',
+  'Inkling-2-Mini-UD-IQ4_XS.gguf',
+  'Inkling-2-Mini-UD-Q2_K_XL.gguf',
+  'Inkling-2-Mini-UD-Q3_K_XL.gguf',
+  'Inkling-2-Mini-UD-Q4_K_M.gguf',
+  'Inkling-2-Mini-UD-Q4_K_XL.gguf',
+  'Inkling-2-Mini-UD-Q8_K_XL.gguf',
+  'Mainline_Support/Inkling-2-Mini-UD-IQ1_M.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-IQ1_S.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-IQ2_XXS.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-IQ3_XXS.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-IQ4_XS.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-Q2_K_XL.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-Q3_K_XL.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-Q4_K_M.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file',
+  'Mainline_Support/Inkling-2-Mini-UD-Q8_K_XL.gguf_file',
+  'Mainline_Support/README.md',
+  'Mainline_Support/dspark-Inkling-2-Mini-Q8_0.gguf_file',
+  'README.md',
+  'assets/size_vs_kld.png',
+  'assets/size_vs_top1.png',
+  'dspark-Inkling-2-Mini-Q8_0.gguf',
+  'dspark/README.md',
+  'dspark/dspark-Inkling-2-Mini-BF16-mainline.gguf_file',
+  'dspark/dspark-Inkling-2-Mini-BF16.gguf',
+  'mmproj-BF16.gguf',
+  'mmproj-F16.gguf',
+  'mmproj-F32.gguf',
+];
+
+/** `unsloth/Qwen3.8-Flash-Next-GGUF` files on Hugging Face (2026-11-23, main f5d175de2cf7). */
+const FLASH_NEXT_REPO_FILES = [
+  '.gitattributes',
+  'BF16/Qwen3.8-Flash-Next-BF16-00001-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00002-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00003-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00004-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00005-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00006-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00007-of-00008.gguf',
+  'BF16/Qwen3.8-Flash-Next-BF16-00008-of-00008.gguf',
+  'MTP/README.md',
+  'MTP/mtp-Qwen3.8-Flash-Next-BF16.gguf',
+  'MTP/mtp-Qwen3.8-Flash-Next-Q4_K_M.gguf',
+  'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
+  'MTP/mtp-Qwen3.8-Flash-Next-shared-BF16.gguf',
+  'MTP/mtp-Qwen3.8-Flash-Next-shared-Q4_K_M.gguf',
+  'MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00001-of-00006.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00002-of-00006.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00003-of-00006.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00004-of-00006.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00005-of-00006.gguf',
+  'Q8_0/Qwen3.8-Flash-Next-Q8_0-00006-of-00006.gguf',
+  'README.md',
+  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf',
+  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf',
+  'UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf',
+  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00001-of-00003.gguf',
+  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00002-of-00003.gguf',
+  'UD-IQ1_S/Qwen3.8-Flash-Next-UD-IQ1_S-00003-of-00003.gguf',
+  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00001-of-00003.gguf',
+  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00002-of-00003.gguf',
+  'UD-IQ2_XS/Qwen3.8-Flash-Next-UD-IQ2_XS-00003-of-00003.gguf',
+  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00001-of-00004.gguf',
+  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00002-of-00004.gguf',
+  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00003-of-00004.gguf',
+  'UD-IQ3_XXS/Qwen3.8-Flash-Next-UD-IQ3_XXS-00004-of-00004.gguf',
+  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00004.gguf',
+  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00002-of-00004.gguf',
+  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00003-of-00004.gguf',
+  'UD-IQ4_XS/Qwen3.8-Flash-Next-UD-IQ4_XS-00004-of-00004.gguf',
+  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00001-of-00003.gguf',
+  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00002-of-00003.gguf',
+  'UD-Q2_0/Qwen3.8-Flash-Next-UD-Q2_0-00003-of-00003.gguf',
+  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00004.gguf',
+  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00004.gguf',
+  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00004.gguf',
+  'UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00004-of-00004.gguf',
+  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf',
+  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00002-of-00004.gguf',
+  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00003-of-00004.gguf',
+  'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00004-of-00004.gguf',
+  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf',
+  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf',
+  'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00001-of-00006.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00002-of-00006.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00003-of-00006.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00004-of-00006.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00005-of-00006.gguf',
+  'UD-Q5_K_XL/Qwen3.8-Flash-Next-UD-Q5_K_XL-00006-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00001-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00002-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00003-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00004-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00005-of-00006.gguf',
+  'UD-Q6_K_XL/Qwen3.8-Flash-Next-UD-Q6_K_XL-00006-of-00006.gguf',
+  'engram/Qwen3.8-Flash-Next-engram-BF16.gguf_file',
+  'engram/Qwen3.8-Flash-Next-engram-IQ4_NL.gguf_file',
+  'engram/Qwen3.8-Flash-Next-engram-Q5_1.gguf_file',
+  'engram/Qwen3.8-Flash-Next-engram-Q8_0.gguf_file',
+  'engram/README.md',
+  'engram/set_split.py',
+  'imatrix_unsloth.gguf_file',
+  'mmproj-BF16.gguf',
+  'mmproj-F16.gguf',
+  'mtp-Qwen3.8-Flash-Next-Q8_0.gguf',
 ];
 
 describe('catalogUpdateRepos — update discovery covers the sidecar sources', () => {
@@ -126,15 +270,16 @@ describe('MODEL_CATALOG', () => {
     }
   });
 
-  it('pins the four visible entries to their verified GGUF repos + sidecar sources', () => {
+  it('pins the five visible entries to their verified GGUF repos + sidecar sources', () => {
     // Load-bearing strings: a typo here is a 404 at best and the wrong weights
     // at worst. Verified on Hugging Face — the GGUF repos ship the globbed
     // variant (plus MTP/mmproj where globbed in), the assetsRepos ship the
     // tokenizer/config files the GGUF repos lack (ungated, unlike google/*).
     expect(visibleCatalog(BIG_MAC).map((entry) => [entry.hfRepo, entry.assetsRepo])).toEqual([
       ['unsloth/Qwen3.8-27B-GGUF', 'Qwen/Qwen3.8-27B'],
-      ['unsloth/Qwen-AgentWorld-35B-A3B-GGUF', 'Qwen/Qwen-AgentWorld-35B-A3B'],
+      ['unsloth/Inkling-2-Mini-GGUF', 'thinkingmachines/Inkling-2-Mini'],
       ['unsloth/gemma-4-26B-A4B-it-GGUF', 'unsloth/gemma-4-26B-A4B-it'],
+      ['unsloth/Qwen3.8-Flash-Next-GGUF', 'Qwen/Qwen3.8-Flash-Next'],
       ['AngelSlim/Hy4-flash-GGUF', 'tencent/Hy4-flash'],
     ]);
   });
@@ -164,23 +309,49 @@ describe('MODEL_CATALOG', () => {
     // The repo also ships Q3_K, IQ2_AH, two SPARK builds and a vision
     // projector: one of them in the selection is 63-162 GB of extra download.
     const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
-    const selected = HY4_REPO_FILES.filter((file) =>
-      hy4.globs!.some((glob) => globMatches(glob, file) || globMatches(glob, file.split('/').pop()!)),
-    );
-    expect(selected).toEqual(['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf']);
+    expect(selectedFiles(hy4, HY4_REPO_FILES)).toEqual([
+      'Hy4-flash-Q4_K_M-00001-of-00002.gguf',
+      'Hy4-flash-Q4_K_M-00002-of-00002.gguf',
+    ]);
   });
 
-  it('Hy4-flash is sized to its two shards and carries the admission floor', () => {
+  it('Inkling-2-Mini globs select the root weight, vision tower and DSpark draft, never the Mainline_Support copy', () => {
+    // `*UD-Q4_K_XL*` would also take `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`,
+    // 17.6 GB more of the same tensors.
+    const inkling = MODEL_CATALOG.find((entry) => entry.label === 'Inkling-2-Mini')!;
+    const selected = selectedFiles(inkling, INKLING_REPO_FILES);
+    expect(selected).toEqual(['Inkling-2-Mini-UD-Q4_K_XL.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf', 'mmproj-BF16.gguf']);
+    expect(selected).not.toContain('Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file');
+    // 17,629,759,456 + 402,278,560 + 641,805,760 B.
+    expect(inkling.sizeGb).toBe(18.7);
+  });
+
+  it('Qwen3.8-Flash-Next globs select exactly the four UD-Q4_K_XL shards in their repo folder', () => {
+    const flashNext = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-Flash-Next')!;
+    expect(selectedFiles(flashNext, FLASH_NEXT_REPO_FILES)).toEqual([
+      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf',
+      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00003-of-00004.gguf',
+      'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00004-of-00004.gguf',
+    ]);
+    // 10,946,618 + 49,720,539,552 + 32,803,030,176 + 28,800,138,432 B.
+    expect(flashNext.sizeGb).toBe(111.3);
+  });
+
+  it('Hy4-flash is sized to its two shards', () => {
     const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
     // 104,986,517,504 + 63,360,616,128 B.
     expect(hy4.sizeGb).toBe(168.3);
-    expect(hy4.minMemoryGb).toBe(39);
     expect(hy4.hidden).toBeUndefined();
     expect(hy4.draft).toBeUndefined();
+  });
+
+  it('only Qwen3.8-Flash-Next and Hy4-flash carry a memory floor, 96 GiB each', () => {
     for (const entry of MODEL_CATALOG) {
-      if (entry.label === 'Hy4-flash') continue;
-      expect(entry.minMemoryGb, entry.label).toBeUndefined();
+      expect(entry.minMemoryGb, entry.label).toBe(FLOORED.includes(entry.label) ? 96 : undefined);
     }
+    // Hy4-flash's load admission accepts 39 GiB; the catalog floor must never sit below it.
+    expect(MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!.minMemoryGb).toBeGreaterThanOrEqual(39);
   });
 
   it('every visible entry names an assetsRepo for tokenizer sidecars', () => {
@@ -247,13 +418,15 @@ describe('catalogEntryForRepo', () => {
 });
 
 describe('visibleCatalog', () => {
-  it('leaves out an entry whose memory floor the machine misses, at exactly the floor too', () => {
-    const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
-    const floor = hy4.minMemoryGb! * GIB;
-    expect(visibleCatalog(SMALL_MAC)).not.toContain(hy4);
-    expect(visibleCatalog(floor - 1)).not.toContain(hy4);
-    expect(visibleCatalog(floor)).toContain(hy4);
-    expect(visibleCatalog(BIG_MAC)).toContain(hy4);
+  it('offers Qwen3.8-Flash-Next and Hy4-flash from 96 GiB, at exactly 96 GiB too', () => {
+    for (const label of FLOORED) {
+      const entry = MODEL_CATALOG.find((candidate) => candidate.label === label)!;
+      expect(visibleCatalog(SMALL_MAC), label).not.toContain(entry);
+      expect(visibleCatalog(64 * GIB), label).not.toContain(entry);
+      expect(visibleCatalog(MAC_96 - 1), label).not.toContain(entry);
+      expect(visibleCatalog(MAC_96), label).toContain(entry);
+      expect(visibleCatalog(BIG_MAC), label).toContain(entry);
+    }
     // Entries without a floor stay on the smallest machine.
     const small = visibleCatalog(SMALL_MAC);
     for (const entry of MODEL_CATALOG.filter(

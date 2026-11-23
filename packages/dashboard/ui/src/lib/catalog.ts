@@ -6,15 +6,20 @@ const GIB = 2 ** 30;
 
 const BUILD_NAMES = new Set(['mxfp', 'mxfp4', 'mxfp8', 'nvfp', 'nvfp4', 'nvfp8']);
 
-/** The text between the stars of a glob like `*UD-Q4_K_XL*`, or null for any other shape. */
+const GGUF_SUFFIX = '.gguf';
+
+/** The build a glob names: `UD-Q4_K_XL` from `*UD-Q4_K_XL*` or `*UD-Q4_K_XL.gguf`, or null for any other shape. */
 function starredBuild(glob: string): string | null {
-  if (glob.length < 3 || !glob.startsWith('*') || !glob.endsWith('*')) return null;
-  const inner = glob.slice(1, -1);
-  if (inner.includes('.') || inner.includes('*')) return null;
+  if (!glob.startsWith('*')) return null;
+  let inner: string;
+  if (glob.endsWith(GGUF_SUFFIX)) inner = glob.slice(1, -GGUF_SUFFIX.length);
+  else if (glob.length >= 3 && glob.endsWith('*')) inner = glob.slice(1, -1);
+  else return null;
+  if (inner.length === 0 || inner.includes('.') || inner.includes('*')) return null;
   return inner;
 }
 
-/** "UD-Q4_K_XL" from globs ['*UD-Q4_K_XL*', …]; else "MXFP4" / "NVFP4" / "MXFP8" from the repo name; else null. */
+/** "UD-Q4_K_XL" from globs ['*UD-Q4_K_XL*', …] or ['*UD-Q4_K_XL.gguf', …]; else "MXFP4" / "NVFP4" / "MXFP8" from the repo name; else null. */
 export function catalogBuildLabel(item: Pick<CatalogItem, 'hfRepo' | 'globs'>): string | null {
   for (const glob of item.globs ?? []) {
     const build = starredBuild(glob);
@@ -45,7 +50,6 @@ export function offeredOnHost(
 /** One plain sentence about a catalog model. */
 export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'isDefault'>): string {
   const label = item.label.toLowerCase();
-  if (label.includes('agentworld')) return 'Tuned for agent workflows, with fast responses.';
   if (label.includes('gemma-4-26b')) return 'Fast responses, with a smaller download to get started.';
   if (item.isDefault === true) return 'Our recommended starting point for working with tools.';
   return item.description;

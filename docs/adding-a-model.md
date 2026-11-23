@@ -260,9 +260,10 @@ load-free context estimates (`startContextEstimates` in
 falls through to the qwen3_5 estimator, which throws on its model type and
 drops the `--max-context` window the host seeded.
 
-**Memory floor (+1).** A catalog entry that no Mac below some RAM can load
-sets `minMemoryGb` (`packages/agent/src/catalog.ts`); the wizard, Models and
-Onboarding hide it below that.
+**Memory floor (+1).** A catalog entry that should not be offered below some
+RAM sets `minMemoryGb` (`packages/agent/src/catalog.ts`); the wizard, Models
+and Onboarding hide it below that. The value is never lower than the RAM at
+which the load admission always refuses.
 
 **Direct GGUF load (+2).** A `ggufArchitectures` entry on the family-data row
 (TS side) and the `general.architecture` → model_type map in

@@ -27,6 +27,8 @@ const items: CatalogItem[] = MODEL_CATALOG.map((item) => ({
   localAssetsRevision: null,
 }));
 const visible = items.filter((item) => !item.hidden && item.category !== 'systemone');
+/** The choices on the 64 GiB Mac of {@link routes}: the entries with a 96 GiB floor are left out. */
+const unfloored = visible.filter((item) => item.minMemoryGb === undefined);
 let page: RenderedPage | undefined;
 let dispose: (() => void) | undefined;
 
@@ -92,24 +94,29 @@ describe('first model onboarding', () => {
     expect(window.location.pathname).toBe('/welcome');
     expect(page.container.querySelector('aside')).toBeNull();
     expect(calls.some((call) => call.method === 'POST')).toBe(false);
-    expect(page.container.querySelectorAll('input[type=radio]')).toHaveLength(visible.length);
+    expect(page.container.querySelectorAll('input[type=radio]')).toHaveLength(unfloored.length);
     const selected = page.container.querySelector<HTMLInputElement>('input:checked');
     expect(selected?.value).toBe(visible.find((item) => item.isDefault)!.hfRepo);
     for (const item of items.filter((item) => item.hidden)) expect(page.text()).not.toContain(item.label);
   });
 
-  it('offers a model with a memory floor only on a Mac that meets it', async () => {
+  it.each([
+    [36, false],
+    [64, false],
+    [96, true],
+    [128, true],
+  ])('on a %i GiB Mac offers Qwen3.8-Flash-Next and Hy4-flash: %s', async (gib, offeredFloored) => {
     const floored = visible.filter((item) => item.minMemoryGb !== undefined);
-    expect(floored.length).toBeGreaterThan(0);
-    const small = routes('/test/small-mac');
+    expect(floored.map((item) => item.label).sort()).toEqual(['Hy4-flash', 'Qwen3.8-Flash-Next']);
+    const mac = routes(`/test/mac-${gib}`);
     dispose = stubApi({
-      ...small,
-      '/models': { ...small['/models'], host: { totalMemBytes: 36 * 1024 ** 3, diskFreeBytes: null } },
+      ...mac,
+      '/models': { ...mac['/models'], host: { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null } },
     });
     page = await renderPage(createElement(App), (text) => text.includes('Download model'));
-    expect(page.container.querySelectorAll('input[type=radio]')).toHaveLength(visible.length - floored.length);
     const offered = [...page.container.querySelectorAll<HTMLInputElement>('input[type=radio]')].map((el) => el.value);
-    for (const item of floored) expect(offered).not.toContain(item.hfRepo);
+    expect(offered).toEqual((offeredFloored ? visible : unfloored).map((item) => item.hfRepo));
+    if (offeredFloored) expect(page.text()).not.toContain("larger than this Mac's memory");
   });
 
   it('keeps returning users in their existing workspace', async () => {

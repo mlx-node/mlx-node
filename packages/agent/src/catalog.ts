@@ -65,9 +65,10 @@ export interface CatalogEntry {
   /** One line for the wizard. */
   description: string;
   /**
-   * Physical RAM in GiB below which the model's load admission always
-   * refuses. Neither the wizard ({@link visibleCatalog}) nor the dashboard
-   * Models page offers the entry on a machine with less.
+   * Physical RAM in GiB below which no UI offers the entry: not the wizard
+   * ({@link visibleCatalog}), and not the dashboard Models page or Onboarding
+   * (`offeredOnHost` in `packages/dashboard/ui/src/lib/catalog.ts`). Never
+   * lower than the RAM at which the model's load admission always refuses.
    */
   minMemoryGb?: number;
   /** Exactly one entry carries this. */
@@ -111,12 +112,17 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     draft: QWEN38_DFLASH2,
   },
   {
-    label: 'Qwen-AgentWorld-35B-A3B',
-    hfRepo: 'unsloth/Qwen-AgentWorld-35B-A3B-GGUF',
-    globs: ['*UD-Q4_K_XL*'],
-    assetsRepo: 'Qwen/Qwen-AgentWorld-35B-A3B',
-    sizeGb: 22.3,
-    description: 'Agent-tuned MoE, fast decode',
+    // The weight glob ends in `.gguf` because `*UD-Q4_K_XL*` also matches
+    // `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB
+    // copy. The native loader pairs the vision tower (`mmproj-BF16.gguf`) and
+    // the root DSpark draft from the model's folder; the drafter under
+    // `dspark/` is never scanned, so it is not globbed.
+    label: 'Inkling-2-Mini',
+    hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
+    globs: ['*UD-Q4_K_XL.gguf', 'mmproj-BF16.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf'],
+    assetsRepo: 'thinkingmachines/Inkling-2-Mini',
+    sizeGb: 18.7,
+    description: 'Looped MoE with vision and DSpark drafts, 1M context',
   },
   {
     // `mmproj-BF16.gguf` is the SigLIP vision tower — the gemma4v projector
@@ -135,6 +141,21 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: 'MoE, fast decode',
   },
   {
+    // The four shards sit in the repo folder `UD-Q4_K_XL/`, and downloads keep
+    // repo paths, so they install to `<slug>/UD-Q4_K_XL/`. The routed experts
+    // and the shard-4 n-gram table stream from SSD, so the weights may exceed
+    // RAM. A GGUF load is text-only: the repo's `mmproj-*.gguf` and MTP GGUF
+    // files are never paired, so they are not globbed. The load has no fixed
+    // admission floor; the catalog offers it from 96 GiB.
+    label: 'Qwen3.8-Flash-Next',
+    hfRepo: 'unsloth/Qwen3.8-Flash-Next-GGUF',
+    globs: ['*UD-Q4_K_XL*'],
+    assetsRepo: 'Qwen/Qwen3.8-Flash-Next',
+    sizeGb: 111.3,
+    description: '125B MoE, 512 experts streamed from SSD',
+    minMemoryGb: 96,
+  },
+  {
     // Shard 2 is the Engram table, read by row from SSD; the routed experts
     // stream from SSD too, so the weights may exceed RAM. The loader reads the
     // embedded GGUF tokenizer, never the sidecar files.
@@ -144,9 +165,10 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     assetsRepo: 'tencent/Hy4-flash',
     sizeGb: 168.3,
     description: '512-expert MoE streamed from SSD, 256K context',
-    // The admission's fixed bytes at its floor (16K context, 2048-row chunk,
-    // MTP on, one staging layer): 26.52 GiB, plus the 12 GiB reserve.
-    minMemoryGb: 39,
+    // The load admission accepts 39 GiB: its fixed bytes at its smallest
+    // settings (16K context, 2048-row chunk, MTP on, one staging layer) are
+    // 26.52 GiB, plus the 12 GiB reserve. The catalog offers it from 96 GiB.
+    minMemoryGb: 96,
   },
   {
     // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via
@@ -321,19 +343,19 @@ export function catalogEntryForRepo(repo: string, platform: NodeJS.Platform): Ca
   return MODEL_CATALOG.find((entry) => catalogRepoFor(entry, platform) === repo);
 }
 
-/** Whether `entry` can load on a machine with `totalMemBytes` of physical RAM. */
+/** Whether the catalog offers `entry` on a machine with `totalMemBytes` of physical RAM ({@link CatalogEntry.minMemoryGb}). */
 export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, totalMemBytes: number): boolean {
   return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
 }
 
-/** Catalog entries the wizard offers: visible chat entries loadable in `totalMemBytes` of RAM. */
+/** Catalog entries the wizard offers: visible chat entries whose memory floor `totalMemBytes` of RAM meets. */
 export function visibleCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
   return MODEL_CATALOG.filter(
     (entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat' && catalogFitsMemory(entry, totalMemBytes),
   );
 }
 
-/** Visible System One (Clairic / CLEF) catalog entries loadable in `totalMemBytes` of RAM. */
+/** Visible System One (Clairic / CLEF) catalog entries whose memory floor `totalMemBytes` of RAM meets. */
 export function visibleSystemOneCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
   return MODEL_CATALOG.filter(
     (entry) => !entry.hidden && entry.category === 'systemone' && catalogFitsMemory(entry, totalMemBytes),

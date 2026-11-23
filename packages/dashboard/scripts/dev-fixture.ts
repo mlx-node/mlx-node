@@ -2220,7 +2220,7 @@ function writeCatalogInstall(home: string, now: number): void {
  * "Needs cleanup" with Reinstall.
  */
 export const CATALOG_BLOCKED = {
-  slug: 'qwen-agentworld-35b-a3b-gguf',
+  slug: 'inkling-2-mini-gguf',
   file: 'imatrix_unsloth.gguf_file',
   sizeBytes: 192_223_904,
 } as const;
