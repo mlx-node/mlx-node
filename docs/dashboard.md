@@ -329,45 +329,96 @@ Where the numbers come from:
 A model is keyed by `modelId ?? model` (`model_key`) and keeps one color on every page: 8 color slots in a registry
 kept in `localStorage`, models 9–16 reuse the hues with a second encoding, later ones fold into "Other".
 
-Every catalog entry installs its Unsloth UD-Q4_K_XL GGUF (one variant out of
-the repo's dozens) plus the base-model tokenizer sidecars fetched from the
-entry's `assetsRepo`; the download runner glob-filters the manifest and stages
-the sidecars before publishing. Hy4-flash installs the `Q4_K_M` build of
-`AngelSlim/Hy4-flash-GGUF` instead. Inkling-2-Mini's weight glob is
-`*UD-Q4_K_XL.gguf` (the repo also holds a `Mainline_Support/…gguf_file` copy of
-the same weights), and its install also takes `mmproj-BF16.gguf` and the root
-`dspark-Inkling-2-Mini-Q8_0.gguf`, which the loader pairs from the folder.
-Qwen3.8-Flash-Next keeps its four shards in the repo folder `UD-Q4_K_XL/`, and
-downloads keep repo paths, so they land in `<slug>/UD-Q4_K_XL/` with the
-sidecars at the root. A card reads present (`isModelPresent`) for a folder with
-a root `config.json` and a loadable weight at the root, or with a GGUF in a
-variant folder one level down, by discovery's folder walk for a GGUF repository
-folder (which folders, which companions, split sets): only when the root holds
-no primary safetensors; never a folder whose name starts with `.`, nor one that
-holds primary safetensors; links to folders and files followed; the GGUF a
-regular file, not a companion (`mmproj`, `imatrix`, `dflash`, `dspark`,
-`draft`, `mtp`), and a split set counted from its first part only with every
-part beside it. Nothing deeper is read. Discovery's family name, header and
-sibling-asset checks are not applied. An entry with `minMemoryGb` is offered on
-Models and on Onboarding only once the host reading is in and the Mac's
-physical RAM reaches it (`offeredOnHost`); Qwen3.8-Flash-Next and Hy4-flash
-need 96 GiB, which a 96 GB Mac reports. The setup wizard filters the same way
-(`visibleCatalog`). Below the floor the page hides the card, its palette
-commands (Install, Update) and its share of the "N of M installed" count. An
-installed copy on a smaller Mac stays in the local list, and loads where its
-load admission accepts the RAM (Hy4-flash from 39 GiB). Qwen3.8-27B carries the
-optional DFlash2 `draft` companion, which is never auto-installed; its MTP
-speculative weights ship inside the same repo and the native loader
-auto-detects them. The catalog renders a draft companion
-(with its own install button, progress, cancel, and update controls)
-whenever a catalog entry carries one, for example a manually installed
-**DFlash2** draft: the roughly 3.85 GB checkpoint lives at
-`qwen3.8-27b-dflash2` in the configured models directory, and compatible
-Qwen3.8-27B targets find it automatically on their next load. It is not another
-chat model. Draft-only checkpoints are excluded from the local-model table and
-model counts. Their bytes still count toward disk use on Models and Overview.
-Expand **Companion weights** in the local models panel to inspect or delete them;
-deleting a separate companion leaves the target model in place.
+A catalog entry (`MODEL_CATALOG` in `packages/agent/src/catalog.ts`) has one or more builds, and each build installs to
+its own folder under the models directory: the last part of its repo in lower case, plus `-<folderSuffix>` for a
+second build of a repo another build already installs. One folder is one build: one job, one marker, one row in Local
+models and one Delete. The chat builds:
+
+| Model              | Build      | Folder                          | Size     |
+| ------------------ | ---------- | ------------------------------- | -------- |
+| Qwen3.8-27B        | UD-Q4_K_XL | `qwen3.8-27b-gguf`              | 17.7 GB  |
+| Qwen3.8-27B        | UD-Q4_K_M  | `qwen3.8-27b-gguf-ud-q4_k_m`    | 16.6 GB  |
+| Inkling-2-Mini     | UD-Q4_K_XL | `inkling-2-mini-gguf`           | 18.7 GB  |
+| Inkling-2-Mini     | UD-Q4_K_M  | `inkling-2-mini-gguf-ud-q4_k_m` | 17.7 GB  |
+| Inkling-2-Mini     | Original   | `inkling-2-mini`                | 20.2 GB  |
+| Qwen3.8-Flash-Next | UD-Q4_K_XL | `qwen3.8-flash-next-gguf`       | 111.3 GB |
+| Hy4-flash          | Q4_K_M     | `hy4-flash-gguf`                | 168.3 GB |
+
+Repos, globs and assets repos are in [cli.md](cli.md#model-selection-and-first-run-wizard). A GGUF build takes one
+variant out of its repo plus the base-model tokenizer sidecars of its `assetsRepo`; the download runner glob-filters
+the manifest and stages the sidecars before publishing. Inkling-2-Mini Original is the safetensors release of
+`thinkingmachines/Inkling-2-Mini` and takes the default filter. Qwen3.8-Flash-Next keeps its four shards in the repo
+folder `UD-Q4_K_XL/`, and downloads keep repo paths, so they land in `<slug>/UD-Q4_K_XL/` with the sidecars at the
+root. The System One section offers Clairic Flash (9B) and Clairic (27B), one build each.
+
+A build reads present (`isModelPresent`) for a folder with a root `config.json` and a loadable weight at the root, or
+with a GGUF in a variant folder one level down, by discovery's folder walk for a GGUF repository folder (which
+folders, which companions, split sets): only when the root holds no primary safetensors; never a folder whose name
+starts with `.`, nor one that holds primary safetensors; links to folders and files followed; the GGUF a regular file,
+not a companion (`mmproj`, `imatrix`, `dflash`, `dspark`, `draft`, `mtp`), and a split set counted from its first part
+only with every part beside it. Nothing deeper is read. Discovery's family name, header and sibling-asset checks are
+not applied. A folder with the download marker of the build's repo under another name counts too. For a repo that two
+builds share (the Qwen3.8-27B and the Inkling-2-Mini GGUF builds), a folder counts as the build its GGUF file name
+states, not the build its name suggests, and the marker alone never makes a build present. When a build's folder holds
+a loadable model that is another build of the same repo, the build has `heldBy` (that build's name, or `another model`
+when the weights state none): the card shows **Holds UD-Q4_K_M** with no Install, the build in the folder reads as
+present on its own segment, and the server refuses an install into the folder with 409
+(`"<folder>" holds <build>. Delete it in Local models, then install <build>.`), because the owned swap would delete
+the other build.
+
+The recommended section is a grid of equal cards: two columns from 780 px of content, one below it, never three. Every
+card in a grid has the same height in every state, because it has five fixed rows: title, description (two lines at
+most), build, extras and action. A state changes what a row shows, never how many rows there are or how tall they
+are. With the dev harness running, `yarn workspace @mlx-node/dashboard dev:shots --card-check` measures this in the
+browser on `/models` and the gallery and exits 1 when two cards of a page differ.
+
+- **Title:** the logo and the model name, which links to the shown build's repo; a Default or System One badge; an
+  Update badge when the shown build is on disk and has an update.
+- **Build:** a card with two or more builds shows a build switch ("Build of Qwen3.8-27B", one segment per build); a
+  one-build card shows the build name as a tag. A segment carries a mark: a spinner (downloading), a warning (needs
+  attention), an up arrow (update available) or a check (installed), each with its word for screen readers. Choosing a
+  segment starts nothing; it changes only what the card shows. The card shows, first match, the build chosen on this
+  page visit (page state, not stored), a build with a running job, the first build on disk, the first build. Under the
+  switch, the build line reads size · source · note (`16.6 GB · Unsloth GGUF · 1.1 GB smaller`). A disk or memory
+  warning replaces it, and a running job replaces it with its live numbers.
+- **Extras:** the build's `included` text (`Vision and DSpark draft included`), or the DFlash2 line on Qwen3.8-27B.
+- **Action:** one control for the shown build. Install (`Install UD-Q4_K_M` on a card with more builds) starts that
+  build only; a download shows a spinner, a bar, the percent and Cancel (none in its last step), with the file name
+  in the bar's tooltip; an installed build reads Installed, then Details (its folder in Local models) when Local
+  models lists it and, in System One, Open; an update adds an Update button. A build in a blocked state shows a
+  status word (Needs update, Needs cleanup, Holds UD-Q4_K_M) and one button. The long texts are not on the card: the
+  status word's tooltip holds the one-line reason (also as screen-reader text), **Update…** loads the plan
+  ("Checking…") and opens its confirmation, **Reinstall…** opens its confirmation, and a folder the app cannot
+  replace gets **Show in Local models** when Local models lists it, else **Show why**, a popover with the reason.
+
+The DFlash2 line belongs to Qwen3.8-27B, not to a build: one copy pairs with both builds by name. It reads
+`Optional DFlash2 · 3.85 GB` with an **Add** button that starts the draft download at once, beside a model download
+too, and never follows the build switch. Then it reads the received bytes and percent with Cancel, `added`, `added ·
+waits for the model` while no Qwen3.8-27B build is on disk, `update available` with Update, or `needs update` /
+`needs cleanup` with Update…, Reinstall… or Show why. The draft lives at `qwen3.8-27b-dflash2` in the models
+directory, and compatible Qwen3.8-27B targets find it automatically on their next load. It is not another chat model
+and never counts as one. Draft-only checkpoints are excluded from the local-model table and model counts; their bytes
+still count toward disk use on Models and Overview. Expand **Companion weights** in the local models panel to inspect
+or delete them; deleting a separate companion leaves the target model in place. Delete is not on the card: Local
+models has one row per folder, and deleting a row removes that one build. The Qwen3.8-27B UD-Q4_K_XL file also carries
+an MTP layer inline, which the native loader detects.
+
+"N of M installed" counts models: a model counts when at least one of its builds is on disk, and M is the number of
+chat models offered on this Mac. The System One section counts its own. The command palette has one command per build
+that can act: `Install Qwen3.8-Flash-Next` for a one-build model, `Install Qwen3.8-27B (UD-Q4_K_M)` for the others,
+and the same for Update, with the ids `models:install:<folder>` and `models:update:<folder>`; a command also chooses
+its build on the card. The System One drawer uses the same card and grid.
+
+Onboarding offers one choice per model, with no build control. A choice stands for the build with a running job, else
+the first build on disk, else the first build, and the dock adds "Build UD-Q4_K_XL. More builds are on the Models
+page." for a model with more builds. The setup wizard asks for the build instead
+([cli.md](cli.md#model-selection-and-first-run-wizard)).
+
+An entry with `minMemoryGb` is offered on Models and on Onboarding only once the host reading is in and the Mac's
+physical RAM reaches it (`offeredOnHost`); Qwen3.8-Flash-Next and Hy4-flash need 96 GiB, which a 96 GB Mac reports.
+The setup wizard filters the same way (`visibleCatalog`). Below the floor the page hides the card, its palette
+commands and its share of the "N of M installed" count. An installed copy on a smaller Mac stays in the local list,
+and loads where its load admission accepts the RAM (Hy4-flash from 39 GiB).
 
 The local-model table's **Quant** column reads the weights. For a folder whose
 weights are GGUF (at the root, else in a variant folder one level down, by the
@@ -390,10 +441,10 @@ trash button. If that refetch fails, the page says "Could not refresh the model 
 was in flight across any mutation never seeds the cache for the next visit (`json-cache` epoch). The Sessions list
 applies a confirmed rename or delete the same way.
 
-A catalog slug held by something the app did not create (a leftover file, a hand-made folder, a link) shows
-**Needs cleanup** with what is in the way (`blocker`: kind, file count, size, at most 3 names; counted with
-`lstat`, never following a link or opening a file, at most 2,000 entries; only the root `config.json` is read, to
-tell whether Local models lists the entry) and a **Reinstall** button. Reinstall
+A catalog folder held by something the app did not create (a leftover file, a hand-made folder, a link) shows
+**Needs cleanup** and a **Reinstall…** button whose confirmation says what is in the way (`blocker`: kind, file count,
+size, at most 3 names; counted with `lstat`, never following a link or opening a file, at most 2,000 entries; only the
+root `config.json` is read, to tell whether Local models lists the entry). Reinstall
 downloads and verifies the model first and only then moves the old entry aside through the downloader's swap and
 deletes it; a failed or cancelled download removes nothing. The request echoes the numbers the user confirmed, and
 the server refuses (409) when the entry no longer matches them, at the request, at job start and right before the
@@ -401,9 +452,9 @@ swap. Reinstall never replaces an entry that holds model files, and the card of 
 entry holds model files when it has, anywhere in it, at any depth (links to folders followed), an entry named
 `config.json` or named like weights (`.safetensors`, `.gguf` including companions, `.pdiparams`, `.pdparams`, `.npz`,
 `.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more than 20,000 entries to look through. When that
-entry is a real folder its card shows **Needs update** and an **Update** button, which adds the missing files and the
-marker and deletes nothing (below). A link, or a folder with more than 2,000 entries, keeps **Needs cleanup** with no
-button. A directory the app has no write permission on is refused at the request, before any download. A link is
+entry is a real folder its card shows **Needs update** and an **Update…** button, which adds the missing files and the
+marker and deletes nothing (below). A link, or a folder with more than 2,000 entries, keeps **Needs cleanup** with
+**Show in Local models** when Local models lists it, else **Show why**. A directory the app has no write permission on is refused at the request, before any download. A link is
 removed as a link; its target is not touched.
 
 The old entry is moved to `.staging/<slug>.reinstall-<pid>.<uuid>`. Before it is deleted, the moved entry is checked
@@ -414,13 +465,13 @@ removes, and the error names it. When the process dies between moving the entry 
 the download manager starts, and before every job for the slug) puts the entry back when the path is empty, deletes it
 when a complete model installed by the app is in place and the backup holds no model files, and otherwise keeps it.
 
-**Update** makes the app own a folder that holds the catalog model but was not made by the app, by adding what is
+**Update…** makes the app own a folder that holds the catalog model but was not made by the app, by adding what is
 missing. It never moves, renames, deletes or overwrites a file that was in the folder. A click asks for a plan
 (`POST /api/downloads/adopt-plan`): the server pins one 40-hex sha for the repo and one for the `assetsRepo`, lists the
 wanted files the same way an install does (the wanted set must hold `config.json`), and scans the folder with `lstat`
 only, opening no file, at most 2,000 entries. A wanted file is **checked** when a regular file of the manifest size is
 at its path, and **downloaded** when nothing is there; any other file that is not a model file stays where it is. The
-plan is refused (409, the text names the file and shows under the card note) for a wanted file of another size, a
+plan is refused (409; the text names the file, and the card shows it in a "Could not check the folder" toast) for a wanted file of another size, a
 wanted file the manifest gives no checksum for (in the folder or missing from it), a file that failed the hash in an earlier Update since the app
 started, a model file that is not part of the catalog model, a name that differs from a wanted name only in letter
 case, links or special files, a `.mlx-download-complete.json` at the root (the app cannot read it), more than 2,000
@@ -465,7 +516,7 @@ its tokenizer. A failed rollback says so and tells the user to remove `config.js
 Update again.
 
 A marker that Update writes has an `adopted` record: the `lstat` size and `mtimeNs` of each wanted file as the job
-proved it. It decides what the app may delete later. When **Update available** replaces such a folder, or backup
+proved it. It decides what the app may delete later. When an update replaces such a folder, or backup
 recovery removes its old copy, only regular files that the marker lists and whose size and `mtimeNs` still equal the
 record are unlinked, and the folders left empty are removed with `rmdir`. Each such file is first renamed to a private
 folder inside the old copy and checked there (the same inode, size and `mtimeNs`), so a file renamed onto its name in
@@ -1534,35 +1585,35 @@ copy button keep the full path.
 Common params of the metrics routes, parsed by hand: `from`, `to` (epoch ms), `model` (exact `model_key`), `bucket`
 (`5m`, `hour`, `day`; hour and day follow local time), `groupBy` (`model`). A request spans at most 2000 buckets.
 
-| Route                          | Method       | Thread    | Purpose                                                                                                                                                                    |
-| ------------------------------ | ------------ | --------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/api/models`                  | GET          | worker    | Local models: name, path, family, quant, size, ctx window, `servedIds`; `host` memory and free disk                                                                        |
-| `/api/models/:name`            | DELETE       | worker    | Delete a model dir (path-checked)                                                                                                                                          |
-| `/api/catalog`                 | GET          | worker    | Recommended catalog + installed/installable state; `blocker` names what holds a blocked slug                                                                               |
-| `/api/catalog/updates`         | GET          | transport | Upstream sha per catalog repo; the page joins it against `/api/catalog`                                                                                                    |
-| `/api/downloads`               | GET / POST   | transport | List active jobs / start a catalog download; `replaceBlocker: { kind, fileCount, sizeBytes, truncated }` is a Reinstall, `adopt: <token>` an Update (409 on change)        |
-| `/api/downloads/adopt-plan`    | POST         | transport | `{slug}` → Update plan: `token`, `revision`, `assetsRevision`, `check` / `download` / `other` counts and bytes, up to 3 other names; 409 names the file it refuses         |
-| `/api/downloads/:id`           | DELETE       | transport | Cancel a download                                                                                                                                                          |
-| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503. `progress.phase: 'check'` while Update hashes a file; `done.keptDir` names kept files          |
-| `/api/coding-agents`           | GET / POST   | transport | Coding agent state with the managed instruction `block` / body `{action: 'refresh'}` or `{action: 'install', agent}`                                                       |
-| `/api/coding-agents/models`    | GET          | worker    | Local model ids the coding agents can be pointed at                                                                                                                        |
-| `/api/metrics/models`          | GET          | worker    | Model keys in first-seen order (color registry seed, model filter)                                                                                                         |
-| `/api/metrics/summary`         | GET          | worker    | Totals, latency quantiles, per model, finish reasons, failures, endpoints, dispatches; `previous` = the window of equal length before `from`                               |
-| `/api/metrics/timeseries`      | GET          | worker    | Per-bucket series, optionally per model                                                                                                                                    |
-| `/api/metrics/distributions`   | GET          | worker    | Histograms with bins chosen by the API                                                                                                                                     |
-| `/api/metrics/speculative`     | GET          | worker    | MTP per model (acceptance per draft position, decode speed with and without MTP) and a trend                                                                               |
-| `/api/metrics/turns`           | GET          | worker    | Turns, newest first; cursor paging (`beforeTs` + `beforeTraceId`), `limit` ≤ 2000, `traceId`, `outcome`                                                                    |
-| `/api/runtime/series`          | GET          | worker    | `from`, `to`, `bucketMs` (5 s … 1 h) → samples, scheduler deltas, processes, loads                                                                                         |
-| `/api/runtime/live`            | GET          | transport | `RuntimeLive` snapshot: status, supervisor, processes                                                                                                                      |
-| `/api/cache`                   | GET / DELETE | worker    | Cold-tier scan and daily trend (`trend[].t`, local day start) / clear all or evict older-than-N-days                                                                       |
-| `/api/cache/prefix`            | GET          | worker    | Model caches per folder: `roots[]` (`namespaces`, `volume`, `readError`, `engines` with their limit), `counting`, `canLock`                                                |
-| `/api/cache/prefix/:namespace` | DELETE       | worker    | Body `{root, openedMs}` → one step `{removed, freedBytes, done, left, directoryRemoved}`; repeat until `done`. 400, 403, 404, 409 `held`/`changed`/`moved`/`no-lock-check` |
-| `/api/ingest`                  | POST         | worker    | Trigger an incremental rescan                                                                                                                                              |
-| `/api/sessions`                | GET          | worker    | `?q=&cwd=&limit=&offset=` → `{sessions, total, cwds}`; limit 1..500, default 100                                                                                           |
-| `/api/sessions/:id`            | GET          | worker    | `{session, transcript, turns, transcriptError?, resumeCommand}`; subagent ids work too; tool, text and subagent entries carry `endTs`                                      |
-| `/api/sessions/:id/timeline`   | GET          | worker    | `?turn=<n>` → `SessionTimelineResponse`: one turn as lanes, spans and handoffs; metadata only (below)                                                                      |
-| `/api/sessions/:id`            | PATCH        | worker    | Body `{title}` → `{id, title}`; 400 bad title, 404, 409 live/recent/changed                                                                                                |
-| `/api/sessions/:id`            | DELETE       | worker    | `{deleted: [id, ...children]}`; 404, 409 when it or any child is live                                                                                                      |
+| Route                          | Method       | Thread    | Purpose                                                                                                                                                                                                                                                                       |
+| ------------------------------ | ------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/api/models`                  | GET          | worker    | Local models: name, path, family, quant, size, ctx window, `servedIds`; `host` memory and free disk                                                                                                                                                                           |
+| `/api/models/:name`            | DELETE       | worker    | Delete a model dir (path-checked)                                                                                                                                                                                                                                             |
+| `/api/catalog`                 | GET          | worker    | Recommended catalog: entries with `builds[]`, each with its folder (`slug`) and state (`installed`, `present`, `heldBy`, `blocker`), and the `draft` companion                                                                                                                |
+| `/api/catalog/updates`         | GET          | transport | Upstream sha per catalog repo; the page joins it against `/api/catalog`                                                                                                                                                                                                       |
+| `/api/downloads`               | GET / POST   | transport | List active jobs / start a catalog download: body `{slug}` (a build or draft folder) → 202 `{id, slug, repo}`; `replaceBlocker: { kind, fileCount, sizeBytes, truncated }` is a Reinstall, `adopt: <token>` an Update (409 on change, or when the folder holds another build) |
+| `/api/downloads/adopt-plan`    | POST         | transport | `{slug}` → Update plan: `token`, `revision`, `assetsRevision`, `check` / `download` / `other` counts and bytes, up to 3 other names; 409 names the file it refuses                                                                                                            |
+| `/api/downloads/:id`           | DELETE       | transport | Cancel a download                                                                                                                                                                                                                                                             |
+| `/api/downloads/:id/events`    | GET          | transport | Not served over the port — use `runtime.subscribe(jobId, fn)`; answers 503. `progress.phase: 'check'` while Update hashes a file; `done.keptDir` names kept files                                                                                                             |
+| `/api/coding-agents`           | GET / POST   | transport | Coding agent state with the managed instruction `block` / body `{action: 'refresh'}` or `{action: 'install', agent}`                                                                                                                                                          |
+| `/api/coding-agents/models`    | GET          | worker    | Local model ids the coding agents can be pointed at                                                                                                                                                                                                                           |
+| `/api/metrics/models`          | GET          | worker    | Model keys in first-seen order (color registry seed, model filter)                                                                                                                                                                                                            |
+| `/api/metrics/summary`         | GET          | worker    | Totals, latency quantiles, per model, finish reasons, failures, endpoints, dispatches; `previous` = the window of equal length before `from`                                                                                                                                  |
+| `/api/metrics/timeseries`      | GET          | worker    | Per-bucket series, optionally per model                                                                                                                                                                                                                                       |
+| `/api/metrics/distributions`   | GET          | worker    | Histograms with bins chosen by the API                                                                                                                                                                                                                                        |
+| `/api/metrics/speculative`     | GET          | worker    | MTP per model (acceptance per draft position, decode speed with and without MTP) and a trend                                                                                                                                                                                  |
+| `/api/metrics/turns`           | GET          | worker    | Turns, newest first; cursor paging (`beforeTs` + `beforeTraceId`), `limit` ≤ 2000, `traceId`, `outcome`                                                                                                                                                                       |
+| `/api/runtime/series`          | GET          | worker    | `from`, `to`, `bucketMs` (5 s … 1 h) → samples, scheduler deltas, processes, loads                                                                                                                                                                                            |
+| `/api/runtime/live`            | GET          | transport | `RuntimeLive` snapshot: status, supervisor, processes                                                                                                                                                                                                                         |
+| `/api/cache`                   | GET / DELETE | worker    | Cold-tier scan and daily trend (`trend[].t`, local day start) / clear all or evict older-than-N-days                                                                                                                                                                          |
+| `/api/cache/prefix`            | GET          | worker    | Model caches per folder: `roots[]` (`namespaces`, `volume`, `readError`, `engines` with their limit), `counting`, `canLock`                                                                                                                                                   |
+| `/api/cache/prefix/:namespace` | DELETE       | worker    | Body `{root, openedMs}` → one step `{removed, freedBytes, done, left, directoryRemoved}`; repeat until `done`. 400, 403, 404, 409 `held`/`changed`/`moved`/`no-lock-check`                                                                                                    |
+| `/api/ingest`                  | POST         | worker    | Trigger an incremental rescan                                                                                                                                                                                                                                                 |
+| `/api/sessions`                | GET          | worker    | `?q=&cwd=&limit=&offset=` → `{sessions, total, cwds}`; limit 1..500, default 100                                                                                                                                                                                              |
+| `/api/sessions/:id`            | GET          | worker    | `{session, transcript, turns, transcriptError?, resumeCommand}`; subagent ids work too; tool, text and subagent entries carry `endTs`                                                                                                                                         |
+| `/api/sessions/:id/timeline`   | GET          | worker    | `?turn=<n>` → `SessionTimelineResponse`: one turn as lanes, spans and handoffs; metadata only (below)                                                                                                                                                                         |
+| `/api/sessions/:id`            | PATCH        | worker    | Body `{title}` → `{id, title}`; 400 bad title, 404, 409 live/recent/changed                                                                                                                                                                                                   |
+| `/api/sessions/:id`            | DELETE       | worker    | `{deleted: [id, ...children]}`; 404, 409 when it or any child is live                                                                                                                                                                                                         |
 
 `/api/sessions`, `/api/sessions/:id` and its timeline read both session homes. `origin` is `agent`, `chat` (the Chat
 home) or `work` (an agent-home session the Work index `~/.mlx-node/chat/conversations.json` names). `resumeCommand` is

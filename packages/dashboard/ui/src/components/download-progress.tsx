@@ -119,19 +119,9 @@ export function reduceProgress(
   }
 }
 
-export interface DownloadProgressProps {
+export interface DownloadProgressProps extends DownloadProgressCallbacks {
   /** Download job id from `POST /api/downloads`. */
   id: string;
-  /** `keptDir`: where a later update put the files of the old folder that the app may not delete. */
-  onDone?: (keptDir: string | undefined) => void;
-  onError?: (message: string) => void;
-  /**
-   * The job stopped without finishing. Distinct from {@link onError}: a cancel is
-   * not a failure and must not raise a red notice. Needed because a `cancelled`
-   * frame does NOT imply this card asked for it — a second tab, or `shutdown()`
-   * aborting the in-flight job, sends one to a card that clicked nothing.
-   */
-  onCancelled?: () => void;
   className?: string;
 }
 
@@ -150,10 +140,24 @@ const LOADER: Record<ProgressPhase, LoaderStatus> = {
   error: 'error',
 };
 
+export interface DownloadProgressCallbacks {
+  /** `keptDir`: where a later update put the files of the old folder that the app may not delete. */
+  onDone?: (keptDir: string | undefined) => void;
+  onError?: (message: string) => void;
+  /**
+   * The job stopped without finishing. Distinct from {@link onError}: a cancel is
+   * not a failure and must not raise a red notice. Needed because a `cancelled`
+   * frame does NOT imply this card asked for it — a second tab, or `shutdown()`
+   * aborting the in-flight job, sends one to a card that clicked nothing.
+   */
+  onCancelled?: () => void;
+}
+
 /**
  * Live progress for one catalog download, driven by a port subscription on the
- * job id. The bar reads each `progress` event's `jobReceivedBytes` against the
- * job total from `start`, so it reflects whole-job completion.
+ * job id; no subscription while `id` is undefined. The bar reads each `progress`
+ * event's `jobReceivedBytes` against the job total from `start`, so it reflects
+ * whole-job completion.
  *
  * Deliberately NOT summed from the per-file events this card witnessed: the host
  * replays only `start` plus the single latest event, so a card mounted
@@ -161,18 +165,19 @@ const LOADER: Record<ProgressPhase, LoaderStatus> = {
  * finished files and would render the current file's bytes as the job's —
  * short by every completed shard.
  */
-export function DownloadProgress({ id, onDone, onError, onCancelled, className }: DownloadProgressProps): ReactElement {
+export function useDownloadProgress(id: string | undefined, callbacks: DownloadProgressCallbacks): ProgressState {
   const [state, setState] = useState<ProgressState>(INITIAL_PROGRESS);
   const connection = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
-  const doneCb = useRef(onDone);
-  const errorCb = useRef(onError);
-  const cancelledCb = useRef(onCancelled);
-  doneCb.current = onDone;
-  errorCb.current = onError;
-  cancelledCb.current = onCancelled;
+  const doneCb = useRef(callbacks.onDone);
+  const errorCb = useRef(callbacks.onError);
+  const cancelledCb = useRef(callbacks.onCancelled);
+  doneCb.current = callbacks.onDone;
+  errorCb.current = callbacks.onError;
+  cancelledCb.current = callbacks.onCancelled;
 
   useEffect(() => {
     setState(INITIAL_PROGRESS);
+    if (id === undefined) return;
     let stallTimer: ReturnType<typeof setTimeout> | undefined;
     const armStall = (): void => {
       clearTimeout(stallTimer);
@@ -204,13 +209,17 @@ export function DownloadProgress({ id, onDone, onError, onCancelled, className }
     // permanently deaf — frozen mid-progress against a healthy new runtime.
   }, [id, connection]);
 
+  return state;
+}
+
+export function DownloadProgress({ id, onDone, onError, onCancelled, className }: DownloadProgressProps): ReactElement {
+  const state = useDownloadProgress(id, { onDone, onError, onCancelled });
   return <DownloadProgressView state={state} className={className} />;
 }
 
-/** The card for one state of {@link reduceProgress}: status line, bar, and file / rate line. */
-export function DownloadProgressView({ state, className }: { state: ProgressState; className?: string }): ReactElement {
-  const staticMotion = useStaticMotion();
-  const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, checking, message, stalled } = state;
+/** The share of the job that is done, 0-100. */
+export function progressPercent(state: ProgressState): number {
+  const { phase, totalBytes, receivedBytes, fileCount, fileIndex } = state;
   const fraction =
     phase === 'done'
       ? 1
@@ -219,9 +228,82 @@ export function DownloadProgressView({ state, className }: { state: ProgressStat
         : fileCount > 0
           ? Math.min(1, fileIndex / fileCount)
           : 0;
-  const pct = Math.round(fraction * 100);
+  return Math.round(fraction * 100);
+}
+
+const DECIMAL_UNITS = ['B', 'kB', 'MB', 'GB', 'TB'] as const;
+
+/**
+ * Bytes in powers of 1000, the units of the catalog's sizes: a card that says `16.6 GB` counts its download up to
+ * `16.6 GB`. {@link formatBytes} counts in powers of 1024 and would end at `15.4 GB`.
+ */
+export function decimalBytesParts(bytes: number): { value: string; unit: string } {
+  if (!Number.isFinite(bytes) || bytes <= 0) return { value: '0', unit: 'B' };
+  let exp = 0;
+  let value = bytes;
+  while (value >= 1000 && exp < DECIMAL_UNITS.length - 1) {
+    value /= 1000;
+    exp += 1;
+  }
+  return { value: value.toFixed(exp === 0 || value >= 100 ? 0 : 1), unit: DECIMAL_UNITS[exp]! };
+}
+
+function decimalBytes(bytes: number): string {
+  const parts = decimalBytesParts(bytes);
+  return `${parts.value} ${parts.unit}`;
+}
+
+/** `7.4 / 16.6 GB`, or `812 MB / 16.6 GB` when the units differ. */
+export function bytesOfTotal(received: number, total: number): string {
+  const done = decimalBytesParts(received);
+  const all = decimalBytesParts(total);
+  return done.unit === all.unit
+    ? `${done.value} / ${all.value} ${all.unit}`
+    : `${done.value} ${done.unit} / ${all.value} ${all.unit}`;
+}
+
+/** The one line a catalog card shows about a job: its step, or bytes, rate and time left. */
+export function progressSummary(state: ProgressState, job: { committing: boolean; cancelling: boolean }): string {
+  if (job.cancelling) return 'Cancelling…';
+  if (job.committing || state.phase === 'done') return 'Finishing…';
+  if (state.phase === 'error') return state.message ?? 'Download failed';
+  if (state.phase === 'connecting' || state.totalBytes <= 0) return 'Starting…';
+  const bytes = bytesOfTotal(state.receivedBytes, state.totalBytes);
+  if (state.checking) return `Checking files · ${bytes}`;
+  const rate = state.rate?.bytesPerSec ?? null;
+  return [bytes, rate !== null ? `${decimalBytes(rate)}/s` : null, timeLeft(state)]
+    .filter((part): part is string => part !== null)
+    .join(' · ');
+}
+
+/** The file the job is on, as `{file} · File i of n`, or null before the first file. */
+export function progressFileLine(state: ProgressState): string | null {
+  if (state.currentFile === '' || state.fileCount <= 0) return null;
+  return `${state.currentFile} · File ${Math.min(state.fileIndex + 1, state.fileCount)} of ${state.fileCount}`;
+}
+
+/** The bar alone, with the moving shine while bytes arrive. */
+export function DownloadBar({ state, label }: { state: ProgressState; label: string }): ReactElement {
+  const staticMotion = useStaticMotion();
+  const pct = progressPercent(state);
+  const shine = state.phase === 'running' && !state.stalled && !staticMotion;
+  return (
+    <div
+      className={styles.bar}
+      data-shine={shine ? '' : undefined}
+      data-phase={state.phase}
+      style={{ '--pct': `${pct}%` } as CSSProperties}
+    >
+      <Progress value={pct} label={label} />
+    </div>
+  );
+}
+
+/** The card for one state of {@link reduceProgress}: status line, bar, and file / rate line. */
+export function DownloadProgressView({ state, className }: { state: ProgressState; className?: string }): ReactElement {
+  const { phase, totalBytes, receivedBytes, fileCount, fileIndex, currentFile, checking, message, stalled } = state;
+  const pct = progressPercent(state);
   const moving = (phase === 'connecting' || phase === 'running') && !stalled;
-  const shine = phase === 'running' && !stalled && !staticMotion;
 
   const status =
     phase === 'done'
@@ -273,14 +355,7 @@ export function DownloadProgressView({ state, className }: { state: ProgressStat
           {bytes !== null ? <SwapText text={bytes} granularity="char" /> : null}
         </span>
       </div>
-      <div
-        className={styles.bar}
-        data-shine={shine ? '' : undefined}
-        data-phase={phase}
-        style={{ '--pct': `${pct}%` } as CSSProperties}
-      >
-        <Progress value={pct} label="Download progress" />
-      </div>
+      <DownloadBar state={state} label="Download progress" />
       {details !== null ? (
         <p className="m-0 text-caption text-secondary tabular-nums" aria-hidden="true">
           <SwapText text={details} granularity="char" />

@@ -20,7 +20,16 @@
  * `happy-dom` is scoped to this file by the docblock above.
  */
 
-import { DownloadProgress, INITIAL_PROGRESS, reduceProgress, type ProgressState } from '@/components/download-progress';
+import {
+  bytesOfTotal,
+  DownloadProgress,
+  INITIAL_PROGRESS,
+  progressFileLine,
+  progressPercent,
+  progressSummary,
+  reduceProgress,
+  type ProgressState,
+} from '@/components/download-progress';
 import { act, createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -276,5 +285,50 @@ describe('reduceProgress', () => {
     expect(reduceProgress(done, { type: 'stalled' })).toBe(done);
     const failed = reduceProgress(running(), { type: 'error', id: 'job-1', message: 'x' }, 0);
     expect(reduceProgress(failed, { type: 'stalled' })).toBe(failed);
+  });
+});
+
+describe('progressSummary — the build line of a catalog card', () => {
+  const GB = 1e9;
+  const idle = { committing: false, cancelling: false };
+  const started = reduceProgress(INITIAL_PROGRESS, {
+    type: 'start',
+    id: 'j',
+    repo: 'org/model',
+    totalBytes: 16.6 * GB,
+    fileCount: 2,
+  });
+  const frame = (bytes: number, phase?: 'check') =>
+    ({
+      type: 'progress',
+      id: 'j',
+      file: 'model-00002-of-00002.gguf',
+      receivedBytes: bytes,
+      jobReceivedBytes: bytes,
+      totalBytes: 16.6 * GB,
+      fileIndex: 1,
+      fileCount: 2,
+      ...(phase === undefined ? {} : { phase }),
+    }) as DownloadEvent;
+  const running = reduceProgress(reduceProgress(started, frame(7.32 * GB), 0), frame(7.4 * GB), 1000);
+
+  it('names each step of a job', () => {
+    expect(progressSummary(INITIAL_PROGRESS, idle)).toBe('Starting…');
+    expect(progressSummary(running, idle)).toBe('7.4 / 16.6 GB · 80.0 MB/s · about 2 min left');
+    expect(progressSummary(reduceProgress(started, frame(GB, 'check'), 0), idle)).toBe(
+      'Checking files · 1.0 / 16.6 GB',
+    );
+    // Mutation: committing gives the running text → red.
+    expect(progressSummary(running, { committing: true, cancelling: false })).toBe('Finishing…');
+    expect(progressSummary(running, { committing: false, cancelling: true })).toBe('Cancelling…');
+  });
+
+  it('gives the bar its percent and its file line', () => {
+    expect(progressPercent(running)).toBe(45);
+    expect(progressFileLine(running)).toBe('model-00002-of-00002.gguf · File 2 of 2');
+    expect(progressFileLine(started)).toBeNull();
+    expect(bytesOfTotal(512e6, 2e9)).toBe('512 MB / 2.0 GB');
+    // Powers of 1000, as the catalog states a size: 16,564,259,744 B is 16.6 GB, not 15.4.
+    expect(bytesOfTotal(16_564_259_744, 16_564_259_744)).toBe('16.6 / 16.6 GB');
   });
 });

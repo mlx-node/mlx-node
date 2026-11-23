@@ -1,7 +1,15 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { MODEL_CATALOG } from '../../agent/src/catalog.js';
-import { catalogBuildAt, hasUpdate, modelBlurb, offeredOnHost } from '../ui/src/lib/catalog.js';
+import {
+  catalogBuildAt,
+  hasUpdate,
+  modelBlurb,
+  modelPresent,
+  offeredOnHost,
+  onboardingBuild,
+  shownBuild,
+} from '../ui/src/lib/catalog.js';
 import type { CatalogBuildItem, CatalogItem } from '../ui/src/lib/types.js';
 
 describe('modelBlurb', () => {
@@ -103,5 +111,49 @@ describe('offeredOnHost', () => {
       expect(offeredOnHost(entry, host(96)), label).toBe(true);
       expect(offeredOnHost(entry, host(128)), label).toBe(true);
     }
+  });
+});
+
+describe('the build a card or a choice stands for', () => {
+  function build(id: string, slug: string, present = false): CatalogBuildItem {
+    return {
+      id,
+      hfRepo: 'org/model-GGUF',
+      sizeGb: 1,
+      source: 'GGUF',
+      slug,
+      installed: present,
+      present,
+      heldBy: null,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+      localAssetsRepo: null,
+      localAssetsRevision: null,
+    };
+  }
+  const entry = (builds: CatalogBuildItem[]): CatalogItem => ({ label: 'M', description: '', builds });
+  const plain = entry([build('XL', 'm'), build('K_M', 'm-k_m'), build('Original', 'orig')]);
+  const secondOnDisk = entry([build('XL', 'm'), build('K_M', 'm-k_m', true), build('Original', 'orig', true)]);
+
+  it('counts a model when any build is on disk', () => {
+    expect(modelPresent(plain)).toBe(false);
+    expect(modelPresent(secondOnDisk)).toBe(true);
+  });
+
+  it('Onboarding: the build with a job, else the first on disk, else the first', () => {
+    expect(onboardingBuild(secondOnDisk, ['orig']).slug).toBe('orig');
+    // Mutation: skip the on-disk step → `m` → red.
+    expect(onboardingBuild(secondOnDisk, []).slug).toBe('m-k_m');
+    expect(onboardingBuild(plain, ['elsewhere']).slug).toBe('m');
+  });
+
+  it('a card: the chosen build first, then the Onboarding rule', () => {
+    expect(shownBuild(secondOnDisk, { M: 'm' }, { orig: {} }).slug).toBe('m');
+    expect(shownBuild(secondOnDisk, {}, { orig: {} }).slug).toBe('orig');
+    expect(shownBuild(secondOnDisk, {}, {}).slug).toBe('m-k_m');
+    expect(shownBuild(plain, { Other: 'orig' }, {}).slug).toBe('m');
+    // A chosen folder the entry no longer has falls back to the rule.
+    expect(shownBuild(plain, { M: 'gone' }, {}).slug).toBe('m');
   });
 });

@@ -1,5 +1,3 @@
-import { catalogTargetForSlug } from '@mlx-node/agent/catalog';
-
 import {
   DownloadConflictError,
   DownloadsClosedError,
@@ -70,14 +68,13 @@ export function handleDownloadStart(ctx: MainApiContext, req: ApiRequest): unkno
     throw ApiError.badRequest('"adopt" and "replaceBlocker" cannot come together');
   }
   try {
-    const id = ctx.downloads.start(
+    const { id, repo } = ctx.downloads.start(
       slug,
       replaceBlocker !== undefined ? { replaceBlocker } : adopt !== undefined ? { adopt } : undefined,
     );
     // Accepted, not done: the route declares `successStatus: 202` so the HTTP
-    // adapter still answers 202 for a job that is only queued. `start` accepted
-    // the slug, so the catalog has its target.
-    return { id, slug, repo: catalogTargetForSlug(slug)!.repo };
+    // adapter still answers 202 for a job that is only queued.
+    return { id, slug, repo };
   } catch (err) {
     // The manager is draining for shutdown: the request is well-formed, the
     // server is simply going away, so answer 503 rather than blaming the caller.

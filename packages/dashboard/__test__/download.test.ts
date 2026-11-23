@@ -614,7 +614,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // With that sweep parked mid-flight, a real job resolves and installs NEW.
     hub.sha = SHA_NEW;
     const events: DownloadEvent[] = [];
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -664,7 +664,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // The job asks first, so its answer is the sha upstream held BEFORE it moved.
     hub.sha = SHA_OLD;
     const events: DownloadEvent[] = [];
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => jobAsked);
 
@@ -709,7 +709,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
 
     hub.sha = SHA_OLD;
     const events: DownloadEvent[] = [];
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => jobAsked);
 
@@ -806,7 +806,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
 
     hub.sha = SHA_NEW;
     const events: DownloadEvent[] = [];
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -827,7 +827,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'done'));
@@ -884,7 +884,7 @@ describe('DownloadManager', () => {
         return url.endsWith('/config.json') ? Promise.resolve(new Response(config)) : weightsFetch(input, init);
       },
     });
-    const id = manager.start(DRAFT_SLUG);
+    const id = manager.start(DRAFT_SLUG).id;
     await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
     expect(manager.jobs().find((job) => job.id === id)?.state).toBe(valid ? 'done' : 'error');
     const draftPath = join(modelsDir, 'qwen3.8-27b-dflash2');
@@ -939,7 +939,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The entry's list + both downloadFileToCacheDir calls all saw exactly one
@@ -970,7 +970,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(SLUG);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
       expect(events.some((event) => event.type === 'done')).toBe(false);
@@ -986,7 +986,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(SLUG);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
       expect(existsSync(finalDir())).toBe(false);
@@ -1000,7 +1000,7 @@ describe('DownloadManager', () => {
         cacheDir,
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
-      const id = manager.start(SLUG);
+      const id = manager.start(SLUG).id;
       await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
       const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
         revision: string;
@@ -1017,7 +1017,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -1063,7 +1063,7 @@ describe('DownloadManager', () => {
         'tokenizer.json': 20,
       }),
     });
-    const id = manager.start(catalogBuildSlug(build));
+    const id = manager.start(catalogBuildSlug(build)).id;
     await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
     expect(manager.jobs().find((job) => job.id === id)?.state).toBe('done');
     expect([...hub.downloadedFrom].sort()).toEqual(
@@ -1080,7 +1080,7 @@ describe('DownloadManager', () => {
     hub.manifest = [];
     const manager = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({}) });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -1106,7 +1106,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -1128,7 +1128,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'model.safetensors': 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(DRAFT_SLUG);
+    const id = manager.start(DRAFT_SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -1188,7 +1188,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'error'));
     expect(hub.downloaded).toContain('config.json');
@@ -1196,7 +1196,7 @@ describe('DownloadManager', () => {
     // Second job: the weight succeeds; config.json is served from the HF cache.
     hub.failOn = [];
     hub.downloaded = [];
-    const id2 = manager.start(SLUG);
+    const id2 = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id2 && j.state === 'done'));
 
     // config.json was a cache hit (no re-fetch); only the weight was fetched.
@@ -1231,7 +1231,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, [MTP]: 33, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -1294,7 +1294,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -1332,7 +1332,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -1355,7 +1355,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
 
@@ -1388,7 +1388,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'mmproj-BF16.gguf': 44, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG_OTHER);
+    const id = manager.start(SLUG_OTHER).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
 
@@ -1416,7 +1416,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1429,7 +1429,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1461,7 +1461,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1475,7 +1475,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     raceHook.onMarkerWrite = () => second.cancel(id2);
     await waitFor(() => events2.some((event) => event.type === 'cancelled' || event.type === 'done'));
@@ -1508,7 +1508,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1526,7 +1526,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1553,7 +1553,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(true);
@@ -1568,7 +1568,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1622,7 +1622,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -1674,7 +1674,7 @@ describe('DownloadManager', () => {
         cacheDir,
         fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
       });
-      const idOne = first.start(SLUG);
+      const idOne = first.start(SLUG).id;
       const eventsOne: DownloadEvent[] = [];
       first.subscribe(idOne, (event) => eventsOne.push(event));
       await waitFor(() => eventsOne.some((event) => event.type === 'done'));
@@ -1690,7 +1690,7 @@ describe('DownloadManager', () => {
           cacheDir,
           fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
         });
-        const idTwo = second.start(SLUG);
+        const idTwo = second.start(SLUG).id;
         const eventsTwo: DownloadEvent[] = [];
         second.subscribe(idTwo, (event) => eventsTwo.push(event));
         await waitFor(() => eventsTwo.some((event) => event.type === 'error' || event.type === 'done'));
@@ -1730,7 +1730,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
@@ -1741,7 +1741,7 @@ describe('DownloadManager', () => {
     hub.downloaded = [];
     const second = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({ [WEIGHT]: 300 }) });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'error' || event.type === 'done'));
 
@@ -1773,7 +1773,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const first: DownloadEvent[] = [];
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => first.push(event));
     await waitFor(() => first.some((event) => event.type === 'done'));
     expect([...hub.downloaded].sort()).toEqual([WEIGHT, 'config.json', 'tokenizer.json'].sort());
@@ -1787,7 +1787,7 @@ describe('DownloadManager', () => {
     hub.downloadedFrom = [];
 
     const second: DownloadEvent[] = [];
-    const id2 = manager.start(SLUG);
+    const id2 = manager.start(SLUG).id;
     manager.subscribe(id2, (event) => second.push(event));
     await waitFor(() => second.some((event) => event.type === 'done'));
 
@@ -1816,7 +1816,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(SLUG);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(readFileSync(join(finalDir(), 'tokenizer.json')).length).toBe(20);
@@ -1835,7 +1835,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 30 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(SLUG);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1861,7 +1861,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // Idempotent: nothing re-fetched, the existing install untouched.
@@ -1891,7 +1891,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     expect(hub.downloaded).toEqual(expect.arrayContaining(['config.json', WEIGHT]));
@@ -1922,7 +1922,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // It genuinely downloaded the resolved revision (never falsely reported done)…
@@ -1957,7 +1957,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The corrupt cache entry failed sha256 → was invalidated → really re-fetched →
@@ -2000,7 +2000,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     expect(hub.downloaded, 'a same-length corrupt Xet blob was accepted without a re-fetch').toContain(WEIGHT);
@@ -2020,7 +2020,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // Wrong git-blob oid → invalidated → re-fetched → matched.
@@ -2049,7 +2049,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2079,7 +2079,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2105,7 +2105,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2146,7 +2146,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2173,7 +2173,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2213,7 +2213,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2264,7 +2264,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2300,7 +2300,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2329,7 +2329,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2356,14 +2356,14 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     let idDuringCancel: string | undefined;
     stagingHook.onVerifyWindow = () => {
       manager.cancel(id1);
       // SYNCHRONOUSLY inside the window — no await, so `processJob` has not yet
       // reached its catch and the job still reads `running`.
-      idDuringCancel = manager.start(SLUG);
+      idDuringCancel = manager.start(SLUG).id;
     };
     await waitFor(() => events1.some((event) => event.type === 'cancelled'));
     expect(idDuringCancel).not.toBe(id1);
@@ -2386,7 +2386,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2411,7 +2411,7 @@ describe('DownloadManager', () => {
     });
     const id = manager.start(SLUG, {
       replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 12, truncated: false },
-    });
+    }).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The freshly downloaded (zero-byte) content replaced the manual directory.
@@ -2447,7 +2447,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2481,7 +2481,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The sweep renamed the backup back into place; the restored (0xAB) content is
@@ -2523,7 +2523,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2560,7 +2560,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The leaked backup was removed; the existing install is untouched.
@@ -2584,7 +2584,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The live-owner backup was NEVER restored/reaped: it survives intact…
@@ -2615,7 +2615,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && (j.state === 'done' || j.state === 'error')));
 
     // Both unparseable backups survive byte-for-byte in `.staging` (not renamed away).
@@ -2652,7 +2652,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The unparseable backups were neither reaped nor promoted: both survive intact.
@@ -2699,7 +2699,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2723,7 +2723,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The published set is exactly the manifest — no stale orphan.
@@ -2756,7 +2756,7 @@ describe('DownloadManager', () => {
         'Qwen3.8-27B-UD-Q4_K_XL-00002-of-00002.gguf': 100,
       }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The stale single-file weight never enters the new sharded install.
@@ -2773,7 +2773,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     const replayed: DownloadEvent[] = [];
@@ -2810,7 +2810,7 @@ describe('DownloadManager', () => {
       ),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // Park on the third file, 1 MiB in: files 1-2 settled (1 + 2 MiB), so the
     // job has 4 MiB of its 7 MiB.
@@ -2880,7 +2880,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2908,7 +2908,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The dead-pid tree was reaped; the live-pid tree was left intact.
@@ -2943,7 +2943,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2988,7 +2988,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -3032,10 +3032,10 @@ describe('DownloadManager', () => {
         blocked = true;
       }),
     });
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
-    expect(manager.start(SLUG)).toBe(id1);
+    expect(manager.start(SLUG).id).toBe(id1);
     expect(manager.jobs().filter((job) => job.repo === REPO)).toHaveLength(1);
 
     // The id the UI tracks is the only running job, so Cancel really stops it.
@@ -3057,12 +3057,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Occupy the single-threaded drain with a different repo's job.
-    const idOther = manager.start(SLUG_OTHER);
+    const idOther = manager.start(SLUG_OTHER).id;
     await waitFor(() => blocked);
 
-    const queued = manager.start(SLUG);
+    const queued = manager.start(SLUG).id;
     expect(queued).not.toBe(idOther);
-    expect(manager.start(SLUG)).toBe(queued);
+    expect(manager.start(SLUG).id).toBe(queued);
     expect(manager.jobs()).toHaveLength(2);
 
     expect(manager.cancel(queued)).toBe(true);
@@ -3081,12 +3081,12 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'error'));
 
     hub.failOn = [];
-    const id2 = manager.start(SLUG);
+    const id2 = manager.start(SLUG).id;
     expect(id2).not.toBe(id1);
     await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
@@ -3101,7 +3101,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     stagingHook.onVerifyWindow = () => {
       manager.cancel(id1);
@@ -3109,7 +3109,7 @@ describe('DownloadManager', () => {
     await waitFor(() => events1.some((event) => event.type === 'cancelled'));
     await waitFor(() => jobStagingDirs().length === 0);
 
-    const id2 = manager.start(SLUG);
+    const id2 = manager.start(SLUG).id;
     expect(id2).not.toBe(id1);
     await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
@@ -3134,7 +3134,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(SLUG);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -3166,7 +3166,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     // config.json completes and caches; the weight fetch blocks (in flight).
@@ -3217,12 +3217,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Job 1 occupies the single-threaded drain (its weight fetch blocks).
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
     // behind it and is cancelled before it can run.
-    const id2 = manager.start(SLUG_OTHER);
+    const id2 = manager.start(SLUG_OTHER).id;
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
     expect(manager.cancel(id2)).toBe(true);
@@ -3248,7 +3248,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // Fire the cancel the instant the runner enters the prune/verify window (the
     // recursive readdir of staging) — after every file has been fetched, before
@@ -3280,7 +3280,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // The marker is written inside `publish`, AFTER the barrier set state to
     // `committing`; a cancel here must be refused (returns false).
@@ -3311,7 +3311,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'error'));
 
@@ -3337,7 +3337,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     let dismissWhileCommitting: boolean | null = null;
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     // The marker is written inside `publish`, AFTER the barrier set state to
     // `committing`; a dismiss here must be refused (returns false) and the job
     // must remain listed and install to completion.
@@ -3368,7 +3368,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -3403,7 +3403,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     // config.json caches; the weight fetch blocks (in flight) with a staging dir on disk.
@@ -3434,12 +3434,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Job 1 occupies the single-threaded drain (its weight fetch blocks in flight).
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
     // behind it (drain is busy) and has not started.
-    const id2 = manager.start(SLUG_OTHER);
+    const id2 = manager.start(SLUG_OTHER).id;
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
 
@@ -3469,7 +3469,7 @@ describe('DownloadManager', () => {
         blocked = true;
       }),
     });
-    const id1 = manager.start(SLUG);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // `shutdown` flips the manager closed before its first await, so the refusal
@@ -3499,7 +3499,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -3567,7 +3567,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     expect(slugItem().blocker).toMatchObject(ONE_FILE);
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe('');
     expect(events.some((e) => e.type === 'done')).toBe(true);
     expect(existsSync(join(finalDir(), LEFTOVER))).toBe(false);
@@ -3587,7 +3587,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
         queueMicrotask(cancel);
       }),
     );
-    const id = m.start(SLUG, { replaceBlocker: ONE_FILE });
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
     cancel = () => void m.cancel(id);
     const events = await settled(m, id);
     expect(duringDownload).toBe(true);
@@ -3600,7 +3600,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     hub.failOn = [WEIGHT];
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
     expect(leftoverIntact()).toBe(true);
     // The error frame is emitted before the job's `finally` removes its staging tree.
@@ -3691,7 +3691,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       writeFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
     };
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe(
       `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it. Nothing was removed.`,
     );
@@ -3747,7 +3747,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
   it('refuses at job start when the entry changed after the request', async () => {
     plantLeftover();
     const m = manager();
-    const id = m.start(SLUG, { replaceBlocker: ONE_FILE });
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
     writeFileSync(join(finalDir(), 'added.txt'), 'x');
     const events = await settled(m, id);
     expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
@@ -3759,7 +3759,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     stagingHook.onVerifyWindow = () => writeFileSync(join(finalDir(), 'added.txt'), 'x');
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
     expect(leftoverIntact()).toBe(true);
     expect(readFileSync(join(finalDir(), 'added.txt'), 'utf-8')).toBe('x');
@@ -3770,7 +3770,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     raceHook.onMarkerWrite = () => writeFileSync(join(finalDir(), 'late.txt'), 'x');
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
     expect(leftoverIntact()).toBe(true);
     expect(readFileSync(join(finalDir(), 'late.txt'), 'utf-8')).toBe('x');
@@ -3783,7 +3783,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
     };
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toContain('holds a model that the app did not create');
     expect(errorOf(events).endsWith('Nothing was removed.')).toBe(true);
     expect(leftoverIntact()).toBe(true);
@@ -3794,7 +3794,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     stagingHook.onVerifyWindow = () => rmSync(finalDir(), { recursive: true, force: true });
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe('');
     expect(isModelInstalled(finalDir())).toBe(true);
   });
@@ -3804,7 +3804,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     const blocker = slugItem().blocker!;
     expect(blocker).toMatchObject({ kind: 'symlink', dangling: true, fileCount: 0, sizeBytes: 0 });
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
     expect(errorOf(events)).toBe('');
     expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
     expect(isModelInstalled(finalDir())).toBe(true);
@@ -3818,7 +3818,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     const blocker = slugItem().blocker!;
     expect(blocker).toMatchObject({ kind: 'symlink', dangling: false, fileCount: 0, sizeBytes: 0 });
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
     expect(errorOf(events)).toBe('');
     expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
     expect(lstatSync(finalDir()).isDirectory()).toBe(true);
@@ -3830,7 +3830,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     const m = manager();
     const events = await settled(
       m,
-      m.start(SLUG, { replaceBlocker: { kind: 'file', fileCount: 1, sizeBytes: 40, truncated: false } }),
+      m.start(SLUG, { replaceBlocker: { kind: 'file', fileCount: 1, sizeBytes: 40, truncated: false } }).id,
     );
     expect(errorOf(events)).toBe('');
     expect(lstatSync(finalDir()).isDirectory()).toBe(true);
@@ -3841,7 +3841,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     const m = manager();
     const events = await settled(
       m,
-      m.start(SLUG, { replaceBlocker: { kind: 'directory', fileCount: 0, sizeBytes: 0, truncated: false } }),
+      m.start(SLUG, { replaceBlocker: { kind: 'directory', fileCount: 0, sizeBytes: 0, truncated: false } }).id,
     );
     expect(errorOf(events)).toBe('');
     expect(isModelInstalled(finalDir())).toBe(true);
@@ -3851,7 +3851,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     plantLeftover();
     renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
     const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
     expect(leftoverIntact()).toBe(true);
     expect(readdirSync(finalDir())).toEqual([LEFTOVER]);
@@ -3864,7 +3864,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
     renameFault.alsoFailFromPrefix = join(stagingRoot(), `${SLUG}.reinstall-`);
     const m = manager();
-    const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE })));
+    const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id));
     const [backup] = reinstallDirs();
     expect(message).toBe(
       `The install failed and "${SLUG}" could not be put back. It is now at "${join(stagingRoot(), backup!)}".`,
@@ -3875,7 +3875,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
   it('refuses a Reinstall while a plain job holds the repo, and hands back a running Reinstall', async () => {
     const block = makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {});
     const plain = manager(block);
-    const plainId = plain.start(SLUG);
+    const plainId = plain.start(SLUG).id;
     plantLeftover();
     expect(() => plain.start(SLUG, { replaceBlocker: ONE_FILE })).toThrow(
       'A download of this model is already in the queue. Cancel it, then use Reinstall.',
@@ -3884,8 +3884,8 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     await settled(plain, plainId);
 
     const m = manager(block);
-    const id = m.start(SLUG, { replaceBlocker: ONE_FILE });
-    expect(m.start(SLUG, { replaceBlocker: ONE_FILE })).toBe(id);
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    expect(m.start(SLUG, { replaceBlocker: ONE_FILE }).id).toBe(id);
     m.cancel(id);
     await settled(m, id);
     expect(leftoverIntact()).toBe(true);
@@ -3905,7 +3905,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     ).toThrow(DownloadConflictError);
     const events = await settled(
       m,
-      m.start(SLUG, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 99, truncated: true } }),
+      m.start(SLUG, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 99, truncated: true } }).id,
     );
     expect(errorOf(events)).toBe('');
     expect(isModelInstalled(finalDir())).toBe(true);
@@ -3920,7 +3920,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
         writeFileSync(join(finalDir(), 'model.safetensors'), 'arrived');
       };
       const m = manager();
-      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
       expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
       expect(readFileSync(join(finalDir(), 'model.safetensors'), 'utf-8')).toBe('arrived');
       expect(leftoverIntact()).toBe(true);
@@ -3937,7 +3937,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
         plantLeftover();
       };
       const m = manager();
-      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }));
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
       expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
       expect(leftoverIntact()).toBe(true);
       expect(readdirSync(original)).toEqual([LEFTOVER]);
@@ -3953,7 +3953,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
         writeFileSync(join(finalDir(), 'other.txt'), 'other');
       };
       const m = manager();
-      const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE })));
+      const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id));
       const kept = readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`));
       expect(kept).toHaveLength(1);
       const keptDir = join(stagingRoot(), kept[0]!);
@@ -3967,7 +3967,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       // No sweep removes a kept entry, even once a model is installed at the slug.
       rmSync(finalDir(), { recursive: true });
       const next = manager();
-      expect(errorOf(await settled(next, next.start(SLUG)))).toBe('');
+      expect(errorOf(await settled(next, next.start(SLUG).id))).toBe('');
       expect(isModelInstalled(finalDir())).toBe(true);
       expect(readdirSync(keptDir).sort()).toEqual([LEFTOVER, 'late.safetensors']);
     });
@@ -4001,9 +4001,9 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
 
     it('puts the old entry back before a job for the slug runs, and refuses the plain install', async () => {
       const m = manager();
-      await settled(m, m.start(SLUG_OTHER));
+      await settled(m, m.start(SLUG_OTHER).id);
       const backup = crashedAfterFirstRename();
-      const events = await settled(m, m.start(SLUG));
+      const events = await settled(m, m.start(SLUG).id);
       expect(errorOf(events)).toContain('Refusing to install over');
       expect(existsSync(backup)).toBe(false);
       expect(leftoverIntact()).toBe(true);
@@ -4012,7 +4012,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
 
     it('removes the backup once the new model is in place', async () => {
       const m = manager();
-      expect(errorOf(await settled(m, m.start(SLUG)))).toBe('');
+      expect(errorOf(await settled(m, m.start(SLUG).id))).toBe('');
       expect(isModelInstalled(finalDir())).toBe(true);
       const backup = reinstallBackup();
       mkdirSync(join(backup, 'sub'), { recursive: true });
@@ -4024,12 +4024,12 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
 
     it('never removes a backup that holds model files, or one whose path something else took', async () => {
       const m = manager();
-      expect(errorOf(await settled(m, m.start(SLUG)))).toBe('');
+      expect(errorOf(await settled(m, m.start(SLUG).id))).toBe('');
       const heldBackup = reinstallBackup();
       mkdirSync(heldBackup, { recursive: true });
       writeFileSync(join(heldBackup, 'model.safetensors'), 'arrived');
       const again = manager();
-      await settled(again, again.start(SLUG));
+      await settled(again, again.start(SLUG).id);
       expect(readFileSync(join(heldBackup, 'model.safetensors'), 'utf-8')).toBe('arrived');
 
       rmSync(finalDir(), { recursive: true });
@@ -4039,7 +4039,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       mkdirSync(foreignBackup);
       writeFileSync(join(foreignBackup, LEFTOVER), 'old');
       const third = manager();
-      await settled(third, third.start(SLUG));
+      await settled(third, third.start(SLUG).id);
       expect(readFileSync(join(foreignBackup, LEFTOVER), 'utf-8')).toBe('old');
       expect(readdirSync(finalDir())).toEqual(['someone-else.txt']);
     });
@@ -4047,7 +4047,7 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     it('leaves the backup of a live owner alone', async () => {
       const backup = crashedAfterFirstRename(process.pid);
       const m = manager();
-      await settled(m, m.start(SLUG));
+      await settled(m, m.start(SLUG).id);
       expect(readFileSync(join(backup, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
       expect(existsSync(finalDir())).toBe(true);
     });
@@ -4210,7 +4210,7 @@ describe('owned update of a folder that Update adopted', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(SLUG);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
     await manager.shutdown();
@@ -4672,7 +4672,7 @@ describe('Update: plan for a folder the app did not create', () => {
     };
     const m = manager({ fetchImpl, probeTimeoutMs: 200 });
     const events: DownloadEvent[] = [];
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'progress' && event.file === WEIGHT));
     const received = m.jobs().find((job) => job.id === id)!.receivedBytes;
@@ -4701,7 +4701,7 @@ describe('Update: plan for a folder the app did not create', () => {
   it('answers 409 while a job holds the repo', async () => {
     flashFolder();
     const m = manager({ fetchImpl: makeStallingFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, 100) });
-    const running = m.start(SLUG);
+    const running = m.start(SLUG).id;
     const events: DownloadEvent[] = [];
     m.subscribe(running, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'progress'));
@@ -4919,7 +4919,7 @@ describe('Update: adopt a folder the app did not create, in place', () => {
   ): Promise<{ id: string; events: DownloadEvent[]; last: DownloadEvent }> {
     const plan = await m.planAdoption(FLASH_SLUG);
     opts.between?.();
-    const id = m.start(FLASH_SLUG, { adopt: plan.token });
+    const id = m.start(FLASH_SLUG, { adopt: plan.token }).id;
     const events: DownloadEvent[] = [];
     m.subscribe(id, (event) => {
       events.push(event);
@@ -5074,7 +5074,7 @@ describe('Update: adopt a folder the app did not create, in place', () => {
     expect(m.jobs()).toEqual([]);
     expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
 
-    const id = m.start(FLASH_SLUG, { adopt: second.token });
+    const id = m.start(FLASH_SLUG, { adopt: second.token }).id;
     const events: DownloadEvent[] = [];
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
@@ -5523,8 +5523,8 @@ describe('Update: adopt a folder the app did not create, in place', () => {
     const before = filesOf(dir);
     const m = manager((path, init) => (path === 'tokenizer.json' ? waitForAbort(init) : undefined));
     const plan = await m.planAdoption(FLASH_SLUG);
-    const id = m.start(FLASH_SLUG, { adopt: plan.token });
-    expect(m.start(FLASH_SLUG, { adopt: plan.token })).toBe(id);
+    const id = m.start(FLASH_SLUG, { adopt: plan.token }).id;
+    expect(m.start(FLASH_SLUG, { adopt: plan.token }).id).toBe(id);
     expect(() =>
       m.start(FLASH_SLUG, { replaceBlocker: { kind: 'directory', fileCount: 6, sizeBytes: 1, truncated: false } }),
     ).toThrow('A download of this model is already in the queue. Cancel it, then use Reinstall.');
@@ -5534,7 +5534,7 @@ describe('Update: adopt a folder the app did not create, in place', () => {
 
     const other = manager();
     const second = await other.planAdoption(FLASH_SLUG);
-    const plain = other.start(FLASH_SLUG);
+    const plain = other.start(FLASH_SLUG).id;
     expect(() => other.start(FLASH_SLUG, { adopt: second.token })).toThrow(
       'A download of this model is already in the queue. Cancel it, then use Update.',
     );
@@ -5553,7 +5553,7 @@ describe('Update: adopt a folder the app did not create, in place', () => {
     writeFileSync(join(dir, 'notes.txt'), 'mine');
     hub.sha = SHA_NEW;
 
-    const id = m.start(FLASH_SLUG);
+    const id = m.start(FLASH_SLUG).id;
     const events: DownloadEvent[] = [];
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
@@ -5635,7 +5635,7 @@ describe('a models directory that is a link to a missing disk', () => {
 
     // The disk is back: the same Install runs to the end into the link target.
     mkdirSync(target, { recursive: true });
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     const events: DownloadEvent[] = [];
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
@@ -5663,8 +5663,8 @@ describe('a models directory that is a link to a missing disk', () => {
       return inner(input, init);
     };
     const m = new DownloadManager({ modelsDir: link, cacheDir, fetchImpl: gated });
-    const first = m.start(SLUG);
-    const second = m.start(SLUG_OTHER);
+    const first = m.start(SLUG).id;
+    const second = m.start(SLUG_OTHER).id;
     const events: DownloadEvent[] = [];
     m.subscribe(first, (event) => events.push(event));
     m.subscribe(second, (event) => events.push(event));
@@ -5733,11 +5733,11 @@ describe('two builds of one repository: one folder, one job, one marker each', (
   it('downloads both builds at the same time into two folders, as two jobs', async () => {
     expect(SLUG_M).toBe('qwen3.8-27b-gguf-ud-q4_k_m');
     const m = manager();
-    const first = m.start(SLUG);
+    const first = m.start(SLUG).id;
     // Asked while the first job is in the queue: its own job, not the first one's id.
-    const second = m.start(SLUG_M);
+    const second = m.start(SLUG_M).id;
     expect(second).not.toBe(first);
-    expect(m.start(SLUG_M)).toBe(second);
+    expect(m.start(SLUG_M).id).toBe(second);
     await waitFor(() => m.jobs().every((job) => job.state === 'done' || job.state === 'error'));
     expect(m.jobs().map((job) => [job.id, job.slug, job.repo, job.state])).toEqual([
       [first, SLUG, REPO, 'done'],
@@ -5766,7 +5766,7 @@ describe('two builds of one repository: one folder, one job, one marker each', (
         blocked = true;
       }),
     );
-    const first = m.start(SLUG);
+    const first = m.start(SLUG).id;
     await waitFor(() => blocked);
     const res = await post(m, '/api/downloads', { slug: SLUG_M });
     expect(res.status).toBe(202);
@@ -5795,7 +5795,7 @@ describe('two builds of one repository: one folder, one job, one marker each', (
     );
     expect(isModelInstalled(finalDir())).toBe(true);
     const m = manager();
-    const id = m.start(SLUG);
+    const id = m.start(SLUG).id;
     await waitFor(() => m.jobs().some((job) => job.id === id && (job.state === 'done' || job.state === 'error')));
     expect(m.jobs().find((job) => job.id === id)?.state).toBe('done');
     expect(hub.downloaded).toContain(WEIGHT);

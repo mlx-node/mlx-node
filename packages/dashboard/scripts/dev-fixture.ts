@@ -2218,6 +2218,37 @@ function writeCatalogInstall(home: string, now: number): void {
 }
 
 /**
+ * The second build of the same catalog model (Qwen3.8-27B UD-Q4_K_M) in its own folder, installed by the app at the
+ * build's current tokenizer source: it reads as installed with no update, so the card's switch marks two builds.
+ */
+export const CATALOG_SECOND_BUILD = {
+  repo: 'unsloth/Qwen3.8-27B-GGUF',
+  slug: 'qwen3.8-27b-gguf-ud-q4_k_m',
+  build: 'UD-Q4_K_M',
+  file: 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+  sizeGb: 15.4,
+  assetsRepo: 'Qwen/Qwen3.8-27B',
+} as const;
+
+function writeCatalogSecondBuild(home: string, now: number): void {
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_SECOND_BUILD.slug);
+  mkdirSync(dir, { recursive: true });
+  writeJson(join(dir, 'config.json'), { model_type: 'qwen3_5', max_position_embeddings: 262144 });
+  const weights = join(dir, CATALOG_SECOND_BUILD.file);
+  writeFileSync(weights, '');
+  truncateSync(weights, Math.round(CATALOG_SECOND_BUILD.sizeGb * GIB));
+  writeJson(join(dir, '.mlx-download-complete.json'), {
+    repo: CATALOG_SECOND_BUILD.repo,
+    revision: '5d1c0e2a9b7f4c3d2e1f0a9b8c7d6e5f4a3b2c1d',
+    completedAt: new Date(now - 2 * DAY_MS).toISOString(),
+    files: ['config.json', CATALOG_SECOND_BUILD.file],
+    scope: 'full',
+    assetsRepo: CATALOG_SECOND_BUILD.assetsRepo,
+    assetsRevision: '8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5',
+  });
+}
+
+/**
  * A catalog slug held by a leftover the app did not create (one companion file, no config.json): the card shows
  * "Needs cleanup" with Reinstall.
  */
@@ -2291,6 +2322,7 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   const sessions = writeSessions(home, random, now);
   writeAgentWork(home, random, now, process.pid);
   writeCatalogInstall(home, now);
+  writeCatalogSecondBuild(home, now);
   writeCatalogBlocked(home);
   writeCatalogUpdate(home);
   writeCodingAgents(home);

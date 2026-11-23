@@ -199,12 +199,15 @@ function modelsRoutes(): Record<string, unknown> {
     dir: '/models',
     host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
-  // Three visible entries, matching the served catalog — one of them the default.
+  // As served below 96 GiB: two chat entries, one of them the default, and a System One entry in its own section.
   const catalog: CatalogResponse = {
     items: [
       catalogItem('Qwen3.8-27B', 'Best tool use — recommended default', 'unsloth/Qwen3.8-27B-GGUF', 17.7, true),
       catalogItem('Inkling-2-Mini', 'Vision MoE, fast decode', 'unsloth/Inkling-2-Mini-GGUF', 18.7),
-      catalogItem('Clairic Flash (9B)', 'Structured extraction', 'Brooooooklyn/Clairic-Flash-GGUF', 7.6),
+      {
+        ...catalogItem('Clairic Flash (9B)', 'Structured extraction', 'Brooooooklyn/Clairic-Flash-GGUF', 7.6),
+        category: 'systemone',
+      },
     ],
   };
   const downloads: DownloadsResponse = { jobs: [] };
@@ -244,7 +247,7 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
       text.includes('Clairic Flash (9B)'),
     );
     expect(loading.skeletons).toBeGreaterThan(0);
-    expect(loaded.catalogCards).toBe(3);
+    expect(loaded.catalogCards).toBe(2);
     expect(loading.catalogCards).toBe(loaded.catalogCards);
   });
 });

@@ -260,6 +260,14 @@ load-free context estimates (`startContextEstimates` in
 falls through to the qwen3_5 estimator, which throws on its model type and
 drops the `--max-context` window the host seeded.
 
+**Catalog entry (+1).** A model the wizard, Models and Onboarding offer is an
+entry of `MODEL_CATALOG` (`packages/agent/src/catalog.ts`) with one or more
+`builds`: each names its repo, globs, `assetsRepo`, size and source, and
+`builds[0]` is the build every surface chooses first. Each build installs to
+its own folder (`catalogBuildSlug`); a second build of a repo that another
+build already installs sets `folderSuffix`. The catalog test pins every folder
+as a literal.
+
 **Memory floor (+1).** A catalog entry that should not be offered below some
 RAM sets `minMemoryGb` (`packages/agent/src/catalog.ts`); the wizard, Models
 and Onboarding hide it below that. The value is never lower than the RAM at

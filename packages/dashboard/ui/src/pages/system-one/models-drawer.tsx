@@ -8,7 +8,7 @@ import { EmptyState } from '../../components/arc/empty-state/empty-state';
 import type { CatalogItem, CatalogResponse, CatalogUpdatesResponse, ModelsResponse } from '../../lib/types';
 import type { AsyncState } from '../../lib/use-api';
 import { PageSection } from '../../shell/page';
-import { CatalogCard, CatalogCardPlaceholder, CatalogGrid } from '../models/catalog';
+import { CatalogCardPlaceholder, CatalogEntryCard, CatalogGrid, useChosenBuilds } from '../models/catalog';
 import type { ModelDownloads } from '../models/use-model-downloads';
 
 export function isSystemOneCatalogItem(item: CatalogItem): boolean {
@@ -26,7 +26,7 @@ export interface SystemOneModelsDrawerProps {
   downloads: ModelDownloads;
 }
 
-/** Drawer reusing the exact `Models` CatalogCard + download progress flow for System One models. */
+/** Drawer reusing the exact `Models` CatalogEntryCard + download progress flow for System One models. */
 export function SystemOneModelsDrawer({
   open,
   onOpenChange,
@@ -37,6 +37,7 @@ export function SystemOneModelsDrawer({
   const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
   const localModels = models.data?.models ?? [];
   const host = models.data?.host;
+  const { chosen, choose } = useChosenBuilds();
 
   return (
     <Drawer open={open} onOpenChange={onOpenChange}>
@@ -59,10 +60,10 @@ export function SystemOneModelsDrawer({
 
           {catalog.data === undefined ? (
             catalog.error !== undefined ? null : (
-              <div className="grid gap-3">
+              <CatalogGrid>
                 <CatalogCardPlaceholder />
                 <CatalogCardPlaceholder />
-              </div>
+              </CatalogGrid>
             )
           ) : items.length === 0 ? (
             <EmptyState
@@ -75,26 +76,19 @@ export function SystemOneModelsDrawer({
               }
             />
           ) : (
-            <div className="grid gap-3">
-              {items.map((item) => {
-                const build = item.builds[0];
-                const props = downloads.downloadProps(build);
-                return (
-                  <CatalogCard
-                    key={item.label}
-                    {...props}
-                    entry={item}
-                    item={build}
-                    host={host}
-                    detailsTo={
-                      localModels.some((model) => model.name === build.slug)
-                        ? `/models?focus=${encodeURIComponent(build.slug)}`
-                        : undefined
-                    }
-                  />
-                );
-              })}
-            </div>
+            <CatalogGrid>
+              {items.map((item) => (
+                <CatalogEntryCard
+                  key={item.label}
+                  item={item}
+                  downloads={downloads}
+                  host={host}
+                  localModels={localModels}
+                  chosen={chosen}
+                  choose={choose}
+                />
+              ))}
+            </CatalogGrid>
           )}
         </div>
       </DrawerContent>
@@ -114,6 +108,7 @@ export function NoSystemOneModelsCard({
 }): ReactElement {
   const items = (catalog.data?.items ?? []).filter((item) => !item.hidden && isSystemOneCatalogItem(item));
   const host = models.data?.host;
+  const { chosen, choose } = useChosenBuilds();
 
   return (
     <PageSection
@@ -127,11 +122,17 @@ export function NoSystemOneModelsCard({
         </CatalogGrid>
       ) : items.length > 0 ? (
         <CatalogGrid>
-          {items.map((item) => {
-            const build = item.builds[0];
-            const props = downloads.downloadProps(build);
-            return <CatalogCard key={item.label} {...props} entry={item} item={build} host={host} />;
-          })}
+          {items.map((item) => (
+            <CatalogEntryCard
+              key={item.label}
+              item={item}
+              downloads={downloads}
+              host={host}
+              localModels={models.data?.models ?? []}
+              chosen={chosen}
+              choose={choose}
+            />
+          ))}
         </CatalogGrid>
       ) : (
         <EmptyState

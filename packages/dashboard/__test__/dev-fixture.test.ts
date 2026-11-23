@@ -24,6 +24,7 @@ import {
   assertFixtureHome,
   CATALOG_BLOCKED,
   CATALOG_INSTALL,
+  CATALOG_SECOND_BUILD,
   CATALOG_UPDATE,
   fixtureArgs,
   fixturePaths,
@@ -270,11 +271,11 @@ describe('dev fixture home', () => {
     expect(read(now, { ...flight, chatModels: [] }).turns).toEqual([]);
   });
 
-  it('holds eight models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
+  it('holds nine models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
     writeFixtureHome(home, { now });
     const paths = fixturePaths(home);
     const models = discoverLocalModels(paths.modelsDir);
-    expect(models.models).toHaveLength(8);
+    expect(models.models).toHaveLength(9);
     expect(models.companions).toHaveLength(2);
     expect([...models.warnings].sort()).toEqual(
       [
@@ -353,8 +354,18 @@ describe('dev fixture content for the manage pages', () => {
     // The marker predates the build's tokenizer source, which the page reads as an update.
     expect(first?.assetsRepo).toBeDefined();
     expect(first?.localAssetsRepo).toBeNull();
-    // The other build of the repository is not on disk.
-    expect(second).toMatchObject({ present: false, installed: false, heldBy: null, blocker: null });
+    // The other build of the repository is in its own folder, at its build's tokenizer source: no update.
+    expect(second).toMatchObject({
+      slug: CATALOG_SECOND_BUILD.slug,
+      id: CATALOG_SECOND_BUILD.build,
+      present: true,
+      installed: true,
+      heldBy: null,
+      blocker: null,
+      localAssetsRepo: CATALOG_SECOND_BUILD.assetsRepo,
+    });
+    expect(second?.assetsRepo).toBe(second?.localAssetsRepo);
+    expect(second?.localAssetsRevision).not.toBeNull();
   });
 
   it('writes a long session with subagents and a live session whose last turn is still running', () => {

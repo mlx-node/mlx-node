@@ -10,7 +10,13 @@
 
 import { join } from 'node:path';
 
-import { type CatalogBuild, catalogBuildRepo, catalogBuildSlug, visibleCatalog } from '@mlx-node/agent';
+import {
+  type CatalogBuild,
+  type CatalogEntry,
+  catalogBuildRepo,
+  catalogBuildSlug,
+  visibleCatalog,
+} from '@mlx-node/agent';
 
 export interface WizardIO {
   select: (opts: { message: string; choices: Array<{ name: string; value: string }> }) => Promise<string>;
@@ -24,6 +30,8 @@ export interface WizardDeps {
   download: (argv: string[]) => Promise<unknown>;
   /** Resolved models dir: the download lands in `<modelsDir>/<build folder>`, the dir `mlx agent` re-scans. */
   modelsDir: string;
+  /** Physical RAM in bytes: the models offered are `visibleCatalog(totalMemBytes)`. */
+  totalMemBytes: number;
 }
 
 /**
@@ -74,14 +82,39 @@ function shellQuote(arg: string): string {
   return `'${arg.replaceAll("'", String.raw`'\''`)}'`;
 }
 
+/** One line of the build question: `UD-Q4_K_M (~16.6 GB) — Unsloth GGUF · 1.1 GB smaller`. */
+function buildChoiceName(build: CatalogBuild): string {
+  const facts = build.note === undefined ? build.source : `${build.source} · ${build.note}`;
+  return `${build.id} (~${build.sizeGb} GB) — ${facts}`;
+}
+
 /**
- * Offer the catalog (default entry first), download the first build of the
- * chosen model, and return the folder it installs to. Non-TTY sessions cannot
- * prompt: throws with the manual `mlx download model` commands instead — the
- * caller must not touch stdin on that path (the binary's print mode owns it).
+ * The build of `entry` to install: the only build of a one-build model with no question, else the answer to
+ * "Build of {model}", whose choices are in catalog order so the first build is the one Enter takes.
+ */
+async function chooseBuild(io: WizardIO, entry: CatalogEntry): Promise<CatalogBuild> {
+  if (entry.builds.length === 1) {
+    return entry.builds[0];
+  }
+  const chosen = await io.select({
+    message: `Build of ${entry.label}`,
+    choices: entry.builds.map((build) => ({ name: buildChoiceName(build), value: build.id })),
+  });
+  const build = entry.builds.find((candidate) => candidate.id === chosen);
+  if (build === undefined) {
+    throw new Error(`Wizard choice "${chosen}" is not a build of ${entry.label}`);
+  }
+  return build;
+}
+
+/**
+ * Offer the catalog (default entry first), then the builds of the chosen model when it has more than one, download
+ * the chosen build and return the folder it installs to. Enter on both questions installs the first build of the
+ * default model. Non-TTY sessions cannot prompt: throws with the manual `mlx download model` commands for the first
+ * build of each model instead — the caller must not touch stdin on that path (the binary's print mode owns it).
  */
 export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
-  const catalog = visibleCatalog();
+  const catalog = visibleCatalog(deps.totalMemBytes);
 
   if (!deps.io.isTTY) {
     const commands = catalog
@@ -109,7 +142,7 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
   if (chosenEntry === undefined) {
     throw new Error(`Wizard choice "${chosen}" is not in the visible catalog`);
   }
-  const build = chosenEntry.builds[0];
+  const build = await chooseBuild(deps.io, chosenEntry);
   await deps.download(downloadModelArgv(build, deps.modelsDir));
   return catalogBuildSlug(build);
 }

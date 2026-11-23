@@ -968,50 +968,71 @@ a speedup for every workload, and an already resident model is not changed mid-s
 
 On a fresh run (no explicit `--model`/`--provider`/session flag), it injects the first discovered local model — honoring a persisted `/model` pick when that model is still present — so ambient cloud credentials (e.g. a stray `GROQ_API_KEY`) never win over the local model this command promises.
 
-When no local model exists, an interactive terminal shows a first-run wizard over a curated catalog and downloads the choice via `mlx download model`. In a non-interactive shell it prints the equivalent `mlx download model` commands instead. The catalog:
+When no local model exists, an interactive terminal shows a first-run wizard over a curated catalog and downloads the choice via `mlx download model`. It asks at most two questions:
 
-| Model                 | HuggingFace repo                  | Size    | Notes                                                |
-| --------------------- | --------------------------------- | ------- | ---------------------------------------------------- |
-| Qwen3.8-27B (default) | `unsloth/Qwen3.8-27B-GGUF`        | ~18 GB  | Best tool use — recommended                          |
-| Inkling-2-Mini        | `unsloth/Inkling-2-Mini-GGUF`     | ~19 GB  | Looped MoE with vision and DSpark drafts, 1M context |
-| Gemma-4-26B-A4B       | `unsloth/gemma-4-26B-A4B-it-GGUF` | ~19 GB  | MoE, fast decode                                     |
-| Qwen3.8-Flash-Next    | `unsloth/Qwen3.8-Flash-Next-GGUF` | ~111 GB | 125B MoE, 512 experts streamed from SSD              |
-| Hy4-flash             | `AngelSlim/Hy4-flash-GGUF`        | ~168 GB | 512-expert MoE streamed from SSD, 256K context       |
+1. **Model to download**: one line per model, the default first, with the size of its first build and its description.
+2. **Build of {model}**: only for a model with two or more builds, its builds in catalog order with size, source and note. A one-build model skips it.
 
-The Unsloth entries install the **UD-Q4_K_XL** GGUF (`-g "*UD-Q4_K_XL*"`), one
-variant out of the dozens the repos carry. Inkling-2-Mini uses
-`-g "*UD-Q4_K_XL.gguf"`, because `*UD-Q4_K_XL*` also matches
-`Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB copy;
-it also takes `mmproj-BF16.gguf` and `dspark-Inkling-2-Mini-Q8_0.gguf`, which
-the loader pairs from the model folder. Gemma takes its `mmproj-BF16.gguf`
-projector. Qwen3.8-Flash-Next's four shards keep their repo folder and land in
-`<slug>/UD-Q4_K_XL/`; its GGUF load is text-only. Hy4-flash installs the
-`Q4_K_M` build. Qwen3.8-Flash-Next and Hy4-flash are offered only on a Mac
-with at least 96 GiB of RAM. The
-same repo serves every platform — Apple Silicon and Linux NVIDIA CUDA alike —
-and the wizard passes each entry's `--assets-repo` (`Qwen/Qwen3.8-27B`,
-`thinkingmachines/Inkling-2-Mini`, `unsloth/gemma-4-26B-A4B-it`,
-`Qwen/Qwen3.8-Flash-Next`, `tencent/Hy4-flash`) so the tokenizer sidecars land
-in the model folder.
+Enter on both questions installs the first build of the default model. In a non-interactive shell the wizard prints one `mlx download model` command per model, for its first build, instead.
+
+Each build installs to its own folder under the models directory. The catalog (`MODEL_CATALOG` in `packages/agent/src/catalog.ts`):
+
+| Model                 | Build      | HuggingFace repo                  | Folder                          | Size      | Globs (`-g`)                                                              |
+| --------------------- | ---------- | --------------------------------- | ------------------------------- | --------- | ------------------------------------------------------------------------- |
+| Qwen3.8-27B (default) | UD-Q4_K_XL | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf`              | ~17.7 GB  | `*UD-Q4_K_XL*`, `config.json`                                             |
+| Qwen3.8-27B           | UD-Q4_K_M  | `unsloth/Qwen3.8-27B-GGUF`        | `qwen3.8-27b-gguf-ud-q4_k_m`    | ~16.6 GB  | `*UD-Q4_K_M*`, `config.json`                                              |
+| Inkling-2-Mini        | UD-Q4_K_XL | `unsloth/Inkling-2-Mini-GGUF`     | `inkling-2-mini-gguf`           | ~18.7 GB  | `*UD-Q4_K_XL.gguf`, `mmproj-BF16.gguf`, `dspark-Inkling-2-Mini-Q8_0.gguf` |
+| Inkling-2-Mini        | UD-Q4_K_M  | `unsloth/Inkling-2-Mini-GGUF`     | `inkling-2-mini-gguf-ud-q4_k_m` | ~17.7 GB  | `*UD-Q4_K_M.gguf`, `mmproj-BF16.gguf`, `dspark-Inkling-2-Mini-Q8_0.gguf`  |
+| Inkling-2-Mini        | Original   | `thinkingmachines/Inkling-2-Mini` | `inkling-2-mini`                | ~20.2 GB  | none (default filter)                                                     |
+| Qwen3.8-Flash-Next    | UD-Q4_K_XL | `unsloth/Qwen3.8-Flash-Next-GGUF` | `qwen3.8-flash-next-gguf`       | ~111.3 GB | `*UD-Q4_K_XL*`                                                            |
+| Hy4-flash             | Q4_K_M     | `AngelSlim/Hy4-flash-GGUF`        | `hy4-flash-gguf`                | ~168.3 GB | `*Q4_K_M*`                                                                |
+
+For each build the wizard runs `mlx download model -m <repo>`, one `-g` per glob,
+`--assets-repo <repo>` when the build has one, `--complete`, and
+`-o <models dir>/<folder>`. The assets repos are `Qwen/Qwen3.8-27B` (both
+Qwen3.8-27B builds), `thinkingmachines/Inkling-2-Mini` (both Inkling-2-Mini GGUF
+builds), `Qwen/Qwen3.8-Flash-Next` and `tencent/Hy4-flash`, so the tokenizer
+sidecars land in the model folder.
+
+The Qwen3.8-27B repo has no plain `Q4_K_M` file; `*UD-Q4_K_M*` takes only
+`Qwen3.8-27B-UD-Q4_K_M.gguf`. The Inkling-2-Mini weight globs end in `.gguf`,
+because `*UD-Q4_K_XL*` also matches
+`Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB copy
+(the same holds for UD-Q4_K_M); both GGUF builds also take `mmproj-BF16.gguf`
+and `dspark-Inkling-2-Mini-Q8_0.gguf`, which the loader pairs from the model
+folder. Inkling-2-Mini Original is the safetensors release (experts NVFP4 and
+MXFP8, the rest BF16, its DSpark draft in `mtp.safetensors`): no glob, so the
+downloader's default filter applies, and no assets repo, because the repo has
+its own `tokenizer.json`. Qwen3.8-Flash-Next's four shards keep their repo
+folder and land in `<folder>/UD-Q4_K_XL/`; its GGUF load is text-only.
+Qwen3.8-Flash-Next and Hy4-flash are offered only on a machine with at least
+96 GiB of RAM. The same repo serves every platform: no build sets a CUDA repo.
+
+A folder is the last part of the build's repo in lower case
+(`catalogBuildSlug`). A second build of a repo that another build already
+installs adds `-<folderSuffix>` from the catalog (`ud-q4_k_m`), so the first
+build of a repo keeps the folder it has always had. For a repo that two builds
+share, a folder counts as the build its GGUF file name states, not the build its
+name suggests. A manual
+`mlx download model` without `-o` writes to `<models dir>/<repo name in lower
+case>`, which for a UD-Q4_K_M build is the UD-Q4_K_XL folder; the wizard always
+passes `-o`.
+
 K-quants are read directly and repacked losslessly into MLX layout in memory on
 every load; only small config/tokenizer assets are cached, not another packed
-checkpoint. Qwen3.8-27B's MTP layer is imported inline from its final GGUF
-block (the repo's separate `MTP/*.gguf` is not downloaded — nothing pairs a
-GGUF MTP sidecar) so speculative decoding activates automatically;
-the Qwen3.8-27B default therefore carries no separate `draft` companion (the
-z-lab DFlash2 draft above remains manually installable for converted
-checkpoints). See `catalogRepo` in `packages/agent/src/catalog.ts` for why GGUF
-replaced the earlier MXFP4/NVFP4 split.
+checkpoint. The Qwen3.8-27B UD-Q4_K_XL file carries its MTP layer inline in its
+final GGUF block, so speculative decoding activates automatically (the repo's
+separate `MTP/*.gguf` is not downloaded — nothing pairs a GGUF MTP sidecar).
+Whether the UD-Q4_K_M file carries that layer is not checked. The wizard
+installs no DFlash2 draft; the desktop Models page offers it, and the command
+above installs it by hand. See `catalogBuildRepo` in
+`packages/agent/src/catalog.ts` for why GGUF replaced the earlier MXFP4/NVFP4
+split.
 
-> **CUDA caveat:** the K-quant modes the GGUF import repacks into
-> (`q4k`/`q5k`/`q6k`) have no CUDA kernels yet — mlx-node's own K-quant
-> primitives throw `"… K-quant modes are not implemented on this GPU backend."`
-> on any GPU but Metal (`crates/mlx-sys/src/mlx_kquant_metal.cpp`). Linux
-> inference on these defaults therefore lands with
-> CUDA K-quant kernel support; today's DGX Spark path is to convert the GGUF
-> with the NVIDIA recipes (`mlx convert --q-recipe nvidia`, see
-> docs/cuda-poc-benchmark.md), which yields CUDA-executable affine/NVFP4
-> layouts.
+On CUDA, a GGUF load runs its K-quants on the CUDA K-quant kernels
+(`crates/mlx-sys/src/cuda/mlx_kquant_cuda.cpp`), which refuse the IQ grid
+formats. Only the Qwen3.6 models named in the README "CUDA preview" section have
+been run on CUDA.
 
 A more compact Gemma-4-12B entry (mxfp4 MLP + mxfp8 attention, ~9 GB, for smaller machines) is coming and will appear in the wizard once it is published.
 

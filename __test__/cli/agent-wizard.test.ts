@@ -22,23 +22,23 @@ function shellSplit(renderedArgs: string): string[] {
 /** The models dir every wizard run below is given. */
 const MODELS_DIR = '/custom/models';
 
-/** The platform-resolved repo of the first build of `entry`, the build the wizard installs. */
+const GIB = 2 ** 30;
+/** RAM at which all four chat models are offered (Flash Next and Hy4-flash need 96 GiB). */
+const LARGE_MAC = 128 * GIB;
+/** RAM at which only Qwen3.8-27B and Inkling-2-Mini are offered. */
+const SMALL_MAC = 64 * GIB;
+
+/** The platform-resolved repo of the first build of `entry`, the build the non-TTY hint names. */
 function repoOf(entry: CatalogEntry): string {
   return catalogBuildRepo(entry.builds[0]);
 }
 
-/**
- * The argv contract the wizard must hand `mlx download model` for one entry:
- * the platform-resolved repo of its first build, that build's globs, the
- * sidecar assets repo, and the output under `<modelsDir>/<build folder>`.
- * Written out literally — a change to the wizard's argv shape must fail here.
- */
+/** The argv of the first build of `entry`, built from the catalog fields, for the non-TTY hint round trips. */
 function expectedArgv(entry: CatalogEntry, modelsDir: string = MODELS_DIR): string[] {
   const build = entry.builds[0];
   const argv = ['-m', repoOf(entry)];
   for (const glob of build.globs ?? []) argv.push('-g', glob);
   if (build.assetsRepo !== undefined) argv.push('--assets-repo', build.assetsRepo);
-  // The prescribed selection is the complete model, never a partial glob run.
   argv.push('--complete');
   argv.push('-o', join(modelsDir, catalogBuildSlug(build)));
   return argv;
@@ -49,13 +49,18 @@ interface SelectCall {
   choices: Array<{ name: string; value: string }>;
 }
 
-function makeIO(overrides: Partial<WizardIO> & { chosen?: string } = {}): {
+/**
+ * A scripted terminal: each question takes the next of `answers`; a question past the end takes the first choice,
+ * which is what Enter picks in `@inquirer/prompts` `select`.
+ */
+function makeIO(overrides: Partial<WizardIO> & { answers?: string[] } = {}): {
   io: WizardIO;
   selectCalls: SelectCall[];
   logs: string[];
 } {
   const selectCalls: SelectCall[] = [];
   const logs: string[] = [];
+  const answers = [...(overrides.answers ?? [])];
   const io: WizardIO = {
     isTTY: overrides.isTTY ?? true,
     log: (line) => logs.push(line),
@@ -63,7 +68,7 @@ function makeIO(overrides: Partial<WizardIO> & { chosen?: string } = {}): {
       overrides.select ??
       (async (opts) => {
         selectCalls.push(opts);
-        return overrides.chosen ?? opts.choices[0]!.value;
+        return answers.shift() ?? opts.choices[0]!.value;
       }),
   };
   return { io, selectCalls, logs };
@@ -81,92 +86,216 @@ function makeDownload(): { download: (argv: string[]) => Promise<unknown>; calls
 }
 
 describe('runFirstRunWizard', () => {
-  it('offers exactly the visible catalog with the default entry first', async () => {
+  it('offers the visible chat models with the default first and the first build size on each line', async () => {
     const { io, selectCalls } = makeIO();
     const { download } = makeDownload();
 
-    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
 
-    expect(selectCalls).toHaveLength(1);
-    const choices = selectCalls[0]!.choices;
-
-    const visible = visibleCatalog();
-    expect(choices.map((c) => c.value).sort()).toEqual(visible.map((e) => e.label).sort());
-
-    // Default entry is preselected by coming first.
-    const defaultEntry = visible.find((e) => e.isDefault)!;
-    expect(defaultEntry).toBeDefined();
-    expect(choices[0]!.value).toBe(defaultEntry.label);
+    const question = selectCalls[0]!;
+    expect(question.message).toBe('Model to download');
+    expect(question.choices.map((c) => c.value)).toEqual([
+      'Qwen3.8-27B',
+      'Inkling-2-Mini',
+      'Qwen3.8-Flash-Next',
+      'Hy4-flash',
+    ]);
+    expect(question.choices.map((c) => c.name)).toEqual([
+      'Qwen3.8-27B (~17.7 GB) — Best tool use — recommended default',
+      'Inkling-2-Mini (~18.7 GB) — Looped MoE with vision and DSpark drafts, 1M context',
+      'Qwen3.8-Flash-Next (~111.3 GB) — 125B MoE, 512 experts streamed from SSD',
+      'Hy4-flash (~168.3 GB) — 512-expert MoE streamed from SSD, 256K context',
+    ]);
 
     // Hidden entries are never offered (the catalog must actually carry one
     // for this assertion to mean anything).
     const hidden = MODEL_CATALOG.filter((e) => e.hidden);
     expect(hidden.length).toBeGreaterThan(0);
     for (const entry of hidden) {
-      expect(choices.map((c) => c.value)).not.toContain(entry.label);
-    }
-
-    // Labels carry the first build's size and the description.
-    for (const entry of visible) {
-      const choice = choices.find((c) => c.value === entry.label)!;
-      expect(choice.name).toContain(entry.label);
-      expect(choice.name).toContain(`(~${entry.builds[0].sizeGb} GB)`);
-      expect(choice.name).toContain(entry.description);
+      expect(question.choices.map((c) => c.value)).not.toContain(entry.label);
     }
   });
 
-  it('downloads the first build of the chosen model and returns its folder', async () => {
-    const visible = visibleCatalog();
-    const entry = visible[visible.length - 1]!;
-    const { io } = makeIO({ chosen: entry.label });
-    const { download, calls } = makeDownload();
+  it('offers only the models that fit the memory it is given', async () => {
+    const { io, selectCalls } = makeIO();
+    const { download } = makeDownload();
 
-    const result = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: SMALL_MAC });
 
-    expect(result).toBe(catalogBuildSlug(entry.builds[0]));
-    expect(calls).toHaveLength(1);
-    expect(calls[0]).toEqual(expectedArgv(entry));
+    expect(selectCalls[0]!.choices.map((c) => c.value)).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini']);
   });
 
-  it('carries the build globs and assets repo into the download argv', async () => {
-    // The catalog must actually carry a multi-variant GGUF entry for this to
-    // mean anything: the wizard exists to install one weight variant plus
-    // the base-model tokenizer sidecars, never every quant in the repo.
-    const entry = visibleCatalog().find((e) => e.builds[0].globs !== undefined && e.builds[0].assetsRepo !== undefined);
-    expect(entry).toBeDefined();
-    expect(entry!.builds[0].globs!.length).toBeGreaterThan(0);
-    const { io } = makeIO({ chosen: entry!.label });
+  it('Enter, Enter installs the first build of the default model to its folder', async () => {
+    const { io, selectCalls } = makeIO();
     const { download, calls } = makeDownload();
 
-    await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+    const folder = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
 
-    expect(calls[0]).toEqual(expectedArgv(entry!));
+    expect(selectCalls.map((call) => call.message)).toEqual(['Model to download', 'Build of Qwen3.8-27B']);
+    expect(selectCalls[1]!.choices).toEqual([
+      { name: 'UD-Q4_K_XL (~17.7 GB) — Unsloth GGUF', value: 'UD-Q4_K_XL' },
+      { name: 'UD-Q4_K_M (~16.6 GB) — Unsloth GGUF · 1.1 GB smaller', value: 'UD-Q4_K_M' },
+    ]);
+    expect(folder).toBe('qwen3.8-27b-gguf');
+    expect(calls).toEqual([
+      [
+        '-m',
+        'unsloth/Qwen3.8-27B-GGUF',
+        '-g',
+        '*UD-Q4_K_XL*',
+        '-g',
+        'config.json',
+        '--assets-repo',
+        'Qwen/Qwen3.8-27B',
+        '--complete',
+        '-o',
+        '/custom/models/qwen3.8-27b-gguf',
+      ],
+    ]);
   });
 
-  it('pins the download output to the build folder under modelsDir', async () => {
-    const entry = visibleCatalog()[0]!;
-    const { io } = makeIO({ chosen: entry.label });
+  it('installs Qwen3.8-27B UD-Q4_K_M to its own folder with its own glob', async () => {
+    const { io } = makeIO({ answers: ['Qwen3.8-27B', 'UD-Q4_K_M'] });
     const { download, calls } = makeDownload();
 
-    await runFirstRunWizard({ io, download, modelsDir: '/other/models' });
+    const folder = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
 
-    expect(calls[0]).toEqual(expectedArgv(entry, '/other/models'));
-    expect(calls[0]!.slice(-2)).toEqual(['-o', '/other/models/qwen3.8-27b-gguf']);
+    expect(folder).toBe('qwen3.8-27b-gguf-ud-q4_k_m');
+    expect(calls).toEqual([
+      [
+        '-m',
+        'unsloth/Qwen3.8-27B-GGUF',
+        '-g',
+        '*UD-Q4_K_M*',
+        '-g',
+        'config.json',
+        '--assets-repo',
+        'Qwen/Qwen3.8-27B',
+        '--complete',
+        '-o',
+        '/custom/models/qwen3.8-27b-gguf-ud-q4_k_m',
+      ],
+    ]);
+  });
+
+  it('asks Inkling-2-Mini for one of its three builds, first build first', async () => {
+    const { io, selectCalls } = makeIO({ answers: ['Inkling-2-Mini'] });
+    const { download, calls } = makeDownload();
+
+    const folder = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+
+    expect(selectCalls.map((call) => call.message)).toEqual(['Model to download', 'Build of Inkling-2-Mini']);
+    expect(selectCalls[1]!.choices).toEqual([
+      { name: 'UD-Q4_K_XL (~18.7 GB) — Unsloth GGUF', value: 'UD-Q4_K_XL' },
+      { name: 'UD-Q4_K_M (~17.7 GB) — Unsloth GGUF · 1 GB smaller', value: 'UD-Q4_K_M' },
+      { name: 'Original (~20.2 GB) — Thinking Machines · NVFP4 + MXFP8', value: 'Original' },
+    ]);
+    expect(folder).toBe('inkling-2-mini-gguf');
+    expect(calls).toEqual([
+      [
+        '-m',
+        'unsloth/Inkling-2-Mini-GGUF',
+        '-g',
+        '*UD-Q4_K_XL.gguf',
+        '-g',
+        'mmproj-BF16.gguf',
+        '-g',
+        'dspark-Inkling-2-Mini-Q8_0.gguf',
+        '--assets-repo',
+        'thinkingmachines/Inkling-2-Mini',
+        '--complete',
+        '-o',
+        '/custom/models/inkling-2-mini-gguf',
+      ],
+    ]);
+  });
+
+  it('installs Inkling-2-Mini UD-Q4_K_M with a weight glob that ends in .gguf', async () => {
+    const { io } = makeIO({ answers: ['Inkling-2-Mini', 'UD-Q4_K_M'] });
+    const { download, calls } = makeDownload();
+
+    const folder = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+
+    expect(folder).toBe('inkling-2-mini-gguf-ud-q4_k_m');
+    expect(calls).toEqual([
+      [
+        '-m',
+        'unsloth/Inkling-2-Mini-GGUF',
+        '-g',
+        '*UD-Q4_K_M.gguf',
+        '-g',
+        'mmproj-BF16.gguf',
+        '-g',
+        'dspark-Inkling-2-Mini-Q8_0.gguf',
+        '--assets-repo',
+        'thinkingmachines/Inkling-2-Mini',
+        '--complete',
+        '-o',
+        '/custom/models/inkling-2-mini-gguf-ud-q4_k_m',
+      ],
+    ]);
+  });
+
+  it('installs Inkling-2-Mini Original from its own repository with no globs and no assets repo', async () => {
+    const { io } = makeIO({ answers: ['Inkling-2-Mini', 'Original'] });
+    const { download, calls } = makeDownload();
+
+    const folder = await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
+
+    expect(folder).toBe('inkling-2-mini');
+    expect(calls).toEqual([
+      ['-m', 'thinkingmachines/Inkling-2-Mini', '--complete', '-o', '/custom/models/inkling-2-mini'],
+    ]);
+  });
+
+  it('asks a one-build model one question', async () => {
+    const { io, selectCalls } = makeIO({ answers: ['Hy4-flash'] });
+    const { download, calls } = makeDownload();
+
+    const folder = await runFirstRunWizard({ io, download, modelsDir: '/other/models', totalMemBytes: LARGE_MAC });
+
+    expect(selectCalls.map((call) => call.message)).toEqual(['Model to download']);
+    expect(folder).toBe('hy4-flash-gguf');
+    expect(calls).toEqual([
+      [
+        '-m',
+        'AngelSlim/Hy4-flash-GGUF',
+        '-g',
+        '*Q4_K_M*',
+        '--assets-repo',
+        'tencent/Hy4-flash',
+        '--complete',
+        '-o',
+        '/other/models/hy4-flash-gguf',
+      ],
+    ]);
+  });
+
+  it('refuses a build answer that is not a build of the model and downloads nothing', async () => {
+    const { io } = makeIO({ answers: ['Qwen3.8-27B', 'Q8_0'] });
+    const { download, calls } = makeDownload();
+
+    await expect(runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC })).rejects.toThrow(
+      'Wizard choice "Q8_0" is not a build of Qwen3.8-27B',
+    );
+    expect(calls).toHaveLength(0);
   });
 
   it('throws without prompting or downloading when not a TTY', async () => {
     const { io, selectCalls } = makeIO({ isTTY: false });
     const { download, calls } = makeDownload();
 
-    await expect(runFirstRunWizard({ io, download, modelsDir: MODELS_DIR })).rejects.toThrow(/mlx download model/);
+    await expect(runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC })).rejects.toThrow(
+      /mlx download model/,
+    );
 
     // The hint must list every offered repo so headless users can copy a command.
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      for (const entry of visibleCatalog()) {
+      for (const entry of visibleCatalog(LARGE_MAC)) {
         expect(message).toContain(repoOf(entry));
       }
     }
@@ -180,11 +309,11 @@ describe('runFirstRunWizard', () => {
     const { download, calls } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      for (const entry of visibleCatalog()) {
+      for (const entry of visibleCatalog(LARGE_MAC)) {
         const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
         expect(line).toBeDefined();
         const renderedArgs = line.trim().replace(/^mlx download model /, '');
@@ -206,13 +335,13 @@ describe('runFirstRunWizard', () => {
 
     let message = '';
     try {
-      await runFirstRunWizard({ io, download, modelsDir });
+      await runFirstRunWizard({ io, download, modelsDir, totalMemBytes: LARGE_MAC });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       message = (error as Error).message;
     }
 
-    for (const entry of visibleCatalog()) {
+    for (const entry of visibleCatalog(LARGE_MAC)) {
       const slug = catalogBuildSlug(entry.builds[0]);
       const line = message.split('\n').find((l) => l.includes(repoOf(entry)));
       expect(line).toBeDefined();
@@ -233,11 +362,11 @@ describe('runFirstRunWizard', () => {
     const { download } = makeDownload();
 
     try {
-      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR });
+      await runFirstRunWizard({ io, download, modelsDir: MODELS_DIR, totalMemBytes: LARGE_MAC });
       expect.unreachable('wizard must throw without a TTY');
     } catch (error) {
       const message = (error as Error).message;
-      const entry = visibleCatalog()[0]!;
+      const entry = visibleCatalog(LARGE_MAC)[0]!;
       const slug = catalogBuildSlug(entry.builds[0]);
       // Safe paths stay readable: the -o value renders unquoted...
       expect(message).toContain(`-o /custom/models/${slug}`);

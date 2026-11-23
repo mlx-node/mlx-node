@@ -1850,14 +1850,14 @@ describe('dashboard api — cancel download route', () => {
 // no multi-GB transfer is triggered — a live-repo POST would really download.
 describe('dashboard api — download start is 202 Accepted', () => {
   it('answers 202 (not 200) for an accepted download start', async () => {
-    const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
+    const ctx = { downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO }) } } as unknown as ApiContext;
     const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
     expect(res.status).toBe(202);
     expect(res.ok ? res.body : null).toEqual({ id: 'job-1', slug: CATALOG_SLUG, repo: CATALOG_REPO });
   });
 
   it('answers 400 for a body that names a repo and no folder', async () => {
-    const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
+    const ctx = { downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO }) } } as unknown as ApiContext;
     const res = await call(ctx, 'POST', '/api/downloads', { repo: CATALOG_REPO });
     expect(res.status).toBe(400);
     expect(res.ok ? '' : res.message).toBe('Body must include a "slug" string');
@@ -1905,7 +1905,7 @@ describe('dashboard api — method-not-allowed vs not-found', () => {
 // manager. That refusal is a server-lifecycle condition, not a malformed request,
 // so it must not be reported as a 400 blaming the caller.
 describe('dashboard api — start download route', () => {
-  function postDownload(start: () => string): ReturnType<typeof dispatch> {
+  function postDownload(start: () => { id: string; repo: string }): ReturnType<typeof dispatch> {
     const ctx = { downloads: { start } } as unknown as ApiContext;
     return call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
   }
@@ -1976,7 +1976,7 @@ describe('dashboard api — Update start', () => {
       downloads: {
         start: (...args: unknown[]) => {
           calls.push(args);
-          return 'job-1';
+          return { id: 'job-1', repo: CATALOG_REPO };
         },
       },
     } as unknown as ApiContext;

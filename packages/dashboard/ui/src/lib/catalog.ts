@@ -26,6 +26,35 @@ export function catalogBuildAt(items: readonly CatalogItem[], slug: string): Cat
   return undefined;
 }
 
+/** A model counts as on this Mac when at least one of its builds is on disk. */
+export function modelPresent(item: Pick<CatalogItem, 'builds'>): boolean {
+  return item.builds.some((build) => build.present);
+}
+
+/** The build Onboarding stands a model for: the one with a job, else the first on disk, else the first. */
+export function onboardingBuild(item: Pick<CatalogItem, 'builds'>, activeSlugs: readonly string[]): CatalogBuildItem {
+  return (
+    item.builds.find((build) => activeSlugs.includes(build.slug)) ??
+    item.builds.find((build) => build.present) ??
+    item.builds[0]
+  );
+}
+
+/**
+ * The build a catalog card shows: the one the user chose on this page visit, else the one with a job, else the first
+ * on disk, else the first. `chosen` maps an entry label to a build folder.
+ */
+export function shownBuild(
+  item: Pick<CatalogItem, 'label' | 'builds'>,
+  chosen: Readonly<Record<string, string>>,
+  active: Readonly<Record<string, unknown>>,
+): CatalogBuildItem {
+  const picked = Object.hasOwn(chosen, item.label)
+    ? item.builds.find((build) => build.slug === chosen[item.label])
+    : undefined;
+  return picked ?? onboardingBuild(item, Object.keys(active));
+}
+
 /** One plain sentence about a catalog model. */
 export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'isDefault'>): string {
   if (item.isDefault === true) return 'Our recommended starting point for working with tools.';

@@ -9,6 +9,7 @@ import type {
   AdoptPlanResponse,
   CancelDownloadResponse,
   CatalogBuildItem,
+  CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   DownloadJob,
@@ -411,5 +412,20 @@ export function useModelDownloads(
     downloadsError: downloads.error,
     reloadDownloads: downloads.reload,
     remoteRevisions,
+  };
+}
+
+/** The download props of every build of `item`, in catalog order, and of its draft. */
+export function entryDownloads(
+  downloads: Pick<ModelDownloads, 'downloadProps'>,
+  item: Pick<CatalogItem, 'builds' | 'draft'>,
+): { builds: CatalogDownloadProps[]; draft: CatalogDownloadProps | undefined } {
+  return {
+    builds: item.builds.map((build) => downloads.downloadProps(build)),
+    draft:
+      item.draft === undefined
+        ? undefined
+        : // Drafts carry no tokenizer sidecars of their own, and no other build shares their folder.
+          downloads.downloadProps({ ...item.draft, heldBy: null, localAssetsRepo: null, localAssetsRevision: null }),
   };
 }

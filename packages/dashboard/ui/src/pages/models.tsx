@@ -7,7 +7,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { offeredOnHost } from '../lib/catalog';
+import { modelPresent, offeredOnHost } from '../lib/catalog';
 import { formatBytes, formatBytesParts, formatCount } from '../lib/format';
 import { useHomeDir } from '../lib/home-dir';
 import { useDataVersion, useRuntimeLive } from '../lib/live';
@@ -16,7 +16,6 @@ import { tildePath } from '../lib/paths';
 import { alignedRange } from '../lib/range';
 import { toast } from '../lib/toast';
 import type {
-  CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   MetricsSummary,
@@ -27,7 +26,13 @@ import type {
 import { useJson } from '../lib/use-api';
 import { useCommands, type AppCommand } from '../shell/commands';
 import { Page, PageHeader, PageSection } from '../shell/page';
-import { CatalogCard, CatalogCardPlaceholder, CatalogDownloadAction, CatalogGrid } from './models/catalog';
+import {
+  CatalogCardPlaceholder,
+  CatalogDownloadAction,
+  CatalogEntryCard,
+  CatalogGrid,
+  useChosenBuilds,
+} from './models/catalog';
 import { LocalModels, type UsageView } from './models/local-models';
 import { ModelDrawer } from './models/model-drawer';
 import { useModelDownloads } from './models/use-model-downloads';
@@ -157,8 +162,9 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   const catalogItems = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
   const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
   const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
-  const present = chatCatalogItems.filter((item) => item.builds[0].present).length;
-  const systemOnePresent = systemOneCatalogItems.filter((item) => item.builds[0].present).length;
+  const present = chatCatalogItems.filter(modelPresent).length;
+  const systemOnePresent = systemOneCatalogItems.filter(modelPresent).length;
+  const { chosen, choose } = useChosenBuilds();
   const activeCount = Object.keys(downloads.active).length;
 
   const setFocus = (name: string | null): void => {
@@ -196,32 +202,29 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   const dir = models.data?.dir ?? '';
   const home = useHomeDir();
   const settlingSlugs = catalogItems
-    .filter((item) => {
-      const props = downloads.downloadProps(item.builds[0]);
+    .flatMap((item) => item.builds)
+    .filter((build) => {
+      const props = downloads.downloadProps(build);
       return props.settling || props.updateSettling;
     })
-    .map((item) => item.builds[0].slug)
+    .map((build) => build.slug)
     .join('\n');
   const commands = useMemo((): AppCommand[] => {
     const list: AppCommand[] = [];
     for (const item of catalogItems) {
-      const build = item.builds[0];
-      const props = downloads.downloadProps(build);
-      if (props.job !== undefined || props.settling) continue;
-      if (!build.present && !build.blockedByForeignDir && build.heldBy === null) {
-        list.push({
-          id: `models:install:${build.slug}`,
-          label: `Install ${item.label}`,
-          group: 'Models',
-          run: props.onInstall,
-        });
-      } else if (build.present && props.updateAvailable && !props.updateSettling) {
-        list.push({
-          id: `models:update:${build.slug}`,
-          label: `Update ${item.label}`,
-          group: 'Models',
-          run: props.onInstall,
-        });
+      for (const build of item.builds) {
+        const props = downloads.downloadProps(build);
+        if (props.job !== undefined || props.settling) continue;
+        const name = item.builds.length > 1 ? `${item.label} (${build.id})` : item.label;
+        const run = (): Promise<void> => {
+          choose(item.label, build.slug);
+          return props.onInstall();
+        };
+        if (!build.present && !build.blockedByForeignDir && build.heldBy === null) {
+          list.push({ id: `models:install:${build.slug}`, label: `Install ${name}`, group: 'Models', run });
+        } else if (build.present && props.updateAvailable && !props.updateSettling) {
+          list.push({ id: `models:update:${build.slug}`, label: `Update ${name}`, group: 'Models', run });
+        }
       }
     }
     list.push({ id: 'models:check-updates', label: 'Check for updates', group: 'Models', run: checkUpdates });
@@ -379,8 +382,8 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           {catalog.data === undefined ? (
             catalog.error !== undefined ? null : (
               <CatalogGrid>
-                {[0, 1, 2].map((index) => (
-                  <CatalogCardPlaceholder key={index} withDraft={index === 0} />
+                {[0, 1].map((index) => (
+                  <CatalogCardPlaceholder key={index} />
                 ))}
               </CatalogGrid>
             )
@@ -392,16 +395,14 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           ) : (
             <CatalogGrid>
               {chatCatalogItems.map((item) => (
-                <CatalogCardEntry
+                <CatalogEntryCard
                   key={item.label}
                   item={item}
                   downloads={downloads}
                   host={host}
-                  detailsTo={
-                    localModels.some((model) => model.name === item.builds[0].slug)
-                      ? `/models?focus=${encodeURIComponent(item.builds[0].slug)}`
-                      : undefined
-                  }
+                  localModels={localModels}
+                  chosen={chosen}
+                  choose={choose}
                 />
               ))}
             </CatalogGrid>
@@ -427,19 +428,15 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           >
             <CatalogGrid>
               {systemOneCatalogItems.map((item) => (
-                <CatalogCardEntry
+                <CatalogEntryCard
                   key={item.label}
                   item={item}
                   downloads={downloads}
                   host={host}
-                  detailsTo={
-                    localModels.some((model) => model.name === item.builds[0].slug)
-                      ? `/models?focus=${encodeURIComponent(item.builds[0].slug)}`
-                      : undefined
-                  }
-                  openTo={
-                    item.builds[0].present ? `/system-one?model=${encodeURIComponent(item.builds[0].slug)}` : undefined
-                  }
+                  localModels={localModels}
+                  chosen={chosen}
+                  choose={choose}
+                  systemOne
                 />
               ))}
             </CatalogGrid>
@@ -459,36 +456,5 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
         deletedRef={deletedRef}
       />
     </Page>
-  );
-}
-
-function CatalogCardEntry(props: {
-  item: CatalogItem;
-  downloads: ReturnType<typeof useModelDownloads>;
-  host: ModelsResponse['host'] | undefined;
-  detailsTo: string | undefined;
-  openTo?: string | undefined;
-}): ReactElement {
-  const { item, downloads } = props;
-  const build = item.builds[0];
-  const download = downloads.downloadProps(build);
-  const draft =
-    item.draft === undefined
-      ? undefined
-      : // Drafts carry no tokenizer sidecars of their own, and no other build shares their folder.
-        downloads.downloadProps({ ...item.draft, heldBy: null, localAssetsRepo: null, localAssetsRevision: null });
-  const busy = download.job !== undefined || draft?.job !== undefined;
-  return (
-    <div className="min-w-0" data-downloading={busy ? '' : undefined}>
-      <CatalogCard
-        {...download}
-        entry={item}
-        item={build}
-        draftDownload={draft}
-        host={props.host}
-        detailsTo={props.detailsTo}
-        openTo={props.openTo}
-      />
-    </div>
   );
 }

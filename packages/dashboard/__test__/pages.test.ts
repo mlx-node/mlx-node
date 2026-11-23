@@ -19,6 +19,7 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
+import { INITIAL_PROGRESS } from '@/components/download-progress';
 import { categoryLabels, truncateMiddle } from '@/lib/labels';
 import { modelShareLabel } from '@/lib/metrics-view';
 import { toast } from '@/lib/toast';
@@ -41,12 +42,16 @@ import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
 import {
   blockerPhrase,
+  catalogActionState,
+  CatalogCardView,
+  type CatalogCardViewProps,
   CatalogDownloadAction,
+  hostLine,
   hostNote,
   reinstallContent,
   updateContent,
 } from '@/pages/models/catalog';
-import { useModelDownloads } from '@/pages/models/use-model-downloads';
+import { type CatalogDownloadProps, useModelDownloads } from '@/pages/models/use-model-downloads';
 import Overview from '@/pages/overview';
 import { SystemOneModelsDrawer } from '@/pages/system-one/models-drawer';
 import { type AppCommand, usePageCommands } from '@/shell/commands';
@@ -941,8 +946,11 @@ describe('Models page — the Install affordance', () => {
   let paletteLabels: string[] = [];
   /** Ids of the same commands. */
   let paletteIds: string[] = [];
+  /** The same commands. */
+  let paletteCommands: readonly AppCommand[] = [];
   function PaletteProbe(): null {
     const commands = usePageCommands();
+    paletteCommands = commands;
     paletteLabels = commands.map((command) => String(command.label));
     paletteIds = commands.map((command) => command.id);
     return null;
@@ -981,9 +989,13 @@ describe('Models page — the Install affordance', () => {
     recordRequests(catalogRoutes({ heldBy: 'UD-Q4_K_M' }));
     await mountModels();
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
-    // Mutation: drop the heldBy branch of CatalogDownloadAction → the card offers Install → red.
-    expect(card.textContent).toContain(`${SLUG} holds UD-Q4_K_M. Delete it in Local models to install MXFP4 here.`);
+    // Mutation: drop the held branch of catalogActionState → the card offers Install → red.
+    expect(card.querySelector('[data-row="action"]')?.textContent).toContain('Holds UD-Q4_K_M');
     expect(buttonLabels()).not.toContain('Install');
+    await act(async () => buttonNamed(card, 'Show why').click());
+    expect(document.body.textContent).toContain(
+      `${SLUG} holds UD-Q4_K_M. Delete it in Local models to install MXFP4 here.`,
+    );
     expect(paletteLabels).not.toContain(`Install ${LABEL}`);
   });
 
@@ -1110,7 +1122,7 @@ describe('Models page — the Install affordance', () => {
     ]);
     await waitFor(() => !(mounted!.container.textContent ?? '').includes('Companion weights (1)'));
     expect(statValue(mounted!.container, 'On disk')).not.toContain('2.0');
-    expect(buttonLabels()).toContain('Install DFlash2');
+    expect(buttonLabels()).toContain('Add');
   });
 
   it.each([false, true])(
@@ -1128,14 +1140,18 @@ describe('Models page — the Install affordance', () => {
       expect(card).toBe(target.closest('[data-model]'));
       expect(link.textContent).toBe('DFlash2');
       const companion = link.closest('[role="group"]')!;
-      expect(companion.textContent).toContain('Used automatically');
-      expect(companion.textContent).toContain('3.85 GB');
+      expect(companion.getAttribute('aria-label')).toBe('DFlash2 add-on');
+      expect(companion.closest('[data-row]')?.getAttribute('data-row')).toBe('extras');
       const button = companion.querySelector('button');
       if (present) {
-        expect(companion.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
+        expect(companion.textContent).toContain('added');
+        expect(companion.textContent).not.toContain('waits for the model');
         expect(button).toBeNull();
       } else {
-        expect(button?.textContent?.trim()).toBe('Install DFlash2');
+        expect(companion.textContent).toContain('Optional');
+        expect(companion.textContent).toContain('3.85 GB');
+        expect(button?.textContent?.trim()).toBe('Add');
+        expect(button?.getAttribute('aria-label')).toBe('Add DFlash2, 3.85 GB');
         expect(button?.disabled).toBe(false);
       }
     },
@@ -1153,10 +1169,10 @@ describe('Models page — the Install affordance', () => {
     const card = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
       .closest('[data-model]')!;
-    const companion = card.querySelector('[role="group"]')!;
+    const companion = card.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
     expect(companion.textContent).toContain('Cancel');
-    expect(companion.textContent).not.toContain('Installed');
-    expect(card.textContent).toContain('Installed');
+    expect(companion.textContent).not.toContain('added');
+    expect(card.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
   });
 
   const LEFTOVER = 'imatrix_unsloth.gguf_file';
@@ -1179,13 +1195,15 @@ describe('Models page — the Install affordance', () => {
       catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Reinstall');
+    expect(buttonLabels()).toContain('Reinstall…');
     expect(buttonLabels()).not.toContain('Install');
     expect(text).toContain('Needs cleanup');
-    expect(text).toContain(`${SLUG} is in the way: a directory with 1 file (183 MB) that the app did not create.`);
-    expect(text).toContain('Reinstall downloads the model, then removes this directory.');
-    expect(text).not.toContain('already exists and was not created by the app');
-    expect(text.toLowerCase()).toContain('remove');
+    // The long text is in the confirmation, not on the card.
+    expect(text).not.toContain('is in the way:');
+    await act(async () => buttonNamed(mounted!.container, 'Reinstall…').click());
+    const dialog = splitWhitespace(reinstallDialog()?.textContent ?? '').join(' ');
+    expect(dialog).toContain(`${SLUG} is in the way: a directory with 1 file (183 MB) that the app did not create.`);
+    expect(dialog).toContain(`permanently deletes the directory ${SLUG}`);
   });
 
   /** A real folder with a model the app did not create: the GGUF, the two head files and a README. */
@@ -1208,11 +1226,11 @@ describe('Models page — the Install affordance', () => {
       catalogRoutes({ blockedByForeignDir: true, blocker: { ...HELD, listed } }),
       LABEL,
     );
-    expect(liveButtonLabels()).toContain('Update');
-    expect(buttonLabels()).not.toContain('Reinstall');
+    expect(liveButtonLabels()).toContain('Update…');
+    expect(buttonLabels()).not.toContain('Reinstall…');
     expect(buttonLabels()).not.toContain('Install');
     expect(text).toContain('Needs update');
-    expect(text).toContain(NOTE);
+    expect(text).not.toContain(NOTE);
     expect(text).not.toContain('Needs cleanup');
   });
 
@@ -1232,17 +1250,18 @@ describe('Models page — the Install affordance', () => {
       { fileCount: 2000, truncated: true, listed: true },
       'Delete it in Local models to install this one.',
     ],
-  ])('offers no button over %s that holds a model', async (_name, overrides, hint) => {
+  ])('offers no install over %s that holds a model, only why', async (_name, overrides, hint) => {
     const text = await mount(
       createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ blockedByForeignDir: true, blocker: { ...HELD, listed: false, ...overrides } }),
       LABEL,
     );
-    expect(buttonLabels()).not.toContain('Update');
-    expect(buttonLabels()).not.toContain('Reinstall');
+    expect(buttonLabels()).not.toContain('Update…');
+    expect(buttonLabels()).not.toContain('Reinstall…');
     expect(buttonLabels()).not.toContain('Install');
     expect(text).toContain('Needs cleanup');
-    expect(text).toContain(
+    await act(async () => buttonNamed(mounted!.container, 'Show why').click());
+    expect(splitWhitespace(document.body.textContent ?? '').join(' ')).toContain(
       `${SLUG} holds a model that the app did not create, so Reinstall cannot replace it. ${hint}`,
     );
   });
@@ -1304,9 +1323,9 @@ describe('Models page — the Install affordance', () => {
     ['a link with no text', { kind: 'symlink', fileCount: 0, linkTarget: null }, null],
   ])('says what Reinstall deletes: %s', (_name, overrides, contents) => {
     const item = blocker(overrides);
-    const noun = blockerPhrase(item).noun;
+    const { phrase, noun } = blockerPhrase(item);
     const text = textOf(reinstallContent({ slug: SLUG, blocker: item }, handlers).description);
-    const first = `This downloads the model, then permanently deletes the ${noun} ${SLUG} and installs the model in its place.`;
+    const first = `${SLUG} is in the way: ${splitWhitespace(phrase).join(' ')} that the app did not create. This downloads the model, then permanently deletes the ${noun} ${SLUG} and installs the model in its place.`;
     const last = 'Nothing is deleted if the download fails or you cancel it.';
     expect(text).toBe(contents === null ? `${first} ${last}` : `${first} ${contents} ${last}`);
   });
@@ -1425,7 +1444,7 @@ describe('Models page — the Install affordance', () => {
       body: { id: 'job-reinstall', slug: SLUG, repo: REPO },
     }));
     await mountModels();
-    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
+    await act(async () => buttonNamed(mounted!.container, 'Reinstall…').click());
     const dialog = reinstallDialog()!;
     expect(dialog).toBeTruthy();
     const text = splitWhitespace(dialog.textContent ?? '').join(' ');
@@ -1441,6 +1460,7 @@ describe('Models page — the Install affordance', () => {
       { slug: SLUG, replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 192_223_904, truncated: false } },
     ]);
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    // The bar's text for assistive tech, also its tooltip.
     await waitFor(() => (card.textContent ?? '').includes('Replaces the old directory when the download is complete.'));
     expect(buttonNamed(card, 'Cancel')).toBeTruthy();
     expect(card.textContent).not.toContain('Needs cleanup');
@@ -1461,7 +1481,7 @@ describe('Models page — the Install affordance', () => {
     }));
     await mountModels();
     const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
-    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
+    await act(async () => buttonNamed(mounted!.container, 'Reinstall…').click());
     await act(async () => buttonNamed(reinstallDialog()!, 'Reinstall').click());
     await waitFor(() => reinstallDialog()?.querySelector('[role="alert"]') !== null);
     const alert = reinstallDialog()!.querySelector('[role="alert"]')!;
@@ -1532,11 +1552,11 @@ describe('Models page — the Install affordance', () => {
     const companion = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
       .closest('[role="group"]')!;
-    expect(companion.textContent).toContain('Needs cleanup');
-    expect(companion.textContent).toContain(`${draft.slug} is in the way: an empty directory`);
-    await act(async () => buttonNamed(companion, 'Reinstall').click());
+    expect(companion.textContent).toContain('needs cleanup');
+    await act(async () => buttonNamed(companion, 'Reinstall…').click());
     const dialog = reinstallDialog('Reinstall companion weights?')!;
     expect(dialog).toBeTruthy();
+    expect(dialog.textContent).toContain(`${draft.slug} is in the way: an empty directory`);
     expect(dialog.textContent).toContain('The directory is empty.');
   });
 
@@ -1611,17 +1631,19 @@ describe('Models page — the Install affordance', () => {
       );
       await mountModels();
       expect(posts(calls, '/downloads/adopt-plan')).toEqual([]);
-      await act(async () => buttonNamed(mounted!.container, 'Update').click());
+      await act(async () => buttonNamed(mounted!.container, 'Update…').click());
       await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 1);
       expect(posts(calls, '/downloads/adopt-plan')).toEqual([{ slug: SLUG }]);
-      expect(buttonNamed(mounted!.container, 'Checking…').disabled).toBe(true);
+      expect(buttonNamed(mounted!.container, 'Checking…').getAttribute('aria-disabled')).toBe('true');
       await settle();
       expect(updateDialog()).toBeUndefined();
 
       held.release();
       await waitFor(() => updateDialog() !== undefined);
       const description = updateDialog()!.querySelector('[id]:not(h2)')!;
-      expect(splitWhitespace(description.textContent ?? '').join(' ')).toBe(expected);
+      expect(splitWhitespace(description.textContent ?? '').join(' ')).toBe(
+        `${SLUG} holds a model that the app did not create. ${expected}`,
+      );
       expect(posts(calls, '/downloads')).toEqual([]);
     },
   );
@@ -1633,12 +1655,12 @@ describe('Models page — the Install affordance', () => {
       () => ({ ok: true, status: 200, body: PLAN }),
     );
     await mountModels();
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
     await waitFor(() => updateDialog() !== undefined);
     await act(async () => buttonNamed(updateDialog()!, 'Cancel').click());
     await waitFor(() => updateDialog() === undefined);
     expect(posts(calls, '/downloads/adopt-plan')).toHaveLength(1);
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
     await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 2);
     await waitFor(() => updateDialog() !== undefined);
     expect(posts(calls, '/downloads')).toEqual([]);
@@ -1667,35 +1689,39 @@ describe('Models page — the Install affordance', () => {
     expect(companion.title).toBe('Update companion weights?');
   });
 
-  it('shows the server text under the card when the plan is refused, and no toast', async () => {
+  it('says a refused plan in a toast and keeps the card as it was', async () => {
     const error = vi.spyOn(toast, 'error');
     onTestFinished(() => error.mockRestore());
     const refusal = `"README.gguf" in "${SLUG}" is a model file that is not part of the catalog model. Move it out of the folder, then use Update again.`;
     let plans = 0;
+    const refused = heldPlan({ ok: false, status: 409, code: 'E_CONFLICT', message: refusal });
     const calls = serveReinstall(
       catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
       () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO } }),
-      () =>
-        ++plans === 1
-          ? { ok: false, status: 409, code: 'E_CONFLICT', message: refusal }
-          : { ok: true, status: 200, body: PLAN },
+      () => (++plans === 1 ? refused.answer() : { ok: true, status: 200, body: PLAN }),
     );
     await mountModels();
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    const update = buttonNamed(mounted!.container, 'Update…');
+    update.focus();
+    await act(async () => update.click());
+    await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 1);
+    // Mutation: disable the button while the plan loads → a browser moves focus to <body> → red.
+    expect(update.textContent).toBe('Checking…');
+    expect(update.disabled).toBe(false);
+    expect(update.getAttribute('aria-disabled')).toBe('true');
+    refused.release();
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls).toEqual([['Could not check the folder', { description: refusal }]]);
+    expect(document.activeElement).toBe(update);
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
-    await waitFor(() => (card.textContent ?? '').includes(refusal));
-    const note = [...card.querySelectorAll('.text-warning')].find((el) => (el.textContent ?? '') === refusal)!;
-    expect(note).toBeTruthy();
-    expect(card.querySelector('p p')).toBeNull();
-    expect(splitWhitespace(card.textContent ?? '').join(' ')).toContain(`${NOTE}${refusal}`);
+    expect(card.textContent).not.toContain(refusal);
+    expect(card.querySelector('[role="alert"]')).toBeNull();
     expect(updateDialog()).toBeUndefined();
-    expect(error).not.toHaveBeenCalled();
-    expect(liveButtonLabels()).toContain('Update');
+    expect(liveButtonLabels()).toContain('Update…');
 
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
     await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 2);
     await waitFor(() => updateDialog() !== undefined);
-    expect(card.textContent).not.toContain(refusal);
     expect(posts(calls, '/downloads')).toEqual([]);
   });
 
@@ -1708,7 +1734,7 @@ describe('Models page — the Install affordance', () => {
       () => ({ ok: true, status: 200, body: PLAN }),
     );
     await mountModels();
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
     await waitFor(() => updateDialog() !== undefined);
     await act(async () => buttonNamed(updateDialog()!, 'Update').click());
     await waitFor(() => openedStreams.includes('job-update'));
@@ -1718,6 +1744,7 @@ describe('Models page — the Install affordance', () => {
     expect(buttonNamed(card, 'Cancel')).toBeTruthy();
     expect(card.textContent).not.toContain('Needs update');
 
+    emitDownload('start', { id: 'job-update', repo: REPO, totalBytes: 6_429_716_416, fileCount: 11 });
     emitDownload('progress', {
       id: 'job-update',
       file: 'Clairic-Flash-UD-Q4_K_XL.gguf',
@@ -1728,7 +1755,10 @@ describe('Models page — the Install affordance', () => {
       fileCount: 11,
       phase: 'check',
     });
-    await waitFor(() => (card.textContent ?? '').includes('Checking Clairic-Flash-UD-Q4_K_XL.gguf'));
+    await waitFor(() => (card.textContent ?? '').includes('Checking files · 1.0 kB / 6.4 GB'));
+    expect(card.querySelector('[role="progressbar"]')?.getAttribute('aria-label')).toBe(
+      'Clairic-Flash-UD-Q4_K_XL.gguf · File 1 of 11',
+    );
     emitDownload('done', { id: 'job-update', outputDir: `/models/${SLUG}` });
     await waitFor(() => success.mock.calls.length > 0);
     expect(success.mock.calls).toEqual([['Update complete', { description: SLUG }]]);
@@ -1753,7 +1783,7 @@ describe('Models page — the Install affordance', () => {
     );
     await mountModels();
     const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
-    await act(async () => buttonNamed(mounted!.container, 'Update').click());
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
     await waitFor(() => updateDialog() !== undefined);
     await act(async () => buttonNamed(updateDialog()!, 'Update').click());
     await waitFor(() => updateDialog()?.querySelector('[role="alert"]') !== null);
@@ -1805,9 +1835,10 @@ describe('Models page — the Install affordance', () => {
     );
     await settle();
     const card = document.body.querySelector<HTMLElement>(`[data-model="${SLUG}"]`)!;
-    expect(splitWhitespace(card.textContent ?? '').join(' ')).toContain(NOTE);
-    await act(async () => buttonNamed(card, 'Update').click());
+    expect(card.querySelector('[data-row="action"]')?.textContent).toContain('Needs update');
+    await act(async () => buttonNamed(card, 'Update…').click());
     await waitFor(() => updateDialog() !== undefined);
+    expect(updateDialog()!.textContent).toContain(`${SLUG} holds a model that the app did not create.`);
     expect(updateDialog()!.textContent).toContain('README.md');
     expect(updateDialog()!.textContent).toContain('After Update the app manages this folder.');
   });
@@ -1916,8 +1947,9 @@ describe('Models page — the Install affordance', () => {
       }),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
-    expect(buttonLabels()).not.toContain('Installed');
+    // The card still says Installed beside the Update button.
+    expect(buttonLabels()).toEqual(expect.arrayContaining(['Update', 'Installed']));
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('stays Installed when the revisions match', async () => {
@@ -1929,7 +1961,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('offers Update when only the tokenizer sidecars advanced', async () => {
@@ -1956,7 +1988,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('stays Installed when the sidecar revision matches', async () => {
@@ -1981,7 +2013,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('stays Installed when the sidecar repo did not answer', async () => {
@@ -2008,7 +2040,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('offers Update when the catalog switched the sidecar source repo', async () => {
@@ -2036,7 +2068,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('offers Update when the install predates sidecar provenance the entry prescribes', async () => {
@@ -2063,7 +2095,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('stays Installed when the catalog dropped its sidecar source', async () => {
@@ -2086,7 +2118,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('never offers Update for a checkpoint the dashboard does not own', async () => {
@@ -2108,7 +2140,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('stays Installed when the update check could not reach Hugging Face', async () => {
@@ -2123,7 +2155,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('dismisses a job that settled while the page was unmounted, without a word', async () => {
@@ -2250,7 +2282,7 @@ describe('Models page — the Install affordance', () => {
       '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
     });
     await mountModels();
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
     expect(buttonLabels()).toContain('Installed');
   });
 
@@ -2284,7 +2316,7 @@ describe('Models page — the Install affordance', () => {
       await settle();
       expect(gets(calls, '/api/catalog/updates')).toBe(2);
       expect(gets(calls, '/api/catalog')).toBe(2);
-      expect(buttonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).not.toContain('Update');
       expect(buttonLabels()).toContain('Installed');
     } finally {
       failed.mockRestore();
@@ -2351,13 +2383,13 @@ describe('Models page — the Install affordance', () => {
     await settle();
     // The refreshed catalog has not landed, so the card still reads the stale
     // comparison — but it must not be pressable while it does.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
     expect(paletteLabels).not.toContain(`Update ${LABEL}`);
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
     expect(paletteLabels).toContain(`Update ${LABEL}`);
   });
 
@@ -2395,12 +2427,12 @@ describe('Models page — the Install affordance', () => {
     await settle();
     // The fresh catalog HAS landed — `localRevision` is the installed one — but
     // it is being compared against the sha from before the job.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes that window on a FIRST install too, where the stale body still says absent', async () => {
@@ -2460,7 +2492,7 @@ describe('Models page — the Install affordance', () => {
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes the updates half for a job that settled while the page was away too', async () => {
@@ -2487,12 +2519,12 @@ describe('Models page — the Install affordance', () => {
 
     // The installed revision is on screen, compared against the sha from before
     // the job. That verdict must not be actionable.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes that window when the job settles as ERROR, which can still have installed', async () => {
@@ -2520,12 +2552,12 @@ describe('Models page — the Install affordance', () => {
 
       emitDownload('error', { id: 'job-err', message: 'fsync failed after publish' });
       await settle();
-      expect(buttonLabels()).toContain('Update available');
-      expect(liveButtonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).toContain('Update');
+      expect(liveButtonLabels()).not.toContain('Update');
 
       held.release();
       await settle();
-      expect(liveButtonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).toContain('Update');
     } finally {
       failed.mockRestore();
     }
@@ -2783,7 +2815,7 @@ describe('Models page — the Install affordance', () => {
 
       held.release();
       await settle();
-      expect(liveButtonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).toContain('Update');
     } finally {
       failed.mockRestore();
     }
@@ -2814,7 +2846,7 @@ describe('Models page — the Install affordance', () => {
     await mountModels();
     // Settled on the newly installed revision: Installed, not a fresh Update.
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
     // Refetched exactly once, in step with the catalog it is compared against.
     expect(gets(calls, '/api/catalog/updates')).toBe(2);
     expect(gets(calls, '/api/catalog')).toBe(2);
@@ -3019,6 +3051,415 @@ describe('Models page — the Install affordance', () => {
     recordRequests(catalogRoutes({}, [downloadJob({ id: 'job-commit', state: 'committing' })]));
     await mountModels();
     expect(buttonLabels()).not.toContain('Cancel');
+  });
+
+  describe('the card with more than one build', () => {
+    const XL_SLUG = 'inkling-2-mini-gguf';
+    const M_SLUG = 'inkling-2-mini-gguf-ud-q4_k_m';
+    const ORIGINAL_SLUG = 'inkling-2-mini';
+    const MODEL = 'Inkling-2-Mini';
+
+    function inklingBuild(fields: Partial<CatalogBuildItem> & Pick<CatalogBuildItem, 'id' | 'slug'>): CatalogBuildItem {
+      return {
+        hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
+        sizeGb: 18.7,
+        source: 'Unsloth GGUF',
+        included: 'Vision and DSpark draft included',
+        installed: false,
+        present: false,
+        heldBy: null,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
+        ...fields,
+      };
+    }
+
+    /** The routes of a page with Inkling-2-Mini in three builds, each build's state overridden by its folder. */
+    function inklingRoutes(
+      builds: Partial<Record<string, Partial<CatalogBuildItem>>> = {},
+      jobs: DownloadJob[] = [],
+      updates: CatalogUpdatesResponse = { items: [] },
+    ): Record<string, unknown> {
+      const routes = catalogRoutes({}, jobs, updates);
+      routes['/catalog'] = {
+        items: [
+          {
+            label: MODEL,
+            description: 'Looped MoE with vision and DSpark drafts, 1M context',
+            builds: [
+              inklingBuild({ id: 'UD-Q4_K_XL', slug: XL_SLUG, ...builds[XL_SLUG] }),
+              inklingBuild({
+                id: 'UD-Q4_K_M',
+                slug: M_SLUG,
+                sizeGb: 17.7,
+                note: '1 GB smaller',
+                ...builds[M_SLUG],
+              }),
+              inklingBuild({
+                id: 'Original',
+                slug: ORIGINAL_SLUG,
+                hfRepo: 'thinkingmachines/Inkling-2-Mini',
+                sizeGb: 20.2,
+                source: 'Thinking Machines',
+                note: 'NVFP4 + MXFP8',
+                ...builds[ORIGINAL_SLUG],
+              }),
+            ],
+          },
+        ],
+      };
+      return routes;
+    }
+
+    async function mountInkling(): Promise<HTMLElement> {
+      mounted = await renderPage(
+        createElement(MemoryRouter, null, createElement(Models), createElement(PaletteProbe)),
+        (text) => text.includes(MODEL),
+      );
+      await settle();
+      return mounted.container.querySelector<HTMLElement>(`[data-model="${XL_SLUG}"]`)!;
+    }
+
+    function segment(card: Element, build: string): HTMLButtonElement {
+      const found = [...card.querySelectorAll<HTMLButtonElement>('[role="group"] button[data-value]')].find(
+        (button) => button.getAttribute('data-value') === build,
+      );
+      expect(found, build).toBeTruthy();
+      return found!;
+    }
+
+    function row(card: Element, name: string): string {
+      return splitWhitespace(card.querySelector(`[data-row="${name}"]`)?.textContent ?? '').join(' ');
+    }
+
+    it('shows the first build and names the switch by the model', async () => {
+      recordRequests(inklingRoutes());
+      const card = await mountInkling();
+      expect(card.querySelector('[role="group"]')?.getAttribute('aria-label')).toBe(`Build of ${MODEL}`);
+      expect(segment(card, XL_SLUG).getAttribute('aria-pressed')).toBe('true');
+      expect(row(card, 'build')).toContain('18.7 GB · Unsloth GGUF');
+      expect(row(card, 'extras')).toBe('Vision and DSpark draft included');
+      expect(buttonLabels()).toContain('Install UD-Q4_K_XL');
+    });
+
+    it('choosing a build starts nothing and changes the link, the build line and the button', async () => {
+      const calls = recordRequests(inklingRoutes());
+      const card = await mountInkling();
+      const before = calls.length;
+      await act(async () => segment(card, ORIGINAL_SLUG).click());
+      await settle();
+      // Mutation: start a job on choose → a POST → red.
+      expect(calls.slice(before).filter((call) => call.method !== 'GET')).toEqual([]);
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card.querySelector('[data-row="title"] a')?.getAttribute('href')).toBe(
+        'https://huggingface.co/thinkingmachines/Inkling-2-Mini',
+      );
+      expect(row(card, 'build')).toContain('20.2 GB · Thinking Machines · NVFP4 + MXFP8');
+      expect(buttonLabels()).toContain('Install Original');
+      expect(buttonLabels()).not.toContain('Install UD-Q4_K_XL');
+    });
+
+    it('Install posts the chosen build folder', async () => {
+      const calls = serveReinstall(inklingRoutes(), (body) => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-m', slug: (body as { slug: string }).slug, repo: 'unsloth/Inkling-2-Mini-GGUF' },
+      }));
+      const card = await mountInkling();
+      await act(async () => segment(card, M_SLUG).click());
+      await act(async () => buttonNamed(card, 'Install UD-Q4_K_M').click());
+      await waitFor(() => openedStreams.includes('job-m'));
+      // Mutation: Install posts builds[0].slug → red.
+      expect(posts(calls, '/downloads')).toEqual([{ slug: M_SLUG }]);
+      expect(segment(card, M_SLUG).querySelector('[data-mark="downloading"]')).not.toBeNull();
+    });
+
+    it('marks every build that is not chosen with its state, in words', async () => {
+      recordRequests(
+        inklingRoutes(
+          {
+            [XL_SLUG]: { blockedByForeignDir: true, blocker: BLOCKER },
+            [M_SLUG]: { present: true, installed: true, localRevision: 'a'.repeat(40) },
+          },
+          [downloadJob({ id: 'job-original', slug: ORIGINAL_SLUG })],
+          { items: [{ hfRepo: 'unsloth/Inkling-2-Mini-GGUF', remoteRevision: 'b'.repeat(40) }] },
+        ),
+      );
+      const card = await mountInkling();
+      // The build with a job is the one the card shows first.
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      // Mutation: mark only the chosen segment → red.
+      expect(segment(card, XL_SLUG).textContent).toBe('UD-Q4_K_XLneeds attention');
+      expect(segment(card, M_SLUG).textContent).toBe('UD-Q4_K_Mupdate available');
+      expect(segment(card, ORIGINAL_SLUG).textContent).toBe('Originaldownloading');
+    });
+
+    it('an installed build that is not first is the one the card shows, with its mark', async () => {
+      recordRequests(inklingRoutes({ [ORIGINAL_SLUG]: { present: true, installed: true } }));
+      const card = await mountInkling();
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card.querySelector('[data-status="installed"]')).not.toBeNull();
+      await act(async () => segment(card, XL_SLUG).click());
+      expect(segment(card, ORIGINAL_SLUG).textContent).toBe('Originalinstalled');
+      expect(buttonLabels()).toContain('Install UD-Q4_K_XL');
+      // A model counts as installed when one of its builds is.
+      expect(mounted!.text()).toContain('1 of 1 installed');
+    });
+
+    it('counts a model with two builds on disk once', async () => {
+      recordRequests(
+        inklingRoutes({
+          [M_SLUG]: { present: true, installed: true },
+          [ORIGINAL_SLUG]: { present: true, installed: true },
+        }),
+      );
+      await mountInkling();
+      // Mutation: count builds on disk in place of models → '2 of 1 installed' → red.
+      expect(mounted!.text()).toContain('1 of 1 installed');
+    });
+
+    it('keeps the build whose job ended on the card until the catalog says it is on disk', async () => {
+      const stale = inklingRoutes({}, [downloadJob({ id: 'job-original', slug: ORIGINAL_SLUG })]);
+      const fresh = inklingRoutes({ [ORIGINAL_SLUG]: { present: true, installed: true } });
+      const held = deferred(fresh['/catalog']);
+      recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], held.body),
+        '/downloads/job-original': { cancelled: true, id: 'job-original' },
+      });
+      await mountInkling();
+      const card = (): Element => mounted!.container.querySelector(`[data-model="${XL_SLUG}"]`)!;
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+
+      emitDownload('done', { id: 'job-original', outputDir: '/models/x' });
+      await settle();
+      // Mutation: shownBuild leaves out the settling build → the card jumps to UD-Q4_K_XL with a live Install → red.
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(liveButtonLabels().filter((label) => label.startsWith('Install'))).toEqual([]);
+
+      held.release();
+      await settle();
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card().querySelector('[data-status="installed"]')).not.toBeNull();
+    });
+
+    it('lists one palette command per build, by folder, and a command chooses its build', async () => {
+      const calls = serveReinstall(inklingRoutes(), (body) => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-p', slug: (body as { slug: string }).slug, repo: 'thinkingmachines/Inkling-2-Mini' },
+      }));
+      const card = await mountInkling();
+      // Mutation: ids by hfRepo → two ids collide → red.
+      expect(paletteIds.filter((id) => id.startsWith('models:install:'))).toEqual([
+        `models:install:${XL_SLUG}`,
+        `models:install:${M_SLUG}`,
+        `models:install:${ORIGINAL_SLUG}`,
+      ]);
+      expect(paletteLabels).toContain(`Install ${MODEL} (UD-Q4_K_M)`);
+      expect(paletteLabels).toContain(`Install ${MODEL} (Original)`);
+      await act(async () => paletteCommands.find((command) => command.id === `models:install:${ORIGINAL_SLUG}`)!.run());
+      await settle();
+      expect(posts(calls, '/downloads')).toEqual([{ slug: ORIGINAL_SLUG }]);
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+    });
+  });
+
+  describe('the five rows', () => {
+    const ENTRY: CatalogItem = {
+      label: LABEL,
+      description: 'Best tool use',
+      builds: [
+        {
+          id: 'MXFP4',
+          hfRepo: REPO,
+          sizeGb: 23.3,
+          source: 'MLX',
+          slug: SLUG,
+          installed: false,
+          present: false,
+          heldBy: null,
+          blockedByForeignDir: false,
+          blocker: null,
+          localRevision: null,
+          localAssetsRepo: null,
+          localAssetsRevision: null,
+        },
+      ],
+    };
+
+    function props(item: Partial<CatalogBuildItem>, fields: Partial<CatalogDownloadProps> = {}): CatalogDownloadProps {
+      return {
+        ...settlingProps(BLOCKER),
+        settling: false,
+        item: { ...ENTRY.builds[0], ...item },
+        ...fields,
+      };
+    }
+
+    function view(download: CatalogDownloadProps, extra: Partial<CatalogCardViewProps> = {}) {
+      return createElement(
+        MemoryRouter,
+        null,
+        createElement(CatalogCardView, {
+          entry: { ...ENTRY, builds: [{ ...ENTRY.builds[0], ...download.item }] },
+          chosen: SLUG,
+          onChoose: () => {},
+          downloads: [download],
+          progress: INITIAL_PROGRESS,
+          starting: [],
+          onStart: () => {},
+          host: undefined,
+          ...extra,
+        }),
+      );
+    }
+
+    const job = { id: 'job-1', committing: false, cancelling: false, connection: 0, source: 'local' as const };
+
+    it.each<[string, CatalogDownloadProps, string]>([
+      ['install', props({}), 'Install'],
+      ['job', props({}, { job }), 'Cancel'],
+      ['installed', props({ present: true, installed: true }), 'Installed'],
+      ['update', props({ present: true, installed: true }, { updateAvailable: true }), 'Update'],
+      ['held', props({ heldBy: 'UD-Q4_K_M' }), 'Holds UD-Q4_K_M'],
+      ['adopt', props({ blockedByForeignDir: true, blocker: HELD }), 'Needs update'],
+      ['stuck', props({ blockedByForeignDir: true, blocker: { ...HELD, truncated: true } }), 'Needs cleanup'],
+      ['replace', props({ blockedByForeignDir: true, blocker: BLOCKER }), 'Needs cleanup'],
+    ])('has five rows and no alert in the %s state', async (state, download, action) => {
+      expect(catalogActionState(download.item, download)).toBe(state);
+      mounted = await renderPage(view(download), (text) => text.includes(LABEL));
+      const card = mounted.container.querySelector('[data-model]')!;
+      const rows = [...card.querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      // Mutation: render the old Alert in the action row → a sixth block or an alert → red.
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      // An Alert is role="alert" (danger) or role="status" (warning).
+      expect(card.querySelector('[role="alert"], [role="status"]')).toBeNull();
+      expect(card.querySelector('[data-row="action"]')?.textContent).toContain(action);
+    });
+
+    it.each<[string, CatalogDownloadProps, string]>([
+      [
+        'held',
+        props({ heldBy: 'UD-Q4_K_M' }),
+        `${SLUG} holds UD-Q4_K_M. Delete it in Local models to install MXFP4 here.`,
+      ],
+      [
+        'stuck',
+        props({ blockedByForeignDir: true, blocker: { ...HELD, truncated: true, listed: true } }),
+        `${SLUG} holds a model that the app did not create.`,
+      ],
+    ])(
+      'gives a keyboard and screen reader user the reason of the %s state beside Show in Local models',
+      async (_state, download, sentence) => {
+        mounted = await renderPage(view(download, { detailsTo: `/models?focus=${SLUG}` }), (text) =>
+          text.includes(LABEL),
+        );
+        const action = mounted.container.querySelector('[data-row="action"]')!;
+        expect(action.textContent).toContain('Show in Local models');
+        // Mutation: keep the sentence in the hover Tooltip only → red.
+        expect([...action.querySelectorAll('.sr-only')].map((node) => node.textContent)).toContain(sentence);
+      },
+    );
+
+    it('marks the installed text installed when an update is available too', async () => {
+      mounted = await renderPage(view(props({ present: true, installed: true }, { updateAvailable: true })), (text) =>
+        text.includes(LABEL),
+      );
+      // Mutation: data-status names the action state ('update') → red.
+      expect(mounted.container.querySelector('[data-row="action"] [data-status="installed"]')).not.toBeNull();
+    });
+
+    it('takes the first match: job, update, installed, held, adopt, stuck, replace, install', () => {
+      const job = { id: 'j', committing: false, cancelling: false, connection: 0, source: 'local' as const };
+      const all = {
+        present: true,
+        heldBy: 'UD-Q4_K_M',
+        blocker: HELD,
+      };
+      expect(catalogActionState(all, { job, updateAvailable: true })).toBe('job');
+      expect(catalogActionState(all, { job: undefined, updateAvailable: true })).toBe('update');
+      expect(catalogActionState(all, { job: undefined, updateAvailable: false })).toBe('installed');
+      const absent = { ...all, present: false };
+      expect(catalogActionState(absent, { job: undefined, updateAvailable: true })).toBe('held');
+      expect(catalogActionState({ ...absent, heldBy: null }, { job: undefined, updateAvailable: false })).toBe('adopt');
+      expect(
+        catalogActionState(
+          { ...absent, heldBy: null, blocker: { ...HELD, kind: 'symlink' } },
+          { job: undefined, updateAvailable: false },
+        ),
+      ).toBe('stuck');
+      expect(
+        catalogActionState({ ...absent, heldBy: null, blocker: BLOCKER }, { job: undefined, updateAvailable: false }),
+      ).toBe('replace');
+      expect(
+        catalogActionState({ ...absent, heldBy: null, blocker: null }, { job: undefined, updateAvailable: false }),
+      ).toBe('install');
+    });
+
+    it('says Starting download… while the request is in flight, with Locate… off', async () => {
+      const download = props({});
+      mounted = await renderPage(view(download, { starting: [SLUG], locate: () => {} }), (text) =>
+        text.includes(LABEL),
+      );
+      expect(buttonNamed(mounted.container, 'Starting download…').disabled).toBe(true);
+      expect(buttonNamed(mounted.container, 'Locate…').disabled).toBe(true);
+    });
+
+    it('renders Locate… only with the prop and only beside Install', async () => {
+      const locate = vi.fn();
+      mounted = await renderPage(view(props({})), (text) => text.includes(LABEL));
+      expect(liveButtonLabels()).not.toContain('Locate…');
+      mounted.unmount();
+      mounted = await renderPage(view(props({}), { locate }), (text) => text.includes(LABEL));
+      await act(async () => buttonNamed(mounted!.container, 'Locate…').click());
+      expect(locate).toHaveBeenCalledWith(expect.objectContaining({ slug: SLUG }));
+      mounted.unmount();
+      mounted = await renderPage(view(props({ present: true, installed: true }), { locate }), (text) =>
+        text.includes(LABEL),
+      );
+      // Mutation: render Locate in every state → red.
+      expect(buttonLabels()).not.toContain('Locate…');
+    });
+
+    it('says a disk that is too small on the build line, with the full sentence for the tooltip', async () => {
+      const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: 10 * 1024 ** 3 };
+      mounted = await renderPage(view(props({}), { host }), (text) => text.includes(LABEL));
+      expect(mounted.container.querySelector('[data-row="build"]')?.textContent).toContain(
+        '23.3 GB · only 10.0 GB free on this disk',
+      );
+      expect(
+        hostLine({ sizeGb: 23.3, present: false }, undefined, { totalMemBytes: 16 * 1024 ** 3, diskFreeBytes: null }),
+      ).toBe("23.3 GB · more than this Mac's 16.0 GB");
+    });
+
+    it('starts the draft from Add with the draft folder, beside a model with no build on disk', async () => {
+      const calls = serveReinstall(catalogRoutes({ draft: draftItem(false) }), (body) => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-draft', slug: (body as { slug: string }).slug, repo: 'z-lab/Qwen3.8-27B-DFlash2' },
+      }));
+      await mountModels();
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      await act(async () => buttonNamed(companion, 'Add').click());
+      await waitFor(() => openedStreams.includes('job-draft'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: 'qwen3.8-27b-dflash2' }]);
+      // The model keeps its own Install beside the draft's job.
+      expect(liveButtonLabels()).toContain('Install');
+    });
+
+    it('says the draft waits for the model when no build of it is on disk', async () => {
+      await mount(
+        createElement(MemoryRouter, null, createElement(Models)),
+        catalogRoutes({ draft: draftItem(true) }),
+        LABEL,
+      );
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      expect(companion.textContent).toContain('added · waits for the model');
+    });
   });
 });
 

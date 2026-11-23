@@ -261,6 +261,37 @@ describe('first model onboarding', () => {
     expect(page.container.querySelector('aside')).not.toBeNull();
   });
 
+  it('offers one choice per model and names the build of a model with more builds in the dock', async () => {
+    dispose = stubApi(routes('/test/builds'));
+    await mount();
+    const radios = [...page!.container.querySelectorAll<HTMLInputElement>('input[type=radio]')];
+    expect(radios.map((radio) => radio.value)).toEqual(unfloored.map((item) => item.label));
+    const qwen = visible.find((item) => item.isDefault === true)!;
+    expect(qwen.builds.length).toBeGreaterThan(1);
+    expect(page!.text()).toContain(`Build ${qwen.builds[0].id}. More builds are on the Models page.`);
+    const single = unfloored.find((item) => item.builds.length === 1);
+    if (single !== undefined) {
+      await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${single.label}"]`)!.click());
+      expect(page!.text()).not.toContain('More builds are on the Models page.');
+    }
+  });
+
+  it('stands a model for its build on disk when that is not its first build', async () => {
+    const inkling = visible.find((item) => item.label === 'Inkling-2-Mini')!;
+    const [first, second, ...rest] = inkling.builds;
+    const onDisk: CatalogItem = { ...inkling, builds: [first, { ...second, present: true }, ...rest] };
+    dispose = stubApi({
+      ...routes('/test/second-build'),
+      '/catalog': { items: items.map((item) => (item.label === inkling.label ? onDisk : item)) },
+    });
+    await mount();
+    const choice = page!.container.querySelector<HTMLInputElement>(`input[value="${inkling.label}"]`)!;
+    const card = choice.closest('label')!;
+    // Mutation: Onboarding reads builds[0] → the first build's size and "One-time download" → red.
+    expect(card.textContent).toContain(`~${second.sizeGb} GB · Downloaded`);
+    expect(card.textContent).toContain('On this Mac');
+  });
+
   it('continues from a ready model to coding agent setup and remembers completion', async () => {
     const dir = '/test/completed-onboarding';
     window.history.replaceState({}, '', '/welcome');

@@ -11,7 +11,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { modelBlurb, offeredOnHost } from '../lib/catalog';
+import { modelBlurb, modelPresent, offeredOnHost, onboardingBuild } from '../lib/catalog';
 import { dismissOnboarding } from '../lib/onboarding';
 import type { CatalogBuildItem, CatalogResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
@@ -60,15 +60,15 @@ export default function Onboarding({
   const items = (catalog.data?.items ?? []).filter(
     (item) => offeredOnHost(item, host) && item.category !== 'systemone',
   );
-  const activeLabel = items.find((item) => activeSlugs.includes(item.builds[0].slug))?.label;
+  const activeLabel = items.find((item) => item.builds.some((build) => activeSlugs.includes(build.slug)))?.label;
   const selected =
     items.find((item) => item.label === (activeLabel ?? selectedLabel)) ??
-    items.find((item) => item.isDefault === true && !blocked(item.builds[0])) ??
-    items.find((item) => !blocked(item.builds[0])) ??
+    items.find((item) => item.isDefault === true && !blocked(onboardingBuild(item, activeSlugs))) ??
+    items.find((item) => !blocked(onboardingBuild(item, activeSlugs))) ??
     items[0];
-  const selectedBuild = selected?.builds[0];
+  const selectedBuild = selected === undefined ? undefined : onboardingBuild(selected, activeSlugs);
   const downloading = activeLabel !== undefined;
-  const ready = selectedBuild?.present === true && !downloading;
+  const ready = selected !== undefined && modelPresent(selected) && !downloading;
   const error = catalog.error ?? models.error ?? downloadsError;
   const loading = catalog.loading || models.loading || downloadsLoading;
   const modelsDir = models.data?.dir;
@@ -148,7 +148,7 @@ export default function Onboarding({
       >
         <legend className="sr-only">Choose your first model</legend>
         {items.map((item) => {
-          const build = item.builds[0];
+          const build = onboardingBuild(item, activeSlugs);
           const note = hostNote(build, item.minMemoryGb, host);
           return (
             <ChoiceCard
@@ -163,7 +163,7 @@ export default function Onboarding({
               descriptionId={`description-${build.slug}`}
               media={<ModelLogo model={item.label} className="size-7" />}
               badge={
-                build.present ? (
+                modelPresent(item) ? (
                   <Badge tone="success" size="sm">
                     On this Mac
                   </Badge>
@@ -249,6 +249,11 @@ export default function Onboarding({
                         ? 'Keep the app open. You can look around while it downloads.'
                         : `About ${selectedBuild.sizeGb} GB to download.`}
                   </p>
+                  {selected.builds.length > 1 ? (
+                    <p className="m-0 text-caption text-secondary">
+                      {`Build ${selectedBuild.id}. More builds are on the Models page.`}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="grid w-[17.5rem] max-w-full shrink-0 justify-items-center gap-2">
                   {ready ? (

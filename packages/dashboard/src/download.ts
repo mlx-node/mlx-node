@@ -1303,8 +1303,10 @@ export class DownloadManager {
    * `adopt` makes the job an Update: it must be the token of the last {@link planAdoption} for the folder, which the
    * request uses up. A repeat Update request while the Update job is active hands back its id; one while another job
    * holds the folder is refused.
+   *
+   * Answers the job's id and the repository it downloads.
    */
-  start(slug: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): string {
+  start(slug: string, opts?: { replaceBlocker?: ReplaceBlocker; adopt?: string }): { id: string; repo: string } {
     if (this.closed) throw new DownloadsClosedError();
     // `hidden` entries are unpublished repos. They stay in MODEL_CATALOG so a
     // locally converted checkpoint at the canonical slug is still recognized as
@@ -1329,7 +1331,7 @@ export class DownloadManager {
           'A download of this model is already in the queue. Cancel it, then use Reinstall.',
         );
       }
-      return active.id;
+      return { id: active.id, repo: active.repo };
     }
     this.assertNotHeld(target);
     const replace = asked === undefined ? null : this.acceptReplace(slug, asked);
@@ -1352,7 +1354,7 @@ export class DownloadManager {
     this.order.push(id);
     this.queue.push(id);
     void this.drain();
-    return id;
+    return { id, repo: target.repo };
   }
 
   /**

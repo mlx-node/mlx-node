@@ -35,6 +35,7 @@ import { CHAT, fill } from '../../../ui/src/lib/chat-strings';
 import { ToastBridge } from '../../../ui/src/lib/toast';
 import { ArcLink } from '../../../ui/src/shell/arc-link';
 import { type ThemePreference, initTheme, useTheme } from '../../../ui/src/theme/theme';
+import { CatalogCardSection } from './catalog-sections';
 import {
   AgentTimelineSection,
   BarListSection,
@@ -585,6 +586,12 @@ function Gallery(): ReactElement {
       </Section>
       <Section title="AgentMark" note="claude, codex, grok at 28 and 20 px, in the text color.">
         <AgentMarkSection />
+      </Section>
+      <Section
+        title="Catalog card"
+        note="Every state of a recommended model card, then the DFlash2 line in each state; every card is one height."
+      >
+        <CatalogCardSection />
       </Section>
       <Section
         title="DownloadProgress"
