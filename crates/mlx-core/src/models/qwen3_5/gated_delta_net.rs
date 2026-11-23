@@ -612,6 +612,17 @@ impl GatedDeltaNet {
     /// output columns that `forward` drops (`split_ba_padded`), so the merge
     /// stays one dispatch per layer with the numerics of the unpadded pair.
     pub fn finalize_after_load(&mut self) -> Result<()> {
+        self.finalize_after_load_with_host_policy(false)
+    }
+
+    /// Like [`Self::finalize_after_load`], but when `preserve_host_backed` is
+    /// `true`, skips GPU row-concatenation merges on projections that have
+    /// settled CUDA host-backed storage (`device < 0`) so overflow layers stay
+    /// host-backed instead of being re-promoted into VRAM.
+    pub(crate) fn finalize_after_load_with_host_policy(
+        &mut self,
+        preserve_host_backed: bool,
+    ) -> Result<()> {
         let mut derived = vec![&self.a_log, &self.qk_norm_w_q, &self.qk_norm_w_k];
         derived.extend(
             [&self.gdn_scale_f32, &self.dt_bias_f32, &self.conv1d_w4_f32]
@@ -621,6 +632,8 @@ impl GatedDeltaNet {
         MxArray::eval_arrays(&derived)?;
         self.split_in_proj_b_a_m8 = None;
         if let Some((b, a)) = self.split_in_proj_b_a.as_ref()
+            && !(preserve_host_backed
+                && (b.has_settled_cuda_host_storage() || a.has_settled_cuda_host_storage()))
             && !std::env::var("MLX_GDN_BA_FUSION").is_ok_and(|v| v == "0")
             && let Some(merged) = merge_split_ba_m8(b, a)?
         {
@@ -635,6 +648,14 @@ impl GatedDeltaNet {
             self.split_in_proj_b_a_m8 = Some(merged);
         }
         if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
+            self.in_proj_qkvz_ba_t = None;
+            self.in_proj_qkvz_ba_q = None;
+            return Ok(());
+        }
+        if preserve_host_backed
+            && (self.in_proj_qkvz.has_settled_cuda_host_storage()
+                || self.in_proj_ba.has_settled_cuda_host_storage())
+        {
             self.in_proj_qkvz_ba_t = None;
             self.in_proj_qkvz_ba_q = None;
             return Ok(());

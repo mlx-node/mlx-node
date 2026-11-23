@@ -114,6 +114,31 @@ impl CudaDeviceBudget {
         }
     }
 
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.unlimited
+    }
+
+    pub(crate) fn align_bytes(bytes: u64) -> Option<u64> {
+        if bytes == 0 {
+            Some(0)
+        } else {
+            bytes.checked_next_multiple_of(CUDA_ALLOC_ALIGN_BYTES)
+        }
+    }
+
+    pub(crate) fn can_fit(&self, bytes: u64) -> bool {
+        if bytes == 0 || self.unlimited {
+            return true;
+        }
+        if self.exhausted.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(needed) = Self::align_bytes(bytes) else {
+            return false;
+        };
+        self.remaining_bytes.load(Ordering::Acquire) >= needed
+    }
+
     pub(crate) fn is_exhausted(&self) -> bool {
         !self.unlimited
             && (self.exhausted.load(Ordering::Acquire)

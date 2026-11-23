@@ -1556,13 +1556,29 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) -> Result<()> {
+        self.set_quantized_dense_mlp_with_merge(gate_proj, up_proj, down_proj, true)
+    }
+
+    /// Like [`Self::set_quantized_dense_mlp`], with `merge_gate_up=false` to
+    /// skip the GPU `concat_rows` merge when preserving host-backed overflow
+    /// projections on discrete CUDA GPUs.
+    pub(crate) fn set_quantized_dense_mlp_with_merge(
+        &mut self,
+        gate_proj: QuantizedLinear,
+        up_proj: QuantizedLinear,
+        down_proj: QuantizedLinear,
+        merge_gate_up: bool,
+    ) -> Result<()> {
         self.mlp = MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
             gate_up: None,
         });
-        self.mlp.finalize_gate_up()
+        if merge_gate_up {
+            self.mlp.finalize_gate_up()?;
+        }
+        Ok(())
     }
 
     /// Whether any main-model projection in this decoder layer is quantized.

@@ -137,6 +137,12 @@ impl MxArray {
         unsafe { sys::mlx_array_cuda_host_bytes(self.handle.0) }
     }
 
+    /// Whether this array is already evaluated and backed by CUDA host memory
+    /// (`device < 0`), without triggering evaluation of lazy arrays.
+    pub(crate) fn is_settled_cuda_host(&self) -> bool {
+        self.is_available() && self.cuda_host_bytes() > 0
+    }
+
     /// Wrap a page-aligned read-only mmap slice as a zero-copy `uint8`
     /// `[n_pages, page_size]` Metal array without charging MLX active memory.
     /// `release_fn(ctx)` is invoked once after the last array and in-flight

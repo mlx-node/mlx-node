@@ -641,6 +641,18 @@ impl LinearProj {
         matches!(self, LinearProj::Quantized(_))
     }
 
+    /// Whether any tensor backing this projection is already settled in CUDA
+    /// host-backed memory (`device < 0`), without evaluating lazy arrays.
+    pub(crate) fn has_settled_cuda_host_storage(&self) -> bool {
+        match self {
+            LinearProj::Standard(l) => {
+                l.get_weight().is_settled_cuda_host()
+                    || l.get_bias().is_some_and(|b| b.is_settled_cuda_host())
+            }
+            LinearProj::Quantized(ql) => ql.has_settled_cuda_host_storage(),
+        }
+    }
+
     /// Row-merge two quantized projections into one `[N1 + N2, K]` packed
     /// linear (see [`QuantizedLinear::concat_rows`]). `Ok(None)` when either
     /// side is dense or the packed formats are incompatible — the caller then
@@ -2480,27 +2492,57 @@ impl QuantizedLinear {
         MxArray::eval_arrays_with_context(&pending, context)
     }
 
+    /// Whether any backing tensor of this projection is already settled in
+    /// CUDA host-backed memory (`device < 0`), without evaluating lazy arrays.
+    pub(crate) fn has_settled_cuda_host_storage(&self) -> bool {
+        self.weight.is_settled_cuda_host()
+            || self.scales.is_settled_cuda_host()
+            || self
+                .biases
+                .as_ref()
+                .is_some_and(MxArray::is_settled_cuda_host)
+            || self.s_w.as_ref().is_some_and(MxArray::is_settled_cuda_host)
+            || self
+                .bias
+                .as_ref()
+                .is_some_and(MxArray::is_settled_cuda_host)
+    }
+
     /// Cast affine-mode `scales`/`biases`/`bias` f16→`target` once at load.
     /// Only f16 operands move: f32 GGUF-adjacent sidecars are already at the
     /// promote path's dtype and bf16 companions (the `a<bits>g64` contract)
     /// are left alone.
-    fn promote_affine_sidecars(&mut self, target: crate::array::DType) -> Result<()> {
+    fn promote_affine_sidecars(
+        &mut self,
+        target: crate::array::DType,
+        preserve_host_backed: bool,
+    ) -> Result<()> {
         if self.mode != DEFAULT_QUANT_MODE {
             return Ok(());
         }
         self.planes = None;
+        let host_backed = preserve_host_backed && self.has_settled_cuda_host_storage();
+        let cast_sidecar = |arr: &MxArray| -> Result<MxArray> {
+            if host_backed || (preserve_host_backed && arr.is_settled_cuda_host()) {
+                let out = arr.astype_cpu(target)?;
+                out.eval();
+                Ok(out)
+            } else {
+                arr.astype(target)
+            }
+        };
         if self.scales.dtype()? == crate::array::DType::Float16 {
-            self.scales = self.scales.astype(target)?;
+            self.scales = cast_sidecar(&self.scales)?;
         }
         if let Some(b) = &self.biases
             && b.dtype()? == crate::array::DType::Float16
         {
-            self.biases = Some(b.astype(target)?);
+            self.biases = Some(cast_sidecar(b)?);
         }
         if let Some(b) = &self.bias
             && b.dtype()? == crate::array::DType::Float16
         {
-            self.bias = Some(b.astype(target)?);
+            self.bias = Some(cast_sidecar(b)?);
         }
         Ok(())
     }
@@ -2516,10 +2558,18 @@ impl QuantizedLinear {
         &mut self,
         compute_dtype: crate::array::DType,
     ) -> Result<()> {
+        self.promote_affine_sidecars_to_f32_with_host_policy(compute_dtype, false)
+    }
+
+    pub(crate) fn promote_affine_sidecars_to_f32_with_host_policy(
+        &mut self,
+        compute_dtype: crate::array::DType,
+        preserve_host_backed: bool,
+    ) -> Result<()> {
         if compute_dtype == crate::array::DType::Float16 {
             return Ok(());
         }
-        self.promote_affine_sidecars(crate::array::DType::Float32)
+        self.promote_affine_sidecars(crate::array::DType::Float32, preserve_host_backed)
     }
 
     /// Cast affine-mode `scales`/`biases`/`bias` f16→bf16 once at load, for
@@ -2532,7 +2582,14 @@ impl QuantizedLinear {
     /// scale/bias are read in bf16 — so it is scoped to the clef loader,
     /// which validated the drift against its bf16 ground truth.
     pub fn promote_affine_sidecars_to_bf16(&mut self) -> Result<()> {
-        self.promote_affine_sidecars(crate::array::DType::BFloat16)
+        self.promote_affine_sidecars_to_bf16_with_host_policy(false)
+    }
+
+    pub(crate) fn promote_affine_sidecars_to_bf16_with_host_policy(
+        &mut self,
+        preserve_host_backed: bool,
+    ) -> Result<()> {
+        self.promote_affine_sidecars(crate::array::DType::BFloat16, preserve_host_backed)
     }
 
     /// Row-concatenate two quantized projections into one `[N1+N2, K]`

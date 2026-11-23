@@ -721,6 +721,8 @@ fn collect_tensor(
 }
 
 type TensorConsumer<'a> = dyn FnMut(HashMap<String, MxArray>) -> Result<()> + 'a;
+type ClefTensorConsumer<'a> =
+    dyn FnMut(HashMap<String, MxArray>, &CudaDeviceBudget) -> Result<()> + 'a;
 
 /// Groups become available only after their last window's GPU and CPU work
 /// completes. Moving their destinations out lets subsequent reads reuse the
@@ -1773,6 +1775,9 @@ pub(crate) struct GgufPreload {
     #[cfg(test)]
     pub identity: GgufIdentity,
     pub stats: LoadStats,
+    /// Shared CUDA device-memory budget used during preload, carried into
+    /// downstream weight installation and post-load residency passes.
+    pub(crate) cuda_budget: Option<CudaDeviceBudget>,
 }
 
 fn add_stats(total: &mut LoadStats, part: &LoadStats) {
@@ -1809,7 +1814,7 @@ impl GgufPreload {
     /// the complete decision head still take the ordinary preload path.
     pub(crate) fn load_clef(
         input: &PreloadInput,
-        consume: &mut TensorConsumer<'_>,
+        consume: &mut ClefTensorConsumer<'_>,
     ) -> Result<Self> {
         Self::load_consuming(input, RepackBackend::Auto, Some(consume))
     }
@@ -1817,7 +1822,7 @@ impl GgufPreload {
     fn load_consuming(
         input: &PreloadInput,
         backend: RepackBackend,
-        mut consume: Option<&mut TensorConsumer<'_>>,
+        mut consume: Option<&mut ClefTensorConsumer<'_>>,
     ) -> Result<Self> {
         let started = Instant::now();
         let mode = PageCacheMode::from_env()?;
@@ -1867,7 +1872,7 @@ impl GgufPreload {
                 transform_imported_part(map, main_header, main_plan, &input.opts, false)?;
             materialize(&mut imported.weights, &imported.views, &budget)?;
             match consume.as_deref_mut() {
-                Some(consume) => consume(imported.weights)?,
+                Some(consume) => consume(imported.weights, &budget)?,
                 None => unreachable!("consumer groups require a callback"),
             }
             budget.refresh_from_free();
@@ -2003,6 +2008,7 @@ impl GgufPreload {
             #[cfg(test)]
             identity: input.identity(),
             stats,
+            cuda_budget: Some(budget),
         })
     }
 }
@@ -3080,7 +3086,7 @@ mod tests {
         let full = GgufPreload::load(&input).unwrap();
         let mut streamed = HashMap::new();
         let mut calls = 0;
-        let rest = GgufPreload::load_clef(&input, &mut |layer| {
+        let rest = GgufPreload::load_clef(&input, &mut |layer, _| {
             assert!(layer.keys().all(|key| key.starts_with("model.layers.")));
             calls += 1;
             streamed.extend(layer);
@@ -3108,7 +3114,7 @@ mod tests {
         let fx = write_import_fixture("qwen35-dense-untied", &work);
         let input = fixture_input(&fx, false);
         let mut changed = false;
-        let err = GgufPreload::load_clef(&input, &mut |_| {
+        let err = GgufPreload::load_clef(&input, &mut |_, _| {
             if !changed {
                 let file = fs::OpenOptions::new().write(true).open(&fx.main).unwrap();
                 file.set_len(file.metadata().unwrap().len() + 1).unwrap();

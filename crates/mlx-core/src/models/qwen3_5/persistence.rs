@@ -1,5 +1,5 @@
 use crate::vision::qwen::weights::{load_vision_weights, parse_vision_config};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -37,6 +37,7 @@ use crate::engine::persistence::{
     spawn_loaded_model_thread, strip_qwen35_vision_weight_prefix,
 };
 use crate::models::clef::head::{HeadConfig, JointHead};
+use crate::utils::gguf_gpu::CudaDeviceBudget;
 use crate::utils::gguf_import::GgufPreload;
 
 use super::config::Qwen3_5Config;
@@ -113,6 +114,16 @@ pub(crate) fn merge_split_projections(
     result: &mut HashMap<String, MxArray>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
 ) -> Result<()> {
+    merge_split_projections_with_policy(result, per_layer_quant, false, None, None)
+}
+
+fn merge_split_projections_with_policy(
+    result: &mut HashMap<String, MxArray>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    preserve_host_backed: bool,
+    cuda_budget: Option<&CudaDeviceBudget>,
+    mut pre_merge_device_bytes: Option<&mut HashMap<String, u64>>,
+) -> Result<()> {
     fn companion_layouts_match(
         params: &HashMap<String, MxArray>,
         left: &str,
@@ -164,6 +175,71 @@ pub(crate) fn merge_split_projections(
         }
     }
 
+    fn cuda_policy_allows_merge(
+        params: &HashMap<String, MxArray>,
+        left: &str,
+        right: &str,
+        preserve_host_backed: bool,
+        cuda_budget: Option<&CudaDeviceBudget>,
+    ) -> bool {
+        if preserve_host_backed {
+            for suffix in ["weight", "scales", "biases"] {
+                if params
+                    .get(&format!("{left}.{suffix}"))
+                    .is_some_and(MxArray::is_settled_cuda_host)
+                    || params
+                        .get(&format!("{right}.{suffix}"))
+                        .is_some_and(MxArray::is_settled_cuda_host)
+                {
+                    return false;
+                }
+            }
+        }
+        if crate::accelerator::cuda_ops_available()
+            && let Some(budget) = cuda_budget.filter(|b| !b.is_unlimited())
+        {
+            let mut merge_peak: Option<u64> = Some(0);
+            for suffix in ["weight", "scales", "biases"] {
+                if let (Some(a), Some(b)) = (
+                    params.get(&format!("{left}.{suffix}")),
+                    params.get(&format!("{right}.{suffix}")),
+                ) {
+                    let combined = (a.nbytes() as u64).checked_add(b.nbytes() as u64);
+                    merge_peak = merge_peak.and_then(|acc| {
+                        let aligned = CudaDeviceBudget::align_bytes(combined?)?;
+                        acc.checked_add(aligned)
+                    });
+                }
+            }
+            if !merge_peak.is_some_and(|need| budget.can_fit(need)) {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn record_merged_device_bytes(
+        pre_merge_device_bytes: &mut Option<&mut HashMap<String, u64>>,
+        merged_key: String,
+        a: &MxArray,
+        b: &MxArray,
+    ) {
+        let Some(map) = pre_merge_device_bytes.as_deref_mut() else {
+            return;
+        };
+        let mut device_bytes = 0u64;
+        for arr in [a, b] {
+            let nbytes = arr.nbytes() as u64;
+            if arr.is_available() && nbytes > 8 && arr.cuda_host_bytes() == 0 {
+                device_bytes =
+                    device_bytes.saturating_add(CudaDeviceBudget::align_bytes(nbytes).unwrap_or(0));
+            }
+        }
+        if device_bytes > 0 {
+            map.insert(merged_key, device_bytes);
+        }
+    }
+
     // Merge in_proj_qkv + in_proj_z → in_proj_qkvz
     let split_qkv_keys: Vec<String> = result
         .keys()
@@ -191,6 +267,15 @@ pub(crate) fn merge_split_projections(
         if !declared_profiles_allow_merge(per_layer_quant, &merged_prefix, &qkv_prefix, &z_prefix) {
             continue;
         }
+        if !cuda_policy_allows_merge(
+            result,
+            &qkv_prefix,
+            &z_prefix,
+            preserve_host_backed,
+            cuda_budget,
+        ) {
+            continue;
+        }
 
         let qkv_w = result
             .remove(qkv_key)
@@ -198,15 +283,24 @@ pub(crate) fn merge_split_projections(
         let z_w = result
             .remove(&z_weight_key)
             .ok_or_else(|| Error::from_reason("z weight missing"))?;
+        let merged_weight_key = format!("{}.in_proj_qkvz.weight", prefix);
+        record_merged_device_bytes(
+            &mut pre_merge_device_bytes,
+            merged_weight_key.clone(),
+            &qkv_w,
+            &z_w,
+        );
         let combined_w = MxArray::concatenate(&qkv_w, &z_w, 0)?;
-        result.insert(format!("{}.in_proj_qkvz.weight", prefix), combined_w);
+        result.insert(merged_weight_key, combined_w);
 
         for suffix in &["scales", "biases"] {
             let qkv_k = format!("{}.in_proj_qkv.{}", prefix, suffix);
             let z_k = format!("{}.in_proj_z.{}", prefix, suffix);
             if let (Some(a), Some(b)) = (result.remove(&qkv_k), result.remove(&z_k)) {
+                let merged_k = format!("{}.in_proj_qkvz.{}", prefix, suffix);
+                record_merged_device_bytes(&mut pre_merge_device_bytes, merged_k.clone(), &a, &b);
                 let combined = MxArray::concatenate(&a, &b, 0)?;
-                result.insert(format!("{}.in_proj_qkvz.{}", prefix, suffix), combined);
+                result.insert(merged_k, combined);
             }
         }
     }
@@ -235,6 +329,15 @@ pub(crate) fn merge_split_projections(
         if !declared_profiles_allow_merge(per_layer_quant, &merged_prefix, &b_prefix, &a_prefix) {
             continue;
         }
+        if !cuda_policy_allows_merge(
+            result,
+            &b_prefix,
+            &a_prefix,
+            preserve_host_backed,
+            cuda_budget,
+        ) {
+            continue;
+        }
 
         let b_w = result
             .remove(b_key)
@@ -242,15 +345,24 @@ pub(crate) fn merge_split_projections(
         let a_w = result
             .remove(&a_weight_key)
             .ok_or_else(|| Error::from_reason("in_proj_a weight missing"))?;
+        let merged_weight_key = format!("{}.in_proj_ba.weight", prefix);
+        record_merged_device_bytes(
+            &mut pre_merge_device_bytes,
+            merged_weight_key.clone(),
+            &b_w,
+            &a_w,
+        );
         let combined_w = MxArray::concatenate(&b_w, &a_w, 0)?;
-        result.insert(format!("{}.in_proj_ba.weight", prefix), combined_w);
+        result.insert(merged_weight_key, combined_w);
 
         for suffix in &["scales", "biases"] {
             let b_k = format!("{}.in_proj_b.{}", prefix, suffix);
             let a_k = format!("{}.in_proj_a.{}", prefix, suffix);
             if let (Some(a), Some(b)) = (result.remove(&b_k), result.remove(&a_k)) {
+                let merged_k = format!("{}.in_proj_ba.{}", prefix, suffix);
+                record_merged_device_bytes(&mut pre_merge_device_bytes, merged_k.clone(), &a, &b);
                 let combined = MxArray::concatenate(&a, &b, 0)?;
-                result.insert(format!("{}.in_proj_ba.{}", prefix, suffix), combined);
+                result.insert(merged_k, combined);
             }
         }
     }
@@ -607,12 +719,36 @@ pub(crate) fn sanitize_qwen35_common(
 /// 6. Remove MTP (multi-token prediction) weights
 /// 7. FP8 E4M3 dequantization (weight + weight_scale_inv → bf16)
 /// 8. 4-bit affine re-quantization (for FP8 source checkpoints)
+#[cfg(test)]
 fn sanitize_weights(
     params: HashMap<String, MxArray>,
     config: &Qwen3_5Config,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     preserve_split_projections: bool,
     preserve_fp32_norms: bool,
+) -> Result<HashMap<String, MxArray>> {
+    sanitize_weights_with_policy(
+        params,
+        config,
+        per_layer_quant,
+        preserve_split_projections,
+        preserve_fp32_norms,
+        false,
+        None,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sanitize_weights_with_policy(
+    params: HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    preserve_split_projections: bool,
+    preserve_fp32_norms: bool,
+    preserve_host_backed: bool,
+    cuda_budget: Option<&CudaDeviceBudget>,
+    pre_merge_device_bytes: Option<&mut HashMap<String, u64>>,
 ) -> Result<HashMap<String, MxArray>> {
     let (mut result, needs_norm_fix, mtp_norms_need_shift) = sanitize_qwen35_common(
         params,
@@ -630,7 +766,13 @@ fn sanitize_weights(
     )?;
 
     if !preserve_split_projections {
-        merge_split_projections(&mut result, per_layer_quant)?;
+        merge_split_projections_with_policy(
+            &mut result,
+            per_layer_quant,
+            preserve_host_backed,
+            cuda_budget,
+            pre_merge_device_bytes,
+        )?;
     }
 
     // For FP8 source checkpoints, keep dequantized bf16 weights as-is.
@@ -1397,9 +1539,18 @@ fn clef_sym8_sign_values(k: usize) -> Vec<f32> {
 
 /// The sym8 rotation for input width `k` (`None` unless `k` is a whole
 /// number of Hadamard blocks). `signs` memoizes the per-width sign array.
+#[cfg(test)]
 fn clef_sym8_transform(
     k: i64,
     signs: &mut HashMap<i64, MxArray>,
+) -> Result<Option<crate::quant::prism_hadamard::HadamardTransform>> {
+    clef_sym8_transform_with_budget(k, signs, None)
+}
+
+fn clef_sym8_transform_with_budget(
+    k: i64,
+    signs: &mut HashMap<i64, MxArray>,
+    cuda_budget: Option<&CudaDeviceBudget>,
 ) -> Result<Option<crate::quant::prism_hadamard::HadamardTransform>> {
     if k <= 0 || k % CLEF_SYM8_HADAMARD_BLOCK != 0 {
         return Ok(None);
@@ -1409,10 +1560,26 @@ fn clef_sym8_transform(
         None => {
             let mut s = MxArray::from_float32(&clef_sym8_sign_values(k as usize), &[k])?;
             s.eval();
-            if crate::accelerator::cuda_ops_available()
-                && let Some(dev_s) = s.ensure_cuda_device()?
-            {
-                s = dev_s;
+            if crate::accelerator::cuda_ops_available() {
+                let promote_allowed = match cuda_budget {
+                    Some(budget) if !budget.is_unlimited() => {
+                        let host_bytes = s.cuda_host_bytes() as u64;
+                        host_bytes > 0 && budget.try_reserve(host_bytes)
+                    }
+                    _ => true,
+                };
+                if promote_allowed {
+                    match s.ensure_cuda_device()? {
+                        Some(dev_s) => s = dev_s,
+                        None => {
+                            if let Some(budget) = cuda_budget
+                                && !budget.is_unlimited()
+                            {
+                                budget.mark_exhausted();
+                            }
+                        }
+                    }
+                }
             }
             signs.insert(k, s.clone());
             s
@@ -1420,6 +1587,38 @@ fn clef_sym8_transform(
     };
     Ok(Some(crate::quant::prism_hadamard::HadamardTransform::new(
         signs,
+        CLEF_SYM8_HADAMARD_BLOCK as i32,
+        None,
+    )?))
+}
+
+/// Build or reuse the sym8 rotation for width `k` when the caller has already
+/// reserved any uncached sign vector bytes in `CudaDeviceBudget`. Newly created
+/// sign arrays are staged in `new_signs` so the caller can commit them to the
+/// shared cache only after evaluation succeeds (or drop them on error).
+fn clef_sym8_transform_reserved(
+    k: i64,
+    signs: &HashMap<i64, MxArray>,
+    new_signs: &mut HashMap<i64, MxArray>,
+) -> Result<Option<crate::quant::prism_hadamard::HadamardTransform>> {
+    if k <= 0 || k % CLEF_SYM8_HADAMARD_BLOCK != 0 {
+        return Ok(None);
+    }
+    let sign_arr = if let Some(s) = signs.get(&k).or_else(|| new_signs.get(&k)) {
+        s.clone()
+    } else {
+        let mut s = MxArray::from_float32(&clef_sym8_sign_values(k as usize), &[k])?;
+        s.eval();
+        if crate::accelerator::cuda_ops_available()
+            && let Some(dev_s) = s.ensure_cuda_device()?
+        {
+            s = dev_s;
+        }
+        new_signs.insert(k, s.clone());
+        s
+    };
+    Ok(Some(crate::quant::prism_hadamard::HadamardTransform::new(
+        sign_arr,
         CLEF_SYM8_HADAMARD_BLOCK as i32,
         None,
     )?))
@@ -1763,6 +1962,67 @@ fn clef_mlp_unit_incomplete(unit: &[String]) -> bool {
 /// something) and the net change in resident weight bytes: the rewritten
 /// arrays minus the packed sources they replaced (positive when a sub-8-bit
 /// checkpoint widens to int8 or bf16), for the caller's weight accounting.
+#[derive(Clone, Copy, Default)]
+struct CudaLoadBudgetCtx<'a> {
+    budget: Option<&'a CudaDeviceBudget>,
+    pre_merge_device_bytes: Option<&'a HashMap<String, u64>>,
+    preserve_host_backed: bool,
+}
+
+fn checked_add_cuda_aligned(acc: Option<u64>, bytes: Option<u64>) -> Option<u64> {
+    acc?.checked_add(CudaDeviceBudget::align_bytes(bytes?)?)
+}
+
+fn clef_source_accounting(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    is_tiled: bool,
+    pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+) -> (Option<u64>, u64) {
+    let mut scratch: Option<u64> = Some(0);
+    let mut freed = 0u64;
+    for suffix in ["weight", "scales", "biases"] {
+        let key = format!("{prefix}.{suffix}");
+        let Some(arr) = params.get(&key) else {
+            continue;
+        };
+        let nbytes = arr.nbytes() as u64;
+        if !arr.is_available() {
+            if nbytes > 8 {
+                scratch = checked_add_cuda_aligned(scratch, Some(nbytes));
+            }
+            if let Some(pre) = pre_merge_device_bytes.and_then(|m| m.get(&key).copied()) {
+                freed = freed.saturating_add(pre);
+            }
+        } else if nbytes > 8 && arr.cuda_host_bytes() == 0 {
+            freed = freed.saturating_add(CudaDeviceBudget::align_bytes(nbytes).unwrap_or(0));
+        }
+        if is_tiled && nbytes > 8 {
+            scratch = checked_add_cuda_aligned(scratch, Some(nbytes));
+        }
+    }
+    (scratch, freed)
+}
+
+enum BudgetDecodedSource {
+    Lazy(MxArray),
+    DeferredFp8 { n: i64, k: i64 },
+}
+
+enum BudgetBuiltOutput {
+    Sym8 {
+        prefix: String,
+        q: MxArray,
+        s: MxArray,
+        transform: Option<crate::quant::prism_hadamard::HadamardTransform>,
+    },
+    Bf16 {
+        prefix: String,
+        weight: MxArray,
+    },
+}
+
+#[cfg(test)]
 fn apply_clef_residency(
     params: &mut HashMap<String, MxArray>,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
@@ -1772,13 +2032,35 @@ fn apply_clef_residency(
     HashMap<String, crate::quant::prism_hadamard::HadamardTransform>,
     i64,
 )> {
-    apply_clef_residency_impl(params, per_layer_quant, default_plq, residency, true)
+    apply_clef_residency_with_budget(params, per_layer_quant, default_plq, residency, None, None)
+}
+
+fn apply_clef_residency_with_budget(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    cuda_budget: Option<&CudaDeviceBudget>,
+    pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+) -> Result<(ClefTransforms, i64)> {
+    let mut signs_by_width = HashMap::new();
+    apply_clef_residency_with_signs(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        true,
+        &mut signs_by_width,
+        cuda_budget,
+        pre_merge_device_bytes,
+    )
 }
 
 type ClefTransforms = HashMap<String, crate::quant::prism_hadamard::HadamardTransform>;
 
 /// With `finish=false`, the enclosing GGUF import owns the final synchronize
 /// and clear. Retain released source/scratch buffers for subsequent layers.
+#[cfg(test)]
 fn apply_clef_residency_impl(
     params: &mut HashMap<String, MxArray>,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
@@ -1794,6 +2076,8 @@ fn apply_clef_residency_impl(
         residency,
         finish,
         &mut signs_by_width,
+        None,
+        None,
     )
 }
 
@@ -1805,6 +2089,56 @@ fn apply_clef_residency_with_signs(
     residency: ClefResidency,
     finish: bool,
     signs_by_width: &mut HashMap<i64, MxArray>,
+    cuda_budget: Option<&CudaDeviceBudget>,
+    pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+) -> Result<(ClefTransforms, i64)> {
+    let enforce_budget =
+        crate::accelerator::cuda_ops_available() && cuda_budget.is_some_and(|b| !b.is_unlimited());
+    apply_clef_residency_core(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        finish,
+        signs_by_width,
+        cuda_budget,
+        pre_merge_device_bytes,
+        enforce_budget,
+    )
+}
+
+#[cfg(test)]
+fn apply_clef_residency_with_budget_for_test(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    cuda_budget: &CudaDeviceBudget,
+) -> Result<(ClefTransforms, i64)> {
+    let mut signs_by_width = HashMap::new();
+    apply_clef_residency_core(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        true,
+        &mut signs_by_width,
+        Some(cuda_budget),
+        None,
+        !cuda_budget.is_unlimited(),
+    )
+}
+
+fn apply_clef_residency_core(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    finish: bool,
+    signs_by_width: &mut HashMap<i64, MxArray>,
+    cuda_budget: Option<&CudaDeviceBudget>,
+    pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+    enforce_budget: bool,
 ) -> Result<(ClefTransforms, i64)> {
     let mut transforms = HashMap::new();
     let mut byte_delta = 0i64;
@@ -1833,6 +2167,7 @@ fn apply_clef_residency_with_signs(
         input_amax: None,
         layout: Default::default(),
     };
+    let enforced_budget = enforce_budget.then_some(cuda_budget).flatten();
     let cuda_sym8 = residency == ClefResidency::Sym8 && crate::accelerator::cuda_sym8_available();
     let mut pending_eval: Vec<MxArray> = Vec::new();
     let mut last_layer_key: Option<String> = None;
@@ -1860,7 +2195,7 @@ fn apply_clef_residency_with_signs(
         {
             continue;
         }
-        if cuda_sym8 && finish {
+        if enforced_budget.is_none() && cuda_sym8 && finish {
             let layer_key = clef_unit_layer_key(&unit[0]);
             if last_layer_key.as_deref() != Some(layer_key) {
                 flush_pending(&mut pending_eval)?;
@@ -1892,9 +2227,121 @@ fn apply_clef_residency_with_signs(
                 }
             }
             if all_q8 {
+                if let Some(budget) = enforced_budget {
+                    let mut output_bytes: Option<u64> = Some(0);
+                    let mut scratch_bytes: Option<u64> = Some(0);
+                    let mut freed_source_device_bytes = 0u64;
+                    let mut uncached_sign_widths: HashSet<i64> = HashSet::new();
+                    for (prefix, src) in &q8_sources {
+                        let n = u64::try_from(src.weight.shape_at(0)?).ok();
+                        let k = u64::try_from(src.k).ok();
+                        output_bytes = checked_add_cuda_aligned(
+                            output_bytes,
+                            n.zip(k).and_then(|(n, k)| n.checked_mul(k)),
+                        );
+                        output_bytes = checked_add_cuda_aligned(
+                            output_bytes,
+                            n.and_then(|n| n.checked_mul(4)),
+                        );
+                        if src.k > 0
+                            && src.k % CLEF_SYM8_HADAMARD_BLOCK == 0
+                            && !signs_by_width.contains_key(&src.k)
+                            && uncached_sign_widths.insert(src.k)
+                        {
+                            output_bytes = checked_add_cuda_aligned(
+                                output_bytes,
+                                k.and_then(|k| k.checked_mul(4)),
+                            );
+                        }
+                        let (src_scratch, src_freed) =
+                            clef_source_accounting(params, prefix, false, pre_merge_device_bytes);
+                        scratch_bytes = scratch_bytes.and_then(|acc| acc.checked_add(src_scratch?));
+                        freed_source_device_bytes =
+                            freed_source_device_bytes.saturating_add(src_freed);
+                    }
+                    let peak_need = output_bytes.and_then(|o| o.checked_add(scratch_bytes?));
+                    let Some(peak_need) = peak_need.filter(|&need| budget.try_reserve(need)) else {
+                        kept.extend(q8_sources.into_iter().map(|(prefix, _)| prefix));
+                        continue;
+                    };
+
+                    let mut new_signs: HashMap<i64, MxArray> = HashMap::new();
+                    let mut built: Vec<(
+                        String,
+                        MxArray,
+                        MxArray,
+                        Option<crate::quant::prism_hadamard::HadamardTransform>,
+                    )> = Vec::with_capacity(q8_sources.len());
+                    let mut unit_arrays: Vec<MxArray> = Vec::with_capacity(q8_sources.len() * 2);
+                    let eval_res = (|| -> Result<()> {
+                        for (prefix, src) in &q8_sources {
+                            let transform = clef_sym8_transform_reserved(
+                                src.k,
+                                signs_by_width,
+                                &mut new_signs,
+                            )?;
+                            let (q, s) = crate::kernels::sym8::quantize_weight_q8(
+                                &src.weight,
+                                &src.scales,
+                                Some(&src.biases),
+                                transform.as_ref().map(|t| t.signs()),
+                            )?;
+                            unit_arrays.push(q.clone());
+                            unit_arrays.push(s.clone());
+                            built.push((prefix.clone(), q, s, transform));
+                        }
+                        let refs: Vec<&MxArray> = unit_arrays.iter().collect();
+                        MxArray::eval_arrays_with_context(&refs, "CLEF budgeted residency")
+                    })();
+                    if let Err(err) = eval_res {
+                        drop(built);
+                        drop(unit_arrays);
+                        drop(new_signs);
+                        drop(q8_sources);
+                        crate::array::clear_cache();
+                        budget.release(peak_need);
+                        budget.refresh_from_free();
+                        return Err(err);
+                    }
+
+                    signs_by_width.extend(new_signs);
+                    let mut old_sources: Vec<MxArray> = Vec::with_capacity(built.len() * 3);
+                    for (prefix, q, s, transform) in built {
+                        let packed_bytes = group_bytes(params, &prefix);
+                        if let Some(old) = params.insert(format!("{prefix}.weight"), q) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.insert(format!("{prefix}.scales"), s) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.remove(&format!("{prefix}.biases")) {
+                            old_sources.push(old);
+                        }
+                        per_layer_quant.insert(prefix.clone(), sym8_plq);
+                        requantized += 1;
+                        byte_delta += group_bytes(params, &prefix) - packed_bytes;
+                        if let Some(t) = transform {
+                            transforms.insert(prefix, t);
+                            rotated += 1;
+                        }
+                    }
+                    drop(unit_arrays);
+                    drop(q8_sources);
+                    drop(old_sources);
+                    crate::array::clear_cache();
+                    budget.release(
+                        scratch_bytes
+                            .unwrap_or(0)
+                            .saturating_add(freed_source_device_bytes),
+                    );
+                    budget.refresh_from_free();
+                    continue;
+                }
+
                 for (prefix, src) in q8_sources {
                     let packed_bytes = group_bytes(params, &prefix);
-                    let transform = clef_sym8_transform(src.k, signs_by_width)?;
+                    let transform =
+                        clef_sym8_transform_with_budget(src.k, signs_by_width, cuda_budget)?;
                     let (q, s) = crate::kernels::sym8::quantize_weight_q8(
                         &src.weight,
                         &src.scales,
@@ -1919,6 +2366,288 @@ fn apply_clef_residency_with_signs(
                 continue;
             }
         }
+
+        if let Some(budget) = enforced_budget {
+            let mut decoded_sources: Vec<(String, PerLayerQuant, BudgetDecodedSource)> =
+                Vec::with_capacity(unit.len());
+            let mut sym8_stored = false;
+            for prefix in &unit {
+                let plq = resolve_plq_for(per_layer_quant, prefix, default_plq);
+                if plq.mode == PerLayerMode::Sym8 {
+                    sym8_stored = true;
+                    match dequantize_sym8_source(params, prefix)? {
+                        Some(dense) => {
+                            decoded_sources.push((
+                                prefix.clone(),
+                                plq,
+                                BudgetDecodedSource::Lazy(dense),
+                            ));
+                        }
+                        None => kept.push(prefix.clone()),
+                    }
+                } else if plq.mode == PerLayerMode::Fp8E4m3 {
+                    let Some(weight) = params.get(&format!("{prefix}.weight")) else {
+                        kept.push(prefix.clone());
+                        continue;
+                    };
+                    if !params.contains_key(&format!("{prefix}.scales")) {
+                        decoded_sources.push((
+                            prefix.clone(),
+                            plq,
+                            BudgetDecodedSource::Lazy(weight.astype(DType::BFloat16)?),
+                        ));
+                        continue;
+                    }
+                    let shape = weight.shape()?;
+                    if weight.dtype()? == DType::Uint8
+                        && shape.len() == 2
+                        && shape[0] > 0
+                        && shape[1] > 0
+                    {
+                        decoded_sources.push((
+                            prefix.clone(),
+                            plq,
+                            BudgetDecodedSource::DeferredFp8 {
+                                n: shape[0],
+                                k: shape[1],
+                            },
+                        ));
+                    } else {
+                        match dequantize_source_head(params, prefix, plq)? {
+                            Some(dense) => {
+                                decoded_sources.push((
+                                    prefix.clone(),
+                                    plq,
+                                    BudgetDecodedSource::Lazy(dense),
+                                ));
+                            }
+                            None => kept.push(prefix.clone()),
+                        }
+                    }
+                } else {
+                    ensure_affine_biases_present(params, prefix, plq.mode, "qwen3_5")?;
+                    match dequantize_source_head(params, prefix, plq)? {
+                        Some(dense) => {
+                            decoded_sources.push((
+                                prefix.clone(),
+                                plq,
+                                BudgetDecodedSource::Lazy(dense),
+                            ));
+                        }
+                        None => kept.push(prefix.clone()),
+                    }
+                }
+            }
+            if decoded_sources.is_empty() {
+                continue;
+            }
+            let mut unit_sym8 = residency == ClefResidency::Sym8
+                && !sym8_stored
+                && !clef_mlp_unit_incomplete(&unit);
+            for (prefix, _, src) in &decoded_sources {
+                let eligible = match src {
+                    BudgetDecodedSource::Lazy(dense) => clef_sym8_eligible(prefix, dense)?,
+                    BudgetDecodedSource::DeferredFp8 { k, .. } => {
+                        clef_sym8_eligible_prefix(prefix) && k % 16 == 0
+                    }
+                };
+                unit_sym8 = unit_sym8 && eligible;
+            }
+
+            let mut output_bytes: Option<u64> = Some(0);
+            let mut scratch_bytes: Option<u64> = Some(0);
+            let mut freed_source_device_bytes = 0u64;
+            let mut uncached_sign_widths: HashSet<i64> = HashSet::new();
+            for (prefix, plq, src) in &decoded_sources {
+                let shape: Vec<i64> = match src {
+                    BudgetDecodedSource::Lazy(dense) => dense.shape()?.to_vec(),
+                    BudgetDecodedSource::DeferredFp8 { n, k } => vec![*n, *k],
+                };
+                let is_tiled = plq.layout == crate::models::quant_dispatch::KQuantLayout::Tiled64;
+                let (src_scratch, src_freed) =
+                    clef_source_accounting(params, prefix, is_tiled, pre_merge_device_bytes);
+                scratch_bytes = scratch_bytes.and_then(|acc| acc.checked_add(src_scratch?));
+                freed_source_device_bytes = freed_source_device_bytes.saturating_add(src_freed);
+                let is_deferred_fp8 = matches!(src, BudgetDecodedSource::DeferredFp8 { .. });
+
+                if unit_sym8 {
+                    let n = shape.first().copied().and_then(|d| u64::try_from(d).ok());
+                    let k_i64 = shape.get(1).copied().unwrap_or(0);
+                    let k = u64::try_from(k_i64).ok();
+                    let numel = n.zip(k).and_then(|(n, k)| n.checked_mul(k));
+                    output_bytes = checked_add_cuda_aligned(output_bytes, numel);
+                    output_bytes =
+                        checked_add_cuda_aligned(output_bytes, n.and_then(|n| n.checked_mul(4)));
+                    if k_i64 > 0
+                        && k_i64 % CLEF_SYM8_HADAMARD_BLOCK == 0
+                        && !signs_by_width.contains_key(&k_i64)
+                        && uncached_sign_widths.insert(k_i64)
+                    {
+                        output_bytes = checked_add_cuda_aligned(
+                            output_bytes,
+                            k.and_then(|k| k.checked_mul(4)),
+                        );
+                    }
+                    let bf16_bytes = numel.and_then(|e| e.checked_mul(2));
+                    scratch_bytes = checked_add_cuda_aligned(scratch_bytes, bf16_bytes);
+                    if is_deferred_fp8 {
+                        let f32_bytes = numel.and_then(|e| e.checked_mul(4));
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, f32_bytes);
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, bf16_bytes);
+                    }
+                } else {
+                    let numel = shape
+                        .iter()
+                        .try_fold(1u64, |acc, &d| acc.checked_mul(u64::try_from(d).ok()?));
+                    let bf16_bytes = numel.and_then(|e| e.checked_mul(2));
+                    output_bytes = checked_add_cuda_aligned(output_bytes, bf16_bytes);
+                    if plq.mode == PerLayerMode::Sym8 {
+                        let f32_bytes = numel.and_then(|e| e.checked_mul(4));
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, f32_bytes);
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, f32_bytes);
+                    } else if is_deferred_fp8 {
+                        let f32_bytes = numel.and_then(|e| e.checked_mul(4));
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, f32_bytes);
+                        scratch_bytes = checked_add_cuda_aligned(scratch_bytes, bf16_bytes);
+                    }
+                }
+            }
+
+            let peak_need = output_bytes.and_then(|o| o.checked_add(scratch_bytes?));
+            let can_keep_native = (!sym8_stored || crate::accelerator::cuda_sym8_available())
+                && !clef_mlp_unit_incomplete(&unit);
+            let reserved_peak = peak_need.filter(|&need| budget.try_reserve(need));
+            if reserved_peak.is_none() && can_keep_native {
+                kept.extend(decoded_sources.into_iter().map(|(prefix, _, _)| prefix));
+                continue;
+            }
+
+            let mut new_signs: HashMap<i64, MxArray> = HashMap::new();
+            let mut built: Vec<BudgetBuiltOutput> = Vec::with_capacity(decoded_sources.len());
+            let mut unit_arrays: Vec<MxArray> = Vec::with_capacity(decoded_sources.len() * 2);
+            let eval_res = (|| -> Result<()> {
+                for (prefix, plq, src) in &decoded_sources {
+                    let dense = match src {
+                        BudgetDecodedSource::Lazy(dense) => dense.clone(),
+                        BudgetDecodedSource::DeferredFp8 { .. } => {
+                            dequantize_source_head(params, prefix, *plq)?.ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "plain FP8 layer '{prefix}' disappeared during CLEF residency"
+                                ))
+                            })?
+                        }
+                    };
+                    if unit_sym8 {
+                        let transform = clef_sym8_transform_reserved(
+                            dense.shape_at(1)?,
+                            signs_by_width,
+                            &mut new_signs,
+                        )?;
+                        let (q, s) = if cuda_sym8 {
+                            crate::kernels::sym8::quantize_weight_dense(
+                                &dense,
+                                transform.as_ref().map(|t| t.signs()),
+                            )?
+                        } else {
+                            let source = match &transform {
+                                Some(t) => t.apply(&dense.astype(DType::Float32)?, false)?,
+                                None => dense,
+                            };
+                            crate::convert::sym8_quantize_store(&source, prefix)?
+                        };
+                        unit_arrays.push(q.clone());
+                        unit_arrays.push(s.clone());
+                        built.push(BudgetBuiltOutput::Sym8 {
+                            prefix: prefix.clone(),
+                            q,
+                            s,
+                            transform,
+                        });
+                    } else {
+                        let bf16 = dense.astype(DType::BFloat16)?;
+                        unit_arrays.push(bf16.clone());
+                        built.push(BudgetBuiltOutput::Bf16 {
+                            prefix: prefix.clone(),
+                            weight: bf16,
+                        });
+                    }
+                }
+                let refs: Vec<&MxArray> = unit_arrays.iter().collect();
+                MxArray::eval_arrays_with_context(&refs, "CLEF budgeted residency")
+            })();
+            if let Err(err) = eval_res {
+                drop(built);
+                drop(unit_arrays);
+                drop(new_signs);
+                drop(decoded_sources);
+                crate::array::clear_cache();
+                if let Some(need) = reserved_peak {
+                    budget.release(need);
+                }
+                budget.refresh_from_free();
+                return Err(err);
+            }
+
+            signs_by_width.extend(new_signs);
+            let mut old_sources: Vec<MxArray> = Vec::with_capacity(built.len() * 3);
+            for item in built {
+                match item {
+                    BudgetBuiltOutput::Sym8 {
+                        prefix,
+                        q,
+                        s,
+                        transform,
+                    } => {
+                        let packed_bytes = group_bytes(params, &prefix);
+                        if let Some(old) = params.insert(format!("{prefix}.weight"), q) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.insert(format!("{prefix}.scales"), s) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.remove(&format!("{prefix}.biases")) {
+                            old_sources.push(old);
+                        }
+                        per_layer_quant.insert(prefix.clone(), sym8_plq);
+                        requantized += 1;
+                        byte_delta += group_bytes(params, &prefix) - packed_bytes;
+                        if let Some(t) = transform {
+                            transforms.insert(prefix, t);
+                            rotated += 1;
+                        }
+                    }
+                    BudgetBuiltOutput::Bf16 { prefix, weight } => {
+                        let packed_bytes = group_bytes(params, &prefix);
+                        if let Some(old) = params.insert(format!("{prefix}.weight"), weight) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.remove(&format!("{prefix}.scales")) {
+                            old_sources.push(old);
+                        }
+                        if let Some(old) = params.remove(&format!("{prefix}.biases")) {
+                            old_sources.push(old);
+                        }
+                        per_layer_quant.remove(&prefix);
+                        dequantized += 1;
+                        byte_delta += group_bytes(params, &prefix) - packed_bytes;
+                    }
+                }
+            }
+            drop(unit_arrays);
+            drop(decoded_sources);
+            drop(old_sources);
+            crate::array::clear_cache();
+            if reserved_peak.is_some() {
+                budget.release(
+                    scratch_bytes
+                        .unwrap_or(0)
+                        .saturating_add(freed_source_device_bytes),
+                );
+            }
+            budget.refresh_from_free();
+            continue;
+        }
+
         // Decode the whole unit first: the residency is one decision per
         // unit, and an MLP member's eligibility needs its dense shape.
         let mut decoded: Vec<(String, MxArray)> = Vec::with_capacity(unit.len());
@@ -1951,7 +2680,11 @@ fn apply_clef_residency_with_signs(
         for (prefix, dense) in decoded {
             let packed_bytes = group_bytes(params, &prefix);
             if unit_sym8 {
-                let transform = clef_sym8_transform(dense.shape_at(1)?, signs_by_width)?;
+                let transform = clef_sym8_transform_with_budget(
+                    dense.shape_at(1)?,
+                    signs_by_width,
+                    cuda_budget,
+                )?;
                 let (q, s) = if cuda_sym8 {
                     crate::kernels::sym8::quantize_weight_dense(
                         &dense,
@@ -1998,10 +2731,10 @@ fn apply_clef_residency_with_signs(
             crate::array::memory::free_released_sources();
         }
     }
-    if cuda_sym8 && finish {
+    if enforced_budget.is_none() && cuda_sym8 && finish {
         flush_pending(&mut pending_eval)?;
     }
-    if requantized + dequantized > 0 {
+    if requantized + dequantized > 0 || !kept.is_empty() {
         info!(
             "CLEF residency {:?}: requantized {} projections to sym8 ({} rotated, {} with K % {} \
              != 0 unrotated), dequantized {} to bf16, {} kept as stored{}",
@@ -2168,6 +2901,40 @@ fn apply_weights_inner_with_residency_and_sym_zp(
     top_level_mode: Option<PerLayerMode>,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     symmetric_zero_points: &SymmetricZeroPoints,
+    has_vision: bool,
+    prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
+    clef: Option<ClefResidency>,
+    prepared_clef: Option<ClefTransforms>,
+    preserve_fp32_norms: bool,
+) -> Result<(PlainFp8Residency, i64)> {
+    apply_weights_inner_with_residency_with_cuda_ctx(
+        inner,
+        params,
+        config,
+        quant_bits,
+        quant_group_size,
+        top_level_mode,
+        per_layer_quant,
+        symmetric_zero_points,
+        has_vision,
+        prism,
+        clef,
+        prepared_clef,
+        preserve_fp32_norms,
+        CudaLoadBudgetCtx::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_weights_inner_with_residency_with_cuda_ctx(
+    inner: &mut Qwen35Inner,
+    params: &mut HashMap<String, MxArray>,
+    config: &Qwen3_5Config,
+    quant_bits: i32,
+    quant_group_size: i32,
+    top_level_mode: Option<PerLayerMode>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    symmetric_zero_points: &SymmetricZeroPoints,
     _has_vision: bool,
     prism: Option<&crate::quant::prism_hadamard::PrismHadamardRuntime>,
     // `Some` on a CLEF decision-model load. Behaviours hanging off it:
@@ -2191,9 +2958,11 @@ fn apply_weights_inner_with_residency_and_sym_zp(
     // Preserve Float32 RMSNorm weights and enable `PreciseF32` evaluation
     // (Clairic checkpoints match `mlx_engine.py::PreciseRMSNorm`).
     preserve_fp32_norms: bool,
+    cuda_ctx: CudaLoadBudgetCtx<'_>,
 ) -> Result<(PlainFp8Residency, i64)> {
     let is_moe = inner.is_moe();
     let family = inner.family_name();
+    let preserve_host_backed = cuda_ctx.preserve_host_backed;
     let is_quantized = is_quantized_checkpoint(params);
     let is_mxfp8 = is_mxfp8_checkpoint(params);
     let default_mode = resolve_default_mode(top_level_mode, is_mxfp8);
@@ -2240,7 +3009,14 @@ fn apply_weights_inner_with_residency_and_sym_zp(
             }
             match prepared_clef {
                 Some(transforms) => (transforms, 0),
-                None => apply_clef_residency(params, &mut per_layer_quant, default_plq, residency)?,
+                None => apply_clef_residency_with_budget(
+                    params,
+                    &mut per_layer_quant,
+                    default_plq,
+                    residency,
+                    cuda_ctx.budget,
+                    cuda_ctx.pre_merge_device_bytes,
+                )?,
             }
         }
         None => (HashMap::new(), 0),
@@ -2279,13 +3055,32 @@ fn apply_weights_inner_with_residency_and_sym_zp(
             QlBuildSpec {
                 tiling: QlTiling::TileCollect(&mut tiled_prefixes.borrow_mut()),
                 input_amax: InputAmaxPolicy::ActivationFp8SitesOnly,
-                promote_affine_sidecars,
+                promote_affine_sidecars: if preserve_host_backed {
+                    AffineSidecarPromotion::None
+                } else {
+                    promote_affine_sidecars
+                },
                 ..QlBuildSpec::standard(family)
             },
         )?;
         let built = if plq.mode == PerLayerMode::Affine {
             let q8_sym128 = resolve_sym_zp_for(symmetric_zero_points, prefix) == Some(128);
-            built.map(|ql| ql.with_q8_symmetric_128(q8_sym128))
+            built
+                .map(|mut ql| -> Result<_> {
+                    if preserve_host_backed {
+                        match promote_affine_sidecars {
+                            AffineSidecarPromotion::None => {}
+                            AffineSidecarPromotion::ToBf16 => {
+                                ql.promote_affine_sidecars_to_bf16_with_host_policy(true)?;
+                            }
+                            AffineSidecarPromotion::ToF32For(dtype) => {
+                                ql.promote_affine_sidecars_to_f32_with_host_policy(dtype, true)?;
+                            }
+                        }
+                    }
+                    Ok(ql.with_q8_symmetric_128(q8_sym128))
+                })
+                .transpose()?
         } else {
             built
         };
@@ -2344,7 +3139,11 @@ fn apply_weights_inner_with_residency_and_sym_zp(
             && compute_dtype == DType::BFloat16
             && weight.dtype()? == DType::Float16
         {
-            let cast = weight.astype(DType::BFloat16)?;
+            let cast = if preserve_host_backed && weight.is_settled_cuda_host() {
+                weight.astype_cpu(DType::BFloat16)?
+            } else {
+                weight.astype(DType::BFloat16)?
+            };
             cast.eval();
             Ok(cast)
         } else {
@@ -2632,8 +3431,17 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                                 &format!("{}.linear_attn.in_proj_z.weight", prefix),
                                 z,
                             )?;
-                            let combined = MxArray::concatenate(w, z, 0)?;
-                            gdn.set_in_proj_qkvz_weight(&combined)?;
+                            if preserve_host_backed
+                                && (w.is_settled_cuda_host() || z.is_settled_cuda_host())
+                            {
+                                gdn.set_split_in_proj_qkv_z(
+                                    LinearProj::Standard(Linear::from_weights(w, None)?),
+                                    LinearProj::Standard(Linear::from_weights(z, None)?),
+                                );
+                            } else {
+                                let combined = MxArray::concatenate(w, z, 0)?;
+                                gdn.set_in_proj_qkvz_weight(&combined)?;
+                            }
                         } else {
                             return Err(Error::from_reason(format!(
                                 "Layer {}: in_proj_qkv found but in_proj_z missing",
@@ -2663,9 +3471,20 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                             &format!("{}.linear_attn.in_proj_a.weight", prefix),
                             a,
                         )?;
-                        let combined = MxArray::concatenate(b, a, 0)?;
-                        let aligned = align_cuda_dense_bf16(&combined)?;
-                        gdn.set_in_proj_ba_weight(&aligned)?;
+                        if preserve_host_backed
+                            && (b.is_settled_cuda_host() || a.is_settled_cuda_host())
+                        {
+                            let b_aligned = align_cuda_dense_bf16(b)?;
+                            let a_aligned = align_cuda_dense_bf16(a)?;
+                            gdn.set_split_in_proj_b_a(
+                                LinearProj::Standard(Linear::from_weights(&b_aligned, None)?),
+                                LinearProj::Standard(Linear::from_weights(&a_aligned, None)?),
+                            );
+                        } else {
+                            let combined = MxArray::concatenate(b, a, 0)?;
+                            let aligned = align_cuda_dense_bf16(&combined)?;
+                            gdn.set_in_proj_ba_weight(&aligned)?;
+                        }
                     }
                     if let Some(w) = params.get(&format!("{}.linear_attn.out_proj.weight", prefix))
                     {
@@ -2692,7 +3511,7 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                 let pre_ba_ptr = gdn.get_in_proj_ba_weight().as_raw_ptr();
                 // Evaluates the derived constants and stacks/merges the
                 // in_proj_qkvz + in_proj_ba pair.
-                gdn.finalize_after_load()?;
+                gdn.finalize_after_load_with_host_policy(preserve_host_backed)?;
                 gdn_merged_in_proj = gdn.get_in_proj_qkvz_weight().as_raw_ptr() != pre_qkvz_ptr
                     && gdn.get_in_proj_ba_weight().as_raw_ptr() != pre_ba_ptr;
             }
@@ -2812,9 +3631,14 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                 // Finalize the block-ordered q/gate split once: dense
                 // projections cache a transpose, while affine and native
                 // K/IQ projections reorder packed operands without
-                // dequantizing.
-                attn.finalize_q_gate_block()?;
-                attn.finalize_kv_proj()?;
+                // dequantizing. Skip on settled host-backed overflow tensors
+                // when discrete-GPU budget enforcement is active.
+                if !(preserve_host_backed && attn.q_proj_has_settled_cuda_host_storage()) {
+                    attn.finalize_q_gate_block()?;
+                }
+                if !(preserve_host_backed && attn.kv_proj_has_settled_cuda_host_storage()) {
+                    attn.finalize_kv_proj()?;
+                }
             }
         }
 
@@ -2829,7 +3653,10 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                     let q_up = try_build_ql(params, &up_key)?;
                     let q_down = try_build_ql(params, &down_key)?;
                     if let (Some(qg), Some(qu), Some(qd)) = (q_gate, q_up, q_down) {
-                        layer.set_quantized_dense_mlp(qg, qu, qd)?;
+                        let merge_gate_up = !(preserve_host_backed
+                            && (qg.has_settled_cuda_host_storage()
+                                || qu.has_settled_cuda_host_storage()));
+                        layer.set_quantized_dense_mlp_with_merge(qg, qu, qd, merge_gate_up)?;
                     } else {
                         // Dense fallback (incomplete quant group or decoded
                         // stored-sym8 / bf16 residency): each load is
@@ -2855,7 +3682,13 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                             loaded_down = true;
                         }
                         if loaded_gate && loaded_up && loaded_down {
-                            mlp.finalize_gate_up()?;
+                            let mlp_host_backed = preserve_host_backed
+                                && (mlp.get_gate_proj_weight().is_settled_cuda_host()
+                                    || mlp.get_up_proj_weight().is_settled_cuda_host()
+                                    || mlp.get_down_proj_weight().is_settled_cuda_host());
+                            if !mlp_host_backed {
+                                mlp.finalize_gate_up()?;
+                            }
                         }
                     }
                 } else {
@@ -2882,7 +3715,13 @@ fn apply_weights_inner_with_residency_and_sym_zp(
                     // E39: precompute the stacked [gate;up].T + down.T weights
                     // so the per-forward MLP path uses one matmul instead of two
                     // and reads pre-transposed weights.
-                    mlp.finalize_gate_up()?;
+                    let mlp_host_backed = preserve_host_backed
+                        && (mlp.get_gate_proj_weight().is_settled_cuda_host()
+                            || mlp.get_up_proj_weight().is_settled_cuda_host()
+                            || mlp.get_down_proj_weight().is_settled_cuda_host());
+                    if !mlp_host_backed {
+                        mlp.finalize_gate_up()?;
+                    }
                 }
             }
             MLPType::Dense(MLPVariant::Quantized { .. }) => {}
@@ -3892,56 +4731,79 @@ async fn load_with_thread_impl(
                         }
                         let mut transforms = HashMap::new();
                         let mut signs_by_width = HashMap::new();
-                        let preload = GgufPreload::load_clef(input, &mut |mut layer| {
-                            // Identical source expansion and sanitize order to
-                            // load_checkpoint + the ordinary CLEF load. Keep a
-                            // whole layer together for split GDN and mixed MLPs.
-                            crate::engine::persistence::expand_symmetric_affine_biases(
-                                path, &mut layer,
-                            )?;
-                            let mut layer =
-                                sanitize_weights(layer, &config, &per_layer_quant, false, false)?;
-                            let default_mode =
-                                resolve_default_mode(top_level_mode, is_mxfp8_checkpoint(&layer));
-                            let default_plq =
-                                default_per_layer_quant(quant_bits, quant_group_size, default_mode);
-                            let cuda_available = crate::accelerator::cuda_ops_available();
-                            let cuda_sym8_available = crate::accelerator::cuda_sym8_available();
-                            let residency = resolve_clef_residency_from_env(
-                                is_quantized_checkpoint(&layer),
-                                unsafe { mlx_sys::mlx_metal_is_nax_available() },
-                                cuda_available,
-                                cuda_sym8_available,
-                            );
-                            clef_layers_finalized += 1;
-                            let flush_released = clef_layers_finalized == 2
-                                || clef_layers_finalized.is_multiple_of(4);
-                            let (rotations, _) = apply_clef_residency_with_signs(
+                        let preload = GgufPreload::load_clef(
+                            input,
+                            &mut |mut layer, cuda_budget| {
+                                // Identical source expansion and sanitize order to
+                                // load_checkpoint + the ordinary CLEF load. Keep a
+                                // whole layer together for split GDN and mixed MLPs.
+                                let cuda_available = crate::accelerator::cuda_ops_available();
+                                let preserve_host_backed =
+                                    cuda_available && !cuda_budget.is_unlimited();
+                                crate::engine::persistence::expand_symmetric_affine_biases_with_host_policy(
+                                path,
                                 &mut layer,
-                                &mut per_layer_quant,
-                                default_plq,
-                                residency,
-                                !cuda_available && flush_released,
-                                &mut signs_by_width,
+                                preserve_host_backed,
                             )?;
-                            // Non-sym8 residencies (`Bf16` and `NativeQuant`) and CUDA `Sym8`
-                            // (which builds lazy fused ops without per-projection syncs)
-                            // evaluate the whole layer in one batch so split/packed sources
-                            // materialize and release before the next layer streams in.
-                            if residency != ClefResidency::Sym8 || cuda_sym8_available {
-                                let arrays: Vec<&MxArray> = layer.values().collect();
-                                MxArray::eval_arrays_with_context(
-                                    &arrays,
-                                    "CLEF streamed residency",
+                                let mut pre_merge_device_bytes = HashMap::new();
+                                let mut layer = sanitize_weights_with_policy(
+                                    layer,
+                                    &config,
+                                    &per_layer_quant,
+                                    false,
+                                    false,
+                                    preserve_host_backed,
+                                    Some(cuda_budget),
+                                    Some(&mut pre_merge_device_bytes),
                                 )?;
-                                if cuda_available && flush_released {
-                                    crate::array::memory::free_released_sources();
+                                let default_mode = resolve_default_mode(
+                                    top_level_mode,
+                                    is_mxfp8_checkpoint(&layer),
+                                );
+                                let default_plq = default_per_layer_quant(
+                                    quant_bits,
+                                    quant_group_size,
+                                    default_mode,
+                                );
+                                let cuda_sym8_available = crate::accelerator::cuda_sym8_available();
+                                let residency = resolve_clef_residency_from_env(
+                                    is_quantized_checkpoint(&layer),
+                                    unsafe { mlx_sys::mlx_metal_is_nax_available() },
+                                    cuda_available,
+                                    cuda_sym8_available,
+                                );
+                                clef_layers_finalized += 1;
+                                let flush_released = clef_layers_finalized == 2
+                                    || clef_layers_finalized.is_multiple_of(4);
+                                let (rotations, _) = apply_clef_residency_with_signs(
+                                    &mut layer,
+                                    &mut per_layer_quant,
+                                    default_plq,
+                                    residency,
+                                    !cuda_available && flush_released,
+                                    &mut signs_by_width,
+                                    Some(cuda_budget),
+                                    Some(&pre_merge_device_bytes),
+                                )?;
+                                // Non-sym8 residencies (`Bf16` and `NativeQuant`) and CUDA `Sym8`
+                                // (which builds lazy fused ops without per-projection syncs)
+                                // evaluate the whole layer in one batch so split/packed sources
+                                // materialize and release before the next layer streams in.
+                                if residency != ClefResidency::Sym8 || cuda_sym8_available {
+                                    let arrays: Vec<&MxArray> = layer.values().collect();
+                                    MxArray::eval_arrays_with_context(
+                                        &arrays,
+                                        "CLEF streamed residency",
+                                    )?;
+                                    if cuda_available && flush_released {
+                                        crate::array::memory::free_released_sources();
+                                    }
                                 }
-                            }
-                            transforms.extend(rotations);
-                            streamed_params.extend(layer);
-                            Ok(())
-                        })?;
+                                transforms.extend(rotations);
+                                streamed_params.extend(layer);
+                                Ok(())
+                            },
+                        )?;
                         prepared_clef = Some(transforms);
                         Some(preload)
                     }
@@ -3956,6 +4818,12 @@ async fn load_with_thread_impl(
                     .map(|preload| std::mem::take(&mut preload.planes))
                     .unwrap_or_default();
                 let mut raw_params = load_checkpoint(path, true, preload.as_mut())?;
+                let mut load_cuda_budget = preload.as_mut().and_then(|p| p.cuda_budget.take());
+                if load_cuda_budget.is_none() && clef && crate::accelerator::cuda_ops_available() {
+                    load_cuda_budget = Some(CudaDeviceBudget::for_current_device());
+                }
+                let preserve_host_backed = crate::accelerator::cuda_ops_available()
+                    && load_cuda_budget.as_ref().is_some_and(|b| !b.is_unlimited());
                 let gguf_clef_head = preload.map(|preload| preload.clef_head.filter(|_| clef));
 
                 // Second snapshot, against the same inodes the mmap pinned; paired
@@ -4063,12 +4931,16 @@ async fn load_with_thread_impl(
                 let has_vision = vision_params.is_some();
 
                 // Sanitize weights
-                let mut params = sanitize_weights(
+                let mut pre_merge_device_bytes = HashMap::new();
+                let mut params = sanitize_weights_with_policy(
                     text_raw_params,
                     &config,
                     &per_layer_quant,
                     prism_config.is_some(),
                     clairic,
+                    preserve_host_backed,
+                    load_cuda_budget.as_ref(),
+                    Some(&mut pre_merge_device_bytes),
                 )?;
                 // These arrays already passed source expansion, sanitization
                 // and residency; never run those transforms a second time.
@@ -4167,7 +5039,7 @@ async fn load_with_thread_impl(
 
                 // Apply weights (GPU finalize precompute reads now-resident pages).
                 let (plain_fp8_residency, clef_byte_delta) =
-                    apply_weights_inner_with_residency_and_sym_zp(
+                    apply_weights_inner_with_residency_with_cuda_ctx(
                         &mut inner,
                         &mut params,
                         &config,
@@ -4181,6 +5053,11 @@ async fn load_with_thread_impl(
                         clef_residency,
                         prepared_clef,
                         clairic,
+                        CudaLoadBudgetCtx {
+                            budget: load_cuda_budget.as_ref(),
+                            pre_merge_device_bytes: Some(&pre_merge_device_bytes),
+                            preserve_host_backed,
+                        },
                     )?;
                 if let Some(plan) = preload_input
                     .as_ref()
@@ -7699,6 +8576,8 @@ mod tests {
                 ClefResidency::Sym8,
                 false,
                 &mut signs_by_width,
+                None,
+                None,
             )
             .unwrap();
             MxArray::eval_arrays_with_context(&part.values().collect::<Vec<_>>(), label).unwrap();
@@ -9624,6 +10503,712 @@ mod tests {
             assert!(
                 params.contains_key(&format!("{retained}.weight")),
                 "unmerged source '{retained}.weight' must stay in params"
+            );
+        }
+    }
+
+    /// Evaluate every array in `params` so settled device vs host accounting is deterministic.
+    fn eval_param_map(params: &HashMap<String, MxArray>, label: &str) {
+        let refs: Vec<&MxArray> = params.values().collect();
+        MxArray::eval_arrays_with_context(&refs, label).unwrap();
+    }
+
+    /// Copy an evaluated array's bytes into a fresh `MxArray::alloc_uninit` buffer
+    /// (CUDA host-backed `device == -1` on CUDA builds).
+    fn copy_to_host_uninit(arr: &MxArray) -> MxArray {
+        arr.eval();
+        let shape = arr.shape().unwrap().to_vec();
+        let dtype = arr.dtype().unwrap();
+        let (host, ptr, bytes) = MxArray::alloc_uninit(&shape, dtype).unwrap();
+        match dtype {
+            DType::Uint32 => {
+                let vals = arr.to_uint32().unwrap();
+                assert_eq!(vals.len() * 4, bytes);
+                // SAFETY: `ptr` owns `bytes` writable bytes and `vals` has exact length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(vals.as_ptr().cast::<u8>(), ptr.0, bytes);
+                }
+            }
+            DType::Float16 | DType::BFloat16 => {
+                let vals = arr.to_uint16_native().unwrap();
+                assert_eq!(vals.len() * 2, bytes);
+                // SAFETY: `ptr` owns `bytes` writable bytes and `vals` has exact length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(vals.as_ptr().cast::<u8>(), ptr.0, bytes);
+                }
+            }
+            DType::Float32 => {
+                let vals = arr.to_float32().unwrap();
+                assert_eq!(vals.len() * 4, bytes);
+                // SAFETY: `ptr` owns `bytes` writable bytes and `vals` has exact length.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(vals.as_ptr().cast::<u8>(), ptr.0, bytes);
+                }
+            }
+            other => panic!("copy_to_host_uninit: unsupported test dtype {other:?}"),
+        }
+        host
+    }
+
+    fn insert_host_affine_group(
+        params: &mut HashMap<String, MxArray>,
+        prefix: &str,
+        dense: &MxArray,
+        bits: i32,
+        group_size: i32,
+    ) {
+        let mut tmp = HashMap::new();
+        insert_affine_group(&mut tmp, prefix, dense, bits, group_size);
+        eval_param_map(&tmp, "insert_host_affine_group");
+        for (k, v) in tmp {
+            params.insert(k, copy_to_host_uninit(&v));
+        }
+    }
+
+    #[test]
+    fn clef_residency_budget_unlimited_converts_all_units_to_sym8() {
+        let label = "clef_residency_budget_unlimited_converts_all_units_to_sym8";
+        let Some((mut before, default_plq)) = clef_affine_fixture(label) else {
+            return;
+        };
+        let Some(wide) = clef_dense_or_skip(label, 64, 1024, 91) else {
+            return;
+        };
+        insert_affine_group(
+            &mut before,
+            "layers.1.linear_attn.in_proj_qkvz",
+            &wide,
+            8,
+            32,
+        );
+        eval_param_map(&before, label);
+
+        let initial_quant =
+            HashMap::from([("layers.0.linear_attn.out_proj".to_string(), clef_sym8_plq())]);
+
+        let mut baseline = before.clone();
+        let mut baseline_quant = initial_quant.clone();
+        let (baseline_transforms, baseline_delta) = apply_clef_residency(
+            &mut baseline,
+            &mut baseline_quant,
+            default_plq,
+            ClefResidency::Sym8,
+        )
+        .unwrap();
+
+        let unlimited = CudaDeviceBudget::from_limits_for_test(128 << 30, None, true);
+        assert!(unlimited.is_unlimited());
+        let mut params = before;
+        let mut per_layer_quant = initial_quant;
+        let (transforms, byte_delta) = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &unlimited,
+        )
+        .unwrap();
+
+        assert_eq!(per_layer_quant, baseline_quant);
+        assert_eq!(byte_delta, baseline_delta);
+        assert_eq!(transforms.len(), baseline_transforms.len());
+        assert_eq!(
+            crate::utils::gguf_import::gate::manifest(&params),
+            crate::utils::gguf_import::gate::manifest(&baseline),
+        );
+        assert_eq!(
+            params["layers.1.linear_attn.in_proj_qkvz.weight"]
+                .dtype()
+                .unwrap(),
+            DType::Int8
+        );
+        assert!(transforms.contains_key("layers.1.linear_attn.in_proj_qkvz"));
+    }
+
+    #[test]
+    fn clef_residency_budget_exhausted_keeps_native_quant_without_allocating_sym8() {
+        let label = "clef_residency_budget_exhausted_keeps_native_quant_without_allocating_sym8";
+        let mut before = HashMap::new();
+        let prefixes = [
+            ("layers.0.mlp.gate_proj", 64, 128, 11),
+            ("layers.0.mlp.up_proj", 64, 128, 12),
+            ("layers.0.mlp.down_proj", 128, 64, 13),
+            ("layers.0.linear_attn.in_proj_qkvz", 96, 128, 14),
+            ("layers.0.linear_attn.in_proj_ba", 8, 128, 15),
+            ("layers.0.linear_attn.out_proj", 64, 1024, 16),
+            ("embedding", 48, 128, 17),
+            ("lm_head", 48, 128, 18),
+        ];
+        for (prefix, n, k, seed) in prefixes {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            insert_affine_group(&mut before, prefix, &dense, 8, 32);
+        }
+        eval_param_map(&before, label);
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        let before_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+
+        // 8 GiB discrete GPU with 2 GiB free == 2 GiB reserve => 0 remaining bytes.
+        let exhausted = CudaDeviceBudget::from_limits_for_test(8 << 30, Some(2 << 30), false);
+        assert!(!exhausted.is_unlimited());
+        assert_eq!(exhausted.remaining_bytes(), 0);
+
+        let mut params = before.clone();
+        let mut per_layer_quant = HashMap::new();
+        let (transforms, byte_delta) = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+        )
+        .unwrap();
+
+        assert!(
+            transforms.is_empty(),
+            "exhausted budget must not attach rotations"
+        );
+        assert_eq!(
+            byte_delta, 0,
+            "exhausted budget must leave resident bytes unchanged"
+        );
+        assert!(
+            per_layer_quant.is_empty(),
+            "exhausted budget must not insert Sym8 overrides"
+        );
+        for (prefix, _, _, _) in prefixes {
+            assert_affine_untouched(&before, &params, prefix);
+            for suffix in ["weight", "scales", "biases"] {
+                let key = format!("{prefix}.{suffix}");
+                assert_eq!(
+                    params[&key].as_raw_ptr(),
+                    before_ptrs[&key],
+                    "exhausted budget must not reallocate '{key}'"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clef_residency_budget_releases_replaced_device_source_and_falls_back_on_overflow() {
+        let label =
+            "clef_residency_budget_releases_replaced_device_source_and_falls_back_on_overflow";
+        let mut before = HashMap::new();
+        for (prefix, n, k, seed) in [
+            ("layers.0.linear_attn.in_proj_qkvz", 256, 512, 31),
+            ("layers.1.linear_attn.in_proj_qkvz", 256, 512, 32),
+            ("layers.2.linear_attn.in_proj_qkvz", 512, 512, 33),
+        ] {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            insert_affine_group(&mut before, prefix, &dense, 8, 32);
+        }
+        eval_param_map(&before, label);
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+
+        let align = |b: u64| CudaDeviceBudget::align_bytes(b).unwrap();
+        let unit0_output = align(256 * 512) + align(256 * 4);
+        let unit0_scratch = if crate::accelerator::cuda_sym8_available() {
+            0
+        } else {
+            align(256 * 512 * 2)
+        };
+        let unit0_peak = unit0_output + unit0_scratch;
+        let source0_freed: u64 = ["weight", "scales", "biases"]
+            .iter()
+            .map(|s| {
+                align(before[&format!("layers.0.linear_attn.in_proj_qkvz.{s}")].nbytes() as u64)
+            })
+            .sum();
+        assert!(
+            source0_freed > unit0_output,
+            "Q8_0 source ({source0_freed}) should exceed Sym8 output ({unit0_output})"
+        );
+
+        // Give the budget room for exactly ONE unit's peak (not two without source release).
+        let budget =
+            CudaDeviceBudget::from_limits_for_test(8 << 30, Some((2 << 30) + unit0_peak), false);
+        assert_eq!(budget.remaining_bytes(), unit0_peak);
+
+        let mut params = before.clone();
+        let mut per_layer_quant = HashMap::new();
+        let (_, byte_delta) = apply_clef_residency_with_budget_for_test(
+            &mut params,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &budget,
+        )
+        .unwrap();
+
+        // Both Unit 0 and Unit 1 convert because Unit 0 released its replaced device source.
+        for converted in [
+            "layers.0.linear_attn.in_proj_qkvz",
+            "layers.1.linear_attn.in_proj_qkvz",
+        ] {
+            assert_eq!(
+                params[&format!("{converted}.weight")].dtype().unwrap(),
+                DType::Int8,
+                "{converted} must convert to Sym8"
+            );
+            assert!(!params.contains_key(&format!("{converted}.biases")));
+            assert_eq!(per_layer_quant.get(converted), Some(&clef_sym8_plq()));
+        }
+        // Larger Unit 2 exceeds the remaining budget and stays in native packed Q8_0.
+        assert_affine_untouched(&before, &params, "layers.2.linear_attn.in_proj_qkvz");
+        assert!(
+            !per_layer_quant.contains_key("layers.2.linear_attn.in_proj_qkvz"),
+            "overflow unit must not get a Sym8 override"
+        );
+        assert_eq!(
+            params["layers.2.linear_attn.in_proj_qkvz.weight"].as_raw_ptr(),
+            before["layers.2.linear_attn.in_proj_qkvz.weight"].as_raw_ptr(),
+        );
+        assert_eq!(byte_delta, map_nbytes(&params) - map_nbytes(&before));
+        assert_eq!(
+            budget.remaining_bytes(),
+            unit0_peak + 2 * (source0_freed - unit0_output),
+            "budget must reflect released device source bytes without double-charging"
+        );
+
+        // On CUDA, host-backed sources must NOT credit freed VRAM when converted:
+        // with budget == unit0_peak, Unit 0 consumes unit0_output permanently and Unit 1 overflows.
+        if crate::accelerator::cuda_ops_available() {
+            let mut host_before = HashMap::new();
+            for (prefix, seed) in [
+                ("layers.0.linear_attn.in_proj_qkvz", 41),
+                ("layers.1.linear_attn.in_proj_qkvz", 42),
+            ] {
+                let dense = clef_dense_or_skip(label, 256, 512, seed).unwrap();
+                insert_host_affine_group(&mut host_before, prefix, &dense, 8, 32);
+                assert!(
+                    host_before[&format!("{prefix}.weight")].cuda_host_bytes() > 0,
+                    "{prefix} must start host-backed on CUDA"
+                );
+            }
+            let host_budget = CudaDeviceBudget::from_limits_for_test(
+                8 << 30,
+                Some((2 << 30) + unit0_peak),
+                false,
+            );
+            let mut host_params = host_before.clone();
+            let mut host_plq = HashMap::new();
+            apply_clef_residency_with_budget_for_test(
+                &mut host_params,
+                &mut host_plq,
+                default_plq,
+                ClefResidency::Sym8,
+                &host_budget,
+            )
+            .unwrap();
+            assert_eq!(
+                host_params["layers.0.linear_attn.in_proj_qkvz.weight"]
+                    .dtype()
+                    .unwrap(),
+                DType::Int8
+            );
+            assert_eq!(
+                host_budget.remaining_bytes(),
+                unit0_scratch,
+                "host-backed source drop must not credit freed VRAM"
+            );
+            assert_affine_untouched(
+                &host_before,
+                &host_params,
+                "layers.1.linear_attn.in_proj_qkvz",
+            );
+            assert!(
+                host_params["layers.1.linear_attn.in_proj_qkvz.weight"].cuda_host_bytes() > 0,
+                "overflow unit must remain host-backed"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_residency_budget_accounts_for_q4_to_sym8_expansion_and_bf16_scratch() {
+        let label = "clef_residency_budget_accounts_for_q4_to_sym8_expansion_and_bf16_scratch";
+        let Some(dense) = clef_dense_or_skip(label, 256, 1024, 51) else {
+            return;
+        };
+        let prefix = "layers.0.linear_attn.in_proj_qkvz";
+        let mut before = HashMap::new();
+        insert_affine_group(&mut before, prefix, &dense, 4, 32);
+        eval_param_map(&before, label);
+        let default_plq = default_per_layer_quant(4, 32, PerLayerMode::Affine);
+
+        let align = |b: u64| CudaDeviceBudget::align_bytes(b).unwrap();
+        let q4_source_bytes: u64 = ["weight", "scales", "biases"]
+            .iter()
+            .map(|s| align(before[&format!("{prefix}.{s}")].nbytes() as u64))
+            .sum();
+        let sym8_output = align(256 * 1024) + align(256 * 4) + align(1024 * 4);
+        let bf16_scratch = align(256 * 1024 * 2);
+        let peak_need = sym8_output + bf16_scratch;
+
+        // Budget > Sym8 output (and > Q4 source) but < Sym8 output + BF16 dequant scratch:
+        // must deny conversion and preserve native Q4_0.
+        let tight_remaining = sym8_output + bf16_scratch / 2;
+        assert!(tight_remaining > sym8_output && tight_remaining > q4_source_bytes);
+        assert!(tight_remaining < peak_need);
+        let tight_budget = CudaDeviceBudget::from_limits_for_test(
+            8 << 30,
+            Some((2 << 30) + tight_remaining),
+            false,
+        );
+        let mut tight_params = before.clone();
+        let mut tight_plq = HashMap::new();
+        let (tight_transforms, tight_delta) = apply_clef_residency_with_budget_for_test(
+            &mut tight_params,
+            &mut tight_plq,
+            default_plq,
+            ClefResidency::Sym8,
+            &tight_budget,
+        )
+        .unwrap();
+        assert!(tight_transforms.is_empty());
+        assert_eq!(tight_delta, 0);
+        assert!(tight_plq.is_empty());
+        assert_affine_untouched(&before, &tight_params, prefix);
+        assert_eq!(tight_budget.remaining_bytes(), tight_remaining);
+
+        // Budget == exact peak_need (Sym8 output + Hadamard signs + BF16 scratch):
+        // must admit conversion, release BF16 scratch + freed Q4 source, and retain net expansion.
+        let exact_budget =
+            CudaDeviceBudget::from_limits_for_test(8 << 30, Some((2 << 30) + peak_need), false);
+        let mut exact_params = before.clone();
+        let mut exact_plq = HashMap::new();
+        let (exact_transforms, exact_delta) = apply_clef_residency_with_budget_for_test(
+            &mut exact_params,
+            &mut exact_plq,
+            default_plq,
+            ClefResidency::Sym8,
+            &exact_budget,
+        )
+        .unwrap();
+        assert_eq!(
+            exact_params[&format!("{prefix}.weight")].dtype().unwrap(),
+            DType::Int8
+        );
+        assert_eq!(
+            exact_params[&format!("{prefix}.weight")]
+                .shape()
+                .unwrap()
+                .as_ref(),
+            [256, 1024]
+        );
+        assert!(!exact_params.contains_key(&format!("{prefix}.biases")));
+        assert_eq!(exact_plq.get(prefix), Some(&clef_sym8_plq()));
+        assert!(exact_transforms.contains_key(prefix));
+        assert_eq!(exact_delta, map_nbytes(&exact_params) - map_nbytes(&before));
+        assert_eq!(
+            exact_budget.remaining_bytes(),
+            peak_need - sym8_output + q4_source_bytes,
+            "BF16 scratch and freed Q4 source must be released while Sym8 output + signs stay charged"
+        );
+    }
+
+    #[test]
+    fn clef_mixed_sym8_and_native_quant_layers_install_and_forward() {
+        let label = "clef_mixed_sym8_and_native_quant_layers_install_and_forward";
+        if unsafe { mlx_sys::mlx_gpu_architecture_gen() } < 17
+            && !crate::accelerator::cuda_sym8_available()
+        {
+            eprintln!("[{label}] SKIP: gpu gen < 17 and CUDA SM >= 8.0 unavailable");
+            return;
+        }
+        // Full-attention layers only (`full_attention_interval = 1`) so forward
+        // exercises full attention + MLP cleanly without touching cuDNN Conv1d.
+        let cfg = Qwen3_5Config {
+            vocab_size: 16,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            head_dim: 32,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 0,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 1,
+            partial_rotary_factor: 0.5,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: Some("bf16".to_string()),
+            rope_scaling: None,
+        };
+        let mut inner = match Qwen35Inner::new(cfg.clone()) {
+            Ok(inner) => inner,
+            Err(error) => {
+                let message = error.reason.to_string();
+                if message.contains("Metal")
+                    || message.contains("device")
+                    || message.contains("LayerKVPool")
+                {
+                    eprintln!("skipping {label} (MLX/Metal unavailable): {message}");
+                    return;
+                }
+                panic!("unexpected Qwen35Inner::new failure in {label}: {message}");
+            }
+        };
+
+        let default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        let layer_specs = [
+            ("self_attn.q_proj", 128, 64, 1),
+            ("self_attn.k_proj", 64, 64, 2),
+            ("self_attn.v_proj", 64, 64, 3),
+            ("self_attn.o_proj", 64, 64, 4),
+            ("mlp.gate_proj", 64, 64, 5),
+            ("mlp.up_proj", 64, 64, 6),
+            ("mlp.down_proj", 64, 64, 7),
+        ];
+
+        // Layer 0: device-resident Q8_0 converted to Sym8 under an unlimited budget.
+        let mut layer0 = HashMap::new();
+        for (suffix, n, k, seed) in layer_specs {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed) else {
+                return;
+            };
+            insert_affine_group(&mut layer0, &format!("layers.0.{suffix}"), &dense, 8, 32);
+        }
+        eval_param_map(&layer0, "layer0");
+        let mut per_layer_quant = HashMap::new();
+        let unlimited = CudaDeviceBudget::from_limits_for_test(128 << 30, None, true);
+        let (prepared_transforms, _) = apply_clef_residency_with_budget_for_test(
+            &mut layer0,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &unlimited,
+        )
+        .unwrap();
+
+        // Layer 1: host-backed Q8_0 kept in native packed format under an exhausted discrete budget.
+        let mut layer1 = HashMap::new();
+        for (suffix, n, k, seed) in layer_specs {
+            let Some(dense) = clef_dense_or_skip(label, n, k, seed + 100) else {
+                return;
+            };
+            insert_host_affine_group(&mut layer1, &format!("layers.1.{suffix}"), &dense, 8, 32);
+        }
+        let exhausted = CudaDeviceBudget::from_limits_for_test(8 << 30, Some(2 << 30), false);
+        let (layer1_transforms, layer1_delta) = apply_clef_residency_with_budget_for_test(
+            &mut layer1,
+            &mut per_layer_quant,
+            default_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+        )
+        .unwrap();
+        assert!(layer1_transforms.is_empty());
+        assert_eq!(layer1_delta, 0);
+
+        // Combine complete checkpoint with embedding, lm_head, and layer norms.
+        let mut params = layer0;
+        params.extend(layer1);
+        for (prefix, n, k, seed) in [("embedding", 16, 64, 201), ("lm_head", 16, 64, 202)] {
+            let dense = clef_dense_or_skip(label, n, k, seed).unwrap();
+            insert_affine_group(&mut params, prefix, &dense, 8, 32);
+        }
+        let norm_h = MxArray::ones(&[64], Some(DType::BFloat16)).unwrap();
+        let norm_hd = MxArray::ones(&[32], Some(DType::BFloat16)).unwrap();
+        params.insert("final_norm.weight".to_string(), norm_h.clone());
+        for layer_idx in 0..2 {
+            params.insert(
+                format!("layers.{layer_idx}.input_layernorm.weight"),
+                norm_h.clone(),
+            );
+            params.insert(
+                format!("layers.{layer_idx}.post_attention_layernorm.weight"),
+                norm_h.clone(),
+            );
+            params.insert(
+                format!("layers.{layer_idx}.self_attn.q_norm.weight"),
+                norm_hd.clone(),
+            );
+            params.insert(
+                format!("layers.{layer_idx}.self_attn.k_norm.weight"),
+                norm_hd.clone(),
+            );
+        }
+
+        apply_weights_inner_with_residency_with_cuda_ctx(
+            &mut inner,
+            &mut params,
+            &cfg,
+            8,
+            32,
+            Some(PerLayerMode::Affine),
+            &per_layer_quant,
+            &SymmetricZeroPoints::default(),
+            false,
+            None,
+            Some(ClefResidency::Sym8),
+            Some(prepared_transforms),
+            false,
+            CudaLoadBudgetCtx {
+                budget: Some(&exhausted),
+                pre_merge_device_bytes: None,
+                preserve_host_backed: true,
+            },
+        )
+        .expect("mixed Sym8 + host-backed NativeQuant checkpoint must install cleanly");
+
+        let sym8 = crate::models::quantized_linear::SYM8_MODE.to_string();
+        let affine = crate::models::quantized_linear::DEFAULT_QUANT_MODE.to_string();
+
+        // Layer 0: Sym8 everywhere; merged on CUDA SM >= 8.0.
+        let AttentionType::Full(attn0) = &inner.layers[0].attn else {
+            panic!("layer 0 must be full attention");
+        };
+        assert_eq!(attn0.q_proj_mode_and_block().0, Some(sym8.clone()));
+        if crate::accelerator::cuda_sym8_available() {
+            assert!(attn0.has_q_gate_block_layout());
+            assert!(attn0.has_merged_kv_proj());
+        }
+        match &inner.layers[0].mlp {
+            MLPType::Dense(MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            }) => {
+                for ql in [gate_proj, up_proj, down_proj] {
+                    assert_eq!(ql.mode(), sym8);
+                }
+                assert_eq!(gate_up.is_some(), crate::accelerator::cuda_sym8_available());
+            }
+            MLPType::Dense(MLPVariant::Standard(_)) | MLPType::MoE(_) => {
+                panic!("layer 0 MLP must be quantized Sym8")
+            }
+        }
+
+        // Layer 1: NativeQuant affine everywhere; host-backed tensors stay host-backed
+        // and skip GPU merges/reorders when preserve_host_backed is active.
+        let AttentionType::Full(attn1) = &inner.layers[1].attn else {
+            panic!("layer 1 must be full attention");
+        };
+        assert_eq!(attn1.q_proj_mode_and_block().0, Some(affine.clone()));
+        if crate::accelerator::cuda_ops_available() {
+            assert!(
+                attn1.get_q_proj_weight().cuda_host_bytes() > 0,
+                "layer 1 q_proj must stay host-backed"
+            );
+            assert!(
+                attn1.get_k_proj_weight().cuda_host_bytes() > 0,
+                "layer 1 k_proj must stay host-backed"
+            );
+            assert!(
+                attn1.get_v_proj_weight().cuda_host_bytes() > 0,
+                "layer 1 v_proj must stay host-backed"
+            );
+            assert!(
+                attn1.get_o_proj_weight().cuda_host_bytes() > 0,
+                "layer 1 o_proj must stay host-backed"
+            );
+            assert!(
+                !attn1.has_q_gate_block_layout(),
+                "host-backed q_proj must skip GPU q/gate reorder"
+            );
+            assert!(
+                !attn1.has_merged_kv_proj(),
+                "host-backed k/v must skip GPU kv_proj merge"
+            );
+        }
+        match &inner.layers[1].mlp {
+            MLPType::Dense(MLPVariant::Quantized {
+                gate_proj,
+                up_proj,
+                down_proj,
+                gate_up,
+            }) => {
+                for ql in [gate_proj, up_proj, down_proj] {
+                    assert_eq!(ql.mode(), affine);
+                    if crate::accelerator::cuda_ops_available() {
+                        assert!(
+                            ql.get_weight().cuda_host_bytes() > 0,
+                            "layer 1 MLP weight must stay host-backed"
+                        );
+                    }
+                }
+                if crate::accelerator::cuda_ops_available() {
+                    assert!(
+                        gate_up.is_none(),
+                        "host-backed MLP must skip GPU gate_up concat_rows merge"
+                    );
+                }
+            }
+            MLPType::Dense(MLPVariant::Standard(_)) | MLPType::MoE(_) => {
+                panic!("layer 1 MLP must stay native quantized")
+            }
+        }
+
+        // Real forward pass across all installed attention + MLP projections of
+        // Layer 0 (Sym8: merged q/gate block, merged kv_proj, merged gate_up) and
+        // Layer 1 (host-backed NativeQuant: unmerged q/k/v/o and gate/up/down),
+        // skipping cuDNN SDPA so the Windows test harness exits cleanly.
+        let x = MxArray::ones(&[1, 2, 64], Some(DType::BFloat16)).unwrap();
+        let (q0, g0, k0, v0, o0) = attn0
+            .forward_projections_no_sdpa(&x)
+            .expect("layer 0 Sym8 attention projections forward");
+        let mlp0 = inner.layers[0]
+            .mlp
+            .forward(&x)
+            .expect("layer 0 Sym8 MLP forward");
+        let (q1, g1, k1, v1, o1) = attn1
+            .forward_projections_no_sdpa(&mlp0)
+            .expect("layer 1 host-backed NativeQuant attention projections forward");
+        let mlp1 = inner.layers[1]
+            .mlp
+            .forward(&mlp0)
+            .expect("layer 1 host-backed NativeQuant MLP forward");
+        MxArray::eval_arrays_with_context(
+            &[
+                &q0, &g0, &k0, &v0, &o0, &mlp0, &q1, &g1, &k1, &v1, &o1, &mlp1,
+            ],
+            label,
+        )
+        .unwrap();
+        for (name, out, expected_shape) in [
+            ("layer 0 q", &q0, &[1i64, 2, 2, 32][..]),
+            ("layer 0 gate", &g0, &[1, 2, 64][..]),
+            ("layer 0 k", &k0, &[1, 2, 64][..]),
+            ("layer 0 v", &v0, &[1, 2, 64][..]),
+            ("layer 0 o", &o0, &[1, 2, 64][..]),
+            ("layer 0 mlp", &mlp0, &[1, 2, 64][..]),
+            ("layer 1 q", &q1, &[1, 2, 2, 32][..]),
+            ("layer 1 gate", &g1, &[1, 2, 64][..]),
+            ("layer 1 k", &k1, &[1, 2, 64][..]),
+            ("layer 1 v", &v1, &[1, 2, 64][..]),
+            ("layer 1 o", &o1, &[1, 2, 64][..]),
+            ("layer 1 mlp", &mlp1, &[1, 2, 64][..]),
+        ] {
+            assert_eq!(out.dtype().unwrap(), DType::BFloat16, "{name} dtype");
+            assert_eq!(
+                out.shape().unwrap().as_ref(),
+                expected_shape,
+                "{name} shape"
+            );
+            let vals = out.astype(DType::Float32).unwrap().to_float32().unwrap();
+            assert!(
+                vals.iter().all(|v| v.is_finite()),
+                "{name} forward produced non-finite values"
             );
         }
     }

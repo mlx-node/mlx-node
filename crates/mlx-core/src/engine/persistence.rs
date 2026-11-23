@@ -141,7 +141,12 @@ pub(crate) fn load_checkpoint(
         return load_all_safetensors(dir, load_vision);
     };
     let mut params = std::mem::take(&mut preload.main);
-    expand_symmetric_affine_biases(dir, &mut params)?;
+    let preserve_host_backed = crate::accelerator::cuda_ops_available()
+        && preload
+            .cuda_budget
+            .as_ref()
+            .is_some_and(|b| !b.is_unlimited());
+    expand_symmetric_affine_biases_with_host_policy(dir, &mut params, preserve_host_backed)?;
     if load_vision {
         let companion = std::mem::take(&mut preload.companion);
         info!("Appending {} GGUF companion tensors", companion.len());
@@ -207,6 +212,18 @@ pub(crate) fn expand_symmetric_affine_biases(
     dir: &Path,
     params: &mut HashMap<String, MxArray>,
 ) -> Result<usize> {
+    expand_symmetric_affine_biases_with_host_policy(dir, params, false)
+}
+
+/// Like [`expand_symmetric_affine_biases`], but when `preserve_host_backed` is
+/// `true` and a tensor's `.scales` is already settled in CUDA host-backed
+/// memory (`device < 0`), derives `.biases` on the CPU stream so discrete-GPU
+/// overflow tensors are never silently re-promoted into VRAM.
+pub(crate) fn expand_symmetric_affine_biases_with_host_policy(
+    dir: &Path,
+    params: &mut HashMap<String, MxArray>,
+    preserve_host_backed: bool,
+) -> Result<usize> {
     let Ok(raw_str) = fs::read_to_string(dir.join("config.json")) else {
         return Ok(0);
     };
@@ -259,7 +276,13 @@ pub(crate) fn expand_symmetric_affine_biases(
                  multiple"
             )));
         }
-        let biases = scales.mul_scalar(-f64::from(*zero_point))?;
+        let biases = if preserve_host_backed && scales.is_settled_cuda_host() {
+            let derived = scales.mul_scalar_cpu(-f64::from(*zero_point))?;
+            derived.eval();
+            derived
+        } else {
+            scales.mul_scalar(-f64::from(*zero_point))?
+        };
         params.insert(format!("{base}.biases"), biases);
     }
 

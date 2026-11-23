@@ -794,6 +794,29 @@ impl Qwen3_5Attention {
         self.kv_proj.is_some()
     }
 
+    pub(crate) fn q_proj_has_settled_cuda_host_storage(&self) -> bool {
+        self.q_proj.has_settled_cuda_host_storage()
+    }
+
+    pub(crate) fn kv_proj_has_settled_cuda_host_storage(&self) -> bool {
+        self.k_proj.has_settled_cuda_host_storage() || self.v_proj.has_settled_cuda_host_storage()
+    }
+
+    /// Test-only: exercise all installed attention projections (`q_proj`,
+    /// `k_proj`, `v_proj`, `o_proj`, including Sym8 fused mixer and q/gate
+    /// block / merged KV layouts) without invoking cuDNN SDPA.
+    #[cfg(test)]
+    pub(crate) fn forward_projections_no_sdpa(
+        &self,
+        x: &MxArray,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray)> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let (q, gate, k, v) = self.project_mixer(x, batch, seq_len)?;
+        let o = self.o_proj.forward(x)?;
+        Ok((q, gate, k, v, o))
+    }
+
     /// Forward pass.
     ///
     /// # Arguments
