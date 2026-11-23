@@ -23,83 +23,16 @@
 
 namespace mlx::core::splash_moe {
 
-// The source router and selector consume weights instead of logits. Keep
-// this operand contract separate from the unchanged60-byte expert Metal ABI.
-inline bool source_router_inputs(const std::vector<array>& a) {
-  return a.size()>=3 && a[0].shape()==Shape{8,2048} && a[0].dtype()==bfloat16 &&
-      a[1].shape()==Shape{256,2048} && a[1].dtype()==bfloat16 &&
-      a[2].shape()==Shape{1,2048} && a[2].dtype()==bfloat16;
-}
-inline bool source_routing_inputs(const std::vector<array>& a, const SplashMoeParams& p) {
-  if(!source_router_inputs(a) || p.rows!=8 || p.hidden!=2048 || p.intermediate!=512 ||
-     p.experts!=256 || p.top_k!=8 || !(p.normalize&1) || !p.source_math ||
-     a.size()!=size_t(21+((p.normalize&8)?1:0)+p.source_residual)) return false;
-  for(int j=0;j<6;++j) {
-    uint32_t f=p.formats[j],bits=f&255;
-    if((f&~511u) || (j%3==2 ? bits!=4&&bits!=6 : bits!=4)) return false;
-    int N=j%3==2?2048:512,K=j%3==2?512:2048;
-    const auto& w=a[3+3*j];const auto& sc=a[4+3*j];const auto& bias=a[5+3*j];
-    Shape ws=j<3?Shape{256,N,K*int(bits)/32}:Shape{N,K*int(bits)/32};
-    Shape ss=j<3?Shape{256,N,K/16}:Shape{N,K/16};
-    Shape bs=j<3?Shape{256,N,K/256*(bits==6?1:2)}:Shape{N,K/256*(bits==6?1:2)};
-    if(w.shape()!=ws || w.dtype()!=uint32 || sc.shape()!=ss || sc.dtype()!=(bits==6?int8:uint8) ||
-       bias.shape()!=bs || bias.dtype()!=float16) return false;
-  }
-  if((p.normalize&8) && (a[21].dtype()!=int32 || a[21].size()!=1)) return false;
-  return !p.source_residual || (a.back().shape()==a[0].shape() && a.back().dtype()==bfloat16);
-}
-#ifdef MLX_NODE_METAL_ENABLED
-// Exact copy of the proven source arithmetic, deliberately isolated from
-// the native expert metallib's safe-math compilation. Safe routing changes
-// coefficient bits; MathMode::Fast matches the original Splash kernels.
-struct SourceFloatParams { uint32_t rows,input_size,output_size[2],out_stride[2],out_offset[2]; };
-struct SourceRouteParams { uint32_t rows,input_size,experts,top_k; };
-static_assert(sizeof(SourceFloatParams)==32 && sizeof(SourceRouteParams)==16,"source routing ABI");
-void encode_source_routing(metal::Device& d, metal::CommandEncoder& enc,
-    const array& x,const array& router,const array& shared,
-    array& scores,size_t score_offset,array& selected,size_t selected_offset,
-    array& weights,size_t weights_offset) {
-  CompileOptions options;options.math_mode=MathMode::Fast;
-  auto* library=d.get_library("mlx_node_source_routing_m8_e256_fast_v1",options,[]{
-    return std::string(
-#include "metal/common/source_routing.metal.inc"
-    );
-  });
-  auto* project=d.get_kernel("mlx_splash_source_router",library);
-  auto* route=d.get_kernel("mlx_splash_source_route",library);
-  for(auto* pipeline:{project,route}) {
-    if(pipeline->threadExecutionWidth()!=32 || pipeline->maxTotalThreadsPerThreadgroup()<256 ||
-       pipeline->staticThreadgroupMemoryLength()>d.mtl_device()->maxThreadgroupMemoryLength())
-      throw std::runtime_error("source routing threadgroup unsupported");
-  }
-  SourceFloatParams fp{8,2048,{256,0},{256,256},{0,0}};
-  enc.set_compute_pipeline_state(project);
-  enc.set_input_array(x,0);enc.set_input_array(router,1);
-  enc.set_output_array(scores,2,score_offset);
-  // The second segment has zero columns and is never accessed.
-  enc.set_input_array(router,3);enc.set_output_array(scores,4,score_offset);enc.set_bytes(fp,5);
-  enc.dispatch_threadgroups(MTL::Size(32,1,1),MTL::Size(256,1,1));
-  SourceRouteParams rp{8,2048,256,8};
-  enc.set_compute_pipeline_state(route);
-  enc.set_input_array(scores,0,score_offset);enc.set_input_array(x,1);enc.set_input_array(shared,2);
-  enc.set_output_array(selected,3,selected_offset);enc.set_output_array(weights,4,weights_offset);enc.set_bytes(rp,5);
-  enc.dispatch_threadgroups(MTL::Size(8,1,1),MTL::Size(256,1,1));
-  bridge_testing::record("splash_moe_source_routing");
-}
-#endif
-
 class GroupedMoe : public UnaryPrimitive {
  public:
-  GroupedMoe(Stream s, SplashMoeParams params, bool source_routing=false, bool workspace=false)
-      : UnaryPrimitive(s), p_(params), source_routing_(source_routing), workspace_(workspace) {}
+  GroupedMoe(Stream s, SplashMoeParams params, bool workspace=false)
+      : UnaryPrimitive(s), p_(params), workspace_(workspace) {}
   DEFINE_NAME(GroupedMoe)
   bool is_equivalent(const Primitive &other) const override {
     const auto& rhs=static_cast<const GroupedMoe&>(other);
-    return workspace_==rhs.workspace_ && source_routing_==rhs.source_routing_ && std::memcmp(&p_, &rhs.p_, sizeof(p_)) == 0;
+    return workspace_==rhs.workspace_ && std::memcmp(&p_, &rhs.p_, sizeof(p_)) == 0;
   }
   std::vector<Shape> output_shapes(const std::vector<array> &inputs) override {
-    if(source_routing_ && !source_routing_inputs(inputs,p_))
-      throw std::invalid_argument("source routing replay changed its measured input contract");
     if (p_.normalize >> 16) return {{1}};
     if ((p_.normalize >> 8)&255) return {{inputs[0].shape(0), int(p_.top_k+1), int((p_.normalize>>8)==4 ? p_.hidden : p_.intermediate)}};
     return {inputs[0].shape()};
@@ -110,7 +43,6 @@ class GroupedMoe : public UnaryPrimitive {
   void eval_gpu(const std::vector<array> &inputs, array &out) override;
  private:
   SplashMoeParams p_;
-  bool source_routing_;
   bool workspace_;
 };
 
@@ -119,24 +51,17 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
   // A shapeless compile may replay a different token count. The weight
   // geometry stays fixed, but rows, tiers and workspaces are replay-local.
   SplashMoeParams p = p_;
-  if(source_routing_ && (!source_routing_inputs(inputs,p) ||
-     metal::device(stream().device).get_architecture_gen()<17))
-    throw std::invalid_argument("source routing replay changed its measured input contract");
   if (inputs[0].ndim() != 2 || inputs[0].shape(1) != int(p.hidden)) {
     throw std::invalid_argument("grouped GGUF MoE replay changed its hidden dimension");
   }
-  if ((p.normalize&8) && (inputs.size()!=size_t(22+p.source_residual) || inputs[21].dtype()!=int32 || inputs[21].size()!=1))
+  if ((p.normalize&8) && (inputs.size()!=22 || inputs[21].dtype()!=int32 || inputs[21].size()!=1))
     throw std::invalid_argument("grouped GGUF MoE replay changed its budget shape/type");
-  if (p.source_residual &&
-      (inputs.size()!=size_t(22+((p.normalize&8)?1:0)) ||
-       inputs.back().dtype()!=bfloat16 || inputs.back().shape()!=inputs[0].shape()))
-    throw std::invalid_argument("source MoE residual replay changed shape/dtype");
   p.rows = inputs[0].shape(0);
   if (p.rows < 1 || p.rows > 2048) {
     throw std::invalid_argument("grouped GGUF MoE replay exceeds its token budget");
   }
   p.tile_rows = p.rows * p.top_k <= p.experts ? 8 : 32;
-  if (!source_routing_ && (inputs[1].size() != size_t(p.rows) * p.experts || inputs[2].size() != p.rows)) {
+  if (inputs[1].size() != size_t(p.rows) * p.experts || inputs[2].size() != p.rows) {
     throw std::invalid_argument("grouped GGUF MoE replay changed its routing shape");
   }
   for (int j = 0; j < 6; ++j) {
@@ -147,22 +72,6 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
         inputs[5 + j * 3].size() != elements / 256 * (bits == 6 ? 1 : 2)) {
       throw std::invalid_argument("grouped GGUF MoE replay changed its weight geometry");
     }
-  }
-  // The legacy body-only diagnostic may replay native fallback widths and
-  // retains native routing. The separately validated source-routing contract
-  // is M8-only and uses original source FP32 scores/selection.
-  p.source_math = p.source_math && p.rows==8 && p.hidden==2048 &&
-      p.intermediate==512 && p.experts==256 && p.top_k==8 &&
-      (p.normalize&6)==6 &&
-      metal::device(stream().device).get_architecture_gen() >= 17 &&
-      (p.formats[0]&255)==4 && (p.formats[1]&255)==4 &&
-      ((p.formats[2]&255)==4 || (p.formats[2]&255)==6) &&
-      (p.formats[3]&255)==4 && (p.formats[4]&255)==4 &&
-      ((p.formats[5]&255)==4 || (p.formats[5]&255)==6);
-  if (p.source_math) {
-    p.normalize &= ~(16u|32u|64u); // source staged schedule has precedence
-    bridge_testing::record("splash_moe_source_math");
-    bridge_testing::record("splash_moe_source_column");
   }
   const bool register_experts = (p.normalize & 16) && p.rows == 8 &&
       metal::device(stream().device).get_architecture_gen() >= 17 &&
@@ -188,7 +97,6 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
       if(int(p.rows)>=kquant::tiled_qmv_vector_limit(K,N)) precision=2;
       else if(p.rows==8 && (p.formats[j]&256)) precision=1;
     }
-    if(p.source_math) precision=1; // both column and staged source weights are half
     p.formats[j] |= precision<<9;
   }
   auto &s = stream();
@@ -306,19 +214,11 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
       enc.set_input_array(weight, index);
     }
   };
-  if(source_routing_) {
-    // Scores occupy the initial8*256*sizeof(float) bytes of gathered until
-    // selection finishes. The following gather overwrites it only after the
-    // encoder's resource dependency barrier; no extra resident score buffer.
-    if(gathered.nbytes()<size_t(8*256*sizeof(float))) throw std::logic_error("source score scratch extent");
-    encode_source_routing(d,enc,a[0],a[1],a[2],gathered,0,selected,0,weights,0);
-  } else {
-    kernel("splash_moe_route");
-    enc.set_input_array(a[1], 0); enc.set_input_array(a[2], 1);
-    enc.set_output_array(selected, 2); enc.set_output_array(weights, 3);
-    enc.set_bytes(p, 4); enc.set_input_array((p.normalize&8) ? a[21] : a[0],5);
-    enc.dispatch_threadgroups(MTL::Size(p.rows, 1, 1), MTL::Size(64, 1, 1));
-  }
+  kernel("splash_moe_route");
+  enc.set_input_array(a[1], 0); enc.set_input_array(a[2], 1);
+  enc.set_output_array(selected, 2); enc.set_output_array(weights, 3);
+  enc.set_bytes(p, 4); enc.set_input_array((p.normalize&8) ? a[21] : a[0],5);
+  enc.dispatch_threadgroups(MTL::Size(p.rows, 1, 1), MTL::Size(64, 1, 1));
   if (profile_done(1, selected)) return;
 
   kernel("splash_moe_group");
@@ -339,7 +239,7 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
   } else enc.dispatch_threadgroups(MTL::Size(max_tiles, p.hidden / 256, 1), MTL::Size(256, 1, 1));
   if (profile_done(3, count)) return;
 
-  kernel(p.source_math ? "splash_moe_gate_up_source_8" : register_experts ? "splash_moe_gate_up_sg8" : "splash_moe_gate_up_" + std::to_string(p.tile_rows));
+  kernel(register_experts ? "splash_moe_gate_up_sg8" : "splash_moe_gate_up_" + std::to_string(p.tile_rows));
   enc.set_input_array(gathered, 0); enc.set_input_array(tiles, 1); enc.set_input_array(count, 2);
   // Routed gate/up and shared gate/up, allowing all four quant formats to differ.
   for (int i=0; i<6; ++i) bind_routed(a[3+i], 3+i);
@@ -354,7 +254,7 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
   expert_grid(p.intermediate / 32, offsetof(SplashMoeTileCount, gate_up_grid));
   if (profile_done(4, count)) return;
 
-  kernel(p.source_math ? "splash_moe_down_source_8" : register_experts ? "splash_moe_down_sg8" : "splash_moe_down_" + std::to_string(p.tile_rows));
+  kernel(register_experts ? "splash_moe_down_sg8" : "splash_moe_down_" + std::to_string(p.tile_rows));
   enc.set_input_array(register_experts ? hidden_packed : hidden, 0); enc.set_input_array(tiles, 1); enc.set_input_array(count, 2);
   for (int i=0; i<3; ++i) bind_routed(a[9+i], 3+i);
   for (int i=0; i<3; ++i) enc.set_input_array(a[18+i], 6+i);
@@ -375,7 +275,6 @@ void GroupedMoe::eval_gpu(const std::vector<array> &inputs, array &out) {
   enc.set_input_array(projected, 0); enc.set_input_array(inverse, 1);
   enc.set_input_array(weights, 2); enc.set_output_array(combined, 3); enc.set_bytes(p, 4);
   enc.set_input_array((p.normalize&8) ? a[21] : a[0],5);
-  enc.set_input_array(p.source_residual ? a.back() : a[0],6);
   enc.dispatch_threadgroups(MTL::Size(p.rows, p.hidden / 256, 1), MTL::Size(256, 1, 1));
   if (profile) profile_done(6, count);
 }
@@ -395,26 +294,14 @@ bool available() {
 #endif
 }
 
-bool source_residual_available() {
-#ifdef MLX_NODE_METAL_ENABLED
-  return available() && metal::device(Device::gpu).get_architecture_gen()>=17;
-#else
-  return false;
-#endif
-}
-
-array grouped(std::vector<array> a, const uint32_t *formats, int top_k, bool normalize, int probe=0, int profile=0, int source_math_policy=-1, const array* residual=nullptr, bool source_routing=false) {
-  if(source_math_policy < -1 || source_math_policy > 1) throw std::invalid_argument("invalid source MoE arithmetic policy");
+array grouped(std::vector<array> a, const uint32_t *formats, int top_k, bool normalize, int probe=0, int profile=0) {
   if (profile<0 || profile>6 || (profile && probe)) throw std::invalid_argument("invalid grouped MoE profile cutoff");
   if (probe<0 || probe>4) throw std::invalid_argument("invalid grouped MoE probe stage");
   if (!available()) throw std::invalid_argument("grouped GGUF MoE is unavailable");
-  if(source_routing && ((a.size()!=21 && a.size()!=22) || !source_router_inputs(a) ||
-     !normalize || top_k!=8 || !source_residual_available() || probe || profile))
-    throw std::invalid_argument("source routing requires measured M8 BF16 profile");
-  if (!source_routing && ((a.size()!=21 && a.size()!=22) || a[0].ndim()!=2 || a[0].dtype()!=bfloat16 || a[1].ndim()!=2 ||
+  if ((a.size()!=21 && a.size()!=22) || a[0].ndim()!=2 || a[0].dtype()!=bfloat16 || a[1].ndim()!=2 ||
       (a[1].dtype()!=float32 && a[1].dtype()!=bfloat16) || (a[2].dtype()!=float32 && a[2].dtype()!=bfloat16) || a[0].shape(0)<1 || a[0].shape(0)>2048 ||
       a[1].shape(0)!=a[0].shape(0) || a[2].size()!=a[0].shape(0) ||
-      top_k<1 || top_k>8 || a[1].shape(1)<top_k || a[1].shape(1)>256))
+      top_k<1 || top_k>8 || a[1].shape(1)<top_k || a[1].shape(1)>256)
     throw std::invalid_argument("invalid grouped GGUF MoE activation/router inputs");
   if(a.size()==22 && (a[21].dtype()!=int32 || a[21].size()!=1))
     throw std::invalid_argument("grouped GGUF MoE row budget must be scalar int32");
@@ -422,7 +309,7 @@ array grouped(std::vector<array> a, const uint32_t *formats, int top_k, bool nor
   // whose inverse indices a budget intentionally leaves uninitialized.
   if (probe && a.size()==22)
     throw std::invalid_argument("grouped MoE stage probes do not support a row budget");
-  uint32_t rows=a[0].shape(0), H=a[0].shape(1), E=source_routing?256:a[1].shape(1);
+  uint32_t rows=a[0].shape(0), H=a[0].shape(1), E=a[1].shape(1);
   if (a[3].ndim()!=3 || a[3].shape(0)!=int(E)) throw std::invalid_argument("invalid grouped GGUF expert stack");
   uint32_t I=a[3].shape(1);
   if (H%256 || I%256 || H<256 || I<256) throw std::invalid_argument("grouped GGUF MoE needs whole 256-column blocks");
@@ -461,30 +348,11 @@ array grouped(std::vector<array> a, const uint32_t *formats, int top_k, bool nor
   if(paired_flag && std::strcmp(paired_flag,"1")==0) p.normalize |=32;
   const char* budget_flag=std::getenv("MLX_SPLASH_MOE_LOGICAL_BUDGET");
   if(budget_flag && std::strcmp(budget_flag,"1")==0) p.normalize |=128;
-  const char* source_math=std::getenv("MLX_SPLASH_MOE_SOURCE_MATH");
-  p.source_math=source_math_policy>=0 ? uint32_t(source_math_policy)
-      : uint32_t(source_math && std::strcmp(source_math,"1")==0);
   p.normalize |= (a.size()==22 ? 8u : 0u) | uint32_t(probe)<<8 | uint32_t(profile)<<16;
-  if (residual) {
-    if (probe || profile || residual->dtype()!=bfloat16 || residual->shape()!=a[0].shape() ||
-        H!=2048 || I!=512 || E!=256 || top_k!=8 || (p.normalize&6)!=6 ||
-        !source_residual_available() ||
-        (p.formats[0]&255)!=4 || (p.formats[1]&255)!=4 ||
-        ((p.formats[2]&255)!=4 && (p.formats[2]&255)!=6) ||
-        (p.formats[3]&255)!=4 || (p.formats[4]&255)!=4 ||
-        ((p.formats[5]&255)!=4 && (p.formats[5]&255)!=6))
-      throw std::invalid_argument("source MoE residual requires measured BF16 geometry/formats");
-    p.source_math=1; p.source_residual=1;
-    a.push_back(*residual);
-  }
-  if(source_routing) {
-    p.source_math=1;
-    if(!source_routing_inputs(a,p)) throw std::invalid_argument("source routing requires measured source expert formats");
-  }
   const char* workspace_flag=std::getenv("MLX_SPLASH_MOE_WORKSPACE");
   const bool workspace=workspace_flag && std::strcmp(workspace_flag,"1")==0;
   auto shape=profile ? Shape{1} : probe ? Shape{int(rows),top_k+1,int(probe==4?H:I)} : a[0].shape();
-  return array(shape,profile ? uint32 : probe || (p.normalize&6)==6 ? bfloat16 : float32,std::make_shared<GroupedMoe>(to_stream(Device::gpu),p,source_routing,workspace),std::move(a));
+  return array(shape,profile ? uint32 : probe || (p.normalize&6)==6 ? bfloat16 : float32,std::make_shared<GroupedMoe>(to_stream(Device::gpu),p,workspace),std::move(a));
 }
 
 // Test-only view of the actual route/group kernels. It permits checking the
@@ -538,38 +406,6 @@ array route_group_probe(const array &logits, const array &shared, int top_k, boo
   return array({3*R+2*T+int(sizeof(SplashMoeTileCount)/sizeof(uint32_t))+T*int(p.tile_rows)},uint32,
       std::make_shared<RouteGroupProbe>(to_stream(Device::gpu),p),{logits,shared});
 }
-// The standalone observer invokes the identical encoder helper used by the
-// production source-routed MoE. Uint32 bits pack scores, selected IDs, weights.
-class SourceRoutingProbe final : public UnaryPrimitive {
- public:
-  explicit SourceRoutingProbe(Stream s):UnaryPrimitive(s){}
-  DEFINE_NAME(SourceRoutingProbe)
-  bool is_equivalent(const Primitive&) const override { return true; }
-  std::vector<Shape> output_shapes(const std::vector<array>& a) override {
-    if(a.size()!=3 || !source_router_inputs(a)) throw std::invalid_argument("source routing probe replay contract");
-    return {{8*256+2*8*9}};
-  }
-  void eval_cpu(const std::vector<array>&,array&) override {throw std::runtime_error("source routing probe requires Metal");}
-  void eval_gpu(const std::vector<array>& inputs,array& out) override {
-#ifdef MLX_NODE_METAL_ENABLED
-    if(inputs.size()!=3 || !source_router_inputs(inputs)) throw std::invalid_argument("source routing probe replay contract");
-    auto s=stream();auto& d=metal::device(s.device);auto& enc=metal::get_command_encoder(s);
-    if(d.get_architecture_gen()<17) throw std::runtime_error("source routing requires M5");
-    std::vector<array>a;
-    for(const auto& input:inputs) {
-      if(input.flags().row_contiguous && input.offset()%16==0) a.push_back(input);
-      else {
-        array c(input.shape(),input.dtype(),nullptr,{});c.set_data(allocator::malloc(c.nbytes()));
-        copy_gpu(input,c,CopyType::General,s);enc.add_temporary(c);a.push_back(std::move(c));
-      }
-    }
-    out.set_data(allocator::malloc(out.nbytes()));
-    encode_source_routing(d,enc,a[0],a[1],a[2],out,0,out,8*256*sizeof(uint32_t),out,(8*256+8*9)*sizeof(uint32_t));
-#else
-    throw std::runtime_error("source routing probe requires Metal");
-#endif
-  }
-};
 } // namespace mlx::core::splash_moe
 
 extern "C" bool mlx_splash_moe_available() { return mlx::core::splash_moe::available(); }
@@ -599,42 +435,6 @@ extern "C" mlx_array *mlx_splash_moe(mlx_array *const *inputs, size_t count,
     return reinterpret_cast<mlx_array *>(new mlx::core::array(mlx::core::splash_moe::grouped(std::move(a),formats,top_k,normalize)));
   } catch (const std::exception &e) {
     std::cerr << "mlx_splash_moe: " << e.what() << std::endl;
-    return nullptr;
-  }
-}
-
-// Production uses a load-captured policy. The original entrypoint above
-// remains environment-driven only for standalone operator diagnostics.
-extern "C" mlx_array *mlx_splash_moe_with_policy(mlx_array *const *inputs,size_t count,
-    const uint32_t *formats,int top_k,bool normalize,bool source_math) {
-  try {
-    if(!inputs||!formats||(count!=21&&count!=22))throw std::invalid_argument("invalid grouped MoE policy arguments");
-    std::vector<mlx::core::array>a;a.reserve(count);
-    for(size_t i=0;i<count;++i){
-      if(!inputs[i])throw std::invalid_argument("null grouped MoE policy input");
-      a.push_back(*reinterpret_cast<mlx::core::array*>(inputs[i]));
-    }
-    return reinterpret_cast<mlx_array*>(new mlx::core::array(
-        mlx::core::splash_moe::grouped(std::move(a),formats,top_k,normalize,0,0,source_math?1:0)));
-  }catch(const std::exception&e){std::cerr<<"mlx_splash_moe_with_policy: "<<e.what()<<std::endl;return nullptr;}
-}
-
-// Separate residual operand preserves the existing21/22-array ABI.
-extern "C" mlx_array *mlx_splash_moe_with_residual(mlx_array *const *inputs, size_t count,
-    const uint32_t *formats, int top_k, bool normalize, mlx_array *residual) {
-  try {
-    if(!inputs || !formats || !residual || (count!=21 && count!=22))
-      throw std::invalid_argument("invalid residual-inclusive grouped MoE arguments");
-    std::vector<mlx::core::array> a; a.reserve(count+1);
-    for(size_t i=0;i<count;++i) {
-      if(!inputs[i]) throw std::invalid_argument("null residual-inclusive grouped input");
-      a.push_back(*reinterpret_cast<mlx::core::array *>(inputs[i]));
-    }
-    const auto& r=*reinterpret_cast<mlx::core::array *>(residual);
-    return reinterpret_cast<mlx_array *>(new mlx::core::array(
-        mlx::core::splash_moe::grouped(std::move(a),formats,top_k,normalize,0,0,1,&r)));
-  } catch(const std::exception& e) {
-    std::cerr << "mlx_splash_moe_with_residual: " << e.what() << std::endl;
     return nullptr;
   }
 }
@@ -892,78 +692,4 @@ extern "C" bool mlx_test_sparse_input_budget_encoder() {
 #else
   return false;
 #endif
-}
-
-// Test-only direct view of the production combine kernel. Every output is
-// initialized, and no source/expert arithmetic is replaced by this adapter.
-namespace mlx::core::splash_moe {
-class SourceResidualCombineProbe : public UnaryPrimitive {
- public:
-  explicit SourceResidualCombineProbe(Stream s):UnaryPrimitive(s){}
-  DEFINE_NAME(SourceResidualCombineProbe)
-  std::vector<Shape> output_shapes(const std::vector<array>& a) override {return {a[3].shape()};}
-  void eval_cpu(const std::vector<array>&,array&) override {throw std::runtime_error("Metal required");}
-  void eval_gpu(const std::vector<array>& a,array& out) override {
-#ifdef MLX_NODE_METAL_ENABLED
-    if(a.size()!=5 || a[3].ndim()!=2 || a[3].dtype()!=bfloat16 ||
-       a[0].dtype()!=bfloat16 || a[1].dtype()!=uint32 || a[2].dtype()!=float32 ||
-       a[4].dtype()!=int32 || a[4].size()!=1 || a[3].shape(0)<1 || a[3].shape(0)>33 ||
-       a[3].shape(1)!=2048 || a[0].shape()!=Shape{a[3].shape(0)*9,2048} ||
-       a[1].shape()!=Shape{a[3].shape(0),9} || a[2].shape()!=a[1].shape())
-      throw std::invalid_argument("source residual combine probe shape/dtype changed");
-    for (const auto& input:a)
-      if (!input.flags().row_contiguous)
-        throw std::invalid_argument("source residual combine probe requires contiguous inputs");
-    SplashMoeParams p{};p.rows=a[3].shape(0);p.hidden=2048;p.top_k=8;
-    p.normalize=1|2|4|8;p.source_math=p.rows==8;p.source_residual=1;
-    out.set_data(allocator::malloc(out.nbytes()));
-    auto& s=stream();auto& d=metal::device(s.device);auto& enc=metal::get_command_encoder(s);
-    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(d,"splash_moe","probe","splash_moe_combine"));
-    for(int i=0;i<3;++i)enc.set_input_array(a[i],i);
-    enc.set_output_array(out,3);enc.set_bytes(p,4);enc.set_input_array(a[4],5);enc.set_input_array(a[3],6);
-    enc.dispatch_threadgroups(MTL::Size(p.rows,8,1),MTL::Size(256,1,1));
-#else
-    throw std::runtime_error("Metal required");
-#endif
-  }
-};
-}
-extern "C" mlx_array* mlx_test_splash_moe_source_residual_combine(mlx_array* experts,
-    mlx_array* inverse,mlx_array* weights,mlx_array* residual,mlx_array* budget) {
-  try {
-    using namespace mlx::core;
-    if(!experts||!inverse||!weights||!residual||!budget||!splash_moe::available())return nullptr;
-    std::vector<array>a;
-    for(auto* p:{experts,inverse,weights,residual,budget})a.push_back(*reinterpret_cast<array*>(p));
-    auto shape=a[3].shape();
-    return reinterpret_cast<mlx_array*>(new array(shape,bfloat16,
-        std::make_shared<splash_moe::SourceResidualCombineProbe>(to_stream(Device::gpu)),std::move(a)));
-  }catch(const std::exception& e){std::cerr<<"source residual combine probe: "<<e.what()<<std::endl;return nullptr;}
-}
-
-extern "C" bool mlx_splash_moe_source_residual_available(){return mlx::core::splash_moe::source_residual_available();}
-
-extern "C" mlx_array* mlx_splash_moe_with_router(mlx_array* const* inputs,size_t count,
-    const uint32_t* formats,int top_k,bool normalize,mlx_array* residual) {
-  try {
-    if(!inputs || !formats || (count!=21 && count!=22)) throw std::invalid_argument("invalid source-routed MoE arguments");
-    std::vector<mlx::core::array>a;a.reserve(count+1);
-    for(size_t i=0;i<count;++i) {
-      if(!inputs[i]) throw std::invalid_argument("null source-routed MoE input");
-      a.push_back(*reinterpret_cast<mlx::core::array*>(inputs[i]));
-    }
-    const auto* r=residual?reinterpret_cast<mlx::core::array*>(residual):nullptr;
-    return reinterpret_cast<mlx_array*>(new mlx::core::array(
-        mlx::core::splash_moe::grouped(std::move(a),formats,top_k,normalize,0,0,1,r,true)));
-  }catch(const std::exception&e){std::cerr<<"mlx_splash_moe_with_router: "<<e.what()<<std::endl;return nullptr;}
-}
-extern "C" mlx_array* mlx_test_splash_moe_source_routing(mlx_array* input,mlx_array* router,mlx_array* shared) {
-  try {
-    using namespace mlx::core;
-    if(!input || !router || !shared || !splash_moe::source_residual_available()) return nullptr;
-    std::vector<array>a{*reinterpret_cast<array*>(input),*reinterpret_cast<array*>(router),*reinterpret_cast<array*>(shared)};
-    if(!splash_moe::source_router_inputs(a)) return nullptr;
-    return reinterpret_cast<mlx_array*>(new array(Shape{8*256+2*8*9},uint32,
-        std::make_shared<splash_moe::SourceRoutingProbe>(to_stream(Device::gpu)),std::move(a)));
-  }catch(const std::exception&e){std::cerr<<"source routing probe: "<<e.what()<<std::endl;return nullptr;}
 }

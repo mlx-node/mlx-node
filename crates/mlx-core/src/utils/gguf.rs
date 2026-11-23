@@ -36,9 +36,6 @@ use crate::quant::prism_hadamard::PrismHadamardConfig;
 use crate::utils::gguf_kquant::{KQuantArrays, KQuantFormat, KQuantRepacker, KQuantScales};
 use crate::utils::safetensors::save_safetensors;
 
-#[path = "gguf_source_math.rs"]
-mod source_math;
-
 // ── GGUF Constants ──────────────────────────────────────────────────────────
 
 pub(super) const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" in little-endian
@@ -451,6 +448,13 @@ impl GgufMetaValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             Self::String(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    pub fn as_bool_array(&self) -> Option<&[bool]> {
+        match self {
+            Self::ArrayBool(v) => Some(v.as_slice()),
             _ => None,
         }
     }
@@ -4991,13 +4995,10 @@ fn check_prism_rope_value(
 /// defaults to 5 and puts the global layers at indices 4, 9, 14 … The real file
 /// has a period of 6, and guessing 5 silently mistypes every layer.
 ///
-/// `gemma4.attention.sliding_window_pattern` would say so directly, but it is an
-/// array of GGUF element type 7 (bool), which [`read_meta_array`] has no variant
-/// for: the unsupported-type arm skips the payload and yields an empty
-/// `ArrayU32`. It is in any case only a redundant second witness. The reliable
-/// one is `gemma4.attention.head_count_kv`, an `ArrayI32` with one entry per
-/// layer whose minimum marks the global layers — the same array
-/// [`apply_gemma4_attention_geometry`] already reads.
+/// `gemma4.attention.sliding_window_pattern` is only a redundant second
+/// witness. The reliable one is `gemma4.attention.head_count_kv`, an
+/// `ArrayI32` with one entry per layer whose minimum marks the global layers —
+/// the same array [`apply_gemma4_attention_geometry`] already reads.
 ///
 /// The header is cross-checked before the flag is flipped, because the tensor
 /// list alone is fail-open: a checkpoint truncated mid-download, or corrupted,
@@ -6188,140 +6189,10 @@ fn apply_gguf_awq_prescaling(
     Ok(())
 }
 
-/// Capture only the measured structural operand contract. Unsupported native
-/// checkpoints still convert successfully with an explicit unavailable record.
-fn capture_source_math_operands(
-    identity: source_math::ImportIdentity,
-    gguf: &GgufFile,
-    weights: &HashMap<String, MxArray>,
-    inline_mtp_index: Option<u64>,
-) -> Result<source_math::Preservation> {
-    let mut config = extract_config(&gguf.metadata);
-    // The GGUF block count may include an inline MTP block. Use the same
-    // already-validated main decoder count as the converter's final config.
-    apply_qwen35_inline_mtp_config(&mut config, inline_mtp_index);
-    let number = |key: &str| {
-        config
-            .get(key)
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0)
-    };
-    let geometry = source_math::Geometry {
-        architecture: gguf
-            .metadata
-            .get("general.architecture")
-            .and_then(GgufMetaValue::as_str)
-            .unwrap_or("")
-            .into(),
-        hidden_size: number("hidden_size"),
-        layers: number("num_hidden_layers"),
-        attention_heads: number("num_attention_heads"),
-        kv_heads: number("num_key_value_heads"),
-        head_dim: number("head_dim"),
-        full_attention_interval: number("full_attention_interval"),
-        experts: number("num_experts"),
-        top_k: number("num_experts_per_tok"),
-        expert_width: number("moe_intermediate_size"),
-    };
-    if geometry.architecture != "qwen35moe" {
-        return Err(Error::from_reason(
-            "Source operand request is only valid for Qwen3.5 MoE",
-        ));
-    }
-    if !geometry.supported() {
-        return Ok(source_math::Preservation::unavailable(
-            identity,
-            geometry,
-            "unsupported_geometry",
-        )?);
-    }
-    let expected = source_math::expected_tensors();
-    // Refuse partial capability before reading any values. A differently
-    // quantized or incomplete norm set remains a valid native-only import.
-    for name in &expected {
-        let descriptors: Vec<_> = gguf
-            .tensors
-            .iter()
-            .filter(|tensor| name.matches_original(&tensor.name))
-            .collect();
-        if descriptors.len() != 1
-            || descriptors[0].tensor_type != GgufTensorType::F32
-            || descriptors[0].n_dims != 1
-            || descriptors[0].dims != [name.width as u64]
-        {
-            return Ok(source_math::Preservation::unavailable(
-                identity,
-                geometry,
-                "original_f32_norm_set_unavailable",
-            )?);
-        }
-        if gguf_name_to_hf_for_metadata(&descriptors[0].name, &gguf.metadata).as_deref()
-            != Some(name.mapped.as_str())
-        {
-            return Err(Error::from_reason(
-                "Source operand mapping changed without schema update",
-            ));
-        }
-        let array = weights
-            .get(&name.mapped)
-            .ok_or_else(|| Error::from_reason("Mapped source norm is missing"))?;
-        if array.dtype()? != DType::Float32 || array.shape()?.as_ref() != [name.width as i64] {
-            return Err(Error::from_reason(
-                "Mapped original source norm changed precision or shape",
-            ));
-        }
-    }
-    let mut tensors = Vec::with_capacity(expected.len());
-    for name in expected {
-        let descriptor = gguf
-            .tensors
-            .iter()
-            .find(|tensor| name.matches_original(&tensor.name))
-            .ok_or_else(|| Error::from_reason("Original source norm descriptor is missing"))?;
-        let values = weights[&name.mapped].to_float32()?;
-        tensors.push(source_math::OriginalTensor {
-            mapped_name: name.mapped,
-            original_name: descriptor.name.clone(),
-            original_shape: descriptor.dims.clone(),
-            original_byte_offset: gguf
-                .data_offset
-                .checked_add(descriptor.offset)
-                .ok_or_else(|| Error::from_reason("Original source norm range overflow"))?,
-            f32_bytes: values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect(),
-        });
-    }
-    Ok(source_math::Preservation::capture(
-        identity, geometry, tensors,
-    )?)
-}
-
 #[napi]
 pub async fn convert_gguf_to_safetensors(
     options: GgufConversionOptions,
 ) -> Result<GgufConversionResult> {
-    convert_gguf_to_safetensors_inner(options, None).await
-}
-
-// Only native MoE preparation requests preservation; the public converter,
-// other families and secondary companion conversion retain their old output.
-async fn convert_gguf_to_safetensors_inner(
-    options: GgufConversionOptions,
-    source_operands: Option<source_math::ImportIdentity>,
-) -> Result<GgufConversionResult> {
-    if source_operands.is_some()
-        && (options.dtype.as_deref() != Some("bfloat16")
-            || options.quantize.unwrap_or(false)
-            || options.imatrix_path.is_some()
-            || options.output_filename.is_some()
-            || options.native_qwen35_layout != Some(true))
-    {
-        return Err(Error::from_reason(
-            "Source operand preservation requires the native BF16 primary MoE import",
-        ));
-    }
     let input_path = PathBuf::from(&options.input_path);
     let output_dir = PathBuf::from(&options.output_dir);
     let config_source_dir = options.config_source_dir.as_deref().map(PathBuf::from);
@@ -6480,53 +6351,12 @@ async fn convert_gguf_to_safetensors_inner(
     )?;
     info!("Loaded {} tensors", weights.len());
 
-    let mut preserved_source_operands = None;
     let super::gguf_import::ImportedWeights {
         mut weights,
         clef_head,
         ..
-    } = super::gguf_import::transform_imported_with_before_dtype(
-        weights,
-        &gguf,
-        &plan,
-        &import_opts,
-        |weights| {
-            preserved_source_operands = source_operands
-                .map(|identity| {
-                    capture_source_math_operands(
-                        identity,
-                        &gguf,
-                        weights,
-                        qwen35_inline_mtp_index(&gguf)?,
-                    )
-                })
-                .transpose()?;
-            Ok(())
-        },
-    )?;
+    } = super::gguf_import::transform_imported(weights, &gguf, &plan, &import_opts)?;
 
-    // Validate the same ordinary BF16 values that will be serialized. No
-    // source operand is inserted into or substituted in the weights map.
-    if let Some(preserved) = &preserved_source_operands {
-        for (name, expected) in preserved.native_digests() {
-            let native = weights
-                .get(name)
-                .ok_or_else(|| Error::from_reason("Missing preserved native norm"))?;
-            if native.dtype()? != DType::BFloat16 {
-                return Err(Error::from_reason("Preserved native norm is not BF16"));
-            }
-            let values = native.astype(DType::Float32)?.to_float32()?;
-            let bytes: Vec<u8> = values
-                .iter()
-                .flat_map(|value| value.to_le_bytes())
-                .collect();
-            if source_math::sha256(&source_math::bf16_bytes(&bytes)?) != expected {
-                return Err(Error::from_reason(format!(
-                    "Native BF16 norm differs from preserved original F32: {name}"
-                )));
-            }
-        }
-    }
     // Apply AWQ pre-scaling if imatrix provided. GGUF Q4/Q8 tensors have
     // already been repacked to Uint32 + sidecars above, so the shared guard
     // must run before AWQ can multiply packed integers or fold norms twice.
@@ -6869,10 +6699,6 @@ async fn convert_gguf_to_safetensors_inner(
         info!(
             "Skipping config.json and tokenizer writes for secondary output file: {safetensors_filename}"
         );
-    }
-
-    if let Some(preserved) = preserved_source_operands {
-        preserved.publish(&output_dir)?;
     }
 
     // Build source format description
@@ -8728,7 +8554,7 @@ impl NativeGgufFamily {
             Self::Qwen35 => "tiled",
             // A distinct string keeps the sparse family's cache key from
             // aliasing the dense one on the same source filename.
-            Self::Qwen35Moe => source_math::LAYOUT,
+            Self::Qwen35Moe => "tiled-moe-v2-source-operands-v1",
             // CLEF shares the dense Qwen3.5 tiled GDN layout; the tag keeps
             // its head-bearing staging output from aliasing a plain qwen35
             // conversion of a (hypothetical) same-named file.
@@ -9371,8 +9197,6 @@ mod tests {
         gemma_native_fixture, gemma4v_mmproj_fixture, muse_glimmer_dflash_metadata,
         muse_native_draft_fixture, muse_native_fixture, write_import_fixture,
     };
-
-    include!("gguf_source_math_import_tests.rs");
 
     async fn prepare_asset_dir_for_test(
         input: &Path,
@@ -10676,7 +10500,10 @@ mod tests {
         );
 
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains(&format!("layout={}\n", source_math::LAYOUT)));
+        assert!(marker.contains(&format!(
+            "layout={}\n",
+            NativeGgufFamily::Qwen35Moe.layout()
+        )));
 
         fs::remove_dir_all(root).ok();
     }
@@ -10722,7 +10549,10 @@ mod tests {
         assert!(
             fs::read_to_string(sparse.join(".complete"))
                 .unwrap()
-                .contains(&format!("layout={}\n", source_math::LAYOUT))
+                .contains(&format!(
+                    "layout={}\n",
+                    NativeGgufFamily::Qwen35Moe.layout()
+                ))
         );
         assert!(
             fs::read_to_string(dense.join(".complete"))
@@ -11139,7 +10969,10 @@ mod tests {
         let output = output_ckpt.asset_dir.clone();
 
         let marker = fs::read_to_string(output.join(".complete")).unwrap();
-        assert!(marker.contains(&format!("layout={}\n", source_math::LAYOUT)));
+        assert!(marker.contains(&format!(
+            "layout={}\n",
+            NativeGgufFamily::Qwen35Moe.layout()
+        )));
 
         let config: serde_json::Value =
             serde_json::from_slice(&fs::read(output.join("config.json")).unwrap()).unwrap();
@@ -19943,6 +19776,74 @@ mod tests {
         let end = bare.len() as u64;
         let header = parse_gguf_reader(std::io::Cursor::new(bare)).unwrap();
         assert_eq!(header.data_offset, end);
+    }
+
+    #[test]
+    fn parse_gguf_reads_bool_arrays() {
+        let pattern = vec![false, true, true, false, true];
+        let bytes = build_minimal_gguf(
+            &[
+                (
+                    "test.sliding_window_pattern",
+                    GgufMetaValue::ArrayBool(pattern.clone()),
+                ),
+                ("test.empty_bools", GgufMetaValue::ArrayBool(Vec::new())),
+                ("test.flag", GgufMetaValue::Bool(true)),
+                ("test.ints", GgufMetaValue::ArrayU32(vec![1, 0])),
+            ],
+            &[],
+        );
+        let parsed = parse_gguf_reader(std::io::Cursor::new(bytes)).unwrap();
+        assert_eq!(
+            parsed
+                .metadata
+                .get("test.sliding_window_pattern")
+                .and_then(GgufMetaValue::as_bool_array),
+            Some(pattern.as_slice())
+        );
+        assert_eq!(
+            parsed
+                .metadata
+                .get("test.empty_bools")
+                .and_then(GgufMetaValue::as_bool_array),
+            Some(&[][..])
+        );
+        assert_eq!(
+            parsed
+                .metadata
+                .get("test.flag")
+                .and_then(GgufMetaValue::as_bool_array),
+            None
+        );
+        assert_eq!(
+            parsed
+                .metadata
+                .get("test.ints")
+                .and_then(GgufMetaValue::as_bool_array),
+            None
+        );
+
+        // Verify non-0/1 payload bytes in a GGUF T_BOOL (7) array decode as `byte != 0`.
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        raw.extend_from_slice(&GGUF_VERSION_3.to_le_bytes());
+        raw.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        raw.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+        let key = b"test.raw_bools";
+        raw.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        raw.extend_from_slice(key);
+        raw.extend_from_slice(&(GgufValueType::Array as u32).to_le_bytes());
+        raw.extend_from_slice(&(GgufValueType::Bool as u32).to_le_bytes());
+        raw.extend_from_slice(&4u64.to_le_bytes());
+        raw.extend_from_slice(&[0u8, 1u8, 2u8, 0xffu8]);
+        let raw_parsed = parse_gguf_reader(std::io::Cursor::new(raw)).unwrap();
+        assert_eq!(
+            raw_parsed
+                .metadata
+                .get("test.raw_bools")
+                .and_then(GgufMetaValue::as_bool_array),
+            Some(&[false, true, true, true][..])
+        );
     }
 
     /// The sweep checks every part a split entry's marker lists: a healthy

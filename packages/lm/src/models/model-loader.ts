@@ -22,17 +22,22 @@ import {
   Qwen35Model as NativeQwen35Model,
   Qwen35MoeModel as NativeQwen35MoeModel,
   Qwen4ExpModel as NativeQwen4ExpModel,
-  type HyV4FlashLoadOptions,
   type Inkling2LoadOptions,
-  type Qwen35LoadOptions,
-  type Qwen4ExpLoadOptions,
 } from '@mlx-node/core';
 
 import { ChatSession, type SessionCapableModel } from '../chat-session.js';
 import { ClairicModel } from '../clairic.js';
 import { ClefModel } from '../clef.js';
 import { findDFlash2Draft } from '../draft-companion.js';
-import { familyDataFor, type ModelType, type TrainableFamilyId } from '../family-data.js';
+import {
+  familyDataFor,
+  filterFamilyLoadOptions,
+  validateFamilyLoadOptions,
+  type FamilyLoadOptions,
+  type LoadModelOptions,
+  type ModelType,
+  type TrainableFamilyId,
+} from '../family-data.js';
 import { detectModelType as detectLocalModelType } from '../model-detection.js';
 import {
   DeepseekV41Model,
@@ -49,182 +54,17 @@ import {
   Qwen4ExpModel,
 } from '../stream.js';
 
-/** Optional settings for {@link loadModel} / {@link loadSession}. */
-export interface LoadModelOptions {
-  /** Matching original HF checkpoint supplying Qwen4 MTP and vision omitted by GGUF. */
-  auxiliaryModelPath?: string;
-  /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
-  autoLoadDraft?: boolean;
-  /**
-   * Directory of an external draft checkpoint (config.json +
-   * model.safetensors) loaded alongside the target for speculative decoding.
-   * Gemma4 accepts either a DSpark draft or a Google gemma-4 assistant draft
-   * (`google/gemma-4-*-it-assistant`); the variant is auto-detected from
-   * the draft's config.json (`model_type` `gemma4_assistant` /
-   * `gemma4_unified_assistant` → assistant, `architectures` containing
-   * `Gemma4DSparkModel` → DSpark). When omitted, Gemma4 automatically loads
-   * an embedded draft from `<modelPath>/draft/` when present. Draft decoding
-   * runs on the flat KV-cache path, so the target checkpoint must not
-   * explicitly enable `use_block_paged_cache`.
-   *
-   * `qwen3_5` and `qwen3_5_moe` accept a matching `DFlash2DraftModel`
-   * companion, such as `z-lab/Qwen3.8-27B-DFlash2` for dense targets or
-   * `incoai/Qwen3.6-35B-A3B-DFlash2` for 35B-A3B MoE. It shares the target embedding and
-   * LM head, validates all companion tensors at load time, and takes
-   * precedence over an inline target MTP head. `qwen4_exp` accepts
-   * `incoai/Qwen3.8-Flash-Next-DFlash2`, only from this option (it is never
-   * discovered): a turn that sets `enableMtp` runs its cycle when it starts
-   * alone on a whole store whose banks are filled.
-   * Other model families reject this option.
-   */
-  draftModelPath?: string;
-  /**
-   * Full-attention K/V format of the block-paged pool for `qwen3_5`,
-   * `qwen3_5_moe` and `qwen4_exp` targets: `'int8'` — per-token symmetric
-   * int8 rows with one fp32 scale each, halving K/V memory and read
-   * bandwidth at a small, measured quality cost — or `'bf16'`. Unset: int8
-   * where the int8 kernels serve the model (qwen3_5 / MoE: Metal, 256-wide
-   * heads, BF16 compute; qwen4_exp: head 128 or 256), bf16 elsewhere. An
-   * explicit `'int8'` the kernels cannot serve, or on a load with no pool
-   * (qwen3_5 / MoE off Metal), fails the load; other model families reject
-   * it.
-   */
-  kvFormat?: 'int8' | 'bf16';
-  /**
-   * Metal memory budget in bytes for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp`
-   * targets (`--max-memory`). It can only lower the automatic budget the
-   * load's memory plan derives from the working set; the plan sizes the KV
-   * pool and the windows from it (and for `qwen4_exp` the expert store).
-   * `hy_v4_flash` sizes its expert cache within it. Other model families
-   * reject it.
-   */
-  maxMemoryBytes?: number;
-  /**
-   * Context token limit for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
-   * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
-   * tokens, and the load fails when its memory plan holds fewer. Past the
-   * native window the target's RoPE takes YaRN, which is static and changes
-   * answers at every length. `hy_v4_flash` takes it too, capped at 262,144
-   * with no YaRN. Other model families reject it.
-   */
-  maxContextTokens?: number;
-  /**
-   * Decode time owed per unit of prefill time while other requests generate,
-   * for `qwen3_5` and `qwen3_5_moe` targets (`--decode-share`): nonnegative
-   * and finite, default 0.5. Other model families reject it.
-   */
-  decodeShare?: number;
-  /**
-   * Int8 activations of `qwen3_5` and `qwen3_5_moe` targets
-   * (`--activations`): `'auto'` lets the paged attention over an int8 pool
-   * score int8 query codes for every query row at KV position 7,168 or
-   * later, in prefill, verify and decode alike, on Apple10 GPUs (M5) and
-   * later; `'bf16'` keeps every query bf16. Unset: `'auto'` for a `qwen3_5`
-   * load with a DFlash2 draft, `'bf16'` for a `qwen3_5` load with none and
-   * for `qwen3_5_moe`. Other model families reject it.
-   */
-  activations?: 'auto' | 'bf16';
-  /**
-   * SSD state tier of `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
-   * (`--max-cache-disk`): `'auto'` (the default), a decimal byte count, or
-   * `'0'` (off). Whether it survives a restart is the paged KV disk cache
-   * switch every family reads, `MLX_PERSIST_PAGED_CACHE`; off, the tier is
-   * temporary. `hy_v4_flash` takes it for its stored states, with the same
-   * switch. Other model families reject it, as they do `cacheDir`.
-   */
-  cacheDisk?: string;
-  /** The persistent tier's root (`--cache-dir`); needs the switch on. */
-  cacheDir?: string;
+export type { LoadModelOptions } from '../family-data.js';
+
+/** Capability-gated native load options for `modelType`, or `null` when none is set. */
+function nativeLoadOptions<Id extends ModelType>(
+  modelType: Id,
+  options: LoadModelOptions | undefined,
+): FamilyLoadOptions<Id> | null {
+  const filtered = filterFamilyLoadOptions(modelType, options);
+  return Object.keys(filtered).length === 0 ? null : filtered;
 }
 
-/** The native Qwen3.5 load options of `options`; `null` when none is set. */
-function qwen35LoadOptions(options: LoadModelOptions | undefined): Qwen35LoadOptions | null {
-  if (
-    options?.draftModelPath === undefined &&
-    options?.kvFormat === undefined &&
-    options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined &&
-    options?.decodeShare === undefined &&
-    options?.activations === undefined &&
-    options?.cacheDisk === undefined &&
-    options?.cacheDir === undefined
-  )
-    return null;
-  return {
-    draftModelPath: options.draftModelPath,
-    kvFormat: options.kvFormat,
-    ...(options.activations !== undefined ? { activations: options.activations } : {}),
-    maxMemoryBytes: options.maxMemoryBytes,
-    maxContextTokens: options.maxContextTokens,
-    decodeShare: options.decodeShare,
-    cacheDisk: options.cacheDisk,
-    cacheDir: options.cacheDir,
-  };
-}
-
-function qwen4ExpLoadOptions(options: LoadModelOptions | undefined): Qwen4ExpLoadOptions | null {
-  if (
-    options?.auxiliaryModelPath === undefined &&
-    options?.draftModelPath === undefined &&
-    options?.kvFormat === undefined &&
-    options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined &&
-    options?.cacheDisk === undefined &&
-    options?.cacheDir === undefined
-  )
-    return null;
-  return {
-    ...(options.auxiliaryModelPath !== undefined ? { auxiliaryModelPath: options.auxiliaryModelPath } : {}),
-    ...(options.draftModelPath !== undefined ? { draftModelPath: options.draftModelPath } : {}),
-    ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
-    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
-    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
-    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
-    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
-  };
-}
-
-function hyV4FlashLoadOptions(options: LoadModelOptions | undefined): HyV4FlashLoadOptions | null {
-  if (
-    options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined &&
-    options?.cacheDisk === undefined &&
-    options?.cacheDir === undefined
-  )
-    return null;
-  return {
-    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
-    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
-    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
-    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
-  };
-}
-
-function inkling2LoadOptions(options: LoadModelOptions | undefined): Inkling2LoadOptions | null {
-  if (
-    options?.draftModelPath === undefined &&
-    options?.autoLoadDraft === undefined &&
-    options?.kvFormat === undefined &&
-    options?.maxMemoryBytes === undefined &&
-    options?.maxContextTokens === undefined &&
-    options?.decodeShare === undefined &&
-    options?.activations === undefined &&
-    options?.cacheDisk === undefined &&
-    options?.cacheDir === undefined
-  )
-    return null;
-  return {
-    ...(options.draftModelPath !== undefined ? { draftModelPath: options.draftModelPath } : {}),
-    ...(options.autoLoadDraft !== undefined ? { autoLoadDraft: options.autoLoadDraft } : {}),
-    ...(options.kvFormat !== undefined ? { kvFormat: options.kvFormat } : {}),
-    ...(options.maxMemoryBytes !== undefined ? { maxMemoryBytes: options.maxMemoryBytes } : {}),
-    ...(options.maxContextTokens !== undefined ? { maxContextTokens: options.maxContextTokens } : {}),
-    ...(options.decodeShare !== undefined ? { decodeShare: options.decodeShare } : {}),
-    ...(options.activations !== undefined ? { activations: options.activations } : {}),
-    ...(options.cacheDisk !== undefined ? { cacheDisk: options.cacheDisk } : {}),
-    ...(options.cacheDir !== undefined ? { cacheDir: options.cacheDir } : {}),
-  };
-}
 type NativeModelClass = abstract new (...args: never[]) => object;
 
 interface LoaderBinding {
@@ -259,10 +99,7 @@ const LOADER_BINDINGS = {
   clairic: { load: (path: string) => ClairicModel.load(path), nativeModelClass: ClairicModel },
   gemma4: {
     load: (modelPath: string, options?: LoadModelOptions) =>
-      Gemma4Model.load(
-        modelPath,
-        options?.draftModelPath === undefined ? null : { draftModelPath: options.draftModelPath },
-      ),
+      Gemma4Model.load(modelPath, nativeLoadOptions('gemma4', options)),
     nativeModelClass: NativeGemma4Model,
   },
   muse_glimmer: {
@@ -278,16 +115,18 @@ const LOADER_BINDINGS = {
     nativeModelClass: NativeQwen3Model,
   },
   qwen3_5: {
-    load: (modelPath: string, options?: LoadModelOptions) => Qwen35Model.load(modelPath, qwen35LoadOptions(options)),
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Qwen35Model.load(modelPath, nativeLoadOptions('qwen3_5', options)),
     nativeModelClass: NativeQwen35Model,
   },
   qwen3_5_moe: {
-    load: (modelPath: string, options?: LoadModelOptions) => Qwen35MoeModel.load(modelPath, qwen35LoadOptions(options)),
+    load: (modelPath: string, options?: LoadModelOptions) =>
+      Qwen35MoeModel.load(modelPath, nativeLoadOptions('qwen3_5_moe', options)),
     nativeModelClass: NativeQwen35MoeModel,
   },
   qwen4_exp: {
     load: (modelPath: string, options?: LoadModelOptions) =>
-      Qwen4ExpModel.load(modelPath, qwen4ExpLoadOptions(options)),
+      Qwen4ExpModel.load(modelPath, nativeLoadOptions('qwen4_exp', options)),
     nativeModelClass: NativeQwen4ExpModel,
   },
   deepseek_v41: {
@@ -296,12 +135,17 @@ const LOADER_BINDINGS = {
   },
   hy_v4_flash: {
     load: (modelPath: string, options?: LoadModelOptions) =>
-      HyV4FlashModel.load(modelPath, hyV4FlashLoadOptions(options)),
+      HyV4FlashModel.load(modelPath, nativeLoadOptions('hy_v4_flash', options)),
     nativeModelClass: NativeHyV4FlashModel,
   },
   inkling2: {
-    load: (modelPath: string, options?: LoadModelOptions) =>
-      Inkling2Model.load(modelPath, inkling2LoadOptions(options)),
+    load: (modelPath: string, options?: LoadModelOptions) => {
+      const filtered: Inkling2LoadOptions = {
+        ...filterFamilyLoadOptions('inkling2', options),
+        ...(options?.autoLoadDraft !== undefined ? { autoLoadDraft: options.autoLoadDraft } : {}),
+      };
+      return Inkling2Model.load(modelPath, Object.keys(filtered).length === 0 ? null : filtered);
+    },
     nativeModelClass: NativeInkling2Model,
   },
   lfm2: {
@@ -380,56 +224,7 @@ function dispatchLoad(
   modelPath: string,
   options: LoadModelOptions | undefined,
 ): Promise<unknown> {
-  if (options?.auxiliaryModelPath !== undefined && requireFamilyData(modelType).acceptsAuxiliaryModel !== true) {
-    throw new Error(
-      `auxiliaryModelPath is only supported by qwen4_exp models; ${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.draftModelPath !== undefined && requireFamilyData(modelType).acceptsDraftModel !== true) {
-    throw new Error(
-      `draftModelPath (speculative-decoding draft) is only supported by gemma4, qwen3_5, qwen3_5_moe, qwen4_exp and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.maxMemoryBytes !== undefined && requireFamilyData(modelType).acceptsMaxMemory !== true) {
-    throw new Error(
-      `maxMemoryBytes (Metal memory budget) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.maxContextTokens !== undefined && requireFamilyData(modelType).acceptsMaxContext !== true) {
-    throw new Error(
-      `maxContextTokens (context token limit) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.activations !== undefined && requireFamilyData(modelType).acceptsActivations !== true) {
-    throw new Error(
-      `activations (int8 activations) is only supported by qwen3_5, qwen3_5_moe and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.decodeShare !== undefined && requireFamilyData(modelType).acceptsDecodeShare !== true) {
-    throw new Error(
-      `decodeShare (decode time owed per unit of prefill time) is only supported by qwen3_5, qwen3_5_moe and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (
-    (options?.cacheDisk !== undefined || options?.cacheDir !== undefined) &&
-    requireFamilyData(modelType).acceptsCacheDisk !== true
-  ) {
-    throw new Error(
-      `cacheDisk and cacheDir (the SSD state tier) are only supported by qwen3_5, qwen3_5_moe, qwen4_exp, hy_v4_flash and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
-  if (options?.kvFormat !== undefined && requireFamilyData(modelType).acceptsKvFormat !== true) {
-    throw new Error(
-      `kvFormat (K/V cache format) is only supported by qwen3_5, qwen3_5_moe, qwen4_exp and inkling2 models; ` +
-        `${modelPath} has model_type "${modelType}"`,
-    );
-  }
+  validateFamilyLoadOptions(modelType, modelPath, options);
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
   // Inkling2 discovers colocated DSpark companions natively with soft fallback on
   // incompatible drafts; forwarding an automatic pick as `draftModelPath` would

@@ -803,25 +803,6 @@ fn grouped_actual_layer_stage_comparison() {
         .parse()
         .unwrap();
     eprintln!("ACTUAL_LAYER layer={layer}");
-    let source_math = std::env::var("MLX_SPLASH_MOE_SOURCE_MATH").as_deref() == Ok("1");
-    let source_reference = source_math.then(|| {
-        let directory = std::path::PathBuf::from(
-            std::env::var("SPLASH_MOE_SOURCE_ORACLE_DIR")
-                .expect("source-math diagnostic requires an independently replayed Splash oracle"),
-        );
-        let run: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(directory.join("run.json")).unwrap()).unwrap();
-        assert_eq!(run["layer"].as_u64(), Some(layer as u64));
-        assert_eq!(run["routing_mode"], "native");
-        assert_eq!(run["zero_residual"], true);
-        assert_eq!(run["router_bf16"], true);
-        assert_eq!(run["shared_bf16"], true);
-        assert_eq!(
-            run["snapshot"].as_str(),
-            Some(std::env::var("SPLASH_MOE_INPUT").unwrap().as_str())
-        );
-        directory
-    });
     let mut tensors = mlx_core::utils::load_safetensors_lazy(path).unwrap();
     let mut get = |name: &str| {
         tensors
@@ -937,9 +918,6 @@ fn grouped_actual_layer_stage_comparison() {
     };
     let mut within_tolerance = true;
     for m in rows {
-        if source_math {
-            assert_eq!(m, 8, "source diagnostic is M8 only");
-        }
         let mut seed = 991u32;
         let xv: Vec<f32> = (0..m * h)
             .map(|_| {
@@ -965,24 +943,6 @@ fn grouped_actual_layer_stage_comparison() {
         } else {
             xv
         };
-        if std::env::var_os("SPLASH_MOE_SOURCE_ROUTING_ORACLE_DIR").is_some() {
-            assert_eq!(m, 8);
-            let source_router = snapshot
-                .as_ref()
-                .and_then(|saved| saved.get("source_router_weight"))
-                .unwrap_or(&router);
-            let source_shared = snapshot
-                .as_ref()
-                .and_then(|saved| saved.get("source_shared_gate_weight"))
-                .unwrap_or(&shared_router);
-            let mut owned = vec![x.clone(), source_router.clone(), source_shared.clone()];
-            for w in &tiled_weights {
-                owned.extend([w.w.clone(), w.scales.clone(), w.biases.clone()]);
-            }
-            let modes: Vec<u32> = formats.iter().map(|q| q.bits as u32 | 256).collect();
-            source_routing_tests::actual(&owned, &modes, layer);
-            continue;
-        }
         let logits = if let Some(saved) = &snapshot {
             saved["router_logits"].clone()
         } else if std::env::var("SPLASH_MOE_ROUTE_PATTERN").as_deref() == Ok("skew") {
@@ -1288,14 +1248,7 @@ fn grouped_actual_layer_stage_comparison() {
             for w in &tiled_weights {
                 owned.extend([w.w.clone(), w.scales.clone(), w.biases.clone()]);
             }
-            workspace_tests::actual_workspace_replay(&owned, &modes, &router, &shared_router);
-        }
-        if source_math && std::env::var_os("SPLASH_MOE_SOURCE_CHECK_REPLAY").is_some() {
-            let mut owned = vec![x.clone(), logits.clone(), shared_logits.clone()];
-            for w in &tiled_weights {
-                owned.extend([w.w.clone(), w.scales.clone(), w.biases.clone()]);
-            }
-            source_math_tests::replay_and_fallbacks(&owned, &modes);
+            workspace_tests::actual_workspace_replay(&owned, &modes);
         }
         let native_ids = ids.to_uint32().unwrap();
         let mut occupancy = vec![0usize; experts as usize];
@@ -1336,25 +1289,6 @@ fn grouped_actual_layer_stage_comparison() {
         });
         unsafe { mlx_sys::mlx_array_delete(route_raw) };
         let route_count = m as usize * (top as usize + 1);
-        if let Some(directory) = &source_reference {
-            let source: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(directory.join("routes.json")).unwrap())
-                    .unwrap();
-            assert_eq!(source["live_rows"], 8);
-            for i in 0..route_count {
-                assert_eq!(
-                    source["selected"][i].as_u64(),
-                    Some(u64::from(route[i])),
-                    "source route id{i}"
-                );
-                let coefficient = source["coefficients"][i].as_f64().unwrap() as f32;
-                assert_eq!(
-                    coefficient.to_bits(),
-                    route[route_count + i],
-                    "source route coefficient{i}"
-                );
-            }
-        }
         let mut route_mismatches = 0usize;
         for r in 0..m as usize {
             for slot in 0..top as usize {
@@ -1470,16 +1404,6 @@ fn grouped_actual_layer_stage_comparison() {
             assert_eq!(dtype, DType::BFloat16);
             let actual: Vec<f32> = bits.iter().map(|v| f32::from_bits(v << 16)).collect();
             let first = ((first_row * (i64::from(top) + 1) + first_slot) * width) as usize;
-            if let Some(directory) = &source_reference
-                && stage >= 2
-            {
-                let name = if stage == 2 {
-                    "activation-route.bf16"
-                } else {
-                    "down-route.bf16"
-                };
-                source_math_tests::require_source_bits(directory, name, &bits);
-            }
             first_actual.push(actual[first..first + width as usize].to_vec());
             first_native.push(reference[first..first + width as usize].to_vec());
             let last =
@@ -1544,25 +1468,13 @@ fn grouped_actual_layer_stage_comparison() {
                     decoded.push(bits.into_iter().map(f32::from_bits).collect::<Vec<_>>());
                 }
                 let input = &xv[(sample_row * h) as usize..((sample_row + 1) * h) as usize];
-                let precision = if source_math {
-                    1
-                } else if native_gemm {
-                    2
-                } else {
-                    0
-                };
+                let precision = if native_gemm { 2 } else { 0 };
                 let oracle_gate = project(input, &decoded[0], intermediate as usize, precision);
                 let oracle_up = project(input, &decoded[1], intermediate as usize, precision);
                 let oracle_activation: Vec<f32> = oracle_gate
                     .iter()
                     .zip(&oracle_up)
-                    .map(|(&g, &u)| {
-                        if source_math {
-                            bf(u * (g / (1.0 + (-g).exp())))
-                        } else {
-                            bf(bf(bf_sigmoid(g) * g) * u)
-                        }
-                    })
+                    .map(|(&g, &u)| bf(bf(bf_sigmoid(g) * g) * u))
                     .collect();
                 let oracle_down = project(&oracle_activation, &decoded[2], h as usize, precision);
                 for (j, reference) in [oracle_gate, oracle_up, oracle_activation, oracle_down]
@@ -1609,11 +1521,7 @@ fn grouped_actual_layer_stage_comparison() {
             (0, h as usize),
             true,
         );
-        if let Some(directory) = &source_reference {
-            source_math_tests::require_source_bits(directory, "output.bf16", &bits);
-        } else {
-            within_tolerance &= native_delta;
-        }
+        within_tolerance &= native_delta;
     }
     assert!(
         within_tolerance,
@@ -1664,12 +1572,6 @@ mod register_expert_tests;
 
 #[path = "splash_moe/paired_stage.rs"]
 mod paired_stage_tests;
-
-#[path = "splash_moe/source_math.rs"]
-mod source_math_tests;
-
-#[path = "splash_moe/source_routing.rs"]
-mod source_routing_tests;
 
 #[path = "splash_moe/workspace.rs"]
 mod workspace_tests;

@@ -72,8 +72,6 @@ impl Qwen35MoeInner {
         Ok(Self {
             config,
             wired: None,
-            source_moe_policy: Default::default(),
-            source_norm_identity: None,
             turn_cancel: None,
             layer_kinds,
             embedding,
@@ -639,11 +637,6 @@ impl Qwen35MoeInner {
         weights: &crate::array::memory::WeightsResident,
         guard: &crate::cold_tier::CheckpointLoadGuard<'_>,
     ) {
-        // The ordinary fingerprint omits source-norm payload/math identity.
-        // This diagnostic never restores or publishes SSD state under it.
-        if self.source_norm_identity.is_some() || self.source_moe_policy.active() {
-            return;
-        }
         let staged = self
             .memory_plan
             .as_ref()
@@ -1041,67 +1034,5 @@ impl Qwen35MoeInner {
         let seq = self.active_scheduled_seq.unwrap_or(0);
         self.dflash2_states.end_turn(seq);
         self.clear_reuse_state();
-    }
-}
-
-impl Qwen35MoeInner {
-    /// Loader-only: install before weights are published or any graph/cache exists.
-    pub(crate) fn configure_source_moe_policy(
-        &mut self,
-        policy: super::super::source_math_policy::SourceMoePolicy,
-    ) {
-        for layer in &mut self.layers {
-            layer.configure_source_mixer(policy.mixer);
-            if let super::super::decoder_layer::MLPType::MoE(moe) = &mut layer.mlp {
-                moe.configure_source_moe_policy(policy);
-            }
-        }
-        self.source_moe_policy = policy;
-    }
-}
-
-#[cfg(test)]
-mod source_mixer_profile_tests {
-    #[test]
-    fn source_mixer_profile_rejects_unmeasured_geometry_before_loading() {
-        let mut cfg = super::super::paged_construction_tests::tiny_paged_forward_moe_cfg();
-        let policy = super::super::super::source_math_policy::SourceMoePolicy::default()
-            .with_mixer_value(Some(std::ffi::OsStr::new("1")));
-        assert!(policy.validate_mixer_profile(&cfg).is_err());
-        cfg.hidden_size = 2048;
-        cfg.num_layers = 40;
-        cfg.num_experts = 256;
-        cfg.num_experts_per_tok = 8;
-        cfg.moe_intermediate_size = Some(512);
-        cfg.num_heads = 16;
-        cfg.num_kv_heads = 2;
-        cfg.head_dim = 256;
-        cfg.linear_num_key_heads = 16;
-        cfg.linear_num_value_heads = 32;
-        cfg.linear_key_head_dim = 128;
-        cfg.linear_value_head_dim = 128;
-        cfg.full_attention_interval = 4;
-        policy.validate_mixer_profile(&cfg).unwrap();
-        for field in 0..12 {
-            let mut bad = cfg.clone();
-            match field {
-                0 => bad.hidden_size = 1024,
-                1 => bad.num_layers = 41,
-                2 => bad.num_experts = 128,
-                3 => bad.num_experts_per_tok = 4,
-                4 => bad.moe_intermediate_size = Some(256),
-                5 => bad.num_heads = 8,
-                6 => bad.num_kv_heads = 1,
-                7 => bad.head_dim = 128,
-                8 => bad.linear_num_key_heads = 8,
-                9 => bad.linear_num_value_heads = 48,
-                10 => bad.linear_key_head_dim = 64,
-                _ => bad.full_attention_interval = 3,
-            }
-            assert!(policy.validate_mixer_profile(&bad).is_err());
-            super::super::super::source_math_policy::SourceMoePolicy::default()
-                .validate_mixer_profile(&bad)
-                .unwrap();
-        }
     }
 }

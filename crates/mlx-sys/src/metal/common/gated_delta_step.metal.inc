@@ -1,5 +1,8 @@
-// Gated delta recurrence kernel: non-vectorized, non-masked
-// g: [B, T, Hv] (scalar per head), mask: always true
+// Gated delta recurrence kernel (parameterized by HAS_MASK and VEC_G).
+//   VEC_G=0:    g is [B, T, Hv] (scalar per head)
+//   VEC_G=1:    g is [B, T, Hv, Dk] (per-element)
+//   HAS_MASK=0: mask always true
+//   HAS_MASK=1: mask[b_idx * T + t]
 R"(
         auto n = thread_position_in_grid.z;
         auto b_idx = n / Hv;
@@ -28,16 +31,29 @@ R"(
           state[i] = static_cast<float>(i_state[s_idx]);
         }
 
+#if VEC_G
+        // g: [B, T, Hv, Dk]
+        auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;
+#else
         // g: [B, T, Hv]
         auto g_ = g + b_idx * T * Hv;
+#endif
         auto beta_ = beta + b_idx * T * Hv;
 
         for (int t = 0; t < T; ++t) {
+#if HAS_MASK
+          if (mask[b_idx * T + t]) {
+#else
           if (true) {
+#endif
             float kv_mem = 0.0f;
             for (int i = 0; i < n_per_t; ++i) {
               auto s_idx = n_per_t * dk_idx + i;
+#if VEC_G
+              state[i] = state[i] * g_[s_idx];
+#else
               state[i] = state[i] * g_[hv_idx];
+#endif
               kv_mem += state[i] * k_[s_idx];
             }
             kv_mem = simd_sum(kv_mem);
@@ -60,7 +76,11 @@ R"(
           k_ += Hk * Dk;
           v_ += Hv * Dv;
           y += Hv * Dv;
+#if VEC_G
+          g_ += Hv * Dk;
+#else
           g_ += Hv;
+#endif
           beta_ += Hv;
         }
         for (int i = 0; i < n_per_t; ++i) {

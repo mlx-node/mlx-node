@@ -3366,18 +3366,6 @@ unsafe extern "C-unwind" {
         out: *mut *mut mlx_array,
     ) -> bool;
 
-    // Original Splash FP32 draft convolution, restricted to the measured
-    // M8/H2048 companion. Side 0 has no residual; side 1 returns complete
-    // hidden state with residual included. Returned handle is caller-owned.
-    pub fn mlx_source_dflash2_conv_available() -> bool;
-    pub fn mlx_source_dflash2_conv(
-        x: *mut mlx_array,
-        dynamic: *mut mlx_array,
-        base: *mut mlx_array,
-        side: i32,
-        residual: *mut mlx_array,
-    ) -> *mut mlx_array;
-
     // GPU architecture generation (M1=13, M2=14, M3=15, M4=16, M5=17)
     pub fn mlx_gpu_architecture_gen() -> i32;
 
@@ -3444,107 +3432,14 @@ unsafe extern "C-unwind" {
         out_bf16: *mut *mut mlx_array,
     ) -> bool;
 
-    // sym8 DECODE matvec (QMV): per-token int8 act quant + int8 MATVEC + rescale
-    // -> bf16 [M,N] = x @ w^T. The small-M (decode, M=1..~16) analogue of
-    // mlx_w8a8_linear — reuses the SAME activation int8 quant + the SAME [K,N]
-    // pre-transposed weight / f32 [N] s_w, but runs a dedicated BW-bound matvec
-    // (one thread per output column) instead of the 128x64 prefill tile (which
-    // wastes 127/128 rows at M=1). x_bf16: [M,K], w_i8: [K,N] int8 (opaque,
-    // pre-transposed at load), s_w: f32 [N]. Returns a LAZY array; caller evals
-    // at end of forward. Returns false (Rust falls back) on gen<17 / K%16!=0.
-    pub fn mlx_int8_qmv(
-        x: *mut mlx_array,
-        w_i8: *mut mlx_array,
-        s_w: *mut mlx_array,
-        out_bf16: *mut *mut mlx_array,
-    ) -> bool;
-
-    // W8A16 sym8 DECODE matvec (QMV): bf16 activations read DIRECTLY — NO
-    // activation quant (single kernel pass, f32 accumulate, activation-exact).
-    // y[m,n] = bf16(s_w[n] * sum_k x[m,k]*w[n,k]). Takes BOTH weight
-    // orientations: w_kn [K,N] (the GEMM operand — consumed by the 2D-block
-    // fallback under INT8_QMV16_SG=0 and the INT8_QMV_W8A16=0 W8A8 reroute)
-    // and w_nk [N,K] int8 (the CHECKPOINT tensor — consumed by the DEFAULT
-    // simd_sum-style kernel, which streams [N,K] row-major like MLX's affine
-    // qmv; buffer-shared with the stored checkpoint, not an extra copy).
-    // This is the PRODUCTION sym8 decode op (M<=2). Returns a LAZY array;
-    // caller evals at end of forward. false on gen<17 / K%16!=0.
-    pub fn mlx_int8_qmv_w8a16(
-        x: *mut mlx_array,
-        w_kn: *mut mlx_array,
-        w_nk: *mut mlx_array,
-        s_w: *mut mlx_array,
-        out_bf16: *mut *mut mlx_array,
-    ) -> bool;
-
-    // Single-residency W8A16 decode: the same default simd_sum kernel as
-    // mlx_int8_qmv_w8a16, but only takes checkpoint-native w_nk [N,K]. Legacy
-    // W8A8/2D-block diagnostics use the dual-layout entry point above.
+    // Single-residency W8A16 sym8 decode matvec (QMV): bf16 activations read
+    // directly with f32 accumulation on checkpoint-native w_nk [N,K]. Returns a
+    // lazy bf16 [M,N] array; false on gen<17 / K%16!=0.
     pub fn mlx_int8_qmv_w8a16_nk(
         x: *mut mlx_array,
         w_nk: *mut mlx_array,
         s_w: *mut mlx_array,
         out_bf16: *mut *mut mlx_array,
-    ) -> bool;
-
-    // MEASUREMENT ONLY (de-risk microbench). Affine-group W8A8 linear directly
-    // on the model's EXACT affine packed weight (no re-quant). Computes
-    //   y[m,n] = s_x[m] * sum_g ( scale[n,g]*P[m,n,g] + bias[n,g]*S[m,g] )
-    // with per-token int8 activation quant (identical to the symmetric path).
-    //   x:        [M,K] bf16
-    //   packed_w: [N, K/4] uint32 affine 8-bit packed weight
-    //   scales:   [N, K/group_size] f32
-    //   biases:   [N, K/group_size] f32
-    // Returns bf16 [M,N]. Returns false (Rust falls back) when gen<17, bits!=8,
-    // or K % group_size != 0. NOT a production op.
-    pub fn mlx_affine_w8a8_linear(
-        x: *mut mlx_array,
-        packed_w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        group_size: i32,
-        bits: i32,
-        out: *mut *mut mlx_array,
-    ) -> bool;
-
-    // MEASUREMENT ONLY (de-risk microbench). LOAD-TIME prepare for the TILED
-    // affine-group W8A8 GEMM (runs once per quantized linear). Unpacks the
-    // affine packed weight into the SIGNED int8 [K,N] kernel operand the tiled
-    // matmul2d wants, keeps the f32 scale, and precomputes
-    // bias_adj = 128*scale + bias.
-    //   packed_w: [N, K/4] uint32 affine 8-bit packed weight
-    //   scales:   [N, K/group_size] f32
-    //   biases:   [N, K/group_size] f32
-    //   -> out_q_s:   opaque int8 [K,N] (q - 128, kernel operand)
-    //      out_scale: f32 [N, K/group_size] (scale kept)
-    //      out_badj:  f32 [N, K/group_size] (= 128*scale + bias)
-    // Returns false (Rust falls back) when gen<17, bits!=8, or K%group_size!=0.
-    pub fn mlx_affine_w8a8_prepare(
-        packed_w: *mut mlx_array,
-        scales: *mut mlx_array,
-        biases: *mut mlx_array,
-        group_size: i32,
-        bits: i32,
-        out_q_s: *mut *mut mlx_array,
-        out_scale: *mut *mut mlx_array,
-        out_badj: *mut *mut mlx_array,
-    ) -> bool;
-
-    // MEASUREMENT ONLY (de-risk microbench). Per-FORWARD prepared linear (the
-    // TIMED hot path). Per-token int8 act quant + per-group act-sum S, then the
-    // TILED grouped matmul2d GEMM.
-    //   x:     [M,K] bf16
-    //   q_s:   [K,N] int8 (signed, from mlx_affine_w8a8_prepare)
-    //   scale: [N, K/group_size] f32 (kept)
-    //   badj:  [N, K/group_size] f32 (= 128*scale + bias)
-    //   -> out: bf16 [M,N] (LAZY). Returns false on gen<17, K%group_size!=0.
-    pub fn mlx_affine_w8a8_linear_prepared(
-        x: *mut mlx_array,
-        q_s: *mut mlx_array,
-        scale: *mut mlx_array,
-        badj: *mut mlx_array,
-        group_size: i32,
-        out: *mut *mut mlx_array,
     ) -> bool;
 
     // MEASUREMENT ONLY (profiler/test scope). Pure int8 GEMM with a
@@ -3796,15 +3691,6 @@ unsafe extern "C" {
     /// Fused residual-add + RMSNorm: writes `h = x + res` and
     /// `normed = rms_norm(h) * w` into the out pointers. Returns false on
     /// contract violation (shape/dtype/contiguity) or kernel build failure.
-    /// H2048, F32 weights/BF16 IO source norm. 1 constructed, 0 fallback, -1 error.
-    pub fn mlx_source_norm_2048(
-        input: *mut mlx_array,
-        weight: *mut mlx_array,
-        residual: *mut mlx_array,
-        staged: bool,
-        out_normalized: *mut *mut mlx_array,
-        out_hidden: *mut *mut mlx_array,
-    ) -> i32;
     pub fn mlx_fused_add_rmsnorm(
         x: *mut mlx_array,
         res: *mut mlx_array,
@@ -4171,63 +4057,6 @@ unsafe extern "C" {
         top_k: i32,
         normalize: bool,
     ) -> *mut mlx_array;
-    pub fn mlx_splash_moe_with_policy(
-        inputs: *const *mut mlx_array,
-        count: usize,
-        formats: *const u32,
-        top_k: i32,
-        normalize: bool,
-        source_math: bool,
-    ) -> *mut mlx_array;
-    /// Slots 1 and 2 carry BF16 router/shared-gate weights instead of logits.
-    /// The source route implies source body arithmetic. Residual is nullable.
-    pub fn mlx_splash_moe_with_router(
-        inputs: *const *mut mlx_array,
-        count: usize,
-        formats: *const u32,
-        top_k: i32,
-        normalize: bool,
-        residual: *mut mlx_array,
-    ) -> *mut mlx_array;
-    /// Packed Uint32 score bits (2048), route IDs (72), coefficient bits (72).
-    pub fn mlx_test_splash_moe_source_routing(
-        input: *mut mlx_array,
-        router: *mut mlx_array,
-        shared: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_splash_moe_source_residual_available() -> bool;
-
-    /// Source Q4 target-output diagnostic. The fixed40-core M5 contract is
-    /// checked before graph construction and again before replay writes.
-    pub fn mlx_source_mixer_q4_available() -> bool;
-    /// Test-only source prep oracle: Table16 BF16 words, F32 sum/seed words,
-    /// then initialized counters, returned as Uint32[19488].
-    pub fn mlx_test_source_mixer_q4_prepare(x: *mut mlx_array) -> *mut mlx_array;
-    /// Owns a new BF16 [8,2048] output handle or returns null on error.
-    /// Inputs: BF16 [8,4096], T64 Q4 [2048,512]/U8[2048,256]/F16[2048,32].
-    /// A nullable BF16 [8,2048] residual is added before the one output cast.
-    pub fn mlx_source_mixer_q4(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        scales: *mut mlx_array,
-        bases: *mut mlx_array,
-        residual: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_test_splash_moe_source_residual_combine(
-        experts: *mut mlx_array,
-        inverse: *mut mlx_array,
-        weights: *mut mlx_array,
-        residual: *mut mlx_array,
-        budget: *mut mlx_array,
-    ) -> *mut mlx_array;
-    pub fn mlx_splash_moe_with_residual(
-        inputs: *const *mut mlx_array,
-        count: usize,
-        formats: *const u32,
-        top_k: i32,
-        normalize: bool,
-        residual: *mut mlx_array,
-    ) -> *mut mlx_array;
     pub fn mlx_qwen4_routed_experts(
         x: *mut mlx_array,
         ids: *mut mlx_array,
@@ -4439,30 +4268,6 @@ unsafe extern "C" {
     // Null unless the array is available and already waited on; never waits
     // and never throws.
     pub fn mlx_array_data_ptr(handle: *mut mlx_array) -> *const std::ffi::c_void;
-}
-
-unsafe extern "C" {
-    pub fn mlx_source_qk_norm_rope_available() -> bool;
-    pub fn mlx_source_qk_norm_rope(
-        q: *mut mlx_array,
-        k: *mut mlx_array,
-        wq: *mut mlx_array,
-        wk: *mut mlx_array,
-        inverse_frequencies: *mut mlx_array,
-        offsets: *mut mlx_array,
-        out_q: *mut *mut mlx_array,
-        out_k: *mut *mut mlx_array,
-    ) -> bool;
-}
-
-unsafe extern "C" {
-    pub fn mlx_source_head_q6_available() -> bool;
-    pub fn mlx_source_head_q6(
-        x: *mut mlx_array,
-        weight: *mut mlx_array,
-        scales: *mut mlx_array,
-        bases: *mut mlx_array,
-    ) -> *mut mlx_array;
 }
 
 unsafe extern "C" {
@@ -5168,6 +4973,9 @@ unsafe extern "C" {
         len: usize,
     ) -> bool;
 }
+
+/// Path to the prebuilt `paged_attn.metallib` compiled by `mlx-sys/build.rs`.
+pub const PAGED_ATTN_METALLIB_PATH: &str = concat!(env!("OUT_DIR"), "/paged_attn.metallib");
 
 /// TEST-ONLY: the planes' test-only kernels (the decode checks and the fp32
 /// epilogue fault kernels), linked by build.rs beside `paged_attn.metallib`

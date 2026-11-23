@@ -18,8 +18,9 @@
 
 namespace mlx::core::fast {
 
-/// On-cache storage element type. Must match
-/// `crates/mlx-paged-attn/src/extern_c.rs::KvDtypeC` value-by-value.
+/// On-cache storage element type. Must match the `u8` kv_dtype codes passed
+/// across the `mlx-sys` C ABI (`Fp16 = 0`, `Bf16 = 1`, `Int8 = 3`; code `2`
+/// is retired).
 enum class KvDtype : uint8_t {
   Fp16 = 0,
   Bf16 = 1,

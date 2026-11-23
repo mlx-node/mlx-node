@@ -47,7 +47,7 @@ pub(crate) fn physical_memory() -> Option<u64> {
     None
 }
 
-/// One `host_statistics64` read, in bytes (family-neutral; callers pass the
+/// One host memory snapshot, in bytes (family-neutral; callers pass the
 /// value on, so tests build it by hand).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostMemory {
@@ -64,6 +64,12 @@ pub struct HostMemory {
 }
 
 impl HostMemory {
+    /// Free plus clean file cache: what the kernel hands out without
+    /// touching another process's data.
+    pub fn available(&self) -> u64 {
+        self.free.saturating_add(self.file)
+    }
+
     /// `host_used` of the guard: wired + compressor + anonymous - purgeable.
     pub fn non_reclaimable(&self) -> u64 {
         self.wired
@@ -72,8 +78,24 @@ impl HostMemory {
     }
 }
 
+/// Raw Mach VM page counts and page size from one `host_statistics64` read.
 #[cfg(target_os = "macos")]
-pub fn host_memory() -> Option<HostMemory> {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MacosVmStats {
+    pub page_size: u64,
+    pub free: u64,
+    pub speculative: u64,
+    pub file_backed: u64,
+    pub purgeable: u64,
+    pub anonymous: u64,
+    pub wired: u64,
+    pub compressor: u64,
+    pub compressed: u64,
+}
+
+/// Sample raw Mach VM page counts and host page size via `host_statistics64`.
+#[cfg(target_os = "macos")]
+pub(crate) fn sample_macos_vm_stats() -> Option<MacosVmStats> {
     unsafe extern "C" {
         fn mach_host_self() -> libc::mach_port_t;
         static mach_task_self_: libc::mach_port_t;
@@ -81,38 +103,93 @@ pub fn host_memory() -> Option<HostMemory> {
             task: libc::mach_port_t,
             name: libc::mach_port_t,
         ) -> libc::kern_return_t;
+        fn host_page_size(
+            host: libc::mach_port_t,
+            size: *mut libc::vm_size_t,
+        ) -> libc::kern_return_t;
     }
     let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
     let mut count = libc::HOST_VM_INFO64_COUNT;
+    let mut page_size: libc::vm_size_t = 0;
     // SAFETY: plain Mach calls on this task's host port; `stats` holds
     // `count` integers and the port is released after the read.
     let (ok, stats) = unsafe {
         let host = mach_host_self();
-        let ok = libc::host_statistics64(
-            host,
-            libc::HOST_VM_INFO64,
-            stats.as_mut_ptr().cast(),
-            &mut count,
-        );
+        let page_ok = host_page_size(host, &mut page_size);
+        let ok = if page_ok == 0 {
+            libc::host_statistics64(
+                host,
+                libc::HOST_VM_INFO64,
+                stats.as_mut_ptr().cast(),
+                &mut count,
+            )
+        } else {
+            page_ok
+        };
         mach_port_deallocate(mach_task_self_, host);
         (ok, stats.assume_init())
     };
-    if ok != 0 {
+    if ok != 0 || page_size == 0 {
         return None;
     }
-    let page = crate::array::page_size() as u64;
-    Some(HostMemory {
-        physical: physical_memory()?,
-        free: u64::from(stats.free_count) * page,
-        file: u64::from(stats.external_page_count) * page,
-        anonymous: u64::from(stats.internal_page_count) * page,
-        purgeable: u64::from(stats.purgeable_count) * page,
-        wired: u64::from(stats.wire_count) * page,
-        compressor: u64::from(stats.compressor_page_count) * page,
+    Some(MacosVmStats {
+        page_size: page_size as u64,
+        free: u64::from(stats.free_count),
+        speculative: u64::from(stats.speculative_count),
+        file_backed: u64::from(stats.external_page_count),
+        purgeable: u64::from(stats.purgeable_count),
+        anonymous: u64::from(stats.internal_page_count),
+        wired: u64::from(stats.wire_count),
+        compressor: u64::from(stats.compressor_page_count),
+        compressed: stats.total_uncompressed_pages_in_compressor,
     })
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "macos")]
+pub fn host_memory() -> Option<HostMemory> {
+    let stats = sample_macos_vm_stats()?;
+    let page = stats.page_size;
+    Some(HostMemory {
+        physical: physical_memory()?,
+        free: stats.free * page,
+        file: stats.file_backed * page,
+        anonymous: stats.anonymous * page,
+        purgeable: stats.purgeable * page,
+        wired: stats.wired * page,
+        compressor: stats.compressor * page,
+    })
+}
+
+#[cfg(target_os = "windows")]
+pub fn host_memory() -> Option<HostMemory> {
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    // SAFETY: `MEMORYSTATUSEX` is a plain Win32 POD struct; zeroed with
+    // `dwLength` initialized before calling `GlobalMemoryStatusEx`.
+    let mut status = MEMORYSTATUSEX {
+        dwLength: std::mem::size_of::<MEMORYSTATUSEX>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+    if ok == 0 || status.ullTotalPhys == 0 {
+        return None;
+    }
+    let physical = status.ullTotalPhys;
+    // Windows `ullAvailPhys` includes free and standby (reclaimable) pages,
+    // matching macOS's `free + file`.
+    let free = status.ullAvailPhys.min(physical);
+    let non_reclaimable = physical.saturating_sub(free);
+    Some(HostMemory {
+        physical,
+        free,
+        file: 0,
+        anonymous: non_reclaimable,
+        purgeable: 0,
+        wired: 0,
+        compressor: 0,
+    })
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub fn host_memory() -> Option<HostMemory> {
     None
 }
@@ -124,7 +201,11 @@ mod tests {
     #[test]
     fn physical_memory_is_known_on_supported_hosts() {
         let bytes = physical_memory();
-        if cfg!(any(target_os = "macos", target_os = "linux")) {
+        if cfg!(any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )) {
             assert!(bytes.is_some_and(|b| b >= 1 << 30), "{bytes:?}");
         }
     }
@@ -132,15 +213,15 @@ mod tests {
     #[test]
     fn host_memory_fields_sane() {
         let Some(h) = host_memory() else {
-            if cfg!(target_os = "macos") {
-                panic!("host_statistics64 failed");
+            if cfg!(any(target_os = "macos", target_os = "windows")) {
+                panic!("host_memory failed on supported host");
             }
             return;
         };
         println!("{h:?} non_reclaimable {}", h.non_reclaimable());
         assert_eq!(Some(h.physical), physical_memory());
         assert!(
-            h.wired > 0 && h.anonymous > 0 && h.free + h.file > 0,
+            (!cfg!(target_os = "macos") || h.wired > 0) && h.anonymous > 0 && h.available() > 0,
             "{h:?}"
         );
         let parts = h.free + h.file + h.anonymous + h.wired + h.compressor;
@@ -159,6 +240,7 @@ mod tests {
             wired: 7 << 30,
             compressor: 5 << 30,
         };
+        assert_eq!(h.available(), 3);
         assert_eq!(h.non_reclaimable(), (7 + 5 + 40 - 3) << 30);
         let under = HostMemory {
             purgeable: 50 << 30,

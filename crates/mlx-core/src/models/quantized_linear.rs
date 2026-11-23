@@ -278,8 +278,6 @@ pub(crate) enum StoreEpilogue {
 /// whole hidden state.
 #[derive(Clone, Copy)]
 pub(crate) enum MixerResidual<'a> {
-    /// Added after the projection, or by the source mixer kernel.
-    Source(&'a MxArray),
     /// Added in the projection's GEMM store where its shape takes the
     /// epilogue GEMM, else after it (the dense prefill).
     Store(&'a MxArray),
@@ -421,8 +419,8 @@ impl LinearProj {
     }
 
     /// A target mixer output. With a residual this always returns complete
-    /// hidden state, including on an unsupported source-kernel fallback.
-    /// The caller must normalize this result without adding the residual again.
+    /// hidden state. The caller must normalize this result without adding the
+    /// residual again.
     pub(crate) fn forward_mixer_output(
         &self,
         x: &MxArray,
@@ -431,14 +429,6 @@ impl LinearProj {
     ) -> Result<MxArray> {
         let residual = match residual {
             None => return self.forward_prepared_sg8(x, prepared),
-            Some(MixerResidual::Source(residual)) => {
-                if let Self::Quantized(q) = self
-                    && let Some(hidden) = q.try_source_mixer_q4(x, residual)?
-                {
-                    return Ok(hidden);
-                }
-                residual
-            }
             Some(MixerResidual::Store(residual)) => {
                 // Prepared operands select their own kernel.
                 if !(prepared.is_some() && self.supports_prepared_sg8())
@@ -514,32 +504,11 @@ impl LinearProj {
         }
     }
 
-    /// The source head policy belongs to this loaded projection and is shared
-    /// by target verification and the DFlash draft. Unsupported row counts use
-    /// its native projection; no process flag can change a captured source head.
-    pub(crate) fn enable_source_head(&mut self) -> Result<()> {
-        match self {
-            Self::Quantized(q) => {
-                q.validate_source_head()?;
-                q.source_head = true;
-                Ok(())
-            }
-            Self::Standard(_) => Err(Error::from_reason(
-                "source head requires an untied native Q6_K T64 vocabulary projection",
-            )),
-        }
-    }
-
-    /// The legacy FP32-head experiment remains separate from the immutable
-    /// source-head policy and is consulted only for native-policy projections.
     pub(crate) fn forward_logits(&self, x: &MxArray) -> Result<MxArray> {
-        if let Self::Quantized(q) = self {
-            if q.source_head {
-                return self.forward(x);
-            }
-            if let Some(logits) = q.try_head_f32(x)? {
-                return Ok(logits);
-            }
+        if let Self::Quantized(q) = self
+            && let Some(logits) = q.try_head_f32(x)?
+        {
+            return Ok(logits);
         }
         self.forward(x)
     }
@@ -549,9 +518,6 @@ impl LinearProj {
     /// (e.g., for softcap / argmax). Native BF16 projections still return BF16.
     pub(crate) fn forward_logits_keep_f32(&self, x: &MxArray) -> Result<MxArray> {
         if let Self::Quantized(q) = self {
-            if q.source_head {
-                return self.forward(x);
-            }
             if let Some(logits) = q.try_head_f32(x)? {
                 return Ok(logits);
             }
@@ -580,14 +546,7 @@ impl LinearProj {
     pub fn forward(&self, x: &MxArray) -> Result<MxArray> {
         match self {
             LinearProj::Standard(l) => l.forward(x),
-            LinearProj::Quantized(l) => {
-                if l.source_head
-                    && let Some(logits) = l.try_source_head(x)?
-                {
-                    return Ok(logits);
-                }
-                l.forward(x)
-            }
+            LinearProj::Quantized(l) => l.forward(x),
         }
     }
 
@@ -602,7 +561,7 @@ impl LinearProj {
     /// 2-4 lanes of 8 rows; every other projection runs once per lane.
     pub fn forward_lanes(&self, x: &MxArray) -> Result<MxArray> {
         match self {
-            LinearProj::Quantized(q) if !q.source_head => q.forward_lanes(x),
+            LinearProj::Quantized(q) => q.forward_lanes(x),
             _ => forward_per_lane(x, |lane| self.forward(lane)),
         }
     }
@@ -611,7 +570,7 @@ impl LinearProj {
     /// tier on this device.
     pub fn lane_tier_holds(&self, k: i64) -> Result<bool> {
         match self {
-            LinearProj::Quantized(q) if !q.source_head => q.lane_tier_holds(k),
+            LinearProj::Quantized(q) => q.lane_tier_holds(k),
             _ => Ok(false),
         }
     }
@@ -1900,9 +1859,6 @@ pub struct QuantizedLinear {
     amax_keys: Option<Box<(String, Option<String>)>>,
     output_layout: QuantizedOutputLayout,
     hadamard: Option<HadamardTransform>,
-    // Set only after the MoE loader validates and installs the complete head.
-    // Immutable thereafter; compiled closures share this same projection.
-    source_head: bool,
     // CUDA-only transient dense weights for K-quant prefill and DFlash2 verify
     // batches. `None` (zero allocation, 8-byte niche-optimized inline footprint
     // across all OSes) on Metal/CPU; single-row AR decode or turn cleanup
@@ -2053,7 +2009,6 @@ impl QuantizedLinear {
             amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
-            source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
@@ -2082,7 +2037,6 @@ impl QuantizedLinear {
             || self.hadamard.is_some()
             || self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
-            || self.source_head
             || self.scales.dtype()? != crate::array::DType::Float16
             || self.weight.dtype()? != crate::array::DType::Uint32
         {
@@ -2371,9 +2325,7 @@ impl QuantizedLinear {
     /// projection keeps up to two keys and records the shared input under
     /// each, which reproduces the unmerged recordings exactly.
     pub fn concat_rows(&self, other: &QuantizedLinear) -> Result<Option<QuantizedLinear>> {
-        if self.source_head
-            || other.source_head
-            || self.symmetric_q8 != other.symmetric_q8
+        if self.symmetric_q8 != other.symmetric_q8
             || self.mode != other.mode
             || self.bits != other.bits
             || self.group_size != other.group_size
@@ -2457,7 +2409,6 @@ impl QuantizedLinear {
             amax_keys,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
-            source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: self.symmetric_q8,
@@ -2479,8 +2430,7 @@ impl QuantizedLinear {
     /// calibration site with a view must re-attach the source's key via
     /// [`with_amax_key`](Self::with_amax_key).
     pub fn slice_rows(&self, start: i64, end: i64) -> Result<QuantizedLinear> {
-        if self.source_head
-            || self.fp8_dequant_weight.is_some()
+        if self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
             || self.hadamard.is_some()
             || self.output_layout != QuantizedOutputLayout::Native
@@ -2529,7 +2479,6 @@ impl QuantizedLinear {
             amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
-            source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: self.symmetric_q8,
@@ -2559,7 +2508,6 @@ impl QuantizedLinear {
             amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
-            source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
@@ -2688,7 +2636,6 @@ impl QuantizedLinear {
             amax_keys: None,
             output_layout: QuantizedOutputLayout::Native,
             hadamard: None,
-            source_head: false,
             cuda_dense_prefill: Self::new_cuda_dense_prefill_slot(),
             planes: None,
             symmetric_q8: false,
@@ -2856,7 +2803,6 @@ impl QuantizedLinear {
             && self.fp8_dequant_weight.is_none()
             && self.s_w.is_none()
             && self.output_layout == QuantizedOutputLayout::Native
-            && !self.source_head
     }
 
     /// Whether `rows` bfloat16 rows of `k` inputs take the store-epilogue
@@ -2934,107 +2880,6 @@ impl QuantizedLinear {
             && self.output_layout == QuantizedOutputLayout::Native
             && self.weight.shape().is_ok_and(|s| s.as_ref() == [2048, 512])
             && std::env::var_os("MLX_KQUANT_REGISTER_OUTPUT").is_none_or(|v| v == "1")
-    }
-
-    fn try_source_mixer_q4(&self, x: &MxArray, residual: &MxArray) -> Result<Option<MxArray>> {
-        // Policy is captured by the target decoder; this dispatch never reads
-        // an environment flag. Source Table16 packing is private to the bridge
-        // and deliberately does not consume native prepared-SG8 operands.
-        if self.mode != "q4k@t64"
-            || self.bits != 4
-            || self.group_size != 32
-            || self.bias.is_some()
-            || self.hadamard.is_some()
-            || self.input_amax.is_some()
-            || self.output_layout != QuantizedOutputLayout::Native
-            || self.weight.shape()?.as_ref() != [2048, 512]
-            || self.scales.shape()?.as_ref() != [2048, 256]
-            || self.weight.dtype()? != crate::array::DType::Uint32
-            || self.scales.dtype()? != crate::array::DType::Uint8
-            || x.shape()?.as_ref() != [1, 8, 4096]
-            || residual.shape()?.as_ref() != [1, 8, 2048]
-            || x.dtype()? != crate::array::DType::BFloat16
-            || residual.dtype()? != crate::array::DType::BFloat16
-            || !unsafe { mlx_sys::mlx_source_mixer_q4_available() }
-        {
-            return Ok(None);
-        }
-        let Some(biases) = self.biases.as_ref() else {
-            return Ok(None);
-        };
-        if biases.shape()?.as_ref() != [2048, 32] || biases.dtype()? != crate::array::DType::Float16
-        {
-            return Ok(None);
-        }
-        let x2 = x.reshape(&[8, 4096])?;
-        let residual2 = residual.reshape(&[8, 2048])?;
-        let output = unsafe {
-            mlx_sys::mlx_source_mixer_q4(
-                x2.as_raw_ptr(),
-                self.weight.as_raw_ptr(),
-                self.scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-                residual2.as_raw_ptr(),
-            )
-        };
-        // Eligibility has already selected the source path. A construction or
-        // execution error is fail-closed, never a second mixer/cache forward.
-        Ok(Some(
-            MxArray::from_handle(output, "source_mixer_q4")?.reshape(&[1, 8, 2048])?,
-        ))
-    }
-
-    fn validate_source_head(&self) -> Result<()> {
-        use crate::array::DType;
-        let bad = || {
-            Error::from_reason("source head requires plain Q6_K T64 H2048/V248320 packed operands")
-        };
-        if self.mode != "q6k@t64"
-            || self.bits != 6
-            || self.group_size != 16
-            || self.bias.is_some()
-            || self.hadamard.is_some()
-            || self.input_amax.is_some()
-            || self.fp8_dequant_weight.is_some()
-            || self.s_w.is_some()
-            || self.output_layout != QuantizedOutputLayout::Native
-            || self.weight.shape()?.as_ref() != [248320, 384]
-            || self.scales.shape()?.as_ref() != [248320, 128]
-            || self.weight.dtype()? != DType::Uint32
-            || self.scales.dtype()? != DType::Int8
-        {
-            return Err(bad());
-        }
-        let biases = self.biases.as_ref().ok_or_else(bad)?;
-        if biases.shape()?.as_ref() != [248320, 8] || biases.dtype()? != DType::Float16 {
-            return Err(bad());
-        }
-        Ok(())
-    }
-
-    fn try_source_head(&self, x: &MxArray) -> Result<Option<MxArray>> {
-        if !self.source_head
-            || x.dtype()? != crate::array::DType::BFloat16
-            || !matches!(x.shape()?.as_ref(), [8, 2048] | [1, 8, 2048])
-            || !unsafe { mlx_sys::mlx_source_head_q6_available() }
-        {
-            return Ok(None);
-        }
-        self.validate_source_head()?;
-        let biases = self.biases.as_ref().ok_or_else(|| {
-            Error::from_reason("source head requires plain Q6_K T64 H2048/V248320 packed operands")
-        })?;
-        let output = unsafe {
-            mlx_sys::mlx_source_head_q6(
-                x.as_raw_ptr(),
-                self.weight.as_raw_ptr(),
-                self.scales.as_raw_ptr(),
-                biases.as_raw_ptr(),
-            )
-        };
-        // Once selected, construction/evaluation errors propagate. Retrying a
-        // different arithmetic path would change already-produced proposals.
-        MxArray::from_handle(output, "source_head_q6").map(Some)
     }
 
     fn try_head_f32(&self, x: &MxArray) -> Result<Option<MxArray>> {
@@ -3501,7 +3346,6 @@ impl QuantizedLinear {
             || self.input_amax.is_some()
             || self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
-            || self.source_head
             || self.weight.ndim()? != 2
         {
             return Ok(false);
@@ -3615,8 +3459,7 @@ impl QuantizedLinear {
                 tensor.format
             ));
         }
-        if self.source_head
-            || self.bias.is_some()
+        if self.bias.is_some()
             || self.biases.is_none()
             || self.hadamard.is_some()
             || self.s_w.is_some()
@@ -8454,121 +8297,7 @@ mod clef_row_gather_tests {
         let got = ql.take_dequantized_rows(&ids).unwrap();
         assert_rows_bit_identical(&got, &want, "fp8_e4m3 resident rows");
     }
-}
 
-#[cfg(test)]
-mod source_mixer_fallback_tests {
-    use super::*;
-    use crate::array::DType;
-    fn bf(values: &[f32], shape: &[i64]) -> MxArray {
-        MxArray::from_float32(values, shape)
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap()
-    }
-    #[test]
-    fn source_mixer_unsupported_weight_planes_decline_before_factory() -> Result<()> {
-        let x = MxArray::zeros(&[1, 8, 4096], Some(DType::BFloat16))?;
-        let residual = MxArray::zeros(&[1, 8, 2048], Some(DType::BFloat16))?;
-        for bad_plane in 0..3 {
-            let projection = QuantizedLinear::new(
-                MxArray::zeros(
-                    &[2048, 512],
-                    Some(if bad_plane == 0 {
-                        DType::Int32
-                    } else {
-                        DType::Uint32
-                    }),
-                )?,
-                MxArray::zeros(
-                    &[2048, 256],
-                    Some(if bad_plane == 1 {
-                        DType::Int8
-                    } else {
-                        DType::Uint8
-                    }),
-                )?,
-                Some(MxArray::zeros(
-                    &[2048, 32],
-                    Some(if bad_plane == 2 {
-                        DType::BFloat16
-                    } else {
-                        DType::Float16
-                    }),
-                )?),
-                None,
-                32,
-                4,
-                "q4k@t64".into(),
-            );
-            assert!(
-                projection.try_source_mixer_q4(&x, &residual)?.is_none(),
-                "plane {bad_plane}"
-            );
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn source_mixer_standard_fallback_keeps_hidden_meaning_on_one_trace() -> Result<()> {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            return Ok(());
-        }
-        let weight = bf(
-            &(0..64 * 32)
-                .map(|i| ((i % 23) as f32 - 11.0) * 0.0078125)
-                .collect::<Vec<_>>(),
-            &[64, 32],
-        );
-        weight.eval();
-        let projection = LinearProj::Standard(Linear::from_weights(&weight, None)?);
-        let key = 0x5150_534d_4958_0002;
-        crate::compiled_graph::erase_compiled_graphs_matching(u64::MAX, key);
-        let mut traces = 0;
-        for (rows, seed) in [(8, 3), (1, 7), (7, 11), (33, 17), (8, 23)] {
-            let x = bf(
-                &(0..rows * 32)
-                    .map(|i| ((i + seed) % 19) as f32 * 0.125 - 1.0)
-                    .collect::<Vec<_>>(),
-                &[1, rows as i64, 32],
-            );
-            let residual = bf(
-                &(0..rows * 64)
-                    .map(|i| ((i * 3 + seed) % 29) as f32 * 0.0625 - 0.5)
-                    .collect::<Vec<_>>(),
-                &[1, rows as i64, 64],
-            );
-            let before = residual.to_uint16_native()?;
-            let mut build = |a: &[MxArray]| -> Result<Vec<MxArray>> {
-                traces += 1;
-                Ok(vec![projection.forward_mixer_output(
-                    &a[0],
-                    None,
-                    Some(MixerResidual::Source(&a[1])),
-                )?])
-            };
-            let got = crate::compiled_graph::invoke_compiled_graph(
-                key,
-                &[&x, &residual],
-                1,
-                true,
-                &mut build,
-            )?
-            .unwrap();
-            let want = residual.add(&projection.forward(&x)?)?;
-            assert_eq!(got[0].to_uint16_native()?, want.to_uint16_native()?);
-            assert_eq!(residual.to_uint16_native()?, before);
-            assert_eq!(
-                projection
-                    .forward_mixer_output(&x, None, None)?
-                    .to_uint16_native()?,
-                projection.forward(&x)?.to_uint16_native()?
-            );
-        }
-        assert_eq!(traces, 1);
-        crate::compiled_graph::erase_compiled_graphs_matching(u64::MAX, key);
-        Ok(())
-    }
     #[test]
     fn quantized_switch_linear_outer_scale_applies_per_expert_and_preserves_dtype() -> Result<()> {
         use crate::array::DType;
@@ -8621,10 +8350,6 @@ mod source_mixer_fallback_tests {
         Ok(())
     }
 }
-
-#[cfg(test)]
-#[path = "source_head_tests.rs"]
-mod source_head_tests;
 
 #[cfg(test)]
 #[path = "quantized_linear_lane_tier_tests.rs"]

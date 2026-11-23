@@ -65,7 +65,7 @@ impl GpuRepackKind {
     }
 }
 
-/// Metal (`paged_attn.metallib`) or CUDA (`qwen4_gguf_repack.cu.inc`) GPU repack
+/// Metal (`paged_attn.metallib`) or CUDA (`gguf_repack.cu.inc`) GPU repack
 /// is available on this host.
 pub(crate) fn gpu_repack_available() -> bool {
     // SAFETY: nullary predicates that catch internally.

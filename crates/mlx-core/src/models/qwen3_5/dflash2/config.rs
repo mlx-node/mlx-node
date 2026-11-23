@@ -53,6 +53,7 @@ pub(crate) struct DFlash2Config {
     pub(super) head_dim: usize,
     pub(super) vocab_size: usize,
     pub(super) rms_norm_eps: f64,
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) max_position_embeddings: usize,
     pub(crate) sliding_window: usize,
     pub(super) conv_group_size: usize,
@@ -236,16 +237,6 @@ impl DFlash2Config {
         DraftContextWindow::new(self.hidden_size as u32, self.sliding_window as u32)
     }
 
-    pub(super) fn supports_source_conv(&self, target: [i32; 5]) -> bool {
-        self.supports_moe_execution_defaults(target)
-            && self.target_layers == [1, 6, 11, 16, 22, 27, 32, 37]
-            && self.mask_token_id == 248077
-            && self.vocab_size == 248320
-            && self.max_position_embeddings == 262144
-            && (self.rms_norm_eps as f32).to_bits() == 1e-6f32.to_bits()
-            && (self.rope_theta as f32).to_bits() == 10000000.0f32.to_bits()
-    }
-
     pub(super) fn supports_moe_execution_defaults(&self, target: [i32; 5]) -> bool {
         target == [2048, 40, 256, 8, 512]
             && self.hidden_size == 2048
@@ -274,24 +265,16 @@ pub(super) struct DraftExecutionPolicy {
     attention_override: Option<bool>,
     supported_moe: bool,
     dense_cuda: bool,
-    source_conv_requested: bool,
-    source_conv_supported: bool,
 }
 
 impl DraftExecutionPolicy {
     #[cfg(test)]
-    pub(super) fn from_values(
-        compile: Option<&str>,
-        attention: Option<&str>,
-        source_conv: Option<&str>,
-    ) -> Self {
+    pub(super) fn from_values(compile: Option<&str>, attention: Option<&str>) -> Self {
         Self {
             compile_override: compile.map(|value| value == "1"),
             attention_override: attention.map(|value| value == "1"),
             supported_moe: false,
             dense_cuda: false,
-            source_conv_requested: source_conv == Some("1"),
-            source_conv_supported: false,
         }
     }
 
@@ -303,24 +286,12 @@ impl DraftExecutionPolicy {
                 .map(|value| value == "1"),
             supported_moe: false,
             dense_cuda: false,
-            source_conv_requested: std::env::var_os("MLX_DFLASH2_SOURCE_CONV")
-                .is_some_and(|value| value == "1"),
-            source_conv_supported: false,
         }
     }
 
     pub(super) fn with_moe_profile(mut self, supported: bool) -> Self {
         self.supported_moe = supported;
         self
-    }
-
-    pub(super) fn with_source_conv_profile(mut self, supported: bool) -> Self {
-        self.source_conv_supported = supported;
-        self
-    }
-
-    pub(super) fn source_conv(self) -> bool {
-        self.source_conv_requested && self.supported_moe && self.source_conv_supported
     }
 
     pub(super) fn with_dense_cuda_profile(mut self, supported: bool) -> Self {

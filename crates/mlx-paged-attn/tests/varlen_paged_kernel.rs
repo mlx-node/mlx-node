@@ -1,9 +1,12 @@
 //! Varlen paged-attention kernel tests.
 //!
 //! End-to-end verification of the multi-row paged-attention kernel
-//! used for MTP speculative decoding. The single-row kernel ships
-//! one Q vector per sequence; the varlen kernel ships
-//! `cu_seqlens_q[num_seqs]` Q vectors and uses an on-GPU binary search
+//! used for MTP speculative decoding through `mlx-sys`'s graph-native C++
+//! primitives (`mlx_paged_kv_write_forward`, `mlx_paged_attention_forward`,
+//! `mlx_paged_attention_varlen_forward`) backed by `LayerKVPool`.
+//!
+//! The single-row kernel ships one Q vector per sequence; the varlen kernel
+//! ships `cu_seqlens_q[num_seqs]` Q vectors and uses an on-GPU binary search
 //! plus per-query causal cutoff
 //!
 //!     effective_context_len = context_len - q_len + q_pos_in_seq + 1
@@ -29,15 +32,24 @@
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
-use metal::MTLResourceOptions;
-use mlx_paged_attn::metal::{
-    MetalDtype, MetalState, PagedAttentionParams, PagedAttentionVarlenParams, RawBufferInfo,
-    dispatch_paged_attention_v1_raw, dispatch_paged_attention_varlen_auto,
-    dispatch_paged_attention_varlen_v1_raw,
-};
+use mlx_paged_attn::metal::{MetalDtype, MetalState};
+use mlx_paged_attn::{LayerKVPool, PagedAttentionConfig};
+use mlx_sys::mlx_array;
+
+const KV_DTYPE_BF16: u8 = 1;
+
+struct Owned(*mut mlx_array);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { mlx_sys::mlx_array_delete(self.0) };
+        }
+    }
+}
 
 // =============================================================================
-// bf16 host helpers (mirrors sliding_window_kernel.rs).
+// bf16 & MLX C ABI host helpers (mirrors paged_int8_read.rs).
 // =============================================================================
 
 fn f32_to_bf16_bits(x: f32) -> u16 {
@@ -56,75 +68,150 @@ fn metal_available() -> bool {
     MetalState::get().is_ok()
 }
 
-// =============================================================================
-// K/V pool builders. Layouts mirror the single-row kernel exactly because
-// the varlen kernel reuses the same K/V pool format — only the Q layout
-// changes.
-// =============================================================================
-
-/// `[num_blocks, num_kv_heads, head_size/x_pack, block_size, x_pack]`
-fn build_k_pool_bf16(
-    k_per_token: &[f32],
-    context_len: usize,
-    head_size: usize,
-    num_kv_heads: usize,
-    block_size: usize,
-    num_blocks: usize,
-    x_pack: usize,
-) -> Vec<u16> {
-    let head_per_block = (head_size / x_pack) * block_size * x_pack;
-    let stride_block = num_kv_heads * head_per_block;
-    let stride_head = head_per_block;
-    let stride_xidx = block_size * x_pack;
-    let stride_blockoff = x_pack;
-    let mut pool = vec![0u16; num_blocks * stride_block];
-    for t in 0..context_len {
-        let block_idx = t / block_size;
-        let block_offset = t % block_size;
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let x_idx = j / x_pack;
-                let x_offset = j % x_pack;
-                let pool_idx = block_idx * stride_block
-                    + h * stride_head
-                    + x_idx * stride_xidx
-                    + block_offset * stride_blockoff
-                    + x_offset;
-                let token_idx = t * num_kv_heads * head_size + h * head_size + j;
-                pool[pool_idx] = f32_to_bf16_bits(k_per_token[token_idx]);
-            }
-        }
-    }
-    pool
+fn from_bf16(data: &[u16], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_bfloat16(data.as_ptr(), shape.as_ptr(), shape.len()) })
 }
 
-/// `[num_blocks, num_kv_heads, head_size, block_size]`
-fn build_v_pool_bf16(
-    v_per_token: &[f32],
-    context_len: usize,
-    head_size: usize,
-    num_kv_heads: usize,
-    block_size: usize,
-    num_blocks: usize,
-) -> Vec<u16> {
-    let head_per_block = head_size * block_size;
-    let stride_block = num_kv_heads * head_per_block;
-    let stride_head = head_per_block;
-    let stride_j = block_size;
-    let mut pool = vec![0u16; num_blocks * stride_block];
-    for t in 0..context_len {
-        let block_idx = t / block_size;
-        let block_offset = t % block_size;
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let pool_idx =
-                    block_idx * stride_block + h * stride_head + j * stride_j + block_offset;
-                let token_idx = t * num_kv_heads * head_size + h * head_size + j;
-                pool[pool_idx] = f32_to_bf16_bits(v_per_token[token_idx]);
-            }
+fn from_f32(data: &[f32], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_float32(data.as_ptr(), shape.as_ptr(), shape.len()) })
+}
+
+fn from_i32(data: &[i32], shape: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_int32(data.as_ptr(), shape.as_ptr(), shape.len()) })
+}
+
+fn from_i64(data: &[i64]) -> Owned {
+    Owned(unsafe { mlx_sys::mlx_array_from_int64(data.as_ptr(), [data.len() as i64].as_ptr(), 1) })
+}
+
+fn to_f32(array: &Owned) -> Vec<f32> {
+    let len = unsafe { mlx_sys::mlx_array_size(array.0) };
+    let mut out = vec![0.0f32; len];
+    assert!(unsafe { mlx_sys::mlx_array_to_float32(array.0, out.as_mut_ptr(), out.len()) });
+    out
+}
+
+/// A BF16 `LayerKVPool` populated with one or more sequences' synthetic K/V via
+/// `mlx_paged_kv_write_forward`.
+struct FilledPool {
+    _pool: LayerKVPool,
+    k_pool: Owned,
+    v_pool: Owned,
+    k_scale: Owned,
+    v_scale: Owned,
+    block_table: Vec<i32>,
+    max_blocks_per_seq: usize,
+}
+
+fn fill_bf16_pool(
+    k_per_seq: &[Vec<f32>],
+    v_per_seq: &[Vec<f32>],
+    context_lens: &[u32],
+    head_size: u32,
+    num_kv_heads: u32,
+    block_size: u32,
+) -> FilledPool {
+    let max_blocks_per_seq = context_lens
+        .iter()
+        .map(|&c| c.div_ceil(block_size))
+        .max()
+        .unwrap();
+
+    let mut block_table = Vec::new();
+    let mut seq_start_blocks = Vec::with_capacity(context_lens.len());
+    let mut next_block: u32 = 0;
+    for &ctx in context_lens {
+        let n_blocks = ctx.div_ceil(block_size);
+        seq_start_blocks.push(next_block);
+        let mut row: Vec<i32> = (next_block..next_block + n_blocks)
+            .map(|b| b as i32)
+            .collect();
+        while row.len() < max_blocks_per_seq as usize {
+            row.push((next_block + n_blocks - 1) as i32);
+        }
+        block_table.extend(row);
+        next_block += n_blocks;
+    }
+    let total_blocks = next_block;
+
+    let config = PagedAttentionConfig {
+        block_size,
+        gpu_memory_mb: 256,
+        head_size,
+        num_kv_heads,
+        num_layers: 1,
+        max_seq_len: Some(max_blocks_per_seq * block_size),
+        max_batch_size: Some(context_lens.len() as u32),
+    };
+    let pool = LayerKVPool::new(config, total_blocks, total_blocks, MetalDtype::BFloat16)
+        .expect("LayerKVPool::new must succeed");
+
+    // Concatenate every sequence's K/V and build the matching flat slot_mapping.
+    let total_tokens: usize = context_lens.iter().map(|&c| c as usize).sum();
+    let stride = (num_kv_heads * head_size) as usize;
+    let mut all_k_bf16 = Vec::with_capacity(total_tokens * stride);
+    let mut all_v_bf16 = Vec::with_capacity(total_tokens * stride);
+    let mut slots = Vec::with_capacity(total_tokens);
+    for (s, &ctx) in context_lens.iter().enumerate() {
+        let base_block = seq_start_blocks[s] as i64;
+        all_k_bf16.extend(k_per_seq[s].iter().copied().map(f32_to_bf16_bits));
+        all_v_bf16.extend(v_per_seq[s].iter().copied().map(f32_to_bf16_bits));
+        for t in 0..ctx as i64 {
+            let block_idx = base_block + t / block_size as i64;
+            let block_offset = t % block_size as i64;
+            slots.push(block_idx * block_size as i64 + block_offset);
         }
     }
-    pool
+
+    let kv_shape = [total_tokens as i64, num_kv_heads as i64, head_size as i64];
+    let new_k = from_bf16(&all_k_bf16, &kv_shape);
+    let new_v = from_bf16(&all_v_bf16, &kv_shape);
+    let slot_mapping = from_i64(&slots);
+    let k_pool_in = Owned(pool.key_cache_array_raw(0).expect("key_cache_array_raw"));
+    let v_pool_in = Owned(
+        pool.value_cache_array_raw(0)
+            .expect("value_cache_array_raw"),
+    );
+    let k_scale_in = from_f32(&[1.0], &[1]);
+    let v_scale_in = from_f32(&[1.0], &[1]);
+
+    let mut out = [std::ptr::null_mut::<mlx_array>(); 4];
+    let [k_out, v_out, ks_out, vs_out] = &mut out;
+    let ok = unsafe {
+        mlx_sys::mlx_paged_kv_write_forward(
+            k_pool_in.0,
+            v_pool_in.0,
+            new_k.0,
+            new_v.0,
+            slot_mapping.0,
+            k_scale_in.0,
+            v_scale_in.0,
+            block_size as i32,
+            num_kv_heads as i32,
+            head_size as i32,
+            KV_DTYPE_BF16,
+            false,
+            k_out,
+            v_out,
+            ks_out,
+            vs_out,
+        )
+    };
+    assert!(ok, "mlx_paged_kv_write_forward must succeed");
+    let written = out.map(Owned);
+    let mut handles = out;
+    assert!(unsafe { mlx_sys::mlx_eval(handles.as_mut_ptr(), 4) });
+    let [k_pool, v_pool, k_scale, v_scale] = written;
+
+    FilledPool {
+        _pool: pool,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        block_table,
+        max_blocks_per_seq: max_blocks_per_seq as usize,
+    }
 }
 
 /// Host-side reference for a single query token attending to
@@ -182,6 +269,62 @@ fn build_synthetic_kv(context_len: usize, head_size: usize, seed: f32) -> (Vec<f
     (k, v)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_varlen(
+    filled: &FilledPool,
+    q_bf16: &[u16],
+    total_queries: usize,
+    context_lens: &[u32],
+    cu_seqlens_q: &[i32],
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_size: u32,
+    block_size: u32,
+    scale: f32,
+) -> Vec<f32> {
+    let q_arr = from_bf16(
+        q_bf16,
+        &[total_queries as i64, num_heads as i64, head_size as i64],
+    );
+    let block_table = from_i32(
+        &filled.block_table,
+        &[context_lens.len() as i64, filled.max_blocks_per_seq as i64],
+    );
+    let seq_lens_i32: Vec<i32> = context_lens.iter().map(|&c| c as i32).collect();
+    let seq_lens = from_i32(&seq_lens_i32, &[context_lens.len() as i64]);
+    let cu_seqlens = from_i32(cu_seqlens_q, &[cu_seqlens_q.len() as i64]);
+
+    let out = unsafe {
+        mlx_sys::mlx_paged_attention_varlen_forward(
+            q_arr.0,
+            filled.k_pool.0,
+            filled.v_pool.0,
+            block_table.0,
+            seq_lens.0,
+            cu_seqlens.0,
+            filled.k_scale.0,
+            filled.v_scale.0,
+            scale,
+            /* softcap */ 0.0,
+            /* sliding_window */ 0,
+            block_size as i32,
+            num_heads as i32,
+            num_kv_heads as i32,
+            head_size as i32,
+            KV_DTYPE_BF16,
+            std::ptr::null_mut(),
+        )
+    };
+    assert!(
+        !out.is_null(),
+        "mlx_paged_attention_varlen_forward must succeed"
+    );
+    let out = Owned(out);
+    let mut handles = [out.0];
+    assert!(unsafe { mlx_sys::mlx_eval(handles.as_mut_ptr(), 1) });
+    to_f32(&out)
+}
+
 // =============================================================================
 // Test 1 — Parity vs single-row kernel for the single-seq T=1 case.
 //
@@ -198,141 +341,70 @@ fn varlen_t1_matches_single_row_kernel() {
         eprintln!("skipping varlen_t1_matches_single_row_kernel: Metal unavailable");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available");
 
     const HEAD_SIZE: u32 = 64;
     const NUM_HEADS: u32 = 1;
     const NUM_KV_HEADS: u32 = 1;
     const BLOCK_SIZE: u32 = 16;
     const CONTEXT_LEN: u32 = 32;
-    const NUM_BLOCKS: u32 = 2;
-    const X_PACK: u32 = 8;
 
     let (k_per_token, v_per_token) =
         build_synthetic_kv(CONTEXT_LEN as usize, HEAD_SIZE as usize, 0.0);
     let q: Vec<f32> = (0..HEAD_SIZE).map(|d| 0.7 + 0.01 * d as f32).collect();
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
-
     let q_bf16: Vec<u16> = q.iter().copied().map(f32_to_bf16_bits).collect();
-    let k_pool = build_k_pool_bf16(
-        &k_per_token,
-        CONTEXT_LEN as usize,
-        HEAD_SIZE as usize,
-        NUM_KV_HEADS as usize,
-        BLOCK_SIZE as usize,
-        NUM_BLOCKS as usize,
-        X_PACK as usize,
+
+    let filled = fill_bf16_pool(
+        &[k_per_token],
+        &[v_per_token],
+        &[CONTEXT_LEN],
+        HEAD_SIZE,
+        NUM_KV_HEADS,
+        BLOCK_SIZE,
     );
-    let v_pool = build_v_pool_bf16(
-        &v_per_token,
-        CONTEXT_LEN as usize,
-        HEAD_SIZE as usize,
-        NUM_KV_HEADS as usize,
-        BLOCK_SIZE as usize,
-        NUM_BLOCKS as usize,
-    );
-
-    let block_table: Vec<u32> = vec![0, 1];
-    let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
-    let cu_seqlens_q: Vec<i32> = vec![0, 1];
-
-    let key_pool = state
-        .device
-        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let q_buf = state
-        .device
-        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let block_table_buf = state
-        .device
-        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let seq_lens_buf = state
-        .device
-        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let cu_seqlens_q_buf = state
-        .device
-        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
-    let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
-    let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
-    let kv_head_stride = (HEAD_SIZE * BLOCK_SIZE) as i32;
 
     // Single-row baseline.
-    let baseline_params = PagedAttentionParams {
-        num_seqs: 1,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
-        block_size: BLOCK_SIZE,
-        max_seq_len: CONTEXT_LEN,
-        max_num_blocks_per_seq: block_table.len() as u32,
-        scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window: 0,
-    };
-    let q_raw = RawBufferInfo {
-        ptr: q_buf.as_ptr() as *mut std::ffi::c_void,
-        offset: 0,
-    };
+    let q_arr = from_bf16(&q_bf16, &[1, NUM_HEADS as i64, HEAD_SIZE as i64]);
+    let block_table = from_i32(&filled.block_table, &[1, filled.max_blocks_per_seq as i64]);
+    let seq_lens = from_i32(&[CONTEXT_LEN as i32], &[1]);
     let baseline_out = unsafe {
-        dispatch_paged_attention_v1_raw(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &baseline_params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
+        mlx_sys::mlx_paged_attention_forward(
+            q_arr.0,
+            filled.k_pool.0,
+            filled.v_pool.0,
+            block_table.0,
+            seq_lens.0,
+            filled.k_scale.0,
+            filled.v_scale.0,
+            scale,
+            /* softcap */ 0.0,
+            /* sliding_window */ 0,
+            BLOCK_SIZE as i32,
+            NUM_HEADS as i32,
+            NUM_KV_HEADS as i32,
+            HEAD_SIZE as i32,
+            KV_DTYPE_BF16,
         )
-    }
-    .expect("single-row dispatch must succeed");
+    };
+    assert!(!baseline_out.is_null(), "single-row dispatch must succeed");
+    let baseline_out = Owned(baseline_out);
+    let mut handles = [baseline_out.0];
+    assert!(unsafe { mlx_sys::mlx_eval(handles.as_mut_ptr(), 1) });
+    let baseline_host = to_f32(&baseline_out);
 
     // Varlen path.
-    let varlen_params = PagedAttentionVarlenParams {
-        num_seqs: 1,
-        total_queries: 1,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
-        block_size: BLOCK_SIZE,
-        max_seq_len: CONTEXT_LEN,
-        max_num_blocks_per_seq: block_table.len() as u32,
+    let varlen_host = run_varlen(
+        &filled,
+        &q_bf16,
+        1,
+        &[CONTEXT_LEN],
+        &[0, 1],
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
         scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window: 0,
-    };
-    let varlen_out = unsafe {
-        dispatch_paged_attention_varlen_v1_raw(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &cu_seqlens_q_buf,
-            &varlen_params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-        )
-    }
-    .expect("varlen dispatch must succeed");
-
-    let baseline_host = read_output_bf16(state, &baseline_out.buffer, HEAD_SIZE as usize);
-    let varlen_host = read_output_bf16(state, &varlen_out.buffer, HEAD_SIZE as usize);
+    );
 
     let mut max_diff = 0.0f32;
     let mut max_idx = 0usize;
@@ -343,11 +415,6 @@ fn varlen_t1_matches_single_row_kernel() {
             max_idx = d;
         }
     }
-    // Both kernels perform fp32 accumulation over bf16 inputs and write
-    // bf16 output. The only divergence is potentially different reduction
-    // ordering inside the warps; in practice with identical NUM_THREADS
-    // and NUM_WARPS the order is identical and the bit pattern matches.
-    // Allow a generous safety margin for any future tuning differences.
     let tol = 1.0e-3_f32;
     assert!(
         max_diff < tol,
@@ -358,49 +425,11 @@ fn varlen_t1_matches_single_row_kernel() {
     );
 }
 
-fn read_output_bf16(state: &MetalState, buf: &metal::Buffer, count: usize) -> Vec<f32> {
-    let bytes = count * std::mem::size_of::<u16>();
-    let shared = state
-        .device
-        .try_new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-    let cmd = state
-        .command_queue
-        .try_new_command_buffer()
-        .expect("test command queue must provide a command buffer");
-    let blit = cmd
-        .try_new_blit_command_encoder()
-        .expect("test command buffer must provide a blit encoder");
-    blit.copy_from_buffer(buf, 0, &shared, 0, bytes as u64);
-    blit.end_encoding();
-    cmd.commit();
-    cmd.wait_until_completed();
-    let slice = unsafe { std::slice::from_raw_parts(shared.contents() as *const u16, count) };
-    slice.iter().map(|&b| bf16_bits_to_f32(b)).collect()
-}
-
 // =============================================================================
 // Test 2 — Ragged batch against host reference.
 //
 // 3 sequences: q_lens [1, 2, 4], context_lens [16, 17, 32].
 // cu_seqlens_q = [0, 1, 3, 7], total_queries = 7.
-//
-// For each query token i we compute:
-//     seq_idx = find_seq_idx(cu_seqlens_q, i)
-//     q_pos_in_seq = i - cu_seqlens_q[seq_idx]
-//     q_len = cu_seqlens_q[seq_idx+1] - cu_seqlens_q[seq_idx]
-//     effective_ctx = context_lens[seq_idx] - q_len + q_pos_in_seq + 1
-// and reference-compute attention restricted to the first effective_ctx
-// KV positions.
-//
-// Expected effective_ctx values:
-//   q=0: seq=0, q_pos=0, q_len=1, ctx=16 -> eff = 16
-//   q=1: seq=1, q_pos=0, q_len=2, ctx=17 -> eff = 16
-//   q=2: seq=1, q_pos=1, q_len=2, ctx=17 -> eff = 17
-//   q=3: seq=2, q_pos=0, q_len=4, ctx=32 -> eff = 29
-//   q=4: seq=2, q_pos=1, q_len=4, ctx=32 -> eff = 30
-//   q=5: seq=2, q_pos=2, q_len=4, ctx=32 -> eff = 31
-//   q=6: seq=2, q_pos=3, q_len=4, ctx=32 -> eff = 32
 // =============================================================================
 
 #[test]
@@ -409,16 +438,14 @@ fn varlen_ragged_batch_matches_host_reference() {
         eprintln!("skipping varlen_ragged_batch_matches_host_reference: Metal unavailable");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available");
 
     const HEAD_SIZE: u32 = 64;
     const NUM_HEADS: u32 = 1;
     const NUM_KV_HEADS: u32 = 1;
     const BLOCK_SIZE: u32 = 16;
-    const X_PACK: u32 = 8;
 
-    let q_lens = vec![1u32, 2, 4];
-    let context_lens = vec![16u32, 17, 32];
+    let q_lens = [1u32, 2, 4];
+    let context_lens = [16u32, 17, 32];
     let cu_seqlens_q: Vec<i32> = {
         let mut v = vec![0i32];
         let mut acc = 0i32;
@@ -428,173 +455,49 @@ fn varlen_ragged_batch_matches_host_reference() {
         }
         v
     };
-    let total_queries: u32 = q_lens.iter().sum();
-    let num_seqs: u32 = q_lens.len() as u32;
-    let max_context_len: u32 = *context_lens.iter().max().unwrap();
+    let total_queries: usize = q_lens.iter().map(|&q| q as usize).sum();
 
-    // Per-sequence K/V (each gets its own seed so attention scores
-    // depend on which sequence the kernel ends up looking up).
-    let mut k_per_seq: Vec<Vec<f32>> = Vec::with_capacity(num_seqs as usize);
-    let mut v_per_seq: Vec<Vec<f32>> = Vec::with_capacity(num_seqs as usize);
+    let mut k_per_seq = Vec::with_capacity(context_lens.len());
+    let mut v_per_seq = Vec::with_capacity(context_lens.len());
     for (s, &ctx) in context_lens.iter().enumerate() {
         let (k, v) = build_synthetic_kv(ctx as usize, HEAD_SIZE as usize, s as f32 + 1.0);
         k_per_seq.push(k);
         v_per_seq.push(v);
     }
 
-    // Lay out a SHARED pool with enough blocks for all sequences. Each
-    // sequence gets ceil(ctx / BLOCK_SIZE) blocks. Block-table maps
-    // global block indices.
-    let mut block_table: Vec<u32> = Vec::new();
-    let mut blocks_per_seq: Vec<u32> = Vec::new();
-    let max_blocks_per_seq: u32 = context_lens
-        .iter()
-        .map(|&c| c.div_ceil(BLOCK_SIZE))
-        .max()
-        .unwrap();
-    let mut next_block: u32 = 0;
-    for &ctx in &context_lens {
-        let n_blocks = ctx.div_ceil(BLOCK_SIZE);
-        blocks_per_seq.push(n_blocks);
-        // Pad to max_blocks_per_seq with the last allocated block (the
-        // kernel never reads past num_context_blocks, so the padding
-        // value doesn't matter but must be in-bounds).
-        let mut row: Vec<u32> = (next_block..next_block + n_blocks).collect();
-        while row.len() < max_blocks_per_seq as usize {
-            row.push(next_block + n_blocks - 1);
-        }
-        block_table.extend(row);
-        next_block += n_blocks;
-    }
-    let total_blocks = next_block;
+    let filled = fill_bf16_pool(
+        &k_per_seq,
+        &v_per_seq,
+        &context_lens,
+        HEAD_SIZE,
+        NUM_KV_HEADS,
+        BLOCK_SIZE,
+    );
 
-    // Allocate the K/V pool and write each sequence's K/V into the
-    // physical blocks it owns. Reuse the single-seq pool builder for
-    // each sequence's slice of the global pool.
-    let head_per_block_k =
-        (HEAD_SIZE as usize / X_PACK as usize) * BLOCK_SIZE as usize * X_PACK as usize;
-    let stride_block_k = NUM_KV_HEADS as usize * head_per_block_k;
-    let head_per_block_v = HEAD_SIZE as usize * BLOCK_SIZE as usize;
-    let stride_block_v = NUM_KV_HEADS as usize * head_per_block_v;
-    let mut k_pool = vec![0u16; total_blocks as usize * stride_block_k];
-    let mut v_pool = vec![0u16; total_blocks as usize * stride_block_v];
-
-    let mut block_cursor: usize = 0;
-    for (s, &ctx) in context_lens.iter().enumerate() {
-        let n_blocks = blocks_per_seq[s] as usize;
-        let local_k = build_k_pool_bf16(
-            &k_per_seq[s],
-            ctx as usize,
-            HEAD_SIZE as usize,
-            NUM_KV_HEADS as usize,
-            BLOCK_SIZE as usize,
-            n_blocks,
-            X_PACK as usize,
-        );
-        let local_v = build_v_pool_bf16(
-            &v_per_seq[s],
-            ctx as usize,
-            HEAD_SIZE as usize,
-            NUM_KV_HEADS as usize,
-            BLOCK_SIZE as usize,
-            n_blocks,
-        );
-        let k_dst =
-            &mut k_pool[block_cursor * stride_block_k..(block_cursor + n_blocks) * stride_block_k];
-        k_dst.copy_from_slice(&local_k);
-        let v_dst =
-            &mut v_pool[block_cursor * stride_block_v..(block_cursor + n_blocks) * stride_block_v];
-        v_dst.copy_from_slice(&local_v);
-        block_cursor += n_blocks;
-    }
-
-    // Per-query distinct Q vectors (so the kernel must look up the right
-    // q_token_idx-th row from the ragged buffer).
-    let mut q_host_f32 = vec![0.0f32; total_queries as usize * HEAD_SIZE as usize];
-    for q in 0..total_queries as usize {
+    let mut q_host_f32 = vec![0.0f32; total_queries * HEAD_SIZE as usize];
+    for q in 0..total_queries {
         for d in 0..HEAD_SIZE as usize {
             q_host_f32[q * HEAD_SIZE as usize + d] = 0.3 + 0.05 * (q as f32) + 0.005 * (d as f32);
         }
     }
     let q_host_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
-    let key_pool = state
-        .device
-        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let q_buf = state
-        .device
-        .try_new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let block_table_buf = state
-        .device
-        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let seq_lens_buf = state
-        .device
-        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let cu_seqlens_q_buf = state
-        .device
-        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
-    let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
-    let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
-    let kv_head_stride = (HEAD_SIZE * BLOCK_SIZE) as i32;
-
-    let params = PagedAttentionVarlenParams {
-        num_seqs,
+    let kernel_out = run_varlen(
+        &filled,
+        &q_host_bf16,
         total_queries,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
-        block_size: BLOCK_SIZE,
-        max_seq_len: max_context_len,
-        max_num_blocks_per_seq: max_blocks_per_seq,
+        &context_lens,
+        &cu_seqlens_q,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
         scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window: 0,
-    };
-    let q_raw = RawBufferInfo {
-        ptr: q_buf.as_ptr() as *mut std::ffi::c_void,
-        offset: 0,
-    };
-    let varlen_out = unsafe {
-        dispatch_paged_attention_varlen_auto(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &cu_seqlens_q_buf,
-            max_context_len,
-            &params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-        )
-    }
-    .expect("ragged varlen dispatch must succeed");
-
-    let kernel_out = read_output_bf16(
-        state,
-        &varlen_out.buffer,
-        (total_queries * HEAD_SIZE) as usize,
     );
 
-    // Host reference: walk every query token, compute effective_ctx,
-    // and reference-attend over the matching sequence's K/V.
     let tol = 5.0e-2_f32;
-    for q_token_idx in 0..total_queries as usize {
-        // Find sequence index (mirrors the kernel's binary search).
+    for q_token_idx in 0..total_queries {
         let seq_idx = cu_seqlens_q
             .iter()
             .position(|&v| v > q_token_idx as i32)
@@ -608,9 +511,6 @@ fn varlen_ragged_batch_matches_host_reference() {
 
         let q_slice =
             &q_host_f32[q_token_idx * HEAD_SIZE as usize..(q_token_idx + 1) * HEAD_SIZE as usize];
-
-        // Round Q to bf16 then back so the host ref sees the same input
-        // the kernel sees (Q is stored as bf16 in q_buf).
         let q_round: Vec<f32> = q_slice
             .iter()
             .map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x)))
@@ -662,167 +562,59 @@ fn varlen_v2_high_partition_matches_host_reference() {
         eprintln!("skipping varlen_v2_high_partition_matches_host_reference: Metal unavailable");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available");
 
     const HEAD_SIZE: u32 = 64;
     const NUM_HEADS: u32 = 1;
     const NUM_KV_HEADS: u32 = 1;
     const BLOCK_SIZE: u32 = 16;
-    const X_PACK: u32 = 8;
 
     let q_lens = [1u32, 3];
     let context_lens = [1024u32, 1024];
-    let cu_seqlens_q: Vec<i32> = vec![0, 1, 4];
-    let total_queries: u32 = q_lens.iter().sum();
-    let num_seqs: u32 = q_lens.len() as u32;
-    let max_context_len: u32 = *context_lens.iter().max().unwrap();
-    let max_blocks_per_seq: u32 = max_context_len.div_ceil(BLOCK_SIZE);
+    let cu_seqlens_q = [0i32, 1, 4];
+    let total_queries: usize = q_lens.iter().map(|&q| q as usize).sum();
 
-    let mut k_per_seq: Vec<Vec<f32>> = Vec::with_capacity(num_seqs as usize);
-    let mut v_per_seq: Vec<Vec<f32>> = Vec::with_capacity(num_seqs as usize);
+    let mut k_per_seq = Vec::with_capacity(context_lens.len());
+    let mut v_per_seq = Vec::with_capacity(context_lens.len());
     for (s, &ctx) in context_lens.iter().enumerate() {
         let (k, v) = build_synthetic_kv(ctx as usize, HEAD_SIZE as usize, s as f32 + 2.0);
         k_per_seq.push(k);
         v_per_seq.push(v);
     }
 
-    let mut block_table: Vec<u32> = Vec::new();
-    let mut next_block: u32 = 0;
-    for &ctx in &context_lens {
-        let n = ctx.div_ceil(BLOCK_SIZE);
-        let mut row: Vec<u32> = (next_block..next_block + n).collect();
-        while row.len() < max_blocks_per_seq as usize {
-            row.push(next_block + n - 1);
-        }
-        block_table.extend(row);
-        next_block += n;
-    }
-    let total_blocks = next_block;
+    let filled = fill_bf16_pool(
+        &k_per_seq,
+        &v_per_seq,
+        &context_lens,
+        HEAD_SIZE,
+        NUM_KV_HEADS,
+        BLOCK_SIZE,
+    );
 
-    let head_per_block_k =
-        (HEAD_SIZE as usize / X_PACK as usize) * BLOCK_SIZE as usize * X_PACK as usize;
-    let stride_block_k = NUM_KV_HEADS as usize * head_per_block_k;
-    let head_per_block_v = HEAD_SIZE as usize * BLOCK_SIZE as usize;
-    let stride_block_v = NUM_KV_HEADS as usize * head_per_block_v;
-    let mut k_pool = vec![0u16; total_blocks as usize * stride_block_k];
-    let mut v_pool = vec![0u16; total_blocks as usize * stride_block_v];
-    let mut block_cursor: usize = 0;
-    for (s, &ctx) in context_lens.iter().enumerate() {
-        let n = ctx.div_ceil(BLOCK_SIZE) as usize;
-        let local_k = build_k_pool_bf16(
-            &k_per_seq[s],
-            ctx as usize,
-            HEAD_SIZE as usize,
-            NUM_KV_HEADS as usize,
-            BLOCK_SIZE as usize,
-            n,
-            X_PACK as usize,
-        );
-        let local_v = build_v_pool_bf16(
-            &v_per_seq[s],
-            ctx as usize,
-            HEAD_SIZE as usize,
-            NUM_KV_HEADS as usize,
-            BLOCK_SIZE as usize,
-            n,
-        );
-        k_pool[block_cursor * stride_block_k..(block_cursor + n) * stride_block_k]
-            .copy_from_slice(&local_k);
-        v_pool[block_cursor * stride_block_v..(block_cursor + n) * stride_block_v]
-            .copy_from_slice(&local_v);
-        block_cursor += n;
-    }
-
-    let mut q_host_f32 = vec![0.0f32; total_queries as usize * HEAD_SIZE as usize];
-    for q in 0..total_queries as usize {
+    let mut q_host_f32 = vec![0.0f32; total_queries * HEAD_SIZE as usize];
+    for q in 0..total_queries {
         for d in 0..HEAD_SIZE as usize {
             q_host_f32[q * HEAD_SIZE as usize + d] = 0.2 + 0.07 * (q as f32) + 0.003 * (d as f32);
         }
     }
     let q_host_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
-    let key_pool = state
-        .device
-        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let q_buf = state
-        .device
-        .try_new_buffer_with_slice(q_host_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let block_table_buf = state
-        .device
-        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let seq_lens_buf = state
-        .device
-        .try_new_buffer_with_slice(context_lens.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let cu_seqlens_q_buf = state
-        .device
-        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
-    let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
-    let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
-    let kv_head_stride = (HEAD_SIZE * BLOCK_SIZE) as i32;
-
-    let params = PagedAttentionVarlenParams {
-        num_seqs,
+    let kernel_out = run_varlen(
+        &filled,
+        &q_host_bf16,
         total_queries,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
-        block_size: BLOCK_SIZE,
-        max_seq_len: max_context_len,
-        max_num_blocks_per_seq: max_blocks_per_seq,
+        &context_lens,
+        &cu_seqlens_q,
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
         scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window: 0,
-    };
-    let q_raw = RawBufferInfo {
-        ptr: q_buf.as_ptr() as *mut std::ffi::c_void,
-        offset: 0,
-    };
-    let varlen_out = unsafe {
-        dispatch_paged_attention_varlen_auto(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &cu_seqlens_q_buf,
-            max_context_len,
-            &params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-        )
-    }
-    .expect("v2 ragged dispatch must succeed");
-
-    let kernel_out = read_output_bf16(
-        state,
-        &varlen_out.buffer,
-        (total_queries * HEAD_SIZE) as usize,
     );
 
-    // V2 stores per-partition outputs in bf16 (io_dtype), then the reduce
-    // kernel re-weights them in fp32 and writes bf16 again. With 1024
-    // context length the bf16 round-trip on partition outputs caps
-    // achievable precision to ~1% relative — looser than the V1 5e-2
-    // absolute tolerance because the output magnitudes here are larger
-    // (~25-50 vs ~3 in the V1 test). Use a relative-or-absolute tolerance
-    // that matches what the single-row V2 path also achieves.
     let rel_tol = 1.5e-2_f32;
     let abs_tol = 5.0e-2_f32;
-    for q_token_idx in 0..total_queries as usize {
+    for q_token_idx in 0..total_queries {
         let seq_idx = cu_seqlens_q
             .iter()
             .position(|&v| v > q_token_idx as i32)
@@ -882,13 +674,6 @@ fn varlen_v2_high_partition_matches_host_reference() {
 // total_queries=2. The two query tokens have DIFFERENT effective_ctx:
 //   q=0 (q_pos=0): eff = 32 - 2 + 0 + 1 = 31
 //   q=1 (q_pos=1): eff = 32 - 2 + 1 + 1 = 32
-// So they attend to overlapping but distinct KV windows. With distinct
-// Q vectors the outputs must differ, AND the q=0 output must NOT depend
-// on KV[31] (the last token) — a kernel that ignores the per-query
-// cutoff would fold KV[31] into q=0's output and the cross-check fails.
-//
-// We verify (a) the two outputs differ, and (b) the q=0 output matches
-// the host reference that masks KV[31].
 // =============================================================================
 
 #[test]
@@ -897,21 +682,17 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
         eprintln!("skipping varlen_per_query_causal_cutoff_is_enforced: Metal unavailable");
         return;
     }
-    let state = MetalState::get().expect("Metal must be available");
 
     const HEAD_SIZE: u32 = 64;
     const NUM_HEADS: u32 = 1;
     const NUM_KV_HEADS: u32 = 1;
     const BLOCK_SIZE: u32 = 16;
     const CONTEXT_LEN: u32 = 32;
-    const NUM_BLOCKS: u32 = 2;
-    const X_PACK: u32 = 8;
 
-    let (k_per_token, v_per_token) =
+    let (k_per_token, mut v_per_token) =
         build_synthetic_kv(CONTEXT_LEN as usize, HEAD_SIZE as usize, 3.0);
     // Make KV[31] very large in V so a kernel that incorrectly
     // includes it in q=0's attention would shift the output noticeably.
-    let mut v_per_token = v_per_token;
     for d in 0..HEAD_SIZE as usize {
         v_per_token[31 * HEAD_SIZE as usize + d] = 100.0 + d as f32;
     }
@@ -923,99 +704,31 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
     }
     let q_bf16: Vec<u16> = q_host_f32.iter().copied().map(f32_to_bf16_bits).collect();
 
-    let k_pool = build_k_pool_bf16(
-        &k_per_token,
-        CONTEXT_LEN as usize,
-        HEAD_SIZE as usize,
-        NUM_KV_HEADS as usize,
-        BLOCK_SIZE as usize,
-        NUM_BLOCKS as usize,
-        X_PACK as usize,
+    let filled = fill_bf16_pool(
+        &[k_per_token.clone()],
+        &[v_per_token.clone()],
+        &[CONTEXT_LEN],
+        HEAD_SIZE,
+        NUM_KV_HEADS,
+        BLOCK_SIZE,
     );
-    let v_pool = build_v_pool_bf16(
-        &v_per_token,
-        CONTEXT_LEN as usize,
-        HEAD_SIZE as usize,
-        NUM_KV_HEADS as usize,
-        BLOCK_SIZE as usize,
-        NUM_BLOCKS as usize,
-    );
-
-    let cu_seqlens_q: Vec<i32> = vec![0, 2];
-    let block_table: Vec<u32> = vec![0, 1];
-    let seq_lens: Vec<u32> = vec![CONTEXT_LEN];
-
-    let key_pool = state
-        .device
-        .try_new_buffer_with_slice(k_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer_with_slice(v_pool.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let q_buf = state
-        .device
-        .try_new_buffer_with_slice(q_bf16.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let block_table_buf = state
-        .device
-        .try_new_buffer_with_slice(block_table.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let seq_lens_buf = state
-        .device
-        .try_new_buffer_with_slice(seq_lens.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let cu_seqlens_q_buf = state
-        .device
-        .try_new_buffer_with_slice(cu_seqlens_q.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
 
     let scale = 1.0f32 / (HEAD_SIZE as f32).sqrt();
-    let q_stride = (NUM_HEADS * HEAD_SIZE) as i32;
-    let kv_block_stride = (NUM_KV_HEADS * HEAD_SIZE * BLOCK_SIZE) as i32;
-    let kv_head_stride = (HEAD_SIZE * BLOCK_SIZE) as i32;
-
-    let params = PagedAttentionVarlenParams {
-        num_seqs: 1,
-        total_queries: 2,
-        num_heads: NUM_HEADS,
-        num_kv_heads: NUM_KV_HEADS,
-        head_size: HEAD_SIZE,
-        block_size: BLOCK_SIZE,
-        max_seq_len: CONTEXT_LEN,
-        max_num_blocks_per_seq: block_table.len() as u32,
+    let kernel_out = run_varlen(
+        &filled,
+        &q_bf16,
+        2,
+        &[CONTEXT_LEN],
+        &[0, 2],
+        NUM_HEADS,
+        NUM_KV_HEADS,
+        HEAD_SIZE,
+        BLOCK_SIZE,
         scale,
-        softcapping: 1.0,
-        q_stride,
-        kv_block_stride,
-        kv_head_stride,
-        sliding_window: 0,
-    };
-    let q_raw = RawBufferInfo {
-        ptr: q_buf.as_ptr() as *mut std::ffi::c_void,
-        offset: 0,
-    };
-    let out = unsafe {
-        dispatch_paged_attention_varlen_v1_raw(
-            &q_raw,
-            &key_pool,
-            &value_pool,
-            &block_table_buf,
-            &seq_lens_buf,
-            &cu_seqlens_q_buf,
-            &params,
-            MetalDtype::BFloat16,
-            MetalDtype::BFloat16,
-        )
-    }
-    .expect("varlen dispatch must succeed");
-
-    let kernel_out = read_output_bf16(state, &out.buffer, (2 * HEAD_SIZE) as usize);
+    );
     let q0_out = &kernel_out[0..HEAD_SIZE as usize];
     let q1_out = &kernel_out[HEAD_SIZE as usize..2 * HEAD_SIZE as usize];
 
-    // The two outputs MUST differ — distinct Q vectors and distinct
-    // effective_ctx ensure they sample different distributions.
     let q01_diff = q0_out
         .iter()
         .zip(q1_out.iter())
@@ -1027,9 +740,6 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
          is likely ignoring per-query effective_context_len"
     );
 
-    // q=0 reference: effective_ctx = 31, so KV[31] must be excluded.
-    // If the kernel mistakenly attends to KV[31] (V=100+) the output
-    // would be dragged up significantly.
     let q_round: Vec<f32> = q_host_f32[..HEAD_SIZE as usize]
         .iter()
         .map(|&x| bf16_bits_to_f32(f32_to_bf16_bits(x)))
@@ -1057,10 +767,6 @@ fn varlen_per_query_causal_cutoff_is_enforced() {
          into the early-window query"
     );
 
-    // Cross-check: if we accidentally attend to KV[31] for q=0, the
-    // output would be at least ~5 in magnitude (V[31] is 100+, softmax
-    // weight ~0.03 for one of 32 positions). Confirm q0 stays below
-    // that magnitude bound.
     let q0_max_magnitude = q0_out
         .iter()
         .copied()

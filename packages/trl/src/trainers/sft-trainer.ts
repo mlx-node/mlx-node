@@ -26,21 +26,13 @@
 import { existsSync, mkdirSync, writeFileSync, readFileSync, readdirSync, copyFileSync, rmSync } from 'node:fs';
 import { join, parse } from 'node:path';
 
-import {
-  SftTrainingEngine,
-  Qwen3Model,
-  Qwen35Model,
-  Qwen35MoeModel,
-  Qwen3Tokenizer,
-  MxArray,
-  type SftEngineConfig,
-  type SftStepMetrics,
-} from '@mlx-node/core';
+import { SftTrainingEngine, Qwen3Tokenizer, MxArray, type SftEngineConfig, type SftStepMetrics } from '@mlx-node/core';
 import { loadModel, type TrainableModel } from '@mlx-node/lm';
 
 import { SFTDataset, loadSFTDataset, type SFTBatch } from '../data/sft-dataset.js';
 import type { SFTTrainerConfig } from './sft-config.js';
 import { getDefaultSFTConfig, mergeSFTConfig } from './sft-config.js';
+import { createTrainingEngine, installTrainerSignalHandlers } from './trainer-utils.js';
 import { createTrainingLogger, type TrainingLogger } from './training-logger.js';
 
 // Re-export types
@@ -125,15 +117,7 @@ export class SFTTrainer {
       gradientCheckpointing: this.config.gradientCheckpointing,
     };
 
-    if (model instanceof Qwen35Model) {
-      this.engine = SftTrainingEngine.fromQwen35(model, engineConfig);
-    } else if (model instanceof Qwen35MoeModel) {
-      this.engine = SftTrainingEngine.fromQwen35Moe(model, engineConfig);
-    } else if (model instanceof Qwen3Model) {
-      this.engine = new SftTrainingEngine(model, engineConfig);
-    } else {
-      throw new Error(`Unsupported model type: ${(model as object).constructor?.name ?? typeof model}`);
-    }
+    this.engine = createTrainingEngine(SftTrainingEngine, model, engineConfig);
   }
 
   /**
@@ -144,29 +128,19 @@ export class SFTTrainer {
     if (this.signalHandlersInstalled) return;
     this.signalHandlersInstalled = true;
 
-    const gracefulShutdown = async (signal: string) => {
-      this.logger.warn(`Received ${signal}, initiating graceful shutdown...`);
-      this.stopRequested = true;
-
-      try {
+    installTrainerSignalHandlers({
+      logger: this.logger,
+      onStop: () => {
+        this.stopRequested = true;
+      },
+      onShutdown: async () => {
         if (this.config.outputDir && this.currentStep > 0) {
           this.logger.info(`Saving emergency checkpoint at step ${this.currentStep}...`);
           await this.saveCheckpoint(`emergency-checkpoint-${this.currentStep}`);
           this.logger.info('Emergency checkpoint saved.');
         }
-      } catch (e) {
-        console.error('Failed to save emergency checkpoint:', e);
-      }
-
-      process.exit(0);
-    };
-
-    process.on('SIGTERM', () => {
-      gracefulShutdown('SIGTERM').catch(console.error);
-    });
-
-    process.on('SIGINT', () => {
-      gracefulShutdown('SIGINT').catch(console.error);
+      },
+      errorMessage: 'Failed to save emergency checkpoint:',
     });
   }
 

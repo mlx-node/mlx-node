@@ -111,9 +111,6 @@ use crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER;
 /// and training state. Training commands are routed via `TrainingDispatch`.
 pub(crate) struct Qwen35MoeInner {
     pub(crate) config: Qwen3_5MoeConfig,
-    pub(crate) source_moe_policy: super::source_math_policy::SourceMoePolicy,
-    /// Immutable load-only arithmetic override; never shares ordinary SSD state.
-    pub(crate) source_norm_identity: Option<super::source_norms::SourceNormIdentity>,
     /// The in-flight turn's cooperative-cancel flag, installed by the sync and
     /// streaming session wrappers via [`ChatBackend::set_turn_cancel_flag`] and
     /// cleared (`None`) in their turn epilogue on every exit path. A set flag

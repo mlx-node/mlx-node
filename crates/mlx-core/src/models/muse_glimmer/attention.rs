@@ -372,17 +372,6 @@ impl MuseGlimmerAttention {
         let q = q.squeeze(Some(&[2]))?;
         let k = k.squeeze(Some(&[2]))?;
         let v = v.squeeze(Some(&[2]))?;
-        // Same contract as every other family's batched decode: no legacy
-        // fallback exists for the [N,1] multi-row path, so disabling either
-        // fast path refuses continuous batching rather than silently
-        // diverging from the flags' documented kill-switch semantics.
-        if !crate::transformer::paged_flags::native_kv_write_enabled()
-            || !crate::transformer::paged_flags::graph_decode_gather_enabled()
-        {
-            return Err(Error::from_reason(
-                "muse-glimmer batched decode requires MLX_PAGED_NATIVE_KV_WRITE=1 and MLX_PAGED_GRAPH_DECODE_GATHER=1",
-            ));
-        }
         adapter
             .update_keys_values_native_batched(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;
@@ -474,13 +463,6 @@ impl MuseGlimmerAttention {
         let q = q.squeeze(Some(&[2]))?;
         let k = k.squeeze(Some(&[2]))?;
         let v = v.squeeze(Some(&[2]))?;
-        if !crate::transformer::paged_flags::native_kv_write_enabled()
-            || !crate::transformer::paged_flags::graph_decode_gather_enabled()
-        {
-            return Err(Error::from_reason(
-                "muse-glimmer ragged decode requires MLX_PAGED_NATIVE_KV_WRITE=1 and MLX_PAGED_GRAPH_DECODE_GATHER=1",
-            ));
-        }
         adapter
             .update_keys_values_native_ragged(paged_idx, &k, &v, rows)
             .map_err(Error::from_reason)?;

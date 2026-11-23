@@ -114,7 +114,6 @@ extern "C" bool mlx_test_bridge_metallib_check(const char *family,
       names = {"splash_moe_route", "splash_moe_group", "splash_moe_gather",
           "splash_moe_gate_up_8", "splash_moe_gate_up_32",
           "splash_moe_down_8", "splash_moe_down_32",
-          "splash_moe_gate_up_source_8", "splash_moe_down_source_8",
           "splash_moe_combine", "splash_moe_probe_scatter",
           "splash_moe_gather_sg8", "splash_moe_gate_up_sg8",
           "splash_moe_down_sg8", "splash_moe_sg8_pack_probe"};

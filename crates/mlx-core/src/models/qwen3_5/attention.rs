@@ -1,4 +1,3 @@
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use crate::array::attention::{scaled_dot_product_attention, scaled_dot_product_attention_causal};
@@ -13,7 +12,6 @@ use crate::models::paddleocr_vl::language::{
 use crate::nn::rope_scaling::{RopeScaling, rotary_inverse_frequencies};
 use crate::nn::{Activations, Linear, RMSNorm, RoPE};
 use crate::transformer::KVCache;
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, SeqId};
 use napi::bindgen_prelude::*;
 
@@ -47,8 +45,6 @@ pub struct Qwen3_5Attention {
 
     q_norm: RMSNorm, // [head_dim]
     k_norm: RMSNorm, // [head_dim]
-    // Alternate load-captured operands; native norm parameters remain intact.
-    source_qk: Option<(MxArray, MxArray, MxArray)>,
 
     rope: RoPE,
     /// Optional M-RoPE for VLM mode (3D position encoding: temporal, height, width)
@@ -91,9 +87,6 @@ pub struct Qwen3_5Attention {
     /// merged buffer is the only resident copy.
     kv_proj: Option<(LinearProj, i64)>,
 }
-
-static NATIVE_KV_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
-static DECODE_GATHER_FALLBACK_REPORTED: AtomicBool = AtomicBool::new(false);
 
 /// The queries one read took, from the adapter's `[bf16, int8]` counters
 /// before and after it.
@@ -188,70 +181,21 @@ pub(super) fn paged_store(
     let report_prefill = inference_info_enabled && prefill && attn_layer_idx == 0 && seq_len > 8;
     let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
     let write_info_start = report_prefill.then(Instant::now);
-    // An int8 pool is written only by the native store (Splash
-    // `PagedAttention::addPrefillStore`); its error is the turn's error.
-    let int8_pool = adapter.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8;
-    let write_path = if native_kv_write_enabled() || int8_pool {
-        match adapter.update_keys_values_native(
+    adapter
+        .update_keys_values_native(
             attn_layer_idx,
             &keys_paged,
             &values_paged,
             first_logical_position,
-        ) {
-            Ok(()) => "native",
-            Err(err) if int8_pool => return Err(napi::Error::from_reason(err)),
-            Err(err) => {
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-attn paged_kv_write_fallback \
-                         layer={} first_position={} seq_len={} error={}",
-                        attn_layer_idx, first_logical_position, seq_len, err
-                    ));
-                }
-                if inference_info_enabled && attn_layer_idx == 0 {
-                    let first_report = !NATIVE_KV_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
-                    if prefill || first_report || first_logical_position.is_multiple_of(32) {
-                        tracing::warn!(
-                            target: "mlx_core::inference",
-                            event = "paged_kv_write_fallback",
-                            layer = attn_layer_idx,
-                            first_position = first_logical_position,
-                            sequence_tokens = seq_len,
-                            error = %err,
-                            "native paged KV write failed; using legacy write path"
-                        );
-                    }
-                }
-                adapter
-                    .update_keys_values(
-                        attn_layer_idx,
-                        &keys_paged,
-                        &values_paged,
-                        first_logical_position,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                "legacy"
-            }
-        }
-    } else {
-        adapter
-            .update_keys_values(
-                attn_layer_idx,
-                &keys_paged,
-                &values_paged,
-                first_logical_position,
-            )
-            .map_err(napi::Error::from_reason)?;
-        "legacy"
-    };
+        )
+        .map_err(napi::Error::from_reason)?;
     if trace_enabled {
         write_inference_trace(format_args!(
             "[MLX_TRACE] qwen3.5-attn paged_kv_write_done \
-             layer={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
+             layer={} first_position={} seq_len={} path=native elapsed_ms={:.1}",
             attn_layer_idx,
             first_logical_position,
             seq_len,
-            write_path,
             write_trace_start.map(elapsed_ms).unwrap_or(0.0)
         ));
     }
@@ -262,7 +206,7 @@ pub(super) fn paged_store(
             layer = attn_layer_idx,
             first_position = first_logical_position,
             sequence_tokens = seq_len,
-            path = write_path,
+            path = "native",
             elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
             "paged KV layer write completed"
         );
@@ -274,7 +218,7 @@ pub(super) fn paged_store(
             layer = attn_layer_idx,
             first_position = first_logical_position,
             sequence_tokens = seq_len,
-            path = write_path,
+            path = "native",
             elapsed_ms = write_info_start.map(elapsed_ms).unwrap_or(0.0),
             "paged prefill KV write completed"
         );
@@ -362,107 +306,36 @@ fn paged_attend(
             let queries_3d = queries.reshape(&[1, num_heads, head_dim])?;
             let gather_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
             let decode_rows = adapter.decode_query_rows();
-            if !graph_decode_gather_enabled() {
-                let attn_3d = adapter
-                    .gather_kv_for_decode(
-                        attn_layer_idx,
-                        &queries_3d,
-                        scale,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                         layer={} path=legacy total_ctx={} queries={} elapsed_ms={:.1}",
-                        attn_layer_idx,
-                        adapter.current_token_count(),
-                        queries_taken(decode_rows, adapter.decode_query_rows()),
-                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-                attn_3d
-            } else {
-                match adapter.gather_kv_for_decode_graph(
+            let attn_3d = adapter
+                .gather_kv_for_decode_graph(
                     attn_layer_idx,
                     &queries_3d,
                     scale,
                     /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn decode_gather_done \
-                                 layer={} path=graph total_ctx={} queries={} elapsed_ms={:.1}",
-                                attn_layer_idx,
-                                adapter.current_token_count(),
-                                queries_taken(decode_rows, adapter.decode_query_rows()),
-                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        if inference_debug_enabled {
-                            tracing::debug!(
-                                target: "mlx_core::inference",
-                                event = "paged_attention_gather_done",
-                                layer = attn_layer_idx,
-                                path = "graph",
-                                context_tokens = adapter.current_token_count(),
-                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                                "paged attention layer gather completed"
-                            );
-                        }
-                        attn_3d
-                    }
-                    Err(err) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3.5-attn decode_gather_fallback \
-                                 layer={} path=raw total_ctx={} error={}",
-                                attn_layer_idx,
-                                adapter.current_token_count(),
-                                err
-                            ));
-                        }
-                        if inference_info_enabled && attn_layer_idx == 0 {
-                            let context_tokens = adapter.current_token_count();
-                            let first_report =
-                                !DECODE_GATHER_FALLBACK_REPORTED.swap(true, Ordering::Relaxed);
-                            if first_report || context_tokens.is_multiple_of(32) {
-                                tracing::warn!(
-                                    target: "mlx_core::inference",
-                                    event = "paged_attention_gather_fallback",
-                                    layer = attn_layer_idx,
-                                    context_tokens,
-                                    failed_path = "graph",
-                                    fallback_path = "raw",
-                                    error = %err,
-                                    "graph paged-attention gather failed; using raw gather"
-                                );
-                            }
-                        }
-                        let attn_3d = adapter
-                            .gather_kv_for_decode(
-                                attn_layer_idx,
-                                &queries_3d,
-                                scale,
-                                /* softcap */ 1.0,
-                            )
-                            .map_err(napi::Error::from_reason)?;
-                        if inference_debug_enabled {
-                            tracing::debug!(
-                                target: "mlx_core::inference",
-                                event = "paged_attention_gather_done",
-                                layer = attn_layer_idx,
-                                path = "raw_fallback",
-                                context_tokens = adapter.current_token_count(),
-                                elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                                "paged attention layer gather completed"
-                            );
-                        }
-                        attn_3d
-                    }
-                }
+                )
+                .map_err(napi::Error::from_reason)?;
+            if trace_enabled {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3.5-attn decode_gather_done \
+                     layer={} path=graph total_ctx={} queries={} elapsed_ms={:.1}",
+                    attn_layer_idx,
+                    adapter.current_token_count(),
+                    queries_taken(decode_rows, adapter.decode_query_rows()),
+                    gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                ));
             }
+            if inference_debug_enabled {
+                tracing::debug!(
+                    target: "mlx_core::inference",
+                    event = "paged_attention_gather_done",
+                    layer = attn_layer_idx,
+                    path = "graph",
+                    context_tokens = adapter.current_token_count(),
+                    elapsed_ms = gather_trace_start.map(elapsed_ms).unwrap_or(0.0),
+                    "paged attention layer gather completed"
+                );
+            }
+            attn_3d
         }
     };
     attn.astype(out_dtype)?
@@ -478,100 +351,6 @@ impl Qwen3_5Attention {
         if let Some((merged, _)) = &self.kv_proj {
             merged.clear_cuda_dense_prefill();
         }
-    }
-
-    pub(crate) fn validate_source_qk_weights(
-        &self,
-        q: &MxArray,
-        k: &MxArray,
-        frequencies: &MxArray,
-    ) -> Result<()> {
-        if self.num_heads != 16
-            || self.num_kv_heads != 2
-            || self.head_dim != 256
-            || self.mrope.is_some()
-            || self.rope.is_scaled()
-            || self.rope.traditional
-            || self.rope.dims != 64
-            || self.rope.base.to_bits() != 10_000_000_f32.to_bits()
-            || self.rope.scale.to_bits() != 1_f32.to_bits()
-            || self.q_norm.eps_f32().to_bits() != 1e-6_f32.to_bits()
-            || self.k_norm.eps_f32().to_bits() != 1e-6_f32.to_bits()
-            || q.shape()?.as_ref() != [256]
-            || k.shape()?.as_ref() != [256]
-            || frequencies.shape()?.as_ref() != [32]
-            || q.dtype()? != DType::Float32
-            || k.dtype()? != DType::Float32
-            || frequencies.dtype()? != DType::Float32
-        {
-            return Err(Error::from_reason(
-                "source QK weights require measured text attention geometry and F32 operands",
-            ));
-        }
-        Ok(())
-    }
-
-    // The loader validates all layers before this infallible publication.
-    pub(crate) fn install_source_qk_weights(
-        &mut self,
-        q: MxArray,
-        k: MxArray,
-        frequencies: MxArray,
-    ) {
-        self.source_qk = Some((q, k, frequencies));
-    }
-
-    fn try_source_qk_norm_rope(
-        &self,
-        queries: &MxArray,
-        keys: &MxArray,
-        offsets: &MxArray,
-    ) -> Result<Option<(MxArray, MxArray)>> {
-        let Some((q_weight, k_weight, frequencies)) = &self.source_qk else {
-            return Ok(None);
-        };
-        if self.mrope.is_some()
-            || self.rope.is_scaled()
-            || self.rope.traditional
-            || queries.shape()?.as_ref() != [1, 8, 16, 256]
-            || keys.shape()?.as_ref() != [1, 8, 2, 256]
-            || queries.dtype()? != DType::BFloat16
-            || keys.dtype()? != DType::BFloat16
-            || !unsafe { mlx_sys::mlx_source_qk_norm_rope_available() }
-        {
-            return Ok(None);
-        }
-        let (mut q, mut k) = (std::ptr::null_mut(), std::ptr::null_mut());
-        let ok = unsafe {
-            mlx_sys::mlx_source_qk_norm_rope(
-                queries.as_raw_ptr(),
-                keys.as_raw_ptr(),
-                q_weight.as_raw_ptr(),
-                k_weight.as_raw_ptr(),
-                frequencies.as_raw_ptr(),
-                offsets.as_raw_ptr(),
-                &mut q,
-                &mut k,
-            )
-        };
-        if !ok || q.is_null() || k.is_null() {
-            unsafe {
-                if !q.is_null() {
-                    mlx_sys::mlx_array_delete(q);
-                }
-                if !k.is_null() {
-                    mlx_sys::mlx_array_delete(k);
-                }
-            }
-            // Selected source arithmetic never retries a native attention or
-            // mutates a KV frontier a second time after factory failure.
-            return Err(Error::from_reason(
-                "source QK norm/RoPE factory rejected selected inputs",
-            ));
-        }
-        let q = MxArray::from_handle(q, "source_qk:q")?;
-        let k = MxArray::from_handle(k, "source_qk:k")?;
-        Ok(Some((q, k)))
     }
 
     pub(super) fn paged_attention_operand(
@@ -673,7 +452,6 @@ impl Qwen3_5Attention {
             o_proj: LinearProj::Standard(o_proj),
             q_norm,
             k_norm,
-            source_qk: None,
             rope,
             mrope: None,
             rope_mode: RopeMode::MRoPE,
@@ -853,7 +631,7 @@ impl Qwen3_5Attention {
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, None, None)
+        self.forward_impl(x, mask, cache, position_ids, None)
     }
 
     /// Tree-verification variant of [`Self::forward`] with per-node RoPE depths
@@ -866,19 +644,7 @@ impl Qwen3_5Attention {
         position_ids: Option<&MxArray>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, None, tree)
-    }
-
-    /// Returns residual-inclusive hidden state; callers must not add again.
-    pub(crate) fn forward_source_residual(
-        &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
-        cache: Option<&mut KVCache>,
-        position_ids: Option<&MxArray>,
-        residual: &MxArray,
-    ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, Some(residual), None)
+        self.forward_impl(x, mask, cache, position_ids, tree)
     }
 
     /// Prefill tail pruning (non-final chunk, final FullAttn layer):
@@ -965,7 +731,6 @@ impl Qwen3_5Attention {
         mask: Option<&MxArray>,
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
-        residual: Option<&MxArray>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
@@ -1005,8 +770,7 @@ impl Qwen3_5Attention {
         // Capture prefix KV length BEFORE appending tree/block rows so
         // `sdpa_tree_few` and tree RoPE know the exact prefix boundary.
         let pre_cache_len = cache.as_ref().map_or(0, |c| c.get_offset());
-        let fused_qkv = if self.source_qk.is_none()
-            && position_ids.is_none()
+        let fused_qkv = if position_ids.is_none()
             && !self.rope.traditional
             && !self.rope.is_scaled()
             && self.q_norm.eps_f32().to_bits() == self.k_norm.eps_f32().to_bits()
@@ -1046,21 +810,7 @@ impl Qwen3_5Attention {
         let (queries, keys, values) = if let Some(triple) = fused_qkv {
             triple
         } else {
-            let source_pair = if tree.is_none()
-                && self.source_qk.is_some()
-                && position_ids.is_none()
-                && batch == 1
-                && seq_len == 8
-            {
-                let offset = cache.as_ref().map_or(0, |c| c.get_offset());
-                let offsets = MxArray::from_int32(&[offset], &[1])?;
-                self.try_source_qk_norm_rope(&queries, &keys, &offsets)?
-            } else {
-                None
-            };
-            let (queries, keys) = if let Some(pair) = source_pair {
-                pair
-            } else if let Some(tv) = tree {
+            let (queries, keys) = if let Some(tv) = tree {
                 // Non-CUDA / Metal / YaRN tree fallback: QK-norm + per-node
                 // depth RoPE at positions `pre_cache_len + depths[t]`.
                 let queries = self.q_norm.forward(&queries)?;
@@ -1290,8 +1040,7 @@ impl Qwen3_5Attention {
         let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
 
         // Output projection
-        self.o_proj
-            .forward_mixer_output(&gated_output, None, residual.map(MixerResidual::Source))
+        self.o_proj.forward(&gated_output)
     }
 
     /// Forward pass routed through the block-paged KV adapter.
@@ -1833,11 +1582,6 @@ impl Qwen3_5Attention {
                 shape.as_ref()
             )));
         }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "Qwen3.5 batched decode requires native K/V writes",
-            ));
-        }
 
         let batch = rows.len() as i64;
         let seq_len = shape[1];
@@ -2046,20 +1790,10 @@ impl Qwen3_5Attention {
         self.o_proj.set_bias(b, "o_proj")
     }
     pub fn set_q_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
-        if self.source_qk.is_some() {
-            return Err(Error::from_reason(
-                "source QK norm operands are immutable; load a new model to change weights",
-            ));
-        }
         self.q_norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
     pub fn set_k_norm_weight(&mut self, w: &MxArray, compute_dtype: DType) -> Result<()> {
-        if self.source_qk.is_some() {
-            return Err(Error::from_reason(
-                "source QK norm operands are immutable; load a new model to change weights",
-            ));
-        }
         self.k_norm
             .set_weight(&super::sidecar_to_compute_dtype(w, compute_dtype)?)
     }
@@ -4034,162 +3768,6 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn source_mixer_attention_fallback_preserves_bf16_kv_frontier() -> Result<()> {
-        let cfg = tiny_cfg();
-        let mut attention = Qwen3_5Attention::new(&cfg)?;
-        let bf = |shape: &[i64], seed: usize| -> Result<MxArray> {
-            let n = shape.iter().product::<i64>() as usize;
-            MxArray::from_float32(
-                &(0..n)
-                    .map(|i| ((i * 7 + seed) % 37) as f32 * 0.015625 - 0.25)
-                    .collect::<Vec<_>>(),
-                shape,
-            )?
-            .astype(DType::BFloat16)
-        };
-        attention.set_q_proj_weight(&bf(&[64, 32], 3)?)?;
-        attention.set_k_proj_weight(&bf(&[16, 32], 7)?)?;
-        attention.set_v_proj_weight(&bf(&[16, 32], 11)?)?;
-        attention.set_o_proj_weight(&bf(&[32, 32], 17)?)?;
-        let norm = MxArray::ones(&[8], Some(DType::BFloat16))?;
-        attention.set_q_norm_weight(&norm, DType::BFloat16)?;
-        attention.set_k_norm_weight(&norm, DType::BFloat16)?;
-        let mut reference = KVCache::new();
-        let mut fused = KVCache::new();
-        for rows in [1, 7, 8, 33, 8] {
-            let x = bf(&[1, rows, 32], rows as usize)?;
-            let residual = bf(&[1, rows, 32], rows as usize + 19)?;
-            let delta = attention.forward(&x, None, Some(&mut reference), None)?;
-            let hidden =
-                attention.forward_source_residual(&x, None, Some(&mut fused), None, &residual)?;
-            assert_eq!(
-                hidden.to_uint16_native()?,
-                residual.add(&delta)?.to_uint16_native()?
-            );
-            assert_eq!(reference.get_offset(), fused.get_offset());
-            for (a, b) in [
-                (reference.keys_ref().unwrap(), fused.keys_ref().unwrap()),
-                (reference.values_ref().unwrap(), fused.values_ref().unwrap()),
-            ] {
-                // Only the committed prefix is initialized in spare-capacity buffers.
-                let end = reference.get_offset() as i64;
-                assert_eq!(
-                    a.slice_axis(2, 0, end)?.to_uint16_native()?,
-                    b.slice_axis(2, 0, end)?.to_uint16_native()?
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn source_qk_operands_preserve_native_fallback_and_eager_kv_frontier() -> Result<()> {
-        if !unsafe { mlx_sys::mlx_source_qk_norm_rope_available() } {
-            return Ok(());
-        }
-        let mut cfg = tiny_cfg();
-        cfg.head_dim = 256;
-        cfg.num_heads = 16;
-        cfg.num_kv_heads = 2;
-        cfg.partial_rotary_factor = 0.25;
-        cfg.rope_theta = 10_000_000.0;
-        cfg.rms_norm_eps = 1e-6;
-        let mut attn = Qwen3_5Attention::new(&cfg)?;
-        let bf = |shape: &[i64], seed: usize| -> Result<MxArray> {
-            let count = shape.iter().product::<i64>() as usize;
-            MxArray::from_float32(
-                &(0..count)
-                    .map(|i| (((i * 7 + seed) % 41) as f32 - 20.0) * 0.0078125)
-                    .collect::<Vec<_>>(),
-                shape,
-            )?
-            .astype(DType::BFloat16)
-        };
-        attn.set_q_proj_weight(&bf(&[8192, 32], 3)?)?;
-        attn.set_k_proj_weight(&bf(&[512, 32], 5)?)?;
-        attn.set_v_proj_weight(&bf(&[512, 32], 7)?)?;
-        attn.set_o_proj_weight(&bf(&[32, 4096], 11)?)?;
-        let source_q = MxArray::from_float32(
-            &(0..256)
-                .map(|i| 1.0 + (i % 17) as f32 * 0.00031)
-                .collect::<Vec<_>>(),
-            &[256],
-        )?;
-        let source_k = MxArray::from_float32(
-            &(0..256)
-                .map(|i| 1.0 + (i % 23) as f32 * 0.00037)
-                .collect::<Vec<_>>(),
-            &[256],
-        )?;
-        let frequencies = MxArray::from_float32(
-            &(0..32)
-                .map(|i| 10_000_000_f32.powf(-(i as f32) / 32.0))
-                .collect::<Vec<_>>(),
-            &[32],
-        )?;
-        attn.set_q_norm_weight(&source_q, DType::BFloat16)?;
-        attn.set_k_norm_weight(&source_k, DType::BFloat16)?;
-        let original_q = attn.get_q_norm_weight().to_uint16_native()?;
-        let original_k = attn.get_k_norm_weight().to_uint16_native()?;
-        attn.validate_source_qk_weights(&source_q, &source_k, &frequencies)?;
-        let mut native_cache = KVCache::new();
-        let mut selected_cache = KVCache::new();
-        for rows in [1, 7, 33] {
-            let x = bf(&[1, rows, 32], rows as usize)?;
-            attn.source_qk = None;
-            let native = attn.forward(&x, None, Some(&mut native_cache), None)?;
-            attn.install_source_qk_weights(source_q.clone(), source_k.clone(), frequencies.clone());
-            let selected = attn.forward(&x, None, Some(&mut selected_cache), None)?;
-            assert_eq!(native.to_uint16_native()?, selected.to_uint16_native()?);
-            assert_eq!(native_cache.get_offset(), selected_cache.get_offset());
-            let end = selected_cache.get_offset() as i64;
-            assert_eq!(
-                native_cache
-                    .keys_ref()
-                    .unwrap()
-                    .slice_axis(2, 0, end)?
-                    .to_uint16_native()?,
-                selected_cache
-                    .keys_ref()
-                    .unwrap()
-                    .slice_axis(2, 0, end)?
-                    .to_uint16_native()?
-            );
-        }
-        assert_eq!(attn.get_q_norm_weight().to_uint16_native()?, original_q);
-        assert_eq!(attn.get_k_norm_weight().to_uint16_native()?, original_k);
-        assert!(attn.set_q_norm_weight(&source_q, DType::BFloat16).is_err());
-        assert!(attn.set_k_norm_weight(&source_k, DType::BFloat16).is_err());
-        assert!(attn.source_qk.is_some());
-        let x = bf(&[1, 8, 32], 29)?;
-        let before = selected_cache.get_offset();
-        let (queries, _, keys, _) = attn.project_mixer(&x, 1, 8)?;
-        let keys = keys.reshape(&[1, 8, 2, 256])?;
-        let offsets = MxArray::from_int32(&[before], &[1])?;
-        let (_, expected_keys) = attn
-            .try_source_qk_norm_rope(&queries, &keys, &offsets)?
-            .expect("strict T8 must select source QK");
-        let invalid = offsets.astype(DType::Float32)?;
-        assert!(
-            attn.try_source_qk_norm_rope(&queries, &keys, &invalid)
-                .is_err()
-        );
-        let result = attn.forward(&x, None, Some(&mut selected_cache), None)?;
-        result.eval();
-        assert_eq!(selected_cache.get_offset(), before + 8);
-        assert_eq!(
-            selected_cache
-                .keys_ref()
-                .unwrap()
-                .slice_axis(2, before as i64, (before + 8) as i64)?
-                .to_uint16_native()?,
-            expected_keys.to_uint16_native()?
-        );
-        assert_eq!(attn.get_q_norm_weight().to_uint16_native()?, original_q);
-        Ok(())
-    }
-
     /// The 27B target attention geometry for the YaRN gates.
     fn yarn_cfg(max_context: Option<u32>) -> Qwen3_5Config {
         let mut cfg = tiny_cfg();
@@ -4238,33 +3816,6 @@ mod tests {
             )?;
             assert_eq!(bits_of(&attn.rope.forward(&x, Some(7))?), bits_of(&direct));
         }
-        Ok(())
-    }
-
-    /// Under YaRN the source QK diagnostic (an unscaled table) steps aside.
-    #[test]
-    fn fused_kernels_step_aside_under_yarn() -> Result<()> {
-        let mut scaled = Qwen3_5Attention::new(&yarn_cfg(Some(409_600)))?;
-        scaled
-            .q_norm
-            .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
-        scaled
-            .k_norm
-            .set_weight(&MxArray::ones(&[256], Some(DType::BFloat16))?)?;
-        let plain = Qwen3_5Attention::new(&yarn_cfg(None))?;
-        assert!(scaled.rope.is_scaled());
-        let weight = MxArray::from_float32(&[1.0; 256], &[256])?;
-        let frequencies = MxArray::from_float32(&[1.0; 32], &[32])?;
-        assert!(
-            plain
-                .validate_source_qk_weights(&weight, &weight, &frequencies)
-                .is_ok()
-        );
-        assert!(
-            scaled
-                .validate_source_qk_weights(&weight, &weight, &frequencies)
-                .is_err()
-        );
         Ok(())
     }
 

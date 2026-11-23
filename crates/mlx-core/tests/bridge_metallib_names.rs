@@ -122,11 +122,9 @@ fn every_affine_mixed_kernel_builds_a_pipeline() {
     assert_eq!(c.built, AFFINE_MIXED_NAMES, "pipelines built");
 }
 
-/// Includes both source-only M8 entrypoints, not just their shared-library
-/// presence: exercise the same pipeline loader used by the grouped bridge.
 #[test]
 fn every_splash_moe_kernel_is_in_the_metallib() {
-    assert_names("splash_moe", 15);
+    assert_names("splash_moe", 13);
 }
 
 #[test]
@@ -134,7 +132,7 @@ fn every_splash_moe_kernel_builds_a_pipeline() {
     let c = check("splash_moe", true);
     assert!(c.report.is_empty(), "{}", c.report);
     let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
-    assert_eq!(c.built, if nax { 15 } else { 0 });
+    assert_eq!(c.built, if nax { 13 } else { 0 });
 }
 
 /// Split (int8 pages with bf16 or INT8 queries, bf16 pages) and reduce

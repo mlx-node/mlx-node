@@ -36,7 +36,6 @@ use crate::array::mask::create_causal_mask;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::{RMSNorm, RoPE};
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{
     PagedDecodeRouteHint, PagedKVCacheAdapter, SeqId,
 };
@@ -356,12 +355,6 @@ impl PagedAttentionCore<'_> {
                 labels.type_name,
                 rows.len(),
                 shape.as_ref()
-            )));
-        }
-        if !native_kv_write_enabled() || !graph_decode_gather_enabled() {
-            return Err(Error::from_reason(format!(
-                "{} batched decode requires native K/V writes and graph decode gather",
-                labels.family
             )));
         }
 

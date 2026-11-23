@@ -1,40 +1,33 @@
 //! Smoke tests for the MLX paged-ops `Custom` primitives
-//! (`PagedKVWrite`, `PagedAttention`) and the `extern "C"` shim that
-//! bridges them to the `dispatch_*` Metal pipelines.
+//! (`PagedKVWrite`, `PagedAttention`, `PagedAttentionVarlen`).
 //!
 //! ## Test list
 //!
-//! 1. **Round-trip K/V** — write 2 tokens of synthetic K/V into a
-//!    miniature paged pool through the shim, read the pool back,
-//!    and assert byte-equality at the right slot offsets.
-//! 2. **Compile-trace cache key stability** — wraps the public
+//! 1. **Compile-trace cache key stability** — wraps the public
 //!    `paged_kv_write` factory in `mlx::core::compile()` and verifies
 //!    the inner trace function runs ONCE across two same-shape calls
 //!    (i.e., the second call hits the compile cache). Implemented via
 //!    a C++ FFI helper that exposes a static atomic trace counter.
-//! 3. **Retired kv_dtype code** — code 2 (paged FP8) is refused.
-//! 4. **`is_equivalent` correctness** — instantiate two
+//! 2. **Retired kv_dtype code** — code 2 (paged FP8) is refused.
+//! 3. **`is_equivalent` correctness** — instantiate two
 //!    `PagedKVWrite` primitives via the C++ FFI helper and assert
 //!    `is_equivalent` correctly distinguishes equal vs. differing
 //!    scalar state.
-//! 5. **VJP throws** — instantiate a `PagedKVWrite` and a
+//! 4. **VJP throws** — instantiate a `PagedKVWrite` and a
 //!    `PagedAttention` via the C++ FFI helper and assert each
 //!    primitive's `vjp` raises `std::runtime_error`.
-//! 6. **Output shape uses scalar state** — verify that
+//! 5. **Output shape uses scalar state** — verify that
 //!    `PagedAttention::output_shapes` reports
 //!    `{q_num_tokens, num_q_heads, head_size}` from the primitive's
 //!    scalar state (NOT echoing q's trailing dims).
-//! 7. **Validation rejection paths** — the public `paged_attention`
-//!    factory rejects (a) `sliding_window != 0`, (b) q whose trailing
+//! 6. **Validation rejection paths** — the public `paged_attention`
+//!    factory rejects (a) `sliding_window < 0`, (b) q whose trailing
 //!    dims disagree with scalar state, (c) q rank != 3, (d)
 //!    block_table batch / dtype mismatch, (e) seq_lens batch mismatch,
 //!    (f) K/V pool inner-dim / x_pack / num_blocks mismatch. The
 //!    public `paged_kv_write` factory rejects K/V pool shapes that
 //!    disagree with scalar state, plus slot_mapping rank / dtype /
-//!    length / out-of-range mismatches (eval-based bounds check). The
-//!    Rust extern-C shim independently rejects nonzero
-//!    `sliding_window` so a missing C++-side check can never tunnel
-//!    through.
+//!    length / out-of-range mismatches (eval-based bounds check).
 //!
 //! All Metal-dependent tests gracefully skip on hosts where
 //! `MetalState::get()` fails ("No Metal device found"). The non-Metal
@@ -43,267 +36,10 @@
 
 #![cfg(all(target_os = "macos", mlx_node_metal_enabled))]
 
-use std::ffi::c_void;
-
-use metal::MTLResourceOptions;
-
 use mlx_paged_attn::metal::MetalState;
-use mlx_paged_attn::mlx_paged_attn_reshape_and_cache_dispatch;
 
 // =============================================================================
-// Convenience: f32 → f16 / f32 → bf16 conversion (host-side, for test
-// inputs).
-// =============================================================================
-
-fn f32_to_f16_bits(x: f32) -> u16 {
-    // half crate isn't a workspace dep; do a simple manual cast that
-    // covers normal positive values used in these tests.
-    let bits = x.to_bits();
-    let sign = ((bits >> 31) & 0x1) as u16;
-    let exp_f32 = ((bits >> 23) & 0xff) as i32;
-    let mant_f32 = bits & 0x7fffff;
-    if exp_f32 == 0xff {
-        // Inf / NaN
-        let mant = if mant_f32 != 0 { 0x200 } else { 0 };
-        return (sign << 15) | (0x1f << 10) | mant;
-    }
-    let exp_unbiased = exp_f32 - 127;
-    if exp_unbiased < -14 {
-        // Subnormal or zero (treat as zero for test convenience)
-        return sign << 15;
-    }
-    if exp_unbiased > 15 {
-        // Overflow → +/- inf
-        return (sign << 15) | (0x1f << 10);
-    }
-    let exp_f16 = ((exp_unbiased + 15) as u16) & 0x1f;
-    let mant_f16 = (mant_f32 >> 13) as u16;
-    (sign << 15) | (exp_f16 << 10) | mant_f16
-}
-
-fn f16_bits_to_f32(bits: u16) -> f32 {
-    let sign = ((bits >> 15) & 0x1) as u32;
-    let exp = ((bits >> 10) & 0x1f) as u32;
-    let mant = (bits & 0x3ff) as u32;
-    if exp == 0 {
-        if mant == 0 {
-            return f32::from_bits(sign << 31);
-        }
-        // Subnormal — normalize.
-        let mut m = mant;
-        let mut e = 0i32;
-        while (m & 0x400) == 0 {
-            m <<= 1;
-            e -= 1;
-        }
-        m &= 0x3ff;
-        let f32_exp = ((127 - 15 + 1 + e) as u32) << 23;
-        return f32::from_bits((sign << 31) | f32_exp | (m << 13));
-    }
-    if exp == 31 {
-        return f32::from_bits((sign << 31) | 0x7f80_0000 | (mant << 13));
-    }
-    let f32_exp = ((exp as i32 - 15 + 127) as u32) << 23;
-    f32::from_bits((sign << 31) | f32_exp | (mant << 13))
-}
-
-// =============================================================================
-// Test 1: round-trip K/V
-//
-// Build two miniature pools (key + value) sized for 4 blocks, 4 KV
-// heads, head_size 64, block_size 16, FP16. Write 2 tokens of
-// synthetic data through the shim, blit the pools back to host, and
-// verify the values land at the right (block, head, position, slot)
-// indices according to the kernel's K layout.
-// =============================================================================
-
-#[test]
-fn round_trip_k_v_through_shim() {
-    let state = match MetalState::get() {
-        Ok(s) => s,
-        Err(e) if e.contains("No Metal device found") => {
-            eprintln!("skipping round_trip_k_v_through_shim: {e}");
-            return;
-        }
-        Err(e) => panic!("unexpected MetalState::get failure: {e}"),
-    };
-
-    // Pool config: 4 blocks, 4 KV heads, head_size 64, block_size 16,
-    // FP16 → x = 8.
-    let num_blocks: u32 = 4;
-    let num_kv_heads: u32 = 4;
-    let head_size: u32 = 64;
-    let block_size: u32 = 16;
-    let x: u32 = 8;
-    let element_size: u64 = 2;
-
-    // Allocate K/V cache buffers in shared storage so we can read the
-    // pool back without an extra blit.
-    let key_cache_size = (num_blocks as u64)
-        * (num_kv_heads as u64)
-        * (head_size as u64 / x as u64)
-        * (block_size as u64)
-        * (x as u64)
-        * element_size;
-    let value_cache_size = (num_blocks as u64)
-        * (num_kv_heads as u64)
-        * (head_size as u64)
-        * (block_size as u64)
-        * element_size;
-
-    let key_pool = state
-        .device
-        .try_new_buffer(key_cache_size, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-    let value_pool = state
-        .device
-        .try_new_buffer(value_cache_size, MTLResourceOptions::StorageModeShared)
-        .expect("test buffer allocation must succeed");
-
-    // Zero-initialize pools so we can detect what got written.
-    unsafe {
-        std::ptr::write_bytes(key_pool.contents() as *mut u8, 0, key_cache_size as usize);
-        std::ptr::write_bytes(
-            value_pool.contents() as *mut u8,
-            0,
-            value_cache_size as usize,
-        );
-    }
-
-    // 2 tokens of synthetic data.
-    let num_tokens: u32 = 2;
-    let tokens_size_elements =
-        (num_tokens as usize) * (num_kv_heads as usize) * (head_size as usize);
-    let mut new_k_host: Vec<u16> = Vec::with_capacity(tokens_size_elements);
-    let mut new_v_host: Vec<u16> = Vec::with_capacity(tokens_size_elements);
-    for t in 0..num_tokens {
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let k_val = (t as f32) * 1000.0 + (h as f32) * 100.0 + (j as f32);
-                let v_val = -k_val;
-                new_k_host.push(f32_to_f16_bits(k_val));
-                new_v_host.push(f32_to_f16_bits(v_val));
-            }
-        }
-    }
-    let new_k = state
-        .device
-        .try_new_buffer_with_slice(new_k_host.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-    let new_v = state
-        .device
-        .try_new_buffer_with_slice(new_v_host.as_ref(), MTLResourceOptions::StorageModeShared)
-        .expect("test buffer-with-slice allocation must succeed");
-
-    // Slot mapping: token 0 → slot 5 (block 0, position 5),
-    //               token 1 → slot 21 (block 1, position 5).
-    let slot_mapping_host: Vec<i64> = vec![5, 21];
-    let slot_mapping = state
-        .device
-        .try_new_buffer_with_slice(
-            slot_mapping_host.as_ref(),
-            MTLResourceOptions::StorageModeShared,
-        )
-        .expect("test buffer-with-slice allocation must succeed");
-
-    // Dispatch through the shim.
-    let rc = unsafe {
-        mlx_paged_attn_reshape_and_cache_dispatch(
-            key_pool.as_ptr() as *mut c_void,
-            value_pool.as_ptr() as *mut c_void,
-            new_k.as_ptr() as *mut c_void,
-            0,
-            new_v.as_ptr() as *mut c_void,
-            0,
-            slot_mapping.as_ptr() as *mut c_void,
-            0,
-            num_tokens,
-            num_kv_heads,
-            head_size,
-            block_size,
-            x as i32,
-            0, // KvDtypeC::Fp16
-        )
-    };
-    assert_eq!(rc, 0, "shim dispatch must succeed (rc=0)");
-
-    // Read the pool buffers back as f16 bits.
-    let key_bits: &[u16] = unsafe {
-        std::slice::from_raw_parts(
-            key_pool.contents() as *const u16,
-            (key_cache_size / 2) as usize,
-        )
-    };
-    let value_bits: &[u16] = unsafe {
-        std::slice::from_raw_parts(
-            value_pool.contents() as *const u16,
-            (value_cache_size / 2) as usize,
-        )
-    };
-
-    // Verify each (token, head, j) lands in the right slot.
-    // K layout: key_cache[block_idx, head_idx, j/x, block_offset, j%x]
-    // V layout: value_cache[block_idx, head_idx, j, block_offset]
-    // strides (in elements):
-    let head_per_block_k = (head_size / x) * block_size * x;
-    let stride_block_k = num_kv_heads * head_per_block_k;
-    let stride_head_k = head_per_block_k;
-    let stride_xidx_k = block_size * x;
-    let stride_blockoff_k = x;
-
-    let head_per_block_v = head_size * block_size;
-    let stride_block_v = num_kv_heads * head_per_block_v;
-    let stride_head_v = head_per_block_v;
-    let stride_j_v = block_size;
-
-    for t in 0..num_tokens {
-        let slot_idx = slot_mapping_host[t as usize];
-        let block_idx = (slot_idx / block_size as i64) as u32;
-        let block_offset = (slot_idx % block_size as i64) as u32;
-        for h in 0..num_kv_heads {
-            for j in 0..head_size {
-                let x_idx = j / x;
-                let x_offset = j % x;
-                let k_target_idx = (block_idx * stride_block_k
-                    + h * stride_head_k
-                    + x_idx * stride_xidx_k
-                    + block_offset * stride_blockoff_k
-                    + x_offset) as usize;
-                let v_target_idx = (block_idx * stride_block_v
-                    + h * stride_head_v
-                    + j * stride_j_v
-                    + block_offset) as usize;
-
-                let expected_k = (t as f32) * 1000.0 + (h as f32) * 100.0 + (j as f32);
-                let expected_v = -expected_k;
-
-                let actual_k = f16_bits_to_f32(key_bits[k_target_idx]);
-                let actual_v = f16_bits_to_f32(value_bits[v_target_idx]);
-
-                let kdiff = (actual_k - expected_k).abs();
-                let vdiff = (actual_v - expected_v).abs();
-
-                // F16 tolerance: ~1 ULP at small magnitudes; the
-                // synthetic values can hit ~1300 which is fine in
-                // F16 precision.
-                let tol = expected_k.abs().max(1.0) * 1e-3;
-                assert!(
-                    kdiff <= tol,
-                    "K mismatch at token={t} head={h} j={j}: \
-                     expected {expected_k}, got {actual_k} (diff {kdiff})"
-                );
-                assert!(
-                    vdiff <= tol,
-                    "V mismatch at token={t} head={h} j={j}: \
-                     expected {expected_v}, got {actual_v} (diff {vdiff})"
-                );
-            }
-        }
-    }
-}
-
-// =============================================================================
-// Test 3: retired kv_dtype code
+// Retired kv_dtype code
 //
 // Code 2 was paged FP8. Splash `kv::Format` has Int8 and BFloat16 only, so
 // the C ABI refuses 2 like any unknown code instead of misrouting it.
@@ -313,38 +49,11 @@ fn round_trip_k_v_through_shim() {
 fn retired_kv_dtype_code_is_refused() {
     let threw = unsafe { mlx_sys::mlx_paged_kv_dtype_refuses_retired_code() };
     assert_eq!(threw, 1, "kv_dtype code 2 must be refused (got {threw})");
-    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
-    let rc = unsafe {
-        mlx_paged_attn_reshape_and_cache_dispatch(
-            dummy, dummy, dummy, 0, dummy, 0, dummy, 0, 1, 4, 64, 16, /*x_pack=*/ 16,
-            /*kv_dtype=*/ 2,
-        )
-    };
-    assert_eq!(rc, -1, "the Rust shim must refuse kv_dtype code 2");
 }
 
 /// Convert f32 to bf16 (truncation — drops 16 LSBs).
 fn f32_to_bf16_bits(x: f32) -> u16 {
     (x.to_bits() >> 16) as u16
-}
-
-/// Negative test — the C++ layer's `paged_attention` shim must reject
-/// zero context length so we don't tunnel that into the kernel
-/// dispatcher. Provides coverage for the wire that connects the C++
-/// primitive's `eval_gpu` to the Rust shim's parameter validation.
-#[test]
-fn paged_attention_shim_rejects_zero_context() {
-    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
-    let rc = unsafe {
-        mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
-            dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
-            /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
-            /*block_size=*/ 16, /*max_context_len=*/ 0, /*max_blocks_per_seq=*/ 4,
-            /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ 0,
-            /*kv_dtype=Bf16*/ 1,
-        )
-    };
-    assert_eq!(rc, -1, "max_context_len=0 must be rejected");
 }
 
 // =============================================================================
@@ -575,25 +284,6 @@ fn paged_kv_write_factory_rejects_pool_shape_mismatch() {
         "paged_kv_write(...) must throw when K-pool interior dims disagree with \
          primitive scalar state (got {threw})"
     );
-}
-
-#[test]
-fn paged_attention_shim_rejects_sliding_window() {
-    // Independent extern-C-side guard: even if some caller bypasses
-    // the C++ factory's rejection (e.g. constructs a primitive
-    // directly) the shim will refuse a NEGATIVE sliding_window. Only
-    // negative values are illegal (the only "no mask" sentinel is 0).
-    let dummy: *mut c_void = std::ptr::dangling_mut::<c_void>();
-    let rc = unsafe {
-        mlx_paged_attn::mlx_paged_attn_paged_attention_dispatch(
-            dummy, 0, dummy, dummy, dummy, dummy, dummy, 0, /*num_seqs=*/ 1,
-            /*num_q_heads=*/ 8, /*num_kv_heads=*/ 4, /*head_size=*/ 64,
-            /*block_size=*/ 16, /*max_context_len=*/ 32, /*max_blocks_per_seq=*/ 4,
-            /*scale=*/ 0.125, /*softcap=*/ 0.0, /*sliding_window=*/ -1,
-            /*kv_dtype=Bf16*/ 1,
-        )
-    };
-    assert_eq!(rc, -1, "shim must reject sliding_window < 0");
 }
 
 // =============================================================================

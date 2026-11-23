@@ -193,7 +193,6 @@ fn grouped_conv(
     let hidden = config.hidden_size;
     let groups = hidden / config.conv_group_size;
     Ok(GroupedDynamicCausalConv {
-        source_enabled: false,
         base_kernel: required(
             params,
             &format!("{base}.{name}.base_kernel"),

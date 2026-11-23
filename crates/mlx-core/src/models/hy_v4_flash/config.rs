@@ -123,7 +123,6 @@ fn bad(msg: impl std::fmt::Display) -> Error {
 
 struct Meta<'a> {
     md: &'a HashMap<String, GgufMetaValue>,
-    bools: &'a HashMap<String, Vec<bool>>,
 }
 
 impl Meta<'_> {
@@ -165,10 +164,9 @@ impl Meta<'_> {
         }
     }
     fn bools(&self, key: &str) -> Result<&[bool]> {
-        self.bools
-            .get(&format!("{ARCH}.{key}"))
-            .map(Vec::as_slice)
-            .ok_or_else(|| bad(format!("missing bool array {ARCH}.{key}")))
+        self.get(key)?
+            .as_bool_array()
+            .ok_or_else(|| bad(format!("{ARCH}.{key} is not a bool array")))
     }
     fn u64s(&self, key: &str) -> Result<Vec<u64>> {
         let ints: Vec<i64> = match self.get(key)? {
@@ -221,8 +219,7 @@ impl Meta<'_> {
 }
 
 impl HyV4FlashConfig {
-    /// `bools` = the bool arrays of the same header (`header::Header::bools`).
-    pub fn from_gguf(gguf: &GgufFile, bools: &HashMap<String, Vec<bool>>) -> Result<Self> {
+    pub fn from_gguf(gguf: &GgufFile) -> Result<Self> {
         let md = &gguf.metadata;
         let arch = md
             .get("general.architecture")
@@ -232,7 +229,7 @@ impl HyV4FlashConfig {
                 "general.architecture is {arch:?}, not {ARCH:?}"
             )));
         }
-        let m = Meta { md, bools };
+        let m = Meta { md };
         let n_all = m.usize("block_count")?;
         let n_mtp = m.opt_usize("nextn_predict_layers")?.unwrap_or(0);
         if n_mtp > 1 {

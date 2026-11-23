@@ -137,7 +137,6 @@ pub(crate) fn tiny_dflash2_model_with_block(
     };
     let grouped_conv = || -> Result<GroupedDynamicCausalConv> {
         Ok(GroupedDynamicCausalConv {
-            source_enabled: false,
             base_kernel: MxArray::random_normal(
                 &[2, config.conv_kernel_size as i64, hidden as i64],
                 0.0,

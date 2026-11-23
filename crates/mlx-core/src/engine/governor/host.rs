@@ -165,53 +165,18 @@ pub(crate) fn query_pressure() -> Option<Pressure> {
 /// Splash `sampleHostPages`: the host's page counts and page size.
 #[cfg(target_os = "macos")]
 fn sample_pages() -> Option<(HostPages, u64)> {
-    unsafe extern "C" {
-        fn mach_host_self() -> libc::mach_port_t;
-        static mach_task_self_: libc::mach_port_t;
-        fn mach_port_deallocate(
-            task: libc::mach_port_t,
-            name: libc::mach_port_t,
-        ) -> libc::kern_return_t;
-        fn host_page_size(
-            host: libc::mach_port_t,
-            size: *mut libc::vm_size_t,
-        ) -> libc::kern_return_t;
-    }
-    let mut stats = std::mem::MaybeUninit::<libc::vm_statistics64>::zeroed();
-    let mut count = libc::HOST_VM_INFO64_COUNT;
-    let mut page_size: libc::vm_size_t = 0;
-    // SAFETY: plain Mach calls on this task's host port; `stats` holds
-    // `count` integers and the port is released after the read.
-    let (ok, stats) = unsafe {
-        let host = mach_host_self();
-        let page_ok = host_page_size(host, &mut page_size);
-        let ok = if page_ok == 0 {
-            libc::host_statistics64(
-                host,
-                libc::HOST_VM_INFO64,
-                stats.as_mut_ptr().cast(),
-                &mut count,
-            )
-        } else {
-            page_ok
-        };
-        mach_port_deallocate(mach_task_self_, host);
-        (ok, stats.assume_init())
-    };
-    if ok != 0 || page_size == 0 {
-        return None;
-    }
+    let stats = crate::utils::host::sample_macos_vm_stats()?;
     Some((
         HostPages {
-            free: u64::from(stats.free_count),
-            speculative: u64::from(stats.speculative_count),
-            file_backed: u64::from(stats.external_page_count),
-            purgeable: u64::from(stats.purgeable_count),
-            anonymous: u64::from(stats.internal_page_count),
-            compressor: u64::from(stats.compressor_page_count),
-            compressed: stats.total_uncompressed_pages_in_compressor,
+            free: stats.free,
+            speculative: stats.speculative,
+            file_backed: stats.file_backed,
+            purgeable: stats.purgeable,
+            anonymous: stats.anonymous,
+            compressor: stats.compressor,
+            compressed: stats.compressed,
         },
-        page_size as u64,
+        stats.page_size,
     ))
 }
 

@@ -5,13 +5,14 @@
 //! swapped orientation; on Hy4 latent == ff, so shape alone cannot.
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use napi::{Error, Result};
 
 use super::config::{Attn, HyV4FlashConfig};
-use super::header::Header;
-use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType};
+use crate::moe_stream::io::open_nocache;
+use crate::utils::gguf::{GgufFile, GgufTensorInfo, GgufTensorType, parse_gguf_reader};
 use crate::utils::gguf_source::{check_split_parts, check_tensor_bounds};
 
 pub const ENGRAM_TABLE: &str = "per_layer_token_embd.weight";
@@ -126,33 +127,33 @@ impl Scan {
     pub fn open(paths: &[PathBuf]) -> Result<Self> {
         let headers = paths
             .iter()
-            .map(|p| Header::read(p))
+            .map(|p| read_header(p))
             .collect::<Result<Vec<_>>>()?;
         Self::from_headers(paths, &headers)
     }
 
-    pub fn from_headers(paths: &[PathBuf], headers: &[Header]) -> Result<Self> {
+    pub fn from_headers(paths: &[PathBuf], headers: &[(GgufFile, u64)]) -> Result<Self> {
         if paths.is_empty() || paths.len() != headers.len() {
             return Err(bad("one header per shard path is required"));
         }
         let parts: Vec<(&Path, &GgufFile)> = paths
             .iter()
             .map(PathBuf::as_path)
-            .zip(headers.iter().map(|h| &h.gguf))
+            .zip(headers.iter().map(|(gguf, _)| gguf))
             .collect();
         check_split_parts(&parts)?;
-        for (path, h) in paths.iter().zip(headers) {
-            check_bounds(h, path)?;
+        for (path, (gguf, file_len)) in paths.iter().zip(headers) {
+            check_bounds(gguf, *file_len, path)?;
         }
-        let cfg = HyV4FlashConfig::from_gguf(&headers[0].gguf, &headers[0].bools)?;
+        let cfg = HyV4FlashConfig::from_gguf(&headers[0].0)?;
         let mut found: HashMap<String, Located> = HashMap::new();
-        for (shard, h) in headers.iter().enumerate() {
-            for t in &h.gguf.tensors {
+        for (shard, (gguf, _)) in headers.iter().enumerate() {
+            for t in &gguf.tensors {
                 found.insert(
                     t.name.clone(),
                     Located {
                         shard,
-                        data_offset: h.gguf.data_offset,
+                        data_offset: gguf.data_offset,
                         info: t.clone(),
                     },
                 );
@@ -162,30 +163,40 @@ impl Scan {
     }
 }
 
+fn read_header(path: &Path) -> Result<(GgufFile, u64)> {
+    let file = open_nocache(path)?;
+    let file_len = file
+        .metadata()
+        .map_err(|e| bad(format!("'{}': {e}", path.display())))?
+        .len();
+    let gguf = parse_gguf_reader(BufReader::with_capacity(1 << 20, file))
+        .map_err(|e| bad(format!("'{}': {}", path.display(), e.reason)))?;
+    Ok((gguf, file_len))
+}
+
 /// `check_tensor_bounds` sizes type 43 as MXFP8 (33 B / 32), which the F8
 /// Engram table is not; the table gets its own 1 B/value bound.
-fn check_bounds(h: &Header, path: &Path) -> Result<()> {
+fn check_bounds(gguf: &GgufFile, file_len: u64, path: &Path) -> Result<()> {
     let rest = GgufFile {
-        version: h.gguf.version,
-        tensor_count: h.gguf.tensor_count,
+        version: gguf.version,
+        tensor_count: gguf.tensor_count,
         metadata: HashMap::new(),
-        tensors: h
-            .gguf
+        tensors: gguf
             .tensors
             .iter()
             .filter(|t| t.name != ENGRAM_TABLE)
             .cloned()
             .collect(),
-        alignment: h.gguf.alignment,
-        data_offset: h.gguf.data_offset,
+        alignment: gguf.alignment,
+        data_offset: gguf.data_offset,
     };
-    check_tensor_bounds(&rest, h.file_len, path)?;
-    if let Some(t) = h.gguf.tensors.iter().find(|t| t.name == ENGRAM_TABLE) {
+    check_tensor_bounds(&rest, file_len, path)?;
+    if let Some(t) = gguf.tensors.iter().find(|t| t.name == ENGRAM_TABLE) {
         let end = t
             .num_elements()?
-            .checked_add(h.gguf.data_offset)
+            .checked_add(gguf.data_offset)
             .and_then(|x| x.checked_add(t.offset));
-        if end.is_none_or(|end| end > h.file_len) {
+        if end.is_none_or(|end| end > file_len) {
             return Err(bad(format!(
                 "'{}': the Engram table runs past the end of the file",
                 path.display()

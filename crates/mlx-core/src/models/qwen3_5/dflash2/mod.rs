@@ -186,18 +186,12 @@ impl DFlash2Model {
                 .unwrap_or(target.intermediate_size),
         ];
         let supported = self.config.supports_moe_execution_defaults(target_profile);
-        let source_conv_supported = self.config.supports_source_conv(target_profile);
         // Also safe if a future internal caller changes policy after tracing:
         // erase captured graphs without clearing a prior fail-closed latch.
         self.invalidate_compiled();
-        self.execution_policy = self
-            .execution_policy
-            .with_moe_profile(supported)
-            .with_source_conv_profile(source_conv_supported);
+        self.execution_policy = self.execution_policy.with_moe_profile(supported);
         for layer in &mut self.layers {
             layer.attention.tensor_attention_enabled = self.execution_policy.tensor_attention();
-            layer.attention_conv.source_enabled = self.execution_policy.source_conv();
-            layer.mlp_conv.source_enabled = self.execution_policy.source_conv();
         }
     }
 

@@ -39,16 +39,6 @@ impl Qwen35MoeInner {
     /// in `qwen3_5::model::Qwen35Inner::save_model_sync`, adapted for the MoE
     /// MLP variant (per-layer dense vs sparse expert routing).
     pub(crate) fn save_model_sync(&self, save_path: &str) -> Result<()> {
-        if self.source_moe_policy.active() {
-            return Err(Error::from_reason(
-                "source MoE arithmetic diagnostic cannot export without its policy",
-            ));
-        }
-        if self.source_norm_identity.is_some() {
-            return Err(Error::from_reason(
-                "source norm diagnostic cannot export weights without its arithmetic policy",
-            ));
-        }
         use crate::models::qwen3_5_moe::decoder_layer::{AttentionType, MLPType};
 
         if let Some(component) = self.first_quantized_save_component() {
@@ -315,16 +305,6 @@ impl Qwen35MoeInner {
         config: crate::grpo::engine::GRPOEngineConfig,
         _model_type: crate::training_model::ModelType,
     ) -> Result<()> {
-        if self.source_moe_policy.active() {
-            return Err(Error::from_reason(
-                "source MoE arithmetic diagnostic is inference-only; reload to train",
-            ));
-        }
-        if self.source_norm_identity.is_some() {
-            return Err(Error::from_reason(
-                "source norm diagnostic is inference-only; reload without the override to train",
-            ));
-        }
         if self.training_state.is_some() {
             return Err(napi::Error::from_reason(
                 "Training state already initialized. A single model thread can host only one active training run.",

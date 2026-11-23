@@ -276,18 +276,14 @@ pub(crate) fn paged_attention_v2_partition_upper_bound(
     grouped.map_or(generic, |grouped| generic.max(grouped))
 }
 
-/// Outcome of `validate_kv_input`: the (kernel-input dtype, num_tokens) tuple
-/// the caller needs after a successful validation. Splitting validation off
-/// `update_keys_values` lets us assert all shape/dtype rejection paths in
-/// pure-CPU unit tests (no `LayerKVPool`, no `MetalState::get()`).
+/// Outcome of `validate_kv_input`: the validated `num_tokens` the caller
+/// needs after a successful validation. Splitting validation off
+/// `update_keys_values_native` lets us assert all shape/dtype rejection paths
+/// in pure-CPU unit tests (no `LayerKVPool`, no `MetalState::get()`).
 #[cfg(any(target_os = "macos", test))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KvInputInfo {
     pub num_tokens: u32,
-    /// Kernel-input dtype routed through `LayerKVPool::write_kv`. Computed
-    /// here so the dispatcher doesn't redo the match.
-    #[cfg(target_os = "macos")]
-    pub input_metal_dtype: mlx_paged_attn::metal::MetalDtype,
 }
 
 /// Pure-data view of an `MxArray`'s metadata. `validate_kv_input` only
@@ -354,7 +350,7 @@ fn metal_io_dtype(cache_dtype: mlx_paged_attn::metal::MetalDtype) -> Result<DTyp
 /// 6. The cache takes rows of its io dtype only (an int8 cache takes bf16
 ///    rows, Splash io is always bf16).
 ///
-/// Returns `KvInputInfo { num_tokens, input_metal_dtype }` on success.
+/// Returns `KvInputInfo { num_tokens }` on success.
 #[cfg(any(target_os = "macos", test))]
 pub(crate) fn validate_kv_input(
     keys: &KvTensorMeta,
@@ -471,23 +467,7 @@ pub(crate) fn validate_kv_input(
         ));
     }
 
-    #[cfg(target_os = "macos")]
-    let input_metal_dtype = match keys.dtype {
-        DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
-        DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
-        // Unreachable: the match above already rejected anything else.
-        other => {
-            return Err(format!(
-                "update_keys_values: unsupported kv dtype {other:?} (expected f16/bf16)"
-            ));
-        }
-    };
-
-    Ok(KvInputInfo {
-        num_tokens,
-        #[cfg(target_os = "macos")]
-        input_metal_dtype,
-    })
+    Ok(KvInputInfo { num_tokens })
 }
 
 /// Outcome of `validate_query_input`. Mirrors `validate_kv_input` in
@@ -4432,13 +4412,19 @@ impl PagedKVCacheAdapter {
                 .deep_copy()
                 .map_err(|error| format!("restore sliding values copy: {error}"))?;
             if let Err(error) =
-                self.update_keys_values(layer as u32, &keys, &values, first_live_position)
+                self.update_keys_values_native(layer as u32, &keys, &values, first_live_position)
             {
                 let _ = self.release_request_for(seq_id);
                 return Err(format!(
                     "restore_sliding_prefix_for failed to upload layer {layer}: {error}"
                 ));
             }
+        }
+        if let Err(error) = self.eval_pending_pool_writes() {
+            let _ = self.release_request_for(seq_id);
+            return Err(format!(
+                "restore_sliding_prefix_for failed to evaluate uploaded layers: {error}"
+            ));
         }
         Ok(())
     }
@@ -5105,20 +5091,6 @@ impl PagedKVCacheAdapter {
     }
 
     #[cfg(target_os = "macos")]
-    fn clear_native_pool_arrays_for_layer(&mut self, layer_idx: u32) -> Result<(), String> {
-        let idx = layer_idx as usize;
-        if idx >= self.native_pool_arrays.len() {
-            return Err(format!(
-                "clear_native_pool_arrays_for_layer: layer_idx {layer_idx} out of range \
-                 (num_layers = {})",
-                self.native_pool_arrays.len()
-            ));
-        }
-        self.native_pool_arrays[idx] = None;
-        Ok(())
-    }
-
-    #[cfg(target_os = "macos")]
     fn write_slot_mapping_array(
         &mut self,
         first_logical_position: u32,
@@ -5352,162 +5324,15 @@ impl PagedKVCacheAdapter {
         }
     }
 
-    /// Write a chunk of K/V tokens into the layer's paged Metal buffers
-    /// via the `reshape_and_cache` kernel.
+    /// Write a chunk of K/V tokens into the layer's paged Metal buffers by
+    /// emitting the C++ `paged_kv_write` custom primitive and storing the
+    /// returned pool arrays so later MLX paged-attention reads depend on the
+    /// write in the same graph.
     ///
     /// `keys` / `values` must have shape `[num_tokens, num_kv_heads,
     /// head_size]` matching the pool's config. `first_logical_position`
     /// is the logical-token index in the active request where this chunk
-    /// starts; it must equal `current_token_count - num_tokens` (i.e. the
-    /// chunk represents the most recently recorded tokens). On mismatch
-    /// the adapter returns a descriptive error rather than silently
-    /// writing into the wrong slots.
-    ///
-    /// Typical caller flow per layer per chunk:
-    ///
-    /// ```ignore
-    /// adapter.allocate_suffix_blocks(total)?;       // before writing
-    /// adapter.record_tokens(chunk_token_ids)?;      // bookkeeping
-    /// let first = adapter.current_token_count() - chunk_token_ids.len() as u32;
-    /// for layer in 0..num_layers {
-    ///     adapter.update_keys_values(layer, &k[layer], &v[layer], first)?;
-    /// }
-    /// ```
-    #[cfg(target_os = "macos")]
-    pub fn update_keys_values(
-        &mut self,
-        layer_idx: u32,
-        keys: &MxArray,
-        values: &MxArray,
-        first_logical_position: u32,
-    ) -> Result<(), String> {
-        // 1. Active request?
-        if self.block_table.is_none() {
-            return Err(
-                "update_keys_values called before reset_for_new_request (no active request)"
-                    .to_string(),
-            );
-        }
-
-        // 2. Layer in range?
-        let num_layers = self.layer_kv_pool.num_layers();
-        if (layer_idx as usize) >= num_layers {
-            return Err(format!(
-                "update_keys_values: layer_idx {layer_idx} out of range (num_layers = \
-                 {num_layers})"
-            ));
-        }
-
-        // 3. Shape + dtype sanity. Routed through `validate_kv_input` so the
-        //    rejection paths can be exercised on any platform (no Metal
-        //    required, no MLX runtime — tests pass `KvTensorMeta` literals
-        //    directly). The kernel re-derives its strides from
-        //    `config.num_kv_heads * config.head_size`; passing e.g.
-        //    `[num_tokens, 1, 1]` keys would still cause the kernel to read
-        //    `num_kv_heads * head_size` worth of bytes per token, walking
-        //    off the end of the buffer. Validation also rejects Float32 /
-        //    unsupported dtypes whose element width does not match the
-        //    pool's 2-byte buffer layout — routing them through `write_kv`
-        //    would silently corrupt the cache or write OOB on the GPU.
-        let keys_meta = KvTensorMeta::from_array(keys, "keys")?;
-        let values_meta = KvTensorMeta::from_array(values, "values")?;
-        let info = validate_kv_input(
-            &keys_meta,
-            &values_meta,
-            self.layer_kv_pool.config(),
-            self.layer_kv_pool.cache_dtype(),
-        )?;
-        let num_tokens = info.num_tokens;
-        if num_tokens == 0 {
-            // Nothing to write — silently succeed rather than dispatch
-            // a zero-sized kernel.
-            return Ok(());
-        }
-
-        // 4. Alignment check: chunk must end at the current token cursor.
-        let current = self.request_tokens.len() as u32;
-        let expected_first = current.checked_sub(num_tokens).ok_or_else(|| {
-            format!(
-                "update_keys_values: chunk has {num_tokens} tokens but only {current} \
-                     have been recorded (call record_tokens first)"
-            )
-        })?;
-        if first_logical_position != expected_first {
-            return Err(format!(
-                "update_keys_values: first_logical_position {first_logical_position} does \
-                 not align with the recorded suffix (expected {expected_first} based on \
-                 current_token_count {current} and chunk size {num_tokens}). The chunk \
-                 must cover the most recently recorded tokens."
-            ));
-        }
-
-        // 5. Build slot mapping and dispatch. The raw Metal writer runs
-        // outside MLX's graph scheduler, so if this layer has a pending
-        // graph-native write chain, force that chain first. After the raw
-        // writer completes synchronously, clear the graph view for this layer
-        // so later graph attention wraps the physical pool after the raw
-        // mutation instead of reusing a stale dependency-carrying view.
-        self.eval_pending_pool_write_for_layer(layer_idx)?;
-        let slot_mapping = self.build_slot_mapping(first_logical_position, num_tokens)?;
-        let trace_enabled = inference_trace_enabled();
-        let inference_debug_enabled =
-            tracing::enabled!(target: "mlx_core::inference", tracing::Level::DEBUG);
-        let write_trace_start = (trace_enabled || inference_debug_enabled).then(Instant::now);
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged_kv update_keys_values_start layer={} first_position={} num_tokens={} current_tokens={} blocks={} first_slot={} last_slot={}",
-                layer_idx,
-                first_logical_position,
-                num_tokens,
-                self.request_tokens.len(),
-                self.num_allocated_blocks(),
-                slot_mapping.first().copied().unwrap_or(-1),
-                slot_mapping.last().copied().unwrap_or(-1)
-            ));
-        }
-
-        // SAFETY: keys/values are valid `MxArray`s held by the caller for
-        // the duration of this call; `as_raw_ptr` returns the borrowed
-        // mlx_array handle. The kernel dispatcher waits until completion
-        // before returning, so the buffers stay valid.
-        unsafe {
-            self.layer_kv_pool.write_kv(
-                layer_idx,
-                keys.as_raw_ptr(),
-                values.as_raw_ptr(),
-                &slot_mapping,
-                info.input_metal_dtype,
-            )
-        }?;
-        if trace_enabled {
-            write_inference_trace(format_args!(
-                "[MLX_TRACE] paged_kv update_keys_values_done layer={} first_position={} num_tokens={} elapsed_ms={:.1}",
-                layer_idx,
-                first_logical_position,
-                num_tokens,
-                write_trace_start.map(elapsed_ms).unwrap_or(0.0)
-            ));
-        }
-        if inference_debug_enabled {
-            tracing::debug!(
-                target: "mlx_core::inference",
-                event = "paged_kv_legacy_write_done",
-                layer = layer_idx,
-                first_position = first_logical_position,
-                sequence_tokens = num_tokens,
-                elapsed_ms = write_trace_start.map(elapsed_ms).unwrap_or(0.0),
-                "paged KV legacy layer write completed"
-            );
-        }
-        self.clear_native_pool_arrays_for_layer(layer_idx)?;
-        Ok(())
-    }
-
-    /// Graph-native variant of [`Self::update_keys_values`]. Instead of
-    /// extracting Metal buffers from `keys` / `values` and synchronizing MLX,
-    /// this emits the C++ `paged_kv_write` custom primitive and stores the
-    /// returned pool arrays so later MLX paged-attention reads depend on the
-    /// write in the same graph.
+    /// starts; it must equal `current_token_count - num_tokens`.
     #[cfg(target_os = "macos")]
     pub fn update_keys_values_native(
         &mut self,
@@ -6127,17 +5952,6 @@ impl PagedKVCacheAdapter {
     /// this on another platform is a programming error rather than a
     /// runtime fallback.
     #[cfg(not(target_os = "macos"))]
-    pub fn update_keys_values(
-        &mut self,
-        _layer_idx: u32,
-        _keys: &MxArray,
-        _values: &MxArray,
-        _first_logical_position: u32,
-    ) -> Result<(), String> {
-        Err("update_keys_values is only supported on macOS (Metal backend)".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
     pub fn update_keys_values_native(
         &mut self,
         _layer_idx: u32,
@@ -6497,10 +6311,10 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
-    /// Graph-native decode attention. Unlike [`Self::gather_kv_for_decode`],
-    /// this consumes the MLX K/V pool arrays tracked in `native_pool_arrays`,
-    /// so a lazy native `paged_kv_write` can feed the attention read through
-    /// normal graph dependencies without a per-layer synchronization point.
+    /// Graph-native decode attention. Consumes the MLX K/V pool arrays tracked
+    /// in `native_pool_arrays`, so a lazy native `paged_kv_write` can feed the
+    /// attention read through normal graph dependencies without a per-layer
+    /// synchronization point.
     #[cfg(target_os = "macos")]
     pub fn gather_kv_for_decode_graph(
         &mut self,
@@ -6962,186 +6776,6 @@ impl PagedKVCacheAdapter {
 
         MxArray::from_handle(raw, "gather_kv_for_decode_graph")
             .map_err(|e| format!("gather_kv_for_decode_graph: failed to wrap output array: {e}"))
-    }
-
-    #[cfg(target_os = "macos")]
-    pub fn gather_kv_for_decode(
-        &mut self,
-        layer_idx: u32,
-        queries: &MxArray,
-        scale: f32,
-        softcap: f32,
-    ) -> Result<MxArray, String> {
-        self.gather_kv_for_decode_with_route(
-            layer_idx,
-            queries,
-            scale,
-            softcap,
-            PagedDecodeRouteHint::Auto,
-            0,
-        )
-        .map(|(output, _)| output)
-    }
-
-    /// Synchronous raw-Metal fallback with the same compute-route hint and
-    /// grouped partition plan (`grouped_stripes`, 0 = unplanned) as the
-    /// graph-native path. Returns whether the grouped D512 kernel was actually
-    /// selected, allowing callers to report a truthful demotion or fallback.
-    #[cfg(target_os = "macos")]
-    pub(crate) fn gather_kv_for_decode_with_route(
-        &mut self,
-        layer_idx: u32,
-        queries: &MxArray,
-        scale: f32,
-        softcap: f32,
-        route_hint: PagedDecodeRouteHint,
-        grouped_stripes: u32,
-    ) -> Result<(MxArray, bool), String> {
-        // 1. Active request?
-        if self.block_table.is_none() {
-            return Err("gather_kv_for_decode called before reset_for_new_request".to_string());
-        }
-
-        // The raw Metal route has no int8 kernel; Splash reads int8 pages
-        // through one path (`splash_attention_page_softmax`).
-        if self.layer_kv_pool.cache_dtype() == mlx_paged_attn::metal::MetalDtype::Int8 {
-            let output = self.gather_kv_for_decode_graph_with_plan(
-                layer_idx,
-                queries,
-                scale,
-                softcap,
-                route_hint,
-                grouped_stripes,
-            )?;
-            output.eval();
-            return Ok((output, false));
-        }
-
-        // Raw Metal gather reads the pool outside MLX's graph scheduler. If a
-        // prior native `paged_kv_write` for this layer is still lazy, force it
-        // now so the gather sees the just-written K/V.
-        self.eval_pending_pool_write_for_layer(layer_idx)?;
-
-        let block_table = self.block_table.as_ref().ok_or_else(|| {
-            "gather_kv_for_decode called before reset_for_new_request".to_string()
-        })?;
-
-        // 2. Tokens recorded?
-        let num_tokens = block_table.num_tokens();
-        if num_tokens == 0 {
-            return Err("gather_kv_for_decode called before any tokens recorded".to_string());
-        }
-
-        // 3. Validate query metadata. Routed through `validate_query_input`
-        //    so the rejection paths are CPU-only and don't require Metal /
-        //    MLX runtime to exercise.
-        let q_meta = KvTensorMeta::from_array(queries, "queries")?;
-        let info = validate_query_input(
-            &q_meta,
-            self.layer_kv_pool.config(),
-            self.layer_kv_pool.num_layers(),
-            layer_idx,
-        )?;
-        let num_query_heads = info.num_query_heads;
-
-        // 4. Build block_ids array (i32) from the same first retained block
-        //    and visible context as the graph-native route, so both routes
-        //    reduce attention over identical partitions. PhysicalBlock
-        //    block_ids are u32 ≥ 0; bounded by num_blocks (allocator
-        //    capacity), far below i32::MAX. Cast is safe.
-        let (first_block, visible_tokens) =
-            decode_read_span(num_tokens, self.sliding_window, self.block_size);
-        let block_ids = build_decode_block_ids(block_table, first_block);
-
-        // 4b. Capacity guard: `record_tokens` does not currently enforce that
-        //     the running token count stays within the allocated block table
-        //     (a caller that forgets `allocate_suffix_blocks` will silently
-        //     advance `num_tokens` past `block_ids.len() * block_size`).
-        //     Without this check the kernel would dispatch with a
-        //     `context_lens` value larger than the block-table buffer it
-        //     uploads, reading past the end on the GPU. Compute the allocated
-        //     capacity via `checked_mul` so the multiplication itself can
-        //     never overflow (block_ids and block_size are both u32-bounded
-        //     by allocator capacity, so the product fits in u64 easily).
-        let block_size_us = self.block_size as usize;
-        let allocated_capacity = block_ids.len().checked_mul(block_size_us).ok_or_else(|| {
-            format!(
-                "gather_kv_for_decode: capacity overflow computing block_ids.len() ({}) * \
-                 block_size ({})",
-                block_ids.len(),
-                block_size_us,
-            )
-        })?;
-        if (visible_tokens as usize) > allocated_capacity {
-            return Err(format!(
-                "gather_kv_for_decode: context length ({num_tokens}; {visible_tokens} from \
-                 block {first_block}) exceeds allocated capacity \
-                 (block_ids.len()={} blocks × block_size={} = {allocated_capacity} slots). \
-                 Call allocate_suffix_blocks(total_tokens) before recording tokens past the \
-                 currently allocated capacity.",
-                block_ids.len(),
-                block_size_us,
-            ));
-        }
-
-        // 5. Resolve the queries dtype that `gather_attention` will thread
-        //    into the kernel-name lookup. The validated `q_meta` already
-        //    rejected anything other than Float16 / BFloat16, so this
-        //    match is exhaustive over the allowed set.
-        let query_metal_dtype = match q_meta.dtype {
-            DType::Float16 => mlx_paged_attn::metal::MetalDtype::Float16,
-            DType::BFloat16 => mlx_paged_attn::metal::MetalDtype::BFloat16,
-            other => {
-                return Err(format!(
-                    "gather_kv_for_decode: unsupported query dtype {other:?} \
-                     (validate_query_input should have rejected this)"
-                ));
-            }
-        };
-
-        // 6. Dispatch and wrap output in an MLX view over the Metal buffer.
-        //    This avoids the old GPU → host → MLX copy in the decode hot path.
-        // SAFETY:
-        // - queries.as_raw_ptr() is borrowed from `queries: &MxArray` and
-        //   stays valid for the synchronous dispatch.
-        // - Block / context buffers are constructed and held inside
-        //   `gather_attention` for the dispatch's lifetime.
-        // - Pool key/value caches outlive `&self`.
-        let raw_route_hint = match route_hint {
-            PagedDecodeRouteHint::Auto => mlx_paged_attn::metal::PagedAttentionRouteHint::Auto,
-            PagedDecodeRouteHint::ForceD512Staged => {
-                mlx_paged_attn::metal::PagedAttentionRouteHint::ForceD512Staged
-            }
-            // D128 is a graph-native specialization. The independent eager
-            // Metal bridge conservatively retains its generic implementation.
-            PagedDecodeRouteHint::ForceGeneric | PagedDecodeRouteHint::ForceD128 => {
-                mlx_paged_attn::metal::PagedAttentionRouteHint::ForceGeneric
-            }
-        };
-        let output = unsafe {
-            self.layer_kv_pool.gather_attention_with_route(
-                layer_idx,
-                queries.as_raw_ptr(),
-                query_metal_dtype,
-                &block_ids,
-                visible_tokens,
-                num_query_heads,
-                scale,
-                softcap,
-                self.sliding_window as i32,
-                raw_route_hint,
-                grouped_stripes,
-            )?
-        };
-        let used_grouped_d512 = output.used_grouped_d512;
-
-        // SAFETY: `to_mlx_array_view` materializes a fresh mlx_array wrapper
-        // and retains the underlying Metal buffer. Ownership transfers to the
-        // MxArray below.
-        let raw = unsafe { output.to_mlx_array_view()? };
-        MxArray::from_handle(raw, "gather_kv_for_decode")
-            .map(|output| (output, used_grouped_d512))
-            .map_err(|e| format!("gather_kv_for_decode: failed to wrap output array: {e}"))
     }
 
     /// Build and cache a compact one-dimensional physical block-ID array for
@@ -8017,30 +7651,6 @@ impl PagedKVCacheAdapter {
         _grouped_stripes: u32,
     ) -> Result<MxArray, String> {
         Err("gather_kv_for_decode_graph is only supported on macOS (Metal backend)".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn gather_kv_for_decode(
-        &mut self,
-        _layer_idx: u32,
-        _queries: &MxArray,
-        _scale: f32,
-        _softcap: f32,
-    ) -> Result<MxArray, String> {
-        Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub(crate) fn gather_kv_for_decode_with_route(
-        &mut self,
-        _layer_idx: u32,
-        _queries: &MxArray,
-        _scale: f32,
-        _softcap: f32,
-        _route_hint: PagedDecodeRouteHint,
-        _grouped_stripes: u32,
-    ) -> Result<(MxArray, bool), String> {
-        Err("gather_kv_for_decode is only supported on macOS (Metal backend)".to_string())
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -9770,6 +9380,7 @@ impl PagedKVCacheAdapter {
         metal_io_dtype(self.layer_kv_pool.cache_dtype()).ok()
     }
 
+    #[cfg(test)]
     pub(crate) fn cache_dtype(&self) -> mlx_paged_attn::metal::MetalDtype {
         self.layer_kv_pool.cache_dtype()
     }
@@ -15636,7 +15247,7 @@ mod tests {
         };
         let k = dummy_kv(1, 1, 32);
         let v = dummy_kv(1, 1, 32);
-        let res = adapter.update_keys_values(0, &k, &v, 0);
+        let res = adapter.update_keys_values_native(0, &k, &v, 0);
         assert!(res.is_err(), "expected error before reset_for_new_request");
         let msg = res.err().unwrap();
         assert!(
@@ -15659,7 +15270,7 @@ mod tests {
         let k = dummy_kv(4, 1, 32);
         let v = dummy_kv(4, 1, 32);
         // Pool was constructed with num_layers = 2; 99 is far out of range.
-        let res = adapter.update_keys_values(99, &k, &v, 0);
+        let res = adapter.update_keys_values_native(99, &k, &v, 0);
         assert!(res.is_err(), "expected layer_idx OOB error");
         let msg = res.err().unwrap();
         assert!(
@@ -15680,7 +15291,7 @@ mod tests {
         adapter.record_tokens(&[1, 2, 3, 4]).unwrap();
         let k = dummy_kv(4, 1, 32);
         let v = dummy_kv(3, 1, 32); // wrong num_tokens
-        let res = adapter.update_keys_values(0, &k, &v, 0);
+        let res = adapter.update_keys_values_native(0, &k, &v, 0);
         assert!(res.is_err(), "expected shape mismatch error");
         let msg = res.err().unwrap();
         assert!(
@@ -15705,7 +15316,7 @@ mod tests {
         let k = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
         let v = dummy_kv_with_dtype(4, 1, 32, crate::array::DType::Float16);
         // Correct value is current(4) - num_tokens(4) = 0. Pass 7 to force misalignment.
-        let res = adapter.update_keys_values(0, &k, &v, 7);
+        let res = adapter.update_keys_values_native(0, &k, &v, 7);
         assert!(res.is_err(), "expected alignment error");
         let msg = res.err().unwrap();
         assert!(
@@ -15958,7 +15569,9 @@ mod tests {
         k.eval();
         v.eval();
 
-        let res = adapter.update_keys_values(0, &k, &v, 0);
+        let res = adapter
+            .update_keys_values_native(0, &k, &v, 0)
+            .and_then(|()| adapter.eval_pending_pool_writes());
         match res {
             Ok(()) => {}
             Err(e) => {
@@ -15966,7 +15579,7 @@ mod tests {
                 // the explicit "Metal GPU not available" error as a skip.
                 assert!(
                     e.contains("Metal GPU not available"),
-                    "unexpected error from update_keys_values: {e}"
+                    "unexpected error from update_keys_values_native: {e}"
                 );
             }
         }
@@ -16015,13 +15628,15 @@ mod tests {
         k.eval();
         v.eval();
 
-        let res = adapter.update_keys_values(0, &k, &v, 0);
+        let res = adapter
+            .update_keys_values_native(0, &k, &v, 0)
+            .and_then(|()| adapter.eval_pending_pool_writes());
         match res {
             Ok(()) => {}
             Err(e) => {
                 assert!(
                     e.contains("Metal GPU not available"),
-                    "unexpected error from update_keys_values (BF16): {e}"
+                    "unexpected error from update_keys_values_native (BF16): {e}"
                 );
             }
         }
@@ -16187,7 +15802,7 @@ mod tests {
         // Float16 zeros so this never reaches the kernel anyway, but the
         // active-request guard fires first.
         let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("zeros");
-        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
+        let res = adapter.gather_kv_for_decode_graph(0, &q, 0.5, 1.0);
         assert!(res.is_err(), "expected error before reset_for_new_request");
         let msg = res.err().unwrap();
         assert!(
@@ -16209,7 +15824,7 @@ mod tests {
         adapter.allocate_suffix_blocks(4).unwrap();
         // Note: NO record_tokens here.
         let q = MxArray::zeros(&[1, 1, 32], Some(DType::Float16)).expect("zeros");
-        let res = adapter.gather_kv_for_decode(0, &q, 0.5, 1.0);
+        let res = adapter.gather_kv_for_decode_graph(0, &q, 0.5, 1.0);
         assert!(res.is_err(), "expected error when num_tokens == 0");
         let msg = res.err().unwrap();
         assert!(
@@ -16842,13 +16457,13 @@ mod tests {
         let v = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("v zeros");
         k.eval();
         v.eval();
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
 
         // Two query heads, head_size matches the pool, dtype Float16.
@@ -16856,14 +16471,15 @@ mod tests {
         q.eval();
 
         let scale = 1.0_f32 / (64.0_f32).sqrt();
-        let out = match adapter.gather_kv_for_decode(0, &q, scale, 1.0) {
+        let out = match adapter.gather_kv_for_decode_graph(0, &q, scale, 1.0) {
             Ok(arr) => arr,
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_gather_kv_for_decode_writes_succeed_on_metal: {e}");
                 return;
             }
-            Err(e) => panic!("unexpected error from gather_kv_for_decode: {e}"),
+            Err(e) => panic!("unexpected error from gather_kv_for_decode_graph: {e}"),
         };
+        out.eval();
 
         // Output shape: [1, num_query_heads, head_size]. The kernel writes
         // Float16 and the adapter wraps that Metal buffer as an MLX view.
@@ -16986,13 +16602,13 @@ mod tests {
         let v = MxArray::zeros(&[4, 1, 64], Some(DType::Float16)).expect("v zeros");
         k.eval();
         v.eval();
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_gather_kv_for_prefill_chunk_writes_succeed_on_metal: {e}");
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
 
         let q = MxArray::zeros(&[2, 2, 64], Some(DType::Float16)).expect("q zeros");
@@ -17078,7 +16694,7 @@ mod tests {
         let v = MxArray::from_float16(&v_bits, &[4, 1, 64]).expect("v values");
         k.eval();
         v.eval();
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!(
@@ -17086,7 +16702,7 @@ mod tests {
                 );
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
 
         let q = MxArray::zeros(&[2, 2, 64], Some(DType::Float16)).expect("q zeros");
@@ -17212,7 +16828,9 @@ mod tests {
                     .map_err(|e| format!("v values: {e}"))?;
                 k.eval();
                 v.eval();
-                adapter.update_keys_values(0, &k, &v, first_pos)
+                adapter
+                    .update_keys_values_native(0, &k, &v, first_pos)
+                    .and_then(|()| adapter.eval_pending_pool_writes())
             };
 
         // Chunk boundary that production reaches before the chunk under test:
@@ -17449,7 +17067,9 @@ mod tests {
                     .map_err(|e| format!("v values: {e}"))?;
                 k.eval();
                 v.eval();
-                adapter.update_keys_values(0, &k, &v, first_pos)
+                adapter
+                    .update_keys_values_native(0, &k, &v, first_pos)
+                    .and_then(|()| adapter.eval_pending_pool_writes())
             };
 
         adapter.record_tokens(&(0..FIX_PREFIX_LEN).collect::<Vec<_>>())?;
@@ -17564,7 +17184,7 @@ mod tests {
             .unwrap();
             k.eval();
             v.eval();
-            adapter.update_keys_values(0, &k, &v, 0).unwrap();
+            adapter.update_keys_values_native(0, &k, &v, 0).unwrap();
             let q = MxArray::from_float32(
                 &(0..q_heads * 512)
                     .map(|i| (i as f32 * 0.021).cos())
@@ -17919,7 +17539,7 @@ mod tests {
             };
             adapter.reset_for_new_request(7).unwrap();
             adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
-            adapter.update_keys_values(0, &k, &v, 0).unwrap();
+            adapter.update_keys_values_native(0, &k, &v, 0).unwrap();
             for query_len in [1u32, 17] {
                 let q_data = data(query_len as usize * HQ * D, 19, 109);
                 let q = MxArray::from_float32(&q_data, &[query_len as i64, HQ as i64, D as i64])
@@ -18010,98 +17630,6 @@ mod tests {
         }
     }
 
-    /// The raw (synchronous) decode route and the graph-native one must give
-    /// the same bits. Both read the span from `decode_read_span`; a raw route
-    /// that passed the whole table plus the window mask partitioned the same
-    /// keys at different 512-token boundaries and rounded differently, so a
-    /// graph-construction fallback (or `MLX_PAGED_GRAPH_DECODE_GATHER=0`)
-    /// changed the greedy transcript.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn raw_and_graph_decode_routes_read_the_same_window() {
-        if !unsafe { mlx_sys::mlx_metal_is_available() } {
-            return;
-        }
-        const N: u32 = 2579;
-        const HQ: usize = 32;
-        const HKV: usize = 2;
-        const D: usize = 128;
-        let data = |len: usize, stride: usize, period: usize| {
-            (0..len)
-                .map(|i| ((i * stride % period) as f32 - (period / 2) as f32) / 64.0)
-                .collect::<Vec<_>>()
-        };
-        let k = MxArray::from_float32(
-            &data(N as usize * HKV * D, 13, 113),
-            &[N as i64, HKV as i64, D as i64],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let v = MxArray::from_float32(
-            &data(N as usize * HKV * D, 17, 127),
-            &[N as i64, HKV as i64, D as i64],
-        )
-        .unwrap()
-        .astype(DType::BFloat16)
-        .unwrap();
-        let q = MxArray::from_float32(&data(HQ * D, 19, 109), &[1, HQ as i64, D as i64])
-            .unwrap()
-            .astype(DType::BFloat16)
-            .unwrap();
-        // The raw route reads the query's Metal buffer directly.
-        q.eval();
-        let scale = 1.0 / (D as f32).sqrt();
-        for window in [0, 513, 2048] {
-            let config = mlx_paged_attn::PagedAttentionConfig {
-                block_size: 16,
-                num_kv_heads: HKV as u32,
-                head_size: D as u32,
-                num_layers: 1,
-                gpu_memory_mb: 256,
-                max_seq_len: Some(8192),
-                max_batch_size: Some(1),
-            };
-            let pool = Arc::new(
-                mlx_paged_attn::LayerKVPool::new(
-                    config,
-                    512,
-                    512,
-                    mlx_paged_attn::metal::MetalDtype::BFloat16,
-                )
-                .unwrap(),
-            );
-            let allocator = Arc::new(Mutex::new(BlockAllocator::new(512, 512, 16)));
-            let mut adapter = if window == 0 {
-                PagedKVCacheAdapter::new(allocator, pool, 16).unwrap()
-            } else {
-                PagedKVCacheAdapter::new_sliding(allocator, pool, 16, window, 8192).unwrap()
-            };
-            adapter.reset_for_new_request(7).unwrap();
-            adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
-            adapter.update_keys_values(0, &k, &v, 0).unwrap();
-            let raw = adapter
-                .gather_kv_for_decode(0, &q, scale, 1.0)
-                .unwrap()
-                .to_float32()
-                .unwrap()
-                .to_vec();
-            let graph = adapter
-                .gather_kv_for_decode_graph(0, &q, scale, 1.0)
-                .unwrap()
-                .to_float32()
-                .unwrap()
-                .to_vec();
-            assert_eq!(raw.len(), HQ * D);
-            assert!(
-                raw.iter()
-                    .zip(&graph)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "window={window}: raw and graph decode routes differ"
-            );
-        }
-    }
-
     /// K2-Horizon geometry (32q/8kv, head_size 128, GQA 4) opts into the
     /// grouped striped kernel via `ForceD128`. Both the generic V2 route and
     /// the grouped route (adapter-resolved stripes) must match an
@@ -18157,7 +17685,7 @@ mod tests {
         let mut adapter = PagedKVCacheAdapter::new(allocator, pool, 16).unwrap();
         adapter.reset_for_new_request(7).unwrap();
         adapter.record_tokens(&(0..N).collect::<Vec<_>>()).unwrap();
-        adapter.update_keys_values(0, &k, &v, 0).unwrap();
+        adapter.update_keys_values_native(0, &k, &v, 0).unwrap();
 
         let q_data = data(HQ * D, 19, 109);
         let q = MxArray::from_float32(&q_data, &[1, HQ as i64, D as i64])
@@ -19436,31 +18964,29 @@ mod tests {
         let v = MxArray::ones(&[4, 1, 64], Some(DType::BFloat16)).expect("v ones");
         k.eval();
         v.eval();
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_gather_kv_for_decode_bf16_numerical_correctness: {e}");
                 return;
             }
             Err(e) => {
-                panic!("unexpected error from update_keys_values (BF16): {e}");
+                panic!("unexpected error from update_keys_values_native (BF16): {e}");
             }
         }
 
         // BF16 query of zeros — io_dtype must equal cache_dtype (BF16).
-        // Float16 would now be rejected by
-        // `LayerKVPool::gather_attention`'s mismatch guard.
         let q = MxArray::zeros(&[1, 1, 64], Some(DType::BFloat16)).expect("q zeros");
         q.eval();
 
         let scale = 1.0_f32 / (64.0_f32).sqrt();
-        let out = match adapter.gather_kv_for_decode(0, &q, scale, 1.0) {
+        let out = match adapter.gather_kv_for_decode_graph(0, &q, scale, 1.0) {
             Ok(arr) => arr,
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_gather_kv_for_decode_bf16_numerical_correctness: {e}");
                 return;
             }
-            Err(e) => panic!("unexpected error from gather_kv_for_decode (BF16): {e}"),
+            Err(e) => panic!("unexpected error from gather_kv_for_decode_graph (BF16): {e}"),
         };
 
         // The zero-copy output view preserves the BF16 io dtype.
@@ -19671,13 +19197,13 @@ mod tests {
         let v = MxArray::ones(&[8, 1, 64], Some(DType::BFloat16)).expect("v ones");
         k.eval();
         v.eval();
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!("skipping test_read_kv_range_round_trip_bf16: {e}");
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
 
         let (k_out, v_out) = match adapter.read_kv_range(0, 0, 4) {
@@ -19794,7 +19320,7 @@ mod tests {
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
         let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!(
@@ -19802,7 +19328,7 @@ mod tests {
                 );
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
         let registered = adapter.register_full_blocks_for_reuse(&[], 0).unwrap();
         assert_eq!(registered, 1);
@@ -19850,7 +19376,7 @@ mod tests {
             .unwrap();
         let k2 = MxArray::from_bfloat16(&vec![0u16; 40 * 64], &[40, 1, 64]).expect("k2 zeros");
         let v2 = MxArray::from_bfloat16(&vec![0x4000u16; 40 * 64], &[40, 1, 64]).expect("v2 twos");
-        match adapter.update_keys_values(0, &k2, &v2, 0) {
+        match adapter.update_keys_values_native(0, &k2, &v2, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!(
@@ -19858,7 +19384,7 @@ mod tests {
                 );
                 return;
             }
-            Err(e) => panic!("unexpected error from second update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from second update_keys_values_native: {e}"),
         }
 
         let (_k_out, v_out) = match adapter.read_kv_range(0, 0, 40) {
@@ -19950,7 +19476,7 @@ mod tests {
         adapter.record_tokens(&[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
         let k = MxArray::from_bfloat16(&vec![0u16; 8 * 64], &[8, 1, 64]).expect("k zeros");
         let v = MxArray::from_bfloat16(&vec![0x3f80u16; 8 * 64], &[8, 1, 64]).expect("v ones");
-        match adapter.update_keys_values(0, &k, &v, 0) {
+        match adapter.update_keys_values_native(0, &k, &v, 0) {
             Ok(()) => {}
             Err(e) if e.contains("Metal GPU not available") => {
                 eprintln!(
@@ -19958,7 +19484,7 @@ mod tests {
                 );
                 return;
             }
-            Err(e) => panic!("unexpected error from update_keys_values: {e}"),
+            Err(e) => panic!("unexpected error from update_keys_values_native: {e}"),
         }
         assert_eq!(adapter.register_full_blocks_for_reuse(&[], 0).unwrap(), 1);
         adapter.release_request().unwrap();

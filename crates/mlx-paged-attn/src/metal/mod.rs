@@ -1,37 +1,14 @@
-//! Metal kernel dispatch for paged attention
+//! Metal state and MLX buffer integration for paged KV pools.
 //!
-//! This module provides GPU-accelerated paged attention using Metal compute kernels.
-//! Based on patterns from mistral.rs Metal implementation.
-//!
-//! # Architecture
-//!
-//! The paged attention Metal dispatch works in two parts:
-//!
-//! 1. **Pre-compiled Kernels**: Metal shaders are compiled to a metallib at build time.
-//!    The kernels use template parameters (not function constants) for MLX compatibility.
-//!
-//! 2. **MLX Buffer Integration**: Metal buffer pointers are extracted from MLX arrays
-//!    via FFI, then used with the Rust `metal` crate for kernel dispatch.
-//!
-//! # Kernel Naming Convention
-//!
-//! - `reshape_and_cache_kv_{type}_cache_{type}`
-//! - `paged_attention_{type}_cache_{type}_hs{head}_bs{block}_nt256_nsl32_ps{partition}[_alibi]`
+//! Paged-attention and `reshape_and_cache` compute dispatch lives in `mlx-sys`'s
+//! graph-native C++ Custom primitives (`paged_attn.metallib`). This module
+//! provides the shared `MetalState` (device, command queue, residency kick
+//! metallib), `MetalDtype`, command-buffer observation, and MLX Metal buffer
+//! extraction.
 
 pub(crate) mod command_buffer;
 mod mlx_integration;
-mod paged_attention;
-mod reshape_and_cache;
 mod state;
 
 pub use mlx_integration::{MlxMetalBuffer, is_metal_extraction_supported, synchronize_mlx};
-pub use paged_attention::{
-    PagedAttentionOutput, PagedAttentionParams, PagedAttentionRouteHint,
-    PagedAttentionVarlenOutput, PagedAttentionVarlenParams, dispatch_paged_attention_auto,
-    dispatch_paged_attention_auto_with_route, dispatch_paged_attention_v1_raw,
-    dispatch_paged_attention_v2_raw, dispatch_paged_attention_v2_raw_with_route,
-    dispatch_paged_attention_varlen_auto, dispatch_paged_attention_varlen_v1_raw,
-    dispatch_paged_attention_varlen_v2_raw,
-};
-pub use reshape_and_cache::{RawBufferInfo, ReshapeAndCacheParams, dispatch_reshape_and_cache_raw};
 pub use state::{MetalDtype, MetalState};

@@ -100,6 +100,10 @@ bool selector_pipelines_supported(const array& scan, const array& merge,
 const char* topk16_header =
 #include "metal/common/topk16_helpers.metal.inc"
     ;
+
+const char* dflash2_conv_source =
+#include "metal/common/dflash2_conv.metal.inc"
+    ;
 #endif
 
 } // namespace
@@ -237,6 +241,71 @@ mlx_array* dflash2_selector_edges_metal(
   return nullptr;
 #endif
 }
+
+#ifdef MLX_NODE_METAL_ENABLED
+std::optional<mlx::core::array> dflash2_conv_metal(
+    const mlx::core::array& x_arr,
+    const mlx::core::array& dyn_arr,
+    const mlx::core::array& base_arr,
+    int32_t side,
+    int B,
+    int L,
+    int H,
+    int K,
+    int G) {
+  auto side_arr = array(side, mlx::core::int32);
+  auto L_arr = array(L, mlx::core::int32);
+  std::vector<array> inputs = {x_arr, dyn_arr, base_arr, side_arr, L_arr};
+  std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+      {"InT", x_arr.dtype()},
+      {"H", H},
+      {"K", K},
+      {"G", G},
+  };
+
+  static std::mutex conv_mutex;
+  static std::optional<fast::CustomKernelFunction> conv_kernel;
+  {
+    std::lock_guard<std::mutex> lock(conv_mutex);
+    if (!conv_kernel.has_value()) {
+      conv_kernel = fast::metal_kernel(
+          "dflash2_conv",
+          {"x", "dyn", "base", "side", "Lp"},
+          {"out"},
+          dflash2_conv_source,
+          "",
+          /* ensure_row_contiguous */ true,
+          /* atomic_outputs */ false);
+    }
+  }
+
+  auto results = conv_kernel.value()(
+      inputs,
+      {x_arr.shape()},
+      {x_arr.dtype()},
+      std::make_tuple(H, L, B),               // grid
+      std::make_tuple(256, 1, 1),             // threadgroup
+      template_args,
+      std::nullopt,
+      false,
+      mlx::core::default_stream(mlx::core::Device::gpu)
+  );
+  return std::move(results[0]);
+}
+#else
+std::optional<mlx::core::array> dflash2_conv_metal(
+    const mlx::core::array&,
+    const mlx::core::array&,
+    const mlx::core::array&,
+    int32_t,
+    int,
+    int,
+    int,
+    int,
+    int) {
+  return std::nullopt;
+}
+#endif
 
 }  // namespace mlx_node_internal
 

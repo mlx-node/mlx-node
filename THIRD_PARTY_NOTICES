@@ -81,43 +81,6 @@ superblocks. Both native split kernel families share the source's
 publication and last-arrival reduction protocol through
 crates/mlx-sys/src/metal/kquant/kquant_split_reduce.h.
 
-The optional exact H2048 RMS kernels in
-crates/mlx-sys/src/metal/common/source_norm.metal.inc and their host bridge
-crates/mlx-sys/src/metal/mlx_source_norm.cpp adapt the same revision's
-runtime/metal/kernels/common/rms_inverse.h,
-runtime/metal/kernels/shared/normalization.metal and
-runtime/ops/Normalization.cpp. They preserve the source's ordered
-256-thread reduction, optional 1024-thread staged schedule, FP32 norm
-weights and BF16 input, residual-add and output boundaries.
-
-The optional exact-width Q4 mixer projection in
-crates/mlx-sys/src/metal/mlx_source_mixer.cpp and
-crates/mlx-sys/src/metal/common/source_mixer.metal.inc adapts
-runtime/metal/kernels/decode/linear_gguf_sgmatrix.metal and
-runtime/metal/kernels/common/{gguf_sgmatrix,sgmatrix,split_reduce}.h at
-that revision. It preserves source Table16 packing, 64-column tiles,
-eight whole-superblock K splits, ordered FP32 partial reduction and the
-single BF16 residual epilogue. Native T64 payloads are read through an
-exact integer chunk permutation; weights are not numerically converted.
-The measured-device diagnostic is separate from native SG8 operands.
-
-The optional measured-companion convolution bridge in
-crates/mlx-sys/src/metal/mlx_source_draft_conv.cpp and
-crates/mlx-sys/src/metal/common/source_draft_conv.metal.inc adapts
-runtime/metal/kernels/decode/draft.metal::draft_conv_phase at that
-revision. It preserves the two current-row dynamic taps, ordered FP32
-products and sum, and the finish residual before a single BF16 store.
-The source arithmetic is isolated from the native BF16 operation policy.
-
-The optional strict Q6 vocabulary head in
-crates/mlx-sys/src/metal/mlx_source_head_q6.cpp and
-crates/mlx-sys/src/metal/common/source_head_q6.metal.inc adapts
-runtime/metal/kernels/common/{gguf_staged,gguf_staged_tile,quant_formats}.h
-and runtime/metal/kernels/shared/gguf_linear.metal at that revision.
-It preserves signed-half decoding, the spread K walk, device-A MPP input,
-per-SIMDgroup stage barriers and FP32 output. Only native T64 code and
-metadata addressing is adapted; generic projections remain separate.
-
 The M = 8 K-quant tensor-op kernel in
 crates/mlx-sys/src/metal/kquant/kquant_m8_nax.h (compiled into
 paged_attn.metallib by crates/mlx-sys/src/metal/kquant/kquant_m8_nax.metal)
@@ -180,23 +143,6 @@ runtime/metal/kernels/decode/sampling.metal and Sampling::addSelection in
 runtime/ops/Sampling.cpp, with the filter law (top_k, top_p and min_p on the
 temperature-1 log-probabilities, softmax at the temperature) and the
 acceptance law kept as mlx-node's.
-
-The optional source-routing path in
-crates/mlx-sys/src/metal/common/source_routing.metal.inc and its dedicated
-Fast-math JIT encoder in crates/mlx-sys/src/metal/mlx_splash_moe.cpp adapt the FP32 router matrix
-projection, top-k selection, normalization and fused shared scalar gate from
-runtime/metal/kernels/shared/gguf_float.metal, shared/moe.metal,
-common/sgmatrix.h and common/activation.h at the same Splash revision. The
-native BF16 router weights are widened exactly; this diagnostic uses the
-source FP32 arithmetic and retains a separate, explicitly selected policy.
-
-The opt-in original Q/K RMS normalization and RoPE primitive in
-crates/mlx-sys/src/metal/mlx_source_qk_norm_rope.cpp and
-crates/mlx-sys/src/metal/common/source_qk_norm_rope.metal.inc adapts
-Splash common/attention_qkv_prepare.h, common/rms_inverse.h and
-common/target_rope.h at the revision above. It preserves the source
-256-thread reduction, BF16 normalization boundary and FP32 rotary
-arithmetic while accepting separately owned strided MLX inputs.
 
 The GGUF tokenizer token rule in
 crates/mlx-core/src/utils/gguf.rs (embedded_gpt2_tokenizer_json: CONTROL rows

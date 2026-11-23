@@ -23,11 +23,7 @@ struct SplashMoeParams {
   // Six projections: routed gate/up/down, shared gate/up/down. Each format
   // is 4, 5 or 6 (GGML K-quant); bit 8 denotes the lossless Tiled64 layout.
   uint32_t formats[6];
-  // Captured opt-in zero-residual source arithmetic. Eval revalidates M8.
-  uint32_t source_math;
-  // Fixed output meaning, even when source_math falls back on replay.
-  uint32_t source_residual;
 };
 static_assert(sizeof(SplashMoeTile) == 8, "shared tile ABI");
 static_assert(sizeof(SplashMoeTileCount) == 28, "shared indirect grid ABI");
-static_assert(sizeof(SplashMoeParams) == 60, "shared parameter ABI");
+static_assert(sizeof(SplashMoeParams) == 52, "shared parameter ABI");

@@ -156,42 +156,6 @@ impl SwitchGLU {
         Ok(true)
     }
 
-    pub(crate) fn supports_source_residual(&self, shared: &MLPVariant) -> Result<bool> {
-        if !self.grouped_compatible(shared)? {
-            return Ok(false);
-        }
-        let (SwitchProj::Quantized(g), SwitchProj::Quantized(u), SwitchProj::Quantized(d)) =
-            (&self.gate_proj, &self.up_proj, &self.down_proj)
-        else {
-            return Ok(false);
-        };
-        let MLPVariant::Quantized {
-            gate_proj: sg,
-            up_proj: su,
-            down_proj: sd,
-            ..
-        } = shared
-        else {
-            return Ok(false);
-        };
-        let modes = [
-            g.mode(),
-            u.mode(),
-            d.mode(),
-            sg.mode(),
-            su.mode(),
-            sd.mode(),
-        ];
-        Ok(modes.into_iter().enumerate().all(|(i, m)| {
-            let bits = grouped_format(m).unwrap_or(0) & 255;
-            if i % 3 == 2 {
-                bits == 4 || bits == 6
-            } else {
-                bits == 4
-            }
-        }))
-    }
-
     pub(crate) fn forward_grouped(
         &self,
         x: &MxArray,
@@ -201,9 +165,6 @@ impl SwitchGLU {
         top_k: i32,
         normalize: bool,
         row_budget: Option<&MxArray>,
-        source_math: bool,
-        source_routing: bool,
-        residual: Option<&MxArray>,
     ) -> Result<MxArray> {
         let (SwitchProj::Quantized(g), SwitchProj::Quantized(u), SwitchProj::Quantized(d)) =
             (&self.gate_proj, &self.up_proj, &self.down_proj)
@@ -262,34 +223,13 @@ impl SwitchGLU {
             arrays.push(budget.handle.0);
         }
         let handle = unsafe {
-            if source_routing {
-                mlx_sys::mlx_splash_moe_with_router(
-                    arrays.as_ptr(),
-                    arrays.len(),
-                    formats.as_ptr(),
-                    top_k,
-                    normalize,
-                    residual.map_or(std::ptr::null_mut(), |r| r.handle.0),
-                )
-            } else if let Some(residual) = residual {
-                mlx_sys::mlx_splash_moe_with_residual(
-                    arrays.as_ptr(),
-                    arrays.len(),
-                    formats.as_ptr(),
-                    top_k,
-                    normalize,
-                    residual.handle.0,
-                )
-            } else {
-                mlx_sys::mlx_splash_moe_with_policy(
-                    arrays.as_ptr(),
-                    arrays.len(),
-                    formats.as_ptr(),
-                    top_k,
-                    normalize,
-                    source_math,
-                )
-            }
+            mlx_sys::mlx_splash_moe(
+                arrays.as_ptr(),
+                arrays.len(),
+                formats.as_ptr(),
+                top_k,
+                normalize,
+            )
         };
         MxArray::from_handle(handle, "grouped GGUF MoE")
     }

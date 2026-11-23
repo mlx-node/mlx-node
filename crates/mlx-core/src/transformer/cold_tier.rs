@@ -37,7 +37,7 @@
 //!   adapter-owned; nothing here carries lazy graph outputs.
 //!
 //! The module is NOT macOS-gated: `mlx_paged_attn`'s cold-cache types are
-//! cross-platform (only its `metal`/`extern_c` modules are gated), matching
+//! cross-platform (only its `metal` module is gated), matching
 //! the ungated status this code had inside the adapter.
 
 use std::sync::{Arc, Mutex};

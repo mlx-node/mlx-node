@@ -35,8 +35,6 @@ enum RmsNormOutputPolicy {
     /// Compute RMSNorm in Float32 and cast the output back to the input dtype
     /// (matching `mlx_engine.py::PreciseRMSNorm` for Clairic checkpoints).
     PreciseF32,
-    SourceF32ReferenceBf16,
-    SourceF32SplashBf16,
 }
 
 pub struct RMSNorm {
@@ -82,44 +80,6 @@ impl RMSNorm {
                 out.astype(in_dtype)
             };
         }
-        if matches!(
-            self.output_policy,
-            RmsNormOutputPolicy::SourceF32ReferenceBf16 | RmsNormOutputPolicy::SourceF32SplashBf16
-        ) {
-            if input.dtype()? != crate::array::DType::BFloat16
-                || input.shape()?.last() != Some(&2048)
-            {
-                return Err(Error::from_reason(
-                    "source residual norm requires BF16 input with width2048",
-                ));
-            }
-            if matches!(self.output_policy, RmsNormOutputPolicy::SourceF32SplashBf16) {
-                let mut normalized = std::ptr::null_mut();
-                let status = unsafe {
-                    sys::mlx_source_norm_2048(
-                        input.handle.0,
-                        self.weight.handle.0,
-                        std::ptr::null_mut(),
-                        true,
-                        &mut normalized,
-                        std::ptr::null_mut(),
-                    )
-                };
-                match status {
-                    1 => return MxArray::from_handle(normalized, "source_splash_rms_norm"),
-                    0 => {} // CPU/unsupported device uses the explicit F32 reference.
-                    _ => return Err(Error::from_reason("source RMS construction failed")),
-                }
-            }
-            // Numerical reference only. Explicit casts preserve the residual/KV
-            // dtype while avoiding the native intermediate BF16 normalized row.
-            let input = input.astype(crate::array::DType::Float32)?;
-            let handle = unsafe {
-                sys::mlx_fast_rms_norm(input.handle.0, self.weight.handle.0, self.eps as f32)
-            };
-            return MxArray::from_handle(handle, "source_f32_reference_rms_norm")?
-                .astype(crate::array::DType::BFloat16);
-        }
         let handle = unsafe {
             sys::mlx_fast_rms_norm(input.handle.0, self.weight.handle.0, self.eps as f32)
         };
@@ -138,34 +98,8 @@ impl RMSNorm {
         {
             return None;
         }
-        match self.output_policy {
-            RmsNormOutputPolicy::PreciseF32 | RmsNormOutputPolicy::SourceF32ReferenceBf16 => {
-                return None;
-            }
-            RmsNormOutputPolicy::SourceF32SplashBf16 => {
-                let mut hidden = std::ptr::null_mut();
-                let mut normalized = std::ptr::null_mut();
-                let status = unsafe {
-                    sys::mlx_source_norm_2048(
-                        x.handle.0,
-                        self.weight.handle.0,
-                        res.handle.0,
-                        true,
-                        &mut normalized,
-                        &mut hidden,
-                    )
-                };
-                if status != 1 {
-                    return None;
-                }
-                // The FFI publishes both handles atomically; from_handle only
-                // rejects null. No extra Add or native-dtype norm is inserted.
-                return Some((
-                    MxArray::from_handle(hidden, "source_add_rms:hidden").ok()?,
-                    MxArray::from_handle(normalized, "source_add_rms:normalized").ok()?,
-                ));
-            }
-            RmsNormOutputPolicy::Native => {}
+        if matches!(self.output_policy, RmsNormOutputPolicy::PreciseF32) {
+            return None;
         }
         let eps = MxArray::from_float32(&[self.eps as f32], &[]).ok()?;
         let mut h = std::ptr::null_mut();
@@ -196,30 +130,6 @@ impl RMSNorm {
         self.output_policy = RmsNormOutputPolicy::PreciseF32;
     }
 
-    /// Load-only diagnostic policy; callers validate original GGUF identity.
-    /// All other models retain native dtype and arithmetic behavior.
-    pub(crate) fn enable_source_f32_reference(&mut self) -> Result<()> {
-        if self.weight.dtype()? != crate::array::DType::Float32
-            || self.weight.shape()?.as_ref() != [2048]
-        {
-            return Err(Error::from_reason(
-                "source residual norm requires F32/[2048] weight",
-            ));
-        }
-        self.output_policy = RmsNormOutputPolicy::SourceF32ReferenceBf16;
-        Ok(())
-    }
-
-    /// Load-only source reduction with its fixed checkpoint epsilon.
-    pub(crate) fn enable_source_f32_splash(&mut self) -> Result<()> {
-        if (self.eps as f32).to_bits() != 1e-6_f32.to_bits() {
-            return Err(Error::from_reason("source RMS requires kernel epsilon1e-6"));
-        }
-        self.enable_source_f32_reference()?;
-        self.output_policy = RmsNormOutputPolicy::SourceF32SplashBf16;
-        Ok(())
-    }
-
     /// Get the weight (scale) parameter
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
@@ -237,14 +147,6 @@ impl RMSNorm {
 
     /// Set the weight (scale) parameter
     pub fn set_weight(&mut self, weight: &MxArray) -> Result<()> {
-        if matches!(
-            self.output_policy,
-            RmsNormOutputPolicy::SourceF32ReferenceBf16 | RmsNormOutputPolicy::SourceF32SplashBf16
-        ) {
-            return Err(Error::from_reason(
-                "source norm diagnostic weights are immutable; reload the model",
-            ));
-        }
         let shape = weight.shape()?;
         if shape.len() != 1 {
             return Err(Error::from_reason(format!(
@@ -542,8 +444,6 @@ impl GroupedRMSNorm {
 
 #[cfg(test)]
 mod tests {
-    include!("source_norm_reference_tests.rs");
-    include!("source_norm_exact_tests.rs");
     use super::*;
     use crate::array::DType;
 

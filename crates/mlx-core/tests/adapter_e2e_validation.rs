@@ -286,21 +286,21 @@ fn run_adapter(
         synchronize();
         fixture
             .adapter
-            .update_keys_values(
+            .update_keys_values_native(
                 /* layer_idx */ 0,
                 &suffix_keys,
                 &suffix_values,
                 /* first_logical_position */ cached_n as u32,
             )
-            .expect("update_keys_values");
+            .expect("update_keys_values_native");
     }
 
     // Gather attention. scale = 1/sqrt(head_size); softcap = 1.0 disables.
     let scale = (head_size as f32).sqrt().recip();
     let out = fixture
         .adapter
-        .gather_kv_for_decode(/* layer_idx */ 0, query, scale, /* softcap */ 1.0)
-        .expect("gather_kv_for_decode");
+        .gather_kv_for_decode_graph(/* layer_idx */ 0, query, scale, /* softcap */ 1.0)
+        .expect("gather_kv_for_decode_graph");
     out.eval();
     synchronize();
 
@@ -647,13 +647,13 @@ fn test_adapter_e2e_prefix_reuse_matches_no_reuse() {
         "second request reuses the entire prefix; zero new blocks expected"
     );
 
-    // Skip update_keys_values entirely — the prefix's KV is already in
+    // Skip update_keys_values_native entirely — the prefix's KV is already in
     // place. Gather directly.
     let scale = (HEAD_SIZE as f32).sqrt().recip();
     let out2 = fixture
         .adapter
-        .gather_kv_for_decode(0, &query, scale, 1.0)
-        .expect("gather_kv_for_decode on reused prefix");
+        .gather_kv_for_decode_graph(0, &query, scale, 1.0)
+        .expect("gather_kv_for_decode_graph on reused prefix");
     out2.eval();
     synchronize();
     let out2_f32 = out2.to_float32().expect("to_float32");

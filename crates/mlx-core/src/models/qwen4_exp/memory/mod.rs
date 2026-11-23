@@ -1,13 +1,10 @@
 //! Gate each weight allocation against live system headroom; the memory plan
 //! sizes the store. Preserve room for other applications and transient work.
 
-#[cfg(target_os = "macos")]
-mod host_macos;
-#[cfg(target_os = "windows")]
-mod host_windows;
 #[cfg(test)]
 mod tests;
 
+pub(super) use crate::utils::host::HostMemory;
 use napi::{Error, Result};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -65,37 +62,6 @@ pub(super) const DIRECT_MARGIN: u64 = 4 << 30;
 /// gate owns admission; this floor only refuses growth near the kernel's
 /// critical level.
 pub(super) const DIRECT_TURN_FLOOR: u64 = 2 << 30;
-
-/// One `host_statistics64` read, in bytes.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(super) struct HostMemory {
-    pub physical: u64,
-    pub free: u64,
-    /// Pageable file-backed pages the kernel can drop on demand.
-    pub file: u64,
-    /// Pageable anonymous pages of every process, active or not.
-    pub anonymous: u64,
-    pub purgeable: u64,
-    pub wired: u64,
-    /// Physical pages the compressor pool occupies.
-    pub compressor: u64,
-}
-
-impl HostMemory {
-    /// Free plus clean file cache: what the kernel hands out without
-    /// touching another process's data.
-    pub fn available(&self) -> u64 {
-        self.free.saturating_add(self.file)
-    }
-
-    /// Memory a turn cannot take from the host: wired, the compressor pool
-    /// and other processes' anonymous pages (purgeable ones excepted).
-    pub fn non_reclaimable(&self) -> u64 {
-        self.wired
-            .saturating_add(self.compressor)
-            .saturating_add(self.anonymous.saturating_sub(self.purgeable))
-    }
-}
 
 #[cfg(test)]
 pub(super) const FIXTURE_HOST_ENV: &str = "MLX_QWEN4_FIXTURE_HOST";
@@ -452,13 +418,11 @@ pub(super) fn host_memory() -> Result<HostMemory> {
     if let Some(host) = test_host_override() {
         return Ok(host);
     }
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     {
-        host_macos::host_memory()
-    }
-    #[cfg(target_os = "windows")]
-    {
-        host_windows::host_memory()
+        crate::utils::host::host_memory().ok_or_else(|| {
+            Error::from_reason("Cannot establish Qwen4 larger-cache memory headroom")
+        })
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {

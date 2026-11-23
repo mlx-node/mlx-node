@@ -23,9 +23,3 @@ pub use config::Qwen3_5MoeConfig;
 pub use model::Qwen3_5MoeModel;
 
 pub(crate) mod verify_budget;
-
-pub(crate) mod source_norms;
-
-pub(crate) mod source_math_policy;
-
-pub(crate) mod source_qk;

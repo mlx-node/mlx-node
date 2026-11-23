@@ -87,43 +87,22 @@ struct PagedAttentionInputs {
 }  // namespace mlx::core::fast::paged
 
 // =============================================================================
-// NA int8 W8A8 lazy graph builders (defined in mlx_na_int8.cpp).
+// NA int8 W8A8 lazy graph builder (defined in mlx_na_int8.cpp).
 //
-// External-linkage C++ entry points for the sym8 (per-output-channel symmetric
-// int8) linear path. The eager Rust `QuantizedLinear::forward_sym8` emits
-// these graphs via the `mlx_w8a8_linear` / `mlx_int8_qmv` FFI wrappers, which
-// delegate to these builders. Keeping the math in ONE definition means every
-// consumer emits byte-identical graph nodes for the same inputs.
-//
-// Contract (both):
+// Contract:
 //   x    : [M,K] activations (bf16; non-bf16 defensively cast)
 //   w_kn : [K,N] CONTIGUOUS int8 kernel operand, pre-transposed at load/
 //          registration time (NOT the checkpoint [N,K] tensor)
 //   s_w  : [N] f32 per-output-channel weight scale
 //   returns LAZY bf16 [M,N] = x @ w^T (composes into the surrounding graph)
 //
-// All THROW std::runtime_error on contract violations (caller-visible
-// fail-loud; the extern "C" wrappers translate to cerr + false for Rust).
-// Dispatch rule mirrors Rust: M <= 2 -> qmv_w8a16 (decode matvec, bf16
-// activations read directly — NO act quant), M >= 3 -> the W8A8 prefill GEMM.
-// qmv_lazy is the OLD W8A8 decode matvec, kept for A/B (qmv_w8a16_lazy falls
-// back to it under INT8_QMV_W8A16=0) and microbenches.
-// qmv_w8a16_lazy takes BOTH weight orientations: w_kn [K,N] (the GEMM operand,
-// consumed by the 2D-block fallback under INT8_QMV16_SG=0 and the W8A8
-// reroute) and w_nk [N,K] (the CHECKPOINT orientation, consumed by the default
-// simd_sum-style kernel — buffer-shared with the params tensor).
+// Throws std::runtime_error on contract violations (the extern "C" wrapper
+// translates to cerr + false for Rust).
 // =============================================================================
 namespace na_int8 {
 mlx::core::array w8a8_linear_lazy(const mlx::core::array& x,
                                   const mlx::core::array& w_kn,
                                   const mlx::core::array& s_w);
-mlx::core::array qmv_lazy(const mlx::core::array& x,
-                          const mlx::core::array& w_kn,
-                          const mlx::core::array& s_w);
-mlx::core::array qmv_w8a16_lazy(const mlx::core::array& x,
-                                const mlx::core::array& w_kn,
-                                const mlx::core::array& w_nk,
-                                const mlx::core::array& s_w);
 }  // namespace na_int8
 
 // Splash `NativeRuntime::executionFailed`: the native exception a reader or

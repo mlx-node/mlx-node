@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
-    println!("cargo:rerun-if-changed=metal/");
+    println!("cargo:rerun-if-changed=metal/shared/residency.metal");
     println!("cargo:rerun-if-env-changed=MLX_DISABLE_METAL");
     // The metallib's min-OS flag reads this too — same declaration mlx-sys
     // makes, so a changed target recompiles the standalone library as well.
@@ -80,12 +80,11 @@ fn compile_metal_shaders() {
     let metal_dir = PathBuf::from(&manifest_dir).join("metal");
     let deployment_target = macos_deployment_target();
 
-    // Metal source files to compile
-    let metal_files = [
-        "attention/paged_attention.metal",
-        "cache/reshape_and_cache.metal",
-        "shared/residency.metal",
-    ];
+    // Only compile `shared/residency.metal` for `MetalState`'s embedded
+    // `residency_kick` pipeline. Paged attention, prefill, reshape_and_cache,
+    // and int8 store shaders are compiled by `crates/mlx-sys/build.rs` into
+    // `paged_attn.metallib`.
+    let metal_files = ["shared/residency.metal"];
 
     let mut air_files = Vec::new();
 
@@ -131,8 +130,8 @@ fn compile_metal_shaders() {
         air_files.push(air_path);
     }
 
-    // Link all AIR files into a single metallib
-    let metallib_path = PathBuf::from(&out_dir).join("paged_attn.metallib");
+    // Link the residency AIR into an embedded metallib for `MetalState`.
+    let metallib_path = PathBuf::from(&out_dir).join("residency.metallib");
 
     let mut link_cmd = Command::new("xcrun");
     link_cmd.args(["-sdk", "macosx", "metallib"]);
@@ -152,13 +151,9 @@ fn compile_metal_shaders() {
         );
     }
 
-    // Export the metallib path for runtime loading
+    // Export the metallib path for compile-time embedding in `MetalState`.
     println!(
         "cargo:rustc-env=PAGED_ATTN_METALLIB={}",
         metallib_path.display()
     );
-
-    // Also copy the metallib to a known location for distribution
-    let dist_metallib = PathBuf::from(&manifest_dir).join("paged_attn.metallib");
-    std::fs::copy(&metallib_path, &dist_metallib).ok();
 }

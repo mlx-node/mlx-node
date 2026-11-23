@@ -2,8 +2,8 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 
 use super::cache::{DraftKvWindow, store_window_tail};
+use crate::array::MxArray;
 use crate::array::attention::scaled_dot_product_attention;
-use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::decoder_layer::DecoderLayer;
 use crate::nn::{Activations, RMSNorm, RoPE};
@@ -406,7 +406,6 @@ impl DFlash2Mlp {
 }
 
 pub(super) struct GroupedDynamicCausalConv {
-    pub(super) source_enabled: bool,
     pub(super) base_kernel: MxArray,
     pub(super) kernel_projection: LinearProj,
     pub(super) kernel_size: usize,
@@ -414,49 +413,13 @@ pub(super) struct GroupedDynamicCausalConv {
 }
 
 impl GroupedDynamicCausalConv {
-    /// The source finish returns the complete hidden state. A selected native
-    /// factory error propagates; only unsupported rows/devices use the old path.
-    fn source_convolve(
-        &self,
-        hidden: &MxArray,
-        dynamic: &MxArray,
-        side: i32,
-        residual: Option<&MxArray>,
-    ) -> Result<Option<MxArray>> {
-        if !self.source_enabled
-            || self.kernel_size != 2
-            || self.group_size != 16
-            || hidden.shape()?.as_ref() != [1, 8, 2048]
-            || hidden.dtype()? != DType::BFloat16
-            || !unsafe { sys::mlx_source_dflash2_conv_available() }
-        {
-            return Ok(None);
-        }
-        let raw = unsafe {
-            sys::mlx_source_dflash2_conv(
-                hidden.as_raw_ptr(),
-                dynamic.as_raw_ptr(),
-                self.base_kernel.as_raw_ptr(),
-                side,
-                residual.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
-            )
-        };
-        Ok(Some(MxArray::from_handle(
-            raw,
-            "source DFlash2 convolution",
-        )?))
-    }
-
     pub(super) fn finish_output(
         &self,
         hidden: &MxArray,
         dynamic: &MxArray,
         residual: &MxArray,
     ) -> Result<DraftLayerOutput> {
-        if let Some(hidden) = self.source_convolve(hidden, dynamic, 1, Some(residual))? {
-            return Ok(DraftLayerOutput::Hidden(hidden));
-        }
-        Ok(DraftLayerOutput::Pending(
+        Ok(DraftLayerOutput(
             residual.clone(),
             self.finish(hidden, dynamic)?,
         ))
@@ -558,10 +521,7 @@ impl GroupedDynamicCausalConv {
             self.kernel_size as i64,
             groups,
         ])?;
-        let prepared = match self.source_convolve(hidden, &dynamic, 0, None)? {
-            Some(prepared) => prepared,
-            None => self.convolve(hidden, &dynamic, 0)?,
-        };
+        let prepared = self.convolve(hidden, &dynamic, 0)?;
         Ok((prepared, dynamic))
     }
 
@@ -587,27 +547,16 @@ pub(super) enum DraftResidual<'a> {
     Pending(&'a MxArray, &'a MxArray),
 }
 
-/// Keeps the arithmetic boundary explicit across both eager and compiled
-/// layers. Native convolution leaves a delta for the fused residual norm;
-/// source convolution has already added the residual before its BF16 store.
-pub(super) enum DraftLayerOutput {
-    Hidden(MxArray),
-    Pending(MxArray, MxArray),
-}
+/// Pending `(residual, delta)` left for the next layer's fused residual norm.
+pub(super) struct DraftLayerOutput(MxArray, MxArray);
 
 impl DraftLayerOutput {
     pub(super) fn as_input(&self) -> DraftResidual<'_> {
-        match self {
-            Self::Hidden(hidden) => DraftResidual::Hidden(hidden),
-            Self::Pending(hidden, delta) => DraftResidual::Pending(hidden, delta),
-        }
+        DraftResidual::Pending(&self.0, &self.1)
     }
 
     pub(super) fn hidden_and_normalized(&self, norm: &RMSNorm) -> Result<(MxArray, MxArray)> {
-        match self {
-            Self::Hidden(hidden) => Ok((hidden.clone(), norm.forward(hidden)?)),
-            Self::Pending(hidden, delta) => DecoderLayer::add_residual_norm(norm, hidden, delta),
-        }
+        DecoderLayer::add_residual_norm(norm, &self.0, &self.1)
     }
 }
 

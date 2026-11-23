@@ -7,7 +7,6 @@ use crate::nn::RMSNorm;
 use crate::transformer::attention::Attention;
 use crate::transformer::kv_cache::KVCache;
 use crate::transformer::mlp::MLP;
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
@@ -327,44 +326,14 @@ impl TransformerBlock {
         //    `MLX_PAGED_NATIVE_KV_WRITE=0` or when the native write errors.
         let trace_enabled = inference_trace_enabled();
         let write_trace_start = trace_enabled.then(Instant::now);
-        let write_path = if native_kv_write_enabled() {
-            match adapter.update_keys_values_native(
-                layer_idx,
-                &qkv.keys,
-                &qkv.values,
-                first_logical_position,
-            ) {
-                Ok(()) => "native",
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] qwen3 paged_kv_write_fallback layer={} first_position={} error={}",
-                            layer_idx, first_logical_position, err
-                        ));
-                    }
-                    adapter
-                        .update_keys_values(
-                            layer_idx,
-                            &qkv.keys,
-                            &qkv.values,
-                            first_logical_position,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    "legacy"
-                }
-            }
-        } else {
-            adapter
-                .update_keys_values(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
-                .map_err(napi::Error::from_reason)?;
-            "legacy"
-        };
+        adapter
+            .update_keys_values_native(layer_idx, &qkv.keys, &qkv.values, first_logical_position)
+            .map_err(napi::Error::from_reason)?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] qwen3 paged_kv_write_done layer={} first_position={} path={} elapsed_ms={:.1}",
+                "[MLX_TRACE] qwen3 paged_kv_write_done layer={} first_position={} path=native elapsed_ms={:.1}",
                 layer_idx,
                 first_logical_position,
-                write_path,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
         }
@@ -468,60 +437,21 @@ impl TransformerBlock {
             let scale = self.self_attn.get_scale();
 
             let gather_trace_start = trace_enabled.then(Instant::now);
-            let attn_3d = if write_path == "native" && graph_decode_gather_enabled() {
-                match adapter.gather_kv_for_decode_graph(
+            let attn_3d = adapter
+                .gather_kv_for_decode_graph(
                     layer_idx,
                     &qkv.queries,
                     scale as f32,
                     /* softcap */ 1.0,
-                ) {
-                    Ok(attn_3d) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3 decode_gather_done layer={} path=graph elapsed_ms={:.1}",
-                                layer_idx,
-                                gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                            ));
-                        }
-                        attn_3d
-                    }
-                    Err(err) => {
-                        if trace_enabled {
-                            write_inference_trace(format_args!(
-                                "[MLX_TRACE] qwen3 decode_gather_fallback layer={} path=raw error={}",
-                                layer_idx, err
-                            ));
-                        }
-                        adapter
-                            .gather_kv_for_decode(
-                                layer_idx,
-                                &qkv.queries,
-                                scale as f32,
-                                /* softcap */ 1.0,
-                            )
-                            .map_err(napi::Error::from_reason)?
-                    }
-                }
-            } else {
-                // Flag off (or the native write above errored): take the
-                // synchronous gather directly, matching the legacy write.
-                let attn_3d = adapter
-                    .gather_kv_for_decode(
-                        layer_idx,
-                        &qkv.queries,
-                        scale as f32,
-                        /* softcap */ 1.0,
-                    )
-                    .map_err(napi::Error::from_reason)?;
-                if trace_enabled {
-                    write_inference_trace(format_args!(
-                        "[MLX_TRACE] qwen3 decode_gather_done layer={} path=legacy elapsed_ms={:.1}",
-                        layer_idx,
-                        gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
-                    ));
-                }
-                attn_3d
-            };
+                )
+                .map_err(napi::Error::from_reason)?;
+            if trace_enabled {
+                write_inference_trace(format_args!(
+                    "[MLX_TRACE] qwen3 decode_gather_done layer={} path=graph elapsed_ms={:.1}",
+                    layer_idx,
+                    gather_trace_start.map(elapsed_ms).unwrap_or(0.0)
+                ));
+            }
 
             // Cast back to x's dtype.
             // Both gathers return `[1, n_heads, head_dim]`, which is
@@ -571,11 +501,6 @@ impl TransformerBlock {
         if rows.is_empty() {
             return Err(Error::from_reason(
                 "forward_paged_adapter_batched requires at least one row",
-            ));
-        }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "forward_paged_adapter_batched requires MLX_PAGED_NATIVE_KV_WRITE=1",
             ));
         }
 
@@ -641,11 +566,6 @@ impl TransformerBlock {
                 "forward_paged_adapter_ragged expects x [{total_queries},1,H], got {:?}",
                 x_shape.as_ref()
             )));
-        }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "forward_paged_adapter_ragged requires MLX_PAGED_NATIVE_KV_WRITE=1",
-            ));
         }
 
         let mut offsets = Vec::with_capacity(total_queries as usize);

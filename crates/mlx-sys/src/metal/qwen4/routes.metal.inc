@@ -1,11 +1,10 @@
 // Adapted from mlxfast TrackFastMoE.route, 8981cef5.
 // MIT, copyright 2026 Layr Labs, Inc.; see ../MLXFAST-LICENSE.txt.
 R"metal(
-
 // Preserve probability-first routing, including BF16 rounding before stable
 // top-k and the sequential ten-term normalization. A selected-logit softmax
 // would change ties and scores for this checkpoint.
-const uint row=threadgroup_position_in_grid.y;
+const uint row = MULTI_ROW ? threadgroup_position_in_grid.y : 0u;
 const uint tid = thread_index_in_threadgroup;
 const uint lane = thread_index_in_simdgroup;
 const uint sg = simdgroup_index_in_threadgroup;
@@ -49,6 +48,4 @@ for(int i=0;i<10;++i){
  denominator=T(selected[i]+denominator);
 }
 if(lane<10){ids[row*10+lane]=indices[lane];scores[row*10+lane]=T(selected[lane]/denominator);}
-
-
 )metal"

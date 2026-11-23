@@ -1878,12 +1878,6 @@ async fn load_with_source_impl(
     warm: bool,
     progress: Arc<crate::engine::load_progress::LoadProgressCell>,
 ) -> Result<Qwen3_5MoeModel> {
-    // Snapshot once, before spawning; forward/compiled graphs never read this
-    // diagnostic setting and another load cannot change an existing model.
-    let source_norm_request = super::source_norms::SourceNormRequest::capture()?;
-    let source_qk_request = super::source_qk::SourceQkRequest::capture()?;
-    let source_moe_policy = super::source_math_policy::SourceMoePolicy::capture()?
-        .with_qk_requested(source_qk_request.is_some());
     // The TS streaming wrappers read the tokenizer from the asset directory,
     // never from the `.gguf` source path.
     let model_assets_path = source.asset_dir().to_string_lossy().into_owned();
@@ -1944,11 +1938,6 @@ async fn load_with_source_impl(
                             .startup_line(config.served_context_tokens())
                     );
                 }
-                source_moe_policy.validate_mixer_profile(&config)?;
-                source_moe_policy.validate_head_profile(&config)?;
-                if source_qk_request.is_some() {
-                    super::source_qk::SourceQkRequest::validate_profile(&config, false)?;
-                }
 
                 crate::transformer::KvFormat::parse(config.kv_format.as_deref())
                     .map_err(|message| Error::from_reason(format!("config.json: {message}")))?;
@@ -1963,9 +1952,7 @@ async fn load_with_source_impl(
 
                 // A persistent SSD tier keys its states by the weights' identity,
                 // so its shard-identity bracket straddles the load.
-                let reads_identity = disk.reads_identity()
-                    && source_norm_request.is_none()
-                    && !source_moe_policy.active();
+                let reads_identity = disk.reads_identity();
                 let gguf_identity = preload_input.as_ref().map(PreloadInput::identity);
                 let checkpoint_files = CheckpointFiles::new(path, gguf_identity.as_ref());
                 let mut checkpoint_load =
@@ -2040,13 +2027,6 @@ async fn load_with_source_impl(
                 let has_vision = raw_params
                     .keys()
                     .any(|k| strip_qwen35_vision_weight_prefix(k).is_some());
-                if (source_moe_policy.mixer || source_moe_policy.qk || source_moe_policy.head)
-                    && has_vision
-                {
-                    return Err(Error::from_reason(
-                        "source attention/head diagnostics are text-only",
-                    ));
-                }
 
                 let (text_raw_params, vision_params) = if has_vision {
                     let mut vision_params: HashMap<String, MxArray> = HashMap::new();
@@ -2084,18 +2064,6 @@ async fn load_with_source_impl(
                 // but copies the config verbatim, so the declaration can be
                 // stale — the loaded dtype is the ground truth).
                 settle_compute_dtype(&raw, &mut params, &mut config, kv_format)?;
-                // Original BF16 norms already selected the residual/embedding
-                // dtype above. Replace only sanitized final-value norm keys.
-                let source_norm_identity = source_norm_request
-                    .as_ref()
-                    .map(|request| {
-                        request.replace_parameters(path, &config, has_vision, &mut params)
-                    })
-                    .transpose()?;
-                let source_qk_weights = source_qk_request
-                    .as_ref()
-                    .map(|request| request.load(path, &config, has_vision, &params))
-                    .transpose()?;
                 let quantized = is_quantized_checkpoint(&params);
                 info!(
                     "Sanitized to {} parameters (quantized={})",
@@ -2161,18 +2129,6 @@ async fn load_with_source_impl(
                 inner.max_context = max_context;
                 inner.decode_share = decode_share;
                 inner.activations = activations;
-                inner.configure_source_moe_policy(source_moe_policy);
-                if source_moe_policy.active() {
-                    info!(
-                        source_body = source_moe_policy.body,
-                        source_residual = source_moe_policy.residual,
-                        source_routing = source_moe_policy.routing,
-                        source_mixer = source_moe_policy.mixer,
-                        source_qk = source_moe_policy.qk,
-                        source_head = source_moe_policy.head,
-                        "Enabled immutable source MoE arithmetic diagnostic; SSD cache/training/export disabled"
-                    );
-                }
                 inner.row_exact_decode_projections =
                     has_kquant_mode(top_level_mode, &per_layer_quant)
                         || top_level_mode == Some(PerLayerMode::Affine)
@@ -2196,39 +2152,7 @@ async fn load_with_source_impl(
                         has_vision,
                     )?;
 
-                if source_moe_policy.head {
-                    inner
-                        .lm_head
-                        .as_mut()
-                        .ok_or_else(|| {
-                            Error::from_reason(
-                                "source head requires a separate vocabulary projection",
-                            )
-                        })?
-                        .enable_source_head()?;
-                }
-                if let Some(weights) = source_qk_weights {
-                    weights.install(&mut inner.layers)?;
-                    info!(
-                        "Enabled source QK norm/RoPE diagnostic with verified original F32 operands; T8 target only"
-                    );
-                }
-                if let Some(identity) = source_norm_identity {
-                    for layer in &mut inner.layers {
-                        layer.enable_source_residual_norms(identity.source_reduction)?;
-                    }
-                    if identity.source_reduction {
-                        inner.final_norm.enable_source_f32_splash()?;
-                    } else {
-                        inner.final_norm.enable_source_f32_reference()?;
-                    }
-                    info!(source_reduction = identity.source_reduction,
-                          payload_sha256 = %identity.payload_sha256,
-                          prepared_complete_sha256 = %identity.prepared_complete_sha256,
-                          "Enabled load-only F32 source residual norms with BF16 outputs; explicit arithmetic policy, SSD cache disabled");
-                    inner.source_norm_identity = Some(identity);
-                }
-                // Materialize mmap-backed weights (including owned source F32 norms).
+                // Materialize mmap-backed weights.
                 let weights_resident = {
                     let mut arrays: Vec<&MxArray> = params.values().collect();
                     if !defer_plain_fp8_materialization() {

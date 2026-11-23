@@ -18,7 +18,6 @@ pub mod mlp;
 #[cfg(test)]
 mod mlp_test;
 pub mod paged_attention_inputs;
-pub(crate) mod paged_flags;
 #[cfg(all(test, target_os = "macos"))]
 mod paged_int8_query_tests;
 #[cfg(all(test, target_os = "macos"))]

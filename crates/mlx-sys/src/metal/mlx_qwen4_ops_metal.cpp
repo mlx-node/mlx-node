@@ -263,6 +263,11 @@ std::vector<array> qwen4_gdn_norm_port(const std::vector<array> &a) {
                 std::nullopt, false,
                 mlx::core::default_stream(mlx::core::Device::gpu));
 }
+// Shared router kernel source for singleton (MULTI_ROW=false) and prefill
+// (MULTI_ROW=true) dispatch.
+static const char *kQwen4RoutesSource =
+#include "metal/qwen4/routes.metal.inc"
+    ;
 #endif
 
 }  // namespace
@@ -299,11 +304,11 @@ bool mlx_qwen4_singleton_routes(mlx_array *logits, mlx_array **ids,
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_singleton_routes", {"logits"}, {"ids", "scores"},
-#include "metal/qwen4/singleton_routes.metal.inc"
-        );
+            kQwen4RoutesSource);
         return kernel({x}, {{1, 1, 10}, {1, 1, 10}},
                       {mlx::core::uint32, x.dtype()}, {128, 1, 1}, {128, 1, 1},
-                      {{"T", x.dtype()}}, std::nullopt, false,
+                      {{"T", x.dtype()}, {"MULTI_ROW", false}}, std::nullopt,
+                      false,
                       mlx::core::default_stream(mlx::core::Device::gpu));
     };
     static auto compiled = mlx::core::compile(graph);
@@ -343,12 +348,12 @@ bool mlx_qwen4_prefill_routes(mlx_array *logits, mlx_array **ids,
         const auto &x = in[0];
         static auto kernel = mlx::core::fast::metal_kernel(
             "qwen4_prefill_routes", {"logits"}, {"ids", "scores"},
-#include "metal/qwen4/prefill_routes.metal.inc"
-        );
+            kQwen4RoutesSource);
         int rows = x.shape(1);
         return kernel({x}, {{1, rows, 10}, {1, rows, 10}},
                       {mlx::core::uint32, x.dtype()}, {128, rows, 1}, {128, 1, 1},
-                      {{"T", x.dtype()}}, std::nullopt, false,
+                      {{"T", x.dtype()}, {"MULTI_ROW", true}}, std::nullopt,
+                      false,
                       mlx::core::default_stream(mlx::core::Device::gpu));
     };
     static auto compiled = mlx::core::compile(graph);

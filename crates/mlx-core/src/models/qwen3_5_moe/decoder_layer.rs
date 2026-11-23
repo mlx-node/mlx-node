@@ -58,34 +58,9 @@ pub struct DecoderLayer {
     pub mlp: MLPType,
     input_layernorm: RMSNorm,
     post_attention_layernorm: RMSNorm,
-    source_mixer: bool,
 }
 
 impl DecoderLayer {
-    pub(crate) fn configure_source_mixer(&mut self, enabled: bool) {
-        self.source_mixer = enabled;
-    }
-
-    fn source_mixer_rows(&self, x: &MxArray) -> Result<bool> {
-        Ok(self.source_mixer
-            && x.shape()?.as_ref() == [1, 8, 2048]
-            && x.dtype()? == crate::array::DType::BFloat16)
-    }
-
-    fn finish_mixer(
-        norm: &RMSNorm,
-        x: &MxArray,
-        output: MxArray,
-        includes_residual: bool,
-    ) -> Result<(MxArray, MxArray)> {
-        if includes_residual {
-            let normalized = norm.forward(&output)?;
-            Ok((output, normalized))
-        } else {
-            Self::add_residual_norm(norm, x, &output)
-        }
-    }
-
     pub(crate) fn add_residual_norm(
         norm: &RMSNorm,
         x: &MxArray,
@@ -150,7 +125,6 @@ impl DecoderLayer {
             mlp,
             input_layernorm,
             post_attention_layernorm,
-            source_mixer: false,
         })
     }
 
@@ -163,38 +137,24 @@ impl DecoderLayer {
         use_kernel: bool,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
-        let includes_residual = self.source_mixer_rows(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                if includes_residual {
-                    gdn.forward_source_residual_with_tape(&normed, mask, ac, use_kernel, None, x)?
-                } else {
-                    gdn.forward(&normed, mask, ac, use_kernel)?
-                }
+                gdn.forward(&normed, mask, ac, use_kernel)?
             }
             AttentionType::Full(attn) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                if includes_residual {
-                    attn.forward_source_residual(&normed, mask, kvc, position_ids, x)?
-                } else {
-                    attn.forward(&normed, mask, kvc, position_ids)?
-                }
+                attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
 
-        self.finish_layer(x, attn_out, includes_residual)
+        self.finish_layer(x, attn_out)
     }
 
     /// Post-attention half of the layer: residual + norm, then the MLP or
     /// expert block and its residual.
-    fn finish_layer(
-        &self,
-        x: &MxArray,
-        attn_out: MxArray,
-        includes_residual: bool,
-    ) -> Result<MxArray> {
-        self.finish_layer_with_budget(x, attn_out, includes_residual, None)
+    fn finish_layer(&self, x: &MxArray, attn_out: MxArray) -> Result<MxArray> {
+        self.finish_layer_with_budget(x, attn_out, None)
     }
 
     /// [`Self::finish_layer`] whose expert tail routes only the rows of
@@ -203,20 +163,9 @@ impl DecoderLayer {
         &self,
         x: &MxArray,
         attn_out: MxArray,
-        includes_residual: bool,
         row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let (h, normed) = Self::finish_mixer(
-            &self.post_attention_layernorm,
-            x,
-            attn_out,
-            includes_residual,
-        )?;
-        if let MLPType::MoE(moe) = &self.mlp
-            && let Some(hidden) = moe.forward_source_residual(&normed, &h, row_budget)?
-        {
-            return Ok(hidden);
-        }
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
         let mlp_out = match &self.mlp {
             MLPType::Dense(mlp) => mlp.forward(&normed)?,
             MLPType::MoE(moe) => moe.forward_with_budget(&normed, row_budget)?,
@@ -237,30 +186,19 @@ impl DecoderLayer {
         row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         let normed = self.input_layernorm.forward(x)?;
-        let includes_residual = self.source_mixer_rows(x)?;
         let attn_out = match &mut self.attn {
             AttentionType::Linear(gdn) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
-                if includes_residual {
-                    gdn.forward_source_residual_with_tape(
-                        &normed, mask, ac, use_kernel, tape_sink, x,
-                    )?
-                } else {
-                    gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
-                }
+                gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
             }
             AttentionType::Full(attn) => {
                 let _ = tape_sink;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                if includes_residual {
-                    attn.forward_source_residual(&normed, mask, kvc, position_ids, x)?
-                } else {
-                    attn.forward(&normed, mask, kvc, position_ids)?
-                }
+                attn.forward(&normed, mask, kvc, position_ids)?
             }
         };
 
-        self.finish_layer_with_budget(x, attn_out, includes_residual, row_budget)
+        self.finish_layer_with_budget(x, attn_out, row_budget)
     }
 
     /// Paged-or-flat dispatch for the MoE decoder layer.
@@ -558,16 +496,6 @@ impl DecoderLayer {
         }
     }
 
-    pub(crate) fn enable_source_residual_norms(&mut self, source_reduction: bool) -> Result<()> {
-        if source_reduction {
-            self.input_layernorm.enable_source_f32_splash()?;
-            self.post_attention_layernorm.enable_source_f32_splash()
-        } else {
-            self.input_layernorm.enable_source_f32_reference()?;
-            self.post_attention_layernorm.enable_source_f32_reference()
-        }
-    }
-
     pub fn set_input_layernorm_weight(&mut self, w: &MxArray) -> Result<()> {
         self.input_layernorm.set_weight(w)
     }
@@ -615,11 +543,3 @@ impl DecoderLayer {
         attention || mlp
     }
 }
-
-#[cfg(test)]
-#[path = "source_residual_tests.rs"]
-mod source_residual_tests;
-
-#[cfg(test)]
-#[path = "source_mixer_tests.rs"]
-mod source_mixer_tests;

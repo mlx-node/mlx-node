@@ -7,7 +7,6 @@ use crate::inference_trace::{
     elapsed_ms, enabled as inference_trace_enabled, write as write_inference_trace,
 };
 use crate::nn::{Linear, RMSNorm, RoPE};
-use crate::transformer::paged_flags::{graph_decode_gather_enabled, native_kv_write_enabled};
 use crate::transformer::paged_kv_cache_adapter::{
     DenseAttentionWindow, PagedAttentionV2Layout, PagedDecodeRouteHint, PagedKVCacheAdapter,
     PagedRaggedRow, SeqId,
@@ -1314,67 +1313,22 @@ impl Gemma4Attention {
             self.head_dim as i64,
         ])?;
         let paged_route_hint = paged_decode_route_hint(requested_paged_kernel);
-        let mut graph_native_route = true;
-        let mut raw_used_grouped_d512 = false;
-        let raw_route = |adapter: &mut PagedKVCacheAdapter| {
-            adapter
-                .gather_kv_for_decode_with_route(
-                    paged_idx,
-                    &queries_3d,
-                    1.0,
-                    1.0,
-                    paged_route_hint,
-                    requested_grouped_stripes.unwrap_or(0),
-                )
-                .map_err(napi::Error::from_reason)
-        };
-        let attn_3d = if !graph_decode_gather_enabled() {
-            graph_native_route = false;
-            let (output, used_grouped) = raw_route(adapter)?;
-            raw_used_grouped_d512 = used_grouped;
-            output
-        } else {
-            match adapter.gather_kv_for_decode_graph_with_plan(
+        let attn_3d = adapter
+            .gather_kv_for_decode_graph_with_plan(
                 paged_idx,
                 &queries_3d,
                 1.0,
                 1.0,
                 paged_route_hint,
                 requested_grouped_stripes.unwrap_or(0),
-            ) {
-                Ok(output) => output,
-                Err(err) => {
-                    graph_native_route = false;
-                    if adapter.should_report_decode_fallback(context_bucket_end) {
-                        tracing::warn!(
-                            target: "mlx_core::inference",
-                            event = "gemma4_paged_decode_fallback",
-                            layer = paged_idx,
-                            configured_mode,
-                            failed_path = "paged_attention_graph",
-                            stage = "graph_construction",
-                            context_bucket_end_tokens = context_bucket_end,
-                            physical_pool_authoritative = true,
-                            error = %err,
-                            "Gemma4 graph-native paged decode attention failed"
-                        );
-                    }
-                    let (output, used_grouped) = raw_route(adapter)?;
-                    raw_used_grouped_d512 = used_grouped;
-                    output
-                }
-            }
-        };
+            )
+            .map_err(napi::Error::from_reason)?;
         let effective_paged_reason = if sdpa_fell_back {
             PagedDecodeReason::SdpaFailedInBucket
         } else {
             plan.reason
         };
-        let selected_paged_backend = if !graph_native_route && raw_used_grouped_d512 {
-            "grouped_d512_direct_raw"
-        } else if !graph_native_route {
-            "generic_v2_raw"
-        } else if paged_route_hint == PagedDecodeRouteHint::ForceD512Staged {
+        let selected_paged_backend = if paged_route_hint == PagedDecodeRouteHint::ForceD512Staged {
             "grouped_d512_direct"
         } else {
             "generic_v2"
@@ -1903,50 +1857,20 @@ impl Gemma4Attention {
                 adapter.num_allocated_blocks()
             ));
         }
-        let write_path = if native_kv_write_enabled() {
-            match adapter.update_keys_values_native(
+        adapter
+            .update_keys_values_native(
                 paged_idx,
                 &keys_paged,
                 &values_paged,
                 first_logical_position,
-            ) {
-                Ok(()) => "native",
-                Err(err) => {
-                    if trace_enabled {
-                        write_inference_trace(format_args!(
-                            "[MLX_TRACE] gemma4 attention_paged_kv_write_fallback paged_idx={} first_position={} seq_len={} error={}",
-                            paged_idx, first_logical_position, seq_len, err
-                        ));
-                    }
-                    adapter
-                        .update_keys_values(
-                            paged_idx,
-                            &keys_paged,
-                            &values_paged,
-                            first_logical_position,
-                        )
-                        .map_err(napi::Error::from_reason)?;
-                    "legacy"
-                }
-            }
-        } else {
-            adapter
-                .update_keys_values(
-                    paged_idx,
-                    &keys_paged,
-                    &values_paged,
-                    first_logical_position,
-                )
-                .map_err(napi::Error::from_reason)?;
-            "legacy"
-        };
+            )
+            .map_err(napi::Error::from_reason)?;
         if trace_enabled {
             write_inference_trace(format_args!(
-                "[MLX_TRACE] gemma4 attention_paged_kv_write_done paged_idx={} first_position={} seq_len={} path={} elapsed_ms={:.1}",
+                "[MLX_TRACE] gemma4 attention_paged_kv_write_done paged_idx={} first_position={} seq_len={} path=native elapsed_ms={:.1}",
                 paged_idx,
                 first_logical_position,
                 seq_len,
-                write_path,
                 write_trace_start.map(elapsed_ms).unwrap_or(0.0)
             ));
         }
@@ -2063,11 +1987,6 @@ impl Gemma4Attention {
                 shape.as_ref()
             )));
         }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "Gemma4 batched decode requires native paged K/V writes",
-            ));
-        }
 
         let batch = rows.len() as i64;
         let offsets = rows
@@ -2159,11 +2078,6 @@ impl Gemma4Attention {
         {
             return Err(Error::from_reason(
                 "Gemma4 ragged queries/offsets do not match row lengths",
-            ));
-        }
-        if !native_kv_write_enabled() {
-            return Err(Error::from_reason(
-                "Gemma4 ragged verification requires native KV writes",
             ));
         }
         let queries = self.q_proj.forward(x)?.reshape(&[
@@ -3185,7 +3099,8 @@ mod tests {
             k.eval();
             v.eval();
             adapter
-                .update_keys_values(0, &k, &v, first)
+                .update_keys_values_native(0, &k, &v, first)
+                .and_then(|()| adapter.eval_pending_pool_writes())
                 .map_err(Error::from_reason)
         };
 
