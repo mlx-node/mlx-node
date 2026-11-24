@@ -599,7 +599,8 @@ describe('Chat host: the model select call before the prompt', () => {
         expect((await answer).status).toBe(200);
       },
       {
-        timings: { modelWaitShowMs: 20 },
+        // The held answer stays held until the end, so a select that waited for it would pass this mark.
+        timings: { modelWaitShowMs: 2_000 },
         mutate: (scenario) => {
           (scenario.prompts as Json[])[0]!.steps = [{ sleepMs: 60_000 }, { end: { stopReason: 'end_turn' } }];
         },
