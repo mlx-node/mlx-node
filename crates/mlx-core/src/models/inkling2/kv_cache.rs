@@ -849,6 +849,140 @@ impl Inkling2KVCacheCoordinator {
     pub(crate) fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
         self.inner.spec_frontier(seq_id)
     }
+
+    /// Tightest logical token capacity across all KV groups (Global physical max & SWA logical max).
+    pub(crate) fn max_capacity_tokens(&self) -> u32 {
+        let mut cap = u32::MAX;
+        for gid in 0..self.groups().len() {
+            if let Ok(adapter) = self.adapter(gid) {
+                cap = cap.min(adapter.max_capacity_tokens());
+                if adapter.sliding_window() == 0
+                    && let Ok(tel) = adapter.block_telemetry()
+                {
+                    cap = cap.min(tel.max_total_blocks.saturating_mul(adapter.block_size()));
+                }
+            }
+        }
+        if cap == u32::MAX { 0 } else { cap }
+    }
+
+    /// Whether a sequence of `total_tokens` fits within the hard logical/Global capacity of every
+    /// KV group (independent of transient occupancy by other idle owners).
+    pub(crate) fn can_fit_logical_tokens(&self, total_tokens: u32) -> bool {
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter(gid) else {
+                return false;
+            };
+            if total_tokens > adapter.max_capacity_tokens() {
+                return false;
+            }
+            let bs = adapter.block_size();
+            if bs == 0 {
+                return false;
+            }
+            if adapter.sliding_window() == 0 {
+                let Ok(tel) = adapter.block_telemetry() else {
+                    return false;
+                };
+                if total_tokens.div_ceil(bs) > tel.max_total_blocks {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether advancing `seq_id` to `new_total_tokens` in ONE allocation step fits within the
+    /// hard single-sequence physical capacity of every KV group (accounting for SWA's reserved
+    /// null block and already-pruned blocks on `seq_id`).
+    pub(crate) fn can_fit_single_allocation(&self, seq_id: u32, new_total_tokens: u32) -> bool {
+        if !self.can_fit_logical_tokens(new_total_tokens) {
+            return false;
+        }
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter(gid) else {
+                return false;
+            };
+            if adapter.sliding_window() == 0 {
+                continue;
+            }
+            let bs = adapter.block_size();
+            if bs == 0 {
+                return false;
+            }
+            let Ok(tel) = adapter.block_telemetry() else {
+                return false;
+            };
+            let current_logical_blocks = adapter
+                .block_table_for(seq_id)
+                .map_or(0, |t| t.num_blocks() as u32);
+            let to_allocate = new_total_tokens
+                .div_ceil(bs)
+                .saturating_sub(current_logical_blocks);
+            let held_by_seq = adapter.releasable_blocks_of(&[seq_id]).len() as u32;
+            let usable_max = tel.max_total_blocks.saturating_sub(1);
+            if held_by_seq.saturating_add(to_allocate) > usable_max {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether restoring `live_blocks` raw SWA blocks fits within the sliding pool's physical max
+    /// (excluding the reserved null block).
+    pub(crate) fn can_fit_sliding_raw_blocks(&self, live_blocks: usize) -> bool {
+        let Some(swa) = self.sliding_adapter() else {
+            return true;
+        };
+        let Ok(tel) = swa.block_telemetry() else {
+            return false;
+        };
+        let usable_max = tel.max_total_blocks.saturating_sub(1);
+        u32::try_from(live_blocks).is_ok_and(|n| n <= usable_max)
+    }
+
+    /// Grow any extent-backed KV group whose current pool lacks blocks for `rows` lookahead rows
+    /// past `seq_id`'s cursor (preserving grow-before-reclaim since `reserve_rows_all` pre-flights
+    /// without growing). Returns `true` if at least one group grew.
+    pub(crate) fn try_grow_all_for_rows(&mut self, seq_id: u32, rows: u32) -> bool {
+        let mut grew = false;
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter_mut(gid) else {
+                continue;
+            };
+            let bs = adapter.block_size();
+            if bs == 0 {
+                continue;
+            }
+            let Some(current_tokens) = adapter
+                .request_tokens_for(seq_id)
+                .map(|tokens| tokens.len() as u32)
+            else {
+                continue;
+            };
+            let Some(new_total) = current_tokens.checked_add(rows) else {
+                continue;
+            };
+            let current_blocks = adapter
+                .block_table_for(seq_id)
+                .map_or(0, |table| table.num_blocks() as u32);
+            let needed_blocks = new_total.div_ceil(bs).saturating_sub(current_blocks);
+            if needed_blocks == 0 {
+                continue;
+            }
+            let Ok(tel) = adapter.block_telemetry() else {
+                continue;
+            };
+            let available = tel.free_blocks.saturating_add(tel.evictable_blocks);
+            if needed_blocks > available && tel.total_blocks < tel.max_total_blocks {
+                let shortfall = needed_blocks - available;
+                if adapter.try_grow_pool(shortfall) {
+                    grew = true;
+                }
+            }
+        }
+        grew
+    }
 }
 
 impl SpecPagedCache for Inkling2KVCacheCoordinator {

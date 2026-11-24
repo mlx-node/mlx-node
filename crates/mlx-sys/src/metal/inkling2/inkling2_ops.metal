@@ -1368,12 +1368,18 @@ inkling2_paged_kv_path_commit(
   const ulong bs = ulong(params.block_size);
   const int64_t bs_i64 = int64_t(params.block_size);
   const int64_t total_slots = int64_t(params.total_slots);
+  for (uint i = 0u; i < params.num_copies; ++i) {
+    const int64_t s_slot = src_slots[i];
+    const int64_t d_slot = dst_slots[i];
+    if (s_slot < 0 || d_slot < 0 || s_slot >= total_slots || d_slot >= total_slots) {
+      return;
+    }
+  }
 
   for (uint i = 0u; i < params.num_copies; ++i) {
     const int64_t s_slot = src_slots[i];
     const int64_t d_slot = dst_slots[i];
-    if (s_slot < 0 || d_slot < 0 || s_slot >= total_slots ||
-        d_slot >= total_slots || s_slot == d_slot) {
+    if (s_slot == d_slot) {
       continue;
     }
     const ulong s_bh = ulong(s_slot / bs_i64) * ulong(n_kv) + ulong(h);

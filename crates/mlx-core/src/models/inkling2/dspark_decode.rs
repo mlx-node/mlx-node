@@ -94,21 +94,19 @@ impl Inkling2DsparkStepper<'_> {
             };
         }
 
-        let (first_pos, ticket) = {
+        let first_pos = {
             let rt = self.inner.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2 DSpark verify: paged runtime missing")
             })?;
             rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
-            let pos = rt
-                .coordinator
+            rt.coordinator
                 .request_token_count_all(self.seq_id)
-                .map_err(Error::from_reason)?;
-            let ticket = rt
-                .coordinator
-                .record_verify(self.seq_id, verify_ids)
-                .map_err(Error::from_reason)?;
-            (pos, ticket)
+                .map_err(Error::from_reason)?
         };
+        let ticket = self
+            .inner
+            .record_verify_exclusive(self.seq_id, verify_ids)
+            .map_err(Error::from_reason)?;
 
         let row = PagedRaggedRow {
             seq_id: self.seq_id,
@@ -173,21 +171,19 @@ impl Inkling2DsparkStepper<'_> {
         }
 
         let placeholders = vec![u32::MAX; len];
-        let (first_pos, ticket) = {
+        let first_pos = {
             let rt = self.inner.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2 DSpark verify_device: paged runtime missing")
             })?;
             rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
-            let pos = rt
-                .coordinator
+            rt.coordinator
                 .request_token_count_all(self.seq_id)
-                .map_err(Error::from_reason)?;
-            let ticket = rt
-                .coordinator
-                .record_verify(self.seq_id, &placeholders)
-                .map_err(Error::from_reason)?;
-            (pos, ticket)
+                .map_err(Error::from_reason)?
         };
+        let ticket = self
+            .inner
+            .record_verify_exclusive(self.seq_id, &placeholders)
+            .map_err(Error::from_reason)?;
 
         let row = PagedRaggedRow {
             seq_id: self.seq_id,
@@ -397,11 +393,8 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
     }
 
     fn reserve_cycle_lookahead(&mut self, rows: usize) -> Result<bool> {
-        let rt = self.inner.paged.as_mut().ok_or_else(|| {
-            Error::from_reason("Inkling2 speculative reserve: paged runtime missing")
-        })?;
-        rt.coordinator
-            .reserve_lookahead(self.seq_id, rows)
+        self.inner
+            .reserve_lookahead_exclusive(self.seq_id, rows)
             .map_err(Error::from_reason)
     }
 
@@ -476,11 +469,11 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
             if let Some(snap) = rt.conv_states.get(&self.seq_id).cloned() {
                 rt.prev_conv_snapshots.insert(self.seq_id, (pos, snap));
             }
-            rt.coordinator
-                .record_tokens_all(self.seq_id, &[anchor_id])
-                .map_err(Error::from_reason)?;
             pos
         };
+        self.inner
+            .record_tokens_all_exclusive(self.seq_id, &[anchor_id])
+            .map_err(Error::from_reason)?;
         let (logits_2d, taps) = self.inner.forward_paged_single_chunk_with_taps(
             self.seq_id,
             &[anchor_id],
@@ -687,7 +680,7 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
                 None
             };
 
-            let (anchor_pos, ticket, used_placeholders) = {
+            let (anchor_pos, rec_ids, used_placeholders) = {
                 let rt = self.inner.paged.as_mut().ok_or_else(|| {
                     Error::from_reason("Inkling2 DFlash2 hybrid 1D verify: paged runtime missing")
                 })?;
@@ -701,12 +694,12 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
                 } else {
                     (vec![u32::MAX; verify_len], true)
                 };
-                let ticket = rt
-                    .coordinator
-                    .record_verify(self.seq_id, &rec_ids)
-                    .map_err(Error::from_reason)?;
-                (pos, ticket, placeholders)
+                (pos, rec_ids, placeholders)
             };
+            let ticket = self
+                .inner
+                .record_verify_exclusive(self.seq_id, &rec_ids)
+                .map_err(Error::from_reason)?;
 
             let row = PagedRaggedRow {
                 seq_id: self.seq_id,
@@ -867,16 +860,13 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
             (lookup, tree)
         };
 
-        // 3. Ensure KV lookahead can accommodate `tree.len()` rows (shrinking gracefully if
-        //    the paged pool is near capacity on `M > 8` trees).
-        let mut reserved = {
-            let rt = self.inner.paged.as_mut().ok_or_else(|| {
-                Error::from_reason("Inkling2 DFlash2 verify_tree: paged runtime missing")
-            })?;
-            rt.coordinator
-                .reserve_lookahead(self.seq_id, tree.len())
-                .map_err(Error::from_reason)?
-        };
+        // 3. Ensure KV lookahead can accommodate `tree.len()` rows (reclaiming idle owners on
+        //    the exclusive lane before shrinking gracefully if the paged pool is near capacity on
+        //    `M > 8` trees).
+        let mut reserved = self
+            .inner
+            .reserve_lookahead_exclusive(self.seq_id, tree.len())
+            .map_err(Error::from_reason)?;
         if !reserved && tree.len() > 1 {
             for fallback_cap in [8usize, 4, 1] {
                 if fallback_cap >= tree.len() {
@@ -897,14 +887,10 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
                         &dctx.lookup_acc,
                     )
                 };
-                reserved = {
-                    let rt = self.inner.paged.as_mut().ok_or_else(|| {
-                        Error::from_reason("Inkling2 DFlash2 verify_tree: paged runtime missing")
-                    })?;
-                    rt.coordinator
-                        .reserve_lookahead(self.seq_id, tree.len())
-                        .map_err(Error::from_reason)?
-                };
+                reserved = self
+                    .inner
+                    .reserve_lookahead_exclusive(self.seq_id, tree.len())
+                    .map_err(Error::from_reason)?;
                 if reserved {
                     break;
                 }
@@ -919,21 +905,19 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
 
         // 4. Record verify rows and run 48-visit target tree verification.
         let tree_len = tree.len();
-        let (anchor_pos, ticket) = {
+        let anchor_pos = {
             let rt = self.inner.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2 DFlash2 verify_tree: paged runtime missing")
             })?;
             rt.ensure_conv_state(self.seq_id, &self.inner.config)?;
-            let pos = rt
-                .coordinator
+            rt.coordinator
                 .request_token_count_all(self.seq_id)
-                .map_err(Error::from_reason)?;
-            let ticket = rt
-                .coordinator
-                .record_verify(self.seq_id, &tree.tokens)
-                .map_err(Error::from_reason)?;
-            (pos, ticket)
+                .map_err(Error::from_reason)?
         };
+        let ticket = self
+            .inner
+            .record_verify_exclusive(self.seq_id, &tree.tokens)
+            .map_err(Error::from_reason)?;
 
         let is_chain = is_strict_linear_chain(&tree);
         let encoded_tree = if is_chain {

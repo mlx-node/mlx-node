@@ -104,6 +104,9 @@ pub struct Inkling2PagedRuntime {
     pub active_seq: SeqId,
     pub prefill_chunk_size: usize,
     pub(crate) paged_finalize_error: Option<String>,
+    /// True only while executing an exclusive barrier turn (`execute_chat_barrier`), enabling
+    /// on-demand idle-owner and `StateStore` KV reclaim on allocation pressure.
+    pub(crate) exclusive_turn_active: bool,
 }
 
 impl Inkling2PagedRuntime {
@@ -133,6 +136,7 @@ impl Inkling2PagedRuntime {
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
+            exclusive_turn_active: false,
         })
     }
 
@@ -153,6 +157,7 @@ impl Inkling2PagedRuntime {
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
+            exclusive_turn_active: false,
         }
     }
 
@@ -421,14 +426,14 @@ fn swa_mpp_verify_mode() -> SwaMppVerifyMode {
 pub(crate) fn lane_uses_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) -> bool {
     mpp_supported
         && row.query_len > 1
-        && row.query_len <= prefill_plan::VERIFY_ROWS
+        && row.query_len <= prefill_plan::INKLING2_VERIFY_ROWS
         && row.first_logical_position >= 2048
 }
 
 /// Per-lane eligibility for MPP `Pass::Verify` on SWA attention layers.
 #[inline]
 pub(crate) fn lane_uses_swa_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) -> bool {
-    if !mpp_supported || row.query_len < 4 || row.query_len > prefill_plan::VERIFY_ROWS {
+    if !mpp_supported || row.query_len < 4 || row.query_len > prefill_plan::INKLING2_VERIFY_ROWS {
         return false;
     }
     match swa_mpp_verify_mode() {
@@ -1261,7 +1266,7 @@ impl Inkling2Inner {
         )?;
 
         let use_mpp_prefill = rows > 1 && inkling2_paged_prefill_mpp_supported();
-        let mpp_pass = if rows <= prefill_plan::VERIFY_ROWS {
+        let mpp_pass = if rows <= prefill_plan::INKLING2_VERIFY_ROWS {
             Pass::Verify
         } else {
             Pass::Prefill
@@ -1622,11 +1627,25 @@ impl Inkling2Inner {
                 "Inkling2Model::paged_prefill_sequence: empty tokens",
             ));
         }
-        let chunk_limit = self
-            .paged
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2Model: paged runtime not initialized"))?
-            .prefill_chunk_size;
+        let chunk_limit = {
+            let rt = self.paged.as_ref().ok_or_else(|| {
+                Error::from_reason("Inkling2Model: paged runtime not initialized")
+            })?;
+            let existing = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
+            let added = u32::try_from(tokens.len())
+                .map_err(|_| Error::from_reason("Inkling2 prompt length overflows u32"))?;
+            let final_total = existing
+                .checked_add(added)
+                .ok_or_else(|| Error::from_reason("Inkling2 prompt total length overflows u32"))?;
+            if !rt.coordinator.can_fit_logical_tokens(final_total) {
+                let capacity = rt.coordinator.max_capacity_tokens();
+                return Err(Error::from_reason(format!(
+                    "context_length_exceeded: requested {final_total} tokens, \
+                     paged cache capacity is {capacity} tokens"
+                )));
+            }
+            rt.prefill_chunk_size
+        };
 
         // Validate total IMAGE_PAD count up front if image embeddings are supplied.
         let mut img_cursor = 0usize;
@@ -1683,15 +1702,12 @@ impl Inkling2Inner {
                     .as_mut()
                     .ok_or_else(|| Error::from_reason("Inkling2Model: paged runtime missing"))?;
                 rt.ensure_conv_state(seq_id, &self.config)?;
-                let pos = rt
-                    .coordinator
-                    .request_token_count_all(seq_id)
-                    .map_err(Error::from_reason)?;
                 rt.coordinator
-                    .record_tokens_all(seq_id, chunk)
-                    .map_err(Error::from_reason)?;
-                pos
+                    .request_token_count_all(seq_id)
+                    .map_err(Error::from_reason)?
             };
+            self.record_tokens_all_exclusive(seq_id, chunk)
+                .map_err(Error::from_reason)?;
 
             let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
                 seq_id,
@@ -1764,11 +1780,10 @@ impl Inkling2Inner {
             if save_prev_snapshot && let Some(snap) = rt.conv_states.get(&seq_id).cloned() {
                 rt.prev_conv_snapshots.insert(seq_id, (pos, snap));
             }
-            rt.coordinator
-                .record_tokens_all(seq_id, &[token_id])
-                .map_err(Error::from_reason)?;
             pos
         };
+        self.record_tokens_all_exclusive(seq_id, &[token_id])
+            .map_err(Error::from_reason)?;
         let chunk = [token_id];
         let positions = [first_pos];
         let cu_seqlens_q = [0usize, 1];
@@ -2152,11 +2167,11 @@ impl Inkling2Inner {
                     "Inkling2Model::paged_verify_ragged_taped: empty query_len",
                 ));
             }
-            if tree.is_some() && row.query_len > prefill_plan::VERIFY_ROWS {
+            if tree.is_some() && row.query_len > prefill_plan::INKLING2_VERIFY_ROWS {
                 return Err(Error::from_reason(format!(
                     "Inkling2Model::paged_verify_ragged_taped: tree query_len {} exceeds max {}",
                     row.query_len,
-                    prefill_plan::VERIFY_ROWS
+                    prefill_plan::INKLING2_VERIFY_ROWS
                 )));
             }
             seq_ids.push(row.seq_id);
@@ -2316,7 +2331,7 @@ impl Inkling2Inner {
         let seq_q_lens = [(seq_id, rows)];
 
         let use_mpp_prefill = rows > 1 && inkling2_paged_prefill_mpp_supported();
-        let mpp_pass = if rows <= prefill_plan::VERIFY_ROWS {
+        let mpp_pass = if rows <= prefill_plan::INKLING2_VERIFY_ROWS {
             Pass::Verify
         } else {
             Pass::Prefill
@@ -4412,7 +4427,9 @@ impl ChatBackend for Inkling2Inner {
 
     fn has_live_session(&self) -> bool {
         if let Some(ref rt) = self.paged {
-            rt.coordinator.is_live_all(rt.active_seq) && rt.conv_states.contains_key(&rt.active_seq)
+            !self.cached_token_history.is_empty()
+                || (rt.coordinator.is_live_all(rt.active_seq)
+                    && rt.conv_states.contains_key(&rt.active_seq))
         } else {
             self.flat_cache.is_some()
         }
@@ -6055,7 +6072,7 @@ mod mpp_verify_tests {
         let too_wide = PagedRaggedRow {
             seq_id: 4,
             first_logical_position: 8192,
-            query_len: prefill_plan::VERIFY_ROWS + 1,
+            query_len: prefill_plan::INKLING2_VERIFY_ROWS + 1,
         };
         assert!(!lane_uses_mpp_verify(&short, true));
         assert!(lane_uses_mpp_verify(&long, true));

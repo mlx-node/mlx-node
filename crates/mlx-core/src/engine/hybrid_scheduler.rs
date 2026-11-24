@@ -5070,6 +5070,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if reset {
             self.owner_sequences.clear();
             self.owner_states.clear();
+            self.owner_last_used.clear();
+        } else {
+            let live: HashSet<SeqId> = self.owner_sequences.values().copied().collect();
+            self.owner_last_used
+                .retain(|seq_id, _| live.contains(seq_id));
+            if let Some(adapter) = self.inner.paged_adapter() {
+                for &seq_id in &live {
+                    if let Some(stamp) = adapter.turn_end_stamp(seq_id) {
+                        self.owner_last_used.insert(seq_id, stamp);
+                    } else if adapter.block_table_for(seq_id).is_none() {
+                        self.owner_last_used.remove(&seq_id);
+                    }
+                }
+            }
         }
         self.close_pass(&mut []);
         None
@@ -8737,6 +8751,36 @@ pub(crate) mod tests {
                 streaming,
                 expected_tree,
                 "dflash2-greedy-unpenalized",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some(DFLASH2_DRAFT_PROPOSALS as i32),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                expected_tree,
+                "dflash2-greedy-full-depth",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some(1),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-pinned-depth-1",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some((DFLASH2_DRAFT_PROPOSALS - 1) as i32),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-pinned-depth-6",
             );
             check_turn(
                 &mut dflash_state,

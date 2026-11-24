@@ -5888,9 +5888,11 @@ bool mlx_inkling2_paged_kv_path_commit(
     }
     const int64_t pool_capacity =
         static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size);
-    if (src_slots.shape(0) > 0 && src_slots.is_available() &&
-        dst_slots.is_available() && src_slots.data_shared_ptr() &&
-        dst_slots.data_shared_ptr()) {
+    if (src_slots.shape(0) > 0) {
+      if (!src_slots.is_available() || !dst_slots.is_available() ||
+          !src_slots.data_shared_ptr() || !dst_slots.data_shared_ptr()) {
+        return false;
+      }
       const int64_t s_stride = src_slots.strides(0);
       const int64_t d_stride = dst_slots.strides(0);
       const int64_t* s_data = src_slots.data<int64_t>();

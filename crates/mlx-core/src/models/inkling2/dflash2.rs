@@ -1013,11 +1013,25 @@ impl Inkling2Inner {
         if tokens.is_empty() {
             return Err(Error::from_reason("Inkling2 DFlash2 prefill: empty tokens"));
         }
-        let chunk_limit = self
-            .paged
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing"))?
-            .prefill_chunk_size;
+        let chunk_limit = {
+            let rt = self.paged.as_ref().ok_or_else(|| {
+                Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing")
+            })?;
+            let existing = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
+            let added = u32::try_from(tokens.len())
+                .map_err(|_| Error::from_reason("Inkling2 DFlash2 prompt length overflows u32"))?;
+            let final_total = existing.checked_add(added).ok_or_else(|| {
+                Error::from_reason("Inkling2 DFlash2 prompt total length overflows u32")
+            })?;
+            if !rt.coordinator.can_fit_logical_tokens(final_total) {
+                let capacity = rt.coordinator.max_capacity_tokens();
+                return Err(Error::from_reason(format!(
+                    "context_length_exceeded: requested {final_total} tokens, \
+                     paged cache capacity is {capacity} tokens"
+                )));
+            }
+            rt.prefill_chunk_size
+        };
         let (tap_visits, sliding_window) = {
             let draft = self.dflash2.as_ref().ok_or_else(|| {
                 Error::from_reason("Inkling2 DFlash2 prefill: DFlash2 draft model missing")
@@ -1052,15 +1066,12 @@ impl Inkling2Inner {
                     Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing")
                 })?;
                 rt.ensure_conv_state(seq_id, &self.config)?;
-                let pos = rt
-                    .coordinator
-                    .request_token_count_all(seq_id)
-                    .map_err(Error::from_reason)?;
                 rt.coordinator
-                    .record_tokens_all(seq_id, chunk)
-                    .map_err(Error::from_reason)?;
-                pos
+                    .request_token_count_all(seq_id)
+                    .map_err(Error::from_reason)?
             };
+            self.record_tokens_all_exclusive(seq_id, chunk)
+                .map_err(Error::from_reason)?;
 
             let tap_arg: &[usize] = if needs_taps { &tap_visits } else { &[] };
             let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(

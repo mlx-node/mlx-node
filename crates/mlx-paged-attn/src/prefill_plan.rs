@@ -11,8 +11,10 @@ pub const TILE_ROWS: u32 = 8;
 pub const PREFILL_MAX_ROWS: u32 = 2048;
 /// Splits of a prefill launch (Splash `SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS`).
 pub const PREFILL_MAX_SPLITS: u32 = 32;
-/// Rows of a verify launch (Splash `SPLASH_TARGET_VERIFY_ROWS`, up to 16 for verify trees).
-pub const VERIFY_ROWS: u32 = 16;
+/// Rows of a verify launch (Splash `SPLASH_TARGET_VERIFY_ROWS`).
+pub const VERIFY_ROWS: u32 = 8;
+/// Maximum rows of an Inkling2 verify-tree launch (`M <= 16` single-tile `_r16` MPP kernel).
+pub const INKLING2_VERIFY_ROWS: u32 = 16;
 /// Splash `kv::kVerifySplits`, `kVerifyMaximumSplits`, `kVerifyPagesPerSplit`.
 pub const VERIFY_MIN_SPLITS: u32 = 32;
 pub const VERIFY_MAX_SPLITS: u32 = 128;

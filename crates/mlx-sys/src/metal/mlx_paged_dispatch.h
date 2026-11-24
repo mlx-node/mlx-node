@@ -230,8 +230,10 @@ constexpr int kPagedPrefillMaxRows = 2048;
 /// SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS / kVerifyMaximumSplits).
 constexpr int kPagedPrefillMaxSplits = 32;
 constexpr int kPagedVerifyMaxSplits = 128;
-/// Rows of a verify launch (Splash SPLASH_TARGET_VERIFY_ROWS, up to 16 for verify trees).
-constexpr int kPagedVerifyRows = 16;
+/// Rows of a verify launch (Splash SPLASH_TARGET_VERIFY_ROWS).
+constexpr int kPagedVerifyRows = 8;
+/// Maximum rows of an Inkling2 verify-tree launch (single-tile _r16 MPP kernel).
+constexpr int kInkling2PagedVerifyRows = 16;
 
 /// Whether a (query heads per KV head, head dim) pair has an instance.
 bool paged_prefill_attention_geometry(int group, int head_size);

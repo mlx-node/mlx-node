@@ -7560,11 +7560,59 @@ mod tests {
             assert!(out_vs.is_null());
         }
 
-        // (b) Lazy GPU-produced `dst_slots` containing an out-of-range slot (>= pool_capacity)
-        //     alongside a valid copy -> executes cleanly; OOB entry skipped by Metal `total_slots`
-        //     guard, valid entry copied accurately, and all other slots untouched.
+        // (b) Lazy/unevaluated `dst_slots` and eager mixed valid + out-of-range batches are
+        //     rejected atomically (`ok == false`, null outputs), leaving both pools 100% untouched.
         {
-            let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+            let assert_rejected_and_untouched =
+                |src_slots: &MxArray, dst_slots: &MxArray, label: &str| {
+                    let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+                    let mut out_kp = std::ptr::null_mut();
+                    let mut out_vp = std::ptr::null_mut();
+                    let mut out_ks = std::ptr::null_mut();
+                    let mut out_vs = std::ptr::null_mut();
+                    let ok = unsafe {
+                        mlx_sys::mlx_inkling2_paged_kv_path_commit(
+                            k_pool.as_raw_ptr(),
+                            v_pool.as_raw_ptr(),
+                            dummy_scale.as_raw_ptr(),
+                            dummy_scale.as_raw_ptr(),
+                            src_slots.as_raw_ptr(),
+                            dst_slots.as_raw_ptr(),
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            block_size as u32,
+                            kv_mode,
+                            &mut out_kp,
+                            &mut out_vp,
+                            &mut out_ks,
+                            &mut out_vs,
+                        )
+                    };
+                    assert!(!ok, "{label}: FFI must reject commit");
+                    assert!(out_kp.is_null(), "{label}: out_kp must be null");
+                    assert!(out_vp.is_null(), "{label}: out_vp must be null");
+                    assert!(out_ks.is_null(), "{label}: out_ks must be null");
+                    assert!(out_vs.is_null(), "{label}: out_vs must be null");
+
+                    let got_k = k_pool.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    let got_v = v_pool.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    for slot in 0..(nb * block_size) {
+                        for h in 0..num_kv_heads {
+                            assert_eq!(
+                                slot_slice(got_k.as_ref(), slot, h),
+                                slot_slice(&orig_k, slot, h),
+                                "{label}: k_pool mutated at slot={slot}, h={h}"
+                            );
+                            assert_eq!(
+                                slot_slice(got_v.as_ref(), slot, h),
+                                slot_slice(&orig_v, slot, h),
+                                "{label}: v_pool mutated at slot={slot}, h={h}"
+                            );
+                        }
+                    }
+                };
+
+            // (b1) Lazy GPU-produced `dst_slots` (mixed valid + OOB).
             let src_slots = MxArray::from_int64(&[6, 5], &[2]).unwrap();
             let dst_base = MxArray::from_int64(&[2, pool_capacity + 3], &[2]).unwrap();
             let dst_zero = MxArray::from_int64(&[0, 0], &[2]).unwrap();
@@ -7573,38 +7621,29 @@ mod tests {
                 !dst_lazy.is_available(),
                 "lazy GPU-produced dst_slots must not be available before eval"
             );
+            assert_rejected_and_untouched(&src_slots, &dst_lazy, "lazy mixed dst_slots");
 
-            let (kp_out, vp_out, _, _) = inkling2_paged_kv_path_commit(
-                &k_pool,
-                &v_pool,
-                &dummy_scale,
-                &dummy_scale,
-                &src_slots,
-                &dst_lazy,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                kv_mode,
-            )
-            .unwrap();
-            let got_k = kp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
-            let got_v = vp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+            // (b2) Eager mixed valid + OOB `dst_slots`: src=[6, 5], dst=[2, pool_capacity + 3].
+            let src_eager_1 = MxArray::from_int64(&[6, 5], &[2]).unwrap();
+            let dst_eager_1 = MxArray::from_int64(&[2, pool_capacity + 3], &[2]).unwrap();
+            assert!(src_eager_1.is_available());
+            assert!(dst_eager_1.is_available());
+            assert_rejected_and_untouched(
+                &src_eager_1,
+                &dst_eager_1,
+                "eager mixed valid + OOB dst_slots",
+            );
 
-            for slot in 0..(nb * block_size) {
-                let expected_src = if slot == 2 { 6 } else { slot };
-                for h in 0..num_kv_heads {
-                    assert_eq!(
-                        slot_slice(got_k.as_ref(), slot, h),
-                        slot_slice(&orig_k, expected_src, h),
-                        "lazy OOB test k_pool mismatch at slot={slot}, h={h}"
-                    );
-                    assert_eq!(
-                        slot_slice(got_v.as_ref(), slot, h),
-                        slot_slice(&orig_v, expected_src, h),
-                        "lazy OOB test v_pool mismatch at slot={slot}, h={h}"
-                    );
-                }
-            }
+            // (b3) Eager mixed OOB `src_slots` + valid entry: src=[pool_capacity + 1, 5], dst=[2, 3].
+            let src_eager_2 = MxArray::from_int64(&[pool_capacity + 1, 5], &[2]).unwrap();
+            let dst_eager_2 = MxArray::from_int64(&[2, 3], &[2]).unwrap();
+            assert!(src_eager_2.is_available());
+            assert!(dst_eager_2.is_available());
+            assert_rejected_and_untouched(
+                &src_eager_2,
+                &dst_eager_2,
+                "eager mixed OOB src_slots + valid",
+            );
         }
 
         // (c) Valid strided 1D `src_slots`/`dst_slots` views (with OOB poison values in the

@@ -2785,7 +2785,7 @@ void validate_inkling2_paged_prefill_inputs(
     prefill_reject(op_name, "max_splits must be 32 (prefill) or 128 (verify)");
   }
   const int max_rows = max_splits == paged::kPagedVerifyMaxSplits
-      ? paged::kPagedVerifyRows
+      ? paged::kInkling2PagedVerifyRows
       : paged::kPagedPrefillMaxRows;
   if (rows <= 0 || rows > max_rows) {
     prefill_reject(op_name, "rows out of range");
