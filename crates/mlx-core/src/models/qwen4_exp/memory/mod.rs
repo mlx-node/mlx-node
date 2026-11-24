@@ -213,7 +213,11 @@ pub(super) fn bank_gate_beside(
 /// Record the live host in `plan`: the gates that follow read it, never the
 /// plan's sizes. Fixtures and unsupported platforms have no snapshot.
 pub(super) fn host_snapshot(plan: &mut Plan) -> Result<()> {
-    if !cfg!(any(target_os = "macos", target_os = "windows")) {
+    if !cfg!(any(
+        target_os = "macos",
+        target_os = "linux",
+        target_os = "windows"
+    )) {
         return Ok(());
     }
     let host = host_memory()?;
@@ -363,12 +367,12 @@ fn physical_memory() -> Result<u64> {
     if let Some(host) = test_host_override() {
         return Ok(host.physical);
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         crate::utils::host::physical_memory()
             .ok_or_else(|| Error::from_reason("Cannot read physical memory for Qwen4 residency"))
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Ok(crate::utils::host::physical_memory().unwrap_or(0))
     }
@@ -418,16 +422,16 @@ pub(super) fn host_memory() -> Result<HostMemory> {
     if let Some(host) = test_host_override() {
         return Ok(host);
     }
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
     {
         crate::utils::host::host_memory().ok_or_else(|| {
             Error::from_reason("Cannot establish Qwen4 larger-cache memory headroom")
         })
     }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
     {
         Err(Error::from_reason(
-            "Qwen4 larger-cache admission is currently available only on macOS and Windows",
+            "Qwen4 larger-cache admission is currently available only on macOS, Linux, and Windows",
         ))
     }
 }

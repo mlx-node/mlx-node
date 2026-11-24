@@ -796,6 +796,14 @@ fn portable_cmake_defines(
             // CUTLASS 4.4 fails to parse with MSVC's strict mode in C++20.
             // https://github.com/NVIDIA/cutlass/issues/3065
             define("CMAKE_CUDA_FLAGS", "-Xcompiler=/permissive,/EHsc");
+        } else if target_os == "linux" {
+            define("CMAKE_CUDA_RUNTIME_LIBRARY", "Shared");
+            define("CMAKE_CUDA_ARCHITECTURES", &cuda_archs);
+            define("CMAKE_INSTALL_LIBDIR", "lib");
+            // If system `libnccl-dev` is installed, `find_package(NCCL)`
+            // auto-compiles `nccl.cpp` into static `libmlx.a`, causing
+            // unresolved `nccl*` symbols when `build.rs` does not link `nccl`.
+            define("CMAKE_DISABLE_FIND_PACKAGE_NCCL", "ON");
         }
     }
     defines
@@ -903,6 +911,12 @@ fn marker_content(release_tag: &str, sha256: &str) -> String {
     format!("{release_tag}\nsha256:{sha256}\n")
 }
 
+const LINUX_CUDA_INCLUDE_DIRS: &[&str] = &["cccl", "cute", "cutlass"];
+
+fn is_linux_triple(triple: &str) -> bool {
+    triple.contains("-linux-")
+}
+
 fn prebuilt_mlx_library(triple: &str) -> &'static str {
     if triple.ends_with("-pc-windows-msvc") {
         "mlx.lib"
@@ -915,13 +929,20 @@ fn prebuilt_mlx_library(triple: &str) -> &'static str {
 /// treated as absent rather than discovered at link time.
 fn prebuilt_layout_complete(dir: &Path, triple: &str) -> bool {
     let windows = triple.ends_with("-pc-windows-msvc");
+    let linux = is_linux_triple(triple);
+    let include_dir = dir.join("include");
     let target_files = if windows {
-        dir.join("lib").join("openblas.lib").is_file() && dir.join("include").join("fmt").is_dir()
+        dir.join("lib").join("openblas.lib").is_file() && include_dir.join("fmt").is_dir()
+    } else if linux {
+        include_dir.join("fmt").is_dir()
+            && LINUX_CUDA_INCLUDE_DIRS
+                .iter()
+                .all(|subdir| include_dir.join(subdir).is_dir())
     } else {
         dir.join("lib").join("mlx.metallib").is_file()
     };
     dir.join("lib").join(prebuilt_mlx_library(triple)).is_file()
-        && dir.join("include").join("mlx").is_dir()
+        && include_dir.join("mlx").is_dir()
         && target_files
 }
 
@@ -1021,6 +1042,8 @@ fn fetch_prebuilt(
         let _ = std::fs::remove_dir_all(&tmp);
         let expected = if triple.ends_with("-pc-windows-msvc") {
             "lib/mlx.lib, lib/openblas.lib, include/mlx, include/fmt"
+        } else if is_linux_triple(triple) {
+            "lib/libmlx.a, include/mlx, include/fmt, include/cccl, include/cute, include/cutlass"
         } else {
             "lib/libmlx.a, lib/mlx.metallib, include/mlx"
         };
@@ -1123,6 +1146,22 @@ fn resolve_mlx_source(
                 dir.display()
             );
         }
+        if is_linux_triple(triple) {
+            let include_dir = dir.join("include");
+            let missing: Vec<&str> = ["fmt", "cccl", "cute", "cutlass"]
+                .into_iter()
+                .filter(|subdir| !include_dir.join(subdir).is_dir())
+                .collect();
+            if !missing.is_empty() {
+                panic!(
+                    "mlx-sys: MLX_PREBUILT_DIR={} is missing include/{{{}}}; expected a complete \
+                     Linux CUDA prebuilt MLX artifact (lib/libmlx.a, include/mlx, include/fmt, \
+                     include/cccl, include/cute, include/cutlass).",
+                    dir.display(),
+                    missing.join(", "),
+                );
+            }
+        }
         if build_metal && let Some(arch) = triple.strip_suffix("-apple-darwin") {
             // Direct fork commits extend CommandEncoder's layout and API. An
             // explicit directory must not bypass their ABI identity.
@@ -1178,6 +1217,7 @@ fn resolve_mlx_source(
             ("macos", "aarch64")
         }
         "aarch64-pc-windows-msvc" if !build_metal => ("windows", "aarch64"),
+        "aarch64-unknown-linux-gnu" if !build_metal => ("linux", "aarch64"),
         _ => {
             return source(&format!(
                 "no prebuilt MLX for {triple} (Metal {})",
@@ -1323,8 +1363,11 @@ fn export_prebuilt(
     let lib_dir = export_dir.join("lib");
     std::fs::create_dir_all(&lib_dir)?;
     let windows = triple.ends_with("-pc-windows-msvc");
+    let linux = is_linux_triple(triple);
     let libraries: Vec<(&str, bool)> = if windows {
         vec![("mlx.lib", true), ("openblas.lib", true)]
+    } else if linux {
+        vec![("libmlx.a", true)]
     } else {
         vec![
             ("libmlx.a", true),
@@ -1344,13 +1387,25 @@ fn export_prebuilt(
         }
     }
     copy_dir_recursive(&dst.join("include"), &export_dir.join("include"))?;
-    if windows {
+    if windows || linux {
         // CUDA's public headers include fmt, which CMake keeps in its build
         // tree rather than installing. The consumer still builds the bridge.
         copy_dir_recursive(
             &dst.join("build/_deps/fmt-src/include/fmt"),
             &export_dir.join("include/fmt"),
         )?;
+    }
+    if linux {
+        let exported_include = export_dir.join("include");
+        for subdir in LINUX_CUDA_INCLUDE_DIRS {
+            let path = exported_include.join(subdir);
+            if !path.is_dir() {
+                return Err(io::Error::other(format!(
+                    "export: {} is missing from the exported Linux CUDA include tree",
+                    path.display()
+                )));
+            }
+        }
     }
     let built_at = if cfg!(target_os = "windows") {
         command_stdout(Command::new("powershell").args([
@@ -1410,6 +1465,184 @@ fn copy_to_sinks(file: &Path, sinks: &[PathBuf]) {
     }
 }
 
+fn remove_existing_path(path: &Path) -> io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                #[cfg(windows)]
+                {
+                    std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+                }
+                #[cfg(not(windows))]
+                {
+                    std::fs::remove_file(path)
+                }
+            } else if meta.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            }
+        }
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn copy_linux_cuda_include_subdirs(src_include: &Path, dst: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for subdir in LINUX_CUDA_INCLUDE_DIRS {
+        copy_dir_recursive(&src_include.join(subdir), &dst.join(subdir))?;
+    }
+    Ok(())
+}
+
+fn stage_cuda_include_dir(src_include: &Path, dst: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = std::fs::symlink_metadata(dst) {
+            if meta.file_type().is_symlink() {
+                if std::fs::read_link(dst).ok().as_deref() == Some(src_include) {
+                    return Ok(());
+                }
+            } else if std::fs::canonicalize(dst).ok().as_deref() == Some(src_include) {
+                return Ok(());
+            }
+        }
+        remove_existing_path(dst)?;
+        if let Some(parent) = dst.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if std::os::unix::fs::symlink(src_include, dst).is_ok() {
+            return Ok(());
+        }
+        copy_linux_cuda_include_subdirs(src_include, dst)
+    }
+    #[cfg(not(unix))]
+    {
+        if std::fs::canonicalize(dst).ok().as_deref() == Some(src_include) {
+            return Ok(());
+        }
+        remove_existing_path(dst)?;
+        copy_linux_cuda_include_subdirs(src_include, dst)
+    }
+}
+
+fn stage_cuda_include_subdir(src_subdir: &Path, dst_subdir: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        if let Ok(meta) = std::fs::symlink_metadata(dst_subdir) {
+            if meta.file_type().is_symlink() {
+                if std::fs::read_link(dst_subdir).ok().as_deref() == Some(src_subdir) {
+                    return Ok(());
+                }
+            } else if let (Ok(dst_canon), Ok(src_canon)) = (
+                std::fs::canonicalize(dst_subdir),
+                std::fs::canonicalize(src_subdir),
+            ) && dst_canon == src_canon
+            {
+                return Ok(());
+            }
+        }
+        remove_existing_path(dst_subdir)?;
+        if std::os::unix::fs::symlink(src_subdir, dst_subdir).is_ok() {
+            return Ok(());
+        }
+        copy_dir_recursive(src_subdir, dst_subdir)
+    }
+    #[cfg(not(unix))]
+    {
+        if let (Ok(dst_canon), Ok(src_canon)) = (
+            std::fs::canonicalize(dst_subdir),
+            std::fs::canonicalize(src_subdir),
+        ) && dst_canon == src_canon
+        {
+            return Ok(());
+        }
+        remove_existing_path(dst_subdir)?;
+        copy_dir_recursive(src_subdir, dst_subdir)
+    }
+}
+
+fn is_legacy_mlx_include_symlink(profile_include: &Path) -> bool {
+    let Ok(target) = std::fs::read_link(profile_include) else {
+        return false;
+    };
+    let resolved = if target.is_absolute() {
+        target.clone()
+    } else {
+        profile_include
+            .parent()
+            .map_or_else(|| target.clone(), |parent| parent.join(&target))
+    };
+    if resolved.exists() {
+        LINUX_CUDA_INCLUDE_DIRS
+            .iter()
+            .all(|subdir| resolved.join(subdir).is_dir())
+    } else {
+        let s = target.to_string_lossy();
+        s.contains("mlx-cmake") || s.contains("mlx-prebuilt")
+    }
+}
+
+fn stage_profile_cuda_include_entries(
+    src_include: &Path,
+    profile_include: &Path,
+) -> io::Result<()> {
+    if let Ok(meta) = std::fs::symlink_metadata(profile_include)
+        && meta.file_type().is_symlink()
+    {
+        if is_legacy_mlx_include_symlink(profile_include) {
+            remove_existing_path(profile_include)?;
+        } else {
+            return Err(io::Error::other(format!(
+                "preserving existing non-MLX symlink at {}",
+                profile_include.display()
+            )));
+        }
+    }
+    std::fs::create_dir_all(profile_include)?;
+    for subdir in LINUX_CUDA_INCLUDE_DIRS {
+        stage_cuda_include_subdir(&src_include.join(subdir), &profile_include.join(subdir))?;
+    }
+    Ok(())
+}
+
+/// Stage Linux CUDA NVRTC header trees (`cccl`, `cute`, `cutlass`) from
+/// `mlx_root/include` into:
+/// - `out_dir/cuda-include` so `packages/core/build.ts` has one authoritative
+///   path for both source builds and prebuilt cache builds;
+/// - best-effort `target/<profile>/include/{cccl,cute,cutlass}` (preserving
+///   any unrelated sibling entries in `target/<profile>/include`) so
+///   `cargo test` binaries in `target/<profile>/deps/` find
+///   `include/{cccl,cute,cutlass}` via `parent_path()/include` and binaries in
+///   `target/<profile>/` find it via `current_binary_dir()/include`.
+fn stage_linux_cuda_includes(mlx_root: &Path, out_dir: &Path) -> io::Result<()> {
+    let src_include = mlx_root.join("include");
+    for subdir in LINUX_CUDA_INCLUDE_DIRS {
+        let path = src_include.join(subdir);
+        if !path.is_dir() {
+            return Err(io::Error::other(format!(
+                "mlx-sys: Linux CUDA NVRTC headers missing: {} does not exist",
+                path.display()
+            )));
+        }
+    }
+    let src_include = std::fs::canonicalize(&src_include).unwrap_or(src_include);
+    stage_cuda_include_dir(&src_include, &out_dir.join("cuda-include"))?;
+    if let Some(profile_dir) =
+        find_ancestor_with_name(out_dir, "build").and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        let profile_include = profile_dir.join("include");
+        if let Err(err) = stage_profile_cuda_include_entries(&src_include, &profile_include) {
+            println!(
+                "cargo:warning=mlx-sys: failed to stage Linux CUDA test headers in {}: {err}",
+                profile_include.display()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn main() -> io::Result<()> {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=mlx");
@@ -1448,6 +1681,11 @@ fn main() -> io::Result<()> {
     let build_cuda = matches!(target_os.as_str(), "linux" | "windows");
     if build_cuda {
         println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
+    }
+    if target_os == "linux" && build_cuda {
+        for key in ["CUDA_PATH", "CUDA_HOME", "CUDNN_PATH"] {
+            println!("cargo:rerun-if-env-changed={key}");
+        }
     }
 
     let metal_disabled = env::var_os("MLX_DISABLE_METAL").is_some();
@@ -1628,6 +1866,9 @@ fn main() -> io::Result<()> {
     for lib_dir in &lib_dirs {
         add_link_search(lib_dir);
     }
+    if target_os == "linux" && build_cuda {
+        stage_linux_cuda_includes(&mlx_root, &out_dir_path)?;
+    }
 
     // Co-locate `paged_attn.metallib` with `mlx.metallib`. Both must
     // ship next to the loaded binary at runtime (see
@@ -1702,17 +1943,34 @@ fn main() -> io::Result<()> {
             // for the final link of the .node addon. Search both the CUDA lib dir
             // and the stubs dir (libcuda.so lives only in stubs at build time;
             // the real driver is found at runtime via LD_LIBRARY_PATH).
-            let cuda_path = env::var("CUDA_PATH")
-                .or_else(|_| env::var("CUDA_HOME"))
-                .unwrap_or_else(|_| "/usr/local/cuda".into());
+            let cuda_path = env_non_empty("CUDA_PATH")
+                .or_else(|| env_non_empty("CUDA_HOME"))
+                .unwrap_or_else(|| "/usr/local/cuda".into());
             println!("cargo:rustc-link-search=native={cuda_path}/lib64");
             println!("cargo:rustc-link-search=native={cuda_path}/lib64/stubs");
+            if let Some(cudnn_path) = env_non_empty("CUDNN_PATH") {
+                let cudnn = PathBuf::from(cudnn_path);
+                for subdir in ["lib64", "lib"] {
+                    let dir = cudnn.join(subdir);
+                    if dir.is_dir() {
+                        println!("cargo:rustc-link-search=native={}", dir.display());
+                    }
+                }
+            }
             for l in [
-                "cudart", "cublas", "cublasLt", "cufft", "cusolver", "nvrtc", "cuda",
+                "cudart",
+                "cublas",
+                "cublasLt",
+                "cufft",
+                "cusolver",
+                "nvrtc",
+                "cuda",
+                "cudnn",
+                "cudnn_graph",
+                "cudnn_engines_runtime_compiled",
             ] {
                 println!("cargo:rustc-link-lib=dylib={l}");
             }
-            println!("cargo:rustc-link-lib=dylib=cudnn");
         }
         // MLX keeps its CPU backend on even for a CUDA build (some ops have no
         // CUDA path), so its CBLAS/LAPACK symbols (e.g. `cblas_dgemm`) are
@@ -1787,6 +2045,17 @@ fn main() -> io::Result<()> {
             .define("MLX_NODE_CUDA_ENABLED", None)
             .include(cuda.join("include"))
             .include(cuda.join("include/cccl"));
+        if target_os == "linux" {
+            // Bake `<OUT_DIR>/cuda-include` into source-built `libmlx_ffi.a`
+            // (never prebuilt `libmlx.a`, leaving `build_key` unchanged) so
+            // `packages/core/linux-cuda-include.ts` can bind NVRTC header
+            // packaging authoritatively to this exact `mlx-sys` build, immune
+            // to `CARGO_BUILD_BUILD_DIR` and stale `target/` dirs.
+            bridge.define(
+                "MLX_NODE_CUDA_INCLUDE_DIR",
+                format!("\"{}\"", out_dir_path.join("cuda-include").display()).as_str(),
+            );
+        }
         if !prebuilt {
             bridge.include(mlx_root.join("build/_deps/fmt-src/include"));
         }
@@ -2054,6 +2323,20 @@ fn build_mlx_from_source(
         // An empty -D value names the working directory during project().
         // Remove a stale macOS-only include from reused Linux caches instead.
         cfg.configure_arg("-UCMAKE_PROJECT_INCLUDE");
+        if let Some(cuda) = env_non_empty("CUDA_PATH").or_else(|| env_non_empty("CUDA_HOME")) {
+            cfg.define("CUDAToolkit_ROOT", cuda);
+        }
+        if let Some(cudnn) = env_non_empty("CUDNN_PATH") {
+            let cudnn = PathBuf::from(cudnn);
+            let lib64 = cudnn.join("lib64");
+            let cudnn_lib = if lib64.is_dir() {
+                lib64
+            } else {
+                cudnn.join("lib")
+            };
+            cfg.define("CUDNN_INCLUDE_PATH", cudnn.join("include"))
+                .define("CUDNN_LIBRARY_PATH", cudnn_lib);
+        }
     }
     let dst = cfg.build();
     (dst, defines, sentinel)

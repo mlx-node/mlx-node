@@ -616,3 +616,363 @@ jobs:
             '```'
           ) | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
           Write-Host "::notice title=mlx-prebuilt.json::$env:TARGET sha256=$sha256 release_tag=$env:TAG mlx_commit=$env:MLX_COMMIT"
+
+  prebuilt-linux:
+    name: mlx aarch64-unknown-linux-gnu
+    if: github.repository == 'mlx-node/mlx-node'
+    runs-on: ubuntu-22.04-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ASSET: mlx-aarch64-unknown-linux-gnu.tar.gz
+      TARGET: aarch64-unknown-linux-gnu
+      CMAKE_GENERATOR: Ninja
+      # Cap parallel nvcc CUTLASS compilations to prevent OOM on the 4-vCPU / 16 GB runner.
+      # `cmake` crate 0.1.58 passes `--parallel $NUM_JOBS` derived from `CARGO_BUILD_JOBS`,
+      # overriding `CMAKE_BUILD_PARALLEL_LEVEL`, so set both.
+      CARGO_BUILD_JOBS: '3'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      CUDA_PATH: /usr/local/cuda-13.0
+      CUDA_HOME: /usr/local/cuda-13.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Setup Rust
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: aarch64-unknown-linux-gnu
+          cache: false
+          rustflags: ''
+
+      # Install only the CUDA 13.0 SBSA compiler/libraries, cuDNN 9, and
+      # BLAS/LAPACK needed to build static libmlx.a for sm_121a. Deliberately
+      # omit libnccl-dev so the prebuilt carries no NCCL runtime dependency.
+      - name: Install Linux CUDA 13.0 SBSA toolchain & build dependencies
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          curl -fsSL --retry 3 -o /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          rm -f /tmp/cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ \
+            ninja-build \
+            libblas-dev \
+            liblapack-dev \
+            liblapacke-dev \
+            libcudnn9-dev-cuda-13 \
+            cuda-compiler-13-0 \
+            cuda-libraries-dev-13-0
+          cmake_ok=false
+          if command -v cmake >/dev/null 2>&1; then
+            cmake_ver="$(cmake --version | awk 'NR==1 {print $3}')"
+            if [ -n "$cmake_ver" ] && awk -v v="$cmake_ver" 'BEGIN { split(v, a, /[^0-9]+/); exit !((a[1] + 0) > 3 || ((a[1] + 0) == 3 && (a[2] + 0) >= 25)) }'; then
+              cmake_ok=true
+            fi
+          fi
+          if [ "$cmake_ok" != true ]; then
+            cmake_version="3.31.6"
+            cmake_dir="/usr/local/cmake-${cmake_version}"
+            curl -fsSL --retry 3 -o /tmp/cmake.tar.gz \
+              "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-aarch64.tar.gz"
+            sudo rm -rf "$cmake_dir"
+            sudo mkdir -p "$cmake_dir"
+            sudo tar -xzf /tmp/cmake.tar.gz --strip-components=1 -C "$cmake_dir"
+            rm -f /tmp/cmake.tar.gz
+            export PATH="$cmake_dir/bin:$PATH"
+            echo "$cmake_dir/bin" >> "$GITHUB_PATH"
+          fi
+          export PATH="/usr/local/cuda-13.0/bin:$PATH"
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          nvcc --version
+          cmake --version
+
+      # MLX's CMake fetches CCCL / NVTX / cuDNN-frontend / CUTLASS from
+      # GitHub. Authenticate those downloads to avoid anonymous rate limits.
+      - name: Configure GitHub token for CMake downloads
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Probe the release tag
+        id: meta
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+          MLX_PREBUILT_PROBE: ${{ github.workspace }}/probe.json
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p mlx-sys --target aarch64-unknown-linux-gnu
+          test -f probe.json
+          for key in mlx_commit release_tag build_key; do
+            value="$(jq -r ".$key // empty" probe.json)"
+            test -n "$value"
+            echo "$key=$value" >> "$GITHUB_OUTPUT"
+            echo "$key: $value"
+          done
+
+      - name: Check for an existing release
+        id: existing
+        env:
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          exists=false
+          is_draft=false
+          complete=false
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets > /tmp/release.json 2>/dev/null; then
+            exists=true
+            is_draft="$(jq -r '.isDraft' /tmp/release.json)"
+            jq -r '.assets[]? | select((.state // "uploaded") == "uploaded") | .name' /tmp/release.json > /tmp/assets.txt
+            if [ "$is_draft" = "false" ] \
+              && grep -qxF "$ASSET" /tmp/assets.txt \
+              && grep -qxF "$ASSET.sha256" /tmp/assets.txt; then
+              complete=true
+            fi
+          fi
+          echo "release_exists=$exists" >> "$GITHUB_OUTPUT"
+          echo "release_is_draft=$is_draft" >> "$GITHUB_OUTPUT"
+          if [ "$exists" = true ] && [ "$complete" = true ] && [ "$FORCE" != true ]; then
+            echo "::notice::Release $TAG already carries $ASSET and its .sha256; nothing to publish (set force_reupload to overwrite)."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            if [ "$exists" = true ] && [ "$is_draft" = "true" ]; then
+              echo "::notice::Release $TAG exists as a draft; continuing to ensure assets are uploaded and publish it."
+            fi
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build MLX from source
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          MLX_PREBUILT: '0'
+          MLX_PREBUILT_EXPORT: ${{ github.workspace }}/prebuilt-out
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p mlx-sys --target aarch64-unknown-linux-gnu
+          built="$(jq -r '.release_tag // empty' prebuilt-out/manifest.json)"
+          if [ "$built" != "$TAG" ]; then
+            echo "::error::manifest names $built but the probe said $TAG"
+            exit 1
+          fi
+
+      # CUDA uses NVRTC and the exported CCCL/CuTe/CUTLASS headers, so unlike
+      # the macOS archive there is deliberately no Metal metallib in this asset.
+      - name: Package
+        if: steps.existing.outputs.skip != 'true'
+        id: pkg
+        run: |
+          set -euo pipefail
+          test -f prebuilt-out/lib/libmlx.a
+          for dir in mlx fmt cccl cute cutlass; do
+            test -d "prebuilt-out/include/$dir"
+          done
+          # Capture nm output to a file before grepping so `set -o pipefail`
+          # cannot mask either a failed `nm` or a SIGPIPE after `grep -q` exits.
+          nm -u prebuilt-out/lib/libmlx.a > /tmp/libmlx-undef.txt
+          if grep -Eq '\bnccl' /tmp/libmlx-undef.txt; then
+            echo "::error::prebuilt-out/lib/libmlx.a has unexpected unresolved nccl references"
+            grep -E '\bnccl' /tmp/libmlx-undef.txt | sed -n '1,20p' || true
+            exit 1
+          fi
+          rm -f /tmp/libmlx-undef.txt
+          ls -la prebuilt-out prebuilt-out/lib
+          tar -C prebuilt-out -czf "$ASSET" .
+          sha="$(sha256sum "$ASSET" | awk '{print $1}')"
+          # `sha256sum -c` compatible format.
+          echo "$sha  $ASSET" > "$ASSET.sha256"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          du -h "$ASSET"
+
+      # Keep the same immutable-release and concurrent-publisher rules as the
+      # macOS job. Prereleases never become the repository's latest release.
+      - name: Create or update release
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
+          BUILD_KEY: ${{ steps.meta.outputs.build_key }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+          RELEASE_EXISTS: ${{ steps.existing.outputs.release_exists }}
+          RELEASE_IS_DRAFT: ${{ steps.existing.outputs.release_is_draft }}
+          FORCE: ${{ inputs.force_reupload == true && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          cat > /tmp/notes.md <<EOF
+          Prebuilt MLX C++ library for \`crates/mlx-sys\` — **not an application release**.
+
+          - mlx fork commit: https://github.com/mlx-node/mlx/commit/$MLX_COMMIT
+          - cmake build key: \`$BUILD_KEY\` (portable defines + \`crates/mlx-sys/cmake/\` + build.rs key revision)
+          - built from mlx-node commit: $GITHUB_SHA
+          - target: \`$TARGET\` (Linux CUDA 13.0, \`sm_121a\`)
+          - contents: \`lib/libmlx.a\`, \`include/**\`, \`manifest.json\`
+
+          \`crates/mlx-sys/build.rs\` downloads the asset named in
+          \`crates/mlx-sys/mlx-prebuilt.json\`, checks its sha256, and links
+          against it instead of running the cmake build. It refuses the prebuilt
+          when the checked-out submodule commit or the cmake build inputs differ
+          from what the pinned tag encodes, and falls back to a source build when
+          the digest is empty or the download fails. \`MLX_PREBUILT=0\` always
+          forces a source build.
+          EOF
+          has_uploaded_asset() {
+            local release_json
+            release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null)" || return 1
+            printf '%s\n' "$release_json" \
+              | jq -e --arg name "$1" 'any(.assets[]?; .name == $name and ((.state // "uploaded") == "uploaded"))' >/dev/null
+          }
+          has_incomplete_asset() {
+            local release_json
+            release_json="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets 2>/dev/null)" || return 1
+            printf '%s\n' "$release_json" \
+              | jq -e --arg name "$1" 'any(.assets[]?; .name == $name and ((.state // "uploaded") != "uploaded"))' >/dev/null
+          }
+          upload_asset_only() {
+            if has_uploaded_asset "$ASSET"; then
+              echo "::notice::Release $TAG already carries uploaded $ASSET; keeping its bytes."
+            elif has_incomplete_asset "$ASSET"; then
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ASSET"
+            elif ! gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$ASSET"; then
+              if has_uploaded_asset "$ASSET"; then
+                echo "::notice::Release $TAG already carries $ASSET (concurrent run won upload race); keeping its bytes."
+                return 0
+              fi
+              return 1
+            fi
+          }
+          upload_missing_assets() {
+            upload_asset_only
+            if has_uploaded_asset "$ASSET.sha256"; then
+              :
+            elif has_incomplete_asset "$ASSET.sha256"; then
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ASSET.sha256"
+            else
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "$ASSET.sha256"
+            fi
+          }
+          release_exists="$RELEASE_EXISTS"
+          release_is_draft="$RELEASE_IS_DRAFT"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft > /tmp/release-live.json 2>/dev/null; then
+            release_exists=true
+            release_is_draft="$(jq -r '.isDraft' /tmp/release-live.json)"
+          fi
+          if [ "$FORCE" = true ]; then
+            if [ "$release_exists" != true ]; then
+              gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+                --title "MLX prebuilt ${MLX_COMMIT:0:12}" --notes-file /tmp/notes.md --target "$GITHUB_SHA"
+            fi
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "$ASSET" "$ASSET.sha256"
+          elif [ "$release_exists" = true ] && [ "$release_is_draft" = true ]; then
+            echo "::notice::Resuming draft release $TAG"
+            upload_asset_only
+          elif [ "$release_exists" != true ] \
+            && gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --prerelease \
+                 --title "MLX prebuilt ${MLX_COMMIT:0:12}" --notes-file /tmp/notes.md --target "$GITHUB_SHA" \
+                 "$ASSET" "$ASSET.sha256"; then
+            :
+          elif has_uploaded_asset "$ASSET"; then
+            echo "::notice::Release $TAG already carries $ASSET (concurrent run or earlier partial upload); keeping its bytes."
+          else
+            upload_missing_assets
+          fi
+          is_draft="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq '.isDraft')"
+          if [ "$is_draft" = "true" ]; then
+            # Before promoting a draft, verify its uploaded archive and repair
+            # its `.sha256` sidecar from that exact archive so a partial/retried
+            # draft can never become publicly visible with a missing or
+            # mismatched checksum.
+            rm -rf /tmp/draft-verify && mkdir -p /tmp/draft-verify
+            gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir /tmp/draft-verify
+            draft_sha="$(sha256sum "/tmp/draft-verify/$ASSET" | awk '{print $1}')"
+            test -n "$draft_sha"
+            echo "$draft_sha  $ASSET" > "/tmp/draft-verify/$ASSET.sha256"
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "/tmp/draft-verify/$ASSET.sha256"
+            if ! has_uploaded_asset "$ASSET" || ! has_uploaded_asset "$ASSET.sha256"; then
+              echo "::error::Draft release $TAG is missing an uploaded archive or checksum after repair"
+              exit 1
+            fi
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease
+            echo "::notice::Verified checksum and published draft release $TAG"
+          elif [ "$is_draft" != "false" ]; then
+            echo "::error::Unexpected isDraft state for release $TAG: $is_draft"
+            exit 1
+          fi
+          echo "::notice::Published $ASSET to release $TAG"
+
+      # Hash the published archive, not the local one: a concurrent publisher
+      # may have won, and tar metadata / manifest built_at can differ.
+      - name: Emit pin snippet
+        if: steps.existing.outputs.skip != 'true'
+        env:
+          MLX_COMMIT: ${{ steps.meta.outputs.mlx_commit }}
+          TAG: ${{ steps.meta.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/published /tmp/published-upload
+          mkdir -p /tmp/published /tmp/published-upload
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json isDraft,assets > /tmp/published/release.json
+          is_draft="$(jq -r '.isDraft' /tmp/published/release.json)"
+          if [ "$is_draft" != "false" ]; then
+            echo "::error::Release $TAG is still a draft (isDraft=$is_draft); consumers cannot download draft assets"
+            exit 1
+          fi
+          jq -r '.assets[]? | select((.state // "uploaded") == "uploaded") | .name' /tmp/published/release.json > /tmp/published/assets.txt
+          jq -r '.assets[]? | select((.state // "uploaded") != "uploaded") | .name' /tmp/published/release.json > /tmp/published/incomplete-assets.txt
+          if ! grep -qxF "$ASSET" /tmp/published/assets.txt; then
+            echo "::error::Release $TAG does not have an uploaded $ASSET asset"
+            exit 1
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET" --dir /tmp/published
+          SHA256="$(sha256sum "/tmp/published/$ASSET" | awk '{print $1}')"
+          test -n "$SHA256"
+          if ! grep -qxF "$ASSET.sha256" /tmp/published/assets.txt; then
+            echo "$SHA256  $ASSET" > "/tmp/published-upload/$ASSET.sha256"
+            if grep -qxF "$ASSET.sha256" /tmp/published/incomplete-assets.txt; then
+              gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "/tmp/published-upload/$ASSET.sha256"
+            elif ! gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" "/tmp/published-upload/$ASSET.sha256"; then
+              if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets \
+                | jq -e --arg name "$ASSET.sha256" 'any(.assets[]?; .name == $name and ((.state // "uploaded") == "uploaded"))' >/dev/null; then
+                exit 1
+              fi
+              echo "::notice::Release $TAG already carries $ASSET.sha256 (concurrent run won upload race); verifying it against the published tarball."
+            else
+              echo "::notice::Release $TAG lacked $ASSET.sha256; uploaded it from the published tarball."
+            fi
+          fi
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$ASSET.sha256" --dir /tmp/published
+          sidecar="$(awk '{print $1}' "/tmp/published/$ASSET.sha256")"
+          if [ "$sidecar" != "$SHA256" ]; then
+            echo "::error::$ASSET.sha256 on $TAG ($sidecar) does not match the published tarball ($SHA256)"
+            exit 1
+          fi
+          snippet="$(cat <<EOF
+          {
+            "repo": "$GITHUB_REPOSITORY",
+            "mlx_commit": "$MLX_COMMIT",
+            "release_tag": "$TAG",
+            "assets": {
+              "$TARGET": {
+                "file": "$ASSET",
+                "sha256": "$SHA256",
+                "release_tag": "$TAG"
+              }
+            }
+          }
+          EOF
+          )"
+          {
+            echo "## MLX prebuilt \`$TAG\`"
+            echo
+            echo "Merge this target entry into \`crates/mlx-sys/mlx-prebuilt.json\` \`assets\`. Keep the existing root \`release_tag\`; this entry carries its own:"
+            echo
+            echo '```json'
+            echo "$snippet"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "::notice title=mlx-prebuilt.json::$TARGET sha256=$SHA256 release_tag=$TAG mlx_commit=$MLX_COMMIT"

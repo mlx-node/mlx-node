@@ -4,10 +4,8 @@ import { parseTriple } from '@napi-rs/cli';
 //
 // `napi.targets` in packages/core/package.json means what napi documents it to
 // mean — "all targets the crate will be compiled for". That list includes
-// `aarch64-unknown-linux-gnu`, the experimental CUDA / DGX Spark build, which
-// is compiled by hand on the Spark and never published. CI builds only
-// darwin-arm64 (the build job is `runs-on: macos-26` and uploads
-// `packages/core/*.node`).
+// desktop-only targets such as `aarch64-pc-windows-msvc`, which are never
+// published to npm. CI publishes `darwin-arm64` and `linux-arm64-gnu`.
 //
 // @napi-rs/cli 3.8 made `napi artifacts` throw when a configured target has no
 // `.node` in the artifacts dir, so the publish step can no longer be handed the

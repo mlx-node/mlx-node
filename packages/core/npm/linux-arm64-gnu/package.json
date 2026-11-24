@@ -1,0 +1,25 @@
+{
+  "name": "@mlx-node/core-linux-arm64-gnu",
+  "version": "0.0.21",
+  "description": "Internal native bindings - import from @mlx-node/lm or @mlx-node/trl instead",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mlx-node/mlx-node.git",
+    "directory": "packages/core/npm/linux-arm64-gnu"
+  },
+  "files": [
+    "mlx-core.linux-arm64-gnu.node",
+    "include"
+  ],
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "arm64"
+  ],
+  "libc": [
+    "glibc"
+  ],
+  "main": "mlx-core.linux-arm64-gnu.node"
+}
