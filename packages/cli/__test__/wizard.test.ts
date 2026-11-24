@@ -103,6 +103,7 @@ describe('runFirstRunWizard', () => {
       },
       modelsDir: MODELS_DIR,
       totalMemBytes: 128 * GIB,
+      platform: 'darwin',
     });
 
     expect(slug).toBe('hy4-flash-gguf');
@@ -138,6 +139,7 @@ describe('runFirstRunWizard', () => {
       download: vi.fn(),
       modelsDir: MODELS_DIR,
       totalMemBytes: 128 * GIB,
+      platform: 'darwin',
     }).catch((e: unknown) => e as Error);
 
     expect(err).toBeInstanceOf(Error);
@@ -155,5 +157,47 @@ describe('runFirstRunWizard', () => {
     expect(flashNextLine).not.toContain(' && ');
     expect(hy4Line).toBeDefined();
     expect(hy4Line).not.toContain(' && ');
+  });
+
+  it('omits darwin-only Hy4-flash from interactive choices and non-TTY hints on win32 and linux', async () => {
+    for (const platform of ['win32', 'linux'] as const) {
+      const seenChoices: string[] = [];
+      const select = vi
+        .fn<
+          ({
+            message,
+            choices,
+          }: {
+            message: string;
+            choices: Array<{ name: string; value: string }>;
+          }) => Promise<string>
+        >()
+        .mockImplementationOnce(async ({ choices }) => {
+          seenChoices.push(...choices.map((c) => c.value));
+          return 'Qwen3.8-Flash-Next';
+        });
+
+      const slug = await runFirstRunWizard({
+        io: { select, isTTY: true, log: () => {} },
+        download: async () => {},
+        modelsDir: MODELS_DIR,
+        totalMemBytes: 128 * GIB,
+        platform,
+      });
+      expect(slug).toBe('qwen3.8-flash-next-gguf');
+      expect(seenChoices, platform).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next']);
+
+      const err = await runFirstRunWizard({
+        io: { select: vi.fn(), isTTY: false, log: () => {} },
+        download: vi.fn(),
+        modelsDir: MODELS_DIR,
+        totalMemBytes: 128 * GIB,
+        platform,
+      }).catch((e: unknown) => e as Error);
+      expect(err).toBeInstanceOf(Error);
+      if (!(err instanceof Error)) return;
+      expect(err.message).not.toContain('AngelSlim/Hy4-flash-GGUF');
+      expect(err.message).toContain('unsloth/Qwen3.8-Flash-Next-GGUF');
+    }
   });
 });

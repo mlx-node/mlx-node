@@ -62,12 +62,28 @@ static const char* volatile kMlxNodeCudaIncludeDir =
     "MLX_NODE_CUDA_INCLUDE_DIR=" MLX_NODE_CUDA_INCLUDE_DIR;
 #endif
 
+#if defined(_WIN32) && defined(MLX_NODE_WINDOWS_BUILD_UNIT)
+#define MLX_NODE_STR_IMPL(x) #x
+#define MLX_NODE_STR(x) MLX_NODE_STR_IMPL(x)
+static const char kWindowsBuildUnitMarker[] =
+    "\0MLX_NODE_WINDOWS_BUILD_UNIT=" MLX_NODE_STR(MLX_NODE_WINDOWS_BUILD_UNIT);
+#undef MLX_NODE_STR
+#undef MLX_NODE_STR_IMPL
+#endif
+
 extern "C" {
 
 // Check if CUDA backend is compiled in AND at least one CUDA GPU is visible.
 bool mlx_cuda_is_available() {
 #ifdef MLX_NODE_CUDA_INCLUDE_DIR
   (void)kMlxNodeCudaIncludeDir;
+#endif
+#if defined(_WIN32) && defined(MLX_NODE_WINDOWS_BUILD_UNIT)
+  // Keep the NUL-framed build-unit marker live through MSVC /OPT:REF so
+  // packages/core/build.ts can bind the built .node addon to its exact mlx-sys
+  // build unit even when the linker places nonzero bytes immediately before it.
+  const volatile char* marker = kWindowsBuildUnitMarker;
+  (void)marker[1];
 #endif
 #ifdef MLX_NODE_CUDA_ENABLED
   try {

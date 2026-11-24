@@ -62,19 +62,22 @@ env:
   MACOSX_DEPLOYMENT_TARGET: '26.2'
   MLX_METALLIB_STRICT: '1'
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  MLX_PREBUILT_CACHE_DIR: ${{ github.workspace }}/.mlx-prebuilt
 
 jobs:
   windows:
     name: Package Windows ARM64
-    # The runner must provide an ARM64 MSVC/Windows SDK plus CUDA 13.4 and
-    # cuDNN 9 through CUDA_PATH/CUDNN_PATH. No Apple signing secrets are used.
-    runs-on: [self-hosted, windows, arm64]
+    # Install CUDA 13.4 + cuDNN 9 on GitHub-hosted windows-11-arm (matching
+    # mlx-prebuilt.yml); no GPU is required. No Apple signing secrets are used.
+    runs-on: windows-11-arm
     outputs:
       windows_zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
     permissions:
       contents: read
       actions: read
     env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
@@ -88,9 +91,6 @@ jobs:
           node-version: '26'
           cache: 'yarn'
 
-      - name: Enable Corepack
-        run: corepack enable
-
       - name: Setup Rust
         uses: actions-rust-lang/setup-rust-toolchain@v2
         with:
@@ -99,17 +99,103 @@ jobs:
           cache: false
           rustflags: ''
 
-      - name: Setup the ARM64 MSVC environment
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          arch: arm64
+      - name: Setup native ARM64 MSVC environment
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vsWhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'
+          $vs = & $vsWhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.ARM64 -property installationPath
+          if (-not $vs) { throw 'Visual Studio with the ARM64 C++ tools was not found' }
+          $devCmd = Join-Path $vs 'Common7/Tools/VsDevCmd.bat'
+          $environment = cmd.exe /d /c "call `"$devCmd`" -arch=arm64 -host_arch=arm64 >nul && set"
+          if ($LASTEXITCODE -ne 0) { throw 'Could not enter the ARM64 MSVC environment' }
+          foreach ($line in $environment) {
+            if ($line -match '^([^=]+)=(.*)$') {
+              $name = $Matches[1]
+              $value = $Matches[2]
+              [Environment]::SetEnvironmentVariable($name, $value, 'Process')
+              "$name=$value" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            }
+          }
+
+      # CUDA 13.4 is the first toolkit with native Windows ARM64 packages.
+      # Install only the compiler, headers and libraries used by MLX; no GPU
+      # or display driver is needed because MLX_CUDA_ARCHITECTURES is pinned.
+      - name: Install CUDA Toolkit 13.4
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP 'cuda-13.4.2.exe'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cuda/13.4.2/local_installers/cuda_13.4.2_windows_arm64.exe' -OutFile $installer
+          $packages = @(
+            'crt_13.4',
+            'cudart_13.4',
+            'nvcc_13.4',
+            'nvvm_13.4',
+            'nvptxcompiler_13.4',
+            'nvrtc_13.4',
+            'nvrtc_dev_13.4',
+            'nvjitlink_13.4',
+            'nvtx_13.4',
+            'cublas_13.4',
+            'cublas_dev_13.4',
+            'cufft_13.4',
+            'cufft_dev_13.4',
+            'cusolver_13.4',
+            'cusolver_dev_13.4',
+            'cusparse_13.4',
+            'cusparse_dev_13.4'
+          )
+          $process = Start-Process -FilePath $installer -ArgumentList (@('-s') + $packages) -NoNewWindow -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "CUDA installer exited with $($process.ExitCode)" }
+          Remove-Item -LiteralPath $installer -Force
+          $cuda = 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.4'
+          if (-not (Test-Path -LiteralPath "$cuda\bin\nvcc.exe" -PathType Leaf)) { throw 'CUDA nvcc.exe was not installed' }
+          "CUDA_PATH=$cuda" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cuda\bin", "$cuda\bin\arm64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install cuDNN 9
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP 'cudnn.zip'
+          $extract = Join-Path $env:RUNNER_TEMP 'cudnn-extracted'
+          Invoke-WebRequest -Uri 'https://developer.download.nvidia.com/compute/cudnn/redist/cudnn/windows-arm64/cudnn-windows-arm64-9.27.0.42_cuda13.4-archive.zip' -OutFile $archive
+          Expand-Archive -LiteralPath $archive -DestinationPath $extract -Force
+          Remove-Item -LiteralPath $archive -Force
+          $cudnn = Get-ChildItem -LiteralPath $extract -Directory | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $cudnn -or -not (Test-Path -LiteralPath "$cudnn\lib\arm64\cudnn.lib" -PathType Leaf)) {
+            throw 'The cuDNN archive did not contain the ARM64 SDK'
+          }
+          "CUDNN_PATH=$cudnn" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$cudnn\bin\arm64" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # MLX's CMake fetches CCCL / NVTX / cuDNN-frontend / CUTLASS from
+      # GitHub. Authenticate those downloads to avoid anonymous rate limits.
+      - name: Configure GitHub token for CMake downloads
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $netrc = @(
+            'machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}',
+            'machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}'
+          )
+          foreach ($name in '.netrc', '_netrc') {
+            $netrc | Set-Content -LiteralPath (Join-Path $env:USERPROFILE $name) -Encoding ascii
+          }
 
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-          prefix-key: v1-rust
+          prefix-key: v2-rust
           shared-key: windows-arm64-release
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
 
       - name: Check the Windows build environment
         shell: pwsh
@@ -118,14 +204,50 @@ jobs:
           if ((node -p "process.arch") -ne 'arm64') { throw 'The release requires ARM64 Node.js.' }
           if ([string]::IsNullOrWhiteSpace($env:CUDA_PATH)) { throw 'CUDA_PATH must name the Windows ARM64 CUDA 13.4 toolkit.' }
           if ([string]::IsNullOrWhiteSpace($env:CUDNN_PATH)) { throw 'CUDNN_PATH must name the Windows ARM64 cuDNN 9 SDK.' }
-          if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\bin\arm64\cudart64_13.dll")) { throw 'CUDA_PATH has no ARM64 runtime DLLs.' }
-          if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\bin\arm64\cudnn64_9.dll")) { throw 'CUDNN_PATH has no ARM64 cuDNN 9 runtime.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\bin\arm64\cudart64_13.dll" -PathType Leaf)) { throw 'CUDA_PATH has no ARM64 runtime DLLs.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\include\cuda_runtime.h" -PathType Leaf)) { throw 'CUDA_PATH is missing include\cuda_runtime.h.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\bin\arm64\cudnn64_9.dll" -PathType Leaf)) { throw 'CUDNN_PATH has no ARM64 cuDNN 9 runtime.' }
+          if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\lib\arm64\cudnn.lib" -PathType Leaf)) { throw 'CUDNN_PATH is missing lib\arm64\cudnn.lib.' }
+          foreach ($tool in 'makepri.exe', 'makeappx.exe') {
+            $found = $null
+            if (-not [string]::IsNullOrWhiteSpace($env:WindowsSdkVerBinPath)) {
+              foreach ($candidate in @(
+                (Join-Path $env:WindowsSdkVerBinPath "arm64\$tool"),
+                (Join-Path $env:WindowsSdkVerBinPath "x64\$tool"),
+                (Join-Path $env:WindowsSdkVerBinPath $tool)
+              )) {
+                if (Test-Path -LiteralPath $candidate -PathType Leaf) { $found = $candidate; break }
+              }
+            }
+            if (-not $found) {
+              $kitsBin = 'C:\Program Files (x86)\Windows Kits\10\bin'
+              if (Test-Path -LiteralPath $kitsBin -PathType Container) {
+                foreach ($arch in 'arm64', 'x64') {
+                  $candidate = Get-ChildItem -LiteralPath $kitsBin -Directory |
+                    Where-Object { $_.Name -match '^\d+\.\d+\.\d+\.\d+$' } |
+                    Sort-Object { [version]$_.Name } -Descending |
+                    ForEach-Object { Join-Path $_.FullName "$arch\$tool" } |
+                    Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+                    Select-Object -First 1
+                  if ($candidate) { $found = $candidate; break }
+                }
+              }
+            }
+            if (-not $found) {
+              $cmd = Get-Command $tool -ErrorAction SilentlyContinue
+              if ($cmd) { $found = $cmd.Source }
+            }
+            if (-not $found) { throw "Windows SDK MSIX tool not found: $tool" }
+            Write-Host "Found ${tool}: $found"
+          }
+          Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize
 
       - name: Install dependencies
         run: yarn install --immutable
 
       - name: Resolve release version
         id: version
+        shell: pwsh
         env:
           TAG: ${{ env.RELEASE_TAG }}
         run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$env:TAG" --manifest packages/desktop/package.json
@@ -274,7 +396,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-          prefix-key: v1-rust
+          prefix-key: v2-rust
+          shared-key: desktop-release
+
+      - name: Cache prebuilt MLX
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
 
       - name: Configure GitHub token for CMake downloads
         run: |
@@ -315,6 +444,8 @@ jobs:
       # a stale metallib gets paired with a current .node, and that failure mode is
       # garbage inference output with no load-time error.
       - name: Build native + TypeScript
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: yarn build
 
       - name: Build dashboard UI
@@ -586,7 +717,7 @@ jobs:
       # would silently stop being bumped. The token is hoisted to job-level `env`
       # (which IS in scope) and tested there instead.
       - name: Bump the Homebrew cask
-        if: inputs.dry_run != true && !contains(steps.version.outputs.version, '-') && env.HOMEBREW_TAP_TOKEN != ''
+        if: inputs.dry_run != true && !contains(steps.version.outputs.version, '-') && !contains(steps.version.outputs.version, '+') && env.HOMEBREW_TAP_TOKEN != ''
         env:
           GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
           # From the tag, via the same validated value the DMG was named with —

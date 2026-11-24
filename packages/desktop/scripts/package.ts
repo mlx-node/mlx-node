@@ -14,15 +14,25 @@
  * instead of re-derived by every consumer.
  */
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { packager } from '@electron/packager';
 
 import { maxOsVersion, parseMinOs } from './min-os.js';
-import { bundledAddonPath, codesignArgs, NATIVE_FILES, PayloadError, resolvePayload } from './payload.js';
+import {
+  assertDarwinAppRuntimeAssets,
+  bundledAddonPath,
+  codesignArgs,
+  findStagedNativeAddons,
+  NATIVE_FILES,
+  needsDylibIdRewrite,
+  parseDylibIds,
+  PayloadError,
+  resolvePayload,
+} from './payload.js';
 import { assertSemver } from './release-version.js';
 import { stageApp } from './stage-app.js';
 import { writeUpdaterConfig } from './update-artifacts.js';
@@ -133,16 +143,37 @@ const staged = stageApp({
   roots: RUNTIME_ROOTS,
   autoUpdates: sign,
 });
-// Upstream NAPI-RS binaries (@napi-rs/keyring for CLI credentials, @napi-rs/canvas
-// for Clairic PDF rasterization) bake the builder's `/Users/.../target/...` path into
-// LC_ID_DYLIB, which fails `verify-bundle.ts` step [3/5]. Rewrite only the staged
-// copies before packager/codesign.
-for (const [pkg, binary] of [
-  ['keyring-darwin-arm64', 'keyring.darwin-arm64.node'],
-  ['canvas-darwin-arm64', 'skia.darwin-arm64.node'],
-] as const) {
-  run('install_name_tool', ['-id', `@rpath/${binary}`, join(STAGE_APP, 'node_modules', '@napi-rs', pkg, binary)]);
+try {
+  assertDarwinAppRuntimeAssets(STAGE_APP);
+} catch (err) {
+  if (err instanceof PayloadError) {
+    console.error(`\n${err.message}\n\n  run: ${err.remedy}\n`);
+    process.exit(1);
+  }
+  throw err;
 }
+// Scan every staged native addon (e.g. @napi-rs/keyring, @napi-rs/canvas, and
+// any future NAPI-RS dependencies) for build-machine paths baked into
+// LC_ID_DYLIB, which fail `verify-bundle.ts` step [3/5]. Rewrite only the
+// staged copies whose LC_ID_DYLIB needs it, leaving MH_BUNDLE and foreign
+// non-Mach-O slices untouched.
+const stagedAddons = findStagedNativeAddons(join(STAGE_APP, 'node_modules'));
+let rewrittenAddons = 0;
+for (const addon of stagedAddons) {
+  const otool = spawnSync('otool', ['-l', addon], {
+    encoding: 'utf-8',
+    maxBuffer: 64 * 1024 * 1024,
+  });
+  if (otool.error !== undefined) throw otool.error;
+  const output = otool.stdout ?? '';
+  if (otool.status !== 0 && !`${output}\n${otool.stderr ?? ''}`.includes('is not an object file')) {
+    throw new Error(`otool -l failed on ${addon} (exit ${otool.status}): ${(otool.stderr ?? '').trim()}`);
+  }
+  if (!needsDylibIdRewrite(parseDylibIds(output))) continue;
+  run('install_name_tool', ['-id', `@rpath/${basename(addon)}`, addon]);
+  rewrittenAddons += 1;
+}
+console.log(`rewrote LC_ID_DYLIB on ${rewrittenAddons} of ${stagedAddons.length} staged native addon(s)`);
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);

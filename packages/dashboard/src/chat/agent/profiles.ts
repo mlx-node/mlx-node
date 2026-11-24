@@ -172,12 +172,20 @@ const HOOK_NAME_END = '/plugin:pre_tool_use[0].hooks[0]';
 const WORK_GUARD_OUTPUT = JSON.stringify({
   hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'ask' },
 });
+// On Windows, `mlx-node/grok-build`'s `xai-grok-hooks/src/runner/command.rs`
+// resolves a single-token relative command directly against `spec.source_dir`
+// (`plugin_root`, i.e. `paths.workGuard`) without consulting PATH, whereas an
+// absolute path containing spaces (e.g. `C:\Users\My Name\...`) triggers the
+// shell-command branch (`detect_windows_shell`).
+export const WORK_GUARD_WIN_COMMAND = 'ask.cmd';
+export const WORK_GUARD_WIN_SCRIPT = `@echo off\r\necho ${WORK_GUARD_OUTPUT}\r\n`;
 
 export function workGuardName(): string {
   return `${WORK_GUARD_PREFIX}${randomBytes(WORK_GUARD_SUFFIX_CHARS / 2).toString('hex')}`;
 }
 
-export function workGuardManifest(name: string): string {
+export function workGuardManifest(name: string, platform: NodeJS.Platform = process.platform): string {
+  const command = platform === 'win32' ? WORK_GUARD_WIN_COMMAND : `printf '%s\\n' '${WORK_GUARD_OUTPUT}'`;
   return `${JSON.stringify(
     {
       name,
@@ -188,7 +196,7 @@ export function workGuardManifest(name: string): string {
           PreToolUse: [
             {
               matcher: WORK_GUARD_MATCHER,
-              hooks: [{ type: 'command', command: `printf '%s\\n' '${WORK_GUARD_OUTPUT}'` }],
+              hooks: [{ type: 'command', command }],
             },
           ],
         },

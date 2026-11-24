@@ -109,6 +109,12 @@ export interface CatalogEntry {
    */
   hidden?: boolean;
   /**
+   * Platforms where this entry is supported (absent means every platform).
+   * Non-matching platforms omit it from {@link visibleCatalog}, {@link visibleSystemOneCatalog},
+   * {@link catalogTargets}, and dashboard UI cards.
+   */
+  platforms?: readonly NodeJS.Platform[];
+  /**
    * The family (an id of the `@mlx-node/lm` family table) of the entry's GGUF builds, set only when that family's GGUF
    * discovery needs no asset files. A folder with no `config.json` counts as a GGUF build of the entry only when the
    * header of the GGUF that names the build states this family. A GGUF build of such an entry with no
@@ -258,6 +264,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     // settings (16K context, 2048-row chunk, MTP on, one staging layer) are
     // 26.52 GiB, plus the 12 GiB reserve. The catalog offers it from 96 GiB.
     minMemoryGb: 96,
+    platforms: ['darwin'],
     ggufFamily: 'hy_v4_flash',
     builds: [
       {
@@ -479,15 +486,23 @@ export type CatalogTarget =
     }
   | { kind: 'draft'; slug: string; entry: CatalogEntry; repo: string };
 
+/** Whether `entry` is supported on `platform` ({@link CatalogEntry.platforms}; absent means every platform). */
+export function catalogSupportedOnPlatform(
+  entry: Pick<CatalogEntry, 'platforms'>,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  return entry.platforms === undefined || entry.platforms.includes(platform);
+}
+
 /**
- * Every build and every draft of the entries that are not hidden, in catalog order. `globs` and `assetsRepo`
- * describe the GGUF repo only, so a platform override repo (a plain safetensors layout) gets neither: globbing it
- * would filter out every weight, and its config/tokenizer files are its own.
+ * Every build and every draft of the entries that are not hidden and supported on `platform`, in catalog order.
+ * `globs` and `assetsRepo` describe the GGUF repo only, so a platform override repo (a plain safetensors layout) gets
+ * neither: globbing it would filter out every weight, and its config/tokenizer files are its own.
  */
 export function catalogTargets(platform: NodeJS.Platform = process.platform): CatalogTarget[] {
   const targets: CatalogTarget[] = [];
   for (const entry of MODEL_CATALOG) {
-    if (entry.hidden) continue;
+    if (entry.hidden || !catalogSupportedOnPlatform(entry, platform)) continue;
     for (const build of entry.builds) {
       const repo = catalogBuildRepo(build, platform);
       const own = repo === build.hfRepo;
@@ -553,17 +568,31 @@ export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, tota
   return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
 }
 
-/** Catalog entries the wizard offers: visible chat entries whose memory floor `totalMemBytes` of RAM meets. */
-export function visibleCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
+/** Catalog entries the wizard offers: visible chat entries supported on `platform` whose memory floor `totalMemBytes` meets. */
+export function visibleCatalog(
+  totalMemBytes: number = totalmem(),
+  platform: NodeJS.Platform = process.platform,
+): CatalogEntry[] {
   return MODEL_CATALOG.filter(
-    (entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat' && catalogFitsMemory(entry, totalMemBytes),
+    (entry) =>
+      !entry.hidden &&
+      (entry.category ?? 'chat') === 'chat' &&
+      catalogSupportedOnPlatform(entry, platform) &&
+      catalogFitsMemory(entry, totalMemBytes),
   );
 }
 
-/** Visible System One (Clairic / CLEF) catalog entries whose memory floor `totalMemBytes` of RAM meets. */
-export function visibleSystemOneCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
+/** Visible System One (Clairic / CLEF) catalog entries supported on `platform` whose memory floor `totalMemBytes` meets. */
+export function visibleSystemOneCatalog(
+  totalMemBytes: number = totalmem(),
+  platform: NodeJS.Platform = process.platform,
+): CatalogEntry[] {
   return MODEL_CATALOG.filter(
-    (entry) => !entry.hidden && entry.category === 'systemone' && catalogFitsMemory(entry, totalMemBytes),
+    (entry) =>
+      !entry.hidden &&
+      entry.category === 'systemone' &&
+      catalogSupportedOnPlatform(entry, platform) &&
+      catalogFitsMemory(entry, totalMemBytes),
   );
 }
 

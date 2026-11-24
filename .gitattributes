@@ -1,0 +1,26 @@
+# Normalize text files to LF across platforms so Windows checkouts compute
+# identical hashes/keys and avoid spurious declaration drift.
+* text=auto eol=lf
+
+# Windows batch scripts require CRLF.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary and ML asset formats.
+*.gguf binary
+*.safetensors binary
+*.npz binary
+*.wav binary
+*.png binary
+*.ico binary
+*.icns binary
+*.sqlite binary
+*.dll binary
+*.lib binary
+*.node binary
+*.metallib binary
+*.zip binary
+*.gz binary
+*.tar binary
+*.msix binary
+*.dmg binary

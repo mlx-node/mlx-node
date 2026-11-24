@@ -5,11 +5,11 @@
  * `eval`, a heredoc fed to a shell, a command substitution) is scanned as a command too.
  */
 
-import { posix } from 'node:path';
+import { posix, win32 } from 'node:path';
 
 import type { CommandFlag } from '../types.js';
 import { ALL_PROVIDER_KEY_ENV } from './env.js';
-import { rootText, type AllowedRoot } from './roots.js';
+import { below, isWinPath, rootText, type AllowedRoot } from './roots.js';
 
 /** The order flags are listed in. */
 export const COMMAND_FLAGS: readonly CommandFlag[] = [
@@ -744,8 +744,7 @@ function aliases(path: string): string[] {
 /** In the work folder (either spelling of a `/private` alias), or in a root the place names by text. */
 function inside(path: string, place: WorkPlace): boolean {
   const folder = place.cwd;
-  if (aliases(path).some((p) => p === folder || p.startsWith(folder.endsWith('/') ? folder : `${folder}/`)))
-    return true;
+  if (aliases(path).some((p) => below(p, folder))) return true;
   return place.temp !== undefined && place.temp.length > 0 && rootText(path, place) !== null;
 }
 
@@ -754,21 +753,24 @@ const OTHER_HOME = Symbol('another user home');
 /** A path as written, made absolute; {@link OTHER_HOME} for `~user`; null when it cannot be known. */
 function resolvePath(word: Word, dir: string | null, home: string): string | typeof OTHER_HOME | null {
   let text = word.text;
-  if (text === '' || text.includes(':')) return null;
+  const win = isWinPath(home) || (dir !== null && isWinPath(dir));
+  if (text === '') return null;
+  if (text.includes(':') && !(win && /^[A-Za-z]:[\\/]/.test(text) && !text.slice(2).includes(':'))) return null;
+  const pathApi = win ? win32 : posix;
   if (word.live.includes('$')) {
     const prefix = ['${HOME}', '$HOME'].find((p) => word.live.startsWith(p));
     if (prefix === undefined) return null;
     const rest = text.slice(prefix.length);
     if (rest.includes('$') || word.live.slice(prefix.length).includes('$')) return null;
-    return posix.normalize(posix.join(home, rest));
+    return pathApi.normalize(pathApi.join(home, rest));
   }
   if (text.startsWith('~')) {
-    if (text !== '~' && !text.startsWith('~/')) return OTHER_HOME;
-    text = posix.join(home, text.slice(1));
+    if (text !== '~' && !text.startsWith('~/') && !(win && text.startsWith('~\\'))) return OTHER_HOME;
+    text = pathApi.join(home, text.slice(1));
   }
-  if (posix.isAbsolute(text)) return posix.normalize(text);
+  if (pathApi.isAbsolute(text)) return pathApi.normalize(text);
   if (dir === null) return null;
-  return posix.normalize(posix.join(dir, text));
+  return pathApi.normalize(pathApi.join(dir, text));
 }
 
 function writtenOutside(word: Word, dir: string | null, place: WorkPlace): boolean {
@@ -923,6 +925,17 @@ function segments(path: string): string[] {
   return path.split('/').filter((s) => s !== '' && s !== '.');
 }
 
+function isAsciiLetter(ch: string | undefined): boolean {
+  if (ch === undefined || ch.length !== 1) return false;
+  const code = ch.charCodeAt(0);
+  return (code >= 65 && code <= 90) || (code >= 97 && code <= 122);
+}
+
+/** Windows drive-relative path like `C:foo.txt` (drive letter + colon without separator). */
+export function isWinDriveRelative(path: string): boolean {
+  return path.length >= 2 && isAsciiLetter(path[0]) && path[1] === ':' && path[2] !== '\\' && path[2] !== '/';
+}
+
 /**
  * The path the agent writes for an edit, as text: trimmed, surrounding quotes removed, `~` and `~/` expanded, a
  * relative path that repeats the work folder without its leading slash taken as that folder, anything else relative
@@ -943,8 +956,33 @@ export function agentPath(path: string, place: WorkPlace): string {
       text = trimAgent(text.slice(0, -2), false, true);
     }
   }
+  const win = isWinPath(place.cwd);
   if (text === '~') text = place.home;
-  else if (text.startsWith('~/')) text = `${place.home}${text.slice(1)}`;
+  else if (win && (text.startsWith('~/') || text.startsWith('~\\'))) {
+    const homeBase = place.home.endsWith('\\') || place.home.endsWith('/') ? place.home : `${place.home}\\`;
+    text = `${homeBase}${text.slice(2)}`;
+  } else if (text.startsWith('~/')) {
+    text = `${place.home}${text.slice(1)}`;
+  }
+  if (win) {
+    // Drive-relative paths (`C:foo.txt`) depend on per-drive process CWD rather
+    // than `place.cwd`: never append them onto `place.cwd`.
+    if (isWinDriveRelative(text)) return text;
+    // Drive-less rooted paths (`\Windows\win.ini` or `/etc/hosts`) resolve
+    // against the Work folder's drive root in Rust's `PathBuf::join`, not the
+    // dashboard process's current drive.
+    const isRootedNoDrive =
+      (text.startsWith('\\') && !text.startsWith('\\\\')) || (text.startsWith('/') && !text.startsWith('//'));
+    if (isRootedNoDrive) {
+      if (place.cwd.length >= 2 && isAsciiLetter(place.cwd[0]) && place.cwd[1] === ':') {
+        return `${place.cwd.slice(0, 2)}${text}`;
+      }
+      return text;
+    }
+    if (win32.isAbsolute(text)) return text;
+    const cwdBase = place.cwd.endsWith('\\') || place.cwd.endsWith('/') ? place.cwd : `${place.cwd}\\`;
+    return text === '' ? place.cwd : `${cwdBase}${text}`;
+  }
   if (text.startsWith('/')) return text;
   if (text !== '') {
     const base = segments(place.cwd);
@@ -965,5 +1003,7 @@ export function landsOutside(path: string, place: WorkPlace): boolean {
 
 /** The warnings for a file the agent asks to edit or write, judged by its path text: whether it lies outside the work folder. */
 export function pathFlags(path: string, place: WorkPlace): CommandFlag[] {
-  return landsOutside(posix.normalize(agentPath(path, place)), place) ? ['outside-folder'] : [];
+  const resolved = agentPath(path, place);
+  const normalized = isWinPath(place.cwd) ? win32.normalize(resolved) : posix.normalize(resolved);
+  return landsOutside(normalized, place) ? ['outside-folder'] : [];
 }

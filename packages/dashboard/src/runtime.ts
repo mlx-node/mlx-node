@@ -38,6 +38,7 @@ import { ProvidersService } from './chat/providers/service.js';
 import type { ProviderId } from './chat/providers/types.js';
 import { redactDeep, redactEntry } from './chat/redact.js';
 import { ChatService, webServerScript, type AgentResolution } from './chat/service.js';
+import { readPathEnv } from './chat/skills/cli-check.js';
 import type { AppEnd, ChatHostEvent, ConversationEvent } from './chat/types.js';
 import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
@@ -347,7 +348,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     paths,
     secrets: chatOpts.secrets ?? new KeyringSecretStore(),
     baseUrls: chatOpts.providerBaseUrls,
-    workPath: () => (chatOpts.workPath === undefined ? workBase.PATH : chatOpts.workPath(workBase, workHome)),
+    workPath: () => (chatOpts.workPath === undefined ? readPathEnv(workBase) : chatOpts.workPath(workBase, workHome)),
   });
   const readEndpoint = chatOpts.readEndpoint ?? (() => readDesktopEndpoint());
   const chat = new ChatService({

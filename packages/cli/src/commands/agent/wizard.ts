@@ -31,8 +31,10 @@ export interface WizardDeps {
   download: (argv: string[]) => Promise<unknown>;
   /** Resolved models dir: the download lands in `<modelsDir>/<build folder>`, the dir `mlx agent` re-scans. */
   modelsDir: string;
-  /** Physical RAM in bytes: the models offered are `visibleCatalog(totalMemBytes)`. */
+  /** Physical RAM in bytes: the models offered are `visibleCatalog(totalMemBytes, platform)`. */
   totalMemBytes: number;
+  /** Target platform override (default `process.platform`). */
+  platform?: NodeJS.Platform;
 }
 
 /**
@@ -50,8 +52,8 @@ export interface WizardDeps {
  * GGUF build only — a platform override (the pre-converted CUDA repo)
  * installs as a plain safetensors directory.
  */
-function downloadModelArgv(build: CatalogBuild, modelsDir: string): string[] {
-  const hfRepo = catalogBuildRepo(build);
+function downloadModelArgv(build: CatalogBuild, modelsDir: string, platform?: NodeJS.Platform): string[] {
+  const hfRepo = catalogBuildRepo(build, platform);
   const own = hfRepo === build.hfRepo;
   const argv = ['-m', hfRepo];
   for (const glob of own ? (build.globs ?? []) : []) {
@@ -64,7 +66,7 @@ function downloadModelArgv(build: CatalogBuild, modelsDir: string): string[] {
   // must not read as a partial (arbitrary-subset) glob run: the dashboard
   // only treats full markers as installed and only offers updates for them.
   argv.push('--complete');
-  argv.push('-o', join(modelsDir, catalogBuildSlug(build)));
+  argv.push('-o', join(modelsDir, catalogBuildSlug(build, platform)));
   return argv;
 }
 
@@ -120,12 +122,12 @@ async function chooseBuild(io: WizardIO, entry: CatalogEntry): Promise<CatalogBu
  * build of each model instead — the caller must not touch stdin on that path (the binary's print mode owns it).
  */
 export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
-  const catalog = visibleCatalog(deps.totalMemBytes);
+  const catalog = visibleCatalog(deps.totalMemBytes, deps.platform);
 
   if (!deps.io.isTTY) {
     const commands = catalog
       .map((entry) => {
-        const modelCmd = `mlx download model ${downloadModelArgv(entry.builds[0], deps.modelsDir).map(shellQuote).join(' ')}`;
+        const modelCmd = `mlx download model ${downloadModelArgv(entry.builds[0], deps.modelsDir, deps.platform).map(shellQuote).join(' ')}`;
         if (entry.draft?.autoInstall !== true) return `  ${modelCmd}`;
         const draftCmd = `mlx download model ${downloadDraftArgv(entry.draft, deps.modelsDir).map(shellQuote).join(' ')}`;
         return `  ${modelCmd} && ${draftCmd}`;
@@ -151,7 +153,7 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
     throw new Error(`Wizard choice "${chosen}" is not in the visible catalog`);
   }
   const build = await chooseBuild(deps.io, chosenEntry);
-  await deps.download(downloadModelArgv(build, deps.modelsDir));
+  await deps.download(downloadModelArgv(build, deps.modelsDir, deps.platform));
   if (chosenEntry.draft?.autoInstall === true) {
     const draftArgv = downloadDraftArgv(chosenEntry.draft, deps.modelsDir);
     deps.io.log(`Downloading companion ${chosenEntry.draft.label} (~${chosenEntry.draft.sizeGb} GB)...`);
@@ -165,5 +167,5 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
       );
     }
   }
-  return catalogBuildSlug(build);
+  return catalogBuildSlug(build, deps.platform);
 }

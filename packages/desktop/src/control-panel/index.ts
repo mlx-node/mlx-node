@@ -43,7 +43,7 @@ import {
   type DashboardRuntime,
 } from '@mlx-node/dashboard';
 
-import { createCliLauncher, runAgentUpdate, type DesktopCliConfig } from '../cli-launcher.js';
+import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import {
   firstClosing,
   LEDGER_DIR_ENV,
@@ -150,7 +150,7 @@ const cli =
 
 /** The Chat page's Install action: the app's own `mlx agent update`. */
 function agentInstaller(launcher: NonNullable<typeof cli>): () => Promise<void> {
-  return async () => runAgentUpdate(await launcher.prepare());
+  return () => launcher.runAgentUpdate();
 }
 runtime = createDashboardRuntime({
   prepareDelegation: cli ? () => cli.prepare() : undefined,

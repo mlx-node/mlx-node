@@ -133,6 +133,32 @@ describe('claudeChildEnv', () => {
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBeUndefined();
   });
 
+  it('drops mixed-case Windows ANTHROPIC_API_KEY and override spellings', () => {
+    const parent = {
+      Anthropic_Api_Key: 'sk-ant-mixed-case-secret',
+      anthropic_base_url: 'https://api.anthropic.com',
+      Anthropic_Auth_Token: 'stale-token',
+      anthropic_model: 'claude-opus',
+      claude_code_max_context_tokens: '1000000',
+    };
+    const env = claudeChildEnv(parent, { ...opts, contextTokens: 139257 });
+    expect(Object.keys(env).filter((k) => k.toLowerCase() === 'anthropic_api_key')).toEqual([]);
+    expect(JSON.stringify(env)).not.toContain('sk-ant-mixed-case-secret');
+    expect(Object.keys(env).filter((k) => k.toLowerCase() === 'anthropic_base_url')).toEqual(['ANTHROPIC_BASE_URL']);
+    expect(env.ANTHROPIC_BASE_URL).toBe(opts.baseUrl);
+    expect(Object.keys(env).filter((k) => k.toLowerCase() === 'anthropic_auth_token')).toEqual([
+      'ANTHROPIC_AUTH_TOKEN',
+    ]);
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe(opts.authToken);
+    expect(Object.keys(env).filter((k) => k.toLowerCase() === 'anthropic_model')).toEqual(['ANTHROPIC_MODEL']);
+    expect(env.ANTHROPIC_MODEL).toBe(opts.model);
+    expect(Object.keys(env).filter((k) => k.toLowerCase() === 'claude_code_max_context_tokens')).toEqual([
+      'CLAUDE_CODE_MAX_CONTEXT_TOKENS',
+    ]);
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('139257');
+    expect(parent.Anthropic_Api_Key).toBe('sk-ant-mixed-case-secret');
+  });
+
   it('does not mutate the parent environment', () => {
     const parent = { ANTHROPIC_API_KEY: 'sk-ant-the-users-own-key' };
     claudeChildEnv(parent, opts);

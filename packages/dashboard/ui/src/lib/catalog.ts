@@ -5,14 +5,18 @@ import type { CatalogBuildItem, CatalogItem, HostResponse } from './types';
 const GIB = 2 ** 30;
 
 /**
- * Whether the page offers `item` on this Mac: not hidden, and its memory floor met. An entry with a floor waits
- * for the host reading.
+ * Whether the page offers `item` on this machine: not hidden, platform supported, and memory floor met. An entry
+ * with a platform restriction or memory floor waits for the host reading.
  */
 export function offeredOnHost(
-  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb'>,
+  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb' | 'platforms'>,
   host: HostResponse | undefined,
 ): boolean {
   if (item.hidden === true) return false;
+  if (item.platforms !== undefined) {
+    if (host === undefined) return false;
+    if (host.platform !== undefined && !item.platforms.includes(host.platform)) return false;
+  }
   if (item.minMemoryGb === undefined) return true;
   return host !== undefined && host.totalMemBytes >= item.minMemoryGb * GIB;
 }

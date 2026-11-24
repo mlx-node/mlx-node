@@ -20,7 +20,13 @@ import { promisify } from 'node:util';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { scopeCoreNativeOverride } from '../scripts/stage-app.js';
-import { createCliLauncher, launcherScript, type DesktopCliConfig } from '../src/cli-launcher.js';
+import {
+  createCliLauncher,
+  directCliInvocation,
+  launcherScript,
+  runAgentUpdate,
+  type DesktopCliConfig,
+} from '../src/cli-launcher.js';
 
 const execute = promisify(execFile);
 const windows = process.platform === 'win32';
@@ -256,5 +262,52 @@ describe('app-owned command', () => {
     await expect(launcher.prepare()).rejects.toThrow('does not support delegation');
     await rm(config.entry);
     await expect(launcher.prepare()).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('builds a direct Electron-as-Node invocation without cmd.exe, preserving Windows CUDA env and stripping NAPI_RS override', () => {
+    const config: DesktopCliConfig = {
+      executable: 'C:\\Users\\A&B (1)\\mlx-node\\mlx-node.exe',
+      entry: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\app\\node_modules\\@mlx-node\\cli\\dist\\cli.js',
+      nativeAddon: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\native\\mlx-core.win32-arm64-msvc.node',
+      nativeRuntimeDir: 'C:\\Users\\A&B (1)\\mlx-node\\resources\\native',
+      modelsDir: 'D:\\Models',
+    };
+    const direct = directCliInvocation(config, ['agent', 'update'], 'win32', {
+      Path: 'C:\\Windows\\System32',
+      Napi_Rs_Native_Library_Path: 'C:\\stale\\other.node',
+    });
+    expect(direct.file).toBe(config.executable);
+    expect(direct.args).toEqual([config.entry, 'agent', 'update']);
+    expect(direct.env.ELECTRON_RUN_AS_NODE).toBe('1');
+    expect(direct.env.MLX_CORE_NATIVE_LIBRARY_PATH).toBe(config.nativeAddon);
+    expect(direct.env.MLX_MODELS_DIR).toBe('D:\\Models');
+    expect(direct.env.CUDA_HOME).toBe(config.nativeRuntimeDir);
+    expect(direct.env.CUDA_PATH).toBe(config.nativeRuntimeDir);
+    expect(direct.env.Path).toBe(`${config.nativeRuntimeDir};C:\\Windows\\System32`);
+    expect(direct.env.MLX_CUDA_USE_CUDNN_SDPA).toBe('0');
+    expect(Object.keys(direct.env).filter((k) => k.toLowerCase() === 'napi_rs_native_library_path')).toEqual([]);
+  });
+
+  it('runs mlx agent update directly through the bundled runtime (including shell metacharacters in home) and surfaces failures', async () => {
+    const { root, config } = await fixture();
+    const metaHome = join(root, 'User & (1) %TEMP%');
+    await mkdir(metaHome, { recursive: true });
+    const launcher = createCliLauncher(config, metaHome);
+    await writeFile(
+      config.entry,
+      `import { writeFileSync } from 'node:fs';
+       if (process.argv[2] === 'delegate' && process.argv[3] === '--help') {
+         console.log('Usage: mlx delegate\\nmlx delegate github');
+       } else if (process.argv[2] === 'agent' && process.argv[3] === 'update') {
+         writeFileSync(${JSON.stringify(join(root, 'updated'))}, process.env.ELECTRON_RUN_AS_NODE ?? '');
+       } else {
+         process.exit(1);
+       }`,
+    );
+    await launcher.runAgentUpdate();
+    expect(await readFile(join(root, 'updated'), 'utf8')).toBe('1');
+
+    await writeFile(config.entry, 'process.exit(2);');
+    await expect(runAgentUpdate(config)).rejects.toThrow('mlx agent update failed');
   });
 });

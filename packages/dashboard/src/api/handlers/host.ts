@@ -3,11 +3,12 @@ import { totalmem } from 'node:os';
 
 import type { ApiPaths } from '../context.js';
 
-/** What the Models page needs to know about this machine: its memory, and the free space of the models disk. */
+/** What the Models page needs to know about this machine: its memory, free space, and OS platform. */
 export interface HostInfo {
   totalMemBytes: number;
   /** `null` when the models folder cannot be read. */
   diskFreeBytes: number | null;
+  platform: NodeJS.Platform;
 }
 
 export async function handleHost(ctx: ApiPaths): Promise<HostInfo> {
@@ -18,5 +19,5 @@ export async function handleHost(ctx: ApiPaths): Promise<HostInfo> {
   } catch {
     diskFreeBytes = null;
   }
-  return { totalMemBytes: totalmem(), diskFreeBytes };
+  return { totalMemBytes: totalmem(), diskFreeBytes, platform: process.platform };
 }

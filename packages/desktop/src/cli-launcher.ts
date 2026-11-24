@@ -13,10 +13,50 @@ const POSIX_HEADER = '#!/bin/sh\n# Managed by mlx-node.\n';
 const WINDOWS_HEADER = '@echo off\r\nREM Managed by mlx-node.\r\n';
 const AGENT_UPDATE_MS = 600_000;
 
-/** `mlx agent update` through the prepared launcher. Its output is not kept: it is not ours to log. */
-export async function runAgentUpdate(command: string): Promise<void> {
+/**
+ * Direct invocation of the bundled CLI through Electron's Node mode (`ELECTRON_RUN_AS_NODE=1`).
+ * Spawning `config.executable` directly avoids routing through `cmd.exe`, so shell metacharacters
+ * (e.g. `&`, `^`, `(`, `%`) in the user's home or install path are never reinterpreted.
+ */
+export function directCliInvocation(
+  config: DesktopCliConfig,
+  args: readonly string[],
+  platform: NodeJS.Platform = process.platform,
+  baseEnv: NodeJS.ProcessEnv = process.env,
+): { file: string; args: string[]; env: NodeJS.ProcessEnv } {
+  const env: NodeJS.ProcessEnv = {};
+  let pathKey = 'PATH';
+  for (const [key, value] of Object.entries(baseEnv)) {
+    if (value === undefined) continue;
+    const upper = key.toUpperCase();
+    if (upper === 'NAPI_RS_NATIVE_LIBRARY_PATH' || upper === 'MLX_CORE_NATIVE_LIBRARY_PATH') continue;
+    if (platform === 'win32' && upper === 'PATH') pathKey = key;
+    env[key] = value;
+  }
+  env.ELECTRON_RUN_AS_NODE = '1';
+  env.MLX_CORE_NATIVE_LIBRARY_PATH = config.nativeAddon;
+  if (config.modelsDir) env.MLX_MODELS_DIR = config.modelsDir;
+  if (platform === 'win32' && config.nativeRuntimeDir) {
+    env.CUDA_HOME = config.nativeRuntimeDir;
+    env.CUDA_PATH = config.nativeRuntimeDir;
+    env[pathKey] = env[pathKey] ? `${config.nativeRuntimeDir};${env[pathKey]}` : config.nativeRuntimeDir;
+    env.MLX_CUDA_USE_CUDNN_SDPA = '0';
+  }
+  return { file: config.executable, args: [config.entry, ...args], env };
+}
+
+/** `mlx agent update` through the bundled runtime directly (no `cmd.exe`). Its output is not ours to log. */
+export async function runAgentUpdate(
+  config: DesktopCliConfig,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
+  const invocation = directCliInvocation(config, ['agent', 'update'], platform);
   try {
-    await execute(command, ['agent', 'update'], { timeout: AGENT_UPDATE_MS, maxBuffer: 1024 * 1024 });
+    await execute(invocation.file, invocation.args, {
+      env: invocation.env,
+      timeout: AGENT_UPDATE_MS,
+      maxBuffer: 1024 * 1024,
+    });
   } catch {
     throw new Error('mlx agent update failed');
   }
@@ -94,19 +134,17 @@ export function createCliLauncher(
     }
     await cache.verify([path, config.executable, config.entry, config.nativeAddon], async () => {
       // No user-installed Node/mlx, shell startup files, model load, or permission overrides.
-      const options = {
-        env: { ...process.env, PATH: windows ? '' : '/usr/bin:/bin:/usr/sbin:/sbin' },
-        // `delegate --help` also starts the agent CLI; cold Windows startup exceeds the POSIX budget.
-        timeout: windows ? 60_000 : 10_000,
-        maxBuffer: 128 * 1024,
-      };
+      // On Windows, invoke the bundled runtime directly instead of routing `path` through
+      // `cmd.exe /c call`, so shell metacharacters in `home` cannot break verification.
+      const baseEnv = { ...process.env, PATH: windows ? '' : '/usr/bin:/bin:/usr/sbin:/sbin' };
+      const timeout = windows ? 60_000 : 10_000;
+      const maxBuffer = 128 * 1024;
       const { stdout } = windows
-        ? await execute(
-            process.env.ComSpec ?? 'cmd.exe',
-            ['/d', '/s', '/c', 'call', path, 'delegate', '--help'],
-            options,
-          )
-        : await execute(path, ['delegate', '--help'], options);
+        ? await (() => {
+            const direct = directCliInvocation(config, ['delegate', '--help'], platform, baseEnv);
+            return execute(direct.file, direct.args, { env: direct.env, timeout, maxBuffer });
+          })()
+        : await execute(path, ['delegate', '--help'], { env: baseEnv, timeout, maxBuffer });
       if (!stdout.includes('Usage: mlx delegate') || !stdout.includes('mlx delegate github')) {
         throw new Error('The bundled command does not support delegation. Reinstall or update mlx-node.');
       }
@@ -120,6 +158,10 @@ export function createCliLauncher(
         pending = undefined;
       });
       return pending;
+    },
+    async runAgentUpdate(): Promise<void> {
+      await this.prepare();
+      await runAgentUpdate(config, platform);
     },
   };
 }

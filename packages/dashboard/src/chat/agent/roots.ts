@@ -14,8 +14,18 @@ export interface AllowedRoot {
   kind: 'work' | 'temp';
 }
 
+/** Whether an absolute path uses Windows syntax (a drive root like `C:\` / `C:/` or a UNC prefix `\\`). */
+export function isWinPath(path: string): boolean {
+  return /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\');
+}
+
 /** `path` is `top` or below it, by text. */
 export function below(path: string, top: string): boolean {
+  if (isWinPath(top)) {
+    const p = path.replaceAll('/', '\\');
+    const t = top.replaceAll('/', '\\');
+    return p === t || p.startsWith(t.endsWith('\\') ? t : `${t}\\`);
+  }
   return path === top || path.startsWith(top.endsWith('/') ? top : `${top}/`);
 }
 

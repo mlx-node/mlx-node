@@ -67,12 +67,13 @@ import {
   rename,
   rm,
   rmdir,
+  stat,
   symlink,
   unlink,
   writeFile,
 } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { basename, dirname, join, resolve, sep } from 'node:path';
+import { basename, dirname, join, resolve, sep, win32 } from 'node:path';
 
 import { downloadFileToCacheDir, getRepoFolderName, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { type CatalogTarget, catalogTargetForSlug, catalogTargets, catalogUpdateRepos } from '@mlx-node/agent/catalog';
@@ -194,19 +195,69 @@ function isGone(path: string): boolean {
   }
 }
 
+/** Whether `target` names a Windows UNC share (which NTFS junctions cannot point to). */
+function isWindowsUncTarget(target: string): boolean {
+  return (
+    target.startsWith('//') ||
+    target.toUpperCase().startsWith('\\\\?\\UNC\\') ||
+    (target.startsWith('\\\\') && !target.startsWith('\\\\?\\'))
+  );
+}
+
+/**
+ * Restore a symlink at `finalDir` on Windows: files get `'file'`; directories try `'dir'` first (preserving both UNC
+ * and local directory symlinks and failing atomically on `EEXIST`), falling back to `'junction'` only on `EPERM` /
+ * `EACCES` for non-UNC targets (where Developer Mode is off so the original entry must have been a junction).
+ * If `stat(resolved)` fails (e.g. an offline SMB share or disconnected drive), propagates the error instead of guessing
+ * `'file'` so `putBack` preserves the original reparse point intact in `.staging`.
+ */
+export async function restoreWindowsSymlink(
+  target: string,
+  finalDir: string,
+  ops: {
+    stat: (p: string) => Promise<{ isDirectory(): boolean }>;
+    symlink: (target: string, path: string, type: 'file' | 'dir' | 'junction') => Promise<void>;
+  } = { stat, symlink },
+): Promise<void> {
+  const resolved = win32.resolve(win32.dirname(finalDir), target);
+  const isDir = (await ops.stat(resolved)).isDirectory();
+  if (!isDir) {
+    await ops.symlink(target, finalDir, 'file');
+    return;
+  }
+  try {
+    await ops.symlink(target, finalDir, 'dir');
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (!isWindowsUncTarget(target) && !isWindowsUncTarget(resolved) && (code === 'EPERM' || code === 'EACCES')) {
+      await ops.symlink(target, finalDir, 'junction');
+      return;
+    }
+    throw error;
+  }
+}
+
 /**
  * Put an entry a cleanup moved aside back at `finalDir`. A file is linked back and a link is made again from its text,
  * so neither replaces what another program put at `finalDir` (EEXIST); a folder is renamed back, which can replace only
  * an empty folder.
  */
 async function putBack(moved: string, finalDir: string): Promise<void> {
-  const stat = await lstat(moved);
-  if (stat.isDirectory()) {
+  const info = await lstat(moved);
+  if (info.isDirectory()) {
     await rename(moved, finalDir);
     return;
   }
-  if (stat.isSymbolicLink()) await symlink(await readlink(moved), finalDir);
-  else await link(moved, finalDir);
+  if (info.isSymbolicLink()) {
+    const target = await readlink(moved);
+    if (process.platform === 'win32') {
+      await restoreWindowsSymlink(target, finalDir);
+    } else {
+      await symlink(target, finalDir);
+    }
+  } else {
+    await link(moved, finalDir);
+  }
   // The entry is back; a second name the unlink leaves stays in `.staging`.
   await unlink(moved).catch(() => {});
 }
@@ -3244,11 +3295,18 @@ export class DownloadManager {
       }
       try {
         if (item.how === 'link') await link(item.realPath, staged);
-        else await symlink(item.realPath, staged);
+        else await symlink(item.realPath, staged, 'file');
       } catch (error) {
-        if (item.how !== 'link') throw error;
         const code = (error as NodeJS.ErrnoException).code ?? String(error);
-        throw new Error(`This disk cannot share a file between two folders (${code}).`);
+        if (item.how === 'link') {
+          throw new Error(`This disk cannot share a file between two folders (${code}).`);
+        }
+        if (process.platform === 'win32' && (code === 'EPERM' || code === 'EACCES')) {
+          throw new Error(
+            `Windows requires Developer Mode to link model files across drives (${code}). Enable Developer Mode in Windows Settings, or keep the files on the same drive as your models folder.`,
+          );
+        }
+        throw error;
       }
     }
 

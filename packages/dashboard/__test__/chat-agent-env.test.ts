@@ -1,4 +1,7 @@
 import { execFileSync } from 'node:child_process';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { describe, expect, it } from 'vite-plus/test';
@@ -11,6 +14,7 @@ import {
   WORK_ANSWER_TOKENS,
   WORK_MAX_COMPLETION_TOKENS,
   workAgentEnv,
+  workInherited,
   workOverlay,
 } from '../src/chat/agent/env.js';
 import {
@@ -25,13 +29,15 @@ import {
   promptParams,
   skillBody,
   WORK_GUARD_PREFIX,
+  WORK_GUARD_WIN_COMMAND,
+  WORK_GUARD_WIN_SCRIPT,
   WORK_RULES,
   workGuardHookName,
   workGuardManifest,
   workGuardName,
   workSessionParams,
 } from '../src/chat/agent/profiles.js';
-import { chatPaths } from '../src/chat/paths.js';
+import { chatPaths, writeWorkGuard } from '../src/chat/paths.js';
 
 const paths = chatPaths('/r');
 const endpoint = { url: 'http://127.0.0.1:4321', token: 'tok-INFERENCE' };
@@ -433,5 +439,76 @@ describe('session contract', () => {
         "You are the Chat assistant of mlx-node. You run on a local model on the user's Mac.",
       ),
     ).toBe(true);
+  });
+
+  it('builds a clean isolated Chat environment on Windows without SHELL or leaked parent vars', () => {
+    const winPaths = {
+      ...paths,
+      chatHome: 'C:\\Users\\dev\\.mlx-node\\chat\\chat-home',
+      chatAgent: 'C:\\Users\\dev\\.mlx-node\\chat\\chat-agent',
+      tmp: 'C:\\Users\\dev\\.mlx-node\\chat\\tmp',
+    };
+    const env = chatAgentEnv({
+      paths: winPaths,
+      endpoint,
+      username: 'dev',
+      platform: 'win32',
+      systemRoot: 'D:\\Windows',
+    });
+    expect(env).not.toHaveProperty('SHELL');
+    expect(env).toMatchObject({
+      SystemRoot: 'D:\\Windows',
+      WINDIR: 'D:\\Windows',
+      SystemDrive: 'D:',
+      ComSpec: 'D:\\Windows\\System32\\cmd.exe',
+      PATHEXT: '.COM;.EXE;.BAT;.CMD',
+      PATH: 'D:\\Windows\\System32;D:\\Windows',
+      HOME: winPaths.chatHome,
+      USERPROFILE: winPaths.chatHome,
+      APPDATA: winPaths.chatHome,
+      LOCALAPPDATA: winPaths.chatHome,
+      TMPDIR: winPaths.tmp,
+      TEMP: winPaths.tmp,
+      TMP: winPaths.tmp,
+      USER: 'dev',
+      USERNAME: 'dev',
+      LOGNAME: 'dev',
+      GROK_HOME: winPaths.chatAgent,
+    });
+  });
+
+  it('strips removed and provider env keys case-insensitively in workInherited on Windows', () => {
+    const base = {
+      Path: 'C:\\Windows\\System32',
+      node_options: '--inspect',
+      Electron_Run_As_Node: '1',
+      exa_api_key: 'secret-exa',
+      Firecrawl_Api_Key: 'secret-fc',
+      KEEP_ME: 'yes',
+    };
+    const winEnv = workInherited(base, 'win32');
+    expect(winEnv).toEqual({ Path: 'C:\\Windows\\System32', KEEP_ME: 'yes' });
+  });
+
+  it('uses ask.cmd in the Windows work guard manifest and writes ask.cmd alongside plugin.json', async () => {
+    const name = workGuardName();
+    const manifestText = workGuardManifest(name, 'win32');
+    const manifest = JSON.parse(manifestText) as {
+      hooks: { hooks: { PreToolUse: Array<{ hooks: Array<{ command: string }> }> } };
+    };
+    expect(manifest.hooks.hooks.PreToolUse[0]!.hooks[0]!.command).toBe(WORK_GUARD_WIN_COMMAND);
+    expect(WORK_GUARD_WIN_SCRIPT).toContain('@echo off\r\necho ');
+    expect(WORK_GUARD_WIN_SCRIPT).toContain('"permissionDecision":"ask"');
+
+    const root = mkdtempSync(join(tmpdir(), 'mlx-win-guard-'));
+    try {
+      const p = chatPaths(root);
+      await writeWorkGuard(p, manifestText, 'win32');
+      expect(existsSync(join(p.workGuard, WORK_GUARD_WIN_COMMAND))).toBe(true);
+      expect(readFileSync(join(p.workGuard, WORK_GUARD_WIN_COMMAND), 'utf8')).toBe(WORK_GUARD_WIN_SCRIPT);
+      expect(readFileSync(join(p.workGuard, 'plugin.json'), 'utf8')).toBe(manifestText);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

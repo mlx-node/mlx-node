@@ -140,12 +140,18 @@ export interface LocatedRecord {
   mode: 'shared' | 'linked';
 }
 
+/** Whether `from` is an absolute POSIX, Windows drive (`C:\` / `C:/`), or UNC (`\\server\share`) path without NULs. */
+function isAbsoluteLocatedPath(from: string): boolean {
+  if (from.includes('\0')) return false;
+  return from.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(from) || /^\\\\[^\\]+[\\/][^\\]+/.test(from);
+}
+
 /** The `located` record of a marker, or `undefined` when it is absent or in any other shape. */
 function readLocated(value: unknown): LocatedRecord | undefined {
   const record = asObject(value);
   if (record === undefined) return undefined;
   const { from, mode } = record;
-  if (typeof from !== 'string' || !from.startsWith('/') || from.includes('\0')) return undefined;
+  if (typeof from !== 'string' || !isAbsoluteLocatedPath(from)) return undefined;
   if (mode !== 'shared' && mode !== 'linked') return undefined;
   return { from, mode };
 }

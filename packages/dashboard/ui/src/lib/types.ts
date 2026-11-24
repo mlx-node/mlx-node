@@ -45,11 +45,12 @@ export interface ModelsResponse {
   dir: string;
 }
 
-/** `GET /api/host`: this Mac's memory and the free space of the disk that holds the models folder. */
+/** `GET /api/host`: this machine's memory, free space on the models disk, and OS platform. */
 export interface HostResponse {
   totalMemBytes: number;
   /** `null` when the models folder cannot be read. */
   diskFreeBytes: number | null;
+  platform?: string;
 }
 
 export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
@@ -119,6 +120,8 @@ export interface CatalogItem {
   category?: 'chat' | 'systemone';
   isDefault?: boolean;
   hidden?: boolean;
+  /** Platforms where this entry is supported (absent means every platform). */
+  platforms?: readonly string[];
   /** Physical RAM in GiB the model's load needs at least; the page leaves the entry out below it. */
   minMemoryGb?: number;
   /** In catalog order; `builds[0]` is the build every surface chooses first. */
