@@ -1,6 +1,7 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
@@ -11,6 +12,7 @@ import {
   DEFAULT_MSIX_IDENTITY,
   escapeXml,
   findWindowsSdkTool,
+  MAX_MSIX_ASSET_BYTES,
   missingWindowsMsixEntries,
   parseAppxManifest,
   readMsixManifest,
@@ -21,6 +23,8 @@ import {
   verifyWindowsMsix,
 } from '../scripts/windows-msix.js';
 import { WINDOWS_ADDON, WINDOWS_RUNTIME_DLLS } from '../scripts/windows-payload.js';
+
+const COMMITTED_MSIX_ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'build', 'msix');
 
 const runtimeFiles = [WINDOWS_ADDON, ...WINDOWS_RUNTIME_DLLS, 'nvrtc-builtins64_134.dll'];
 
@@ -291,6 +295,100 @@ describe('Windows SDK tool discovery', () => {
   });
 });
 
+describe('MSIX visual asset size validation', () => {
+  let root: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mlx-windows-msix-assets-'));
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  function writeFixture(relativePath: string, contents: string | Buffer): void {
+    const fullPath = join(root, relativePath);
+    mkdirSync(dirname(fullPath), { recursive: true });
+    writeFileSync(fullPath, contents);
+  }
+
+  it('rejects any MSIX PNG asset >= MAX_MSIX_ASSET_BYTES (204,800 bytes) with filename and byte size', () => {
+    expect(MAX_MSIX_ASSET_BYTES).toBe(204_800);
+
+    const appDir = join(root, 'mlx-node-win32-arm64');
+    const assetsDir = join(root, 'msix-assets');
+    const msixPath = join(root, 'out', 'mlx-node-0.0.21-win32-arm64.msix');
+
+    writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
+    for (const asset of REQUIRED_MSIX_ASSETS) {
+      writeFixture(`msix-assets/${asset}`, TINY_PNG);
+    }
+
+    // Exact boundary: 204,800 bytes is rejected by WACK test 2.1.
+    writeFixture('msix-assets/Square310x310Logo.scale-200.png', Buffer.alloc(MAX_MSIX_ASSET_BYTES, 1));
+    expect(() =>
+      buildWindowsMsix({
+        appPath: appDir,
+        msixPath,
+        version: '0.0.21',
+        assetsDir,
+      }),
+    ).toThrow(PayloadError);
+    expect(() =>
+      buildWindowsMsix({
+        appPath: appDir,
+        msixPath,
+        version: '0.0.21',
+        assetsDir,
+      }),
+    ).toThrow(/Square310x310Logo\.scale-200\.png \(204800 bytes\)/);
+
+    // Non-required scale PNG over the limit is also caught before staging.
+    writeFixture('msix-assets/Square310x310Logo.scale-200.png', TINY_PNG);
+    writeFixture('msix-assets/Square150x150Logo.scale-400.png', Buffer.alloc(MAX_MSIX_ASSET_BYTES + 123, 1));
+    expect(() =>
+      buildWindowsMsix({
+        appPath: appDir,
+        msixPath,
+        version: '0.0.21',
+        assetsDir,
+      }),
+    ).toThrow(/Square150x150Logo\.scale-400\.png \(204923 bytes\)/);
+
+    // Empty extra PNG in assetsDir is also rejected.
+    writeFixture('msix-assets/Square150x150Logo.scale-400.png', Buffer.alloc(0));
+    expect(() =>
+      buildWindowsMsix({
+        appPath: appDir,
+        msixPath,
+        version: '0.0.21',
+        assetsDir,
+      }),
+    ).toThrow(/Square150x150Logo\.scale-400\.png \(0 bytes\)/);
+  });
+
+  it('ensures every committed PNG in packages/desktop/build/msix/ is non-empty and strictly < 204,800 bytes', () => {
+    expect(existsSync(COMMITTED_MSIX_ASSETS_DIR)).toBe(true);
+    const pngFiles = readdirSync(COMMITTED_MSIX_ASSETS_DIR, { withFileTypes: true })
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.png'))
+      .map((entry) => entry.name)
+      .sort((a, b) => a.localeCompare(b));
+
+    expect(pngFiles.length).toBeGreaterThanOrEqual(REQUIRED_MSIX_ASSETS.length);
+    for (const required of REQUIRED_MSIX_ASSETS) {
+      expect(pngFiles).toContain(required);
+    }
+
+    for (const file of pngFiles) {
+      const { size } = statSync(join(COMMITTED_MSIX_ASSETS_DIR, file));
+      expect(size, `${file} must be non-empty`).toBeGreaterThan(0);
+      expect(size, `${file} (${size} bytes) must be strictly under ${MAX_MSIX_ASSET_BYTES} bytes`).toBeLessThan(
+        MAX_MSIX_ASSET_BYTES,
+      );
+    }
+  });
+});
+
 describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK', () => {
   let root: string;
 
@@ -355,5 +453,37 @@ describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK
         runtimeFiles,
       }),
     ).toThrow(/Identity\/@Version/);
+  });
+
+  it('builds and verifies a real MSIX against the actual committed packages/desktop/build/msix/ assets', () => {
+    const appDir = join(root, 'mlx-node-win32-arm64');
+    const outDir = join(root, 'out');
+    const msixPath = join(outDir, 'mlx-node-0.0.21-win32-arm64-real-assets.msix');
+
+    writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
+    writeFixture('mlx-node-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
+    writeFixture('mlx-node-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
+    writeFixture('mlx-node-win32-arm64/resources/www/index.html', '<!doctype html>');
+    for (const file of runtimeFiles) {
+      writeFixture(`mlx-node-win32-arm64/resources/native/${file}`, file);
+    }
+
+    const built = buildWindowsMsix({
+      appPath: appDir,
+      msixPath,
+      version: '0.0.21',
+      assetsDir: COMMITTED_MSIX_ASSETS_DIR,
+    });
+
+    expect(built.msixPath).toBe(msixPath);
+    expect(existsSync(msixPath)).toBe(true);
+
+    const manifest = verifyWindowsMsix({
+      msixPath,
+      expectedVersion: '0.0.21',
+      runtimeFiles,
+    });
+    expect(manifest.version).toBe('1.0.21.0');
+    expect(manifest.identityName).toBe(DEFAULT_MSIX_IDENTITY.identityName);
   });
 });

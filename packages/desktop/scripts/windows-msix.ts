@@ -34,6 +34,12 @@ export const DEFAULT_MSIX_IDENTITY: Readonly<MsixIdentity> = {
 };
 
 /**
+ * Microsoft Store Windows App Certification Kit (WACK) Desktop Bridge test 2.1
+ * rejects any manifest visual asset that is 204,800 bytes (200 KiB) or larger.
+ */
+export const MAX_MSIX_ASSET_BYTES = 204_800;
+
+/**
  * Minimum MSIX visual assets expected in `packages/desktop/build/msix/`:
  * every base file referenced by `AppxManifest.xml` plus key scale and unplated
  * taskbar variants indexed into `resources.pri`.
@@ -48,6 +54,8 @@ export const REQUIRED_MSIX_ASSETS = [
   'Square44x44Logo.targetsize-24.png',
   'Square44x44Logo.targetsize-24_altform-unplated.png',
   'Square44x44Logo.targetsize-48_altform-unplated.png',
+  'Square44x44Logo.targetsize-24_altform-lightunplated.png',
+  'Square44x44Logo.targetsize-48_altform-lightunplated.png',
   'Square71x71Logo.png',
   'Square71x71Logo.scale-100.png',
   'Square71x71Logo.scale-200.png',
@@ -469,6 +477,43 @@ function runWindowsSdkTool(toolPath: string, toolLabel: string, args: readonly s
   }
 }
 
+function assertValidMsixPngAssets(dir: string, files: readonly string[]): void {
+  const present = new Set(files);
+  const missingAssets = REQUIRED_MSIX_ASSETS.filter((file) => !present.has(file));
+  if (missingAssets.length > 0) {
+    throw new PayloadError(
+      `Missing required regular-file MSIX visual assets in ${dir}: ${missingAssets.join(', ')}`,
+      'yarn workspace @mlx-node/desktop icons',
+    );
+  }
+  const pngAssetSizes = files.map((file) => ({
+    file,
+    size: statSync(join(dir, file)).size,
+  }));
+  const emptyPngAssets = pngAssetSizes.filter(({ size }) => size === 0);
+  if (emptyPngAssets.length > 0) {
+    throw new PayloadError(
+      `Empty MSIX visual assets in ${dir}: ${emptyPngAssets.map(({ file }) => `${file} (0 bytes)`).join(', ')}`,
+      'yarn workspace @mlx-node/desktop icons',
+    );
+  }
+  const oversizedPngAssets = pngAssetSizes.filter(({ size }) => size >= MAX_MSIX_ASSET_BYTES);
+  if (oversizedPngAssets.length > 0) {
+    const details = oversizedPngAssets.map(({ file, size }) => `${file} (${size} bytes)`).join(', ');
+    throw new PayloadError(
+      `MSIX visual assets in ${dir} must be strictly under ${MAX_MSIX_ASSET_BYTES} bytes (Microsoft Store WACK limit): ${details}`,
+      'yarn workspace @mlx-node/desktop icons',
+    );
+  }
+}
+
+function listRegularPngFiles(dir: string): string[] {
+  return readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.png'))
+    .map((entry) => entry.name)
+    .sort((a, b) => a.localeCompare(b));
+}
+
 /** Build an unsigned Windows ARM64 `.msix` using `MakePri.exe` and `MakeAppx.exe`. */
 export function buildWindowsMsix(options: BuildWindowsMsixOptions): BuildWindowsMsixResult {
   const env = options.env ?? process.env;
@@ -481,16 +526,8 @@ export function buildWindowsMsix(options: BuildWindowsMsixOptions): BuildWindows
       'yarn workspace @mlx-node/desktop icons',
     );
   }
-  const missingAssets = REQUIRED_MSIX_ASSETS.filter((file) => {
-    const path = join(options.assetsDir, file);
-    return !isExistingFile(path) || statSync(path).size === 0;
-  });
-  if (missingAssets.length > 0) {
-    throw new PayloadError(
-      `Missing or empty MSIX visual assets in ${options.assetsDir}: ${missingAssets.join(', ')}`,
-      'yarn workspace @mlx-node/desktop icons',
-    );
-  }
+  const pngAssets = listRegularPngFiles(options.assetsDir);
+  assertValidMsixPngAssets(options.assetsDir, pngAssets);
 
   if (!isExistingFile(join(options.appPath, 'mlx-node.exe'))) {
     throw new PayloadError(
@@ -514,13 +551,12 @@ export function buildWindowsMsix(options: BuildWindowsMsixOptions): BuildWindows
     const stagedAssets = join(priRoot, 'Assets');
     mkdirSync(stagedAssets, { recursive: true });
 
-    const pngAssets = readdirSync(options.assetsDir, { withFileTypes: true })
-      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.png'))
-      .map((entry) => entry.name)
-      .sort((a, b) => a.localeCompare(b));
     for (const asset of pngAssets) {
       cpSync(join(options.assetsDir, asset), join(stagedAssets, asset));
     }
+    // Re-verify the exact staged regular-file copies consumed by MakePri and MakeAppx.
+    const stagedPngAssets = listRegularPngFiles(stagedAssets);
+    assertValidMsixPngAssets(stagedAssets, stagedPngAssets);
 
     const manifestPath = join(stageRoot, 'AppxManifest.xml');
     writeFileSync(manifestPath, renderAppxManifest({ version: options.version, identity }), 'utf8');
@@ -565,7 +601,7 @@ export function buildWindowsMsix(options: BuildWindowsMsixOptions): BuildWindows
     const mappingEntries: MakeAppxMappingEntry[] = [
       { source: manifestPath, target: 'AppxManifest.xml' },
       { source: priPath, target: 'resources.pri' },
-      ...pngAssets.map((asset) => ({
+      ...stagedPngAssets.map((asset) => ({
         source: join(stagedAssets, asset),
         target: `Assets\\${asset}`,
       })),

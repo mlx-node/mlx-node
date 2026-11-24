@@ -1,16 +1,22 @@
 /**
- * Generate the macOS, Windows, and Microsoft Store MSIX app icons from the mlx-node logo.
+ * Generate the macOS, Windows, and Microsoft Store MSIX app icons.
  *
- * `images/logo.png` is the canonical MLX wordmark plus green node used by the
- * mlx-node GitHub organization. The app icon presents that mark directly on a
- * white rounded tile. At 16px..32px it uses the logo's compact X + node
- * portion as an optical variant, because shrinking the 3.7:1 wordmark that far
- * makes every letter unreadable.
+ * macOS assets use `images/logo.png` (canonical MLX wordmark plus green node)
+ * on a white rounded tile, with the compact X + node optical variant at
+ * 16px..32px, and `tray-icon-source.png` thresholded into a pure black-and-alpha
+ * menu-bar template (`iconTemplate.png` / `iconTemplate@2x.png`).
  *
- * The menu-bar asset uses a dedicated hex-M mark generated for this app:
- * `tray-icon-source.png` is thresholded and resized into a pure black-and-alpha
- * template. macOS recolours that silhouette for light, dark and highlighted
- * states.
+ * Windows and Microsoft Store MSIX assets use `portato-logo-source.png`
+ * (canonical 1024x1024 Portato mascot + wordmark):
+ * - Square icons (`icon.ico` and square MSIX tiles) place the extracted Portato
+ *   mascot emblem on a warm `#F1F2EC` rounded-square tile with transparent outer
+ *   corners and a subtle dark keyline (`rgba(22, 25, 24, 0.22)`) so the icon
+ *   reads cleanly on both dark (`#202020`) and light (`#F3F3F3`) Windows taskbars.
+ * - Wide tiles and splash screens (`Wide310x150Logo*`, `SplashScreen*`) render a
+ *   rounded `#F1F2EC` card with a centered horizontal lockup of the mascot emblem
+ *   and the `portato` wordmark.
+ * - MSIX PNGs are kept strictly below Microsoft Store WACK's 204,800-byte limit
+ *   (quantizing oversized truecolor assets to 8-bit indexed PNG with `PLTE` + `tRNS`).
  *
  *     icon.iconset/ -> icon.icns      macOS app icon, 10 images, 16..1024 with @2x (darwin only)
  *     icon.ico                        Windows multi-resolution PNG-in-ICO, 16..256
@@ -27,12 +33,23 @@ import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { dirname, join, relative, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { CompressionType, FilterType, ResizeFilterType, ResizeFit, Transformer } from '@napi-rs/image';
+import {
+  CompressionType,
+  FilterType,
+  losslessCompressPngSync,
+  pngQuantizeSync,
+  ResizeFilterType,
+  ResizeFit,
+  Transformer,
+} from '@napi-rs/image';
+
+import { MAX_MSIX_ASSET_BYTES } from '../scripts/windows-msix.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
 const LOGO_PATH = join(REPO_ROOT, 'images', 'logo.png');
 const TRAY_SOURCE_PATH = join(HERE, 'tray-icon-source.png');
+const PORTATO_SOURCE_PATH = join(HERE, 'portato-logo-source.png');
 
 const CANVAS = 1024;
 const SQUIRCLE = 824;
@@ -42,6 +59,7 @@ const APP_SS = 4;
 const TRAY_SS = 8;
 
 type Bounds = readonly [left: number, top: number, right: number, bottom: number];
+type Rgb = readonly [red: number, green: number, blue: number];
 
 interface RgbaImage {
   width: number;
@@ -49,9 +67,13 @@ interface RgbaImage {
   pixels: Uint8Array;
 }
 
-// Bounds measured from the canonical 1024px logo.
+// Bounds measured from the canonical 1024px logos.
 const WORDMARK_BOUNDS: Bounds = [98, 404, 926, 630];
 const COMPACT_BOUNDS: Bounds = [552, 404, 926, 630];
+const PORTATO_EMBLEM_REGION: Bounds = [205, 160, 843, 775];
+const PORTATO_WORDMARK_REGION: Bounds = [0, 795, CANVAS, CANVAS];
+const PORTATO_BG_TOLERANCE = 26;
+const PORTATO_FALLBACK_INK: Rgb = [9, 12, 32];
 
 const PNG_OPTIONS = {
   compressionType: CompressionType.Best,
@@ -92,8 +114,17 @@ function decodeLogo(): RgbaImage {
   return logo;
 }
 
+function decodePortatoSource(): RgbaImage {
+  const logo = decodeOpaqueImage(PORTATO_SOURCE_PATH);
+  if (logo.width !== CANVAS || logo.height !== CANVAS) {
+    throw new Error(`${PORTATO_SOURCE_PATH} must be ${CANVAS}x${CANVAS}, got ${logo.width}x${logo.height}`);
+  }
+  return logo;
+}
+
 const SOURCE_LOGO = decodeLogo();
 const TRAY_SOURCE = decodeOpaqueImage(TRAY_SOURCE_PATH);
+const PORTATO_SOURCE = decodePortatoSource();
 
 function cropImage(image: RgbaImage, bounds: Bounds): RgbaImage {
   const [left, top, right, bottom] = bounds;
@@ -271,7 +302,7 @@ function foregroundMask(image: RgbaImage, threshold: number): RgbaImage {
   return result;
 }
 
-function alphaBounds(image: RgbaImage): Bounds {
+function alphaBounds(image: RgbaImage, label = 'Tray source'): Bounds {
   let left = image.width;
   let top = image.height;
   let right = -1;
@@ -287,7 +318,7 @@ function alphaBounds(image: RgbaImage): Bounds {
     }
   }
 
-  if (right < left || bottom < top) throw new Error('Tray source does not contain a foreground mark');
+  if (right < left || bottom < top) throw new Error(`${label} does not contain a foreground mark`);
   return [left, top, right + 1, bottom + 1];
 }
 
@@ -337,7 +368,7 @@ interface MsixAssetSpec {
   name: string;
   width: number;
   height: number;
-  kind: 'square' | 'wide';
+  kind: 'square' | 'light-unplated' | 'wide';
 }
 
 const MSIX_ASSETS: readonly MsixAssetSpec[] = [
@@ -364,12 +395,19 @@ const MSIX_ASSETS: readonly MsixAssetSpec[] = [
   { name: 'Square44x44Logo.targetsize-48.png', width: 48, height: 48, kind: 'square' },
   { name: 'Square44x44Logo.targetsize-256.png', width: 256, height: 256, kind: 'square' },
 
-  // Square44x44Logo (targetsize altform-unplated variants)
+  // Square44x44Logo (targetsize altform-unplated variants — dark/default taskbar)
   { name: 'Square44x44Logo.targetsize-16_altform-unplated.png', width: 16, height: 16, kind: 'square' },
   { name: 'Square44x44Logo.targetsize-24_altform-unplated.png', width: 24, height: 24, kind: 'square' },
   { name: 'Square44x44Logo.targetsize-32_altform-unplated.png', width: 32, height: 32, kind: 'square' },
   { name: 'Square44x44Logo.targetsize-48_altform-unplated.png', width: 48, height: 48, kind: 'square' },
   { name: 'Square44x44Logo.targetsize-256_altform-unplated.png', width: 256, height: 256, kind: 'square' },
+
+  // Square44x44Logo (targetsize altform-lightunplated variants — light taskbar)
+  { name: 'Square44x44Logo.targetsize-16_altform-lightunplated.png', width: 16, height: 16, kind: 'light-unplated' },
+  { name: 'Square44x44Logo.targetsize-24_altform-lightunplated.png', width: 24, height: 24, kind: 'light-unplated' },
+  { name: 'Square44x44Logo.targetsize-32_altform-lightunplated.png', width: 32, height: 32, kind: 'light-unplated' },
+  { name: 'Square44x44Logo.targetsize-48_altform-lightunplated.png', width: 48, height: 48, kind: 'light-unplated' },
+  { name: 'Square44x44Logo.targetsize-256_altform-lightunplated.png', width: 256, height: 256, kind: 'light-unplated' },
 
   // Square71x71Logo
   { name: 'Square71x71Logo.png', width: 71, height: 71, kind: 'square' },
@@ -408,7 +446,376 @@ const MSIX_ASSETS: readonly MsixAssetSpec[] = [
 
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 
-function drawWideTile(width: number, height: number): RgbaImage {
+function clampByte(value: number): number {
+  return Math.max(0, Math.min(255, Math.round(value)));
+}
+
+function sampleCornerBackground(image: RgbaImage): Rgb {
+  const corners: readonly (readonly [number, number])[] = [
+    [0, 0],
+    [image.width - 1, 0],
+    [0, image.height - 1],
+    [image.width - 1, image.height - 1],
+  ];
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  for (const [x, y] of corners) {
+    const offset = (y * image.width + x) * 4;
+    sumR += image.pixels[offset];
+    sumG += image.pixels[offset + 1];
+    sumB += image.pixels[offset + 2];
+  }
+  return [Math.round(sumR / 4), Math.round(sumG / 4), Math.round(sumB / 4)];
+}
+
+function maxChannelDiff(pixels: Uint8Array, offset: number, bg: Rgb): number {
+  return Math.max(
+    Math.abs(pixels[offset] - bg[0]),
+    Math.abs(pixels[offset + 1] - bg[1]),
+    Math.abs(pixels[offset + 2] - bg[2]),
+  );
+}
+
+/**
+ * Extract the Portato mascot emblem onto a transparent canvas.
+ *
+ * Uses an exterior-only 4-connected flood-fill starting from the crop borders
+ * so interior white/cream artwork (snout, chest stripe, eyes, eyebrows) stays
+ * 100% opaque, then computes anti-aliased alpha and color unmixing against the
+ * background color on the 1-2px boundary band adjacent to the exterior so no
+ * light halo appears on dark Windows taskbars.
+ */
+function extractPortatoEmblem(source: RgbaImage, bg: Rgb): RgbaImage {
+  const crop = cropImage(source, PORTATO_EMBLEM_REGION);
+  const { width, height, pixels } = crop;
+  const totalPixels = width * height;
+  const bgMask = new Uint8Array(totalPixels);
+  const queue = new Int32Array(totalPixels);
+  let tail = 0;
+
+  const enqueueBg = (x: number, y: number): void => {
+    const index = y * width + x;
+    if (bgMask[index] !== 0) return;
+    if (maxChannelDiff(pixels, index * 4, bg) <= PORTATO_BG_TOLERANCE) {
+      bgMask[index] = 1;
+      queue[tail] = index;
+      tail += 1;
+    }
+  };
+
+  for (let x = 0; x < width; x += 1) {
+    enqueueBg(x, 0);
+    enqueueBg(x, height - 1);
+  }
+  for (let y = 0; y < height; y += 1) {
+    enqueueBg(0, y);
+    enqueueBg(width - 1, y);
+  }
+
+  for (let head = 0; head < tail; head += 1) {
+    const index = queue[head];
+    const x = index % width;
+    const y = (index - x) / width;
+    if (x > 0) enqueueBg(x - 1, y);
+    if (x + 1 < width) enqueueBg(x + 1, y);
+    if (y > 0) enqueueBg(x, y - 1);
+    if (y + 1 < height) enqueueBg(x, y + 1);
+  }
+
+  // BFS Manhattan distance from the flood-filled exterior up to 3px inward.
+  const distance = new Uint8Array(totalPixels).fill(255);
+  const distQueue = new Int32Array(totalPixels);
+  let distTail = 0;
+  for (let index = 0; index < totalPixels; index += 1) {
+    if (bgMask[index] !== 0) {
+      distance[index] = 0;
+      distQueue[distTail] = index;
+      distTail += 1;
+    }
+  }
+
+  const enqueueDist = (x: number, y: number, nextDist: number): void => {
+    const index = y * width + x;
+    if (distance[index] <= nextDist) return;
+    distance[index] = nextDist;
+    distQueue[distTail] = index;
+    distTail += 1;
+  };
+
+  for (let head = 0; head < distTail; head += 1) {
+    const index = distQueue[head];
+    const currentDist = distance[index];
+    if (currentDist >= 3) continue;
+    const x = index % width;
+    const y = (index - x) / width;
+    const nextDist = currentDist + 1;
+    if (x > 0) enqueueDist(x - 1, y, nextDist);
+    if (x + 1 < width) enqueueDist(x + 1, y, nextDist);
+    if (y > 0) enqueueDist(x, y - 1, nextDist);
+    if (y + 1 < height) enqueueDist(x, y + 1, nextDist);
+  }
+
+  const original = new Uint8Array(pixels);
+  for (let index = 0; index < totalPixels; index += 1) {
+    if (bgMask[index] !== 0) {
+      const offset = index * 4;
+      pixels[offset] = 0;
+      pixels[offset + 1] = 0;
+      pixels[offset + 2] = 0;
+      pixels[offset + 3] = 0;
+    }
+  }
+
+  const sampleInteriorColor = (cx: number, cy: number, radius: number): Rgb | null => {
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let count = 0;
+    const minY = Math.max(0, cy - radius);
+    const maxY = Math.min(height - 1, cy + radius);
+    const minX = Math.max(0, cx - radius);
+    const maxX = Math.min(width - 1, cx + radius);
+    for (let y = minY; y <= maxY; y += 1) {
+      for (let x = minX; x <= maxX; x += 1) {
+        const index = y * width + x;
+        if (distance[index] < 3 || bgMask[index] !== 0) continue;
+        const offset = index * 4;
+        sumR += original[offset];
+        sumG += original[offset + 1];
+        sumB += original[offset + 2];
+        count += 1;
+      }
+    }
+    if (count === 0) return null;
+    return [sumR / count, sumG / count, sumB / count];
+  };
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (distance[index] !== 1 && distance[index] !== 2) continue;
+
+      const interior = sampleInteriorColor(x, y, 3) ?? sampleInteriorColor(x, y, 5);
+      if (interior === null) continue;
+
+      const dr = interior[0] - bg[0];
+      const dg = interior[1] - bg[1];
+      const db = interior[2] - bg[2];
+      const denom = dr * dr + dg * dg + db * db;
+      if (denom < 400) continue;
+
+      const offset = index * 4;
+      const cr = original[offset];
+      const cg = original[offset + 1];
+      const cb = original[offset + 2];
+      const alpha = Math.max(0, Math.min(1, ((cr - bg[0]) * dr + (cg - bg[1]) * dg + (cb - bg[2]) * db) / denom));
+
+      if (alpha < 0.05) {
+        pixels[offset] = 0;
+        pixels[offset + 1] = 0;
+        pixels[offset + 2] = 0;
+        pixels[offset + 3] = 0;
+      } else if (alpha < 0.98) {
+        const unmixedR = clampByte((cr - bg[0] * (1 - alpha)) / alpha);
+        const unmixedG = clampByte((cg - bg[1] * (1 - alpha)) / alpha);
+        const unmixedB = clampByte((cb - bg[2] * (1 - alpha)) / alpha);
+        // Stabilize very low-alpha pixels against JPEG noise amplification.
+        const weight = Math.min(1, alpha / 0.4);
+        pixels[offset] = clampByte(interior[0] * (1 - weight) + unmixedR * weight);
+        pixels[offset + 1] = clampByte(interior[1] * (1 - weight) + unmixedG * weight);
+        pixels[offset + 2] = clampByte(interior[2] * (1 - weight) + unmixedB * weight);
+        pixels[offset + 3] = clampByte(alpha * 255);
+      }
+    }
+  }
+
+  return cropImage(crop, alphaBounds(crop, 'Portato emblem'));
+}
+
+/**
+ * Extract the lower `portato` wordmark with crisp anti-aliased alpha and
+ * dark-navy ink color unmixing against the sampled canvas background.
+ */
+function extractPortatoWordmark(source: RgbaImage, bg: Rgb): RgbaImage {
+  const crop = cropImage(source, PORTATO_WORDMARK_REGION);
+  const { width, height, pixels } = crop;
+
+  let inkSumR = 0;
+  let inkSumG = 0;
+  let inkSumB = 0;
+  let inkCount = 0;
+  for (let offset = 0; offset < pixels.length; offset += 4) {
+    const r = pixels[offset];
+    const g = pixels[offset + 1];
+    const b = pixels[offset + 2];
+    if (r < 30 && g < 30 && b < 45) {
+      inkSumR += r;
+      inkSumG += g;
+      inkSumB += b;
+      inkCount += 1;
+    }
+  }
+  const ink: Rgb = inkCount > 0 ? [inkSumR / inkCount, inkSumG / inkCount, inkSumB / inkCount] : PORTATO_FALLBACK_INK;
+
+  const dr = ink[0] - bg[0];
+  const dg = ink[1] - bg[1];
+  const db = ink[2] - bg[2];
+  const denom = dr * dr + dg * dg + db * db;
+
+  const result = blankImage(width, height);
+  for (let offset = 0; offset < pixels.length; offset += 4) {
+    const cr = pixels[offset];
+    const cg = pixels[offset + 1];
+    const cb = pixels[offset + 2];
+    const rawAlpha = ((cr - bg[0]) * dr + (cg - bg[1]) * dg + (cb - bg[2]) * db) / denom;
+    const alpha = Math.max(0, Math.min(1, (rawAlpha - 0.08) / (0.94 - 0.08)));
+    if (alpha <= 0) continue;
+
+    const unmixedR = clampByte((cr - bg[0] * (1 - alpha)) / alpha);
+    const unmixedG = clampByte((cg - bg[1] * (1 - alpha)) / alpha);
+    const unmixedB = clampByte((cb - bg[2] * (1 - alpha)) / alpha);
+    const weight = Math.min(1, alpha / 0.5);
+    result.pixels[offset] = clampByte(ink[0] * (1 - weight) + unmixedR * weight);
+    result.pixels[offset + 1] = clampByte(ink[1] * (1 - weight) + unmixedG * weight);
+    result.pixels[offset + 2] = clampByte(ink[2] * (1 - weight) + unmixedB * weight);
+    result.pixels[offset + 3] = clampByte(alpha * 255);
+  }
+
+  return cropImage(result, alphaBounds(result, 'Portato wordmark'));
+}
+
+const PORTATO_BG = sampleCornerBackground(PORTATO_SOURCE);
+const PORTATO_EMBLEM = extractPortatoEmblem(PORTATO_SOURCE, PORTATO_BG);
+const PORTATO_WORDMARK = extractPortatoWordmark(PORTATO_SOURCE, PORTATO_BG);
+
+const WINDOWS_TILE_KEYLINE_RGB: Rgb = [22, 25, 24];
+const WINDOWS_TILE_KEYLINE_ALPHA = 0.22;
+const WINDOWS_TILE_RADIUS_RATIO = 0.225;
+const WINDOWS_TILE_SAMPLES = 8;
+
+function drawWindowsTile(size: number, fill: Rgb): RgbaImage {
+  const image = blankImage(size, size);
+  const radius = size * WINDOWS_TILE_RADIUS_RATIO;
+  const keylineWidth = Math.max(1, (size * 4) / CANVAS);
+  const innerRadius = Math.max(0, radius - keylineWidth);
+  const borderR = Math.round(
+    WINDOWS_TILE_KEYLINE_RGB[0] * WINDOWS_TILE_KEYLINE_ALPHA + fill[0] * (1 - WINDOWS_TILE_KEYLINE_ALPHA),
+  );
+  const borderG = Math.round(
+    WINDOWS_TILE_KEYLINE_RGB[1] * WINDOWS_TILE_KEYLINE_ALPHA + fill[1] * (1 - WINDOWS_TILE_KEYLINE_ALPHA),
+  );
+  const borderB = Math.round(
+    WINDOWS_TILE_KEYLINE_RGB[2] * WINDOWS_TILE_KEYLINE_ALPHA + fill[2] * (1 - WINDOWS_TILE_KEYLINE_ALPHA),
+  );
+
+  const samples = WINDOWS_TILE_SAMPLES;
+  const totalSamples = samples * samples;
+  const safeEdge = Math.ceil(keylineWidth);
+  const safeCorner = Math.ceil(radius);
+
+  for (let y = 0; y < size; y += 1) {
+    const inSafeY = y >= safeEdge && y + 1 <= size - safeEdge;
+    const inMidY = y >= safeCorner && y + 1 <= size - safeCorner;
+    for (let x = 0; x < size; x += 1) {
+      const offset = (y * size + x) * 4;
+      const inSafeX = x >= safeEdge && x + 1 <= size - safeEdge;
+      const inMidX = x >= safeCorner && x + 1 <= size - safeCorner;
+
+      if ((inSafeX && inMidY) || (inMidX && inSafeY)) {
+        image.pixels[offset] = fill[0];
+        image.pixels[offset + 1] = fill[1];
+        image.pixels[offset + 2] = fill[2];
+        image.pixels[offset + 3] = 255;
+        continue;
+      }
+
+      let sumR = 0;
+      let sumG = 0;
+      let sumB = 0;
+      let covered = 0;
+      for (let sy = 0; sy < samples; sy += 1) {
+        const py = y + (sy + 0.5) / samples;
+        for (let sx = 0; sx < samples; sx += 1) {
+          const px = x + (sx + 0.5) / samples;
+          if (!roundedRectContains(px, py, 0, 0, size, size, radius)) continue;
+          covered += 1;
+          if (
+            roundedRectContains(
+              px,
+              py,
+              keylineWidth,
+              keylineWidth,
+              size - keylineWidth,
+              size - keylineWidth,
+              innerRadius,
+            )
+          ) {
+            sumR += fill[0];
+            sumG += fill[1];
+            sumB += fill[2];
+          } else {
+            sumR += borderR;
+            sumG += borderG;
+            sumB += borderB;
+          }
+        }
+      }
+      if (covered === 0) continue;
+      image.pixels[offset] = Math.round(sumR / covered);
+      image.pixels[offset + 1] = Math.round(sumG / covered);
+      image.pixels[offset + 2] = Math.round(sumB / covered);
+      image.pixels[offset + 3] = Math.round((covered / totalSamples) * 255);
+    }
+  }
+
+  return image;
+}
+
+function windowsAppIcon(size: number): RgbaImage {
+  const image = drawWindowsTile(size, PORTATO_BG);
+  const fillRatio = size <= 24 ? 0.9 : 0.86;
+  const targetBox = Math.max(1, Math.round(size * fillRatio));
+  const scale = Math.min(targetBox / PORTATO_EMBLEM.width, targetBox / PORTATO_EMBLEM.height);
+  const targetWidth = Math.max(1, Math.round(PORTATO_EMBLEM.width * scale));
+  const targetHeight = Math.max(1, Math.round(PORTATO_EMBLEM.height * scale));
+  const resizedMark = resizeImage(PORTATO_EMBLEM, targetWidth, targetHeight);
+  compositeAt(image, resizedMark, Math.round((size - targetWidth) / 2), Math.round((size - targetHeight) / 2));
+
+  const cornerOffsets = [3, (size - 1) * 4 + 3, (size - 1) * size * 4 + 3, (size * size - 1) * 4 + 3];
+  for (const alphaOffset of cornerOffsets) {
+    if (image.pixels[alphaOffset] !== 0) {
+      throw new Error(`windowsAppIcon(${size}) outer corner must remain transparent`);
+    }
+  }
+  return image;
+}
+
+/**
+ * Light-theme taskbar unplated icon: renders the dark-navy Portato mascot
+ * directly on a transparent canvas so it achieves strong silhouette contrast
+ * against Windows 11's light taskbar (#F3F3F3) without a cream backplate.
+ */
+function windowsLightUnplatedIcon(size: number): RgbaImage {
+  const image = blankImage(size, size);
+  const fillRatio = size <= 24 ? 0.94 : 0.9;
+  const targetBox = Math.max(1, Math.round(size * fillRatio));
+  const scale = Math.min(targetBox / PORTATO_EMBLEM.width, targetBox / PORTATO_EMBLEM.height);
+  const targetWidth = Math.max(1, Math.round(PORTATO_EMBLEM.width * scale));
+  const targetHeight = Math.max(1, Math.round(PORTATO_EMBLEM.height * scale));
+  const resizedMark = resizeImage(PORTATO_EMBLEM, targetWidth, targetHeight);
+  compositeAt(image, resizedMark, Math.round((size - targetWidth) / 2), Math.round((size - targetHeight) / 2));
+
+  const cornerOffsets = [3, (size - 1) * 4 + 3, (size - 1) * size * 4 + 3, (size * size - 1) * 4 + 3];
+  for (const alphaOffset of cornerOffsets) {
+    if (image.pixels[alphaOffset] !== 0) {
+      throw new Error(`windowsLightUnplatedIcon(${size}) outer corner must remain transparent`);
+    }
+  }
+  return image;
+}
+
+function drawWideTile(width: number, height: number, fill: Rgb): RgbaImage {
   const ss = width >= 1000 ? 2 : APP_SS;
   const renderWidth = width * ss;
   const renderHeight = height * ss;
@@ -447,9 +854,9 @@ function drawWideTile(width: number, height: number): RgbaImage {
   for (let pixel = 0; pixel < mask.length; pixel += 1) {
     if (mask[pixel] === 0) continue;
     const offset = pixel * 4;
-    tile.pixels[offset] = 255;
-    tile.pixels[offset + 1] = 255;
-    tile.pixels[offset + 2] = 255;
+    tile.pixels[offset] = fill[0];
+    tile.pixels[offset + 1] = fill[1];
+    tile.pixels[offset + 2] = fill[2];
     tile.pixels[offset + 3] = 255;
   }
 
@@ -476,19 +883,37 @@ function drawWideTile(width: number, height: number): RgbaImage {
   return resizeImage(tile, width, height);
 }
 
-function wideAppTile(width: number, height: number): RgbaImage {
-  const image = drawWideTile(width, height);
-  const mark = cropImage(SOURCE_LOGO, WORDMARK_BOUNDS);
+function widePortatoTile(width: number, height: number): RgbaImage {
+  const image = drawWideTile(width, height, PORTATO_BG);
   const margin = scaled(SQUIRCLE_MARGIN, height);
   const cardWidth = width - margin * 2;
   const cardHeight = height - margin * 2;
-  const maxMarkWidth = Math.round(cardWidth * 0.78);
-  const maxMarkHeight = Math.round(cardHeight * 0.62);
-  const scale = Math.min(maxMarkWidth / mark.width, maxMarkHeight / mark.height);
-  const targetWidth = Math.max(1, Math.round(mark.width * scale));
-  const targetHeight = Math.max(1, Math.round(mark.height * scale));
-  const resizedMark = resizeImage(mark, targetWidth, targetHeight);
-  compositeAt(image, resizedMark, Math.trunc((width - targetWidth) / 2), Math.trunc((height - targetHeight) / 2));
+
+  const baseEmblemHeight = cardHeight * 0.68;
+  const baseEmblemWidth = (PORTATO_EMBLEM.width * baseEmblemHeight) / PORTATO_EMBLEM.height;
+  const baseWordmarkHeight = baseEmblemHeight * 0.5;
+  const baseWordmarkWidth = (PORTATO_WORDMARK.width * baseWordmarkHeight) / PORTATO_WORDMARK.height;
+  const baseGap = baseEmblemHeight * 0.16;
+  const fitScale = Math.min(1, (cardWidth * 0.86) / (baseEmblemWidth + baseGap + baseWordmarkWidth));
+
+  const emblemWidth = Math.max(1, Math.round(baseEmblemWidth * fitScale));
+  const emblemHeight = Math.max(1, Math.round(baseEmblemHeight * fitScale));
+  const wordmarkWidth = Math.max(1, Math.round(baseWordmarkWidth * fitScale));
+  const wordmarkHeight = Math.max(1, Math.round(baseWordmarkHeight * fitScale));
+  const gap = Math.max(1, Math.round(baseGap * fitScale));
+
+  const totalWidth = emblemWidth + gap + wordmarkWidth;
+  const startX = Math.round((width - totalWidth) / 2);
+  const emblemY = Math.round((height - emblemHeight) / 2);
+  const wordmarkY = Math.round((height - wordmarkHeight) / 2);
+
+  compositeAt(image, resizeImage(PORTATO_EMBLEM, emblemWidth, emblemHeight), startX, emblemY);
+  compositeAt(
+    image,
+    resizeImage(PORTATO_WORDMARK, wordmarkWidth, wordmarkHeight),
+    startX + emblemWidth + gap,
+    wordmarkY,
+  );
   return image;
 }
 
@@ -516,23 +941,110 @@ function validateRgbaImage(image: RgbaImage, expectedWidth: number, expectedHeig
   if (!hasForegroundInk) throw new Error(`${label} must contain non-white foreground pixels`);
 }
 
-function validateEncodedPng(png: Buffer, expectedWidth: number, expectedHeight: number, label: string): void {
+interface ValidateEncodedPngOptions {
+  allowIndexed?: boolean;
+  maxBytes?: number;
+}
+
+function validateEncodedPng(
+  png: Buffer,
+  expectedWidth: number,
+  expectedHeight: number,
+  label: string,
+  options: ValidateEncodedPngOptions = {},
+): void {
   if (png.length < 33 || !png.subarray(0, 8).equals(PNG_SIGNATURE)) {
     throw new Error(`${label} is not a valid PNG`);
   }
-  if (png.subarray(12, 16).toString('ascii') !== 'IHDR') {
+  if (options.maxBytes !== undefined && png.length >= options.maxBytes) {
+    throw new Error(`${label} PNG size (${png.length} bytes) must be strictly under ${options.maxBytes} bytes`);
+  }
+  if (png.readUInt32BE(8) !== 13 || png.subarray(12, 16).toString('ascii') !== 'IHDR') {
     throw new Error(`${label} is missing PNG IHDR chunk`);
   }
   const width = png.readUInt32BE(16);
   const height = png.readUInt32BE(20);
+  const bitDepth = png[24];
   const colorType = png[25];
   if (width !== expectedWidth || height !== expectedHeight) {
     throw new Error(`${label} PNG IHDR dimensions ${width}x${height} do not match ${expectedWidth}x${expectedHeight}`);
   }
-  // Color type 6 = truecolor with alpha (RGBA).
-  if (colorType !== 6) {
-    throw new Error(`${label} PNG color type must be RGBA (6), got ${colorType}`);
+
+  let offset = 8;
+  let hasPlte = false;
+  let plteLength = 0;
+  let hasTrns = false;
+  let trnsLength = 0;
+  let hasIdat = false;
+  let hasIend = false;
+  while (offset + 12 <= png.length) {
+    const chunkLength = png.readUInt32BE(offset);
+    const chunkType = png.subarray(offset + 4, offset + 8).toString('ascii');
+    const nextOffset = offset + 12 + chunkLength;
+    if (nextOffset > png.length) {
+      throw new Error(`${label} PNG chunk ${chunkType} exceeds buffer bounds`);
+    }
+    if (chunkType === 'PLTE') {
+      hasPlte = true;
+      plteLength = chunkLength;
+    } else if (chunkType === 'tRNS') {
+      hasTrns = true;
+      trnsLength = chunkLength;
+    } else if (chunkType === 'IDAT') {
+      hasIdat = true;
+    } else if (chunkType === 'IEND') {
+      hasIend = true;
+      offset = nextOffset;
+      break;
+    }
+    offset = nextOffset;
   }
+
+  if (!hasIdat || !hasIend || offset !== png.length) {
+    throw new Error(`${label} PNG has malformed chunk framing`);
+  }
+
+  if (colorType === 6) {
+    if (bitDepth !== 8) {
+      throw new Error(`${label} RGBA PNG bit depth must be 8, got ${bitDepth}`);
+    }
+  } else if (colorType === 3 && options.allowIndexed) {
+    if (bitDepth !== 1 && bitDepth !== 2 && bitDepth !== 4 && bitDepth !== 8) {
+      throw new Error(`${label} indexed PNG has invalid bit depth ${bitDepth}`);
+    }
+    if (!hasPlte || plteLength === 0 || plteLength > 768 || plteLength % 3 !== 0) {
+      throw new Error(`${label} indexed PNG is missing a valid PLTE chunk`);
+    }
+    if (!hasTrns || trnsLength === 0 || trnsLength > plteLength / 3) {
+      throw new Error(`${label} indexed PNG is missing a valid tRNS alpha chunk`);
+    }
+  } else {
+    const expected = options.allowIndexed ? 'RGBA (6) or indexed palette (3)' : 'RGBA (6)';
+    throw new Error(`${label} PNG color type must be ${expected}, got ${colorType}`);
+  }
+}
+
+function optimizeMsixPng(png: Buffer, width: number, height: number, label: string): Buffer {
+  let candidate = png;
+  if (candidate.length >= MAX_MSIX_ASSET_BYTES) {
+    const lossless = losslessCompressPngSync(png, {
+      strip: true,
+      colorTypeReduction: false,
+      grayscaleReduction: false,
+    });
+    if (lossless.length < candidate.length) candidate = lossless;
+  }
+  if (candidate.length >= MAX_MSIX_ASSET_BYTES) {
+    candidate = pngQuantizeSync(png, { colors: 256, minQuality: 70, speed: 1 });
+  }
+  if (candidate.length >= MAX_MSIX_ASSET_BYTES) {
+    candidate = pngQuantizeSync(png, { colors: 128, minQuality: 60, speed: 1 });
+  }
+  validateEncodedPng(candidate, width, height, label, {
+    allowIndexed: true,
+    maxBytes: MAX_MSIX_ASSET_BYTES,
+  });
+  return candidate;
 }
 
 interface IcoEntry {
@@ -633,8 +1145,8 @@ function main(): void {
   const tray2xPng = encodePng(tray2x);
 
   const renderedPngCache = new Map<string, Buffer>();
-  const getSquarePng = (size: number): Buffer => {
-    const key = `square:${size}`;
+  const getMacSquarePng = (size: number): Buffer => {
+    const key = `mac-square:${size}`;
     const cached = renderedPngCache.get(key);
     if (cached !== undefined) return cached;
     const image = appIcon(size);
@@ -644,32 +1156,69 @@ function main(): void {
     renderedPngCache.set(key, png);
     return png;
   };
+  const getWindowsSquarePng = (size: number): Buffer => {
+    const key = `win-square:${size}`;
+    const cached = renderedPngCache.get(key);
+    if (cached !== undefined) return cached;
+    const image = windowsAppIcon(size);
+    validateRgbaImage(image, size, size, `windowsAppIcon(${size})`);
+    const png = encodePng(image);
+    validateEncodedPng(png, size, size, `windowsAppIcon(${size})`);
+    renderedPngCache.set(key, png);
+    return png;
+  };
+  const getWindowsLightUnplatedPng = (size: number): Buffer => {
+    const key = `win-light-unplated:${size}`;
+    const cached = renderedPngCache.get(key);
+    if (cached !== undefined) return cached;
+    const image = windowsLightUnplatedIcon(size);
+    validateRgbaImage(image, size, size, `windowsLightUnplatedIcon(${size})`);
+    const png = encodePng(image);
+    validateEncodedPng(png, size, size, `windowsLightUnplatedIcon(${size})`);
+    renderedPngCache.set(key, png);
+    return png;
+  };
   const getWidePng = (width: number, height: number): Buffer => {
     const key = `wide:${width}x${height}`;
     const cached = renderedPngCache.get(key);
     if (cached !== undefined) return cached;
-    const image = wideAppTile(width, height);
-    validateRgbaImage(image, width, height, `wideAppTile(${width}x${height})`);
+    const image = widePortatoTile(width, height);
+    validateRgbaImage(image, width, height, `widePortatoTile(${width}x${height})`);
     const png = encodePng(image);
-    validateEncodedPng(png, width, height, `wideAppTile(${width}x${height})`);
+    validateEncodedPng(png, width, height, `widePortatoTile(${width}x${height})`);
     renderedPngCache.set(key, png);
     return png;
   };
 
-  const icoEntries: IcoEntry[] = ICO_SIZES.map((size) => ({ size, png: getSquarePng(size) }));
+  const getMsixPng = (spec: MsixAssetSpec): Buffer => {
+    const key = `msix:${spec.kind}:${spec.width}x${spec.height}`;
+    const cached = renderedPngCache.get(key);
+    if (cached !== undefined) return cached;
+    const rawPng =
+      spec.kind === 'square'
+        ? getWindowsSquarePng(spec.width)
+        : spec.kind === 'light-unplated'
+          ? getWindowsLightUnplatedPng(spec.width)
+          : getWidePng(spec.width, spec.height);
+    const png = optimizeMsixPng(rawPng, spec.width, spec.height, spec.name);
+    renderedPngCache.set(key, png);
+    return png;
+  };
+
+  const icoEntries: IcoEntry[] = ICO_SIZES.map((size) => ({ size, png: getWindowsSquarePng(size) }));
   const icoBuffer = encodeIco(icoEntries);
   validateIco(icoBuffer, ICO_SIZES);
 
   const msixOutputs = MSIX_ASSETS.map((spec) => ({
     name: spec.name,
-    png: spec.kind === 'square' ? getSquarePng(spec.width) : getWidePng(spec.width, spec.height),
+    png: getMsixPng(spec),
   }));
 
   const iconsetOutputs =
     process.platform === 'darwin'
       ? [16, 32, 128, 256, 512].flatMap((points) => [
-          { name: `icon_${points}x${points}.png`, png: getSquarePng(points) },
-          { name: `icon_${points}x${points}@2x.png`, png: getSquarePng(points * 2) },
+          { name: `icon_${points}x${points}.png`, png: getMacSquarePng(points) },
+          { name: `icon_${points}x${points}@2x.png`, png: getMacSquarePng(points * 2) },
         ])
       : [];
 
