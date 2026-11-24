@@ -44,12 +44,17 @@ describe('classifyModel', () => {
       'Nemotron-3.5-Lightning-30B-A3B': 'generic',
       'Clairic Flash (9B)': 'cloudflare',
       'Clairic (27B)': 'cloudflare',
+      'CLEF Flash (9B)': 'cloudflare',
+      'CLEF (27B)': 'cloudflare',
     });
   });
 
   it.each([
     ['clairic-flash-gguf', 'cloudflare'],
     ['clef-v1', 'cloudflare'],
+    // The Local models rows of the CLEF builds: the file stem and the folder.
+    ['Clef-Flash-Q8_0', 'cloudflare'],
+    ['clef-gguf-q4_k_m', 'cloudflare'],
     ['gemma-4-26b-a4b-it-gguf', 'gemma'],
     ['LFM2.5-1.2B', 'liquid'],
     ['ornith-7b', 'ornith'],

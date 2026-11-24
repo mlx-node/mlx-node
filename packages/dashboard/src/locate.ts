@@ -246,10 +246,14 @@ export function isCommitSha(text: string): boolean {
   return true;
 }
 
-/** The record describes a complete install: it lists a config and a weight, and every file it lists is in `dir`. */
-export async function recordInstalled(dir: string, record: DownloadCompletion): Promise<boolean> {
+/**
+ * The record describes a complete install: it lists a weight and a `config.json` (no `config.json` when `configless`:
+ * the build installs with none), and every file it lists is in `dir`.
+ */
+export async function recordInstalled(dir: string, record: DownloadCompletion, configless: boolean): Promise<boolean> {
   if (record.scope === 'partial') return false;
-  if (!record.files.includes('config.json') || !record.files.some(isWeightFile)) return false;
+  if (!record.files.some(isWeightFile)) return false;
+  if (configless ? record.files.includes('config.json') : !record.files.includes('config.json')) return false;
   for (const file of record.files) {
     if ((await foundAt(join(dir, ...file.split('/')))) === null) return false;
   }

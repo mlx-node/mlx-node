@@ -97,6 +97,7 @@ describe('a GGUF model that Chat loads with no config.json', () => {
         localAssetsRevision: null,
         listed: true,
       });
+      expect(catalogActionState(buildItem(layout.slug), { job: undefined, updateAvailable: false })).toBe('installed');
     });
 
     it('lists in Local models with its family from the header and its build from the file name', () => {
@@ -254,6 +255,24 @@ describe('a GGUF with no config.json that is not the model of its catalog folder
     });
     expect(catalogActionState(item, { job: undefined, updateAvailable: false })).toBe('adopt');
     expect(heldByOtherBuild(modelsDir, slug)).toBeNull();
+  });
+
+  it('a full app record with no config.json of a GGUF of another family is not installed on the card', () => {
+    const dir = join(modelsDir, HY4.slug);
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'DeepSeek-V4.1-Flash-Q4_K_M.gguf'), ggufHeader('deepseek41'));
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({
+        repo: 'AngelSlim/Hy4-flash-GGUF',
+        revision: '6'.repeat(40),
+        files: ['DeepSeek-V4.1-Flash-Q4_K_M.gguf'],
+        scope: 'full',
+        completedAt: '2026-11-18T11:30:13.744Z',
+      }),
+    );
+    expect(isModelInstalled(dir)).toBe(false);
+    expect(buildItem(HY4.slug)).toMatchObject({ present: false, installed: false, localRevision: null });
   });
 
   it('a renamed folder with the Hy4-flash record and DeepSeek weights does not make the Hy4-flash card present', () => {

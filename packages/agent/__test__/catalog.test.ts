@@ -296,6 +296,32 @@ const HY4_REPO_FILES: RepoFiles = [
   ['patch/hy4-flash-spark.patch', 315266],
 ];
 
+/** `ggml-org/Clef-Flash-GGUF` files on Hugging Face (2026-11-12, main c3d92545). */
+const CLEF_FLASH_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 1820],
+  ['.src_sha', 49],
+  ['Clef-Flash-BF16.gguf', 18164488448],
+  ['Clef-Flash-Q4_K_M.gguf', 6732781824],
+  ['Clef-Flash-Q8_0.gguf', 9657260288],
+  ['README.md', 559],
+  ['convert.log', 337134],
+  ['mmproj-Clef-Flash-BF16.gguf', 921704928],
+  ['mmproj-Clef-Flash-Q8_0.gguf', 624229728],
+];
+
+/** `ggml-org/Clef-GGUF` files on Hugging Face (2026-11-12, main 415c1d23). */
+const CLEF_REPO_FILES: RepoFiles = [
+  ['.gitattributes', 1790],
+  ['.src_sha', 49],
+  ['Clef-BF16.gguf', 54064664736],
+  ['Clef-Q4_K_M.gguf', 19540136096],
+  ['Clef-Q8_0.gguf', 28732215456],
+  ['README.md', 535],
+  ['convert.log', 523228],
+  ['mmproj-Clef-BF16.gguf', 931146336],
+  ['mmproj-Clef-Q8_0.gguf', 629247456],
+];
+
 /** The real file list of each published GGUF build's repository. */
 const REPO_FILES: ReadonlyMap<string, RepoFiles> = new Map([
   ['unsloth/Qwen3.8-27B-GGUF', QWEN_REPO_FILES],
@@ -303,6 +329,8 @@ const REPO_FILES: ReadonlyMap<string, RepoFiles> = new Map([
   ['thinkingmachines/Inkling-2-Mini', INKLING_ORIGINAL_REPO_FILES],
   ['unsloth/Qwen3.8-Flash-Next-GGUF', FLASH_NEXT_REPO_FILES],
   ['AngelSlim/Hy4-flash-GGUF', HY4_REPO_FILES],
+  ['ggml-org/Clef-Flash-GGUF', CLEF_FLASH_REPO_FILES],
+  ['ggml-org/Clef-GGUF', CLEF_REPO_FILES],
 ]);
 
 describe('install folders', () => {
@@ -325,6 +353,10 @@ describe('install folders', () => {
       ['Nemotron-3.5-Lightning-30B-A3B', 'NVFP4', 'nvidia-nemotron-3.5-lightning-30b-a3b-nvfp4-mlx'],
       ['Clairic Flash (9B)', 'UD-Q4_K_XL', 'clairic-flash-gguf'],
       ['Clairic (27B)', 'UD-Q4_K_XL', 'clairic-gguf'],
+      ['CLEF Flash (9B)', 'Q8_0', 'clef-flash-gguf'],
+      ['CLEF Flash (9B)', 'Q4_K_M', 'clef-flash-gguf-q4_k_m'],
+      ['CLEF (27B)', 'Q8_0', 'clef-gguf'],
+      ['CLEF (27B)', 'Q4_K_M', 'clef-gguf-q4_k_m'],
       ['Qwen3.8-27B', 'DFlash2', 'qwen3.8-27b-dflash2'],
     ]);
     const names = folders.map((row) => row[2]);
@@ -354,6 +386,10 @@ describe('install folders', () => {
       ['Qwen3.8-27B', 'UD-Q4_K_M'],
       ['Inkling-2-Mini', 'UD-Q4_K_XL'],
       ['Inkling-2-Mini', 'UD-Q4_K_M'],
+      ['CLEF Flash (9B)', 'Q8_0'],
+      ['CLEF Flash (9B)', 'Q4_K_M'],
+      ['CLEF (27B)', 'Q8_0'],
+      ['CLEF (27B)', 'Q4_K_M'],
     ]);
   });
 
@@ -441,6 +477,10 @@ describe('builds', () => {
       [buildOf('Inkling-2-Mini', 'UD-Q4_K_M'), 'Inkling-2-Mini-UD-Q4_K_M.gguf', undefined],
       [buildOf('Qwen3.8-Flash-Next', 'UD-Q4_K_XL'), 'Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf', 'UD-Q4_K_XL'],
       [buildOf('Hy4-flash', 'Q4_K_M'), 'Hy4-flash-Q4_K_M-00001-of-00002.gguf', undefined],
+      [buildOf('CLEF Flash (9B)', 'Q8_0'), 'Clef-Flash-Q8_0.gguf', undefined],
+      [buildOf('CLEF Flash (9B)', 'Q4_K_M'), 'Clef-Flash-Q4_K_M.gguf', undefined],
+      [buildOf('CLEF (27B)', 'Q8_0'), 'Clef-Q8_0.gguf', undefined],
+      [buildOf('CLEF (27B)', 'Q4_K_M'), 'Clef-Q4_K_M.gguf', undefined],
     ];
     for (const [build, file, variantFolder] of weights) {
       const folder = catalogBuildSlug(build, 'darwin');
@@ -502,6 +542,10 @@ describe('the files each build installs', () => {
         ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
         168_347_133_632,
       ],
+      ['CLEF Flash (9B)', 'Q8_0', ['Clef-Flash-Q8_0.gguf'], 9_657_260_288],
+      ['CLEF Flash (9B)', 'Q4_K_M', ['Clef-Flash-Q4_K_M.gguf'], 6_732_781_824],
+      ['CLEF (27B)', 'Q8_0', ['Clef-Q8_0.gguf'], 28_732_215_456],
+      ['CLEF (27B)', 'Q4_K_M', ['Clef-Q4_K_M.gguf'], 19_540_136_096],
     ];
     const covered = new Set<CatalogBuild>();
     for (const [label, id, files, bytes] of expected) {
@@ -513,9 +557,25 @@ describe('the files each build installs', () => {
       expect(bytesOf(listing, selected), `${label} ${id}`).toBe(bytes);
       expect(Math.round(bytes / 1e8) / 10, `${label} ${id}`).toBe(build.sizeGb);
     }
-    // Every chat build of the catalog is checked here.
-    for (const entry of visibleCatalog(BIG_MAC)) {
+    // Every chat build and every CLEF build of the catalog is checked here.
+    for (const entry of [...visibleCatalog(BIG_MAC), ...visibleSystemOneCatalog(BIG_MAC)]) {
+      if (entry.label.startsWith('Clairic')) continue;
       for (const build of entry.builds) expect(covered.has(build), `${entry.label} ${build.id}`).toBe(true);
+    }
+  });
+
+  it('a CLEF glob is the exact file name: a wildcard on the quant also takes the mmproj', () => {
+    const wildcard: CatalogBuild = { ...buildOf('CLEF Flash (9B)', 'Q8_0'), globs: ['*Q8_0*'] };
+    expect(selectedFiles(wildcard, CLEF_FLASH_REPO_FILES)).toEqual([
+      'Clef-Flash-Q8_0.gguf',
+      'mmproj-Clef-Flash-Q8_0.gguf',
+    ]);
+    // A base config.json beside the GGUF makes discovery drop it: no CLEF build takes a sidecar repo.
+    const clef = MODEL_CATALOG.filter((item) => item.ggufFamily === 'clef');
+    expect(clef.map((entry) => entry.label)).toEqual(['CLEF Flash (9B)', 'CLEF (27B)']);
+    for (const entry of clef) {
+      expect(entry.minMemoryGb, entry.label).toBeUndefined();
+      for (const build of entry.builds) expect(build.assetsRepo, `${entry.label} ${build.id}`).toBeUndefined();
     }
   });
 
@@ -555,6 +615,10 @@ describe('download targets', () => {
       ['build', 'hy4-flash-gguf', 'AngelSlim/Hy4-flash-GGUF'],
       ['build', 'clairic-flash-gguf', 'Brooooooklyn/Clairic-Flash-GGUF'],
       ['build', 'clairic-gguf', 'Brooooooklyn/Clairic-GGUF'],
+      ['build', 'clef-flash-gguf', 'ggml-org/Clef-Flash-GGUF'],
+      ['build', 'clef-flash-gguf-q4_k_m', 'ggml-org/Clef-Flash-GGUF'],
+      ['build', 'clef-gguf', 'ggml-org/Clef-GGUF'],
+      ['build', 'clef-gguf-q4_k_m', 'ggml-org/Clef-GGUF'],
     ]);
     for (const entry of MODEL_CATALOG.filter((item) => item.hidden)) {
       for (const build of entry.builds)
@@ -627,6 +691,8 @@ describe('MODEL_CATALOG', () => {
       ['Inkling-2-Mini', 'inkling2'],
       ['Qwen3.8-Flash-Next', 'qwen4_exp'],
       ['Hy4-flash', 'hy_v4_flash'],
+      ['CLEF Flash (9B)', 'clef'],
+      ['CLEF (27B)', 'clef'],
     ]);
     for (const entry of MODEL_CATALOG) {
       if (entry.ggufFamily === undefined) continue;
@@ -722,9 +788,29 @@ describe('visibleSystemOneCatalog', () => {
         'systemone',
       ],
       ['Clairic (27B)', [['UD-Q4_K_XL', 'Brooooooklyn/Clairic-GGUF', 'Cloudflare/clairic', 18.9]], 'systemone'],
+      [
+        'CLEF Flash (9B)',
+        [
+          ['Q8_0', 'ggml-org/Clef-Flash-GGUF', undefined, 9.7],
+          ['Q4_K_M', 'ggml-org/Clef-Flash-GGUF', undefined, 6.7],
+        ],
+        'systemone',
+      ],
+      [
+        'CLEF (27B)',
+        [
+          ['Q8_0', 'ggml-org/Clef-GGUF', undefined, 28.7],
+          ['Q4_K_M', 'ggml-org/Clef-GGUF', undefined, 19.5],
+        ],
+        'systemone',
+      ],
     ]);
     const chatRepos = new Set(visibleCatalog().flatMap((entry) => entry.builds.map((build) => build.hfRepo)));
     for (const entry of sysOne) expect(chatRepos.has(entry.builds[0].hfRepo)).toBe(false);
+    // The wizard offers no System One entry on any machine.
+    for (const memory of [SMALL_MAC, BIG_MAC]) {
+      expect(visibleCatalog(memory).filter((entry) => sysOne.includes(entry))).toEqual([]);
+    }
   });
 
   it('includes System One repos in the download targets and catalogUpdateRepos', () => {

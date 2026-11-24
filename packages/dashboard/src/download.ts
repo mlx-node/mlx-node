@@ -93,7 +93,7 @@ const CATALOG_SHA_NEGATIVE_TTL_MS = 60 * 1000;
  */
 const CATALOG_SHA_PROBE_TIMEOUT_MS = 15 * 1000;
 
-import { catalogBlocker, heldByOtherBuild } from './catalog.js';
+import { catalogBlocker, configlessBuildOf, heldByOtherBuild } from './catalog.js';
 import {
   candidateFolders,
   checksumOf,
@@ -120,6 +120,8 @@ import {
   withDeadline,
 } from './locate.js';
 import {
+  catalogFolderModel,
+  type ConfiglessBuild,
   type DownloadCompletion,
   DOWNLOAD_COMPLETE_MARKER,
   type ForeignEntrySummary,
@@ -131,7 +133,9 @@ import {
   isPathOccupied,
   isSafeRelPath,
   isWeightFile,
+  globToRegex,
   type LocatedRecord,
+  matchesAnyGlob,
   modelsChildPath,
   modelsDirUnavailable,
   readCompletion,
@@ -248,23 +252,6 @@ function isWantedFile(path: string): boolean {
   );
 }
 
-// Glob matching below is byte-identical to the CLI's (`globToRegex` /
-// `matchesAnyGlob` in `packages/cli/src/commands/download-model.ts`). The CLI
-// does not export them and the dashboard must not depend on the CLI package,
-// so the mirror lives here — keep the two in sync: a divergence would make
-// the wizard's `mlx download model -g …` select a different file set than a
-// dashboard install of the same catalog entry.
-/** Convert a simple glob pattern (with * wildcards) to a RegExp. */
-function globToRegex(pattern: string): RegExp {
-  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
-  return new RegExp(`^${escaped}$`, 'i');
-}
-
-/** Check if a filename matches any of the glob patterns. */
-function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
-  return patterns.some((re) => re.test(filename));
-}
-
 /**
  * The manifest filter for one job: the catalog entry's `globs` when it carries
  * them (multi-variant GGUF repos — match on basename OR full repo path, core
@@ -311,19 +298,45 @@ const ASSET_SIDECAR_CANDIDATE_SET: ReadonlySet<string> = new Set(ASSET_SIDECAR_C
  * quantization repos ship weights only), so the manifest itself only needs to
  * prove a weight payload. A platform override repo carries no such selection
  * even when the entry's GGUF build has one.
+ *
+ * A build that installs with no `config.json` ({@link Selection.ggufFamily})
+ * needs a GGUF weight and no `config.json`: a `config.json` beside the GGUF
+ * makes discovery read the folder as another family and drop the GGUF.
  */
-function hasModelPayload(files: ListFileEntry[], waivesConfigRequirement: boolean): boolean {
-  const hasConfig = waivesConfigRequirement || files.some((file) => file.path === 'config.json');
-  return hasConfig && files.some((file) => isWeightFile(file.path));
+function hasModelPayload(files: ListFileEntry[], selection: Selection): boolean {
+  const hasConfig = files.some((file) => file.path === 'config.json');
+  if (selection.ggufFamily !== undefined) {
+    return !hasConfig && files.some((file) => isWeightFile(file.path) && file.path.endsWith('.gguf'));
+  }
+  return (selection.assetsRepo !== undefined || hasConfig) && files.some((file) => isWeightFile(file.path));
 }
 
-function assertModelPayload(repoName: string, files: ListFileEntry[], assetsRepo: string | undefined): void {
-  if (hasModelPayload(files, assetsRepo !== undefined)) return;
+function assertModelPayload(repoName: string, files: ListFileEntry[], selection: Selection): void {
+  if (selection.ggufFamily !== undefined) {
+    // A glob with no `*` is the name of a file the build needs.
+    const missing = selection.globs?.find((glob) => {
+      const name = [globToRegex(glob)];
+      return (
+        !glob.includes('*') &&
+        !files.some((file) => matchesAnyGlob(basename(file.path), name) || matchesAnyGlob(file.path, name))
+      );
+    });
+    if (missing !== undefined) throw new Error(`The Hub has no file "${missing}" for this build.`);
+  }
+  if (hasModelPayload(files, selection)) return;
   const need =
-    assetsRepo !== undefined
-      ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
-      : 'both a config.json and a weight file';
+    selection.ggufFamily !== undefined
+      ? 'a GGUF weight file and no config.json'
+      : selection.assetsRepo !== undefined
+        ? 'at least one weight file (config.json comes from the assetsRepo sidecar fetch)'
+        : 'both a config.json and a weight file';
   throw new Error(`Repo "${repoName}" is not a complete model (needs ${need})`);
+}
+
+/** Whether the staged folder `dir` holds `target`'s build as the engine loads it with no `config.json` ({@link catalogFolderModel}). */
+function holdsConfiglessBuild(dir: string, target: BuildTarget, family: string): boolean {
+  const model = catalogFolderModel(dir, target.slug, family, true);
+  return model !== undefined && model.configless && model.builds.includes(target.build.id);
 }
 
 /** The tokenizer/config sidecars one job fetches from the entry's `assetsRepo`, pinned to one commit. */
@@ -697,12 +710,33 @@ function catalogTarget(slug: string): CatalogTarget {
   return target;
 }
 
-/** The globs and sidecar source a job of `target` plans; a draft has neither. */
-function selectionOf(target: CatalogTarget): { globs?: readonly string[]; assetsRepo?: string } {
+/**
+ * The file selection of one job: the globs and sidecar source it plans, and `ggufFamily` for a build that installs
+ * with no `config.json`.
+ */
+interface Selection {
+  globs?: readonly string[];
+  assetsRepo?: string;
+  /**
+   * The family the build's GGUF header must state, set for a GGUF build with no sidecar source whose entry names a
+   * {@link CatalogEntry.ggufFamily}: such a build installs the GGUF alone.
+   */
+  ggufFamily?: string;
+}
+
+/** The {@link ConfiglessBuild} of `target` when it installs with no `config.json`; a draft needs one. */
+function configlessOf(target: CatalogTarget): ConfiglessBuild | undefined {
+  return target.kind === 'build' ? configlessBuildOf(target.entry, target.build) : undefined;
+}
+
+/** The selection a job of `target` plans; a draft has none. */
+function selectionOf(target: CatalogTarget): Selection {
   if (target.kind === 'draft') return {};
+  const ggufFamily = configlessOf(target)?.family;
   return {
     ...(target.globs !== undefined ? { globs: target.globs } : {}),
     ...(target.assetsRepo !== undefined ? { assetsRepo: target.assetsRepo } : {}),
+    ...(ggufFamily !== undefined ? { ggufFamily } : {}),
   };
 }
 
@@ -810,6 +844,14 @@ function locateNotBesideMessage(name: string): string {
     `These files are on another disk than the models folder, and "${name}" is not beside them. ` +
     'The app does not add files to your folder. ' +
     'Use Install, or copy the folder to the disk of the models folder and use Locate again.'
+  );
+}
+
+function locateConfigBesideMessage(label: string): string {
+  return (
+    `These files are on another disk than the models folder, and a config.json is beside them, ` +
+    `so the app would not load them as ${label}. ` +
+    'Move the config.json out of the folder, or copy the GGUF to the disk of the models folder, then use Locate again.'
   );
 }
 
@@ -1655,7 +1697,7 @@ export class DownloadManager {
         wanted.push({ file, repo: sidecarPlan.repo.name, revision: sidecarPlan.revision });
       }
     }
-    if (!wanted.some((item) => item.file.path === 'config.json')) {
+    if (selection.ggufFamily === undefined && !wanted.some((item) => item.file.path === 'config.json')) {
       throw new Error(
         `Repo "${repo}" is not a complete model (neither it nor its assets repo "${selection.assetsRepo}" provides a config.json)`,
       );
@@ -1809,6 +1851,13 @@ export class DownloadManager {
           'Locate uses only files outside the models folder.',
       );
     }
+    // Through a link the engine reads the config.json beside the real GGUF, and then does not load it as this build.
+    if (plan.mode === 'linked' && selectionOf(target).ggufFamily !== undefined) {
+      const beside = plan.use.find(
+        (item) => isWeightFile(item.path) && existsSync(join(dirname(item.realPath), 'config.json')),
+      );
+      if (beside !== undefined) throw new DownloadConflictError(locateConfigBesideMessage(target.entry.label));
+    }
     return plan;
   }
 
@@ -1824,10 +1873,12 @@ export class DownloadManager {
   ): Promise<LocatePlan | null> {
     const found: { dir: string; record: DownloadCompletion }[] = [];
     let otherBuild: string | null = null;
+    const family = selectionOf(target).ggufFamily;
     for (const dir of folders) {
       const record = await readRecord(dir);
       if (record === undefined || !isLocatableRecord(record, target.repo)) continue;
-      if (!(await recordInstalled(dir, record))) continue;
+      if (!(await recordInstalled(dir, record, family !== undefined))) continue;
+      if (family !== undefined && !holdsConfiglessBuild(dir, target, family)) continue;
       const weights = record.files.filter(isWeightFile);
       if (!weights.every((path) => buildTakes(target, path))) {
         otherBuild ??= this.otherBuildTaking(target, weights);
@@ -1942,7 +1993,7 @@ export class DownloadManager {
     for (const file of sidecarPlan?.files ?? []) {
       wanted.push({ file, repo: sidecarPlan!.repo.name, revision: sidecarPlan!.revision });
     }
-    if (!wanted.some((item) => item.file.path === 'config.json')) {
+    if (selection.ggufFamily === undefined && !wanted.some((item) => item.file.path === 'config.json')) {
       throw new Error(
         `Repo "${target.repo}" is not a complete model (neither it nor its assets repo "${selection.assetsRepo}" provides a config.json)`,
       );
@@ -2526,7 +2577,7 @@ export class DownloadManager {
     fetchImpl: typeof fetch,
   ): Promise<{
     revision: string;
-    selection: { globs?: readonly string[]; assetsRepo?: string };
+    selection: Selection;
     files: ListFileEntry[];
     sidecarPlan: SidecarPlan | null;
   }> {
@@ -2534,7 +2585,7 @@ export class DownloadManager {
     const revision = await this.resolveRevision(repoName, fetchImpl);
     const selection = selectionOf(target);
     const files = await this.listWantedFiles(repoName, revision, selection.globs?.map(globToRegex), fetchImpl);
-    assertModelPayload(repoName, files, selection.assetsRepo);
+    assertModelPayload(repoName, files, selection);
     const sidecarPlan =
       selection.assetsRepo === undefined ? null : await this.planAssetSidecars(selection.assetsRepo, files, fetchImpl);
     return { revision, selection, files, sidecarPlan };
@@ -2616,7 +2667,7 @@ export class DownloadManager {
       // Recover/reap an orphaned publish backup for THIS model — AFTER the preflight,
       // so a foreign finalDir link was already refused and can't be followed here.
       // Pid-gated: a live peer's active publish backup is never reclaimed.
-      await this.recoverBackup(slug, finalDir);
+      await this.recoverBackup(slug, finalDir, configlessOf(job.target));
 
       // Re-run the preflight after recovery: recovery puts back an owned backup or an
       // entry a crashed cleanup moved aside, and this refuses any unowned occupant at finalDir before
@@ -2645,7 +2696,7 @@ export class DownloadManager {
       let totalBytes = 0;
       for (const file of files) if (file.size > 0) totalBytes += file.size;
 
-      assertModelPayload(job.repo, files, selection.assetsRepo);
+      assertModelPayload(job.repo, files, selection);
 
       // Resolve the sidecar manifest BEFORE `start` so the emitted total and
       // file count cover everything this job will fetch. The UI keeps the
@@ -2696,7 +2747,7 @@ export class DownloadManager {
         installed.repo === job.repo &&
         installed.revision === revision &&
         files.every((file) => installed.files.includes(file.path)) &&
-        isModelInstalled(finalDir) &&
+        isModelInstalled(finalDir, configlessOf(job.target)) &&
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
         (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
       // `refreshInstalledAssets` is the one pre-publish path that mutates the
@@ -2797,6 +2848,16 @@ export class DownloadManager {
         if (!(await isStagedCopyComplete(join(stagingDir, file.path), file))) {
           throw new Error(`Staged file "${file.path}" failed content verification before publish`);
         }
+      }
+      if (
+        selection.ggufFamily !== undefined &&
+        job.target.kind === 'build' &&
+        !holdsConfiglessBuild(stagingDir, job.target, selection.ggufFamily)
+      ) {
+        throw new Error(
+          `The downloaded file is not ${job.target.entry.label} ${job.target.build.id}, so the app cannot load it. ` +
+            'Nothing was installed.',
+        );
       }
 
       // Commit barrier: this is the last cancellable instant. Check, then flip to
@@ -3042,7 +3103,9 @@ export class DownloadManager {
       }
       await linkInto(target, slug, DOWNLOAD_COMPLETE_MARKER, stagedMarker, markerFingerprint, added, madeDirs);
       await fsyncDir(target);
-      if (!isModelInstalled(target)) throw new Error(`"${slug}" changed on disk during the update.`);
+      if (!isModelInstalled(target, configlessOf(job.target))) {
+        throw new Error(`"${slug}" changed on disk during the update.`);
+      }
     } catch (error) {
       const keptDir = join(this.modelsDir, '.staging', `${slug}${KEPT_MARK}${randomUUID()}`);
       const { stays, kept } = await removeAddedNames(target, added, madeDirs, keptDir);
@@ -3099,7 +3162,7 @@ export class DownloadManager {
     if (!plan.byRecord) this.noteJobRevision(job.repo, plan.revision, at);
     if (plan.token !== confirmed.token) throw new Error(LOCATE_CHANGED);
     const finalDir = this.assertLocateSlugFree(slug);
-    await this.recoverBackup(slug, finalDir);
+    await this.recoverBackup(slug, finalDir, configlessOf(target));
     this.assertLocateSlugFree(slug);
 
     const sizeOf = (file: ListFileEntry): number => (file.size > 0 ? file.size : 0);
@@ -3341,7 +3404,7 @@ export class DownloadManager {
    *     finalDir absent — a non-owned backup) → RETAIN the backup untouched
    *     and never clobber whatever occupies finalDir. Never throws.
    */
-  private async recoverBackup(slug: string, finalDir: string): Promise<void> {
+  private async recoverBackup(slug: string, finalDir: string, configless: ConfiglessBuild | undefined): Promise<void> {
     const stagingRoot = join(this.modelsDir, '.staging');
     let entries: string[];
     try {
@@ -3366,7 +3429,7 @@ export class DownloadManager {
       let finalAbsent = false;
       try {
         const st = lstatSync(finalDir);
-        finalOwnedComplete = st.isDirectory() && isDownloaderOwned(finalDir) && isModelInstalled(finalDir);
+        finalOwnedComplete = st.isDirectory() && isDownloaderOwned(finalDir) && isModelInstalled(finalDir, configless);
       } catch {
         finalAbsent = true;
       }

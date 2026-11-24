@@ -349,7 +349,42 @@ variant out of its repo plus the base-model tokenizer sidecars of its `assetsRep
 the manifest and stages the sidecars before publishing. Inkling-2-Mini Original is the safetensors release of
 `thinkingmachines/Inkling-2-Mini` and takes the default filter. Qwen3.8-Flash-Next keeps its four shards in the repo
 folder `UD-Q4_K_XL/`, and downloads keep repo paths, so they land in `<slug>/UD-Q4_K_XL/` with the sidecars at the
-root. The System One section offers Clairic Flash (9B) and Clairic (27B), one build each.
+root. The System One section offers Clairic Flash (9B) and Clairic (27B), one build each, and CLEF Flash (9B) and
+CLEF (27B), two builds each:
+
+| Model           | Build  | Folder                   | Size    |
+| --------------- | ------ | ------------------------ | ------- |
+| CLEF Flash (9B) | Q8_0   | `clef-flash-gguf`        | 9.7 GB  |
+| CLEF Flash (9B) | Q4_K_M | `clef-flash-gguf-q4_k_m` | 6.7 GB  |
+| CLEF (27B)      | Q8_0   | `clef-gguf`              | 28.7 GB |
+| CLEF (27B)      | Q4_K_M | `clef-gguf-q4_k_m`       | 19.5 GB |
+
+A CLEF build takes one file, by its exact name, out of `ggml-org/Clef-Flash-GGUF` or `ggml-org/Clef-GGUF` (`*Q8_0*`
+would also take the mmproj file, which CLEF never uses). The GGUF carries the tokenizer and the decision head, and it
+has no `assetsRepo`: a base `config.json` beside it makes discovery read the folder as `qwen3_5` and drop the GGUF. Such
+a build (`configlessBuildOf`: a build of a `-GGUF` repo with no `assetsRepo` on this platform, of an entry with
+`ggufFamily`; today only the CLEF builds) installs the GGUF alone: when the Hub list has no file of one of its exact
+names the job fails before any download with "The Hub has no file "<name>" for this build."; its file list must hold a
+GGUF weight and no `config.json` (else "Repo "<repo>" is not a complete model (needs a GGUF weight file and no
+config.json)"), and after the download the staged folder must hold the build by the rule below for the entry's family
+(`clef`), else the job fails with "The downloaded file is not <model> <build>, so the app cannot load it. Nothing was
+installed." and publishes nothing. Its record lists only the GGUF. For such a build, and only for it, a record with no
+`config.json` counts as installed (`isModelInstalled` with the build): every file it lists is there, every weight file
+it lists is one the build's globs select, and a GGUF it lists loads with no `config.json` and states the entry's family.
+So the card shows Installed, the revision and the update badge as for any install, the skip check of a job, the backup
+recovery of a crashed publish and a Locate from a folder with this app's record read the same rule, and a full-repo
+`mlx download` record of a CLEF repo (every quant, BF16 and the mmproj files) is not the Q8_0 build installed. A folder
+with a `config.json` (at the root, or beside the real GGUF) is not such a build at all: the card is not present, and
+goes to Install for this app's folder or to Update in place / Clean up & update for another. Update hashes the GGUF and
+adds only the record; Locate needs no `config.json`, and in linked mode it refuses a GGUF with a `config.json` beside
+the real file ("These files are on another disk than the models folder, and a config.json is beside them, so the app
+would not load them as <model>. …"). For every other build, and for every reader with no build (Local models reads a
+Located folder of a GGUF that loads alone by its family, with no globs), a record counts as installed only when it
+lists a `config.json`, as before. **Open** on a System One card links to `/system-one?model=<folder>&build=<build>`;
+the page selects the model whose id or name is `<folder>` (links from elsewhere name a model id), else the model of
+that build (discovery's `variant`) whose GGUF is in that folder, and switches to Decide for a CLEF model and to Extract
+for a Clairic one. The link names the build's own folder: a card present through a sibling or a renamed folder opens
+the page with no model chosen, since the catalog does not say which folder holds the build.
 
 A build reads present (`isModelPresent`) for a folder with a root `config.json` and a loadable weight at the root, or
 with a GGUF in a variant folder one level down, by discovery's folder walk for a GGUF repository folder (which
@@ -360,24 +395,23 @@ only with every part beside it. Nothing deeper is read. With a root `config.json
 and sibling-asset checks are not applied.
 
 A GGUF folder with no `config.json` reads present on the card of its own model only when the engine loads it with no
-asset files and it is that card's build: the GGUF names the build, every part of its split set is a regular file, the real folder of the file (links
-resolved) has no `config.json`, and its header (`general.architecture`, read by `readGgufArchitectureSync` of
-`@mlx-node/lm/gguf-metadata`, at most 16384 keys and tensors and 128 MiB, as `readGgufHeader`) names a family whose
-GGUF discovery needs no `config.json` or `tokenizer.json`, admits the file name (`bareGgufFamily` of
-`@mlx-node/lm/model-discovery`) and is the catalog entry's `ggufFamily` (`qwen3_5` for Qwen3.8-27B, `inkling2`,
-`qwen4_exp` for Qwen3.8-Flash-Next, `hy_v4_flash`; set only on an entry with GGUF builds, and only a build of a
-`-GGUF` repo uses it). Any other such folder (a header that cannot be read, a GGUF of another model or another build,
-a GGUF at the Inkling-2-Mini Original folder) keeps the card it had without the rule: **Update** or **Clean up &
-update**. Local models lists a folder the engine loads with no `config.json` under its family from the header, its
-build from the file name and no context window, whichever catalog entry its folder name belongs to. A folder with the
-download marker of the build's repo under another name counts too, by the same rules. For a repo that two
-builds share (the Qwen3.8-27B and the Inkling-2-Mini GGUF builds), a folder counts as the build its GGUF file name
-states, not the build its name suggests, and the marker alone never makes a build present. When a build's folder holds
-a loadable model that is another build of the same repo, the build has `heldBy` (that build's name, or `another model`
-when the weights state none): the card shows **Holds UD-Q4_K_M** with no Install, the build in the folder reads as
-present on its own segment, and the server refuses an install into the folder with 409
-(`"<folder>" holds <build>. Delete it in Local models, then install <build>.`), because the owned swap would delete
-the other build.
+asset files and it is that card's build: the GGUF names the build, every part of its split set is a regular file, the
+real folder of the file (links resolved) has no `config.json`, and its header (`general.architecture`, read by
+`readGgufArchitectureSync` of `@mlx-node/lm/gguf-metadata`, at most 16384 keys and tensors and 128 MiB, as
+`readGgufHeader`) names a family whose GGUF discovery needs no `config.json` or `tokenizer.json`, admits the file name
+(`bareGgufFamily` of `@mlx-node/lm/model-discovery`) and is the catalog entry's `ggufFamily` (`qwen3_5` for Qwen3.8-27B,
+`inkling2`, `qwen4_exp` for Qwen3.8-Flash-Next, `hy_v4_flash`, `clef` for both CLEF entries; set only on an entry with
+GGUF builds, and only a build of a `-GGUF` repo uses it). Any other such folder (a header that cannot be read, a GGUF of
+another model or another build, a GGUF at the Inkling-2-Mini Original folder) keeps the card it had without the rule:
+**Update** or **Clean up & update**. Local models lists a folder the engine loads with no `config.json` under its family
+from the header, its build from the file name and no context window, whichever catalog entry its folder name belongs to.
+A folder with the download marker of the build's repo under another name counts too, by the same rules. For a repo that
+two builds share (the Qwen3.8-27B, the Inkling-2-Mini and the CLEF GGUF builds), a folder counts as the build its GGUF
+file name states, not the build its name suggests, and the marker alone never makes a build present. When a build's
+folder holds a loadable model that is another build of the same repo, the build has `heldBy` (that build's name, or
+`another model` when the weights state none): the card shows **Holds UD-Q4_K_M** with no Install, the build in the
+folder reads as present on its own segment, and the server refuses an install into the folder with 409 (`"<folder>"
+holds <build>. Delete it in Local models, then install <build>.`), because the owned swap would delete the other build.
 
 A folder that reads present counts as installed on its card: the card reads **Installed** and **Details**. Without
 the app's complete record (`installed` false, as for a hand-made folder or an `mlx download` of the weights only, also
@@ -460,7 +494,9 @@ The reading is `GET /api/host` (`{ totalMemBytes, diskFreeBytes }`, `useHost`), 
 waits behind the worker's walk of the model folders that `/api/models` does; the Models page asks for `/catalog`
 before `/models` for the same reason. Until `/api/host` settles, the Recommended and System One sections keep their
 loading shape and show no count, so "N of M installed" is never counted over a list that is still filtered. When it
-fails, the entries with a floor stay hidden. Onboarding and the System One drawer read the same request.
+fails, the entries with a floor stay hidden. Onboarding and the System One drawer read the same request. The System
+One drawer and its empty card show one placeholder per System One entry once `/api/catalog` has answered, and two
+before.
 The setup wizard filters the same way (`visibleCatalog`). Below the floor the page hides the card, its palette
 commands and its share of the "N of M installed" count. An installed copy on a smaller Mac stays in the local list,
 and loads where its load admission accepts the RAM (Hy4-flash from 39 GiB).
@@ -577,28 +613,27 @@ build) carry no reason and stay a "Could not check the folder" toast. A download
 answers "A download of this model is already in the queue. Cancel it, then use Clean up & update."
 
 **Update…** makes the app own a folder that holds the catalog model but was not made by the app, by adding what is
-missing. It never moves, renames, deletes or overwrites a file that was in the folder. A click asks for a plan
-(`POST /api/downloads/adopt-plan`): the server pins one 40-hex sha for the repo and one for the `assetsRepo`, lists the
-wanted files the same way an install does (the wanted set must hold `config.json`), and scans the folder with `lstat`
-only, opening no file, at most 2,000 entries. A wanted file is **checked** when a regular file of the manifest size is
-at its path, and **downloaded** when nothing is there; any other file that is not a model file stays where it is. The
-plan is refused (409 with `reason: 'needs-cleanup'`; the text names the file, and the card turns into the cleanup
-confirmation above) for a wanted file of another size, a
-wanted file the manifest gives no checksum for (in the folder or missing from it), a file that failed the hash in an earlier Update since the app
-started, a model file that is not part of the catalog model, a name that differs from a wanted name only in letter
-case, links or special files, a `.mlx-download-complete.json` at the root (the app cannot read it), more than 2,000
-entries, or a disk that cannot link files; no write permission is refused with no reason (the card shows No access
-first). The plan, and the commit scan, read a `.mlx-download-complete.json` at the root on
-the transport thread with no size limit, as the catalog, a cleanup and every install already do: a file of hundreds of
-MB there stalls download progress and Cancel for as long as the read takes (seconds on a slow disk), and then the
-folder is refused. The plan reads Hugging Face with a deadline and outside any job, so it neither adds
-bytes to a running download nor dies with its cancel. Its token is a sha256 over the repo, both shas, the wanted files
-with their checksums, the checked files with size, `mtimeNs` and inode, the downloaded paths and the folder's
-`dev:ino`; other files are not in it, so a new `.DS_Store` does not break the confirm. The confirm shows the counts,
-the sizes and up to 3 other names. The start request carries the token, and a token starts one job only: a token that
-is not the last plan's gets 409, and so does a used one once its job has ended. While the Update job is active, an
-Update request for the folder returns that job's id. The job computes the plan again before it does anything and
-stops with "Nothing was changed." when the token differs.
+missing. It never moves, renames, deletes or overwrites a file that was in the folder. A click asks for a plan (`POST
+/api/downloads/adopt-plan`): the server pins one 40-hex sha for the repo and one for the `assetsRepo`, lists the wanted
+files the same way an install does (the wanted set must hold `config.json`, except for a build that installs the GGUF
+alone), and scans the folder with `lstat` only, opening no file, at most 2,000 entries. A wanted file is **checked**
+when a regular file of the manifest size is at its path, and **downloaded** when nothing is there; any other file that
+is not a model file stays where it is. The plan is refused (409 with `reason: 'needs-cleanup'`; the text names the file,
+and the card turns into the cleanup confirmation above) for a wanted file of another size, a wanted file the manifest
+gives no checksum for (in the folder or missing from it), a file that failed the hash in an earlier Update since the app
+started, a model file that is not part of the catalog model, a name that differs from a wanted name only in letter case,
+links or special files, a `.mlx-download-complete.json` at the root (the app cannot read it), more than 2,000 entries,
+or a disk that cannot link files; no write permission is refused with no reason (the card shows No access first). The
+plan, and the commit scan, read a `.mlx-download-complete.json` at the root on the transport thread with no size limit,
+as the catalog, a cleanup and every install already do: a file of hundreds of MB there stalls download progress and
+Cancel for as long as the read takes (seconds on a slow disk), and then the folder is refused. The plan reads Hugging
+Face with a deadline and outside any job, so it neither adds bytes to a running download nor dies with its cancel. Its
+token is a sha256 over the repo, both shas, the wanted files with their checksums, the checked files with size,
+`mtimeNs` and inode, the downloaded paths and the folder's `dev:ino`; other files are not in it, so a new `.DS_Store`
+does not break the confirm. The confirm shows the counts, the sizes and up to 3 other names. The start request carries
+the token, and a token starts one job only: a token that is not the last plan's gets 409, and so does a used one once
+its job has ended. While the Update job is active, an Update request for the folder returns that job's id. The job
+computes the plan again before it does anything and stops with "Nothing was changed." when the token differs.
 
 The job hashes each checked file where it is. It opens the file with `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`, the `fstat`
 of the descriptor must match the plan, the sha256 must equal the manifest's `lfs.oid` (or the git blob sha1 its

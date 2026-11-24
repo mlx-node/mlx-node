@@ -1539,8 +1539,9 @@ export async function run(argv: string[]) {
     );
     // A FRESH install that claims a loadable model — a catalog prescription, or
     // one that pulled sidecars — must certify a config: isModelInstalled
-    // requires one, so a marker without it can never read as installed while
-    // the wizard calls the run a success. Updates are covered by the prune
+    // requires one for every build but a catalog GGUF that installs with none
+    // (CLEF), so a marker without it can never read as installed while the
+    // wizard calls the run a success. Updates are covered by the prune
     // guard below, whose message names the removals that would break the
     // install; this gate exists for the case with nothing to prune.
     if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {

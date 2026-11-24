@@ -29,7 +29,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch } from '../src/api/dispatch.js';
-import { type CatalogBuildItem, catalogWithState } from '../src/catalog.js';
+import { type CatalogBuildItem, catalogWithState, configlessBuildOf } from '../src/catalog.js';
 import { DownloadConflictError, type DownloadEvent, DownloadManager, HubUnreachableError } from '../src/download.js';
 import {
   DOWNLOAD_COMPLETE_MARKER,
@@ -39,6 +39,7 @@ import {
   locatedState,
   readCompletion,
 } from '../src/models.js';
+import { ggufHeader } from './helpers/configless-gguf-fixtures.js';
 
 interface ManifestEntry {
   type: 'file' | 'directory';
@@ -1313,5 +1314,102 @@ describe('Locate: the route', () => {
       body: { slug: SLUG, path: folder },
     });
     expect(res.status).toBe(409);
+  });
+});
+
+describe('Locate of a CLEF build: a folder that holds only the GGUF', () => {
+  const Q8 = catalogBuild('CLEF Flash (9B)', 'Q8_0');
+  const CLEF_FLASH = MODEL_CATALOG.find((entry) => entry.label === 'CLEF Flash (9B)')!;
+  const CLEF_REPO = catalogBuildRepo(Q8);
+  const CLEF_SLUG = catalogBuildSlug(Q8);
+  const FILE = 'Clef-Flash-Q8_0.gguf';
+  const BYTES = Buffer.concat([ggufHeader('clef'), Buffer.alloc(16, 0x03)]);
+
+  beforeEach(() => {
+    const sha256 = createHash('sha256').update(BYTES).digest('hex');
+    const blob = createHash('sha1').update(`blob ${BYTES.length}\0`).update(BYTES).digest('hex');
+    hub.manifests[CLEF_REPO] = [
+      entryOf('.gitattributes', Buffer.from('*.gguf filter=lfs')),
+      {
+        type: 'file',
+        path: FILE,
+        size: BYTES.length,
+        oid: blob,
+        lfs: { oid: sha256, size: BYTES.length, pointerSize: 134 },
+      },
+      entryOf('README.md', Buffer.from('# CLEF Flash')),
+    ];
+  });
+
+  function clefManager(opts: { sameVolume?: (a: bigint, b: bigint) => boolean } = {}): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl: serveCanon, ...opts });
+  }
+
+  it.each<['shared' | 'linked']>([['shared'], ['linked']])(
+    'uses the GGUF %s and needs no config.json',
+    async (mode) => {
+      const folder = userFolder('clef', { [FILE]: BYTES, 'README.md': Buffer.from('notes') });
+      const m = clefManager(mode === 'linked' ? { sameVolume: otherDisk } : {});
+      const { plan, events } = await locate(m, folder, CLEF_SLUG);
+      expect(plan).toMatchObject({
+        repo: CLEF_REPO,
+        folder,
+        mode,
+        byRecord: false,
+        use: { count: 1, bytes: BYTES.length },
+        download: { count: 0, bytes: 0 },
+      });
+      expect(events.map((event) => event.type)).toContain('done');
+      expect(hub.downloaded).toEqual([]);
+      const dir = join(modelsDir, CLEF_SLUG);
+      expect(readdirSync(dir).sort()).toEqual([DOWNLOAD_COMPLETE_MARKER, FILE]);
+      expect(lstatSync(join(dir, FILE)).isSymbolicLink()).toBe(mode === 'linked');
+      expect(readCompletion(dir)).toMatchObject({ files: [FILE], located: { from: folder, mode } });
+      expect(isModelInstalled(dir, configlessBuildOf(CLEF_FLASH, Q8))).toBe(true);
+      expect(buildState(CLEF_SLUG)).toMatchObject({
+        installed: true,
+        present: true,
+        localRevision: hub.sha,
+        located: { from: folder, mode, filesAvailable: true },
+      });
+      // Local models has no build for the row, and reads the files as there too.
+      expect(discoverLocalModels(modelsDir).models).toEqual([
+        expect.objectContaining({ name: CLEF_SLUG, located: expect.objectContaining({ filesAvailable: true }) }),
+      ]);
+    },
+  );
+
+  it('refuses a link to a GGUF with a config.json beside it, which the engine would read as another model', async () => {
+    const folder = userFolder('clef', { [FILE]: BYTES, 'config.json': Buffer.from('{"model_type":"qwen3_5"}') });
+    expect(await refusal(clefManager({ sameVolume: otherDisk }), folder, CLEF_SLUG)).toBe(
+      'These files are on another disk than the models folder, and a config.json is beside them, ' +
+        'so the app would not load them as CLEF Flash (9B). ' +
+        'Move the config.json out of the folder, or copy the GGUF to the disk of the models folder, then use Locate again.',
+    );
+    // On the disk of the models folder the app's folder has no config.json, so the same folder is fine.
+    expect((await clefManager().planLocate(CLEF_SLUG, folder)).mode).toBe('shared');
+  });
+
+  it('trusts the app record of a CLEF install in the picked folder', async () => {
+    const folder = userFolder('copy', { [FILE]: BYTES });
+    writeFileSync(
+      join(folder, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: CLEF_REPO, revision: hub.sha, files: [FILE], scope: 'full', completedAt: 'x' }),
+    );
+    const { plan, events } = await locate(clefManager(), folder, CLEF_SLUG);
+    expect(plan).toMatchObject({ byRecord: true, read: { count: 0, bytes: 0 }, download: { count: 0, bytes: 0 } });
+    expect(events.map((event) => event.type)).toContain('done');
+    expect(buildState(CLEF_SLUG)).toMatchObject({ installed: true, localRevision: hub.sha });
+  });
+
+  it('does not trust an app record whose GGUF now states another family', async () => {
+    const folder = userFolder('copy', { [FILE]: Buffer.concat([ggufHeader('hy_v4_flash'), Buffer.alloc(16, 0x03)]) });
+    writeFileSync(
+      join(folder, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: CLEF_REPO, revision: hub.sha, files: [FILE], scope: 'full', completedAt: 'x' }),
+    );
+    expect(await refusal(clefManager(), folder, CLEF_SLUG)).toContain(
+      `"${FILE}" here is not the file the catalog lists`,
+    );
   });
 });

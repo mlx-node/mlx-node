@@ -1885,7 +1885,9 @@ export function CatalogEntryCard(props: {
       draft={draft}
       host={props.host}
       openTo={
-        props.systemOne === true && build.present ? `/system-one?model=${encodeURIComponent(build.slug)}` : undefined
+        props.systemOne === true && build.present
+          ? `/system-one?model=${encodeURIComponent(build.slug)}&build=${encodeURIComponent(build.id)}`
+          : undefined
       }
     />
   );

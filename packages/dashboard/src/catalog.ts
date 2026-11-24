@@ -22,6 +22,7 @@ import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-compani
 
 import {
   catalogFolderModel,
+  type ConfiglessBuild,
   type ForeignEntrySummary,
   isDownloaderOwned,
   isListedFolder,
@@ -211,17 +212,31 @@ function ggufFamilyOf(entry: CatalogEntry, build: CatalogBuild): string | undefi
 }
 
 /**
+ * The {@link ConfiglessBuild} of `build` when it installs with no `config.json`: a GGUF build with no
+ * {@link CatalogBuild.assetsRepo} on this platform whose entry names a {@link CatalogEntry.ggufFamily}. The globs and
+ * the sidecar source are the build's only for its own repository, as a job plans them (`catalogTargets`).
+ */
+export function configlessBuildOf(entry: CatalogEntry, build: CatalogBuild): ConfiglessBuild | undefined {
+  const own = catalogBuildRepo(build) === build.hfRepo;
+  if (own && build.assetsRepo !== undefined) return undefined;
+  const family = ggufFamilyOf(entry, build);
+  return family === undefined ? undefined : { family, globs: own ? build.globs : undefined };
+}
+
+/**
  * Whether the folder `name` under `modelsDir` holds `build` ({@link catalogFolderModel} with the build's
- * {@link ggufFamilyOf}): a GGUF weight file names the build, or, with `byName` false, the folder has a `config.json`.
+ * {@link ggufFamilyOf}, and `configless` for a build that installs with no `config.json`): a GGUF weight file names the
+ * build, or, with `byName` false, the folder has a `config.json`.
  */
 function holdsBuild(
   modelsDir: string,
   name: string,
   build: CatalogBuild,
   family: string | undefined,
+  configless: boolean,
   byName: boolean,
 ): boolean {
-  const model = catalogFolderModel(join(modelsDir, name), name, family);
+  const model = catalogFolderModel(join(modelsDir, name), name, family, configless);
   return model !== undefined && ((!byName && !model.configless) || model.builds.includes(build.id));
 }
 
@@ -230,10 +245,15 @@ function holdsBuild(
  * build shares: its build names, or `another model` when its weights state none. `null` when the folder holds no
  * loadable model, holds `build`, or the repository is the build's alone.
  */
-function heldByOther(modelsDir: string, build: CatalogBuild, family: string | undefined): string | null {
+function heldByOther(
+  modelsDir: string,
+  build: CatalogBuild,
+  family: string | undefined,
+  configless: boolean,
+): string | null {
   if (!catalogSharesRepo(build)) return null;
   const slug = catalogBuildSlug(build);
-  const model = catalogFolderModel(join(modelsDir, slug), slug, family);
+  const model = catalogFolderModel(join(modelsDir, slug), slug, family, configless);
   if (model === undefined || model.builds.includes(build.id)) return null;
   return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
 }
@@ -250,27 +270,29 @@ function buildWithState(
   const dir = join(modelsDir, slug);
   const markedFolders = downloaded.get(hfRepo.toLowerCase()) ?? [];
   const family = ggufFamilyOf(entry, build);
+  const configless = configlessBuildOf(entry, build);
   let present: boolean;
   let installed: boolean;
   let heldBy: string | null = null;
   if (catalogSharesRepo(build)) {
     // The folder is the build it HOLDS, never the build its name suggests: a
     // marker names only the repository, and two builds share it.
-    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, true);
+    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, configless !== undefined, true);
     const siblings = MODEL_CATALOG.flatMap((candidate) => candidate.builds).filter(
       (other) => other !== build && catalogBuildRepo(other) === hfRepo,
     );
     present = holds(slug) || siblings.some((other) => holds(catalogBuildSlug(other))) || markedFolders.some(holds);
-    installed = isModelInstalled(dir) && holds(slug);
-    heldBy = heldByOther(modelsDir, build, family);
+    installed = isModelInstalled(dir, configless) && holds(slug);
+    heldBy = heldByOther(modelsDir, build, family, configless !== undefined);
   } else {
     // A loadable checkpoint at the folder OR under any folder name whose
     // completion marker names THIS PLATFORM's repo. Matching the other
     // platform's build too would render the card "Installed" with `installed`
     // false — no Install button and no update affordance.
-    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, false);
+    const holds = (name: string): boolean =>
+      holdsBuild(modelsDir, name, build, family, configless !== undefined, false);
     present = holds(slug) || markedFolders.some(holds);
-    installed = isModelInstalled(dir);
+    installed = isModelInstalled(dir, configless);
   }
   // Exactly the state the download runner's ownership preflight refuses, computed
   // with the SAME predicates it uses (isPathOccupied stays no-follow; a live
@@ -279,7 +301,7 @@ function buildWithState(
   // Read from the build's own folder ONLY — see `localRevision` for why a
   // provenance-matched renamed dir deliberately reports null.
   const completion = installed ? readCompletion(dir) : undefined;
-  const located = locatedState(dir);
+  const located = locatedState(dir, configless);
   return {
     id: build.id,
     hfRepo,
@@ -362,7 +384,9 @@ export function catalogBlocker(modelsDir: string, slug: string): CatalogBlocker 
 export function heldByOtherBuild(modelsDir: string, slug: string): string | null {
   for (const entry of MODEL_CATALOG) {
     for (const build of entry.builds) {
-      if (catalogBuildSlug(build) === slug) return heldByOther(modelsDir, build, ggufFamilyOf(entry, build));
+      if (catalogBuildSlug(build) === slug) {
+        return heldByOther(modelsDir, build, ggufFamilyOf(entry, build), configlessBuildOf(entry, build) !== undefined);
+      }
     }
   }
   return null;

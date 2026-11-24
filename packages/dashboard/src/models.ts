@@ -198,6 +198,32 @@ export function isWeightFile(path: string): boolean {
   return path.endsWith('.safetensors') || path.endsWith('.pdiparams');
 }
 
+// Glob matching below is byte-identical to the CLI's (`globToRegex` /
+// `matchesAnyGlob` in `packages/cli/src/commands/download-model.ts`). The CLI
+// does not export them and the dashboard must not depend on the CLI package,
+// so the mirror lives here — keep the two in sync: a divergence would make
+// the wizard's `mlx download model -g …` select a different file set than a
+// dashboard install of the same catalog entry.
+/** Convert a simple glob pattern (with * wildcards) to a RegExp. */
+export function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+/** Check if a filename matches any of the glob patterns. */
+export function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
+  return patterns.some((re) => re.test(filename));
+}
+
+/**
+ * A catalog build that installs with no `config.json` (`configlessBuildOf` in `catalog.ts`): the family its GGUF
+ * header states, and the globs of its files (`undefined`: every file, as for a job with no globs).
+ */
+export interface ConfiglessBuild {
+  family: string;
+  globs: readonly string[] | undefined;
+}
+
 /**
  * A checkpoint counts as installed only when its atomic-publish completion
  * marker is present, parses, lists BOTH a `config.json` and at least one weight
@@ -206,8 +232,12 @@ export function isWeightFile(path: string): boolean {
  * missing weights) nor a one-sided manifest (config-only or weights-only), both
  * of which `loadModel` would reject yet a laxer check would falsely report as
  * installed, hiding the retry.
+ *
+ * For a build that installs with no `config.json` (`configless`) the marker lists none, every weight file it lists
+ * is one the build's globs select, and a GGUF it lists loads with no `config.json` as the build's family
+ * ({@link bareGgufFiles}).
  */
-export function isModelInstalled(modelDir: string): boolean {
+export function isModelInstalled(modelDir: string, configless?: ConfiglessBuild): boolean {
   const marker = readCompletion(modelDir);
   if (marker === undefined || marker.scope === 'partial') return false;
   const files = marker.files;
@@ -215,8 +245,18 @@ export function isModelInstalled(modelDir: string): boolean {
   // describes a hollow/one-sided publish that must NOT read as installed.
   const hasConfig = files.some((file) => file === 'config.json');
   const hasWeight = files.some((file) => typeof file === 'string' && isWeightFile(file));
-  if (!hasConfig || !hasWeight) return false;
-  return files.every((file) => typeof file === 'string' && isRegularFile(join(modelDir, file)));
+  if (hasConfig === (configless !== undefined) || !hasWeight) return false;
+  if (!files.every((file) => typeof file === 'string' && isRegularFile(join(modelDir, file)))) return false;
+  if (configless === undefined) return true;
+  const globs = configless.globs?.map(globToRegex);
+  const selected = (file: string): boolean =>
+    globs === undefined || matchesAnyGlob(basename(file), globs) || matchesAnyGlob(file, globs);
+  if (!files.filter(isWeightFile).every(selected)) return false;
+  return bareGgufFiles(modelDir).some(
+    (file) =>
+      file.family === configless.family &&
+      files.includes(file.folder === undefined ? file.name : `${file.folder}/${file.name}`),
+  );
 }
 
 /**
@@ -461,16 +501,20 @@ function bareGgufFiles(modelDir: string): (GgufFile & { family: string })[] {
 /**
  * The model in `modelDir` (listed as `folderName`) as a catalog entry whose GGUF builds are of `family` reads it
  * (`undefined`: the entry names none), or `undefined` when there is none: {@link isModelPresent}, then with a
- * `config.json` the builds of {@link ggufBuilds}; without one (`configless`), only the builds of the GGUFs of
- * {@link bareGgufFiles} whose header states `family`, and no model when there are none.
+ * `config.json` the builds of {@link ggufBuilds} (no model for a build that installs with no `config.json`,
+ * `configlessBuild`: the engine then reads the folder as another model); without one (`configless`), only the builds
+ * of the GGUFs of {@link bareGgufFiles} whose header states `family`, and no model when there are none.
  */
 export function catalogFolderModel(
   modelDir: string,
   folderName: string,
   family: string | undefined,
+  configlessBuild: boolean,
 ): { configless: boolean; builds: string[] } | undefined {
   if (!isModelPresent(modelDir)) return undefined;
-  if (existsSync(join(modelDir, 'config.json'))) return { configless: false, builds: ggufBuilds(modelDir, folderName) };
+  if (existsSync(join(modelDir, 'config.json'))) {
+    return configlessBuild ? undefined : { configless: false, builds: ggufBuilds(modelDir, folderName) };
+  }
   const builds = buildsOf(
     bareGgufFiles(modelDir).filter((file) => file.family === family),
     folderName,
@@ -638,9 +682,9 @@ export interface LocatedState extends LocatedRecord {
 
 /**
  * The {@link LocatedState} of `dir`, or `null` when it is not a real folder whose marker Locate wrote, or when none of
- * its weight-like files is a link or has another name any more.
+ * its weight-like files is a link or has another name any more. `configless` as for {@link isModelInstalled}.
  */
-export function locatedState(dir: string): LocatedState | null {
+export function locatedState(dir: string, configless?: ConfiglessBuild): LocatedState | null {
   try {
     if (!lstatSync(dir).isDirectory()) return null;
   } catch {
@@ -660,7 +704,7 @@ export function locatedState(dir: string): LocatedState | null {
   // Every weight file is the folder's own (`mlx download` wrote new copies, or the located originals were removed):
   // the folder no longer uses the located files.
   if (!elsewhere.includes(true)) return null;
-  return { from, mode, filesAvailable: isModelInstalled(dir), filesStay: !elsewhere.includes(false) };
+  return { from, mode, filesAvailable: isModelInstalled(dir, configless), filesStay: !elsewhere.includes(false) };
 }
 
 /**
@@ -872,12 +916,15 @@ function isClairicGgufDir(dir: string): boolean {
 
 /**
  * The family and builds of GGUF weights in `dir` that load without a `config.json`: a Clairic GGUF dir, or
- * {@link bareGgufFiles}. `undefined` when there are none.
+ * {@link bareGgufFiles} (`bare`). `undefined` when there are none.
  */
-function configlessGguf(dir: string, folderName: string): { modelType: string; builds: string[] } | undefined {
-  if (isClairicGgufDir(dir)) return { modelType: 'clairic', builds: ggufBuilds(dir, folderName) };
+function configlessGguf(
+  dir: string,
+  folderName: string,
+): { modelType: string; builds: string[]; bare: boolean } | undefined {
+  if (isClairicGgufDir(dir)) return { modelType: 'clairic', builds: ggufBuilds(dir, folderName), bare: false };
   const bare = bareGgufFiles(dir);
-  return bare.length > 0 ? { modelType: bare[0]!.family, builds: buildsOf(bare, folderName) } : undefined;
+  return bare.length > 0 ? { modelType: bare[0]!.family, builds: buildsOf(bare, folderName), bare: true } : undefined;
 }
 
 /**
@@ -1239,7 +1286,8 @@ export function discoverLocalModels(
         sizeBytes,
         fileCount,
         servedIds: [],
-        located: locatedState(full),
+        // A row has no build: the files of a Locate of a GGUF that loads alone are there when that GGUF is.
+        located: locatedState(full, label.bare ? { family: label.modelType, globs: undefined } : undefined),
         link: entry.isSymbolicLink(),
       });
       continue;

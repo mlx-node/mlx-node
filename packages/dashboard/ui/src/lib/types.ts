@@ -1270,6 +1270,8 @@ export interface SystemOneModelInfo {
   name: string;
   modelType: 'clairic' | 'clef';
   format: string;
+  /** The build discovery names the model by (`Q8_0`), the catalog's build id; `null` for a model only the running endpoint lists. */
+  variant: string | null;
   supportsImages: boolean;
   contextWindow: number;
   resident: boolean;

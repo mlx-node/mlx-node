@@ -26,6 +26,7 @@ import {
   sanitizeRequestForHistory,
   type SystemOneJobSnapshot,
 } from '../src/systemone.js';
+import { ggufHeader } from './helpers/configless-gguf-fixtures.js';
 
 let rootDir: string;
 let modelsDir: string;
@@ -162,14 +163,37 @@ function liveWithModels(pid: number, residentNames: string[]): { readNow(): Prom
 describe('catalogWithState category propagation', () => {
   it('tags chat and systemone entries with their category', () => {
     const items = catalogWithState(modelsDir);
-    const clairic = items.filter((item) => item.category === 'systemone');
-    expect(clairic.map((item) => item.builds[0].hfRepo)).toEqual([
+    const systemOne = items.filter((item) => item.category === 'systemone');
+    expect(systemOne.map((item) => item.builds[0].hfRepo)).toEqual([
       'Brooooooklyn/Clairic-Flash-GGUF',
       'Brooooooklyn/Clairic-GGUF',
+      'ggml-org/Clef-Flash-GGUF',
+      'ggml-org/Clef-GGUF',
     ]);
     for (const item of items) {
       expect(item.category === 'chat' || item.category === 'systemone').toBe(true);
     }
+  });
+});
+
+describe('System One models in the CLEF catalog folders', () => {
+  it('lists the GGUF of each folder by its file name, as CLEF, with the folder in its path', async () => {
+    const files = [
+      ['clef-flash-gguf', 'Clef-Flash-Q8_0.gguf'],
+      ['clef-gguf-q4_k_m', 'Clef-Q4_K_M.gguf'],
+    ] as const;
+    for (const [folder, file] of files) {
+      mkdirSync(join(modelsDir, folder));
+      writeFileSync(join(modelsDir, folder, file), ggufHeader('clef'));
+    }
+    const service = new SystemOneService({ modelsDir, readEndpoint: async () => null, historyPath });
+    const { models } = await service.state();
+    expect(models.map((model) => [model.id, model.modelType, model.variant, model.supportsImages, model.path])).toEqual(
+      [
+        ['Clef-Flash-Q8_0', 'clef', 'Q8_0', false, join(modelsDir, 'clef-flash-gguf', 'Clef-Flash-Q8_0.gguf')],
+        ['Clef-Q4_K_M', 'clef', 'Q4_K_M', false, join(modelsDir, 'clef-gguf-q4_k_m', 'Clef-Q4_K_M.gguf')],
+      ],
+    );
   });
 });
 
@@ -278,6 +302,7 @@ describe('SystemOneService', () => {
         name: 'clairic-flash-4bit',
         modelType: 'clairic',
         format: 'mlx',
+        variant: '4-bit',
         supportsImages: true,
         contextWindow: 65536,
         resident: true,

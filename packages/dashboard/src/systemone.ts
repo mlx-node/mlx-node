@@ -39,6 +39,8 @@ export interface SystemOneModelInfo {
   name: string;
   modelType: 'clairic' | 'clef';
   format: string;
+  /** The build discovery names the model by (`Q8_0`), the catalog's build id; `null` for a model only the running endpoint lists. */
+  variant: string | null;
   supportsImages: boolean;
   contextWindow: number;
   resident: boolean;
@@ -344,6 +346,7 @@ export class SystemOneService {
         name: model.name,
         modelType: model.modelType,
         format: model.format,
+        variant: model.variant,
         supportsImages: model.supportsImages,
         contextWindow: model.contextWindow,
         resident: residentNames.has(model.name),
@@ -364,6 +367,7 @@ export class SystemOneService {
           name: model.name,
           modelType,
           format: model.format,
+          variant: null,
           supportsImages: modelType === 'clairic',
           contextWindow: modelType === 'clairic' ? 65536 : 16384,
           resident: residentNames.has(model.name),

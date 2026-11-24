@@ -17,6 +17,24 @@ export function isSystemOneCatalogItem(item: CatalogItem): boolean {
   return hay.includes('clairic') || hay.includes('clef');
 }
 
+/** Placeholders before the catalog answers: one row of the grid. */
+const PLACEHOLDERS_BEFORE_CATALOG = 2;
+
+/** The loading cards: one per System One entry once the catalog is there. */
+function SystemOnePlaceholders({ catalog }: { catalog: AsyncState<CatalogResponse> }): ReactElement {
+  const count =
+    catalog.data === undefined
+      ? PLACEHOLDERS_BEFORE_CATALOG
+      : catalog.data.items.filter((item) => !item.hidden && isSystemOneCatalogItem(item)).length;
+  return (
+    <CatalogGrid>
+      {Array.from({ length: count }, (_, index) => (
+        <CatalogCardPlaceholder key={index} />
+      ))}
+    </CatalogGrid>
+  );
+}
+
 export interface SystemOneModelsDrawerProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
@@ -42,7 +60,7 @@ export function SystemOneModelsDrawer({
       <DrawerContent
         side="right"
         title="System One models"
-        description="Download Clairic Flash (9B), Clairic (27B), or CLEF checkpoints directly to this Mac."
+        description="Download Clairic models for extraction and CLEF models for decisions to this Mac."
       >
         <div className="grid min-w-0 gap-4">
           {catalog.error !== undefined ? (
@@ -58,15 +76,12 @@ export function SystemOneModelsDrawer({
 
           {catalog.data === undefined || host.loading ? (
             catalog.error !== undefined ? null : (
-              <CatalogGrid>
-                <CatalogCardPlaceholder />
-                <CatalogCardPlaceholder />
-              </CatalogGrid>
+              <SystemOnePlaceholders catalog={catalog} />
             )
           ) : items.length === 0 ? (
             <EmptyState
               title="No System One catalog entries"
-              description="Check the Models page or install a Clairic checkpoint via the CLI."
+              description="Check the Models page, or install a Clairic or CLEF model with `mlx download`."
               action={
                 <Link className="link" to="/models">
                   Go to Models
@@ -109,13 +124,10 @@ export function NoSystemOneModelsCard({
   return (
     <PageSection
       title="Install a System One model to get started"
-      description="Download Clairic Flash (9B) for fast structured extraction or Clairic (27B) for highest accuracy and forecasting."
+      description="Clairic models extract fields from text, images and PDFs. CLEF models answer yes/no, choice and score questions. The 9B models are faster, the 27B models more accurate."
     >
       {(catalog.data === undefined && catalog.error === undefined) || host.loading ? (
-        <CatalogGrid>
-          <CatalogCardPlaceholder />
-          <CatalogCardPlaceholder />
-        </CatalogGrid>
+        <SystemOnePlaceholders catalog={catalog} />
       ) : items.length > 0 ? (
         <CatalogGrid>
           {items.map((item) => (

@@ -111,7 +111,8 @@ export interface CatalogEntry {
   /**
    * The family (an id of the `@mlx-node/lm` family table) of the entry's GGUF builds, set only when that family's GGUF
    * discovery needs no asset files. A folder with no `config.json` counts as a GGUF build of the entry only when the
-   * header of the GGUF that names the build states this family.
+   * header of the GGUF that names the build states this family. A GGUF build of such an entry with no
+   * {@link CatalogBuild.assetsRepo} installs with no `config.json`.
    */
   ggufFamily?: string;
   /** `builds[0]` is the build every surface chooses first. */
@@ -339,6 +340,61 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
         sizeGb: 18.9,
         source: 'GGUF',
         included: 'Vision and Clair head included',
+      },
+    ],
+  },
+  {
+    label: 'CLEF Flash (9B)',
+    description: 'Fast 9B decisions: yes/no, choice & score',
+    category: 'systemone',
+    // No assetsRepo: the GGUF carries its tokenizer and decision head, and a base config.json beside it makes
+    // discovery read the folder as qwen3_5 and drop the GGUF. The globs are exact names: `*Q8_0*` also takes the mmproj.
+    ggufFamily: 'clef',
+    builds: [
+      {
+        id: 'Q8_0',
+        hfRepo: 'ggml-org/Clef-Flash-GGUF',
+        globs: ['Clef-Flash-Q8_0.gguf'],
+        sizeGb: 9.7,
+        source: 'ggml-org GGUF',
+        included: 'Text only · decision head included',
+      },
+      {
+        id: 'Q4_K_M',
+        hfRepo: 'ggml-org/Clef-Flash-GGUF',
+        globs: ['Clef-Flash-Q4_K_M.gguf'],
+        sizeGb: 6.7,
+        source: 'ggml-org GGUF',
+        note: '2.9 GB smaller',
+        included: 'Text only · decision head included',
+        folderSuffix: 'q4_k_m',
+      },
+    ],
+  },
+  {
+    label: 'CLEF (27B)',
+    description: 'High-accuracy 27B calibrated decisions',
+    category: 'systemone',
+    // No assetsRepo, for the reason on CLEF Flash (9B).
+    ggufFamily: 'clef',
+    builds: [
+      {
+        id: 'Q8_0',
+        hfRepo: 'ggml-org/Clef-GGUF',
+        globs: ['Clef-Q8_0.gguf'],
+        sizeGb: 28.7,
+        source: 'ggml-org GGUF',
+        included: 'Text only · decision head included',
+      },
+      {
+        id: 'Q4_K_M',
+        hfRepo: 'ggml-org/Clef-GGUF',
+        globs: ['Clef-Q4_K_M.gguf'],
+        sizeGb: 19.5,
+        source: 'ggml-org GGUF',
+        note: '9.2 GB smaller',
+        included: 'Text only · decision head included',
+        folderSuffix: 'q4_k_m',
       },
     ],
   },

@@ -56,6 +56,7 @@ import {
   parseClairicPayload,
   parseClefPayload,
   persistSavedSpecs,
+  requestedModel,
   type SavedSpec,
   summarizeResult,
   summarizeRouting,
@@ -106,6 +107,7 @@ interface RunFailure {
 export default function SystemOne(): ReactElement {
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedModelParam = searchParams.get('model');
+  const requestedBuildParam = searchParams.get('build');
 
   const connectionGen = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
   const live = useRuntimeLive();
@@ -323,7 +325,7 @@ export default function SystemOne(): ReactElement {
     if (installedModels.length === 0) return;
 
     if (requestedModelParam !== null && requestedModelParam !== '') {
-      const match = installedModels.find((m) => m.id === requestedModelParam || m.name === requestedModelParam);
+      const match = requestedModel(installedModels, requestedModelParam, requestedBuildParam);
       if (match !== undefined) {
         setSelectedModelId(match.id);
         setMode(match.modelType === 'clef' ? 'decide' : 'extract');
@@ -331,6 +333,7 @@ export default function SystemOne(): ReactElement {
           (current) => {
             const next = new URLSearchParams(current);
             next.delete('model');
+            next.delete('build');
             return next;
           },
           { replace: true },
@@ -346,7 +349,7 @@ export default function SystemOne(): ReactElement {
         setSelectedModelId(preferred.id);
       }
     }
-  }, [installedModels, modelsForMode, requestedModelParam, selectedModelId, setSearchParams]);
+  }, [installedModels, modelsForMode, requestedBuildParam, requestedModelParam, selectedModelId, setSearchParams]);
 
   const selectedModelForMode: SystemOneModelInfo | undefined =
     modelsForMode.find((m) => m.id === selectedModelId) ?? modelsForMode[0];

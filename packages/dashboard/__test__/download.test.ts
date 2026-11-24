@@ -36,7 +36,7 @@ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch } from '../src/api/dispatch.js';
-import { type CatalogBuildItem, catalogWithState } from '../src/catalog.js';
+import { type CatalogBuildItem, catalogWithState, configlessBuildOf } from '../src/catalog.js';
 import {
   DownloadConflictError,
   type DownloadEvent,
@@ -46,6 +46,9 @@ import {
   type ReplaceBlocker,
 } from '../src/download.js';
 import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
+import { hasUpdate, modelPresent } from '../ui/src/lib/catalog.js';
+import { catalogActionState } from '../ui/src/pages/models/catalog.js';
+import { ggufHeader } from './helpers/configless-gguf-fixtures.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -6538,5 +6541,330 @@ describe('two builds of one repository: one folder, one job, one marker each', (
     const unknown = await post(manager(), '/api/downloads/adopt-plan', { slug: 'someone-not-in-catalog' });
     expect(unknown.status).toBe(400);
     expect(unknown.ok ? '' : unknown.message).toBe('"someone-not-in-catalog" is not a folder of the model catalog');
+  });
+});
+
+describe('a CLEF build: the GGUF alone, with no config.json', () => {
+  const CLEF_FLASH = MODEL_CATALOG.find((entry) => entry.label === 'CLEF Flash (9B)')!;
+  const Q8 = catalogBuild('CLEF Flash (9B)', 'Q8_0');
+  const Q4 = catalogBuild('CLEF Flash (9B)', 'Q4_K_M');
+  const CLEF_REPO = catalogBuildRepo(Q8);
+  const SLUG_Q8 = catalogBuildSlug(Q8);
+  const SLUG_Q4 = catalogBuildSlug(Q4);
+  const FILE_Q8 = 'Clef-Flash-Q8_0.gguf';
+  const FILE_Q4 = 'Clef-Flash-Q4_K_M.gguf';
+  /** The bytes the hub serves, by repo path: each weight a real `clef` header with its own tail. */
+  let served: Record<string, Buffer>;
+
+  function gguf(architecture: string, tail: number): Buffer {
+    return Buffer.concat([ggufHeader(architecture), Buffer.alloc(16, tail)]);
+  }
+
+  function entry(path: string, bytes: Buffer): ManifestEntry {
+    const blob = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+    if (!path.endsWith('.gguf')) return { type: 'file', path, size: bytes.length, oid: blob };
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return {
+      type: 'file',
+      path,
+      size: bytes.length,
+      oid: blob,
+      lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    };
+  }
+
+  /** The repository as Hugging Face lists it: three weights, two projectors and the notes; no config.json. */
+  function listRepo(): void {
+    hub.manifests[CLEF_REPO] = Object.entries(served).map(([path, bytes]) => entry(path, bytes));
+  }
+
+  beforeEach(() => {
+    served = {
+      '.gitattributes': Buffer.from('*.gguf filter=lfs'),
+      '.src_sha': Buffer.from('src'),
+      'Clef-Flash-BF16.gguf': gguf('clef', 0x01),
+      [FILE_Q4]: gguf('clef', 0x02),
+      [FILE_Q8]: gguf('clef', 0x03),
+      'README.md': Buffer.from('# CLEF Flash'),
+      'convert.log': Buffer.from('log'),
+      'mmproj-Clef-Flash-BF16.gguf': gguf('clip', 0x04),
+      'mmproj-Clef-Flash-Q8_0.gguf': gguf('clip', 0x05),
+    };
+    listRepo();
+  });
+
+  const serveBytes: typeof fetch = async (input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    return new Response(new Uint8Array(served[url.split('/').slice(3).join('/')] ?? []), { status: 200 });
+  };
+
+  function manager(): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl: serveBytes });
+  }
+
+  async function run(m: DownloadManager, slug: string, opts?: Parameters<DownloadManager['start']>[1]) {
+    const id = m.start(slug, opts).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    return events;
+  }
+
+  function errorOf(events: DownloadEvent[]): string | undefined {
+    const error = events.find((event) => event.type === 'error');
+    return error?.type === 'error' ? error.message : undefined;
+  }
+
+  function marker(slug: string): { repo: string; revision: string; files: string[]; assetsRepo?: string } {
+    return JSON.parse(readFileSync(join(modelsDir, slug, MARKER_FILE), 'utf-8')) as {
+      repo: string;
+      revision: string;
+      files: string[];
+    };
+  }
+
+  it('installs the GGUF alone; the card is installed at its revision and shows an update only for a new one', async () => {
+    expect([SLUG_Q8, SLUG_Q4]).toEqual(['clef-flash-gguf', 'clef-flash-gguf-q4_k_m']);
+    const events = await run(manager(), SLUG_Q8);
+    expect(errorOf(events)).toBeUndefined();
+    expect(events.find((event) => event.type === 'start')).toMatchObject({
+      fileCount: 1,
+      totalBytes: served[FILE_Q8]!.length,
+    });
+    expect(hub.downloaded).toEqual([FILE_Q8]);
+    expect(readdirSync(join(modelsDir, SLUG_Q8)).sort()).toEqual([MARKER_FILE, FILE_Q8]);
+    expect(marker(SLUG_Q8)).toMatchObject({ repo: CLEF_REPO, revision: hub.sha, files: [FILE_Q8] });
+    expect(marker(SLUG_Q8).assetsRepo).toBeUndefined();
+    expect(isModelInstalled(join(modelsDir, SLUG_Q8), configlessBuildOf(CLEF_FLASH, Q8))).toBe(true);
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ installed: true, present: true, heldBy: null, localRevision: hub.sha, listed: true });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: false, present: false, heldBy: null, blocker: null });
+    // System One lists it by its file name, as a CLEF model.
+    expect(
+      (await discoverLocalChatModels(modelsDir, { includeDecisions: true })).map((model) => [
+        model.name,
+        model.modelType,
+      ]),
+    ).toEqual([['Clef-Flash-Q8_0', 'clef']]);
+
+    expect(hasUpdate(item, await manager().checkCatalogUpdates())).toBe(false);
+    hub.sha = SHA_NEW;
+    expect(hasUpdate(buildState(SLUG_Q8)!, await manager().checkCatalogUpdates())).toBe(true);
+  });
+
+  it('reads an install at the same revision as done and downloads nothing', async () => {
+    await run(manager(), SLUG_Q8);
+    hub.downloaded = [];
+    const before = lstatSync(join(modelsDir, SLUG_Q8, FILE_Q8)).ino;
+    const events = await run(manager(), SLUG_Q8);
+    expect(events.map((event) => event.type)).toContain('done');
+    expect(hub.downloaded).toEqual([]);
+    expect(lstatSync(join(modelsDir, SLUG_Q8, FILE_Q8)).ino).toBe(before);
+  });
+
+  it('fails and publishes nothing when the GGUF it downloaded states another family', async () => {
+    served[FILE_Q4] = gguf('qwen35', 0x02);
+    listRepo();
+    const events = await run(manager(), SLUG_Q4);
+    expect(errorOf(events)).toBe(
+      'The downloaded file is not CLEF Flash (9B) Q4_K_M, so the app cannot load it. Nothing was installed.',
+    );
+    expect(existsSync(join(modelsDir, SLUG_Q4))).toBe(false);
+    await waitFor(() => readdirSync(stagingRoot()).every((name) => !name.startsWith(`${SLUG_Q4}@`)));
+  });
+
+  it('refuses a repository with a config.json before it downloads anything', async () => {
+    served['config.json'] = Buffer.from('{"model_type":"qwen3_5"}');
+    listRepo();
+    const events = await run(manager(), SLUG_Q8);
+    expect(errorOf(events)).toBe(
+      `Repo "${CLEF_REPO}" is not a complete model (needs a GGUF weight file and no config.json)`,
+    );
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(modelsDir, SLUG_Q8))).toBe(false);
+  });
+
+  it('a build with an assetsRepo still needs a config.json', async () => {
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'tokenizer.json', size: 20 }];
+    const m = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'tokenizer.json': 20 }),
+    });
+    expect(errorOf(await run(m, SLUG))).toBe(
+      `Repo "${REPO}" is not a complete model (neither it nor its assets repo "${ASSETS_REPO}" provides a config.json)`,
+    );
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  it('installs both builds of one repository in their two folders, and a folder with the other build is held', async () => {
+    const m = manager();
+    expect(errorOf(await run(m, SLUG_Q8))).toBeUndefined();
+    expect(errorOf(await run(m, SLUG_Q4))).toBeUndefined();
+    expect(readdirSync(join(modelsDir, SLUG_Q4)).sort()).toEqual([MARKER_FILE, FILE_Q4]);
+    expect(buildState(SLUG_Q8)).toMatchObject({ installed: true, heldBy: null });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: true, heldBy: null });
+    deleteLocalModel(modelsDir, SLUG_Q4);
+    expect(buildState(SLUG_Q8)).toMatchObject({ installed: true, present: true });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: false, present: false });
+
+    // The Q8_0 folder now holds the Q4_K_M file: its card is held, and the other card is present by it.
+    rmSync(join(modelsDir, SLUG_Q8), { recursive: true });
+    mkdirSync(join(modelsDir, SLUG_Q8));
+    writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q4), served[FILE_Q4]!);
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: false, installed: false, heldBy: 'Q4_K_M', blocker: null });
+    expect(buildState(SLUG_Q4)).toMatchObject({ present: true, installed: false });
+    expect(() => m.start(SLUG_Q8)).toThrow(`"${SLUG_Q8}" holds Q4_K_M. Delete it in Local models, then install Q8_0.`);
+  });
+
+  it('Update in place hashes the GGUF of a folder the app did not create and writes the record, downloading nothing', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q8), served[FILE_Q8]!);
+    writeFileSync(join(dir, 'notes.txt'), 'mine');
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: false, localRevision: null });
+    const m = manager();
+    const plan = await m.planAdoption(SLUG_Q8);
+    expect(plan).toMatchObject({
+      repo: CLEF_REPO,
+      assetsRevision: null,
+      check: { count: 1, bytes: served[FILE_Q8]!.length },
+      download: { count: 0, bytes: 0 },
+      other: { count: 1, names: ['notes.txt'] },
+    });
+    expect(errorOf(await run(m, SLUG_Q8, { adopt: plan.token }))).toBeUndefined();
+    expect(hub.downloaded).toEqual([]);
+    expect(readdirSync(dir).sort()).toEqual([MARKER_FILE, FILE_Q8, 'notes.txt']);
+    expect(marker(SLUG_Q8)).toMatchObject({ revision: hub.sha, files: [FILE_Q8] });
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: true, localRevision: hub.sha });
+  });
+
+  it('Update in place takes a folder whose GGUF is of another family as not present, and refuses it by its hash', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q4), gguf('qwen35', 0x02));
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ present: false, heldBy: null, blockedByForeignDir: true });
+    expect(catalogActionState(item, { job: undefined, updateAvailable: false })).toBe('adopt');
+    await expect(manager().planAdoption(SLUG_Q8)).rejects.toThrow(
+      `"${FILE_Q4}" in "${SLUG_Q8}" is a model file that is not part of the catalog model.`,
+    );
+  });
+
+  it('names the file of the build when the Hub list does not have it', async () => {
+    delete served[FILE_Q8];
+    listRepo();
+    expect(errorOf(await run(manager(), SLUG_Q8))).toBe(`The Hub has no file "${FILE_Q8}" for this build.`);
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(modelsDir, SLUG_Q8))).toBe(false);
+  });
+
+  it.each<[string]>([['hy_v4_flash'], ['qwen35']])(
+    'downloads again when the GGUF of an install was replaced by one of %s under the same name',
+    async (architecture) => {
+      await run(manager(), SLUG_Q8);
+      writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q8), gguf(architecture, 0x03));
+      expect(isModelInstalled(join(modelsDir, SLUG_Q8), configlessBuildOf(CLEF_FLASH, Q8))).toBe(false);
+      expect(buildState(SLUG_Q8)).toMatchObject({ present: false, installed: false, localRevision: null });
+      const events = await run(manager(), SLUG_Q8);
+      expect(errorOf(events)).toBeUndefined();
+      expect(readFileSync(join(modelsDir, SLUG_Q8, FILE_Q8)).equals(served[FILE_Q8]!)).toBe(true);
+      expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: true, localRevision: hub.sha });
+    },
+  );
+
+  it('keeps a backup of a good install when the folder now holds a GGUF of another family', async () => {
+    await run(manager(), SLUG_Q8);
+    mkdirSync(stagingRoot(), { recursive: true });
+    const backup = join(stagingRoot(), `${SLUG_Q8}.backup-999999999.11111111-1111-1111-1111-111111111111`);
+    cpSync(join(modelsDir, SLUG_Q8), backup, { recursive: true });
+    writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q8), gguf('hy_v4_flash', 0x03));
+    rmCalls.paths = [];
+    expect(errorOf(await run(manager(), SLUG_Q8))).toBeUndefined();
+    expect(rmCalls.paths).not.toContain(backup);
+    expect(existsSync(join(backup, FILE_Q8))).toBe(true);
+  });
+
+  it('a folder with a config.json beside the GGUF is not present: Install with the record, Update in place without', async () => {
+    await run(manager(), SLUG_Q8);
+    writeFileSync(join(modelsDir, SLUG_Q8, 'config.json'), '{"model_type":"qwen3_5"}');
+    hub.sha = SHA_NEW;
+    const updates = await manager().checkCatalogUpdates();
+    const owned = buildState(SLUG_Q8)!;
+    expect(owned).toMatchObject({ present: false, installed: false, localRevision: null, blocker: null });
+    expect(hasUpdate(owned, updates)).toBe(false);
+    expect(catalogActionState(owned, { job: undefined, updateAvailable: false })).toBe('install');
+
+    const dir = join(modelsDir, SLUG_Q4);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q4), served[FILE_Q4]!);
+    writeFileSync(join(dir, 'config.json'), '{}');
+    const foreign = buildState(SLUG_Q4)!;
+    expect(foreign).toMatchObject({ present: false, installed: false, heldBy: null, blockedByForeignDir: true });
+    expect(catalogActionState(foreign, { job: undefined, updateAvailable: false })).toBe('adopt');
+    const entry = catalogWithState(modelsDir).find((item) => item.label === 'CLEF Flash (9B)')!;
+    expect(modelPresent(entry)).toBe(false);
+  });
+
+  it('a CLI folder with every file of the repository is not this build installed, and offers no Update', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    const files = [
+      'Clef-Flash-BF16.gguf',
+      FILE_Q4,
+      FILE_Q8,
+      'mmproj-Clef-Flash-BF16.gguf',
+      'mmproj-Clef-Flash-Q8_0.gguf',
+    ];
+    for (const file of files) writeFileSync(join(dir, file), served[file]!);
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({ repo: CLEF_REPO, revision: SHA_OLD, files, scope: 'full', completedAt: 'x' }),
+    );
+    expect(isModelInstalled(dir, configlessBuildOf(CLEF_FLASH, Q8))).toBe(false);
+    const updates = await manager().checkCatalogUpdates();
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ present: true, installed: false, localRevision: null });
+    expect(hasUpdate(item, updates)).toBe(false);
+    expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
+  });
+});
+
+describe('a full record with no config.json of a build that needs one, as before CLEF', () => {
+  /** Plants `files` (each a GGUF of `architecture`) in the folder of `build` with a full record of its repository. */
+  function plantCliFolder(build: CatalogBuild, files: readonly string[], architecture: string): string {
+    const dir = join(modelsDir, catalogBuildSlug(build));
+    mkdirSync(dir);
+    for (const file of files)
+      writeFileSync(join(dir, file), Buffer.concat([ggufHeader(architecture), Buffer.alloc(8)]));
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({ repo: catalogBuildRepo(build), revision: hub.sha, files, scope: 'full', completedAt: 'x' }),
+    );
+    return dir;
+  }
+
+  it.each<[string, CatalogBuild, string[], string]>([
+    [
+      'the Qwen3.8-27B XL folder with two quants',
+      BUILD,
+      ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'Qwen3.8-27B-UD-Q6_K_XL.gguf'],
+      'qwen35',
+    ],
+    [
+      'the Hy4-flash folder with its split set',
+      catalogBuild('Hy4-flash', 'Q4_K_M'),
+      ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
+      'hy_v4_flash',
+    ],
+  ])('%s: present, not installed, no Update', (_name, build, files, architecture) => {
+    const dir = plantCliFolder(build, files, architecture);
+    expect(isModelInstalled(dir)).toBe(false);
+    const item = buildState(catalogBuildSlug(build))!;
+    expect(item).toMatchObject({ present: true, installed: false, localRevision: null });
+    const updates = new Map<string, string | null>([[catalogBuildRepo(build), SHA_NEW]]);
+    expect(hasUpdate(item, updates)).toBe(false);
+    expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
   });
 });
