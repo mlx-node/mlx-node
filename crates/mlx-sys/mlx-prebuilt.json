@@ -1,16 +1,21 @@
 {
   "repo": "mlx-node/mlx-node",
-  "mlx_commit": "6dc14b919fc1966547456dff1aeb13f283ea93b5",
-  "release_tag": "mlx-prebuilt-6dc14b919fc1-3d951e0b",
+  "mlx_commit": "76276123a2843954d85028a8142f58e638ba0101",
+  "release_tag": "mlx-prebuilt-76276123a284-3d951e0b",
   "assets": {
     "aarch64-apple-darwin": {
       "file": "mlx-aarch64-apple-darwin.tar.gz",
-      "sha256": "3b410c64b70694a4cdddcfe79e3d42d9e2724d0692fe4ed5c0a07c250b6c8517"
+      "sha256": "6fca03a742ffe16a5cc2f12ddc81056901108401b2a51fa73181a34bef285e66"
     },
     "aarch64-pc-windows-msvc": {
       "file": "mlx-aarch64-pc-windows-msvc.tar.gz",
-      "sha256": "c3bab122eb811132f87d0bda93dcde40d729a65a7c490c75ab4dbf8c81c3ea1b",
-      "release_tag": "mlx-prebuilt-6dc14b919fc1-e0cab3ee"
+      "sha256": "e28d178d2eb803f9b28b9f1b8798289c9f5c1db2dca28f8d25aa8b3dca7cf8dc",
+      "release_tag": "mlx-prebuilt-76276123a284-e0cab3ee"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "file": "mlx-aarch64-unknown-linux-gnu.tar.gz",
+      "sha256": "7b84cee3e0e703e98514420652ae3fa5239d972971ebbfeb7cde4dd19bb43f0b",
+      "release_tag": "mlx-prebuilt-76276123a284-23ca1e3b"
     }
   }
 }

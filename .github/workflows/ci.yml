@@ -32,6 +32,7 @@ concurrency:
 #   rust-int (macos) ──────────────────────────────────────────┼─▶ publish (ubuntu, main only)
 #   build (macos) ─┬─▶ ts-test (macos) ────────────────────────┤
 #                  └─▶ model-test ×N (macos; main / label) ────┤
+#   build-linux-arm64 (ubuntu-22.04-arm) ──────────────────────┘
 #   done (ubuntu, always) ◀── every job above; the one required status
 #
 # The Rust test legs do NOT wait for `build`: they need no .node addon, only
@@ -242,6 +243,222 @@ jobs:
           path: |
             packages/core/mlx.metallib
             packages/core/paged_attn.metallib
+
+  build-linux-arm64:
+    name: Build (Linux arm64 CUDA)
+    # Keep the Linux build in replacement `model-e2e` runs too (a `model-e2e`
+    # label shares the PR concurrency group and cancels an in-flight push/sync
+    # run). When `model-e2e` fires this run, the "Reuse existing build" step
+    # below pulls the head SHA's already-uploaded artifacts instead of
+    # installing CUDA and recompiling.
+    if: >-
+      github.event.action != 'labeled' ||
+      github.event.label.name == 'model-e2e'
+    runs-on: ubuntu-22.04-arm
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      CMAKE_GENERATOR: Ninja
+      # Cap parallel nvcc CUTLASS compilations to prevent OOM on the 4-vCPU / 16 GB runner
+      # during a source fallback build. `cmake` crate 0.1.58 passes `--parallel $NUM_JOBS`
+      # derived from `CARGO_BUILD_JOBS`, overriding `CMAKE_BUILD_PARALLEL_LEVEL`, so set both.
+      CARGO_BUILD_JOBS: '3'
+      CMAKE_BUILD_PARALLEL_LEVEL: '3'
+      CUDA_PATH: /usr/local/cuda-13.0
+      CUDA_HOME: /usr/local/cuda-13.0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      # On a `model-e2e` label opt-in the head SHA was already built by its
+      # push/sync CI run — download those artifacts instead of reinstalling CUDA
+      # and recompiling. Runs ONLY on label events (never on push/sync, so normal
+      # CI always builds natively). One artifact per `gh run download` call: a
+      # single -n extracts flat into -D, whereas multiple -n names nest into
+      # their own subdirs. Falls through to a full native build if no prior
+      # successful run exists yet (a cancelled or failed prior run has no
+      # conclusion == "success").
+      - name: Reuse existing build on model-e2e opt-in (no native rebuild)
+        id: reuse
+        if: github.event.action == 'labeled'
+        env:
+          # Pass through env (not inline ${{ }}) — branch names are untrusted.
+          SHA: ${{ github.event.pull_request.head.sha }}
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow ci.yml \
+            --branch "$BRANCH" --limit 40 \
+            --json databaseId,headSha,conclusion \
+            --jq "[.[] | select(.headSha == \"$SHA\" and .conclusion == \"success\")][0].databaseId")"
+          # The downloads sit INSIDE the `if` condition so a missing / expired /
+          # partial artifact does NOT abort under `set -e` — it falls through to
+          # the native build below instead of failing the run.
+          if [ -n "${run_id:-}" ] && [ "$run_id" != "null" ] \
+            && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-node-linux-arm64-gnu -D packages/core/ \
+            && mkdir -p packages/core/npm/linux-arm64-gnu/include \
+            && gh run download "$run_id" --repo "$GITHUB_REPOSITORY" -n mlx-cuda-include-linux-arm64-gnu -D packages/core/npm/linux-arm64-gnu/include/; then
+            echo "Reused Linux arm64 artifacts from CI run $run_id for $SHA (no rebuild)"
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+          else
+            rm -rf packages/core/mlx-core.linux-arm64-gnu.node packages/core/npm/linux-arm64-gnu/include
+            echo "No reusable Linux arm64 build for $SHA; building natively."
+          fi
+
+      - name: Setup Node.js
+        if: steps.reuse.outputs.reused != 'true'
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'yarn'
+
+      - name: Setup Rust
+        if: steps.reuse.outputs.reused != 'true'
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+        with:
+          toolchain: stable
+          target: aarch64-unknown-linux-gnu
+          cache: false
+          rustflags: ''
+
+      # Runs BEFORE rust-cache so CARGO_* values enter its env hash and
+      # PR/main builds keep separate dependency caches.
+      - name: Use a parallel release profile on pull requests
+        if: github.event_name == 'pull_request' && steps.reuse.outputs.reused != 'true'
+        run: |
+          echo "CARGO_PROFILE_RELEASE_LTO=thin" >> "$GITHUB_ENV"
+          echo "CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16" >> "$GITHUB_ENV"
+
+      - name: Cache Rust
+        if: steps.reuse.outputs.reused != 'true'
+        uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+          prefix-key: v2-rust
+          shared-key: build-linux-arm64
+          cache-on-failure: true
+
+      - name: Cache prebuilt MLX
+        if: steps.reuse.outputs.reused != 'true'
+        uses: actions/cache@v6
+        with:
+          path: .mlx-prebuilt
+          key: mlx-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
+
+      # Install CUDA 13.0 SBSA + cuDNN 9 + BLAS/LAPACK + g++/ninja + CMake >= 3.25
+      # so both prebuilt linking and source fallback work. Deliberately omit
+      # libnccl-dev so the addon carries no NCCL runtime dependency.
+      - name: Install Linux CUDA 13.0 SBSA toolchain & build dependencies
+        if: steps.reuse.outputs.reused != 'true'
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          curl -fsSL --retry 3 -o /tmp/cuda-keyring.deb \
+            https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
+          sudo dpkg -i /tmp/cuda-keyring.deb
+          rm -f /tmp/cuda-keyring.deb
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            g++ \
+            ninja-build \
+            libblas-dev \
+            liblapack-dev \
+            liblapacke-dev \
+            libcudnn9-dev-cuda-13 \
+            cuda-compiler-13-0 \
+            cuda-libraries-dev-13-0
+          cmake_ok=false
+          if command -v cmake >/dev/null 2>&1; then
+            cmake_ver="$(cmake --version | awk 'NR==1 {print $3}')"
+            if [ -n "$cmake_ver" ] && awk -v v="$cmake_ver" 'BEGIN { split(v, a, /[^0-9]+/); exit !((a[1] + 0) > 3 || ((a[1] + 0) == 3 && (a[2] + 0) >= 25)) }'; then
+              cmake_ok=true
+            fi
+          fi
+          if [ "$cmake_ok" != true ]; then
+            cmake_version="3.31.6"
+            cmake_dir="/usr/local/cmake-${cmake_version}"
+            curl -fsSL --retry 3 -o /tmp/cmake.tar.gz \
+              "https://github.com/Kitware/CMake/releases/download/v${cmake_version}/cmake-${cmake_version}-linux-aarch64.tar.gz"
+            sudo rm -rf "$cmake_dir"
+            sudo mkdir -p "$cmake_dir"
+            sudo tar -xzf /tmp/cmake.tar.gz --strip-components=1 -C "$cmake_dir"
+            rm -f /tmp/cmake.tar.gz
+            export PATH="$cmake_dir/bin:$PATH"
+            echo "$cmake_dir/bin" >> "$GITHUB_PATH"
+          fi
+          export PATH="/usr/local/cuda-13.0/bin:$PATH"
+          echo "/usr/local/cuda-13.0/bin" >> "$GITHUB_PATH"
+          nvcc --version
+          cmake --version
+
+      # Only used when build.rs falls back to the source cmake build (MLX's
+      # FetchContent pulls from github.com).
+      - name: Configure GitHub token for CMake downloads
+        if: steps.reuse.outputs.reused != 'true'
+        run: |
+          echo "machine github.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          echo "machine objects.githubusercontent.com login x-access-token password ${{ secrets.GITHUB_TOKEN }}" >> ~/.netrc
+          chmod 600 ~/.netrc
+
+      - name: Install dependencies
+        if: steps.reuse.outputs.reused != 'true'
+        run: yarn install --immutable
+
+      - name: Build native module
+        if: steps.reuse.outputs.reused != 'true'
+        run: yarn build:native
+
+      - name: Verify Linux arm64 addon & bundled CUDA headers
+        run: |
+          set -euo pipefail
+          addon="packages/core/mlx-core.linux-arm64-gnu.node"
+          test -f "$addon"
+          readelf -h "$addon" > /tmp/addon-header.txt
+          if ! grep -Eq 'Machine:[[:space:]]+AArch64' /tmp/addon-header.txt; then
+            echo "::error::$addon is not an AArch64 ELF binary"
+            cat /tmp/addon-header.txt
+            exit 1
+          fi
+          readelf -d "$addon" > /tmp/addon-dynamic.txt
+          cat /tmp/addon-dynamic.txt
+          if ! grep -Eq '\(NEEDED\).*\[libcudart\.so\.13\]' /tmp/addon-dynamic.txt; then
+            echo "::error::$addon is missing NEEDED libcudart.so.13"
+            exit 1
+          fi
+          if ! grep -Eq '\(NEEDED\).*\[libcudnn\.so\.9\]' /tmp/addon-dynamic.txt; then
+            echo "::error::$addon is missing NEEDED libcudnn.so.9"
+            exit 1
+          fi
+          if ! grep -Eq '\(RUNPATH\).*(\[|:)/usr/local/cuda/lib64/?(:|\])' /tmp/addon-dynamic.txt; then
+            echo "::error::$addon RUNPATH does not contain /usr/local/cuda/lib64"
+            exit 1
+          fi
+          if grep -Fq 'libnccl.so' /tmp/addon-dynamic.txt; then
+            echo "::error::$addon unexpectedly links libnccl.so"
+            exit 1
+          fi
+          readelf -r "$addon" > /tmp/addon-relocs.txt
+          if grep -Fq 'R_AARCH64_TLS_TPREL' /tmp/addon-relocs.txt || grep -Fq 'STATIC_TLS' /tmp/addon-dynamic.txt; then
+            echo "::error::$addon contains static TLS relocations that fail dlopen in Node.js"
+            grep -E 'R_AARCH64_TLS_TPREL|STATIC_TLS' /tmp/addon-relocs.txt /tmp/addon-dynamic.txt | head -n 20 || true
+            exit 1
+          fi
+          rm -f /tmp/addon-header.txt /tmp/addon-dynamic.txt /tmp/addon-relocs.txt
+          for header in \
+            packages/core/npm/linux-arm64-gnu/include/cccl/cuda/std/array \
+            packages/core/npm/linux-arm64-gnu/include/cute/tensor.hpp \
+            packages/core/npm/linux-arm64-gnu/include/cutlass/cutlass.h; do
+            test -f "$header"
+          done
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-node-linux-arm64-gnu
+          path: packages/core/mlx-core.linux-arm64-gnu.node
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mlx-cuda-include-linux-arm64-gnu
+          path: packages/core/npm/linux-arm64-gnu/include/
 
   clippy:
     name: Clippy
@@ -997,6 +1214,7 @@ jobs:
     needs:
       - lint-ts
       - build
+      - build-linux-arm64
       - clippy
       - rust-lib-qwen4
       - rust-lib-core
@@ -1008,6 +1226,7 @@ jobs:
         if: >-
           ${{ contains(needs.*.result, 'failure') ||
               contains(needs.*.result, 'cancelled') ||
+              needs.build-linux-arm64.result != 'success' ||
               needs.rust-lib-qwen4.result != 'success' ||
               needs.rust-lib-core.result != 'success' ||
               !contains(needs.*.result, 'success') }}
@@ -1021,6 +1240,7 @@ jobs:
       packages: write
     needs:
       - build
+      - build-linux-arm64
       - lint-ts
       - clippy
       - rust-lib-qwen4
@@ -1034,6 +1254,7 @@ jobs:
       !cancelled() &&
       github.event.action != 'labeled' &&
       needs.build.result == 'success' &&
+      needs.build-linux-arm64.result == 'success' &&
       needs.lint-ts.result == 'success' &&
       needs.clippy.result == 'success' &&
       needs.rust-lib-qwen4.result == 'success' &&
@@ -1074,17 +1295,31 @@ jobs:
           path: packages/core/artifacts
       - uses: actions/download-artifact@v8
         with:
+          name: mlx-node-linux-arm64-gnu
+          path: packages/core/artifacts
+      - uses: actions/download-artifact@v8
+        with:
           name: mlx-metallib
           path: packages/core/npm/darwin-arm64/
-      # Not a bare `napi artifacts`: `napi.targets` also lists the
-      # hand-built DGX Spark target `aarch64-unknown-linux-gnu`, which this
-      # job never downloads, and @napi-rs/cli >= 3.8 fails on a configured
-      # target with no `.node`. `yarn workspace @mlx-node/core artifacts`
-      # runs the same collector over the targets this repo actually
-      # publishes, derived from its own optionalDependencies +
+      - uses: actions/download-artifact@v8
+        with:
+          name: mlx-cuda-include-linux-arm64-gnu
+          path: packages/core/npm/linux-arm64-gnu/include/
+      # Not a bare `napi artifacts`: `napi.targets` also lists
+      # `aarch64-pc-windows-msvc` (`win32-arm64-msvc`), which stays
+      # desktop-only and is never downloaded here, and @napi-rs/cli >= 3.8
+      # fails on a configured target with no `.node`.
+      # `yarn workspace @mlx-node/core artifacts` runs the same collector
+      # over the targets this repo actually publishes (`darwin-arm64` and
+      # `linux-arm64-gnu`), derived from its own optionalDependencies +
       # `packages/core/npm/*` (see packages/core/publish-targets.ts).
       - name: move artifacts
         run: yarn workspace @mlx-node/core artifacts
+      - name: Verify published Linux arm64 package layout
+        run: |
+          set -euo pipefail
+          test -f packages/core/npm/linux-arm64-gnu/mlx-core.linux-arm64-gnu.node
+          test -f packages/core/npm/linux-arm64-gnu/include/cccl/cuda/std/array
       - name: List dir
         run: ls -R packages/core
       - name: Publish package

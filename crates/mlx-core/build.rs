@@ -2,6 +2,11 @@ extern crate napi_build;
 
 fn main() {
     napi_build::setup();
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        // Use DT_RUNPATH so the cdylib searches `/usr/local/cuda/lib64` after
+        // `LD_LIBRARY_PATH` without touching `stubs/`.
+        println!("cargo:rustc-link-arg-cdylib=-Wl,--enable-new-dtags,-rpath,/usr/local/cuda/lib64");
+    }
     build_ggml_kquant_reference();
 }
 

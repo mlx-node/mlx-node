@@ -6,6 +6,7 @@ import { NapiCli, createBuildCommand } from '@napi-rs/cli';
 import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
+import { LINUX_CUDA_HEADER_MARKERS, LINUX_CUDA_INCLUDE_DIRS, selectLinuxCudaIncludeDir } from './linux-cuda-include';
 import {
   assertAddonMinOs,
   assertMetallibFloor,
@@ -81,6 +82,9 @@ if (metalBuild) {
 await copyNativeAddon(outputs);
 if (process.platform === 'win32' && process.arch === 'arm64') {
   await copyWindowsCudaRuntime();
+}
+if (process.platform === 'linux' && process.arch === 'arm64') {
+  await copyLinuxCudaIncludes(outputs);
 }
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
@@ -163,11 +167,10 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   }
 
   const npmPlatformDir = join(__dirname, 'npm', triple);
-  // The darwin platform dir is committed (it carries the metallibs + a
-  // README). The linux dir is not: its only published artifact would be a
-  // .node that CI never builds, so we don't ship it as an optional package.
-  // A from-source linux build still needs somewhere to land the .node, so
-  // create the dir on demand (no-op when it already exists, e.g. darwin).
+  // Published platform dirs (darwin-arm64, linux-arm64-gnu) are committed,
+  // whereas desktop-only targets (win32-arm64-msvc) are not. Create the dir
+  // on demand so from-source builds on unpublished targets still have
+  // somewhere to land their .node (no-op when it already exists).
   await mkdir(npmPlatformDir, { recursive: true });
   const dst = join(npmPlatformDir, expectedName);
   await copyFile(nodeOutput.path, dst);
@@ -232,6 +235,68 @@ async function copyWindowsCudaRuntime() {
     for (const include of ['cccl', 'cute', 'cutlass']) {
       await cp(join(source, 'include', include), join(dest, 'include', include), { recursive: true });
     }
+  }
+}
+
+async function copyLinuxCudaIncludes(outputs: Awaited<typeof task>) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (!nodeOutput) {
+    throw new Error('[build.ts smoke check] native addon output missing from napi build');
+  }
+  const targetRoot = resolveTargetRoot({
+    targetDir: buildOptions.targetDir,
+    env: process.env,
+    defaultRoot: join(__dirname, '../../target'),
+  });
+  const profile = profileDirName(buildOptions);
+  const triple = buildOptions.target || process.env.CARGO_BUILD_TARGET || 'aarch64-unknown-linux-gnu';
+  const picked = await selectLinuxCudaIncludeDir({
+    addonBinary: await readFile(nodeOutput.path),
+    addonPath: nodeOutput.path,
+    targetRoot,
+    buildDir: process.env.CARGO_BUILD_BUILD_DIR,
+    triple,
+    profile,
+    env: process.env,
+  });
+  console.log(
+    {
+      baked: `Linux CUDA NVRTC headers bound via the addon's baked MLX_NODE_CUDA_INCLUDE_DIR: ${picked.includeDir}`,
+      scan: `Linux CUDA NVRTC headers selected by directory scan (no baked MLX_NODE_CUDA_INCLUDE_DIR): ${picked.includeDir}`,
+    }[picked.source],
+  );
+
+  const destinations = [join(__dirname, 'include'), join(__dirname, 'npm', 'linux-arm64-gnu', 'include')];
+  for (const destRoot of destinations) {
+    await mkdir(destRoot, { recursive: true });
+    for (const name of LINUX_CUDA_INCLUDE_DIRS) {
+      const src = join(picked.includeDir, name);
+      const dst = join(destRoot, name);
+      await rm(dst, { recursive: true, force: true });
+      await cp(src, dst, { recursive: true, dereference: true, force: true });
+    }
+    console.log(`Copied Linux CUDA NVRTC headers from ${picked.includeDir} -> ${destRoot}`);
+  }
+
+  for (const destRoot of destinations) {
+    for (const marker of LINUX_CUDA_HEADER_MARKERS) {
+      const markerPath = join(destRoot, marker);
+      let isFile = false;
+      try {
+        isFile = (await stat(markerPath)).isFile();
+      } catch (error: unknown) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      }
+      if (!isFile) {
+        throw new Error(
+          `[build.ts smoke check] expected Linux CUDA NVRTC header ${marker} at ${markerPath} but it is missing. ` +
+            'If this fires, the published @mlx-node/core-linux-arm64-gnu package will be missing NVRTC headers ' +
+            'and JIT kernels will fail at runtime.',
+        );
+      }
+    }
+    console.log(`Smoke check: ${destRoot} has all ${LINUX_CUDA_HEADER_MARKERS.length} required Linux CUDA headers.`);
   }
 }
 

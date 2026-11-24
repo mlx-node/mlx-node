@@ -15,13 +15,14 @@ ml-explore/mlx main  bebd6422f (2026-10-14)
         │  + 1 patch     per-graph compile_with_mode
         │  + 1 patch     CUDA cuBLASLt cache, WDDM host pool, sm_121 graph limits, Win32 NVRTC
         │  + 1 patch     CUDA dynamic graph toggle & WDDM BufferCache / unified-RAM tuning
+        │  + 1 patch     NVRTC colocated, Cargo 1.100, and CUDA 13 include-path lookup
         ▼
-mlx-node/mlx         6dc14b919  ◄── gitlink at crates/mlx-sys/mlx
+mlx-node/mlx         76276123a  ◄── gitlink at crates/mlx-sys/mlx
 ```
 
 Name a patch by its subject and use its commit hash for the exact gitlink.
 
-## The 16 patches
+## The 17 patches
 
 | #   | commit      | patch                                                                                                                                                                                                                                                                 | why it cannot live in mlx-node                                                                                                                                                                                                                                                                                                                                                                                                                                    | upstream candidate |
 | --- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
@@ -41,13 +42,15 @@ Name a patch by its subject and use its commit hash for the exact gitlink.
 | 14  | `5ddc3d9e2` | `compile_with_mode()` compiles a function with a per-function `CompileMode` override (and matching cache-key erasure on destruction), leaving the global compile mode untouched                                                                                      | CUDA DFlash2 compiled draft replay requires `CompileMode::no_fuse` for BF16 rounding bit-parity with eager execution while Metal graphs and other compiled graphs stay fused. MLX's public `compile()` only reads the process-global `compile_mode()`.                                                                                                                                                                                                           | yes                |
 | 15  | `c1aec005f` | cuBLASLt plan cache, WDDM pinned-host pool separation (`host_buffer_cache_`), `sm_121` CUDA graph node/byte limits, and Win32 NVRTC/PTX fixes                                                                                                                        | Lives inside MLX's internal `CudaAllocator`, `CommandEncoder`, `cublas_utils`, `delayload`, and `jit_module` (`mlx/backend/cuda/`). Separating `device == -1` pinned-host buffers from `device >= 0` pool buffers prevents WDDM GPU ops from silently reusing host-pinned memory, and cuBLASLt plan caching + Win32 NVRTC fixes sit inside MLX's own CUDA GEMM/JIT paths.                                                                                            | yes                |
 | 16  | `6dc14b919` | Thread-safe `cu::get_use_cuda_graphs()` / `set_use_cuda_graphs(bool)` toggle; optional `BufferCache` `max_reuse_slack` applied strictly to buffers `>= 1 MiB`; `#ifdef _WIN32` 64 MiB slack, unified-RAM `total_memory_` (`GlobalMemoryStatusEx`), and 8 GiB pool cap | `use_cuda_graphs()` is a file-local `static bool` read inside `CommandEncoder` (`device.cpp`) with no public setter to disable graph capture during large prefill while keeping it on for decode; `BufferCache::reuse_from_cache()` (`buffer_cache.h`) hardcodes `2 * page_size` slack inside private `CudaAllocator::buffer_cache_`; `total_memory_` and `free_limit_` (`allocator.cpp`) are private constructor-only fields read from `cudaMemGetInfo` (`8 GiB` WDDM carveout on RTX Spark) with no setter, causing cache thrashing on every miss above `7.6 GiB`. (Only the 4-line `max_pool_size_` cap could alternatively use `set_cache_limit`.) | yes                |
+| 17  | `76276123a` | NVRTC `include_path_args()` resolves colocated `<binary_dir>/include`, `<binary_dir>/../include`, Cargo >= 1.100 `<profile>/build/<pkg>/<hash>/out` -> `<profile>/include`, `MLX_CUDA_INCLUDE_DIR`, non-throwing `exists(..., ec)`, and `<cuda>/include/cccl` fallback | `include_path_args()` is an anonymous-namespace function inside `mlx/backend/cuda/jit_module.cpp`. Upstream unconditionally strips `current_binary_dir().parent_path()` on Linux (for `mlx/lib/libmlx.so`), which misses flat npm native addons that ship `include/{cccl,cute,cutlass}` next to the `.node` binary as well as Cargo >= 1.100 test binaries under `build/<pkg>/<hash>/out/`, and does not append CUDA 13's `<cuda>/include/cccl` fallback when bundled or build-time CCCL is absent. | yes                |
 
 The active pin merges the 10 direct commits from the fork's `fn-d1` branch with
 our local CUDA constructor fix `e0dcc863e`, which is not an upstream
 `ml-explore/mlx` change, and carries the thread-scoped TF32 commit `6fe39a2b7`,
 the cuDNN thread-exit commit `849f89346`, `compile_with_mode` `5ddc3d9e2`,
-the CUDA cuBLASLt/WDDM/NVRTC commit `c1aec005f`, and the dynamic CUDA graph
-toggle + WDDM BufferCache/unified-RAM commit `6dc14b919` on top. The retired workspace commit remains an inactive
+the CUDA cuBLASLt/WDDM/NVRTC commit `c1aec005f`, the dynamic CUDA graph
+toggle + WDDM BufferCache/unified-RAM commit `6dc14b919`, and the NVRTC
+colocated/Cargo-1.100/CUDA-13 include-path commit `76276123a` on top. The retired workspace commit remains an inactive
 descendant on `fn-d1`; moving the gitlink to its parent does not rewrite that
 branch. `build.rs` uses the checked-out submodule directly for CMake, bridge
 headers, Metal kernels and generated preambles. There is no parent-repo patch

@@ -53,10 +53,22 @@ int32_t cuda_device_static_memory_info(
 
 }  // namespace mlx_node
 
+#ifdef MLX_NODE_CUDA_INCLUDE_DIR
+// Authoritative path to `<OUT_DIR>/cuda-include` read from the built `.node`
+// addon by `packages/core/linux-cuda-include.ts`. Volatile-read from the
+// exported `mlx_cuda_is_available()` below so `--gc-sections` and LTO never
+// strip the marker string.
+static const char* volatile kMlxNodeCudaIncludeDir =
+    "MLX_NODE_CUDA_INCLUDE_DIR=" MLX_NODE_CUDA_INCLUDE_DIR;
+#endif
+
 extern "C" {
 
 // Check if CUDA backend is compiled in AND at least one CUDA GPU is visible.
 bool mlx_cuda_is_available() {
+#ifdef MLX_NODE_CUDA_INCLUDE_DIR
+  (void)kMlxNodeCudaIncludeDir;
+#endif
 #ifdef MLX_NODE_CUDA_ENABLED
   try {
     return mlx::core::cu::is_available() && mlx::core::gpu::device_count() > 0;

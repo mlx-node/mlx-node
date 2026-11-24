@@ -352,6 +352,7 @@ pub(crate) struct Inkling2TargetView<'a> {
     pub(crate) embed_tokens: &'a Embedding,
     pub(crate) embed_norm: &'a MxArray,
     pub(crate) lm_head: &'a LinearProj,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub(crate) lm_head_bf16_unpadded: Option<&'a MxArray>,
     pub(crate) rms_norm_eps: f32,
     pub(crate) unpadded_vocab_size: usize,
