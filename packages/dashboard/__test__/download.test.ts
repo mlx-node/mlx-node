@@ -451,7 +451,7 @@ const SLUG = catalogBuildSlug(BUILD);
 const BUILD_OTHER = catalogBuild('Inkling-2-Mini', 'UD-Q4_K_XL');
 const REPO_OTHER = catalogBuildRepo(BUILD_OTHER);
 const SLUG_OTHER = catalogBuildSlug(BUILD_OTHER);
-/** The folder of the optional Qwen3.8-27B DFlash2 draft. */
+/** The folder of the auto-installed Qwen3.8-27B DFlash2 draft. */
 const DRAFT_SLUG = catalogDraftSlug(QWEN38_DFLASH2);
 /** The folder of the auto-installed Inkling-2-Mini DFlash2 draft. */
 const INKLING_DRAFT_SLUG = catalogDraftSlug(INKLING2_DFLASH2);

@@ -588,4 +588,70 @@ describe('first model onboarding', () => {
     await waitFor(() => expect(hasButton('Set up coding agents')).toBe(true));
     expect(page!.text()).toContain('Model ready');
   });
+
+  it('co-downloads Qwen3.8-27B DFlash2 on the default onboarding model and still finishes if the companion fails', async () => {
+    const qwen = visible.find((item) => item.isDefault === true)!;
+    const draft: NonNullable<CatalogItem['draft']> = {
+      label: 'DFlash2',
+      hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
+      sizeGb: 3.85,
+      autoInstall: true,
+      slug: 'qwen3.8-27b-dflash2',
+      installed: false,
+      present: false,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+    };
+    const withDraft = items.map((item) => (item.label === qwen.label ? { ...item, draft } : item));
+    const buildPresent = withDraft.map((item) => (item.label === qwen.label ? withPresent(item, true) : item));
+    const calls: ApiCall[] = [];
+    const listeners = new Map<string, (event: DownloadEvent) => void>();
+    dispose = stubApi(
+      {
+        ...routes(),
+        '/catalog': sequence({ items: withDraft }, { items: buildPresent }, { items: buildPresent }),
+        '/downloads': sequence(
+          { jobs: [] },
+          { id: 'qwen-build', slug: slugOf(qwen), repo: qwen.builds[0].hfRepo, kind: 'install' },
+          { id: 'qwen-draft', slug: draft.slug, repo: draft.hfRepo, kind: 'install' },
+        ),
+        '/downloads/qwen-build': { cancelled: true, id: 'qwen-build' },
+        '/downloads/qwen-draft': { cancelled: true, id: 'qwen-draft' },
+      },
+      {
+        onCall: (call) => calls.push(call),
+        subscribe: (id, fn) => {
+          listeners.set(id, fn);
+          return () => {
+            listeners.delete(id);
+          };
+        },
+      },
+    );
+    await mount();
+    expect(page!.container.querySelector<HTMLInputElement>('input:checked')?.value).toBe('Qwen3.8-27B');
+    expect(page!.text()).toContain('Includes DFlash2 (3.85 GB) for faster replies.');
+
+    await act(async () => button('Download model').click());
+    await waitFor(() => expect(listeners.has('qwen-build') && listeners.has('qwen-draft')).toBe(true));
+    expect(calls.filter((call) => call.method === 'POST').map((call) => call.body)).toEqual([
+      { slug: slugOf(qwen) },
+      { slug: draft.slug },
+    ]);
+
+    await act(async () =>
+      listeners.get('qwen-build')!({ type: 'done', id: 'qwen-build', outputDir: `/models/${slugOf(qwen)}` }),
+    );
+    await waitFor(() => expect(page!.text()).toContain('Getting DFlash2'));
+    expect(hasButton('Set up coding agents')).toBe(false);
+
+    // Companion draft error must not block finishing onboarding with the installed default model.
+    await act(async () =>
+      listeners.get('qwen-draft')!({ type: 'error', id: 'qwen-draft', message: 'companion fetch failed' }),
+    );
+    await waitFor(() => expect(hasButton('Set up coding agents')).toBe(true));
+    expect(page!.text()).toContain('Model ready');
+    expect(page!.container.querySelector('[role=alert]')).toBeNull();
+  });
 });

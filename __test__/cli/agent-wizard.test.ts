@@ -167,6 +167,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/qwen3.8-27b-gguf',
       ],
+      ['-m', 'z-lab/Qwen3.8-27B-DFlash2', '--complete', '-o', '/custom/models/qwen3.8-27b-dflash2'],
     ]);
   });
 
@@ -191,6 +192,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/qwen3.8-27b-gguf-ud-q4_k_m',
       ],
+      ['-m', 'z-lab/Qwen3.8-27B-DFlash2', '--complete', '-o', '/custom/models/qwen3.8-27b-dflash2'],
     ]);
   });
 
@@ -402,10 +404,18 @@ describe('runFirstRunWizard', () => {
       const slug = catalogBuildSlug(entry.builds[0]);
       // Safe paths stay readable: the -o value renders unquoted...
       expect(message).toContain(`-o /custom/models/${slug}`);
-      // ...and the whole line still parses back to the intended argv.
+      if (entry.draft?.autoInstall === true) {
+        expect(message).toContain(`-o /custom/models/${catalogDraftSlug(entry.draft)}`);
+      }
+      // ...and the whole line still parses back to the intended argv(s).
       const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
-      const renderedArgs = line.trim().replace(/^mlx download model /, '');
-      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry));
+      const commands = line.trim().split(' && ');
+      expect(
+        commands.map((cmd) => {
+          expect(cmd.startsWith('mlx download model ')).toBe(true);
+          return shellSplit(cmd.slice('mlx download model '.length));
+        }),
+      ).toEqual(expectedHintArgvs(entry));
     }
   });
 });

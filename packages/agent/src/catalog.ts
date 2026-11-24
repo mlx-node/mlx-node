@@ -170,9 +170,10 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
         folderSuffix: 'ud-q4_k_m',
       },
     ],
-    // The optional z-lab DFlash2 draft pairs with either build by name; it is
-    // never auto-installed.
-    draft: QWEN38_DFLASH2,
+    // Shared z-lab DFlash2 draft pairs with either build by name and takes
+    // precedence over the inline MTP layer; downloaded alongside any build
+    // install.
+    draft: { ...QWEN38_DFLASH2, autoInstall: true },
   },
   {
     label: 'Inkling-2-Mini',

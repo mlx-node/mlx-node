@@ -12,8 +12,8 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use napi::bindgen_prelude::{Error, Result};
 
@@ -158,21 +158,122 @@ fn is_paged_allocation_blocked(err_msg: &str) -> bool {
         || err_msg.contains("could allocate only")
 }
 
+/// Bounded wait budget when exclusive-turn reclaim has no non-SSD victims left and must wait
+/// for in-flight StateDisk state/chain writes to land and unmark Global KV blocks.
+const EXCLUSIVE_SSD_RECLAIM_WAIT_BUDGET: Duration =
+    Duration::from_secs(crate::engine::governor::wait::RESOURCE_WAIT_SECONDS as u64);
+
+/// Poll slice for StateDisk `Tick::Wait` during bounded exclusive-turn SSD reclaim waits,
+/// keeping turn cancellation responsive while advancing chain offloads.
+const EXCLUSIVE_SSD_RECLAIM_POLL_SLICE: Duration = Duration::from_millis(25);
+
+/// Short event-wait / sleep slice when a StateDisk tick made no immediate progress while
+/// background disk worker writes are in flight, preventing 100% CPU busy-spinning.
+const EXCLUSIVE_SSD_RECLAIM_IDLE_SLICE: Duration = Duration::from_millis(5);
+
+/// Which KV pool group(s) require blocks during an exclusive-turn reclaim attempt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExclusiveReclaimScope {
+    /// Global (Group 0) or both groups need blocks: reclaim `StateStore` checkpoints,
+    /// then idle owners and ordinary `StateStore` marks in unified `CacheRecency` order.
+    Any,
+    /// Only SWA (Group 1) needs blocks: skip `StateStore` checkpoints and ordinary marks
+    /// (which only pin Global KV, never SWA), and only reclaim idle owners that hold live
+    /// Group 1 (SWA) blocks.
+    SlidingOnly,
+}
+
+/// Per-allocation reclaim cursor for exclusive barrier turns.
+///
+/// Defers SSD-backed `StateStore` entries (`pending_ssd`) until non-blocking victims are
+/// exhausted, records unprogressable entries in `skipped`, and initializes `wait_deadline`
+/// at most once per allocation attempt.
+#[derive(Default)]
+pub(crate) struct ExclusiveReclaimState {
+    skipped: HashSet<EntryId>,
+    pending_ssd: Vec<EntryId>,
+    wait_deadline: Option<Instant>,
+}
+
+impl ExclusiveReclaimState {
+    fn is_deferred(&self, id: EntryId) -> bool {
+        self.skipped.contains(&id) || self.pending_ssd.contains(&id)
+    }
+
+    fn push_pending_ssd(&mut self, id: EntryId) {
+        if !self.skipped.contains(&id) && !self.pending_ssd.contains(&id) {
+            self.pending_ssd.push(id);
+        }
+    }
+}
+
 /// Mirror of `HybridStateStore`'s `Entry::marks_chain`: an entry pins its Global KV chain
 /// while it holds a RAM copy or an SSD copy whose Global KV blocks are still owed to disk.
 fn store_entry_marks_chain<S>(entry: &Entry<S>) -> bool {
     entry.ram().is_some() || entry.disk().is_some_and(|d| d.chain_owed)
 }
 
-/// Reclaim or advance one marked `StateStore` entry for an exclusive turn.
+/// Whether the attached StateDisk tier can still advance or land an in-flight write.
+fn state_disk_can_progress(rt: &Inkling2PagedRuntime) -> bool {
+    rt.state_store.disk.as_ref().is_some_and(|disk| {
+        disk.writable()
+            || disk.writing()
+            || disk.chain.as_ref().is_some_and(|c| !c.in_flight.is_empty())
+    })
+}
+
+/// Choose [`ExclusiveReclaimScope::SlidingOnly`] when Group 0 (Global) already has enough
+/// free/evictable blocks for advancing `seq_id` to `new_total_tokens` and ONLY Group 1 (SWA)
+/// is short — avoiding unnecessary eviction of Global `StateStore` checkpoints or marks that
+/// cannot free any SWA block.
+fn exclusive_reclaim_scope_for_total(
+    rt: &Inkling2PagedRuntime,
+    seq_id: SeqId,
+    new_total_tokens: u32,
+) -> ExclusiveReclaimScope {
+    let Some(swa) = rt.coordinator.sliding_adapter() else {
+        return ExclusiveReclaimScope::Any;
+    };
+    let full = rt.coordinator.full_adapter();
+    let full_bs = full.block_size();
+    let swa_bs = swa.block_size();
+    if full_bs == 0 || swa_bs == 0 {
+        return ExclusiveReclaimScope::Any;
+    }
+    let (Ok(full_tel), Ok(swa_tel)) = (full.block_telemetry(), swa.block_telemetry()) else {
+        return ExclusiveReclaimScope::Any;
+    };
+    let full_cur = full
+        .block_table_for(seq_id)
+        .map_or(0, |t| t.num_blocks() as u32);
+    let full_need = new_total_tokens.div_ceil(full_bs).saturating_sub(full_cur);
+    let full_avail = full_tel
+        .free_blocks
+        .saturating_add(full_tel.evictable_blocks);
+
+    let swa_cur = swa
+        .block_table_for(seq_id)
+        .map_or(0, |t| t.num_blocks() as u32);
+    let swa_need = new_total_tokens.div_ceil(swa_bs).saturating_sub(swa_cur);
+    let swa_avail = swa_tel.free_blocks.saturating_add(swa_tel.evictable_blocks);
+
+    if full_need <= full_avail && swa_need > swa_avail {
+        ExclusiveReclaimScope::SlidingOnly
+    } else {
+        ExclusiveReclaimScope::Any
+    }
+}
+
+/// Reclaim or advance one marked `StateStore` entry for an exclusive turn without blocking.
 ///
-/// Returns `true` if the entry was removed/unmarked or Global `marked_blocks()` decreased;
-/// otherwise records `id` in `skipped_store` and returns `false` so caller loops terminate
-/// in strictly bounded steps even when SSD writes are in flight.
+/// Returns `true` if the entry was removed/unmarked or Global `marked_blocks()` decreased
+/// immediately; otherwise defers `id` to `state.pending_ssd` (when StateDisk can still land
+/// an in-flight write) or `state.skipped` (when unprogressable) so immediate non-SSD victims
+/// are always tried first before any bounded SSD wait.
 fn reclaim_store_entry_for_exclusive(
     rt: &mut Inkling2PagedRuntime,
     id: EntryId,
-    skipped_store: &mut HashSet<EntryId>,
+    state: &mut ExclusiveReclaimState,
 ) -> bool {
     let Some(has_ram) = rt
         .state_store
@@ -180,9 +281,17 @@ fn reclaim_store_entry_for_exclusive(
         .get(id)
         .map(|entry| entry.ram().is_some())
     else {
+        state.skipped.insert(id);
         return false;
     };
     let marked_before = rt.coordinator.full_adapter().marked_blocks();
+    let defer = |rt: &Inkling2PagedRuntime, state: &mut ExclusiveReclaimState| {
+        if state_disk_can_progress(rt) {
+            state.push_pending_ssd(id);
+        } else {
+            state.skipped.insert(id);
+        }
+    };
 
     if has_ram {
         match rt.state_store.reclaim_entry(&rt.coordinator, id) {
@@ -193,7 +302,7 @@ fn reclaim_store_entry_for_exclusive(
                     .store
                     .get(id)
                     .is_some_and(store_entry_marks_chain);
-                if !still_marks {
+                if !still_marks || rt.coordinator.full_adapter().marked_blocks() < marked_before {
                     return true;
                 }
                 rt.state_store.tick(
@@ -212,7 +321,7 @@ fn reclaim_store_entry_for_exclusive(
                 {
                     return true;
                 }
-                skipped_store.insert(id);
+                defer(rt, state);
                 return false;
             }
             ReclaimOutcome::Pending => {
@@ -232,14 +341,14 @@ fn reclaim_store_entry_for_exclusive(
                 {
                     return true;
                 }
-                skipped_store.insert(id);
+                defer(rt, state);
                 return false;
             }
         }
     }
 
-    // Disk-only entry with `chain_owed`: drive one tick to advance chain offload; if still
-    // pinned, skip it so other reclaimable victims can be tried without spinning.
+    // Disk-only entry with `chain_owed`: drive one non-blocking tick to advance chain offload;
+    // if still pinned, defer to `pending_ssd` so non-SSD victims are tried before waiting.
     rt.state_store.tick(
         &rt.coordinator,
         Tick::Wait {
@@ -254,23 +363,156 @@ fn reclaim_store_entry_for_exclusive(
     if !still_marks_after || rt.coordinator.full_adapter().marked_blocks() < marked_before {
         return true;
     }
-    skipped_store.insert(id);
+    defer(rt, state);
     false
 }
 
+/// Retry `reclaim_entry` on deferred `pending_ssd` entries that still hold a RAM copy:
+/// - Any entry whose own disk state write just landed drops RAM immediately (`RamDropped`).
+/// - If no deferred entry is already spilling its chain (`ram().is_none()`) and the staging
+///   buffer is free (or disk became non-writable), advance at most one deferred RAM entry.
+fn retry_pending_ssd_ram_reclaim(rt: &mut Inkling2PagedRuntime, pending_ssd: &[EntryId]) {
+    for &id in pending_ssd {
+        let ready_to_drop_ram = rt
+            .state_store
+            .store
+            .get(id)
+            .is_some_and(|e| e.ram().is_some() && e.disk().is_some_and(|c| c.landed));
+        if ready_to_drop_ram {
+            let _ = rt.state_store.reclaim_entry(&rt.coordinator, id);
+        }
+    }
+    let has_spilling_chain = pending_ssd.iter().any(|&id| {
+        rt.state_store
+            .store
+            .get(id)
+            .is_some_and(|e| e.ram().is_none() && store_entry_marks_chain(e))
+    });
+    if has_spilling_chain {
+        return;
+    }
+    let can_stage_next = rt
+        .state_store
+        .disk
+        .as_ref()
+        .is_none_or(|disk| !disk.writing() || !disk.writable());
+    if !can_stage_next {
+        return;
+    }
+    if let Some(&id) = pending_ssd.iter().find(|&&id| {
+        rt.state_store
+            .store
+            .get(id)
+            .is_some_and(|e| e.ram().is_some())
+    }) {
+        let _ = rt.state_store.reclaim_entry(&rt.coordinator, id);
+    }
+}
+
+fn is_exclusive_reclaim_cancelled(
+    turn_cancel: Option<&Arc<std::sync::atomic::AtomicBool>>,
+) -> bool {
+    turn_cancel.is_some_and(|flag| flag.load(Ordering::Relaxed))
+        || crate::engine::governor::governor::cancelled()
+}
+
 impl Inkling2Inner {
+    /// Bounded, cancellation-aware wait for deferred SSD `StateStore` writes to land and
+    /// unmark Global KV blocks once no immediate non-SSD victims remain.
+    fn wait_for_pending_ssd_reclaim(&mut self, state: &mut ExclusiveReclaimState) -> bool {
+        let Some(marked_before) = self
+            .paged
+            .as_ref()
+            .map(|rt| rt.coordinator.full_adapter().marked_blocks())
+        else {
+            return false;
+        };
+        let wait_deadline = *state
+            .wait_deadline
+            .get_or_insert_with(|| Instant::now() + EXCLUSIVE_SSD_RECLAIM_WAIT_BUDGET);
+
+        let prune_and_check = |rt: &Inkling2PagedRuntime, pending: &mut Vec<EntryId>| -> bool {
+            let before_len = pending.len();
+            pending.retain(|&id| {
+                rt.state_store
+                    .store
+                    .get(id)
+                    .is_some_and(store_entry_marks_chain)
+            });
+            pending.len() < before_len
+                || rt.coordinator.full_adapter().marked_blocks() < marked_before
+        };
+
+        let turn_cancel = self.turn_cancel.as_ref();
+        while !is_exclusive_reclaim_cancelled(turn_cancel) && Instant::now() < wait_deadline {
+            let Some(rt) = self.paged.as_mut() else {
+                break;
+            };
+            retry_pending_ssd_ram_reclaim(rt, &state.pending_ssd);
+            if prune_and_check(rt, &mut state.pending_ssd) {
+                return true;
+            }
+
+            let slice_deadline =
+                (Instant::now() + EXCLUSIVE_SSD_RECLAIM_POLL_SLICE).min(wait_deadline);
+            let progressed = rt.state_store.tick(
+                &rt.coordinator,
+                Tick::Wait {
+                    deadline: slice_deadline,
+                },
+            );
+            retry_pending_ssd_ram_reclaim(rt, &state.pending_ssd);
+            if prune_and_check(rt, &mut state.pending_ssd) {
+                return true;
+            }
+
+            if !state_disk_can_progress(rt) {
+                break;
+            }
+
+            // Avoid busy-spinning while background disk worker writes complete.
+            if !progressed
+                && Instant::now() < wait_deadline
+                && !is_exclusive_reclaim_cancelled(turn_cancel)
+            {
+                let idle_deadline =
+                    (Instant::now() + EXCLUSIVE_SSD_RECLAIM_IDLE_SLICE).min(wait_deadline);
+                let awaited = rt
+                    .state_store
+                    .disk
+                    .as_ref()
+                    .is_some_and(|disk| disk.engine.await_landing(idle_deadline));
+                if !awaited {
+                    let remaining = wait_deadline.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        std::thread::sleep(remaining.min(EXCLUSIVE_SSD_RECLAIM_IDLE_SLICE));
+                    }
+                }
+            }
+        }
+
+        for id in state.pending_ssd.drain(..) {
+            state.skipped.insert(id);
+        }
+        false
+    }
+
     /// Scoped on-demand reclaim primitive for exclusive barrier turns (`exclusive_turn_active`).
     ///
-    /// Reclaims at most ONE victim per call (never `active_seq` and never `protected_store`),
-    /// following Splash's `Phase::Checkpoints` then unified `CacheRecency` stamp order across
-    /// idle owners and marked ordinary `StateStore` entries.
-    ///
-    /// Strictly bounded: every internal iteration either removes a victim or records a
-    /// non-progressing `StateStore` `EntryId` in `skipped_store`.
+    /// Reclaims at most ONE victim per call (never `active_seq`, never ownerless `seq_id = 0`,
+    /// and never `protected_store`):
+    /// - Under [`ExclusiveReclaimScope::Any`]: follows Splash's `Phase::Checkpoints` then
+    ///   unified `CacheRecency` stamp order across idle named owners and marked ordinary
+    ///   `StateStore` entries, deferring in-flight SSD writes until immediate victims are
+    ///   exhausted and then waiting within a bounded, cancellation-aware budget.
+    /// - Under [`ExclusiveReclaimScope::SlidingOnly`]: skips `StateStore` entries (which only
+    ///   pin Global KV, never SWA) and reclaims only idle named owners holding live Group 1
+    ///   (SWA) blocks.
     pub(crate) fn try_reclaim_one_for_exclusive(
         &mut self,
         active_seq: SeqId,
-        skipped_store: &mut HashSet<EntryId>,
+        scope: ExclusiveReclaimScope,
+        reclaim_state: &mut ExclusiveReclaimState,
         protected_store: Option<EntryId>,
     ) -> bool {
         if !self
@@ -283,33 +525,46 @@ impl Inkling2Inner {
 
         loop {
             // Phase 1: Disposable `StateClass::Checkpoint` entries (oldest `last_used` first).
-            let checkpoint_victim = self.paged.as_ref().and_then(|rt| {
-                rt.state_store
-                    .store
-                    .entries()
-                    .filter(|entry| {
-                        entry.checkpoint()
-                            && store_entry_marks_chain(entry)
-                            && !skipped_store.contains(&entry.id())
-                            && Some(entry.id()) != protected_store
-                    })
-                    .min_by_key(|entry| (entry.last_used(), entry.id()))
-                    .map(Entry::id)
-            });
-            if let Some(id) = checkpoint_victim {
-                let Some(rt) = self.paged.as_mut() else {
-                    return false;
-                };
-                if reclaim_store_entry_for_exclusive(rt, id, skipped_store) {
-                    return true;
+            // Skipped under `SlidingOnly` since `StateStore` marks only pin Global KV blocks.
+            if scope == ExclusiveReclaimScope::Any {
+                let checkpoint_victim = self.paged.as_ref().and_then(|rt| {
+                    rt.state_store
+                        .store
+                        .entries()
+                        .filter(|entry| {
+                            entry.checkpoint()
+                                && store_entry_marks_chain(entry)
+                                && !reclaim_state.is_deferred(entry.id())
+                                && Some(entry.id()) != protected_store
+                        })
+                        .min_by_key(|entry| (entry.last_used(), entry.id()))
+                        .map(Entry::id)
+                });
+                if let Some(id) = checkpoint_victim {
+                    let Some(rt) = self.paged.as_mut() else {
+                        return false;
+                    };
+                    if reclaim_store_entry_for_exclusive(rt, id, reclaim_state) {
+                        return true;
+                    }
+                    continue;
                 }
-                continue;
             }
 
-            // Phase 2: Merge idle owners (`candidate != active_seq`) and marked ordinary
-            // `StateStore` entries on their shared `CacheRecency` stamp clock.
+            // Phase 2: Merge idle named owners (`candidate != active_seq && candidate != 0`;
+            // ownerless `seq_id = 0` is reserved and never reclaimed by named turns) and marked
+            // ordinary `StateStore` entries on their shared `CacheRecency` stamp clock.
             let best_owner: Option<(u64, SeqId)> = self.paged.as_ref().and_then(|rt| {
                 let full = rt.coordinator.full_adapter();
+                if scope == ExclusiveReclaimScope::SlidingOnly {
+                    let swa = rt.coordinator.sliding_adapter()?;
+                    return swa
+                        .live_seq_ids()
+                        .into_iter()
+                        .filter(|&seq| seq != active_seq && seq != 0)
+                        .map(|seq| (full.turn_end_stamp(seq).unwrap_or(0), seq))
+                        .min();
+                }
                 let mut candidates: Vec<SeqId> = full.live_seq_ids();
                 if let Some(swa) = rt.coordinator.sliding_adapter() {
                     candidates.extend(swa.live_seq_ids());
@@ -320,27 +575,38 @@ impl Inkling2Inner {
                 candidates.dedup();
                 candidates
                     .into_iter()
-                    .filter(|&seq| seq != active_seq)
+                    .filter(|&seq| seq != active_seq && seq != 0)
                     .map(|seq| (full.turn_end_stamp(seq).unwrap_or(0), seq))
                     .min()
             });
 
-            let best_store: Option<(u64, EntryId)> = self.paged.as_ref().and_then(|rt| {
-                rt.state_store
-                    .store
-                    .entries()
-                    .filter(|entry| {
-                        !entry.checkpoint()
-                            && store_entry_marks_chain(entry)
-                            && !skipped_store.contains(&entry.id())
-                            && Some(entry.id()) != protected_store
-                    })
-                    .map(|entry| (entry.last_used(), entry.id()))
-                    .min()
-            });
+            let best_store: Option<(u64, EntryId)> = if scope == ExclusiveReclaimScope::SlidingOnly
+            {
+                None
+            } else {
+                self.paged.as_ref().and_then(|rt| {
+                    rt.state_store
+                        .store
+                        .entries()
+                        .filter(|entry| {
+                            !entry.checkpoint()
+                                && store_entry_marks_chain(entry)
+                                && !reclaim_state.is_deferred(entry.id())
+                                && Some(entry.id()) != protected_store
+                        })
+                        .map(|entry| (entry.last_used(), entry.id()))
+                        .min()
+                })
+            };
 
             match (best_owner, best_store) {
-                (None, None) => return false,
+                (None, None) => {
+                    if scope == ExclusiveReclaimScope::Any && !reclaim_state.pending_ssd.is_empty()
+                    {
+                        return self.wait_for_pending_ssd_reclaim(reclaim_state);
+                    }
+                    return false;
+                }
                 (Some((o_stamp, victim)), Some((s_stamp, _))) if o_stamp <= s_stamp => {
                     self.release_idle_owner_for_exclusive(victim, active_seq);
                     return true;
@@ -353,7 +619,7 @@ impl Inkling2Inner {
                     let Some(rt) = self.paged.as_mut() else {
                         return false;
                     };
-                    if reclaim_store_entry_for_exclusive(rt, id, skipped_store) {
+                    if reclaim_store_entry_for_exclusive(rt, id, reclaim_state) {
                         return true;
                     }
                 }
@@ -390,7 +656,7 @@ impl Inkling2Inner {
         seq_id: SeqId,
         tokens: &[u32],
     ) -> std::result::Result<(), String> {
-        let mut skipped_store = HashSet::new();
+        let mut reclaim_state = ExclusiveReclaimState::default();
         loop {
             let res = {
                 let rt = self
@@ -402,23 +668,24 @@ impl Inkling2Inner {
             match res {
                 Ok(()) => return Ok(()),
                 Err(err) => {
-                    let can_retry = self.paged.as_ref().is_some_and(|rt| {
+                    let retry_scope = self.paged.as_ref().and_then(|rt| {
                         if !rt.exclusive_turn_active || !is_paged_allocation_blocked(&err) {
-                            return false;
+                            return None;
                         }
-                        let Ok(cur) = rt.coordinator.request_token_count_all(seq_id) else {
-                            return false;
-                        };
-                        let Ok(added) = u32::try_from(tokens.len()) else {
-                            return false;
-                        };
-                        let Some(new_total) = cur.checked_add(added) else {
-                            return false;
-                        };
-                        rt.coordinator.can_fit_single_allocation(seq_id, new_total)
+                        let cur = rt.coordinator.request_token_count_all(seq_id).ok()?;
+                        let added = u32::try_from(tokens.len()).ok()?;
+                        let new_total = cur.checked_add(added)?;
+                        rt.coordinator
+                            .can_fit_single_allocation(seq_id, new_total)
+                            .then(|| exclusive_reclaim_scope_for_total(rt, seq_id, new_total))
                     });
-                    if can_retry
-                        && self.try_reclaim_one_for_exclusive(seq_id, &mut skipped_store, None)
+                    if let Some(scope) = retry_scope
+                        && self.try_reclaim_one_for_exclusive(
+                            seq_id,
+                            scope,
+                            &mut reclaim_state,
+                            None,
+                        )
                     {
                         continue;
                     }
@@ -434,7 +701,7 @@ impl Inkling2Inner {
         seq_id: SeqId,
         tokens: &[u32],
     ) -> std::result::Result<VerifyTicket, String> {
-        let mut skipped_store = HashSet::new();
+        let mut reclaim_state = ExclusiveReclaimState::default();
         loop {
             let res = {
                 let rt = self
@@ -446,23 +713,24 @@ impl Inkling2Inner {
             match res {
                 Ok(ticket) => return Ok(ticket),
                 Err(err) => {
-                    let can_retry = self.paged.as_ref().is_some_and(|rt| {
+                    let retry_scope = self.paged.as_ref().and_then(|rt| {
                         if !rt.exclusive_turn_active || !is_paged_allocation_blocked(&err) {
-                            return false;
+                            return None;
                         }
-                        let Ok(cur) = rt.coordinator.request_token_count_all(seq_id) else {
-                            return false;
-                        };
-                        let Ok(added) = u32::try_from(tokens.len()) else {
-                            return false;
-                        };
-                        let Some(new_total) = cur.checked_add(added) else {
-                            return false;
-                        };
-                        rt.coordinator.can_fit_single_allocation(seq_id, new_total)
+                        let cur = rt.coordinator.request_token_count_all(seq_id).ok()?;
+                        let added = u32::try_from(tokens.len()).ok()?;
+                        let new_total = cur.checked_add(added)?;
+                        rt.coordinator
+                            .can_fit_single_allocation(seq_id, new_total)
+                            .then(|| exclusive_reclaim_scope_for_total(rt, seq_id, new_total))
                     });
-                    if can_retry
-                        && self.try_reclaim_one_for_exclusive(seq_id, &mut skipped_store, None)
+                    if let Some(scope) = retry_scope
+                        && self.try_reclaim_one_for_exclusive(
+                            seq_id,
+                            scope,
+                            &mut reclaim_state,
+                            None,
+                        )
                     {
                         continue;
                     }
@@ -482,7 +750,7 @@ impl Inkling2Inner {
         rows: usize,
     ) -> std::result::Result<bool, String> {
         let rows_u32 = u32::try_from(rows).unwrap_or(u32::MAX);
-        let mut skipped_store = HashSet::new();
+        let mut reclaim_state = ExclusiveReclaimState::default();
         let mut tried_grow = false;
         loop {
             let reserved = {
@@ -495,21 +763,19 @@ impl Inkling2Inner {
             if reserved {
                 return Ok(true);
             }
-            let can_fit = self.paged.as_ref().is_some_and(|rt| {
+            let retry_scope = self.paged.as_ref().and_then(|rt| {
                 if !rt.exclusive_turn_active {
-                    return false;
+                    return None;
                 }
-                let Ok(cur) = rt.coordinator.request_token_count_all(seq_id) else {
-                    return false;
-                };
-                let Some(new_total) = cur.checked_add(rows_u32) else {
-                    return false;
-                };
-                rt.coordinator.can_fit_single_allocation(seq_id, new_total)
+                let cur = rt.coordinator.request_token_count_all(seq_id).ok()?;
+                let new_total = cur.checked_add(rows_u32)?;
+                rt.coordinator
+                    .can_fit_single_allocation(seq_id, new_total)
+                    .then(|| exclusive_reclaim_scope_for_total(rt, seq_id, new_total))
             });
-            if !can_fit {
+            let Some(scope) = retry_scope else {
                 return Ok(false);
-            }
+            };
             if !tried_grow {
                 tried_grow = true;
                 let grew = self
@@ -520,7 +786,7 @@ impl Inkling2Inner {
                     continue;
                 }
             }
-            if self.try_reclaim_one_for_exclusive(seq_id, &mut skipped_store, None) {
+            if self.try_reclaim_one_for_exclusive(seq_id, scope, &mut reclaim_state, None) {
                 continue;
             }
             return Ok(false);
@@ -534,7 +800,7 @@ impl Inkling2Inner {
         tokens: &[u32],
         total_budget: u32,
     ) -> std::result::Result<u32, String> {
-        let mut skipped_store = HashSet::new();
+        let mut reclaim_state = ExclusiveReclaimState::default();
         loop {
             let res = {
                 let rt = self
@@ -553,7 +819,12 @@ impl Inkling2Inner {
                             && rt.coordinator.can_fit_logical_tokens(total_budget)
                     });
                     if can_retry
-                        && self.try_reclaim_one_for_exclusive(seq_id, &mut skipped_store, None)
+                        && self.try_reclaim_one_for_exclusive(
+                            seq_id,
+                            ExclusiveReclaimScope::Any,
+                            &mut reclaim_state,
+                            None,
+                        )
                     {
                         continue;
                     }
@@ -682,7 +953,7 @@ impl Inkling2Inner {
         // `prepare_turn_per_block_booking_hit_only`, which installs the matched blocks (hot or
         // restored via `arm_state_restore` / `arm_landed_chain`) directly into `seq_id`'s block
         // table and `request_tokens`.
-        let mut skipped_store = HashSet::new();
+        let mut global_reclaim_state = ExclusiveReclaimState::default();
         let restored_global = loop {
             let (prepared, chain_hot, refused) = {
                 let rt = self
@@ -725,7 +996,8 @@ impl Inkling2Inner {
                     if can_retry
                         && self.try_reclaim_one_for_exclusive(
                             seq_id,
-                            &mut skipped_store,
+                            ExclusiveReclaimScope::Any,
+                            &mut global_reclaim_state,
                             Some(hit.id),
                         )
                     {
@@ -744,7 +1016,8 @@ impl Inkling2Inner {
                     if can_retry
                         && self.try_reclaim_one_for_exclusive(
                             seq_id,
-                            &mut skipped_store,
+                            ExclusiveReclaimScope::Any,
+                            &mut global_reclaim_state,
                             Some(hit.id),
                         )
                     {
@@ -762,12 +1035,16 @@ impl Inkling2Inner {
         }
 
         // Restore Group 1 (40 SWA visits) raw blocks + 48 ShortConv states.
+        // Borrow `&anchor` across retries so `swa_blocks` (~82.5 MiB) is never deep-copied,
+        // and restrict reclaim to `SlidingOnly` so Global `StateStore` checkpoints/marks are
+        // never evicted for SWA-only pool pressure.
         let exclusive = self
             .paged
             .as_ref()
             .is_some_and(|rt| rt.exclusive_turn_active);
         if exclusive {
             let swa_blocks_len = anchor.swa_blocks.len();
+            let mut swa_reclaim_state = ExclusiveReclaimState::default();
             loop {
                 let swa_res = {
                     let rt = self
@@ -780,7 +1057,7 @@ impl Inkling2Inner {
                         seq_id,
                         tokens,
                         depth,
-                        anchor.clone(),
+                        &anchor,
                     )
                 };
                 match swa_res {
@@ -793,7 +1070,8 @@ impl Inkling2Inner {
                         if can_retry
                             && self.try_reclaim_one_for_exclusive(
                                 seq_id,
-                                &mut skipped_store,
+                                ExclusiveReclaimScope::SlidingOnly,
+                                &mut swa_reclaim_state,
                                 Some(hit.id),
                             )
                         {
@@ -821,7 +1099,7 @@ impl Inkling2Inner {
                 seq_id,
                 tokens,
                 depth,
-                anchor,
+                &anchor,
             ) {
                 let _ = rt.coordinator.release_request_all(seq_id);
                 rt.conv_states.remove(&seq_id);
@@ -3111,5 +3389,446 @@ mod tests {
         assert!(rt.conv_states.contains_key(&seq_a));
         assert!(sched.inner.dspark_turn_contexts.contains_key(&seq_a));
         assert_eq!(rt.state_store.store.entries().count(), store_entries_before);
+    }
+
+    /// Test (6): Ownerless `seq_id = 0` is NEVER evicted by named exclusive-turn pressure.
+    ///
+    /// Ownerless `SessionStart` (`cache_owner_id: None`) runs on reserved `seq_id = 0` first
+    /// (carrying an older recency stamp than Named Owner A). Named Owner A fills the remaining
+    /// pool capacity on `seq_id = 1`, then Named Owner B arrives under pressure and must reclaim
+    /// Named Owner A without touching `seq_id = 0`. Ownerless `SessionContinue` then succeeds
+    /// cleanly without failing with `"requires an initialized session"`.
+    #[test]
+    fn exclusive_reclaim_preserves_ownerless_seq_zero_across_named_pressure() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let inner = build_synthetic_dflash2_inner(128, None);
+        let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+
+        let mut cfg_ownerless = exclusive_dflash2_config("unused", 4, "salt-ownerless");
+        cfg_ownerless.cache_owner_id = None;
+
+        // 1. Ownerless SessionStart runs on seq_id = 0 (2 Global blocks, older stamp).
+        let res_0 = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            user_msg("alpha0"),
+            cfg_ownerless.clone(),
+        )
+        .expect("Ownerless SessionStart must succeed");
+        assert_eq!(res_0.num_tokens, 4);
+        let (seq0_block0, stamp_0) = {
+            let rt = sched.inner.paged.as_ref().expect("paged runtime");
+            let full = rt.coordinator.full_adapter();
+            assert!(rt.coordinator.is_live_all(0), "seq_id = 0 must be live");
+            assert!(rt.conv_states.contains_key(&0));
+            (
+                full.block_table_for(0).unwrap().blocks()[0].block_id,
+                full.turn_end_stamp(0).expect("seq_id = 0 stamp"),
+            )
+        };
+
+        // 2. Named Owner A runs on seq_id >= 1 and fills the remaining 2 blocks (4/4 full).
+        let res_a = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            user_msg("alpha1"),
+            exclusive_dflash2_config("owner-a", 4, "salt-a"),
+        )
+        .expect("Owner A SessionStart must succeed");
+        assert_eq!(res_a.num_tokens, 4);
+        let seq_a = *sched.owner_sequences.get("owner-a").expect("seq_a");
+        assert!(seq_a >= 1, "named owners must allocate seq_id >= 1");
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged runtime");
+            let full = rt.coordinator.full_adapter();
+            let stamp_a = full.turn_end_stamp(seq_a).expect("stamp_a");
+            assert!(
+                stamp_0 < stamp_a,
+                "ownerless seq_id = 0 must be older than Named Owner A"
+            );
+            assert_eq!(
+                full.block_telemetry().unwrap().free_blocks,
+                0,
+                "seq 0 + Owner A must fill the 4-block pool"
+            );
+        }
+
+        // 3. Named Owner B arrives under pressure -> must reclaim Owner A (NOT older seq 0).
+        let res_b = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            user_msg("bravo2"),
+            exclusive_dflash2_config("owner-b", 4, "salt-b"),
+        )
+        .expect("Owner B SessionStart must reclaim Owner A while preserving ownerless seq 0");
+        assert_eq!(res_b.num_tokens, 4);
+        let seq_b = *sched.owner_sequences.get("owner-b").expect("seq_b");
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged runtime");
+            let full = rt.coordinator.full_adapter();
+            assert!(
+                rt.coordinator.is_live_all(0),
+                "ownerless seq_id = 0 must stay live across named pressure"
+            );
+            assert!(rt.conv_states.contains_key(&0));
+            assert_eq!(
+                full.block_table_for(0).unwrap().blocks()[0].block_id,
+                seq0_block0,
+                "ownerless seq_id = 0 KV block 0 must remain untouched"
+            );
+            assert!(
+                !rt.coordinator.is_live_all(seq_a),
+                "Named Owner A must be reclaimed"
+            );
+            assert!(rt.coordinator.is_live_all(seq_b), "Owner B must be live");
+        }
+
+        // 4. Ownerless SessionContinue runs and succeeds cleanly (no "requires an initialized session").
+        let mut cont_msgs = user_msg("alpha0");
+        cont_msgs.extend(user_msg("ok"));
+        let res_0_cont = send_session_continue(&mut sched, &tx, &mut rx, cont_msgs, cfg_ownerless)
+            .expect("Ownerless SessionContinue must succeed after named pressure");
+        assert_eq!(res_0_cont.num_tokens, 4);
+        let rt = sched.inner.paged.as_ref().expect("paged runtime");
+        assert!(rt.coordinator.is_live_all(0), "seq_id = 0 remains live");
+    }
+
+    /// Test (7): Bounded, cancellation-aware SSD reclaim wait.
+    ///
+    /// With a real temporary `StateDisk` SSD tier attached to a capped 2-block pool:
+    /// 1. Owner A fills both blocks and arms a `StateStore` `Ordinary` entry pinning block 0.
+    ///    Owner B triggers exclusive reclaim, spilling Owner A's state blob + Global KV chain
+    ///    to SSD and waiting within the bounded budget until the write lands and unmarks block 0,
+    ///    allowing Owner B to succeed cleanly.
+    /// 2. Setting `turn_cancel` immediately short-circuits the bounded wait and moves pending
+    ///    SSD entries into `skipped` without blocking.
+    #[test]
+    fn exclusive_reclaim_waits_for_pending_ssd_chain_write() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-excl-ssd-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).expect("create temp_root");
+        let _temp_guard = TempDirGuard(temp_root.clone());
+
+        let mut inner = build_synthetic_dflash2_inner(64, None);
+        let disk_opts = crate::disk_tier::DiskTierOptions {
+            cache_disk: crate::disk_tier::CacheDisk::Bytes(64u64 << 20),
+            persistent: false,
+            cache_dir: None,
+            temp_root: Some(temp_root),
+        };
+        assert!(
+            inner.attach_state_disk(&disk_opts, || None).is_some(),
+            "temporary StateDisk tier must attach"
+        );
+
+        let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+
+        // 1. Owner A fills the 2-block pool and publishes a StateStore entry pinning block 0.
+        let res_a = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            user_msg("alpha1"),
+            exclusive_dflash2_config("owner-a", 8, "salt-a"),
+        )
+        .expect("Owner A SessionStart must succeed");
+        assert_eq!(res_a.num_tokens, 8);
+        let seq_a = *sched.owner_sequences.get("owner-a").expect("seq_a");
+        let entry_a = {
+            let rt = sched.inner.paged.as_ref().expect("paged runtime");
+            assert!(rt.state_store.disk.is_some());
+            assert_eq!(
+                rt.coordinator
+                    .full_adapter()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks,
+                0
+            );
+            assert!(
+                rt.state_store.store.marks().next().is_some(),
+                "Owner A must publish a StateStore entry with armed chain marks"
+            );
+            let entry_a = rt
+                .state_store
+                .store
+                .entries()
+                .next()
+                .expect("Owner A must publish a StateStore entry");
+            assert!(super::store_entry_marks_chain(entry_a));
+            entry_a.id()
+        };
+
+        // 2. Owner B needs all 2 blocks -> spills Owner A's StateStore entry to SSD and waits
+        //    for its state blob + Global KV chain write to land and unmark block 0.
+        let res_b = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            user_msg("bravo2"),
+            exclusive_dflash2_config("owner-b", 8, "salt-b"),
+        )
+        .expect("Owner B must wait for Owner A's SSD chain write to land and succeed");
+        assert_eq!(res_b.num_tokens, 8);
+        let seq_b = *sched.owner_sequences.get("owner-b").expect("seq_b");
+        let entry_b = {
+            let rt = sched.inner.paged.as_ref().expect("paged runtime");
+            assert!(rt.coordinator.is_live_all(seq_b), "Owner B must be live");
+            assert!(
+                !rt.coordinator.is_live_all(seq_a),
+                "Owner A must be reclaimed"
+            );
+            assert!(
+                rt.state_store.disk_counters().offloads >= 1,
+                "Owner A's StateStore entry must have spilled and landed on SSD"
+            );
+            let spilled_a = rt
+                .state_store
+                .store
+                .get(entry_a)
+                .expect("Owner A entry remains indexed on SSD after spill");
+            assert!(spilled_a.ram().is_none(), "Owner A RAM copy was dropped");
+            assert!(
+                spilled_a.disk().is_some_and(|d| d.landed && !d.chain_owed),
+                "Owner A SSD state + Global KV chain must have landed cleanly"
+            );
+            rt.state_store
+                .store
+                .entries()
+                .find(|e| e.id() != entry_a && super::store_entry_marks_chain(e))
+                .expect("Owner B must hold a marked StateStore entry")
+                .id()
+        };
+
+        // 3. Cancellation must immediately short-circuit the bounded SSD wait.
+        crate::engine::hybrid_scheduler::HybridSchedulerBackend::release_scheduled_cache(
+            &mut sched.inner,
+            seq_b,
+        )
+        .expect("release seq_b so only pending SSD entry remains");
+        sched.inner.paged.as_mut().unwrap().exclusive_turn_active = true;
+        sched.inner.turn_cancel = Some(Arc::new(AtomicBool::new(true)));
+
+        let mut reclaim_state = super::ExclusiveReclaimState::default();
+        reclaim_state.push_pending_ssd(entry_b);
+        let t0 = Instant::now();
+        let progressed = sched.inner.try_reclaim_one_for_exclusive(
+            99,
+            super::ExclusiveReclaimScope::Any,
+            &mut reclaim_state,
+            None,
+        );
+        let elapsed = t0.elapsed();
+
+        sched.inner.turn_cancel = None;
+        sched.inner.paged.as_mut().unwrap().exclusive_turn_active = false;
+        assert!(
+            !progressed,
+            "cancelled SSD wait must return false without reclaiming"
+        );
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "cancelled SSD wait must short-circuit immediately, took {elapsed:?}"
+        );
+        assert!(reclaim_state.pending_ssd.is_empty());
+        assert!(reclaim_state.skipped.contains(&entry_b));
+        assert!(
+            sched
+                .inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .store
+                .get(entry_b)
+                .is_some_and(super::store_entry_marks_chain),
+            "cancelled wait must leave pending entry untouched"
+        );
+
+        let _ = sched
+            .inner
+            .close_state_disk(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// Test (8): Group-targeted `SlidingOnly` reclaim preserves Global `StateStore` checkpoints
+    /// and borrows `&Inkling2StateAnchor` across SWA restore retries without deep-copying.
+    #[test]
+    fn exclusive_reclaim_sliding_pressure_preserves_global_checkpoints() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        // 8 Global blocks (256 tokens), while SWA (window=64, block_size=32, max_chunk=32) has a
+        // tighter fixed pool so SWA exhausts while Global still has free blocks.
+        let inner = build_synthetic_dflash2_inner(256, None);
+        let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+
+        let cfg_a = exclusive_dflash2_config("owner-a", 4, "salt-a");
+        let cfg_c = exclusive_dflash2_config("owner-c", 4, "salt-c");
+        let hit_salt =
+            crate::engine::backend::ChatBackend::resolve_params(&sched.inner, &cfg_a).cache_salt;
+        let cp_salt =
+            crate::engine::backend::ChatBackend::resolve_params(&sched.inner, &cfg_c).cache_salt;
+
+        let _ = send_session_start(&mut sched, &tx, &mut rx, user_msg("alpha1"), cfg_a)
+            .expect("Owner A");
+        let _ = send_session_start(&mut sched, &tx, &mut rx, user_msg("gamma3"), cfg_c)
+            .expect("Owner C");
+        let seq_a = *sched.owner_sequences.get("owner-a").expect("seq_a");
+        let seq_c = *sched.owner_sequences.get("owner-c").expect("seq_c");
+
+        let (tokens_a, cp_id) = {
+            let rt = sched.inner.paged.as_mut().expect("paged runtime");
+            let tokens_a = rt
+                .coordinator
+                .full_adapter()
+                .request_tokens_for(seq_a)
+                .expect("seq_a tokens")
+                .to_vec();
+            let ord_a_id = rt
+                .state_store
+                .store
+                .entries()
+                .next()
+                .expect("Owner A turn must have captured an Ordinary StateStore entry")
+                .id();
+            // Owner C's SessionStart also published an Ordinary entry at (seq_c, cp_salt).
+            // Evict that Ordinary entry so re-capturing seq_c at depth 32 inserts a genuine
+            // `StateClass::Checkpoint` entry marking Global KV.
+            let stale_c_ids: Vec<_> = rt
+                .state_store
+                .store
+                .entries()
+                .filter(|e| e.id() != ord_a_id)
+                .map(|e| e.id())
+                .collect();
+            for stale_id in stale_c_ids {
+                let _ = rt.state_store.reclaim_entry(&rt.coordinator, stale_id);
+            }
+
+            let tokens_c = rt
+                .coordinator
+                .full_adapter()
+                .request_tokens_for(seq_c)
+                .expect("seq_c tokens")
+                .to_vec();
+            let conv_c = rt.conv_states.get(&seq_c).expect("seq_c conv").clone();
+            let cp_id = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv_c,
+                    seq_c,
+                    &tokens_c,
+                    32,
+                    cp_salt,
+                    super::StateClass::Checkpoint,
+                )
+                .expect("capture unrelated Checkpoint")
+                .expect("Checkpoint entry id");
+
+            // Ensure SWA has 0 free blocks while Global still has >= 2 free blocks.
+            let swa_free = rt
+                .coordinator
+                .sliding_adapter()
+                .expect("sliding adapter")
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            if swa_free > 0 {
+                let seq_fill = 50u32;
+                let fill_tokens: Vec<u32> = (100..100 + swa_free * 32).collect();
+                rt.coordinator
+                    .reset_scheduled_request(seq_fill)
+                    .expect("reset filler");
+                rt.coordinator
+                    .record_tokens_all(seq_fill, &fill_tokens)
+                    .expect("fill remaining SWA blocks");
+                rt.coordinator
+                    .finalize_keep_live_all(seq_fill, &[], 0xF111)
+                    .expect("stamp filler newer than seq_a");
+            }
+            let full_free = rt
+                .coordinator
+                .full_adapter()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            let swa_free_after = rt
+                .coordinator
+                .sliding_adapter()
+                .unwrap()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            assert!(
+                full_free >= 2,
+                "Global must still have free blocks, got {full_free}"
+            );
+            assert_eq!(swa_free_after, 0, "SWA pool must be full");
+            assert!(
+                rt.state_store
+                    .store
+                    .get(cp_id)
+                    .is_some_and(|e| e.checkpoint() && super::store_entry_marks_chain(e)),
+                "unrelated Checkpoint must be present and marking Global KV"
+            );
+            assert_eq!(
+                super::exclusive_reclaim_scope_for_total(rt, seq_c, 96),
+                super::ExclusiveReclaimScope::SlidingOnly,
+                "SWA-only shortfall with free Global blocks must select SlidingOnly"
+            );
+            (tokens_a, cp_id)
+        };
+
+        // End-to-end SWA restore retry via `prepare_prefix_sync` -> `install_state_hit_sync`:
+        // Global restore succeeds immediately; SWA restore hits pool exhaustion, reclaims
+        // oldest idle SWA owner `seq_a` under `SlidingOnly`, retries with borrowed `&anchor`,
+        // and leaves the unrelated Global `StateClass::Checkpoint` completely untouched!
+        let seq_b = 99u32;
+        let mut query_tokens = tokens_a[..32].to_vec();
+        query_tokens.extend_from_slice(&[10, 11, 12, 13]);
+        sched.inner.paged.as_mut().unwrap().exclusive_turn_active = true;
+        let prefix = sched
+            .inner
+            .prepare_prefix_sync(seq_b, &query_tokens, true, hit_salt)
+            .expect("SWA restore under SlidingOnly pressure must succeed");
+        sched.inner.paged.as_mut().unwrap().exclusive_turn_active = false;
+
+        assert_eq!(
+            prefix.effective_cached_prefix_len, 32,
+            "StateStore hit must restore cleanly at depth 32 instead of falling back to cold"
+        );
+        let rt = sched.inner.paged.as_ref().expect("paged runtime");
+        assert!(
+            rt.state_store.store.get(cp_id).is_some(),
+            "unrelated Global StateClass::Checkpoint must be preserved under SlidingOnly pressure"
+        );
+        let swa_live = rt.coordinator.sliding_adapter().unwrap().live_seq_ids();
+        assert!(
+            !swa_live.contains(&seq_a),
+            "oldest idle owner holding SWA blocks (seq_a) must have been reclaimed"
+        );
+        assert!(
+            swa_live.contains(&seq_b),
+            "restored sequence seq_b must now hold SWA blocks"
+        );
     }
 }

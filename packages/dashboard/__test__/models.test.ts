@@ -896,6 +896,7 @@ describe('catalog companion state', () => {
     const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
     expect(target.builds.some((build) => build.present)).toBe(false);
     expect(target.draft).toMatchObject({
+      autoInstall: true,
       present: true,
       installed: false,
       blockedByForeignDir: false,

@@ -676,10 +676,14 @@ describe('MODEL_CATALOG', () => {
     expect(MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!.minMemoryGb).toBeGreaterThanOrEqual(39);
   });
 
-  it('Qwen3.8-27B keeps its optional DFlash2 companion and Inkling-2-Mini carries its auto-installed DFlash2 companion', () => {
+  it('Qwen3.8-27B and Inkling-2-Mini carry auto-installed DFlash2 companions', () => {
     const qwen = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B');
-    expect(qwen?.draft?.hfRepo).toBe('z-lab/Qwen3.8-27B-DFlash2');
-    expect(qwen?.draft?.autoInstall).toBeUndefined();
+    expect(qwen?.draft).toEqual({
+      label: 'DFlash2',
+      hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
+      sizeGb: 3.85,
+      autoInstall: true,
+    });
     const inkling = MODEL_CATALOG.find((entry) => entry.label === 'Inkling-2-Mini');
     expect(inkling?.draft).toEqual({
       label: 'Inkling-2-Mini DFlash2',
