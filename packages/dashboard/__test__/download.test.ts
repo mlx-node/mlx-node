@@ -2,36 +2,53 @@ import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  cpSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   renameSync,
   rmSync,
   symlinkSync,
+  truncateSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
-import { catalogUpdateRepos, catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import type { ListFileEntry } from '@huggingface/hub';
+import {
+  type CatalogBuild,
+  catalogBuildRepo,
+  catalogBuildSlug,
+  catalogDraftSlug,
+  catalogUpdateRepos,
+  MODEL_CATALOG,
+} from '@mlx-node/agent/catalog';
 import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch } from '../src/api/dispatch.js';
-import { catalogWithState } from '../src/catalog.js';
+import { type CatalogBuildItem, catalogWithState, configlessBuildOf } from '../src/catalog.js';
 import {
   DownloadConflictError,
   type DownloadEvent,
   DownloadManager,
   pidAlive,
+  proveInPlace,
   type ReplaceBlocker,
 } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled } from '../src/models.js';
+import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
+import { hasUpdate, modelPresent } from '../ui/src/lib/catalog.js';
+import { catalogActionState } from '../ui/src/pages/models/catalog.js';
+import { ggufHeader } from './helpers/configless-gguf-fixtures.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -139,6 +156,8 @@ const renameFault = vi.hoisted(() => ({
   failFromPrefix: null as string | null,
   /** A second prefix, so a test can fail the swap AND its rollback. */
   alsoFailFromPrefix: null as string | null,
+  /** A target prefix, so a test can fail one move by where it goes. */
+  failToPrefix: null as string | null,
 }));
 
 // Fires once around the first rename whose source is `from`: `before` runs just before the real rename, `after`
@@ -160,6 +179,54 @@ const raceHook = vi.hoisted(() => ({ onMarkerWrite: null as (() => void) | null 
 // (Finding E), the window where cancellation used to be ignored.
 const stagingHook = vi.hoisted(() => ({ onVerifyWindow: null as (() => void) | null }));
 
+// Runs before every `link` with its target, so a test can act like a writer in the folder during the adds, or make
+// the link fail by throwing. `probe` runs instead for the plan's link test in `.staging` (a `.link-test-` name).
+const linkHook = vi.hoisted(() => ({
+  before: null as ((to: string) => void) | null,
+  probe: null as ((to: string) => void) | null,
+}));
+
+// Runs before every async `unlink` with its path, so a test can make the unlink fail by throwing.
+const unlinkHook = vi.hoisted(() => ({ before: null as ((path: string) => void) | null }));
+
+// Every async `rm` the runner makes, by path, so a test can prove it never reaches an entry the app did not create.
+const rmCalls = vi.hoisted(() => ({ paths: [] as string[] }));
+
+// The Trash every manager in this file gets: the default `moveToSystemTrash` renames the path into `dir` (a fixture
+// folder per test), so no test reaches the real Trash. `refuse` makes it reject and move nothing; `ignore` makes it
+// answer success and move nothing. `before` runs first with the path, so a test can change the disk around the call.
+const trash = vi.hoisted(() => ({
+  dir: '',
+  calls: [] as string[],
+  refuse: false,
+  ignore: false,
+  before: null as ((path: string) => void) | null,
+}));
+
+vi.mock('../src/trash.js', async () => {
+  const { existsSync: exists, renameSync } = await import('node:fs');
+  const { basename, join } = await import('node:path');
+  return {
+    moveToSystemTrash: async (path: string) => {
+      trash.calls.push(path);
+      trash.before?.(path);
+      if (trash.refuse) throw new Error('simulated Trash refusal');
+      if (trash.ignore) return;
+      // A second item of the same name gets a suffix, as in the real Trash.
+      let target = join(trash.dir, basename(path));
+      for (let n = 2; exists(target); n++) target = join(trash.dir, `${basename(path)} ${n}`);
+      renameSync(path, target);
+    },
+  };
+});
+
+// Runs before every async `lstat` with its path, so a test can remove an entry between a folder listing and its stat.
+// `after` runs once the real `lstat` has returned, so a test can act like a writer between a check and the next call.
+const lstatHook = vi.hoisted(() => ({
+  before: null as ((path: string) => void) | null,
+  after: null as ((path: string) => void) | null,
+}));
+
 vi.mock('node:fs/promises', async (importActual) => {
   const actual = await importActual<typeof import('node:fs/promises')>();
   return {
@@ -169,7 +236,8 @@ vi.mock('node:fs/promises', async (importActual) => {
       if (
         (renameFault.failFromPath !== null && f === renameFault.failFromPath) ||
         (renameFault.failFromPrefix !== null && f.startsWith(renameFault.failFromPrefix)) ||
-        (renameFault.alsoFailFromPrefix !== null && f.startsWith(renameFault.alsoFailFromPrefix))
+        (renameFault.alsoFailFromPrefix !== null && f.startsWith(renameFault.alsoFailFromPrefix)) ||
+        (renameFault.failToPrefix !== null && String(to).startsWith(renameFault.failToPrefix))
       ) {
         throw new Error(`simulated rename failure moving ${f}`);
       }
@@ -183,7 +251,7 @@ vi.mock('node:fs/promises', async (importActual) => {
       }
       return actual.rename(from, to);
     },
-    writeFile: async (path: string, data: string | Uint8Array) => {
+    writeFile: async (path: string, data: string | Uint8Array, options?: { flag?: string }) => {
       // `includes` catches the atomic writer too: `writeMarkerAtomically` puts
       // the marker's bytes in `<marker>.<pid>.<uuid>.tmp` before the rename, so
       // a refresh-time hook fires on the temp write, not the final path.
@@ -192,7 +260,26 @@ vi.mock('node:fs/promises', async (importActual) => {
         raceHook.onMarkerWrite = null;
         hook();
       }
-      return actual.writeFile(path, data);
+      return actual.writeFile(path, data, options);
+    },
+    link: async (from: string, to: string) => {
+      if (String(to).includes('/.link-test-')) linkHook.probe?.(String(to));
+      else linkHook.before?.(String(to));
+      return actual.link(from, to);
+    },
+    unlink: async (path: string) => {
+      unlinkHook.before?.(String(path));
+      return actual.unlink(path);
+    },
+    lstat: async (path: string, options?: { bigint?: boolean }) => {
+      lstatHook.before?.(String(path));
+      const stat = await actual.lstat(path, options as never);
+      lstatHook.after?.(String(path));
+      return stat;
+    },
+    rm: async (path: string, options?: { recursive?: boolean; force?: boolean }) => {
+      rmCalls.paths.push(String(path));
+      return actual.rm(path, options);
     },
     readdir: async (path: string, options?: { recursive?: boolean }) => {
       if (stagingHook.onVerifyWindow !== null && options?.recursive === true && path.includes('.staging')) {
@@ -345,20 +432,34 @@ async function waitFor(cond: () => boolean, timeoutMs = 5000): Promise<void> {
   }
 }
 
-// Resolved through `catalogRepo`, matching the allowlist gate in `start` — the
-// catalog carries a different build per platform, so the raw `hfRepo` would be
-// refused on a CUDA host.
-const REPO = catalogRepo(MODEL_CATALOG[0]!);
-const SLUG = REPO.split('/').pop()!.toLowerCase();
-/** A SECOND catalog repo, for the cases that need two genuinely distinct jobs. */
-const REPO_OTHER = catalogRepo(MODEL_CATALOG[1]!);
+/** The build `id` of the catalog entry `label`. */
+function catalogBuild(label: string, id: string): CatalogBuild {
+  const build = MODEL_CATALOG.find((entry) => entry.label === label)?.builds.find((candidate) => candidate.id === id);
+  if (build === undefined) throw new Error(`no build ${label} ${id}`);
+  return build;
+}
+
+/** The first build of the default model (Qwen3.8-27B UD-Q4_K_XL): the build most cases install. */
+const BUILD = catalogBuild('Qwen3.8-27B', 'UD-Q4_K_XL');
+// Resolved through `catalogBuildRepo`, matching the target `start` looks up — the
+// catalog can carry a different build per platform, so the raw `hfRepo` would be
+// wrong on a CUDA host.
+const REPO = catalogBuildRepo(BUILD);
+/** The folder {@link BUILD} installs to: the key `start` takes. */
+const SLUG = catalogBuildSlug(BUILD);
+/** A build of ANOTHER catalog repo, for the cases that need two genuinely distinct jobs. Its `*UD-Q4_K_XL.gguf` glob takes {@link WEIGHT}. */
+const BUILD_OTHER = catalogBuild('Inkling-2-Mini', 'UD-Q4_K_XL');
+const REPO_OTHER = catalogBuildRepo(BUILD_OTHER);
+const SLUG_OTHER = catalogBuildSlug(BUILD_OTHER);
+/** The folder of the optional DFlash2 draft. */
+const DRAFT_SLUG = catalogDraftSlug(QWEN38_DFLASH2);
 /**
- * The `Qwen/Qwen3.8-27B` base-model repo `MODEL_CATALOG[0].assetsRepo` names for
+ * The `Qwen/Qwen3.8-27B` base-model repo {@link BUILD}'s `assetsRepo` names for
  * the tokenizer/config sidecars a GGUF quantization repo does not ship.
  */
-const ASSETS_REPO = MODEL_CATALOG[0]!.assetsRepo!;
+const ASSETS_REPO = BUILD.assetsRepo!;
 /**
- * The single UD-Q4_K_XL weight variant `MODEL_CATALOG[0].globs` selects out of the
+ * The single UD-Q4_K_XL weight variant {@link BUILD}'s globs select out of the
  * multi-variant repo. Entry-based jobs stage THIS name: the entry ships its
  * weights as a `.gguf` and its globs (`*UD-Q4_K_XL*`, `config.json`)
  * match no `.safetensors` path at all, so a safetensors fixture would be filtered
@@ -372,6 +473,12 @@ let cacheDir: string;
 function finalDir(): string {
   return join(modelsDir, SLUG);
 }
+/** The catalog state of the build that installs to `slug`, from a fresh scan. */
+function buildState(slug: string): CatalogBuildItem | undefined {
+  return catalogWithState(modelsDir)
+    .flatMap((item) => item.builds)
+    .find((build) => build.slug === slug);
+}
 /** The `.staging` root (a dotdir model discovery skips). */
 function stagingRoot(): string {
   return join(modelsDir, '.staging');
@@ -384,9 +491,13 @@ function jobStagingDirs(): string[] {
 function backupDirs(): string[] {
   return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.backup-')) : [];
 }
-/** Reinstall backups left under `.staging` (`<slug>.reinstall-...`); empty when clean. */
-function reinstallDirs(): string[] {
-  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.reinstall-')) : [];
+/** Cleanup holders left under `.staging` (`<slug>.cleanup-...`); empty when clean. */
+function holderDirs(): string[] {
+  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.includes('.cleanup-')) : [];
+}
+/** Old entries a cleanup kept under `.staging` (`<slug>.kept-...`). */
+function keptDirs(): string[] {
+  return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`)) : [];
 }
 /** The legacy SHARED staging path (`<slug>@<rev>`), used only to plant pre-fix leftovers. */
 function legacyStagingDir(revision: string = hub.sha): string {
@@ -424,21 +535,33 @@ beforeEach(() => {
   renameFault.failFromPath = null;
   renameFault.failFromPrefix = null;
   renameFault.alsoFailFromPrefix = null;
+  renameFault.failToPrefix = null;
   renameHook.from = null;
   renameHook.before = null;
   renameHook.after = null;
   raceHook.onMarkerWrite = null;
   stagingHook.onVerifyWindow = null;
+  linkHook.before = null;
+  linkHook.probe = null;
+  lstatHook.before = null;
+  lstatHook.after = null;
+  unlinkHook.before = null;
   hub.modelInfoRepos = [];
   hub.modelInfoError = null;
   hub.modelInfoFailRepos = [];
   hub.modelInfoUsesFetch = false;
   modelsDir = mkdtempSync(join(tmpdir(), 'dash-dl-models-'));
   cacheDir = mkdtempSync(join(tmpdir(), 'dash-dl-cache-'));
+  rmCalls.paths = [];
+  trash.dir = mkdtempSync(join(tmpdir(), 'dash-dl-trash-'));
+  trash.calls = [];
+  trash.refuse = false;
+  trash.ignore = false;
+  trash.before = null;
 });
 
 afterEach(() => {
-  for (const dir of [modelsDir, cacheDir]) rmSync(dir, { recursive: true, force: true });
+  for (const dir of [modelsDir, cacheDir, trash.dir]) rmSync(dir, { recursive: true, force: true });
 });
 
 describe('DownloadManager.checkCatalogUpdates — the read half of the staleness check', () => {
@@ -456,13 +579,14 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     const expected = catalogUpdateRepos();
     expect([...shas.keys()].sort()).toEqual([...expected].sort());
     expect(shas.get(REPO)).toBe(hub.sha);
-    for (const entry of MODEL_CATALOG.filter((e) => !e.hidden && e.assetsRepo !== undefined)) {
-      expect(shas.has(entry.assetsRepo!)).toBe(true);
-      expect(hub.modelInfoRepos).toContain(entry.assetsRepo);
+    for (const build of MODEL_CATALOG.filter((e) => !e.hidden).flatMap((e) => e.builds)) {
+      if (build.assetsRepo === undefined) continue;
+      expect(shas.has(build.assetsRepo)).toBe(true);
+      expect(hub.modelInfoRepos).toContain(build.assetsRepo);
     }
-    for (const entry of MODEL_CATALOG.filter((e) => e.hidden)) {
-      expect(hub.modelInfoRepos).not.toContain(catalogRepo(entry));
-      if (entry.assetsRepo !== undefined) expect(hub.modelInfoRepos).not.toContain(entry.assetsRepo);
+    for (const build of MODEL_CATALOG.filter((e) => e.hidden).flatMap((e) => e.builds)) {
+      expect(hub.modelInfoRepos).not.toContain(catalogBuildRepo(build));
+      if (build.assetsRepo !== undefined) expect(hub.modelInfoRepos).not.toContain(build.assetsRepo);
     }
   });
 
@@ -545,7 +669,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // With that sweep parked mid-flight, a real job resolves and installs NEW.
     hub.sha = SHA_NEW;
     const events: DownloadEvent[] = [];
-    const id = m.start(REPO);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -595,7 +719,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
     // The job asks first, so its answer is the sha upstream held BEFORE it moved.
     hub.sha = SHA_OLD;
     const events: DownloadEvent[] = [];
-    const id = m.start(REPO);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => jobAsked);
 
@@ -640,7 +764,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
 
     hub.sha = SHA_OLD;
     const events: DownloadEvent[] = [];
-    const id = m.start(REPO);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => jobAsked);
 
@@ -737,7 +861,7 @@ describe('DownloadManager.checkCatalogUpdates — the read half of the staleness
 
     hub.sha = SHA_NEW;
     const events: DownloadEvent[] = [];
-    const id = m.start(REPO);
+    const id = m.start(SLUG).id;
     m.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -758,7 +882,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'done'));
@@ -815,14 +939,14 @@ describe('DownloadManager', () => {
         return url.endsWith('/config.json') ? Promise.resolve(new Response(config)) : weightsFetch(input, init);
       },
     });
-    const id = manager.start(QWEN38_DFLASH2.hfRepo);
+    const id = manager.start(DRAFT_SLUG).id;
     await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
     expect(manager.jobs().find((job) => job.id === id)?.state).toBe(valid ? 'done' : 'error');
     const draftPath = join(modelsDir, 'qwen3.8-27b-dflash2');
     expect(existsSync(draftPath)).toBe(valid);
     expect(findDFlash2Draft(join(modelsDir, 'qwen3.8-27b-mxfp4-mlx'), 'qwen3_5')).toBe(valid ? draftPath : undefined);
     const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
-    expect(target.present).toBe(false);
+    expect(target.builds.some((build) => build.present)).toBe(false);
     expect(target.draft?.present).toBe(valid);
     expect(target.draft?.installed).toBe(valid);
     await manager.shutdown();
@@ -843,16 +967,15 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
 
-    // Through the resolver, mirroring the allowlist. Hidden entries carry no
-    // CUDA build today, so this is the same string — but a raw `hfRepo` here
-    // would silently start testing the wrong thing the day one does.
-    expect(() => manager.start(catalogRepo(hidden!))).toThrow('not in the model catalog');
+    // Its folder, through the resolver the catalog installs it with.
+    expect(() => manager.start(catalogBuildSlug(hidden!.builds[0]))).toThrow('is not a folder of the model catalog');
+    expect(() => manager.start('someone-not-in-catalog')).toThrow('is not a folder of the model catalog');
     // Rejected BEFORE any job is allocated — otherwise the SPA renders a job
     // that marches to a 401 instead of an immediate, actionable error.
     expect(manager.jobs()).toEqual([]);
 
     // Non-hidden entries are unaffected.
-    expect(() => manager.start(REPO)).not.toThrow();
+    expect(() => manager.start(SLUG)).not.toThrow();
     // That last `start` allocated a REAL job whose `drain` runs detached. Without
     // this the test returns while `processJob` is still writing under `modelsDir`,
     // and the `afterEach` `rmSync` races it to an intermittent ENOTEMPTY.
@@ -871,7 +994,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The entry's list + both downloadFileToCacheDir calls all saw exactly one
@@ -902,7 +1025,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(REPO);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
       expect(events.some((event) => event.type === 'done')).toBe(false);
@@ -918,7 +1041,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(REPO);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
       expect(existsSync(finalDir())).toBe(false);
@@ -932,7 +1055,7 @@ describe('DownloadManager', () => {
         cacheDir,
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
-      const id = manager.start(REPO);
+      const id = manager.start(SLUG).id;
       await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
       const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
         revision: string;
@@ -949,7 +1072,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -965,15 +1088,54 @@ describe('DownloadManager', () => {
     expect(existsSync(finalDir())).toBe(false);
     await waitFor(() => jobStagingDirs().length === 0);
     // Catalog must NOT report the aborted download as installed.
-    const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
+    const item = buildState(SLUG)!;
     expect(item.installed).toBe(false);
+  });
+
+  it('installs a repo that keeps its weights in a variant folder, and the catalog reads it installed and present', async () => {
+    const build = catalogBuild('Qwen3.8-Flash-Next', 'UD-Q4_K_XL');
+    const repo = catalogBuildRepo(build);
+    const assetsRepo = build.assetsRepo!;
+    const shards = [1, 2, 3, 4].map((part) => `UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`);
+    hub.manifests[repo] = [
+      { type: 'directory', path: 'UD-Q4_K_XL', size: 0 },
+      ...shards.map((path) => ({ type: 'file' as const, path, size: 100 })),
+      { type: 'file', path: 'UD-Q3_K_XL/Qwen3.8-Flash-Next-UD-Q3_K_XL-00001-of-00004.gguf', size: 100 },
+      { type: 'file', path: 'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf', size: 100 },
+      { type: 'file', path: 'mmproj-BF16.gguf', size: 100 },
+      { type: 'file', path: 'README.md', size: 10 },
+    ];
+    hub.manifests[assetsRepo] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({
+        ...Object.fromEntries(shards.map((path) => [path, 100])),
+        'config.json': 12,
+        'tokenizer.json': 20,
+      }),
+    });
+    const id = manager.start(catalogBuildSlug(build)).id;
+    await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
+    expect(manager.jobs().find((job) => job.id === id)?.state).toBe('done');
+    expect([...hub.downloadedFrom].sort()).toEqual(
+      [...shards.map((path) => `${repo}/${path}`), `${assetsRepo}/config.json`, `${assetsRepo}/tokenizer.json`].sort(),
+    );
+    const item = catalogWithState(modelsDir).find((candidate) => candidate.label === 'Qwen3.8-Flash-Next')!.builds[0];
+    for (const shard of shards) expect(existsSync(join(modelsDir, item.slug, shard)), shard).toBe(true);
+    expect(existsSync(join(modelsDir, item.slug, 'config.json'))).toBe(true);
+    expect(item).toMatchObject({ installed: true, present: true, blockedByForeignDir: false, blocker: null });
+    await manager.shutdown();
   });
 
   it('errors on an empty manifest instead of publishing a hollow dir', async () => {
     hub.manifest = [];
     const manager = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({}) });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -981,7 +1143,7 @@ describe('DownloadManager', () => {
     expect(events.some((event) => event.type === 'done')).toBe(false);
     expect(events.find((event) => event.type === 'error')).toMatchObject({ type: 'error' });
     expect(existsSync(finalDir())).toBe(false);
-    const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
+    const item = buildState(SLUG)!;
     expect(item.installed).toBe(false);
   });
 
@@ -999,14 +1161,14 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
     expect(events.some((event) => event.type === 'done')).toBe(false);
     expect(existsSync(finalDir())).toBe(false);
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
     expect(jobStagingDirs()).toEqual([]);
   });
 
@@ -1021,7 +1183,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'model.safetensors': 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(QWEN38_DFLASH2.hfRepo);
+    const id = manager.start(DRAFT_SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -1037,7 +1199,7 @@ describe('DownloadManager', () => {
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12));
     writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
 
     // A marker listing both a config and a weight, all present → installed.
     writeFileSync(
@@ -1049,7 +1211,7 @@ describe('DownloadManager', () => {
         completedAt: '2026-07-21T00:00:00Z',
       }),
     );
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
 
     // A marker referencing a missing file must NOT count as installed.
     writeFileSync(
@@ -1061,7 +1223,7 @@ describe('DownloadManager', () => {
         completedAt: 'x',
       }),
     );
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
 
     // A one-sided marker (config-only, no weight) is never installed either — a
     // hollow publish `loadModel` would reject (Finding G2).
@@ -1069,7 +1231,7 @@ describe('DownloadManager', () => {
       join(finalDir(), DOWNLOAD_COMPLETE_MARKER),
       JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json'], completedAt: 'x' }),
     );
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
   });
 
   it('resumes from the HF cache without re-fetching already-cached files', async () => {
@@ -1081,7 +1243,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'error'));
     expect(hub.downloaded).toContain('config.json');
@@ -1089,13 +1251,13 @@ describe('DownloadManager', () => {
     // Second job: the weight succeeds; config.json is served from the HF cache.
     hub.failOn = [];
     hub.downloaded = [];
-    const id2 = manager.start(REPO);
+    const id2 = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id2 && j.state === 'done'));
 
     // config.json was a cache hit (no re-fetch); only the weight was fetched.
     expect(hub.downloaded).not.toContain('config.json');
     expect(hub.downloaded).toContain(WEIGHT);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('downloads only the glob-matched variants of a multi-variant GGUF repo', async () => {
@@ -1124,7 +1286,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, [MTP]: 33, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -1157,7 +1319,7 @@ describe('DownloadManager', () => {
     // …while the selected build and the core metadata landed.
     expect(existsSync(join(finalDir(), WEIGHT))).toBe(true);
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('fetches the tokenizer sidecars from the entry assetsRepo and lists them in the completion marker', async () => {
@@ -1187,7 +1349,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
@@ -1210,7 +1372,7 @@ describe('DownloadManager', () => {
     expect(marker.repo).toBe(REPO);
     expect(marker.revision).toBe(hub.sha);
     expect(marker.files).toEqual(expect.arrayContaining([WEIGHT, ...sidecars]));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('accepts a weights-only manifest when the entry names an assetsRepo for the config half', async () => {
@@ -1225,13 +1387,13 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done'));
 
     expect(events.some((event) => event.type === 'error')).toBe(false);
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('errors without publishing when neither the repo nor its assetsRepo provides a config.json', async () => {
@@ -1248,7 +1410,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
 
@@ -1261,19 +1423,16 @@ describe('DownloadManager', () => {
   });
 
   it('errors when the only matched GGUF is a companion artifact, not the target', async () => {
-    // The GEMMA entry is the one whose globs select a companion by name
+    // The Inkling GGUF builds' globs select a companion by name
     // (`mmproj-BF16.gguf`, for the vision tower). A partial upstream upload (or
     // a renamed target) can leave the manifest with the projector and nothing
     // else: publishing that would certify a directory model-discovery never
-    // lists — "Installed" with no loadable model. (The Qwen3.8 entry cannot
-    // express this: its globs filter a companion out before the gate runs.)
-    const gemma = MODEL_CATALOG.find((entry) => entry.label === 'Gemma-4-26B-A4B')!;
-    const gemmaRepo = catalogRepo(gemma);
-    const gemmaSlug = gemmaRepo.split('/').pop()!.toLowerCase();
-    expect(gemma.globs).toContain('mmproj-BF16.gguf');
+    // lists — "Installed" with no loadable model. (The Qwen3.8 builds cannot
+    // express this: their globs filter a companion out before the gate runs.)
+    expect(BUILD_OTHER.globs).toContain('mmproj-BF16.gguf');
 
     hub.manifest = [{ type: 'file', path: 'mmproj-BF16.gguf', size: 44 }];
-    hub.manifests[gemma.assetsRepo!] = [
+    hub.manifests[BUILD_OTHER.assetsRepo!] = [
       { type: 'file', path: 'config.json', size: 12 },
       { type: 'file', path: 'tokenizer.json', size: 20 },
     ];
@@ -1284,13 +1443,13 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'mmproj-BF16.gguf': 44, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(gemmaRepo);
+    const id = manager.start(SLUG_OTHER).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
 
     expect(events.some((event) => event.type === 'error')).toBe(true);
     expect(events.some((event) => event.type === 'done')).toBe(false);
-    expect(existsSync(join(modelsDir, gemmaSlug))).toBe(false);
+    expect(existsSync(join(modelsDir, SLUG_OTHER))).toBe(false);
     await waitFor(() => jobStagingDirs().length === 0);
   });
 
@@ -1312,7 +1471,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1325,7 +1484,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1357,7 +1516,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1371,7 +1530,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     raceHook.onMarkerWrite = () => second.cancel(id2);
     await waitFor(() => events2.some((event) => event.type === 'cancelled' || event.type === 'done'));
@@ -1404,7 +1563,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
 
@@ -1422,7 +1581,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1449,7 +1608,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(true);
@@ -1464,7 +1623,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1518,7 +1677,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -1570,7 +1729,7 @@ describe('DownloadManager', () => {
         cacheDir,
         fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
       });
-      const idOne = first.start(REPO);
+      const idOne = first.start(SLUG).id;
       const eventsOne: DownloadEvent[] = [];
       first.subscribe(idOne, (event) => eventsOne.push(event));
       await waitFor(() => eventsOne.some((event) => event.type === 'done'));
@@ -1586,7 +1745,7 @@ describe('DownloadManager', () => {
           cacheDir,
           fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
         });
-        const idTwo = second.start(REPO);
+        const idTwo = second.start(SLUG).id;
         const eventsTwo: DownloadEvent[] = [];
         second.subscribe(idTwo, (event) => eventsTwo.push(event));
         await waitFor(() => eventsTwo.some((event) => event.type === 'error' || event.type === 'done'));
@@ -1610,7 +1769,7 @@ describe('DownloadManager', () => {
   );
 
   it('refuses to prune away the last config, leaving the install intact', async () => {
-    // The primary GGUF repo ships no config.json (AgentWorld's doesn't): the
+    // The primary GGUF repo ships no config.json here: the
     // sidecar is the ONLY one. Upstream dropping it must not delete the live
     // install into an unloadable shape — the refresh fails instead, marker and
     // files untouched.
@@ -1626,7 +1785,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
@@ -1637,7 +1796,7 @@ describe('DownloadManager', () => {
     hub.downloaded = [];
     const second = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({ [WEIGHT]: 300 }) });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'error' || event.type === 'done'));
 
@@ -1669,7 +1828,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const first: DownloadEvent[] = [];
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => first.push(event));
     await waitFor(() => first.some((event) => event.type === 'done'));
     expect([...hub.downloaded].sort()).toEqual([WEIGHT, 'config.json', 'tokenizer.json'].sort());
@@ -1683,7 +1842,7 @@ describe('DownloadManager', () => {
     hub.downloadedFrom = [];
 
     const second: DownloadEvent[] = [];
-    const id2 = manager.start(REPO);
+    const id2 = manager.start(SLUG).id;
     manager.subscribe(id2, (event) => second.push(event));
     await waitFor(() => second.some((event) => event.type === 'done'));
 
@@ -1712,7 +1871,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 20 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = first.start(REPO);
+    const id1 = first.start(SLUG).id;
     first.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'done'));
     expect(readFileSync(join(finalDir(), 'tokenizer.json')).length).toBe(20);
@@ -1731,7 +1890,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12, 'tokenizer.json': 30 }),
     });
     const events2: DownloadEvent[] = [];
-    const id2 = second.start(REPO);
+    const id2 = second.start(SLUG).id;
     second.subscribe(id2, (event) => events2.push(event));
     await waitFor(() => events2.some((event) => event.type === 'done'));
 
@@ -1757,7 +1916,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // Idempotent: nothing re-fetched, the existing install untouched.
@@ -1787,7 +1946,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     expect(hub.downloaded).toEqual(expect.arrayContaining(['config.json', WEIGHT]));
@@ -1818,7 +1977,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // It genuinely downloaded the resolved revision (never falsely reported done)…
@@ -1832,7 +1991,7 @@ describe('DownloadManager', () => {
     };
     expect(marker.revision).toBe(SHA_NEW);
     expect(backupDirs()).toEqual([]);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('re-fetches and recovers when a corrupt cached blob fails the sha256 check', async () => {
@@ -1853,14 +2012,14 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The corrupt cache entry failed sha256 → was invalidated → really re-fetched →
     // matched → published (without invalidation the retry would recopy the same blob).
     expect(hub.downloaded).toContain(WEIGHT);
     expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('content-verifies a XET-backed weight, which carries all three digest fields at once', async () => {
@@ -1896,12 +2055,12 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     expect(hub.downloaded, 'a same-length corrupt Xet blob was accepted without a re-fetch').toContain(WEIGHT);
     expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('re-fetches when a corrupt cached blob fails the git-blob oid check', async () => {
@@ -1916,13 +2075,13 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // Wrong git-blob oid → invalidated → re-fetched → matched.
     expect(hub.downloaded).toContain('config.json');
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('invalidates the cached pointer AND blob when staged bytes never match the manifest', async () => {
@@ -1945,7 +2104,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -1975,7 +2134,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -1984,7 +2143,7 @@ describe('DownloadManager', () => {
     expect(hub.downloaded.filter((p) => p === WEIGHT).length).toBeGreaterThan(1);
     // No publish, no marker, catalog reports not-installed.
     expect(existsSync(finalDir())).toBe(false);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
   });
 
   it('fails fast on an unowned existing dir — before listing or downloading any bytes', async () => {
@@ -2001,7 +2160,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2014,7 +2173,7 @@ describe('DownloadManager', () => {
     const err = events.find((event) => event.type === 'error');
     expect(err?.type).toBe('error');
     if (err?.type === 'error') {
-      // A plain install names the refusal; only a Reinstall may replace the entry.
+      // A plain install names the refusal; only a cleanup may replace the entry.
       expect(err.message.toLowerCase()).not.toContain('overwrite');
       expect(err.message).toContain('not created by the dashboard');
     }
@@ -2032,7 +2191,7 @@ describe('DownloadManager', () => {
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
 
-    const item = catalogWithState(modelsDir).find((entry) => entry.slug === SLUG)!;
+    const item = buildState(SLUG)!;
     expect(item.present).toBe(false);
     expect(item.blockedByForeignDir).toBe(true);
 
@@ -2042,7 +2201,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2069,7 +2228,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2109,7 +2268,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2160,7 +2319,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2196,7 +2355,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2205,7 +2364,7 @@ describe('DownloadManager', () => {
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
     expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
   });
 
   it('refuses a dir whose marker is not the full shape we write, and leaves it intact', async () => {
@@ -2225,7 +2384,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2236,7 +2395,7 @@ describe('DownloadManager', () => {
     expect(events.some((event) => event.type === 'done')).toBe(false);
     // And the catalog must agree, or the UI would keep offering the Install that
     // the runner now refuses every time.
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.blockedByForeignDir).toBe(true);
+    expect(buildState(SLUG)!.blockedByForeignDir).toBe(true);
   });
 
   it('does not hand back an in-flight job that is already cancelling', async () => {
@@ -2252,14 +2411,14 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     let idDuringCancel: string | undefined;
     stagingHook.onVerifyWindow = () => {
       manager.cancel(id1);
       // SYNCHRONOUSLY inside the window — no await, so `processJob` has not yet
       // reached its catch and the job still reads `running`.
-      idDuringCancel = manager.start(REPO);
+      idDuringCancel = manager.start(SLUG).id;
     };
     await waitFor(() => events1.some((event) => event.type === 'cancelled'));
     expect(idDuringCancel).not.toBe(id1);
@@ -2282,7 +2441,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2291,12 +2450,12 @@ describe('DownloadManager', () => {
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xcd));
     expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xcd));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(false);
+    expect(buildState(SLUG)!.installed).toBe(false);
     // No leaked backup was left behind by the refused swap.
     expect(backupDirs()).toEqual([]);
   });
 
-  it('replaces an unowned dir only through a Reinstall that echoes its numbers', async () => {
+  it('replaces an unowned dir only through a cleanup that echoes its numbers', async () => {
     mkdirSync(finalDir(), { recursive: true });
     writeFileSync(join(finalDir(), 'notes.txt'), Buffer.alloc(12, 0xab));
 
@@ -2305,16 +2464,16 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO, {
-      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 12, truncated: false },
-    });
+    const id = manager.start(SLUG, {
+      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 12, truncated: false, linkTarget: null },
+    }).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The freshly downloaded (zero-byte) content replaced the manual directory.
     expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12));
     expect(existsSync(join(finalDir(), 'notes.txt'))).toBe(false);
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('restores the original owned dir when the publish swap rename fails', async () => {
@@ -2343,7 +2502,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2377,7 +2536,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The sweep renamed the backup back into place; the restored (0xAB) content is
@@ -2419,7 +2578,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2456,7 +2615,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The leaked backup was removed; the existing install is untouched.
@@ -2480,7 +2639,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The live-owner backup was NEVER restored/reaped: it survives intact…
@@ -2511,7 +2670,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && (j.state === 'done' || j.state === 'error')));
 
     // Both unparseable backups survive byte-for-byte in `.staging` (not renamed away).
@@ -2548,7 +2707,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The unparseable backups were neither reaped nor promoted: both survive intact.
@@ -2595,7 +2754,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2619,14 +2778,14 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The published set is exactly the manifest — no stale orphan.
     expect(existsSync(join(finalDir(), 'stale.safetensors'))).toBe(false);
     expect(existsSync(join(finalDir(), 'config.json'))).toBe(true);
     expect(existsSync(join(finalDir(), WEIGHT))).toBe(true);
-    expect(catalogWithState(modelsDir).find((e) => e.slug === SLUG)!.installed).toBe(true);
+    expect(buildState(SLUG)!.installed).toBe(true);
   });
 
   it('does not reuse another revision staged files across a revision change', async () => {
@@ -2652,7 +2811,7 @@ describe('DownloadManager', () => {
         'Qwen3.8-27B-UD-Q4_K_XL-00002-of-00002.gguf': 100,
       }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The stale single-file weight never enters the new sharded install.
@@ -2669,7 +2828,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     const replayed: DownloadEvent[] = [];
@@ -2706,7 +2865,7 @@ describe('DownloadManager', () => {
       ),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // Park on the third file, 1 MiB in: files 1-2 settled (1 + 2 MiB), so the
     // job has 4 MiB of its 7 MiB.
@@ -2776,7 +2935,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2804,7 +2963,7 @@ describe('DownloadManager', () => {
       cacheDir,
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'done'));
 
     // The dead-pid tree was reaped; the live-pid tree was left intact.
@@ -2839,7 +2998,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -2864,7 +3023,7 @@ describe('DownloadManager', () => {
   // An owned-upgrade backup name (`.backup-`) holding a FOREIGN SYMLINK is never
   // promoted: the owned rule restores only what proves owned, and the second
   // preflight refuses a foreign link at finalDir before skip-detection can follow
-  // it. A Reinstall names its backup `.reinstall-`, which has its own rule.
+  // it. A cleanup names its holder `.cleanup-`, which has its own rule.
   it('does NOT restore a foreign-symlink backup onto an absent finalDir, and never reports done through it', async () => {
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
@@ -2884,7 +3043,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
@@ -2908,7 +3067,7 @@ describe('DownloadManager', () => {
     rmSync(external, { recursive: true, force: true });
   });
 
-  it('rejects a repo that is not in the catalog', () => {
+  it('rejects a folder no catalog build installs to', () => {
     const manager = new DownloadManager({ modelsDir, cacheDir, fetchImpl: makeFetchImpl({}) });
     expect(() => manager.start('someone/not-in-catalog')).toThrow();
   });
@@ -2928,10 +3087,10 @@ describe('DownloadManager', () => {
         blocked = true;
       }),
     });
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
-    expect(manager.start(REPO)).toBe(id1);
+    expect(manager.start(SLUG).id).toBe(id1);
     expect(manager.jobs().filter((job) => job.repo === REPO)).toHaveLength(1);
 
     // The id the UI tracks is the only running job, so Cancel really stops it.
@@ -2953,12 +3112,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Occupy the single-threaded drain with a different repo's job.
-    const idOther = manager.start(REPO_OTHER);
+    const idOther = manager.start(SLUG_OTHER).id;
     await waitFor(() => blocked);
 
-    const queued = manager.start(REPO);
+    const queued = manager.start(SLUG).id;
     expect(queued).not.toBe(idOther);
-    expect(manager.start(REPO)).toBe(queued);
+    expect(manager.start(SLUG).id).toBe(queued);
     expect(manager.jobs()).toHaveLength(2);
 
     expect(manager.cancel(queued)).toBe(true);
@@ -2977,12 +3136,12 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     await waitFor(() => events1.some((event) => event.type === 'error'));
 
     hub.failOn = [];
-    const id2 = manager.start(REPO);
+    const id2 = manager.start(SLUG).id;
     expect(id2).not.toBe(id1);
     await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
@@ -2997,7 +3156,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events1: DownloadEvent[] = [];
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     manager.subscribe(id1, (event) => events1.push(event));
     stagingHook.onVerifyWindow = () => {
       manager.cancel(id1);
@@ -3005,7 +3164,7 @@ describe('DownloadManager', () => {
     await waitFor(() => events1.some((event) => event.type === 'cancelled'));
     await waitFor(() => jobStagingDirs().length === 0);
 
-    const id2 = manager.start(REPO);
+    const id2 = manager.start(SLUG).id;
     expect(id2).not.toBe(id1);
     await waitFor(() => manager.jobs().some((job) => job.id === id2 && job.state === 'done'));
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
@@ -3030,7 +3189,7 @@ describe('DownloadManager', () => {
         fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
       });
       const events: DownloadEvent[] = [];
-      const id = manager.start(REPO);
+      const id = manager.start(SLUG).id;
       manager.subscribe(id, (event) => events.push(event));
       await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -3062,7 +3221,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     // config.json completes and caches; the weight fetch blocks (in flight).
@@ -3113,12 +3272,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Job 1 occupies the single-threaded drain (its weight fetch blocks).
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
     // behind it and is cancelled before it can run.
-    const id2 = manager.start(REPO_OTHER);
+    const id2 = manager.start(SLUG_OTHER).id;
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
     expect(manager.cancel(id2)).toBe(true);
@@ -3144,7 +3303,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // Fire the cancel the instant the runner enters the prune/verify window (the
     // recursive readdir of staging) — after every file has been fetched, before
@@ -3176,7 +3335,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     // The marker is written inside `publish`, AFTER the barrier set state to
     // `committing`; a cancel here must be refused (returns false).
@@ -3207,7 +3366,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => manager.jobs().some((j) => j.id === id && j.state === 'error'));
 
@@ -3233,7 +3392,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     let dismissWhileCommitting: boolean | null = null;
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     // The marker is written inside `publish`, AFTER the barrier set state to
     // `committing`; a dismiss here must be refused (returns false) and the job
     // must remain listed and install to completion.
@@ -3264,7 +3423,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'error'));
 
@@ -3299,7 +3458,7 @@ describe('DownloadManager', () => {
       }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     // config.json caches; the weight fetch blocks (in flight) with a staging dir on disk.
@@ -3330,12 +3489,12 @@ describe('DownloadManager', () => {
       }),
     });
     // Job 1 occupies the single-threaded drain (its weight fetch blocks in flight).
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // Job 2 (a DIFFERENT repo — a same-repo request would reuse job 1) queues
     // behind it (drain is busy) and has not started.
-    const id2 = manager.start(REPO_OTHER);
+    const id2 = manager.start(SLUG_OTHER).id;
     const events2: DownloadEvent[] = [];
     manager.subscribe(id2, (event) => events2.push(event));
 
@@ -3365,13 +3524,13 @@ describe('DownloadManager', () => {
         blocked = true;
       }),
     });
-    const id1 = manager.start(REPO);
+    const id1 = manager.start(SLUG).id;
     await waitFor(() => blocked);
 
     // `shutdown` flips the manager closed before its first await, so the refusal
     // does not depend on how wide the in-flight job's unwind window happens to be.
     const shutdownP = manager.shutdown();
-    expect(() => manager.start(REPO)).toThrow('shutting down');
+    expect(() => manager.start(SLUG)).toThrow('shutting down');
     await shutdownP;
 
     // The refused job was never registered, so nothing extended the drain and the
@@ -3395,7 +3554,7 @@ describe('DownloadManager', () => {
       fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
     });
     const events: DownloadEvent[] = [];
-    const id = manager.start(REPO);
+    const id = manager.start(SLUG).id;
     manager.subscribe(id, (event) => events.push(event));
 
     await waitFor(() => events.some((event) => event.type === 'error'));
@@ -3421,10 +3580,18 @@ describe('pidAlive (download.ts)', () => {
   });
 });
 
-describe('Reinstall: replace the entry in the way after a verified download', () => {
+describe('Clean up & update: replace the entry in the way after a verified download', () => {
+  type DoneEvent = Extract<DownloadEvent, { type: 'done' }>;
   const LEFTOVER = 'imatrix_unsloth.gguf_file';
   const LEFTOVER_BYTES = 183;
-  const ONE_FILE: ReplaceBlocker = { kind: 'directory', fileCount: 1, sizeBytes: LEFTOVER_BYTES, truncated: false };
+  const ONE_FILE: ReplaceBlocker = {
+    kind: 'directory',
+    fileCount: 1,
+    sizeBytes: LEFTOVER_BYTES,
+    truncated: false,
+    linkTarget: null,
+  };
+  const DEAD_PID = 999999999;
 
   function plantLeftover(): void {
     mkdirSync(finalDir(), { recursive: true });
@@ -3437,6 +3604,39 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     } catch {
       return false;
     }
+  }
+
+  /**
+   * Every entry under `root` by `lstat`, never followed: path, kind, size, mtime and inode. A root folder is named by
+   * kind and inode only, since a rename to a new parent may touch its own times.
+   */
+  function treeOf(root: string): string[] {
+    const out: string[] = [];
+    const walk = (rel: string): void => {
+      const path = rel === '' ? root : join(root, rel);
+      const stat = lstatSync(path, { bigint: true });
+      const kind = stat.isSymbolicLink() ? 'link' : stat.isDirectory() ? 'dir' : 'file';
+      const facts = rel === '' && kind === 'dir' ? `${stat.ino}` : `${stat.size}|${stat.mtimeNs}|${stat.ino}`;
+      out.push(`${rel === '' ? '.' : rel}|${kind}|${facts}`);
+      if (kind === 'dir') for (const name of readdirSync(path).sort()) walk(rel === '' ? name : `${rel}/${name}`);
+    };
+    walk('');
+    return out;
+  }
+
+  function identityOf(path: string): string {
+    const stat = lstatSync(path, { bigint: true });
+    return `${stat.dev}:${stat.ino}`;
+  }
+
+  function trashed(): string[] {
+    return readdirSync(trash.dir);
+  }
+
+  /** `rm` calls on anything but a job's own staging tree or a file in it: there must never be one. */
+  function foreignRm(): string[] {
+    const prefix = join(stagingRoot(), `${SLUG}@`);
+    return rmCalls.paths.filter((path) => !path.startsWith(prefix));
   }
 
   function manager(fetchImpl: typeof fetch = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 })): DownloadManager {
@@ -3455,52 +3655,222 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     return error?.type === 'error' ? error.message : '';
   }
 
-  function slugItem() {
-    return catalogWithState(modelsDir).find((e) => e.slug === SLUG)!;
+  function doneOf(events: DownloadEvent[]): DoneEvent | undefined {
+    return events.find((e): e is DoneEvent => e.type === 'done');
   }
 
-  it('replaces a one-file foreign directory once the download is verified', async () => {
+  function slugItem() {
+    return buildState(SLUG)!;
+  }
+
+  /** A folder outside the models folder for a link to point at, removed when the test ends. */
+  function externalFolder(): string {
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    return external;
+  }
+
+  /** A link at the slug to a folder of GGUF shards the app did not make (the owner's most likely card). */
+  function plantLinkToShards(): string {
+    const external = externalFolder();
+    writeFileSync(join(external, 'Qwen3.8-27B-UD-Q4_K_XL-00001-of-00002.gguf'), Buffer.alloc(90, 0x21));
+    writeFileSync(join(external, 'Qwen3.8-27B-UD-Q4_K_XL-00002-of-00002.gguf'), Buffer.alloc(70, 0x22));
+    symlinkSync(external, finalDir());
+    return external;
+  }
+
+  it('replaces a one-file folder and moves it to the Trash whole, once the download is verified', async () => {
     plantLeftover();
+    const tree = treeOf(finalDir());
     expect(slugItem().blocker).toMatchObject(ONE_FILE);
     const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    const started = m.start(SLUG, { replaceBlocker: ONE_FILE });
+    expect(started.kind).toBe('cleanup');
+    expect(m.jobs().find((job) => job.id === started.id)?.kind).toBe('cleanup');
+    const events = await settled(m, started.id);
     expect(errorOf(events)).toBe('');
-    expect(events.some((e) => e.type === 'done')).toBe(true);
-    expect(existsSync(join(finalDir(), LEFTOVER))).toBe(false);
+    expect(doneOf(events)).toEqual({ type: 'done', id: started.id, outputDir: finalDir(), removed: 'trash' });
     expect(isModelInstalled(finalDir())).toBe(true);
+    expect(trashed()).toEqual([SLUG]);
+    expect(treeOf(join(trash.dir, SLUG))).toEqual(tree);
+    expect(holderDirs()).toEqual([]);
     expect(backupDirs()).toEqual([]);
-    expect(reinstallDirs()).toEqual([]);
+    expect(foreignRm()).toEqual([]);
     expect(slugItem()).toMatchObject({ installed: true, blocker: null, blockedByForeignDir: false });
   });
 
-  it('keeps the foreign entry while the download runs, and after a cancel', async () => {
-    plantLeftover();
-    let duringDownload: boolean | undefined;
-    let cancel = (): void => {};
-    const m = manager(
-      makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {
-        duringDownload = leftoverIntact();
-        queueMicrotask(cancel);
-      }),
-    );
-    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
-    cancel = () => void m.cancel(id);
-    const events = await settled(m, id);
-    expect(duringDownload).toBe(true);
-    expect(events.some((e) => e.type === 'cancelled')).toBe(true);
-    expect(leftoverIntact()).toBe(true);
-    expect(m.jobs().find((job) => job.id === id)?.state).toBe('cancelled');
+  it.each<[string, () => ReplaceBlocker]>([
+    [
+      'a folder with model files that Local models lists',
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3' }));
+        writeFileSync(join(finalDir(), 'model-00001-of-00002.safetensors'), 'valuable-1');
+        writeFileSync(join(finalDir(), 'model-00002-of-00002.safetensors'), 'valuable-2');
+        return slugItem().blocker!;
+      },
+    ],
+    [
+      'a folder of companion GGUFs',
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), 'imatrix_unsloth.gguf'), Buffer.alloc(10));
+        writeFileSync(join(finalDir(), 'mmproj-F16.gguf'), Buffer.alloc(20));
+        return slugItem().blocker!;
+      },
+    ],
+    [
+      'a folder over the size walk budget',
+      () => {
+        const deep = join(finalDir(), 'a', 'b');
+        mkdirSync(deep, { recursive: true });
+        for (let i = 0; i < 2_001; i++) writeFileSync(join(deep, `f${i}`), '');
+        const blocker = slugItem().blocker!;
+        expect(blocker.truncated).toBe(true);
+        return blocker;
+      },
+    ],
+    [
+      'a junk folder',
+      () => {
+        mkdirSync(join(finalDir(), 'logs'), { recursive: true });
+        writeFileSync(join(finalDir(), 'logs', 'run.txt'), 'log');
+        writeFileSync(join(finalDir(), '.DS_Store'), Buffer.alloc(16));
+        return slugItem().blocker!;
+      },
+    ],
+    [
+      'an empty folder',
+      () => {
+        mkdirSync(finalDir());
+        return slugItem().blocker!;
+      },
+    ],
+    [
+      'a file',
+      () => {
+        writeFileSync(finalDir(), Buffer.alloc(40, 0x1));
+        return slugItem().blocker!;
+      },
+    ],
+  ])('installs over %s and moves it to the Trash as one item', async (_name, plant) => {
+    const blocker = plant();
+    const tree = treeOf(finalDir());
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
+    expect(errorOf(events)).toBe('');
+    expect(doneOf(events)).toMatchObject({ removed: 'trash' });
+    expect(doneOf(events)?.keptDir).toBeUndefined();
+    expect(isModelInstalled(finalDir())).toBe(true);
+    expect(trashed()).toEqual([SLUG]);
+    expect(treeOf(join(trash.dir, SLUG))).toEqual(tree);
+    expect(trash.calls).toHaveLength(1);
+    expect(holderDirs()).toEqual([]);
+    expect(foreignRm()).toEqual([]);
+  });
+
+  it('removes only a link to a folder of model files, and never writes or moves anything in that folder', async () => {
+    const external = plantLinkToShards();
+    const tree = treeOf(external);
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ kind: 'symlink', dangling: false, linkTarget: external, holdsModel: true });
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
+    expect(errorOf(events)).toBe('');
+    expect(doneOf(events)).toMatchObject({ removed: 'link' });
+    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+    expect(isModelInstalled(finalDir())).toBe(true);
+    expect(treeOf(external)).toEqual(tree);
+    expect(existsSync(join(external, MARKER_FILE))).toBe(false);
+    expect(trashed()).toEqual([]);
+    expect(trash.calls).toEqual([]);
+    expect(holderDirs()).toEqual([]);
+    expect(foreignRm()).toEqual([]);
+  });
+
+  it('removes a dead link as a link', async () => {
+    symlinkSync(join(modelsDir, 'nowhere'), finalDir());
+    const blocker = slugItem().blocker!;
+    expect(blocker).toMatchObject({ kind: 'symlink', dangling: true, fileCount: 0, sizeBytes: 0 });
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
+    expect(doneOf(events)).toMatchObject({ removed: 'link' });
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
+    expect(trashed()).toEqual([]);
+  });
+
+  it.each<[string, (external: string) => void]>([
+    [
+      'retargeted',
+      (external) => {
+        const other = join(dirname(external), `${basename(external)}-other`);
+        mkdirSync(other);
+        onTestFinished(() => rmSync(other, { recursive: true, force: true }));
+        rmSync(finalDir());
+        symlinkSync(other, finalDir());
+      },
+    ],
+    [
+      'replaced by a folder',
+      () => {
+        rmSync(finalDir());
+        mkdirSync(finalDir());
+      },
+    ],
+  ])('refuses a link that was %s during the download, and leaves it as the user left it', async (_name, change) => {
+    const external = plantLinkToShards();
+    const blocker = slugItem().blocker!;
+    let after = '';
+    stagingHook.onVerifyWindow = () => {
+      change(external);
+      after = identityOf(finalDir());
+    };
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(identityOf(finalDir())).toBe(after);
+    expect(trashed()).toEqual([]);
+    expect(holderDirs()).toEqual([]);
+    expect(existsSync(join(finalDir(), MARKER_FILE))).toBe(false);
+  });
+
+  it('keeps the entry while the download runs, and after a cancel, for a folder and for a link', async () => {
+    for (const plant of [plantLeftover, plantLinkToShards]) {
+      rmSync(finalDir(), { recursive: true, force: true });
+      plant();
+      const identity = identityOf(finalDir());
+      const tree = treeOf(finalDir());
+      let duringDownload: string | undefined;
+      let cancel = (): void => {};
+      const m = manager(
+        makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {
+          duringDownload = identityOf(finalDir());
+          queueMicrotask(cancel);
+        }),
+      );
+      const id = m.start(SLUG, { replaceBlocker: slugItem().blocker! }).id;
+      cancel = () => void m.cancel(id);
+      const events = await settled(m, id);
+      expect(duringDownload).toBe(identity);
+      expect(events.some((e) => e.type === 'cancelled')).toBe(true);
+      expect(identityOf(finalDir())).toBe(identity);
+      expect(treeOf(finalDir())).toEqual(tree);
+      await waitFor(() => jobStagingDirs().length === 0);
+      expect(holderDirs()).toEqual([]);
+      expect(trashed()).toEqual([]);
+    }
   });
 
   it('says nothing was removed when the download fails, and removes nothing', async () => {
     plantLeftover();
     hub.failOn = [WEIGHT];
     const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
     expect(leftoverIntact()).toBe(true);
-    // The error frame is emitted before the job's `finally` removes its staging tree.
     await waitFor(() => jobStagingDirs().length === 0);
+    expect(trashed()).toEqual([]);
   });
 
   it.each<[string, () => void, ReplaceBlocker]>([
@@ -3508,6 +3878,11 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     ['a wrong size', plantLeftover, { ...ONE_FILE, sizeBytes: LEFTOVER_BYTES + 1 }],
     ['a wrong kind', plantLeftover, { ...ONE_FILE, kind: 'file' }],
     ['a path that is gone', () => {}, ONE_FILE],
+    [
+      'another link text',
+      () => symlinkSync('nowhere', finalDir()),
+      { kind: 'symlink', fileCount: 0, sizeBytes: 0, truncated: false, linkTarget: 'elsewhere' },
+    ],
     [
       'a path the downloader owns',
       () => {
@@ -3519,28 +3894,25 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       },
       ONE_FILE,
     ],
+    [
+      'a model Local models lists as present',
+      () => {
+        mkdirSync(join(finalDir(), 'UD-Q4_K_XL'), { recursive: true });
+        writeFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
+        writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      },
+      { kind: 'directory', fileCount: 2, sizeBytes: 0, truncated: false, linkTarget: null },
+    ],
   ])('refuses at the request when the echo does not match: %s', (_name, plant, echo) => {
     plant();
-    const before = existsSync(finalDir()) ? readdirSync(finalDir()).sort() : null;
+    const before = existsSync(finalDir()) ? treeOf(finalDir()) : null;
     const m = manager();
-    expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(DownloadConflictError);
-    expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(
+    expect(() => m.start(SLUG, { replaceBlocker: echo })).toThrow(DownloadConflictError);
+    expect(() => m.start(SLUG, { replaceBlocker: echo })).toThrow(
       `"${SLUG}" changed on disk. Check it, then try again.`,
     );
     expect(m.jobs()).toEqual([]);
-    expect(existsSync(finalDir()) ? readdirSync(finalDir()).sort() : null).toEqual(before);
-  });
-
-  it('refuses a complete model the app did not create, and leaves it intact', () => {
-    mkdirSync(finalDir(), { recursive: true });
-    writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
-    writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
-    const m = manager();
-    expect(() =>
-      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 2, sizeBytes: 312, truncated: false } }),
-    ).toThrow(`"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`);
-    expect(m.jobs()).toEqual([]);
-    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+    expect(existsSync(finalDir()) ? treeOf(finalDir()) : null).toEqual(before);
   });
 
   function qwen35Gguf(): Buffer {
@@ -3559,75 +3931,52 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     return Buffer.concat([header, string('general.architecture'), stringType, string('qwen35')]);
   }
 
-  it.each<[string, string, boolean]>([
-    ['a GGUF at its root and no config.json', WEIGHT, false],
-    ['a config.json and a GGUF in a variant folder', join('UD-Q4_K_XL', WEIGHT), true],
-  ])('refuses an entry that mlx serve lists: %s', async (_name, gguf, withConfig) => {
-    mkdirSync(dirname(join(finalDir(), gguf)), { recursive: true });
-    writeFileSync(join(finalDir(), gguf), qwen35Gguf());
-    if (withConfig) writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
-    const served = (await discoverLocalChatModels(modelsDir)).map((model) => model.path);
-    expect(served).toEqual([join(finalDir(), gguf)]);
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ holdsModel: true, listed: withConfig });
+  it.each<[string, () => void]>([
+    [
+      'a folder with a GGUF at its root',
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), WEIGHT), qwen35Gguf());
+      },
+    ],
+    [
+      'a link to a folder with a GGUF in a variant folder',
+      () => {
+        const external = externalFolder();
+        mkdirSync(join(external, 'UD-Q4_K_XL'));
+        writeFileSync(join(external, 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
+        symlinkSync(external, finalDir());
+      },
+    ],
+  ])('refuses Clean up at the request and a plain install at the job for %s that Chat loads', async (_name, plant) => {
+    plant();
+    expect(await discoverLocalChatModels(modelsDir)).toHaveLength(1);
+    // Before this folder counted as present, the card offered Clean up with this summary.
+    const asked = summarizeForeignEntry(finalDir())!;
+    expect(slugItem()).toMatchObject({ present: true, installed: false, blocker: null });
+    const tree = treeOf(finalDir());
     const m = manager();
-    expect(() => m.start(REPO, { replaceBlocker: blocker })).toThrow(
-      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`,
+    expect(() => m.start(SLUG, { replaceBlocker: asked })).toThrow(
+      `"${SLUG}" changed on disk. Check it, then try again.`,
     );
-    expect(m.jobs()).toEqual([]);
-    expect(readFileSync(join(finalDir(), gguf))).toEqual(qwen35Gguf());
-  });
-
-  it('refuses at the swap when a GGUF lands in a variant folder during the download', async () => {
-    plantLeftover();
-    stagingHook.onVerifyWindow = () => {
-      mkdirSync(join(finalDir(), 'UD-Q4_K_XL'));
-      writeFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
-    };
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-    expect(errorOf(events)).toBe(
-      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it. Nothing was removed.`,
-    );
-    expect(leftoverIntact()).toBe(true);
-    expect(readFileSync(join(finalDir(), 'UD-Q4_K_XL', WEIGHT))).toEqual(qwen35Gguf());
-  });
-
-  it('refuses an entry that holds only companion GGUFs', () => {
-    mkdirSync(finalDir());
-    writeFileSync(join(finalDir(), 'imatrix_unsloth.gguf'), Buffer.alloc(10));
-    writeFileSync(join(finalDir(), 'mmproj-F16.gguf'), Buffer.alloc(20));
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ holdsModel: true, fileCount: 2, sizeBytes: 30 });
-    expect(() => manager().start(REPO, { replaceBlocker: blocker })).toThrow(DownloadConflictError);
-    expect(readdirSync(finalDir()).sort()).toEqual(['imatrix_unsloth.gguf', 'mmproj-F16.gguf']);
-  });
-
-  it('refuses SafeTensors shards with no index that mlx serve lists, and keeps them', async () => {
-    mkdirSync(finalDir());
-    writeFileSync(join(finalDir(), 'config.json'), JSON.stringify({ model_type: 'qwen3' }));
-    writeFileSync(join(finalDir(), 'model-00001-of-00002.safetensors'), 'valuable-1');
-    writeFileSync(join(finalDir(), 'model-00002-of-00002.safetensors'), 'valuable-2');
-    expect((await discoverLocalChatModels(modelsDir)).map((model) => model.path)).toEqual([finalDir()]);
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ holdsModel: true, listed: true });
-    expect(() => manager().start(REPO, { replaceBlocker: blocker })).toThrow(
-      `"${SLUG}" holds a model that the app did not create. Remove it yourself if you do not need it.`,
-    );
-    expect(readFileSync(join(finalDir(), 'model-00001-of-00002.safetensors'), 'utf-8')).toBe('valuable-1');
+    const events = await settled(m, m.start(SLUG).id);
+    expect(errorOf(events)).toContain('Refusing to install over');
+    expect(treeOf(finalDir())).toEqual(tree);
+    expect(trashed()).toEqual([]);
   });
 
   it.each<[string, number]>([
     ['cannot be read or written', 0o000],
     ['can be read but not written', 0o500],
-  ])('refuses at the request a directory the swap cannot move: one that %s', (_name, mode) => {
+  ])('refuses at the request a folder the swap cannot move: one that %s', (_name, mode) => {
     plantLeftover();
     chmodSync(finalDir(), mode);
     try {
       const echo = { ...slugItem().blocker! };
+      expect(echo.locked).toBe(true);
       const m = manager();
-      expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(DownloadConflictError);
-      expect(() => m.start(REPO, { replaceBlocker: echo })).toThrow(
+      expect(() => m.start(SLUG, { replaceBlocker: echo })).toThrow(DownloadConflictError);
+      expect(() => m.start(SLUG, { replaceBlocker: echo })).toThrow(
         `The app cannot move "${SLUG}": it has no write permission on it. Change its permissions, then try again.`,
       );
       expect(m.jobs()).toEqual([]);
@@ -3638,342 +3987,724 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
     expect(leftoverIntact()).toBe(true);
   });
 
-  it('refuses at job start when the entry changed after the request', async () => {
+  it.each<[string, (m: DownloadManager) => void]>([
+    ['after the request', () => writeFileSync(join(finalDir(), 'added.txt'), 'x')],
+    [
+      'during the download',
+      () => (stagingHook.onVerifyWindow = () => writeFileSync(join(finalDir(), 'added.txt'), 'x')),
+    ],
+    ['right before the swap', () => (raceHook.onMarkerWrite = () => writeFileSync(join(finalDir(), 'added.txt'), 'x'))],
+  ])('moves a file added %s to the Trash with the folder: the swap checks identity only', async (_name, add) => {
     plantLeftover();
     const m = manager();
-    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
-    writeFileSync(join(finalDir(), 'added.txt'), 'x');
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    add(m);
     const events = await settled(m, id);
-    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
-    expect(leftoverIntact()).toBe(true);
-    expect(hub.downloaded).toEqual([]);
-  });
-
-  it('refuses at the swap when a file was added during the download', async () => {
-    plantLeftover();
-    stagingHook.onVerifyWindow = () => writeFileSync(join(finalDir(), 'added.txt'), 'x');
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
-    expect(leftoverIntact()).toBe(true);
-    expect(readFileSync(join(finalDir(), 'added.txt'), 'utf-8')).toBe('x');
-    expect(backupDirs()).toEqual([]);
-  });
-
-  it('checks the entry again right before it is moved aside', async () => {
-    plantLeftover();
-    raceHook.onMarkerWrite = () => writeFileSync(join(finalDir(), 'late.txt'), 'x');
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
-    expect(leftoverIntact()).toBe(true);
-    expect(readFileSync(join(finalDir(), 'late.txt'), 'utf-8')).toBe('x');
-  });
-
-  it('refuses at the swap when the entry became a complete model during the download', async () => {
-    plantLeftover();
-    stagingHook.onVerifyWindow = () => {
-      writeFileSync(join(finalDir(), 'config.json'), Buffer.alloc(12, 0xab));
-      writeFileSync(join(finalDir(), WEIGHT), Buffer.alloc(300, 0xab));
-    };
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-    expect(errorOf(events)).toContain('holds a model that the app did not create');
-    expect(errorOf(events).endsWith('Nothing was removed.')).toBe(true);
-    expect(leftoverIntact()).toBe(true);
-    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+    expect(errorOf(events)).toBe('');
+    expect(isModelInstalled(finalDir())).toBe(true);
+    expect(readdirSync(join(trash.dir, SLUG)).sort()).toEqual(['added.txt', LEFTOVER]);
   });
 
   it('installs when the entry was removed by hand during the download', async () => {
     plantLeftover();
     stagingHook.onVerifyWindow = () => rmSync(finalDir(), { recursive: true, force: true });
     const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
     expect(errorOf(events)).toBe('');
     expect(isModelInstalled(finalDir())).toBe(true);
+    expect(trashed()).toEqual([]);
   });
 
-  it('removes a dangling link as a link', async () => {
-    symlinkSync(join(modelsDir, 'nowhere'), finalDir());
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ kind: 'symlink', dangling: true, fileCount: 0, sizeBytes: 0 });
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: blocker }));
-    expect(errorOf(events)).toBe('');
-    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
-    expect(isModelInstalled(finalDir())).toBe(true);
-  });
-
-  it('removes a live link to an unmarked directory without touching its target', async () => {
-    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
-    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
-    writeFileSync(join(external, 'keep.txt'), Buffer.alloc(64, 0x33));
-    symlinkSync(external, finalDir());
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ kind: 'symlink', dangling: false, fileCount: 0, sizeBytes: 0 });
-    const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: blocker }));
-    expect(errorOf(events)).toBe('');
-    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
-    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
-    expect(readFileSync(join(external, 'keep.txt'))).toEqual(Buffer.alloc(64, 0x33));
-  });
-
-  it('replaces a regular file at the slug path', async () => {
-    writeFileSync(finalDir(), Buffer.alloc(40, 0x1));
-    const m = manager();
-    const events = await settled(
-      m,
-      m.start(REPO, { replaceBlocker: { kind: 'file', fileCount: 1, sizeBytes: 40, truncated: false } }),
-    );
-    expect(errorOf(events)).toBe('');
-    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
-  });
-
-  it('replaces an empty directory', async () => {
-    mkdirSync(finalDir());
-    const m = manager();
-    const events = await settled(
-      m,
-      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 0, sizeBytes: 0, truncated: false } }),
-    );
-    expect(errorOf(events)).toBe('');
-    expect(isModelInstalled(finalDir())).toBe(true);
-  });
-
-  it('puts the foreign entry back when the swap rename fails', async () => {
+  it('refuses a folder that another folder replaced during the download, and leaves both', async () => {
     plantLeftover();
-    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+    const original = join(modelsDir, 'original');
+    stagingHook.onVerifyWindow = () => {
+      renameSync(finalDir(), original);
+      plantLeftover();
+    };
     const m = manager();
-    const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-    expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
     expect(leftoverIntact()).toBe(true);
-    expect(readdirSync(finalDir())).toEqual([LEFTOVER]);
-    expect(backupDirs()).toEqual([]);
-    expect(reinstallDirs()).toEqual([]);
+    expect(readdirSync(original)).toEqual([LEFTOVER]);
+    expect(trashed()).toEqual([]);
   });
 
-  it('names the backup path, without "Nothing was removed", when the rollback fails too', async () => {
+  it('refuses at the publish a folder that replaced the confirmed one, even when it goes before the swap', async () => {
+    plantLeftover();
+    const original = join(modelsDir, 'original');
+    stagingHook.onVerifyWindow = () => {
+      renameSync(finalDir(), original);
+      plantLeftover();
+    };
+    raceHook.onMarkerWrite = () => rmSync(finalDir(), { recursive: true, force: true });
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(raceHook.onMarkerWrite).not.toBeNull();
+    expect(leftoverIntact()).toBe(true);
+    expect(readdirSync(original)).toEqual([LEFTOVER]);
+    expect(trashed()).toEqual([]);
+  });
+
+  it('refuses before any download a folder that another folder of the same content replaced after the request', async () => {
+    plantLeftover();
+    const original = join(modelsDir, 'original');
+    const m = manager();
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    renameSync(finalDir(), original);
+    plantLeftover();
+    const events = await settled(m, id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(hub.downloaded).toEqual([]);
+    expect(leftoverIntact()).toBe(true);
+    expect(readdirSync(original)).toEqual([LEFTOVER]);
+    expect(holderDirs()).toEqual([]);
+    expect(trashed()).toEqual([]);
+  });
+
+  it('puts the old entry back at its path when the rename of staging fails', async () => {
+    plantLeftover();
+    const identity = identityOf(finalDir());
+    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events).endsWith('. Nothing was removed.')).toBe(true);
+    expect(identityOf(finalDir())).toBe(identity);
+    expect(readdirSync(finalDir())).toEqual([LEFTOVER]);
+    expect(leftoverIntact()).toBe(true);
+    expect(holderDirs()).toEqual([]);
+    expect(backupDirs()).toEqual([]);
+    expect(trashed()).toEqual([]);
+    expect(trash.calls).toEqual([]);
+  });
+
+  it('names where the old entry is, without "Nothing was removed", when the way back fails too', async () => {
     plantLeftover();
     renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
-    renameFault.alsoFailFromPrefix = join(stagingRoot(), `${SLUG}.reinstall-`);
+    renameFault.alsoFailFromPrefix = join(stagingRoot(), `${SLUG}.cleanup-`);
     const m = manager();
-    const message = errorOf(await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE })));
-    const [backup] = reinstallDirs();
-    expect(message).toBe(
-      `The install failed and "${SLUG}" could not be put back. It is now at "${join(stagingRoot(), backup!)}".`,
-    );
-    expect(readFileSync(join(stagingRoot(), backup!, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id));
+    const [holder] = holderDirs();
+    const moved = join(stagingRoot(), holder!, SLUG);
+    expect(message).toBe(`The install failed and "${SLUG}" could not be put back. It is now at "${moved}".`);
+    expect(readFileSync(join(moved, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    expect(trashed()).toEqual([]);
   });
 
-  it('refuses a Reinstall while a plain job holds the repo, and hands back a running Reinstall', async () => {
+  it('never puts the old entry back over a file another program wrote at its path after the swap began', async () => {
+    writeFileSync(finalDir(), Buffer.alloc(41, 0x1));
+    const blocker = slugItem().blocker!;
+    renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+    renameHook.from = finalDir();
+    renameHook.after = () => writeFileSync(finalDir(), 'newcomer');
+    const m = manager();
+    const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id));
+    const kept = keptDirs();
+    expect(kept).toHaveLength(1);
+    const keptDir = join(stagingRoot(), kept[0]!);
+    expect(message).toBe(
+      `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
+        `The old entry is at "${join(keptDir, SLUG)}". Nothing was removed.`,
+    );
+    expect(readFileSync(finalDir(), 'utf8')).toBe('newcomer');
+    expect(readFileSync(join(keptDir, SLUG))).toEqual(Buffer.alloc(41, 0x1));
+    expect(trashed()).toEqual([]);
+  });
+
+  it('puts the entry back when a folder with another identity took its path before the rename', async () => {
+    plantLeftover();
+    const original = join(modelsDir, 'original');
+    renameHook.from = finalDir();
+    renameHook.before = () => {
+      renameSync(finalDir(), original);
+      plantLeftover();
+    };
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+    expect(leftoverIntact()).toBe(true);
+    expect(readdirSync(original)).toEqual([LEFTOVER]);
+    expect(holderDirs()).toEqual([]);
+    expect(trashed()).toEqual([]);
+  });
+
+  it.each<[string, string[]]>([
+    ['a folder with a file', ['other.txt']],
+    ['an empty folder', []],
+  ])('keeps a changed entry at a named path when %s takes its path after the rename', async (_name, names) => {
+    plantLeftover();
+    const original = join(modelsDir, 'original');
+    renameHook.from = finalDir();
+    renameHook.before = () => {
+      renameSync(finalDir(), original);
+      plantLeftover();
+    };
+    renameHook.after = () => {
+      mkdirSync(finalDir());
+      for (const name of names) writeFileSync(join(finalDir(), name), 'other');
+    };
+    const m = manager();
+    const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id));
+    const kept = keptDirs();
+    expect(kept).toHaveLength(1);
+    const keptDir = join(stagingRoot(), kept[0]!);
+    expect(message).toBe(
+      `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
+        `The old entry is at "${join(keptDir, SLUG)}". Nothing was removed.`,
+    );
+    expect(readFileSync(join(keptDir, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    expect(readdirSync(finalDir())).toEqual(names);
+    expect(trashed()).toEqual([]);
+  });
+
+  it.each<[string, () => void]>([
+    ['the Trash refuses', () => (trash.refuse = true)],
+    ['the Trash answers success and the path is still there', () => (trash.ignore = true)],
+  ])('keeps the old folder in .staging when %s; the model is installed', async (_name, set) => {
+    plantLeftover();
+    const tree = treeOf(finalDir());
+    set();
+    const m = manager();
+    const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+    expect(errorOf(events)).toBe('');
+    expect(isModelInstalled(finalDir())).toBe(true);
+    const kept = keptDirs();
+    expect(kept).toHaveLength(1);
+    const keptDir = join(stagingRoot(), kept[0]!);
+    const done = doneOf(events)!;
+    expect(done.keptDir).toBe(keptDir);
+    expect(done.removed).toBeUndefined();
+    expect(readdirSync(keptDir)).toEqual([SLUG]);
+    expect(treeOf(join(keptDir, SLUG))).toEqual(tree);
+    expect(holderDirs()).toEqual([]);
+    expect(foreignRm()).toEqual([]);
+    // No sweep removes a kept entry.
+    const next = manager();
+    await settled(next, next.start(SLUG).id);
+    expect(treeOf(join(keptDir, SLUG))).toEqual(tree);
+  });
+
+  it('refuses a cleanup while a plain job holds the repo, and hands back a running cleanup', async () => {
     const block = makeCancelFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, () => {});
     const plain = manager(block);
-    const plainId = plain.start(REPO);
+    const plainId = plain.start(SLUG).id;
+    expect(plain.jobs()[0]?.kind).toBe('install');
     plantLeftover();
-    expect(() => plain.start(REPO, { replaceBlocker: ONE_FILE })).toThrow(
-      'A download of this model is already in the queue. Cancel it, then use Reinstall.',
+    expect(() => plain.start(SLUG, { replaceBlocker: ONE_FILE })).toThrow(
+      'A download of this model is already in the queue. Cancel it, then use Clean up & update.',
     );
     plain.cancel(plainId);
     await settled(plain, plainId);
 
     const m = manager(block);
-    const id = m.start(REPO, { replaceBlocker: ONE_FILE });
-    expect(m.start(REPO, { replaceBlocker: ONE_FILE })).toBe(id);
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    expect(m.start(SLUG, { replaceBlocker: ONE_FILE })).toMatchObject({ id, kind: 'cleanup' });
     m.cancel(id);
     await settled(m, id);
     expect(leftoverIntact()).toBe(true);
   });
 
   it('compares a truncated walk by kind only', async () => {
-    // Past the size walk's budget, inside the held-model scan's larger one, and no file is named like a model.
     const deep = join(finalDir(), 'a', 'b');
     mkdirSync(deep, { recursive: true });
     for (let i = 0; i < 2_001; i++) writeFileSync(join(deep, `f${i}`), '');
-    const blocker = slugItem().blocker!;
-    expect(blocker.truncated).toBe(true);
-    expect(blocker.holdsModel).toBe(false);
+    expect(slugItem().blocker!.truncated).toBe(true);
     const m = manager();
     expect(() =>
-      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 0, truncated: false } }),
+      m.start(SLUG, { replaceBlocker: { ...ONE_FILE, fileCount: 7, sizeBytes: 0, truncated: false } }),
     ).toThrow(DownloadConflictError);
     const events = await settled(
       m,
-      m.start(REPO, { replaceBlocker: { kind: 'directory', fileCount: 7, sizeBytes: 99, truncated: true } }),
+      m.start(SLUG, { replaceBlocker: { ...ONE_FILE, fileCount: 7, sizeBytes: 99, truncated: true } }).id,
     );
     expect(errorOf(events)).toBe('');
     expect(isModelInstalled(finalDir())).toBe(true);
   });
 
-  describe('an outside writer at the swap', () => {
-    it('puts the entry back when model files arrive between the last check and the rename', async () => {
-      plantLeftover();
-      renameHook.from = finalDir();
-      renameHook.before = () => {
-        writeFileSync(join(finalDir(), 'config.json'), 'arrived');
-        writeFileSync(join(finalDir(), 'model.safetensors'), 'arrived');
-      };
-      const m = manager();
-      const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
-      expect(readFileSync(join(finalDir(), 'model.safetensors'), 'utf-8')).toBe('arrived');
-      expect(leftoverIntact()).toBe(true);
-      expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(false);
-      expect(reinstallDirs()).toEqual([]);
-    });
-
-    it('puts the entry back when a directory of the same shape was swapped in before the rename', async () => {
-      plantLeftover();
-      const original = join(modelsDir, 'original');
-      renameHook.from = finalDir();
-      renameHook.before = () => {
-        renameSync(finalDir(), original);
-        plantLeftover();
-      };
-      const m = manager();
-      const events = await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE }));
-      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
-      expect(leftoverIntact()).toBe(true);
-      expect(readdirSync(original)).toEqual([LEFTOVER]);
-      expect(reinstallDirs()).toEqual([]);
-    });
-
-    it('keeps a changed entry at a named path when its own path is taken again after the rename', async () => {
-      plantLeftover();
-      renameHook.from = finalDir();
-      renameHook.before = () => writeFileSync(join(finalDir(), 'late.safetensors'), 'arrived');
-      renameHook.after = () => {
-        mkdirSync(finalDir());
-        writeFileSync(join(finalDir(), 'other.txt'), 'other');
-      };
-      const m = manager();
-      const message = errorOf(await settled(m, m.start(REPO, { replaceBlocker: ONE_FILE })));
-      const kept = readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`));
-      expect(kept).toHaveLength(1);
-      const keptDir = join(stagingRoot(), kept[0]!);
-      expect(message).toBe(
-        `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
-          `The old entry is at "${keptDir}". Nothing was removed.`,
-      );
-      expect(readFileSync(join(keptDir, 'late.safetensors'), 'utf-8')).toBe('arrived');
-      expect(readFileSync(join(keptDir, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
-      expect(readdirSync(finalDir())).toEqual(['other.txt']);
-      // No sweep removes a kept entry, even once a model is installed at the slug.
-      rmSync(finalDir(), { recursive: true });
-      const next = manager();
-      expect(errorOf(await settled(next, next.start(REPO)))).toBe('');
-      expect(isModelInstalled(finalDir())).toBe(true);
-      expect(readdirSync(keptDir).sort()).toEqual([LEFTOVER, 'late.safetensors']);
-    });
-  });
-
-  describe('a crash between moving the old entry aside and deleting it', () => {
-    const DEAD_PID = 999999999;
-    function reinstallBackup(pid: number = DEAD_PID): string {
-      return join(stagingRoot(), `${SLUG}.reinstall-${pid}.55555555-5555-5555-5555-555555555555`);
+  describe('a crash between moving the old entry into its holder and removing it', () => {
+    /** A holder name as a cleanup makes it: owner pid, then the inode of the folder it renames in. */
+    function holderPath(pid: number = DEAD_PID, ino: bigint = 1n): string {
+      return join(stagingRoot(), `${SLUG}.cleanup-${pid}.${ino}.55555555-5555-5555-5555-555555555555`);
     }
-    /** The disk as a Reinstall left it when it died right after `rename(finalDir, backup)`. */
+    /** The inode of the folder at the slug: what the holder of the cleanup that put it there names. */
+    function finalIno(): bigint {
+      return lstatSync(finalDir(), { bigint: true }).ino;
+    }
+    /** The disk as a cleanup left it when it died right after `rename(finalDir, <holder>/<slug>)`. */
     function crashedAfterFirstRename(pid: number = DEAD_PID): string {
       plantLeftover();
-      const deadStaging = join(stagingRoot(), `${SLUG}@${SHA_DEFAULT}.${pid}.66666666-6666-6666-6666-666666666666`);
-      mkdirSync(deadStaging, { recursive: true });
-      writeFileSync(join(deadStaging, 'config.json'), 'new');
-      const backup = reinstallBackup(pid);
-      renameSync(finalDir(), backup);
-      return backup;
+      const holder = holderPath(pid);
+      mkdirSync(holder, { recursive: true });
+      renameSync(finalDir(), join(holder, SLUG));
+      return holder;
+    }
+    async function installed(): Promise<void> {
+      const m = manager();
+      expect(errorOf(await settled(m, m.start(SLUG).id))).toBe('');
+      expect(isModelInstalled(finalDir())).toBe(true);
+    }
+    /** A manager whose start-up recovery has run: its job waits for it. */
+    async function recovered(): Promise<void> {
+      const m = manager();
+      await settled(m, m.start(SLUG_OTHER).id);
     }
 
-    it('puts the old entry back when the manager starts, and the card offers Reinstall again', async () => {
-      const backup = crashedAfterFirstRename();
+    it('removes an empty holder', async () => {
+      mkdirSync(holderPath(), { recursive: true });
+      await recovered();
+      expect(existsSync(holderPath())).toBe(false);
+    });
+
+    it('puts the old entry back when the path is free, and the card offers the cleanup again', async () => {
+      const holder = crashedAfterFirstRename();
       expect(slugItem().blocker).toBeNull();
-      manager();
-      await waitFor(() => existsSync(finalDir()));
-      expect(existsSync(backup)).toBe(false);
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
       expect(leftoverIntact()).toBe(true);
       expect(slugItem().blocker).toMatchObject({ ...ONE_FILE, holdsModel: false });
     });
 
     it('puts the old entry back before a job for the slug runs, and refuses the plain install', async () => {
       const m = manager();
-      await settled(m, m.start(REPO_OTHER));
-      const backup = crashedAfterFirstRename();
-      const events = await settled(m, m.start(REPO));
+      await settled(m, m.start(SLUG_OTHER).id);
+      const holder = crashedAfterFirstRename();
+      const events = await settled(m, m.start(SLUG).id);
       expect(errorOf(events)).toContain('Refusing to install over');
-      expect(existsSync(backup)).toBe(false);
+      expect(existsSync(holder)).toBe(false);
       expect(leftoverIntact()).toBe(true);
       expect(jobStagingDirs()).toEqual([]);
     });
 
-    it('removes the backup once the new model is in place', async () => {
-      const m = manager();
-      expect(errorOf(await settled(m, m.start(REPO)))).toBe('');
-      expect(isModelInstalled(finalDir())).toBe(true);
-      const backup = reinstallBackup();
-      mkdirSync(join(backup, 'sub'), { recursive: true });
-      writeFileSync(join(backup, 'sub', LEFTOVER), 'old');
-      manager();
-      await waitFor(() => !existsSync(backup));
+    it.each<[string, (holder: string) => void, (holder: string) => void]>([
+      [
+        'a file',
+        (holder) => writeFileSync(join(holder, SLUG), 'old file'),
+        (at) => expect(readFileSync(join(at, SLUG), 'utf-8')).toBe('old file'),
+      ],
+      [
+        'a link',
+        (holder) => symlinkSync('old-target', join(holder, SLUG)),
+        (at) => expect(readlinkSync(join(at, SLUG))).toBe('old-target'),
+      ],
+    ])('never puts back %s over a file another program wrote at the path meanwhile', async (_name, plant, intact) => {
+      const holder = holderPath();
+      mkdirSync(holder, { recursive: true });
+      plant(holder);
+      lstatHook.after = (path) => {
+        if (path !== join(holder, SLUG)) return;
+        lstatHook.after = null;
+        writeFileSync(finalDir(), 'newcomer');
+      };
+      const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+      onTestFinished(() => error.mockRestore());
+      await recovered();
+      expect(readFileSync(finalDir(), 'utf-8')).toBe('newcomer');
+      const kept = keptDirs();
+      expect(kept).toHaveLength(1);
+      intact(join(stagingRoot(), kept[0]!));
+      expect(existsSync(holder)).toBe(false);
+      expect(error.mock.calls.some((call) => String(call[0]).includes(join(stagingRoot(), kept[0]!)))).toBe(true);
+    });
+
+    it('finishes the cleanup when the folder at the path is the one it renamed in: a folder goes to the Trash', async () => {
+      await installed();
+      const holder = holderPath(DEAD_PID, finalIno());
+      mkdirSync(join(holder, SLUG, 'sub'), { recursive: true });
+      writeFileSync(join(holder, SLUG, 'sub', LEFTOVER), 'old');
+      const tree = treeOf(join(holder, SLUG));
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
+      expect(treeOf(join(trash.dir, SLUG))).toEqual(tree);
       expect(isModelInstalled(finalDir())).toBe(true);
     });
 
-    it('never removes a backup that holds model files, or one whose path something else took', async () => {
-      const m = manager();
-      expect(errorOf(await settled(m, m.start(REPO)))).toBe('');
-      const heldBackup = reinstallBackup();
-      mkdirSync(heldBackup, { recursive: true });
-      writeFileSync(join(heldBackup, 'model.safetensors'), 'arrived');
-      const again = manager();
-      await settled(again, again.start(REPO));
-      expect(readFileSync(join(heldBackup, 'model.safetensors'), 'utf-8')).toBe('arrived');
+    it('finishes the cleanup when the folder at the path is the one it renamed in: a link is unlinked, its folder untouched', async () => {
+      await installed();
+      const external = externalFolder();
+      writeFileSync(join(external, 'keep.gguf'), Buffer.alloc(64, 0x33));
+      const tree = treeOf(external);
+      const holder = holderPath(DEAD_PID, finalIno());
+      mkdirSync(holder, { recursive: true });
+      symlinkSync(external, join(holder, SLUG));
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
+      expect(treeOf(external)).toEqual(tree);
+      expect(trashed()).toEqual([]);
+    });
 
-      rmSync(finalDir(), { recursive: true });
+    it.each<[string, (holder: string) => void]>([
+      [
+        'a folder',
+        (holder) => {
+          mkdirSync(join(holder, SLUG));
+          writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
+        },
+      ],
+      ['a link', (holder) => symlinkSync('old-target', join(holder, SLUG))],
+    ])(
+      'keeps %s, never removed, when the model at the path is not the one this cleanup installed',
+      async (_name, plant) => {
+        await installed();
+        const holder = holderPath(DEAD_PID, finalIno() + 1n);
+        mkdirSync(holder, { recursive: true });
+        plant(holder);
+        const tree = treeOf(join(holder, SLUG));
+        const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+        onTestFinished(() => error.mockRestore());
+        await recovered();
+        const kept = keptDirs();
+        expect(kept).toHaveLength(1);
+        expect(treeOf(join(stagingRoot(), kept[0]!, SLUG))).toEqual(tree);
+        expect(trashed()).toEqual([]);
+        expect(trash.calls).toEqual([]);
+        expect(error.mock.calls.some((call) => String(call[0]).includes(join(stagingRoot(), kept[0]!)))).toBe(true);
+        expect(isModelInstalled(finalDir())).toBe(true);
+      },
+    );
+
+    it('keeps the old entry when the Trash refuses during recovery', async () => {
+      await installed();
+      const holder = holderPath(DEAD_PID, finalIno());
+      mkdirSync(join(holder, SLUG), { recursive: true });
+      writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
+      trash.refuse = true;
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
+      const kept = keptDirs();
+      expect(kept).toHaveLength(1);
+      expect(readFileSync(join(stagingRoot(), kept[0]!, SLUG, LEFTOVER), 'utf-8')).toBe('old');
+    });
+
+    it('leaves everything when something else is at the path', async () => {
       mkdirSync(finalDir());
       writeFileSync(join(finalDir(), 'someone-else.txt'), 'x');
-      const foreignBackup = join(stagingRoot(), `${SLUG}.reinstall-${DEAD_PID}.77777777-7777-7777-7777-777777777777`);
-      mkdirSync(foreignBackup);
-      writeFileSync(join(foreignBackup, LEFTOVER), 'old');
-      const third = manager();
-      await settled(third, third.start(REPO));
-      expect(readFileSync(join(foreignBackup, LEFTOVER), 'utf-8')).toBe('old');
+      const holder = holderPath();
+      mkdirSync(join(holder, SLUG), { recursive: true });
+      writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
+      await recovered();
+      expect(readFileSync(join(holder, SLUG, LEFTOVER), 'utf-8')).toBe('old');
       expect(readdirSync(finalDir())).toEqual(['someone-else.txt']);
+      expect(trashed()).toEqual([]);
     });
 
-    it('leaves the backup of a live owner alone', async () => {
-      const backup = crashedAfterFirstRename(process.pid);
-      const m = manager();
-      await settled(m, m.start(REPO));
-      expect(readFileSync(join(backup, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
-      expect(existsSync(finalDir())).toBe(true);
+    it('leaves the holder of a live owner alone', async () => {
+      expect(pidAlive(process.ppid)).toBe(true);
+      const holder = crashedAfterFirstRename(process.ppid);
+      await recovered();
+      expect(readFileSync(join(holder, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+      expect(existsSync(finalDir())).toBe(false);
+    });
+
+    it('settles a holder with its own pid at manager start: no job of this process exists yet', async () => {
+      const holder = crashedAfterFirstRename(process.pid);
+      await recovered();
+      expect(existsSync(holder)).toBe(false);
+      expect(leftoverIntact()).toBe(true);
     });
   });
 
-  it('never lets Delete and Reinstall act on the same entry: Delete needs a config.json, Reinstall refuses one', () => {
-    const layouts: Array<() => void> = [
-      plantLeftover,
+  it('never calls rm on an entry the app did not create, in the job or in recovery', async () => {
+    const layouts: Array<() => ReplaceBlocker> = [
       () => {
-        mkdirSync(finalDir());
-        writeFileSync(join(finalDir(), 'config.json'), '{}');
+        plantLeftover();
+        return ONE_FILE;
       },
-      () => mkdirSync(join(finalDir(), 'config.json'), { recursive: true }),
       () => {
-        const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
-        onTestFinished(() => rmSync(external, { recursive: true, force: true }));
-        writeFileSync(join(external, 'config.json'), '{}');
-        symlinkSync(external, finalDir());
+        writeFileSync(finalDir(), Buffer.alloc(40, 0x1));
+        return slugItem().blocker!;
+      },
+      () => {
+        plantLinkToShards();
+        return slugItem().blocker!;
+      },
+      () => {
+        symlinkSync(join(modelsDir, 'nowhere'), finalDir());
+        return slugItem().blocker!;
+      },
+      // The folder gains the app's record during the download: it still goes to the Trash whole.
+      () => {
+        plantLeftover();
+        stagingHook.onVerifyWindow = () => writeMarker(finalDir(), SHA_OLD);
+        return ONE_FILE;
       },
     ];
-    for (const plant of layouts) {
+    for (const [index, plant] of layouts.entries()) {
       rmSync(finalDir(), { recursive: true, force: true });
-      plant();
-      const held = slugItem().blocker!.holdsModel;
-      let deleted = true;
-      try {
-        deleteLocalModel(modelsDir, SLUG);
-      } catch {
-        deleted = false;
-      }
-      expect(deleted).toBe(held);
+      const blocker = plant();
+      trash.refuse = index === 0;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
+      expect(errorOf(events)).toBe('');
+      await waitFor(() => jobStagingDirs().length === 0);
     }
+    trash.refuse = false;
+    for (const pid of [DEAD_PID]) {
+      const ino = lstatSync(finalDir(), { bigint: true }).ino;
+      const holder = join(stagingRoot(), `${SLUG}.cleanup-${pid}.${ino}.88888888-8888-8888-8888-888888888888`);
+      mkdirSync(join(holder, SLUG), { recursive: true });
+      writeFileSync(join(holder, SLUG, LEFTOVER), 'old');
+      const m = manager();
+      await settled(m, m.start(SLUG).id);
+      expect(existsSync(holder)).toBe(false);
+    }
+    expect(rmCalls.paths.length).toBeGreaterThan(0);
+    expect(foreignRm()).toEqual([]);
+  });
+
+  /** The app's record in `dir`, of this repo at `revision`, listing the files of a plain install. */
+  function writeMarker(dir: string, revision: string): void {
+    writeFileSync(
+      join(dir, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision, files: ['config.json', WEIGHT], completedAt: 'x' }),
+    );
+  }
+
+  describe('an entry that gains the app record during the job', () => {
+    it('moves a folder that gained the record during the download to the Trash whole', async () => {
+      plantLeftover();
+      writeFileSync(join(finalDir(), 'notes.txt'), 'my notes');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: slugItem().blocker! }).id;
+      stagingHook.onVerifyWindow = () => writeMarker(finalDir(), SHA_OLD);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'trash' });
+      expect(trash.calls).toHaveLength(1);
+      expect(trash.calls[0]!.startsWith(join(stagingRoot(), `${SLUG}.cleanup-`))).toBe(true);
+      expect(readFileSync(join(trash.dir, SLUG, 'notes.txt'), 'utf-8')).toBe('my notes');
+      expect(isModelInstalled(finalDir())).toBe(true);
+      expect(foreignRm()).toEqual([]);
+    });
+
+    it('refuses a folder with the record that replaced the confirmed one, and removes nothing', async () => {
+      plantLeftover();
+      const original = join(modelsDir, 'original');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      stagingHook.onVerifyWindow = () => {
+        renameSync(finalDir(), original);
+        plantLeftover();
+        writeMarker(finalDir(), SHA_OLD);
+      };
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(readdirSync(finalDir()).sort()).toEqual([DOWNLOAD_COMPLETE_MARKER, LEFTOVER].sort());
+      expect(leftoverIntact()).toBe(true);
+      expect(readdirSync(original)).toEqual([LEFTOVER]);
+      expect(trashed()).toEqual([]);
+      expect(foreignRm()).toEqual([]);
+    });
+
+    it('refuses before any download a folder with the record that replaced the confirmed one after the request', async () => {
+      plantLeftover();
+      const original = join(modelsDir, 'original');
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      renameSync(finalDir(), original);
+      plantLeftover();
+      writeMarker(finalDir(), SHA_OLD);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe(`"${SLUG}" changed on disk during the download. Nothing was removed.`);
+      expect(hub.downloaded).toEqual([]);
+      expect(leftoverIntact()).toBe(true);
+      expect(trashed()).toEqual([]);
+    });
+
+    it('replaces a folder that became a complete install of this revision after the request', async () => {
+      const plain = manager();
+      expect(errorOf(await settled(plain, plain.start(SLUG).id))).toBe('');
+      // Outside the models folder: a marked folder there would read as this build installed elsewhere.
+      const install = join(externalFolder(), 'install');
+      renameSync(finalDir(), install);
+      plantLeftover();
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+      cpSync(install, finalDir(), { recursive: true });
+      expect(isModelInstalled(finalDir())).toBe(true);
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'trash' });
+      expect(readdirSync(join(trash.dir, SLUG))).toContain(LEFTOVER);
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('removes only the link when its folder gains the record during the download', async () => {
+      const external = plantLinkToShards();
+      const blocker = slugItem().blocker!;
+      const m = manager();
+      const id = m.start(SLUG, { replaceBlocker: blocker }).id;
+      let tree: string[] = [];
+      stagingHook.onVerifyWindow = () => {
+        writeMarker(external, SHA_OLD);
+        tree = treeOf(external);
+      };
+      const events = await settled(m, id);
+      expect(errorOf(events)).toBe('');
+      expect(doneOf(events)).toMatchObject({ removed: 'link' });
+      expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+      expect(treeOf(external)).toEqual(tree);
+      expect(existsSync(join(external, DOWNLOAD_COMPLETE_MARKER))).toBe(true);
+      expect(trash.calls).toEqual([]);
+      expect(foreignRm()).toEqual([]);
+    });
+  });
+
+  describe('what the Trash step reports', () => {
+    it('keeps the old folder when the entry cannot be read after a refused Trash', async () => {
+      plantLeftover();
+      const tree = treeOf(finalDir());
+      onTestFinished(() => {
+        if (!existsSync(stagingRoot())) return;
+        for (const name of readdirSync(stagingRoot())) chmodSync(join(stagingRoot(), name), 0o700);
+      });
+      trash.before = (path) => chmodSync(dirname(path), 0o000);
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      for (const name of readdirSync(stagingRoot())) chmodSync(join(stagingRoot(), name), 0o700);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBeDefined();
+      expect(treeOf(join(done.keptDir!, SLUG))).toEqual(tree);
+      expect(isModelInstalled(finalDir())).toBe(true);
+    });
+
+    it('names the holder when the holder is gone after a refused Trash', async () => {
+      plantLeftover();
+      const away = join(modelsDir, 'away');
+      let holder = '';
+      trash.before = (path) => {
+        holder = dirname(path);
+        renameSync(holder, away);
+      };
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBe(holder);
+      expect(readFileSync(join(away, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    });
+
+    it('never renames a folder that took the holder path during a refused Trash', async () => {
+      plantLeftover();
+      const away = join(modelsDir, 'away');
+      let holder = '';
+      trash.before = (path) => {
+        holder = dirname(path);
+        renameSync(holder, away);
+        mkdirSync(holder);
+      };
+      trash.refuse = true;
+      const m = manager();
+      const events = await settled(m, m.start(SLUG, { replaceBlocker: ONE_FILE }).id);
+      const done = doneOf(events)!;
+      expect(done.removed).toBeUndefined();
+      expect(done.keptDir).toBe(holder);
+      expect(keptDirs()).toEqual([]);
+      expect(readdirSync(holder)).toEqual([]);
+      expect(readFileSync(join(away, SLUG, LEFTOVER))).toEqual(Buffer.alloc(LEFTOVER_BYTES, 0x5c));
+    });
+  });
+
+  it('keeps what a done job did in its row of the job list, with the kind of the cleaned entry', async () => {
+    plantLeftover();
+    trash.refuse = true;
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => error.mockRestore());
+    const m = manager();
+    const id = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    const done = doneOf(await settled(m, id))!;
+    expect(done.keptDir).toBeDefined();
+    // The core log names the kept folder too.
+    expect(error.mock.calls.some((call) => String(call[0]).includes(done.keptDir!))).toBe(true);
+    expect(m.jobs()).toEqual([
+      expect.objectContaining({
+        id,
+        state: 'done',
+        keptDir: done.keptDir,
+        entry: { kind: 'directory', linkToFile: false },
+      }),
+    ]);
+    expect(m.jobs()[0]!.removed).toBeUndefined();
+
+    rmSync(finalDir(), { recursive: true, force: true });
+    m.cancel(id);
+    trash.refuse = false;
+    plantLeftover();
+    const next = m.start(SLUG, { replaceBlocker: ONE_FILE }).id;
+    await settled(m, next);
+    expect(m.jobs().find((job) => job.id === next)).toMatchObject({ removed: 'trash' });
+    expect(m.jobs().find((job) => job.id === next)?.keptDir).toBeUndefined();
+  });
+
+  describe('the way back of a file or a link', () => {
+    it.each<[string, () => void, (at: string) => void]>([
+      [
+        'a file',
+        () => writeFileSync(finalDir(), Buffer.alloc(41, 0x1)),
+        (at) => expect(readFileSync(at)).toEqual(Buffer.alloc(41, 0x1)),
+      ],
+      [
+        'a link',
+        () => symlinkSync(join(modelsDir, 'nowhere'), finalDir()),
+        (at) => expect(readlinkSync(at)).toBe(join(modelsDir, 'nowhere')),
+      ],
+    ])('never replaces a file that lands at the path while %s is put back', async (_name, plant, intact) => {
+      plant();
+      const blocker = slugItem().blocker!;
+      renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+      lstatHook.after = (path) => {
+        if (!path.includes(`${SLUG}.cleanup-`) || basename(path) !== SLUG) return;
+        lstatHook.after = null;
+        writeFileSync(finalDir(), 'newcomer');
+      };
+      const m = manager();
+      const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id));
+      expect(readFileSync(finalDir(), 'utf-8')).toBe('newcomer');
+      const kept = keptDirs();
+      expect(kept).toHaveLength(1);
+      const keptDir = join(stagingRoot(), kept[0]!);
+      intact(join(keptDir, SLUG));
+      expect(message).toBe(
+        `"${SLUG}" changed on disk during the download, and something else is now at its path. ` +
+          `The old entry is at "${join(keptDir, SLUG)}". Nothing was removed.`,
+      );
+      expect(trashed()).toEqual([]);
+    });
+
+    it.each<[string, () => void, (at: string) => void]>([
+      [
+        'a file',
+        () => writeFileSync(finalDir(), Buffer.alloc(41, 0x1)),
+        (at) => expect(readFileSync(at)).toEqual(Buffer.alloc(41, 0x1)),
+      ],
+      [
+        'a link',
+        () => symlinkSync(join(modelsDir, 'nowhere'), finalDir()),
+        (at) => expect(readlinkSync(at)).toBe(join(modelsDir, 'nowhere')),
+      ],
+    ])(
+      'says nothing was removed when %s is back but its name in the holder cannot be unlinked',
+      async (_name, plant, intact) => {
+        plant();
+        const blocker = slugItem().blocker!;
+        renameFault.failFromPrefix = join(stagingRoot(), `${SLUG}@`);
+        unlinkHook.before = (path) => {
+          if (path.includes(`${SLUG}.cleanup-`) && basename(path) === SLUG) {
+            throw Object.assign(new Error('simulated unlink failure'), { code: 'EPERM' });
+          }
+        };
+        const m = manager();
+        const message = errorOf(await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id));
+        intact(finalDir());
+        expect(message).not.toContain('could not be put back');
+        expect(message.endsWith('. Nothing was removed.')).toBe(true);
+        expect(keptDirs()).toEqual([]);
+        expect(trashed()).toEqual([]);
+      },
+    );
   });
 
   describe('through the route', () => {
@@ -3988,57 +4719,2152 @@ describe('Reinstall: replace the entry in the way after a verified download', ()
       ['a negative count', { ...ONE_FILE, fileCount: -1 }],
       ['a fractional size', { ...ONE_FILE, sizeBytes: 1.5 }],
       ['a non-boolean truncated', { ...ONE_FILE, truncated: 'no' }],
+      ['no link text', { kind: 'directory', fileCount: 1, sizeBytes: LEFTOVER_BYTES, truncated: false }],
+      ['a link text of 202 characters', { ...ONE_FILE, kind: 'symlink', linkTarget: 'x'.repeat(202) }],
     ])('answers 400 for %s', async (_name, replaceBlocker) => {
       plantLeftover();
       const m = manager();
-      const res = await post(m, { repo: REPO, replaceBlocker });
+      const res = await post(m, { slug: SLUG, replaceBlocker });
       expect(res.status).toBe(400);
+      expect(res.ok ? '' : res.message).toBe(
+        '"replaceBlocker" must be { kind: "directory" | "symlink" | "file", fileCount, sizeBytes, truncated, linkTarget }',
+      );
       expect(m.jobs()).toEqual([]);
     });
 
-    it('ignores a path in the body: the target is the slug of the repo', async () => {
+    it('ignores a path and a repo in the body: the target is the catalog folder', async () => {
       plantLeftover();
       const elsewhere = join(modelsDir, 'elsewhere');
       mkdirSync(elsewhere);
       writeFileSync(join(elsewhere, 'keep'), 'k');
       const m = manager();
-      const res = await post(m, { repo: REPO, replaceBlocker: ONE_FILE, path: elsewhere, slug: 'elsewhere' });
+      const res = await post(m, { slug: SLUG, replaceBlocker: ONE_FILE, path: elsewhere, repo: 'someone/elsewhere' });
       expect(res.status).toBe(202);
+      expect(res.ok ? res.body : null).toMatchObject({ slug: SLUG, repo: REPO, kind: 'cleanup' });
       await settled(m, (res.ok ? (res.body as { id: string }) : { id: '' }).id);
       expect(readFileSync(join(elsewhere, 'keep'), 'utf-8')).toBe('k');
       expect(isModelInstalled(finalDir())).toBe(true);
     });
 
-    it('maps a conflict to 409 with the gate text', async () => {
+    it('maps a conflict to 409 with the gate text and no reason', async () => {
       plantLeftover();
-      const res = await post(manager(), { repo: REPO, replaceBlocker: { ...ONE_FILE, fileCount: 3 } });
+      const res = await post(manager(), { slug: SLUG, replaceBlocker: { ...ONE_FILE, fileCount: 3 } });
       expect(res.status).toBe(409);
       expect(res.ok ? '' : res.message).toBe(`"${SLUG}" changed on disk. Check it, then try again.`);
+      expect('reason' in res).toBe(false);
     });
 
-    it('runs the whole flow: catalog blocker, POST with the echo, done, installed', async () => {
-      plantLeftover();
+    it('runs the whole flow: catalog blocker, POST with the five fields, done, installed', async () => {
+      const external = plantLinkToShards();
       const ctx = { downloads: manager(), modelsDir } as unknown as ApiContext;
       const get = (pathname: string) => dispatch(ctx, { method: 'GET', pathname, query: new URLSearchParams() });
-      const before = await get('/api/catalog');
-      const item = (
-        before.ok ? (before.body as { items: Array<{ slug: string; blocker: ReplaceBlocker }> }) : { items: [] }
-      ).items.find((entry) => entry.slug === SLUG)!;
-      const { kind, fileCount, sizeBytes, truncated } = item.blocker;
+      type Build = { slug: string; listed: boolean; blocker: ReplaceBlocker & { locked: boolean } };
+      const buildOf = async (): Promise<Build> => {
+        const res = await get('/api/catalog');
+        return (res.ok ? (res.body as { items: Array<{ builds: Build[] }> }) : { items: [] }).items
+          .flatMap((entry) => entry.builds)
+          .find((build) => build.slug === SLUG)!;
+      };
+      const before = await buildOf();
+      expect(before).toMatchObject({
+        listed: false,
+        blocker: { kind: 'symlink', linkTarget: external, locked: false },
+      });
+      const { kind, fileCount, sizeBytes, truncated, linkTarget } = before.blocker;
       const res = await post(ctx.downloads as DownloadManager, {
-        repo: REPO,
-        replaceBlocker: { kind, fileCount, sizeBytes, truncated },
+        slug: SLUG,
+        replaceBlocker: { kind, fileCount, sizeBytes, truncated, linkTarget },
       });
       expect(res.status).toBe(202);
-      await settled(ctx.downloads as DownloadManager, (res.ok ? (res.body as { id: string }) : { id: '' }).id);
-      const after = await get('/api/catalog');
-      expect(
-        (after.ok ? (after.body as { items: Array<{ slug: string }> }) : { items: [] }).items.find(
-          (e) => e.slug === SLUG,
-        ),
-      ).toMatchObject({ installed: true, blocker: null });
-      // The stub download writes zero bytes, so the new config.json does not parse and the listing cannot show it.
-      expect(readdirSync(finalDir())).not.toContain(LEFTOVER);
+      const events = await settled(
+        ctx.downloads as DownloadManager,
+        (res.ok ? (res.body as { id: string }) : { id: '' }).id,
+      );
+      expect(doneOf(events)).toMatchObject({ removed: 'link' });
+      expect(await buildOf()).toMatchObject({ installed: true, blocker: null });
     });
+  });
+});
+
+describe('owned update of a folder that Update adopted', () => {
+  type DoneEvent = Extract<DownloadEvent, { type: 'done' }>;
+
+  /** The `adopted` record entry of a file as it is on disk now. */
+  function recordOf(path: string): { size: number; mtimeNs: string } {
+    const stat = lstatSync(path, { bigint: true });
+    return { size: Number(stat.size), mtimeNs: stat.mtimeNs.toString() };
+  }
+
+  /**
+   * A folder Update adopted: `listed` files the marker names with a record taken now (or `adopted` when given), plus
+   * `extra` files that only the user put there.
+   */
+  function writeAdoptedFolder(
+    dir: string,
+    listed: Record<string, Buffer>,
+    opts: { extra?: Record<string, string>; adopted?: unknown; revision?: string; marker?: object } = {},
+  ): void {
+    mkdirSync(dir, { recursive: true });
+    const record: Record<string, { size: number; mtimeNs: string }> = {};
+    for (const [path, bytes] of Object.entries(listed)) {
+      mkdirSync(dirname(join(dir, path)), { recursive: true });
+      writeFileSync(join(dir, path), bytes);
+      record[path] = recordOf(join(dir, path));
+    }
+    for (const [path, text] of Object.entries(opts.extra ?? {})) writeFileSync(join(dir, path), text);
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({
+        repo: REPO,
+        revision: opts.revision ?? SHA_OLD,
+        files: Object.keys(listed),
+        scope: 'full',
+        completedAt: 'x',
+        adopted: opts.adopted ?? record,
+        ...opts.marker,
+      }),
+    );
+  }
+
+  const OLD_FILES = (): Record<string, Buffer> => ({
+    'config.json': Buffer.alloc(12, 0xab),
+    [WEIGHT]: Buffer.alloc(300, 0xab),
+  });
+
+  /** `.staging/<slug>.kept-<uuid>` folders, by name. */
+  function keptDirs(): string[] {
+    return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${SLUG}.kept-`)) : [];
+  }
+
+  async function runJob(): Promise<DoneEvent> {
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300, 'tokenizer.json': 20 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(SLUG).id;
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    await manager.shutdown();
+    expect(events.find((event) => event.type === 'error')).toBeUndefined();
+    return events.find((event): event is DoneEvent => event.type === 'done')!;
+  }
+
+  it('deletes the files that still match the record and leaves no kept folder', async () => {
+    writeAdoptedFolder(finalDir(), { ...OLD_FILES(), 'sub/extra.json': Buffer.from('{}') });
+
+    const done = await runJob();
+
+    expect(done.keptDir).toBeUndefined();
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toEqual([]);
+    expect(hub.downloaded).toContain(WEIGHT);
+    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
+    expect(existsSync(join(finalDir(), 'sub'))).toBe(false);
+  });
+
+  it('keeps a file the user added and names the kept folder on done', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+
+    const done = await runJob();
+
+    expect(keptDirs()).toHaveLength(1);
+    const kept = join(stagingRoot(), keptDirs()[0]!);
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+    expect(existsSync(join(finalDir(), 'README.md'))).toBe(false);
+    expect(backupDirs()).toEqual([]);
+  });
+
+  it('keeps a listed file that was rewritten in place with the same size', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES());
+    const rewritten = Buffer.alloc(300, 0xcd);
+    writeFileSync(join(finalDir(), WEIGHT), rewritten);
+    utimesSync(join(finalDir(), WEIGHT), 1_000_000, 1_000_000);
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT))).toEqual(rewritten);
+  });
+
+  it('keeps everything when the record is malformed', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { adopted: { 'config.json': { size: '12', mtimeNs: '1' } } });
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'config.json', WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+  });
+
+  it('a second pass over a backup that could not be renamed keeps the same files', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    renameFault.failToPrefix = join(stagingRoot(), `${SLUG}.kept-`);
+
+    const done = await runJob();
+
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toHaveLength(1);
+    const backup = join(stagingRoot(), backupDirs()[0]!);
+    expect(done.keptDir).toBe(backup);
+    expect(readdirSync(backup).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+
+    // As if the app had died: the backup's owner pid is gone, so the next job's recovery takes it.
+    renameFault.failToPrefix = null;
+    renameSync(backup, join(stagingRoot(), `${SLUG}.backup-999999999.33333333-3333-3333-3333-333333333333`));
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(backupDirs()).toEqual([]);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+  });
+
+  it('recovery of a dead-pid backup uses the same rule', async () => {
+    await runJob();
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);
+    writeAdoptedFolder(backup, OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(existsSync(backup)).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md'].sort());
+    expect(errors.mock.calls.some((call) => String(call[0]).includes(kept))).toBe(true);
+  });
+
+  it('a stale sidecar in an adopted folder is not deleted in place', async () => {
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+    const users = Buffer.alloc(20, 0x75);
+    writeAdoptedFolder(
+      finalDir(),
+      { [WEIGHT]: Buffer.alloc(300), 'config.json': Buffer.alloc(12), 'tokenizer.json': users },
+      { revision: hub.sha, marker: { assetsRepo: ASSETS_REPO, assetsRevision: SHA_NEW } },
+    );
+    // The user rewrote the file after Update, so its record no longer proves it.
+    utimesSync(join(finalDir(), 'tokenizer.json'), 1_000_000, 1_000_000);
+
+    const done = await runJob();
+
+    expect(hub.downloaded).toContain(WEIGHT);
+    expect(existsSync(join(finalDir(), 'tokenizer.json'))).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readFileSync(join(kept, 'tokenizer.json'))).toEqual(users);
+  });
+
+  it('a file renamed onto a proven name between the check and the removal is kept and named', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    lstatHook.after = (path) => {
+      if (!path.includes(`${SLUG}.backup-`) || !path.endsWith(`/${WEIGHT}`)) return;
+      lstatHook.after = null;
+      renameSync(join(dirname(path), 'README.md'), path);
+    };
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, WEIGHT].sort());
+    expect(readFileSync(join(kept, WEIGHT), 'utf-8')).toBe('# my notes');
+  });
+
+  it('a file that cannot be put back at its name stays in the kept folder', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    let backupWeight = '';
+    lstatHook.after = (path) => {
+      if (!path.includes(`${SLUG}.backup-`) || !path.endsWith(`/${WEIGHT}`)) return;
+      lstatHook.after = null;
+      backupWeight = path;
+      renameSync(join(dirname(path), 'README.md'), path);
+    };
+    linkHook.before = (to) => {
+      if (backupWeight !== '' && to === backupWeight) writeFileSync(to, 'later');
+    };
+
+    const done = await runJob();
+
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(done.keptDir).toBe(kept);
+    const files = (readdirSync(kept, { recursive: true }) as string[]).filter((rel) =>
+      lstatSync(join(kept, rel)).isFile(),
+    );
+    const texts = files.map((rel) => readFileSync(join(kept, rel), 'utf-8'));
+    expect(texts).toContain('# my notes');
+    expect(texts).toContain('later');
+  });
+
+  it('a backup whose marker cannot be read is kept whole', async () => {
+    await runJob();
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.55555555-5555-5555-5555-555555555555`);
+    writeAdoptedFolder(backup, OLD_FILES(), { extra: { 'README.md': '# my notes' } });
+    writeFileSync(join(backup, MARKER_FILE), '{"truncated');
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {});
+    onTestFinished(() => errors.mockRestore());
+
+    await runJob();
+
+    expect(existsSync(backup)).toBe(false);
+    const kept = join(stagingRoot(), keptDirs()[0] ?? 'none');
+    expect(readdirSync(kept).sort()).toEqual([MARKER_FILE, 'README.md', 'config.json', WEIGHT].sort());
+    expect(readFileSync(join(kept, 'README.md'), 'utf-8')).toBe('# my notes');
+  });
+
+  it('an install without the record is removed as before', async () => {
+    writeAdoptedFolder(finalDir(), OLD_FILES(), {
+      extra: { 'README.md': '# my notes' },
+      marker: { adopted: undefined },
+    });
+
+    const done = await runJob();
+
+    expect(done.keptDir).toBeUndefined();
+    expect(keptDirs()).toEqual([]);
+    expect(backupDirs()).toEqual([]);
+    expect(existsSync(join(finalDir(), 'README.md'))).toBe(false);
+  });
+});
+
+const FLASH_BUILD = catalogBuild('Clairic Flash (9B)', 'UD-Q4_K_XL');
+const FLASH = catalogBuildRepo(FLASH_BUILD);
+const FLASH_ASSETS = FLASH_BUILD.assetsRepo!;
+const FLASH_SLUG = catalogBuildSlug(FLASH_BUILD);
+const FLASH_WEIGHT = 'Clairic-Flash-UD-Q4_K_XL.gguf';
+const ASSETS_SHA = SHA_NEW;
+
+/** The files of the user's folder, the five the catalog wants from the GGUF repo. */
+const USER_FILES: Record<string, Buffer> = {
+  [FLASH_WEIGHT]: Buffer.alloc(64, 0x11),
+  'mmproj-BF16.gguf': Buffer.alloc(32, 0x22),
+  'clair_head.safetensors': Buffer.alloc(48, 0x33),
+  'clair_head_config.json': Buffer.from('{"head":1}'),
+  'preprocessor_config.json': Buffer.from('{"size":448}'),
+};
+/** The files of the assets repo, in its listing order. */
+const ASSET_FILES: Record<string, Buffer> = {
+  'clairic_runtime/api.py': Buffer.from('pass'),
+  LICENSE: Buffer.from('license'),
+  'chat_template.jinja': Buffer.from('{{ messages }}'),
+  'config.json': Buffer.from('{"model_type":"clairic"}'),
+  'generation_config.json': Buffer.from('{}'),
+  'merges.txt': Buffer.from('a b'),
+  'preprocessor_config.json': Buffer.from('{"size":448}'),
+  'tokenizer.json': Buffer.alloc(40, 0x44),
+  'tokenizer_config.json': Buffer.from('{"t":1}'),
+  'video_preprocessor_config.json': Buffer.from('{"v":1}'),
+};
+const LFS = new Set([FLASH_WEIGHT, 'mmproj-BF16.gguf', 'clair_head.safetensors', 'tokenizer.json']);
+
+/** A manifest entry for `bytes` as Hugging Face lists it: LFS (with Xet) for weights, a git blob for small files. */
+function entryOf(path: string, bytes: Buffer): ManifestEntry {
+  const blob = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+  if (!LFS.has(path)) return { type: 'file', path, size: bytes.length, oid: blob };
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  return {
+    type: 'file',
+    path,
+    size: bytes.length,
+    oid: blob,
+    lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    xetHash: sha256.slice(0, 32),
+  };
+}
+
+/** The two repos the catalog entry reads, shaped like their real listings, and the user's folder. */
+function flashFolder(): string {
+  hub.manifests[FLASH] = [
+    entryOf('.gitattributes', Buffer.from('*.gguf filter=lfs')),
+    ...Object.entries(USER_FILES).map(([path, bytes]) => entryOf(path, bytes)),
+    entryOf('README.md', Buffer.from('# Clairic Flash')),
+  ];
+  hub.manifests[FLASH_ASSETS] = [
+    { type: 'directory', path: 'clairic_runtime', size: 0 },
+    ...Object.entries(ASSET_FILES).map(([path, bytes]) => entryOf(path, bytes)),
+  ];
+  hub.shaByRepo[FLASH_ASSETS] = ASSETS_SHA;
+  const dir = join(modelsDir, FLASH_SLUG);
+  mkdirSync(dir, { recursive: true });
+  for (const [path, bytes] of Object.entries(USER_FILES)) writeFileSync(join(dir, path), bytes);
+  writeFileSync(join(dir, 'README.md'), 'notes');
+  return dir;
+}
+
+describe('Update: plan for a folder the app did not create', () => {
+  function manager(opts: { fetchImpl?: typeof fetch; probeTimeoutMs?: number } = {}): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, ...opts });
+  }
+
+  /**
+   * The text of the plan's refusal, which must be a conflict with the reason `reason`: `needs-cleanup` for a folder
+   * that a cleanup can replace, none for a refusal that passes or that a cleanup cannot solve.
+   */
+  async function refusal(m: DownloadManager, reason: 'needs-cleanup' | 'none' = 'needs-cleanup'): Promise<string> {
+    const error = await m.planAdoption(FLASH_SLUG).then(
+      () => null,
+      (e: unknown) => e,
+    );
+    expect(error).toBeInstanceOf(DownloadConflictError);
+    expect((error as DownloadConflictError).reason).toBe(reason === 'none' ? undefined : reason);
+    return (error as Error).message;
+  }
+
+  it("plans a folder like the user's: 5 to check, 6 to download, README.md stays", async () => {
+    flashFolder();
+    const plan = await manager().planAdoption(FLASH_SLUG);
+    const sizes = (paths: string[]): number =>
+      paths.reduce(
+        (sum, path) =>
+          sum + (hub.manifests[FLASH]!.concat(hub.manifests[FLASH_ASSETS]!).find((e) => e.path === path)?.size ?? 0),
+        0,
+      );
+    expect(plan).toEqual({
+      repo: FLASH,
+      slug: FLASH_SLUG,
+      token: plan.token,
+      revision: hub.sha,
+      assetsRevision: ASSETS_SHA,
+      check: { count: 5, bytes: sizes(Object.keys(USER_FILES)) },
+      download: {
+        count: 6,
+        bytes: sizes([
+          'config.json',
+          'tokenizer.json',
+          'tokenizer_config.json',
+          'chat_template.jinja',
+          'generation_config.json',
+          'video_preprocessor_config.json',
+        ]),
+      },
+      other: { count: 1, bytes: 5, names: ['README.md'] },
+    });
+    expect(plan.token.length).toBe(64);
+    expect(plan.token.split('').every((ch) => (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))).toBe(true);
+    expect(hub.revisionsByRepo[FLASH]).toEqual([hub.sha]);
+    expect(hub.revisionsByRepo[FLASH_ASSETS]).toEqual([ASSETS_SHA]);
+    expect(hub.downloaded).toEqual([]);
+  });
+
+  it('reads no file content', async () => {
+    const dir = flashFolder();
+    const paths = [...Object.keys(USER_FILES), 'README.md'].map((path) => join(dir, path));
+    for (const path of paths) chmodSync(path, 0o000);
+    const plan = await manager()
+      .planAdoption(FLASH_SLUG)
+      .finally(() => {
+        for (const path of paths) chmodSync(path, 0o644);
+      });
+    expect(plan.check.count).toBe(5);
+    expect(plan.other.names).toEqual(['README.md']);
+  });
+
+  it('refuses a file with the catalog name and another size, and names it', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, FLASH_WEIGHT), Buffer.alloc(65, 0x11));
+    expect(await refusal(manager())).toBe(
+      `"${FLASH_WEIGHT}" in "${FLASH_SLUG}" is not the catalog file. Its size is different. ` +
+        `Move it out of the folder, then use Update again. Update then downloads the catalog file (64 bytes).`,
+    );
+  });
+
+  it('refuses a catalog file that has no checksum in the manifest', async () => {
+    flashFolder();
+    hub.manifests[FLASH] = hub.manifests[FLASH]!.map((entry) =>
+      entry.path === 'clair_head_config.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+    );
+    const m = manager();
+    expect(await refusal(m)).toBe(
+      `The catalog gives no checksum for "clair_head_config.json", so Update cannot check it. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+  });
+
+  it('refuses a missing catalog file that has no checksum in the manifest, and names it', async () => {
+    flashFolder();
+    hub.manifests[FLASH_ASSETS] = hub.manifests[FLASH_ASSETS]!.map((entry) =>
+      entry.path === 'tokenizer.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+    );
+    expect(await refusal(manager())).toBe(
+      `The catalog gives no checksum for "tokenizer.json", so Update cannot check what it downloads.`,
+    );
+  });
+
+  it('refuses an extra model file', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, 'Clairic-Flash-Q8_0.gguf'), 'q8');
+    expect(await refusal(manager())).toBe(
+      `"Clairic-Flash-Q8_0.gguf" in "${FLASH_SLUG}" is a model file that is not part of the catalog model. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+  });
+
+  it('refuses a name that differs only in letter case', async () => {
+    const dir = flashFolder();
+    rmSync(join(dir, 'clair_head_config.json'));
+    writeFileSync(join(dir, 'Clair_Head_Config.json'), USER_FILES['clair_head_config.json']!);
+    expect(await refusal(manager())).toBe(
+      `"Clair_Head_Config.json" in "${FLASH_SLUG}" differs from the catalog name "clair_head_config.json" only in ` +
+        `letter case. Rename it, then use Update again.`,
+    );
+  });
+
+  it.each<[string, (dir: string) => void, string]>([
+    ['a link', (dir) => symlinkSync(join(dir, 'README.md'), join(dir, 'notes.md')), 'holds links or special files'],
+    ['a special file', (dir) => execFileSync('/usr/bin/mkfifo', [join(dir, 'pipe')]), 'holds links or special files'],
+    [
+      'more than 2,000 entries',
+      (dir) => {
+        mkdirSync(join(dir, 'pages'));
+        for (let n = 0; n < 1_995; n++) writeFileSync(join(dir, 'pages', `${n}.txt`), '');
+      },
+      'holds more than 2,000 files',
+    ],
+    ['a folder with no write permission', (dir) => chmodSync(dir, 0o555), 'no write permission'],
+    [
+      'an owned folder',
+      (dir) =>
+        writeFileSync(
+          join(dir, MARKER_FILE),
+          JSON.stringify({ repo: FLASH, revision: SHA_OLD, files: Object.keys(USER_FILES), completedAt: 'x' }),
+        ),
+      'changed on disk',
+    ],
+    [
+      'a linked slug',
+      (dir) => {
+        const elsewhere = join(modelsDir, 'elsewhere');
+        renameSync(dir, elsewhere);
+        symlinkSync(elsewhere, dir);
+      },
+      'changed on disk',
+    ],
+    ['an unreadable marker file', (dir) => writeFileSync(join(dir, MARKER_FILE), '{'), 'cannot read'],
+  ])('refuses %s', async (_name, plant, words) => {
+    const dir = flashFolder();
+    plant(dir);
+    const texts: Record<string, string> = {
+      'holds links or special files': `"${FLASH_SLUG}" holds links or special files. Update cannot check it.`,
+      'holds more than 2,000 files': `"${FLASH_SLUG}" holds more than 2,000 files. Update cannot check it.`,
+      'no write permission':
+        `The app cannot add files to "${FLASH_SLUG}": it has no write permission on it. ` +
+        `Change its permissions, then try again.`,
+      'changed on disk': `"${FLASH_SLUG}" changed on disk. Check it, then try again.`,
+      'cannot read':
+        `"${FLASH_SLUG}" holds a download record that the app cannot read (${MARKER_FILE}). ` +
+        `Move it out of the folder, then use Update again.`,
+    };
+    const reason = words === 'no write permission' || words === 'changed on disk' ? 'none' : 'needs-cleanup';
+    try {
+      expect(await refusal(manager(), reason)).toBe(texts[words]);
+    } finally {
+      if (lstatSync(dir).isDirectory()) chmodSync(dir, 0o755);
+    }
+  });
+
+  it('plans a folder of exactly 2,000 entries', async () => {
+    const dir = flashFolder();
+    mkdirSync(join(dir, 'pages'));
+    // 6 files and the folder itself are already 7 entries.
+    for (let n = 0; n < 1_993; n++) writeFileSync(join(dir, 'pages', `${n}.txt`), '');
+    expect((await manager().planAdoption(FLASH_SLUG)).other.count).toBe(1_994);
+  });
+
+  it('a new .DS_Store does not change the token; a touched check file does', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    const first = await m.planAdoption(FLASH_SLUG);
+    writeFileSync(join(dir, '.DS_Store'), Buffer.alloc(6148));
+    const second = await m.planAdoption(FLASH_SLUG);
+    expect(second.other.names).toEqual(['.DS_Store', 'README.md']);
+    expect(second.token).toBe(first.token);
+    utimesSync(join(dir, FLASH_WEIGHT), 1_000_000, 1_000_000);
+    expect((await m.planAdoption(FLASH_SLUG)).token).not.toBe(first.token);
+  });
+
+  it('uses the raw fetch with a deadline while another job downloads', async () => {
+    flashFolder();
+    hub.modelInfoUsesFetch = true;
+    const stalling = makeStallingFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, 100);
+    let cancelJob = (): void => {};
+    const fetchImpl: typeof fetch = (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!url.endsWith(`/api/models/${FLASH}`)) return stalling(input, init);
+      // The plan's metadata read hangs; the running job is cancelled while it waits.
+      return new Promise<Response>((_resolve, reject) => {
+        const signal = init!.signal!;
+        signal.addEventListener('abort', () => reject(signal.reason as Error));
+        cancelJob();
+      });
+    };
+    const m = manager({ fetchImpl, probeTimeoutMs: 200 });
+    const events: DownloadEvent[] = [];
+    const id = m.start(SLUG).id;
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'progress' && event.file === WEIGHT));
+    const received = m.jobs().find((job) => job.id === id)!.receivedBytes;
+    cancelJob = () => {
+      expect(m.jobs().find((job) => job.id === id)!.receivedBytes).toBe(received);
+      m.cancel(id);
+    };
+
+    const error = await m.planAdoption(FLASH_SLUG).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+
+    expect(error?.message).toBe('Could not check the folder: The operation was aborted due to timeout');
+    await waitFor(() => events.some((event) => event.type === 'cancelled'));
+  });
+
+  it('says it could not check the folder when Hugging Face does not answer', async () => {
+    flashFolder();
+    hub.modelInfoError = 'getaddrinfo ENOTFOUND huggingface.co';
+    await expect(manager().planAdoption(FLASH_SLUG)).rejects.toThrow(
+      'Could not check the folder: getaddrinfo ENOTFOUND huggingface.co',
+    );
+  });
+
+  it('answers 409 while a job holds the repo', async () => {
+    flashFolder();
+    const m = manager({ fetchImpl: makeStallingFetch({ 'config.json': 12, [WEIGHT]: 300 }, WEIGHT, 100) });
+    const running = m.start(SLUG).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(running, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'progress'));
+    m.start(FLASH_SLUG);
+    expect(await refusal(m, 'none')).toBe(
+      'A download of this model is already in the queue. Cancel it, then use Update.',
+    );
+    await m.shutdown();
+  });
+
+  it('refuses a disk that cannot link files before it reads the network, and leaves no test file', async () => {
+    const dir = flashFolder();
+    const before = readdirSync(dir).sort();
+    linkHook.probe = () => {
+      throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' });
+    };
+    expect(await refusal(manager())).toBe(
+      `This disk cannot link files, so Update cannot add files to "${FLASH_SLUG}".`,
+    );
+    expect(hub.modelInfoRepos).toEqual([]);
+    expect(readdirSync(stagingRoot())).toEqual([]);
+    expect(readdirSync(dir).sort()).toEqual(before);
+  });
+
+  it('refuses in a plain sentence when the app cannot write its link test file', async () => {
+    flashFolder();
+    mkdirSync(stagingRoot(), { recursive: true });
+    chmodSync(stagingRoot(), 0o500);
+    try {
+      expect(await refusal(manager(), 'none')).toBe(
+        `The app cannot write in the models folder, so Update cannot add files to "${FLASH_SLUG}".`,
+      );
+    } finally {
+      chmodSync(stagingRoot(), 0o700);
+    }
+    expect(hub.modelInfoRepos).toEqual([]);
+    expect(readdirSync(stagingRoot())).toEqual([]);
+  });
+
+  it('sends the reason beside the 409 text through the route, and none for a refusal that passes', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, 'Clairic-Flash-Q8_0.gguf'), 'q8');
+    const ctx = { downloads: manager(), modelsDir } as unknown as ApiContext;
+    const plan = () =>
+      dispatch(ctx, {
+        method: 'POST',
+        pathname: '/api/downloads/adopt-plan',
+        query: new URLSearchParams(),
+        body: { slug: FLASH_SLUG },
+      });
+    const refused = await plan();
+    expect(refused).toMatchObject({ ok: false, status: 409, code: 'E_CONFLICT', reason: 'needs-cleanup' });
+    rmSync(join(dir, 'Clairic-Flash-Q8_0.gguf'));
+    chmodSync(dir, 0o555);
+    try {
+      const locked = await plan();
+      expect(locked).toMatchObject({ ok: false, status: 409 });
+      expect('reason' in locked).toBe(false);
+    } finally {
+      chmodSync(dir, 0o755);
+    }
+  });
+});
+
+describe('Update: proof in place', () => {
+  const NAME = 'weights.gguf';
+  const BYTES = Buffer.alloc(1024 * 1024, 0x5a);
+
+  function lfs(bytes: Buffer, path = NAME): ManifestEntry {
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return {
+      type: 'file',
+      path,
+      size: bytes.length,
+      oid: 'f'.repeat(40),
+      lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    };
+  }
+
+  function expected(path: string): { size: number; mtimeNs: bigint; ino: bigint } {
+    const stat = lstatSync(path, { bigint: true });
+    return { size: Number(stat.size), mtimeNs: stat.mtimeNs, ino: stat.ino };
+  }
+
+  function folder(): string {
+    const dir = join(modelsDir, 'user-folder');
+    mkdirSync(dir);
+    writeFileSync(join(dir, NAME), BYTES);
+    return dir;
+  }
+
+  const quiet = { cancelled: () => false, onBytes: () => {} };
+
+  it('proves a file by sha256 and by git-blob sha1', async () => {
+    const dir = folder();
+    const config = Buffer.from('{"model_type":"clairic"}');
+    writeFileSync(join(dir, 'config.json'), config);
+    const blob: ManifestEntry = {
+      type: 'file',
+      path: 'config.json',
+      size: config.length,
+      oid: createHash('sha1').update(`blob ${config.length}\0`).update(config).digest('hex'),
+    };
+
+    const weights = await proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), quiet);
+    const small = await proveInPlace(dir, blob as ListFileEntry, expected(join(dir, 'config.json')), quiet);
+    const wrong = await proveInPlace(
+      dir,
+      lfs(Buffer.alloc(BYTES.length, 0x5b)) as ListFileEntry,
+      expected(join(dir, NAME)),
+      quiet,
+    );
+
+    expect(weights.match).toBe(true);
+    expect(weights.fingerprint.ino).toBe(lstatSync(join(dir, NAME), { bigint: true }).ino);
+    expect(small.match).toBe(true);
+    expect(wrong.match).toBe(false);
+  });
+
+  it('does not follow a link', async () => {
+    const dir = folder();
+    symlinkSync(join(dir, NAME), join(dir, 'linked.gguf'));
+    const error = await proveInPlace(
+      dir,
+      lfs(BYTES, 'linked.gguf') as ListFileEntry,
+      expected(join(dir, NAME)),
+      quiet,
+    ).then(
+      () => null,
+      (e: unknown) => e as NodeJS.ErrnoException,
+    );
+    expect(error?.code).toBe('ELOOP');
+  });
+
+  it('refuses a file that is not the one the plan saw', async () => {
+    const dir = folder();
+    const plan = expected(join(dir, NAME));
+    utimesSync(join(dir, NAME), 1_000_000, 1_000_000);
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, plan, quiet)).rejects.toThrow(
+      `"${NAME}" in "user-folder" changed during the check. Nothing was changed. Use Update again.`,
+    );
+  });
+
+  it('fails when the file is rewritten with the same size during the read', async () => {
+    const dir = folder();
+    // Only the first chunk differs, and it is read before the rewrite, so the bytes read hash to the catalog file.
+    const rewritten = Buffer.from(BYTES);
+    rewritten[0] = 0x00;
+    let first = true;
+    const hooks = {
+      cancelled: () => false,
+      onBytes: () => {
+        if (!first) return;
+        first = false;
+        writeFileSync(join(dir, NAME), rewritten);
+      },
+    };
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks)).rejects.toThrow(
+      `"${NAME}" in "user-folder" changed during the check. Nothing was changed. Use Update again.`,
+    );
+  });
+
+  it('stops inside a file when cancelled', async () => {
+    const dir = folder();
+    let read = 0;
+    const hooks = { cancelled: () => read > 0, onBytes: (n: number) => void (read += n) };
+    await expect(proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks)).rejects.toThrow(
+      'Download cancelled',
+    );
+    expect(read).toBeGreaterThan(0);
+    expect(read).toBeLessThan(BYTES.length);
+  });
+
+  it('reports every byte once', async () => {
+    const dir = folder();
+    const chunks: number[] = [];
+    const hooks = { cancelled: () => false, onBytes: (n: number) => void chunks.push(n) };
+    const proof = await proveInPlace(dir, lfs(BYTES) as ListFileEntry, expected(join(dir, NAME)), hooks);
+    expect(proof.match).toBe(true);
+    expect(chunks.length).toBeGreaterThan(1);
+    expect(chunks.reduce((sum, n) => sum + n, 0)).toBe(BYTES.length);
+  });
+});
+
+describe('Update: adopt a folder the app did not create, in place', () => {
+  /** What the job downloads for the user's folder, in the order it adds them: config.json last. */
+  const DOWNLOADED = [
+    'tokenizer.json',
+    'tokenizer_config.json',
+    'chat_template.jinja',
+    'generation_config.json',
+    'video_preprocessor_config.json',
+    'config.json',
+  ];
+  const BYTES: Record<string, Buffer> = { ...ASSET_FILES, ...USER_FILES };
+  let fetched: string[] = [];
+
+  beforeEach(() => {
+    fetched = [];
+  });
+
+  /**
+   * A fetch that serves each file's own bytes, so its download verifies, and logs the path. `hold` may answer a path
+   * itself, for a download that waits.
+   */
+  function manager(hold?: (path: string, init?: RequestInit) => Promise<Response> | undefined): DownloadManager {
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      const path = url.split('/').slice(3).join('/');
+      fetched.push(path);
+      const held = hold?.(path, init);
+      if (held !== undefined) return held;
+      return new Response(new Uint8Array(BYTES[path] ?? Buffer.alloc(0)), { status: 200 });
+    };
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl });
+  }
+
+  /** A download that only ends when the job's fetch is aborted. */
+  function waitForAbort(init: RequestInit | undefined): Promise<Response> {
+    return new Promise<Response>((_resolve, reject) => {
+      const abort = (): void => reject(new DOMException('The operation was aborted', 'AbortError'));
+      if (init?.signal?.aborted) abort();
+      else init?.signal?.addEventListener('abort', abort);
+    });
+  }
+
+  interface FileState {
+    ino: bigint;
+    mtimeNs: bigint;
+    bytes: Buffer;
+  }
+
+  /** Every file under `dir` by path, with its inode, mtime and bytes. */
+  function filesOf(dir: string): Map<string, FileState> {
+    const out = new Map<string, FileState>();
+    for (const rel of readdirSync(dir, { recursive: true }) as string[]) {
+      const stat = lstatSync(join(dir, rel), { bigint: true });
+      if (stat.isFile()) out.set(rel, { ino: stat.ino, mtimeNs: stat.mtimeNs, bytes: readFileSync(join(dir, rel)) });
+    }
+    return out;
+  }
+
+  /** Every file that was in the folder is still there at the same inode, with the same mtime and bytes. */
+  function expectKept(before: Map<string, FileState>, dir: string): void {
+    const now = filesOf(dir);
+    for (const [path, state] of before) expect(now.get(path), path).toEqual(state);
+  }
+
+  /** The names the folder has now that it did not have in `before`. */
+  function addedNames(before: Map<string, FileState>, dir: string): string[] {
+    return [...filesOf(dir).keys()].filter((path) => !before.has(path)).sort();
+  }
+
+  function flashStagingDirs(): string[] {
+    return existsSync(stagingRoot()) ? readdirSync(stagingRoot()).filter((n) => n.startsWith(`${FLASH_SLUG}@`)) : [];
+  }
+
+  function errorOf(events: DownloadEvent[]): string | undefined {
+    const error = events.find((event) => event.type === 'error');
+    return error?.type === 'error' ? error.message : undefined;
+  }
+
+  /**
+   * Plan an Update, run `between` (a change after the confirm), start the job with the plan's token, and wait for its
+   * last event. `onEvent` sees every event as it comes.
+   */
+  async function runUpdate(
+    m: DownloadManager,
+    opts: { between?: () => void; onEvent?: (event: DownloadEvent, id: string) => void } = {},
+  ): Promise<{ id: string; events: DownloadEvent[]; last: DownloadEvent }> {
+    const plan = await m.planAdoption(FLASH_SLUG);
+    opts.between?.();
+    const id = m.start(FLASH_SLUG, { adopt: plan.token }).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => {
+      events.push(event);
+      opts.onEvent?.(event, id);
+    });
+    await waitFor(() =>
+      events.some((event) => event.type === 'done' || event.type === 'error' || event.type === 'cancelled'),
+    );
+    return { id, events, last: events.at(-1)! };
+  }
+
+  it('keeps every checked file at its inode, adds only the missing files, writes the marker last, and the catalog says installed', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const order: string[] = [];
+    linkHook.before = (to) => void order.push(to.slice(dir.length + 1));
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last).toEqual({ type: 'done', id: last.id, outputDir: dir });
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED, MARKER_FILE].sort());
+    expect(order).toEqual([...DOWNLOADED, MARKER_FILE]);
+    expect(fetched.sort()).toEqual([...DOWNLOADED].sort());
+    for (const path of DOWNLOADED) {
+      expect(readFileSync(join(dir, path))).toEqual(ASSET_FILES[path]);
+      // The staging tree is gone, so the folder holds the only name of each added file.
+      expect(lstatSync(join(dir, path), { bigint: true }).nlink).toBe(1n);
+    }
+    expect(flashStagingDirs()).toEqual([]);
+    expect(isModelInstalled(dir)).toBe(true);
+    expect(buildState(FLASH_SLUG)).toMatchObject({
+      installed: true,
+      blocker: null,
+    });
+  });
+
+  it('a crash at any add leaves a folder the app does not own', async () => {
+    const dir = flashFolder();
+    const ownedAtAdd: Array<[string, boolean]> = [];
+    linkHook.before = (to) => {
+      const path = to.slice(dir.length + 1);
+      if (path !== MARKER_FILE) ownedAtAdd.push([path, existsSync(join(dir, MARKER_FILE))]);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(ownedAtAdd).toEqual(DOWNLOADED.map((path) => [path, false]));
+  });
+
+  it('leaves README.md in place and records every listed file in adopted', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager();
+
+    expect((await runUpdate(m)).last.type).toBe('done');
+    await m.shutdown();
+
+    expectKept(before, dir);
+    expect(readFileSync(join(dir, 'README.md'), 'utf-8')).toBe('notes');
+    const marker = JSON.parse(readFileSync(join(dir, MARKER_FILE), 'utf-8')) as {
+      repo: string;
+      revision: string;
+      files: string[];
+      scope: string;
+      assetsRepo: string;
+      assetsRevision: string;
+      adopted: Record<string, { size: number; mtimeNs: string }>;
+    };
+    const wanted = [...Object.keys(USER_FILES), ...DOWNLOADED].sort();
+    expect(marker).toMatchObject({
+      repo: FLASH,
+      revision: hub.sha,
+      scope: 'full',
+      assetsRepo: FLASH_ASSETS,
+      assetsRevision: ASSETS_SHA,
+    });
+    expect([...marker.files].sort()).toEqual(wanted);
+    expect(Object.keys(marker.adopted).sort()).toEqual(wanted);
+    for (const path of wanted) {
+      const stat = lstatSync(join(dir, path), { bigint: true });
+      expect(marker.adopted[path], path).toEqual({ size: Number(stat.size), mtimeNs: stat.mtimeNs.toString() });
+    }
+  });
+
+  it('stops and changes nothing when a same-size file is not the catalog file; the next plan refuses it without a new hash', async () => {
+    const dir = flashFolder();
+    writeFileSync(join(dir, 'clair_head.safetensors'), Buffer.alloc(48, 0x34));
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `"clair_head.safetensors" in "${FLASH_SLUG}" is not the catalog file. Nothing was changed. ` +
+        `Move it out of the folder, then use Update again.`,
+    );
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+    // No file is read while planning, so the refusal comes from what the job's hash found.
+    chmodSync(join(dir, 'clair_head.safetensors'), 0o000);
+    const refused = await m.planAdoption(FLASH_SLUG).then(
+      () => null,
+      (e: unknown) => e as Error,
+    );
+    chmodSync(join(dir, 'clair_head.safetensors'), 0o644);
+    expect(refused).toBeInstanceOf(DownloadConflictError);
+    expect((refused as DownloadConflictError).reason).toBe('needs-cleanup');
+    expect(refused?.message).toBe(
+      `"clair_head.safetensors" in "${FLASH_SLUG}" is not the catalog file. Move it out of the folder, then use Update again.`,
+    );
+    await m.shutdown();
+  });
+
+  it('downloads a catalog file that is missing from the folder', async () => {
+    const dir = flashFolder();
+    rmSync(join(dir, FLASH_WEIGHT));
+    const before = filesOf(dir);
+    const m = manager();
+    expect((await m.planAdoption(FLASH_SLUG)).download.count).toBe(7);
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED, FLASH_WEIGHT, MARKER_FILE].sort());
+    expect(hub.downloadedFrom).toContain(`${FLASH}/${FLASH_WEIGHT}`);
+    expect(readFileSync(join(dir, FLASH_WEIGHT))).toEqual(USER_FILES[FLASH_WEIGHT]);
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('refuses a token that is not the last plan (409) and queues nothing', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    const first = await m.planAdoption(FLASH_SLUG);
+    const refusedText = `"${FLASH_SLUG}" changed on disk. Close this, then use Update again.`;
+
+    expect(() => m.start(FLASH_SLUG, { adopt: 'f'.repeat(64) })).toThrow(refusedText);
+    utimesSync(join(dir, FLASH_WEIGHT), 1_000_000, 1_000_000);
+    const second = await m.planAdoption(FLASH_SLUG);
+    expect(second.token).not.toBe(first.token);
+    expect(() => m.start(FLASH_SLUG, { adopt: first.token })).toThrow(DownloadConflictError);
+    expect(() => m.start(FLASH_SLUG, { adopt: first.token })).toThrow(refusedText);
+    expect(m.jobs()).toEqual([]);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+
+    const id = m.start(FLASH_SLUG, { adopt: second.token }).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done'));
+    // A token starts one job only.
+    expect(() => m.start(FLASH_SLUG, { adopt: second.token })).toThrow(refusedText);
+    await m.shutdown();
+  });
+
+  it.each<[string, (dir: string) => void]>([
+    ['upstream moved', () => void (hub.sha = SHA_NEW)],
+    ['the assets repo moved', () => void (hub.shaByRepo[FLASH_ASSETS] = SHA_A)],
+    ['a check file was touched', (dir) => utimesSync(join(dir, 'clair_head.safetensors'), 1_000_000, 1_000_000)],
+  ])('fails at job start when %s after the confirm', async (_name, change) => {
+    const dir = flashFolder();
+    let before = new Map<string, FileState>();
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      between: () => {
+        change(dir);
+        before = filesOf(dir);
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `"${FLASH_SLUG}" or the catalog changed after you confirmed. Nothing was changed. Use Update again.`,
+    );
+    expect(events.some((event) => event.type === 'start')).toBe(false);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+  });
+
+  it('fails at the commit when a check file was touched after its hash', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager((path) => {
+      if (path === 'tokenizer.json') utimesSync(join(dir, 'clair_head_config.json'), 1_000_000, 1_000_000);
+      return undefined;
+    });
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(readFileSync(join(dir, 'clair_head_config.json'))).toEqual(USER_FILES['clair_head_config.json']);
+    expect(lstatSync(join(dir, 'clair_head_config.json'), { bigint: true }).ino).toBe(
+      before.get('clair_head_config.json')!.ino,
+    );
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('an other file that goes away during the commit scan does not stop the Update', async () => {
+    const dir = flashFolder();
+    const notes = join(dir, 'notes.txt');
+    writeFileSync(notes, 'temp');
+    let scans = 0;
+    // The 1st lstat is the plan's scan, the 2nd the job's own plan, the 3rd the commit scan: the file is gone after
+    // the scan listed it and before its lstat.
+    lstatHook.before = (path) => {
+      if (path === notes && ++scans === 3) rmSync(notes);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(scans).toBe(3);
+    expect(last).toEqual({ type: 'done', id: last.id, outputDir: dir });
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('a check file that goes away during the commit scan still fails the Update', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const head = join(dir, 'clair_head_config.json');
+    const kept = join(modelsDir, 'clair_head_config.json');
+    let scans = 0;
+    lstatHook.before = (path) => {
+      if (path === head && ++scans === 3) renameSync(head, kept);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    renameSync(kept, head);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+  });
+
+  it('a file that appears at a path the job adds makes link fail, and the job removes what it added', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const mine = Buffer.from('{"model_type":"mine"}');
+    // Lands after the commit scan, while the marker is written into staging.
+    raceHook.onMarkerWrite = () => writeFileSync(join(dir, 'config.json'), mine);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"config.json" appeared in "${FLASH_SLUG}" during the update. Nothing was changed.`);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual(['config.json']);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(mine);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it("never removes an added name that is no longer the job's inode", async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const mine = Buffer.from('my tokenizer');
+    linkHook.before = (to) => {
+      if (to !== join(dir, 'config.json')) return;
+      // The user replaces a file the job added, and puts a config.json where the job adds one.
+      rmSync(join(dir, 'tokenizer.json'));
+      writeFileSync(join(dir, 'tokenizer.json'), mine);
+      writeFileSync(to, '{}');
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"config.json" appeared in "${FLASH_SLUG}" during the update. Nothing was changed.`);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual(['config.json', 'tokenizer.json']);
+    expect(readFileSync(join(dir, 'tokenizer.json'))).toEqual(mine);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+  });
+
+  it('keeps every added file when it cannot remove the added config.json, and says to remove it', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) throw Object.assign(new Error('simulated'), { code: 'EIO' });
+    };
+    renameFault.failFromPath = join(dir, 'config.json');
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    const stays = [...DOWNLOADED].reverse();
+    expect(errorOf(events)).toBe(
+      `Update stopped. These files that it added stay in "${FLASH_SLUG}": ${stays.join(', ')}. ` +
+        `No file of yours was changed. Remove config.json from the folder, then use Update again.`,
+    );
+    expectKept(before, dir);
+    // A config.json without its tokenizer would read as installed; with every added file beside it the folder is whole.
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED].sort());
+    for (const path of DOWNLOADED) expect(readFileSync(join(dir, path))).toEqual(ASSET_FILES[path]);
+    expect(buildState(FLASH_SLUG)).toMatchObject({
+      present: true,
+      installed: false,
+      blocker: null,
+    });
+    rmSync(join(dir, 'config.json'));
+    expect(buildState(FLASH_SLUG)?.blocker).toMatchObject({
+      holdsModel: true,
+      kind: 'directory',
+    });
+  });
+
+  it('a file renamed onto an added name between the check and the removal is not deleted', async () => {
+    const dir = flashFolder();
+    const notes = Buffer.from('my notes');
+    writeFileSync(join(dir, 'my-notes.txt'), notes);
+    let rollingBack = false;
+    linkHook.before = (to) => {
+      if (to !== join(dir, MARKER_FILE)) return;
+      rollingBack = true;
+      throw Object.assign(new Error('simulated'), { code: 'EIO' });
+    };
+    lstatHook.after = (path) => {
+      if (!rollingBack || path !== join(dir, 'config.json')) return;
+      lstatHook.after = null;
+      renameSync(join(dir, 'my-notes.txt'), path);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toContain(`The app could not add "${MARKER_FILE}" to "${FLASH_SLUG}" (EIO).`);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(notes);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    for (const path of DOWNLOADED.filter((path) => path !== 'config.json')) {
+      expect(existsSync(join(dir, path)), path).toBe(false);
+    }
+    expect(readdirSync(stagingRoot()).filter((name) => name.startsWith(`${FLASH_SLUG}.kept-`))).toEqual([]);
+  });
+
+  it('a file that cannot be put back at its name is kept, and the error names where', async () => {
+    const dir = flashFolder();
+    const notes = Buffer.from('my notes');
+    const later = Buffer.from('{"later":1}');
+    writeFileSync(join(dir, 'my-notes.txt'), notes);
+    let rollingBack = false;
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) {
+        rollingBack = true;
+        throw Object.assign(new Error('simulated'), { code: 'EIO' });
+      }
+      // Something takes the name while the moved file is checked, so it cannot go back.
+      if (rollingBack && to === join(dir, 'config.json')) writeFileSync(to, later);
+    };
+    lstatHook.after = (path) => {
+      if (!rollingBack || path !== join(dir, 'config.json')) return;
+      lstatHook.after = null;
+      renameSync(join(dir, 'my-notes.txt'), path);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    const kept = readdirSync(stagingRoot()).filter((name) => name.startsWith(`${FLASH_SLUG}.kept-`));
+    expect(kept).toHaveLength(1);
+    const keptDir = join(stagingRoot(), kept[0]!);
+    expect(readFileSync(join(keptDir, 'config.json'))).toEqual(notes);
+    expect(readFileSync(join(dir, 'config.json'))).toEqual(later);
+    const message = errorOf(events)!;
+    expect(message).toContain(`"${keptDir}"`);
+    expect(message).not.toContain('No file of yours was changed');
+    expect(message).not.toContain('Nothing was changed');
+  });
+
+  it('a checked file that changes while the files are added stops the Update before the marker', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = (to) => {
+      if (to === join(dir, 'config.json')) truncateSync(join(dir, FLASH_WEIGHT), 3);
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(`"${FLASH_SLUG}" changed on disk during the update. Nothing was changed.`);
+    expect(existsSync(join(dir, MARKER_FILE))).toBe(false);
+    expect(addedNames(before, dir)).toEqual([]);
+    before.delete(FLASH_WEIGHT);
+    expectKept(before, dir);
+  });
+
+  it('a change to a checked file at the marker link itself is not seen (accepted)', async () => {
+    const dir = flashFolder();
+    linkHook.before = (to) => {
+      if (to === join(dir, MARKER_FILE)) truncateSync(join(dir, FLASH_WEIGHT), 3);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(lstatSync(join(dir, FLASH_WEIGHT)).size).toBe(3);
+  });
+
+  it('a missing file whose checksum leaves the manifest after the confirm stops the job before any download', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      between: () => {
+        hub.manifests[FLASH_ASSETS] = hub.manifests[FLASH_ASSETS]!.map((entry) =>
+          entry.path === 'tokenizer.json' ? { type: 'file', path: entry.path, size: entry.size } : entry,
+        );
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toContain(`The catalog gives no checksum for "tokenizer.json"`);
+    expect(fetched).toEqual([]);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('stops with a clear text when the volume cannot link', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    linkHook.before = () => {
+      throw Object.assign(new Error('operation not supported'), { code: 'ENOTSUP' });
+    };
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('error');
+    expect(errorOf(events)).toBe(
+      `The app could not add "tokenizer.json" to "${FLASH_SLUG}" (ENOTSUP). Update needs a volume that can link ` +
+        `files. Nothing was changed.`,
+    );
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('cancel during the check stops inside the file and leaves the folder as it was', async () => {
+    const dir = flashFolder();
+    const big = Buffer.alloc(1024 * 1024, 0x11);
+    writeFileSync(join(dir, FLASH_WEIGHT), big);
+    hub.manifests[FLASH] = hub.manifests[FLASH]!.map((entry) =>
+      entry.path === FLASH_WEIGHT ? entryOf(FLASH_WEIGHT, big) : entry,
+    );
+    const before = filesOf(dir);
+    const m = manager();
+
+    const { events, last } = await runUpdate(m, {
+      onEvent: (event, id) => {
+        if (event.type === 'progress' && event.phase === 'check') m.cancel(id);
+      },
+    });
+    await m.shutdown();
+
+    expect(last.type).toBe('cancelled');
+    const read = events.flatMap((event) => (event.type === 'progress' ? [event.receivedBytes] : []));
+    expect(read.length).toBeGreaterThan(0);
+    expect(Math.max(...read)).toBeLessThan(big.length);
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('cancel during the sidecar download leaves the folder as it was', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    let cancel = (): void => {};
+    const m = manager((path, init) => {
+      if (path !== 'tokenizer_config.json') return undefined;
+      cancel();
+      return waitForAbort(init);
+    });
+
+    const { last } = await runUpdate(m, { onEvent: (_event, id) => void (cancel = () => void m.cancel(id)) });
+    await m.shutdown();
+
+    expect(last.type).toBe('cancelled');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+    expect(flashStagingDirs()).toEqual([]);
+  });
+
+  it('refuses to cancel once committing and still finishes', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    let cancelled: boolean | null = null;
+    let jobId = '';
+    raceHook.onMarkerWrite = () => {
+      cancelled = m.cancel(jobId);
+    };
+    const m = manager();
+
+    const { last } = await runUpdate(m, { onEvent: (_event, id) => void (jobId = id) });
+    await m.shutdown();
+
+    expect(cancelled).toBe(false);
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('after a crash in the middle of the adds, the next Update finishes', async () => {
+    const dir = flashFolder();
+    // What an Update that died after two adds leaves: two complete catalog files and no marker.
+    writeFileSync(join(dir, 'tokenizer.json'), ASSET_FILES['tokenizer.json']!);
+    writeFileSync(join(dir, 'tokenizer_config.json'), ASSET_FILES['tokenizer_config.json']!);
+    const before = filesOf(dir);
+    const m = manager();
+    const plan = await m.planAdoption(FLASH_SLUG);
+    expect([plan.check.count, plan.download.count]).toEqual([7, 4]);
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([...DOWNLOADED.slice(2), MARKER_FILE].sort());
+    expect(fetched.sort()).toEqual(DOWNLOADED.slice(2).sort());
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it("a dead job's staging tree with second names is reaped and the folder keeps its files", async () => {
+    const dir = flashFolder();
+    const dead = join(stagingRoot(), `${FLASH_SLUG}@${hub.sha}.999999999.55555555-5555-5555-5555-555555555555`);
+    mkdirSync(dead, { recursive: true });
+    writeFileSync(join(dead, 'tokenizer.json'), ASSET_FILES['tokenizer.json']!);
+    linkSync(join(dead, 'tokenizer.json'), join(dir, 'tokenizer.json'));
+    const ino = lstatSync(join(dir, 'tokenizer.json'), { bigint: true }).ino;
+    const m = manager();
+
+    const { last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    expect(existsSync(dead)).toBe(false);
+    const stat = lstatSync(join(dir, 'tokenizer.json'), { bigint: true });
+    expect([stat.ino, stat.nlink]).toEqual([ino, 1n]);
+    expect(readFileSync(join(dir, 'tokenizer.json'))).toEqual(ASSET_FILES['tokenizer.json']);
+    expect(fetched).not.toContain('tokenizer.json');
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+
+  it('the start total covers checked and downloaded bytes and no frame passes it; check frames carry phase check', async () => {
+    flashFolder();
+    const m = manager();
+
+    const { events, last } = await runUpdate(m);
+    await m.shutdown();
+
+    expect(last.type).toBe('done');
+    const sum = (paths: string[]): number => paths.reduce((total, path) => total + BYTES[path]!.length, 0);
+    const total = sum([...Object.keys(USER_FILES), ...DOWNLOADED]);
+    expect(events[0]).toEqual({ type: 'start', id: last.id, repo: FLASH, totalBytes: total, fileCount: 11 });
+    const frames = events.filter((event) => event.type === 'progress');
+    for (const frame of frames) {
+      expect(frame.jobReceivedBytes).toBeLessThanOrEqual(total);
+      expect(frame.receivedBytes).toBeLessThanOrEqual(frame.totalBytes);
+      expect(frame.fileCount).toBe(11);
+      expect(frame.phase, frame.file).toBe(Object.hasOwn(USER_FILES, frame.file) ? 'check' : undefined);
+    }
+    expect(new Set(frames.map((frame) => frame.file))).toEqual(new Set([...Object.keys(USER_FILES), ...DOWNLOADED]));
+    expect(frames.at(-1)!.jobReceivedBytes).toBe(total);
+  });
+
+  it('hands back a running Update and refuses one while a plain job holds the repo', async () => {
+    const dir = flashFolder();
+    const before = filesOf(dir);
+    const m = manager((path, init) => (path === 'tokenizer.json' ? waitForAbort(init) : undefined));
+    const plan = await m.planAdoption(FLASH_SLUG);
+    const id = m.start(FLASH_SLUG, { adopt: plan.token }).id;
+    expect(m.start(FLASH_SLUG, { adopt: plan.token }).id).toBe(id);
+    expect(() =>
+      m.start(FLASH_SLUG, {
+        replaceBlocker: { kind: 'directory', fileCount: 6, sizeBytes: 1, truncated: false, linkTarget: null },
+      }),
+    ).toThrow('A download of this model is already in the queue. Cancel it, then use Clean up & update.');
+    await m.shutdown();
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+
+    const other = manager();
+    const second = await other.planAdoption(FLASH_SLUG);
+    const plain = other.start(FLASH_SLUG).id;
+    expect(() => other.start(FLASH_SLUG, { adopt: second.token })).toThrow(
+      'A download of this model is already in the queue. Cancel it, then use Update.',
+    );
+    const events: DownloadEvent[] = [];
+    other.subscribe(plain, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+    await other.shutdown();
+    expectKept(before, dir);
+    expect(addedNames(before, dir)).toEqual([]);
+  });
+
+  it('a later Update available job on the adopted folder keeps what was added after Update', async () => {
+    const dir = flashFolder();
+    const m = manager();
+    expect((await runUpdate(m)).last.type).toBe('done');
+    writeFileSync(join(dir, 'notes.txt'), 'mine');
+    hub.sha = SHA_NEW;
+
+    const id = m.start(FLASH_SLUG).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    await m.shutdown();
+
+    expect(errorOf(events)).toBeUndefined();
+    const done = events.find((event) => event.type === 'done');
+    const keptDir = done?.type === 'done' ? done.keptDir : undefined;
+    expect(keptDir).toBeDefined();
+    expect(readdirSync(keptDir!).sort()).toEqual([MARKER_FILE, 'README.md', 'notes.txt'].sort());
+    expect(readFileSync(join(keptDir!, 'README.md'), 'utf-8')).toBe('notes');
+    expect(readFileSync(join(keptDir!, 'notes.txt'), 'utf-8')).toBe('mine');
+    expect(readdirSync(dir).sort()).toEqual([...Object.keys(USER_FILES), ...DOWNLOADED, MARKER_FILE].sort());
+    expect(JSON.parse(readFileSync(join(dir, MARKER_FILE), 'utf-8'))).toMatchObject({ revision: SHA_NEW });
+    expect(isModelInstalled(dir)).toBe(true);
+  });
+});
+
+describe('a models directory that is a link to a missing disk', () => {
+  let root: string;
+  let link: string;
+  let target: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'dash-dl-link-'));
+    link = join(root, 'models');
+    target = join(root, 'Volumes', 'Disk', 'models');
+  });
+
+  afterEach(() => {
+    rmSync(root, { recursive: true, force: true });
+  });
+
+  const sentence = (): string =>
+    `The models folder ${link} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`;
+
+  it('refuses Install with the plain sentence and writes nothing anywhere', async () => {
+    symlinkSync(target, link);
+    hub.modelInfoUsesFetch = true;
+    const fetched: string[] = [];
+    const inner = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 });
+    const m = new DownloadManager({
+      modelsDir: link,
+      cacheDir,
+      fetchImpl: (input, init) => {
+        fetched.push(typeof input === 'string' ? input : input instanceof URL ? input.href : input.url);
+        return inner(input, init);
+      },
+    });
+    expect(() => m.start(SLUG)).toThrow(sentence());
+    const ctx = { downloads: m, modelsDir: link } as unknown as ApiContext;
+    const res = await dispatch(ctx, {
+      method: 'POST',
+      pathname: '/api/downloads',
+      query: new URLSearchParams(),
+      body: { slug: SLUG },
+    });
+    expect(res.status).toBe(503);
+    expect(res.ok ? '' : res.message).toBe(sentence());
+    expect(m.jobs()).toEqual([]);
+    // No folder in place of the link, none at its target, nothing in the HF cache, no request.
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+    expect(readdirSync(cacheDir)).toEqual([]);
+    expect(fetched).toEqual([]);
+    expect(hub.downloaded).toEqual([]);
+
+    await expect(m.planAdoption(SLUG)).rejects.toThrow(sentence());
+    const plan = await dispatch(ctx, {
+      method: 'POST',
+      pathname: '/api/downloads/adopt-plan',
+      query: new URLSearchParams(),
+      body: { slug: SLUG },
+    });
+    expect(plan.status).toBe(503);
+    expect(plan.ok ? '' : plan.message).toBe(sentence());
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+    expect(fetched).toEqual([]);
+
+    // The disk is back: the same Install runs to the end into the link target.
+    mkdirSync(target, { recursive: true });
+    const id = m.start(SLUG).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error' || event.type === 'done'));
+    expect(events.map((event) => event.type)).toContain('done');
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(readdirSync(target)).toContain(REPO.split('/').pop()!.toLowerCase());
+  });
+
+  it('fails a running and a queued job whose disk went away with the same sentence', async () => {
+    mkdirSync(target, { recursive: true });
+    symlinkSync(target, link);
+    let release: (() => void) | undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    hub.modelInfoUsesFetch = true;
+    const inner = makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 });
+    let parked = false;
+    const gated: typeof fetch = async (input, init) => {
+      const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+      if (!parked && url.includes('/api/models/')) {
+        parked = true;
+        await gate;
+      }
+      return inner(input, init);
+    };
+    const m = new DownloadManager({ modelsDir: link, cacheDir, fetchImpl: gated });
+    const first = m.start(SLUG).id;
+    const second = m.start(SLUG_OTHER).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(first, (event) => events.push(event));
+    m.subscribe(second, (event) => events.push(event));
+    await waitFor(() => parked);
+
+    // The disk goes away while the first job waits on the network.
+    rmSync(join(root, 'Volumes'), { recursive: true, force: true });
+    release!();
+    await waitFor(() => events.filter((event) => event.type === 'error' || event.type === 'done').length === 2);
+
+    for (const id of [first, second]) {
+      const error = events.find((event) => event.type === 'error' && event.id === id);
+      expect(error?.type === 'error' ? error.message : '', id === first ? 'running' : 'queued').toBe(sentence());
+    }
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(root, 'Volumes'))).toBe(false);
+  });
+});
+
+describe('two builds of one repository: one folder, one job, one marker each', () => {
+  const BUILD_M = catalogBuild('Qwen3.8-27B', 'UD-Q4_K_M');
+  const SLUG_M = catalogBuildSlug(BUILD_M);
+  const WEIGHT_M = 'Qwen3.8-27B-UD-Q4_K_M.gguf';
+  const SIZES = { [WEIGHT]: 300, [WEIGHT_M]: 280, 'config.json': 12, 'tokenizer.json': 20 };
+
+  beforeEach(() => {
+    // The repository holds both weights; each build's glob takes one. The base model supplies the sidecars.
+    hub.manifests[REPO] = [
+      { type: 'file', path: WEIGHT, size: 300 },
+      { type: 'file', path: WEIGHT_M, size: 280 },
+    ];
+    hub.manifests[ASSETS_REPO] = [
+      { type: 'file', path: 'config.json', size: 12 },
+      { type: 'file', path: 'tokenizer.json', size: 20 },
+    ];
+  });
+
+  function manager(fetchImpl: typeof fetch = makeFetchImpl(SIZES)): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl });
+  }
+
+  /** An install of `files` in the folder `slug` with the shared marker, pinned to `revision`. */
+  function plantInstall(slug: string, files: Record<string, Buffer>, revision: string = hub.sha): void {
+    const dir = join(modelsDir, slug);
+    mkdirSync(dir, { recursive: true });
+    for (const [path, bytes] of Object.entries(files)) writeFileSync(join(dir, path), bytes);
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({
+        repo: REPO,
+        revision,
+        files: Object.keys(files),
+        scope: 'full',
+        assetsRepo: ASSETS_REPO,
+        assetsRevision: revision,
+        completedAt: 'x',
+      }),
+    );
+  }
+
+  function post(m: DownloadManager, pathname: string, body: unknown): ReturnType<typeof dispatch> {
+    const ctx = { downloads: m, modelsDir } as unknown as ApiContext;
+    return dispatch(ctx, { method: 'POST', pathname, query: new URLSearchParams(), body });
+  }
+
+  it('downloads both builds at the same time into two folders, as two jobs', async () => {
+    expect(SLUG_M).toBe('qwen3.8-27b-gguf-ud-q4_k_m');
+    const m = manager();
+    const first = m.start(SLUG).id;
+    // Asked while the first job is in the queue: its own job, not the first one's id.
+    const second = m.start(SLUG_M).id;
+    expect(second).not.toBe(first);
+    expect(m.start(SLUG_M).id).toBe(second);
+    await waitFor(() => m.jobs().every((job) => job.state === 'done' || job.state === 'error'));
+    expect(m.jobs().map((job) => [job.id, job.slug, job.repo, job.state])).toEqual([
+      [first, SLUG, REPO, 'done'],
+      [second, SLUG_M, REPO, 'done'],
+    ]);
+    expect(readdirSync(join(modelsDir, SLUG)).sort()).toEqual([MARKER_FILE, WEIGHT, 'config.json', 'tokenizer.json']);
+    expect(readdirSync(join(modelsDir, SLUG_M)).sort()).toEqual([
+      MARKER_FILE,
+      WEIGHT_M,
+      'config.json',
+      'tokenizer.json',
+    ]);
+    expect(buildState(SLUG)).toMatchObject({ installed: true, heldBy: null, localRevision: hub.sha });
+    expect(buildState(SLUG_M)).toMatchObject({ installed: true, heldBy: null, localRevision: hub.sha });
+
+    // Delete of one folder leaves the other build installed.
+    deleteLocalModel(modelsDir, SLUG_M);
+    expect(buildState(SLUG)).toMatchObject({ installed: true, present: true });
+    expect(buildState(SLUG_M)).toMatchObject({ installed: false, present: false });
+  });
+
+  it('gives build B its own job while build A downloads', async () => {
+    let blocked = false;
+    const m = manager(
+      makeCancelFetch(SIZES, WEIGHT, () => {
+        blocked = true;
+      }),
+    );
+    const first = m.start(SLUG).id;
+    await waitFor(() => blocked);
+    const res = await post(m, '/api/downloads', { slug: SLUG_M });
+    expect(res.status).toBe(202);
+    const body = (res.ok ? res.body : {}) as { id: string; slug: string; repo: string };
+    expect(body).toEqual({ id: body.id, slug: SLUG_M, repo: REPO, kind: 'install' });
+    expect(body.id).not.toBe(first);
+    expect(m.cancel(body.id)).toBe(true);
+    expect(m.cancel(first)).toBe(true);
+    await waitFor(() => m.jobs().every((job) => job.state === 'cancelled'));
+  });
+
+  it('does not read build B as done from a marker of the same repository and revision that lacks its weight', async () => {
+    // The folder of UD-Q4_K_XL holds both weights (two hand runs), with the
+    // marker of a UD-Q4_K_M run at the current revision: complete, current and
+    // owned, but its files are not this build's.
+    plantInstall(SLUG, {
+      'config.json': Buffer.alloc(12),
+      'tokenizer.json': Buffer.alloc(20),
+      [WEIGHT_M]: Buffer.alloc(280),
+      [WEIGHT]: Buffer.alloc(300, 0xab),
+    });
+    const marker = JSON.parse(readFileSync(join(finalDir(), MARKER_FILE), 'utf-8')) as { files: string[] };
+    writeFileSync(
+      join(finalDir(), MARKER_FILE),
+      JSON.stringify({ ...marker, files: marker.files.filter((path) => path !== WEIGHT) }),
+    );
+    expect(isModelInstalled(finalDir())).toBe(true);
+    const m = manager();
+    const id = m.start(SLUG).id;
+    await waitFor(() => m.jobs().some((job) => job.id === id && (job.state === 'done' || job.state === 'error')));
+    expect(m.jobs().find((job) => job.id === id)?.state).toBe('done');
+    expect(hub.downloaded).toContain(WEIGHT);
+    const published = JSON.parse(readFileSync(join(finalDir(), MARKER_FILE), 'utf-8')) as { files: string[] };
+    expect(published.files).toContain(WEIGHT);
+    expect(readFileSync(join(finalDir(), WEIGHT))).toEqual(Buffer.alloc(300));
+  });
+
+  it('refuses an install into a folder that holds the other build, and changes nothing', async () => {
+    // A hand run of the CLI put UD-Q4_K_M in the first build's folder; the
+    // owned swap of a UD-Q4_K_XL install would delete it.
+    plantInstall(SLUG, { 'config.json': Buffer.alloc(12), [WEIGHT_M]: Buffer.alloc(280) });
+    const sentence = `"${SLUG}" holds UD-Q4_K_M. Delete it in Local models, then install UD-Q4_K_XL.`;
+    const m = manager();
+    expect(() => m.start(SLUG)).toThrow(DownloadConflictError);
+    expect(() => m.start(SLUG)).toThrow(sentence);
+    await expect(m.planAdoption(SLUG)).rejects.toThrow(sentence);
+    await expect(m.planAdoption(SLUG)).rejects.toMatchObject({ reason: undefined });
+    const res = await post(m, '/api/downloads', { slug: SLUG });
+    expect(res.status).toBe(409);
+    expect(res.ok ? '' : res.message).toBe(sentence);
+    expect('reason' in res).toBe(false);
+    expect(m.jobs()).toEqual([]);
+    expect(readdirSync(finalDir()).sort()).toEqual([MARKER_FILE, WEIGHT_M, 'config.json']);
+    expect(buildState(SLUG)).toMatchObject({ heldBy: 'UD-Q4_K_M', present: false, blocker: null });
+    expect(buildState(SLUG_M)).toMatchObject({ present: true, installed: false });
+    expect(hub.modelInfoRepos).toEqual([]);
+  });
+
+  it('lets the update sweep mark both installed builds of one repository', async () => {
+    plantInstall(SLUG, { 'config.json': Buffer.alloc(12), [WEIGHT]: Buffer.alloc(300) }, SHA_OLD);
+    plantInstall(SLUG_M, { 'config.json': Buffer.alloc(12), [WEIGHT_M]: Buffer.alloc(280) }, SHA_OLD);
+    hub.sha = SHA_NEW;
+    const shas = await manager().checkCatalogUpdates();
+    expect(catalogUpdateRepos().filter((repo) => repo === REPO)).toEqual([REPO]);
+    expect(shas.get(REPO)).toBe(SHA_NEW);
+    // The page compares each build's repo and local revision with the sweep: both builds read as stale.
+    for (const slug of [SLUG, SLUG_M]) {
+      expect(buildState(slug)).toMatchObject({ installed: true, hfRepo: REPO, localRevision: SHA_OLD });
+    }
+  });
+
+  it('keys the adopt plan by folder', async () => {
+    const res = await post(manager(), '/api/downloads/adopt-plan', { repo: REPO });
+    expect(res.status).toBe(400);
+    expect(res.ok ? '' : res.message).toBe('Body must include a "slug" string');
+    const unknown = await post(manager(), '/api/downloads/adopt-plan', { slug: 'someone-not-in-catalog' });
+    expect(unknown.status).toBe(400);
+    expect(unknown.ok ? '' : unknown.message).toBe('"someone-not-in-catalog" is not a folder of the model catalog');
+  });
+});
+
+describe('a CLEF build: the GGUF alone, with no config.json', () => {
+  const CLEF_FLASH = MODEL_CATALOG.find((entry) => entry.label === 'CLEF Flash (9B)')!;
+  const Q8 = catalogBuild('CLEF Flash (9B)', 'Q8_0');
+  const Q4 = catalogBuild('CLEF Flash (9B)', 'Q4_K_M');
+  const CLEF_REPO = catalogBuildRepo(Q8);
+  const SLUG_Q8 = catalogBuildSlug(Q8);
+  const SLUG_Q4 = catalogBuildSlug(Q4);
+  const FILE_Q8 = 'Clef-Flash-Q8_0.gguf';
+  const FILE_Q4 = 'Clef-Flash-Q4_K_M.gguf';
+  /** The bytes the hub serves, by repo path: each weight a real `clef` header with its own tail. */
+  let served: Record<string, Buffer>;
+
+  function gguf(architecture: string, tail: number): Buffer {
+    return Buffer.concat([ggufHeader(architecture), Buffer.alloc(16, tail)]);
+  }
+
+  function entry(path: string, bytes: Buffer): ManifestEntry {
+    const blob = createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
+    if (!path.endsWith('.gguf')) return { type: 'file', path, size: bytes.length, oid: blob };
+    const sha256 = createHash('sha256').update(bytes).digest('hex');
+    return {
+      type: 'file',
+      path,
+      size: bytes.length,
+      oid: blob,
+      lfs: { oid: sha256, size: bytes.length, pointerSize: 134 },
+    };
+  }
+
+  /** The repository as Hugging Face lists it: three weights, two projectors and the notes; no config.json. */
+  function listRepo(): void {
+    hub.manifests[CLEF_REPO] = Object.entries(served).map(([path, bytes]) => entry(path, bytes));
+  }
+
+  beforeEach(() => {
+    served = {
+      '.gitattributes': Buffer.from('*.gguf filter=lfs'),
+      '.src_sha': Buffer.from('src'),
+      'Clef-Flash-BF16.gguf': gguf('clef', 0x01),
+      [FILE_Q4]: gguf('clef', 0x02),
+      [FILE_Q8]: gguf('clef', 0x03),
+      'README.md': Buffer.from('# CLEF Flash'),
+      'convert.log': Buffer.from('log'),
+      'mmproj-Clef-Flash-BF16.gguf': gguf('clip', 0x04),
+      'mmproj-Clef-Flash-Q8_0.gguf': gguf('clip', 0x05),
+    };
+    listRepo();
+  });
+
+  const serveBytes: typeof fetch = async (input) => {
+    const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+    return new Response(new Uint8Array(served[url.split('/').slice(3).join('/')] ?? []), { status: 200 });
+  };
+
+  function manager(): DownloadManager {
+    return new DownloadManager({ modelsDir, cacheDir, fetchImpl: serveBytes });
+  }
+
+  async function run(m: DownloadManager, slug: string, opts?: Parameters<DownloadManager['start']>[1]) {
+    const id = m.start(slug, opts).id;
+    const events: DownloadEvent[] = [];
+    m.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+    return events;
+  }
+
+  function errorOf(events: DownloadEvent[]): string | undefined {
+    const error = events.find((event) => event.type === 'error');
+    return error?.type === 'error' ? error.message : undefined;
+  }
+
+  function marker(slug: string): { repo: string; revision: string; files: string[]; assetsRepo?: string } {
+    return JSON.parse(readFileSync(join(modelsDir, slug, MARKER_FILE), 'utf-8')) as {
+      repo: string;
+      revision: string;
+      files: string[];
+    };
+  }
+
+  it('installs the GGUF alone; the card is installed at its revision and shows an update only for a new one', async () => {
+    expect([SLUG_Q8, SLUG_Q4]).toEqual(['clef-flash-gguf', 'clef-flash-gguf-q4_k_m']);
+    const events = await run(manager(), SLUG_Q8);
+    expect(errorOf(events)).toBeUndefined();
+    expect(events.find((event) => event.type === 'start')).toMatchObject({
+      fileCount: 1,
+      totalBytes: served[FILE_Q8]!.length,
+    });
+    expect(hub.downloaded).toEqual([FILE_Q8]);
+    expect(readdirSync(join(modelsDir, SLUG_Q8)).sort()).toEqual([MARKER_FILE, FILE_Q8]);
+    expect(marker(SLUG_Q8)).toMatchObject({ repo: CLEF_REPO, revision: hub.sha, files: [FILE_Q8] });
+    expect(marker(SLUG_Q8).assetsRepo).toBeUndefined();
+    expect(isModelInstalled(join(modelsDir, SLUG_Q8), configlessBuildOf(CLEF_FLASH, Q8))).toBe(true);
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ installed: true, present: true, heldBy: null, localRevision: hub.sha, listed: true });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: false, present: false, heldBy: null, blocker: null });
+    // System One lists it by its file name, as a CLEF model.
+    expect(
+      (await discoverLocalChatModels(modelsDir, { includeDecisions: true })).map((model) => [
+        model.name,
+        model.modelType,
+      ]),
+    ).toEqual([['Clef-Flash-Q8_0', 'clef']]);
+
+    expect(hasUpdate(item, await manager().checkCatalogUpdates())).toBe(false);
+    hub.sha = SHA_NEW;
+    expect(hasUpdate(buildState(SLUG_Q8)!, await manager().checkCatalogUpdates())).toBe(true);
+  });
+
+  it('reads an install at the same revision as done and downloads nothing', async () => {
+    await run(manager(), SLUG_Q8);
+    hub.downloaded = [];
+    const before = lstatSync(join(modelsDir, SLUG_Q8, FILE_Q8)).ino;
+    const events = await run(manager(), SLUG_Q8);
+    expect(events.map((event) => event.type)).toContain('done');
+    expect(hub.downloaded).toEqual([]);
+    expect(lstatSync(join(modelsDir, SLUG_Q8, FILE_Q8)).ino).toBe(before);
+  });
+
+  it('fails and publishes nothing when the GGUF it downloaded states another family', async () => {
+    served[FILE_Q4] = gguf('qwen35', 0x02);
+    listRepo();
+    const events = await run(manager(), SLUG_Q4);
+    expect(errorOf(events)).toBe(
+      'The downloaded file is not CLEF Flash (9B) Q4_K_M, so the app cannot load it. Nothing was installed.',
+    );
+    expect(existsSync(join(modelsDir, SLUG_Q4))).toBe(false);
+    await waitFor(() => readdirSync(stagingRoot()).every((name) => !name.startsWith(`${SLUG_Q4}@`)));
+  });
+
+  it('refuses a repository with a config.json before it downloads anything', async () => {
+    served['config.json'] = Buffer.from('{"model_type":"qwen3_5"}');
+    listRepo();
+    const events = await run(manager(), SLUG_Q8);
+    expect(errorOf(events)).toBe(
+      `Repo "${CLEF_REPO}" is not a complete model (needs a GGUF weight file and no config.json)`,
+    );
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(modelsDir, SLUG_Q8))).toBe(false);
+  });
+
+  it('a build with an assetsRepo still needs a config.json', async () => {
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'tokenizer.json', size: 20 }];
+    const m = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'tokenizer.json': 20 }),
+    });
+    expect(errorOf(await run(m, SLUG))).toBe(
+      `Repo "${REPO}" is not a complete model (neither it nor its assets repo "${ASSETS_REPO}" provides a config.json)`,
+    );
+    expect(existsSync(finalDir())).toBe(false);
+  });
+
+  it('installs both builds of one repository in their two folders, and a folder with the other build is held', async () => {
+    const m = manager();
+    expect(errorOf(await run(m, SLUG_Q8))).toBeUndefined();
+    expect(errorOf(await run(m, SLUG_Q4))).toBeUndefined();
+    expect(readdirSync(join(modelsDir, SLUG_Q4)).sort()).toEqual([MARKER_FILE, FILE_Q4]);
+    expect(buildState(SLUG_Q8)).toMatchObject({ installed: true, heldBy: null });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: true, heldBy: null });
+    deleteLocalModel(modelsDir, SLUG_Q4);
+    expect(buildState(SLUG_Q8)).toMatchObject({ installed: true, present: true });
+    expect(buildState(SLUG_Q4)).toMatchObject({ installed: false, present: false });
+
+    // The Q8_0 folder now holds the Q4_K_M file: its card is held, and the other card is present by it.
+    rmSync(join(modelsDir, SLUG_Q8), { recursive: true });
+    mkdirSync(join(modelsDir, SLUG_Q8));
+    writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q4), served[FILE_Q4]!);
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: false, installed: false, heldBy: 'Q4_K_M', blocker: null });
+    expect(buildState(SLUG_Q4)).toMatchObject({ present: true, installed: false });
+    expect(() => m.start(SLUG_Q8)).toThrow(`"${SLUG_Q8}" holds Q4_K_M. Delete it in Local models, then install Q8_0.`);
+  });
+
+  it('Update in place hashes the GGUF of a folder the app did not create and writes the record, downloading nothing', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q8), served[FILE_Q8]!);
+    writeFileSync(join(dir, 'notes.txt'), 'mine');
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: false, localRevision: null });
+    const m = manager();
+    const plan = await m.planAdoption(SLUG_Q8);
+    expect(plan).toMatchObject({
+      repo: CLEF_REPO,
+      assetsRevision: null,
+      check: { count: 1, bytes: served[FILE_Q8]!.length },
+      download: { count: 0, bytes: 0 },
+      other: { count: 1, names: ['notes.txt'] },
+    });
+    expect(errorOf(await run(m, SLUG_Q8, { adopt: plan.token }))).toBeUndefined();
+    expect(hub.downloaded).toEqual([]);
+    expect(readdirSync(dir).sort()).toEqual([MARKER_FILE, FILE_Q8, 'notes.txt']);
+    expect(marker(SLUG_Q8)).toMatchObject({ revision: hub.sha, files: [FILE_Q8] });
+    expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: true, localRevision: hub.sha });
+  });
+
+  it('Update in place takes a folder whose GGUF is of another family as not present, and refuses it by its hash', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q4), gguf('qwen35', 0x02));
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ present: false, heldBy: null, blockedByForeignDir: true });
+    expect(catalogActionState(item, { job: undefined, updateAvailable: false })).toBe('adopt');
+    await expect(manager().planAdoption(SLUG_Q8)).rejects.toThrow(
+      `"${FILE_Q4}" in "${SLUG_Q8}" is a model file that is not part of the catalog model.`,
+    );
+  });
+
+  it('names the file of the build when the Hub list does not have it', async () => {
+    delete served[FILE_Q8];
+    listRepo();
+    expect(errorOf(await run(manager(), SLUG_Q8))).toBe(`The Hub has no file "${FILE_Q8}" for this build.`);
+    expect(hub.downloaded).toEqual([]);
+    expect(existsSync(join(modelsDir, SLUG_Q8))).toBe(false);
+  });
+
+  it.each<[string]>([['hy_v4_flash'], ['qwen35']])(
+    'downloads again when the GGUF of an install was replaced by one of %s under the same name',
+    async (architecture) => {
+      await run(manager(), SLUG_Q8);
+      writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q8), gguf(architecture, 0x03));
+      expect(isModelInstalled(join(modelsDir, SLUG_Q8), configlessBuildOf(CLEF_FLASH, Q8))).toBe(false);
+      expect(buildState(SLUG_Q8)).toMatchObject({ present: false, installed: false, localRevision: null });
+      const events = await run(manager(), SLUG_Q8);
+      expect(errorOf(events)).toBeUndefined();
+      expect(readFileSync(join(modelsDir, SLUG_Q8, FILE_Q8)).equals(served[FILE_Q8]!)).toBe(true);
+      expect(buildState(SLUG_Q8)).toMatchObject({ present: true, installed: true, localRevision: hub.sha });
+    },
+  );
+
+  it('keeps a backup of a good install when the folder now holds a GGUF of another family', async () => {
+    await run(manager(), SLUG_Q8);
+    mkdirSync(stagingRoot(), { recursive: true });
+    const backup = join(stagingRoot(), `${SLUG_Q8}.backup-999999999.11111111-1111-1111-1111-111111111111`);
+    cpSync(join(modelsDir, SLUG_Q8), backup, { recursive: true });
+    writeFileSync(join(modelsDir, SLUG_Q8, FILE_Q8), gguf('hy_v4_flash', 0x03));
+    rmCalls.paths = [];
+    expect(errorOf(await run(manager(), SLUG_Q8))).toBeUndefined();
+    expect(rmCalls.paths).not.toContain(backup);
+    expect(existsSync(join(backup, FILE_Q8))).toBe(true);
+  });
+
+  it('a folder with a config.json beside the GGUF is not present: Install with the record, Update in place without', async () => {
+    await run(manager(), SLUG_Q8);
+    writeFileSync(join(modelsDir, SLUG_Q8, 'config.json'), '{"model_type":"qwen3_5"}');
+    hub.sha = SHA_NEW;
+    const updates = await manager().checkCatalogUpdates();
+    const owned = buildState(SLUG_Q8)!;
+    expect(owned).toMatchObject({ present: false, installed: false, localRevision: null, blocker: null });
+    expect(hasUpdate(owned, updates)).toBe(false);
+    expect(catalogActionState(owned, { job: undefined, updateAvailable: false })).toBe('install');
+
+    const dir = join(modelsDir, SLUG_Q4);
+    mkdirSync(dir);
+    writeFileSync(join(dir, FILE_Q4), served[FILE_Q4]!);
+    writeFileSync(join(dir, 'config.json'), '{}');
+    const foreign = buildState(SLUG_Q4)!;
+    expect(foreign).toMatchObject({ present: false, installed: false, heldBy: null, blockedByForeignDir: true });
+    expect(catalogActionState(foreign, { job: undefined, updateAvailable: false })).toBe('adopt');
+    const entry = catalogWithState(modelsDir).find((item) => item.label === 'CLEF Flash (9B)')!;
+    expect(modelPresent(entry)).toBe(false);
+  });
+
+  it('a CLI folder with every file of the repository is not this build installed, and offers no Update', async () => {
+    const dir = join(modelsDir, SLUG_Q8);
+    mkdirSync(dir);
+    const files = [
+      'Clef-Flash-BF16.gguf',
+      FILE_Q4,
+      FILE_Q8,
+      'mmproj-Clef-Flash-BF16.gguf',
+      'mmproj-Clef-Flash-Q8_0.gguf',
+    ];
+    for (const file of files) writeFileSync(join(dir, file), served[file]!);
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({ repo: CLEF_REPO, revision: SHA_OLD, files, scope: 'full', completedAt: 'x' }),
+    );
+    expect(isModelInstalled(dir, configlessBuildOf(CLEF_FLASH, Q8))).toBe(false);
+    const updates = await manager().checkCatalogUpdates();
+    const item = buildState(SLUG_Q8)!;
+    expect(item).toMatchObject({ present: true, installed: false, localRevision: null });
+    expect(hasUpdate(item, updates)).toBe(false);
+    expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
+  });
+});
+
+describe('a full record with no config.json of a build that needs one, as before CLEF', () => {
+  /** Plants `files` (each a GGUF of `architecture`) in the folder of `build` with a full record of its repository. */
+  function plantCliFolder(build: CatalogBuild, files: readonly string[], architecture: string): string {
+    const dir = join(modelsDir, catalogBuildSlug(build));
+    mkdirSync(dir);
+    for (const file of files)
+      writeFileSync(join(dir, file), Buffer.concat([ggufHeader(architecture), Buffer.alloc(8)]));
+    writeFileSync(
+      join(dir, MARKER_FILE),
+      JSON.stringify({ repo: catalogBuildRepo(build), revision: hub.sha, files, scope: 'full', completedAt: 'x' }),
+    );
+    return dir;
+  }
+
+  it.each<[string, CatalogBuild, string[], string]>([
+    [
+      'the Qwen3.8-27B XL folder with two quants',
+      BUILD,
+      ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'Qwen3.8-27B-UD-Q6_K_XL.gguf'],
+      'qwen35',
+    ],
+    [
+      'the Hy4-flash folder with its split set',
+      catalogBuild('Hy4-flash', 'Q4_K_M'),
+      ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
+      'hy_v4_flash',
+    ],
+  ])('%s: present, not installed, no Update', (_name, build, files, architecture) => {
+    const dir = plantCliFolder(build, files, architecture);
+    expect(isModelInstalled(dir)).toBe(false);
+    const item = buildState(catalogBuildSlug(build))!;
+    expect(item).toMatchObject({ present: true, installed: false, localRevision: null });
+    const updates = new Map<string, string | null>([[catalogBuildRepo(build), SHA_NEW]]);
+    expect(hasUpdate(item, updates)).toBe(false);
+    expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
   });
 });

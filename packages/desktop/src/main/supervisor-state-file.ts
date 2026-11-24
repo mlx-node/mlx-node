@@ -5,7 +5,9 @@
  * anything over the port.
  *
  * Metadata only: exit reasons, stderr, native error detail and the sidecar
- * URL are never written.
+ * URL are never written. The one text is `failureReason`: the message of the
+ * child's start-failure line, written before any request could run, so it
+ * names the environment (a missing models folder) and never a prompt.
  */
 
 import { mkdir, rename, unlink, writeFile } from 'node:fs/promises';
@@ -40,7 +42,16 @@ export interface SupervisorStateFile {
   /** Shim name only (`array_eval`, …): 1–32 chars of a-z, 0-9, `_`; else null. */
   lastNativeErrorContext: string | null;
   lastNativeErrorAt: number | null;
+  /**
+   * Why the last start failed, in the child's words: one line of at most
+   * {@link MAX_FAILURE_REASON_CHARS}, control characters turned into spaces.
+   * Set only while the state is `restarting` or `failed`, so a good start, a
+   * stop and a new start all clear it.
+   */
+  failureReason: string | null;
 }
+
+export const MAX_FAILURE_REASON_CHARS = 300;
 
 const STATES: readonly SupervisorState[] = ['stopped', 'starting', 'running', 'restarting', 'failed', 'lying'];
 const HEALTH: readonly SupervisorHealthStatus[] = ['ok', 'loading', 'degraded', 'error'];
@@ -72,6 +83,22 @@ function safeSignal(value: unknown): string | null {
     if (!(c >= 65 && c <= 90) && !(c >= 48 && c <= 57)) return null;
   }
   return value;
+}
+
+/** `text` on one line: control characters and line separators become spaces; trimmed, capped with `…`; null when empty. */
+export function oneLineReason(text: string): string | null {
+  let out = '';
+  for (const ch of text) {
+    const c = ch.codePointAt(0)!;
+    out += c < 0x20 || (c >= 0x7f && c <= 0x9f) || c === 0x2028 || c === 0x2029 ? ' ' : ch;
+  }
+  out = out.trim();
+  if (out.length === 0) return null;
+  if (out.length <= MAX_FAILURE_REASON_CHARS) return out;
+  let cut = out.slice(0, MAX_FAILURE_REASON_CHARS - 1);
+  const last = cut.charCodeAt(cut.length - 1);
+  if (last >= 0xd800 && last <= 0xdbff) cut = cut.slice(0, -1);
+  return `${cut.trimEnd()}…`;
 }
 
 function finiteOrNull(value: unknown): number | null {
@@ -109,6 +136,13 @@ export function projectSupervisorState(
     nativeErrorsCapped: errors.length >= MAX_NATIVE_ERRORS,
     lastNativeErrorContext: last === undefined ? null : safeShimName(last.context),
     lastNativeErrorAt: last === undefined ? null : finiteOrNull(last.observedAtMs),
+    failureReason:
+      (snapshot.state === 'restarting' || snapshot.state === 'failed') &&
+      exit !== null &&
+      exit.verdict === 'crash' &&
+      typeof exit.startFailure === 'string'
+        ? oneLineReason(exit.startFailure)
+        : null,
   };
 }
 

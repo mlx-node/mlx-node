@@ -46,6 +46,7 @@ import {
   quarantineAfter,
   requestCaused,
   restartAfter,
+  startFailureText,
   stopCause,
   type ChildIntent,
   type QuarantineState,
@@ -598,6 +599,7 @@ export function createSupervisor(opts: SupervisorOptions): Supervisor {
       signal: exit.signal,
       atMs: Date.now(),
       stderrTail: [...stderrTail],
+      startFailure: startFailureText(stderrTail),
     };
 
     settlePending(`inference sidecar exited (${assessment.reason})`);

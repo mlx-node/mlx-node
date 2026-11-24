@@ -42,6 +42,8 @@ import { validateKey } from './validate.js';
 
 /** Every Keychain call races this. */
 export const KEYCHAIN_CALL_MS = 8_000;
+/** A providers read asks the shell again at most this often: each ask runs the user's shell start files. */
+export const WORK_PATH_ASK_GAP_MS = 15_000;
 
 const PROVIDER_NAMES: Readonly<Record<ProviderId, string>> = {
   exa: 'Exa',
@@ -64,8 +66,11 @@ export interface ProvidersServiceOptions {
   /** Provider origins for key checks. Production leaves it unset (the fixed provider hosts). */
   baseUrls?: Partial<Record<ProviderId, string>>;
   fetch?: typeof fetch;
-  /** The `PATH` the Work agent's shell gets: where the `firecrawl` CLI is looked for. */
-  workPath?: () => string | undefined;
+  /**
+   * The `PATH` a Work command gets: where the `firecrawl` CLI is looked for. Asked only while Firecrawl is on: once
+   * at start, then by `GET /api/providers` and by a route that turns Firecrawl on, while the CLI is not found.
+   */
+  workPath: () => string | undefined | Promise<string | undefined>;
   now?: () => number;
   keychainCallMs?: number;
   validateTimeoutMs?: number;
@@ -101,6 +106,11 @@ export class ProvidersService implements ProviderSource {
   /** The selected provider whose key was not in the Keychain at start; told to the page once. */
   private vanished: ProviderId | null = null;
   private cliFound = false;
+  /** The last answer of `workPath`; before the first, the CLI counts as not found. */
+  private workPath: string | undefined;
+  private pathAsked: Promise<void> | null = null;
+  private everAsked = false;
+  private pathAskedAt = Number.NEGATIVE_INFINITY;
   /** Providers whose Keychain write timed out and is still pending: a newer write could land before it. */
   private readonly writing = new Set<ProviderId>();
   private chain: Promise<void> = Promise.resolve();
@@ -176,9 +186,12 @@ export class ProvidersService implements ProviderSource {
     }).catch(() => {});
   }
 
+  /** Never waits for the shell: a Work host that starts before the answer is restarted by it. */
   async settled(): Promise<void> {
     await this.start();
     await this.chain;
+    // Firecrawl may have come on since start (a late Keychain answer).
+    if (!this.everAsked && this.firecrawlOn()) void this.askPath();
     await this.refreshCli();
   }
 
@@ -209,6 +222,8 @@ export class ProvidersService implements ProviderSource {
   async list(): Promise<ProvidersResponse> {
     await this.start();
     const reread = this.keychainDown ? await this.rereadAll() : null;
+    const due = this.pathAsked !== null || this.now() - this.pathAskedAt >= WORK_PATH_ASK_GAP_MS;
+    if (this.firecrawlOn() && !this.cliFound && due) await this.askPath();
     return this.exclusive(async () => {
       if (reread !== null) await this.applyReread(reread);
       await this.verifyInstalled();
@@ -228,7 +243,7 @@ export class ProvidersService implements ProviderSource {
     if (result.check === 'rejected') {
       return { saved: false, check: 'rejected', providers: await this.exclusive(async () => this.snapshot()) };
     }
-    return this.exclusive(async () => {
+    const reply = await this.exclusive(async (): Promise<ProviderKeyReply> => {
       if (this.writing.has(id)) throw keychainError();
       await this.keychainWrite(
         id,
@@ -251,6 +266,7 @@ export class ProvidersService implements ProviderSource {
       });
       return { saved: true, check: result.check, providers: this.snapshot() };
     });
+    return id === 'firecrawl' ? { ...reply, providers: await this.withWorkPath(reply.providers) } : reply;
   }
 
   /** `DELETE /api/providers/:id/key`: the selection that used the key is cleared and its skills are removed. */
@@ -317,7 +333,7 @@ export class ProvidersService implements ProviderSource {
   /** `PUT /api/providers/selection`: nothing changes unless every wanted skill folder installs. */
   async select(input: ProviderSelectionInput): Promise<ProvidersResponse> {
     await this.start();
-    return this.exclusive(async () => {
+    const reply = await this.exclusive(async () => {
       const previous = { ...this.settings, checks: { ...this.settings.checks } };
       const next = { ...previous, checks: { ...previous.checks } };
       if (input.search !== undefined) {
@@ -364,6 +380,7 @@ export class ProvidersService implements ProviderSource {
       if (changed) this.hooks.changed();
       return this.snapshot();
     });
+    return input.firecrawl === true ? this.withWorkPath(reply) : reply;
   }
 
   // ── internals ─────────────────────────────────────────────────────────────────────────────────────────────────
@@ -379,8 +396,35 @@ export class ProvidersService implements ProviderSource {
       if (repaired) await writeSettings(this.opts.paths.providers, this.settings).catch(() => {});
       await this.sync().catch(() => {});
       await this.refreshCli();
+      // Not awaited: its answer queues behind this step.
+      if (this.firecrawlOn()) void this.askPath();
     });
     return this.started;
+  }
+
+  /** One question at a time: a caller while one is open joins it. A throw keeps the earlier answer. */
+  private askPath(): Promise<void> {
+    this.everAsked = true;
+    if (this.pathAsked === null) this.pathAskedAt = this.now();
+    this.pathAsked ??= (async () => this.opts.workPath())()
+      .then((path) =>
+        this.exclusive(async () => {
+          this.workPath = path;
+          await this.refreshCli();
+        }),
+      )
+      .catch(() => {})
+      .finally(() => {
+        this.pathAsked = null;
+      });
+    return this.pathAsked;
+  }
+
+  /** A route that turned Firecrawl on: the reply waits for the Work PATH, as `list()` does. */
+  private async withWorkPath(reply: ProvidersResponse): Promise<ProvidersResponse> {
+    if (!this.firecrawlOn() || this.cliFound) return reply;
+    await this.askPath();
+    return this.exclusive(async () => this.snapshot());
   }
 
   private async fill(id: ProviderId): Promise<void> {
@@ -586,8 +630,7 @@ export class ProvidersService implements ProviderSource {
 
   /** A change decides whether Work gets the Firecrawl key and skills: the hosts restart when idle. */
   private async refreshCli(): Promise<void> {
-    const path = (this.opts.workPath ?? (() => process.env.PATH))();
-    const found = (await findOnPath('firecrawl', path)) !== null;
+    const found = (await findOnPath('firecrawl', this.workPath)) !== null;
     if (found === this.cliFound) return;
     this.cliFound = found;
     if (this.firecrawlOn()) this.hooks.changed();

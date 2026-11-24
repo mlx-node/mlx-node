@@ -38,7 +38,7 @@ export const CONTROL_PANEL_PORT_CHANNEL = 'mlx:control-panel-port';
 export const CONTROL_PANEL_READY_CHANNEL = 'mlx:control-panel-ready';
 
 /**
- * Renderer → MAIN: "let the user choose a Work folder", with a request id. MAIN answers on
+ * Renderer → MAIN: "let the user choose a folder", with a request id and a {@link FolderPurpose}. MAIN answers on
  * {@link CONTROL_PANEL_FOLDER_CHANNEL}. Duplicated as a literal in the preload, pinned by `window-policy.test.ts`.
  */
 export const CONTROL_PANEL_PICK_FOLDER_CHANNEL = 'mlx:control-panel-pick-folder';
@@ -51,32 +51,51 @@ export function isFolderRequestId(value: unknown): value is string {
   return typeof value === 'string' && value.length >= 1 && value.length <= 64;
 }
 
+/** What the folder is for: a Work folder, or the model files Locate uses. */
+export type FolderPurpose = 'work' | 'model';
+
+export function isFolderPurpose(value: unknown): value is FolderPurpose {
+  return value === 'work' || value === 'model';
+}
+
 /**
- * The folder dialog. Every option is fixed here: the page sends only a request id, so it can never choose a path,
- * a title, a default folder or dialog flags. The answer is the path the user picked, or `null`.
+ * The folder dialog of each purpose. Every option is fixed here: the page sends only a request id and one of the two
+ * purpose words, so it can never choose a path, a title, a default folder or dialog flags. The answer is the path the
+ * user picked, or `null`. `showHiddenFiles` lets Locate reach `~/.lmstudio` and `~/.cache`.
  */
 export const FOLDER_DIALOG_OPTIONS = {
-  title: 'Choose a folder for Work',
-  buttonLabel: 'Choose',
-  properties: ['openDirectory', 'createDirectory'],
+  work: {
+    title: 'Choose a folder for Work',
+    buttonLabel: 'Choose',
+    properties: ['openDirectory', 'createDirectory'],
+  },
+  model: {
+    title: 'Locate model files',
+    message: 'Choose the folder that holds the model files.',
+    buttonLabel: 'Locate',
+    properties: ['openDirectory', 'showHiddenFiles'],
+  },
 } as const;
+
+export type FolderDialogOptions = (typeof FOLDER_DIALOG_OPTIONS)[FolderPurpose];
 
 /** What the folder handler needs from Electron: the sender check and the dialog. */
 export interface FolderPickerDeps<Sender, Window> {
   /** The window allowed to ask, or null while there is none. */
   window(): { win: Window; contents: Sender } | null;
-  showOpenDialog(win: Window, options: typeof FOLDER_DIALOG_OPTIONS): Promise<{ canceled: boolean; filePaths: string[] }>;
+  showOpenDialog(win: Window, options: FolderDialogOptions): Promise<{ canceled: boolean; filePaths: string[] }>;
 }
 
 /**
  * The `ipcMain` handler for {@link CONTROL_PANEL_PICK_FOLDER_CHANNEL}: only our window may ask, one dialog at a time
- * (a second request while one is open is answered `null`), and the reply goes back to the asking sender only.
+ * whatever its purpose (a second request while one is open is answered `null`), an unknown purpose opens nothing and
+ * is answered `null`, and the reply goes back to the asking sender only.
  */
 export function createFolderPicker<Sender extends { send(channel: string, ...args: unknown[]): void }, Window>(
   deps: FolderPickerDeps<Sender, Window>,
-): (event: { sender: Sender }, requestId: unknown) => void {
+): (event: { sender: Sender }, requestId: unknown, purpose: unknown) => void {
   let open = false;
-  return (event, requestId) => {
+  return (event, requestId, purpose) => {
     const current = deps.window();
     if (current === null || event.sender !== current.contents || !isFolderRequestId(requestId)) return;
     const reply = (path: string | null): void => {
@@ -86,12 +105,12 @@ export function createFolderPicker<Sender extends { send(channel: string, ...arg
         // The window went away while the dialog was open.
       }
     };
-    if (open) {
+    if (open || !isFolderPurpose(purpose)) {
       reply(null);
       return;
     }
     open = true;
-    deps.showOpenDialog(current.win, FOLDER_DIALOG_OPTIONS).then(
+    deps.showOpenDialog(current.win, FOLDER_DIALOG_OPTIONS[purpose]).then(
       (result) => {
         open = false;
         const path = result.canceled ? undefined : result.filePaths[0];

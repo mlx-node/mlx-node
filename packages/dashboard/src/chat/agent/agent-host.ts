@@ -34,6 +34,7 @@ import {
   type WorkflowUpdate,
 } from '../acp/messages.js';
 import { AgentProcess, spawnAgent, type AgentExit, type SpawnAgent } from '../acp/process.js';
+import type { AttachmentInput } from '../attachment-rule.js';
 import {
   ensureChatDirs,
   pluginDir,
@@ -159,6 +160,8 @@ export const FAILURE_MESSAGES: Readonly<Record<ChatFailureCode, string>> = {
   'conversation-busy': 'An answer or a workflow is still running.',
   'engine-busy': 'The engine is busy: an answer, a workflow or a model load runs.',
   'slash-text': 'Start the message with a word, not /.',
+  'attachment-refused': 'The attached files were refused.',
+  'pictures-full': 'This chat has too many pictures to keep. Start a new chat to send more.',
   'keychain-unavailable': 'The Keychain cannot be reached. Keys cannot be saved.',
   'skill-bundle-corrupt': "The app's skill files are damaged. Reinstall the app.",
 };
@@ -789,7 +792,12 @@ export class AgentHost {
    * Starts a turn. Synchronous checks throw (`conversation-busy`); loading a cold session, the guard and the model
    * call run in the background, and `done` resolves when the turn ended.
    */
-  startTurn(sessionId: string, text: string, load: LoadInput): { turnId: string; done: Promise<TurnResult> } {
+  startTurn(
+    sessionId: string,
+    text: string,
+    load: LoadInput,
+    attachments: readonly AttachmentInput[] = [],
+  ): { turnId: string; done: Promise<TurnResult> } {
     if (this.closed) throw new AgentHostError('agent-crashed');
     const existing = this.sessions.get(sessionId);
     if (this.isBusy(sessionId) || existing?.creating === true) throw new AgentHostError('conversation-busy');
@@ -821,7 +829,7 @@ export class AgentHost {
     this.clearIdle();
     this.emitTurn(session);
     this.emitState();
-    const done = this.runTurn(session, turn, text, load).then((result) => {
+    const done = this.runTurn(session, turn, text, load, attachments).then((result) => {
       this.finishTurn(session, turn, result);
       return result;
     });
@@ -1500,7 +1508,13 @@ export class AgentHost {
 
   // ── turns ──────────────────────────────────────────────────────────────────────────────────────────────────────
 
-  private async runTurn(session: HostSession, turn: TurnRecord, text: string, load: LoadInput): Promise<TurnResult> {
+  private async runTurn(
+    session: HostSession,
+    turn: TurnRecord,
+    text: string,
+    load: LoadInput,
+    attachments: readonly AttachmentInput[],
+  ): Promise<TurnResult> {
     const aborted = new Promise<TurnResult>((resolve) => {
       turn.abort = resolve;
     });
@@ -1549,6 +1563,10 @@ export class AgentHost {
     if (!('process' in ready)) return ready;
     if (turn.recorded !== null) return unsent({ outcome: causeOutcome(turn.recorded) });
     const running = ready;
+    // An agent that does not take embedded resources would drop the file text.
+    if (running.embeddedContext !== true && attachments.some((a) => a.kind === 'file')) {
+      return unsent({ failure: 'agent-incompatible' });
+    }
     if (this.mode === 'chat') session.ledger.addUserText(text);
     turn.abort = null;
     turn.phase = 'running';
@@ -1562,11 +1580,12 @@ export class AgentHost {
     this.exitWaiters.add(onExit);
     try {
       let prompt = text;
+      let blocks = attachments;
       for (;;) {
         turn.between = false;
         turn.toolSeen = false;
         turn.endSeen = false;
-        const sent = running.process.client.start('session/prompt', promptParams(session.id, prompt), null);
+        const sent = running.process.client.start('session/prompt', promptParams(session.id, prompt, blocks), null);
         turn.prompt = { client: running.process.client, id: sent.id };
         if (turn.continues > 0) this.opts.listener?.onAutoContinue?.(session.id, turn.continues);
         const end = await this.promptEnd(sent.reply, turn, running, () => exited);
@@ -1580,6 +1599,7 @@ export class AgentHost {
         turn.continues += 1;
         this.emitTurn(session);
         prompt = CONTINUE_PROMPT;
+        blocks = [];
       }
     } finally {
       turn.between = false;

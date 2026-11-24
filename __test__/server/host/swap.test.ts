@@ -463,6 +463,12 @@ describe('makeSwapController', () => {
     }
   });
 
+  it('tells the agent the Anthropic body cap on every row', () => {
+    const reg = fakeRegistry();
+    const ctrl = makeSwapController(discovered(['a', 'b']), reg as unknown as ModelRegistry, vi.fn());
+    expect(ctrl.listModels().map((entry) => entry.max_request_bytes)).toEqual([16_777_216, 16_777_216]);
+  });
+
   it('disposeAll empties the registry and the aliases but keeps the selection for the next unknown name', async () => {
     const reg = fakeRegistry();
     const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);

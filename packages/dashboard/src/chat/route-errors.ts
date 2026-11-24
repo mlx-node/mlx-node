@@ -39,6 +39,8 @@ const CODE_OF_FAILURE: Readonly<Record<ChatFailureCode, ApiErrorCode>> = {
   'engine-busy': 'E_CONFLICT',
   'cwd-invalid': 'E_BAD_REQUEST',
   'slash-text': 'E_BAD_REQUEST',
+  'attachment-refused': 'E_BAD_REQUEST',
+  'pictures-full': 'E_CONFLICT',
 };
 
 /** The typed route failure of a code: its API code, its fixed sentence, and the code as `reason`. */

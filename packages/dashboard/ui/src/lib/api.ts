@@ -31,7 +31,7 @@ import type { LiveEvent, SystemOneJobSnapshot } from './types';
 export class DashboardApiError extends Error {
   readonly status: number;
   readonly code: string;
-  /** A finer cause the Chat routes send (a `ChatFailureCode`, `slash-text`, …). */
+  /** A finer cause some routes send (a `ChatFailureCode`, `slash-text`, `needs-cleanup` of a refused Update plan, …). */
   readonly reason: string | undefined;
 
   constructor(status: number, code: string, message: string, reason?: string) {

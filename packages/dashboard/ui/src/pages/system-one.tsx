@@ -1,12 +1,12 @@
-import { Code2, Download, FileDown, History, Play, Square } from 'lucide-react';
+import { CircleX, Code2, Download, FileDown, History, Play, Square } from 'lucide-react';
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
 
 import { CodePanel } from '../components/arc-x/code-panel/code-panel';
 import { Disclosure } from '../components/arc-x/disclosure/disclosure';
-import { IconButton } from '../components/arc-x/icon-button/icon-button';
 import { MediaDropzone } from '../components/arc-x/media-dropzone/media-dropzone';
 import { ModelPicker } from '../components/arc-x/model-picker/model-picker';
+import { shownShare } from '../components/arc-x/number-value/number-value';
 import { Panel } from '../components/arc-x/panel/panel';
 import { type HighlightSpanEntry, SpanHighlighter } from '../components/arc-x/span-highlighter/span-highlighter';
 import { Meter } from '../components/arc-x/split-bar/split-bar';
@@ -25,7 +25,8 @@ import { WaitClock } from '../components/wait-clock';
 import { DashboardApiError, getJson, mutate, subscribeSystemOne, type Subscription } from '../lib/api';
 import { getConnectionGeneration, subscribeConnection } from '../lib/connection';
 import { errMessage } from '../lib/errors';
-import { formatCount, formatDurationParts, formatPercent } from '../lib/format';
+import { formatClock, formatCount, formatDurationParts, formatPercent } from '../lib/format';
+import { useHost } from '../lib/host';
 import { useRuntimeLive } from '../lib/live';
 import {
   type BatchRow,
@@ -55,6 +56,7 @@ import {
   parseClairicPayload,
   parseClefPayload,
   persistSavedSpecs,
+  requestedModel,
   type SavedSpec,
   summarizeResult,
   summarizeRouting,
@@ -93,17 +95,28 @@ import styles from './system-one/system-one.module.css';
 type WorkspaceMode = 'single' | 'batch';
 type CodeFormat = 'json' | 'ts' | 'python' | 'curl' | 'sdk';
 
+/** The last failure of a run or of an auto-detect, shown in the Output status line until the next one ends. */
+interface RunFailure {
+  seq: number;
+  kind: 'run' | 'detect';
+  title: string;
+  text: string;
+  mode: SystemOneMode;
+}
+
 export default function SystemOne(): ReactElement {
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedModelParam = searchParams.get('model');
+  const requestedBuildParam = searchParams.get('build');
 
   const connectionGen = useSyncExternalStore(subscribeConnection, getConnectionGeneration, getConnectionGeneration);
   const live = useRuntimeLive();
   const stateQuery = useJson<SystemOneState>('/systemone/state');
   const modelsQuery = useJson<ModelsResponse>('/models');
   const catalogQuery = useJson<CatalogResponse>('/catalog');
+  const hostQuery = useHost();
   const updatesQuery = useJson<CatalogUpdatesResponse>('/catalog/updates');
-  const downloads = useModelDownloads(modelsQuery, catalogQuery, updatesQuery);
+  const downloads = useModelDownloads(modelsQuery, catalogQuery, updatesQuery, hostQuery);
 
   const liveRunning = live === undefined ? undefined : live.processes.some((p) => p.status === 'running');
   const liveResidentKey = useMemo(() => {
@@ -230,10 +243,31 @@ export default function SystemOne(): ReactElement {
   // Active single-run & output state
   const [activeJob, setActiveJob] = useState<SystemOneJobSnapshot | null>(null);
   const [result, setResult] = useState<Record<string, unknown> | undefined>(undefined);
+  /** The mode `result` came from, and the mode of the last submitted request: the other mode must not show them. */
+  const [resultMode, setResultMode] = useState<SystemOneMode | null>(null);
+  const [requestMode, setRequestMode] = useState<SystemOneMode | null>(null);
   const [lastElapsedMs, setLastElapsedMs] = useState<number | null>(null);
   const [lastRequestPayload, setLastRequestPayload] = useState<Record<string, unknown> | null>(null);
   const [lastSubmittedAttachments, setLastSubmittedAttachments] = useState<MediaAttachment[]>([]);
-  const [runError, setRunError] = useState<string | null>(null);
+  const [runFailure, setRunFailure] = useState<RunFailure | null>(null);
+  const [resultRun, setResultRun] = useState<{ model: string; at: number } | null>(null);
+  const runLineRef = useRef<HTMLDivElement | null>(null);
+
+  const failRun = useCallback(
+    (kind: RunFailure['kind'], title: string, text: string, failedMode: SystemOneMode): void => {
+      setRunFailure((prev) => ({ seq: (prev?.seq ?? 0) + 1, kind, title, text, mode: failedMode }));
+      if (kind === 'run') {
+        // A failed run has no answers. The answers of an earlier input must not stay below its error.
+        setResult(undefined);
+        setResultMode(null);
+        setResultRun(null);
+        setLastElapsedMs(null);
+      }
+      const line = runLineRef.current;
+      if (line === null || shownShare(line) < 1) toast.error(title, { id: 'system-one-run', description: text });
+    },
+    [],
+  );
   const [submitting, setSubmitting] = useState(false);
   const [autoDetecting, setAutoDetecting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -291,7 +325,7 @@ export default function SystemOne(): ReactElement {
     if (installedModels.length === 0) return;
 
     if (requestedModelParam !== null && requestedModelParam !== '') {
-      const match = installedModels.find((m) => m.id === requestedModelParam || m.name === requestedModelParam);
+      const match = requestedModel(installedModels, requestedModelParam, requestedBuildParam);
       if (match !== undefined) {
         setSelectedModelId(match.id);
         setMode(match.modelType === 'clef' ? 'decide' : 'extract');
@@ -299,6 +333,7 @@ export default function SystemOne(): ReactElement {
           (current) => {
             const next = new URLSearchParams(current);
             next.delete('model');
+            next.delete('build');
             return next;
           },
           { replace: true },
@@ -314,7 +349,7 @@ export default function SystemOne(): ReactElement {
         setSelectedModelId(preferred.id);
       }
     }
-  }, [installedModels, modelsForMode, requestedModelParam, selectedModelId, setSearchParams]);
+  }, [installedModels, modelsForMode, requestedBuildParam, requestedModelParam, selectedModelId, setSearchParams]);
 
   const selectedModelForMode: SystemOneModelInfo | undefined =
     modelsForMode.find((m) => m.id === selectedModelId) ?? modelsForMode[0];
@@ -379,7 +414,7 @@ export default function SystemOne(): ReactElement {
           setFields(suggested.fields);
           setRawJsonDraft(null);
           setRawJsonError(null);
-          setRunError(null);
+          setRunFailure(null);
           if (pending.thenRun) {
             toast.info(`Detected ${suggested.categoryLabel} — extracting ${String(suggested.fields.length)} fields…`);
             const nextPayload = buildClairicPayload({
@@ -395,7 +430,7 @@ export default function SystemOne(): ReactElement {
             toast.success(`Detected ${suggested.categoryLabel} — ${String(suggested.fields.length)} fields ready`);
           }
         } else if (snap.status === 'error') {
-          setRunError(snap.error ?? 'Could not auto-detect fields');
+          failRun('detect', 'Auto-detect failed', snap.error ?? 'The engine gave no reason.', 'extract');
         } else if (snap.status === 'cancelled') {
           toast.info('Auto-detect cancelled');
         }
@@ -405,13 +440,14 @@ export default function SystemOne(): ReactElement {
       setActiveJob(snap.status === 'running' ? snap : null);
       if (snap.status === 'done') {
         setResult(snap.result);
+        setResultMode(snap.mode);
+        setResultRun({ model: snap.model, at: snap.startedAt });
         setLastElapsedMs(snap.elapsedMs);
-        setRunError(null);
+        setRunFailure(null);
         setCancelling(false);
         stateQuery.reload();
       } else if (snap.status === 'error') {
-        setRunError(snap.error ?? 'Extraction failed');
-        setLastElapsedMs(snap.elapsedMs);
+        failRun('run', 'Run failed', snap.error ?? 'The engine gave no reason.', snap.mode);
         setCancelling(false);
         stateQuery.reload();
       } else if (snap.status === 'cancelled') {
@@ -420,7 +456,7 @@ export default function SystemOne(): ReactElement {
         stateQuery.reload();
       }
     },
-    [stateQuery.reload],
+    [stateQuery.reload, failRun],
   );
 
   // Subscribe to a running single job
@@ -487,7 +523,7 @@ export default function SystemOne(): ReactElement {
           setAutoDetecting(false);
           setActiveJob(null);
           setCancelling(false);
-          setRunError('Previous run was interrupted');
+          failRun('run', 'Run interrupted', 'The engine no longer has this run. Run it again.', activeJob.mode);
           return;
         }
         if (mismatch) {
@@ -496,7 +532,7 @@ export default function SystemOne(): ReactElement {
           setAutoDetecting(false);
           setActiveJob(null);
           setCancelling(false);
-          setRunError('Previous run was interrupted');
+          failRun('run', 'Run interrupted', 'The engine no longer has this run. Run it again.', activeJob.mode);
         }
       });
 
@@ -558,7 +594,7 @@ export default function SystemOne(): ReactElement {
     setSpecsOpen(false);
     setRawJsonDraft(null);
     setRawJsonError(null);
-    setRunError(null);
+    setRunFailure(null);
     setFocusedSpanField(null);
     setMode(preset.mode);
     setWorkspaceMode('single');
@@ -635,7 +671,7 @@ export default function SystemOne(): ReactElement {
     setSpecsOpen(false);
     setRawJsonDraft(null);
     setRawJsonError(null);
-    setRunError(null);
+    setRunFailure(null);
     setMode(spec.mode);
     if (spec.mode === 'decide') {
       const parsed = parseClefPayload({ questions: spec.questions ?? {} });
@@ -675,7 +711,7 @@ export default function SystemOne(): ReactElement {
       setWorkspaceMode('batch');
       setRawJsonDraft(null);
       setRawJsonError(null);
-      setRunError(null);
+      setRunFailure(null);
       if (preset !== undefined) {
         if (sample.mode === 'decide') {
           const parsed = parseClefPayload(preset.payload);
@@ -710,9 +746,9 @@ export default function SystemOne(): ReactElement {
       activeAttachments: MediaAttachment[],
     ): Promise<void> => {
       setSubmitting(true);
-      setRunError(null);
       setFocusedSpanField(null);
       setLastRequestPayload(payloadToSend);
+      setRequestMode(targetMode);
       setLastSubmittedAttachments(targetMode === 'extract' ? activeAttachments : []);
       try {
         const res = await mutate<{ jobId: string }>('POST', '/systemone/run', {
@@ -730,8 +766,7 @@ export default function SystemOne(): ReactElement {
         });
         attachJobSubscription(res.jobId);
       } catch (err) {
-        setRunError(errMessage(err));
-        toast.error('Run failed to start', { description: errMessage(err) });
+        failRun('run', 'Run did not start', errMessage(err), targetMode);
       } finally {
         setSubmitting(false);
       }
@@ -763,7 +798,6 @@ export default function SystemOne(): ReactElement {
       const detectPayload = buildAutoDetectPayload({ stateText, attachments });
       setSubmitting(true);
       setAutoDetecting(true);
-      setRunError(null);
       try {
         const res = await mutate<{ jobId: string }>('POST', '/systemone/run', {
           model: selectedModelForMode.id,
@@ -793,8 +827,7 @@ export default function SystemOne(): ReactElement {
       } catch (err) {
         pendingAutoDetectRef.current = null;
         setAutoDetecting(false);
-        setRunError(errMessage(err));
-        toast.error('Auto-detect failed to start', { description: errMessage(err) });
+        failRun('detect', 'Auto-detect did not start', errMessage(err), 'extract');
       } finally {
         setSubmitting(false);
       }
@@ -935,7 +968,6 @@ export default function SystemOne(): ReactElement {
 
       batchCancelledRef.current = false;
       setBatchRunning(true);
-      setRunError(null);
       setCancelling(false);
 
       const idSet = new Set(snapshotRows.map((r) => r.id));
@@ -1241,9 +1273,17 @@ export default function SystemOne(): ReactElement {
     }
 
     setLastRequestPayload(entry.request);
+    setRequestMode(entry.mode);
     setResult(entry.result);
+    setResultMode(entry.mode);
+    setResultRun(entry.result !== undefined ? { model: entry.model, at: entry.createdAt } : null);
     setLastElapsedMs(entry.elapsedMs);
-    setRunError(entry.error ?? null);
+    const restoredError = entry.error;
+    setRunFailure((prev) =>
+      restoredError !== undefined
+        ? { seq: (prev?.seq ?? 0) + 1, kind: 'run', title: 'Run failed', text: restoredError, mode: entry.mode }
+        : null,
+    );
 
     if (omittedCount > 0) {
       toast.info('Restored run (media omitted)', {
@@ -1255,7 +1295,7 @@ export default function SystemOne(): ReactElement {
   };
 
   const handleDownloadJson = (): void => {
-    if (result === undefined) return;
+    if (resultMode !== mode || result === undefined) return;
     const blob = new Blob([JSON.stringify(result, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
@@ -1327,32 +1367,41 @@ export default function SystemOne(): ReactElement {
   );
   useCommands(commands);
 
-  // Derived result summaries
-  const summary = useMemo(() => summarizeResult(result), [result]);
-  const routingSummary = useMemo(() => summarizeRouting(result, policy), [result, policy]);
+  // Derived result summaries, from the run of the mode on screen.
+  const shownResult = resultMode === mode ? result : undefined;
+  const shownRequestPayload = requestMode === mode ? lastRequestPayload : null;
+  const summary = useMemo(() => summarizeResult(shownResult), [shownResult]);
+  const routingSummary = useMemo(() => summarizeRouting(shownResult, policy), [shownResult, policy]);
   const latencyParts = formatDurationParts(lastElapsedMs);
 
   const requestFields = useMemo(() => {
-    const src = lastRequestPayload ?? structuredPayload;
+    const src = shownRequestPayload ?? structuredPayload;
     return isPlainObject(src.fields) ? (src.fields as Record<string, unknown>) : {};
-  }, [lastRequestPayload, structuredPayload]);
+  }, [shownRequestPayload, structuredPayload]);
+
+  /** The fields or questions of the request in flight: the Output lists them while their answers load. */
+  const pendingNames = useMemo(() => {
+    const src = shownRequestPayload ?? structuredPayload;
+    if (isPlainObject(src.fields)) return Object.keys(src.fields);
+    return isPlainObject(src.questions) ? Object.keys(src.questions) : [];
+  }, [shownRequestPayload, structuredPayload]);
 
   const evidenceText = useMemo(() => {
-    if (result !== undefined && typeof result.state_text === 'string') return result.state_text;
-    const req = lastRequestPayload ?? structuredPayload;
+    if (shownResult !== undefined && typeof shownResult.state_text === 'string') return shownResult.state_text;
+    const req = shownRequestPayload ?? structuredPayload;
     if (typeof req.state === 'string') return req.state;
     return stateText;
-  }, [result, lastRequestPayload, structuredPayload, stateText]);
+  }, [shownResult, shownRequestPayload, structuredPayload, stateText]);
 
   const spanEntries = useMemo<HighlightSpanEntry[]>(() => {
-    if (result === undefined || !isPlainObject(result.answers)) return [];
-    return Object.entries(result.answers).map(([field, raw], index) => ({
+    if (shownResult === undefined || !isPlainObject(shownResult.answers)) return [];
+    return Object.entries(shownResult.answers).map(([field, raw], index) => ({
       field,
       color: fieldAccentColor(index),
       confidence: isPlainObject(raw) && typeof raw.confidence === 'number' ? raw.confidence : undefined,
       spans: extractAnswerSpans(raw),
     }));
-  }, [result]);
+  }, [shownResult]);
 
   const liveServeProcess = useMemo(
     () => live?.processes.find((p) => p.status === 'running' && p.host !== 'desktop') ?? null,
@@ -1362,7 +1411,10 @@ export default function SystemOne(): ReactElement {
   const apiEndpointUrl =
     liveServePort !== null ? `http://127.0.0.1:${String(liveServePort)}/v1/systemone` : DEFAULT_SYSTEMONE_ENDPOINT;
 
-  const resultJson = useMemo(() => (result === undefined ? '' : JSON.stringify(result, null, 2)), [result]);
+  const resultJson = useMemo(
+    () => (shownResult === undefined ? '' : JSON.stringify(shownResult, null, 2)),
+    [shownResult],
+  );
   const activeModelSlug = selectedModelForMode?.id ?? (mode === 'decide' ? 'clef-flash' : 'clairic-flash');
   const activeModelPath =
     selectedModelForMode?.path ??
@@ -1427,6 +1479,21 @@ export default function SystemOne(): ReactElement {
         : workspaceMode === 'batch' && runnableBatchCount === 0
           ? 'Add at least one case to run batch'
           : 'Run (⌘↵)';
+
+  // A run started in one mode keeps its own wording and stays out of the other mode's Output.
+  const runMode = activeJob?.mode ?? mode;
+  const runModelName = activeJob?.model ?? selectedModelForMode?.name ?? 'model';
+  const engineLoading = live?.processes.some((p) => p.status === 'running' && p.loading.length > 0) ?? false;
+  const runPending = isRunning && !batchRunning && !autoDetecting && runMode === mode;
+  const shownFailure = runFailure?.mode === mode ? runFailure : null;
+  const runLineRest =
+    shownResult === undefined
+      ? 'No run yet'
+      : resultRun === null
+        ? 'Last run'
+        : `Last run · ${resultRun.model} · ${formatClock(resultRun.at)}`;
+  // CLEF answers are probabilities with no text spans, so Decide has no Highlights tab.
+  const outputTab = mode === 'decide' && rightTab === 'evidence' ? 'answers' : rightTab;
 
   const optionsMeta = [
     referenceDate.trim() !== '' ? referenceDate.trim() : null,
@@ -1521,19 +1588,22 @@ export default function SystemOne(): ReactElement {
         }
         actions={
           <div className={styles.headerActions}>
-            <span className={styles.historyBtnWrap}>
-              <IconButton
-                label="History & compare"
-                tooltip={history.length > 0 ? `History & compare (${String(history.length)})` : 'History & compare'}
-                icon={<History size={14} strokeWidth={1.75} aria-hidden="true" />}
+            <Tooltip content="History & compare">
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                aria-label={
+                  history.length > 0 ? `History & compare, ${String(history.length)} runs` : 'History & compare'
+                }
                 onClick={() => setHistoryDrawerOpen(true)}
-              />
-              {history.length > 0 ? (
-                <span className={styles.historyCount} aria-hidden="true">
-                  {history.length > 99 ? '99+' : history.length}
-                </span>
-              ) : null}
-            </span>
+              >
+                <History size={14} strokeWidth={1.75} aria-hidden="true" />
+                {history.length > 0 ? (
+                  <span className={styles.historyCount}>{history.length > 99 ? '99+' : history.length}</span>
+                ) : null}
+              </Button>
+            </Tooltip>
 
             <Button type="button" variant="ghost" size="sm" onClick={() => setModelsDrawerOpen(true)}>
               <Download size={14} strokeWidth={1.75} aria-hidden="true" />
@@ -1541,19 +1611,26 @@ export default function SystemOne(): ReactElement {
             </Button>
 
             {isRunning ? (
-              <Button type="button" variant="danger" size="sm" loading={cancelling} onClick={() => void handleCancel()}>
-                <Square size={12} strokeWidth={2} aria-hidden="true" />
-                {batchRunning ? 'Stop' : 'Cancel'}
-              </Button>
+              <span className={styles.runSlot}>
+                <Button
+                  type="button"
+                  variant="danger"
+                  size="sm"
+                  loading={cancelling}
+                  onClick={() => void handleCancel()}
+                >
+                  <Square size={12} strokeWidth={2} aria-hidden="true" />
+                  {batchRunning ? 'Stop' : 'Cancel'}
+                </Button>
+              </span>
             ) : (
               <Tooltip content={runTooltip}>
-                <span className={styles.runTipWrap}>
+                <span className={styles.runSlot}>
                   <Button
                     type="button"
                     variant="primary"
                     size="sm"
                     disabled={runDisabled}
-                    title="Run (⌘↵)"
                     onClick={() => void handleRun()}
                   >
                     <Play size={12} strokeWidth={2} aria-hidden="true" />
@@ -1600,13 +1677,7 @@ export default function SystemOne(): ReactElement {
       ) : null}
 
       {showEmptyInstallCard ? (
-        <NoSystemOneModelsCard models={modelsQuery} catalog={catalogQuery} downloads={downloads} />
-      ) : null}
-
-      {runError !== null ? (
-        <Alert tone="danger" title="Run failed">
-          {runError}
-        </Alert>
+        <NoSystemOneModelsCard catalog={catalogQuery} host={hostQuery} downloads={downloads} />
       ) : null}
 
       <div className={styles.apiStrip} role="region" aria-label="Local System One API endpoint">
@@ -1674,63 +1745,77 @@ export default function SystemOne(): ReactElement {
         />
       ) : (
         <>
-          {result !== undefined ? (
-            <StatGroup label="System One run metrics" maxColumns={4}>
-              <StatTile label="Latency" value={latencyParts.value} unit={latencyParts.unit} countUp={false} />
-              <StatTile
-                label="Routing"
-                value={
-                  routingSummary.totalCount > 0
+          {/* Always mounted: a row that comes and goes with a run moves the two cards below it. */}
+          <StatGroup label="System One run metrics" maxColumns={4}>
+            <StatTile
+              label="Latency"
+              value={shownResult === undefined ? null : latencyParts.value}
+              unit={shownResult === undefined ? undefined : latencyParts.unit}
+              countUp={false}
+              held={runPending}
+            />
+            <StatTile
+              label="Routing"
+              value={
+                shownResult === undefined
+                  ? null
+                  : routingSummary.totalCount > 0
                     ? `${formatCount(routingSummary.autoCount)} / ${formatCount(routingSummary.totalCount)}`
                     : formatCount(summary.extractedCount + summary.nullCount)
-                }
-                hint={[
-                  `${formatCount(routingSummary.autoCount)} auto`,
-                  routingSummary.reviewCount > 0 ? `${formatCount(routingSummary.reviewCount)} review` : null,
-                  routingSummary.missingCount > 0 ? `${formatCount(routingSummary.missingCount)} missing` : null,
-                  summary.truncated ? 'truncated' : null,
-                ]
-                  .filter((part): part is string => part !== null)
-                  .join(' · ')}
-                countUp={false}
-              />
-              <StatTile
-                label="Tokens"
-                value={
-                  summary.inputTokens === null && summary.outputTokens === null
-                    ? null
-                    : formatCount((summary.inputTokens ?? 0) + (summary.outputTokens ?? 0))
-                }
-                hint={[
-                  summary.inputTokens !== null ? `${formatCount(summary.inputTokens)} in` : null,
-                  summary.outputTokens !== null ? `${formatCount(summary.outputTokens)} out` : null,
-                  summary.imageTokens !== null && summary.imageTokens > 0
-                    ? `${formatCount(summary.imageTokens)} img`
-                    : null,
-                ]
-                  .filter((part): part is string => part !== null)
-                  .join(' · ')}
-                countUp={false}
-              />
-              <StatTile
-                label="Confidence"
-                value={summary.meanConfidence === null ? null : formatPercent(summary.meanConfidence)}
-                footer={
-                  summary.meanConfidence !== null ? (
-                    <Meter
-                      label="Confidence"
-                      value={summary.meanConfidence * 100}
-                      max={100}
-                      unit="%"
-                      warnAt={1.01}
-                      dangerAt={1.01}
-                    />
-                  ) : undefined
-                }
-                countUp={false}
-              />
-            </StatGroup>
-          ) : null}
+              }
+              hint={
+                shownResult === undefined
+                  ? 'No answers yet'
+                  : [
+                      `${formatCount(routingSummary.autoCount)} auto`,
+                      routingSummary.reviewCount > 0 ? `${formatCount(routingSummary.reviewCount)} review` : null,
+                      routingSummary.missingCount > 0 ? `${formatCount(routingSummary.missingCount)} missing` : null,
+                      summary.truncated ? 'truncated' : null,
+                    ]
+                      .filter((part): part is string => part !== null)
+                      .join(' · ')
+              }
+              countUp={false}
+              held={runPending}
+            />
+            <StatTile
+              label="Tokens"
+              value={
+                summary.inputTokens === null && summary.outputTokens === null
+                  ? null
+                  : formatCount((summary.inputTokens ?? 0) + (summary.outputTokens ?? 0))
+              }
+              hint={[
+                summary.inputTokens !== null ? `${formatCount(summary.inputTokens)} in` : null,
+                summary.outputTokens !== null ? `${formatCount(summary.outputTokens)} out` : null,
+                summary.imageTokens !== null && summary.imageTokens > 0
+                  ? `${formatCount(summary.imageTokens)} img`
+                  : null,
+              ]
+                .filter((part): part is string => part !== null)
+                .join(' · ')}
+              countUp={false}
+              held={runPending}
+            />
+            <StatTile
+              label="Confidence"
+              value={summary.meanConfidence === null ? null : formatPercent(summary.meanConfidence)}
+              footer={
+                summary.meanConfidence !== null ? (
+                  <Meter
+                    label="Confidence"
+                    value={summary.meanConfidence * 100}
+                    max={100}
+                    unit="%"
+                    warnAt={1.01}
+                    dangerAt={1.01}
+                  />
+                ) : undefined
+              }
+              countUp={false}
+              held={runPending}
+            />
+          </StatGroup>
 
           <div className={styles.workspace}>
             <Panel
@@ -1905,16 +1990,23 @@ export default function SystemOne(): ReactElement {
               actions={
                 <SegmentedControl
                   label="Output view"
-                  options={[
-                    { value: 'answers', label: 'Answers' },
-                    { value: 'evidence', label: 'Highlights' },
-                    { value: 'code', label: 'Code & JSON' },
-                  ]}
-                  value={rightTab}
+                  options={
+                    mode === 'decide'
+                      ? [
+                          { value: 'answers', label: 'Answers' },
+                          { value: 'code', label: 'Code & JSON' },
+                        ]
+                      : [
+                          { value: 'answers', label: 'Answers' },
+                          { value: 'evidence', label: 'Highlights' },
+                          { value: 'code', label: 'Code & JSON' },
+                        ]
+                  }
+                  value={outputTab}
                   onValueChange={(next) => {
                     const tab = next as 'answers' | 'evidence' | 'code';
                     setRightTab(tab);
-                    if (tab === 'code' && result === undefined && codeFormat === 'json') {
+                    if (tab === 'code' && shownResult === undefined && codeFormat === 'json') {
                       setCodeFormat('ts');
                     }
                   }}
@@ -1922,24 +2014,54 @@ export default function SystemOne(): ReactElement {
               }
             >
               <div className={styles.paneContent}>
-                {isRunning ? (
-                  <div className={styles.runningStrip} role="status" aria-live="polite">
-                    <WaitLine
-                      orb="think"
-                      text={
-                        autoDetecting
-                          ? `Detecting fields with ${activeJob?.model ?? selectedModelForMode?.name ?? 'model'}…`
-                          : `Running ${mode === 'decide' ? 'decision' : 'extraction'} on ${activeJob?.model ?? selectedModelForMode?.name ?? 'model'}…`
-                      }
-                      enter
-                    />
-                    {activeJob !== null ? <WaitClock since={activeJob.startedAt} /> : null}
-                  </div>
-                ) : null}
+                {/* One box with three faces: rest, running, failed. It is always mounted, and the face of the last run
+                    stays in the cell during a run, so the answers below do not move. */}
+                <div ref={runLineRef} className={styles.runLine}>
+                  {shownFailure !== null ? (
+                    <div
+                      key={shownFailure.seq}
+                      className={styles.runLineFailed}
+                      role={isRunning ? undefined : 'alert'}
+                      aria-hidden={isRunning ? true : undefined}
+                      data-leaving={isRunning ? '' : undefined}
+                    >
+                      <CircleX size={16} strokeWidth={1.75} aria-hidden="true" />
+                      <p title={shownFailure.text}>
+                        <strong>{shownFailure.title}</strong> {shownFailure.text}
+                      </p>
+                    </div>
+                  ) : (
+                    <p
+                      className={styles.runLineRest}
+                      aria-hidden={isRunning ? true : undefined}
+                      data-leaving={isRunning ? '' : undefined}
+                    >
+                      {runLineRest}
+                    </p>
+                  )}
+                  {isRunning ? (
+                    <div className={styles.runLineWait} role="status" aria-live="polite">
+                      <WaitLine
+                        orb={engineLoading ? 'load' : 'think'}
+                        text={
+                          engineLoading
+                            ? `Loading ${runModelName}…`
+                            : autoDetecting
+                              ? `Detecting fields with ${runModelName}…`
+                              : `Running ${runMode === 'decide' ? 'decision' : 'extraction'} on ${runModelName}…`
+                        }
+                      />
+                      {activeJob !== null ? <WaitClock since={activeJob.startedAt} /> : null}
+                    </div>
+                  ) : null}
+                </div>
 
-                {rightTab === 'answers' ? (
+                {outputTab === 'answers' ? (
                   <ResultsView
-                    result={result}
+                    result={shownResult}
+                    pending={runPending}
+                    failed={shownFailure?.kind === 'run'}
+                    pendingNames={pendingNames}
                     requestFields={requestFields}
                     mode={mode}
                     presets={SYSTEM_ONE_PRESETS}
@@ -1956,13 +2078,14 @@ export default function SystemOne(): ReactElement {
                     onOpenApiGuide={() => setApiGuideOpen(true)}
                     apiEndpointUrl={apiEndpointUrl}
                   />
-                ) : rightTab === 'evidence' ? (
+                ) : outputTab === 'evidence' ? (
                   <SpanHighlighter
                     text={evidenceText}
                     entries={spanEntries}
+                    hasResult={shownResult !== undefined}
                     focusedField={focusedSpanField}
                     onFocusField={setFocusedSpanField}
-                    attachments={lastSubmittedAttachments}
+                    attachments={requestMode === mode ? lastSubmittedAttachments : []}
                   />
                 ) : (
                   <div className={styles.jsonStack}>
@@ -1981,7 +2104,7 @@ export default function SystemOne(): ReactElement {
                       />
                       <div className={styles.subToolbarActions}>
                         {codeFormat === 'json' ? (
-                          result !== undefined ? (
+                          shownResult !== undefined ? (
                             <>
                               <CopyButton value={resultJson} label="Copy JSON" />
                               <Button type="button" variant="secondary" size="sm" onClick={handleDownloadJson}>
@@ -2003,7 +2126,7 @@ export default function SystemOne(): ReactElement {
                     </div>
 
                     {codeFormat === 'json' ? (
-                      result === undefined ? (
+                      shownResult === undefined ? (
                         <div className={styles.emptyCenter}>
                           <EmptyState
                             title="No response JSON yet"
@@ -2033,8 +2156,8 @@ export default function SystemOne(): ReactElement {
       <SystemOneModelsDrawer
         open={modelsDrawerOpen}
         onOpenChange={setModelsDrawerOpen}
-        models={modelsQuery}
         catalog={catalogQuery}
+        host={hostQuery}
         updates={updatesQuery}
         downloads={downloads}
       />

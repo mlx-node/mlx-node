@@ -6,6 +6,7 @@
  */
 
 import { isAsciiDigit } from './text-scan';
+import type { SystemOneModelInfo } from './types';
 
 export const CLAIRIC_MAX_IMAGES = 4;
 export const CLAIRIC_MAX_MEDIA_BYTES = 4 * 1024 * 1024;
@@ -90,6 +91,28 @@ export function isSystemOneModelType(modelType: string | null | undefined): bool
   if (modelType == null) return false;
   const lower = modelType.toLowerCase();
   return lower === 'clairic' || lower === 'clef';
+}
+
+/**
+ * The model `?model=` (and `&build=`) of a link names: the model whose id or name is `model`, else, with a `build`, the
+ * model of that build in the folder `model` of the models directory. A catalog card links by its folder and its
+ * build, and a GGUF model's id is its file name; one folder can hold several builds.
+ */
+export function requestedModel<T extends Pick<SystemOneModelInfo, 'id' | 'name' | 'path' | 'variant'>>(
+  models: readonly T[],
+  model: string,
+  build: string | null,
+): T | undefined {
+  const byId = models.find((candidate) => candidate.id === model || candidate.name === model);
+  if (byId !== undefined || build === null) return byId;
+  return models.find((candidate) => candidate.variant === build && modelFolder(candidate.path) === model);
+}
+
+/** The folder of a model in the models directory: its path, or the folder of a GGUF file. */
+function modelFolder(path: string): string {
+  const parts = path.split('/');
+  const last = parts[parts.length - 1] ?? '';
+  return (last.toLowerCase().endsWith('.gguf') ? parts[parts.length - 2] : last) ?? '';
 }
 
 export function formatModelFamily(modelType: string): string {

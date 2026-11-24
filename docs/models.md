@@ -263,11 +263,13 @@ the model's `<tool_calls:…>` block as `toolCalls`; values stay text, object
 and array literals parse as JSON, and broken markup gives one `parse_error`
 call.
 
-The catalog lists the model only on a Mac with at least 39 GiB of RAM
-(`minMemoryGb`): the admission's fixed bytes at its smallest settings (16K
-context, 2,048-row chunk, MTP on, one staging layer) are 26.52 GiB, plus the
-12 GiB it keeps free for other apps. The setup wizard and the Models page hide
-it below that.
+The load admission accepts a Mac with 39 GiB of RAM: its fixed bytes at its
+smallest settings (16K context, 2,048-row chunk, MTP on, one staging layer)
+are 26.52 GiB, plus the 12 GiB it keeps free for other apps. The catalog
+offers the model only from 96 GiB (`minMemoryGb`): the setup wizard, the
+Models page and Onboarding hide it below that. A copy already in the models
+folder still lists on a smaller Mac, and loads where the admission accepts the
+RAM (from 39 GiB).
 
 How it fits in memory:
 

@@ -1,5 +1,3 @@
-import { statfsSync } from 'node:fs';
-import { totalmem } from 'node:os';
 import { isAbsolute, relative, sep } from 'node:path';
 
 import { discoverMlxModels } from '@mlx-node/agent/models';
@@ -9,11 +7,13 @@ import { catalogWithState } from '../../catalog.js';
 import {
   discoverLocalModels,
   deleteLocalModel,
+  FilesNoLongerStayError,
   isModelPresent,
   isRegularFile,
+  modelsDirUnavailable,
   type ModelsResponse,
 } from '../../models.js';
-import type { ApiPaths, ApiRequest, MainApiContext } from '../context.js';
+import { type ApiPaths, type ApiRequest, type MainApiContext, requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
 
 /** The first path segment of `path` under `root`, or null when it is not inside it. */
@@ -44,28 +44,17 @@ async function servedIdsByEntry(modelsDir: string): Promise<Map<string, string[]
   return out;
 }
 
-function diskFreeBytes(dir: string): number | null {
-  try {
-    const fs = statfsSync(dir);
-    return Number(fs.bavail) * Number(fs.bsize);
-  } catch {
-    return null;
-  }
-}
-
 export async function handleModels(ctx: ApiPaths): Promise<ModelsResponse> {
+  // A link to a missing disk is not an empty library: an empty list would read as "no model installed" and send a
+  // first run to Onboarding. The page branches on the reason.
+  const unavailable = modelsDirUnavailable(ctx.modelsDir);
+  if (unavailable !== null) throw new ApiError('E_UNAVAILABLE', unavailable, 'models-dir-unavailable');
   const { models, companions, warnings } = discoverLocalModels(ctx.modelsDir);
   const served = await servedIdsByEntry(ctx.modelsDir);
   for (const model of models) model.servedIds = served.get(model.name) ?? [];
   // `dir` lets the UI show WHERE these checkpoints live — the directory is
   // configurable (`--models-dir`), so the count alone is ambiguous.
-  return {
-    models,
-    companions,
-    warnings,
-    dir: ctx.modelsDir,
-    host: { totalMemBytes: totalmem(), diskFreeBytes: diskFreeBytes(ctx.modelsDir) },
-  };
+  return { models, companions, warnings, dir: ctx.modelsDir };
 }
 
 export async function handleCodingAgentModels(ctx: ApiPaths): Promise<unknown> {
@@ -78,11 +67,27 @@ export async function handleCodingAgentModels(ctx: ApiPaths): Promise<unknown> {
   };
 }
 
+/** The Remove form sends `{ keepsFiles: true }`; the Delete form sends no body. */
+function keepsFilesOf(req: ApiRequest): boolean {
+  const body = requireBody(req);
+  if (body === null) return false;
+  if (
+    typeof body === 'object' &&
+    Object.keys(body).length === 1 &&
+    (body as { keepsFiles?: unknown }).keepsFiles === true
+  ) {
+    return true;
+  }
+  throw ApiError.badRequest('The body is { keepsFiles: true } or none.');
+}
+
 export function handleDeleteModel(ctx: ApiPaths, req: ApiRequest): unknown {
   try {
-    deleteLocalModel(ctx.modelsDir, req.params.name);
+    deleteLocalModel(ctx.modelsDir, req.params.name, () => keepsFilesOf(req));
     return { deleted: true, name: req.params.name };
   } catch (err) {
+    if (err instanceof ApiError) throw err;
+    if (err instanceof FilesNoLongerStayError) throw ApiError.conflict(err.message);
     const message = err instanceof Error ? err.message : String(err);
     // The store surfaces "not found" only through the message text; keep sniffing
     // it verbatim so an unknown name stays a 404 and every other failure a 400.

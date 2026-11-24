@@ -1053,6 +1053,81 @@ describe('handleCreateMessage', () => {
       expect((model.resetCaches as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
     });
 
+    describe('an image for a model that does not see images', () => {
+      const imageMessage = {
+        role: 'user' as const,
+        content: [
+          { type: 'text' as const, text: 'describe' },
+          { type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: 'AQID' } },
+        ],
+      };
+
+      async function send(registry: ModelRegistry, messages: unknown[]) {
+        const response = createMockRes();
+        await handleCreateMessage(
+          response.res,
+          { model: 'm', messages, max_tokens: 32 } as Parameters<typeof handleCreateMessage>[1],
+          registry,
+        );
+        return response;
+      }
+
+      function expectImageRefused(response: ReturnType<typeof createMockRes>, model: SessionCapableModel) {
+        expect(response.getStatus()).toBe(400);
+        const parsed = JSON.parse(response.getBody());
+        expect(parsed.error.type).toBe('invalid_request_error');
+        expect(parsed.error.message.startsWith('Could not process image')).toBe(true);
+        expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+        expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      }
+
+      // MUTATION: drop the image check after the model lookup -> both refusals answer 200.
+      it('gets a 400 when supportsImages() answers false or the model has no such method', async () => {
+        for (const extra of [{ supportsImages: () => false }, {}]) {
+          const model = Object.assign(createMockModel(), extra);
+          const registry = new ModelRegistry();
+          registry.register('m', model);
+          expectImageRefused(await send(registry, [imageMessage]), model);
+        }
+      });
+
+      it('gets the same 400 for an image earlier in the history', async () => {
+        const model = createMockModel();
+        const registry = new ModelRegistry();
+        registry.register('m', model);
+        const history = [imageMessage, { role: 'assistant', content: 'a cat' }, { role: 'user', content: 'and now?' }];
+        expectImageRefused(await send(registry, history), model);
+      });
+
+      it('releases its permit, so the next request is admitted', async () => {
+        const model = createMockModel();
+        const registry = new ModelRegistry({ maxQueueDepth: 0 });
+        registry.register('m', model);
+        expectImageRefused(await send(registry, [imageMessage]), model);
+        expectImageRefused(await send(registry, [imageMessage]), model);
+        expect(registry.getSessionRegistry('m')!.preDispatchAdmitCount).toBe(0);
+        const next = await send(registry, [{ role: 'user', content: 'hi' }]);
+        expect(next.getStatus()).toBe(200);
+        expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+      });
+
+      it('leaves a vision model and a text-only request as they were', async () => {
+        const vision = Object.assign(createMockModel(), { supportsImages: () => true });
+        const visionRegistry = new ModelRegistry();
+        visionRegistry.register('m', vision);
+        const seen = await send(visionRegistry, [imageMessage]);
+        expect(seen.getStatus()).toBe(200);
+        expect((vision.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+
+        const textOnly = createMockModel();
+        const textRegistry = new ModelRegistry();
+        textRegistry.register('m', textOnly);
+        const text = await send(textRegistry, [{ role: 'user', content: 'hi' }]);
+        expect(text.getStatus()).toBe(200);
+        expect((textOnly.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(1);
+      });
+    });
+
     it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
       const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
         expect(Array.from(messages[0]?.images?.[0] ?? [])).toEqual([1, 2, 3]);
@@ -1067,6 +1142,7 @@ describe('handleCreateMessage', () => {
         }),
         applyChatTemplate: vi.fn(() => new Uint32Array(4)),
         expandedPromptTokenCount,
+        supportsImages: () => true,
       });
       const registry = new ModelRegistry();
       registry.register('test-model', model);
@@ -1157,6 +1233,7 @@ describe('handleCreateMessage', () => {
       it('returns a JSON 400 before SSE for an image prompt above the window with generation_mode=mtp', async () => {
         const model = createLaneWindowModel(4, {
           expandedPromptTokenCount: vi.fn(() => 80),
+          supportsImages: () => true,
         });
         const registry = new ModelRegistry();
         registry.register('test-model', model);

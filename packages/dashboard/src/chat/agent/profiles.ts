@@ -1,10 +1,12 @@
 /**
- * The session contract of both modes. Every field of every request is built here; only the message text and the
- * Work folder come from the page, and both are checked before they get here. `agentProfile` must stay an object: a
+ * The session contract of both modes. Every field of every request is built here; only the message text, its
+ * attachments and the Work folder come from the page, and all are checked before they get here. `agentProfile` must stay an object: a
  * string is read as an agent name and silently gives the full default agent.
  */
 
 import { randomBytes } from 'node:crypto';
+
+import { attachmentUri, type AttachmentInput } from '../attachment-rule.js';
 
 export const AGENT_ARGS = ['--disable-web-search', 'agent', '--no-leader', 'stdio'] as const;
 
@@ -243,7 +245,26 @@ export function loadSessionParams(newParams: Record<string, unknown>, sessionId:
   return { sessionId, cwd: newParams.cwd, mcpServers: newParams.mcpServers, _meta: { ...meta, noReplay: true } };
 }
 
-/** Exactly one text block, with no `_meta`: a `bash_command` in a block's `_meta` would run a shell. */
-export function promptParams(sessionId: string, text: string): Record<string, unknown> {
-  return { sessionId, prompt: [{ type: 'text', text }] };
+/**
+ * One text block, then one `resource` block per text file, then one `image` block per image. No block carries `_meta`
+ * (a `bash_command` there would run a shell) and no image carries `uri` (a file:// uri is read as a disk path).
+ */
+export function promptParams(
+  sessionId: string,
+  text: string,
+  attachments: readonly AttachmentInput[] = [],
+): Record<string, unknown> {
+  const prompt: Array<Record<string, unknown>> = [{ type: 'text', text }];
+  for (const item of attachments) {
+    if (item.kind === 'file') {
+      prompt.push({
+        type: 'resource',
+        resource: { uri: attachmentUri(item.name), mimeType: 'text/plain', text: item.text },
+      });
+    }
+  }
+  for (const item of attachments) {
+    if (item.kind === 'image') prompt.push({ type: 'image', data: item.data, mimeType: item.mediaType });
+  }
+  return { sessionId, prompt };
 }

@@ -7,19 +7,23 @@ import styles from './model-logos.module.css';
 /**
  * Per-model brand marks for assistant messages. Each model family shows the logo
  * of the org behind its base model — so a reader can tell at a glance which model
- * produced a turn. Marks are simplified, self-contained inline SVG (single path,
- * no external refs) traced from each provider's official icon; unknown models get
- * a name monogram. Brand colour lives on the glyph only, an accent against the
- * otherwise-monochrome chrome.
+ * produced a turn. The brand marks in this file are self-contained inline SVG on
+ * a 16×16 view box (no ids, no external refs) taken from each provider's official
+ * icon; a multi-colour mark sets the fill on each shape, so no `currentColor`
+ * rule recolours it. Unknown models get a name monogram. Brand colour lives on
+ * the glyph only, an accent against the otherwise-monochrome chrome.
  */
 
-export type ModelFamily = 'qwen' | 'gemma' | 'liquid' | 'ornith' | 'internscience' | 'cloudflare' | 'generic';
+export type ModelFamily = 'qwen' | 'gemma' | 'liquid' | 'ornith' | 'internscience' | 'cloudflare' | 'hy' | 'generic';
 
 /**
  * Classify a model id into a logo family by substring. Order matters: more
  * specific brands are checked before the Qwen base family. `Agents-A1`
  * (InternScience, on a Qwen3.5-MoE base) gets its own InternScience mark;
  * `Qwen-AgentWorld` is a first-party Qwen release, so it rides the Qwen mark.
+ * Tencent Hy names match `hunyuan`, `hy4`, `hy3`, `hy_v4`, or `hy-` at the start
+ * of the name or of its repo part: a bare `hy` would take `Hybrid …`, and
+ * `tencent` also publishes other brands.
  */
 export function classifyModel(model: string): ModelFamily {
   const m = model.toLowerCase();
@@ -31,6 +35,16 @@ export function classifyModel(model: string): ModelFamily {
     m.includes('system-one')
   ) {
     return 'cloudflare';
+  }
+  if (
+    m.includes('hunyuan') ||
+    m.includes('hy4') ||
+    m.includes('hy3') ||
+    m.includes('hy_v4') ||
+    m.startsWith('hy-') ||
+    m.includes('/hy-')
+  ) {
+    return 'hy';
   }
   if (m.includes('gemma')) return 'gemma';
   if (m.includes('lfm') || m.includes('liquid')) return 'liquid';
@@ -151,6 +165,49 @@ function InternScienceLogo({ className }: LogoProps) {
   );
 }
 
+/**
+ * Tencent Hy (Hy4-flash; Hunyuan is another Tencent Hy name): the swirl-circle
+ * mark. The shapes of hy.tencent.com `logo.svg` (view box 31×30) without three
+ * zero-area slivers, scaled to 16; its luminance mask is the right half of its
+ * own circle, drawn here as a path.
+ */
+function HyLogo({ className }: LogoProps) {
+  return (
+    <svg viewBox="0 0 16 16" className={className} aria-hidden>
+      <g transform="matrix(.53333 0 0 .53333 -.122 0)">
+        <path
+          fill="#B3DDF2"
+          d="M15.2287 30C23.4603 30 30.1333 23.2843 30.1333 15C30.1333 6.71573 23.4603 0 15.2287 0C6.9972 0 0.324219 6.71573 0.324219 15C0.324219 23.2843 6.9972 30 15.2287 30Z"
+        />
+        <path
+          fill="#0053E0"
+          d="M15.2318 29.9966C19.3467 29.9966 22.6824 26.6395 22.6824 22.4983C22.6824 18.3571 19.3467 15 15.2318 15C11.117 15 7.78125 18.3571 7.78125 22.4983C7.78125 26.6395 11.117 29.9966 15.2318 29.9966Z"
+        />
+        <path
+          fill="#0053E0"
+          d="M15.2326 0C23.4642 0 30.1372 6.71573 30.1372 15C30.1372 23.2843 23.4642 30 15.2326 30Z"
+        />
+        <path
+          fill="#B3DDF2"
+          d="M15.2318 14.9966C19.3467 14.9966 22.6824 11.6395 22.6824 7.49831C22.6824 3.35711 19.3467 0 15.2318 0C11.117 0 7.78125 3.35711 7.78125 7.49831C7.78125 11.6395 11.117 14.9966 15.2318 14.9966Z"
+        />
+        <path
+          fill="#2AB9FF"
+          d="M15.3712 0.00674309C18.5069 0.0842886 21.0228 2.66015 21.0228 5.83277C21.0228 8.50977 19.2271 10.8328 16.6007 11.5037C16.6007 11.5037 16.6241 11.5003 16.6576 11.4936C14.4097 11.9757 12.7246 13.9852 12.7246 16.3924C12.7246 19.1605 14.9524 21.4026 17.7028 21.4026C18.4164 21.4026 19.3879 21.234 20.001 20.9609C23.9675 19.3493 26.47 15.4552 26.47 10.8867C26.47 4.87188 21.6258 0 15.6559 0C15.5588 0 15.465 0.00337154 15.3712 0.00674309Z"
+        />
+        <path
+          fill="#0053E0"
+          d="M4.20222 18.9028C4.20222 15.8718 5.4116 13.124 7.36805 11.1213V11.1145C7.87726 10.5549 8.19217 9.81313 8.19217 8.99384C8.19217 7.2575 6.79518 5.85156 5.06989 5.85156C3.87056 5.85156 2.82868 6.53599 2.30607 7.53733C1.04979 9.73558 0.326172 12.2811 0.326172 15.0019C0.326172 23.0936 6.69468 29.685 14.6645 29.9884C8.83873 29.6917 4.20222 24.8435 4.20222 18.9028Z"
+        />
+        <path
+          fill="#ECECEE"
+          d="M15.3756 0.0078125C18.5113 0.085358 21.0272 2.66122 21.0272 5.83384C21.0272 8.51084 19.2014 10.8372 16.6051 11.5048C14.6285 11.9667 13.1679 13.5344 12.8262 15.4023C12.8262 15.4023 13.8948 15.0044 15.2148 15.0044C15.2148 15.0044 15.2081 15.0044 15.2047 15.0044C15.2148 15.0044 15.2215 15.0044 15.2315 15.0044C19.3488 15.0044 22.6821 11.6464 22.6821 7.50612C22.6821 3.36587 19.4225 0.085358 15.3756 0.0078125Z"
+        />
+      </g>
+    </svg>
+  );
+}
+
 /** Two leading alphanumerics of a name, for the unknown-model fallback tile. */
 function initialsOf(name: string): string {
   const first = splitWhitespace(name)[0] ?? '';
@@ -195,6 +252,8 @@ export function ModelLogo({ model, className }: { model: string; className?: str
       return <Bird className={className} style={{ color: '#FD8E5B' }} aria-hidden />;
     case 'internscience':
       return <InternScienceLogo className={className} />;
+    case 'hy':
+      return <HyLogo className={className} />;
     default:
       return <Monogram model={model} className={className} />;
   }

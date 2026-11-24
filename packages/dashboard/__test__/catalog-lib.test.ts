@@ -1,42 +1,63 @@
 import { describe, expect, it } from 'vite-plus/test';
 
-import { catalogBuildLabel, hasUpdate, modelBlurb, offeredOnHost } from '../ui/src/lib/catalog.js';
-
-describe('catalogBuildLabel', () => {
-  it('takes the build from the first starred glob', () => {
-    expect(catalogBuildLabel({ hfRepo: 'unsloth/Qwen3.8-27B-GGUF', globs: ['*.json', '*UD-Q4_K_XL*', '*Q8_0*'] })).toBe(
-      'UD-Q4_K_XL',
-    );
-  });
-
-  it('skips globs that name a file type or are not starred on both ends', () => {
-    expect(catalogBuildLabel({ hfRepo: 'org/Model-GGUF', globs: ['*Q4.gguf*', 'Q4*', '**'] })).toBeNull();
-  });
-
-  it('reads an mxfp / nvfp part of the repo name, upper-cased', () => {
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Qwen3.6-35B-A3B-mxfp4' })).toBe('MXFP4');
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/gemma-4-26b-NVFP4-text' })).toBe('NVFP4');
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Model-mxfp8', globs: [] })).toBe('MXFP8');
-  });
-
-  it('is null when nothing names a build', () => {
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/Qwen3.6-35B-A3B-4bit' })).toBeNull();
-    expect(catalogBuildLabel({ hfRepo: 'mlx-node/notmxfp4' })).toBeNull();
-  });
-});
+import { MODEL_CATALOG } from '../../agent/src/catalog.js';
+import {
+  catalogBuildAt,
+  hasUpdate,
+  modelBlurb,
+  modelPresent,
+  offeredOnHost,
+  onboardingBuild,
+  shownBuild,
+} from '../ui/src/lib/catalog.js';
+import type { CatalogBlocker, CatalogBuildItem, CatalogItem } from '../ui/src/lib/types.js';
+import { catalogActionState } from '../ui/src/pages/models/catalog.js';
 
 describe('modelBlurb', () => {
-  it('keeps the three special cases, then the catalog description', () => {
-    expect(modelBlurb({ label: 'AgentWorld-8B', description: 'x' })).toBe(
-      'Tuned for agent workflows, with fast responses.',
-    );
-    expect(modelBlurb({ label: 'Gemma-4-26B-A4B', description: 'x', isDefault: true })).toBe(
-      'Fast responses, with a smaller download to get started.',
-    );
+  it('keeps the default case, then the catalog description', () => {
     expect(modelBlurb({ label: 'Qwen3.6', description: 'x', isDefault: true })).toBe(
       'Our recommended starting point for working with tools.',
     );
     expect(modelBlurb({ label: 'Qwen3.6', description: 'Plain description.' })).toBe('Plain description.');
+  });
+
+  it('gives the catalog entries without a special case their own description', () => {
+    for (const label of ['Inkling-2-Mini', 'Qwen3.8-Flash-Next', 'Hy4-flash']) {
+      const entry = MODEL_CATALOG.find((item) => item.label === label)!;
+      expect(modelBlurb(entry), label).toBe(entry.description);
+    }
+  });
+});
+
+describe('catalogBuildAt', () => {
+  function build(id: string, slug: string): CatalogBuildItem {
+    return {
+      id,
+      hfRepo: 'org/model-GGUF',
+      sizeGb: 1,
+      source: 'GGUF',
+      slug,
+      installed: false,
+      present: false,
+      heldBy: null,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+      localAssetsRepo: null,
+      localAssetsRevision: null,
+      located: null,
+      listed: false,
+    };
+  }
+  const items: CatalogItem[] = [
+    { label: 'A', description: '', builds: [build('UD-Q4_K_XL', 'a-gguf')] },
+    { label: 'B', description: '', builds: [build('UD-Q4_K_XL', 'b-gguf'), build('UD-Q4_K_M', 'b-gguf-ud-q4_k_m')] },
+  ];
+
+  it('finds a later build of an entry by its folder, and nothing for a folder no build installs to', () => {
+    expect(catalogBuildAt(items, 'b-gguf-ud-q4_k_m')?.id).toBe('UD-Q4_K_M');
+    expect(catalogBuildAt(items, 'a-gguf')?.id).toBe('UD-Q4_K_XL');
+    expect(catalogBuildAt(items, 'b')).toBeUndefined();
   });
 });
 
@@ -47,6 +68,8 @@ describe('hasUpdate', () => {
     localRevision: 'aaa',
     localAssetsRepo: null,
     localAssetsRevision: null,
+    located: null,
+    listed: false,
   };
 
   it('compares the primary revision only for a dashboard-owned install', () => {
@@ -83,5 +106,106 @@ describe('offeredOnHost', () => {
     expect(offeredOnHost({ minMemoryGb: 39 }, { totalMemBytes: 39 * GIB - 1, diskFreeBytes: null })).toBe(false);
     expect(offeredOnHost({ minMemoryGb: 39 }, host(39))).toBe(true);
     expect(offeredOnHost({ minMemoryGb: 39 }, host(128))).toBe(true);
+  });
+
+  it('offers Qwen3.8-Flash-Next and Hy4-flash from the 96 GiB a 96 GB Mac reports', () => {
+    for (const label of ['Qwen3.8-Flash-Next', 'Hy4-flash']) {
+      const entry = MODEL_CATALOG.find((item) => item.label === label)!;
+      expect(offeredOnHost(entry, host(64)), label).toBe(false);
+      expect(offeredOnHost(entry, { totalMemBytes: 96 * GIB - 1, diskFreeBytes: null }), label).toBe(false);
+      expect(offeredOnHost(entry, host(96)), label).toBe(true);
+      expect(offeredOnHost(entry, host(128)), label).toBe(true);
+    }
+  });
+});
+
+describe('the build a card or a choice stands for', () => {
+  function build(id: string, slug: string, present = false): CatalogBuildItem {
+    return {
+      id,
+      hfRepo: 'org/model-GGUF',
+      sizeGb: 1,
+      source: 'GGUF',
+      slug,
+      installed: present,
+      present,
+      heldBy: null,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+      localAssetsRepo: null,
+      localAssetsRevision: null,
+      located: null,
+      listed: false,
+    };
+  }
+  const entry = (builds: CatalogBuildItem[]): CatalogItem => ({ label: 'M', description: '', builds });
+  const plain = entry([build('XL', 'm'), build('K_M', 'm-k_m'), build('Original', 'orig')]);
+  const secondOnDisk = entry([build('XL', 'm'), build('K_M', 'm-k_m', true), build('Original', 'orig', true)]);
+
+  it('counts a model when any build is on disk', () => {
+    expect(modelPresent(plain)).toBe(false);
+    expect(modelPresent(secondOnDisk)).toBe(true);
+  });
+
+  it('Onboarding: the build with a job, else the first on disk, else the first', () => {
+    expect(onboardingBuild(secondOnDisk, ['orig']).slug).toBe('orig');
+    // Mutation: skip the on-disk step → `m` → red.
+    expect(onboardingBuild(secondOnDisk, []).slug).toBe('m-k_m');
+    expect(onboardingBuild(plain, ['elsewhere']).slug).toBe('m');
+  });
+
+  it('a card: the chosen build first, then the Onboarding rule', () => {
+    expect(shownBuild(secondOnDisk, { M: 'm' }, { orig: {} }).slug).toBe('m');
+    expect(shownBuild(secondOnDisk, {}, { orig: {} }).slug).toBe('orig');
+    expect(shownBuild(secondOnDisk, {}, {}).slug).toBe('m-k_m');
+    expect(shownBuild(plain, { Other: 'orig' }, {}).slug).toBe('m');
+    // A chosen folder the entry no longer has falls back to the rule.
+    expect(shownBuild(plain, { M: 'gone' }, {}).slug).toBe('m');
+  });
+});
+
+describe('catalogActionState: the card each entry in the way gets', () => {
+  const folder: CatalogBlocker = {
+    kind: 'directory',
+    fileCount: 4,
+    sizeBytes: 7_612_909_326,
+    truncated: false,
+    names: [],
+    listed: true,
+    modelLike: true,
+    holdsModel: true,
+    linkTarget: null,
+    dangling: false,
+    linkToFile: false,
+    locked: false,
+  };
+  const link: CatalogBlocker = { ...folder, kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/M/x' };
+  const absent = { present: false, heldBy: null, located: null };
+  const idle = { job: undefined, updateAvailable: false };
+  const state = (blocker: CatalogBlocker | null, refused = false, heldBy: string | null = null) =>
+    catalogActionState({ ...absent, heldBy, blocker }, { ...idle, refused });
+
+  it.each<[string, CatalogBlocker, string]>([
+    ['a link to a folder of model files', link, 'cleanup'],
+    ['a dead link', { ...link, holdsModel: false, dangling: true }, 'cleanup'],
+    ['a file', { ...folder, kind: 'file', fileCount: 1, holdsModel: false, listed: false }, 'cleanup'],
+    ['an empty folder', { ...folder, fileCount: 0, sizeBytes: 0, holdsModel: false, listed: false }, 'cleanup'],
+    ['a folder of other files', { ...folder, fileCount: 2, holdsModel: false, listed: false }, 'cleanup'],
+    ['a folder too large to list', { ...folder, fileCount: 2000, truncated: true }, 'cleanup'],
+    // Mutation: drop the locked check → the locked folder of model files is an adopt → red.
+    ['a folder the app cannot write', { ...folder, locked: true }, 'locked'],
+    ['a locked folder too large to read', { ...folder, truncated: true, fileCount: 0, locked: true }, 'locked'],
+    ['a folder of model files', folder, 'adopt'],
+  ])('%s', (_name, blocker, expected) => {
+    expect(state(blocker)).toBe(expected);
+  });
+
+  it('turns an adopt into a cleanup while Update refused this folder, and not a held folder', () => {
+    expect(state(folder, true)).toBe('cleanup');
+    expect(state(folder, false)).toBe('adopt');
+    expect(state(null, false, 'UD-Q4_K_M')).toBe('held');
+    expect(state(folder, true, 'UD-Q4_K_M')).toBe('held');
+    expect(state(null)).toBe('install');
   });
 });

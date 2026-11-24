@@ -229,6 +229,22 @@ describe('workAgentEnv', () => {
     expect(env.PATH).toBeUndefined();
     expect(env.EXA_API_KEY).toBe('k');
   });
+
+  it('pins the address the firecrawl CLI sends the key to', () => {
+    const inherited = { ...base, FIRECRAWL_API_URL: 'https://elsewhere.example' };
+    for (const from of [inherited, base]) {
+      const env = workAgentEnv({
+        base: from,
+        endpoint,
+        agentHome: null,
+        providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
+      });
+      expect([env.FIRECRAWL_API_KEY, env.FIRECRAWL_API_URL]).toEqual(['fc-key', 'https://api.firecrawl.dev']);
+    }
+    const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {} });
+    expect(none.FIRECRAWL_API_URL).toBe('https://elsewhere.example');
+    expect(none).not.toHaveProperty('FIRECRAWL_API_KEY');
+  });
 });
 
 describe('session contract', () => {
@@ -376,6 +392,36 @@ describe('session contract', () => {
     expect(params).toEqual({ sessionId: 'sid', prompt: [{ type: 'text', text: 'hello' }] });
     const block = (params.prompt as Array<Record<string, unknown>>)[0]!;
     expect(Object.keys(block).sort()).toEqual(['text', 'type']);
+  });
+
+  it('attachments follow the text block: every file as a resource, then every picture, none with _meta, no picture with a uri', () => {
+    const png = 'iVBORw0KGgoAAAANSUhEUg==';
+    expect(promptParams('sid', 'hello', [])).toEqual(promptParams('sid', 'hello'));
+    const params = promptParams('sid', 'hello', [
+      { kind: 'image', mediaType: 'image/png', data: png },
+      { kind: 'file', name: 'a#b.ts', text: 'const a = 1;\n' },
+      { kind: 'image', mediaType: 'image/jpeg', data: '/9j/4A==' },
+      { kind: 'file', name: 'notes.md', text: '# notes' },
+    ]);
+    expect(params).toEqual({
+      sessionId: 'sid',
+      prompt: [
+        { type: 'text', text: 'hello' },
+        {
+          type: 'resource',
+          resource: { uri: 'file:///attached/a_b.ts', mimeType: 'text/plain', text: 'const a = 1;\n' },
+        },
+        { type: 'resource', resource: { uri: 'file:///attached/notes.md', mimeType: 'text/plain', text: '# notes' } },
+        { type: 'image', data: png, mimeType: 'image/png' },
+        { type: 'image', data: '/9j/4A==', mimeType: 'image/jpeg' },
+      ],
+    });
+    for (const block of params.prompt as Array<Record<string, unknown>>) {
+      expect(block).not.toHaveProperty('_meta');
+      if (block.type === 'image') expect(Object.keys(block).sort()).toEqual(['data', 'mimeType', 'type']);
+      if (block.type === 'resource')
+        expect(Object.keys(block.resource as object).sort()).toEqual(['mimeType', 'text', 'uri']);
+    }
   });
 
   it('the Chat prompt is the head, a blank line and the skill body without frontmatter', () => {

@@ -6,6 +6,7 @@ import { act, createElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { ToolChip } from '../ui/src/components/arc-x/tool-chip/tool-chip.js';
+import { cssRules, cssValue } from './helpers/css-rules.js';
 import { mount, unmountAll } from './helpers/mount.js';
 import { byRole } from './render.js';
 
@@ -44,6 +45,23 @@ describe('ToolChip', () => {
     const chip = byRole(container, 'button', 'Web Search')!;
     expect(chip.querySelector('[data-chip-label]')).toBeNull();
     expect(chip.hasAttribute('data-compact')).toBe(true);
+  });
+
+  it('compact with a dot: the dot is a corner mark, so the icon and the row never move', () => {
+    const container = mount(
+      createElement(ToolChip, {
+        icon,
+        label: 'Tools',
+        compact: true,
+        dot: 'danger',
+        'aria-label': 'Tools, key rejected',
+      }),
+    );
+    const chip = byRole(container, 'button', 'Tools, key rejected')!;
+    expect(chip.querySelector('[data-tone="danger"]')).not.toBeNull();
+    const rules = cssRules('components/arc-x/tool-chip/tool-chip.module.css');
+    expect(cssValue(rules, '.root[data-compact] > .dot', 'position')).toBe('absolute');
+    expect(cssValue(rules, '.root[data-compact]', 'position')).toBe('relative');
   });
 
   it('give: a tier only on a label longer than 8 characters, so a short chip never gets a floor wider than its text', () => {

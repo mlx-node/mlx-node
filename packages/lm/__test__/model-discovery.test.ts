@@ -1,10 +1,11 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
-import { discoverLocalChatModels, ggufSplitPart } from '../src/model-discovery.js';
+import { MODEL_FAMILY_DATA } from '../src/family-data.js';
+import { bareGgufFamily, discoverLocalChatModels, ggufSplitPart } from '../src/model-discovery.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mlx-discovery-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -902,5 +903,143 @@ describe('discoverLocalChatModels', () => {
         format: 'mlx',
       }),
     ]);
+  });
+});
+
+describe('discoverLocalChatModels — a folder that Locate made', () => {
+  const WEIGHT = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+  const CONFIG = JSON.stringify({ model_type: 'qwen3_5', text_config: { max_position_embeddings: 262144 } });
+
+  /** A user's folder `<tmp>/<name>` with the weight and, when asked, its projector. */
+  function userFolder(name: string, mmproj: boolean): string {
+    const dir = join(tmp, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, WEIGHT), minimalGguf('qwen35'));
+    if (mmproj) writeFileSync(join(dir, 'mmproj-BF16.gguf'), minimalGguf('clip'));
+    return dir;
+  }
+
+  /** A models dir with the app's folder `qwen3.8-27b-gguf`: its own config.json, and `add` for the weights. */
+  function appFolder(name: string, add: (app: string) => void): string {
+    const models = join(tmp, name);
+    const app = join(models, 'qwen3.8-27b-gguf');
+    mkdirSync(app, { recursive: true });
+    writeFileSync(join(app, 'config.json'), CONFIG);
+    add(app);
+    return models;
+  }
+
+  // Mutation: drop the dead-link skip → red (the folder lists as an MLX model through its config.json).
+  it('lists nothing for a folder whose weight links are dead, at the root or in a variant folder', async () => {
+    const root = appFolder('located-dead-root', (app) => {
+      symlinkSync(join(tmp, 'disk-away', WEIGHT), join(app, WEIGHT));
+    });
+    const variant = appFolder('located-dead-variant', (app) => {
+      mkdirSync(join(app, 'UD-Q4_K_XL'));
+      symlinkSync(join(tmp, 'disk-away', WEIGHT), join(app, 'UD-Q4_K_XL', WEIGHT));
+    });
+    for (const dir of [root, variant]) {
+      const failures: string[] = [];
+      expect(await discoverLocalChatModels(dir, { onEntryFailure: (_e, path) => failures.push(path) })).toEqual([]);
+      expect(failures).toEqual([]);
+    }
+  });
+
+  it('lists the live GGUF of a folder that also holds a dead link', async () => {
+    const user = userFolder('located-live-user', false);
+    const models = appFolder('located-live-and-dead', (app) => {
+      linkSync(join(user, WEIGHT), join(app, WEIGHT));
+      symlinkSync(join(tmp, 'disk-away', 'mmproj-BF16.gguf'), join(app, 'mmproj-BF16.gguf'));
+    });
+    expect(await discoverLocalChatModels(models)).toEqual([
+      expect.objectContaining({ name: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', supportsImages: false }),
+    ]);
+  });
+
+  it('lists nothing for a split set or a safetensors checkpoint with one part whose link is dead', async () => {
+    const user = join(tmp, 'located-part-user');
+    mkdirSync(user, { recursive: true });
+    const parts = [1, 2].map((i) => `Flash-UD-Q4_K_XL-0000${i}-of-00002.gguf`);
+    writeFileSync(join(user, parts[0]!), minimalGguf('qwen4exp'));
+    writeFileSync(join(user, 'model-00001-of-00002.safetensors'), 'w');
+    const splitRoot = appFolder('located-part-gguf', (app) => {
+      symlinkSync(join(user, parts[0]!), join(app, parts[0]!));
+      symlinkSync(join(tmp, 'disk-away', parts[1]!), join(app, parts[1]!));
+    });
+    const splitVariant = appFolder('located-part-variant', (app) => {
+      mkdirSync(join(app, 'UD-Q4_K_XL'));
+      symlinkSync(join(user, parts[0]!), join(app, 'UD-Q4_K_XL', parts[0]!));
+      symlinkSync(join(tmp, 'disk-away', parts[1]!), join(app, 'UD-Q4_K_XL', parts[1]!));
+    });
+    const safetensors = appFolder('located-part-safetensors', (app) => {
+      symlinkSync(join(user, 'model-00001-of-00002.safetensors'), join(app, 'model-00001-of-00002.safetensors'));
+      symlinkSync(
+        join(tmp, 'disk-away', 'model-00002-of-00002.safetensors'),
+        join(app, 'model-00002-of-00002.safetensors'),
+      );
+    });
+    const listed = await Promise.all(
+      [splitRoot, splitVariant, safetensors].map(async (dir) => (await discoverLocalChatModels(dir)).length),
+    );
+    expect(listed).toEqual([0, 0, 0]);
+  });
+
+  it('lists a shared folder (second names) by its file id, with images from the app folder', async () => {
+    const user = userFolder('located-shared-user', true);
+    const models = appFolder('located-shared', (app) => {
+      linkSync(join(user, WEIGHT), join(app, WEIGHT));
+      linkSync(join(user, 'mmproj-BF16.gguf'), join(app, 'mmproj-BF16.gguf'));
+    });
+    expect(await discoverLocalChatModels(models)).toEqual([
+      expect.objectContaining({
+        name: 'Qwen3.8-27B-UD-Q4_K_XL',
+        path: join(models, 'qwen3.8-27b-gguf', WEIGHT),
+        modelType: 'qwen3_5',
+        format: 'gguf',
+        supportsImages: true,
+      }),
+    ]);
+  });
+
+  it('lists a linked folder by its file id, with images only when the projector is beside the real weight', async () => {
+    for (const mmproj of [true, false]) {
+      const user = userFolder(`located-linked-user-${mmproj}`, mmproj);
+      const models = appFolder(`located-linked-${mmproj}`, (app) => {
+        symlinkSync(join(user, WEIGHT), join(app, WEIGHT));
+      });
+      expect(await discoverLocalChatModels(models)).toEqual([
+        expect.objectContaining({
+          name: 'Qwen3.8-27B-UD-Q4_K_XL',
+          path: join(models, 'qwen3.8-27b-gguf', WEIGHT),
+          modelType: 'qwen3_5',
+          supportsImages: mmproj,
+        }),
+      ]);
+    }
+  });
+});
+
+describe('bareGgufFamily — a GGUF with no config.json beside it', () => {
+  const ARCHITECTURES = MODEL_FAMILY_DATA.flatMap((row) =>
+    'ggufArchitectures' in row ? row.ggufArchitectures.map((architecture) => [row.id, architecture] as const) : [],
+  );
+  const NAMES = ['Model-Q4_K_M.gguf', 'Model-UD-Q4_K_XL.gguf', 'Model-UD-Q4_K_XL-00001-of-00002.gguf'];
+
+  it.each(ARCHITECTURES.flatMap(([family, architecture]) => NAMES.map((name) => [family, architecture, name])))(
+    'agrees with discovery for %s (%s) named %s',
+    async (_family, architecture, name) => {
+      const dir = modelsDir(`bare-${architecture}-${name}`, { [`repo/${name}`]: minimalGguf(architecture) });
+      const listed = await discoverLocalChatModels(dir, { includeDecisions: true });
+      const family = bareGgufFamily(name, architecture);
+      expect(listed.map((model) => model.modelType)).toEqual(family === undefined ? [] : [family]);
+    },
+  );
+
+  it('names the family of Hy4-flash and Qwen3.8-Flash-Next, and none for an asset-requiring family', () => {
+    expect(bareGgufFamily('Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'hy_v4_flash')).toBe('hy_v4_flash');
+    expect(bareGgufFamily('Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf', 'qwen4exp')).toBe('qwen4_exp');
+    expect(bareGgufFamily('gemma-4-UD-Q4_K_XL.gguf', 'gemma4')).toBeUndefined();
+    expect(bareGgufFamily('Model-Q4_K_M.gguf', 'llama')).toBeUndefined();
+    expect(bareGgufFamily('Hy4-flash-Q4_K_M-00002-of-00002.gguf', 'hy_v4_flash')).toBeUndefined();
   });
 });

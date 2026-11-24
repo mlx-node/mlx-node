@@ -50,9 +50,14 @@
   font-size: var(--text-sm);
 }
 
+/* One box for the chevron and for the loader, so the picker keeps its width when a run starts. */
 .chevron {
   display: inline-flex;
   flex: none;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
   color: var(--text-secondary);
 }
 

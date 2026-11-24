@@ -571,7 +571,7 @@ export const MODEL_TABLE: readonly ModelRow[] = [
     expected: { id: 'heron-6b-unsloth-nvfp4-mlx', base: 'heron-6b', variant: 'NVFP4 Unsloth', format: 'mlx' },
   },
   {
-    covers: 'foreign quantization_config the rule does not read: the name tag',
+    covers: 'modelopt quantization_config: its algorithm, as the name tag says',
     path: 'ivory-20b-nvfp4',
     modelType: 'deepseek_v41',
     config: { torch_dtype: 'bfloat16', quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' } },

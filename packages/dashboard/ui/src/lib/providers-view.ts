@@ -2,7 +2,13 @@
 
 import { formatCount, formatDay, formatRelativeTime } from './format';
 import { PROVIDERS } from './providers-strings';
-import type { ProviderId, ProviderState, ProvidersResponse, SearchProviderId } from './providers-types';
+import type {
+  ProviderId,
+  ProviderSelectionInput,
+  ProviderState,
+  ProvidersResponse,
+  SearchProviderId,
+} from './providers-types';
 
 export const SEARCH_IDS: readonly SearchProviderId[] = ['exa', 'deepseek', 'brave'];
 export const PROVIDER_ORDER: readonly ProviderId[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
@@ -183,6 +189,27 @@ export function skillSource(p: ProviderState): string {
 export function keyReachesWork(p: ProviderState): boolean {
   if (p.id === 'firecrawl') return p.configured && p.selected && p.work.ready;
   return p.configured && p.selected;
+}
+
+/** The option of the Crawler list in use. */
+export type CrawlerValue = 'firecrawl' | 'off';
+
+/** The selection body of each Crawler option, the same from the Web Search page and the `+` menu. */
+export const CRAWLER_BODIES: Readonly<Record<CrawlerValue, ProviderSelectionInput>> = {
+  firecrawl: { firecrawl: true },
+  off: { firecrawl: false },
+};
+
+/** From a `/providers` body or the host summary: both carry `firecrawl`. */
+export function crawlerValue(data: Pick<ProvidersResponse, 'firecrawl'>): CrawlerValue {
+  return data.firecrawl ? 'firecrawl' : 'off';
+}
+
+/** Who reads pages for Chat when the crawler is off: the search provider, Brave's excerpts, or nobody. */
+export function crawlerOffNote(search: SearchProviderId | null): string {
+  if (search === null) return PROVIDERS.crawlerOffNone;
+  if (search === 'brave') return PROVIDERS.crawlerOffExcerpts;
+  return fill(PROVIDERS.crawlerOffReads, { provider: providerName(search) });
 }
 
 export interface Progress {

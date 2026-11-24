@@ -33,12 +33,15 @@ import {
 } from './handlers/chat.js';
 import { handleCodingAgents, handleCodingAgentAction } from './handlers/coding-agents.js';
 import {
+  handleDownloadAdoptPlan,
+  handleDownloadLocatePlan,
   handleDownloadCancel,
   handleDownloadEventsUnsupported,
   handleDownloadStart,
   handleDownloadsList,
 } from './handlers/downloads.js';
 import { handleHealth } from './handlers/health.js';
+import { handleHost } from './handlers/host.js';
 import { handleIngest } from './handlers/ingest.js';
 import {
   handleMetricsDistributions,
@@ -150,11 +153,16 @@ export const ROUTES: Route[] = [
   workerRoute('DELETE', '/api/models/:name', handleDeleteModel),
   workerRoute('GET', '/api/catalog', handleCatalog),
   mainRoute('GET', '/api/catalog/updates', handleCatalogUpdates),
+  // Answers on the transport thread so the cards never wait for the worker.
+  mainRoute('GET', '/api/host', handleHost),
   // The download routes stay on the transport thread: network I/O and progress
   // events must never queue behind a synchronous query, and a cancel click has to
   // be RECEIVED while one is running.
   mainRoute('GET', '/api/downloads', handleDownloadsList),
   mainRoute('POST', '/api/downloads', handleDownloadStart, { successStatus: 202 }),
+  mainRoute('POST', '/api/downloads/adopt-plan', handleDownloadAdoptPlan),
+  // On the transport thread so the plan agrees with the job queue; it reads the picked folder with async fs only.
+  mainRoute('POST', '/api/downloads/locate-plan', handleDownloadLocatePlan),
   mainRoute('DELETE', '/api/downloads/:id', handleDownloadCancel),
   mainRoute('GET', '/api/downloads/:id/events', handleDownloadEventsUnsupported, { stream: true }),
   workerRoute('GET', '/api/metrics/models', handleMetricsModels),

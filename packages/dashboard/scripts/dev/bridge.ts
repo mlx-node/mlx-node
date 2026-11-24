@@ -15,12 +15,14 @@ import.meta.hot?.on('mlx:dev-rpc-reply', (data: { channel?: unknown; message?: u
 import.meta.hot?.send('mlx:dev-open', { channel });
 addEventListener('pagehide', () => import.meta.hot?.send('mlx:dev-close', { channel }));
 
-// The desktop preload's folder dialog: the harness answers with its throwaway Work folder.
+// The desktop preload's folder dialog: the harness answers with its throwaway folder for the purpose.
 addEventListener('message', (event: MessageEvent) => {
   if (event.source !== window) return;
-  const data = event.data as { type?: unknown; requestId?: unknown } | null;
+  const data = event.data as { type?: unknown; requestId?: unknown; purpose?: unknown } | null;
   if (typeof data !== 'object' || data === null || data.type !== 'mlx:pick-folder') return;
-  if (typeof data.requestId === 'string') import.meta.hot?.send('mlx:dev-pick-folder', { requestId: data.requestId });
+  if (typeof data.requestId === 'string') {
+    import.meta.hot?.send('mlx:dev-pick-folder', { requestId: data.requestId, purpose: data.purpose });
+  }
 });
 import.meta.hot?.on('mlx:dev-folder', (data: { requestId?: unknown; path?: unknown }) => {
   if (typeof data.requestId !== 'string') return;

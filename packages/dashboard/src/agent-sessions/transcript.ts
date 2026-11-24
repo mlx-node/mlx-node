@@ -8,6 +8,7 @@
  */
 
 import { readCompaction } from '../chat/acp/messages.js';
+import { base64Bytes, nameOfUri, utf8Bytes, type UserAttachment } from '../chat/attachment-rule.js';
 import { CONTINUE_PROMPT, type TranscriptOp } from '../chat/types.js';
 import { mcpOutputText } from './mcp-output.js';
 import type { TranscriptEntry, TurnMetric, WakeCause } from './types.js';
@@ -251,6 +252,23 @@ function contentBlockText(block: unknown): string {
     default:
       return '';
   }
+}
+
+/**
+ * A prompt block of the user that is a file or a picture, as its view: the name from the resource uri and the sizes
+ * of the stored text or base64. Null for any other block, and for a resource with neither text nor blob.
+ */
+function userAttachment(block: unknown): UserAttachment | null {
+  if (!isRecord(block)) return null;
+  if (block.type === 'image') {
+    return { kind: 'image', mediaType: str(block.mimeType) ?? 'image', bytes: base64Bytes(str(block.data) ?? '') };
+  }
+  if (block.type !== 'resource' || !isRecord(block.resource)) return null;
+  const name = nameOfUri(str(block.resource.uri) ?? '');
+  const text = str(block.resource.text);
+  if (text !== null) return { kind: 'file', name, bytes: utf8Bytes(text) };
+  const blob = str(block.resource.blob);
+  return blob === null ? null : { kind: 'file', name, bytes: base64Bytes(blob) };
 }
 
 /** ACP `ToolCallContent[]` → display text. */
@@ -498,16 +516,24 @@ export class TranscriptReducer {
     );
   }
 
-  /** The user's prompt: the agent does not echo it live, so the host pushes it when the prompt is accepted. */
-  userPrompt(text: string, ts: number = this.now()): TranscriptOp[] {
-    return this.collect(() =>
+  /**
+   * The user's prompt: the agent does not echo it live, so the host pushes it when the prompt is accepted, with the
+   * views of its attachments as the reader makes them from the stored blocks.
+   */
+  userPrompt(text: string, attachments: UserAttachment[] = [], ts: number = this.now()): TranscriptOp[] {
+    return this.collect(() => {
+      const at = this.transcript.length;
       this.step({
         xai: false,
         update: { sessionUpdate: 'user_message_chunk', content: { type: 'text', text } },
         ts,
         contextUsed: null,
-      }),
-    );
+      });
+      const entry = this.transcript[at];
+      if (attachments.length === 0 || entry?.kind !== 'user') return;
+      entry.attachments = [...attachments];
+      this.changed(entry);
+    });
   }
 
   /** A model switch the user made between turns. */
@@ -718,7 +744,8 @@ export class TranscriptReducer {
             if (this.turnPrompt === null) this.turnPrompt = { entry, atWake: new Map() };
             break;
           }
-          if (body === '') break;
+          const attachment = userAttachment(content);
+          if (attachment === null && body === '') break;
           const interjection = meta.interjection === true;
           const prev = this.last();
           if (
@@ -728,16 +755,18 @@ export class TranscriptReducer {
             promptIndex !== null &&
             prev.promptIndex === promptIndex
           ) {
-            prev.text += `\n${body}`;
+            if (attachment !== null) prev.attachments = [...(prev.attachments ?? []), attachment];
+            else prev.text = prev.text === '' ? body : `${prev.text}\n${body}`;
             this.changed(prev);
           } else {
             const entry: TranscriptEntry = {
               kind: 'user',
               ts,
-              text: body,
+              text: attachment === null ? body : '',
               promptIndex,
               ...(interjection ? { interjection: true } : {}),
               ...(!interjection && body === CONTINUE_PROMPT && isLengthEnd(prev) ? { continued: true as const } : {}),
+              ...(attachment === null ? {} : { attachments: [attachment] }),
             };
             this.add(entry);
             if (this.turnPrompt === null && !interjection) this.turnPrompt = { entry, atWake: null };

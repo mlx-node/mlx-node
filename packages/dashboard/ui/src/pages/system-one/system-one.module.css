@@ -6,34 +6,21 @@
   gap: var(--space-2);
 }
 
-.historyBtnWrap {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-}
-
 .historyCount {
-  position: absolute;
-  top: -3px;
-  right: -3px;
-  min-width: 15px;
-  height: 15px;
-  padding: 0 3px;
-  border-radius: var(--radius-pill);
-  border: 1px solid var(--border);
-  background: var(--surface);
   color: var(--text-secondary);
-  font-size: 10px;
-  font-weight: 500;
-  line-height: 13px;
-  text-align: center;
+  font-size: var(--text-xs);
   font-variant-numeric: tabular-nums;
-  pointer-events: none;
 }
 
-.runTipWrap {
+/* Run and Cancel fill one slot of one width, so the header controls do not move when a run starts or ends. */
+.runSlot {
   display: inline-flex;
   align-items: center;
+  min-width: 5.5rem;
+}
+
+.runSlot > button {
+  flex: 1 1 auto;
 }
 
 .popoverList {
@@ -146,15 +133,90 @@
   min-width: 0;
 }
 
-.runningStrip {
-  display: flex;
+/* Output status line. Its faces share one grid cell, so the box has the height of the tallest face. */
+.runLine {
+  display: grid;
   align-items: center;
-  justify-content: space-between;
-  gap: var(--space-3);
+  box-sizing: border-box;
+  min-height: 44px;
   margin-bottom: var(--space-3);
   padding: 10px 14px;
   border-radius: var(--radius-control);
   background: var(--surface-muted);
+}
+
+.runLine > * {
+  grid-area: 1 / 1;
+  min-width: 0;
+}
+
+/* A run shorter than the hold changes nothing here. */
+.runLineWait {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  animation: run-line-arrive var(--duration-fast) var(--ease-enter) var(--duration-hold) both;
+}
+
+.runLine > [data-leaving] {
+  pointer-events: none;
+  animation: run-line-leave var(--duration-fast) var(--ease-standard) var(--duration-hold) both;
+}
+
+@keyframes run-line-arrive {
+  from {
+    opacity: 0;
+  }
+}
+
+@keyframes run-line-leave {
+  to {
+    opacity: 0;
+  }
+}
+
+.runLineRest {
+  margin: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.runLineFailed {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.runLineFailed > svg {
+  flex: none;
+  margin-top: 2px;
+  color: var(--danger);
+}
+
+.runLineFailed > p {
+  display: -webkit-box;
+  margin: 0;
+  overflow: hidden;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
+.runLineFailed strong {
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.answerNoValue {
+  color: var(--text-muted);
 }
 
 /* Left pane: Source + Options + inset hairline + Fields */
@@ -275,11 +337,21 @@
   min-width: 0;
 }
 
+/* The title shares a row with the actions; the hint takes the full width below, so it does not wrap beside them. */
 .sectionHeader {
-  display: flex;
-  align-items: flex-start;
-  justify-content: space-between;
-  gap: var(--space-2);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 2px var(--space-2);
+}
+
+.sectionHeader > .sectionHeadingGroup {
+  display: contents;
+}
+
+.sectionHeader .sectionHint {
+  grid-row: 2;
+  grid-column: 1 / -1;
 }
 
 .sectionHeaderActions {
@@ -726,6 +798,12 @@
   display: flex;
   flex-direction: column;
   min-width: 0;
+  transition: opacity var(--duration-standard) var(--ease-standard);
+}
+
+/* Answers of the run before, while the next run is in flight. */
+.answerList[data-held] {
+  opacity: 0.5;
 }
 
 .answerRow {
@@ -945,11 +1023,21 @@
   flex: 1;
 }
 
+/* One line: a long model name is cut, and the badges keep their place beside it. */
 .historyHead {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
   gap: var(--space-1-5);
+  min-width: 0;
+}
+
+.historyHead > :first-child {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.historyHead > :not(:first-child) {
+  flex: none;
 }
 
 .historyMeta {
@@ -1632,6 +1720,16 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .runLineWait,
+  .runLine > [data-leaving] {
+    animation: none;
+  }
+
+  .runLine > [data-leaving] {
+    visibility: hidden;
+  }
+
+  .answerList,
   .rowChevron,
   .rowTrigger,
   .rowHoverAction,

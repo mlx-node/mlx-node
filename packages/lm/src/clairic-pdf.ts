@@ -66,6 +66,93 @@ function loadCanvasModule(): CanvasModule {
   }
 }
 
+type PdfjsModule = typeof import('pdfjs-dist/legacy/build/pdf.mjs');
+
+let cachedPdfjsModule: PdfjsModule | undefined;
+
+function isElectronNonBrowserProcess(): boolean {
+  const processType: unknown = Reflect.get(process, 'type');
+  return Boolean(process.versions.electron) && Boolean(processType) && processType !== 'browser';
+}
+
+/**
+ * Make `target[key]` read as `undefined` and return the function that puts the
+ * original back, or `undefined` when the property cannot be hidden.
+ */
+function hideProperty(target: object, key: string): (() => void) | undefined {
+  const saved = Object.getOwnPropertyDescriptor(target, key);
+  let restore: () => void;
+  if (saved === undefined) {
+    if (!Object.isExtensible(target)) {
+      return undefined;
+    }
+    Object.defineProperty(target, key, { value: undefined, writable: true, configurable: true, enumerable: false });
+    restore = () => {
+      Reflect.deleteProperty(target, key);
+    };
+  } else if (saved.configurable === true) {
+    Object.defineProperty(target, key, {
+      value: undefined,
+      writable: true,
+      configurable: true,
+      enumerable: saved.enumerable,
+    });
+    restore = () => {
+      Object.defineProperty(target, key, saved);
+    };
+  } else if (saved.writable === true) {
+    Reflect.set(target, key, undefined);
+    restore = () => {
+      Reflect.set(target, key, saved.value);
+    };
+  } else {
+    return undefined;
+  }
+  if (Reflect.get(target, key) !== undefined) {
+    restore();
+    return undefined;
+  }
+  return restore;
+}
+
+/**
+ * Load `pdfjs-dist` so that it configures itself for Node.
+ *
+ * pdfjs decides "is this Node?" once, at module evaluation, and answers no in
+ * any Electron process whose `process.type` is not `'browser'` (the desktop
+ * app's utility process included). It then takes DOM defaults and
+ * `getDocument` throws `document is not defined`. In such a process the
+ * Electron marker is hidden while both pdfjs modules evaluate: the main module
+ * and the worker module, which has its own copy of the check and is what the
+ * in-process fake worker runs (it publishes `globalThis.pdfjsWorker`, which
+ * pdfjs uses instead of importing the worker again). The load is a synchronous
+ * `require` of ESM so no other code can run while the marker is hidden. This
+ * file must stay the only place that imports pdfjs: a module evaluated
+ * elsewhere would cache the DOM configuration for the whole process.
+ */
+async function loadPdfjsModule(): Promise<PdfjsModule> {
+  if (cachedPdfjsModule !== undefined) {
+    return cachedPdfjsModule;
+  }
+  if (!isElectronNonBrowserProcess()) {
+    cachedPdfjsModule = await import('pdfjs-dist/legacy/build/pdf.mjs');
+    return cachedPdfjsModule;
+  }
+  const require = createRequire(import.meta.url);
+  const restore = hideProperty(process, 'type') ?? hideProperty(process.versions, 'electron');
+  if (restore === undefined) {
+    throw new Error('PDF rendering is unavailable in this Electron process');
+  }
+  try {
+    const pdfjs = require('pdfjs-dist/legacy/build/pdf.mjs') as PdfjsModule;
+    require('pdfjs-dist/legacy/build/pdf.worker.mjs');
+    cachedPdfjsModule = pdfjs;
+    return cachedPdfjsModule;
+  } finally {
+    restore();
+  }
+}
+
 function toTrailingSlashPath(dir: string): string {
   const normalized = dir.replaceAll('\\', '/');
   return normalized.endsWith('/') ? normalized : `${normalized}/`;
@@ -254,7 +341,7 @@ export async function renderClairicDocuments(
   // so priming the module cache with `NAPI_RS_NATIVE_LIBRARY_PATH` hidden ensures
   // both pdfjs and our renderer get Skia rather than `@mlx-node/core`.
   const { createCanvas } = loadCanvasModule();
-  const pdfjs = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const pdfjs = await loadPdfjsModule();
 
   signal?.throwIfAborted();
   const assetUrls = resolvePdfjsAssetUrls();

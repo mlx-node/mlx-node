@@ -57,9 +57,11 @@ export const PROVIDERS = {
   selectedStatus: '{provider} selected. {n} skills installed.',
   selectedStatusOne: '{provider} selected. 1 skill installed.',
   offStatus: 'Web search is off.',
-  firecrawlSwitch: 'Read pages with Firecrawl',
+  crawler: 'Crawler',
+  crawlerOffReads: '{provider} reads pages for Chat.',
+  crawlerOffExcerpts: 'Brave gives Chat page excerpts only.',
+  crawlerOffNone: 'Chat cannot read pages.',
   firecrawlNoKey: 'Add a Firecrawl key below.',
-  firecrawlOff: 'Off. Chat reads pages through the search provider. Work has no Firecrawl skills.',
   firecrawlOn: 'Chat reads pages through Firecrawl. Work gets {n} Firecrawl skills.',
 
   leavesTitle: 'What leaves this Mac',

@@ -44,8 +44,10 @@ const ADDON_FREE_SUBPATHS = [
   '@mlx-node/lm/family-data',
   '@mlx-node/lm/cold-tier',
   '@mlx-node/lm/draft-companion',
+  '@mlx-node/lm/gguf-metadata',
   '@mlx-node/lm/model-detection',
   '@mlx-node/lm/model-discovery',
+  '@mlx-node/lm/model-variant',
   '@mlx-node/rerank/catalog',
   '@mlx-node/rerank/families',
   '@mlx-node/rerank/protocol',
@@ -220,6 +222,7 @@ describe('CONTROL PANEL never links the native addon', () => {
     expect(graph.files).toContain('packages/lm/src/model-discovery.ts');
     expect(graph.files).toContain('packages/lm/src/model-detection.ts');
     expect(graph.files).toContain('packages/lm/src/gguf-metadata.ts');
+    expect(graph.files).toContain('packages/lm/src/model-variant.ts');
   });
 
   it('rejects unknown exports instead of silently truncating the workspace graph', () => {

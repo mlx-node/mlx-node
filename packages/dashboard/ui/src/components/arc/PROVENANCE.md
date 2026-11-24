@@ -47,7 +47,8 @@ relative, as shipped. Formatting and linting skip this folder so every file stay
 Every `.ts` / `.tsx` file that shipped with a first line `"use client";` has that line removed (the bundler warns on
 module-level directives): `lib/arc-provider.tsx`, `lib/use-copy-feedback.ts`, and the `.tsx` file of every item above
 except `arc-foundation` and `arc-motion-tokens`. No other file changed except the regex replacements below
-(this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`).
+(this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`) and the one
+`drawer/drawer.tsx` fix in the last rows of the table.
 
 | File | Line (here) | Upstream | Here |
 |---|---|---|---|
@@ -61,5 +62,12 @@ except `arc-foundation` and `arc-motion-tokens`. No other file changed except th
 | `command-palette/command-palette.tsx` | 32 | `/[\p{L}\p{N}]/u.test(text.charAt(start - 1))` | `isWordChar(text.charAt(start - 1))` |
 | `command-palette/command-palette.tsx` | 59 | `query.trim().toLowerCase().split(/\s+/).filter(Boolean)` | `splitWhitespace(query.trim().toLowerCase())` |
 | `command-palette/command-palette.tsx` | 91 | `shortcut.split(/\s+\|\+(?=.)/).filter(Boolean)` | `splitShortcut(shortcut)` |
+| `drawer/drawer.tsx` | 97 | — | the comment line above the `offset` value |
+| `drawer/drawer.tsx` | 98 | `const offset = useMotionValue<number \| string>(0);` (four lines higher, above `pan`) | ``const offset = useMotionValue<number \| string>(reduced ? 0 : `${sign * 100}%`);`` |
+
+The drawer fix: the panel's motion value started at 0 while the entrance starts at `100%`. Motion writes that first
+frame into the value when the panel mounts, the jump read as a velocity of 100 % in 30 ms, and the entrance spring
+inherited it, so the first open of each drawer went about 30 % of the panel width past its resting edge (143 px on a
+480 px panel) and came back. Later opens were right because the exit leaves the value at `100%`.
 
 All files compile under `ui/tsconfig.json` as shipped; no type fix was needed.

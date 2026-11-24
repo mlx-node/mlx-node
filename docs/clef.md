@@ -93,6 +93,18 @@ per `K` (bit-identical across processes) and shared by every projection of
 one width. Projections with `K % 1024 != 0` requantize without rotation; the
 loader summary logs both counts.
 
+### In the app's catalog
+
+The Models page and System One offer CLEF Flash (9B) and CLEF (27B) from the
+ggml-org GGUFs (`Clef-Flash-GGUF`, `Clef-GGUF`), one GGUF file per build and no
+other file: no `config.json`, no tokenizer, no mmproj. Q8_0 is the first build
+because it is the build inside the 0.01 gate in the table above. Q4_K_M is
+offered too, as a smaller download. The Q4_K_M number above (0.08, outside the
+gate) is for the 9B, CLEF Flash; there is no Q4_K_M measurement of the 27B, and
+the current uploads have not been measured. The app install path is
+covered by tests with small fixture files only; no install of the real weights
+through the app was run. See [dashboard.md](dashboard.md) for the install rules.
+
 ## TypeScript
 
 ```ts

@@ -2,8 +2,8 @@
  * Curated model catalog for `mlx agent`.
  *
  * The first-run download wizard offers `visibleCatalog()` and feeds the chosen
- * entry's `catalogRepo()` to `mlx download model`. Slugs are verified against
- * Hugging Face — use them verbatim.
+ * build's `catalogBuildRepo()` to `mlx download model`. Slugs are verified
+ * against Hugging Face — use them verbatim.
  */
 
 import { totalmem } from 'node:os';
@@ -12,20 +12,22 @@ import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 const GIB = 2 ** 30;
 
-export interface CatalogEntry {
-  /** Wizard display name. */
-  label: string;
-  /** HF slug for `mlx download model` — the GGUF build, every platform. */
+/** One downloadable build of a catalog model: a repository, the files it takes, and the folder it installs to. */
+export interface CatalogBuild {
+  /**
+   * The build's name on every surface (`UD-Q4_K_XL`, `Original`), and the quant tag discovery reads from its weight
+   * file name. Unique in its entry.
+   */
+  id: string;
+  /** HF slug for `mlx download model`, every platform. */
   hfRepo: string;
   /**
    * HF slug on Linux + NVIDIA CUDA, when a platform-specific build exists.
    *
    * Absent means {@link hfRepo} serves both — the case for every current
-   * entry: all platforms install the Unsloth UD quant from one GGUF repo.
-   * Retained for future platform-specific builds; {@link globs} and
-   * {@link assetsRepo} describe {@link hfRepo} only and never apply to an
-   * override repo. Resolve with {@link catalogRepo}, never by reading the
-   * field.
+   * build. {@link globs} and {@link assetsRepo} describe {@link hfRepo} only
+   * and never apply to an override repo. Resolve with
+   * {@link catalogBuildRepo}, never by reading the field.
    */
   hfRepoCuda?: string;
   /**
@@ -34,7 +36,8 @@ export interface CatalogEntry {
    * any glob; core metadata files (config/tokenizer) present in the repo are
    * always included. Mirrors the `mlx download model --glob` semantics so the
    * wizard, the dashboard downloader, and a manual CLI run select the same
-   * file set out of a repo that ships dozens of quantization variants.
+   * file set out of a repo that ships dozens of quantization variants. Absent
+   * means the downloader's default filter.
    *
    * Applies to {@link hfRepo} only — the pre-converted CUDA repo has no
    * quantization variants to filter.
@@ -58,16 +61,32 @@ export interface CatalogEntry {
   assetsRepo?: string;
   /** Approximate download size in GB, for display. */
   sizeGb: number;
-  /** Which product surface this catalog entry belongs to (default `'chat'`). */
-  category?: 'chat' | 'systemone';
-  /** Optional companion, downloaded separately and never offered as a chat model. */
-  draft?: { label: string; hfRepo: string; sizeGb: number };
+  /** Who made the files and in which format, for the build line: `Unsloth GGUF`, `Thinking Machines`, `MLX`. */
+  source: string;
+  /** One short fact after the source: `1.1 GB smaller`, `NVFP4 + MXFP8`. */
+  note?: string;
+  /** What comes with the weights, for the extras line. */
+  included?: string;
+  /**
+   * Only on a build whose repository an earlier build of the catalog already installs: the tail of its folder name
+   * ({@link catalogBuildSlug}). Written here, never derived from the order of builds, so moving a build inside its
+   * entry never moves a folder.
+   */
+  folderSuffix?: string;
+}
+
+export interface CatalogEntry {
+  /** Display name; unique, and the key of an entry in the dashboard and the wizard. */
+  label: string;
   /** One line for the wizard. */
   description: string;
+  /** Which product surface this catalog entry belongs to (default `'chat'`). */
+  category?: 'chat' | 'systemone';
   /**
-   * Physical RAM in GiB below which the model's load admission always
-   * refuses. Neither the wizard ({@link visibleCatalog}) nor the dashboard
-   * Models page offers the entry on a machine with less.
+   * Physical RAM in GiB below which no UI offers the entry: not the wizard
+   * ({@link visibleCatalog}), and not the dashboard Models page or Onboarding
+   * (`offeredOnHost` in `packages/dashboard/ui/src/lib/catalog.ts`). Never
+   * lower than the RAM at which the model's load admission always refuses.
    */
   minMemoryGb?: number;
   /** Exactly one entry carries this. */
@@ -81,181 +100,316 @@ export interface CatalogEntry {
    * `catalogWithState()` deliberately keeps hidden entries so the UI, not the
    * dashboard core, decides.
    *
-   * Also honoured by the download allowlist: `DownloadManager.start`
-   * (`packages/dashboard/src/download.ts`) refuses a hidden repo up front
-   * rather than allocating a job that fails mid-download with a 401 from
-   * Hugging Face. No UI reaches that path for a hidden entry, but a direct
-   * API call does.
+   * Also honoured by the download allowlist: {@link catalogTargets} leaves a
+   * hidden entry out, so `DownloadManager.start`
+   * (`packages/dashboard/src/download.ts`) refuses its folder up front rather
+   * than allocating a job that fails mid-download with a 401 from Hugging
+   * Face. No UI reaches that path for a hidden entry, but a direct API call
+   * does.
    */
   hidden?: boolean;
+  /**
+   * The family (an id of the `@mlx-node/lm` family table) of the entry's GGUF builds, set only when that family's GGUF
+   * discovery needs no asset files. A folder with no `config.json` counts as a GGUF build of the entry only when the
+   * header of the GGUF that names the build states this family. A GGUF build of such an entry with no
+   * {@link CatalogBuild.assetsRepo} installs with no `config.json`.
+   */
+  ggufFamily?: string;
+  /** `builds[0]` is the build every surface chooses first. */
+  builds: readonly [CatalogBuild, ...CatalogBuild[]];
+  /** Optional companion, downloaded separately and never offered as a chat model. */
+  draft?: { label: string; hfRepo: string; sizeGb: number };
 }
+
+/** The files Inkling-2-Mini's GGUF builds take beside the weight: the vision tower and the root DSpark draft. */
+const INKLING_COMPANIONS = ['mmproj-BF16.gguf', 'dspark-Inkling-2-Mini-Q8_0.gguf'];
+
+/** The files a Clairic build takes beside its weight: vision tower, Clair head and its image processor. */
+const CLAIRIC_SIDECARS = [
+  'mmproj-BF16.gguf',
+  'clair_head.safetensors',
+  'clair_head_config.json',
+  'preprocessor_config.json',
+];
 
 export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
-    // The UD-Q4_K_XL file carries its MTP layer INLINE (block 64 of 65,
-    // `blk.64.nextn.*`), which the native prepare converts to `mtp.*` in the
-    // cache — hasMtpWeights() is true from the primary file alone (validated:
-    // ~4.8 tokens accepted per cycle). The repo's separate
-    // `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` is deliberately NOT globbed: nothing
-    // in the runtime pairs a GGUF MTP sidecar (`mtp_sidecar_candidates` is
-    // safetensors-only), so it would be 1.28 GB of dead weight per install.
-    // The optional z-lab DFlash2 draft stays offered beside the target for
-    // checkpoints that pair with it; it is never auto-installed.
     label: 'Qwen3.8-27B',
-    hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
-    globs: ['*UD-Q4_K_XL*', 'config.json'],
-    assetsRepo: 'Qwen/Qwen3.8-27B',
-    sizeGb: 17.6,
     description: 'Best tool use — recommended default',
     isDefault: true,
+    ggufFamily: 'qwen3_5',
+    builds: [
+      {
+        // The UD-Q4_K_XL file carries its MTP layer INLINE (block 64 of 65,
+        // `blk.64.nextn.*`), which the native prepare converts to `mtp.*` in the
+        // cache — hasMtpWeights() is true from the primary file alone (validated:
+        // ~4.8 tokens accepted per cycle). The repo's separate
+        // `MTP/mtp-Qwen3.8-27B-Q4_0.gguf` is deliberately NOT globbed: nothing
+        // in the runtime pairs a GGUF MTP sidecar (`mtp_sidecar_candidates` is
+        // safetensors-only), so it would be 1.28 GB of dead weight per install.
+        id: 'UD-Q4_K_XL',
+        hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
+        globs: ['*UD-Q4_K_XL*', 'config.json'],
+        assetsRepo: 'Qwen/Qwen3.8-27B',
+        sizeGb: 17.7,
+        source: 'Unsloth GGUF',
+      },
+      {
+        // The repo has no plain Q4_K_M file; this glob takes only
+        // `Qwen3.8-27B-UD-Q4_K_M.gguf`.
+        id: 'UD-Q4_K_M',
+        hfRepo: 'unsloth/Qwen3.8-27B-GGUF',
+        globs: ['*UD-Q4_K_M*', 'config.json'],
+        assetsRepo: 'Qwen/Qwen3.8-27B',
+        sizeGb: 16.6,
+        source: 'Unsloth GGUF',
+        note: '1.1 GB smaller',
+        folderSuffix: 'ud-q4_k_m',
+      },
+    ],
+    // The optional z-lab DFlash2 draft pairs with either build by name; it is
+    // never auto-installed.
     draft: QWEN38_DFLASH2,
   },
   {
-    label: 'Qwen-AgentWorld-35B-A3B',
-    hfRepo: 'unsloth/Qwen-AgentWorld-35B-A3B-GGUF',
-    globs: ['*UD-Q4_K_XL*'],
-    assetsRepo: 'Qwen/Qwen-AgentWorld-35B-A3B',
-    sizeGb: 22.3,
-    description: 'Agent-tuned MoE, fast decode',
+    label: 'Inkling-2-Mini',
+    description: 'Looped MoE with vision and DSpark drafts, 1M context',
+    ggufFamily: 'inkling2',
+    builds: [
+      {
+        // The weight glob ends in `.gguf` because `*UD-Q4_K_XL*` also matches
+        // `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB
+        // copy. The native loader pairs the vision tower (`mmproj-BF16.gguf`) and
+        // the root DSpark draft from the model's folder; the drafter under
+        // `dspark/` is never scanned, so it is not globbed.
+        id: 'UD-Q4_K_XL',
+        hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
+        globs: ['*UD-Q4_K_XL.gguf', ...INKLING_COMPANIONS],
+        assetsRepo: 'thinkingmachines/Inkling-2-Mini',
+        sizeGb: 18.7,
+        source: 'Unsloth GGUF',
+        included: 'Vision and DSpark draft included',
+      },
+      {
+        // `.gguf` ending for the same reason: `*UD-Q4_K_M*` doubles the download
+        // with the Mainline_Support copy.
+        id: 'UD-Q4_K_M',
+        hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
+        globs: ['*UD-Q4_K_M.gguf', ...INKLING_COMPANIONS],
+        assetsRepo: 'thinkingmachines/Inkling-2-Mini',
+        sizeGb: 17.7,
+        source: 'Unsloth GGUF',
+        note: '1 GB smaller',
+        included: 'Vision and DSpark draft included',
+        folderSuffix: 'ud-q4_k_m',
+      },
+      {
+        // The original safetensors release: experts NVFP4 (layers 0-19) and
+        // MXFP8 (layers 20-23), the rest BF16, vision in the same file and its
+        // DSpark draft in `mtp.safetensors`. The default filter takes every
+        // file the loader reads; it skips `tiktoken/tokenizer.model`, which the
+        // loader does not read (it reads `tokenizer.json`).
+        id: 'Original',
+        hfRepo: 'thinkingmachines/Inkling-2-Mini',
+        sizeGb: 20.2,
+        source: 'Thinking Machines',
+        note: 'NVFP4 + MXFP8',
+        included: 'Vision and DSpark draft included',
+      },
+    ],
   },
   {
-    // `mmproj-BF16.gguf` is the SigLIP vision tower — the gemma4v projector
-    // importer converts it to `vision.safetensors` during native prepare, so
-    // this entry supports images. The repo's `mtp-*.gguf` files are
-    // deliberately NOT globbed — mlx-node's Gemma speculative decode is the
-    // DSpark draft path, nothing pairs those llama.cpp MTP artifacts, and
-    // they would add ~2.5 GB of dead weight per install.
-    label: 'Gemma-4-26B-A4B',
-    hfRepo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
-    globs: ['*UD-Q4_K_XL*', 'mmproj-BF16.gguf', 'config.json'],
-    // The license-gated google/gemma-4-26B-A4B-it would 401 for most users;
-    // unsloth's mirror ships the same tokenizer/config files ungated.
-    assetsRepo: 'unsloth/gemma-4-26B-A4B-it',
-    sizeGb: 18.2,
-    description: 'MoE, fast decode',
+    label: 'Qwen3.8-Flash-Next',
+    description: '125B MoE, 512 experts streamed from SSD',
+    // The load has no fixed admission floor; the catalog offers it from 96 GiB.
+    minMemoryGb: 96,
+    ggufFamily: 'qwen4_exp',
+    builds: [
+      {
+        // The four shards sit in the repo folder `UD-Q4_K_XL/`, and downloads keep
+        // repo paths, so they install to `<slug>/UD-Q4_K_XL/`. The routed experts
+        // and the shard-4 n-gram table stream from SSD, so the weights may exceed
+        // RAM. A GGUF load is text-only: the repo's `mmproj-*.gguf` and MTP GGUF
+        // files are never paired, so they are not globbed.
+        id: 'UD-Q4_K_XL',
+        hfRepo: 'unsloth/Qwen3.8-Flash-Next-GGUF',
+        globs: ['*UD-Q4_K_XL*'],
+        assetsRepo: 'Qwen/Qwen3.8-Flash-Next',
+        sizeGb: 111.3,
+        source: 'Unsloth GGUF',
+        included: 'Text only · streams from SSD',
+      },
+    ],
   },
   {
-    // Shard 2 is the Engram table, read by row from SSD; the routed experts
-    // stream from SSD too, so the weights may exceed RAM. The loader reads the
-    // embedded GGUF tokenizer, never the sidecar files.
     label: 'Hy4-flash',
-    hfRepo: 'AngelSlim/Hy4-flash-GGUF',
-    globs: ['*Q4_K_M*'],
-    assetsRepo: 'tencent/Hy4-flash',
-    sizeGb: 168.3,
     description: '512-expert MoE streamed from SSD, 256K context',
-    // The admission's fixed bytes at its floor (16K context, 2048-row chunk,
-    // MTP on, one staging layer): 26.52 GiB, plus the 12 GiB reserve.
-    minMemoryGb: 39,
+    // The load admission accepts 39 GiB: its fixed bytes at its smallest
+    // settings (16K context, 2048-row chunk, MTP on, one staging layer) are
+    // 26.52 GiB, plus the 12 GiB reserve. The catalog offers it from 96 GiB.
+    minMemoryGb: 96,
+    ggufFamily: 'hy_v4_flash',
+    builds: [
+      {
+        // Shard 2 is the Engram table, read by row from SSD; the routed experts
+        // stream from SSD too, so the weights may exceed RAM. The loader reads the
+        // embedded GGUF tokenizer, never the sidecar files.
+        id: 'Q4_K_M',
+        hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+        globs: ['*Q4_K_M*'],
+        assetsRepo: 'tencent/Hy4-flash',
+        sizeGb: 168.3,
+        source: 'AngelSlim GGUF',
+        included: 'Streams from SSD',
+      },
+    ],
   },
   {
-    // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via
-    // `mlx convert --q-recipe nvidia` on gemma-4-12b-it (coherent + tool
-    // calling through `mlx agent`). Provisional slug — the user finalizes it
-    // on HF upload; entry stays hidden until the repo exists.
     label: 'Gemma-4-12B',
-    hfRepo: 'Brooooooklyn/Gemma-4-12B-IT-mxfp-mlx',
-    sizeGb: 8.6,
     description: 'Compact (mxfp4 MLP + mxfp8 attention), fits smaller machines',
     hidden: true,
+    builds: [
+      {
+        // Produced + validated locally as mxfp4 (MLP) + mxfp8 (attention) via
+        // `mlx convert --q-recipe nvidia` on gemma-4-12b-it (coherent + tool
+        // calling through `mlx agent`). Provisional slug — the user finalizes it
+        // on HF upload; entry stays hidden until the repo exists.
+        id: 'MXFP',
+        hfRepo: 'Brooooooklyn/Gemma-4-12B-IT-mxfp-mlx',
+        sizeGb: 8.6,
+        source: 'MLX',
+      },
+    ],
   },
   {
-    // NOT DOWNLOADABLE. This repo does not exist: the slug below is a
-    // placeholder the user has not uploaded to, and Hugging Face answers 401
-    // for it. Nothing may offer it as an install until the upload happens and
-    // `hidden` is dropped — and do not guess a substitute slug, because a
-    // wrong-but-live repo would install the wrong weights silently.
-    //
-    // The only route to this model today is local conversion from NVIDIA's
-    // modelopt checkpoint:
-    //   mlx convert -m nemotron_h \
-    //     -i <nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4> \
-    //     -o <models>/nemotron-3.5-lightning-30b-a3b-nvfp4-mlx
-    // (NVFP4 preserved byte-for-byte; the FP8 Mamba-2 projections are
-    // re-quantized. See docs/cli.md "modelopt NVFP4 ingest".)
-    //
-    // The entry is kept — rather than deleted — so the wizard, the dashboard
-    // catalog state, and `catalogSlug()` recognize a locally converted
-    // checkpoint sitting at the canonical slug.
     label: 'Nemotron-3.5-Lightning-30B-A3B',
-    hfRepo: 'Brooooooklyn/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-nvfp4-mlx',
-    sizeGb: 23,
     description: 'Hybrid Mamba-2 + MoE, native MTP, 1M context',
     hidden: true,
+    builds: [
+      {
+        // NOT DOWNLOADABLE. This repo does not exist: the slug below is a
+        // placeholder the user has not uploaded to, and Hugging Face answers 401
+        // for it. Nothing may offer it as an install until the upload happens and
+        // `hidden` is dropped — and do not guess a substitute slug, because a
+        // wrong-but-live repo would install the wrong weights silently.
+        //
+        // The only route to this model today is local conversion from NVIDIA's
+        // modelopt checkpoint:
+        //   mlx convert -m nemotron_h \
+        //     -i <nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4> \
+        //     -o <models>/nemotron-3.5-lightning-30b-a3b-nvfp4-mlx
+        // (NVFP4 preserved byte-for-byte; the FP8 Mamba-2 projections are
+        // re-quantized. See docs/cli.md "modelopt NVFP4 ingest".)
+        //
+        // The entry is kept — rather than deleted — so the wizard, the dashboard
+        // catalog state, and `catalogBuildSlug()` recognize a locally converted
+        // checkpoint sitting at the canonical slug.
+        id: 'NVFP4',
+        hfRepo: 'Brooooooklyn/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-nvfp4-mlx',
+        sizeGb: 23,
+        source: 'MLX',
+      },
+    ],
   },
   {
     label: 'Clairic Flash (9B)',
-    hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
-    globs: [
-      '*UD-Q4_K_XL*',
-      'mmproj-BF16.gguf',
-      'clair_head.safetensors',
-      'clair_head_config.json',
-      'preprocessor_config.json',
-    ],
-    assetsRepo: 'Cloudflare/clairic-flash',
-    sizeGb: 7.6,
+    description: 'Fast 9B extraction, vision, PDF & forecasting',
     category: 'systemone',
-    description: 'Fast 9B extraction, vision, PDF & forecasting (UD-Q4_K_XL)',
+    builds: [
+      {
+        id: 'UD-Q4_K_XL',
+        hfRepo: 'Brooooooklyn/Clairic-Flash-GGUF',
+        globs: ['*UD-Q4_K_XL*', ...CLAIRIC_SIDECARS],
+        assetsRepo: 'Cloudflare/clairic-flash',
+        sizeGb: 7.6,
+        source: 'GGUF',
+        included: 'Vision and Clair head included',
+      },
+    ],
   },
   {
     label: 'Clairic (27B)',
-    hfRepo: 'Brooooooklyn/Clairic-GGUF',
-    globs: [
-      '*UD-Q4_K_XL*',
-      'mmproj-BF16.gguf',
-      'clair_head.safetensors',
-      'clair_head_config.json',
-      'preprocessor_config.json',
-    ],
-    assetsRepo: 'Cloudflare/clairic',
-    sizeGb: 18.9,
+    description: 'High-accuracy 27B extraction, tables & PDFs',
     category: 'systemone',
-    description: 'High-accuracy 27B extraction, tables & PDFs (UD-Q4_K_XL)',
+    builds: [
+      {
+        id: 'UD-Q4_K_XL',
+        hfRepo: 'Brooooooklyn/Clairic-GGUF',
+        globs: ['*UD-Q4_K_XL*', ...CLAIRIC_SIDECARS],
+        assetsRepo: 'Cloudflare/clairic',
+        sizeGb: 18.9,
+        source: 'GGUF',
+        included: 'Vision and Clair head included',
+      },
+    ],
+  },
+  {
+    label: 'CLEF Flash (9B)',
+    description: 'Fast 9B decisions: yes/no, choice & score',
+    category: 'systemone',
+    // No assetsRepo: the GGUF carries its tokenizer and decision head, and a base config.json beside it makes
+    // discovery read the folder as qwen3_5 and drop the GGUF. The globs are exact names: `*Q8_0*` also takes the mmproj.
+    ggufFamily: 'clef',
+    builds: [
+      {
+        id: 'Q8_0',
+        hfRepo: 'ggml-org/Clef-Flash-GGUF',
+        globs: ['Clef-Flash-Q8_0.gguf'],
+        sizeGb: 9.7,
+        source: 'ggml-org GGUF',
+        included: 'Text only · decision head included',
+      },
+      {
+        id: 'Q4_K_M',
+        hfRepo: 'ggml-org/Clef-Flash-GGUF',
+        globs: ['Clef-Flash-Q4_K_M.gguf'],
+        sizeGb: 6.7,
+        source: 'ggml-org GGUF',
+        note: '2.9 GB smaller',
+        included: 'Text only · decision head included',
+        folderSuffix: 'q4_k_m',
+      },
+    ],
+  },
+  {
+    label: 'CLEF (27B)',
+    description: 'High-accuracy 27B calibrated decisions',
+    category: 'systemone',
+    // No assetsRepo, for the reason on CLEF Flash (9B).
+    ggufFamily: 'clef',
+    builds: [
+      {
+        id: 'Q8_0',
+        hfRepo: 'ggml-org/Clef-GGUF',
+        globs: ['Clef-Q8_0.gguf'],
+        sizeGb: 28.7,
+        source: 'ggml-org GGUF',
+        included: 'Text only · decision head included',
+      },
+      {
+        id: 'Q4_K_M',
+        hfRepo: 'ggml-org/Clef-GGUF',
+        globs: ['Clef-Q4_K_M.gguf'],
+        sizeGb: 19.5,
+        source: 'ggml-org GGUF',
+        note: '9.2 GB smaller',
+        included: 'Text only · decision head included',
+        folderSuffix: 'q4_k_m',
+      },
+    ],
   },
 ];
 
 /**
- * Every repo whose upstream revision participates in update discovery: the
- * visible target repos and their companions, plus the `assetsRepo` each entry
- * sources its tokenizer sidecars from.
+ * The repo THIS platform installs for `build`.
  *
- * The download allowlist ({@link catalogDownloadRepos}) is deliberately
- * narrower — sidecars are fetched INSIDE a job, never started as one — but a
- * tokenizer or chat-template fix in the base model is an update a user must be
- * able to see. Without these, a sidecar-only upstream change raises no badge,
- * the update endpoint never reports it, and the UI's Installed button stays
- * disabled: the repair path is unreachable by design.
- */
-export function catalogUpdateRepos(): string[] {
-  const repos = new Set(catalogDownloadRepos());
-  for (const entry of MODEL_CATALOG) {
-    if (!entry.hidden && entry.assetsRepo !== undefined) repos.add(entry.assetsRepo);
-  }
-  return [...repos];
-}
-
-/** Visible target repos plus their optional companion downloads. */
-export function catalogDownloadRepos(): string[] {
-  return [
-    ...new Set(
-      MODEL_CATALOG.filter((entry) => !entry.hidden).flatMap((entry) =>
-        entry.draft === undefined ? [catalogRepo(entry)] : [catalogRepo(entry), entry.draft.hfRepo],
-      ),
-    ),
-  ];
-}
-
-/**
- * The repo THIS platform installs for `entry`.
- *
- * All platforms take the Unsloth UD-Q4_K_XL GGUF: Unsloth Dynamic quants
- * keep embeddings and `lm_head` at high precision, which measured as the best
+ * The chat GGUF builds run on every platform: Unsloth Dynamic quants keep
+ * embeddings and `lm_head` at high precision, which measured as the best
  * output quality AND 1.44× decode over MXFP4 on Qwen3.8-27B with MTP — with
  * smaller downloads on top — and ggml K-quants are losslessly repacked into
  * MLX layout at first load, so the GGUF is as native as a pre-converted
  * safetensors repo once cached. GGUF quantization repos ship no tokenizer
- * files, so each entry pairs its repo with {@link CatalogEntry.assetsRepo}
+ * files, so each such build pairs its repo with {@link CatalogBuild.assetsRepo}
  * sidecars — required for correct tool calling (see that field's comment).
  *
  * CUDA caveat, measured not assumed: the native import repacks K-quants into
@@ -268,72 +422,135 @@ export function catalogDownloadRepos(): string[] {
  * NVIDIA recipes (see README "CUDA preview"), which produce CUDA-executable
  * affine/NVFP4 layouts.
  *
- * Every consumer that turns a catalog entry into a download, a slug, or an
- * allowlist check must go through here. Reading `entry.hfRepo` directly
- * installs the macOS build on a CUDA box the day a CUDA build returns.
+ * Every consumer that turns a build into a download, a folder, or an
+ * allowlist check must go through here. Reading `build.hfRepo` directly
+ * installs the macOS build on a CUDA box the day a CUDA build returns. The
+ * platform is a parameter so both branches can be asserted without touching
+ * `process.platform`, a global shared with every test file on the worker.
  */
-export function catalogRepo(entry: CatalogEntry): string {
-  return catalogRepoFor(entry, process.platform);
+export function catalogBuildRepo(build: CatalogBuild, platform: NodeJS.Platform = process.platform): string {
+  return platform === 'linux' && build.hfRepoCuda !== undefined ? build.hfRepoCuda : build.hfRepo;
+}
+
+/** The last part of `repo` (`owner/name`), in lower case. */
+function repoFolderName(repo: string): string {
+  const at = repo.lastIndexOf('/');
+  return repo.slice(at + 1).toLowerCase();
 }
 
 /**
- * The file-selection fields that apply to `repo` when it is `entry`'s GGUF
- * repo: {@link CatalogEntry.globs} and {@link CatalogEntry.assetsRepo}.
- *
- * Both describe the multi-variant GGUF artifact only. A platform-specific
- * override repo (the pre-converted CUDA build) is a plain safetensors layout:
- * globbing it would filter out every weight, and its config/tokenizer files
- * are its own. Consumers must resolve selection through here rather than
- * reading the entry fields directly.
+ * The folder `build` installs to under the models directory: the last part of THIS platform's repo in lower case,
+ * then `-` and {@link CatalogBuild.folderSuffix} when the build has one. The first build of a repository keeps the
+ * repository's folder, so an install made before a second build existed stays where it is.
  */
-export function catalogSelectionForRepo(
-  entry: CatalogEntry,
-  repo: string,
-): { globs?: readonly string[]; assetsRepo?: string } {
-  if (repo !== entry.hfRepo) return {};
-  return { globs: entry.globs, assetsRepo: entry.assetsRepo };
+export function catalogBuildSlug(build: CatalogBuild, platform: NodeJS.Platform = process.platform): string {
+  const folder = repoFolderName(catalogBuildRepo(build, platform));
+  return build.folderSuffix === undefined ? folder : `${folder}-${build.folderSuffix}`;
+}
+
+/** The folder a companion draft installs to: its repository's name, in lower case. */
+export function catalogDraftSlug(draft: NonNullable<CatalogEntry['draft']>): string {
+  return repoFolderName(draft.hfRepo);
+}
+
+/** One thing the dashboard downloader may start a job for, keyed by the folder it installs to. */
+export type CatalogTarget =
+  | {
+      kind: 'build';
+      slug: string;
+      entry: CatalogEntry;
+      build: CatalogBuild;
+      /** {@link catalogBuildRepo} of the build. */
+      repo: string;
+      /** The build's globs, only when {@link repo} is the build's GGUF repo. */
+      globs?: readonly string[];
+      /** The build's sidecar source, only when {@link repo} is the build's GGUF repo. */
+      assetsRepo?: string;
+    }
+  | { kind: 'draft'; slug: string; entry: CatalogEntry; repo: string };
+
+/**
+ * Every build and every draft of the entries that are not hidden, in catalog order. `globs` and `assetsRepo`
+ * describe the GGUF repo only, so a platform override repo (a plain safetensors layout) gets neither: globbing it
+ * would filter out every weight, and its config/tokenizer files are its own.
+ */
+export function catalogTargets(platform: NodeJS.Platform = process.platform): CatalogTarget[] {
+  const targets: CatalogTarget[] = [];
+  for (const entry of MODEL_CATALOG) {
+    if (entry.hidden) continue;
+    for (const build of entry.builds) {
+      const repo = catalogBuildRepo(build, platform);
+      const own = repo === build.hfRepo;
+      targets.push({
+        kind: 'build',
+        slug: catalogBuildSlug(build, platform),
+        entry,
+        build,
+        repo,
+        ...(own && build.globs !== undefined ? { globs: build.globs } : {}),
+        ...(own && build.assetsRepo !== undefined ? { assetsRepo: build.assetsRepo } : {}),
+      });
+    }
+    if (entry.draft !== undefined) {
+      targets.push({ kind: 'draft', slug: catalogDraftSlug(entry.draft), entry, repo: entry.draft.hfRepo });
+    }
+  }
+  return targets;
+}
+
+/** The target that installs to the folder `slug`: the download allowlist and the lookup of a job. */
+export function catalogTargetForSlug(
+  slug: string,
+  platform: NodeJS.Platform = process.platform,
+): CatalogTarget | undefined {
+  return catalogTargets(platform).find((target) => target.slug === slug);
 }
 
 /**
- * {@link catalogRepo} with the platform passed in — the pure half.
- *
- * Exists so both branches can be asserted without touching `process.platform`.
- * Mutating that global leaks across test files sharing a worker: it made
- * `catalogRepo` disagree with a sibling suite's module-level constant and fail
- * a download allowlist check that has nothing to do with the catalog.
+ * Whether another build of the catalog, hidden entries included, installs the same repository as `build` on this
+ * platform. Such a build's folder must name the build in its weight file to count as that build.
  */
-export function catalogRepoFor(entry: CatalogEntry, platform: NodeJS.Platform): string {
-  return platform === 'linux' && entry.hfRepoCuda !== undefined ? entry.hfRepoCuda : entry.hfRepo;
+export function catalogSharesRepo(build: CatalogBuild, platform: NodeJS.Platform = process.platform): boolean {
+  const repo = catalogBuildRepo(build, platform);
+  return MODEL_CATALOG.some((entry) =>
+    entry.builds.some((other) => other !== build && catalogBuildRepo(other, platform) === repo),
+  );
 }
 
 /**
- * The catalog entry whose THIS-platform download repo is `repo`, if any.
+ * Every repo whose upstream revision participates in update discovery: the
+ * repos of {@link catalogTargets}, plus the `assetsRepo` each build sources
+ * its tokenizer sidecars from.
  *
- * The dashboard downloader looks entries up by the repo a job was started
- * with (already allowlisted through `catalogDownloadRepos`, so a match is
- * guaranteed in practice) to find the entry's `globs` file filter and
- * `assetsRepo` sidecar source. Matching goes through
- * {@link catalogRepoFor} — never a raw `hfRepo` comparison — so a future
- * platform-split entry resolves against the repo this platform actually
- * installs.
+ * The download allowlist is deliberately narrower — sidecars are fetched
+ * INSIDE a job, never started as one — but a tokenizer or chat-template fix
+ * in the base model is an update a user must be able to see. Without these, a
+ * sidecar-only upstream change raises no badge, the update endpoint never
+ * reports it, and the UI's Installed button stays disabled: the repair path is
+ * unreachable by design.
  */
-export function catalogEntryForRepo(repo: string, platform: NodeJS.Platform): CatalogEntry | undefined {
-  return MODEL_CATALOG.find((entry) => catalogRepoFor(entry, platform) === repo);
+export function catalogUpdateRepos(platform: NodeJS.Platform = process.platform): string[] {
+  const repos = new Set<string>();
+  for (const target of catalogTargets(platform)) {
+    repos.add(target.repo);
+    if (target.kind === 'build' && target.assetsRepo !== undefined) repos.add(target.assetsRepo);
+  }
+  return [...repos];
 }
 
-/** Whether `entry` can load on a machine with `totalMemBytes` of physical RAM. */
+/** Whether the catalog offers `entry` on a machine with `totalMemBytes` of physical RAM ({@link CatalogEntry.minMemoryGb}). */
 export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, totalMemBytes: number): boolean {
   return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
 }
 
-/** Catalog entries the wizard offers: visible chat entries loadable in `totalMemBytes` of RAM. */
+/** Catalog entries the wizard offers: visible chat entries whose memory floor `totalMemBytes` of RAM meets. */
 export function visibleCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
   return MODEL_CATALOG.filter(
     (entry) => !entry.hidden && (entry.category ?? 'chat') === 'chat' && catalogFitsMemory(entry, totalMemBytes),
   );
 }
 
-/** Visible System One (Clairic / CLEF) catalog entries loadable in `totalMemBytes` of RAM. */
+/** Visible System One (Clairic / CLEF) catalog entries whose memory floor `totalMemBytes` of RAM meets. */
 export function visibleSystemOneCatalog(totalMemBytes: number = totalmem()): CatalogEntry[] {
   return MODEL_CATALOG.filter(
     (entry) => !entry.hidden && entry.category === 'systemone' && catalogFitsMemory(entry, totalMemBytes),

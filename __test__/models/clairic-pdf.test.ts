@@ -91,6 +91,71 @@ function makeTinyPngDataUri(): string {
   return `data:image/png;base64,${pngHeader.toString('base64')}`;
 }
 
+interface ElectronMarkerShape {
+  type: PropertyDescriptor;
+  electron: PropertyDescriptor;
+}
+
+/**
+ * Render a one-page PDF `renders` times in a fresh Node process whose
+ * `process.type` / `process.versions.electron` are defined, before any import,
+ * the way an Electron utility process has them. Returns the child's stdout.
+ */
+function runInSimulatedElectronUtility(shape: ElectronMarkerShape, renders: number): string {
+  const root = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
+  const pdfModulePath = resolve(root, 'packages/lm/src/clairic-pdf.ts');
+  const docUri = `data:application/pdf;base64,${makeOnePagePdf().toString('base64')}`;
+  const probe = `
+    Object.defineProperty(process.versions, 'electron', ${JSON.stringify(shape.electron)});
+    Object.defineProperty(process, 'type', ${JSON.stringify(shape.type)});
+    const describeMarkers = () =>
+      JSON.stringify([
+        Object.getOwnPropertyDescriptor(process, 'type'),
+        Object.getOwnPropertyDescriptor(process.versions, 'electron'),
+      ]);
+    const before = describeMarkers();
+    const { registerHooks } = await import('node:module');
+    registerHooks({
+      resolve(specifier, context, nextResolve) {
+        if (specifier === './clairic-types.js') {
+          return nextResolve('./clairic-types.ts', context);
+        }
+        return nextResolve(specifier, context);
+      },
+    });
+    const { renderClairicDocuments } = await import(${JSON.stringify(pdfModulePath)});
+    for (let i = 0; i < ${renders}; i++) {
+      let pages;
+      try {
+        pages = await renderClairicDocuments({ documents: [${JSON.stringify(docUri)}], fields: {} });
+      } catch (error) {
+        console.log('RENDER-ERROR ' + error.message);
+        break;
+      }
+      if (!Array.isArray(pages) || pages.length !== 1) throw new Error('expected 1 rendered page');
+      const { rgb, width, height } = pages[0];
+      if (width <= 0 || height <= 0 || rgb.length !== width * height * 3) throw new Error('invalid RGB24 buffer');
+      let dark = 0;
+      for (let p = 0; p < rgb.length; p += 3) {
+        if (rgb[p] < 64 && rgb[p + 1] < 64 && rgb[p + 2] < 64) dark++;
+      }
+      if (dark === 0) throw new Error('no dark text pixels');
+      console.log('RENDER-OK ' + i);
+    }
+    if (describeMarkers() !== before) throw new Error('Electron markers changed: ' + describeMarkers() + ' vs ' + before);
+    if (process.type !== 'utility' || process.versions.electron !== '45.2.3') throw new Error('Electron markers not restored');
+    console.log('MARKERS-RESTORED');
+  `;
+  return execFileSync(process.execPath, ['--input-type=module', '-e', probe], { encoding: 'utf-8' });
+}
+
+const configurableElectronVersion: PropertyDescriptor = {
+  value: '45.2.3',
+  writable: false,
+  enumerable: true,
+  configurable: true,
+};
+
 function countNonWhitePixels(rgb: Buffer): number {
   let nonWhite = 0;
   for (let i = 0; i < rgb.length; i += 3) {
@@ -427,5 +492,57 @@ describe('renderClairicDocuments', () => {
       encoding: 'utf-8',
     });
     expect(output).toContain('CLAIRIC-TYPES-NATIVE-FREE-OK');
+  });
+
+  describe('in an Electron utility process', () => {
+    it('renders twice when process.type is read-only but configurable', () => {
+      const output = runInSimulatedElectronUtility(
+        {
+          type: { value: 'utility', writable: false, enumerable: true, configurable: true },
+          electron: configurableElectronVersion,
+        },
+        2,
+      );
+      expect(output).toContain('RENDER-OK 0');
+      expect(output).toContain('RENDER-OK 1');
+      expect(output).toContain('MARKERS-RESTORED');
+    });
+
+    it('renders when process.type is writable but not configurable', () => {
+      const output = runInSimulatedElectronUtility(
+        {
+          type: { value: 'utility', writable: true, enumerable: true, configurable: false },
+          electron: configurableElectronVersion,
+        },
+        1,
+      );
+      expect(output).toContain('RENDER-OK 0');
+      expect(output).toContain('MARKERS-RESTORED');
+    });
+
+    it('hides process.versions.electron when process.type can be neither redefined nor written', () => {
+      const output = runInSimulatedElectronUtility(
+        {
+          type: { value: 'utility', writable: false, enumerable: true, configurable: false },
+          electron: configurableElectronVersion,
+        },
+        2,
+      );
+      expect(output).toContain('RENDER-OK 0');
+      expect(output).toContain('RENDER-OK 1');
+      expect(output).toContain('MARKERS-RESTORED');
+    });
+
+    it('fails with a clear message when no Electron marker can be hidden', () => {
+      const output = runInSimulatedElectronUtility(
+        {
+          type: { value: 'utility', writable: false, enumerable: true, configurable: false },
+          electron: { value: '45.2.3', writable: false, enumerable: true, configurable: false },
+        },
+        1,
+      );
+      expect(output).toContain('RENDER-ERROR PDF rendering is unavailable in this Electron process');
+      expect(output).toContain('MARKERS-RESTORED');
+    });
   });
 });

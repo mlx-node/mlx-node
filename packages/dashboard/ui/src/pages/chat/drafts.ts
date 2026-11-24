@@ -1,15 +1,50 @@
 /**
- * Window memory of the Chat page: the draft per place and the last open conversation per workspace. Prompt text is
- * never written to storage; only the last used mode, the chosen model per mode and the last model picked per base are.
+ * Window memory of the Chat page: the draft, the attached files and the failed send per place and the last open
+ * conversation per workspace. Prompt text and files are never written to storage; only the last used mode, the chosen model per mode
+ * and the last model picked per base are.
  */
 
+import { attachQueue, type DraftAttachment } from '../../lib/chat-attachments';
 import type { ChatMode } from '../../lib/chat-types';
+import type { StripNotice } from './blockers';
 
 /** The New screen of both modes shares one draft: it is one composer. */
 export const NEW_PLACE = 'new';
 
 const drafts = new Map<string, string>();
+const attachments = new Map<string, readonly DraftAttachment[]>();
+/** How often `forgetPlace` removed each place: a read that started before a delete must not bring its files back. */
+const forgets = new Map<string, number>();
+const NO_ATTACHMENTS: readonly DraftAttachment[] = [];
 const lastPlace: Record<ChatMode, string | null> = { chat: null, work: null };
+
+/** A message whose send failed, kept for Retry until it is sent, a send from its place succeeds, or the place is gone. */
+export interface FailedSend {
+  text: string;
+  files: readonly DraftAttachment[];
+  /** What the failure shows over the composer; null when the thread's own end strip shows it. */
+  strip: StripNotice | null;
+  /** It was put back into the composer, so the composer holds it too. */
+  restored: boolean;
+}
+
+const failures = new Map<string, FailedSend>();
+const listeners = new Set<() => void>();
+
+/** Called after every change of the attached files or the failed sends, whichever page made it. */
+export function subscribeDrafts(listener: () => void): () => void {
+  listeners.add(listener);
+  return () => {
+    listeners.delete(listener);
+  };
+}
+
+function changed(): void {
+  for (const listener of listeners) listener();
+}
+
+/** One queue for every read of files into this store, whichever Chat mount started it. */
+export const attachDrafts = attachQueue();
 
 export function readDraft(place: string): string {
   return drafts.get(place) ?? '';
@@ -18,6 +53,39 @@ export function readDraft(place: string): string {
 export function writeDraft(place: string, text: string): void {
   if (text === '') drafts.delete(place);
   else drafts.set(place, text);
+}
+
+export function readAttachments(place: string): readonly DraftAttachment[] {
+  return attachments.get(place) ?? NO_ATTACHMENTS;
+}
+
+/** Taken when a read or a send starts and given to its `writeAttachments`. */
+export function placeEpoch(place: string): number {
+  return forgets.get(place) ?? 0;
+}
+
+/** Dropped when `forgetPlace` removed the place after `epoch` was taken. */
+export function writeAttachments(
+  place: string,
+  items: readonly DraftAttachment[],
+  epoch: number = placeEpoch(place),
+): void {
+  if (epoch !== placeEpoch(place)) return;
+  if (items.length === 0) attachments.delete(place);
+  else attachments.set(place, items);
+  changed();
+}
+
+export function readFailed(place: string): FailedSend | null {
+  return failures.get(place) ?? null;
+}
+
+/** Dropped when `forgetPlace` removed the place after `epoch` was taken. */
+export function writeFailed(place: string, record: FailedSend | null, epoch: number = placeEpoch(place)): void {
+  if (epoch !== placeEpoch(place)) return;
+  if (record === null) failures.delete(place);
+  else failures.set(place, record);
+  changed();
 }
 
 export function lastPlaceOf(mode: ChatMode): string | null {
@@ -33,6 +101,10 @@ export function forgetPlace(id: string): void {
   if (lastPlace.chat === id) lastPlace.chat = null;
   if (lastPlace.work === id) lastPlace.work = null;
   drafts.delete(id);
+  attachments.delete(id);
+  failures.delete(id);
+  forgets.set(id, placeEpoch(id) + 1);
+  changed();
 }
 
 /** The folder the user chose for the next Work conversation, in this window. */

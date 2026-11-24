@@ -39,7 +39,14 @@ import type { ProvidersResponse } from '../ui/src/lib/providers-types.js';
 import { toast } from '../ui/src/lib/toast.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import Chat from '../ui/src/pages/chat.js';
-import { forgetPlace, NEW_PLACE, writeDraft, chooseFolder } from '../ui/src/pages/chat/drafts.js';
+import {
+  chooseFolder,
+  forgetPlace,
+  NEW_PLACE,
+  writeAttachments,
+  writeDraft,
+  writeFailed,
+} from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
 import {
   folderReason,
@@ -54,6 +61,7 @@ import { type AppCommand, usePageCommands } from '../ui/src/shell/commands.js';
 import { answer, end, user } from './helpers/chat-thread-fixtures.js';
 import {
   accessibleName,
+  allByRole,
   byRole,
   type ChatSync,
   deferred,
@@ -236,6 +244,15 @@ function chip(place: 'composer' | 'header' = 'composer'): HTMLButtonElement {
   return found;
 }
 
+/** The page bar: the header that holds the page's h1. */
+function bar(): HTMLElement {
+  const found = [...page!.container.querySelectorAll<HTMLElement>('header')].find(
+    (h) => h.querySelector('h1') !== null,
+  );
+  if (found === undefined) throw new Error('no bar');
+  return found;
+}
+
 function menu(): HTMLElement | null {
   return document.querySelector<HTMLElement>(`[role="dialog"][aria-label="${P.name}"]`);
 }
@@ -318,13 +335,19 @@ beforeEach(() => {
   localStorage.clear();
 });
 
-afterEach(() => {
+afterEach(async () => {
   page?.unmount();
+  // A call still in flight fails when the port closes; its toast must not land in the next test.
+  const closed = api?.closed;
   api?.();
+  await closed;
+  await new Promise((resolve) => setImmediate(resolve));
   page = undefined;
   api = undefined;
   navigate = undefined;
   writeDraft(NEW_PLACE, '');
+  writeAttachments(NEW_PLACE, []);
+  writeFailed(NEW_PLACE, null);
   for (const id of used.splice(0)) forgetPlace(id);
   chooseFolder(null);
   vi.restoreAllMocks();
@@ -1870,19 +1893,30 @@ describe('the New Work screen: a mode picked before the first message', () => {
     ];
     await openNew({ rows, conversations: { 'pm-new-a': sync('pm-new-a') } });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => page!.container.querySelector(label) !== null);
+    await waitFor(() => bar().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'auto') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
-    click(page!.container.querySelector<HTMLElement>(label)!);
+    click(bar().querySelector<HTMLElement>(label)!);
     const options = (): HTMLElement[] => [
       ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
     ];
     await waitFor(() => options().length === 2);
+    const popover = document.querySelector(`[role="dialog"][aria-label="${CHAT.folderRecent}"]`)!;
+    expect([popover.getAttribute('data-side'), popover.getAttribute('data-align')]).toEqual(['bottom', 'end']);
+    expect(options().map((o) => o.textContent ?? '')).toEqual([
+      expect.stringContaining('proj'),
+      expect.stringContaining('other'),
+    ]);
     click(options().find((o) => (o.textContent ?? '').includes('other'))!);
     await waitFor(() => posts().length === 1);
     expect(posts()).toEqual([`${draftPath(first)} ${JSON.stringify({ mode: 'ask', up: false })}`]);
     expect(chip().getAttribute('data-permission-mode')).toBe('ask');
+    expect(page!.container.querySelector('textarea')!.placeholder).toBe(
+      fill(CHAT.placeholderWork, { folder: 'other' }),
+    );
+    expect(bar().querySelector(`[aria-label="${fill(CHAT.folderLabel, { folder: OTHER })}"]`)).not.toBeNull();
+    await waitFor(() => document.activeElement === page!.container.querySelector('textarea'));
 
     const second = made.at(-1)!;
     expect(second).not.toBe(first);
@@ -1951,7 +1985,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       conversations: { 'pm-new-a': sync('pm-new-a'), 'pm-made': sync('pm-made') },
     });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => page!.container.querySelector(label) !== null);
+    await waitFor(() => bar().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'bypass') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
@@ -1959,7 +1993,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     sendNow();
     await waitFor(() => creates().length === 1);
     act(() => api!.emitChatHost({ type: 'state', state: READY_CHAT_HOST }));
-    click(page!.container.querySelector<HTMLElement>(label)!);
+    click(bar().querySelector<HTMLElement>(label)!);
     const options = (): HTMLElement[] => [
       ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
     ];
@@ -2060,14 +2094,239 @@ describe('the New Work screen: a mode picked before the first message', () => {
     expect(page!.container.querySelector('[data-permission-chip]')).toBeNull();
   });
 
-  it('the tools row: the folder and web chips carry their tier, the mode chip none, the picker wrapper 3', async () => {
+  it('the tools row: the + first without a tier, the picker wrapper 3, the folder chip 1, the mode chip none', async () => {
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
+    });
+    const start = chip().parentElement!;
+    const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
+    expect(tiers).toEqual([null, '3', '1', null]);
+    expect(chip().getAttribute('data-give')).toBeNull();
+  });
+
+  it('the Work hero says the agent can read the key only when a key is in the Work environment', async () => {
+    const hero = async (firecrawl: boolean): Promise<string> => {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+        host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, firecrawl } },
+      });
+      const text = page!.text();
+      page!.unmount();
+      api?.();
+      page = undefined;
+      api = undefined;
+      return text;
+    };
+    expect(await hero(true)).toContain(CHAT.workKeyNotice);
+    expect(await hero(false)).not.toContain(CHAT.workKeyNotice);
+  });
+
+  it('the tools row once a folder is chosen: the +, the picker, the mode chip', async () => {
     chooseFolder('/tmp/work/a-twenty-char-folder');
     await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
       host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
     });
     const start = chip().parentElement!;
     const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
-    expect(tiers).toEqual(['3', '1', '2', null]);
-    expect(chip().getAttribute('data-give')).toBeNull();
+    expect(tiers).toEqual([null, '3', null]);
+  });
+
+  it('Work: opening the + reads the keys once; the panel has the same rows as Chat and counts the skills under them', async () => {
+    const exa = (names: string[], check: 'ok' | 'rejected' = 'ok') => ({
+      search: 'exa',
+      firecrawl: false,
+      fetch: 'exa',
+      keychain: 'ok',
+      applyPending: false,
+      vanished: null,
+      providers: [
+        {
+          id: 'exa',
+          configured: true,
+          check,
+          skill: { installed: true, names, upstream: null },
+          work: { ready: true, missing: null },
+        },
+      ],
+    });
+    const panel = async (
+      searchCheck: 'ok' | 'rejected',
+      row: string,
+      body: unknown = exa(['exa-search', 'exa-fetch']),
+    ): Promise<HTMLElement> => {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+        host: {
+          ...READY_CHAT_HOST,
+          providers: { ...READY_CHAT_HOST.providers, search: 'exa', searchCheck, fetch: 'exa' },
+        },
+        routes: { '/providers': body },
+      });
+      const reads = (): number => calls.filter((call) => call.method === 'GET' && pathOf(call) === '/providers').length;
+      expect(reads()).toBe(0);
+      click(buttonIn(document.body, searchCheck === 'ok' ? CHAT.tools : 'Tools, web search key rejected'));
+      await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+      await waitFor(() => reads() === 1);
+      click(byRole(document.body, 'menuitem', row)!);
+      await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+      return byRole(document.body, 'dialog', CHAT.webSearch)!;
+    };
+    const ok = await panel('ok', 'Web search, Exa');
+    const skills = fill(CHAT.webWork, { skills: '2 Exa skills' });
+    await waitFor(() => shown(ok).includes(skills));
+    const list = byRole(ok, 'menu', CHAT.webSearch)!;
+    expect(allByRole(list, 'menuitemradio').map((row) => row.getAttribute('data-label'))).toEqual([
+      'exa',
+      'deepseek',
+      'brave',
+      'off',
+    ]);
+    expect(list.textContent).not.toContain(skills);
+    expect(shown(ok).indexOf(skills)).toBeGreaterThan(shown(ok).indexOf(CHAT.webSettings));
+    page!.unmount();
+    api!();
+
+    const rejected = await panel(
+      'rejected',
+      'Web search, Exa, key rejected',
+      exa(['exa-search', 'exa-fetch'], 'rejected'),
+    );
+    await waitFor(() => shown(rejected).includes(skills));
+    expect([...rejected.querySelectorAll('p')].map((p) => p.textContent)).toEqual([skills]);
+    const row = byRole(rejected, 'menuitemradio', 'Exa, key rejected')!;
+    expect(row.textContent).toBe(`Exa${CHAT.webEndRejected}`);
+    expect(row.querySelector('[data-tone="danger"]')).not.toBeNull();
+    expect(byRole(rejected, 'menuitem', CHAT.webSettings)).not.toBeNull();
+    page!.unmount();
+    api!();
+
+    const base = exa(['exa-search', 'exa-fetch']);
+    const noCli = await panel('ok', 'Web search, Exa', {
+      ...base,
+      firecrawl: true,
+      providers: [
+        ...base.providers,
+        {
+          id: 'firecrawl',
+          skill: { installed: true, names: ['a', 'b', 'c', 'd', 'e'], upstream: null },
+          work: { ready: false, missing: 'firecrawl-cli' },
+        },
+      ],
+    });
+    await waitFor(() => shown(noCli).includes(skills));
+    expect([...noCli.querySelectorAll('p')].map((p) => p.textContent)).toEqual([skills]);
+  });
+
+  it('Work: the Crawler panel says what Work gets from Firecrawl; the Web search line counts search skills only', async () => {
+    const body = (place: 'firecrawl' | 'off', missing: 'firecrawl-cli' | null, installed = true) => ({
+      search: 'exa',
+      firecrawl: place !== 'off',
+      fetch: place === 'off' ? 'exa' : 'firecrawl',
+      keychain: 'ok',
+      applyPending: false,
+      vanished: null,
+      providers: [
+        {
+          id: 'exa',
+          configured: true,
+          check: 'ok',
+          skill: { installed: true, names: ['exa-search', 'exa-fetch'], upstream: null },
+          work: { ready: true, missing: null },
+        },
+        {
+          id: 'firecrawl',
+          configured: true,
+          check: 'ok',
+          skill: { installed: installed && place !== 'off', names: ['a', 'b', 'c', 'd', 'e'], upstream: null },
+          work: { ready: missing === null && place !== 'off', missing },
+        },
+      ],
+    });
+    const panel = async (
+      place: 'firecrawl' | 'off',
+      row: string,
+      missing: 'firecrawl-cli' | null = null,
+      installed = true,
+    ): Promise<HTMLElement> => {
+      page?.unmount();
+      api?.();
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+        host: {
+          ...READY_CHAT_HOST,
+          providers: {
+            ...READY_CHAT_HOST.providers,
+            search: 'exa',
+            searchCheck: 'ok',
+            firecrawl: place !== 'off',
+            fetch: place === 'off' ? 'exa' : 'firecrawl',
+          },
+        },
+        routes: { '/providers': body(place, missing, installed) },
+      });
+      click(buttonIn(document.body, CHAT.tools));
+      await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+      click(byRole(document.body, 'menuitem', row)!);
+      await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+      return byRole(document.body, 'dialog', CHAT.crawler)!;
+    };
+    const line = async (dialog: HTMLElement, text: string): Promise<void> => {
+      await waitFor(() => shown(dialog).includes(text));
+      expect([...dialog.querySelectorAll('p')].map((p) => p.textContent)).toEqual([text]);
+      expect(byRole(dialog, 'menu', CHAT.crawler)!.textContent).not.toContain(text);
+      expect(shown(dialog).indexOf(text)).toBeGreaterThan(shown(dialog).indexOf(CHAT.webSettings));
+    };
+
+    const on = await panel('firecrawl', CHAT.crawlerNameOn);
+    await line(on, fill(CHAT.crawlerWorkKey, { n: 5 }));
+    key(on, 'ArrowLeft');
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) === null);
+    click(byRole(document.body, 'menuitem', 'Web search, Exa')!);
+    await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+    const web = byRole(document.body, 'dialog', CHAT.webSearch)!;
+    const skills = fill(CHAT.webWork, { skills: '2 Exa skills' });
+    await waitFor(() => shown(web).includes(skills));
+    expect([...web.querySelectorAll('p')].map((p) => p.textContent)).toEqual([skills]);
+
+    await line(await panel('firecrawl', CHAT.crawlerNameOn, 'firecrawl-cli'), CHAT.crawlerWorkNoCli);
+    await line(await panel('firecrawl', CHAT.crawlerNameOn, null, false), CHAT.crawlerWorkMissing);
+    await line(await panel('off', CHAT.crawlerNameOff), CHAT.crawlerWorkOff);
+  });
+});
+
+describe('files on the shared New screen', () => {
+  it('a picture attached in Chat blocks Send in Work with the Work sentence, and the + row says text files only', async () => {
+    chooseFolder(FOLDER);
+    writeAttachments(NEW_PLACE, [
+      {
+        id: 'mode-pic',
+        kind: 'image',
+        name: 'shot.png',
+        mediaType: 'image/png',
+        bytes: 16,
+        dataUrl: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg==',
+      },
+    ]);
+    const vision: ChatHostState = {
+      ...READY_CHAT_HOST,
+      models: [{ ...READY_CHAT_HOST.models[0]!, images: true }],
+    };
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), { host: vision });
+    const form = (): HTMLFormElement =>
+      page!.container.querySelector<HTMLFormElement>(`form[aria-label="${CHAT.composerLabel}"]`)!;
+    const area = form().querySelector('textarea')!;
+    act(() => {
+      Reflect.set(HTMLTextAreaElement.prototype, 'value', 'What is on it?', area);
+      area.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    const send = (): HTMLButtonElement => [...form().querySelectorAll('button')].at(-1)!;
+    expect(send().disabled).toBe(false);
+    expect(shown(form())).not.toContain(CHAT.attach.chipWork);
+    click(buttonIn(page!.container, CHAT.modeWork));
+    await waitFor(() => shown().includes(CHAT.heroWorkTitle));
+    expect(shown(form())).toContain(CHAT.attach.chipWork);
+    expect(shown(form())).toContain(CHAT.attach.blockedWork);
+    expect(send().disabled).toBe(true);
+    click(buttonIn(form(), CHAT.tools));
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    const row = byRole(document.body, 'menuitem', CHAT.attach.row)!;
+    expect(row.textContent).toContain(CHAT.attach.noteWork);
   });
 });

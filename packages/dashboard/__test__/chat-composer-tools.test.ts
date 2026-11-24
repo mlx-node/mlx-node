@@ -2,13 +2,18 @@
  * @vitest-environment happy-dom
  */
 
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { act, createElement } from 'react';
+import { MemoryRouter } from 'react-router-dom';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { Tooltip } from '../ui/src/components/arc/tooltip/tooltip.js';
 import { CHAT } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState } from '../ui/src/lib/chat-types.js';
-import { modelBases, startModel } from '../ui/src/pages/chat/composer-tools.js';
+import { type AttachRow, ComposerMenu, modelBases, startModel } from '../ui/src/pages/chat/composer-tools.js';
+import { RenameDialog } from '../ui/src/pages/chat/conversation-actions.js';
 import { pickedVariants, storeVariant } from '../ui/src/pages/chat/drafts.js';
-import { hostModel, READY_CHAT_HOST } from './render.js';
+import { mount, unmountAll } from './helpers/mount.js';
+import { accessibleName, allByRole, byRole, hostModel, READY_CHAT_HOST, waitFor } from './render.js';
 
 const MODELS = ['alpha', 'bravo', 'charlie', 'delta'].map((id) => hostModel(id, 32768));
 
@@ -60,6 +65,7 @@ function build(
     format: id.includes('gguf') || variant.startsWith('UD-') ? 'gguf' : 'mlx',
     contextTokens: 262144,
     sizeBytes: sizeGb === null ? null : Math.round(sizeGb * GB),
+    images: false,
     ...over,
   };
 }
@@ -211,5 +217,165 @@ describe('the last model picked per base', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('ComposerMenu', () => {
+  afterEach(unmountAll);
+
+  it('before the first host state the + is drawn and disabled, and a click opens no menu', () => {
+    const container = mount(
+      createElement(ComposerMenu, { providers: null, mode: 'chat', attach: { open: () => undefined, full: false } }),
+    );
+    const plus = [...container.querySelectorAll('button')].find((b) => accessibleName(b) === CHAT.tools)!;
+    expect(plus.disabled).toBe(true);
+    act(() => plus.click());
+    expect(byRole(document.body, 'menu', CHAT.tools)).toBeNull();
+  });
+
+  describe('Add files or photos', () => {
+    const open = vi.fn();
+    afterEach(() => open.mockClear());
+
+    interface Setup {
+      attach?: Partial<AttachRow>;
+      providers?: ChatHostState['providers'] | null;
+      mode?: 'chat' | 'work';
+      rename?: boolean;
+    }
+
+    function setup(over: Setup = {}): HTMLElement {
+      const attach: AttachRow = { open, full: false, ...over.attach };
+      // The settings row of the Web search panel navigates.
+      return mount(
+        createElement(
+          MemoryRouter,
+          null,
+          createElement('textarea', { 'aria-label': 'Message' }),
+          createElement(ComposerMenu, {
+            providers: over.providers === undefined ? READY_CHAT_HOST.providers : over.providers,
+            mode: over.mode ?? 'chat',
+            attach,
+          }),
+          createElement(Tooltip, { content: 'Tip', children: createElement('button', { type: 'button' }, 'Tipped') }),
+          createElement(RenameDialog, {
+            target: over.rename === true ? { id: 'c1', title: 'Old', busy: false } : null,
+            onOpenChange: () => undefined,
+            onRenamed: () => undefined,
+          }),
+        ),
+      );
+    }
+
+    const plus = (): HTMLButtonElement =>
+      [...document.querySelectorAll('button')].find((b) => accessibleName(b) === CHAT.tools)!;
+    const menu = (): HTMLElement | null => byRole(document.body, 'menu', CHAT.tools);
+    const metaU = (target: Element): void => {
+      act(() => {
+        target.dispatchEvent(
+          new KeyboardEvent('keydown', { key: 'u', metaKey: true, bubbles: true, cancelable: true }),
+        );
+      });
+    };
+    const openMenu = async (): Promise<HTMLElement> => {
+      act(() => plus().click());
+      await waitFor(() => menu() !== null);
+      return menu()!;
+    };
+
+    it('is the first row of the + menu, above Web search and Crawler, with ⌘U; picking it opens the picker and closes the menu', async () => {
+      setup();
+      const rows = allByRole(await openMenu(), 'menuitem');
+      expect(rows.map((row) => row.querySelector('[class*="label"]')?.textContent)).toEqual([
+        CHAT.attach.row,
+        CHAT.webSearch,
+        CHAT.crawler,
+      ]);
+      expect(rows[0]!.getAttribute('aria-keyshortcuts')).toBe('Meta+U');
+      expect(rows[0]!.textContent).toContain(CHAT.attach.keys);
+      act(() => rows[0]!.click());
+      expect(open).toHaveBeenCalledTimes(1);
+      await waitFor(() => menu() === null);
+    });
+
+    it.each([
+      ['images on', { note: undefined }, null],
+      ['images off', { note: CHAT.attach.noteNoImages }, CHAT.attach.noteNoImages],
+      ['Work', { note: CHAT.attach.noteWork }, CHAT.attach.noteWork],
+    ] as const)('the row note with %s; the row acts', async (_, attach, note) => {
+      setup({ attach });
+      const row = byRole(await openMenu(), 'menuitem', CHAT.attach.row)!;
+      const described = row.getAttribute('aria-describedby');
+      expect(described === null ? null : document.getElementById(described)?.textContent).toBe(note);
+      expect(row.getAttribute('aria-disabled')).toBeNull();
+      act(() => row.click());
+      expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('with 4 attached the row says so and does nothing, and ⌘U does nothing', async () => {
+      setup({ attach: { full: true, note: CHAT.attach.noteFull } });
+      const row = byRole(await openMenu(), 'menuitem', CHAT.attach.row)!;
+      expect(row.getAttribute('aria-disabled')).toBe('true');
+      expect(row.textContent).toContain(CHAT.attach.noteFull);
+      act(() => row.click());
+      metaU(document.body);
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it('⌘U opens the picker from the message field', () => {
+      setup();
+      const area = document.querySelector('textarea')!;
+      act(() => area.focus());
+      metaU(area);
+      expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('⌘U opens the picker with the + menu open, and the menu closes', async () => {
+      setup();
+      const shown = await openMenu();
+      metaU(shown);
+      expect(open).toHaveBeenCalledTimes(1);
+      await waitFor(() => menu() === null);
+    });
+
+    it('⌘U opens the picker with the Web search panel open: a dialog inside a popover is not a modal', async () => {
+      setup();
+      const web = allByRole(await openMenu(), 'menuitem')[1]!;
+      act(() => web.click());
+      await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
+      metaU(byRole(document.body, 'dialog', CHAT.webSearch)!);
+      expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('⌘U opens the picker with the Crawler panel open', async () => {
+      setup();
+      const crawler = allByRole(await openMenu(), 'menuitem')[2]!;
+      act(() => crawler.click());
+      await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
+      metaU(byRole(document.body, 'dialog', CHAT.crawler)!);
+      expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('⌘U opens the picker while a tooltip shows', async () => {
+      setup();
+      const tipped = [...document.querySelectorAll('button')].find((b) => b.textContent === 'Tipped')!;
+      act(() => tipped.focus());
+      await waitFor(() => document.querySelector('[role="tooltip"]') !== null);
+      metaU(tipped);
+      expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('⌘U does nothing before the first host state (the + is disabled)', () => {
+      setup({ providers: null });
+      metaU(document.querySelector('textarea')!);
+      expect(open).not.toHaveBeenCalled();
+    });
+
+    it('⌘U does nothing while the Rename dialog is open', async () => {
+      setup({ rename: true });
+      await waitFor(() => byRole(document.body, 'dialog') !== null);
+      metaU(document.activeElement ?? document.body);
+      expect(open).not.toHaveBeenCalled();
+    });
   });
 });

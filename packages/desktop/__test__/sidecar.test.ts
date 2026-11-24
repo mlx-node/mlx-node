@@ -18,10 +18,13 @@ import { AddressInfo } from 'node:net';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
+import { ModelsDirUnavailableError } from '../../server/src/host/paths.js';
+import { STARTUP_FAILURE_PREFIX } from '../src/inference/exit-codes.js';
 import {
   endpointModels,
   EXIT_STARTUP_FAILED,
   handleSidecarRequest,
+  isPermanentStartupFailure,
   NoParentChannelError,
   resolveParentChannel,
   runSidecar,
@@ -68,7 +71,15 @@ async function realHost(overrides: Partial<SidecarHost> = {}): Promise<SidecarHo
     modelsDir: '/models',
     boundModel: 'a-model',
     models: [
-      { name: 'a-model', path: '/models/a-model', modelType: 'qwen3', base: 'a-model', variant: 'BF16', format: 'mlx' },
+      {
+        name: 'a-model',
+        path: '/models/a-model',
+        modelType: 'qwen3',
+        base: 'a-model',
+        variant: 'BF16',
+        format: 'mlx',
+        supportsImages: false,
+      },
     ],
     logDir: null,
     close: async () => {
@@ -225,6 +236,21 @@ describe('the readiness handshake', () => {
     expect(h.stderr.join('\n')).toContain('No models discovered');
   });
 
+  it('exits 78 with the plain sentence when the models folder is a link to a missing disk', async () => {
+    // Mutation: drop the name from isPermanentStartupFailure → red (exits 1, six retries).
+    const unavailable = new ModelsDirUnavailableError('/Users/x/.mlx-node/models', '/Volumes/Disk/models');
+    expect(isPermanentStartupFailure(unavailable)).toBe(true);
+    const h = harness(() => Promise.reject(unavailable));
+    await runSidecar(h.deps);
+
+    expect(h.exits).toEqual([EXIT_STARTUP_FAILED]);
+    // The one line MAIN reads the reason from.
+    expect(h.stderr).toEqual([`${STARTUP_FAILURE_PREFIX}${unavailable.message}`]);
+    expect(unavailable.message).toBe(
+      'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.',
+    );
+  });
+
   it('exits 1, not 78, for a startup failure a retry could clear', async () => {
     // A locked responses.db rejects createHost exactly like an empty models
     // dir does, but the lock is transient — 78 would tell the supervisor to
@@ -323,9 +349,17 @@ describe('handleSidecarRequest', () => {
 });
 
 describe('endpointModels', () => {
-  it('writes each served model field by field, with its base, variant, format, modelType and kind', () => {
+  it('writes each served model field by field, with its base, variant, format, modelType, kind and images', () => {
     const models = [
-      { name: 'm-Q4_K_M', path: '/m.gguf', modelType: 'qwen4_exp', base: 'm', variant: 'Q4_K_M', format: 'gguf' },
+      {
+        name: 'm-Q4_K_M',
+        path: '/m.gguf',
+        modelType: 'qwen4_exp',
+        base: 'm',
+        variant: 'Q4_K_M',
+        format: 'gguf',
+        supportsImages: false,
+      },
       {
         name: 'm-bf16',
         path: '/m-bf16',
@@ -333,6 +367,7 @@ describe('endpointModels', () => {
         base: 'm',
         variant: 'BF16',
         format: 'mlx',
+        supportsImages: true,
         preset: {},
       },
       {
@@ -342,6 +377,7 @@ describe('endpointModels', () => {
         base: 'clairic-flash-4bit',
         variant: '4-bit',
         format: 'mlx',
+        supportsImages: true,
       },
       {
         name: 'clef-flash',
@@ -350,6 +386,7 @@ describe('endpointModels', () => {
         base: 'clef-flash',
         variant: 'MLX',
         format: 'mlx',
+        supportsImages: false,
       },
     ] as SidecarHost['models'];
     const value = endpointModels(models);
@@ -362,6 +399,7 @@ describe('endpointModels', () => {
         format: 'gguf',
         modelType: 'qwen4_exp',
         kind: 'chat',
+        images: false,
       },
       {
         name: 'm-bf16',
@@ -371,6 +409,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'qwen4_exp',
         kind: 'chat',
+        images: true,
       },
       {
         name: 'clairic-flash-4bit',
@@ -380,6 +419,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'clairic',
         kind: 'decision',
+        images: true,
       },
       {
         name: 'clef-flash',
@@ -389,6 +429,7 @@ describe('endpointModels', () => {
         format: 'mlx',
         modelType: 'clef',
         kind: 'decision',
+        images: false,
       },
     ]);
   });

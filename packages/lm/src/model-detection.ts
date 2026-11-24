@@ -14,6 +14,11 @@ const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>(
   ),
 );
 
+/** The family whose `ggufArchitectures` holds a GGUF header's `general.architecture`, or undefined. */
+export function ggufArchitectureModelType(architecture: string): ModelType | undefined {
+  return GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
+}
+
 export async function readModelConfig(modelDir: string): Promise<unknown> {
   const file = await open(join(modelDir, 'config.json'), constants.O_RDONLY | constants.O_NONBLOCK);
   try {
@@ -81,7 +86,7 @@ export async function detectModelType(
   } catch (error) {
     if (isGguf && (error as NodeJS.ErrnoException).code === 'ENOENT') {
       const architecture = await readArchitecture(modelPath);
-      const type = GGUF_ARCHITECTURE_MODEL_TYPES.get(architecture);
+      const type = ggufArchitectureModelType(architecture);
       if (type === undefined) throw new Error(`Unsupported GGUF architecture "${architecture}" in ${modelPath}`);
       if (type === 'qwen3_5') {
         const promoted = await detectQwen35Sidecar(sidecarDir, false);

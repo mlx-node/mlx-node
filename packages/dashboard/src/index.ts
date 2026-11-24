@@ -24,6 +24,7 @@ export {
   type ApiRequestInput,
 } from './api/dispatch.js';
 export { ROUTES, type Route, type RouteThread } from './api/routes.js';
+export { workCommandPath } from './chat/agent/work-path.js';
 export type {
   MetricsDistributions,
   MetricsModels,
@@ -50,7 +51,13 @@ export type {
   WakeCause,
 } from './agent-sessions/types.js';
 export { type ColdCacheDiskInfo, clearColdCache, evictOlderThan, scanColdCache } from './cache.js';
-export { type CatalogItem, catalogSlug, catalogWithState } from './catalog.js';
+export {
+  type CatalogBlocker,
+  type CatalogBuildItem,
+  type CatalogDraftItem,
+  type CatalogItem,
+  catalogWithState,
+} from './catalog.js';
 export { type DashboardDb, openDashboardDb } from './db/open.js';
 export { traces } from './db/schema.js';
 export { DownloadManager, type DownloadEvent } from './download.js';

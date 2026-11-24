@@ -49,6 +49,11 @@
       "types": "./dist/model-discovery.d.ts",
       "import": "./dist/model-discovery.js"
     },
+    "./model-variant": {
+      "@mlx-node/source": "./src/model-variant.ts",
+      "types": "./dist/model-variant.d.ts",
+      "import": "./dist/model-variant.js"
+    },
     "./gguf-metadata": {
       "@mlx-node/source": "./src/gguf-metadata.ts",
       "types": "./dist/gguf-metadata.d.ts",

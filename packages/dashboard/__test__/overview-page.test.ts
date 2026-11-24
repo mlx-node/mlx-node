@@ -57,11 +57,12 @@ const GGUF_MODELS: ModelsResponse = {
       sizeBytes: 16 * 1024 ** 3,
       fileCount: 3,
       servedIds: ['Qwen3.6-27B-Q4_K_M'],
+      located: null,
+      link: false,
     },
   ],
   warnings: [],
   dir: '/models',
-  host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
 };
 
 function routes(overrides: Record<string, unknown> = {}): Record<string, unknown> {
@@ -165,6 +166,7 @@ describe('Overview engine panel', () => {
           nativeErrorsCapped: false,
           lastNativeErrorContext: null,
           lastNativeErrorAt: null,
+          failureReason: null,
           writtenAt: Date.now(),
         },
       }),

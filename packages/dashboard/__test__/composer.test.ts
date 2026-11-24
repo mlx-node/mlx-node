@@ -187,6 +187,107 @@ describe('Composer', () => {
   });
 });
 
+/** A DataTransfer stand-in: happy-dom has none that holds files. */
+function transfer(types: string[], files: File[]): DataTransfer {
+  const items = files.map((file) => ({ kind: 'file', type: file.type, getAsFile: () => file }));
+  return { types, files, items } as unknown as DataTransfer;
+}
+
+function dispatchWith(
+  target: Element,
+  name: string,
+  field: 'clipboardData' | 'dataTransfer',
+  data: DataTransfer,
+): Event {
+  const event = new Event(name, { bubbles: true, cancelable: true });
+  Object.defineProperty(event, field, { value: data });
+  act(() => {
+    target.dispatchEvent(event);
+  });
+  return event;
+}
+
+describe('Composer files', () => {
+  const png = new File(['png'], 'shot.png', { type: 'image/png' });
+  const notes = new File(['notes'], 'notes.md', { type: 'text/markdown' });
+
+  it('the attachments slot renders between the notice and the text field', () => {
+    const container = mount(
+      createElement(
+        Composer,
+        props({
+          notice: { tone: 'warning', text: 'Engine starting' },
+          attachments: createElement('div', { 'data-testid': 'strip' }, 'STRIP'),
+        }),
+      ),
+    );
+    const form = container.querySelector('form')!;
+    const strip = form.querySelector('[data-testid="strip"]')!;
+    const notice = byRole(container, 'status')!;
+    const area = byRole(container, 'textbox', 'Message')!;
+    const order = [...form.children];
+    const at = (node: Element): number => order.findIndex((child) => child.contains(node));
+    expect(at(notice)).toBeLessThan(at(strip));
+    expect(at(strip)).toBeLessThan(at(area));
+  });
+
+  it('a paste with files and no plain text calls onFiles and stops the paste; with plain text it does not', () => {
+    const onFiles = vi.fn();
+    const container = mount(createElement(Composer, props({ onFiles })));
+    const area = byRole(container, 'textbox', 'Message')!;
+    const fileOnly = dispatchWith(area, 'paste', 'clipboardData', transfer(['Files'], [png]));
+    expect(onFiles).toHaveBeenCalledWith([png]);
+    expect(fileOnly.defaultPrevented).toBe(true);
+    onFiles.mockClear();
+    const withText = dispatchWith(area, 'paste', 'clipboardData', transfer(['text/plain', 'Files'], [png]));
+    expect(onFiles).not.toHaveBeenCalled();
+    expect(withText.defaultPrevented).toBe(false);
+    const textOnly = dispatchWith(area, 'paste', 'clipboardData', transfer(['text/plain'], []));
+    expect(textOnly.defaultPrevented).toBe(false);
+    expect(onFiles).not.toHaveBeenCalled();
+  });
+
+  it('a file drop on the form calls onFiles; dragging marks the form until the pointer leaves it', () => {
+    const onFiles = vi.fn();
+    const container = mount(createElement(Composer, props({ onFiles })));
+    const form = container.querySelector('form')!;
+    const area = byRole(container, 'textbox', 'Message')!;
+    const over = dispatchWith(area, 'dragover', 'dataTransfer', transfer(['Files'], [notes]));
+    expect(over.defaultPrevented).toBe(true);
+    expect(form.hasAttribute('data-dragging')).toBe(true);
+    const inside = new Event('dragleave', { bubbles: true });
+    Object.defineProperty(inside, 'relatedTarget', { value: area });
+    act(() => {
+      form.dispatchEvent(inside);
+    });
+    expect(form.hasAttribute('data-dragging')).toBe(true);
+    act(() => {
+      form.dispatchEvent(new Event('dragleave', { bubbles: true }));
+    });
+    expect(form.hasAttribute('data-dragging')).toBe(false);
+    dispatchWith(form, 'dragover', 'dataTransfer', transfer(['Files'], [notes]));
+    const drop = dispatchWith(form, 'drop', 'dataTransfer', transfer(['Files'], [notes, png]));
+    expect(drop.defaultPrevented).toBe(true);
+    expect(onFiles).toHaveBeenCalledWith([notes, png]);
+    expect(form.hasAttribute('data-dragging')).toBe(false);
+    expect(
+      cssValue(cssRules('components/arc-x/composer/composer.module.css'), '.root[data-dragging]', 'border-color'),
+    ).toBe('var(--foreground)');
+  });
+
+  it('without onFiles a file drop on the text field is still ignored and the form is not marked', () => {
+    const container = mount(createElement(Composer, props()));
+    const form = container.querySelector('form')!;
+    const area = byRole(container, 'textbox', 'Message')!;
+    const over = dispatchWith(area, 'dragover', 'dataTransfer', transfer(['Files'], [notes]));
+    const drop = dispatchWith(area, 'drop', 'dataTransfer', transfer(['Files'], [notes]));
+    expect([over.defaultPrevented, drop.defaultPrevented]).toEqual([true, true]);
+    expect(form.hasAttribute('data-dragging')).toBe(false);
+    const paste = dispatchWith(area, 'paste', 'clipboardData', transfer(['Files'], [png]));
+    expect(paste.defaultPrevented).toBe(false);
+  });
+});
+
 describe('Composer tools row', () => {
   const rules = cssRules('components/arc-x/composer/composer.module.css');
   const value = (selector: string, property: string): string | undefined => cssValue(rules, selector, property);
@@ -215,7 +316,7 @@ describe('Composer tools row', () => {
     expect(value(".fit[data-side='reason']", 'flex-wrap')).toBe('nowrap');
   });
 
-  it('the chips give way in order: folder, then web, then the model, each down to its floor', () => {
+  it('the chips give way in order: tier 1, then tier 2, then the model, each down to its floor', () => {
     const shrink = (give: number): number =>
       Number(value(`.toolsStart > [data-give='${String(give)}']`, 'flex-shrink'));
     expect(shrink(1)).toBeGreaterThan(shrink(2) * 1000);

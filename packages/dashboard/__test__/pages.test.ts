@@ -17,42 +17,69 @@
  * environment stays `node` for every other suite.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
+import { INITIAL_PROGRESS } from '@/components/download-progress';
+import { useHost } from '@/lib/host';
 import { categoryLabels, truncateMiddle } from '@/lib/labels';
 import { modelShareLabel } from '@/lib/metrics-view';
+import { FOLDER_PICKED_MESSAGE, PICK_FOLDER_MESSAGE } from '@/lib/pick-folder';
 import { toast } from '@/lib/toast';
 import type {
   CacheResponse,
   CacheScope,
+  AdoptPlanResponse,
   CatalogBlocker,
+  CatalogBuildItem,
   CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   ColdTierHealth,
   DownloadJob,
   DownloadsResponse,
+  HostResponse,
+  LocatePlanResponse,
   ModelsResponse,
 } from '@/lib/types';
 import Cache from '@/pages/cache';
 import Metrics from '@/pages/metrics';
 import Models from '@/pages/models';
-import { blockerPhrase, CatalogDownloadAction, hostNote, reinstallContent } from '@/pages/models/catalog';
+import {
+  catalogActionState,
+  CatalogCardView,
+  type CatalogCardViewProps,
+  CatalogDownloadAction,
+  cleanupContent,
+  hostLine,
+  hostNote,
+  type LocateControl,
+  locateContent,
+  updateContent,
+} from '@/pages/models/catalog';
+import { type CatalogDownloadProps, useModelDownloads } from '@/pages/models/use-model-downloads';
 import Overview from '@/pages/overview';
+import { SystemOneModelsDrawer } from '@/pages/system-one/models-drawer';
 import { type AppCommand, usePageCommands } from '@/shell/commands';
 import { act, createElement, type ReactNode } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
+import { MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { ApiResponse } from '../src/api/errors.js';
+import { catalogWithState } from '../src/catalog.js';
 import type { DownloadEvent } from '../src/download.js';
+import { discoverLocalModels } from '../src/models.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
-import { reloadMountedQueries } from '../ui/src/lib/use-api.js';
+import { reloadMountedQueries, useJson } from '../ui/src/lib/use-api.js';
+import { FLASH_NEXT, HY4 } from './helpers/configless-gguf-fixtures.js';
 import {
   byModelRow,
   dayStart,
@@ -75,6 +102,7 @@ import {
   sequence,
   statValue,
   stubApi,
+  stubError,
   waitFor,
   type RenderedPage,
 } from './render.js';
@@ -627,7 +655,6 @@ describe('Overview page', () => {
       models: [],
       warnings: [],
       dir: '/models',
-      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     };
     const downloads: DownloadsResponse = { jobs: [] };
     return {
@@ -713,7 +740,6 @@ describe('Metrics page — the Models table', () => {
         models: [],
         warnings: [],
         dir: '/models',
-        host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
       },
     };
   }
@@ -794,38 +820,60 @@ describe('Models page — the Install affordance', () => {
   const LABEL = 'Qwen3.8-27B';
   const SLUG = 'qwen3.8-27b-mxfp4-mlx';
 
+  /** The state of the card's one build, plus the entry fields a test sets. */
+  type CardOverrides = Partial<CatalogBuildItem> & Pick<CatalogItem, 'category' | 'draft'>;
+
+  const HOST_64: HostResponse = { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null };
+
   function catalogRoutes(
-    item: Partial<CatalogItem>,
+    overrides: CardOverrides,
     jobs: DownloadJob[] = [],
     updates: CatalogUpdatesResponse = { items: [] },
   ): Record<string, unknown> {
+    const { category, draft, ...build } = overrides;
     const models: ModelsResponse = {
       models: [],
       warnings: [],
       dir: '/models',
-      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     };
     const catalog: CatalogResponse = {
       items: [
         {
           label: LABEL,
-          hfRepo: REPO,
-          sizeGb: 23.3,
           description: 'Best tool use',
-          slug: SLUG,
-          installed: false,
-          present: false,
-          blockedByForeignDir: false,
-          blocker: null,
-          localRevision: null,
-          localAssetsRepo: null,
-          localAssetsRevision: null,
-          ...item,
+          ...(category === undefined ? {} : { category }),
+          ...(draft === undefined ? {} : { draft }),
+          builds: [
+            {
+              id: 'MXFP4',
+              hfRepo: REPO,
+              sizeGb: 23.3,
+              source: 'MLX',
+              slug: SLUG,
+              installed: false,
+              present: false,
+              heldBy: null,
+              blockedByForeignDir: false,
+              blocker: null,
+              localRevision: null,
+              localAssetsRepo: null,
+              localAssetsRevision: null,
+              located: null,
+              listed: false,
+              ...build,
+            },
+          ],
         },
       ],
     };
     const downloads: DownloadsResponse = { jobs };
-    return { '/models': models, '/catalog': catalog, '/catalog/updates': updates, '/downloads': downloads };
+    return {
+      '/models': models,
+      '/host': HOST_64,
+      '/catalog': catalog,
+      '/catalog/updates': updates,
+      '/downloads': downloads,
+    };
   }
 
   /** Trimmed label of every rendered button, plus each card's "Installed" status (text beside a check, not a button). */
@@ -845,7 +893,16 @@ describe('Models page — the Install affordance', () => {
   }
 
   function downloadJob(overrides: Partial<DownloadJob>): DownloadJob {
-    return { id: 'job-1', repo: REPO, state: 'running', receivedBytes: 0, totalBytes: 1024, ...overrides };
+    return {
+      id: 'job-1',
+      slug: SLUG,
+      repo: REPO,
+      kind: 'install',
+      state: 'running',
+      receivedBytes: 0,
+      totalBytes: 1024,
+      ...overrides,
+    };
   }
 
   /** Job ids every mounted card subscribed to, in order. */
@@ -915,8 +972,15 @@ describe('Models page — the Install affordance', () => {
 
   /** Labels of the palette commands the mounted page registers, as of the last render. */
   let paletteLabels: string[] = [];
+  /** Ids of the same commands. */
+  let paletteIds: string[] = [];
+  /** The same commands. */
+  let paletteCommands: readonly AppCommand[] = [];
   function PaletteProbe(): null {
-    paletteLabels = usePageCommands().map((command) => String(command.label));
+    const commands = usePageCommands();
+    paletteCommands = commands;
+    paletteLabels = commands.map((command) => String(command.label));
+    paletteIds = commands.map((command) => command.id);
     return null;
   }
 
@@ -942,36 +1006,69 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Install');
   });
 
+  it('keys the palette Install command by the build folder', async () => {
+    recordRequests(catalogRoutes({}));
+    await mountModels();
+    // Two builds of one repository share `hfRepo`; only the folder tells their commands apart.
+    expect(paletteIds).toContain(`models:install:${SLUG}`);
+  });
+
+  it('names the other build a folder holds and offers no Install into it', async () => {
+    recordRequests(catalogRoutes({ heldBy: 'UD-Q4_K_M' }));
+    await mountModels();
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    // Mutation: drop the held branch of catalogActionState → the card offers Install → red.
+    expect(card.querySelector('[data-row="action"]')?.textContent).toContain('Holds UD-Q4_K_M');
+    expect(buttonLabels()).not.toContain('Install');
+    await act(async () => buttonNamed(card, 'Show why').click());
+    expect(document.body.textContent).toContain(
+      `${SLUG} holds UD-Q4_K_M. It is a working model, so this card does not remove it. Delete it in Local models to install MXFP4 here.`,
+    );
+    expect(paletteLabels).not.toContain(`Install ${LABEL}`);
+  });
+
+  it('follows a job by its folder, not by its repository', async () => {
+    // A job of another build of the same repository installs to another folder.
+    recordRequests(catalogRoutes({}, [downloadJob({}), downloadJob({ id: 'job-sibling', slug: `${SLUG}-ud-q4_k_m` })]));
+    await mountModels();
+    // Mutation: key `active` by job.repo → the card follows no job, or the sibling's → red.
+    expect(openedStreams).toEqual(['job-1']);
+  });
+
   /** {@link catalogRoutes} plus a streamed entry with a memory floor, on a Mac with `memGib` of RAM. */
   function floorRoutes(memGib: number): Record<string, unknown> {
     const routes = catalogRoutes({});
     const catalog = routes['/catalog'] as CatalogResponse;
+    const first = catalog.items[0]!;
     const streamed: CatalogItem = {
-      ...catalog.items[0]!,
+      ...first,
       label: 'Hy4-flash',
-      hfRepo: 'AngelSlim/Hy4-flash-GGUF',
-      slug: 'hy4-flash-gguf',
-      sizeGb: 168.3,
       description: '512-expert MoE streamed from SSD',
-      minMemoryGb: 39,
+      minMemoryGb: 96,
+      builds: [
+        {
+          ...first.builds[0],
+          id: 'Q4_K_M',
+          hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+          slug: 'hy4-flash-gguf',
+          sizeGb: 168.3,
+        },
+      ],
     };
     routes['/catalog'] = { items: [...catalog.items, streamed] };
-    routes['/models'] = {
-      ...(routes['/models'] as ModelsResponse),
-      host: { totalMemBytes: memGib * 1024 ** 3, diskFreeBytes: null },
-    };
+    routes['/host'] = { totalMemBytes: memGib * 1024 ** 3, diskFreeBytes: null };
     return routes;
   }
 
   it('leaves out a recommended model whose memory floor this Mac misses', async () => {
-    await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(36), LABEL);
+    await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(64), LABEL);
     await settle();
     expect(mounted!.container.querySelector(`[data-model="${SLUG}"]`)).not.toBeNull();
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).toBeNull();
   });
 
   it('offers a streamed model at its memory floor, with no weights-larger-than-memory note', async () => {
-    const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(39), 'Hy4-flash');
+    const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(96), 'Hy4-flash');
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).not.toBeNull();
     expect(text).toContain(LABEL);
     expect(text).not.toContain("larger than this Mac's memory");
@@ -981,10 +1078,107 @@ describe('Models page — the Install affordance', () => {
     expect(installs).toHaveLength(2);
   });
 
+  /** `/models` never answers: the walk of every model folder must not hold the cards back. */
+  const modelsNever = (path: string): Promise<ApiResponse> | undefined =>
+    path === '/models' ? new Promise<ApiResponse>(() => {}) : undefined;
+
+  it.each<[number, boolean]>([
+    [128, true],
+    [64, false],
+  ])('filters the cards by the /host memory while /models never answers (%i GiB)', async (gib, floored) => {
+    serveJobs(
+      floorRoutes(gib),
+      () => ({ ok: false, status: 404, code: 'E_NOT_FOUND', message: 'no' }),
+      undefined,
+      modelsNever,
+    );
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes(' installed'),
+    );
+    expect(mounted.container.querySelector('[data-model="hy4-flash-gguf"]') !== null).toBe(floored);
+    expect(mounted.text()).toContain(floored ? '0 of 2 installed' : '0 of 1 installed');
+  });
+
+  it('keeps the loading shape and no count until /host answers, and asks for /catalog before /models', async () => {
+    let answerHost!: () => void;
+    const host = new Promise<ApiResponse>((resolve) => {
+      answerHost = () =>
+        resolve({ ok: true, status: 200, body: { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null } });
+    });
+    const routes = floorRoutes(128);
+    const catalog = routes['/catalog'] as CatalogResponse;
+    const first = catalog.items[0]!;
+    const systemOne: CatalogItem = {
+      ...first,
+      label: 'Clairic-Mini',
+      category: 'systemone',
+      builds: [{ ...first.builds[0]!, hfRepo: 'mlx-node/Clairic-Mini', slug: 'clairic-mini' }],
+    };
+    routes['/catalog'] = { items: [...catalog.items, systemOne] };
+    const calls = serveJobs(
+      routes,
+      () => ({ ok: false, status: 404, code: 'E_NOT_FOUND', message: 'no' }),
+      undefined,
+      (path) => (path === '/host' ? host : modelsNever(path)),
+    );
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes('Recommended models'),
+    );
+    await waitFor(() => calls.some((call) => call.path === '/catalog'));
+    await settle();
+    // Mutation: filter by an unknown host → "0 of 1 installed" for a list that is still filtered → red.
+    expect(mounted.text()).not.toContain('installed');
+    expect(mounted.container.querySelector('[data-model]')).toBeNull();
+    expect(mounted.container.querySelector('[data-catalog-card]')).not.toBeNull();
+    // The System One section keeps its place too, as two placeholders.
+    expect(mounted.container.querySelectorAll('#system-one-models [data-catalog-card]')).toHaveLength(2);
+    expect(mounted.container.querySelector('#system-one-models [data-model]')).toBeNull();
+    answerHost();
+    await waitFor(() => (mounted!.text() ?? '').includes('0 of 2 installed'));
+    expect(mounted.text()).toContain('0 of 1 installed');
+    expect(mounted.container.querySelector('#system-one-models [data-model="clairic-mini"]')).not.toBeNull();
+    const order = calls.filter((call) => call.method === 'GET').map((call) => call.path);
+    expect(order.indexOf('/catalog')).toBeLessThan(order.indexOf('/models'));
+  });
+
+  it('links an installed card to Details and a held one to Local models while /models never answers', async () => {
+    serveJobs(
+      catalogRoutes({ present: true, installed: true, listed: true }),
+      () => ({ ok: false, status: 404, code: 'E_NOT_FOUND', message: 'no' }),
+      undefined,
+      modelsNever,
+    );
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes('Details'),
+    );
+    const card = mounted.container.querySelector(`[data-model="${SLUG}"]`)!;
+    expect(card.querySelector('a[href^="/models"]')?.getAttribute('href')).toBe(`/models?focus=${SLUG}`);
+    mounted.unmount();
+    restoreApi?.();
+    serveJobs(
+      catalogRoutes({ heldBy: 'UD-Q4_K_M', listed: true }),
+      () => ({ ok: false, status: 404, code: 'E_NOT_FOUND', message: 'no' }),
+      undefined,
+      modelsNever,
+    );
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes('Show in Local models'),
+    );
+    expect(mounted.container.querySelector(`[data-model="${SLUG}"] a[href="/models?focus=${SLUG}"]`)).not.toBeNull();
+  });
+
   it('hostNote keeps the weights note for entries without a memory floor only', () => {
     const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: null };
-    expect(hostNote({ sizeGb: 168.3, present: false }, host)).toContain("larger than this Mac's memory");
-    expect(hostNote({ sizeGb: 168.3, present: false, minMemoryGb: 39 }, host)).toBeNull();
+    expect(hostNote({ sizeGb: 168.3, present: false }, undefined, host)).toContain("larger than this Mac's memory");
+    expect(hostNote({ sizeGb: 168.3, present: false }, 96, host)).toBeNull();
+  });
+
+  it.each([96, 128])('hostNote gives Qwen3.8-Flash-Next and Hy4-flash no note on a %i GiB Mac', (gib) => {
+    const host = { totalMemBytes: gib * 1024 ** 3, diskFreeBytes: null };
+    for (const label of ['Qwen3.8-Flash-Next', 'Hy4-flash']) {
+      const entry = MODEL_CATALOG.find((item) => item.label === label)!;
+      expect(hostNote({ sizeGb: entry.builds[0].sizeGb, present: false }, entry.minMemoryGb, host), label).toBeNull();
+    }
   });
 
   function draftItem(present = false): NonNullable<CatalogItem['draft']> {
@@ -1012,7 +1206,6 @@ describe('Models page — the Install affordance', () => {
       companions: [companion],
       warnings: [],
       dir: '/models',
-      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     };
     routes['/models'] = sequence(initial, { ...initial, companions: [] });
     routes[`/models/${draft.slug}`] = { deleted: true, name: draft.slug };
@@ -1042,7 +1235,7 @@ describe('Models page — the Install affordance', () => {
     ]);
     await waitFor(() => !(mounted!.container.textContent ?? '').includes('Companion weights (1)'));
     expect(statValue(mounted!.container, 'On disk')).not.toContain('2.0');
-    expect(buttonLabels()).toContain('Install DFlash2');
+    expect(buttonLabels()).toContain('Add');
   });
 
   it.each([false, true])(
@@ -1060,14 +1253,18 @@ describe('Models page — the Install affordance', () => {
       expect(card).toBe(target.closest('[data-model]'));
       expect(link.textContent).toBe('DFlash2');
       const companion = link.closest('[role="group"]')!;
-      expect(companion.textContent).toContain('Used automatically');
-      expect(companion.textContent).toContain('3.85 GB');
+      expect(companion.getAttribute('aria-label')).toBe('DFlash2 add-on');
+      expect(companion.closest('[data-row]')?.getAttribute('data-row')).toBe('extras');
       const button = companion.querySelector('button');
       if (present) {
-        expect(companion.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
+        expect(companion.textContent).toContain('added');
+        expect(companion.textContent).not.toContain('waits for the model');
         expect(button).toBeNull();
       } else {
-        expect(button?.textContent?.trim()).toBe('Install DFlash2');
+        expect(companion.textContent).toContain('Optional');
+        expect(companion.textContent).toContain('3.85 GB');
+        expect(button?.textContent?.trim()).toBe('Add');
+        expect(button?.getAttribute('aria-label')).toBe('Add DFlash2, 3.85 GB');
         expect(button?.disabled).toBe(false);
       }
     },
@@ -1076,17 +1273,19 @@ describe('Models page — the Install affordance', () => {
   it('resumes a companion download and subscribes to its own progress', async () => {
     const draft = draftItem();
     recordRequests(
-      catalogRoutes({ present: true, installed: true, draft }, [downloadJob({ id: 'draft-job', repo: draft.hfRepo })]),
+      catalogRoutes({ present: true, installed: true, draft }, [
+        downloadJob({ id: 'draft-job', slug: draft.slug, repo: draft.hfRepo }),
+      ]),
     );
     await mountModels();
     expect(openedStreams).toContain('draft-job');
     const card = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
       .closest('[data-model]')!;
-    const companion = card.querySelector('[role="group"]')!;
+    const companion = card.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
     expect(companion.textContent).toContain('Cancel');
-    expect(companion.textContent).not.toContain('Installed');
-    expect(card.textContent).toContain('Installed');
+    expect(companion.textContent).not.toContain('added');
+    expect(card.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
   });
 
   const LEFTOVER = 'imatrix_unsloth.gguf_file';
@@ -1101,37 +1300,120 @@ describe('Models page — the Install affordance', () => {
     holdsModel: false,
     linkTarget: null,
     dangling: false,
+    linkToFile: false,
+    locked: false,
   };
+  const CLEANUP = 'Clean up & update…';
 
-  it('names what is in the way and offers Reinstall instead of an Install the runner refuses', async () => {
+  /** A confirmation's text with its white space folded. */
+  function dialogText(title = 'Clean up and update?'): string {
+    return splitWhitespace(confirmDialog(title)?.textContent ?? '').join(' ');
+  }
+
+  it('names what is in the way and offers Clean up & update instead of an Install the runner refuses', async () => {
     const text = await mount(
       createElement(MemoryRouter, null, createElement(Models)),
       catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Reinstall');
+    expect(buttonLabels()).toContain(CLEANUP);
     expect(buttonLabels()).not.toContain('Install');
     expect(text).toContain('Needs cleanup');
-    expect(text).toContain(`${SLUG} is in the way: a directory with 1 file (183 MB) that the app did not create.`);
-    expect(text).toContain('Reinstall downloads the model, then removes this directory.');
-    expect(text).not.toContain('already exists and was not created by the app');
-    expect(text.toLowerCase()).toContain('remove');
+    // The long text is in the confirmation, not on the card.
+    expect(text).not.toContain('that the app did not create.');
+    await act(async () => buttonNamed(mounted!.container, CLEANUP).click());
+    const dialog = dialogText();
+    expect(dialog).toContain(`${SLUG} is a folder that the app did not create.`);
+    expect(dialog).toContain(`To the Trash The folder ${SLUG}: 1 file (183 MB): ${LEFTOVER}.`);
+    expect(dialog).toContain('Downloaded Qwen3.8-27B MXFP4, 23.3 GB, into a new folder.');
   });
 
-  it.each<[string, boolean, string]>([
-    ['not listed', false, 'Move or delete it in Finder to install this one.'],
-    ['listed in Local models', true, 'Delete it in Local models to install this one.'],
-  ])('offers no Reinstall over a model mlx serve lists (%s)', async (_name, listed, hint) => {
+  /** A real folder with a model the app did not create: the GGUF, the two head files and a README. */
+  const HELD: CatalogBlocker = {
+    ...BLOCKER,
+    fileCount: 4,
+    sizeBytes: 7_612_909_326,
+    names: [],
+    listed: true,
+    holdsModel: true,
+  };
+  const NOTE = `${SLUG} holds a model that the app did not create. Update checks its files against the catalog and downloads the files that are missing. It deletes nothing.`;
+
+  it.each<[string, boolean]>([
+    ['not listed', false],
+    ['listed in Local models', true],
+  ])('offers Update over a real folder that holds a model (%s)', async (_name, listed) => {
     const text = await mount(
       createElement(MemoryRouter, null, createElement(Models)),
-      catalogRoutes({ blockedByForeignDir: true, blocker: { ...BLOCKER, holdsModel: true, listed } }),
+      catalogRoutes({ blockedByForeignDir: true, blocker: { ...HELD, listed } }),
       LABEL,
     );
-    expect(buttonLabels()).not.toContain('Reinstall');
+    expect(liveButtonLabels()).toContain('Update…');
+    expect(buttonLabels()).not.toContain(CLEANUP);
+    expect(buttonLabels()).not.toContain('Install');
+    expect(text).toContain('Needs update');
+    expect(text).not.toContain(NOTE);
+    expect(text).not.toContain('Needs cleanup');
+  });
+
+  it.each<[string, Partial<CatalogBlocker>, string[]]>([
+    [
+      'a link to a folder of model files',
+      { kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/x/m' },
+      [
+        `${SLUG} is a link that the app did not create.`,
+        'Removed Only the link. It points to /Volumes/x/m.',
+        'Stays That folder and every file in it. The app does not change it and no longer uses it.',
+        'The link is removed only when the download is complete and checked. If you cancel or the download fails, nothing changes. The old files keep their disk space.',
+      ],
+    ],
+    [
+      'a folder too large to list',
+      { fileCount: 2000, truncated: true },
+      [
+        `${SLUG} is a folder that the app did not create.`,
+        `To the Trash The whole folder ${SLUG}: more than 2,000 files (more than 7.1 GB). The app could not list all of it.`,
+        'It moves to the Trash only when the download is complete and checked.',
+      ],
+    ],
+    [
+      'a listed folder too large to list',
+      { fileCount: 2000, truncated: true, listed: true },
+      ['Local models lists this folder as a model. Make sure that you do not need it.'],
+    ],
+    [
+      'a link to a folder Local models lists',
+      { kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/x/m', listed: true },
+      ['Local models lists this folder as a model. Make sure that you do not need it.'],
+    ],
+  ])('offers Clean up & update over %s that holds a model, never Show why', async (_name, overrides, lines) => {
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      catalogRoutes({ blockedByForeignDir: true, blocker: { ...HELD, listed: false, ...overrides } }),
+      LABEL,
+    );
+    expect(buttonLabels()).not.toContain('Update…');
+    expect(buttonLabels()).not.toContain('Show why');
     expect(buttonLabels()).not.toContain('Install');
     expect(text).toContain('Needs cleanup');
-    expect(text).toContain(
-      `${SLUG} holds a model that the app did not create, so Reinstall cannot replace it. ${hint}`,
+    await act(async () => buttonNamed(mounted!.container, CLEANUP).click());
+    const dialog = dialogText();
+    for (const line of lines) expect(dialog).toContain(line);
+  });
+
+  it('says No access with the reason for a folder the app cannot write, and offers nothing to start', async () => {
+    const text = await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      catalogRoutes({ blockedByForeignDir: true, blocker: { ...HELD, locked: true } }),
+      LABEL,
+    );
+    expect(text).toContain('No access');
+    expect(text).not.toContain('Needs cleanup');
+    expect(buttonLabels()).not.toContain(CLEANUP);
+    expect(buttonLabels()).not.toContain('Update…');
+    await act(async () => buttonNamed(mounted!.container, 'Show why').click());
+    expect(splitWhitespace(document.body.textContent ?? '').join(' ')).toContain(
+      `The app has no write permission on ${SLUG}, so it cannot move it or add files to it. Change its permissions (Finder, Get Info), then open this page again.`,
     );
   });
 
@@ -1143,60 +1425,124 @@ describe('Models page — the Install affordance', () => {
   }
 
   const blocker = (overrides: Partial<CatalogBlocker>): CatalogBlocker => ({ ...BLOCKER, names: [], ...overrides });
+  const handlers = { onCleanup: () => Promise.resolve(), onConfirmStarted: () => {} };
+  const WHAT = { name: 'Qwen3.8-27B MXFP4', sizeGb: 18.7, spaceNote: null };
+  const LINK_NOTICE =
+    'The link is removed only when the download is complete and checked. If you cancel or the download fails, nothing changes.';
+  const TRASH_NOTICE =
+    'It moves to the Trash only when the download is complete and checked. If you cancel or the download fails, nothing changes. You can take it back from the Trash. Its disk space is free only after you empty the Trash.';
+  const DOWNLOADED = 'Downloaded Qwen3.8-27B MXFP4, 18.7 GB, into a new folder.';
 
-  it.each<[string, Partial<CatalogBlocker>, string, string]>([
-    ['empty', { fileCount: 0, sizeBytes: 0 }, 'an empty directory', 'directory'],
-    ['one file', { fileCount: 1, sizeBytes: 2048 }, 'a directory with 1 file (2.0\u00a0KB)', 'directory'],
-    ['many files', { fileCount: 1234, sizeBytes: 2048 }, 'a directory with 1,234 files (2.0\u00a0KB)', 'directory'],
-    ['truncated', { fileCount: 2000, truncated: true }, 'a directory with more than 2,000 files', 'directory'],
+  it.each<[string, Partial<CatalogBlocker>, string]>([
     [
-      'truncated before any file was counted',
-      { fileCount: 0, sizeBytes: 0, truncated: true },
-      'a directory the app could not fully read',
-      'directory',
+      'a live link',
+      { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m' },
+      `${SLUG} is a link that the app did not create. Removed Only the link. It points to /Volumes/x/m. Stays That folder and every file in it. The app does not change it and no longer uses it. ${DOWNLOADED}`,
     ],
-    ['a file', { kind: 'file', fileCount: 1, sizeBytes: 2048 }, 'a file (2.0\u00a0KB)', 'file'],
-    ['a link', { kind: 'symlink', fileCount: 0, sizeBytes: 0 }, 'a link', 'link'],
-  ])('phrases the blocker on the card: %s', (_name, overrides, phrase, noun) => {
-    expect(blockerPhrase(blocker(overrides))).toEqual({ phrase, noun });
+    [
+      'a dead link',
+      { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m', dangling: true },
+      `${SLUG} is a link that the app did not create. Removed Only the link. It points to /Volumes/x/m, which is not there. ${DOWNLOADED}`,
+    ],
+    [
+      'a link to a file',
+      { kind: 'symlink', fileCount: 0, linkTarget: '/m/model.gguf', linkToFile: true },
+      `${SLUG} is a link that the app did not create. Removed Only the link. It points to /m/model.gguf. ${DOWNLOADED}`,
+    ],
+    [
+      'a link whose text is unknown',
+      { kind: 'symlink', fileCount: 0, linkTarget: null },
+      `${SLUG} is a link that the app did not create. Removed Only the link. Stays That folder and every file in it. The app does not change it and no longer uses it. ${DOWNLOADED}`,
+    ],
+    [
+      'a folder with named files',
+      { fileCount: 2, sizeBytes: 2048, names: ['a.bin', 'sub/b.bin'] },
+      `${SLUG} is a folder that the app did not create. To the Trash The folder ${SLUG}: 2 files (2.0 KB): a.bin, sub/b.bin. ${DOWNLOADED}`,
+    ],
+    [
+      'a folder of four files',
+      { fileCount: 4, sizeBytes: 2048 },
+      `${SLUG} is a folder that the app did not create. To the Trash The folder ${SLUG}: 4 files (2.0 KB). ${DOWNLOADED}`,
+    ],
+    [
+      'an empty folder',
+      { fileCount: 0, sizeBytes: 0 },
+      `${SLUG} is a folder that the app did not create. To the Trash The empty folder ${SLUG}. ${DOWNLOADED}`,
+    ],
+    [
+      'a folder too large to list',
+      { fileCount: 2000, sizeBytes: 2048, truncated: true },
+      `${SLUG} is a folder that the app did not create. To the Trash The whole folder ${SLUG}: more than 2,000 files (more than 2.0 KB). The app could not list all of it. ${DOWNLOADED}`,
+    ],
+    [
+      'a folder the app could not read',
+      { fileCount: 0, sizeBytes: 0, truncated: true },
+      `${SLUG} is a folder that the app did not create. To the Trash The whole folder ${SLUG}. The app could not read it, so its size is not known. ${DOWNLOADED}`,
+    ],
+    [
+      'a file',
+      { kind: 'file', fileCount: 1, sizeBytes: 4096 },
+      `${SLUG} is a file that the app did not create. To the Trash The file ${SLUG} (4.0 KB). ${DOWNLOADED}`,
+    ],
+  ])('says what Clean up & update removes and downloads: %s', (_name, overrides, expected) => {
+    const content = cleanupContent({ slug: SLUG, blocker: blocker(overrides) }, WHAT, handlers);
+    expect(textOf(content.description)).toBe(expected);
+    expect(content).toMatchObject({
+      title: 'Clean up and update?',
+      confirmLabel: 'Clean up & update',
+      workingLabel: 'Starting…',
+      successLabel: 'Started',
+      tone: 'neutral',
+      errorTitle: 'Could not start the download',
+    });
   });
 
-  const handlers = { onReinstall: () => Promise.resolve(), onReinstallStarted: () => {} };
+  it.each<[string, Partial<CatalogBlocker>, string | null, string]>([
+    [
+      'a link to model files',
+      { kind: 'symlink', holdsModel: true },
+      null,
+      `${LINK_NOTICE} The old files keep their disk space.`,
+    ],
+    ['a link to other files', { kind: 'symlink' }, null, LINK_NOTICE],
+    [
+      'a link Local models lists',
+      { kind: 'symlink', listed: true },
+      null,
+      `Local models lists this folder as a model. Make sure that you do not need it. ${LINK_NOTICE}`,
+    ],
+    ['a folder', {}, null, TRASH_NOTICE],
+    [
+      'a folder Local models lists',
+      { listed: true, holdsModel: true },
+      null,
+      `Local models lists this folder as a model. Make sure that you do not need it. ${TRASH_NOTICE}`,
+    ],
+    [
+      'a short disk',
+      {},
+      'Needs about 18.7 GB. 10.0 GB is free on this disk.',
+      `${TRASH_NOTICE} Needs about 18.7 GB. 10.0 GB is free on this disk.`,
+    ],
+  ])('notices: %s', (_name, overrides, spaceNote, notice) => {
+    const content = cleanupContent({ slug: SLUG, blocker: blocker(overrides) }, { ...WHAT, spaceNote }, handlers);
+    expect(textOf(content.notice)).toBe(notice);
+  });
 
-  it.each<[string, Partial<CatalogBlocker>, string | null]>([
-    ['empty', { fileCount: 0, sizeBytes: 0 }, 'The directory is empty.'],
-    [
-      'named files',
-      { fileCount: 2, sizeBytes: 2048, names: ['a.bin', 'sub/b.bin'] },
-      'It holds 2 files (2.0 KB): a.bin, sub/b.bin.',
-    ],
-    ['one named file', { fileCount: 1, sizeBytes: 2048, names: ['a.bin'] }, 'It holds 1 file (2.0 KB): a.bin.'],
-    ['four files', { fileCount: 4, sizeBytes: 2048 }, 'It holds 4 files (2.0 KB).'],
-    [
-      'truncated',
-      { fileCount: 2000, sizeBytes: 2048, truncated: true },
-      'It holds more than 2,000 files (more than 2.0 KB).',
-    ],
-    [
-      'truncated before any file was counted',
-      { fileCount: 0, sizeBytes: 0, truncated: true },
-      'The app could not read all of it, so its size is not known.',
-    ],
-    ['a file', { kind: 'file', fileCount: 1, sizeBytes: 2048 }, 'The file is 2.0 KB.'],
-    ['a live link', { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m' }, 'It points to /Volumes/x/m.'],
-    [
-      'a dangling link',
-      { kind: 'symlink', fileCount: 0, linkTarget: '/Volumes/x/m', dangling: true },
-      'It points to /Volumes/x/m, which does not exist.',
-    ],
-    ['a link with no text', { kind: 'symlink', fileCount: 0, linkTarget: null }, null],
-  ])('says what Reinstall deletes: %s', (_name, overrides, contents) => {
-    const item = blocker(overrides);
-    const noun = blockerPhrase(item).noun;
-    const text = textOf(reinstallContent({ slug: SLUG, blocker: item }, handlers).description);
-    const first = `This downloads the model, then permanently deletes the ${noun} ${SLUG} and installs the model in its place.`;
-    const last = 'Nothing is deleted if the download fails or you cancel it.';
-    expect(text).toBe(contents === null ? `${first} ${last}` : `${first} ${contents} ${last}`);
+  it('says a download of 20 GB or more can take an hour, and not one of 19.9 GB', () => {
+    const at = (sizeGb: number) =>
+      textOf(cleanupContent({ slug: SLUG, blocker: BLOCKER }, { ...WHAT, sizeGb }, handlers).description);
+    expect(at(20)).toContain('20 GB, into a new folder. A download of this size can take an hour or more.');
+    expect(at(19.9)).not.toContain('an hour');
+  });
+
+  it('leads with the server sentence of a refused Update, then the whole model', () => {
+    const sentence = `"x.gguf" in "${SLUG}" is not the catalog file. Move it out of the folder, then use Update again.`;
+    const content = cleanupContent({ slug: SLUG, blocker: HELD }, WHAT, { ...handlers, companion: true }, sentence);
+    expect(content.title).toBe('Clean up and update companion weights?');
+    expect(textOf(content.description)).toBe(
+      `Update cannot use ${SLUG} as it is. ${sentence} Clean up & update does this instead: To the Trash The folder ${SLUG}: 4 files (7.1 GB). Downloaded The whole model: Qwen3.8-27B MXFP4, 18.7 GB, into a new folder.`,
+    );
   });
 
   it('truncates a long file name in the middle and keeps the full name on hover', () => {
@@ -1205,7 +1551,7 @@ describe('Models page — the Install affordance', () => {
       createElement(
         'div',
         null,
-        reinstallContent({ slug: SLUG, blocker: blocker({ fileCount: 1, names: [long] }) }, handlers).description,
+        cleanupContent({ slug: SLUG, blocker: blocker({ fileCount: 1, names: [long] }) }, WHAT, handlers).description,
       ),
     );
     expect(html).toContain(`title="${long}"`);
@@ -1217,45 +1563,23 @@ describe('Models page — the Install affordance', () => {
       createElement(
         'div',
         null,
-        reinstallContent({ slug: SLUG, blocker: blocker({ fileCount: 4, sizeBytes: 2048 }) }, handlers).description,
+        cleanupContent({ slug: SLUG, blocker: blocker({ fileCount: 4, sizeBytes: 2048 }) }, WHAT, handlers).description,
       ),
     );
-    expect(html).toContain('It holds 4 files (2.0 KB).');
-  });
-
-  it.each<[string, Partial<CatalogBlocker>, string | undefined]>([
-    [
-      'a link, even one that lists',
-      { kind: 'symlink', listed: true, modelLike: true },
-      'This is a link. Only the link is removed. The target is not changed.',
-    ],
-    [
-      'a listed directory',
-      { listed: true, modelLike: true },
-      'Local models lists this directory. Make sure that you do not need it.',
-    ],
-    ['a config.json', { modelLike: true }, 'This directory has a config.json. Make sure that you do not need it.'],
-    ['nothing to warn about', {}, undefined],
-  ])('warns first about %s', (_name, overrides, notice) => {
-    const content = reinstallContent({ slug: SLUG, blocker: blocker(overrides) }, handlers);
-    expect(content.notice).toBe(notice);
-    expect(content).toMatchObject({
-      title: 'Reinstall model?',
-      confirmLabel: 'Reinstall',
-      workingLabel: 'Starting…',
-      successLabel: 'Started',
-      tone: 'danger',
-      errorTitle: 'Could not start the download',
-    });
+    expect(html).toContain(`The folder ${SLUG}: 4 files (2.0 KB).`);
   });
 
   /**
-   * Serve the catalog routes plus a POST /downloads answered by `post`. The route stub matches by path alone, and a
-   * Reinstall needs the GET and the POST of `/downloads` to answer differently.
+   * Serve the catalog routes plus a POST /downloads answered by `post` and a POST /downloads/adopt-plan answered by
+   * `plan`. The route stub matches by path alone, and a start needs the GET and the POST of `/downloads` to answer
+   * differently.
    */
-  function serveReinstall(
+  function serveJobs(
     routes: Record<string, unknown>,
     post: (body: unknown) => ApiResponse,
+    plan?: (body: unknown) => ApiResponse | Promise<ApiResponse>,
+    get?: (path: string) => Promise<ApiResponse> | undefined,
+    locatePlan?: (body: unknown) => ApiResponse | Promise<ApiResponse>,
   ): Array<{ method: string; path: string; body: unknown }> {
     const calls: Array<{ method: string; path: string; body: unknown }> = [];
     openedStreams = [];
@@ -1268,6 +1592,12 @@ describe('Models page — the Install affordance', () => {
           const path = (call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path).split('?')[0]!;
           calls.push({ method: call.method, path, body: call.body });
           if (call.method === 'POST' && path === '/downloads') return post(call.body);
+          if (call.method === 'POST' && path === '/downloads/adopt-plan' && plan !== undefined) return plan(call.body);
+          if (call.method === 'POST' && path === '/downloads/locate-plan' && locatePlan !== undefined) {
+            return locatePlan(call.body);
+          }
+          const answer = call.method === 'GET' ? get?.(path) : undefined;
+          if (answer !== undefined) return answer;
           if (call.method === 'GET' && Object.hasOwn(routes, path)) {
             return { ok: true as const, status: 200, body: routes[path] };
           }
@@ -1288,7 +1618,7 @@ describe('Models page — the Install affordance', () => {
     return calls;
   }
 
-  function reinstallDialog(title = 'Reinstall model?'): HTMLElement | undefined {
+  function confirmDialog(title = 'Clean up and update?'): HTMLElement | undefined {
     return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) => el.textContent?.includes(title));
   }
 
@@ -1300,42 +1630,85 @@ describe('Models page — the Install affordance', () => {
     return button!;
   }
 
-  it('confirms, posts the numbers the user saw and nothing else, then follows the job', async () => {
-    const calls = serveReinstall(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
-      ok: true,
-      status: 202,
-      body: { id: 'job-reinstall', repo: REPO },
-    }));
-    await mountModels();
-    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
-    const dialog = reinstallDialog()!;
-    expect(dialog).toBeTruthy();
-    const text = splitWhitespace(dialog.textContent ?? '').join(' ');
-    expect(text).toContain(`permanently deletes the directory ${SLUG}`);
-    expect(text).toContain(`It holds 1 file (183 MB): ${LEFTOVER}.`);
-    expect(text).toContain('Nothing is deleted if the download fails or you cancel it.');
-    expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
+  it.each<[string, CatalogBlocker, string]>([
+    ['a folder', BLOCKER, 'Moves the old folder to the Trash when the download is complete.'],
+    [
+      'a link',
+      { ...BLOCKER, kind: 'symlink', fileCount: 0, sizeBytes: 0, names: [], linkTarget: '/Volumes/x/m' },
+      'Removes the link when the download is complete. Its folder is not changed.',
+    ],
+  ])(
+    'confirms %s, posts the numbers the user saw and nothing else, then follows the job',
+    async (_name, seen, line) => {
+      const calls = serveJobs(catalogRoutes({ blockedByForeignDir: true, blocker: seen }), () => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-cleanup', slug: SLUG, repo: REPO, kind: 'cleanup' },
+      }));
+      await mountModels();
+      await act(async () => buttonNamed(mounted!.container, CLEANUP).click());
+      const dialog = confirmDialog()!;
+      expect(dialog).toBeTruthy();
+      expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
 
-    await act(async () => buttonNamed(dialog, 'Reinstall').click());
-    await waitFor(() => openedStreams.includes('job-reinstall'));
-    const posts = calls.filter((call) => call.method === 'POST');
-    expect(posts.map((call) => call.body)).toEqual([
-      { repo: REPO, replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 192_223_904, truncated: false } },
-    ]);
+      await act(async () => buttonNamed(dialog, 'Clean up & update').click());
+      await waitFor(() => openedStreams.includes('job-cleanup'));
+      const posts = calls.filter((call) => call.method === 'POST');
+      const { kind, fileCount, sizeBytes, truncated, linkTarget } = seen;
+      expect(posts.map((call) => call.body)).toEqual([
+        { slug: SLUG, replaceBlocker: { kind, fileCount, sizeBytes, truncated, linkTarget } },
+      ]);
+      const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+      // The bar's text for assistive tech, also its tooltip.
+      await waitFor(() => (card.textContent ?? '').includes(line));
+      expect(buttonNamed(card, 'Cancel')).toBeTruthy();
+      expect(card.textContent).not.toContain('Needs cleanup');
+    },
+  );
+
+  it('names the confirmed entry in the job line and the done toast once the reloaded catalog no longer has it', async () => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    const seen: CatalogBlocker = { ...BLOCKER, kind: 'file', sizeBytes: 4096, names: [] };
+    const after = catalogRoutes({}, [downloadJob({ id: 'job-cleanup', kind: 'cleanup' })]);
+    let started = false;
+    serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: seen }),
+      () => {
+        started = true;
+        return { ok: true, status: 202, body: { id: 'job-cleanup', slug: SLUG, repo: REPO, kind: 'cleanup' } };
+      },
+      undefined,
+      (path) =>
+        started && (path === '/catalog' || path === '/downloads')
+          ? Promise.resolve({ ok: true as const, status: 200, body: after[path] })
+          : undefined,
+    );
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, CLEANUP).click());
+    await act(async () => buttonNamed(confirmDialog()!, 'Clean up & update').click());
+    await waitFor(() => openedStreams.includes('job-cleanup'));
+    await act(async () => reloadMountedQueries());
+    await settle();
     const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
-    await waitFor(() => (card.textContent ?? '').includes('Replaces the old directory when the download is complete.'));
-    expect(buttonNamed(card, 'Cancel')).toBeTruthy();
-    expect(card.textContent).not.toContain('Needs cleanup');
+    await waitFor(() =>
+      (card.textContent ?? '').includes('Moves the old file to the Trash when the download is complete.'),
+    );
+    emitDownload('done', { id: 'job-cleanup', outputDir: `/models/${SLUG}`, removed: 'trash' });
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success.mock.calls).toEqual([
+      ['Download complete', { description: `The old file ${SLUG} is in the Trash.` }],
+    ]);
   });
 
-  it('keeps a refused Reinstall in the confirmation, reloads the catalog, and raises no toast', async () => {
+  it('keeps a refused Clean up & update in the confirmation, reloads the catalog, and raises no toast', async () => {
     const error = vi.spyOn(toast, 'error');
     const success = vi.spyOn(toast, 'success');
     onTestFinished(() => {
       error.mockRestore();
       success.mockRestore();
     });
-    const calls = serveReinstall(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
+    const calls = serveJobs(catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }), () => ({
       ok: false,
       status: 409,
       code: 'E_CONFLICT',
@@ -1343,10 +1716,10 @@ describe('Models page — the Install affordance', () => {
     }));
     await mountModels();
     const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
-    await act(async () => buttonNamed(mounted!.container, 'Reinstall').click());
-    await act(async () => buttonNamed(reinstallDialog()!, 'Reinstall').click());
-    await waitFor(() => reinstallDialog()?.querySelector('[role="alert"]') !== null);
-    const alert = reinstallDialog()!.querySelector('[role="alert"]')!;
+    await act(async () => buttonNamed(mounted!.container, CLEANUP).click());
+    await act(async () => buttonNamed(confirmDialog()!, 'Clean up & update').click());
+    await waitFor(() => confirmDialog()?.querySelector('[role="alert"]') !== null);
+    const alert = confirmDialog()!.querySelector('[role="alert"]')!;
     expect(alert.textContent).toContain('Could not start the download');
     expect(alert.textContent).toContain('changed on disk. Check it, then try again.');
     await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length > catalogGets);
@@ -1355,59 +1728,585 @@ describe('Models page — the Install affordance', () => {
     expect(openedStreams).toEqual([]);
   });
 
-  it('turns Reinstall off while the last download is being checked', async () => {
-    const props = {
+  /** The props of a card over `blocker` whose last job settled and whose catalog has not been reloaded yet. */
+  function settlingProps(
+    blocker: CatalogBlocker,
+    onPlanUpdate: () => Promise<AdoptPlanResponse> = () => Promise.reject(new Error('no plan')),
+  ): Parameters<typeof CatalogDownloadAction>[0] {
+    return {
+      buildName: 'MXFP4',
+      modelName: LABEL,
+      cleanupName: `${LABEL} MXFP4`,
+      host: undefined,
       item: {
         hfRepo: REPO,
         slug: SLUG,
+        sizeGb: 23.3,
         installed: false,
         present: false,
+        heldBy: null,
         blockedByForeignDir: true,
-        blocker: BLOCKER,
+        blocker,
         localRevision: null,
         localAssetsRepo: null,
         localAssetsRevision: null,
+        located: null,
       },
       updateAvailable: false,
       settling: true,
       updateSettling: false,
       job: undefined,
+      refused: false,
+      refusedSentence: undefined,
       onInstall: () => Promise.resolve(),
-      onReinstall: () => Promise.resolve(),
-      onReinstallStarted: () => {},
+      onCleanup: () => Promise.resolve(),
+      onConfirmStarted: () => {},
+      onPlanUpdate,
+      onUpdateRefused: () => {},
+      onUpdateInPlace: () => Promise.resolve(),
+      onPlanLocate: () => Promise.reject(new Error('no plan')),
+      onLocate: () => Promise.resolve(),
+      onRecheck: () => {},
+      onReplaceLocated: () => Promise.resolve(),
       onDone: () => {},
       onError: () => {},
       onCancelled: () => {},
       onCancel: () => {},
     };
-    mounted = await renderPage(createElement(CatalogDownloadAction, props), (text) => text.includes('Reinstall'));
-    const trigger = buttonNamed(mounted.container, 'Reinstall');
+  }
+
+  it('turns Clean up & update off while the last download is being checked', async () => {
+    const props = settlingProps(BLOCKER);
+    mounted = await renderPage(createElement(CatalogDownloadAction, props), (text) => text.includes(CLEANUP));
+    const trigger = buttonNamed(mounted.container, CLEANUP);
     expect(trigger.getAttribute('aria-disabled')).toBe('true');
     await act(async () => trigger.click());
-    expect(reinstallDialog()).toBeUndefined();
+    expect(confirmDialog()).toBeUndefined();
   });
 
-  it('offers the same Reinstall for a blocked companion, with its own title', async () => {
+  it.each<[string, Partial<CatalogDownloadProps>, string, string]>([
+    [
+      'held',
+      { item: { ...settlingProps(BLOCKER).item, heldBy: 'UD-Q4_K_M', blocker: null } },
+      'Holds UD-Q4_K_M',
+      `${SLUG} holds UD-Q4_K_M. It is a working model, so this card does not remove it. Delete it in Local models to install MXFP4 here.`,
+    ],
+    [
+      'locked',
+      { item: { ...settlingProps(BLOCKER).item, blocker: { ...BLOCKER, locked: true } } },
+      'No access',
+      `The app has no write permission on ${SLUG}`,
+    ],
+    ['cleanup', {}, 'Needs cleanup', `${SLUG} is in the way of this model.`],
+  ])('Onboarding names the %s state in the title of its alert', async (_state, fields, title, sentence) => {
+    const props = { ...settlingProps(BLOCKER), settling: false, ...fields };
+    mounted = await renderPage(createElement(CatalogDownloadAction, props), (text) => text.includes(title));
+    expect(mounted.text()).toContain(sentence);
+    expect(buttonLabels().includes(CLEANUP)).toBe(title === 'Needs cleanup');
+  });
+
+  it('offers the same Clean up & update for a blocked companion, with its own title', async () => {
     const draft = {
       ...draftItem(false),
       blockedByForeignDir: true,
       blocker: { ...BLOCKER, fileCount: 0, sizeBytes: 0, names: [] },
     };
-    serveReinstall(catalogRoutes({ present: true, installed: true, draft }), () => ({
+    serveJobs(catalogRoutes({ present: true, installed: true, draft }), () => ({
       ok: true,
       status: 202,
-      body: { id: 'job-draft', repo: draft.hfRepo },
+      body: { id: 'job-draft', slug: draft.slug, repo: draft.hfRepo, kind: 'cleanup' },
     }));
     await mountModels();
     const companion = mounted!.container
       .querySelector(`a[href="https://huggingface.co/${draft.hfRepo}"]`)!
       .closest('[role="group"]')!;
-    expect(companion.textContent).toContain('Needs cleanup');
-    expect(companion.textContent).toContain(`${draft.slug} is in the way: an empty directory`);
-    await act(async () => buttonNamed(companion, 'Reinstall').click());
-    const dialog = reinstallDialog('Reinstall companion weights?')!;
-    expect(dialog).toBeTruthy();
-    expect(dialog.textContent).toContain('The directory is empty.');
+    expect(companion.textContent).toContain('needs cleanup');
+    await act(async () => buttonNamed(companion, CLEANUP).click());
+    const dialog = dialogText('Clean up and update companion weights?');
+    expect(dialog).toContain(`${draft.slug} is a folder that the app did not create.`);
+    expect(dialog).toContain(`To the Trash The empty folder ${draft.slug}.`);
+    expect(dialog).toContain('Downloaded DFlash2, 3.85 GB, into a new folder.');
+  });
+
+  const PLAN: AdoptPlanResponse = {
+    repo: REPO,
+    slug: SLUG,
+    token: 'a1'.repeat(32),
+    revision: 'b'.repeat(40),
+    assetsRevision: 'c'.repeat(40),
+    check: { count: 5, bytes: 7_612_907_561 },
+    download: { count: 6, bytes: 12_800_000 },
+    other: { count: 1, bytes: 1765, names: ['README.md'] },
+  };
+  const KEEPS =
+    'Update deletes nothing and moves nothing. If a file is not the catalog file, Update stops and changes nothing.';
+
+  function updateDialog(title = 'Update model?'): HTMLElement | undefined {
+    return confirmDialog(title);
+  }
+
+  /** A plan reply that waits for `release`, so a test can look at the card while the plan loads. */
+  function heldPlan(reply: ApiResponse): { answer: () => Promise<ApiResponse>; release: () => void } {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    return { answer: () => gate.then(() => reply), release };
+  }
+
+  function posts(calls: Array<{ method: string; path: string; body: unknown }>, path: string): unknown[] {
+    return calls.filter((call) => call.method === 'POST' && call.path === path).map((call) => call.body);
+  }
+
+  it.each<[string, Partial<AdoptPlanResponse>, string]>([
+    [
+      'checks, downloads and leaves',
+      {},
+      `Update checks 5 files (7.1 GB) in ${SLUG} against the catalog. It downloads 6 files (12.2 MB) and adds them to the folder. 1 other file stays where it is: README.md. ${KEEPS}`,
+    ],
+    [
+      'nothing to check',
+      { check: { count: 0, bytes: 0 } },
+      `Update downloads 6 files (12.2 MB) and adds them to the folder. 1 other file stays where it is: README.md. ${KEEPS}`,
+    ],
+    [
+      'nothing to download',
+      { download: { count: 0, bytes: 0 } },
+      `Update checks 5 files (7.1 GB) in ${SLUG} against the catalog. 1 other file stays where it is: README.md. ${KEEPS}`,
+    ],
+    [
+      'no other file',
+      { other: { count: 0, bytes: 0, names: [] } },
+      `Update checks 5 files (7.1 GB) in ${SLUG} against the catalog. It downloads 6 files (12.2 MB) and adds them to the folder. ${KEEPS}`,
+    ],
+    [
+      'one of each, and more other files than names',
+      {
+        check: { count: 1, bytes: 2048 },
+        download: { count: 1, bytes: 2048 },
+        other: { count: 5, bytes: 10, names: ['.DS_Store', 'README.md', 'notes.txt'] },
+      },
+      `Update checks 1 file (2.0 KB) in ${SLUG} against the catalog. It downloads 1 file (2.0 KB) and adds it to the folder. 5 other files stay where they are: .DS_Store, README.md, notes.txt. ${KEEPS}`,
+    ],
+  ])(
+    'loads the plan on the click, then says in numbers what Update checks, downloads and leaves: %s',
+    async (_name, overrides, expected) => {
+      const held = heldPlan({ ok: true, status: 200, body: { ...PLAN, ...overrides } });
+      const calls = serveJobs(
+        catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+        () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO, kind: 'update' } }),
+        held.answer,
+      );
+      await mountModels();
+      expect(posts(calls, '/downloads/adopt-plan')).toEqual([]);
+      await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+      await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 1);
+      expect(posts(calls, '/downloads/adopt-plan')).toEqual([{ slug: SLUG }]);
+      expect(buttonNamed(mounted!.container, 'Checking…').getAttribute('aria-disabled')).toBe('true');
+      await settle();
+      expect(updateDialog()).toBeUndefined();
+
+      held.release();
+      await waitFor(() => updateDialog() !== undefined);
+      const description = updateDialog()!.querySelector('[id]:not(h2)')!;
+      expect(splitWhitespace(description.textContent ?? '').join(' ')).toBe(
+        `${SLUG} holds a model that the app did not create. ${expected}`,
+      );
+      expect(posts(calls, '/downloads')).toEqual([]);
+    },
+  );
+
+  it('drops the plan when the confirmation closes, so the next click loads a new one', async () => {
+    const calls = serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO, kind: 'update' } }),
+      () => ({ ok: true, status: 200, body: PLAN }),
+    );
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => updateDialog() !== undefined);
+    await act(async () => buttonNamed(updateDialog()!, 'Cancel').click());
+    await waitFor(() => updateDialog() === undefined);
+    expect(posts(calls, '/downloads/adopt-plan')).toHaveLength(1);
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 2);
+    await waitFor(() => updateDialog() !== undefined);
+    expect(posts(calls, '/downloads')).toEqual([]);
+  });
+
+  it('says that the app manages the folder after Update', async () => {
+    const content = updateContent(SLUG, PLAN, {
+      onUpdateInPlace: () => Promise.resolve(),
+      onConfirmStarted: () => {},
+    });
+    expect(content).toMatchObject({
+      title: 'Update model?',
+      notice:
+        'After Update the app manages this folder. A later update replaces it. Files that you add or change in it are then moved to .staging in the models folder. The app does not delete them.',
+      confirmLabel: 'Update',
+      workingLabel: 'Starting…',
+      successLabel: 'Started',
+      tone: 'neutral',
+      errorTitle: 'Could not start the update',
+    });
+    const companion = updateContent(SLUG, PLAN, {
+      companion: true,
+      onUpdateInPlace: () => Promise.resolve(),
+      onConfirmStarted: () => {},
+    });
+    expect(companion.title).toBe('Update companion weights?');
+  });
+
+  it('says a refused plan in a toast and keeps the card as it was', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    const refusal = `"README.gguf" in "${SLUG}" is a model file that is not part of the catalog model. Move it out of the folder, then use Update again.`;
+    let plans = 0;
+    const refused = heldPlan({ ok: false, status: 409, code: 'E_CONFLICT', message: refusal });
+    const calls = serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO, kind: 'update' } }),
+      () => (++plans === 1 ? refused.answer() : { ok: true, status: 200, body: PLAN }),
+    );
+    await mountModels();
+    const update = buttonNamed(mounted!.container, 'Update…');
+    update.focus();
+    await act(async () => update.click());
+    await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 1);
+    // Mutation: disable the button while the plan loads → a browser moves focus to <body> → red.
+    expect(update.textContent).toBe('Checking…');
+    expect(update.disabled).toBe(false);
+    expect(update.getAttribute('aria-disabled')).toBe('true');
+    refused.release();
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls).toEqual([['Could not check the folder', { description: refusal }]]);
+    expect(document.activeElement).toBe(update);
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    expect(card.textContent).not.toContain(refusal);
+    expect(card.querySelector('[role="alert"]')).toBeNull();
+    expect(updateDialog()).toBeUndefined();
+    expect(liveButtonLabels()).toContain('Update…');
+
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => posts(calls, '/downloads/adopt-plan').length === 2);
+    await waitFor(() => updateDialog() !== undefined);
+    expect(posts(calls, '/downloads')).toEqual([]);
+  });
+
+  it('turns a plan refused for a reason a cleanup solves into Clean up & update, open with the server sentence', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    const refusal = `"UD-Q4_K_XL/x-00002-of-00004.gguf" in "${SLUG}" is not the catalog file. Its size is different. Move it out of the folder, then use Update again.`;
+    const calls = serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+      () => ({ ok: true, status: 202, body: { id: 'job-cleanup', slug: SLUG, repo: REPO, kind: 'cleanup' } }),
+      () => ({ ok: false, status: 409, code: 'E_CONFLICT', message: refusal, reason: 'needs-cleanup' }),
+    );
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    // Mutation: ignore the reason → a toast and Update… again → red.
+    await waitFor(() => confirmDialog() !== undefined);
+    expect(error).not.toHaveBeenCalled();
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    expect(card.querySelector('[data-row="action"]')?.textContent).toContain('Needs cleanup');
+    expect(dialogText()).toContain(
+      `Update cannot use ${SLUG} as it is. ${refusal} Clean up & update does this instead:`,
+    );
+    expect(dialogText()).toContain(`To the Trash The folder ${SLUG}: 4 files (7.1 GB).`);
+    expect(dialogText()).toContain('Downloaded The whole model: Qwen3.8-27B MXFP4, 23.3 GB, into a new folder.');
+    await act(async () => buttonNamed(confirmDialog()!, 'Clean up & update').click());
+    await waitFor(() => openedStreams.includes('job-cleanup'));
+    expect(posts(calls, '/downloads')).toEqual([
+      {
+        slug: SLUG,
+        replaceBlocker: {
+          kind: 'directory',
+          fileCount: 4,
+          sizeBytes: 7_612_909_326,
+          truncated: false,
+          linkTarget: null,
+        },
+      },
+    ]);
+  });
+
+  it('offers Update again once the folder changed after a refusal', async () => {
+    const refusal = `"x.gguf" in "${SLUG}" is not the catalog file. Move it out of the folder, then use Update again.`;
+    const routes = catalogRoutes({ blockedByForeignDir: true, blocker: HELD });
+    const fixed = catalogRoutes({
+      blockedByForeignDir: true,
+      blocker: { ...HELD, fileCount: 3, sizeBytes: 7_000_000_000 },
+    });
+    let catalogBody = routes['/catalog'];
+    serveJobs(
+      routes,
+      () => ({ ok: true, status: 202, body: { id: 'job-x', slug: SLUG, repo: REPO, kind: 'cleanup' } }),
+      () => ({ ok: false, status: 409, code: 'E_CONFLICT', message: refusal, reason: 'needs-cleanup' }),
+      (path) => (path === '/catalog' ? Promise.resolve({ ok: true, status: 200, body: catalogBody }) : undefined),
+    );
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => confirmDialog() !== undefined);
+    await act(async () => buttonNamed(confirmDialog()!, 'Cancel').click());
+    await waitFor(() => confirmDialog() === undefined);
+    expect(liveButtonLabels()).toContain(CLEANUP);
+    // The user moved the file out by hand: the catalog reads other numbers, so the kept refusal no longer applies.
+    catalogBody = fixed['/catalog'];
+    await act(async () => reloadMountedQueries());
+    await waitFor(() => liveButtonLabels().includes('Update…'));
+    expect(buttonLabels()).not.toContain(CLEANUP);
+  });
+
+  it('posts the token and follows the job after the success pill', async () => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    const calls = serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO, kind: 'update' } }),
+      () => ({ ok: true, status: 200, body: PLAN }),
+    );
+    await mountModels();
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => updateDialog() !== undefined);
+    await act(async () => buttonNamed(updateDialog()!, 'Update').click());
+    await waitFor(() => openedStreams.includes('job-update'));
+    expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG, adopt: PLAN.token }]);
+    const card = mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    await waitFor(() => (card.textContent ?? '').includes(`Checks the files in ${SLUG}. Nothing is deleted.`));
+    expect(buttonNamed(card, 'Cancel')).toBeTruthy();
+    expect(card.textContent).not.toContain('Needs update');
+
+    emitDownload('start', { id: 'job-update', repo: REPO, totalBytes: 6_429_716_416, fileCount: 11 });
+    emitDownload('progress', {
+      id: 'job-update',
+      file: 'Clairic-Flash-UD-Q4_K_XL.gguf',
+      receivedBytes: 1024,
+      jobReceivedBytes: 1024,
+      totalBytes: 6_429_716_416,
+      fileIndex: 0,
+      fileCount: 11,
+      phase: 'check',
+    });
+    await waitFor(() => (card.textContent ?? '').includes('Checking files · 1.0 kB / 6.4 GB'));
+    expect(card.querySelector('[role="progressbar"]')?.getAttribute('aria-label')).toBe(
+      'Clairic-Flash-UD-Q4_K_XL.gguf · File 1 of 11',
+    );
+    emitDownload('done', { id: 'job-update', outputDir: `/models/${SLUG}` });
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success.mock.calls).toEqual([['Update complete', { description: SLUG }]]);
+  });
+
+  it('keeps a refused Update in the confirmation, reloads the catalog, raises no toast', async () => {
+    const error = vi.spyOn(toast, 'error');
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => {
+      error.mockRestore();
+      success.mockRestore();
+    });
+    const calls = serveJobs(
+      catalogRoutes({ blockedByForeignDir: true, blocker: HELD }),
+      () => ({
+        ok: false,
+        status: 409,
+        code: 'E_CONFLICT',
+        message: `"${SLUG}" changed on disk. Close this, then use Update again.`,
+      }),
+      () => ({ ok: true, status: 200, body: PLAN }),
+    );
+    await mountModels();
+    const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
+    await act(async () => buttonNamed(mounted!.container, 'Update…').click());
+    await waitFor(() => updateDialog() !== undefined);
+    await act(async () => buttonNamed(updateDialog()!, 'Update').click());
+    await waitFor(() => updateDialog()?.querySelector('[role="alert"]') !== null);
+    const alert = updateDialog()!.querySelector('[role="alert"]')!;
+    expect(alert.textContent).toContain('Could not start the update');
+    expect(alert.textContent).toContain('changed on disk. Close this, then use Update again.');
+    await waitFor(() => calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length > catalogGets);
+    expect(error).not.toHaveBeenCalled();
+    expect(success).not.toHaveBeenCalled();
+    expect(openedStreams).toEqual([]);
+  });
+
+  it('turns Update off while the last download is being checked', async () => {
+    const plan = vi.fn(() => Promise.resolve(PLAN));
+    mounted = await renderPage(createElement(CatalogDownloadAction, settlingProps(HELD, plan)), (text) =>
+      text.includes('Needs update'),
+    );
+    const trigger = buttonNamed(mounted.container, 'Update');
+    expect(trigger.getAttribute('aria-disabled')).toBe('true');
+    await act(async () => trigger.click());
+    await settle();
+    expect(plan).not.toHaveBeenCalled();
+    expect(updateDialog()).toBeUndefined();
+  });
+
+  it('the System One drawer shows the same Update', async () => {
+    const routes = catalogRoutes({ blockedByForeignDir: true, blocker: HELD, category: 'systemone' });
+    serveJobs(
+      routes,
+      () => ({ ok: true, status: 202, body: { id: 'job-update', slug: SLUG, repo: REPO, kind: 'update' } }),
+      () => ({ ok: true, status: 200, body: PLAN }),
+    );
+    function DrawerPage(): ReactNode {
+      const models = useJson<ModelsResponse>('/models');
+      const catalog = useJson<CatalogResponse>('/catalog');
+      const host = useHost();
+      const updates = useJson<CatalogUpdatesResponse>('/catalog/updates');
+      const downloads = useModelDownloads(models, catalog, updates, host);
+      return createElement(SystemOneModelsDrawer, {
+        open: true,
+        onOpenChange: () => {},
+        catalog,
+        host,
+        updates,
+        downloads,
+      });
+    }
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(DrawerPage)), () =>
+      (document.body.textContent ?? '').includes('Needs update'),
+    );
+    await settle();
+    const card = document.body.querySelector<HTMLElement>(`[data-model="${SLUG}"]`)!;
+    expect(card.querySelector('[data-row="action"]')?.textContent).toContain('Needs update');
+    await act(async () => buttonNamed(card, 'Update…').click());
+    await waitFor(() => updateDialog() !== undefined);
+    expect(updateDialog()!.textContent).toContain(`${SLUG} holds a model that the app did not create.`);
+    expect(updateDialog()!.textContent).toContain('README.md');
+    expect(updateDialog()!.textContent).toContain('After Update the app manages this folder.');
+  });
+
+  it('names a failed Update "Update failed"', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    recordRequests({
+      ...catalogRoutes({ blockedByForeignDir: true, blocker: HELD }, [
+        downloadJob({ id: 'job-update', kind: 'update' }),
+      ]),
+      '/downloads/job-update': { cancelled: true, id: 'job-update' },
+    });
+    await mountModels();
+    const message = `"${SLUG}" changed on disk during the update. Nothing was changed.`;
+    emitDownload('error', { id: 'job-update', message });
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls).toEqual([['Update failed', { description: message }]]);
+  });
+
+  it('names an Update that failed while the page was away "Update failed"', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    recordRequests({
+      ...catalogRoutes({ blockedByForeignDir: true, blocker: HELD }, [
+        downloadJob({ id: 'job-update', kind: 'update', state: 'error' }),
+      ]),
+      '/downloads/job-update': { cancelled: true, id: 'job-update' },
+    });
+    await mountModels();
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls).toEqual([['Update failed', { description: SLUG }]]);
+  });
+
+  it('names a job that failed while the page was away by its kind, before the catalog answers', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    const routes = catalogRoutes({ blockedByForeignDir: true, blocker: BLOCKER }, [
+      downloadJob({ id: 'job-update', kind: 'update', state: 'error' }),
+      downloadJob({ id: 'job-cleanup', slug: `${SLUG}-other`, kind: 'cleanup', state: 'error' }),
+    ]);
+    // `/catalog` runs on a worker and `/downloads` on the main thread: the job list can land first.
+    serveJobs(
+      routes,
+      () => ({ ok: true, status: 202, body: { id: 'job-x', slug: SLUG, repo: REPO, kind: 'install' } }),
+      undefined,
+      (path) => (path === '/catalog' ? new Promise<ApiResponse>(() => {}) : undefined),
+    );
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+      text.includes('Recommended models'),
+    );
+    await waitFor(() => error.mock.calls.length === 2);
+    expect(error.mock.calls).toEqual([
+      ['Update failed', { description: SLUG }],
+      ['Download failed', { description: `${SLUG}-other` }],
+    ]);
+  });
+
+  it('tells where the kept files are when a later update is done', async () => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    const keptDir = `/models/.staging/${SLUG}.kept-0d6f`;
+    recordRequests({
+      ...catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40) }, [downloadJob({})], {
+        items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+      }),
+      '/downloads/job-1': { cancelled: true, id: 'job-1' },
+    });
+    await mountModels();
+    emitDownload('done', { id: 'job-1', outputDir: `/models/${SLUG}`, keptDir });
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success.mock.calls).toEqual([
+      [
+        'Download complete',
+        { description: `Files that were added or changed in the old folder are in ${keptDir}.`, duration: Infinity },
+      ],
+    ]);
+  });
+
+  it.each<[string, Partial<CatalogBlocker>, Record<string, unknown>, string]>([
+    [
+      'a link',
+      { kind: 'symlink', fileCount: 0 },
+      { removed: 'link' },
+      `The link ${SLUG} was removed. Its folder was not changed.`,
+    ],
+    [
+      'a link to a file',
+      { kind: 'symlink', fileCount: 0, linkToFile: true },
+      { removed: 'link' },
+      `The link ${SLUG} was removed.`,
+    ],
+    [
+      'a link the app could not remove',
+      { kind: 'symlink', fileCount: 0 },
+      { keptDir: `/models/.staging/${SLUG}.kept-0d6f` },
+      `The link ${SLUG} could not be removed. It is in /models/.staging/${SLUG}.kept-0d6f. Its folder was not changed.`,
+    ],
+    ['a folder', {}, { removed: 'trash' }, `The old folder ${SLUG} is in the Trash.`],
+    ['a file', { kind: 'file' }, { removed: 'trash' }, `The old file ${SLUG} is in the Trash.`],
+    [
+      'an entry the Trash refused',
+      {},
+      { keptDir: `/models/.staging/${SLUG}.kept-0d6f` },
+      `The old ${SLUG} could not go to the Trash. It is in /models/.staging/${SLUG}.kept-0d6f. Nothing was deleted.`,
+    ],
+  ])('says where the old entry went when a cleanup of %s is done', async (_name, overrides, done, description) => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    recordRequests({
+      ...catalogRoutes({ blockedByForeignDir: true, blocker: { ...BLOCKER, ...overrides } }, [
+        downloadJob({ kind: 'cleanup' }),
+      ]),
+      '/downloads/job-1': { cancelled: true, id: 'job-1' },
+    });
+    await mountModels();
+    emitDownload('done', { id: 'job-1', outputDir: `/models/${SLUG}`, ...done });
+    await waitFor(() => success.mock.calls.length > 0);
+    // A toast that names a kept folder stays until the user closes it.
+    const stays = 'keptDir' in done ? { duration: Infinity } : {};
+    expect(success.mock.calls).toEqual([['Download complete', { description, ...stays }]]);
+  });
+
+  it('titles a failed job by its kind, not by what was in the way', async () => {
+    const error = vi.spyOn(toast, 'error');
+    onTestFinished(() => error.mockRestore());
+    recordRequests({
+      ...catalogRoutes({ blockedByForeignDir: true, blocker: HELD }, [downloadJob({ kind: 'cleanup' })]),
+      '/downloads/job-1': { cancelled: true, id: 'job-1' },
+    });
+    await mountModels();
+    const message = 'The download failed. Nothing was removed.';
+    emitDownload('error', { id: 'job-1', message });
+    await waitFor(() => error.mock.calls.length > 0);
+    expect(error.mock.calls).toEqual([['Download failed', { description: message }]]);
   });
 
   it('still shows an installed model as installed', async () => {
@@ -1420,6 +2319,36 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).not.toContain('Install');
   });
 
+  it.each([HY4, FLASH_NEXT])(
+    'shows $label that Chat loads with no config.json as Installed with Details, and no update',
+    async (layout) => {
+      const root = mkdtempSync(join(tmpdir(), 'dash-page-configless-'));
+      onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+      const modelsDir = join(root, 'models');
+      mkdirSync(modelsDir);
+      layout.plant(join(root, layout.slug));
+      symlinkSync(join(root, layout.slug), join(modelsDir, layout.slug));
+      const catalog: CatalogResponse = { items: catalogWithState(modelsDir) };
+      const build = catalog.items.flatMap((item) => item.builds).find((candidate) => candidate.slug === layout.slug)!;
+      restoreApi = stubApi({
+        '/models': { ...discoverLocalModels(modelsDir), dir: modelsDir } satisfies ModelsResponse,
+        '/host': { totalMemBytes: 256 * 1024 ** 3, diskFreeBytes: null } satisfies HostResponse,
+        '/catalog': catalog,
+        '/catalog/updates': { items: [{ hfRepo: build.hfRepo, remoteRevision: 'b'.repeat(40) }] },
+        '/downloads': { jobs: [] } satisfies DownloadsResponse,
+      });
+      mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+        text.includes('Details'),
+      );
+      const card = mounted.container.querySelector(`[data-catalog-card][data-model="${layout.slug}"]`)!;
+      expect(card.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
+      const details = card.querySelector(`a[href="/models?focus=${encodeURIComponent(layout.slug)}"]`);
+      expect(details?.textContent).toContain('Details');
+      const labels = Array.from(card.querySelectorAll('button')).map((button) => (button.textContent ?? '').trim());
+      for (const label of ['Install', 'Locate…', 'Update', 'Clean up & update…']) expect(labels).not.toContain(label);
+    },
+  );
+
   it('offers Update available when upstream holds a different revision', async () => {
     // The whole point of the check: a re-upload lands new bytes at the SAME repo
     // id, so an installed model must still be offered the newer weights.
@@ -1430,8 +2359,9 @@ describe('Models page — the Install affordance', () => {
       }),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
-    expect(buttonLabels()).not.toContain('Installed');
+    // The card still says Installed beside the Update button.
+    expect(buttonLabels()).toEqual(expect.arrayContaining(['Update', 'Installed']));
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('stays Installed when the revisions match', async () => {
@@ -1443,7 +2373,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('offers Update when only the tokenizer sidecars advanced', async () => {
@@ -1470,7 +2400,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('stays Installed when the sidecar revision matches', async () => {
@@ -1495,7 +2425,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('stays Installed when the sidecar repo did not answer', async () => {
@@ -1522,7 +2452,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('offers Update when the catalog switched the sidecar source repo', async () => {
@@ -1550,7 +2480,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('offers Update when the install predates sidecar provenance the entry prescribes', async () => {
@@ -1566,6 +2496,8 @@ describe('Models page — the Install affordance', () => {
           assetsRepo: 'base/model',
           localAssetsRepo: null,
           localAssetsRevision: null,
+          located: null,
+          listed: false,
         },
         [],
         {
@@ -1577,7 +2509,7 @@ describe('Models page — the Install affordance', () => {
       ),
       LABEL,
     );
-    expect(buttonLabels()).toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
   });
 
   it('stays Installed when the catalog dropped its sidecar source', async () => {
@@ -1600,7 +2532,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('never offers Update for a checkpoint the dashboard does not own', async () => {
@@ -1622,7 +2554,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('stays Installed when the update check could not reach Hugging Face', async () => {
@@ -1637,7 +2569,7 @@ describe('Models page — the Install affordance', () => {
       LABEL,
     );
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
   });
 
   it('dismisses a job that settled while the page was unmounted, without a word', async () => {
@@ -1646,6 +2578,7 @@ describe('Models page — the Install affordance', () => {
     // keeps the rows for the life of the process, with the Overview tile
     // reporting "1 completed" beside a model that is simply installed.
     const failed = vi.spyOn(toast, 'error');
+    const succeeded = vi.spyOn(toast, 'success');
     try {
       const calls = recordRequests({
         ...catalogRoutes({ present: true, installed: true }, [
@@ -1660,10 +2593,46 @@ describe('Models page — the Install affordance', () => {
       // Both outcomes are already known to the user — the model is installed, the
       // cancel was their own — so neither may raise a failure notice.
       expect(failed.mock.calls).toEqual([]);
+      expect(succeeded.mock.calls).toEqual([]);
       expect(buttonLabels()).toContain('Installed');
     } finally {
       failed.mockRestore();
+      succeeded.mockRestore();
     }
+  });
+
+  it.each<[string, Partial<DownloadJob>, string, Record<string, unknown>]>([
+    [
+      'kept the old folder',
+      { keptDir: `/models/.staging/${SLUG}.kept-0d6f`, entry: { kind: 'directory', linkToFile: false } },
+      `The old ${SLUG} could not go to the Trash. It is in /models/.staging/${SLUG}.kept-0d6f. Nothing was deleted.`,
+      { duration: Infinity },
+    ],
+    [
+      'moved a file to the Trash',
+      { removed: 'trash', entry: { kind: 'file', linkToFile: false } },
+      `The old file ${SLUG} is in the Trash.`,
+      {},
+    ],
+    [
+      'removed a link',
+      { removed: 'link', entry: { kind: 'symlink', linkToFile: false } },
+      `The link ${SLUG} was removed. Its folder was not changed.`,
+      {},
+    ],
+  ])('tells what a cleanup that ended while the page was away did: %s', async (_name, row, description, stays) => {
+    const success = vi.spyOn(toast, 'success');
+    onTestFinished(() => success.mockRestore());
+    const calls = recordRequests({
+      ...catalogRoutes({ present: true, installed: true }, [
+        downloadJob({ id: 'job-done', kind: 'cleanup', state: 'done', ...row }),
+      ]),
+      '/downloads/job-done': { cancelled: true, id: 'job-done' },
+    });
+    await mountModels();
+    await waitFor(() => dismissed(calls).length > 0);
+    expect(success.mock.calls).toEqual([['Download complete', { description, ...stays }]]);
+    expect(dismissed(calls)).toEqual(['job-done']);
   });
 
   it('reverts to Install when a job is cancelled from somewhere else', async () => {
@@ -1764,7 +2733,7 @@ describe('Models page — the Install affordance', () => {
       '/downloads/job-upd': { cancelled: true, id: 'job-upd' },
     });
     await mountModels();
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
     expect(buttonLabels()).toContain('Installed');
   });
 
@@ -1798,7 +2767,7 @@ describe('Models page — the Install affordance', () => {
       await settle();
       expect(gets(calls, '/api/catalog/updates')).toBe(2);
       expect(gets(calls, '/api/catalog')).toBe(2);
-      expect(buttonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).not.toContain('Update');
       expect(buttonLabels()).toContain('Installed');
     } finally {
       failed.mockRestore();
@@ -1865,13 +2834,13 @@ describe('Models page — the Install affordance', () => {
     await settle();
     // The refreshed catalog has not landed, so the card still reads the stale
     // comparison — but it must not be pressable while it does.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
     expect(paletteLabels).not.toContain(`Update ${LABEL}`);
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
     expect(paletteLabels).toContain(`Update ${LABEL}`);
   });
 
@@ -1909,12 +2878,12 @@ describe('Models page — the Install affordance', () => {
     await settle();
     // The fresh catalog HAS landed — `localRevision` is the installed one — but
     // it is being compared against the sha from before the job.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes that window on a FIRST install too, where the stale body still says absent', async () => {
@@ -1974,7 +2943,7 @@ describe('Models page — the Install affordance', () => {
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes the updates half for a job that settled while the page was away too', async () => {
@@ -2001,12 +2970,12 @@ describe('Models page — the Install affordance', () => {
 
     // The installed revision is on screen, compared against the sha from before
     // the job. That verdict must not be actionable.
-    expect(buttonLabels()).toContain('Update available');
-    expect(liveButtonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).toContain('Update');
+    expect(liveButtonLabels()).not.toContain('Update');
 
     held.release();
     await settle();
-    expect(liveButtonLabels()).toContain('Update available');
+    expect(liveButtonLabels()).toContain('Update');
   });
 
   it('closes that window when the job settles as ERROR, which can still have installed', async () => {
@@ -2034,12 +3003,12 @@ describe('Models page — the Install affordance', () => {
 
       emitDownload('error', { id: 'job-err', message: 'fsync failed after publish' });
       await settle();
-      expect(buttonLabels()).toContain('Update available');
-      expect(liveButtonLabels()).not.toContain('Update available');
+      expect(buttonLabels()).toContain('Update');
+      expect(liveButtonLabels()).not.toContain('Update');
 
       held.release();
       await settle();
-      expect(liveButtonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).toContain('Update');
     } finally {
       failed.mockRestore();
     }
@@ -2159,7 +3128,7 @@ describe('Models page — the Install affordance', () => {
         call: async (call: ApiCall) => {
           const path = call.path.startsWith('/api') ? call.path.slice('/api'.length) : call.path;
           if (call.method === 'POST' && path === '/downloads') {
-            return { ok: true as const, status: 202, body: { id: 'job-b', repo: REPO } };
+            return { ok: true as const, status: 202, body: { id: 'job-b', slug: SLUG, repo: REPO, kind: 'install' } };
           }
           if (call.method === 'DELETE' && path === '/downloads/job-a') {
             await heldDelete;
@@ -2297,7 +3266,7 @@ describe('Models page — the Install affordance', () => {
 
       held.release();
       await settle();
-      expect(liveButtonLabels()).toContain('Update available');
+      expect(liveButtonLabels()).toContain('Update');
     } finally {
       failed.mockRestore();
     }
@@ -2328,7 +3297,7 @@ describe('Models page — the Install affordance', () => {
     await mountModels();
     // Settled on the newly installed revision: Installed, not a fresh Update.
     expect(buttonLabels()).toContain('Installed');
-    expect(buttonLabels()).not.toContain('Update available');
+    expect(buttonLabels()).not.toContain('Update');
     // Refetched exactly once, in step with the catalog it is compared against.
     expect(gets(calls, '/api/catalog/updates')).toBe(2);
     expect(gets(calls, '/api/catalog')).toBe(2);
@@ -2377,7 +3346,7 @@ describe('Models page — the Install affordance', () => {
       await mountModels();
       expect(
         failed.mock.calls.map((call) => [call[0], (call[1] as { description?: string } | undefined)?.description]),
-      ).toEqual([['Download failed', REPO]]);
+      ).toEqual([['Download failed', SLUG]]);
       expect(dismissed(calls)).toEqual(['job-bad']);
       // …and the card is back at Install, ready for the retry.
       expect(buttonLabels()).toContain('Install');
@@ -2465,7 +3434,11 @@ describe('Models page — the Install affordance', () => {
             return { ok: true as const, status: 200, body: await olderDownloads };
           }
           if (call.method === 'POST' && path === '/downloads') {
-            return { ok: true as const, status: 202, body: { id: 'job-local', repo: REPO } };
+            return {
+              ok: true as const,
+              status: 202,
+              body: { id: 'job-local', slug: SLUG, repo: REPO, kind: 'install' },
+            };
           }
           if (call.method === 'GET' && Object.hasOwn(routes, path)) {
             return { ok: true as const, status: 200, body: routes[path] };
@@ -2534,13 +3507,799 @@ describe('Models page — the Install affordance', () => {
     await mountModels();
     expect(buttonLabels()).not.toContain('Cancel');
   });
+
+  describe('Locate', () => {
+    const FOLDER = '/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF';
+    const LOCATE_PLAN: LocatePlanResponse = {
+      slug: SLUG,
+      repo: REPO,
+      token: 'e5'.repeat(32),
+      folder: FOLDER,
+      mode: 'shared',
+      byRecord: false,
+      revision: 'f'.repeat(40),
+      use: { count: 1, bytes: 17.6 * 1024 ** 3 },
+      read: { count: 1, bytes: 17.6 * 1024 ** 3 },
+      download: { count: 5, bytes: 11.4 * 1024 ** 2 },
+    };
+
+    /** The native dialog: records each request and answers it with `answer()` when that is not undefined. */
+    function desktopDialog(answer: () => string | null | undefined): unknown[] {
+      const requests: unknown[] = [];
+      const onMessage = (event: MessageEvent): void => {
+        const data = event.data as { type?: unknown; requestId?: unknown };
+        if (data?.type !== PICK_FOLDER_MESSAGE) return;
+        requests.push(data);
+        const path = answer();
+        if (path === undefined) return;
+        window.dispatchEvent(
+          new MessageEvent('message', {
+            data: { type: FOLDER_PICKED_MESSAGE, requestId: data.requestId, path },
+            source: window,
+          }),
+        );
+      };
+      window.addEventListener('message', onMessage);
+      onTestFinished(() => window.removeEventListener('message', onMessage));
+      return requests;
+    }
+
+    function locateDialog(): HTMLElement | undefined {
+      return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes('Use these files?'),
+      );
+    }
+
+    function card(): Element {
+      return mounted!.container.querySelector(`[data-model="${SLUG}"]`)!;
+    }
+
+    function textOf(node: ParentNode | undefined): string {
+      return splitWhitespace(node?.textContent ?? '').join(' ');
+    }
+
+    it('picks a model folder, checks it, confirms in the words of the plan, then posts the slug and the token', async () => {
+      const success = vi.spyOn(toast, 'success');
+      onTestFinished(() => success.mockRestore());
+      const held = heldPlan({ ok: true, status: 200, body: LOCATE_PLAN });
+      const requests = desktopDialog(() => FOLDER);
+      const calls = serveJobs(
+        catalogRoutes({}),
+        () => ({ ok: true, status: 202, body: { id: 'job-locate', slug: SLUG, repo: REPO, kind: 'locate' } }),
+        undefined,
+        undefined,
+        held.answer,
+      );
+      await mountModels();
+      const locate = buttonNamed(card(), 'Locate…');
+      await act(async () => locate.click());
+      await waitFor(() => posts(calls, '/downloads/locate-plan').length === 1);
+      // Mutation: send the Work purpose → MAIN opens the Work dialog → red.
+      expect(requests).toEqual([{ type: PICK_FOLDER_MESSAGE, requestId: expect.any(String), purpose: 'model' }]);
+      expect(posts(calls, '/downloads/locate-plan')).toEqual([{ slug: SLUG, path: FOLDER }]);
+      const checking = buttonNamed(card(), 'Checking…');
+      expect(checking.getAttribute('aria-disabled')).toBe('true');
+      // A second click while the check runs does nothing.
+      await act(async () => checking.click());
+      await settle();
+      expect(requests).toHaveLength(1);
+      expect(posts(calls, '/downloads/locate-plan')).toHaveLength(1);
+      expect(buttonNamed(card(), 'Install').disabled).toBe(true);
+      expect(locateDialog()).toBeUndefined();
+
+      held.release();
+      await waitFor(() => locateDialog() !== undefined);
+      const text = textOf(locateDialog());
+      expect(text).toContain(
+        `The app found 1 file (17.6 GB) of ${LABEL} in ${truncateMiddle(FOLDER, 48)}. So far it checked names and sizes. Next it reads each file once to check its content. This can take a few minutes. Nothing is copied: the models folder shares these files on disk, so they take no extra space. It downloads 5 files (11.4 MB) into the models folder.`,
+      );
+      expect(text).toContain('Nothing in your folder is changed, moved or deleted.');
+      expect(posts(calls, '/downloads')).toEqual([]);
+
+      await act(async () => buttonNamed(locateDialog()!, 'Use files').click());
+      await waitFor(() => openedStreams.includes('job-locate'));
+      // Mutation: post the repository or drop the token → red.
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG, locate: LOCATE_PLAN.token }]);
+      await waitFor(() => buttonLabels().includes('Cancel'));
+      emitDownload('done', { id: 'job-locate', outputDir: `/models/${SLUG}` });
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success.mock.calls).toEqual([['Model located', { description: `Uses the files in ${FOLDER}.` }]]);
+    });
+
+    it('does nothing when the dialog is cancelled', async () => {
+      const requests = desktopDialog(() => null);
+      const calls = serveJobs(catalogRoutes({}), () => ({
+        ok: false,
+        status: 500,
+        code: 'E_INTERNAL',
+        message: 'no',
+      }));
+      await mountModels();
+      await act(async () => buttonNamed(card(), 'Locate…').click());
+      await waitFor(() => requests.length === 1);
+      await settle();
+      expect(calls.filter((call) => call.method === 'POST')).toEqual([]);
+      expect(liveButtonLabels()).toContain('Locate…');
+      expect(card().querySelector('[data-row="build"]')?.textContent).toContain('23.3 GB');
+      expect(locateDialog()).toBeUndefined();
+    });
+
+    it('says a refusal on the build line of the card, raises no toast and offers Locate again', async () => {
+      const error = vi.spyOn(toast, 'error');
+      onTestFinished(() => error.mockRestore());
+      const refusal = `This folder holds UD-Q4_K_M. Choose UD-Q4_K_M on the card, then use Locate again.`;
+      desktopDialog(() => FOLDER);
+      let plans = 0;
+      const calls = serveJobs(
+        catalogRoutes({}),
+        () => ({ ok: true, status: 202, body: { id: 'job-locate', slug: SLUG, repo: REPO, kind: 'locate' } }),
+        undefined,
+        undefined,
+        () =>
+          ++plans === 1
+            ? { ok: false, status: 409, code: 'E_CONFLICT', message: refusal }
+            : { ok: true, status: 200, body: LOCATE_PLAN },
+      );
+      await mountModels();
+      const before = card().getBoundingClientRect().height;
+      const locate = buttonNamed(card(), 'Locate…');
+      locate.focus();
+      await act(async () => locate.click());
+      await waitFor(() => (card().querySelector('[data-row="build"]')?.textContent ?? '').includes(refusal));
+      expect(error).not.toHaveBeenCalled();
+      expect(card().querySelector('[role="alert"], [role="status"]')).toBeNull();
+      // The sentence is read out, and the line opens it whole.
+      expect(card().querySelector('[aria-live="polite"]')?.textContent).toBe(refusal);
+      const rows = [...card().querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      expect(card().getBoundingClientRect().height).toBe(before);
+      expect(document.activeElement).toBe(buttonNamed(card(), 'Locate…'));
+
+      await act(async () => buttonNamed(card(), 'Locate…').click());
+      await waitFor(() => locateDialog() !== undefined);
+      expect(posts(calls, '/downloads/locate-plan')).toHaveLength(2);
+      expect(card().querySelector('[data-row="build"]')?.textContent).not.toContain(refusal);
+    });
+
+    it('says the other disk and the install record in the confirmation, and leaves out an empty download', () => {
+      const handlers = { onLocate: () => Promise.resolve(), onStarted: () => {} };
+      const linked = locateContent('Hy4-flash', { ...LOCATE_PLAN, mode: 'linked' }, handlers);
+      const record = locateContent(
+        'Qwen3.8-27B UD-Q4_K_XL',
+        {
+          ...LOCATE_PLAN,
+          byRecord: true,
+          read: { count: 0, bytes: 0 },
+          download: { count: 0, bytes: 0 },
+        },
+        handlers,
+      );
+      const words = (node: ReactNode): string =>
+        splitWhitespace(
+          renderToStaticMarkup(createElement('p', null, node))
+            .replace('<p>', '')
+            .replace('</p>', ''),
+        )
+          .join(' ')
+          .replaceAll(`<span class="font-medium text-foreground" title="${FOLDER}">`, '')
+          .replaceAll('</span>', '');
+      expect(words(linked.description)).toBe(
+        `The app found 1 file (17.6 GB) of Hy4-flash in ${truncateMiddle(FOLDER, 48)}. So far it checked names and sizes. Next it reads each file once to check its content. This can take a few minutes. Nothing is copied: the app links to these files. The model works only while this disk is connected. It downloads 5 files (11.4 MB) into the models folder.`,
+      );
+      expect(words(record.description)).toBe(
+        `The app found 1 file (17.6 GB) of Qwen3.8-27B UD-Q4_K_XL in ${truncateMiddle(FOLDER, 48)}. This folder has this app&#x27;s install record for Qwen3.8-27B UD-Q4_K_XL. The app trusts the record: it checks that the files are there and does not read them. Nothing is copied: the models folder shares these files on disk, so they take no extra space.`,
+      );
+      expect(record).toMatchObject({
+        title: 'Use these files?',
+        notice: 'Nothing in your folder is changed, moved or deleted.',
+        confirmLabel: 'Use files',
+        workingLabel: 'Starting…',
+        successLabel: 'Started',
+        tone: 'neutral',
+        errorTitle: 'Could not start Locate',
+      });
+    });
+
+    it('names the folder a located build uses, and asks before an update downloads the whole build', async () => {
+      const located = { from: FOLDER, mode: 'shared' as const, filesAvailable: true };
+      const calls = serveJobs(
+        catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40), located }, [], {
+          items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+        } as CatalogUpdatesResponse),
+        () => ({ ok: true, status: 202, body: { id: 'job-new', slug: SLUG, repo: REPO, kind: 'install' } }),
+      );
+      await mountModels();
+      expect(card().querySelector('[data-row="build"] p')?.textContent).toBe(
+        `Uses files in ${truncateMiddle(FOLDER, 48)}`,
+      );
+      expect(card().querySelector('[data-row="action"] [data-status="installed"]')).not.toBeNull();
+      expect(buttonLabels()).not.toContain('Locate…');
+      await act(async () => buttonNamed(card(), 'Update').click());
+      const dialog = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes('Download the new version?'),
+      );
+      // Mutation: start the update on the click → a POST before the confirmation → red.
+      expect(posts(calls, '/downloads')).toEqual([]);
+      expect(textOf(dialog)).toContain(
+        `The app downloads it (about 23.3 GB) into the models folder. The files in ${truncateMiddle(FOLDER, 48)} are not changed, and the app stops using them.`,
+      );
+      await act(async () => buttonNamed(dialog!, 'Download').click());
+      await waitFor(() => openedStreams.includes('job-new'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
+
+    it('shows Files not found in the five rows with Check again, Locate… and Download instead', async () => {
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      const calls = serveJobs(catalogRoutes({ located: away }), () => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-instead', slug: SLUG, repo: REPO, kind: 'install' },
+      }));
+      await mountModels();
+      const rows = [...card().querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      expect(card().querySelector('[data-row="build"] p')?.textContent).toBe('Files not found · /Volumes/Models/qwen');
+      // Mutation: ignore filesAvailable → a bare Install shows → red.
+      expect(buttonLabels()).not.toContain('Install');
+      const action = card().querySelector('[data-row="action"]')!;
+      expect([...action.querySelectorAll('button')].map((button) => button.textContent?.trim())).toEqual([
+        'Check again',
+        'Locate…',
+        'Download instead',
+      ]);
+      await act(async () => buttonNamed(card(), 'Files not found · /Volumes/Models/qwen').click());
+      expect(document.body.textContent).toContain(
+        '/Volumes/Models/qwen is not available. Connect the disk, or locate the files again.',
+      );
+      const catalogGets = calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length;
+      await act(async () => buttonNamed(card(), 'Check again').click());
+      await waitFor(
+        () => calls.filter((call) => call.method === 'GET' && call.path === '/catalog').length > catalogGets,
+      );
+      expect(posts(calls, '/downloads')).toEqual([]);
+      await act(async () => buttonNamed(card(), 'Download instead').click());
+      await waitFor(() => openedStreams.includes('job-instead'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
+
+    it('offers no Locate on the DFlash2 line', async () => {
+      serveJobs(
+        catalogRoutes({
+          draft: {
+            label: 'DFlash2',
+            hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
+            sizeGb: 3.85,
+            slug: 'qwen3.8-27b-dflash2',
+            installed: false,
+            present: false,
+            blockedByForeignDir: false,
+            blocker: null,
+            localRevision: null,
+          },
+        }),
+        () => ({ ok: false, status: 500, code: 'E_INTERNAL', message: 'no' }),
+      );
+      await mountModels();
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      // Mutation: render Locate in the draft line → red.
+      expect([...companion.querySelectorAll('button')].map((button) => button.textContent?.trim())).toEqual(['Add']);
+      expect(buttonLabels().filter((label) => label === 'Locate…')).toHaveLength(1);
+    });
+  });
+
+  describe('the card with more than one build', () => {
+    const XL_SLUG = 'inkling-2-mini-gguf';
+    const M_SLUG = 'inkling-2-mini-gguf-ud-q4_k_m';
+    const ORIGINAL_SLUG = 'inkling-2-mini';
+    const MODEL = 'Inkling-2-Mini';
+
+    function inklingBuild(fields: Partial<CatalogBuildItem> & Pick<CatalogBuildItem, 'id' | 'slug'>): CatalogBuildItem {
+      return {
+        hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
+        sizeGb: 18.7,
+        source: 'Unsloth GGUF',
+        included: 'Vision and DSpark draft included',
+        installed: false,
+        present: false,
+        heldBy: null,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
+        located: null,
+        listed: false,
+        ...fields,
+      };
+    }
+
+    /** The routes of a page with Inkling-2-Mini in three builds, each build's state overridden by its folder. */
+    function inklingRoutes(
+      builds: Partial<Record<string, Partial<CatalogBuildItem>>> = {},
+      jobs: DownloadJob[] = [],
+      updates: CatalogUpdatesResponse = { items: [] },
+    ): Record<string, unknown> {
+      const routes = catalogRoutes({}, jobs, updates);
+      routes['/catalog'] = {
+        items: [
+          {
+            label: MODEL,
+            description: 'Looped MoE with vision and DSpark drafts, 1M context',
+            builds: [
+              inklingBuild({ id: 'UD-Q4_K_XL', slug: XL_SLUG, ...builds[XL_SLUG] }),
+              inklingBuild({
+                id: 'UD-Q4_K_M',
+                slug: M_SLUG,
+                sizeGb: 17.7,
+                note: '1 GB smaller',
+                ...builds[M_SLUG],
+              }),
+              inklingBuild({
+                id: 'Original',
+                slug: ORIGINAL_SLUG,
+                hfRepo: 'thinkingmachines/Inkling-2-Mini',
+                sizeGb: 20.2,
+                source: 'Thinking Machines',
+                note: 'NVFP4 + MXFP8',
+                ...builds[ORIGINAL_SLUG],
+              }),
+            ],
+          },
+        ],
+      };
+      return routes;
+    }
+
+    async function mountInkling(): Promise<HTMLElement> {
+      mounted = await renderPage(
+        createElement(MemoryRouter, null, createElement(Models), createElement(PaletteProbe)),
+        (text) => text.includes(MODEL),
+      );
+      await settle();
+      return mounted.container.querySelector<HTMLElement>(`[data-model="${XL_SLUG}"]`)!;
+    }
+
+    function segment(card: Element, build: string): HTMLButtonElement {
+      const found = [...card.querySelectorAll<HTMLButtonElement>('[role="group"] button[data-value]')].find(
+        (button) => button.getAttribute('data-value') === build,
+      );
+      expect(found, build).toBeTruthy();
+      return found!;
+    }
+
+    function row(card: Element, name: string): string {
+      return splitWhitespace(card.querySelector(`[data-row="${name}"]`)?.textContent ?? '').join(' ');
+    }
+
+    it('shows the first build and names the switch by the model', async () => {
+      recordRequests(inklingRoutes());
+      const card = await mountInkling();
+      expect(card.querySelector('[role="group"]')?.getAttribute('aria-label')).toBe(`Build of ${MODEL}`);
+      expect(segment(card, XL_SLUG).getAttribute('aria-pressed')).toBe('true');
+      expect(row(card, 'build')).toContain('18.7 GB · Unsloth GGUF');
+      expect(row(card, 'extras')).toBe('Vision and DSpark draft included');
+      expect(buttonLabels()).toContain('Install UD-Q4_K_XL');
+    });
+
+    it('choosing a build starts nothing and changes the link, the build line and the button', async () => {
+      const calls = recordRequests(inklingRoutes());
+      const card = await mountInkling();
+      const before = calls.length;
+      await act(async () => segment(card, ORIGINAL_SLUG).click());
+      await settle();
+      // Mutation: start a job on choose → a POST → red.
+      expect(calls.slice(before).filter((call) => call.method !== 'GET')).toEqual([]);
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card.querySelector('[data-row="title"] a')?.getAttribute('href')).toBe(
+        'https://huggingface.co/thinkingmachines/Inkling-2-Mini',
+      );
+      expect(row(card, 'build')).toContain('20.2 GB · Thinking Machines · NVFP4 + MXFP8');
+      expect(buttonLabels()).toContain('Install Original');
+      expect(buttonLabels()).not.toContain('Install UD-Q4_K_XL');
+    });
+
+    it('Install posts the chosen build folder', async () => {
+      const calls = serveJobs(inklingRoutes(), (body) => ({
+        ok: true,
+        status: 202,
+        body: {
+          id: 'job-m',
+          slug: (body as { slug: string }).slug,
+          repo: 'unsloth/Inkling-2-Mini-GGUF',
+          kind: 'install',
+        },
+      }));
+      const card = await mountInkling();
+      await act(async () => segment(card, M_SLUG).click());
+      await act(async () => buttonNamed(card, 'Install UD-Q4_K_M').click());
+      await waitFor(() => openedStreams.includes('job-m'));
+      // Mutation: Install posts builds[0].slug → red.
+      expect(posts(calls, '/downloads')).toEqual([{ slug: M_SLUG }]);
+      expect(segment(card, M_SLUG).querySelector('[data-mark="downloading"]')).not.toBeNull();
+    });
+
+    it('marks every build that is not chosen with its state, in words', async () => {
+      recordRequests(
+        inklingRoutes(
+          {
+            [XL_SLUG]: { blockedByForeignDir: true, blocker: BLOCKER },
+            [M_SLUG]: { present: true, installed: true, localRevision: 'a'.repeat(40) },
+          },
+          [downloadJob({ id: 'job-original', slug: ORIGINAL_SLUG })],
+          { items: [{ hfRepo: 'unsloth/Inkling-2-Mini-GGUF', remoteRevision: 'b'.repeat(40) }] },
+        ),
+      );
+      const card = await mountInkling();
+      // The build with a job is the one the card shows first.
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      // Mutation: mark only the chosen segment → red.
+      expect(segment(card, XL_SLUG).textContent).toBe('UD-Q4_K_XLneeds attention');
+      expect(segment(card, M_SLUG).textContent).toBe('UD-Q4_K_Mupdate available');
+      expect(segment(card, ORIGINAL_SLUG).textContent).toBe('Originaldownloading');
+    });
+
+    it('an installed build that is not first is the one the card shows, with its mark', async () => {
+      recordRequests(inklingRoutes({ [ORIGINAL_SLUG]: { present: true, installed: true } }));
+      const card = await mountInkling();
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card.querySelector('[data-status="installed"]')).not.toBeNull();
+      await act(async () => segment(card, XL_SLUG).click());
+      expect(segment(card, ORIGINAL_SLUG).textContent).toBe('Originalinstalled');
+      expect(buttonLabels()).toContain('Install UD-Q4_K_XL');
+      // A model counts as installed when one of its builds is.
+      expect(mounted!.text()).toContain('1 of 1 installed');
+    });
+
+    it('counts a model with two builds on disk once', async () => {
+      recordRequests(
+        inklingRoutes({
+          [M_SLUG]: { present: true, installed: true },
+          [ORIGINAL_SLUG]: { present: true, installed: true },
+        }),
+      );
+      await mountInkling();
+      // Mutation: count builds on disk in place of models → '2 of 1 installed' → red.
+      expect(mounted!.text()).toContain('1 of 1 installed');
+    });
+
+    it('keeps the build whose job ended on the card until the catalog says it is on disk', async () => {
+      const stale = inklingRoutes({}, [downloadJob({ id: 'job-original', slug: ORIGINAL_SLUG })]);
+      const fresh = inklingRoutes({ [ORIGINAL_SLUG]: { present: true, installed: true } });
+      const held = deferred(fresh['/catalog']);
+      recordRequests({
+        ...stale,
+        '/catalog': sequence(stale['/catalog'], held.body),
+        '/downloads/job-original': { cancelled: true, id: 'job-original' },
+      });
+      await mountInkling();
+      const card = (): Element => mounted!.container.querySelector(`[data-model="${XL_SLUG}"]`)!;
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+
+      emitDownload('done', { id: 'job-original', outputDir: '/models/x' });
+      await settle();
+      // Mutation: shownBuild leaves out the settling build → the card jumps to UD-Q4_K_XL with a live Install → red.
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(liveButtonLabels().filter((label) => label.startsWith('Install'))).toEqual([]);
+
+      held.release();
+      await settle();
+      expect(card().getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+      expect(card().querySelector('[data-status="installed"]')).not.toBeNull();
+    });
+
+    it('lists one palette command per build, by folder, and a command chooses its build', async () => {
+      const calls = serveJobs(inklingRoutes(), (body) => ({
+        ok: true,
+        status: 202,
+        body: {
+          id: 'job-p',
+          slug: (body as { slug: string }).slug,
+          repo: 'thinkingmachines/Inkling-2-Mini',
+          kind: 'install',
+        },
+      }));
+      const card = await mountInkling();
+      // Mutation: ids by hfRepo → two ids collide → red.
+      expect(paletteIds.filter((id) => id.startsWith('models:install:'))).toEqual([
+        `models:install:${XL_SLUG}`,
+        `models:install:${M_SLUG}`,
+        `models:install:${ORIGINAL_SLUG}`,
+      ]);
+      expect(paletteLabels).toContain(`Install ${MODEL} (UD-Q4_K_M)`);
+      expect(paletteLabels).toContain(`Install ${MODEL} (Original)`);
+      await act(async () => paletteCommands.find((command) => command.id === `models:install:${ORIGINAL_SLUG}`)!.run());
+      await settle();
+      expect(posts(calls, '/downloads')).toEqual([{ slug: ORIGINAL_SLUG }]);
+      expect(card.getAttribute('data-build')).toBe(ORIGINAL_SLUG);
+    });
+  });
+
+  describe('the five rows', () => {
+    const ENTRY: CatalogItem = {
+      label: LABEL,
+      description: 'Best tool use',
+      builds: [
+        {
+          id: 'MXFP4',
+          hfRepo: REPO,
+          sizeGb: 23.3,
+          source: 'MLX',
+          slug: SLUG,
+          installed: false,
+          present: false,
+          heldBy: null,
+          blockedByForeignDir: false,
+          blocker: null,
+          localRevision: null,
+          localAssetsRepo: null,
+          localAssetsRevision: null,
+          located: null,
+          listed: false,
+        },
+      ],
+    };
+
+    function props(item: Partial<CatalogBuildItem>, fields: Partial<CatalogDownloadProps> = {}): CatalogDownloadProps {
+      return {
+        ...settlingProps(BLOCKER),
+        settling: false,
+        item: { ...ENTRY.builds[0], ...item },
+        ...fields,
+      };
+    }
+
+    function view(download: CatalogDownloadProps, extra: Partial<CatalogCardViewProps> = {}) {
+      return createElement(
+        MemoryRouter,
+        null,
+        createElement(CatalogCardView, {
+          entry: { ...ENTRY, builds: [{ ...ENTRY.builds[0], ...download.item }] },
+          chosen: SLUG,
+          onChoose: () => {},
+          downloads: [download],
+          progress: INITIAL_PROGRESS,
+          starting: [],
+          onStart: () => {},
+          host: undefined,
+          ...extra,
+        }),
+      );
+    }
+
+    const job = {
+      id: 'job-1',
+      kind: 'install' as const,
+      committing: false,
+      cancelling: false,
+      connection: 0,
+      source: 'local' as const,
+      blocker: null,
+    };
+
+    it.each<[string, CatalogDownloadProps, string]>([
+      ['install', props({}), 'Install'],
+      ['job', props({}, { job }), 'Cancel'],
+      ['installed', props({ present: true, installed: true }), 'Installed'],
+      ['update', props({ present: true, installed: true }, { updateAvailable: true }), 'Update'],
+      ['held', props({ heldBy: 'UD-Q4_K_M' }), 'Holds UD-Q4_K_M'],
+      ['locked', props({ blockedByForeignDir: true, blocker: { ...HELD, locked: true } }), 'No access'],
+      ['adopt', props({ blockedByForeignDir: true, blocker: HELD }), 'Needs update'],
+      ['cleanup', props({ blockedByForeignDir: true, blocker: { ...HELD, truncated: true } }), 'Needs cleanup'],
+      ['cleanup', props({ blockedByForeignDir: true, blocker: BLOCKER }), 'Needs cleanup'],
+      ['cleanup', props({ blockedByForeignDir: true, blocker: HELD }, { refused: true }), 'Needs cleanup'],
+    ])('has five rows and no alert in the %s state', async (state, download, action) => {
+      expect(catalogActionState(download.item, download)).toBe(state);
+      mounted = await renderPage(view(download), (text) => text.includes(LABEL));
+      const card = mounted.container.querySelector('[data-model]')!;
+      const rows = [...card.querySelectorAll('[data-row]')].map((cell) => cell.getAttribute('data-row'));
+      // Mutation: render the old Alert in the action row → a sixth block or an alert → red.
+      expect(rows).toEqual(['title', 'description', 'build', 'extras', 'action']);
+      // An Alert is role="alert" (danger) or role="status" (warning).
+      expect(card.querySelector('[role="alert"], [role="status"]')).toBeNull();
+      expect(card.querySelector('[data-row="action"]')?.textContent).toContain(action);
+    });
+
+    it.each<[string, CatalogDownloadProps, string, string]>([
+      [
+        'held',
+        props({ heldBy: 'UD-Q4_K_M', listed: true }),
+        'Show in Local models',
+        `${SLUG} holds UD-Q4_K_M. It is a working model, so this card does not remove it. Delete it in Local models to install MXFP4 here.`,
+      ],
+      [
+        'locked',
+        props({ blockedByForeignDir: true, blocker: { ...HELD, locked: true } }),
+        'Show why',
+        `The app has no write permission on ${SLUG}, so it cannot move it or add files to it. Change its permissions (Finder, Get Info), then open this page again.`,
+      ],
+      [
+        'cleanup',
+        props({ blockedByForeignDir: true, blocker: BLOCKER }),
+        'Clean up & update…',
+        `${SLUG} is in the way of this model.`,
+      ],
+    ])(
+      'gives a keyboard and screen reader user the reason of the %s state beside %s',
+      async (_state, download, control, sentence) => {
+        mounted = await renderPage(view(download), (text) => text.includes(LABEL));
+        const action = mounted.container.querySelector('[data-row="action"]')!;
+        expect(action.textContent).toContain(control);
+        // Mutation: keep the sentence in the hover Tooltip only → red.
+        expect([...action.querySelectorAll('.sr-only')].map((node) => node.textContent)).toContain(sentence);
+      },
+    );
+
+    it('links Details and Show in Local models from the build, not from the local model list', async () => {
+      mounted = await renderPage(view(props({ present: true, installed: true, listed: true })), (text) =>
+        text.includes(LABEL),
+      );
+      expect(mounted.container.querySelector('[data-row="action"] a')?.getAttribute('href')).toBe(
+        `/models?focus=${SLUG}`,
+      );
+      mounted.unmount();
+      mounted = await renderPage(view(props({ present: true, installed: true })), (text) => text.includes(LABEL));
+      expect(mounted.container.querySelector('[data-row="action"] a')).toBeNull();
+      mounted.unmount();
+      mounted = await renderPage(view(props({ heldBy: 'UD-Q4_K_M' })), (text) => text.includes(LABEL));
+      expect(liveButtonLabels()).toContain('Show why');
+    });
+
+    it('marks the installed text installed when an update is available too', async () => {
+      mounted = await renderPage(view(props({ present: true, installed: true }, { updateAvailable: true })), (text) =>
+        text.includes(LABEL),
+      );
+      // Mutation: data-status names the action state ('update') → red.
+      expect(mounted.container.querySelector('[data-row="action"] [data-status="installed"]')).not.toBeNull();
+    });
+
+    it('takes the first match: job, update, installed, missing, held, locked, adopt, cleanup, install', () => {
+      const all = {
+        present: true,
+        heldBy: 'UD-Q4_K_M',
+        blocker: HELD,
+        located: null,
+      };
+      expect(catalogActionState(all, { job, updateAvailable: true })).toBe('job');
+      expect(catalogActionState(all, { job: undefined, updateAvailable: true })).toBe('update');
+      expect(catalogActionState(all, { job: undefined, updateAvailable: false })).toBe('installed');
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      expect(catalogActionState({ ...all, located: away }, { job: undefined, updateAvailable: false })).toBe(
+        'installed',
+      );
+      expect(
+        catalogActionState({ ...all, present: false, located: away }, { job: undefined, updateAvailable: true }),
+      ).toBe('missing');
+      const absent = { ...all, present: false };
+      expect(catalogActionState(absent, { job: undefined, updateAvailable: true })).toBe('held');
+      const free = { ...absent, heldBy: null };
+      expect(
+        catalogActionState({ ...free, blocker: { ...HELD, locked: true } }, { job: undefined, updateAvailable: false }),
+      ).toBe('locked');
+      expect(catalogActionState(free, { job: undefined, updateAvailable: false })).toBe('adopt');
+      expect(catalogActionState(free, { job: undefined, updateAvailable: false, refused: true })).toBe('cleanup');
+      expect(
+        catalogActionState(
+          { ...free, blocker: { ...HELD, kind: 'symlink' } },
+          { job: undefined, updateAvailable: false },
+        ),
+      ).toBe('cleanup');
+      expect(catalogActionState({ ...free, blocker: BLOCKER }, { job: undefined, updateAvailable: false })).toBe(
+        'cleanup',
+      );
+      expect(
+        catalogActionState({ ...absent, heldBy: null, blocker: null }, { job: undefined, updateAvailable: false }),
+      ).toBe('install');
+    });
+
+    function control(view: LocateControl['view'] = { step: 'idle' }): LocateControl & { starts: number } {
+      const made = { view, starts: 0, start: () => (made.starts += 1), close: () => {} };
+      return made;
+    }
+
+    it('says Starting download… while the request is in flight, with Locate… off', async () => {
+      const download = props({});
+      mounted = await renderPage(view(download, { starting: [SLUG], locate: control() }), (text) =>
+        text.includes(LABEL),
+      );
+      expect(buttonNamed(mounted.container, 'Starting download…').disabled).toBe(true);
+      expect(buttonNamed(mounted.container, 'Locate…').disabled).toBe(true);
+    });
+
+    it('renders Locate… only with the prop, beside Install and in Files not found', async () => {
+      const locate = control();
+      mounted = await renderPage(view(props({})), (text) => text.includes(LABEL));
+      expect(liveButtonLabels()).not.toContain('Locate…');
+      mounted.unmount();
+      mounted = await renderPage(view(props({}), { locate }), (text) => text.includes(LABEL));
+      await act(async () => buttonNamed(mounted!.container, 'Locate…').click());
+      expect(locate.starts).toBe(1);
+      const away = { from: '/Volumes/Models/qwen', mode: 'linked' as const, filesAvailable: false };
+      for (const [state, item, fields] of [
+        ['installed', { present: true, installed: true }, {}],
+        ['update', { present: true, installed: true }, { updateAvailable: true }],
+        ['job', {}, { job }],
+        ['held', { heldBy: 'UD-Q4_K_M' }, {}],
+        ['adopt', { blockedByForeignDir: true, blocker: HELD }, {}],
+        ['locked', { blockedByForeignDir: true, blocker: { ...HELD, locked: true } }, {}],
+        ['cleanup', { blockedByForeignDir: true, blocker: BLOCKER }, {}],
+        ['missing', { located: away }, {}],
+      ] as const) {
+        mounted.unmount();
+        const download = props(item, fields);
+        expect(catalogActionState(download.item, download)).toBe(state);
+        mounted = await renderPage(view(download, { locate }), (text) => text.includes(LABEL));
+        // Mutation: render Locate in every state → red.
+        expect([state, buttonLabels().includes('Locate…')]).toEqual([state, state === 'missing']);
+      }
+    });
+
+    it('says Checking… while the folder is checked, and a refusal on the build line', async () => {
+      mounted = await renderPage(view(props({}), { locate: control({ step: 'plan' }) }), (text) =>
+        text.includes(LABEL),
+      );
+      const checking = buttonNamed(mounted.container, 'Checking…');
+      expect(checking.getAttribute('aria-disabled')).toBe('true');
+      expect(buttonNamed(mounted.container, 'Install').disabled).toBe(true);
+      mounted.unmount();
+      const message = 'The app cannot read this folder. Pick the folder that holds the model files.';
+      mounted = await renderPage(view(props({}), { locate: control({ step: 'refused', message }) }), (text) =>
+        text.includes(LABEL),
+      );
+      expect(mounted.container.querySelector('[data-row="build"] button')?.textContent).toBe(message);
+      expect(mounted.container.querySelector('[role="alert"], [role="status"]')).toBeNull();
+    });
+
+    it('says a disk that is too small on the build line, with the full sentence for the tooltip', async () => {
+      const host = { totalMemBytes: 128 * 1024 ** 3, diskFreeBytes: 10 * 1024 ** 3 };
+      mounted = await renderPage(view(props({}), { host }), (text) => text.includes(LABEL));
+      expect(mounted.container.querySelector('[data-row="build"]')?.textContent).toContain(
+        '23.3 GB · only 10.0 GB free on this disk',
+      );
+      expect(
+        hostLine({ sizeGb: 23.3, present: false }, undefined, { totalMemBytes: 16 * 1024 ** 3, diskFreeBytes: null }),
+      ).toBe("23.3 GB · more than this Mac's 16.0 GB");
+    });
+
+    it('starts the draft from Add with the draft folder, beside a model with no build on disk', async () => {
+      const calls = serveJobs(catalogRoutes({ draft: draftItem(false) }), (body) => ({
+        ok: true,
+        status: 202,
+        body: {
+          id: 'job-draft',
+          slug: (body as { slug: string }).slug,
+          repo: 'z-lab/Qwen3.8-27B-DFlash2',
+          kind: 'install',
+        },
+      }));
+      await mountModels();
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      await act(async () => buttonNamed(companion, 'Add').click());
+      await waitFor(() => openedStreams.includes('job-draft'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: 'qwen3.8-27b-dflash2' }]);
+      // The model keeps its own Install beside the draft's job.
+      expect(liveButtonLabels()).toContain('Install');
+    });
+
+    it('says the draft waits for the model when no build of it is on disk', async () => {
+      await mount(
+        createElement(MemoryRouter, null, createElement(Models)),
+        catalogRoutes({ draft: draftItem(true) }),
+        LABEL,
+      );
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
+      expect(companion.textContent).toContain('added · waits for the model');
+    });
+  });
 });
 
 describe('Models page — local models and the drawer', () => {
   const NAME = 'qwen3.8-27b-gguf';
   const SERVED = 'Qwen3.8-27B-UD-Q4_K_XL';
 
-  function modelsRoutes(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  function modelsRoutes(
+    extra: Record<string, unknown> = {},
+    located: ModelsResponse['models'][number]['located'] = null,
+  ): Record<string, unknown> {
     const models: ModelsResponse = {
       models: [
         {
@@ -2552,11 +4311,12 @@ describe('Models page — local models and the drawer', () => {
           sizeBytes: 17 * 1024 ** 3,
           fileCount: 2,
           servedIds: [SERVED],
+          located,
+          link: false,
         },
       ],
       warnings: [],
       dir: '/models',
-      host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
     };
     return {
       '/models': models,
@@ -2616,6 +4376,133 @@ describe('Models page — local models and the drawer', () => {
     expect(button).toBeTruthy();
     return button!;
   }
+
+  describe('a model that Locate made', () => {
+    const FROM = '/Volumes/Models/lmstudio/unsloth/Qwen3.8-27B-GGUF';
+
+    function dialogWith(title: string): HTMLElement | undefined {
+      return [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+        el.textContent?.includes(title),
+      );
+    }
+
+    it.each<[string, ModelsResponse['models'][number]['located'], string | null]>([
+      ['linked', { from: FROM, mode: 'linked', filesAvailable: true, filesStay: true }, 'Linked'],
+      ['away', { from: FROM, mode: 'linked', filesAvailable: false, filesStay: true }, 'Not connected'],
+      ['shared', { from: FROM, mode: 'shared', filesAvailable: true, filesStay: true }, null],
+    ])('badges the row of a %s model', async (_name, located, badge) => {
+      await mountModels(modelsRoutes({}, located));
+      const cell = modelRow().querySelector('td')!;
+      const badges = [...cell.querySelectorAll('[title]')].filter((node) => node.getAttribute('title') === FROM);
+      expect(badges.map((node) => node.textContent)).toEqual(badge === null ? [] : [badge]);
+    });
+
+    it('says Remove when the model files stay on disk, and the delete calls the same route', async () => {
+      const success = vi.spyOn(toast, 'success');
+      const located = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: true };
+      const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } }, located);
+      routes['/models'] = sequence(routes['/models'], { ...(routes['/models'] as ModelsResponse), models: [] });
+      await mountModels(routes);
+      expect(modelRow().querySelector(`button[aria-label="Delete ${NAME}"]`)).toBeNull();
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Remove ${NAME}"]`)!.click(),
+      );
+      const dialog = dialogWith('Remove model?')!;
+      expect(splitWhitespace(dialog.textContent ?? '').join(' ')).toContain(
+        `This removes ${NAME} from the app. Its model files stay on disk; you located them in ${truncateMiddle(FROM, 48)}.`,
+      );
+      expect(dialog.textContent).not.toContain('permanently');
+      await act(async () => buttonIn(dialog, 'Remove').click());
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success).toHaveBeenCalledWith('Model removed', { description: NAME });
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+        [`/api/models/${NAME}`, { keepsFiles: true }],
+      ]);
+    });
+
+    it('turns Remove into the danger Delete when the server says the files no longer stay', async () => {
+      const success = vi.spyOn(toast, 'success');
+      const stays = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: true };
+      const routes = modelsRoutes({}, stays);
+      const listed = routes['/models'] as ModelsResponse;
+      const lastCopy = { ...listed, models: [{ ...listed.models[0]!, located: { ...stays, filesStay: false } }] };
+      routes['/models'] = sequence(listed, lastCopy, { ...listed, models: [] });
+      const conflict = `The model files of "${NAME}" are no longer anywhere else on disk. Delete now removes them.`;
+      routes[`/models/${NAME}`] = sequence(stubError('E_CONFLICT', conflict), { deleted: true, name: NAME });
+      await mountModels(routes);
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Remove ${NAME}"]`)!.click(),
+      );
+      await act(async () => buttonIn(dialogWith('Remove model?')!, 'Remove').click());
+      await waitFor(() => dialogWith('Delete model?')?.textContent?.includes(conflict) === true);
+      const dialog = popover();
+      expect(dialog.textContent).toContain('permanently removes');
+      expect(dialogWith('Remove model?')).toBeUndefined();
+      expect(success).not.toHaveBeenCalled();
+      await act(async () => buttonIn(dialog, 'Delete').click());
+      await waitFor(() => success.mock.calls.length > 0);
+      expect(success).toHaveBeenCalledWith('Model deleted', { description: NAME });
+      expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+        [`/api/models/${NAME}`, { keepsFiles: true }],
+        [`/api/models/${NAME}`, undefined],
+      ]);
+    });
+
+    it('says the danger Delete when the folder holds the last name of a model file', async () => {
+      const located = { from: FROM, mode: 'shared' as const, filesAvailable: true, filesStay: false };
+      await mountModels(modelsRoutes({}, located));
+      // Mutation: read `located` alone, not `filesStay` → the Remove text over the last copy → red.
+      await act(async () =>
+        modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click(),
+      );
+      expect(popover().textContent).toContain('permanently removes');
+      expect(dialogWith('Remove model?')).toBeUndefined();
+    });
+
+    const shown = truncateMiddle(FROM, 42);
+    it.each<[string, 'shared' | 'linked', boolean, string]>([
+      ['shared', 'shared', true, `Shares files with${shown}`],
+      ['linked', 'linked', true, `Linked to${shown}`],
+      ['away', 'linked', false, `Linked to${shown} · not available`],
+    ])('names the located folder in the drawer of a %s model', async (_name, mode, filesAvailable, row) => {
+      await mountModels(
+        modelsRoutes({}, { from: FROM, mode, filesAvailable, filesStay: true }),
+        `/models?focus=${NAME}`,
+      );
+      await waitFor(() => byRole(document, 'dialog', NAME) !== null);
+      const disk = byRole(document, 'region', 'On disk') ?? byRole(document, 'dialog', NAME)!;
+      expect(splitWhitespace(disk.textContent ?? '').join(' ')).toContain(splitWhitespace(row).join(' '));
+      expect(buttonIn(byRole(document, 'dialog', NAME)!, 'Remove model')).toBeTruthy();
+    });
+  });
+
+  it('says Remove link for a model whose folder is a link, and the delete calls the same route', async () => {
+    const success = vi.spyOn(toast, 'success');
+    const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } });
+    const listed = routes['/models'] as ModelsResponse;
+    routes['/models'] = sequence(
+      { ...listed, models: [{ ...listed.models[0]!, link: true }] },
+      { ...listed, models: [] },
+    );
+    await mountModels(routes);
+    await act(async () => modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click());
+    const dialog = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+      el.textContent?.includes('Remove link?'),
+    )!;
+    expect(splitWhitespace(dialog.textContent ?? '').join(' ')).toContain(
+      `This removes the link ${NAME} from the models folder. Its folder and the model files in it are not changed.`,
+    );
+    expect(dialog.textContent).not.toContain('permanently');
+    expect((dialog.closest('[data-tone]') ?? dialog.querySelector('[data-tone]'))?.getAttribute('data-tone')).toBe(
+      'neutral',
+    );
+    await act(async () => buttonIn(dialog, 'Remove link').click());
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success).toHaveBeenCalledWith('Link removed', { description: NAME });
+    expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+      [`/api/models/${NAME}`, undefined],
+    ]);
+  });
 
   it('joins a GGUF checkpoint to its usage, live state and drawer through its served id', async () => {
     await mountModels(modelsRoutes());
@@ -2889,5 +4776,28 @@ describe('Models page — local models and the drawer', () => {
       });
     }
     await waitFor(() => document.activeElement?.hasAttribute('data-scroll-root') === true);
+  });
+});
+
+describe('the gallery card forms', () => {
+  it('pairs every "Needs cleanup" with Clean up & update…, and no form says Reinstall', async () => {
+    const { CatalogCardSection } = await import('../scripts/dev/gallery/catalog-sections.js');
+    mounted = await renderPage(createElement(MemoryRouter, null, createElement(CatalogCardSection)), (text) =>
+      text.includes('Needs cleanup'),
+    );
+    const forms = [...mounted.container.querySelectorAll<HTMLElement>('[data-gallery-card]')];
+    let cleanups = 0;
+    for (const form of forms) {
+      const name = form.getAttribute('data-gallery-card');
+      const text = form.textContent ?? '';
+      expect([name, text.includes('Reinstall')]).toEqual([name, false]);
+      for (const row of form.querySelectorAll<HTMLElement>('[data-row="action"], [role="group"]')) {
+        if (!(row.textContent ?? '').toLowerCase().includes('needs cleanup')) continue;
+        cleanups += 1;
+        const labels = [...row.querySelectorAll('button')].map((button) => (button.textContent ?? '').trim());
+        expect([name, labels.includes('Clean up & update…'), labels.includes('Show why')]).toEqual([name, true, false]);
+      }
+    }
+    expect(cleanups).toBeGreaterThanOrEqual(8);
   });
 });

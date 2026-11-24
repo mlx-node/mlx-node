@@ -66,7 +66,7 @@ export interface ThreadBarProps {
   onRename: () => void;
   /** The New button when the list is a drawer (it sits last in the bar). */
   trailing?: ReactNode;
-  /** Work: the folder chip after the title. */
+  /** Work: the folder chip after the title (an open conversation's, or a new one's once a folder is chosen). */
   folder?: ReactNode;
   /** Work: the permission mode chip after the folder chip, while the mode is Auto or Bypass. */
   permission?: ReactNode;

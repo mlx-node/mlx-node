@@ -7,6 +7,7 @@
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 
 import type { ChatPaths } from '../paths.js';
+import { PROVIDER_ORIGINS } from '../web/http.js';
 
 export interface InferenceAccess {
   /** Loopback origin of the inference sidecar, without a path. */
@@ -147,11 +148,17 @@ export function workOverlay(base: string | undefined): string {
   });
 }
 
-export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
+/** What Work inherits from the Control Panel: every variable minus the app's internals and every provider key. */
+export function workInherited(base: NodeJS.ProcessEnv): Record<string, string> {
   const env: Record<string, string> = {};
-  for (const [name, value] of Object.entries(input.base)) if (value !== undefined) env[name] = value;
+  for (const [name, value] of Object.entries(base)) if (value !== undefined) env[name] = value;
   for (const name of WORK_ENV_REMOVED) delete env[name];
   for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
+  return env;
+}
+
+export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
+  const env = workInherited(input.base);
   Object.assign(env, baseUrls(input.endpoint));
   env.XAI_API_KEY = input.endpoint.token;
   env.GROK_DISABLE_AUTOUPDATER = '1';
@@ -166,6 +173,8 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   for (const [name, value] of Object.entries(input.providerKeys)) {
     if (ALL_PROVIDER_KEY_ENV.includes(name)) env[name] = value;
   }
+  // The CLI sends the key to `FIRECRAWL_API_URL` before an address it saved itself (`firecrawl config --api-url`).
+  if (env.FIRECRAWL_API_KEY !== undefined) env.FIRECRAWL_API_URL = PROVIDER_ORIGINS.firecrawl;
   env.FIRECRAWL_NO_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_NO_ENDPOINT_FEEDBACK = '1';

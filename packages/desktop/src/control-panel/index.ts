@@ -39,6 +39,7 @@ import {
   createDashboardRuntime,
   createOpenCalls,
   serveRuntimeOverPort,
+  workCommandPath,
   type DashboardRuntime,
 } from '@mlx-node/dashboard';
 
@@ -146,6 +147,7 @@ runtime = createDashboardRuntime({
   chat: {
     ...(cli ? { installAgent: agentInstaller(cli) } : {}),
     appEnds: readAppEnds(process.env[LEDGER_DIR_ENV]),
+    workPath: workCommandPath,
     // MAIN never holds a turn count older than the turn itself.
     onBusyChange: () => post(pongOf(0, runtime, calls, Date.now())),
   },

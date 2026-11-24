@@ -1,6 +1,7 @@
 /**
- * Subprocess gate for the native-free import contract: `@mlx-node/agent/catalog`
- * and the `@mlx-node/lm/family-data` leaf must reach nothing that dlopens the
+ * Subprocess gate for the native-free import contract: `@mlx-node/agent/catalog`,
+ * the `@mlx-node/lm/family-data` leaf and the `@mlx-node/lm/model-variant` name
+ * parser the dashboard's local list reads must reach nothing that dlopens the
  * addon. A stray value import is invisible to every behavioural test, which runs
  * in a vitest worker that already loaded it.
  *
@@ -20,6 +21,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
 const CATALOG_DIST = resolve(ROOT, 'packages/agent/dist/catalog.js');
 const PATHS_DIST = resolve(ROOT, 'packages/agent/dist/paths.js');
 const FAMILY_DATA_DIST = resolve(ROOT, 'packages/lm/dist/family-data.js');
+const MODEL_VARIANT_DIST = resolve(ROOT, 'packages/lm/dist/model-variant.js');
 const LM_ROOT_DIST = resolve(ROOT, 'packages/lm/dist/index.js');
 const MODELS_DIST = resolve(ROOT, 'packages/agent/dist/models.js');
 const BINARY_DIST = resolve(ROOT, 'packages/agent/dist/binary.js');
@@ -66,6 +68,8 @@ describe('native-free catalog + family-data subpaths', () => {
     expect(existsSync(PATHS_DIST)).toBe(true);
     expect(Object.keys(agentPkg.exports)).toContain('./models');
     expect(Object.keys(lmPkg.exports)).toContain('./model-detection');
+    expect(Object.keys(lmPkg.exports)).toContain('./model-variant');
+    expect(existsSync(MODEL_VARIANT_DIST)).toBe(true);
     expect(existsSync(MODELS_DIST)).toBe(true);
     expect(Object.keys(agentPkg.exports)).toContain('./binary');
     expect(existsSync(BINARY_DIST)).toBe(true);
@@ -112,6 +116,10 @@ describe('native-free catalog + family-data subpaths', () => {
       const catalog = await import(${JSON.stringify(CATALOG_DIST)});
       const familyData = await import(${JSON.stringify(FAMILY_DATA_DIST)});
       const paths = await import(${JSON.stringify(PATHS_DIST)});
+      const variant = await import(${JSON.stringify(MODEL_VARIANT_DIST)});
+      if (variant.ggufVariant('Hy4-flash-Q4_K_M', 'hy4-flash-gguf', undefined, 'Hy4-flash-Q4_K_M').variant !== 'Q4_K_M') {
+        throw new Error('model-variant ggufVariant wrong in child');
+      }
       const binary = await import(${JSON.stringify(BINARY_DIST)});
       if (typeof binary.probeAgentInstall !== 'function') throw new Error('binary.probeAgentInstall missing');
       const { pathToFileURL } = await import('node:url');

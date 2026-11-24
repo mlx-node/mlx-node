@@ -46,8 +46,8 @@ export function NowPanel({ data }: { data: ProvidersResponse }): ReactElement {
                   {work.map((part, index) => (
                     <Fragment key={part.text}>
                       {part.missing ? (
-                        <span className="inline-flex items-center gap-1 text-danger">
-                          <TriangleAlert size={12} aria-hidden="true" />
+                        <span className="inline-flex items-baseline gap-1 text-danger">
+                          <TriangleAlert size={12} className="self-center" aria-hidden="true" />
                           <SwapText text={part.text} />
                         </span>
                       ) : (

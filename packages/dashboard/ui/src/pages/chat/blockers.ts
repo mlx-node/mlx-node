@@ -4,8 +4,19 @@
  * message is used only for a code this table does not know.
  */
 
+import {
+  CHAT_PICTURES_MAX_BASE64,
+  estimateTokens,
+  MESSAGE_FILES_MAX_BYTES,
+  storedPictureChars,
+  type UserAttachment,
+  utf8Bytes,
+  WINDOW_SHARE,
+} from '../../../../src/chat/attachment-rule.js';
+import { type DraftAttachment, draftInput } from '../../lib/chat-attachments';
 import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatFailure, ChatFailureCode, ChatHostState, ChatMode } from '../../lib/chat-types';
+import type { TranscriptEntry } from '../../lib/types';
 
 export type BlockActionKind =
   | 'install'
@@ -195,6 +206,10 @@ export function sendFailure(
       return strip(e['slash-text'], null);
     case 'keychain-unavailable':
       return strip(e['keychain-unavailable'], 'open-providers', 'warning');
+    case 'attachment-refused':
+      return strip(e['attachment-refused'], null);
+    case 'pictures-full':
+      return strip(e['pictures-full'], null);
     default:
       break;
   }
@@ -202,4 +217,49 @@ export function sendFailure(
   const known = reason === undefined ? undefined : BLOCKER_SENTENCES[reason as ChatFailureCode];
   if (known !== undefined) return { strip: { tone: 'danger', text: known } };
   return strip(e.other, 'retry');
+}
+
+export interface AttachFacts {
+  mode: ChatMode;
+  /** Chat and the model row has images = true. */
+  seesImages: boolean;
+  text: string;
+  files: readonly DraftAttachment[];
+  /** The model's context window in tokens; null while no agent listed the model. */
+  windowTokens: number | null;
+  /** Files of this place still being read. */
+  reading: number;
+  /** Stored base64 of the pictures the conversation already holds ({@link heldPictureChars}). */
+  heldPictures: number;
+}
+
+export function heldPictureChars(entries: readonly TranscriptEntry[]): number {
+  const items: UserAttachment[] = [];
+  for (const entry of entries)
+    if (entry.kind === 'user' && entry.attachments !== undefined) items.push(...entry.attachments);
+  return storedPictureChars(items);
+}
+
+/**
+ * Why a message with these files cannot go, first match wins; null when it can. The composer shows it beside Send,
+ * and `send()` checks it again, so Retry and Send again cannot pass it.
+ */
+export function attachProblem(facts: AttachFacts): string | null {
+  const a = CHAT.attach;
+  if (facts.reading > 0) return a.reading;
+  if (facts.files.length === 0) return null;
+  const pictures = facts.files.some((file) => file.kind === 'image');
+  if (pictures && facts.mode === 'work') return a.blockedWork;
+  if (pictures && !facts.seesImages) return a.blockedModel;
+  if (pictures && facts.heldPictures + storedPictureChars(facts.files) > CHAT_PICTURES_MAX_BASE64) {
+    return CHAT.sendErrors['pictures-full'][0];
+  }
+  let bytes = utf8Bytes(facts.text);
+  for (const file of facts.files) if (file.kind === 'file') bytes += file.numbered;
+  if (bytes > MESSAGE_FILES_MAX_BYTES) return a.blockedLong;
+  const window = facts.windowTokens;
+  if (window !== null && estimateTokens(facts.text, facts.files.map(draftInput)) > window * WINDOW_SHARE) {
+    return a.blockedWindow;
+  }
+  return null;
 }

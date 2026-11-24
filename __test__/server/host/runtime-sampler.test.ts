@@ -188,25 +188,30 @@ async function flushIo(): Promise<void> {
 }
 
 /**
- * Wait until the live body built at time `builtAt` is on disk. The write runs on
- * the thread pool, and a tick that finds a write still in flight writes nothing,
- * so reading or advancing the clock before it lands sees a stale file.
+ * Wait until the live body built at time `builtAt` is on disk and the sampler's write has settled. The file shows on
+ * disk before the write's promise settles, and a tick that finds a write still in flight writes nothing, so a clock
+ * advance in that window leaves a stale file.
  */
-async function liveLanded(file: string, builtAt: number | null): Promise<void> {
+async function liveLanded(sampler: RuntimeSampler | null, file: string, builtAt: number | null): Promise<void> {
+  const inFlight = () => (sampler as unknown as { liveWrite: Promise<void> | null } | null)?.liveWrite ?? null;
   const deadline = performance.now() + 10_000;
   for (;;) {
+    const write = inFlight();
+    if (write !== null) {
+      await write;
+      continue;
+    }
     let ts: number | null = null;
     try {
       ts = (JSON.parse(readFileSync(file, 'utf8')) as RuntimeLiveFile).ts;
     } catch {
       // not written yet
     }
-    if (ts !== null && ts === builtAt) break;
+    if (ts !== null && ts === builtAt) return;
     if (performance.now() > deadline)
       throw new Error(`live file never reached ts ${String(builtAt)}; last ${String(ts)}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
-  await new Promise((resolve) => setImmediate(resolve));
 }
 
 describe('runtime sampler', () => {
@@ -232,7 +237,7 @@ describe('runtime sampler', () => {
 
   /** When the sampler last built a live body: only that build reads `host.persistPagedCache`. */
   let liveBuiltAt: number | null = null;
-  const landed = () => liveLanded(join(dir, `live-${process.pid}.json`), liveBuiltAt);
+  const landed = () => liveLanded(sampler, join(dir, `live-${process.pid}.json`), liveBuiltAt);
   const readLive = () => JSON.parse(readFileSync(join(dir, `live-${process.pid}.json`), 'utf8')) as RuntimeLiveFile;
 
   function start(entries: ResidentModel[], overrides: Partial<RuntimeSamplerDeps> = {}) {
@@ -465,6 +470,7 @@ describe('runtime sampler', () => {
         pool: null,
         stateNamespace: null,
         experts: null,
+        images: false,
       },
     ]);
     expect(live.turns).toEqual([
@@ -575,6 +581,22 @@ describe('runtime sampler', () => {
       null,
       null,
     ]);
+  });
+
+  // MUTATION: any answer of the method counts as yes -> the 'no' row goes red.
+  it("each model row carries the loaded model's own supportsImages() answer", async () => {
+    const sees = fakeBinding();
+    (sees.entry.model as { supportsImages?: () => boolean }).supportsImages = () => true;
+    const blind = fakeBinding();
+    (blind.entry.model as { supportsImages?: () => boolean }).supportsImages = () => false;
+    const broken = fakeBinding();
+    (broken.entry.model as { supportsImages?: () => boolean }).supportsImages = () => {
+      throw new Error('gone');
+    };
+    const plain = fakeBinding();
+    start([sees.entry, blind.entry, broken.entry, plain.entry]);
+    await landed();
+    expect(readLive().models.map((model) => model.images)).toEqual([true, false, null, false]);
   });
 
   // MUTATION: `streaming: snapshot.residency === 'direct'` -> the partial row says false -> red.

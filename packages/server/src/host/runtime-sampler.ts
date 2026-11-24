@@ -233,6 +233,16 @@ function stateNamespaceOf(model: object): string | null {
   }
 }
 
+function imagesOf(model: object): boolean | null {
+  const ask = (model as { supportsImages?: () => unknown }).supportsImages;
+  if (typeof ask !== 'function') return false;
+  try {
+    return ask.call(model) === true;
+  } catch {
+    return null;
+  }
+}
+
 function liveExperts(model: object): RuntimeLiveModel['experts'] {
   const snapshot = readResidency(model);
   return snapshot === null ? null : expertsLiveOf(snapshot);
@@ -706,6 +716,7 @@ class Sampler implements RuntimeSampler {
       pool: schedState?.pool ?? null,
       stateNamespace: stateNamespaceOf(view.entry.model as object),
       experts: liveExperts(view.entry.model as object),
+      images: imagesOf(view.entry.model as object),
     };
   }
 

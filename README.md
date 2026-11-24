@@ -149,12 +149,13 @@ The npm `darwin-arm64` binary has a macOS 26.2 deployment target. It does not lo
 
 The CUDA path has been tested with Qwen3.6 27B Dense and 35B-A3B MoE on GB10 / DGX Spark (`sm_121`, CUDA 13.0). It currently uses eager fallbacks and has no mlx-node-specific CUDA kernels. Training, speculative decoding, x86_64 Linux, and prebuilt CUDA binaries are not supported.
 
-The wizard's three default models (Qwen3.8-27B, Qwen-AgentWorld-35B-A3B, Gemma-4-26B-A4B) install Unsloth **UD-Q4_K_XL GGUF** files on every platform — one repo per model, one quantization variant, with base-model tokenizer sidecars fetched automatically (`--assets-repo`). Each load reads the GGUF directly and repacks K-quants losslessly into MLX layout in memory. Only a small config/tokenizer asset directory is cached; no second packed-weight checkpoint is written.
+The wizard's catalog models are Qwen3.8-27B, Inkling-2-Mini, Qwen3.8-Flash-Next and Hy4-flash. Qwen3.8-27B and Inkling-2-Mini offer more than one build, and each build installs to its own folder ([docs/cli.md](docs/cli.md#model-selection-and-first-run-wizard) lists them). Every build but one is **GGUF** on every platform: one quantization variant out of its repo (Unsloth **UD-Q4_K_XL** first, **UD-Q4_K_M** second; `Q4_K_M` for Hy4-flash), with base-model tokenizer sidecars fetched automatically (`--assets-repo`). The other is Inkling-2-Mini Original, the safetensors release in NVFP4 and MXFP8. Qwen3.8-Flash-Next and Hy4-flash are offered only on a machine with at least 96 GiB of RAM. Each GGUF load reads the GGUF directly and repacks K-quants losslessly into MLX layout in memory. Only a small config/tokenizer asset directory is cached; no second packed-weight checkpoint is written.
 
-The three GGUF presets use the CUDA K-quant implementations for their packed
-embeddings, dense projections, and expert projections. The CUDA implementation
-covers `q2k` through `q6k`, `iq4nl`, and `iq4xs`. The lower-bit IQ grid
-formats still require the CPU or Metal. The NVIDIA quantization recipes in
+On CUDA, a GGUF load uses the CUDA K-quant implementations for its packed
+embeddings, dense projections, and expert projections. The only models tested
+on CUDA are the Qwen3.6 models named at the start of this section. The CUDA
+implementation covers `q2k` through `q6k`, `iq4nl`, and `iq4xs`. The lower-bit
+IQ grid formats still require the CPU or Metal. The NVIDIA quantization recipes in
 [the CUDA benchmark notes](docs/cuda-poc-benchmark.md) apply to SafeTensors inputs.
 
 Build it on an aarch64 glibc host with CUDA 13.0 and `nvcc` on `PATH`:

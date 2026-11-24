@@ -1,6 +1,7 @@
 import { type ReactElement, type ReactNode, useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 
+import { DashboardApiError } from '../lib/api';
 import { hasDismissedOnboarding } from '../lib/onboarding';
 import type { ModelsResponse } from '../lib/types';
 import { useJson } from '../lib/use-api';
@@ -8,7 +9,8 @@ import styles from './app-shell.module.css';
 
 /**
  * Entry at `/` with an empty model library (not dismissed for that library) goes to `/welcome`. Decided once, on
- * entry: a user already in the workspace who deletes the last model stays where they are.
+ * entry: a user already in the workspace who deletes the last model stays where they are. A models folder that is a
+ * link to a missing disk is not an empty library: that entry goes to `/models`, which says so.
  */
 export function FirstRunGate({ children }: { children: ReactNode }): ReactElement {
   const { pathname } = useLocation();
@@ -22,6 +24,13 @@ export function FirstRunGate({ children }: { children: ReactNode }): ReactElemen
           Opening your workspace…
         </div>
       );
+    }
+    if (
+      pathname === '/' &&
+      models.error instanceof DashboardApiError &&
+      models.error.reason === 'models-dir-unavailable'
+    ) {
+      return <Navigate to="/models" replace />;
     }
     if (
       models.error === undefined &&

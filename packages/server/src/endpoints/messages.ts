@@ -1444,6 +1444,13 @@ export async function handleCreateMessage(
     sendAnthropicNotFound(res, `Model "${body.model}" not found`);
     return;
   }
+  // "Could not process image" with a 400 is what makes the agent strip the request's images and retry.
+  if (mappedMessages.some((message) => (message.images?.length ?? 0) > 0) && model.supportsImages?.() !== true) {
+    preDispatchAdmission?.release();
+    modelLoadAdmission?.release();
+    sendAnthropicBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`);
+    return;
+  }
 
   // The lease keeps the binding's FIFO `execLock` chain alive across every
   // await — a concurrent `unregister()` + `register(sameModel)` would otherwise

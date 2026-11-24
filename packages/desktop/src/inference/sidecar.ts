@@ -21,7 +21,7 @@ import { familyDataFor } from '@mlx-node/lm/family-data';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 
-import { EXIT_STARTUP_FAILED } from './exit-codes.js';
+import { EXIT_STARTUP_FAILED, STARTUP_FAILURE_PREFIX } from './exit-codes.js';
 import { parseFingerprintList, QUARANTINED_ENV, TURN_JOURNAL_ENV } from './turn-journal.js';
 
 // Re-exported so existing importers keep working; the definition and the rule
@@ -161,6 +161,7 @@ export interface SidecarHost {
     base: string;
     variant: string;
     format: 'gguf' | 'mlx';
+    supportsImages: boolean;
   }[];
   logDir: string | null;
   close(opts?: { timeoutMs?: number }): Promise<void>;
@@ -175,8 +176,9 @@ export function endpointModels(models: SidecarHost['models']): {
   format: 'gguf' | 'mlx';
   modelType: string;
   kind: 'chat' | 'decision';
+  images: boolean;
 }[] {
-  return models.map(({ name, path, base, variant, format, modelType }) => ({
+  return models.map(({ name, path, base, variant, format, modelType, supportsImages }) => ({
     name,
     path,
     base,
@@ -184,6 +186,7 @@ export function endpointModels(models: SidecarHost['models']): {
     format,
     modelType,
     kind: familyDataFor(modelType)?.kind === 'decision' ? 'decision' : 'chat',
+    images: supportsImages,
   }));
 }
 
@@ -272,12 +275,17 @@ export class NoParentChannelError extends Error {
  * the addon this file is forbidden from mapping (see the module docstring).
  * The class sets `this.name` in its constructor, so the string is stable.
  *
- * Only a confirmed "nothing to serve" qualifies. An unclassified rejection —
- * a locked `responses.db`, a schema-init failure, an I/O error — may clear on
- * its own, so it exits 1 and the supervisor's bounded crash retries apply.
+ * Only a confirmed "nothing to serve" qualifies: an empty models folder
+ * (`NoModelsDiscoveredError`), or a models folder that is a link to a missing
+ * target (`ModelsDirUnavailableError`, a disk that is not connected). An
+ * unclassified rejection — a locked `responses.db`, a schema-init failure, an
+ * I/O error — may clear on its own, so it exits 1 and the supervisor's bounded
+ * crash retries apply.
  */
 export function isPermanentStartupFailure(error: unknown): boolean {
-  return error instanceof Error && error.name === 'NoModelsDiscoveredError';
+  return (
+    error instanceof Error && (error.name === 'NoModelsDiscoveredError' || error.name === 'ModelsDirUnavailableError')
+  );
 }
 
 /*
@@ -441,7 +449,7 @@ export async function runSidecar(deps: SidecarDeps): Promise<void> {
       throw error;
     }
   } catch (error) {
-    deps.logError(`[mlx] inference host failed to start: ${describe(error)}`);
+    deps.logError(`${STARTUP_FAILURE_PREFIX}${describe(error)}`);
     deps.exit(isPermanentStartupFailure(error) ? EXIT_STARTUP_FAILED : 1);
     return;
   }

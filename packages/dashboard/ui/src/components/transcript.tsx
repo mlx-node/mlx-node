@@ -6,6 +6,7 @@ import { thoughtDuration } from '../lib/chat-turns';
 import { formatClock, formatCount, formatCountNoun, formatDuration } from '../lib/format';
 import { groupTurns, turnTitle, wakeTitle, type TurnGroup } from '../lib/sessions';
 import type { TranscriptEntry, TurnMetric } from '../lib/types';
+import { AttachmentStrip, sentChips } from './arc-x/attachment-strip/attachment-strip';
 import { CompactField } from './arc-x/compact-field/compact-field';
 import { Disclosure } from './arc-x/disclosure/disclosure';
 import { EventRow, RuleLabel } from './arc-x/event-row/event-row';
@@ -72,6 +73,7 @@ function entryMatches(entry: TranscriptEntry, needle: string): boolean {
   const has = (value: string | undefined): boolean => value !== undefined && value.toLowerCase().includes(needle);
   switch (entry.kind) {
     case 'user':
+      return has(entry.text) || (entry.attachments?.some((item) => item.kind === 'file' && has(item.name)) ?? false);
     case 'assistant':
     case 'thinking':
       return has(entry.text);
@@ -240,7 +242,14 @@ function GroupBody(props: BodyProps): ReactElement {
             label={entry.interjection === true ? 'You · interjection' : 'You'}
             ts={entry.ts}
           >
-            <Markdown text={entry.text} />
+            {entry.attachments !== undefined && entry.attachments.length > 0 ? (
+              <div className="grid gap-2">
+                {entry.text !== '' ? <Markdown text={entry.text} /> : null}
+                <AttachmentStrip readOnly items={sentChips(entry.attachments)} />
+              </div>
+            ) : (
+              <Markdown text={entry.text} />
+            )}
           </Message>,
         );
         break;

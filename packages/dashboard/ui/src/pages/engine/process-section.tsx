@@ -32,6 +32,13 @@ export function StatusBadge({ status }: { status: EngineStatus | undefined }): R
   );
 }
 
+/** ` Reason: <text>` with a closing period, or '' when the supervisor has no reason. */
+function reasonText(supervisor: SupervisorLive | null): string {
+  const reason = supervisor?.failureReason ?? null;
+  if (reason === null) return '';
+  return ` Reason: ${reason}${['.', '…', '?', '!'].includes(reason.slice(-1)) ? '' : '.'}`;
+}
+
 /** The alert under the header for a status that needs one; null otherwise. */
 export function StatusAlert({
   live,
@@ -46,7 +53,7 @@ export function StatusAlert({
     case 'restarting':
       return (
         <Alert tone="warning" title="Inference is restarting">
-          {`Failures in a row: ${formatNumber(supervisor?.streak ?? 0)}.`}
+          {`Failures in a row: ${formatNumber(supervisor?.streak ?? 0)}.${reasonText(supervisor)}`}
         </Alert>
       );
     case 'unresponsive': {
@@ -67,7 +74,7 @@ export function StatusAlert({
       const failuresText = shortLived > 0 ? `Short-lived failures in a row: ${formatNumber(shortLived)}. ` : '';
       return (
         <Alert tone="danger" title="Inference failed">
-          {`It stopped and was not restarted. ${failuresText}${exitText}`}
+          {`It stopped and was not restarted.${reasonText(supervisor)} ${failuresText}${exitText}`}
         </Alert>
       );
     }

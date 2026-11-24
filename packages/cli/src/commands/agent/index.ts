@@ -19,7 +19,7 @@
  */
 
 import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { homedir, totalmem } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 // Native-free subpaths: the help path must print without loading the addon, and
@@ -845,6 +845,7 @@ async function runProductionWizard(modelsDir: string): Promise<void> {
     },
     download: (downloadArgv) => downloadModel(downloadArgv),
     modelsDir,
+    totalMemBytes: totalmem(),
   });
 }
 

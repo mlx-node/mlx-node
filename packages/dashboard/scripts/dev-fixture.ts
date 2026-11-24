@@ -14,6 +14,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  symlinkSync,
   truncateSync,
   utimesSync,
   writeFileSync,
@@ -982,6 +983,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         },
         stateNamespace: fixturePrefixNamespaces()[0]!,
         experts: null,
+        images: false,
       },
       {
         name: small,
@@ -997,6 +999,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         pool: { at: now - 40_000, blockCapacity: 2048, allocatedBlocks: 310, freeBlocks: 1738, reclaimableBlocks: 120 },
         stateNamespace: null,
         experts: null,
+        images: false,
       },
       ...(live.chatModels ?? []).map((name) => ({
         name,
@@ -1012,6 +1015,7 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         pool: null,
         stateNamespace: null,
         experts: null,
+        images: false,
       })),
       ...(live.engineStates === true ? engineStateModels(live, now) : []),
     ],
@@ -1092,6 +1096,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       },
       stateNamespace: null,
       experts: null,
+      images: false,
     };
   });
   const loadedAt = live.startedAt + 3000;
@@ -1109,6 +1114,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: null,
+      images: false,
     },
     {
       ...UNREAD_MODEL,
@@ -1122,6 +1128,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: null,
+      images: false,
     },
     {
       ...STREAMING_MODEL,
@@ -1135,6 +1142,7 @@ function engineStateModels(live: LiveProcess, now: number): RuntimeLiveFile['mod
       pool: null,
       stateNamespace: null,
       experts: { inMemory: 409, total: 512, streaming: true },
+      images: false,
     },
   ];
 }
@@ -1159,6 +1167,7 @@ export function writeSupervisorFile(home: string, mainPid: number, sidecarPid: n
     nativeErrorsCapped: false,
     lastNativeErrorContext: null,
     lastNativeErrorAt: null,
+    failureReason: null,
   };
   writeJson(supervisorPath, state);
 }
@@ -2182,20 +2191,21 @@ function writeCodingAgents(home: string): void {
 }
 
 /**
- * A catalog entry installed by the app, from before the entry named its tokenizer source: it reads as installed with
- * an update, with no network.
+ * The first build of a catalog model (Qwen3.8-27B UD-Q4_K_XL) installed by the app, from before the build named its
+ * tokenizer source: it reads as installed with an update, with no network.
  */
 export const CATALOG_INSTALL = {
-  repo: 'unsloth/gemma-4-26B-A4B-it-GGUF',
-  slug: 'gemma-4-26b-a4b-it-gguf',
-  file: 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf',
-  sizeGb: 16.9,
+  repo: 'unsloth/Qwen3.8-27B-GGUF',
+  slug: 'qwen3.8-27b-gguf',
+  build: 'UD-Q4_K_XL',
+  file: 'Qwen3.8-27B-UD-Q4_K_XL.gguf',
+  sizeGb: 16.4,
 } as const;
 
 function writeCatalogInstall(home: string, now: number): void {
   const dir = join(fixturePaths(home).modelsDir, CATALOG_INSTALL.slug);
   mkdirSync(dir, { recursive: true });
-  writeJson(join(dir, 'config.json'), { model_type: 'gemma4', max_position_embeddings: 262144 });
+  writeJson(join(dir, 'config.json'), { model_type: 'qwen3_5', max_position_embeddings: 262144 });
   const weights = join(dir, CATALOG_INSTALL.file);
   writeFileSync(weights, '');
   truncateSync(weights, Math.round(CATALOG_INSTALL.sizeGb * GIB));
@@ -2209,11 +2219,42 @@ function writeCatalogInstall(home: string, now: number): void {
 }
 
 /**
+ * The second build of the same catalog model (Qwen3.8-27B UD-Q4_K_M) in its own folder, installed by the app at the
+ * build's current tokenizer source: it reads as installed with no update, so the card's switch marks two builds.
+ */
+export const CATALOG_SECOND_BUILD = {
+  repo: 'unsloth/Qwen3.8-27B-GGUF',
+  slug: 'qwen3.8-27b-gguf-ud-q4_k_m',
+  build: 'UD-Q4_K_M',
+  file: 'Qwen3.8-27B-UD-Q4_K_M.gguf',
+  sizeGb: 15.4,
+  assetsRepo: 'Qwen/Qwen3.8-27B',
+} as const;
+
+function writeCatalogSecondBuild(home: string, now: number): void {
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_SECOND_BUILD.slug);
+  mkdirSync(dir, { recursive: true });
+  writeJson(join(dir, 'config.json'), { model_type: 'qwen3_5', max_position_embeddings: 262144 });
+  const weights = join(dir, CATALOG_SECOND_BUILD.file);
+  writeFileSync(weights, '');
+  truncateSync(weights, Math.round(CATALOG_SECOND_BUILD.sizeGb * GIB));
+  writeJson(join(dir, '.mlx-download-complete.json'), {
+    repo: CATALOG_SECOND_BUILD.repo,
+    revision: '5d1c0e2a9b7f4c3d2e1f0a9b8c7d6e5f4a3b2c1d',
+    completedAt: new Date(now - 2 * DAY_MS).toISOString(),
+    files: ['config.json', CATALOG_SECOND_BUILD.file],
+    scope: 'full',
+    assetsRepo: CATALOG_SECOND_BUILD.assetsRepo,
+    assetsRevision: '8e7d6c5b4a39281706f5e4d3c2b1a0f9e8d7c6b5',
+  });
+}
+
+/**
  * A catalog slug held by a leftover the app did not create (one companion file, no config.json): the card shows
- * "Needs cleanup" with Reinstall.
+ * "Needs cleanup" with Clean up & update, which sends the folder to the Trash.
  */
 export const CATALOG_BLOCKED = {
-  slug: 'qwen-agentworld-35b-a3b-gguf',
+  slug: 'inkling-2-mini-gguf',
   file: 'imatrix_unsloth.gguf_file',
   sizeBytes: 192_223_904,
 } as const;
@@ -2224,6 +2265,104 @@ function writeCatalogBlocked(home: string): void {
   const file = join(dir, CATALOG_BLOCKED.file);
   writeFileSync(file, '');
   truncateSync(file, CATALOG_BLOCKED.sizeBytes);
+}
+
+/**
+ * A catalog slug (Qwen3.8-Flash-Next) that is a link the user made to a folder of model files: the first of the four
+ * shards, so no model is there to load. The card shows "Needs cleanup" with Clean up & update, which removes only the
+ * link. The folder stays inside the fixture home.
+ */
+export const CATALOG_LINK = {
+  slug: 'qwen3.8-flash-next-gguf',
+  target: 'external/Qwen3.8-Flash-Next-GGUF',
+  shard: 'UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf',
+  shardBytes: 2 * MIB,
+} as const;
+
+function writeCatalogLink(home: string): void {
+  const target = join(home, CATALOG_LINK.target);
+  const shard = join(target, CATALOG_LINK.shard);
+  mkdirSync(dirname(shard), { recursive: true });
+  writeFileSync(shard, '');
+  truncateSync(shard, CATALOG_LINK.shardBytes);
+  const link = join(fixturePaths(home).modelsDir, CATALOG_LINK.slug);
+  rmSync(link, { force: true });
+  symlinkSync(realpathSync(target), link);
+}
+
+/**
+ * A catalog slug holding a Clairic GGUF folder that the app did not create (weights, the two head files and a README,
+ * no marker): the card shows "Needs update" with Update. The files are small, so a plan against Hugging Face refuses
+ * the GGUF for its size; the fixture is for the idle card.
+ */
+export const CATALOG_UPDATE = {
+  slug: 'clairic-flash-gguf',
+  weights: 'Clairic-Flash-UD-Q4_K_XL.gguf',
+  weightsBytes: 4 * MIB,
+  head: 'clair_head.safetensors',
+  headBytes: MIB,
+} as const;
+
+function writeCatalogUpdate(home: string): void {
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_UPDATE.slug);
+  mkdirSync(dir, { recursive: true });
+  for (const [name, bytes] of [
+    [CATALOG_UPDATE.weights, CATALOG_UPDATE.weightsBytes],
+    [CATALOG_UPDATE.head, CATALOG_UPDATE.headBytes],
+  ] as const) {
+    const file = join(dir, name);
+    writeFileSync(file, '');
+    truncateSync(file, bytes);
+  }
+  writeJson(join(dir, 'clair_head_config.json'), {});
+  writeFileSync(join(dir, 'README.md'), '# Clairic Flash\n\nCopied from another Mac.\n');
+}
+
+/**
+ * A catalog model (Clairic (27B)) that Locate made from a folder on another disk: the app's folder links to the weight
+ * files in {@link CATALOG_LOCATED.source} and holds its own copies of the small files. The card reads as installed with
+ * the folder it uses, and Local models shows the Linked badge. The links stay inside the fixture home.
+ */
+export const CATALOG_LOCATED = {
+  repo: 'Brooooooklyn/Clairic-GGUF',
+  slug: 'clairic-gguf',
+  /** Under the fixture home: the folder the harness's Locate dialog answers with. */
+  picked: 'lmstudio/models',
+  source: 'lmstudio/models/Brooooooklyn/Clairic-GGUF',
+  weights: ['Clairic-UD-Q4_K_XL.gguf', 'mmproj-BF16.gguf', 'clair_head.safetensors'],
+  weightsBytes: [18 * GIB, 876 * MIB, 24 * MIB],
+  small: ['config.json', 'clair_head_config.json', 'preprocessor_config.json'],
+  assetsRepo: 'Cloudflare/clairic',
+} as const;
+
+function writeCatalogLocated(home: string, now: number): void {
+  const source = join(home, CATALOG_LOCATED.source);
+  mkdirSync(source, { recursive: true });
+  const dir = join(fixturePaths(home).modelsDir, CATALOG_LOCATED.slug);
+  mkdirSync(dir, { recursive: true });
+  CATALOG_LOCATED.weights.forEach((name, index) => {
+    const file = join(source, name);
+    writeFileSync(file, '');
+    truncateSync(file, CATALOG_LOCATED.weightsBytes[index]!);
+    const link = join(dir, name);
+    rmSync(link, { force: true });
+    symlinkSync(realpathSync(file), link);
+  });
+  for (const name of CATALOG_LOCATED.small) {
+    const value = name === 'config.json' ? { model_type: 'qwen3_5', max_position_embeddings: 262144 } : {};
+    writeJson(join(source, name), value);
+    writeJson(join(dir, name), value);
+  }
+  writeJson(join(dir, '.mlx-download-complete.json'), {
+    repo: CATALOG_LOCATED.repo,
+    revision: '3f0b1c2d4e5f60718293a4b5c6d7e8f901234567',
+    completedAt: new Date(now - 4 * DAY_MS).toISOString(),
+    files: [...CATALOG_LOCATED.small, ...CATALOG_LOCATED.weights].sort(),
+    scope: 'full',
+    assetsRepo: CATALOG_LOCATED.assetsRepo,
+    assetsRevision: '0a1b2c3d4e5f60718293a4b5c6d7e8f9a0b1c2d3',
+    located: { from: realpathSync(source), mode: 'linked' },
+  });
 }
 
 export interface FixtureSummary {
@@ -2254,7 +2393,11 @@ export function writeFixtureHome(home: string, options: FixtureOptions = {}): Fi
   const sessions = writeSessions(home, random, now);
   writeAgentWork(home, random, now, process.pid);
   writeCatalogInstall(home, now);
+  writeCatalogSecondBuild(home, now);
   writeCatalogBlocked(home);
+  writeCatalogLink(home);
+  writeCatalogUpdate(home);
+  writeCatalogLocated(home, now);
   writeCodingAgents(home);
   return { traces, sessions, live };
 }

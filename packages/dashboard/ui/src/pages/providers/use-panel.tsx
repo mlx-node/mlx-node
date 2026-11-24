@@ -1,4 +1,4 @@
-import { type ReactElement, useId } from 'react';
+import type { ReactElement } from 'react';
 
 import { LiveLabel } from '../../components/arc-x/live-label/live-label';
 import { OptionList, type OptionItem } from '../../components/arc-x/option-list/option-list';
@@ -7,10 +7,13 @@ import { ProofLine } from '../../components/arc-x/proof-line/proof-line';
 import { Rule } from '../../components/arc-x/rule/rule';
 import { SwapText } from '../../components/arc-x/swap-text/swap-text';
 import { Badge } from '../../components/arc/badge/badge';
-import { Switch } from '../../components/arc/switch/switch';
 import { PROVIDERS } from '../../lib/providers-strings';
 import type { ProviderSelectionInput, ProvidersResponse, SearchProviderId } from '../../lib/providers-types';
 import {
+  CRAWLER_BODIES,
+  crawlerOffNote,
+  type CrawlerValue,
+  crawlerValue,
   fill,
   type Progress,
   providerById,
@@ -22,7 +25,12 @@ import {
 
 const OFF = 'off';
 
-export type Selecting = { search?: SearchProviderId | null; firecrawl?: boolean } | null;
+export type Selecting = ProviderSelectionInput | null;
+
+/** The Crawler option a selection body picks, or null for a body that does not touch the crawler. */
+function crawlerTarget(input: ProviderSelectionInput): CrawlerValue | null {
+  return input.firecrawl === undefined ? null : input.firecrawl ? 'firecrawl' : 'off';
+}
 
 export interface UsePanelProps {
   data: ProvidersResponse;
@@ -57,14 +65,12 @@ function checkBadge(check: string | null): ReactElement | null {
   return null;
 }
 
-/** The exclusive search provider choice and the independent Firecrawl switch. */
+/** The exclusive search provider choice and the crawler that reads pages: Firecrawl or off. */
 export function UsePanel({ data, selecting, locked, lockedReason, progress, onSelect }: UsePanelProps): ReactElement {
-  const switchId = useId();
-  const descriptionId = useId();
   const configured = SEARCH_IDS.map((id) => providerById(data, id)).filter((p) => p !== undefined && p.configured);
   const firecrawl = providerById(data, 'firecrawl');
   const busySearch = selecting !== null && selecting.search !== undefined;
-  const busyFire = selecting !== null && selecting.firecrawl !== undefined;
+  const target = selecting === null ? null : crawlerTarget(selecting);
   const blocked = locked || selecting !== null;
 
   const options: OptionItem[] = configured.map((p) => {
@@ -95,14 +101,42 @@ export function UsePanel({ data, selecting, locked, lockedReason, progress, onSe
     });
   }
 
-  const fireConfigured = firecrawl?.configured === true;
+  const current = crawlerValue(data);
   const fireCount = firecrawl?.skill.names.length ?? 0;
-  let fireText: string;
-  if (busyFire) fireText = selecting.firecrawl === true ? PROVIDERS.installing : PROVIDERS.removing;
-  else if (!fireConfigured) fireText = PROVIDERS.firecrawlNoKey;
-  else if (!data.firecrawl) fireText = PROVIDERS.firecrawlOff;
-  else if (firecrawl?.work.missing === 'firecrawl-cli') fireText = PROVIDERS.firecrawlOnNoCli;
-  else fireText = fill(PROVIDERS.firecrawlOn, { n: fireCount });
+  const crawler: OptionItem[] = [];
+  if (firecrawl?.configured === true) {
+    crawler.push({
+      value: 'firecrawl',
+      title: providerName('firecrawl'),
+      note: roleWords('firecrawl'),
+      trailing: (
+        <>
+          {checkBadge(firecrawl.check)}
+          <span>{skillsForWork(firecrawl)}</span>
+        </>
+      ),
+      working: target === 'firecrawl',
+      workingLabel: PROVIDERS.installing,
+      disabledReason: lockedReason,
+    });
+    crawler.push({
+      value: 'off',
+      title: PROVIDERS.off,
+      note: crawlerOffNote(data.search),
+      working: target === 'off',
+      workingLabel: PROVIDERS.removing,
+      disabledReason: lockedReason,
+    });
+  }
+
+  let fireText: string | null = null;
+  if (target !== null) fireText = target === 'off' ? PROVIDERS.removing : PROVIDERS.installing;
+  else if (current !== 'off') {
+    fireText =
+      firecrawl?.work.missing === 'firecrawl-cli'
+        ? PROVIDERS.firecrawlOnNoCli
+        : fill(PROVIDERS.firecrawlOn, { n: fireCount });
+  }
 
   const proof = (area: Progress['area']): ReactElement | null =>
     progress !== null && progress.area === area ? (
@@ -133,26 +167,26 @@ export function UsePanel({ data, selecting, locked, lockedReason, progress, onSe
         )}
         {proof('search')}
         <Rule className="my-2" />
-        <div className="flex items-start justify-between gap-4">
-          <div className="grid min-w-0 gap-0.5">
-            <label htmlFor={switchId} className="text-body font-medium text-foreground">
-              {PROVIDERS.firecrawlSwitch}
-            </label>
-            <span id={descriptionId} className="text-caption text-secondary">
-              {busyFire ? <LiveLabel active>{fireText}</LiveLabel> : <SwapText text={fireText} />}
-            </span>
-          </div>
-          <Switch
-            id={switchId}
-            aria-describedby={descriptionId}
-            checked={data.firecrawl}
-            disabled={(blocked && !busyFire) || !fireConfigured}
-            aria-disabled={busyFire ? true : undefined}
-            onCheckedChange={(next) => {
-              if (selecting === null) onSelect({ firecrawl: next });
-            }}
+        <p className="m-0 text-caption font-medium text-secondary uppercase">
+          {PROVIDERS.crawler} · {PROVIDERS.oneAtATime}
+        </p>
+        {crawler.length === 0 ? (
+          <p className="m-0 text-body text-secondary">{PROVIDERS.firecrawlNoKey}</p>
+        ) : (
+          <OptionList
+            label={PROVIDERS.crawler}
+            value={current}
+            options={crawler}
+            disabled={blocked}
+            wrap
+            onValueChange={(value) => onSelect(CRAWLER_BODIES[value as CrawlerValue])}
           />
-        </div>
+        )}
+        {fireText !== null ? (
+          <p className="m-0 text-caption text-secondary">
+            {target !== null ? <LiveLabel active>{fireText}</LiveLabel> : <SwapText text={fireText} />}
+          </p>
+        ) : null}
         {proof('firecrawl')}
       </div>
     </Panel>

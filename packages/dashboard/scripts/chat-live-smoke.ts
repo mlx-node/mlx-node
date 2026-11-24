@@ -2,7 +2,9 @@
  * The live Chat smoke: a real `mlx-agent` and a real model, on a throwaway home, one trial per row, one PASS / FAIL /
  * INFO / SKIP line per row. Opt-in, never part of a test run. This file holds the rows that need no search provider
  * key. The packaged-build rows run only with `--app` (the executable inside a packaged `.app`) and `--finder-path` (the
- * `PATH` a Work command printed in that app started from Finder); without them they print SKIP.
+ * `PATH` of an app started from Finder, `/usr/bin:/bin:/usr/sbin:/sbin` on macOS); without them they print SKIP. U16
+ * gives Work that `PATH`, zsh and a `~/.zshenv` that puts a stub `firecrawl` first, and passes when the `PATH` a Work
+ * command prints holds the `PATH` the app's check predicted (`workCommandPath`) and that `PATH` finds the stub.
  *
  *   MLX_CHAT_LIVE=1 MLX_CHAT_SMOKE_TOKEN=<token> oxnode packages/dashboard/scripts/chat-live-smoke.ts \
  *     --agent <mlx-agent binary> --url <http://127.0.0.1:port of a throwaway server> --model <id> \
@@ -13,7 +15,7 @@
  */
 
 import { randomBytes } from 'node:crypto';
-import { existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 
@@ -21,6 +23,7 @@ import { RECENT_WRITE_MS } from '../src/agent-sessions/liveness.js';
 import { AgentSessionsReader } from '../src/agent-sessions/reader.js';
 import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js';
 import { AGENT_ARGS } from '../src/chat/agent/profiles.js';
+import { workCommandPath } from '../src/chat/agent/work-path.js';
 import { applyOp } from '../src/chat/conversation.js';
 import { chatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore } from '../src/chat/providers/secrets.js';
@@ -315,8 +318,16 @@ async function main(): Promise<void> {
   }));
   const marker = `MARKER-${randomBytes(6).toString('hex')}`;
 
-  let workPath: string | null = null;
-  const make = (webServer?: { command: string; script: string }): ChatService =>
+  const workEnv = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    PATH: process.env.PATH ?? '/usr/bin:/bin',
+    HOME: userHome,
+    // The smoke reaches no outside host: the Work agent's telemetry is off, as the Chat env has it.
+    DISABLE_TELEMETRY: '1',
+    GROK_TELEMETRY_ENABLED: 'false',
+    GROK_TELEMETRY_TRACE_UPLOAD: 'false',
+    ...over,
+  });
+  const make = (webServer?: { command: string; script: string }, base = workEnv()): ChatService =>
     new ChatService({
       paths,
       readEndpoint: async () => ({ version: 1, pid: process.pid, url: args.url, token: args.token, models }),
@@ -326,17 +337,14 @@ async function main(): Promise<void> {
         tag: null,
       }),
       readSession: async (id) => reader.detail(id),
-      providers: new ProvidersService({ paths, secrets: new MemorySecretStore() }),
+      providers: new ProvidersService({
+        paths,
+        secrets: new MemorySecretStore(),
+        workPath: () => workCommandPath(base, userHome),
+      }),
       clientVersion: '0.0.0-smoke',
       webServer: webServer ?? { command: process.execPath, script: webServerScript() },
-      baseEnv: {
-        PATH: workPath ?? process.env.PATH ?? '/usr/bin:/bin',
-        HOME: userHome,
-        // The smoke reaches no outside host: the Work agent's telemetry is off, as the Chat env has it.
-        DISABLE_TELEMETRY: '1',
-        GROK_TELEMETRY_ENABLED: 'false',
-        GROK_TELEMETRY_TRACE_UPLOAD: 'false',
-      },
+      baseEnv: base,
       agentHome: join(args.home, 'work-agent'),
       workAgentHome: join(args.home, 'work-agent'),
       homeDir: userHome,
@@ -651,11 +659,15 @@ async function main(): Promise<void> {
     if (args.finderPath === null) {
       row('SKIP', 'packaged build: the Work PATH of an app started from Finder (U16)', 'no --finder-path');
     } else {
-      workPath = args.finderPath;
-      service = make();
-      await finderPathRow(args, service);
+      const stubDir = join(args.home, 'smoke-bin');
+      mkdirSync(stubDir, { recursive: true });
+      writeFileSync(join(stubDir, 'firecrawl'), '#!/bin/sh\n');
+      chmodSync(join(stubDir, 'firecrawl'), 0o755);
+      writeFileSync(join(userHome, '.zshenv'), `export PATH="${stubDir}:$PATH"\n`);
+      const base = workEnv({ PATH: args.finderPath, SHELL: '/bin/zsh' });
+      service = make(undefined, base);
+      await finderPathRow(args, service, base, stubDir);
       await service.close();
-      workPath = null;
     }
 
     // The inference token: every 8-character window, anywhere under the home.
@@ -784,9 +796,15 @@ async function workTurns(
   }
 }
 
-/** U16: the `PATH` of an app started from Finder, as Work gets it, and whether `firecrawl` is found on it. */
-async function finderPathRow(args: Args, service: ChatService): Promise<void> {
-  const found = await findOnPath('firecrawl', args.finderPath ?? undefined);
+/** U16: the `PATH` the app predicts for a Work command, against the one a Work command prints. */
+async function finderPathRow(
+  args: Args,
+  service: ChatService,
+  base: NodeJS.ProcessEnv,
+  stubDir: string,
+): Promise<void> {
+  const predicted = await workCommandPath(base, join(args.home, 'user-home'));
+  const found = await findOnPath('firecrawl', predicted);
   const folder = join(args.home, 'user-home', 'project');
   try {
     const { conversation } = await service.create({
@@ -808,10 +826,12 @@ async function finderPathRow(args: Args, service: ChatService): Promise<void> {
     const output = toolsOf(view)
       .map((t) => t.output ?? '')
       .join(' ');
-    row(
-      'INFO',
+    const held = predicted !== undefined && output.includes(predicted);
+    const stubOn = predicted !== undefined && predicted.split(':').includes(stubDir);
+    check(
+      held && stubOn && found === join(stubDir, 'firecrawl'),
       'packaged build: the Work PATH of an app started from Finder (U16)',
-      `firecrawl ${found === null ? 'not found' : 'found'}; homebrew ${output.includes('/opt/homebrew/bin') ? 'on' : 'off'} the printed PATH; outcome ${view.outcome ?? 'none'}`,
+      `predicted ${held ? 'in' : 'not in'} the printed PATH; stub folder ${stubOn ? 'on' : 'off'} it; firecrawl ${found === null ? 'not found' : found === join(stubDir, 'firecrawl') ? 'the stub' : 'elsewhere'}; outcome ${view.outcome ?? 'none'}`,
     );
   } catch (error) {
     row('FAIL', 'packaged build: the Work PATH (U16)', codeOf(error));
