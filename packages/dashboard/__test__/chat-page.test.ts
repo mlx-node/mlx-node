@@ -1404,7 +1404,7 @@ describe('Chat page: states that stop every message', () => {
       });
       click(button(CHAT.blockers.copyDetails));
       await waitFor(() => writeText.mock.calls.length === 1);
-      expect(writeText).toHaveBeenCalledWith('agent mlx-agent-v0.3.3 (1.0.45) · needs mlx-agent-v0.3.3');
+      expect(writeText).toHaveBeenCalledWith('agent mlx-agent-v0.3.4 (1.0.45) · needs mlx-agent-v0.3.4');
     } finally {
       if (original === undefined) Reflect.deleteProperty(navigator, 'clipboard');
       else Object.defineProperty(navigator, 'clipboard', original);

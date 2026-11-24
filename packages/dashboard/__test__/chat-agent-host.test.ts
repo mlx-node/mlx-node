@@ -85,11 +85,11 @@ describe('launchFromProbe', () => {
     ).toEqual({
       failure: 'agent-too-old',
     });
-    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.3' })).toEqual({
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.4' })).toEqual({
       command: '/m',
       args: ['--disable-web-search', 'agent', '--no-leader', 'stdio'],
       source: 'managed',
-      tag: 'mlx-agent-v0.3.3',
+      tag: 'mlx-agent-v0.3.4',
       versionVerified: true,
     });
     expect(launchFromProbe({ source: 'env', path: '/e' })).toMatchObject({

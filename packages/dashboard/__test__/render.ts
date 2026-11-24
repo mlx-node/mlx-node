@@ -105,8 +105,8 @@ export const READY_CHAT_HOST: ChatHostState = {
   agent: {
     binary: 'ok',
     source: 'bundled',
-    tag: 'mlx-agent-v0.3.3',
-    minTag: 'mlx-agent-v0.3.3',
+    tag: 'mlx-agent-v0.3.4',
+    minTag: 'mlx-agent-v0.3.4',
     versionVerified: true,
     install: 'idle',
   },

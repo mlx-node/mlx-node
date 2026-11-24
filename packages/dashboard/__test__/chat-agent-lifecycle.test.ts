@@ -178,7 +178,9 @@ describe('calls while the process stops or starts', () => {
         const a = await fake.host.createSession({ modelId: MODEL });
         const b = await fake.host.createSession({ modelId: MODEL });
         const slow = fake.host.startTurn(a.sessionId, 'slow', { modelId: MODEL });
-        await until(() => fake.host.turnState(a.sessionId)?.phase === 'running');
+        await until(() =>
+          fake.sent().some((m) => m.method === 'session/prompt' && (m.params as Json).sessionId === a.sessionId),
+        );
         fake.endpoint.current = { ...fake.endpoint.current!, url: 'http://127.0.0.1:10', token: 'tok-REPLACED-0002' };
         const result = await fake.host.startTurn(b.sessionId, 'hi', { modelId: MODEL }).done;
         expect(result).toMatchObject({ failure: { code: 'inference-failed' } });
