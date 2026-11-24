@@ -23,10 +23,12 @@
 #include <limits>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <tuple>
+#include <unordered_map>
 #include <vector>
 
 #include "mlx/allocator.h"
@@ -779,10 +781,25 @@ const std::string& paged_attention_varlen_v2_reduce_kernel_name(
 MTL::ComputePipelineState* load_pipeline(
     mlx::core::metal::Device& device,
     const std::string& kernel_name) {
+  thread_local const void* cached_dev = nullptr;
+  thread_local std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+  const void* cur_dev = static_cast<const void*>(device.mtl_device());
+  if (cached_dev != cur_dev) {
+    cache.clear();
+    cached_dev = cur_dev;
+  }
+  auto it = cache.find(kernel_name);
+  if (it != cache.end()) {
+    return it->second;
+  }
   MTL::Library* lib = get_paged_attn_library(device);
   // `get_kernel(base_name, mtl_lib)` in `device.h` is the lookup by
   // name only; it caches by `(library, base_name)`.
-  return device.get_kernel(kernel_name, lib);
+  auto* pipe = device.get_kernel(kernel_name, lib);
+  if (pipe != nullptr) {
+    cache.emplace(kernel_name, pipe);
+  }
+  return pipe;
 }
 
 struct GroupedPipelineLimits {
@@ -2604,8 +2621,24 @@ std::vector<std::string> paged_prefill_attention_kernel_names() {
 MTL::ComputePipelineState* paged_prefill_pipeline(
     mlx::core::metal::Device& device,
     const std::string& name) {
+  thread_local const void* cached_dev = nullptr;
+  thread_local std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+  const void* cur_dev = static_cast<const void*>(device.mtl_device());
+  if (cached_dev != cur_dev) {
+    cache.clear();
+    cached_dev = cur_dev;
+  }
+  auto it = cache.find(name);
+  if (it != cache.end()) {
+    return it->second;
+  }
   try {
-    return get_prebuilt_kernel(device, "paged_prefill", "paged prefill attention", name);
+    auto* pipe =
+        get_prebuilt_kernel(device, "paged_prefill", "paged prefill attention", name);
+    if (pipe != nullptr) {
+      cache.emplace(name, pipe);
+    }
+    return pipe;
   } catch (const std::exception& e) {
     throw std::runtime_error(
         "paged prefill attention kernel " + name + " has no pipeline on " +
@@ -2759,18 +2792,34 @@ namespace {
 const std::string& inkling2_decode_kernel_name(
     KvDtype cache_dtype,
     int block_size,
-    bool partitioned) {
+    bool partitioned,
+    bool has_tree) {
   static const std::string ktm_v1 = "paged_attention_inkling2_ktm_hs128_ps0";
   static const std::string ktm_v2 = "paged_attention_inkling2_ktm_hs128_ps512";
+  static const std::string ktm_v1_tree = "paged_attention_inkling2_ktm_hs128_ps0_tree";
+  static const std::string ktm_v2_tree = "paged_attention_inkling2_ktm_hs128_ps512_tree";
   static const std::string bf16_b16_v1 = "paged_attention_inkling2_bf16_hs128_bs16_ps0";
   static const std::string bf16_b16_v2 = "paged_attention_inkling2_bf16_hs128_bs16_ps512";
+  static const std::string bf16_b16_v1_tree = "paged_attention_inkling2_bf16_hs128_bs16_ps0_tree";
+  static const std::string bf16_b16_v2_tree = "paged_attention_inkling2_bf16_hs128_bs16_ps512_tree";
   static const std::string bf16_b32_v1 = "paged_attention_inkling2_bf16_hs128_bs32_ps0";
   static const std::string bf16_b32_v2 = "paged_attention_inkling2_bf16_hs128_bs32_ps512";
+  static const std::string bf16_b32_v1_tree = "paged_attention_inkling2_bf16_hs128_bs32_ps0_tree";
+  static const std::string bf16_b32_v2_tree = "paged_attention_inkling2_bf16_hs128_bs32_ps512_tree";
   if (cache_dtype == KvDtype::Int8) {
+    if (has_tree) {
+      return partitioned ? ktm_v2_tree : ktm_v1_tree;
+    }
     return partitioned ? ktm_v2 : ktm_v1;
   }
   if (block_size == 32) {
+    if (has_tree) {
+      return partitioned ? bf16_b32_v2_tree : bf16_b32_v1_tree;
+    }
     return partitioned ? bf16_b32_v2 : bf16_b32_v1;
+  }
+  if (has_tree) {
+    return partitioned ? bf16_b16_v2_tree : bf16_b16_v1_tree;
   }
   return partitioned ? bf16_b16_v2 : bf16_b16_v1;
 }
@@ -2782,36 +2831,160 @@ const std::string& inkling2_decode_reduce_kernel_name() {
 
 const std::string& inkling2_prefill_split_name(
     KvDtype cache_dtype,
-    bool int8_queries) {
+    bool int8_queries,
+    bool r16 = false) {
   static const std::string q8_ktm = "inkling2_paged_prefill_q8_split_g3_d128_ktm";
   static const std::string q8q_ktm = "inkling2_paged_prefill_q8q_split_g3_d128_ktm";
   static const std::string bf16 = "inkling2_paged_prefill_bf16_split_g3_d128";
+  static const std::string q8_ktm_r16 = "inkling2_paged_prefill_q8_split_g3_d128_ktm_r16";
+  static const std::string q8q_ktm_r16 = "inkling2_paged_prefill_q8q_split_g3_d128_ktm_r16";
+  static const std::string bf16_r16 = "inkling2_paged_prefill_bf16_split_g3_d128_r16";
+  if (r16) {
+    if (cache_dtype == KvDtype::Int8) {
+      return int8_queries ? q8q_ktm_r16 : q8_ktm_r16;
+    }
+    return bf16_r16;
+  }
   if (cache_dtype == KvDtype::Int8) {
     return int8_queries ? q8q_ktm : q8_ktm;
   }
   return bf16;
 }
 
-const std::string& inkling2_prefill_reduce_name() {
+const std::string& inkling2_prefill_reduce_name(bool r16 = false) {
   static const std::string name = "inkling2_paged_prefill_reduce_g3_d128";
-  return name;
+  static const std::string name_r16 = "inkling2_paged_prefill_reduce_g3_d128_r16";
+  return r16 ? name_r16 : name;
+}
+
+struct Inkling2V2PersistentScratch {
+  // Owns `{exp_sums, max_logits, tmp_out}` in `owner.inputs()` so
+  // `encoder.retain_inputs(owner)` pins every Metal buffer on the unretained
+  // command buffer without calling `add_temporary` (which strips fences).
+  mlx::core::array owner;
+};
+
+using Inkling2V2ScratchMap = std::unordered_map<int, Inkling2V2PersistentScratch>;
+
+Inkling2V2ScratchMap& inkling2_v2_scratch_pool() {
+  static thread_local Inkling2V2ScratchMap by_stream;
+  return by_stream;
+}
+
+bool inkling2_v2_encoder_alive(int stream_index) {
+  auto& local = mlx::core::metal::get_command_encoders();
+  if (local.find(stream_index) != local.end()) {
+    return true;
+  }
+  auto& global = mlx::core::metal::get_global_command_encoders();
+  return global.find(stream_index) != global.end();
+}
+
+void reap_destroyed_inkling2_v2_scratch(Inkling2V2ScratchMap& entries) {
+  for (auto it = entries.begin(); it != entries.end();) {
+    // A missing encoder has already synchronized in its destructor.
+    if (inkling2_v2_encoder_alive(it->first)) {
+      ++it;
+    } else {
+      it = entries.erase(it);
+    }
+  }
+}
+
+constexpr size_t kInkling2MaxV2ScratchBytes = size_t(4) << 20; // 4 MiB cap
+
+// Reuse per-stream FP32 V2 auxiliary scratch (`exp_sums`, `max_logits`, `tmp_out`)
+// across consecutive Inkling2 V2 paged-attention visits on the same stream (zero
+// per-visit `allocator::malloc`!). MLX automatically fences back-to-back visits
+// because Stage 1 binds them as outputs and Stage 2 binds them as inputs.
+std::optional<V2WorkspaceAndMeta> try_inkling2_v2_scratch(
+    mlx::core::Stream stream,
+    mlx::core::metal::CommandEncoder& encoder,
+    int exp_sums_size,
+    int tmp_out_size) {
+  const size_t need_bytes =
+      (static_cast<size_t>(exp_sums_size) * 2u + static_cast<size_t>(tmp_out_size)) *
+      sizeof(float);
+  if (need_bytes > kInkling2MaxV2ScratchBytes) {
+    return std::nullopt;
+  }
+  auto& by_stream = inkling2_v2_scratch_pool();
+  auto it = by_stream.find(stream.index);
+  if (it != by_stream.end()) {
+    const auto& slots = it->second.owner.inputs();
+    if (slots[0].size() >= static_cast<size_t>(exp_sums_size) &&
+        slots[2].size() >= static_cast<size_t>(tmp_out_size)) {
+      encoder.retain_inputs(it->second.owner);
+      return V2WorkspaceAndMeta{
+          slots[0],
+          slots[1],
+          slots[2],
+          mlx::core::array(Shape{0}, mlx::core::int32, nullptr, {})};
+    }
+  } else {
+    reap_destroyed_inkling2_v2_scratch(by_stream);
+  }
+  const int alloc_exp = std::max(exp_sums_size, 4096);
+  const int alloc_tmp = std::max(tmp_out_size, 256 * 1024);
+  mlx::core::array exp_sums(
+      mlx::core::Shape{alloc_exp}, mlx::core::float32, nullptr, {});
+  exp_sums.set_data(mlx::core::allocator::malloc(exp_sums.nbytes()));
+  mlx::core::array max_logits(
+      mlx::core::Shape{alloc_exp}, mlx::core::float32, nullptr, {});
+  max_logits.set_data(mlx::core::allocator::malloc(max_logits.nbytes()));
+  mlx::core::array tmp_out(
+      mlx::core::Shape{alloc_tmp}, mlx::core::float32, nullptr, {});
+  tmp_out.set_data(mlx::core::allocator::malloc(tmp_out.nbytes()));
+  mlx::core::array owner(
+      mlx::core::Shape{},
+      mlx::core::uint8,
+      nullptr,
+      std::vector<mlx::core::array>{exp_sums, max_logits, tmp_out});
+  encoder.retain_inputs(owner);
+  if (it != by_stream.end()) {
+    // Previous dispatches on `encoder` already pinned the old buffers via
+    // `encoder.retain_inputs(old_owner)`, so replacing the entry is safe.
+    it->second.owner = std::move(owner);
+  } else {
+    by_stream.emplace(
+        stream.index, Inkling2V2PersistentScratch{std::move(owner)});
+  }
+  return V2WorkspaceAndMeta{
+      std::move(exp_sums),
+      std::move(max_logits),
+      std::move(tmp_out),
+      mlx::core::array(Shape{0}, mlx::core::int32, nullptr, {})};
 }
 
 } // namespace
+
+void clear_inkling2_v2_scratch() {
+  inkling2_v2_scratch_pool().clear();
+}
 
 std::vector<std::string> inkling2_paged_kernel_names() {
   return {
       "paged_attention_inkling2_ktm_hs128_ps0",
       "paged_attention_inkling2_ktm_hs128_ps512",
+      "paged_attention_inkling2_ktm_hs128_ps0_tree",
+      "paged_attention_inkling2_ktm_hs128_ps512_tree",
       "paged_attention_inkling2_bf16_hs128_bs16_ps0",
       "paged_attention_inkling2_bf16_hs128_bs16_ps512",
+      "paged_attention_inkling2_bf16_hs128_bs16_ps0_tree",
+      "paged_attention_inkling2_bf16_hs128_bs16_ps512_tree",
       "paged_attention_inkling2_bf16_hs128_bs32_ps0",
       "paged_attention_inkling2_bf16_hs128_bs32_ps512",
+      "paged_attention_inkling2_bf16_hs128_bs32_ps0_tree",
+      "paged_attention_inkling2_bf16_hs128_bs32_ps512_tree",
       "paged_attention_inkling2_v2_reduce_hs128_ps512",
       "inkling2_paged_prefill_q8_split_g3_d128_ktm",
       "inkling2_paged_prefill_q8q_split_g3_d128_ktm",
       "inkling2_paged_prefill_bf16_split_g3_d128",
       "inkling2_paged_prefill_reduce_g3_d128",
+      "inkling2_paged_prefill_q8_split_g3_d128_ktm_r16",
+      "inkling2_paged_prefill_q8q_split_g3_d128_ktm_r16",
+      "inkling2_paged_prefill_bf16_split_g3_d128_r16",
+      "inkling2_paged_prefill_reduce_g3_d128_r16",
   };
 }
 
@@ -2821,15 +2994,20 @@ bool inkling2_paged_prefill_mpp_supported(mlx::core::metal::Device& device) {
       if (!device.mtl_device()->supportsFamily(MTL::GPUFamilyApple7)) {
         return false;
       }
-      auto* q8 = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, false));
-      auto* bf = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Bf16, false));
-      auto* red = paged_prefill_pipeline(device, inkling2_prefill_reduce_name());
-      if (q8 == nullptr || bf == nullptr || red == nullptr) {
+      auto* q8 = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, false, false));
+      auto* bf = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Bf16, false, false));
+      auto* red = paged_prefill_pipeline(device, inkling2_prefill_reduce_name(false));
+      auto* q8_r16 = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, false, true));
+      auto* bf_r16 = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Bf16, false, true));
+      auto* red_r16 = paged_prefill_pipeline(device, inkling2_prefill_reduce_name(true));
+      if (q8 == nullptr || bf == nullptr || red == nullptr ||
+          q8_r16 == nullptr || bf_r16 == nullptr || red_r16 == nullptr) {
         return false;
       }
       if (paged_prefill_int8_queries_supported(device)) {
-        auto* q8q = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, true));
-        if (q8q == nullptr) {
+        auto* q8q = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, true, false));
+        auto* q8q_r16 = paged_prefill_pipeline(device, inkling2_prefill_split_name(KvDtype::Int8, true, true));
+        if (q8q == nullptr || q8q_r16 == nullptr) {
           return false;
         }
       }
@@ -2873,7 +3051,8 @@ void dispatch_inkling2_paged_attention_auto(
     int sliding_window,
     int rel_extent,
     KvDtype kv_dtype,
-    const mlx::core::array* score_scales) {
+    const mlx::core::array* score_scales,
+    const mlx::core::array* tree_rows) {
   if (head_size != 128) {
     throw std::runtime_error(
         "[mlx_paged_dispatch] inkling2 paged attention requires head_size == 128");
@@ -2945,6 +3124,11 @@ void dispatch_inkling2_paged_attention_auto(
         encoder.set_bytes(dummy_zero, 27);
       }
       encoder.set_bytes(stage1_extra, 28);
+      if (stage1_extra.has_tree != 0u && tree_rows != nullptr) {
+        encoder.set_input_array(*tree_rows, 29);
+      } else {
+        encoder.set_bytes(dummy_zero, 29);
+      }
     } else {
       bind_pool_plane(encoder, k_pool, 4, live_blocks);
       bind_pool_plane(encoder, v_pool, 5, live_blocks);
@@ -2984,13 +3168,19 @@ void dispatch_inkling2_paged_attention_auto(
         encoder.set_bytes(dummy_zero, 23);
       }
       encoder.set_bytes(stage1_extra, 24);
+      if (stage1_extra.has_tree != 0u && tree_rows != nullptr) {
+        encoder.set_input_array(*tree_rows, 25);
+      } else {
+        encoder.set_bytes(dummy_zero, 25);
+      }
     }
   };
 
   const bool is_ktm = kv_dtype == KvDtype::Int8;
+  const bool has_tree = extra.has_tree != 0u && tree_rows != nullptr;
   if (use_v1) {
     const std::string& kernel_name =
-        inkling2_decode_kernel_name(kv_dtype, block_size, /*partitioned=*/false);
+        inkling2_decode_kernel_name(kv_dtype, block_size, /*partitioned=*/false, has_tree);
     MTL::ComputePipelineState* pipeline = load_pipeline(device, kernel_name);
     encoder.set_compute_pipeline_state(pipeline);
 
@@ -3020,27 +3210,51 @@ void dispatch_inkling2_paged_attention_auto(
   const uint32_t max_num_partitions =
       (static_cast<uint32_t>(max_context_len) + kPartitionSize - 1) /
       kPartitionSize;
-  const bool tiled = num_seqs == 1;
-  const int tile_rows = tiled
+  const bool can_tile = (num_seqs == 1) && !has_tree;
+  const int tile_rows = can_tile
       ? static_cast<int>(std::clamp<int64_t>(
             kVarlenWorkspaceRows / static_cast<int64_t>(max_num_partitions),
             1,
             total_queries))
       : total_queries;
   const int num_tiles = (total_queries + tile_rows - 1) / tile_rows;
+  // Single-tile dispatches (100% of decode & verify <= 16 rows up to 32K ctx)
+  // already match `seq_lens` and `cu_seqlens_q` directly — skip `tile_meta` malloc!
+  const bool tiled = can_tile && (num_tiles > 1);
 
-  V2WorkspaceAndMeta ws = allocate_v2_workspace_and_meta(
-      tile_rows,
-      num_q_heads,
-      max_num_partitions,
-      head_size,
-      mlx::core::float32,
-      tiled,
-      num_tiles,
-      total_queries,
-      tile_rows,
-      max_context_len,
-      "Inkling2 V2");
+  const int64_t exp_sums_size_i64 =
+      static_cast<int64_t>(tile_rows) *
+      static_cast<int64_t>(num_q_heads) *
+      static_cast<int64_t>(max_num_partitions);
+  const int64_t tmp_out_size_i64 =
+      exp_sums_size_i64 * static_cast<int64_t>(head_size);
+  std::optional<V2WorkspaceAndMeta> ws_opt;
+  bool persistent_v2_ws = false;
+  if (!tiled &&
+      exp_sums_size_i64 <= std::numeric_limits<int>::max() &&
+      tmp_out_size_i64 <= std::numeric_limits<int>::max()) {
+    ws_opt = try_inkling2_v2_scratch(
+        stream,
+        encoder,
+        static_cast<int>(exp_sums_size_i64),
+        static_cast<int>(tmp_out_size_i64));
+    persistent_v2_ws = ws_opt.has_value();
+  }
+  if (!ws_opt.has_value()) {
+    ws_opt = allocate_v2_workspace_and_meta(
+        tile_rows,
+        num_q_heads,
+        max_num_partitions,
+        head_size,
+        mlx::core::float32,
+        tiled,
+        num_tiles,
+        total_queries,
+        tile_rows,
+        max_context_len,
+        "Inkling2 V2");
+  }
+  V2WorkspaceAndMeta& ws = *ws_opt;
 
   const size_t stage1_tg_mem =
       stage1_threadgroup_memory_bytes(kPartitionSize, head_size);
@@ -3048,7 +3262,7 @@ void dispatch_inkling2_paged_attention_auto(
       16, static_cast<size_t>(max_num_partitions) * sizeof(float));
 
   const std::string& stage1_name =
-      inkling2_decode_kernel_name(kv_dtype, block_size, /*partitioned=*/true);
+      inkling2_decode_kernel_name(kv_dtype, block_size, /*partitioned=*/true, has_tree);
   MTL::ComputePipelineState* stage1_pipe = load_pipeline(device, stage1_name);
   MTL::ComputePipelineState* reduce_pipe =
       load_pipeline(device, inkling2_decode_reduce_kernel_name());
@@ -3141,9 +3355,11 @@ void dispatch_inkling2_paged_attention_auto(
   if (tiled) {
     encoder.add_temporary(std::move(ws.tile_meta));
   }
-  encoder.add_temporary(std::move(ws.exp_sums));
-  encoder.add_temporary(std::move(ws.max_logits));
-  encoder.add_temporary(std::move(ws.tmp_out));
+  if (!persistent_v2_ws) {
+    encoder.add_temporary(std::move(ws.exp_sums));
+    encoder.add_temporary(std::move(ws.max_logits));
+    encoder.add_temporary(std::move(ws.tmp_out));
+  }
   (void)stream;
 }
 
@@ -3168,19 +3384,23 @@ void dispatch_inkling2_paged_prefill_attention(
     int head_size,
     KvDtype cache_dtype,
     bool int8_queries,
-    int64_t live_blocks) {
+    int64_t live_blocks,
+    const mlx::core::array* tree_rows) {
   const int kv_heads = static_cast<int>(params.kv_heads);
   const int group = num_q_heads / kv_heads;
-  const int tiles = (static_cast<int>(params.rows) + kPagedPrefillTileRows - 1) /
-      kPagedPrefillTileRows;
+  const bool use_r16 =
+      params.rows > static_cast<uint32_t>(kPagedPrefillTileRows) &&
+      params.rows <= 16u;
+  const int tile_rows = use_r16 ? 16 : kPagedPrefillTileRows;
+  const int tiles = (static_cast<int>(params.rows) + tile_rows - 1) / tile_rows;
   const int64_t partial_floats = static_cast<int64_t>(tiles) *
-      params.split_count * kPagedPrefillTileRows * num_q_heads * head_size;
+      params.split_count * tile_rows * num_q_heads * head_size;
   const float dummy_zero = 0.0f;
 
   // Stage 1: MPP split
   {
     auto* pipeline = paged_prefill_pipeline(
-        device, inkling2_prefill_split_name(cache_dtype, int8_queries));
+        device, inkling2_prefill_split_name(cache_dtype, int8_queries, use_r16));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_input_array(q_staged, 0);
     encoder.set_output_array(workspace, 1);
@@ -3199,6 +3419,11 @@ void dispatch_inkling2_paged_prefill_attention(
       } else {
         encoder.set_bytes(dummy_zero, 10);
       }
+      if (params.has_tree != 0u && tree_rows != nullptr) {
+        encoder.set_input_array(*tree_rows, 11);
+      } else {
+        encoder.set_bytes(dummy_zero, 11);
+      }
     } else {
       bind_pool_plane(encoder, k_pool, 4, live_blocks);
       bind_pool_plane(encoder, v_pool, 5, live_blocks);
@@ -3212,6 +3437,11 @@ void dispatch_inkling2_paged_prefill_attention(
         encoder.set_input_array(*rel_bias_w, 8);
       } else {
         encoder.set_bytes(dummy_zero, 8);
+      }
+      if (params.has_tree != 0u && tree_rows != nullptr) {
+        encoder.set_input_array(*tree_rows, 9);
+      } else {
+        encoder.set_bytes(dummy_zero, 9);
       }
     }
     encoder.dispatch_threadgroups(
@@ -3227,7 +3457,7 @@ void dispatch_inkling2_paged_prefill_attention(
   // Stage 2: reduce -> BF16 out (+ optional fused gate+sink) + optional F32 lse
   {
     auto* pipeline =
-        paged_prefill_pipeline(device, inkling2_prefill_reduce_name());
+        paged_prefill_pipeline(device, inkling2_prefill_reduce_name(use_r16));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_input_array(workspace, 0);
     encoder.set_input_array(workspace, 1, partial_floats * 4);
@@ -3248,7 +3478,7 @@ void dispatch_inkling2_paged_prefill_attention(
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
             static_cast<size_t>(kv_heads),
-            static_cast<size_t>(kPagedPrefillTileRows * group),
+            static_cast<size_t>(tile_rows * group),
             static_cast<size_t>(tiles)),
         MTL::Size::Make(static_cast<size_t>(head_size), 1, 1));
   }

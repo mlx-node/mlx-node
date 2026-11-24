@@ -462,18 +462,19 @@ browser on `/models` and the gallery and exits 1 when two cards of a page differ
   left out while checking or stalled, and reads `under a minute left`, `about N min left`, `about H h M min left`
   (minutes by 5, up to 10 h), `about H h left` or `more than a day left`.
 
-The DFlash2 line belongs to Qwen3.8-27B, not to a build: one copy pairs with both builds by name. It reads
-`Optional DFlash2 · 3.85 GB` with an **Add** button that starts the draft download at once, beside a model download
-too, and never follows the build switch. Then it reads the received bytes and percent with Cancel, `added`, `added ·
-waits for the model` while no Qwen3.8-27B build is on disk, `update available` with Update, or `needs update` /
-`needs cleanup` with Update… or Clean up & update… (`Clean up and update companion weights?`), or `no access` with
-Show why. The draft lives at `qwen3.8-27b-dflash2` in the models
-directory, and compatible Qwen3.8-27B targets find it automatically on their next load. It is not another chat model
-and never counts as one. Draft-only checkpoints are excluded from the local-model table and model counts; their bytes
-still count toward disk use on Models and Overview. Expand **Companion weights** in the local models panel to inspect
-or delete them; deleting a separate companion leaves the target model in place. Delete is not on the card: Local
-models has one row per folder, and deleting a row removes that one build. The Qwen3.8-27B UD-Q4_K_XL file also carries
-an MTP layer inline, which the native loader detects.
+The DFlash2 line belongs to its parent model (Qwen3.8-27B or Inkling-2-Mini), not to a single build: one copy pairs
+with every build of that model by name. When auto-installed (`autoInstall: true`), it reads
+`Included DFlash2 · <size>` and queues automatically alongside a fresh build install (with an **Add** button still
+available if removed or skipped), never following the build switch. Then it reads the received bytes and percent with
+Cancel, `added`, `added · waits for the model` while no build of that model is on disk, `update available` with Update,
+or `needs update` / `needs cleanup` with Update… or Clean up & update… (`Clean up and update companion weights?`), or
+`no access` with Show why. The drafts live at `qwen3.8-27b-dflash2` and `inkling-2-mini-dflash2` in the models
+directory, and compatible targets find them automatically on their next load. They are not chat models and never count
+as ones. Draft-only checkpoints are excluded from the local-model table and model counts; their bytes still count toward
+disk use on Models and Overview. Expand **Companion weights** in the local models panel to inspect or delete them;
+deleting a separate companion leaves the target model in place. Delete is not on the card: Local models has one row per
+folder, and deleting a row removes that one build. The Qwen3.8-27B UD-Q4_K_XL file also carries an MTP layer inline,
+which the native loader detects.
 
 "N of M installed" counts models: a model counts when at least one of its builds is on disk, and M is the number of
 chat models offered on this Mac. The System One section counts its own. The command palette has one command per build

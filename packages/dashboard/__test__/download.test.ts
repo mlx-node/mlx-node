@@ -30,7 +30,7 @@ import {
   catalogUpdateRepos,
   MODEL_CATALOG,
 } from '@mlx-node/agent/catalog';
-import { findDFlash2Draft, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+import { findDFlash2Draft, INKLING2_DFLASH2, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/test';
 
@@ -451,8 +451,10 @@ const SLUG = catalogBuildSlug(BUILD);
 const BUILD_OTHER = catalogBuild('Inkling-2-Mini', 'UD-Q4_K_XL');
 const REPO_OTHER = catalogBuildRepo(BUILD_OTHER);
 const SLUG_OTHER = catalogBuildSlug(BUILD_OTHER);
-/** The folder of the optional DFlash2 draft. */
+/** The folder of the auto-installed Qwen3.8-27B DFlash2 draft. */
 const DRAFT_SLUG = catalogDraftSlug(QWEN38_DFLASH2);
+/** The folder of the auto-installed Inkling-2-Mini DFlash2 draft. */
+const INKLING_DRAFT_SLUG = catalogDraftSlug(INKLING2_DFLASH2);
 /**
  * The `Qwen/Qwen3.8-27B` base-model repo {@link BUILD}'s `assetsRepo` names for
  * the tokenizer/config sidecars a GGUF quantization repo does not ship.
@@ -918,39 +920,85 @@ describe('DownloadManager', () => {
     expect(job.receivedBytes).toBe(312);
   });
 
-  it.each([true, false])('publishes only a complete DFlash2 companion (valid architecture: %s)', async (valid) => {
-    const config = JSON.stringify({
-      model_type: 'qwen3',
-      architectures: [valid ? 'DFlash2DraftModel' : 'Qwen3ForCausalLM'],
-    });
-    // The draft repo is a catalog DOWNLOAD repo but not a catalog ENTRY, so it
-    // carries no globs and no assetsRepo: the no-glob default filter applies and
-    // the companion stays a safetensors repo (there is nothing to match a GGUF glob).
-    hub.manifest = [
-      { type: 'file', path: 'config.json', size: Buffer.byteLength(config) },
-      { type: 'file', path: 'model.safetensors', size: 16 },
-    ];
-    const weightsFetch = makeFetchImpl({ 'model.safetensors': 16 });
-    const manager = new DownloadManager({
-      modelsDir,
-      cacheDir,
-      fetchImpl: (input, init) => {
-        const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
-        return url.endsWith('/config.json') ? Promise.resolve(new Response(config)) : weightsFetch(input, init);
-      },
-    });
-    const id = manager.start(DRAFT_SLUG).id;
-    await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
-    expect(manager.jobs().find((job) => job.id === id)?.state).toBe(valid ? 'done' : 'error');
-    const draftPath = join(modelsDir, 'qwen3.8-27b-dflash2');
-    expect(existsSync(draftPath)).toBe(valid);
-    expect(findDFlash2Draft(join(modelsDir, 'qwen3.8-27b-mxfp4-mlx'), 'qwen3_5')).toBe(valid ? draftPath : undefined);
-    const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
-    expect(target.builds.some((build) => build.present)).toBe(false);
-    expect(target.draft?.present).toBe(valid);
-    expect(target.draft?.installed).toBe(valid);
-    await manager.shutdown();
-  });
+  it.each([
+    {
+      label: 'Qwen3.8-27B',
+      slug: DRAFT_SLUG,
+      family: 'qwen3_5',
+      probePath: 'qwen3.8-27b-mxfp4-mlx',
+      badArch: 'Qwen3ForCausalLM',
+      valid: true,
+    },
+    {
+      label: 'Qwen3.8-27B',
+      slug: DRAFT_SLUG,
+      family: 'qwen3_5',
+      probePath: 'qwen3.8-27b-mxfp4-mlx',
+      badArch: 'Qwen3ForCausalLM',
+      valid: false,
+    },
+    {
+      label: 'Inkling-2-Mini',
+      slug: INKLING_DRAFT_SLUG,
+      family: 'inkling2',
+      probePath: 'inkling-2-mini',
+      badArch: 'Inkling2LoopForConditionalGeneration',
+      valid: true,
+    },
+    {
+      label: 'Inkling-2-Mini',
+      slug: INKLING_DRAFT_SLUG,
+      family: 'inkling2',
+      probePath: 'inkling-2-mini',
+      badArch: 'Inkling2LoopForConditionalGeneration',
+      valid: false,
+    },
+  ])(
+    'publishes only a complete DFlash2 companion ($label, valid architecture: $valid)',
+    async ({ label, slug, family, probePath, badArch, valid }) => {
+      const config = JSON.stringify({
+        model_type: family === 'inkling2' ? 'inkling2_loop' : 'qwen3',
+        architectures: [valid ? 'DFlash2DraftModel' : badArch],
+        ...(family === 'inkling2' ? { hidden_size: 2304, num_target_layers: 48 } : {}),
+      });
+      // The draft repo is a catalog DOWNLOAD target with no globs and no assetsRepo:
+      // the no-glob default filter applies and the companion stays a safetensors repo.
+      hub.manifest = [
+        { type: 'file', path: 'config.json', size: Buffer.byteLength(config) },
+        { type: 'file', path: 'model.safetensors', size: 16 },
+      ];
+      const weightsFetch = makeFetchImpl({ 'model.safetensors': 16 });
+      const manager = new DownloadManager({
+        modelsDir,
+        cacheDir,
+        fetchImpl: (input, init) => {
+          const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+          return url.endsWith('/config.json') ? Promise.resolve(new Response(config)) : weightsFetch(input, init);
+        },
+      });
+      const id = manager.start(slug).id;
+      await waitFor(() => manager.jobs().some((job) => job.id === id && ['done', 'error'].includes(job.state)));
+      expect(manager.jobs().find((job) => job.id === id)?.state).toBe(valid ? 'done' : 'error');
+      const draftPath = join(modelsDir, slug);
+      expect(existsSync(draftPath)).toBe(valid);
+      expect(findDFlash2Draft(join(modelsDir, probePath), family, modelsDir)).toBe(valid ? draftPath : undefined);
+      const target = catalogWithState(modelsDir).find((item) => item.label === label)!;
+      expect(target.builds.some((build) => build.present)).toBe(false);
+      expect(target.draft?.present).toBe(valid);
+      expect(target.draft?.installed).toBe(valid);
+      if (valid) {
+        // Re-running a completed DFlash2 draft short-circuits without re-downloading,
+        // and mutating config.json out of DFlash2DraftModel forces a re-download instead of skipping.
+        writeFileSync(join(draftPath, 'config.json'), JSON.stringify({ architectures: [badArch] }));
+        const repairId = manager.start(slug).id;
+        await waitFor(() => manager.jobs().some((job) => job.id === repairId && job.state === 'done'));
+        expect(JSON.parse(readFileSync(join(draftPath, 'config.json'), 'utf8')).architectures).toEqual([
+          'DFlash2DraftModel',
+        ]);
+      }
+      await manager.shutdown();
+    },
+  );
 
   it('refuses a hidden catalog entry up front instead of failing mid-download', async () => {
     // A `hidden` entry is an UNPUBLISHED repo: it stays in MODEL_CATALOG so a

@@ -13,10 +13,14 @@ pub const PREFILL_MAX_ROWS: u32 = 2048;
 pub const PREFILL_MAX_SPLITS: u32 = 32;
 /// Rows of a verify launch (Splash `SPLASH_TARGET_VERIFY_ROWS`).
 pub const VERIFY_ROWS: u32 = 8;
+/// Maximum rows of an Inkling2 verify-tree launch (`M <= 16` single-tile `_r16` MPP kernel).
+pub const INKLING2_VERIFY_ROWS: u32 = 16;
 /// Splash `kv::kVerifySplits`, `kVerifyMaximumSplits`, `kVerifyPagesPerSplit`.
 pub const VERIFY_MIN_SPLITS: u32 = 32;
 pub const VERIFY_MAX_SPLITS: u32 = 128;
 pub const VERIFY_PAGES_PER_SPLIT: u32 = 16;
+/// Splash `RelativeAttention::kDecodeCorePages`: decode/verify split density numerator.
+pub const INKLING2_DECODE_CORE_PAGES: u32 = 80;
 
 /// A prefill chunk or a verify block: the split rule and the workspace bound
 /// differ (Splash `prefillSplits` vs `verifyAttentionSplits`).
@@ -66,6 +70,43 @@ pub fn verify_splits(committed: u32) -> u32 {
     scaled.clamp(u64::from(VERIFY_MIN_SPLITS), u64::from(VERIFY_MAX_SPLITS)) as u32
 }
 
+/// Splash `RelativeAttention::decodeMostSplits`: resident split cap for one Inkling2
+/// decode/verify lane on a GPU of `reported_cores` cores (`18` for `M <= 8` and `12` for
+/// `9 <= M <= 16` on a 40-core M5 Max; `16`/`10` on 32-core; `12`/`7` on 20-core).
+pub fn inkling2_verify_most_splits(rows: u32, reported_cores: u32) -> u32 {
+    let cores = if reported_cores == 0 {
+        ASSUMED_GPU_CORES
+    } else {
+        reported_cores
+    };
+    let most = if rows > TILE_ROWS {
+        (cores + 8) / 4
+    } else {
+        (cores + 16) / 3
+    };
+    most.clamp(1, VERIFY_MAX_SPLITS)
+}
+
+/// Splash `RelativeAttention::decodeSplits` for Inkling2 MPP verify (`1..=16` rows):
+/// 1 split per `max(2, 80 / cores)` active pages, capped at [`inkling2_verify_most_splits`]
+/// (18 for `M <= 8`, 12 for `M > 8` on 40-core Apple10), normalized so no split is empty.
+pub fn inkling2_verify_splits(active_pages: u32, rows: u32, reported_cores: u32) -> u32 {
+    if active_pages <= 1 {
+        return 1;
+    }
+    let cores = if reported_cores == 0 {
+        ASSUMED_GPU_CORES
+    } else {
+        reported_cores
+    };
+    let most = u64::from(inkling2_verify_most_splits(rows, cores));
+    let pages = u64::from(active_pages);
+    let pages_per_split = u64::from((INKLING2_DECODE_CORE_PAGES / cores).max(2));
+    let raw = pages.div_ceil(pages_per_split).clamp(1, most);
+    let per_split = pages.div_ceil(raw).max(1);
+    pages.div_ceil(per_split).max(1) as u32
+}
+
 /// The launch's split count.
 pub fn splits(pass: Pass, rows: u32, history: u32, pages_per_split: u32) -> u32 {
     match pass {
@@ -108,7 +149,7 @@ pub fn workspace_floats(rows: u32, splits: u32, query_heads: u32, head_dim: u32)
 pub fn workspace_bound_floats(pass: Pass, query_heads: u32, head_dim: u32) -> u64 {
     let slots = match pass {
         Pass::Prefill => prefill_workspace_slots(PREFILL_MAX_ROWS),
-        Pass::Verify => VERIFY_MAX_SPLITS,
+        Pass::Verify => tiles(VERIFY_ROWS) * VERIFY_MAX_SPLITS,
     };
     u64::from(slots) * u64::from(TILE_ROWS) * u64::from(query_heads) * (u64::from(head_dim) + 2)
 }
@@ -128,7 +169,7 @@ pub fn attention_bytes(
 ) -> u64 {
     let rows = match pass {
         Pass::Prefill => rows.min(PREFILL_MAX_ROWS),
-        Pass::Verify => VERIFY_ROWS,
+        Pass::Verify => rows.min(VERIFY_ROWS),
     };
     let row_bytes = u64::from(query_heads) * u64::from(head_dim) * 2;
     let kv_row_bytes = u64::from(kv_heads) * u64::from(head_dim) * 2;
@@ -275,11 +316,28 @@ mod tests {
             attention_bytes(1 << 20, 24, 4, 256, Pass::Prefill),
             109_445_120
         );
-        assert_eq!(attention_bytes(8, 24, 4, 256, Pass::Verify), 25_886_720);
+        assert_eq!(
+            attention_bytes(8, 24, 4, 256, Pass::Verify),
+            workspace_bound_floats(Pass::Verify, 24, 256) * 4
+                + 32 * 24 * 256 * 2
+                + 8 * 24 * 256 * 2
+                + 2 * 8 * 4 * 256 * 2
+        );
         assert_eq!(
             workspace_floats(2048, 1, 24, 256),
             workspace_bound_floats(Pass::Prefill, 24, 256)
         );
+        assert_eq!(inkling2_verify_most_splits(8, 40), 18);
+        assert_eq!(inkling2_verify_most_splits(16, 40), 12);
+        assert_eq!(inkling2_verify_most_splits(8, 32), 16);
+        assert_eq!(inkling2_verify_most_splits(16, 32), 10);
+        assert_eq!(inkling2_verify_most_splits(8, 20), 12);
+        assert_eq!(inkling2_verify_most_splits(16, 20), 7);
+        assert_eq!(inkling2_verify_splits(32, 8, 40), 16);
+        assert_eq!(inkling2_verify_splits(64, 8, 40), 16);
+        assert_eq!(inkling2_verify_splits(64, 16, 40), 11);
+        assert_eq!(inkling2_verify_splits(256, 8, 40), 18);
+        assert_eq!(inkling2_verify_splits(256, 16, 40), 12);
     }
 
     #[test]

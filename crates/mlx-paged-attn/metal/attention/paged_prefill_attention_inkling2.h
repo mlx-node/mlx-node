@@ -27,7 +27,28 @@ struct Inkling2PagedPrefillParams {
   uint sink_row_stride;
   uint sink_is_f32;
   uint write_lse;
+  uint has_tree; // 0 = linear causal chain, 1 = verify tree (tree_rows [rows, 2] u32: x=ancestors, y=parent|(depth<<16))
+  uint _pad_tree;
 };
+
+inline bool inkling2_prefill_tree_visible(uint k_pos, uint anchor, bool in_tree,
+                                          uint ancestors) {
+  if (!in_tree || k_pos < anchor) {
+    return true;
+  }
+  const uint rel = k_pos - anchor;
+  return rel < 32u && (((ancestors >> rel) & 1u) != 0u);
+}
+
+inline uint inkling2_prefill_tree_dist(uint k_pos, uint anchor, uint q_pos,
+                                       bool in_tree, uint ancestors,
+                                       uint depth) {
+  if (in_tree && k_pos >= anchor) {
+    const uint rel = min(k_pos - anchor, 31u);
+    return depth - popcount(ancestors & ((1u << rel) - 1u));
+  }
+  return q_pos - k_pos;
+}
 
 inline bool inkling2_prefill_contract_valid(
     constant Inkling2PagedPrefillParams &params) {
@@ -42,17 +63,17 @@ inline bool inkling2_prefill_contract_valid(
          params.max_splits <= PAGED_PREFILL_MAX_SPLITS;
 }
 
-template <uint Group, uint HeadDim>
+template <uint Group, uint Rows, uint HeadDim>
 inline PagedPrefillTile inkling2_prefill_tile(
     constant Inkling2PagedPrefillParams &params, uint kv_head, uint tile) {
-  const uint start = tile * PAGED_PREFILL_TILE_ROWS;
+  const uint start = tile * Rows;
   if (!inkling2_prefill_contract_valid(params) || kv_head >= params.kv_heads ||
       start >= params.rows)
     return {};
   return {(ulong(kv_head) * params.chunk_stride + start) * Group * HeadDim,
           (ulong(tile) * params.kv_heads + kv_head) * params.split_count,
           params.committed_tokens + start,
-          min(PAGED_PREFILL_TILE_ROWS, params.rows - start),
+          min(Rows, params.rows - start),
           start,
           params.split_count,
           true};
@@ -79,15 +100,16 @@ inline float inkling2_prefill_read_bias(device const uchar *rel_bias_raw,
 }
 
 // Compute active 32-token page range `[first_page, last_page_excl)` for a tile.
-// For SWA (`sliding_window > 0`), skips all evicted pages before `q_tile_min + 1 - sliding_window`.
-inline void inkling2_active_page_range(uint first_position, uint active_rows,
+// For SWA (`sliding_window > 0`), skips all evicted pages before `window_pos + 1 - sliding_window`.
+// In verify-tree mode (`has_tree != 0`), `window_pos` MUST be the sequence anchor (`committed_tokens`),
+// not `tile.first_position`, because a shallow node in a later tile can have logical position `anchor + 1`.
+inline void inkling2_active_page_range(uint window_pos, uint visible_tokens,
                                        uint sliding_window,
                                        thread uint &first_page,
                                        thread uint &last_page_excl) {
-  const uint visible_tokens = first_position + active_rows;
   const uint tile_min_k =
-      (sliding_window > 0u && first_position + 1u > sliding_window)
-          ? (first_position + 1u - sliding_window)
+      (sliding_window > 0u && window_pos + 1u > sliding_window)
+          ? (window_pos + 1u - sliding_window)
           : 0u;
   first_page = tile_min_k / PAGED_PREFILL_PAGE_TOKENS;
   last_page_excl = paged_prefill_pages(visible_tokens);
@@ -103,10 +125,11 @@ inline void inkling2_prefill_page_softmax(
     threadgroup float *row_sum, threadgroup float *previous_scale,
     threadgroup atomic_uint *rescale, device const float4 *key_scales4,
     device const float4 *value_scales4, device const uchar *rel_bias_raw,
-    device const float *rel_bias_w, uint rel_extent, uint rel_bias_is_f32,
-    uint rel_mode, uint sliding_window, uint kv_head, uint num_q_heads,
-    uint tile_first_row, uint token_start, uint visible_tokens,
-    uint committed_tokens, uint active_rows, uint thread_index) {
+    device const float *rel_bias_w, device const uint2 *tree_rows,
+    uint rel_extent, uint rel_bias_is_f32, uint rel_mode, uint sliding_window,
+    uint kv_head, uint num_q_heads, uint tile_first_row, uint token_start,
+    uint visible_tokens, uint anchor, uint tile_first_pos, uint active_rows,
+    uint has_tree, uint thread_index) {
   constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;
   constexpr uint FusedRows = Rows * Group;
   constexpr uint TokensPerLane = 8;
@@ -116,8 +139,14 @@ inline void inkling2_prefill_page_softmax(
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
   const uint query_row = min(fused_row / Group, active_rows - 1u);
-  const uint q_pos = committed_tokens + query_row;
-  const uint limit = min(visible_tokens, q_pos + 1u);
+  const uint global_q_row = tile_first_row + query_row;
+  const bool in_tree = (has_tree != 0u);
+  const uint2 trow = in_tree ? tree_rows[global_q_row] : uint2(0u, 0u);
+  const uint tree_ancestors = trow.x;
+  const uint tree_depth = trow.y >> 16u;
+  const uint slot_pos = tile_first_pos + query_row;
+  const uint limit = min(visible_tokens, slot_pos + 1u);
+  const uint q_pos = in_tree ? (anchor + tree_depth) : slot_pos;
   const uint row_lower =
       (sliding_window > 0u && q_pos + 1u > sliding_window)
           ? (q_pos + 1u - sliding_window)
@@ -143,7 +172,6 @@ inline void inkling2_prefill_page_softmax(
   ulong bias_row_base = 0;
   float4 r0(0.0f), r1(0.0f), r2(0.0f), r3(0.0f);
   if constexpr (HasBias) {
-    const uint global_q_row = tile_first_row + query_row;
     const uint global_q_head = kv_head * Group + (fused_row % Group);
     if (rel_mode == 2u) {
       const device float4 *r4 =
@@ -163,10 +191,13 @@ inline void inkling2_prefill_page_softmax(
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint k_pos = token + j;
-    const bool valid = k_pos >= row_lower && k_pos < limit;
+    const bool valid =
+        k_pos >= row_lower && k_pos < limit &&
+        inkling2_prefill_tree_visible(k_pos, anchor, in_tree, tree_ancestors);
     if (valid) {
       if constexpr (HasBias) {
-        const uint dist = q_pos - k_pos;
+        const uint dist = inkling2_prefill_tree_dist(
+            k_pos, anchor, q_pos, in_tree, tree_ancestors, tree_depth);
         if (dist < rel_extent) {
           if (rel_mode == 2u) {
             const device float4 *w4 =
@@ -194,7 +225,9 @@ inline void inkling2_prefill_page_softmax(
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
     const uint k_pos = token + j;
-    const bool valid = k_pos >= row_lower && k_pos < limit;
+    const bool valid =
+        k_pos >= row_lower && k_pos < limit &&
+        inkling2_prefill_tree_visible(k_pos, anchor, in_tree, tree_ancestors);
     probability[j] =
         (valid && finite_max) ? fast::exp(score[j] - next_max) : 0.0f;
     local_sum += probability[j];
@@ -216,16 +249,30 @@ inline void inkling2_prefill_page_softmax(
   if constexpr (IsInt8Ktm) {
     const float4 low_scales = value_scales4[vector];
     const float4 high_scales = value_scales4[vector + 1u];
-    low = float4(
-        (token + 0u >= row_lower && token + 0u < limit) ? probability[0] * low_scales.x : 0.0f,
-        (token + 1u >= row_lower && token + 1u < limit) ? probability[1] * low_scales.y : 0.0f,
-        (token + 2u >= row_lower && token + 2u < limit) ? probability[2] * low_scales.z : 0.0f,
-        (token + 3u >= row_lower && token + 3u < limit) ? probability[3] * low_scales.w : 0.0f);
-    high = float4(
-        (token + 4u >= row_lower && token + 4u < limit) ? probability[4] * high_scales.x : 0.0f,
-        (token + 5u >= row_lower && token + 5u < limit) ? probability[5] * high_scales.y : 0.0f,
-        (token + 6u >= row_lower && token + 6u < limit) ? probability[6] * high_scales.z : 0.0f,
-        (token + 7u >= row_lower && token + 7u < limit) ? probability[7] * high_scales.w : 0.0f);
+    const bool v0 = token + 0u >= row_lower && token + 0u < limit &&
+                    inkling2_prefill_tree_visible(token + 0u, anchor, in_tree, tree_ancestors);
+    const bool v1 = token + 1u >= row_lower && token + 1u < limit &&
+                    inkling2_prefill_tree_visible(token + 1u, anchor, in_tree, tree_ancestors);
+    const bool v2 = token + 2u >= row_lower && token + 2u < limit &&
+                    inkling2_prefill_tree_visible(token + 2u, anchor, in_tree, tree_ancestors);
+    const bool v3 = token + 3u >= row_lower && token + 3u < limit &&
+                    inkling2_prefill_tree_visible(token + 3u, anchor, in_tree, tree_ancestors);
+    const bool v4 = token + 4u >= row_lower && token + 4u < limit &&
+                    inkling2_prefill_tree_visible(token + 4u, anchor, in_tree, tree_ancestors);
+    const bool v5 = token + 5u >= row_lower && token + 5u < limit &&
+                    inkling2_prefill_tree_visible(token + 5u, anchor, in_tree, tree_ancestors);
+    const bool v6 = token + 6u >= row_lower && token + 6u < limit &&
+                    inkling2_prefill_tree_visible(token + 6u, anchor, in_tree, tree_ancestors);
+    const bool v7 = token + 7u >= row_lower && token + 7u < limit &&
+                    inkling2_prefill_tree_visible(token + 7u, anchor, in_tree, tree_ancestors);
+    low = float4(v0 ? probability[0] * low_scales.x : 0.0f,
+                 v1 ? probability[1] * low_scales.y : 0.0f,
+                 v2 ? probability[2] * low_scales.z : 0.0f,
+                 v3 ? probability[3] * low_scales.w : 0.0f);
+    high = float4(v4 ? probability[4] * high_scales.x : 0.0f,
+                  v5 ? probability[5] * high_scales.y : 0.0f,
+                  v6 ? probability[6] * high_scales.z : 0.0f,
+                  v7 ? probability[7] * high_scales.w : 0.0f);
   } else {
     low = float4(probability[0], probability[1], probability[2], probability[3]);
     high = float4(probability[4], probability[5], probability[6], probability[7]);
@@ -236,17 +283,61 @@ inline void inkling2_prefill_page_softmax(
   probabilities4[1] = bfloat4(high);
 }
 
-// Unified page loop for Inkling2 KTM INT8 and BF16 vLLM pools (G=3, D=128, M=24).
+// Quantize the tile's M fused query rows from threadgroup SRAM (`q_tile [M, HeadDim]`)
+// into device INT8 codes with 0-ULP parity to `paged_prefill_query_codes`.
+template <uint M, uint HeadDim>
+inline float inkling2_prefill_query_codes_tg(
+    threadgroup const bfloat *q_tile,
+    device int8_t *codes,
+    uint thread_index) {
+  constexpr uint LanesPerRow = PAGED_PREFILL_LANES_PER_ROW;
+  static_assert(LanesPerRow == 4, "two xor shuffles reduce a row's four lanes");
+  constexpr uint Quarter = HeadDim / LanesPerRow;
+  if (thread_index >= LanesPerRow * M)
+    return 0.0f;
+  const uint first = thread_index / LanesPerRow * HeadDim +
+                     thread_index % LanesPerRow * Quarter;
+  threadgroup const bfloat4 *source =
+      reinterpret_cast<threadgroup const bfloat4 *>(q_tile + first);
+  float maximum = 0.0f;
+  uint finite = 1;
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i) {
+    const bfloat4 query = source[i];
+    finite &= !paged_int8_activation_not_finite(query);
+    const float4 value = abs(float4(query));
+    maximum = max(maximum, max(max(value.x, value.y), max(value.z, value.w)));
+  }
+  maximum = max(maximum, simd_shuffle_xor(maximum, 1));
+  maximum = max(maximum, simd_shuffle_xor(maximum, 2));
+  finite &= simd_shuffle_xor(finite, 1);
+  finite &= simd_shuffle_xor(finite, 2);
+  const PagedInt8Block block = paged_int8_activation_block(maximum);
+  using Codes = PagedInt8Codes<int8_t>;
+  device typename Codes::Vec *target =
+      reinterpret_cast<device typename Codes::Vec *>(codes + first);
+#pragma unroll
+  for (uint i = 0; i < Quarter / 4; ++i)
+    target[i] = Codes::of(paged_int8_activation_code(float4(source[i]), block.inverse));
+  return as_type<float>(paged_int8_activation_bits(block.scale, finite != 0));
+}
+
+// Unified page loop for Inkling2 KTM INT8 and BF16 vLLM pools (G=3, D=128, M=24 or M=48).
+// Reads raw `[params.rows, kv_heads * Group, HeadDim]` BF16 queries directly into
+// threadgroup SRAM `q_tile [M, HeadDim]` (eliminating host reshape+transpose+pad ops &
+// DRAM roundtrip, and serving every KV page iteration from SRAM!).
 template <uint Group, uint Rows, uint HeadDim, bool IsInt8Ktm, bool Int8Queries>
 inline void inkling2_prefill_page_loop(
-    device bfloat *tile_queries, device const int *table,
+    device const bfloat *raw_queries, device const int *table,
     device conditional_t<IsInt8Ktm, int8_t, bfloat> *key_pool,
     device conditional_t<IsInt8Ktm, int8_t, bfloat> *value_pool,
     device const float *key_scales, device const float *value_scales,
     device const uchar *rel_bias_raw, device const float *rel_bias_w,
+    device const uint2 *tree_rows,
     constant Inkling2PagedPrefillParams &params, uint kv_head,
-    uint committed_tokens, uint tile_first_row, uint active_rows, uint splits,
+    uint tile_first_pos, uint tile_first_row, uint active_rows, uint splits,
     uint split, device float *partials, device float *statistics, ulong slot,
+    threadgroup bfloat *q_tile,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup conditional_t<IsInt8Ktm, int8_t, bfloat> *keys,
     threadgroup float *row_max, threadgroup float *row_sum,
@@ -268,11 +359,13 @@ inline void inkling2_prefill_page_loop(
   const uint block_size = params.block_size;
   const uint kv_heads = params.kv_heads;
   const uint num_q_heads = kv_heads * Group;
-  const uint visible_tokens = committed_tokens + active_rows;
+  const uint anchor = params.committed_tokens;
+  const uint window_pos = (params.has_tree != 0u) ? anchor : tile_first_pos;
+  const uint visible_tokens = tile_first_pos + active_rows;
   const uint visible_blocks =
       IsInt8Ktm ? 0u : (visible_tokens + block_size - 1u) / block_size;
   uint first_page = 0u, last_page_excl = 0u;
-  inkling2_active_page_range(committed_tokens, active_rows,
+  inkling2_active_page_range(window_pos, visible_tokens,
                              params.sliding_window, first_page, last_page_excl);
   const uint active_pages =
       last_page_excl > first_page ? last_page_excl - first_page : 0u;
@@ -286,20 +379,38 @@ inline void inkling2_prefill_page_loop(
 
   // Earliest key position that can ever receive a non-zero rel_bias in this tile.
   const uint bias_min_k =
-      (params.rel_extent > 0u && committed_tokens + 1u > params.rel_extent)
-          ? (committed_tokens + 1u - params.rel_extent)
+      (params.rel_extent > 0u && window_pos + 1u > params.rel_extent)
+          ? (window_pos + 1u - params.rel_extent)
           : 0u;
 
-  using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
+  // Cooperatively stage `[Rows, Group, HeadDim]` of raw `[params.rows, num_q_heads, HeadDim]`
+  // into threadgroup SRAM `q_tile [M, HeadDim]` via 16B `uint4` loads (0-padded past `active_rows`).
+  constexpr uint QVecsPerRow = HeadDim / 8u;
+  constexpr uint QTotalVecs = M * QVecsPerRow;
+  threadgroup uint4 *q_dst4 = reinterpret_cast<threadgroup uint4 *>(q_tile);
+  for (uint idx = thread_index; idx < QTotalVecs; idx += PAGED_PREFILL_THREADS) {
+    const uint fused_r = idx / QVecsPerRow;
+    const uint vec = idx % QVecsPerRow;
+    const uint r = fused_r / Group;
+    const uint g = fused_r % Group;
+    if (r < active_rows) {
+      const ulong src_row = ulong(tile_first_row + r) * ulong(num_q_heads) +
+                            ulong(kv_head * Group + g);
+      q_dst4[idx] = reinterpret_cast<device const uint4 *>(
+          raw_queries + src_row * HeadDim)[vec];
+    } else {
+      q_dst4[idx] = uint4(0);
+    }
+  }
+
   using Score = conditional_t<Int8Queries, int, float>;
-  device QueryElement *queries;
+  device int8_t *int8_queries = nullptr;
   float score_scale = paged_prefill_scale<HeadDim>();
   if constexpr (Int8Queries) {
-    queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    int8_queries = reinterpret_cast<device int8_t *>(partials + slot * M * D);
     score_scale = paged_int8_score_scale<HeadDim>(
-        paged_prefill_query_codes<M, HeadDim>(tile_queries, queries, thread_index));
-  } else {
-    queries = tile_queries;
+        inkling2_prefill_query_codes_tg<M, HeadDim>(q_tile, int8_queries, thread_index));
   }
   if (thread_index < M) {
     row_max[thread_index] = -INFINITY;
@@ -309,13 +420,11 @@ inline void inkling2_prefill_page_loop(
                                   : mem_flags::mem_threadgroup);
 
   threadgroup Score *page_score_tile = reinterpret_cast<threadgroup Score *>(scores);
-  auto qt = tensor(queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
   auto st = tensor(page_score_tile, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto pt = tensor(probabilities, dextents<int, 2>{N, M}, array<int, 2>{1, N});
   auto value_type = tensor(
       static_cast<device CacheElement *>(nullptr), dextents<int, 2>{PvK, D},
       array<int, 2>{1, IsInt8Ktm ? int(N) : int(block_size)});
-  auto q0 = qt.template slice<D, M>(0, 0);
   auto p0 = pt.template slice<PvK, M>(0, 0);
   auto v0 = value_type.template slice<PvK, D>(0, 0);
   constexpr auto qk_descriptor =
@@ -344,10 +453,21 @@ inline void inkling2_prefill_page_loop(
       auto kt = tensor(key_pool + ktm_first * D, dextents<int, 2>{D, N},
                        array<int, 2>{1, D});
       auto ks = kt.template slice<D, N>(0, 0);
-      auto page_scores = qk.template get_destination_cooperative_tensor<
-          decltype(q0), decltype(ks), Score>();
-      qk.run(q0, ks, page_scores);
-      page_scores.store(st.template slice<N, M>(0, 0));
+      if constexpr (Int8Queries) {
+        auto qt = tensor(int8_queries, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+        auto q0 = qt.template slice<D, M>(0, 0);
+        auto page_scores = qk.template get_destination_cooperative_tensor<
+            decltype(q0), decltype(ks), Score>();
+        qk.run(q0, ks, page_scores);
+        page_scores.store(st.template slice<N, M>(0, 0));
+      } else {
+        auto qt = tensor(q_tile, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+        auto q0 = qt.template slice<D, M>(0, 0);
+        auto page_scores = qk.template get_destination_cooperative_tensor<
+            decltype(q0), decltype(ks), Score>();
+        qk.run(q0, ks, page_scores);
+        page_scores.store(st.template slice<N, M>(0, 0));
+      }
     } else {
       const uint blocks_per_page = N / block_size;
       const uint vectors = Chunks * block_size;
@@ -369,6 +489,8 @@ inline void inkling2_prefill_page_loop(
       }
       threadgroup_barrier(mem_flags::mem_threadgroup);
 
+      auto qt = tensor(q_tile, dextents<int, 2>{D, M}, array<int, 2>{1, D});
+      auto q0 = qt.template slice<D, M>(0, 0);
       auto kt = tensor(keys, dextents<int, 2>{D, N}, array<int, 2>{1, D});
       auto k0 = kt.template slice<D, N>(0, 0);
       auto page_scores = qk.template get_destination_cooperative_tensor<
@@ -395,19 +517,19 @@ inline void inkling2_prefill_page_loop(
                                     IsInt8Ktm>(
           page_score_tile, score_scale, probabilities, row_max, row_sum,
           previous_scale, rescale, ks4, vs4, rel_bias_raw, rel_bias_w,
-          params.rel_extent, params.rel_bias_is_f32, params.rel_mode,
+          tree_rows, params.rel_extent, params.rel_bias_is_f32, params.rel_mode,
           params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          token_start, visible_tokens, anchor, tile_first_pos, active_rows,
+          params.has_tree, thread_index);
     } else {
       inkling2_prefill_page_softmax<Group, Rows, HeadDim, Score, false,
                                     IsInt8Ktm>(
           page_score_tile, score_scale, probabilities, row_max, row_sum,
           previous_scale, rescale, ks4, vs4, rel_bias_raw, rel_bias_w,
-          params.rel_extent, params.rel_bias_is_f32, params.rel_mode,
+          tree_rows, params.rel_extent, params.rel_bias_is_f32, params.rel_mode,
           params.sliding_window, kv_head, num_q_heads, tile_first_row,
-          token_start, visible_tokens, committed_tokens, active_rows,
-          thread_index);
+          token_start, visible_tokens, anchor, tile_first_pos, active_rows,
+          params.has_tree, thread_index);
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
@@ -468,18 +590,18 @@ inline float inkling2_prefill_apply_gate_sink(
 #pragma clang fp contract(fast)
 
 // Inkling2 prefill reduce: emits BF16 `output` (with optional fused gate+sink) + optional F32 `lse`.
-template <uint Group, uint HeadDim>
+template <uint Group, uint Rows, uint HeadDim>
 inline void inkling2_prefill_reduce_phase(
     device const float *partials, device const float *statistics,
     device bfloat *output, device float *lse_out,
     device const uchar *gate_raw, device const uchar *sink_raw,
     constant Inkling2PagedPrefillParams &params, uint3 group, uint thread_index,
     threadgroup float *weights, threadgroup float *group_values) {
-  constexpr uint M = PAGED_PREFILL_TILE_ROWS * Group;
+  constexpr uint M = Rows * Group;
   constexpr uint D = HeadDim;
   const uint fused_row = group.y;
   const PagedPrefillTile tile =
-      inkling2_prefill_tile<Group, HeadDim>(params, group.x, group.z);
+      inkling2_prefill_tile<Group, Rows, HeadDim>(params, group.x, group.z);
   if (!tile.active || fused_row >= M || thread_index >= D)
     return;
   const uint row = tile.first_row + fused_row / Group;
@@ -491,7 +613,9 @@ inline void inkling2_prefill_reduce_phase(
   device bfloat *row_output = output + out_head_idx * D;
 
   uint first_page = 0u, last_page_excl = 0u;
-  inkling2_active_page_range(tile.first_position, tile.active_rows,
+  const uint window_pos =
+      (params.has_tree != 0u) ? params.committed_tokens : tile.first_position;
+  inkling2_active_page_range(window_pos, tile.first_position + tile.active_rows,
                              params.sliding_window, first_page, last_page_excl);
   const uint active_pages =
       last_page_excl > first_page ? last_page_excl - first_page : 0u;
@@ -549,101 +673,109 @@ inline void inkling2_prefill_reduce_phase(
   }
 }
 
-#define INKLING2_PAGED_PREFILL_KTM_SPLIT(Name, Group, HeadDim, Int8Queries)    \
-  [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                \
-      device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
-      device float *statistics [[buffer(2)]],                                  \
-      device const int *table [[buffer(3)]],                                   \
-      device int8_t *key_pool [[buffer(4)]],                                   \
-      device int8_t *value_pool [[buffer(5)]],                                 \
-      device const float *key_scales [[buffer(6)]],                            \
-      device const float *value_scales [[buffer(7)]],                          \
-      device const uchar *rel_bias_raw [[buffer(8)]],                          \
-      constant Inkling2PagedPrefillParams &params [[buffer(9)]],               \
-      device const float *rel_bias_w [[buffer(10)]],                           \
-      uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS;                        \
-    constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;                              \
-    alignas(16) threadgroup float scores[M * N];                               \
-    alignas(16) threadgroup bfloat probabilities[M * N];                       \
-    threadgroup float row_max[M];                                              \
-    threadgroup float row_sum[M];                                              \
-    threadgroup float previous_scale[M];                                       \
-    threadgroup atomic_uint rescale;                                           \
-    const uint split = group.z;                                                \
-    const uint kv_head = group.x;                                              \
-    const PagedPrefillTile tile =                                              \
-        inkling2_prefill_tile<Group, HeadDim>(params, kv_head, group.y);       \
-    if (!tile.active || split >= tile.splits)                                  \
-      return;                                                                  \
-    inkling2_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS, HeadDim, true,  \
-                               Int8Queries>(                                   \
-        queries + tile.offset, table, key_pool, value_pool, key_scales,        \
-        value_scales, rel_bias_raw, rel_bias_w, params, kv_head,               \
-        tile.first_position, tile.first_row, tile.active_rows, tile.splits,    \
-        split, partials, statistics, tile.first_slot + split, scores,          \
-        probabilities, static_cast<threadgroup int8_t *>(nullptr), row_max,    \
-        row_sum, previous_scale, &rescale, thread_index);                      \
+#define INKLING2_PAGED_PREFILL_KTM_SPLIT(Name, Group, Rows, HeadDim, Int8Queries) \
+  [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                   \
+      device const bfloat *queries [[buffer(0)]],                                 \
+      device float *partials [[buffer(1)]],                                       \
+      device float *statistics [[buffer(2)]],                                     \
+      device const int *table [[buffer(3)]],                                      \
+      device int8_t *key_pool [[buffer(4)]],                                      \
+      device int8_t *value_pool [[buffer(5)]],                                    \
+      device const float *key_scales [[buffer(6)]],                               \
+      device const float *value_scales [[buffer(7)]],                             \
+      device const uchar *rel_bias_raw [[buffer(8)]],                             \
+      constant Inkling2PagedPrefillParams &params [[buffer(9)]],                  \
+      device const float *rel_bias_w [[buffer(10)]],                              \
+      device const uint2 *tree_rows [[buffer(11)]],                               \
+      uint3 group [[threadgroup_position_in_grid]],                               \
+      uint thread_index [[thread_index_in_threadgroup]]) {                        \
+    constexpr uint M = Group * Rows;                                              \
+    constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;                                 \
+    alignas(16) threadgroup bfloat q_tile[M * HeadDim];                           \
+    alignas(16) threadgroup float scores[M * N];                                  \
+    alignas(16) threadgroup bfloat probabilities[M * N];                          \
+    threadgroup float row_max[M];                                                 \
+    threadgroup float row_sum[M];                                                 \
+    threadgroup float previous_scale[M];                                          \
+    threadgroup atomic_uint rescale;                                              \
+    const uint split = group.z;                                                   \
+    const uint kv_head = group.x;                                                 \
+    const PagedPrefillTile tile =                                                 \
+        inkling2_prefill_tile<Group, Rows, HeadDim>(params, kv_head, group.y);    \
+    if (!tile.active || split >= tile.splits)                                     \
+      return;                                                                     \
+    inkling2_prefill_page_loop<Group, Rows, HeadDim, true, Int8Queries>(          \
+        queries, table, key_pool, value_pool, key_scales,                         \
+        value_scales, rel_bias_raw, rel_bias_w, tree_rows, params, kv_head,       \
+        tile.first_position, tile.first_row, tile.active_rows, tile.splits,       \
+        split, partials, statistics, tile.first_slot + split, q_tile, scores,     \
+        probabilities, static_cast<threadgroup int8_t *>(nullptr), row_max,       \
+        row_sum, previous_scale, &rescale, thread_index);                         \
   }
 
-#define INKLING2_PAGED_PREFILL_BF16_SPLIT(Name, Group, HeadDim)                \
-  [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                \
-      device bfloat *queries [[buffer(0)]],                                    \
-      device float *partials [[buffer(1)]],                                    \
-      device float *statistics [[buffer(2)]],                                  \
-      device const int *table [[buffer(3)]],                                   \
-      device bfloat *key_pool [[buffer(4)]],                                   \
-      device bfloat *value_pool [[buffer(5)]],                                 \
-      device const uchar *rel_bias_raw [[buffer(6)]],                          \
-      constant Inkling2PagedPrefillParams &params [[buffer(7)]],               \
-      device const float *rel_bias_w [[buffer(8)]],                            \
-      uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS;                        \
-    constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;                              \
-    alignas(16) threadgroup float scores[M * N];                               \
-    alignas(16) threadgroup bfloat probabilities[M * N];                       \
-    alignas(16) threadgroup bfloat keys[N * HeadDim];                          \
-    threadgroup float row_max[M];                                              \
-    threadgroup float row_sum[M];                                              \
-    threadgroup float previous_scale[M];                                       \
-    threadgroup atomic_uint rescale;                                           \
-    const uint split = group.z;                                                \
-    const uint kv_head = group.x;                                              \
-    const PagedPrefillTile tile =                                              \
-        inkling2_prefill_tile<Group, HeadDim>(params, kv_head, group.y);       \
-    if (!tile.active || split >= tile.splits)                                  \
-      return;                                                                  \
-    inkling2_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS, HeadDim, false, \
-                               false>(                                         \
-        queries + tile.offset, table, key_pool, value_pool, nullptr, nullptr,  \
-        rel_bias_raw, rel_bias_w, params, kv_head, tile.first_position,        \
-        tile.first_row, tile.active_rows, tile.splits, split, partials,        \
-        statistics, tile.first_slot + split, scores, probabilities, keys,      \
-        row_max, row_sum, previous_scale, &rescale, thread_index);             \
+#define INKLING2_PAGED_PREFILL_BF16_SPLIT(Name, Group, Rows, HeadDim)             \
+  [[kernel, max_total_threads_per_threadgroup(256)]] void Name(                   \
+      device const bfloat *queries [[buffer(0)]],                                 \
+      device float *partials [[buffer(1)]],                                       \
+      device float *statistics [[buffer(2)]],                                     \
+      device const int *table [[buffer(3)]],                                      \
+      device bfloat *key_pool [[buffer(4)]],                                      \
+      device bfloat *value_pool [[buffer(5)]],                                    \
+      device const uchar *rel_bias_raw [[buffer(6)]],                             \
+      constant Inkling2PagedPrefillParams &params [[buffer(7)]],                  \
+      device const float *rel_bias_w [[buffer(8)]],                               \
+      device const uint2 *tree_rows [[buffer(9)]],                                \
+      uint3 group [[threadgroup_position_in_grid]],                               \
+      uint thread_index [[thread_index_in_threadgroup]]) {                        \
+    constexpr uint M = Group * Rows;                                              \
+    constexpr uint N = PAGED_PREFILL_PAGE_TOKENS;                                 \
+    alignas(16) threadgroup bfloat q_tile[M * HeadDim];                           \
+    alignas(16) threadgroup float scores[M * N];                                  \
+    alignas(16) threadgroup bfloat probabilities[M * N];                          \
+    alignas(16) threadgroup bfloat keys[N * HeadDim];                             \
+    threadgroup float row_max[M];                                                 \
+    threadgroup float row_sum[M];                                                 \
+    threadgroup float previous_scale[M];                                          \
+    threadgroup atomic_uint rescale;                                              \
+    const uint split = group.z;                                                   \
+    const uint kv_head = group.x;                                                 \
+    const PagedPrefillTile tile =                                                 \
+        inkling2_prefill_tile<Group, Rows, HeadDim>(params, kv_head, group.y);    \
+    if (!tile.active || split >= tile.splits)                                     \
+      return;                                                                     \
+    inkling2_prefill_page_loop<Group, Rows, HeadDim, false, false>(               \
+        queries, table, key_pool, value_pool, nullptr, nullptr,                   \
+        rel_bias_raw, rel_bias_w, tree_rows, params, kv_head, tile.first_position,\
+        tile.first_row, tile.active_rows, tile.splits, split, partials,           \
+        statistics, tile.first_slot + split, q_tile, scores, probabilities, keys, \
+        row_max, row_sum, previous_scale, &rescale, thread_index);                \
   }
 
-#define INKLING2_PAGED_PREFILL_REDUCE(Name, Group, HeadDim)                    \
-  [[kernel, max_total_threads_per_threadgroup(HeadDim)]] void Name(            \
-      device const float *partials [[buffer(0)]],                              \
-      device const float *statistics [[buffer(1)]],                            \
-      device bfloat *output [[buffer(2)]],                                     \
-      device float *lse_out [[buffer(3)]],                                     \
-      constant Inkling2PagedPrefillParams &params [[buffer(4)]],               \
-      device const uchar *gate_raw [[buffer(5)]],                              \
-      device const uchar *sink_raw [[buffer(6)]],                              \
-      uint3 group [[threadgroup_position_in_grid]],                            \
-      uint thread_index [[thread_index_in_threadgroup]]) {                     \
-    threadgroup float weights[PAGED_PREFILL_MAX_SPLITS];                       \
-    threadgroup float group_values[HeadDim / 32];                              \
-    inkling2_prefill_reduce_phase<Group, HeadDim>(                             \
-        partials, statistics, output, lse_out, gate_raw, sink_raw, params,     \
-        group, thread_index, weights, group_values);                           \
+#define INKLING2_PAGED_PREFILL_REDUCE(Name, Group, Rows, HeadDim)                 \
+  [[kernel, max_total_threads_per_threadgroup(HeadDim)]] void Name(               \
+      device const float *partials [[buffer(0)]],                                 \
+      device const float *statistics [[buffer(1)]],                               \
+      device bfloat *output [[buffer(2)]],                                        \
+      device float *lse_out [[buffer(3)]],                                        \
+      constant Inkling2PagedPrefillParams &params [[buffer(4)]],                  \
+      device const uchar *gate_raw [[buffer(5)]],                                 \
+      device const uchar *sink_raw [[buffer(6)]],                                 \
+      uint3 group [[threadgroup_position_in_grid]],                               \
+      uint thread_index [[thread_index_in_threadgroup]]) {                        \
+    threadgroup float weights[PAGED_PREFILL_MAX_SPLITS];                          \
+    threadgroup float group_values[HeadDim / 32];                                 \
+    inkling2_prefill_reduce_phase<Group, Rows, HeadDim>(                          \
+        partials, statistics, output, lse_out, gate_raw, sink_raw, params,        \
+        group, thread_index, weights, group_values);                              \
   }
 
-INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8_split_g3_d128_ktm, 3, 128, false)
-INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8q_split_g3_d128_ktm, 3, 128, true)
-INKLING2_PAGED_PREFILL_BF16_SPLIT(inkling2_paged_prefill_bf16_split_g3_d128, 3, 128)
-INKLING2_PAGED_PREFILL_REDUCE(inkling2_paged_prefill_reduce_g3_d128, 3, 128)
+INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8_split_g3_d128_ktm, 3, 8, 128, false)
+INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8q_split_g3_d128_ktm, 3, 8, 128, true)
+INKLING2_PAGED_PREFILL_BF16_SPLIT(inkling2_paged_prefill_bf16_split_g3_d128, 3, 8, 128)
+INKLING2_PAGED_PREFILL_REDUCE(inkling2_paged_prefill_reduce_g3_d128, 3, 8, 128)
+
+// Single-tile 16-row verify variants (`M = 3 * 16 = 48 <= 64`): reads KV pages ONCE for M=9..=16!
+INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8_split_g3_d128_ktm_r16, 3, 16, 128, false)
+INKLING2_PAGED_PREFILL_KTM_SPLIT(inkling2_paged_prefill_q8q_split_g3_d128_ktm_r16, 3, 16, 128, true)
+INKLING2_PAGED_PREFILL_BF16_SPLIT(inkling2_paged_prefill_bf16_split_g3_d128_r16, 3, 16, 128)
+INKLING2_PAGED_PREFILL_REDUCE(inkling2_paged_prefill_reduce_g3_d128_r16, 3, 16, 128)

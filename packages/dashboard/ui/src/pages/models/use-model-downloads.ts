@@ -11,6 +11,7 @@ import type {
   CancelDownloadResponse,
   CatalogBlocker,
   CatalogBuildItem,
+  CatalogDraftItem,
   CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
@@ -200,6 +201,24 @@ export interface ModelDownloads {
 }
 
 /**
+ * The companion draft to queue alongside a fresh install of `buildSlug`, or `undefined` when none should start
+ * automatically (the entry has no auto-install draft, the slug is not a build, or the draft is already present,
+ * blocked by a foreign entry, or already active).
+ */
+export function autoInstallDraftForBuild(
+  items: readonly CatalogItem[] | undefined,
+  buildSlug: string,
+  active: Readonly<Record<string, unknown>>,
+): CatalogDraftItem | undefined {
+  if (items === undefined) return undefined;
+  const entry = items.find((item) => item.builds.some((build) => build.slug === buildSlug));
+  const draft = entry?.draft;
+  if (draft === undefined || draft.autoInstall !== true) return undefined;
+  if (draft.present || draft.blockedByForeignDir || Object.hasOwn(active, draft.slug)) return undefined;
+  return draft;
+}
+
+/**
  * The download state machine of the Models page and Onboarding: hydration from `/downloads`, terminal dismiss, the
  * settle window after a job ends, and cancel marking. `models`, `catalog`, `updates` and `host` are the page's own
  * queries; a job that ends reloads them all.
@@ -220,6 +239,8 @@ export function useModelDownloads(
    * a new identity IS the refreshed body. Both, because the verdict joins both and they arrive independently.
    */
   const [settledOn, setSettledOn] = useState<ReadonlyMap<string, SettledBodies>>(() => new Map());
+  const settledOnRef = useRef(settledOn);
+  settledOnRef.current = settledOn;
   /** The same bodies, read by the reconcile effect; it must not depend on them (it reloads them). */
   const catalogBody = useRef(catalog.data);
   catalogBody.current = catalog.data;
@@ -228,6 +249,8 @@ export function useModelDownloads(
   const settledBodies = (): SettledBodies => ({ catalog: catalog.data, updates: updates.data });
 
   const [active, setActive] = useState<Record<string, ActiveJob>>({});
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const [downloadError, setDownloadError] = useState<ModelDownloadError | null>(null);
   /** Folders whose Update plan was refused for a reason a cleanup solves, for this visit: the sentence and the blocker. */
   const [refusals, setRefusals] = useState<ReadonlyMap<string, { message: string; key: string }>>(() => new Map());
@@ -307,14 +330,14 @@ export function useModelDownloads(
   }, [downloads.data, connection, reloadModels, reloadCatalog, reloadUpdates, reloadHost]);
 
   const starting = useRef(new Set<string>());
-  const install = async (slug: string): Promise<void> => {
-    if (starting.current.has(slug)) return;
+  const startOne = async (slug: string, companion = false): Promise<boolean> => {
+    if (starting.current.has(slug)) return false;
     starting.current.add(slug);
-    setDownloadError(null);
+    if (!companion) setDownloadError(null);
     const startedConnection = connection;
     try {
       const res = await mutate<DownloadStartResponse>('POST', '/downloads', { slug });
-      if (getConnectionGeneration() !== startedConnection) return;
+      if (getConnectionGeneration() !== startedConnection) return false;
       setActive((prev) => ({
         ...prev,
         [slug]: {
@@ -327,12 +350,27 @@ export function useModelDownloads(
           blocker: null,
         },
       }));
+      return true;
     } catch (err) {
-      setDownloadError({ slug, message: errMessage(err) });
-      toast.error('Failed to start download', { description: errMessage(err) });
+      if (!companion) setDownloadError({ slug, message: errMessage(err) });
+      toast.error(companion ? 'Failed to start companion download' : 'Failed to start download', {
+        description: errMessage(err),
+      });
+      return false;
     } finally {
       starting.current.delete(slug);
     }
+  };
+
+  const install = async (item: DownloadItem): Promise<void> => {
+    const started = await startOne(item.slug);
+    if (!started || item.present) return;
+    const draft = autoInstallDraftForBuild(catalogBody.current?.items, item.slug, activeRef.current);
+    if (draft === undefined) return;
+    if (settledOnRef.current.has(draft.slug) && settledOnRef.current.get(draft.slug)?.catalog === catalogBody.current) {
+      return;
+    }
+    await startOne(draft.slug, true);
   };
 
   /** Jobs a confirmation started, held until the confirmation hands over (setting `active` would unmount it). */
@@ -504,7 +542,7 @@ export function useModelDownloads(
       job: active[item.slug],
       refused,
       refusedSentence: refused ? refusal.message : undefined,
-      onInstall: () => install(item.slug),
+      onInstall: () => install(item),
       onCleanup: () => cleanup(item),
       onConfirmStarted: () => confirmStarted(item.slug),
       onPlanUpdate: () => planUpdate(item),

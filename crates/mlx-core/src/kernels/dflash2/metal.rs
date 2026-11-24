@@ -18,6 +18,34 @@ pub(super) fn topk16(logits: &MxArray) -> Option<(MxArray, MxArray)> {
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn selector_edges(
+    candidates: &MxArray,
+    unary: &MxArray,
+    hidden: &MxArray,
+    predecessor: &MxArray,
+    successor: &MxArray,
+    anchor: &MxArray,
+    softcap: f32,
+) -> Option<MxArray> {
+    let scores = unsafe {
+        sys::mlx_dflash2_selector_edges(
+            candidates.as_raw_ptr(),
+            unary.as_raw_ptr(),
+            hidden.as_raw_ptr(),
+            predecessor.as_raw_ptr(),
+            successor.as_raw_ptr(),
+            anchor.as_raw_ptr(),
+            softcap,
+        )
+    };
+    if scores.is_null() {
+        return None;
+    }
+    MxArray::from_handle(scores, "dflash2_selector_edges").ok()
+}
+
+#[inline]
 pub(super) fn greedy_path(candidates: &MxArray, scores: &MxArray) -> Option<MxArray> {
     let mut path = std::ptr::null_mut();
     let ok = unsafe {

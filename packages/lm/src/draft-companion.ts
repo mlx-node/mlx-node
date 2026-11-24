@@ -25,6 +25,14 @@ export const QWEN36_MOE_DFLASH2 = {
   sizeGb: 1.1,
 } as const;
 
+export const INKLING2_DFLASH2 = {
+  label: 'Inkling-2-Mini DFlash2',
+  hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+  sizeGb: 1.0,
+} as const;
+
+export type DraftCompanion = typeof QWEN38_DFLASH2 | typeof QWEN36_MOE_DFLASH2 | typeof INKLING2_DFLASH2;
+
 const GGUF_SCALAR_BYTES = new Map<number, number>([
   [0, 1],
   [1, 1],
@@ -351,19 +359,57 @@ function hasMoeDFlash2Geometry(path: string): boolean {
   }
 }
 
-function isEmbeddedDFlash2Companion(path: string, requireMoeGeometry: boolean): boolean {
-  return isDFlash2Companion(path) && (!requireMoeGeometry || hasMoeDFlash2Geometry(path));
+function hasInkling2DFlash2Geometry(path: string): boolean {
+  try {
+    const config = JSON.parse(readFileSync(join(path, 'config.json'), 'utf8')) as {
+      hidden_size?: unknown;
+      num_target_layers?: unknown;
+    } | null;
+    return config?.hidden_size === 2304 && config.num_target_layers === 48;
+  } catch {
+    return false;
+  }
+}
+
+function isEmbeddedDFlash2Companion(path: string, requiredGeometry: 'none' | 'moe' | 'inkling2'): boolean {
+  if (!isDFlash2Companion(path)) return false;
+  if (requiredGeometry === 'moe') return hasMoeDFlash2Geometry(path);
+  if (requiredGeometry === 'inkling2') return hasInkling2DFlash2Geometry(path);
+  return true;
 }
 
 /**
- * Prefer a target's explicit `draft/`, then its family's shared companion.
- * Shared pairing requires the released target name. Renamed or fine-tuned
- * targets can opt in with `draft/` or an explicit draftModelPath; geometry
- * compatibility alone does not establish a trained companion pairing.
+ * Shared DFlash2 companion metadata for a released target model, or `undefined`
+ * when `modelPath`/`modelType` does not name a released target with a shared
+ * companion.
+ */
+export function draftCompanionForModel(modelPath: string, modelType: string): DraftCompanion | undefined {
+  const isGguf = modelPath.toLowerCase().endsWith('.gguf');
+  const modelDir = isGguf ? dirname(modelPath) : modelPath;
+  const matchesTarget = (pattern: RegExp): boolean =>
+    pattern.test(basename(modelPath)) || (isGguf && pattern.test(basename(modelDir)));
+
+  if (modelType === 'qwen3_5') {
+    return matchesTarget(/(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i) ? QWEN38_DFLASH2 : undefined;
+  }
+  if (modelType === 'qwen3_5_moe') {
+    return matchesTarget(/(?:^|[-_.])qwen3[._-]6[-_.]35b[-_.]a3b(?:[-_.]|$)/i) ? QWEN36_MOE_DFLASH2 : undefined;
+  }
+  if (modelType === 'inkling2') {
+    return matchesTarget(/(?:^|[-_.])inkling[-_.]?2[-_.]mini(?:[-_.]|$)/i) ? INKLING2_DFLASH2 : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Prefer a target's explicit `draft/`, then its family's shared companion, and
+ * for `inkling2` finally fall back to bundled DSpark (`mtp.safetensors` /
+ * `dspark-*.gguf`). Shared pairing requires the released target name. Renamed
+ * or fine-tuned targets can opt in with `draft/` or an explicit draftModelPath;
+ * geometry compatibility alone does not establish a trained companion pairing.
  */
 export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir?: string): string | undefined {
-  if (modelType === 'inkling2') return findInkling2DSparkDraft(modelPath);
-  if (modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe') return undefined;
+  if (modelType !== 'qwen3_5' && modelType !== 'qwen3_5_moe' && modelType !== 'inkling2') return undefined;
   const isGguf = modelPath.toLowerCase().endsWith('.gguf');
   // Discovery records the lexical symlink path, and the recorded model path
   // must stay lexical, so searches run against BOTH the lexical dir and the
@@ -381,67 +427,105 @@ export function findDFlash2Draft(modelPath: string, modelType: string, modelsDir
   const modelDir = isGguf ? dirname(modelPath) : modelPath;
   const resolvedDir = isGguf ? dirname(resolved) : resolved;
   // A standalone GGUF's directory can be a shared store, so its generic
-  // `draft/` has no target ownership. MoE discovery admits only the released
-  // MoE geometry there; repository and directory drafts remain explicit.
-  const standaloneMoe = isGguf && modelType === 'qwen3_5_moe' && !regularFile(join(modelDir, 'config.json'));
+  // `draft/` has no target ownership. MoE and Inkling2 discovery admit only
+  // their released geometry there; repository and directory drafts remain explicit.
+  const embeddedRequirement = (dir: string): 'none' | 'moe' | 'inkling2' => {
+    if (!isGguf || regularFile(join(dir, 'config.json'))) return 'none';
+    if (modelType === 'qwen3_5_moe') return 'moe';
+    if (modelType === 'inkling2') return 'inkling2';
+    return 'none';
+  };
   const embedded = join(modelDir, 'draft');
-  if (isEmbeddedDFlash2Companion(embedded, standaloneMoe)) return embedded;
+  if (isEmbeddedDFlash2Companion(embedded, embeddedRequirement(modelDir))) return embedded;
   if (resolvedDir !== modelDir) {
-    const resolvedStandaloneMoe =
-      isGguf && modelType === 'qwen3_5_moe' && !regularFile(join(resolvedDir, 'config.json'));
     const resolvedEmbedded = join(resolvedDir, 'draft');
-    if (isEmbeddedDFlash2Companion(resolvedEmbedded, resolvedStandaloneMoe)) return resolvedEmbedded;
+    if (isEmbeddedDFlash2Companion(resolvedEmbedded, embeddedRequirement(resolvedDir))) return resolvedEmbedded;
   }
 
-  const targetName =
-    modelType === 'qwen3_5_moe'
-      ? /(?:^|[-_.])qwen3[._-]6[-_.]35b[-_.]a3b(?:[-_.]|$)/i
-      : /(?:^|[-_.])qwen3[._-]8[-_.]27b(?:[-_.]|$)/i;
-  if (!targetName.test(basename(modelPath)) && !(isGguf && targetName.test(basename(modelDir)))) return undefined;
-  const companion = modelType === 'qwen3_5_moe' ? QWEN36_MOE_DFLASH2 : QWEN38_DFLASH2;
-  const slug = companion.hfRepo.split('/')[1].toLowerCase();
-  const roots = modelsDir === undefined ? [isGguf ? modelDir : dirname(modelDir)] : [modelsDir];
-  // The linked target's own directory and its parent get the same searches —
-  // a companion shipped beside the real file attaches identically to a
-  // linked entry.
-  if (resolvedDir !== modelDir) {
-    roots.push(resolvedDir);
-    if (!isGguf) {
-      // A symlinked model DIRECTORY resolves to the target itself: the
-      // companion beside the real checkpoint lives in the target's parent,
-      // which an explicit modelsDir must not suppress — callers pass the
-      // symlink's store while the real dir can live outside it.
+  const companion = draftCompanionForModel(modelPath, modelType);
+  if (companion !== undefined) {
+    const slug = companion.hfRepo.split('/')[1].toLowerCase();
+    const roots = modelsDir === undefined ? [isGguf ? modelDir : dirname(modelDir)] : [modelsDir];
+    // The linked target's own directory and its parent get the same searches —
+    // a companion shipped beside the real file attaches identically to a
+    // linked entry.
+    if (resolvedDir !== modelDir) {
+      roots.push(resolvedDir);
+      if (!isGguf) {
+        // A symlinked model DIRECTORY resolves to the target itself: the
+        // companion beside the real checkpoint lives in the target's parent,
+        // which an explicit modelsDir must not suppress — callers pass the
+        // symlink's store while the real dir can live outside it.
+        const resolvedParent = dirname(resolvedDir);
+        if (!roots.includes(resolvedParent)) roots.push(resolvedParent);
+      }
+    }
+    // A sibling config identifies a downloaded model repository. Its parent
+    // can hold the shared companion; a standalone GGUF's containing directory
+    // is already the model store, so do not search above it. An explicit store
+    // always takes precedence over this repository inference.
+    if (modelsDir === undefined && isGguf && regularFile(join(modelDir, 'config.json'))) {
+      roots.push(dirname(modelDir));
+    }
+    // The resolved repo parent is searched even with an explicit store: a
+    // symlinked GGUF's target legitimately lives outside `modelsDir`, matching
+    // the resolved-dir branch above for directory targets. The config.json
+    // sibling check still confines the inference to real repositories.
+    if (isGguf && resolvedDir !== modelDir && regularFile(join(resolvedDir, 'config.json'))) {
       const resolvedParent = dirname(resolvedDir);
       if (!roots.includes(resolvedParent)) roots.push(resolvedParent);
     }
-  }
-  // A sibling config identifies a downloaded model repository. Its parent
-  // can hold the shared companion; a standalone GGUF's containing directory
-  // is already the model store, so do not search above it. An explicit store
-  // always takes precedence over this repository inference.
-  if (modelsDir === undefined && isGguf && regularFile(join(modelDir, 'config.json'))) {
-    roots.push(dirname(modelDir));
-  }
-  // The resolved repo parent is searched even with an explicit store: a
-  // symlinked GGUF's target legitimately lives outside `modelsDir`, matching
-  // the resolved-dir branch above for directory targets. The config.json
-  // sibling check still confines the inference to real repositories.
-  if (isGguf && resolvedDir !== modelDir && regularFile(join(resolvedDir, 'config.json'))) {
-    const resolvedParent = dirname(resolvedDir);
-    if (!roots.includes(resolvedParent)) roots.push(resolvedParent);
-  }
-  for (const root of roots) {
-    try {
-      const candidates = readdirSync(root, { withFileTypes: true })
-        .filter((entry) => direntKind(root, entry) === 'dir' && entry.name.toLowerCase() === slug)
-        .sort((a, b) => a.name.localeCompare(b.name));
-      for (const candidate of candidates) {
-        const path = join(root, candidate.name);
-        if (isDFlash2Companion(path)) return path;
+    for (const root of roots) {
+      try {
+        const candidates = readdirSync(root, { withFileTypes: true })
+          .filter((entry) => direntKind(root, entry) === 'dir' && entry.name.toLowerCase() === slug)
+          .sort((a, b) => a.name.localeCompare(b.name));
+        for (const candidate of candidates) {
+          const path = join(root, candidate.name);
+          if (isDFlash2Companion(path)) return path;
+        }
+      } catch {
+        // An absent/unreadable companion leaves ordinary target loading available.
       }
-    } catch {
-      // An absent/unreadable companion leaves ordinary target loading available.
     }
   }
+  if (modelType === 'inkling2') return findInkling2DSparkDraft(modelPath);
   return undefined;
+}
+
+/**
+ * Returns an auto-discovered Inkling-2-Mini DFlash2 companion ONLY when it
+ * resides inside an external `modelsDir` outside the model's own directory and
+ * parent directory (where native `Inkling2Model::load` already auto-discovers
+ * `draft/`, sibling `inkling-2-mini-dflash2/`, and bundled DSpark with soft
+ * fallback).
+ */
+export function findExternalInkling2DFlash2Draft(modelPath: string, modelsDir?: string): string | undefined {
+  if (modelsDir === undefined) return undefined;
+  const discovered = findDFlash2Draft(modelPath, 'inkling2', modelsDir);
+  if (discovered === undefined || !isDFlash2Companion(discovered)) return undefined;
+  const isGguf = modelPath.toLowerCase().endsWith('.gguf');
+  const modelDir = isGguf ? dirname(modelPath) : modelPath;
+  let resolved = modelPath;
+  try {
+    resolved = realpathSync(modelPath);
+  } catch {
+    // Keep lexical comparison when realpath is unavailable.
+  }
+  const resolvedDir = isGguf ? dirname(resolved) : resolved;
+  let discoveredParent = dirname(discovered);
+  try {
+    discoveredParent = realpathSync(discoveredParent);
+  } catch {
+    // Keep lexical parent.
+  }
+  const nativeRoots = new Set<string>([modelDir, dirname(modelDir), resolvedDir, dirname(resolvedDir)]);
+  for (const dir of Array.from(nativeRoots)) {
+    try {
+      nativeRoots.add(realpathSync(dir));
+    } catch {
+      // Ignore unresolvable paths.
+    }
+  }
+  return nativeRoots.has(discoveredParent) ? undefined : discovered;
 }

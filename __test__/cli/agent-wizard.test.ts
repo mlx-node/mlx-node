@@ -1,7 +1,14 @@
 import { execFileSync } from 'node:child_process';
 import { join } from 'node:path';
 
-import { type CatalogEntry, catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG, visibleCatalog } from '@mlx-node/agent';
+import {
+  type CatalogEntry,
+  catalogBuildRepo,
+  catalogBuildSlug,
+  catalogDraftSlug,
+  MODEL_CATALOG,
+  visibleCatalog,
+} from '@mlx-node/agent';
 import { describe, expect, it } from 'vite-plus/test';
 
 import { runFirstRunWizard, type WizardIO } from '../../packages/cli/src/commands/agent/wizard.js';
@@ -42,6 +49,15 @@ function expectedArgv(entry: CatalogEntry, modelsDir: string = MODELS_DIR): stri
   argv.push('--complete');
   argv.push('-o', join(modelsDir, catalogBuildSlug(build)));
   return argv;
+}
+
+/** The chained argv list rendered on one non-TTY hint line (model, plus auto-installed draft when configured). */
+function expectedHintArgvs(entry: CatalogEntry, modelsDir: string = MODELS_DIR): string[][] {
+  const argvs = [expectedArgv(entry, modelsDir)];
+  if (entry.draft?.autoInstall === true) {
+    argvs.push(['-m', entry.draft.hfRepo, '--complete', '-o', join(modelsDir, catalogDraftSlug(entry.draft))]);
+  }
+  return argvs;
 }
 
 interface SelectCall {
@@ -102,7 +118,7 @@ describe('runFirstRunWizard', () => {
     ]);
     expect(question.choices.map((c) => c.name)).toEqual([
       'Qwen3.8-27B (~17.7 GB) — Best tool use — recommended default',
-      'Inkling-2-Mini (~18.7 GB) — Looped MoE with vision and DSpark drafts, 1M context',
+      'Inkling-2-Mini (~18.7 GB) — Looped MoE with vision and DFlash2 draft, 1M context',
       'Qwen3.8-Flash-Next (~111.3 GB) — 125B MoE, 512 experts streamed from SSD',
       'Hy4-flash (~168.3 GB) — 512-expert MoE streamed from SSD, 256K context',
     ]);
@@ -151,6 +167,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/qwen3.8-27b-gguf',
       ],
+      ['-m', 'z-lab/Qwen3.8-27B-DFlash2', '--complete', '-o', '/custom/models/qwen3.8-27b-dflash2'],
     ]);
   });
 
@@ -175,6 +192,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/qwen3.8-27b-gguf-ud-q4_k_m',
       ],
+      ['-m', 'z-lab/Qwen3.8-27B-DFlash2', '--complete', '-o', '/custom/models/qwen3.8-27b-dflash2'],
     ]);
   });
 
@@ -207,6 +225,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/inkling-2-mini-gguf',
       ],
+      ['-m', 'incoai/Inkling-2-Mini-DFlash2', '--complete', '-o', '/custom/models/inkling-2-mini-dflash2'],
     ]);
   });
 
@@ -233,6 +252,7 @@ describe('runFirstRunWizard', () => {
         '-o',
         '/custom/models/inkling-2-mini-gguf-ud-q4_k_m',
       ],
+      ['-m', 'incoai/Inkling-2-Mini-DFlash2', '--complete', '-o', '/custom/models/inkling-2-mini-dflash2'],
     ]);
   });
 
@@ -245,6 +265,7 @@ describe('runFirstRunWizard', () => {
     expect(folder).toBe('inkling-2-mini');
     expect(calls).toEqual([
       ['-m', 'thinkingmachines/Inkling-2-Mini', '--complete', '-o', '/custom/models/inkling-2-mini'],
+      ['-m', 'incoai/Inkling-2-Mini-DFlash2', '--complete', '-o', '/custom/models/inkling-2-mini-dflash2'],
     ]);
   });
 
@@ -316,10 +337,15 @@ describe('runFirstRunWizard', () => {
       for (const entry of visibleCatalog(LARGE_MAC)) {
         const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
         expect(line).toBeDefined();
-        const renderedArgs = line.trim().replace(/^mlx download model /, '');
-        // The hint must reconstruct the interactive argv exactly — including
-        // the globs and assets repo, so a headless user gets the same file set.
-        expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry));
+        const commands = line.trim().split(' && ');
+        // The hint must reconstruct the interactive argv(s) exactly — including
+        // globs, assets repo, and any auto-installed companion draft command.
+        expect(
+          commands.map((cmd) => {
+            expect(cmd.startsWith('mlx download model ')).toBe(true);
+            return shellSplit(cmd.slice('mlx download model '.length));
+          }),
+        ).toEqual(expectedHintArgvs(entry));
       }
     }
     expect(calls).toHaveLength(0);
@@ -345,14 +371,22 @@ describe('runFirstRunWizard', () => {
       const slug = catalogBuildSlug(entry.builds[0]);
       const line = message.split('\n').find((l) => l.includes(repoOf(entry)));
       expect(line).toBeDefined();
-      const renderedArgs = line!.trim().replace(/^mlx download model /, '');
-      // Round-trip: a real POSIX shell parses the displayed command back
+      const commands = line!.trim().split(' && ');
+      // Round-trip: a real POSIX shell parses each displayed command back
       // into EXACTLY the argv the interactive path would pass — globs as
       // single words, one `-o` word, `$HOME` unexpanded, `;`/`&` inert.
-      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry, modelsDir));
+      expect(
+        commands.map((cmd) => {
+          expect(cmd.startsWith('mlx download model ')).toBe(true);
+          return shellSplit(cmd.slice('mlx download model '.length));
+        }),
+      ).toEqual(expectedHintArgvs(entry, modelsDir));
       // Known-correct quoted form: safe words bare, unsafe -o value
       // single-quoted with the embedded quote escaped as '\''.
       expect(line).toContain(`-o '/tmp/My Models/it'\\''s;echo x&$HOME/${slug}'`);
+      if (entry.draft?.autoInstall === true) {
+        expect(line).toContain(`-o '/tmp/My Models/it'\\''s;echo x&$HOME/${catalogDraftSlug(entry.draft)}'`);
+      }
     }
     expect(calls).toHaveLength(0);
   });
@@ -370,10 +404,18 @@ describe('runFirstRunWizard', () => {
       const slug = catalogBuildSlug(entry.builds[0]);
       // Safe paths stay readable: the -o value renders unquoted...
       expect(message).toContain(`-o /custom/models/${slug}`);
-      // ...and the whole line still parses back to the intended argv.
+      if (entry.draft?.autoInstall === true) {
+        expect(message).toContain(`-o /custom/models/${catalogDraftSlug(entry.draft)}`);
+      }
+      // ...and the whole line still parses back to the intended argv(s).
       const line = message.split('\n').find((l) => l.includes(repoOf(entry)))!;
-      const renderedArgs = line.trim().replace(/^mlx download model /, '');
-      expect(shellSplit(renderedArgs)).toEqual(expectedArgv(entry));
+      const commands = line.trim().split(' && ');
+      expect(
+        commands.map((cmd) => {
+          expect(cmd.startsWith('mlx download model ')).toBe(true);
+          return shellSplit(cmd.slice('mlx download model '.length));
+        }),
+      ).toEqual(expectedHintArgvs(entry));
     }
   });
 });

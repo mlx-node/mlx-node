@@ -76,7 +76,7 @@ import { basename, dirname, join, resolve, sep } from 'node:path';
 
 import { downloadFileToCacheDir, getRepoFolderName, listFiles, type ListFileEntry, modelInfo } from '@huggingface/hub';
 import { type CatalogTarget, catalogTargetForSlug, catalogTargets, catalogUpdateRepos } from '@mlx-node/agent/catalog';
-import { isDFlash2Companion, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+import { isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
 /** How long a resolved set of catalog shas is reused before re-dialling HF. */
 const CATALOG_SHA_TTL_MS = 6 * 60 * 60 * 1000;
@@ -2748,7 +2748,7 @@ export class DownloadManager {
         installed.revision === revision &&
         files.every((file) => installed.files.includes(file.path)) &&
         isModelInstalled(finalDir, configlessOf(job.target)) &&
-        (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
+        (job.target.kind !== 'draft' || isDFlash2Companion(finalDir)) &&
         (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
       // `refreshInstalledAssets` is the one pre-publish path that mutates the
       // live install (stale-sidecar deletes, marker rewrite) — and only on a
@@ -2866,7 +2866,7 @@ export class DownloadManager {
       // `committing`, `cancel()`'s `state !== 'running'` gate rejects it (the route
       // 404s) and publish runs to completion.
       if (job.cancelled) throw new Error('Download cancelled');
-      if (job.repo === QWEN38_DFLASH2.hfRepo && !isDFlash2Companion(stagingDir)) {
+      if (job.target.kind === 'draft' && !isDFlash2Companion(stagingDir)) {
         throw new Error('DFlash2 download requires a DFlash2DraftModel config and model.safetensors');
       }
       job.state = 'committing';
@@ -3079,7 +3079,7 @@ export class DownloadManager {
         const path = item.file.path;
         await linkInto(target, slug, path, join(stagingDir, path), staged.get(path)!, added, madeDirs);
       }
-      if (job.repo === QWEN38_DFLASH2.hfRepo && !isDFlash2Companion(target)) {
+      if (job.target.kind === 'draft' && !isDFlash2Companion(target)) {
         throw new Error('DFlash2 download requires a DFlash2DraftModel config and model.safetensors');
       }
       // The adds and the fsync above take milliseconds; a checked file changed in that time must not get a marker.

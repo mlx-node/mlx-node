@@ -420,9 +420,9 @@ impl LoopController {
         #[cfg(target_os = "macos")]
         {
             if unsafe { mlx_sys::mlx_metal_is_available() } {
-                let t = msg.shape()?[0];
+                let t = msg.shape_at(0)?;
                 let d = self.dim;
-                let rank = self.down_proj_w.shape()?[0];
+                let rank = self.down_proj_w.shape_at(0)?;
                 let w_dtype = self.down_proj_w.dtype()?;
                 let (min_t, max_t) = fused_loop_ctrl_range();
                 if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
@@ -431,18 +431,13 @@ impl LoopController {
                     && d % 4 == 0
                     && rank % 4 == 0
                 {
-                    let h = super::kernels::inkling2_loop_ctrl_down(
+                    return super::kernels::inkling2_loop_ctrl_fused_single(
                         dest,
                         msg,
                         &self.down_proj_w,
-                        ATTN_RES_EPS,
-                    )?;
-                    return super::kernels::inkling2_loop_ctrl_up_blend_norm(
-                        &h,
                         &self.gain_forget_w,
-                        dest,
-                        msg,
                         norm_weight,
+                        ATTN_RES_EPS,
                         eps,
                         out_dtype,
                     );
@@ -625,57 +620,46 @@ impl LoopLayerControllers {
         eps: f32,
         out_dtype: DType,
     ) -> Result<(MxArray, MxArray, MxArray)> {
-        let m_shape = msgs_qkv.shape()?;
-        let t = m_shape[1];
-        let d = m_shape[2];
+        let t = msgs_qkv.shape_at(1)?;
+        let d = msgs_qkv.shape_at(2)?;
         #[cfg(target_os = "macos")]
         {
             if unsafe { mlx_sys::mlx_metal_is_available() } {
-                let rank = self.qkv_down_w.shape()?[1];
+                let rank = self.qkv_down_w.shape_at(1)?;
                 let w_dtype = self.qkv_down_w.dtype()?;
                 let (min_t, max_t) = fused_loop_ctrl_range();
-                let out_3 = if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
+                if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
                     && t >= min_t
                     && t <= max_t
                     && d % 4 == 0
                     && rank % 4 == 0
                 {
-                    let h_3 = super::kernels::inkling2_loop_ctrl_down(
+                    return super::kernels::inkling2_loop_ctrl_fused_qkv(
                         dest,
                         msgs_qkv,
                         &self.qkv_down_w,
-                        ATTN_RES_EPS,
-                    )?;
-                    super::kernels::inkling2_loop_ctrl_up_blend_norm(
-                        &h_3,
                         &self.qkv_gain_forget_w,
-                        dest,
-                        msgs_qkv,
                         norm_weight,
-                        eps,
-                        out_dtype,
-                    )?
-                } else {
-                    let pair_3 = super::kernels::inkling2_pair_rms_norm(
-                        dest,
-                        msgs_qkv,
                         ATTN_RES_EPS,
-                        w_dtype,
-                    )?;
-                    let h_3 = pair_3.matmul(&self.qkv_down_proj_t)?;
-                    let gf_3 = h_3.matmul(&self.qkv_gain_forget_proj_t)?;
-                    let gain_3 = gf_3.slice(&[0, 0, 0], &[3, t, d])?;
-                    let forget_3 = gf_3.slice(&[0, 0, d], &[3, t, 2 * d])?;
-                    super::kernels::inkling2_loop_blend_rms_norm(
-                        dest,
-                        msgs_qkv,
-                        &gain_3,
-                        &forget_3,
-                        norm_weight,
                         eps,
                         out_dtype,
-                    )?
-                };
+                    );
+                }
+                let pair_3 =
+                    super::kernels::inkling2_pair_rms_norm(dest, msgs_qkv, ATTN_RES_EPS, w_dtype)?;
+                let h_3 = pair_3.matmul(&self.qkv_down_proj_t)?;
+                let gf_3 = h_3.matmul(&self.qkv_gain_forget_proj_t)?;
+                let gain_3 = gf_3.slice(&[0, 0, 0], &[3, t, d])?;
+                let forget_3 = gf_3.slice(&[0, 0, d], &[3, t, 2 * d])?;
+                let out_3 = super::kernels::inkling2_loop_blend_rms_norm(
+                    dest,
+                    msgs_qkv,
+                    &gain_3,
+                    &forget_3,
+                    norm_weight,
+                    eps,
+                    out_dtype,
+                )?;
                 let x_q = out_3.slice(&[0, 0, 0], &[1, t, d])?.squeeze(Some(&[0]))?;
                 let x_k = out_3.slice(&[1, 0, 0], &[2, t, d])?.squeeze(Some(&[0]))?;
                 let x_v = out_3.slice(&[2, 0, 0], &[3, t, d])?.squeeze(Some(&[0]))?;
@@ -691,7 +675,7 @@ impl LoopLayerControllers {
         let msg_v = msgs_qkv
             .slice(&[2, 0, 0], &[3, t, d])?
             .squeeze(Some(&[0]))?;
-        let (dq, dk, dv) = if dest.shape()?.len() == 3 {
+        let (dq, dk, dv) = if dest.ndim()? == 3 {
             (
                 dest.slice(&[0, 0, 0], &[1, t, d])?.squeeze(Some(&[0]))?,
                 dest.slice(&[1, 0, 0], &[2, t, d])?.squeeze(Some(&[0]))?,
@@ -700,7 +684,7 @@ impl LoopLayerControllers {
         } else {
             (dest.clone(), dest.clone(), dest.clone())
         };
-        let (wq, wk, wv) = if norm_weight.shape()?.len() == 2 {
+        let (wq, wk, wv) = if norm_weight.ndim()? == 2 {
             (
                 norm_weight.slice(&[0, 0], &[1, d])?.squeeze(Some(&[0]))?,
                 norm_weight.slice(&[1, 0], &[2, d])?.squeeze(Some(&[0]))?,

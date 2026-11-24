@@ -77,7 +77,11 @@ export default function Onboarding({
   const items = (catalog.data?.items ?? []).filter(
     (item) => offeredOnHost(item, host) && item.category !== 'systemone',
   );
-  const activeLabel = items.find((item) => item.builds.some((build) => activeSlugs.includes(build.slug)))?.label;
+  const activeLabel = items.find(
+    (item) =>
+      item.builds.some((build) => activeSlugs.includes(build.slug)) ||
+      (item.draft !== undefined && activeSlugs.includes(item.draft.slug)),
+  )?.label;
   const selected =
     items.find((item) => item.label === (activeLabel ?? selectedLabel)) ??
     items.find((item) => item.isDefault === true && !blocked(onboardingBuild(item, activeSlugs))) ??
@@ -255,7 +259,11 @@ export default function Onboarding({
                 <div className="grid min-w-[min(100%,16rem)] flex-1 gap-1" aria-live="polite">
                   {downloading ? (
                     <LiveLabel active as="p" className="m-0 text-caption text-secondary">
-                      Getting the model
+                      {selected.draft !== undefined &&
+                      activeSlugs.includes(selected.draft.slug) &&
+                      !activeSlugs.includes(selectedBuild.slug)
+                        ? `Getting ${selected.draft.label}`
+                        : 'Getting the model'}
                     </LiveLabel>
                   ) : (
                     <p className="m-0 text-caption text-secondary">{ready ? 'Model ready' : 'Your first model'}</p>
@@ -268,6 +276,11 @@ export default function Onboarding({
                         ? 'Keep the app open. You can look around while it finishes.'
                         : `About ${selectedBuild.sizeGb} GB to download.`}
                   </p>
+                  {!ready && !downloading && selected.draft?.autoInstall === true && !selected.draft.present ? (
+                    <p className="m-0 text-caption text-secondary">
+                      {`Includes ${selected.draft.label} (${selected.draft.sizeGb} GB) for faster replies.`}
+                    </p>
+                  ) : null}
                   {selected.builds.length > 1 ? (
                     <p className="m-0 text-caption text-secondary">
                       {`Build ${selectedBuild.id}. More builds are on the Models page.`}

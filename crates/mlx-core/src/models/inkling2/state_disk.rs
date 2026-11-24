@@ -1453,14 +1453,14 @@ pub(crate) fn install_anchor_swa_and_conv(
     seq_id: SeqId,
     prompt_tokens: &[u32],
     boundary: u32,
-    anchor: Inkling2StateAnchor,
+    anchor: &Inkling2StateAnchor,
 ) -> Result<()> {
     if coordinator.sliding_adapter().is_some() {
         coordinator
             .restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, &anchor.swa_blocks)
             .map_err(Error::from_reason)?;
     }
-    conv_states.insert(seq_id, anchor.conv_state);
+    conv_states.insert(seq_id, anchor.conv_state.clone());
     Ok(())
 }
 

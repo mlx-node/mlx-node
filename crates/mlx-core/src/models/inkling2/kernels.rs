@@ -18,6 +18,40 @@ pub enum Inkling2KvDtype {
     Int8 = 3,
 }
 
+/// One speculative verification tree node row passed to Inkling2 Metal attention & ShortConv
+/// kernels (`[T, 2]` `UInt32` array where word0 = `ancestors`, word1 = `(depth << 16) | parent`).
+///
+/// Matches Splash `SplashTreeRow`: rows MUST be in topological order (parent index < child index),
+/// with row 0 as the anchor (`depth = 0`, `ancestors = 1`, `parent = u16::MAX`).
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct Inkling2TreeRow {
+    /// Bitmask of row indices on the path from root (row 0) to this row, **including this row itself**
+    /// (`bit r` set iff row `r` is on the root-to-node path).
+    pub ancestors: u32,
+    /// Parent row index (`u16::MAX` for root row 0).
+    pub parent: u16,
+    /// Tree depth relative to the lane anchor (`0` for root row 0).
+    pub depth: u16,
+}
+
+/// Pack `&[Inkling2TreeRow]` into a contiguous `[T, 2]` `UInt32` MLX array
+/// (`word0 = ancestors`, `word1 = (u32::from(depth) << 16) | u32::from(parent)`).
+pub fn encode_inkling2_tree_rows(rows: &[Inkling2TreeRow]) -> Result<MxArray> {
+    if rows.is_empty() || rows.len() > 16 {
+        return Err(Error::from_reason(format!(
+            "encode_inkling2_tree_rows: expected 1..=16 rows, got {}",
+            rows.len()
+        )));
+    }
+    let mut packed = Vec::with_capacity(rows.len() * 2);
+    for row in rows {
+        packed.push(row.ancestors);
+        packed.push((u32::from(row.depth) << 16) | u32::from(row.parent));
+    }
+    MxArray::from_uint32(&packed, &[rows.len() as i64, 2])
+}
+
 /// Returns true when the G=3, D=128 Inkling2 in-place MPP prefill pipelines build on this GPU.
 pub fn inkling2_paged_prefill_mpp_supported() -> bool {
     // SAFETY: nullary FFI query that catches internally.
@@ -25,12 +59,12 @@ pub fn inkling2_paged_prefill_mpp_supported() -> bool {
 }
 
 /// Inkling-2-Mini varlen relative-bias + LSE paged attention (head_size = 128) with optional
-/// on-the-fly `r_for_rel @ rel_bias_w^T` (`rel_bias_w = Some([rel_extent, 16] F32)` and
-/// `rel_bias = Some(r_for_rel [T, H, 16] F32)`) and optional fused gate+sink epilogue.
+/// on-the-fly `r_for_rel @ rel_bias_w^T`, optional fused gate+sink epilogue, optional speculative
+/// verify `tree_rows` (`[T, 2]` `UInt32`), and optional precomputed `live_blocks` count.
 ///
 /// When `want_lse == false`, skips LSE buffer allocation and DRAM write (returns `None`).
 #[allow(clippy::too_many_arguments)]
-pub fn inkling2_paged_attention_ex(
+pub fn inkling2_paged_attention_ex_tree(
     q: &MxArray,
     k_pool: &MxArray,
     v_pool: &MxArray,
@@ -52,6 +86,8 @@ pub fn inkling2_paged_attention_ex(
     head_size: i32,
     kv_dtype: Inkling2KvDtype,
     score_scales: Option<&MxArray>,
+    tree_rows: Option<&MxArray>,
+    live_blocks: Option<i32>,
 ) -> Result<(MxArray, Option<MxArray>)> {
     let (gate_ptr, sink_ptr) = match gate_sink {
         Some((g, s)) => (g.as_raw_ptr(), s.as_raw_ptr()),
@@ -88,6 +124,8 @@ pub fn inkling2_paged_attention_ex(
             head_size,
             kv_dtype as u8,
             score_scales.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            live_blocks.unwrap_or(-1),
             &mut out_attn,
             out_lse_ptr,
         )
@@ -107,6 +145,62 @@ pub fn inkling2_paged_attention_ex(
         None
     };
     Ok((attn, lse))
+}
+
+/// Inkling-2-Mini varlen relative-bias + LSE paged attention (head_size = 128) with optional
+/// on-the-fly `r_for_rel @ rel_bias_w^T` (`rel_bias_w = Some([rel_extent, 16] F32)` and
+/// `rel_bias = Some(r_for_rel [T, H, 16] F32)`) and optional fused gate+sink epilogue.
+///
+/// When `want_lse == false`, skips LSE buffer allocation and DRAM write (returns `None`).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_paged_attention_ex(
+    q: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    block_table: &MxArray,
+    seq_lens: &MxArray,
+    cu_seqlens_q: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    rel_bias: Option<&MxArray>,
+    rel_bias_w: Option<&MxArray>,
+    gate_sink: Option<(&MxArray, &MxArray)>,
+    want_lse: bool,
+    scale: f32,
+    sliding_window: i32,
+    rel_extent: i32,
+    block_size: i32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_size: i32,
+    kv_dtype: Inkling2KvDtype,
+    score_scales: Option<&MxArray>,
+) -> Result<(MxArray, Option<MxArray>)> {
+    inkling2_paged_attention_ex_tree(
+        q,
+        k_pool,
+        v_pool,
+        block_table,
+        seq_lens,
+        cu_seqlens_q,
+        k_scale,
+        v_scale,
+        rel_bias,
+        rel_bias_w,
+        gate_sink,
+        want_lse,
+        scale,
+        sliding_window,
+        rel_extent,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        kv_dtype,
+        score_scales,
+        None,
+        None,
+    )
 }
 
 /// Inkling-2-Mini varlen relative-bias + natural-log LSE paged attention (head_size = 128).
@@ -165,9 +259,11 @@ pub fn inkling2_paged_attention(
 }
 
 /// Inkling-2-Mini in-place MPP paged prefill / verify attention (G=3, D=128) with optional
-/// on-the-fly `r_for_rel @ rel_bias_w^T`, optional fused gate+sink epilogue, and optional LSE.
+/// on-the-fly `r_for_rel @ rel_bias_w^T`, optional fused gate+sink epilogue, optional LSE,
+/// optional speculative verify `tree_rows` (`[T, 2]` `UInt32`), and optional precomputed
+/// `live_blocks` count.
 #[allow(clippy::too_many_arguments)]
-pub fn inkling2_paged_prefill_attention_ex(
+pub fn inkling2_paged_prefill_attention_ex_tree(
     q: &MxArray,
     k_pool: &MxArray,
     v_pool: &MxArray,
@@ -191,6 +287,8 @@ pub fn inkling2_paged_prefill_attention_ex(
     kv_dtype: Inkling2KvDtype,
     int8_queries: bool,
     scale: f32,
+    tree_rows: Option<&MxArray>,
+    live_blocks: Option<i32>,
 ) -> Result<(MxArray, Option<MxArray>, MxArray)> {
     let (gate_ptr, sink_ptr) = match gate_sink {
         Some((g, s)) => (g.as_raw_ptr(), s.as_raw_ptr()),
@@ -230,6 +328,8 @@ pub fn inkling2_paged_prefill_attention_ex(
             kv_dtype as u8,
             int8_queries,
             scale,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            live_blocks.unwrap_or(-1),
             &mut out_attn,
             out_lse_ptr,
             &mut out_ws,
@@ -248,6 +348,63 @@ pub fn inkling2_paged_prefill_attention_ex(
     };
     let ws = MxArray::from_handle(out_ws, "inkling2_paged_prefill.workspace")?;
     Ok((attn, lse, ws))
+}
+
+/// Inkling-2-Mini in-place MPP paged prefill / verify attention (G=3, D=128) with optional
+/// on-the-fly `r_for_rel @ rel_bias_w^T`, optional fused gate+sink epilogue, and optional LSE.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_paged_prefill_attention_ex(
+    q: &MxArray,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    block_table: &MxArray,
+    workspace: &MxArray,
+    rel_bias: Option<&MxArray>,
+    rel_bias_w: Option<&MxArray>,
+    gate_sink: Option<(&MxArray, &MxArray)>,
+    want_lse: bool,
+    committed_tokens: i32,
+    splits: i32,
+    max_splits: i32,
+    block_size: i32,
+    num_q_heads: i32,
+    num_kv_heads: i32,
+    head_size: i32,
+    sliding_window: i32,
+    rel_extent: i32,
+    kv_dtype: Inkling2KvDtype,
+    int8_queries: bool,
+    scale: f32,
+) -> Result<(MxArray, Option<MxArray>, MxArray)> {
+    inkling2_paged_prefill_attention_ex_tree(
+        q,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        block_table,
+        workspace,
+        rel_bias,
+        rel_bias_w,
+        gate_sink,
+        want_lse,
+        committed_tokens,
+        splits,
+        max_splits,
+        block_size,
+        num_q_heads,
+        num_kv_heads,
+        head_size,
+        sliding_window,
+        rel_extent,
+        kv_dtype,
+        int8_queries,
+        scale,
+        None,
+        None,
+    )
 }
 
 /// Inkling-2-Mini in-place MPP paged prefill / verify attention (G=3, D=128) with SWA page skip,
@@ -388,23 +545,25 @@ pub fn inkling2_loop_blend_rms_norm(
     MxArray::from_handle(ptr, "inkling2_loop_blend_rms_norm")
 }
 
-/// Fused Inkling2 causal k=4 ShortConv (static when `dyn_taps` is `None`, dynamic global when `Some`).
-/// Returns `(y [T, C], updated_history [3, C])`.
-pub fn inkling2_sconv_k4(
+/// Fused Inkling2 causal k=4 ShortConv (static when `dyn_taps` is `None`, dynamic global when `Some`,
+/// tree-causal when `tree_rows` is `Some`). Returns `(y [T, C], updated_history [3, C])`.
+pub fn inkling2_sconv_k4_tree(
     x: &MxArray,
     weight: &MxArray,
     history_in: &MxArray,
     dyn_taps: Option<&MxArray>,
+    tree_rows: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
     let mut out_y = std::ptr::null_mut();
     let mut out_hist = std::ptr::null_mut();
-    // SAFETY: all input pointers are live; `dyn_taps` may be null.
+    // SAFETY: all input pointers are live; optional pointers may be null.
     let ok = unsafe {
         mlx_sys::mlx_inkling2_sconv_k4(
             x.as_raw_ptr(),
             weight.as_raw_ptr(),
             history_in.as_raw_ptr(),
             dyn_taps.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             &mut out_y,
             &mut out_hist,
         )
@@ -415,6 +574,17 @@ pub fn inkling2_sconv_k4(
     let y = MxArray::from_handle(out_y, "inkling2_sconv_k4.y")?;
     let hist = MxArray::from_handle(out_hist, "inkling2_sconv_k4.history")?;
     Ok((y, hist))
+}
+
+/// Fused Inkling2 causal k=4 ShortConv (static when `dyn_taps` is `None`, dynamic global when `Some`).
+/// Returns `(y [T, C], updated_history [3, C])`.
+pub fn inkling2_sconv_k4(
+    x: &MxArray,
+    weight: &MxArray,
+    history_in: &MxArray,
+    dyn_taps: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    inkling2_sconv_k4_tree(x, weight, history_in, dyn_taps, None)
 }
 
 /// Fused Inkling2 strided Q & R L2-clip + optional global `tau` -> `(Q [T, H, D], R [T, H, d_rel] F32)`.
@@ -473,13 +643,10 @@ pub fn inkling2_qr_clip(
     Ok((q, r))
 }
 
-/// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm.
-///
-/// Supports 1..=4 unstacked `[3, kv_dim]` histories per stream (zero `stack` overhead!) or
-/// packed `[N, 3, kv_dim]` histories when `packed_hist == true`.
-/// Returns `(k_cur [T, H_kv, head_dim], v_cur [T, H_kv, head_dim], k_hist_out, v_hist_out)`.
+/// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm
+/// with optional speculative verify `tree_rows` (`[T, 2]` `UInt32`).
 #[allow(clippy::too_many_arguments)]
-pub fn inkling2_sconv_k4_kv_prep(
+pub fn inkling2_sconv_k4_kv_prep_tree(
     k_in: &MxArray,
     v_in: &MxArray,
     k_weight: &MxArray,
@@ -496,6 +663,7 @@ pub fn inkling2_sconv_k4_kv_prep(
     qk_thresh: f32,
     v_eps: f32,
     l2_eps: f32,
+    tree_rows: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
     let expected_h = if packed_hist { 1 } else { num_seqs };
     if num_seqs == 0 || k_hists.len() != expected_h || v_hists.len() != expected_h {
@@ -528,6 +696,7 @@ pub fn inkling2_sconv_k4_kv_prep(
             qk_thresh,
             v_eps,
             l2_eps,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             &mut out_k,
             &mut out_v,
             &mut out_kh,
@@ -545,14 +714,58 @@ pub fn inkling2_sconv_k4_kv_prep(
     ))
 }
 
+/// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm.
+///
+/// Supports 1..=4 unstacked `[3, kv_dim]` histories per stream (zero `stack` overhead!) or
+/// packed `[N, 3, kv_dim]` histories when `packed_hist == true`.
+/// Returns `(k_cur [T, H_kv, head_dim], v_cur [T, H_kv, head_dim], k_hist_out, v_hist_out)`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_sconv_k4_kv_prep(
+    k_in: &MxArray,
+    v_in: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    k_hists: &[&MxArray],
+    v_hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+    num_kv_heads: usize,
+    head_dim: usize,
+    qk_thresh: f32,
+    v_eps: f32,
+    l2_eps: f32,
+) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+    inkling2_sconv_k4_kv_prep_tree(
+        k_in,
+        v_in,
+        k_weight,
+        v_weight,
+        dyn_k,
+        dyn_v,
+        cu_seqlens,
+        k_hists,
+        v_hists,
+        num_seqs,
+        packed_hist,
+        num_kv_heads,
+        head_dim,
+        qk_thresh,
+        v_eps,
+        l2_eps,
+        None,
+    )
+}
+
 /// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm +
-/// in-place PagedKVWrite (INT8-KTM & BF16), writing directly into the paged Metal KV pools
-/// with ZERO intermediate `[T, H_kv, head_dim]` DRAM roundtrip.
+/// in-place PagedKVWrite (INT8-KTM & BF16) with optional speculative verify `tree_rows`.
 ///
 /// `kv_mode`: `0` = INT8-KTM, `1` = BF16 vLLM (x=8), `2` = BF16 values_token_major.
 /// Returns `(k_pool', v_pool', k_scale', v_scale', k_hist_out, v_hist_out)`.
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
-pub fn inkling2_sconv_k4_kv_prep_paged(
+pub fn inkling2_sconv_k4_kv_prep_paged_tree(
     k_in: &MxArray,
     v_in: &MxArray,
     k_weight: &MxArray,
@@ -576,6 +789,7 @@ pub fn inkling2_sconv_k4_kv_prep_paged(
     qk_thresh: f32,
     v_eps: f32,
     l2_eps: f32,
+    tree_rows: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray, MxArray)> {
     let expected_h = if packed_hist { 1 } else { num_seqs };
     if num_seqs == 0 || k_hists.len() != expected_h || v_hists.len() != expected_h {
@@ -617,6 +831,7 @@ pub fn inkling2_sconv_k4_kv_prep_paged(
             qk_thresh,
             v_eps,
             l2_eps,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             &mut out_kp,
             &mut out_vp,
             &mut out_ks,
@@ -637,6 +852,249 @@ pub fn inkling2_sconv_k4_kv_prep_paged(
         MxArray::from_handle(out_vs, "inkling2_sconv_k4_kv_prep_paged.v_scale")?,
         MxArray::from_handle(out_kh, "inkling2_sconv_k4_kv_prep_paged.k_hist")?,
         MxArray::from_handle(out_vh, "inkling2_sconv_k4_kv_prep_paged.v_hist")?,
+    ))
+}
+
+/// 40-core parallel fusion: `inkling2_qr_clip` (`num_q_heads` warps/tok) +
+/// `inkling2_sconv_k4_kv_prep_paged` (`2 * num_kv_heads` warps/tok) in ONE single Metal
+/// dispatch & ONE MLX graph op (`40` TGs at `M=1` = 100% M5 Max core occupancy!).
+///
+/// Returns `(q_out, r_out, k_pool', v_pool', k_scale', v_scale', k_hist_out, v_hist_out)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn inkling2_qr_clip_sconv_k4_kv_prep_paged_tree(
+    q_in: &MxArray,
+    r_in: &MxArray,
+    q_clip: &MxArray,
+    rel_clip: &MxArray,
+    tau: Option<&MxArray>,
+    k_in: &MxArray,
+    v_in: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    k_hists: &[&MxArray],
+    v_hists: &[&MxArray],
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    slot_mapping: &MxArray,
+    num_seqs: usize,
+    packed_hist: bool,
+    num_q_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    d_rel: usize,
+    block_size: usize,
+    kv_mode: u32,
+    qk_thresh: f32,
+    rel_thresh: f32,
+    v_eps: f32,
+    l2_eps: f32,
+    r_round_bf16: bool,
+    tree_rows: Option<&MxArray>,
+) -> Result<(
+    MxArray,
+    MxArray,
+    MxArray,
+    MxArray,
+    MxArray,
+    MxArray,
+    MxArray,
+    MxArray,
+)> {
+    let expected_h = if packed_hist { 1 } else { num_seqs };
+    if num_seqs == 0 || k_hists.len() != expected_h || v_hists.len() != expected_h {
+        return Err(Error::from_reason(
+            "inkling2_qr_clip_sconv_k4_kv_prep_paged_tree: history slice count mismatch",
+        ));
+    }
+    let k_ptrs: Vec<*mut mlx_sys::mlx_array> = k_hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let v_ptrs: Vec<*mut mlx_sys::mlx_array> = v_hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let mut out_q = std::ptr::null_mut();
+    let mut out_r = std::ptr::null_mut();
+    let mut out_kp = std::ptr::null_mut();
+    let mut out_vp = std::ptr::null_mut();
+    let mut out_ks = std::ptr::null_mut();
+    let mut out_vs = std::ptr::null_mut();
+    let mut out_kh = std::ptr::null_mut();
+    let mut out_vh = std::ptr::null_mut();
+    // SAFETY: all input pointers live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_qr_clip_sconv_k4_kv_prep_paged(
+            q_in.as_raw_ptr(),
+            r_in.as_raw_ptr(),
+            q_clip.as_raw_ptr(),
+            rel_clip.as_raw_ptr(),
+            tau.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            k_in.as_raw_ptr(),
+            v_in.as_raw_ptr(),
+            k_weight.as_raw_ptr(),
+            v_weight.as_raw_ptr(),
+            dyn_k.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            dyn_v.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            cu_seqlens.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            k_ptrs.as_ptr(),
+            v_ptrs.as_ptr(),
+            k_pool.as_raw_ptr(),
+            v_pool.as_raw_ptr(),
+            k_scale.as_raw_ptr(),
+            v_scale.as_raw_ptr(),
+            slot_mapping.as_raw_ptr(),
+            num_seqs as u32,
+            packed_hist,
+            num_q_heads as u32,
+            num_kv_heads as u32,
+            head_dim as u32,
+            d_rel as u32,
+            block_size as u32,
+            kv_mode,
+            qk_thresh,
+            rel_thresh,
+            v_eps,
+            l2_eps,
+            r_round_bf16,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            &mut out_q,
+            &mut out_r,
+            &mut out_kp,
+            &mut out_vp,
+            &mut out_ks,
+            &mut out_vs,
+            &mut out_kh,
+            &mut out_vh,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_qr_clip_sconv_k4_kv_prep_paged failed",
+        ));
+    }
+    Ok((
+        MxArray::from_handle(out_q, "inkling2_qr_clip_sconv_k4_kv_prep_paged.q")?,
+        MxArray::from_handle(out_r, "inkling2_qr_clip_sconv_k4_kv_prep_paged.r")?,
+        MxArray::from_handle(out_kp, "inkling2_qr_clip_sconv_k4_kv_prep_paged.k_pool")?,
+        MxArray::from_handle(out_vp, "inkling2_qr_clip_sconv_k4_kv_prep_paged.v_pool")?,
+        MxArray::from_handle(out_ks, "inkling2_qr_clip_sconv_k4_kv_prep_paged.k_scale")?,
+        MxArray::from_handle(out_vs, "inkling2_qr_clip_sconv_k4_kv_prep_paged.v_scale")?,
+        MxArray::from_handle(out_kh, "inkling2_qr_clip_sconv_k4_kv_prep_paged.k_hist")?,
+        MxArray::from_handle(out_vh, "inkling2_qr_clip_sconv_k4_kv_prep_paged.v_hist")?,
+    ))
+}
+
+/// Fused Inkling2 single/ragged static/dynamic k=4 K+V ShortConv + K L2-clip + V RMSNorm +
+/// in-place PagedKVWrite (INT8-KTM & BF16), writing directly into the paged Metal KV pools
+/// with ZERO intermediate `[T, H_kv, head_dim]` DRAM roundtrip.
+///
+/// `kv_mode`: `0` = INT8-KTM, `1` = BF16 vLLM (x=8), `2` = BF16 values_token_major.
+/// Returns `(k_pool', v_pool', k_scale', v_scale', k_hist_out, v_hist_out)`.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn inkling2_sconv_k4_kv_prep_paged(
+    k_in: &MxArray,
+    v_in: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    k_hists: &[&MxArray],
+    v_hists: &[&MxArray],
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    slot_mapping: &MxArray,
+    num_seqs: usize,
+    packed_hist: bool,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_mode: u32,
+    qk_thresh: f32,
+    v_eps: f32,
+    l2_eps: f32,
+) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray, MxArray)> {
+    inkling2_sconv_k4_kv_prep_paged_tree(
+        k_in,
+        v_in,
+        k_weight,
+        v_weight,
+        dyn_k,
+        dyn_v,
+        cu_seqlens,
+        k_hists,
+        v_hists,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        num_seqs,
+        packed_hist,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        kv_mode,
+        qk_thresh,
+        v_eps,
+        l2_eps,
+        None,
+    )
+}
+
+/// In-place paged KV slot compaction for speculative tree path commit
+/// (`src_slots[i] -> dst_slots[i]` sequentially in ascending order across all 3 KV modes).
+///
+/// `kv_mode`: `0` = INT8-KTM, `1` = BF16 vLLM (x=8), `2` = BF16 values_token_major.
+/// Returns `(k_pool', v_pool', k_scale', v_scale')`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_paged_kv_path_commit(
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    src_slots: &MxArray,
+    dst_slots: &MxArray,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_mode: u32,
+) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+    let mut out_kp = std::ptr::null_mut();
+    let mut out_vp = std::ptr::null_mut();
+    let mut out_ks = std::ptr::null_mut();
+    let mut out_vs = std::ptr::null_mut();
+    // SAFETY: all input handles remain live for the duration of the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_paged_kv_path_commit(
+            k_pool.as_raw_ptr(),
+            v_pool.as_raw_ptr(),
+            k_scale.as_raw_ptr(),
+            v_scale.as_raw_ptr(),
+            src_slots.as_raw_ptr(),
+            dst_slots.as_raw_ptr(),
+            num_kv_heads as u32,
+            head_dim as u32,
+            block_size as u32,
+            kv_mode,
+            &mut out_kp,
+            &mut out_vp,
+            &mut out_ks,
+            &mut out_vs,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_paged_kv_path_commit failed",
+        ));
+    }
+    Ok((
+        MxArray::from_handle(out_kp, "inkling2_paged_kv_path_commit.k_pool")?,
+        MxArray::from_handle(out_vp, "inkling2_paged_kv_path_commit.v_pool")?,
+        MxArray::from_handle(out_ks, "inkling2_paged_kv_path_commit.k_scale")?,
+        MxArray::from_handle(out_vs, "inkling2_paged_kv_path_commit.v_scale")?,
     ))
 }
 
@@ -779,10 +1237,185 @@ pub fn inkling2_loop_ctrl_up_blend_norm(
     MxArray::from_handle(ptr, "inkling2_loop_ctrl_up_blend_norm")
 }
 
-/// Fused Inkling2 multi-sequence ragged causal k=4 ShortConv with optional FP32 residual epilogue
-/// (`res_a` + optional `res_b` + `conv_out`).
+/// End-to-end fused single-stream LoopController (`down + up_blend + rms_norm_from_sq`) in 1 MLX
+/// primitive with persistent per-stream scratch (zero per-call intermediate allocations, 0-ULP
+/// bit-exact to `inkling2_loop_ctrl_down` + `inkling2_loop_ctrl_up_blend_norm`).
 #[allow(clippy::too_many_arguments)]
-pub fn inkling2_sconv_k4_ragged(
+pub fn inkling2_loop_ctrl_fused_single(
+    dest: &MxArray,
+    msg: &MxArray,
+    down_w: &MxArray,
+    gain_forget_w: &MxArray,
+    norm_weight: &MxArray,
+    attn_res_eps: f32,
+    norm_eps: f32,
+    out_dtype: DType,
+) -> Result<MxArray> {
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_loop_ctrl_fused_single: unsupported out_dtype {other:?}"
+            )));
+        }
+    };
+    let mut out_0 = std::ptr::null_mut();
+    // SAFETY: all input handles are live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_loop_ctrl_fused(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            down_w.as_raw_ptr(),
+            gain_forget_w.as_raw_ptr(),
+            norm_weight.as_raw_ptr(),
+            attn_res_eps,
+            norm_eps,
+            output_f32,
+            false,
+            &mut out_0,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_loop_ctrl_fused (single) failed",
+        ));
+    }
+    MxArray::from_handle(out_0, "inkling2_loop_ctrl_fused.out0")
+}
+
+/// End-to-end fused 3-stream Q/K/V LoopController (`down + up_blend + rms_norm_from_sq_split3`)
+/// in 1 MLX primitive returning 3 direct contiguous `[T, D]` outputs `(x_q, x_k, x_v)` with ZERO
+/// slice/squeeze view nodes and persistent per-stream scratch.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_loop_ctrl_fused_qkv(
+    dest: &MxArray,
+    msg: &MxArray,
+    down_w: &MxArray,
+    gain_forget_w: &MxArray,
+    norm_weight: &MxArray,
+    attn_res_eps: f32,
+    norm_eps: f32,
+    out_dtype: DType,
+) -> Result<(MxArray, MxArray, MxArray)> {
+    let output_f32 = match out_dtype {
+        DType::Float32 => true,
+        DType::BFloat16 => false,
+        other => {
+            return Err(Error::from_reason(format!(
+                "inkling2_loop_ctrl_fused_qkv: unsupported out_dtype {other:?}"
+            )));
+        }
+    };
+    let mut out_0 = std::ptr::null_mut();
+    let mut out_1 = std::ptr::null_mut();
+    let mut out_2 = std::ptr::null_mut();
+    // SAFETY: all input handles are live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_loop_ctrl_fused(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            down_w.as_raw_ptr(),
+            gain_forget_w.as_raw_ptr(),
+            norm_weight.as_raw_ptr(),
+            attn_res_eps,
+            norm_eps,
+            output_f32,
+            true,
+            &mut out_0,
+            &mut out_1,
+            &mut out_2,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_loop_ctrl_fused (qkv) failed",
+        ));
+    }
+    let x_q = MxArray::from_handle(out_0, "inkling2_loop_ctrl_fused.q")?;
+    let x_k = MxArray::from_handle(out_1, "inkling2_loop_ctrl_fused.k")?;
+    let x_v = MxArray::from_handle(out_2, "inkling2_loop_ctrl_fused.v")?;
+    Ok((x_q, x_k, x_v))
+}
+
+/// Fused `o_proj` (Sym-Q8_0 when `scales.is_some()`, else BF16), static k=4 ragged ShortConv,
+/// optional FP32 residual epilogue, and optional pre-conv rollback tape in 1 MLX primitive.
+///
+/// Accepts `y` as either 2D `[T, K]` or 3D `[T, H, D]` BF16 (zero reshape op needed!).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_oproj_sconv_k4_ragged_tree(
+    y: &MxArray,
+    weight: &MxArray,
+    scales: Option<&MxArray>,
+    conv_weight: &MxArray,
+    cu_seqlens: Option<&MxArray>,
+    res_a: Option<&MxArray>,
+    hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+    tree_rows: Option<&MxArray>,
+    emit_tape: bool,
+) -> Result<(MxArray, MxArray, Option<MxArray>)> {
+    let expected_h = if packed_hist { 1 } else { num_seqs };
+    if num_seqs == 0 || hists.len() != expected_h {
+        return Err(Error::from_reason(
+            "inkling2_oproj_sconv_k4_ragged: history slice count mismatch",
+        ));
+    }
+    let num_seqs_u32 = u32::try_from(num_seqs).map_err(|_| {
+        Error::from_reason("inkling2_oproj_sconv_k4_ragged: num_seqs exceeds u32::MAX")
+    })?;
+    let h_ptrs: Vec<*mut mlx_sys::mlx_array> = hists.iter().map(|a| a.as_raw_ptr()).collect();
+    let mut out_y = std::ptr::null_mut();
+    let mut out_hist = std::ptr::null_mut();
+    let mut out_tape = std::ptr::null_mut();
+    let out_tape_ptr = if emit_tape {
+        &mut out_tape as *mut *mut mlx_sys::mlx_array
+    } else {
+        std::ptr::null_mut()
+    };
+    // SAFETY: all input handles are live through the FFI call.
+    let ok = unsafe {
+        mlx_sys::mlx_inkling2_oproj_sconv_k4_ragged(
+            y.as_raw_ptr(),
+            weight.as_raw_ptr(),
+            scales.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            conv_weight.as_raw_ptr(),
+            cu_seqlens.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            res_a.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            h_ptrs.as_ptr(),
+            num_seqs_u32,
+            packed_hist,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
+            &mut out_y,
+            &mut out_hist,
+            out_tape_ptr,
+        )
+    };
+    if !ok {
+        return Err(Error::from_reason(
+            "mlx_inkling2_oproj_sconv_k4_ragged failed",
+        ));
+    }
+    let y_out = MxArray::from_handle(out_y, "inkling2_oproj_sconv_k4_ragged.y")?;
+    let h_out = MxArray::from_handle(out_hist, "inkling2_oproj_sconv_k4_ragged.history")?;
+    let tape_out = if emit_tape {
+        Some(MxArray::from_handle(
+            out_tape,
+            "inkling2_oproj_sconv_k4_ragged.tape",
+        )?)
+    } else {
+        None
+    };
+    Ok((y_out, h_out, tape_out))
+}
+
+/// Fused Inkling2 multi-sequence ragged causal k=4 ShortConv with optional FP32 residual epilogue
+/// (`res_a` + optional `res_b` + `conv_out`) and optional speculative verify `tree_rows`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_sconv_k4_ragged_tree(
     x: &MxArray,
     weight: &MxArray,
     dyn_taps: Option<&MxArray>,
@@ -792,6 +1425,7 @@ pub fn inkling2_sconv_k4_ragged(
     hists: &[&MxArray],
     num_seqs: usize,
     packed_hist: bool,
+    tree_rows: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray)> {
     let expected_h = if packed_hist { 1 } else { num_seqs };
     if num_seqs == 0 || hists.len() != expected_h {
@@ -816,6 +1450,7 @@ pub fn inkling2_sconv_k4_ragged(
             h_ptrs.as_ptr(),
             num_seqs_u32,
             packed_hist,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             &mut out_y,
             &mut out_hist,
         )
@@ -826,6 +1461,34 @@ pub fn inkling2_sconv_k4_ragged(
     let y = MxArray::from_handle(out_y, "inkling2_sconv_k4_ragged.y")?;
     let h = MxArray::from_handle(out_hist, "inkling2_sconv_k4_ragged.history")?;
     Ok((y, h))
+}
+
+/// Fused Inkling2 multi-sequence ragged causal k=4 ShortConv with optional FP32 residual epilogue
+/// (`res_a` + optional `res_b` + `conv_out`).
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_sconv_k4_ragged(
+    x: &MxArray,
+    weight: &MxArray,
+    dyn_taps: Option<&MxArray>,
+    cu_seqlens: Option<&MxArray>,
+    res_a: Option<&MxArray>,
+    res_b: Option<&MxArray>,
+    hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+) -> Result<(MxArray, MxArray)> {
+    inkling2_sconv_k4_ragged_tree(
+        x,
+        weight,
+        dyn_taps,
+        cu_seqlens,
+        res_a,
+        res_b,
+        hists,
+        num_seqs,
+        packed_hist,
+        None,
+    )
 }
 
 /// Fused Inkling2 MoE router: `sigmoid(logits) + bias` -> exact top-K (`int32`) with smaller-index
@@ -1216,12 +1879,12 @@ pub fn inkling2_grouped_moe(
     MxArray::from_handle(ptr, "inkling2_grouped_moe")
 }
 
-/// End-to-end fused `1 <= T <= 32` Inkling2 MoE forward:
+/// End-to-end fused `1 <= T <= 32` Inkling2 MoE forward with optional speculative verify `tree_rows`:
 /// `route+group -> direct-gather gate_up+SiTU -> down -> combine+post_conv+residual (+ optional tape)`.
 ///
 /// Returns `(y [T, D] BF16, hist_out [3, D] or [N, 3, D] BF16, Option<tape_out [T, D] BF16>)`.
 #[allow(clippy::too_many_arguments)]
-pub fn inkling2_grouped_moe_fused(
+pub fn inkling2_grouped_moe_fused_tree(
     x: &MxArray,
     router_input: &MxArray,
     router_bias: Option<&MxArray>,
@@ -1248,6 +1911,7 @@ pub fn inkling2_grouped_moe_fused(
     round_bf16_before_situ: bool,
     emit_tape: bool,
     router_input_is_weight: bool,
+    tree_rows: Option<&MxArray>,
 ) -> Result<(MxArray, MxArray, Option<MxArray>)> {
     let expected_h = if packed_hist { 1 } else { num_seqs };
     if num_seqs == 0 || hists.len() != expected_h {
@@ -1327,6 +1991,7 @@ pub fn inkling2_grouped_moe_fused(
             round_bf16_before_situ,
             emit_tape,
             router_input_is_weight,
+            tree_rows.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr),
             &mut out_y,
             &mut out_hist,
             &mut out_tape,
@@ -1346,6 +2011,70 @@ pub fn inkling2_grouped_moe_fused(
         None
     };
     Ok((y, hist, tape))
+}
+
+/// End-to-end fused `1 <= T <= 32` Inkling2 MoE forward:
+/// `route+group -> direct-gather gate_up+SiTU -> down -> combine+post_conv+residual (+ optional tape)`.
+///
+/// Returns `(y [T, D] BF16, hist_out [3, D] or [N, 3, D] BF16, Option<tape_out [T, D] BF16>)`.
+#[allow(clippy::too_many_arguments)]
+pub fn inkling2_grouped_moe_fused(
+    x: &MxArray,
+    router_input: &MxArray,
+    router_bias: Option<&MxArray>,
+    down_outer_scale: Option<&MxArray>,
+    gu_w: &MxArray,
+    gu_s: &MxArray,
+    gu_aux: Option<&MxArray>,
+    dn_w: &MxArray,
+    dn_s: &MxArray,
+    dn_aux: Option<&MxArray>,
+    post_conv_w: &MxArray,
+    residual: Option<&MxArray>,
+    cu_seqlens: &[usize],
+    hists: &[&MxArray],
+    num_seqs: usize,
+    packed_hist: bool,
+    top_k: usize,
+    route_scale: f32,
+    gu_quant_mode: Inkling2MoeQuantMode,
+    dn_quant_mode: Inkling2MoeQuantMode,
+    interleaved_gate_up: bool,
+    gate_softcap: f32,
+    up_softcap: f32,
+    round_bf16_before_situ: bool,
+    emit_tape: bool,
+    router_input_is_weight: bool,
+) -> Result<(MxArray, MxArray, Option<MxArray>)> {
+    inkling2_grouped_moe_fused_tree(
+        x,
+        router_input,
+        router_bias,
+        down_outer_scale,
+        gu_w,
+        gu_s,
+        gu_aux,
+        dn_w,
+        dn_s,
+        dn_aux,
+        post_conv_w,
+        residual,
+        cu_seqlens,
+        hists,
+        num_seqs,
+        packed_hist,
+        top_k,
+        route_scale,
+        gu_quant_mode,
+        dn_quant_mode,
+        interleaved_gate_up,
+        gate_softcap,
+        up_softcap,
+        round_bf16_before_situ,
+        emit_tape,
+        router_input_is_weight,
+        None,
+    )
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -6716,5 +7445,274 @@ mod tests {
             y_2048_prefix.as_ref(),
             "Q8 prefix [0..960) diverged between M=960 and M=2048 chunks"
         );
+    }
+
+    #[test]
+    fn test_inkling2_paged_kv_path_commit_strided_and_lazy_bounds() {
+        if !metal_available() {
+            return;
+        }
+
+        let nb = 2usize;
+        let num_kv_heads = 2usize;
+        let block_size = 4usize;
+        let head_dim = 8usize;
+        let kv_mode = 2u32; // BF16 values_token_major: [nb, nkv, bs, hd]
+        let pool_capacity = (nb * block_size) as i64; // 8 slots (0..8)
+        let pool_shape = [
+            nb as i64,
+            num_kv_heads as i64,
+            block_size as i64,
+            head_dim as i64,
+        ];
+        let total_elems = nb * num_kv_heads * block_size * head_dim;
+
+        let make_pools = || -> (MxArray, MxArray, MxArray, Vec<f32>, Vec<f32>) {
+            let mut k_vals = vec![0.0_f32; total_elems];
+            let mut v_vals = vec![0.0_f32; total_elems];
+            for b in 0..nb {
+                for h in 0..num_kv_heads {
+                    for t in 0..block_size {
+                        let slot = b * block_size + t;
+                        for d in 0..head_dim {
+                            let idx = ((b * num_kv_heads + h) * block_size + t) * head_dim + d;
+                            // Small integers 1..=128 and -128..=-1 are exact in BF16.
+                            let val = (slot * 16 + h * 8 + d + 1) as f32;
+                            k_vals[idx] = val;
+                            v_vals[idx] = -val;
+                        }
+                    }
+                }
+            }
+            let k_pool = MxArray::from_float32(&k_vals, &pool_shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let v_pool = MxArray::from_float32(&v_vals, &pool_shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let dummy_scale = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+            k_pool.eval();
+            v_pool.eval();
+            dummy_scale.eval();
+            (k_pool, v_pool, dummy_scale, k_vals, v_vals)
+        };
+
+        let slot_slice = |buf: &[f32], slot: usize, h: usize| -> Vec<f32> {
+            let b = slot / block_size;
+            let t = slot % block_size;
+            let start = ((b * num_kv_heads + h) * block_size + t) * head_dim;
+            buf[start..start + head_dim].to_vec()
+        };
+
+        // (a) Evaluated strided 1D `dst_slots` view with stride 2 where backing[1] = 0 (in-range)
+        //     while logical[1] = backing[2] = pool_capacity + 5 (out-of-range) -> FFI returns false.
+        {
+            let (k_pool, v_pool, dummy_scale, _, _) = make_pools();
+            let src_slots = MxArray::from_int64(&[1, 3], &[2]).unwrap();
+            let dst_backing = MxArray::from_int64(&[0, 0, pool_capacity + 5, 0], &[2, 2]).unwrap();
+            let dst_strided = dst_backing
+                .slice(&[0, 0], &[2, 1])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            dst_strided.eval();
+            assert!(
+                dst_strided.is_available(),
+                "evaluated strided dst_slots must be host-available"
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(dst_strided.as_raw_ptr()) },
+                3,
+                "dst_strided must remain a stride-2 view over the backing buffer"
+            );
+
+            let mut out_kp = std::ptr::null_mut();
+            let mut out_vp = std::ptr::null_mut();
+            let mut out_ks = std::ptr::null_mut();
+            let mut out_vs = std::ptr::null_mut();
+            let ok = unsafe {
+                mlx_sys::mlx_inkling2_paged_kv_path_commit(
+                    k_pool.as_raw_ptr(),
+                    v_pool.as_raw_ptr(),
+                    dummy_scale.as_raw_ptr(),
+                    dummy_scale.as_raw_ptr(),
+                    src_slots.as_raw_ptr(),
+                    dst_strided.as_raw_ptr(),
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    kv_mode,
+                    &mut out_kp,
+                    &mut out_vp,
+                    &mut out_ks,
+                    &mut out_vs,
+                )
+            };
+            assert!(
+                !ok,
+                "FFI must reject strided dst_slots whose logical element exceeds pool capacity"
+            );
+            assert!(out_kp.is_null());
+            assert!(out_vp.is_null());
+            assert!(out_ks.is_null());
+            assert!(out_vs.is_null());
+        }
+
+        // (b) Lazy/unevaluated `dst_slots` and eager mixed valid + out-of-range batches are
+        //     rejected atomically (`ok == false`, null outputs), leaving both pools 100% untouched.
+        {
+            let assert_rejected_and_untouched =
+                |src_slots: &MxArray, dst_slots: &MxArray, label: &str| {
+                    let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+                    let mut out_kp = std::ptr::null_mut();
+                    let mut out_vp = std::ptr::null_mut();
+                    let mut out_ks = std::ptr::null_mut();
+                    let mut out_vs = std::ptr::null_mut();
+                    let ok = unsafe {
+                        mlx_sys::mlx_inkling2_paged_kv_path_commit(
+                            k_pool.as_raw_ptr(),
+                            v_pool.as_raw_ptr(),
+                            dummy_scale.as_raw_ptr(),
+                            dummy_scale.as_raw_ptr(),
+                            src_slots.as_raw_ptr(),
+                            dst_slots.as_raw_ptr(),
+                            num_kv_heads as u32,
+                            head_dim as u32,
+                            block_size as u32,
+                            kv_mode,
+                            &mut out_kp,
+                            &mut out_vp,
+                            &mut out_ks,
+                            &mut out_vs,
+                        )
+                    };
+                    assert!(!ok, "{label}: FFI must reject commit");
+                    assert!(out_kp.is_null(), "{label}: out_kp must be null");
+                    assert!(out_vp.is_null(), "{label}: out_vp must be null");
+                    assert!(out_ks.is_null(), "{label}: out_ks must be null");
+                    assert!(out_vs.is_null(), "{label}: out_vs must be null");
+
+                    let got_k = k_pool.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    let got_v = v_pool.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    for slot in 0..(nb * block_size) {
+                        for h in 0..num_kv_heads {
+                            assert_eq!(
+                                slot_slice(got_k.as_ref(), slot, h),
+                                slot_slice(&orig_k, slot, h),
+                                "{label}: k_pool mutated at slot={slot}, h={h}"
+                            );
+                            assert_eq!(
+                                slot_slice(got_v.as_ref(), slot, h),
+                                slot_slice(&orig_v, slot, h),
+                                "{label}: v_pool mutated at slot={slot}, h={h}"
+                            );
+                        }
+                    }
+                };
+
+            // (b1) Lazy GPU-produced `dst_slots` (mixed valid + OOB).
+            let src_slots = MxArray::from_int64(&[6, 5], &[2]).unwrap();
+            let dst_base = MxArray::from_int64(&[2, pool_capacity + 3], &[2]).unwrap();
+            let dst_zero = MxArray::from_int64(&[0, 0], &[2]).unwrap();
+            let dst_lazy = dst_base.add(&dst_zero).unwrap();
+            assert!(
+                !dst_lazy.is_available(),
+                "lazy GPU-produced dst_slots must not be available before eval"
+            );
+            assert_rejected_and_untouched(&src_slots, &dst_lazy, "lazy mixed dst_slots");
+
+            // (b2) Eager mixed valid + OOB `dst_slots`: src=[6, 5], dst=[2, pool_capacity + 3].
+            let src_eager_1 = MxArray::from_int64(&[6, 5], &[2]).unwrap();
+            let dst_eager_1 = MxArray::from_int64(&[2, pool_capacity + 3], &[2]).unwrap();
+            assert!(src_eager_1.is_available());
+            assert!(dst_eager_1.is_available());
+            assert_rejected_and_untouched(
+                &src_eager_1,
+                &dst_eager_1,
+                "eager mixed valid + OOB dst_slots",
+            );
+
+            // (b3) Eager mixed OOB `src_slots` + valid entry: src=[pool_capacity + 1, 5], dst=[2, 3].
+            let src_eager_2 = MxArray::from_int64(&[pool_capacity + 1, 5], &[2]).unwrap();
+            let dst_eager_2 = MxArray::from_int64(&[2, 3], &[2]).unwrap();
+            assert!(src_eager_2.is_available());
+            assert!(dst_eager_2.is_available());
+            assert_rejected_and_untouched(
+                &src_eager_2,
+                &dst_eager_2,
+                "eager mixed OOB src_slots + valid",
+            );
+        }
+
+        // (c) Valid strided 1D `src_slots`/`dst_slots` views (with OOB poison values in the
+        //     skipped stride-2 gaps, covering both zero and non-zero view offsets) -> copies
+        //     exact logical strided slots into their destinations.
+        {
+            let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+            let src_backing = MxArray::from_int64(&[7, 999, 5, 888], &[2, 2]).unwrap();
+            let src_strided = src_backing
+                .slice(&[0, 0], &[2, 1])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            src_strided.eval();
+
+            let dst_backing = MxArray::from_int64(&[777, 1, 666, 3], &[2, 2]).unwrap();
+            let dst_strided = dst_backing
+                .slice(&[0, 1], &[2, 2])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            dst_strided.eval();
+
+            assert!(src_strided.is_available());
+            assert!(dst_strided.is_available());
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(src_strided.as_raw_ptr()) },
+                3
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(dst_strided.as_raw_ptr()) },
+                3
+            );
+
+            let (kp_out, vp_out, _, _) = inkling2_paged_kv_path_commit(
+                &k_pool,
+                &v_pool,
+                &dummy_scale,
+                &dummy_scale,
+                &src_strided,
+                &dst_strided,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                kv_mode,
+            )
+            .unwrap();
+            let got_k = kp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let got_v = vp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+
+            for slot in 0..(nb * block_size) {
+                let expected_src = match slot {
+                    1 => 7,
+                    3 => 5,
+                    _ => slot,
+                };
+                for h in 0..num_kv_heads {
+                    assert_eq!(
+                        slot_slice(got_k.as_ref(), slot, h),
+                        slot_slice(&orig_k, expected_src, h),
+                        "strided valid test k_pool mismatch at slot={slot}, h={h}"
+                    );
+                    assert_eq!(
+                        slot_slice(got_v.as_ref(), slot, h),
+                        slot_slice(&orig_v, expected_src, h),
+                        "strided valid test v_pool mismatch at slot={slot}, h={h}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -31,6 +31,10 @@ fn checkpoint_inventory_config() -> DFlash2Config {
         selector_rank: 8,
         selector_top_k: 4,
         rope_theta: 10_000.0,
+        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
     }
 }
 
@@ -365,6 +369,8 @@ fn test_selector(vocab: usize, top_k: usize, rank: usize, hidden: usize) -> Cand
         top_k,
         rank,
         vocab_size: vocab,
+        active_vocab_size: vocab,
+        final_logit_softcapping: None,
     }
 }
 
@@ -409,6 +415,7 @@ fn selector_fp32_edges_hook_widens_native_bf16_unary() {
                 predecessor.as_raw_ptr(),
                 successor.as_raw_ptr(),
                 anchor.as_raw_ptr(),
+                0.0,
             )
         },
         "test selector FP32 edges",
@@ -1087,6 +1094,10 @@ fn record_only_advances_context_without_kv() {
         selector_rank: 4,
         selector_top_k: 4,
         rope_theta: 10_000.0,
+        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     let mut context = DFlash2ContextCache::new(&config);
     context.record_only(&[10, 11, 12]).unwrap();
@@ -1498,6 +1509,10 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         selector_rank: 8,
         selector_top_k: 4,
         rope_theta: 10_000_000.0,
+        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     let execution_policy = super::DraftExecutionPolicy::capture();
     super::DFlash2Model {
@@ -1537,6 +1552,7 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         config,
         weight_bytes: 0,
         context_kv: None,
+        mask_embedding: None,
         compiled: super::CompiledDraft::default(),
     }
 }

@@ -1,12 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::{Error, Result};
 
-use crate::array::memory::{materialize_weights, synchronize_and_clear_cache};
+use crate::array::memory::{WeightsResident, materialize_weights, synchronize_and_clear_cache};
 use crate::array::{DType, MxArray};
 use crate::cache_limit;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
@@ -35,6 +35,7 @@ use crate::utils::gguf_import::PreloadInput;
 use super::attention::Inkling2Attention;
 use super::attn_res::{LoopController, LoopLayerControllers};
 use super::config::{Inkling2Config, Inkling2VisionConfig};
+use super::dflash2::{discover_inkling2_dflash2_candidates, is_dflash2_dir};
 use super::dspark::{Inkling2DsparkModel, resolve_inkling2_dspark_candidates};
 use super::kv_cache::{Inkling2KVCacheCoordinator, Inkling2PagedConfig};
 use super::memory::{
@@ -51,6 +52,7 @@ use super::scheduled_dspark::Inkling2ScheduledDsparkStates;
 use super::scheduler::Inkling2SchedulerState;
 use super::state_disk::compute_persistent_identity;
 use super::vision::{Inkling2VisionBlock, Inkling2VisionEncoder};
+use crate::models::qwen3_5::dflash2::{DFlash2TargetShape, load_dflash2, read_dflash2_config};
 
 const FAMILY_NAME: &str = "inkling2";
 
@@ -124,8 +126,8 @@ pub(crate) async fn load_model_with_options(
     options: Inkling2LoadOptions,
 ) -> Result<Inkling2Model> {
     let explicit_draft_path = options.draft_model_path.clone();
+    let auto_draft_path = options.auto_draft_model_path.clone();
     let auto_load_draft = options.auto_load_draft.unwrap_or(true);
-    let draft_is_explicit = explicit_draft_path.is_some();
     let disk_options = options.disk_tier("Inkling2")?;
     let kv_format = resolve_kv_format("Inkling2", options.kv_format.as_deref())?;
     let activations = resolve_activations("Inkling2", options.activations.as_deref())?;
@@ -154,18 +156,6 @@ pub(crate) async fn load_model_with_options(
             (Some(checkpoint.preload_input(true)), companion_meta, true)
         }
     };
-    let draft_candidates = if draft_is_explicit {
-        resolve_inkling2_dspark_candidates(
-            &source_dir,
-            &asset_dir,
-            is_gguf,
-            explicit_draft_path.as_deref(),
-        )?
-    } else if auto_load_draft {
-        resolve_inkling2_dspark_candidates(&source_dir, &asset_dir, is_gguf, None)?
-    } else {
-        Vec::new()
-    };
 
     struct InitMeta {
         model_id: u64,
@@ -191,56 +181,32 @@ pub(crate) async fn load_model_with_options(
             let mut load_guard =
                 CheckpointLoadGuard::before_read(ckpt_files, disk_options.reads_identity());
 
-            // 1. Load & materialize backbone + optional DSpark drafter weights.
+            // 1. Load & materialize target backbone weights first so an OOM while
+            //    materializing an auto-discovered draft cannot abort startup.
             let mut inner = load_weights_sync(
                 &asset_dir,
                 preload_input,
                 gguf_vision_meta.as_ref(),
                 is_gguf,
             )?;
-            if !draft_candidates.is_empty() {
-                let mut last_err: Option<Error> = None;
-                for draft_path in &draft_candidates {
-                    let t_draft = std::time::Instant::now();
-                    match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head)
-                    {
-                        Ok(draft) => {
-                            tracing::info!(
-                                "Inkling2 DSpark loaded from {} in {:.2}s (layers={}, block_size={}, markov_rank={}, taps={:?}, weights={:.1} MiB)",
-                                draft_path.display(),
-                                t_draft.elapsed().as_secs_f64(),
-                                draft.config.num_hidden_layers,
-                                draft.config.block_size,
-                                draft.config.markov_rank,
-                                draft.config.target_layer_ids,
-                                draft.weight_bytes() as f64 / (1024.0 * 1024.0),
-                            );
-                            inner.dspark = Some(draft);
-                            last_err = None;
-                            break;
-                        }
-                        Err(err) => {
-                            tracing::warn!(
-                                "Skipping Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
-                                draft_path.display()
-                            );
-                            last_err = Some(err);
-                        }
-                    }
-                }
-                if draft_is_explicit
-                    && inner.dspark.is_none()
-                    && let Some(err) = last_err
-                {
-                    return Err(err);
-                }
-            }
-            load_guard.record_read();
-            let weight_arrays = inner.weight_arrays();
-            let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-            let resident = materialize_weights(&weight_refs)?;
-            let weight_bytes = inner.weight_bytes();
+            let mut resident = {
+                let weight_arrays = inner.weight_arrays();
+                let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
+                materialize_weights(&weight_refs)?
+            };
             synchronize_and_clear_cache();
+
+            // 2. Load & materialize optional DFlash2 / DSpark drafter weights.
+            let (draft_kind, initial_draft_resident) = load_inkling2_draft_into(
+                &mut inner,
+                &source_dir,
+                &asset_dir,
+                is_gguf,
+                explicit_draft_path.as_deref(),
+                auto_draft_path.as_deref(),
+                auto_load_draft,
+            )?;
+            load_guard.record_read();
 
             let trained_window = u32::try_from(inner.config.max_position_embeddings)
                 .unwrap_or(u32::MAX)
@@ -265,38 +231,75 @@ pub(crate) async fn load_model_with_options(
                 None,
             );
 
-            // 2. Plan & allocate extent-grown Group 0 + Group 1 KV pools under Governor Ledger.
+            // 3. Plan & allocate extent-grown Group 0 + Group 1 KV pools under Governor Ledger.
+            // If an auto-discovered draft does not fit the KV/memory budget, step down cleanly
+            // (`AutoDflash2 -> AutoDspark -> pure AR`) while keeping explicit drafts strict.
             if crate::engine::persistence::compiled_forward_backend_available() {
+                struct KvPlanFallbackCtx<'a> {
+                    inner: &'a mut Inkling2Inner,
+                    extra_resident: Option<WeightsResident>,
+                }
+
                 let model_id = inner.model_id;
-                let recency = Arc::clone(&inner.cache_recency);
-                let cfg_ref = &inner.config;
-                let (pool_plan, guard, mut coordinator) =
-                    start_under_growth_lock(memory_governor(), || {
-                        let live = live_memory().ok_or_else(|| {
-                            Error::from_reason(
-                                "Inkling2 memory plan: Metal working set unavailable",
-                            )
-                        })?;
-                        let plan = evaluate_inkling2_plan(
-                            "Inkling2",
-                            cfg_ref,
-                            kv_format,
-                            live,
-                            max_memory_bytes,
-                            max_context,
-                            max_lanes,
-                            disk_options.cache_disk,
-                        )?;
-                        let (reg_guard, coord) = Inkling2KVCacheCoordinator::new_with_memory_plan(
-                            cfg_ref,
-                            &plan,
-                            model_id,
-                            memory_governor(),
-                            Arc::clone(&recency),
-                            activations,
-                        )?;
-                        Ok((plan, reg_guard, coord))
-                    })?;
+                let mut plan_ctx = KvPlanFallbackCtx {
+                    inner: &mut inner,
+                    extra_resident: initial_draft_resident,
+                };
+                let ((pool_plan, guard, mut coordinator), _final_draft_kind) =
+                    plan_kv_with_auto_draft_fallback(
+                        &mut plan_ctx,
+                        draft_kind,
+                        |ctx, _kind| {
+                            let recency = Arc::clone(&ctx.inner.cache_recency);
+                            let cfg_ref = &ctx.inner.config;
+                            start_under_growth_lock(memory_governor(), || {
+                                let live = live_memory().ok_or_else(|| {
+                                    Error::from_reason(
+                                        "Inkling2 memory plan: Metal working set unavailable",
+                                    )
+                                })?;
+                                let plan = evaluate_inkling2_plan(
+                                    "Inkling2",
+                                    cfg_ref,
+                                    kv_format,
+                                    live,
+                                    max_memory_bytes,
+                                    max_context,
+                                    max_lanes,
+                                    disk_options.cache_disk,
+                                )?;
+                                let (reg_guard, coord) =
+                                    Inkling2KVCacheCoordinator::new_with_memory_plan(
+                                        cfg_ref,
+                                        &plan,
+                                        model_id,
+                                        memory_governor(),
+                                        Arc::clone(&recency),
+                                        activations,
+                                    )?;
+                                Ok((plan, reg_guard, coord))
+                            })
+                        },
+                        |ctx| {
+                            ctx.inner.dflash2 = None;
+                            synchronize_and_clear_cache();
+                        },
+                        |ctx| {
+                            let (loaded, dspark_resident) =
+                                load_auto_dspark_into(ctx.inner, &source_dir, &asset_dir, is_gguf);
+                            ctx.extra_resident = dspark_resident;
+                            loaded
+                        },
+                        |ctx| {
+                            ctx.inner.dspark = None;
+                            ctx.extra_resident = None;
+                            synchronize_and_clear_cache();
+                        },
+                    )?;
+                let KvPlanFallbackCtx { extra_resident, .. } = plan_ctx;
+                if let Some(extra) = extra_resident {
+                    resident = resident.and(extra);
+                }
 
                 // Register every group's pool with cache_limit::coordinator() + growth notifier.
                 for gid in 0..coordinator.groups().len() {
@@ -367,6 +370,7 @@ pub(crate) async fn load_model_with_options(
                 }
             }
 
+            let weight_bytes = inner.weight_bytes();
             let weight_guard = cache_limit::coordinator().register(weight_bytes);
             let meta = InitMeta {
                 model_id: inner.model_id,
@@ -376,7 +380,7 @@ pub(crate) async fn load_model_with_options(
                 paged_active: inner.paged.is_some(),
                 scheduled_lanes,
                 vision_active: inner.vision_encoder.is_some(),
-                dspark_active: inner.dspark.is_some(),
+                dspark_active: inner.has_speculative_draft(),
                 context_limits,
                 state_tier,
                 weight_guard,
@@ -408,6 +412,420 @@ pub(crate) async fn load_model_with_options(
     })
 }
 
+/// Normalize a candidate path for deduplication: prefer `fs::canonicalize` when
+/// the path resolves on disk, falling back to lexically normalized components.
+fn normalize_candidate_key(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
+}
+
+/// Build the ordered, deduplicated auto-discovery DFlash2 candidate list:
+/// 1. Colocated `<modelDir>/draft/` (highest precedence)
+/// 2. Caller-supplied auto-discovered external companion (`auto_draft_path`), if present on disk
+/// 3. Sibling `<parent(modelDir)>/inkling-2-mini-dflash2/` (and other shape-matching siblings)
+fn build_auto_dflash2_candidates(
+    source_dir: &Path,
+    asset_dir: &Path,
+    target_shape: DFlash2TargetShape,
+    auto_draft_path: Option<&str>,
+) -> Vec<PathBuf> {
+    let discovered = discover_inkling2_dflash2_candidates(source_dir, asset_dir, target_shape);
+    let mut colocated_keys = HashSet::new();
+    for dir in [source_dir, asset_dir] {
+        colocated_keys.insert(normalize_candidate_key(&dir.join("draft")));
+        if let Ok(canon_dir) = fs::canonicalize(dir) {
+            colocated_keys.insert(normalize_candidate_key(&canon_dir.join("draft")));
+        }
+    }
+
+    let mut colocated = Vec::new();
+    let mut siblings = Vec::new();
+    for cand in discovered {
+        if colocated_keys.contains(&normalize_candidate_key(&cand)) {
+            colocated.push(cand);
+        } else {
+            siblings.push(cand);
+        }
+    }
+
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_unique = |cand: PathBuf| {
+        if seen.insert(normalize_candidate_key(&cand)) {
+            out.push(cand);
+        }
+    };
+
+    // 1. Colocated `<modelDir>/draft/`.
+    for cand in colocated {
+        push_unique(cand);
+    }
+
+    // 2. Auto-discovered external companion (`auto_draft_model_path`).
+    if let Some(raw) = auto_draft_path {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let cand: PathBuf = Path::new(trimmed).components().collect();
+            if cand.exists() || cand.symlink_metadata().is_ok() {
+                push_unique(cand);
+            }
+        }
+    }
+
+    // 3. Sibling `<parent(modelDir)>/inkling-2-mini-dflash2/` and other compatible siblings.
+    for cand in siblings {
+        push_unique(cand);
+    }
+
+    out
+}
+
+/// Provenance of the speculative draft currently attached to an [`Inkling2Inner`].
+///
+/// Distinguishes user-requested explicit drafts (which remain strict on KV/memory budget
+/// failures) from auto-discovered drafts (which step down `AutoDflash2 -> AutoDspark -> None`
+/// when startup KV planning or memory reservation fails).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadedDraftKind {
+    None,
+    Explicit,
+    AutoDflash2,
+    AutoDspark,
+}
+
+/// Returns `true` when an error from KV memory planning, governor admission, or Metal KV pool
+/// allocation indicates a memory-budget / context-fit / allocation-pressure failure that releasing
+/// an auto-discovered speculative draft can resolve.
+///
+/// Structural/configuration errors (e.g. zero global attention visits, unreadable Metal working
+/// set, invalid block geometry, or out-of-scope governor logic bugs) return `false` so they
+/// propagate immediately without dropping drafts or retrying.
+fn is_memory_or_fit_error(err: &Error) -> bool {
+    let msg = err.reason.as_str();
+    if msg.contains("allocated outside a claim's scope") {
+        return false;
+    }
+    msg.contains("one lane's state and the KV runway need")
+        || msg.contains("floors of the memory plan require")
+        || (msg.contains("--max-context") && msg.contains("exceeds the"))
+        || (msg.contains("paged_cache_memory_mb") && msg.contains("exceeds the"))
+        || msg.contains("exceed memory governor limit")
+        || msg.contains("macOS is short of memory")
+        || msg.contains("the KV pool's runway")
+        || msg.contains("engine memory budget exceeded")
+        || msg.contains("host memory reserve protected")
+        || msg.contains("Metal driver rejected allocation")
+        || msg.contains("Metal returned a nil")
+        || crate::engine::governor::is_gpu_out_of_memory(msg)
+        || msg.to_ascii_lowercase().contains("out of memory")
+}
+
+/// Execute startup KV planning & pool allocation with bounded automatic draft step-down on
+/// memory/fit failures:
+/// - `AutoDflash2` -> release DFlash2 -> try bundled `AutoDspark` (or `None` if absent) -> retry.
+/// - `AutoDspark` -> release DSpark -> retry as `None` (pure autoregressive).
+/// - `Explicit` / `None` -> single attempt, propagate errors immediately.
+/// - Non-memory/structural errors -> propagate immediately without releasing any draft.
+fn plan_kv_with_auto_draft_fallback<C, T>(
+    ctx: &mut C,
+    mut draft_kind: LoadedDraftKind,
+    mut plan_fn: impl FnMut(&C, LoadedDraftKind) -> Result<T>,
+    mut drop_dflash2_fn: impl FnMut(&mut C),
+    mut try_load_dspark_fn: impl FnMut(&mut C) -> LoadedDraftKind,
+    mut drop_dspark_fn: impl FnMut(&mut C),
+) -> Result<(T, LoadedDraftKind)> {
+    loop {
+        match plan_fn(ctx, draft_kind) {
+            Ok(planned) => return Ok((planned, draft_kind)),
+            Err(err) => match draft_kind {
+                LoadedDraftKind::AutoDflash2 if is_memory_or_fit_error(&err) => {
+                    tracing::warn!(
+                        "Auto-discovered Inkling2 DFlash2 draft does not fit memory/KV budget ({err}); releasing DFlash2 and retrying with bundled DSpark / AR fallback"
+                    );
+                    drop_dflash2_fn(ctx);
+                    draft_kind = match try_load_dspark_fn(ctx) {
+                        LoadedDraftKind::AutoDspark => LoadedDraftKind::AutoDspark,
+                        _ => LoadedDraftKind::None,
+                    };
+                }
+                LoadedDraftKind::AutoDspark if is_memory_or_fit_error(&err) => {
+                    tracing::warn!(
+                        "Auto-discovered Inkling2 DSpark draft does not fit memory/KV budget ({err}); releasing DSpark and retrying as pure autoregressive"
+                    );
+                    drop_dspark_fn(ctx);
+                    draft_kind = LoadedDraftKind::None;
+                }
+                _ => return Err(err),
+            },
+        }
+    }
+}
+
+/// Auto-discover, load, and materialize a bundled/colocated Inkling2 DSpark draft
+/// (`mtp.safetensors` or `dspark-*.gguf`) into `inner`, logging warnings and soft-falling back
+/// to `(LoadedDraftKind::None, None)` on any discovery, load, or materialization error.
+fn load_auto_dspark_into(
+    inner: &mut Inkling2Inner,
+    source_dir: &Path,
+    asset_dir: &Path,
+    is_gguf: bool,
+) -> (LoadedDraftKind, Option<WeightsResident>) {
+    load_auto_dspark_into_with(inner, source_dir, asset_dir, is_gguf, materialize_weights)
+}
+
+fn load_auto_dspark_into_with(
+    inner: &mut Inkling2Inner,
+    source_dir: &Path,
+    asset_dir: &Path,
+    is_gguf: bool,
+    mut materialize_dspark: impl FnMut(&[&MxArray]) -> Result<WeightsResident>,
+) -> (LoadedDraftKind, Option<WeightsResident>) {
+    let dspark_candidates =
+        match resolve_inkling2_dspark_candidates(source_dir, asset_dir, is_gguf, None) {
+            Ok(candidates) => candidates,
+            Err(err) => {
+                tracing::warn!("Skipping auto-discovered Inkling2 DSpark candidates: {err}");
+                return (LoadedDraftKind::None, None);
+            }
+        };
+    for draft_path in &dspark_candidates {
+        let t_draft = std::time::Instant::now();
+        match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head) {
+            Ok(draft) => {
+                let mat_res = {
+                    let dspark_arrays = draft.weight_arrays();
+                    let dspark_refs: Vec<&MxArray> = dspark_arrays.iter().collect();
+                    materialize_dspark(&dspark_refs)
+                };
+                match mat_res {
+                    Ok(dspark_resident) => {
+                        synchronize_and_clear_cache();
+                        tracing::info!(
+                            "Inkling2 DSpark auto-loaded from {} in {:.2}s (layers={}, block_size={}, markov_rank={}, taps={:?}, weights={:.1} MiB)",
+                            draft_path.display(),
+                            t_draft.elapsed().as_secs_f64(),
+                            draft.config.num_hidden_layers,
+                            draft.config.block_size,
+                            draft.config.markov_rank,
+                            draft.config.target_layer_ids,
+                            draft.weight_bytes() as f64 / (1024.0 * 1024.0),
+                        );
+                        inner.dspark = Some(draft);
+                        return (LoadedDraftKind::AutoDspark, Some(dspark_resident));
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Failed to materialize auto-discovered Inkling2 DSpark draft '{}' ({err}); releasing DSpark and falling back",
+                            draft_path.display()
+                        );
+                        drop(draft);
+                        inner.dspark = None;
+                        synchronize_and_clear_cache();
+                    }
+                }
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "Skipping auto-discovered Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
+                    draft_path.display()
+                );
+            }
+        }
+    }
+    (LoadedDraftKind::None, None)
+}
+
+/// Load and materialize an Inkling-2-Mini speculative drafter into `inner` following exact
+/// precedence:
+/// - Explicit `"none"` / `"off"` / `""` -> disables both DFlash2 and DSpark (ignores `auto_draft_path`).
+/// - Explicit path `P` (ignores `auto_draft_path`):
+///   - If `is_dflash2_dir(P)` -> load & materialize DFlash2 (hard error on failure).
+///   - Else -> resolve, load & materialize DSpark (hard error on failure).
+/// - Auto-discovery (`explicit == None && auto_load_draft`):
+///   1. Colocated `<modelDir>/draft/` DFlash2 companion
+///   2. External auto-discovered companion (`auto_draft_path`), if present
+///   3. Sibling `<parent(modelDir)>/inkling-2-mini-dflash2/` (or shape-matching sibling DFlash2 dir)
+///   4. Bundled/colocated DSpark (`mtp.safetensors` / `dspark-*.gguf`)
+///   5. Pure AR fallback (soft fallback on incompatible/corrupt/OOM auto-discovered drafts).
+///
+/// Returns `(LoadedDraftKind, Option<WeightsResident>)`, where the `WeightsResident` carries
+/// DSpark's materialization witness when DSpark is attached so callers can fold it into the
+/// backbone witness or drop it if DSpark is later released during KV-fit fallback. (`load_dflash2`
+/// already materializes DFlash2 weights internally.)
+fn load_inkling2_draft_into(
+    inner: &mut Inkling2Inner,
+    source_dir: &Path,
+    asset_dir: &Path,
+    is_gguf: bool,
+    explicit: Option<&str>,
+    auto_draft_path: Option<&str>,
+    auto_load_draft: bool,
+) -> Result<(LoadedDraftKind, Option<WeightsResident>)> {
+    load_inkling2_draft_into_with(
+        inner,
+        source_dir,
+        asset_dir,
+        is_gguf,
+        explicit,
+        auto_draft_path,
+        auto_load_draft,
+        load_dflash2,
+        materialize_weights,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn load_inkling2_draft_into_with(
+    inner: &mut Inkling2Inner,
+    source_dir: &Path,
+    asset_dir: &Path,
+    is_gguf: bool,
+    explicit: Option<&str>,
+    auto_draft_path: Option<&str>,
+    auto_load_draft: bool,
+    mut load_dflash2_fn: impl FnMut(
+        &Path,
+    ) -> Result<(crate::models::qwen3_5::dflash2::DFlash2Model, u64)>,
+    mut materialize_dspark: impl FnMut(&[&MxArray]) -> Result<WeightsResident>,
+) -> Result<(LoadedDraftKind, Option<WeightsResident>)> {
+    let target_shape = inner.draft_target_shape();
+
+    if let Some(raw) = explicit {
+        let trimmed = raw.trim();
+        if trimmed.is_empty()
+            || trimmed.eq_ignore_ascii_case("none")
+            || trimmed.eq_ignore_ascii_case("off")
+        {
+            return Ok((LoadedDraftKind::None, None));
+        }
+        let explicit_path = Path::new(trimmed);
+        if is_dflash2_dir(explicit_path) {
+            let t_draft = std::time::Instant::now();
+            read_dflash2_config(explicit_path)?.validate_target(target_shape)?;
+            let (mut draft, bytes) = match load_dflash2_fn(explicit_path) {
+                Ok(loaded) => loaded,
+                Err(err) => {
+                    synchronize_and_clear_cache();
+                    return Err(err);
+                }
+            };
+            draft.validate_target(target_shape)?;
+            draft.configure_inkling2_execution(target_shape);
+            synchronize_and_clear_cache();
+            tracing::info!(
+                "Inkling2 DFlash2 loaded from {} in {:.2}s (block_size={}, taps={:?}, softcap={:?}, weights={:.1} MiB)",
+                explicit_path.display(),
+                t_draft.elapsed().as_secs_f64(),
+                draft.config.block_size,
+                draft.config.target_layers,
+                draft.config.final_logit_softcapping,
+                bytes as f64 / (1024.0 * 1024.0),
+            );
+            inner.dflash2 = Some(draft);
+            return Ok((LoadedDraftKind::Explicit, None));
+        }
+
+        let candidates =
+            resolve_inkling2_dspark_candidates(source_dir, asset_dir, is_gguf, Some(trimmed))?;
+        let mut last_err: Option<Error> = None;
+        for draft_path in &candidates {
+            let t_draft = std::time::Instant::now();
+            match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head) {
+                Ok(draft) => {
+                    let mat_res = {
+                        let dspark_arrays = draft.weight_arrays();
+                        let dspark_refs: Vec<&MxArray> = dspark_arrays.iter().collect();
+                        materialize_dspark(&dspark_refs)
+                    };
+                    let dspark_resident = match mat_res {
+                        Ok(res) => res,
+                        Err(err) => {
+                            drop(draft);
+                            synchronize_and_clear_cache();
+                            return Err(err);
+                        }
+                    };
+                    synchronize_and_clear_cache();
+                    tracing::info!(
+                        "Inkling2 DSpark loaded from {} in {:.2}s (layers={}, block_size={}, markov_rank={}, taps={:?}, weights={:.1} MiB)",
+                        draft_path.display(),
+                        t_draft.elapsed().as_secs_f64(),
+                        draft.config.num_hidden_layers,
+                        draft.config.block_size,
+                        draft.config.markov_rank,
+                        draft.config.target_layer_ids,
+                        draft.weight_bytes() as f64 / (1024.0 * 1024.0),
+                    );
+                    inner.dspark = Some(draft);
+                    return Ok((LoadedDraftKind::Explicit, Some(dspark_resident)));
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        "Skipping Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
+                        draft_path.display()
+                    );
+                    last_err = Some(err);
+                }
+            }
+        }
+        if let Some(err) = last_err {
+            return Err(err);
+        }
+        return Ok((LoadedDraftKind::None, None));
+    }
+
+    if !auto_load_draft {
+        return Ok((LoadedDraftKind::None, None));
+    }
+
+    // 1, 2 & 3. Auto-discover DFlash2 (`<modelDir>/draft/` -> `auto_draft_path` ->
+    // `<parent>/inkling-2-mini-dflash2/` and compatible siblings) ahead of bundled DSpark,
+    // with soft fallback on any config/shape/weight/materialization error.
+    for dflash_path in
+        build_auto_dflash2_candidates(source_dir, asset_dir, target_shape, auto_draft_path)
+    {
+        let t_draft = std::time::Instant::now();
+        match read_dflash2_config(&dflash_path)
+            .and_then(|cfg| cfg.validate_target(target_shape))
+            .and_then(|()| load_dflash2_fn(&dflash_path))
+            .and_then(|(mut draft, bytes)| {
+                draft.validate_target(target_shape)?;
+                draft.configure_inkling2_execution(target_shape);
+                Ok((draft, bytes))
+            }) {
+            Ok((draft, bytes)) => {
+                synchronize_and_clear_cache();
+                tracing::info!(
+                    "Inkling2 DFlash2 auto-loaded from {} in {:.2}s (block_size={}, taps={:?}, softcap={:?}, weights={:.1} MiB)",
+                    dflash_path.display(),
+                    t_draft.elapsed().as_secs_f64(),
+                    draft.config.block_size,
+                    draft.config.target_layers,
+                    draft.config.final_logit_softcapping,
+                    bytes as f64 / (1024.0 * 1024.0),
+                );
+                inner.dflash2 = Some(draft);
+                return Ok((LoadedDraftKind::AutoDflash2, None));
+            }
+            Err(err) => {
+                synchronize_and_clear_cache();
+                tracing::warn!(
+                    "Skipping auto-discovered Inkling2 DFlash2 draft '{}' (trying next candidate): {err}",
+                    dflash_path.display()
+                );
+            }
+        }
+    }
+
+    // 4. Fall back to bundled/colocated DSpark (`mtp.safetensors` / `dspark-*.gguf`).
+    Ok(load_auto_dspark_into_with(
+        inner,
+        source_dir,
+        asset_dir,
+        is_gguf,
+        materialize_dspark,
+    ))
+}
+
 fn load_sync(
     asset_dir: &Path,
     source_dir: &Path,
@@ -418,24 +836,19 @@ fn load_sync(
 ) -> Result<Inkling2Inner> {
     let mut model = load_weights_sync(asset_dir, preload_input, gguf_vision_meta, is_gguf)?;
 
-    // Auto-discover colocated DSpark drafts (`mtp.safetensors` / `dspark-*.gguf`) in target-format
-    // priority order, falling through to the next candidate if an earlier draft fails to load.
-    let draft_candidates =
-        resolve_inkling2_dspark_candidates(source_dir, asset_dir, is_gguf, None)?;
-    for draft_path in &draft_candidates {
-        match Inkling2DsparkModel::load_auto(draft_path, &model.config, &model.lm_head) {
-            Ok(draft) => {
-                model.dspark = Some(draft);
-                break;
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "Skipping auto-discovered Inkling2 DSpark draft '{}' (trying next candidate if any): {err}",
-                    draft_path.display()
-                );
-            }
-        }
-    }
+    // Materialize target backbone weights cleanly without Metal watchdog timeout before
+    // attaching any auto-discovered draft.
+    let _resident = {
+        let weight_arrays = model.weight_arrays();
+        let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
+        materialize_weights(&weight_refs)?
+    };
+    synchronize_and_clear_cache();
+
+    // Auto-discover DFlash2 (`draft/` -> sibling `inkling-2-mini-dflash2/`) before bundled DSpark
+    // (`mtp.safetensors` / `dspark-*.gguf`), falling back cleanly to pure AR if none load.
+    let (_draft_kind, _draft_resident) =
+        load_inkling2_draft_into(&mut model, source_dir, asset_dir, is_gguf, None, None, true)?;
 
     // Initialize block-paged hybrid KV runtime on Metal (default INT8 32-token KTM).
     if crate::engine::persistence::compiled_forward_backend_available() {
@@ -447,11 +860,6 @@ fn load_sync(
             Arc::clone(&model.cache_recency),
         )?);
     }
-
-    // Materialize all weights cleanly without Metal watchdog timeout.
-    let weight_arrays = model.weight_arrays();
-    let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-    let _resident = materialize_weights(&weight_refs)?;
 
     Ok(model)
 }
@@ -558,6 +966,20 @@ fn load_weights_sync(
     // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) to native Float16 scales
     // with zero biases (4x less sidecar DRAM), falling back to F32 hoisting for asymmetric affine.
     lm_head.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
+    let lm_head_bf16_unpadded = if let LinearProj::Standard(ref lin) = lm_head
+        && lin.get_bias().is_none()
+    {
+        let w = lin.get_weight();
+        let unpadded = config.effective_unpadded_vocab_size();
+        let vocab_cols = w.shape_at(0)? as usize;
+        if w.dtype()? == DType::BFloat16 && unpadded < vocab_cols {
+            Some(w.slice_axis(0, 0, unpadded as i64)?)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     // Global cross-pass message queries (Unsloth GGUF format)
     let global_loop_res = params.get("loop_res_query.weight");
@@ -613,9 +1035,11 @@ fn load_weights_sync(
         output_res_query_t,
         output_norm,
         lm_head,
+        lm_head_bf16_unpadded,
         vision_encoder,
         tokenizer,
         dspark: None,
+        dflash2: None,
         dspark_turn_contexts: HashMap::new(),
         scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
         paged: None,
@@ -1655,5 +2079,1281 @@ mod tests {
             mm_parser.content(),
             mm_raw
         );
+    }
+
+    struct TempDirGuard(PathBuf);
+
+    impl TempDirGuard {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "mlx-inkling2-draft-test-{tag}-{}-{id}",
+                std::process::id()
+            ));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).expect("create temp test dir");
+            Self(dir)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn build_synthetic_draft_target_inner() -> Inkling2Inner {
+        let d = 256usize;
+        let vocab = 64usize;
+        let unpadded_vocab = 60usize;
+        let config = Inkling2Config {
+            model_type: "inkling2".to_string(),
+            hidden_size: d,
+            num_hidden_layers: 2,
+            num_physical_layers: Some(2),
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 128,
+            value_head_dim: None,
+            vocab_size: vocab,
+            padded_vocab_size: Some(vocab),
+            unpadded_vocab_size: Some(unpadded_vocab),
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 256,
+            sliding_window: 64,
+            sliding_window_pattern: vec![true, false],
+            local_layer_ids: vec![0],
+            sconv_kernel_size: 4,
+            n_layers_per_attn_res_block: 2,
+            d_rel: 16,
+            rel_extent: 64,
+            qk_l2_clip_threshold: 16.0,
+            rel_l2_clip_threshold: 8.0,
+            log_scaling_n_floor: 4,
+            log_scaling_alpha: 0.25,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            moe_intermediate_size: Some(64),
+            intermediate_size: Some(64),
+            route_scale: 1.0,
+            mlp_gate_softcap: 15.0,
+            mlp_up_softcap: 15.0,
+            final_logit_softcapping: 30.0,
+            loop_config: None,
+            vision_config: None,
+            dspark_config: None,
+            eos_token_id: 2,
+            pad_token_id: 0,
+            gate_up_interleaved: false,
+        };
+        let emb_w = MxArray::zeros(&[vocab as i64, d as i64], Some(DType::BFloat16)).expect("emb");
+        let embed_tokens = Embedding::from_weight(&emb_w).expect("Embedding::from_weight");
+        let embed_norm = MxArray::ones(&[d as i64], Some(DType::Float32)).expect("embed_norm");
+        let output_res_query = MxArray::zeros(&[1, d as i64], Some(DType::Float32)).expect("out_q");
+        let output_res_query_t = output_res_query.transpose(None).expect("out_q_t");
+        let output_norm = MxArray::ones(&[d as i64], Some(DType::Float32)).expect("out_norm");
+        let lm_w = MxArray::zeros(&[vocab as i64, d as i64], Some(DType::BFloat16)).expect("lm_w");
+        let lm_head = LinearProj::Standard(Linear::from_weights(&lm_w, None).expect("lm_head"));
+
+        Inkling2Inner {
+            config,
+            embed_tokens,
+            embed_norm,
+            layers: Vec::new(),
+            output_res_query,
+            output_res_query_t,
+            output_norm,
+            lm_head,
+            lm_head_bf16_unpadded: None,
+            vision_encoder: None,
+            tokenizer: None,
+            dspark: None,
+            dflash2: None,
+            dspark_turn_contexts: HashMap::new(),
+            scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
+            paged: None,
+            flat_cache: None,
+            cached_token_history: Vec::new(),
+            cached_image_key: None,
+            turn_cancel: None,
+            model_id: next_inkling2_model_id(),
+            memory_plan: None,
+            memory_registration: None,
+            wired: None,
+            cache_recency: Arc::new(CacheRecency::new()),
+            decode_share: default_decode_share(),
+            max_context: None,
+            activations: Activations::Auto,
+            disk_options: DiskTierOptions::default(),
+            prefill_runs: HashMap::new(),
+        }
+    }
+
+    fn dflash2_config_json(
+        hidden_size: usize,
+        num_target_layers: usize,
+        vocab_size: usize,
+        valid_vocab_size: usize,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": hidden_size,
+            "intermediate_size": hidden_size,
+            "num_hidden_layers": 1,
+            "num_target_layers": num_target_layers,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 128,
+            "vocab_size": vocab_size,
+            "rms_norm_eps": 1e-6,
+            "max_position_embeddings": 256,
+            "sliding_window": 16,
+            "layer_types": ["sliding_attention"],
+            "is_causal": false,
+            "rope_theta": 10000.0,
+            "dflash_config": {
+                "block_size": 8,
+                "conv_group_size": 16,
+                "conv_kernel_size": 2,
+                "mask_token_id": 0,
+                "selector_rank": 64,
+                "selector_top_k": 4,
+                "target_layer_ids": [0, 1],
+                "final_logit_softcapping": 30.0,
+                "selector_softcap_mode": "after_correction",
+                "valid_vocab_size": valid_vocab_size,
+                "embedding_normalization": "folded_rmsnorm",
+                "capture_final_norm": true,
+                "target_hidden_reduction": "none"
+            }
+        })
+    }
+
+    #[test]
+    fn auto_draft_path_soft_fallback_on_corrupt_mismatched_and_missing() {
+        let root = TempDirGuard::new("soft-fallback");
+        let model_dir = root.path().join("inkling-2-mini");
+        let external_store = root.path().join("external-store");
+        fs::create_dir_all(&model_dir).expect("create model_dir");
+        fs::create_dir_all(&external_store).expect("create external_store");
+
+        // 1. Corrupt/truncated `model.safetensors` with valid matching `config.json`.
+        let corrupt_weights = external_store.join("external-corrupt-weights");
+        fs::create_dir_all(&corrupt_weights).expect("mkdir corrupt_weights");
+        fs::write(
+            corrupt_weights.join("config.json"),
+            dflash2_config_json(256, 2, 64, 60).to_string(),
+        )
+        .expect("write config.json");
+        fs::write(
+            corrupt_weights.join("model.safetensors"),
+            b"not-safetensors",
+        )
+        .expect("write truncated safetensors");
+
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&corrupt_weights.to_string_lossy()),
+            true,
+        )
+        .expect("corrupt auto_draft_model_path must soft-fallback, never Err");
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_none());
+
+        // 2. Corrupt `config.json` (malformed JSON).
+        let corrupt_config = external_store.join("external-corrupt-config");
+        fs::create_dir_all(&corrupt_config).expect("mkdir corrupt_config");
+        fs::write(corrupt_config.join("config.json"), "{ invalid json").expect("write bad json");
+        fs::write(corrupt_config.join("model.safetensors"), b"truncated").expect("write stub");
+
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&corrupt_config.to_string_lossy()),
+            true,
+        )
+        .expect("corrupt config.json in auto_draft_model_path must soft-fallback");
+        assert!(inner.dflash2.is_none());
+
+        // 3. Mismatched-shape `config.json` (wrong hidden_size / num_target_layers / vocab_size).
+        let mismatched = external_store.join("external-mismatched-shape");
+        fs::create_dir_all(&mismatched).expect("mkdir mismatched");
+        fs::write(
+            mismatched.join("config.json"),
+            dflash2_config_json(512, 48, 128, 120).to_string(),
+        )
+        .expect("write mismatched config");
+        fs::write(mismatched.join("model.safetensors"), b"stub").expect("write stub");
+
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&mismatched.to_string_lossy()),
+            true,
+        )
+        .expect("mismatched auto_draft_model_path must soft-fallback");
+        assert!(inner.dflash2.is_none());
+
+        // 4. Nonexistent `auto_draft_model_path`.
+        let missing = external_store.join("does-not-exist-companion");
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&missing.to_string_lossy()),
+            true,
+        )
+        .expect("nonexistent auto_draft_model_path must soft-fallback");
+        assert!(inner.dflash2.is_none());
+
+        // 5. Corrupt `auto_draft_model_path` falls through cleanly to a valid sibling DFlash2 dir.
+        let sibling_valid = root.path().join("inkling-2-mini-dflash2");
+        crate::models::qwen3_5::dflash2::write_test_checkpoint(
+            &sibling_valid,
+            &dflash2_config_json(256, 2, 64, 60),
+        )
+        .expect("write valid sibling DFlash2 checkpoint");
+
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&corrupt_weights.to_string_lossy()),
+            true,
+        )
+        .expect("corrupt auto_draft_model_path must fall through to valid sibling");
+        assert!(
+            inner.dflash2.is_some(),
+            "expected valid sibling DFlash2 to load after corrupt auto_draft_model_path"
+        );
+    }
+
+    #[test]
+    fn explicit_draft_path_remains_strict_and_ignores_auto_draft_path() {
+        let root = TempDirGuard::new("explicit-strict");
+        let model_dir = root.path().join("inkling-2-mini");
+        let external_store = root.path().join("external-store");
+        fs::create_dir_all(&model_dir).expect("create model_dir");
+        fs::create_dir_all(&external_store).expect("create external_store");
+
+        let valid_auto = external_store.join("valid-external-dflash2");
+        crate::models::qwen3_5::dflash2::write_test_checkpoint(
+            &valid_auto,
+            &dflash2_config_json(256, 2, 64, 60),
+        )
+        .expect("write valid external checkpoint");
+
+        // Sanity check: `valid_auto` genuinely loads via `auto_draft_path` when auto-load is on.
+        let mut sanity_inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut sanity_inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&valid_auto.to_string_lossy()),
+            true,
+        )
+        .expect("valid external auto_draft_model_path must load");
+        assert!(sanity_inner.dflash2.is_some());
+
+        let corrupt_weights = external_store.join("corrupt-explicit-weights");
+        fs::create_dir_all(&corrupt_weights).expect("mkdir corrupt_weights");
+        fs::write(
+            corrupt_weights.join("config.json"),
+            dflash2_config_json(256, 2, 64, 60).to_string(),
+        )
+        .expect("write config.json");
+        fs::write(corrupt_weights.join("model.safetensors"), b"corrupt-bytes")
+            .expect("write corrupt safetensors");
+
+        // 1. Explicit corrupt DFlash2 directory MUST return Err even when `auto_draft_path` is valid.
+        let mut inner = build_synthetic_draft_target_inner();
+        let err = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&corrupt_weights.to_string_lossy()),
+            Some(&valid_auto.to_string_lossy()),
+            true,
+        )
+        .map(|(k, _)| k)
+        .expect_err("explicit draft_model_path with corrupt safetensors must fail hard");
+        assert!(!err.reason.is_empty());
+        assert!(inner.dflash2.is_none());
+
+        // 2. Explicit mismatched-shape DFlash2 directory MUST return Err.
+        let mismatched = external_store.join("mismatched-explicit");
+        fs::create_dir_all(&mismatched).expect("mkdir mismatched");
+        fs::write(
+            mismatched.join("config.json"),
+            dflash2_config_json(512, 48, 128, 120).to_string(),
+        )
+        .expect("write mismatched config");
+        fs::write(mismatched.join("model.safetensors"), b"stub").expect("write stub");
+
+        let mut inner = build_synthetic_draft_target_inner();
+        let err = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&mismatched.to_string_lossy()),
+            Some(&valid_auto.to_string_lossy()),
+            true,
+        )
+        .map(|(k, _)| k)
+        .expect_err("explicit draft_model_path with mismatched shape must fail hard");
+        assert!(
+            err.reason.contains("mismatch"),
+            "expected shape mismatch error, got: {}",
+            err.reason
+        );
+        assert!(inner.dflash2.is_none());
+
+        // 3. Explicit `"none"` / `"off"` / `""` disables all drafts and ignores `auto_draft_path`.
+        for disable in ["none", "off", ""] {
+            let mut inner = build_synthetic_draft_target_inner();
+            load_inkling2_draft_into(
+                &mut inner,
+                &model_dir,
+                &model_dir,
+                false,
+                Some(disable),
+                Some(&valid_auto.to_string_lossy()),
+                true,
+            )
+            .expect("explicit disable sentinel must succeed");
+            assert!(
+                inner.dflash2.is_none() && inner.dspark.is_none(),
+                "explicit '{disable}' must disable all drafts"
+            );
+        }
+
+        // 4. `auto_load_draft = false` ignores `auto_draft_path`.
+        let mut inner = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&valid_auto.to_string_lossy()),
+            false,
+        )
+        .expect("auto_load_draft=false must succeed without loading");
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_none());
+    }
+
+    #[test]
+    fn auto_dflash2_candidate_precedence_and_dedup() {
+        let root = TempDirGuard::new("precedence");
+        let model_dir = root.path().join("inkling-2-mini");
+        let colocated = model_dir.join("draft");
+        let sibling = root.path().join("inkling-2-mini-dflash2");
+        let external_parent = root.path().join("external-store");
+        let external = external_parent.join("cached-dflash2");
+        fs::create_dir_all(&colocated).expect("mkdir colocated");
+        fs::create_dir_all(&sibling).expect("mkdir sibling");
+        fs::create_dir_all(&external).expect("mkdir external");
+
+        let cfg = dflash2_config_json(256, 2, 64, 60).to_string();
+        for dir in [&colocated, &sibling, &external] {
+            fs::write(dir.join("config.json"), &cfg).expect("write config");
+            fs::write(dir.join("model.safetensors"), b"stub").expect("write stub");
+        }
+
+        let inner = build_synthetic_draft_target_inner();
+        let target_shape = inner.draft_target_shape();
+
+        // Exact order: 1. colocated `<modelDir>/draft/`, 2. `auto_draft_path`, 3. sibling `inkling-2-mini-dflash2/`.
+        let ordered = build_auto_dflash2_candidates(
+            &model_dir,
+            &model_dir,
+            target_shape,
+            Some(&external.to_string_lossy()),
+        );
+        let ordered_canon: Vec<PathBuf> =
+            ordered.iter().map(|p| normalize_candidate_key(p)).collect();
+        assert_eq!(
+            ordered_canon,
+            vec![
+                normalize_candidate_key(&colocated),
+                normalize_candidate_key(&external),
+                normalize_candidate_key(&sibling),
+            ]
+        );
+
+        // Deduplication when `auto_draft_path` aliases colocated `<modelDir>/draft/` via `./`.
+        let colocated_alias = model_dir.join(".").join("draft");
+        let dedup_colocated = build_auto_dflash2_candidates(
+            &model_dir,
+            &model_dir,
+            target_shape,
+            Some(&colocated_alias.to_string_lossy()),
+        );
+        let dedup_colocated_canon: Vec<PathBuf> = dedup_colocated
+            .iter()
+            .map(|p| normalize_candidate_key(p))
+            .collect();
+        assert_eq!(
+            dedup_colocated_canon,
+            vec![
+                normalize_candidate_key(&colocated),
+                normalize_candidate_key(&sibling),
+            ]
+        );
+
+        // Deduplication when `auto_draft_path` aliases sibling `inkling-2-mini-dflash2/`.
+        let dedup_sibling = build_auto_dflash2_candidates(
+            &model_dir,
+            &model_dir,
+            target_shape,
+            Some(&sibling.to_string_lossy()),
+        );
+        let dedup_sibling_canon: Vec<PathBuf> = dedup_sibling
+            .iter()
+            .map(|p| normalize_candidate_key(p))
+            .collect();
+        assert_eq!(
+            dedup_sibling_canon,
+            vec![
+                normalize_candidate_key(&colocated),
+                normalize_candidate_key(&sibling),
+            ]
+        );
+    }
+
+    #[test]
+    fn loaded_draft_kind_distinguishes_explicit_auto_and_disabled() {
+        let root = TempDirGuard::new("draft-kind");
+        let model_dir = root.path().join("inkling-2-mini");
+        let external_dir = root.path().join("external-dflash2");
+        fs::create_dir_all(&model_dir).expect("create model_dir");
+        crate::models::qwen3_5::dflash2::write_test_checkpoint(
+            &external_dir,
+            &dflash2_config_json(256, 2, 64, 60),
+        )
+        .expect("write valid external DFlash2 checkpoint");
+
+        // Explicit DFlash2 path -> LoadedDraftKind::Explicit.
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&external_dir.to_string_lossy()),
+            None,
+            true,
+        )
+        .expect("explicit DFlash2 should load");
+        assert_eq!(kind, LoadedDraftKind::Explicit);
+        assert!(resident.is_none());
+        assert!(inner.dflash2.is_some());
+
+        // Auto-discovered DFlash2 -> LoadedDraftKind::AutoDflash2.
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&external_dir.to_string_lossy()),
+            true,
+        )
+        .expect("auto DFlash2 should load");
+        assert_eq!(kind, LoadedDraftKind::AutoDflash2);
+        assert!(resident.is_none());
+        assert!(inner.dflash2.is_some());
+
+        // Disabled via "none" or auto_load_draft=false -> LoadedDraftKind::None.
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            Some("none"),
+            Some(&external_dir.to_string_lossy()),
+            true,
+        )
+        .expect("explicit none should succeed");
+        assert_eq!(kind, LoadedDraftKind::None);
+        assert!(resident.is_none());
+        assert!(!inner.has_speculative_draft());
+
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = load_inkling2_draft_into(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&external_dir.to_string_lossy()),
+            false,
+        )
+        .expect("auto_load_draft=false should succeed");
+        assert_eq!(kind, LoadedDraftKind::None);
+        assert!(resident.is_none());
+        assert!(!inner.has_speculative_draft());
+    }
+
+    fn write_synthetic_dspark_checkpoint(dir: &Path) {
+        fs::create_dir_all(dir).expect("mkdir dspark checkpoint dir");
+        let cfg = serde_json::json!({
+            "model_type": "inkling2",
+            "mtp_config": {
+                "hidden_size": 256,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 128,
+                "block_size": 8,
+                "markov_rank": 32,
+                "target_layer_ids": [0, 1],
+                "local_layer_ids": [0]
+            }
+        });
+        fs::write(dir.join("config.json"), cfg.to_string()).expect("write dspark config.json");
+
+        let d = 256i64;
+        let q_dim = 256i64;
+        let kv_dim = 128i64;
+        let head_dim = 128i64;
+        let ffn = 64i64;
+        let vocab = 64i64;
+        let rank = 32i64;
+
+        let mut tensors: HashMap<String, MxArray> = HashMap::new();
+        let mut insert_zeros = |name: &str, shape: &[i64], dtype: DType| {
+            let arr = MxArray::zeros(shape, Some(dtype)).expect("zeros tensor");
+            tensors.insert(name.to_string(), arr);
+        };
+
+        insert_zeros("fuse_weight", &[2, 2], DType::BFloat16);
+        insert_zeros(
+            "layers.0.self_attn.q_proj.weight",
+            &[q_dim, d],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "layers.0.self_attn.k_proj.weight",
+            &[kv_dim, d],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "layers.0.self_attn.v_proj.weight",
+            &[kv_dim, d],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "layers.0.self_attn.k_proj_ctx.weight",
+            &[kv_dim, d],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "layers.0.self_attn.v_proj_ctx.weight",
+            &[kv_dim, d],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "layers.0.self_attn.o_proj.weight",
+            &[d, q_dim],
+            DType::BFloat16,
+        );
+        insert_zeros("layers.0.mlp.gate_proj.weight", &[ffn, d], DType::BFloat16);
+        insert_zeros("layers.0.mlp.up_proj.weight", &[ffn, d], DType::BFloat16);
+        insert_zeros("layers.0.mlp.down_proj.weight", &[d, ffn], DType::BFloat16);
+        insert_zeros("layers.0.input_layernorm.weight", &[d], DType::Float32);
+        insert_zeros(
+            "layers.0.post_attention_layernorm.weight",
+            &[d],
+            DType::Float32,
+        );
+        insert_zeros("layers.0.dflare_norm.weight", &[d], DType::Float32);
+        insert_zeros(
+            "layers.0.self_attn.q_norm.weight",
+            &[head_dim],
+            DType::Float32,
+        );
+        insert_zeros(
+            "layers.0.self_attn.k_norm.weight",
+            &[head_dim],
+            DType::Float32,
+        );
+        insert_zeros(
+            "layers.0.self_attn.k_norm_ctx.weight",
+            &[head_dim],
+            DType::Float32,
+        );
+        insert_zeros("norm.weight", &[d], DType::Float32);
+        insert_zeros("mask_embed", &[d], DType::BFloat16);
+        insert_zeros("markov_head.dflare_norm.weight", &[d], DType::Float32);
+        insert_zeros(
+            "markov_head.markov_w1.weight",
+            &[vocab, rank],
+            DType::BFloat16,
+        );
+        insert_zeros(
+            "markov_head.rnn_proj.weight",
+            &[3 * rank, 2 * rank + 2 * d],
+            DType::BFloat16,
+        );
+        insert_zeros("markov_head.rnn_proj.bias", &[3 * rank], DType::Float32);
+        insert_zeros("markov_head.hidden_out.weight", &[d, rank], DType::BFloat16);
+        insert_zeros("markov_head.hidden_out.bias", &[d], DType::BFloat16);
+
+        crate::utils::safetensors::save_safetensors(
+            dir.join("mtp.safetensors"),
+            &mut tensors,
+            None,
+        )
+        .expect("save synthetic mtp.safetensors");
+    }
+
+    #[test]
+    fn auto_draft_materialization_failure_falls_through_while_explicit_fails_strictly() {
+        let root = TempDirGuard::new("draft-mat-fallback");
+        let model_dir = root.path().join("inkling-2-mini");
+        let dflash_dir = model_dir.join("draft");
+        write_synthetic_dspark_checkpoint(&model_dir);
+        crate::models::qwen3_5::dflash2::write_test_checkpoint(
+            &dflash_dir,
+            &dflash2_config_json(256, 2, 64, 60),
+        )
+        .expect("write valid colocated DFlash2 checkpoint");
+
+        let oom_msg = "Insufficient Memory (kIOGPUCommandBufferCallbackErrorOutOfMemory)";
+
+        // 1. Auto DFlash2 materialization failure falls through to bundled Auto DSpark.
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = {
+            let _oom = crate::array::fail_native_call_at("weight_materialize_chunk", oom_msg);
+            load_inkling2_draft_into(&mut inner, &model_dir, &model_dir, false, None, None, true)
+                .expect("auto DFlash2 OOM must soft-fallback to auto DSpark")
+        };
+        assert_eq!(kind, LoadedDraftKind::AutoDspark);
+        assert!(
+            resident.as_ref().is_some_and(|w| w.arrays() > 0),
+            "kept AutoDspark must return its non-empty WeightsResident witness"
+        );
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_some());
+
+        // 2. Auto DSpark materialization failure (when DFlash2 is absent) falls through to pure AR.
+        let dspark_only_dir = root.path().join("inkling-2-mini-dspark-only");
+        write_synthetic_dspark_checkpoint(&dspark_only_dir);
+        let mut inner = build_synthetic_draft_target_inner();
+        let (kind, resident) = {
+            let _oom = crate::array::fail_native_call_at("weight_materialize_chunk", oom_msg);
+            load_inkling2_draft_into(
+                &mut inner,
+                &dspark_only_dir,
+                &dspark_only_dir,
+                false,
+                None,
+                None,
+                true,
+            )
+            .expect("auto DSpark OOM must soft-fallback to pure AR")
+        };
+        assert_eq!(kind, LoadedDraftKind::None);
+        assert!(resident.is_none());
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_none());
+
+        // 3. Full single-call cascade: AutoDflash2 materialization fails -> tries AutoDspark ->
+        //    AutoDspark materialization ALSO fails -> falls through cleanly to None (pure AR).
+        let mut inner = build_synthetic_draft_target_inner();
+        let attempted: std::cell::RefCell<Vec<&'static str>> = std::cell::RefCell::new(Vec::new());
+        let (kind, resident) = load_inkling2_draft_into_with(
+            &mut inner,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            None,
+            true,
+            |_path| {
+                attempted.borrow_mut().push("dflash2");
+                Err(Error::from_reason(oom_msg))
+            },
+            |arrays| {
+                assert!(!arrays.is_empty());
+                attempted.borrow_mut().push("dspark");
+                Err(Error::from_reason(oom_msg))
+            },
+        )
+        .expect("AutoDflash2 -> AutoDspark -> None materialization cascade must not abort");
+        assert_eq!(*attempted.borrow(), vec!["dflash2", "dspark"]);
+        assert_eq!(kind, LoadedDraftKind::None);
+        assert!(resident.is_none());
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_none());
+
+        // 4. Explicit DFlash2 materialization failure propagates Err strictly (never falls back
+        //    to colocated DSpark).
+        let mut inner = build_synthetic_draft_target_inner();
+        let err = {
+            let _oom = crate::array::fail_native_call_at("weight_materialize_chunk", oom_msg);
+            load_inkling2_draft_into(
+                &mut inner,
+                &model_dir,
+                &model_dir,
+                false,
+                Some(&dflash_dir.to_string_lossy()),
+                None,
+                true,
+            )
+            .map(|(k, _)| k)
+            .expect_err("explicit DFlash2 materialization failure must fail hard")
+        };
+        assert!(
+            err.reason.contains("Insufficient Memory"),
+            "expected OOM error to propagate, got: {}",
+            err.reason
+        );
+        assert!(inner.dflash2.is_none());
+        assert!(inner.dspark.is_none());
+
+        // 5. Explicit DSpark materialization failure propagates Err strictly and leaves
+        //    `inner.dspark` unset.
+        let mtp_path = model_dir.join("mtp.safetensors");
+        let mut inner = build_synthetic_draft_target_inner();
+        let err = {
+            let _oom = crate::array::fail_native_call_at("weight_materialize_chunk", oom_msg);
+            load_inkling2_draft_into(
+                &mut inner,
+                &model_dir,
+                &model_dir,
+                false,
+                Some(&mtp_path.to_string_lossy()),
+                None,
+                true,
+            )
+            .map(|(k, _)| k)
+            .expect_err("explicit DSpark materialization failure must fail hard")
+        };
+        assert!(
+            err.reason.contains("Insufficient Memory"),
+            "expected OOM error to propagate, got: {}",
+            err.reason
+        );
+        assert!(inner.dspark.is_none());
+        assert!(inner.dflash2.is_none());
+    }
+
+    #[test]
+    fn memory_or_fit_error_classifies_real_plan_and_governor_errors() {
+        use crate::engine::governor::governor::Failure;
+        use crate::engine::memory_plan::{MemoryBound, PlanError};
+
+        let fit_errors = vec![
+            Error::from_reason(
+                PlanError::KvPoolDoesNotFit {
+                    required: 22u64 << 30,
+                    budget: 20u64 << 30,
+                    bound: MemoryBound::DeviceMemory,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                PlanError::KvPoolDoesNotFit {
+                    required: 22u64 << 30,
+                    budget: 20u64 << 30,
+                    bound: MemoryBound::MaxMemory,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                PlanError::FloorsDoNotFit {
+                    required: 21u64 << 30,
+                    budget: 20u64 << 30,
+                    bound: MemoryBound::DeviceMemory,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                PlanError::ContextAbovePlan {
+                    requested: 131_072,
+                    plan: 65_536,
+                    bound: MemoryBound::MaxMemory,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                PlanError::PoolAbovePlan {
+                    requested_mib: 4096,
+                    plan_mib: 2048,
+                    bound: MemoryBound::DeviceMemory,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                "memory plan: existing Metal allocations exceed memory governor limit (20480 MiB charged, 18432 MiB limit)",
+            ),
+            Error::from_reason(
+                "memory plan: macOS is short of memory (512 MiB available, 2048 MiB kept for macOS); close memory-heavy applications",
+            ),
+            Error::from_reason(format!(
+                "memory plan: the KV pool's runway (128 MiB) could not be allocated: {}",
+                Failure::name(Some(Failure::EngineBudget))
+            )),
+            Error::from_reason(format!(
+                "memory plan: the KV pool's runway (128 MiB) could not be allocated: {}",
+                Failure::name(Some(Failure::HostPressure))
+            )),
+            Error::from_reason(format!(
+                "memory plan: the KV pool's runway (128 MiB) could not be allocated: {}",
+                Failure::name(Some(Failure::DriverRejected))
+            )),
+            Error::from_reason(
+                "Failed to construct Inkling2 KV group 0 pool: LayerKVPool::new: Metal returned a nil Key buffer",
+            ),
+            Error::from_reason(
+                "[METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory).",
+            ),
+        ];
+
+        for err in &fit_errors {
+            assert!(
+                is_memory_or_fit_error(err),
+                "expected memory/fit error to trigger fallback: {}",
+                err.reason
+            );
+        }
+
+        let structural_errors = vec![
+            Error::from_reason("Inkling2 memory plan: config has zero global attention visits"),
+            Error::from_reason("Inkling2 memory plan: Metal working set unavailable"),
+            Error::from_reason("Inkling2 memory plan: produced no KV pool plan"),
+            Error::from_reason(
+                PlanError::WorkingSetTooSmall {
+                    working_set: 512u64 << 20,
+                    margin: 1u64 << 30,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason(
+                PlanError::ContextWithoutPlan {
+                    requested: 2_000_000,
+                    native: 1_048_576,
+                }
+                .message("Inkling2"),
+            ),
+            Error::from_reason("Inkling2 KV cache block_size must be > 0"),
+            Error::from_reason(
+                "Failed to construct Inkling2 KV group 0 pool: LayerKVPool::new: num_blocks must be > 0",
+            ),
+            Error::from_reason(format!(
+                "memory plan: the KV pool's runway (128 MiB) could not be allocated: {}",
+                Failure::name(Some(Failure::OutsideScope))
+            )),
+        ];
+
+        for err in &structural_errors {
+            assert!(
+                !is_memory_or_fit_error(err),
+                "structural/non-memory error must NOT trigger draft fallback: {}",
+                err.reason
+            );
+        }
+    }
+
+    #[test]
+    fn kv_plan_auto_draft_fallback_transitions() {
+        use crate::engine::memory_plan::{MemoryBound, PlanError};
+
+        #[derive(Default)]
+        struct FakeState {
+            dflash2_loaded: bool,
+            dspark_loaded: bool,
+            has_bundled_dspark: bool,
+            dropped_dflash2: usize,
+            tried_load_dspark: usize,
+            dropped_dspark: usize,
+        }
+
+        let kv_fit_err = || {
+            Error::from_reason(
+                PlanError::KvPoolDoesNotFit {
+                    required: 22u64 << 30,
+                    budget: 20u64 << 30,
+                    bound: MemoryBound::DeviceMemory,
+                }
+                .message("Inkling2"),
+            )
+        };
+        let context_fit_err = || {
+            Error::from_reason(
+                PlanError::ContextAbovePlan {
+                    requested: 131_072,
+                    plan: 65_536,
+                    bound: MemoryBound::MaxMemory,
+                }
+                .message("Inkling2"),
+            )
+        };
+
+        // (a) AutoDflash2 fails with fit error -> releases DFlash2 -> loads AutoDspark -> succeeds.
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let (res, final_kind) = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDflash2,
+            |s, kind| {
+                attempts.push(kind);
+                // Verify weights were actually released/loaded before re-planning.
+                match kind {
+                    LoadedDraftKind::AutoDflash2 => {
+                        assert!(s.dflash2_loaded && !s.dspark_loaded);
+                        Err(kv_fit_err())
+                    }
+                    LoadedDraftKind::AutoDspark => {
+                        assert!(!s.dflash2_loaded && s.dspark_loaded);
+                        Ok("planned-with-dspark")
+                    }
+                    other => panic!("unexpected plan attempt kind: {other:?}"),
+                }
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                if s.has_bundled_dspark {
+                    s.dspark_loaded = true;
+                    LoadedDraftKind::AutoDspark
+                } else {
+                    LoadedDraftKind::None
+                }
+            },
+            |s| {
+                s.dspark_loaded = false;
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect("AutoDflash2 -> AutoDspark fallback must succeed");
+        assert_eq!(res, "planned-with-dspark");
+        assert_eq!(final_kind, LoadedDraftKind::AutoDspark);
+        assert_eq!(
+            attempts,
+            vec![LoadedDraftKind::AutoDflash2, LoadedDraftKind::AutoDspark]
+        );
+        assert!(!st.dflash2_loaded && st.dspark_loaded);
+        assert_eq!(st.dropped_dflash2, 1);
+        assert_eq!(st.tried_load_dspark, 1);
+        assert_eq!(st.dropped_dspark, 0);
+
+        // (b) AutoDflash2 fails with fit error -> AutoDspark ALSO fails with fit error ->
+        //     releases DSpark -> succeeds as None (pure AR).
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let (res, final_kind) = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDflash2,
+            |s, kind| {
+                attempts.push(kind);
+                match kind {
+                    LoadedDraftKind::AutoDflash2 => {
+                        assert!(s.dflash2_loaded && !s.dspark_loaded);
+                        Err(kv_fit_err())
+                    }
+                    LoadedDraftKind::AutoDspark => {
+                        assert!(!s.dflash2_loaded && s.dspark_loaded);
+                        Err(context_fit_err())
+                    }
+                    LoadedDraftKind::None => {
+                        assert!(!s.dflash2_loaded && !s.dspark_loaded);
+                        Ok("planned-pure-ar")
+                    }
+                    LoadedDraftKind::Explicit => panic!("unexpected Explicit"),
+                }
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                s.dspark_loaded = true;
+                LoadedDraftKind::AutoDspark
+            },
+            |s| {
+                s.dspark_loaded = false;
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect("AutoDflash2 -> AutoDspark -> pure AR fallback must succeed");
+        assert_eq!(res, "planned-pure-ar");
+        assert_eq!(final_kind, LoadedDraftKind::None);
+        assert_eq!(
+            attempts,
+            vec![
+                LoadedDraftKind::AutoDflash2,
+                LoadedDraftKind::AutoDspark,
+                LoadedDraftKind::None,
+            ]
+        );
+        assert!(!st.dflash2_loaded && !st.dspark_loaded);
+        assert_eq!(st.dropped_dflash2, 1);
+        assert_eq!(st.tried_load_dspark, 1);
+        assert_eq!(st.dropped_dspark, 1);
+
+        // (c) AutoDflash2 fails with fit error -> no bundled DSpark exists -> retries directly
+        //     as None (pure AR) and succeeds in 2 attempts.
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: false,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let (res, final_kind) = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDflash2,
+            |s, kind| {
+                attempts.push(kind);
+                match kind {
+                    LoadedDraftKind::AutoDflash2 => Err(kv_fit_err()),
+                    LoadedDraftKind::None => {
+                        assert!(!s.dflash2_loaded && !s.dspark_loaded);
+                        Ok("planned-direct-ar")
+                    }
+                    other => panic!("unexpected attempt kind: {other:?}"),
+                }
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                LoadedDraftKind::None
+            },
+            |s| {
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect("AutoDflash2 -> None direct fallback must succeed");
+        assert_eq!(res, "planned-direct-ar");
+        assert_eq!(final_kind, LoadedDraftKind::None);
+        assert_eq!(
+            attempts,
+            vec![LoadedDraftKind::AutoDflash2, LoadedDraftKind::None]
+        );
+        assert_eq!(st.dropped_dflash2, 1);
+        assert_eq!(st.tried_load_dspark, 1);
+        assert_eq!(st.dropped_dspark, 0);
+
+        // (d) Explicit draft fails with fit error -> immediately propagates Err without dropping
+        //     the explicit draft or retrying.
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let err = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::Explicit,
+            |_s, kind| -> Result<()> {
+                attempts.push(kind);
+                Err(kv_fit_err())
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                LoadedDraftKind::AutoDspark
+            },
+            |s| {
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect_err("Explicit draft must propagate fit error without fallback");
+        assert!(is_memory_or_fit_error(&err));
+        assert_eq!(attempts, vec![LoadedDraftKind::Explicit]);
+        assert!(st.dflash2_loaded, "explicit draft must not be dropped");
+        assert_eq!(st.dropped_dflash2, 0);
+        assert_eq!(st.tried_load_dspark, 0);
+        assert_eq!(st.dropped_dspark, 0);
+
+        // (e) Non-memory structural error propagates immediately without dropping auto draft.
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let err = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDflash2,
+            |_s, kind| -> Result<()> {
+                attempts.push(kind);
+                Err(Error::from_reason(
+                    "Inkling2 memory plan: config has zero global attention visits",
+                ))
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                LoadedDraftKind::AutoDspark
+            },
+            |s| {
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect_err("structural error must propagate immediately");
+        assert!(err.reason.contains("zero global attention visits"));
+        assert_eq!(attempts, vec![LoadedDraftKind::AutoDflash2]);
+        assert!(
+            st.dflash2_loaded,
+            "structural error must not drop auto draft"
+        );
+        assert_eq!(st.dropped_dflash2, 0);
+        assert_eq!(st.tried_load_dspark, 0);
+        assert_eq!(st.dropped_dspark, 0);
+
+        // (f) Initial AutoDspark fails with fit error -> drops DSpark -> succeeds as None.
+        let mut st = FakeState {
+            dspark_loaded: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let (res, final_kind) = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDspark,
+            |s, kind| {
+                attempts.push(kind);
+                match kind {
+                    LoadedDraftKind::AutoDspark => Err(kv_fit_err()),
+                    LoadedDraftKind::None => {
+                        assert!(!s.dspark_loaded);
+                        Ok("planned-after-dspark-drop")
+                    }
+                    other => panic!("unexpected attempt kind: {other:?}"),
+                }
+            },
+            |s| {
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                LoadedDraftKind::None
+            },
+            |s| {
+                s.dspark_loaded = false;
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect("AutoDspark -> None fallback must succeed");
+        assert_eq!(res, "planned-after-dspark-drop");
+        assert_eq!(final_kind, LoadedDraftKind::None);
+        assert_eq!(
+            attempts,
+            vec![LoadedDraftKind::AutoDspark, LoadedDraftKind::None]
+        );
+        assert_eq!(st.dropped_dflash2, 0);
+        assert_eq!(st.tried_load_dspark, 0);
+        assert_eq!(st.dropped_dspark, 1);
+
+        // (g) Even pure AR fails with fit error -> terminates cleanly after 3 attempts and returns
+        //     the final pure-AR error.
+        let mut st = FakeState {
+            dflash2_loaded: true,
+            has_bundled_dspark: true,
+            ..Default::default()
+        };
+        let mut attempts = Vec::new();
+        let err = plan_kv_with_auto_draft_fallback(
+            &mut st,
+            LoadedDraftKind::AutoDflash2,
+            |_s, kind| -> Result<()> {
+                attempts.push(kind);
+                match kind {
+                    LoadedDraftKind::AutoDflash2 => Err(kv_fit_err()),
+                    LoadedDraftKind::AutoDspark => Err(kv_fit_err()),
+                    LoadedDraftKind::None => Err(Error::from_reason(
+                        PlanError::FloorsDoNotFit {
+                            required: 19u64 << 30,
+                            budget: 16u64 << 30,
+                            bound: MemoryBound::DeviceMemory,
+                        }
+                        .message("Inkling2"),
+                    )),
+                    LoadedDraftKind::Explicit => panic!("unexpected Explicit"),
+                }
+            },
+            |s| {
+                s.dflash2_loaded = false;
+                s.dropped_dflash2 += 1;
+            },
+            |s| {
+                s.tried_load_dspark += 1;
+                s.dspark_loaded = true;
+                LoadedDraftKind::AutoDspark
+            },
+            |s| {
+                s.dspark_loaded = false;
+                s.dropped_dspark += 1;
+            },
+        )
+        .expect_err("pure AR fit failure must return final error");
+        assert!(err.reason.contains("floors of the memory plan require"));
+        assert_eq!(
+            attempts,
+            vec![
+                LoadedDraftKind::AutoDflash2,
+                LoadedDraftKind::AutoDspark,
+                LoadedDraftKind::None,
+            ]
+        );
+        assert!(!st.dflash2_loaded && !st.dspark_loaded);
+        assert_eq!(st.dropped_dflash2, 1);
+        assert_eq!(st.tried_load_dspark, 1);
+        assert_eq!(st.dropped_dspark, 1);
     }
 }

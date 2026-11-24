@@ -69,6 +69,7 @@ const DRAFT: NonNullable<CatalogItem['draft']> = {
   label: 'DFlash2',
   hfRepo: 'z-lab/Qwen3.8-27B-DFlash2',
   sizeGb: 3.85,
+  autoInstall: true,
   slug: 'qwen3.8-27b-dflash2',
   installed: false,
   present: false,

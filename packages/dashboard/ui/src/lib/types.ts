@@ -123,14 +123,14 @@ export interface CatalogItem {
   minMemoryGb?: number;
   /** In catalog order; `builds[0]` is the build every surface chooses first. */
   builds: CatalogBuildItem[];
-  /** Separate optional draft weights, never a standalone chat-model entry. */
+  /** Separate companion draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
 }
 
 export type CatalogDraftItem = Pick<
   CatalogBuildItem,
   'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
-> & { label: string };
+> & { label: string; autoInstall?: boolean };
 
 /**
  * An entry at a catalog slug that the app did not create, measured without following a link or opening a file. The

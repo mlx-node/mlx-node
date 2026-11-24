@@ -509,6 +509,36 @@ impl HybridKVCacheCoordinator {
         Ok(())
     }
 
+    /// Compact accepted speculative verify-tree KV slots `[anchor + accepted_rows[d]] -> [anchor + d]`
+    /// in-place across every KV group (Global + SWA). Fast-paths contiguous prefixes (`row == d`).
+    pub fn compact_kv_path_all(
+        &mut self,
+        seq_id: u32,
+        anchor: u32,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            self.adapter_mut(group_id)?
+                .compact_kv_path_for(seq_id, anchor, accepted_rows)?;
+        }
+        Ok(())
+    }
+
+    /// Compact the trailing `tree_len` recorded token IDs along `accepted_rows` across every KV
+    /// group without truncating (call immediately before `commit_cycle`).
+    pub fn compact_recorded_tree_tokens_all(
+        &mut self,
+        seq_id: u32,
+        tree_len: usize,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        for group_id in 0..self.inner.groups().len() {
+            self.adapter_mut(group_id)?
+                .compact_recorded_tree_tokens_for(seq_id, tree_len, accepted_rows)?;
+        }
+        Ok(())
+    }
+
     /// [`PagedKVCacheAdapter::check_wave_fits`] for every KV group. Each group
     /// has its own allocator, so each sums its own rows.
     pub fn check_wave_fits_all(&self, rows: &[(u32, u32)]) -> std::result::Result<(), String> {

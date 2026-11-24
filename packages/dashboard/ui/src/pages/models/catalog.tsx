@@ -1498,7 +1498,9 @@ function DraftLine({ entry, draft, download, progress, starting, onStart, host }
   const { item, job, settling, updateSettling } = download;
   const cleanupOpen = useCleanupOpen(item.slug);
   const state = catalogActionState(item, download);
-  const both = entry.builds.length === 2 ? ' Works with both builds.' : '';
+  const autoInstall = draft.autoInstall === true;
+  const buildsNote =
+    entry.builds.length === 2 ? ' Works with both builds.' : entry.builds.length > 2 ? ' Works with every build.' : '';
   let glyph: ReactNode;
   let text: string;
   let tooltip: string;
@@ -1544,9 +1546,11 @@ function DraftLine({ entry, draft, download, progress, starting, onStart, host }
       ? `Install a ${entry.label} build to use it.`
       : `Used when ${entry.label} loads. To remove it, open Local models, Companion weights.`;
   } else if (state === 'install') {
-    glyph = <Badge size="sm">Optional</Badge>;
+    glyph = <Badge size="sm">{autoInstall ? 'Included' : 'Optional'}</Badge>;
     text = `${draft.sizeGb} GB`;
-    tooltip = `A draft model that can speed up replies. The answers stay the same. Used the next time ${entry.label} loads.${both}`;
+    tooltip = autoInstall
+      ? `Downloaded with this model for faster replies. The answers stay the same. Used the next time ${entry.label} loads.${buildsNote}`
+      : `A draft model that can speed up replies. The answers stay the same. Used the next time ${entry.label} loads.${buildsNote}`;
     const add = (
       <Button
         type="button"
@@ -1807,7 +1811,7 @@ export function CatalogCardView({
 }
 
 /** Subscribes to a job the card does not show, so its end still reaches the page. */
-function JobFollower({ download }: { download: CatalogDownloadProps }): null {
+export function JobFollower({ download }: { download: CatalogDownloadProps }): null {
   useDownloadProgress(download.job?.id, download);
   return null;
 }

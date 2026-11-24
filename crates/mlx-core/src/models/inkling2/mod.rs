@@ -18,6 +18,7 @@
 pub mod attention;
 pub mod attn_res;
 pub mod config;
+pub(crate) mod dflash2;
 pub mod dspark;
 pub(crate) mod dspark_decode;
 pub mod kernels;

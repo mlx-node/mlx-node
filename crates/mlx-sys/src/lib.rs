@@ -1334,6 +1334,8 @@ unsafe extern "C-unwind" {
         head_size: i32,
         kv_dtype: u8,
         score_scales: *mut mlx_array,
+        tree_rows: *mut mlx_array,
+        live_blocks: i32,
         out_attention: *mut *mut mlx_array,
         out_lse: *mut *mut mlx_array,
     ) -> bool;
@@ -1366,6 +1368,8 @@ unsafe extern "C-unwind" {
         kv_dtype: u8,
         int8_queries: bool,
         scale: f32,
+        tree_rows: *mut mlx_array,
+        live_blocks: i32,
         out_attention: *mut *mut mlx_array,
         out_lse: *mut *mut mlx_array,
         out_workspace: *mut *mut mlx_array,
@@ -1409,6 +1413,7 @@ unsafe extern "C-unwind" {
         weight: *mut mlx_array,
         history_in: *mut mlx_array,
         dyn_taps: *mut mlx_array,
+        tree_rows: *mut mlx_array,
         out_y: *mut *mut mlx_array,
         out_history: *mut *mut mlx_array,
     ) -> bool;
@@ -1452,6 +1457,7 @@ unsafe extern "C-unwind" {
         qk_thresh: f32,
         v_eps: f32,
         l2_eps: f32,
+        tree_rows: *mut mlx_array,
         out_k: *mut *mut mlx_array,
         out_v: *mut *mut mlx_array,
         out_k_hist: *mut *mut mlx_array,
@@ -1485,12 +1491,80 @@ unsafe extern "C-unwind" {
         qk_thresh: f32,
         v_eps: f32,
         l2_eps: f32,
+        tree_rows: *mut mlx_array,
         out_k_pool: *mut *mut mlx_array,
         out_v_pool: *mut *mut mlx_array,
         out_k_scale: *mut *mut mlx_array,
         out_v_scale: *mut *mut mlx_array,
         out_k_hist: *mut *mut mlx_array,
         out_v_hist: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// 40-core parallel fusion: `inkling2_qr_clip` + `inkling2_sconv_k4_kv_prep_paged` in ONE
+    /// Metal dispatch & ONE MLX graph op (grid `(num_q_heads + 2*num_kv_heads, T, 1) x 32`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_qr_clip_sconv_k4_kv_prep_paged(
+        q_in: *mut mlx_array,
+        r_in: *mut mlx_array,
+        q_clip: *mut mlx_array,
+        rel_clip: *mut mlx_array,
+        tau: *mut mlx_array,
+        k_in: *mut mlx_array,
+        v_in: *mut mlx_array,
+        k_weight: *mut mlx_array,
+        v_weight: *mut mlx_array,
+        dyn_k: *mut mlx_array,
+        dyn_v: *mut mlx_array,
+        cu_seqlens: *mut mlx_array,
+        k_hists: *const *mut mlx_array,
+        v_hists: *const *mut mlx_array,
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        slot_mapping: *mut mlx_array,
+        num_seqs: u32,
+        packed_hist: bool,
+        num_q_heads: u32,
+        num_kv_heads: u32,
+        head_dim: u32,
+        d_rel: u32,
+        block_size: u32,
+        kv_mode: u32,
+        qk_thresh: f32,
+        rel_thresh: f32,
+        v_eps: f32,
+        l2_eps: f32,
+        r_round_bf16: bool,
+        tree_rows: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_r: *mut *mut mlx_array,
+        out_k_pool: *mut *mut mlx_array,
+        out_v_pool: *mut *mut mlx_array,
+        out_k_scale: *mut *mut mlx_array,
+        out_v_scale: *mut *mut mlx_array,
+        out_k_hist: *mut *mut mlx_array,
+        out_v_hist: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// In-place paged KV slot compaction for speculative tree path commit
+    /// (`src_slots[i] -> dst_slots[i]` in ascending order, all 3 KV modes).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_paged_kv_path_commit(
+        k_pool: *mut mlx_array,
+        v_pool: *mut mlx_array,
+        k_scale: *mut mlx_array,
+        v_scale: *mut mlx_array,
+        src_slots: *mut mlx_array,
+        dst_slots: *mut mlx_array,
+        num_kv_heads: u32,
+        head_dim: u32,
+        block_size: u32,
+        kv_mode: u32,
+        out_k_pool: *mut *mut mlx_array,
+        out_v_pool: *mut *mut mlx_array,
+        out_k_scale: *mut *mut mlx_array,
+        out_v_scale: *mut *mut mlx_array,
     ) -> bool;
 
     /// Fused Inkling2 Block AttnRes over `1..=8` sources (+ optional addend & sublayer RMSNorm).
@@ -1541,6 +1615,47 @@ unsafe extern "C-unwind" {
         output_f32: bool,
     ) -> *mut mlx_array;
 
+    /// End-to-end fused LoopController (`down + up_blend + rms_norm_from_sq`) in 1 MLX primitive
+    /// with persistent per-stream scratch. When `split_outputs == true` (`S == 3`), writes 3 direct
+    /// `[T, D]` outputs `(out_0, out_1, out_2)` with zero slice/squeeze view nodes; when `false`,
+    /// writes 1 output into `out_0`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_loop_ctrl_fused(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        down_w: *mut mlx_array,
+        gain_forget_w: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        attn_res_eps: f32,
+        norm_eps: f32,
+        output_f32: bool,
+        split_outputs: bool,
+        out_0: *mut *mut mlx_array,
+        out_1: *mut *mut mlx_array,
+        out_2: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Fused `o_proj` (Sym-Q8_0 when `scales != null`, else BF16), static k=4 ragged ShortConv,
+    /// optional FP32 residual epilogue, and optional pre-conv tape output in 1 MLX primitive.
+    ///
+    /// Accepts `y` as either 2D `[T, K]` or 3D `[T, H, D]` BF16 (zero reshape op needed!).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_oproj_sconv_k4_ragged(
+        y: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        conv_weight: *mut mlx_array,
+        cu_seqlens: *mut mlx_array,
+        res_a: *mut mlx_array,
+        hists: *const *mut mlx_array,
+        num_seqs: u32,
+        packed_hist: bool,
+        tree_rows: *mut mlx_array,
+        out_y: *mut *mut mlx_array,
+        out_history: *mut *mut mlx_array,
+        out_tape: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Fused Inkling2 multi-sequence ragged k=4 ShortConv + optional FP32 residual epilogue.
     #[allow(clippy::too_many_arguments)]
     pub fn mlx_inkling2_sconv_k4_ragged(
@@ -1553,6 +1668,7 @@ unsafe extern "C-unwind" {
         hists: *const *mut mlx_array,
         num_seqs: u32,
         packed_hist: bool,
+        tree_rows: *mut mlx_array,
         out_y: *mut *mut mlx_array,
         out_history: *mut *mut mlx_array,
     ) -> bool;
@@ -1734,6 +1850,7 @@ unsafe extern "C-unwind" {
         round_bf16_before_situ: bool,
         emit_tape: bool,
         router_input_is_weight: bool,
+        tree_rows: *mut mlx_array,
         out_y: *mut *mut mlx_array,
         out_history: *mut *mut mlx_array,
         out_tape: *mut *mut mlx_array,
@@ -3728,6 +3845,7 @@ unsafe extern "C" {
         predecessor: *mut mlx_array,
         successor: *mut mlx_array,
         anchor: *mut mlx_array,
+        softcap: f32,
     ) -> *mut mlx_array;
     /// Fused device-resident greedy predecessor walk for DFlash2 selector
     /// candidates `[1,L,K]` i32 and score tables `[L,K,K]` f32. Returns a

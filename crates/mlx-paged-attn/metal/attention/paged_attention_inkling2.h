@@ -35,8 +35,39 @@ struct Inkling2AttnExtraParams {
   uint32_t sink_is_f32;
   uint32_t write_lse;
   uint32_t rel_mode; // 0 = none, 1 = precomputed [T,H,rel_extent], 2 = on-the-fly r [T,H,16] x w [rel_extent,16]
-  uint32_t _pad;
+  uint32_t has_tree; // 0 = linear causal chain, 1 = verify tree (tree_rows [total_q, 2] u32: x=ancestors, y=parent|(depth<<16))
 };
+
+template <bool HasTree>
+inline bool inkling2_tree_visible(int tok, int anchor, uint32_t ancestors) {
+  if constexpr (!HasTree) {
+    (void)tok;
+    (void)anchor;
+    (void)ancestors;
+    return true;
+  } else {
+    if (tok < anchor) {
+      return true;
+    }
+    const uint rel = uint(tok - anchor);
+    return rel < 32u && (((ancestors >> rel) & 1u) != 0u);
+  }
+}
+
+template <bool HasTree>
+inline int inkling2_tree_dist(int tok, int anchor, int q_pos,
+                              uint32_t ancestors, uint32_t depth) {
+  if constexpr (HasTree) {
+    if (tok >= anchor) {
+      const uint rel = min(uint(tok - anchor), 31u);
+      return int(depth - popcount(ancestors & ((1u << rel) - 1u)));
+    }
+  }
+  (void)anchor;
+  (void)ancestors;
+  (void)depth;
+  return q_pos - tok;
+}
 
 inline float inkling2_read_rel_bias(const device uchar *rel_bias_raw,
                                     int64_t idx, int rel_bias_is_f32) {
@@ -79,7 +110,8 @@ inline float inkling2_apply_gate_sink(float o_f, float g_val, float sink_scale) 
 // Both modes write unnormalized FP32 partials in V2 so they share the exact
 // same FP32 reducer (`paged_attention_inkling2_v2_reduce`).
 // ============================================================================
-template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE, bool IsInt8Ktm>
+template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE, bool IsInt8Ktm,
+          bool HasTree>
 inline void paged_attention_inkling2_impl(
     device float *exp_sums,
     device float *max_logits,
@@ -110,6 +142,7 @@ inline void paged_attention_inkling2_impl(
     const device uchar *sink_raw,
     const device float *rel_bias_w,
     const constant Inkling2AttnExtraParams &extra,
+    const device uint2 *tree_rows,
     threadgroup char *shared_mem,
     threadgroup typename PagedAttentionLayout<
         bfloat16_t, HEAD_SIZE, BLOCK_SIZE, 256, 32>::Q_vec (
@@ -142,8 +175,8 @@ inline void paged_attention_inkling2_impl(
   const int q_seq_start = cu_seqlens_q[seq_idx];
   const int q_len = cu_seqlens_q[seq_idx + 1] - q_seq_start;
   const int q_pos_in_seq = q_token_idx - q_seq_start;
-  const int effective_context_len =
-      int(context_lens[seq_idx]) - q_len + q_pos_in_seq + 1;
+  const int anchor = int(context_lens[seq_idx]) - q_len;
+  const int effective_context_len = anchor + q_pos_in_seq + 1;
   if (effective_context_len <= 0) {
     if (!USE_PARTITIONING && thread_idx == 0 && extra.write_lse != 0u) {
       lse_out[q_token_idx * num_heads + head_idx] = -INFINITY;
@@ -154,10 +187,19 @@ inline void paged_attention_inkling2_impl(
     return;
   }
 
-  const int q_pos = effective_context_len - 1;
+  uint32_t tree_ancestors = 0u;
+  uint32_t tree_depth = 0u;
+  if constexpr (HasTree) {
+    const uint2 trow = tree_rows[q_token_idx];
+    tree_ancestors = trow.x;
+    tree_depth = trow.y >> 16u;
+  } else {
+    (void)tree_rows;
+  }
+  const int q_pos = HasTree ? (anchor + int(tree_depth)) : (effective_context_len - 1);
   const int sliding_lower =
-      (sliding_window > 0 && effective_context_len > sliding_window)
-          ? (effective_context_len - sliding_window)
+      (sliding_window > 0 && (q_pos + 1) > sliding_window)
+          ? (q_pos + 1 - sliding_window)
           : 0;
 
   const int num_context_blocks =
@@ -259,7 +301,8 @@ inline void paged_attention_inkling2_impl(
           (thread_group_idx + i * NUM_SIMD_LANES) % BLOCK_SIZE;
       const int token_idx = block_idx * BLOCK_SIZE + physical_block_offset;
       const bool valid =
-          token_idx < effective_context_len && token_idx >= sliding_lower;
+          token_idx < effective_context_len && token_idx >= sliding_lower &&
+          inkling2_tree_visible<HasTree>(token_idx, anchor, tree_ancestors);
 
       float qk = -INFINITY;
       if (valid) {
@@ -300,8 +343,9 @@ inline void paged_attention_inkling2_impl(
         }
 
         if (rel_extent > 0) {
-          const int dist = q_pos - token_idx;
-          if (dist < rel_extent) {
+          const int dist = inkling2_tree_dist<HasTree>(
+              token_idx, anchor, q_pos, tree_ancestors, tree_depth);
+          if (dist >= 0 && dist < rel_extent) {
             if (extra.rel_mode == 2u) {
               const device float4 *w4 =
                   reinterpret_cast<const device float4 *>(rel_bias_w) +
@@ -356,7 +400,8 @@ inline void paged_attention_inkling2_impl(
   const bool has_valid = qk_max > -FLT_MAX;
   for (int i = thread_idx; i < num_tokens; i += NUM_THREADS) {
     const int tok = start_token_idx + i;
-    const bool valid = tok >= sliding_lower && tok < effective_context_len;
+    const bool valid = tok >= sliding_lower && tok < effective_context_len &&
+                       inkling2_tree_visible<HasTree>(tok, anchor, tree_ancestors);
     const float val = (has_valid && valid) ? fast::exp(logits[i] - qk_max) : 0.0f;
     logits[i] = val;
     exp_sum += val;
@@ -415,15 +460,19 @@ inline void paged_attention_inkling2_impl(
             page_half * BLOCK_SIZE + physical_block_offset;
 #pragma unroll
         for (int j = 0; j < V_VEC_SIZE; j++) {
-          const bool valid = token_idx + j < effective_context_len &&
-                             token_idx + j >= sliding_lower;
+          const int tok_j = token_idx + j;
+          const bool valid = tok_j < effective_context_len &&
+                             tok_j >= sliding_lower &&
+                             inkling2_tree_visible<HasTree>(tok_j, anchor, tree_ancestors);
           p[j] = valid ? p[j] * value_scales[j] : 0.0f;
         }
       } else {
 #pragma unroll
         for (int j = 0; j < V_VEC_SIZE; j++) {
-          const bool valid = token_idx + j < effective_context_len &&
-                             token_idx + j >= sliding_lower;
+          const int tok_j = token_idx + j;
+          const bool valid = tok_j < effective_context_len &&
+                             tok_j >= sliding_lower &&
+                             inkling2_tree_visible<HasTree>(tok_j, anchor, tree_ancestors);
           if (!valid) {
             p[j] = 0.0f;
           }
@@ -450,13 +499,17 @@ inline void paged_attention_inkling2_impl(
         } else {
           v_vec = *reinterpret_cast<const device V_vec *>(v_ptr + offset);
         }
-        if (block_idx == num_context_blocks - 1) {
+        if (block_idx == num_context_blocks - 1 ||
+            (HasTree && (block_idx + 1) * BLOCK_SIZE > anchor)) {
           thread T *v_vec_ptr = reinterpret_cast<thread T *>(&v_vec);
 #pragma unroll
           for (int j = 0; j < V_VEC_SIZE; j++) {
-            v_vec_ptr[j] = token_idx + j < effective_context_len
-                               ? v_vec_ptr[j]
-                               : zero_value;
+            const int tok_j = token_idx + j;
+            v_vec_ptr[j] =
+                (tok_j < effective_context_len &&
+                 inkling2_tree_visible<HasTree>(tok_j, anchor, tree_ancestors))
+                    ? v_vec_ptr[j]
+                    : zero_value;
           }
         }
         accs[i] += dot<Float_L_vec>(logits_vec, v_vec);
@@ -551,7 +604,7 @@ inline void paged_attention_inkling2_impl(
 // ============================================================================
 // INT8 32-token KTM Inkling2 decode / varlen entry (buffers 0..28)
 // ============================================================================
-template <int HEAD_SIZE, int PARTITION_SIZE>
+template <int HEAD_SIZE, int PARTITION_SIZE, bool HasTree>
 [[kernel]] void paged_attention_inkling2_ktm(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
@@ -583,6 +636,7 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
     const device uchar *sink_raw [[buffer(26)]],
     const device float *rel_bias_w [[buffer(27)]],
     const constant Inkling2AttnExtraParams &extra [[buffer(28)]],
+    const device uint2 *tree_rows [[buffer(29)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -593,21 +647,21 @@ template <int HEAD_SIZE, int PARTITION_SIZE>
   threadgroup typename Layout::Q_vec
       q_vecs[Layout::THREAD_GROUP_SIZE][Layout::NUM_VECS_PER_THREAD];
   threadgroup float red_smem[2 * Layout::NUM_WARPS];
-  paged_attention_inkling2_impl<HEAD_SIZE, 16, PARTITION_SIZE, true>(
+  paged_attention_inkling2_impl<HEAD_SIZE, 16, PARTITION_SIZE, true, HasTree>(
       exp_sums, max_logits, out, q, k_cache, v_cache, k_scale, v_scale,
       num_kv_heads, scale, block_tables, context_lens, max_num_blocks_per_seq,
       q_stride, kv_block_stride, kv_head_stride, sliding_window, cu_seqlens_q,
       num_seqs, rel_bias_raw, rel_extent, rel_bias_is_f32, score_scales,
       has_score_scales, lse_out, gate_raw, sink_raw, rel_bias_w, extra,
-      shared_mem, q_vecs, red_smem, threadgroup_position_in_grid,
+      tree_rows, shared_mem, q_vecs, red_smem, threadgroup_position_in_grid,
       threadgroups_per_grid, thread_position_in_threadgroup, simd_tid,
       simd_lid);
 }
 
 // ============================================================================
-// BF16 vLLM-pool Inkling2 decode / varlen entry (buffers 0..24)
+// BF16 vLLM-pool Inkling2 decode / varlen entry (buffers 0..25)
 // ============================================================================
-template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
+template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE, bool HasTree>
 [[kernel]] void paged_attention_inkling2_bf16(
     device float *exp_sums [[buffer(0)]],
     device float *max_logits [[buffer(1)]],
@@ -635,6 +689,7 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
     const device uchar *sink_raw [[buffer(22)]],
     const device float *rel_bias_w [[buffer(23)]],
     const constant Inkling2AttnExtraParams &extra [[buffer(24)]],
+    const device uint2 *tree_rows [[buffer(25)]],
     threadgroup char *shared_mem [[threadgroup(0)]],
     uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],
     uint3 threadgroups_per_grid [[threadgroups_per_grid]],
@@ -646,13 +701,14 @@ template <int HEAD_SIZE, int BLOCK_SIZE, int PARTITION_SIZE>
   threadgroup typename Layout::Q_vec
       q_vecs[Layout::THREAD_GROUP_SIZE][Layout::NUM_VECS_PER_THREAD];
   threadgroup float red_smem[2 * Layout::NUM_WARPS];
-  paged_attention_inkling2_impl<HEAD_SIZE, BLOCK_SIZE, PARTITION_SIZE, false>(
+  paged_attention_inkling2_impl<HEAD_SIZE, BLOCK_SIZE, PARTITION_SIZE, false,
+                                HasTree>(
       exp_sums, max_logits, out, q, k_cache, v_cache, nullptr, nullptr,
       num_kv_heads, scale, block_tables, context_lens, max_num_blocks_per_seq,
       q_stride, kv_block_stride, kv_head_stride, sliding_window, cu_seqlens_q,
       num_seqs, rel_bias_raw, rel_extent, rel_bias_is_f32, nullptr, 0, lse_out,
-      gate_raw, sink_raw, rel_bias_w, extra, shared_mem, q_vecs, red_smem,
-      threadgroup_position_in_grid, threadgroups_per_grid,
+      gate_raw, sink_raw, rel_bias_w, extra, tree_rows, shared_mem, q_vecs,
+      red_smem, threadgroup_position_in_grid, threadgroups_per_grid,
       thread_position_in_threadgroup, simd_tid, simd_lid);
 }
 
@@ -755,9 +811,9 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
 // ============================================================================
 // Explicit instantiations (HEAD_SIZE = 128)
 // ============================================================================
-#define instantiate_paged_attention_inkling2_ktm(name, out_type, ps)           \
+#define instantiate_paged_attention_inkling2_ktm(name, out_type, ps, has_tree) \
   template [[host_name(name)]] [[kernel]] void                                 \
-  paged_attention_inkling2_ktm<128, ps>(                                       \
+  paged_attention_inkling2_ktm<128, ps, has_tree>(                             \
       device float *exp_sums [[buffer(0)]],                                    \
       device float *max_logits [[buffer(1)]],                                  \
       device out_type *out [[buffer(2)]],                                      \
@@ -787,6 +843,7 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
       const device uchar *sink_raw [[buffer(26)]],                             \
       const device float *rel_bias_w [[buffer(27)]],                           \
       const constant Inkling2AttnExtraParams &extra [[buffer(28)]],            \
+      const device uint2 *tree_rows [[buffer(29)]],                            \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -796,13 +853,18 @@ template <int HEAD_SIZE, int NUM_THREADS, int PARTITION_SIZE>
       uint simd_lid [[thread_index_in_simdgroup]]);
 
 instantiate_paged_attention_inkling2_ktm(
-    "paged_attention_inkling2_ktm_hs128_ps0", bfloat16_t, 0);
+    "paged_attention_inkling2_ktm_hs128_ps0", bfloat16_t, 0, false);
 instantiate_paged_attention_inkling2_ktm(
-    "paged_attention_inkling2_ktm_hs128_ps512", float, 512);
+    "paged_attention_inkling2_ktm_hs128_ps512", float, 512, false);
+instantiate_paged_attention_inkling2_ktm(
+    "paged_attention_inkling2_ktm_hs128_ps0_tree", bfloat16_t, 0, true);
+instantiate_paged_attention_inkling2_ktm(
+    "paged_attention_inkling2_ktm_hs128_ps512_tree", float, 512, true);
 
-#define instantiate_paged_attention_inkling2_bf16(name, out_type, bs, ps)      \
+#define instantiate_paged_attention_inkling2_bf16(name, out_type, bs, ps,      \
+                                                  has_tree)                    \
   template [[host_name(name)]] [[kernel]] void                                 \
-  paged_attention_inkling2_bf16<128, bs, ps>(                                  \
+  paged_attention_inkling2_bf16<128, bs, ps, has_tree>(                        \
       device float *exp_sums [[buffer(0)]],                                    \
       device float *max_logits [[buffer(1)]],                                  \
       device out_type *out [[buffer(2)]],                                      \
@@ -828,6 +890,7 @@ instantiate_paged_attention_inkling2_ktm(
       const device uchar *sink_raw [[buffer(22)]],                             \
       const device float *rel_bias_w [[buffer(23)]],                           \
       const constant Inkling2AttnExtraParams &extra [[buffer(24)]],            \
+      const device uint2 *tree_rows [[buffer(25)]],                            \
       threadgroup char *shared_mem [[threadgroup(0)]],                         \
       uint3 threadgroup_position_in_grid [[threadgroup_position_in_grid]],     \
       uint3 threadgroups_per_grid [[threadgroups_per_grid]],                   \
@@ -837,13 +900,25 @@ instantiate_paged_attention_inkling2_ktm(
       uint simd_lid [[thread_index_in_simdgroup]]);
 
 instantiate_paged_attention_inkling2_bf16(
-    "paged_attention_inkling2_bf16_hs128_bs16_ps0", bfloat16_t, 16, 0);
+    "paged_attention_inkling2_bf16_hs128_bs16_ps0", bfloat16_t, 16, 0, false);
 instantiate_paged_attention_inkling2_bf16(
-    "paged_attention_inkling2_bf16_hs128_bs16_ps512", float, 16, 512);
+    "paged_attention_inkling2_bf16_hs128_bs16_ps512", float, 16, 512, false);
 instantiate_paged_attention_inkling2_bf16(
-    "paged_attention_inkling2_bf16_hs128_bs32_ps0", bfloat16_t, 32, 0);
+    "paged_attention_inkling2_bf16_hs128_bs32_ps0", bfloat16_t, 32, 0, false);
 instantiate_paged_attention_inkling2_bf16(
-    "paged_attention_inkling2_bf16_hs128_bs32_ps512", float, 32, 512);
+    "paged_attention_inkling2_bf16_hs128_bs32_ps512", float, 32, 512, false);
+instantiate_paged_attention_inkling2_bf16(
+    "paged_attention_inkling2_bf16_hs128_bs16_ps0_tree", bfloat16_t, 16, 0,
+    true);
+instantiate_paged_attention_inkling2_bf16(
+    "paged_attention_inkling2_bf16_hs128_bs16_ps512_tree", float, 16, 512,
+    true);
+instantiate_paged_attention_inkling2_bf16(
+    "paged_attention_inkling2_bf16_hs128_bs32_ps0_tree", bfloat16_t, 32, 0,
+    true);
+instantiate_paged_attention_inkling2_bf16(
+    "paged_attention_inkling2_bf16_hs128_bs32_ps512_tree", float, 32, 512,
+    true);
 
 template [[host_name("paged_attention_inkling2_v2_reduce_hs128_ps512")]]
 [[kernel]] void paged_attention_inkling2_v2_reduce<128, 256, 512>(

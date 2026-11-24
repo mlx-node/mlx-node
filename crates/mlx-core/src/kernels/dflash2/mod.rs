@@ -19,6 +19,42 @@ pub(crate) fn topk16(logits: &MxArray) -> Option<(MxArray, MxArray)> {
     }
 }
 
+/// Fused selector edge scoring `[L, 16, 16]` FP32 with optional post-correction
+/// tanh softcap (`softcap > 0.0`). Returns `None` on decline/CPU.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn selector_edges(
+    candidates: &MxArray,
+    unary: &MxArray,
+    hidden: &MxArray,
+    predecessor: &MxArray,
+    successor: &MxArray,
+    anchor: &MxArray,
+    softcap: f32,
+) -> Option<MxArray> {
+    match active_backend() {
+        ActiveBackend::MetalGpu => metal::selector_edges(
+            candidates,
+            unary,
+            hidden,
+            predecessor,
+            successor,
+            anchor,
+            softcap,
+        ),
+        ActiveBackend::CudaGpu => cuda::selector_edges(
+            candidates,
+            unary,
+            hidden,
+            predecessor,
+            successor,
+            anchor,
+            softcap,
+        ),
+        ActiveBackend::Cpu => None,
+    }
+}
+
 /// Fused device-resident greedy predecessor path walk.
 #[inline]
 pub(crate) fn greedy_path(candidates: &MxArray, scores: &MxArray) -> Option<MxArray> {

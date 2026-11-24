@@ -15,6 +15,7 @@ import {
   type CatalogEntry,
   catalogBuildRepo,
   catalogBuildSlug,
+  catalogDraftSlug,
   visibleCatalog,
 } from '@mlx-node/agent';
 
@@ -65,6 +66,11 @@ function downloadModelArgv(build: CatalogBuild, modelsDir: string): string[] {
   argv.push('--complete');
   argv.push('-o', join(modelsDir, catalogBuildSlug(build)));
   return argv;
+}
+
+/** argv for `mlx download model` of a companion draft, pinned to the folder the dashboard installs it to. */
+function downloadDraftArgv(draft: NonNullable<CatalogEntry['draft']>, modelsDir: string): string[] {
+  return ['-m', draft.hfRepo, '--complete', '-o', join(modelsDir, catalogDraftSlug(draft))];
 }
 
 /**
@@ -118,10 +124,12 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
 
   if (!deps.io.isTTY) {
     const commands = catalog
-      .map(
-        (entry) =>
-          `  mlx download model ${downloadModelArgv(entry.builds[0], deps.modelsDir).map(shellQuote).join(' ')}`,
-      )
+      .map((entry) => {
+        const modelCmd = `mlx download model ${downloadModelArgv(entry.builds[0], deps.modelsDir).map(shellQuote).join(' ')}`;
+        if (entry.draft?.autoInstall !== true) return `  ${modelCmd}`;
+        const draftCmd = `mlx download model ${downloadDraftArgv(entry.draft, deps.modelsDir).map(shellQuote).join(' ')}`;
+        return `  ${modelCmd} && ${draftCmd}`;
+      })
       .join('\n');
     throw new Error(
       `No local models found. Run in a terminal for the setup wizard, or download one directly:\n${commands}`,
@@ -144,5 +152,18 @@ export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
   }
   const build = await chooseBuild(deps.io, chosenEntry);
   await deps.download(downloadModelArgv(build, deps.modelsDir));
+  if (chosenEntry.draft?.autoInstall === true) {
+    const draftArgv = downloadDraftArgv(chosenEntry.draft, deps.modelsDir);
+    deps.io.log(`Downloading companion ${chosenEntry.draft.label} (~${chosenEntry.draft.sizeGb} GB)...`);
+    try {
+      await deps.download(draftArgv);
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      deps.io.log(
+        `Warning: failed to download companion ${chosenEntry.draft.label} (${detail}). Continuing with ${chosenEntry.label}; retry later with:\n` +
+          `  mlx download model ${draftArgv.map(shellQuote).join(' ')}`,
+      );
+    }
+  }
   return catalogBuildSlug(build);
 }

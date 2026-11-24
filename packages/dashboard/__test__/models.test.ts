@@ -896,6 +896,7 @@ describe('catalog companion state', () => {
     const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
     expect(target.builds.some((build) => build.present)).toBe(false);
     expect(target.draft).toMatchObject({
+      autoInstall: true,
       present: true,
       installed: false,
       blockedByForeignDir: false,
@@ -911,6 +912,62 @@ describe('catalog companion state', () => {
     expect(state()).toMatchObject({ present: false, blockedByForeignDir: true });
     writeFileSync(join(draft, 'model.safetensors'), 'weights');
     expect(state()).toMatchObject({ present: true, installed: false, blockedByForeignDir: false });
+  });
+
+  it('tracks Inkling-2-Mini DFlash2 independently of bundled DSpark fallbacks', () => {
+    // Plant Inkling-2-Mini Original with bundled DSpark (`mtp.safetensors`) AND GGUF folder with a DSpark `.gguf`.
+    const origDir = join(modelsDir, 'inkling-2-mini');
+    mkdirSync(origDir);
+    writeFileSync(
+      join(origDir, 'config.json'),
+      JSON.stringify({
+        model_type: 'inkling2_loop',
+        mtp_config: { markov_rank: 256, target_layer_ids: [5, 23, 41, 48] },
+      }),
+    );
+    writeFileSync(join(origDir, 'model.safetensors'), 'target');
+    writeFileSync(join(origDir, 'mtp.safetensors'), 'dspark');
+
+    const state = () => catalogWithState(modelsDir).find((item) => item.label === 'Inkling-2-Mini')!.draft;
+    // Bundled DSpark fallback must NEVER make DFlash2 appear present.
+    expect(state()).toMatchObject({
+      slug: 'inkling-2-mini-dflash2',
+      hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+      autoInstall: true,
+      present: false,
+      installed: false,
+      blockedByForeignDir: false,
+    });
+
+    // An incomplete foreign `inkling-2-mini-dflash2` dir still reports as blocked even with bundled DSpark.
+    const draft = join(modelsDir, 'inkling-2-mini-dflash2');
+    mkdirSync(draft);
+    writeFileSync(
+      join(draft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    expect(state()).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
+
+    // Completing the DFlash2 companion marks it present (still unowned without completion marker).
+    writeFileSync(join(draft, 'model.safetensors'), 'dflash2');
+    expect(state()).toMatchObject({
+      present: true,
+      installed: false,
+      blockedByForeignDir: false,
+      localRevision: null,
+    });
+  });
+
+  it('recognizes an embedded DFlash2 draft under a non-first Inkling-2-Mini build', () => {
+    const embedded = join(modelsDir, 'inkling-2-mini', 'draft');
+    mkdirSync(embedded, { recursive: true });
+    writeFileSync(
+      join(embedded, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    writeFileSync(join(embedded, 'model.safetensors'), 'dflash2');
+    const draft = catalogWithState(modelsDir).find((item) => item.label === 'Inkling-2-Mini')!.draft;
+    expect(draft).toMatchObject({ present: true, installed: false, blockedByForeignDir: false });
   });
 });
 

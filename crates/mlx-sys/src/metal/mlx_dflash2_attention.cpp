@@ -28,7 +28,7 @@ bool supported(const std::vector<array>& a) {
   if (a.size() != 3 && a.size() != 4) return false;
   if (a[0].shape() != Shape{1, 32, 8, 128} || a[1].ndim() != 4 ||
       a[1].shape(0) != 1 || a[1].shape(1) != 8 || a[1].shape(2) < 8 ||
-      a[1].shape(2) > 2055 || a[1].shape(3) != 128 || a[2].shape() != a[1].shape())
+      a[1].shape(2) > 2056 || a[1].shape(3) != 128 || a[2].shape() != a[1].shape())
     return false;
   // MPP operands retain 16-byte row/base alignment. Arbitrary element-offset
   // views use generic SDPA instead of relying on undocumented tensor alignment.
