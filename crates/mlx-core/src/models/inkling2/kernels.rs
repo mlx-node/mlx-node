@@ -7446,4 +7446,234 @@ mod tests {
             "Q8 prefix [0..960) diverged between M=960 and M=2048 chunks"
         );
     }
+
+    #[test]
+    fn test_inkling2_paged_kv_path_commit_strided_and_lazy_bounds() {
+        if !metal_available() {
+            return;
+        }
+
+        let nb = 2usize;
+        let num_kv_heads = 2usize;
+        let block_size = 4usize;
+        let head_dim = 8usize;
+        let kv_mode = 2u32; // BF16 values_token_major: [nb, nkv, bs, hd]
+        let pool_capacity = (nb * block_size) as i64; // 8 slots (0..8)
+        let pool_shape = [
+            nb as i64,
+            num_kv_heads as i64,
+            block_size as i64,
+            head_dim as i64,
+        ];
+        let total_elems = nb * num_kv_heads * block_size * head_dim;
+
+        let make_pools = || -> (MxArray, MxArray, MxArray, Vec<f32>, Vec<f32>) {
+            let mut k_vals = vec![0.0_f32; total_elems];
+            let mut v_vals = vec![0.0_f32; total_elems];
+            for b in 0..nb {
+                for h in 0..num_kv_heads {
+                    for t in 0..block_size {
+                        let slot = b * block_size + t;
+                        for d in 0..head_dim {
+                            let idx = ((b * num_kv_heads + h) * block_size + t) * head_dim + d;
+                            // Small integers 1..=128 and -128..=-1 are exact in BF16.
+                            let val = (slot * 16 + h * 8 + d + 1) as f32;
+                            k_vals[idx] = val;
+                            v_vals[idx] = -val;
+                        }
+                    }
+                }
+            }
+            let k_pool = MxArray::from_float32(&k_vals, &pool_shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let v_pool = MxArray::from_float32(&v_vals, &pool_shape)
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let dummy_scale = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+            k_pool.eval();
+            v_pool.eval();
+            dummy_scale.eval();
+            (k_pool, v_pool, dummy_scale, k_vals, v_vals)
+        };
+
+        let slot_slice = |buf: &[f32], slot: usize, h: usize| -> Vec<f32> {
+            let b = slot / block_size;
+            let t = slot % block_size;
+            let start = ((b * num_kv_heads + h) * block_size + t) * head_dim;
+            buf[start..start + head_dim].to_vec()
+        };
+
+        // (a) Evaluated strided 1D `dst_slots` view with stride 2 where backing[1] = 0 (in-range)
+        //     while logical[1] = backing[2] = pool_capacity + 5 (out-of-range) -> FFI returns false.
+        {
+            let (k_pool, v_pool, dummy_scale, _, _) = make_pools();
+            let src_slots = MxArray::from_int64(&[1, 3], &[2]).unwrap();
+            let dst_backing = MxArray::from_int64(&[0, 0, pool_capacity + 5, 0], &[2, 2]).unwrap();
+            let dst_strided = dst_backing
+                .slice(&[0, 0], &[2, 1])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            dst_strided.eval();
+            assert!(
+                dst_strided.is_available(),
+                "evaluated strided dst_slots must be host-available"
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(dst_strided.as_raw_ptr()) },
+                3,
+                "dst_strided must remain a stride-2 view over the backing buffer"
+            );
+
+            let mut out_kp = std::ptr::null_mut();
+            let mut out_vp = std::ptr::null_mut();
+            let mut out_ks = std::ptr::null_mut();
+            let mut out_vs = std::ptr::null_mut();
+            let ok = unsafe {
+                mlx_sys::mlx_inkling2_paged_kv_path_commit(
+                    k_pool.as_raw_ptr(),
+                    v_pool.as_raw_ptr(),
+                    dummy_scale.as_raw_ptr(),
+                    dummy_scale.as_raw_ptr(),
+                    src_slots.as_raw_ptr(),
+                    dst_strided.as_raw_ptr(),
+                    num_kv_heads as u32,
+                    head_dim as u32,
+                    block_size as u32,
+                    kv_mode,
+                    &mut out_kp,
+                    &mut out_vp,
+                    &mut out_ks,
+                    &mut out_vs,
+                )
+            };
+            assert!(
+                !ok,
+                "FFI must reject strided dst_slots whose logical element exceeds pool capacity"
+            );
+            assert!(out_kp.is_null());
+            assert!(out_vp.is_null());
+            assert!(out_ks.is_null());
+            assert!(out_vs.is_null());
+        }
+
+        // (b) Lazy GPU-produced `dst_slots` containing an out-of-range slot (>= pool_capacity)
+        //     alongside a valid copy -> executes cleanly; OOB entry skipped by Metal `total_slots`
+        //     guard, valid entry copied accurately, and all other slots untouched.
+        {
+            let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+            let src_slots = MxArray::from_int64(&[6, 5], &[2]).unwrap();
+            let dst_base = MxArray::from_int64(&[2, pool_capacity + 3], &[2]).unwrap();
+            let dst_zero = MxArray::from_int64(&[0, 0], &[2]).unwrap();
+            let dst_lazy = dst_base.add(&dst_zero).unwrap();
+            assert!(
+                !dst_lazy.is_available(),
+                "lazy GPU-produced dst_slots must not be available before eval"
+            );
+
+            let (kp_out, vp_out, _, _) = inkling2_paged_kv_path_commit(
+                &k_pool,
+                &v_pool,
+                &dummy_scale,
+                &dummy_scale,
+                &src_slots,
+                &dst_lazy,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                kv_mode,
+            )
+            .unwrap();
+            let got_k = kp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let got_v = vp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+
+            for slot in 0..(nb * block_size) {
+                let expected_src = if slot == 2 { 6 } else { slot };
+                for h in 0..num_kv_heads {
+                    assert_eq!(
+                        slot_slice(got_k.as_ref(), slot, h),
+                        slot_slice(&orig_k, expected_src, h),
+                        "lazy OOB test k_pool mismatch at slot={slot}, h={h}"
+                    );
+                    assert_eq!(
+                        slot_slice(got_v.as_ref(), slot, h),
+                        slot_slice(&orig_v, expected_src, h),
+                        "lazy OOB test v_pool mismatch at slot={slot}, h={h}"
+                    );
+                }
+            }
+        }
+
+        // (c) Valid strided 1D `src_slots`/`dst_slots` views (with OOB poison values in the
+        //     skipped stride-2 gaps, covering both zero and non-zero view offsets) -> copies
+        //     exact logical strided slots into their destinations.
+        {
+            let (k_pool, v_pool, dummy_scale, orig_k, orig_v) = make_pools();
+            let src_backing = MxArray::from_int64(&[7, 999, 5, 888], &[2, 2]).unwrap();
+            let src_strided = src_backing
+                .slice(&[0, 0], &[2, 1])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            src_strided.eval();
+
+            let dst_backing = MxArray::from_int64(&[777, 1, 666, 3], &[2, 2]).unwrap();
+            let dst_strided = dst_backing
+                .slice(&[0, 1], &[2, 2])
+                .unwrap()
+                .squeeze(Some(&[1]))
+                .unwrap();
+            dst_strided.eval();
+
+            assert!(src_strided.is_available());
+            assert!(dst_strided.is_available());
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(src_strided.as_raw_ptr()) },
+                3
+            );
+            assert_eq!(
+                unsafe { mlx_sys::mlx_array_get_data_size(dst_strided.as_raw_ptr()) },
+                3
+            );
+
+            let (kp_out, vp_out, _, _) = inkling2_paged_kv_path_commit(
+                &k_pool,
+                &v_pool,
+                &dummy_scale,
+                &dummy_scale,
+                &src_strided,
+                &dst_strided,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                kv_mode,
+            )
+            .unwrap();
+            let got_k = kp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+            let got_v = vp_out.astype(DType::Float32).unwrap().to_float32().unwrap();
+
+            for slot in 0..(nb * block_size) {
+                let expected_src = match slot {
+                    1 => 7,
+                    3 => 5,
+                    _ => slot,
+                };
+                for h in 0..num_kv_heads {
+                    assert_eq!(
+                        slot_slice(got_k.as_ref(), slot, h),
+                        slot_slice(&orig_k, expected_src, h),
+                        "strided valid test k_pool mismatch at slot={slot}, h={h}"
+                    );
+                    assert_eq!(
+                        slot_slice(got_v.as_ref(), slot, h),
+                        slot_slice(&orig_v, expected_src, h),
+                        "strided valid test v_pool mismatch at slot={slot}, h={h}"
+                    );
+                }
+            }
+        }
+    }
 }

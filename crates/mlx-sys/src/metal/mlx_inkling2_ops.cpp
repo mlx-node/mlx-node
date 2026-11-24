@@ -197,8 +197,7 @@ struct Inkling2PagedKvPathCommitParams {
   uint32_t block_size;
   uint32_t kv_mode;
   uint32_t _pad0;
-  uint32_t _pad1;
-  uint32_t _pad2;
+  uint64_t total_slots;
 };
 static_assert(sizeof(Inkling2PagedKvPathCommitParams) == 32);
 
@@ -2324,22 +2323,6 @@ class Inkling2PagedKvPathCommit : public fast::Custom {
     const array& dst_slots = inputs[5];
 
     const uint32_t num_copies = static_cast<uint32_t>(src_slots.shape(0));
-    if (num_copies > 0u) {
-      const int64_t pool_capacity =
-          static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size_);
-      const int64_t* s_data = src_slots.data<int64_t>();
-      const int64_t* d_data = dst_slots.data<int64_t>();
-      for (uint32_t i = 0; i < num_copies; ++i) {
-        if (s_data[i] >= pool_capacity || d_data[i] >= pool_capacity) {
-          throw std::invalid_argument(
-              "Inkling2PagedKvPathCommit: slot exceeds pool capacity");
-        }
-      }
-    }
-
-    array src_c = ensure_row_contiguous(src_slots, s, enc);
-    array dst_c = ensure_row_contiguous(dst_slots, s, enc);
-
     outputs[0].copy_shared_buffer(k_pool);
     outputs[1].copy_shared_buffer(v_pool);
     outputs[2].copy_shared_buffer(k_scale);
@@ -2348,6 +2331,14 @@ class Inkling2PagedKvPathCommit : public fast::Custom {
     if (num_copies == 0u) {
       return;
     }
+
+    array src_c = ensure_row_contiguous(src_slots, s, enc);
+    array dst_c = ensure_row_contiguous(dst_slots, s, enc);
+
+    const uint64_t pool_capacity = k_pool.shape(0) > 0
+        ? static_cast<uint64_t>(k_pool.shape(0)) *
+            static_cast<uint64_t>(block_size_)
+        : 0ull;
 
     const float dummy = 0.0f;
     enc.set_compute_pipeline_state(get_cached_inkling2_kernel(
@@ -2364,7 +2355,13 @@ class Inkling2PagedKvPathCommit : public fast::Custom {
     enc.set_input_array(src_c, 4);
     enc.set_input_array(dst_c, 5);
     Inkling2PagedKvPathCommitParams params{
-        num_copies, num_kv_heads_, head_dim_, block_size_, kv_mode_, 0u, 0u, 0u};
+        num_copies,
+        num_kv_heads_,
+        head_dim_,
+        block_size_,
+        kv_mode_,
+        0u,
+        pool_capacity};
     enc.set_bytes(params, 6);
     // Keep BOTH pre- and post-dispatch barriers: `Inkling2PagedKvPathCommit`
     // reads `src_slots` and writes `dst_slots` in-place via `bind_inplace_pool_output`
@@ -5887,6 +5884,23 @@ bool mlx_inkling2_paged_kv_path_commit(
           k_pool.shape() != Shape{nb, nkv, bs, hd} ||
           v_pool.shape() != Shape{nb, nkv, bs, hd}) {
         return false;
+      }
+    }
+    const int64_t pool_capacity =
+        static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size);
+    if (src_slots.shape(0) > 0 && src_slots.is_available() &&
+        dst_slots.is_available() && src_slots.data_shared_ptr() &&
+        dst_slots.data_shared_ptr()) {
+      const int64_t s_stride = src_slots.strides(0);
+      const int64_t d_stride = dst_slots.strides(0);
+      const int64_t* s_data = src_slots.data<int64_t>();
+      const int64_t* d_data = dst_slots.data<int64_t>();
+      for (int i = 0; i < src_slots.shape(0); ++i) {
+        const int64_t sv = s_data[static_cast<int64_t>(i) * s_stride];
+        const int64_t dv = d_data[static_cast<int64_t>(i) * d_stride];
+        if (sv < 0 || dv < 0 || sv >= pool_capacity || dv >= pool_capacity) {
+          return false;
+        }
       }
     }
     auto s = to_stream(Device::gpu);

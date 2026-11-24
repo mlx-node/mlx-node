@@ -5102,11 +5102,20 @@ export interface Inkling2ContextLimits {
 
 /** Optional load-time configuration for [`Inkling2Model::load`]. */
 export interface Inkling2LoadOptions {
-  /** Optional external DSpark drafter checkpoint path. */
+  /**
+   * Optional explicit external speculative drafter checkpoint path (DFlash2 directory or DSpark GGUF/SafeTensors).
+   * Strict: fails hard on load or validation error; pass `"none"` / `"off"` / `""` to disable all drafts.
+   */
   draftModelPath?: string;
-  /** Optional auto-discovered external draft checkpoint path (soft fallback on load failure when `autoLoadDraft` is enabled). */
+  /**
+   * Optional auto-discovered external DFlash2 companion candidate path tried with soft fallback
+   * (falls through to sibling DFlash2, bundled DSpark, or pure AR on load/validation error)
+   * when `draft_model_path` is unset and `auto_load_draft != Some(false)`. Ignored when
+   * `draft_model_path` is set or `auto_load_draft == Some(false)`; whereas `draft_model_path`
+   * remains strict/explicit.
+   */
   autoDraftModelPath?: string;
-  /** Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`). */
+  /** Auto-discover a colocated/sibling DFlash2 or bundled DSpark drafter when `draft_model_path` is unset (default `true`). */
   autoLoadDraft?: boolean;
   /** KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`. */
   kvFormat?: 'int8' | 'bf16' | undefined;

@@ -927,6 +927,14 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.has_speculative_draft() && self.paged.is_some()
     }
 
+    fn speculative_turn_requires_exclusive_lane(
+        &self,
+        params: &crate::engine::params::ChatParams,
+    ) -> bool {
+        let policy = super::dflash2::Inkling2VerifyTreePolicy::from_env();
+        should_use_exclusive_verify_tree_lane(self.dflash2.is_some(), params, policy.mode)
+    }
+
     fn scheduled_sampled_rows(&self) -> bool {
         self.has_speculative_draft()
     }
@@ -1188,9 +1196,157 @@ impl HybridSchedulerBackend for Inkling2Inner {
     }
 }
 
+/// Pure decision helper for Inkling-2-Mini DFlash2 verify-tree exclusive-lane
+/// routing. Mirrors the whole-turn stepper's `tree_greedy_unpenalized` check in
+/// `engine::dspark_turn` and
+/// [`super::dflash2::Inkling2VerifyTreePolicy::tree_path_active`]: greedy
+/// unpenalized DFlash2 turns take the exclusive whole-turn lane when `mode` is
+/// `Auto` or `Always`, while `Off`, sampled, penalized, and DSpark-only turns
+/// stay on the multi-lane scheduled verifier.
+pub(crate) fn should_use_exclusive_verify_tree_lane(
+    has_dflash2: bool,
+    params: &crate::engine::params::ChatParams,
+    mode: super::dflash2::Inkling2VerifyTreeMode,
+) -> bool {
+    if !has_dflash2 {
+        return false;
+    }
+    let policy = super::dflash2::Inkling2VerifyTreePolicy {
+        mode,
+        ..super::dflash2::Inkling2VerifyTreePolicy::default()
+    };
+    if !policy.tree_path_active() {
+        return false;
+    }
+    let temperature = params
+        .sampling_config
+        .and_then(|config| config.temperature)
+        .unwrap_or(1.0);
+    crate::sampling::is_greedy_temperature(temperature)
+        && params.repetition_penalty == 1.0
+        && params.presence_penalty == 0.0
+        && params.frequency_penalty == 0.0
+}
+
 /// Ensure `AtomicBool` import stays used by tests and scheduler helpers.
 #[allow(dead_code)]
 fn _cancel_flag_type_check(_flag: &Arc<AtomicBool>) {}
+
+#[cfg(test)]
+mod verify_tree_routing_tests {
+    use super::should_use_exclusive_verify_tree_lane;
+    use crate::engine::params::extract_chat_params;
+    use crate::engine::types::ChatConfig;
+    use crate::models::inkling2::dflash2::Inkling2VerifyTreeMode;
+
+    fn params_with(config: ChatConfig) -> crate::engine::params::ChatParams {
+        extract_chat_params(&config)
+    }
+
+    #[test]
+    fn dflash2_greedy_unpenalized_routes_by_verify_tree_mode() {
+        let greedy = params_with(ChatConfig {
+            enable_mtp: Some(true),
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        });
+        assert!(should_use_exclusive_verify_tree_lane(
+            true,
+            &greedy,
+            Inkling2VerifyTreeMode::Auto
+        ));
+        assert!(should_use_exclusive_verify_tree_lane(
+            true,
+            &greedy,
+            Inkling2VerifyTreeMode::Always
+        ));
+        assert!(!should_use_exclusive_verify_tree_lane(
+            true,
+            &greedy,
+            Inkling2VerifyTreeMode::Off
+        ));
+
+        // Near-zero f32 greedy boundary matches `is_greedy_temperature`.
+        let near_zero = params_with(ChatConfig {
+            enable_mtp: Some(true),
+            temperature: Some(1e-7),
+            ..ChatConfig::default()
+        });
+        assert!(should_use_exclusive_verify_tree_lane(
+            true,
+            &near_zero,
+            Inkling2VerifyTreeMode::Auto
+        ));
+    }
+
+    #[test]
+    fn sampled_penalized_and_dspark_only_turns_stay_on_scheduled_lane() {
+        let modes = [
+            Inkling2VerifyTreeMode::Auto,
+            Inkling2VerifyTreeMode::Always,
+            Inkling2VerifyTreeMode::Off,
+        ];
+
+        // Sampled explicit & unset temperature (defaults to 1.0).
+        for temp in [Some(1.0), Some(0.7), Some(1e-3), None] {
+            let p = params_with(ChatConfig {
+                enable_mtp: Some(true),
+                temperature: temp,
+                ..ChatConfig::default()
+            });
+            for mode in modes {
+                assert!(
+                    !should_use_exclusive_verify_tree_lane(true, &p, mode),
+                    "sampled temp={temp:?} mode={mode:?} must stay scheduled"
+                );
+            }
+        }
+
+        // Greedy with any non-neutral penalty stays scheduled (matches `dspark_turn`).
+        let penalized_configs = [
+            ChatConfig {
+                enable_mtp: Some(true),
+                temperature: Some(0.0),
+                repetition_penalty: Some(1.1),
+                ..ChatConfig::default()
+            },
+            ChatConfig {
+                enable_mtp: Some(true),
+                temperature: Some(0.0),
+                presence_penalty: Some(0.2),
+                ..ChatConfig::default()
+            },
+            ChatConfig {
+                enable_mtp: Some(true),
+                temperature: Some(0.0),
+                frequency_penalty: Some(0.2),
+                ..ChatConfig::default()
+            },
+        ];
+        for cfg in penalized_configs {
+            let p = params_with(cfg);
+            for mode in modes {
+                assert!(
+                    !should_use_exclusive_verify_tree_lane(true, &p, mode),
+                    "penalized greedy mode={mode:?} must stay scheduled"
+                );
+            }
+        }
+
+        // DSpark-only (`has_dflash2 == false`) greedy stays on scheduled lane.
+        let greedy = params_with(ChatConfig {
+            enable_mtp: Some(true),
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        });
+        for mode in modes {
+            assert!(
+                !should_use_exclusive_verify_tree_lane(false, &greedy, mode),
+                "DSpark-only greedy mode={mode:?} must stay scheduled"
+            );
+        }
+    }
+}
 
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
