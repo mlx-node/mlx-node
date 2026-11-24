@@ -345,14 +345,14 @@ function TrendPlot(props: TrendPlotProps): ReactElement {
                   <MorphPath
                     className={styles.area}
                     style={lines[0].style}
-                    exact={areaPath(lines[0].points, height)}
+                    exact={areaPath(lines[0].points, height, curve)}
                     samples={lines[0].samples}
-                    toPath={(mixed) => areaPath(zipPoints(sx, mixed), height)}
+                    toPath={(mixed) => areaPath(zipPoints(sx, mixed), height, curve)}
                     signature={signature}
                     progress={progress}
                   />
                 ) : (
-                  <path className={styles.area} d={areaPath(lines[0].points, height)} style={lines[0].style} />
+                  <path className={styles.area} d={areaPath(lines[0].points, height, curve)} style={lines[0].style} />
                 )
               ) : null}
               {lines.map((line) => {

@@ -738,7 +738,7 @@ interface TimelineSpanBase {
 }
 
 export type TimelineSpan =
-  | (TimelineSpanBase & { kind: 'generate'; phase: 'reasoning' | 'answer' })
+  | (TimelineSpanBase & { kind: 'generate'; phase: 'reasoning' | 'answer' | 'tool-call' })
   | (TimelineSpanBase & { kind: 'tool'; tools: string[]; calls: number; failedCalls: number })
   /** until: what ended the wait. 'open' = still waiting (running) or cut by the lane's end. */
   | (TimelineSpanBase & { kind: 'wait'; reason: 'model'; until: 'text' | 'tool' | 'open' })

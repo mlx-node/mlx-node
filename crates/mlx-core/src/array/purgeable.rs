@@ -80,6 +80,44 @@ impl BankWatch {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn mincore_pages(
+    ptr: SendPtr<u8>,
+    nbytes: usize,
+    page: usize,
+    status: &mut Vec<u8>,
+) -> Result<usize> {
+    if nbytes == 0 {
+        return Ok(0);
+    }
+    let pages = nbytes.div_ceil(page);
+    status.resize(pages, 0);
+    // SAFETY: caller guarantees `[ptr, ptr + nbytes)` is a live, page-aligned
+    // mapping for the duration of the call; `mincore` writes one byte per page.
+    let rc = unsafe { libc::mincore(ptr.0.cast::<c_void>(), nbytes, status.as_mut_ptr().cast()) };
+    if rc != 0 {
+        return Err(Error::from_reason(format!(
+            "purgeable bank: mincore failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(status.iter().filter(|&&v| v & 1 != 0).count())
+}
+
+#[cfg(target_os = "macos")]
+fn run_chunk_workers<'a, F, S>(workers: usize, mut spawn_helper: S, drain: &'a F)
+where
+    F: Fn() + Sync + 'a,
+    S: FnMut(&'a F) -> std::io::Result<()>,
+{
+    for _ in 0..workers.saturating_sub(1) {
+        if spawn_helper(drain).is_err() {
+            break;
+        }
+    }
+    drain();
+}
+
 /// One anonymous no-copy Metal allocation and its MLX array.
 ///
 /// Complete GPU reads before making a bank volatile. Before any subsequent CPU
@@ -172,28 +210,123 @@ impl PurgeableBank {
         #[cfg(target_os = "macos")]
         {
             let page = super::page_size();
-            let mut status = vec![0u8; self.shared.nbytes.div_ceil(page)];
-            // SAFETY: the pointer is the page-aligned start of the live bank
-            // and the length its size; mincore writes one byte per page.
-            let rc = unsafe {
-                libc::mincore(
-                    self.data.0.cast::<c_void>(),
-                    self.shared.nbytes,
-                    status.as_mut_ptr().cast(),
-                )
-            };
-            if rc != 0 {
-                return Err(Error::from_reason(format!(
-                    "purgeable bank: mincore failed: {}",
-                    std::io::Error::last_os_error()
-                )));
-            }
-            let pages = status.iter().filter(|&&v| v & 1 != 0).count();
+            let mut status = Vec::new();
+            let pages = mincore_pages(self.data, self.shared.nbytes, page, &mut status)?;
             Ok((pages * page).min(self.shared.nbytes) as u64)
         }
         #[cfg(not(target_os = "macos"))]
         {
             Ok(self.shared.nbytes as u64)
+        }
+    }
+
+    /// Bytes of each bank's pages resident in RAM now. On macOS, scans large
+    /// bank sets in page-aligned chunks across worker threads so multi-dozen-GiB
+    /// banks don't stall single-threaded `mincore` probes.
+    pub(crate) fn resident_bytes_batch(banks: &[&PurgeableBank]) -> Result<Vec<u64>> {
+        #[cfg(target_os = "macos")]
+        {
+            const PARALLEL_MIN_BYTES: usize = 64 << 20;
+            const CHUNK_BYTES: usize = 256 << 20;
+
+            if banks.is_empty() {
+                return Ok(Vec::new());
+            }
+            let page = super::page_size();
+            let total_bytes: usize = banks.iter().map(|b| b.shared.nbytes).sum();
+            if total_bytes < PARALLEL_MIN_BYTES {
+                let mut status = Vec::new();
+                let mut out = Vec::with_capacity(banks.len());
+                for b in banks {
+                    let pages = mincore_pages(b.data, b.shared.nbytes, page, &mut status)?;
+                    out.push((pages * page).min(b.shared.nbytes) as u64);
+                }
+                return Ok(out);
+            }
+
+            let chunk_size = (CHUNK_BYTES / page).max(1) * page;
+            let mut chunks: Vec<(usize, SendPtr<u8>, usize)> = Vec::new();
+            for (idx, b) in banks.iter().enumerate() {
+                let nbytes = b.shared.nbytes;
+                let mut offset = 0usize;
+                while offset < nbytes {
+                    let len = chunk_size.min(nbytes - offset);
+                    // SAFETY: `offset < nbytes`, staying within the single live
+                    // allocation borrowed for the duration of `thread::scope`.
+                    let ptr = SendPtr(unsafe { b.data.0.add(offset) });
+                    chunks.push((idx, ptr, len));
+                    offset += len;
+                }
+            }
+
+            let workers = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(4)
+                .clamp(1, 8)
+                .min(chunks.len().max(1));
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let page_counts: Vec<std::sync::atomic::AtomicUsize> = (0..banks.len())
+                .map(|_| std::sync::atomic::AtomicUsize::new(0))
+                .collect();
+            let first_err: Mutex<Option<Error>> = Mutex::new(None);
+            let failed = std::sync::atomic::AtomicBool::new(false);
+
+            let drain = || {
+                let mut status = Vec::new();
+                loop {
+                    if failed.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(bank_idx, ptr, len)) = chunks.get(i) else {
+                        break;
+                    };
+                    match mincore_pages(ptr, len, page, &mut status) {
+                        Ok(pages) => {
+                            page_counts[bank_idx].fetch_add(pages, Ordering::Relaxed);
+                        }
+                        Err(err) => {
+                            failed.store(true, Ordering::Relaxed);
+                            let mut slot = first_err
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            if slot.is_none() {
+                                *slot = Some(err);
+                            }
+                            break;
+                        }
+                    }
+                }
+            };
+
+            std::thread::scope(|scope| {
+                run_chunk_workers(
+                    workers,
+                    |work| {
+                        std::thread::Builder::new()
+                            .name("mlx-mincore".into())
+                            .spawn_scoped(scope, work)
+                            .map(|_| ())
+                    },
+                    &drain,
+                );
+            });
+
+            if let Some(err) = first_err
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+            {
+                return Err(err);
+            }
+            Ok(banks
+                .iter()
+                .zip(page_counts)
+                .map(|(b, count)| (count.into_inner() * page).min(b.shared.nbytes) as u64)
+                .collect())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Ok(banks.iter().map(|b| b.shared.nbytes as u64).collect())
         }
     }
 
@@ -570,5 +703,66 @@ mod tests {
             assert!(PurgeableBank::new(&[BANK_BYTES as i64], DType::Uint8).is_err());
         }
         assert_eq!(reclaimable_purgeable_bytes(), before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn resident_bytes_batch_survives_helper_spawn_failure() {
+        use std::sync::atomic::AtomicUsize;
+
+        let chunks: Vec<(usize, usize)> = (0..128).map(|i| (i % 3, (i % 7) + 1)).collect();
+        let mut expected = [0usize; 3];
+        for &(bank_idx, pages) in &chunks {
+            expected[bank_idx] += pages;
+        }
+
+        for allow_helpers in [1usize, 0usize] {
+            let next = AtomicUsize::new(0);
+            let visits: Vec<AtomicUsize> = (0..chunks.len()).map(|_| AtomicUsize::new(0)).collect();
+            let page_counts = [
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+                AtomicUsize::new(0),
+            ];
+            let mut attempts = 0usize;
+            let mut spawned = 0usize;
+
+            let drain = || {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&(bank_idx, pages)) = chunks.get(i) else {
+                        break;
+                    };
+                    visits[i].fetch_add(1, Ordering::Relaxed);
+                    page_counts[bank_idx].fetch_add(pages, Ordering::Relaxed);
+                }
+            };
+
+            std::thread::scope(|scope| {
+                run_chunk_workers(
+                    6,
+                    |work| {
+                        attempts += 1;
+                        if spawned < allow_helpers {
+                            std::thread::Builder::new()
+                                .name("mlx-mincore-test".into())
+                                .spawn_scoped(scope, work)
+                                .map(|_| {
+                                    spawned += 1;
+                                })
+                        } else {
+                            Err(std::io::Error::from_raw_os_error(libc::EAGAIN))
+                        }
+                    },
+                    &drain,
+                );
+            });
+
+            assert_eq!(spawned, allow_helpers);
+            assert_eq!(attempts, allow_helpers + 1);
+            assert!(visits.iter().all(|v| v.load(Ordering::Relaxed) == 1));
+            let got = page_counts.map(AtomicUsize::into_inner);
+            assert_eq!(got, expected);
+        }
     }
 }

@@ -79,11 +79,16 @@ describe('LiveStream', () => {
     expect(moves).toBe(2);
   });
 
-  it('a hole under 20 s stays one line', () => {
+  it('a hole under 20 s stays one line with smooth monotone curves', () => {
     const { container } = mount(liveStream(stream(90, [40, 31])));
     const group = byRole(container, 'group', 'Output rate') as HTMLElement;
+    const area = group.querySelector('g > path:nth-of-type(1)');
     const line = group.querySelector('g > path:nth-of-type(2)');
-    expect((line?.getAttribute('d') ?? '').split('M').length - 1).toBe(1);
+    const lineD = line?.getAttribute('d') ?? '';
+    const areaD = area?.getAttribute('d') ?? '';
+    expect(lineD.split('M').length - 1).toBe(1);
+    expect(lineD).toContain('C');
+    expect(areaD).toContain('C');
   });
 
   it('reports live, paused and stopped in data-state', () => {

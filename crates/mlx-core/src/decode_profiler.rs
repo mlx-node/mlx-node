@@ -46,7 +46,6 @@
 //! profiler.report();
 //! ```
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use crate::profiling;
@@ -75,25 +74,25 @@ fn is_env_enabled() -> bool {
 pub struct DecodeProfiler {
     enabled: bool,
     env_enabled: bool,
+    record_spans: bool,
     inference_logging_enabled: bool,
     label: &'static str,
     model_type: &'static str,
-    phases: HashMap<&'static str, PhaseStats>,
-    phase_order: Vec<&'static str>,
-    /// Stack of in-flight phases. Each frame stores its own `(name, start,
+    phases: Vec<(&'static str, PhaseStats)>,
+    /// Stack of in-flight phases. Each frame stores its own `(phase_idx, start,
     /// steady-clock start)`, so nested begin/end pairs compose correctly
     /// (e.g. outer `mtp_cycle` can wrap inner `draft`, `verify`, etc.
-    /// without losing the cycle total).
-    phase_stack: Vec<(&'static str, Instant, f64)>,
+    /// without losing the cycle total) without hashing on `end()`.
+    phase_stack: Vec<(usize, Instant, f64)>,
     /// Every closed phase as a timestamped span, for the per-cycle timeline
-    /// dump (`[dspark-span]`). Empty while disabled.
+    /// dump (`[dspark-span]`). Populated only when `record_spans` is true.
     spans: Vec<Span>,
-    /// One entry per `record_mtp_cycle` while enabled.
+    /// One entry per `record_mtp_cycle` while `record_spans` is true.
     cycle_marks: Vec<CycleMark>,
     /// Current cycle index for spans; `begin_cycle` advances it (1-based,
     /// `0` = before the first cycle).
     cycle_index: u32,
-    loop_start: Instant,
+    loop_start: Option<Instant>,
     /// Number of emitted generated output tokens, including the first token.
     /// Decode throughput derives its numerator as `num_tokens - 1` because the
     /// first token belongs to TTFT.
@@ -160,16 +159,16 @@ impl DecodeProfiler {
         Self {
             enabled,
             env_enabled,
+            record_spans: env_enabled,
             inference_logging_enabled,
             label,
             model_type,
-            phases: HashMap::new(),
-            phase_order: Vec::new(),
+            phases: Vec::new(),
             phase_stack: Vec::new(),
             spans: Vec::new(),
             cycle_marks: Vec::new(),
             cycle_index: 0,
-            loop_start: Instant::now(),
+            loop_start: enabled.then(Instant::now),
             num_tokens: 0,
             prompt_tokens: 0,
             prefill_start: None,
@@ -186,6 +185,12 @@ impl DecodeProfiler {
             mtp_attempt_by_position: Vec::new(),
             mtp_accept_by_position: Vec::new(),
         }
+    }
+
+    /// Whether timing instrumentation is enabled for this turn.
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
     }
 
     /// Update the label (e.g. after branching compiled vs rust).
@@ -222,7 +227,7 @@ impl DecodeProfiler {
             self.prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
         }
         // Reset loop_start to measure decode time from here
-        self.loop_start = Instant::now();
+        self.loop_start = Some(Instant::now());
     }
 
     /// Take a memory snapshot before generation.
@@ -262,15 +267,19 @@ impl DecodeProfiler {
     ///
     /// First-seen ordering is established here on `begin()` so that an outer
     /// phase (begun first, ended last) still appears before inner phases in
-    /// `phase_order`.
+    /// `phases`.
     #[inline]
     pub fn begin(&mut self, phase: &'static str) {
         if !self.enabled {
             return;
         }
-        self.register_phase(phase);
-        self.phase_stack
-            .push((phase, Instant::now(), steady_now_s()));
+        let idx = self.register_phase(phase);
+        let start_s = if self.record_spans {
+            steady_now_s()
+        } else {
+            0.0
+        };
+        self.phase_stack.push((idx, Instant::now(), start_s));
     }
 
     /// `begin` for the phase that wraps one speculative cycle: every span
@@ -291,15 +300,19 @@ impl DecodeProfiler {
         if !self.enabled {
             return;
         }
-        if let Some((phase, start, start_s)) = self.phase_stack.pop() {
+        if let Some((idx, start, start_s)) = self.phase_stack.pop() {
             let elapsed_us = start.elapsed().as_micros() as u64;
-            self.accumulate(phase, elapsed_us);
-            self.spans.push(Span {
-                phase,
-                cycle: self.cycle_index,
-                start_s,
-                end_s: steady_now_s(),
-            });
+            let (phase, stats) = &mut self.phases[idx];
+            stats.total_us += elapsed_us;
+            stats.count += 1;
+            if self.record_spans {
+                self.spans.push(Span {
+                    phase: *phase,
+                    cycle: self.cycle_index,
+                    start_s,
+                    end_s: steady_now_s(),
+                });
+            }
         }
     }
 
@@ -312,33 +325,29 @@ impl DecodeProfiler {
         if !self.enabled {
             return;
         }
-        self.register_phase(name);
+        let idx = self.register_phase(name);
         let elapsed_us = dur.as_micros() as u64;
-        self.accumulate(name, elapsed_us);
+        let stats = &mut self.phases[idx].1;
+        stats.total_us += elapsed_us;
+        stats.count += 1;
     }
 
-    /// Register `name` in `phase_order` on first sight, and ensure a
-    /// `PhaseStats` entry exists. Idempotent on repeated calls.
+    /// Ensure a `PhaseStats` entry exists for `name` (in first-seen order)
+    /// and return its index. Idempotent on repeated calls.
     #[inline]
-    fn register_phase(&mut self, name: &'static str) {
-        let phase_order = &mut self.phase_order;
-        self.phases.entry(name).or_insert_with(|| {
-            phase_order.push(name);
+    fn register_phase(&mut self, name: &'static str) -> usize {
+        if let Some(idx) = self.phases.iter().position(|(k, _)| *k == name) {
+            return idx;
+        }
+        let idx = self.phases.len();
+        self.phases.push((
+            name,
             PhaseStats {
                 total_us: 0,
                 count: 0,
-            }
-        });
-    }
-
-    /// Accumulate `elapsed_us` into `phases[name]`. Callers MUST have run
-    /// `register_phase(name)` first; an unregistered name is silently dropped.
-    #[inline]
-    fn accumulate(&mut self, name: &'static str, elapsed_us: u64) {
-        if let Some(stats) = self.phases.get_mut(name) {
-            stats.total_us += elapsed_us;
-            stats.count += 1;
-        }
+            },
+        ));
+        idx
     }
 
     /// Record one emitted generated output token, including the first token.
@@ -366,7 +375,7 @@ impl DecodeProfiler {
     #[inline]
     pub fn record_mtp_cycle(&mut self, depth: usize, accepted_drafts: usize) {
         let k = accepted_drafts.min(depth);
-        if self.enabled {
+        if self.record_spans {
             self.cycle_marks.push(CycleMark {
                 cycle: self.cycle_index,
                 depth: depth as u32,
@@ -400,7 +409,7 @@ impl DecodeProfiler {
         &self.cycle_marks
     }
 
-    /// Test-only: force the profiler on so `begin`/`end` record phases.
+    /// Test-only: force the profiler on so `begin`/`end` record phases and spans.
     /// `begin` no-ops while `!enabled`, so a test that wants to observe
     /// which decode branch ran (via [`ran_phase`]) must call this first.
     /// Enabling only turns on timing instrumentation — it never changes
@@ -410,6 +419,8 @@ impl DecodeProfiler {
     #[cfg(test)]
     pub(crate) fn enable_for_test(&mut self) {
         self.enabled = true;
+        self.record_spans = true;
+        self.loop_start.get_or_insert_with(Instant::now);
     }
 
     /// Test-only: did a phase with this exact name run (i.e. was
@@ -421,7 +432,7 @@ impl DecodeProfiler {
     /// [`enable_for_test`]: Self::enable_for_test
     #[cfg(test)]
     pub(crate) fn ran_phase(&self, name: &str) -> bool {
-        self.phases.contains_key(name)
+        self.phases.iter().any(|(k, _)| *k == name)
     }
 
     /// Test-only view of `(generated tokens, post-first decode tokens)`.
@@ -503,15 +514,13 @@ impl DecodeProfiler {
     /// and `GenerationProfile`.
     fn phase_profiles(&self) -> Vec<PhaseProfile> {
         let n = (self.num_tokens as f64).max(1.0);
-        self.phase_order
+        self.phases
             .iter()
-            .filter_map(|&name| {
-                self.phases.get(name).map(|stats| PhaseProfile {
-                    name: name.to_string(),
-                    total_ms: stats.total_us as f64 / 1000.0,
-                    avg_us_per_token: stats.total_us as f64 / n,
-                    count: stats.count as u32,
-                })
+            .map(|(name, stats)| PhaseProfile {
+                name: (*name).to_string(),
+                total_ms: stats.total_us as f64 / 1000.0,
+                avg_us_per_token: stats.total_us as f64 / n,
+                count: stats.count as u32,
             })
             .collect()
     }
@@ -556,7 +565,8 @@ impl DecodeProfiler {
         // decode throughput.
         let n = self.num_tokens.saturating_sub(1) as f64;
         let report_time = Instant::now();
-        let decode_start = self.first_token_time.unwrap_or(self.loop_start);
+        let loop_start = self.loop_start.unwrap_or(report_time);
+        let decode_start = self.first_token_time.unwrap_or(loop_start);
         let decode_ms = report_time
             .saturating_duration_since(decode_start)
             .as_secs_f64()
@@ -572,7 +582,7 @@ impl DecodeProfiler {
             .map(|t| {
                 // TTFT = prefill time + time from decode loop start to first token
                 let from_loop_start =
-                    t.saturating_duration_since(self.loop_start).as_secs_f64() * 1000.0;
+                    t.saturating_duration_since(loop_start).as_secs_f64() * 1000.0;
                 self.prefill_ms + from_loop_start
             })
             .unwrap_or(0.0);
@@ -667,12 +677,6 @@ impl DecodeProfiler {
         }
     }
 
-    /// Check if the profiler is enabled (for testing).
-    #[cfg(test)]
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     fn format_stderr_report(&self, n: f64, wall_ms: f64, wall_tok_s: f64) -> String {
         let mut lines = Vec::new();
 
@@ -689,20 +693,18 @@ impl DecodeProfiler {
         ));
 
         let mut cpu_total_us: u64 = 0;
-        for phase in &self.phase_order {
-            if let Some(stats) = self.phases.get(phase) {
-                cpu_total_us += stats.total_us;
-                let ms = stats.total_us as f64 / 1000.0;
-                let us_per_tok = if n > 0.0 {
-                    stats.total_us as f64 / n
-                } else {
-                    0.0
-                };
-                lines.push(format!(
-                    "  {:<20} {:>8.1}ms ({:>7.1}us/tok, {} calls)",
-                    phase, ms, us_per_tok, stats.count
-                ));
-            }
+        for (phase, stats) in &self.phases {
+            cpu_total_us += stats.total_us;
+            let ms = stats.total_us as f64 / 1000.0;
+            let us_per_tok = if n > 0.0 {
+                stats.total_us as f64 / n
+            } else {
+                0.0
+            };
+            lines.push(format!(
+                "  {:<20} {:>8.1}ms ({:>7.1}us/tok, {} calls)",
+                phase, ms, us_per_tok, stats.count
+            ));
         }
 
         let cpu_ms = cpu_total_us as f64 / 1000.0;

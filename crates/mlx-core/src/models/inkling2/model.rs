@@ -19,7 +19,7 @@ use crate::model_thread::ModelThread;
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::Embedding;
 use crate::stream::WiredResidency;
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::inkling::IMAGE_PAD_ID;
 use crate::transformer::Activations;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
@@ -805,6 +805,7 @@ pub struct Inkling2Model {
     #[allow(dead_code)]
     pub(crate) config: Inkling2Config,
     pub(crate) vision_config: Option<Inkling2VisionConfig>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) paged_active: bool,
     pub(crate) scheduled_lanes: u32,
     pub(crate) vision_active: bool,
@@ -874,6 +875,38 @@ impl Inkling2Model {
     #[napi]
     pub fn context_limits(&self) -> Inkling2ContextLimits {
         self.context_limits.clone()
+    }
+
+    /// Render chat messages to Inkling2 native wire token IDs using the loaded tokenizer
+    /// without touching the GPU scheduler thread or inference caches.
+    #[napi]
+    pub async fn apply_chat_template(
+        &self,
+        messages: Vec<ChatMessage>,
+        add_generation_prompt: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
+    ) -> Result<Uint32Array> {
+        let _ = add_generation_prompt;
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Inkling2 tokenizer not loaded"))?;
+        let ids = tokio::task::spawn_blocking(move || {
+            super::paged_forward::render_inkling2_prompt(
+                &tokenizer,
+                &messages,
+                tools.as_deref(),
+                enable_thinking,
+                reasoning_effort.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            Error::from_reason(format!("Inkling2 apply_chat_template join error: {e}"))
+        })??;
+        Ok(Uint32Array::new(ids))
     }
 
     /// Compute the exact prompt length after Inkling2 image-placeholder expansion without

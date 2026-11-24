@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import { type EventSegment, parseEvents } from '../src/agent-sessions/events.js';
 import {
   buildTimeline,
   type ChildEvents,
@@ -1415,5 +1416,382 @@ describe('buildTimeline: a woken turn', () => {
     expect(hasTurnWork([wake(1)])).toBe(true);
     const r = build([user(0), turnEnd(100, 100), wake(200)], { turn: 2, live: true, lastTs: T + 200 });
     expect(r.open).toBe(true);
+  });
+});
+
+describe('buildTimeline: events.jsonl phase reconstruction', () => {
+  const iso = (offset: number): string => new Date(T + offset).toISOString();
+  const ev = (offset: number, type: string, extra: Record<string, unknown> = {}): string =>
+    JSON.stringify({ ts: iso(offset), type, ...extra });
+
+  it('reconstructs wait, reasoning, tool-call decode, and answer from events.jsonl without misattributing permission waits', () => {
+    const eventsLog = `${[
+      ev(0, 'turn_started', { turn_number: 0 }),
+      ev(5, 'loop_started', { loop_index: 0 }),
+      ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+      ev(15_000, 'first_token'),
+      ev(15_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ev(20_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ev(23_500, 'phase_changed', { phase: 'tool_execution' }),
+      ev(23_500, 'tool_started', { tool_name: 'run_terminal_command' }),
+      ev(23_510, 'phase_changed', { phase: 'permission_prompt' }),
+      ev(23_510, 'permission_requested', { tool_name: 'run_terminal_command' }),
+      ev(35_000, 'permission_resolved', { tool_name: 'run_terminal_command', decision: 'allow', wait_ms: 11_490 }),
+      ev(35_000, 'phase_changed', { phase: 'tool_execution' }),
+      ev(35_500, 'tool_completed', { tool_name: 'run_terminal_command', duration_ms: 500, outcome: 'success' }),
+      ev(35_500, 'loop_started', { loop_index: 1 }),
+      ev(35_510, 'phase_changed', { phase: 'waiting_for_model' }),
+      ev(48_000, 'first_token'),
+      ev(48_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ev(118_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ev(118_100, 'phase_changed', { phase: 'streaming_text' }),
+      ev(168_000, 'phase_changed', { phase: 'streaming_text' }),
+      ev(168_500, 'turn_ended', { outcome: 'completed' }),
+    ].join('\n')}\n{"ts":"torn-line`;
+    const parsedEvents = parseEvents(eventsLog);
+    // Coalesced updates.jsonl stamps thinking & answer at their final chunk time (0ms slivers).
+    const entries: DigestEntry[] = [
+      user(0),
+      think(20_001, 20_001),
+      tool(23_500, 35_500, 'run_terminal_command'),
+      think(118_000, 118_000),
+      answer(168_000, 168_000),
+      turnEnd(168_600, 168_600),
+    ];
+    const result = buildTimeline(
+      {
+        turn: 1,
+        parent: { ...source(entries), eventSpans: parsedEvents.segments },
+        live: false,
+        asOfMs: T + 200_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (result === 'no-turn') throw new Error('no-turn');
+    expect(lane(result)).toEqual([
+      'wait text 0-15000',
+      'reasoning 15000-20000',
+      'tool-call 20000-23500',
+      'tool run_terminal_command 23500-35500',
+      'wait text 35500-48000',
+      'reasoning 48000-118000',
+      'answer 118100-168000',
+    ]);
+  });
+
+  it('extends an open streaming phase while live and records wait-model before a cancelled turn_ended', () => {
+    const liveEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(4_000, 'first_token'),
+        ev(4_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(9_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ].join('\n')}\n`,
+    );
+    const liveResult = buildTimeline(
+      {
+        turn: 1,
+        parent: { ...source([user(0)], [], T + 9_000), eventSpans: liveEvents.segments },
+        live: true,
+        asOfMs: T + 12_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (liveResult === 'no-turn') throw new Error('no-turn');
+    expect(lane(liveResult)).toEqual(['wait text 0-4000', 'reasoning 4000-…']);
+
+    const cancelledEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(50, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(12_000, 'turn_ended', { outcome: 'cancelled' }),
+      ].join('\n')}\n`,
+    );
+    const cancelled = buildTimeline(
+      {
+        turn: 1,
+        parent: { ...source([user(0), turnEnd(12_050, 12_050, 0, 'cancelled')]), eventSpans: cancelledEvents.segments },
+        live: false,
+        asOfMs: T + 20_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (cancelled === 'no-turn') throw new Error('no-turn');
+    expect(lane(cancelled)).toEqual(['wait open 50-12000']);
+  });
+
+  it('bounds an open events.jsonl streaming phase when updates.jsonl already records a later tool or generation', () => {
+    const laggedEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(4_000, 'first_token'),
+        ev(4_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(9_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+      ].join('\n')}\n`,
+    );
+
+    const withTool = buildTimeline(
+      {
+        turn: 1,
+        parent: {
+          ...source([user(0), think(9_001, 9_001), tool(12_000, 15_000, 'read_file')], [], T + 15_000),
+          eventSpans: laggedEvents.segments,
+        },
+        live: true,
+        asOfMs: T + 16_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (withTool === 'no-turn') throw new Error('no-turn');
+    expect(lane(withTool)).toEqual([
+      'wait text 0-4000',
+      'reasoning 4000-9000',
+      'tool read_file 12000-15000',
+      'wait open 15000-…',
+    ]);
+
+    const withFollowup = buildTimeline(
+      {
+        turn: 1,
+        parent: {
+          ...source(
+            [
+              user(0),
+              think(9_001, 9_001),
+              tool(12_000, 15_000, 'read_file'),
+              think(18_000, 18_000),
+              answer(20_000, 21_000),
+            ],
+            [],
+            T + 21_000,
+          ),
+          eventSpans: laggedEvents.segments,
+        },
+        live: true,
+        asOfMs: T + 22_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (withFollowup === 'no-turn') throw new Error('no-turn');
+    expect(lane(withFollowup)).toEqual([
+      'wait text 0-4000',
+      'reasoning 4000-9000',
+      'tool read_file 12000-15000',
+      'wait text 15000-18000',
+      'reasoning 18000-18000',
+      'answer 20000-…',
+    ]);
+  });
+
+  it('keeps an open tool running when streaming_reasoning starts and ends on the exact same millisecond', () => {
+    const sameMsEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(4_000, 'first_token'),
+        ev(4_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(4_000, 'phase_changed', { phase: 'tool_execution' }),
+        ev(4_000, 'tool_started', { tool_name: 'run_terminal_command' }),
+        ev(4_000, 'phase_changed', { phase: 'permission_prompt' }),
+        ev(4_000, 'permission_requested', { tool_name: 'run_terminal_command' }),
+      ].join('\n')}\n`,
+    );
+    const result = buildTimeline(
+      {
+        turn: 1,
+        parent: {
+          ...source([user(0), think(4_000, 4_000), tool(4_000, null, 'run_terminal_command')], [], T + 4_000),
+          eventSpans: sameMsEvents.segments,
+        },
+        live: true,
+        asOfMs: T + 10_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (result === 'no-turn') throw new Error('no-turn');
+    expect(lane(result)).toEqual(['wait text 0-4000', 'reasoning 4000-4000', 'tool run_terminal_command 4000-…']);
+    expect(spansOf(result).at(-1)).toMatchObject({
+      kind: 'tool',
+      startMs: 4_000,
+      endMs: null,
+      status: 'running',
+      inferredEnd: false,
+    });
+  });
+
+  it('does not erase a next-loop reasoning update across a fast tool call when events.jsonl lags by one loop', () => {
+    const laggedEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(1_000, 'first_token'),
+        ev(1_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(2_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(2_000, 'phase_changed', { phase: 'tool_execution' }),
+        ev(2_000, 'tool_started', { tool_name: 'read_file' }),
+      ].join('\n')}\n`,
+    );
+    const result = buildTimeline(
+      {
+        turn: 1,
+        parent: {
+          ...source([
+            user(0),
+            think(2_000, 2_000),
+            tool(2_000, 2_200, 'read_file'),
+            think(2_450, 2_450),
+            answer(2_500, 2_550),
+            turnEnd(2_600, 2_600),
+          ]),
+          eventSpans: laggedEvents.segments,
+        },
+        live: false,
+        asOfMs: T + 5_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (result === 'no-turn') throw new Error('no-turn');
+    expect(lane(result)).toEqual([
+      'wait text 0-1000',
+      'reasoning 1000-2000',
+      'tool read_file 2000-2200',
+      'wait text 2200-2450',
+      'reasoning 2450-2450',
+      'answer 2500-2550',
+    ]);
+
+    // Same-ms trailing flush before tool start stays covered, while loop 2's reasoning 450 ms later is preserved.
+    const sameMsToolEvents = parseEvents(
+      `${[
+        ev(0, 'turn_started', { turn_number: 0 }),
+        ev(10, 'phase_changed', { phase: 'waiting_for_model' }),
+        ev(1_000, 'first_token'),
+        ev(1_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(2_000, 'phase_changed', { phase: 'streaming_reasoning' }),
+        ev(2_001, 'phase_changed', { phase: 'tool_execution' }),
+        ev(2_001, 'tool_started', { tool_name: 'read_file' }),
+      ].join('\n')}\n`,
+    );
+    const sameMsTool = buildTimeline(
+      {
+        turn: 1,
+        parent: {
+          ...source([
+            user(0),
+            think(2_001, 2_001),
+            tool(2_001, 2_200, 'read_file'),
+            think(2_450, 2_450),
+            answer(2_500, 2_550),
+            turnEnd(2_600, 2_600),
+          ]),
+          eventSpans: sameMsToolEvents.segments,
+        },
+        live: false,
+        asOfMs: T + 5_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (sameMsTool === 'no-turn') throw new Error('no-turn');
+    expect(lane(sameMsTool)).toEqual([
+      'wait text 0-1000',
+      'reasoning 1000-2000',
+      'tool-call 2000-2001',
+      'tool read_file 2001-2200',
+      'wait text 2200-2450',
+      'reasoning 2450-2450',
+      'answer 2500-2550',
+    ]);
+  });
+
+  it('reconciles 5,000 events.jsonl model loops linearly and stays well under 250 ms', () => {
+    const n = 5_000;
+    const entries: DigestEntry[] = [user(0)];
+    const eventSpans: EventSegment[] = [];
+    for (let i = 0; i < n; i += 1) {
+      const base = i * 400;
+      eventSpans.push(
+        { kind: 'wait-model', start: T + base, end: T + base + 100, lastEnd: T + base + 100, until: 'text' },
+        { kind: 'reasoning', start: T + base + 100, end: T + base + 200, lastEnd: T + base + 200 },
+        { kind: 'tool-call', start: T + base + 200, end: T + base + 250, lastEnd: T + base + 250 },
+      );
+      entries.push(think(base + 201, base + 201), tool(base + 250, base + 400, 'read_file'));
+    }
+    const tail = n * 400;
+    // Open trailing segment exercises openEventCap and resolveGenEvents after all 5,000 prior loops.
+    eventSpans.push(
+      { kind: 'wait-model', start: T + tail, end: T + tail + 100, lastEnd: T + tail + 100, until: 'text' },
+      { kind: 'reasoning', start: T + tail + 100, end: null, lastEnd: T + tail + 200 },
+    );
+    entries.push(think(tail + 201, tail + 201), tool(tail + 250, tail + 400, 'read_file'), turnEnd(tail + 500));
+
+    const started = performance.now();
+    const result = buildTimeline(
+      {
+        turn: 1,
+        parent: { ...source(entries), eventSpans },
+        live: false,
+        asOfMs: T + tail + 1_000,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    const elapsed = performance.now() - started;
+    if (result === 'no-turn') throw new Error('no-turn');
+    expect(elapsed).toBeLessThan(250);
+    expect(spansOf(result)).toHaveLength(MAX_LANE_SPANS);
+    expect(result.notes.droppedSpans).toBe(4 * n + 3 - MAX_LANE_SPANS);
+  });
+
+  it('caps inferred tool-call decoding at an earlier recorded tool failure instead of hiding it', () => {
+    const eventsJsonl = [
+      JSON.stringify({ ts: new Date(T).toISOString(), type: 'turn_started', turn_number: 0 }),
+      JSON.stringify({ ts: new Date(T).toISOString(), type: 'loop_started', loop_index: 0 }),
+      JSON.stringify({ ts: new Date(T + 1_000).toISOString(), type: 'phase_changed', phase: 'streaming_reasoning' }),
+      JSON.stringify({ ts: new Date(T + 7_000).toISOString(), type: 'phase_changed', phase: 'streaming_reasoning' }),
+      // Delayed tool_execution transition at 8,000 ms after updates.jsonl already recorded a failed tool at 7,800-7,900 ms.
+      JSON.stringify({ ts: new Date(T + 8_000).toISOString(), type: 'phase_changed', phase: 'tool_execution' }),
+      JSON.stringify({ ts: new Date(T + 8_100).toISOString(), type: 'turn_ended' }),
+    ].join('\n');
+    const eventSpans = parseEvents(eventsJsonl).segments;
+    const entries: DigestEntry[] = [user(0), think(7_000, 7_000), tool(7_800, 7_900, 'use_tool', true), turnEnd(8_100)];
+    const result = buildTimeline(
+      {
+        turn: 1,
+        parent: { ...source(entries), eventSpans },
+        live: false,
+        asOfMs: T + 8_100,
+        main: { name: 'Main agent', type: null, model: 'hy4', sessionId: 's' },
+        children: new Map(),
+      },
+      new Map(),
+    );
+    if (result === 'no-turn') throw new Error('no-turn');
+    expect(lane(result)).toEqual([
+      'wait text 0-1000',
+      'reasoning 1000-7000',
+      'tool-call 7000-7800',
+      'tool use_tool 7800-7900',
+    ]);
+    const failedTool = spansOf(result).find((s) => s.kind === 'tool');
+    expect(failedTool?.status).toBe('failed');
   });
 });

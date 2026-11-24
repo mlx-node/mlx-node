@@ -632,7 +632,11 @@ export const MODEL_FAMILY_DATA = [
     acceptsDecodeShare: true,
     acceptsActivations: true,
     acceptsCacheDisk: true,
-    streamOpts: { recordModelPath: true },
+    /**
+     * Retains the native wire-renderer `Inkling2Model#applyChatTemplate`
+     * instead of installing the factory's path-backed Jinja tokenizer.
+     */
+    streamOpts: { recordModelPath: false, applyTemplate: false },
     traits: { reasoning: true, fallbackContextWindow: 1048576 },
     launchPreset: {
       sampling: INKLING2_SAMPLING_DEFAULTS,

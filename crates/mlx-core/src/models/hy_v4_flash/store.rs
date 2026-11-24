@@ -669,6 +669,41 @@ pub fn direct_kv_allowance(p: &Profile, max_ctx: usize) -> u64 {
         .saturating_add(p.kv_per_ctx.saturating_mul(tokens))
 }
 
+/// Full advertised-context KV allowance: `ctx` tokens plus the profile's
+/// fixed KV base (without the [`DIRECT_KV_ALLOWANCE_TOKENS`] cap).
+pub fn full_kv_allowance(p: &Profile, ctx: usize) -> u64 {
+    p.kv_base
+        .saturating_add(p.kv_per_ctx.saturating_mul(ctx as u64))
+}
+
+/// Maximum paged KV pool bytes `Paged::open` can grow to for `ctx` tokens
+/// across `lanes` lanes (`(ctx.div_ceil(BLOCK) + lanes + 1) * page_bytes`).
+pub fn paged_pool_max_bytes(page_bytes: u64, ctx: usize, lanes: usize) -> u64 {
+    let max_blocks = (ctx
+        .div_ceil(super::paged::BLOCK as usize)
+        .saturating_add(lanes)
+        .saturating_add(1)) as u64;
+    max_blocks.saturating_mul(page_bytes)
+}
+
+/// Full-context KV reservation for `MmapMode::Auto` residency-set budgeting:
+/// covers at least both [`full_kv_allowance`] plus `extra_lanes` and
+/// [`paged_pool_max_bytes`] plus `state_bytes` (or `extra_lanes` when
+/// `state_bytes` is smaller).
+pub fn mmap_full_kv_bytes(
+    p: &Profile,
+    ctx: usize,
+    lanes: usize,
+    page_bytes: u64,
+    extra_lanes: u64,
+    state_bytes: u64,
+) -> u64 {
+    let profile_kv = full_kv_allowance(p, ctx).saturating_add(extra_lanes);
+    let paged_kv =
+        paged_pool_max_bytes(page_bytes, ctx, lanes).saturating_add(state_bytes.max(extra_lanes));
+    profile_kv.max(paged_kv)
+}
+
 /// Direct-mode prefill scratch allowance at `prefill_rows` and `ctx`, using the
 /// 1.2x profile compute formula.
 pub fn direct_scratch_bytes(p: &Profile, prefill_rows: usize, ctx: usize) -> u64 {
@@ -807,7 +842,7 @@ pub fn mmap_gate(
     let kv_and_scratch = kv_allowance_initial.saturating_add(scratch_bytes);
     let base_need = dense_bytes.saturating_add(kv_and_scratch);
     let need = match mode {
-        MmapMode::Auto => base_need.saturating_add(mapped_bytes),
+        MmapMode::Auto => base_need.saturating_add(mapped_bytes / 2),
         MmapMode::On | MmapMode::Off => base_need,
     };
     let physical_ok = match mode {
@@ -935,6 +970,7 @@ pub enum ExpertResidency {
     },
     Streamed {
         direct_refusal: Option<DirectDecision>,
+        mmap_refusal: Option<MmapDecision>,
     },
 }
 
@@ -994,6 +1030,7 @@ pub fn select_expert_mode_for(
     cache_cap: Option<u64>,
 ) -> Result<ExpertResidency> {
     let has_experts = direct_expert_bytes > 0 && mapped_bytes > 0;
+    let mmap_eligible = metal_available && has_experts && host.physical >= MMAP_MIN_PHYSICAL;
     let try_mmap = |mode: MmapMode| {
         pick_mmap_with_max(
             mode,
@@ -1057,6 +1094,7 @@ pub fn select_expert_mode_for(
             } else {
                 Ok(ExpertResidency::Streamed {
                     direct_refusal: (direct == DirectMode::On).then_some(gate),
+                    mmap_refusal: None,
                 })
             }
         }
@@ -1078,6 +1116,7 @@ pub fn select_expert_mode_for(
                 }
                 Ok(ExpertResidency::Streamed {
                     direct_refusal: Some(d_gate),
+                    mmap_refusal: mmap_eligible.then_some(m_gate),
                 })
             }
             DirectMode::Auto => {
@@ -1097,6 +1136,7 @@ pub fn select_expert_mode_for(
                 }
                 Ok(ExpertResidency::Streamed {
                     direct_refusal: None,
+                    mmap_refusal: mmap_eligible.then_some(m_gate),
                 })
             }
             DirectMode::Off => {
@@ -1109,6 +1149,7 @@ pub fn select_expert_mode_for(
                 }
                 Ok(ExpertResidency::Streamed {
                     direct_refusal: None,
+                    mmap_refusal: mmap_eligible.then_some(m_gate),
                 })
             }
         },
@@ -1208,19 +1249,38 @@ pub fn mmap_warm_budget(
     kv_bytes: u64,
     margin: u64,
     mapped_bytes: u64,
+    max_memory: Option<u64>,
 ) -> u64 {
     if mode == MmapMode::Off || mapped_bytes == 0 {
         return 0;
     }
-    let budget = host
+    let available = host
         .physical
         .saturating_sub(host.non_reclaimable())
-        .saturating_sub(dense_bytes.saturating_add(kv_bytes).saturating_add(margin))
+        .saturating_sub(margin);
+    let cap = max_memory.map_or(available, |m| available.min(m));
+    let budget = cap
+        .saturating_sub(dense_bytes.saturating_add(kv_bytes))
         .min(mapped_bytes);
     if budget < MMAP_PREWARM_MIN_BUDGET {
         0
     } else {
         budget
+    }
+}
+
+/// Computes the `MetalResidencySet` byte cap for mmap residency.
+///
+/// - `MmapMode::On` (explicitly forced full mmap): `u64::MAX` so every mapped
+///   buffer is pinned (page-alignment padding never drops the final layer).
+/// - `MmapMode::Auto`: `gate_budget - reserve_bytes`, keeping wired anonymous
+///   memory (`dense + full_ctx_kv + scratch`) plus pinned residency within the
+///   admitted `gate.budget` (which already reflects `--max-memory`).
+pub fn mmap_rset_budget(mode: MmapMode, gate_budget: u64, reserve_bytes: u64) -> u64 {
+    match mode {
+        MmapMode::Off => 0,
+        MmapMode::On => u64::MAX,
+        MmapMode::Auto => gate_budget.saturating_sub(reserve_bytes),
     }
 }
 
@@ -1479,8 +1539,26 @@ pub fn reading(
     h: HostMemory,
     lag: u64,
 ) -> Result<Reading> {
-    let r = bank.residency()?;
-    let in_turn = bank.in_turn();
+    Ok(reading_with_residency(
+        bank.residency()?,
+        bank.in_turn(),
+        dense,
+        kv,
+        pool,
+        h,
+        lag,
+    ))
+}
+
+fn reading_with_residency(
+    r: Residency,
+    in_turn: bool,
+    dense: u64,
+    kv: u64,
+    pool: u64,
+    h: HostMemory,
+    lag: u64,
+) -> Reading {
     let counted = Residency {
         volatile: r.volatile.saturating_add(lag).min(r.resident),
         ..r
@@ -1489,11 +1567,11 @@ pub fn reading(
         volatile: r.resident,
         ..r
     };
-    Ok(Reading {
+    Reading {
         host: settled(h, counted, in_turn),
         wary: settled(h, all, in_turn),
         own: own_of(dense, kv, r.resident, in_turn, free_pool(), pool),
-    })
+    }
 }
 
 /// Bank bytes a turn start's flip to non-volatile left in the host's
@@ -1722,14 +1800,28 @@ impl Lease {
         {
             let cur = t.admission.ok_or_else(|| bad("no admission"))?;
             let before = purgeable_before_flip(self.max_memory)?;
-            let flipped = bank.residency()?.volatile;
+            let before_res = bank.residency()?;
+            let flipped = before_res.volatile;
             // non-volatile first: its resident pages are then in `host_used`
             // and counted as own
-            bank.begin_turn()?;
+            let emptied = bank.begin_turn()?;
             let next = (|| {
                 let (h, ws) = host_reading(self.max_memory)?;
                 let lag = flip_lag(before, h.purgeable, flipped);
-                let r = reading(bank, dense, kv, cur.terms.pool, h, lag)?;
+                let after_res = if emptied {
+                    bank.residency()?
+                } else {
+                    bank.residency_after_begin(before_res.resident)?
+                };
+                let r = reading_with_residency(
+                    after_res,
+                    bank.in_turn(),
+                    dense,
+                    kv,
+                    cur.terms.pool,
+                    h,
+                    lag,
+                );
                 let turn = self.readmit(&cur, limits, &r, ws)?;
                 let now = || {
                     admit_with(
@@ -2084,6 +2176,10 @@ pub struct Store {
     pub max_memory: Option<u64>,
     /// Host budget when direct full-expert residency was admitted.
     pub direct_budget: Option<u64>,
+    /// True when `MmapMode::Auto` bounded `MetalResidencySet` pinning against
+    /// `gate.budget` so the memory governor charges `rset_pinned_bytes` as
+    /// untracked memory.
+    pub rset_bounded: bool,
     pub lease: Lease,
 }
 
@@ -2126,6 +2222,8 @@ impl Store {
             Mmap {
                 warm_budget: u64,
                 force_prewarm: bool,
+                rset_budget: u64,
+                rset_bounded: bool,
             },
             Direct,
             Streamed {
@@ -2169,19 +2267,43 @@ impl Store {
                     ExpertResidency::Mmap { chunk, gate } => {
                         let ctx = max_ctx;
                         let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                        let mtp_row = kv_per_token(&scan.cfg, mtp)
+                            .saturating_sub(kv_per_token(&scan.cfg, false));
+                        let page_bytes = super::paged::PageGeometry::of(&scan.cfg)
+                            .and_then(|g| g.block_bytes())
+                            .unwrap_or(0);
+                        let rset_reserve_for = |n: usize| {
+                            let extra = n.saturating_sub(1) as u64 * floor;
+                            let state = (n as u64)
+                                .saturating_mul(floor)
+                                .saturating_add(LADDER_BYTES)
+                                .saturating_add(mtp_row.saturating_mul(ctx as u64));
+                            let full_kv =
+                                mmap_full_kv_bytes(&one_lane, ctx, n, page_bytes, extra, state);
+                            gate.dense_bytes
+                                .saturating_add(full_kv)
+                                .saturating_add(gate.scratch_bytes)
+                        };
                         let lanes = (1..=want)
                             .rev()
                             .find(|&n| {
                                 n == 1
-                                    || gate.need.saturating_add(n.saturating_sub(1) as u64 * floor)
+                                    || (gate
+                                        .need
+                                        .saturating_add(n.saturating_sub(1) as u64 * floor)
                                         <= gate.budget
+                                        && (opts.mmap != MmapMode::Auto
+                                            || rset_reserve_for(n) <= gate.budget))
                             })
                             .unwrap_or(1);
                         let extra_lanes = lanes.saturating_sub(1) as u64 * floor;
                         let kv_total = kv_initial.saturating_add(extra_lanes);
                         let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
                         let mmap_fixed = gate.dense_bytes.saturating_add(kv_scratch);
+                        let rset_reserve = rset_reserve_for(lanes);
                         let total_slots = sizes.total_experts();
+                        let rset_budget = mmap_rset_budget(opts.mmap, gate.budget, rset_reserve);
+                        let rset_bounded = opts.mmap == MmapMode::Auto;
                         let warm_budget = mmap_warm_budget(
                             opts.mmap_prewarm,
                             &h,
@@ -2189,6 +2311,7 @@ impl Store {
                             kv_total,
                             gate.margin,
                             mapped_bytes,
+                            Some(gate.budget),
                         );
                         let wired_cap = direct_wired_limit(mmap_fixed, ws);
                         let a = Admission {
@@ -2242,6 +2365,8 @@ impl Store {
                             BankInit::Mmap {
                                 warm_budget,
                                 force_prewarm: opts.mmap_prewarm == MmapMode::On,
+                                rset_budget,
+                                rset_bounded,
                             },
                         )
                     }
@@ -2314,7 +2439,26 @@ impl Store {
                             BankInit::Direct,
                         )
                     }
-                    ExpertResidency::Streamed { direct_refusal } => {
+                    ExpertResidency::Streamed {
+                        direct_refusal,
+                        mmap_refusal,
+                    } => {
+                        if let Some(gate) = mmap_refusal {
+                            tracing::warn!(
+                                "hy_v4_flash mmap residency refused (need {:.2} GiB = dense {:.2} GiB \
+                                 + kv/scratch {:.2} GiB + 50% mapped {:.2} GiB vs budget {:.2} GiB, \
+                                 available {:.2} GiB, others {:.2} GiB, margin {:.2} GiB); \
+                                 falling back to partial streaming",
+                                gate.need as f64 / GIB as f64,
+                                gate.dense_bytes as f64 / GIB as f64,
+                                gate.kv_and_scratch as f64 / GIB as f64,
+                                (gate.mapped_bytes / 2) as f64 / GIB as f64,
+                                gate.budget as f64 / GIB as f64,
+                                gate.available as f64 / GIB as f64,
+                                gate.others as f64 / GIB as f64,
+                                gate.margin as f64 / GIB as f64,
+                            );
+                        }
                         if let Some(gate) = direct_refusal {
                             tracing::warn!(
                                 "hy_v4_flash direct residency refused (need {:.2} GiB vs budget \
@@ -2390,6 +2534,13 @@ impl Store {
         let rows = admitted as u64;
         let chunk = opts.chunk_cap.map_or(admitted, |c| admitted.min(c));
         let is_mmap = matches!(bank_init, BankInit::Mmap { .. });
+        let rset_bounded = matches!(
+            bank_init,
+            BankInit::Mmap {
+                rset_bounded: true,
+                ..
+            }
+        );
         let size = ModelSize {
             ctx: ctx as u64,
             dense: if is_mmap {
@@ -2409,6 +2560,8 @@ impl Store {
             BankInit::Mmap {
                 warm_budget,
                 force_prewarm,
+                rset_budget,
+                ..
             } => {
                 let dense_spec = mmap_dense_spec(&scan)?;
                 let (b, d) = KqBank::new_mmap_with_dense(
@@ -2418,8 +2571,14 @@ impl Store {
                     &scan.paths,
                     warm_budget,
                     force_prewarm,
+                    rset_budget,
                     &dense_spec,
                 )?;
+                tracing::info!(
+                    "hy_v4_flash mmap residency: pinned {:.2}/{:.2} GiB in MetalResidencySet",
+                    b.rset_pinned_bytes() as f64 / GIB as f64,
+                    b.rset_total_bytes() as f64 / GIB as f64,
+                );
                 (Arc::new(b), d)
             }
             BankInit::Direct => (
@@ -2511,6 +2670,7 @@ impl Store {
             bank_alloc_s,
             max_memory: opts.max_memory,
             direct_budget,
+            rset_bounded,
             lease,
         })
     }
@@ -2551,6 +2711,17 @@ impl Store {
             .direct_budget()
             .or(self.direct_budget)
             .unwrap_or_else(|| capped_ws(working_set(), self.max_memory))
+    }
+
+    /// Bytes pinned outside MLX's allocator that the memory governor must count
+    /// against [`Self::hard_budget`]: `rset_pinned_bytes` when `MmapMode::Auto`
+    /// bounded `MetalResidencySet` pinning against `gate.budget`, 0 otherwise.
+    pub fn governor_untracked_bytes(&self) -> u64 {
+        if self.rset_bounded {
+            self.bank.rset_pinned_bytes()
+        } else {
+            0
+        }
     }
 
     pub fn cache_slots(&self) -> [usize; 2] {

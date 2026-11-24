@@ -282,7 +282,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         if profiling {
             self.inner.complete_scheduled_draft_state(&seq_ids)?;
         }
-        let wave_started = Instant::now();
+        let wave_started = profiling.then(Instant::now);
         let zero_probe = probe
             .as_ref()
             .is_some_and(|shape| shape.iter().all(|&n| n == 0));
@@ -669,7 +669,13 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
         // as well as calibration-only draft append/materialization. This can
         // prefer AR too early, but cannot credit speculation for an inflated
         // AR baseline.
-        let zero_probe_ns = wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
+        let zero_probe_ns = if profiling && zero_probe {
+            wave_started.map_or(0, |t| {
+                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+            })
+        } else {
+            0
+        };
         let committed = self.inner.commit_scheduled_verify(&commits);
         let mut committed = match committed {
             Ok(results) if results.len() == work.len() => results,
@@ -700,7 +706,9 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                             if zero_probe {
                                 zero_probe_ns
                             } else {
-                                wave_started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                                wave_started.map_or(0, |t| {
+                                    t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                                })
                             },
                         );
                     }

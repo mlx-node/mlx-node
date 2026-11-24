@@ -13,12 +13,7 @@ import type {
   WarmupReport,
 } from '@mlx-node/core';
 
-import {
-  EXPERT_RESIDENCIES,
-  RESIDENCY_DELTA_FIELDS,
-  type ExpertResidency,
-  type ResidencyDeltaField,
-} from './metrics-trace.js';
+import { RESIDENCY_DELTA_FIELDS, type ExpertResidency, type ResidencyDeltaField } from './metrics-trace.js';
 
 export type { LoadProgress, PipelineStats, WarmupReport };
 
@@ -39,11 +34,11 @@ export type LoadResidencyField = (typeof LOAD_RESIDENCY_FIELDS)[number];
 /** A validated `residencyInfo()`: the closed enum, the slot counts, and every number the records read. */
 export interface ResidencySnapshot {
   residency: ExpertResidency;
-  /** Slots per layer, or the expert count on a direct store. */
+  /** Slots per layer, or the expert count on a direct store (total slots across layers for Hy4-flash). */
   expertSlots: number;
   expertCount: number;
-  load: Record<LoadResidencyField, number>;
-  counters: Record<ResidencyDeltaField, number>;
+  load: Partial<Record<LoadResidencyField, number>>;
+  counters: Partial<Record<ResidencyDeltaField, number>>;
 }
 
 /** What the heartbeat says about a model's experts. */
@@ -138,30 +133,72 @@ function nonNegative(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null;
 }
 
+const QWEN4_EXP_RESIDENCIES = ['direct', 'host-gate', 'store-plan', 'rows'] as const;
+const HY4_FLASH_RESIDENCIES = ['mmap', 'direct', 'streamed'] as const;
+const HY4_FLASH_DELTA_FIELDS = [
+  'slotHits',
+  'slotMisses',
+  'checkpointBytesRead',
+  'prefixPublished',
+  'prefixRestored',
+] as const satisfies readonly ResidencyDeltaField[];
+
+function matchResidency<T extends ExpertResidency>(value: unknown, allowed: readonly T[]): T | null {
+  for (const kind of allowed) if (kind === value) return kind;
+  return null;
+}
+
 /**
- * A validated residency report, or null. Every field must be present and valid: a model whose
- * `residencyInfo()` has another shape (DeepSeek V4.1's) gives null.
+ * A validated residency report, or null. Supports `Qwen4ExpResidencyInfo` and
+ * `HyV4FlashResidencyInfo`; a model whose `residencyInfo()` has another shape
+ * (DeepSeek V4.1's) gives null.
  */
 export function residencySnapshotOf(value: unknown): ResidencySnapshot | null {
   if (!isObj(value)) return null;
-  let residency: ExpertResidency | null = null;
-  for (const kind of EXPERT_RESIDENCIES) if (kind === value.residency) residency = kind;
-  const expertSlots = count(value.partialExpertSlots);
-  const expertCount = count(value.expertCount);
-  if (residency === null || expertSlots === null || expertCount === null || expertCount === 0) return null;
-  const load = {} as Record<LoadResidencyField, number>;
-  for (const key of LOAD_RESIDENCY_FIELDS) {
-    const field = nonNegative(value[key]);
-    if (field === null) return null;
-    load[key] = field;
+
+  // Qwen4Exp shape: every load and counter field must be present and valid.
+  const partialSlots = count(value.partialExpertSlots);
+  if (partialSlots !== null) {
+    const residency = matchResidency(value.residency, QWEN4_EXP_RESIDENCIES);
+    const expertCount = count(value.expertCount);
+    if (residency === null || expertCount === null || expertCount === 0) return null;
+    const load: Partial<Record<LoadResidencyField, number>> = {};
+    for (const key of LOAD_RESIDENCY_FIELDS) {
+      const field = nonNegative(value[key]);
+      if (field === null) return null;
+      load[key] = field;
+    }
+    const counters: Partial<Record<ResidencyDeltaField, number>> = {};
+    for (const key of RESIDENCY_DELTA_FIELDS) {
+      const field = nonNegative(value[key]);
+      if (field === null) return null;
+      counters[key] = field;
+    }
+    return { residency, expertSlots: partialSlots, expertCount, load, counters };
   }
-  const counters = {} as Record<ResidencyDeltaField, number>;
-  for (const key of RESIDENCY_DELTA_FIELDS) {
-    const field = nonNegative(value[key]);
-    if (field === null) return null;
-    counters[key] = field;
+
+  // Hy4-flash shape: `residency`, `expertCacheSlots`, `totalExpertSlots`, and its shared counters.
+  const hy4Slots = count(value.expertCacheSlots);
+  if (hy4Slots !== null) {
+    const residency = matchResidency(value.residency, HY4_FLASH_RESIDENCIES);
+    const expertCount = count(value.totalExpertSlots);
+    if (residency === null || expertCount === null || expertCount === 0) return null;
+    const load: Partial<Record<LoadResidencyField, number>> = {};
+    if (value.fixedBytes !== undefined && value.fixedBytes !== null) {
+      const fixed = nonNegative(value.fixedBytes);
+      if (fixed === null) return null;
+      load.anonymousNeedBytes = fixed;
+    }
+    const counters: Partial<Record<ResidencyDeltaField, number>> = {};
+    for (const key of HY4_FLASH_DELTA_FIELDS) {
+      const field = nonNegative(value[key]);
+      if (field === null) return null;
+      counters[key] = field;
+    }
+    return { residency, expertSlots: hy4Slots, expertCount, load, counters };
   }
-  return { residency, expertSlots, expertCount, load, counters };
+
+  return null;
 }
 
 /** The `residencyInfo()` of a loaded model; null for a model without one or with another shape. */
@@ -180,7 +217,7 @@ export function expertsLiveOf(snapshot: ResidencySnapshot): ExpertsLive {
   return {
     inMemory: Math.min(snapshot.expertSlots, snapshot.expertCount),
     total: snapshot.expertCount,
-    streaming: snapshot.residency !== 'direct',
+    streaming: snapshot.residency !== 'direct' && snapshot.residency !== 'mmap',
   };
 }
 
