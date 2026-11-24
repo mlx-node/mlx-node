@@ -9,8 +9,8 @@
     },
     "aarch64-pc-windows-msvc": {
       "file": "mlx-aarch64-pc-windows-msvc.tar.gz",
-      "sha256": "e28d178d2eb803f9b28b9f1b8798289c9f5c1db2dca28f8d25aa8b3dca7cf8dc",
-      "release_tag": "mlx-prebuilt-76276123a284-e0cab3ee"
+      "sha256": "825cd2a1e86e6424d76a465d09f0d5423273279c4ec60a7da113bc37b526d745",
+      "release_tag": "mlx-prebuilt-76276123a284-5db20dc6"
     },
     "aarch64-unknown-linux-gnu": {
       "file": "mlx-aarch64-unknown-linux-gnu.tar.gz",

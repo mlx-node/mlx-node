@@ -2115,15 +2115,15 @@ function scanRun(
   budget: number,
 ): { scan: AutoScan; dirs: string[][] } {
   const scan = emptyScan();
-  if (isWinPath(place.cwd)) {
-    scan.unread = true;
-    scan.checks = null;
-    scan.targets = null;
-    return { scan, dirs: [] };
-  }
   const meter: Meter = { steps: 0, budget };
   const dirs: string[][] = [];
   try {
+    if (isWinPath(place.cwd)) {
+      scan.unread = true;
+      scan.checks = null;
+      scan.targets = null;
+      return { scan, dirs: [] };
+    }
     const parts = lex(command, meter);
     const ctx: Ctx = {
       place,
