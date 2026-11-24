@@ -1156,6 +1156,10 @@ unsafe extern "C-unwind" {
     /// To get bytes, multiply by itemsize from mlx_array_get_itemsize()
     pub fn mlx_array_get_data_size(handle: *mut mlx_array) -> usize;
 
+    /// Get the backing allocator buffer size in bytes for an already-available
+    /// array, or 0 if unavailable / null / empty. Never triggers evaluation.
+    pub fn mlx_array_get_buffer_size(handle: *mut mlx_array) -> usize;
+
     /// Get the item size in bytes for the array's dtype
     pub fn mlx_array_get_itemsize(handle: *mut mlx_array) -> usize;
 

@@ -12,6 +12,8 @@
 use std::collections::VecDeque;
 use std::sync::OnceLock;
 
+use napi::bindgen_prelude::Result;
+
 use crate::array::MxArray;
 use crate::models::qwen3_5::layer_cache::Qwen3_5LayerCache;
 
@@ -140,6 +142,10 @@ impl<K, V> BoundedLru<K, V> {
     }
 }
 
+fn retained_array_bytes(arr: &MxArray) -> usize {
+    arr.nbytes().max(arr.backing_buffer_bytes())
+}
+
 #[allow(dead_code)]
 fn estimate_prefix_bytes(snapshot: &PrefixSnapshot) -> usize {
     let mut arrays: Vec<&MxArray> = Vec::with_capacity(snapshot.caches.len().saturating_mul(2));
@@ -149,6 +155,127 @@ fn estimate_prefix_bytes(snapshot: &PrefixSnapshot) -> usize {
     arrays
         .into_iter()
         .fold(0usize, |acc, arr| acc.saturating_add(arr.nbytes()))
+}
+
+fn estimate_retained_prefix_bytes(snapshot: &PrefixSnapshot) -> usize {
+    let mut arrays: Vec<&MxArray> = Vec::with_capacity(snapshot.caches.len().saturating_mul(2));
+    for layer in &snapshot.caches {
+        layer.collect_arrays(&mut arrays);
+    }
+    arrays.into_iter().fold(0usize, |acc, arr| {
+        acc.saturating_add(retained_array_bytes(arr))
+    })
+}
+
+enum DetachTarget {
+    Linear { layer: usize, slot: usize },
+    FullKeys { layer: usize },
+    FullValues { layer: usize },
+}
+
+fn detach_array_if_view(arr: &MxArray, force_copy: bool) -> Result<Option<MxArray>> {
+    let has_storage = arr.nbytes() > 0 || arr.backing_buffer_bytes() > 0;
+    if (force_copy && has_storage) || arr.is_oversized_view() {
+        Ok(Some(arr.deep_copy()?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Materialize independent tightly-sized copies for any array in `snapshot`
+/// that may pin a larger backing allocation (such as GDN `conv_state` split
+/// views over `[1, T + 3, conv_dim]` `conv_input` buffers or zero-offset prefix
+/// slices), then evaluate all detached buffers together before swapping them
+/// into `snapshot` so parent allocations are released immediately and
+/// `snapshot` remains untouched on error.
+fn detach_snapshot_views(snapshot: &mut PrefixSnapshot) -> Result<()> {
+    // Ensure any lazy arrays are materialized before inspecting backing buffers.
+    // In production `compute_prefix_snapshot` already runs `eval_caches_only()`,
+    // so `unready` is empty.
+    {
+        let mut arrays: Vec<&MxArray> = Vec::with_capacity(snapshot.caches.len().saturating_mul(2));
+        for layer in &snapshot.caches {
+            layer.collect_arrays(&mut arrays);
+        }
+        let unready: Vec<&MxArray> = arrays
+            .into_iter()
+            .filter(|arr| !arr.is_available())
+            .collect();
+        if !unready.is_empty() {
+            MxArray::eval_arrays_with_context(
+                &unready,
+                "clairic_persistent_cache::detach_snapshot_views::eval",
+            )?;
+        }
+    }
+
+    let mut pending: Vec<(DetachTarget, MxArray)> = Vec::new();
+    for (layer_idx, layer) in snapshot.caches.iter().enumerate() {
+        match layer {
+            Qwen3_5LayerCache::Linear(ac) => {
+                for slot in 0..ac.len() {
+                    // Slot 0 (`conv_state`) is always tiny (`[1, 3, conv_dim]`) and
+                    // is typically a split view over a huge `conv_input` allocation
+                    // on CUDA / non-fused Metal.
+                    if let Some(arr) = ac.get(slot)
+                        && let Some(copied) = detach_array_if_view(arr, slot == 0)?
+                    {
+                        pending.push((
+                            DetachTarget::Linear {
+                                layer: layer_idx,
+                                slot,
+                            },
+                            copied,
+                        ));
+                    }
+                }
+            }
+            Qwen3_5LayerCache::FullAttention(kv) => {
+                if let Some(keys) = kv.keys_ref()
+                    && let Some(copied) = detach_array_if_view(keys, false)?
+                {
+                    pending.push((DetachTarget::FullKeys { layer: layer_idx }, copied));
+                }
+                if let Some(values) = kv.values_ref()
+                    && let Some(copied) = detach_array_if_view(values, false)?
+                {
+                    pending.push((DetachTarget::FullValues { layer: layer_idx }, copied));
+                }
+            }
+        }
+    }
+
+    if pending.is_empty() {
+        return Ok(());
+    }
+
+    let refs: Vec<&MxArray> = pending.iter().map(|(_, arr)| arr).collect();
+    MxArray::eval_arrays_with_context(
+        &refs,
+        "clairic_persistent_cache::detach_snapshot_views::copy",
+    )?;
+
+    for (target, detached) in pending {
+        match target {
+            DetachTarget::Linear { layer, slot } => {
+                if let Qwen3_5LayerCache::Linear(ac) = &mut snapshot.caches[layer] {
+                    ac.set(slot, detached)?;
+                }
+            }
+            DetachTarget::FullKeys { layer } => {
+                if let Qwen3_5LayerCache::FullAttention(kv) = &mut snapshot.caches[layer] {
+                    kv.set_keys(detached);
+                }
+            }
+            DetachTarget::FullValues { layer } => {
+                if let Qwen3_5LayerCache::FullAttention(kv) = &mut snapshot.caches[layer] {
+                    kv.set_values(detached);
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Model-lifetime, content-addressed LRU caches shared across Clairic requests.
@@ -220,15 +347,64 @@ impl ClairicPersistentCache {
             .map(|(features, grid)| (features.clone(), *grid))
     }
 
-    /// Insert vision features keyed by `image_digest`, evicting the oldest
-    /// entries when over count or byte budget. No-op when disabled or when a
-    /// single entry exceeds the byte budget.
+    /// Insert vision features keyed by `image_digest`, detaching oversized
+    /// slice/strided views so cached entries do not pin larger backing buffers
+    /// and charging actual retained backing bytes against the LRU budget.
+    /// No-op when disabled, when a single entry exceeds the byte budget, or if
+    /// materializing a detached copy fails.
     #[allow(dead_code)]
-    pub(crate) fn insert_media(&mut self, image_digest: String, features: MxArray, grid: [i32; 3]) {
+    pub(crate) fn insert_media(
+        &mut self,
+        image_digest: String,
+        mut features: MxArray,
+        grid: [i32; 3],
+    ) {
         if !self.effective_enabled() {
             return;
         }
-        let bytes = features.nbytes();
+        if self.media_features.max_entries == 0 || features.nbytes() > self.media_features.max_bytes
+        {
+            return;
+        }
+        if !features.is_available()
+            && let Err(err) = MxArray::eval_arrays_with_context(
+                &[&features],
+                "clairic_persistent_cache::insert_media::eval",
+            )
+        {
+            tracing::warn!(
+                target: "mlx_core::clairic",
+                error = %err,
+                "Failed to evaluate vision features before persistent caching; skipping insert"
+            );
+            return;
+        }
+        match detach_array_if_view(&features, false) {
+            Ok(Some(detached)) => {
+                if let Err(err) = MxArray::eval_arrays_with_context(
+                    &[&detached],
+                    "clairic_persistent_cache::insert_media::copy",
+                ) {
+                    tracing::warn!(
+                        target: "mlx_core::clairic",
+                        error = %err,
+                        "Failed to materialize detached vision features view; skipping insert"
+                    );
+                    return;
+                }
+                features = detached;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                tracing::warn!(
+                    target: "mlx_core::clairic",
+                    error = %err,
+                    "Failed to detach oversized vision features view; skipping insert"
+                );
+                return;
+            }
+        }
+        let bytes = retained_array_bytes(&features);
         let _ = self
             .media_features
             .insert(image_digest, (features, grid), bytes);
@@ -251,24 +427,42 @@ impl ClairicPersistentCache {
     }
 
     /// Insert a `B=1` prefix snapshot keyed strictly by
-    /// `(media_content_digest, prefix_hash)`, estimating its footprint by
-    /// summing `arr.nbytes()` over `collect_arrays`. Evicts oldest entries when
-    /// over count or byte budget.
+    /// `(media_content_digest, prefix_hash)`, detaching view-backed layer state
+    /// (such as GDN `conv_state` split views) so parent allocations are
+    /// released immediately and charging actual retained backing bytes
+    /// (`arr.nbytes().max(arr.backing_buffer_bytes())`) against the LRU budget.
+    /// Evicts oldest entries when over count or byte budget.
     ///
     /// Returns `None` when stored in the persistent cache, or `Some(snapshot)`
-    /// when declined (persistent cache disabled or single entry exceeds the
-    /// byte budget), allowing the caller to retain it in request-local storage.
+    /// when declined (persistent cache disabled, single entry exceeds the byte
+    /// budget, or view detachment fails), allowing the caller to retain it in
+    /// request-local storage.
     #[allow(dead_code)]
     pub(crate) fn insert_prefix(
         &mut self,
         media_content_digest: String,
         prefix_hash: String,
-        snapshot: PrefixSnapshot,
+        mut snapshot: PrefixSnapshot,
     ) -> Option<PrefixSnapshot> {
         if !self.effective_enabled() {
             return Some(snapshot);
         }
-        let bytes = estimate_prefix_bytes(&snapshot);
+        // Reject entries whose logical size already exceeds the budget before
+        // paying any copy/eval work to detach views.
+        if self.prefix_snapshots.max_entries == 0
+            || estimate_prefix_bytes(&snapshot) > self.prefix_snapshots.max_bytes
+        {
+            return Some(snapshot);
+        }
+        if let Err(err) = detach_snapshot_views(&mut snapshot) {
+            tracing::warn!(
+                target: "mlx_core::clairic",
+                error = %err,
+                "Failed to detach views from prefix snapshot; skipping persistent cache insert"
+            );
+            return Some(snapshot);
+        }
+        let bytes = estimate_retained_prefix_bytes(&snapshot);
         self.prefix_snapshots
             .insert((media_content_digest, prefix_hash), snapshot, bytes)
     }
@@ -413,14 +607,31 @@ mod tests {
 
     #[test]
     fn persistent_cache_media_lru_and_byte_budget() -> Result<()> {
-        // Each f32 tensor of length 4 is 16 bytes.
-        // Budget: max 2 entries, max 40 bytes (holds two 16B entries = 32B, not three).
-        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 2, 40, 2, 128);
+        // Measure actual retained backing bytes per tensor so the test is
+        // deterministic across CUDA (power-of-2 buckets), Metal, and CPU
+        // regardless of allocator cache reuse slack.
+        let t_a = f32_tensor(4, 1.0)?;
+        let t_b = f32_tensor(4, 2.0)?;
+        let t_c = f32_tensor(4, 3.0)?;
+        let t_big = f32_tensor(16, 5.0)?;
+        let t_huge = f32_tensor(64, 9.0)?;
 
-        cache.insert_media("img_a".to_string(), f32_tensor(4, 1.0)?, [1, 2, 2]);
-        cache.insert_media("img_b".to_string(), f32_tensor(4, 2.0)?, [1, 4, 4]);
+        let b_a = retained_array_bytes(&t_a);
+        let b_b = retained_array_bytes(&t_b);
+        let b_big = retained_array_bytes(&t_big);
+        let b_huge = retained_array_bytes(&t_huge);
+        // Budget holds two small tensors (a + b) or one `t_big`, never `t_big + small`
+        // and never `t_huge`.
+        let max_bytes = (b_a + b_b).max(b_big);
+        assert!(b_big > b_a && b_big > b_b);
+        assert!(b_huge > max_bytes);
+
+        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 2, max_bytes, 2, 128);
+
+        cache.insert_media("img_a".to_string(), t_a, [1, 2, 2]);
+        cache.insert_media("img_b".to_string(), t_b, [1, 4, 4]);
         assert_eq!(cache.media_features.len(), 2);
-        assert_eq!(cache.media_features.total_bytes(), 32);
+        assert_eq!(cache.media_features.total_bytes(), b_a + b_b);
 
         // Touch img_a so img_b becomes LRU.
         let hit_a = cache
@@ -429,21 +640,23 @@ mod tests {
         assert_eq!(hit_a.1, [1, 2, 2]);
         assert_eq!(hit_a.0.nbytes(), 16);
 
-        // Inserting img_c (16B) evicts img_b.
-        cache.insert_media("img_c".to_string(), f32_tensor(4, 3.0)?, [1, 6, 6]);
+        // Inserting img_c evicts img_b by entry count.
+        let b_c = retained_array_bytes(&t_c);
+        assert!(b_a + b_c <= max_bytes);
+        cache.insert_media("img_c".to_string(), t_c, [1, 6, 6]);
         assert!(cache.get_media("img_b").is_none());
         assert!(cache.get_media("img_a").is_some());
         assert!(cache.get_media("img_c").is_some());
 
-        // Single entry exceeding 40B (12 floats = 48B) is ignored without evicting.
-        cache.insert_media("img_huge".to_string(), f32_tensor(12, 9.0)?, [1, 8, 8]);
+        // Single entry exceeding max_bytes is ignored without evicting.
+        cache.insert_media("img_huge".to_string(), t_huge, [1, 8, 8]);
         assert!(cache.get_media("img_huge").is_none());
         assert_eq!(cache.media_features.len(), 2);
 
-        // Entry of 32B (8 floats) fits in 40B only after evicting both 16B entries.
-        cache.insert_media("img_big".to_string(), f32_tensor(8, 5.0)?, [1, 10, 10]);
+        // Entry of size `b_big` fits only after evicting both smaller entries.
+        cache.insert_media("img_big".to_string(), t_big, [1, 10, 10]);
         assert_eq!(cache.media_features.len(), 1);
-        assert_eq!(cache.media_features.total_bytes(), 32);
+        assert_eq!(cache.media_features.total_bytes(), b_big);
         let hit_big = cache
             .get_media("img_big")
             .ok_or_else(|| Error::from_reason("expected img_big hit"))?;
@@ -455,16 +668,30 @@ mod tests {
 
         // Partial byte-budget eviction with generous entry cap: evicts only as many LRU
         // entries as needed to fit the incoming tensor.
-        let mut by_bytes = ClairicPersistentCache::with_limits_for_test(true, 8, 48, 2, 128);
-        by_bytes.insert_media("a".to_string(), f32_tensor(4, 1.0)?, [1, 1, 1]);
-        by_bytes.insert_media("b".to_string(), f32_tensor(4, 2.0)?, [1, 1, 1]);
-        by_bytes.insert_media("c".to_string(), f32_tensor(4, 3.0)?, [1, 1, 1]);
-        assert_eq!(by_bytes.media_features.total_bytes(), 48);
+        let a = f32_tensor(4, 1.0)?;
+        let b = f32_tensor(4, 2.0)?;
+        let c = f32_tensor(4, 3.0)?;
+        let d = f32_tensor(8, 4.0)?;
+        let a_b = retained_array_bytes(&a);
+        let b_b = retained_array_bytes(&b);
+        let c_b = retained_array_bytes(&c);
+        let d_b = retained_array_bytes(&d);
+        // `d` is 32B logical while `a, b, c` are 16B logical (< 32B backing), so
+        // `d_b > b_b` guarantees `a_b + c_b + d_b > max(a_b + b_b + c_b, a_b + d_b)`.
+        let partial_budget = (a_b + b_b + c_b).max(a_b + d_b);
+        assert!(a_b + c_b + d_b > partial_budget);
+
+        let mut by_bytes =
+            ClairicPersistentCache::with_limits_for_test(true, 8, partial_budget, 2, 128);
+        by_bytes.insert_media("a".to_string(), a, [1, 1, 1]);
+        by_bytes.insert_media("b".to_string(), b, [1, 1, 1]);
+        by_bytes.insert_media("c".to_string(), c, [1, 1, 1]);
+        assert_eq!(by_bytes.media_features.total_bytes(), a_b + b_b + c_b);
         assert!(by_bytes.get_media("a").is_some()); // order: [b, c, a]
-        // 24B (6 floats) requires freeing >= 24B -> evicts b (16B) and c (16B), keeping a (16B).
-        by_bytes.insert_media("d".to_string(), f32_tensor(6, 4.0)?, [1, 2, 3]);
+        // Evicts b and c, keeping a alongside d.
+        by_bytes.insert_media("d".to_string(), d, [1, 2, 3]);
         assert_eq!(by_bytes.media_features.len(), 2);
-        assert_eq!(by_bytes.media_features.total_bytes(), 40);
+        assert_eq!(by_bytes.media_features.total_bytes(), a_b + d_b);
         assert!(by_bytes.get_media("b").is_none());
         assert!(by_bytes.get_media("c").is_none());
         assert!(by_bytes.get_media("a").is_some());
@@ -474,9 +701,10 @@ mod tests {
 
     #[test]
     fn persistent_cache_prefix_keys_budgets_eviction_and_disabled() -> Result<()> {
-        // Each snapshot with 4 floats per slot has 4 arrays * 16B = 64B.
-        // Budget: max 2 entries, max 140 bytes (holds two 64B snapshots = 128B).
-        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 256, 2, 140);
+        // Each 4-float-per-slot snapshot has 4 * 16B = 64B logical (<= 124B retained
+        // with worst-case <2x allocator slack). Budget of 256B always fits two
+        // 4-float snapshots while rejecting a 32-float snapshot (512B logical).
+        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 256, 2, 256);
 
         assert!(
             cache
@@ -497,7 +725,20 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.prefix_snapshots.len(), 2);
-        assert_eq!(cache.prefix_snapshots.total_bytes(), 128);
+        let stored_1_bytes = estimate_retained_prefix_bytes(
+            cache
+                .get_prefix("media_1", "tok_shared")
+                .ok_or_else(|| Error::from_reason("expected media_1 hit"))?,
+        );
+        let stored_2_bytes = estimate_retained_prefix_bytes(
+            cache
+                .get_prefix("media_2", "tok_shared")
+                .ok_or_else(|| Error::from_reason("expected media_2 hit"))?,
+        );
+        assert_eq!(
+            cache.prefix_snapshots.total_bytes(),
+            stored_1_bytes + stored_2_bytes
+        );
 
         // Strict composite key: same prefix_hash with distinct media digest returns distinct entry.
         let snap1 = cache
@@ -507,7 +748,7 @@ mod tests {
         assert_eq!(snap1.next_position, 10);
 
         // media_1 was just touched, so media_2 is now oldest.
-        // Inserting media_3 (64B) evicts media_2.
+        // Inserting media_3 evicts media_2.
         assert!(
             cache
                 .insert_prefix(
@@ -521,12 +762,12 @@ mod tests {
         assert!(cache.get_prefix("media_1", "tok_shared").is_some());
         assert!(cache.get_prefix("media_3", "tok_shared").is_some());
 
-        // Oversized snapshot (4 arrays * 10 floats * 4B = 160B > 140B) is returned back
+        // Oversized snapshot (4 arrays * 32 floats * 4B = 512B > 256B) is returned back
         // to the caller rather than silently dropped, leaving existing entries intact.
         let returned_huge = cache.insert_prefix(
             "media_huge".to_string(),
             "tok_huge".to_string(),
-            make_prefix_snapshot(10, 99, 99)?,
+            make_prefix_snapshot(32, 99, 99)?,
         );
         let returned_huge = returned_huge
             .ok_or_else(|| Error::from_reason("expected oversized snapshot to be returned"))?;
@@ -567,8 +808,9 @@ mod tests {
 
     #[test]
     fn persistent_cache_returns_oversized_prefix_snapshot_for_local_fallback() -> Result<()> {
-        // Budget of 64 bytes fits a 4-float snapshot (64B) but rejects an 8-float snapshot (128B).
-        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 256, 4, 64);
+        // Budget of 128B fits a 4-float snapshot (64B logical, <= 124B retained)
+        // but rejects a 16-float snapshot (256B logical > 128B).
+        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 256, 4, 128);
 
         assert!(
             cache
@@ -580,9 +822,15 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.prefix_snapshots.len(), 1);
-        assert_eq!(cache.prefix_snapshots.total_bytes(), 64);
+        let small_bytes = estimate_retained_prefix_bytes(
+            cache
+                .get_prefix("media_small", "tok_small")
+                .ok_or_else(|| Error::from_reason("expected media_small hit"))?,
+        );
+        assert_eq!(cache.prefix_snapshots.total_bytes(), small_bytes);
+        assert!((64..=128).contains(&small_bytes));
 
-        let oversized = make_prefix_snapshot(8, 256, 260)?;
+        let oversized = make_prefix_snapshot(16, 256, 260)?;
         let declined = cache.insert_prefix(
             "media_oversized".to_string(),
             "tok_oversized".to_string(),
@@ -601,7 +849,7 @@ mod tests {
                 .is_none()
         );
         assert_eq!(cache.prefix_snapshots.len(), 1);
-        assert_eq!(cache.prefix_snapshots.total_bytes(), 64);
+        assert_eq!(cache.prefix_snapshots.total_bytes(), small_bytes);
         assert!(cache.get_prefix("media_small", "tok_small").is_some());
         Ok(())
     }
@@ -611,18 +859,25 @@ mod tests {
         let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 256, 2, 128);
         assert!(!cache.evict_oldest_media());
 
-        cache.insert_media("img_1".to_string(), f32_tensor(4, 1.0)?, [1, 2, 2]);
-        cache.insert_media("img_2".to_string(), f32_tensor(6, 2.0)?, [1, 4, 4]);
-        cache.insert_media("img_3".to_string(), f32_tensor(4, 3.0)?, [1, 6, 6]);
+        let img_1 = f32_tensor(4, 1.0)?;
+        let img_2 = f32_tensor(6, 2.0)?;
+        let img_3 = f32_tensor(4, 3.0)?;
+        let b_1 = retained_array_bytes(&img_1);
+        let b_2 = retained_array_bytes(&img_2);
+        let b_3 = retained_array_bytes(&img_3);
+
+        cache.insert_media("img_1".to_string(), img_1, [1, 2, 2]);
+        cache.insert_media("img_2".to_string(), img_2, [1, 4, 4]);
+        cache.insert_media("img_3".to_string(), img_3, [1, 6, 6]);
         assert_eq!(cache.media_features.len(), 3);
-        assert_eq!(cache.media_features.total_bytes(), 16 + 24 + 16);
+        assert_eq!(cache.media_features.total_bytes(), b_1 + b_2 + b_3);
 
         // Touch img_1 so LRU order becomes [img_2, img_3, img_1].
         assert!(cache.get_media("img_1").is_some());
 
         assert!(cache.evict_oldest_media());
         assert_eq!(cache.media_features.len(), 2);
-        assert_eq!(cache.media_features.total_bytes(), 32);
+        assert_eq!(cache.media_features.total_bytes(), b_1 + b_3);
         assert!(cache.get_media("img_2").is_none());
         assert!(cache.get_media("img_3").is_some());
         assert!(cache.get_media("img_1").is_some());
@@ -630,7 +885,7 @@ mod tests {
         // Above get_media calls moved img_3 then img_1 to MRU; img_3 is now oldest.
         assert!(cache.evict_oldest_media());
         assert_eq!(cache.media_features.len(), 1);
-        assert_eq!(cache.media_features.total_bytes(), 16);
+        assert_eq!(cache.media_features.total_bytes(), b_1);
         assert!(cache.get_media("img_3").is_none());
         assert!(cache.get_media("img_1").is_some());
 
@@ -638,6 +893,240 @@ mod tests {
         assert_eq!(cache.media_features.len(), 0);
         assert_eq!(cache.media_features.total_bytes(), 0);
         assert!(!cache.evict_oldest_media());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_prefix_detaches_split_view_conv_state_and_bounds_backing_memory() -> Result<()> {
+        const ROWS: i64 = 4096;
+        const COLS: i64 = 512;
+        const KEEP_ROWS: i64 = 3;
+        let logical_bytes = (KEEP_ROWS * COLS) as usize * std::mem::size_of::<f32>();
+
+        // 4096 * 512 * 4 = 8 MiB conv_input with exact distinct f32 values per (row, col).
+        let mut data = Vec::with_capacity((ROWS * COLS) as usize);
+        for r in 0..ROWS {
+            let base = (r as f32) * 1024.0;
+            for c in 0..COLS {
+                data.push(base + (c as f32));
+            }
+        }
+        let conv_input = MxArray::from_float32(&data, &[1, ROWS, COLS])?;
+        let parts = conv_input.split_sections(&[ROWS - KEEP_ROWS], 1)?;
+        assert_eq!(parts.len(), 2);
+        let conv_state = parts[1].clone();
+        MxArray::eval_arrays(&[&conv_state])?;
+
+        // Confirm the split view really pins the 8 MiB parent buffer at a nonzero offset.
+        assert_eq!(conv_state.nbytes(), logical_bytes);
+        assert!(
+            conv_state.backing_buffer_bytes() >= (8 << 20),
+            "expected split view to retain >= 8 MiB backing buffer, got {}",
+            conv_state.backing_buffer_bytes()
+        );
+        let pre_offset = unsafe { mlx_sys::mlx_array_get_buffer_offset(conv_state.as_raw_ptr()) };
+        assert!(pre_offset > 0, "expected nonzero byte offset on tail split");
+        assert!(conv_state.is_oversized_view());
+
+        let expected = conv_state.to_float32()?.to_vec();
+        drop(parts);
+        drop(conv_input);
+
+        let mut linear = Qwen3_5LayerCache::new_linear();
+        linear
+            .as_arrays_cache_mut()
+            .ok_or_else(|| Error::from_reason("expected Linear cache"))?
+            .set(0, conv_state)?;
+        let snapshot = PrefixSnapshot {
+            caches: vec![linear],
+            cache_len: ROWS as i32,
+            next_position: ROWS as i32,
+        };
+
+        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 1 << 20, 4, 1 << 20);
+        assert!(
+            cache
+                .insert_prefix("media_split".to_string(), "tok_split".to_string(), snapshot)
+                .is_none()
+        );
+        assert!(
+            cache.prefix_snapshots.total_bytes() <= (64 << 10),
+            "expected detached LRU byte charge <= 64 KiB, got {}",
+            cache.prefix_snapshots.total_bytes()
+        );
+        assert!(cache.prefix_snapshots.total_bytes() >= logical_bytes);
+
+        let stored = cache
+            .get_prefix("media_split", "tok_split")
+            .ok_or_else(|| Error::from_reason("expected media_split hit"))?;
+        let Qwen3_5LayerCache::Linear(ac) = &stored.caches[0] else {
+            return Err(Error::from_reason(
+                "expected Linear layer in stored snapshot",
+            ));
+        };
+        let stored_conv = ac
+            .get(0)
+            .ok_or_else(|| Error::from_reason("expected stored slot 0"))?;
+        assert_eq!(stored_conv.nbytes(), logical_bytes);
+        assert!(
+            stored_conv.backing_buffer_bytes() <= (64 << 10),
+            "expected detached conv_state backing buffer <= 64 KiB, got {}",
+            stored_conv.backing_buffer_bytes()
+        );
+        let post_offset = unsafe { mlx_sys::mlx_array_get_buffer_offset(stored_conv.as_raw_ptr()) };
+        assert_eq!(post_offset, 0);
+        assert!(!stored_conv.is_oversized_view());
+        assert_eq!(stored_conv.to_float32()?.as_ref(), expected.as_slice());
+        Ok(())
+    }
+
+    #[test]
+    fn insert_prefix_detaches_prefix_slice_view_with_zero_offset() -> Result<()> {
+        const ROWS: i64 = 4096;
+        const COLS: i64 = 512;
+        const KEEP_ROWS: i64 = 3;
+        let logical_elems = (KEEP_ROWS * COLS) as usize;
+        let logical_bytes = logical_elems * std::mem::size_of::<f32>();
+
+        let mut data = Vec::with_capacity((ROWS * COLS) as usize);
+        for r in 0..ROWS {
+            let base = (r as f32) * 1024.0;
+            for c in 0..COLS {
+                data.push(base + (c as f32));
+            }
+        }
+        let big = MxArray::from_float32(&data, &[1, ROWS, COLS])?;
+        let prefix_slice = big.slice_axis(1, 0, KEEP_ROWS)?;
+        MxArray::eval_arrays(&[&prefix_slice])?;
+
+        // Confirm zero-offset, contiguous prefix slice still pins the 8 MiB backing buffer.
+        let pre_offset = unsafe { mlx_sys::mlx_array_get_buffer_offset(prefix_slice.as_raw_ptr()) };
+        let pre_data_size = unsafe { mlx_sys::mlx_array_get_data_size(prefix_slice.as_raw_ptr()) };
+        assert_eq!(pre_offset, 0);
+        assert_eq!(pre_data_size, logical_elems);
+        assert_eq!(prefix_slice.nbytes(), logical_bytes);
+        assert!(
+            prefix_slice.backing_buffer_bytes() >= (8 << 20),
+            "expected zero-offset slice to retain >= 8 MiB backing buffer, got {}",
+            prefix_slice.backing_buffer_bytes()
+        );
+        assert!(prefix_slice.is_oversized_view());
+
+        let expected = prefix_slice.to_float32()?.to_vec();
+        drop(big);
+
+        // 1) Non-forced Linear slot 1 (`recurrent_state`) path.
+        let mut linear = Qwen3_5LayerCache::new_linear();
+        linear
+            .as_arrays_cache_mut()
+            .ok_or_else(|| Error::from_reason("expected Linear cache"))?
+            .set(1, prefix_slice.clone())?;
+        let snapshot = PrefixSnapshot {
+            caches: vec![linear],
+            cache_len: KEEP_ROWS as i32,
+            next_position: KEEP_ROWS as i32,
+        };
+
+        let mut cache = ClairicPersistentCache::with_limits_for_test(true, 4, 1 << 20, 4, 1 << 20);
+        assert!(
+            cache
+                .insert_prefix(
+                    "media_prefix_slice".to_string(),
+                    "tok_prefix_slice".to_string(),
+                    snapshot,
+                )
+                .is_none()
+        );
+        assert!(
+            cache.prefix_snapshots.total_bytes() <= (64 << 10),
+            "expected detached slot 1 LRU charge <= 64 KiB, got {}",
+            cache.prefix_snapshots.total_bytes()
+        );
+        assert!(cache.prefix_snapshots.total_bytes() >= logical_bytes);
+
+        let stored = cache
+            .get_prefix("media_prefix_slice", "tok_prefix_slice")
+            .ok_or_else(|| Error::from_reason("expected media_prefix_slice hit"))?;
+        let Qwen3_5LayerCache::Linear(ac) = &stored.caches[0] else {
+            return Err(Error::from_reason(
+                "expected Linear layer in stored snapshot",
+            ));
+        };
+        let stored_slot1 = ac
+            .get(1)
+            .ok_or_else(|| Error::from_reason("expected stored slot 1"))?;
+        assert_eq!(stored_slot1.nbytes(), logical_bytes);
+        assert!(
+            stored_slot1.backing_buffer_bytes() <= (64 << 10),
+            "expected detached slot 1 backing buffer <= 64 KiB, got {}",
+            stored_slot1.backing_buffer_bytes()
+        );
+        assert!(!stored_slot1.is_oversized_view());
+        assert_eq!(stored_slot1.to_float32()?.as_ref(), expected.as_slice());
+
+        // 2) Non-forced FullAttention KVCache (`keys` / `values`) path.
+        let mut full = Qwen3_5LayerCache::new_full_attention();
+        let kv = full
+            .as_kv_cache_mut()
+            .ok_or_else(|| Error::from_reason("expected FullAttention cache"))?;
+        kv.set_keys(prefix_slice.clone());
+        kv.set_values(prefix_slice.clone());
+        kv.set_offset(KEEP_ROWS as i32);
+        let kv_snapshot = PrefixSnapshot {
+            caches: vec![full],
+            cache_len: KEEP_ROWS as i32,
+            next_position: KEEP_ROWS as i32,
+        };
+        assert!(
+            cache
+                .insert_prefix(
+                    "media_kv_slice".to_string(),
+                    "tok_kv_slice".to_string(),
+                    kv_snapshot,
+                )
+                .is_none()
+        );
+        let stored_kv = cache
+            .get_prefix("media_kv_slice", "tok_kv_slice")
+            .ok_or_else(|| Error::from_reason("expected media_kv_slice hit"))?;
+        let Qwen3_5LayerCache::FullAttention(kv_out) = &stored_kv.caches[0] else {
+            return Err(Error::from_reason(
+                "expected FullAttention layer in stored snapshot",
+            ));
+        };
+        let k_out = kv_out
+            .keys_ref()
+            .ok_or_else(|| Error::from_reason("expected stored keys"))?;
+        let v_out = kv_out
+            .values_ref()
+            .ok_or_else(|| Error::from_reason("expected stored values"))?;
+        assert!(k_out.backing_buffer_bytes() <= (64 << 10));
+        assert!(v_out.backing_buffer_bytes() <= (64 << 10));
+        assert!(!k_out.is_oversized_view());
+        assert!(!v_out.is_oversized_view());
+        assert_eq!(k_out.to_float32()?.as_ref(), expected.as_slice());
+        assert_eq!(v_out.to_float32()?.as_ref(), expected.as_slice());
+
+        // 3) `insert_media` non-forced `is_oversized_view()` path.
+        cache.insert_media("img_prefix_slice".to_string(), prefix_slice, [1, 1, 3]);
+        assert!(
+            cache.media_features.total_bytes() <= (64 << 10),
+            "expected detached media LRU charge <= 64 KiB, got {}",
+            cache.media_features.total_bytes()
+        );
+        assert!(cache.media_features.total_bytes() >= logical_bytes);
+        let (stored_media, grid) = cache
+            .get_media("img_prefix_slice")
+            .ok_or_else(|| Error::from_reason("expected img_prefix_slice hit"))?;
+        assert_eq!(grid, [1, 1, 3]);
+        assert_eq!(stored_media.nbytes(), logical_bytes);
+        assert!(
+            stored_media.backing_buffer_bytes() <= (64 << 10),
+            "expected detached media backing buffer <= 64 KiB, got {}",
+            stored_media.backing_buffer_bytes()
+        );
+        assert!(!stored_media.is_oversized_view());
+        assert_eq!(stored_media.to_float32()?.as_ref(), expected.as_slice());
         Ok(())
     }
 }

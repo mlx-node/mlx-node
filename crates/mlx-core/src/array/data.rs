@@ -409,6 +409,46 @@ impl MxArray {
         unsafe { sys::mlx_array_nbytes(self.handle.0) }
     }
 
+    /// Get the backing allocator buffer size in bytes for an already-available
+    /// array, or `0` when the array is not yet available or holds no backing
+    /// allocation. Never triggers evaluation.
+    pub(crate) fn backing_buffer_bytes(&self) -> usize {
+        // SAFETY: `self.handle.0` is a live `mlx_array` handle.
+        unsafe { sys::mlx_array_get_buffer_size(self.handle.0) }
+    }
+
+    /// Returns `true` when an already-available array is a view that may pin a
+    /// larger or non-owning backing allocation:
+    /// - nonzero byte offset into a shared buffer (e.g. tail split/slice),
+    /// - non-contiguous / strided / broadcast view (`data_size != size`), or
+    /// - backing buffer materially larger than `nbytes()` (e.g. zero-offset
+    ///   prefix slice `big.slice_axis(1, 0, 3)`), allowing margin for Metal/CUDA
+    ///   allocator bucket rounding and `BufferCache` reuse slack.
+    ///
+    /// Returns `false` for unavailable (lazy) arrays without triggering eval.
+    pub(crate) fn is_oversized_view(&self) -> bool {
+        if !self.is_available() {
+            return false;
+        }
+        // SAFETY: `self.handle.0` is a live, already-available `mlx_array` handle.
+        let offset = unsafe { sys::mlx_array_get_buffer_offset(self.handle.0) };
+        if offset > 0 {
+            return true;
+        }
+        let size = unsafe { sys::mlx_array_size(self.handle.0) };
+        let data_size = unsafe { sys::mlx_array_get_data_size(self.handle.0) };
+        if data_size != size {
+            return true;
+        }
+        let nbytes = self.nbytes();
+        let buffer_size = self.backing_buffer_bytes();
+        let allowed = nbytes
+            .saturating_mul(2)
+            .saturating_add(32_768)
+            .max(nbytes.saturating_add(65_536));
+        buffer_size > allowed
+    }
+
     #[napi]
     pub fn ndim(&self) -> Result<u32> {
         Ok(unsafe { sys::mlx_array_ndim(self.handle.0) as u32 })
