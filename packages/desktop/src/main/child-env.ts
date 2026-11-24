@@ -32,6 +32,9 @@ const NATIVE_LIBRARY_PATH = 'NAPI_RS_NATIVE_LIBRARY_PATH';
 /** Read by `resolveModelsDir` (INFERENCE) and `defaultModelsDir` (CONTROL PANEL) alike. */
 const MODELS_DIR = 'MLX_MODELS_DIR';
 
+/** Set to `'1'` in CONTROL PANEL when running inside a packaged Microsoft Store (MSIX) container. */
+export const WINDOWS_STORE_ENV = 'MLX_DESKTOP_WINDOWS_STORE';
+
 export interface ChildEnvInput {
   /** `AppPaths.nativeAddon` — the `.node` file, never its directory. */
   nativeAddon: string;
@@ -89,11 +92,14 @@ export function controlPanelEnvOverrides(
   input: Pick<ChildEnvInput, 'modelsDir'> & {
     /** MAIN's ledger folder: the panel reads the ends of earlier panel lives from it at start. */
     ledgerDir?: string;
+    /** True when running inside a Microsoft Store (MSIX) container; disables external binary downloads. */
+    windowsStore?: boolean;
   },
 ): Record<string, string> {
   return {
     ...modelsDirEnv(input.modelsDir),
     ...(input.ledgerDir === undefined ? {} : { [LEDGER_DIR_ENV]: input.ledgerDir }),
+    ...(input.windowsStore === true ? { [WINDOWS_STORE_ENV]: '1' } : {}),
   };
 }
 

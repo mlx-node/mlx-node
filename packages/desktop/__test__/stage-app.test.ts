@@ -39,10 +39,13 @@ import { loadManifest, readBundleFile, readChatSkill } from '../../dashboard/src
 import {
   isNonRuntimeFile,
   pruneExcludedNested,
+  RUNTIME_BUILD_FILES,
+  runtimeBuildFiles,
   runtimeClosure,
   scopeCoreNativeOverride,
   stageApp,
   stageRuntimeBuildFiles,
+  WINDOWS_RUNTIME_BUILD_FILES,
   workspaceShipEntries,
 } from '../scripts/stage-app.js';
 
@@ -128,27 +131,82 @@ function seedDesktop(root: string): string {
 }
 
 describe('runtime build assets', () => {
-  it('stages the tray images without generator inputs', () => {
+  function seedBuildDir(desktop: string): void {
+    mkdirSync(join(desktop, 'build'), { recursive: true });
+    for (const name of [
+      'iconTemplate.png',
+      'iconTemplate@2x.png',
+      'icon.icns',
+      'icon.ico',
+      'make-icons.ts',
+      'tray-icon-source.png',
+    ]) {
+      writeFileSync(join(desktop, 'build', name), name);
+    }
+    mkdirSync(join(desktop, 'build', 'icon.iconset'), { recursive: true });
+    writeFileSync(join(desktop, 'build', 'icon.iconset', 'icon_16x16.png'), 'generated');
+    mkdirSync(join(desktop, 'build', 'msix'), { recursive: true });
+    writeFileSync(join(desktop, 'build', 'msix', 'StoreLogo.png'), 'generated');
+  }
+
+  it('stages the tray images without generator inputs by default (macOS)', () => {
     const root = mkdtempSync(join(tmpdir(), 'mlx-desktop-build-'));
     const desktop = join(root, 'desktop');
     const stage = join(root, 'stage');
     try {
-      mkdirSync(join(desktop, 'build'), { recursive: true });
-      for (const name of [
-        'iconTemplate.png',
-        'iconTemplate@2x.png',
-        'icon.icns',
-        'make-icons.ts',
-        'tray-icon-source.png',
-      ]) {
-        writeFileSync(join(desktop, 'build', name), name);
-      }
-      mkdirSync(join(desktop, 'build', 'icon.iconset'));
-      writeFileSync(join(desktop, 'build', 'icon.iconset', 'icon_16x16.png'), 'generated');
+      seedBuildDir(desktop);
 
       stageRuntimeBuildFiles(desktop, stage);
 
-      expect(readdirSync(join(stage, 'build')).sort()).toEqual(['iconTemplate.png', 'iconTemplate@2x.png'].sort());
+      expect(readdirSync(join(stage, 'build')).sort()).toEqual([...RUNTIME_BUILD_FILES].sort());
+      expect(runtimeBuildFiles()).toEqual(RUNTIME_BUILD_FILES);
+      expect(runtimeBuildFiles('darwin')).toEqual(RUNTIME_BUILD_FILES);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('stages icon.ico alongside tray images on win32 without build-only inputs', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-desktop-build-win-'));
+    const desktop = join(root, 'desktop');
+    const stage = join(root, 'stage');
+    try {
+      seedBuildDir(desktop);
+
+      stageRuntimeBuildFiles(desktop, stage, 'win32');
+
+      expect(readdirSync(join(stage, 'build')).sort()).toEqual([...WINDOWS_RUNTIME_BUILD_FILES].sort());
+      expect(runtimeBuildFiles('win32')).toEqual(WINDOWS_RUNTIME_BUILD_FILES);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('forwards platform from stageApp so win32 stages icon.ico while default/darwin stays unchanged', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-desktop-stage-platform-'));
+    try {
+      const desktop = seedDesktop(root);
+      seedBuildDir(desktop);
+      seedPkg(root, 'fixture');
+
+      const defaultStage = join(root, 'stage-default');
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: defaultStage, roots: ['fixture'] });
+      expect(readdirSync(join(defaultStage, 'build')).sort()).toEqual(
+        ['iconTemplate.png', 'iconTemplate@2x.png'].sort(),
+      );
+
+      const darwinStage = join(root, 'stage-darwin');
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: darwinStage, roots: ['fixture'], platform: 'darwin' });
+      expect(readdirSync(join(darwinStage, 'build')).sort()).toEqual(
+        ['iconTemplate.png', 'iconTemplate@2x.png'].sort(),
+      );
+
+      const winStage = join(root, 'stage-win32');
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: winStage, roots: ['fixture'], platform: 'win32' });
+      expect(readdirSync(join(winStage, 'build')).sort()).toEqual(
+        ['icon.ico', 'iconTemplate.png', 'iconTemplate@2x.png'].sort(),
+      );
+      expect(readFileSync(join(winStage, 'build', 'icon.ico'), 'utf8')).toBe('icon.ico');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

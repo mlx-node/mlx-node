@@ -19,6 +19,7 @@ name: Desktop Release
 #   APPLE_API_ISSUER_ID          UUID at the top of the Keys page
 # Optional:
 #   HOMEBREW_TAP_TOKEN           PAT with contents:write on the tap repo
+#   WINGET_TOKEN                 PAT with public_repo scope for winget-pkgs PRs
 #
 # Notarization authenticates with an App Store Connect API key rather than
 # `--apple-id` + an app-specific password. The key belongs to the organization
@@ -68,6 +69,8 @@ jobs:
     # The runner must provide an ARM64 MSVC/Windows SDK plus CUDA 13.4 and
     # cuDNN 9 through CUDA_PATH/CUDNN_PATH. No Apple signing secrets are used.
     runs-on: [self-hosted, windows, arm64]
+    outputs:
+      windows_zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
     permissions:
       contents: read
       actions: read
@@ -135,7 +138,7 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
-      - name: Package the portable Windows ZIP
+      - name: Package Windows ARM64 (ZIP + MSIX)
         id: package
         shell: pwsh
         env:
@@ -151,13 +154,37 @@ jobs:
           if (-not (Test-Path -LiteralPath $result.zipPath -PathType Leaf)) { throw "Missing Windows ZIP: $($result.zipPath)" }
           "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
           "zip=$($result.zipPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          $zipSha256 = (Get-FileHash -LiteralPath $result.zipPath -Algorithm SHA256).Hash.ToUpperInvariant()
+          "zip_sha256=$zipSha256" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (($env:APP_VERSION -notmatch '[-+]') -and [string]::IsNullOrWhiteSpace($result.msixPath)) {
+            throw "Stable build $env:APP_VERSION produced no Windows MSIX"
+          }
+          if (-not [string]::IsNullOrWhiteSpace($result.msixPath)) {
+            if (-not (Test-Path -LiteralPath $result.msixPath -PathType Leaf)) { throw "Missing Windows MSIX: $($result.msixPath)" }
+            "msix=$($result.msixPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          }
 
       - name: Validate the Windows app and artifact versions
+        shell: pwsh
         env:
           TAG: ${{ env.RELEASE_TAG }}
           APP: ${{ steps.package.outputs.app }}
           ZIP: ${{ steps.package.outputs.zip }}
-        run: yarn oxnode packages/desktop/scripts/check-release.ts verify-windows --tag "$env:TAG" --manifest packages/desktop/package.json --app "$env:APP" --zip "$env:ZIP"
+          MSIX: ${{ steps.package.outputs.msix }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'oxnode', 'packages/desktop/scripts/check-release.ts', 'verify-windows',
+            '--tag', $env:TAG,
+            '--manifest', 'packages/desktop/package.json',
+            '--app', $env:APP,
+            '--zip', $env:ZIP
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:MSIX)) {
+            $argsList += @('--msix', $env:MSIX)
+          }
+          & yarn @argsList
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v7
         with:
@@ -165,10 +192,58 @@ jobs:
           path: ${{ steps.package.outputs.zip }}
           if-no-files-found: error
 
+      # Kept as a separate workflow artifact (not a GitHub Release asset) because
+      # the MSIX is unsigned for Partner Center ingestion; end users cannot
+      # sideload an unsigned MSIX directly.
+      - name: Upload the Windows ARM64 MSIX artifact
+        if: steps.package.outputs.msix != ''
+        uses: actions/upload-artifact@v7
+        with:
+          name: mlx-node-desktop-windows-arm64-msix
+          path: ${{ steps.package.outputs.msix }}
+          if-no-files-found: error
+
+      - name: Generate WinGet manifests
+        if: "!contains(steps.version.outputs.version, '-') && !contains(steps.version.outputs.version, '+')"
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ env.RELEASE_TAG }}
+          ZIP: ${{ steps.package.outputs.zip }}
+          WINGET_PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID }}
+          REPO: ${{ github.repository }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'oxnode', 'packages/desktop/scripts/winget-manifest.ts',
+            '--version', $env:APP_VERSION,
+            '--zip', $env:ZIP,
+            '--out', 'packages/desktop/out/winget',
+            '--repo', $env:REPO
+          )
+          if (-not [string]::IsNullOrWhiteSpace($env:TAG)) {
+            $argsList += @('--tag', $env:TAG)
+          }
+          & yarn @argsList
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload the WinGet manifests artifact
+        if: "!contains(steps.version.outputs.version, '-') && !contains(steps.version.outputs.version, '+')"
+        uses: actions/upload-artifact@v7
+        with:
+          name: mlx-node-desktop-winget-manifests
+          path: packages/desktop/out/winget
+          if-no-files-found: error
+
   release:
     name: Sign, notarize, publish
     needs: windows
     runs-on: macos-26
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
+      published: ${{ steps.publish.outputs.published }}
     permissions:
       contents: write
       actions: read
@@ -225,7 +300,9 @@ jobs:
         id: version
         env:
           TAG: ${{ env.RELEASE_TAG }}
-        run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
+        run: |
+          yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
+          echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
 
       - name: Prepare draft release
         if: inputs.dry_run != true
@@ -484,6 +561,7 @@ jobs:
             ${{ steps.update.outputs.manifest }}
 
       - name: Upload artifacts and publish the draft release
+        id: publish
         if: inputs.dry_run != true
         # Includes up to three hours for CI on the exact tagged commit. A failed
         # or missing CI run leaves the fully uploaded release in draft.
@@ -496,9 +574,11 @@ jobs:
           MANIFEST: ${{ steps.update.outputs.manifest }}
           WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
         run: |
+          set -euo pipefail
           yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
             --dmg "$DMG" --zip "$ZIP" --blockmap "$BLOCKMAP" --manifest "$MANIFEST" \
             --windows-zip "$WINDOWS_ZIP"
+          echo "published=true" >> "$GITHUB_OUTPUT"
 
       # The `secrets` context is NOT available in a step `if` — only github, needs,
       # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
@@ -533,3 +613,272 @@ jobs:
       - name: Remove the signing keychain
         if: always()
         run: security delete-keychain "$KEYCHAIN" || true
+
+  winget:
+    name: Submit WinGet update
+    needs: [windows, release]
+    runs-on: ubuntu-latest
+    if: always() && needs.release.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.release.outputs.version, '-') && !contains(needs.release.outputs.version, '+')
+    permissions:
+      contents: read
+    steps:
+      - name: Install pinned Komac
+        env:
+          KOMAC_VERSION: '2.17.2'
+          KOMAC_URL: 'https://github.com/russellbanks/Komac/releases/download/v2.17.2/komac-2.17.2-x86_64-unknown-linux-gnu.tar.gz'
+          KOMAC_SHA256: 'b03b020eec98acfb0b53e284a6e21815b884be33de6785b97e7a120f0e748966'
+        run: |
+          set -euo pipefail
+          TARBALL="$RUNNER_TEMP/komac-${KOMAC_VERSION}.tar.gz"
+          curl -fsSL -o "$TARBALL" "$KOMAC_URL"
+          echo "$KOMAC_SHA256  $TARBALL" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/komac"
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/komac" komac
+          chmod +x "$RUNNER_TEMP/komac/komac"
+          rm -f "$TARBALL"
+
+      # Confirm the live GitHub Release asset URL and SHA-256 match the built
+      # Windows ZIP before invoking Komac with WINGET_TOKEN.
+      - name: Verify published Windows ZIP asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+        run: |
+          set -euo pipefail
+          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_ZIP_NAME" ] || [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::Missing release outputs required to verify published Windows ZIP asset (version, release_tag, windows_zip_name, or windows_zip_sha256)."
+            exit 1
+          fi
+          EXPECTED_SHA256="${EXPECTED_SHA256^^}"
+          if [[ ! "$EXPECTED_SHA256" =~ ^[0-9A-F]{64}$ ]]; then
+            echo "::error::Expected Windows ZIP SHA-256 is not a valid 64-character hex digest: $EXPECTED_SHA256"
+            exit 1
+          fi
+          RELEASE_JSON="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$RELEASE_TAG")"
+          if [ "$(jq -r '.draft' <<< "$RELEASE_JSON")" != "false" ]; then
+            echo "::error::Release $RELEASE_TAG is still a draft; refusing to submit WinGet update."
+            exit 1
+          fi
+          ASSET_JSON="$(jq -c --arg name "$WINDOWS_ZIP_NAME" '[.assets[] | select(.name == $name)]' <<< "$RELEASE_JSON")"
+          ASSET_COUNT="$(jq 'length' <<< "$ASSET_JSON")"
+          if [ "$ASSET_COUNT" -ne 1 ]; then
+            echo "::error::Expected exactly 1 published release asset named $WINDOWS_ZIP_NAME on tag $RELEASE_TAG (found $ASSET_COUNT)."
+            exit 1
+          fi
+          ASSET_STATE="$(jq -r '.[0].state // empty' <<< "$ASSET_JSON")"
+          if [ "$ASSET_STATE" != "uploaded" ]; then
+            echo "::error::Published release asset $WINDOWS_ZIP_NAME is not uploaded (state=$ASSET_STATE)."
+            exit 1
+          fi
+          EXPECTED_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          DOWNLOAD_URL="$(jq -r '.[0].browser_download_url // empty' <<< "$ASSET_JSON")"
+          if [ "$DOWNLOAD_URL" != "$EXPECTED_URL" ]; then
+            echo "::error::Published asset browser_download_url ($DOWNLOAD_URL) does not match expected URL ($EXPECTED_URL)."
+            exit 1
+          fi
+          ASSET_DIGEST="$(jq -r '.[0].digest // empty' <<< "$ASSET_JSON")"
+          if [[ "$ASSET_DIGEST" == sha256:* ]]; then
+            ACTUAL_SHA256="${ASSET_DIGEST#sha256:}"
+            ACTUAL_SHA256="${ACTUAL_SHA256^^}"
+            if [[ ! "$ACTUAL_SHA256" =~ ^[0-9A-F]{64}$ ]]; then
+              echo "::error::Published asset digest has invalid sha256 format: $ASSET_DIGEST"
+              exit 1
+            fi
+            if [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "::error::Published asset digest ($ACTUAL_SHA256) does not match expected Windows ZIP SHA-256 ($EXPECTED_SHA256)."
+              exit 1
+            fi
+            echo "Verified published Windows ZIP asset via GitHub Release digest: $DOWNLOAD_URL ($ACTUAL_SHA256)"
+          else
+            ACTUAL_SHA256="$(curl -fsSL "$DOWNLOAD_URL" | sha256sum | cut -d' ' -f1 | tr '[:lower:]' '[:upper:]')"
+            if [[ ! "$ACTUAL_SHA256" =~ ^[0-9A-F]{64}$ ]] || [ "$ACTUAL_SHA256" != "$EXPECTED_SHA256" ]; then
+              echo "::error::Downloaded Windows ZIP SHA-256 ($ACTUAL_SHA256) does not match expected SHA-256 ($EXPECTED_SHA256)."
+              exit 1
+            fi
+            echo "Verified published Windows ZIP asset via stream SHA-256: $DOWNLOAD_URL ($ACTUAL_SHA256)"
+          fi
+
+      - name: Publish to winget-pkgs
+        id: submit
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+        run: |
+          set -euo pipefail
+          if [ -z "$WINGET_TOKEN" ]; then
+            echo "WINGET_TOKEN is not set; skipping WinGet submission."
+            exit 0
+          fi
+          if [ -z "$VERSION" ] || [ -z "$RELEASE_TAG" ] || [ -z "$WINDOWS_ZIP_NAME" ]; then
+            echo "::error::Missing release outputs required for WinGet submission (version, release_tag, or windows_zip_name)."
+            exit 1
+          fi
+          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          KOMAC_LOG="$RUNNER_TEMP/komac-submit.log"
+          GITHUB_TOKEN="$WINGET_TOKEN" "$RUNNER_TEMP/komac/komac" update "$PACKAGE_ID" \
+            --version "$VERSION" \
+            --urls "$INSTALLER_URL" \
+            --submit | tee "$KOMAC_LOG"
+          # Strip ANSI escape codes before scanning for the created winget-pkgs PR URL.
+          PR_NUMBER="$(sed -E 's/\x1B\[[0-9;]*[[:alpha:]]//g' "$KOMAC_LOG" \
+            | grep -Eo 'https://github\.com/microsoft/winget-pkgs/pull/[0-9]+' \
+            | tail -n 1 \
+            | grep -Eo '[0-9]+$' || true)"
+          echo "submitted=true" >> "$GITHUB_OUTPUT"
+          if [ -n "$PR_NUMBER" ]; then
+            echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Komac exits 0 in CI when get_existing_pull_request matches a closed or
+      # stale PR, so confirm the exact installer manifest (with the published
+      # arm64 ZIP URL and SHA-256) exists on winget-pkgs default branch or on
+      # an open PR targeting the default branch that adds/modifies it.
+      - name: Verify WinGet submission
+        if: steps.submit.outputs.submitted == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
+          VERSION: ${{ needs.release.outputs.version }}
+          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          PR_NUMBER: ${{ steps.submit.outputs.pr_number }}
+        run: |
+          set -euo pipefail
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::Missing windows_zip_sha256 output for WinGet verification."
+            exit 1
+          fi
+          INSTALLER_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/$RELEASE_TAG/$WINDOWS_ZIP_NAME"
+          FIRST_LETTER="$(printf '%s' "${PACKAGE_ID:0:1}" | tr '[:upper:]' '[:lower:]')"
+          MANIFEST_PATH="manifests/$FIRST_LETTER/${PACKAGE_ID//./\/}/$VERSION"
+          INSTALLER_MANIFEST="$MANIFEST_PATH/$PACKAGE_ID.installer.yaml"
+          DEFAULT_BRANCH="$(gh api repos/microsoft/winget-pkgs --jq '.default_branch')"
+          if [ -z "$DEFAULT_BRANCH" ]; then
+            echo "::error::Failed to resolve default branch for microsoft/winget-pkgs."
+            exit 1
+          fi
+
+          verify_installer_manifest() {
+            local repo="$1"
+            local ref="$2"
+            local encoded
+            if [ -n "$ref" ]; then
+              encoded="$(gh api "repos/$repo/contents/$INSTALLER_MANIFEST?ref=$ref" --jq '.content' 2>/dev/null)" || return 1
+            else
+              encoded="$(gh api "repos/$repo/contents/$INSTALLER_MANIFEST" --jq '.content' 2>/dev/null)" || return 1
+            fi
+            [ -n "$encoded" ] || return 1
+            printf '%s' "$encoded" | tr -d '\n' | base64 -d | EXPECTED_ID="$PACKAGE_ID" EXPECTED_VER="$VERSION" EXPECTED_URL="$INSTALLER_URL" EXPECTED_SHA="$EXPECTED_SHA256" python3 -c '
+          import os, sys, yaml
+          doc = yaml.safe_load(sys.stdin.read())
+          if not isinstance(doc, dict):
+              sys.exit(1)
+          if str(doc.get("PackageIdentifier", "")) != os.environ["EXPECTED_ID"]:
+              sys.exit(1)
+          if str(doc.get("PackageVersion", "")) != os.environ["EXPECTED_VER"]:
+              sys.exit(1)
+          expected_url = os.environ["EXPECTED_URL"]
+          expected_sha = os.environ["EXPECTED_SHA"].upper()
+          installers = doc.get("Installers")
+          if not isinstance(installers, list):
+              sys.exit(1)
+          for item in installers:
+              if not isinstance(item, dict):
+                  continue
+              arch = str(item.get("Architecture", "")).lower()
+              url = str(item.get("InstallerUrl", ""))
+              sha = str(item.get("InstallerSha256", "")).upper()
+              if arch == "arm64" and url == expected_url and sha == expected_sha:
+                  sys.exit(0)
+          sys.exit(1)
+          '
+          }
+
+          verify_open_pr() {
+            local pr_num="$1"
+            local pr_json state base_ref head_repo head_sha pr_url changed_files
+            pr_json="$(gh api "repos/microsoft/winget-pkgs/pulls/$pr_num" 2>/dev/null)" || return 1
+            state="$(jq -r '.state' <<< "$pr_json")"
+            base_ref="$(jq -r '.base.ref // empty' <<< "$pr_json")"
+            head_repo="$(jq -r '.head.repo.full_name // empty' <<< "$pr_json")"
+            head_sha="$(jq -r '.head.sha // empty' <<< "$pr_json")"
+            pr_url="$(jq -r '.html_url' <<< "$pr_json")"
+            if [ "$state" != "open" ]; then
+              return 1
+            fi
+            if [ "$base_ref" != "$DEFAULT_BRANCH" ]; then
+              echo "::warning::Candidate open WinGet PR $pr_url targets $base_ref instead of $DEFAULT_BRANCH."
+              return 1
+            fi
+            if [ -z "$head_repo" ] || [ -z "$head_sha" ]; then
+              echo "::warning::Candidate open WinGet PR $pr_url is missing head repository or commit metadata."
+              return 1
+            fi
+            changed_files="$(gh api --paginate "repos/microsoft/winget-pkgs/pulls/$pr_num/files" --jq '.[] | select(.status == "added" or .status == "modified") | .filename' 2>/dev/null)" || return 1
+            if ! grep -Fxq -- "$INSTALLER_MANIFEST" <<< "$changed_files"; then
+              echo "::warning::Candidate open WinGet PR $pr_url does not add or modify $INSTALLER_MANIFEST."
+              return 1
+            fi
+            if verify_installer_manifest "$head_repo" "$head_sha"; then
+              echo "Verified open WinGet PR targeting $DEFAULT_BRANCH with matching arm64 URL and SHA-256: $pr_url"
+              return 0
+            fi
+            echo "::warning::Candidate open WinGet PR $pr_url does not match $INSTALLER_URL / $EXPECTED_SHA256."
+            return 1
+          }
+
+          if verify_installer_manifest "microsoft/winget-pkgs" ""; then
+            echo "Verified WinGet installer manifest on default branch: $INSTALLER_MANIFEST"
+            exit 0
+          fi
+
+          if [ -n "$PR_NUMBER" ] && verify_open_pr "$PR_NUMBER"; then
+            exit 0
+          fi
+
+          for attempt in 1 2 3; do
+            mapfile -t OPEN_PRS < <(gh api graphql \
+              -f query='query($q: String!) { search(first: 100, type: ISSUE, query: $q) { nodes { ... on PullRequest { number title state } } } }' \
+              -f q="repo:microsoft/winget-pkgs is:pr is:open in:title $PACKAGE_ID $VERSION" \
+              | jq -r --arg pkg "$PACKAGE_ID" --arg ver "$VERSION" '
+                  .data.search.nodes[]
+                  | select(.state == "OPEN")
+                  | select([(.title // "") | splits("\\s+")] | (index($pkg) != null and index($ver) != null))
+                  | .number
+                ')
+            for candidate in "${OPEN_PRS[@]}"; do
+              if [ -n "$candidate" ] && verify_open_pr "$candidate"; then
+                exit 0
+              fi
+            done
+            if verify_installer_manifest "microsoft/winget-pkgs" ""; then
+              echo "Verified WinGet installer manifest on default branch: $INSTALLER_MANIFEST"
+              exit 0
+            fi
+            if [ "$attempt" -lt 3 ]; then
+              sleep 3
+            fi
+          done
+
+          CLOSED_URL="$(gh api graphql \
+            -f query='query($q: String!) { search(first: 100, type: ISSUE, query: $q) { nodes { ... on PullRequest { title url state } } } }' \
+            -f q="repo:microsoft/winget-pkgs is:pr is:closed in:title $PACKAGE_ID $VERSION" \
+            | jq -r --arg pkg "$PACKAGE_ID" --arg ver "$VERSION" '
+                .data.search.nodes[]
+                | select(.state == "CLOSED")
+                | select([(.title // "") | splits("\\s+")] | (index($pkg) != null and index($ver) != null))
+                | .url
+              ' | head -n 1)"
+          if [ -n "$CLOSED_URL" ]; then
+            echo "::error::WinGet verification failed: no merged manifest at $INSTALLER_MANIFEST or open PR matching $INSTALLER_URL ($EXPECTED_SHA256). A closed PR ($CLOSED_URL) may have caused Komac to skip submission."
+          else
+            echo "::error::WinGet verification failed: neither default branch ($INSTALLER_MANIFEST) nor any open PR matches $INSTALLER_URL ($EXPECTED_SHA256)."
+          fi
+          exit 1

@@ -22,6 +22,7 @@ import {
   createFolderPicker,
   FOLDER_DIALOG_OPTIONS,
   windowBackground,
+  windowChromeOptions,
 } from '../src/main/window-policy.js';
 import * as windowPolicy from '../src/main/window-policy.js';
 
@@ -189,6 +190,15 @@ describe('window chrome', () => {
 
   it('centres the traffic lights in the 40 px title bar', () => {
     expect(TRAFFIC_LIGHT_POSITION).toEqual({ x: 14, y: 14 });
+  });
+
+  it('uses hiddenInset traffic lights on macOS and native frame controls on Windows and Linux', () => {
+    expect(windowChromeOptions('darwin')).toEqual({
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: TRAFFIC_LIGHT_POSITION,
+    });
+    expect(windowChromeOptions('win32')).toEqual({ autoHideMenuBar: true });
+    expect(windowChromeOptions('linux')).toEqual({ autoHideMenuBar: true });
   });
 });
 

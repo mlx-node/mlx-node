@@ -260,6 +260,17 @@ describe('Chat routes — a conversation', () => {
     expect(hostEvents[0]).toMatchObject({ type: 'state' });
     off();
   });
+
+  it('reports agent.canInstall from whether installAgent is configured', async () => {
+    start('chat-basic');
+    const withoutInstaller = await call('GET', '/api/chat/state');
+    expect(withoutInstaller.ok && withoutInstaller.body).toMatchObject({ agent: { canInstall: false } });
+    await runtime.close();
+
+    start('chat-basic', undefined, { installAgent: async () => {} });
+    const withInstaller = await call('GET', '/api/chat/state');
+    expect(withInstaller.ok && withInstaller.body).toMatchObject({ agent: { canInstall: true } });
+  });
 });
 
 describe('Chat routes — engine unload', () => {

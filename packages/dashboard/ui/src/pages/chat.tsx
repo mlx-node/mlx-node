@@ -471,6 +471,7 @@ export default function Chat(): ReactElement {
   };
 
   // Why Send is off.
+  const canInstallAgent = host?.agent.canInstall !== false;
   const blocker = modeBlocker(connected, host, mode);
   let blocked = blocker?.reason;
   if (blocked === undefined && isNew && mode === 'work' && newFolder === null) blocked = CHAT.folderNeeded;
@@ -625,7 +626,14 @@ export default function Chat(): ReactElement {
       }
       const reason = err instanceof DashboardApiError ? err.reason : undefined;
       const code = err instanceof DashboardApiError ? err.code : undefined;
-      const outcome = sendFailure(reason, code, mode, err instanceof Error ? err.message : undefined);
+      const outcome = sendFailure(
+        reason,
+        code,
+        mode,
+        err instanceof Error ? err.message : undefined,
+        undefined,
+        canInstallAgent,
+      );
       if ('toast' in outcome && restored) {
         toast.error(outcome.toast);
         return;
@@ -757,6 +765,7 @@ export default function Chat(): ReactElement {
     if (fromFailed) settleFailed(place);
     switch (action.kind) {
       case 'install':
+        if (!canInstallAgent) return;
         mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
         return;
       case 'restart':
@@ -809,7 +818,14 @@ export default function Chat(): ReactElement {
   const turnStrip =
     conv !== null && endFailure !== undefined && conv.lastEnd?.outcome === undefined && dismissedEnd !== conv.lastEnd
       ? (() => {
-          const outcome = sendFailure(endFailure.code, undefined, mode, undefined, conv.conversation.modelId);
+          const outcome = sendFailure(
+            endFailure.code,
+            undefined,
+            mode,
+            undefined,
+            conv.conversation.modelId,
+            canInstallAgent,
+          );
           if (!('strip' in outcome)) return null;
           // Retry needs the text of the message that never ran; without it the strip has no button.
           const strip = outcome.strip;
@@ -1375,8 +1391,13 @@ export default function Chat(): ReactElement {
   useLayoutEffect(() => {
     resendRef.current = resend;
   });
+  const canInstallRef = useRef(canInstallAgent);
+  useLayoutEffect(() => {
+    canInstallRef.current = canInstallAgent;
+  });
   const onTurnAction = useCallback((action: TurnAction) => {
     if (action.kind === 'update-agent') {
+      if (!canInstallRef.current) return;
       mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
       return;
     }
@@ -1455,6 +1476,7 @@ export default function Chat(): ReactElement {
           conversationId === null ? undefined : `/sessions/${encodeURIComponent(conversationId)}?tab=activity`
         }
         onTurnAction={onTurnAction}
+        canInstallAgent={canInstallAgent}
         keptFor={keptFor}
         actionDisabledReason={engineReason}
         onStatus={announce}

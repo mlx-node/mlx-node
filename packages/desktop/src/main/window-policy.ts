@@ -171,3 +171,19 @@ export function windowBackground(dark: boolean): string {
 
 /** Centres the 12 px traffic lights in the SPA's 40 px title bar. */
 export const TRAFFIC_LIGHT_POSITION = { x: 14, y: 14 } as const;
+
+export type WindowChromeOptions =
+  | { titleBarStyle: 'hiddenInset'; trafficLightPosition: typeof TRAFFIC_LIGHT_POSITION }
+  | { autoHideMenuBar: true };
+
+/**
+ * Platform-specific window frame options. macOS integrates traffic lights into
+ * the SPA's 40 px title bar; Windows and Linux keep the native title bar and
+ * window controls while auto-hiding the menu bar.
+ */
+export function windowChromeOptions(platform: NodeJS.Platform): WindowChromeOptions {
+  if (platform === 'darwin') {
+    return { titleBarStyle: 'hiddenInset', trafficLightPosition: TRAFFIC_LIGHT_POSITION };
+  }
+  return { autoHideMenuBar: true };
+}

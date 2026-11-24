@@ -100,6 +100,68 @@ export function versionFromWindowsZipPath(path: string): string | null {
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
 }
 
+/** Unsigned Windows ARM64 MSIX package for Microsoft Store submission. */
+export function windowsMsixFileName(version: string): string {
+  return `mlx-node-${assertSemver('version', version)}-win32-arm64.msix`;
+}
+
+export function versionFromWindowsMsixPath(path: string): string | null {
+  const match = /^mlx-node-(.+)-win32-arm64\.msix$/.exec(artifactBaseName(path));
+  return match !== null && SEMVER.test(match[1]) ? match[1] : null;
+}
+
+const MSIX_MAX_PART = 65535;
+const MSIX_MAX_SEMVER_MAJOR = MSIX_MAX_PART - 1;
+
+/**
+ * Convert a stable semver `MAJOR.MINOR.PATCH` into the four-part MSIX identity
+ * version `(MAJOR + 1).MINOR.PATCH.0` required by the Microsoft Store.
+ *
+ * Microsoft Store Partner Center rejects MSIX packages whose `<Identity Version>`
+ * starts with `0.` (Major must be `1..65535`, Minor and Build `0..65535`, and
+ * Revision `0` reserved for the Store), forbids prerelease identifiers, and
+ * forbids build metadata. Adding `1` to Major keeps Store versions strictly
+ * monotonic across `0.x.y` -> `1.x.y` -> `N.x.y` without ever decreasing
+ * (`0.0.21` -> `1.0.21.0`, `0.1.0` -> `1.1.0.0`, `1.0.0` -> `2.0.0.0`), while
+ * capping semver Major at `65534` so `major + 1 <= 65535`.
+ */
+export function msixPackageVersion(version: string): string {
+  assertSemver('version', version);
+  if (version.includes('-')) {
+    throw new ReleaseVersionError(
+      `MSIX package version cannot use prerelease version ${JSON.stringify(version)}`,
+      'Microsoft Store MSIX packages require a stable MAJOR.MINOR.PATCH version without prerelease identifiers',
+    );
+  }
+  if (version.includes('+')) {
+    throw new ReleaseVersionError(
+      `MSIX package version cannot include build metadata in ${JSON.stringify(version)}`,
+      'Microsoft Store MSIX packages require a plain MAJOR.MINOR.PATCH version without +build metadata',
+    );
+  }
+  const [major, minor, patch] = version.split('.').map(Number);
+  if (!Number.isInteger(major) || major < 0 || major > MSIX_MAX_SEMVER_MAJOR) {
+    throw new ReleaseVersionError(
+      `MSIX package version major component out of range (0..${MSIX_MAX_SEMVER_MAJOR} -> Store 1..${MSIX_MAX_PART}): ${JSON.stringify(version)}`,
+      `semver MAJOR must be between 0 and ${MSIX_MAX_SEMVER_MAJOR} so shifted MSIX major (MAJOR + 1) stays within 1..${MSIX_MAX_PART}`,
+    );
+  }
+  if (
+    !Number.isInteger(minor) ||
+    !Number.isInteger(patch) ||
+    minor < 0 ||
+    minor > MSIX_MAX_PART ||
+    patch < 0 ||
+    patch > MSIX_MAX_PART
+  ) {
+    throw new ReleaseVersionError(
+      `MSIX package version component out of range (0..${MSIX_MAX_PART}): ${JSON.stringify(version)}`,
+      `each MINOR and PATCH component must be between 0 and ${MSIX_MAX_PART} for MSIX`,
+    );
+  }
+  return `${major + 1}.${minor}.${patch}.0`;
+}
+
 function artifactBaseName(path: string): string {
   return path.split(/[\\/]/).pop() ?? path;
 }
@@ -119,6 +181,8 @@ export interface ReleaseVersions {
   zip: string | null;
   /** Parsed out of the portable Windows archive, when that job has produced it. */
   windowsZip?: string | null;
+  /** Parsed out of the Windows MSIX package, when that job has produced it. */
+  windowsMsix?: string | null;
 }
 
 /**
@@ -161,6 +225,11 @@ export function assertVersionsAgree(versions: ReleaseVersions): string {
       label: 'Windows ZIP filename',
       value: versions.windowsZip ?? null,
       remedy: 'the Windows ZIP must match the version of the app it holds',
+    },
+    {
+      label: 'Windows MSIX filename',
+      value: versions.windowsMsix ?? null,
+      remedy: 'the Windows MSIX must match the version of the app it holds',
     },
   ];
 

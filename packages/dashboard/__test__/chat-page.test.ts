@@ -1485,6 +1485,92 @@ describe('Chat page: states that stop every message', () => {
       strip: { text: e.other[0], action: { kind: 'retry' } },
     });
   });
+
+  it('when canInstall is false, agent blockers omit install/update actions and show unavailable copy', () => {
+    const unavailable = { ...agent, canInstall: false };
+    const missing = modeBlocker(true, host({ agent: { ...unavailable, binary: 'missing' } }), 'chat');
+    expect(missing?.reason).toBe(CHAT.blockers['agent-install-unavailable'][1]);
+    expect(missing?.notice?.action).toBeUndefined();
+    expect(missing?.panel?.action).toBeUndefined();
+
+    const failed = modeBlocker(true, host({ agent: { ...unavailable, binary: 'missing', install: 'failed' } }), 'work');
+    expect(failed?.reason).toBe(CHAT.blockers['agent-install-unavailable'][1]);
+    expect(failed?.notice?.action).toBeUndefined();
+    expect(failed?.panel?.action).toBeUndefined();
+
+    const tooOld = modeBlocker(true, host({ agent: { ...unavailable, binary: 'too-old' } }), 'chat');
+    expect(tooOld?.reason).toBe(CHAT.blockers['agent-too-old-unavailable'][1]);
+    expect(tooOld?.notice?.action).toBeUndefined();
+    expect(tooOld?.panel?.action).toBeUndefined();
+
+    const incompatible = modeBlocker(true, host({ agent: unavailable, modes: failure('agent-incompatible') }), 'chat');
+    expect(incompatible?.reason).toBe(CHAT.blockers['agent-incompatible'][1]);
+    expect(incompatible?.notice?.action).toBeUndefined();
+    expect(incompatible?.panel?.action).toBeUndefined();
+    expect(incompatible?.notice?.secondary).toEqual({ label: CHAT.blockers.copyDetails, kind: 'copy-details' });
+    expect(incompatible?.panel?.secondary).toEqual({ label: CHAT.blockers.copyDetails, kind: 'copy-details' });
+  });
+
+  it('when canInstall is false, sendFailure omits the install action on profile-mismatch', () => {
+    expect(sendFailure('profile-mismatch', undefined, 'chat', undefined, undefined, false)).toEqual({
+      strip: { tone: 'danger', text: CHAT.sendErrors['profile-mismatch-chat'][0], action: undefined },
+    });
+    expect(sendFailure('profile-mismatch', undefined, 'work', undefined, undefined, false)).toEqual({
+      strip: { tone: 'danger', text: CHAT.sendErrors['profile-mismatch-work'][0], action: undefined },
+    });
+  });
+
+  it('when canInstall is false, Chat and Work show no Install, Try again, or Update the agent buttons', async () => {
+    const unavailable = { ...agent, canInstall: false };
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.blockers['agent-install-unavailable'][1]), {
+      host: host({ agent: { ...unavailable, binary: 'missing' } }),
+    });
+    expect(page!.container.querySelector('[data-hero-action]')).toBeNull();
+    expect(hasButton('Install')).toBe(false);
+    page!.unmount();
+    api!();
+
+    await open('/chat?mode=work', (text) => text.includes(CHAT.blockers['agent-install-unavailable'][1]), {
+      host: host({ agent: { ...unavailable, binary: 'missing', install: 'failed' } }),
+    });
+    expect(page!.container.querySelector('[data-hero-action]')).toBeNull();
+    expect(hasButton('Try again')).toBe(false);
+    page!.unmount();
+    api!();
+
+    await open('/chat?c=p-refused-ok', (text) => text.includes(CHAT.outcomes['refused-chat']), {
+      host: host({ agent: { ...agent, canInstall: true } }),
+      conversations: {
+        'p-refused-ok': sync('p-refused-ok', {
+          entries: [user('Hello'), end('cancelled')],
+          lastEnd: { turnId: 't1', outcome: 'refused' },
+        }),
+      },
+    });
+    expect(hasButton(CHAT.updateAgent)).toBe(true);
+    page!.unmount();
+    api!();
+
+    await open('/chat?c=p-refused', (text) => text.includes(CHAT.outcomes['refused-chat']), {
+      host: host({ agent: unavailable }),
+      conversations: {
+        'p-refused': sync('p-refused', {
+          entries: [user('Hello'), end('cancelled')],
+          lastEnd: { turnId: 't1', outcome: 'refused' },
+        }),
+      },
+      routes: { '/chat/conversations/p-refused/prompt': stubError('E_UNAVAILABLE', 'mismatch', 'profile-mismatch') },
+    });
+    expect(hasButton(CHAT.updateAgent)).toBe(false);
+    type('Try sending');
+    click(sendFace());
+    await waitFor(
+      () =>
+        writes().length === 1 &&
+        byRole(page!.container, 'alert')?.textContent?.includes(CHAT.sendErrors['profile-mismatch-chat'][0]) === true,
+    );
+    expect(hasButton(CHAT.updateAgent)).toBe(false);
+  });
 });
 
 describe('Chat page: the live stream', () => {
