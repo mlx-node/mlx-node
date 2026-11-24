@@ -418,7 +418,41 @@ struct Inkling2SconvK4Params {
   uint history_is_f32;
   uint dyn_is_f32;
   uint x_row_stride;     // elems per token row t in x (0 => channels)
+  uint has_tree;         // 0 = linear chain, 1 = speculative verify tree
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
 };
+
+// Returns the tree row index of the `step`-th ancestor (0-based from root) in `ancestors` bitmask.
+inline uint inkling2_sconv_path_row(uint ancestors, uint step) {
+  uint mask = ancestors;
+  for (uint i = 0u; i < step; ++i) {
+    mask &= mask - 1u;
+  }
+  return ctz(mask);
+}
+
+// Returns 4 causal ShortConv tap indices (x = tap3/oldest, y = tap2, z = tap1, w = tap0/current)
+// in combined [hist(0..2), x(3..3+seq_t_len-1)] coordinates.
+// `tree_rows[global_t]` packs `x = ancestors` (uint32 bitmask including local_t), `y = parent | (depth << 16)`.
+inline uint4 inkling2_sconv_tap_indices(
+    uint local_t,
+    uint has_tree,
+    device const uint2 *tree_rows,
+    uint global_t) {
+  if (has_tree != 0u) {
+    const uint2 tr = tree_rows[global_t];
+    const uint ancestors = tr.x;
+    const uint depth = tr.y >> 16u;
+    const uint idx3 = (depth >= 3u) ? (3u + inkling2_sconv_path_row(ancestors, depth - 3u)) : depth;
+    const uint idx2 = (depth >= 2u) ? (3u + inkling2_sconv_path_row(ancestors, depth - 2u)) : (depth + 1u);
+    const uint idx1 = (depth >= 1u) ? (3u + inkling2_sconv_path_row(ancestors, depth - 1u)) : (depth + 2u);
+    const uint idx0 = 3u + local_t;
+    return uint4(idx3, idx2, idx1, idx0);
+  }
+  return uint4(local_t, local_t + 1u, local_t + 2u, local_t + 3u);
+}
 
 template <typename T>
 inline float inkling2_sconv_read_full_strided(
@@ -447,6 +481,7 @@ inline void inkling2_sconv_k4_impl(
     device T *y_out,
     device T *history_out,
     constant Inkling2SconvK4Params &params,
+    device const uint2 *tree_rows,
     uint2 gid) {
   const uint ch = gid.x;
   const uint t = gid.y;
@@ -456,11 +491,12 @@ inline void inkling2_sconv_k4_impl(
     return;
   }
   const uint x_stride = params.x_row_stride;
+  const uint4 taps = inkling2_sconv_tap_indices(t, params.has_tree, tree_rows, t);
 
-  const float x3 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, t + 0u, ch);
-  const float x2 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, t + 1u, ch);
-  const float x1 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, t + 2u, ch);
-  const float x0 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, t + 3u, ch);
+  const float x3 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, taps.x, ch);
+  const float x2 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, taps.y, ch);
+  const float x1 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, taps.z, ch);
+  const float x0 = inkling2_sconv_read_full_strided<T>(history_in_raw, 0ul, C, params.history_is_f32, x, 0u, x_stride, taps.w, ch);
 
   const ulong w_base = ulong(ch) * 4ul;
   float w3 = inkling2_read_f32(weight_raw, w_base + 0ul, params.weight_is_f32);
@@ -500,9 +536,10 @@ inline void inkling2_sconv_k4_impl(
     device bfloat *y_out [[buffer(4)]],
     device bfloat *history_out [[buffer(5)]],
     constant Inkling2SconvK4Params &params [[buffer(6)]],
+    device const uint2 *tree_rows [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]) {
   inkling2_sconv_k4_impl<bfloat>(
-      x, weight_raw, history_in_raw, dyn_taps_raw, y_out, history_out, params, gid);
+      x, weight_raw, history_in_raw, dyn_taps_raw, y_out, history_out, params, tree_rows, gid);
 }
 
 [[kernel]] void inkling2_sconv_k4_f32(
@@ -513,9 +550,10 @@ inline void inkling2_sconv_k4_impl(
     device float *y_out [[buffer(4)]],
     device float *history_out [[buffer(5)]],
     constant Inkling2SconvK4Params &params [[buffer(6)]],
+    device const uint2 *tree_rows [[buffer(7)]],
     uint2 gid [[thread_position_in_grid]]) {
   inkling2_sconv_k4_impl<float>(
-      x, weight_raw, history_in_raw, dyn_taps_raw, y_out, history_out, params, gid);
+      x, weight_raw, history_in_raw, dyn_taps_raw, y_out, history_out, params, tree_rows, gid);
 }
 
 // ============================================================================
@@ -694,7 +732,7 @@ struct Inkling2SconvK4KvPrepParams {
   uint flags;            // bit0: kw_f32, bit1: vw_f32, bit2: dk_f32, bit3: dv_f32
   uint k_hist_f32_mask;  // bit s = 1 if k_hist[s] is f32
   uint v_hist_f32_mask;  // bit s = 1 if v_hist[s] is f32
-  uint _pad0;
+  uint has_tree;         // 0 = linear chain, 1 = speculative verify tree
   uint _pad1;
   uint k_hist_strides[4]; // row stride in elems for kh0..kh3 (C when packed)
   uint v_hist_strides[4]; // row stride in elems for vh0..vh3 (C when packed)
@@ -722,6 +760,7 @@ inline void inkling2_sconv_k4_kv_prep_impl(
     device T *k_hist_out,
     device T *v_hist_out,
     constant Inkling2SconvK4KvPrepParams &params,
+    device const uint2 *tree_rows,
     uint2 tgid,
     uint lane) {
   const uint n_kv = params.num_kv_heads;
@@ -822,15 +861,16 @@ inline void inkling2_sconv_k4_kv_prep_impl(
       }
     }
   }
+  const uint4 taps = inkling2_sconv_tap_indices(local_t, params.has_tree, tree_rows, t);
   float conv_regs[8];
   float sum_sq = 0.0f;
   uint reg_i = 0u;
   for (uint d = lane; d < hd; d += 32u) {
     const uint ch = h * hd + d;
-    const float x3 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 0u, ch);
-    const float x2 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 1u, ch);
-    const float x1 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 2u, ch);
-    const float x0 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 3u, ch);
+    const float x3 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.x, ch);
+    const float x2 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.y, ch);
+    const float x1 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.z, ch);
+    const float x0 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.w, ch);
 
     if (is_last_tok) {
       h_out_ptr[h_out_base + 0ul * ulong(C) + ch] = T(x2);
@@ -888,12 +928,13 @@ inline void inkling2_sconv_k4_kv_prep_impl(
     device bfloat *k_hist_out [[buffer(17)]],
     device bfloat *v_hist_out [[buffer(18)]],
     constant Inkling2SconvK4KvPrepParams &params [[buffer(19)]],
+    device const uint2 *tree_rows [[buffer(20)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   inkling2_sconv_k4_kv_prep_impl<bfloat>(
       k_in, v_in, k_weight, v_weight, dyn_k, dyn_v, cu_seqlens,
       kh0, kh1, kh2, kh3, vh0, vh1, vh2, vh3,
-      k_out, v_out, k_hist_out, v_hist_out, params, tgid, lane);
+      k_out, v_out, k_hist_out, v_hist_out, params, tree_rows, tgid, lane);
 }
 
 [[kernel, max_total_threads_per_threadgroup(32)]] void inkling2_sconv_k4_kv_prep_f32(
@@ -917,12 +958,13 @@ inline void inkling2_sconv_k4_kv_prep_impl(
     device float *k_hist_out [[buffer(17)]],
     device float *v_hist_out [[buffer(18)]],
     constant Inkling2SconvK4KvPrepParams &params [[buffer(19)]],
+    device const uint2 *tree_rows [[buffer(20)]],
     uint2 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]]) {
   inkling2_sconv_k4_kv_prep_impl<float>(
       k_in, v_in, k_weight, v_weight, dyn_k, dyn_v, cu_seqlens,
       kh0, kh1, kh2, kh3, vh0, vh1, vh2, vh3,
-      k_out, v_out, k_hist_out, v_hist_out, params, tgid, lane);
+      k_out, v_out, k_hist_out, v_hist_out, params, tree_rows, tgid, lane);
 }
 
 // ============================================================================
@@ -942,7 +984,7 @@ struct Inkling2SconvK4KvPrepPagedParams {
   float l2_eps;           // 1e-6f
   uint is_dynamic;        // 0 or 1
   uint packed_hist;       // 0 = up to 4 separate bufs, 1 = packed [N, 3, C] in buf 0
-  uint flags;             // bit0: kw_f32, bit1: vw_f32, bit2: dk_f32, bit3: dv_f32
+  uint flags;             // bit0: kw_f32, bit1: vw_f32, bit2: dk_f32, bit3: dv_f32, bit4: has_tree
   uint k_hist_f32_mask;   // bit s = 1 if k_hist[s] is f32
   uint v_hist_f32_mask;   // bit s = 1 if v_hist[s] is f32
   uint block_size;        // 16 or 32
@@ -951,33 +993,33 @@ struct Inkling2SconvK4KvPrepPagedParams {
   uint v_hist_strides[4]; // row stride in elems for vh0..vh3 (C when packed)
 };
 
-[[kernel, max_total_threads_per_threadgroup(32)]] void
-inkling2_sconv_k4_kv_prep_paged_bf16(
-    device const bfloat *k_in [[buffer(0)]],
-    device const bfloat *v_in [[buffer(1)]],
-    device const uchar *k_weight [[buffer(2)]],
-    device const uchar *v_weight [[buffer(3)]],
-    device const uchar *dyn_k [[buffer(4)]],
-    device const uchar *dyn_v [[buffer(5)]],
-    device const int32_t *cu_seqlens [[buffer(6)]],
-    device const uchar *kh0 [[buffer(7)]],
-    device const uchar *kh1 [[buffer(8)]],
-    device const uchar *kh2 [[buffer(9)]],
-    device const uchar *kh3 [[buffer(10)]],
-    device const uchar *vh0 [[buffer(11)]],
-    device const uchar *vh1 [[buffer(12)]],
-    device const uchar *vh2 [[buffer(13)]],
-    device const uchar *vh3 [[buffer(14)]],
-    device bfloat *k_hist_out [[buffer(15)]],
-    device bfloat *v_hist_out [[buffer(16)]],
-    device uchar *k_pool [[buffer(17)]],
-    device uchar *v_pool [[buffer(18)]],
-    device float *k_scale [[buffer(19)]],
-    device float *v_scale [[buffer(20)]],
-    device const int64_t *slot_mapping [[buffer(21)]],
-    constant Inkling2SconvK4KvPrepPagedParams &params [[buffer(22)]],
-    uint2 tgid [[threadgroup_position_in_grid]],
-    uint lane [[thread_index_in_simdgroup]]) {
+inline void inkling2_sconv_k4_kv_prep_paged_bf16_impl(
+    device const bfloat *k_in,
+    device const bfloat *v_in,
+    device const uchar *k_weight,
+    device const uchar *v_weight,
+    device const uchar *dyn_k,
+    device const uchar *dyn_v,
+    device const int32_t *cu_seqlens,
+    device const uchar *kh0,
+    device const uchar *kh1,
+    device const uchar *kh2,
+    device const uchar *kh3,
+    device const uchar *vh0,
+    device const uchar *vh1,
+    device const uchar *vh2,
+    device const uchar *vh3,
+    device bfloat *k_hist_out,
+    device bfloat *v_hist_out,
+    device uchar *k_pool,
+    device uchar *v_pool,
+    device float *k_scale,
+    device float *v_scale,
+    device const int64_t *slot_mapping,
+    constant Inkling2SconvK4KvPrepPagedParams &params,
+    device const uint2 *tree_rows,
+    uint2 tgid,
+    uint lane) {
   const uint n_kv = params.num_kv_heads;
   const uint t = tgid.y;
   if (tgid.x >= 2u * n_kv || t >= params.seq_len) {
@@ -1075,19 +1117,21 @@ inkling2_sconv_k4_kv_prep_paged_bf16(
     }
   }
 
+  const uint has_tree = (params.flags >> 4u) & 1u;
+  const uint4 taps = inkling2_sconv_tap_indices(local_t, has_tree, tree_rows, t);
   float conv_regs[8];
   float sum_sq = 0.0f;
   uint reg_count = 0u;
   for (uint d = lane; d < hd; d += 32u) {
     const uint ch = h * hd + d;
     const float x3 = inkling2_sconv_read_full_strided<bfloat>(
-        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 0u, ch);
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.x, ch);
     const float x2 = inkling2_sconv_read_full_strided<bfloat>(
-        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 1u, ch);
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.y, ch);
     const float x1 = inkling2_sconv_read_full_strided<bfloat>(
-        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 2u, ch);
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.z, ch);
     const float x0 = inkling2_sconv_read_full_strided<bfloat>(
-        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, local_t + 3u, ch);
+        h_ptr, h_base, h_row_stride, h_f32, x_ptr, seq_start, x_stride, taps.w, ch);
 
     if (is_last_tok) {
       h_out_ptr[h_out_base + 0ul * ulong(C) + ch] = bfloat(x2);
@@ -1188,6 +1232,191 @@ inkling2_sconv_k4_kv_prep_paged_bf16(
     uint r = 0u;
     for (uint d = lane; d < hd; d += 32u) {
       dst[row_base + ulong(d)] = bfloat(conv_regs[r++] * factor);
+    }
+  }
+}
+
+[[kernel, max_total_threads_per_threadgroup(32)]] void
+inkling2_sconv_k4_kv_prep_paged_bf16(
+    device const bfloat *k_in [[buffer(0)]],
+    device const bfloat *v_in [[buffer(1)]],
+    device const uchar *k_weight [[buffer(2)]],
+    device const uchar *v_weight [[buffer(3)]],
+    device const uchar *dyn_k [[buffer(4)]],
+    device const uchar *dyn_v [[buffer(5)]],
+    device const int32_t *cu_seqlens [[buffer(6)]],
+    device const uchar *kh0 [[buffer(7)]],
+    device const uchar *kh1 [[buffer(8)]],
+    device const uchar *kh2 [[buffer(9)]],
+    device const uchar *kh3 [[buffer(10)]],
+    device const uchar *vh0 [[buffer(11)]],
+    device const uchar *vh1 [[buffer(12)]],
+    device const uchar *vh2 [[buffer(13)]],
+    device const uchar *vh3 [[buffer(14)]],
+    device bfloat *k_hist_out [[buffer(15)]],
+    device bfloat *v_hist_out [[buffer(16)]],
+    device uchar *k_pool [[buffer(17)]],
+    device uchar *v_pool [[buffer(18)]],
+    device float *k_scale [[buffer(19)]],
+    device float *v_scale [[buffer(20)]],
+    device const int64_t *slot_mapping [[buffer(21)]],
+    constant Inkling2SconvK4KvPrepPagedParams &params [[buffer(22)]],
+    device const uint2 *tree_rows [[buffer(23)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  inkling2_sconv_k4_kv_prep_paged_bf16_impl(
+      k_in, v_in, k_weight, v_weight, dyn_k, dyn_v, cu_seqlens,
+      kh0, kh1, kh2, kh3, vh0, vh1, vh2, vh3,
+      k_hist_out, v_hist_out, k_pool, v_pool, k_scale, v_scale,
+      slot_mapping, params, tree_rows, tgid, lane);
+}
+
+// ============================================================================
+// 6b2. inkling2_qr_clip_sconv_k4_kv_prep_paged_bf16
+//      40-core parallel fusion: runs `qr_clip` (H_q=24 warps/tok) and
+//      `sconv_k4_kv_prep_paged` (2*H_kv=16 warps/tok) concurrently in ONE
+//      Metal dispatch (`grid = (H_q + 2*H_kv, T, 1) x 32` -> 40 TGs at T=1!).
+//      Calls the exact shared `*_impl` helpers -> 100% 0-ULP bit-identical.
+// ============================================================================
+struct Inkling2QrClipSconvK4KvPrepPagedParams {
+  Inkling2QrClipParams qr;
+  Inkling2SconvK4KvPrepPagedParams kv;
+};
+
+[[kernel, max_total_threads_per_threadgroup(32)]] void
+inkling2_qr_clip_sconv_k4_kv_prep_paged_bf16(
+    device const uchar *q_in_raw [[buffer(0)]],
+    device const uchar *r_in_raw [[buffer(1)]],
+    device const uchar *q_clip_raw [[buffer(2)]],
+    device const uchar *rel_clip_raw [[buffer(3)]],
+    device const uchar *tau_raw [[buffer(4)]],
+    device bfloat *q_out [[buffer(5)]],
+    device float *r_out [[buffer(6)]],
+    device const bfloat *k_in [[buffer(7)]],
+    device const bfloat *v_in [[buffer(8)]],
+    device const uchar *k_weight [[buffer(9)]],
+    device const uchar *v_weight [[buffer(10)]],
+    device const uchar *dyn_k [[buffer(11)]],
+    device const uchar *dyn_v [[buffer(12)]],
+    device const int32_t *cu_seqlens [[buffer(13)]],
+    device const uchar *kh0 [[buffer(14)]],
+    device const uchar *kh1 [[buffer(15)]],
+    device const uchar *kh2 [[buffer(16)]],
+    device const uchar *kh3 [[buffer(17)]],
+    device const uchar *vh0 [[buffer(18)]],
+    device const uchar *vh1 [[buffer(19)]],
+    device const uchar *vh2 [[buffer(20)]],
+    device const uchar *vh3 [[buffer(21)]],
+    device bfloat *k_hist_out [[buffer(22)]],
+    device bfloat *v_hist_out [[buffer(23)]],
+    device uchar *k_pool [[buffer(24)]],
+    device uchar *v_pool [[buffer(25)]],
+    device float *k_scale [[buffer(26)]],
+    device float *v_scale [[buffer(27)]],
+    device const int64_t *slot_mapping [[buffer(28)]],
+    device const uint2 *tree_rows [[buffer(29)]],
+    constant Inkling2QrClipSconvK4KvPrepPagedParams &params [[buffer(30)]],
+    uint2 tgid [[threadgroup_position_in_grid]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  if (tgid.x < params.qr.num_heads) {
+    inkling2_qr_clip_impl<bfloat>(
+        q_in_raw, r_in_raw, q_clip_raw, rel_clip_raw, tau_raw,
+        q_out, r_out, params.qr, tgid, lane);
+  } else {
+    inkling2_sconv_k4_kv_prep_paged_bf16_impl(
+        k_in, v_in, k_weight, v_weight, dyn_k, dyn_v, cu_seqlens,
+        kh0, kh1, kh2, kh3, vh0, vh1, vh2, vh3,
+        k_hist_out, v_hist_out, k_pool, v_pool, k_scale, v_scale,
+        slot_mapping, params.kv, tree_rows,
+        uint2(tgid.x - params.qr.num_heads, tgid.y), lane);
+  }
+}
+
+// ============================================================================
+// 6c. inkling2_paged_kv_path_commit
+//     In-place KV slot compaction for speculative tree verification commit:
+//     copies `src_slots[i] -> dst_slots[i]` in ascending order across all 3 KV modes.
+//     Grid: (num_kv_heads, 1, 1), TG: (128, 1, 1).
+// ============================================================================
+struct Inkling2PagedKvPathCommitParams {
+  uint num_copies;
+  uint num_kv_heads;
+  uint head_dim;
+  uint block_size;
+  uint kv_mode; // 0 = INT8-KTM, 1 = BF16 vLLM (x=8), 2 = BF16 values_token_major
+  uint _pad0;
+  uint _pad1;
+  uint _pad2;
+};
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void
+inkling2_paged_kv_path_commit(
+    device uchar *k_pool [[buffer(0)]],
+    device uchar *v_pool [[buffer(1)]],
+    device float *k_scale [[buffer(2)]],
+    device float *v_scale [[buffer(3)]],
+    device const int64_t *src_slots [[buffer(4)]],
+    device const int64_t *dst_slots [[buffer(5)]],
+    constant Inkling2PagedKvPathCommitParams &params [[buffer(6)]],
+    uint h [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tpg [[threads_per_threadgroup]]) {
+  const uint n_kv = params.num_kv_heads;
+  if (h >= n_kv) {
+    return;
+  }
+  const ulong hd = ulong(params.head_dim);
+  const ulong bs = ulong(params.block_size);
+  const int64_t bs_i64 = int64_t(params.block_size);
+
+  for (uint i = 0u; i < params.num_copies; ++i) {
+    const int64_t s_slot = src_slots[i];
+    const int64_t d_slot = dst_slots[i];
+    if (s_slot < 0 || d_slot < 0 || s_slot == d_slot) {
+      continue;
+    }
+    const ulong s_bh = ulong(s_slot / bs_i64) * ulong(n_kv) + ulong(h);
+    const ulong s_tok = ulong(s_slot % bs_i64);
+    const ulong d_bh = ulong(d_slot / bs_i64) * ulong(n_kv) + ulong(h);
+    const ulong d_tok = ulong(d_slot % bs_i64);
+
+    if (params.kv_mode == 0u) {
+      device char *k_buf = reinterpret_cast<device char *>(k_pool);
+      device char *v_buf = reinterpret_cast<device char *>(v_pool);
+      const ulong s_sc = s_bh * bs + s_tok;
+      const ulong d_sc = d_bh * bs + d_tok;
+      if (tid == 0u) {
+        k_scale[d_sc] = k_scale[s_sc];
+        v_scale[d_sc] = v_scale[s_sc];
+      }
+      for (uint d = tid; d < params.head_dim; d += tpg) {
+        k_buf[d_sc * hd + ulong(d)] = k_buf[s_sc * hd + ulong(d)];
+        v_buf[(d_bh * hd + ulong(d)) * bs + d_tok] =
+            v_buf[(s_bh * hd + ulong(d)) * bs + s_tok];
+      }
+    } else if (params.kv_mode == 1u) {
+      device bfloat *k_buf = reinterpret_cast<device bfloat *>(k_pool);
+      device bfloat *v_buf = reinterpret_cast<device bfloat *>(v_pool);
+      const ulong x = 8ul;
+      const ulong chunks = hd / x;
+      for (uint d = tid; d < params.head_dim; d += tpg) {
+        const ulong x_idx = ulong(d) / x;
+        const ulong x_off = ulong(d) % x;
+        const ulong s_k = (s_bh * chunks + x_idx) * bs * x + s_tok * x + x_off;
+        const ulong d_k = (d_bh * chunks + x_idx) * bs * x + d_tok * x + x_off;
+        k_buf[d_k] = k_buf[s_k];
+        v_buf[(d_bh * hd + ulong(d)) * bs + d_tok] =
+            v_buf[(s_bh * hd + ulong(d)) * bs + s_tok];
+      }
+    } else {
+      device bfloat *k_buf = reinterpret_cast<device bfloat *>(k_pool);
+      device bfloat *v_buf = reinterpret_cast<device bfloat *>(v_pool);
+      const ulong s_base = (s_bh * bs + s_tok) * hd;
+      const ulong d_base = (d_bh * bs + d_tok) * hd;
+      for (uint d = tid; d < params.head_dim; d += tpg) {
+        k_buf[d_base + ulong(d)] = k_buf[s_base + ulong(d)];
+        v_buf[d_base + ulong(d)] = v_buf[s_base + ulong(d)];
+      }
     }
   }
 }
@@ -1843,7 +2072,7 @@ struct Inkling2SconvK4RaggedParams {
   uint res_b_stride;   // elems per token row t in res_b
   uint flags;          // bit0: w_f32, bit1: dyn_f32, bit2: has_res_a, bit3: res_a_f32, bit4: has_res_b, bit5: res_b_f32
   uint hist_f32_mask;  // bit s = 1 if hist[s] is f32
-  uint _pad;
+  uint has_tree;       // 0 = linear chain, 1 = speculative verify tree
 };
 
 template <typename T>
@@ -1861,6 +2090,7 @@ inline void inkling2_sconv_k4_ragged_impl(
     device T *y_out,
     device T *hist_out,
     constant Inkling2SconvK4RaggedParams &params,
+    device const uint2 *tree_rows,
     uint2 gid) {
   const uint ch = gid.x;
   const uint t = gid.y;
@@ -1890,10 +2120,11 @@ inline void inkling2_sconv_k4_ragged_impl(
   }
 
   const uint x_stride = params.x_row_stride;
-  const float x3 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, local_t + 0u, ch);
-  const float x2 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, local_t + 1u, ch);
-  const float x1 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, local_t + 2u, ch);
-  const float x0 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, local_t + 3u, ch);
+  const uint4 taps = inkling2_sconv_tap_indices(local_t, params.has_tree, tree_rows, t);
+  const float x3 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, taps.x, ch);
+  const float x2 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, taps.y, ch);
+  const float x1 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, taps.z, ch);
+  const float x0 = inkling2_sconv_read_full_strided<T>(h_ptr, h_base, C, h_f32, x, seq_start, x_stride, taps.w, ch);
 
   const uint w_f32 = (params.flags >> 0u) & 1u;
   const ulong w_base = ulong(ch) * 4ul;
@@ -1984,10 +2215,11 @@ inline void inkling2_sconv_k4_ragged_impl(
     device bfloat *y_out [[buffer(10)]],
     device bfloat *hist_out [[buffer(11)]],
     constant Inkling2SconvK4RaggedParams &params [[buffer(12)]],
+    device const uint2 *tree_rows [[buffer(13)]],
     uint2 gid [[thread_position_in_grid]]) {
   inkling2_sconv_k4_ragged_impl<bfloat>(
       x, weight_raw, dyn_taps_raw, cu_seqlens, res_a_raw, res_b_raw,
-      h0, h1, h2, h3, y_out, hist_out, params, gid);
+      h0, h1, h2, h3, y_out, hist_out, params, tree_rows, gid);
 }
 
 [[kernel]] void inkling2_sconv_k4_ragged_f32(
@@ -2004,10 +2236,11 @@ inline void inkling2_sconv_k4_ragged_impl(
     device float *y_out [[buffer(10)]],
     device float *hist_out [[buffer(11)]],
     constant Inkling2SconvK4RaggedParams &params [[buffer(12)]],
+    device const uint2 *tree_rows [[buffer(13)]],
     uint2 gid [[thread_position_in_grid]]) {
   inkling2_sconv_k4_ragged_impl<float>(
       x, weight_raw, dyn_taps_raw, cu_seqlens, res_a_raw, res_b_raw,
-      h0, h1, h2, h3, y_out, hist_out, params, gid);
+      h0, h1, h2, h3, y_out, hist_out, params, tree_rows, gid);
 }
 
 // ============================================================================
@@ -2371,7 +2604,7 @@ struct Inkling2MarkovGateParams {
 // ============================================================================
 // 14. inkling2_moe_router_proj_f32 (coalesced exact-FP32 router matmul for T <= 32)
 //     Avoids MLX's slow M=8/32 64x64-padded FP32 steel_matmul on [T, 2304] @ [2304, 128]!
-//     Grid: (ceil(E / 4), ceil(T / 8), 1), TG: (128, 1, 1) -> 4 SGs, 1 expert/SG, 8 rows/TG.
+//     Grid: (ceil(E / 2), ceil(T / row_group), 1), TG: (64, 1, 1) -> 2 SGs, 1 expert/SG, 8 or 16 rows/TG.
 // ============================================================================
 struct Inkling2MoeRouterProjParams {
   uint rows;        // T
@@ -2379,12 +2612,12 @@ struct Inkling2MoeRouterProjParams {
   uint num_experts; // E
   uint x_stride;    // row stride of x in elements
   uint x_is_f32;    // 0 = BF16, 1 = F32
-  uint _pad0;
+  uint _pad0;       // row_group override (0 => 8, 16 => 16 rows/TG)
   uint _pad1;
   uint _pad2;
 };
 
-[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_moe_router_proj_f32(
+[[kernel, max_total_threads_per_threadgroup(64)]] void inkling2_moe_router_proj_f32(
     device const uchar *x_raw [[buffer(0)]],
     device const float *w_f32 [[buffer(1)]],
     device float *logits [[buffer(2)]],
@@ -2392,20 +2625,56 @@ struct Inkling2MoeRouterProjParams {
     uint2 tgid [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
-  const uint expert = tgid.x * 4u + sg;
+  const uint expert = tgid.x * 2u + sg;
   if (expert >= params.num_experts) {
     return;
   }
-  const uint row0 = tgid.y * 8u;
+  const uint row_group = (params._pad0 != 0u) ? params._pad0 : 8u;
+  const uint row0 = tgid.y * row_group;
   if (row0 >= params.rows) {
     return;
   }
-  const uint n_rows = min(8u, params.rows - row0);
+  const uint n_rows = min(row_group, params.rows - row0);
   const uint dim4 = params.dim >> 2u;
   const device float4 *w4 = reinterpret_cast<device const float4 *>(
       w_f32 + ulong(expert) * ulong(params.dim));
 
-  float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+  if (n_rows <= 8u) {
+    float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (params.x_is_f32 != 0u) {
+      const device float *xf = reinterpret_cast<device const float *>(x_raw);
+      for (uint i = lane; i < dim4; i += 32u) {
+        const float4 wv = w4[i];
+        for (uint r = 0u; r < n_rows; ++r) {
+          const float4 xv = *reinterpret_cast<device const float4 *>(
+              xf + ulong(row0 + r) * ulong(params.x_stride) + ulong(i << 2u));
+          acc[r] += dot(wv, xv);
+        }
+      }
+    } else {
+      const device bfloat *xb = reinterpret_cast<device const bfloat *>(x_raw);
+      for (uint i = lane; i < dim4; i += 32u) {
+        const float4 wv = w4[i];
+        for (uint r = 0u; r < n_rows; ++r) {
+          const bfloat4 xbh = *reinterpret_cast<device const bfloat4 *>(
+              xb + ulong(row0 + r) * ulong(params.x_stride) + ulong(i << 2u));
+          acc[r] += dot(wv, float4(xbh));
+        }
+      }
+    }
+
+    for (uint r = 0u; r < n_rows; ++r) {
+      const float sum = simd_sum(acc[r]);
+      if (lane == 0u) {
+        logits[ulong(row0 + r) * ulong(params.num_experts) + expert] = sum;
+      }
+    }
+    return;
+  }
+
+  float acc[16] = {
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+      0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
   if (params.x_is_f32 != 0u) {
     const device float *xf = reinterpret_cast<device const float *>(x_raw);
     for (uint i = lane; i < dim4; i += 32u) {
@@ -2477,12 +2746,13 @@ inline float4 inkling2_load_w4(device const uchar *w_raw, ulong idx4, bool w_is_
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
   const uint r_idx = tgid.x;
-  const uint row0 = tgid.y * 8u;
+  const uint row_group = (params._pad0 != 0u) ? params._pad0 : 8u;
+  const uint row0 = tgid.y * row_group;
   const uint s = tgid.z;
   if (r_idx >= params.rank || row0 >= params.rows || s >= params.num_streams) {
     return;
   }
-  const uint n_rows = min(8u, params.rows - row0);
+  const uint n_rows = min(row_group, params.rows - row0);
   const uint dim = params.dim;
   const uint dim4 = dim >> 2u;
   const uint half_id = sg >> 1u;              // 0 = dest (sg 0,1), 1 = msg (sg 2,3)
@@ -2500,8 +2770,8 @@ inline float4 inkling2_load_w4(device const uchar *w_raw, ulong idx4, bool w_is_
   const ulong in_rs4 = ulong(rs) >> 2u;
   const ulong in_s_base4 = (ulong(s) * ulong(ss) + ulong(row0) * ulong(rs)) >> 2u;
 
-  threadgroup float tg_sq[4][8];
-  threadgroup float tg_acc[4][8];
+  threadgroup float tg_sq[4][16];
+  threadgroup float tg_acc[4][16];
 
   if (n_rows == 1u) {
     float sq = 0.0f;
@@ -2543,21 +2813,60 @@ inline float4 inkling2_load_w4(device const uchar *w_raw, ulong idx4, bool w_is_
     return;
   }
 
-  float sq[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  float ac[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-  if (in_is_f32 != 0u) {
-    const device float4 *in_f4 = reinterpret_cast<device const float4 *>(in_raw) + in_s_base4;
-    if (n_rows == 8u) {
+  if (n_rows <= 8u) {
+    float sq[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float ac[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (in_is_f32 != 0u) {
+      const device float4 *in_f4 = reinterpret_cast<device const float4 *>(in_raw) + in_s_base4;
+      if (n_rows == 8u) {
+        for (uint i = local_tid; i < dim4; i += 64u) {
+          const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+          #pragma unroll
+          for (uint r = 0u; r < 8u; ++r) {
+            const float4 xv = in_f4[ulong(r) * in_rs4 + i];
+            sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+            ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+          }
+        }
+      } else {
+        for (uint i = local_tid; i < dim4; i += 64u) {
+          const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+          for (uint r = 0u; r < n_rows; ++r) {
+            const float4 xv = in_f4[ulong(r) * in_rs4 + i];
+            sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+            ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+          }
+        }
+      }
+    } else {
+      const device bfloat4 *in_b4 = reinterpret_cast<device const bfloat4 *>(in_raw) + in_s_base4;
       for (uint i = local_tid; i < dim4; i += 64u) {
         const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
-        #pragma unroll
-        for (uint r = 0u; r < 8u; ++r) {
-          const float4 xv = in_f4[ulong(r) * in_rs4 + i];
+        for (uint r = 0u; r < n_rows; ++r) {
+          const float4 xv = float4(in_b4[ulong(r) * in_rs4 + i]);
           sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
           ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
         }
       }
-    } else {
+    }
+
+    for (uint r = 0u; r < n_rows; ++r) {
+      const float sr = simd_sum(sq[r]);
+      const float ar = simd_sum(ac[r]);
+      if (lane == 0u) {
+        tg_sq[sg][r] = sr;
+        tg_acc[sg][r] = ar;
+      }
+    }
+  } else {
+    float sq[16] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    float ac[16] = {
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    if (in_is_f32 != 0u) {
+      const device float4 *in_f4 = reinterpret_cast<device const float4 *>(in_raw) + in_s_base4;
       for (uint i = local_tid; i < dim4; i += 64u) {
         const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
         for (uint r = 0u; r < n_rows; ++r) {
@@ -2566,25 +2875,25 @@ inline float4 inkling2_load_w4(device const uchar *w_raw, ulong idx4, bool w_is_
           ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
         }
       }
-    }
-  } else {
-    const device bfloat4 *in_b4 = reinterpret_cast<device const bfloat4 *>(in_raw) + in_s_base4;
-    for (uint i = local_tid; i < dim4; i += 64u) {
-      const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
-      for (uint r = 0u; r < n_rows; ++r) {
-        const float4 xv = float4(in_b4[ulong(r) * in_rs4 + i]);
-        sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
-        ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+    } else {
+      const device bfloat4 *in_b4 = reinterpret_cast<device const bfloat4 *>(in_raw) + in_s_base4;
+      for (uint i = local_tid; i < dim4; i += 64u) {
+        const float4 wv = inkling2_load_w4(down_w_raw, w_row_base4 + i, w_is_bf16);
+        for (uint r = 0u; r < n_rows; ++r) {
+          const float4 xv = float4(in_b4[ulong(r) * in_rs4 + i]);
+          sq[r] += (xv.x * xv.x + xv.y * xv.y) + (xv.z * xv.z + xv.w * xv.w);
+          ac[r] += (wv.x * xv.x + wv.y * xv.y) + (wv.z * xv.z + wv.w * xv.w);
+        }
       }
     }
-  }
 
-  for (uint r = 0u; r < n_rows; ++r) {
-    const float sr = simd_sum(sq[r]);
-    const float ar = simd_sum(ac[r]);
-    if (lane == 0u) {
-      tg_sq[sg][r] = sr;
-      tg_acc[sg][r] = ar;
+    for (uint r = 0u; r < n_rows; ++r) {
+      const float sr = simd_sum(sq[r]);
+      const float ar = simd_sum(ac[r]);
+      if (lane == 0u) {
+        tg_sq[sg][r] = sr;
+        tg_acc[sg][r] = ar;
+      }
     }
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -2642,7 +2951,8 @@ struct Inkling2LoopCtrlUpBlendParams {
     uint sg [[simdgroup_index_in_threadgroup]]) {
   (void)tid;
   const uint d_tile = tgid.x;
-  const uint row0 = tgid.y * 8u;
+  const uint row_group = (params._pad0 != 0u) ? params._pad0 : 8u;
+  const uint row0 = tgid.y * row_group;
   const uint s = tgid.z;
   if (d_tile >= params.num_d_tiles || row0 >= params.rows || s >= params.num_streams) {
     return;
@@ -2650,7 +2960,7 @@ struct Inkling2LoopCtrlUpBlendParams {
   const uint D = params.dim;
   const uint R = params.rank;
   const uint R4 = R >> 2u;
-  const uint n_rows = min(8u, params.rows - row0);
+  const uint n_rows = min(row_group, params.rows - row0);
   const bool w_is_bf16 = ((params.flags >> 2u) & 1u) != 0u;
 
   const uint half_id = lane >> 4u; // 0 = gain (lanes 0..15), 1 = forget (lanes 16..31)
@@ -2661,8 +2971,8 @@ struct Inkling2LoopCtrlUpBlendParams {
   const ulong w_half_base4 = (ulong(s) * 2ul + ulong(half_id)) * ulong(D) * ulong(R4);
   const device float4 *h4 = reinterpret_cast<device const float4 *>(h) + h_s_base4;
 
-  threadgroup float tg_g[8][32];
-  threadgroup float tg_f[8][32];
+  threadgroup float tg_g[16][32];
+  threadgroup float tg_f[16][32];
 
   if (R4 == 16u) {
     // Fast path for R = 64: entire h row fits in 1 float4/lane in registers (zero tg_h!).
@@ -2763,8 +3073,34 @@ struct Inkling2LoopCtrlUpBlendParams {
           }
         }
       }
-    } else {
+    } else if (n_rows <= 8u) {
       float4 hv[8];
+      for (uint r = 0u; r < n_rows; ++r) {
+        hv[r] = h4[ulong(row0 + r) * 16ul + sub];
+      }
+      for (uint c = 0u; c < 8u; ++c) {
+        const uint col = col_base + c;
+        if (col >= D) {
+          break;
+        }
+        const float4 wv = inkling2_load_w4(gf_w_raw, w_half_base4 + ulong(col) * 16ul + sub, w_is_bf16);
+        for (uint r = 0u; r < n_rows; ++r) {
+          float p = (wv.x * hv[r].x + wv.y * hv[r].y) + (wv.z * hv[r].z + wv.w * hv[r].w);
+          p += simd_shuffle_xor(p, 8);
+          p += simd_shuffle_xor(p, 4);
+          p += simd_shuffle_xor(p, 2);
+          p += simd_shuffle_xor(p, 1);
+          if (sub == 0u) {
+            if (half_id == 0u) {
+              tg_g[r][sg * 8u + c] = p;
+            } else {
+              tg_f[r][sg * 8u + c] = p;
+            }
+          }
+        }
+      }
+    } else {
+      float4 hv[16];
       for (uint r = 0u; r < n_rows; ++r) {
         hv[r] = h4[ulong(row0 + r) * 16ul + sub];
       }
@@ -2797,7 +3133,9 @@ struct Inkling2LoopCtrlUpBlendParams {
       if (col >= D) {
         break;
       }
-      float acc[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+      float acc[16] = {
+          0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f,
+          0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
       const ulong w_col_base4 = w_half_base4 + ulong(col) * ulong(R4);
       for (uint k4 = sub; k4 < R4; k4 += 16u) {
         const float4 wv = inkling2_load_w4(gf_w_raw, w_col_base4 + k4, w_is_bf16);
@@ -2924,6 +3262,76 @@ inline void inkling2_rms_norm_from_sq_impl(
     uint lane [[thread_index_in_simdgroup]]) {
   inkling2_rms_norm_from_sq_impl<float>(
       blended, partial_sum_sq, norm_weight_raw, out, params, tgid, tid, lane);
+}
+
+// 3-stream split-output RMSNorm from partial sum-of-squares (writes `(out0, out1, out2)`
+// directly as contiguous `[T, D]` tensors with 0-ULP parity to `inkling2_rms_norm_from_sq`,
+// eliminating all 6 slice/squeeze MLX view nodes per QKV loop controller!).
+template <typename OutT>
+inline void inkling2_rms_norm_from_sq_split3_impl(
+    device const float *blended,
+    device const float *partial_sum_sq,
+    device const uchar *norm_weight_raw,
+    device OutT *out0,
+    device OutT *out1,
+    device OutT *out2,
+    constant Inkling2RmsNormFromSqParams &params,
+    uint3 tgid,
+    uint tid,
+    uint lane) {
+  const uint row = tgid.y;
+  const uint s = tgid.z;
+  if (row >= params.rows || s >= params.num_streams) {
+    return;
+  }
+  const ulong row_flat = ulong(s) * ulong(params.rows) + ulong(row);
+  const ulong sq_base = row_flat * ulong(params.num_d_tiles);
+  float sq = 0.0f;
+  for (uint i = lane; i < params.num_d_tiles; i += 32u) {
+    sq += partial_sum_sq[sq_base + i];
+  }
+  sq = simd_sum(sq);
+  const float inv_rms = rsqrt(sq / float(params.dim) + params.eps);
+
+  const uint col = tgid.x * 128u + tid;
+  if (col < params.dim) {
+    const ulong idx = row_flat * ulong(params.dim) + col;
+    const float b = blended[idx];
+    const float w = inkling2_read_f32(
+        norm_weight_raw, ulong(s) * ulong(params.weight_stream_stride) + col, params.weight_is_f32);
+    device OutT *dst = (s == 0u) ? out0 : ((s == 1u) ? out1 : out2);
+    dst[ulong(row) * ulong(params.dim) + col] = OutT((b * inv_rms) * w);
+  }
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_rms_norm_from_sq_split3_bf16(
+    device const float *blended [[buffer(0)]],
+    device const float *partial_sum_sq [[buffer(1)]],
+    device const uchar *norm_weight_raw [[buffer(2)]],
+    device bfloat *out0 [[buffer(3)]],
+    device bfloat *out1 [[buffer(4)]],
+    device bfloat *out2 [[buffer(5)]],
+    constant Inkling2RmsNormFromSqParams &params [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  inkling2_rms_norm_from_sq_split3_impl<bfloat>(
+      blended, partial_sum_sq, norm_weight_raw, out0, out1, out2, params, tgid, tid, lane);
+}
+
+[[kernel, max_total_threads_per_threadgroup(128)]] void inkling2_rms_norm_from_sq_split3_f32(
+    device const float *blended [[buffer(0)]],
+    device const float *partial_sum_sq [[buffer(1)]],
+    device const uchar *norm_weight_raw [[buffer(2)]],
+    device float *out0 [[buffer(3)]],
+    device float *out1 [[buffer(4)]],
+    device float *out2 [[buffer(5)]],
+    constant Inkling2RmsNormFromSqParams &params [[buffer(6)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]]) {
+  inkling2_rms_norm_from_sq_split3_impl<float>(
+      blended, partial_sum_sq, norm_weight_raw, out0, out1, out2, params, tgid, tid, lane);
 }
 
 // ============================================================================

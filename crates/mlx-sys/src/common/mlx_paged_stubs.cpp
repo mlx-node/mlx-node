@@ -263,6 +263,8 @@ bool mlx_inkling2_paged_attention_forward(
     int,
     uint8_t,
     mlx_array*,
+    mlx_array*,
+    int,
     mlx_array** out_attention,
     mlx_array** out_lse) {
   if (out_attention) *out_attention = nullptr;
@@ -294,6 +296,8 @@ bool mlx_inkling2_paged_prefill_attention_forward(
     uint8_t,
     bool,
     float,
+    mlx_array*,
+    int,
     mlx_array** out_attention,
     mlx_array** out_lse,
     mlx_array** out_workspace) {

@@ -388,6 +388,23 @@ describe('standalone GGUF model detection', () => {
       await loadModel(modelPath, { draftModelPath: dsparkPath });
       expect(loadSpy).toHaveBeenLastCalledWith(modelPath, { draftModelPath: dsparkPath });
 
+      // `autoDraftModelPath` flows through to Inkling2Model.load without becoming explicit `draftModelPath`.
+      const externalDflash2 = join(root, 'external-inkling-2-mini-dflash2');
+      await loadModel(modelPath, { autoDraftModelPath: externalDflash2 });
+      expect(loadSpy).toHaveBeenLastCalledWith(
+        modelPath,
+        supportsAutomaticDFlash2('inkling2')
+          ? { autoDraftModelPath: externalDflash2 }
+          : { autoDraftModelPath: externalDflash2, autoLoadDraft: false },
+      );
+
+      // Explicit `draftModelPath` stays distinct from `autoDraftModelPath` when both are supplied.
+      await loadModel(modelPath, { draftModelPath: dsparkPath, autoDraftModelPath: externalDflash2 });
+      expect(loadSpy).toHaveBeenLastCalledWith(modelPath, {
+        draftModelPath: dsparkPath,
+        autoDraftModelPath: externalDflash2,
+      });
+
       // `autoLoadDraft: false` propagates to Rust so native discovery stays disabled.
       await loadModel(modelPath, {
         autoLoadDraft: false,

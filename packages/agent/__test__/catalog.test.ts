@@ -358,6 +358,7 @@ describe('install folders', () => {
       ['CLEF (27B)', 'Q8_0', 'clef-gguf'],
       ['CLEF (27B)', 'Q4_K_M', 'clef-gguf-q4_k_m'],
       ['Qwen3.8-27B', 'DFlash2', 'qwen3.8-27b-dflash2'],
+      ['Inkling-2-Mini', 'Inkling-2-Mini DFlash2', 'inkling-2-mini-dflash2'],
     ]);
     const names = folders.map((row) => row[2]);
     expect(new Set(names).size).toBe(names.length);
@@ -611,6 +612,7 @@ describe('download targets', () => {
       ['build', 'inkling-2-mini-gguf', 'unsloth/Inkling-2-Mini-GGUF'],
       ['build', 'inkling-2-mini-gguf-ud-q4_k_m', 'unsloth/Inkling-2-Mini-GGUF'],
       ['build', 'inkling-2-mini', 'thinkingmachines/Inkling-2-Mini'],
+      ['draft', 'inkling-2-mini-dflash2', 'incoai/Inkling-2-Mini-DFlash2'],
       ['build', 'qwen3.8-flash-next-gguf', 'unsloth/Qwen3.8-Flash-Next-GGUF'],
       ['build', 'hy4-flash-gguf', 'AngelSlim/Hy4-flash-GGUF'],
       ['build', 'clairic-flash-gguf', 'Brooooooklyn/Clairic-Flash-GGUF'],
@@ -674,11 +676,19 @@ describe('MODEL_CATALOG', () => {
     expect(MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!.minMemoryGb).toBeGreaterThanOrEqual(39);
   });
 
-  it('Qwen3.8-27B keeps its optional DFlash2 companion, and no other entry has one', () => {
+  it('Qwen3.8-27B keeps its optional DFlash2 companion and Inkling-2-Mini carries its auto-installed DFlash2 companion', () => {
     const qwen = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B');
     expect(qwen?.draft?.hfRepo).toBe('z-lab/Qwen3.8-27B-DFlash2');
+    expect(qwen?.draft?.autoInstall).toBeUndefined();
+    const inkling = MODEL_CATALOG.find((entry) => entry.label === 'Inkling-2-Mini');
+    expect(inkling?.draft).toEqual({
+      label: 'Inkling-2-Mini DFlash2',
+      hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+      sizeGb: 1.0,
+      autoInstall: true,
+    });
     for (const entry of MODEL_CATALOG) {
-      if (entry.label === 'Qwen3.8-27B') continue;
+      if (entry.label === 'Qwen3.8-27B' || entry.label === 'Inkling-2-Mini') continue;
       expect(entry.draft, entry.label).toBeUndefined();
     }
   });

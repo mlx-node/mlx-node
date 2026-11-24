@@ -920,15 +920,15 @@ impl HybridSchedulerBackend for Inkling2Inner {
     }
 
     fn supports_scheduled_speculation(&self) -> bool {
-        self.dspark.is_some() && self.paged.is_some()
+        self.has_speculative_draft() && self.paged.is_some()
     }
 
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
-        self.dspark.is_some() && self.paged.is_some()
+        self.has_speculative_draft() && self.paged.is_some()
     }
 
     fn scheduled_sampled_rows(&self) -> bool {
-        self.dspark.is_some()
+        self.has_speculative_draft()
     }
 
     fn scheduled_speculation_owners(&self) -> usize {
@@ -949,6 +949,9 @@ impl HybridSchedulerBackend for Inkling2Inner {
     }
 
     fn scheduled_draft_state_bytes(&self, total_tokens: u32) -> u64 {
+        if let Some(ref draft) = self.dflash2 {
+            return draft.config.lane_bytes();
+        }
         let Some(ref draft) = self.dspark else {
             return 0;
         };
@@ -974,9 +977,9 @@ impl HybridSchedulerBackend for Inkling2Inner {
         max_drafts: usize,
         params: &crate::engine::params::ChatParams,
         rng: &mut dyn rand::Rng,
-        _confidence: bool,
+        confidence: bool,
     ) -> Result<crate::engine::backend::DsparkProposal> {
-        self.propose_scheduled_dspark(seq_id, anchor, max_drafts, params, rng)
+        self.propose_scheduled_dspark(seq_id, anchor, max_drafts, params, rng, confidence)
     }
 
     fn propose_scheduled_batch(

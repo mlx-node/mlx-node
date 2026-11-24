@@ -4756,6 +4756,54 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
+    /// Reorder the trailing `tree_len` recorded token IDs along a strictly-increasing
+    /// `accepted_rows` path (`request_tokens[anchor + d] = request_tokens[anchor + accepted_rows[d]]`)
+    /// WITHOUT truncating `request_tokens` (so the subsequent `commit_cycle` rollback of
+    /// `tree_len - accepted_rows.len()` drops only the unaccepted tail).
+    pub fn compact_recorded_tree_tokens_for(
+        &mut self,
+        seq_id: SeqId,
+        tree_len: usize,
+        accepted_rows: &[usize],
+    ) -> Result<(), String> {
+        self.activate_request(seq_id)?;
+        let len = self.request_tokens.len();
+        if tree_len > len {
+            return Err(format!(
+                "compact_recorded_tree_tokens_for: tree_len={tree_len} exceeds recorded tokens={len}"
+            ));
+        }
+        if accepted_rows.len() > tree_len {
+            return Err(format!(
+                "compact_recorded_tree_tokens_for: accepted_rows.len()={} exceeds tree_len={tree_len}",
+                accepted_rows.len()
+            ));
+        }
+        for (d, &row) in accepted_rows.iter().enumerate() {
+            if row >= tree_len {
+                return Err(format!(
+                    "compact_recorded_tree_tokens_for: accepted_rows[{d}]={row} >= tree_len={tree_len}"
+                ));
+            }
+            if d > 0 && row <= accepted_rows[d - 1] {
+                return Err(format!(
+                    "compact_recorded_tree_tokens_for: accepted_rows must be strictly increasing (got {} then {row})",
+                    accepted_rows[d - 1]
+                ));
+            }
+        }
+        if accepted_rows.iter().enumerate().all(|(d, &row)| row == d) {
+            return Ok(());
+        }
+        let anchor = len - tree_len;
+        for (d, &row) in accepted_rows.iter().enumerate() {
+            if row != d {
+                self.request_tokens[anchor + d] = self.request_tokens[anchor + row];
+            }
+        }
+        Ok(())
+    }
+
     /// Roll back the most recent `n` tokens from `request_tokens` and
     /// `block_table.num_tokens`. Used by the C++ compiled-paged dispatcher
     /// when a forward step fails after `record_tokens` has already advanced
@@ -5946,6 +5994,128 @@ impl PagedKVCacheAdapter {
                 v_scale,
             },
         )
+    }
+
+    /// Compact accepted speculative tree KV slots in-place across all layers of this KV group:
+    /// copies `[anchor + accepted_rows[d]] -> [anchor + d]` in ascending `d` order (skipping
+    /// positions where `accepted_rows[d] == d`, so contiguous prefixes perform zero GPU work).
+    ///
+    /// Must be called BEFORE `commit_cycle` / `rollback_last_tokens` shrinks the sequence cursor.
+    pub fn compact_kv_path_for(
+        &mut self,
+        seq_id: SeqId,
+        anchor: u32,
+        accepted_rows: &[usize],
+    ) -> Result<(), String> {
+        for (d, &row) in accepted_rows.iter().enumerate() {
+            if d > 0 && row <= accepted_rows[d - 1] {
+                return Err(format!(
+                    "compact_kv_path_for: accepted_rows must be strictly increasing (got {} then {row})",
+                    accepted_rows[d - 1]
+                ));
+            }
+        }
+        if accepted_rows.iter().enumerate().all(|(d, &row)| row == d) {
+            return Ok(());
+        }
+        self.activate_request(seq_id)?;
+        let table = self
+            .block_table
+            .as_ref()
+            .ok_or_else(|| format!("compact_kv_path_for: missing block table for seq {seq_id}"))?;
+        let recorded = table.num_tokens();
+        let mut src_slots: Vec<i64> = Vec::new();
+        let mut dst_slots: Vec<i64> = Vec::new();
+        for (d, &row) in accepted_rows.iter().enumerate() {
+            if row == d {
+                continue;
+            }
+            let row_u32 = u32::try_from(row)
+                .map_err(|_| format!("compact_kv_path_for: row {row} exceeds u32"))?;
+            let d_u32 = u32::try_from(d)
+                .map_err(|_| format!("compact_kv_path_for: depth {d} exceeds u32"))?;
+            let src_pos = anchor
+                .checked_add(row_u32)
+                .ok_or_else(|| "compact_kv_path_for: src_pos overflow".to_string())?;
+            let dst_pos = anchor
+                .checked_add(d_u32)
+                .ok_or_else(|| "compact_kv_path_for: dst_pos overflow".to_string())?;
+            if src_pos >= recorded || dst_pos >= recorded {
+                return Err(format!(
+                    "compact_kv_path_for: positions ({src_pos} -> {dst_pos}) exceed recorded tokens {recorded}"
+                ));
+            }
+            let src_slot = table.absolute_slot_index(src_pos).ok_or_else(|| {
+                format!("compact_kv_path_for: missing physical slot for src_pos {src_pos}")
+            })?;
+            let dst_slot = table.absolute_slot_index(dst_pos).ok_or_else(|| {
+                format!("compact_kv_path_for: missing physical slot for dst_pos {dst_pos}")
+            })?;
+            src_slots.push(src_slot);
+            dst_slots.push(dst_slot);
+        }
+        if src_slots.is_empty() {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let n_copies = src_slots.len() as i64;
+            let src_arr = MxArray::from_int64(&src_slots, &[n_copies])
+                .map_err(|e| format!("compact_kv_path_for src_slots: {e}"))?;
+            let dst_arr = MxArray::from_int64(&dst_slots, &[n_copies])
+                .map_err(|e| format!("compact_kv_path_for dst_slots: {e}"))?;
+            let num_layers = self.layer_kv_pool.num_layers();
+            let num_kv_heads = self.layer_kv_pool.config().num_kv_heads;
+            let head_size = self.layer_kv_pool.config().head_size;
+            let block_size = self.block_size;
+            for layer_idx in 0..num_layers as u32 {
+                let (k_pool, v_pool, k_scale, v_scale, kv_mode) =
+                    self.native_fused_write_pool_arrays(layer_idx)?;
+                let mut out_kp: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                let mut out_vp: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                let mut out_ks: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                let mut out_vs: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                // SAFETY: all handles remain live for the duration of the FFI call.
+                let ok = unsafe {
+                    mlx_sys::mlx_inkling2_paged_kv_path_commit(
+                        k_pool.as_raw_ptr(),
+                        v_pool.as_raw_ptr(),
+                        k_scale.as_raw_ptr(),
+                        v_scale.as_raw_ptr(),
+                        src_arr.as_raw_ptr(),
+                        dst_arr.as_raw_ptr(),
+                        num_kv_heads,
+                        head_size,
+                        block_size,
+                        kv_mode,
+                        &mut out_kp,
+                        &mut out_vp,
+                        &mut out_ks,
+                        &mut out_vs,
+                    )
+                };
+                if !ok {
+                    return Err(format!(
+                        "compact_kv_path_for: mlx_inkling2_paged_kv_path_commit failed (layer={layer_idx})"
+                    ));
+                }
+                let kp = MxArray::from_handle(out_kp, "compact_kv_path.k_pool")
+                    .map_err(|e| format!("compact_kv_path_for k_pool: {e}"))?;
+                let vp = MxArray::from_handle(out_vp, "compact_kv_path.v_pool")
+                    .map_err(|e| format!("compact_kv_path_for v_pool: {e}"))?;
+                let ks = MxArray::from_handle(out_ks, "compact_kv_path.k_scale")
+                    .map_err(|e| format!("compact_kv_path_for k_scale: {e}"))?;
+                let vs = MxArray::from_handle(out_vs, "compact_kv_path.v_scale")
+                    .map_err(|e| format!("compact_kv_path_for v_scale: {e}"))?;
+                self.commit_native_fused_write(layer_idx, kp, vp, ks, vs)?;
+            }
+            Ok(())
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (src_slots, dst_slots);
+            Err("compact_kv_path_for is only supported on macOS (Metal backend)".to_string())
+        }
     }
 
     /// Non-macOS stub: the underlying Metal kernel is macOS-only. Calling

@@ -4289,6 +4289,163 @@ describe('Models page — the Install affordance', () => {
       const companion = mounted!.container.querySelector('[role="group"][aria-label="DFlash2 add-on"]')!;
       expect(companion.textContent).toContain('added · waits for the model');
     });
+
+    it('co-downloads an autoInstall draft alongside any build install and shows the Included badge', async () => {
+      const inklingDraft: NonNullable<CatalogItem['draft']> = {
+        label: 'Inkling-2-Mini DFlash2',
+        hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+        sizeGb: 1,
+        autoInstall: true,
+        slug: 'inkling-2-mini-dflash2',
+        installed: false,
+        present: false,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+      };
+      const routes = catalogRoutes({ draft: inklingDraft });
+      let seq = 0;
+      const calls = serveJobs(routes, (body) => {
+        const slug = (body as { slug: string }).slug;
+        seq += 1;
+        return {
+          ok: true,
+          status: 202,
+          body: {
+            id: `job-${seq}`,
+            slug,
+            repo: slug === inklingDraft.slug ? inklingDraft.hfRepo : REPO,
+            kind: 'install',
+          },
+        };
+      });
+      await mountModels();
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="Inkling-2-Mini DFlash2 add-on"]')!;
+      expect(companion.textContent).toContain('Included');
+      expect(companion.textContent).not.toContain('Optional');
+      expect(companion.textContent).toContain('1 GB');
+      expect(buttonNamed(companion, 'Add')).toBeTruthy();
+
+      await act(async () => buttonNamed(mounted!.container, 'Install').click());
+      await waitFor(() => openedStreams.includes('job-1') && openedStreams.includes('job-2'));
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }, { slug: inklingDraft.slug }]);
+    });
+
+    it('keeps the target download running and toasts an error when the autoInstall companion fails to start', async () => {
+      const error = vi.spyOn(toast, 'error');
+      onTestFinished(() => error.mockRestore());
+      const inklingDraft: NonNullable<CatalogItem['draft']> = {
+        label: 'Inkling-2-Mini DFlash2',
+        hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+        sizeGb: 1,
+        autoInstall: true,
+        slug: 'inkling-2-mini-dflash2',
+        installed: false,
+        present: false,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+      };
+      const calls = serveJobs(catalogRoutes({ draft: inklingDraft }), (body) => {
+        const slug = (body as { slug: string }).slug;
+        if (slug === inklingDraft.slug) {
+          return { ok: false, status: 500, code: 'E_INTERNAL', message: 'companion unavailable' };
+        }
+        return { ok: true, status: 202, body: { id: 'job-target', slug, repo: REPO, kind: 'install' } };
+      });
+      await mountModels();
+      await act(async () => buttonNamed(mounted!.container, 'Install').click());
+      await waitFor(() => openedStreams.includes('job-target'));
+      await settle();
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }, { slug: inklingDraft.slug }]);
+      expect(error).toHaveBeenCalledWith('Failed to start companion download', {
+        description: 'companion unavailable',
+      });
+      // Target download stays live with its Cancel button.
+      expect(liveButtonLabels()).toContain('Cancel');
+    });
+
+    it.each<[string, Partial<NonNullable<CatalogItem['draft']>>, DownloadJob[]]>([
+      ['already present', { present: true, installed: true }, []],
+      ['blocked by foreign dir', { blockedByForeignDir: true, blocker: BLOCKER }, []],
+      [
+        'already active',
+        {},
+        [downloadJob({ id: 'draft-running', slug: 'inkling-2-mini-dflash2', repo: 'incoai/Inkling-2-Mini-DFlash2' })],
+      ],
+      ['optional (autoInstall unset)', { autoInstall: undefined }, []],
+    ])('does not co-download the draft when it is %s', async (_reason, draftPatch, jobs) => {
+      const draft: NonNullable<CatalogItem['draft']> = {
+        label: 'Inkling-2-Mini DFlash2',
+        hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+        sizeGb: 1,
+        autoInstall: true,
+        slug: 'inkling-2-mini-dflash2',
+        installed: false,
+        present: false,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+        ...draftPatch,
+      };
+      const calls = serveJobs(catalogRoutes({ draft }, jobs), (body) => ({
+        ok: true,
+        status: 202,
+        body: { id: 'job-only', slug: (body as { slug: string }).slug, repo: REPO, kind: 'install' },
+      }));
+      await mountModels();
+      await act(async () => buttonNamed(mounted!.container, 'Install').click());
+      await waitFor(() => openedStreams.includes('job-only'));
+      await settle();
+      expect(posts(calls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
+
+    it('does not co-download the draft when updating an already-present build or when the build fails to start', async () => {
+      const draft: NonNullable<CatalogItem['draft']> = {
+        label: 'Inkling-2-Mini DFlash2',
+        hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+        sizeGb: 1,
+        autoInstall: true,
+        slug: 'inkling-2-mini-dflash2',
+        installed: false,
+        present: false,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+      };
+      const updateCalls = serveJobs(
+        catalogRoutes({ present: true, installed: true, localRevision: 'a'.repeat(40), draft }, [], {
+          items: [{ hfRepo: REPO, remoteRevision: 'b'.repeat(40) }],
+        }),
+        (body) => ({
+          ok: true,
+          status: 202,
+          body: { id: 'job-update', slug: (body as { slug: string }).slug, repo: REPO, kind: 'install' },
+        }),
+      );
+      await mountModels();
+      await act(async () => buttonNamed(mounted!.container, 'Update').click());
+      await waitFor(() => openedStreams.includes('job-update'));
+      await settle();
+      expect(posts(updateCalls, '/downloads')).toEqual([{ slug: SLUG }]);
+      // Companion still exposes its own Add button so existing installs can opt in independently.
+      const companion = mounted!.container.querySelector('[role="group"][aria-label="Inkling-2-Mini DFlash2 add-on"]')!;
+      expect(buttonNamed(companion, 'Add')).toBeTruthy();
+
+      mounted!.unmount();
+      mounted = undefined;
+
+      const failCalls = serveJobs(catalogRoutes({ draft }), () => ({
+        ok: false,
+        status: 500,
+        code: 'E_INTERNAL',
+        message: 'build failed',
+      }));
+      await mountModels();
+      await act(async () => buttonNamed(mounted!.container, 'Install').click());
+      await settle();
+      expect(posts(failCalls, '/downloads')).toEqual([{ slug: SLUG }]);
+    });
   });
 });
 

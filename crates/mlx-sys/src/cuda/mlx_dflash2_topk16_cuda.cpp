@@ -4,6 +4,7 @@
 #include "mlx_cuda_ops.h"
 #include "mlx/primitives.h"
 
+#include <cmath>
 #include <limits>
 
 namespace mlx::core {
@@ -111,7 +112,8 @@ public:
 
 class DFlash2SelectorEdgesCuda : public UnaryPrimitive {
 public:
-  explicit DFlash2SelectorEdgesCuda(Stream stream) : UnaryPrimitive(stream) {}
+  DFlash2SelectorEdgesCuda(Stream stream, float softcap)
+      : UnaryPrimitive(stream), softcap_(softcap) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error("DFlash2SelectorEdgesCuda requires CUDA");
@@ -147,17 +149,22 @@ public:
     args.append(out);
     args.append<int32_t>(vocab);
     args.append<int32_t>(unary_is_bf16);
+    args.append<float>(softcap_);
     encoder.add_kernel_node_raw(
         kernel, dim3(length, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
   }
 
   DEFINE_NAME(DFlash2SelectorEdgesCuda)
-  bool is_equivalent(const Primitive&) const override {
-    return true;
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& o = static_cast<const DFlash2SelectorEdgesCuda&>(other);
+    return softcap_ == o.softcap_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     return {{inputs[0].shape(1), 16, 16}};
   }
+
+private:
+  float softcap_;
 };
 
 } // namespace
@@ -166,7 +173,8 @@ public:
 
 extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
     mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
-    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor) {
+    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor,
+    float softcap) {
 #ifdef MLX_NODE_CUDA_ENABLED
   try {
     using namespace mlx::core;
@@ -189,9 +197,10 @@ extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
         s.shape() != p.shape() || a.shape() != Shape{1}) {
       return nullptr;
     }
+    const float cap = (std::isfinite(softcap) && softcap > 0.0f) ? softcap : 0.0f;
     auto result = array(
         Shape{c.shape(1), 16, 16}, float32,
-        std::make_shared<DFlash2SelectorEdgesCuda>(default_stream(Device::gpu)),
+        std::make_shared<DFlash2SelectorEdgesCuda>(default_stream(Device::gpu), cap),
         {c, u, h, p, s, a});
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   } catch (const std::exception& error) {
@@ -200,6 +209,7 @@ extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
   }
 #else
   (void)candidates; (void)unary; (void)hidden; (void)predecessor; (void)successor; (void)anchor;
+  (void)softcap;
   return nullptr;
 #endif
 }

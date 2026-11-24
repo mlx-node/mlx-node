@@ -147,6 +147,8 @@ export interface CatalogDraftItem {
   label: string;
   hfRepo: string;
   sizeGb: number;
+  /** When true, installing a build of this entry downloads this draft alongside it. */
+  autoInstall?: boolean;
   slug: string;
   installed: boolean;
   present: boolean;
@@ -325,13 +327,23 @@ function buildWithState(
   };
 }
 
-/** The state of `entry`'s companion draft; its lookup starts from the folder of the entry's first build. */
+/** The state of `entry`'s companion draft; its lookup checks the entry's builds and canonical shared folder. */
 function draftWithState(modelsDir: string, entry: CatalogEntry): CatalogDraftItem | undefined {
   if (entry.draft === undefined) return undefined;
   const draftSlug = catalogDraftSlug(entry.draft);
   const canonicalDraftDir = join(modelsDir, draftSlug);
-  const targetDir = join(modelsDir, catalogBuildSlug(entry.builds[0]));
-  const draftDir = findDFlash2Draft(targetDir, 'qwen3_5', modelsDir) ?? canonicalDraftDir;
+  let found: string | undefined;
+  if (entry.ggufFamily !== undefined) {
+    for (const build of entry.builds) {
+      const candidate = findDFlash2Draft(join(modelsDir, catalogBuildSlug(build)), entry.ggufFamily, modelsDir);
+      // `findDFlash2Draft` falls back to bundled DSpark files for `inkling2`; only a real DFlash2 companion counts here.
+      if (candidate !== undefined && isDFlash2Companion(candidate)) {
+        found = candidate;
+        break;
+      }
+    }
+  }
+  const draftDir = found ?? canonicalDraftDir;
   const draftPresent = isModelPresent(draftDir) && isDFlash2Companion(draftDir);
   const draftInstalled = draftPresent && draftDir === canonicalDraftDir && isModelInstalled(draftDir);
   const draftBlocker = blockerAt(

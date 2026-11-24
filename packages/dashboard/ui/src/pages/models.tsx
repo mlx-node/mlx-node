@@ -33,11 +33,12 @@ import {
   CatalogDownloadAction,
   CatalogEntryCard,
   CatalogGrid,
+  JobFollower,
   useChosenBuilds,
 } from './models/catalog';
 import { LocalModels, type UsageView } from './models/local-models';
 import { ModelDrawer } from './models/model-drawer';
-import { useModelDownloads } from './models/use-model-downloads';
+import { entryDownloads, useModelDownloads } from './models/use-model-downloads';
 import Onboarding from './onboarding';
 
 export type { ModelDownloadError } from './models/use-model-downloads';
@@ -110,18 +111,42 @@ export default function Models({ onboarding = false }: { onboarding?: boolean })
         downloadsLoading={downloads.downloadsLoading}
         downloadsError={downloads.downloadsError}
         reloadDownloads={downloads.reloadDownloads}
-        renderDownload={(build, entry, modelName) => (
-          <CatalogDownloadAction
-            {...downloads.downloadProps(build)}
-            buildName={build.id}
-            modelName={modelName}
-            cleanupName={buildFullName(entry, build)}
-            host={host.data}
-            prominent
-            installLabel="Download model"
-            settlingLabel="Checking download…"
-          />
-        )}
+        renderDownload={(build, entry, modelName) => {
+          const buildProps = downloads.downloadProps(build);
+          const draftProps = entry.draft === undefined ? undefined : entryDownloads(downloads, entry).draft;
+          return (
+            <>
+              {buildProps.job !== undefined && draftProps?.job !== undefined ? (
+                <JobFollower download={draftProps} />
+              ) : null}
+              {buildProps.job === undefined && draftProps?.job !== undefined && entry.draft !== undefined ? (
+                <CatalogDownloadAction
+                  key={entry.draft.slug}
+                  {...draftProps}
+                  buildName={entry.draft.label}
+                  modelName={entry.draft.label}
+                  cleanupName={entry.draft.label}
+                  host={host.data}
+                  prominent
+                  installLabel="Download companion"
+                  settlingLabel="Checking download…"
+                />
+              ) : (
+                <CatalogDownloadAction
+                  key={build.slug}
+                  {...buildProps}
+                  buildName={build.id}
+                  modelName={modelName}
+                  cleanupName={buildFullName(entry, build)}
+                  host={host.data}
+                  prominent
+                  installLabel="Download model"
+                  settlingLabel="Checking download…"
+                />
+              )}
+            </>
+          );
+        }}
       />
     );
   }

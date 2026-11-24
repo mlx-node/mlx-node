@@ -230,8 +230,8 @@ constexpr int kPagedPrefillMaxRows = 2048;
 /// SPLASH_PREFILL_ATTENTION_MAXIMUM_SPLITS / kVerifyMaximumSplits).
 constexpr int kPagedPrefillMaxSplits = 32;
 constexpr int kPagedVerifyMaxSplits = 128;
-/// Rows of a verify launch (Splash SPLASH_TARGET_VERIFY_ROWS).
-constexpr int kPagedVerifyRows = 8;
+/// Rows of a verify launch (Splash SPLASH_TARGET_VERIFY_ROWS, up to 16 for verify trees).
+constexpr int kPagedVerifyRows = 16;
 
 /// Whether a (query heads per KV head, head dim) pair has an instance.
 bool paged_prefill_attention_geometry(int group, int head_size);
@@ -325,7 +325,7 @@ struct Inkling2AttnExtraParams {
   uint32_t sink_is_f32;
   uint32_t write_lse;
   uint32_t rel_mode; // 0 = none, 1 = precomputed [T,H,rel_extent], 2 = on-the-fly r [T,H,16] x w [rel_extent,16]
-  uint32_t _pad;
+  uint32_t has_tree; // 0 = linear causal chain, 1 = verify tree (tree_rows [total_q, 2] u32)
 };
 static_assert(sizeof(Inkling2AttnExtraParams) == 32, "matches the Metal struct");
 
@@ -350,12 +350,15 @@ struct Inkling2PagedPrefillParams {
   uint32_t sink_row_stride;
   uint32_t sink_is_f32;
   uint32_t write_lse;
+  uint32_t has_tree;
+  uint32_t _pad_tree;
 };
-static_assert(sizeof(Inkling2PagedPrefillParams) == 72, "matches the Metal struct");
+static_assert(sizeof(Inkling2PagedPrefillParams) == 80, "matches the Metal struct");
 
 /// Dispatches Inkling2 relative-bias + LSE varlen paged attention (V1 ps=0 or
 /// V2 ps=512 + shared FP32 reducer) for INT8 32-token KTM or BF16 vLLM pools,
-/// with optional on-the-fly `r @ rel_bias_w^T` and optional fused gate+sink epilogue.
+/// with optional on-the-fly `r @ rel_bias_w^T`, optional fused gate+sink epilogue,
+/// and optional verify-tree metadata (`tree_rows [total_q, 2]` u32).
 void dispatch_inkling2_paged_attention_auto(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -388,7 +391,8 @@ void dispatch_inkling2_paged_attention_auto(
     int sliding_window,
     int rel_extent,
     KvDtype kv_dtype,
-    const mlx::core::array* score_scales = nullptr);
+    const mlx::core::array* score_scales = nullptr,
+    const mlx::core::array* tree_rows = nullptr);
 
 /// Whether the device can run the G=3, D=128 Inkling2 MPP prefill pipelines.
 bool inkling2_paged_prefill_mpp_supported(mlx::core::metal::Device& device);
@@ -396,9 +400,12 @@ bool inkling2_paged_prefill_mpp_supported(mlx::core::metal::Device& device);
 /// Every Inkling2 paged-attention kernel name in `paged_attn.metallib` (decode & prefill).
 std::vector<std::string> inkling2_paged_kernel_names();
 
+/// Clears this thread's persistent V2 scratch buffers for Inkling2 paged attention.
+void clear_inkling2_v2_scratch();
+
 /// Dispatches Inkling2 G=3, D=128 in-place MPP paged prefill (split + reduce),
 /// writing BF16 `out [rows, num_q_heads, 128]` (optionally gate+sink fused) and
-/// optional F32 `lse_out [rows, num_q_heads]`.
+/// optional F32 `lse_out [rows, num_q_heads]`. Uses single-tile `_r16` for 9..=16 rows.
 void dispatch_inkling2_paged_prefill_attention(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
@@ -420,7 +427,8 @@ void dispatch_inkling2_paged_prefill_attention(
     int head_size,
     KvDtype cache_dtype,
     bool int8_queries,
-    int64_t live_blocks);
+    int64_t live_blocks,
+    const mlx::core::array* tree_rows = nullptr);
 
 } // namespace mlx::core::fast::paged
 

@@ -30,7 +30,8 @@ use super::attn_res::{
     block_attn_res_mix_single_q_prenormed, normalize_attn_res_source, stack_normed_sources_tnd,
 };
 use super::config::{Inkling2Config, Inkling2VisionConfig};
-use super::dspark::{Inkling2DsparkContext, Inkling2DsparkModel};
+use super::dflash2::Inkling2DraftContext;
+use super::dspark::Inkling2DsparkModel;
 use super::kv_cache::Inkling2PagedConfig;
 use super::memory::Inkling2ContextLimits;
 use super::moe::Inkling2MoE;
@@ -39,6 +40,7 @@ use super::scheduled_dspark::Inkling2ScheduledDsparkStates;
 use super::scheduler::{Inkling2Cmd, Inkling2FamilyCommand, Inkling2SchedulerState};
 use super::short_conv::Inkling2ShortConvState;
 use super::vision::{Inkling2VisionEncoder, preprocess_image_bytes};
+use crate::models::qwen3_5::dflash2::{DFlash2Model, DFlash2TargetShape};
 use crate::nn::normalization::rms_norm_unscaled;
 
 static INKLING2_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -401,13 +403,18 @@ pub struct Inkling2Inner {
     pub output_res_query_t: MxArray,
     pub output_norm: MxArray,
     pub lm_head: LinearProj,
+    /// Cached unpadded `[unpadded_vocab_size, hidden_size]` BF16 view of `lm_head`
+    /// when `lm_head` is a standard BF16 projection (avoids per-cycle slicing in DFlash2).
+    pub(crate) lm_head_bf16_unpadded: Option<MxArray>,
     pub vision_encoder: Option<Inkling2VisionEncoder>,
     pub tokenizer: Option<Arc<Qwen3Tokenizer>>,
-    /// Optional external DSpark speculative drafter (`dspark-Inkling-2-Mini-Q8_0.gguf`).
+    /// Optional external DSpark speculative drafter (`dspark-Inkling-2-Mini-Q8_0.gguf` / `mtp.safetensors`).
     pub dspark: Option<Inkling2DsparkModel>,
-    /// Per-sequence whole-turn DSpark draft contexts (keyed by `SeqId`).
-    pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DsparkContext>,
-    /// Scheduled continuous-batching DSpark lane contexts + verify wave state.
+    /// Optional external DFlash2 speculative drafter (`incoai/Inkling-2-Mini-DFlash2`).
+    pub(crate) dflash2: Option<DFlash2Model>,
+    /// Per-sequence whole-turn speculative draft contexts (DSpark or DFlash2, keyed by `SeqId`).
+    pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DraftContext>,
+    /// Scheduled continuous-batching speculative lane contexts + verify wave state.
     pub(crate) scheduled_dspark: Inkling2ScheduledDsparkStates,
     /// Block-paged hybrid KV cache runtime (8 Global + 40 SWA, default INT8 32-token KTM on Metal)
     /// + Qwen 3.8-style StateDisk store.
@@ -738,10 +745,53 @@ impl Inkling2Inner {
 
     /// Approximate resident weight bytes (for `cache_limit::coordinator()`).
     pub fn weight_bytes(&self) -> u64 {
-        self.weight_arrays()
+        let base = self
+            .weight_arrays()
             .iter()
             .map(|a| a.nbytes() as u64)
-            .sum::<u64>()
+            .sum::<u64>();
+        base.saturating_add(self.dflash2.as_ref().map_or(0, |d| d.weight_bytes))
+    }
+
+    /// True when either an external DFlash2 or DSpark drafter is loaded.
+    pub(crate) fn has_speculative_draft(&self) -> bool {
+        self.dflash2.is_some() || self.dspark.is_some()
+    }
+
+    /// Target visit indices tapped by the active speculative drafter (`[5, 23, 41, 48]`),
+    /// preferring DFlash2 when attached.
+    pub(crate) fn active_draft_tap_visits(&self) -> Option<&[usize]> {
+        if let Some(ref draft) = self.dflash2 {
+            Some(&draft.config.target_layers)
+        } else {
+            self.dspark
+                .as_ref()
+                .map(|draft| draft.config.target_layer_ids.as_slice())
+        }
+    }
+
+    /// Number of proposal tokens drafted per speculative cycle by the active drafter.
+    pub(crate) fn active_draft_block_size(&self) -> Option<usize> {
+        if let Some(ref draft) = self.dflash2 {
+            Some(draft.config.block_size)
+        } else {
+            self.dspark
+                .as_ref()
+                .map(|draft| draft.config.num_draft_tokens())
+        }
+    }
+
+    /// Target shape contract validated against an Inkling-2-Mini DFlash2 checkpoint.
+    pub(crate) fn draft_target_shape(&self) -> DFlash2TargetShape {
+        DFlash2TargetShape {
+            hidden_size: self.config.hidden_size,
+            vocab_size: self.config.effective_padded_vocab_size(),
+            valid_vocab_size: self.config.effective_unpadded_vocab_size(),
+            num_layers: self.config.num_layer_visits(),
+            final_logit_softcapping: (self.config.final_logit_softcapping > 0.0)
+                .then_some(self.config.final_logit_softcapping as f32),
+            reads_layer_inputs: true,
+        }
     }
 }
 
@@ -749,9 +799,16 @@ impl Inkling2Inner {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Inkling2LoadOptions {
-    /// Optional external DSpark drafter checkpoint path.
+    /// Optional explicit external speculative drafter checkpoint path (DFlash2 directory or DSpark GGUF/SafeTensors).
+    /// Strict: fails hard on load or validation error; pass `"none"` / `"off"` / `""` to disable all drafts.
     pub draft_model_path: Option<String>,
-    /// Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`).
+    /// Optional auto-discovered external DFlash2 companion candidate path tried with soft fallback
+    /// (falls through to sibling DFlash2, bundled DSpark, or pure AR on load/validation error)
+    /// when `draft_model_path` is unset and `auto_load_draft != Some(false)`. Ignored when
+    /// `draft_model_path` is set or `auto_load_draft == Some(false)`; whereas `draft_model_path`
+    /// remains strict/explicit.
+    pub auto_draft_model_path: Option<String>,
+    /// Auto-discover a colocated/sibling DFlash2 or bundled DSpark drafter when `draft_model_path` is unset (default `true`).
     pub auto_load_draft: Option<bool>,
     /// KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]

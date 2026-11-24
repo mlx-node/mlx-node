@@ -519,4 +519,73 @@ describe('first model onboarding', () => {
     await act(async () => button('Try again').click());
     await waitFor(() => expect(page!.text()).toContain('Download model'));
   });
+
+  it('co-downloads an autoInstall companion draft in onboarding and waits for both before marking ready', async () => {
+    const inkling = visible.find((item) => item.label === 'Inkling-2-Mini')!;
+    const draft: NonNullable<CatalogItem['draft']> = {
+      label: 'Inkling-2-Mini DFlash2',
+      hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+      sizeGb: 1,
+      autoInstall: true,
+      slug: 'inkling-2-mini-dflash2',
+      installed: false,
+      present: false,
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+    };
+    const withDraft = items.map((item) => (item.label === inkling.label ? { ...item, draft } : item));
+    const buildPresent = withDraft.map((item) => (item.label === inkling.label ? withPresent(item, true) : item));
+    const bothPresent = buildPresent.map((item) =>
+      item.label === inkling.label ? { ...item, draft: { ...draft, present: true, installed: true } } : item,
+    );
+    const calls: ApiCall[] = [];
+    const listeners = new Map<string, (event: DownloadEvent) => void>();
+    dispose = stubApi(
+      {
+        ...routes(),
+        '/catalog': sequence({ items: withDraft }, { items: buildPresent }, { items: bothPresent }),
+        '/downloads': sequence(
+          { jobs: [] },
+          { id: 'inkling-build', slug: slugOf(inkling), repo: inkling.builds[0].hfRepo, kind: 'install' },
+          { id: 'inkling-draft', slug: draft.slug, repo: draft.hfRepo, kind: 'install' },
+        ),
+        '/downloads/inkling-build': { cancelled: true, id: 'inkling-build' },
+        '/downloads/inkling-draft': { cancelled: true, id: 'inkling-draft' },
+      },
+      {
+        onCall: (call) => calls.push(call),
+        subscribe: (id, fn) => {
+          listeners.set(id, fn);
+          return () => {
+            listeners.delete(id);
+          };
+        },
+      },
+    );
+    await mount();
+    await act(async () => page!.container.querySelector<HTMLInputElement>(`input[value="${inkling.label}"]`)!.click());
+    expect(page!.text()).toContain('Includes Inkling-2-Mini DFlash2 (1 GB) for faster replies.');
+
+    await act(async () => button('Download model').click());
+    await waitFor(() => expect(listeners.has('inkling-build') && listeners.has('inkling-draft')).toBe(true));
+    expect(calls.filter((call) => call.method === 'POST').map((call) => call.body)).toEqual([
+      { slug: slugOf(inkling) },
+      { slug: draft.slug },
+    ]);
+
+    // Finish the main build: onboarding switches to following the queued companion draft.
+    await act(async () =>
+      listeners.get('inkling-build')!({ type: 'done', id: 'inkling-build', outputDir: `/models/${slugOf(inkling)}` }),
+    );
+    await waitFor(() => expect(page!.text()).toContain('Getting Inkling-2-Mini DFlash2'));
+    expect(hasButton('Set up coding agents')).toBe(false);
+
+    // Finish the companion draft: onboarding transitions to ready.
+    await act(async () =>
+      listeners.get('inkling-draft')!({ type: 'done', id: 'inkling-draft', outputDir: `/models/${draft.slug}` }),
+    );
+    await waitFor(() => expect(hasButton('Set up coding agents')).toBe(true));
+    expect(page!.text()).toContain('Model ready');
+  });
 });

@@ -1,5 +1,6 @@
 #include "mlx_common.h"
 
+#include <cmath>
 #include <functional>
 #include <memory>
 #include <sstream>
@@ -179,7 +180,8 @@ namespace mlx_node_internal {
 
 mlx_array* dflash2_selector_edges_metal(
     mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
-    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor) {
+    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor,
+    float softcap) {
 #ifdef MLX_NODE_METAL_ENABLED
   using namespace mlx::core;
   if (!candidates || !unary || !hidden || !predecessor || !successor || !anchor ||
@@ -200,12 +202,14 @@ mlx_array* dflash2_selector_edges_metal(
         p.shape(0) < 16 || p.shape(1) != 256 || s.shape() != p.shape() ||
         a.shape() != Shape{1})
       return nullptr;
+    const float cap = (std::isfinite(softcap) && softcap > 0.0f) ? softcap : 0.0f;
+    array softcap_arr(&cap, Shape{1}, float32);
     static auto kernel = mlx::core::fast::metal_kernel(
         "dflash2_selector_edges", {"candidates", "unary", "hidden",
-                                    "predecessor", "successor", "anchor"}, {"scores"},
+                                    "predecessor", "successor", "anchor", "softcap"}, {"scores"},
 #include "metal/common/dflash2_selector_edges.metal.inc"
     );
-    auto output = kernel({c, u, h, p, s, a}, {{c.shape(1), 16, 16}}, {float32},
+    auto output = kernel({c, u, h, p, s, a, softcap_arr}, {{c.shape(1), 16, 16}}, {float32},
                          {c.shape(1) * 256, 1, 1}, {256, 1, 1}, {},
                          std::nullopt, false, Device::gpu);
     // All supported calls have identical generated input types and rank.
@@ -238,6 +242,7 @@ mlx_array* dflash2_selector_edges_metal(
   (void)predecessor;
   (void)successor;
   (void)anchor;
+  (void)softcap;
   return nullptr;
 #endif
 }

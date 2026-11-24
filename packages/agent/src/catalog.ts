@@ -8,7 +8,7 @@
 
 import { totalmem } from 'node:os';
 
-import { QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
+import { INKLING2_DFLASH2, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 const GIB = 2 ** 30;
 
@@ -117,8 +117,11 @@ export interface CatalogEntry {
   ggufFamily?: string;
   /** `builds[0]` is the build every surface chooses first. */
   builds: readonly [CatalogBuild, ...CatalogBuild[]];
-  /** Optional companion, downloaded separately and never offered as a chat model. */
-  draft?: { label: string; hfRepo: string; sizeGb: number };
+  /**
+   * Companion draft weights, downloaded to their own folder and never offered as a chat model.
+   * When `autoInstall` is true, installing a build of this entry downloads the draft alongside it.
+   */
+  draft?: { label: string; hfRepo: string; sizeGb: number; autoInstall?: boolean };
 }
 
 /** The files Inkling-2-Mini's GGUF builds take beside the weight: the vision tower and the root DSpark draft. */
@@ -173,22 +176,23 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
   },
   {
     label: 'Inkling-2-Mini',
-    description: 'Looped MoE with vision and DSpark drafts, 1M context',
+    description: 'Looped MoE with vision and DFlash2 draft, 1M context',
     ggufFamily: 'inkling2',
     builds: [
       {
         // The weight glob ends in `.gguf` because `*UD-Q4_K_XL*` also matches
         // `Mainline_Support/Inkling-2-Mini-UD-Q4_K_XL.gguf_file`, a second 17.6 GB
         // copy. The native loader pairs the vision tower (`mmproj-BF16.gguf`) and
-        // the root DSpark draft from the model's folder; the drafter under
-        // `dspark/` is never scanned, so it is not globbed.
+        // the root DSpark draft from the model's folder (as fallback when the
+        // shared DFlash2 draft is absent); the drafter under `dspark/` is never
+        // scanned, so it is not globbed.
         id: 'UD-Q4_K_XL',
         hfRepo: 'unsloth/Inkling-2-Mini-GGUF',
         globs: ['*UD-Q4_K_XL.gguf', ...INKLING_COMPANIONS],
         assetsRepo: 'thinkingmachines/Inkling-2-Mini',
         sizeGb: 18.7,
         source: 'Unsloth GGUF',
-        included: 'Vision and DSpark draft included',
+        included: 'Vision and DSpark fallback included',
       },
       {
         // `.gguf` ending for the same reason: `*UD-Q4_K_M*` doubles the download
@@ -200,23 +204,28 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
         sizeGb: 17.7,
         source: 'Unsloth GGUF',
         note: '1 GB smaller',
-        included: 'Vision and DSpark draft included',
+        included: 'Vision and DSpark fallback included',
         folderSuffix: 'ud-q4_k_m',
       },
       {
         // The original safetensors release: experts NVFP4 (layers 0-19) and
         // MXFP8 (layers 20-23), the rest BF16, vision in the same file and its
-        // DSpark draft in `mtp.safetensors`. The default filter takes every
-        // file the loader reads; it skips `tiktoken/tokenizer.model`, which the
-        // loader does not read (it reads `tokenizer.json`).
+        // DSpark draft in `mtp.safetensors` (fallback when DFlash2 is absent).
+        // The default filter takes every file the loader reads; it skips
+        // `tiktoken/tokenizer.model`, which the loader does not read (it reads
+        // `tokenizer.json`).
         id: 'Original',
         hfRepo: 'thinkingmachines/Inkling-2-Mini',
         sizeGb: 20.2,
         source: 'Thinking Machines',
         note: 'NVFP4 + MXFP8',
-        included: 'Vision and DSpark draft included',
+        included: 'Vision and DSpark fallback included',
       },
     ],
+    // Shared incoai DFlash2 draft pairs with every Inkling-2-Mini build (GGUF
+    // and Original) and takes precedence over bundled DSpark; downloaded
+    // alongside any build install.
+    draft: { ...INKLING2_DFLASH2, autoInstall: true },
   },
   {
     label: 'Qwen3.8-Flash-Next',

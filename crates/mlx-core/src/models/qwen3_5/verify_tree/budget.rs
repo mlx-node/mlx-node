@@ -70,6 +70,8 @@ impl BudgetLabel {
 /// Online logistic calibrator for draft tree probabilities (Splash `VerifyBudget`).
 #[derive(Clone, Debug)]
 pub(crate) struct VerifyBudget {
+    prior: BudgetAcceptance,
+    refit_cycles: u64,
     acceptance: [BudgetAcceptance; 2],
     labels: [Vec<BudgetLabel>; 2],
     next: [usize; 2],
@@ -92,7 +94,34 @@ impl VerifyBudget {
 
     pub(crate) fn new() -> Self {
         Self {
+            prior: BudgetAcceptance::PRIOR,
+            refit_cycles: Self::REFIT_CYCLES,
             acceptance: [BudgetAcceptance::PRIOR, BudgetAcceptance::PRIOR],
+            labels: [Vec::new(), Vec::new()],
+            next: [0, 0],
+            cycles: 0,
+        }
+    }
+
+    /// Construct a [`VerifyBudget`] with a model-specific logistic prior and
+    /// MAP refit cadence (preserving [`Self::new`] for Qwen3.5/Qwen3.8 defaults).
+    pub(crate) fn with_prior(
+        slope: f64,
+        intercepts: [f64; DRAFT_SLOTS],
+        refit_cycles: usize,
+    ) -> Self {
+        let mut prior_intercepts = [0.0f32; DRAFT_SLOTS];
+        for (dst, &src) in prior_intercepts.iter_mut().zip(intercepts.iter()) {
+            *dst = src as f32;
+        }
+        let prior = BudgetAcceptance {
+            slope: slope as f32,
+            intercepts: prior_intercepts,
+        };
+        Self {
+            prior,
+            refit_cycles: (refit_cycles.max(1)) as u64,
+            acceptance: [prior, prior],
             labels: [Vec::new(), Vec::new()],
             next: [0, 0],
             cycles: 0,
@@ -103,7 +132,7 @@ impl VerifyBudget {
         &self.acceptance[usize::from(samples)]
     }
 
-    /// Record a cycle's draft labels and trigger a MAP refit every `REFIT_CYCLES`.
+    /// Record a cycle's draft labels and trigger a MAP refit every `refit_cycles`.
     pub(crate) fn observe(&mut self, samples: bool, labels: &[BudgetLabel]) {
         let slot = usize::from(samples);
         let kept = &mut self.labels[slot];
@@ -120,11 +149,12 @@ impl VerifyBudget {
             }
         }
         self.cycles = self.cycles.wrapping_add(1);
-        if self.cycles.is_multiple_of(Self::REFIT_CYCLES) {
+        if self.cycles.is_multiple_of(self.refit_cycles) {
             for s in 0..2 {
                 if !self.labels[s].is_empty() {
                     let ordered = self.ordered_labels(s == 1);
-                    self.acceptance[s] = Self::fit(&ordered, &self.acceptance[s]);
+                    self.acceptance[s] =
+                        Self::fit_with_prior(&ordered, &self.acceptance[s], &self.prior);
                 }
             }
         }
@@ -234,9 +264,20 @@ impl VerifyBudget {
         x
     }
 
-    /// Maximum a posteriori logistic calibration via damped Newton iterations.
+    /// Maximum a posteriori logistic calibration via damped Newton iterations
+    /// regularized toward [`BudgetAcceptance::PRIOR`].
     pub(crate) fn fit(labels: &[BudgetLabel], start: &BudgetAcceptance) -> BudgetAcceptance {
-        let prior = Self::params_of(&BudgetAcceptance::PRIOR);
+        Self::fit_with_prior(labels, start, &BudgetAcceptance::PRIOR)
+    }
+
+    /// Maximum a posteriori logistic calibration via damped Newton iterations
+    /// regularized toward an explicit `prior_acceptance`.
+    pub(crate) fn fit_with_prior(
+        labels: &[BudgetLabel],
+        start: &BudgetAcceptance,
+        prior_acceptance: &BudgetAcceptance,
+    ) -> BudgetAcceptance {
+        let prior = Self::params_of(prior_acceptance);
         let mut theta = Self::params_of(start);
         let mut current = Self::objective(labels, &theta, &prior);
 

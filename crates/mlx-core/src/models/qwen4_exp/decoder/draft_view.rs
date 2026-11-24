@@ -79,11 +79,7 @@ impl Decoder {
 
 /// What a DFlash2 draft must match in a target of config `c`.
 pub(in super::super) fn draft_target_shape_of(c: &Config) -> DFlash2TargetShape {
-    DFlash2TargetShape {
-        hidden_size: c.hidden_size,
-        vocab_size: c.vocab_size,
-        num_layers: c.num_hidden_layers,
-    }
+    DFlash2TargetShape::new(c.hidden_size, c.vocab_size, c.num_hidden_layers)
 }
 
 /// Sequence rows `from..to` of `passes`, one `[1, to - from, hidden]` array

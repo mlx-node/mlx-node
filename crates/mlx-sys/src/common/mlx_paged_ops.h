@@ -643,7 +643,9 @@ class Inkling2PagedAttention : public Custom {
       bool has_rel_bias_w,
       bool has_gate_sink,
       bool write_lse,
-      bool has_score_scales)
+      bool has_score_scales,
+      bool has_tree = false,
+      int live_blocks_override = -1)
       : Custom(stream, std::move(fallback)),
         scale_(scale),
         block_size_(block_size),
@@ -657,7 +659,9 @@ class Inkling2PagedAttention : public Custom {
         has_rel_bias_w_(has_rel_bias_w),
         has_gate_sink_(has_gate_sink),
         write_lse_(write_lse),
-        has_score_scales_(has_score_scales) {}
+        has_score_scales_(has_score_scales),
+        has_tree_(has_tree),
+        live_blocks_override_(live_blocks_override) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -694,7 +698,9 @@ class Inkling2PagedAttention : public Custom {
         has_rel_bias_w_,
         has_gate_sink_,
         write_lse_,
-        has_score_scales_);
+        has_score_scales_,
+        has_tree_,
+        live_blocks_override_);
   }
 
  private:
@@ -711,12 +717,14 @@ class Inkling2PagedAttention : public Custom {
   bool has_gate_sink_;
   bool write_lse_;
   bool has_score_scales_;
+  bool has_tree_;
+  int live_blocks_override_;
 };
 
 /// `Inkling2PagedPrefillAttention`: in-place MPP paged prefill / verify for
 /// Inkling-2-Mini (G=3, D=128, INT8 32-token KTM `q8`/`q8q` and BF16 vLLM),
 /// with SWA tile skip, relative bias (precomputed or on-the-fly `r @ rel_bias_w^T`),
-/// optional fused gate+sink epilogue, and optional natural-log LSE.
+/// optional fused gate+sink epilogue, optional natural-log LSE, and optional verify tree.
 class Inkling2PagedPrefillAttention : public Custom {
  public:
   Inkling2PagedPrefillAttention(
@@ -737,7 +745,9 @@ class Inkling2PagedPrefillAttention : public Custom {
       bool has_rel_bias,
       bool has_rel_bias_w,
       bool has_gate_sink,
-      bool write_lse)
+      bool write_lse,
+      bool has_tree = false,
+      int live_blocks_override = -1)
       : Custom(stream, std::move(fallback)),
         committed_tokens_(committed_tokens),
         rows_(rows),
@@ -754,7 +764,9 @@ class Inkling2PagedPrefillAttention : public Custom {
         has_rel_bias_(has_rel_bias),
         has_rel_bias_w_(has_rel_bias_w),
         has_gate_sink_(has_gate_sink),
-        write_lse_(write_lse) {}
+        write_lse_(write_lse),
+        has_tree_(has_tree),
+        live_blocks_override_(live_blocks_override) {}
 
   void eval_cpu(const std::vector<array>& inputs, std::vector<array>& outputs)
       override {
@@ -794,7 +806,9 @@ class Inkling2PagedPrefillAttention : public Custom {
         has_rel_bias_,
         has_rel_bias_w_,
         has_gate_sink_,
-        write_lse_);
+        write_lse_,
+        has_tree_,
+        live_blocks_override_);
   }
 
  private:
@@ -814,6 +828,8 @@ class Inkling2PagedPrefillAttention : public Custom {
   bool has_rel_bias_w_;
   bool has_gate_sink_;
   bool write_lse_;
+  bool has_tree_;
+  int live_blocks_override_;
 };
 
 std::vector<array> inkling2_paged_attention(
@@ -839,7 +855,9 @@ std::vector<array> inkling2_paged_attention(
     const std::optional<array>& rel_bias_w = std::nullopt,
     const std::optional<array>& gate = std::nullopt,
     const std::optional<array>& sink = std::nullopt,
-    bool write_lse = true);
+    bool write_lse = true,
+    const std::optional<array>& tree_rows = std::nullopt,
+    int live_blocks_override = -1);
 
 std::vector<array> inkling2_paged_prefill_attention(
     const array& q,
@@ -866,7 +884,9 @@ std::vector<array> inkling2_paged_prefill_attention(
     const std::optional<array>& rel_bias_w = std::nullopt,
     const std::optional<array>& gate = std::nullopt,
     const std::optional<array>& sink = std::nullopt,
-    bool write_lse = true);
+    bool write_lse = true,
+    const std::optional<array>& tree_rows = std::nullopt,
+    int live_blocks_override = -1);
 
 } // namespace mlx::core::fast
 
@@ -1007,6 +1027,8 @@ extern "C" bool mlx_inkling2_paged_attention_forward(
     int head_size,
     uint8_t kv_dtype,
     mlx_array* score_scales,
+    mlx_array* tree_rows,
+    int live_blocks,
     mlx_array** out_attention,
     mlx_array** out_lse);
 
@@ -1037,6 +1059,8 @@ extern "C" bool mlx_inkling2_paged_prefill_attention_forward(
     uint8_t kv_dtype,
     bool int8_queries,
     float scale,
+    mlx_array* tree_rows,
+    int live_blocks,
     mlx_array** out_attention,
     mlx_array** out_lse,
     mlx_array** out_workspace);

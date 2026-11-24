@@ -2883,10 +2883,18 @@ inkling2_moe_grouped_combine_bf16(
   out[ulong(row) * p.hidden + col] = bfloat(sum);
 }
 
-// Fused grouped weighted combine + static post_conv (k=4, ragged multi-seq) + optional FP32
-// residual + hist_out + optional pre-conv tape write (for T <= 32 decode & speculative verify).
+inline uint inkling2_moe_path_row(uint32_t ancestors, uint step) {
+  uint32_t remaining = ancestors;
+  for (uint i = 0u; i < step; ++i) {
+    remaining &= (remaining - 1u);
+  }
+  return ctz(remaining);
+}
+
+// Fused grouped weighted combine + static post_conv (k=4, ragged multi-seq, optional verify tree)
+// + optional FP32 residual + hist_out + optional pre-conv tape write (for T <= 32 decode & verify).
 // Grid: (ceil(D / 32), num_seqs, 1), TG: (256, 1, 1) -> 8 SGs combine & convolve up to 8 tokens
-// in parallel per chunk (72 TGs at M=8, 288 TGs at M=32; full M5 Max 40-core utilization!).
+// in parallel per chunk (or all <= 16 tree rows simultaneously in tg_moe[19][32] when has_tree!).
 [[kernel, max_total_threads_per_threadgroup(256)]] void
 inkling2_moe_grouped_combine_sconv_bf16(
     device const bfloat *projected [[buffer(0)]],
@@ -2903,6 +2911,7 @@ inkling2_moe_grouped_combine_sconv_bf16(
     device bfloat *hist_out [[buffer(11)]],
     device bfloat *tape_out [[buffer(12)]],
     constant Inkling2MoePostConvParams &pc [[buffer(13)]],
+    device const uint2 *tree_rows [[buffer(14)]],
     uint2 group [[threadgroup_position_in_grid]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
@@ -2929,8 +2938,8 @@ inkling2_moe_grouped_combine_sconv_bf16(
     h_f32 = (pc.hist_f32_mask >> seq_idx) & 1u;
   }
 
-  // Rows 0..2 hold the rolling 3-row carry history; rows 3..10 hold up to 8 combined MoE rows.
-  threadgroup float tg_moe[11][32];
+  // Rows 0..2 hold the 3-row carry history; rows 3..18 hold up to 16 tree rows (or 8 per linear chunk).
+  threadgroup float tg_moe[19][32];
   if (sg < 3u && valid_col) {
     tg_moe[sg][lane] = inkling2_moe_read_f32(h_ptr, h_base + ulong(sg) * ulong(D) + col, h_f32);
   }
@@ -2945,9 +2954,66 @@ inkling2_moe_grouped_combine_sconv_bf16(
   const bool has_res = ((pc.flags >> 1u) & 1u) != 0u;
   const uint res_f32 = (pc.flags >> 2u) & 1u;
   const bool write_tape = ((pc.flags >> 3u) & 1u) != 0u;
+  const bool has_tree = ((pc.flags >> 4u) & 1u) != 0u;
   const float scale = 0.44721359549995793f;
 
   threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  const uint seq_len = seq_end - seq_start;
+  if (has_tree && seq_len <= 16u) {
+    // Verify-tree mode (M <= 16): keep ALL combined rows resident in tg_moe[3..3+M) so any node
+    // in rows 8..15 can read ancestors back to root row 0 without chunk eviction!
+    for (uint row = sg; row < seq_len; row += 8u) {
+      if (valid_col) {
+        const uint t = seq_start + row;
+        const uint base = t * pc.top_k;
+        float sum = 0.0f;
+        for (uint k = 0u; k < pc.top_k; ++k) {
+          const uint pos = inverse[base + k];
+          sum += gamma[base + k] * float(projected[ulong(pos) * ulong(D) + col]);
+        }
+        const bfloat moe_b = bfloat(sum);
+        if (write_tape) {
+          tape_out[ulong(t) * ulong(D) + col] = moe_b;
+        }
+        tg_moe[3u + row][lane] = float(moe_b);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint row = sg; row < seq_len; row += 8u) {
+      if (valid_col) {
+        const uint t = seq_start + row;
+        const uint2 trow = tree_rows[t];
+        const uint32_t anc = trow.x;
+        const int depth = int(trow.y >> 16u);
+        const int b3 = depth - 3;
+        const int b2 = depth - 2;
+        const int b1 = depth - 1;
+        const int s3 = (b3 >= 0) ? int(inkling2_moe_path_row(anc, uint(b3))) : b3;
+        const int s2 = (b2 >= 0) ? int(inkling2_moe_path_row(anc, uint(b2))) : b2;
+        const int s1 = (b1 >= 0) ? int(inkling2_moe_path_row(anc, uint(b1))) : b1;
+        const float x3 = tg_moe[uint(3 + s3)][lane];
+        const float x2 = tg_moe[uint(3 + s2)][lane];
+        const float x1 = tg_moe[uint(3 + s1)][lane];
+        const float x0 = tg_moe[3u + row][lane];
+        const float conv_acc = x0 + w3 * x3 + w2 * x2 + w1 * x1 + w0 * x0;
+        const bfloat conv_val = bfloat(conv_acc * scale);
+        if (has_res) {
+          const float rv = inkling2_moe_read_f32(
+              res_raw, ulong(t) * ulong(pc.res_stride) + col, res_f32);
+          y_out[ulong(t) * ulong(D) + col] = bfloat(rv + float(conv_val));
+        } else {
+          y_out[ulong(t) * ulong(D) + col] = conv_val;
+        }
+      }
+    }
+    if (sg < 3u && valid_col) {
+      const ulong ho_base = ulong(seq_idx) * 3ul * ulong(D);
+      hist_out[ho_base + ulong(sg) * ulong(D) + col] = bfloat(tg_moe[seq_len + sg][lane]);
+    }
+    return;
+  }
 
   uint last_chunk_len = 0u;
   for (uint chunk_start = seq_start; chunk_start < seq_end; chunk_start += 8u) {

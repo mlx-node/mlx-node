@@ -761,6 +761,30 @@ impl Inkling2KVCacheCoordinator {
         self.inner.patch_last_recorded_tokens_all(seq_id, tokens)
     }
 
+    /// Compact accepted speculative verify-tree KV slots `[anchor + accepted_rows[d]] -> [anchor + d]`
+    /// in-place across both Global (Group 0) and SWA (Group 1) pools.
+    pub fn compact_kv_path_all(
+        &mut self,
+        seq_id: u32,
+        anchor: u32,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .compact_kv_path_all(seq_id, anchor, accepted_rows)
+    }
+
+    /// Compact the trailing `tree_len` recorded token IDs along `accepted_rows` across both KV
+    /// groups without truncating (call immediately before `commit_cycle`).
+    pub fn compact_recorded_tree_tokens_all(
+        &mut self,
+        seq_id: u32,
+        tree_len: usize,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .compact_recorded_tree_tokens_all(seq_id, tree_len, accepted_rows)
+    }
+
     /// Reserve speculative lookahead rows atomically across every KV group (all or none).
     pub fn reserve_rows_all(&mut self, seq_id: u32, rows: u32) -> std::result::Result<u32, String> {
         self.inner.reserve_rows_all(seq_id, rows)

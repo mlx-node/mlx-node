@@ -939,6 +939,11 @@ export interface LoadModelOptions {
   /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
   autoLoadDraft?: boolean;
   /**
+   * Optional auto-discovered external draft checkpoint path for `inkling2`
+   * (soft fallback on load failure when `autoLoadDraft` is enabled).
+   */
+  autoDraftModelPath?: string;
+  /**
    * Directory of an external draft checkpoint (config.json +
    * model.safetensors) loaded alongside the target for speculative decoding.
    * Gemma4 accepts either a DSpark draft or a Google gemma-4 assistant draft
@@ -1024,7 +1029,7 @@ export interface LoadModelOptions {
 export type FamilyLoadOptionFlag = Extract<keyof ModelFamilyData, `accepts${string}`>;
 
 /** Keys of {@link LoadModelOptions} gated by a per-family `accepts*` capability flag. */
-export type GatedLoadOptionKey = Exclude<keyof LoadModelOptions, 'autoLoadDraft'>;
+export type GatedLoadOptionKey = Exclude<keyof LoadModelOptions, 'autoLoadDraft' | 'autoDraftModelPath'>;
 
 /**
  * Single declarative table mapping every `accepts*` capability flag on

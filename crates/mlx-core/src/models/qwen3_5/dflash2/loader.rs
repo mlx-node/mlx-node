@@ -373,19 +373,52 @@ pub(crate) fn read_dflash2_config(path: &Path) -> Result<DFlash2Config> {
     DFlash2Config::from_raw(raw)
 }
 
+/// Optional sidecar `mask_embedding.safetensors` shipping a single
+/// `mask_embedding` BF16 vector `[hidden_size]` (Splash `DraftCheckpoint`).
+fn load_optional_mask_embedding(path: &Path, hidden_size: usize) -> Result<Option<MxArray>> {
+    let mask_path = path.join("mask_embedding.safetensors");
+    if !mask_path.is_file() {
+        return Ok(None);
+    }
+    let mut mask_params = load_safetensors_lazy(&mask_path)?;
+    let raw = required(&mut mask_params, "mask_embedding", &[hidden_size as i64])?;
+    if !mask_params.is_empty() {
+        let mut unexpected = mask_params.keys().cloned().collect::<Vec<_>>();
+        unexpected.sort();
+        return Err(Error::from_reason(format!(
+            "DFlash2 mask_embedding.safetensors contains unexpected tensors: {unexpected:?}"
+        )));
+    }
+    let bf16 = if raw.dtype()? == DType::BFloat16 {
+        raw
+    } else {
+        raw.astype(DType::BFloat16)?
+    };
+    Ok(Some(bf16.reshape(&[1, 1, hidden_size as i64])?))
+}
+
 /// Bytes of the DFlash2 checkpoint file in `path`, before it loads.
 pub(crate) fn dflash2_file_bytes(path: &Path) -> Result<u64> {
     let tensor_path = resolve_safetensors(path)?;
-    fs::metadata(&tensor_path)
+    let base = fs::metadata(&tensor_path)
         .map(|metadata| metadata.len())
         .map_err(|error| {
             Error::from_reason(format!("Failed to stat {}: {error}", tensor_path.display()))
-        })
+        })?;
+    let mask_path = path.join("mask_embedding.safetensors");
+    let mask_bytes = if mask_path.is_file() {
+        fs::metadata(&mask_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(base.saturating_add(mask_bytes))
 }
 
 pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     let config = read_dflash2_config(path)?;
-    let execution_policy = DraftExecutionPolicy::capture();
+    let execution_policy = DraftExecutionPolicy::default_for_config(&config);
     let tensor_path = resolve_safetensors(path)?;
     crate::engine::persistence::prewarm_checkpoint_pages(path);
     let mut params = load_safetensors_lazy(&tensor_path)?;
@@ -393,10 +426,17 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     // valid but incomplete companion must fail before any target or draft
     // state can be mutated.
     validate_tensor_inventory(&params, &config)?;
-    let weight_bytes = params.values().fold(0u64, |total, array| {
+    let mask_embedding = load_optional_mask_embedding(path, config.hidden_size)?;
+    let mut weight_bytes = params.values().fold(0u64, |total, array| {
         total.saturating_add(array.nbytes() as u64)
     });
-    let arrays = params.values().collect::<Vec<_>>();
+    if let Some(ref mask_emb) = mask_embedding {
+        weight_bytes = weight_bytes.saturating_add(mask_emb.nbytes() as u64);
+    }
+    let mut arrays = params.values().collect::<Vec<_>>();
+    if let Some(ref mask_emb) = mask_embedding {
+        arrays.push(mask_emb);
+    }
     let _resident = crate::array::memory::materialize_weights(&arrays)?;
 
     let hidden = config.hidden_size;
@@ -556,6 +596,8 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         top_k: config.selector_top_k,
         rank: config.selector_rank,
         vocab_size: config.vocab_size,
+        active_vocab_size: config.valid_vocab_size.unwrap_or(config.vocab_size),
+        final_logit_softcapping: config.final_logit_softcapping,
     };
     if !params.is_empty() {
         let mut unexpected = params.keys().cloned().collect::<Vec<_>>();
@@ -575,6 +617,7 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         norm: final_norm,
         selector,
         context_kv: None,
+        mask_embedding,
         compiled: CompiledDraft::default(),
     };
     model.merge_projections()?;

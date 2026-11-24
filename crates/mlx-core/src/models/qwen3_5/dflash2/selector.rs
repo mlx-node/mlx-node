@@ -15,6 +15,27 @@ pub(super) struct CandidateSelector {
     pub(super) top_k: usize,
     pub(super) rank: usize,
     pub(super) vocab_size: usize,
+    pub(super) active_vocab_size: usize,
+    pub(super) final_logit_softcapping: Option<f32>,
+}
+
+fn apply_selector_softcap(scores: &MxArray, softcap: f32) -> Result<MxArray> {
+    if !softcap.is_finite() || softcap <= 0.0 {
+        return Ok(scores.clone());
+    }
+    let cap = f64::from(softcap);
+    // Preserve `-INFINITY` and non-finite sentinels while applying Splash's
+    // post-correction softcap `cap * tanh(clamp(sum / cap, -20.0, 20.0))`.
+    let neg_inf = MxArray::from_float32(&[f32::NEG_INFINITY], &[1])?;
+    let pos_inf = MxArray::from_float32(&[f32::INFINITY], &[1])?;
+    let is_finite = scores
+        .greater(&neg_inf)?
+        .logical_and(&scores.less(&pos_inf)?)?;
+    let zero = MxArray::from_float32(&[0.0], &[1])?;
+    let safe = is_finite.where_(scores, &zero)?;
+    let scaled = safe.mul_scalar(1.0 / cap)?.clip(Some(-20.0), Some(20.0))?;
+    let capped = scaled.tanh()?.mul_scalar(cap)?;
+    is_finite.where_(&capped, scores)
 }
 
 pub(super) fn normalized_selector_probs(scores: &[f32], temperature: f64) -> Result<Vec<f64>> {
@@ -259,14 +280,23 @@ impl CandidateSelector {
         spanned: bool,
     ) -> Result<(MxArray, MxArray)> {
         let length = hidden.shape_at(1)? as usize;
-        let (candidates, unary) = match self.fused_topk16(logits) {
+        let logits_vocab = logits.shape_at(2)? as usize;
+        let active_vocab = self.active_vocab_size.min(self.vocab_size);
+        let logits_sliced;
+        let active_logits = if !spanned && logits_vocab > active_vocab {
+            logits_sliced = logits.slice_axis(2, 0, active_vocab as i64)?;
+            &logits_sliced
+        } else {
+            logits
+        };
+        let (candidates, unary) = match self.fused_topk16(active_logits) {
             Some((ids, values)) => (ids, values),
             None => {
-                let vocab = logits.shape_at(2)?;
-                let candidates = logits
+                let vocab = active_logits.shape_at(2)?;
+                let candidates = active_logits
                     .argpartition(-(self.top_k as i32), Some(-1))?
                     .slice_axis(2, vocab - self.top_k as i64, vocab)?;
-                let unary = logits.take_along_axis(&candidates, -1)?;
+                let unary = active_logits.take_along_axis(&candidates, -1)?;
                 (candidates, unary)
             }
         };
@@ -319,10 +349,11 @@ impl CandidateSelector {
             };
             return Ok((SelectorPath::Device(path), Vec::new()));
         }
+        let active_vocab = self.active_vocab_size.min(self.vocab_size);
         if !greedy
             && device_path
             && let Some(path) =
-                device_sampled_path(&candidates, &scores, self.vocab_size, temperature, rng)
+                device_sampled_path(&candidates, &scores, active_vocab, temperature, rng)
         {
             return Ok((path, Vec::new()));
         }
@@ -349,7 +380,7 @@ impl CandidateSelector {
                 rows.push(SparseDistribution::from_parts(
                     candidate_ids[support_start..support_start + self.top_k].to_vec(),
                     probs.clone(),
-                    self.vocab_size,
+                    active_vocab,
                 )?);
                 sample_selector_index(&probs, rng)
             };
@@ -368,9 +399,11 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         length: usize,
     ) -> Result<MxArray> {
+        let softcap = self.final_logit_softcapping.unwrap_or(0.0);
         let use_cuda = crate::accelerator::cuda_ops_available();
         let use_metal = !use_cuda
-            && std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").is_ok_and(|v| v == "1")
+            && (softcap > 0.0
+                || std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").is_ok_and(|v| v == "1"))
             && unsafe { sys::mlx_metal_is_available() && sys::mlx_default_device() == 1 };
         if self.top_k == 16 && self.rank == 256 && (use_cuda || use_metal) {
             let predecessor = self.predecessor_codebook.get_weight();
@@ -382,18 +415,16 @@ impl CandidateSelector {
                 unary_arg = unary.astype(DType::Float32)?;
                 &unary_arg
             };
-            let scores = unsafe {
-                sys::mlx_dflash2_selector_edges(
-                    candidates.as_raw_ptr(),
-                    unary_ref.as_raw_ptr(),
-                    projected.as_raw_ptr(),
-                    predecessor.as_raw_ptr(),
-                    successor.as_raw_ptr(),
-                    anchor_ids.as_raw_ptr(),
-                )
-            };
-            if !scores.is_null() {
-                return MxArray::from_handle(scores, "dflash2_selector_edges");
+            if let Some(scores) = crate::kernels::dflash2::selector_edges(
+                candidates,
+                unary_ref,
+                projected,
+                &predecessor,
+                &successor,
+                anchor_ids,
+                softcap,
+            ) {
+                return Ok(scores);
             }
         }
         let candidate_flat = candidates.reshape(&[(length * self.top_k) as i64])?;
@@ -423,7 +454,15 @@ impl CandidateSelector {
         let edges = predecessors
             .mul(projected)?
             .matmul(&successors.transpose(Some(&[0, 2, 1]))?)?;
-        let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
-        scores.astype(DType::Float32)
+        if softcap > 0.0 {
+            let unary_f32 = unary
+                .reshape(&[length as i64, 1, self.top_k as i64])?
+                .astype(DType::Float32)?;
+            let scores_f32 = edges.astype(DType::Float32)?.add(&unary_f32)?;
+            apply_selector_softcap(&scores_f32, softcap)
+        } else {
+            let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
+            scores.astype(DType::Float32)
+        }
     }
 }

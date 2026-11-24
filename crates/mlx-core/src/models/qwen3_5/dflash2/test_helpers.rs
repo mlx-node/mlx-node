@@ -57,6 +57,10 @@ pub(crate) fn tiny_dflash2_config() -> DFlash2Config {
         selector_rank: 8,
         selector_top_k: 4,
         rope_theta: 1e4,
+        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
     }
 }
 
@@ -97,6 +101,10 @@ pub(crate) fn tiny_dflash2_model_with_block(
         selector_rank: 8,
         selector_top_k: 4,
         rope_theta: target.rope_theta,
+        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     if config
         .target_layers
@@ -190,11 +198,14 @@ pub(crate) fn tiny_dflash2_model_with_block(
             top_k: config.selector_top_k,
             rank: config.selector_rank,
             vocab_size: config.vocab_size,
+            active_vocab_size: config.valid_vocab_size.unwrap_or(config.vocab_size),
+            final_logit_softcapping: config.final_logit_softcapping,
         },
         layers: vec![layer],
         config,
         weight_bytes: 0,
         context_kv: None,
+        mask_embedding: None,
         compiled: CompiledDraft::default(),
     })
 }

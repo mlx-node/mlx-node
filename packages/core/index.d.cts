@@ -5104,6 +5104,8 @@ export interface Inkling2ContextLimits {
 export interface Inkling2LoadOptions {
   /** Optional external DSpark drafter checkpoint path. */
   draftModelPath?: string;
+  /** Optional auto-discovered external draft checkpoint path (soft fallback on load failure when `autoLoadDraft` is enabled). */
+  autoDraftModelPath?: string;
   /** Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`). */
   autoLoadDraft?: boolean;
   /** KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`. */

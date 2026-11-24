@@ -4,6 +4,15 @@
 #include "mlx_common.h"
 #include "mlx_sampling.h"
 
+#ifdef MLX_NODE_METAL_ENABLED
+namespace mlx::core::fast::paged {
+void clear_inkling2_v2_scratch();
+}
+namespace mlx::core::inkling2_ops {
+void clear_inkling2_ops_scratch();
+}
+#endif
+
 extern "C" {
 
 // Same clock as the [metal-command] stamps in mlx/backend/metal/device.cpp.
@@ -34,6 +43,10 @@ bool mlx_synchronize() {
 // Clear the memory cache to prevent memory buildup
 void mlx_clear_cache() {
   try {
+#ifdef MLX_NODE_METAL_ENABLED
+    mlx::core::fast::paged::clear_inkling2_v2_scratch();
+    mlx::core::inkling2_ops::clear_inkling2_ops_scratch();
+#endif
     mlx::core::clear_cache();
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in clear_cache: " << e.what() << std::endl;
@@ -45,6 +58,10 @@ void mlx_clear_cache() {
 // Windows requires worker streams to be destroyed before thread teardown.
 void mlx_clear_streams() {
   CudaGraphsEvalReadLock graphs_eval_lock;
+#ifdef MLX_NODE_METAL_ENABLED
+  mlx::core::fast::paged::clear_inkling2_v2_scratch();
+  mlx::core::inkling2_ops::clear_inkling2_ops_scratch();
+#endif
   mlx::core::clear_streams();
 }
 
