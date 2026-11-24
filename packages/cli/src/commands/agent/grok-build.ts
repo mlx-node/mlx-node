@@ -20,7 +20,7 @@
  * except the agent binary, which takes over the terminal.
  */
 
-import { spawn, spawnSync, type ChildProcess, type SpawnOptions } from 'node:child_process';
+import { spawn, type ChildProcess, type SpawnOptions } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   existsSync,
@@ -37,6 +37,7 @@ import { connect, createServer, type Server } from 'node:net';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { createInterface } from 'node:readline';
+import { gunzipSync } from 'node:zlib';
 
 import {
   agentBinName,
@@ -495,6 +496,134 @@ export async function downloadAgentBinary(
   );
 }
 
+const TAR_BLOCK = 512;
+
+function isZeroBlock(buf: Buffer, offset: number): boolean {
+  for (let i = 0; i < TAR_BLOCK; i++) {
+    if (buf[offset + i] !== 0) return false;
+  }
+  return true;
+}
+
+function verifyTarChecksum(header: Buffer): void {
+  const raw = header.subarray(148, 156).toString('ascii').replace(/\0.*$/, '').trim();
+  if (raw === '' || !/^[0-7]+$/.test(raw)) {
+    throw new Error('invalid tar header checksum');
+  }
+  const expected = Number.parseInt(raw, 8);
+  let unsigned = 0;
+  let signed = 0;
+  for (let i = 0; i < TAR_BLOCK; i++) {
+    const byte = i >= 148 && i < 156 ? 0x20 : header[i]!;
+    unsigned += byte;
+    signed += byte < 128 ? byte : byte - 256;
+  }
+  if (expected !== unsigned && expected !== signed) {
+    throw new Error('tar header checksum mismatch');
+  }
+}
+
+function parseTarSize(header: Buffer): number {
+  const first = header[124]!;
+  if ((first & 0x80) !== 0) {
+    if ((first & 0x40) !== 0) throw new Error('negative tar entry size');
+    let value = BigInt(first & 0x7f);
+    for (let i = 125; i < 136; i++) {
+      value = (value << 8n) | BigInt(header[i]!);
+    }
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('tar entry size overflow');
+    return Number(value);
+  }
+  const raw = header.subarray(124, 136).toString('ascii').replace(/\0.*$/, '').trim();
+  if (raw === '') return 0;
+  if (!/^[0-7]+$/.test(raw)) throw new Error('invalid octal tar entry size');
+  return Number.parseInt(raw, 8);
+}
+
+function parsePaxHeaders(payload: Buffer): Record<string, string> {
+  const headers: Record<string, string> = {};
+  let pos = 0;
+  while (pos < payload.length) {
+    const space = payload.indexOf(0x20, pos);
+    if (space === -1) throw new Error('malformed PAX header');
+    const lenStr = payload.subarray(pos, space).toString('ascii');
+    if (!/^[0-9]+$/.test(lenStr)) throw new Error('malformed PAX header length');
+    const len = Number.parseInt(lenStr, 10);
+    if (len <= space - pos + 1 || pos + len > payload.length) throw new Error('truncated PAX header');
+    const end = pos + len;
+    if (payload[end - 1] !== 0x0a) throw new Error('unterminated PAX header');
+    const entry = payload.subarray(space + 1, end - 1).toString('utf8');
+    const eq = entry.indexOf('=');
+    if (eq !== -1) headers[entry.slice(0, eq)] = entry.slice(eq + 1);
+    pos = end;
+  }
+  return headers;
+}
+
+/**
+ * Pure Node ustar/PAX single-file `.tar.gz` extractor for prebuilt agent release archives.
+ * Avoids shelling out to `tar` (unavailable or BSD/GNU-divergent on Windows) and writes no temp files.
+ */
+export function unpackAgentTarGz(archive: Buffer): Buffer {
+  const tar = gunzipSync(archive, { maxOutputLength: MAX_AGENT_ARCHIVE_BYTES + 1024 * 1024 });
+  if (tar.length === 0) throw new Error('empty tar archive');
+
+  let offset = 0;
+  const globalPax: Record<string, string> = {};
+  let nextPax: Record<string, string> = {};
+  let extracted: Buffer | null = null;
+
+  while (offset < tar.length) {
+    if (offset + TAR_BLOCK > tar.length) throw new Error('truncated tar header');
+    if (isZeroBlock(tar, offset)) break;
+    const header = tar.subarray(offset, offset + TAR_BLOCK);
+    verifyTarChecksum(header);
+    const typeflag = header[156]!;
+    const dataStart = offset + TAR_BLOCK;
+
+    if (typeflag === 0x78 || typeflag === 0x67 || typeflag === 0x4c || typeflag === 0x4b) {
+      const metaSize = parseTarSize(header);
+      if (metaSize > tar.length - dataStart) throw new Error('truncated tar metadata entry');
+      const paddedEnd = dataStart + Math.ceil(metaSize / TAR_BLOCK) * TAR_BLOCK;
+      if (paddedEnd > tar.length) throw new Error('truncated tar metadata padding');
+      const payload = tar.subarray(dataStart, dataStart + metaSize);
+      if (typeflag === 0x78) {
+        Object.assign(nextPax, parsePaxHeaders(payload));
+      } else if (typeflag === 0x67) {
+        Object.assign(globalPax, parsePaxHeaders(payload));
+      }
+      offset = paddedEnd;
+      continue;
+    }
+
+    const paxSize = nextPax.size ?? globalPax.size;
+    nextPax = {};
+    let size: number;
+    if (paxSize !== undefined) {
+      if (!/^[0-9]+$/.test(paxSize)) throw new Error('invalid PAX size');
+      size = Number(paxSize);
+      if (!Number.isSafeInteger(size)) throw new Error('PAX size overflow');
+    } else {
+      size = parseTarSize(header);
+    }
+
+    if (size > tar.length - dataStart) throw new Error('truncated tar entry');
+    const paddedEnd = dataStart + Math.ceil(size / TAR_BLOCK) * TAR_BLOCK;
+    if (paddedEnd > tar.length) throw new Error('truncated tar entry padding');
+
+    if (typeflag === 0x00 || typeflag === 0x30) {
+      if (extracted !== null) throw new Error('tar archive contains multiple regular files');
+      extracted = Buffer.from(tar.subarray(dataStart, dataStart + size));
+    }
+    offset = paddedEnd;
+  }
+
+  if (extracted === null || extracted.length === 0) {
+    throw new Error('tar archive contains no file payload');
+  }
+  return extracted;
+}
+
 /**
  * Fetch `tag`'s archive from the mirrors and unpack it. Returns the binary
  * bytes ONLY when they hash to the GitHub-published checksum — R2 first,
@@ -563,14 +692,11 @@ async function fetchAgentRelease(dest: string, tag: string): Promise<Buffer> {
   if (!tar) {
     throw new Error(`verified download failed (${asset} unavailable or checksum-mismatched on R2 and GitHub)`);
   }
-  const tmp = join(dirname(dest), `${asset}.tmp-${process.pid}`);
-  writeFileSync(tmp, tar, { mode: 0o600 });
-  const out = spawnSync('tar', ['-xzf', tmp, '-O'], { encoding: 'buffer', maxBuffer: 256 * 1024 * 1024 });
-  rmSync(tmp, { force: true });
-  if (out.status !== 0 || out.stdout.length === 0) {
+  try {
+    return unpackAgentTarGz(tar);
+  } catch {
     throw new Error(`downloaded ${asset} but failed to unpack it`);
   }
-  return out.stdout;
 }
 
 /**

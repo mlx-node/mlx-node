@@ -22,11 +22,21 @@ import {
   resolveMsixIdentity,
   verifyWindowsMsix,
 } from '../scripts/windows-msix.js';
-import { WINDOWS_ADDON, WINDOWS_RUNTIME_DLLS } from '../scripts/windows-payload.js';
+import {
+  WINDOWS_ADDON,
+  WINDOWS_APP_RUNTIME_DIRS,
+  WINDOWS_APP_RUNTIME_FILES,
+  WINDOWS_RUNTIME_DLLS,
+} from '../scripts/windows-payload.js';
 
 const COMMITTED_MSIX_ASSETS_DIR = join(dirname(fileURLToPath(import.meta.url)), '..', 'build', 'msix');
 
 const runtimeFiles = [WINDOWS_ADDON, ...WINDOWS_RUNTIME_DLLS, 'nvrtc-builtins64_134.dll'];
+const pdfjsSampleFiles = [
+  'node_modules/pdfjs-dist/wasm/openjpeg.wasm',
+  'node_modules/pdfjs-dist/cmaps/Adobe-GB1-UCS2.bcmap',
+  'node_modules/pdfjs-dist/standard_fonts/LiberationSans-Regular.ttf',
+] as const;
 
 // Minimal valid 1x1 PNG so MakePri.exe accepts the visual asset files in end-to-end Windows tests.
 const TINY_PNG = Buffer.from(
@@ -190,6 +200,8 @@ describe('MSIX entry verification', () => {
     'Assets/SplashScreen.png',
     'app/mlx-node.exe',
     'app/resources/app/package.json',
+    ...WINDOWS_APP_RUNTIME_FILES.map((file) => `app/resources/app/${file}`),
+    ...pdfjsSampleFiles.map((file) => `app/resources/app/${file}`),
     'app/resources/native/include/cuda_runtime.h',
     'app/resources/www/index.html',
     ...runtimeFiles.map((file) => `app/resources/native/${file}`),
@@ -215,6 +227,26 @@ describe('MSIX entry verification', () => {
       'Assets/StoreLogo.png',
       'app/resources/native/openblas.dll',
     ]);
+  });
+
+  it.each(WINDOWS_APP_RUNTIME_FILES)('reports missing required app runtime file %s', (file) => {
+    const pruned = completeEntries.filter((entry) => entry !== `app/resources/app/${file}`);
+    expect(missingWindowsMsixEntries(pruned, runtimeFiles)).toEqual([`app/resources/app/${file}`]);
+  });
+
+  it('reports missing or bare-directory-only pdfjs-dist runtime asset directories', () => {
+    for (let i = 0; i < WINDOWS_APP_RUNTIME_DIRS.length; i += 1) {
+      const dir = WINDOWS_APP_RUNTIME_DIRS[i];
+      const sample = pdfjsSampleFiles[i];
+      const withoutFiles = completeEntries.filter((entry) => entry !== `app/resources/app/${sample}`);
+      expect(missingWindowsMsixEntries(withoutFiles, runtimeFiles)).toEqual([`app/resources/app/${dir}`]);
+      expect(
+        missingWindowsMsixEntries(
+          [...withoutFiles, `app/resources/app/${dir}/`, `app/resources/app/${dir}`],
+          runtimeFiles,
+        ),
+      ).toEqual([`app/resources/app/${dir}`]);
+    }
   });
 });
 
@@ -414,6 +446,12 @@ describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK
 
     writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
     writeFixture('mlx-node-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
+    for (const file of WINDOWS_APP_RUNTIME_FILES) {
+      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+    }
+    for (const file of pdfjsSampleFiles) {
+      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+    }
     writeFixture('mlx-node-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
     writeFixture('mlx-node-win32-arm64/resources/www/index.html', '<!doctype html>');
     for (const file of runtimeFiles) {
@@ -462,6 +500,12 @@ describe.runIf(hasWindowsSdkTools())('MSIX end-to-end packaging with Windows SDK
 
     writeFixture('mlx-node-win32-arm64/mlx-node.exe', Buffer.from([0x4d, 0x5a]));
     writeFixture('mlx-node-win32-arm64/resources/app/package.json', JSON.stringify({ version: '0.0.21' }));
+    for (const file of WINDOWS_APP_RUNTIME_FILES) {
+      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+    }
+    for (const file of pdfjsSampleFiles) {
+      writeFixture(`mlx-node-win32-arm64/resources/app/${file}`, file);
+    }
     writeFixture('mlx-node-win32-arm64/resources/native/include/cuda_runtime.h', '// header');
     writeFixture('mlx-node-win32-arm64/resources/www/index.html', '<!doctype html>');
     for (const file of runtimeFiles) {

@@ -11,6 +11,7 @@ import {
   catalogDraftSlug,
   catalogFitsMemory,
   catalogSharesRepo,
+  catalogSupportedOnPlatform,
   catalogTargetForSlug,
   catalogTargets,
   catalogUpdateRepos,
@@ -415,7 +416,7 @@ describe('builds', () => {
     // Load-bearing strings: a typo here is a 404 at best and the wrong weights
     // at worst. Verified on Hugging Face.
     expect(
-      visibleCatalog(BIG_MAC).map((entry) => [
+      visibleCatalog(BIG_MAC, 'darwin').map((entry) => [
         entry.label,
         entry.builds.map((build) => [build.id, build.hfRepo, build.assetsRepo, build.sizeGb, build.source]),
       ]),
@@ -461,7 +462,7 @@ describe('builds', () => {
     // The GGUF repos ship no tokenizer files; without the official sidecars
     // the native runtime extracts the embedded tokenizer and tool calling
     // silently breaks (see the assetsRepo field comment).
-    for (const entry of visibleCatalog(BIG_MAC)) {
+    for (const entry of visibleCatalog(BIG_MAC, 'darwin')) {
       for (const build of entry.builds) {
         if (build.hfRepo.endsWith('-GGUF')) expect(build.assetsRepo, `${entry.label} ${build.id}`).toBeDefined();
       }
@@ -559,7 +560,7 @@ describe('the files each build installs', () => {
       expect(Math.round(bytes / 1e8) / 10, `${label} ${id}`).toBe(build.sizeGb);
     }
     // Every chat build and every CLEF build of the catalog is checked here.
-    for (const entry of [...visibleCatalog(BIG_MAC), ...visibleSystemOneCatalog(BIG_MAC)]) {
+    for (const entry of [...visibleCatalog(BIG_MAC, 'darwin'), ...visibleSystemOneCatalog(BIG_MAC, 'darwin')]) {
       if (entry.label.startsWith('Clairic')) continue;
       for (const build of entry.builds) expect(covered.has(build), `${entry.label} ${build.id}`).toBe(true);
     }
@@ -649,7 +650,7 @@ describe('catalogUpdateRepos — update discovery covers the sidecar sources', (
     // The assets sources are the point: a sidecar-only upstream change moves
     // nothing in the primary repo, so without these it raises no badge and the
     // repair job is unreachable.
-    for (const entry of visibleCatalog(BIG_MAC)) {
+    for (const entry of visibleCatalog(BIG_MAC, 'darwin')) {
       for (const build of entry.builds) {
         if (build.assetsRepo !== undefined) expect(updates).toContain(build.assetsRepo);
       }
@@ -657,6 +658,19 @@ describe('catalogUpdateRepos — update discovery covers the sidecar sources', (
     // Hidden entries stay out (their repos 401).
     for (const entry of MODEL_CATALOG.filter((item) => item.hidden)) {
       for (const build of entry.builds) expect(updates).not.toContain(build.hfRepo);
+    }
+  });
+
+  it('omits darwin-only Hy4-flash from targets, slug allowlist, and update repos on non-darwin platforms', () => {
+    expect(catalogTargetForSlug('hy4-flash-gguf', 'darwin')?.repo).toBe('AngelSlim/Hy4-flash-GGUF');
+    for (const platform of ['win32', 'linux'] as const) {
+      expect(catalogTargets(platform).map((t) => t.slug)).not.toContain('hy4-flash-gguf');
+      expect(catalogTargetForSlug('hy4-flash-gguf', platform)).toBeUndefined();
+      const updates = catalogUpdateRepos(platform);
+      expect(updates).not.toContain('AngelSlim/Hy4-flash-GGUF');
+      expect(updates).not.toContain('tencent/Hy4-flash');
+      expect(updates).toContain('unsloth/Qwen3.8-27B-GGUF');
+      expect(updates).toContain('unsloth/Qwen3.8-Flash-Next-GGUF');
     }
   });
 });
@@ -735,21 +749,36 @@ describe('MODEL_CATALOG', () => {
 });
 
 describe('visibleCatalog', () => {
-  it('offers Qwen3.8-Flash-Next and Hy4-flash from 96 GiB, at exactly 96 GiB too', () => {
+  it('offers Qwen3.8-Flash-Next and Hy4-flash from 96 GiB on darwin, at exactly 96 GiB too', () => {
     for (const label of FLOORED) {
       const entry = MODEL_CATALOG.find((candidate) => candidate.label === label)!;
-      expect(visibleCatalog(SMALL_MAC), label).not.toContain(entry);
-      expect(visibleCatalog(64 * GIB), label).not.toContain(entry);
-      expect(visibleCatalog(MAC_96 - 1), label).not.toContain(entry);
-      expect(visibleCatalog(MAC_96), label).toContain(entry);
-      expect(visibleCatalog(BIG_MAC), label).toContain(entry);
+      expect(visibleCatalog(SMALL_MAC, 'darwin'), label).not.toContain(entry);
+      expect(visibleCatalog(64 * GIB, 'darwin'), label).not.toContain(entry);
+      expect(visibleCatalog(MAC_96 - 1, 'darwin'), label).not.toContain(entry);
+      expect(visibleCatalog(MAC_96, 'darwin'), label).toContain(entry);
+      expect(visibleCatalog(BIG_MAC, 'darwin'), label).toContain(entry);
     }
     // Entries without a floor stay on the smallest machine.
-    const small = visibleCatalog(SMALL_MAC);
+    const small = visibleCatalog(SMALL_MAC, 'darwin');
     for (const entry of MODEL_CATALOG.filter(
       (item) => !item.hidden && (item.category ?? 'chat') === 'chat' && item.minMemoryGb === undefined,
     )) {
       expect(small, entry.label).toContain(entry);
+    }
+  });
+
+  it('gates Hy4-flash to darwin and leaves cross-platform entries visible on win32 and linux', () => {
+    const hy4 = MODEL_CATALOG.find((entry) => entry.label === 'Hy4-flash')!;
+    expect(hy4.platforms).toEqual(['darwin']);
+    expect(catalogSupportedOnPlatform(hy4, 'darwin')).toBe(true);
+    expect(catalogSupportedOnPlatform(hy4, 'win32')).toBe(false);
+    expect(catalogSupportedOnPlatform(hy4, 'linux')).toBe(false);
+    expect(catalogSupportedOnPlatform({}, 'win32')).toBe(true);
+
+    for (const platform of ['win32', 'linux'] as const) {
+      const labels = visibleCatalog(BIG_MAC, platform).map((entry) => entry.label);
+      expect(labels, platform).toEqual(['Qwen3.8-27B', 'Inkling-2-Mini', 'Qwen3.8-Flash-Next']);
+      expect(visibleSystemOneCatalog(BIG_MAC, platform).length).toBeGreaterThan(0);
     }
   });
 

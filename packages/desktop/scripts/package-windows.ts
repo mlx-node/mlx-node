@@ -12,7 +12,8 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -21,8 +22,14 @@ import { packager } from '@electron/packager';
 import { PayloadError } from './payload.js';
 import { assertSemver, ReleaseVersionError, windowsMsixFileName, windowsZipFileName } from './release-version.js';
 import { stageApp } from './stage-app.js';
+import { verifyPackagedNativeRuntime } from './verify-cli.js';
 import { buildWindowsMsix, type BuildWindowsMsixResult, verifyWindowsMsix } from './windows-msix.js';
-import { missingWindowsZipEntries, readPackagedWindowsApp, resolveWindowsPayload } from './windows-payload.js';
+import {
+  assertWindowsAppRuntimeAssets,
+  missingWindowsZipEntries,
+  readPackagedWindowsApp,
+  resolveWindowsPayload,
+} from './windows-payload.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const APP_DIR = resolve(HERE, '..');
@@ -91,6 +98,15 @@ const staged = stageApp({
   autoUpdates: false,
   platform: 'win32',
 });
+try {
+  assertWindowsAppRuntimeAssets(STAGE_APP);
+} catch (error) {
+  if (error instanceof PayloadError) {
+    console.error(`\n${error.message}\n\n  run: ${error.remedy}\n`);
+    process.exit(1);
+  }
+  throw error;
+}
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`staged ${payload.runtimeFiles.length - 1} native runtime DLLs`);
 
@@ -129,13 +145,26 @@ if (packaged.version !== appVersion) {
   throw new Error(`Packaged app version ${packaged.version} does not match --app-version ${appVersion}`);
 }
 
+const tempHome = mkdtempSync(join(tmpdir(), 'mlx-windows-runtime-check-'));
+try {
+  verifyPackagedNativeRuntime({
+    executable: join(appPath, 'mlx-node.exe'),
+    appDir: join(appPath, 'resources', 'app'),
+    home: tempHome,
+    platform: 'win32',
+  });
+  console.log('packaged Windows native runtime verified (Keyring, Canvas, pdfjs-dist, Clairic PDF)');
+} finally {
+  rmSync(tempHome, { recursive: true, force: true });
+}
+
 const zipPath = join(OUT, windowsZipFileName(appVersion));
 rmSync(zipPath, { force: true });
 const appDirectoryName = basename(appPath);
 execFileSync(TAR, ['-a', '-cf', zipPath, '-C', dirname(appPath), appDirectoryName], { stdio: 'inherit' });
 const entries = execFileSync(TAR, ['-tf', zipPath], {
   encoding: 'utf8',
-  maxBuffer: 16 * 1024 * 1024,
+  maxBuffer: 32 * 1024 * 1024,
 })
   .split(/\r?\n/)
   .filter(Boolean);

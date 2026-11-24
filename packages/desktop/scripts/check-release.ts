@@ -20,7 +20,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { PayloadError } from './payload.js';
@@ -38,7 +38,7 @@ import {
   windowsZipFileName,
 } from './release-version.js';
 import { verifyWindowsMsix } from './windows-msix.js';
-import { readPackagedWindowsApp } from './windows-payload.js';
+import { missingWindowsZipEntries, readPackagedWindowsApp } from './windows-payload.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -177,6 +177,21 @@ function verifyWindows(): string {
     windowsZip: versionFromWindowsZipPath(zip),
     windowsMsix: msix === '' ? null : versionFromWindowsMsixPath(msix),
   });
+  const tar =
+    process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+  const zipEntries = execFileSync(tar, ['-tf', zip], {
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const missingZip = missingWindowsZipEntries(zipEntries, basename(resolvePath(values.app)), app.runtimeFiles);
+  if (missingZip.length > 0) {
+    throw new PayloadError(
+      `Windows ZIP is missing required entries:\n${missingZip.join('\n')}`,
+      'repackage the Windows ZIP',
+    );
+  }
   if (msix !== '') {
     verifyWindowsMsix({
       msixPath: msix,

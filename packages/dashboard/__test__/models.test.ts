@@ -828,11 +828,18 @@ describe('readCompletion — the located record', () => {
     writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), JSON.stringify(body));
   }
 
-  it('reads the located record of a marker', () => {
+  it('reads the located record of a marker (POSIX, Windows drive, and UNC paths)', () => {
     const dir = join(modelsDir, 'located');
-    for (const mode of ['shared', 'linked']) {
-      writeMarker(dir, { ...BASE, located: { from: '/Users/me/models/qwen', mode } });
-      expect(readCompletion(dir)).toEqual({ ...BASE, located: { from: '/Users/me/models/qwen', mode } });
+    for (const from of [
+      '/Users/me/models/qwen',
+      'C:\\Users\\me\\models\\qwen',
+      'D:/models/qwen',
+      '\\\\fileserver\\models\\qwen',
+    ]) {
+      for (const mode of ['shared', 'linked']) {
+        writeMarker(dir, { ...BASE, located: { from, mode } });
+        expect(readCompletion(dir)).toEqual({ ...BASE, located: { from, mode } });
+      }
     }
   });
 
@@ -842,7 +849,11 @@ describe('readCompletion — the located record', () => {
       ['null', null],
       ['array', ['/Users/me', 'shared']],
       ['relative', { from: 'me/models', mode: 'shared' }],
+      ['drive-relative', { from: 'C:models', mode: 'shared' }],
+      ['root-relative-win', { from: '\\models', mode: 'shared' }],
+      ['unc-missing-share', { from: '\\\\server\\', mode: 'shared' }],
       ['nul', { from: '/a\0b', mode: 'shared' }],
+      ['nul-win', { from: 'C:\\a\0b', mode: 'shared' }],
       ['from-number', { from: 1, mode: 'shared' }],
       ['mode-copy', { from: '/a', mode: 'copy' }],
       ['mode-missing', { from: '/a' }],

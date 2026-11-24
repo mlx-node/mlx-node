@@ -821,6 +821,11 @@ const PREBUILT_BUILD_KEY_REVISION: u32 = 2;
 /// `crates/mlx-sys/cmake/`, and `PREBUILT_BUILD_KEY_REVISION`. Together with
 /// the submodule commit this is everything that decides the artifact's bytes,
 /// up to the toolchain.
+///
+/// `cmake/` text files are hashed with CRLF normalized to LF so Windows
+/// checkouts with `core.autocrlf=true` compute the same key as LF checkouts
+/// (moving Windows from `e0cab3ee` to `5db20dc6` without affecting macOS
+/// `3d951e0b`).
 fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::Result<String> {
     let mut canonical = format!("revision={PREBUILT_BUILD_KEY_REVISION}\n");
     for (key, value) in defines {
@@ -830,20 +835,55 @@ fn prebuilt_build_key(manifest_dir: &Path, defines: &[(String, String)]) -> io::
     // a subdirectory must move the key, or the publisher keeps the old asset.
     let mut files = Vec::new();
     walk_files(&manifest_dir.join("cmake"), &mut files)?;
-    files.sort();
-    for file in files {
-        let rel = file
-            .strip_prefix(manifest_dir)
-            .unwrap()
-            .to_string_lossy()
-            .replace('\\', "/");
-        canonical.push_str(&format!("{rel}={}\n", sha256_file(&file)?));
+    let mut rel_files: Vec<(String, PathBuf)> = files
+        .into_iter()
+        .map(|file| {
+            let rel = file
+                .strip_prefix(manifest_dir)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            (rel, file)
+        })
+        .collect();
+    rel_files.sort_by(|a, b| a.0.cmp(&b.0));
+    for (rel, file) in rel_files {
+        canonical.push_str(&format!("{rel}={}\n", sha256_text_file_lf(&file)?));
     }
-    let tmp = env::temp_dir().join(format!("mlx-prebuilt-key-{}.txt", std::process::id()));
-    std::fs::write(&tmp, canonical)?;
+    sha256_bytes(canonical.as_bytes())
+}
+
+fn sha256_bytes(bytes: &[u8]) -> io::Result<String> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = env::temp_dir().join(format!(
+        "mlx-prebuilt-sha256-{}-{seq}.tmp",
+        std::process::id()
+    ));
+    std::fs::write(&tmp, bytes)?;
     let key = sha256_file(&tmp);
     let _ = std::fs::remove_file(&tmp);
     key
+}
+
+fn sha256_text_file_lf(path: &Path) -> io::Result<String> {
+    let bytes = std::fs::read(path)?;
+    if bytes.windows(2).any(|w| w == b"\r\n") {
+        let mut normalized = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\r' && bytes.get(i + 1) == Some(&b'\n') {
+                normalized.push(b'\n');
+                i += 2;
+            } else {
+                normalized.push(bytes[i]);
+                i += 1;
+            }
+        }
+        sha256_bytes(&normalized)
+    } else {
+        sha256_file(path)
+    }
 }
 
 fn walk_files(dir: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
@@ -876,6 +916,36 @@ fn submodule_state(mlx_dir: &Path) -> Result<(String, bool), String> {
     Ok((head, !status.is_empty()))
 }
 
+fn windows_powershell_output(
+    args: &[&str],
+    env_pair: Option<(&str, &Path)>,
+) -> io::Result<std::process::Output> {
+    let run = |program: &str| {
+        let mut cmd = Command::new(program);
+        cmd.args(args);
+        if let Some((key, value)) = env_pair {
+            cmd.env(key, value);
+        }
+        cmd.output()
+    };
+    match run("pwsh") {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => run("powershell"),
+        other => other,
+    }
+}
+
+fn tar_command() -> PathBuf {
+    if cfg!(target_os = "windows")
+        && let Some(system_root) = env_non_empty("SystemRoot").or_else(|| env_non_empty("WINDIR"))
+    {
+        let system_tar = PathBuf::from(system_root).join("System32").join("tar.exe");
+        if system_tar.is_file() {
+            return system_tar;
+        }
+    }
+    PathBuf::from("tar")
+}
+
 fn sha256_file(path: &Path) -> io::Result<String> {
     // The host tools avoid a hashing build-dependency: `shasum` ships with
     // macOS, `sha256sum` with coreutils on Linux, and Get-FileHash with Windows.
@@ -885,11 +955,15 @@ fn sha256_file(path: &Path) -> io::Result<String> {
             .arg(path)
             .output()
     } else if cfg!(target_os = "windows") {
-        Command::new("pwsh")
-            .args(["-NoProfile", "-NonInteractive", "-Command"])
-            .arg("(Get-FileHash -Algorithm SHA256 -LiteralPath $env:MLX_PREBUILT_HASH_PATH).Hash")
-            .env("MLX_PREBUILT_HASH_PATH", path)
-            .output()
+        windows_powershell_output(
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-FileHash -Algorithm SHA256 -LiteralPath $env:MLX_PREBUILT_HASH_PATH).Hash",
+            ],
+            Some(("MLX_PREBUILT_HASH_PATH", path)),
+        )
     } else {
         Command::new("sha256sum").arg(path).output()
     }?;
@@ -925,6 +999,14 @@ fn prebuilt_mlx_library(triple: &str) -> &'static str {
     }
 }
 
+fn windows_prebuilt_layout_complete(dir: &Path) -> bool {
+    dir.join("lib").join("openblas.lib").is_file()
+        && dir.join("openblas.dll").is_file()
+        && ["fmt", "cccl", "cute", "cutlass"]
+            .into_iter()
+            .all(|subdir| dir.join("include").join(subdir).is_dir())
+}
+
 /// The files every consumer path reads; a cache dir missing one of them is
 /// treated as absent rather than discovered at link time.
 fn prebuilt_layout_complete(dir: &Path, triple: &str) -> bool {
@@ -932,7 +1014,7 @@ fn prebuilt_layout_complete(dir: &Path, triple: &str) -> bool {
     let linux = is_linux_triple(triple);
     let include_dir = dir.join("include");
     let target_files = if windows {
-        dir.join("lib").join("openblas.lib").is_file() && include_dir.join("fmt").is_dir()
+        windows_prebuilt_layout_complete(dir)
     } else if linux {
         include_dir.join("fmt").is_dir()
             && LINUX_CUDA_INCLUDE_DIRS
@@ -1026,7 +1108,7 @@ fn fetch_prebuilt(
     let tmp = parent.join(format!(".unpack-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&tmp);
     std::fs::create_dir_all(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
-    let status = Command::new("tar")
+    let status = Command::new(tar_command())
         .arg("-xzf")
         .arg(&archive)
         .arg("-C")
@@ -1041,7 +1123,7 @@ fn fetch_prebuilt(
     if !prebuilt_layout_complete(&tmp, triple) {
         let _ = std::fs::remove_dir_all(&tmp);
         let expected = if triple.ends_with("-pc-windows-msvc") {
-            "lib/mlx.lib, lib/openblas.lib, include/mlx, include/fmt"
+            "openblas.dll, lib/mlx.lib, lib/openblas.lib, include/mlx, include/fmt, include/{cccl,cute,cutlass}"
         } else if is_linux_triple(triple) {
             "lib/libmlx.a, include/mlx, include/fmt, include/cccl, include/cute, include/cutlass"
         } else {
@@ -1136,13 +1218,11 @@ fn resolve_mlx_source(
                 dir.display()
             );
         }
-        if triple.ends_with("-pc-windows-msvc")
-            && (!dir.join("lib").join("openblas.lib").is_file()
-                || !dir.join("include").join("fmt").is_dir())
-        {
+        if triple.ends_with("-pc-windows-msvc") && !windows_prebuilt_layout_complete(&dir) {
             panic!(
-                "mlx-sys: MLX_PREBUILT_DIR={} has no lib/openblas.lib or include/fmt; expected a \
-                 complete Windows CUDA prebuilt MLX artifact.",
+                "mlx-sys: MLX_PREBUILT_DIR={} is missing required Windows CUDA prebuilt files \
+                 (openblas.dll, lib/openblas.lib, include/fmt, include/{{cccl,cute,cutlass}}); \
+                 expected a complete Windows CUDA prebuilt MLX artifact.",
                 dir.display()
             );
         }
@@ -1386,6 +1466,17 @@ fn export_prebuilt(
             )));
         }
     }
+    if windows {
+        let openblas_dll = dst.join("openblas.dll");
+        if openblas_dll.is_file() {
+            std::fs::copy(&openblas_dll, export_dir.join("openblas.dll"))?;
+        } else {
+            return Err(io::Error::other(format!(
+                "export: {} is missing from the cmake install tree",
+                openblas_dll.display()
+            )));
+        }
+    }
     copy_dir_recursive(&dst.join("include"), &export_dir.join("include"))?;
     if windows || linux {
         // CUDA's public headers include fmt, which CMake keeps in its build
@@ -1407,13 +1498,32 @@ fn export_prebuilt(
             }
         }
     }
+    if !prebuilt_layout_complete(export_dir, triple) {
+        let expected = if windows {
+            "openblas.dll, lib/mlx.lib, lib/openblas.lib, include/mlx, include/fmt, include/{cccl,cute,cutlass}"
+        } else if linux {
+            "lib/libmlx.a, include/mlx, include/fmt, include/cccl, include/cute, include/cutlass"
+        } else {
+            "lib/libmlx.a, lib/mlx.metallib, include/mlx"
+        };
+        return Err(io::Error::other(format!(
+            "export: {} is incomplete (expected {expected})",
+            export_dir.display()
+        )));
+    }
     let built_at = if cfg!(target_os = "windows") {
-        command_stdout(Command::new("powershell").args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')",
-        ]))
+        windows_powershell_output(
+            &[
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                "(Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')",
+            ],
+            None,
+        )
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
     } else {
         command_stdout(Command::new("date").args(["-u", "+%Y-%m-%dT%H:%M:%SZ"]))
     }
@@ -1860,9 +1970,23 @@ fn main() -> io::Result<()> {
                     .join(prebuilt_mlx_library(&triple))
                     .display()
             );
+            if target_os == "windows" {
+                println!(
+                    "cargo:rerun-if-changed={}",
+                    dir.join("openblas.dll").display()
+                );
+            }
             (dir.clone(), vec![dir.join("lib")], true)
         }
     };
+    if target_os == "windows" {
+        let abs_mlx_root = std::path::absolute(&mlx_root)
+            .map_err(|error| build_file_error("resolve absolute MLX root", &mlx_root, error))?;
+        let runtime_root_path = out_dir_path.join("mlx-runtime-root.txt");
+        std::fs::write(&runtime_root_path, format!("{}\n", abs_mlx_root.display())).map_err(
+            |error| build_file_error("write Windows MLX runtime root", &runtime_root_path, error),
+        )?;
+    }
     for lib_dir in &lib_dirs {
         add_link_search(lib_dir);
     }
@@ -2073,6 +2197,12 @@ fn main() -> io::Result<()> {
             .flag("/EHsc")
             .flag("/Zc:__cplusplus")
             .flag("/wd4244");
+        if let Some(unit_hash) = cargo_build_unit_hash(&out_dir_path) {
+            bridge.define(
+                "MLX_NODE_WINDOWS_BUILD_UNIT",
+                format!("unit_{unit_hash}").as_str(),
+            );
+        }
     }
 
     // `__APPLE__` alone does not mean this build contains MLX's Metal backend:
@@ -2358,6 +2488,34 @@ fn windows_cudnn_lib_dir(cudnn: &Path, arch: &str) -> PathBuf {
     let lib = cudnn.join("lib");
     let arch_lib = lib.join(arch);
     if arch_lib.is_dir() { arch_lib } else { lib }
+}
+
+fn is_lower_hex(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Extract the Cargo build-script unit hash from `OUT_DIR`:
+/// `<build>/mlx-sys-<hex>/out` (pre-Cargo 1.100) or
+/// `<build>/mlx-sys/<hex>/out` (Cargo 1.100+).
+fn cargo_build_unit_hash(out_dir: &Path) -> Option<String> {
+    if out_dir.file_name()?.to_str()? != "out" {
+        return None;
+    }
+    let unit_dir = out_dir.parent()?;
+    let unit_name = unit_dir.file_name()?.to_str()?;
+    if let Some(hex) = unit_name.strip_prefix("mlx-sys-") {
+        return is_lower_hex(hex).then(|| hex.to_string());
+    }
+    if is_lower_hex(unit_name)
+        && unit_dir
+            .parent()
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some("mlx-sys")
+    {
+        return Some(unit_name.to_string());
+    }
+    None
 }
 
 /// MLX kernel headers as source text for the JIT-built bridge kernels.

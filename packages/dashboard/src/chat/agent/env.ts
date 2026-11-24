@@ -64,18 +64,52 @@ export interface ChatEnvInput {
   paths: ChatPaths;
   endpoint: InferenceAccess;
   username: string;
+  platform?: NodeJS.Platform;
+  systemRoot?: string;
 }
 
 export function chatAgentEnv(input: ChatEnvInput): Record<string, string> {
+  const platform = input.platform ?? process.platform;
+  const baseEnv: Record<string, string> =
+    platform === 'win32'
+      ? (() => {
+          const rawSysRoot = input.systemRoot || process.env.SystemRoot || process.env.SYSTEMROOT || 'C:\\Windows';
+          const sysRoot = rawSysRoot.replace(/[\\/]+$/, '') || 'C:\\Windows';
+          const driveMatch = /^[A-Za-z]:/.exec(sysRoot);
+          const systemDrive = driveMatch ? driveMatch[0] : 'C:';
+          return {
+            SystemRoot: sysRoot,
+            WINDIR: sysRoot,
+            SystemDrive: systemDrive,
+            ComSpec: `${sysRoot}\\System32\\cmd.exe`,
+            PATHEXT: '.COM;.EXE;.BAT;.CMD',
+            PATH: `${sysRoot}\\System32;${sysRoot}`,
+            HOME: input.paths.chatHome,
+            USERPROFILE: input.paths.chatHome,
+            APPDATA: input.paths.chatHome,
+            LOCALAPPDATA: input.paths.chatHome,
+            USER: input.username,
+            USERNAME: input.username,
+            LOGNAME: input.username,
+            LANG: 'en_US.UTF-8',
+            TERM: 'dumb',
+            TMPDIR: input.paths.tmp,
+            TEMP: input.paths.tmp,
+            TMP: input.paths.tmp,
+          };
+        })()
+      : {
+          PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
+          HOME: input.paths.chatHome,
+          USER: input.username,
+          LOGNAME: input.username,
+          SHELL: '/bin/sh',
+          LANG: 'en_US.UTF-8',
+          TERM: 'dumb',
+          TMPDIR: input.paths.tmp,
+        };
   const env: Record<string, string> = {
-    PATH: '/usr/bin:/bin:/usr/sbin:/sbin',
-    HOME: input.paths.chatHome,
-    USER: input.username,
-    LOGNAME: input.username,
-    SHELL: '/bin/sh',
-    LANG: 'en_US.UTF-8',
-    TERM: 'dumb',
-    TMPDIR: input.paths.tmp,
+    ...baseEnv,
     GROK_HOME: input.paths.chatAgent,
     ...baseUrls(input.endpoint),
     XAI_API_KEY: input.endpoint.token,
@@ -109,6 +143,7 @@ export interface WorkEnvInput {
   agentHome: string | null;
   /** The selected providers' key variables (name → key). Every other provider key variable is removed. */
   providerKeys: Readonly<Record<string, string>>;
+  platform?: NodeJS.Platform;
 }
 
 function plainObject(value: unknown): Record<string, unknown> | null {
@@ -149,16 +184,26 @@ export function workOverlay(base: string | undefined): string {
 }
 
 /** What Work inherits from the Control Panel: every variable minus the app's internals and every provider key. */
-export function workInherited(base: NodeJS.ProcessEnv): Record<string, string> {
+export function workInherited(
+  base: NodeJS.ProcessEnv,
+  platform: NodeJS.Platform = process.platform,
+): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(base)) if (value !== undefined) env[name] = value;
-  for (const name of WORK_ENV_REMOVED) delete env[name];
-  for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
+  if (platform === 'win32') {
+    const blocked = new Set([...WORK_ENV_REMOVED, ...ALL_PROVIDER_KEY_ENV].map((name) => name.toLowerCase()));
+    for (const key of Object.keys(env)) {
+      if (blocked.has(key.toLowerCase())) delete env[key];
+    }
+  } else {
+    for (const name of WORK_ENV_REMOVED) delete env[name];
+    for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
+  }
   return env;
 }
 
 export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
-  const env = workInherited(input.base);
+  const env = workInherited(input.base, input.platform);
   Object.assign(env, baseUrls(input.endpoint));
   env.XAI_API_KEY = input.endpoint.token;
   env.GROK_DISABLE_AUTOUPDATER = '1';

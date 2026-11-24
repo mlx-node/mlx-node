@@ -149,4 +149,12 @@ describe('workCommandPath', () => {
   it('a shell that cannot be started gives the app PATH', async () => {
     expect(await workCommandPath(base(), join(root, 'missing'))).toBe(`/usr/bin:/bin:${app}`);
   });
+
+  it('on win32 returns PATH/Path directly without spawning a POSIX shell', async () => {
+    expect(await workCommandPath({ Path: 'C:\\Windows\\System32;C:\\Tools' }, 'C:\\Users\\dev', 5_000, 'win32')).toBe(
+      'C:\\Windows\\System32;C:\\Tools',
+    );
+    expect(await workCommandPath({ PATH: 'D:\\Bin' }, 'C:\\Users\\dev', 5_000, 'win32')).toBe('D:\\Bin');
+    expect(await workCommandPath({}, 'C:\\Users\\dev', 5_000, 'win32')).toBeUndefined();
+  });
 });

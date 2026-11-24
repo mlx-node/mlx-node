@@ -12,6 +12,7 @@ import { delimiter, dirname, join, relative } from 'node:path';
 
 import { PayloadError } from './payload.js';
 import { msixPackageVersion } from './release-version.js';
+import { WINDOWS_APP_RUNTIME_DIRS, WINDOWS_APP_RUNTIME_FILES } from './windows-payload.js';
 
 export interface MsixIdentity {
   identityName: string;
@@ -699,18 +700,30 @@ export function readMsixManifest(msixPath: string): ParsedAppxManifest {
 
 /** Return any required archive members missing from an MSIX entry list. */
 export function missingWindowsMsixEntries(entries: readonly string[], runtimeFiles: readonly string[]): string[] {
-  const normalized = new Set(entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, '')));
+  const normalizedList = entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, ''));
+  const normalized = new Set(normalizedList);
   const required = [
     'AppxManifest.xml',
     'resources.pri',
     ...MANIFEST_BASE_ASSETS.map((asset) => `Assets/${asset}`),
     'app/mlx-node.exe',
     'app/resources/app/package.json',
+    ...WINDOWS_APP_RUNTIME_FILES.map((file) => `app/resources/app/${file}`),
     ...runtimeFiles.map((file) => `app/resources/native/${file}`),
     'app/resources/native/include/cuda_runtime.h',
     'app/resources/www/index.html',
   ];
-  return required.filter((entry) => !normalized.has(entry));
+  const missing = required.filter((entry) => !normalized.has(entry));
+  for (const dir of WINDOWS_APP_RUNTIME_DIRS) {
+    const prefix = `app/resources/app/${dir}/`;
+    const hasFile = normalizedList.some(
+      (entry) => entry.startsWith(prefix) && entry.length > prefix.length && !entry.endsWith('/'),
+    );
+    if (!hasFile) {
+      missing.push(`app/resources/app/${dir}`);
+    }
+  }
+  return missing;
 }
 
 /**

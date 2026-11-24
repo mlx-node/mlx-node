@@ -480,10 +480,10 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          foreach ($path in 'prebuilt-out/lib/mlx.lib', 'prebuilt-out/lib/openblas.lib') {
+          foreach ($path in 'prebuilt-out/openblas.dll', 'prebuilt-out/lib/mlx.lib', 'prebuilt-out/lib/openblas.lib') {
             if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "$path is missing" }
           }
-          foreach ($path in 'prebuilt-out/include/mlx', 'prebuilt-out/include/fmt', 'prebuilt-out/include/cccl', 'prebuilt-out/include/cutlass') {
+          foreach ($path in 'prebuilt-out/include/mlx', 'prebuilt-out/include/fmt', 'prebuilt-out/include/cccl', 'prebuilt-out/include/cute', 'prebuilt-out/include/cutlass') {
             if (-not (Test-Path -LiteralPath $path -PathType Container)) { throw "$path is missing" }
           }
           Get-ChildItem -LiteralPath prebuilt-out, prebuilt-out/lib
@@ -524,7 +524,7 @@ jobs:
           - cmake build key: $env:BUILD_KEY (portable defines + crates/mlx-sys/cmake/ + build.rs key revision)
           - built from mlx-node commit: $env:GITHUB_SHA
           - target: $env:TARGET (CUDA 13.4, sm_121a)
-          - contents: lib/mlx.lib, lib/openblas.lib, include/**, manifest.json
+          - contents: openblas.dll, lib/mlx.lib, lib/openblas.lib, include/**, manifest.json
 
           crates/mlx-sys/build.rs downloads the asset named in crates/mlx-sys/mlx-prebuilt.json,
           checks its sha256, and links against it instead of running the cmake build.

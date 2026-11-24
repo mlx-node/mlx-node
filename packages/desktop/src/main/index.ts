@@ -47,7 +47,7 @@ import {
 } from './agent-updates.js';
 import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
-import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
+import { buildControlPanelEnv, sidecarEnvOverrides } from './child-env.js';
 import { electronBrokerDeps } from './control-panel-child.js';
 import { createLaunchVisibility } from './launch-visibility.js';
 import { viewMenuTemplate } from './menu-policy.js';
@@ -448,14 +448,14 @@ async function bootstrap(): Promise<void> {
   broker = createControlPanelBroker<WebContents>({
     ...electronBrokerDeps({
       entry: paths.controlPanelEntry,
-      env: {
-        ...process.env,
-        // After `...process.env` on purpose: the bundle already MERGED any
-        // inherited NODE_EXTRA_CA_CERTS, so this replaces rather than duplicates.
-        ...(extraCaBundlePath === null ? {} : { NODE_EXTRA_CA_CERTS: extraCaBundlePath }),
-        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir, ledgerDir, windowsStore }),
-        MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
-      } as Record<string, string>,
+      env: buildControlPanelEnv({
+        baseEnv: process.env,
+        modelsDir: settings.modelsDir,
+        ledgerDir,
+        windowsStore,
+        extraCaBundlePath,
+        desktopCli: JSON.stringify(cliConfig),
+      }),
       onLog: (stream, line) => {
         if (stream === 'stderr') console.error(`[mlx] control panel: ${line}`);
       },

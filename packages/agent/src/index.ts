@@ -8,6 +8,7 @@ export {
   catalogBuildSlug,
   catalogDraftSlug,
   catalogSharesRepo,
+  catalogSupportedOnPlatform,
   catalogTargetForSlug,
   catalogTargets,
   catalogUpdateRepos,

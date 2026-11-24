@@ -119,7 +119,7 @@ import {
   workGuardName,
   workSessionParams,
 } from './profiles.js';
-import { tempRoots, type AllowedRoot } from './roots.js';
+import { below, isWinPath, tempRoots, type AllowedRoot } from './roots.js';
 import { MODEL_SELECT_MAX_MS, selectModel, type SelectAnswer, type SelectTarget } from './select-model.js';
 import { applyWebResult, readWebToolResult } from './web-results.js';
 
@@ -2653,6 +2653,13 @@ function callKey(sessionId: string, toolCallId: string): string {
 
 /** A Work folder's key: its real path with each part folded as the disk compares names. */
 function folderKey(cwd: string): string {
+  if (isWinPath(cwd)) {
+    return cwd
+      .replaceAll('/', '\\')
+      .split('\\')
+      .map((p) => foldName(p))
+      .join('\\');
+  }
   return cwd
     .split('/')
     .map((p) => foldName(p))
@@ -2661,7 +2668,7 @@ function folderKey(cwd: string): string {
 
 /** Two folder keys that are the same folder, or one holds the other. */
 function nestedFolders(a: string, b: string): boolean {
-  return a === b || a.startsWith(b.endsWith('/') ? b : `${b}/`) || b.startsWith(a.endsWith('/') ? a : `${a}/`);
+  return below(a, b) || below(b, a);
 }
 
 /** The id of a tool call this update reports as ended (`completed` or `failed`), else null. */

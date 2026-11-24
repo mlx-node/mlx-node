@@ -11,7 +11,7 @@ import { type ChildProcess, spawn } from 'node:child_process';
 import { stat } from 'node:fs/promises';
 import { basename } from 'node:path';
 
-import { findOnPath } from '../skills/cli-check.js';
+import { findOnPath, readPathEnv } from '../skills/cli-check.js';
 import { workInherited } from './env.js';
 
 type ShellKind = 'zsh' | 'bash';
@@ -139,8 +139,10 @@ export async function workCommandPath(
   base: NodeJS.ProcessEnv,
   home: string,
   timeoutMs = 5_000,
+  platform: NodeJS.Platform = process.platform,
 ): Promise<string | undefined> {
-  const env = workInherited(base);
+  if (platform === 'win32') return readPathEnv(base);
+  const env = workInherited(base, platform);
   const kind: ShellKind = (env.SHELL ?? '').includes('zsh') ? 'zsh' : 'bash';
   const binary = await shellBinary(kind, env);
   const login = await askShell(

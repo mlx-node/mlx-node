@@ -90,7 +90,11 @@ describe('hasUpdate', () => {
 
 describe('offeredOnHost', () => {
   const GIB = 2 ** 30;
-  const host = (gib: number) => ({ totalMemBytes: gib * GIB, diskFreeBytes: null });
+  const host = (gib: number, platform?: string) => ({
+    totalMemBytes: gib * GIB,
+    diskFreeBytes: null,
+    ...(platform === undefined ? {} : { platform }),
+  });
 
   it('offers an entry without a floor on any host, and before the host is known', () => {
     expect(offeredOnHost({}, host(8))).toBe(true);
@@ -108,14 +112,33 @@ describe('offeredOnHost', () => {
     expect(offeredOnHost({ minMemoryGb: 39 }, host(128))).toBe(true);
   });
 
-  it('offers Qwen3.8-Flash-Next and Hy4-flash from the 96 GiB a 96 GB Mac reports', () => {
+  it('offers platform-restricted entries only on matching platforms once host is known', () => {
+    expect(offeredOnHost({ platforms: ['darwin'] }, undefined)).toBe(false);
+    expect(offeredOnHost({ platforms: ['darwin'] }, host(128, 'darwin'))).toBe(true);
+    expect(offeredOnHost({ platforms: ['darwin'] }, host(128, 'win32'))).toBe(false);
+    expect(offeredOnHost({ platforms: ['darwin'] }, host(128, 'linux'))).toBe(false);
+    // Legacy host payloads without `platform` still evaluate memory floors.
+    expect(offeredOnHost({ platforms: ['darwin'] }, host(128))).toBe(true);
+  });
+
+  it('offers Qwen3.8-Flash-Next and Hy4-flash from 96 GiB on darwin, and omits Hy4-flash on win32/linux', () => {
     for (const label of ['Qwen3.8-Flash-Next', 'Hy4-flash']) {
       const entry = MODEL_CATALOG.find((item) => item.label === label)!;
-      expect(offeredOnHost(entry, host(64)), label).toBe(false);
-      expect(offeredOnHost(entry, { totalMemBytes: 96 * GIB - 1, diskFreeBytes: null }), label).toBe(false);
-      expect(offeredOnHost(entry, host(96)), label).toBe(true);
-      expect(offeredOnHost(entry, host(128)), label).toBe(true);
+      expect(offeredOnHost(entry, host(64, 'darwin')), label).toBe(false);
+      expect(
+        offeredOnHost(entry, { totalMemBytes: 96 * GIB - 1, diskFreeBytes: null, platform: 'darwin' }),
+        label,
+      ).toBe(false);
+      expect(offeredOnHost(entry, host(96, 'darwin')), label).toBe(true);
+      expect(offeredOnHost(entry, host(128, 'darwin')), label).toBe(true);
     }
+    const hy4 = MODEL_CATALOG.find((item) => item.label === 'Hy4-flash')!;
+    const flashNext = MODEL_CATALOG.find((item) => item.label === 'Qwen3.8-Flash-Next')!;
+    for (const platform of ['win32', 'linux']) {
+      expect(offeredOnHost(hy4, host(128, platform)), platform).toBe(false);
+      expect(offeredOnHost(flashNext, host(128, platform)), platform).toBe(true);
+    }
+    expect(offeredOnHost(hy4, undefined)).toBe(false);
   });
 });
 

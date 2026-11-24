@@ -138,6 +138,7 @@ export interface CatalogItem {
   minMemoryGb?: number;
   isDefault?: boolean;
   hidden?: boolean;
+  platforms?: readonly NodeJS.Platform[];
   /** In catalog order; `builds[0]` is the build every surface chooses first. */
   builds: CatalogBuildItem[];
   draft?: CatalogDraftItem;
@@ -375,6 +376,7 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     ...(entry.minMemoryGb !== undefined ? { minMemoryGb: entry.minMemoryGb } : {}),
     ...(entry.isDefault !== undefined ? { isDefault: entry.isDefault } : {}),
     ...(entry.hidden !== undefined ? { hidden: entry.hidden } : {}),
+    ...(entry.platforms !== undefined ? { platforms: entry.platforms } : {}),
     builds: entry.builds.map((build) => buildWithState(modelsDir, entry, build, downloaded)),
     draft: draftWithState(modelsDir, entry),
   }));

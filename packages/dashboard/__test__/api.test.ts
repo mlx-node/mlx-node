@@ -2040,18 +2040,23 @@ describe('dashboard api — Update start', () => {
 });
 
 describe('dashboard api — host', () => {
-  it('answers on the transport thread with the memory and the free space of the models disk', async () => {
+  it('answers on the transport thread with the memory, free space of the models disk, and platform', async () => {
     const route = ROUTES.find((r) => r.method === 'GET' && r.segments.join('/') === 'api/host');
     expect(route?.thread).toBe('main');
-    const body = await get<{ totalMemBytes: number; diskFreeBytes: number | null }>('/api/host');
+    const body = await get<{ totalMemBytes: number; diskFreeBytes: number | null; platform: string }>('/api/host');
     expect(body.totalMemBytes).toBe(totalmem());
     expect(body.diskFreeBytes).toBeGreaterThan(0);
+    expect(body.platform).toBe(process.platform);
   });
 
   it('answers null free space for a models folder that is not there', async () => {
     const ctx = { modelsDir: join(base, 'missing') } as unknown as ApiContext;
     const res = await call(ctx, 'GET', '/api/host');
-    expect(res.ok ? res.body : null).toEqual({ totalMemBytes: totalmem(), diskFreeBytes: null });
+    expect(res.ok ? res.body : null).toEqual({
+      totalMemBytes: totalmem(),
+      diskFreeBytes: null,
+      platform: process.platform,
+    });
   });
 });
 

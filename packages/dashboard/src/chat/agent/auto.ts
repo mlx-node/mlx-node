@@ -12,10 +12,10 @@ import type { PermissionRequest } from '../acp/messages.js';
 import type { AutoAsk, AutoAskCause, CommandFlag, PermissionInteraction, TempAsk } from '../types.js';
 import { landingPath } from '../work-folder.js';
 import { autoScan, foldName, hasNonAscii, protectedPart, type AutoScan, type PathCheck } from './auto-scan.js';
-import { agentPath, commandFlags, landsOutside, type WorkPlace } from './command-flags.js';
+import { agentPath, commandFlags, isWinDriveRelative, landsOutside, type WorkPlace } from './command-flags.js';
 import { requestTarget } from './permissions.js';
 import { ALLOW_ONCE_OPTION_ID } from './profiles.js';
-import { below, rootOf, rootText, tempRoots, typedPath } from './roots.js';
+import { below, isWinPath, rootOf, rootText, tempRoots, typedPath } from './roots.js';
 
 /** Calls Auto may allow in one answer; then each call asks. An allow by the user starts the count again. */
 export const AUTO_PER_TURN_MAX = 100;
@@ -208,16 +208,55 @@ export function changesFolder(facts: AutoFacts, access: PermissionInteraction['a
 
 /** The parts of `path` below the top of its root, or all of its parts when it is in no root. */
 function partsBelow(path: string, place: WorkPlace): string[] {
+  const win = isWinPath(place.cwd) || isWinPath(path);
+  const split = (s: string): string[] => (win ? s.split(/[\\/]/) : s.split('/'));
   const root = rootOf(path, place);
-  if (root !== null) return path === root.top ? [] : path.slice(root.top.length + 1).split('/');
-  const base = place.cwd.endsWith('/') ? place.cwd : `${place.cwd}/`;
-  if (path.startsWith(`/private${base}`)) return path.slice(base.length + 8).split('/');
-  return path.split('/');
+  if (root !== null) {
+    if (path === root.top) return [];
+    const skip = root.top.endsWith('/') || (win && root.top.endsWith('\\')) ? root.top.length : root.top.length + 1;
+    return split(path.slice(skip));
+  }
+  if (!win) {
+    const base = place.cwd.endsWith('/') ? place.cwd : `${place.cwd}/`;
+    if (path.startsWith(`/private${base}`)) return path.slice(base.length + 8).split('/');
+  }
+  return split(path);
+}
+
+/** Strip trailing dots and spaces Win32 trims on file creation (preserving `.` and `..`). */
+function normalizeWinPart(part: string): string {
+  const colon = part.indexOf(':');
+  const base = colon > 0 ? part.slice(0, colon) : part;
+  if (base === '.' || base === '..') return base;
+  let end = base.length;
+  while (end > 0 && (base[end - 1] === '.' || base[end - 1] === ' ')) end--;
+  return base.slice(0, end);
+}
+
+/** Whether a Windows path component uses trailing dots/spaces or an NTFS stream (`:`) that Win32 normalizes. */
+function hasAmbiguousWinPart(path: string, place: WorkPlace): boolean {
+  const parts = partsBelow(path, place);
+  for (let i = 0; i < parts.length; i++) {
+    const part = parts[i]!;
+    if (part === '' || part === '.' || part === '..') continue;
+    // Skip a leading drive root `C:` when `path` is outside all roots.
+    if (i === 0 && part.length === 2 && part[1] === ':') continue;
+    if (part.includes(':') || part.endsWith('.') || part.endsWith(' ')) return true;
+  }
+  return false;
 }
 
 /** Whether a path has a protected part (folded as the disk compares names): below its root's top, or anywhere outside. */
 export function protectedLanding(path: string, place: WorkPlace): boolean {
-  for (const part of partsBelow(path, place)) if (part !== '' && protectedPart(part)) return true;
+  const win = isWinPath(place.cwd) || isWinPath(path);
+  for (const part of partsBelow(path, place)) {
+    if (part === '') continue;
+    if (protectedPart(part)) return true;
+    if (win) {
+      const normalized = normalizeWinPart(part);
+      if (normalized !== '' && normalized !== part && protectedPart(normalized)) return true;
+    }
+  }
   return false;
 }
 
@@ -272,7 +311,7 @@ async function isFolder(path: string): Promise<boolean> {
 async function realFolders(base: string, parts: readonly string[]): Promise<boolean> {
   let at = base;
   for (const part of parts) {
-    at = `${at}/${part}`;
+    at = join(at, part);
     const info = await lstatOrNull(at);
     if (info === null || info.isSymbolicLink() || !info.isDirectory()) return false;
   }
@@ -287,7 +326,9 @@ async function plainEntry(path: string, place: WorkPlace): Promise<boolean> {
   const root = rootOf(path, place);
   if (root === null) return false;
   if (path === root.top) return root.kind === 'work';
-  const parts = path.slice(root.top.length + 1).split('/');
+  const win = isWinPath(root.top);
+  const skip = root.top.endsWith('/') || (win && root.top.endsWith('\\')) ? root.top.length : root.top.length + 1;
+  const parts = win ? path.slice(skip).split(/[\\/]/) : path.slice(skip).split('/');
   if (parts.some((p) => p === '' || p === '.' || p === '..')) return false;
   if (!(await realFolders(root.top, parts.slice(0, -1)))) return false;
   const last = await lstatOrNull(path);
@@ -295,7 +336,7 @@ async function plainEntry(path: string, place: WorkPlace): Promise<boolean> {
 }
 
 function under(path: string, root: string): boolean {
-  return path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
+  return below(path, root);
 }
 
 const NO_FACTS: AutoFacts = {
@@ -323,6 +364,13 @@ interface Moved {
 
 /** A path with each part folded as the disk compares names: a later spelling in another case or form still matches. */
 function foldPath(path: string): string {
+  if (isWinPath(path)) {
+    return path
+      .replaceAll('/', '\\')
+      .split('\\')
+      .map((p) => foldName(p))
+      .join('\\');
+  }
   return path
     .split('/')
     .map((p) => foldName(p))
@@ -1040,13 +1088,15 @@ async function gitPlain(
 
 /** Each start folder below the Work folder finds no other `.git` on its way up to it. */
 async function workDirsPlain(dirs: readonly string[], place: WorkPlace): Promise<boolean> {
-  const base = place.cwd.endsWith('/') ? place.cwd : `${place.cwd}/`;
+  const win = isWinPath(place.cwd);
+  const skip = place.cwd.endsWith('/') || (win && place.cwd.endsWith('\\')) ? place.cwd.length : place.cwd.length + 1;
   for (const dir of dirs) {
     if (dir === place.cwd) continue;
-    if (!dir.startsWith(base)) return false;
+    if (!below(dir, place.cwd)) return false;
     let at = place.cwd;
-    for (const part of dir.slice(base.length).split('/')) {
-      at = `${at}/${part}`;
+    const parts = win ? dir.slice(skip).split(/[\\/]/) : dir.slice(skip).split('/');
+    for (const part of parts) {
+      at = join(at, part);
       if ((await lstatOrNull(join(at, '.git'))) !== null) return false;
     }
   }
@@ -1334,7 +1384,11 @@ async function repository(scan: AutoScan, place: WorkPlace, facts: AutoFacts): P
 
 async function commandFacts(command: string, place: WorkPlace, cdpath: boolean): Promise<AutoFacts> {
   const flags = commandFlags(command, place);
-  const scan = autoScan(command, place, { cdpath });
+  const rawScan = autoScan(command, place, { cdpath });
+  const scan =
+    process.platform === 'win32' || isWinPath(place.cwd)
+      ? { ...rawScan, unread: true, checks: null, targets: null, git: false, redirect: false }
+      : rawScan;
   const facts: AutoFacts = { ...NO_FACTS, scan, flags, placed: true };
   const temps = tempRoots(place).map((r) => r.top);
   const reach = new Set<string>();
@@ -1364,14 +1418,22 @@ async function commandFacts(command: string, place: WorkPlace, cdpath: boolean):
 /** The facts of an edit: its landing, the gate's flags, and the unit rules when its text or landing is in a temp root. */
 async function editFacts(path: string, place: WorkPlace, landing: string | null): Promise<AutoFacts> {
   const written = agentPath(path, place);
-  const known = landing !== null && !(await special(landing)) && !(await isFolder(landing));
+  const win = isWinPath(place.cwd);
+  const driveRelative = win && isWinDriveRelative(written);
+  const ambiguousWin =
+    win && (hasAmbiguousWinPart(written, place) || (landing !== null && hasAmbiguousWinPart(landing, place)));
+  const effectiveLanding = driveRelative || ambiguousWin ? null : landing;
+  const known = effectiveLanding !== null && !(await special(effectiveLanding)) && !(await isFolder(effectiveLanding));
   const facts: AutoFacts = {
     ...NO_FACTS,
-    flags: landing === null || landsOutside(landing, place) ? ['outside-folder'] : [],
-    landing: known ? landing : null,
-    landingOutside: landing !== null && rootOf(landing, place) === null,
-    protectedPath: protectedLanding(written, place) || (landing !== null && protectedLanding(landing, place)),
-    links: landing !== null && (await linked(landing)),
+    flags: effectiveLanding === null || landsOutside(effectiveLanding, place) ? ['outside-folder'] : [],
+    landing: known ? effectiveLanding : null,
+    landingOutside: driveRelative || (effectiveLanding !== null && rootOf(effectiveLanding, place) === null),
+    protectedPath:
+      protectedLanding(written, place) ||
+      (landing !== null && protectedLanding(landing, place)) ||
+      (effectiveLanding !== null && protectedLanding(effectiveLanding, place)),
+    links: effectiveLanding !== null && (await linked(effectiveLanding)),
   };
   const temps = tempRoots(place).map((r) => r.top);
   const reach = new Set<string>();
@@ -1383,7 +1445,8 @@ async function editFacts(path: string, place: WorkPlace, landing: string | null)
   const landTemp = landing !== null && inTempReal(landing, place);
   if (landTemp) facts.touched = true;
   if (!textTemp && !landTemp) return facts;
-  if (written.split('/').includes('..')) {
+  const writtenParts = isWinPath(place.cwd) || isWinPath(written) ? written.split(/[\\/]/) : written.split('/');
+  if (writtenParts.includes('..')) {
     refuse(facts, written, 'place', place);
     return facts;
   }

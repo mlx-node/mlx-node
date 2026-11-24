@@ -8,6 +8,7 @@ import { chmod, mkdir, readdir, rename, unlink, writeFile } from 'node:fs/promis
 import { join } from 'node:path';
 
 import { mlxNodeHome } from '../paths.js';
+import { WORK_GUARD_WIN_COMMAND, WORK_GUARD_WIN_SCRIPT } from './agent/profiles.js';
 
 export function defaultChatRoot(): string {
   return join(mlxNodeHome(), 'chat');
@@ -76,11 +77,18 @@ export async function ensureChatDirs(paths: ChatPaths): Promise<void> {
   }
 }
 
-/** Writes the Work guard plugin (`plugin.json` only) before every Work agent start; a failure stops the start. */
-export async function writeWorkGuard(paths: ChatPaths, manifest: string): Promise<void> {
+/** Writes the Work guard plugin (`plugin.json`, plus `ask.cmd` on Windows) before every Work agent start; a failure stops the start. */
+export async function writeWorkGuard(
+  paths: ChatPaths,
+  manifest: string,
+  platform: NodeJS.Platform = process.platform,
+): Promise<void> {
   for (const dir of [paths.root, paths.workGuard]) {
     await mkdir(dir, { recursive: true, mode: 0o700 });
     await chmod(dir, 0o700);
+  }
+  if (platform === 'win32') {
+    await writeFileAtomic(join(paths.workGuard, WORK_GUARD_WIN_COMMAND), WORK_GUARD_WIN_SCRIPT);
   }
   await writeFileAtomic(join(paths.workGuard, 'plugin.json'), manifest);
 }

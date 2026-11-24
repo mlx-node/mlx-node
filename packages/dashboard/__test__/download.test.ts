@@ -44,6 +44,7 @@ import {
   pidAlive,
   proveInPlace,
   type ReplaceBlocker,
+  restoreWindowsSymlink,
 } from '../src/download.js';
 import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
 import { hasUpdate, modelPresent } from '../ui/src/lib/catalog.js';
@@ -6914,5 +6915,111 @@ describe('a full record with no config.json of a build that needs one, as before
     const updates = new Map<string, string | null>([[catalogBuildRepo(build), SHA_NEW]]);
     expect(hasUpdate(item, updates)).toBe(false);
     expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
+  });
+
+  it('propagates entry platforms in catalogWithState while retaining platform-restricted entries', () => {
+    const items = catalogWithState(modelsDir);
+    const hy4 = items.find((entry) => entry.label === 'Hy4-flash');
+    const qwen = items.find((entry) => entry.label === 'Qwen3.8-27B');
+    expect(hy4?.platforms).toEqual(['darwin']);
+    expect(qwen?.platforms).toBeUndefined();
+  });
+});
+
+describe('restoreWindowsSymlink', () => {
+  it('restores a file symlink with type "file"', async () => {
+    const calls: Array<{ target: string; path: string; type: 'file' | 'dir' | 'junction' }> = [];
+    const stated: string[] = [];
+    await restoreWindowsSymlink('C:\\models\\weights.gguf', 'C:\\models\\slug', {
+      stat: async (p) => {
+        stated.push(p);
+        return { isDirectory: () => false };
+      },
+      symlink: async (target, path, type) => {
+        calls.push({ target, path, type });
+      },
+    });
+    expect(stated).toEqual(['C:\\models\\weights.gguf']);
+    expect(calls).toEqual([{ target: 'C:\\models\\weights.gguf', path: 'C:\\models\\slug', type: 'file' }]);
+  });
+
+  it.each(['\\\\server\\share\\model', '\\\\?\\UNC\\server\\share\\model', '//server/share/model'])(
+    'restores UNC directory symlink %s with type "dir" only and never attempts "junction"',
+    async (uncTarget) => {
+      const okCalls: Array<'file' | 'dir' | 'junction'> = [];
+      await restoreWindowsSymlink(uncTarget, 'C:\\models\\slug', {
+        stat: async () => ({ isDirectory: () => true }),
+        symlink: async (_target, _path, type) => {
+          okCalls.push(type);
+        },
+      });
+      expect(okCalls).toEqual(['dir']);
+
+      const permCalls: Array<'file' | 'dir' | 'junction'> = [];
+      await expect(
+        restoreWindowsSymlink(uncTarget, 'C:\\models\\slug', {
+          stat: async () => ({ isDirectory: () => true }),
+          symlink: async (_target, _path, type) => {
+            permCalls.push(type);
+            throw Object.assign(new Error('operation not permitted'), { code: 'EPERM' });
+          },
+        }),
+      ).rejects.toThrow('operation not permitted');
+      expect(permCalls).toEqual(['dir']);
+    },
+  );
+
+  it('restores a local directory symlink with type "dir" when permitted', async () => {
+    const calls: Array<{ target: string; path: string; type: 'file' | 'dir' | 'junction' }> = [];
+    await restoreWindowsSymlink('..\\shared\\model', 'C:\\models\\slug', {
+      stat: async () => ({ isDirectory: () => true }),
+      symlink: async (target, path, type) => {
+        calls.push({ target, path, type });
+      },
+    });
+    expect(calls).toEqual([{ target: '..\\shared\\model', path: 'C:\\models\\slug', type: 'dir' }]);
+  });
+
+  it('falls back to "junction" for local directories only when "dir" throws EPERM or EACCES', async () => {
+    for (const code of ['EPERM', 'EACCES'] as const) {
+      const calls: Array<'file' | 'dir' | 'junction'> = [];
+      await restoreWindowsSymlink('C:\\local\\model', 'C:\\models\\slug', {
+        stat: async () => ({ isDirectory: () => true }),
+        symlink: async (_target, _path, type) => {
+          calls.push(type);
+          if (type === 'dir') throw Object.assign(new Error(`symlink ${code}`), { code });
+        },
+      });
+      expect(calls).toEqual(['dir', 'junction']);
+    }
+  });
+
+  it('rethrows EEXIST immediately without falling back to "junction"', async () => {
+    const calls: Array<'file' | 'dir' | 'junction'> = [];
+    await expect(
+      restoreWindowsSymlink('C:\\local\\model', 'C:\\models\\slug', {
+        stat: async () => ({ isDirectory: () => true }),
+        symlink: async (_target, _path, type) => {
+          calls.push(type);
+          throw Object.assign(new Error('file already exists'), { code: 'EEXIST' });
+        },
+      }),
+    ).rejects.toThrow('file already exists');
+    expect(calls).toEqual(['dir']);
+  });
+
+  it('rejects without guessing "file" when the link target is offline or unreachable', async () => {
+    const calls: Array<'file' | 'dir' | 'junction'> = [];
+    await expect(
+      restoreWindowsSymlink('\\\\nas\\models\\qwen', 'C:\\models\\slug', {
+        stat: async () => {
+          throw Object.assign(new Error('network path not found'), { code: 'ENOENT' });
+        },
+        symlink: async (_target, _path, type) => {
+          calls.push(type);
+        },
+      }),
+    ).rejects.toThrow('network path not found');
+    expect(calls).toEqual([]);
   });
 });

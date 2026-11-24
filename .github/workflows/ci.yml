@@ -914,7 +914,7 @@ jobs:
             # docs/paged-cache.md) there cannot be one: the smallest published
             # qwen3_5_moe is 35B-A3B.
             lib_tests: >-
-              models::qwen3_5_moe::model::paged_construction_tests::moe_hybrid_n2_batched_decode_matches_scalar_replay
+              models::qwen3_5::model::moe_paged_tests::moe_hybrid_n2_batched_decode_matches_scalar_replay
           - name: lfm2
             model: LiquidAI/LFM2.5-1.2B-Thinking
             slug: lfm2.5-1.2b-thinking
@@ -1248,11 +1248,13 @@ jobs:
       - rust-int
       - ts-test
       - model-test
-    # Allow skipped model tests, but stop on workflow cancellation or failed
-    # checks. Label-only opt-ins do not republish unchanged artifacts.
+    # Only publish from main in the upstream repository once every check
+    # (including model-test) passes. Never run on PRs or forks.
     if: >-
       !cancelled() &&
-      github.event.action != 'labeled' &&
+      github.repository == 'mlx-node/mlx-node' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      github.ref == 'refs/heads/main' &&
       needs.build.result == 'success' &&
       needs.build-linux-arm64.result == 'success' &&
       needs.lint-ts.result == 'success' &&
@@ -1261,8 +1263,7 @@ jobs:
       needs.rust-lib-core.result == 'success' &&
       needs.rust-int.result == 'success' &&
       needs.ts-test.result == 'success' &&
-      needs.model-test.result != 'failure' &&
-      needs.model-test.result != 'cancelled'
+      needs.model-test.result == 'success'
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1279,15 +1280,6 @@ jobs:
 
       - name: Build TypeScript
         run: yarn build:ts
-
-      # tsc -b only emits dashboard server `dist/`; the Vite SPA under `web/`
-      # is gitignored and built separately. Build it explicitly so the tarball
-      # ships `web/index.html` (dashboard's `prepack` also covers `npm pack`).
-      # `build:ui` runs `vp build`; `vite-plus` is a dashboard devDependency, so
-      # yarn generates the `vp` bin in this workspace's scope — no global `vp` /
-      # setup-vp needed on this runner (which has none).
-      - name: Build dashboard UI
-        run: yarn workspace @mlx-node/dashboard build:ui
 
       - uses: actions/download-artifact@v8
         with:
