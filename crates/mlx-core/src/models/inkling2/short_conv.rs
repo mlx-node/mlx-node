@@ -528,7 +528,7 @@ pub fn fused_short_conv_ragged_residual_taped(
     res_b: Option<&MxArray>,
     histories: &mut [&mut MxArray],
     cu_seqlens_q: &[usize],
-    cu_seqlens_arr: Option<&MxArray>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] cu_seqlens_arr: Option<&MxArray>,
     mut tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
 ) -> Result<MxArray> {
     let num_seqs = histories.len();
@@ -539,6 +539,7 @@ pub fn fused_short_conv_ragged_residual_taped(
         )));
     }
     let c = x.shape()?[1];
+    #[cfg(target_os = "macos")]
     let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
 
     #[cfg(target_os = "macos")]
@@ -639,7 +640,7 @@ pub fn fused_short_conv_kv_prep_taped(
     k_histories: &mut [&mut MxArray],
     v_histories: &mut [&mut MxArray],
     cu_seqlens_q: &[usize],
-    cu_seqlens_arr: Option<&MxArray>,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] cu_seqlens_arr: Option<&MxArray>,
     k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
     v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
     num_kv_heads: usize,
@@ -653,7 +654,9 @@ pub fn fused_short_conv_kv_prep_taped(
             "fused_short_conv_kv_prep_taped: invalid sequence count",
         ));
     }
+    #[cfg(target_os = "macos")]
     let kv_dim = (num_kv_heads * head_dim) as i64;
+    #[cfg(target_os = "macos")]
     let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
 
     #[cfg(target_os = "macos")]

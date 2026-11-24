@@ -290,6 +290,12 @@ unsafe extern "C-unwind" {
     /// Read readiness without evaluating or scheduling the array.
     pub fn mlx_array_is_available(handle: *mut mlx_array) -> bool;
     pub fn mlx_async_eval(handles: *mut *mut mlx_array, count: usize);
+    pub fn mlx_async_eval_with_error(
+        handles: *mut *mut mlx_array,
+        count: usize,
+        error_out: *mut std::ffi::c_char,
+        error_capacity: usize,
+    ) -> bool;
     pub fn mlx_eval(handles: *mut *mut mlx_array, count: usize) -> bool;
     pub fn mlx_eval_with_error(
         handles: *mut *mut mlx_array,
@@ -831,6 +837,23 @@ unsafe extern "C-unwind" {
         out_k: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Standalone fused CUDA QK-Norm + non-traditional partial RoPE with explicit
+    /// per-token `positions` (`int32[B, T]`) and optional FP32 `PreciseF32` norm.
+    pub fn mlx_qk_norm_rope_positions_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        positions: *mut mlx_array,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        precise_f32: bool,
+        out_q: *mut *mut mlx_array,
+        out_k: *mut *mut mlx_array,
+    ) -> bool;
+
     // Strict test entry: null on unsupported segmented dispatch; no concat
     // fallback. Always the vector routes (bit-identical to MLX's vector
     // SDPA), whatever the calibrated crossover says.
@@ -1132,6 +1155,10 @@ unsafe extern "C-unwind" {
     /// Get the data size of the array in number of ELEMENTS (not bytes)
     /// To get bytes, multiply by itemsize from mlx_array_get_itemsize()
     pub fn mlx_array_get_data_size(handle: *mut mlx_array) -> usize;
+
+    /// Get the backing allocator buffer size in bytes for an already-available
+    /// array, or 0 if unavailable / null / empty. Never triggers evaluation.
+    pub fn mlx_array_get_buffer_size(handle: *mut mlx_array) -> usize;
 
     /// Get the item size in bytes for the array's dtype
     pub fn mlx_array_get_itemsize(handle: *mut mlx_array) -> usize;
@@ -2606,6 +2633,40 @@ unsafe extern "C-unwind" {
         scale: f32,
     ) -> *mut mlx_array;
 
+    /// FlashAttention-2 D=256 BF16 prefill SDPA on CUDA with optional boolean mask.
+    ///
+    /// When `is_causal == true` and `mask` is non-null (`MASK_MODE = 3`), `mask`
+    /// must be a 4D bool tensor of shape `[1 | B, 1, 1, >= K_len]` and the kernel
+    /// applies `causal & (mask | self_diagonal)`, i.e. key `k` is attended by
+    /// query row `q` iff `(k <= K_len - Q_len + q) && (mask[b, 0, 0, k] || k == K_len - Q_len + q)`.
+    /// Forcing the causal self-diagonal keeps softmax well-defined on padded query rows
+    /// where all preceding keys are masked out.
+    pub fn mlx_sdpa_prefill_d256_masked_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        mask: *mut mlx_array,
+        scale: f32,
+        is_causal: bool,
+    ) -> *mut mlx_array;
+
+    /// FlashAttention-2 D=256 BF16 prefill SDPA on CUDA with fused
+    /// `[B, Q_len, Hq * 256]` output layout and `sigmoid(gate)` epilogue.
+    ///
+    /// `gate` must be a 3D BF16 tensor of shape `[B, Q_len, Hq * 256]`
+    /// (accepts strided views along `B`/`Q_len` when last-dim stride is 1,
+    /// outer strides are even, and base pointer is 4-byte aligned).
+    /// `mask` and `is_causal` follow [`mlx_sdpa_prefill_d256_masked_cuda`].
+    pub fn mlx_cuda_sdpa_prefill_d256_gated(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        gate: *mut mlx_array,
+        mask: *mut mlx_array,
+        scale: f32,
+        is_causal: bool,
+    ) -> *mut mlx_array;
+
     /// BF16 `x` times a transposed affine projection whose scales/biases are
     /// F32: BF16 result from one primitive with the promoted path's F32 math.
     /// Null unless the operands have exactly that form (and Metal is present).
@@ -3079,6 +3140,23 @@ unsafe extern "C-unwind" {
         outputs: *mut *mut mlx_array,
     ) -> bool;
 
+    /// Batched CUDA fused GDN preparation supporting arbitrary `(Hk, Hv)`, `B >= 1`,
+    /// 2D `[3, W]` (`B == 1`) or 3D `[B, 3, W]` history, and nullable `int32 [B]`
+    /// `valid_lengths` for per-row `next_history` extraction.
+    pub fn mlx_gdn_prepare_batched_cuda(
+        qkv_handle: *mut mlx_array,
+        a_handle: *mut mlx_array,
+        b_handle: *mut mlx_array,
+        conv_handle: *mut mlx_array,
+        history_handle: *mut mlx_array,
+        scale_handle: *mut mlx_array,
+        dt_handle: *mut mlx_array,
+        valid_lengths_handle: *mut mlx_array,
+        mean_eps: bool,
+        bf16_beta: bool,
+        out_handles: *mut *mut mlx_array,
+    ) -> bool;
+
     /// Tree-conv1d variant of fused CUDA GDN preparation (`conv_taps` is int32 `[T, 4]`).
     pub fn mlx_gdn_prepare_tree_cuda(
         qkv: *mut mlx_array,
@@ -3283,6 +3361,28 @@ unsafe extern "C-unwind" {
         rope_base: f32,
         rope_scale: f32,
         offset: i32,
+        out_q: *mut *mut mlx_array,
+        out_k_cache: *mut *mut mlx_array,
+        out_v_cache: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Explicit-positions variant of fused CUDA QK-Norm + partial RoPE + in-place
+    /// KV cache store (`positions` int32 `[B, T]`; KV writes at slot `offset + t`).
+    pub fn mlx_qk_norm_rope_kv_store_positions_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        q_norm_w: *mut mlx_array,
+        k_norm_w: *mut mlx_array,
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        positions: *mut mlx_array,
+        offset: i32,
+        eps: f32,
+        rope_dims: i32,
+        rope_base: f32,
+        rope_scale: f32,
+        precise_f32: bool,
         out_q: *mut *mut mlx_array,
         out_k_cache: *mut *mut mlx_array,
         out_v_cache: *mut *mut mlx_array,
@@ -3698,6 +3798,31 @@ unsafe extern "C" {
         eps: *mut mlx_array,
         out_h: *mut *mut mlx_array,
         out_normed: *mut *mut mlx_array,
+    ) -> bool;
+    /// Fused CUDA residual-add + PreciseF32 RMSNorm (BF16/FP16 I/O, FP32 weight).
+    pub fn mlx_fused_add_rmsnorm_precise_f32_cuda(
+        x: *mut mlx_array,
+        residual: *mut mlx_array,
+        weight_f32: *mut mlx_array,
+        eps: f32,
+        out_h: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+    ) -> bool;
+    /// Standalone CUDA PreciseF32 RMSNorm (BF16/FP16 I/O, FP32 weight).
+    pub fn mlx_rmsnorm_precise_f32_cuda(
+        x: *mut mlx_array,
+        weight_f32: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+    /// Fused CUDA grammar bitmask + argmax + FP64-accumulated log-sum-exp.
+    pub fn mlx_clairic_grammar_select_cuda(
+        logits: *mut mlx_array,
+        bitmask: *mut mlx_array,
+        score_token_ids: *mut mlx_array,
+        grammar_vocab: i32,
+        out_choice: *mut *mut mlx_array,
+        out_choice_lp: *mut *mut mlx_array,
+        out_scored_lps: *mut *mut mlx_array,
     ) -> bool;
     /// Owning handle copy sharing the source's ArrayDesc (no graph node —
     /// unlike `mlx_array_copy`). Used by the compiled-graph builder to hand
@@ -4262,6 +4387,89 @@ unsafe extern "C" {
         s_up: *mut mlx_array,
         b_up: *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// CUDA Sym8 (optional Rademacher signs + FWHT-1024) + per-token symmetric INT8 quantization.
+    /// `signs` may be null (skips FWHT-1024). Outputs `int8 [..., K]` and `f32 [...]`.
+    pub fn mlx_cuda_sym8_hadamard_quant(
+        x: *mut mlx_array,
+        signs: *mut mlx_array,
+        out_xq: *mut *mut mlx_array,
+        out_sx: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA fused SwiGLU + optional Rademacher signs + FWHT-1024 + per-token INT8 quantization.
+    /// `gate_up` has shape `[..., 2*K]` (`[gate, up]`). `signs` may be null.
+    pub fn mlx_cuda_sym8_swiglu_hadamard_quant(
+        gate_up: *mut mlx_array,
+        signs: *mut mlx_array,
+        out_xq: *mut *mut mlx_array,
+        out_sx: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA Sym8 IMMA GEMM (`int8 [..., K] x int8 [N, K]^T -> bfloat16 [..., N]`)
+    /// with fused FP32 per-token (`s_x`) and per-channel (`s_w`) rescale epilogue.
+    pub fn mlx_cuda_sym8_imma_gemm(
+        x_i8: *mut mlx_array,
+        w_i8: *mut mlx_array,
+        s_x: *mut mlx_array,
+        s_w: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// CUDA bit-exact FP32 weight quantizer: packed affine Q8 (`uint32 [N, K/4]`,
+    /// `f16/bf16/f32 [N, K/32]` scales and optional biases) + optional `f32 [K]` signs
+    /// & FWHT-1024 -> `int8 [N, K]` and `f32 [N]`.
+    pub fn mlx_cuda_sym8_quantize_weight_q8(
+        w_u32: *mut mlx_array,
+        w_scales: *mut mlx_array,
+        w_biases: *mut mlx_array,
+        signs: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA bit-exact FP32 weight quantizer: packed K-quant (`Q4_K` or `Q6_K`,
+    /// `RowMajor` or `Tiled64`) + optional `f32 [K]` signs & FWHT-1024 ->
+    /// `int8 [N, K]` and `f32 [N]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_sym8_quantize_weight_kquant_cuda(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        is_q6k: bool,
+        tiled: bool,
+        signs: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA bit-exact FP32 weight quantizer: dense `bf16/f16/f32 [N, K]` + optional
+    /// `f32 [K]` signs & FWHT-1024 -> `int8 [N, K]` and `f32 [N]`.
+    pub fn mlx_cuda_sym8_quantize_weight_dense(
+        w: *mut mlx_array,
+        signs: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// CUDA fused `(optional residual add) + RMSNorm + optional Hadamard-1024 + per-token INT8 quant`.
+    /// - `h`: `bfloat16 [..., H]` (`16 <= H <= 8192`, `H % 16 == 0`; `H % 1024 == 0` when `signs` non-null).
+    /// - `delta`: nullable `bfloat16` same shape as `h`; populates `out_h` iff non-null.
+    /// - `w_norm`: `bfloat16 [H]` (`Native` policy) or `float32 [H]` (`PreciseF32` policy).
+    /// - `signs`: nullable `float32 [H]`.
+    /// - `write_normed`: populates `out_normed` (`bfloat16 [..., H]`) iff `true`.
+    /// - `out_xq`: `int8 [..., H]`, `out_sx`: `float32 [...]`.
+    pub fn mlx_cuda_sym8_add_rmsnorm_hadamard_quant(
+        h: *mut mlx_array,
+        delta: *mut mlx_array,
+        w_norm: *mut mlx_array,
+        signs: *mut mlx_array,
+        eps: f32,
+        write_normed: bool,
+        out_h: *mut *mut mlx_array,
+        out_normed: *mut *mut mlx_array,
+        out_xq: *mut *mut mlx_array,
+        out_sx: *mut *mut mlx_array,
+    ) -> bool;
 }
 
 unsafe extern "C" {
@@ -4732,6 +4940,7 @@ unsafe extern "C-unwind" {
     pub fn mlx_array_alloc_gpu_uninit(shape: *const i64, ndim: usize, dtype: i32)
     -> *mut mlx_array;
     pub fn mlx_array_ensure_cuda_device(arr: *mut mlx_array) -> *mut mlx_array;
+    pub fn mlx_array_cuda_host_bytes(arr: *mut mlx_array) -> usize;
     /// Native Metal allocation with a CPU-visible pointer and a last-array
     /// lease (`mlx_array_alloc.cpp`). Null on unsupported builds or failure;
     /// `release_fn(ctx)` is not invoked on a null return.

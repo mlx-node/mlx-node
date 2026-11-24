@@ -259,6 +259,7 @@ struct GroupAttentionMeta {
     cu_seqlens_q: MxArray,
     /// Prebuilt `int64` write slot mapping (`(slot_mapping, total_queries)`) computed ONCE
     /// per KV group before the 48-visit loop for fused `sconv_k4_kv_prep_paged` writes.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     write_slot_mapping: Option<(MxArray, u32)>,
 }
 
@@ -1140,6 +1141,7 @@ impl Inkling2Inner {
                     .coordinator
                     .adapter_mut(gid)
                     .map_err(Error::from_reason)?;
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut meta = build_group_attention_meta(adapter, &seq_q_lens)?;
                 #[cfg(target_os = "macos")]
                 {
@@ -2231,6 +2233,7 @@ impl Inkling2Inner {
                     .coordinator
                     .adapter_mut(gid)
                     .map_err(Error::from_reason)?;
+                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
                 let mut meta = build_group_attention_meta(adapter, seq_q_lens)?;
                 #[cfg(target_os = "macos")]
                 {
@@ -3216,6 +3219,7 @@ fn forward_attention_paged(
 
     // 4 & 6. Fused K+V ShortConv + K L2-clip + V RMSNorm + PagedKVWrite in 1 Metal dispatch!
     let cu_arr = Some(&group_meta.cu_seqlens_q);
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut fused_kv_done = false;
     #[cfg(target_os = "macos")]
     if act_dtype == DType::BFloat16

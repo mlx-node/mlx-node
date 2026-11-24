@@ -7,8 +7,8 @@
 //! - Dynamic free-memory probing (`query_free_device_memory`) and budget-driven
 //!   transient dense-weight retention (`can_retain_dense_prefill`).
 
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use napi_derive::napi;
 
@@ -233,6 +233,13 @@ pub(crate) fn cuda_ops_available() -> bool {
     active_backend() == ActiveBackend::CudaGpu
 }
 
+/// Whether CUDA `Sym8` (IMMA `m16n8k32` + `cp.async`) kernels are supported
+/// on the active GPU (requires CUDA backend with Ampere SM >= 8.0).
+#[inline]
+pub(crate) fn cuda_sym8_available() -> bool {
+    cuda_ops_available() && caps().cuda_sm.is_some_and(|(major, _)| major >= 8)
+}
+
 /// Whether async eval overlap across streams is safe (Metal only; MLX-CUDA segfaults
 /// in `cu::AtomicEvent::wait` on cross-stream async eval).
 #[inline]
@@ -288,6 +295,79 @@ pub(crate) fn cuda_cache_clear_threshold_bytes() -> f64 {
         (c.total_device_bytes / 12).max(8u64 << 30) as f64
     } else {
         1024.0 * 1024.0 * 1024.0
+    }
+}
+
+/// `(active_guard_depth, saved_graphs_enabled)` protected by a mutex so nested
+/// or out-of-order [`CudaGraphsGuard`] scopes never race or prematurely
+/// re-enable CUDA Graphs while another guard is still active.
+static CUDA_GRAPHS_DISABLE_STATE: Mutex<(usize, bool)> = Mutex::new((0, false));
+
+fn acquire_cuda_graphs_disable(
+    state_mutex: &Mutex<(usize, bool)>,
+    get_enabled: impl FnOnce() -> bool,
+    set_enabled: impl FnOnce(bool),
+) {
+    let mut state = state_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if state.0 == 0 {
+        let enabled = get_enabled();
+        state.1 = enabled;
+        if enabled {
+            set_enabled(false);
+        }
+    }
+    state.0 = state.0.saturating_add(1);
+}
+
+fn release_cuda_graphs_disable(state_mutex: &Mutex<(usize, bool)>, set_enabled: impl FnOnce(bool)) {
+    let mut state = state_mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    state.0 = state.0.saturating_sub(1);
+    if state.0 == 0 && state.1 {
+        state.1 = false;
+        set_enabled(true);
+    }
+}
+
+/// RAII guard that temporarily disables MLX CUDA Graph capture for dynamic-shape
+/// prefill passes and restores the previous state once the last active guard drops.
+///
+/// Complete no-op on Metal/CPU. Nested and out-of-order drops are reference-counted.
+pub(crate) struct CudaGraphsGuard {
+    active: bool,
+}
+
+impl CudaGraphsGuard {
+    pub(crate) fn disable_for_prefill() -> Self {
+        if !cuda_ops_available() {
+            return Self { active: false };
+        }
+        acquire_cuda_graphs_disable(
+            &CUDA_GRAPHS_DISABLE_STATE,
+            // SAFETY: FFI helpers catch all C++ exceptions and return false on non-CUDA builds.
+            || unsafe { mlx_sys::mlx_cuda_get_use_graphs() },
+            |enabled| unsafe {
+                mlx_sys::mlx_cuda_set_use_graphs(enabled);
+            },
+        );
+        Self { active: true }
+    }
+}
+
+impl Drop for CudaGraphsGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        release_cuda_graphs_disable(&CUDA_GRAPHS_DISABLE_STATE, |enabled| {
+            // SAFETY: FFI helper catches all C++ exceptions.
+            unsafe {
+                mlx_sys::mlx_cuda_set_use_graphs(enabled);
+            }
+        });
     }
 }
 
@@ -382,6 +462,10 @@ pub(crate) fn try_retain_dense_prefill_weight(
 mod tests {
     use super::*;
 
+    /// Serializes live `CudaGraphsGuard` tests so parallel `cargo test` threads
+    /// never observe each other's temporary `CUDA_GRAPHS_DISABLE_STATE` count.
+    static LIVE_GRAPHS_TEST_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn active_backend_and_caps_are_consistent() {
         let c = caps();
@@ -400,6 +484,7 @@ mod tests {
                 assert!(rt.supports_moe_dflash2);
                 assert!(host_has_metal());
                 assert!(!host_has_cuda());
+                assert!(!cuda_sym8_available());
                 assert!(!cuda_draft_no_fuse());
                 assert!(supports_async_overlap());
                 assert!(matches!(
@@ -415,6 +500,10 @@ mod tests {
                 assert!(!rt.supports_moe_dflash2);
                 assert!(!host_has_metal());
                 assert!(host_has_cuda());
+                assert_eq!(
+                    cuda_sym8_available(),
+                    cuda_ops_available() && c.cuda_sm.is_some_and(|(major, _)| major >= 8)
+                );
                 assert!(cuda_draft_no_fuse());
                 assert!(!supports_async_overlap());
                 assert!(c.apple_gpu_gen.is_none());
@@ -434,6 +523,7 @@ mod tests {
                 assert!(!rt.supports_moe_dflash2);
                 assert!(!host_has_metal());
                 assert!(!host_has_cuda());
+                assert!(!cuda_sym8_available());
                 assert_eq!(active, ActiveBackend::Cpu);
                 assert_eq!(default_stream_device(), DeviceType::Cpu);
             }
@@ -531,5 +621,324 @@ mod tests {
         assert!(rejected.is_none(), "oversized weight must be rejected");
         drop(admitted);
         assert_eq!(RETAINED_DENSE_BYTES.load(Ordering::Acquire), before);
+    }
+
+    #[test]
+    fn cuda_graphs_guard_refcounts_nested_and_out_of_order_drops() {
+        use std::cell::{Cell, RefCell};
+
+        struct MockGuard<'a> {
+            state: &'a Mutex<(usize, bool)>,
+            enabled: &'a Cell<bool>,
+            set_calls: &'a RefCell<Vec<bool>>,
+        }
+
+        impl<'a> MockGuard<'a> {
+            fn acquire(
+                state: &'a Mutex<(usize, bool)>,
+                enabled: &'a Cell<bool>,
+                set_calls: &'a RefCell<Vec<bool>>,
+            ) -> Self {
+                acquire_cuda_graphs_disable(
+                    state,
+                    || enabled.get(),
+                    |v| {
+                        enabled.set(v);
+                        set_calls.borrow_mut().push(v);
+                    },
+                );
+                Self {
+                    state,
+                    enabled,
+                    set_calls,
+                }
+            }
+        }
+
+        impl Drop for MockGuard<'_> {
+            fn drop(&mut self) {
+                release_cuda_graphs_disable(self.state, |v| {
+                    self.enabled.set(v);
+                    self.set_calls.borrow_mut().push(v);
+                });
+            }
+        }
+
+        // Case 1: graphs initially enabled -> disabled on first acquire, stay disabled across
+        // nested & out-of-order drops, and re-enabled only when the final guard drops.
+        let state = Mutex::new((0usize, false));
+        let enabled = Cell::new(true);
+        let set_calls = RefCell::new(Vec::new());
+
+        let g1 = MockGuard::acquire(&state, &enabled, &set_calls);
+        assert_eq!(*state.lock().unwrap(), (1, true));
+        assert!(!enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false]);
+
+        let g2 = MockGuard::acquire(&state, &enabled, &set_calls);
+        assert_eq!(*state.lock().unwrap(), (2, true));
+        assert!(!enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false]);
+
+        // Out-of-order drop of outer guard `g1` must keep graphs disabled while `g2` lives.
+        drop(g1);
+        assert_eq!(*state.lock().unwrap(), (1, true));
+        assert!(!enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false]);
+
+        // Re-nesting while depth == 1 must not toggle FFI state.
+        let g3 = MockGuard::acquire(&state, &enabled, &set_calls);
+        assert_eq!(*state.lock().unwrap(), (2, true));
+        assert!(!enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false]);
+
+        // Drop `g2` before `g3`: still disabled at depth 1.
+        drop(g2);
+        assert_eq!(*state.lock().unwrap(), (1, true));
+        assert!(!enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false]);
+
+        // Final drop restores graphs to enabled and resets saved flag.
+        drop(g3);
+        assert_eq!(*state.lock().unwrap(), (0, false));
+        assert!(enabled.get());
+        assert_eq!(*set_calls.borrow(), vec![false, true]);
+
+        // Case 2: graphs initially disabled -> never re-enabled on final drop.
+        let state_off = Mutex::new((0usize, false));
+        let enabled_off = Cell::new(false);
+        let set_calls_off = RefCell::new(Vec::new());
+
+        let h1 = MockGuard::acquire(&state_off, &enabled_off, &set_calls_off);
+        let h2 = MockGuard::acquire(&state_off, &enabled_off, &set_calls_off);
+        assert_eq!(*state_off.lock().unwrap(), (2, false));
+        drop(h1);
+        assert_eq!(*state_off.lock().unwrap(), (1, false));
+        drop(h2);
+        assert_eq!(*state_off.lock().unwrap(), (0, false));
+        assert!(!enabled_off.get());
+        assert!(set_calls_off.borrow().is_empty());
+
+        // Exercise the live `CudaGraphsGuard` RAII type on this host (no-op off CUDA;
+        // keeps graphs disabled across out-of-order drops on CUDA).
+        let _live_lock = LIVE_GRAPHS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let live1 = CudaGraphsGuard::disable_for_prefill();
+        let live2 = CudaGraphsGuard::disable_for_prefill();
+        if cuda_ops_available() {
+            assert!(!unsafe { mlx_sys::mlx_cuda_get_use_graphs() });
+        }
+        drop(live1);
+        if cuda_ops_available() {
+            assert!(!unsafe { mlx_sys::mlx_cuda_get_use_graphs() });
+        }
+        drop(live2);
+        if cuda_ops_available() {
+            assert_eq!(CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0, 0);
+        }
+    }
+
+    #[test]
+    fn cuda_graphs_guard_concurrent_eval_matches_serial() {
+        use std::sync::{Arc, Barrier};
+
+        use crate::array::{DType, MxArray};
+        use crate::nn::{Activations, rms_norm_scaled};
+
+        if !cuda_ops_available() {
+            return;
+        }
+
+        let _live_lock = LIVE_GRAPHS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        struct ClearStreamsOnDrop;
+        impl Drop for ClearStreamsOnDrop {
+            fn drop(&mut self) {
+                #[cfg(windows)]
+                unsafe {
+                    mlx_sys::mlx_clear_streams();
+                }
+            }
+        }
+
+        fn make_pattern(len: usize, seed: usize) -> Vec<f32> {
+            (0..len)
+                .map(|i| {
+                    let v = ((i.wrapping_mul(17).wrapping_add(seed)) % 97) as f32;
+                    (v - 48.0) * 0.01
+                })
+                .collect()
+        }
+
+        struct ChainInputs {
+            x: MxArray,
+            w1: MxArray,
+            b1: MxArray,
+            w2: MxArray,
+            b2: MxArray,
+            w3: MxArray,
+            b3: MxArray,
+            w4: MxArray,
+            norm_w: MxArray,
+        }
+
+        impl ChainInputs {
+            fn build(rows: i64, seed_offset: usize) -> Self {
+                const D: i64 = 64;
+                let make = |shape: &[i64], seed: usize| {
+                    let len = shape.iter().product::<i64>() as usize;
+                    MxArray::from_float32(&make_pattern(len, seed + seed_offset), shape)
+                        .unwrap()
+                        .astype(DType::BFloat16)
+                        .unwrap()
+                };
+                let x = make(&[rows, D], 1);
+                let w1 = make(&[D, D], 7);
+                let b1 = make(&[1, D], 13);
+                let w2 = make(&[D, D], 19);
+                let b2 = make(&[1, D], 23);
+                let w3 = make(&[D, D], 29);
+                let b3 = make(&[1, D], 31);
+                let w4 = make(&[D, D], 37);
+                let norm_w = MxArray::from_float32(
+                    &(0..D as usize)
+                        .map(|i| 0.8 + ((i % 11) as f32) * 0.04)
+                        .collect::<Vec<_>>(),
+                    &[D],
+                )
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+                MxArray::eval_arrays(&[&x, &w1, &b1, &w2, &b2, &w3, &b3, &w4, &norm_w]).unwrap();
+                Self {
+                    x,
+                    w1,
+                    b1,
+                    w2,
+                    b2,
+                    w3,
+                    b3,
+                    w4,
+                    norm_w,
+                }
+            }
+
+            // 4 chained matmuls + adds + rms_norm + silu -> queues multiple graph
+            // nodes and cuBLAS CaptureContext scopes per eval.
+            fn forward(&self) -> MxArray {
+                let h1 = self.x.matmul(&self.w1).unwrap().add(&self.b1).unwrap();
+                let h1 = rms_norm_scaled(&h1, &self.norm_w, 1e-5).unwrap();
+                let h1 = Activations::silu(&h1).unwrap();
+
+                let h2 = h1.matmul(&self.w2).unwrap().add(&self.b2).unwrap();
+                let h2 = rms_norm_scaled(&h2, &self.norm_w, 1e-5).unwrap();
+                let h2 = Activations::silu(&h2).unwrap();
+
+                let h3 = h2.matmul(&self.w3).unwrap().add(&self.b3).unwrap();
+                let h3 = Activations::silu(&h3).unwrap();
+
+                h3.matmul(&self.w4).unwrap().add(&self.x).unwrap()
+            }
+        }
+
+        // Compute deterministic serial ground truth for both worker workloads.
+        let serial_a = ChainInputs::build(16, 0).forward();
+        MxArray::eval_arrays(&[&serial_a]).unwrap();
+        let expected_a: Vec<f32> = serial_a.to_float32().unwrap().to_vec();
+        assert_eq!(expected_a.len(), 16 * 64);
+        assert!(expected_a.iter().all(|v| v.is_finite()));
+        assert!(expected_a.iter().any(|v| v.abs() > 1e-4));
+
+        let serial_b = ChainInputs::build(32, 100).forward();
+        MxArray::eval_arrays(&[&serial_b]).unwrap();
+        let expected_b: Vec<f32> = serial_b.to_float32().unwrap().to_vec();
+        assert_eq!(expected_b.len(), 32 * 64);
+        assert!(expected_b.iter().all(|v| v.is_finite()));
+        assert!(expected_b.iter().any(|v| v.abs() > 1e-4));
+
+        let graphs_before = unsafe { mlx_sys::mlx_cuda_get_use_graphs() };
+        assert_eq!(CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0, 0);
+
+        const ITERS: usize = 80;
+        let barrier = Arc::new(Barrier::new(2));
+
+        let barrier_a = Arc::clone(&barrier);
+        let expected_a_thread = expected_a;
+        let thread_a = std::thread::spawn(move || {
+            let _cleanup = ClearStreamsOnDrop;
+            let inputs = ChainInputs::build(16, 0);
+            barrier_a.wait();
+            for iter in 0..ITERS {
+                let out = inputs.forward();
+                match iter % 3 {
+                    0 => out.eval(),
+                    1 => {
+                        let mut ptr = out.as_raw_ptr();
+                        // SAFETY: single valid array handle owned by `out` on this thread.
+                        unsafe {
+                            mlx_sys::mlx_async_eval(&mut ptr, 1);
+                        }
+                    }
+                    _ => MxArray::eval_arrays(&[&out]).unwrap(),
+                }
+                let got = out.to_float32().unwrap();
+                assert_eq!(got.len(), expected_a_thread.len());
+                let mut max_abs_err = 0.0f32;
+                for (&g, &e) in got.iter().zip(expected_a_thread.iter()) {
+                    assert!(g.is_finite(), "Thread A iter {iter}: non-finite output {g}");
+                    max_abs_err = max_abs_err.max((g - e).abs());
+                }
+                assert_eq!(
+                    max_abs_err, 0.0,
+                    "Thread A iter {iter}: concurrent eval diverged from serial ground truth (max_abs_err={max_abs_err})"
+                );
+            }
+        });
+
+        let barrier_b = Arc::clone(&barrier);
+        let expected_b_thread = expected_b;
+        let thread_b = std::thread::spawn(move || {
+            let _cleanup = ClearStreamsOnDrop;
+            let inputs = ChainInputs::build(32, 100);
+            barrier_b.wait();
+            for iter in 0..ITERS {
+                let _guard = CudaGraphsGuard::disable_for_prefill();
+                assert!(
+                    !unsafe { mlx_sys::mlx_cuda_get_use_graphs() },
+                    "Thread B iter {iter}: graphs must stay disabled while CudaGraphsGuard is held"
+                );
+                let out = inputs.forward();
+                MxArray::eval_arrays(&[&out]).unwrap();
+                let got = out.to_float32().unwrap();
+                assert_eq!(got.len(), expected_b_thread.len());
+                let mut max_abs_err = 0.0f32;
+                for (&g, &e) in got.iter().zip(expected_b_thread.iter()) {
+                    assert!(g.is_finite(), "Thread B iter {iter}: non-finite output {g}");
+                    max_abs_err = max_abs_err.max((g - e).abs());
+                }
+                assert_eq!(
+                    max_abs_err, 0.0,
+                    "Thread B iter {iter}: prefill eval diverged from serial ground truth (max_abs_err={max_abs_err})"
+                );
+            }
+        });
+
+        thread_a.join().expect("Thread A panicked");
+        thread_b.join().expect("Thread B panicked");
+
+        // Verify reference count returned to 0 and CUDA Graphs state restored cleanly.
+        assert_eq!(
+            CUDA_GRAPHS_DISABLE_STATE.lock().unwrap().0,
+            0,
+            "active_disable_count must return to 0 after all guards drop"
+        );
+        assert_eq!(
+            unsafe { mlx_sys::mlx_cuda_get_use_graphs() },
+            graphs_before,
+            "CUDA Graphs state must restore to initial value after all guards drop"
+        );
     }
 }

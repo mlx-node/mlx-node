@@ -478,6 +478,7 @@ fn block_runs_read_a_chain_back_in_runs() {
 
 /// The pool's page of a block holds the bytes `split_block` makes of the
 /// same latent rows and pooled keys. Needs Metal (skips without it).
+#[cfg(target_os = "macos")]
 #[test]
 fn pool_blobs_are_split_block_of_the_rows() {
     use mlx_paged_attn::metal::MetalDtype;

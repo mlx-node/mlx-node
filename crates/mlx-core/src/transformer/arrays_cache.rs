@@ -147,6 +147,34 @@ impl ArraysCache {
         }
         Ok(out)
     }
+
+    /// Compact the batch dimension (axis 0) in place by selecting rows at `indices`.
+    ///
+    /// Replaces each populated slot with `arr.take(indices, 0)?` while leaving
+    /// `None` slots as `None`.
+    pub fn select_batch_rows(&mut self, indices: &MxArray) -> Result<()> {
+        if indices.ndim()? != 1 || indices.shape_at(0)? < 1 {
+            return Err(Error::from_reason(
+                "ArraysCache::select_batch_rows requires a non-empty 1D index array",
+            ));
+        }
+        let mut updated = Vec::with_capacity(self.cache.len());
+        for (slot, entry) in self.cache.iter().enumerate() {
+            match entry {
+                Some(arr) => {
+                    if arr.ndim()? == 0 {
+                        return Err(Error::from_reason(format!(
+                            "ArraysCache::select_batch_rows slot {slot} must have rank >= 1"
+                        )));
+                    }
+                    updated.push(Some(arr.take(indices, 0)?));
+                }
+                None => updated.push(None),
+            }
+        }
+        self.cache = updated;
+        Ok(())
+    }
 }
 
 /// Advance independent recurrent rows through their singleton projection

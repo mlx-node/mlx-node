@@ -26,6 +26,66 @@
 #include <iostream>
 #include <unordered_map>
 #include <mutex>
+#ifdef MLX_NODE_CUDA_ENABLED
+#include <shared_mutex>
+#endif
+
+namespace mlx_node {
+
+#ifdef MLX_NODE_CUDA_ENABLED
+// Shared-exclusive lock coordinating MLX GPU evaluation/synchronization
+// against process-wide CUDA graph mode toggles (`mlx_cuda_set_use_graphs`).
+// Readers acquire shared access (re-entrant via per-thread depth so nested
+// helpers never deadlock on a writer-preferring `std::shared_mutex`);
+// `mlx_cuda_set_use_graphs` acquires exclusive access so `use_cuda_graphs_flag`
+// never flips while any thread's CommandEncoder has queued graph nodes or an
+// open CaptureContext/ConcurrentContext.
+std::shared_mutex& mlx_cuda_graphs_eval_mutex() noexcept;
+uint32_t& mlx_cuda_graphs_eval_read_depth() noexcept;
+
+class CudaGraphsEvalReadLock {
+ public:
+  CudaGraphsEvalReadLock() {
+    uint32_t& depth = mlx_cuda_graphs_eval_read_depth();
+    if (depth == 0) {
+      mlx_cuda_graphs_eval_mutex().lock_shared();
+    }
+    ++depth;
+  }
+
+  ~CudaGraphsEvalReadLock() noexcept {
+    uint32_t& depth = mlx_cuda_graphs_eval_read_depth();
+    if (depth > 0) {
+      --depth;
+      if (depth == 0) {
+        mlx_cuda_graphs_eval_mutex().unlock_shared();
+      }
+    }
+  }
+
+  CudaGraphsEvalReadLock(const CudaGraphsEvalReadLock&) = delete;
+  CudaGraphsEvalReadLock& operator=(const CudaGraphsEvalReadLock&) = delete;
+  CudaGraphsEvalReadLock(CudaGraphsEvalReadLock&&) = delete;
+  CudaGraphsEvalReadLock& operator=(CudaGraphsEvalReadLock&&) = delete;
+};
+#else
+// Zero-overhead no-op on Metal / CPU / non-CUDA builds. User-provided empty
+// constructor/destructor prevent `-Wunused-variable` under `-Wall -Wextra -Werror`
+// while still optimizing to zero instructions.
+struct CudaGraphsEvalReadLock {
+  CudaGraphsEvalReadLock() noexcept {}
+  ~CudaGraphsEvalReadLock() noexcept {}
+
+  CudaGraphsEvalReadLock(const CudaGraphsEvalReadLock&) = delete;
+  CudaGraphsEvalReadLock& operator=(const CudaGraphsEvalReadLock&) = delete;
+  CudaGraphsEvalReadLock(CudaGraphsEvalReadLock&&) = delete;
+  CudaGraphsEvalReadLock& operator=(CudaGraphsEvalReadLock&&) = delete;
+};
+#endif
+
+}  // namespace mlx_node
+
+using mlx_node::CudaGraphsEvalReadLock;
 
 // Forward declaration of opaque handle type for FFI
 struct mlx_array;
@@ -340,6 +400,7 @@ bool copy_to_buffer_as(const array& arr, T* out, size_t len, mlx::core::Dtype dt
   if (arr.size() != len) return false;
   if (len == 0) return true;
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto host = astype(flatten(arr), dtype);
     host.eval();
     // Calling contiguous unconditionally would also copy a small contiguous

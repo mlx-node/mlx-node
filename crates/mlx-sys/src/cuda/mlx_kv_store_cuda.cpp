@@ -329,6 +329,200 @@ class QkNormRopeKvStoreTreeCuda final : public Primitive {
   int32_t offset_;
 };
 
+class QkNormRopeKvStorePositionsCuda final : public Primitive {
+ public:
+  QkNormRopeKvStorePositionsCuda(
+      Stream stream,
+      float eps,
+      int32_t rope_dims,
+      float rope_base,
+      float rope_scale,
+      int32_t offset,
+      bool precise_f32)
+      : Primitive(stream),
+        eps_(eps),
+        rope_dims_(rope_dims),
+        rope_base_(rope_base),
+        rope_scale_(rope_scale),
+        offset_(offset),
+        precise_f32_(precise_f32) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("QkNormRopeKvStorePositionsCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs,
+                std::vector<array>& outputs) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    auto ensure_last_contiguous = [&](const array& x) {
+      if (x.strides(3) == 1) {
+        return x;
+      }
+      auto copy = contiguous_copy_gpu(x, stream());
+      encoder.add_temporary(copy);
+      return copy;
+    };
+
+    const array q_in = ensure_last_contiguous(inputs[0]);
+    const array k_in = ensure_last_contiguous(inputs[1]);
+    const array v_in = ensure_last_contiguous(inputs[2]);
+    const array q_w = cu::ensure_row_contiguous_aligned<8>(inputs[3], stream(), encoder);
+    const array k_w = cu::ensure_row_contiguous_aligned<8>(inputs[4], stream(), encoder);
+    const array& k_cache = inputs[5];
+    const array& v_cache = inputs[6];
+    const array& positions = inputs[7];
+
+    const int B = q_in.shape(0);
+    const int T = q_in.shape(1);
+    const int Hq = q_in.shape(2);
+    const int D = q_in.shape(3);
+    const int Hkv = k_in.shape(2);
+    const int cap = k_cache.shape(2);
+    const auto expected_w_dt = precise_f32_ ? float32 : bfloat16;
+    const bool is_2d =
+        positions.ndim() == 2 && positions.shape(0) == B && positions.shape(1) == T;
+    const bool is_1d = positions.ndim() == 1 && positions.shape(0) == B;
+    auto cache_strides_ok = [&](const array& c) {
+      return c.strides(3) == 1 &&
+          (cap <= 1 || c.strides(2) >= D) &&
+          (Hkv <= 1 ||
+           (c.strides(1) >= static_cast<int64_t>(cap) * D &&
+            (cap <= 1 || c.strides(1) / cap >= c.strides(2)))) &&
+          (B <= 1 ||
+           (c.strides(0) >= static_cast<int64_t>(Hkv) * cap * D &&
+            (Hkv <= 1 || c.strides(0) / Hkv >= c.strides(1)) &&
+            (Hkv > 1 || cap <= 1 || c.strides(0) / cap >= c.strides(2))));
+    };
+    if (B < 1 || B > 65535 || T < 1 || Hq < 1 || Hkv < 1 ||
+        static_cast<int64_t>(Hq) + Hkv > 65535 ||
+        D < 2 || D > 1024 || (D & 1) != 0 ||
+        q_in.dtype() != bfloat16 || k_in.dtype() != bfloat16 || v_in.dtype() != bfloat16 ||
+        k_cache.dtype() != bfloat16 || v_cache.dtype() != bfloat16 ||
+        q_w.ndim() != 1 || q_w.shape(0) != D || q_w.dtype() != expected_w_dt ||
+        k_w.ndim() != 1 || k_w.shape(0) != D || k_w.dtype() != expected_w_dt ||
+        k_in.shape() != Shape{B, T, Hkv, D} || v_in.shape() != Shape{B, T, Hkv, D} ||
+        k_cache.shape() != Shape{B, Hkv, cap, D} ||
+        v_cache.shape() != Shape{B, Hkv, cap, D} ||
+        positions.dtype() != int32 || (!is_2d && !is_1d) ||
+        offset_ < 0 || int64_t(offset_) + T > cap ||
+        !cache_strides_ok(k_cache) || !cache_strides_ok(v_cache) ||
+        rope_dims_ < 0 || rope_dims_ > D || (rope_dims_ & 1) != 0 ||
+        !(rope_base_ > 0.0f)) {
+      throw std::invalid_argument(
+          "QkNormRopeKvStorePositionsCuda: invalid shape, dtype, or bounds");
+    }
+    const void* kc_ptr = k_cache.buffer().ptr();
+    const void* vc_ptr = v_cache.buffer().ptr();
+    if (kc_ptr == vc_ptr ||
+        kc_ptr == q_in.buffer().ptr() || kc_ptr == k_in.buffer().ptr() ||
+        kc_ptr == v_in.buffer().ptr() || kc_ptr == q_w.buffer().ptr() ||
+        kc_ptr == k_w.buffer().ptr() || kc_ptr == positions.buffer().ptr() ||
+        vc_ptr == q_in.buffer().ptr() || vc_ptr == k_in.buffer().ptr() ||
+        vc_ptr == v_in.buffer().ptr() || vc_ptr == q_w.buffer().ptr() ||
+        vc_ptr == k_w.buffer().ptr() || vc_ptr == positions.buffer().ptr()) {
+      throw std::invalid_argument(
+          "QkNormRopeKvStorePositionsCuda: cache buffer aliases input");
+    }
+
+    auto& q_out = outputs[0];
+    auto& k_cache_out = outputs[1];
+    auto& v_cache_out = outputs[2];
+    q_out.set_data(cu::malloc_async(q_out.nbytes(), encoder));
+    k_cache_out.copy_shared_buffer(k_cache);
+    v_cache_out.copy_shared_buffer(v_cache);
+
+    encoder.set_input_array(q_in);
+    encoder.set_input_array(k_in);
+    encoder.set_input_array(v_in);
+    encoder.set_input_array(q_w);
+    encoder.set_input_array(k_w);
+    encoder.set_input_array(positions);
+    // Do NOT call encoder.set_input_array(k_cache/v_cache): k_cache_out and
+    // v_cache_out alias them and set_output_array already tracks dependencies
+    // without inflating bytes_in_graph_ by the preallocated KV buffers.
+    encoder.set_output_array(q_out);
+    encoder.set_output_array(k_cache_out);
+    encoder.set_output_array(v_cache_out);
+
+    static constexpr const char* kEntries[2][2] = {
+        {"mlx_qk_norm_rope_kv_store_positions_cuda_kernel<false,false>",
+         "mlx_qk_norm_rope_kv_store_positions_cuda_kernel<false,true>"},
+        {"mlx_qk_norm_rope_kv_store_positions_cuda_kernel<true,false>",
+         "mlx_qk_norm_rope_kv_store_positions_cuda_kernel<true,true>"},
+    };
+    const char* entry = kEntries[D == 256 ? 1 : 0][precise_f32_ ? 1 : 0];
+    auto kernel = cu::jit_kernel(encoder.device(), kQkNormRopeKvCudaSrc, entry);
+
+    const int32_t pos_is_2d = is_2d ? 1 : 0;
+    const int64_t pos_sb = positions.strides(0);
+    const int64_t pos_st = is_2d ? positions.strides(1) : 0;
+
+    cu::KernelArgs args;
+    args.append(q_in);
+    args.append(k_in);
+    args.append(v_in);
+    args.append(q_w);
+    args.append(k_w);
+    args.append(positions);
+    args.append(q_out);
+    args.append(k_cache_out);
+    args.append(v_cache_out);
+    args.append<int32_t>(T);
+    args.append<int32_t>(Hq);
+    args.append<int32_t>(D);
+    args.append<int32_t>(rope_dims_);
+    args.append<float>(std::log2(rope_base_));
+    args.append<float>(rope_scale_);
+    args.append<float>(eps_);
+    args.append<int32_t>(offset_);
+    args.append<int32_t>(pos_is_2d);
+    args.append<int64_t>(pos_sb);
+    args.append<int64_t>(pos_st);
+    args.append<int64_t>(q_in.strides(0));
+    args.append<int64_t>(q_in.strides(1));
+    args.append<int64_t>(q_in.strides(2));
+    args.append<int64_t>(k_in.strides(0));
+    args.append<int64_t>(k_in.strides(1));
+    args.append<int64_t>(k_in.strides(2));
+    args.append<int64_t>(v_in.strides(0));
+    args.append<int64_t>(v_in.strides(1));
+    args.append<int64_t>(v_in.strides(2));
+    args.append<int64_t>(k_cache.strides(0));
+    args.append<int64_t>(k_cache.strides(1));
+    args.append<int64_t>(k_cache.strides(2));
+    args.append<int64_t>(v_cache.strides(0));
+    args.append<int64_t>(v_cache.strides(1));
+    args.append<int64_t>(v_cache.strides(2));
+
+    encoder.add_kernel_node_raw(
+        kernel, dim3(T, Hq + Hkv, B), dim3(128, 1, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(QkNormRopeKvStorePositionsCuda)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const QkNormRopeKvStorePositionsCuda*>(&other);
+    return rhs && rhs->eps_ == eps_ && rhs->rope_dims_ == rope_dims_ &&
+        rhs->rope_base_ == rope_base_ && rhs->rope_scale_ == rope_scale_ &&
+        rhs->offset_ == offset_ && rhs->precise_f32_ == precise_f32_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const auto& q = inputs[0];
+    return {
+        {q.shape(0), q.shape(2), q.shape(1), q.shape(3)},
+        inputs[5].shape(),
+        inputs[6].shape(),
+    };
+  }
+
+ private:
+  float eps_;
+  int32_t rope_dims_;
+  float rope_base_;
+  float rope_scale_;
+  int32_t offset_;
+  bool precise_f32_;
+};
+
 class KvCompactRowsCuda final : public Primitive {
  public:
   KvCompactRowsCuda(Stream stream, int32_t base_offset)
@@ -466,12 +660,14 @@ class QkNormRopeCuda final : public Primitive {
       float eps,
       float rope_base,
       float rope_scale,
-      int32_t rope_dims)
+      int32_t rope_dims,
+      bool precise_f32 = false)
       : Primitive(stream),
         eps_(eps),
         rope_base_(rope_base),
         rope_scale_(rope_scale),
-        rope_dims_(rope_dims) {}
+        rope_dims_(rope_dims),
+        precise_f32_(precise_f32) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("QkNormRopeCuda requires CUDA");
@@ -493,7 +689,7 @@ class QkNormRopeCuda final : public Primitive {
     const array k_in = ensure_last_contiguous(inputs[1]);
     const array q_w = cu::ensure_row_contiguous_aligned<8>(inputs[2], stream(), encoder);
     const array k_w = cu::ensure_row_contiguous_aligned<8>(inputs[3], stream(), encoder);
-    const array offsets = cu::ensure_row_contiguous_aligned<4>(inputs[4], stream(), encoder);
+    const array& positions = inputs[4];
 
     const int B = q_in.shape(0);
     const int T = q_in.shape(1);
@@ -501,18 +697,25 @@ class QkNormRopeCuda final : public Primitive {
     const int D = q_in.shape(3);
     const int Hk = k_in.shape(2);
     const auto dt = q_in.dtype();
-    const bool valid_offsets =
-        offsets.dtype() == int32 &&
-        ((offsets.ndim() == 1 && offsets.shape(0) == B) ||
-         (offsets.ndim() == 0 && B == 1));
-    if (B < 1 || T < 1 || Hq < 1 || Hk < 1 || D < 2 || D > 4096 || (D & 1) != 0 ||
+    const auto expected_w_dt = precise_f32_ ? float32 : dt;
+    const bool is_2d =
+        positions.ndim() == 2 && positions.shape(0) == B && positions.shape(1) == T;
+    const bool is_1d = positions.ndim() == 1 && positions.shape(0) == B;
+    const bool is_0d = positions.ndim() == 0 && B == 1;
+    const bool valid_positions =
+        positions.dtype() == int32 && (is_2d || is_1d || is_0d);
+    if (B < 1 || B > 65535 || T < 1 || Hq < 1 || Hk < 1 ||
+        static_cast<int64_t>(Hq) + Hk > 65535 ||
+        D < 2 || D > 4096 || (D & 1) != 0 ||
         k_in.shape() != Shape{B, T, Hk, D} ||
         q_w.ndim() != 1 || q_w.shape(0) != D ||
         k_w.ndim() != 1 || k_w.shape(0) != D ||
-        k_in.dtype() != dt || q_w.dtype() != dt || k_w.dtype() != dt ||
+        k_in.dtype() != dt || q_w.dtype() != expected_w_dt ||
+        k_w.dtype() != expected_w_dt ||
         (dt != bfloat16 && dt != float16 && dt != float32) ||
-        !valid_offsets ||
-        rope_dims_ < 0 || rope_dims_ > D || (rope_dims_ & 1) != 0) {
+        !valid_positions ||
+        rope_dims_ < 0 || rope_dims_ > D || (rope_dims_ & 1) != 0 ||
+        !(rope_base_ > 0.0f)) {
       throw std::invalid_argument("QkNormRopeCuda: invalid shape or dtype");
     }
 
@@ -525,32 +728,52 @@ class QkNormRopeCuda final : public Primitive {
     encoder.set_input_array(k_in);
     encoder.set_input_array(q_w);
     encoder.set_input_array(k_w);
-    encoder.set_input_array(offsets);
+    encoder.set_input_array(positions);
     encoder.set_output_array(q_out);
     encoder.set_output_array(k_out);
 
     const int dt_idx = (dt == bfloat16) ? 0 : (dt == float16 ? 1 : 2);
     const int d_idx = (D == 128) ? 0 : (D == 256 ? 1 : 2);
-    static constexpr const char* kEntries[3][3] = {
-        {"mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,128>",
-         "mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,256>",
-         "mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,0>"},
-        {"mlx_qk_norm_rope_cuda_kernel<__half,128>",
-         "mlx_qk_norm_rope_cuda_kernel<__half,256>",
-         "mlx_qk_norm_rope_cuda_kernel<__half,0>"},
-        {"mlx_qk_norm_rope_cuda_kernel<float,128>",
-         "mlx_qk_norm_rope_cuda_kernel<float,256>",
-         "mlx_qk_norm_rope_cuda_kernel<float,0>"},
+    const int w_idx = (precise_f32_ && dt != float32) ? 1 : 0;
+    static constexpr const char* kEntries[3][3][2] = {
+        {
+            {"mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,128,false>",
+             "mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,128,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,256,false>",
+             "mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,256,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,0,false>",
+             "mlx_qk_norm_rope_cuda_kernel<nv_bfloat16,0,true>"},
+        },
+        {
+            {"mlx_qk_norm_rope_cuda_kernel<__half,128,false>",
+             "mlx_qk_norm_rope_cuda_kernel<__half,128,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<__half,256,false>",
+             "mlx_qk_norm_rope_cuda_kernel<__half,256,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<__half,0,false>",
+             "mlx_qk_norm_rope_cuda_kernel<__half,0,true>"},
+        },
+        {
+            {"mlx_qk_norm_rope_cuda_kernel<float,128,false>",
+             "mlx_qk_norm_rope_cuda_kernel<float,128,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<float,256,false>",
+             "mlx_qk_norm_rope_cuda_kernel<float,256,true>"},
+            {"mlx_qk_norm_rope_cuda_kernel<float,0,false>",
+             "mlx_qk_norm_rope_cuda_kernel<float,0,true>"},
+        },
     };
     auto kernel = cu::jit_kernel(
-        encoder.device(), kQkNormRopeKvCudaSrc, kEntries[dt_idx][d_idx]);
+        encoder.device(), kQkNormRopeKvCudaSrc, kEntries[dt_idx][d_idx][w_idx]);
+
+    const int32_t pos_is_2d = is_2d ? 1 : 0;
+    const int64_t pos_sb = is_0d ? 0 : positions.strides(0);
+    const int64_t pos_st = is_2d ? positions.strides(1) : 0;
 
     cu::KernelArgs args;
     args.append(q_in);
     args.append(k_in);
     args.append(q_w);
     args.append(k_w);
-    args.append(offsets);
+    args.append(positions);
     args.append(q_out);
     args.append(k_out);
     args.append<int32_t>(T);
@@ -561,6 +784,9 @@ class QkNormRopeCuda final : public Primitive {
     args.append<float>(std::log2(rope_base_));
     args.append<float>(rope_scale_);
     args.append<float>(eps_);
+    args.append<int32_t>(pos_is_2d);
+    args.append<int64_t>(pos_sb);
+    args.append<int64_t>(pos_st);
     args.append<int64_t>(q_in.strides(0));
     args.append<int64_t>(q_in.strides(1));
     args.append<int64_t>(q_in.strides(2));
@@ -576,7 +802,8 @@ class QkNormRopeCuda final : public Primitive {
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const QkNormRopeCuda*>(&other);
     return rhs && rhs->eps_ == eps_ && rhs->rope_base_ == rope_base_ &&
-        rhs->rope_scale_ == rope_scale_ && rhs->rope_dims_ == rope_dims_;
+        rhs->rope_scale_ == rope_scale_ && rhs->rope_dims_ == rope_dims_ &&
+        rhs->precise_f32_ == precise_f32_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     const auto& q = inputs[0];
@@ -592,6 +819,7 @@ class QkNormRopeCuda final : public Primitive {
   float rope_base_;
   float rope_scale_;
   int32_t rope_dims_;
+  bool precise_f32_;
 };
 
 class KvStoreRowsCuda final : public Primitive {
@@ -1065,7 +1293,9 @@ extern "C" bool mlx_qk_norm_rope_cuda(
     const bool valid_offsets =
         oa.dtype() == int32 &&
         ((oa.ndim() == 1 && oa.shape(0) == B) || (oa.ndim() == 0 && B == 1));
-    if (B < 1 || T < 1 || Hq < 1 || Hk < 1 || D < 2 || D > 4096 || (D & 1) != 0 ||
+    if (B < 1 || B > 65535 || T < 1 || Hq < 1 || Hk < 1 ||
+        static_cast<int64_t>(Hq) + Hk > 65535 ||
+        D < 2 || D > 4096 || (D & 1) != 0 ||
         ka.shape() != Shape{B, T, Hk, D} ||
         qw.shape(0) != D || kw.shape(0) != D ||
         (dt != bfloat16 && dt != float16 && dt != float32) ||
@@ -1091,6 +1321,200 @@ extern "C" bool mlx_qk_norm_rope_cuda(
 #else
   (void)q; (void)k; (void)q_weight; (void)k_weight; (void)offsets;
   (void)eps; (void)rope_base; (void)rope_scale; (void)rope_dims;
+  return false;
+#endif
+}
+
+// Fused CUDA QK-Norm + non-traditional partial RoPE + in-place KV cache store
+// with explicit 2D [B, T] or 1D [B] int32 positions and optional FP32 norm weights.
+extern "C" bool mlx_qk_norm_rope_kv_store_positions_cuda(
+    mlx_array* q_handle,
+    mlx_array* k_handle,
+    mlx_array* v_handle,
+    mlx_array* q_norm_w_handle,
+    mlx_array* k_norm_w_handle,
+    mlx_array* k_cache_handle,
+    mlx_array* v_cache_handle,
+    mlx_array* positions_handle,
+    int32_t offset,
+    float eps,
+    int32_t rope_dims,
+    float rope_base,
+    float rope_scale,
+    bool precise_f32,
+    mlx_array** out_q,
+    mlx_array** out_k_cache,
+    mlx_array** out_v_cache) {
+  if (out_q) *out_q = nullptr;
+  if (out_k_cache) *out_k_cache = nullptr;
+  if (out_v_cache) *out_v_cache = nullptr;
+#ifdef MLX_NODE_CUDA_ENABLED
+  try {
+    using namespace mlx::core;
+    if (!q_handle || !k_handle || !v_handle || !q_norm_w_handle ||
+        !k_norm_w_handle || !k_cache_handle || !v_cache_handle ||
+        !positions_handle || !out_q || !out_k_cache || !out_v_cache ||
+        default_device() != Device::gpu) {
+      return false;
+    }
+    const auto& qa = *reinterpret_cast<array*>(q_handle);
+    const auto& ka = *reinterpret_cast<array*>(k_handle);
+    const auto& va = *reinterpret_cast<array*>(v_handle);
+    const auto& qw = *reinterpret_cast<array*>(q_norm_w_handle);
+    const auto& kw = *reinterpret_cast<array*>(k_norm_w_handle);
+    const auto& kc = *reinterpret_cast<array*>(k_cache_handle);
+    const auto& vc = *reinterpret_cast<array*>(v_cache_handle);
+    const auto& pa = *reinterpret_cast<array*>(positions_handle);
+    const auto expected_w_dt = precise_f32 ? float32 : bfloat16;
+    if (qa.dtype() != bfloat16 || ka.dtype() != bfloat16 || va.dtype() != bfloat16 ||
+        qw.dtype() != expected_w_dt || kw.dtype() != expected_w_dt ||
+        kc.dtype() != bfloat16 || vc.dtype() != bfloat16 ||
+        pa.dtype() != int32) {
+      return false;
+    }
+    if (qa.ndim() != 4 || ka.ndim() != 4 || va.ndim() != 4 ||
+        qw.ndim() != 1 || kw.ndim() != 1 ||
+        kc.ndim() != 4 || vc.ndim() != 4) {
+      return false;
+    }
+    const int B = qa.shape(0);
+    const int T = qa.shape(1);
+    const int Hq = qa.shape(2);
+    const int D = qa.shape(3);
+    const int Hkv = ka.shape(2);
+    const int cap = kc.shape(2);
+    const bool valid_positions =
+        (pa.ndim() == 2 && pa.shape(0) == B && pa.shape(1) == T) ||
+        (pa.ndim() == 1 && pa.shape(0) == B);
+    auto cache_strides_ok = [&](const array& c) {
+      return c.strides(3) == 1 &&
+          (cap <= 1 || c.strides(2) >= D) &&
+          (Hkv <= 1 ||
+           (c.strides(1) >= static_cast<int64_t>(cap) * D &&
+            (cap <= 1 || c.strides(1) / cap >= c.strides(2)))) &&
+          (B <= 1 ||
+           (c.strides(0) >= static_cast<int64_t>(Hkv) * cap * D &&
+            (Hkv <= 1 || c.strides(0) / Hkv >= c.strides(1)) &&
+            (Hkv > 1 || cap <= 1 || c.strides(0) / cap >= c.strides(2))));
+    };
+    if (B < 1 || B > 65535 || T < 1 || Hq < 1 || Hkv < 1 ||
+        static_cast<int64_t>(Hq) + Hkv > 65535 ||
+        D < 2 || D > 1024 || (D & 1) != 0 ||
+        ka.shape() != Shape{B, T, Hkv, D} || va.shape() != Shape{B, T, Hkv, D} ||
+        qw.shape() != Shape{D} || kw.shape() != Shape{D} ||
+        kc.shape() != Shape{B, Hkv, cap, D} || vc.shape() != Shape{B, Hkv, cap, D} ||
+        !valid_positions ||
+        offset < 0 || int64_t(offset) + T > cap ||
+        !cache_strides_ok(kc) || !cache_strides_ok(vc) ||
+        rope_dims < 0 || rope_dims > D || (rope_dims & 1) != 0 ||
+        !(rope_base > 0.0f)) {
+      return false;
+    }
+    auto stream = default_stream(Device::gpu);
+    auto outputs = array::make_arrays(
+        {Shape{B, Hq, T, D}, kc.shape(), vc.shape()},
+        {bfloat16, bfloat16, bfloat16},
+        std::make_shared<QkNormRopeKvStorePositionsCuda>(
+            stream, eps, rope_dims, rope_base, rope_scale, offset, precise_f32),
+        {qa, ka, va, qw, kw, kc, vc, pa});
+    *out_q = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
+    *out_k_cache = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));
+    *out_v_cache = reinterpret_cast<mlx_array*>(new array(std::move(outputs[2])));
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_qk_norm_rope_kv_store_positions_cuda: %s\n", e.what());
+    return false;
+  } catch (...) {
+    std::fprintf(stderr, "mlx_qk_norm_rope_kv_store_positions_cuda: unknown exception\n");
+    return false;
+  }
+#else
+  (void)q_handle; (void)k_handle; (void)v_handle; (void)q_norm_w_handle;
+  (void)k_norm_w_handle; (void)k_cache_handle; (void)v_cache_handle;
+  (void)positions_handle; (void)offset; (void)eps; (void)rope_dims;
+  (void)rope_base; (void)rope_scale; (void)precise_f32;
+  return false;
+#endif
+}
+
+// Standalone fused CUDA QK-Norm + non-traditional partial RoPE with explicit
+// 2D [B, T] or 1D [B] int32 positions and optional FP32 norm weights.
+extern "C" bool mlx_qk_norm_rope_positions_cuda(
+    mlx_array* q_handle,
+    mlx_array* k_handle,
+    mlx_array* q_norm_w_handle,
+    mlx_array* k_norm_w_handle,
+    mlx_array* positions_handle,
+    float eps,
+    int32_t rope_dims,
+    float rope_base,
+    float rope_scale,
+    bool precise_f32,
+    mlx_array** out_q,
+    mlx_array** out_k) {
+  if (out_q) *out_q = nullptr;
+  if (out_k) *out_k = nullptr;
+#ifdef MLX_NODE_CUDA_ENABLED
+  try {
+    using namespace mlx::core;
+    if (!q_handle || !k_handle || !q_norm_w_handle || !k_norm_w_handle ||
+        !positions_handle || !out_q || !out_k ||
+        default_device() != Device::gpu) {
+      return false;
+    }
+    const auto& qa = *reinterpret_cast<array*>(q_handle);
+    const auto& ka = *reinterpret_cast<array*>(k_handle);
+    const auto& qw = *reinterpret_cast<array*>(q_norm_w_handle);
+    const auto& kw = *reinterpret_cast<array*>(k_norm_w_handle);
+    const auto& pa = *reinterpret_cast<array*>(positions_handle);
+    if (qa.ndim() != 4 || ka.ndim() != 4 || qw.ndim() != 1 || kw.ndim() != 1) {
+      return false;
+    }
+    const int B = qa.shape(0);
+    const int T = qa.shape(1);
+    const int Hq = qa.shape(2);
+    const int D = qa.shape(3);
+    const int Hk = ka.shape(2);
+    const auto dt = qa.dtype();
+    const auto expected_w_dt = precise_f32 ? float32 : dt;
+    const bool valid_positions =
+        pa.dtype() == int32 &&
+        ((pa.ndim() == 2 && pa.shape(0) == B && pa.shape(1) == T) ||
+         (pa.ndim() == 1 && pa.shape(0) == B));
+    if (B < 1 || B > 65535 || T < 1 || Hq < 1 || Hk < 1 ||
+        static_cast<int64_t>(Hq) + Hk > 65535 ||
+        D < 2 || D > 4096 || (D & 1) != 0 ||
+        ka.shape() != Shape{B, T, Hk, D} ||
+        qw.shape(0) != D || kw.shape(0) != D ||
+        (dt != bfloat16 && dt != float16 && dt != float32) ||
+        ka.dtype() != dt || qw.dtype() != expected_w_dt ||
+        kw.dtype() != expected_w_dt ||
+        !valid_positions ||
+        rope_dims < 0 || rope_dims > D || (rope_dims & 1) != 0 ||
+        !(rope_base > 0.0f)) {
+      return false;
+    }
+    auto stream = default_stream(Device::gpu);
+    auto outputs = array::make_arrays(
+        {Shape{B, Hq, T, D}, Shape{B, Hk, T, D}},
+        {dt, dt},
+        std::make_shared<QkNormRopeCuda>(
+            stream, eps, rope_base, rope_scale, rope_dims, precise_f32),
+        {qa, ka, qw, kw, pa});
+    *out_q = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
+    *out_k = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_qk_norm_rope_positions_cuda: %s\n", e.what());
+    return false;
+  } catch (...) {
+    std::fprintf(stderr, "mlx_qk_norm_rope_positions_cuda: unknown exception\n");
+    return false;
+  }
+#else
+  (void)q_handle; (void)k_handle; (void)q_norm_w_handle; (void)k_norm_w_handle;
+  (void)positions_handle; (void)eps; (void)rope_dims; (void)rope_base;
+  (void)rope_scale; (void)precise_f32;
   return false;
 #endif
 }

@@ -144,6 +144,7 @@ extern "C" size_t mlx_value_and_gradients(LossFunctionPtr loss_fn,
   // Note: the Rust caller also evals, but doing it here ensures the graph is
   // materialized before we extract handles (avoiding lazy-graph-across-FFI issues)
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     value.eval();
     for (auto& grad : gradients) {
       grad.eval();

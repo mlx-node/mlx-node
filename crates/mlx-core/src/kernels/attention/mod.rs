@@ -65,6 +65,153 @@ pub fn sdpa_prefill_d256(
     }
 }
 
+/// Causal FlashAttention-2 prefill fast path on CUDA (`D=256`, `Q_len >= 9`, BF16)
+/// with fused `[B, Q_len, Hq * 256]` layout and `sigmoid(gate)` epilogue.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn sdpa_prefill_d256_gated(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    gate: &MxArray,
+    head_dim: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::sdpa_prefill_d256_gated(queries, keys, values, gate, head_dim, seq_len, scale)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Unmasked small-query (`Q in 1..=16`) Flash-Decoding SDPA fast path on CUDA
+/// (`D in {128, 256}`, `GQA >= 1`, `M = gqa * Q <= 96` or two-tile `Q > 8 && gqa * 8 <= 96`, BF16).
+#[inline]
+pub(crate) fn sdpa_unmasked_few(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    head_dim: i64,
+    gqa: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::sdpa_unmasked_few(queries, keys, values, head_dim, gqa, seq_len, scale)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Masked small-query (`Q in 1..=16`) Flash-Decoding SDPA fast path on CUDA
+/// (`D in {128, 256}`, `GQA >= 1`, `M = gqa * Q <= 96` or two-tile `Q > 8 && gqa * 8 <= 96`,
+/// BF16, boolean mask).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_masked_few(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    mask: &MxArray,
+    head_dim: i64,
+    gqa: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::sdpa_masked_few(queries, keys, values, mask, head_dim, gqa, seq_len, scale)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Masked FlashAttention-2 prefill fast path on CUDA (`D=256`, `Q_len >= 9`, BF16, boolean mask).
+#[inline]
+pub(crate) fn sdpa_prefill_d256_masked(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    mask: &MxArray,
+    head_dim: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::sdpa_prefill_d256_masked(queries, keys, values, mask, head_dim, seq_len, scale)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Causal + per-key validity `[B|1, 1, 1, K]` FlashAttention-2 prefill fast
+/// path on CUDA (`D=256`, `Q_len >= 9`, `K_len >= Q_len`, BF16, boolean
+/// validity mask with diagonal self-attend for padded query rows).
+#[inline]
+pub(crate) fn sdpa_prefill_d256_causal_valid(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    valid_mask: &MxArray,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => {
+            cuda::sdpa_prefill_d256_causal_valid(queries, keys, values, valid_mask, scale)
+        }
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Masked FlashAttention-2 prefill fast path on CUDA (`D=256`, `Q_len >= 9`,
+/// BF16, boolean mask) with fused `[B, Q_len, Hq * 256]` layout and
+/// `sigmoid(gate)` epilogue.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_prefill_d256_masked_gated(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    gate: &MxArray,
+    mask: &MxArray,
+    head_dim: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::sdpa_prefill_d256_masked_gated(
+            queries, keys, values, gate, mask, head_dim, seq_len, scale,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Causal + per-key validity `[B|1, 1, 1, K]` FlashAttention-2 prefill fast
+/// path on CUDA (`D=256`, `Q_len >= 9`, `K_len >= Q_len`, BF16, boolean
+/// validity mask with diagonal self-attend for padded query rows) with fused
+/// `[B, Q_len, Hq * 256]` layout and `sigmoid(gate)` epilogue.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_prefill_d256_causal_valid_gated(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    gate: &MxArray,
+    valid_mask: &MxArray,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::sdpa_prefill_d256_causal_valid_gated(
+            queries, keys, values, gate, valid_mask, scale,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
 /// DFlash2 masked/unmasked small-query attention fast path:
 /// - Metal: `mlx_dflash2_attention_with_policy` (fail-closed on negative status).
 /// - CUDA: `mlx_sdpa_tc_few_masked_cuda` for `D in {128, 256}`, `Q in 1..=8`, BF16.
@@ -127,6 +274,42 @@ pub(crate) fn qk_norm_rope_offsets(
             queries, keys, q_weight, k_weight, offsets, eps, rope_base, rope_scale, rope_dims,
         ),
         ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Fused CUDA Q/K RMSNorm + non-traditional partial RoPE with explicit per-token
+/// `positions` (`int32[B, T]`) and optional FP32 `PreciseF32` norm.
+///
+/// Inputs: `queries` `[B, T, HQ, D]`, `keys` `[B, T, HK, D]`, `q_norm_w`/`k_norm_w` `[D]`,
+/// `positions` `int32[B, T]`. Outputs: `([B, HQ, T, D], [B, HK, T, D])`.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn qk_norm_rope_positions(
+    queries: &MxArray,
+    keys: &MxArray,
+    q_norm_w: &MxArray,
+    k_norm_w: &MxArray,
+    positions: &MxArray,
+    eps: f32,
+    rope_dims: i32,
+    rope_base: f32,
+    rope_scale: f32,
+    precise_f32: bool,
+) -> Result<Option<(MxArray, MxArray)>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::qk_norm_rope_positions(
+            queries,
+            keys,
+            q_norm_w,
+            k_norm_w,
+            positions,
+            eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            precise_f32,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
     }
 }
 

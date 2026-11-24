@@ -5,7 +5,7 @@ use crate::transformer::paged_kv_cache_adapter::PagedKVCacheAdapter;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
 use napi::bindgen_prelude::*;
 
-use super::attention::{PagedPass, PagedWaveLane, Qwen3_5Attention, RopeMode};
+use super::attention::{AttentionMask, PagedPass, PagedWaveLane, Qwen3_5Attention, RopeMode};
 use super::config::{Qwen3_5Config, Qwen35MoeParams};
 use super::gated_delta_net::GatedDeltaNet;
 use super::gdn_blob::{GdnWaveCells, gdn_wave_layer};
@@ -76,6 +76,19 @@ pub(crate) fn compute_layer_kinds(
 pub(crate) enum LayerResidual {
     Hidden(MxArray),
     Pending { h: MxArray, delta: MxArray },
+}
+
+enum ResolvedInputNorm {
+    Normed(MxArray),
+    PrequantFull {
+        x_i8: MxArray,
+        s_x: MxArray,
+    },
+    PrequantLinear {
+        normed: MxArray,
+        x_i8: MxArray,
+        s_x: MxArray,
+    },
 }
 
 impl LayerResidual {
@@ -230,6 +243,30 @@ impl MLPType {
         }
     }
 
+    pub(crate) fn can_fuse_norm_sym8_cuda(&self) -> Option<Option<&MxArray>> {
+        match self {
+            Self::Dense(mlp) => mlp.can_fuse_norm_sym8_cuda(),
+            Self::MoE(_) => None,
+        }
+    }
+
+    pub(crate) fn forward_prequantized_sym8_cuda(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        prefix_shape: &[i64],
+        out_dtype: DType,
+    ) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => {
+                mlp.forward_prequantized_sym8_cuda(x_i8, s_x, prefix_shape, out_dtype)
+            }
+            Self::MoE(_) => Err(Error::from_reason(
+                "MLPType::forward_prequantized_sym8_cuda requires a dense MLP",
+            )),
+        }
+    }
+
     pub fn wave_ready(&self, hidden: i64) -> Result<bool> {
         match self {
             Self::Dense(mlp) => mlp.wave_ready(hidden),
@@ -286,6 +323,168 @@ impl DecoderLayer {
         Ok((h, normed))
     }
 
+    fn try_sym8_norm_hadamard_quant(
+        norm: &RMSNorm,
+        h: &MxArray,
+        delta: Option<&MxArray>,
+        signs: Option<&MxArray>,
+        write_normed: bool,
+    ) -> Result<Option<crate::kernels::sym8::Sym8NormHadQuantOutput>> {
+        let w_is_f32 = if norm.is_precise_f32() {
+            true
+        } else if norm.is_native_policy() {
+            false
+        } else {
+            return Ok(None);
+        };
+        crate::kernels::sym8::add_rmsnorm_hadamard_quant(
+            h,
+            delta,
+            norm.weight(),
+            norm.eps_f32(),
+            signs,
+            write_normed,
+            w_is_f32,
+        )
+    }
+
+    /// Resolve `input` through `input_layernorm`, fusing `(optional residual add) +
+    /// RMSNorm + optional Hadamard-1024 + INT8 quant` into one CUDA kernel when
+    /// the mixer's input projections are `Sym8`-eligible.
+    fn resolve_input_norm(&self, input: LayerResidual) -> Result<(MxArray, ResolvedInputNorm)> {
+        if crate::accelerator::cuda_sym8_available() {
+            let (h_ref, delta_ref) = match &input {
+                LayerResidual::Hidden(x) => (x, None),
+                LayerResidual::Pending { h, delta } => (h, Some(delta)),
+            };
+            if h_ref.ndim()? == 3 {
+                match &self.attn {
+                    AttentionType::Full(attn) => {
+                        if let Some(signs) = attn.can_fuse_norm_sym8_cuda()?
+                            && let Some(out) = Self::try_sym8_norm_hadamard_quant(
+                                &self.input_layernorm,
+                                h_ref,
+                                delta_ref,
+                                signs,
+                                false,
+                            )?
+                        {
+                            let completed_x = match out.h_out {
+                                Some(h_out) => h_out,
+                                None => match input {
+                                    LayerResidual::Hidden(x) => x,
+                                    LayerResidual::Pending { .. } => {
+                                        return Err(Error::from_reason(
+                                            "sym8 fused input norm missing residual output",
+                                        ));
+                                    }
+                                },
+                            };
+                            return Ok((
+                                completed_x,
+                                ResolvedInputNorm::PrequantFull {
+                                    x_i8: out.x_i8,
+                                    s_x: out.s_x,
+                                },
+                            ));
+                        }
+                    }
+                    AttentionType::Linear(gdn) => {
+                        if let Some(signs) = gdn.can_fuse_norm_sym8_cuda()
+                            && let Some(out) = Self::try_sym8_norm_hadamard_quant(
+                                &self.input_layernorm,
+                                h_ref,
+                                delta_ref,
+                                signs,
+                                true,
+                            )?
+                        {
+                            let normed = out.normed_out.ok_or_else(|| {
+                                Error::from_reason(
+                                    "sym8 fused GDN input norm missing normed output",
+                                )
+                            })?;
+                            let completed_x = match out.h_out {
+                                Some(h_out) => h_out,
+                                None => match input {
+                                    LayerResidual::Hidden(x) => x,
+                                    LayerResidual::Pending { .. } => {
+                                        return Err(Error::from_reason(
+                                            "sym8 fused input norm missing residual output",
+                                        ));
+                                    }
+                                },
+                            };
+                            return Ok((
+                                completed_x,
+                                ResolvedInputNorm::PrequantLinear {
+                                    normed,
+                                    x_i8: out.x_i8,
+                                    s_x: out.s_x,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        let (x, normed) = match input {
+            LayerResidual::Hidden(x) => {
+                let normed = self.input_layernorm.forward(&x)?;
+                (x, normed)
+            }
+            LayerResidual::Pending { h, delta } => {
+                Self::add_residual_norm(&self.input_layernorm, &h, &delta)?
+            }
+        };
+        Ok((x, ResolvedInputNorm::Normed(normed)))
+    }
+
+    /// Compute `(h = x + attn_out, mlp_out)` fusing `Add + post_attention_layernorm +
+    /// optional Hadamard-1024 + INT8 quant` into one CUDA kernel on `Sym8` MLPs.
+    fn post_attention_mlp_pending(
+        &self,
+        x: &MxArray,
+        attn_out: &MxArray,
+    ) -> Result<(MxArray, MxArray)> {
+        self.post_attention_mlp_pending_with_budget(x, attn_out, None)
+    }
+
+    /// Variant of [`Self::post_attention_mlp_pending`] forwarding `row_budget`
+    /// to MoE MLPs (dense MLPs ignore `row_budget` and keep CUDA `Sym8` fusion).
+    fn post_attention_mlp_pending_with_budget(
+        &self,
+        x: &MxArray,
+        attn_out: &MxArray,
+        row_budget: Option<&MxArray>,
+    ) -> Result<(MxArray, MxArray)> {
+        if let Some(signs) = self.mlp.can_fuse_norm_sym8_cuda()
+            && let Some(out) = Self::try_sym8_norm_hadamard_quant(
+                &self.post_attention_layernorm,
+                x,
+                Some(attn_out),
+                signs,
+                false,
+            )?
+        {
+            let h = out.h_out.ok_or_else(|| {
+                Error::from_reason("sym8 fused post-attention norm missing residual output")
+            })?;
+            let shape = h.shape()?;
+            let prefix_shape = &shape[..shape.len() - 1];
+            let mlp_out = self.mlp.forward_prequantized_sym8_cuda(
+                &out.x_i8,
+                &out.s_x,
+                prefix_shape,
+                DType::BFloat16,
+            )?;
+            return Ok((h, mlp_out));
+        }
+        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, attn_out)?;
+        let mlp_out = self.mlp.forward_with_budget(&normed, row_budget)?;
+        Ok((h, mlp_out))
+    }
+
     /// Whether this layer uses linear attention (derived from attention type).
     pub fn is_linear(&self) -> bool {
         matches!(self.attn, AttentionType::Linear(_))
@@ -329,9 +528,7 @@ impl DecoderLayer {
         }
         let attn_last = attn.forward_last_row_prefill(&normed, kv_cache)?;
         let x_last = x.slice_axis(1, seq_len - 1, seq_len)?;
-        let (h, post_normed) =
-            Self::add_residual_norm(&self.post_attention_layernorm, &x_last, &attn_last)?;
-        let mlp_out = self.mlp.forward(&post_normed)?;
+        let (h, mlp_out) = self.post_attention_mlp_pending(&x_last, &attn_last)?;
         Ok(Some((x, LayerResidual::Pending { h, delta: mlp_out })))
     }
 
@@ -361,20 +558,130 @@ impl DecoderLayer {
         cache: Option<&mut Qwen3_5LayerCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out = match &self.attn {
-            AttentionType::Linear(gdn) => {
+        self.forward_batched_flat_with_mask(
+            x,
+            attn_mask.map(AttentionMask::Full),
+            linear_mask,
+            linear_lengths,
+            cache,
+            position_ids,
+        )
+    }
+
+    /// Variant of [`Self::forward_batched_flat`] accepting an explicit
+    /// [`AttentionMask`] mode for full-attention layers.
+    pub(crate) fn forward_batched_flat_with_mask(
+        &self,
+        x: &MxArray,
+        attn_mask: Option<AttentionMask<'_>>,
+        linear_mask: Option<&MxArray>,
+        linear_lengths: Option<&[i32]>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let (_, resolved) = self.resolve_input_norm(LayerResidual::Hidden(x.clone()))?;
+        let attn_out = match (&self.attn, resolved) {
+            (
+                AttentionType::Linear(gdn),
+                ResolvedInputNorm::PrequantLinear { normed, x_i8, s_x },
+            ) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_batched_masked_prequant_sym8(
+                    &normed,
+                    (&x_i8, &s_x),
+                    linear_mask,
+                    linear_lengths,
+                    ac,
+                )?
+            }
+            (AttentionType::Linear(gdn), ResolvedInputNorm::Normed(normed)) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
                 gdn.forward_batched_masked(&normed, linear_mask, linear_lengths, ac)?
             }
-            AttentionType::Full(attn) => {
+            (AttentionType::Full(attn), ResolvedInputNorm::PrequantFull { x_i8, s_x }) => {
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
-                attn.forward(&normed, attn_mask, kvc, position_ids)?
+                attn.forward_with_mask_prequant_sym8(&x_i8, &s_x, attn_mask, kvc, position_ids)?
             }
+            (AttentionType::Full(attn), ResolvedInputNorm::Normed(normed)) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_with_mask(&normed, attn_mask, kvc, position_ids)?
+            }
+            _ => unreachable!("resolve_input_norm variant always matches self.attn"),
         };
 
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        h.add(&self.mlp.forward(&normed)?)
+        let (h, mlp_out) = self.post_attention_mlp_pending(x, &attn_out)?;
+        h.add(&mlp_out)
+    }
+
+    /// Cross-layer `AddRMSNorm` variant of [`Self::forward_batched_flat`]:
+    /// resolves `input` through `input_layernorm` (fusing the previous layer's
+    /// MLP residual add into `input_layernorm` when `input` is
+    /// [`LayerResidual::Pending`]), runs the batched mixer and MLP, and returns
+    /// [`LayerResidual::Pending`] so the next layer's `input_layernorm` (or
+    /// `final_norm` after the last layer) fuses this layer's MLP residual too.
+    #[allow(dead_code)]
+    pub(crate) fn forward_batched_flat_pending(
+        &self,
+        input: LayerResidual,
+        attn_mask: Option<&MxArray>,
+        linear_mask: Option<&MxArray>,
+        linear_lengths: Option<&[i32]>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<LayerResidual> {
+        self.forward_batched_flat_pending_with_mask(
+            input,
+            attn_mask.map(AttentionMask::Full),
+            linear_mask,
+            linear_lengths,
+            cache,
+            position_ids,
+        )
+    }
+
+    /// Variant of [`Self::forward_batched_flat_pending`] accepting an explicit
+    /// [`AttentionMask`] mode for full-attention layers.
+    pub(crate) fn forward_batched_flat_pending_with_mask(
+        &self,
+        input: LayerResidual,
+        attn_mask: Option<AttentionMask<'_>>,
+        linear_mask: Option<&MxArray>,
+        linear_lengths: Option<&[i32]>,
+        cache: Option<&mut Qwen3_5LayerCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<LayerResidual> {
+        let (x, resolved) = self.resolve_input_norm(input)?;
+        let attn_out = match (&self.attn, resolved) {
+            (
+                AttentionType::Linear(gdn),
+                ResolvedInputNorm::PrequantLinear { normed, x_i8, s_x },
+            ) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_batched_masked_prequant_sym8(
+                    &normed,
+                    (&x_i8, &s_x),
+                    linear_mask,
+                    linear_lengths,
+                    ac,
+                )?
+            }
+            (AttentionType::Linear(gdn), ResolvedInputNorm::Normed(normed)) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_batched_masked(&normed, linear_mask, linear_lengths, ac)?
+            }
+            (AttentionType::Full(attn), ResolvedInputNorm::PrequantFull { x_i8, s_x }) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_with_mask_prequant_sym8(&x_i8, &s_x, attn_mask, kvc, position_ids)?
+            }
+            (AttentionType::Full(attn), ResolvedInputNorm::Normed(normed)) => {
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_with_mask(&normed, attn_mask, kvc, position_ids)?
+            }
+            _ => unreachable!("resolve_input_norm variant always matches self.attn"),
+        };
+
+        let (h, mlp_out) = self.post_attention_mlp_pending(&x, &attn_out)?;
+        Ok(LayerResidual::Pending { h, delta: mlp_out })
     }
     pub fn new(config: &Qwen3_5Config, layer_idx: usize) -> Result<Self> {
         Self::new_with_moe(config, None, layer_idx)
@@ -434,15 +741,15 @@ impl DecoderLayer {
 
     /// Post-attention half of the layer whose expert tail routes only the rows
     /// of `row_budget` (Splash `budgetsVerifyRows`). Dense MLPs ignore
-    /// `row_budget`.
+    /// `row_budget` and take the fused CUDA `Sym8` path when eligible.
     fn finish_layer_with_budget(
         &self,
         x: &MxArray,
         attn_out: MxArray,
         row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-        h.add(&self.mlp.forward_with_budget(&normed, row_budget)?)
+        let (h, mlp_out) = self.post_attention_mlp_pending_with_budget(x, &attn_out, row_budget)?;
+        h.add(&mlp_out)
     }
 
     /// Forward pass.
@@ -515,20 +822,42 @@ impl DecoderLayer {
         row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
         // Pre-norm + attention (always on full T for cache fidelity)
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out = match &mut self.attn {
-            AttentionType::Linear(gdn) => {
+        let (_, resolved) = self.resolve_input_norm(LayerResidual::Hidden(x.clone()))?;
+        let attn_out = match (&self.attn, resolved) {
+            (
+                AttentionType::Linear(gdn),
+                ResolvedInputNorm::PrequantLinear { normed, x_i8, s_x },
+            ) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_with_tape_deferred_tree_prequant_sym8(
+                    &normed,
+                    (&x_i8, &s_x),
+                    mask,
+                    ac,
+                    use_kernel,
+                    tape_sink,
+                    None,
+                    None,
+                )?
+            }
+            (AttentionType::Linear(gdn), ResolvedInputNorm::Normed(normed)) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
                 gdn.forward_with_tape(&normed, mask, ac, use_kernel, tape_sink)?
             }
-            AttentionType::Full(attn) => {
+            (AttentionType::Full(attn), ResolvedInputNorm::PrequantFull { x_i8, s_x }) => {
+                let _ = tape_sink;
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_tree_prequant_sym8(&x_i8, &s_x, mask, kvc, position_ids, None)?
+            }
+            (AttentionType::Full(attn), ResolvedInputNorm::Normed(normed)) => {
                 // Full-attention layers do not record a GDN tape.
                 let _ = tape_sink;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
                 attn.forward(&normed, mask, kvc, position_ids)?
             }
+            _ => unreachable!("resolve_input_norm variant always matches self.attn"),
         };
-        // Residual + post-attention norm (fused add_rmsnorm when eligible)
+        // Residual + post-attention norm + MLP (fused on CUDA Sym8 when eligible; MoE honors row_budget)
         self.finish_layer_with_budget(x, attn_out, row_budget)
     }
 
@@ -577,17 +906,25 @@ impl DecoderLayer {
         cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<(MxArray, LayerResidual)> {
-        let (x, normed) = match input {
-            LayerResidual::Hidden(x) => {
-                let normed = self.input_layernorm.forward(&x)?;
-                (x, normed)
+        let (x, resolved) = self.resolve_input_norm(input)?;
+        let attn_out = match (&self.attn, resolved) {
+            (
+                AttentionType::Linear(gdn),
+                ResolvedInputNorm::PrequantLinear { normed, x_i8, s_x },
+            ) => {
+                let ac = cache.and_then(|c| c.as_arrays_cache_mut());
+                gdn.forward_with_tape_deferred_tree_prequant_sym8(
+                    &normed,
+                    (&x_i8, &s_x),
+                    mask,
+                    ac,
+                    use_kernel,
+                    tape_sink,
+                    cuda_deferred,
+                    tree,
+                )?
             }
-            LayerResidual::Pending { h, delta } => {
-                Self::add_residual_norm(&self.input_layernorm, &h, &delta)?
-            }
-        };
-        let attn_out = match &mut self.attn {
-            AttentionType::Linear(gdn) => {
+            (AttentionType::Linear(gdn), ResolvedInputNorm::Normed(normed)) => {
                 let ac = cache.and_then(|c| c.as_arrays_cache_mut());
                 gdn.forward_with_tape_deferred_tree(
                     &normed,
@@ -599,15 +936,21 @@ impl DecoderLayer {
                     tree,
                 )?
             }
-            AttentionType::Full(attn) => {
+            (AttentionType::Full(attn), ResolvedInputNorm::PrequantFull { x_i8, s_x }) => {
+                let _ = tape_sink;
+                let _ = cuda_deferred;
+                let kvc = cache.and_then(|c| c.as_kv_cache_mut());
+                attn.forward_tree_prequant_sym8(&x_i8, &s_x, mask, kvc, position_ids, tree)?
+            }
+            (AttentionType::Full(attn), ResolvedInputNorm::Normed(normed)) => {
                 let _ = tape_sink;
                 let _ = cuda_deferred;
                 let kvc = cache.and_then(|c| c.as_kv_cache_mut());
                 attn.forward_tree(&normed, mask, kvc, position_ids, tree)?
             }
+            _ => unreachable!("resolve_input_norm variant always matches self.attn"),
         };
-        let (h, normed) = Self::add_residual_norm(&self.post_attention_layernorm, &x, &attn_out)?;
-        let mlp_out = self.mlp.forward(&normed)?;
+        let (h, mlp_out) = self.post_attention_mlp_pending(&x, &attn_out)?;
         Ok((x, LayerResidual::Pending { h, delta: mlp_out }))
     }
 
@@ -1212,13 +1555,29 @@ impl DecoderLayer {
         up_proj: QuantizedLinear,
         down_proj: QuantizedLinear,
     ) -> Result<()> {
+        self.set_quantized_dense_mlp_with_merge(gate_proj, up_proj, down_proj, true)
+    }
+
+    /// Like [`Self::set_quantized_dense_mlp`], with `merge_gate_up=false` to
+    /// skip the GPU `concat_rows` merge when preserving host-backed overflow
+    /// projections on discrete CUDA GPUs.
+    pub(crate) fn set_quantized_dense_mlp_with_merge(
+        &mut self,
+        gate_proj: QuantizedLinear,
+        up_proj: QuantizedLinear,
+        down_proj: QuantizedLinear,
+        merge_gate_up: bool,
+    ) -> Result<()> {
         self.mlp = MLPType::Dense(MLPVariant::Quantized {
             gate_proj,
             up_proj,
             down_proj,
             gate_up: None,
         });
-        self.mlp.finalize_gate_up()
+        if merge_gate_up {
+            self.mlp.finalize_gate_up()?;
+        }
+        Ok(())
     }
 
     /// Whether any main-model projection in this decoder layer is quantized.

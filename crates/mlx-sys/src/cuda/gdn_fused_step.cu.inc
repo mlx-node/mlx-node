@@ -101,9 +101,9 @@ template <bool BETA_BF16, bool SIGMOID_GATE>
 __global__ __launch_bounds__(1024, 1) void mlx_gdn_fused_step_cuda_kernel(
     const nv_bfloat16* __restrict__ q, const nv_bfloat16* __restrict__ k,
     const nv_bfloat16* __restrict__ v, const float* __restrict__ g,
-    const void* __restrict__ beta, const float* __restrict__ state,
+    const void* __restrict__ beta, const float* state,
     const nv_bfloat16* __restrict__ z, const void* __restrict__ w,
-    nv_bfloat16* __restrict__ out, float* __restrict__ state_out,
+    nv_bfloat16* __restrict__ out, float* state_out,
     int T, int Hk, int Hv, long long z_stride_b,
     long long z_stride_t, float eps, int tiled_heads, int w_is_f32) {
   constexpr int D = 128;

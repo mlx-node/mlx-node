@@ -419,6 +419,149 @@ pub fn fill_batch_allowed_bitmasks(
     Ok(out)
 }
 
+#[inline]
+fn copy_bitmask_row(bits: &[u32], row_dst: &mut [u32]) {
+    let copy_len = bits.len().min(row_dst.len());
+    row_dst[..copy_len].copy_from_slice(&bits[..copy_len]);
+    if copy_len < row_dst.len() {
+        row_dst[copy_len..].fill(0);
+    }
+}
+
+/// Compute compact flat `[active_rows.len(), mask_words]` `u32` allowed-token
+/// bitmasks into reusable buffer `dst`.
+///
+/// `active_rows` maps each local batch slot `slot in 0..active_rows.len()` to
+/// its original matcher index `orig = active_rows[slot]` in `matchers`.
+/// Only slots with `row_active[slot] == true` invoke the grammar matcher;
+/// inactive slots have their `mask_words` slice zeroed.
+///
+/// Runs inline when `live_count <= 2` to avoid OS thread-spawn overhead, and
+/// uses `std::thread::scope` when `live_count >= 3`.
+pub fn fill_batch_allowed_bitmasks_flat(
+    matchers: &mut [GrammarMatcher],
+    active_rows: &[usize],
+    row_active: &[bool],
+    dst: &mut Vec<u32>,
+    mask_words: usize,
+) -> Result<()> {
+    if row_active.len() != active_rows.len() {
+        return Err(ClairicError::from_reason(format!(
+            "row_active length {} != active_rows length {}",
+            row_active.len(),
+            active_rows.len()
+        )));
+    }
+    let total_words = active_rows.len().checked_mul(mask_words).ok_or_else(|| {
+        ClairicError::from_reason("fill_batch_allowed_bitmasks_flat buffer size overflow")
+    })?;
+    dst.resize(total_words, 0);
+    if active_rows.is_empty() {
+        return Ok(());
+    }
+
+    // Validate indices and reject duplicates before splitting mutable borrows.
+    let mut slot_for_orig: Vec<Option<usize>> = vec![None; matchers.len()];
+    let mut live_count = 0usize;
+    for (slot, (&orig, &is_active)) in active_rows.iter().zip(row_active.iter()).enumerate() {
+        if orig >= matchers.len() {
+            return Err(ClairicError::from_reason(format!(
+                "active_rows[{slot}] = {orig} out of bounds for matchers length {}",
+                matchers.len()
+            )));
+        }
+        if slot_for_orig[orig].replace(slot).is_some() {
+            return Err(ClairicError::from_reason(format!(
+                "duplicate matcher index {orig} in active_rows"
+            )));
+        }
+        if is_active {
+            live_count += 1;
+        }
+    }
+
+    if mask_words == 0 {
+        return Ok(());
+    }
+    if live_count == 0 {
+        dst.fill(0);
+        return Ok(());
+    }
+
+    let max_threads = if live_count <= 2 {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1)
+            .min(live_count)
+    };
+
+    if max_threads <= 1 {
+        for ((&orig, &is_active), row_dst) in active_rows
+            .iter()
+            .zip(row_active.iter())
+            .zip(dst.chunks_exact_mut(mask_words))
+        {
+            if is_active {
+                let bits = matchers[orig].compute_allowed_bitmask()?;
+                copy_bitmask_row(&bits, row_dst);
+            } else {
+                row_dst.fill(0);
+            }
+        }
+        return Ok(());
+    }
+
+    // Split `dst` into disjoint per-slot slices, zero inactive slots, and pair
+    // each live slot with its corresponding `&mut GrammarMatcher` in safe Rust.
+    let mut row_slices: Vec<Option<&mut [u32]>> =
+        dst.chunks_exact_mut(mask_words).map(Some).collect();
+    for (slot, &is_active) in row_active.iter().enumerate() {
+        if !is_active && let Some(row_dst) = row_slices[slot].take() {
+            row_dst.fill(0);
+        }
+    }
+
+    let mut work: Vec<(&mut GrammarMatcher, &mut [u32])> = Vec::with_capacity(live_count);
+    for (orig, matcher) in matchers.iter_mut().enumerate() {
+        if let Some(slot) = slot_for_orig[orig]
+            && let Some(row_dst) = row_slices[slot].take()
+        {
+            work.push((matcher, row_dst));
+        }
+    }
+
+    let chunk_size = work.len().div_ceil(max_threads);
+    let results: Vec<Result<()>> = std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(max_threads);
+        for chunk in work.chunks_mut(chunk_size) {
+            handles.push(scope.spawn(move || -> Result<()> {
+                for (matcher, row_dst) in chunk {
+                    let bits = matcher.compute_allowed_bitmask()?;
+                    copy_bitmask_row(&bits, row_dst);
+                }
+                Ok(())
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|h| match h.join() {
+                Ok(r) => r,
+                Err(_) => Err(ClairicError::from_reason(
+                    "Worker thread panicked during fill_batch_allowed_bitmasks_flat",
+                )),
+            })
+            .collect()
+    });
+
+    for res in results {
+        res?;
+    }
+
+    Ok(())
+}
+
 /// Apply compact `u32` `bitmask` directly over `logits` without allocating a
 /// full-vocab copy or `log_probs` buffer.
 ///
@@ -976,5 +1119,114 @@ mod tests {
         assert!(!batch[0].is_empty());
         assert!(batch[1].is_empty(), "inactive row must be skipped");
         assert_eq!(batch[0], batch[2]);
+    }
+
+    #[test]
+    fn fill_batch_allowed_bitmasks_flat_matches_per_row_and_reuses_buffer() {
+        let engine = load_clef_engine();
+        let mask_words = engine.vocab_size().div_ceil(32);
+        let specs = [
+            GrammarSpec::JsonSchema(json!({"type": "boolean"})),
+            GrammarSpec::JsonSchema(json!({"type": "number"})),
+            GrammarSpec::JsonSchema(json!({"type": "string"})),
+            GrammarSpec::GroundedText {
+                source: "hello world".to_string(),
+                normalized_source: None,
+                nullable: true,
+            },
+        ];
+        let mut matchers_flat: Vec<GrammarMatcher> = specs
+            .iter()
+            .map(|s| engine.compile(s).expect("compile flat"))
+            .collect();
+        let mut matchers_ref: Vec<GrammarMatcher> = specs
+            .iter()
+            .map(|s| engine.compile(s).expect("compile ref"))
+            .collect();
+
+        // Parallel path (live_count == 3 >= 3) with one inactive row.
+        let mut dst = vec![u32::MAX; 4 * mask_words];
+        let row_active = [true, false, true, true];
+        fill_batch_allowed_bitmasks_flat(
+            &mut matchers_flat,
+            &[0, 1, 2, 3],
+            &row_active,
+            &mut dst,
+            mask_words,
+        )
+        .expect("flat parallel");
+        let ref_masks =
+            fill_batch_allowed_bitmasks(&mut matchers_ref, &row_active).expect("ref parallel");
+        assert_eq!(dst.len(), 4 * mask_words);
+        for slot in 0..4 {
+            let row = &dst[slot * mask_words..(slot + 1) * mask_words];
+            if row_active[slot] {
+                assert_eq!(row, ref_masks[slot].as_slice(), "slot {slot} mismatch");
+            } else {
+                assert!(
+                    row.iter().all(|&w| w == 0),
+                    "inactive slot {slot} must be zeroed"
+                );
+            }
+        }
+
+        // Inline path (live_count == 2 <= 2) over a compacted subset reusing `dst`.
+        let cap_before = dst.capacity();
+        fill_batch_allowed_bitmasks_flat(
+            &mut matchers_flat,
+            &[3, 0],
+            &[true, true],
+            &mut dst,
+            mask_words,
+        )
+        .expect("flat compacted inline");
+        assert_eq!(dst.len(), 2 * mask_words);
+        assert_eq!(dst.capacity(), cap_before);
+        assert_eq!(&dst[..mask_words], ref_masks[3].as_slice());
+        assert_eq!(&dst[mask_words..2 * mask_words], ref_masks[0].as_slice());
+
+        // Single active row with previously dirty slot zeroed cleanly.
+        fill_batch_allowed_bitmasks_flat(
+            &mut matchers_flat,
+            &[0, 2],
+            &[false, true],
+            &mut dst,
+            mask_words,
+        )
+        .expect("flat single active");
+        assert!(dst[..mask_words].iter().all(|&w| w == 0));
+        assert_eq!(&dst[mask_words..2 * mask_words], ref_masks[2].as_slice());
+
+        // Validation errors.
+        assert!(
+            fill_batch_allowed_bitmasks_flat(
+                &mut matchers_flat,
+                &[0, 0],
+                &[true, true],
+                &mut dst,
+                mask_words
+            )
+            .is_err()
+        );
+        assert!(
+            fill_batch_allowed_bitmasks_flat(
+                &mut matchers_flat,
+                &[99],
+                &[true],
+                &mut dst,
+                mask_words
+            )
+            .is_err()
+        );
+        assert!(
+            fill_batch_allowed_bitmasks_flat(
+                &mut matchers_flat,
+                &[0],
+                &[true, false],
+                &mut dst,
+                mask_words
+            )
+            .is_err()
+        );
     }
 }

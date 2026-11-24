@@ -8,6 +8,7 @@ pub mod ar_engine;
 pub mod head;
 #[cfg(test)]
 mod orchestrator_tests;
+pub(crate) mod persistent_cache;
 
 pub use mlx_clairic::{
     ar, completion, contracts, crops, decimal_util, embedded, errors, grounding, head_config,

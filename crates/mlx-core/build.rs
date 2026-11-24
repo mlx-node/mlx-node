@@ -25,6 +25,7 @@ fn build_ggml_kquant_reference() {
     let mut build = cc::Build::new();
     let no_contraction = if build.get_compiler().is_like_msvc() {
         build.flag("/utf-8");
+        build.flag("/wd4244");
         "/fp:strict"
     } else {
         "-ffp-contract=off"

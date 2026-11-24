@@ -28,7 +28,8 @@ use crate::utils::gguf_cpu_repack::{
     copy_dense_band_into, cpu_kquant_band_into, decode_affine_band_into,
 };
 use crate::utils::gguf_gpu::{
-    GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for, gpu_repack_available, gpu_repack_band,
+    CudaDeviceBudget, GpuRepackKind, RepackDst, band_offset_rule, gpu_kind_for,
+    gpu_repack_available, gpu_repack_band,
 };
 use crate::utils::gguf_plan::{ImportOptions, ImportPlan};
 use crate::utils::gguf_read::{
@@ -255,6 +256,10 @@ fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> 
 enum Dst {
     Empty,
     Consumed,
+    GpuRepack {
+        dst: Option<RepackDst>,
+        k: usize,
+    },
     Repack {
         dst: Option<RepackDst>,
         ptrs: DstPtrs,
@@ -592,13 +597,28 @@ impl Seek for OffsetReader<'_> {
     }
 }
 
-fn alloc_dst(t: &GgufTensorInfo, route: Route, probe: &ImportProbe) -> Result<Dst> {
+fn alloc_dst(
+    t: &GgufTensorInfo,
+    route: Route,
+    probe: &ImportProbe,
+    budget: &CudaDeviceBudget,
+) -> Result<Dst> {
     Ok(match route {
-        Route::Gpu(_, layout) | Route::CpuKQuant(layout) => {
-            let (dst, ptrs) = match route {
-                Route::Gpu(kind, _) => RepackDst::alloc_for_kind(t, kind, layout)?,
-                _ => RepackDst::alloc(t, layout)?,
-            };
+        Route::Gpu(kind, layout) => {
+            let (dst, meta) = RepackDst::alloc_gpu_for_kind_with_budget(t, kind, layout, budget)?;
+            for a in std::iter::once(&dst.weight)
+                .chain(dst.scales.as_ref())
+                .chain(dst.biases.as_ref())
+            {
+                probe.alloc(a.nbytes());
+            }
+            Dst::GpuRepack {
+                dst: Some(dst),
+                k: meta.k,
+            }
+        }
+        Route::CpuKQuant(layout) => {
+            let (dst, ptrs) = RepackDst::alloc(t, layout)?;
             for a in std::iter::once(&dst.weight)
                 .chain(dst.scales.as_ref())
                 .chain(dst.biases.as_ref())
@@ -610,7 +630,7 @@ fn alloc_dst(t: &GgufTensorInfo, route: Route, probe: &ImportProbe) -> Result<Ds
                 ptrs,
             }
         }
-        Route::CpuAffine => alloc_dst(t, Route::CpuKQuant(OutLayout::RowMajor), probe)?,
+        Route::CpuAffine => alloc_dst(t, Route::CpuKQuant(OutLayout::RowMajor), probe, budget)?,
         Route::Dense(dtype) => {
             let (array, ptr, bytes) = MxArray::alloc_uninit(&t.mlx_shape(), dtype)?;
             probe.alloc(bytes);
@@ -657,7 +677,7 @@ fn collect_tensor(
     ple_shards: &mut Option<(String, Vec<MxArray>, usize)>,
 ) -> Result<()> {
     match dst {
-        Dst::Repack { dst: Some(dst), .. } => {
+        Dst::GpuRepack { dst: Some(dst), .. } | Dst::Repack { dst: Some(dst), .. } => {
             let prefix = t.name.strip_suffix(".weight").unwrap_or(&t.name);
             let RepackDst {
                 weight,
@@ -687,7 +707,10 @@ fn collect_tensor(
         }
         Dst::Done(arrays) => map.extend(arrays),
         Dst::Consumed => {}
-        Dst::Empty | Dst::Whole(_) | Dst::Repack { dst: None, .. } => {
+        Dst::Empty
+        | Dst::Whole(_)
+        | Dst::GpuRepack { dst: None, .. }
+        | Dst::Repack { dst: None, .. } => {
             return Err(Error::from_reason(format!(
                 "GGUF tensor '{}' was not fully read",
                 t.name
@@ -698,6 +721,8 @@ fn collect_tensor(
 }
 
 type TensorConsumer<'a> = dyn FnMut(HashMap<String, MxArray>) -> Result<()> + 'a;
+type ClefTensorConsumer<'a> =
+    dyn FnMut(HashMap<String, MxArray>, &CudaDeviceBudget) -> Result<()> + 'a;
 
 /// Groups become available only after their last window's GPU and CPU work
 /// completes. Moving their destinations out lets subsequent reads reuse the
@@ -758,6 +783,7 @@ impl ConsumeGroups<'_> {
 }
 
 /// Read every tensor of `h` into its final arrays (model thread only).
+#[cfg(test)]
 pub(crate) fn read_gguf_tensors(
     h: &GgufFileHandle,
     plan: &ImportPlan,
@@ -777,6 +803,7 @@ pub(crate) fn read_gguf_tensors(
 
 /// [`read_gguf_tensors`] reading through `src` (the handle's file, or a test
 /// double over it) with explicit ring / pool sizes.
+#[cfg(test)]
 pub(crate) fn read_gguf_tensors_with(
     src: &dyn ReadAt,
     h: &GgufFileHandle,
@@ -786,7 +813,8 @@ pub(crate) fn read_gguf_tensors_with(
     cfg: &ReadConfig,
     probe: &ImportProbe,
 ) -> Result<RawTensors> {
-    read_gguf_tensors_consuming(src, h, plan, backend, mode, cfg, probe, None)
+    let budget = CudaDeviceBudget::for_current_device();
+    read_gguf_tensors_consuming(src, h, plan, backend, mode, cfg, probe, None, &budget)
 }
 
 fn read_gguf_tensors_consuming(
@@ -798,6 +826,7 @@ fn read_gguf_tensors_consuming(
     cfg: &ReadConfig,
     probe: &ImportProbe,
     mut consumer: Option<&mut ConsumeGroups<'_>>,
+    budget: &CudaDeviceBudget,
 ) -> Result<RawTensors> {
     let started = Instant::now();
     let header: &GgufFile = &h.header;
@@ -810,16 +839,20 @@ fn read_gguf_tensors_consuming(
     let windows = plan_reads(header, h.len, cfg.slot_bytes, &|i| routes[i].row_multiple())?;
 
     let mut bands = vec![0usize; header.tensors.len()];
-    for b in windows.iter().flat_map(|w| &w.bands) {
-        bands[b.tensor] += 1;
-        if let Route::Gpu(kind, layout) = routes[b.tensor]
-            && !b.src_off.is_multiple_of(band_offset_rule(kind))
-        {
-            routes[b.tensor] = if kind.is_kquant() {
-                Route::CpuKQuant(layout)
-            } else {
-                Route::CpuAffine
-            };
+    let mut tensor_last_window = vec![0usize; header.tensors.len()];
+    for (w, window) in windows.iter().enumerate() {
+        for b in &window.bands {
+            bands[b.tensor] += 1;
+            tensor_last_window[b.tensor] = w;
+            if let Route::Gpu(kind, layout) = routes[b.tensor]
+                && !b.src_off.is_multiple_of(band_offset_rule(kind))
+            {
+                routes[b.tensor] = if kind.is_kquant() {
+                    Route::CpuKQuant(layout)
+                } else {
+                    Route::CpuAffine
+                };
+            }
         }
     }
     if let Some(i) = bands.iter().position(|&n| n == 0) {
@@ -827,6 +860,12 @@ fn read_gguf_tensors_consuming(
             "GGUF tensor '{}' has no data to read",
             header.tensors[i].name
         )));
+    }
+    let mut last_window = vec![Vec::new(); windows.len()];
+    for (i, (&route, &w)) in routes.iter().zip(&tensor_last_window).enumerate() {
+        if matches!(route, Route::CpuKQuant(_) | Route::CpuAffine) {
+            last_window[w].push(i);
+        }
     }
     if let Some(consumer) = consumer.as_mut() {
         consumer.plan(&windows, header.tensors.len())?;
@@ -913,10 +952,12 @@ fn read_gguf_tensors_consuming(
             pool: &pool,
             guard: &mut guard,
             windows: &windows,
+            last_window: &last_window,
             header,
             plan,
             cfg,
             probe,
+            budget,
         };
         run.all(consumer)
     })?;
@@ -957,10 +998,12 @@ struct Run<'r, 's, 'p> {
     pool: &'r CpuPool,
     guard: &'r mut ImportGuard<'p>,
     windows: &'r [Window],
+    last_window: &'r [Vec<usize>],
     header: &'r GgufFile,
     plan: &'r ImportPlan,
     cfg: &'r ReadConfig,
     probe: &'r ImportProbe,
+    budget: &'r CudaDeviceBudget,
 }
 
 impl Run<'_, '_, '_> {
@@ -977,6 +1020,95 @@ impl Run<'_, '_, '_> {
         MxArray::eval_arrays_with_context(&refs, "GGUF repack window")?;
         self.pool.wait_window(w)?;
         self.probe.event(ImportEvent::Completed(w));
+        Ok(())
+    }
+
+    /// Promote finished `CpuKQuant` / `CpuAffine` tensors from window `w` to
+    /// CUDA device memory (`device >= 0`) within `self.budget`, releasing their
+    /// `device == -1` host buffers back into `host_buffer_cache_` for reuse by
+    /// subsequent windows.
+    fn promote_finished_cpu_repacks(&mut self, w: usize) -> Result<()> {
+        if !crate::accelerator::cuda_ops_available() || self.budget.is_exhausted() {
+            return Ok(());
+        }
+        let Some(indices) = self.last_window.get(w) else {
+            return Ok(());
+        };
+        for &i in indices {
+            if self.budget.is_exhausted() {
+                break;
+            }
+            let state = &mut self.guard.states[i];
+            if state.bands_left != 0 {
+                continue;
+            }
+            if let Dst::Repack {
+                dst: Some(repack), ..
+            } = &mut state.dst
+            {
+                let w_bytes = repack.weight.cuda_host_bytes() as u64;
+                let s_bytes = repack
+                    .scales
+                    .as_ref()
+                    .map_or(0, |s| s.cuda_host_bytes() as u64);
+                let b_bytes = repack
+                    .biases
+                    .as_ref()
+                    .map_or(0, |b| b.cuda_host_bytes() as u64);
+                let Some(total_bytes) = w_bytes
+                    .checked_add(s_bytes)
+                    .and_then(|v| v.checked_add(b_bytes))
+                else {
+                    continue;
+                };
+                if total_bytes == 0 || !self.budget.try_reserve(total_bytes) {
+                    continue;
+                }
+                let mut allocated = 0u64;
+                let promote_part =
+                    |arr: &mut MxArray, bytes: u64, allocated: &mut u64| -> Result<bool> {
+                        if bytes == 0 {
+                            return Ok(true);
+                        }
+                        match arr.ensure_cuda_device() {
+                            Ok(Some(dev)) => {
+                                *arr = dev;
+                                *allocated = allocated.saturating_add(bytes);
+                                Ok(true)
+                            }
+                            Ok(None) => Ok(false),
+                            Err(err) => Err(err),
+                        }
+                    };
+                let step = (|| -> Result<bool> {
+                    if !promote_part(&mut repack.weight, w_bytes, &mut allocated)? {
+                        return Ok(false);
+                    }
+                    if let Some(scales) = repack.scales.as_mut()
+                        && !promote_part(scales, s_bytes, &mut allocated)?
+                    {
+                        return Ok(false);
+                    }
+                    if let Some(biases) = repack.biases.as_mut()
+                        && !promote_part(biases, b_bytes, &mut allocated)?
+                    {
+                        return Ok(false);
+                    }
+                    Ok(true)
+                })();
+                match step {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        self.budget.mark_exhausted();
+                        break;
+                    }
+                    Err(err) => {
+                        self.budget.release(total_bytes.saturating_sub(allocated));
+                        return Err(err);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1001,6 +1133,7 @@ impl Run<'_, '_, '_> {
         for w in 0..n {
             if w > 0 {
                 self.complete(w - 1, &std::mem::take(&mut pending))?;
+                self.promote_finished_cpu_repacks(w - 1)?;
                 if let Some(consumer) = consumer.as_mut() {
                     consumer.complete(w - 1, self.header, &mut self.guard.states)?;
                 }
@@ -1022,6 +1155,7 @@ impl Run<'_, '_, '_> {
         }
         self.complete(n - 1, &pending)?;
         drop(pending);
+        self.promote_finished_cpu_repacks(n - 1)?;
         if let Some(consumer) = consumer.as_mut() {
             consumer.complete(n - 1, self.header, &mut self.guard.states)?;
         }
@@ -1053,12 +1187,12 @@ impl Run<'_, '_, '_> {
             let t = &header.tensors[band.tensor];
             let state = &mut self.guard.states[band.tensor];
             if matches!(state.dst, Dst::Empty) {
-                state.dst = alloc_dst(t, state.route, self.probe)?;
+                state.dst = alloc_dst(t, state.route, self.probe, self.budget)?;
             }
             let src = SendPtr(base.0.wrapping_add(band.src_off));
             let row_bytes = band.bytes / band.rows;
             match (state.route, &mut state.dst) {
-                (Route::Gpu(kind, layout), Dst::Repack { dst, ptrs }) => {
+                (Route::Gpu(kind, layout), Dst::GpuRepack { dst, k }) => {
                     let current = dst.take().ok_or_else(|| {
                         Error::from_reason(format!("GGUF tensor '{}' lost its arrays", t.name))
                     })?;
@@ -1070,7 +1204,7 @@ impl Run<'_, '_, '_> {
                         band.src_off as u64,
                         kind,
                         layout,
-                        u32_of(ptrs.k, t)?,
+                        u32_of(*k, t)?,
                         u32_of(row0, t)?,
                         u32_of(rows, t)?,
                         current,
@@ -1491,14 +1625,77 @@ fn eval_lazy<'a>(arrays: impl Iterator<Item = &'a MxArray>) -> Result<()> {
     MxArray::eval_arrays_with_context(&batch, "GGUF import transform")
 }
 
-/// Copy `views` into contiguous storage, then evaluate every lazy array.
-fn materialize(map: &mut HashMap<String, MxArray>, views: &HashSet<String>) -> Result<()> {
+/// Promoted CUDA byte threshold before clearing MLX's host buffer cache.
+const CUDA_PROMOTE_FLUSH_BYTES: usize = 256 << 20;
+
+/// Promote a settled `device == -1` array to CUDA device memory (`device >= 0`)
+/// within `budget`, clearing MLX's host buffer cache and refreshing live VRAM
+/// every 256 MiB of promoted bytes so freed pinned-host buffers do not balloon
+/// peak RAM and external GPU allocations cannot erode the reserve.
+///
+/// Returns `Ok(true)` if the caller should continue checking later arrays, or
+/// `Ok(false)` if the CUDA device budget is exhausted and promotion should stop.
+fn promote_array_with_budget(
+    arr: &mut MxArray,
+    promoted_bytes: &mut usize,
+    budget: &CudaDeviceBudget,
+) -> Result<bool> {
+    if budget.is_exhausted() {
+        return Ok(false);
+    }
+    let host_bytes = arr.cuda_host_bytes();
+    if host_bytes == 0 {
+        return Ok(true);
+    }
+    let host_bytes_u64 = host_bytes as u64;
+    if !budget.try_reserve(host_bytes_u64) {
+        return Ok(!budget.is_exhausted());
+    }
+    match arr.ensure_cuda_device() {
+        Ok(Some(dev)) => {
+            *arr = dev;
+            *promoted_bytes = promoted_bytes.saturating_add(host_bytes);
+            if *promoted_bytes >= CUDA_PROMOTE_FLUSH_BYTES {
+                clear_cache();
+                *promoted_bytes = 0;
+                budget.refresh_from_free();
+            }
+            Ok(!budget.is_exhausted())
+        }
+        Ok(None) => {
+            budget.mark_exhausted();
+            Ok(false)
+        }
+        Err(err) => {
+            budget.release(host_bytes_u64);
+            Err(err)
+        }
+    }
+}
+
+/// Copy `views` into contiguous storage, evaluate every lazy array, and on CUDA
+/// promote any remaining pinned-host arrays to GPU device memory within `budget`.
+fn materialize(
+    map: &mut HashMap<String, MxArray>,
+    views: &HashSet<String>,
+    budget: &CudaDeviceBudget,
+) -> Result<()> {
     for key in views {
         if let Some(a) = map.get_mut(key) {
             *a = a.deep_copy()?;
         }
     }
-    eval_lazy(map.values())
+    eval_lazy(map.values())?;
+    if crate::accelerator::cuda_ops_available() {
+        budget.refresh_from_free();
+        let mut promoted_bytes = 0usize;
+        for arr in map.values_mut() {
+            if !promote_array_with_budget(arr, &mut promoted_bytes, budget)? {
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// One GGUF file of a preload: path, the header parsed at prepare, the
@@ -1578,6 +1775,9 @@ pub(crate) struct GgufPreload {
     #[cfg(test)]
     pub identity: GgufIdentity,
     pub stats: LoadStats,
+    /// Shared CUDA device-memory budget used during preload, carried into
+    /// downstream weight installation and post-load residency passes.
+    pub(crate) cuda_budget: Option<CudaDeviceBudget>,
 }
 
 fn add_stats(total: &mut LoadStats, part: &LoadStats) {
@@ -1614,7 +1814,7 @@ impl GgufPreload {
     /// the complete decision head still take the ordinary preload path.
     pub(crate) fn load_clef(
         input: &PreloadInput,
-        consume: &mut TensorConsumer<'_>,
+        consume: &mut ClefTensorConsumer<'_>,
     ) -> Result<Self> {
         Self::load_consuming(input, RepackBackend::Auto, Some(consume))
     }
@@ -1622,7 +1822,7 @@ impl GgufPreload {
     fn load_consuming(
         input: &PreloadInput,
         backend: RepackBackend,
-        mut consume: Option<&mut TensorConsumer<'_>>,
+        mut consume: Option<&mut ClefTensorConsumer<'_>>,
     ) -> Result<Self> {
         let started = Instant::now();
         let mode = PageCacheMode::from_env()?;
@@ -1666,14 +1866,17 @@ impl GgufPreload {
                 }
             }
         }
+        let budget = CudaDeviceBudget::for_current_device();
         let mut transform = |map| {
             let mut imported =
                 transform_imported_part(map, main_header, main_plan, &input.opts, false)?;
-            materialize(&mut imported.weights, &imported.views)?;
+            materialize(&mut imported.weights, &imported.views, &budget)?;
             match consume.as_deref_mut() {
-                Some(consume) => consume(imported.weights),
+                Some(consume) => consume(imported.weights, &budget)?,
                 None => unreachable!("consumer groups require a callback"),
             }
+            budget.refresh_from_free();
+            Ok(())
         };
         let mut consumer = ConsumeGroups {
             groups: groups.into_values().collect(),
@@ -1700,6 +1903,7 @@ impl GgufPreload {
                 &read_config,
                 &main_probe,
                 consumer.as_deref_mut(),
+                &budget,
             )?;
             if index == 0 {
                 stats = raw.stats.clone();
@@ -1724,7 +1928,7 @@ impl GgufPreload {
             clef_head,
             views,
         } = transform_imported(raw_map, main_header, main_plan, &input.opts)?;
-        materialize(&mut main, &views)?;
+        materialize(&mut main, &views, &budget)?;
 
         let clef_head = match clef_head {
             Some((mut head, config)) => {
@@ -1733,7 +1937,7 @@ impl GgufPreload {
                     .filter(|(_, a)| !is_available(a))
                     .map(|(k, _)| k.clone())
                     .collect();
-                materialize(&mut head, &lazy)?;
+                materialize(&mut head, &lazy, &budget)?;
                 Some((head, config))
             }
             None => None,
@@ -1748,7 +1952,7 @@ impl GgufPreload {
                         ))
                     },
                 )?;
-                let shards = shards
+                let mut shards = shards
                     .into_iter()
                     .map(
                         |shard| match dtype_pass_target(&key, &shard, main_plan, &input.opts)? {
@@ -1758,6 +1962,15 @@ impl GgufPreload {
                     )
                     .collect::<Result<Vec<_>>>()?;
                 eval_lazy(shards.iter())?;
+                if crate::accelerator::cuda_ops_available() {
+                    budget.refresh_from_free();
+                    let mut promoted_bytes = 0usize;
+                    for shard in &mut shards {
+                        if !promote_array_with_budget(shard, &mut promoted_bytes, &budget)? {
+                            break;
+                        }
+                    }
+                }
                 Some((shards, rows_per_shard))
             }
             None => None,
@@ -1765,11 +1978,21 @@ impl GgufPreload {
 
         let mut companion_map = HashMap::new();
         if let (Some(handle), Some((_, header, _, plan))) = (&set.companion, companion) {
-            let raw = read_gguf_tensors(handle, plan, backend, mode)?;
+            let raw = read_gguf_tensors_consuming(
+                &handle.file,
+                handle,
+                plan,
+                backend,
+                mode,
+                &ReadConfig::default(),
+                &ImportProbe::default(),
+                None,
+                &budget,
+            )?;
             add_stats(&mut stats, &raw.stats);
             let imported = transform_imported(raw.map, header, plan, &input.opts)?;
             companion_map = imported.weights;
-            materialize(&mut companion_map, &imported.views)?;
+            materialize(&mut companion_map, &imported.views, &budget)?;
         }
 
         set.recheck()?;
@@ -1785,6 +2008,7 @@ impl GgufPreload {
             #[cfg(test)]
             identity: input.identity(),
             stats,
+            cuda_budget: Some(budget),
         })
     }
 }
@@ -2256,6 +2480,7 @@ mod tests {
                 ready: Vec::new(),
                 consume: &mut consume,
             };
+            let budget = CudaDeviceBudget::for_current_device();
             let raw = read_gguf_tensors_consuming(
                 &fx.handle.file,
                 &fx.handle,
@@ -2265,6 +2490,7 @@ mod tests {
                 &small_slots(2),
                 &probe,
                 Some(&mut groups),
+                &budget,
             )
             .unwrap();
             assert!(consumed.keys().all(|key| !raw.map.contains_key(key)));
@@ -2294,6 +2520,7 @@ mod tests {
             ready: Vec::new(),
             consume: &mut fail,
         };
+        let budget = CudaDeviceBudget::for_current_device();
         let err = read_gguf_tensors_consuming(
             &mock,
             &fx.handle,
@@ -2303,6 +2530,7 @@ mod tests {
             &small_slots(SLOTS),
             &probe,
             Some(&mut groups),
+            &budget,
         )
         .err()
         .expect("residency failure must abort preload");
@@ -2858,7 +3086,7 @@ mod tests {
         let full = GgufPreload::load(&input).unwrap();
         let mut streamed = HashMap::new();
         let mut calls = 0;
-        let rest = GgufPreload::load_clef(&input, &mut |layer| {
+        let rest = GgufPreload::load_clef(&input, &mut |layer, _| {
             assert!(layer.keys().all(|key| key.starts_with("model.layers.")));
             calls += 1;
             streamed.extend(layer);
@@ -2886,7 +3114,7 @@ mod tests {
         let fx = write_import_fixture("qwen35-dense-untied", &work);
         let input = fixture_input(&fx, false);
         let mut changed = false;
-        let err = GgufPreload::load_clef(&input, &mut |_| {
+        let err = GgufPreload::load_clef(&input, &mut |_, _| {
             if !changed {
                 let file = fs::OpenOptions::new().write(true).open(&fx.main).unwrap();
                 file.set_len(file.metadata().unwrap().len() + 1).unwrap();

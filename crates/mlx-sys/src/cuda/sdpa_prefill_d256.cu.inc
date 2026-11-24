@@ -47,6 +47,21 @@ __device__ __forceinline__ unsigned int sdpa_p256_pack_bf16x2(float lo, float hi
   return *reinterpret_cast<const unsigned int*>(&v);
 }
 
+__device__ __forceinline__ unsigned int sdpa_p256_gate_pack_bf16x2(
+    float o_lo, float o_hi, __nv_bfloat162 g_bf) {
+  const __nv_bfloat162 o_bf = __floats2bfloat162_rn(o_lo, o_hi);
+  const float g0 = __low2float(g_bf);
+  const float g1 = __high2float(g_bf);
+  const float y0 = 1.0f / (1.0f + expf(fabsf(g0)));
+  const float y1 = 1.0f / (1.0f + expf(fabsf(g1)));
+  const __nv_bfloat162 s_bf = __floats2bfloat162_rn(
+      (g0 < 0.0f) ? y0 : (1.0f - y0),
+      (g1 < 0.0f) ? y1 : (1.0f - y1));
+  return sdpa_p256_pack_bf16x2(
+      __low2float(o_bf) * __low2float(s_bf),
+      __high2float(o_bf) * __high2float(s_bf));
+}
+
 __device__ __forceinline__ int sdpa_p256_swiz256(int row, int c8) {
   return row * 256 + ((c8 ^ (row & 7)) << 3);
 }
@@ -84,18 +99,24 @@ __device__ __forceinline__ void sdpa_p256_load_kv_checked(
   sdpa_p256_cp_commit();
 }
 
-// FlashAttention-2 BF16 causal prefill kernel for D=256 on sm_80+ / sm_121a.
+// FlashAttention-2 BF16 prefill kernel for D=256 on sm_80+ / sm_121a.
 // Tile: Br=64, Bc=32, 4 warps (128 threads), 48 KB static SMEM (2 CTAs/SM), zero register spills.
 //   - Q[0..127] kept in registers (32 uint32/thread), Q[128..255] in sQ_hi (16 KB).
 //   - sK (16 KB) and sV (16 KB) asynchronously overlapped via cp.async with QK^T and PV MMAs.
 //   - 128B XOR swizzle gives bank-conflict-free cp.async and ldmatrix.x4(.trans).
+//   - MASK_MODE: 0=causal unmasked, 1=bool mask [B_m,1,Q_m,K_len], 2=unmasked non-causal,
+//                3=causal + 1D bool valid mask [B_m,1,1,K_stride] (self-attend diagonal).
 // Grid:  (ceil(Q_len / 64) * gqa, Hkv, B) — reverse q_block for causal load balance,
 //        consecutive gqa heads share K/V in L2.
 // Block: (128, 1, 1)
 // Q: [B, Hq, Q_len, 256] (last dim contiguous, outer strides 16B aligned).
 // K, V: [B, Hkv, K_len, 256] (last dim contiguous, outer strides 16B aligned).
-// O: [B, Hq, Q_len, 256] row-contiguous.
-extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
+// O: [B, Hq, Q_len, 256] row-contiguous (GATED_BTHD=false), or
+//    [B, Q_len, Hq * 256] row-contiguous multiplied by sigmoid(gate) (GATED_BTHD=true).
+// gate (when GATED_BTHD=true): [B, Q_len, Hq * 256] bf16 (last dim contiguous,
+//    gate_sb and gate_st even, 4B aligned base pointer).
+template <int MASK_MODE, bool GATED_BTHD = false>
+__global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
     const nv_bfloat16* __restrict__ Q,
     const nv_bfloat16* __restrict__ K,
     const nv_bfloat16* __restrict__ V,
@@ -104,7 +125,12 @@ extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
     long long q_sb, long long q_sh, long long q_ss,
     long long k_sb, long long k_sh, long long k_ss,
     long long v_sb, long long v_sh, long long v_ss,
-    float scale_log2) {
+    float scale_log2,
+    const unsigned char* __restrict__ mask_ptr,
+    long long mask_sb, long long mask_sq,
+    const nv_bfloat16* __restrict__ gate_ptr = nullptr,
+    long long gate_sb = 0,
+    long long gate_st = 0) {
   constexpr int BR = 64;
   constexpr int BC = 32;
   constexpr int D = 256;
@@ -124,12 +150,13 @@ extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
   const int tid_in_grp = lane & 3;
 
   const int q_block_start = q_block * BR;
-  const int q_block_end =
-      (q_block_start + BR - 1 < Q_len) ? (q_block_start + BR - 1) : (Q_len - 1);
-  const int offset = K_len - Q_len;
-  const int max_k = offset + q_block_end;
-  const int num_tiles = (max_k / BC) + 1;
-  const int num_full_tiles = (offset + q_block_start + 1) / BC;
+  const int num_tiles = (MASK_MODE == 0 || MASK_MODE == 3)
+      ? (((K_len - Q_len) + ((q_block_start + BR - 1 < Q_len) ? (q_block_start + BR - 1) : (Q_len - 1))) / BC + 1)
+      : ((K_len + BC - 1) / BC);
+  const int num_full_tiles = (MASK_MODE == 0)
+      ? (((K_len - Q_len) + q_block_start + 1) / BC)
+      : ((MASK_MODE == 2) ? (K_len / BC) : 0);
+  (void)num_full_tiles;
 
   __shared__ alignas(128) nv_bfloat16 sQ_hi[BR * 128]; // 16 KB (Q cols 128..255)
   __shared__ alignas(128) nv_bfloat16 sK[BC * D];      // 16 KB (initially Q cols 0..127)
@@ -165,10 +192,18 @@ extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
   const nv_bfloat16* K_base = K + (long long)b * k_sb + (long long)hkv * k_sh;
   const nv_bfloat16* V_base = V + (long long)b * v_sb + (long long)hkv * v_sh;
 
-  if (num_full_tiles > 0) {
-    sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, 0, tid);
+  if constexpr (MASK_MODE == 0) {
+    if (num_full_tiles > 0) {
+      sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, 0, tid);
+    } else {
+      sdpa_p256_load_kv_checked(sK, K_base, k_ss, 0, K_len, tid);
+    }
   } else {
-    sdpa_p256_load_kv_checked(sK, K_base, k_ss, 0, K_len, tid);
+    if (BC <= K_len) {
+      sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, 0, tid);
+    } else {
+      sdpa_p256_load_kv_checked(sK, K_base, k_ss, 0, K_len, tid);
+    }
   }
 
   float accO[32][4];
@@ -186,8 +221,6 @@ extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
 
   const int row0_abs = q_block_start + warp * 16 + group_id;
   const int row1_abs = row0_abs + 8;
-  const int clim0 = offset + ((row0_abs < Q_len) ? row0_abs : (Q_len - 1));
-  const int clim1 = offset + ((row1_abs < Q_len) ? row1_abs : (Q_len - 1));
 
   const int k_ld_r0 = ((lane >> 4) * 8) + (lane & 7);
   const int k_ld_c8_base = (lane >> 3) & 1;
@@ -198,15 +231,22 @@ extern "C" __global__ __launch_bounds__(128, 2) void mlx_node_sdpa_prefill_d256(
 )cuda"
 R"cuda(
     const int k_start = tile * BC;
-    const bool is_masked = (tile >= num_full_tiles);
 
     sdpa_p256_cp_wait0();
     __syncthreads();
 
-    if (!is_masked) {
-      sdpa_p256_load_kv_unchecked(sV, V_base, v_ss, k_start, tid);
+    if constexpr (MASK_MODE == 0) {
+      if (tile < num_full_tiles) {
+        sdpa_p256_load_kv_unchecked(sV, V_base, v_ss, k_start, tid);
+      } else {
+        sdpa_p256_load_kv_checked(sV, V_base, v_ss, k_start, K_len, tid);
+      }
     } else {
-      sdpa_p256_load_kv_checked(sV, V_base, v_ss, k_start, K_len, tid);
+      if (k_start + BC <= K_len) {
+        sdpa_p256_load_kv_unchecked(sV, V_base, v_ss, k_start, tid);
+      } else {
+        sdpa_p256_load_kv_checked(sV, V_base, v_ss, k_start, K_len, tid);
+      }
     }
 
     float s_acc[4][4] = {};
@@ -258,7 +298,68 @@ R"cuda(
 
     float local_max0 = -1e30f;
     float local_max1 = -1e30f;
-    if (!is_masked) {
+    if constexpr (MASK_MODE == 1) {
+      const int col_base = k_start + 2 * tid_in_grp;
+      const unsigned char* bmask = mask_ptr + (long long)b * mask_sb;
+      const unsigned char* b0 =
+          bmask + (long long)(row0_abs < Q_len ? row0_abs : 0) * mask_sq + col_base;
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+        const int c0 = col_base + nt * 8;
+        const int c1 = c0 + 1;
+        const bool v00 = (c0 < K_len) && __ldg(b0 + nt * 8);
+        const bool v01 = (c1 < K_len) && __ldg(b0 + nt * 8 + 1);
+        s_acc[nt][0] = v00 ? (s_acc[nt][0] * scale_log2) : -1e30f;
+        s_acc[nt][1] = v01 ? (s_acc[nt][1] * scale_log2) : -1e30f;
+        local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
+      }
+      const unsigned char* b1 =
+          bmask + (long long)(row1_abs < Q_len ? row1_abs : 0) * mask_sq + col_base;
+#pragma unroll
+      for (int nt = 0; nt < 4; ++nt) {
+        const int c0 = col_base + nt * 8;
+        const int c1 = c0 + 1;
+        const bool v10 = (c0 < K_len) && __ldg(b1 + nt * 8);
+        const bool v11 = (c1 < K_len) && __ldg(b1 + nt * 8 + 1);
+        s_acc[nt][2] = v10 ? (s_acc[nt][2] * scale_log2) : -1e30f;
+        s_acc[nt][3] = v11 ? (s_acc[nt][3] * scale_log2) : -1e30f;
+        local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+      }
+    } else if constexpr (MASK_MODE == 3) {
+      const unsigned char* b_valid = mask_ptr + (long long)b * mask_sb;
+      const int kc = k_start + lane;
+      const bool lane_valid = (kc < K_len) && (__ldg(b_valid + kc) != 0);
+      const unsigned int valid_bits = __ballot_sync(0xffffffffu, lane_valid);
+      const int base_off = (K_len - Q_len) - k_start;
+      {
+        const int rel0 = base_off + ((row0_abs < Q_len) ? row0_abs : (Q_len - 1));
+        unsigned int rm0 = (rel0 < 0)
+            ? 0u
+            : ((rel0 >= 32) ? valid_bits
+                            : ((valid_bits & ((1u << rel0) - 1u)) | (1u << rel0)));
+        rm0 >>= (2 * tid_in_grp);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          s_acc[nt][0] = (rm0 & (1u << (nt * 8))) ? (s_acc[nt][0] * scale_log2) : -1e30f;
+          s_acc[nt][1] = (rm0 & (2u << (nt * 8))) ? (s_acc[nt][1] * scale_log2) : -1e30f;
+          local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
+        }
+      }
+      {
+        const int rel1 = base_off + ((row1_abs < Q_len) ? row1_abs : (Q_len - 1));
+        unsigned int rm1 = (rel1 < 0)
+            ? 0u
+            : ((rel1 >= 32) ? valid_bits
+                            : ((valid_bits & ((1u << rel1) - 1u)) | (1u << rel1)));
+        rm1 >>= (2 * tid_in_grp);
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          s_acc[nt][2] = (rm1 & (1u << (nt * 8))) ? (s_acc[nt][2] * scale_log2) : -1e30f;
+          s_acc[nt][3] = (rm1 & (2u << (nt * 8))) ? (s_acc[nt][3] * scale_log2) : -1e30f;
+          local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        }
+      }
+    } else if (tile < num_full_tiles) {
 #pragma unroll
       for (int nt = 0; nt < 4; ++nt) {
         s_acc[nt][0] *= scale_log2;
@@ -269,16 +370,33 @@ R"cuda(
         local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
       }
     } else {
+      if constexpr (MASK_MODE == 0) {
+        const int offset = K_len - Q_len;
+        const int clim0 = offset + ((row0_abs < Q_len) ? row0_abs : (Q_len - 1));
+        const int clim1 = offset + ((row1_abs < Q_len) ? row1_abs : (Q_len - 1));
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt) {
-        const int c0 = k_start + nt * 8 + 2 * tid_in_grp;
-        const int c1 = c0 + 1;
-        s_acc[nt][0] = (c0 <= clim0) ? (s_acc[nt][0] * scale_log2) : -1e30f;
-        s_acc[nt][1] = (c1 <= clim0) ? (s_acc[nt][1] * scale_log2) : -1e30f;
-        s_acc[nt][2] = (c0 <= clim1) ? (s_acc[nt][2] * scale_log2) : -1e30f;
-        s_acc[nt][3] = (c1 <= clim1) ? (s_acc[nt][3] * scale_log2) : -1e30f;
-        local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
-        local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        for (int nt = 0; nt < 4; ++nt) {
+          const int c0 = k_start + nt * 8 + 2 * tid_in_grp;
+          const int c1 = c0 + 1;
+          s_acc[nt][0] = (c0 <= clim0) ? (s_acc[nt][0] * scale_log2) : -1e30f;
+          s_acc[nt][1] = (c1 <= clim0) ? (s_acc[nt][1] * scale_log2) : -1e30f;
+          s_acc[nt][2] = (c0 <= clim1) ? (s_acc[nt][2] * scale_log2) : -1e30f;
+          s_acc[nt][3] = (c1 <= clim1) ? (s_acc[nt][3] * scale_log2) : -1e30f;
+          local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
+          local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        }
+      } else {
+#pragma unroll
+        for (int nt = 0; nt < 4; ++nt) {
+          const int c0 = k_start + nt * 8 + 2 * tid_in_grp;
+          const int c1 = c0 + 1;
+          s_acc[nt][0] = (c0 < K_len) ? (s_acc[nt][0] * scale_log2) : -1e30f;
+          s_acc[nt][1] = (c1 < K_len) ? (s_acc[nt][1] * scale_log2) : -1e30f;
+          s_acc[nt][2] = (c0 < K_len) ? (s_acc[nt][2] * scale_log2) : -1e30f;
+          s_acc[nt][3] = (c1 < K_len) ? (s_acc[nt][3] * scale_log2) : -1e30f;
+          local_max0 = fmaxf(local_max0, fmaxf(s_acc[nt][0], s_acc[nt][1]));
+          local_max1 = fmaxf(local_max1, fmaxf(s_acc[nt][2], s_acc[nt][3]));
+        }
       }
     }
     local_max0 = fmaxf(local_max0, __shfl_xor_sync(0xffffffffu, local_max0, 1));
@@ -288,8 +406,19 @@ R"cuda(
 
     const float new_m0 = fmaxf(m_row0, local_max0);
     const float new_m1 = fmaxf(m_row1, local_max1);
-    const float alpha0 = (m_row0 > -1e20f) ? sdpa_p256_exp2f(m_row0 - new_m0) : 0.0f;
-    const float alpha1 = (m_row1 > -1e20f) ? sdpa_p256_exp2f(m_row1 - new_m1) : 0.0f;
+)cuda"
+R"cuda(
+    float alpha0;
+    float alpha1;
+    if constexpr (MASK_MODE == 1 || MASK_MODE == 3) {
+      alpha0 = (m_row0 > -1e20f && new_m0 > -1e20f)
+          ? sdpa_p256_exp2f(m_row0 - new_m0) : 0.0f;
+      alpha1 = (m_row1 > -1e20f && new_m1 > -1e20f)
+          ? sdpa_p256_exp2f(m_row1 - new_m1) : 0.0f;
+    } else {
+      alpha0 = (m_row0 > -1e20f) ? sdpa_p256_exp2f(m_row0 - new_m0) : 0.0f;
+      alpha1 = (m_row1 > -1e20f) ? sdpa_p256_exp2f(m_row1 - new_m1) : 0.0f;
+    }
 
     float local_sum0 = 0.0f;
     float local_sum1 = 0.0f;
@@ -298,14 +427,26 @@ R"cuda(
     for (int ks = 0; ks < 2; ++ks) {
       const int nt0 = ks * 2;
       const int nt1 = ks * 2 + 1;
-      const float p00 = sdpa_p256_exp2f(s_acc[nt0][0] - new_m0);
-      const float p01 = sdpa_p256_exp2f(s_acc[nt0][1] - new_m0);
-      const float p10 = sdpa_p256_exp2f(s_acc[nt0][2] - new_m1);
-      const float p11 = sdpa_p256_exp2f(s_acc[nt0][3] - new_m1);
-      const float p02 = sdpa_p256_exp2f(s_acc[nt1][0] - new_m0);
-      const float p03 = sdpa_p256_exp2f(s_acc[nt1][1] - new_m0);
-      const float p12 = sdpa_p256_exp2f(s_acc[nt1][2] - new_m1);
-      const float p13 = sdpa_p256_exp2f(s_acc[nt1][3] - new_m1);
+      float p00, p01, p10, p11, p02, p03, p12, p13;
+      if constexpr (MASK_MODE == 1 || MASK_MODE == 3) {
+        p00 = (s_acc[nt0][0] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt0][0] - new_m0) : 0.0f;
+        p01 = (s_acc[nt0][1] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt0][1] - new_m0) : 0.0f;
+        p10 = (s_acc[nt0][2] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt0][2] - new_m1) : 0.0f;
+        p11 = (s_acc[nt0][3] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt0][3] - new_m1) : 0.0f;
+        p02 = (s_acc[nt1][0] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt1][0] - new_m0) : 0.0f;
+        p03 = (s_acc[nt1][1] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt1][1] - new_m0) : 0.0f;
+        p12 = (s_acc[nt1][2] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt1][2] - new_m1) : 0.0f;
+        p13 = (s_acc[nt1][3] > -1e20f) ? sdpa_p256_exp2f(s_acc[nt1][3] - new_m1) : 0.0f;
+      } else {
+        p00 = sdpa_p256_exp2f(s_acc[nt0][0] - new_m0);
+        p01 = sdpa_p256_exp2f(s_acc[nt0][1] - new_m0);
+        p10 = sdpa_p256_exp2f(s_acc[nt0][2] - new_m1);
+        p11 = sdpa_p256_exp2f(s_acc[nt0][3] - new_m1);
+        p02 = sdpa_p256_exp2f(s_acc[nt1][0] - new_m0);
+        p03 = sdpa_p256_exp2f(s_acc[nt1][1] - new_m0);
+        p12 = sdpa_p256_exp2f(s_acc[nt1][2] - new_m1);
+        p13 = sdpa_p256_exp2f(s_acc[nt1][3] - new_m1);
+      }
       local_sum0 += (p00 + p01) + (p02 + p03);
       local_sum1 += (p10 + p11) + (p12 + p13);
       p_frag[ks][0] = sdpa_p256_pack_bf16x2(p00, p01);
@@ -334,10 +475,19 @@ R"cuda(
     __syncthreads();
 
     if (tile + 1 < num_tiles) {
-      if (tile + 1 < num_full_tiles) {
-        sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, (tile + 1) * BC, tid);
+      const int next_start = (tile + 1) * BC;
+      if constexpr (MASK_MODE == 0) {
+        if (tile + 1 < num_full_tiles) {
+          sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, next_start, tid);
+        } else {
+          sdpa_p256_load_kv_checked(sK, K_base, k_ss, next_start, K_len, tid);
+        }
       } else {
-        sdpa_p256_load_kv_checked(sK, K_base, k_ss, (tile + 1) * BC, K_len, tid);
+        if (next_start + BC <= K_len) {
+          sdpa_p256_load_kv_unchecked(sK, K_base, k_ss, next_start, tid);
+        } else {
+          sdpa_p256_load_kv_checked(sK, K_base, k_ss, next_start, K_len, tid);
+        }
       }
     }
 
@@ -365,21 +515,57 @@ R"cuda(
 
   const float inv_l0 = (l_row0 > 0.0f) ? (1.0f / l_row0) : 0.0f;
   const float inv_l1 = (l_row1 > 0.0f) ? (1.0f / l_row1) : 0.0f;
-  nv_bfloat16* O_base = O + (((long long)b * (Hkv * gqa) + hq) * Q_len) * D;
-  if (row0_abs < Q_len) {
-    nv_bfloat16* dst0 = O_base + (long long)row0_abs * D;
+  if constexpr (!GATED_BTHD) {
+    (void)gate_ptr;
+    (void)gate_sb;
+    (void)gate_st;
+    nv_bfloat16* O_base = O + (((long long)b * (Hkv * gqa) + hq) * Q_len) * D;
+    if (row0_abs < Q_len) {
+      nv_bfloat16* dst0 = O_base + (long long)row0_abs * D;
 #pragma unroll
-    for (int t = 0; t < 32; ++t) {
-      *reinterpret_cast<unsigned int*>(&dst0[t * 8 + 2 * tid_in_grp]) =
-          sdpa_p256_pack_bf16x2(accO[t][0] * inv_l0, accO[t][1] * inv_l0);
+      for (int t = 0; t < 32; ++t) {
+        *reinterpret_cast<unsigned int*>(&dst0[t * 8 + 2 * tid_in_grp]) =
+            sdpa_p256_pack_bf16x2(accO[t][0] * inv_l0, accO[t][1] * inv_l0);
+      }
     }
-  }
-  if (row1_abs < Q_len) {
-    nv_bfloat16* dst1 = O_base + (long long)row1_abs * D;
+    if (row1_abs < Q_len) {
+      nv_bfloat16* dst1 = O_base + (long long)row1_abs * D;
 #pragma unroll
-    for (int t = 0; t < 32; ++t) {
-      *reinterpret_cast<unsigned int*>(&dst1[t * 8 + 2 * tid_in_grp]) =
-          sdpa_p256_pack_bf16x2(accO[t][2] * inv_l1, accO[t][3] * inv_l1);
+      for (int t = 0; t < 32; ++t) {
+        *reinterpret_cast<unsigned int*>(&dst1[t * 8 + 2 * tid_in_grp]) =
+            sdpa_p256_pack_bf16x2(accO[t][2] * inv_l1, accO[t][3] * inv_l1);
+      }
+    }
+  } else {
+    const long long HD = (long long)Hkv * gqa * D;
+    nv_bfloat16* O_head = O + (long long)b * Q_len * HD + (long long)hq * D;
+    const nv_bfloat16* G_head =
+        gate_ptr + (long long)b * gate_sb + (long long)hq * D;
+    if (row0_abs < Q_len) {
+      nv_bfloat16* dst0 = O_head + (long long)row0_abs * HD;
+      const nv_bfloat16* g0 = G_head + (long long)row0_abs * gate_st;
+#pragma unroll
+      for (int t = 0; t < 32; ++t) {
+        const int col = t * 8 + 2 * tid_in_grp;
+        const __nv_bfloat162 gv =
+            *reinterpret_cast<const __nv_bfloat162*>(&g0[col]);
+        *reinterpret_cast<unsigned int*>(&dst0[col]) =
+            sdpa_p256_gate_pack_bf16x2(
+                accO[t][0] * inv_l0, accO[t][1] * inv_l0, gv);
+      }
+    }
+    if (row1_abs < Q_len) {
+      nv_bfloat16* dst1 = O_head + (long long)row1_abs * HD;
+      const nv_bfloat16* g1 = G_head + (long long)row1_abs * gate_st;
+#pragma unroll
+      for (int t = 0; t < 32; ++t) {
+        const int col = t * 8 + 2 * tid_in_grp;
+        const __nv_bfloat162 gv =
+            *reinterpret_cast<const __nv_bfloat162*>(&g1[col]);
+        *reinterpret_cast<unsigned int*>(&dst1[col]) =
+            sdpa_p256_gate_pack_bf16x2(
+                accO[t][2] * inv_l1, accO[t][3] * inv_l1, gv);
+      }
     }
   }
 }

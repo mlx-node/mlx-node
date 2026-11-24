@@ -2,30 +2,18 @@ use super::*;
 
 /// RAII guard that temporarily disables MLX CUDA Graph capture for large
 /// prefill passes (`M > 16`) and restores the previous state on drop.
+///
+/// Delegates to the process-wide reference-counted
+/// [`crate::accelerator::CudaGraphsGuard`] so concurrent prefill scopes across
+/// models never race or prematurely re-enable CUDA Graphs.
 pub(super) struct CudaGraphsGuard {
-    prev: Option<bool>,
+    _inner: Option<crate::accelerator::CudaGraphsGuard>,
 }
 
 impl CudaGraphsGuard {
     pub(super) fn disable_if(should_disable: bool) -> Self {
-        if !should_disable {
-            return Self { prev: None };
-        }
-        // SAFETY: FFI helper catches all C++ exceptions and returns previous flag.
-        let prev = unsafe { mlx_sys::mlx_cuda_set_use_graphs(false) };
         Self {
-            prev: prev.then_some(true),
-        }
-    }
-}
-
-impl Drop for CudaGraphsGuard {
-    fn drop(&mut self) {
-        if let Some(prev) = self.prev {
-            // SAFETY: FFI helper catches all C++ exceptions.
-            unsafe {
-                mlx_sys::mlx_cuda_set_use_graphs(prev);
-            }
+            _inner: should_disable.then(crate::accelerator::CudaGraphsGuard::disable_for_prefill),
         }
     }
 }

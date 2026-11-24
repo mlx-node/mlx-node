@@ -31,6 +31,28 @@ pub enum RopeMode {
     Temporal,
 }
 
+/// Explicit attention mask semantics for [`Qwen3_5Attention`].
+#[derive(Clone, Copy)]
+pub(crate) enum AttentionMask<'a> {
+    /// Standard explicit SDPA mask passed through verbatim (boolean keep mask
+    /// or float additive mask).
+    Full(&'a MxArray),
+    /// Compact `[B|1, 1, 1, K]` boolean per-key validity mask with implicit
+    /// causal + self-diagonal semantics (`causal & (valid | diag)`), avoiding
+    /// `O(B * Q * K)` mask materialization on CUDA `D=256` prefill.
+    CausalValid(&'a MxArray),
+}
+
+enum AttnInput<'a> {
+    Normed(&'a MxArray),
+    PrequantSym8 { x_i8: &'a MxArray, s_x: &'a MxArray },
+}
+
+enum Sym8KvTarget<'a> {
+    Merged(&'a QuantizedLinear, i64),
+    Split(&'a QuantizedLinear, &'a QuantizedLinear),
+}
+
 /// Qwen3.5 full attention with gating and partial RoPE.
 ///
 /// Key differences from standard Qwen3 attention:
@@ -540,12 +562,163 @@ impl Qwen3_5Attention {
         batch: i64,
         seq_len: i64,
     ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        if let Some(sym8) = self.project_mixer_sym8_cuda(x, batch, seq_len)? {
+            return Ok(sym8);
+        }
         if let Some(fused) = self.project_mixer_fused(x, batch, seq_len)? {
             return Ok(fused);
         }
         let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
         let (keys, values) = self.project_kv(x)?;
         Ok((queries, gate, keys, values))
+    }
+
+    /// Resolve the CUDA Sym8 mixer projections (`q_proj` + `kv_proj` or
+    /// `k_proj`/`v_proj`) when all are `Sym8` with compatible Hadamard transforms.
+    fn sym8_mixer_targets(&self) -> Result<Option<(&QuantizedLinear, Sym8KvTarget<'_>)>> {
+        if !crate::accelerator::cuda_sym8_available() || self.q_gate_block_t.is_some() {
+            return Ok(None);
+        }
+        let Some(q_ql) = self.q_proj.as_quantized() else {
+            return Ok(None);
+        };
+        if !q_ql.is_sym8() || q_ql.hadamard().is_some_and(|h| h.gdn_permutation.is_some()) {
+            return Ok(None);
+        }
+        let kv_target = match &self.kv_proj {
+            Some((merged, k_rows)) => {
+                let Some(kv_ql) = merged.as_quantized() else {
+                    return Ok(None);
+                };
+                if !kv_ql.is_sym8() || !q_ql.sym8_hadamard_compatible_with(kv_ql)? {
+                    return Ok(None);
+                }
+                Sym8KvTarget::Merged(kv_ql, *k_rows)
+            }
+            None => {
+                let (Some(k_ql), Some(v_ql)) =
+                    (self.k_proj.as_quantized(), self.v_proj.as_quantized())
+                else {
+                    return Ok(None);
+                };
+                if !k_ql.is_sym8()
+                    || !v_ql.is_sym8()
+                    || !q_ql.sym8_hadamard_compatible_with(k_ql)?
+                    || !q_ql.sym8_hadamard_compatible_with(v_ql)?
+                {
+                    return Ok(None);
+                }
+                Sym8KvTarget::Split(k_ql, v_ql)
+            }
+        };
+        Ok(Some((q_ql, kv_target)))
+    }
+
+    /// Whether this attention layer can consume pre-quantized `(x_i8, s_x)`
+    /// from a fused `(Add +) RMSNorm + Hadamard-1024 + INT8 quant` kernel on
+    /// CUDA, returning the shared `signs` (`Option<&MxArray>`) when eligible.
+    pub(crate) fn can_fuse_norm_sym8_cuda(&self) -> Result<Option<Option<&MxArray>>> {
+        Ok(self
+            .sym8_mixer_targets()?
+            .map(|(q_ql, _)| q_ql.sym8_signs()))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn project_mixer_sym8_from_targets(
+        &self,
+        q_ql: &QuantizedLinear,
+        kv_target: Sym8KvTarget<'_>,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        out_dtype: DType,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        let prefix = [batch, seq_len];
+        let q_out = q_ql.forward_prequantized_sym8(x_i8, s_x, &prefix, out_dtype)?;
+        let hd = i64::from(self.num_heads * self.head_dim);
+        let (queries, gate) = if q_ql.has_q_gate_block_layout() {
+            let qg = q_out.split_sections(&[hd], 2)?;
+            let queries = qg[0].reshape(&[
+                batch,
+                seq_len,
+                i64::from(self.num_heads),
+                i64::from(self.head_dim),
+            ])?;
+            (queries, qg[1].clone())
+        } else {
+            let q_per_head = q_out.reshape(&[
+                batch,
+                seq_len,
+                i64::from(self.num_heads),
+                i64::from(self.head_dim * 2),
+            ])?;
+            let queries = q_per_head.slice_axis(3, 0, i64::from(self.head_dim))?;
+            let gate = q_per_head
+                .slice_axis(3, i64::from(self.head_dim), i64::from(self.head_dim * 2))?
+                .reshape(&[batch, seq_len, hd])?;
+            (queries, gate)
+        };
+
+        let (keys, values) = match kv_target {
+            Sym8KvTarget::Merged(kv_ql, k_rows) => {
+                let kv = kv_ql.forward_prequantized_sym8(x_i8, s_x, &prefix, out_dtype)?;
+                let kv_split = kv.split_sections(&[k_rows], 2)?;
+                (kv_split[0].clone(), kv_split[1].clone())
+            }
+            Sym8KvTarget::Split(k_ql, v_ql) => (
+                k_ql.forward_prequantized_sym8(x_i8, s_x, &prefix, out_dtype)?,
+                v_ql.forward_prequantized_sym8(x_i8, s_x, &prefix, out_dtype)?,
+            ),
+        };
+
+        Ok((queries, gate, keys, values))
+    }
+
+    /// CUDA Sym8 fast path for [`Self::project_mixer`]: quantizes `x` (with its
+    /// optional Hadamard-1024 rotation) once and reuses `(x_i8, s_x)` across
+    /// `q_proj` and `kv_proj` (or unmerged `k_proj` / `v_proj`).
+    fn project_mixer_sym8_cuda(
+        &self,
+        x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
+        let Some((q_ql, kv_target)) = self.sym8_mixer_targets()? else {
+            return Ok(None);
+        };
+        let shape = x.shape()?;
+        if shape.len() != 3 || shape[0] != batch || shape[1] != seq_len {
+            return Ok(None);
+        }
+        let k = shape[2];
+        let m = batch * seq_len;
+        if m == 0 {
+            return Ok(None);
+        }
+        let out_dtype = x.dtype()?;
+        let x_2d = x.reshape(&[m, k])?;
+        let (x_i8, s_x) = crate::kernels::sym8::hadamard_quant_int8(&x_2d, q_ql.sym8_signs())?;
+        self.project_mixer_sym8_from_targets(
+            q_ql, kv_target, &x_i8, &s_x, batch, seq_len, out_dtype,
+        )
+        .map(Some)
+    }
+
+    fn project_mixer_prequant_sym8_cuda(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+        out_dtype: DType,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        let Some((q_ql, kv_target)) = self.sym8_mixer_targets()? else {
+            return Err(Error::from_reason(
+                "Qwen3_5Attention::project_mixer_prequant_sym8_cuda called on non-Sym8 layer",
+            ));
+        };
+        self.project_mixer_sym8_from_targets(q_ql, kv_target, x_i8, s_x, batch, seq_len, out_dtype)
     }
 
     /// [`Self::project_mixer`]'s one-dispatch route, `None` where it does not
@@ -613,6 +786,37 @@ impl Qwen3_5Attention {
         Ok(())
     }
 
+    pub(crate) fn has_q_gate_block_layout(&self) -> bool {
+        self.q_proj.has_q_gate_block_layout()
+    }
+
+    pub(crate) fn has_merged_kv_proj(&self) -> bool {
+        self.kv_proj.is_some()
+    }
+
+    pub(crate) fn q_proj_has_settled_cuda_host_storage(&self) -> bool {
+        self.q_proj.has_settled_cuda_host_storage()
+    }
+
+    pub(crate) fn kv_proj_has_settled_cuda_host_storage(&self) -> bool {
+        self.k_proj.has_settled_cuda_host_storage() || self.v_proj.has_settled_cuda_host_storage()
+    }
+
+    /// Test-only: exercise all installed attention projections (`q_proj`,
+    /// `k_proj`, `v_proj`, `o_proj`, including Sym8 fused mixer and q/gate
+    /// block / merged KV layouts) without invoking cuDNN SDPA.
+    #[cfg(test)]
+    pub(crate) fn forward_projections_no_sdpa(
+        &self,
+        x: &MxArray,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray, MxArray)> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let (q, gate, k, v) = self.project_mixer(x, batch, seq_len)?;
+        let o = self.o_proj.forward(x)?;
+        Ok((q, gate, k, v, o))
+    }
+
     /// Forward pass.
     ///
     /// # Arguments
@@ -631,7 +835,44 @@ impl Qwen3_5Attention {
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, None)
+        self.forward_impl(
+            AttnInput::Normed(x),
+            mask.map(AttentionMask::Full),
+            cache,
+            position_ids,
+            None,
+        )
+    }
+
+    /// Internal variant of [`Self::forward`] with explicit [`AttentionMask`]
+    /// semantics (such as compact `CausalValid` right-padded prefill masks).
+    pub(crate) fn forward_with_mask(
+        &self,
+        x: &MxArray,
+        mask: Option<AttentionMask<'_>>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        self.forward_impl(AttnInput::Normed(x), mask, cache, position_ids, None)
+    }
+
+    /// CUDA Sym8 pre-quantized variant of [`Self::forward_with_mask`] consuming
+    /// `(x_i8, s_x)` directly from `sym8::add_rmsnorm_hadamard_quant`.
+    pub(crate) fn forward_with_mask_prequant_sym8(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        mask: Option<AttentionMask<'_>>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        self.forward_impl(
+            AttnInput::PrequantSym8 { x_i8, s_x },
+            mask,
+            cache,
+            position_ids,
+            None,
+        )
     }
 
     /// Tree-verification variant of [`Self::forward`] with per-node RoPE depths
@@ -644,7 +885,33 @@ impl Qwen3_5Attention {
         position_ids: Option<&MxArray>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
-        self.forward_impl(x, mask, cache, position_ids, tree)
+        self.forward_impl(
+            AttnInput::Normed(x),
+            mask.map(AttentionMask::Full),
+            cache,
+            position_ids,
+            tree,
+        )
+    }
+
+    /// CUDA Sym8 pre-quantized variant of [`Self::forward_tree`] consuming
+    /// `(x_i8, s_x)` directly from `sym8::add_rmsnorm_hadamard_quant`.
+    pub(crate) fn forward_tree_prequant_sym8(
+        &self,
+        x_i8: &MxArray,
+        s_x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut KVCache>,
+        position_ids: Option<&MxArray>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<MxArray> {
+        self.forward_impl(
+            AttnInput::PrequantSym8 { x_i8, s_x },
+            mask.map(AttentionMask::Full),
+            cache,
+            position_ids,
+            tree,
+        )
     }
 
     /// Prefill tail pruning (non-final chunk, final FullAttn layer):
@@ -727,14 +994,16 @@ impl Qwen3_5Attention {
 
     fn forward_impl(
         &self,
-        x: &MxArray,
-        mask: Option<&MxArray>,
+        input: AttnInput<'_>,
+        mask: Option<AttentionMask<'_>>,
         cache: Option<&mut KVCache>,
         position_ids: Option<&MxArray>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
-        let batch = x.shape_at(0)?;
-        let seq_len = x.shape_at(1)?;
+        let (batch, seq_len) = match input {
+            AttnInput::Normed(x) => (x.shape_at(0)?, x.shape_at(1)?),
+            AttnInput::PrequantSym8 { x_i8, .. } => (x_i8.shape_at(0)?, x_i8.shape_at(1)?),
+        };
         if let Some(tv) = tree {
             if batch != 1 {
                 return Err(Error::from_reason(format!(
@@ -749,7 +1018,12 @@ impl Qwen3_5Attention {
             }
         }
 
-        let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
+        let (queries, gate, keys, values) = match input {
+            AttnInput::Normed(x) => self.project_mixer(x, batch, seq_len)?,
+            AttnInput::PrequantSym8 { x_i8, s_x } => {
+                self.project_mixer_prequant_sym8_cuda(x_i8, s_x, batch, seq_len, DType::BFloat16)?
+            }
+        };
 
         // Reshape to head format: [B, T, H, D]
         // queries already in [B, T, H, D] from per-head split above
@@ -770,38 +1044,161 @@ impl Qwen3_5Attention {
         // Capture prefix KV length BEFORE appending tree/block rows so
         // `sdpa_tree_few` and tree RoPE know the exact prefix boundary.
         let pre_cache_len = cache.as_ref().map_or(0, |c| c.get_offset());
-        let fused_qkv = if position_ids.is_none()
-            && !self.rope.traditional
+        let precise_f32 = self.q_norm.is_precise_f32();
+        let norm_policy_matches = precise_f32 == self.k_norm.is_precise_f32();
+        let common_fused_ok = !self.rope.traditional
             && !self.rope.is_scaled()
             && self.q_norm.eps_f32().to_bits() == self.k_norm.eps_f32().to_bits()
-            && let Some(c) = cache.as_deref_mut()
-        {
-            if let Some(tv) = tree {
-                c.qk_norm_rope_update_and_fetch_tree(
-                    &queries,
-                    &keys,
-                    &values,
-                    self.q_norm.weight(),
-                    self.k_norm.weight(),
-                    &tv.depths_i32,
-                    self.q_norm.eps_f32(),
-                    self.rope.dims,
-                    self.rope.base,
-                    self.rope.scale,
-                    self.rope.traditional,
+            && norm_policy_matches;
+        let fused_qkv = if common_fused_ok && position_ids.is_none() {
+            if !precise_f32 {
+                if let Some(c) = cache.as_deref_mut() {
+                    if let Some(tv) = tree {
+                        c.qk_norm_rope_update_and_fetch_tree(
+                            &queries,
+                            &keys,
+                            &values,
+                            self.q_norm.weight(),
+                            self.k_norm.weight(),
+                            &tv.depths_i32,
+                            self.q_norm.eps_f32(),
+                            self.rope.dims,
+                            self.rope.base,
+                            self.rope.scale,
+                            self.rope.traditional,
+                        )?
+                    } else {
+                        c.qk_norm_rope_update_and_fetch(
+                            &queries,
+                            &keys,
+                            &values,
+                            self.q_norm.weight(),
+                            self.k_norm.weight(),
+                            self.q_norm.eps_f32(),
+                            self.rope.dims,
+                            self.rope.base,
+                            self.rope.scale,
+                        )?
+                    }
+                } else if tree.is_none() && crate::accelerator::cuda_ops_available() {
+                    let offsets = MxArray::zeros(&[batch], Some(DType::Int32))?;
+                    if let Some((q_rot, k_rot)) = crate::kernels::attention::qk_norm_rope_offsets(
+                        &queries,
+                        &keys,
+                        self.q_norm.weight(),
+                        self.k_norm.weight(),
+                        &offsets,
+                        self.q_norm.eps_f32(),
+                        self.rope.base,
+                        self.rope.scale,
+                        self.rope.dims,
+                    )? {
+                        Some((q_rot, k_rot, values.transpose(Some(&[0, 2, 1, 3]))?))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else if crate::accelerator::cuda_ops_available()
+                && tree.is_none()
+                && queries.dtype()? == DType::BFloat16
+                && let Ok(batch_i32) = i32::try_from(batch)
+                && let Ok(seq_i32) = i32::try_from(seq_len)
+                && let Some(end_pos) = pre_cache_len.checked_add(seq_i32)
+            {
+                let pos_1d = MxArray::arange(
+                    f64::from(pre_cache_len),
+                    f64::from(end_pos),
+                    Some(1.0),
+                    Some(DType::Int32),
                 )?
+                .reshape(&[1, seq_len])?;
+                let pos_t = if batch_i32 == 1 {
+                    pos_1d
+                } else {
+                    MxArray::tile(&pos_1d, &[batch_i32, 1])?
+                };
+                if let Some(c) = cache.as_deref_mut() {
+                    c.qk_norm_rope_update_and_fetch_positions(
+                        &queries,
+                        &keys,
+                        &values,
+                        self.q_norm.weight(),
+                        self.k_norm.weight(),
+                        &pos_t,
+                        self.q_norm.eps_f32(),
+                        self.rope.dims,
+                        self.rope.base,
+                        self.rope.scale,
+                        true,
+                    )?
+                } else if let Some((q_rot, k_rot)) =
+                    crate::kernels::attention::qk_norm_rope_positions(
+                        &queries,
+                        &keys,
+                        self.q_norm.weight(),
+                        self.k_norm.weight(),
+                        &pos_t,
+                        self.q_norm.eps_f32(),
+                        self.rope.dims,
+                        self.rope.base,
+                        self.rope.scale,
+                        true,
+                    )?
+                {
+                    let v_t = values.transpose(Some(&[0, 2, 1, 3]))?;
+                    Some((q_rot, k_rot, v_t))
+                } else {
+                    None
+                }
             } else {
-                c.qk_norm_rope_update_and_fetch(
+                None
+            }
+        } else if common_fused_ok
+            && crate::accelerator::cuda_ops_available()
+            && tree.is_none()
+            && self.rope_mode == RopeMode::Temporal
+            && self
+                .mrope
+                .as_ref()
+                .is_some_and(|m| m.mrope_section_arr().iter().sum::<i32>() * 2 == self.rope.dims)
+            && queries.dtype()? == DType::BFloat16
+            && let Some(pos_ids) = position_ids
+            && pos_ids.ndim()? == 3
+            && pos_ids.shape_at(0)? >= 1
+        {
+            let pos_t = pos_ids.slice_axis(0, 0, 1)?.squeeze(Some(&[0]))?;
+            if let Some(c) = cache.as_deref_mut() {
+                c.qk_norm_rope_update_and_fetch_positions(
                     &queries,
                     &keys,
                     &values,
                     self.q_norm.weight(),
                     self.k_norm.weight(),
+                    &pos_t,
                     self.q_norm.eps_f32(),
                     self.rope.dims,
                     self.rope.base,
                     self.rope.scale,
+                    precise_f32,
                 )?
+            } else if let Some((q_rot, k_rot)) = crate::kernels::attention::qk_norm_rope_positions(
+                &queries,
+                &keys,
+                self.q_norm.weight(),
+                self.k_norm.weight(),
+                &pos_t,
+                self.q_norm.eps_f32(),
+                self.rope.dims,
+                self.rope.base,
+                self.rope.scale,
+                precise_f32,
+            )? {
+                let v_t = values.transpose(Some(&[0, 2, 1, 3]))?;
+                Some((q_rot, k_rot, v_t))
+            } else {
+                None
             }
         } else {
             None
@@ -901,6 +1298,13 @@ impl Qwen3_5Attention {
             (queries, keys, values)
         };
 
+        enum AttentionOutput {
+            /// Already `[B, T, H*D]` and multiplied by `sigmoid(gate)`.
+            Gated(MxArray),
+            /// Standard `[B, H, T, D]` SDPA output awaiting transpose/reshape/gating.
+            Ungated(MxArray),
+        }
+
         // Scaled dot-product attention using fast kernel.
         // When `tree` is `Some`: use `sdpa_tree_few` on CUDA (mask_mode=3) or
         // an explicit boolean ancestor mask fallback on Metal/CPU.
@@ -923,7 +1327,7 @@ impl Qwen3_5Attention {
                 seq_len,
                 self.scale,
             )? {
-                out
+                AttentionOutput::Ungated(out)
             } else {
                 let kv_len = keys.shape_at(2)?;
                 let prefix_len = usize::try_from(pre_cache_len).map_err(|_| {
@@ -940,16 +1344,126 @@ impl Qwen3_5Attention {
                 }
                 let tree_mask = MxArray::from_uint8(&visible, &[1, 1, seq_len, kv_len])?
                     .not_equal(&MxArray::from_uint8(&[0], &[1])?)?;
-                scaled_dot_product_attention(
+                AttentionOutput::Ungated(scaled_dot_product_attention(
                     &queries,
                     &keys,
                     &values,
                     self.scale as f64,
                     Some(&tree_mask),
-                )?
+                )?)
             }
-        } else if let Some(m) = mask {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, Some(m))?
+        } else if let Some(attn_mask) = mask {
+            match attn_mask {
+                AttentionMask::CausalValid(m) => {
+                    let kv_len = keys.shape_at(2)?;
+                    if seq_len < 9
+                        || kv_len < seq_len
+                        || m.ndim()? != 4
+                        || (m.shape_at(0)? != batch && m.shape_at(0)? != 1)
+                        || m.shape_at(1)? != 1
+                        || m.shape_at(2)? != 1
+                        || m.shape_at(3)? < kv_len
+                    {
+                        return Err(Error::from_reason(format!(
+                            "Qwen3_5Attention causal valid mask invalid geometry: batch={batch}, seq_len={seq_len}, kv_len={kv_len}, mask_shape={:?}",
+                            m.shape()?.as_ref()
+                        )));
+                    }
+                    if self.head_dim == 256
+                        && let Some(out) =
+                            crate::kernels::attention::sdpa_prefill_d256_causal_valid_gated(
+                                &queries, &keys, &values, &gate, m, self.scale,
+                            )?
+                    {
+                        AttentionOutput::Gated(out)
+                    } else if self.head_dim == 256
+                        && let Some(out) =
+                            crate::kernels::attention::sdpa_prefill_d256_causal_valid(
+                                &queries, &keys, &values, m, self.scale,
+                            )?
+                    {
+                        AttentionOutput::Ungated(out)
+                    } else {
+                        // Never pass a causal-omitted `[B, 1, 1, K]` validity mask
+                        // directly to non-causal SDPA: materialize the full causal
+                        // + validity + self-diagonal `[B, 1, Q, K]` boolean mask.
+                        let offset = kv_len - seq_len;
+                        let m_sliced = if m.shape_at(3)? > kv_len {
+                            Some(m.slice_axis(3, 0, kv_len)?)
+                        } else {
+                            None
+                        };
+                        let valid_4d = m_sliced.as_ref().unwrap_or(m);
+                        let key_index =
+                            MxArray::arange(0.0, kv_len as f64, Some(1.0), Some(DType::Int32))?
+                                .reshape(&[1, 1, 1, kv_len])?;
+                        let row_index = MxArray::arange(
+                            offset as f64,
+                            kv_len as f64,
+                            Some(1.0),
+                            Some(DType::Int32),
+                        )?
+                        .reshape(&[1, 1, seq_len, 1])?;
+                        let causal = key_index.less_equal(&row_index)?;
+                        let diag = key_index.equal(&row_index)?;
+                        let visible = valid_4d.logical_or(&diag)?;
+                        let full_mask = causal.logical_and(&visible)?;
+                        AttentionOutput::Ungated(scaled_dot_product_attention(
+                            &queries,
+                            &keys,
+                            &values,
+                            self.scale as f64,
+                            Some(&full_mask),
+                        )?)
+                    }
+                }
+                AttentionMask::Full(m) => {
+                    let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+                    if let Some(out) = crate::kernels::attention::sdpa_masked_few(
+                        &queries,
+                        &keys,
+                        &values,
+                        m,
+                        self.head_dim as i64,
+                        gqa,
+                        seq_len,
+                        self.scale,
+                    )? {
+                        AttentionOutput::Ungated(out)
+                    } else if let Some(out) =
+                        crate::kernels::attention::sdpa_prefill_d256_masked_gated(
+                            &queries,
+                            &keys,
+                            &values,
+                            &gate,
+                            m,
+                            self.head_dim as i64,
+                            seq_len,
+                            self.scale,
+                        )?
+                    {
+                        AttentionOutput::Gated(out)
+                    } else if let Some(out) = crate::kernels::attention::sdpa_prefill_d256_masked(
+                        &queries,
+                        &keys,
+                        &values,
+                        m,
+                        self.head_dim as i64,
+                        seq_len,
+                        self.scale,
+                    )? {
+                        AttentionOutput::Ungated(out)
+                    } else {
+                        AttentionOutput::Ungated(scaled_dot_product_attention(
+                            &queries,
+                            &keys,
+                            &values,
+                            self.scale as f64,
+                            Some(m),
+                        )?)
+                    }
+                }
+            }
         } else if seq_len > 1 {
             // The fused vector kernel launches 32×gqa×qL threads in its
             // 2-pass variant — qL·gqa > 32 exceeds the threadgroup limit and
@@ -1003,7 +1517,7 @@ impl Qwen3_5Attention {
                     &values,
                     self.scale as f64,
                 )?;
-                MxArray::concatenate(&out_head, &out_tail, 2)?
+                AttentionOutput::Ungated(MxArray::concatenate(&out_head, &out_tail, 2)?)
             } else if let Some(out) = crate::kernels::attention::sdpa_causal_few(
                 &queries,
                 &keys,
@@ -1013,7 +1527,17 @@ impl Qwen3_5Attention {
                 seq_len,
                 self.scale,
             )? {
-                out
+                AttentionOutput::Ungated(out)
+            } else if let Some(out) = crate::kernels::attention::sdpa_prefill_d256_gated(
+                &queries,
+                &keys,
+                &values,
+                &gate,
+                self.head_dim as i64,
+                seq_len,
+                self.scale,
+            )? {
+                AttentionOutput::Gated(out)
             } else if let Some(out) = crate::kernels::attention::sdpa_prefill_d256(
                 &queries,
                 &keys,
@@ -1022,22 +1546,52 @@ impl Qwen3_5Attention {
                 seq_len,
                 self.scale,
             )? {
-                out
+                AttentionOutput::Ungated(out)
             } else {
-                scaled_dot_product_attention_causal(&queries, &keys, &values, self.scale as f64)?
+                AttentionOutput::Ungated(scaled_dot_product_attention_causal(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                )?)
             }
         } else {
-            scaled_dot_product_attention(&queries, &keys, &values, self.scale as f64, None)?
+            let gqa = (self.num_heads / self.num_kv_heads.max(1)) as i64;
+            if let Some(out) = crate::kernels::attention::sdpa_unmasked_few(
+                &queries,
+                &keys,
+                &values,
+                self.head_dim as i64,
+                gqa,
+                seq_len,
+                self.scale,
+            )? {
+                AttentionOutput::Ungated(out)
+            } else {
+                AttentionOutput::Ungated(scaled_dot_product_attention(
+                    &queries,
+                    &keys,
+                    &values,
+                    self.scale as f64,
+                    None,
+                )?)
+            }
         };
 
-        // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
-        let output = output.transpose(Some(&[0, 2, 1, 3]))?;
-        let output = output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
+        let gated_output = match output {
+            AttentionOutput::Gated(out) => out,
+            AttentionOutput::Ungated(output) => {
+                // Transpose back: [B, H, T, D] → [B, T, H, D] → flatten to [B, T, H*D]
+                let output = output.transpose(Some(&[0, 2, 1, 3]))?;
+                let output =
+                    output.reshape(&[batch, seq_len, (self.num_heads * self.head_dim) as i64])?;
 
-        // Apply gate: output * sigmoid(gate) — one compiled fusion instead
-        // of a Sigmoid + Multiply pair.
-        // gate is already [B, T, H*D] from the per-head split above
-        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+                // Apply gate: output * sigmoid(gate) — one compiled fusion instead
+                // of a Sigmoid + Multiply pair.
+                // gate is already [B, T, H*D] from the per-head split above
+                Activations::sigmoid_mul_compiled(&gate, &output)?
+            }
+        };
 
         // Output projection
         self.o_proj.forward(&gated_output)
@@ -3876,6 +4430,7 @@ mod tests {
 
     /// `n` values uniform in ±1 from `seed`; with `outlier`, dimension
     /// `(row · 37) % dim` of each `dim`-wide row times 60.
+    #[cfg(target_os = "macos")]
     fn paged_attend_values(n: usize, dim: usize, seed: u32, outlier: bool) -> Vec<f32> {
         let mut state = seed.wrapping_mul(2_654_435_761).wrapping_add(11);
         (0..n)
@@ -3892,12 +4447,14 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "macos")]
     fn bf16_array(values: &[f32], shape: &[i64]) -> MxArray {
         MxArray::from_float32(values, shape)
             .and_then(|a| a.astype(DType::BFloat16))
             .expect("bf16 array")
     }
 
+    #[cfg(target_os = "macos")]
     fn f32_values(array: &MxArray) -> Vec<f32> {
         array
             .astype(DType::Float32)
@@ -4528,5 +5085,188 @@ mod tests {
         assert_eq!(probe(0) - launches, 2, "one tile launch per chunk");
         assert!(crate::transformer::paged_kv_cache_adapter::device_prefill_mpp_builds());
         assert_eq!(probe(2), 1, "the device is asked once per process");
+    }
+
+    #[test]
+    fn causal_valid_mask_matches_explicit_padded_mask_d256() -> Result<()> {
+        let cfg = Qwen3_5Config {
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 1,
+            head_dim: 256,
+            partial_rotary_factor: 0.25,
+            ..tiny_cfg()
+        };
+        let mut attn = Qwen3_5Attention::new(&cfg)?;
+        let det_bf16 = |shape: &[i64], salt: f32, scale: f32| -> Result<MxArray> {
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            let vals: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.2713 + salt).sin() * scale)
+                .collect();
+            MxArray::from_float32(&vals, shape)?.astype(DType::BFloat16)
+        };
+        let h = cfg.hidden_size as i64;
+        let nq = cfg.num_heads as i64;
+        let nkv = cfg.num_kv_heads as i64;
+        let d = cfg.head_dim as i64;
+        attn.set_q_proj_weight(&det_bf16(&[2 * nq * d, h], 1.0, 0.08)?)?;
+        attn.set_k_proj_weight(&det_bf16(&[nkv * d, h], 2.0, 0.08)?)?;
+        attn.set_v_proj_weight(&det_bf16(&[nkv * d, h], 3.0, 0.08)?)?;
+        attn.set_o_proj_weight(&det_bf16(&[h, nq * d], 4.0, 0.08)?)?;
+        let norm_w = MxArray::ones(&[d], Some(DType::BFloat16))?;
+        attn.set_q_norm_weight(&norm_w, DType::BFloat16)?;
+        attn.set_k_norm_weight(&norm_w, DType::BFloat16)?;
+
+        let prefix = det_bf16(&[2, 7, h], 5.0, 0.25)?;
+        let mut kv_compact = KVCache::new();
+        let mut kv_explicit = KVCache::new();
+        let _ = attn.forward(&prefix, None, Some(&mut kv_compact), None)?;
+        let _ = attn.forward(&prefix, None, Some(&mut kv_explicit), None)?;
+
+        // Exercise both Q=12 (inside 9..=16, must NOT hit non-causal sdpa_masked_few)
+        // and Q=20 (> 16), with right-padding on row 0 and non-zero KV cache offset.
+        for (step, &q_len) in [12i64, 20i64].iter().enumerate() {
+            let offset = kv_compact.get_offset() as i64;
+            let total_kv = offset + q_len;
+            let mut valid = vec![1i32; (2 * total_kv) as usize];
+            valid[(offset + q_len - 4) as usize..total_kv as usize].fill(0);
+            let valid_4d = MxArray::from_int32(&valid, &[2, 1, 1, total_kv])?
+                .greater(&MxArray::scalar_int(0)?)?;
+            let key_index = MxArray::arange(0.0, total_kv as f64, Some(1.0), Some(DType::Int32))?
+                .reshape(&[1, 1, 1, total_kv])?;
+            let row_index = MxArray::arange(
+                offset as f64,
+                total_kv as f64,
+                Some(1.0),
+                Some(DType::Int32),
+            )?
+            .reshape(&[1, 1, q_len, 1])?;
+            let causal = key_index.less_equal(&row_index)?;
+            let diag = key_index.equal(&row_index)?;
+            let explicit_mask = causal.logical_and(&valid_4d.logical_or(&diag)?)?;
+
+            let x = det_bf16(&[2, q_len, h], 10.0 + step as f32, 0.25)?;
+            let out_compact = attn
+                .forward_with_mask(
+                    &x,
+                    Some(AttentionMask::CausalValid(&valid_4d)),
+                    Some(&mut kv_compact),
+                    None,
+                )?
+                .astype(DType::Float32)?;
+            let out_explicit = attn
+                .forward(&x, Some(&explicit_mask), Some(&mut kv_explicit), None)?
+                .astype(DType::Float32)?;
+            MxArray::eval_arrays(&[&out_compact, &out_explicit])?;
+
+            let got = out_compact.to_float32()?;
+            let want = out_explicit.to_float32()?;
+            assert_eq!(got.len(), want.len());
+            let mut max_diff = 0.0f32;
+            for (&a, &b) in got.iter().zip(want.iter()) {
+                assert!(
+                    a.is_finite() && b.is_finite(),
+                    "non-finite output at Q={q_len}"
+                );
+                max_diff = max_diff.max((a - b).abs());
+            }
+            assert!(
+                max_diff < 2e-2,
+                "causal valid [B,1,1,K] vs explicit [B,1,Q,K] mismatch at Q={q_len}: max_diff={max_diff}"
+            );
+        }
+
+        // Invalid CausalValid geometry (seq_len < 9) must fail loudly instead of silently
+        // routing to a non-causal SDPA kernel.
+        let short_x = det_bf16(&[2, 4, h], 99.0, 0.25)?;
+        let short_valid =
+            MxArray::from_int32(&[1; 8], &[2, 1, 1, 4])?.greater(&MxArray::scalar_int(0)?)?;
+        assert!(
+            attn.forward_with_mask(
+                &short_x,
+                Some(AttentionMask::CausalValid(&short_valid)),
+                None,
+                None,
+            )
+            .is_err(),
+            "CausalValid mask with seq_len < 9 must return an error"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forward_additive_1d_mask_at_q12_is_not_hijacked_or_inverted() -> Result<()> {
+        let cfg = Qwen3_5Config {
+            hidden_size: 256,
+            num_heads: 4,
+            num_kv_heads: 1,
+            head_dim: 256,
+            partial_rotary_factor: 0.25,
+            ..tiny_cfg()
+        };
+        let mut attn = Qwen3_5Attention::new(&cfg)?;
+        let det_bf16 = |shape: &[i64], salt: f32, scale: f32| -> Result<MxArray> {
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            let vals: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.2713 + salt).sin() * scale)
+                .collect();
+            MxArray::from_float32(&vals, shape)?.astype(DType::BFloat16)
+        };
+        let h = cfg.hidden_size as i64;
+        let nq = cfg.num_heads as i64;
+        let nkv = cfg.num_kv_heads as i64;
+        let d = cfg.head_dim as i64;
+        attn.set_q_proj_weight(&det_bf16(&[2 * nq * d, h], 11.0, 0.08)?)?;
+        attn.set_k_proj_weight(&det_bf16(&[nkv * d, h], 12.0, 0.08)?)?;
+        attn.set_v_proj_weight(&det_bf16(&[nkv * d, h], 13.0, 0.08)?)?;
+        attn.set_o_proj_weight(&det_bf16(&[h, nq * d], 14.0, 0.08)?)?;
+        let norm_w = MxArray::ones(&[d], Some(DType::BFloat16))?;
+        attn.set_q_norm_weight(&norm_w, DType::BFloat16)?;
+        attn.set_k_norm_weight(&norm_w, DType::BFloat16)?;
+
+        let q_len = 12i64;
+        let x = det_bf16(&[2, q_len, h], 15.0, 0.25)?;
+
+        // Float additive [B, 1, 1, K] mask (0.0 = attend, -1e9 = mask out):
+        // - batch 0 attends only to keys 0..4
+        // - batch 1 attends only to future keys 4..12
+        // If public `forward` hijacked `shape(2) == 1` into `causal & (valid | diag)`,
+        // `logical_or` would invert 0.0 -> false and -1e9 -> true AND force causal masking.
+        let mut mask_vals = vec![0.0f32; (2 * q_len) as usize];
+        mask_vals[4..q_len as usize].fill(-1e9);
+        mask_vals[q_len as usize..(q_len + 4) as usize].fill(-1e9);
+        let additive_1d =
+            MxArray::from_float32(&mask_vals, &[2, 1, 1, q_len])?.astype(DType::BFloat16)?;
+        let additive_full = MxArray::tile(&additive_1d, &[1, 1, q_len as i32, 1])?;
+
+        let out_1d = attn
+            .forward(&x, Some(&additive_1d), None, None)?
+            .astype(DType::Float32)?;
+        let out_full = attn
+            .forward(&x, Some(&additive_full), None, None)?
+            .astype(DType::Float32)?;
+        let out_causal = attn.forward(&x, None, None, None)?.astype(DType::Float32)?;
+        MxArray::eval_arrays(&[&out_1d, &out_full, &out_causal])?;
+
+        let got = out_1d.to_float32()?;
+        let want = out_full.to_float32()?;
+        let causal = out_causal.to_float32()?;
+        assert_eq!(got.len(), want.len());
+        let mut max_diff = 0.0f32;
+        let mut max_causal_diff = 0.0f32;
+        for ((&a, &b), &c) in got.iter().zip(want.iter()).zip(causal.iter()) {
+            assert!(a.is_finite() && b.is_finite(), "non-finite output at Q=12");
+            max_diff = max_diff.max((a - b).abs());
+            max_causal_diff = max_causal_diff.max((a - c).abs());
+        }
+        assert!(
+            max_diff < 1e-3,
+            "public forward hijacked/inverted float additive [B,1,1,K] mask at Q=12: max_diff={max_diff}"
+        );
+        assert!(
+            max_causal_diff > 1e-3,
+            "float additive [B,1,1,K] mask had no effect vs causal attention: max_causal_diff={max_causal_diff}"
+        );
+        Ok(())
     }
 }

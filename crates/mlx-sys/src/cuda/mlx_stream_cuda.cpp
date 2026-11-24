@@ -13,6 +13,20 @@
 
 namespace mlx_node {
 
+#ifdef MLX_NODE_CUDA_ENABLED
+std::shared_mutex& mlx_cuda_graphs_eval_mutex() noexcept {
+  // Intentionally leaked so background threads or late destructors during
+  // process shutdown never lock a destroyed mutex.
+  static auto* mu = new std::shared_mutex();
+  return *mu;
+}
+
+uint32_t& mlx_cuda_graphs_eval_read_depth() noexcept {
+  thread_local uint32_t depth = 0;
+  return depth;
+}
+#endif
+
 int32_t cuda_device_static_memory_info(
     uint64_t* out_total,
     bool* out_is_unified) {
@@ -127,6 +141,15 @@ int32_t mlx_device_free_memory(uint64_t* out_free) {
 bool mlx_cuda_set_use_graphs(bool enable) {
 #ifdef MLX_NODE_CUDA_ENABLED
   try {
+    if (mlx_node::mlx_cuda_graphs_eval_read_depth() > 0) {
+      std::cerr << "[MLX] Refusing mlx_cuda_set_use_graphs("
+                << (enable ? "true" : "false")
+                << ") while CUDA eval read lock is held on current thread"
+                << std::endl;
+      return mlx::core::cu::get_use_cuda_graphs();
+    }
+    std::unique_lock<std::shared_mutex> lk(
+        mlx_node::mlx_cuda_graphs_eval_mutex());
     return mlx::core::cu::set_use_cuda_graphs(enable);
   } catch (const std::exception& e) {
     std::cerr << "[MLX] Exception in mlx_cuda_set_use_graphs: " << e.what()

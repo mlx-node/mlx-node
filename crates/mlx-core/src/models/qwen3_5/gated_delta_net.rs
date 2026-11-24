@@ -595,7 +595,9 @@ impl GatedDeltaNet {
     /// Precomputes the stacked `[qkvz; ba]` input projection, so forward uses
     /// one matmul plus two axis-2 slices instead of two separate matmuls.
     ///
-    /// Dense path: stacks the transposed weights into `in_proj_qkvz_ba_t`.
+    /// Dense path: stacks the transposed weights into `in_proj_qkvz_ba_t` and
+    /// swaps `in_proj_qkvz`/`in_proj_ba` for zero-copy row-slice views so
+    /// getters keep working and no duplicate storage is retained.
     /// Quantized path: row-merges the packed weights into `in_proj_qkvz_ba_q`
     /// when both formats are mergeable (`LinearProj::concat_rows`), and swaps
     /// `in_proj_qkvz`/`in_proj_ba` for zero-copy row-slice views so getters
@@ -610,6 +612,17 @@ impl GatedDeltaNet {
     /// output columns that `forward` drops (`split_ba_padded`), so the merge
     /// stays one dispatch per layer with the numerics of the unpadded pair.
     pub fn finalize_after_load(&mut self) -> Result<()> {
+        self.finalize_after_load_with_host_policy(false)
+    }
+
+    /// Like [`Self::finalize_after_load`], but when `preserve_host_backed` is
+    /// `true`, skips GPU row-concatenation merges on projections that have
+    /// settled CUDA host-backed storage (`device < 0`) so overflow layers stay
+    /// host-backed instead of being re-promoted into VRAM.
+    pub(crate) fn finalize_after_load_with_host_policy(
+        &mut self,
+        preserve_host_backed: bool,
+    ) -> Result<()> {
         let mut derived = vec![&self.a_log, &self.qk_norm_w_q, &self.qk_norm_w_k];
         derived.extend(
             [&self.gdn_scale_f32, &self.dt_bias_f32, &self.conv1d_w4_f32]
@@ -619,6 +632,8 @@ impl GatedDeltaNet {
         MxArray::eval_arrays(&derived)?;
         self.split_in_proj_b_a_m8 = None;
         if let Some((b, a)) = self.split_in_proj_b_a.as_ref()
+            && !(preserve_host_backed
+                && (b.has_settled_cuda_host_storage() || a.has_settled_cuda_host_storage()))
             && !std::env::var("MLX_GDN_BA_FUSION").is_ok_and(|v| v == "0")
             && let Some(merged) = merge_split_ba_m8(b, a)?
         {
@@ -633,6 +648,14 @@ impl GatedDeltaNet {
             self.split_in_proj_b_a_m8 = Some(merged);
         }
         if self.split_in_proj_qkv_z.is_some() || self.split_in_proj_b_a.is_some() {
+            self.in_proj_qkvz_ba_t = None;
+            self.in_proj_qkvz_ba_q = None;
+            return Ok(());
+        }
+        if preserve_host_backed
+            && (self.in_proj_qkvz.has_settled_cuda_host_storage()
+                || self.in_proj_ba.has_settled_cuda_host_storage())
+        {
             self.in_proj_qkvz_ba_t = None;
             self.in_proj_qkvz_ba_q = None;
             return Ok(());
@@ -661,11 +684,24 @@ impl GatedDeltaNet {
             }
             _ => return Ok(()),
         }
+        if self.in_proj_qkvz_ba_t.is_some() {
+            return Ok(());
+        }
         let w_qkvz = self.in_proj_qkvz.get_weight(); // [qkvz_dim, hidden]
         let w_ba = self.in_proj_ba.get_weight(); // [ba_dim, hidden]
+        let qkvz_dim = w_qkvz.shape_at(0)?;
+        let ba_dim = w_ba.shape_at(0)?;
         let stacked = MxArray::concatenate(&w_qkvz, &w_ba, 0)?; // [qkvz_dim+ba_dim, hidden]
         let stacked_t = stacked.transpose(Some(&[1, 0]))?; // [hidden, qkvz_dim+ba_dim]
         stacked_t.eval();
+        // Replace the individual dense projection buffers with zero-copy views
+        // over `stacked_t` so the original `w_qkvz`/`w_ba` buffers are
+        // released while preserving `get_in_proj_*_weight()` bit-for-bit.
+        let stacked_view = stacked_t.transpose(Some(&[1, 0]))?;
+        let qkvz_view = stacked_view.slice_axis(0, 0, qkvz_dim)?;
+        let ba_view = stacked_view.slice_axis(0, qkvz_dim, qkvz_dim + ba_dim)?;
+        self.in_proj_qkvz.set_weight(&qkvz_view, "in_proj_qkvz")?;
+        self.in_proj_ba.set_weight(&ba_view, "in_proj_ba")?;
         self.in_proj_qkvz_ba_t = Some(stacked_t);
         Ok(())
     }
@@ -779,6 +815,32 @@ impl GatedDeltaNet {
         )
     }
 
+    /// Whether this GDN layer can consume pre-quantized `(x_i8, s_x)` for
+    /// `in_proj_qkvz` alongside `normed` for `in_proj_ba` from a fused
+    /// `(Add +) RMSNorm + Hadamard-1024 + INT8 quant` kernel on CUDA.
+    ///
+    /// Returns `Some(signs)` (`in_proj_qkvz.sym8_signs()`) when `in_proj_qkvz`
+    /// is unmerged `Sym8` (no `in_proj_qkvz_ba_q`, `in_proj_qkvz_ba_t`, or
+    /// `split_in_proj_qkv_z`, and no GDN permutation).
+    pub(crate) fn can_fuse_norm_sym8_cuda(&self) -> Option<Option<&MxArray>> {
+        if !crate::accelerator::cuda_sym8_available()
+            || self.in_proj_qkvz_ba_t.is_some()
+            || self.in_proj_qkvz_ba_q.is_some()
+            || self.split_in_proj_qkv_z.is_some()
+        {
+            return None;
+        }
+        let qkvz_ql = self.in_proj_qkvz.as_quantized()?;
+        if !qkvz_ql.is_sym8()
+            || qkvz_ql
+                .hadamard()
+                .is_some_and(|h| h.gdn_permutation.is_some())
+        {
+            return None;
+        }
+        Some(qkvz_ql.sym8_signs())
+    }
+
     /// Tree-verification + CUDA deferred-fold variant of [`Self::forward_with_tape`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_with_tape_deferred_tree(
@@ -791,8 +853,39 @@ impl GatedDeltaNet {
         cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(
+        self.forward_with_tape_core(
             x,
+            None,
+            mask,
+            None,
+            cache,
+            use_kernel,
+            tape_sink,
+            None,
+            None,
+            cuda_deferred,
+            tree,
+        )
+    }
+
+    /// CUDA Sym8 pre-quantized variant of [`Self::forward_with_tape_deferred_tree`]:
+    /// feeds `prequant_sym8` straight to `in_proj_qkvz.forward_prequantized_sym8`
+    /// and `x` (`normed`) to `in_proj_ba`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_tape_deferred_tree_prequant_sym8(
+        &self,
+        x: &MxArray,
+        prequant_sym8: (&MxArray, &MxArray),
+        mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_core(
+            x,
+            Some(prequant_sym8),
             mask,
             None,
             cache,
@@ -825,8 +918,33 @@ impl GatedDeltaNet {
         valid_lengths: Option<&[i32]>,
         cache: Option<&mut ArraysCache>,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(
+        self.forward_with_tape_core(
             x,
+            None,
+            mask,
+            valid_lengths,
+            cache,
+            true,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// CUDA Sym8 pre-quantized variant of [`Self::forward_batched_masked`].
+    pub(crate) fn forward_batched_masked_prequant_sym8(
+        &self,
+        x: &MxArray,
+        prequant_sym8: (&MxArray, &MxArray),
+        mask: Option<&MxArray>,
+        valid_lengths: Option<&[i32]>,
+        cache: Option<&mut ArraysCache>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_core(
+            x,
+            Some(prequant_sym8),
             mask,
             valid_lengths,
             cache,
@@ -988,6 +1106,36 @@ impl GatedDeltaNet {
         x: &MxArray,
         mask: Option<&MxArray>,
         valid_lengths: Option<&[i32]>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        residual: Option<MixerResidual<'_>>,
+        capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
+        cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
+        tree: Option<&super::verify_tree::TreeDeviceViews>,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_core(
+            x,
+            None,
+            mask,
+            valid_lengths,
+            cache,
+            use_kernel,
+            tape_sink,
+            residual,
+            capture,
+            cuda_deferred,
+            tree,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_with_tape_core(
+        &self,
+        x: &MxArray,
+        prequant_sym8: Option<(&MxArray, &MxArray)>,
+        mask: Option<&MxArray>,
+        valid_lengths: Option<&[i32]>,
         mut cache: Option<&mut ArraysCache>,
         use_kernel: bool,
         mut tape_sink: Option<&mut Option<GdnLayerTape>>,
@@ -1049,7 +1197,7 @@ impl GatedDeltaNet {
             ));
         }
 
-        let (qkv, z, b, a) = self.in_projections(x)?;
+        let (qkv, z, b, a) = self.in_projections(x, prequant_sym8)?;
 
         // Apply mask before conv to prevent masked values leaking through convolution
         let qkv = if let Some(m) = mask {
@@ -1174,14 +1322,75 @@ impl GatedDeltaNet {
         }
 
         // Fully-fused prep: conv + SiLU + q|k|v split + q/k L2-norm + decay/beta
-        // gating in ONE GPU dispatch (`kernels::gdn::prepare` or `prepare_tree`
-        // — Metal or CUDA, hardcoded to this family's 10240-wide 16k/48v×128 geometry).
-        let prepared = (|| -> Option<[MxArray; 6]> {
-            let max_prepare_seq = if crate::accelerator::cuda_ops_available() {
-                4097
-            } else {
-                64
-            };
+        // gating in ONE GPU dispatch (`kernels::gdn::prepare_batched` on CUDA for
+        // general 128-dim geometries & B >= 1, `prepare_tree` for tree verify, or
+        // `prepare` on Metal for the 10240-wide 16k/48v×128 geometry).
+        let prepared = (|| -> Option<([MxArray; 6], bool)> {
+            if !use_kernel {
+                return None;
+            }
+            let is_cuda = crate::accelerator::cuda_ops_available();
+            if is_cuda && tree.is_none() {
+                if batch < 1
+                    || !(1..65536).contains(&seq_len)
+                    || self.conv_kernel_dim != 4
+                    || self.key_head_dim != 128
+                    || self.value_head_dim != 128
+                    || self.num_k_heads <= 0
+                    || self.num_v_heads <= 0
+                    || self.num_v_heads % self.num_k_heads != 0
+                    || self.conv_dim != (2 * self.num_k_heads + self.num_v_heads) * 128
+                {
+                    return None;
+                }
+                let conv_w = self.conv1d_w4_f32.as_ref()?;
+                let scale = self.gdn_scale_f32.as_ref()?;
+                let dt = self.dt_bias_f32.as_ref()?;
+                if qkv.dtype().ok()? != crate::array::DType::BFloat16
+                    || a.dtype().ok()? == crate::array::DType::Float16
+                    || b.dtype().ok()? == crate::array::DType::Float16
+                {
+                    return None;
+                }
+                let history = match &conv_state {
+                    Some(s) => {
+                        if s.dtype().ok()? != crate::array::DType::BFloat16 {
+                            return None;
+                        }
+                        s.clone()
+                    }
+                    None => MxArray::zeros(
+                        &[
+                            batch,
+                            (self.conv_kernel_dim - 1) as i64,
+                            self.conv_dim as i64,
+                        ],
+                        Some(crate::array::DType::BFloat16),
+                    )
+                    .ok()?,
+                };
+                let valid_lengths_arr = valid_lengths
+                    .map(|ls| MxArray::from_int32(ls, &[batch]))
+                    .transpose()
+                    .ok()?;
+                // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
+                // mean) and bf16 beta — bit-faithful to the conv fallback.
+                let out = crate::kernels::gdn::prepare_batched(
+                    &qkv,
+                    &a,
+                    &b,
+                    conv_w,
+                    &history,
+                    scale,
+                    dt,
+                    valid_lengths_arr.as_ref(),
+                    true,
+                    true,
+                )
+                .ok()??;
+                return Some((out, true));
+            }
+            let max_prepare_seq = if is_cuda { 65536 } else { 64 };
             if batch != 1
                 || seq_len >= max_prepare_seq
                 || valid_lengths.is_some()
@@ -1191,7 +1400,6 @@ impl GatedDeltaNet {
                 || self.key_head_dim != 128
                 || self.num_v_heads != 48
                 || self.value_head_dim != 128
-                || !use_kernel
             {
                 return None;
             }
@@ -1214,7 +1422,7 @@ impl GatedDeltaNet {
             };
             // qwen3_5 semantics: mean-eps norm (rms_norm eps inside the
             // mean) and bf16 beta — bit-faithful to the conv fallback.
-            if let Some(tv) = tree {
+            let out = if let Some(tv) = tree {
                 crate::kernels::gdn::prepare_tree(
                     &qkv,
                     &a,
@@ -1227,56 +1435,60 @@ impl GatedDeltaNet {
                     true,
                     true,
                 )
-                .ok()?
+                .ok()??
             } else {
                 crate::kernels::gdn::prepare(&qkv, &a, &b, conv_w, &history, scale, dt, true, true)
-                    .ok()?
-            }
+                    .ok()??
+            };
+            Some((out, false))
         })();
 
-        let (q, k, v, precomputed) = if let Some([pq, pk, pv, decay, beta, history]) = prepared {
-            if let Some(cache) = cache.as_deref_mut() {
-                // Same [K-1, W] window tail the fused/fallback conv paths store.
-                cache.set(
-                    0,
-                    history.reshape(&[
-                        1,
-                        (self.conv_kernel_dim - 1) as i64,
-                        self.conv_dim as i64,
-                    ])?,
-                )?;
-            }
-            (pq, pk, pv, Some((decay, beta)))
-        } else if let Some(tv) = tree {
-            let (q, k, v) = self.prep_via_conv_tree(
-                &qkv,
-                batch,
-                seq_len,
-                cache.as_deref_mut(),
-                conv_state,
-                &tv.conv_taps_i32,
-            )?;
-            (q, k, v, None)
-        } else {
-            let (q, k, v) = match prefill_prep {
-                // The conv already ran inside `prefill_fused`; only the q/k
-                // norms are left of the prep stage.
-                Some(PrefillPrep::Raw { q, k, v }) => {
-                    let (q, k) = self.norm_qk(&q, &k)?;
-                    (q, k, v)
+        let (q, k, v, precomputed) =
+            if let Some(([pq, pk, pv, decay, beta, history], history_is_3d)) = prepared {
+                if let Some(cache) = cache.as_deref_mut() {
+                    // Same [B, K-1, W] window tail the fused/fallback conv paths store.
+                    let next_conv = if history_is_3d {
+                        history
+                    } else {
+                        history.reshape(&[
+                            1,
+                            (self.conv_kernel_dim - 1) as i64,
+                            self.conv_dim as i64,
+                        ])?
+                    };
+                    cache.set(0, next_conv)?;
                 }
-                _ => self.prep_via_conv(
+                (pq, pk, pv, Some((decay, beta)))
+            } else if let Some(tv) = tree {
+                let (q, k, v) = self.prep_via_conv_tree(
                     &qkv,
                     batch,
                     seq_len,
-                    valid_lengths,
                     cache.as_deref_mut(),
                     conv_state,
-                    use_kernel,
-                )?,
+                    &tv.conv_taps_i32,
+                )?;
+                (q, k, v, None)
+            } else {
+                let (q, k, v) = match prefill_prep {
+                    // The conv already ran inside `prefill_fused`; only the q/k
+                    // norms are left of the prep stage.
+                    Some(PrefillPrep::Raw { q, k, v }) => {
+                        let (q, k) = self.norm_qk(&q, &k)?;
+                        (q, k, v)
+                    }
+                    _ => self.prep_via_conv(
+                        &qkv,
+                        batch,
+                        seq_len,
+                        valid_lengths,
+                        cache.as_deref_mut(),
+                        conv_state,
+                        use_kernel,
+                    )?,
+                };
+                (q, k, v, None)
             };
-            (q, k, v, None)
-        };
         if self.tiled_gguf_layout
             && (self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0)
         {
@@ -1610,9 +1822,8 @@ impl GatedDeltaNet {
             }
             result
         } else {
-            let mut start_state_opt = None;
-            if mask.is_none()
-                && batch == 1
+            let mut cuda_chain = None;
+            if batch >= 1
                 && use_kernel
                 && crate::accelerator::cuda_ops_available()
                 && self.key_head_dim == 128
@@ -1623,7 +1834,7 @@ impl GatedDeltaNet {
                     Some(s) => s.clone(),
                     None => MxArray::zeros(
                         &[
-                            1,
+                            batch,
                             self.num_v_heads as i64,
                             self.value_head_dim as i64,
                             self.key_head_dim as i64,
@@ -1631,12 +1842,22 @@ impl GatedDeltaNet {
                         Some(crate::array::DType::Float32),
                     )?,
                 };
-                if let Some((y_flat, new_state)) = crate::kernels::gdn::prefill_chain_gated(
+                let masked = mask
+                    .map(|m| super::gated_delta::apply_neutral_gdn_mask(&k, &v, decay, beta, m))
+                    .transpose()?;
+                let (k_in, v_in, decay_in, beta_in) = match &masked {
+                    Some((km, vm, dm, bm)) => (km, vm, dm, bm),
+                    None => (&k, &v, decay, beta),
+                };
+                if matches!(
+                    self.norm.weight().dtype().ok(),
+                    Some(crate::array::DType::BFloat16 | crate::array::DType::Float32)
+                ) && let Some((y_flat, new_state)) = crate::kernels::gdn::prefill_chain_gated(
                     &q,
-                    &k,
-                    &v,
-                    decay,
-                    beta,
+                    k_in,
+                    v_in,
+                    decay_in,
+                    beta_in,
                     &start_state,
                     &z,
                     self.norm.weight(),
@@ -1650,23 +1871,16 @@ impl GatedDeltaNet {
                     note_route(GdnRoute::Chain);
                     return self.out_proj.forward_mixer_output(&y_flat, None, residual);
                 }
-                start_state_opt = Some(start_state);
-            }
-            let cuda_chain = if let (Some(start_state), Some((decay, beta))) =
-                (start_state_opt.as_ref(), precomputed.as_ref())
-            {
-                crate::kernels::gdn::prefill_chain(
+                cuda_chain = crate::kernels::gdn::prefill_chain(
                     &q,
-                    &k,
-                    &v,
-                    decay,
-                    beta,
-                    start_state,
+                    k_in,
+                    v_in,
+                    decay_in,
+                    beta_in,
+                    &start_state,
                     self.tiled_gguf_layout,
-                )?
-            } else {
-                None
-            };
+                )?;
+            }
             if let Some(pair) = cuda_chain {
                 pair
             } else if self.tiled_gguf_layout {
@@ -1729,7 +1943,35 @@ impl GatedDeltaNet {
     }
 
     /// `x` `[B, T, H]` -> `(qkv, z, b, a)`, the layer's input projections.
-    fn in_projections(&self, x: &MxArray) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+    fn in_projections(
+        &self,
+        x: &MxArray,
+        prequant_sym8: Option<(&MxArray, &MxArray)>,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        if let Some((x_i8, s_x)) = prequant_sym8
+            && self.in_proj_qkvz_ba_t.is_none()
+            && self.in_proj_qkvz_ba_q.is_none()
+            && self.split_in_proj_qkv_z.is_none()
+            && let Some(qkvz_ql) = self.in_proj_qkvz.as_quantized()
+            && qkvz_ql.is_sym8()
+        {
+            let batch = x.shape_at(0)?;
+            let seq_len = x.shape_at(1)?;
+            let qkvz =
+                qkvz_ql.forward_prequantized_sym8(x_i8, s_x, &[batch, seq_len], x.dtype()?)?;
+            let qkvz_split = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
+            let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
+                match project_split_ba_m8(x, self.split_in_proj_b_a_m8.as_ref())? {
+                    Some(pair) => pair,
+                    None => (b_proj.forward(x)?, a_proj.forward(x)?),
+                }
+            } else {
+                let ba = self.in_proj_ba.forward(x)?;
+                self.split_ba_padded(&ba)?
+            };
+            return Ok((qkvz_split[0].clone(), qkvz_split[1].clone(), b, a));
+        }
+
         // When the stacked weight is available, do one matmul + one split.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
         let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
@@ -1828,7 +2070,7 @@ impl GatedDeltaNet {
         };
         if self.in_proj_qkvz_ba_t.is_some() {
             let parts = per_lane(&|x| {
-                let (qkv, z, b, a) = self.in_projections(x)?;
+                let (qkv, z, b, a) = self.in_projections(x, None)?;
                 Ok(vec![qkv, z, b, a])
             })?;
             return Ok((

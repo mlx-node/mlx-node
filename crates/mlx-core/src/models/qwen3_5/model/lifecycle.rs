@@ -106,6 +106,7 @@ impl Qwen35Inner {
             clairic_grammar: None,
             clairic_multimodal: crate::models::qwen3_5::config::Qwen3_5MultimodalTokens::default(),
             clairic_profile: None,
+            clairic_cache: crate::models::clairic::persistent_cache::ClairicPersistentCache::new(),
             prism_hadamard: None,
             dflash2: None,
             dflash2_context: None,
@@ -142,6 +143,7 @@ impl Qwen35Inner {
             model_id,
             clef_compiled_decide_disabled: false,
             clef_compiled_decide_shapes: std::collections::HashSet::new(),
+            clef_cuda_gdn_zeros: None,
             active_cache_owner_id: String::new(),
             gdn_root_cache_owner_id: None,
             gdn_root_cache_owner_is_explicit: false,
@@ -850,6 +852,7 @@ impl Qwen35Inner {
             }
         }
         self.caches = None;
+        self.clairic_cache.clear();
         self.dflash2_context = None;
         self.dflash2_turn_state = None;
         self.dflash2_states.clear();
@@ -1578,6 +1581,7 @@ impl Qwen35Inner {
 
 impl Drop for Qwen35Inner {
     fn drop(&mut self) {
+        self.clairic_cache.clear();
         self.erase_compiled_verifies();
     }
 }
@@ -1913,6 +1917,7 @@ impl Qwen35Inner {
     pub(crate) fn set_vision_encoder(&mut self, enc: QwenVisionEncoder) -> Result<()> {
         self.vision_encoder = Some(Arc::new(enc));
         self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+        self.clairic_cache.clear();
         Ok(())
     }
 
@@ -1920,12 +1925,14 @@ impl Qwen35Inner {
     pub(crate) fn set_image_processor(&mut self, proc: QwenImageProcessor) {
         self.image_processor = Some(Arc::new(proc));
         self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+        self.clairic_cache.clear();
     }
 
     /// Set spatial merge size.
     pub(crate) fn set_spatial_merge_size(&mut self, size: i32) {
         self.spatial_merge_size = Some(size);
         self.vision_cache = Arc::new(Mutex::new(VisionCacheInner::new()));
+        self.clairic_cache.clear();
     }
 
     /// Initialize M-RoPE on all full attention layers (VLM mode).
@@ -1935,6 +1942,7 @@ impl Qwen35Inner {
         rope_theta: f64,
         max_position_embeddings: i32,
     ) -> Result<()> {
+        self.clairic_cache.clear();
         let rope_dims = self.config.rope_dims();
         let scaling = self.config.scaling();
         for layer in self.layers.iter_mut() {
@@ -1961,5 +1969,6 @@ impl Qwen35Inner {
         for layer in self.layers.iter_mut() {
             layer.set_rope_mode(mode);
         }
+        self.clairic_cache.clear();
     }
 }

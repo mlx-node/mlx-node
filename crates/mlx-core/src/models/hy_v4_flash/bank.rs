@@ -22,7 +22,9 @@
 //! them `NonVolatile` again and, when Metal emptied a class's banks, forgets
 //! that class's tags and cache entries before a gather can read the slots.
 
-use std::collections::{HashMap, VecDeque};
+#[cfg(unix)]
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::ffi::CString;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -35,7 +37,9 @@ use napi::{Error, Result};
 use super::config::MoeConfig;
 use super::kq_slot;
 use super::scan::{ExpertClass, ExpertLayer, Located};
-use super::weights::{Dense, MmapDense, MmapDenseSpec};
+#[cfg(any(unix, test))]
+use super::weights::Dense;
+use super::weights::{MmapDense, MmapDenseSpec};
 use crate::array::alloc::{DstPtrs, MetalResidencySet, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
@@ -1433,7 +1437,9 @@ fn build_direct_bank(
     })
 }
 
+#[cfg(unix)]
 const MMAP_PREWARM_CHUNK: usize = 4 << 20;
+#[cfg(unix)]
 const MMAP_PREWARM_MERGE_GAP: u64 = 4096;
 
 #[cfg(unix)]
@@ -1563,7 +1569,7 @@ fn set_background_io_qos() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn set_background_io_qos() {}
 
 struct MmapWarmHandle {
@@ -1650,13 +1656,17 @@ fn run_mmap_prewarm(
 }
 
 pub const RSET_KEEPALIVE_ENV: &str = "MLX_HY4_RSET_KEEPALIVE_MS";
+#[cfg(any(unix, test))]
 const DEFAULT_RSET_KEEPALIVE_MS: u64 = 2000;
 /// Keep pinging residency briefly after a turn ends so short inter-turn gaps
 /// stay warm, then go quiet during long idle cooldowns so Metal residency pings
 /// do not fight macOS's VM compressor.
+#[cfg(any(unix, test))]
 pub(crate) const RSET_IDLE_GRACE_MS: u64 = 15_000;
+#[cfg(any(unix, test))]
 pub(crate) const RSET_NO_TURN_ENDED: u64 = u64::MAX;
 
+#[cfg(any(unix, test))]
 pub(crate) fn should_ping_rset(
     in_turn: bool,
     last_turn_end_ms: u64,
@@ -1669,6 +1679,7 @@ pub(crate) fn should_ping_rset(
     last_turn_end_ms != RSET_NO_TURN_ENDED && now_ms.saturating_sub(last_turn_end_ms) <= grace_ms
 }
 
+#[cfg(any(unix, test))]
 fn parse_rset_keepalive_ms(val: Option<&str>) -> Option<Duration> {
     let ms = val
         .and_then(|v| v.trim().parse::<u64>().ok())
@@ -1676,6 +1687,7 @@ fn parse_rset_keepalive_ms(val: Option<&str>) -> Option<Duration> {
     (ms > 0).then(|| Duration::from_millis(ms))
 }
 
+#[cfg(any(unix, test))]
 fn rset_keepalive_interval() -> Option<Duration> {
     parse_rset_keepalive_ms(std::env::var(RSET_KEEPALIVE_ENV).ok().as_deref())
 }
@@ -1696,6 +1708,7 @@ impl Drop for RsetKeepaliveHandle {
     }
 }
 
+#[cfg(unix)]
 fn run_rset_keepalive(
     rset: Arc<MetalResidencySet>,
     state: Arc<(Mutex<bool>, Condvar)>,

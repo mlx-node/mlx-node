@@ -620,6 +620,7 @@ bool mlx_array_to_uint8(mlx_array* handle, uint8_t* out, size_t len) {
     return false;
   }
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto flat = flatten(*arr);
     flat.eval();
 
@@ -650,6 +651,7 @@ bool mlx_array_to_int8(mlx_array* handle, int8_t* out, size_t len) {
     return false;
   }
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto flat = flatten(*arr);
     flat.eval();
 

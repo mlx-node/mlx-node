@@ -822,6 +822,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
     // not when CUDA or other GPU backends might be in use
     if (!mlx::core::metal::is_available()) return nullptr;
 
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // Ensure array is evaluated
@@ -840,6 +841,7 @@ void* mlx_array_get_metal_buffer(mlx_array* handle) {
 /// Note: offset() already returns bytes (used with char* in MLX internals)
 size_t mlx_array_get_buffer_offset(mlx_array* handle) {
     if (!handle) return 0;
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto& arr = *reinterpret_cast<array*>(handle);
 
     // eval not strictly needed for offset, but ensure consistency
@@ -857,6 +859,23 @@ size_t mlx_array_get_data_size(mlx_array* handle) {
     return arr.data_size();
 }
 
+/// Get the backing allocator buffer size in bytes for an already-available array.
+/// Returns 0 if the handle is null, the array is not yet available, has no
+/// backing data buffer, or if querying the allocator throws. Never triggers eval.
+size_t mlx_array_get_buffer_size(mlx_array* handle) {
+    if (!handle) return 0;
+    try {
+        const auto& arr = *reinterpret_cast<const array*>(handle);
+        if (!arr.is_available() || !arr.data_shared_ptr() ||
+            arr.buffer().ptr() == nullptr) {
+            return 0;
+        }
+        return arr.buffer_size();
+    } catch (...) {
+        return 0;
+    }
+}
+
 /// Get the item size in bytes for the array's dtype
 size_t mlx_array_get_itemsize(mlx_array* handle) {
     if (!handle) return 0;
@@ -867,6 +886,7 @@ size_t mlx_array_get_itemsize(mlx_array* handle) {
 /// Synchronize - ensure all MLX operations are complete
 /// Call this before dispatching external Metal kernels
 void mlx_metal_synchronize() {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     mlx::core::synchronize();
 }
 

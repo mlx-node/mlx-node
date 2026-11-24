@@ -294,7 +294,7 @@ fn a_lone_verify_takes_one_dispatch_for_its_gdn_in_projections() -> Result<()> {
     ] {
         let gdn = net(qkv, z, seed)?;
         let x8 = bf16_input(&[1, 8, HIDDEN], seed + 10)?;
-        let lone = routes(|| gdn.in_projections(&x8))?;
+        let lone = routes(|| gdn.in_projections(&x8, None))?;
         println!("ROW route {tag} lone 8 rows {ROUTE_FAMILIES:?} = {lone:?}");
         assert_eq!(
             lone,
@@ -302,11 +302,11 @@ fn a_lone_verify_takes_one_dispatch_for_its_gdn_in_projections() -> Result<()> {
             "{tag}: a lone 8-row verify takes one joined dispatch and no b|a call"
         );
         let x7 = bf16_input(&[1, 7, HIDDEN], seed + 11)?;
-        let seven = routes(|| gdn.in_projections(&x7))?;
+        let seven = routes(|| gdn.in_projections(&x7, None))?;
         println!("ROW route {tag} 7 rows = {seven:?}");
         assert_eq!(seven, [0, 0, 1], "{tag}: 7 rows keep b|a on its own call");
         let x64 = bf16_input(&[1, 64, HIDDEN], seed + 12)?;
-        let prefill = routes(|| gdn.in_projections(&x64))?;
+        let prefill = routes(|| gdn.in_projections(&x64, None))?;
         println!("ROW route {tag} prefill 64 rows = {prefill:?}");
         assert_eq!(
             prefill,

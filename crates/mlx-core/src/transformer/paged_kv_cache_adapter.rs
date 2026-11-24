@@ -6006,6 +6006,31 @@ impl PagedKVCacheAdapter {
     }
 
     #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn build_ragged_slot_mapping(
+        &mut self,
+        _rows: &[PagedRaggedRow],
+    ) -> Result<(MxArray, u32), String> {
+        Err("build_ragged_slot_mapping is only supported on macOS (Metal backend)".to_string())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn update_keys_values_native_with_slot_mapping(
+        &mut self,
+        _layer_idx: u32,
+        _keys: &MxArray,
+        _values: &MxArray,
+        _slot_mapping: &MxArray,
+        _total_queries: u32,
+    ) -> Result<(), String> {
+        Err(
+            "update_keys_values_native_with_slot_mapping is only supported on macOS (Metal backend)"
+                .to_string(),
+        )
+    }
+
+    #[cfg(not(target_os = "macos"))]
     pub fn decode_attention_inputs_batched(
         &mut self,
         _seq_ids: &[SeqId],

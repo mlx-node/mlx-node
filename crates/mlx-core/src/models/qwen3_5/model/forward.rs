@@ -552,7 +552,10 @@ impl Qwen35Inner {
     /// Builder errors also latch the model off: a trace failure is
     /// structural and the failed trace keeps its registry entry.
     fn decide_backbone_compiled(&mut self, ids: &MxArray) -> Result<Option<MxArray>> {
-        if self.clef_compiled_decide_disabled || std::env::var_os("MLX_CLEF_NO_COMPILED").is_some()
+        if self.clef_compiled_decide_disabled
+            || std::env::var_os("MLX_CLEF_NO_COMPILED").is_some()
+            || (crate::accelerator::cuda_ops_available()
+                && std::env::var_os("MLX_CLEF_FORCE_COMPILED").is_none())
         {
             return Ok(None);
         }
@@ -629,6 +632,44 @@ impl Qwen35Inner {
         }
     }
 
+    /// Return (creating and evaluating once) the detached zero `(conv_state,
+    /// recurrent_state)` pair for stateless CLEF GDN layers on CUDA.
+    ///
+    /// Safe to share across layers and across `decide_clef` calls: every GDN
+    /// kernel treats `conv_state` and `recurrent_state` as read-only when no
+    /// slot-2 `state_dst` is provided (`ArraysCache::new(2)`), and keeping a
+    /// live reference on `self` prevents MLX buffer donation.
+    fn cached_clef_cuda_gdn_zeros(
+        &mut self,
+        conv_dtype: crate::array::DType,
+    ) -> Result<(MxArray, MxArray)> {
+        if let Some((cached_dtype, conv_zero, state_zero)) = &self.clef_cuda_gdn_zeros
+            && *cached_dtype == conv_dtype
+        {
+            return Ok((conv_zero.clone(), state_zero.clone()));
+        }
+        let conv_zero = MxArray::zeros(
+            &[
+                1,
+                (self.config.linear_conv_kernel_dim - 1) as i64,
+                self.config.linear_conv_dim() as i64,
+            ],
+            Some(conv_dtype),
+        )?;
+        let state_zero = MxArray::zeros(
+            &[
+                1,
+                self.config.linear_num_value_heads as i64,
+                self.config.linear_value_head_dim as i64,
+                self.config.linear_key_head_dim as i64,
+            ],
+            Some(crate::array::DType::Float32),
+        )?;
+        MxArray::eval_arrays(&[&conv_zero, &state_zero])?;
+        self.clef_cuda_gdn_zeros = Some((conv_dtype, conv_zero.clone(), state_zero.clone()));
+        Ok((conv_zero, state_zero))
+    }
+
     pub(crate) fn decide_clef(
         &mut self,
         request: &crate::models::clef::encoding::Request,
@@ -661,6 +702,7 @@ impl Qwen35Inner {
         // compiled graph keys on the default stream — it must be active
         // before the first invoke traces.
         let _stream_ctx = crate::stream::StreamContext::new(crate::stream::Stream::generation());
+        let _graphs_guard = crate::accelerator::CudaGraphsGuard::disable_for_prefill();
         // The compiled replay cannot check the flag between layers (the
         // whole backbone is one tape), so gate the one point we still
         // control before entering it.
@@ -672,7 +714,7 @@ impl Qwen35Inner {
                 hidden
             }
             None => {
-                let mut caches = Some(fresh_dense_layer_caches(&self.config));
+                let is_cuda = crate::accelerator::cuda_ops_available();
                 let mut hidden = self.embedding.forward(&ids)?;
                 // A packed affine (GGUF) embedding dequantizes to f16; the
                 // first bf16 norm would promote the whole residual stream to
@@ -689,31 +731,88 @@ impl Qwen35Inner {
                 // — measured ~x1.4-1.8 slower than a single eval at decide
                 // sizes. Sync every four layers only for long prompts, where
                 // an unevaluated whole-backbone graph would hold tens of GB
-                // of lazy intermediates.
+                // of lazy intermediates; the final sync happens once below
+                // after `final_norm`.
                 let layer_count = self.layers.len();
                 let long_prompt = ids.shape_at(1)? > 4096;
-                for (i, layer) in self.layers.iter_mut().enumerate() {
-                    check_cancel(cancelled)?;
-                    let layer_start = timing.then(std::time::Instant::now);
-                    hidden = layer.forward(
-                        &hidden,
-                        None,
-                        caches.as_mut().map(|c| &mut c[i]),
-                        None,
-                        true,
-                    )?;
-                    if i + 1 == layer_count || (long_prompt && (i + 1) % 4 == 0) {
-                        MxArray::eval_arrays(&[&hidden])?;
+                if is_cuda {
+                    use super::super::decoder_layer::LayerResidual;
+                    let compute_dtype = hidden.dtype()?;
+                    let cuda_gdn_zeros = if self.layers.iter().any(DecoderLayer::is_linear) {
+                        Some(self.cached_clef_cuda_gdn_zeros(compute_dtype)?)
+                    } else {
+                        None
+                    };
+                    let mut state = LayerResidual::Hidden(hidden);
+                    for (i, layer) in self.layers.iter_mut().enumerate() {
+                        check_cancel(cancelled)?;
+                        let layer_start = timing.then(std::time::Instant::now);
+                        let mut cuda_cache_slot = if layer.is_linear()
+                            && let Some((conv_zero, state_zero)) = &cuda_gdn_zeros
+                        {
+                            let mut detached =
+                                crate::models::qwen3_5::arrays_cache::ArraysCache::new(2);
+                            detached.set(0, conv_zero.clone())?;
+                            detached.set(1, state_zero.clone())?;
+                            Some(Qwen3_5LayerCache::Linear(detached))
+                        } else {
+                            None
+                        };
+                        // Fuse previous layer's MLP residual add into this layer's
+                        // `input_layernorm` via `FusedAddRmsNormCuda`, deferring
+                        // this layer's MLP residual add to the next layer (or
+                        // `final_norm`).
+                        let (_, next_state) = layer.forward_inner_with_tape_pending(
+                            state,
+                            None,
+                            cuda_cache_slot.as_mut(),
+                            None,
+                            true,
+                            None,
+                            None,
+                        )?;
+                        state = next_state;
+                        if long_prompt && (i + 1) % 4 == 0 && i + 1 < layer_count {
+                            match &state {
+                                LayerResidual::Hidden(h) => MxArray::eval_arrays(&[h])?,
+                                LayerResidual::Pending { h, delta } => {
+                                    MxArray::eval_arrays(&[h, delta])?;
+                                }
+                            }
+                        }
+                        if let Some(t) = layer_start {
+                            eprintln!(
+                                "[clef] layer {i} ({}) build+eval: {:?}",
+                                if layer.is_linear() { "gdn" } else { "full" },
+                                t.elapsed()
+                            );
+                        }
                     }
-                    if let Some(t) = layer_start {
-                        eprintln!(
-                            "[clef] layer {i} ({}) build+eval: {:?}",
-                            if layer.is_linear() { "gdn" } else { "full" },
-                            t.elapsed()
-                        );
+                    match state {
+                        LayerResidual::Hidden(h) => self.final_norm.forward(&h)?,
+                        LayerResidual::Pending { h, delta } => {
+                            DecoderLayer::add_residual_norm(&self.final_norm, &h, &delta)?.1
+                        }
                     }
+                } else {
+                    let mut caches = fresh_dense_layer_caches(&self.config);
+                    for (i, layer) in self.layers.iter_mut().enumerate() {
+                        check_cancel(cancelled)?;
+                        let layer_start = timing.then(std::time::Instant::now);
+                        hidden = layer.forward(&hidden, None, Some(&mut caches[i]), None, true)?;
+                        if long_prompt && (i + 1) % 4 == 0 && i + 1 < layer_count {
+                            MxArray::eval_arrays(&[&hidden])?;
+                        }
+                        if let Some(t) = layer_start {
+                            eprintln!(
+                                "[clef] layer {i} ({}) build+eval: {:?}",
+                                if layer.is_linear() { "gdn" } else { "full" },
+                                t.elapsed()
+                            );
+                        }
+                    }
+                    self.final_norm.forward(&hidden)?
                 }
-                self.final_norm.forward(&hidden)?
             }
         };
         check_cancel(cancelled)?;
@@ -754,7 +853,18 @@ impl Qwen35Inner {
         // coordinator cap is loose.
         let cc_start = std::time::Instant::now();
         let cache_bytes = crate::array::get_cache_memory();
-        if cache_bytes > CLEF_CLEAR_CACHE_THRESHOLD_BYTES as f64 {
+        let caps = crate::accelerator::caps();
+        let should_clear = if crate::accelerator::cuda_ops_available()
+            && caps.is_unified_memory
+            && caps.total_device_bytes > 0
+        {
+            let active_plus_cache = crate::array::get_active_memory() + cache_bytes;
+            let threshold = (caps.total_device_bytes.saturating_mul(3) / 4) as f64;
+            active_plus_cache > threshold
+        } else {
+            cache_bytes > CLEF_CLEAR_CACHE_THRESHOLD_BYTES as f64
+        };
+        if should_clear {
             crate::array::clear_cache();
             if timing {
                 eprintln!(

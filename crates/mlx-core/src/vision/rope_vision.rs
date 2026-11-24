@@ -4,7 +4,7 @@
 //! 2D rotary position embeddings for vision transformers.
 //! Used for encoding spatial (height, width) positions in image patches.
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
@@ -415,42 +415,88 @@ pub fn apply_interleaved_rotary(
     Ok((q_out, k_out))
 }
 
-/// Apply rotary position embedding to vision tensor (internal)
+/// Precompute FP32 `(cos, sin)` tensors from vision RoPE frequencies.
+///
+/// Computing `cos`/`sin` and tiling once per image avoids repeating trig and
+/// tile kernels across Q and K in every vision transformer layer.
 ///
 /// # Arguments
-/// * `tensor` - Input tensor of shape [batch, seq_len, num_heads, head_dim].
-///   Only 4D input is supported; 3D input will fail.
-/// * `freqs` - Frequency tensor of shape [seq_len, dim] where dim = head_dim/2
+/// * `freqs` - Frequency tensor of shape `[seq_len, dim]` where `dim = head_dim / 2`
 ///
 /// # Returns
-/// * Tensor with rotary embedding applied
-pub fn apply_rotary_pos_emb_vision(tensor: &MxArray, freqs: &MxArray) -> Result<MxArray> {
-    let orig_dtype = tensor.dtype()?;
+/// * `(cos, sin)` each of shape `[seq_len, 1, head_dim]` in FP32
+pub fn precompute_rotary_cos_sin(freqs: &MxArray) -> Result<(MxArray, MxArray)> {
+    let freqs_f32 = if freqs.dtype()? != DType::Float32 {
+        freqs.astype(DType::Float32)?
+    } else {
+        freqs.clone()
+    };
+    let shape = freqs_f32.shape()?;
+    if shape.len() != 2 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!(
+                "precompute_rotary_cos_sin expects 2D freqs [seq_len, dim], got {:?}",
+                shape.as_ref()
+            ),
+        ));
+    }
+    let freq_dim = shape[1];
 
-    // Compute cos and sin from frequencies
-    let cos = freqs.cos()?;
-    let sin = freqs.sin()?;
+    // Compute cos and sin from frequencies in FP32
+    let cos = freqs_f32.cos()?;
+    let sin = freqs_f32.sin()?;
 
     // Expand dims: [seq_len, dim] -> [seq_len, 1, dim]
-    let cos = cos.reshape(&[-1, 1, freqs.shape()?[1]])?;
-    let sin = sin.reshape(&[-1, 1, freqs.shape()?[1]])?;
+    let cos = cos.reshape(&[-1, 1, freq_dim])?;
+    let sin = sin.reshape(&[-1, 1, freq_dim])?;
 
-    // Tile to double the dimension: [seq_len, 1, dim*2]
+    // Tile to double the dimension: [seq_len, 1, dim*2] (= [seq_len, 1, head_dim])
     let cos = MxArray::tile(&cos, &[1, 1, 2])?;
     let sin = MxArray::tile(&sin, &[1, 1, 2])?;
 
-    // Add batch dimension: [1, seq_len, 1, dim*2]
-    let cos = cos.reshape(&[1, cos.shape()?[0], 1, cos.shape()?[2]])?;
-    let sin = sin.reshape(&[1, sin.shape()?[0], 1, sin.shape()?[2]])?;
+    Ok((cos, sin))
+}
+
+/// Apply rotary position embedding to a vision tensor using precomputed `(cos, sin)`.
+///
+/// # Arguments
+/// * `tensor` - Input tensor of shape `[seq_len, num_heads, head_dim]` or
+///   `[batch, seq_len, num_heads, head_dim]`
+/// * `cos` - Precomputed cosine tensor of shape `[seq_len, 1, head_dim]` (FP32)
+/// * `sin` - Precomputed sine tensor of shape `[seq_len, 1, head_dim]` (FP32)
+///
+/// # Returns
+/// * Tensor with rotary embedding applied in `tensor`'s original dtype
+pub fn apply_rotary_pos_emb_vision_precomputed(
+    tensor: &MxArray,
+    cos: &MxArray,
+    sin: &MxArray,
+) -> Result<MxArray> {
+    let orig_dtype = tensor.dtype()?;
 
     // Apply rotary embedding: x * cos + rotate_half(x) * sin
     let rotated = rotate_half(tensor)?;
-    let cos_term = tensor.mul(&cos)?;
-    let sin_term = rotated.mul(&sin)?;
+    let cos_term = tensor.mul(cos)?;
+    let sin_term = rotated.mul(sin)?;
     let output = cos_term.add(&sin_term)?;
 
     // Cast back to original dtype
     output.astype(orig_dtype)
+}
+
+/// Apply rotary position embedding to vision tensor (internal)
+///
+/// # Arguments
+/// * `tensor` - Input tensor of shape `[batch, seq_len, num_heads, head_dim]`
+///   or `[seq_len, num_heads, head_dim]`
+/// * `freqs` - Frequency tensor of shape `[seq_len, dim]` where `dim = head_dim/2`
+///
+/// # Returns
+/// * Tensor with rotary embedding applied
+pub fn apply_rotary_pos_emb_vision(tensor: &MxArray, freqs: &MxArray) -> Result<MxArray> {
+    let (cos, sin) = precompute_rotary_cos_sin(freqs)?;
+    apply_rotary_pos_emb_vision_precomputed(tensor, &cos, &sin)
 }
 
 #[cfg(test)]
@@ -492,7 +538,6 @@ mod tests {
 
     #[test]
     fn test_mrope_forward_output_shapes() {
-        use crate::array::DType;
         let mrope = MultimodalRoPE::new(128, 131072, Some(500000.0), vec![16, 24, 24]).unwrap();
 
         let x = MxArray::zeros(&[1, 4, 128], Some(DType::Float32)).unwrap();
@@ -520,7 +565,6 @@ mod tests {
 
     #[test]
     fn test_interleaved_selection_axis_assignment() {
-        use crate::array::DType;
         let head_dim = 12i64;
         let mut cos_data = Vec::with_capacity(3 * head_dim as usize);
         for axis in 0..3 {
@@ -546,7 +590,6 @@ mod tests {
 
     #[test]
     fn test_interleaved_text_invariance() {
-        use crate::array::DType;
         let rope_dims = 64i32;
         let mrope =
             MultimodalRoPE::new(rope_dims, 4096, Some(100_000.0), vec![11, 11, 10]).unwrap();
@@ -609,7 +652,6 @@ mod tests {
 
     #[test]
     fn test_precomputed_cos_sin_reused_across_layers_matches_per_layer_recompute() {
-        use crate::array::DType;
         let rope_dims = 64i32;
         let mrope_section = vec![11i32, 11, 10];
         let mrope =
@@ -701,5 +743,53 @@ mod tests {
             k2_opt.to_float32().unwrap().as_ref(),
             "layer 2 K (reused cos/sin) must match the pre-fix per-layer recompute"
         );
+    }
+
+    #[test]
+    fn test_precomputed_rotary_matches_direct_for_fp32_and_bf16() -> Result<()> {
+        let seq_len = 6i64;
+        let num_heads = 2i64;
+        let head_dim = 8i64;
+        let freq_dim = head_dim / 2;
+
+        let freq_data: Vec<f32> = (0..(seq_len * freq_dim) as usize)
+            .map(|i| (i as f32) * 0.13)
+            .collect();
+        let freqs = MxArray::from_float32(&freq_data, &[seq_len, freq_dim])?;
+
+        let (cos, sin) = precompute_rotary_cos_sin(&freqs)?;
+        assert_eq!(cos.dtype()?, DType::Float32);
+        assert_eq!(sin.dtype()?, DType::Float32);
+        assert_eq!(cos.shape()?.as_ref(), &[seq_len, 1, head_dim]);
+        assert_eq!(sin.shape()?.as_ref(), &[seq_len, 1, head_dim]);
+
+        let tensor_data: Vec<f32> = (0..(seq_len * num_heads * head_dim) as usize)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.1)
+            .collect();
+        let tensor_4d_f32 =
+            MxArray::from_float32(&tensor_data, &[1, seq_len, num_heads, head_dim])?;
+        let tensor_3d_f32 = MxArray::from_float32(&tensor_data, &[seq_len, num_heads, head_dim])?;
+
+        let direct_f32 =
+            apply_rotary_pos_emb_vision(&tensor_4d_f32, &freqs)?.squeeze(Some(&[0]))?;
+        let precomp_f32 = apply_rotary_pos_emb_vision_precomputed(&tensor_3d_f32, &cos, &sin)?;
+        assert_eq!(precomp_f32.dtype()?, DType::Float32);
+        assert_eq!(
+            direct_f32.to_float32()?.as_ref(),
+            precomp_f32.to_float32()?.as_ref()
+        );
+
+        let tensor_4d_bf16 = tensor_4d_f32.astype(DType::BFloat16)?;
+        let tensor_3d_bf16 = tensor_3d_f32.astype(DType::BFloat16)?;
+        let direct_bf16 =
+            apply_rotary_pos_emb_vision(&tensor_4d_bf16, &freqs)?.squeeze(Some(&[0]))?;
+        let precomp_bf16 = apply_rotary_pos_emb_vision_precomputed(&tensor_3d_bf16, &cos, &sin)?;
+        assert_eq!(precomp_bf16.dtype()?, DType::BFloat16);
+        assert_eq!(
+            direct_bf16.to_float32()?.as_ref(),
+            precomp_bf16.to_float32()?.as_ref()
+        );
+
+        Ok(())
     }
 }

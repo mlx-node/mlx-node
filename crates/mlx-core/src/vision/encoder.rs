@@ -8,7 +8,9 @@ use crate::array::MxArray;
 use crate::array::attention::scaled_dot_product_attention;
 use crate::nn::activations::Activations;
 use crate::nn::{LayerNorm, Linear};
-use crate::vision::rope_vision::apply_rotary_pos_emb_vision;
+use crate::vision::rope_vision::{
+    apply_rotary_pos_emb_vision_precomputed, precompute_rotary_cos_sin,
+};
 use napi::bindgen_prelude::*;
 use std::sync::Arc;
 
@@ -194,6 +196,7 @@ impl VisionAttention {
         &self,
         x: &MxArray,
         rotary_pos_emb: Option<&MxArray>,
+        rotary_cos_sin: Option<(&MxArray, &MxArray)>,
     ) -> Result<(MxArray, MxArray, MxArray, i64)> {
         let shape = x.shape()?;
         let seq_len = shape[0];
@@ -214,17 +217,14 @@ impl VisionAttention {
         let v = qkv.slice_axis(0, 2, 3)?.squeeze(Some(&[0]))?;
 
         // Apply rotary position embeddings if provided
-        let (q, k) = if let Some(freqs) = rotary_pos_emb {
-            let q_expanded =
-                q.reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?;
-            let k_expanded =
-                k.reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?;
-
-            let q_rot = apply_rotary_pos_emb_vision(&q_expanded, freqs)?;
-            let k_rot = apply_rotary_pos_emb_vision(&k_expanded, freqs)?;
-
-            let q_rot = q_rot.squeeze(Some(&[0]))?;
-            let k_rot = k_rot.squeeze(Some(&[0]))?;
+        let (q, k) = if let Some((cos, sin)) = rotary_cos_sin {
+            let q_rot = apply_rotary_pos_emb_vision_precomputed(&q, cos, sin)?;
+            let k_rot = apply_rotary_pos_emb_vision_precomputed(&k, cos, sin)?;
+            (q_rot, k_rot)
+        } else if let Some(freqs) = rotary_pos_emb {
+            let (cos, sin) = precompute_rotary_cos_sin(freqs)?;
+            let q_rot = apply_rotary_pos_emb_vision_precomputed(&q, &cos, &sin)?;
+            let k_rot = apply_rotary_pos_emb_vision_precomputed(&k, &cos, &sin)?;
             (q_rot, k_rot)
         } else {
             (q, k)
@@ -262,7 +262,7 @@ impl VisionAttention {
         attention_mask: Option<&MxArray>,
         rotary_pos_emb: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
+        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb, None)?;
 
         // Use fused scaled dot-product attention (Metal kernel)
         // mask shape [1, seq_len, seq_len] broadcasts to [1, num_heads, seq_len, seq_len]
@@ -271,23 +271,14 @@ impl VisionAttention {
         self.project_attention_output(output, seq_len)
     }
 
-    /// Forward variable-length image segments without constructing a global
-    /// quadratic block-diagonal mask.
-    ///
-    /// Q/K/V projections and the output projection still run once over the
-    /// concatenated token stream. Only SDPA is split at the cumulative segment
-    /// boundaries, matching mlx-vlm's Qwen3-VL vision attention. Since the old
-    /// additive mask allowed attention only within each segment, this preserves
-    /// the same attention semantics while reducing mask storage from
-    /// `O(total_tokens^2)` to zero and attention work to
-    /// `O(sum(segment_tokens^2))`.
-    pub(crate) fn forward_segmented(
+    fn forward_segmented_inner(
         &self,
         x: &MxArray,
         segment_boundaries: &[i64],
         rotary_pos_emb: Option<&MxArray>,
+        rotary_cos_sin: Option<(&MxArray, &MxArray)>,
     ) -> Result<MxArray> {
-        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb)?;
+        let (q, k, v, seq_len) = self.attention_inputs(x, rotary_pos_emb, rotary_cos_sin)?;
         if segment_boundaries.len() < 2
             || segment_boundaries.first().copied() != Some(0)
             || segment_boundaries.last().copied() != Some(seq_len)
@@ -324,6 +315,37 @@ impl VisionAttention {
             MxArray::concatenate_many(refs, Some(2))?
         };
         self.project_attention_output(output, seq_len)
+    }
+
+    /// Forward variable-length image segments without constructing a global
+    /// quadratic block-diagonal mask.
+    ///
+    /// Q/K/V projections and the output projection still run once over the
+    /// concatenated token stream. Only SDPA is split at the cumulative segment
+    /// boundaries, matching mlx-vlm's Qwen3-VL vision attention. Since the old
+    /// additive mask allowed attention only within each segment, this preserves
+    /// the same attention semantics while reducing mask storage from
+    /// `O(total_tokens^2)` to zero and attention work to
+    /// `O(sum(segment_tokens^2))`.
+    pub fn forward_segmented(
+        &self,
+        x: &MxArray,
+        segment_boundaries: &[i64],
+        rotary_pos_emb: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        self.forward_segmented_inner(x, segment_boundaries, rotary_pos_emb, None)
+    }
+
+    /// Variant of [`Self::forward_segmented`] taking precomputed FP32
+    /// `(cos, sin)` tensors from [`precompute_rotary_cos_sin`] so multi-layer
+    /// vision stacks avoid recomputing RoPE trig/tile on every layer.
+    pub fn forward_segmented_with_cos_sin(
+        &self,
+        x: &MxArray,
+        segment_boundaries: &[i64],
+        rotary_cos_sin: Option<(&MxArray, &MxArray)>,
+    ) -> Result<MxArray> {
+        self.forward_segmented_inner(x, segment_boundaries, None, rotary_cos_sin)
     }
 
     /// Forward pass, building the attention mask from `cu_seqlens` internally.
@@ -518,7 +540,7 @@ impl VisionEncoderLayer {
     /// Forward with attention split at variable-length image/frame boundaries.
     /// Pointwise norms/MLP and both residuals remain on the concatenated stream;
     /// only the attention operation is segmented.
-    pub(crate) fn forward_segmented(
+    pub fn forward_segmented(
         &self,
         hidden_states: &MxArray,
         segment_boundaries: &[i64],
@@ -528,6 +550,27 @@ impl VisionEncoderLayer {
         let attn_output =
             self.self_attn
                 .forward_segmented(&normed, segment_boundaries, rotary_pos_emb)?;
+        let hidden_states = hidden_states.add(&attn_output)?;
+
+        let normed = self.layer_norm2.forward(&hidden_states)?;
+        let mlp_output = self.mlp.forward(&normed)?;
+        hidden_states.add(&mlp_output)
+    }
+
+    /// Forward with segmented attention using precomputed FP32 `(cos, sin)`
+    /// rotary embeddings hoisted once per forward pass.
+    pub fn forward_segmented_with_cos_sin(
+        &self,
+        hidden_states: &MxArray,
+        segment_boundaries: &[i64],
+        rotary_cos_sin: Option<(&MxArray, &MxArray)>,
+    ) -> Result<MxArray> {
+        let normed = self.layer_norm1.forward(hidden_states)?;
+        let attn_output = self.self_attn.forward_segmented_with_cos_sin(
+            &normed,
+            segment_boundaries,
+            rotary_cos_sin,
+        )?;
         let hidden_states = hidden_states.add(&attn_output)?;
 
         let normed = self.layer_norm2.forward(&hidden_states)?;

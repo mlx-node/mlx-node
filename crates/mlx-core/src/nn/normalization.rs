@@ -61,12 +61,31 @@ impl RMSNorm {
     pub fn forward(&self, input: &MxArray) -> Result<MxArray> {
         if matches!(self.output_policy, RmsNormOutputPolicy::PreciseF32) {
             let in_dtype = input.dtype()?;
+            let w_dtype = self.weight.dtype()?;
+            if crate::accelerator::cuda_ops_available()
+                && matches!(
+                    in_dtype,
+                    crate::array::DType::BFloat16 | crate::array::DType::Float16
+                )
+                && w_dtype == crate::array::DType::Float32
+            {
+                let handle = unsafe {
+                    sys::mlx_rmsnorm_precise_f32_cuda(
+                        input.handle.0,
+                        self.weight.handle.0,
+                        self.eps as f32,
+                    )
+                };
+                if !handle.is_null() {
+                    return MxArray::from_handle(handle, "precise_f32_rms_norm_cuda");
+                }
+            }
             let x_f32 = if in_dtype == crate::array::DType::Float32 {
                 input.clone()
             } else {
                 input.astype(crate::array::DType::Float32)?
             };
-            let w_f32 = if self.weight.dtype()? == crate::array::DType::Float32 {
+            let w_f32 = if w_dtype == crate::array::DType::Float32 {
                 self.weight.clone()
             } else {
                 self.weight.astype(crate::array::DType::Float32)?
@@ -98,8 +117,41 @@ impl RMSNorm {
         {
             return None;
         }
-        if matches!(self.output_policy, RmsNormOutputPolicy::PreciseF32) {
-            return None;
+        match self.output_policy {
+            RmsNormOutputPolicy::PreciseF32 => {
+                if !crate::accelerator::cuda_ops_available() {
+                    return None;
+                }
+                let x_dtype = x.dtype().ok()?;
+                if !matches!(
+                    x_dtype,
+                    crate::array::DType::BFloat16 | crate::array::DType::Float16
+                ) || res.dtype().ok()? != x_dtype
+                    || self.weight.dtype().ok()? != crate::array::DType::Float32
+                {
+                    return None;
+                }
+                let mut h = std::ptr::null_mut();
+                let mut normed = std::ptr::null_mut();
+                if !unsafe {
+                    sys::mlx_fused_add_rmsnorm_precise_f32_cuda(
+                        x.handle.0,
+                        res.handle.0,
+                        self.weight.handle.0,
+                        self.eps as f32,
+                        &mut h,
+                        &mut normed,
+                    )
+                } || h.is_null()
+                    || normed.is_null()
+                {
+                    return None;
+                }
+                let h = MxArray::from_handle(h, "add_rmsnorm_precise_f32:h").ok()?;
+                let normed = MxArray::from_handle(normed, "add_rmsnorm_precise_f32:normed").ok()?;
+                return Some((h, normed));
+            }
+            RmsNormOutputPolicy::Native => {}
         }
         let eps = MxArray::from_float32(&[self.eps as f32], &[]).ok()?;
         let mut h = std::ptr::null_mut();
@@ -128,6 +180,16 @@ impl RMSNorm {
     /// cast the result back to the input dtype.
     pub fn set_precise_f32(&mut self) {
         self.output_policy = RmsNormOutputPolicy::PreciseF32;
+    }
+
+    /// Whether this layer evaluates RMSNorm in Float32 (`PreciseF32` policy).
+    pub(crate) fn is_precise_f32(&self) -> bool {
+        matches!(self.output_policy, RmsNormOutputPolicy::PreciseF32)
+    }
+
+    /// Whether this layer uses the default `Native` output policy (not `PreciseF32`).
+    pub(crate) fn is_native_policy(&self) -> bool {
+        matches!(self.output_policy, RmsNormOutputPolicy::Native)
     }
 
     /// Get the weight (scale) parameter
@@ -273,7 +335,7 @@ impl LayerNorm {
             }
             b.clone()
         } else {
-            MxArray::zeros(&shape, None)?
+            MxArray::zeros(&shape, Some(weight.dtype()?))?
         };
 
         Ok(Self {
@@ -660,8 +722,36 @@ mod tests {
             .astype(DType::BFloat16)
             .unwrap();
 
-        // PreciseF32 must decline the fused residual-add kernel so callers fall back.
-        assert!(norm.forward_residual_add(&x_bf16, &res_bf16).is_none());
+        if crate::accelerator::cuda_ops_available() {
+            let (h_fused, normed_fused) = norm
+                .forward_residual_add(&x_bf16, &res_bf16)
+                .expect("CUDA PreciseF32 fused residual-add declined a valid contract");
+            let h_ref = x_bf16.add(&res_bf16).unwrap();
+            let normed_ref = norm.forward(&h_ref).unwrap();
+            assert_eq!(h_fused.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(normed_fused.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(h_fused.shape().unwrap().as_ref(), &[2, hidden]);
+            assert_eq!(normed_fused.shape().unwrap().as_ref(), &[2, hidden]);
+            assert_eq!(
+                h_fused.to_float32().unwrap().to_vec(),
+                h_ref.to_float32().unwrap().to_vec(),
+                "PreciseF32 fused residual-add h mismatch"
+            );
+            for (got, want) in normed_fused
+                .to_float32()
+                .unwrap()
+                .iter()
+                .zip(normed_ref.to_float32().unwrap().iter())
+            {
+                assert!(
+                    (got - want).abs() <= 1e-5,
+                    "PreciseF32 fused residual-add normed mismatch: got {got}, want {want}"
+                );
+            }
+        } else {
+            // Non-CUDA PreciseF32 declines the fused residual-add kernel so callers fall back.
+            assert!(norm.forward_residual_add(&x_bf16, &res_bf16).is_none());
+        }
 
         let out = norm.forward(&x_bf16).unwrap();
         assert_eq!(out.dtype().unwrap(), DType::BFloat16);

@@ -130,6 +130,58 @@ pub(super) fn qk_norm_rope_kv_store_tree(
 }
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn qk_norm_rope_kv_store_positions(
+    q_in: &MxArray,
+    k_in: &MxArray,
+    v_in: &MxArray,
+    q_norm_w: &MxArray,
+    k_norm_w: &MxArray,
+    k_cache: &MxArray,
+    v_cache: &MxArray,
+    positions: &MxArray,
+    offset: i32,
+    eps: f32,
+    rope_dims: i32,
+    rope_base: f32,
+    rope_scale: f32,
+    precise_f32: bool,
+) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+    let mut out_q = std::ptr::null_mut();
+    let mut out_k_cache = std::ptr::null_mut();
+    let mut out_v_cache = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_qk_norm_rope_kv_store_positions_cuda(
+            q_in.as_raw_ptr(),
+            k_in.as_raw_ptr(),
+            v_in.as_raw_ptr(),
+            q_norm_w.as_raw_ptr(),
+            k_norm_w.as_raw_ptr(),
+            k_cache.as_raw_ptr(),
+            v_cache.as_raw_ptr(),
+            positions.as_raw_ptr(),
+            offset,
+            eps,
+            rope_dims,
+            rope_base,
+            rope_scale,
+            precise_f32,
+            &mut out_q,
+            &mut out_k_cache,
+            &mut out_v_cache,
+        )
+    };
+    if !ok || out_q.is_null() || out_k_cache.is_null() || out_v_cache.is_null() {
+        return Ok(None);
+    }
+    Ok(Some((
+        MxArray::from_handle(out_q, "qk_norm_rope_kv_store_positions:q")?,
+        MxArray::from_handle(out_k_cache, "qk_norm_rope_kv_store_positions:k_cache")?,
+        MxArray::from_handle(out_v_cache, "qk_norm_rope_kv_store_positions:v_cache")?,
+    )))
+}
+
+#[inline]
 pub(super) fn kv_compact_rows(
     k_cache: &MxArray,
     v_cache: &MxArray,

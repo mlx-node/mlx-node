@@ -10,8 +10,284 @@ use crate::array::{DType, MxArray};
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType, symmetric_zero_point};
 use napi::bindgen_prelude::*;
 use std::ffi::{CStr, c_char};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(crate) use crate::array::alloc::{DstPtrs, OutLayout};
+
+/// Minimum VRAM headroom kept free on discrete CUDA GPUs for KV cache,
+/// activations, cuBLAS workspaces, and CUDA graph capture.
+const CUDA_BUDGET_MIN_RESERVE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Interval of reserved bytes between live free-VRAM probes on discrete CUDA.
+const CUDA_BUDGET_REFRESH_INTERVAL_BYTES: u64 = 256 * 1024 * 1024;
+/// Alignment granularity matching `CudaAllocator::page_size`.
+const CUDA_ALLOC_ALIGN_BYTES: u64 = 16 * 1024;
+
+/// Shared CUDA device-memory budget for one GGUF load.
+///
+/// - On unified-memory CUDA hosts (e.g. RTX Spark N1X 128 GB), `unlimited` is
+///   `true` and every reservation succeeds with zero NVML/CUDA query overhead.
+/// - On discrete CUDA GPUs, reserves `max(total / 8, 2 GiB)` clamped at
+///   `total / 2` for inference headroom, shrinks against co-resident VRAM
+///   usage via live free-memory probes, and denies allocations that would eat
+///   into the reserve so callers fall back cleanly to host-backed storage.
+/// - On non-CUDA hosts (Metal / CPU), starts exhausted as a zero-cost no-op.
+pub(crate) struct CudaDeviceBudget {
+    unlimited: bool,
+    probe_live_memory: bool,
+    reserve_bytes: u64,
+    total_cap_bytes: u64,
+    remaining_bytes: AtomicU64,
+    bytes_since_refresh: AtomicU64,
+    exhausted: AtomicBool,
+}
+
+impl CudaDeviceBudget {
+    pub(crate) fn for_current_device() -> Self {
+        if !crate::accelerator::cuda_ops_available() {
+            return Self {
+                unlimited: false,
+                probe_live_memory: false,
+                reserve_bytes: 0,
+                total_cap_bytes: 0,
+                remaining_bytes: AtomicU64::new(0),
+                bytes_since_refresh: AtomicU64::new(0),
+                exhausted: AtomicBool::new(true),
+            };
+        }
+        let caps = crate::accelerator::caps();
+        if caps.is_unified_memory {
+            return Self::from_limits(caps.total_device_bytes, None, true, false);
+        }
+        if caps.total_device_bytes == 0 {
+            return Self::from_limits(0, None, false, false);
+        }
+        // Flush leftover MLX pool memory from a prior unloaded model so the
+        // initial free-VRAM probe reflects true available device memory.
+        if crate::array::memory::cache_memory_bytes() > 0 {
+            crate::array::clear_cache();
+        }
+        let free = crate::accelerator::query_free_device_memory();
+        Self::from_limits(caps.total_device_bytes, free, false, true)
+    }
+
+    fn from_limits(
+        total: u64,
+        free: Option<u64>,
+        is_unified: bool,
+        probe_live_memory: bool,
+    ) -> Self {
+        if is_unified {
+            return Self {
+                unlimited: true,
+                probe_live_memory: false,
+                reserve_bytes: 0,
+                total_cap_bytes: u64::MAX,
+                remaining_bytes: AtomicU64::new(u64::MAX),
+                bytes_since_refresh: AtomicU64::new(0),
+                exhausted: AtomicBool::new(false),
+            };
+        }
+        if total == 0 {
+            return Self {
+                unlimited: false,
+                probe_live_memory: false,
+                reserve_bytes: 0,
+                total_cap_bytes: 0,
+                remaining_bytes: AtomicU64::new(0),
+                bytes_since_refresh: AtomicU64::new(0),
+                exhausted: AtomicBool::new(true),
+            };
+        }
+        let reserve = (total / 8)
+            .max(CUDA_BUDGET_MIN_RESERVE_BYTES)
+            .min(total / 2);
+        let total_cap = total.saturating_sub(reserve);
+        let initial_remaining = total_cap.min(free.unwrap_or(total).saturating_sub(reserve));
+        Self {
+            unlimited: false,
+            probe_live_memory,
+            reserve_bytes: reserve,
+            total_cap_bytes: total_cap,
+            remaining_bytes: AtomicU64::new(initial_remaining),
+            bytes_since_refresh: AtomicU64::new(0),
+            exhausted: AtomicBool::new(initial_remaining == 0),
+        }
+    }
+
+    pub(crate) fn is_unlimited(&self) -> bool {
+        self.unlimited
+    }
+
+    pub(crate) fn align_bytes(bytes: u64) -> Option<u64> {
+        if bytes == 0 {
+            Some(0)
+        } else {
+            bytes.checked_next_multiple_of(CUDA_ALLOC_ALIGN_BYTES)
+        }
+    }
+
+    pub(crate) fn can_fit(&self, bytes: u64) -> bool {
+        if bytes == 0 || self.unlimited {
+            return true;
+        }
+        if self.exhausted.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(needed) = Self::align_bytes(bytes) else {
+            return false;
+        };
+        self.remaining_bytes.load(Ordering::Acquire) >= needed
+    }
+
+    pub(crate) fn is_exhausted(&self) -> bool {
+        !self.unlimited
+            && (self.exhausted.load(Ordering::Acquire)
+                || self.remaining_bytes.load(Ordering::Acquire) == 0)
+    }
+
+    pub(crate) fn try_reserve(&self, bytes: u64) -> bool {
+        if bytes == 0 || self.unlimited {
+            return true;
+        }
+        if self.exhausted.load(Ordering::Acquire) {
+            return false;
+        }
+        let Some(needed) = bytes.checked_next_multiple_of(CUDA_ALLOC_ALIGN_BYTES) else {
+            return false;
+        };
+
+        if self.probe_live_memory {
+            let prev = self.bytes_since_refresh.load(Ordering::Relaxed);
+            if (prev >= CUDA_BUDGET_REFRESH_INTERVAL_BYTES
+                || (prev > 0 && prev.saturating_add(needed) >= CUDA_BUDGET_REFRESH_INTERVAL_BYTES))
+                && self
+                    .bytes_since_refresh
+                    .compare_exchange(prev, 0, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                self.refresh_from_free();
+            }
+        }
+
+        let mut cur = self.remaining_bytes.load(Ordering::Acquire);
+        loop {
+            if cur < needed {
+                return false;
+            }
+            match self.remaining_bytes.compare_exchange_weak(
+                cur,
+                cur - needed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if self.probe_live_memory {
+                        self.bytes_since_refresh
+                            .fetch_add(needed, Ordering::Relaxed);
+                    }
+                    return true;
+                }
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    pub(crate) fn release(&self, bytes: u64) {
+        if self.unlimited || bytes == 0 || self.exhausted.load(Ordering::Acquire) {
+            return;
+        }
+        let Some(aligned) = bytes.checked_next_multiple_of(CUDA_ALLOC_ALIGN_BYTES) else {
+            return;
+        };
+        let mut cur = self.remaining_bytes.load(Ordering::Acquire);
+        loop {
+            if self.exhausted.load(Ordering::Acquire) {
+                return;
+            }
+            let next = cur.saturating_add(aligned).min(self.total_cap_bytes);
+            match self.remaining_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    pub(crate) fn refresh_from_free(&self) {
+        if self.unlimited || !self.probe_live_memory || self.exhausted.load(Ordering::Acquire) {
+            return;
+        }
+        self.bytes_since_refresh.store(0, Ordering::Relaxed);
+        let Some(mut free) = crate::accelerator::query_free_device_memory() else {
+            return;
+        };
+        let cur_remaining = self.remaining_bytes.load(Ordering::Acquire);
+        if free.saturating_sub(self.reserve_bytes) < cur_remaining
+            && crate::array::memory::cache_memory_bytes() > 0
+        {
+            crate::array::clear_cache();
+            if let Some(refreshed) = crate::accelerator::query_free_device_memory() {
+                free = refreshed;
+            }
+        }
+        self.apply_live_free(free);
+    }
+
+    fn apply_live_free(&self, live_free: u64) {
+        if self.unlimited || self.exhausted.load(Ordering::Acquire) {
+            return;
+        }
+        let live_headroom = live_free
+            .saturating_sub(self.reserve_bytes)
+            .min(self.total_cap_bytes);
+        let mut cur = self.remaining_bytes.load(Ordering::Acquire);
+        loop {
+            let next = cur.min(live_headroom);
+            if next == cur {
+                break;
+            }
+            match self.remaining_bytes.compare_exchange_weak(
+                cur,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => cur = observed,
+            }
+        }
+    }
+
+    pub(crate) fn mark_exhausted(&self) {
+        if !self.unlimited {
+            self.exhausted.store(true, Ordering::Release);
+            self.remaining_bytes.store(0, Ordering::Release);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_limits_for_test(total: u64, free: Option<u64>, is_unified: bool) -> Self {
+        Self::from_limits(total, free, is_unified, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_live_free_for_test(&self, live_free: u64) {
+        self.apply_live_free(live_free);
+    }
+
+    pub(crate) fn remaining_bytes(&self) -> u64 {
+        self.remaining_bytes.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reserve_bytes(&self) -> u64 {
+        self.reserve_bytes
+    }
+}
 
 /// GGUF types with a GPU repack kernel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,8 +352,8 @@ pub(crate) fn gpu_repack_available() -> bool {
 }
 
 /// Whether the active GPU backend implements a repack kernel for `kind`.
-/// Metal supports all 12 kinds; CUDA implements the 5 Qwen3.8/GGUF kinds
-/// (`Q4K`, `Q5K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
+/// Metal supports all 12 kinds; CUDA implements the 6 Qwen3.8/GGUF kinds
+/// (`Q4K`, `Q5K`, `Q6K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
 pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
     if crate::accelerator::host_has_metal() {
         true
@@ -86,6 +362,7 @@ pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
             kind,
             GpuRepackKind::Q4K
                 | GpuRepackKind::Q5K
+                | GpuRepackKind::Q6K
                 | GpuRepackKind::Q5_1
                 | GpuRepackKind::Q8_0
                 | GpuRepackKind::Q8_0Bias
@@ -178,12 +455,96 @@ pub(crate) struct RepackDst {
     pub biases: Option<MxArray>,
 }
 
+/// Geometry of a GPU-repacked tensor's destination arrays (without exposing
+/// CPU-writable host pointers).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct GpuDstMeta {
+    pub rows: usize,
+    pub k: usize,
+    pub layout: OutLayout,
+}
+
 /// Destination columns of one row of `k` values, and the `.scales` dtype.
 struct DstCols {
     weight: usize,
     scales: usize,
     scales_dtype: DType,
     biases: Option<usize>,
+}
+
+struct ValidatedDst {
+    shape: Vec<i64>,
+    cols: DstCols,
+    meta: GpuDstMeta,
+}
+
+impl ValidatedDst {
+    fn row_shape(&self, cols: usize) -> Vec<i64> {
+        let mut s = self.shape.clone();
+        if let Some(last) = s.last_mut() {
+            *last = cols as i64;
+        }
+        s
+    }
+}
+
+fn validate_kind(t: &GgufTensorInfo, kind: GpuRepackKind) -> Result<()> {
+    if t.tensor_type != kind.gguf_type() {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' of type {} cannot use {kind:?} repack",
+            t.name,
+            t.tensor_type.name()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_dst(t: &GgufTensorInfo, layout: OutLayout, q8_bias_bank: bool) -> Result<ValidatedDst> {
+    let ty = t.tensor_type;
+    let block = ty.block_size();
+    let shape = t.mlx_shape();
+    let k = shape.last().copied().unwrap_or(0);
+    if k <= 0 || !(k as usize).is_multiple_of(block) {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
+            t.name
+        )));
+    }
+    let k = k as usize;
+    let mut cols = dst_cols(ty, k).ok_or_else(|| {
+        Error::from_reason(format!(
+            "no packed destination contract for GGUF tensor '{}' of type {}",
+            t.name,
+            ty.name()
+        ))
+    })?;
+    if q8_bias_bank {
+        cols.biases = Some(k / ty.block_size());
+    }
+    let rows = usize::try_from(t.num_elements()?).map_err(|_| {
+        Error::from_reason(format!(
+            "GGUF tensor '{}' element count exceeds usize",
+            t.name
+        ))
+    })? / k;
+    if layout == OutLayout::Tiled64
+        && (ty.k_quant_format().is_none()
+            || shape.len() != 2
+            || !rows.is_multiple_of(64)
+            || !k.is_multiple_of(256))
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' of type {} shape {shape:?} cannot be Tiled64",
+            t.name,
+            ty.name()
+        )));
+    }
+    Ok(ValidatedDst {
+        shape,
+        cols,
+        meta: GpuDstMeta { rows, k, layout },
+    })
 }
 
 /// The loader's destination geometry for `t` with row length `k`: the
@@ -223,6 +584,15 @@ fn dst_cols(t: GgufTensorType, k: usize) -> Option<DstCols> {
     })
 }
 
+fn shape_bytes(shape: &[i64], dtype: DType) -> Option<u64> {
+    let mut numel = 1u64;
+    for &d in shape {
+        let d = u64::try_from(d).ok()?;
+        numel = numel.checked_mul(d)?;
+    }
+    numel.checked_mul(dtype.byte_size() as u64)
+}
+
 impl RepackDst {
     /// Uninitialized arrays with the loader's shapes and dtypes for `t`: the
     /// GGUF shape with the last dimension replaced by the weight / scales /
@@ -238,14 +608,91 @@ impl RepackDst {
         kind: GpuRepackKind,
         layout: OutLayout,
     ) -> Result<(RepackDst, DstPtrs)> {
-        if t.tensor_type != kind.gguf_type() {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' of type {} cannot use {kind:?} repack",
-                t.name,
-                t.tensor_type.name()
-            )));
-        }
+        validate_kind(t, kind)?;
         Self::alloc_inner(t, layout, kind == GpuRepackKind::Q8_0Bias)
+    }
+
+    /// Device-resident destination for an explicit GPU repack route using a
+    /// fresh `CudaDeviceBudget` for the current host.
+    #[cfg(test)]
+    pub(crate) fn alloc_gpu_for_kind(
+        t: &GgufTensorInfo,
+        kind: GpuRepackKind,
+        layout: OutLayout,
+    ) -> Result<(RepackDst, GpuDstMeta)> {
+        let budget = CudaDeviceBudget::for_current_device();
+        Self::alloc_gpu_for_kind_with_budget(t, kind, layout, &budget)
+    }
+
+    /// Device-resident destination for an explicit GPU repack route, bounded by
+    /// `budget`. On CUDA, reserves `weight + scales + biases` bytes atomically
+    /// and allocates all arrays directly in GPU device memory (`device == 0`);
+    /// when `budget` denies the reservation, an allocation unexpectedly fails
+    /// with OOM, or on non-CUDA hosts, falls back cleanly to host-backed
+    /// `MxArray::alloc_uninit` for all arrays together.
+    pub(crate) fn alloc_gpu_for_kind_with_budget(
+        t: &GgufTensorInfo,
+        kind: GpuRepackKind,
+        layout: OutLayout,
+        budget: &CudaDeviceBudget,
+    ) -> Result<(RepackDst, GpuDstMeta)> {
+        validate_kind(t, kind)?;
+        let spec = validate_dst(t, layout, kind == GpuRepackKind::Q8_0Bias)?;
+        let w_shape = spec.row_shape(spec.cols.weight);
+        let s_shape = spec.row_shape(spec.cols.scales);
+        let b_shape = spec.cols.biases.map(|c| spec.row_shape(c));
+
+        if crate::accelerator::cuda_ops_available() {
+            let total_bytes = shape_bytes(&w_shape, DType::Uint32)
+                .and_then(|w| w.checked_add(shape_bytes(&s_shape, spec.cols.scales_dtype)?))
+                .and_then(|ws| match b_shape.as_deref() {
+                    Some(bs) => ws.checked_add(shape_bytes(bs, DType::Float16)?),
+                    None => Some(ws),
+                });
+            if let Some(total_bytes) = total_bytes
+                && budget.try_reserve(total_bytes)
+            {
+                let alloc_result = (|| -> Result<Option<RepackDst>> {
+                    let Some(weight) = MxArray::alloc_gpu_uninit(&w_shape, DType::Uint32)? else {
+                        return Ok(None);
+                    };
+                    let Some(scales) = MxArray::alloc_gpu_uninit(&s_shape, spec.cols.scales_dtype)?
+                    else {
+                        drop(weight);
+                        return Ok(None);
+                    };
+                    let biases = match b_shape.as_deref() {
+                        Some(bs) => match MxArray::alloc_gpu_uninit(bs, DType::Float16)? {
+                            Some(b) => Some(b),
+                            None => {
+                                drop(scales);
+                                drop(weight);
+                                return Ok(None);
+                            }
+                        },
+                        None => None,
+                    };
+                    Ok(Some(RepackDst {
+                        weight,
+                        scales: Some(scales),
+                        biases,
+                    }))
+                })();
+                match alloc_result {
+                    Ok(Some(dst)) => return Ok((dst, spec.meta)),
+                    Ok(None) => {
+                        budget.mark_exhausted();
+                    }
+                    Err(err) => {
+                        budget.release(total_bytes);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+
+        let (dst, _) = Self::alloc_host_from_spec(&spec)?;
+        Ok((dst, spec.meta))
     }
 
     fn alloc_inner(
@@ -253,57 +700,18 @@ impl RepackDst {
         layout: OutLayout,
         q8_bias_bank: bool,
     ) -> Result<(RepackDst, DstPtrs)> {
-        let ty = t.tensor_type;
-        let block = ty.block_size();
-        let shape = t.mlx_shape();
-        let k = shape.last().copied().unwrap_or(0);
-        if k <= 0 || !(k as usize).is_multiple_of(block) {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
-                t.name
-            )));
-        }
-        let k = k as usize;
-        let mut cols = dst_cols(ty, k).ok_or_else(|| {
-            Error::from_reason(format!(
-                "no packed destination contract for GGUF tensor '{}' of type {}",
-                t.name,
-                ty.name()
-            ))
-        })?;
-        if q8_bias_bank {
-            cols.biases = Some(k / ty.block_size());
-        }
-        let rows = usize::try_from(t.num_elements()?).map_err(|_| {
-            Error::from_reason(format!(
-                "GGUF tensor '{}' element count exceeds usize",
-                t.name
-            ))
-        })? / k;
-        if layout == OutLayout::Tiled64
-            && (ty.k_quant_format().is_none()
-                || shape.len() != 2
-                || !rows.is_multiple_of(64)
-                || !k.is_multiple_of(256))
-        {
-            return Err(Error::from_reason(format!(
-                "GGUF tensor '{}' of type {} shape {shape:?} cannot be Tiled64",
-                t.name,
-                ty.name()
-            )));
-        }
-        let row_shape = |cols: usize| -> Vec<i64> {
-            let mut s = shape.clone();
-            if let Some(last) = s.last_mut() {
-                *last = cols as i64;
-            }
-            s
-        };
-        let (weight, wp, _) = MxArray::alloc_uninit(&row_shape(cols.weight), DType::Uint32)?;
-        let (scales, sp, _) = MxArray::alloc_uninit(&row_shape(cols.scales), cols.scales_dtype)?;
-        let (biases, bp) = match cols.biases {
+        let spec = validate_dst(t, layout, q8_bias_bank)?;
+        Self::alloc_host_from_spec(&spec)
+    }
+
+    fn alloc_host_from_spec(spec: &ValidatedDst) -> Result<(RepackDst, DstPtrs)> {
+        let (weight, wp, _) =
+            MxArray::alloc_uninit(&spec.row_shape(spec.cols.weight), DType::Uint32)?;
+        let (scales, sp, _) =
+            MxArray::alloc_uninit(&spec.row_shape(spec.cols.scales), spec.cols.scales_dtype)?;
+        let (biases, bp) = match spec.cols.biases {
             Some(c) => {
-                let (b, bp, _) = MxArray::alloc_uninit(&row_shape(c), DType::Float16)?;
+                let (b, bp, _) = MxArray::alloc_uninit(&spec.row_shape(c), DType::Float16)?;
                 (Some(b), Some(bp))
             }
             None => (None, None),
@@ -318,9 +726,9 @@ impl RepackDst {
                 weight: wp,
                 scales: Some(sp),
                 biases: bp,
-                rows,
-                k,
-                layout,
+                rows: spec.meta.rows,
+                k: spec.meta.k,
+                layout: spec.meta.layout,
             },
         ))
     }
@@ -1694,6 +2102,312 @@ mod tests {
             biases: Vec::new(),
         };
         assert_same(&read(&dst), &want_bytes, "Nvfp4 3D MoE [4, 7, 128]");
+    }
+
+    #[test]
+    fn alloc_gpu_for_kind_matches_alloc_for_kind_contract() -> Result<()> {
+        fn shape_dtype(a: &MxArray) -> Result<(Vec<i64>, DType)> {
+            Ok((a.shape()?.to_vec(), a.dtype()?))
+        }
+        for kind in ALL_KINDS {
+            let layouts: &[OutLayout] = if kind.is_kquant() {
+                &[OutLayout::RowMajor, OutLayout::Tiled64]
+            } else {
+                &[OutLayout::RowMajor]
+            };
+            let (rows, k) = (64usize, 256usize);
+            let info = tensor_info(kind, rows, k);
+            for &layout in layouts {
+                let (gpu_dst, meta) = RepackDst::alloc_gpu_for_kind(&info, kind, layout)?;
+                let (cpu_dst, ptrs) = RepackDst::alloc_for_kind(&info, kind, layout)?;
+                assert_eq!(
+                    (meta.rows, meta.k, meta.layout),
+                    (ptrs.rows, ptrs.k, ptrs.layout),
+                    "{kind:?} {layout:?} meta"
+                );
+                assert_eq!(
+                    shape_dtype(&gpu_dst.weight)?,
+                    shape_dtype(&cpu_dst.weight)?,
+                    "{kind:?} {layout:?} weight"
+                );
+                assert_eq!(
+                    gpu_dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    cpu_dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} scales"
+                );
+                assert_eq!(
+                    gpu_dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    cpu_dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} biases"
+                );
+            }
+            if !kind.is_kquant() {
+                assert!(
+                    RepackDst::alloc_gpu_for_kind(&info, kind, OutLayout::Tiled64).is_err(),
+                    "{kind:?} Tiled64"
+                );
+            }
+        }
+        let q4k_info = tensor_info(GpuRepackKind::Q4K, 64, 256);
+        assert!(
+            RepackDst::alloc_gpu_for_kind(&q4k_info, GpuRepackKind::Q8_0, OutLayout::RowMajor)
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_device_budget_unified_memory_is_unlimited() {
+        const GIB: u64 = 1 << 30;
+        let budget = CudaDeviceBudget::from_limits_for_test(128 * GIB, Some(8 * GIB), true);
+        assert!(!budget.is_exhausted());
+        assert_eq!(budget.reserve_bytes(), 0);
+        assert!(budget.try_reserve(100 * GIB));
+        assert!(budget.try_reserve(u64::MAX / 2));
+        budget.apply_live_free_for_test(0);
+        assert!(!budget.is_exhausted());
+        budget.mark_exhausted();
+        assert!(!budget.is_exhausted());
+        assert!(budget.try_reserve(16 * GIB));
+    }
+
+    #[test]
+    fn cuda_device_budget_discrete_reserve_and_coresident_vram() {
+        const GIB: u64 = 1 << 30;
+
+        // Zero total memory -> safe exhausted fallback.
+        let empty = CudaDeviceBudget::from_limits_for_test(0, Some(0), false);
+        assert!(empty.is_exhausted());
+        assert_eq!(empty.remaining_bytes(), 0);
+        assert!(!empty.try_reserve(1));
+
+        // Reserve = max(total / 8, 2 GiB) clamped at total / 2.
+        let cases = [
+            (2 * GIB, GIB, GIB),
+            (4 * GIB, 2 * GIB, 2 * GIB),
+            (16 * GIB, 2 * GIB, 14 * GIB),
+            (24 * GIB, 3 * GIB, 21 * GIB),
+            (80 * GIB, 10 * GIB, 70 * GIB),
+        ];
+        for (total, want_reserve, want_cap) in cases {
+            let b = CudaDeviceBudget::from_limits_for_test(total, Some(total), false);
+            assert_eq!(b.reserve_bytes(), want_reserve, "total={total}");
+            assert_eq!(b.remaining_bytes(), want_cap, "total={total}");
+            assert!(!b.is_exhausted(), "total={total}");
+        }
+
+        // Co-resident VRAM usage shrinks initial budget to `free - reserve`.
+        let partial = CudaDeviceBudget::from_limits_for_test(24 * GIB, Some(10 * GIB), false);
+        assert_eq!(partial.reserve_bytes(), 3 * GIB);
+        assert_eq!(partial.remaining_bytes(), 7 * GIB);
+        assert!(!partial.is_exhausted());
+
+        // `free <= reserve` starts exhausted with 0 remaining.
+        let at_reserve = CudaDeviceBudget::from_limits_for_test(24 * GIB, Some(3 * GIB), false);
+        assert_eq!(at_reserve.remaining_bytes(), 0);
+        assert!(at_reserve.is_exhausted());
+        let below_reserve = CudaDeviceBudget::from_limits_for_test(24 * GIB, Some(GIB), false);
+        assert_eq!(below_reserve.remaining_bytes(), 0);
+        assert!(below_reserve.is_exhausted());
+
+        // Missing free-memory reading falls back to `total - reserve`.
+        let no_free = CudaDeviceBudget::from_limits_for_test(24 * GIB, None, false);
+        assert_eq!(no_free.remaining_bytes(), 21 * GIB);
+        assert!(!no_free.is_exhausted());
+    }
+
+    #[test]
+    fn cuda_device_budget_reserve_release_refresh_and_exhaustion() {
+        const GIB: u64 = 1 << 30;
+        let b = CudaDeviceBudget::from_limits_for_test(16 * GIB, Some(16 * GIB), false);
+        assert_eq!(b.reserve_bytes(), 2 * GIB);
+        assert_eq!(b.remaining_bytes(), 14 * GIB);
+
+        assert!(b.try_reserve(0));
+        assert_eq!(b.remaining_bytes(), 14 * GIB);
+
+        // Allocate 10 GiB -> 4 GiB remaining.
+        assert!(b.try_reserve(10 * GIB));
+        assert_eq!(b.remaining_bytes(), 4 * GIB);
+
+        // 5 GiB would eat into the 2 GiB reserve -> denied without latching exhaustion.
+        assert!(!b.try_reserve(5 * GIB));
+        assert!(!b.is_exhausted());
+        assert_eq!(b.remaining_bytes(), 4 * GIB);
+
+        // Smaller allocations that fit within remaining budget still succeed (16 KiB aligned).
+        assert!(b.try_reserve(1000));
+        assert_eq!(b.remaining_bytes(), 4 * GIB - CUDA_ALLOC_ALIGN_BYTES);
+
+        // Overflowing alignment fails cleanly without mutating state.
+        assert!(!b.try_reserve(u64::MAX));
+        assert_eq!(b.remaining_bytes(), 4 * GIB - CUDA_ALLOC_ALIGN_BYTES);
+
+        // `release` restores unused bytes and caps at `total - reserve`.
+        b.release(1000);
+        assert_eq!(b.remaining_bytes(), 4 * GIB);
+        b.release(100 * GIB);
+        assert_eq!(b.remaining_bytes(), 14 * GIB);
+
+        // Live-VRAM tightening is monotonic: external VRAM usage shrinks remaining,
+        // while a higher free reading never expands it back.
+        b.apply_live_free_for_test(6 * GIB);
+        assert_eq!(b.remaining_bytes(), 4 * GIB);
+        b.apply_live_free_for_test(12 * GIB);
+        assert_eq!(b.remaining_bytes(), 4 * GIB);
+
+        // `mark_exhausted` latches to 0 and rejects all further reservations/releases.
+        b.mark_exhausted();
+        assert!(b.is_exhausted());
+        assert_eq!(b.remaining_bytes(), 0);
+        assert!(!b.try_reserve(1));
+        b.release(GIB);
+        assert!(b.is_exhausted());
+        assert_eq!(b.remaining_bytes(), 0);
+    }
+
+    #[test]
+    fn alloc_gpu_for_kind_with_zero_budget_falls_back_to_host() -> Result<()> {
+        fn shape_dtype(a: &MxArray) -> Result<(Vec<i64>, DType)> {
+            Ok((a.shape()?.to_vec(), a.dtype()?))
+        }
+        let budget = CudaDeviceBudget::from_limits_for_test(16u64 << 30, Some(0), false);
+        assert!(budget.is_exhausted());
+        let host_cuda = crate::accelerator::host_has_cuda();
+        for kind in ALL_KINDS {
+            let layouts: &[OutLayout] = if kind.is_kquant() {
+                &[OutLayout::RowMajor, OutLayout::Tiled64]
+            } else {
+                &[OutLayout::RowMajor]
+            };
+            let (rows, k) = (64usize, 256usize);
+            let info = tensor_info(kind, rows, k);
+            for &layout in layouts {
+                let (dst, meta) =
+                    RepackDst::alloc_gpu_for_kind_with_budget(&info, kind, layout, &budget)?;
+                let (want_dst, ptrs) = RepackDst::alloc_for_kind(&info, kind, layout)?;
+                assert_eq!(
+                    (meta.rows, meta.k, meta.layout),
+                    (ptrs.rows, ptrs.k, ptrs.layout),
+                    "{kind:?} {layout:?} meta"
+                );
+                assert_eq!(
+                    shape_dtype(&dst.weight)?,
+                    shape_dtype(&want_dst.weight)?,
+                    "{kind:?} {layout:?} weight"
+                );
+                assert_eq!(
+                    dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    want_dst.scales.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} scales"
+                );
+                assert_eq!(
+                    dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    want_dst.biases.as_ref().map(shape_dtype).transpose()?,
+                    "{kind:?} {layout:?} biases"
+                );
+                if host_cuda {
+                    for arr in std::iter::once(&dst.weight)
+                        .chain(dst.scales.as_ref())
+                        .chain(dst.biases.as_ref())
+                    {
+                        if arr.nbytes() > 8 {
+                            assert_eq!(
+                                arr.cuda_host_bytes(),
+                                arr.nbytes(),
+                                "{kind:?} {layout:?} must fall back to host-backed storage"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cuda_q6k_repack_matches_cpu_and_tail_safe() {
+        if !crate::accelerator::host_has_cuda() || !gpu_repack_available() {
+            return;
+        }
+        assert!(gpu_repack_supports_kind(GpuRepackKind::Q6K));
+        assert_eq!(gpu_kind_for(GgufTensorType::Q6K), Some(GpuRepackKind::Q6K));
+        row_major_cases(GpuRepackKind::Q6K);
+        tiled_cases(GpuRepackKind::Q6K);
+        bands_of_one_staging(GpuRepackKind::Q6K, OutLayout::RowMajor, &[3, 5, 1], 768, 2);
+        bands_of_one_staging(
+            GpuRepackKind::Q6K,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+
+        // Exact tail-word safety at 0 and 2 mod 4 endings (including single-block 210 B
+        // and odd 9-block 1890 B staging arrays, plus Tiled64 at exact staging end).
+        for (layout, rows, k) in [
+            (OutLayout::RowMajor, 1usize, 256usize),
+            (OutLayout::RowMajor, 3usize, 768usize),
+            (OutLayout::Tiled64, 64usize, 768usize),
+        ] {
+            let blocks = random_bytes(rows * row_bytes(GpuRepackKind::Q6K, k), 41 + rows as u64);
+            for pad in [0usize, 2] {
+                let staging = staging_exact(&blocks, pad, 9);
+                let end = pad + blocks.len();
+                assert_eq!(staging.nbytes(), end);
+                let (dst, _) = RepackDst::alloc_gpu_for_kind(
+                    &tensor_info(GpuRepackKind::Q6K, rows, k),
+                    GpuRepackKind::Q6K,
+                    layout,
+                )
+                .unwrap();
+                let out = gpu_repack_band(
+                    &staging,
+                    pad as u64,
+                    GpuRepackKind::Q6K,
+                    layout,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "CUDA Q6K {layout:?} band ending at byte {end}: {}",
+                        e.reason
+                    )
+                });
+                assert_same(
+                    &read(&out),
+                    &oracle(GpuRepackKind::Q6K, layout, &blocks, rows, k),
+                    &format!("CUDA Q6K {layout:?} exact tail rows={rows} k={k} pad={pad}"),
+                );
+                let short = staging_exact(&blocks[..blocks.len() - 1], pad, 9);
+                let (dst, _) = RepackDst::alloc_for_kind(
+                    &tensor_info(GpuRepackKind::Q6K, rows, k),
+                    GpuRepackKind::Q6K,
+                    layout,
+                )
+                .unwrap();
+                let err = gpu_repack_band(
+                    &short,
+                    pad as u64,
+                    GpuRepackKind::Q6K,
+                    layout,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .err()
+                .expect("Q6K band one byte past staging end was accepted");
+                assert!(
+                    err.reason.contains("past the end of the staging"),
+                    "{}",
+                    err.reason
+                );
+            }
+        }
     }
 }
 

@@ -46,6 +46,7 @@ unsafe impl Send for MetalResidencySet {}
 unsafe impl Sync for MetalResidencySet {}
 
 impl MetalResidencySet {
+    #[cfg(unix)]
     pub(crate) fn create(arrays: &[&MxArray]) -> Option<Self> {
         if arrays.is_empty() {
             return None;
@@ -127,6 +128,19 @@ impl MxArray {
             handle,
             "array_ensure_cuda_device",
         )?))
+    }
+
+    /// Returns this array's byte size iff it is a CUDA host-backed (`device < 0`)
+    /// array eligible for `ensure_cuda_device()`, else `0`.
+    pub fn cuda_host_bytes(&self) -> usize {
+        // SAFETY: `self.handle.0` is a live `mlx_array` handle.
+        unsafe { sys::mlx_array_cuda_host_bytes(self.handle.0) }
+    }
+
+    /// Whether this array is already evaluated and backed by CUDA host memory
+    /// (`device < 0`), without triggering evaluation of lazy arrays.
+    pub(crate) fn is_settled_cuda_host(&self) -> bool {
+        self.is_available() && self.cuda_host_bytes() > 0
     }
 
     /// Wrap a page-aligned read-only mmap slice as a zero-copy `uint8`
@@ -262,6 +276,29 @@ mod tests {
         assert!(MxArray::alloc_uninit(&[0, 4], DType::Float32).is_err());
         assert!(MxArray::alloc_uninit(&[-1], DType::Float32).is_err());
         assert!(MxArray::alloc_uninit(&[i64::from(i32::MAX) + 1], DType::Uint8).is_err());
+    }
+
+    #[test]
+    fn cuda_host_bytes_reports_host_backed_eligibility() {
+        let (host_large, _, host_bytes) = MxArray::alloc_uninit(&[64], DType::Float32).unwrap();
+        assert_eq!(host_bytes, 256);
+        let (host_small, _, _) = MxArray::alloc_uninit(&[2], DType::Float32).unwrap();
+        if crate::accelerator::host_has_cuda() {
+            assert_eq!(host_large.cuda_host_bytes(), 256);
+            assert_eq!(host_small.cuda_host_bytes(), 0);
+            let gpu = MxArray::alloc_gpu_uninit(&[64], DType::Float32)
+                .unwrap()
+                .expect("alloc_gpu_uninit on CUDA");
+            assert_eq!(gpu.cuda_host_bytes(), 0);
+            let promoted = host_large
+                .ensure_cuda_device()
+                .unwrap()
+                .expect("ensure_cuda_device on host-backed array");
+            assert_eq!(promoted.cuda_host_bytes(), 0);
+        } else {
+            assert_eq!(host_large.cuda_host_bytes(), 0);
+            assert_eq!(host_small.cuda_host_bytes(), 0);
+        }
     }
 
     fn special_f32() -> MxArray {

@@ -1929,6 +1929,7 @@ fn profile_48_visits(
         let mut outs = Vec::with_capacity(captures.len() * 2);
         for cap in &captures {
             let attn = &inner.layers[cap.phys_layer].self_attn;
+            #[cfg(target_os = "macos")]
             let gm = &group_metas[cap.group_id];
             let (xk_in, xv_in) = cap
                 .x_k_v

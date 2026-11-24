@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, atomic::AtomicBool};
+use std::time::Instant;
 
 use image::RgbImage;
 use serde_json::{Map, Value, json};
@@ -92,6 +93,23 @@ pub trait ClairicBackend {
 
     /// Release any per-request vision/prefix caches after a request completes or fails.
     fn clear_request_caches(&mut self);
+
+    /// Whether opt-in `[clairic-phase]` timing instrumentation is enabled.
+    fn phase_timing_enabled(&self) -> bool {
+        false
+    }
+
+    /// Record request-level start timestamp and `parse_request` latency so
+    /// [`Self::finish_request_timing`] can emit a complete `[clairic-phase]`
+    /// summary including `clear_cache_ms` and total wall time.
+    fn set_request_timing_start(&mut self, _start: Instant, _parse_ms: f64) {}
+
+    /// Record `encode_request` latency for `[clairic-phase]` reporting.
+    fn set_request_encode_ms(&mut self, _encode_ms: f64) {}
+
+    /// Emit any recorded `[clairic-phase]` timing breakdown once request cache
+    /// cleanup finishes.
+    fn finish_request_timing(&mut self) {}
 }
 
 const ALLOWED_TOP_LEVEL_KEYS: &[&str] = &[
@@ -3802,7 +3820,9 @@ fn without_quantiles(answer: &Value) -> Value {
     Value::Object(out)
 }
 
-/// RAII guard guaranteeing [`ClairicBackend::clear_request_caches`] runs on every exit path.
+/// RAII guard guaranteeing [`ClairicBackend::clear_request_caches`] runs on
+/// every exit path and emitting the opt-in `[clairic-phase]` timing breakdown
+/// once cache cleanup finishes.
 struct CacheCleanupGuard<'a, B: ClairicBackend + ?Sized> {
     backend: &'a mut B,
 }
@@ -3810,6 +3830,7 @@ struct CacheCleanupGuard<'a, B: ClairicBackend + ?Sized> {
 impl<B: ClairicBackend + ?Sized> Drop for CacheCleanupGuard<'_, B> {
     fn drop(&mut self) {
         self.backend.clear_request_caches();
+        self.backend.finish_request_timing();
     }
 }
 
@@ -3821,14 +3842,27 @@ pub fn extract_json<B: ClairicBackend + ?Sized>(
     rendered_pdf_pages: Vec<RenderedPdfPageData>,
     cancelled: Option<&Arc<AtomicBool>>,
 ) -> Result<String> {
+    let request_start = backend.phase_timing_enabled().then(Instant::now);
     check_cancel_opt(cancelled)?;
 
+    let parse_start = request_start.map(|_| Instant::now());
     let parsed = parse_request(raw_request, rendered_pdf_pages)?;
+    let parse_ms = parse_start.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
+
+    if let Some(start) = request_start {
+        backend.set_request_timing_start(start, parse_ms);
+    }
     let guard = CacheCleanupGuard { backend };
 
     let profile = guard.backend.profile();
 
+    let encode_start = request_start.map(|_| Instant::now());
     let mut encoded = encode_request(guard.backend, profile, &parsed.internal, cancelled)?;
+    if let Some(t) = encode_start {
+        guard
+            .backend
+            .set_request_encode_ms(t.elapsed().as_secs_f64() * 1000.0);
+    }
     check_cancel_opt(cancelled)?;
 
     // Path B: Typed-head readout

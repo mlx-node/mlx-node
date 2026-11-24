@@ -49,6 +49,40 @@ pub(crate) fn prepare(
     }
 }
 
+/// Batched / general-geometry CUDA fused GDN prepare
+/// (`conv1d + SiLU + q/k RMSNorm + decay/beta + next_history`, with optional
+/// per-row `valid_lengths` for right-padded batches).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_batched(
+    qkv: &MxArray,
+    a: &MxArray,
+    b: &MxArray,
+    conv_w: &MxArray,
+    history: &MxArray,
+    scale: &MxArray,
+    dt: &MxArray,
+    valid_lengths: Option<&MxArray>,
+    mean_eps: bool,
+    bf16_beta: bool,
+) -> Result<Option<[MxArray; 6]>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::prepare_batched(
+            qkv,
+            a,
+            b,
+            conv_w,
+            history,
+            scale,
+            dt,
+            valid_lengths,
+            mean_eps,
+            bf16_beta,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
 /// Fused GDN recurrence + gated RMSNorm + z-gate in one GPU dispatch (SiLU gate).
 #[inline]
 #[allow(clippy::too_many_arguments)]

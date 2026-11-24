@@ -78,6 +78,7 @@ void mlx_set_default_device(int32_t device_type) {
 // Synchronize with the given stream
 void mlx_stream_synchronize(mlx_stream stream) {
   try {
+    CudaGraphsEvalReadLock graphs_eval_lock;
     auto s = from_mlx_stream_helper(stream);
     mlx::core::synchronize(s);
   } catch (const std::exception& e) {
