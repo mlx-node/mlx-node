@@ -2071,6 +2071,9 @@ fn estimate_clef_gguf_discrete_fit(
     for unit in clef_residency_units(&backbone_prefixes) {
         let incomplete_mlp = clef_mlp_unit_incomplete(&unit)
             || clef_mlp_base_prefix(&unit[0]).is_some_and(|b| dense_mlp_bases.contains(b));
+        if incomplete_mlp {
+            native_executable = false;
+        }
         let unit_sym8 = !incomplete_mlp && unit.iter().all(|p| backbone_entries[p].sym8_eligible);
         let unit_all_direct =
             unit_sym8 && unit.iter().all(|p| backbone_entries[p].is_direct_cuda_sym8);
@@ -2255,7 +2258,11 @@ fn estimate_clef_params_discrete_fit(
         }
 
         let mut sym8_stored = false;
-        let mut unit_sym8 = !clef_mlp_unit_incomplete(&unit);
+        let incomplete_mlp = clef_mlp_unit_incomplete(&unit);
+        if incomplete_mlp {
+            native_executable = false;
+        }
+        let mut unit_sym8 = !incomplete_mlp;
         let mut unit_all_direct = true;
         let mut unit_entries: Vec<(&str, PerLayerQuant, i64, i64, u64)> =
             Vec::with_capacity(unit.len());
@@ -13055,7 +13062,7 @@ mod tests {
         //    untiled checkpoints (`native_executable = false`).
         let mut cfg = no_mtp_layer_cfg();
         cfg.tie_word_embeddings = false;
-        let header = GgufFile {
+        let mut header = GgufFile {
             version: 3,
             tensor_count: 6,
             alignment: 32,
@@ -13149,6 +13156,68 @@ mod tests {
         assert!(!fit_untiled.native_executable);
         assert_eq!(
             resolve_clef_residency_for_load(true, false, true, true, None, Some(fit_untiled)),
+            Sym8
+        );
+
+        // Mixed dense+quantized MLP (Q4_K gate/up + dense BF16 down) cannot install
+        // as NativeQuant; both GGUF and params estimators must set native_executable=false.
+        header.tensors[4].tensor_type = GgufTensorType::BF16;
+        let mixed_plan = make_plan(&["blk.0.ffn_gate.weight", "blk.0.ffn_up.weight"]);
+        let fit_mixed_gguf = estimate_clef_gguf_discrete_fit(&header, &mixed_plan, &cfg, 16 * MIB)
+            .expect("mixed MLP GGUF produces memory fit");
+        assert!(!fit_mixed_gguf.native_executable);
+        assert_eq!(
+            resolve_clef_residency_for_load(true, false, true, true, None, Some(fit_mixed_gguf)),
+            Sym8
+        );
+
+        let mut mixed_params: HashMap<String, MxArray> = HashMap::new();
+        let mut mixed_plq: HashMap<String, PerLayerQuant> = HashMap::new();
+        let plq_gate = insert_synthetic_kquant_group(
+            "mixed_fit_gate",
+            &mut mixed_params,
+            "layers.0.mlp.gate_proj",
+            PerLayerMode::Q4K,
+            crate::models::quant_dispatch::KQuantLayout::Tiled64,
+            64,
+            2048,
+            1,
+        )
+        .expect("q4k plq");
+        let plq_up = insert_synthetic_kquant_group(
+            "mixed_fit_up",
+            &mut mixed_params,
+            "layers.0.mlp.up_proj",
+            PerLayerMode::Q4K,
+            crate::models::quant_dispatch::KQuantLayout::Tiled64,
+            64,
+            2048,
+            2,
+        )
+        .expect("q4k plq");
+        mixed_plq.insert("layers.0.mlp.gate_proj".to_string(), plq_gate);
+        mixed_plq.insert("layers.0.mlp.up_proj".to_string(), plq_up);
+        mixed_params.insert(
+            "layers.0.mlp.down_proj.weight".to_string(),
+            MxArray::zeros(&[2048, 64], Some(DType::BFloat16)).expect("dense down"),
+        );
+        let budget = crate::utils::gguf_gpu::CudaDeviceBudget::from_limits_for_test(
+            16 * GIB,
+            Some(16 * GIB),
+            false,
+        );
+        let empty_pre_merge = HashMap::new();
+        let fit_mixed_params = estimate_clef_params_discrete_fit(
+            &mixed_params,
+            &mixed_plq,
+            plq_gate,
+            &budget,
+            &empty_pre_merge,
+        )
+        .expect("mixed MLP params produces memory fit");
+        assert!(!fit_mixed_params.native_executable);
+        assert_eq!(
+            resolve_clef_residency_for_load(true, false, true, true, None, Some(fit_mixed_params)),
             Sym8
         );
     }
