@@ -307,7 +307,7 @@ impl DecodeProfiler {
             stats.count += 1;
             if self.record_spans {
                 self.spans.push(Span {
-                    phase: *phase,
+                    phase,
                     cycle: self.cycle_index,
                     start_s,
                     end_s: steady_now_s(),
