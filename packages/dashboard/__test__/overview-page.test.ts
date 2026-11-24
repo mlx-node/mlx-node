@@ -58,6 +58,7 @@ const GGUF_MODELS: ModelsResponse = {
       fileCount: 3,
       servedIds: ['Qwen3.6-27B-Q4_K_M'],
       located: null,
+      link: false,
     },
   ],
   warnings: [],

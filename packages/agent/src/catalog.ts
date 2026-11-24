@@ -108,6 +108,12 @@ export interface CatalogEntry {
    * does.
    */
   hidden?: boolean;
+  /**
+   * The family (an id of the `@mlx-node/lm` family table) of the entry's GGUF builds, set only when that family's GGUF
+   * discovery needs no asset files. A folder with no `config.json` counts as a GGUF build of the entry only when the
+   * header of the GGUF that names the build states this family.
+   */
+  ggufFamily?: string;
   /** `builds[0]` is the build every surface chooses first. */
   builds: readonly [CatalogBuild, ...CatalogBuild[]];
   /** Optional companion, downloaded separately and never offered as a chat model. */
@@ -130,6 +136,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     label: 'Qwen3.8-27B',
     description: 'Best tool use — recommended default',
     isDefault: true,
+    ggufFamily: 'qwen3_5',
     builds: [
       {
         // The UD-Q4_K_XL file carries its MTP layer INLINE (block 64 of 65,
@@ -166,6 +173,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
     label: 'Inkling-2-Mini',
     description: 'Looped MoE with vision and DSpark drafts, 1M context',
+    ggufFamily: 'inkling2',
     builds: [
       {
         // The weight glob ends in `.gguf` because `*UD-Q4_K_XL*` also matches
@@ -214,6 +222,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     description: '125B MoE, 512 experts streamed from SSD',
     // The load has no fixed admission floor; the catalog offers it from 96 GiB.
     minMemoryGb: 96,
+    ggufFamily: 'qwen4_exp',
     builds: [
       {
         // The four shards sit in the repo folder `UD-Q4_K_XL/`, and downloads keep
@@ -238,6 +247,7 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
     // settings (16K context, 2048-row chunk, MTP on, one staging layer) are
     // 26.52 GiB, plus the 12 GiB reserve. The catalog offers it from 96 GiB.
     minMemoryGb: 96,
+    ggufFamily: 'hy_v4_flash',
     builds: [
       {
         // Shard 2 is the Engram table, read by row from SSD; the routed experts

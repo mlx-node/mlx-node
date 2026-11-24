@@ -156,6 +156,7 @@ function localModel(overrides: Partial<LocalModel>): LocalModel {
     fileCount: 7,
     servedIds: [],
     located: null,
+    link: false,
     ...overrides,
   };
 }

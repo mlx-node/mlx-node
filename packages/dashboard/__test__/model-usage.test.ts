@@ -13,6 +13,7 @@ const GGUF: LocalModel = {
   fileCount: 2,
   servedIds: ['Qwen3.8-27B-UD-Q4_K_XL', 'Qwen3.8-27B-Q8_0'],
   located: null,
+  link: false,
 };
 
 const PLAIN: LocalModel = { ...GGUF, name: 'gemma-4-e4b', path: '/models/gemma-4-e4b', servedIds: [] };

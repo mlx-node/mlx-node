@@ -170,7 +170,6 @@ const LEFTOVER: CatalogBlocker = {
   listed: false,
   modelLike: false,
   holdsModel: false,
-  served: false,
   linkTarget: null,
   dangling: false,
   linkToFile: false,

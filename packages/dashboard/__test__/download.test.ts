@@ -45,7 +45,7 @@ import {
   proveInPlace,
   type ReplaceBlocker,
 } from '../src/download.js';
-import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled } from '../src/models.js';
+import { DOWNLOAD_COMPLETE_MARKER, deleteLocalModel, isModelInstalled, summarizeForeignEntry } from '../src/models.js';
 
 /** Filename of the atomic-publish completion marker (kept in sync with models.ts). */
 const MARKER_FILE = '.mlx-download-complete.json';
@@ -3928,19 +3928,14 @@ describe('Clean up & update: replace the entry in the way after a verified downl
     return Buffer.concat([header, string('general.architecture'), stringType, string('qwen35')]);
   }
 
-  it('accepts a folder with a GGUF at its root that mlx serve lists, and moves it to the Trash', async () => {
-    mkdirSync(finalDir());
-    writeFileSync(join(finalDir(), WEIGHT), qwen35Gguf());
-    expect((await discoverLocalChatModels(modelsDir)).map((model) => model.path)).toEqual([join(finalDir(), WEIGHT)]);
-    const blocker = slugItem().blocker!;
-    expect(blocker).toMatchObject({ holdsModel: true, locked: false, listed: false, served: true });
-    const m = manager();
-    const events = await settled(m, m.start(SLUG, { replaceBlocker: blocker }).id);
-    expect(doneOf(events)).toMatchObject({ removed: 'trash' });
-    expect(readFileSync(join(trash.dir, SLUG, WEIGHT))).toEqual(qwen35Gguf());
-  });
-
-  it.each<[string, () => void, boolean]>([
+  it.each<[string, () => void]>([
+    [
+      'a folder with a GGUF at its root',
+      () => {
+        mkdirSync(finalDir());
+        writeFileSync(join(finalDir(), WEIGHT), qwen35Gguf());
+      },
+    ],
     [
       'a link to a folder with a GGUF in a variant folder',
       () => {
@@ -3949,28 +3944,22 @@ describe('Clean up & update: replace the entry in the way after a verified downl
         writeFileSync(join(external, 'UD-Q4_K_XL', WEIGHT), qwen35Gguf());
         symlinkSync(external, finalDir());
       },
-      true,
     ],
-    [
-      'a folder of companion GGUFs',
-      () => {
-        mkdirSync(finalDir());
-        writeFileSync(join(finalDir(), 'mmproj-F16.gguf'), Buffer.alloc(20));
-      },
-      false,
-    ],
-    [
-      'a link to a model file',
-      () => {
-        const file = join(externalFolder(), WEIGHT);
-        writeFileSync(file, qwen35Gguf());
-        symlinkSync(file, finalDir());
-      },
-      false,
-    ],
-  ])('says whether Chat can load a model from %s', (_name, plant, served) => {
+  ])('refuses Clean up at the request and a plain install at the job for %s that Chat loads', async (_name, plant) => {
     plant();
-    expect(slugItem().blocker).toMatchObject({ served });
+    expect(await discoverLocalChatModels(modelsDir)).toHaveLength(1);
+    // Before this folder counted as present, the card offered Clean up with this summary.
+    const asked = summarizeForeignEntry(finalDir())!;
+    expect(slugItem()).toMatchObject({ present: true, installed: false, blocker: null });
+    const tree = treeOf(finalDir());
+    const m = manager();
+    expect(() => m.start(SLUG, { replaceBlocker: asked })).toThrow(
+      `"${SLUG}" changed on disk. Check it, then try again.`,
+    );
+    const events = await settled(m, m.start(SLUG).id);
+    expect(errorOf(events)).toContain('Refusing to install over');
+    expect(treeOf(finalDir())).toEqual(tree);
+    expect(trashed()).toEqual([]);
   });
 
   it.each<[string, number]>([

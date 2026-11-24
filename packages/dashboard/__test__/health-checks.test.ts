@@ -24,6 +24,7 @@ function models(count: number, warnings: string[] = []): ModelsResponse {
       fileCount: 1,
       servedIds: [],
       located: null,
+      link: false,
     })),
     warnings,
     dir: '/models',

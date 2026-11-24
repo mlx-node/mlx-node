@@ -356,8 +356,21 @@ with a GGUF in a variant folder one level down, by discovery's folder walk for a
 folders, which companions, split sets): only when the root holds no primary safetensors; never a folder whose name
 starts with `.`, nor one that holds primary safetensors; links to folders and files followed; the GGUF a regular file,
 not a companion (`mmproj`, `imatrix`, `dflash`, `dspark`, `draft`, `mtp`), and a split set counted from its first part
-only with every part beside it. Nothing deeper is read. Discovery's family name, header and sibling-asset checks are
-not applied. A folder with the download marker of the build's repo under another name counts too. For a repo that two
+only with every part beside it. Nothing deeper is read. With a root `config.json`, discovery's family name, header
+and sibling-asset checks are not applied.
+
+A GGUF folder with no `config.json` reads present on the card of its own model only when the engine loads it with no
+asset files and it is that card's build: the GGUF names the build, every part of its split set is a regular file, the real folder of the file (links
+resolved) has no `config.json`, and its header (`general.architecture`, read by `readGgufArchitectureSync` of
+`@mlx-node/lm/gguf-metadata`, at most 16384 keys and tensors and 128 MiB, as `readGgufHeader`) names a family whose
+GGUF discovery needs no `config.json` or `tokenizer.json`, admits the file name (`bareGgufFamily` of
+`@mlx-node/lm/model-discovery`) and is the catalog entry's `ggufFamily` (`qwen3_5` for Qwen3.8-27B, `inkling2`,
+`qwen4_exp` for Qwen3.8-Flash-Next, `hy_v4_flash`; set only on an entry with GGUF builds, and only a build of a
+`-GGUF` repo uses it). Any other such folder (a header that cannot be read, a GGUF of another model or another build,
+a GGUF at the Inkling-2-Mini Original folder) keeps the card it had without the rule: **Update** or **Clean up &
+update**. Local models lists a folder the engine loads with no `config.json` under its family from the header, its
+build from the file name and no context window, whichever catalog entry its folder name belongs to. A folder with the
+download marker of the build's repo under another name counts too, by the same rules. For a repo that two
 builds share (the Qwen3.8-27B and the Inkling-2-Mini GGUF builds), a folder counts as the build its GGUF file name
 states, not the build its name suggests, and the marker alone never makes a build present. When a build's folder holds
 a loadable model that is another build of the same repo, the build has `heldBy` (that build's name, or `another model`
@@ -365,6 +378,14 @@ when the weights state none): the card shows **Holds UD-Q4_K_M** with no Install
 present on its own segment, and the server refuses an install into the folder with 409
 (`"<folder>" holds <build>. Delete it in Local models, then install <build>.`), because the owned swap would delete
 the other build.
+
+A folder that reads present counts as installed on its card: the card reads **Installed** and **Details**. Without
+the app's complete record (`installed` false, as for a hand-made folder or an `mlx download` of the weights only, also
+through a link) the card shows no version and no update badge. To get the catalog's version, delete the folder in
+Local models, then install. Delete of a row whose entry in the models folder is a link (`link` on the row) removes
+only the link: its confirmation is **Remove link?** "This removes the link <name> from the models folder. Its folder
+and the model files in it are not changed." with **Remove link** in the neutral tone and the toast "Link removed"; the
+row's size is the size of the folder the link points to. A real folder is deleted with its files.
 
 The recommended section is a grid of equal cards: two columns from 780 px of content, one below it, never three. Every
 card in a grid has the same height in every state, because it has five fixed rows: title, description (two lines at
@@ -467,9 +488,9 @@ applies a confirmed rename or delete the same way.
 
 A catalog folder held by something the app did not create (a leftover file, a hand-made folder, a link) is described
 by `blocker`: kind, file count, size, at most 3 names (counted with `lstat`, never following a link or opening a file,
-at most 2,000 entries; only the root `config.json` is read, to tell whether Local models lists the entry), the link
-text (cut to 200 characters), whether the link is dead, whether it holds model files, and `locked` (a real folder
-without write permission). An entry holds model files when it has, anywhere in it, at any depth (links to folders
+at most 2,000 entries; only the root `config.json`, or without it GGUF headers, is read, to tell whether Local models
+lists the entry), the link text (cut to 200 characters), whether the link is dead, whether it holds model files, and
+`locked` (a real folder without write permission). An entry holds model files when it has, anywhere in it, at any depth (links to folders
 followed), an entry named `config.json` or named like weights (`.safetensors`, `.gguf` including companions,
 `.pdiparams`, `.pdparams`, `.npz`, `.bin`, `.pt`, `.pth`, `.pkl`), or a folder that cannot be read, or more than
 20,000 entries to look through. A fully listed real folder that holds model files gets **Update…** (below); a locked
@@ -500,11 +521,8 @@ The confirmation (`cleanupContent`, tone neutral) says it in three rows: **Remov
 (or "The file <slug> (4.0 KB).") for a folder or a file, and **Downloaded** with the model, its size and, from 20 GB,
 "A download of this size can take an hour or more." The notice says the entry leaves only when the download is
 complete and checked, that a cancel or a failure changes nothing, and for the Trash that the space is free only after
-the Trash is emptied; an entry Chat can load a model from (`served`: the folder, or a link's folder, holds a GGUF by
-the file rules of the present check, with no `config.json` needed) adds "Chat can load a model from this folder. Make
-sure that you do not need it.", else an entry Local models lists (a folder, or a link to one) adds "Local models lists this folder as a model. Make
-sure that you do not need it."; a short disk adds the disk line. Such a GGUF folder without `config.json` is not
-listed in Local models, but Chat loads it, and its cleanup moves it to the Trash like any other folder. The toasts
+the Trash is emptied; an entry Local models lists (a folder, or a link to one) adds "Local models lists this folder as
+a model. Make sure that you do not need it."; a short disk adds the disk line. The toasts
 after the job: "The link <slug> was removed. Its folder was not changed.", "The old folder
 <slug> is in the Trash.", or "The old <slug> could not go to the Trash. It is in <keptDir>. Nothing was deleted."; for
 a link that could not be removed, "The link <slug> could not be removed. It is in <keptDir>." A link to a file gets no
@@ -623,9 +641,9 @@ and swaps instead. A record in any other shape reads as empty and proves nothing
 whose marker cannot be read is kept whole in `.staging/<slug>.kept-<uuid>`. The `mlx` CLI keeps the record when it
 rewrites the marker; a file it downloaded again no longer matches the record, so it is kept, not deleted.
 
-Delete in Local models removes a loadable folder for good; a catalog card never does: Clean up & update only unlinks a
-link or moves an entry to the Trash, and a held folder (another build, a working model) gets only Show in Local
-models. Update and Delete can reach the same folder; a Delete during an Update makes the Update stop.
+Delete in Local models removes a loadable folder for good (a link row loses only its link); a catalog card never does:
+Clean up & update only unlinks a link or moves an entry to the Trash, and a held folder (another build, a working
+model) gets only Show in Local models. Update and Delete can reach the same folder; a Delete during an Update makes the Update stop.
 
 ### Locate
 

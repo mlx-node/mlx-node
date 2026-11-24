@@ -175,7 +175,6 @@ describe('catalogActionState: the card each entry in the way gets', () => {
     listed: true,
     modelLike: true,
     holdsModel: true,
-    served: false,
     linkTarget: null,
     dangling: false,
     linkToFile: false,

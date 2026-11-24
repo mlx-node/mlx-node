@@ -4,7 +4,8 @@ import { dirname, join, relative } from 'node:path';
 
 import { afterAll, describe, expect, it } from 'vite-plus/test';
 
-import { discoverLocalChatModels, ggufSplitPart } from '../src/model-discovery.js';
+import { MODEL_FAMILY_DATA } from '../src/family-data.js';
+import { bareGgufFamily, discoverLocalChatModels, ggufSplitPart } from '../src/model-discovery.js';
 
 const tmp = mkdtempSync(join(tmpdir(), 'mlx-discovery-'));
 afterAll(() => rmSync(tmp, { recursive: true, force: true }));
@@ -1015,5 +1016,30 @@ describe('discoverLocalChatModels — a folder that Locate made', () => {
         }),
       ]);
     }
+  });
+});
+
+describe('bareGgufFamily — a GGUF with no config.json beside it', () => {
+  const ARCHITECTURES = MODEL_FAMILY_DATA.flatMap((row) =>
+    'ggufArchitectures' in row ? row.ggufArchitectures.map((architecture) => [row.id, architecture] as const) : [],
+  );
+  const NAMES = ['Model-Q4_K_M.gguf', 'Model-UD-Q4_K_XL.gguf', 'Model-UD-Q4_K_XL-00001-of-00002.gguf'];
+
+  it.each(ARCHITECTURES.flatMap(([family, architecture]) => NAMES.map((name) => [family, architecture, name])))(
+    'agrees with discovery for %s (%s) named %s',
+    async (_family, architecture, name) => {
+      const dir = modelsDir(`bare-${architecture}-${name}`, { [`repo/${name}`]: minimalGguf(architecture) });
+      const listed = await discoverLocalChatModels(dir, { includeDecisions: true });
+      const family = bareGgufFamily(name, architecture);
+      expect(listed.map((model) => model.modelType)).toEqual(family === undefined ? [] : [family]);
+    },
+  );
+
+  it('names the family of Hy4-flash and Qwen3.8-Flash-Next, and none for an asset-requiring family', () => {
+    expect(bareGgufFamily('Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'hy_v4_flash')).toBe('hy_v4_flash');
+    expect(bareGgufFamily('Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf', 'qwen4exp')).toBe('qwen4_exp');
+    expect(bareGgufFamily('gemma-4-UD-Q4_K_XL.gguf', 'gemma4')).toBeUndefined();
+    expect(bareGgufFamily('Model-Q4_K_M.gguf', 'llama')).toBeUndefined();
+    expect(bareGgufFamily('Hy4-flash-Q4_K_M-00002-of-00002.gguf', 'hy_v4_flash')).toBeUndefined();
   });
 });

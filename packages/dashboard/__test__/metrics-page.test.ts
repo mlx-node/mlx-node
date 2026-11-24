@@ -62,6 +62,7 @@ const GGUF: ModelsResponse = {
       fileCount: 1,
       servedIds: ['qwen3-8b'],
       located: null,
+      link: false,
     },
   ],
   warnings: [],

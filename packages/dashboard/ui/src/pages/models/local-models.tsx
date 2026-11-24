@@ -110,6 +110,8 @@ export interface DeleteTarget {
   companion?: boolean;
   /** A folder that Locate made: when its model files stay on disk, the delete only removes the model from the app. */
   located?: LocalModel['located'];
+  /** The entry in the models folder is a link: the delete removes only the link. */
+  link?: boolean;
 }
 
 export interface DeleteHandlers {
@@ -187,6 +189,26 @@ export function deleteContent(target: DeleteTarget, handlers: DeleteHandlers): C
       onDone: () => {
         const gone = goneBeforeDelete.delete(target.name);
         toast.success(gone ? 'Model was already gone' : 'Model removed', { description: target.name });
+        handlers.onDeleted(target.name);
+      },
+    };
+  }
+  if (target.link === true) {
+    return {
+      title: 'Remove link?',
+      description: (
+        <>This removes the link {name} from the models folder. Its folder and the model files in it are not changed.</>
+      ),
+      notice,
+      confirmLabel: 'Remove link',
+      workingLabel: 'Removing…',
+      successLabel: 'Removed',
+      tone: 'neutral',
+      errorTitle: 'Failed to remove link',
+      onConfirm: remove,
+      onDone: () => {
+        const gone = goneBeforeDelete.delete(target.name);
+        toast.success(gone ? 'Link was already gone' : 'Link removed', { description: target.name });
         handlers.onDeleted(target.name);
       },
     };

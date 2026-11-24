@@ -21,8 +21,8 @@ import {
 import { findDFlash2Draft, isDFlash2Companion } from '@mlx-node/lm/draft-companion';
 
 import {
+  catalogFolderModel,
   type ForeignEntrySummary,
-  ggufBuilds,
   isDownloaderOwned,
   isListedFolder,
   isModelInstalled,
@@ -202,10 +202,27 @@ function downloadedRepos(modelsDir: string): Map<string, string[]> {
   return repos;
 }
 
-/** Whether the folder `name` under `modelsDir` holds a loadable model whose GGUF weight file names `buildId`. */
-function holdsBuild(modelsDir: string, name: string, buildId: string): boolean {
-  const dir = join(modelsDir, name);
-  return isModelPresent(dir) && ggufBuilds(dir, name).includes(buildId);
+/**
+ * The family a folder with no `config.json` must state in a GGUF header to be `build` of `entry`
+ * ({@link CatalogEntry.ggufFamily}): only for a build of a GGUF repository on this platform.
+ */
+function ggufFamilyOf(entry: CatalogEntry, build: CatalogBuild): string | undefined {
+  return catalogBuildRepo(build).endsWith('-GGUF') ? entry.ggufFamily : undefined;
+}
+
+/**
+ * Whether the folder `name` under `modelsDir` holds `build` ({@link catalogFolderModel} with the build's
+ * {@link ggufFamilyOf}): a GGUF weight file names the build, or, with `byName` false, the folder has a `config.json`.
+ */
+function holdsBuild(
+  modelsDir: string,
+  name: string,
+  build: CatalogBuild,
+  family: string | undefined,
+  byName: boolean,
+): boolean {
+  const model = catalogFolderModel(join(modelsDir, name), name, family);
+  return model !== undefined && ((!byName && !model.configless) || model.builds.includes(build.id));
 }
 
 /**
@@ -213,19 +230,18 @@ function holdsBuild(modelsDir: string, name: string, buildId: string): boolean {
  * build shares: its build names, or `another model` when its weights state none. `null` when the folder holds no
  * loadable model, holds `build`, or the repository is the build's alone.
  */
-function heldByOther(modelsDir: string, build: CatalogBuild): string | null {
+function heldByOther(modelsDir: string, build: CatalogBuild, family: string | undefined): string | null {
   if (!catalogSharesRepo(build)) return null;
   const slug = catalogBuildSlug(build);
-  const dir = join(modelsDir, slug);
-  if (!isModelPresent(dir)) return null;
-  const builds = ggufBuilds(dir, slug);
-  if (builds.includes(build.id)) return null;
-  return builds.length > 0 ? builds.join(', ') : 'another model';
+  const model = catalogFolderModel(join(modelsDir, slug), slug, family);
+  if (model === undefined || model.builds.includes(build.id)) return null;
+  return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
 }
 
 /** The state of one build's install folder, by the rules on {@link CatalogBuildItem}. */
 function buildWithState(
   modelsDir: string,
+  entry: CatalogEntry,
   build: CatalogBuild,
   downloaded: ReadonlyMap<string, readonly string[]>,
 ): CatalogBuildItem {
@@ -233,25 +249,27 @@ function buildWithState(
   const slug = catalogBuildSlug(build);
   const dir = join(modelsDir, slug);
   const markedFolders = downloaded.get(hfRepo.toLowerCase()) ?? [];
+  const family = ggufFamilyOf(entry, build);
   let present: boolean;
   let installed: boolean;
   let heldBy: string | null = null;
   if (catalogSharesRepo(build)) {
     // The folder is the build it HOLDS, never the build its name suggests: a
     // marker names only the repository, and two builds share it.
-    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build.id);
-    const siblings = MODEL_CATALOG.flatMap((entry) => entry.builds).filter(
+    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, true);
+    const siblings = MODEL_CATALOG.flatMap((candidate) => candidate.builds).filter(
       (other) => other !== build && catalogBuildRepo(other) === hfRepo,
     );
     present = holds(slug) || siblings.some((other) => holds(catalogBuildSlug(other))) || markedFolders.some(holds);
     installed = isModelInstalled(dir) && holds(slug);
-    heldBy = heldByOther(modelsDir, build);
+    heldBy = heldByOther(modelsDir, build, family);
   } else {
     // A loadable checkpoint at the folder OR under any folder name whose
     // completion marker names THIS PLATFORM's repo. Matching the other
     // platform's build too would render the card "Installed" with `installed`
     // false — no Install button and no update affordance.
-    present = isModelPresent(dir) || markedFolders.length > 0;
+    const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, false);
+    present = holds(slug) || markedFolders.some(holds);
     installed = isModelInstalled(dir);
   }
   // Exactly the state the download runner's ownership preflight refuses, computed
@@ -323,7 +341,7 @@ export function catalogWithState(modelsDir: string): CatalogItem[] {
     ...(entry.minMemoryGb !== undefined ? { minMemoryGb: entry.minMemoryGb } : {}),
     ...(entry.isDefault !== undefined ? { isDefault: entry.isDefault } : {}),
     ...(entry.hidden !== undefined ? { hidden: entry.hidden } : {}),
-    builds: entry.builds.map((build) => buildWithState(modelsDir, build, downloaded)),
+    builds: entry.builds.map((build) => buildWithState(modelsDir, entry, build, downloaded)),
     draft: draftWithState(modelsDir, entry),
   }));
 }
@@ -344,7 +362,7 @@ export function catalogBlocker(modelsDir: string, slug: string): CatalogBlocker 
 export function heldByOtherBuild(modelsDir: string, slug: string): string | null {
   for (const entry of MODEL_CATALOG) {
     for (const build of entry.builds) {
-      if (catalogBuildSlug(build) === slug) return heldByOther(modelsDir, build);
+      if (catalogBuildSlug(build) === slug) return heldByOther(modelsDir, build, ggufFamilyOf(entry, build));
     }
   }
   return null;

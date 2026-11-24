@@ -14,7 +14,12 @@ import {
   type ModelType,
 } from './family-data.js';
 import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGgufFileName } from './gguf-name.js';
-import { detectModelType, readGgufArchitecture, readModelConfig } from './model-detection.js';
+import {
+  detectModelType,
+  ggufArchitectureModelType,
+  readGgufArchitecture,
+  readModelConfig,
+} from './model-detection.js';
 import {
   folderVariant,
   ggufNames,
@@ -88,6 +93,17 @@ function supportedGgufName(name: string, modelType: ModelType): boolean {
   const whole = split === undefined ? name : `${split.stem}.gguf`;
   if (modelType === 'qwen3_5' && isBonsaiPq2GgufName(whole)) return true;
   return policy.variants === 'all' || isQwen35XlGgufName(whole);
+}
+
+/**
+ * The family discovery lists the GGUF file `name` under when no `config.json` sits beside it and its header states
+ * `architecture`: the family of that architecture, when its GGUF discovery needs no asset files and admits the name.
+ * `undefined` when discovery skips such a file.
+ */
+export function bareGgufFamily(name: string, architecture: string): ModelType | undefined {
+  const modelType = ggufArchitectureModelType(architecture);
+  if (modelType === undefined || familyDataFor(modelType)?.ggufDiscovery?.requiresAssets) return undefined;
+  return supportedGgufName(name, modelType) ? modelType : undefined;
 }
 
 async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {

@@ -22,6 +22,8 @@ export interface LocalModel {
   servedIds: string[];
   /** Set when Locate made the folder from model files the user already had. */
   located: (LocatedFiles & { filesStay: boolean }) | null;
+  /** The entry in the models folder is a link: Delete removes only the link. */
+  link: boolean;
 }
 
 /** Where the model files of a folder that Locate made are. */
@@ -149,8 +151,6 @@ export interface CatalogBlocker {
   modelLike: boolean;
   /** It holds model files (a checkpoint or a GGUF); for a link, the folder it points to does. */
   holdsModel: boolean;
-  /** Chat can load a GGUF from it (for a link, from its folder), even when Local models does not list it. */
-  served: boolean;
   /** The link text, cut to 200 characters and `…`. */
   linkTarget: string | null;
   dangling: boolean;

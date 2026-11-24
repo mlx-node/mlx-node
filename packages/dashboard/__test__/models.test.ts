@@ -304,6 +304,9 @@ describe('discoverLocalModels', () => {
       expect(linked.modelType).toBe('qwen3');
       expect(linked.fileCount).toBe(2);
       expect(linked.sizeBytes).toBe(Buffer.byteLength(CONFIG_A) + WEIGHT_A_BYTES);
+      // The row says it is a link, so its Delete says that only the link goes.
+      expect(linked.link).toBe(true);
+      expect(models.filter((m) => m.name !== 'linked-model').map((m) => m.link)).toEqual([false, false]);
       // And the internal no-follow walk still holds: a link inside a model dir is
       // never descended into (covered by the cycle test above).
     } finally {
@@ -1704,7 +1707,6 @@ describe('catalog blocker: what is in the way, measured without following or ope
       listed: false,
       modelLike: false,
       holdsModel: false,
-      served: false,
       linkTarget: null,
       dangling: false,
       linkToFile: false,
@@ -1761,9 +1763,11 @@ describe('catalog blocker: what is in the way, measured without following or ope
     rmSync(slugDir(), { recursive: true });
     const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
     onTestFinished(() => rmSync(external, { recursive: true, force: true }));
-    writeFileSync(join(external, GGUF), ggufHeader('qwen35'));
+    writeFileSync(join(external, GGUF), ggufHeader('gemma4'));
     symlinkSync(external, slugDir());
-    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: false, blocker: { kind: 'symlink' } });
+    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: false, blocker: { kind: 'symlink', listed: false } });
+    writeFileSync(join(external, GGUF), ggufHeader('qwen35'));
+    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: true, present: true, blocker: null });
   });
 
   it('names up to three files, sorted, with their relative paths; none for four', () => {

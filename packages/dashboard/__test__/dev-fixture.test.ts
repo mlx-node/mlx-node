@@ -329,7 +329,6 @@ describe('dev fixture content for the manage pages', () => {
       listed: false,
       modelLike: false,
       holdsModel: false,
-      served: false,
       linkTarget: null,
       dangling: false,
       linkToFile: false,

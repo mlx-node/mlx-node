@@ -17,6 +17,9 @@
  * environment stays `node` for every other suite.
  */
 
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { MessageChannel } from 'node:worker_threads';
 
 import { INITIAL_PROGRESS } from '@/components/download-progress';
@@ -67,13 +70,16 @@ import { afterEach, describe, expect, it, onTestFinished, vi } from 'vite-plus/t
 
 import { MODEL_CATALOG } from '../../agent/src/catalog.js';
 import type { ApiResponse } from '../src/api/errors.js';
+import { catalogWithState } from '../src/catalog.js';
 import type { DownloadEvent } from '../src/download.js';
+import { discoverLocalModels } from '../src/models.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import type { ApiCall } from '../src/runtime.js';
 import { connectDashboardApi, disconnectDashboardApi } from '../ui/src/lib/api.js';
 import { splitWhitespace } from '../ui/src/lib/text-scan.js';
 import { reloadMountedQueries, useJson } from '../ui/src/lib/use-api.js';
+import { FLASH_NEXT, HY4 } from './helpers/configless-gguf-fixtures.js';
 import {
   byModelRow,
   dayStart,
@@ -1292,7 +1298,6 @@ describe('Models page — the Install affordance', () => {
     listed: false,
     modelLike: false,
     holdsModel: false,
-    served: false,
     linkTarget: null,
     dangling: false,
     linkToFile: false,
@@ -1375,16 +1380,6 @@ describe('Models page — the Install affordance', () => {
       'a listed folder too large to list',
       { fileCount: 2000, truncated: true, listed: true },
       ['Local models lists this folder as a model. Make sure that you do not need it.'],
-    ],
-    [
-      'a folder that Local models does not list but Chat can load',
-      { fileCount: 2000, truncated: true, served: true },
-      ['Chat can load a model from this folder. Make sure that you do not need it.'],
-    ],
-    [
-      'a link to a folder Chat can load',
-      { kind: 'symlink', fileCount: 0, sizeBytes: 0, linkTarget: '/Volumes/x/m', served: true },
-      ['Chat can load a model from this folder. Make sure that you do not need it.'],
     ],
     [
       'a link to a folder Local models lists',
@@ -2323,6 +2318,36 @@ describe('Models page — the Install affordance', () => {
     expect(buttonLabels()).toContain('Installed');
     expect(buttonLabels()).not.toContain('Install');
   });
+
+  it.each([HY4, FLASH_NEXT])(
+    'shows $label that Chat loads with no config.json as Installed with Details, and no update',
+    async (layout) => {
+      const root = mkdtempSync(join(tmpdir(), 'dash-page-configless-'));
+      onTestFinished(() => rmSync(root, { recursive: true, force: true }));
+      const modelsDir = join(root, 'models');
+      mkdirSync(modelsDir);
+      layout.plant(join(root, layout.slug));
+      symlinkSync(join(root, layout.slug), join(modelsDir, layout.slug));
+      const catalog: CatalogResponse = { items: catalogWithState(modelsDir) };
+      const build = catalog.items.flatMap((item) => item.builds).find((candidate) => candidate.slug === layout.slug)!;
+      restoreApi = stubApi({
+        '/models': { ...discoverLocalModels(modelsDir), dir: modelsDir } satisfies ModelsResponse,
+        '/host': { totalMemBytes: 256 * 1024 ** 3, diskFreeBytes: null } satisfies HostResponse,
+        '/catalog': catalog,
+        '/catalog/updates': { items: [{ hfRepo: build.hfRepo, remoteRevision: 'b'.repeat(40) }] },
+        '/downloads': { jobs: [] } satisfies DownloadsResponse,
+      });
+      mounted = await renderPage(createElement(MemoryRouter, null, createElement(Models)), (text) =>
+        text.includes('Details'),
+      );
+      const card = mounted.container.querySelector(`[data-catalog-card][data-model="${layout.slug}"]`)!;
+      expect(card.querySelector('[data-status="installed"]')?.textContent).toContain('Installed');
+      const details = card.querySelector(`a[href="/models?focus=${encodeURIComponent(layout.slug)}"]`);
+      expect(details?.textContent).toContain('Details');
+      const labels = Array.from(card.querySelectorAll('button')).map((button) => (button.textContent ?? '').trim());
+      for (const label of ['Install', 'Locate…', 'Update', 'Clean up & update…']) expect(labels).not.toContain(label);
+    },
+  );
 
   it('offers Update available when upstream holds a different revision', async () => {
     // The whole point of the check: a re-upload lands new bytes at the SAME repo
@@ -4287,6 +4312,7 @@ describe('Models page — local models and the drawer', () => {
           fileCount: 2,
           servedIds: [SERVED],
           located,
+          link: false,
         },
       ],
       warnings: [],
@@ -4448,6 +4474,34 @@ describe('Models page — local models and the drawer', () => {
       expect(splitWhitespace(disk.textContent ?? '').join(' ')).toContain(splitWhitespace(row).join(' '));
       expect(buttonIn(byRole(document, 'dialog', NAME)!, 'Remove model')).toBeTruthy();
     });
+  });
+
+  it('says Remove link for a model whose folder is a link, and the delete calls the same route', async () => {
+    const success = vi.spyOn(toast, 'success');
+    const routes = modelsRoutes({ [`/models/${NAME}`]: { deleted: true, name: NAME } });
+    const listed = routes['/models'] as ModelsResponse;
+    routes['/models'] = sequence(
+      { ...listed, models: [{ ...listed.models[0]!, link: true }] },
+      { ...listed, models: [] },
+    );
+    await mountModels(routes);
+    await act(async () => modelRow().querySelector<HTMLButtonElement>(`button[aria-label="Delete ${NAME}"]`)!.click());
+    const dialog = [...document.querySelectorAll<HTMLElement>('[role="dialog"]')].find((el) =>
+      el.textContent?.includes('Remove link?'),
+    )!;
+    expect(splitWhitespace(dialog.textContent ?? '').join(' ')).toContain(
+      `This removes the link ${NAME} from the models folder. Its folder and the model files in it are not changed.`,
+    );
+    expect(dialog.textContent).not.toContain('permanently');
+    expect((dialog.closest('[data-tone]') ?? dialog.querySelector('[data-tone]'))?.getAttribute('data-tone')).toBe(
+      'neutral',
+    );
+    await act(async () => buttonIn(dialog, 'Remove link').click());
+    await waitFor(() => success.mock.calls.length > 0);
+    expect(success).toHaveBeenCalledWith('Link removed', { description: NAME });
+    expect(calls.filter((call) => call.method === 'DELETE').map((call) => [call.path, call.body])).toEqual([
+      [`/api/models/${NAME}`, undefined],
+    ]);
   });
 
   it('joins a GGUF checkpoint to its usage, live state and drawer through its served id', async () => {

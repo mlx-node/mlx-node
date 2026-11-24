@@ -1,5 +1,6 @@
 import { totalmem } from 'node:os';
 
+import { familyDataFor } from '@mlx-node/lm/family-data';
 import { ggufNames, ggufVariant } from '@mlx-node/lm/model-variant';
 import { describe, expect, it } from 'vite-plus/test';
 
@@ -615,6 +616,27 @@ describe('MODEL_CATALOG', () => {
     for (const entry of MODEL_CATALOG) {
       if (entry.label === 'Qwen3.8-27B') continue;
       expect(entry.draft, entry.label).toBeUndefined();
+    }
+  });
+
+  it('names the GGUF family of an entry only for a family whose GGUF discovery needs no asset files', () => {
+    expect(
+      MODEL_CATALOG.flatMap((entry) => (entry.ggufFamily === undefined ? [] : [[entry.label, entry.ggufFamily]])),
+    ).toEqual([
+      ['Qwen3.8-27B', 'qwen3_5'],
+      ['Inkling-2-Mini', 'inkling2'],
+      ['Qwen3.8-Flash-Next', 'qwen4_exp'],
+      ['Hy4-flash', 'hy_v4_flash'],
+    ]);
+    for (const entry of MODEL_CATALOG) {
+      if (entry.ggufFamily === undefined) continue;
+      const discovery = familyDataFor(entry.ggufFamily)?.ggufDiscovery;
+      expect(discovery, entry.label).toBeDefined();
+      expect(discovery?.requiresAssets, entry.label).toBeUndefined();
+      expect(
+        entry.builds.some((build) => build.hfRepo.endsWith('-GGUF')),
+        entry.label,
+      ).toBe(true);
     }
   });
 

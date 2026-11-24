@@ -216,11 +216,7 @@ export function cleanupContent(
   const noun = link ? 'link' : blocker.kind === 'file' ? 'file' : 'folder';
   const long = what.sizeGb >= LONG_DOWNLOAD_GB ? ' A download of this size can take an hour or more.' : '';
   const notices = [
-    blocker.served
-      ? 'Chat can load a model from this folder. Make sure that you do not need it.'
-      : blocker.listed
-        ? 'Local models lists this folder as a model. Make sure that you do not need it.'
-        : null,
+    blocker.listed ? 'Local models lists this folder as a model. Make sure that you do not need it.' : null,
     link
       ? `The link is removed only when the download is complete and checked. If you cancel or the download fails, nothing changes.${
           blocker.holdsModel ? ' The old files keep their disk space.' : ''

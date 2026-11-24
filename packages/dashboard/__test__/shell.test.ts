@@ -656,6 +656,7 @@ describe('model colors', () => {
         fileCount: 1,
         servedIds: ['gguf-dir/q8', 'gguf-dir/q4'],
         located: null,
+        link: false,
       },
       {
         name: 'b-plain',
@@ -667,6 +668,7 @@ describe('model colors', () => {
         fileCount: 1,
         servedIds: [],
         located: null,
+        link: false,
       },
       {
         name: 'zeta-7b',
@@ -678,6 +680,7 @@ describe('model colors', () => {
         fileCount: 1,
         servedIds: ['zeta-7b'],
         located: null,
+        link: false,
       },
     ],
     warnings: [],
