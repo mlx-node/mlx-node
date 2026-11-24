@@ -748,8 +748,7 @@ impl DecoderLayer {
         attn_out: MxArray,
         row_budget: Option<&MxArray>,
     ) -> Result<MxArray> {
-        let (h, mlp_out) =
-            self.post_attention_mlp_pending_with_budget(x, &attn_out, row_budget)?;
+        let (h, mlp_out) = self.post_attention_mlp_pending_with_budget(x, &attn_out, row_budget)?;
         h.add(&mlp_out)
     }
 
