@@ -646,7 +646,10 @@ export class TurnTraceModel implements SessionCapableModel {
     }
     const residency = readResidency(this.inner);
     if (residency !== null) {
-      for (const key of RESIDENCY_DELTA_FIELDS) this.residencyMarks[key] ??= residency.counters[key];
+      for (const key of RESIDENCY_DELTA_FIELDS) {
+        const current = residency.counters[key];
+        if (current !== undefined) this.residencyMarks[key] ??= current;
+      }
     }
     const traced = config as TracedChatConfig | null | undefined;
     const ctx: TurnContext = {
@@ -711,6 +714,7 @@ export class TurnTraceModel implements SessionCapableModel {
     const marks = this.residencyMarks;
     for (const key of RESIDENCY_DELTA_FIELDS) {
       const current = residency.counters[key];
+      if (current === undefined) continue;
       const since = marks[key];
       rec[key] = since === undefined || current < since ? current : current - since;
       marks[key] = current;

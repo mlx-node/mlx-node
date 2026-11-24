@@ -237,7 +237,17 @@ impl TurnProgress {
     }
 
     /// Prefill finished and the first token is sampled. Idempotent.
+    #[inline]
     pub(crate) fn first_token(&self) {
+        if self.phase() == PHASE_DECODE {
+            return;
+        }
+        self.first_token_slow();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn first_token_slow(&self) {
         self.picked_up();
         if self.first_token_us.load(Ordering::Relaxed) == UNSET {
             self.first_token_us.store(self.now_us(), Ordering::Relaxed);
@@ -255,8 +265,11 @@ impl TurnProgress {
     }
 
     /// `n` more tokens were kept and streamed.
+    #[inline]
     pub(crate) fn add_generated(&self, n: u32) {
-        self.first_token();
+        if self.phase() != PHASE_DECODE {
+            self.first_token_slow();
+        }
         self.generated.fetch_add(n, Ordering::Relaxed);
     }
 

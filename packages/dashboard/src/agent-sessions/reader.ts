@@ -11,6 +11,7 @@ import { homedir } from 'node:os';
 import { join, resolve, sep } from 'node:path';
 
 import { resolveTitle } from '../chat/titles.js';
+import { type ParsedEvents, parseEvents } from './events.js';
 import {
   type ActiveRegistry,
   isPidAlive,
@@ -61,6 +62,7 @@ const TRANSCRIPT_CACHE_ENTRIES = 4;
 /** Larger subagent event files are not read for a timeline; the lane says so. */
 export const MAX_TIMELINE_CHILD_BYTES = 8 * 1024 * 1024;
 const DIGEST_CACHE_ENTRIES = 32;
+const EVENT_CACHE_ENTRIES = 32;
 
 export interface SessionRef {
   id: string;
@@ -201,6 +203,8 @@ export class AgentSessionsReader {
   private readonly transcripts = new Map<string, Cached<ParsedUpdates>>();
   /** Child event digests for timelines; text-free, so child files never enter `transcripts`. */
   private readonly digests = new Map<string, Cached<LaneSource>>();
+  /** Parsed `events.jsonl` timing digests for main and child timeline lanes. */
+  private readonly eventDigests = new Map<string, Cached<ParsedEvents>>();
   private readonly ownWrites = new Map<string, number>();
   private readonly maxTimelineChildBytes: number;
   private readonly origin: SessionOrigin;
@@ -289,9 +293,11 @@ export class AgentSessionsReader {
     for (const key of this.summaries.keys()) if (!seenSummaries.has(key)) this.summaries.delete(key);
     for (const key of this.metas.keys()) if (!seenMetas.has(key)) this.metas.delete(key);
     const liveUpdates = new Set([...sessions.values()].map((r) => join(r.dir, 'updates.jsonl')));
+    const liveEvents = new Set([...sessions.values()].map((r) => join(r.dir, 'events.jsonl')));
     for (const key of this.stats.keys()) if (!liveUpdates.has(key)) this.stats.delete(key);
     for (const key of this.transcripts.keys()) if (!liveUpdates.has(key)) this.transcripts.delete(key);
     for (const key of this.digests.keys()) if (!liveUpdates.has(key)) this.digests.delete(key);
+    for (const key of this.eventDigests.keys()) if (!liveEvents.has(key)) this.eventDigests.delete(key);
 
     return { sessions, ambiguous, parentOf, childrenOf, spawnedBy, unreadable };
   }
@@ -414,7 +420,7 @@ export class AgentSessionsReader {
         transcriptError: updates.error,
       };
     }
-    const parent = digestUpdates(updates.parsed);
+    const parent = withEvents(digestUpdates(updates.parsed), this.readEvents(ref.dir, MAX_UPDATES_BYTES));
     const children = new Map<string, TimelineChildInfo>();
     for (const e of parent.entries) {
       if (e.kind !== 'subagent' || children.has(e.childId)) continue;
@@ -475,7 +481,7 @@ export class AgentSessionsReader {
     if (fresh(hit, st)) {
       this.digests.delete(path);
       this.digests.set(path, hit!);
-      return { ok: true, source: hit!.value };
+      return { ok: true, source: withEvents(hit!.value, this.readEvents(ref.dir, this.maxTimelineChildBytes)) };
     }
     let text: string;
     try {
@@ -486,7 +492,32 @@ export class AgentSessionsReader {
     const source = digestUpdates(parseUpdates(text));
     this.digests.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: source });
     while (this.digests.size > DIGEST_CACHE_ENTRIES) this.digests.delete(this.digests.keys().next().value!);
-    return { ok: true, source };
+    return { ok: true, source: withEvents(source, this.readEvents(ref.dir, this.maxTimelineChildBytes)) };
+  }
+
+  /** Sibling `events.jsonl` timing digest for a lane, cached by `(mtimeMs, size)`; fails open to `null`. */
+  private readEvents(dir: string, maxBytes: number): ParsedEvents | null {
+    const path = join(dir, 'events.jsonl');
+    const st = regularFile(path);
+    if (st === null || st.size === 0 || st.size > maxBytes) return null;
+    const hit = this.eventDigests.get(path);
+    if (fresh(hit, st)) {
+      this.eventDigests.delete(path);
+      this.eventDigests.set(path, hit!);
+      return hit!.value;
+    }
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return null;
+    }
+    const parsed = parseEvents(text);
+    this.eventDigests.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: parsed });
+    while (this.eventDigests.size > EVENT_CACHE_ENTRIES) {
+      this.eventDigests.delete(this.eventDigests.keys().next().value!);
+    }
+    return parsed;
   }
 
   /**
@@ -549,10 +580,15 @@ export class AgentSessionsReader {
   /** Drop every cached parse and own-write mark under a session dir after we changed it. */
   invalidate(dir: string): void {
     const prefix = dir.endsWith(sep) ? dir : dir + sep;
-    for (const cache of [this.summaries, this.metas, this.stats, this.transcripts, this.digests, this.ownWrites] as Map<
-      string,
-      unknown
-    >[]) {
+    for (const cache of [
+      this.summaries,
+      this.metas,
+      this.stats,
+      this.transcripts,
+      this.digests,
+      this.eventDigests,
+      this.ownWrites,
+    ] as Map<string, unknown>[]) {
       for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key);
     }
   }
@@ -664,6 +700,15 @@ export function subagentDescendants(index: SessionIndex, id: string): SessionRef
     }
   }
   return out;
+}
+
+function withEvents(source: LaneSource, events: ParsedEvents | null): LaneSource {
+  if (events === null || (events.segments.length === 0 && events.lastTs <= source.lastTs)) return source;
+  return {
+    ...source,
+    lastTs: Math.max(source.lastTs, events.lastTs),
+    ...(events.segments.length > 0 ? { eventSpans: events.segments } : {}),
+  };
 }
 
 /** `null` = no file; an `Error` = present but unusable. */

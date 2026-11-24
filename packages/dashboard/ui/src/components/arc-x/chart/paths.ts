@@ -23,8 +23,12 @@ export function segments(points: readonly (XY | null)[]): XY[][] {
   return runs;
 }
 
-function monotoneRun(run: readonly XY[]): string {
-  if (run.length < 3) return `M${run.map((p) => `${n(p.x)} ${n(p.y)}`).join('L')}`;
+function monotoneTail(run: readonly XY[]): string {
+  if (run.length < 3)
+    return run
+      .slice(1)
+      .map((p) => `L${n(p.x)} ${n(p.y)}`)
+      .join('');
   const count = run.length;
   const slopes: number[] = [];
   for (let i = 0; i < count - 1; i += 1) {
@@ -38,7 +42,7 @@ function monotoneRun(run: readonly XY[]): string {
     tangents.push(a * b <= 0 ? 0 : (2 * a * b) / (a + b));
   }
   tangents.push(slopes[count - 2]);
-  let d = `M${n(run[0].x)} ${n(run[0].y)}`;
+  let d = '';
   for (let i = 0; i < count - 1; i += 1) {
     const p = run[i];
     const q = run[i + 1];
@@ -46,6 +50,10 @@ function monotoneRun(run: readonly XY[]): string {
     d += `C${n(p.x + third)} ${n(p.y + tangents[i] * third)} ${n(q.x - third)} ${n(q.y - tangents[i + 1] * third)} ${n(q.x)} ${n(q.y)}`;
   }
   return d;
+}
+
+function monotoneRun(run: readonly XY[]): string {
+  return `M${n(run[0].x)} ${n(run[0].y)}${monotoneTail(run)}`;
 }
 
 /** Line through every run of two or more points; lone points come back separately so the caller draws them as dots. */
@@ -66,12 +74,17 @@ export function linePath(
 }
 
 /** The area between each run and the baseline. */
-export function areaPath(points: readonly (XY | null)[], baseline: number): string {
+export function areaPath(
+  points: readonly (XY | null)[],
+  baseline: number,
+  curve: 'linear' | 'monotone' = 'linear',
+): string {
   let d = '';
   for (const run of segments(points)) {
     if (run.length < 2) continue;
-    d += `M${n(run[0].x)} ${n(baseline)}`;
-    for (const p of run) d += `L${n(p.x)} ${n(p.y)}`;
+    d += `M${n(run[0].x)} ${n(baseline)}L${n(run[0].x)} ${n(run[0].y)}`;
+    if (curve === 'monotone') d += monotoneTail(run);
+    else for (let i = 1; i < run.length; i += 1) d += `L${n(run[i].x)} ${n(run[i].y)}`;
     d += `L${n(run[run.length - 1].x)} ${n(baseline)}Z`;
   }
   return d;

@@ -101,6 +101,21 @@ pub(crate) fn resolve(config: &ChatConfig, defaults: &ModelGenerationDefaults) -
     params
 }
 
+/// Like [`resolve`], defaulting `mtp_depth` to `MTP_DEPTH_MAX` (3) when
+/// experts live in full-residency `Mmap`/`Direct` mode (zero SSD miss
+/// amplification) and the caller did not specify `mtp_depth`.
+pub(crate) fn resolve_with_residency(
+    config: &ChatConfig,
+    defaults: &ModelGenerationDefaults,
+    is_direct: bool,
+) -> ChatParams {
+    let mut params = resolve(config, defaults);
+    if config.mtp_depth.is_none() && is_direct {
+        params.mtp_depth = MTP_DEPTH_MAX;
+    }
+    params
+}
+
 /// The GGUF's `tokenizer.ggml.eos_token_id` must be `EOS`.
 pub fn check_eos(gguf_eos: u32) -> Result<u32> {
     if gguf_eos != EOS {
@@ -317,6 +332,8 @@ impl<S: Seq> Conv<S> {
 /// Admission and bank state as of the last turn edge (host values only).
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Residency {
+    pub residency: &'static str,
+    pub total_expert_slots: usize,
     pub admission: Option<Admission>,
     pub cache_slots: [usize; 2],
     pub expert_cache_bytes: Option<u64>,
@@ -551,6 +568,15 @@ impl Inner {
     }
 
     pub(super) fn publish(&mut self, bank_resident: Option<u64>) {
+        let residency = if self.store.bank.is_mmap() {
+            "mmap"
+        } else if self.store.bank.is_direct() {
+            "direct"
+        } else {
+            "streamed"
+        };
+        let total_slots = self.store.sizes.total_experts();
+        let total_expert_slots = total_slots[0] + total_slots[1];
         let admission = self.store.admission();
         let switches = self.store.lease.switches().len() as u32;
         let cache_slots = self.store.cache_slots();
@@ -577,6 +603,8 @@ impl Inner {
             (None, None) => [0; 4],
         };
         let mut r = self.residency();
+        r.residency = residency;
+        r.total_expert_slots = total_expert_slots;
         r.admission = admission;
         r.switches = switches;
         r.cache_slots = cache_slots;
@@ -753,9 +781,10 @@ impl ChatBackend for Inner {
         Some(&self.defaults)
     }
 
-    /// MTP is on unless the request turns it off.
+    /// MTP is on unless the request turns it off; defaults to depth 3 in
+    /// full-residency `Mmap`/`Direct` mode and 1 in `Streamed` mode.
     fn resolve_params(&self, config: &ChatConfig) -> ChatParams {
-        let mut p = resolve(config, &self.defaults);
+        let mut p = resolve_with_residency(config, &self.defaults, self.store.is_direct());
         if config.enable_mtp.is_none() {
             p.enable_mtp = self.mtp.is_some();
         }
@@ -1039,6 +1068,10 @@ pub struct HyV4FlashContextLimits {
 /// The load-time and latest per-turn admission, and the expert bank.
 #[napi(object)]
 pub struct HyV4FlashResidencyInfo {
+    /// Where the routed experts live: zero-copy file-backed mmap, anonymous
+    /// full-expert direct banks, or partial streamed cache banks.
+    #[napi(ts_type = "'mmap' | 'direct' | 'streamed'")]
+    pub residency: String,
     pub dense_bytes: f64,
     pub physical_bytes: Option<f64>,
     /// Other processes' (and other models') bytes at the last admission.
@@ -1048,6 +1081,8 @@ pub struct HyV4FlashResidencyInfo {
     pub fixed_bytes: Option<f64>,
     /// Expert cache slots of both classes.
     pub expert_cache_slots: u32,
+    /// Total routed experts across all trunk MoE layers.
+    pub total_expert_slots: u32,
     /// Expert cache slots per class (Q6_K down, Q4_K down).
     pub expert_cache_slots_by_class: Vec<u32>,
     pub expert_cache_bytes: Option<f64>,
@@ -1365,11 +1400,17 @@ impl HyV4FlashModel {
         let (c, w, t) = (&r.counters, &r.waves, &*self.telemetry);
         let load = |n: &std::sync::atomic::AtomicU64| n.load(Ordering::Relaxed) as f64;
         HyV4FlashResidencyInfo {
+            residency: if r.residency.is_empty() {
+                "streamed".to_string()
+            } else {
+                r.residency.to_string()
+            },
             dense_bytes: self.dense_bytes as f64,
             physical_bytes: a.map(|a| a.physical as f64),
             others_bytes: a.map(|a| a.others as f64),
             fixed_bytes: a.map(|a| a.fixed as f64),
             expert_cache_slots: u32::try_from(slots[0] + slots[1]).unwrap_or(u32::MAX),
+            total_expert_slots: u32::try_from(r.total_expert_slots).unwrap_or(u32::MAX),
             expert_cache_slots_by_class: slots
                 .iter()
                 .map(|&n| u32::try_from(n).unwrap_or(u32::MAX))

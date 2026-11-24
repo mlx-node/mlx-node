@@ -1764,6 +1764,10 @@ struct MmapExpertBank {
     slot_bytes: [u64; 2],
     cache_slots: [usize; 2],
     mapped_bytes: u64,
+    rset_pinned_bytes: u64,
+    rset_total_bytes: u64,
+    #[cfg(test)]
+    rset_pinned_bufs: usize,
     in_turn: Arc<AtomicBool>,
     origin: Instant,
     last_turn_end_ms: Arc<AtomicU64>,
@@ -1896,6 +1900,7 @@ impl MmapExpertBank {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         n_experts: usize,
         layout: &ClassLayout,
@@ -1904,6 +1909,7 @@ impl MmapExpertBank {
         paths: &[PathBuf],
         warm_budget_bytes: u64,
         force_prewarm: bool,
+        rset_budget_bytes: u64,
         dense_spec: &MmapDenseSpec,
     ) -> Result<(Self, MmapDense)> {
         if n_experts == 0 || u32::try_from(n_experts).is_err() {
@@ -2009,12 +2015,40 @@ impl MmapExpertBank {
             });
         }
 
-        let buf_refs: Vec<&MxArray> = layers
+        let rset_total_bytes = extra_bufs
             .iter()
-            .flat_map(|l| l.projs.iter().map(|p| &p.buf))
-            .chain(extra_bufs.iter())
-            .collect();
+            .map(|b| b.nbytes() as u64)
+            .chain(
+                layers
+                    .iter()
+                    .flat_map(|l| l.projs.iter().map(|p| p.buf.nbytes() as u64)),
+            )
+            .fold(0u64, u64::saturating_add);
+        let mut buf_refs: Vec<&MxArray> = Vec::with_capacity(extra_bufs.len() + layers.len() * 3);
+        let mut selected_bytes = 0u64;
+        for buf in &extra_bufs {
+            let bytes = buf.nbytes() as u64;
+            if selected_bytes.saturating_add(bytes) <= rset_budget_bytes {
+                buf_refs.push(buf);
+                selected_bytes = selected_bytes.saturating_add(bytes);
+            }
+        }
+        for layer in &layers {
+            let layer_bytes = layer
+                .projs
+                .iter()
+                .fold(0u64, |acc, p| acc.saturating_add(p.buf.nbytes() as u64));
+            if selected_bytes.saturating_add(layer_bytes) <= rset_budget_bytes {
+                buf_refs.extend(layer.projs.iter().map(|p| &p.buf));
+                selected_bytes = selected_bytes.saturating_add(layer_bytes);
+            } else {
+                break;
+            }
+        }
         let rset = MetalResidencySet::create(&buf_refs).map(Arc::new);
+        let rset_pinned_bytes = if rset.is_some() { selected_bytes } else { 0 };
+        #[cfg(test)]
+        let rset_pinned_bufs = if rset.is_some() { buf_refs.len() } else { 0 };
         let origin = Instant::now();
         let in_turn = Arc::new(AtomicBool::new(false));
         let last_turn_end_ms = Arc::new(AtomicU64::new(RSET_NO_TURN_ENDED));
@@ -2088,6 +2122,10 @@ impl MmapExpertBank {
                 slot_bytes,
                 cache_slots,
                 mapped_bytes,
+                rset_pinned_bytes,
+                rset_total_bytes,
+                #[cfg(test)]
+                rset_pinned_bufs,
                 in_turn,
                 origin,
                 last_turn_end_ms,
@@ -2099,6 +2137,7 @@ impl MmapExpertBank {
     }
 
     #[cfg(not(unix))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         _n_experts: usize,
         _layout: &ClassLayout,
@@ -2107,6 +2146,7 @@ impl MmapExpertBank {
         _paths: &[PathBuf],
         _warm_budget_bytes: u64,
         _force_prewarm: bool,
+        _rset_budget_bytes: u64,
         _dense_spec: &MmapDenseSpec,
     ) -> Result<(Self, MmapDense)> {
         Err(bad("mmap expert bank requires Unix"))
@@ -2268,14 +2308,16 @@ impl KqBank {
             paths,
             warm_budget_bytes,
             force_prewarm,
+            u64::MAX,
             &MmapDenseSpec::default(),
         )?;
         Ok(bank)
     }
 
     /// Zero-copy mmap expert bank that also maps `token_embd.weight` /
-    /// `output.weight` on the same shard mappings and registers them in the
-    /// shared `MetalResidencySet`.
+    /// `output.weight` on the same shard mappings and pins buffers in the
+    /// shared `MetalResidencySet` up to `rset_budget_bytes`.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_mmap_with_dense(
         pool: IoPool,
         moe: &MoeConfig,
@@ -2283,6 +2325,7 @@ impl KqBank {
         paths: &[PathBuf],
         warm_budget_bytes: u64,
         force_prewarm: bool,
+        rset_budget_bytes: u64,
         dense_spec: &MmapDenseSpec,
     ) -> Result<(Self, MmapDense)> {
         let n = moe.n_experts;
@@ -2300,6 +2343,7 @@ impl KqBank {
             paths,
             warm_budget_bytes,
             force_prewarm,
+            rset_budget_bytes,
             dense_spec,
         )?;
         Ok((
@@ -2436,6 +2480,24 @@ impl KqBank {
         }
     }
 
+    /// Total page-aligned bytes pinned in the standing `MetalResidencySet`
+    /// (0 when not in mmap mode or when no residency set is active).
+    pub fn rset_pinned_bytes(&self) -> u64 {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => m.rset_pinned_bytes,
+            _ => 0,
+        }
+    }
+
+    /// Total page-aligned bytes across all mmap buffers eligible for
+    /// `MetalResidencySet` pinning (0 when not in mmap mode).
+    pub fn rset_total_bytes(&self) -> u64 {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => m.rset_total_bytes,
+            _ => 0,
+        }
+    }
+
     /// Re-affirms Metal residency for mmap expert buffers; no-op otherwise.
     pub fn keep_residency_alive(&self) {
         if let Some(ResidentBank::Mmap(mmap)) = self.direct.get() {
@@ -2482,6 +2544,14 @@ impl KqBank {
     pub(crate) fn extra_mmap_bufs(&self) -> usize {
         match self.direct.get() {
             Some(ResidentBank::Mmap(m)) => m._extra_bufs.len(),
+            _ => 0,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rset_pinned_bufs(&self) -> usize {
+        match self.direct.get() {
+            Some(ResidentBank::Mmap(m)) => m.rset_pinned_bufs,
             _ => 0,
         }
     }
@@ -2700,25 +2770,29 @@ impl KqBank {
     pub fn resident_bytes(&self) -> Result<u64> {
         match self.direct.get() {
             Some(ResidentBank::Direct(direct)) => {
-                let mut n = 0;
-                for p in direct.layers.iter().flat_map(|l| &l.proj) {
-                    for b in p.banks() {
-                        n += b.resident_bytes()?;
-                    }
-                }
-                return Ok(n);
+                let banks: Vec<&PurgeableBank> = direct
+                    .layers
+                    .iter()
+                    .flat_map(|l| &l.proj)
+                    .flat_map(ProjBank::banks)
+                    .collect();
+                return Ok(PurgeableBank::resident_bytes_batch(&banks)?
+                    .into_iter()
+                    .sum());
             }
             Some(ResidentBank::Mmap(_)) => return Ok(0),
             None => {}
         }
         let g = lock(&self.inner);
-        let mut n = 0;
-        for p in g.classes.iter().flat_map(|c| &c.proj) {
-            for b in p.banks() {
-                n += b.resident_bytes()?;
-            }
-        }
-        Ok(n)
+        let banks: Vec<&PurgeableBank> = g
+            .classes
+            .iter()
+            .flat_map(|c| &c.proj)
+            .flat_map(ProjBank::banks)
+            .collect();
+        Ok(PurgeableBank::resident_bytes_batch(&banks)?
+            .into_iter()
+            .sum())
     }
 
     /// Bytes of every bank resident in RAM now, and of those the bytes of
@@ -2729,14 +2803,18 @@ impl KqBank {
     pub fn residency(&self) -> Result<Residency> {
         match self.direct.get() {
             Some(ResidentBank::Direct(direct)) => {
+                let banks: Vec<&PurgeableBank> = direct
+                    .layers
+                    .iter()
+                    .flat_map(|l| &l.proj)
+                    .flat_map(ProjBank::banks)
+                    .collect();
+                let bytes = PurgeableBank::resident_bytes_batch(&banks)?;
                 let mut r = Residency::default();
-                for p in direct.layers.iter().flat_map(|l| &l.proj) {
-                    for b in p.banks() {
-                        let n = b.resident_bytes()?;
-                        r.resident += n;
-                        if kernel_volatile(b).unwrap_or(false) {
-                            r.volatile += n;
-                        }
+                for (b, n) in banks.into_iter().zip(bytes) {
+                    r.resident += n;
+                    if kernel_volatile(b).unwrap_or(false) {
+                        r.volatile += n;
                     }
                 }
                 return Ok(r);
@@ -2745,17 +2823,53 @@ impl KqBank {
             None => {}
         }
         let g = lock(&self.inner);
+        let banks: Vec<&PurgeableBank> = g
+            .classes
+            .iter()
+            .flat_map(|c| &c.proj)
+            .flat_map(ProjBank::banks)
+            .collect();
+        let bytes = PurgeableBank::resident_bytes_batch(&banks)?;
         let mut r = Residency::default();
-        for p in g.classes.iter().flat_map(|c| &c.proj) {
-            for b in p.banks() {
-                let n = b.resident_bytes()?;
-                r.resident += n;
-                if kernel_volatile(b).unwrap_or(!g.in_turn) {
-                    r.volatile += n;
-                }
+        for (b, n) in banks.into_iter().zip(bytes) {
+            r.resident += n;
+            if kernel_volatile(b).unwrap_or(!g.in_turn) {
+                r.volatile += n;
             }
         }
         Ok(r)
+    }
+
+    /// Fast residency check right after `begin_turn()` returned `Ok(false)`
+    /// (no bank emptied): reuses `prev_resident` from the pre-flip `residency()`
+    /// call and probes only `vm_purgable_control` per bank, avoiding a second
+    /// full `mincore` scan over tens of GiB when every bank is now non-volatile.
+    pub fn residency_after_begin(&self, prev_resident: u64) -> Result<Residency> {
+        match self.direct.get() {
+            Some(ResidentBank::Direct(_)) => return self.residency(),
+            Some(ResidentBank::Mmap(_)) => return Ok(Residency::default()),
+            None => {}
+        }
+        let g = lock(&self.inner);
+        let volatile_banks: Vec<&PurgeableBank> = g
+            .classes
+            .iter()
+            .flat_map(|c| &c.proj)
+            .flat_map(ProjBank::banks)
+            .filter(|b| kernel_volatile(b).unwrap_or(!g.in_turn))
+            .collect();
+        let volatile = if volatile_banks.is_empty() {
+            0
+        } else {
+            PurgeableBank::resident_bytes_batch(&volatile_banks)?
+                .into_iter()
+                .sum::<u64>()
+                .min(prev_resident)
+        };
+        Ok(Residency {
+            resident: prev_resident,
+            volatile,
+        })
     }
 
     /// Writes zeros over every bank so each of its pages is resident.

@@ -41,7 +41,7 @@ use crate::engine::plan::{
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::dflash2_state::store::StateClass;
 use crate::stream::{Stream, StreamContext};
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::inkling::{
     CONTENT_MODEL_END_SAMPLING_ID, IMAGE_PAD_ID, Inkling2RenderOptions, InklingParserState,
     InklingStreamParser, InklingToolSpec, count_inkling2_reasoning_tokens,
@@ -3930,6 +3930,44 @@ fn finalize_inkling2_turn(args: FinalizeArgs<'_>) -> Result<ChatResult> {
     })
 }
 
+/// Render `messages` to Inkling2 native wire token IDs matching [`Inkling2Inner::render_prompt`].
+///
+/// Shared by both [`ChatBackend::render_prompt`] and [`super::model::Inkling2Model::apply_chat_template`]
+/// so preflight context sizing, `/v1/messages/count_tokens`, and GPU inference agree identically.
+pub(crate) fn render_inkling2_prompt(
+    tok: &Qwen3Tokenizer,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Result<Vec<u32>> {
+    let effort = if let Some(raw_effort) = reasoning_effort {
+        parse_reasoning_effort(raw_effort)
+            .map_err(|e| Error::from_reason(format!("Inkling2 invalid reasoning_effort: {e}")))?
+    } else if enable_thinking == Some(false) {
+        0.0
+    } else {
+        crate::tools::inkling::DEFAULT_REASONING_EFFORT
+    };
+    let specs = match tools {
+        Some(defs) => defs
+            .iter()
+            .map(InklingToolSpec::from_tool_definition)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|e| {
+                Error::from_reason(format!("Inkling2 tool spec conversion failed: {e}"))
+            })?,
+        None => Vec::new(),
+    };
+    let opts = Inkling2RenderOptions {
+        reasoning_effort: effort,
+        tools: specs,
+        ..Default::default()
+    };
+    render_inkling2_chat_messages_to_ids(messages, tok, &opts)
+        .map_err(|e| Error::from_reason(format!("Inkling2 prompt render failed: {e}")))
+}
+
 impl ChatBackend for Inkling2Inner {
     fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
         self.tokenizer
@@ -3978,32 +4016,17 @@ impl ChatBackend for Inkling2Inner {
         config: &ChatConfig,
         _preserve_thinking: bool,
     ) -> Result<Vec<u32>> {
-        let effort = if let Some(ref raw_effort) = config.reasoning_effort {
-            parse_reasoning_effort(raw_effort).map_err(|e| {
-                Error::from_reason(format!("Inkling2 invalid reasoning_effort: {e}"))
-            })?
-        } else if crate::engine::resolve_enable_thinking(config) == Some(false) {
-            0.0
-        } else {
-            crate::tools::inkling::DEFAULT_REASONING_EFFORT
-        };
-        let tools = match config.tools.as_deref() {
-            Some(defs) => defs
-                .iter()
-                .map(InklingToolSpec::from_tool_definition)
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|e| {
-                    Error::from_reason(format!("Inkling2 tool spec conversion failed: {e}"))
-                })?,
-            None => Vec::new(),
-        };
-        let opts = Inkling2RenderOptions {
-            reasoning_effort: effort,
-            tools,
-            ..Default::default()
-        };
-        render_inkling2_chat_messages_to_ids(messages, tok, &opts)
-            .map_err(|e| Error::from_reason(format!("Inkling2 prompt render failed: {e}")))
+        render_inkling2_prompt(
+            tok,
+            messages,
+            config.tools.as_deref(),
+            crate::engine::resolve_enable_thinking(config),
+            config.reasoning_effort.as_deref(),
+        )
+    }
+
+    fn uses_jinja_continuation(&self) -> bool {
+        false
     }
 
     fn cached_token_history(&self) -> &[u32] {

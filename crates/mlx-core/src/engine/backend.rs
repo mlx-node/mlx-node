@@ -864,6 +864,15 @@ pub(crate) trait ChatBackend {
         tok.apply_chat_template_with_config(messages, true, config, preserve_thinking)
     }
 
+    /// Whether [`crate::engine::session::render_live_continuation`] should use
+    /// the tokenizer's Jinja template continuation verifier. Families that
+    /// render prompts natively in Rust instead of through `chat_template.jinja`
+    /// (e.g. Inkling-2) override this to `false` so `TurnKind::Continue` never
+    /// runs a divergent Jinja template and relies on exact token-prefix reuse.
+    fn uses_jinja_continuation(&self) -> bool {
+        true
+    }
+
     /// The session's committed token history.
     fn cached_token_history(&self) -> &[u32];
 

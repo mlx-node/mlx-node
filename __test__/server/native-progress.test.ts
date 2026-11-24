@@ -1,11 +1,13 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import {
+  expertsLiveOf,
   loadProgressOf,
   pipelineStatsOf,
   readLoadProgress,
   readPipelineStats,
   readWarmupReport,
+  residencySnapshotOf,
   warmupReportOf,
   type WarmupReport,
 } from '../../packages/server/src/native-progress.js';
@@ -101,5 +103,48 @@ describe('native warm-up report', () => {
     expect(readWarmupReport(new Gone())).toBeNull();
     expect(readWarmupReport({})).toBeNull();
     expect(readWarmupReport(null)).toBeNull();
+  });
+});
+
+describe('residency snapshot', () => {
+  const hy4Base = {
+    residency: 'mmap',
+    expertCacheSlots: 20_992,
+    totalExpertSlots: 20_992,
+    fixedBytes: 12_500_000_000,
+    slotHits: 100,
+    slotMisses: 0,
+    checkpointBytesRead: 0,
+    prefixPublished: 2,
+    prefixRestored: 1,
+  };
+
+  it('validates Hy4-flash mmap, direct, and streamed snapshots without fabricating Qwen4Exp fields', () => {
+    const mmap = residencySnapshotOf(hy4Base);
+    expect(mmap).toEqual({
+      residency: 'mmap',
+      expertSlots: 20_992,
+      expertCount: 20_992,
+      load: { anonymousNeedBytes: 12_500_000_000 },
+      counters: {
+        slotHits: 100,
+        slotMisses: 0,
+        checkpointBytesRead: 0,
+        prefixPublished: 2,
+        prefixRestored: 1,
+      },
+    });
+    expect(expertsLiveOf(mmap!)).toEqual({ inMemory: 20_992, total: 20_992, streaming: false });
+
+    const direct = residencySnapshotOf({ ...hy4Base, residency: 'direct', fixedBytes: undefined });
+    expect(direct?.load).toEqual({});
+    expect(expertsLiveOf(direct!)).toEqual({ inMemory: 20_992, total: 20_992, streaming: false });
+
+    const streamed = residencySnapshotOf({ ...hy4Base, residency: 'streamed', expertCacheSlots: 11_000 });
+    expect(expertsLiveOf(streamed!)).toEqual({ inMemory: 11_000, total: 20_992, streaming: true });
+
+    expect(residencySnapshotOf({ denseBytes: 1, bankSwitches: 2, inTurn: false })).toBeNull();
+    expect(residencySnapshotOf({ ...hy4Base, residency: 'unknown' })).toBeNull();
+    expect(residencySnapshotOf({ ...hy4Base, totalExpertSlots: 0 })).toBeNull();
   });
 });

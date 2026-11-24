@@ -143,17 +143,20 @@ describe('live history', () => {
     unmount();
   });
 
-  it('an idle running process is 0; no running process is null', () => {
+  it('an idle running process is 0; prefilling in-flight with null decodeTps or no running process is null', () => {
     const unmount = mountProbe();
     act(() => {
       recordLiveSnapshot(snapshot(1_000, [{ pid: 1, status: 'running', decodeTps: null }]));
-      recordLiveSnapshot(snapshot(2_000, [{ pid: 1, status: 'unresponsive', decodeTps: 5 }]));
-      recordLiveSnapshot(snapshot(3_000, []));
+      recordLiveSnapshot(snapshot(2_000, [{ pid: 1, status: 'running', decodeTps: null, inFlight: 1 }]));
+      recordLiveSnapshot(snapshot(3_000, [{ pid: 1, status: 'unresponsive', decodeTps: 5 }]));
+      recordLiveSnapshot(snapshot(4_000, []));
     });
     expect(latest[0].outTps).toBe(0);
     expect(latest[0].inFlight).toBe(0);
-    expect(latest[1]).toEqual({
-      t: 2_000,
+    expect(latest[1].outTps).toBeNull();
+    expect(latest[1].inFlight).toBe(1);
+    expect(latest[2]).toEqual({
+      t: 3_000,
       pid: null,
       outTps: null,
       memActive: null,
@@ -161,7 +164,7 @@ describe('live history', () => {
       inFlight: null,
       queued: null,
     });
-    expect(latest[2].outTps).toBeNull();
+    expect(latest[3].outTps).toBeNull();
     unmount();
   });
 

@@ -2342,9 +2342,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .and_then(|logits| Self::prepare_sample_next(turn, logits));
                 pending.push(sample);
             }
-            let started = Instant::now();
+            let started = running
+                .iter()
+                .any(|turn| turn.payload.profiler.is_enabled())
+                .then(Instant::now);
             let sampled = engine::batch_sampling::evaluate_pending_samples(pending);
-            sampling_eval_time = Some(started.elapsed());
+            sampling_eval_time = started.map(|t| t.elapsed());
             sampled.into_iter().map(Some).collect()
         } else {
             Vec::new()
@@ -2458,14 +2461,11 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
     ) -> std::result::Result<StepResult, Self::Error> {
         let mut rows = Vec::with_capacity(plan.rows.len());
         rows.resize_with(plan.rows.len(), || None);
-        let decode_started = Instant::now();
+        let has_decode = plan.rows.iter().any(|row| row.kind == StepKind::Decode);
+        let decode_started = has_decode.then(Instant::now);
         let (decode_results, executed_decode_batch, executed_greedy_epilogue_batch) =
             self.execute_decode_rows(plan, running)?;
-        let decode_wall_micros = if plan.rows.iter().any(|row| row.kind == StepKind::Decode) {
-            Self::elapsed_micros(decode_started)
-        } else {
-            0
-        };
+        let decode_wall_micros = decode_started.map_or(0, Self::elapsed_micros);
         let mut prefill_started = None;
         let batched_decode_blocked = decode_results
             .iter()

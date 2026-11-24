@@ -56,6 +56,10 @@ export const HEARTBEAT_IDLE_MS = 5000;
 export const SAMPLE_BUSY_MS = 5000;
 export const SAMPLE_IDLE_MS = 60_000;
 export const EDGE_COALESCE_MS = 250;
+export const RATE_WINDOW_MS = 5000;
+const RATE_MIN_DT_MS = 500;
+const PRE_DECODE_PHASES: ReadonlySet<string> = new Set(['queued', 'slot', 'prepare', 'prefill']);
+const MODEL_META_REFRESH_MS = SAMPLE_BUSY_MS;
 export const SCHED_IDLE_SETTLE_MS = 500;
 export const LIVE_TURNS_MAX = 32;
 export const LIVE_DEAD_AFTER_MS = 300_000;
@@ -188,7 +192,10 @@ function residencyFields(snapshot: ResidencySnapshot): Partial<RuntimeLoadRecord
     expertSlots: snapshot.expertSlots,
     expertCount: snapshot.expertCount,
   };
-  for (const key of LOAD_RESIDENCY_FIELDS) fields[key] = snapshot.load[key];
+  for (const key of LOAD_RESIDENCY_FIELDS) {
+    const value = snapshot.load[key];
+    if (value !== undefined) fields[key] = value;
+  }
   return fields;
 }
 
@@ -324,6 +331,29 @@ interface SchedState {
 interface ModelFacts {
   ctxWindow: number | undefined;
   paged: boolean;
+  images: boolean | null;
+  hasStateNamespace: boolean;
+  hasResidency: boolean;
+  stateNamespace: string | null;
+  stateNamespaceAt: number | null;
+  experts: RuntimeLiveModel['experts'];
+  expertsAt: number | null;
+}
+
+interface TickSnapshot {
+  counters: TurnCounters;
+  inFlight: number;
+  queued: number;
+  allPreDecode: boolean;
+  mem?: { activeBytes: number; peakBytes: number; cacheBytes: number };
+  rss?: number;
+  rejected?: number;
+  health?: SamplerHealth | null;
+}
+
+interface RatePoint {
+  ts: number;
+  tokens: number;
 }
 
 interface BindingView {
@@ -370,8 +400,7 @@ class Sampler implements RuntimeSampler {
 
   private liveWrite: Promise<void> | null = null;
   private liveDirReady = false;
-  private lastLiveAt: number | null = null;
-  private lastLiveTokens = 0;
+  private rateWindow: RatePoint[] = [];
 
   constructor(private readonly deps: RuntimeSamplerDeps) {
     this.now = deps.now ?? Date.now;
@@ -513,10 +542,125 @@ class Sampler implements RuntimeSampler {
       } catch {
         // Facts stay at their defaults.
       }
-      facts = { ctxWindow, paged };
+      const hasStateNamespace = typeof (model as { stateTierNamespace?: unknown }).stateTierNamespace === 'function';
+      const hasResidency = typeof (model as { residencyInfo?: unknown }).residencyInfo === 'function';
+      facts = {
+        ctxWindow,
+        paged,
+        images: imagesOf(model),
+        hasStateNamespace,
+        hasResidency,
+        stateNamespace: null,
+        stateNamespaceAt: null,
+        experts: null,
+        expertsAt: null,
+      };
       this.facts.set(model, facts);
     }
     return facts;
+  }
+
+  private snapshotTick(views: BindingView[]): TickSnapshot {
+    let inFlight = 0;
+    let queued = 0;
+    let chatTurns = 0;
+    let decisionActive = 0;
+    let everyPreDecode = true;
+    for (const view of views) {
+      if (view.entry.kind === 'decision') {
+        inFlight += view.active;
+        decisionActive += view.active;
+      } else {
+        inFlight += view.turns.length;
+        chatTurns += view.turns.length;
+        for (const turn of view.turns) {
+          const phase = turn.progress?.phase;
+          if (phase === undefined || !PRE_DECODE_PHASES.has(phase)) everyPreDecode = false;
+        }
+      }
+      queued += view.queued;
+    }
+    const allPreDecode = chatTurns > 0 && decisionActive === 0 && everyPreDecode;
+    return { counters: turnCounters(), inFlight, queued, allPreDecode };
+  }
+
+  private memOf(snap: TickSnapshot): { activeBytes: number; peakBytes: number; cacheBytes: number } {
+    snap.mem ??= this.memory();
+    return snap.mem;
+  }
+
+  private rssOf(snap: TickSnapshot): number {
+    snap.rss ??= process.memoryUsage.rss();
+    return snap.rss;
+  }
+
+  private rejectedOf(snap: TickSnapshot): number {
+    snap.rejected ??= queueRejections();
+    return snap.rejected;
+  }
+
+  private healthOf(snap: TickSnapshot): SamplerHealth | null {
+    if (snap.health === undefined) {
+      try {
+        snap.health = this.deps.health();
+      } catch {
+        snap.health = null;
+      }
+    }
+    return snap.health;
+  }
+
+  /**
+   * Sliding-window decode throughput (tokens/s) over `RATE_WINDOW_MS`.
+   * Returns null when idle, while all in-flight turns are prefilling (no tokens
+   * advancing in the window), or before at least `RATE_MIN_DT_MS` has elapsed.
+   */
+  private sampleDecodeTps(now: number, inFlight: number, streamedTokens: number, allPreDecode: boolean): number | null {
+    if (inFlight <= 0) {
+      this.rateWindow.length = 0;
+      return null;
+    }
+    if (allPreDecode) {
+      // Every in-flight turn is pre-decode (queued/slot/prepare/prefill): drop any
+      // prior turn's decode samples and advance the baseline to now so prefill time
+      // neither leaks a finished turn's rate nor dilutes the next decode burst.
+      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
+      return null;
+    }
+    const len = this.rateWindow.length;
+    if (len === 0) {
+      this.rateWindow.push({ ts: now, tokens: streamedTokens });
+      return null;
+    }
+    const last = this.rateWindow[len - 1]!;
+    if (now < last.ts || streamedTokens < last.tokens) {
+      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
+      return null;
+    }
+    if (now === last.ts) {
+      last.tokens = streamedTokens;
+    } else {
+      this.rateWindow.push({ ts: now, tokens: streamedTokens });
+    }
+    const cutoff = now - RATE_WINDOW_MS;
+    while (this.rateWindow.length >= 2 && this.rateWindow[1]!.ts <= cutoff) {
+      this.rateWindow.shift();
+    }
+    if (this.rateWindow.length >= 2 && now - this.rateWindow[0]!.ts > RATE_WINDOW_MS * 2) {
+      this.rateWindow.shift();
+    }
+    const anchor = this.rateWindow[0]!;
+    const dTokens = streamedTokens - anchor.tokens;
+    if (dTokens <= 0) {
+      // Turns are in flight but no tokens advanced (e.g. prefill); move the
+      // baseline forward so prefill time does not dilute decode speed once tokens flow.
+      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
+      return null;
+    }
+    const dt = now - anchor.ts;
+    if (dt < RATE_MIN_DT_MS) return null;
+    const rate = (dTokens * 1000) / dt;
+    return Number.isFinite(rate) && rate > 0 ? Math.round(rate * 100) / 100 : null;
   }
 
   private tick(): void {
@@ -527,7 +671,9 @@ class Sampler implements RuntimeSampler {
       const views = this.collect();
       busy = this.computeBusy(views);
       this.noteBusy(now, busy);
-      this.writeLive(now, views, busy);
+      const snap = this.snapshotTick(views);
+      const decodeTps = this.sampleDecodeTps(now, snap.inFlight, snap.counters.streamedTokens, snap.allPreDecode);
+      this.writeLive(now, views, busy, snap, decodeTps);
       const residentKey = views.map((v) => this.modelKey(v.entry.model as object)).join(',');
       const interval = busy ? SAMPLE_BUSY_MS : SAMPLE_IDLE_MS;
       if (
@@ -536,7 +682,7 @@ class Sampler implements RuntimeSampler {
         busy !== this.lastSampleBusy ||
         residentKey !== this.lastResidentKey
       ) {
-        this.writeSample(now, views, busy);
+        this.writeSample(now, views, busy, snap);
         this.lastResidentKey = residentKey;
       }
       this.snapshotSchedulers(now, views);
@@ -546,24 +692,15 @@ class Sampler implements RuntimeSampler {
     if (!this.stopped) this.schedule(busy ? HEARTBEAT_BUSY_MS : HEARTBEAT_IDLE_MS);
   }
 
-  private health(): RuntimeSampleRecord['health'] {
-    try {
-      return this.deps.health().status;
-    } catch {
-      return 'error';
-    }
-  }
-
-  private writeSample(now: number, views: BindingView[], busy: boolean): void {
-    const mem = this.memory();
-    const counters = turnCounters();
-    const rejected = queueRejections();
-    let inFlight = 0;
-    let queued = 0;
-    for (const view of views) {
-      inFlight += view.entry.kind === 'decision' ? view.active : view.turns.length;
-      queued += view.queued;
-    }
+  private writeSample(
+    now: number,
+    views: BindingView[],
+    busy: boolean,
+    snap: TickSnapshot = this.snapshotTick(views),
+  ): void {
+    const mem = this.memOf(snap);
+    const counters = snap.counters;
+    const rejected = this.rejectedOf(snap);
     const busyMs = this.busyAccumMs + (this.busySince !== null ? now - this.busySince : 0);
     this.busyAccumMs = 0;
     if (this.busySince !== null) this.busySince = now;
@@ -576,13 +713,13 @@ class Sampler implements RuntimeSampler {
       dtMs: this.lastSampleAt === null ? 0 : now - this.lastSampleAt,
       busy,
       busyMs,
-      health: this.health(),
+      health: this.healthOf(snap)?.status ?? 'error',
       memActive: finiteOr0(mem.activeBytes),
       memPeak: finiteOr0(mem.peakBytes),
       memCache: finiteOr0(mem.cacheBytes),
-      rss: process.memoryUsage.rss(),
-      inFlight,
-      queued,
+      rss: this.rssOf(snap),
+      inFlight: snap.inFlight,
+      queued: snap.queued,
       resident: views.length,
       dOk: counters.ok - this.prevCounters.ok,
       dError: counters.error - this.prevCounters.error,
@@ -695,13 +832,25 @@ class Sampler implements RuntimeSampler {
     this.trace.append(rec);
   }
 
-  private liveModel(view: BindingView): RuntimeLiveModel {
+  private liveModel(view: BindingView, now: number, busy: boolean): RuntimeLiveModel {
     const sessions = view.entry.sessions;
     const identity = sessions.identity;
     const discovered = this.discovered.get(view.name);
+    const model = view.entry.model as object;
     const facts = this.factsOf(view.entry);
+    if (
+      facts.hasStateNamespace &&
+      (facts.stateNamespaceAt === null || !busy || now - facts.stateNamespaceAt >= MODEL_META_REFRESH_MS)
+    ) {
+      facts.stateNamespace = stateNamespaceOf(model);
+      facts.stateNamespaceAt = now;
+    }
+    if (facts.hasResidency && (facts.expertsAt === null || !busy || now - facts.expertsAt >= MODEL_META_REFRESH_MS)) {
+      facts.experts = liveExperts(model);
+      facts.expertsAt = now;
+    }
     const loaded = this.loaded.get(view.name);
-    const schedState = this.sched.get(view.entry.model as object);
+    const schedState = this.sched.get(model);
     return {
       name: view.name,
       modelType: identity?.modelType ?? discovered?.modelType ?? '',
@@ -714,9 +863,9 @@ class Sampler implements RuntimeSampler {
       queued: view.queued,
       queueLimit: sessions.queueDepthLimit ?? null,
       pool: schedState?.pool ?? null,
-      stateNamespace: stateNamespaceOf(view.entry.model as object),
-      experts: liveExperts(view.entry.model as object),
-      images: imagesOf(view.entry.model as object),
+      stateNamespace: facts.stateNamespace,
+      experts: facts.experts,
+      images: facts.images,
     };
   }
 
@@ -751,25 +900,17 @@ class Sampler implements RuntimeSampler {
     });
   }
 
-  private buildLive(now: number, views: BindingView[], busy: boolean): RuntimeLiveFile {
-    const mem = this.memory();
-    const counters = turnCounters();
-    let inFlight = 0;
-    for (const view of views) inFlight += view.entry.kind === 'decision' ? view.active : view.turns.length;
-    let decodeTps: number | null = null;
-    if (inFlight > 0 && this.lastLiveAt !== null && now > this.lastLiveAt) {
-      const rate = ((counters.streamedTokens - this.lastLiveTokens) * 1000) / (now - this.lastLiveAt);
-      if (Number.isFinite(rate) && rate > 0) decodeTps = Math.round(rate * 100) / 100;
-    }
-    this.lastLiveAt = now;
-    this.lastLiveTokens = counters.streamedTokens;
-    let health: SamplerHealth | null;
-    try {
-      health = this.deps.health();
-    } catch {
-      health = null;
-    }
-    const models = views.map((view) => this.liveModel(view));
+  private buildLive(
+    now: number,
+    views: BindingView[],
+    busy: boolean,
+    snap: TickSnapshot,
+    decodeTps: number | null,
+  ): RuntimeLiveFile {
+    const mem = this.memOf(snap);
+    const counters = snap.counters;
+    const health = this.healthOf(snap);
+    const models = views.map((view) => this.liveModel(view, now, busy));
     return {
       v: 2,
       pid: process.pid,
@@ -794,7 +935,7 @@ class Sampler implements RuntimeSampler {
         peak: finiteOr0(mem.peakBytes),
         cache: finiteOr0(mem.cacheBytes),
         wiredLimit: this.wiredLimit,
-        rss: process.memoryUsage.rss(),
+        rss: this.rssOf(snap),
       },
       decodeTps,
       loading: this.liveLoads(),
@@ -804,7 +945,7 @@ class Sampler implements RuntimeSampler {
         cancelled: counters.cancelled,
         outputTokens: counters.outputTokens,
         loads: this.loads,
-        rejected: queueRejections(),
+        rejected: this.rejectedOf(snap),
       },
       models,
       turns: this.liveTurns(views),
@@ -840,9 +981,15 @@ class Sampler implements RuntimeSampler {
       });
   }
 
-  private writeLive(now: number, views: BindingView[], busy: boolean): void {
+  private writeLive(
+    now: number,
+    views: BindingView[],
+    busy: boolean,
+    snap: TickSnapshot,
+    decodeTps: number | null,
+  ): void {
     if (this.liveWrite !== null || !this.trace.enabled) return;
-    const body = JSON.stringify(this.buildLive(now, views, busy));
+    const body = JSON.stringify(this.buildLive(now, views, busy, snap, decodeTps));
     const path = this.livePath();
     const tmp = `${path}.tmp`;
     this.liveWrite = (async () => {

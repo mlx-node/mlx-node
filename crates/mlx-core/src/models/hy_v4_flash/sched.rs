@@ -556,6 +556,16 @@ impl Drop for Paged {
 }
 
 impl Paged {
+    pub(crate) fn model_registration(store: &Store, page: u64) -> ModelRegistration {
+        ModelRegistration {
+            model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
+                .fetch_add(1, Ordering::Relaxed),
+            hard_budget: store.hard_budget(),
+            untracked: store.governor_untracked_bytes(),
+            page_bytes: page,
+        }
+    }
+
     /// The pool for `store`'s admitted context (one partial block per lane
     /// on top), allocated whole at load.
     /// The model registers with the memory governor, which admits the pool
@@ -576,13 +586,7 @@ impl Paged {
         } else {
             max_blocks
         };
-        let registration = ModelRegistration {
-            model_id: crate::engine::compiled_lock::QWEN35_MODEL_ID_COUNTER
-                .fetch_add(1, Ordering::Relaxed),
-            hard_budget: store.hard_budget(),
-            untracked: 0,
-            page_bytes: page,
-        };
+        let registration = Self::model_registration(store, page);
         crate::array::memory::synchronize_and_clear_cache();
         let gov: &'static Governor = crate::engine::governor::governor();
         let (governor, (adapter, pool)) = start_under_growth_lock(gov, || {

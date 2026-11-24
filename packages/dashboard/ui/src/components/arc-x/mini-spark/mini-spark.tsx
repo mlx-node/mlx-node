@@ -46,7 +46,7 @@ export function MiniSpark(props: MiniSparkProps): ReactElement {
   const xs = data.map((_, i) => (data.length <= 1 ? width / 2 : PAD + (i / (data.length - 1)) * (width - PAD * 2)));
   const ys = data.map((value) => (value === null || !Number.isFinite(value) ? null : yOf(value)));
   const points = zipPoints(xs, ys);
-  const path = linePath(points);
+  const path = linePath(points, 'monotone');
   let end: { x: number; y: number } | null = null;
   for (let i = points.length - 1; i >= 0 && end === null; i -= 1) end = points[i] ?? null;
   const signature = `${String(data.length)}|${data.map((value) => (value === null ? '' : value.toPrecision(4))).join(',')}`;
@@ -76,7 +76,7 @@ export function MiniSpark(props: MiniSparkProps): ReactElement {
             className={styles.line}
             exact={path.d}
             samples={resample(ys, motionX.morphSamples)}
-            toPath={(mixed) => linePath(zipPoints(sx, mixed)).d}
+            toPath={(mixed) => linePath(zipPoints(sx, mixed), 'monotone').d}
             signature={signature}
             progress={progress}
           />

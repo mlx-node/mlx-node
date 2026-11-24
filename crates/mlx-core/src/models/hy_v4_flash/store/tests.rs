@@ -439,6 +439,7 @@ impl ModeRig {
             kv,
             DIRECT_MARGIN,
             self.mapped_bytes,
+            self.max_memory,
         )
     }
 }
@@ -1896,7 +1897,11 @@ fn mmap_admission_headroom_guard_and_precedence() {
     use DirectMode as D;
     use MmapMode as M;
     let mut rig = ModeRig::real();
-    let (q128, b128) = (host_mem(128 * G, 20 * G), host_mem(128 * G, 50 * G));
+    let (q128, b128, s128) = (
+        host_mem(128 * G, 20 * G),
+        host_mem(128 * G, 50 * G),
+        host_mem(128 * G, 80 * G),
+    );
     let (b192, h96) = (host_mem(192 * G, 50 * G), host_mem(96 * G, 20 * G));
 
     // 1. Quiet 128 GiB host + Auto/Auto admits Mmap at 4096 with wired_limit < 20 GiB.
@@ -1909,7 +1914,7 @@ fn mmap_admission_headroom_guard_and_precedence() {
     );
     assert_eq!(
         gate.need,
-        gate.dense_bytes + gate.kv_and_scratch + rig.mapped_bytes
+        gate.dense_bytes + gate.kv_and_scratch + rig.mapped_bytes / 2
     );
     let wired = gate.dense_bytes + gate.kv_and_scratch;
     assert!(wired < 20 * G && direct_wired_limit(wired, rig.ws) < 20 * G);
@@ -1918,11 +1923,11 @@ fn mmap_admission_headroom_guard_and_precedence() {
     assert_eq!(rig.warm(M::Off, &q128), 0);
     assert_eq!(rig.warm(M::Auto, &host_mem(128 * G, 108 * G)), 0);
 
-    // 2. Forced MmapMode::On admits on busy 128 GiB host with base-only need (< 20 GiB).
+    // 2. Forced MmapMode::On admits on squeezed 128 GiB host with base-only need (< 20 GiB).
     let ExpertResidency::Mmap {
         chunk: fc,
         gate: fg,
-    } = rig.select(M::On, D::Auto, &b128).unwrap()
+    } = rig.select(M::On, D::Auto, &s128).unwrap()
     else {
         panic!("expected MLX_HY4_MMAP=1 to force Mmap");
     };
@@ -1949,9 +1954,12 @@ fn mmap_admission_headroom_guard_and_precedence() {
         ExpertResidency::Streamed { .. } => Kind::Streamed,
     };
     for (m, d, metal, h, want) in [
-        (M::Auto, D::Auto, true, b128, Kind::Streamed),
-        (M::Auto, D::Off, true, b128, Kind::Streamed),
-        (M::Auto, D::On, true, b128, Kind::Streamed),
+        (M::Auto, D::Auto, true, b128, Kind::Mmap),
+        (M::Auto, D::Off, true, b128, Kind::Mmap),
+        (M::Auto, D::On, true, b128, Kind::Mmap),
+        (M::Auto, D::Auto, true, s128, Kind::Streamed),
+        (M::Auto, D::Off, true, s128, Kind::Streamed),
+        (M::Auto, D::On, true, s128, Kind::Streamed),
         (M::Auto, D::Auto, true, b192, Kind::Mmap),
         (M::Off, D::Auto, true, q128, Kind::Direct),
         (M::Off, D::Auto, true, b128, Kind::Streamed),
@@ -1968,6 +1976,23 @@ fn mmap_admission_headroom_guard_and_precedence() {
             "{m:?} {d:?} metal={metal}"
         );
     }
+
+    // Squeezed >=100 GiB Metal host records mmap_refusal; <100 GiB host does not.
+    rig.metal = true;
+    assert!(matches!(
+        rig.select(M::Auto, D::Auto, &s128).unwrap(),
+        ExpertResidency::Streamed {
+            direct_refusal: None,
+            mmap_refusal: Some(g),
+        } if !g.admitted
+    ));
+    assert!(matches!(
+        rig.select(M::Auto, D::Auto, &h96).unwrap(),
+        ExpertResidency::Streamed {
+            direct_refusal: None,
+            mmap_refusal: None,
+        }
+    ));
 
     // 4. Forced MmapMode::On fails loud when squeezed or without Metal.
     rig.metal = true;
@@ -2249,11 +2274,11 @@ fn select_expert_mode_with_retry_recovers_mmap_after_clear_cache() {
             || {
                 rd.set(rd.get() + 1);
                 Ok((
-                    host_mem(128 * G, if cl.get() == 0 { 32 * G } else { 20 * G }),
+                    host_mem(128 * G, if cl.get() == 0 { 76 * G } else { 60 * G }),
                     rig.ws,
                 ))
             },
-            || if cl.get() == 0 { 12 * G } else { 0 },
+            || if cl.get() == 0 { 16 * G } else { 0 },
             || cl.set(cl.get() + 1),
         )
         .unwrap();
@@ -2267,13 +2292,22 @@ fn select_expert_mode_with_retry_recovers_mmap_after_clear_cache() {
             DirectMode::Auto,
             || {
                 rd.set(rd.get() + 1);
-                Ok((host_mem(128 * G, 50 * G), rig.ws))
+                Ok((host_mem(128 * G, 80 * G), rig.ws))
             },
             || 0,
             || cl.set(cl.get() + 1),
         )
         .unwrap();
-    assert!((cl.get(), rd.get()) == (0, 1) && matches!(res, ExpertResidency::Streamed { .. }));
+    assert!(
+        (cl.get(), rd.get()) == (0, 1)
+            && matches!(
+                res,
+                ExpertResidency::Streamed {
+                    direct_refusal: None,
+                    mmap_refusal: Some(_),
+                }
+            )
+    );
 
     let cl = Cell::new(0usize);
     let (_, _, res) = rig
@@ -2291,4 +2325,319 @@ fn select_expert_mode_with_retry_recovers_mmap_after_clear_cache() {
         )
         .unwrap();
     assert!(cl.get() == 1 && matches!(res, ExpertResidency::Mmap { .. }));
+}
+
+#[test]
+fn mmap_rset_and_warm_budgets_bound_auto_and_max_memory() {
+    use DirectMode as D;
+    use MmapMode as M;
+
+    // Busy 128 GiB host: Auto admits with partial headroom (< mapped_bytes).
+    let mut rig = ModeRig::real().with_savings(1_194_590_208);
+    let b128 = host_mem(128 * G, 50 * G);
+    let ExpertResidency::Mmap { gate, .. } = rig.select_for(M::Auto, D::Auto, &b128).unwrap()
+    else {
+        panic!("expected Mmap on busy 128 GiB host");
+    };
+    let kv = direct_kv_allowance(&rig.p, rig.ctx);
+    let page = 12 * u64::from(crate::models::hy_v4_flash::paged::BLOCK) * (576 * 2 + 128 * 2 / 4);
+    let full_kv = mmap_full_kv_bytes(&rig.p, rig.ctx, 1, page, 0, 0);
+    let rset_reserve = gate.dense_bytes + full_kv + gate.scratch_bytes;
+    let rset_auto = mmap_rset_budget(M::Auto, gate.budget, rset_reserve);
+    assert_eq!(rset_auto, gate.budget - rset_reserve);
+    assert!(rset_auto <= gate.budget - gate.dense_bytes - full_kv);
+    assert!(rset_auto < rig.mapped_bytes && rset_auto >= rig.mapped_bytes / 2);
+    assert_eq!(mmap_rset_budget(M::On, gate.budget, rset_reserve), u64::MAX);
+    assert_eq!(mmap_rset_budget(M::Off, gate.budget, rset_reserve), 0);
+
+    // Roomy 192 GiB host capped by --max-memory bounds BOTH rset and prewarm.
+    let q192 = host_mem(192 * G, 20 * G);
+    rig.max_memory = Some(70 * G);
+    let ExpertResidency::Mmap { gate: mg, .. } = rig.select_for(M::Auto, D::Auto, &q192).unwrap()
+    else {
+        panic!("expected Mmap under 70 GiB max_memory");
+    };
+    assert_eq!(mg.budget, 70 * G);
+    let m_reserve = mg.dense_bytes + full_kv + mg.scratch_bytes;
+    let m_rset = mmap_rset_budget(M::Auto, mg.budget, m_reserve);
+    let m_warm = mmap_warm_budget(
+        M::Auto,
+        &q192,
+        mg.dense_bytes,
+        kv,
+        mg.margin,
+        rig.mapped_bytes,
+        Some(mg.budget),
+    );
+    assert_eq!(m_rset, 70 * G - m_reserve);
+    assert_eq!(m_warm, 70 * G - mg.dense_bytes - kv);
+    assert!(m_rset <= 70 * G - mg.dense_bytes - full_kv && m_warm < rig.mapped_bytes);
+
+    // Tight max_memory below prewarm floor disables background prewarm cleanly.
+    assert_eq!(
+        mmap_warm_budget(
+            M::Auto,
+            &q192,
+            mg.dense_bytes,
+            kv,
+            mg.margin,
+            rig.mapped_bytes,
+            Some(mg.dense_bytes + kv + MMAP_PREWARM_MIN_BUDGET - 1),
+        ),
+        0
+    );
+}
+
+#[test]
+fn partial_auto_mmap_charges_rset_pinned_bytes_in_governor_untracked() {
+    use std::collections::HashMap;
+
+    use crate::engine::governor::governor::tests::{FakeIo, host as gov_host, lane, stats};
+    use crate::engine::governor::governor::{Failure, Governor, ModelRegistration, Scope};
+    use crate::engine::governor::host::Pressure;
+    use crate::engine::governor::ledger::ClaimClass;
+    use crate::models::hy_v4_flash::paged::BLOCK;
+    use crate::models::hy_v4_flash::scan::{ENGRAM_TABLE, Located};
+    use crate::models::hy_v4_flash::sched::Paged;
+    use crate::models::hy_v4_flash::test_support::{
+        TINY_CLASSES, TinyWeightsOpts, tiny_engram_table, tiny_weights_opts,
+    };
+    use crate::models::hy_v4_flash::weights::MmapDenseSpec;
+    use crate::models::qwen3_5::dflash2_decode::runway_pool_extent_blocks;
+    use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+
+    // 1. Real Hy4 numbers under partial MmapMode::Auto + tight --max-memory (70 GiB).
+    let mut rig = ModeRig::real().with_savings(1_194_590_208);
+    rig.max_memory = Some(70 * G);
+    let q192 = host_mem(192 * G, 20 * G);
+    let ExpertResidency::Mmap { gate, .. } = rig
+        .select_for(MmapMode::Auto, DirectMode::Auto, &q192)
+        .unwrap()
+    else {
+        panic!("expected partial Mmap under 70 GiB max_memory");
+    };
+    assert_eq!(gate.budget, 70 * G);
+    let page = 12 * u64::from(BLOCK) * (576 * 2 + 128 * 2 / 4); // 466,944 B
+    let lanes = 1usize;
+    let full_kv = mmap_full_kv_bytes(&rig.p, rig.ctx, lanes, page, 0, 0);
+    let max_pool = paged_pool_max_bytes(page, rig.ctx, lanes);
+    assert!(full_kv >= full_kv_allowance(&rig.p, rig.ctx) && full_kv >= max_pool);
+    // Multi-lane and non-block-aligned edge checks: full KV reservation always
+    // covers both profile full-ctx + extra lanes AND exact paged max_blocks + state.
+    let extra_4 = 3 * 36 * MIB;
+    let state_4 = 4 * 36 * MIB + LADDER_BYTES + (15_812 - 14_596) * rig.ctx as u64;
+    let full_kv_4 = mmap_full_kv_bytes(&rig.p, rig.ctx, 4, page, extra_4, state_4);
+    assert!(full_kv_4 >= full_kv_allowance(&rig.p, rig.ctx) + extra_4);
+    assert!(full_kv_4 >= paged_pool_max_bytes(page, rig.ctx, 4) + state_4);
+    let zero_base = Profile {
+        kv_base: 0,
+        ..rig.p
+    };
+    assert_eq!(
+        mmap_full_kv_bytes(&zero_base, 100, 4, page, extra_4, 0),
+        paged_pool_max_bytes(page, 100, 4) + extra_4
+    );
+
+    let rset_reserve = gate
+        .dense_bytes
+        .saturating_add(full_kv)
+        .saturating_add(gate.scratch_bytes);
+    let rset_pinned = mmap_rset_budget(MmapMode::Auto, gate.budget, rset_reserve);
+    assert!(rset_pinned > 0 && rset_pinned < rig.mapped_bytes);
+    assert!(rset_reserve + rset_pinned <= gate.budget);
+
+    let runway = u64::from(runway_pool_extent_blocks(page)) * page;
+    let kv_64k_pool = (DIRECT_KV_ALLOWANCE_TOKENS as u64 / u64::from(BLOCK)) * page;
+    assert!(runway < kv_64k_pool && kv_64k_pool < max_pool);
+
+    let io = FakeIo::new(stats(gate.dense_bytes), gov_host(64 * G, Pressure::Normal));
+    let gov = Governor::new(io.clone());
+    let reg = ModelRegistration {
+        model_id: 1,
+        hard_budget: gate.budget,
+        untracked: rset_pinned,
+        page_bytes: page,
+    };
+    let (_guard, ()) = gov.load_pool(reg, runway, || Ok(())).unwrap();
+    io.with(|s| s.stats.pools = runway);
+    assert_eq!(
+        gov.snapshot().headroom,
+        full_kv + gate.scratch_bytes - runway
+    );
+
+    // Growing KV all the way to the advertised 262,144-token window
+    // (max_blocks = ctx.div_ceil(32) + lanes + 1) WITH full prefill scratch
+    // active succeeds within hard_budget.
+    let claim = gov.open(lane(ClaimClass::InService, 1, 0), reg.model_id);
+    {
+        let _scope = Scope::enter(claim.claim());
+        let res = gov.try_reserve(kv_64k_pool - runway).unwrap();
+        io.with(|s| s.stats.pools = kv_64k_pool);
+        drop(res);
+
+        io.with(|s| s.stats.active = gate.dense_bytes + gate.scratch_bytes);
+        let res_full = gov.try_reserve(max_pool - kv_64k_pool).unwrap();
+        io.with(|s| s.stats.pools = max_pool);
+        drop(res_full);
+        assert!(gate.dense_bytes + gate.scratch_bytes + max_pool + rset_pinned <= gate.budget);
+
+        // An extra claim past hard_budget is properly rejected with Failure::EngineBudget.
+        let leftover = gov.snapshot().headroom;
+        assert_eq!(
+            gov.try_reserve(leftover + page).err(),
+            Some(Failure::EngineBudget)
+        );
+    }
+
+    // 2. Real Store + Paged::model_registration wiring on Metal (rset_bounded on vs off).
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let cfg = tiny_cfg();
+    let mut rng = Rng::new(9);
+    let mut exp_file = rng.bytes(1024);
+    let experts: Vec<Option<ExpertLayer>> = TINY_CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| c.map(|c| kquant_layer(&mut rng, &cfg.moe, il, c, 32, &mut exp_file)))
+        .collect();
+    let tmp = Temp::new("store-rset-gov");
+    let exp_path = tmp.write("experts.bin", &exp_file);
+    let engram_rows: u64 = cfg.engram.head_vocab_sizes.iter().sum();
+    let engram_path = tmp.write(
+        "engram.bin",
+        &vec![0u8; engram_rows as usize * cfg.engram.head_dim],
+    );
+    let paths = vec![exp_path.clone(), engram_path];
+    let shards = Arc::new(ShardSet::open(&paths).unwrap());
+    let engram_loc = Located {
+        shard: 1,
+        data_offset: 0,
+        info: GgufTensorInfo {
+            name: ENGRAM_TABLE.into(),
+            n_dims: 2,
+            dims: vec![cfg.engram.head_dim as u64, engram_rows],
+            tensor_type: GgufTensorType::MXFP8,
+            offset: 0,
+        },
+    };
+    let table = Arc::new(
+        F8Table::open_with_options(Arc::clone(&shards), 1, &engram_loc, &cfg.engram, 1, 1).unwrap(),
+    );
+    let (probe, _) = KqBank::new_mmap_with_dense(
+        IoPool::new(Arc::clone(&shards), 2).unwrap(),
+        &cfg.moe,
+        &experts,
+        std::slice::from_ref(&exp_path),
+        0,
+        false,
+        u64::MAX,
+        &MmapDenseSpec::default(),
+    )
+    .unwrap();
+    let partial_cap = probe.rset_total_bytes() / 2;
+    let rset_supported = probe.has_residency_set();
+    drop(probe);
+
+    let (bank, _) = KqBank::new_mmap_with_dense(
+        IoPool::new(Arc::clone(&shards), 2).unwrap(),
+        &cfg.moe,
+        &experts,
+        std::slice::from_ref(&exp_path),
+        0,
+        false,
+        partial_cap,
+        &MmapDenseSpec::default(),
+    )
+    .unwrap();
+    let bank = Arc::new(bank);
+    let pinned = bank.rset_pinned_bytes();
+    assert!(pinned <= partial_cap);
+    if rset_supported {
+        assert!(pinned > 0 && pinned < bank.rset_total_bytes());
+    }
+    let classes = Classes {
+        layers: [2, 1],
+        slot: bank.slot_bytes(),
+    };
+    let p = profile(15_812);
+    let size = ModelSize {
+        dense: 4 * MIB,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: cfg.moe.n_experts as u64,
+        ctx: cfg.context_length as u64,
+    };
+    let hard_budget = size.dense + pinned + 2 * MIB;
+    let b_ref = Arc::clone(&bank);
+    let model = Model::new(
+        cfg.clone(),
+        Box::new(tiny_weights_opts(&cfg, TinyWeightsOpts::default())),
+        move |_| Ok(ExpertSource::Bank(Arc::clone(&b_ref))),
+        Box::new(tiny_engram_table(&cfg.engram, 9)),
+    )
+    .unwrap();
+    let lease =
+        Lease::new(p, size, 64, classes, None, None, &bank).with_direct_budget(Some(hard_budget));
+    let mut store = Store {
+        model,
+        bank: Arc::clone(&bank),
+        table,
+        scan: Scan {
+            paths,
+            cfg: cfg.clone(),
+            tensors: HashMap::new(),
+            experts,
+            engram_table: engram_loc,
+            mtp: None,
+        },
+        shards,
+        dense_read: 0,
+        dense_bytes: size.dense,
+        sizes: Sizes {
+            dense_trunk: size.dense,
+            dense_mtp: 0,
+            classes,
+            n_experts: cfg.moe.n_experts,
+        },
+        size,
+        profile: p,
+        ctx: size.ctx as usize,
+        chunk: 64,
+        lanes: 1,
+        row_cap: 12,
+        mtp: false,
+        bank_alloc_s: 0.0,
+        max_memory: Some(hard_budget),
+        direct_budget: Some(hard_budget),
+        rset_bounded: true,
+        lease,
+    };
+
+    // Bounded MmapMode::Auto passes rset_pinned_bytes into ModelRegistration.untracked.
+    let auto_reg = Paged::model_registration(&store, 64 * 1024);
+    assert_eq!(store.governor_untracked_bytes(), pinned);
+    assert_eq!(
+        (auto_reg.hard_budget, auto_reg.untracked),
+        (hard_budget, pinned)
+    );
+
+    let io2 = FakeIo::new(stats(size.dense), gov_host(4 * G, Pressure::Normal));
+    let gov2 = Governor::new(io2.clone());
+    let (_g2, ()) = gov2.load_pool(auto_reg, MIB, || Ok(())).unwrap();
+    io2.with(|s| s.stats.pools = MIB);
+    assert_eq!(gov2.snapshot().headroom, MIB);
+    let c2 = gov2.open(lane(ClaimClass::InService, 1, 0), auto_reg.model_id);
+    {
+        let _scope = Scope::enter(c2.claim());
+        assert_eq!(
+            gov2.try_reserve(MIB + 64 * 1024).err(),
+            Some(Failure::EngineBudget)
+        );
+    }
+
+    // Forced MmapMode::On (rset_bounded = false) leaves untracked = 0 even with pinned bytes.
+    store.rset_bounded = false;
+    let on_reg = Paged::model_registration(&store, 64 * 1024);
+    assert_eq!((store.governor_untracked_bytes(), on_reg.untracked), (0, 0));
 }

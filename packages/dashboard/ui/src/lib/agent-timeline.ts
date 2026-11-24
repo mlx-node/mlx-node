@@ -70,7 +70,16 @@ function spanWords(
 ): { label: string; facts: string[]; notes: string[] } {
   switch (span.kind) {
     case 'generate':
-      return { label: span.phase === 'reasoning' ? 'Reasoning' : 'Writing the answer', facts: [], notes: [] };
+      return {
+        label:
+          span.phase === 'reasoning'
+            ? 'Reasoning'
+            : span.phase === 'tool-call'
+              ? 'Preparing tool call'
+              : 'Writing the answer',
+        facts: [],
+        notes: [],
+      };
     case 'tool':
       return {
         label: toolWords(span.tools, span.calls, 'Tool call'),

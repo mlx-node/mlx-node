@@ -1413,9 +1413,17 @@ fn rset_keepalive_idle_grace_and_mmap_dense_residency() {
     }
     let (fx, dense_spec, dense_bytes) = BankFixture::with_dense(16, 64, 37);
     let ps = std::slice::from_ref(&fx.path);
-    let (bank, dense) =
-        KqBank::new_mmap_with_dense(fx.pool(2), &fx.moe, &fx.experts, ps, 0, false, &dense_spec)
-            .unwrap();
+    let (bank, dense) = KqBank::new_mmap_with_dense(
+        fx.pool(2),
+        &fx.moe,
+        &fx.experts,
+        ps,
+        0,
+        false,
+        u64::MAX,
+        &dense_spec,
+    )
+    .unwrap();
 
     assert_eq!((bank.extra_mmap_bufs(), bank.nbytes()), (2, 0));
     assert_eq!(bank.mapped_bytes(), fx.expected_mapped() + dense_bytes);
@@ -1433,6 +1441,101 @@ fn rset_keepalive_idle_grace_and_mmap_dense_residency() {
     // Drop dense views BEFORE bank (matching Store's drop order).
     drop(dense);
     drop(bank);
+}
+
+#[test]
+fn rset_budget_caps_pinned_buffers_while_unpinned_layers_stay_valid() {
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let (fx, dense_spec, _) = BankFixture::with_dense(16, 64, 41);
+    let ps = std::slice::from_ref(&fx.path);
+
+    let (full, full_dense) = KqBank::new_mmap_with_dense(
+        fx.pool(2),
+        &fx.moe,
+        &fx.experts,
+        ps,
+        0,
+        false,
+        u64::MAX,
+        &dense_spec,
+    )
+    .unwrap();
+    let total = full.rset_total_bytes();
+    let emb_bytes = match full_dense.token_embd {
+        Some(Dense::MmapQ8_0 { ref buf, .. }) => buf.nbytes() as u64,
+        _ => panic!("expected mmap token_embd"),
+    };
+    let out_bytes = match full_dense.output {
+        Some(Dense::MmapBf16 { ref buf, .. }) => buf.nbytes() as u64,
+        _ => panic!("expected mmap output"),
+    };
+    let l1_bytes: u64 = full
+        .mmap_layer(1, 0)
+        .unwrap()
+        .unwrap()
+        .iter()
+        .map(|p| p.buf.nbytes() as u64)
+        .sum();
+    let rset_supported = full.has_residency_set();
+    if rset_supported {
+        assert_eq!(
+            (full.rset_pinned_bytes(), full.rset_pinned_bufs()),
+            (total, 11)
+        );
+    }
+    drop(full_dense);
+    drop(full);
+
+    // Budget fits both dense buffers + layer 1 (5 buffers), excluding layers 2 and 3.
+    let budget = emb_bytes + out_bytes + l1_bytes;
+    assert!(budget < total);
+    let (capped, capped_dense) = KqBank::new_mmap_with_dense(
+        fx.pool(2),
+        &fx.moe,
+        &fx.experts,
+        ps,
+        0,
+        false,
+        budget,
+        &dense_spec,
+    )
+    .unwrap();
+    assert!(capped.rset_pinned_bytes() <= budget);
+    if rset_supported {
+        assert_eq!(
+            (capped.rset_pinned_bytes(), capped.rset_pinned_bufs()),
+            (budget, 5)
+        );
+    }
+    // Unpinned layers (2 and 3) remain valid zero-copy mmap projections.
+    for il in [1, 2, 3] {
+        assert!(capped.mmap_layer(il, 0).unwrap().is_some());
+    }
+    drop(capped_dense);
+    drop(capped);
+
+    // Zero budget skips residency-set creation while preserving zero-copy layers.
+    let (zero, zero_dense) = KqBank::new_mmap_with_dense(
+        fx.pool(2),
+        &fx.moe,
+        &fx.experts,
+        ps,
+        0,
+        false,
+        0,
+        &dense_spec,
+    )
+    .unwrap();
+    assert!(!zero.has_residency_set());
+    assert_eq!((zero.rset_pinned_bytes(), zero.rset_pinned_bufs()), (0, 0));
+    for il in [1, 2, 3] {
+        assert!(zero.mmap_layer(il, 0).unwrap().is_some());
+    }
+    drop(zero_dense);
+    drop(zero);
 }
 
 fn stream_tensor(

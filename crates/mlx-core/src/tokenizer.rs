@@ -2328,8 +2328,8 @@ impl Qwen3Tokenizer {
             |value: minijinja::Value,
              kwargs: minijinja::value::Kwargs|
              -> std::result::Result<String, minijinja::Error> {
-                check_tojson_kwargs(&kwargs)?;
-                Ok(to_json_python_separators(&value).unwrap_or_else(|| "null".to_string()))
+                let opts = parse_tojson_kwargs(&kwargs)?;
+                Ok(to_json_with_options(&value, &opts).unwrap_or_else(|| "null".to_string()))
             },
         );
 
@@ -3693,14 +3693,106 @@ impl RenderInputs {
 ///    nested containers, insertion key order — is byte-identical. Pre-existing,
 ///    unchanged by this formatter, and pinned both ways by
 ///    `tojson_float_spelling_is_the_only_known_divergence_from_cpython`.
-/// 2. **Arity.** The filter takes one positional value and, of HF's `tojson`
-///    kwargs (`ensure_ascii` / `indent` / `separators` / `sort_keys`), only the
-///    two that leave these bytes unchanged: `ensure_ascii=False` and
-///    `indent=None` ([`check_tojson_kwargs`]; Hy4-flash writes
-///    `tojson(ensure_ascii=False)`). Any other kwarg or value, e.g.
-///    `tojson(indent=4)`, fails to render with "too many arguments", as every
-///    kwarg did before.
+/// 2. **Arity.** The filter takes one positional value and supports HF's
+///    `tojson` kwargs `ensure_ascii=False`, `indent=None`, `sort_keys`, and
+///    `separators` ([`parse_tojson_kwargs`]). Unsupported values (e.g.
+///    `ensure_ascii=True`, `indent=4`, invalid `separators`) or unknown kwargs
+///    fail to render with `TooManyArguments` ("too many arguments").
 struct PythonDefaultFormatter;
+
+/// Customizable JSON item/key separator formatter (matching Python `json.dumps(..., separators=...)`).
+struct JsonSeparatorsFormatter<'a> {
+    item_separator: &'a [u8],
+    key_separator: &'a [u8],
+}
+
+impl serde_json::ser::Formatter for JsonSeparatorsFormatter<'_> {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(self.item_separator)
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(self.item_separator)
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(self.key_separator)
+    }
+}
+
+/// Serialization wrapper around a [`minijinja::Value`] that recursively sorts
+/// map keys lexicographically (matching Python `json.dumps(..., sort_keys=True)`).
+struct SortedJsonValue<'a>(&'a minijinja::Value);
+
+impl serde::Serialize for SortedJsonValue<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use minijinja::value::ValueKind;
+        use serde::ser::{SerializeMap, SerializeSeq};
+
+        match self.0.kind() {
+            ValueKind::Map => {
+                let mut entries: Vec<(String, minijinja::Value, minijinja::Value)> = Vec::new();
+                if let Some(pairs) = self.0.as_object().and_then(|obj| obj.try_iter_pairs()) {
+                    for (k, v) in pairs {
+                        let sort_key = k
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| k.to_string());
+                        entries.push((sort_key, k, v));
+                    }
+                } else {
+                    let iter = self.0.try_iter().map_err(serde::ser::Error::custom)?;
+                    for k in iter {
+                        let v = self.0.get_item(&k).map_err(serde::ser::Error::custom)?;
+                        let sort_key = k
+                            .as_str()
+                            .map(str::to_string)
+                            .unwrap_or_else(|| k.to_string());
+                        entries.push((sort_key, k, v));
+                    }
+                }
+                entries.sort_by(|a, b| a.0.cmp(&b.0));
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (_, k, v) in &entries {
+                    map.serialize_entry(k, &SortedJsonValue(v))?;
+                }
+                map.end()
+            }
+            ValueKind::Seq | ValueKind::Iterable => {
+                let iter = self.0.try_iter().map_err(serde::ser::Error::custom)?;
+                let items: Vec<minijinja::Value> = iter.collect();
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in &items {
+                    seq.serialize_element(&SortedJsonValue(item))?;
+                }
+                seq.end()
+            }
+            _ => self.0.serialize(serializer),
+        }
+    }
+}
 
 impl serde_json::ser::Formatter for PythonDefaultFormatter {
     fn begin_array_value<W: ?Sized + std::io::Write>(
@@ -3808,25 +3900,35 @@ fn to_json_cpython_floats(value: &minijinja::Value) -> Option<String> {
     String::from_utf8(buf).ok()
 }
 
-/// Serialize `value` with [`PythonDefaultFormatter`].
-///
-/// Returns `None` on serialization failure so callers can fall back the same way
-/// `serde_json::to_string(...).unwrap_or("null")` did.
-fn to_json_python_separators<T: Serialize + ?Sized>(value: &T) -> Option<String> {
+struct ToJsonOptions {
+    sort_keys: bool,
+    item_separator: String,
+    key_separator: String,
+}
+
+fn to_json_with_options(value: &minijinja::Value, opts: &ToJsonOptions) -> Option<String> {
     let mut buf = Vec::new();
-    let mut ser = serde_json::Serializer::with_formatter(&mut buf, PythonDefaultFormatter);
-    value.serialize(&mut ser).ok()?;
+    let formatter = JsonSeparatorsFormatter {
+        item_separator: opts.item_separator.as_bytes(),
+        key_separator: opts.key_separator.as_bytes(),
+    };
+    let mut ser = serde_json::Serializer::with_formatter(&mut buf, formatter);
+    if opts.sort_keys {
+        SortedJsonValue(value).serialize(&mut ser).ok()?;
+    } else {
+        value.serialize(&mut ser).ok()?;
+    }
     String::from_utf8(buf).ok()
 }
 
-/// HF's `tojson` kwargs that leave [`to_json_python_separators`]'s bytes as
-/// they are: `ensure_ascii=False` (HF's default) and `indent=None`. Any other
-/// value or kwarg is a render error, not a silently different JSON, of the
-/// kind ("too many arguments") the one-argument filter gave every kwarg: the
-/// cross-family gates record unrenderable templates by that text.
-fn check_tojson_kwargs(
+/// Parse HF's `tojson` kwargs: supports `ensure_ascii=False`, `indent=None`,
+/// `sort_keys` (recursive lexicographical key sort), and `separators`
+/// (`None` -> Python default `(", ", ": ")`, or a 2-tuple of strings
+/// `(item_sep, key_sep)`). Unsupported values or unknown kwargs fail with
+/// `ErrorKind::TooManyArguments`.
+fn parse_tojson_kwargs(
     kwargs: &minijinja::value::Kwargs,
-) -> std::result::Result<(), minijinja::Error> {
+) -> std::result::Result<ToJsonOptions, minijinja::Error> {
     if kwargs.get::<Option<bool>>("ensure_ascii")? == Some(true) {
         return Err(minijinja::Error::new(
             minijinja::ErrorKind::TooManyArguments,
@@ -3839,7 +3941,40 @@ fn check_tojson_kwargs(
             "tojson: only indent=None is supported",
         ));
     }
-    kwargs.assert_all_used()
+    let sort_keys = kwargs.get::<Option<bool>>("sort_keys")?.unwrap_or(false);
+    let (item_separator, key_separator) = match kwargs
+        .get::<Option<minijinja::Value>>("separators")?
+    {
+        None => (", ".to_string(), ": ".to_string()),
+        Some(sep_val) => {
+            if sep_val.kind() != minijinja::value::ValueKind::Seq {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::TooManyArguments,
+                    "tojson: separators must be a 2-tuple of strings (item_separator, key_separator)",
+                ));
+            }
+            let parts: Vec<minijinja::Value> = sep_val.try_iter()?.collect();
+            if parts.len() != 2 {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::TooManyArguments,
+                    "tojson: separators must be a 2-tuple of strings (item_separator, key_separator)",
+                ));
+            }
+            let (Some(item_sep), Some(key_sep)) = (parts[0].as_str(), parts[1].as_str()) else {
+                return Err(minijinja::Error::new(
+                    minijinja::ErrorKind::TooManyArguments,
+                    "tojson: separators must be a 2-tuple of strings (item_separator, key_separator)",
+                ));
+            };
+            (item_sep.to_string(), key_sep.to_string())
+        }
+    };
+    kwargs.assert_all_used()?;
+    Ok(ToJsonOptions {
+        sort_keys,
+        item_separator,
+        key_separator,
+    })
 }
 
 /// Python `str.format` for automatic positional fields only: `{}` takes the

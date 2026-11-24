@@ -690,6 +690,56 @@ describe('AgentSessionsReader.timeline', () => {
     setMtimes(parentDir, NOW - DAY);
     expect(r.detail(parentId)!.transcript[0]).toMatchObject({ text: 'Plan the work' });
   });
+
+  it('reads sibling events.jsonl for main and child lanes and refreshes when it grows', () => {
+    const T0 = 1_800_000_000_000;
+    const iso = (d: number) => new Date(T0 + d).toISOString();
+    const sid = '01b30000-0000-7000-8000-000000000000';
+    const dir = writeSession(home, {
+      id: sid,
+      lines: [userLine(T0, 'Explain it'), answerLine(T0 + 50_000, 'Done'), turnLine(T0 + 50_500, 50_500)],
+    });
+    const evPath = join(dir, 'events.jsonl');
+    writeFileSync(
+      evPath,
+      `${[
+        JSON.stringify({ ts: iso(10), type: 'phase_changed', phase: 'waiting_for_model' }),
+        JSON.stringify({ ts: iso(10_000), type: 'first_token' }),
+        JSON.stringify({ ts: iso(10_000), type: 'phase_changed', phase: 'streaming_text' }),
+        JSON.stringify({ ts: iso(50_000), type: 'phase_changed', phase: 'streaming_text' }),
+        JSON.stringify({ ts: iso(50_400), type: 'turn_ended', outcome: 'completed' }),
+      ].join('\n')}\n`,
+    );
+    setMtimes(dir, NOW - DAY);
+    const r = reader();
+    const first = r.timeline(sid, 1);
+    if (first === null || first === 'no-turn') throw new Error('no timeline');
+    expect(first.spans.map((s) => [s.kind, s.startMs, s.endMs])).toEqual([
+      ['wait', 0, 10_000],
+      ['generate', 10_000, 50_000],
+    ]);
+    // Growing events.jsonl busts the stamp cache even when updates.jsonl is untouched.
+    writeFileSync(
+      evPath,
+      `${[
+        JSON.stringify({ ts: iso(10), type: 'phase_changed', phase: 'waiting_for_model' }),
+        JSON.stringify({ ts: iso(5_000), type: 'first_token' }),
+        JSON.stringify({ ts: iso(5_000), type: 'phase_changed', phase: 'streaming_reasoning' }),
+        JSON.stringify({ ts: iso(20_000), type: 'phase_changed', phase: 'streaming_reasoning' }),
+        JSON.stringify({ ts: iso(20_100), type: 'phase_changed', phase: 'streaming_text' }),
+        JSON.stringify({ ts: iso(50_000), type: 'phase_changed', phase: 'streaming_text' }),
+        JSON.stringify({ ts: iso(50_400), type: 'turn_ended', outcome: 'completed' }),
+      ].join('\n')}\n`,
+    );
+    setMtimes(dir, NOW - DAY);
+    const second = r.timeline(sid, 1);
+    if (second === null || second === 'no-turn') throw new Error('no timeline');
+    expect(second.spans.map((s) => [s.kind, s.kind === 'generate' ? s.phase : null, s.startMs, s.endMs])).toEqual([
+      ['wait', null, 0, 5_000],
+      ['generate', 'reasoning', 5_000, 20_000],
+      ['generate', 'answer', 20_100, 50_000],
+    ]);
+  });
 });
 
 describe('AgentSessionsReader titles', () => {
