@@ -63,6 +63,24 @@ Acceptance gate: `< 0.01` max absolute probability error across all 28 probabili
 | **SUM 6 Cases** | `10,002.8 / 4,110.8 ms` | `4,636.4 / 3,842.2 ms` | `3,085.0 / 2,495.1 ms` | **`2,950.2 / 2,373.5 ms`** | **3.39× / 1.73×** | **`0.002496` PASS** |
 | `stress_6k` (`5,688`) | `8,801.4 / 6,170.0 ms` | `4,755.5 / 4,639.1 ms` | `3,040.1 / 2,769.8 ms` | **`2,984.7 / 2,564.5 ms`** (`2,218 tok/s`) | **2.95× / 2.41×** | `det=true` |
 
+### Clef 27B Q4_K_M (`Clef-Q4_K_M.gguf`, 18.19 GiB)
+
+Tensor mix: 364 `Q8_0` (Attention/GDN/`lm_head`/`clef_head`), 193 `Q4_K` (all 64 MLP units = 192 tensors + `token_embd`), 453 `F32`, 1 `BF16`.
+
+| Metric / Case (Tokens) | `CLEF_RESIDENCY=native` (`KQuantPrefill`) Cold / Warm | Pre-Fusion `Sym8` (`Tiled64` untile + scalar dequant) Cold / Warm | **Fused `Q4_K -> Sym8`** Cold / Warm | Speedup vs Native / Pre-Fusion | Max Prob Err |
+| :--- | ---: | ---: | ---: | ---: | ---: |
+| **Load (page-cached) / Active / Peak** | `7.27 s` / `20.80` / `20.92 GB` | `11.88 s` / `27.42` / `28.41 GB` | **`9.08 s` / `27.08` / `27.54 GB`** | **-2.80 s Load (-24%) / -0.87 GB Load Peak** | — |
+| `invoice` (`258`) | `2,252.9 / 303.3 ms` | `1,227.6 / 196.5 ms` | **`1,223.6 / 201.2 ms`** (`1,282 tok/s`) | **1.51×** warm vs native | `0.000665` |
+| `outage` (`314`) | `340.1 / 311.8 ms` | `324.9 / 203.7 ms` | **`231.3 / 206.4 ms`** (`1,521 tok/s`) | **1.51×** warm vs native | `0.010387` *(native `0.010409`)* |
+| `routine` (`340`) | `334.0 / 315.3 ms` | `349.7 / 215.5 ms` | **`242.9 / 216.6 ms`** (`1,570 tok/s`) | **1.46×** warm vs native | `0.001470` |
+| `unicode` (`243`) | `231.3 / 230.7 ms` | `197.7 / 191.5 ms` | **`196.9 / 187.9 ms`** (`1,293 tok/s`) | **1.23×** warm vs native | `0.000196` |
+| `single-option` (`120`) | `472.1 / 153.0 ms` | `267.0 / 164.8 ms` | **`204.3 / 161.1 ms`** (`745 tok/s`) | `0.95×` warm vs native | `0.000000` |
+| `long-context` (`2,960`) | `2,603.8 / 2,453.1 ms` | `2,435.6 / 1,387.8 ms` | **`1,501.1 / 1,368.4 ms`** (`2,163 tok/s`) | **1.79×** warm vs native | `0.000076` |
+| **SUM 6 Cases** | `6,234.2 / 3,767.2 ms` | `4,802.5 / 2,359.8 ms` | **`3,600.1 / 2,341.6 ms`** | **1.61× warm vs native / -1.20 s cold** | `allModal/Exp/Det=true` |
+| `stress_6k` (`5,688`) | `4,983.0 / 4,802.2 ms` | `4,441.5 / 2,667.2 ms` | **`3,309.0 / 2,625.5 ms`** (`2,166 tok/s`) | **1.83×** warm vs native (`peak 29.07 GB`) | `det=true` |
+
+> On discrete 24 GB CUDA GPUs (`21 GiB` VRAM budget), `DiscreteGpuMemoryFit` automatically selects `NativeQuant` (`19.37 GiB <= 21 GiB`, 100% VRAM-resident via `KQuantPrefill` with zero PCIe spill) when `CLEF_RESIDENCY` is unset, while unified-memory hosts (RTX Spark) and 32+ GB GPUs run full `Sym8` (`2,166 tok/s`).
+
 ---
 
 ## Silicon Roofline & Key Changes
@@ -88,4 +106,9 @@ Acceptance gate: `< 0.01` max absolute probability error across all 28 probabili
   - **P3**: Fused `Add + RMSNorm + Hadamard-1024 + INT8 Quant` (`sym8_rmsnorm_hadamard.cu.inc`, 16-warp `sum_sq` parity matching `add_rmsnorm.cu.inc` bit-for-bit) across MLP, FullAttn (`write_normed=false`), and GDN (`write_normed=true`).
   - **P4**: Fixed small-`M` L2 thrashing (`st.global.cs.v4.u32`, `cp.async.ca` on small `A`, `L2::256B` on `B`, `sym8_imma_128x64_k128_s3`, `128x128_k128_s3_gm8` for `M >= 280, N >= 16384`: `-39%` on 27B `M=340` `gate_up`).
   - **P5**: Replaced full `[T, H]` FP32 `span_cumsum` in `JointHead` with single-`take` compacted span-slice means.
+- **Wave 4 (`Clef-Q4_K_M` & K-Quant CUDA Path)**:
+  - Added CUDA `Q6_K` GGUF repack kernels (`gguf_repack_q6k.cu.inc`, `RowMajor` & `Tiled64`, 36–40 regs, 0 B spills, tail-read safe) in `mlx_gguf_repack_cuda.cpp` and `gguf_gpu.rs`.
+  - Added fused `sym8_quantize_weight_kquant` (`sym8_weight_quant_kquant.cu.inc`, `Q4_K` & `Q6_K`, `RowMajor` & `Tiled64` direct in registers -> FP32 FWHT-1024 -> `Sym8`, 34–48 regs, 0 B spills), eliminating `Tiled64 -> RowMajor` GPU untile copies and `~510 MiB`/MLP BF16 scratch during `Clef-Q4_K_M` load (`11.88 s -> 9.08 s` warm load, `28.41 -> 27.54 GB` load peak, matching `Clef-Q8_0` `2,166 tok/s` warm throughput).
+  - Added post-Sym8 GDN `in_proj_qkv` + `in_proj_z` merge in `apply_weights_inner_with_residency` so mixed-qtype GDN checkpoints still unlock fused `Add+RMSNorm+HadQuant`.
+  - Added `DiscreteGpuMemoryFit` auto-residency on discrete CUDA GPUs so K-quant checkpoints that fit VRAM natively (`Clef-Q4_K_M` `19.37 GiB` on a 24 GB GPU) stay 100% VRAM-resident under `NativeQuant` instead of expanding past the VRAM budget and spilling over PCIe.
 - **Hardening**: Fixed all 9 adversarial review findings (process-wide mutex + static-SMEM-aware `ensure_dynamic_smem`, `NaN`/`Inf` propagation, `eps < 0` / zero-row guards, `grid_x` overflow checks, `cuda_sym8_available()` `sm >= 8.0` gate, fail-loud missing affine `.biases`, and `block_size == 1024` validation).

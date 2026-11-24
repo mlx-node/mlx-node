@@ -26,6 +26,10 @@ constexpr char kSym8WeightQuantSrc[] =
 #include "cuda/sym8/sym8_weight_quant.cu.inc"
     ;
 
+constexpr char kSym8WeightQuantKQuantSrc[] =
+#include "cuda/sym8/sym8_weight_quant_kquant.cu.inc"
+    ;
+
 constexpr char kSym8ImmaLargeSrc[] =
 #include "cuda/sym8/sym8_imma_large.cu.inc"
     ;
@@ -44,6 +48,11 @@ inline std::string_view sym8_hadamard_src() noexcept {
 
 inline std::string_view sym8_weight_quant_src() noexcept {
   return std::string_view(kSym8WeightQuantSrc, sizeof(kSym8WeightQuantSrc) - 1);
+}
+
+inline std::string_view sym8_weight_quant_kquant_src() noexcept {
+  return std::string_view(
+      kSym8WeightQuantKQuantSrc, sizeof(kSym8WeightQuantKQuantSrc) - 1);
 }
 
 inline std::string_view sym8_imma_large_src() noexcept {
@@ -660,6 +669,117 @@ class Sym8QuantizeWeightDenseCuda final : public Primitive {
 };
 
 // ============================================================================
+// 4b. Bit-Exact FP32 Weight Quantizer: Packed K-Quant (Q4_K / Q6_K) -> Sym8
+// ============================================================================
+class Sym8QuantizeWeightKQuantCuda final : public Primitive {
+ public:
+  Sym8QuantizeWeightKQuantCuda(
+      Stream stream, bool is_q6k, bool tiled, bool has_signs, int N, int K)
+      : Primitive(stream),
+        is_q6k_(is_q6k),
+        tiled_(tiled),
+        has_signs_(has_signs),
+        N_(N),
+        K_(K) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Sym8QuantizeWeightKQuantCuda requires CUDA");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    array w = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    array scales =
+        cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
+    array biases =
+        cu::ensure_row_contiguous_aligned<2>(inputs[2], stream(), encoder);
+    std::optional<array> signs;
+    if (has_signs_) {
+      signs = cu::ensure_row_contiguous_aligned<16>(inputs[3], stream(), encoder);
+    }
+
+    const int64_t num_sb = static_cast<int64_t>(K_) / 256;
+    const int64_t expected_w_cols = num_sb * (is_q6k_ ? 48 : 32);
+    const int64_t expected_s_cols = num_sb * 16;
+    const int64_t expected_b_cols = is_q6k_ ? num_sb : (num_sb * 2);
+    const Dtype expected_s_dt = is_q6k_ ? int8 : uint8;
+    if (N_ < 1 || K_ < 256 || (K_ % 256) != 0 || (tiled_ && (N_ % 64) != 0) ||
+        (has_signs_ && (K_ % 1024) != 0) ||
+        w.dtype() != uint32 || w.ndim() != 2 || w.shape(0) != N_ ||
+        w.shape(1) != expected_w_cols ||
+        scales.dtype() != expected_s_dt || scales.ndim() != 2 ||
+        scales.shape(0) != N_ || scales.shape(1) != expected_s_cols ||
+        biases.dtype() != float16 || biases.ndim() != 2 ||
+        biases.shape(0) != N_ || biases.shape(1) != expected_b_cols ||
+        (has_signs_ &&
+         (signs->dtype() != float32 || signs->ndim() != 1 ||
+          signs->shape(0) != K_))) {
+      throw std::invalid_argument(
+          "Sym8QuantizeWeightKQuantCuda: unsupported shape or dtype");
+    }
+
+    auto& out_q = outputs[0];
+    auto& out_s = outputs[1];
+    out_q.set_data(cu::malloc_async(out_q.nbytes(), encoder));
+    out_s.set_data(cu::malloc_async(out_s.nbytes(), encoder));
+
+    encoder.set_input_array(w);
+    encoder.set_input_array(scales);
+    encoder.set_input_array(biases);
+    if (has_signs_) encoder.set_input_array(*signs);
+    encoder.set_output_array(out_q);
+    encoder.set_output_array(out_s);
+
+    static constexpr const char* kEntries[2][2][2] = {
+        {{"mlx_sym8_wq_q4k_rm_nosigns", "mlx_sym8_wq_q4k_rm_signs"},
+         {"mlx_sym8_wq_q4k_t64_nosigns", "mlx_sym8_wq_q4k_t64_signs"}},
+        {{"mlx_sym8_wq_q6k_rm_nosigns", "mlx_sym8_wq_q6k_rm_signs"},
+         {"mlx_sym8_wq_q6k_t64_nosigns", "mlx_sym8_wq_q6k_t64_signs"}},
+    };
+    auto fn = cu::jit_kernel(
+        encoder.device(), sym8_weight_quant_kquant_src(),
+        kEntries[is_q6k_ ? 1 : 0][tiled_ ? 1 : 0][has_signs_ ? 1 : 0]);
+
+    cu::KernelArgs args;
+    args.append(w);
+    args.append(scales);
+    args.append(biases);
+    if (has_signs_) {
+      args.append(*signs);
+    } else {
+      args.append<CUdeviceptr>(0);
+    }
+    args.append(out_q);
+    args.append(out_s);
+    args.append<int32_t>(N_);
+    args.append<int32_t>(K_);
+
+    encoder.add_kernel_node_raw(
+        fn, dim3(static_cast<uint32_t>(N_), 1, 1), dim3(128, 1, 1), {}, 0,
+        args.args());
+  }
+
+  DEFINE_NAME(Sym8QuantizeWeightKQuantCuda)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const Sym8QuantizeWeightKQuantCuda*>(&other);
+    return rhs && rhs->is_q6k_ == is_q6k_ && rhs->tiled_ == tiled_ &&
+        rhs->has_signs_ == has_signs_ && rhs->N_ == N_ && rhs->K_ == K_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>&) override {
+    return {{static_cast<ShapeElem>(N_), static_cast<ShapeElem>(K_)},
+            {static_cast<ShapeElem>(N_)}};
+  }
+
+ private:
+  bool is_q6k_;
+  bool tiled_;
+  bool has_signs_;
+  int N_;
+  int K_;
+};
+
+// ============================================================================
 // 5. Fused (Optional Residual Add +) RMSNorm + Optional Hadamard-1024 + INT8 Quant
 // ============================================================================
 class Sym8AddRmsNormHadQuantCuda final : public Primitive {
@@ -1070,6 +1190,94 @@ extern "C" bool mlx_cuda_sym8_quantize_weight_q8(
   }
 }
 
+extern "C" bool mlx_sym8_quantize_weight_kquant_cuda(
+    mlx_array* w_h,
+    mlx_array* scales_h,
+    mlx_array* biases_h,
+    bool is_q6k,
+    bool tiled,
+    mlx_array* signs_h,
+    mlx_array** out_q,
+    mlx_array** out_s) {
+  if (out_q) *out_q = nullptr;
+  if (out_s) *out_s = nullptr;
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::sym8_ops;
+    if (!w_h || !scales_h || !biases_h || !out_q || !out_s ||
+        default_device() != Device::gpu ||
+        cu::device(Device::gpu).compute_capability_major() < 8) {
+      return false;
+    }
+    const auto& w = *reinterpret_cast<array*>(w_h);
+    const auto& scales = *reinterpret_cast<array*>(scales_h);
+    const auto& biases = *reinterpret_cast<array*>(biases_h);
+    const Dtype expected_s_dt = is_q6k ? int8 : uint8;
+    if (w.dtype() != uint32 || w.ndim() != 2 ||
+        scales.dtype() != expected_s_dt || scales.ndim() != 2 ||
+        biases.dtype() != float16 || biases.ndim() != 2) {
+      return false;
+    }
+    const int64_t N = w.shape(0);
+    const int64_t w_cols = w.shape(1);
+    const int64_t words_per_sb = is_q6k ? 48 : 32;
+    if (N < 1 || N > std::numeric_limits<int32_t>::max() ||
+        (tiled && (N % 64) != 0) ||
+        w_cols < words_per_sb || (w_cols % words_per_sb) != 0) {
+      return false;
+    }
+    const int64_t num_sb = w_cols / words_per_sb;
+    if (num_sb > std::numeric_limits<int32_t>::max() / 256) {
+      return false;
+    }
+    const int64_t K = num_sb * 256;
+    const int64_t expected_s_cols = num_sb * 16;
+    const int64_t expected_b_cols = is_q6k ? num_sb : (num_sb * 2);
+    if (scales.shape(0) != N || scales.shape(1) != expected_s_cols ||
+        biases.shape(0) != N || biases.shape(1) != expected_b_cols) {
+      return false;
+    }
+
+    const bool has_signs = (signs_h != nullptr);
+    std::vector<array> inputs;
+    inputs.reserve(has_signs ? 4 : 3);
+    inputs.push_back(w);
+    inputs.push_back(scales);
+    inputs.push_back(biases);
+    if (has_signs) {
+      const auto& s = *reinterpret_cast<array*>(signs_h);
+      if (s.dtype() != float32 || s.ndim() != 1 || s.shape(0) != K ||
+          (K % 1024) != 0) {
+        return false;
+      }
+      inputs.push_back(s);
+    }
+
+    auto results = array::make_arrays(
+        {{static_cast<ShapeElem>(N), static_cast<ShapeElem>(K)},
+         {static_cast<ShapeElem>(N)}},
+        {int8, float32},
+        std::make_shared<Sym8QuantizeWeightKQuantCuda>(
+            default_stream(Device::gpu), is_q6k, tiled, has_signs,
+            static_cast<int>(N), static_cast<int>(K)),
+        std::move(inputs));
+    *out_q = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
+    *out_s = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_sym8_quantize_weight_kquant_cuda: %s\n", e.what());
+    if (out_q && *out_q) {
+      delete reinterpret_cast<mlx::core::array*>(*out_q);
+      *out_q = nullptr;
+    }
+    if (out_s && *out_s) {
+      delete reinterpret_cast<mlx::core::array*>(*out_s);
+      *out_s = nullptr;
+    }
+    return false;
+  }
+}
+
 extern "C" bool mlx_cuda_sym8_quantize_weight_dense(
     mlx_array* w_h, mlx_array* signs_h,
     mlx_array** out_q, mlx_array** out_s) {
@@ -1305,6 +1513,26 @@ extern "C" bool mlx_cuda_sym8_quantize_weight_q8(
   (void)w_u32_h;
   (void)w_scales_h;
   (void)w_biases_h;
+  (void)signs_h;
+  if (out_q) *out_q = nullptr;
+  if (out_s) *out_s = nullptr;
+  return false;
+}
+
+extern "C" bool mlx_sym8_quantize_weight_kquant_cuda(
+    mlx_array* w_h,
+    mlx_array* scales_h,
+    mlx_array* biases_h,
+    bool is_q6k,
+    bool tiled,
+    mlx_array* signs_h,
+    mlx_array** out_q,
+    mlx_array** out_s) {
+  (void)w_h;
+  (void)scales_h;
+  (void)biases_h;
+  (void)is_q6k;
+  (void)tiled;
   (void)signs_h;
   if (out_q) *out_q = nullptr;
   if (out_s) *out_s = nullptr;

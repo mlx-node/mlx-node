@@ -4423,6 +4423,21 @@ unsafe extern "C" {
         out_s: *mut *mut mlx_array,
     ) -> bool;
 
+    /// CUDA bit-exact FP32 weight quantizer: packed K-quant (`Q4_K` or `Q6_K`,
+    /// `RowMajor` or `Tiled64`) + optional `f32 [K]` signs & FWHT-1024 ->
+    /// `int8 [N, K]` and `f32 [N]`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_sym8_quantize_weight_kquant_cuda(
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        is_q6k: bool,
+        tiled: bool,
+        signs: *mut mlx_array,
+        out_q: *mut *mut mlx_array,
+        out_s: *mut *mut mlx_array,
+    ) -> bool;
+
     /// CUDA bit-exact FP32 weight quantizer: dense `bf16/f16/f32 [N, K]` + optional
     /// `f32 [K]` signs & FWHT-1024 -> `int8 [N, K]` and `f32 [N]`.
     pub fn mlx_cuda_sym8_quantize_weight_dense(

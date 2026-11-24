@@ -8,6 +8,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifdef MLX_NODE_CUDA_ENABLED
@@ -22,6 +23,10 @@ using namespace mlx_node::gguf_repack;
 
 constexpr char gguf_repack_source[] =
 #include "cuda/gguf_repack.cu.inc"
+    ;
+
+constexpr char gguf_repack_q6k_source[] =
+#include "cuda/gguf_repack_q6k.cu.inc"
     ;
 
 class GgufRepackBandCuda final : public Primitive {
@@ -54,6 +59,12 @@ class GgufRepackBandCuda final : public Primitive {
         throw std::runtime_error(
             "GgufRepackBandCuda: K-quant scales/biases destination alignment error");
       }
+    } else if (kernel_ == 4 || kernel_ == 5) {
+      if ((reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[1])) & 15u) != 0u ||
+          (reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[2])) & 1u) != 0u) {
+        throw std::runtime_error(
+            "GgufRepackBandCuda: Q6_K scales/biases destination alignment error");
+      }
     }
     array st = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
     encoder.set_input_array(st);
@@ -77,15 +88,19 @@ class GgufRepackBandCuda final : public Primitive {
       grid_x = static_cast<uint32_t>((uint64_t(params_.nb) * 8ull + 255ull) / 256ull);
     } else {
       args.append<uint32_t>(params_.row0);
-      if (kernel_ == 0 || kernel_ == 2) {
+      if (kernel_ == 0 || kernel_ == 2 || kernel_ == 4) {
         grid_x = (params_.nb + 31u) / 32u;
       } else {
         grid_x = (params_.nb + 255u) / 256u;
       }
     }
 
-    auto fn = cu::jit_kernel(
-        encoder.device(), gguf_repack_source, kKernels[kernel_].name);
+    const std::string_view src = (kernel_ == 4 || kernel_ == 5)
+        ? std::string_view(
+              gguf_repack_q6k_source, sizeof(gguf_repack_q6k_source) - 1)
+        : std::string_view(
+              gguf_repack_source, sizeof(gguf_repack_source) - 1);
+    auto fn = cu::jit_kernel(encoder.device(), src, kKernels[kernel_].name);
     encoder.add_kernel_node_raw(
         fn, dim3(grid_x, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
   }
@@ -132,6 +147,8 @@ bool cuda_repack_supports_kernel(int kernel) noexcept {
     case 1:   // mlx_node_gguf_repack_q4k_t64
     case 2:   // mlx_node_gguf_repack_q5k
     case 3:   // mlx_node_gguf_repack_q5k_t64
+    case 4:   // mlx_node_gguf_repack_q6k
+    case 5:   // mlx_node_gguf_repack_q6k_t64
     case 14:  // mlx_node_gguf_repack_q8_0
     case 17:  // mlx_node_gguf_repack_q5_1
     case 18:  // mlx_node_gguf_repack_q8_0_bias

@@ -352,8 +352,8 @@ pub(crate) fn gpu_repack_available() -> bool {
 }
 
 /// Whether the active GPU backend implements a repack kernel for `kind`.
-/// Metal supports all 12 kinds; CUDA implements the 5 Qwen3.8/GGUF kinds
-/// (`Q4K`, `Q5K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
+/// Metal supports all 12 kinds; CUDA implements the 6 Qwen3.8/GGUF kinds
+/// (`Q4K`, `Q5K`, `Q6K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
 pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
     if crate::accelerator::host_has_metal() {
         true
@@ -362,6 +362,7 @@ pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
             kind,
             GpuRepackKind::Q4K
                 | GpuRepackKind::Q5K
+                | GpuRepackKind::Q6K
                 | GpuRepackKind::Q5_1
                 | GpuRepackKind::Q8_0
                 | GpuRepackKind::Q8_0Bias
@@ -2322,6 +2323,91 @@ mod tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn cuda_q6k_repack_matches_cpu_and_tail_safe() {
+        if !crate::accelerator::host_has_cuda() || !gpu_repack_available() {
+            return;
+        }
+        assert!(gpu_repack_supports_kind(GpuRepackKind::Q6K));
+        assert_eq!(gpu_kind_for(GgufTensorType::Q6K), Some(GpuRepackKind::Q6K));
+        row_major_cases(GpuRepackKind::Q6K);
+        tiled_cases(GpuRepackKind::Q6K);
+        bands_of_one_staging(GpuRepackKind::Q6K, OutLayout::RowMajor, &[3, 5, 1], 768, 2);
+        bands_of_one_staging(
+            GpuRepackKind::Q6K,
+            OutLayout::Tiled64,
+            &[64, 128, 64],
+            768,
+            2,
+        );
+
+        // Exact tail-word safety at 0 and 2 mod 4 endings (including single-block 210 B
+        // and odd 9-block 1890 B staging arrays, plus Tiled64 at exact staging end).
+        for (layout, rows, k) in [
+            (OutLayout::RowMajor, 1usize, 256usize),
+            (OutLayout::RowMajor, 3usize, 768usize),
+            (OutLayout::Tiled64, 64usize, 768usize),
+        ] {
+            let blocks = random_bytes(rows * row_bytes(GpuRepackKind::Q6K, k), 41 + rows as u64);
+            for pad in [0usize, 2] {
+                let staging = staging_exact(&blocks, pad, 9);
+                let end = pad + blocks.len();
+                assert_eq!(staging.nbytes(), end);
+                let (dst, _) = RepackDst::alloc_gpu_for_kind(
+                    &tensor_info(GpuRepackKind::Q6K, rows, k),
+                    GpuRepackKind::Q6K,
+                    layout,
+                )
+                .unwrap();
+                let out = gpu_repack_band(
+                    &staging,
+                    pad as u64,
+                    GpuRepackKind::Q6K,
+                    layout,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .unwrap_or_else(|e| {
+                    panic!(
+                        "CUDA Q6K {layout:?} band ending at byte {end}: {}",
+                        e.reason
+                    )
+                });
+                assert_same(
+                    &read(&out),
+                    &oracle(GpuRepackKind::Q6K, layout, &blocks, rows, k),
+                    &format!("CUDA Q6K {layout:?} exact tail rows={rows} k={k} pad={pad}"),
+                );
+                let short = staging_exact(&blocks[..blocks.len() - 1], pad, 9);
+                let (dst, _) = RepackDst::alloc_for_kind(
+                    &tensor_info(GpuRepackKind::Q6K, rows, k),
+                    GpuRepackKind::Q6K,
+                    layout,
+                )
+                .unwrap();
+                let err = gpu_repack_band(
+                    &short,
+                    pad as u64,
+                    GpuRepackKind::Q6K,
+                    layout,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .err()
+                .expect("Q6K band one byte past staging end was accepted");
+                assert!(
+                    err.reason.contains("past the end of the staging"),
+                    "{}",
+                    err.reason
+                );
+            }
+        }
     }
 }
 
