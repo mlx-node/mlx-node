@@ -1645,27 +1645,50 @@ pub(crate) fn resolve_clef_residency(
     }
 }
 
+/// Resolved CLEF residency together with whether an active `CLEF_RESIDENCY`
+/// environment override selected it on this host.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResolvedClefResidency {
+    residency: ClefResidency,
+    explicit_override: bool,
+}
+
 /// Apply an explicit `CLEF_RESIDENCY` override (`bf16`, `native`, `sym8`) on
 /// CUDA quantized checkpoints; non-CUDA (macOS Metal / CPU) and unquantized
 /// checkpoints ignore the override and keep [`resolve_clef_residency`].
 /// `CLEF_RESIDENCY=sym8` requires `cuda_sym8_available` (SM >= 8.0) and falls
 /// back cleanly on pre-Ampere CUDA GPUs, while `CLEF_RESIDENCY=native` works
 /// on any CUDA GPU.
-fn resolve_clef_residency_with_override(
+fn resolve_clef_residency_with_override_detailed(
     is_quantized: bool,
     nax_available: bool,
     cuda_available: bool,
     cuda_sym8_available: bool,
     env_override: Option<&str>,
-) -> ClefResidency {
+) -> ResolvedClefResidency {
     if is_quantized
         && cuda_available
         && let Some(raw) = env_override
     {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "bf16" => return ClefResidency::Bf16,
-            "native" | "native_quant" => return ClefResidency::NativeQuant,
-            "sym8" if cuda_sym8_available => return ClefResidency::Sym8,
+            "bf16" => {
+                return ResolvedClefResidency {
+                    residency: ClefResidency::Bf16,
+                    explicit_override: true,
+                };
+            }
+            "native" | "native_quant" => {
+                return ResolvedClefResidency {
+                    residency: ClefResidency::NativeQuant,
+                    explicit_override: true,
+                };
+            }
+            "sym8" if cuda_sym8_available => {
+                return ResolvedClefResidency {
+                    residency: ClefResidency::Sym8,
+                    explicit_override: true,
+                };
+            }
             "sym8" => {
                 warn!(
                     "Ignoring CLEF_RESIDENCY=sym8: CUDA Sym8 kernels require SM >= 8.0; \
@@ -1676,7 +1699,28 @@ fn resolve_clef_residency_with_override(
             _ => {}
         }
     }
-    resolve_clef_residency(is_quantized, nax_available, cuda_sym8_available)
+    ResolvedClefResidency {
+        residency: resolve_clef_residency(is_quantized, nax_available, cuda_sym8_available),
+        explicit_override: false,
+    }
+}
+
+#[cfg(test)]
+fn resolve_clef_residency_with_override(
+    is_quantized: bool,
+    nax_available: bool,
+    cuda_available: bool,
+    cuda_sym8_available: bool,
+    env_override: Option<&str>,
+) -> ClefResidency {
+    resolve_clef_residency_with_override_detailed(
+        is_quantized,
+        nax_available,
+        cuda_available,
+        cuda_sym8_available,
+        env_override,
+    )
+    .residency
 }
 
 /// Memory-fit summary used on discrete CUDA GPUs (SM >= 8.0) to decide whether
@@ -1693,29 +1737,32 @@ pub(crate) struct DiscreteGpuMemoryFit {
 
 /// Pure CLEF residency decision for a load, combining explicit
 /// `CLEF_RESIDENCY` overrides with discrete-GPU auto-residency:
-///   * An explicit non-empty `raw_override` ALWAYS delegates to
-///     [`resolve_clef_residency_with_override`] (`sym8`/`native`/`bf16` wins).
+///   * An active explicit override (`sym8`/`native`/`bf16` on a supported
+///     quantized CUDA load) ALWAYS wins and sets `explicit_override = true`.
 ///   * Otherwise starts from [`resolve_clef_residency`]. When that selects
 ///     `Sym8` on a discrete CUDA SM >= 8.0 GPU and `discrete_fit` shows that
 ///     `Sym8` peak exceeds the VRAM budget while `NativeQuant` is fully
 ///     kernel-executable and strictly smaller than `Sym8`, auto-selects
 ///     `NativeQuant` to stay in VRAM (or minimize PCIe spill).
-fn resolve_clef_residency_for_load(
+fn resolve_clef_residency_for_load_detailed(
     is_quantized: bool,
     nax_available: bool,
     cuda_available: bool,
     cuda_sym8_available: bool,
     raw_override: Option<&str>,
     discrete_fit: Option<DiscreteGpuMemoryFit>,
-) -> ClefResidency {
+) -> ResolvedClefResidency {
     if let Some(raw) = raw_override.filter(|s| !s.trim().is_empty()) {
-        return resolve_clef_residency_with_override(
+        let overridden = resolve_clef_residency_with_override_detailed(
             is_quantized,
             nax_available,
             cuda_available,
             cuda_sym8_available,
             Some(raw),
         );
+        if overridden.explicit_override {
+            return overridden;
+        }
     }
     let base = resolve_clef_residency(is_quantized, nax_available, cuda_sym8_available);
     if base == ClefResidency::Sym8
@@ -1730,16 +1777,43 @@ fn resolve_clef_residency_for_load(
         info!(
             "CLEF discrete-GPU auto-residency selected NativeQuant: \
              native={:.2} GiB < sym8={:.2} GiB (sym8 peak={:.2} GiB > VRAM budget={:.2} GiB); \
-             set {}=sym8 to force Sym8",
+             set {}=sym8 to force Sym8 (requires sufficient free VRAM; fails if the \
+             discrete-GPU VRAM budget is exceeded)",
             fit.native_bytes as f64 / gib,
             fit.sym8_bytes as f64 / gib,
             fit.sym8_peak_bytes as f64 / gib,
             fit.budget_bytes as f64 / gib,
             CLEF_RESIDENCY_ENV,
         );
-        return ClefResidency::NativeQuant;
+        return ResolvedClefResidency {
+            residency: ClefResidency::NativeQuant,
+            explicit_override: false,
+        };
     }
-    base
+    ResolvedClefResidency {
+        residency: base,
+        explicit_override: false,
+    }
+}
+
+#[cfg(test)]
+fn resolve_clef_residency_for_load(
+    is_quantized: bool,
+    nax_available: bool,
+    cuda_available: bool,
+    cuda_sym8_available: bool,
+    raw_override: Option<&str>,
+    discrete_fit: Option<DiscreteGpuMemoryFit>,
+) -> ClefResidency {
+    resolve_clef_residency_for_load_detailed(
+        is_quantized,
+        nax_available,
+        cuda_available,
+        cuda_sym8_available,
+        raw_override,
+        discrete_fit,
+    )
+    .residency
 }
 
 fn resolve_clef_residency_from_env(
@@ -1748,9 +1822,9 @@ fn resolve_clef_residency_from_env(
     cuda_available: bool,
     cuda_sym8_available: bool,
     discrete_fit: Option<DiscreteGpuMemoryFit>,
-) -> ClefResidency {
+) -> ResolvedClefResidency {
     let env_override = std::env::var(CLEF_RESIDENCY_ENV).ok();
-    resolve_clef_residency_for_load(
+    resolve_clef_residency_for_load_detailed(
         is_quantized,
         nax_available,
         cuda_available,
@@ -2692,6 +2766,7 @@ struct CudaLoadBudgetCtx<'a> {
     budget: Option<&'a CudaDeviceBudget>,
     pre_merge_device_bytes: Option<&'a HashMap<String, u64>>,
     preserve_host_backed: bool,
+    clef_explicit_override: bool,
 }
 
 fn checked_add_cuda_aligned(acc: Option<u64>, bytes: Option<u64>) -> Option<u64> {
@@ -2757,7 +2832,15 @@ fn apply_clef_residency(
     HashMap<String, crate::quant::prism_hadamard::HadamardTransform>,
     i64,
 )> {
-    apply_clef_residency_with_budget(params, per_layer_quant, default_plq, residency, None, None)
+    apply_clef_residency_with_budget(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        None,
+        None,
+        false,
+    )
 }
 
 fn apply_clef_residency_with_budget(
@@ -2767,6 +2850,7 @@ fn apply_clef_residency_with_budget(
     residency: ClefResidency,
     cuda_budget: Option<&CudaDeviceBudget>,
     pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+    explicit_override: bool,
 ) -> Result<(ClefTransforms, i64)> {
     let mut signs_by_width = HashMap::new();
     apply_clef_residency_with_signs(
@@ -2778,6 +2862,7 @@ fn apply_clef_residency_with_budget(
         &mut signs_by_width,
         cuda_budget,
         pre_merge_device_bytes,
+        explicit_override,
     )
 }
 
@@ -2803,10 +2888,12 @@ fn apply_clef_residency_impl(
         &mut signs_by_width,
         None,
         None,
+        false,
     )
 }
 
 /// The caller owns `signs_by_width` so streamed layers share one sign array per K.
+#[allow(clippy::too_many_arguments)]
 fn apply_clef_residency_with_signs(
     params: &mut HashMap<String, MxArray>,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
@@ -2816,6 +2903,7 @@ fn apply_clef_residency_with_signs(
     signs_by_width: &mut HashMap<i64, MxArray>,
     cuda_budget: Option<&CudaDeviceBudget>,
     pre_merge_device_bytes: Option<&HashMap<String, u64>>,
+    explicit_override: bool,
 ) -> Result<(ClefTransforms, i64)> {
     let enforce_budget =
         crate::accelerator::cuda_ops_available() && cuda_budget.is_some_and(|b| !b.is_unlimited());
@@ -2829,6 +2917,7 @@ fn apply_clef_residency_with_signs(
         cuda_budget,
         pre_merge_device_bytes,
         enforce_budget,
+        explicit_override,
     )
 }
 
@@ -2839,6 +2928,25 @@ fn apply_clef_residency_with_budget_for_test(
     default_plq: PerLayerQuant,
     residency: ClefResidency,
     cuda_budget: &CudaDeviceBudget,
+) -> Result<(ClefTransforms, i64)> {
+    apply_clef_residency_with_budget_and_override_for_test(
+        params,
+        per_layer_quant,
+        default_plq,
+        residency,
+        cuda_budget,
+        false,
+    )
+}
+
+#[cfg(test)]
+fn apply_clef_residency_with_budget_and_override_for_test(
+    params: &mut HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    residency: ClefResidency,
+    cuda_budget: &CudaDeviceBudget,
+    explicit_override: bool,
 ) -> Result<(ClefTransforms, i64)> {
     let mut signs_by_width = HashMap::new();
     apply_clef_residency_core(
@@ -2851,9 +2959,11 @@ fn apply_clef_residency_with_budget_for_test(
         Some(cuda_budget),
         None,
         !cuda_budget.is_unlimited(),
+        explicit_override,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn apply_clef_residency_core(
     params: &mut HashMap<String, MxArray>,
     per_layer_quant: &mut HashMap<String, PerLayerQuant>,
@@ -2864,6 +2974,7 @@ fn apply_clef_residency_core(
     cuda_budget: Option<&CudaDeviceBudget>,
     pre_merge_device_bytes: Option<&HashMap<String, u64>>,
     enforce_budget: bool,
+    explicit_override: bool,
 ) -> Result<(ClefTransforms, i64)> {
     let mut transforms = HashMap::new();
     let mut byte_delta = 0i64;
@@ -2893,6 +3004,8 @@ fn apply_clef_residency_core(
         layout: Default::default(),
     };
     let enforced_budget = enforce_budget.then_some(cuda_budget).flatten();
+    let disallow_native_for_override =
+        explicit_override && matches!(residency, ClefResidency::Bf16 | ClefResidency::Sym8);
     let cuda_sym8 = residency == ClefResidency::Sym8 && crate::accelerator::cuda_sym8_available();
     let mut pending_eval: Vec<MxArray> = Vec::new();
     let mut last_layer_key: Option<String> = None;
@@ -2992,6 +3105,23 @@ fn apply_clef_residency_core(
                     }
                     let peak_need = output_bytes.and_then(|o| o.checked_add(scratch_bytes?));
                     let Some(peak_need) = peak_need.filter(|&need| budget.try_reserve(need)) else {
+                        if disallow_native_for_override {
+                            let unit_desc = direct_sources
+                                .iter()
+                                .map(|(prefix, _)| prefix.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            let need_desc = peak_need
+                                .map(|bytes| format!("{bytes} bytes"))
+                                .unwrap_or_else(|| "overflowing byte estimate".to_string());
+                            return Err(Error::from_reason(format!(
+                                "CLEF discrete-GPU VRAM budget denied required conversion for \
+                                 [{unit_desc}] (explicit {CLEF_RESIDENCY_ENV}=sym8 override \
+                                 cannot fall back to native quantized storage; needed {need_desc}, \
+                                 remaining {} bytes)",
+                                budget.remaining_bytes()
+                            )));
+                        }
                         kept.extend(direct_sources.into_iter().map(|(prefix, _)| prefix));
                         continue;
                     };
@@ -3241,7 +3371,8 @@ fn apply_clef_residency_core(
                 .any(|(_, plq, _)| plq.mode == PerLayerMode::Fp8E4m3);
             let can_keep_native = (!sym8_stored || crate::accelerator::cuda_sym8_available())
                 && !has_fp8_e4m3
-                && !clef_mlp_unit_incomplete(&unit);
+                && !clef_mlp_unit_incomplete(&unit)
+                && !disallow_native_for_override;
             let Some(reserved_peak) = peak_need.filter(|&need| budget.try_reserve(need)) else {
                 if can_keep_native {
                     kept.extend(decoded_sources.into_iter().map(|(prefix, _, _)| prefix));
@@ -3256,8 +3387,22 @@ fn apply_clef_residency_core(
                     "mixed dense+quantized MLP requires dense BF16 reconstruction"
                 } else if has_fp8_e4m3 {
                     "plain FP8 E4M3 requires dense BF16 reconstruction"
-                } else {
+                } else if sym8_stored && !crate::accelerator::cuda_sym8_available() {
                     "stored sym8 requires dense BF16 reconstruction without CUDA Sym8 support"
+                } else if disallow_native_for_override {
+                    match residency {
+                        ClefResidency::Bf16 => {
+                            "explicit CLEF_RESIDENCY=bf16 override cannot fall back to native quantized storage"
+                        }
+                        ClefResidency::Sym8 => {
+                            "explicit CLEF_RESIDENCY=sym8 override cannot fall back to native quantized storage"
+                        }
+                        ClefResidency::NativeQuant => unreachable!(),
+                    }
+                } else {
+                    unreachable!(
+                        "can_keep_native is false only when one of the conditions above holds"
+                    )
                 };
                 let need_desc = peak_need
                     .map(|bytes| format!("{bytes} bytes"))
@@ -3759,6 +3904,7 @@ fn apply_weights_inner_with_residency_with_cuda_ctx(
                     residency,
                     cuda_ctx.budget,
                     cuda_ctx.pre_merge_device_bytes,
+                    cuda_ctx.clef_explicit_override,
                 )?,
             }
         }
@@ -5500,7 +5646,7 @@ async fn load_with_thread_impl(
                 let mut streamed_params = HashMap::new();
                 let mut clef_layers_finalized = 0usize;
                 let mut prepared_clef = None;
-                let mut streamed_clef_residency: Option<ClefResidency> = None;
+                let mut streamed_clef_residency: Option<ResolvedClefResidency> = None;
                 if let Some(input) = preload_input.as_mut() {
                     input.planes = load_planes_plan(
                         input,
@@ -5590,18 +5736,19 @@ async fn load_with_thread_impl(
                                 clef_layers_finalized += 1;
                                 let flush_released = clef_layers_finalized == 2
                                     || clef_layers_finalized.is_multiple_of(4);
-                                if resolved_residency != ClefResidency::NativeQuant
+                                if resolved_residency.residency != ClefResidency::NativeQuant
                                     || has_sym8_mode(Some(default_plq.mode), &per_layer_quant)
                                 {
                                     let (rotations, _) = apply_clef_residency_with_signs(
                                         &mut layer,
                                         &mut per_layer_quant,
                                         default_plq,
-                                        resolved_residency,
+                                        resolved_residency.residency,
                                         !cuda_available && flush_released,
                                         &mut signs_by_width,
                                         Some(cuda_budget),
                                         Some(&pre_merge_device_bytes),
+                                        resolved_residency.explicit_override,
                                     )?;
                                     transforms.extend(rotations);
                                 }
@@ -5609,7 +5756,9 @@ async fn load_with_thread_impl(
                                 // (which builds lazy fused ops without per-projection syncs)
                                 // evaluate the whole layer in one batch so split/packed sources
                                 // materialize and release before the next layer streams in.
-                                if resolved_residency != ClefResidency::Sym8 || cuda_sym8_available {
+                                if resolved_residency.residency != ClefResidency::Sym8
+                                    || cuda_sym8_available
+                                {
                                     let arrays: Vec<&MxArray> = layer.values().collect();
                                     MxArray::eval_arrays_with_context(
                                         &arrays,
@@ -5886,13 +6035,15 @@ async fn load_with_thread_impl(
                         &symmetric_zero_points,
                         has_vision,
                         prism_runtime.as_ref(),
-                        clef_residency,
+                        clef_residency.map(|r| r.residency),
                         prepared_clef,
                         clairic,
                         CudaLoadBudgetCtx {
                             budget: load_cuda_budget.as_ref(),
                             pre_merge_device_bytes: Some(&pre_merge_device_bytes),
                             preserve_host_backed,
+                            clef_explicit_override: clef_residency
+                                .is_some_and(|r| r.explicit_override),
                         },
                     )?;
                 if let Some(plan) = preload_input
@@ -9414,6 +9565,7 @@ mod tests {
                 &mut signs_by_width,
                 None,
                 None,
+                false,
             )
             .unwrap();
             MxArray::eval_arrays_with_context(&part.values().collect::<Vec<_>>(), label).unwrap();
@@ -10654,20 +10806,61 @@ mod tests {
             }
         }
 
-        // Verify PreciseF32 policy is active on final_norm: BF16 input -> BF16 output
-        // and forward_residual_add declines.
+        // Verify PreciseF32 policy is active on final_norm: BF16 input -> BF16 output,
+        // CUDA fused residual-add matches unfused FP32 reference, and non-CUDA declines.
+        assert!(inner.final_norm.is_precise_f32());
         let bf16_in = MxArray::from_float32(&vec![0.5f32; h as usize], &[1, h])
             .unwrap()
             .astype(DType::BFloat16)
             .unwrap();
         let normed = inner.final_norm.forward(&bf16_in).unwrap();
         assert_eq!(normed.dtype().unwrap(), DType::BFloat16);
-        assert!(
-            inner
+        if crate::accelerator::cuda_ops_available()
+            && std::env::var_os("MLX_DISABLE_FUSED_ADD_RMSNORM").is_none()
+        {
+            let (h_fused, normed_fused) = inner
                 .final_norm
                 .forward_residual_add(&bf16_in, &bf16_in)
-                .is_none()
-        );
+                .expect("CUDA PreciseF32 fused residual-add declined a valid contract");
+            assert_eq!(h_fused.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(normed_fused.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(h_fused.shape().unwrap().as_ref(), &[1, h]);
+            assert_eq!(normed_fused.shape().unwrap().as_ref(), &[1, h]);
+
+            let h_ref = bf16_in.add(&bf16_in).unwrap();
+            let h_ref_f32 = h_ref.astype(DType::Float32).unwrap();
+            let normed_ref = crate::nn::normalization::rms_norm_scaled(
+                &h_ref_f32,
+                inner.final_norm.weight(),
+                inner.final_norm.eps_f32(),
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            assert_eq!(
+                h_fused.to_float32().unwrap().to_vec(),
+                h_ref.to_float32().unwrap().to_vec(),
+                "PreciseF32 fused residual-add h mismatch"
+            );
+            for (got, want) in normed_fused
+                .to_float32()
+                .unwrap()
+                .iter()
+                .zip(normed_ref.to_float32().unwrap().iter())
+            {
+                assert!(
+                    (got - want).abs() <= 1e-5,
+                    "PreciseF32 fused residual-add normed mismatch: got {got}, want {want}"
+                );
+            }
+        } else {
+            assert!(
+                inner
+                    .final_norm
+                    .forward_residual_add(&bf16_in, &bf16_in)
+                    .is_none()
+            );
+        }
     }
 
     #[test]
@@ -11902,6 +12095,7 @@ mod tests {
                 budget: Some(&exhausted),
                 pre_merge_device_bytes: None,
                 preserve_host_backed: true,
+                clef_explicit_override: false,
             },
         )
         .expect("mixed Sym8 + host-backed NativeQuant checkpoint must install cleanly");
@@ -12304,6 +12498,314 @@ mod tests {
     }
 
     #[test]
+    fn clef_residency_explicit_bf16_override_fails_loud_when_budget_denies() {
+        use crate::models::quant_dispatch::KQuantLayout;
+
+        let label = "clef_residency_explicit_bf16_override_fails_loud_when_budget_denies";
+        let exhausted = CudaDeviceBudget::from_limits_for_test(16 << 30, Some(0), false);
+        assert!(!exhausted.is_unlimited());
+        assert_eq!(exhausted.remaining_bytes(), 0);
+
+        // Case 1: Q8_0 (Affine 8-bit, g=32) unit denied under explicit CLEF_RESIDENCY=bf16.
+        let prefix = "layers.0.linear_attn.out_proj";
+        let Some(dense) = clef_dense_or_skip(label, 64, 128, 91) else {
+            return;
+        };
+        let mut before_q8 = HashMap::new();
+        insert_affine_group(&mut before_q8, prefix, &dense, 8, 32);
+        eval_param_map(&before_q8, label);
+        let q8_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before_q8
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let q8_default_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+
+        let mut params_q8 = before_q8.clone();
+        let mut plq_q8 = HashMap::new();
+        let err = apply_clef_residency_with_budget_and_override_for_test(
+            &mut params_q8,
+            &mut plq_q8,
+            q8_default_plq,
+            ClefResidency::Bf16,
+            &exhausted,
+            true,
+        )
+        .err()
+        .expect("explicit CLEF_RESIDENCY=bf16 must fail loud on Q8_0 when budget denies");
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("explicit CLEF_RESIDENCY=bf16"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(prefix),
+            "error must name denied unit prefix '{prefix}': {}",
+            err.reason
+        );
+        assert!(
+            plq_q8.is_empty(),
+            "denied bf16 override must not mutate per_layer_quant"
+        );
+        assert_eq!(params_q8.len(), before_q8.len());
+        assert_affine_untouched(&before_q8, &params_q8, prefix);
+        for (key, before_ptr) in &q8_ptrs {
+            assert_eq!(
+                params_q8[key].as_raw_ptr(),
+                *before_ptr,
+                "denied bf16 override must not reallocate '{key}'"
+            );
+        }
+
+        // Case 2: Q4_K (Tiled64) unit denied under explicit CLEF_RESIDENCY=bf16.
+        let mut before_q4k = HashMap::new();
+        let Some(q4k_plq) = insert_synthetic_kquant_group(
+            label,
+            &mut before_q4k,
+            prefix,
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            64,
+            256,
+            92,
+        ) else {
+            return;
+        };
+        let q4k_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before_q4k
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let mut params_q4k = before_q4k.clone();
+        let mut plq_q4k = HashMap::from([(prefix.to_string(), q4k_plq)]);
+        let plq_q4k_before = plq_q4k.clone();
+        let err = apply_clef_residency_with_budget_and_override_for_test(
+            &mut params_q4k,
+            &mut plq_q4k,
+            q8_default_plq,
+            ClefResidency::Bf16,
+            &exhausted,
+            true,
+        )
+        .err()
+        .expect("explicit CLEF_RESIDENCY=bf16 must fail loud on Q4_K when budget denies");
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("explicit CLEF_RESIDENCY=bf16"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(prefix),
+            "error must name denied unit prefix '{prefix}': {}",
+            err.reason
+        );
+        assert_eq!(plq_q4k, plq_q4k_before);
+        assert_eq!(params_q4k.len(), before_q4k.len());
+        assert_affine_untouched(&before_q4k, &params_q4k, prefix);
+        for (key, before_ptr) in &q4k_ptrs {
+            assert_eq!(
+                params_q4k[key].as_raw_ptr(),
+                *before_ptr,
+                "denied bf16 override on Q4_K must not reallocate '{key}'"
+            );
+        }
+    }
+
+    #[test]
+    fn clef_residency_explicit_sym8_override_fails_loud_when_budget_denies() {
+        use crate::models::quant_dispatch::KQuantLayout;
+
+        let label = "clef_residency_explicit_sym8_override_fails_loud_when_budget_denies";
+        let exhausted = CudaDeviceBudget::from_limits_for_test(16 << 30, Some(0), false);
+        assert!(!exhausted.is_unlimited());
+        assert_eq!(exhausted.remaining_bytes(), 0);
+        let prefix = "layers.0.linear_attn.out_proj";
+
+        // Case 1: Direct-CUDA Q8_0 unit (hits direct CUDA Sym8 budget denial when cuda_sym8_available).
+        let Some(dense_q8) = clef_dense_or_skip(label, 64, 128, 93) else {
+            return;
+        };
+        let mut before_q8 = HashMap::new();
+        insert_affine_group(&mut before_q8, prefix, &dense_q8, 8, 32);
+        eval_param_map(&before_q8, label);
+        let q8_plq = default_per_layer_quant(8, 32, PerLayerMode::Affine);
+        assert!(
+            try_cuda_direct_sym8_source(&before_q8, prefix, q8_plq)
+                .unwrap()
+                .is_some(),
+            "Q8_0 fixture must exercise the direct CUDA Sym8 path"
+        );
+        let q8_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before_q8
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let mut params_q8 = before_q8.clone();
+        let mut plq_q8 = HashMap::new();
+        let err = apply_clef_residency_with_budget_and_override_for_test(
+            &mut params_q8,
+            &mut plq_q8,
+            q8_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+            true,
+        )
+        .err()
+        .expect("explicit CLEF_RESIDENCY=sym8 must fail loud on Q8_0 when budget denies");
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("explicit CLEF_RESIDENCY=sym8"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(prefix),
+            "error must name denied unit prefix '{prefix}': {}",
+            err.reason
+        );
+        assert!(plq_q8.is_empty());
+        assert_eq!(params_q8.len(), before_q8.len());
+        assert_affine_untouched(&before_q8, &params_q8, prefix);
+        for (key, before_ptr) in &q8_ptrs {
+            assert_eq!(
+                params_q8[key].as_raw_ptr(),
+                *before_ptr,
+                "denied sym8 override on Q8_0 must not reallocate '{key}'"
+            );
+        }
+
+        // Case 2: Direct-CUDA Q4_K unit (Tiled64).
+        let mut before_q4k = HashMap::new();
+        let Some(q4k_plq) = insert_synthetic_kquant_group(
+            label,
+            &mut before_q4k,
+            prefix,
+            PerLayerMode::Q4K,
+            KQuantLayout::Tiled64,
+            64,
+            256,
+            94,
+        ) else {
+            return;
+        };
+        assert!(
+            try_cuda_direct_sym8_source(&before_q4k, prefix, q4k_plq)
+                .unwrap()
+                .is_some(),
+            "Q4_K fixture must exercise the direct CUDA Sym8 path"
+        );
+        let q4k_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before_q4k
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let mut params_q4k = before_q4k.clone();
+        let mut plq_q4k = HashMap::from([(prefix.to_string(), q4k_plq)]);
+        let plq_q4k_before = plq_q4k.clone();
+        let err = apply_clef_residency_with_budget_and_override_for_test(
+            &mut params_q4k,
+            &mut plq_q4k,
+            q8_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+            true,
+        )
+        .err()
+        .expect("explicit CLEF_RESIDENCY=sym8 must fail loud on Q4_K when budget denies");
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("explicit CLEF_RESIDENCY=sym8"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(prefix),
+            "error must name denied unit prefix '{prefix}': {}",
+            err.reason
+        );
+        assert_eq!(plq_q4k, plq_q4k_before);
+        assert_eq!(params_q4k.len(), before_q4k.len());
+        assert_affine_untouched(&before_q4k, &params_q4k, prefix);
+        for (key, before_ptr) in &q4k_ptrs {
+            assert_eq!(
+                params_q4k[key].as_raw_ptr(),
+                *before_ptr,
+                "denied sym8 override on Q4_K must not reallocate '{key}'"
+            );
+        }
+
+        // Case 3: Non-direct Affine 4-bit (Q4_0) unit (hits general budgeted denial path).
+        let Some(dense_q4) = clef_dense_or_skip(label, 64, 128, 95) else {
+            return;
+        };
+        let mut before_q4 = HashMap::new();
+        insert_affine_group(&mut before_q4, prefix, &dense_q4, 4, 32);
+        eval_param_map(&before_q4, label);
+        let q4_plq = default_per_layer_quant(4, 32, PerLayerMode::Affine);
+        assert!(
+            try_cuda_direct_sym8_source(&before_q4, prefix, q4_plq)
+                .unwrap()
+                .is_none(),
+            "Affine 4-bit fixture must exercise the general budgeted Sym8 path"
+        );
+        let q4_ptrs: HashMap<String, *mut mlx_sys::mlx_array> = before_q4
+            .iter()
+            .map(|(k, v)| (k.clone(), v.as_raw_ptr()))
+            .collect();
+        let mut params_q4 = before_q4.clone();
+        let mut plq_q4 = HashMap::new();
+        let err = apply_clef_residency_with_budget_and_override_for_test(
+            &mut params_q4,
+            &mut plq_q4,
+            q4_plq,
+            ClefResidency::Sym8,
+            &exhausted,
+            true,
+        )
+        .err()
+        .expect("explicit CLEF_RESIDENCY=sym8 must fail loud on Affine 4-bit when budget denies");
+        assert!(
+            err.reason.contains("CLEF discrete-GPU VRAM budget denied"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains("explicit CLEF_RESIDENCY=sym8"),
+            "unexpected error reason: {}",
+            err.reason
+        );
+        assert!(
+            err.reason.contains(prefix),
+            "error must name denied unit prefix '{prefix}': {}",
+            err.reason
+        );
+        assert!(plq_q4.is_empty());
+        assert_eq!(params_q4.len(), before_q4.len());
+        assert_affine_untouched(&before_q4, &params_q4, prefix);
+        for (key, before_ptr) in &q4_ptrs {
+            assert_eq!(
+                params_q4[key].as_raw_ptr(),
+                *before_ptr,
+                "denied sym8 override on Affine 4-bit must not reallocate '{key}'"
+            );
+        }
+    }
+
+    #[test]
     fn clef_residency_discrete_gpu_auto_selects_native_when_kquant_fits_but_sym8_overflows() {
         use crate::utils::gguf::{GgufFile, GgufMetaValue, GgufTensorInfo, GgufTensorType};
         use crate::utils::gguf_plan::{ImportPlan, OutputRole};
@@ -12372,7 +12874,143 @@ mod tests {
             Sym8
         );
 
-        // 6. Explicit CLEF_RESIDENCY override ALWAYS wins over discrete-GPU auto-selection.
+        // 6. Explicit CLEF_RESIDENCY override ALWAYS wins over discrete-GPU auto-selection
+        //    and records `explicit_override = true` only when active on this host.
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("sym8"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: Sym8,
+                explicit_override: true,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("native"),
+                Some(fit_9b_16gb),
+            ),
+            ResolvedClefResidency {
+                residency: NativeQuant,
+                explicit_override: true,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("NATIVE_QUANT"),
+                Some(fit_9b_16gb),
+            ),
+            ResolvedClefResidency {
+                residency: NativeQuant,
+                explicit_override: true,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("bf16"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: Bf16,
+                explicit_override: true,
+            }
+        );
+        // Unrecognized override (`bogus`), whitespace-only, ignored pre-Ampere `sym8`,
+        // non-CUDA, unquantized, and unset MUST keep `explicit_override = false`.
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("bogus"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: NativeQuant,
+                explicit_override: false,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(true, false, true, true, Some("bogus"), None),
+            ResolvedClefResidency {
+                residency: Sym8,
+                explicit_override: false,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                true,
+                Some("   "),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: NativeQuant,
+                explicit_override: false,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                false,
+                true,
+                false,
+                Some("sym8"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: Bf16,
+                explicit_override: false,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                true,
+                true,
+                false,
+                false,
+                Some("bf16"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: Sym8,
+                explicit_override: false,
+            }
+        );
+        assert_eq!(
+            resolve_clef_residency_for_load_detailed(
+                false,
+                false,
+                true,
+                true,
+                Some("bf16"),
+                Some(fit_27b_24gb),
+            ),
+            ResolvedClefResidency {
+                residency: Bf16,
+                explicit_override: false,
+            }
+        );
         assert_eq!(
             resolve_clef_residency_for_load(
                 true,
@@ -12972,6 +13610,7 @@ mod tests {
                 budget: Some(&exhausted),
                 pre_merge_device_bytes: None,
                 preserve_host_backed: false,
+                clef_explicit_override: false,
             },
         )
         .expect_err("partial checkpoint must hit completeness validation");
