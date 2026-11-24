@@ -41,6 +41,11 @@ export function presentUpdate(status: UpdateStatus, percent: number | null = nul
   }
 }
 
+/** True when running inside a packaged Microsoft Store (MSIX) container on Windows. */
+export function isWindowsStoreRuntime(proc: { platform?: string; windowsStore?: boolean } = process): boolean {
+  return proc.platform === 'win32' && proc.windowsStore === true;
+}
+
 /** Only signed, packaged stable builds participate in the public release feed. */
 export function canAutoUpdate(options: {
   packaged: boolean;
@@ -48,10 +53,12 @@ export function canAutoUpdate(options: {
   platform: string;
   arch: string;
   version: string;
+  windowsStore?: boolean;
 }): boolean {
   return (
     options.packaged &&
     options.enabled &&
+    options.windowsStore !== true &&
     options.platform === 'darwin' &&
     options.arch === 'arm64' &&
     STABLE_VERSION.test(options.version)
@@ -84,7 +91,7 @@ export interface DesktopUpdater {
   installOnQuit(completeQuit: CompleteQuit): boolean;
 }
 
-interface UpdateClient extends Pick<
+export interface UpdateClient extends Pick<
   AppUpdater,
   | 'quitAndInstall'
   | 'autoDownload'
@@ -100,6 +107,21 @@ interface UpdateClient extends Pick<
   on(event: 'update-not-available', listener: () => void): unknown;
   on(event: 'update-downloaded', listener: () => void): unknown;
   on(event: 'download-progress', listener: (progress: { percent: number }) => void): unknown;
+}
+
+/** No-op update client used on non-macOS hosts so `MacUpdater` is never constructed there. */
+export function createNoopUpdateClient(): UpdateClient {
+  return {
+    autoDownload: false,
+    autoInstallOnAppQuit: false,
+    autoRunAppAfterInstall: false,
+    allowPrerelease: false,
+    allowDowngrade: false,
+    isUpdateSupported: () => false,
+    checkForUpdates: () => Promise.resolve(null),
+    quitAndInstall: () => {},
+    on: () => {},
+  };
 }
 
 /** Electron is injected so download and shutdown races can be tested without a GUI. */

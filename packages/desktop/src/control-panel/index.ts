@@ -44,7 +44,15 @@ import {
 } from '@mlx-node/dashboard';
 
 import { createCliLauncher, runAgentUpdate, type DesktopCliConfig } from '../cli-launcher.js';
-import { firstClosing, LEDGER_DIR_ENV, onRuntimeLifecycle, pongOf, readAppEnds, readPing } from './lifecycle.js';
+import {
+  firstClosing,
+  LEDGER_DIR_ENV,
+  onRuntimeLifecycle,
+  pongOf,
+  readAppEnds,
+  readPing,
+  WINDOWS_STORE_ENV,
+} from './lifecycle.js';
 import { createControlPanelSession, type ControlPanelSession } from './session.js';
 import { CONTROL_PANEL_PROCESS_EXIT_CAP_MS, CONTROL_PANEL_WORKER_SHUTDOWN_STEP_MS } from './shutdown-timings.js';
 
@@ -134,9 +142,11 @@ function teardown(code: number): void {
     });
 }
 
-const cli = process.env.MLX_DESKTOP_CLI
-  ? createCliLauncher(JSON.parse(process.env.MLX_DESKTOP_CLI) as DesktopCliConfig)
-  : undefined;
+const windowsStore = process.env[WINDOWS_STORE_ENV] === '1';
+const cli =
+  !windowsStore && process.env.MLX_DESKTOP_CLI
+    ? createCliLauncher(JSON.parse(process.env.MLX_DESKTOP_CLI) as DesktopCliConfig)
+    : undefined;
 
 /** The Chat page's Install action: the app's own `mlx agent update`. */
 function agentInstaller(launcher: NonNullable<typeof cli>): () => Promise<void> {

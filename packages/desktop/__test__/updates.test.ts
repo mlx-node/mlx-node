@@ -6,7 +6,9 @@ import { createQuitHandler, type CompleteQuit } from '../src/main/quit.js';
 import {
   canAutoUpdate,
   createDesktopUpdater,
+  createNoopUpdateClient,
   isMacUpdateSupported,
+  isWindowsStoreRuntime,
   presentUpdate,
   UPDATE_INTERVAL_MS,
 } from '../src/main/updates.js';
@@ -53,6 +55,8 @@ describe('release update feed', () => {
     { packaged: false },
     { enabled: false },
     { platform: 'linux' },
+    { platform: 'win32' },
+    { windowsStore: true },
     { arch: 'x64' },
     { version: '0.0.14-rc.1' },
     { version: '0.0.14+local' },
@@ -60,6 +64,24 @@ describe('release update feed', () => {
     { version: '0.01.0' },
   ])('disables updates for an ineligible build: %j', (override) => {
     expect(canAutoUpdate({ ...release, ...override })).toBe(false);
+  });
+
+  it('detects Microsoft Store runtimes only on Windows with windowsStore enabled', () => {
+    expect(isWindowsStoreRuntime({ platform: 'win32', windowsStore: true })).toBe(true);
+    expect(isWindowsStoreRuntime({ platform: 'win32', windowsStore: false })).toBe(false);
+    expect(isWindowsStoreRuntime({ platform: 'win32' })).toBe(false);
+    expect(isWindowsStoreRuntime({ platform: 'darwin', windowsStore: true })).toBe(false);
+    expect(isWindowsStoreRuntime({ platform: 'linux', windowsStore: true })).toBe(false);
+  });
+
+  it('provides a no-op update client for non-macOS hosts', async () => {
+    const client = createNoopUpdateClient();
+    expect(client.autoDownload).toBe(false);
+    expect(client.autoInstallOnAppQuit).toBe(false);
+    expect(client.isUpdateSupported({ version: '0.0.14' } as never)).toBe(false);
+    await expect(client.checkForUpdates()).resolves.toBeNull();
+    expect(() => client.quitAndInstall()).not.toThrow();
+    expect(() => client.on('error', () => {})).not.toThrow();
   });
 });
 

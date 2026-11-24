@@ -32,17 +32,18 @@ export interface TrayActions {
 
 export interface TrayOptions {
   /**
-   * Path to `iconTemplate.png`. The `Template` suffix is what makes macOS treat
-   * it as a mask — black + alpha, recoloured for light/dark and inverted while
-   * the menu is open — and `iconTemplate@2x.png` beside it is picked up by name
-   * for Retina. {@link nativeImage.setTemplateImage} is set explicitly anyway,
+   * Path to the tray icon (`iconTemplate.png` on macOS, `icon.ico` on Windows).
+   * On macOS, the `Template` suffix makes the OS treat it as a mask — black +
+   * alpha, recoloured for light/dark and inverted while the menu is open — and
+   * `iconTemplate@2x.png` beside it is picked up by name for Retina.
+   * {@link nativeImage.setTemplateImage} is set explicitly on macOS anyway,
    * because the filename convention is silently lost if the file is ever renamed
    * during packaging.
    */
   iconPath: string;
   showInDock(): boolean;
-  appUpdate(): UpdatePresentation;
-  agentUpdate(): UpdatePresentation;
+  appUpdate(): UpdatePresentation | null;
+  agentUpdate(): UpdatePresentation | null;
   actions: TrayActions;
 }
 
@@ -52,6 +53,7 @@ export interface TrayController {
 }
 
 export function createTray(options: TrayOptions): TrayController {
+  const isDarwin = process.platform === 'darwin';
   const icon = nativeImage.createFromPath(options.iconPath);
   if (icon.isEmpty()) {
     // A tray built from an empty image is a menubar item with no icon and no
@@ -59,19 +61,65 @@ export function createTray(options: TrayOptions): TrayController {
     // line, because nothing else in the app will look wrong.
     console.error(`[mlx] tray icon missing or unreadable: ${options.iconPath}`);
   }
-  icon.setTemplateImage(true);
+  if (isDarwin) icon.setTemplateImage(true);
 
   // Held in the closure deliberately. A `Tray` that becomes unreachable is
   // garbage-collected and vanishes from the menubar — the single most common way
   // an Electron menubar app "randomly" loses its icon.
   const tray = new Tray(icon);
-  if (process.platform === 'darwin') tray.setIgnoreDoubleClickEvents(true);
+  if (isDarwin) tray.setIgnoreDoubleClickEvents(true);
+  if (process.platform === 'win32') {
+    tray.on('click', () => {
+      options.actions.openControlPanel();
+    });
+  }
 
   let rendered: string | null = null;
 
-  function render(presentation: TrayPresentation): void {
-    if (process.platform === 'darwin') tray.setTitle(presentation.title);
+  function render(
+    presentation: TrayPresentation,
+    appUpdate: UpdatePresentation | null,
+    agentUpdate: UpdatePresentation | null,
+  ): void {
+    if (isDarwin) tray.setTitle(presentation.title);
     tray.setToolTip(presentation.tooltip);
+
+    const dockItems: MenuItemConstructorOptions[] = isDarwin
+      ? [
+          { type: 'separator' },
+          {
+            label: 'Show in Dock',
+            type: 'checkbox',
+            checked: options.showInDock(),
+            click: (item) => {
+              options.actions.setShowInDock(item.checked);
+            },
+          },
+        ]
+      : [];
+
+    const updateItems: MenuItemConstructorOptions[] = [
+      ...(appUpdate === null
+        ? []
+        : [
+            {
+              ...appUpdate,
+              click: () => {
+                options.actions.updateApp();
+              },
+            },
+          ]),
+      ...(agentUpdate === null
+        ? []
+        : [
+            {
+              ...agentUpdate,
+              click: () => {
+                options.actions.updateAgent();
+              },
+            },
+          ]),
+    ];
 
     // Every `click` is wrapped rather than passed by reference: a method handed
     // straight to Electron is called with the menu item as `this`, and the
@@ -127,34 +175,15 @@ export function createTray(options: TrayOptions): TrayController {
           options.actions.restartInference();
         },
       },
+      ...dockItems,
+      ...(updateItems.length > 0 ? [{ type: 'separator' as const }, ...updateItems] : []),
       { type: 'separator' },
-      {
-        label: 'Show in Dock',
-        type: 'checkbox',
-        checked: options.showInDock(),
-        click: (item) => {
-          options.actions.setShowInDock(item.checked);
-        },
-      },
-      { type: 'separator' },
-      {
-        ...options.appUpdate(),
-        click: () => {
-          options.actions.updateApp();
-        },
-      },
-      {
-        ...options.agentUpdate(),
-        click: () => {
-          options.actions.updateAgent();
-        },
-      },
       // The accelerator is display-only on a tray menu, which is why an
       // application menu with the standard roles is also installed — see
       // `index.ts`.
       {
         label: 'Quit mlx-node',
-        accelerator: 'Command+Q',
+        ...(isDarwin ? { accelerator: 'Command+Q' } : {}),
         click: () => {
           options.actions.quit();
         },
@@ -168,13 +197,15 @@ export function createTray(options: TrayOptions): TrayController {
     update(snapshot: SupervisorSnapshot): void {
       if (tray.isDestroyed()) return;
       const presentation = presentTray(snapshot);
+      const appUpdate = options.appUpdate();
+      const agentUpdate = options.agentUpdate();
       // The supervisor emits a state event for every health poll and every
       // trace line. Rebuilding the menu closes it if it happens to be open, so
       // an unchanged presentation is not re-rendered.
-      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}|${JSON.stringify(options.appUpdate())}|${JSON.stringify(options.agentUpdate())}`;
+      const key = `${JSON.stringify(presentation)}|${String(options.showInDock())}|${JSON.stringify(appUpdate)}|${JSON.stringify(agentUpdate)}`;
       if (key === rendered) return;
       rendered = key;
-      render(presentation);
+      render(presentation, appUpdate, agentUpdate);
     },
     dispose(): void {
       if (!tray.isDestroyed()) tray.destroy();

@@ -88,17 +88,21 @@ export interface AppPaths {
   /** Per-generation `MLX_INFERENCE_TRACE_FILE` directory. Created by the supervisor. */
   traceDir: string;
   settingsFile: string;
-  /** The menubar icon. `iconTemplate@2x.png` sits beside it and `nativeImage` finds it by name. */
+  /** The menubar / system tray icon (`icon.ico` on Windows; `iconTemplate.png` elsewhere). */
   trayIcon: string;
+  /** The Control Panel window icon (`icon.ico` on Windows; `null` elsewhere where the OS uses the bundle icon). */
+  windowIcon: string | null;
   /** Preload for the Control Panel window. `.cjs`: a sandboxed preload cannot be ESM. */
   controlPanelPreload: string;
 }
 
 export function resolveAppPaths(layout: AppLayout): AppPaths {
   const { appPath, resourcesPath, packaged, userData } = layout;
-  const windowsArm64 = layout.platform === 'win32' && layout.arch === 'arm64';
+  const windows = layout.platform === 'win32';
+  const windowsArm64 = windows && layout.arch === 'arm64';
   const addon = windowsArm64 ? 'mlx-core.win32-arm64-msvc.node' : ADDON_FILE;
   const nativeAddon = packaged ? join(resourcesPath, 'native', addon) : join(appPath, '..', 'core', addon);
+  const windowsIcon = join(appPath, 'build', 'icon.ico');
   return {
     cliEntry: packaged
       ? join(appPath, 'node_modules', '@mlx-node', 'cli', 'dist', 'cli.js')
@@ -121,7 +125,8 @@ export function resolveAppPaths(layout: AppLayout): AppPaths {
     nativeRuntimeDir: packaged && windowsArm64 ? dirname(nativeAddon) : null,
     traceDir: join(userData, 'traces'),
     settingsFile: join(userData, 'settings.json'),
-    trayIcon: join(appPath, 'build', 'iconTemplate.png'),
+    trayIcon: windows ? windowsIcon : join(appPath, 'build', 'iconTemplate.png'),
+    windowIcon: windows ? windowsIcon : null,
     controlPanelPreload: join(appPath, 'dist', 'preload', 'index.cjs'),
   };
 }

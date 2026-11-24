@@ -138,6 +138,8 @@ export interface ChatThreadProps {
   keptFor?: string | null;
   /** Why the turn actions are off now (the engine is stopped). */
   actionDisabledReason?: string;
+  /** False hides the "Update the agent" turn action when in-app installation is unavailable. */
+  canInstallAgent?: boolean;
   /** One status sentence for the page's polite live region. */
   onStatus?: (sentence: string) => void;
   /** The message column: `useStickToBottom` follows its size. */
@@ -491,6 +493,7 @@ interface TurnViewProps {
   liveFrom: number;
   shownText: Map<number, string>;
   actionDisabledReason: string | undefined;
+  canInstallAgent: boolean;
   onTurnAction: ((action: TurnAction) => void) | undefined;
   keptFor: string | null;
   unload: UnloadControl | undefined;
@@ -528,6 +531,7 @@ function sameTurn(prev: TurnViewProps, next: TurnViewProps): boolean {
     prev.isLast === next.isLast &&
     prev.outcome?.text === next.outcome?.text &&
     prev.outcome?.detail === next.outcome?.detail &&
+    prev.outcome?.action === next.outcome?.action &&
     prev.outcome?.note?.text === next.outcome?.note?.text &&
     prev.outcome?.note?.action === next.outcome?.note?.action &&
     prev.unload === next.unload &&
@@ -539,6 +543,7 @@ function sameTurn(prev: TurnViewProps, next: TurnViewProps): boolean {
     prev.offscreen === next.offscreen &&
     prev.liveFrom === next.liveFrom &&
     prev.actionDisabledReason === next.actionDisabledReason &&
+    prev.canInstallAgent === next.canInstallAgent &&
     prev.onTurnAction === next.onTurnAction &&
     prev.keptFor === next.keptFor &&
     prev.turnMarks?.key === next.turnMarks?.key
@@ -855,7 +860,7 @@ const TurnView = memo(function TurnView(props: TurnViewProps): ReactElement {
           label: CHAT.continueAnswer,
           onSelect: () => onTurnAction({ kind: 'continue', text: CHAT.continuePrompt }),
         };
-      else if (outcome.action === 'update-agent')
+      else if (outcome.action === 'update-agent' && props.canInstallAgent)
         action = { label: CHAT.updateAgent, onSelect: () => onTurnAction({ kind: 'update-agent' }) };
     }
     items.push(
@@ -1326,6 +1331,7 @@ export function ChatThread(props: ChatThreadProps): ReactElement {
               liveFrom={liveFrom}
               shownText={shownText}
               actionDisabledReason={props.actionDisabledReason}
+              canInstallAgent={props.canInstallAgent !== false}
               onTurnAction={props.onTurnAction}
               keptFor={isLast ? (props.keptFor ?? null) : null}
               unload={isLast ? props.unload : undefined}

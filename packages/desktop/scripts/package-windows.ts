@@ -1,23 +1,27 @@
 /**
- * Build an unsigned, portable Windows ARM64 ZIP in packages/desktop/out.
+ * Build an unsigned, portable Windows ARM64 ZIP (and, for stable versions, an
+ * unsigned Microsoft Store ARM64 MSIX) in packages/desktop/out.
  *
  *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21
+ *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21 --skip-msix
  *
  * The ZIP contains mlx-node-win32-arm64/mlx-node.exe, the staged JS closure,
  * the addon, every CUDA/cuDNN/OpenBLAS runtime DLL, and the NVRTC headers.
- * Windows signing and automatic updates are deliberately not part of this path.
+ * Windows signing and automatic updates are deliberately not part of this path
+ * (Partner Center signs the MSIX during Microsoft Store ingestion).
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { cpSync, existsSync, mkdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { packager } from '@electron/packager';
 
 import { PayloadError } from './payload.js';
-import { assertSemver, windowsZipFileName } from './release-version.js';
+import { assertSemver, ReleaseVersionError, windowsMsixFileName, windowsZipFileName } from './release-version.js';
 import { stageApp } from './stage-app.js';
+import { buildWindowsMsix, type BuildWindowsMsixResult, verifyWindowsMsix } from './windows-msix.js';
 import { missingWindowsZipEntries, readPackagedWindowsApp, resolveWindowsPayload } from './windows-payload.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -35,6 +39,7 @@ if (process.platform !== 'win32' || process.arch !== 'arm64') {
   process.exit(1);
 }
 
+const skipMsix = process.argv.includes('--skip-msix');
 const manifestVersion = (await import(join(APP_DIR, 'package.json'), { with: { type: 'json' } })).default.version;
 const versionFlag = process.argv.indexOf('--app-version');
 if (versionFlag !== -1 && process.argv[versionFlag + 1] === undefined) {
@@ -45,6 +50,12 @@ const appVersion = assertSemver(
   versionFlag === -1 ? 'packages/desktop/package.json version' : '--app-version',
   versionFlag === -1 ? manifestVersion : process.argv[versionFlag + 1],
 );
+
+const iconPath = join(APP_DIR, 'build', 'icon.ico');
+if (!existsSync(iconPath) || statSync(iconPath).size === 0) {
+  console.error(`\nMissing or empty Windows app icon: ${iconPath}\n\n  run: yarn workspace @mlx-node/desktop icons\n`);
+  process.exit(1);
+}
 
 const payload = (() => {
   try {
@@ -78,6 +89,7 @@ const staged = stageApp({
   stageDir: STAGE_APP,
   roots: RUNTIME_ROOTS,
   autoUpdates: false,
+  platform: 'win32',
 });
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`staged ${payload.runtimeFiles.length - 1} native runtime DLLs`);
@@ -90,6 +102,7 @@ const [appPath] = await packager({
   arch: 'arm64',
   appVersion,
   executableName: PRODUCT_NAME,
+  icon: iconPath,
   overwrite: true,
   asar: false,
   extraResource: [stagedNative, payload.wwwRoot],
@@ -130,6 +143,38 @@ const missing = missingWindowsZipEntries(entries, appDirectoryName, packaged.run
 if (missing.length > 0) throw new Error(`Windows ZIP is missing required entries:\n${missing.join('\n')}`);
 
 rmSync(STAGE, { recursive: true, force: true });
+
+let msixResult: BuildWindowsMsixResult | null = null;
+if (skipMsix) {
+  console.log('skipping MSIX packaging (--skip-msix)');
+} else if (appVersion.includes('-') || appVersion.includes('+')) {
+  console.log(
+    `skipping MSIX packaging for non-stable version ${appVersion} (Microsoft Store requires stable MAJOR.MINOR.PATCH mapped to (MAJOR + 1).MINOR.PATCH.0)`,
+  );
+} else {
+  console.log('packaging Windows ARM64 MSIX…');
+  try {
+    msixResult = buildWindowsMsix({
+      appPath,
+      msixPath: join(OUT, windowsMsixFileName(appVersion)),
+      version: appVersion,
+      assetsDir: join(APP_DIR, 'build', 'msix'),
+    });
+    verifyWindowsMsix({
+      msixPath: msixResult.msixPath,
+      expectedVersion: appVersion,
+      runtimeFiles: packaged.runtimeFiles,
+      identity: msixResult.identity,
+    });
+  } catch (error) {
+    if (error instanceof PayloadError || error instanceof ReleaseVersionError) {
+      console.error(`\n${error.message}\n\n  ${error.remedy}\n`);
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
 const resultPath = join(OUT, 'windows-package-result.json');
 writeFileSync(
   resultPath,
@@ -137,6 +182,10 @@ writeFileSync(
     {
       appPath,
       zipPath,
+      msixPath: msixResult?.msixPath ?? null,
+      msixVersion: msixResult?.msixVersion ?? null,
+      msixIdentityName: msixResult?.identity.identityName ?? null,
+      msixPublisher: msixResult?.identity.publisher ?? null,
       version: appVersion,
       platform: 'win32',
       arch: 'arm64',
@@ -148,4 +197,6 @@ writeFileSync(
   )}\n`,
 );
 
-console.log(`\n${zipPath}\n\n  result: ${resultPath}\n`);
+console.log(`\n${zipPath}`);
+if (msixResult !== null) console.log(msixResult.msixPath);
+console.log(`\n  result: ${resultPath}\n`);

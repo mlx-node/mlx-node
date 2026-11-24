@@ -383,6 +383,8 @@ export interface ChatHostState {
     minTag: string;
     versionVerified: boolean;
     install: 'idle' | 'running' | 'failed';
+    /** False when in-app agent installation/updates are unavailable in this build. */
+    canInstall?: boolean;
   };
   modes: { chat: AgentModeState; work: AgentModeState };
   providers: {

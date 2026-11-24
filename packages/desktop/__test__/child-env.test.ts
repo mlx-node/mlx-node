@@ -13,7 +13,7 @@ import { extname } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { controlPanelEnvOverrides, sidecarEnvOverrides } from '../src/main/child-env.js';
+import { controlPanelEnvOverrides, sidecarEnvOverrides, WINDOWS_STORE_ENV } from '../src/main/child-env.js';
 import { resolveAppPaths } from '../src/main/paths.js';
 
 const ADDON = '/Applications/mlx-node.app/Contents/Resources/native/mlx-core.darwin-arm64.node';
@@ -82,6 +82,14 @@ describe('controlPanelEnvOverrides', () => {
       sidecarEnvOverrides({ nativeAddon: ADDON, modelsDir }).MLX_MODELS_DIR,
     );
     expect(controlPanelEnvOverrides({ modelsDir: null })).toEqual({});
+  });
+
+  it('propagates the Microsoft Store flag only when enabled', () => {
+    expect(controlPanelEnvOverrides({ modelsDir: null, windowsStore: true })).toEqual({
+      [WINDOWS_STORE_ENV]: '1',
+    });
+    expect(controlPanelEnvOverrides({ modelsDir: null, windowsStore: false })).toEqual({});
+    expect(controlPanelEnvOverrides({ modelsDir: '/models' })).not.toHaveProperty(WINDOWS_STORE_ENV);
   });
 });
 

@@ -72,7 +72,14 @@ import { createSupervisor, type Supervisor } from './supervisor/index.js';
 import { prepareExtraCaBundle, securityText } from './system-ca.js';
 import { claudeConnectCommand, codexConnectCommand } from './tray-view.js';
 import { createTray, type TrayController } from './tray.js';
-import { canAutoUpdate, createDesktopUpdater, presentUpdate, type DesktopUpdater } from './updates.js';
+import {
+  canAutoUpdate,
+  createDesktopUpdater,
+  createNoopUpdateClient,
+  isWindowsStoreRuntime,
+  presentUpdate,
+  type DesktopUpdater,
+} from './updates.js';
 import { createControlPanelWindowManager, type ControlPanelWindowManager } from './window.js';
 
 /** Coalescing window for settings writes. Long enough that a drag is one write. */
@@ -200,6 +207,9 @@ function wire(): void {
 }
 
 async function bootstrap(): Promise<void> {
+  const isDarwin = process.platform === 'darwin';
+  const windowsStore = isWindowsStoreRuntime();
+
   // Captured as well as passed: AppPaths derives per-file locations from it
   // but keeps no handle to the directory, and the CA bundle needs one.
   const userData = app.getPath('userData');
@@ -233,23 +243,32 @@ async function bootstrap(): Promise<void> {
   // carry the Edit key equivalents the Control Panel window needs — a text field with no
   // Cmd+C is the first thing a user notices. It also gives the Dock-visible mode
   // a real application menu instead of Electron's default.
+  const appSubmenu: MenuItemConstructorOptions[] = [
+    { role: 'about' },
+    ...(windowsStore
+      ? []
+      : [
+          { id: 'app-update', ...presentUpdate('disabled'), click: updateApp },
+          { id: 'agent-update', ...presentAgentUpdate('idle'), click: updateAgent },
+        ]),
+    ...(isDarwin
+      ? [
+          { type: 'separator' as const },
+          { role: 'services' as const },
+          { type: 'separator' as const },
+          { role: 'hide' as const },
+          { role: 'hideOthers' as const },
+          { role: 'unhide' as const },
+        ]
+      : []),
+    { type: 'separator' },
+    { role: 'quit' },
+  ];
   Menu.setApplicationMenu(
     Menu.buildFromTemplate([
       {
         label: app.name,
-        submenu: [
-          { role: 'about' },
-          { id: 'app-update', ...presentUpdate('disabled'), click: updateApp },
-          { id: 'agent-update', ...presentAgentUpdate('idle'), click: updateAgent },
-          { type: 'separator' },
-          { role: 'services' },
-          { type: 'separator' },
-          { role: 'hide' },
-          { role: 'hideOthers' },
-          { role: 'unhide' },
-          { type: 'separator' },
-          { role: 'quit' },
-        ],
+        submenu: appSubmenu,
       },
       { role: 'editMenu' },
       // Dev access is gated (menu-policy.ts): an unpackaged run or
@@ -277,7 +296,7 @@ async function bootstrap(): Promise<void> {
   // Packaging stamps this flag before signing. app.isPackaged alone also
   // accepts local unsigned bundles, which Squirrel cannot safely update.
   let autoUpdates = false;
-  if (app.isPackaged) {
+  if (app.isPackaged && !windowsStore) {
     try {
       const manifest = JSON.parse(await readFile(join(app.getAppPath(), 'package.json'), 'utf-8')) as {
         autoUpdates?: unknown;
@@ -295,9 +314,10 @@ async function bootstrap(): Promise<void> {
       platform: process.platform,
       arch: process.arch,
       version: app.getVersion(),
+      windowsStore,
     }),
-    native: new electronUpdater.MacUpdater(),
-    squirrel: autoUpdater,
+    native: isDarwin ? new electronUpdater.MacUpdater() : createNoopUpdateClient(),
+    squirrel: isDarwin ? autoUpdater : { on: () => {} },
     systemVersion: process.getSystemVersion(),
     onChange: refreshUpdates,
     requestQuit: () => app.quit(),
@@ -309,11 +329,15 @@ async function bootstrap(): Promise<void> {
   // `mlx agent update` in a utilityProcess — MAIN must never wait on the
   // network — and the downloaded binary lands in the managed cache
   // (~/.mlx-node/bin), which shadows the bundled one on the next launch.
-  agentUpdates = createAgentUpdater({
-    run: (args) => runAgentUpdateCli(paths?.cliEntry ?? '', args),
-    onChange: refreshAgentUpdates,
-    report: (error) => console.error('[mlx] agent update:', error),
-  });
+  // Disabled in Microsoft Store builds (Policy 10.2.2 / 10.2.5: no self-update
+  // or downloading external executable binaries).
+  agentUpdates = windowsStore
+    ? null
+    : createAgentUpdater({
+        run: (args) => runAgentUpdateCli(paths?.cliEntry ?? '', args),
+        onChange: refreshAgentUpdates,
+        report: (error) => console.error('[mlx] agent update:', error),
+      });
 
   supervisor = createSupervisor({
     entry: paths.sidecarEntry,
@@ -378,10 +402,14 @@ async function bootstrap(): Promise<void> {
     nativeRuntimeDir: paths.nativeRuntimeDir,
     modelsDir: settings.modelsDir,
   };
-  // Failure is surfaced on Coding Agents; command setup must not stop the app.
-  void createCliLauncher(cliConfig)
-    .prepare()
-    .catch((error: unknown) => console.error('[mlx] command setup:', error));
+  if (!windowsStore) {
+    // Failure is surfaced on Coding Agents; command setup must not stop the app.
+    // Skipped in Microsoft Store builds because `prepare()` runs `delegate --help`,
+    // which can trigger an external agent binary download.
+    void createCliLauncher(cliConfig)
+      .prepare()
+      .catch((error: unknown) => console.error('[mlx] command setup:', error));
+  }
 
   // Whole-operation deadline: on macOS each `security`/`plutil` call is
   // individually bounded (10 s), but up to four run sequentially inside the
@@ -425,7 +453,7 @@ async function bootstrap(): Promise<void> {
         // After `...process.env` on purpose: the bundle already MERGED any
         // inherited NODE_EXTRA_CA_CERTS, so this replaces rather than duplicates.
         ...(extraCaBundlePath === null ? {} : { NODE_EXTRA_CA_CERTS: extraCaBundlePath }),
-        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir, ledgerDir }),
+        ...controlPanelEnvOverrides({ modelsDir: settings.modelsDir, ledgerDir, windowsStore }),
         MLX_DESKTOP_CLI: JSON.stringify(cliConfig),
       } as Record<string, string>,
       onLog: (stream, line) => {
@@ -441,6 +469,7 @@ async function bootstrap(): Promise<void> {
 
   controlPanel = createControlPanelWindowManager({
     preload: paths.controlPanelPreload,
+    windowIcon: paths.windowIcon,
     bounds: () => settings.controlPanelWindow,
     workAreas: () => screen.getAllDisplays().map((display): Rect => display.workArea),
     isQuitting: () => quitting,
@@ -475,8 +504,10 @@ async function bootstrap(): Promise<void> {
   tray = createTray({
     iconPath: paths.trayIcon,
     showInDock: () => settings.showInDock,
-    appUpdate: () => presentUpdate(updates?.status() ?? 'disabled', updates?.progress()),
-    agentUpdate: () => presentAgentUpdate(agentUpdates?.status() ?? 'idle', agentUpdates?.latest() ?? null),
+    appUpdate: windowsStore ? () => null : () => presentUpdate(updates?.status() ?? 'disabled', updates?.progress()),
+    agentUpdate: windowsStore
+      ? () => null
+      : () => presentAgentUpdate(agentUpdates?.status() ?? 'idle', agentUpdates?.latest() ?? null),
     actions: {
       openControlPanel: () => controlPanel?.show(),
       startInference: () => {

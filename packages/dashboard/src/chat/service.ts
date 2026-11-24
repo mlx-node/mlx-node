@@ -1671,6 +1671,7 @@ export class ChatService {
       minTag: MLX_AGENT_MIN_RELEASE,
       versionVerified: 'failure' in launch ? false : launch.versionVerified,
       install: this.install,
+      canInstall: this.opts.installAgent !== undefined,
     };
   }
 }

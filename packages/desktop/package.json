@@ -22,7 +22,8 @@
     "package:windows": "oxnode scripts/package-windows.ts",
     "spike:electron": "electron spike/main.mjs",
     "spike:node": "node spike/workload.mjs",
-    "start": "electron ."
+    "start": "electron .",
+    "winget:manifests": "oxnode scripts/winget-manifest.ts"
   },
   "dependencies": {
     "@mlx-node/dashboard": "workspace:*",
