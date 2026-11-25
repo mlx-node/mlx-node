@@ -177,9 +177,67 @@ fn duplicate_images_count_once_for_cache_floor_but_once_per_request_for_concat()
     let a = key(10, [1, 1, 1]);
     let b = key(20, [1, 1, 1]);
     let requests = [request(a, 0, 1), request(a, 1, 1), request(b, 2, 1)];
+    // Each image is 1 * 8 * 2 = 16 raw bytes -> rounds up to 1 Metal page (16 KiB) individually,
+    // while the single concatenated output buffer (48 raw bytes) also fits in 1 Metal page.
     let (request_bytes, protected_bytes) = projected_vision_feature_bytes(&requests, 8, 2);
-    assert_eq!(request_bytes, 48, "concat contains A, A, and B");
-    assert_eq!(protected_bytes, 32, "cache stores only unique A and B");
+    assert_eq!(
+        request_bytes, METAL_ALLOC_PAGE_BYTES as u64,
+        "concat (A, A, B) is one buffer rounded up once to 16 KiB"
+    );
+    assert_eq!(
+        protected_bytes,
+        2 * METAL_ALLOC_PAGE_BYTES as u64,
+        "cache stores unique A and B as two separate 16 KiB buffers"
+    );
+
+    // Larger images where concat spans more pages than unique cache entries:
+    // Each image = 10000 raw bytes (1 page); 3 copies in concat = 30000 bytes (2 pages);
+    // 2 unique cached entries = 2 separate 1-page buffers (2 pages).
+    let (req_mid, prot_mid) = projected_vision_feature_bytes(&requests, 5000, 2);
+    assert_eq!(req_mid, 2 * METAL_ALLOC_PAGE_BYTES as u64);
+    assert_eq!(prot_mid, 2 * METAL_ALLOC_PAGE_BYTES as u64);
+
+    // Each image = 20000 raw bytes (2 pages = 32 KiB); 3 copies in concat = 60000 bytes (4 pages = 64 KiB);
+    // 2 unique cached entries = 2 * 2 pages = 4 pages (64 KiB);
+    // With 4 copies of A and 1 of B: concat = 100000 bytes (7 pages), unique = 2 * 2 = 4 pages.
+    let requests_5 = [
+        request(a, 0, 1),
+        request(a, 1, 1),
+        request(a, 2, 1),
+        request(a, 3, 1),
+        request(b, 4, 1),
+    ];
+    let (req_large, prot_large) = projected_vision_feature_bytes(&requests_5, 10_000, 2);
+    assert_eq!(
+        req_large,
+        7 * METAL_ALLOC_PAGE_BYTES as u64,
+        "single concat buffer of 100000 bytes rounds up to 7 Metal pages"
+    );
+    assert_eq!(
+        prot_large,
+        4 * METAL_ALLOC_PAGE_BYTES as u64,
+        "2 unique images of 20000 bytes each occupy 2 * 2 = 4 Metal pages"
+    );
+}
+
+#[test]
+fn vision_array_bytes_rounds_up_to_16kib_metal_pages() {
+    let page = METAL_ALLOC_PAGE_BYTES;
+    let empty = MxArray::zeros(&[0, 8], Some(DType::BFloat16)).unwrap();
+    assert_eq!(vision_array_bytes(&empty).unwrap(), 0);
+
+    let four_bytes = MxArray::zeros(&[1], Some(DType::Float32)).unwrap();
+    assert_eq!(vision_array_bytes(&four_bytes).unwrap(), page);
+
+    let exact_page = MxArray::zeros(&[4096], Some(DType::Float32)).unwrap();
+    assert_eq!(vision_array_bytes(&exact_page).unwrap(), page);
+
+    let page_plus_one = MxArray::zeros(&[page as i64 + 1], Some(DType::Uint8)).unwrap();
+    assert_eq!(vision_array_bytes(&page_plus_one).unwrap(), 2 * page);
+
+    // [5, 2048] BF16 = 20480 raw bytes -> rounds up to 32768 (2 pages).
+    let non_aligned_bf16 = MxArray::zeros(&[5, 2048], Some(DType::BFloat16)).unwrap();
+    assert_eq!(vision_array_bytes(&non_aligned_bf16).unwrap(), 2 * page);
 }
 
 #[test]

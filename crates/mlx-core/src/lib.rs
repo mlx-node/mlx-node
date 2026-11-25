@@ -57,6 +57,7 @@ pub mod training_state;
 pub mod transformer;
 pub mod utils;
 pub mod vision;
+pub use vision::{validate_image_bytes, validate_image_bytes_async};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]

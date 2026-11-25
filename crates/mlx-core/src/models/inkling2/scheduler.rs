@@ -18,11 +18,14 @@ use std::time::{Duration, Instant};
 use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::MxArray;
+use crate::disk_tier::state_disk::{Tick, copy_demand_bytes, instant_at, point_in_use};
+use crate::disk_tier::store::{Entry, EntryId, StateBytes, StateClass, StoreHit};
 use crate::engine::backend::ChatBackend;
 use crate::engine::cmd::ChatCmd;
 use crate::engine::governor::governor::{Governor, MemoryAccounts, ModelGuard};
 use crate::engine::governor::ledger::{
-    FreeOutcome, Reserves, Stage, Taken as LedgerTaken, UnitKey, UnitRuns, Victim, VictimQuery,
+    CertainReuse, FreeOutcome, Need, Reserves, Stage, TakeRights, Taken as LedgerTaken, UnitKey,
+    UnitRuns, Victim, VictimQuery, WantedChains,
 };
 use crate::engine::hybrid_scheduler::{
     DualLaneChatBarrier, HybridSchedulerBackend, HybridSchedulerState, HybridStepExecutor,
@@ -30,13 +33,11 @@ use crate::engine::hybrid_scheduler::{
     StepClaims, execute_dual_lane_chat_barrier,
 };
 use crate::engine::model_command::{FamilyCommand, ModelCommand};
-use crate::engine::scheduler::{MeasuredConfig, PreemptionMode, StepPlan};
+use crate::engine::scheduler::{
+    MeasuredConfig, PreemptionMode, StepPlan, is_paged_allocation_blocked,
+};
 use crate::engine::spec_paged::{SpecPagedCache, VerifyTicket};
 use crate::model_thread::ResponseTx;
-use crate::models::qwen3_5::dflash2_state::disk::{Tick, instant_at};
-use crate::models::qwen3_5::dflash2_state::store::{
-    Entry, EntryId, StateBytes, StateClass, StoreHit,
-};
 use crate::stream::{Stream, WiredResidency};
 use crate::transformer::paged_kv_cache_adapter::{
     ChainPrefetchStart, PagedKVCacheAdapter, RestoreUploadBudget, SeqId,
@@ -47,9 +48,9 @@ use super::memory::short_conv_state_bytes;
 use super::model::{Inkling2FlatCache, Inkling2Inner};
 use super::paged_forward::{Inkling2PagedRuntime, Inkling2PrefixState};
 use super::state_disk::{
-    BoundaryDraftWindow, Inkling2Restore, Inkling2RestorePhase, Inkling2StateAnchor,
-    ReclaimOutcome, install_anchor_swa_and_conv, planned_rolling_checkpoints, poll_restore_ticket,
-    start_global_chain_prefetch,
+    BoundaryDraftWindow, CaptureOptions, INKLING2_WRITE_BEHIND_MIN_TOKENS, Inkling2Restore,
+    Inkling2RestorePhase, Inkling2StateAnchor, ReclaimOutcome, install_anchor_swa_and_conv,
+    planned_rolling_checkpoints, poll_restore_ticket, start_global_chain_prefetch,
 };
 
 /// Family-specific commands routed to Inkling-2-Mini's dedicated model thread.
@@ -104,6 +105,7 @@ thread_local! {
 pub(crate) struct Inkling2OwnerState {
     pub cached_token_history: Vec<u32>,
     pub cached_image_key: Option<u64>,
+    pub cached_paged_image_token_positions: Vec<(u32, u64)>,
     pub flat_cache: Option<Inkling2FlatCache>,
     pub cuda_cache: Option<super::cuda_kv::Inkling2CudaCache>,
     pub cuda_dflash2_ctx: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
@@ -125,6 +127,8 @@ impl DualLaneChatBarrier for Inkling2Inner {
     fn prepare_ownerless_barrier(&mut self, _flat_lane: bool) {
         if let Some(rt) = self.paged.as_mut() {
             rt.active_seq = 0;
+            rt.cached_paged_image_token_positions.clear();
+            rt.seq_image_lineage.remove(&0);
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
@@ -151,12 +155,16 @@ impl DualLaneChatBarrier for Inkling2Inner {
         self.cuda_dspark_ctx = state.cuda_dspark_ctx;
         self.cached_token_history = state.cached_token_history;
         self.cached_image_key = state.cached_image_key;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.cached_paged_image_token_positions.clear();
+        }
     }
 
     fn capture_flat_owner_state(&mut self) -> Self::OwnerState {
         Inkling2OwnerState {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
+            cached_paged_image_token_positions: Vec::new(),
             flat_cache: self.flat_cache.take(),
             cuda_cache: self.cuda_cache.take(),
             cuda_dflash2_ctx: self.cuda_dflash2_ctx.take(),
@@ -165,17 +173,29 @@ impl DualLaneChatBarrier for Inkling2Inner {
     }
 
     fn install_paged_owner_state(&mut self, seq_id: SeqId, state: Self::OwnerState) {
-        if let Some(rt) = self.paged.as_mut() {
-            rt.active_seq = seq_id;
-        }
         self.cached_token_history = state.cached_token_history;
         self.cached_image_key = state.cached_image_key;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_seq = seq_id;
+            rt.cached_paged_image_token_positions = state.cached_paged_image_token_positions;
+            if let Some(key) = self.cached_image_key {
+                rt.seq_image_lineage
+                    .insert(seq_id, (key, rt.cached_paged_image_token_positions.clone()));
+            } else {
+                rt.seq_image_lineage.remove(&seq_id);
+            }
+        }
     }
 
     fn capture_paged_owner_state(&mut self) -> Self::OwnerState {
         Inkling2OwnerState {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
+            cached_paged_image_token_positions: self
+                .paged
+                .as_ref()
+                .map(|rt| rt.cached_paged_image_token_positions.clone())
+                .unwrap_or_default(),
             flat_cache: None,
             cuda_cache: None,
             cuda_dflash2_ctx: None,
@@ -186,15 +206,6 @@ impl DualLaneChatBarrier for Inkling2Inner {
     fn release_dead_paged_owner(&mut self, seq_id: SeqId) {
         let _ = self.release_scheduled_cache(seq_id);
     }
-}
-
-/// Returns `true` only when `err_msg` reports transient paged KV pool exhaustion
-/// (reclaimable by releasing idle owners or unmarking `StateStore` chains), never
-/// hard capacity exhaustion (`requested N tokens, ... capacity is C`) or unrelated errors.
-fn is_paged_allocation_blocked(err_msg: &str) -> bool {
-    err_msg.contains("could not reserve")
-        || err_msg.contains("are free or reclaimable")
-        || err_msg.contains("could allocate only")
 }
 
 /// Bounded wait budget when exclusive-turn reclaim has no non-SSD victims left and must wait
@@ -666,6 +677,96 @@ impl Inkling2Inner {
         }
     }
 
+    /// Current governor clock timestamp (`governor.now()`) for `WriteBehind`.
+    pub(crate) fn governor_now(&self) -> f64 {
+        self.memory_registration
+            .as_ref()
+            .map_or_else(crate::engine::governor::governor, ModelGuard::governor)
+            .now()
+    }
+
+    /// Reclaim the oldest **idle** Group 1 (SWA) owner for `active_seq` without touching
+    /// `StateStore` marks, ownerless `seq_id = 0`, or any actively running / `WaitingForSsd`
+    /// scheduled lane (`active_scheduled_seqs`). Works in both exclusive and scheduled modes.
+    fn try_reclaim_one_idle_swa_owner(&mut self, active_seq: SeqId) -> bool {
+        let victim = self.paged.as_ref().and_then(|rt| {
+            let swa = rt.coordinator.sliding_adapter()?;
+            let full = rt.coordinator.full_adapter();
+            swa.live_seq_ids()
+                .into_iter()
+                .filter(|&seq| {
+                    seq != active_seq
+                        && seq != 0
+                        && (rt.exclusive_turn_active || !rt.active_scheduled_seqs.contains(&seq))
+                })
+                .map(|seq| (full.turn_end_stamp(seq).unwrap_or(0), seq))
+                .min()
+                .map(|(_, seq)| seq)
+        });
+        let Some(victim) = victim else {
+            return false;
+        };
+        self.release_idle_owner_for_exclusive(victim, active_seq);
+        true
+    }
+
+    /// Proactively reclaim idle Group 1 (SWA) owners until `seq_id` has enough Group 1
+    /// free/evictable (or growable) blocks to advance to `target_total_tokens`, or no idle SWA
+    /// owners remain. Never touches active scheduled lanes (`active_scheduled_seqs`), `seq_id`
+    /// itself, ownerless `seq_id = 0`, or Global `StateStore` marks.
+    pub(crate) fn ensure_swa_headroom_for_total(
+        &mut self,
+        seq_id: SeqId,
+        target_total_tokens: u32,
+    ) {
+        loop {
+            let needs_reclaim = self.paged.as_mut().is_some_and(|rt| {
+                let Some(swa) = rt.coordinator.sliding_adapter_mut() else {
+                    return false;
+                };
+                let bs = swa.block_size();
+                if bs == 0 {
+                    return false;
+                }
+                let current_blocks = swa
+                    .block_table_for(seq_id)
+                    .map_or(0, |t| t.num_blocks() as u32);
+                let needed_blocks = target_total_tokens
+                    .div_ceil(bs)
+                    .saturating_sub(current_blocks);
+                if needed_blocks == 0 {
+                    return false;
+                }
+                let Ok(tel) = swa.block_telemetry() else {
+                    return false;
+                };
+                let avail = tel.free_blocks.saturating_add(tel.evictable_blocks);
+                if needed_blocks <= avail {
+                    return false;
+                }
+                // Preserve grow-before-reclaim when Group 1 is extent-backed.
+                if tel.total_blocks < tel.max_total_blocks {
+                    let shortfall = needed_blocks - avail;
+                    let _ = swa.try_grow_pool(shortfall);
+                    if let Ok(tel_after) = swa.block_telemetry()
+                        && needed_blocks
+                            <= tel_after
+                                .free_blocks
+                                .saturating_add(tel_after.evictable_blocks)
+                    {
+                        return false;
+                    }
+                }
+                let held_by_seq = swa.releasable_blocks_of(&[seq_id]).len() as u32;
+                let usable_max = tel.max_total_blocks.saturating_sub(1);
+                held_by_seq.saturating_add(needed_blocks) <= usable_max
+            });
+            if !needs_reclaim || !self.try_reclaim_one_idle_swa_owner(seq_id) {
+                break;
+            }
+        }
+    }
+
     /// Release idle owner `victim` across all KV groups + ShortConv + draft contexts, sync
     /// state marks, and re-activate `active_seq` on every KV group where `active_seq` is live
     /// (`release_request_for` clears the adapter's `active_seq` slot).
@@ -895,6 +996,7 @@ impl Inkling2Inner {
                 .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
             rt.active_seq = seq_id;
             rt.seq_reuse_cache.insert(seq_id, reuse_cache);
+            rt.seq_cache_salt.insert(seq_id, cache_salt);
             if !rt.coordinator.can_fit_logical_tokens(total_budget) {
                 let capacity = rt.coordinator.max_capacity_tokens();
                 return Err(Error::from_reason(format!(
@@ -933,11 +1035,13 @@ impl Inkling2Inner {
                 && let Some(boundary) =
                     self.install_state_hit_sync(seq_id, tokens, cache_salt, hit)?
             {
-                // StateStore restores target KV/ShortConv + staged `restored_draft_windows`,
+                // StateStore restores text-only target KV/ShortConv + staged
+                // `restored_draft_windows` (no DSpark draft KV or prior multimodal image lineage),
                 // so drop any stale draft context previously owned by `seq_id`.
                 self.dspark_turn_contexts.remove(&seq_id);
                 self.scheduled_dspark.seq_lanes.remove(&seq_id);
                 self.scheduled_dspark.sync_decode_limit();
+                self.clear_seq_image_lineage(seq_id);
                 return Ok(Inkling2PrefixState {
                     effective_cached_prefix_len: boundary,
                     suffix_len: tokens.len().saturating_sub(boundary),
@@ -953,12 +1057,14 @@ impl Inkling2Inner {
         self.dspark_turn_contexts.remove(&seq_id);
         self.scheduled_dspark.seq_lanes.remove(&seq_id);
         self.scheduled_dspark.sync_decode_limit();
+        self.clear_seq_image_lineage(seq_id);
         let rt = self
             .paged
             .as_mut()
             .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
         rt.reset_sequence(seq_id, &config)?;
         rt.seq_reuse_cache.insert(seq_id, reuse_cache);
+        rt.seq_cache_salt.insert(seq_id, cache_salt);
         Ok(Inkling2PrefixState {
             effective_cached_prefix_len: 0,
             suffix_len: tokens.len(),
@@ -1082,8 +1188,8 @@ impl Inkling2Inner {
 
         // Restore Group 1 (40 SWA visits) raw blocks + 48 ShortConv states.
         // Borrow `&anchor` across retries so `swa_data` (~82.5 MiB) is never deep-copied,
-        // and restrict reclaim to `SlidingOnly` so Global `StateStore` checkpoints/marks are
-        // never evicted for SWA-only pool pressure.
+        // and reclaim ONLY truly idle Group 1 SWA owners (never active scheduled lanes, never
+        // Global `StateStore` checkpoints/marks) in BOTH exclusive and scheduled modes.
         let geometry = {
             let rt = self
                 .paged
@@ -1102,71 +1208,50 @@ impl Inkling2Inner {
             .paged
             .as_ref()
             .is_some_and(|rt| rt.exclusive_turn_active);
-        if exclusive {
-            let swa_blocks_len = geometry.live_swa_blocks(depth) as usize;
-            let mut swa_reclaim_state = ExclusiveReclaimState::default();
-            loop {
-                let swa_res = {
-                    let rt = self
-                        .paged
-                        .as_mut()
-                        .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
-                    install_anchor_swa_and_conv(
-                        &mut rt.coordinator,
-                        &mut rt.conv_states,
-                        &geometry,
-                        seq_id,
-                        tokens,
-                        depth,
-                        &anchor,
-                    )
-                };
-                match swa_res {
-                    Ok(()) => break,
-                    Err(err) => {
-                        let can_retry = is_paged_allocation_blocked(&err.reason)
-                            && self.paged.as_ref().is_some_and(|rt| {
-                                rt.coordinator.can_fit_sliding_raw_blocks(swa_blocks_len)
-                            });
-                        if can_retry
-                            && self.try_reclaim_one_for_exclusive(
-                                seq_id,
-                                ExclusiveReclaimScope::SlidingOnly,
-                                &mut swa_reclaim_state,
-                                Some(hit.id),
-                            )
-                        {
-                            continue;
-                        }
-                        if let Some(rt) = self.paged.as_mut() {
-                            let _ = rt.coordinator.release_request_all(seq_id);
-                            rt.conv_states.remove(&seq_id);
-                        }
-                        tracing::warn!(
-                            "Inkling2 StateDisk SWA/ShortConv restore fell back to cold: {err}"
-                        );
-                        return Ok(None);
+        let swa_blocks_len = geometry.live_swa_blocks(depth) as usize;
+        loop {
+            let swa_res = {
+                let rt = self
+                    .paged
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
+                install_anchor_swa_and_conv(
+                    &mut rt.coordinator,
+                    &mut rt.conv_states,
+                    &geometry,
+                    seq_id,
+                    tokens,
+                    depth,
+                    &anchor,
+                )
+            };
+            match swa_res {
+                Ok(()) => break,
+                Err(err) => {
+                    let blocked = is_paged_allocation_blocked(&err.reason);
+                    let can_retry = blocked
+                        && self.paged.as_ref().is_some_and(|rt| {
+                            rt.coordinator.can_fit_sliding_raw_blocks(swa_blocks_len)
+                        });
+                    if can_retry && self.try_reclaim_one_idle_swa_owner(seq_id) {
+                        continue;
                     }
+                    let other_active_lanes = !exclusive
+                        && self.paged.as_ref().is_some_and(|rt| {
+                            rt.active_scheduled_seqs.iter().any(|&s| s != seq_id)
+                        });
+                    if let Some(rt) = self.paged.as_mut() {
+                        let _ = rt.coordinator.release_request_all(seq_id);
+                        rt.conv_states.remove(&seq_id);
+                    }
+                    if blocked && other_active_lanes {
+                        return Err(err);
+                    }
+                    tracing::warn!(
+                        "Inkling2 StateDisk SWA/ShortConv restore fell back to cold: {err}"
+                    );
+                    return Ok(None);
                 }
-            }
-        } else {
-            let rt = self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
-            if let Err(err) = install_anchor_swa_and_conv(
-                &mut rt.coordinator,
-                &mut rt.conv_states,
-                &geometry,
-                seq_id,
-                tokens,
-                depth,
-                &anchor,
-            ) {
-                let _ = rt.coordinator.release_request_all(seq_id);
-                rt.conv_states.remove(&seq_id);
-                tracing::warn!("Inkling2 StateDisk SWA/ShortConv restore fell back to cold: {err}");
-                return Ok(None);
             }
         }
 
@@ -1251,6 +1336,7 @@ impl Inkling2Inner {
                 window: complete_win,
             },
         );
+        self.clear_seq_image_lineage(seq_id);
         Ok(Some(hit.depth))
     }
 
@@ -1324,6 +1410,7 @@ impl Inkling2Inner {
                             prefix.reuse_cache = reuse_cache;
                             if let Some(rt) = self.paged.as_mut() {
                                 rt.seq_reuse_cache.insert(seq_id, reuse_cache);
+                                rt.seq_cache_salt.insert(seq_id, cache_salt);
                             }
                             return Ok(ScheduledPrefixAdmission::Ready(prefix));
                         }
@@ -1448,6 +1535,7 @@ impl Inkling2Inner {
         };
         if let Some(rt) = self.paged.as_mut() {
             rt.seq_reuse_cache.insert(seq_id, prefix.reuse_cache);
+            rt.seq_cache_salt.insert(seq_id, prefix.cache_salt);
         }
 
         Ok(Some(ScheduledRestoreResult {
@@ -1460,12 +1548,47 @@ impl Inkling2Inner {
         }))
     }
 
-    fn inkling2_victim_units(&self, query: &VictimQuery, _kept: &[u32]) -> UnitRuns {
-        #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-        enum StatePhase {
+    fn inkling2_kept_lookups<'a>(
+        kept: &'a [u32],
+        wanted: &'a WantedChains,
+        reuse: CertainReuse,
+    ) -> Vec<&'a [u32]> {
+        let mut lookups = vec![&kept[..kept.len().saturating_sub(1)]];
+        if reuse != CertainReuse::All {
+            lookups.extend(wanted.lookups());
+        }
+        lookups.retain(|lookup| !lookup.is_empty());
+        lookups
+    }
+
+    pub(crate) fn inkling2_victim_units(&self, query: &VictimQuery, kept: &[u32]) -> UnitRuns {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Write {
+            None,
+            ChainOwedRam,
+            Needed,
+            InFlight,
+            Chain,
+            UnwritableChain,
+        }
+
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Phase {
             Ahead,
             Merged,
             After,
+            InUse(u8),
+        }
+
+        struct StateUnit {
+            unit: Victim,
+            mark: Option<u64>,
+            kept: bool,
+            wanted: bool,
+            ordinary: bool,
+            checkpoint: bool,
+            write: Write,
+            phase: Phase,
         }
 
         let mut runs = UnitRuns::default();
@@ -1473,19 +1596,24 @@ impl Inkling2Inner {
             return runs;
         };
         let full = rt.coordinator.full_adapter();
+        let host_refused = query.need.host_refused;
+        let pages_only = host_refused && query.need.pages > 0;
+        let states_only = host_refused && query.need.pages == 0;
+        let keep_one = query.rights.reserves == Reserves::None;
+        let wanted = self
+            .memory_governor()
+            .map(|g| g.wanted_chains(self.memory_model()))
+            .unwrap_or_default();
 
-        // 1. Freeable empty pool extents & dead KV leaves first (byte-only reclaim —
-        //    `release_free_extents` / `release_cached_extent` shrink the pool rather than
-        //    freeing allocatable pages, so mixed claims with `need.pages > 0` must never
-        //    reclaim extents from the pool they need pages from). Empty extents
-        //    (`UnitKey::Extent`) are reclaimed before dead leaves and before evicting any
-        //    stored hybrid state.
-        let states_only = query.need.host_refused && query.need.pages == 0;
-        if !query.need.host_refused && query.need.bytes > 0 && query.need.pages == 0 {
-            let keep_one = query.rights.reserves == Reserves::None;
+        // 1. Freeable pool extents & dead KV leaves: byte-only claims only (`need.bytes > 0 &&
+        //    need.pages == 0 && !host_refused`), always with `pages: 0` because releasing extents
+        //    shrinks the pool rather than freeing allocatable pages inside it.
+        let mut extent = None;
+        let mut dead_leaves = None;
+        if !host_refused && query.need.bytes > 0 && query.need.pages == 0 {
             let free_bytes = full.free_extent_bytes(keep_one);
             if free_bytes > 0 {
-                runs.ahead.push(Victim {
+                extent = Some(Victim {
                     key: UnitKey::Extent,
                     stamp: 0,
                     bytes: free_bytes,
@@ -1494,12 +1622,13 @@ impl Inkling2Inner {
                     later: false,
                 });
             }
-            let bytes = full.cached_extent_bytes(keep_one, &[]);
-            if bytes > 0 {
-                runs.ahead.push(Victim {
+            let lookups = Self::inkling2_kept_lookups(kept, &wanted, query.rights.certain_reuse);
+            let cached_bytes = full.cached_extent_bytes(keep_one, &lookups);
+            if cached_bytes > 0 {
+                dead_leaves = Some(Victim {
                     key: UnitKey::DeadLeaves,
                     stamp: 0,
-                    bytes,
+                    bytes: cached_bytes,
                     pages: 0,
                     stage: Stage::FreeNow,
                     later: false,
@@ -1513,10 +1642,9 @@ impl Inkling2Inner {
         //     covering window go in `runs.merged` (`Stage::NeedsWrite`, `later: false`) so byte
         //     claims prefer reclaiming backed rings and `FreeNow` states before dropping an
         //     unbacked draft ring.
-        let pages_only = query.need.host_refused && query.need.pages > 0;
+        let mut parked_free: Vec<(u64, SeqId, u64)> = Vec::new();
+        let mut parked_unbacked: Vec<(u64, SeqId, u64)> = Vec::new();
         if query.need.bytes > 0 && !pages_only && !self.dspark_turn_contexts.is_empty() {
-            let mut parked_free: Vec<(u64, SeqId, u64)> = Vec::new();
-            let mut parked_unbacked: Vec<(u64, SeqId, u64)> = Vec::new();
             for (&seq_id, ctx) in &self.dspark_turn_contexts {
                 if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
                     continue;
@@ -1546,121 +1674,244 @@ impl Inkling2Inner {
                 }
             }
             parked_free.sort_by_key(|&(stamp, seq_id, _)| (stamp, seq_id));
-            for (stamp, seq_id, bytes) in parked_free {
-                runs.ahead.push(Victim {
+            parked_unbacked.sort_by_key(|&(stamp, seq_id, _)| (stamp, seq_id));
+        }
+
+        // 2. Stored hybrid states, mirroring Qwen3.5 `dflash2_turn::model_units`.
+        let store = &rt.state_store.store;
+        let disk_opt = rt.state_store.disk.as_ref();
+        let disk_writable = disk_opt.is_some_and(|d| d.writable());
+        let kept_prefix = &kept[..kept.len().saturating_sub(1)];
+        let state_bytes = |bytes: u64| if pages_only { 0 } else { bytes };
+
+        let mut all: Vec<StateUnit> = Vec::new();
+        for entry in store.entries() {
+            let in_use = store.in_use(entry.mark());
+            let checkpoint = entry.checkpoint() && !in_use;
+            let (write, bytes, marks) = match (entry.ram(), entry.disk()) {
+                (None, Some(c)) if c.chain_owed => {
+                    let w = if disk_writable {
+                        Write::Chain
+                    } else {
+                        Write::UnwritableChain
+                    };
+                    (w, 0, true)
+                }
+                (None, _) => continue,
+                (Some(_), Some(c)) if c.landed => {
+                    let durable =
+                        !c.chain_owed && disk_opt.is_some_and(|d| d.entry_disk_restorable(entry));
+                    if durable || !disk_writable || entry.checkpoint() {
+                        (Write::None, entry.state_bytes(), true)
+                    } else {
+                        // State blob already landed on SSD (`chain_owed` or not yet restorable):
+                        // does not consume the single state staging buffer, and an urgent claim
+                        // (`allow_wait == false`) discards & erases it immediately even while
+                        // another entry is writing.
+                        (Write::ChainOwedRam, entry.state_bytes(), true)
+                    }
+                }
+                (Some(_), Some(_)) => (Write::InFlight, entry.state_bytes(), false),
+                (Some(_), None)
+                    if disk_opt.is_some_and(|d| d.engine.reclaim_writes(store, entry.id())) =>
+                {
+                    (Write::Needed, entry.state_bytes(), true)
+                }
+                (Some(_), None) => (Write::None, entry.state_bytes(), true),
+            };
+            let key = if matches!(write, Write::Chain | Write::UnwritableChain) {
+                UnitKey::StoreChain(entry.id())
+            } else {
+                UnitKey::Store(entry.id())
+            };
+            let is_kept = !entry.tokens().is_empty() && kept_prefix.starts_with(entry.tokens());
+            all.push(StateUnit {
+                unit: Victim {
+                    key,
+                    stamp: entry.last_used(),
+                    bytes: state_bytes(bytes),
+                    pages: 0,
+                    stage: if in_use { Stage::InUse } else { Stage::FreeNow },
+                    later: false,
+                },
+                mark: marks.then(|| entry.mark()),
+                kept: is_kept,
+                wanted: wanted.keeps(entry.tokens()),
+                ordinary: !entry.checkpoint(),
+                checkpoint,
+                write,
+                phase: Phase::Merged,
+            });
+        }
+
+        // Splash `StateCache::resumePoint`: newest non-InUse ordinary state, else newest checkpoint.
+        let resume_point = {
+            let newest = |ordinary: bool| {
+                all.iter()
+                    .filter(|s| s.ordinary == ordinary && s.unit.stage != Stage::InUse)
+                    .max_by_key(|s| s.unit.stamp)
+                    .map(|s| s.unit.key.clone())
+            };
+            newest(true).or_else(|| newest(false))
+        };
+        let has_in_flight = all.iter().any(|s| s.write == Write::InFlight);
+        let reuse = query.rights.certain_reuse;
+        let mut states: Vec<StateUnit> = all
+            .into_iter()
+            .filter(|state| {
+                !state.kept
+                    && (reuse == CertainReuse::All || !state.wanted)
+                    && (reuse != CertainReuse::None
+                        || resume_point.as_ref() != Some(&state.unit.key))
+                    && !(pages_only && state.checkpoint)
+            })
+            .collect();
+
+        states.sort_by_key(|state| state.unit.stamp);
+        let busy = has_in_flight || disk_opt.is_some_and(|d| d.writing() || d.has_read_waiters());
+        let staged = (!busy)
+            .then(|| {
+                let writes = |in_use: bool, checkpoint: Option<bool>| {
+                    states.iter().position(|state| {
+                        state.write == Write::Needed
+                            && (state.unit.stage == Stage::InUse) == in_use
+                            && checkpoint.is_none_or(|cp| state.checkpoint == cp)
+                    })
+                };
+                writes(false, Some(true))
+                    .or_else(|| writes(false, Some(false)))
+                    .or_else(|| query.rights.in_use.then(|| writes(true, None)).flatten())
+            })
+            .flatten();
+
+        for (index, state) in states.iter_mut().enumerate() {
+            match state.write {
+                Write::UnwritableChain => {
+                    state.unit.stage = Stage::FreeNow;
+                    state.unit.later = false;
+                    state.phase = Phase::Ahead;
+                }
+                Write::Chain => {
+                    if state.unit.stage != Stage::InUse {
+                        state.unit.stage = Stage::NeedsWrite;
+                    }
+                    state.unit.later = true;
+                    state.phase = Phase::After;
+                }
+                Write::None | Write::ChainOwedRam | Write::Needed | Write::InFlight => {
+                    let later = match state.write {
+                        Write::None | Write::ChainOwedRam => false,
+                        Write::Needed => staged != Some(index),
+                        Write::InFlight => true,
+                        Write::Chain | Write::UnwritableChain => unreachable!(),
+                    };
+                    if state.write != Write::None && state.unit.stage != Stage::InUse {
+                        state.unit.stage = Stage::NeedsWrite;
+                    }
+                    state.unit.later = later;
+                    state.phase = match (state.unit.stage, state.write) {
+                        (Stage::InUse, Write::None) => Phase::InUse(0),
+                        (Stage::InUse, _) if !state.unit.later => Phase::InUse(1),
+                        (Stage::InUse, _) => Phase::InUse(2),
+                        _ if state.checkpoint => Phase::Ahead,
+                        _ => Phase::Merged,
+                    };
+                }
+            }
+        }
+
+        // Order units in Splash's phase order (`Extent -> Checkpoints/UnwritableChain -> DeadLeaves
+        // -> backed DraftContext -> Ordinary & unbacked DraftContext -> Chain -> InUse(0..3)`),
+        // then stable-sort into exact take order `(stage, later)` BEFORE computing non-overcounted
+        // `freed_by_marks`.
+        let mut listed: Vec<(Victim, Option<u64>, Phase)> = Vec::new();
+        listed.extend(extent.map(|u| (u, None, Phase::Ahead)));
+        listed.extend(
+            states
+                .iter()
+                .filter(|s| s.phase == Phase::Ahead)
+                .map(|s| (s.unit.clone(), s.mark, Phase::Ahead)),
+        );
+        listed.extend(dead_leaves.map(|u| (u, None, Phase::Ahead)));
+        listed.extend(parked_free.into_iter().map(|(stamp, seq_id, bytes)| {
+            (
+                Victim {
                     key: UnitKey::DraftContext(seq_id),
                     stamp,
                     bytes,
                     pages: 0,
                     stage: Stage::FreeNow,
                     later: false,
-                });
-            }
-            parked_unbacked.sort_by_key(|&(stamp, seq_id, _)| (stamp, seq_id));
-            for (stamp, seq_id, bytes) in parked_unbacked {
-                runs.merged.push(Victim {
+                },
+                None,
+                Phase::Ahead,
+            )
+        }));
+        listed.extend(
+            states
+                .iter()
+                .filter(|s| s.phase == Phase::Merged)
+                .map(|s| (s.unit.clone(), s.mark, Phase::Merged)),
+        );
+        listed.extend(parked_unbacked.into_iter().map(|(stamp, seq_id, bytes)| {
+            (
+                Victim {
                     key: UnitKey::DraftContext(seq_id),
                     stamp,
                     bytes,
                     pages: 0,
                     stage: Stage::NeedsWrite,
                     later: false,
-                });
-            }
-        }
-
-        // 2. Stored hybrid states: disposable `StateClass::Checkpoint` go in `ahead` (evicted first),
-        //    `StateClass::Ordinary` go in `merged` sorted by shared `CacheRecency` stamp, and
-        //    disk-only `chain_owed` states go in `after` as `UnitKey::StoreChain`.
-        //    Each marking entry is emitted ONCE so neither bytes nor KV pages are double-counted,
-        //    and reclaimable `pages` are derived in exact take order via `full.freed_by_marks`.
-        let disk_writable = rt.state_store.disk.as_ref().is_some_and(|d| d.writable());
-        let mut states: Vec<(Victim, u64, StatePhase)> = Vec::new();
-        for entry in rt.state_store.store.entries() {
-            if entry.ram().is_none() {
-                if entry.disk().is_some_and(|c| c.chain_owed) {
-                    let (stage, later, phase) = if disk_writable {
-                        (Stage::NeedsWrite, true, StatePhase::After)
-                    } else {
-                        // Writer stopped accepting tracked writes: taking `StoreChain(id)`
-                        // retires this incomplete disk-only entry synchronously without waiting
-                        // on any write, freeing its pinned Global KV pages immediately.
-                        (Stage::FreeNow, false, StatePhase::Ahead)
-                    };
-                    states.push((
-                        Victim {
-                            key: UnitKey::StoreChain(entry.id()),
-                            stamp: entry.last_used(),
-                            bytes: 0,
-                            pages: 0,
-                            stage,
-                            later,
-                        },
-                        entry.mark(),
-                        phase,
-                    ));
-                }
-                continue;
-            }
-            let has_durable_disk = entry.disk().is_some_and(|c| c.landed && !c.chain_owed)
-                && rt
-                    .state_store
-                    .disk
-                    .as_ref()
-                    .is_some_and(|d| d.entry_disk_restorable(entry));
-            let needs_write = !has_durable_disk && disk_writable;
-            let victim = Victim {
-                key: UnitKey::Store(entry.id()),
-                stamp: entry.last_used(),
-                bytes: entry.state_bytes(),
-                pages: 0,
-                stage: if entry.checkpoint() {
-                    Stage::FreeNow
-                } else if needs_write {
-                    Stage::NeedsWrite
-                } else {
-                    Stage::FreeNow
                 },
-                later: false,
-            };
-            let phase = if entry.checkpoint() {
-                StatePhase::Ahead
-            } else {
-                StatePhase::Merged
-            };
-            states.push((victim, entry.mark(), phase));
+                None,
+                Phase::Merged,
+            )
+        }));
+        listed.extend(
+            states
+                .iter()
+                .filter(|s| s.phase == Phase::After)
+                .map(|s| (s.unit.clone(), s.mark, Phase::After)),
+        );
+        for group in 0..3 {
+            listed.extend(
+                states
+                    .iter()
+                    .filter(|s| s.phase == Phase::InUse(group))
+                    .map(|s| (s.unit.clone(), s.mark, Phase::After)),
+            );
         }
+        listed.retain(|(unit, mark, _)| unit.bytes > 0 || unit.pages > 0 || mark.is_some());
+        listed.sort_by_key(|(unit, _, _)| (unit.stage, unit.later));
 
-        // Sort into exact take order before computing allocator-reclaimable KV pages so shared
-        // ancestor blocks are credited once to the last listed mark that pins them, and blocks
-        // held by live sequences or unlisted marks are excluded.
-        states.sort_by_key(|(unit, _, phase)| (unit.stage, unit.later, *phase, unit.stamp));
-        if !states_only && !states.is_empty() {
-            let marks: Vec<u64> = states.iter().map(|(_, mark, _)| *mark).collect();
-            for ((unit, _, _), pages) in states.iter_mut().zip(full.freed_by_marks(&marks)) {
-                unit.pages = pages;
+        if !states_only {
+            let marked: Vec<usize> = (0..listed.len())
+                .filter(|&idx| listed[idx].1.is_some())
+                .collect();
+            let marks: Vec<u64> = marked.iter().filter_map(|&idx| listed[idx].1).collect();
+            for (idx, pages) in marked.into_iter().zip(full.freed_by_marks(&marks)) {
+                listed[idx].0.pages = pages;
             }
         }
-        for (unit, _, phase) in states {
+
+        for (unit, _, phase) in listed {
             if unit.bytes == 0 && unit.pages == 0 {
                 continue;
             }
             match phase {
-                StatePhase::Ahead => runs.ahead.push(unit),
-                StatePhase::Merged => runs.merged.push(unit),
-                StatePhase::After => runs.after.push(unit),
+                Phase::Ahead => runs.ahead.push(unit),
+                Phase::Merged => runs.merged.push(unit),
+                Phase::After | Phase::InUse(_) => runs.after.push(unit),
             }
         }
-        runs.ahead.sort_by_key(|v| (v.stage, v.stamp));
-        runs.merged.sort_by_key(|v| (v.stage, v.stamp));
-        runs.after.sort_by_key(|v| (v.stage, v.later, v.stamp));
         runs
     }
 
-    pub(super) fn inkling2_take_victim(
+    pub(crate) fn inkling2_take_victim(
         &mut self,
         query: &VictimQuery,
         victim: &Victim,
+        kept: &[u32],
     ) -> LedgerTaken {
         if let UnitKey::DraftContext(seq_id) = victim.key {
             if self.paged.is_none()
@@ -1690,15 +1941,19 @@ impl Inkling2Inner {
                 pages: 0,
             };
         }
+        let wanted = self
+            .memory_governor()
+            .map(|g| g.wanted_chains(self.memory_model()))
+            .unwrap_or_default();
         let Some(rt) = self.paged.as_mut() else {
             return LedgerTaken::default();
         };
+        let keep_one = query.rights.reserves == Reserves::None;
         match victim.key {
             UnitKey::Extent => {
                 if query.need.pages > 0 {
                     return LedgerTaken::default();
                 }
-                let keep_one = query.rights.reserves == Reserves::None;
                 let pool_bytes = rt
                     .coordinator
                     .full_adapter_mut()
@@ -1718,11 +1973,12 @@ impl Inkling2Inner {
                 if query.need.pages > 0 {
                     return LedgerTaken::default();
                 }
-                let keep_one = query.rights.reserves == Reserves::None;
+                let lookups =
+                    Self::inkling2_kept_lookups(kept, &wanted, query.rights.certain_reuse);
                 let pool_bytes = rt
                     .coordinator
                     .full_adapter_mut()
-                    .release_cached_extent(keep_one, &[]);
+                    .release_cached_extent(keep_one, &lookups);
                 if pool_bytes > 0 {
                     LedgerTaken {
                         outcome: FreeOutcome::Met,
@@ -1735,6 +1991,7 @@ impl Inkling2Inner {
                 }
             }
             UnitKey::Store(id) => {
+                let active_before = crate::array::memory::active_memory_bytes();
                 let takeable_before = rt.coordinator.full_adapter().takeable_blocks();
                 let host_before = rt.state_store.host_resident_bytes();
                 let (had_ram, exclusive_ram, lineage) = match rt.state_store.store.get(id) {
@@ -1760,10 +2017,12 @@ impl Inkling2Inner {
                             .full_adapter()
                             .takeable_blocks()
                             .saturating_sub(takeable_before);
+                        let active_freed = active_before
+                            .saturating_sub(crate::array::memory::active_memory_bytes());
                         let host_freed =
                             host_before.saturating_sub(rt.state_store.host_resident_bytes());
                         let now_bytes = if had_ram {
-                            exclusive_ram.min(host_freed)
+                            exclusive_ram.min(host_freed).saturating_add(active_freed)
                         } else {
                             0
                         };
@@ -1785,10 +2044,15 @@ impl Inkling2Inner {
                             .full_adapter()
                             .takeable_blocks()
                             .saturating_sub(takeable_before);
+                        let active_freed = active_before
+                            .saturating_sub(crate::array::memory::active_memory_bytes());
                         let host_freed =
                             host_before.saturating_sub(rt.state_store.host_resident_bytes());
                         let now_bytes = if had_ram && erased {
-                            exclusive_ram.saturating_add(lineage).min(host_freed)
+                            exclusive_ram
+                                .saturating_add(lineage)
+                                .min(host_freed)
+                                .saturating_add(active_freed)
                         } else {
                             0
                         };
@@ -1826,6 +2090,8 @@ impl Inkling2Inner {
                                     .get(id)
                                     .is_none_or(|e| e.ram().is_none());
                             if pages > 0 || ram_gone {
+                                let active_freed = active_before
+                                    .saturating_sub(crate::array::memory::active_memory_bytes());
                                 let host_freed = host_before
                                     .saturating_sub(rt.state_store.host_resident_bytes());
                                 let erased = rt.state_store.store.get(id).is_none();
@@ -1835,7 +2101,7 @@ impl Inkling2Inner {
                                     exclusive_ram
                                 };
                                 let now_bytes = if ram_gone {
-                                    expected.min(host_freed)
+                                    expected.min(host_freed).saturating_add(active_freed)
                                 } else {
                                     0
                                 };
@@ -1897,6 +2163,44 @@ impl Inkling2Inner {
             }
             _ => LedgerTaken::default(),
         }
+    }
+
+    /// Splash `WriteBehind::demanded` for temporary SSD tiers: whether copy demand exceeds what
+    /// immediately freeable units + in-flight copies ahead already cover.
+    fn inkling2_write_behind_demanded(&self, demand_bytes: u64) -> bool {
+        let mut covered = self
+            .paged
+            .as_ref()
+            .and_then(|rt| {
+                rt.state_store
+                    .disk
+                    .as_ref()
+                    .map(|d| d.engine.copying_ahead_bytes(&rt.state_store.store))
+            })
+            .unwrap_or(0);
+        if covered >= demand_bytes {
+            return false;
+        }
+        let query = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                ..TakeRights::default()
+            },
+            need: Need {
+                bytes: demand_bytes,
+                ..Need::default()
+            },
+        };
+        for unit in self.inkling2_victim_units(&query, &[]).into_units() {
+            if unit.later || matches!(unit.stage, Stage::Rebuild | Stage::InUse) {
+                continue;
+            }
+            covered = covered.saturating_add(unit.bytes);
+            if covered >= demand_bytes {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -2014,22 +2318,170 @@ impl HybridSchedulerBackend for Inkling2Inner {
         }
     }
 
+    fn set_active_scheduled_seqs(&mut self, active: &[SeqId]) {
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.clear();
+            rt.active_scheduled_seqs.extend(active.iter().copied());
+        }
+    }
+
     fn tick_state_disk(&mut self, tick: Tick) -> bool {
-        let Some(rt) = self.paged.as_mut() else {
+        if self
+            .paged
+            .as_ref()
+            .is_none_or(|rt| rt.state_store.disk.is_none())
+        {
             return false;
+        }
+        let mut progressed = {
+            let Some(rt) = self.paged.as_mut() else {
+                return false;
+            };
+            rt.state_store.tick(&rt.coordinator, tick)
         };
-        rt.state_store.tick(&rt.coordinator, tick)
+        if let Tick::Full { command_pages } = tick {
+            let governor = self
+                .memory_registration
+                .as_ref()
+                .map_or_else(crate::engine::governor::governor, ModelGuard::governor);
+            let now = governor.now();
+            let (page_bytes, persistent, read_waiting) = match self.paged.as_ref() {
+                Some(rt) => (
+                    rt.coordinator.full_adapter().bytes_per_block().unwrap_or(0),
+                    rt.state_store
+                        .disk
+                        .as_ref()
+                        .is_some_and(|d| d.tier.persistent),
+                    rt.state_store
+                        .disk
+                        .as_ref()
+                        .is_some_and(|d| d.has_read_waiters()),
+                ),
+                None => (0, false, false),
+            };
+            let demand = copy_demand_bytes(governor, now, command_pages, page_bytes);
+            let claim_waiting = governor.ledger(|l| l.claim_waiting()) || read_waiting;
+            let taken_wb = self
+                .paged
+                .as_mut()
+                .and_then(|rt| rt.state_store.disk.as_mut())
+                .map(|disk| std::mem::take(&mut disk.write_behind));
+            if let Some(mut behind) = taken_wb {
+                let settled = behind.step(
+                    self,
+                    now,
+                    demand,
+                    claim_waiting,
+                    persistent,
+                    |inner, id| {
+                        inner
+                            .paged
+                            .as_ref()
+                            .is_some_and(|rt| point_in_use(&rt.state_store.store, persistent, id))
+                    },
+                    |inner, bytes| inner.inkling2_write_behind_demanded(bytes),
+                    |inner, id, head| {
+                        let Some(rt) = inner.paged.as_mut() else {
+                            return crate::disk_tier::state_disk::PersistStatus::Refused;
+                        };
+                        rt.state_store.persist_entry(&rt.coordinator, id, head)
+                    },
+                );
+                if let Some(disk) = self
+                    .paged
+                    .as_mut()
+                    .and_then(|rt| rt.state_store.disk.as_mut())
+                {
+                    disk.write_behind = behind;
+                }
+                progressed |= settled;
+            }
+            if let Some(guard) = self.memory_registration.as_ref() {
+                let wakeup = self.paged.as_ref().and_then(|rt| {
+                    let disk = rt.state_store.disk.as_ref()?;
+                    disk.write_behind
+                        .next_wakeup(&rt.state_store.store, disk.tier.persistent)
+                });
+                crate::engine::governor::monitor::set_next_wakeup(guard.model_id(), wakeup);
+            }
+        }
+        let pages = self.paged.as_ref().map_or(0, |rt| {
+            rt.state_store.disk.as_ref().map_or(0, |disk| {
+                disk.engine
+                    .landing_pages(&rt.state_store.store, Some(rt.coordinator.full_adapter()))
+            })
+        });
+        let changed = self
+            .paged
+            .as_mut()
+            .and_then(|rt| rt.state_store.disk.as_mut())
+            .is_some_and(|disk| std::mem::replace(&mut disk.published_landing, pages) != pages);
+        if let Some(guard) = self.memory_registration.as_ref() {
+            let governor = guard.governor();
+            if changed {
+                governor.publish_landing_pages(guard.model_id(), pages);
+            }
+            if progressed {
+                governor.signal_progress(guard.model_id());
+            }
+        }
+        progressed
     }
 
     fn victim_units(&self, query: &VictimQuery, kept: &[u32]) -> UnitRuns {
         self.inkling2_victim_units(query, kept)
     }
 
-    fn take_victim(&mut self, query: &VictimQuery, victim: &Victim, _kept: &[u32]) -> LedgerTaken {
-        self.inkling2_take_victim(query, victim)
+    fn take_victim(&mut self, query: &VictimQuery, victim: &Victim, kept: &[u32]) -> LedgerTaken {
+        self.inkling2_take_victim(query, victim, kept)
     }
 
     fn claim_step_rows(state: &mut HybridSchedulerState<Self>, plan: &StepPlan) -> StepClaims {
+        // Refresh `active_scheduled_seqs` with every planned row before step-level SWA reclaim
+        // (newly admitted waiting/running/SSD-parked lanes are also registered on prefix
+        // admission and cleared on turn close/preempt/release).
+        if let Some(rt) = state.inner.paged.as_mut() {
+            for row in &plan.rows {
+                rt.active_scheduled_seqs.insert(row.seq_id);
+            }
+        }
+        // Proactively reclaim idle Group 1 (SWA) owners for planned rows BEFORE
+        // `claim_rows_in_order` (which only inspects Group 0) or `run_scheduled_prefill_pass`
+        // starts committing sub-slice 0.
+        for row in &plan.rows {
+            if row.cancel_snapshot {
+                continue;
+            }
+            let target_total = match row.kind {
+                crate::engine::scheduler::StepKind::Prefill => {
+                    row.token_start.saturating_add(row.num_tokens)
+                }
+                crate::engine::scheduler::StepKind::Decode => {
+                    let cur = state
+                        .inner
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.coordinator.request_token_count_all(row.seq_id).ok())
+                        .unwrap_or(row.token_start);
+                    let lookahead = if state
+                        .inner
+                        .scheduled_dspark
+                        .seq_lanes
+                        .contains_key(&row.seq_id)
+                    {
+                        u32::try_from(state.inner.active_draft_block_size().unwrap_or(0))
+                            .unwrap_or(0)
+                            .saturating_add(1)
+                    } else {
+                        row.num_tokens.max(1)
+                    };
+                    cur.saturating_add(lookahead)
+                }
+            };
+            state
+                .inner
+                .ensure_swa_headroom_for_total(row.seq_id, target_total);
+        }
         if state.inner.reclaims_in_order() {
             state.claim_rows_in_order(plan)
         } else {
@@ -2084,6 +2536,7 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.abort_prefill_run(seq_id);
         self.park_scheduled_dspark(seq_id);
         if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.remove(&seq_id);
             rt.state_store.clear_seq_checkpoint(seq_id);
         }
     }
@@ -2096,6 +2549,7 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.abort_prefill_run(seq_id);
         self.release_scheduled_dspark(seq_id);
         if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.remove(&seq_id);
             rt.state_store.clear_seq_checkpoint(seq_id);
             rt.release_sequence(seq_id);
         }
@@ -2108,60 +2562,90 @@ impl HybridSchedulerBackend for Inkling2Inner {
         cache_salt: u64,
         mode: PreemptionMode,
     ) -> Result<()> {
+        self.preempt_scheduled_cache_with_prompt(seq_id, u32::MAX, cache_salt, mode)
+    }
+
+    fn preempt_scheduled_cache_with_prompt(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        cache_salt: u64,
+        mode: PreemptionMode,
+    ) -> Result<()> {
         // 1. Abort any in-flight layer-chunked prefill unit and release scheduled DSpark lane state.
         self.abort_prefill_run(seq_id);
         self.release_scheduled_dspark(seq_id);
 
+        let has_image_lineage = self.seq_has_image_lineage(seq_id);
+        let now = self.governor_now();
         let governor = self
             .memory_registration
             .as_ref()
             .map(|g| (g.governor(), g.model_id()));
         if let Some(rt) = self.paged.as_mut() {
-            // 2. Preserve completed prefix state if we have a valid block-aligned frontier before
-            //    releasing the sequence's physical blocks so preemption replay can resume cleanly,
-            //    UNLESS the turn opted out of cache reuse (`reuse_cache == false`).
             let allow_cache = rt.seq_reuse_cache(seq_id);
-            let recorded = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
-            let bs = rt.coordinator.block_size().max(1);
-            if allow_cache
-                && let Some((boundary, conv)) = rt.block_boundary_conv.get(&seq_id).cloned()
-                && boundary > 0
-                && boundary <= recorded
-                && boundary.is_multiple_of(bs)
-                && let Some(tokens) = rt
-                    .coordinator
-                    .full_adapter()
-                    .request_tokens_for(seq_id)
-                    .map(|t| t.to_vec())
-                && tokens.len() >= boundary as usize
-            {
-                let draft_win = rt
-                    .block_boundary_draft_window
-                    .get(&seq_id)
-                    .filter(|(wb, _)| *wb == boundary)
-                    .map(|(_, w)| w);
-                let _ = rt.state_store.capture_boundary_with_window(
-                    &mut rt.coordinator,
-                    &conv,
-                    seq_id,
-                    &tokens,
-                    boundary,
-                    cache_salt,
-                    StateClass::Checkpoint,
-                    draft_win,
-                    governor,
-                );
-            }
+            if allow_cache && !has_image_lineage {
+                // 2. Preserve completed prefix state if we have a valid block-aligned frontier before
+                //    releasing the sequence's physical blocks so preemption replay can resume cleanly,
+                //    UNLESS the turn opted out of cache reuse (`reuse_cache == false`) or carries
+                //    multimodal image lineage.
+                //    Splash 1.7.2 `Engine::vacateLane`: long replies (`>= prompt_replay + 2048`)
+                //    are kept as non-disposable `StateClass::Ordinary` (without eager write-behind)
+                //    so they survive Checkpoint-first eviction and spill to SSD on governor reclaim.
+                let recorded = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
+                let bs = rt.coordinator.block_size().max(1);
+                let prompt_replay = (prompt_tokens.saturating_sub(1) / bs) * bs;
+                let long_reply_threshold =
+                    prompt_replay.saturating_add(INKLING2_WRITE_BEHIND_MIN_TOKENS as u32);
+                if let Some((boundary, conv)) = rt.current_block_boundary_conv(seq_id)
+                    && boundary > 0
+                    && boundary <= recorded
+                    && boundary.is_multiple_of(bs)
+                    && let Some(tokens) = rt
+                        .coordinator
+                        .full_adapter()
+                        .request_tokens_for(seq_id)
+                        .map(|t| t.to_vec())
+                    && tokens.len() >= boundary as usize
+                {
+                    let long_reply = prompt_tokens != u32::MAX && boundary >= long_reply_threshold;
+                    let class = if long_reply {
+                        StateClass::Ordinary
+                    } else {
+                        StateClass::Checkpoint
+                    };
+                    let draft_win = rt
+                        .block_boundary_draft_window
+                        .get(&seq_id)
+                        .filter(|(wb, _)| *wb == boundary)
+                        .map(|(_, w)| w);
+                    let _ = rt.state_store.capture_boundary_with_window_and_options(
+                        &mut rt.coordinator,
+                        &conv,
+                        seq_id,
+                        &tokens,
+                        boundary,
+                        cache_salt,
+                        class,
+                        draft_win,
+                        governor,
+                        CaptureOptions {
+                            keep_prev_checkpoint: false,
+                            enqueue_write_behind: false,
+                            is_head: false,
+                            now,
+                        },
+                    );
+                }
 
-            // 3. Register full Group 0 blocks for prefix reuse (when cache reuse is allowed),
-            //    then release Group 0 + Group 1 + ShortConv.
-            if allow_cache {
+                // 3. Register full Group 0 blocks for prefix reuse, then release Group 0 + Group 1 + ShortConv.
                 let _ = rt.coordinator.register_full_blocks_for_reuse_for(
                     seq_id,
                     cache_salt,
                     mode == PreemptionMode::Ssd,
                 );
             }
+            rt.active_scheduled_seqs.remove(&seq_id);
             rt.state_store.clear_seq_checkpoint(seq_id);
             rt.release_sequence(seq_id);
         }
@@ -2202,6 +2686,7 @@ impl HybridSchedulerBackend for Inkling2Inner {
     ) -> Result<ScheduledPrefillPass> {
         if let Some(rt) = self.paged.as_mut() {
             rt.active_seq = seq_id;
+            rt.seq_cache_salt.insert(seq_id, base.cache_salt);
         }
         let pass = self.run_paged_prefill_pass(
             seq_id,
@@ -2228,6 +2713,7 @@ impl HybridSchedulerBackend for Inkling2Inner {
     ) -> Result<Option<MxArray>> {
         if let Some(rt) = self.paged.as_mut() {
             rt.active_seq = seq_id;
+            rt.seq_cache_salt.insert(seq_id, base.cache_salt);
         }
         match self.run_paged_prefill_pass(
             seq_id,
@@ -2335,6 +2821,17 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.propose_scheduled_dspark_batch(requests)
     }
 
+    fn restore_scheduled_draft_handles(&mut self, seq_id: SeqId) {
+        self.restore_scheduled_dspark_draft_handles(seq_id);
+    }
+
+    fn validate_scheduled_verify_row(
+        &mut self,
+        row: &crate::engine::hybrid_scheduler::ScheduledVerifyRow,
+    ) -> Result<()> {
+        self.validate_scheduled_dspark_verify_row(row)
+    }
+
     fn run_scheduled_verify(
         &mut self,
         rows: &[crate::engine::hybrid_scheduler::ScheduledVerifyRow],
@@ -2398,8 +2895,13 @@ impl HybridSchedulerBackend for Inkling2Inner {
         cache_salt: u64,
         _block_size: u32,
     ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
-        self.prepare_prefix_sync(seq_id, tokens, reuse_cache, cache_salt)
-            .map(ScheduledPrefixAdmission::Ready)
+        let admission = self
+            .prepare_prefix_sync(seq_id, tokens, reuse_cache, cache_salt)
+            .map(ScheduledPrefixAdmission::Ready)?;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.insert(seq_id);
+        }
+        Ok(admission)
     }
 
     fn prepare_contended_prefix(
@@ -2411,7 +2913,12 @@ impl HybridSchedulerBackend for Inkling2Inner {
         cache_salt: u64,
         _block_size: u32,
     ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
-        self.prepare_contended_prefix_impl(seq_id, tokens, reuse_cache, cache_salt)
+        let admission =
+            self.prepare_contended_prefix_impl(seq_id, tokens, reuse_cache, cache_salt)?;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.insert(seq_id);
+        }
+        Ok(admission)
     }
 
     fn poll_scheduled_restore(
@@ -2443,7 +2950,13 @@ impl HybridSchedulerBackend for Inkling2Inner {
         _owner_history: &[u32],
         _is_preemption_replay: bool,
     ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
-        self.land_parked_restore_impl(seq_id, restore, prompt_tokens)
+        let res = self.land_parked_restore_impl(seq_id, restore, prompt_tokens)?;
+        if res.is_some()
+            && let Some(rt) = self.paged.as_mut()
+        {
+            rt.active_scheduled_seqs.insert(seq_id);
+        }
+        Ok(res)
     }
 
     fn restore_reserved_blocks(restore: &Self::RestoreTicket) -> u32 {
@@ -2492,17 +3005,30 @@ impl HybridSchedulerBackend for Inkling2Inner {
     }
 
     fn install_owner_state(&mut self, seq_id: SeqId, state: &Self::OwnerState) {
-        if let Some(rt) = self.paged.as_mut() {
-            rt.active_seq = seq_id;
-        }
         self.cached_token_history = state.cached_token_history.clone();
         self.cached_image_key = state.cached_image_key;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_seq = seq_id;
+            rt.cached_paged_image_token_positions =
+                state.cached_paged_image_token_positions.clone();
+            if let Some(key) = self.cached_image_key {
+                rt.seq_image_lineage
+                    .insert(seq_id, (key, rt.cached_paged_image_token_positions.clone()));
+            } else {
+                rt.seq_image_lineage.remove(&seq_id);
+            }
+        }
     }
 
     fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
         Inkling2OwnerState {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
+            cached_paged_image_token_positions: self
+                .paged
+                .as_ref()
+                .map(|rt| rt.cached_paged_image_token_positions.clone())
+                .unwrap_or_default(),
             flat_cache: None,
             cuda_cache: None,
             cuda_dflash2_ctx: None,
@@ -6074,9 +6600,8 @@ pub(super) mod tests {
                 panic!("opted-out turn finished before preemption could be triggered: {res:?}");
             }
             let crossed_boundary = sched.inner.paged.as_ref().is_some_and(|rt| {
-                rt.block_boundary_conv
-                    .get(&seq_id)
-                    .is_some_and(|(boundary, _)| *boundary >= 32)
+                rt.current_block_boundary_conv(seq_id)
+                    .is_some_and(|(boundary, _)| boundary >= 32)
             });
             if crossed_boundary {
                 assert!(
@@ -6223,7 +6748,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -6373,6 +6898,7 @@ pub(super) mod tests {
                 units: true,
                 waits_for_writes: true,
                 waits_for_landings: true,
+                certain_reuse: super::CertainReuse::All,
                 ..Default::default()
             },
             need: Need {
@@ -6574,6 +7100,7 @@ pub(super) mod tests {
                         units: true,
                         waits_for_writes: true,
                         waits_for_landings: true,
+                        certain_reuse: super::CertainReuse::All,
                         ..Default::default()
                     },
                     need: Need {
@@ -7277,7 +7804,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -7360,6 +7887,7 @@ pub(super) mod tests {
                 units: true,
                 waits_for_writes: true,
                 waits_for_landings: true,
+                certain_reuse: super::CertainReuse::All,
                 ..Default::default()
             },
             need: Need {
@@ -7862,7 +8390,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -8307,7 +8835,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -8719,7 +9247,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -9018,7 +9546,7 @@ pub(super) mod tests {
                 .full_adapter_mut()
                 .release_request()
                 .expect("release 3");
-            let taken_dl = inner.inkling2_take_victim(&byte_query, dl);
+            let taken_dl = inner.inkling2_take_victim(&byte_query, dl, &[]);
             assert_eq!(taken_dl.outcome, FreeOutcome::Met);
             assert!(taken_dl.now_bytes > 0);
             assert_eq!(
@@ -9072,7 +9600,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -9371,7 +9899,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -9455,6 +9983,7 @@ pub(super) mod tests {
             rights: TakeRights {
                 units: true,
                 reserves: Reserves::None,
+                certain_reuse: super::CertainReuse::All,
                 ..Default::default()
             },
             need: mixed_need,
@@ -9485,7 +10014,7 @@ pub(super) mod tests {
                 stage: Stage::FreeNow,
                 later: false,
             };
-            let taken = inner.inkling2_take_victim(&mixed_query, &dummy);
+            let taken = inner.inkling2_take_victim(&mixed_query, &dummy, &[]);
             assert_eq!(taken, Taken::default());
         }
 
@@ -9837,7 +10366,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
                 self.taken.push(victim.key.clone());
-                self.inner.inkling2_take_victim(query, victim)
+                self.inner.inkling2_take_victim(query, victim, &[])
             }
         }
 
@@ -10120,8 +10649,9 @@ pub(super) mod tests {
                 panic!("turn finished before boundary-32 preemption: {res:?}");
             }
             let rt = sched.inner.paged.as_ref().expect("paged");
-            if let Some((&seq_id, _)) = rt.block_boundary_conv.iter().find(|(sid, (b, _))| {
-                *b == 32 && rt.coordinator.request_token_count_all(**sid).unwrap_or(0) > 32
+            if let Some((&seq_id, _)) = rt.block_boundary_conv.iter().find(|(sid, hist)| {
+                hist.current.0 == 32
+                    && rt.coordinator.request_token_count_all(**sid).unwrap_or(0) > 32
             }) {
                 assert!(
                     rt.block_boundary_draft_window.get(&seq_id).is_some_and(
@@ -10152,9 +10682,7 @@ pub(super) mod tests {
                 "prompt < 32 tokens must not pre-populate StateStore before rolling checkpoint"
             );
             let (_, conv) = rt
-                .block_boundary_conv
-                .get(&seq_id)
-                .cloned()
+                .current_block_boundary_conv(seq_id)
                 .expect("boundary conv at 32");
             let tokens = rt
                 .coordinator
@@ -10586,7 +11114,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, q: &VictimQuery, v: &Victim) -> Taken {
                 self.1.push(v.key.clone());
-                self.0.inkling2_take_victim(q, v)
+                self.0.inkling2_take_victim(q, v, &[])
             }
         }
         let tok = build_synthetic_inkling2_tokenizer();
@@ -10726,7 +11254,7 @@ pub(super) mod tests {
             }
             fn take(&mut self, q: &VictimQuery, v: &Victim) -> Taken {
                 self.1.push(v.key.clone());
-                self.0.inkling2_take_victim(q, v)
+                self.0.inkling2_take_victim(q, v, &[])
             }
         }
         let tok = build_synthetic_inkling2_tokenizer();
@@ -10841,5 +11369,2716 @@ pub(super) mod tests {
         assert_eq!(src.1, vec![UnitKey::DraftContext(seq_b)]);
         assert!(!sched.inner.dspark_turn_contexts.contains_key(&seq_b));
         assert!(sched.inner.dspark_turn_contexts.contains_key(&seq_a));
+    }
+
+    #[test]
+    fn multimodal_extra_keys_isolate_prefix_registry_and_survive_live_continuation() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::PagedBackend;
+        use crate::tools::inkling::IMAGE_PAD_ID;
+
+        let mut inner = build_synthetic_dflash2_inner(128, None);
+        let seq_id = 0u32;
+        let salt = 0xAA11u64;
+
+        // Build a 40-token expanded multimodal prompt (>= 1 full 32-token block) containing
+        // 4 IMAGE_PAD_ID placeholders at positions 4..8 inside block 0.
+        let mut expanded_tokens: Vec<u32> = (100..140).collect();
+        for pos in 4..8 {
+            expanded_tokens[pos] = IMAGE_PAD_ID;
+        }
+        let img_a: Vec<Vec<u8>> = vec![b"image-A-bytes".to_vec()];
+        let img_b: Vec<Vec<u8>> = vec![b"image-B-bytes".to_vec()];
+        let (key_a, digests_a) = crate::engine::compute_image_cache_keys(&img_a);
+        let (_key_b, digests_b) = crate::engine::compute_image_cache_keys(&img_b);
+        let pos_a = crate::engine::map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_PAD_ID,
+            &[4],
+            &digests_a,
+        )
+        .expect("map image A positions");
+        let pos_b = crate::engine::map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_PAD_ID,
+            &[4],
+            &digests_b,
+        )
+        .expect("map image B positions");
+
+        // 1. Simulate Turn 1 multimodal prefill + finalize with image A extra_keys.
+        {
+            let rt = inner.paged.as_mut().expect("paged runtime");
+            rt.active_seq = seq_id;
+            rt.reset_sequence(seq_id, &inner.config).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_id, &expanded_tokens)
+                .unwrap();
+            let bs = rt.coordinator.block_size();
+            let extra_a = crate::engine::build_paged_extra_keys(expanded_tokens.len(), bs, &pos_a);
+            rt.coordinator
+                .finalize_keep_live_all(seq_id, &extra_a, salt)
+                .unwrap();
+            rt.cached_paged_image_token_positions = pos_a.clone();
+            rt.seq_image_lineage.insert(seq_id, (key_a, pos_a.clone()));
+        }
+        inner.cached_image_key = Some(key_a);
+        inner.cached_token_history = expanded_tokens.clone();
+
+        let probe_prefix = |full: &mut super::PagedKVCacheAdapter,
+                            tokens: &[u32],
+                            extra: &[Vec<u64>],
+                            salt: u64|
+         -> u32 {
+            let probe_seq = 777u32;
+            let _ = full.release_request_for(probe_seq);
+            full.begin_request(probe_seq).unwrap();
+            let hit = full
+                .find_cached_prefix_per_block(tokens, extra, salt, false)
+                .unwrap()
+                .cached_token_count;
+            let _ = full.release_request_for(probe_seq);
+            let _ = full.activate_request(seq_id);
+            hit
+        };
+
+        // Check Group 0 PrefixRegistry isolation immediately after Turn 1:
+        // - Empty extra_keys (text-only) MUST miss (0 cached tokens).
+        // - Image B extra_keys MUST miss (0 cached tokens).
+        // - Image A extra_keys MUST hit (32 cached tokens = 1 full block).
+        {
+            let full = inner.paged.as_mut().unwrap().coordinator.full_adapter_mut();
+            let bs = full.block_size();
+            let empty_keys = crate::engine::build_paged_extra_keys(expanded_tokens.len(), bs, &[]);
+            let keys_a = crate::engine::build_paged_extra_keys(expanded_tokens.len(), bs, &pos_a);
+            let keys_b = crate::engine::build_paged_extra_keys(expanded_tokens.len(), bs, &pos_b);
+            assert_eq!(
+                probe_prefix(full, &expanded_tokens, &empty_keys, salt),
+                0,
+                "text-only lookup must miss image A's Group 0 blocks"
+            );
+            assert_eq!(
+                probe_prefix(full, &expanded_tokens, &keys_b, salt),
+                0,
+                "image B lookup must miss image A's Group 0 blocks"
+            );
+            assert_eq!(
+                probe_prefix(full, &expanded_tokens, &keys_a, salt),
+                32,
+                "image A lookup must hit image A's Group 0 block"
+            );
+        }
+
+        // 2. Live text continuation Turn 2 extending past block 1 (to 72 tokens = 2 full blocks):
+        //    `prepare_prefix_sync` must preserve image lineage, and `finalize_paged_turn` must
+        //    re-register blocks 0..2 with image A's extra_keys (NEVER poisoning empty extra_keys!).
+        let mut turn2_tokens = expanded_tokens.clone();
+        turn2_tokens.extend(200..232);
+        let p2 = inner
+            .prepare_prefix_sync(seq_id, &turn2_tokens, true, salt)
+            .expect("live continuation");
+        assert!(p2.live_continuation);
+        assert_eq!(inner.cached_image_key, Some(key_a));
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .cached_paged_image_token_positions
+                .is_empty()
+        );
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_id, &turn2_tokens[p2.effective_cached_prefix_len..])
+                .unwrap();
+        }
+        inner.finalize_paged_turn(true, salt);
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let bs = rt.coordinator.block_size();
+            let empty_keys = crate::engine::build_paged_extra_keys(turn2_tokens.len(), bs, &[]);
+            let keys_a = crate::engine::build_paged_extra_keys(turn2_tokens.len(), bs, &pos_a);
+            {
+                let full = rt.coordinator.full_adapter_mut();
+                assert_eq!(
+                    probe_prefix(full, &turn2_tokens, &empty_keys, salt),
+                    0,
+                    "live continuation must NOT poison Group 0 PrefixRegistry under empty extra_keys"
+                );
+                assert_eq!(
+                    probe_prefix(full, &turn2_tokens, &keys_a, salt),
+                    64,
+                    "both blocks 0 and 1 must chain image A's extra_keys"
+                );
+            }
+            assert_eq!(
+                rt.state_store.store.entries().count(),
+                0,
+                "multimodal live continuation must NOT capture into text-lineage StateStore"
+            );
+        }
+    }
+
+    #[test]
+    fn sticky_cached_image_key_clears_on_cold_fallback_state_hit_and_guards_preemption() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::PagedBackend;
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefixAdmission};
+        use crate::engine::scheduler::PreemptionMode;
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-sticky-img-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let _guard = TempDirGuard(temp_root.clone());
+
+        let mut inner = build_synthetic_dflash2_inner(128, None);
+        let disk_opts = crate::disk_tier::DiskTierOptions {
+            cache_disk: crate::disk_tier::CacheDisk::Bytes(64u64 << 20),
+            persistent: false,
+            cache_dir: None,
+            temp_root: Some(temp_root),
+        };
+        assert!(inner.attach_state_disk(&disk_opts, || None).is_some());
+
+        let seq_id = 0u32;
+        let salt = 0xBB22u64;
+
+        // 1. Seed sticky multimodal image state on `seq_id = 0`.
+        inner.cached_image_key = Some(0xDEAD_BEEF);
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.active_seq = seq_id;
+            rt.reset_sequence(seq_id, &inner.config).unwrap();
+            let mm_tokens: Vec<u32> = (500..540).collect();
+            rt.coordinator
+                .record_tokens_all(seq_id, &mm_tokens)
+                .unwrap();
+            rt.record_block_boundary_conv(seq_id, 32);
+            rt.cached_paged_image_token_positions = vec![(4, 0x1111), (4, 0x2222)];
+            rt.seq_image_lineage
+                .insert(seq_id, (0xDEAD_BEEF, vec![(4, 0x1111), (4, 0x2222)]));
+        }
+
+        // Verify `preempt_scheduled_cache` skips StateStore capture & PrefixRegistry registration
+        // while `seq_id` carries image lineage (even when another owner is installed on `self`).
+        inner.cached_image_key = None; // simulate another text owner installed on `self`
+        inner
+            .preempt_scheduled_cache(seq_id, salt, PreemptionMode::Recompute)
+            .expect("preempt multimodal seq");
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            assert_eq!(
+                rt.state_store.store.entries().count(),
+                0,
+                "preempt_scheduled_cache must skip StateStore capture for image-bearing seq"
+            );
+            let mm_tokens: Vec<u32> = (500..540).collect();
+            let empty = crate::engine::build_paged_extra_keys(mm_tokens.len(), 32, &[]);
+            let full = rt.coordinator.full_adapter_mut();
+            full.reset_for_new_request(778).unwrap();
+            let hit = full
+                .find_cached_prefix_per_block(&mm_tokens, &empty, salt, false)
+                .unwrap()
+                .cached_token_count;
+            let _ = full.release_request_for(778);
+            assert_eq!(
+                hit, 0,
+                "preempt_scheduled_cache must not register image-bearing blocks under empty extra_keys"
+            );
+        }
+
+        // 2. Re-arm sticky `cached_image_key` and run a cold text Turn 2 (`prepare_prefix_sync` cold branch):
+        //    sticky state must be cleared, `finalize_paged_turn` must publish into StateStore,
+        //    and Turn 3's `prepare_contended_prefix_impl` must have `should_park` enabled again!
+        inner.cached_image_key = Some(0xCAFE_BABE);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .cached_paged_image_token_positions = vec![(2, 0x9999)];
+        let text_turn2: Vec<u32> = (10..50).collect();
+        let p_cold = inner
+            .prepare_prefix_sync(seq_id, &text_turn2, true, salt)
+            .expect("cold text turn 2");
+        assert!(!p_cold.live_continuation);
+        assert_eq!(p_cold.effective_cached_prefix_len, 0);
+        assert_eq!(
+            inner.cached_image_key, None,
+            "cold fallback must clear sticky cached_image_key"
+        );
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .cached_paged_image_token_positions
+                .is_empty(),
+            "cold fallback must clear cached_paged_image_token_positions"
+        );
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_id, &text_turn2)
+                .unwrap();
+            rt.record_block_boundary_conv(seq_id, 32);
+        }
+        inner.finalize_paged_turn(true, salt);
+        let stored_after_turn2 = inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .state_store
+            .store
+            .entries()
+            .count();
+        assert!(
+            stored_after_turn2 >= 1,
+            "finalize_paged_turn must capture cold text Turn 2 into StateStore once sticky key is cleared"
+        );
+
+        // 3. Re-arm sticky `cached_image_key` on a new sequence and hit the text-only StateStore entry
+        //    via `prepare_prefix_sync`: text-only StateStore hit must ALSO clear sticky image lineage!
+        let seq_hit = 1u32;
+        inner.cached_image_key = Some(0xFEED_FACE);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .cached_paged_image_token_positions = vec![(1, 0x7777)];
+        let mut text_turn3 = text_turn2[..32].to_vec();
+        text_turn3.extend(900..908);
+        let p_hit = inner
+            .prepare_prefix_sync(seq_hit, &text_turn3, true, salt)
+            .expect("text StateStore hit");
+        assert_eq!(p_hit.effective_cached_prefix_len, 32);
+        assert_eq!(
+            inner.cached_image_key, None,
+            "text-only StateStore hit must clear sticky cached_image_key"
+        );
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .cached_paged_image_token_positions
+                .is_empty()
+        );
+
+        // 4. Verify `prepare_contended_prefix_impl` can park for async SSD restore once the hot
+        //    blocks are evicted to SSD (proving `should_park` is re-enabled after cold clear!).
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let entry_id = rt.state_store.store.entries().next().unwrap().id();
+            let _ = rt.state_store.reclaim_entry(&rt.coordinator, entry_id);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                rt.state_store.tick(
+                    &rt.coordinator,
+                    super::Tick::Wait {
+                        deadline: Instant::now() + Duration::from_millis(25),
+                    },
+                );
+                let landed = rt.state_store.store.get(entry_id).is_some_and(|e| {
+                    e.ram().is_none() && e.disk().is_some_and(|d| d.landed && !d.chain_owed)
+                });
+                if landed {
+                    break;
+                }
+            }
+            let _ = rt.coordinator.evict_all_hot_blocks_without_suppress();
+            rt.conv_states.clear();
+        }
+        let admission = inner
+            .prepare_contended_prefix_impl(2, &text_turn3, true, salt)
+            .expect("contended prefix admission");
+        assert!(
+            matches!(admission, ScheduledPrefixAdmission::Waiting { .. }),
+            "Turn 3 contended admission must park for async SSD restore once sticky cached_image_key is cleared"
+        );
+    }
+
+    /// Bug 1b: `inkling2_victim_units` reports exact `freed_by_marks` pages for marked `Store`
+    /// entries, omits `Extent`/`DeadLeaves` when `need.pages > 0`, and `inkling2_take_victim`
+    /// returns the exact `takeable_blocks` delta > 0.
+    #[test]
+    fn victim_units_reports_freed_by_marks_pages_and_reclaims_global_kv_on_page_only_need() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::governor::ledger::{
+            CertainReuse, FreeOutcome, Need, Reserves, TakeRights, UnitKey, VictimQuery,
+        };
+
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        let tokens1: Vec<u32> = (100u32..196u32).collect();
+        let tokens2: Vec<u32> = (500u32..564u32).collect();
+        let (e1, e2) = {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+            rt.coordinator.reset_scheduled_request(1).unwrap();
+            rt.coordinator.record_tokens_all(1, &tokens1).unwrap();
+            let e1 = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &tokens1,
+                    64,
+                    0,
+                    super::StateClass::Ordinary,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            rt.release_sequence(1);
+
+            rt.coordinator.reset_scheduled_request(2).unwrap();
+            rt.coordinator.record_tokens_all(2, &tokens2).unwrap();
+            let e2 = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    2,
+                    &tokens2,
+                    64,
+                    0,
+                    super::StateClass::Checkpoint,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            rt.release_sequence(2);
+            (e1, e2)
+        };
+
+        let query = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                waits_for_writes: true,
+                waits_for_landings: true,
+                in_use: false,
+                certain_reuse: CertainReuse::All,
+                reserves: Reserves::None,
+                rebuilt_pools: false,
+            },
+            need: Need {
+                bytes: 0,
+                pages: 2,
+                kv: true,
+                host_refused: false,
+            },
+        };
+        let runs = inner.inkling2_victim_units(&query, &[]);
+        let units = runs.into_units();
+        assert!(
+            !units
+                .iter()
+                .any(|u| matches!(u.key, UnitKey::Extent | UnitKey::DeadLeaves)),
+            "Extent/DeadLeaves must be omitted when need.pages > 0"
+        );
+        let cp_unit = units
+            .iter()
+            .find(|u| u.key == UnitKey::Store(e2))
+            .expect("checkpoint entry must be listed");
+        let ord_unit = units
+            .iter()
+            .find(|u| u.key == UnitKey::Store(e1))
+            .expect("ordinary entry must be listed");
+        assert_eq!(
+            cp_unit.pages, 2,
+            "freed_by_marks must report exact 2 Global KV pages for 64-tok checkpoint"
+        );
+        assert_eq!(
+            ord_unit.pages, 2,
+            "freed_by_marks must report exact 2 Global KV pages for 64-tok ordinary state"
+        );
+
+        let takeable_before = inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .full_adapter()
+            .takeable_blocks();
+        let taken = inner.inkling2_take_victim(&query, cp_unit, &[]);
+        let takeable_after = inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .full_adapter()
+            .takeable_blocks();
+        assert_eq!(taken.outcome, FreeOutcome::Met);
+        assert_eq!(taken.pages, 2);
+        assert_eq!(takeable_after.saturating_sub(takeable_before), 2);
+    }
+
+    /// Bug 1c: `inkling2_take_victim` credits exact measured `host_freed + active_freed`,
+    /// `Pending` returns `now_bytes=0, later_bytes=0, pages=0` (no phantom `later_bytes`), and
+    /// `allocate()` continues to the next victim instead of hitting `met.contains(&need)` ->
+    /// `capacity_exhausted`.
+    #[test]
+    fn take_victim_reports_real_governor_byte_delta_no_phantom_exhaustion() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::Mutex;
+
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::governor::allocate::{Refusal, StateAdmission, UnitSources, allocate};
+        use crate::engine::governor::governor::{
+            Governor, GovernorIo, HostSample, MemoryStats, ModelRegistration,
+        };
+        use crate::engine::governor::host::{HostMemory, Pressure};
+        use crate::engine::governor::ledger::{
+            CertainReuse, ClaimClass, ClaimRank, ClaimSpec, FreeOutcome, Need, NeedTiming,
+            ReachClass, Reserves, TakeRights, Taken as LedgerTaken, UnitKey, Victim, VictimQuery,
+            VictimSource,
+        };
+
+        struct LocalPoolIo {
+            local_limit: Arc<CacheLimitCoordinator>,
+            clock: Mutex<f64>,
+        }
+
+        impl GovernorIo for LocalPoolIo {
+            fn stats(&self) -> MemoryStats {
+                MemoryStats {
+                    active: crate::array::memory::active_memory_bytes(),
+                    pools: self.local_limit.registered_pool_bytes(),
+                    cache: 0,
+                }
+            }
+            fn host(&self) -> HostSample {
+                HostSample {
+                    memory: Some(HostMemory {
+                        available: 64u64 << 30,
+                        spare: 64u64 << 30,
+                    }),
+                    pressure: Some(Pressure::Normal),
+                }
+            }
+            fn now(&self) -> f64 {
+                *self.clock.lock().unwrap()
+            }
+            fn sleep(&self, _seconds: f64) {}
+            fn clear_cache(&self) {}
+            fn set_memory_limit(&self, _bytes: u64) -> u64 {
+                0
+            }
+            fn physical_memory(&self) -> u64 {
+                128u64 << 30
+            }
+        }
+
+        struct Inkling2Source<'a>(&'a mut crate::models::inkling2::Inkling2Inner);
+        impl VictimSource for Inkling2Source<'_> {
+            fn units(&self, query: &VictimQuery) -> Vec<Victim> {
+                self.0.inkling2_victim_units(query, &[]).into_units()
+            }
+            fn take(&mut self, query: &VictimQuery, victim: &Victim) -> LedgerTaken {
+                self.0.inkling2_take_victim(query, victim, &[])
+            }
+        }
+        impl UnitSources for Inkling2Source<'_> {
+            fn sources(&mut self) -> Vec<&mut dyn VictimSource> {
+                vec![self]
+            }
+            fn poll_landings(&mut self) {}
+        }
+
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        let local_limit = Arc::new(CacheLimitCoordinator::new_for_test());
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .state_store
+            .attach_host_budget_to(Arc::clone(&local_limit));
+
+        // Capture 2 Ordinary entries with known host_resident_bytes.
+        let io = Arc::new(LocalPoolIo {
+            local_limit: Arc::clone(&local_limit),
+            clock: Mutex::new(1.0),
+        });
+        let (e1, e2, one_host_bytes, one_entry_delta) = {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+            let t1: Vec<u32> = (10u32..42u32).collect();
+            rt.coordinator.reset_scheduled_request(1).unwrap();
+            rt.coordinator.record_tokens_all(1, &t1).unwrap();
+            let e1 = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &t1,
+                    32,
+                    0,
+                    super::StateClass::Ordinary,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let one_host_bytes = rt.state_store.host_resident_bytes();
+            assert!(one_host_bytes > 0);
+            assert_eq!(local_limit.registered_pool_bytes(), one_host_bytes);
+            let charge_after_e1 = io.stats().active.saturating_add(io.stats().pools);
+
+            let t2: Vec<u32> = (200u32..232u32).collect();
+            rt.coordinator.reset_scheduled_request(2).unwrap();
+            rt.coordinator.record_tokens_all(2, &t2).unwrap();
+            let e2 = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    2,
+                    &t2,
+                    32,
+                    0,
+                    super::StateClass::Ordinary,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            let charge_after_e2 = io.stats().active.saturating_add(io.stats().pools);
+            let one_entry_delta = charge_after_e2
+                .saturating_sub(charge_after_e1)
+                .max(one_host_bytes);
+            rt.release_sequence(1);
+            rt.release_sequence(2);
+            (e1, e2, one_host_bytes, one_entry_delta)
+        };
+        assert_eq!(local_limit.registered_pool_bytes(), one_host_bytes * 2);
+
+        // Configure a local Governor whose budget sits right at current charge, then demand
+        // `1.5 * one_entry_delta`: reclaiming e1 alone is NOT enough, so `allocate()` MUST keep
+        // going and reclaim e2 as well without false `capacity_exhausted`!
+        let baseline_charge = io.stats().active.saturating_add(io.stats().pools);
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let model_id = 0x1C00_0001u64;
+        let reg = governor
+            .register_model(ModelRegistration {
+                model_id,
+                hard_budget: baseline_charge,
+                untracked: 0,
+                page_bytes: 4096,
+            })
+            .expect("register");
+        inner.memory_registration = Some(reg);
+
+        let spec = ClaimSpec {
+            cls: ClaimClass::Start,
+            request_id: 1,
+            rank: ClaimRank::default(),
+            reach: ReachClass::InUse,
+            timing: NeedTiming::CanWait,
+        };
+        let claim = governor.open(spec, model_id);
+        let wanted_bytes = one_entry_delta + one_entry_delta / 2;
+        let mut sources = Inkling2Source(&mut inner);
+        let outcome = allocate(
+            claim.claim(),
+            spec,
+            Refusal::Settled,
+            false,
+            &mut sources,
+            |_src| StateAdmission(governor.try_reserve(wanted_bytes)),
+        );
+        assert!(
+            outcome.admission.0.is_ok(),
+            "allocate() must reclaim both entries sequentially instead of hitting phantom capacity_exhausted: denial={:?}, err={:?}",
+            outcome.denial,
+            outcome.admission.0.as_ref().err()
+        );
+        let rt = inner.paged.as_ref().unwrap();
+        assert!(rt.state_store.store.get(e1).is_none());
+        assert!(rt.state_store.store.get(e2).is_none());
+        assert_eq!(local_limit.registered_pool_bytes(), 0);
+
+        // Also verify `ReclaimOutcome::Pending` returns `now_bytes=0, later_bytes=0, pages=0`
+        // (never phantom `later_bytes`).
+        let temp_root = std::env::temp_dir().join(format!(
+            "inkling2-pending-zero-later-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(64u64 << 20),
+            persistent: false,
+            cache_dir: None,
+            temp_root: Some(temp_root.clone()),
+        };
+        assert!(inner.attach_state_disk(&disk_opts, || None).is_some());
+        let e3 = {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+            let t3: Vec<u32> = (400u32..432u32).collect();
+            rt.coordinator.reset_scheduled_request(3).unwrap();
+            rt.coordinator.record_tokens_all(3, &t3).unwrap();
+            rt.state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    3,
+                    &t3,
+                    32,
+                    0,
+                    super::StateClass::Ordinary,
+                    None,
+                )
+                .unwrap()
+                .unwrap()
+        };
+        // Hold staging buffer so `stage` returns `Busy` -> `ReclaimOutcome::Pending`.
+        let held = inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .state_store
+            .disk
+            .as_mut()
+            .unwrap()
+            .engine
+            .staging
+            .take();
+        let pending_query = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                waits_for_writes: true,
+                waits_for_landings: true,
+                in_use: false,
+                certain_reuse: CertainReuse::All,
+                reserves: Reserves::None,
+                rebuilt_pools: false,
+            },
+            need: Need {
+                bytes: one_host_bytes,
+                pages: 0,
+                kv: false,
+                host_refused: false,
+            },
+        };
+        let pending_victim = Victim {
+            key: UnitKey::Store(e3),
+            stamp: 0,
+            bytes: one_host_bytes,
+            pages: 0,
+            stage: super::Stage::NeedsWrite,
+            later: false,
+        };
+        let taken = inner.inkling2_take_victim(&pending_query, &pending_victim, &[]);
+        assert_eq!(taken.outcome, FreeOutcome::Pending);
+        assert_eq!(taken.now_bytes, 0);
+        assert_eq!(
+            taken.later_bytes, 0,
+            "Pending must NEVER report phantom non-zero later_bytes"
+        );
+        assert_eq!(taken.pages, 0);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .state_store
+            .disk
+            .as_mut()
+            .unwrap()
+            .engine
+            .staging = held;
+        let _ = inner.close_state_disk(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Bug 1d: `inkling2_victim_units` respects `kept`, `wanted_chains`, `certain_reuse` /
+    /// `resume_point`, `host_refused` (`pages_only` / `states_only`), and single-staging-buffer
+    /// `later` serialization.
+    #[test]
+    fn victim_units_respects_kept_wanted_certain_reuse_host_refused_and_later() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, stats};
+        use crate::engine::governor::governor::{Governor, ModelRegistration};
+        use crate::engine::governor::host::Pressure;
+        use crate::engine::governor::ledger::{
+            CertainReuse, Need, Reserves, Stage, TakeRights, UnitKey, VictimQuery,
+        };
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-victim-query-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(64u64 << 20),
+            persistent: true,
+            cache_dir: Some(temp_root.join("cache")),
+            temp_root: Some(temp_root.clone()),
+        };
+
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        let io = FakeIo::new(stats(G), host(32 * G, Pressure::Normal));
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io)));
+        let model_id = 0x1D00_0001u64;
+        inner.memory_registration = Some(
+            governor
+                .register_model(ModelRegistration {
+                    model_id,
+                    hard_budget: 16 * G,
+                    untracked: 0,
+                    page_bytes: 4096,
+                })
+                .expect("register"),
+        );
+        assert!(inner.attach_state_disk(&disk_opts, || None).is_some());
+
+        let t_kept: Vec<u32> = (100u32..140u32).collect();
+        let t_wanted: Vec<u32> = (200u32..240u32).collect();
+        let t_ord1: Vec<u32> = (300u32..340u32).collect();
+        let t_ord2: Vec<u32> = (400u32..440u32).collect();
+        let t_cp: Vec<u32> = (500u32..540u32).collect();
+
+        let (id_kept, id_wanted, id_ord1, id_ord2, id_cp) = {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+            let mut add = |seq: u32, toks: &[u32], cls: super::StateClass| {
+                rt.coordinator.reset_scheduled_request(seq).unwrap();
+                rt.coordinator.record_tokens_all(seq, toks).unwrap();
+                let id = rt
+                    .state_store
+                    .capture_boundary(&mut rt.coordinator, &conv, seq, toks, 32, 0, cls, None)
+                    .unwrap()
+                    .unwrap();
+                rt.release_sequence(seq);
+                id
+            };
+            let id_cp = add(1, &t_cp, super::StateClass::Checkpoint);
+            let id_kept = add(2, &t_kept, super::StateClass::Ordinary);
+            let id_wanted = add(3, &t_wanted, super::StateClass::Ordinary);
+            let id_ord1 = add(4, &t_ord1, super::StateClass::Ordinary);
+            // `id_ord2` is the newest ordinary -> `resume_point`!
+            let id_ord2 = add(5, &t_ord2, super::StateClass::Ordinary);
+            (id_kept, id_wanted, id_ord1, id_ord2, id_cp)
+        };
+
+        // Publish `t_wanted` (with a trailing query token, since `WantedChains::keeps` excludes
+        // the prompt's last token) in governor's wanted_chains.
+        let mut wanted_prompt = t_wanted.clone();
+        wanted_prompt.push(9999);
+        governor.set_wanted_chains(
+            model_id,
+            crate::engine::governor::ledger::WantedChains::new(vec![wanted_prompt]),
+        );
+
+        // 1. `CertainReuse::None` protects `kept`, `wanted`, AND `resume_point` (`id_ord2`).
+        let q_none = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                waits_for_writes: true,
+                waits_for_landings: true,
+                in_use: false,
+                certain_reuse: CertainReuse::None,
+                reserves: Reserves::None,
+                rebuilt_pools: false,
+            },
+            need: Need {
+                bytes: 1 << 20,
+                pages: 0,
+                kv: false,
+                host_refused: false,
+            },
+        };
+        let u_none = inner.inkling2_victim_units(&q_none, &t_kept).into_units();
+        assert!(
+            !u_none.iter().any(|u| u.key == UnitKey::Store(id_kept)),
+            "kept prefix entry must be excluded"
+        );
+        assert!(
+            !u_none.iter().any(|u| u.key == UnitKey::Store(id_wanted)),
+            "wanted_chains entry must be protected when CertainReuse != All"
+        );
+        assert!(
+            !u_none.iter().any(|u| u.key == UnitKey::Store(id_ord2)),
+            "newest ordinary resume_point must be protected when CertainReuse == None"
+        );
+        assert!(u_none.iter().any(|u| u.key == UnitKey::Store(id_ord1)));
+        assert!(u_none.iter().any(|u| u.key == UnitKey::Store(id_cp)));
+
+        // 2. `CertainReuse::All` unlocks `wanted` & `resume_point` (still excludes `kept`),
+        //    and at most ONE `NeedsWrite` unit gets `later: false`!
+        let q_all = VictimQuery {
+            rights: TakeRights {
+                certain_reuse: CertainReuse::All,
+                ..q_none.rights
+            },
+            need: q_none.need,
+        };
+        let u_all = inner.inkling2_victim_units(&q_all, &t_kept).into_units();
+        assert!(!u_all.iter().any(|u| u.key == UnitKey::Store(id_kept)));
+        assert!(u_all.iter().any(|u| u.key == UnitKey::Store(id_wanted)));
+        assert!(u_all.iter().any(|u| u.key == UnitKey::Store(id_ord2)));
+        let needs_write: Vec<_> = u_all
+            .iter()
+            .filter(|u| u.stage == Stage::NeedsWrite)
+            .collect();
+        assert!(
+            needs_write.len() >= 3,
+            "multiple RAM-only entries need write on writable SSD"
+        );
+        let non_later_count = needs_write.iter().filter(|u| !u.later).count();
+        assert_eq!(
+            non_later_count, 1,
+            "at most 1 NeedsWrite unit may have later=false (single staging buffer)"
+        );
+
+        // 3. `host_refused + pages > 0` (`pages_only`): omits checkpoints, omits Extent/DeadLeaves,
+        //    and zeroes `bytes` on remaining state units.
+        let q_pages_only = VictimQuery {
+            rights: q_all.rights,
+            need: Need {
+                bytes: 1 << 20,
+                pages: 1,
+                kv: true,
+                host_refused: true,
+            },
+        };
+        let u_pages = inner.inkling2_victim_units(&q_pages_only, &[]).into_units();
+        assert!(!u_pages.iter().any(|u| u.key == UnitKey::Store(id_cp)));
+        assert!(
+            !u_pages
+                .iter()
+                .any(|u| matches!(u.key, UnitKey::Extent | UnitKey::DeadLeaves))
+        );
+        for u in &u_pages {
+            assert_eq!(u.bytes, 0, "pages_only must zero bytes on every unit");
+        }
+
+        // 4. `host_refused + pages == 0` (`states_only`): skips freed_by_marks (`pages == 0`)
+        //    and omits Extent/DeadLeaves.
+        let q_states_only = VictimQuery {
+            rights: q_all.rights,
+            need: Need {
+                bytes: 1 << 20,
+                pages: 0,
+                kv: false,
+                host_refused: true,
+            },
+        };
+        let u_states = inner
+            .inkling2_victim_units(&q_states_only, &[])
+            .into_units();
+        assert!(
+            !u_states
+                .iter()
+                .any(|u| matches!(u.key, UnitKey::Extent | UnitKey::DeadLeaves))
+        );
+        assert!(!u_states.is_empty());
+        for u in &u_states {
+            assert_eq!(u.pages, 0, "states_only must skip freed_by_marks (pages=0)");
+            assert!(u.bytes > 0);
+        }
+
+        let _ = inner.close_state_disk(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Bug 1e: In non-exclusive scheduled mode (`exclusive_turn_active == false`),
+    /// `install_state_hit_sync` reclaims the oldest **idle** SWA owner while leaving actively
+    /// scheduled lanes untouched, and restores the `StateStore` hit instead of falling back cold.
+    #[test]
+    fn scheduled_install_state_hit_reclaims_idle_swa_owner_not_active_lane() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        let salt = 0x1E00u64;
+        let seq_active = 10u32;
+        let seq_idle = 11u32;
+        let seq_restore = 12u32;
+
+        // Capture a restorable 32-token StateStore entry first (from seq_idle), then fill Group 1
+        // SWA completely with `seq_active` (older stamp, ACTIVE) and `seq_idle` (newer stamp, IDLE).
+        let hit_tokens: Vec<u32> = (700u32..736u32).collect();
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+
+            // Populate `seq_active` first so it has the OLDEST turn_end_stamp — verifying our
+            // filter protects it by `active_scheduled_seqs` rather than stamp luck!
+            let active_tokens: Vec<u32> = (100u32..164u32).collect();
+            rt.coordinator.reset_scheduled_request(seq_active).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_active, &active_tokens)
+                .unwrap();
+            rt.coordinator
+                .finalize_keep_live_all(seq_active, &[], 0xA111)
+                .unwrap();
+
+            // Populate `seq_idle` and capture a StateStore entry at depth 32.
+            rt.coordinator.reset_scheduled_request(seq_idle).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_idle, &hit_tokens)
+                .unwrap();
+            rt.state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    seq_idle,
+                    &hit_tokens,
+                    32,
+                    salt,
+                    super::StateClass::Ordinary,
+                    None,
+                )
+                .unwrap()
+                .unwrap();
+            rt.coordinator
+                .finalize_keep_live_all(seq_idle, &[], salt)
+                .unwrap();
+
+            // Fill any remaining free SWA blocks with another idle filler owner (`seq_idle2`).
+            let swa_free = rt
+                .coordinator
+                .sliding_adapter()
+                .unwrap()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            if swa_free > 0 {
+                let filler_tokens: Vec<u32> = (800..800 + swa_free * 32).collect();
+                rt.coordinator.reset_scheduled_request(13).unwrap();
+                rt.coordinator
+                    .record_tokens_all(13, &filler_tokens)
+                    .unwrap();
+                rt.coordinator
+                    .finalize_keep_live_all(13, &[], 0xF222)
+                    .unwrap();
+            }
+            assert_eq!(
+                rt.coordinator
+                    .sliding_adapter()
+                    .unwrap()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks,
+                0,
+                "SWA pool must be full"
+            );
+            assert!(
+                rt.coordinator
+                    .full_adapter()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks
+                    >= 2,
+                "Global pool must still have free blocks"
+            );
+            assert!(!rt.exclusive_turn_active, "must be in scheduled mode");
+        }
+
+        // Mark ONLY `seq_active` as an active scheduled lane.
+        inner.set_active_scheduled_seqs(&[seq_active]);
+
+        let mut query = hit_tokens[..32].to_vec();
+        query.extend_from_slice(&[901, 902, 903, 904]);
+        let prefix = inner
+            .prepare_prefix_sync(seq_restore, &query, true, salt)
+            .expect("scheduled SWA restore must succeed by reclaiming idle SWA owner");
+        assert_eq!(
+            prefix.effective_cached_prefix_len, 32,
+            "scheduled restore must hit depth 32 instead of cold fallback"
+        );
+        let rt = inner.paged.as_ref().unwrap();
+        let swa_live = rt.coordinator.sliding_adapter().unwrap().live_seq_ids();
+        assert!(
+            swa_live.contains(&seq_active),
+            "active scheduled lane seq_active MUST NOT be evicted"
+        );
+        assert!(
+            !swa_live.contains(&seq_idle),
+            "oldest idle SWA owner seq_idle must have been reclaimed"
+        );
+        assert!(swa_live.contains(&seq_restore));
+
+        // Reclaiming `seq_idle` (2 blocks) for `seq_restore` (1 block) leaves 1 free SWA block;
+        // fill any remaining free SWA blocks with another active lane (`seq_filler_active = 14`),
+        // then mark ALL live SWA owners as active scheduled lanes so 0 free blocks and 0 idle
+        // owners remain, and verify a scheduled restore propagates `is_paged_allocation_blocked`
+        // Err (so `start_prepared` defers instead of evicting an active lane!).
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let swa_free = rt
+                .coordinator
+                .sliding_adapter()
+                .unwrap()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            if swa_free > 0 {
+                let filler_tokens: Vec<u32> = (1200..1200 + swa_free * 32).collect();
+                rt.coordinator.reset_scheduled_request(14).unwrap();
+                rt.coordinator
+                    .record_tokens_all(14, &filler_tokens)
+                    .unwrap();
+            }
+            assert_eq!(
+                rt.coordinator
+                    .sliding_adapter()
+                    .unwrap()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks,
+                0,
+                "SWA pool must have 0 free blocks before checking active-only deferral"
+            );
+        }
+        let all_active = inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .sliding_adapter()
+            .unwrap()
+            .live_seq_ids();
+        inner.set_active_scheduled_seqs(&all_active);
+        let Err(err) = inner.prepare_prefix_sync(99, &query, true, salt) else {
+            panic!("when all SWA owners are active lanes, scheduled restore must defer via Err");
+        };
+        assert!(
+            super::is_paged_allocation_blocked(&err.reason),
+            "returned error must match is_paged_allocation_blocked, got: {}",
+            err.reason
+        );
+        let swa_live_after = inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .coordinator
+            .sliding_adapter()
+            .unwrap()
+            .live_seq_ids();
+        for active in &all_active {
+            assert!(
+                swa_live_after.contains(active),
+                "active lane {active} must remain untouched on deferral"
+            );
+        }
+    }
+
+    /// Bug 16c: Preempting a lane with a long reply (`>= prompt_replay + 2048`) publishes a
+    /// non-disposable `StateClass::Ordinary` state (NOT eagerly enqueued into `write_behind`,
+    /// survives Checkpoint-first eviction / spills to SSD on reclaim), while a short reply
+    /// (`prompt_replay + 512`) publishes a disposable `StateClass::Checkpoint`.
+    #[test]
+    fn preempt_long_reply_keeps_ordinary_short_reply_keeps_checkpoint() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::governor::ledger::{
+            CertainReuse, Need, Reserves, Stage, TakeRights, UnitKey, VictimQuery,
+        };
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::engine::scheduler::PreemptionMode;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-preempt-reply-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_root).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(128u64 << 20),
+            persistent: true,
+            cache_dir: Some(temp_root.join("cache")),
+            temp_root: Some(temp_root.clone()),
+        };
+
+        let mut inner = build_synthetic_dflash2_inner(4096, None);
+        assert!(inner.attach_state_disk(&disk_opts, || None).is_some());
+
+        let prompt_tokens: u32 = 64; // prompt_replay = (63 / 32) * 32 = 32
+        let short_boundary: u32 = 32 + 512; // 544 < 32 + 2048
+        let long_boundary: u32 = 32 + 2048; // 2080 >= 32 + 2048
+        let salt = 0x16C2u64;
+
+        let make_conv = |cfg: &super::super::config::Inkling2Config| {
+            super::super::short_conv::Inkling2ShortConvState::new(
+                cfg.num_layer_visits(),
+                cfg.sconv_kernel_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                cfg.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap()
+        };
+
+        let record_chunked = |coord: &mut super::super::kv_cache::Inkling2KVCacheCoordinator,
+                              seq: u32,
+                              toks: &[u32]| {
+            coord.reset_scheduled_request(seq).unwrap();
+            for chunk in toks.chunks(32) {
+                coord.record_tokens_all(seq, chunk).unwrap();
+                coord.prune_sliding_all(seq).unwrap();
+            }
+        };
+
+        // 1. Short reply lane (seq 1) at boundary 544 -> disposable Checkpoint.
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let short_toks: Vec<u32> = (1000u32..1000 + short_boundary + 4).collect();
+            record_chunked(&mut rt.coordinator, 1, &short_toks);
+            rt.conv_states.insert(1, make_conv(&inner.config));
+            rt.record_block_boundary_conv(1, short_boundary);
+        }
+        inner
+            .preempt_scheduled_cache_with_prompt(1, prompt_tokens, salt, PreemptionMode::Recompute)
+            .expect("preempt short reply");
+
+        // 2. Long reply lane (seq 2) at boundary 2080 -> non-disposable Ordinary, NOT in write_behind!
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let long_toks: Vec<u32> = (5000u32..5000 + long_boundary + 4).collect();
+            record_chunked(&mut rt.coordinator, 2, &long_toks);
+            rt.conv_states.insert(2, make_conv(&inner.config));
+            rt.record_block_boundary_conv(2, long_boundary);
+        }
+        inner
+            .preempt_scheduled_cache_with_prompt(2, prompt_tokens, salt, PreemptionMode::Recompute)
+            .expect("preempt long reply");
+
+        let (short_id, long_id) = {
+            let rt = inner.paged.as_ref().unwrap();
+            let short_entry = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == short_boundary as usize)
+                .expect("short reply state captured");
+            let long_entry = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == long_boundary as usize)
+                .expect("long reply state captured");
+            assert!(
+                short_entry.checkpoint(),
+                "short reply (< prompt_replay + 2048) must be disposable Checkpoint"
+            );
+            assert!(
+                !long_entry.checkpoint(),
+                "long reply (>= prompt_replay + 2048) must be non-disposable Ordinary"
+            );
+            assert_eq!(
+                rt.state_store
+                    .disk
+                    .as_ref()
+                    .unwrap()
+                    .write_behind
+                    .snapshot()
+                    .waiting,
+                0,
+                "preempted long reply must NOT be eagerly enqueued to write_behind"
+            );
+            (short_entry.id(), long_entry.id())
+        };
+
+        // Verify victim ordering: short reply Checkpoint sits in `ahead` (evicted first), while
+        // long reply Ordinary sits in `merged` (`Stage::NeedsWrite`, spills to SSD on reclaim).
+        let q = VictimQuery {
+            rights: TakeRights {
+                units: true,
+                waits_for_writes: true,
+                waits_for_landings: true,
+                in_use: false,
+                certain_reuse: CertainReuse::All,
+                reserves: Reserves::None,
+                rebuilt_pools: false,
+            },
+            need: Need {
+                bytes: 1 << 20,
+                pages: 0,
+                kv: false,
+                host_refused: false,
+            },
+        };
+        let runs = inner.inkling2_victim_units(&q, &[]);
+        assert!(
+            runs.ahead.iter().any(|u| u.key == UnitKey::Store(short_id)),
+            "short reply Checkpoint must be in runs.ahead"
+        );
+        let long_unit = runs
+            .merged
+            .iter()
+            .find(|u| u.key == UnitKey::Store(long_id))
+            .expect("long reply Ordinary must be in runs.merged");
+        assert_eq!(long_unit.stage, Stage::NeedsWrite);
+
+        let _ = inner.close_state_disk(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// Bug 16d: Inkling2's shared `WriteBehind` skips superseded Turn 1/2, persists Turn 3 +
+    /// persistent head, does not drop waiting entries on `Busy`, and publishes/clears
+    /// `monitor::set_next_wakeup(model_id, wakeup)` in `tick_state_disk(Tick::Full)`.
+    #[test]
+    fn inkling2_write_behind_skips_superseded_keeps_head_survives_busy_and_sets_wakeup() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use crate::disk_tier::state_disk::DELAY_SECONDS;
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::governor::governor::tests::{FakeIo, G, host, stats};
+        use crate::engine::governor::governor::{Governor, ModelRegistration};
+        use crate::engine::governor::host::Pressure;
+        use crate::engine::governor::monitor;
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-wb-shared-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(128u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        let io = FakeIo::new(stats(G), host(32 * G, Pressure::Normal));
+        let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+        let model_id = 0x16D0_0001u64;
+        inner.memory_registration = Some(
+            governor
+                .register_model(ModelRegistration {
+                    model_id,
+                    hard_budget: 16 * G,
+                    untracked: 0,
+                    page_bytes: 4096,
+                })
+                .expect("register"),
+        );
+        let geom = super::super::state_disk::Inkling2StateGeometry::from_coordinator(
+            &inner.config,
+            &inner.paged.as_ref().unwrap().coordinator,
+        )
+        .unwrap();
+        let pid = super::super::state_disk::compute_path_identity(
+            &temp_root,
+            &inner.config,
+            &inner.paged.as_ref().unwrap().coordinator,
+            &geom,
+            Some(1024),
+            None,
+        );
+        assert!(inner.attach_state_disk(&disk_opts, move || pid).is_some());
+
+        let wakes = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&wakes);
+        monitor::register_waker(
+            model_id,
+            Box::new(move || {
+                counted.fetch_add(1, Ordering::AcqRel);
+                true
+            }),
+        );
+
+        // Multi-turn conversation sharing a prefix:
+        //   Head (32 tok, is_head=true) -> Turn 1 (64 tok) -> Turn 2 (96 tok) -> Turn 3 (128 tok).
+        let tokens: Vec<u32> = (1000u32..1136u32).collect();
+        let (head_id, t1_id, t2_id, t3_id) = {
+            let rt = inner.paged.as_mut().unwrap();
+            let conv = super::super::short_conv::Inkling2ShortConvState::new(
+                inner.config.num_layer_visits(),
+                inner.config.sconv_kernel_size,
+                inner.config.num_key_value_heads * inner.config.head_dim,
+                inner.config.hidden_size,
+                crate::array::DType::BFloat16,
+            )
+            .unwrap();
+            rt.coordinator.reset_scheduled_request(1).unwrap();
+            let mut advance_and_cap = |from: usize, to: usize, is_head: bool| {
+                rt.coordinator
+                    .record_tokens_all(1, &tokens[from..to])
+                    .unwrap();
+                rt.coordinator.prune_sliding_all(1).unwrap();
+                rt.state_store
+                    .capture_boundary_with_window_and_options(
+                        &mut rt.coordinator,
+                        &conv,
+                        1,
+                        &tokens[..to],
+                        to as u32,
+                        0,
+                        super::StateClass::Ordinary,
+                        None,
+                        None,
+                        super::CaptureOptions {
+                            keep_prev_checkpoint: true,
+                            enqueue_write_behind: true,
+                            is_head,
+                            now: 0.0,
+                        },
+                    )
+                    .unwrap()
+                    .unwrap()
+            };
+            let head_id = advance_and_cap(0, 32, true);
+            let t1_id = advance_and_cap(32, 64, false);
+            let t2_id = advance_and_cap(64, 96, false);
+            let t3_id = advance_and_cap(96, 128, false);
+            (head_id, t1_id, t2_id, t3_id)
+        };
+
+        // 1. At t = 0.0: tick_state_disk(Tick::Full) must publish `monitor::set_next_wakeup(..., Some(DELAY_SECONDS))`.
+        io.with(|s| s.now = 0.0);
+        inner.tick_state_disk(super::Tick::Full { command_pages: 0 });
+        io.with(|s| s.now = DELAY_SECONDS - 0.1);
+        monitor::tick(governor);
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            0,
+            "wakeup not due before DELAY_SECONDS"
+        );
+        io.with(|s| s.now = DELAY_SECONDS);
+        monitor::tick(governor);
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            1,
+            "tick_state_disk(Tick::Full) must schedule monitor wakeup at DELAY_SECONDS"
+        );
+        monitor::wake_taken(model_id);
+
+        // 2. While staging buffer is held (`Busy`), stepping at t = DELAY_SECONDS must NOT drop
+        //    waiting entries from write_behind!
+        let held = inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .state_store
+            .disk
+            .as_mut()
+            .unwrap()
+            .engine
+            .staging
+            .take();
+        io.with(|s| s.now = DELAY_SECONDS + 1.0);
+        inner.tick_state_disk(super::Tick::Full { command_pages: 0 });
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .disk
+                .as_ref()
+                .unwrap()
+                .write_behind
+                .snapshot()
+                .waiting
+                >= 1,
+            "Busy staging must NOT drop entries from write_behind"
+        );
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .state_store
+            .disk
+            .as_mut()
+            .unwrap()
+            .engine
+            .staging = held;
+
+        // 3. Drive `tick_state_disk(Tick::Full)` until write_behind drains: ONLY `head_id` and
+        //    `t3_id` persist to SSD; superseded `t1_id` and `t2_id` settle as `Unneeded`!
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            inner.tick_state_disk(super::Tick::Full { command_pages: 0 });
+            let waiting = inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .disk
+                .as_ref()
+                .unwrap()
+                .write_behind
+                .snapshot()
+                .waiting;
+            if waiting == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let rt = inner.paged.as_ref().unwrap();
+        let disk = rt.state_store.disk.as_ref().unwrap();
+        let snap = disk.write_behind.snapshot();
+        assert_eq!(snap.waiting, 0, "all write-behind entries must settle");
+        assert_eq!(
+            snap.durable, 2,
+            "only persistent head + Turn 3 must become durable"
+        );
+        assert_eq!(
+            snap.unneeded, 2,
+            "superseded Turn 1 + Turn 2 must settle as Unneeded"
+        );
+        assert!(
+            rt.state_store
+                .store
+                .get(head_id)
+                .unwrap()
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "persistent head must be durable on SSD"
+        );
+        assert!(
+            rt.state_store.store.get(t1_id).unwrap().disk().is_none(),
+            "superseded Turn 1 must NOT be written to SSD"
+        );
+        assert!(
+            rt.state_store.store.get(t2_id).unwrap().disk().is_none(),
+            "superseded Turn 2 must NOT be written to SSD"
+        );
+        assert!(
+            rt.state_store
+                .store
+                .get(t3_id)
+                .unwrap()
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "newest Turn 3 must be durable on SSD"
+        );
+
+        // 4. Once durable, next_wakeup is cleared to `None` (monitor::tick fires no extra wake).
+        assert_eq!(
+            disk.write_behind
+                .next_wakeup(&rt.state_store.store, disk.tier.persistent),
+            None
+        );
+        io.with(|s| s.now = DELAY_SECONDS + 100.0);
+        monitor::tick(governor);
+        assert_eq!(
+            wakes.load(Ordering::Acquire),
+            1,
+            "cleared wakeup must not trigger spurious wakes once durable"
+        );
+
+        monitor::forget_waker(model_id);
+        let _ = inner.close_state_disk(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    struct CheckpointIntervalGuard(Option<u32>);
+
+    impl CheckpointIntervalGuard {
+        fn set(interval: u32) -> Self {
+            let prev = super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE
+                .with(|cell| cell.replace(Some(interval)));
+            Self(prev)
+        }
+    }
+
+    impl Drop for CheckpointIntervalGuard {
+        fn drop(&mut self) {
+            super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE.with(|cell| cell.set(self.0));
+        }
+    }
+
+    /// Reproduces the multi-sub-slice Group 1 SWA exhaustion scenario (`20:24:10` frontier
+    /// mismatch) across BOTH fast (`budget_ms = None`) and resumable (`budget_ms = Some(0.0)`)
+    /// prefill paths:
+    /// - Unit `[64..224)` splits across rolling checkpoint `128` and prompt junction `192`
+    ///   (`sub0 = [64..128)` = 64 tok = 2 blocks, `sub1 = [128..192)` = 64 tok = 2 blocks,
+    ///   `sub2 = [192..224)` = 32 tok = 1 block).
+    /// - An ACTIVE peer holds Group 1 SWA blocks so `sub0` fits (2 free blocks) but `sub1` hits
+    ///   `allocation_blocked`.
+    /// - Verifies atomic rollback back to `unit_start = 64` (0 leaked KV tokens in Group 0 & 1,
+    ///   exact `unit_initial_conv`, `block_boundary_conv <= 64`, draft lane `committed_len == 64`,
+    ///   no partial checkpoint, SWA blocks `[0..64)` unpruned).
+    /// - Verifies fail-closed `pos == start` guard rejects mismatched `start`.
+    /// - Once SWA frees up, retrying completes cleanly at `224` with ZERO duplicate tokens and
+    ///   bit-identical final logits to an uninterrupted baseline!
+    #[test]
+    fn multi_sub_slice_swa_exhaustion_rolls_back_atomically_and_guards_frontier() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefillPass};
+
+        let _cp_guard = CheckpointIntervalGuard::set(128);
+        let gen_stream = crate::stream::Stream::generation();
+        let prompt: Vec<u32> = (0u32..224u32).map(|i| 10 + (i % 80)).collect();
+
+        let drive_unit = |inner: &mut crate::models::inkling2::model::Inkling2Inner,
+                          seq_id: super::SeqId,
+                          start: usize,
+                          end: usize,
+                          salt: u64,
+                          budget_ms: Option<f64>|
+         -> napi::bindgen_prelude::Result<Option<crate::array::MxArray>> {
+            for _ in 0..256 {
+                match inner.run_paged_prefill_pass(
+                    seq_id, &prompt, start, end, salt, true, gen_stream, budget_ms,
+                )? {
+                    ScheduledPrefillPass::Paused => {}
+                    ScheduledPrefillPass::Done(logits) => return Ok(logits),
+                }
+            }
+            panic!("prefill pass did not terminate");
+        };
+
+        // 1. Uninterrupted baseline run (`[0..64)` then `[64..224)`).
+        let mut baseline = build_synthetic_dflash2_inner_with_window(512, None, 64, 3);
+        let seq_base = 1u32;
+        baseline
+            .prepare_prefix_sync(seq_base, &prompt, true, 0xB001)
+            .expect("prepare baseline");
+        assert!(
+            baseline
+                .begin_scheduled_dspark(seq_base, 0)
+                .expect("dspark base")
+        );
+        assert!(
+            drive_unit(&mut baseline, seq_base, 0, 64, 0xB001, None)
+                .expect("base prefix")
+                .is_none()
+        );
+        let base_logits = drive_unit(&mut baseline, seq_base, 64, 224, 0xB001, None)
+            .expect("base unit")
+            .expect("final logits");
+        let base_vec = base_logits.to_float32().expect("base f32").to_vec();
+
+        // 2. Test BOTH fast path (`None`) and resumable multi-step path (`Some(0.0)`).
+        for (case_idx, budget_ms) in [None, Some(0.0)].into_iter().enumerate() {
+            let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 64, 3);
+            let seq_id = 10u32 + case_idx as u32;
+            let seq_peer = 50u32 + case_idx as u32;
+            let salt = 0xC100u64 + case_idx as u64;
+
+            inner
+                .prepare_prefix_sync(seq_id, &prompt, true, salt)
+                .expect("prepare seq");
+            assert!(
+                inner
+                    .begin_scheduled_dspark(seq_id, 0)
+                    .expect("begin dspark"),
+                "scheduled DFlash2 lane must activate at pos=0"
+            );
+            assert!(
+                drive_unit(&mut inner, seq_id, 0, 64, salt, None)
+                    .expect("prefix [0..64)")
+                    .is_none()
+            );
+            // Clear any pre-unit state_store entries so we can verify zero partial publications.
+            {
+                let rt = inner.paged.as_mut().unwrap();
+                rt.state_store.clear_ram_and_checkpoints();
+                rt.state_store.sync_marks(&rt.coordinator);
+            }
+
+            // Fill Group 1 SWA with an ACTIVE scheduled peer leaving EXACTLY 2 free blocks:
+            // enough for sub-slice 0 (`[64..128)` = 64 tok = 2 blocks), NOT sub-slice 1 (`[128..192)`).
+            inner.set_active_scheduled_seqs(&[seq_id, seq_peer]);
+            {
+                let rt = inner.paged.as_mut().unwrap();
+                let swa_free = rt
+                    .coordinator
+                    .sliding_adapter()
+                    .unwrap()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks;
+                assert!(
+                    swa_free >= 4,
+                    "need >= 4 free SWA blocks before pinning active peer, got {swa_free}"
+                );
+                let peer_blocks = swa_free - 2;
+                let peer_tokens: Vec<u32> = (0..peer_blocks * 32).map(|i| 1 + (i % 50)).collect();
+                rt.coordinator.reset_scheduled_request(seq_peer).unwrap();
+                rt.coordinator
+                    .record_tokens_all(seq_peer, &peer_tokens)
+                    .unwrap();
+                let remaining_swa = rt
+                    .coordinator
+                    .sliding_adapter()
+                    .unwrap()
+                    .block_telemetry()
+                    .unwrap()
+                    .free_blocks;
+                assert_eq!(
+                    remaining_swa, 2,
+                    "Group 1 SWA must have exact room for sub-slice 0 (2 blocks) only"
+                );
+            }
+
+            // Attempt `[64..224)`: sub0 fits in 2 SWA blocks, sub1 hits Group 1 allocation_blocked!
+            let Err(err) = drive_unit(&mut inner, seq_id, 64, 224, salt, budget_ms) else {
+                panic!("sub-slice 1 SWA exhaustion must return allocation_blocked");
+            };
+            assert!(
+                super::is_paged_allocation_blocked(&err.reason),
+                "case {case_idx}: expected allocation_blocked, got: {}",
+                err.reason
+            );
+
+            // Verify atomic rollback to exact `unit_start = 64` (ZERO leaked tokens!).
+            assert!(
+                !inner.prefill_runs.contains_key(&seq_id),
+                "case {case_idx}: failed unit must not leave stale prefill_runs entry"
+            );
+            {
+                let rt = inner.paged.as_ref().unwrap();
+                assert_eq!(
+                    rt.coordinator.request_token_count_all(seq_id).unwrap(),
+                    64,
+                    "case {case_idx}: BOTH Group 0 and Group 1 must roll back to unit_start=64"
+                );
+                assert_eq!(
+                    rt.current_block_boundary_conv(seq_id).map(|(b, _)| b),
+                    Some(64),
+                    "case {case_idx}: block_boundary_conv must stay at 64 (no stale 128)"
+                );
+                assert_eq!(
+                    rt.state_store.store.entries().count(),
+                    0,
+                    "case {case_idx}: failed unit must not publish partial checkpoint at 128"
+                );
+            }
+            assert_eq!(
+                inner
+                    .scheduled_dspark
+                    .seq_lanes
+                    .get(&seq_id)
+                    .expect("dspark lane must survive atomic rollback")
+                    .ctx
+                    .committed_len(),
+                64,
+                "case {case_idx}: draft lane must remain at exact unit_start=64"
+            );
+
+            // Verify fail-closed `pos == start` guard rejects a mismatched start without appending.
+            let Err(mismatch_err) = inner.run_paged_prefill_pass(
+                seq_id, &prompt, 32, 128, salt, true, gen_stream, budget_ms,
+            ) else {
+                panic!("mismatched start must fail closed");
+            };
+            assert!(
+                mismatch_err.reason.contains("frontier mismatch"),
+                "case {case_idx}: expected frontier mismatch error, got: {}",
+                mismatch_err.reason
+            );
+            assert_eq!(
+                inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .coordinator
+                    .request_token_count_all(seq_id)
+                    .unwrap(),
+                64,
+                "case {case_idx}: frontier mismatch guard must not append tokens"
+            );
+
+            // Release active peer so SWA space opens up, then retry `[64..224)`!
+            inner
+                .release_scheduled_cache(seq_peer)
+                .expect("release peer");
+            inner.set_active_scheduled_seqs(&[seq_id]);
+
+            let retry_logits = drive_unit(&mut inner, seq_id, 64, 224, salt, budget_ms)
+                .expect("retry after SWA frees up must succeed")
+                .expect("retry must produce final logits");
+            let retry_vec = retry_logits.to_float32().expect("retry f32").to_vec();
+            assert_eq!(
+                inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .coordinator
+                    .request_token_count_all(seq_id)
+                    .unwrap(),
+                224,
+                "case {case_idx}: retry must finish at exact end=224 with zero duplicate tokens"
+            );
+            assert_eq!(
+                inner
+                    .scheduled_dspark
+                    .seq_lanes
+                    .get(&seq_id)
+                    .unwrap()
+                    .ctx
+                    .committed_len(),
+                224
+            );
+            assert_eq!(
+                retry_vec, base_vec,
+                "case {case_idx}: retried logits must be bit-identical to uninterrupted baseline"
+            );
+            let depths: Vec<usize> = inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .store
+                .entries()
+                .map(|e| e.depth())
+                .collect();
+            assert!(
+                depths.contains(&128) && depths.contains(&192),
+                "case {case_idx}: expected checkpoint 128 and junction 192, got {depths:?}"
+            );
+        }
+    }
+
+    /// Verifies proactive Group 1 (SWA) idle-owner reclaim runs BEFORE a multi-sub-slice prefill
+    /// unit commits sub-slice 0 so an idle owner never causes spurious `allocation_blocked`.
+    #[test]
+    fn proactive_swa_reclaim_evicts_idle_owner_before_multi_sub_slice_prefill() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefillPass};
+
+        let _cp_guard = CheckpointIntervalGuard::set(128);
+        let gen_stream = crate::stream::Stream::generation();
+        let prompt: Vec<u32> = (0u32..224u32).map(|i| 15 + (i % 70)).collect();
+        let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 64, 3);
+        let seq_id = 20u32;
+        let seq_idle = 21u32;
+        let salt = 0xD200u64;
+
+        inner
+            .prepare_prefix_sync(seq_id, &prompt, true, salt)
+            .expect("prepare seq");
+        inner
+            .run_paged_prefill_pass(seq_id, &prompt, 0, 64, salt, true, gen_stream, None)
+            .expect("prefix [0..64)");
+
+        // Fill Group 1 SWA with an IDLE owner (NOT in `active_scheduled_seqs`), leaving only 2 free blocks.
+        inner.set_active_scheduled_seqs(&[seq_id]);
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            let swa_free = rt
+                .coordinator
+                .sliding_adapter()
+                .unwrap()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            let idle_blocks = swa_free - 2;
+            let idle_tokens: Vec<u32> = (0..idle_blocks * 32).map(|i| 5 + (i % 40)).collect();
+            rt.coordinator.reset_scheduled_request(seq_idle).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_idle, &idle_tokens)
+                .unwrap();
+            rt.coordinator
+                .finalize_keep_live_all(seq_idle, &[], 0x1D1E)
+                .unwrap();
+        }
+
+        // Prefill `[64..224)` must proactively reclaim `seq_idle` and succeed on the FIRST attempt!
+        match inner
+            .run_paged_prefill_pass(seq_id, &prompt, 64, 224, salt, true, gen_stream, None)
+            .expect("proactive SWA reclaim must let unit finish on first try")
+        {
+            ScheduledPrefillPass::Done(Some(_)) => {}
+            other => panic!(
+                "expected Done(Some(logits)), got {}",
+                matches!(other, ScheduledPrefillPass::Paused)
+            ),
+        }
+        let rt = inner.paged.as_ref().unwrap();
+        assert_eq!(rt.coordinator.request_token_count_all(seq_id).unwrap(), 224);
+        assert!(
+            !rt.coordinator.is_live_all(seq_idle),
+            "idle SWA owner must be reclaimed proactively"
+        );
+    }
+
+    /// Verifies periodic decode rolling checkpoints capture `StateClass::Checkpoint` at multiples
+    /// of `checkpoint_interval_tokens()` for BOTH single-sequence and batched AR decode, using
+    /// `seq_cache_salt` and respecting `seq_reuse_cache` opt-out BEFORE SWA pruning.
+    #[test]
+    fn decode_rolling_checkpoint_captures_at_interval_for_single_and_batched() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+
+        let _cp_guard = CheckpointIntervalGuard::set(64);
+        let gen_stream = crate::stream::Stream::generation();
+
+        // 1. Single-sequence AR decode crossing boundary 63 -> 64.
+        {
+            let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 2);
+            let seq = 1u32;
+            let salt = 0xE101u64;
+            let prompt: Vec<u32> = (0u32..63u32).map(|i| 10 + (i % 60)).collect();
+            inner
+                .prepare_prefix_sync(seq, &prompt, true, salt)
+                .expect("prepare single");
+            inner
+                .run_paged_prefill_pass(seq, &prompt, 0, prompt.len(), salt, true, gen_stream, None)
+                .expect("prefill 63");
+            // Clear prompt junction (32) so only decode checkpoint (64) is inspected.
+            {
+                let rt = inner.paged.as_mut().unwrap();
+                rt.state_store.clear_ram_and_checkpoints();
+                rt.state_store.sync_marks(&rt.coordinator);
+            }
+            let _ = inner.paged_decode_step(seq, 42).expect("decode 63->64");
+            let _ = inner.settle_paged_step(seq).expect("settle single");
+
+            let mut full = prompt.clone();
+            full.push(42);
+            // `lookup_deepest_restorable` requires strictly shorter prefix (`max_depth = len - 1`),
+            // so append a trailing query token to probe the depth-64 checkpoint.
+            full.push(99);
+            let rt = inner.paged.as_ref().unwrap();
+            let hit = rt
+                .state_store
+                .lookup_deepest_restorable(&rt.coordinator, &full, salt)
+                .expect("single AR decode must capture rolling checkpoint at 64");
+            assert_eq!(hit.depth, 64);
+            assert!(
+                rt.state_store.store.get(hit.id).unwrap().checkpoint(),
+                "decode rolling capture must use StateClass::Checkpoint"
+            );
+            // Wrong salt must not hit.
+            assert!(
+                rt.state_store
+                    .lookup_deepest_restorable(&rt.coordinator, &full, salt ^ 1)
+                    .is_none()
+            );
+        }
+
+        // 2. Scheduled batched AR decode crossing 63 -> 64 with one cache-enabled lane and one
+        //    cache-opted-out (`reuse_cache = false`) peer lane.
+        {
+            let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 2);
+            let seq_ok = 2u32;
+            let seq_optout = 3u32;
+            let salt_ok = 0xE201u64;
+            let salt_optout = 0xE202u64;
+            let prompt_ok: Vec<u32> = (0u32..63u32).map(|i| 20 + (i % 50)).collect();
+            let prompt_optout: Vec<u32> = (0u32..63u32).map(|i| 30 + (i % 50)).collect();
+
+            inner
+                .prepare_prefix_sync(seq_ok, &prompt_ok, true, salt_ok)
+                .expect("prepare ok");
+            inner
+                .run_paged_prefill_pass(
+                    seq_ok,
+                    &prompt_ok,
+                    0,
+                    prompt_ok.len(),
+                    salt_ok,
+                    true,
+                    gen_stream,
+                    None,
+                )
+                .expect("prefill ok");
+
+            inner
+                .prepare_prefix_sync(seq_optout, &prompt_optout, false, salt_optout)
+                .expect("prepare optout");
+            inner
+                .run_paged_prefill_pass(
+                    seq_optout,
+                    &prompt_optout,
+                    0,
+                    prompt_optout.len(),
+                    salt_optout,
+                    false,
+                    gen_stream,
+                    None,
+                )
+                .expect("prefill optout");
+
+            {
+                let rt = inner.paged.as_mut().unwrap();
+                rt.state_store.clear_ram_and_checkpoints();
+                rt.state_store.sync_marks(&rt.coordinator);
+            }
+
+            let rows = [(seq_ok, 55u32), (seq_optout, 56u32)];
+            let _ = inner
+                .paged_decode_step_batched(&rows)
+                .expect("batched decode 63->64");
+            inner
+                .finish_scheduled_decode_batch(&rows)
+                .expect("finish batched decode");
+
+            let mut full_ok = prompt_ok.clone();
+            full_ok.push(55);
+            full_ok.push(99);
+            let mut full_optout = prompt_optout.clone();
+            full_optout.push(56);
+            full_optout.push(99);
+            let rt = inner.paged.as_ref().unwrap();
+            let hit = rt
+                .state_store
+                .lookup_deepest_restorable(&rt.coordinator, &full_ok, salt_ok)
+                .expect(
+                    "batched AR decode must capture rolling checkpoint at 64 for reuse_cache=true",
+                );
+            assert_eq!(hit.depth, 64);
+            assert!(rt.state_store.store.get(hit.id).unwrap().checkpoint());
+            assert!(
+                rt.state_store
+                    .lookup_deepest_restorable(&rt.coordinator, &full_optout, salt_optout)
+                    .is_none(),
+                "reuse_cache=false lane must NOT publish decode rolling checkpoint"
+            );
+            assert_eq!(rt.state_store.store.entries().count(), 1);
+        }
+    }
+
+    /// Regression for Codex Finding 1: when a new lane is admitted via
+    /// `prepare_contended_prefix` / `prepare_scheduled_prefix` AFTER `set_active_scheduled_seqs`
+    /// snapshotted only older lanes, step-level Group 1 (SWA) reclaim MUST NOT evict the newly
+    /// admitted live lane (even though its `turn_end_stamp` is `0`, older than finalized idle
+    /// owners!). Once `scheduled_turn_closed` fires, the lane drops out of
+    /// `active_scheduled_seqs` and becomes reclaimable.
+    #[test]
+    fn swa_reclaim_protects_newly_admitted_lane_after_stale_active_snapshot() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{
+            HybridSchedulerBackend, ScheduledPrefillPass, ScheduledPrefixAdmission,
+        };
+
+        let _cp_guard = CheckpointIntervalGuard::set(128);
+        let gen_stream = crate::stream::Stream::generation();
+        let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 64, 3);
+
+        let seq_a = 10u32;
+        let seq_b = 11u32;
+        let seq_seed = 12u32;
+        let seq_idle = 13u32;
+        let salt_a = 0xF101u64;
+        let salt_b = 0xF102u64;
+
+        let prompt_a: Vec<u32> = (0u32..224u32).map(|i| 10 + (i % 70)).collect();
+        let prompt_b_prefix: Vec<u32> = (0u32..36u32).map(|i| 40 + (i % 60)).collect();
+
+        // 1. Seed a restorable depth-32 StateStore entry for `prompt_b_prefix` then release seed.
+        inner
+            .prepare_prefix_sync(seq_seed, &prompt_b_prefix, true, salt_b)
+            .expect("prepare seed");
+        inner
+            .run_paged_prefill_pass(
+                seq_seed,
+                &prompt_b_prefix,
+                0,
+                prompt_b_prefix.len(),
+                salt_b,
+                true,
+                gen_stream,
+                None,
+            )
+            .expect("prefill seed");
+        inner
+            .release_scheduled_cache(seq_seed)
+            .expect("release seed");
+
+        // 2. Admit & partially prefill Lane A (`[0..64)`).
+        inner
+            .prepare_scheduled_prefix(seq_a, &prompt_a, &[], true, salt_a, 32)
+            .expect("prepare seq_a");
+        inner
+            .run_paged_prefill_pass(seq_a, &prompt_a, 0, 64, salt_a, true, gen_stream, None)
+            .expect("prefill seq_a [0..64)");
+
+        // 3. Mirror `HybridSchedulerState::admit_prepared`: snapshot `active_scheduled_seqs`
+        //    BEFORE prefix preparation (`[seq_a]` only), then admit `seq_b` via
+        //    `prepare_contended_prefix` WITHOUT refreshing `set_active_scheduled_seqs`!
+        inner.set_active_scheduled_seqs(&[seq_a]);
+        let admission = inner
+            .prepare_contended_prefix(seq_b, &prompt_b_prefix, &[], true, salt_b, 32)
+            .expect("prepare_contended_prefix seq_b");
+        match admission {
+            ScheduledPrefixAdmission::Ready(prefix) => {
+                assert_eq!(prefix.effective_cached_prefix_len, 32);
+            }
+            ScheduledPrefixAdmission::Waiting { .. } => {
+                panic!("expected Ready RAM StateStore restore for seq_b");
+            }
+        }
+
+        // 4. Fill remaining Group 1 SWA blocks with a finalized idle owner (`seq_idle` has a
+        //    newer non-zero `turn_end_stamp`, whereas newly admitted `seq_b` has stamp 0!),
+        //    leaving only 2 free SWA blocks so Lane A's `[64..224)` must trigger SWA reclaim.
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            assert_eq!(rt.coordinator.request_token_count_all(seq_b), Ok(32));
+            assert!(
+                rt.coordinator
+                    .full_adapter()
+                    .block_table_for(seq_b)
+                    .is_some()
+            );
+            assert!(
+                rt.coordinator
+                    .sliding_adapter()
+                    .unwrap()
+                    .block_table_for(seq_b)
+                    .is_some()
+            );
+            assert!(rt.conv_states.contains_key(&seq_b));
+            let swa_free = rt
+                .coordinator
+                .sliding_adapter()
+                .unwrap()
+                .block_telemetry()
+                .unwrap()
+                .free_blocks;
+            let idle_blocks = swa_free.saturating_sub(2).max(1);
+            let idle_tokens: Vec<u32> = (0..idle_blocks * 32).map(|i| 5 + (i % 40)).collect();
+            rt.coordinator.reset_scheduled_request(seq_idle).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_idle, &idle_tokens)
+                .unwrap();
+            rt.coordinator
+                .finalize_keep_live_all(seq_idle, &[], 0x1D1E)
+                .unwrap();
+        }
+
+        // 5. Run step-level SWA reclaim + prefill pass for Lane A: `seq_idle` must be reclaimed
+        //    while newly admitted `seq_b` keeps both KV groups and its ShortConv state intact!
+        inner.ensure_swa_headroom_for_total(seq_a, 224);
+        match inner
+            .run_paged_prefill_pass(seq_a, &prompt_a, 64, 224, salt_a, true, gen_stream, None)
+            .expect("seq_a [64..224) must succeed by reclaiming seq_idle")
+        {
+            ScheduledPrefillPass::Done(Some(_)) => {}
+            ScheduledPrefillPass::Done(None) | ScheduledPrefillPass::Paused => {
+                panic!("expected Done(Some(logits)) for seq_a");
+            }
+        }
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            assert_eq!(
+                rt.coordinator.request_token_count_all(seq_b),
+                Ok(32),
+                "newly admitted lane seq_b must remain live in BOTH KV groups after SWA reclaim"
+            );
+            assert!(
+                rt.coordinator
+                    .full_adapter()
+                    .block_table_for(seq_b)
+                    .is_some()
+                    && rt
+                        .coordinator
+                        .sliding_adapter()
+                        .unwrap()
+                        .block_table_for(seq_b)
+                        .is_some(),
+                "newly admitted lane seq_b must retain both Global and SWA block tables"
+            );
+            assert!(
+                rt.conv_states.contains_key(&seq_b),
+                "newly admitted lane seq_b must retain its ShortConv state after SWA reclaim"
+            );
+            assert!(
+                !rt.coordinator.is_live_all(seq_idle),
+                "idle owner seq_idle must be reclaimed instead of newly admitted seq_b"
+            );
+        }
+
+        // 6. Once `scheduled_turn_closed(seq_b)` runs, `seq_b` drops out of
+        //    `active_scheduled_seqs` and becomes eligible for SWA reclaim.
+        inner.scheduled_turn_closed(seq_b);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .active_scheduled_seqs
+                .contains(&seq_b),
+            "scheduled_turn_closed must remove seq_b from active_scheduled_seqs"
+        );
+    }
+
+    /// Regression for Codex Finding 2: verifies scheduled speculative verification (multi-token
+    /// DFlash2 accept crossing a rolling checkpoint interval, e.g. `61 -> 66` across `64`) AND
+    /// scheduled AR peer verification (`63 -> 64`) both capture restorable `StateClass::Checkpoint`
+    /// entries BEFORE `settle_committed` prunes SWA, carrying the 4-bit `DraftContextWindow` on
+    /// DFlash2 lanes while respecting `reuse_cache = false` opt-out.
+    #[test]
+    fn scheduled_speculative_verify_captures_decode_rolling_checkpoint_before_swa_prune() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{ScheduledVerifyCommit, ScheduledVerifyRow};
+
+        let _cp_guard = CheckpointIntervalGuard::set(64);
+        let gen_stream = crate::stream::Stream::generation();
+        let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 4);
+
+        let seq_spec = 1u32;
+        let seq_optout = 2u32;
+        let seq_ar = 3u32;
+        let seq_restore = 4u32;
+        let salt_spec = 0xF201u64;
+        let salt_optout = 0xF202u64;
+        let salt_ar = 0xF203u64;
+
+        let prompt_spec: Vec<u32> = (0u32..61u32).map(|i| 10 + (i % 50)).collect();
+        let prompt_optout: Vec<u32> = (0u32..61u32).map(|i| 25 + (i % 50)).collect();
+        let prompt_ar: Vec<u32> = (0u32..63u32).map(|i| 40 + (i % 50)).collect();
+
+        // Prefill two speculative DFlash2 lanes to 61 tokens (one cacheable, one reuse_cache=false)
+        // and one AR peer lane to 63 tokens.
+        inner
+            .prepare_prefix_sync(seq_spec, &prompt_spec, true, salt_spec)
+            .expect("prepare spec");
+        assert!(
+            inner
+                .begin_scheduled_dspark(seq_spec, 0)
+                .expect("begin spec")
+        );
+        inner
+            .run_paged_prefill_pass(
+                seq_spec,
+                &prompt_spec,
+                0,
+                prompt_spec.len(),
+                salt_spec,
+                true,
+                gen_stream,
+                None,
+            )
+            .expect("prefill spec");
+
+        inner
+            .prepare_prefix_sync(seq_optout, &prompt_optout, false, salt_optout)
+            .expect("prepare optout");
+        assert!(
+            inner
+                .begin_scheduled_dspark(seq_optout, 0)
+                .expect("begin optout")
+        );
+        inner
+            .run_paged_prefill_pass(
+                seq_optout,
+                &prompt_optout,
+                0,
+                prompt_optout.len(),
+                salt_optout,
+                false,
+                gen_stream,
+                None,
+            )
+            .expect("prefill optout");
+
+        inner
+            .prepare_prefix_sync(seq_ar, &prompt_ar, true, salt_ar)
+            .expect("prepare ar");
+        inner
+            .run_paged_prefill_pass(
+                seq_ar,
+                &prompt_ar,
+                0,
+                prompt_ar.len(),
+                salt_ar,
+                true,
+                gen_stream,
+                None,
+            )
+            .expect("prefill ar");
+
+        // Clear prompt-time junctions so only rolling checkpoints captured by the scheduled verify
+        // commit exist in `state_store`.
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.state_store.clear_ram_and_checkpoints();
+            rt.state_store.sync_marks(&rt.coordinator);
+        }
+
+        let spec_verify_tokens = vec![71u32, 72, 73, 74, 75, 76, 77, 78];
+        let optout_verify_tokens = vec![81u32, 82, 83, 84, 85, 86, 87, 88];
+        let ar_verify_tokens = vec![91u32];
+
+        let verify_rows = vec![
+            ScheduledVerifyRow {
+                seq_id: seq_spec,
+                first_position: 61,
+                tokens: spec_verify_tokens.clone(),
+                speculative: true,
+            },
+            ScheduledVerifyRow {
+                seq_id: seq_optout,
+                first_position: 61,
+                tokens: optout_verify_tokens.clone(),
+                speculative: true,
+            },
+            ScheduledVerifyRow {
+                seq_id: seq_ar,
+                first_position: 63,
+                tokens: ar_verify_tokens.clone(),
+                speculative: false,
+            },
+        ];
+        let _ = inner
+            .verify_scheduled_dspark(&verify_rows)
+            .expect("scheduled verify wave");
+
+        // Commit `keep = 5` on both speculative lanes (crossing boundary 64 -> 66, followed by
+        // `settle_committed` SWA pruning) and `keep = 1` on the AR peer (63 -> 64).
+        let commit_results = inner
+            .commit_scheduled_dspark(&[
+                ScheduledVerifyCommit {
+                    seq_id: seq_spec,
+                    keep: 5,
+                },
+                ScheduledVerifyCommit {
+                    seq_id: seq_optout,
+                    keep: 5,
+                },
+                ScheduledVerifyCommit {
+                    seq_id: seq_ar,
+                    keep: 1,
+                },
+            ])
+            .expect("scheduled commit wave");
+        assert!(commit_results.iter().all(Result::is_ok));
+
+        let mut query_spec = prompt_spec.clone();
+        query_spec.extend_from_slice(&spec_verify_tokens[..3]); // exact depth 64
+        query_spec.push(99); // trailing query token required by lookup_deepest_restorable
+
+        let mut query_optout = prompt_optout.clone();
+        query_optout.extend_from_slice(&optout_verify_tokens[..3]);
+        query_optout.push(99);
+
+        let mut query_ar = prompt_ar.clone();
+        query_ar.push(ar_verify_tokens[0]); // exact depth 64
+        query_ar.push(99);
+
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            let hit_spec = rt
+                .state_store
+                .lookup_deepest_restorable(&rt.coordinator, &query_spec, salt_spec)
+                .expect(
+                    "scheduled DFlash2 multi-token commit must capture rolling checkpoint at 64",
+                );
+            assert_eq!(hit_spec.depth, 64);
+            let entry_spec = rt.state_store.store.get(hit_spec.id).unwrap();
+            assert!(
+                entry_spec.checkpoint(),
+                "scheduled speculative rolling capture must use StateClass::Checkpoint"
+            );
+            assert!(
+                entry_spec.ram().unwrap().draft_window.is_some(),
+                "DFlash2 decode rolling checkpoint must carry its 4-bit DraftContextWindow"
+            );
+            assert!(
+                rt.state_store
+                    .lookup_deepest_restorable(&rt.coordinator, &query_spec, salt_spec ^ 1)
+                    .is_none(),
+                "wrong salt must not hit speculative checkpoint"
+            );
+            assert!(
+                rt.state_store
+                    .lookup_deepest_restorable(&rt.coordinator, &query_optout, salt_optout)
+                    .is_none(),
+                "reuse_cache=false speculative lane must NOT publish rolling checkpoint"
+            );
+
+            let hit_ar = rt
+                .state_store
+                .lookup_deepest_restorable(&rt.coordinator, &query_ar, salt_ar)
+                .expect("scheduled AR peer commit must capture rolling checkpoint at 64");
+            assert_eq!(hit_ar.depth, 64);
+            assert!(rt.state_store.store.get(hit_ar.id).unwrap().checkpoint());
+            assert_eq!(rt.state_store.store.entries().count(), 2);
+        }
+
+        // Verify the captured DFlash2 rolling checkpoint actually restores onto a fresh lane
+        // and resumes DFlash2 speculation at position 64!
+        let restored = inner
+            .prepare_prefix_sync(seq_restore, &query_spec, true, salt_spec)
+            .expect("restore speculative rolling checkpoint");
+        assert_eq!(restored.effective_cached_prefix_len, 64);
+        assert!(
+            inner
+                .begin_scheduled_dspark(seq_restore, 64)
+                .expect("begin_scheduled_dspark on restored rolling checkpoint"),
+            "restored DFlash2 rolling checkpoint must reactivate speculation at depth 64"
+        );
+    }
+
+    /// Regression for Codex Finding 3: a single-lane fault during batched DFlash2 proposal
+    /// selection OR batched DFlash2 tap append MUST fail ONLY the broken lane (and discard its
+    /// dirty draft owner + invalidate any gapped draft window) while every healthy peer lane in
+    /// the wave succeeds and continues speculating cleanly.
+    #[test]
+    fn batched_dflash2_propose_and_tap_append_fault_isolation_preserves_healthy_peer() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::array::{DType, MxArray};
+        use crate::engine::hybrid_scheduler::{
+            ScheduledProposalRequest, ScheduledVerifyCommit, ScheduledVerifyRow,
+        };
+        use crate::engine::params::ChatParams;
+        use crate::models::inkling2::dflash2::Inkling2DraftContext;
+        use crate::models::qwen3_5::dflash2::DFlash2Model;
+        use crate::sampling::SamplingConfig;
+
+        let gen_stream = crate::stream::Stream::generation();
+        let greedy_params = ChatParams {
+            cache_salt: 0,
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+            max_new_tokens: 32,
+            repetition_penalty: 1.0,
+            repetition_context_size: 0,
+            presence_penalty: 0.0,
+            presence_context_size: 0,
+            frequency_penalty: 0.0,
+            frequency_context_size: 0,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                ..SamplingConfig::default()
+            }),
+            report_performance: false,
+            reuse_cache: true,
+            include_reasoning: false,
+            extra_eos_ids: Vec::new(),
+            enable_mtp: true,
+            mtp_depth: 7,
+            mtp_adaptive_depth: false,
+        };
+        let mut host_sampled_params = greedy_params.clone();
+        host_sampled_params.repetition_penalty = 1.1;
+        host_sampled_params.sampling_config = Some(SamplingConfig {
+            temperature: Some(0.8),
+            ..SamplingConfig::default()
+        });
+
+        // Part A: Single-lane selector fault during `propose_scheduled_dspark_batch`.
+        {
+            let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 4);
+            let seq_bad = 1u32;
+            let seq_ok = 2u32;
+            let prompt_bad: Vec<u32> = vec![10, 11, 12, 13, 14, 15, 16, 17];
+            let prompt_ok: Vec<u32> = vec![20, 21, 22, 23, 24, 25, 26, 27];
+
+            for (seq, prompt, salt) in [
+                (seq_bad, &prompt_bad, 0xA1u64),
+                (seq_ok, &prompt_ok, 0xA2u64),
+            ] {
+                inner
+                    .prepare_prefix_sync(seq, prompt, true, salt)
+                    .expect("prepare");
+                assert!(inner.begin_scheduled_dspark(seq, 0).expect("begin"));
+                inner
+                    .run_paged_prefill_pass(
+                        seq,
+                        prompt,
+                        0,
+                        prompt.len(),
+                        salt,
+                        true,
+                        gen_stream,
+                        None,
+                    )
+                    .expect("prefill");
+            }
+
+            // Poison `seq_bad`'s draft context with NaN taps so host-sampled selection returns Err.
+            {
+                let h = inner.config.hidden_size as i64;
+                let draft = inner.dflash2.as_ref().unwrap();
+                let n_taps = draft.config.target_layers.len();
+                let nan_tap = MxArray::from_float32(&vec![f32::NAN; 2 * h as usize], &[2, h])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let nan_taps: Vec<MxArray> = (0..n_taps).map(|_| nan_tap.clone()).collect();
+                let lane = inner.scheduled_dspark.seq_lanes.get_mut(&seq_bad).unwrap();
+                let Inkling2DraftContext::Dflash2(dctx) = &mut lane.ctx else {
+                    panic!("expected DFlash2 lane");
+                };
+                dctx.append_taps(draft, &nan_taps, &[30, 31]).unwrap();
+            }
+
+            let mut rng_bad = rand::rng();
+            let mut rng_ok = rand::rng();
+            let mut prop_iter = inner
+                .propose_scheduled_dspark_batch(&mut [
+                    ScheduledProposalRequest {
+                        seq_id: seq_bad,
+                        anchor: 31,
+                        max_drafts: 7,
+                        params: &host_sampled_params,
+                        rng: &mut rng_bad,
+                        confidence: false,
+                    },
+                    ScheduledProposalRequest {
+                        seq_id: seq_ok,
+                        anchor: 27,
+                        max_drafts: 7,
+                        params: &greedy_params,
+                        rng: &mut rng_ok,
+                        confidence: true,
+                    },
+                ])
+                .into_iter();
+            assert!(
+                prop_iter.next().unwrap().is_err(),
+                "NaN-poisoned lane must fail proposal cleanly"
+            );
+            assert!(
+                !inner.scheduled_dspark.seq_lanes.contains_key(&seq_bad),
+                "failing proposal lane must be discarded from seq_lanes (never parked dirty)"
+            );
+            let mut ok_prop = prop_iter
+                .next()
+                .unwrap()
+                .expect("healthy peer must succeed despite sibling proposal fault");
+            ok_prop.materialize_draft_ids().unwrap();
+            assert_eq!(ok_prop.draft_ids.len(), 7);
+            assert!(inner.scheduled_dspark.seq_lanes.contains_key(&seq_ok));
+
+            // Confirm healthy peer verifies + commits cleanly after sibling failure.
+            let mut verify_tokens = vec![27u32];
+            verify_tokens.extend(ok_prop.draft_ids.iter().map(|&t| t as u32));
+            let _ = inner
+                .verify_scheduled_dspark(&[ScheduledVerifyRow {
+                    seq_id: seq_ok,
+                    first_position: 8,
+                    tokens: verify_tokens,
+                    speculative: true,
+                }])
+                .expect("healthy peer verify");
+            let commit = inner
+                .commit_scheduled_dspark(&[ScheduledVerifyCommit {
+                    seq_id: seq_ok,
+                    keep: 4,
+                }])
+                .expect("healthy peer commit");
+            assert!(commit[0].is_ok());
+            assert_eq!(
+                inner
+                    .scheduled_dspark
+                    .seq_lanes
+                    .get(&seq_ok)
+                    .unwrap()
+                    .ctx
+                    .committed_len(),
+                12
+            );
+        }
+
+        // Part B: Mid-batch ring-store fault during `commit_scheduled_dspark` (`append_committed_taps_batch`).
+        {
+            let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 4);
+            let seqs = [10u32, 11, 12];
+            for (idx, &seq) in seqs.iter().enumerate() {
+                let prompt: Vec<u32> = (0u32..8u32)
+                    .map(|k| ((idx as u32) * 15 + k + 5) % 100)
+                    .collect();
+                let salt = 0xB0u64 + idx as u64;
+                inner
+                    .prepare_prefix_sync(seq, &prompt, true, salt)
+                    .expect("prepare");
+                assert!(inner.begin_scheduled_dspark(seq, 0).expect("begin"));
+                inner
+                    .run_paged_prefill_pass(
+                        seq,
+                        &prompt,
+                        0,
+                        prompt.len(),
+                        salt,
+                        true,
+                        gen_stream,
+                        None,
+                    )
+                    .expect("prefill");
+            }
+
+            let verify_rows: Vec<ScheduledVerifyRow> = seqs
+                .iter()
+                .enumerate()
+                .map(|(idx, &seq)| ScheduledVerifyRow {
+                    seq_id: seq,
+                    first_position: 8,
+                    tokens: (0u32..8u32)
+                        .map(|k| ((idx as u32) * 12 + k + 40) % 100)
+                        .collect(),
+                    speculative: true,
+                })
+                .collect();
+            let _ = inner
+                .verify_scheduled_dspark(&verify_rows)
+                .expect("3-lane verify wave");
+
+            // Corrupt middle lane (`seqs[1]`) draft ring buffer so `append_batched` fails mid-wave
+            // AFTER `seqs[0]` committed and BEFORE `seqs[2]` runs.
+            {
+                let last_layer = inner
+                    .dflash2
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .num_hidden_layers
+                    .saturating_sub(1);
+                let lane = inner.scheduled_dspark.seq_lanes.get_mut(&seqs[1]).unwrap();
+                let Inkling2DraftContext::Dflash2(dctx) = &mut lane.ctx else {
+                    panic!("expected DFlash2 lane");
+                };
+                DFlash2Model::corrupt_window_buffer_for_test(&mut dctx.cache, last_layer);
+            }
+
+            let commit_results = inner
+                .commit_scheduled_dspark(&[
+                    ScheduledVerifyCommit {
+                        seq_id: seqs[0],
+                        keep: 3,
+                    },
+                    ScheduledVerifyCommit {
+                        seq_id: seqs[1],
+                        keep: 3,
+                    },
+                    ScheduledVerifyCommit {
+                        seq_id: seqs[2],
+                        keep: 4,
+                    },
+                ])
+                .expect("commit wave returns per-lane results");
+            assert!(
+                commit_results[0].is_ok(),
+                "lane 0 must commit cleanly: {:?}",
+                commit_results[0]
+            );
+            assert!(
+                commit_results[1].is_err(),
+                "corrupted middle lane must return per-lane Err"
+            );
+            assert!(
+                commit_results[2].is_ok(),
+                "lane 2 must recover and commit cleanly: {:?}",
+                commit_results[2]
+            );
+
+            assert!(
+                !inner.scheduled_dspark.seq_lanes.contains_key(&seqs[1]),
+                "failing tap-append lane must be discarded from seq_lanes"
+            );
+            assert!(
+                !inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .draft_windows
+                    .contains_key(&seqs[1]),
+                "failing tap-append lane must have its gapped draft window invalidated"
+            );
+            assert_eq!(
+                inner
+                    .scheduled_dspark
+                    .seq_lanes
+                    .get(&seqs[0])
+                    .unwrap()
+                    .ctx
+                    .committed_len(),
+                11
+            );
+            assert_eq!(
+                inner
+                    .scheduled_dspark
+                    .seq_lanes
+                    .get(&seqs[2])
+                    .unwrap()
+                    .ctx
+                    .committed_len(),
+                12
+            );
+
+            // Both healthy peers continue batched proposal cleanly on the very next cycle!
+            let mut rng0 = rand::rng();
+            let mut rng2 = rand::rng();
+            let next_props = inner.propose_scheduled_dspark_batch(&mut [
+                ScheduledProposalRequest {
+                    seq_id: seqs[0],
+                    anchor: 42,
+                    max_drafts: 7,
+                    params: &greedy_params,
+                    rng: &mut rng0,
+                    confidence: false,
+                },
+                ScheduledProposalRequest {
+                    seq_id: seqs[2],
+                    anchor: 67,
+                    max_drafts: 7,
+                    params: &greedy_params,
+                    rng: &mut rng2,
+                    confidence: false,
+                },
+            ]);
+            assert!(next_props[0].is_ok(), "lane 0 next propose must succeed");
+            assert!(next_props[1].is_ok(), "lane 2 next propose must succeed");
+        }
     }
 }

@@ -129,6 +129,21 @@ fn merge_split_projections_with_policy(
         left: &str,
         right: &str,
     ) -> Result<bool> {
+        // Keep projections split whenever either member carries a per-tensor outer scale
+        // (e.g. NVFP4 `.global_scale` / `.weight_scale_2` / `.weight_global_scale` / `.scale`),
+        // because merging under one prefix would orphan/drop those sidecars before `build_ql`.
+        for outer_suffix in [
+            "scale",
+            "global_scale",
+            "weight_scale_2",
+            "weight_global_scale",
+        ] {
+            if params.contains_key(&format!("{left}.{outer_suffix}"))
+                || params.contains_key(&format!("{right}.{outer_suffix}"))
+            {
+                return Ok(false);
+            }
+        }
         for suffix in ["weight", "scales", "biases"] {
             let a = params.get(&format!("{left}.{suffix}"));
             let b = params.get(&format!("{right}.{suffix}"));
@@ -1872,6 +1887,7 @@ fn gguf_tensor_imports_quantized(
     (tensor_type.k_quant_format().is_some() && import_k_quants)
         || tensor_type.is_mlx_affine_quantized()
         || tensor_type.is_mlx_mxfp4_quantized()
+        || tensor_type.is_mlx_mxfp8_quantized()
         || tensor_type.is_mlx_nvfp4_quantized()
 }
 
@@ -1982,6 +1998,8 @@ fn estimate_clef_gguf_discrete_fit(
                 .checked_add(align(sidecar_bytes)?)?
         } else if tensor.tensor_type.is_mlx_mxfp4_quantized() {
             align(numel / 2)?.checked_add(align(numel / 32)?)?
+        } else if tensor.tensor_type.is_mlx_mxfp8_quantized() {
+            align(numel)?.checked_add(align(numel / 32)?)?
         } else if tensor.tensor_type.is_mlx_nvfp4_quantized() {
             align(numel / 2)?.checked_add(align(numel / 16)?)?
         } else {
@@ -3951,30 +3969,35 @@ fn apply_weights_inner_with_residency_with_cuda_ctx(
             QlBuildSpec {
                 tiling: QlTiling::TileCollect(&mut tiled_prefixes.borrow_mut()),
                 input_amax: InputAmaxPolicy::ActivationFp8SitesOnly,
-                promote_affine_sidecars: if preserve_host_backed {
-                    AffineSidecarPromotion::None
-                } else {
-                    promote_affine_sidecars
-                },
+                promote_affine_sidecars: AffineSidecarPromotion::None,
                 ..QlBuildSpec::standard(family)
             },
         )?;
         let built = if plq.mode == PerLayerMode::Affine {
             let q8_sym128 = resolve_sym_zp_for(symmetric_zero_points, prefix) == Some(128);
             built
-                .map(|mut ql| -> Result<_> {
-                    if preserve_host_backed {
-                        match promote_affine_sidecars {
-                            AffineSidecarPromotion::None => {}
-                            AffineSidecarPromotion::ToBf16 => {
-                                ql.promote_affine_sidecars_to_bf16_with_host_policy(true)?;
-                            }
-                            AffineSidecarPromotion::ToF32For(dtype) => {
-                                ql.promote_affine_sidecars_to_f32_with_host_policy(dtype, true)?;
-                            }
+                .map(|ql| -> Result<_> {
+                    // Mark `q8_symmetric_128` BEFORE promoting sidecars to F32 so
+                    // Metal retains the pre-promotion Float16 scales for BF16-I/O
+                    // NAX prefill (`mlx_inkling2_q8_sym_matmul_bf16`) while keeping
+                    // F32 sidecars for M=1..=8 decode/verify (`mixed_projection_forward`
+                    // and `affine_bf16_matmul_few`).
+                    let mut ql = ql.with_q8_symmetric_128(q8_sym128);
+                    match promote_affine_sidecars {
+                        AffineSidecarPromotion::None => {}
+                        AffineSidecarPromotion::ToBf16 => {
+                            ql.promote_affine_sidecars_to_bf16_with_host_policy(
+                                preserve_host_backed,
+                            )?;
+                        }
+                        AffineSidecarPromotion::ToF32For(dtype) => {
+                            ql.promote_affine_sidecars_to_f32_with_host_policy(
+                                dtype,
+                                preserve_host_backed,
+                            )?;
                         }
                     }
-                    Ok(ql.with_q8_symmetric_128(q8_sym128))
+                    Ok(ql)
                 })
                 .transpose()?
         } else {
@@ -11002,6 +11025,200 @@ mod tests {
             down_proj.get_biases().unwrap().dtype().unwrap(),
             DType::Float32
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_q8_sym128_retains_f16_prefill_scales_on_in_proj_ba_and_merged_proj() {
+        use crate::models::quantized_linear::METAL_SYM_Q8_PREFILL_CALLS;
+        use std::sync::atomic::Ordering;
+
+        let cfg = Qwen3_5Config {
+            vocab_size: 16,
+            hidden_size: 64,
+            num_layers: 2,
+            num_heads: 2,
+            num_kv_heads: 2,
+            intermediate_size: 64,
+            rms_norm_eps: 1e-6,
+            head_dim: 32,
+            tie_word_embeddings: true,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 0,
+            linear_num_value_heads: 48,
+            linear_num_key_heads: 2,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 2,
+            partial_rotary_factor: 0.5,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: Some("bf16".to_string()),
+            rope_scaling: None,
+        };
+        let mut inner = Qwen35Inner::new(cfg.clone()).expect("Qwen35Inner::new");
+        let mut params = HashMap::new();
+        params.insert(
+            "embedding.weight".to_string(),
+            MxArray::zeros(&[cfg.vocab_size as i64, 64], Some(DType::BFloat16)).unwrap(),
+        );
+        let insert_q8_sym128 =
+            |params: &mut HashMap<String, MxArray>, prefix: &str, n: i64, k: i64| {
+                let scales = MxArray::ones(&[n, k / 32], Some(DType::Float16)).unwrap();
+                let biases = scales.mul_scalar(-128.0).unwrap();
+                params.insert(
+                    format!("{prefix}.weight"),
+                    MxArray::zeros(&[n, k / 4], Some(DType::Uint32)).unwrap(),
+                );
+                params.insert(format!("{prefix}.scales"), scales);
+                params.insert(format!("{prefix}.biases"), biases);
+            };
+        // Layer 0 (GDN): dense BF16 `in_proj_qkvz`/`out_proj` + Q8_0 `in_proj_ba` (N=96 = 2 * 48 v_heads)
+        // matching Qwen3.8-27B's hybrid K-quant/Q8_0 split where `in_proj_ba` runs standalone.
+        let key_dim = i64::from(cfg.linear_num_key_heads * cfg.linear_key_head_dim);
+        let value_dim = i64::from(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
+        let conv_dim = key_dim * 2 + value_dim;
+        params.insert(
+            "layers.0.linear_attn.in_proj_qkvz.weight".to_string(),
+            MxArray::zeros(&[conv_dim + value_dim, 64], Some(DType::BFloat16)).unwrap(),
+        );
+        insert_q8_sym128(&mut params, "layers.0.linear_attn.in_proj_ba", 96, 64);
+        params.insert(
+            "layers.0.linear_attn.out_proj.weight".to_string(),
+            MxArray::zeros(&[64, value_dim], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.conv1d.weight".to_string(),
+            MxArray::zeros(&[conv_dim, 4, 1], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.norm.weight".to_string(),
+            MxArray::ones(&[32], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.dt_bias".to_string(),
+            MxArray::zeros(&[48], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.A_log".to_string(),
+            MxArray::zeros(&[48], Some(DType::Float32)).unwrap(),
+        );
+        // Layer 0 MLP: Q8_0 `gate_proj` + `up_proj` + `down_proj` (`gate|up` merge via `concat_rows` + `slice_rows`).
+        insert_q8_sym128(&mut params, "layers.0.mlp.gate_proj", 64, 64);
+        insert_q8_sym128(&mut params, "layers.0.mlp.up_proj", 64, 64);
+        insert_q8_sym128(&mut params, "layers.0.mlp.down_proj", 64, 64);
+        // Layer 1 (FullAttn): Q8_0 `o_proj` (direct) + `k_proj`/`v_proj` (merged `kv_proj`).
+        insert_q8_sym128(&mut params, "layers.1.self_attn.k_proj", 64, 64);
+        insert_q8_sym128(&mut params, "layers.1.self_attn.v_proj", 64, 64);
+        insert_q8_sym128(&mut params, "layers.1.self_attn.o_proj", 64, 64);
+
+        let q8_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            input_amax: None,
+            layout: Default::default(),
+        };
+        let per_layer_quant = HashMap::from([
+            ("layers.0.linear_attn.in_proj_ba".to_string(), q8_plq),
+            ("layers.0.mlp.gate_proj".to_string(), q8_plq),
+            ("layers.0.mlp.up_proj".to_string(), q8_plq),
+            ("layers.0.mlp.down_proj".to_string(), q8_plq),
+            ("layers.1.self_attn.k_proj".to_string(), q8_plq),
+            ("layers.1.self_attn.v_proj".to_string(), q8_plq),
+            ("layers.1.self_attn.o_proj".to_string(), q8_plq),
+        ]);
+        let sym_zp = SymmetricZeroPoints {
+            default: None,
+            per_layer: HashMap::from([
+                ("layers.0.linear_attn.in_proj_b".to_string(), Some(128)),
+                ("layers.0.linear_attn.in_proj_a".to_string(), Some(128)),
+                ("layers.0.mlp.gate_proj".to_string(), Some(128)),
+                ("layers.0.mlp.up_proj".to_string(), Some(128)),
+                ("layers.0.mlp.down_proj".to_string(), Some(128)),
+                ("layers.1.self_attn.k_proj".to_string(), Some(128)),
+                ("layers.1.self_attn.v_proj".to_string(), Some(128)),
+                ("layers.1.self_attn.o_proj".to_string(), Some(128)),
+            ]),
+        };
+
+        let err = apply_weights_inner_with_residency_and_sym_zp(
+            &mut inner,
+            &mut params,
+            &cfg,
+            4,
+            64,
+            Some(PerLayerMode::Affine),
+            &per_layer_quant,
+            &sym_zp,
+            false,
+            None,
+            None,
+            None,
+            false,
+        )
+        .expect_err("partial checkpoint should fail completeness validation");
+        assert!(
+            err.reason.contains("missing mandatory weights"),
+            "unexpected error: {}",
+            err.reason
+        );
+
+        // 1. Layer 0 GDN `in_proj_ba` (N=96) routes cleanly through Metal NAX BF16-I/O
+        //    Q8_0 prefill on M=32 without FP32 promotion.
+        let AttentionType::Linear(gdn) = &inner.layers[0].attn else {
+            panic!("layer 0 must be GDN");
+        };
+        if unsafe { mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_metal_is_nax_available() } {
+            let x = MxArray::ones(&[1, 32, 64], Some(DType::BFloat16)).unwrap();
+            let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+            let y = gdn.forward(&x, None, None, true).unwrap();
+            let after = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+            assert_eq!(y.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(y.shape().unwrap().as_ref(), [1, 32, 64]);
+            assert!(
+                after > before,
+                "GDN in_proj_ba (N=96) must hit Metal NAX BF16-I/O symmetric Q8_0 prefill"
+            );
+        }
+
+        // 2. Merged Q8_0 `gate_proj`/`up_proj` keep Float32 sidecars for M=1..=8 AND retain
+        //    native Float16 prefill scales across `concat_rows` + `slice_rows`.
+        let MLPType::Dense(MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            gate_up,
+            ..
+        }) = &inner.layers[0].mlp
+        else {
+            panic!("layer 0 MLP must be quantized");
+        };
+        let merged = &gate_up.as_ref().expect("Q8_0 gate|up must merge").0;
+        for ql in [gate_proj, up_proj, merged] {
+            assert_eq!(ql.get_scales().dtype().unwrap(), DType::Float32);
+            assert_eq!(ql.get_biases().unwrap().dtype().unwrap(), DType::Float32);
+            assert!(ql.is_q8_symmetric_128());
+            assert!(ql.has_q8_scales_f16());
+        }
+
+        // 3. FullAttn `o_proj` and merged `kv_proj`.
+        let AttentionType::Full(attn) = &inner.layers[1].attn else {
+            panic!("layer 1 must be full attention");
+        };
+        assert!(attn.has_merged_kv_proj());
+        let LinearProj::Quantized(o_ql) = attn.o_proj() else {
+            panic!("layer 1 o_proj must be quantized");
+        };
+        assert_eq!(o_ql.get_scales().dtype().unwrap(), DType::Float32);
+        assert!(o_ql.is_q8_symmetric_128());
+        assert!(o_ql.has_q8_scales_f16());
     }
 
     #[test]

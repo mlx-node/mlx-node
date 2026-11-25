@@ -639,7 +639,61 @@ impl HybridSchedulerBackend for Qwen35Inner {
         cache_salt: u64,
         mode: crate::engine::scheduler::PreemptionMode,
     ) -> Result<()> {
+        let prompt_tokens = self
+            .dflash2_states
+            .turns
+            .get(&seq_id)
+            .map_or(u32::MAX, |turn| turn.prompt_tokens);
+        self.preempt_scheduled_cache_with_prompt(seq_id, prompt_tokens, cache_salt, mode)
+    }
+
+    /// Splash 1.7.2 `Engine::vacateLane`: before releasing a preempted lane's
+    /// KV blocks, promote its latest reply checkpoint (`>= prompt_replay + 2048`)
+    /// to non-disposable `StateClass::Ordinary` (`Reply::Kept`, without eager
+    /// write-behind) so it survives Checkpoint-first eviction and spills to SSD
+    /// under memory pressure.
+    fn preempt_scheduled_cache_with_prompt(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        cache_salt: u64,
+        mode: crate::engine::scheduler::PreemptionMode,
+    ) -> Result<()> {
+        const PREEMPT_KEEP_REPLY_MIN_TOKENS: u32 = 2048;
         self.end_prefill_run(seq_id)?;
+        let block = self
+            .paged_adapter
+            .as_ref()
+            .map_or(1, PagedKVCacheAdapter::block_size)
+            .max(1);
+        let promoted = {
+            let states = &mut self.dflash2_states;
+            if let Some(turn) = states.turns.get_mut(&seq_id) {
+                let prompt_replay = if turn.plan.prompt_replay > 0 {
+                    turn.plan.prompt_replay
+                } else {
+                    (prompt_tokens.saturating_sub(1) / block) * block
+                };
+                let threshold = prompt_replay.saturating_add(PREEMPT_KEEP_REPLY_MIN_TOKENS);
+                if let Some((cp_id, publication)) = turn.latest_checkpoint
+                    && let Some(entry) = states.store.get(cp_id)
+                    && entry.checkpoint()
+                    && entry.publication() == publication
+                    && u32::try_from(entry.depth()).unwrap_or(0) >= threshold
+                {
+                    states.store.reuse(cp_id, false);
+                    turn.latest_checkpoint = None;
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if promoted {
+            self.sync_gdn_state_marks();
+        }
         let adapter = self.paged_adapter.as_mut().ok_or_else(|| {
             Error::from_reason(format!(
                 "{} cache manager is unavailable during preemption",
@@ -791,5 +845,253 @@ impl HybridSchedulerBackend for Qwen35Inner {
 
     fn step_executor(&mut self) -> Self::StepExecutor<'_> {
         crate::engine::hybrid_scheduler::HybridStepExecutor::new(self)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod preempt_reply_tests {
+    use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+    use crate::engine::scheduler::PreemptionMode;
+    use crate::models::qwen3_5::dflash2_state::disk::tests::{
+        fixture_on, park_blocks, persistent_test_tier,
+    };
+    use crate::models::qwen3_5::dflash2_state::paged::TurnStates;
+    use crate::models::qwen3_5::dflash2_state::plan::StatePlan;
+    use crate::models::qwen3_5::dflash2_state::store::StateClass;
+
+    #[test]
+    fn qwen35_preempt_long_reply_promotes_checkpoint_to_ordinary() {
+        let Some((mut inner, _tier)) = fixture_on(
+            0x16C0_0001,
+            256,
+            256,
+            persistent_test_tier("qwen35-preempt-reply", 1 << 30),
+        ) else {
+            return;
+        };
+        let bs = inner.paged_adapter.as_ref().unwrap().block_size();
+        // Short reply checkpoint: depth = 2 blocks (32 tokens < prompt_replay(16) + 2048).
+        let short_cp = park_blocks(&mut inner, 11, 2, StateClass::Checkpoint);
+        let short_pub = inner.dflash2_states.store.checkpoint_state(short_cp);
+        inner
+            .paged_adapter
+            .as_mut()
+            .unwrap()
+            .reset_for_new_request(1)
+            .unwrap();
+        inner.dflash2_states.turns.insert(
+            1,
+            TurnStates {
+                plan: StatePlan {
+                    boundaries: Vec::new(),
+                    prompt_replay: bs,
+                },
+                cursor: 0,
+                passed: Vec::new(),
+                anchor_bytes: 0,
+                latest_checkpoint: short_pub,
+                cache_salt: 0,
+                extra_keys: Vec::new(),
+                junction: 0,
+                prompt_tokens: bs + 4,
+                reuse: true,
+            },
+        );
+        inner
+            .preempt_scheduled_cache_with_prompt(1, bs + 4, 0, PreemptionMode::Recompute)
+            .expect("preempt short reply");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(short_cp)
+                .is_some_and(|e| e.checkpoint()),
+            "short reply checkpoint (< prompt_replay + 2048) must remain disposable Checkpoint"
+        );
+
+        // Long reply checkpoint: depth = prompt_replay + 2048 tokens -> promoted to Ordinary!
+        let long_blocks = 1 + 2048u32.div_ceil(bs);
+        let long_cp = park_blocks(&mut inner, 22, long_blocks, StateClass::Checkpoint);
+        let long_pub = inner.dflash2_states.store.checkpoint_state(long_cp);
+        inner
+            .paged_adapter
+            .as_mut()
+            .unwrap()
+            .reset_for_new_request(2)
+            .unwrap();
+        inner.dflash2_states.turns.insert(
+            2,
+            TurnStates {
+                plan: StatePlan {
+                    boundaries: Vec::new(),
+                    prompt_replay: bs,
+                },
+                cursor: 0,
+                passed: Vec::new(),
+                anchor_bytes: 0,
+                latest_checkpoint: long_pub,
+                cache_salt: 0,
+                extra_keys: Vec::new(),
+                junction: 0,
+                prompt_tokens: bs + 4,
+                reuse: true,
+            },
+        );
+        let wb_before = inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .unwrap()
+            .write_behind
+            .snapshot()
+            .waiting;
+        inner
+            .preempt_scheduled_cache_with_prompt(2, bs + 4, 0, PreemptionMode::Recompute)
+            .expect("preempt long reply");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(long_cp)
+                .is_some_and(|e| !e.checkpoint()),
+            "long reply checkpoint (>= prompt_replay + 2048) must be promoted to Ordinary"
+        );
+        assert_eq!(
+            inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .unwrap()
+                .write_behind
+                .snapshot()
+                .waiting,
+            wb_before,
+            "promoted preempted reply must NOT be eagerly enqueued into write_behind"
+        );
+    }
+
+    #[test]
+    fn qwen35_preempt_scheduled_cache_uses_turn_prompt_tokens_when_prompt_replay_is_zero() {
+        let Some((mut inner, _tier)) = fixture_on(
+            0x16C0_0002,
+            256,
+            256,
+            persistent_test_tier("qwen35-preempt-prompt-replay-zero", 1 << 30),
+        ) else {
+            return;
+        };
+        let bs = inner.paged_adapter.as_ref().unwrap().block_size();
+        // Short prompt (< block_size) -> prompt_replay = 0. Calling the 3-arg
+        // `HybridSchedulerBackend::preempt_scheduled_cache` must resolve the
+        // prompt length from `turn.prompt_tokens` instead of `u32::MAX` (which
+        // previously saturated `threshold` and suppressed checkpoint promotion).
+        let short_prompt = (bs / 2).max(1);
+
+        // Short reply (< 2048): must remain disposable Checkpoint.
+        let short_cp = park_blocks(&mut inner, 31, 2, StateClass::Checkpoint);
+        let short_pub = inner.dflash2_states.store.checkpoint_state(short_cp);
+        inner
+            .paged_adapter
+            .as_mut()
+            .unwrap()
+            .reset_for_new_request(11)
+            .unwrap();
+        inner.dflash2_states.turns.insert(
+            11,
+            TurnStates {
+                plan: StatePlan {
+                    boundaries: Vec::new(),
+                    prompt_replay: 0,
+                },
+                cursor: 0,
+                passed: Vec::new(),
+                anchor_bytes: 0,
+                latest_checkpoint: short_pub,
+                cache_salt: 0,
+                extra_keys: Vec::new(),
+                junction: 0,
+                prompt_tokens: short_prompt,
+                reuse: true,
+            },
+        );
+        HybridSchedulerBackend::preempt_scheduled_cache(
+            &mut inner,
+            11,
+            0,
+            PreemptionMode::Recompute,
+        )
+        .expect("preempt short reply via 3-arg trait entry point");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(short_cp)
+                .is_some_and(|e| e.checkpoint()),
+            "short reply (< 2048) with prompt_replay=0 must remain disposable Checkpoint"
+        );
+
+        // Long reply (>= 2048): must be promoted to Ordinary via 3-arg trait entry point!
+        let long_blocks = 2048u32.div_ceil(bs);
+        let long_cp = park_blocks(&mut inner, 32, long_blocks, StateClass::Checkpoint);
+        let long_pub = inner.dflash2_states.store.checkpoint_state(long_cp);
+        inner
+            .paged_adapter
+            .as_mut()
+            .unwrap()
+            .reset_for_new_request(12)
+            .unwrap();
+        inner.dflash2_states.turns.insert(
+            12,
+            TurnStates {
+                plan: StatePlan {
+                    boundaries: Vec::new(),
+                    prompt_replay: 0,
+                },
+                cursor: 0,
+                passed: Vec::new(),
+                anchor_bytes: 0,
+                latest_checkpoint: long_pub,
+                cache_salt: 0,
+                extra_keys: Vec::new(),
+                junction: 0,
+                prompt_tokens: short_prompt,
+                reuse: true,
+            },
+        );
+        let wb_before = inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .unwrap()
+            .write_behind
+            .snapshot()
+            .waiting;
+        HybridSchedulerBackend::preempt_scheduled_cache(
+            &mut inner,
+            12,
+            0,
+            PreemptionMode::Recompute,
+        )
+        .expect("preempt long reply via 3-arg trait entry point");
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(long_cp)
+                .is_some_and(|e| !e.checkpoint()),
+            "long reply (>= 2048) with prompt_replay=0 must be promoted to Ordinary via preempt_scheduled_cache"
+        );
+        assert_eq!(
+            inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .unwrap()
+                .write_behind
+                .snapshot()
+                .waiting,
+            wb_before,
+            "promoted preempted reply must NOT be eagerly enqueued into write_behind"
+        );
     }
 }

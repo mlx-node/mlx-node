@@ -1566,24 +1566,51 @@ fn profile_48_visits(
                     None,
                 )
             };
-            let gate_up = moe
-                .gate_up_proj
-                .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)
-                .expect("gu");
-            let gu_in = if gate_up.dtype().expect("dt") == act_dtype {
-                gate_up.clone()
-            } else {
-                gate_up.astype(act_dtype).expect("c")
+            let (gate_up, act_in) = match &moe.gate_up_proj {
+                super::moe::ExpertGateUp::Fused(proj) => {
+                    let gate_up = proj
+                        .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)
+                        .expect("gu");
+                    let gu_in = if gate_up.dtype().expect("dt") == act_dtype {
+                        gate_up.clone()
+                    } else {
+                        gate_up.astype(act_dtype).expect("c")
+                    };
+                    let outer_arg = proj.outer_scale().map(|s| (s, &idx_for_gather));
+                    let act = inkling2_situ(
+                        &gu_in,
+                        outer_arg,
+                        moe.mlp_gate_softcap as f32,
+                        moe.mlp_up_softcap as f32,
+                        moe.gate_up_interleaved,
+                    )
+                    .expect("situ");
+                    (gate_up, act)
+                }
+                super::moe::ExpertGateUp::Split { gate, up } => {
+                    let g = gate
+                        .forward(&x_for_gather, &idx_for_gather, do_sort)
+                        .expect("g");
+                    let u = up
+                        .forward(&x_for_gather, &idx_for_gather, do_sort)
+                        .expect("u");
+                    let gu = MxArray::concatenate(&g, &u, -1).expect("cat");
+                    let gu_in = if gu.dtype().expect("dt") == act_dtype {
+                        gu.clone()
+                    } else {
+                        gu.astype(act_dtype).expect("c")
+                    };
+                    let act = inkling2_situ(
+                        &gu_in,
+                        None,
+                        moe.mlp_gate_softcap as f32,
+                        moe.mlp_up_softcap as f32,
+                        false,
+                    )
+                    .expect("situ");
+                    (gu, act)
+                }
             };
-            let outer_arg = moe.gate_up_proj.outer_scale().map(|s| (s, &idx_for_gather));
-            let act_in = inkling2_situ(
-                &gu_in,
-                outer_arg,
-                moe.mlp_gate_softcap as f32,
-                moe.mlp_up_softcap as f32,
-                moe.gate_up_interleaved,
-            )
-            .expect("situ");
             let down_out = moe
                 .down_proj
                 .forward_without_outer_scale(&act_in, &idx_for_gather, do_sort)
@@ -2339,15 +2366,25 @@ fn profile_48_visits(
             let mut outs = Vec::with_capacity(caps.len());
             for cap in caps {
                 let moe = &inner.layers[cap.phys_layer].moe;
-                outs.push(
-                    moe.gate_up_proj
+                let gu = match &moe.gate_up_proj {
+                    super::moe::ExpertGateUp::Fused(proj) => proj
                         .forward_without_outer_scale(
                             &cap.x_for_gather,
                             &cap.idx_for_gather,
                             do_sort,
                         )
                         .expect("gu"),
-                );
+                    super::moe::ExpertGateUp::Split { gate, up } => {
+                        let g = gate
+                            .forward(&cap.x_for_gather, &cap.idx_for_gather, do_sort)
+                            .expect("g");
+                        let u = up
+                            .forward(&cap.x_for_gather, &cap.idx_for_gather, do_sort)
+                            .expect("u");
+                        MxArray::concatenate(&g, &u, -1).expect("cat")
+                    }
+                };
+                outs.push(gu);
             }
             eval_owned_sync(&outs);
         });
@@ -2365,14 +2402,20 @@ fn profile_48_visits(
                 } else {
                     cap.idx_for_gather.astype(DType::Int32).expect("c")
                 };
-                let outer = moe.gate_up_proj.outer_scale().map(|s| (s, &idx_i32));
+                let (outer, interleaved) = match &moe.gate_up_proj {
+                    super::moe::ExpertGateUp::Fused(proj) => (
+                        proj.outer_scale().map(|s| (s, &idx_i32)),
+                        moe.gate_up_interleaved,
+                    ),
+                    super::moe::ExpertGateUp::Split { .. } => (None, false),
+                };
                 outs.push(
                     inkling2_situ(
                         &gu_in,
                         outer,
                         moe.mlp_gate_softcap as f32,
                         moe.mlp_up_softcap as f32,
-                        moe.gate_up_interleaved,
+                        interleaved,
                     )
                     .expect("situ"),
                 );

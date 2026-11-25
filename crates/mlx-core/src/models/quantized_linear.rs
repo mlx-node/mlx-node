@@ -22,6 +22,7 @@ fn is_cuda_kquant_multi_eligible(q: &QuantizedLinear, rows: i64) -> bool {
     let mode_ok = matches!(base, "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs");
     mode_ok
         && q.bias.is_none()
+        && q.outer_scale.is_none()
         && q.hadamard.is_none()
         && q.input_amax.is_none()
         && q.biases.is_some()
@@ -142,7 +143,11 @@ pub(crate) fn mixed_projection_forward(
         };
         // A Q/gate row reorder is physical and remains valid here. Additive
         // bias and input transforms require their standalone forward semantics.
-        if q.bias.is_some() || q.hadamard.is_some() || q.input_amax.is_some() {
+        if q.bias.is_some()
+            || q.outer_scale.is_some()
+            || q.hadamard.is_some()
+            || q.input_amax.is_some()
+        {
             return Ok(None);
         }
         let format = match (q.mode.as_str(), q.bits, q.group_size) {
@@ -231,6 +236,77 @@ pub use crate::models::quant_dispatch::{KQuantLayout, PerLayerMode, PerLayerQuan
 pub(crate) struct PreparedSg8 {
     pub packed: MxArray,
     pub sums: MxArray,
+}
+
+/// Pre-quantized per-64 symmetric INT8 activation for Tiled64 NAX prefill
+/// (`kquant_prefill_int8_nax.metal`). Quantize once per shared input `x` and
+/// reuse across sibling projections (MLP gate+up, attention q+kv, GDN qkv+z).
+pub(crate) struct PreparedInt8Prefill {
+    pub xq: MxArray,
+    pub x_sa: MxArray,
+    pub x_ysum: MxArray,
+    pub orig_shape: Vec<i64>,
+}
+
+impl PreparedInt8Prefill {
+    /// Quantize `x` (`bfloat16 [..., M, K]`, `M >= 65`, `K % 256 == 0`) on
+    /// Metal NAX. Returns `Ok(None)` when off-contract or unsupported.
+    pub(crate) fn try_new(x: &MxArray) -> Result<Option<Self>> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = x;
+            Ok(None)
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::array::DType;
+            // SAFETY: nullary Metal capability / default-device predicates.
+            let metal_nax = unsafe {
+                sys::mlx_metal_is_available()
+                    && sys::mlx_metal_is_nax_available()
+                    && sys::mlx_default_device() == 1
+            };
+            if !metal_nax || x.dtype()? != DType::BFloat16 {
+                return Ok(None);
+            }
+            let shape = x.shape()?.to_vec();
+            if shape.len() < 2 {
+                return Ok(None);
+            }
+            let k = *shape.last().unwrap_or(&0);
+            if k <= 0 || k % 256 != 0 {
+                return Ok(None);
+            }
+            let m: i64 = shape[..shape.len() - 1].iter().product();
+            if m < 65 {
+                return Ok(None);
+            }
+            let mut out_xq = std::ptr::null_mut();
+            let mut out_sa = std::ptr::null_mut();
+            let mut out_ysum = std::ptr::null_mut();
+            // SAFETY: live array handle and writable output slots.
+            let status = unsafe {
+                sys::mlx_kquant_quantize_prefill_int8(
+                    x.handle.0,
+                    &mut out_xq,
+                    &mut out_sa,
+                    &mut out_ysum,
+                )
+            };
+            match status {
+                1 => Ok(Some(Self {
+                    xq: MxArray::from_handle(out_xq, "kquant_quantize_prefill_int8:xq")?,
+                    x_sa: MxArray::from_handle(out_sa, "kquant_quantize_prefill_int8:x_sa")?,
+                    x_ysum: MxArray::from_handle(out_ysum, "kquant_quantize_prefill_int8:x_ysum")?,
+                    orig_shape: shape,
+                })),
+                0 => Ok(None),
+                _ => Err(Error::from_reason(
+                    "K-quant INT8 prefill quantization failed",
+                )),
+            }
+        }
+    }
 }
 
 // `forward_lanes` routes taken on this thread: (lane tier calls, per-lane
@@ -386,6 +462,63 @@ pub enum LinearProj {
 impl LinearProj {
     pub(crate) fn supports_prepared_sg8(&self) -> bool {
         matches!(self, Self::Quantized(q) if q.supports_prepared_sg8())
+    }
+
+    pub(crate) fn supports_int8_prefill(&self) -> bool {
+        matches!(self, Self::Quantized(q) if q.supports_int8_prefill())
+    }
+
+    /// Forward using pre-quantized INT8 activation when supported, else `self.forward(x)`.
+    pub(crate) fn forward_int8_prefill_or(
+        &self,
+        x: &MxArray,
+        pre: Option<&PreparedInt8Prefill>,
+    ) -> Result<MxArray> {
+        if let (Self::Quantized(q), Some(pre)) = (self, pre)
+            && let Some(y) = q.forward_int8_prefill(pre)?
+        {
+            return Ok(y);
+        }
+        self.forward(x)
+    }
+
+    /// Mixer output projection that quantizes `x` to INT8 when `int8_act` is
+    /// enabled and fuses `MixerResidual::Store` into the INT8 GEMM store.
+    pub(crate) fn forward_mixer_output_int8_prefill(
+        &self,
+        x: &MxArray,
+        residual: Option<MixerResidual<'_>>,
+        int8_act: bool,
+    ) -> Result<MxArray> {
+        if int8_act
+            && let Self::Quantized(q) = self
+            && q.supports_int8_prefill()
+            && let Some(pre) = PreparedInt8Prefill::try_new(x)?
+        {
+            match residual {
+                None => {
+                    if let Some(y) = q.forward_int8_prefill(&pre)? {
+                        return Ok(y);
+                    }
+                }
+                Some(MixerResidual::Store(res)) => {
+                    if let Some(hidden) =
+                        q.try_store_epilogue_int8_prefill(&pre, res, StoreEpilogue::Residual)?
+                    {
+                        return Ok(hidden);
+                    }
+                    if let Some(delta) = q.forward_int8_prefill(&pre)? {
+                        return res.add(&delta);
+                    }
+                }
+                Some(MixerResidual::Verify(res)) => {
+                    if let Some(delta) = q.forward_int8_prefill(&pre)? {
+                        return res.add(&delta);
+                    }
+                }
+            }
+        }
+        self.forward_mixer_output(x, None, residual)
     }
 
     pub(crate) fn forward_prepared_sg8(
@@ -1013,6 +1146,152 @@ impl MLPVariant {
         }
     }
 
+    /// Quantized SwiGLU activation sharing a single `PreparedInt8Prefill`
+    /// across `gate_proj` and `up_proj` (with fused `SWIGLU` store epilogue on
+    /// `up_proj` when eligible). Returns `Ok(None)` when INT8 prefill does not
+    /// apply to either projection.
+    fn int8_prefill_activated(
+        x: &MxArray,
+        gate_proj: &QuantizedLinear,
+        up_proj: &QuantizedLinear,
+        gate_up: &Option<Box<(QuantizedLinear, i64)>>,
+    ) -> Result<Option<MxArray>> {
+        let any_i8 = gate_proj.supports_int8_prefill()
+            || up_proj.supports_int8_prefill()
+            || gate_up
+                .as_deref()
+                .is_some_and(|(m, _)| m.supports_int8_prefill());
+        if !any_i8 {
+            return Ok(None);
+        }
+        let Some(pre) = PreparedInt8Prefill::try_new(x)? else {
+            return Ok(None);
+        };
+        if gate_proj.supports_int8_prefill() && up_proj.supports_int8_prefill() {
+            let gate = match gate_proj.forward_int8_prefill(&pre)? {
+                Some(g) => g,
+                None => gate_proj.forward(x)?,
+            };
+            if let Some(activated) =
+                up_proj.try_store_epilogue_int8_prefill(&pre, &gate, StoreEpilogue::Swiglu)?
+            {
+                return Ok(Some(activated));
+            }
+            let up = match up_proj.forward_int8_prefill(&pre)? {
+                Some(u) => u,
+                None => up_proj.forward(x)?,
+            };
+            return Activations::swiglu_compiled(&gate, &up).map(Some);
+        }
+        if let Some((merged, split)) = gate_up.as_deref()
+            && let Some(combined) = merged.forward_int8_prefill(&pre)?
+        {
+            let last = combined.ndim()? as usize - 1;
+            let gu = combined.split_sections(&[*split], last as i32)?;
+            return Activations::swiglu_compiled(&gu[0], &gu[1]).map(Some);
+        }
+        let gate = match gate_proj.forward_int8_prefill(&pre)? {
+            Some(g) => g,
+            None => gate_proj.forward(x)?,
+        };
+        if let Some(activated) =
+            up_proj.try_store_epilogue_int8_prefill(&pre, &gate, StoreEpilogue::Swiglu)?
+        {
+            return Ok(Some(activated));
+        }
+        if let Some(activated) = up_proj.try_store_epilogue(x, &gate, StoreEpilogue::Swiglu)? {
+            return Ok(Some(activated));
+        }
+        let up = match up_proj.forward_int8_prefill(&pre)? {
+            Some(u) => u,
+            None => up_proj.forward(x)?,
+        };
+        Activations::swiglu_compiled(&gate, &up).map(Some)
+    }
+
+    /// `forward_store_residual` opting into per-32 INT8-activation NAX prefill
+    /// when `int8_act` is `true` (`Activations::Auto`), sharing one activation
+    /// quantization across `gate_proj` + `up_proj` and quantizing `activated`
+    /// once for `down_proj` with fused `RESIDUAL` store epilogue.
+    pub(crate) fn forward_store_residual_with_int8(
+        &self,
+        x: &MxArray,
+        residual: &MxArray,
+        int8_act: bool,
+    ) -> Result<MxArray> {
+        if !int8_act {
+            return self.forward_store_residual(x, residual);
+        }
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return residual.add(&self.forward(x)?);
+        };
+        if let Some(out) = Self::forward_sym8_cuda(x, down_proj, gate_up)? {
+            return residual.add(&out);
+        }
+        let activated = match Self::int8_prefill_activated(x, gate_proj, up_proj, gate_up)? {
+            Some(activated) => activated,
+            None => match Self::swiglu_store(x, gate_proj, up_proj, gate_up)? {
+                Some(activated) => activated,
+                None => Self::quantized_activated(x, gate_proj, up_proj, gate_up)?,
+            },
+        };
+        if down_proj.supports_int8_prefill()
+            && let Some(pre_act) = PreparedInt8Prefill::try_new(&activated)?
+        {
+            if let Some(hidden) = down_proj.try_store_epilogue_int8_prefill(
+                &pre_act,
+                residual,
+                StoreEpilogue::Residual,
+            )? {
+                return Ok(hidden);
+            }
+            if let Some(delta) = down_proj.forward_int8_prefill(&pre_act)? {
+                return residual.add(&delta);
+            }
+        }
+        match down_proj.try_store_epilogue(&activated, residual, StoreEpilogue::Residual)? {
+            Some(hidden) => Ok(hidden),
+            None => residual.add(&down_proj.forward(&activated)?),
+        }
+    }
+
+    /// `forward` opting into per-32 INT8-activation NAX prefill when `int8_act`
+    /// is `true` (`Activations::Auto`).
+    pub(crate) fn forward_with_int8(&self, x: &MxArray, int8_act: bool) -> Result<MxArray> {
+        if !int8_act {
+            return self.forward(x);
+        }
+        let MLPVariant::Quantized {
+            gate_proj,
+            up_proj,
+            down_proj,
+            gate_up,
+        } = self
+        else {
+            return self.forward(x);
+        };
+        if let Some(out) = Self::forward_sym8_cuda(x, down_proj, gate_up)? {
+            return Ok(out);
+        }
+        let activated = match Self::int8_prefill_activated(x, gate_proj, up_proj, gate_up)? {
+            Some(activated) => activated,
+            None => Self::quantized_activated(x, gate_proj, up_proj, gate_up)?,
+        };
+        if down_proj.supports_int8_prefill()
+            && let Some(pre_act) = PreparedInt8Prefill::try_new(&activated)?
+            && let Some(out) = down_proj.forward_int8_prefill(&pre_act)?
+        {
+            return Ok(out);
+        }
+        down_proj.forward(&activated)
+    }
+
     /// The SwiGLU activation of a DFlash2 verify's rows on the planes: a
     /// merged gate|up in one pass (`_gate_up`) or as one `_a` split as
     /// [`Self::quantized_activated`] splits it, an unmerged pair as `_a`
@@ -1506,15 +1785,216 @@ pub fn try_build_mxfp4_quantized_linear(
     ))
 }
 
-/// Try to build an NVFP4 QuantizedLinear from weight/scales keys in a params map.
-/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
-pub fn try_build_nvfp4_quantized_linear(
+/// Divisor converting upstream MLX NVFP4 `.global_scale` (`amax = max|W|`) into
+/// the multiplicative outer scale (`amax / (6.0 * 448.0)` = `amax / 2688.0`).
+pub const MLX_NVFP4_GLOBAL_SCALE_DIVISOR: f64 = 6.0 * 448.0;
+
+/// Controls whether NVFP4 builders automatically resolve outer-scale sidecars
+/// (`.scale`, `.weight_scale_2`, `.global_scale / 2688.0`, `1.0 / .weight_global_scale`).
+///
+/// `ExternalCaller` skips auto-resolution for families like Nemotron-H whose own
+/// converter stores raw `weight_scale_2` (`amax / 2688.0`) under `.global_scale`
+/// and applies it externally (avoiding 2688x mis-scaling and double scaling).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Nvfp4OuterScalePolicy {
+    Standard,
+    ExternalCaller,
+}
+
+#[derive(Clone, Copy)]
+enum Nvfp4ScaleSidecarKind {
+    Direct,
+    UpstreamMlxAmax,
+    CompressedTensorsInverse,
+}
+
+fn find_nvfp4_outer_scale_sidecar<'a>(
+    params: &'a HashMap<String, MxArray>,
+    prefix: &str,
+) -> Result<Option<(&'static str, Nvfp4ScaleSidecarKind, &'a MxArray)>> {
+    const CANDIDATES: [(&str, Nvfp4ScaleSidecarKind); 4] = [
+        (".scale", Nvfp4ScaleSidecarKind::Direct),
+        (".weight_scale_2", Nvfp4ScaleSidecarKind::Direct),
+        (".global_scale", Nvfp4ScaleSidecarKind::UpstreamMlxAmax),
+        (
+            ".weight_global_scale",
+            Nvfp4ScaleSidecarKind::CompressedTensorsInverse,
+        ),
+    ];
+    let mut found: Vec<(&'static str, Nvfp4ScaleSidecarKind, &'a MxArray)> = Vec::new();
+    for (suffix, kind) in CANDIDATES {
+        if let Some(arr) = params.get(&format!("{prefix}{suffix}")) {
+            found.push((suffix, kind, arr));
+        }
+    }
+    if found.len() > 1 {
+        let names: Vec<&str> = found.iter().map(|(s, _, _)| *s).collect();
+        return Err(Error::from_reason(format!(
+            "Conflicting NVFP4 outer scale sidecars on '{prefix}': found {}",
+            names.join(", ")
+        )));
+    }
+    Ok(found.pop())
+}
+
+fn transform_outer_scale_values(
+    scale: &MxArray,
+    kind: Nvfp4ScaleSidecarKind,
+    context: &str,
+) -> Result<(Vec<i64>, Vec<f32>)> {
+    let f32_scale = if scale.dtype()? == crate::array::DType::Float32 {
+        scale.clone()
+    } else {
+        scale.astype(crate::array::DType::Float32)?
+    };
+    let shape = f32_scale.shape()?.to_vec();
+    let raw_vals = f32_scale.to_float32()?;
+    let mut out = Vec::with_capacity(raw_vals.len());
+    for &v in raw_vals.iter() {
+        if !v.is_finite() {
+            return Err(Error::from_reason(format!(
+                "Non-finite outer scale value on '{context}'"
+            )));
+        }
+        let converted = match kind {
+            Nvfp4ScaleSidecarKind::Direct => v,
+            Nvfp4ScaleSidecarKind::UpstreamMlxAmax => {
+                (f64::from(v) / MLX_NVFP4_GLOBAL_SCALE_DIVISOR) as f32
+            }
+            Nvfp4ScaleSidecarKind::CompressedTensorsInverse => {
+                if v <= 0.0 {
+                    return Err(Error::from_reason(format!(
+                        "Invalid compressed-tensors weight_global_scale ({v}) on '{context}': must be > 0"
+                    )));
+                }
+                (1.0_f64 / f64::from(v)) as f32
+            }
+        };
+        if !converted.is_finite() {
+            return Err(Error::from_reason(format!(
+                "Non-finite converted outer scale value on '{context}'"
+            )));
+        }
+        out.push(converted);
+    }
+    Ok((shape, out))
+}
+
+/// Validate and normalize a 2-D scalar outer scale tensor into `[1]` F32.
+pub fn normalize_scalar_outer_scale(scale: &MxArray, context: &str) -> Result<MxArray> {
+    let (shape, vals) =
+        transform_outer_scale_values(scale, Nvfp4ScaleSidecarKind::Direct, context)?;
+    if vals.len() != 1 {
+        return Err(Error::from_reason(format!(
+            "Expected scalar 2-D outer scale on '{context}', got shape {shape:?}"
+        )));
+    }
+    MxArray::from_float32(&[vals[0]], &[1])
+}
+
+/// Validate and normalize a 3-D per-expert outer scale tensor into `[num_experts]` F32.
+/// Accepts `[E]`, `[E, 1]`, `[1, E]`, `[E, 1, 1]`, or scalar (`[]` / `[1]` / `[1, 1]`).
+pub fn normalize_expert_outer_scale(
+    scale: &MxArray,
+    num_experts: i64,
+    context: &str,
+) -> Result<MxArray> {
+    let (shape, vals) =
+        transform_outer_scale_values(scale, Nvfp4ScaleSidecarKind::Direct, context)?;
+    normalize_expert_outer_scale_from_vals(&shape, &vals, num_experts, context)
+}
+
+fn normalize_expert_outer_scale_from_vals(
+    shape: &[i64],
+    vals: &[f32],
+    num_experts: i64,
+    context: &str,
+) -> Result<MxArray> {
+    if num_experts <= 0 {
+        return Err(Error::from_reason(format!(
+            "Invalid num_experts {num_experts} while normalizing outer scale on '{context}'"
+        )));
+    }
+    match shape {
+        [] | [1] | [1, 1] | [1, 1, 1] if vals.len() == 1 => {
+            let expanded = vec![vals[0]; num_experts as usize];
+            MxArray::from_float32(&expanded, &[num_experts])
+        }
+        [e] | [e, 1] | [1, e] | [e, 1, 1] if *e == num_experts && vals.len() == *e as usize => {
+            MxArray::from_float32(vals, &[num_experts])
+        }
+        other => Err(Error::from_reason(format!(
+            "Unsupported 3-D outer scale shape {other:?} on '{context}' (expected [{num_experts}], [{num_experts}, 1], [1, {num_experts}], [{num_experts}, 1, 1], or scalar)"
+        ))),
+    }
+}
+
+/// Resolve an optional 2-D NVFP4 outer scale (`.scale`, `.weight_scale_2`,
+/// `.global_scale / 2688.0`, or `1.0 / .weight_global_scale`) into normalized `[1]` F32.
+pub fn resolve_nvfp4_outer_scale_2d(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+) -> Result<Option<MxArray>> {
+    let Some((suffix, kind, arr)) = find_nvfp4_outer_scale_sidecar(params, prefix)? else {
+        return Ok(None);
+    };
+    let context = format!("{prefix}{suffix}");
+    let (shape, vals) = transform_outer_scale_values(arr, kind, &context)?;
+    if vals.len() != 1 {
+        return Err(Error::from_reason(format!(
+            "Expected scalar 2-D NVFP4 outer scale on '{context}', got shape {shape:?}"
+        )));
+    }
+    Ok(Some(MxArray::from_float32(&[vals[0]], &[1])?))
+}
+
+/// Resolve an optional 3-D NVFP4 per-expert outer scale (`.scale`, `.weight_scale_2`,
+/// `.global_scale / 2688.0`, or `1.0 / .weight_global_scale`) into normalized `[E]` F32.
+pub fn resolve_nvfp4_outer_scale_3d(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    num_experts: i64,
+) -> Result<Option<MxArray>> {
+    let Some((suffix, kind, arr)) = find_nvfp4_outer_scale_sidecar(params, prefix)? else {
+        return Ok(None);
+    };
+    let context = format!("{prefix}{suffix}");
+    let (shape, vals) = transform_outer_scale_values(arr, kind, &context)?;
+    Ok(Some(normalize_expert_outer_scale_from_vals(
+        &shape,
+        &vals,
+        num_experts,
+        &context,
+    )?))
+}
+
+/// Resolve an optional direct `{prefix}.scale` sidecar for non-NVFP4 3-D expert stacks
+/// (Affine, MXFP4, MXFP8, K-quants, Dense) into normalized `[E]` F32.
+pub fn resolve_optional_outer_scale_3d(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    num_experts: i64,
+) -> Result<Option<MxArray>> {
+    let key = format!("{prefix}.scale");
+    let Some(arr) = params.get(&key) else {
+        return Ok(None);
+    };
+    Ok(Some(normalize_expert_outer_scale(arr, num_experts, &key)?))
+}
+
+/// Try to build an NVFP4 QuantizedLinear with an explicit outer-scale resolution policy.
+pub fn try_build_nvfp4_quantized_linear_with_policy(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
-) -> Option<QuantizedLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
-    Some(QuantizedLinear::new(
+    policy: Nvfp4OuterScalePolicy,
+) -> Result<Option<QuantizedLinear>> {
+    let Some(weight) = params.get(&format!("{}.weight", key_prefix)) else {
+        return Ok(None);
+    };
+    let Some(scales) = params.get(&format!("{}.scales", key_prefix)) else {
+        return Ok(None);
+    };
+    let mut ql = QuantizedLinear::new(
         weight.clone(),
         scales.clone(),
         None,
@@ -1522,7 +2002,28 @@ pub fn try_build_nvfp4_quantized_linear(
         NVFP4_GROUP_SIZE,
         NVFP4_BITS,
         NVFP4_MODE.to_string(),
-    ))
+    );
+    if policy == Nvfp4OuterScalePolicy::Standard
+        && let Some(outer) = resolve_nvfp4_outer_scale_2d(params, key_prefix)?
+    {
+        ql = ql.with_outer_scale(outer);
+    }
+    Ok(Some(ql))
+}
+
+/// Try to build an NVFP4 QuantizedLinear from weight/scales keys in a params map.
+/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
+pub fn try_build_nvfp4_quantized_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedLinear> {
+    try_build_nvfp4_quantized_linear_with_policy(
+        params,
+        key_prefix,
+        Nvfp4OuterScalePolicy::Standard,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Build the plain per-output E4M3 correctness fallback.
@@ -2037,6 +2538,7 @@ pub struct QuantizedLinear {
     capture_input: Option<Box<(std::path::PathBuf, std::sync::OnceLock<()>)>>,
     biases: Option<MxArray>, // Affine biases or native K/IQ floating sidecars
     bias: Option<MxArray>,   // Linear bias (additive)
+    outer_scale: Option<MxArray>, // Optional scalar [1] F32 multiplicative outer scale (e.g. NVFP4)
     group_size: i32,
     bits: i32,
     mode: String, // affine, MX/NVFP, native GGUF K/IQ, fp8_e4m3, or sym8
@@ -2087,8 +2589,15 @@ pub struct QuantizedLinear {
     // True when this affine Q8_0 (bits=8, group_size=32) projection comes from
     // a checkpoint declaring `symmetric_zero_point == 128` (every group bias is
     // exact `-128 * scale`), enabling the faster `general_bias = false` path in
-    // CUDA `q8_prefill_cuda`.
+    // CUDA `q8_prefill_cuda` and Metal NAX BF16-I/O prefill.
     q8_symmetric_128: bool,
+    // Pre-promotion native Float16 scales retained for symmetric Q8_0
+    // (`q8_symmetric_128`) on Metal when `scales`/`biases` are promoted to
+    // Float32 for M=1..=8 decode/verify (`mixed_projection_forward` /
+    // `affine_bf16_matmul_few`), so NAX prefill (`M >= 9 && M <= 2048`) runs
+    // `mlx_inkling2_q8_sym_matmul_bf16` directly on BF16 I/O with exact Float16
+    // scales and zero `AsType(BF16->F32->BF16)` casts.
+    q8_scales_f16: Option<MxArray>,
 }
 
 /// One projection's planes and the planned tensor they were written for.
@@ -2192,6 +2701,9 @@ pub(crate) static SYM8_QMV_CALLS: std::sync::atomic::AtomicU64 =
 #[cfg(test)]
 pub(crate) static SYM8_GEMM_CALLS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+pub(crate) static METAL_SYM_Q8_PREFILL_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// `MLX_SYM8_DEBUG=1` prints one line per sym8 forward with the chosen kernel
 /// and the (M, K, N) shape — e2e dispatch evidence. Read once per process.
@@ -2234,6 +2746,7 @@ impl QuantizedLinear {
             capture_input: None,
             biases,
             bias,
+            outer_scale: None,
             group_size,
             bits,
             mode,
@@ -2248,7 +2761,22 @@ impl QuantizedLinear {
             symmetric_q8: false,
             preserve_promoted_dtype: false,
             q8_symmetric_128: false,
+            q8_scales_f16: None,
         }
+    }
+
+    /// Attach a scalar `[1]` F32 multiplicative outer scale applied to the
+    /// matmul output BEFORE any additive linear bias.
+    pub fn with_outer_scale(mut self, outer_scale: MxArray) -> Self {
+        self.planes = None;
+        self.q8_scales_f16 = None;
+        self.outer_scale = Some(outer_scale);
+        self
+    }
+
+    /// Optional scalar `[1]` F32 multiplicative outer scale.
+    pub fn outer_scale(&self) -> Option<&MxArray> {
+        self.outer_scale.as_ref()
     }
 
     /// Preserve MLX's promoted output dtype on mixed-dtype affine `quantized_matmul`
@@ -2276,6 +2804,7 @@ impl QuantizedLinear {
             || self.bits != 8
             || self.group_size != 32
             || self.bias.is_some()
+            || self.outer_scale.is_some()
             || self.decode_sidecars.is_some()
             || self.output_layout != QuantizedOutputLayout::Native
             || self.hadamard.is_some()
@@ -2307,6 +2836,7 @@ impl QuantizedLinear {
         }
         self.planes = None;
         self.biases = None;
+        self.q8_scales_f16 = None;
         self.symmetric_q8 = true;
         Ok(true)
     }
@@ -2422,6 +2952,7 @@ impl QuantizedLinear {
             kq
         };
         if self.output_layout != QuantizedOutputLayout::Native
+            || self.outer_scale.is_some()
             || self.hadamard.is_some()
             || self.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
@@ -2479,6 +3010,7 @@ impl QuantizedLinear {
         self.scales = scales;
         self.biases = Some(biases);
         self.bias = bias;
+        self.q8_scales_f16 = None;
         self.mode = format!("{}{KQUANT_TILED_SUFFIX}", kq.mode_str);
         self.clear_cuda_dense_prefill();
         Ok(true)
@@ -2496,6 +3028,8 @@ impl QuantizedLinear {
         let mut pending = vec![&self.weight, &self.scales];
         pending.extend(self.biases.as_ref());
         pending.extend(self.bias.as_ref());
+        pending.extend(self.outer_scale.as_ref());
+        pending.extend(self.q8_scales_f16.as_ref());
         MxArray::eval_arrays_with_context(&pending, context)
     }
 
@@ -2511,6 +3045,14 @@ impl QuantizedLinear {
             || self.s_w.as_ref().is_some_and(MxArray::is_settled_cuda_host)
             || self
                 .bias
+                .as_ref()
+                .is_some_and(MxArray::is_settled_cuda_host)
+            || self
+                .outer_scale
+                .as_ref()
+                .is_some_and(MxArray::is_settled_cuda_host)
+            || self
+                .q8_scales_f16
                 .as_ref()
                 .is_some_and(MxArray::is_settled_cuda_host)
     }
@@ -2539,7 +3081,21 @@ impl QuantizedLinear {
             }
         };
         if self.scales.dtype()? == crate::array::DType::Float16 {
+            if target == crate::array::DType::Float32
+                && self.q8_symmetric_128
+                && self.bits == 8
+                && self.group_size == 32
+                && self.bias.is_none()
+                && self.outer_scale.is_none()
+                && crate::accelerator::host_has_metal()
+            {
+                self.q8_scales_f16 = Some(self.scales.clone());
+            } else {
+                self.q8_scales_f16 = None;
+            }
             self.scales = cast_sidecar(&self.scales)?;
+        } else if target != crate::array::DType::Float32 {
+            self.q8_scales_f16 = None;
         }
         if let Some(b) = &self.biases
             && b.dtype()? == crate::array::DType::Float16
@@ -2635,6 +3191,8 @@ impl QuantizedLinear {
                 || other.biases.is_some()
                 || self.decode_sidecars.is_some()
                 || other.decode_sidecars.is_some()
+                || self.outer_scale.is_some()
+                || other.outer_scale.is_some()
                 || self.capture_input.is_some()
                 || other.capture_input.is_some()
                 || self.amax_keys.as_ref().is_some_and(|k| k.1.is_some())
@@ -2696,6 +3254,7 @@ impl QuantizedLinear {
                 capture_input: None,
                 biases: None,
                 bias,
+                outer_scale: None,
                 group_size: self.group_size,
                 bits: self.bits,
                 mode: self.mode.clone(),
@@ -2710,6 +3269,7 @@ impl QuantizedLinear {
                 symmetric_q8: false,
                 preserve_promoted_dtype: self.preserve_promoted_dtype,
                 q8_symmetric_128: false,
+                q8_scales_f16: None,
             }));
         }
         if self.symmetric_q8 != other.symmetric_q8
@@ -2720,6 +3280,8 @@ impl QuantizedLinear {
             || self.output_layout != QuantizedOutputLayout::Native
             || other.output_layout != QuantizedOutputLayout::Native
             || self.input_amax != other.input_amax
+            || self.outer_scale.is_some()
+            || other.outer_scale.is_some()
             || self.fp8_dequant_weight.is_some()
             || other.fp8_dequant_weight.is_some()
             || self.s_w.is_some()
@@ -2771,6 +3333,19 @@ impl QuantizedLinear {
             (None, None) => None,
             _ => return Ok(None),
         };
+        let q8_symmetric_128 = self.q8_symmetric_128 && other.q8_symmetric_128;
+        let q8_scales_f16 = if q8_symmetric_128 {
+            match (&self.q8_scales_f16, &other.q8_scales_f16) {
+                (Some(a), Some(b)) => {
+                    let combined = MxArray::concatenate(a, b, 0)?;
+                    combined.eval();
+                    Some(combined)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         weight.eval();
         scales.eval();
         if let Some(b) = &biases {
@@ -2794,6 +3369,7 @@ impl QuantizedLinear {
             capture_input: None,
             biases,
             bias,
+            outer_scale: None,
             group_size: self.group_size,
             bits: self.bits,
             mode: self.mode.clone(),
@@ -2807,7 +3383,8 @@ impl QuantizedLinear {
             planes: None,
             symmetric_q8: self.symmetric_q8,
             preserve_promoted_dtype: self.preserve_promoted_dtype,
-            q8_symmetric_128: self.q8_symmetric_128 && other.q8_symmetric_128,
+            q8_symmetric_128,
+            q8_scales_f16,
         }))
     }
 
@@ -2857,6 +3434,7 @@ impl QuantizedLinear {
                     .as_ref()
                     .map(|b| b.slice_axis(0, start, end))
                     .transpose()?,
+                outer_scale: self.outer_scale.clone(),
                 group_size: self.group_size,
                 bits: self.bits,
                 mode: self.mode.clone(),
@@ -2871,6 +3449,7 @@ impl QuantizedLinear {
                 symmetric_q8: false,
                 preserve_promoted_dtype: self.preserve_promoted_dtype,
                 q8_symmetric_128: false,
+                q8_scales_f16: None,
             });
         }
         if self.fp8_dequant_weight.is_some()
@@ -2916,6 +3495,7 @@ impl QuantizedLinear {
                 .as_ref()
                 .map(|b| b.slice_axis(0, start, end))
                 .transpose()?,
+            outer_scale: self.outer_scale.clone(),
             group_size: self.group_size,
             bits: self.bits,
             mode: self.mode.clone(),
@@ -2930,6 +3510,11 @@ impl QuantizedLinear {
             symmetric_q8: self.symmetric_q8,
             preserve_promoted_dtype: self.preserve_promoted_dtype,
             q8_symmetric_128: self.q8_symmetric_128,
+            q8_scales_f16: self
+                .q8_scales_f16
+                .as_ref()
+                .map(|s| s.slice_axis(0, start, end))
+                .transpose()?,
         })
     }
 
@@ -2961,6 +3546,7 @@ impl QuantizedLinear {
             capture_input: None,
             biases: None,
             bias,
+            outer_scale: None,
             group_size: FP8_E4M3_GROUP_SIZE,
             bits: FP8_E4M3_BITS,
             mode: FP8_E4M3_MODE.to_string(),
@@ -2975,16 +3561,21 @@ impl QuantizedLinear {
             symmetric_q8: false,
             preserve_promoted_dtype: false,
             q8_symmetric_128: false,
+            q8_scales_f16: None,
         }
     }
 
     /// Mark an affine Q8_0 (`bits=8, group_size=32`) projection as having
     /// symmetric zero-point 128 (`bias == -128 * scale` on every group),
-    /// enabling the `general_bias = false` path in CUDA `q8_prefill_cuda`.
-    /// Non-Q8_0 or non-affine projections ignore `true` and stay `false`.
+    /// enabling the `general_bias = false` path in CUDA `q8_prefill_cuda` and
+    /// Metal NAX BF16-I/O prefill. Non-Q8_0 or non-affine projections ignore
+    /// `true` and stay `false`.
     pub fn with_q8_symmetric_128(mut self, symmetric: bool) -> Self {
         self.q8_symmetric_128 =
             symmetric && self.mode == DEFAULT_QUANT_MODE && self.bits == 8 && self.group_size == 32;
+        if !self.q8_symmetric_128 {
+            self.q8_scales_f16 = None;
+        }
         self
     }
 
@@ -2992,6 +3583,11 @@ impl QuantizedLinear {
     /// invariant.
     pub fn is_q8_symmetric_128(&self) -> bool {
         self.q8_symmetric_128
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_q8_scales_f16(&self) -> bool {
+        self.q8_scales_f16.is_some()
     }
 
     /// Attach a per-tensor FP8 activation scale (`PerLayerQuant::input_amax`).
@@ -3144,6 +3740,7 @@ impl QuantizedLinear {
             capture_input: None,
             biases: None,
             bias,
+            outer_scale: None,
             group_size: SYM8_GROUP_SIZE,
             bits: SYM8_BITS,
             mode: SYM8_MODE.to_string(),
@@ -3158,6 +3755,7 @@ impl QuantizedLinear {
             symmetric_q8: false,
             preserve_promoted_dtype: false,
             q8_symmetric_128: false,
+            q8_scales_f16: None,
         }
     }
 
@@ -3285,10 +3883,18 @@ impl QuantizedLinear {
             .as_ref()
             .map(|bias| bias.take(&indices, 0))
             .transpose()?;
+        let q8_scales_f16 = self
+            .q8_scales_f16
+            .as_ref()
+            .map(|s| s.take(&indices, 0))
+            .transpose()?;
 
         let mut arrays = vec![&weight, &scales, &quant_biases];
         if let Some(bias) = bias.as_ref() {
             arrays.push(bias);
+        }
+        if let Some(s16) = q8_scales_f16.as_ref() {
+            arrays.push(s16);
         }
         MxArray::eval_arrays(&arrays)?;
 
@@ -3296,6 +3902,7 @@ impl QuantizedLinear {
         self.scales = scales;
         self.biases = Some(quant_biases);
         self.bias = bias;
+        self.q8_scales_f16 = q8_scales_f16;
         self.output_layout = QuantizedOutputLayout::QGateBlock;
         self.planes = None;
         Ok(true)
@@ -3429,6 +4036,7 @@ impl QuantizedLinear {
     fn store_epilogue_plain(&self) -> bool {
         self.biases.is_some()
             && self.bias.is_none()
+            && self.outer_scale.is_none()
             && self.hadamard.is_none()
             && self.input_amax.is_none()
             && self.fp8_dequant_weight.is_none()
@@ -3501,12 +4109,126 @@ impl QuantizedLinear {
         }
     }
 
+    /// Whether this projection can execute the Tiled64 INT8-activation NAX
+    /// prefill GEMM (`kquant_prefill_int8_nax.metal`): Tiled64 mode in
+    /// `{q4k, q5k, iq4xs, iq4nl}` with no `outer_scale`, Hadamard transform, or
+    /// static FP8 activation quantizer. A physical `QGateBlock` row reorder
+    /// remains valid.
+    pub(crate) fn supports_int8_prefill(&self) -> bool {
+        matches!(
+            self.mode.as_str(),
+            "q4k@t64" | "q5k@t64" | "iq4xs@t64" | "iq4nl@t64"
+        ) && self.biases.is_some()
+            && self.outer_scale.is_none()
+            && self.hadamard.is_none()
+            && self.input_amax.is_none()
+            && self.fp8_dequant_weight.is_none()
+            && self.s_w.is_none()
+            && self.decode_sidecars.is_none()
+    }
+
+    /// Execute `x @ w.T` using pre-quantized INT8 activations `pre`, returning
+    /// `Ok(None)` when off-contract or unsupported so the caller falls back to
+    /// exact BF16.
+    pub(crate) fn forward_int8_prefill(
+        &self,
+        pre: &PreparedInt8Prefill,
+    ) -> Result<Option<MxArray>> {
+        if !self.supports_int8_prefill() {
+            return Ok(None);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(None);
+        };
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let mut output = std::ptr::null_mut();
+        // SAFETY: live array handles, valid shape slice, NUL-terminated mode.
+        let status = unsafe {
+            sys::mlx_kquant_matmul_int8(
+                pre.xq.handle.0,
+                pre.x_sa.handle.0,
+                pre.x_ysum.handle.0,
+                self.weight.handle.0,
+                self.scales.handle.0,
+                biases.handle.0,
+                std::ptr::null_mut(),
+                pre.orig_shape.as_ptr(),
+                pre.orig_shape.len(),
+                mode.as_ptr(),
+                0,
+                &mut output,
+            )
+        };
+        match status {
+            1 => {
+                let mut result = MxArray::from_handle(output, "kquant_matmul_int8")?;
+                if let Some(ref b) = self.bias {
+                    result = result.add(b)?;
+                }
+                Ok(Some(result))
+            }
+            0 => Ok(None),
+            _ => Err(Error::from_reason(
+                "K-quant INT8 prefill matmul construction failed",
+            )),
+        }
+    }
+
+    /// Execute `x @ w.T` using pre-quantized INT8 activations `pre` with a
+    /// fused store epilogue (`Residual` or `Swiglu`), returning `Ok(None)` when
+    /// unsupported.
+    pub(crate) fn try_store_epilogue_int8_prefill(
+        &self,
+        pre: &PreparedInt8Prefill,
+        aux: &MxArray,
+        epilogue: StoreEpilogue,
+    ) -> Result<Option<MxArray>> {
+        if !self.supports_int8_prefill() || !self.store_epilogue_plain() {
+            return Ok(None);
+        }
+        let Some(biases) = self.biases.as_ref() else {
+            return Ok(None);
+        };
+        let mode = CString::new(self.mode.as_str())
+            .map_err(|e| Error::from_reason(format!("Invalid mode string: {e}")))?;
+        let mut output = std::ptr::null_mut();
+        // SAFETY: live array handles, valid shape slice, NUL-terminated mode.
+        let status = unsafe {
+            sys::mlx_kquant_matmul_int8(
+                pre.xq.handle.0,
+                pre.x_sa.handle.0,
+                pre.x_ysum.handle.0,
+                self.weight.handle.0,
+                self.scales.handle.0,
+                biases.handle.0,
+                aux.handle.0,
+                pre.orig_shape.as_ptr(),
+                pre.orig_shape.len(),
+                mode.as_ptr(),
+                epilogue as i32,
+                &mut output,
+            )
+        };
+        match status {
+            1 => Ok(Some(MxArray::from_handle(
+                output,
+                "kquant_matmul_int8_epilogue",
+            )?)),
+            0 => Ok(None),
+            _ => Err(Error::from_reason(
+                "K-quant INT8 prefill epilogue matmul construction failed",
+            )),
+        }
+    }
+
     fn supports_prepared_sg8(&self) -> bool {
         self.mode == "q4k@t64"
             && self.bits == 4
             && self.group_size == 32
             && self.biases.is_some()
             && self.bias.is_none()
+            && self.outer_scale.is_none()
             && self.hadamard.is_none()
             && self.input_amax.is_none()
             && self.output_layout == QuantizedOutputLayout::Native
@@ -3519,6 +4241,7 @@ impl QuantizedLinear {
             || self.bits != 6
             || self.group_size != 16
             || self.bias.is_some()
+            || self.outer_scale.is_some()
             || self.hadamard.is_some()
             || self.input_amax.is_some()
             || self.output_layout != QuantizedOutputLayout::Native
@@ -3553,6 +4276,7 @@ impl QuantizedLinear {
         // unpacking and accumulation happen in FP32 registers inside the QMV.
         if !mixed_affine_qmv_enabled()
             || self.bias.is_some()
+            || self.outer_scale.is_some()
             || self.mode != DEFAULT_QUANT_MODE
             || self.bits != 4
             || self.group_size != 32
@@ -3592,6 +4316,85 @@ impl QuantizedLinear {
             )
         };
         Ok(Some(MxArray::from_handle(raw, "mixed affine qmv")?))
+    }
+
+    /// Metal NAX BF16-I/O prefill for exact symmetric Q8_0 (`mode == "affine"`,
+    /// `bits == 8`, `group_size == 32`, `biases == -128 * scales`): runs
+    /// `mlx_inkling2_q8_sym_matmul_bf16` (`inkling2_q8_sym_matmul_nax_bf16`,
+    /// M-major `matmul2d(32, 32, 32)` on BF16 input × exact BF16 int8 codes with
+    /// native FP16 scales in FP32 accumulation) directly on BF16 input/output
+    /// for `9 <= M <= 2048`. Eliminates `AsType(BF16->F32->BF16)` and the
+    /// non-NAX `split_k=2` fallback on narrow projections like `in_proj_ba`
+    /// (`N=96`) while leaving `M=1` decode and `M=2..=8` verify
+    /// (`mixed_projection_forward` / `affine_bf16_matmul_few`) untouched.
+    #[cfg(target_os = "macos")]
+    fn try_metal_sym_q8_bf16_prefill(&self, x: &MxArray) -> Result<Option<MxArray>> {
+        use crate::array::DType;
+        if crate::accelerator::cuda_ops_available()
+            || self.mode != DEFAULT_QUANT_MODE
+            || self.bits != 8
+            || self.group_size != 32
+            || !(self.q8_symmetric_128 || self.symmetric_q8)
+            || self.bias.is_some()
+            || self.outer_scale.is_some()
+            || self.hadamard.is_some()
+            || self.decode_sidecars.is_some()
+            || x.dtype()? != DType::BFloat16
+            || self.weight.ndim()? != 2
+            || self.weight.dtype()? != DType::Uint32
+        {
+            return Ok(None);
+        }
+        let scales_f16 = if self.scales.dtype()? == DType::Float16 {
+            &self.scales
+        } else if let Some(s16) = self.q8_scales_f16.as_ref() {
+            s16
+        } else {
+            return Ok(None);
+        };
+        if scales_f16.ndim()? != 2 || scales_f16.dtype()? != DType::Float16 {
+            return Ok(None);
+        }
+        let shape = x.shape()?;
+        if shape.len() < 2 {
+            return Ok(None);
+        }
+        let k = shape[shape.len() - 1];
+        if k <= 0 || k % 32 != 0 {
+            return Ok(None);
+        }
+        let rows = x.size()? as i64 / k;
+        if !(9..=2048).contains(&rows) {
+            return Ok(None);
+        }
+        if !unsafe { sys::mlx_metal_is_available() && sys::mlx_metal_is_nax_available() } {
+            return Ok(None);
+        }
+        let x_2d = if shape.len() == 2 {
+            x.clone()
+        } else {
+            x.reshape(&[rows, k])?
+        };
+        let raw = unsafe {
+            sys::mlx_inkling2_q8_sym_matmul_bf16(
+                x_2d.handle.0,
+                self.weight.handle.0,
+                scales_f16.handle.0,
+                false,
+            )
+        };
+        if raw.is_null() {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        METAL_SYM_Q8_PREFILL_CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let out_2d = MxArray::from_handle(raw, "metal_sym_q8_bf16_prefill")?;
+        if shape.len() == 2 {
+            Ok(Some(out_2d))
+        } else {
+            let out_n = self.weight.shape_at(0)?;
+            Ok(Some(out_2d.reshape(&with_last(&shape, out_n))?))
+        }
     }
 
     /// Forward pass using quantized_matmul (sym8 routes to the int8 W8A8
@@ -3737,9 +4540,35 @@ impl QuantizedLinear {
                     &fallback_weight_t
                 }
             };
-            let mut result = x.matmul(weight_t)?;
+            let input_dtype = x.dtype()?;
+            let promote_f16 =
+                self.outer_scale.is_some() && input_dtype == crate::array::DType::Float16;
+            let x_f32_owned;
+            let x_in = if promote_f16 {
+                x_f32_owned = x.astype(crate::array::DType::Float32)?;
+                &x_f32_owned
+            } else {
+                x
+            };
+            let mut result = x_in.matmul(weight_t)?;
+            if let Some(ref outer) = self.outer_scale {
+                let outer_f32 = if outer.dtype()? == crate::array::DType::Float32 {
+                    outer.clone()
+                } else {
+                    outer.astype(crate::array::DType::Float32)?
+                };
+                let res_f32 = if result.dtype()? == crate::array::DType::Float32 {
+                    result
+                } else {
+                    result.astype(crate::array::DType::Float32)?
+                };
+                result = res_f32.mul(&outer_f32)?;
+            }
             if let Some(ref b) = self.bias {
                 result = result.add(b)?;
+            }
+            if self.outer_scale.is_some() && round_affine_to_act && result.dtype()? != input_dtype {
+                result = result.astype(input_dtype)?;
             }
             return Ok(result);
         }
@@ -3774,6 +4603,7 @@ impl QuantizedLinear {
             && self.bits == 8
             && self.group_size == 32
             && self.bias.is_none()
+            && self.outer_scale.is_none()
             && (self.biases.is_some() || self.symmetric_q8)
         {
             let scale_dtype = self.scales.dtype()?;
@@ -3868,6 +4698,7 @@ impl QuantizedLinear {
             && !crate::accelerator::cuda_ops_available()
             && activation_dtype == Some(crate::array::DType::BFloat16)
             && self.bias.is_none()
+            && self.outer_scale.is_none()
             && self.scales.dtype()? == crate::array::DType::Float32
             && let Some(biases) = &self.biases
             && biases.dtype()? == crate::array::DType::Float32
@@ -3890,12 +4721,21 @@ impl QuantizedLinear {
             }
         }
 
+        // Metal NAX symmetric Q8_0 prefill (`9 <= M <= 2048`): BF16 input/output
+        // with native Float16 scales, avoiding `AsType(BF16->F32->BF16)` and the
+        // non-NAX `split_k=2` fallback on narrow projections (`in_proj_ba`, N=96).
+        #[cfg(target_os = "macos")]
+        if round_affine_to_act && let Some(output) = self.try_metal_sym_q8_bf16_prefill(x)? {
+            return Ok(output);
+        }
+
         // Supported small-row batches stay packed through CUDA INT8 MMA (checked
         // BEFORE taking the dense-prefill lock so decode has zero mutex overhead).
         // Other K-quant batches share one dense weight through cuBLAS when the
         // device memory budget admits retention, or dequantize ephemerally on
         // tighter discrete GPUs.
         if crate::accelerator::cuda_ops_available()
+            && self.outer_scale.is_none()
             && matches!(
                 crate::models::quant_dispatch::split_kquant_layout(&self.mode).0,
                 "q2k" | "q3k" | "q4k" | "q5k" | "q6k" | "iq4nl" | "iq4xs"
@@ -3990,6 +4830,7 @@ impl QuantizedLinear {
             && self.bits == 4
             && self.group_size == 64
             && self.bias.is_none()
+            && self.outer_scale.is_none()
             && x.dtype()? == crate::array::DType::BFloat16
             && self.scales.dtype()? == crate::array::DType::BFloat16
             && let Some(biases) = self.biases.as_ref()
@@ -4036,9 +4877,24 @@ impl QuantizedLinear {
             .or(syn_biases.as_ref())
             .map_or(std::ptr::null_mut(), |b| b.handle.0);
 
+        // Float16 overflow guard: when an outer scale (e.g. NVFP4 global_scale / 2688.0)
+        // is applied post-matmul, the raw unscaled product can reach ~2688 * |y| and overflow
+        // Float16 (max 65504 -> overflows at |y| > 24.37). Promote Float16 x to Float32 before
+        // matmul, apply outer_scale in Float32 BEFORE additive bias, then restore output dtype.
+        let input_dtype = x.dtype()?;
+        let promote_f16_for_outer_scale =
+            self.outer_scale.is_some() && input_dtype == crate::array::DType::Float16;
+        let x_f32_owned;
+        let x_qmm = if promote_f16_for_outer_scale {
+            x_f32_owned = x.astype(crate::array::DType::Float32)?;
+            &x_f32_owned
+        } else {
+            x
+        };
+
         let handle = unsafe {
             sys::mlx_quantized_matmul(
-                x.handle.0,
+                x_qmm.handle.0,
                 self.weight.handle.0,
                 self.scales.handle.0,
                 biases_ptr,
@@ -4050,13 +4906,33 @@ impl QuantizedLinear {
         };
         let mut result = MxArray::from_handle(handle, "quantized_matmul")?;
 
+        // Apply multiplicative outer scale in FP32 BEFORE additive linear bias.
+        if let Some(ref outer) = self.outer_scale {
+            let outer_f32 = if outer.dtype()? == crate::array::DType::Float32 {
+                outer.clone()
+            } else {
+                outer.astype(crate::array::DType::Float32)?
+            };
+            let res_f32 = if result.dtype()? == crate::array::DType::Float32 {
+                result
+            } else {
+                result.astype(crate::array::DType::Float32)?
+            };
+            result = res_f32.mul(&outer_f32)?;
+        }
+
         // Add linear bias if present
         if let Some(ref b) = self.bias {
             result = result.add(b)?;
         }
 
+        let target_out_dtype = if self.outer_scale.is_some() {
+            Some(input_dtype)
+        } else {
+            activation_dtype
+        };
         if round_affine_to_act
-            && let Some(dtype) = activation_dtype
+            && let Some(dtype) = target_out_dtype
             && result.dtype()? != dtype
         {
             result = result.astype(dtype)?;
@@ -4082,6 +4958,7 @@ impl QuantizedLinear {
     /// [`Self::wave_exact`]).
     pub fn lane_tier_holds(&self, k: i64) -> Result<bool> {
         if self.bias.is_some()
+            || self.outer_scale.is_some()
             || self.biases.is_none()
             || self.hadamard.is_some()
             || self.input_amax.is_some()
@@ -4169,6 +5046,7 @@ impl QuantizedLinear {
         self.clear_cuda_dense_prefill();
         self.planes = None;
         self.q8_symmetric_128 = false;
+        self.q8_scales_f16 = None;
         if self.mode == FP8_E4M3_MODE {
             self.fp8_dequant_weight = None;
         }
@@ -4176,6 +5054,9 @@ impl QuantizedLinear {
 
     pub fn set_bias(&mut self, bias: Option<MxArray>) {
         self.bias = bias;
+        if self.bias.is_some() {
+            self.q8_scales_f16 = None;
+        }
         self.planes = None;
     }
 
@@ -4205,6 +5086,7 @@ impl QuantizedLinear {
             ));
         }
         if self.bias.is_some()
+            || self.outer_scale.is_some()
             || self.biases.is_none()
             || self.hadamard.is_some()
             || self.s_w.is_some()
@@ -4408,6 +5290,23 @@ impl QuantizedLinear {
         self.dequantize_current_weight()
     }
 
+    fn apply_outer_scale_f32(&self, w: MxArray) -> Result<MxArray> {
+        let Some(ref outer) = self.outer_scale else {
+            return Ok(w);
+        };
+        let outer_f32 = if outer.dtype()? == crate::array::DType::Float32 {
+            outer.clone()
+        } else {
+            outer.astype(crate::array::DType::Float32)?
+        };
+        let w_f32 = if w.dtype()? == crate::array::DType::Float32 {
+            w
+        } else {
+            w.astype(crate::array::DType::Float32)?
+        };
+        w_f32.mul(&outer_f32)
+    }
+
     /// Dequantize the arrays in their current forward order. Unlike the public
     /// storage-layout API above, this is valid after q/gate finalization.
     fn dequantize_current_weight(&self) -> Result<MxArray> {
@@ -4417,7 +5316,7 @@ impl QuantizedLinear {
                     "plain FP8 QuantizedLinear missing load-time BF16 reconstruction",
                 )
             })?;
-            return weight.to_source_shape();
+            return self.apply_outer_scale_f32(weight.to_source_shape()?);
         }
         if self.mode == SYM8_MODE {
             return Err(Error::from_reason(
@@ -4483,7 +5382,8 @@ impl QuantizedLinear {
                 self.mode
             )));
         }
-        MxArray::from_handle(handle, "quantized_linear_dequantize")
+        let w = MxArray::from_handle(handle, "quantized_linear_dequantize")?;
+        self.apply_outer_scale_f32(w)
     }
 
     /// Dense `[row_ids.len(), K]` rows of the dequantized weight, gathered on
@@ -4519,7 +5419,7 @@ impl QuantizedLinear {
         }
         let ids = MxArray::from_uint32(row_ids, &[row_ids.len() as i64])?;
         if let Some(w) = &self.fp8_dequant_weight {
-            return w.to_source_shape()?.take(&ids, 0);
+            return self.apply_outer_scale_f32(w.to_source_shape()?.take(&ids, 0)?);
         }
         if self.mode == FP8_E4M3_MODE {
             return Err(Error::from_reason(
@@ -4535,7 +5435,7 @@ impl QuantizedLinear {
                 .take(&ids, 0)?
                 .astype(crate::array::DType::Float32)?;
             let s = s_w.take(&ids, 0)?.expand_dims(-1)?;
-            return w.mul(&s);
+            return self.apply_outer_scale_f32(w.mul(&s)?);
         }
         let (base_mode, tiled) = crate::models::quant_dispatch::split_kquant_layout(&self.mode);
         use crate::models::quant_dispatch as qd;
@@ -4618,7 +5518,21 @@ impl QuantizedLinear {
                 self.mode
             )));
         }
-        MxArray::from_handle(handle, "quantized_linear_rows_dequantize")
+        let mut w = MxArray::from_handle(handle, "quantized_linear_rows_dequantize")?;
+        if let Some(ref outer) = self.outer_scale {
+            let outer_f32 = if outer.dtype()? == crate::array::DType::Float32 {
+                outer.clone()
+            } else {
+                outer.astype(crate::array::DType::Float32)?
+            };
+            let w_f32 = if w.dtype()? == crate::array::DType::Float32 {
+                w
+            } else {
+                w.astype(crate::array::DType::Float32)?
+            };
+            w = w_f32.mul(&outer_f32)?;
+        }
+        Ok(w)
     }
 
     /// Model-owned BF16 reconstruction retained by the plain-E4M3 fallback.
@@ -4662,6 +5576,7 @@ impl QuantizedLinear {
 
     pub(crate) fn grouped_moe_plain_projection(&self) -> bool {
         self.bias.is_none()
+            && self.outer_scale.is_none()
             && self.hadamard.is_none()
             && self.input_amax.is_none()
             && self.output_layout == QuantizedOutputLayout::Native
@@ -4682,8 +5597,14 @@ impl QuantizedLinear {
         if let Some(ref mut bias) = self.bias {
             promoted += bias.promote_cuda_device()?;
         }
+        if let Some(ref mut os) = self.outer_scale {
+            promoted += os.promote_cuda_device()?;
+        }
         if let Some(ref mut s_w) = self.s_w {
             promoted += s_w.promote_cuda_device()?;
+        }
+        if let Some(ref mut q8_f16) = self.q8_scales_f16 {
+            promoted += q8_f16.promote_cuda_device()?;
         }
         if let Some(ref mut ds) = self.decode_sidecars {
             promoted += ds.0.promote_cuda_device()?;
@@ -4767,7 +5688,10 @@ impl QuantizedSwitchLinear {
     /// change ownership; no second resident copy or dequantization is kept.
     pub(crate) fn tile_grouped_layout(&mut self) -> Result<bool> {
         use crate::models::quant_dispatch::{kquant_tile_rows, split_kquant_layout};
-        if !self.transpose || !unsafe { sys::mlx_splash_moe_available() } {
+        if !self.transpose
+            || self.outer_scale.is_some()
+            || !unsafe { sys::mlx_splash_moe_available() }
+        {
             return Ok(false);
         }
         let (base, tiled) = split_kquant_layout(&self.mode);
@@ -4945,21 +5869,61 @@ impl QuantizedSwitchLinear {
     /// Forward pass using gather_qmm, applying the optional per-expert
     /// `outer_scale` if attached.
     pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
-        let mut result = self.forward_without_outer_scale(x, indices, sorted)?;
+        // Float16 overflow guard: promote Float16 activations to Float32 before
+        // unscaled gather_qmm when outer_scale is present, then scale in Float32
+        // and restore Float16 output dtype.
+        let input_dtype = x.dtype()?;
+        let promote_f16_for_outer_scale =
+            self.outer_scale.is_some() && input_dtype == crate::array::DType::Float16;
+        let x_f32_owned;
+        let x_in = if promote_f16_for_outer_scale {
+            x_f32_owned = x.astype(crate::array::DType::Float32)?;
+            &x_f32_owned
+        } else {
+            x
+        };
+        let mut result = self.forward_without_outer_scale(x_in, indices, sorted)?;
         if let Some(outer) = self.outer_scale.as_ref() {
-            let out_dtype = result.dtype()?;
-            let gathered = outer.take(indices, 0)?;
-            let mut broadcast_shape = indices.shape()?.to_vec();
-            let result_ndim = result.ndim()? as usize;
-            if result_ndim < broadcast_shape.len() {
-                return Err(Error::from_reason(format!(
-                    "QuantizedSwitchLinear outer_scale broadcast mismatch: result ndim {result_ndim} < indices ndim {}",
-                    broadcast_shape.len()
-                )));
-            }
-            broadcast_shape.resize(result_ndim, 1);
-            let scale = gathered.reshape(&broadcast_shape)?;
-            let scaled = result.mul(&scale)?;
+            let out_dtype = if promote_f16_for_outer_scale
+                && !self.preserve_promoted_dtype
+                && self.mode != FP8_E4M3_MODE
+            {
+                input_dtype
+            } else {
+                result.dtype()?
+            };
+            let outer_f32 = if outer.dtype()? == crate::array::DType::Float32 {
+                outer.clone()
+            } else {
+                outer.astype(crate::array::DType::Float32)?
+            };
+            let res_f32 = if result.dtype()? == crate::array::DType::Float32 {
+                result
+            } else {
+                result.astype(crate::array::DType::Float32)?
+            };
+            let scaled = if outer_f32.size()? == 1 {
+                let s = outer_f32.reshape(&[1])?;
+                res_f32.mul(&s)?
+            } else {
+                let outer_1d = if outer_f32.ndim()? == 1 {
+                    outer_f32
+                } else {
+                    outer_f32.reshape(&[-1])?
+                };
+                let gathered = outer_1d.take(indices, 0)?;
+                let mut broadcast_shape = indices.shape()?.to_vec();
+                let result_ndim = res_f32.ndim()? as usize;
+                if result_ndim < broadcast_shape.len() {
+                    return Err(Error::from_reason(format!(
+                        "QuantizedSwitchLinear outer_scale broadcast mismatch: result ndim {result_ndim} < indices ndim {}",
+                        broadcast_shape.len()
+                    )));
+                }
+                broadcast_shape.resize(result_ndim, 1);
+                let scale = gathered.reshape(&broadcast_shape)?;
+                res_f32.mul(&scale)?
+            };
             result = if scaled.dtype()? != out_dtype {
                 scaled.astype(out_dtype)?
             } else {
@@ -5275,15 +6239,22 @@ pub fn try_build_mxfp4_quantized_switch_linear(
     ))
 }
 
-/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys,
-/// attaching optional per-expert F32 `{prefix}.scale` outer scale when present.
-/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
-pub fn try_build_nvfp4_quantized_switch_linear(
+/// Try to build an NVFP4 QuantizedSwitchLinear with an explicit outer-scale policy.
+/// Under `Standard`, resolves optional `.scale`, `.weight_scale_2`,
+/// `.global_scale / 2688.0`, or `1.0 / .weight_global_scale` into normalized `[E]` F32.
+/// Under `ExternalCaller` (e.g. Nemotron-H), skips auto-resolution so the caller
+/// can apply its own scale contract without 2688x mis-scaling or double-scaling.
+pub fn try_build_nvfp4_quantized_switch_linear_with_policy(
     params: &HashMap<String, MxArray>,
     key_prefix: &str,
-) -> Option<QuantizedSwitchLinear> {
-    let weight = params.get(&format!("{}.weight", key_prefix))?;
-    let scales = params.get(&format!("{}.scales", key_prefix))?;
+    policy: Nvfp4OuterScalePolicy,
+) -> Result<Option<QuantizedSwitchLinear>> {
+    let Some(weight) = params.get(&format!("{}.weight", key_prefix)) else {
+        return Ok(None);
+    };
+    let Some(scales) = params.get(&format!("{}.scales", key_prefix)) else {
+        return Ok(None);
+    };
     let mut qsl = QuantizedSwitchLinear::new(
         weight.clone(),
         scales.clone(),
@@ -5292,10 +6263,29 @@ pub fn try_build_nvfp4_quantized_switch_linear(
         NVFP4_BITS,
         NVFP4_MODE.to_string(),
     );
-    if let Some(outer) = params.get(&format!("{}.scale", key_prefix)) {
-        qsl = qsl.with_outer_scale(outer.clone());
+    if policy == Nvfp4OuterScalePolicy::Standard {
+        let num_experts = weight.shape_at(0)?;
+        if let Some(outer) = resolve_nvfp4_outer_scale_3d(params, key_prefix, num_experts)? {
+            qsl = qsl.with_outer_scale(outer);
+        }
     }
-    Some(qsl)
+    Ok(Some(qsl))
+}
+
+/// Try to build an NVFP4 QuantizedSwitchLinear from weight/scales keys,
+/// attaching optional per-expert F32 outer scale when present.
+/// NVFP4 has no biases (only weight + uint8 E4M3 scales), fixed at 4 bits / group_size 16.
+pub fn try_build_nvfp4_quantized_switch_linear(
+    params: &HashMap<String, MxArray>,
+    key_prefix: &str,
+) -> Option<QuantizedSwitchLinear> {
+    try_build_nvfp4_quantized_switch_linear_with_policy(
+        params,
+        key_prefix,
+        Nvfp4OuterScalePolicy::Standard,
+    )
+    .ok()
+    .flatten()
 }
 
 /// Build a plain E4M3 expert stack and reconstruct it to BF16 once at load.
@@ -6027,6 +7017,241 @@ mod cuda_prefill_tests {
         // F16-sidecar `dequant_q8_bf16_cuda` + cuBLAS fallback.
         let odd_linear = run_case(33, 256, &[1, 8, 32], true, &mut rng);
         odd_linear.clear_cuda_dense_prefill();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn metal_sym_q8_bf16_prefill_routes_in_proj_ba_and_preserves_invariants() {
+        use crate::array::DType;
+        use std::sync::atomic::Ordering;
+
+        if !unsafe { sys::mlx_metal_is_available() && sys::mlx_metal_is_nax_available() } {
+            eprintln!(
+                "SKIP metal_sym_q8_bf16_prefill_routes_in_proj_ba_and_preserves_invariants: no NAX Metal"
+            );
+            return;
+        }
+
+        let mut rng = 0x9E37_79B9_7F4A_7C15u64;
+        let next_f32 = |state: &mut u64| -> f32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((*state >> 40) as f32) * (1.0 / ((1u32 << 24) as f32));
+            u * 2.0 - 1.0
+        };
+        let make_q8 = |n: i64, k: i64, sym128: bool, rng: &mut u64| -> QuantizedLinear {
+            let packed = (0..n * (k / 4))
+                .map(|_| {
+                    *rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (*rng >> 32) as u32
+                })
+                .collect::<Vec<_>>();
+            let weight = MxArray::from_uint32(&packed, &[n, k / 4]).unwrap();
+            let scale_vals = (0..n * (k / 32))
+                .map(|_| 0.004 + next_f32(rng).abs() * 0.016)
+                .collect::<Vec<_>>();
+            let scales = MxArray::from_float32(&scale_vals, &[n, k / 32])
+                .unwrap()
+                .astype(DType::Float16)
+                .unwrap();
+            let biases = if sym128 {
+                scales.mul_scalar(-128.0).unwrap()
+            } else {
+                let off = (0..n * (k / 32))
+                    .map(|_| next_f32(rng) * 0.02)
+                    .collect::<Vec<_>>();
+                scales
+                    .mul_scalar(-128.0)
+                    .unwrap()
+                    .add(
+                        &MxArray::from_float32(&off, &[n, k / 32])
+                            .unwrap()
+                            .astype(DType::Float16)
+                            .unwrap(),
+                    )
+                    .unwrap()
+            };
+            let mut ql = QuantizedLinear::new(
+                weight,
+                scales,
+                Some(biases),
+                None,
+                32,
+                8,
+                DEFAULT_QUANT_MODE.to_string(),
+            )
+            .with_q8_symmetric_128(sym128);
+            ql.promote_affine_sidecars_to_f32(DType::BFloat16).unwrap();
+            ql
+        };
+
+        // Qwen3.8-27B `in_proj_ba` shape (N=96, K=5120) and `attn_k/v` shape (N=1024, K=5120).
+        for (label, n, k, row_counts) in [
+            ("in_proj_ba", 96i64, 5120i64, &[1i64, 8, 9, 96, 2048][..]),
+            ("attn_kv", 1024i64, 5120i64, &[8i64, 64, 256][..]),
+        ] {
+            let ql = make_q8(n, k, true, &mut rng);
+            assert_eq!(ql.get_scales().dtype().unwrap(), DType::Float32);
+            assert_eq!(ql.get_biases().unwrap().dtype().unwrap(), DType::Float32);
+            assert!(ql.is_q8_symmetric_128());
+            assert!(ql.has_q8_scales_f16());
+
+            let ref_w_t = ql
+                .dequantize_current_weight()
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .transpose(Some(&[1, 0]))
+                .unwrap();
+
+            for &m in row_counts {
+                let x = MxArray::random_normal(&[1, m, k], 0.0, 0.25, Some(DType::Float32))
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+                let got = ql.forward(&x).unwrap();
+                let after = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+                assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(got.shape().unwrap().as_ref(), [1, m, n]);
+                if (9..=2048).contains(&m) {
+                    assert!(
+                        after > before,
+                        "{label} M={m} must route through Metal BF16-I/O symmetric Q8_0 prefill"
+                    );
+                } else {
+                    assert_eq!(
+                        after, before,
+                        "{label} M={m} must keep decode/verify route untouched"
+                    );
+                }
+
+                // Compare against exact FP32 dequant + matmul on the first 64 rows (or all rows).
+                let check_m = m.min(64);
+                let x_chk = x.slice_axis(1, 0, check_m).unwrap();
+                let got_chk = got.slice_axis(1, 0, check_m).unwrap();
+                let want = x_chk
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .matmul(&ref_w_t)
+                    .unwrap();
+                got_chk.eval();
+                want.eval();
+                let a = got_chk
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                let e = want.to_float32().unwrap();
+                let mut err_sq = 0.0f64;
+                let mut ref_sq = 0.0f64;
+                for (&av, &ev) in a.iter().zip(e.iter()) {
+                    let d = f64::from(av - ev);
+                    err_sq += d * d;
+                    ref_sq += f64::from(ev) * f64::from(ev);
+                }
+                let nrmse = (err_sq / ref_sq.max(1e-12)).sqrt();
+                assert!(nrmse <= 3.5e-3, "{label} M={m}: nrmse={nrmse:.3e} > 3.5e-3");
+            }
+        }
+
+        // Invariants:
+        // 1. General (non-symmetric) Q8_0 never retains `q8_scales_f16` or takes the fast path.
+        let general = make_q8(96, 256, false, &mut rng);
+        assert!(!general.is_q8_symmetric_128());
+        assert!(!general.has_q8_scales_f16());
+        let x32 = MxArray::random_normal(&[1, 32, 256], 0.0, 0.25, Some(DType::BFloat16)).unwrap();
+        let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+        let _ = general.forward(&x32).unwrap();
+        assert_eq!(
+            METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed),
+            before,
+            "general affine Q8_0 must not take symmetric Q8_0 fast path"
+        );
+
+        // 2. `outer_scale`, additive `bias`, and `forward_keep_f32` must NOT bypass their paths.
+        let sym = make_q8(96, 256, true, &mut rng);
+        assert!(sym.has_q8_scales_f16());
+
+        let with_outer = make_q8(96, 256, true, &mut rng)
+            .with_outer_scale(MxArray::from_float32(&[2.0], &[1]).unwrap());
+        assert!(!with_outer.has_q8_scales_f16());
+        let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+        let y_outer = with_outer.forward(&x32).unwrap();
+        assert_eq!(
+            METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed),
+            before,
+            "outer_scale projection must not bypass outer_scale via Q8_0 fast path"
+        );
+        assert_eq!(y_outer.dtype().unwrap(), DType::BFloat16);
+
+        let mut with_bias = make_q8(96, 256, true, &mut rng);
+        with_bias.set_bias(Some(MxArray::ones(&[96], Some(DType::Float32)).unwrap()));
+        assert!(!with_bias.has_q8_scales_f16());
+        let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+        let _ = with_bias.forward(&x32).unwrap();
+        assert_eq!(
+            METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed),
+            before,
+            "additive bias projection must not bypass bias via Q8_0 fast path"
+        );
+
+        let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+        let y_f32 = sym.forward_keep_f32(&x32).unwrap();
+        assert_eq!(
+            METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed),
+            before,
+            "forward_keep_f32 must not round to BF16 via Q8_0 fast path"
+        );
+        assert_eq!(y_f32.dtype().unwrap(), DType::Float32);
+
+        // 3. `concat_rows`, `slice_rows`, `finalize_packed_q_gate_block`, and `set_scales`
+        //    propagate / invalidate `q8_scales_f16` consistently.
+        let sym2 = make_q8(96, 256, true, &mut rng);
+        let merged = sym.concat_rows(&sym2).unwrap().expect("sym + sym merges");
+        assert!(merged.is_q8_symmetric_128() && merged.has_q8_scales_f16());
+        let sliced = merged.slice_rows(0, 96).unwrap();
+        assert!(sliced.is_q8_symmetric_128() && sliced.has_q8_scales_f16());
+        let mixed = sym
+            .concat_rows(&general)
+            .unwrap()
+            .expect("sym + gen merges");
+        assert!(!mixed.is_q8_symmetric_128() && !mixed.has_q8_scales_f16());
+
+        let mut qg = make_q8(64, 256, true, &mut rng);
+        assert!(qg.finalize_packed_q_gate_block(2, 16).unwrap());
+        assert!(qg.is_q8_symmetric_128() && qg.has_q8_scales_f16());
+        let qg_ref = qg
+            .dequantize_current_weight()
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .transpose(Some(&[1, 0]))
+            .unwrap();
+        let before = METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed);
+        let y_qg = qg.forward(&x32).unwrap();
+        assert!(METAL_SYM_Q8_PREFILL_CALLS.load(Ordering::Relaxed) > before);
+        let want_qg = x32.astype(DType::Float32).unwrap().matmul(&qg_ref).unwrap();
+        y_qg.eval();
+        want_qg.eval();
+        let a = y_qg.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let e = want_qg.to_float32().unwrap();
+        let max_diff = a
+            .iter()
+            .zip(e.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 5e-2,
+            "QGateBlock q8_scales_f16 permutation mismatch: {max_diff}"
+        );
+
+        let mut cleared = make_q8(96, 256, true, &mut rng);
+        cleared.set_scales(cleared.get_scales().clone());
+        assert!(!cleared.is_q8_symmetric_128() && !cleared.has_q8_scales_f16());
     }
 
     #[test]
@@ -9642,6 +10867,653 @@ mod clef_row_gather_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn nvfp4_2d_outer_scale_directions_bias_dequant_slice_concat_and_f16_overflow() -> Result<()> {
+        use crate::array::DType;
+        // 2D NVFP4: N=8, K=64 -> weight [8, 8] uint32 (code 2 = E2M1 1.0), scales [8, 4] uint8 (0x38 = E4M3 1.0).
+        // Unscaled W is all 1.0, so x = ones([1, 64]) -> raw matmul = 64.0.
+        let w = MxArray::from_uint32(&vec![0x2222_2222u32; 8 * 8], &[8, 8])?;
+        let s = MxArray::from_uint8(&vec![0x38u8; 8 * 4], &[8, 4])?;
+        let bias = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8])?;
+
+        // 1. Upstream MLX `.global_scale` (= amax): multiplies by amax / 2688.0.
+        let amax = 5376.0f32; // amax / 2688.0 = 2.0
+        let mut params_gs = HashMap::new();
+        params_gs.insert("proj.weight".to_string(), w.clone());
+        params_gs.insert("proj.scales".to_string(), s.clone());
+        params_gs.insert(
+            "proj.global_scale".to_string(),
+            MxArray::from_float32(&[amax], &[1])?,
+        );
+        let mut ql_gs = try_build_nvfp4_quantized_linear_with_policy(
+            &params_gs,
+            "proj",
+            Nvfp4OuterScalePolicy::Standard,
+        )?
+        .expect("build 2D NVFP4 with global_scale");
+        ql_gs.set_bias(Some(bias.clone()));
+        assert_eq!(ql_gs.outer_scale().unwrap().to_float32()?[0], 2.0f32);
+
+        let x_f32 = MxArray::ones(&[1, 64], Some(DType::Float32))?;
+        let y_gs = ql_gs.forward(&x_f32)?.to_float32()?;
+        // Expected: (64.0 * 2.0) + bias_j = 128.0 + (j + 1) (proves bias is NOT scaled!)
+        for j in 0..8 {
+            let want = 128.0 + (j + 1) as f32;
+            assert!(
+                (y_gs[j] - want).abs() < 1e-3,
+                "2D global_scale col {j}: got {}, want {want}",
+                y_gs[j]
+            );
+        }
+
+        // dequantized_weight & take_dequantized_rows apply outer_scale (1.0 * 2.0 = 2.0)
+        let dq = ql_gs.dequantized_weight()?.to_float32()?;
+        assert!(dq.iter().all(|&v| (v - 2.0).abs() < 1e-4));
+        let dq_rows = ql_gs.take_dequantized_rows(&[0, 7])?.to_float32()?;
+        assert_eq!(dq_rows.len(), 2 * 64);
+        assert!(dq_rows.iter().all(|&v| (v - 2.0).abs() < 1e-4));
+
+        // concat_rows must refuse when either side has outer_scale; slice_rows must preserve it.
+        assert!(ql_gs.concat_rows(&ql_gs)?.is_none());
+        let sliced = ql_gs.slice_rows(2, 6)?;
+        assert_eq!(sliced.outer_scale().unwrap().to_float32()?[0], 2.0f32);
+        let y_sl = sliced.forward(&x_f32)?.to_float32()?;
+        for j in 0..4 {
+            let want = 128.0 + (j + 3) as f32;
+            assert!((y_sl[j] - want).abs() < 1e-3);
+        }
+
+        // 2. ModelOpt `.weight_scale_2` & GGUF `.scale` multiply DIRECTLY (NO / 2688.0).
+        for sidecar in [".weight_scale_2", ".scale"] {
+            let mut p = HashMap::new();
+            p.insert("proj.weight".to_string(), w.clone());
+            p.insert("proj.scales".to_string(), s.clone());
+            p.insert(
+                format!("proj{sidecar}"),
+                MxArray::from_float32(&[0.5f32], &[1])?,
+            );
+            let ql = try_build_nvfp4_quantized_linear_with_policy(
+                &p,
+                "proj",
+                Nvfp4OuterScalePolicy::Standard,
+            )?
+            .unwrap();
+            let y = ql.forward(&x_f32)?.to_float32()?;
+            assert!(
+                y.iter().all(|&v| (v - 32.0).abs() < 1e-3),
+                "{sidecar}: got {:?}",
+                y.as_ref()
+            );
+        }
+
+        // 3. compressed-tensors `.weight_global_scale` (= 2688 / amax): divides (1.0 / val).
+        let mut p_ct = HashMap::new();
+        p_ct.insert("proj.weight".to_string(), w.clone());
+        p_ct.insert("proj.scales".to_string(), s.clone());
+        p_ct.insert(
+            "proj.weight_global_scale".to_string(),
+            MxArray::from_float32(&[4.0f32], &[1])?,
+        );
+        let ql_ct = try_build_nvfp4_quantized_linear_with_policy(
+            &p_ct,
+            "proj",
+            Nvfp4OuterScalePolicy::Standard,
+        )?
+        .unwrap();
+        let y_ct = ql_ct.forward(&x_f32)?.to_float32()?;
+        assert!(y_ct.iter().all(|&v| (v - 16.0).abs() < 1e-3));
+
+        // 4. Nemotron-H ExternalCaller policy must NOT touch `.global_scale`!
+        let ql_ext = try_build_nvfp4_quantized_linear_with_policy(
+            &params_gs,
+            "proj",
+            Nvfp4OuterScalePolicy::ExternalCaller,
+        )?
+        .unwrap();
+        assert!(ql_ext.outer_scale().is_none());
+        let y_ext = ql_ext.forward(&x_f32)?.to_float32()?;
+        assert!(y_ext.iter().all(|&v| (v - 64.0).abs() < 1e-3));
+
+        // 5. Float16 activation overflow guard: raw unscaled matmul > 65504 (F16 max),
+        //    true scaled output = 50.0 (> 24.37 threshold!).
+        //    Use E2M1 code 7 (6.0) + E4M3 scale 0x7E (448.0) -> each weight = 2688.0.
+        //    With K=64 and x = 50 / 64 in F16, raw dot = 50 * 2688 = 134400 (overflows F16 to Inf!).
+        //    With global_scale = 1.0 (outer_scale = 1 / 2688.0), true y = 50.0 (fits F16!).
+        let w_max = MxArray::from_uint32(&vec![0x7777_7777u32; 8 * 8], &[8, 8])?;
+        let s_max = MxArray::from_uint8(&vec![0x7Eu8; 8 * 4], &[8, 4])?;
+        let mut p_ovf = HashMap::new();
+        p_ovf.insert("ovf.weight".to_string(), w_max);
+        p_ovf.insert("ovf.scales".to_string(), s_max);
+        p_ovf.insert(
+            "ovf.global_scale".to_string(),
+            MxArray::from_float32(&[1.0f32], &[1])?,
+        );
+        let ql_ovf = try_build_nvfp4_quantized_linear_with_policy(
+            &p_ovf,
+            "ovf",
+            Nvfp4OuterScalePolicy::Standard,
+        )?
+        .unwrap();
+        let x_f16 =
+            MxArray::from_float32(&vec![50.0f32 / 64.0; 64], &[1, 64])?.astype(DType::Float16)?;
+        let y_f16 = ql_ovf.forward(&x_f16)?;
+        assert_eq!(y_f16.dtype()?, DType::Float16);
+        let y_f16_vals = y_f16.astype(DType::Float32)?.to_float32()?;
+        for &v in y_f16_vals.iter() {
+            assert!(
+                v.is_finite() && (v - 50.0).abs() < 0.25,
+                "2D F16 overflow guard failed: got {v}"
+            );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn nvfp4_3d_outer_scale_edge_cases_and_f16_overflow() -> Result<()> {
+        use crate::array::DType;
+        // 3D NVFP4: E=2, N=4, K=64, max E2M1 (6.0) * max E4M3 (448.0) = 2688.0 per weight.
+        let w_max = MxArray::from_uint32(&vec![0x7777_7777u32; 2 * 4 * 8], &[2, 4, 8])?;
+        let s_max = MxArray::from_uint8(&vec![0x7Eu8; 2 * 4 * 4], &[2, 4, 4])?;
+
+        // Upstream MLX `.global_scale` [E, 1] + F16 overflow test (true output = 50.0 and 0.0)
+        let mut p = HashMap::new();
+        p.insert("e.weight".to_string(), w_max.clone());
+        p.insert("e.scales".to_string(), s_max.clone());
+        p.insert(
+            "e.global_scale".to_string(),
+            MxArray::from_float32(&[1.0f32, 0.0], &[2, 1])?,
+        );
+        let qsl = try_build_nvfp4_quantized_switch_linear_with_policy(
+            &p,
+            "e",
+            Nvfp4OuterScalePolicy::Standard,
+        )?
+        .unwrap();
+        assert_eq!(qsl.outer_scale().unwrap().shape()?.as_ref(), &[2]);
+        let x_f16 = MxArray::from_float32(&vec![50.0f32 / 64.0; 64], &[1, 1, 1, 64])?
+            .astype(DType::Float16)?;
+        let idx = MxArray::from_uint32(&[0, 1], &[1, 2])?;
+        let y = qsl.forward(&x_f16, &idx, false)?;
+        assert_eq!(y.dtype()?, DType::Float16);
+        let vals = y.astype(DType::Float32)?.to_float32()?;
+        // Expert 0: 50.0 (no Inf!); Expert 1: scale 0.0 -> 0.0 (no NaN!)
+        for &v in &vals[0..4] {
+            assert!(v.is_finite() && (v - 50.0).abs() < 0.25, "e0 got {v}");
+        }
+        for &v in &vals[4..8] {
+            assert!(v.is_finite() && v == 0.0, "e1 (zero scale) got {v}");
+        }
+
+        // Shape normalizations: [1, E], [E, 1, 1], scalar [1] and []
+        for (raw_shape, raw_vals, want) in [
+            (vec![1, 2], vec![2.0f32, 3.0], vec![2.0f32, 3.0]),
+            (vec![2, 1, 1], vec![4.0f32, 5.0], vec![4.0f32, 5.0]),
+            (vec![1], vec![7.0f32], vec![7.0f32, 7.0]),
+            (vec![], vec![9.0f32], vec![9.0f32, 9.0]),
+        ] {
+            let norm = normalize_expert_outer_scale(
+                &MxArray::from_float32(&raw_vals, &raw_shape)?,
+                2,
+                "test",
+            )?;
+            assert_eq!(norm.shape()?.as_ref(), &[2]);
+            assert_eq!(norm.to_float32()?.as_ref(), want.as_slice());
+        }
+
+        // NaN / Inf rejection
+        for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            let mut p_bad = HashMap::new();
+            p_bad.insert("e.weight".to_string(), w_max.clone());
+            p_bad.insert("e.scales".to_string(), s_max.clone());
+            p_bad.insert(
+                "e.scale".to_string(),
+                MxArray::from_float32(&[1.0, bad], &[2])?,
+            );
+            assert!(
+                try_build_nvfp4_quantized_switch_linear_with_policy(
+                    &p_bad,
+                    "e",
+                    Nvfp4OuterScalePolicy::Standard,
+                )
+                .is_err(),
+                "must reject non-finite scale {bad}"
+            );
+        }
+
+        // Conflicting sidecars rejection
+        let mut p_conf = HashMap::new();
+        p_conf.insert("e.weight".to_string(), w_max.clone());
+        p_conf.insert("e.scales".to_string(), s_max.clone());
+        p_conf.insert(
+            "e.scale".to_string(),
+            MxArray::from_float32(&[1.0, 1.0], &[2])?,
+        );
+        p_conf.insert(
+            "e.global_scale".to_string(),
+            MxArray::from_float32(&[2688.0, 2688.0], &[2])?,
+        );
+        let err = try_build_nvfp4_quantized_switch_linear_with_policy(
+            &p_conf,
+            "e",
+            Nvfp4OuterScalePolicy::Standard,
+        )
+        .err()
+        .expect("conflicting sidecars must error");
+        assert!(err.reason.contains("Conflicting"), "{}", err.reason);
+
+        // ExternalCaller skips auto-resolution on 3D too
+        let qsl_ext = try_build_nvfp4_quantized_switch_linear_with_policy(
+            &p,
+            "e",
+            Nvfp4OuterScalePolicy::ExternalCaller,
+        )?
+        .unwrap();
+        assert!(qsl_ext.outer_scale().is_none());
+
+        Ok(())
+    }
+
+    #[test]
+    fn int8_prefill_nax_accuracy_epilogues_and_non_finite_propagation() -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::array::DType;
+            use crate::models::quant_dispatch::{PerLayerMode, kquant_mode_params, mode_to_str};
+
+            if !unsafe {
+                sys::mlx_metal_is_available()
+                    && sys::mlx_metal_is_nax_available()
+                    && sys::mlx_default_device() == 1
+            } {
+                return Ok(());
+            }
+
+            fn lcg(st: &mut u32) -> u32 {
+                *st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *st
+            }
+            fn rand_sym(st: &mut u32) -> f32 {
+                // Uniform in [-1.5, 1.5]
+                let u = ((lcg(st) >> 8) as f32) / ((1u32 << 24) as f32);
+                (u - 0.5) * 3.0
+            }
+            fn build_tiled_mode(mode: PerLayerMode, n: i64, k: i64, seed: u32) -> QuantizedLinear {
+                let kq = kquant_mode_params(mode).unwrap();
+                let mut st = seed;
+                let weight_cols = k * i64::from(kq.bits) / 32;
+                let scale_cols = k / i64::from(kq.group_size) * i64::from(kq.scale_bytes_per_group);
+                let super_block = i64::from(kq.group_size) * i64::from(kq.super_ratio);
+                let bias_cols = k / super_block * i64::from(kq.bias_entries_per_super_block);
+                let words: Vec<u32> = (0..n * weight_cols).map(|_| lcg(&mut st)).collect();
+                let scales_arr = if matches!(mode, PerLayerMode::Q4K | PerLayerMode::Q5K) {
+                    // Unsigned (sc, m) pairs in 1..32 so weights have balanced range.
+                    let scales: Vec<u8> = (0..n * scale_cols)
+                        .map(|_| 1 + (lcg(&mut st) % 31) as u8)
+                        .collect();
+                    MxArray::from_uint8(&scales, &[n, scale_cols]).unwrap()
+                } else {
+                    // Signed int8 scales in [-24, 24] \ {0}.
+                    let scales: Vec<i8> = (0..n * scale_cols)
+                        .map(|_| {
+                            let v = ((lcg(&mut st) % 48) as i32) - 24;
+                            if v == 0 { 1 } else { v as i8 }
+                        })
+                        .collect();
+                    MxArray::from_int8(&scales, &[n, scale_cols]).unwrap()
+                };
+                // Small positive float16 super-scales (~0.015..0.06) to avoid bf16 overflow.
+                let biases: Vec<u16> = (0..n * bias_cols)
+                    .map(|_| 0x2200 + (lcg(&mut st) % 0x0600) as u16)
+                    .collect();
+                let mut ql = QuantizedLinear::new(
+                    MxArray::from_uint32(&words, &[n, weight_cols]).unwrap(),
+                    scales_arr,
+                    Some(MxArray::from_float16(&biases, &[n, bias_cols]).unwrap()),
+                    None,
+                    kq.group_size,
+                    kq.bits,
+                    mode_to_str(mode).to_string(),
+                );
+                assert!(ql.tile_kquant_layout().unwrap(), "{mode:?} must tile");
+                ql
+            }
+
+            // Q6_K stays on fast P0 BF16 p128 and must NOT claim INT8 prefill support.
+            let q6k_ql = build_tiled_mode(PerLayerMode::Q6K, 128, 512, 0x6600);
+            assert!(
+                !q6k_ql.supports_int8_prefill(),
+                "Q6K must stay on BF16 p128 and not support INT8 prefill"
+            );
+
+            let modes = [
+                PerLayerMode::Q4K,
+                PerLayerMode::Q5K,
+                PerLayerMode::IQ4XS,
+                PerLayerMode::IQ4NL,
+            ];
+            let n = 128i64;
+            let mut st = 0x18A5_5EEDu32;
+
+            // Exercise both odd num_sb (K=256 -> num_sb=1, U_pad=16) and even num_sb (K=512),
+            // plus partial tail row counts M = 65, 97, 130.
+            for &(k, m) in &[(256i64, 65i64), (512, 65), (512, 97), (512, 130)] {
+                let mut x_vals: Vec<f32> = (0..m * k).map(|_| rand_sym(&mut st)).collect();
+                // Make row 0 all zeros to exercise the amax <= 2^-100 zero-group branch.
+                for v in &mut x_vals[0..k as usize] {
+                    *v = 0.0;
+                }
+                let x = MxArray::from_float32(&x_vals, &[1, m, k])?.astype(DType::BFloat16)?;
+                let aux_vals: Vec<f32> = (0..m * n).map(|_| rand_sym(&mut st)).collect();
+                let aux = MxArray::from_float32(&aux_vals, &[1, m, n])?.astype(DType::BFloat16)?;
+
+                let pre = PreparedInt8Prefill::try_new(&x)?
+                    .expect("PreparedInt8Prefill::try_new must succeed on Metal NAX");
+
+                for (mi, &mode) in modes.iter().enumerate() {
+                    let ql =
+                        build_tiled_mode(mode, n, k, 0xCAFE_0000u32 + mi as u32 * 97 + k as u32);
+                    assert!(
+                        ql.supports_int8_prefill(),
+                        "{mode:?} must support INT8 prefill"
+                    );
+
+                    let cases: [(&str, MxArray, MxArray); 3] = [
+                        (
+                            "none",
+                            ql.forward(&x)?,
+                            ql.forward_int8_prefill(&pre)?
+                                .expect("forward_int8_prefill must succeed"),
+                        ),
+                        (
+                            "residual",
+                            ql.try_store_epilogue(&x, &aux, StoreEpilogue::Residual)?
+                                .expect("bf16 residual epilogue"),
+                            ql.try_store_epilogue_int8_prefill(
+                                &pre,
+                                &aux,
+                                StoreEpilogue::Residual,
+                            )?
+                            .expect("int8 residual epilogue"),
+                        ),
+                        (
+                            "swiglu",
+                            ql.try_store_epilogue(&x, &aux, StoreEpilogue::Swiglu)?
+                                .expect("bf16 swiglu epilogue"),
+                            ql.try_store_epilogue_int8_prefill(&pre, &aux, StoreEpilogue::Swiglu)?
+                                .expect("int8 swiglu epilogue"),
+                        ),
+                    ];
+
+                    for (ep_name, ref_arr, got_arr) in cases {
+                        assert_eq!(got_arr.shape()?.as_ref(), &[1, m, n]);
+                        assert_eq!(got_arr.dtype()?, DType::BFloat16);
+                        let r = ref_arr.astype(DType::Float32)?.to_float32()?;
+                        let g = got_arr.astype(DType::Float32)?.to_float32()?;
+                        let mut dot = 0.0f64;
+                        let mut rn2 = 0.0f64;
+                        let mut gn2 = 0.0f64;
+                        let mut diff2 = 0.0f64;
+                        for (idx, (&rv, &gv)) in r.iter().zip(g.iter()).enumerate() {
+                            assert!(
+                                gv.is_finite(),
+                                "{mode:?} K={k} M={m} ep={ep_name} idx={idx}: non-finite {gv}"
+                            );
+                            let rf = f64::from(rv);
+                            let gf = f64::from(gv);
+                            dot += rf * gf;
+                            rn2 += rf * rf;
+                            gn2 += gf * gf;
+                            let d = gf - rf;
+                            diff2 += d * d;
+                        }
+                        let cos = dot / (rn2.sqrt() * gn2.sqrt()).max(1e-12);
+                        let rel_rmse = (diff2 / rn2.max(1e-12)).sqrt();
+                        assert!(
+                            cos > 0.999,
+                            "{mode:?} K={k} M={m} ep={ep_name}: cosine {cos:.6} <= 0.999"
+                        );
+                        assert!(
+                            rel_rmse < 0.02,
+                            "{mode:?} K={k} M={m} ep={ep_name}: rel_rmse {rel_rmse:.6} >= 0.02"
+                        );
+                    }
+                }
+            }
+
+            // Non-finite propagation: NaN, +Inf, -Inf must poison every column of their row
+            // without corrupting neighboring rows (test both K=256 odd num_sb and K=512).
+            for &k in &[256i64, 512] {
+                let m = 65i64;
+                let mut x_nf: Vec<f32> = (0..m * k).map(|_| rand_sym(&mut st)).collect();
+                x_nf[3 * k as usize + 17] = f32::NAN;
+                x_nf[31 * k as usize + 127] = f32::INFINITY;
+                x_nf[64 * k as usize + (k as usize - 1)] = f32::NEG_INFINITY;
+                let x_nf_arr = MxArray::from_float32(&x_nf, &[1, m, k])?.astype(DType::BFloat16)?;
+                let aux_nf = MxArray::from_float32(&vec![0.5f32; (m * n) as usize], &[1, m, n])?
+                    .astype(DType::BFloat16)?;
+                let pre_nf = PreparedInt8Prefill::try_new(&x_nf_arr)?
+                    .expect("PreparedInt8Prefill on non-finite input");
+
+                for (mi, &mode) in modes.iter().enumerate() {
+                    let ql =
+                        build_tiled_mode(mode, n, k, 0xBEEF_0000u32 + mi as u32 * 31 + k as u32);
+                    for (ep_name, got) in [
+                        ("none", ql.forward_int8_prefill(&pre_nf)?.unwrap()),
+                        (
+                            "residual",
+                            ql.try_store_epilogue_int8_prefill(
+                                &pre_nf,
+                                &aux_nf,
+                                StoreEpilogue::Residual,
+                            )?
+                            .unwrap(),
+                        ),
+                        (
+                            "swiglu",
+                            ql.try_store_epilogue_int8_prefill(
+                                &pre_nf,
+                                &aux_nf,
+                                StoreEpilogue::Swiglu,
+                            )?
+                            .unwrap(),
+                        ),
+                    ] {
+                        let vals = got.astype(DType::Float32)?.to_float32()?;
+                        for &bad_row in &[3usize, 31, 64] {
+                            for col in 0..n as usize {
+                                assert!(
+                                    vals[bad_row * n as usize + col].is_nan(),
+                                    "{mode:?} K={k} ep={ep_name}: row {bad_row} col {col} expected NaN, got {}",
+                                    vals[bad_row * n as usize + col]
+                                );
+                            }
+                        }
+                        for &good_row in &[0usize, 2, 4, 32, 63] {
+                            for col in 0..n as usize {
+                                assert!(
+                                    vals[good_row * n as usize + col].is_finite(),
+                                    "{mode:?} K={k} ep={ep_name}: clean row {good_row} col {col} got non-finite {}",
+                                    vals[good_row * n as usize + col]
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn int8_prefill_nax_q4k_q5k_affine_cancellation_and_large_finite_activations() -> Result<()> {
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Ok(());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use crate::array::DType;
+            use crate::models::quant_dispatch::{PerLayerMode, kquant_mode_params, mode_to_str};
+
+            if !unsafe {
+                sys::mlx_metal_is_available()
+                    && sys::mlx_metal_is_nax_available()
+                    && sys::mlx_default_device() == 1
+            } {
+                return Ok(());
+            }
+
+            // Build a Tiled64 Q4_K or Q5_K weight `[N=64, K=5120]` where:
+            //   - cols 0..32:  d = dmin = 1.0, sc = mn = 1, all codes q = 1 -> w = 0 exact
+            //   - cols 32..48: d = dmin = half(1.0009765625) (non-bf16 11-bit half), sc = mn = 3,
+            //                  all codes q = 1 -> w = 0 exact (verifies exact FP32 m-term, not bf16)
+            //   - cols 48..56: d = dmin = 2^-14 (0x0400), sc = mn = 1, all codes q = 1 -> w = 0 exact
+            //                  (verifies cancellation on 1e36 activations without overflow!)
+            //   - cols 56..64: d = dmin = 2^-14 (0x0400), sc = mn = 1, all codes q = 0 -> w = -2^-14
+            //                  (verifies finite nonzero output on 1e36 activations without overflow!)
+            fn build_special_q45k(mode: PerLayerMode, k: i64) -> QuantizedLinear {
+                let kq = kquant_mode_params(mode).unwrap();
+                let n = 64i64;
+                let weight_cols = k * i64::from(kq.bits) / 32;
+                let scale_cols = k / i64::from(kq.group_size) * i64::from(kq.scale_bytes_per_group);
+                let super_block = i64::from(kq.group_size) * i64::from(kq.super_ratio);
+                let bias_cols = k / super_block * i64::from(kq.bias_entries_per_super_block);
+                let units = (k / 32) as usize;
+                let bits = kq.bits as usize;
+
+                // One unit of 32 packed codes all equal to 1:
+                let mut unit_ones = vec![0u32; bits];
+                if bits == 4 {
+                    unit_ones.fill(0x1111_1111u32);
+                } else {
+                    for j in 0..32usize {
+                        let bit = j * bits;
+                        unit_ones[bit / 32] |= 1u32 << (bit % 32);
+                    }
+                }
+
+                let mut words = vec![0u32; (n * weight_cols) as usize];
+                let mut scales = vec![1u8; (n * scale_cols) as usize];
+                let mut biases = vec![0u16; (n * bias_cols) as usize];
+                for row in 0..n as usize {
+                    let (q_one, sc_val, d_bits) = if row < 32 {
+                        (true, 1u8, 0x3c00u16) // 1.0f16
+                    } else if row < 48 {
+                        (true, 3u8, 0x3c01u16) // 1.0009765625f16 (non-bf16!)
+                    } else if row < 56 {
+                        (true, 1u8, 0x0400u16) // 2^-14 f16, q=1 -> w=0
+                    } else {
+                        (false, 1u8, 0x0400u16) // 2^-14 f16, q=0 -> w=-2^-14
+                    };
+                    if q_one {
+                        for u in 0..units {
+                            let base = row * weight_cols as usize + u * bits;
+                            words[base..base + bits].copy_from_slice(&unit_ones);
+                        }
+                    }
+                    let sbase = row * scale_cols as usize;
+                    scales[sbase..sbase + scale_cols as usize].fill(sc_val);
+                    let bbase = row * bias_cols as usize;
+                    biases[bbase..bbase + bias_cols as usize].fill(d_bits);
+                }
+                let mut ql = QuantizedLinear::new(
+                    MxArray::from_uint32(&words, &[n, weight_cols]).unwrap(),
+                    MxArray::from_uint8(&scales, &[n, scale_cols]).unwrap(),
+                    Some(MxArray::from_float16(&biases, &[n, bias_cols]).unwrap()),
+                    None,
+                    kq.group_size,
+                    kq.bits,
+                    mode_to_str(mode).to_string(),
+                );
+                assert!(ql.tile_kquant_layout().unwrap(), "{mode:?} must tile");
+                assert!(ql.supports_int8_prefill(), "{mode:?} must support INT8");
+                ql
+            }
+
+            let m = 65i64;
+            let k = 5120i64;
+            let n = 64i64;
+            let mut x_vals = vec![0.0f32; (m * k) as usize];
+            for row in 0..m as usize {
+                for col in 0..k as usize {
+                    x_vals[row * k as usize + col] = if row < 32 {
+                        // Exact Codex repro: 31 copies of 127/64 + 1 copy of 126/64 per 32-group
+                        // (sum = 63.484375, which BF16 rounded to 63.5 -> drifted to ~-2.5 at K=5120).
+                        if col % 32 == 31 {
+                            126.0 / 64.0
+                        } else {
+                            127.0 / 64.0
+                        }
+                    } else if row < 48 {
+                        // 24-bit repeating amax/127 scale (1.0 / 127.0): 31x 1.0 + 1x 0.5
+                        if col % 32 == 31 { 0.5 } else { 1.0 }
+                    } else {
+                        // Large finite activations (~1e36): must NOT overflow m-term to Inf/NaN!
+                        1e36f32
+                    };
+                }
+            }
+            let x = MxArray::from_float32(&x_vals, &[1, m, k])?.astype(DType::BFloat16)?;
+            let pre = PreparedInt8Prefill::try_new(&x)?
+                .expect("PreparedInt8Prefill::try_new must succeed on Metal NAX");
+
+            for mode in [PerLayerMode::Q4K, PerLayerMode::Q5K] {
+                let ql = build_special_q45k(mode, k);
+                let out = ql
+                    .forward_int8_prefill(&pre)?
+                    .expect("forward_int8_prefill must succeed");
+                let got = out.astype(DType::Float32)?.to_float32()?;
+
+                // 1) Exact affine cancellation across K=5120 (cols 0..48, rows 0..48):
+                //    - rows 0..32 (power-of-2 scale 1/64): exact 0.0 cancellation (<= 1e-4)
+                //    - rows 32..48 (repeating 1/127 scale, sum ≈ 5040): within 4 FP32 ULPs (<= 5e-3,
+                //      i.e. < 1e-6 relative, vs the old BF16 x_ysum drift of ~2.5).
+                for row in 0..48usize {
+                    let tol = if row < 32 { 1e-4 } else { 5e-3 };
+                    for col in 0..48usize {
+                        let v = got[row * n as usize + col];
+                        assert!(
+                            v.is_finite() && v.abs() <= tol,
+                            "{mode:?} cancel row={row} col={col}: expected ~0.0 (tol={tol}), got {v}"
+                        );
+                    }
+                }
+                // 2) Large finite 1e36 activations (rows 48..65):
+                //    - cols 48..56 have w = 0 (d=dmin=2^-14, q=1) -> exact 0.0 without overflow
+                //    - cols 56..64 have w = -2^-14 (q=0) -> finite -5120 * 1e36 * 2^-14 ≈ -3.125e35
+                let expected_big = (-5120.0f64 * 1e36f64 * (2.0f64).powi(-14)) as f32;
+                for row in 48..m as usize {
+                    for col in 48..56usize {
+                        let v = got[row * n as usize + col];
+                        assert!(
+                            v.is_finite() && v.abs() <= 1e29,
+                            "{mode:?} large-1e36-cancel row={row} col={col}: expected ~0.0, got {v}"
+                        );
+                    }
+                    for col in 56..n as usize {
+                        let v = got[row * n as usize + col];
+                        assert!(
+                            v.is_finite(),
+                            "{mode:?} large-1e36 row={row} col={col}: got non-finite {v}"
+                        );
+                        let rel = ((v - expected_big) / expected_big).abs();
+                        assert!(
+                            rel < 0.02,
+                            "{mode:?} large-1e36 row={row} col={col}: got {v}, expected {expected_big} (rel={rel})"
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
     }
 }
 

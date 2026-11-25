@@ -495,21 +495,26 @@ pub(crate) struct ImageLimits {
 impl ImageLimits {
     pub fn validate(&self, images: &[Vec<u8>]) -> Result<()> {
         if images.len() > self.max_images {
-            return Err(Error::from_reason(format!(
+            return Err(crate::vision::validate::image_processing_error(format!(
                 "image count exceeds the {} image conversation budget",
                 self.max_images
             )));
         }
         for bytes in images {
             if bytes.len() > self.max_encoded_bytes {
-                return Err(Error::from_reason("image exceeds the encoded byte budget"));
+                return Err(crate::vision::validate::image_processing_error(
+                    "image exceeds the encoded byte budget",
+                ));
             }
             let (w, h) = image::ImageReader::new(std::io::Cursor::new(bytes))
-                .with_guessed_format()?
+                .with_guessed_format()
+                .map_err(crate::vision::validate::image_processing_error)?
                 .into_dimensions()
-                .map_err(|e| Error::from_reason(e.to_string()))?;
+                .map_err(crate::vision::validate::image_processing_error)?;
             if u64::from(w) * u64::from(h) > self.max_pixels {
-                return Err(Error::from_reason("image exceeds the pixel budget"));
+                return Err(crate::vision::validate::image_processing_error(
+                    "image exceeds the pixel budget",
+                ));
             }
         }
         Ok(())

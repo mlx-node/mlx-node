@@ -422,9 +422,7 @@ impl CacheLimitCoordinator {
             pool_bytes as f64 / ONE_GIB,
             state.pools.len(),
         );
-        recompute_locked(&mut state);
-        drop(state);
-        pools_changed();
+        self.finish_pool_mutation(state);
         Some(PoolCacheLimitGuard { id })
     }
 
@@ -432,24 +430,20 @@ impl CacheLimitCoordinator {
     /// debited by memory that MLX's own allocator counters cannot see. Reserve
     /// restore staging up front, avoiding callbacks under the pool upload locks.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
-        let id = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let id = state.next_id;
-            state.next_id = state.next_id.saturating_add(1);
-            state.pools.insert(
-                id,
-                pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
-            );
-            info!(
-                "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
-                id,
-                pool_bytes as f64 / ONE_GIB,
-                state.pools.len(),
-            );
-            recompute_locked(&mut state);
-            id
-        };
-        pools_changed();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.pools.insert(
+            id,
+            pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
+        );
+        info!(
+            "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            pool_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        self.finish_pool_mutation(state);
         PoolCacheLimitGuard { id }
     }
 
@@ -460,27 +454,24 @@ impl CacheLimitCoordinator {
     /// already dropped) or the byte total is unchanged.
     pub fn update_pool(&self, id: u64, new_bytes: u64) {
         let new_bytes = new_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES);
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(bytes) = state.pools.get_mut(&id) else {
-                return;
-            };
-            if *bytes == new_bytes {
-                return;
-            }
-            *bytes = new_bytes;
-            info!(
-                "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
-                id,
-                new_bytes as f64 / ONE_GIB,
-                state.pools.len(),
-            );
-            recompute_locked(&mut state);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = state.pools.get_mut(&id) else {
+            return;
+        };
+        if *bytes == new_bytes {
+            return;
         }
-        pools_changed();
+        *bytes = new_bytes;
+        info!(
+            "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            new_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        self.finish_pool_mutation(state);
     }
 
-    /// Register a host-resident memory pool (e.g. Inkling2's flat host-RAM state
+    /// Register a host-resident memory pool (e.g. Inkling2's host-RAM state
     /// store) without adding paged-KV `RESTORE_STAGING_BYTES`. Its exact byte
     /// total is included in [`Self::registered_pool_bytes`] so both the MLX
     /// cache ceiling and the memory governor charge it alongside private Metal
@@ -1402,35 +1393,42 @@ mod tests {
 
     #[test]
     fn host_pool_guard_tracks_exact_bytes_without_restore_staging() {
-        let _lock = POOL_LOCK.lock().unwrap();
-        let before = coordinator().registered_pool_bytes();
-        let guard = coordinator().register_host_pool(64 << 20);
+        let local = std::sync::Arc::new(CacheLimitCoordinator::new_for_test());
+        assert_eq!(local.registered_pool_bytes(), 0);
+        let guard = local.register_host_pool_local(64 << 20);
         assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
+            local.registered_pool_bytes(),
             64 << 20,
-            "register_host_pool must charge exact bytes without RESTORE_STAGING_BYTES"
+            "register_host_pool_local must charge exact bytes without RESTORE_STAGING_BYTES"
         );
         guard.update(96 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            96 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 96 << 20);
         guard.update(96 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            96 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 96 << 20);
         guard.update(16 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            16 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 16 << 20);
         drop(guard);
         assert_eq!(
-            coordinator().registered_pool_bytes(),
-            before,
-            "dropping HostPoolCacheLimitGuard must unregister exact bytes"
+            local.registered_pool_bytes(),
+            0,
+            "dropping HostPoolCacheLimitGuard must unregister its host pool bytes"
         );
+
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let global_guard = coordinator().register_host_pool(32 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            32 << 20,
+            "global register_host_pool must also charge exact bytes without RESTORE_STAGING_BYTES"
+        );
+        global_guard.update(48 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            48 << 20
+        );
+        drop(global_guard);
+        assert_eq!(coordinator().registered_pool_bytes(), before);
     }
 
     // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────

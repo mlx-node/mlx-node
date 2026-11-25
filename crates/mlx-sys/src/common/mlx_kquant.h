@@ -23,6 +23,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <tuple>
 
 namespace mlx::core::kquant {
 
@@ -424,6 +425,65 @@ private:
   int bits_;
   Mode mode_;
   StoreEpilogue epilogue_;
+};
+
+// Whether `mode` has Tiled64 INT8-activation NAX prefill kernels
+// (`kquant_prefill_int8_nax.metal`).
+constexpr bool is_int8_prefill_mode(Mode mode) {
+  return mode == Mode::Q4K || mode == Mode::Q5K || mode == Mode::IQ4XS ||
+         mode == Mode::IQ4NL;
+}
+
+// Quantize a bfloat16 activation `[..., M, K]` (`K % 256 == 0`) per 64-element
+// group to `(xq: int8 [M_pad, K], x_sa: float32 [K/64, M_pad],
+// x_ysum: float32 [M_pad, U_pad])` with `M_pad = ((M + 31) / 32) * 32` and
+// `U_pad = (((K / 32) + 15) / 16) * 16`, or nullopt when the INT8 prefill
+// kernels are unavailable or operands are off-contract.
+std::optional<std::tuple<array, array, array>>
+quantize_prefill_int8(const array &x, StreamOrDevice s = {});
+
+// `x @ w.T` on a Tiled64 weight using pre-quantized `(xq, x_sa, x_ysum)` from
+// `quantize_prefill_int8`, with `epilogue` in `{0 (none), 1 (residual),
+// 2 (swiglu)}` and `aux` shaped as `out_shape` when `epilogue != 0`.
+std::optional<array> quantized_matmul_int8(
+    const array &xq, const array &x_sa, const array &x_ysum, const array &w,
+    const array &scales, const array &biases, const std::optional<array> &aux,
+    const Shape &orig_shape, Mode mode, int epilogue, StreamOrDevice s = {});
+
+class KQuantQuantizePrefillInt8 : public Primitive {
+public:
+  explicit KQuantQuantizePrefillInt8(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array> &inputs,
+                std::vector<array> &outputs) override;
+  void eval_gpu(const std::vector<array> &inputs,
+                std::vector<array> &outputs) override;
+
+  DEFINE_NAME(KQuantQuantizePrefillInt8)
+  bool is_equivalent(const Primitive &other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array> &inputs) override;
+};
+
+class KQuantMatmulInt8 : public UnaryPrimitive {
+public:
+  KQuantMatmulInt8(Stream stream, int group_size, int bits, Mode mode,
+                   int epilogue, Shape out_shape)
+      : UnaryPrimitive(stream), group_size_(group_size), bits_(bits),
+        mode_(mode), epilogue_(epilogue), out_shape_(std::move(out_shape)) {}
+
+  void eval_cpu(const std::vector<array> &inputs, array &out) override;
+  void eval_gpu(const std::vector<array> &inputs, array &out) override;
+
+  DEFINE_NAME(KQuantMatmulInt8)
+  bool is_equivalent(const Primitive &other) const override;
+  std::vector<Shape> output_shapes(const std::vector<array> &inputs) override;
+
+private:
+  int group_size_;
+  int bits_;
+  Mode mode_;
+  int epilogue_;
+  Shape out_shape_;
 };
 
 class KQuantMatmul : public UnaryPrimitive {

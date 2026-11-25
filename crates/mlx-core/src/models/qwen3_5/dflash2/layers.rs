@@ -306,11 +306,8 @@ impl DFlash2Attention {
         self.attend_masked_with_broadcast(queries, keys, values, mask, None)
     }
 
-    // MLX's generic SDPA inserts a Broadcast with the construction-time
-    // [B,H,Q,K] shape. During compiled replay, a pre-broadcast explicit input
-    // makes that operation a no-op, allowing masked K to grow dynamically.
-    // The custom tensor-op path keeps its singleton-head mask contract.
-    pub(super) fn attend_masked_with_broadcast(
+    /// Attention output before `o_proj` (`[B, seq, HQ * D]`).
+    pub(super) fn attend_masked_pre_oproj(
         &self,
         queries: &MxArray,
         keys: &MxArray,
@@ -321,7 +318,7 @@ impl DFlash2Attention {
         let batch = queries.shape_at(0)?;
         let seq = queries.shape_at(2)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attended = if let Some(out_bthd) = crate::kernels::attention::sdpa_draft_masked_bthd(
+        if let Some(out_bthd) = crate::kernels::attention::sdpa_draft_masked_bthd(
             queries,
             keys,
             values,
@@ -332,7 +329,7 @@ impl DFlash2Attention {
             seq,
             scale as f32,
         )? {
-            out_bthd
+            Ok(out_bthd)
         } else {
             match crate::kernels::attention::sdpa_draft_masked(
                 queries,
@@ -346,18 +343,33 @@ impl DFlash2Attention {
                 scale as f32,
                 self.tensor_attention_enabled,
             )? {
-                Some(out) => out,
+                Some(out) => Ok(out),
                 None => scaled_dot_product_attention(
                     queries,
                     keys,
                     values,
                     scale,
                     broadcast_mask.or(mask),
-                )?,
-            }
+                ),
+            }?
             .transpose(Some(&[0, 2, 1, 3]))?
-            .reshape(&[batch, seq, self.num_heads * self.head_dim])?
-        };
+            .reshape(&[batch, seq, self.num_heads * self.head_dim])
+        }
+    }
+
+    // MLX's generic SDPA inserts a Broadcast with the construction-time
+    // [B,H,Q,K] shape. During compiled replay, a pre-broadcast explicit input
+    // makes that operation a no-op, allowing masked K to grow dynamically.
+    // The custom tensor-op path keeps its singleton-head mask contract.
+    pub(super) fn attend_masked_with_broadcast(
+        &self,
+        queries: &MxArray,
+        keys: &MxArray,
+        values: &MxArray,
+        mask: Option<&MxArray>,
+        broadcast_mask: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        let attended = self.attend_masked_pre_oproj(queries, keys, values, mask, broadcast_mask)?;
         self.o_proj.forward(&attended)
     }
 }
@@ -611,6 +623,66 @@ impl DFlash2Layer {
         let attention = self
             .attention
             .attend_masked(&queries, &keys, &values, mask)?;
+        let (hidden, normed) = self
+            .attention_conv
+            .finish_output(&attention, &dynamic, &residual)?
+            .hidden_and_normalized(&self.post_attention_norm)?;
+        let (prepared, dynamic) = self.mlp_conv.prepare(&normed)?;
+        self.mlp_conv.finish_output(
+            &self.mlp.forward(&prepared, merged_rows)?,
+            &dynamic,
+            &hidden,
+        )
+    }
+
+    /// Batched multi-lane forward over `[N, L, H]` with per-lane RoPE `offsets`
+    /// (`Int32 [N]`), per-lane [`DraftKvWindow`]s, and per-lane attention `masks`.
+    ///
+    /// Runs every norm, dynamic causal conv, merged QKV projection, fused
+    /// QK-norm+RoPE, output projection, and MLP ONCE for all `N` lanes, while
+    /// keeping per-lane sliding-window KV attention exact.
+    pub(super) fn forward_batched(
+        &self,
+        input: DraftResidual<'_>,
+        windows: &mut [&mut DraftKvWindow],
+        offsets: &MxArray,
+        masks: &[Option<MxArray>],
+        merged_rows: i64,
+    ) -> Result<DraftLayerOutput> {
+        let n = windows.len();
+        if masks.len() != n {
+            return Err(Error::from_reason(format!(
+                "DFlash2Layer::forward_batched masks len {} != windows len {n}",
+                masks.len()
+            )));
+        }
+        let (residual, normed) = match input {
+            DraftResidual::Hidden(hidden) => (hidden.clone(), self.input_norm.forward(hidden)?),
+            DraftResidual::Pending(hidden, delta) => {
+                DecoderLayer::add_residual_norm(&self.input_norm, hidden, delta)?
+            }
+        };
+        let (prepared, dynamic) = self.attention_conv.prepare(&normed)?;
+        let (queries, block_keys, block_values) =
+            self.attention
+                .project_block_offsets(&prepared, offsets, merged_rows)?;
+        let mut per_lane_attended = Vec::with_capacity(n);
+        for (i, (window, mask)) in windows.iter_mut().zip(masks.iter()).enumerate() {
+            let bi = i as i64;
+            let q_i = queries.slice_axis(0, bi, bi + 1)?;
+            let k_i = block_keys.slice_axis(0, bi, bi + 1)?;
+            let v_i = block_values.slice_axis(0, bi, bi + 1)?;
+            let (keys, values) = window.with_block(&k_i, &v_i)?;
+            per_lane_attended.push(self.attention.attend_masked_pre_oproj(
+                &q_i,
+                &keys,
+                &values,
+                mask.as_ref(),
+                None,
+            )?);
+        }
+        let attended = MxArray::concatenate_many(per_lane_attended.iter().collect(), Some(0))?;
+        let attention = self.attention.o_proj.forward(&attended)?;
         let (hidden, normed) = self
             .attention_conv
             .finish_output(&attention, &dynamic, &residual)?

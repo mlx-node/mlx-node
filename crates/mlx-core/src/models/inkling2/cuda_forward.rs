@@ -35,6 +35,7 @@ use super::attn_res::{ATTN_RES_EPS, apply_sublayer_rms_norm};
 use super::config::Inkling2Config;
 use super::cuda_kv::Inkling2CudaCache;
 use super::model::{AttnInputNorm, Inkling2Inner, Inkling2PhysicalLayer, overwrite_image_pad_rows};
+use super::moe::ExpertGateUp;
 use super::short_conv::{
     Inkling2ShortConvTape, StreamShortConvTape, VisitShortConvState, VisitShortConvTape,
 };
@@ -944,8 +945,12 @@ fn forward_cuda_visit(
 
     // 8. Fused CUDA Sparse MoE + `ffn_post_conv` + residual `+ ffn_inp` (+ optional rollback tape).
     let t_moe = profile.is_some().then(Instant::now);
+    let gu_classified = match &layer.moe.gate_up_proj {
+        ExpertGateUp::Fused(proj) => classify_cuda_moe_proj(proj, true)?,
+        ExpertGateUp::Split { .. } => None,
+    };
     let fused_moe_out = if let (Some((gu, gu_mode)), Some((dn, dn_mode))) = (
-        classify_cuda_moe_proj(&layer.moe.gate_up_proj, true)?,
+        gu_classified,
         classify_cuda_moe_proj(&layer.moe.down_proj, false)?,
     ) {
         let res = moe_forward_cuda(&MoeForwardParams {

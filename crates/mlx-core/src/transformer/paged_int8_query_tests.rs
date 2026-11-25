@@ -548,9 +548,9 @@ fn int8_query_tile_tracks_the_fp64_reference_over_its_codes() {
 }
 
 /// Each tile launch takes the kernel its rows' positions select, whatever
-/// its rows: on the 27B geometry a 2,048-row chunk after 0 and a 64-row
-/// piece ending at 7,168 keep bf16 queries, a 64-row piece from 7,168 scores
-/// INT8 codes, a piece or a verify across 7,168 runs as one launch per side,
+/// its rows: on the 27B geometry a 256-row chunk after 0 and a 64-row
+/// piece ending at 256 keep bf16 queries, a 64-row piece from 256 scores
+/// INT8 codes, a piece or a verify across 256 runs as one launch per side,
 /// and activations bf16 never takes q8q. The split launch equals its two
 /// halves launched alone, bit for bit.
 /// Mutations rows16 (q8q iff 16 rows or more), no-split (a straddling launch
@@ -564,18 +564,19 @@ fn each_launch_takes_the_kernel_its_position_selects() {
     const GROUP: usize = 6;
     const D: usize = 256;
     let hq = KV * GROUP;
-    let Some((mut adapter, _)) = filled(MetalDtype::Int8, KV, D, 16, 7_232, false) else {
+    let Some((mut adapter, _)) = filled(MetalDtype::Int8, KV, D, 16, 2_112, false) else {
         return;
     };
     // (committed, rows, pass, [bf16, q8q] launches under auto)
     let cases: &[(u32, usize, Pass, [u64; 2])] = &[
-        (0, 2048, Pass::Prefill, [1, 0]),
-        (7_104, 64, Pass::Prefill, [1, 0]),
-        (7_168, 64, Pass::Prefill, [0, 1]),
-        (7_136, 64, Pass::Prefill, [1, 1]),
-        (7_164, 8, Pass::Verify, [1, 1]),
-        (7_168, 8, Pass::Verify, [0, 1]),
-        (7_167, 1, Pass::Verify, [1, 0]),
+        (0, 256, Pass::Prefill, [1, 0]),
+        (0, 2048, Pass::Prefill, [1, 1]),
+        (192, 64, Pass::Prefill, [1, 0]),
+        (256, 64, Pass::Prefill, [0, 1]),
+        (224, 64, Pass::Prefill, [1, 1]),
+        (252, 8, Pass::Verify, [1, 1]),
+        (256, 8, Pass::Verify, [0, 1]),
+        (255, 1, Pass::Verify, [1, 0]),
     ];
     let mut wrong = Vec::new();
     for activations in [Activations::Auto, Activations::Bf16] {
@@ -604,14 +605,14 @@ fn each_launch_takes_the_kernel_its_position_selects() {
 
     adapter.set_activations(Activations::Auto);
     let q = outlier_queries(64, hq, D, 7);
-    let whole = attend(&mut adapter, &q, (64, hq, D), 7_136, Pass::Prefill);
+    let whole = attend(&mut adapter, &q, (64, hq, D), 224, Pass::Prefill);
     let half = 32 * hq * D;
-    let mut halves = attend(&mut adapter, &q[..half], (32, hq, D), 7_136, Pass::Prefill);
+    let mut halves = attend(&mut adapter, &q[..half], (32, hq, D), 224, Pass::Prefill);
     halves.extend(attend(
         &mut adapter,
         &q[half..],
         (32, hq, D),
-        7_168,
+        256,
         Pass::Prefill,
     ));
     assert!(
@@ -622,12 +623,12 @@ fn each_launch_takes_the_kernel_its_position_selects() {
         "a launch split at the threshold differs from its halves"
     );
     adapter.set_activations(Activations::Bf16);
-    let mut bf16 = attend(&mut adapter, &q[..half], (32, hq, D), 7_136, Pass::Prefill);
+    let mut bf16 = attend(&mut adapter, &q[..half], (32, hq, D), 224, Pass::Prefill);
     bf16.extend(attend(
         &mut adapter,
         &q[half..],
         (32, hq, D),
-        7_168,
+        256,
         Pass::Prefill,
     ));
     assert!(
@@ -1646,15 +1647,15 @@ fn a_default_dense_load_scores_int8_queries_from_the_threshold() {
     );
     assert_eq!(
         adapter.int8_queries_from(),
-        Some(7_168),
+        Some(256),
         "the rule's threshold"
     );
     let mut wrong = Vec::new();
     for (committed, rows, pass, want) in [
-        (7_104u32, 64usize, Pass::Prefill, [1u64, 0]),
-        (7_160, 8, Pass::Verify, [1, 0]),
-        (7_168, 64, Pass::Prefill, [0, 1]),
-        (7_168, 8, Pass::Verify, [0, 1]),
+        (192u32, 64usize, Pass::Prefill, [1u64, 0]),
+        (248, 8, Pass::Verify, [1, 0]),
+        (256, 64, Pass::Prefill, [0, 1]),
+        (256, 8, Pass::Verify, [0, 1]),
     ] {
         let q = uniform(rows * hq * D, u64::from(committed) + rows as u64, 2.0);
         let before = adapter.tile_query_launches();

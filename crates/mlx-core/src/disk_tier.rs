@@ -599,6 +599,21 @@ impl TierHandle {
             .and_then(std::sync::Weak::upgrade)
             .is_some_and(|tier| tier.is_open())
     }
+
+    /// Active mode of the state tier: `"persistent"` or `"temp"` while open,
+    /// else `"off"` (absent, closed, dropped, or after a non-space write error).
+    pub(crate) fn mode(&self) -> &'static str {
+        match self.0.as_ref().and_then(std::sync::Weak::upgrade) {
+            Some(tier) if tier.is_open() => {
+                if tier.persistent {
+                    "persistent"
+                } else {
+                    "temp"
+                }
+            }
+            _ => "off",
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1134,6 +1149,105 @@ pub(crate) mod store;
 
 #[cfg(all(test, unix))]
 mod tests;
+
+#[cfg(all(test, unix))]
+mod mode_tests {
+    use super::*;
+
+    struct TempRoot(PathBuf);
+
+    impl TempRoot {
+        fn new(tag: &str) -> Self {
+            let path = std::env::temp_dir()
+                .join(format!("mlx-disk-tier-mode-{tag}-{}", uuid::Uuid::new_v4()));
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempRoot {
+        fn drop(&mut self) {
+            VOLUMES.with(|volumes| volumes.borrow_mut().clear());
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn tier_handle_mode_tracks_default_open_close_and_drop() {
+        assert_eq!(TierHandle::default().mode(), "off");
+        assert_eq!(TierHandle::of(None).mode(), "off");
+
+        let root = TempRoot::new("lifecycle");
+        let tmp = root.join("tmp");
+        let cache = root.join("cache");
+        fs::create_dir_all(&tmp).unwrap();
+        fs::create_dir_all(&cache).unwrap();
+        VOLUMES.with(|volumes| {
+            volumes.borrow_mut().push((
+                root.0.clone(),
+                Some(Volume {
+                    available: 200 * GIB,
+                    size: 512 * GIB,
+                    local: true,
+                    mount: "/Volumes/Test".to_string(),
+                }),
+            ));
+        });
+
+        // Open temp -> "temp", then close -> "off".
+        let temp_opts = DiskTierOptions {
+            temp_root: Some(tmp.clone()),
+            ..DiskTierOptions::default()
+        };
+        let temp_tier =
+            open_disk_tier(&temp_opts, || None, 1024).expect("open temporary disk tier");
+        let temp_handle = TierHandle::of(Some(&temp_tier));
+        assert_eq!(temp_handle.mode(), "temp");
+        assert!(temp_tier.close(Instant::now() + Duration::from_secs(2)));
+        assert_eq!(temp_handle.mode(), "off");
+        drop(temp_tier);
+        assert_eq!(temp_handle.mode(), "off");
+
+        // Open persistent -> "persistent", then close -> "off".
+        let ns = "0123456789abcdef0123456789abcdef";
+        let fp = ColdCacheFingerprint::from_components([ns.as_bytes()]);
+        let persist_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Auto,
+            persistent: true,
+            cache_dir: Some(cache.clone()),
+            temp_root: Some(tmp.clone()),
+        };
+        let persist_tier = open_disk_tier(
+            &persist_opts,
+            || {
+                Some(PersistentIdentity {
+                    namespace: ns.to_string(),
+                    state: fp,
+                    kv: fp,
+                })
+            },
+            1024,
+        )
+        .expect("open persistent disk tier");
+        let persist_handle = TierHandle::of(Some(&persist_tier));
+        assert_eq!(persist_handle.mode(), "persistent");
+        assert!(persist_tier.close(Instant::now() + Duration::from_secs(2)));
+        assert_eq!(persist_handle.mode(), "off");
+        drop(persist_tier);
+
+        // Open temp then drop without explicit close -> weak upgrade fails -> "off".
+        let drop_tier =
+            open_disk_tier(&temp_opts, || None, 1024).expect("open temporary disk tier for drop");
+        let drop_handle = TierHandle::of(Some(&drop_tier));
+        assert_eq!(drop_handle.mode(), "temp");
+        drop(drop_tier);
+        assert_eq!(drop_handle.mode(), "off");
+    }
+}
 
 #[cfg(windows)]
 impl DiskTier {

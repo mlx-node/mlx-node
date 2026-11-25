@@ -615,7 +615,16 @@ impl Inkling2KVCacheCoordinator {
                     })?;
                     adapter.set_admission(Arc::new(governor));
                     if initial_blocks < max_blocks {
-                        adapter.set_extent_growth(extent_blocks.max(1));
+                        match group.attention_kind {
+                            AttentionKind::Full => {
+                                let extent = extent_blocks.max(1);
+                                adapter
+                                    .set_extent_growth_geometric(extent, extent.saturating_mul(8));
+                            }
+                            AttentionKind::SlidingWindow { .. } => {
+                                adapter.set_extent_growth(extent_blocks.max(1));
+                            }
+                        }
                     }
                     adapter.set_memory_ceiling(ceiling_bytes);
                     adapter.set_activations(activations);

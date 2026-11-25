@@ -56,7 +56,8 @@ pub struct Inkling2VisionConfig {
     pub patch_size: usize,
     #[serde(
         default = "default_vision_spatial_merge_size",
-        alias = "adapter_merge_size"
+        alias = "adapter_merge_size",
+        alias = "merge_size"
     )]
     pub spatial_merge_size: usize,
     #[serde(default = "default_vision_projection_dim", alias = "text_hidden_size")]
@@ -292,9 +293,15 @@ pub struct Inkling2Config {
     pub vision_config: Option<Inkling2VisionConfig>,
     #[serde(default)]
     pub dspark_config: Option<Inkling2DsparkConfig>,
-    #[serde(default = "default_eos_token_id")]
+    #[serde(
+        default = "default_eos_token_id",
+        deserialize_with = "deserialize_eos_token_id"
+    )]
     pub eos_token_id: u32,
-    #[serde(default = "default_pad_token_id")]
+    #[serde(
+        default = "default_pad_token_id",
+        deserialize_with = "deserialize_pad_token_id"
+    )]
     pub pad_token_id: u32,
     /// True when `gate_up_proj` is stored interleaved `(g0, u0, g1, u1, ...)` (HF/vLLM);
     /// false when split `[gate (0..I), up (I..2I)]` (GGUF: both Unsloth and mainline llama.cpp).
@@ -384,11 +391,82 @@ fn default_pad_token_id() -> u32 {
     199_999
 }
 
+fn parse_token_id_value(val: &serde_json::Value) -> std::result::Result<Option<u32>, String> {
+    match val {
+        serde_json::Value::Null => Ok(None),
+        serde_json::Value::Number(n) => n
+            .as_u64()
+            .and_then(|v| u32::try_from(v).ok())
+            .map(Some)
+            .ok_or_else(|| format!("expected u32 token id, got {val}")),
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if item.is_null() {
+                    continue;
+                }
+                let id = item
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| format!("expected u32 element in token id array, got {item}"))?;
+                return Ok(Some(id));
+            }
+            Ok(None)
+        }
+        other => Err(format!("expected u32, array of u32, or null, got {other}")),
+    }
+}
+
+fn deserialize_eos_token_id<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    parse_token_id_value(&val)
+        .map(|opt| opt.unwrap_or_else(default_eos_token_id))
+        .map_err(serde::de::Error::custom)
+}
+
+fn deserialize_pad_token_id<'de, D>(deserializer: D) -> std::result::Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val = serde_json::Value::deserialize(deserializer)?;
+    parse_token_id_value(&val)
+        .map(|opt| opt.unwrap_or_else(default_pad_token_id))
+        .map_err(serde::de::Error::custom)
+}
+
+fn parse_vision_config_value(
+    vc: &serde_json::Value,
+    default_projection_dim: usize,
+) -> Option<Inkling2VisionConfig> {
+    if !vc.is_object() {
+        return None;
+    }
+    let mut parsed = serde_json::from_value::<Inkling2VisionConfig>(vc.clone()).ok()?;
+    if vc.get("image_size").is_none()
+        && let Some(grid) = vc.get("posemb_grid_size").and_then(|v| v.as_u64())
+        && grid > 0
+    {
+        parsed.image_size = (grid as usize).saturating_mul(parsed.patch_size);
+    }
+    if vc.get("intermediate_size").is_none()
+        && let Some(ratio) = vc.get("mlp_ratio").and_then(|v| v.as_f64())
+        && ratio > 0.0
+    {
+        parsed.intermediate_size = (parsed.hidden_size as f64 * ratio).round() as usize;
+    }
+    if vc.get("projection_dim").is_none() && vc.get("text_hidden_size").is_none() {
+        parsed.projection_dim = default_projection_dim;
+    }
+    Some(parsed)
+}
+
 impl Inkling2Config {
     /// Parse either a flat GGUF-extracted `config.json` or a HuggingFace composite
     /// `config.json` (which nests text fields inside `text_config` and vision fields
     /// inside `vision_config`).
-    pub fn from_json_str(raw: &str, is_gguf_checkpoint: bool) -> Result<Self> {
+    pub fn from_json_str(raw: &str, _is_gguf_checkpoint: bool) -> Result<Self> {
         let root: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
             Error::from_reason(format!("Failed to parse Inkling2 config.json: {e}"))
         })?;
@@ -397,31 +475,38 @@ impl Inkling2Config {
             Error::from_reason(format!("Failed to deserialize Inkling2Config: {e}"))
         })?;
 
-        if cfg.vision_config.is_none()
-            && let Some(vc) = root.get("vision_config")
-            && !vc.is_null()
-            && let Ok(mut parsed) = serde_json::from_value::<Inkling2VisionConfig>(vc.clone())
+        if let Some(vc) = root.get("vision_config")
+            && let Some(parsed) = parse_vision_config_value(vc, cfg.hidden_size)
         {
-            if vc.get("image_size").is_none()
-                && let Some(grid) = vc.get("posemb_grid_size").and_then(|v| v.as_u64())
-                && grid > 0
-            {
-                parsed.image_size = (grid as usize).saturating_mul(parsed.patch_size);
-            }
-            if vc.get("intermediate_size").is_none()
-                && let Some(ratio) = vc.get("mlp_ratio").and_then(|v| v.as_f64())
-                && ratio > 0.0
-            {
-                parsed.intermediate_size = (parsed.hidden_size as f64 * ratio).round() as usize;
-            }
             cfg.vision_config = Some(parsed);
         }
 
-        if text_val.get("eos_token_id").is_none()
-            && let Some(eos) = root.get("eos_token_id").and_then(|v| v.as_u64())
-            && let Ok(eos_u32) = u32::try_from(eos)
+        let text_eos = text_val
+            .get("eos_token_id")
+            .map(parse_token_id_value)
+            .transpose()
+            .map_err(|e| Error::from_reason(format!("Invalid text_config.eos_token_id: {e}")))?
+            .flatten();
+        if text_eos.is_none()
+            && let Some(root_eos_val) = root.get("eos_token_id")
+            && let Some(eos) = parse_token_id_value(root_eos_val)
+                .map_err(|e| Error::from_reason(format!("Invalid eos_token_id: {e}")))?
         {
-            cfg.eos_token_id = eos_u32;
+            cfg.eos_token_id = eos;
+        }
+
+        let text_pad = text_val
+            .get("pad_token_id")
+            .map(parse_token_id_value)
+            .transpose()
+            .map_err(|e| Error::from_reason(format!("Invalid text_config.pad_token_id: {e}")))?
+            .flatten();
+        if text_pad.is_none()
+            && let Some(root_pad_val) = root.get("pad_token_id")
+            && let Some(pad) = parse_token_id_value(root_pad_val)
+                .map_err(|e| Error::from_reason(format!("Invalid pad_token_id: {e}")))?
+        {
+            cfg.pad_token_id = pad;
         }
 
         if cfg.dspark_config.is_none()
@@ -453,9 +538,16 @@ impl Inkling2Config {
             }
         }
 
-        // GGUF checkpoints store split `[gate, up]`; HF checkpoints store interleaved.
-        if !is_gguf_checkpoint && root.get("text_config").is_some() {
-            cfg.gate_up_interleaved = true;
+        // Honor explicit root-level `gate_up_interleaved` when `text_config` omits it.
+        // Tensor layout in `inkling2/persistence.rs` remains authoritative for converted
+        // SafeTensors layouts (`Release` / `oMLX` / `mlx-vlm` => true; `mlx-lm` split => false).
+        // Do NOT guess from `root.get("text_config").is_some()`, which misclassifies split
+        // `mlx-lm` checkpoints and flat-config `oMLX` checkpoints.
+        if text_val.get("gate_up_interleaved").is_none()
+            && let Some(root_interleaved) =
+                root.get("gate_up_interleaved").and_then(|v| v.as_bool())
+        {
+            cfg.gate_up_interleaved = root_interleaved;
         }
 
         cfg.validate()?;
@@ -756,7 +848,8 @@ mod tests {
         let cfg = Inkling2Config::from_json_str(&raw, false).unwrap();
         assert_eq!(cfg.num_physical_layers(), 24);
         assert_eq!(cfg.num_layer_visits(), 48);
-        assert!(cfg.gate_up_interleaved);
+        // Tensor layout in persistence.rs is authoritative; config.rs does not guess from text_config.
+        assert!(!cfg.gate_up_interleaved);
         assert_eq!(cfg.vision_config.as_ref().unwrap().num_hidden_layers, 23);
     }
 
@@ -813,7 +906,7 @@ mod tests {
         assert_eq!(cfg.num_layer_visits(), 48);
         assert_eq!(cfg.max_position_embeddings, 1_048_576);
         assert_eq!(cfg.eos_token_id, 200_006);
-        assert!(cfg.gate_up_interleaved);
+        assert!(!cfg.gate_up_interleaved);
 
         let vc = cfg.vision_config.as_ref().unwrap();
         assert_eq!(vc.projection_dim, 2304);
@@ -828,5 +921,93 @@ mod tests {
         assert_eq!(dc.block_size, 8);
         assert_eq!(dc.markov_rank, 256);
         assert_eq!(dc.target_layer_ids, vec![5, 23, 41, 48]);
+    }
+
+    #[test]
+    fn eos_and_pad_token_id_accept_scalar_array_and_null() {
+        // Array eos_token_id and null pad_token_id inside text_config + root fallback
+        let raw_array = serde_json::json!({
+            "eos_token_id": [200010, 200011],
+            "pad_token_id": [199990],
+            "text_config": {
+                "hidden_size": 2304,
+                "num_hidden_layers": 24,
+                "eos_token_id": [200006, 200007],
+                "pad_token_id": null
+            }
+        })
+        .to_string();
+        let cfg = Inkling2Config::from_json_str(&raw_array, false).unwrap();
+        assert_eq!(cfg.eos_token_id, 200_006);
+        assert_eq!(cfg.pad_token_id, 199_990);
+        assert!(!cfg.gate_up_interleaved);
+
+        // Both null -> falls back to defaults
+        let raw_null = serde_json::json!({
+            "eos_token_id": null,
+            "pad_token_id": null,
+            "hidden_size": 2304,
+            "num_hidden_layers": 24
+        })
+        .to_string();
+        let cfg_null = Inkling2Config::from_json_str(&raw_null, false).unwrap();
+        assert_eq!(cfg_null.eos_token_id, default_eos_token_id());
+        assert_eq!(cfg_null.pad_token_id, default_pad_token_id());
+
+        // Empty array in text_config falls back to root scalar; explicit gate_up_interleaved honored
+        let raw_empty = serde_json::json!({
+            "eos_token_id": 42,
+            "pad_token_id": 7,
+            "text_config": {
+                "hidden_size": 2304,
+                "num_hidden_layers": 24,
+                "eos_token_id": [],
+                "pad_token_id": [],
+                "gate_up_interleaved": true
+            }
+        })
+        .to_string();
+        let cfg_empty = Inkling2Config::from_json_str(&raw_empty, false).unwrap();
+        assert_eq!(cfg_empty.eos_token_id, 42);
+        assert_eq!(cfg_empty.pad_token_id, 7);
+        assert!(cfg_empty.gate_up_interleaved);
+
+        // Root-level `gate_up_interleaved: true` honored when `text_config` omits it
+        let raw_root_il = serde_json::json!({
+            "gate_up_interleaved": true,
+            "text_config": {
+                "hidden_size": 2304,
+                "num_hidden_layers": 24
+            }
+        })
+        .to_string();
+        let cfg_root_il = Inkling2Config::from_json_str(&raw_root_il, false).unwrap();
+        assert!(cfg_root_il.gate_up_interleaved);
+    }
+
+    #[test]
+    fn flat_config_derives_vision_image_size_intermediate_size_and_merge_size_alias() {
+        let raw = serde_json::json!({
+            "model_type": "inkling2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 24,
+            "vision_config": {
+                "hidden_size": 768,
+                "mlp_ratio": 3.5,
+                "native_patch_size": 16,
+                "posemb_grid_size": 24,
+                "merge_size": 4
+            }
+        })
+        .to_string();
+
+        let cfg = Inkling2Config::from_json_str(&raw, false).unwrap();
+        let vc = cfg.vision_config.as_ref().expect("vision_config present");
+        assert_eq!(vc.spatial_merge_size, 4);
+        assert_eq!(vc.patch_size, 16);
+        assert_eq!(vc.image_size, 384);
+        assert_eq!(vc.intermediate_size, 2688);
+        assert_eq!(vc.posemb_grid_size(), 24);
+        assert_eq!(vc.projection_dim, 2048);
     }
 }

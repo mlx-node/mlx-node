@@ -794,6 +794,8 @@ pub(crate) enum PreemptionMode {
 pub(crate) fn is_paged_allocation_blocked(reason: &str) -> bool {
     reason.contains("paged decode could not reserve")
         || reason.contains("paged cache could not reserve")
+        || reason.contains("could allocate only")
+        || reason.contains("are free or reclaimable")
 }
 
 const SSD_PREEMPT_MIN_BLOCKS: u64 = 64;
@@ -1166,6 +1168,14 @@ impl<P, Exclusive, Barrier> Scheduler<P, Exclusive, Barrier> {
             .iter()
             .chain(self.running.iter())
             .any(|turn| turn.seq_id == seq_id)
+    }
+
+    pub(crate) fn live_seq_ids(&self) -> Vec<SeqId> {
+        self.waiting
+            .iter()
+            .chain(self.running.iter())
+            .map(|turn| turn.seq_id)
+            .collect()
     }
 
     pub fn has_live_turns(&self) -> bool {
@@ -4433,5 +4443,28 @@ mod tests {
             ),
             (1, 0, 0, 2)
         );
+    }
+
+    #[test]
+    fn is_paged_allocation_blocked_matches_swa_and_hybrid_shortfalls() {
+        assert!(is_paged_allocation_blocked(
+            "context_length_exceeded: paged decode could not reserve 2 more block(s)"
+        ));
+        assert!(is_paged_allocation_blocked(
+            "context_length_exceeded: paged cache could not reserve 4 blocks for a disk restore"
+        ));
+        assert!(is_paged_allocation_blocked(
+            "restore_sliding_raw_blocks_for could allocate only 1 of 2 blocks"
+        ));
+        assert!(is_paged_allocation_blocked(
+            "restore_sliding_prefix_for could allocate only 0 of 2 blocks"
+        ));
+        assert!(is_paged_allocation_blocked(
+            "Hybrid KV group 1 needs 2 blocks, but only 0 are free or reclaimable"
+        ));
+        assert!(!is_paged_allocation_blocked(
+            "context_length_exceeded: requested 9000 tokens, paged cache capacity is 8192 tokens"
+        ));
+        assert!(!is_paged_allocation_blocked("unrelated model error"));
     }
 }

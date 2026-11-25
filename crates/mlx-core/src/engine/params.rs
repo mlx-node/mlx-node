@@ -225,9 +225,9 @@ pub(crate) fn resolve_enable_thinking(config: &ChatConfig) -> Option<bool> {
 /// (e.g. LFM2). None = unlimited. Qwen3.5 must NOT call this (its template honors enable_thinking).
 pub(crate) fn default_thinking_budget_for_effort(reasoning_effort: Option<&str>) -> Option<i32> {
     match reasoning_effort {
-        Some("none") => Some(0),  // force </think> ASAP → minimal thinking
-        Some("low") => Some(256), // small cap; short reasoning still leaves room to answer
-        _ => None,                // medium/high/unset → unlimited (preserves current default)
+        Some("none") => Some(0), // force </think> ASAP → minimal thinking
+        Some("minimal" | "low") => Some(256), // small cap; short reasoning still leaves room to answer
+        _ => None, // medium/high/unset → unlimited (preserves current default)
     }
 }
 
@@ -250,6 +250,11 @@ pub(crate) enum ThinkingPolicy {
     /// the budget to 256 but does NOT disable thinking (`enabled` stays
     /// `true`).
     AlwaysOnBudgetFromEffort,
+    /// Dynamic open-token thinking policy for families whose prompt does NOT
+    /// pre-open `<think>` (e.g. Inkling2 emits `<|content_thought|>` dynamically):
+    /// `ReasoningTracker` starts outside thinking and enters thinking when
+    /// `ThinkEndResolution::think_open_id` is observed.
+    OpenTokenHonoring,
 }
 
 /// Resolve a [`ThinkingPolicy`] + request config into the concrete
@@ -276,6 +281,11 @@ pub(crate) fn resolve(
             budget: config
                 .thinking_token_budget
                 .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
+            cycle_guard,
+        },
+        ThinkingPolicy::OpenTokenHonoring => ThinkingSetup {
+            enabled: resolve_enable_thinking(config).unwrap_or(true),
+            budget: config.thinking_token_budget,
             cycle_guard,
         },
     }
@@ -783,7 +793,11 @@ mod tests {
     fn test_default_thinking_budget_for_effort() {
         // none → Some(0): force </think> ASAP (minimal thinking).
         assert_eq!(default_thinking_budget_for_effort(Some("none")), Some(0));
-        // low → Some(256): small cap.
+        // minimal / low → Some(256): small cap.
+        assert_eq!(
+            default_thinking_budget_for_effort(Some("minimal")),
+            Some(256)
+        );
         assert_eq!(default_thinking_budget_for_effort(Some("low")), Some(256));
         // medium / high / unset / unknown → None (unlimited; preserves default).
         assert_eq!(default_thinking_budget_for_effort(Some("medium")), None);
@@ -801,6 +815,7 @@ mod tests {
             think_end_str: Some("</think>".to_string()),
             thinking_end: std::sync::Arc::from([8, 9]),
             think_end_extra_ids: Vec::new(),
+            think_open_id: None,
         };
         let run = |policy: ThinkingPolicy, guard: Option<bool>| {
             let config = ChatConfig {
@@ -831,5 +846,36 @@ mod tests {
         let none = run(ThinkingPolicy::None, Some(true));
         assert_eq!(none.close, None);
         assert_eq!(none.cycle_period, None);
+    }
+
+    #[test]
+    fn open_token_honoring_policy_resolves_effort_budget_and_cycle_guard() {
+        let default_cfg = ChatConfig::default();
+        let setup = resolve(ThinkingPolicy::OpenTokenHonoring, &default_cfg);
+        assert!(setup.enabled);
+        assert_eq!(setup.budget, None);
+        assert!(!setup.cycle_guard);
+
+        let none_cfg = ChatConfig {
+            reasoning_effort: Some("none".to_string()),
+            thinking_token_budget: Some(128),
+            thinking_cycle_guard: Some(true),
+            ..ChatConfig::default()
+        };
+        let disabled = resolve(ThinkingPolicy::OpenTokenHonoring, &none_cfg);
+        assert!(!disabled.enabled);
+        assert_eq!(disabled.budget, Some(128));
+        assert!(disabled.cycle_guard);
+
+        let low_cfg = ChatConfig {
+            reasoning_effort: Some("low".to_string()),
+            thinking_token_budget: Some(64),
+            thinking_cycle_guard: Some(true),
+            ..ChatConfig::default()
+        };
+        let enabled = resolve(ThinkingPolicy::OpenTokenHonoring, &low_cfg);
+        assert!(enabled.enabled);
+        assert_eq!(enabled.budget, Some(64));
+        assert!(enabled.cycle_guard);
     }
 }

@@ -34,14 +34,15 @@ use tracing::warn;
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::{
     LinearProj, MLPVariant, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP8_BITS, MXFP8_GROUP_SIZE, NVFP4_BITS,
-    NVFP4_GROUP_SIZE, QuantizedLinear, QuantizedSwitchLinear,
-    try_build_affine_quantized_linear_tiled, try_build_fp8_e4m3_quantized_linear,
-    try_build_fp8_e4m3_quantized_switch_linear, try_build_kquant_quantized_linear,
-    try_build_kquant_quantized_linear_tiled, try_build_kquant_quantized_switch_linear,
-    try_build_mxfp4_quantized_linear, try_build_mxfp4_quantized_switch_linear,
-    try_build_mxfp8_quantized_linear, try_build_mxfp8_quantized_switch_linear,
-    try_build_nvfp4_quantized_linear, try_build_nvfp4_quantized_switch_linear,
-    try_build_quantized_linear, try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
+    NVFP4_GROUP_SIZE, Nvfp4OuterScalePolicy, QuantizedLinear, QuantizedSwitchLinear,
+    resolve_optional_outer_scale_3d, try_build_affine_quantized_linear_tiled,
+    try_build_fp8_e4m3_quantized_linear, try_build_fp8_e4m3_quantized_switch_linear,
+    try_build_kquant_quantized_linear, try_build_kquant_quantized_linear_tiled,
+    try_build_kquant_quantized_switch_linear, try_build_mxfp4_quantized_linear,
+    try_build_mxfp4_quantized_switch_linear, try_build_mxfp8_quantized_linear,
+    try_build_mxfp8_quantized_switch_linear, try_build_nvfp4_quantized_linear_with_policy,
+    try_build_nvfp4_quantized_switch_linear_with_policy, try_build_quantized_linear,
+    try_build_quantized_switch_linear, try_build_sym8_quantized_linear,
 };
 use crate::nn::Embedding;
 
@@ -1180,9 +1181,25 @@ fn quant_object(quant_cfg: Option<&Value>) -> Result<Option<&serde_json::Map<Str
     })
 }
 
+fn is_upstream_non_mlx_quant_config(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("quant_method")
+        && !obj.contains_key("bits")
+        && !obj.contains_key("group_size")
+        && !obj.contains_key("mode")
+}
+
+fn is_mlx_quant_block(obj: &serde_json::Map<String, Value>) -> bool {
+    obj.contains_key("bits") || obj.contains_key("group_size") || obj.contains_key("mode")
+}
+
 /// Select the modern or legacy quantization block without silent alias
-/// shadowing. A null/non-object alias or a divergent pair is malformed and must
-/// fail before any dtype-based legacy mode heuristic runs.
+/// shadowing. A null/non-object alias or a divergent MLX pair is malformed and
+/// must fail before any dtype-based legacy mode heuristic runs.
+///
+/// Compatibility: MLX converters frequently emit an MLX `"quantization"` block
+/// alongside an upstream HuggingFace `"quantization_config"` block (e.g.
+/// `{"quant_method": "modelopt", ...}` with no MLX `bits`/`group_size`/`mode`
+/// keys). In that specific non-conflicting case, select `"quantization"`.
 pub fn select_quantization_block(raw: &Value) -> Result<Option<&Value>> {
     let modern = raw.get("quantization");
     let legacy = raw.get("quantization_config");
@@ -1196,10 +1213,19 @@ pub fn select_quantization_block(raw: &Value) -> Result<Option<&Value>> {
         }
     }
     match (modern, legacy) {
-        (Some(modern), Some(legacy)) if modern != legacy => Err(Error::from_reason(
-            "Conflicting quantization aliases: 'quantization' and 'quantization_config' must be identical when both are present"
-                .to_string(),
-        )),
+        (Some(modern), Some(legacy)) if modern != legacy => {
+            if modern.as_object().is_some_and(is_mlx_quant_block)
+                && legacy
+                    .as_object()
+                    .is_some_and(is_upstream_non_mlx_quant_config)
+            {
+                return Ok(Some(modern));
+            }
+            Err(Error::from_reason(
+                "Conflicting quantization aliases: 'quantization' and 'quantization_config' must be identical when both are present"
+                    .to_string(),
+            ))
+        }
         (Some(value), _) | (_, Some(value)) => Ok(Some(value)),
         (None, None) => Ok(None),
     }
@@ -1497,6 +1523,11 @@ fn parse_per_layer_entries(
 
     for (key, value) in obj {
         let Some(child) = value.as_object() else {
+            // MLX converters (mlx-lm / mlx-vlm / oMLX) record `"<tensor_path>": false`
+            // for intentionally unquantized (dense) projections.
+            if value == &Value::Bool(false) {
+                continue;
+            }
             let normalized = normalize_per_layer_key(key);
             let looks_like_tensor_path = normalized.starts_with("layers.")
                 || normalized.starts_with("mtp.")
@@ -1982,6 +2013,9 @@ pub(crate) struct QlBuildSpec<'a> {
     pub promote_affine_sidecars: AffineSidecarPromotion,
     /// Optional NVFP4 post-build guard (e.g. Nemotron-H `.global_scale` gate).
     pub validate_nvfp4: Option<&'a dyn Fn(&str) -> Result<()>>,
+    /// Policy governing NVFP4 outer-scale auto-resolution. Defaults to `Standard`;
+    /// automatically treated as `ExternalCaller` when `validate_nvfp4` is set.
+    pub nvfp4_outer_scale_policy: Nvfp4OuterScalePolicy,
     /// Optional Affine post-build guard (e.g. Nemotron-H `require_affine_sidecars`).
     pub validate_affine: Option<&'a dyn Fn(&HashMap<String, MxArray>, &str) -> Result<()>>,
 }
@@ -2003,6 +2037,7 @@ impl<'a> QlBuildSpec<'a> {
             input_amax: InputAmaxPolicy::None,
             promote_affine_sidecars: AffineSidecarPromotion::None,
             validate_nvfp4: None,
+            nvfp4_outer_scale_policy: Nvfp4OuterScalePolicy::Standard,
             validate_affine: None,
         }
     }
@@ -2056,7 +2091,12 @@ pub(crate) fn build_ql(
             }
         },
         PerLayerMode::Nvfp4 => {
-            let built = try_build_nvfp4_quantized_linear(params, prefix);
+            let policy = if spec.validate_nvfp4.is_some() {
+                Nvfp4OuterScalePolicy::ExternalCaller
+            } else {
+                spec.nvfp4_outer_scale_policy
+            };
+            let built = try_build_nvfp4_quantized_linear_with_policy(params, prefix, policy)?;
             if built.is_some()
                 && let Some(validate) = spec.validate_nvfp4
             {
@@ -2213,11 +2253,34 @@ pub(crate) fn build_qsl(
         return Ok(None);
     }
 
+    let attach_optional_scale =
+        |built: Option<QuantizedSwitchLinear>| -> Result<Option<QuantizedSwitchLinear>> {
+            let Some(qsl) = built else {
+                return Ok(None);
+            };
+            let num_experts = qsl.get_weight().shape_at(0)?;
+            if let Some(outer) = resolve_optional_outer_scale_3d(params, prefix, num_experts)? {
+                Ok(Some(qsl.with_outer_scale(outer)))
+            } else {
+                Ok(Some(qsl))
+            }
+        };
+
     Ok(match plq.mode {
-        PerLayerMode::Mxfp4 => try_build_mxfp4_quantized_switch_linear(params, prefix),
-        PerLayerMode::Mxfp8 => try_build_mxfp8_quantized_switch_linear(params, prefix),
+        PerLayerMode::Mxfp4 => {
+            attach_optional_scale(try_build_mxfp4_quantized_switch_linear(params, prefix))?
+        }
+        PerLayerMode::Mxfp8 => {
+            attach_optional_scale(try_build_mxfp8_quantized_switch_linear(params, prefix))?
+        }
         PerLayerMode::Nvfp4 => {
-            let built = try_build_nvfp4_quantized_switch_linear(params, prefix);
+            let policy = if spec.nvfp4_outer_scale.is_some() {
+                Nvfp4OuterScalePolicy::ExternalCaller
+            } else {
+                Nvfp4OuterScalePolicy::Standard
+            };
+            let built =
+                try_build_nvfp4_quantized_switch_linear_with_policy(params, prefix, policy)?;
             match (built, spec.nvfp4_outer_scale) {
                 (Some(qsl), Some(resolve_scale)) => {
                     let gs = resolve_scale(params, prefix)?;
@@ -2253,14 +2316,8 @@ pub(crate) fn build_qsl(
         },
         PerLayerMode::Affine => {
             let built = try_build_quantized_switch_linear(params, prefix, plq.group_size, plq.bits);
-            if spec.affine_optional_outer_scale {
-                built.map(|q| match params.get(&format!("{prefix}.scale")) {
-                    Some(outer) => q.with_outer_scale(outer.clone()),
-                    None => q,
-                })
-            } else {
-                built
-            }
+            let _ = spec.affine_optional_outer_scale;
+            attach_optional_scale(built)?
         }
         PerLayerMode::Q6K
         | PerLayerMode::Q4K
@@ -2275,13 +2332,13 @@ pub(crate) fn build_qsl(
         | PerLayerMode::IQ2S
         | PerLayerMode::IQ3XXS
         | PerLayerMode::IQ1S
-        | PerLayerMode::IQ1M => try_build_kquant_quantized_switch_linear(
+        | PerLayerMode::IQ1M => attach_optional_scale(try_build_kquant_quantized_switch_linear(
             params,
             prefix,
             plq.mode,
             plq.layout,
             spec.family,
-        )?,
+        )?)?,
         PerLayerMode::Sym8 => match spec.sym8 {
             QslSym8Policy::RejectLfm2 => {
                 return Err(Error::from_reason(format!(
@@ -4395,5 +4452,221 @@ mod tests {
         );
         assert_eq!(got, default_plq);
         assert_ne!(got, default_gate_plq);
+    }
+
+    #[test]
+    fn parse_per_layer_entries_skips_false_and_rejects_true_or_scalar() {
+        let cfg = serde_json::json!({
+            "bits": 4,
+            "group_size": 64,
+            "model.language_model.layers.0.self_attn.sink_proj": false,
+            "lm_head": false,
+            "model.layers.0.mlp.gate_proj": {"bits": 8, "group_size": 32}
+        });
+        let (bits, gs, mode, per_layer) = parse_quant_settings(Some(&cfg), 4, 64).unwrap();
+        assert_eq!((bits, gs, mode), (4, 64, None));
+        assert!(!per_layer.contains_key("layers.0.self_attn.sink_proj"));
+        assert!(!per_layer.contains_key("lm_head"));
+        assert_eq!(per_layer.get("layers.0.mlp.gate_proj").unwrap().bits, 8);
+
+        // `true` on a tensor path must still fail closed.
+        let bad_true = serde_json::json!({
+            "bits": 4,
+            "group_size": 64,
+            "lm_head": true
+        });
+        assert!(parse_quant_settings(Some(&bad_true), 4, 64).is_err());
+
+        // String / number / null on a tensor path must still fail closed.
+        for bad_val in [
+            serde_json::json!("mxfp4"),
+            serde_json::json!(8),
+            serde_json::Value::Null,
+        ] {
+            let bad = serde_json::json!({
+                "bits": 4,
+                "group_size": 64,
+                "model.layers.0.mlp.gate_proj": bad_val
+            });
+            assert!(parse_quant_settings(Some(&bad), 4, 64).is_err());
+        }
+    }
+
+    #[test]
+    fn select_quantization_block_prefers_mlx_over_upstream_modelopt_config() {
+        // MLX converter writes `quantization` while leaving HF `quantization_config` (modelopt).
+        let coexisting = serde_json::json!({
+            "quantization": {
+                "bits": 4,
+                "group_size": 64,
+                "mode": "affine"
+            },
+            "quantization_config": {
+                "quant_method": "modelopt",
+                "quant_algo": "NVFP4"
+            }
+        });
+        let selected = select_quantization_block(&coexisting).unwrap().unwrap();
+        assert_eq!(selected["bits"], 4);
+        assert_eq!(selected["group_size"], 64);
+
+        // Divergent MLX-vs-MLX pair must still be rejected as conflicting.
+        let conflicting_mlx = serde_json::json!({
+            "quantization": { "bits": 4, "group_size": 64 },
+            "quantization_config": { "bits": 8, "group_size": 32 }
+        });
+        let err = select_quantization_block(&conflicting_mlx).unwrap_err();
+        assert!(err.reason.contains("Conflicting"), "{}", err.reason);
+    }
+
+    #[test]
+    fn build_qsl_attaches_optional_scale_on_all_3d_modes() {
+        let e = 2i64;
+        let n = 4i64;
+        let k = 64i64;
+        let scale_arr = MxArray::from_float32(&[1.5, 0.25], &[e, 1]).unwrap();
+
+        // MXFP4 + .scale
+        let mut p_mxfp4 = HashMap::new();
+        p_mxfp4.insert(
+            "exp.weight".to_string(),
+            MxArray::from_uint32(
+                &vec![0x2222_2222u32; (e * n * (k / 8)) as usize],
+                &[e, n, k / 8],
+            )
+            .unwrap(),
+        );
+        p_mxfp4.insert(
+            "exp.scales".to_string(),
+            MxArray::from_uint8(&vec![127u8; (e * n * (k / 32)) as usize], &[e, n, k / 32])
+                .unwrap(),
+        );
+        p_mxfp4.insert("exp.scale".to_string(), scale_arr.clone());
+        let qsl_mxfp4 = build_qsl(
+            &p_mxfp4,
+            "exp",
+            PerLayerQuant {
+                bits: 4,
+                group_size: 32,
+                mode: PerLayerMode::Mxfp4,
+                layout: KQuantLayout::RowMajor,
+                input_amax: None,
+            },
+            QslBuildSpec {
+                family: "test",
+                validate_storage: true,
+                fp8: QslFp8Policy::RejectUnsupported,
+                sym8: QslSym8Policy::RejectUnsupported,
+                nvfp4_only: false,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            qsl_mxfp4
+                .outer_scale()
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[1.5f32, 0.25]
+        );
+
+        // MXFP8 + .scale
+        let mut p_mxfp8 = HashMap::new();
+        p_mxfp8.insert(
+            "exp.weight".to_string(),
+            MxArray::from_uint32(
+                &vec![0x3838_3838u32; (e * n * (k / 4)) as usize],
+                &[e, n, k / 4],
+            )
+            .unwrap(),
+        );
+        p_mxfp8.insert(
+            "exp.scales".to_string(),
+            MxArray::from_uint8(&vec![127u8; (e * n * (k / 32)) as usize], &[e, n, k / 32])
+                .unwrap(),
+        );
+        p_mxfp8.insert("exp.scale".to_string(), scale_arr.clone());
+        let qsl_mxfp8 = build_qsl(
+            &p_mxfp8,
+            "exp",
+            PerLayerQuant {
+                bits: 8,
+                group_size: 32,
+                mode: PerLayerMode::Mxfp8,
+                layout: KQuantLayout::RowMajor,
+                input_amax: None,
+            },
+            QslBuildSpec {
+                family: "test",
+                validate_storage: true,
+                fp8: QslFp8Policy::RejectUnsupported,
+                sym8: QslSym8Policy::RejectUnsupported,
+                nvfp4_only: false,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            qsl_mxfp8
+                .outer_scale()
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[1.5f32, 0.25]
+        );
+
+        // Affine + .scale even when affine_optional_outer_scale == false
+        let mut p_aff = HashMap::new();
+        p_aff.insert(
+            "exp.weight".to_string(),
+            MxArray::from_uint32(&vec![0u32; (e * n * (k / 8)) as usize], &[e, n, k / 8]).unwrap(),
+        );
+        p_aff.insert(
+            "exp.scales".to_string(),
+            MxArray::ones(&[e, n, k / 32], Some(DType::Float16)).unwrap(),
+        );
+        p_aff.insert(
+            "exp.biases".to_string(),
+            MxArray::zeros(&[e, n, k / 32], Some(DType::Float16)).unwrap(),
+        );
+        p_aff.insert("exp.scale".to_string(), scale_arr);
+        let qsl_aff = build_qsl(
+            &p_aff,
+            "exp",
+            PerLayerQuant {
+                bits: 4,
+                group_size: 32,
+                mode: PerLayerMode::Affine,
+                layout: KQuantLayout::RowMajor,
+                input_amax: None,
+            },
+            QslBuildSpec {
+                family: "test",
+                validate_storage: true,
+                fp8: QslFp8Policy::RejectUnsupported,
+                sym8: QslSym8Policy::RejectUnsupported,
+                nvfp4_only: false,
+                affine_optional_outer_scale: false,
+                nvfp4_outer_scale: None,
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            qsl_aff
+                .outer_scale()
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[1.5f32, 0.25]
+        );
     }
 }

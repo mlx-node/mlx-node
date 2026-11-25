@@ -957,4 +957,6 @@ module.exports.scoreAgainstTeacher = nativeBinding.scoreAgainstTeacher;
 module.exports.setProfilingEnabled = nativeBinding.setProfilingEnabled;
 module.exports.setResidencyKeepAlive = nativeBinding.setResidencyKeepAlive;
 module.exports.sweepCacheLeftovers = nativeBinding.sweepCacheLeftovers;
+module.exports.validateImageBytes = nativeBinding.validateImageBytes;
+module.exports.validateImageBytesAsync = nativeBinding.validateImageBytesAsync;
 module.exports.__internal__ = nativeBinding.__internal__;

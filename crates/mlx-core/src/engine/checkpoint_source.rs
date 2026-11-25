@@ -228,7 +228,16 @@ impl GgufCheckpoint {
         let record = read_gguf_source_json(dir)?;
         let main = open_gguf_main_with(&record.main, open_recorded)?;
         family.check_main_header(&main.header, main.path())?;
-        let companion = record.companion.as_ref().map(open_recorded).transpose()?;
+        let mut companion = match record.companion.as_ref().map(open_recorded).transpose() {
+            Ok(c) => c,
+            Err(err) if family == NativeGgufFamily::Inkling2 => {
+                tracing::warn!(
+                    "Inkling2: failed to reopen recorded vision projector companion ({err}); continuing in text-only mode"
+                );
+                None
+            }
+            Err(err) => return Err(err),
+        };
         let (opts, main_plan, companion_plan) = native_import_plans(
             family,
             (main.path(), &main.header),
@@ -236,6 +245,9 @@ impl GgufCheckpoint {
                 .as_ref()
                 .map(|(path, header, _)| (path.as_path(), &**header)),
         )?;
+        if companion_plan.is_none() {
+            companion = None;
+        }
         Ok(Self {
             asset_dir: dir.to_path_buf(),
             main,
@@ -293,11 +305,22 @@ pub(crate) fn native_import_plans(
         ..base
     };
     let main_plan = plan_gguf_import(main.1, main.0, &main_opts, OutputRole::Primary)?;
-    let companion_plan = companion
-        .map(|(path, header)| {
-            plan_gguf_import(header, path, &companion_opts, companion_role(family))
-        })
-        .transpose()?;
+    let companion_plan = match companion {
+        Some((path, header)) => {
+            match plan_gguf_import(header, path, &companion_opts, companion_role(family)) {
+                Ok(plan) => Some(plan),
+                Err(err) if family == NativeGgufFamily::Inkling2 => {
+                    tracing::warn!(
+                        "Inkling2: optional vision projector '{}' cannot be imported ({err}); continuing in text-only mode",
+                        path.display()
+                    );
+                    None
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        None => None,
+    };
     Ok((main_opts, main_plan, companion_plan))
 }
 

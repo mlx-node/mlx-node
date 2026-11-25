@@ -27,7 +27,7 @@ const VERIFY_ROWS: i64 = 8;
 /// tail page's rows past the visible tokens hold stored rows.
 const POOL_TOKENS: u32 = 72 * CHUNK as u32;
 /// The product's INT8-query position on Apple10 (`prefill_plan::int8_query_from`).
-const PRODUCT_INT8_FROM: u32 = 7_168;
+const PRODUCT_INT8_FROM: u32 = 256;
 
 /// (pass, committed, rows) of the bit points.
 const BIT_POINTS: [(Pass, u32, i64); 8] = [
@@ -309,8 +309,9 @@ fn compare_points(
 }
 
 /// The keys-token-major tile gives the block-16 tile's bits at every
-/// point, bf16 and INT8 queries; the chunk of 2,048 rows at 6,144 under the
-/// product rule runs as two launches (one per query mode) on both pages.
+/// point, bf16 and INT8 queries; a chunk of 2,048 rows straddling
+/// `PRODUCT_INT8_FROM` (128 + 2,048 across 256) under the product rule
+/// runs as two launches (one per query mode) on both pages.
 #[test]
 fn keys_token_major_tile_is_the_block16_tile() -> Result<()> {
     let Some(mut f) = fixture(
@@ -323,7 +324,8 @@ fn keys_token_major_tile_is_the_block16_tile() -> Result<()> {
     let mut failures = Vec::new();
     compare_points(&mut f, Queries::Bf16, &BIT_POINTS, &mut failures)?;
     if apple10() {
-        let straddle = [(Pass::Prefill, 6_144, CHUNK)];
+        let straddle_committed = PRODUCT_INT8_FROM - 128;
+        let straddle = [(Pass::Prefill, straddle_committed, CHUNK)];
         let before = f.adapters[1].tile_query_launches();
         compare_points(&mut f, Queries::Product, &straddle, &mut failures)?;
         for adapter in &f.adapters {
@@ -332,7 +334,7 @@ fn keys_token_major_tile_is_the_block16_tile() -> Result<()> {
         let after = f.adapters[1].tile_query_launches();
         if [after[0] - before[0], after[1] - before[1]] != [1, 1] {
             failures.push(format!(
-                "6144+2048 under the product rule: query launches {before:?} -> {after:?}, not one per mode"
+                "{straddle_committed}+{CHUNK} under the product rule: query launches {before:?} -> {after:?}, not one per mode"
             ));
         }
         compare_points(&mut f, Queries::Int8, &BIT_POINTS, &mut failures)?;

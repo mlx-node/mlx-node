@@ -175,6 +175,38 @@ pub(crate) struct ScheduledVerifyCommit {
     pub keep: usize,
 }
 
+#[cfg(test)]
+type TestValidateVerifyRowFn =
+    Arc<dyn Fn(Option<&PagedKVCacheAdapter>, &ScheduledVerifyRow) -> Result<()> + Send + Sync>;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_VALIDATE_SCHEDULED_VERIFY_ROW: std::cell::RefCell<Option<TestValidateVerifyRowFn>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::engine::hybrid_scheduler) struct TestValidateVerifyRowGuard {
+    prev: Option<TestValidateVerifyRowFn>,
+}
+
+#[cfg(test)]
+impl Drop for TestValidateVerifyRowGuard {
+    fn drop(&mut self) {
+        TEST_VALIDATE_SCHEDULED_VERIFY_ROW.with(|cell| {
+            *cell.borrow_mut() = self.prev.take();
+        });
+    }
+}
+
+#[cfg(test)]
+pub(in crate::engine::hybrid_scheduler) fn set_test_validate_scheduled_verify_row(
+    hook: TestValidateVerifyRowFn,
+) -> TestValidateVerifyRowGuard {
+    let prev = TEST_VALIDATE_SCHEDULED_VERIFY_ROW.with(|cell| cell.borrow_mut().replace(hook));
+    TestValidateVerifyRowGuard { prev }
+}
+
 /// What one prefill pass of a unit left.
 pub(crate) enum ScheduledPrefillPass {
     /// The unit stopped between its layers; its rows are not computed yet.
@@ -211,6 +243,10 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     /// whichever path finishes or rejects it.
     fn scheduled_turn_opened(&mut self, _seq_id: SeqId) {}
     fn scheduled_turn_closed(&mut self, _seq_id: SeqId) {}
+    /// Synchronizes the set of currently active scheduled sequence IDs
+    /// (running, waiting, or parked for SSD restore) so family-local auxiliary
+    /// KV reclaim (e.g. Inkling2 Group 1 SWA) never evicts an active lane.
+    fn set_active_scheduled_seqs(&mut self, _active: &[SeqId]) {}
     /// The family prefills this prompt (`prompt_tokens`, `cached_prefix` of
     /// them cached) in groups of windows: each slice (its
     /// `scheduler_prefill_ends`, else the whole prompt) is one step, the
@@ -421,6 +457,18 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
             .and_then(|_| adapter.release_request_for(seq_id).map(|_| ()))
             .map_err(Error::from_reason)
     }
+    /// Preemption hook receiving the turn's original `prompt_tokens` length so
+    /// families can preserve long replies (`>= prompt_replay + 2048`) as
+    /// non-disposable ordinary states (Splash 1.7.2 `Engine::vacateLane`).
+    fn preempt_scheduled_cache_with_prompt(
+        &mut self,
+        seq_id: SeqId,
+        _prompt_tokens: u32,
+        cache_salt: u64,
+        mode: PreemptionMode,
+    ) -> Result<()> {
+        self.preempt_scheduled_cache(seq_id, cache_salt, mode)
+    }
     fn max_position_embeddings(&self) -> i32;
     /// Token ids a prompt may hold: `0..token_vocab_size()`.
     fn token_vocab_size(&self) -> u32 {
@@ -584,6 +632,19 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
                 )
             })
             .collect()
+    }
+    /// Restore any pre-proposal draft ring handles mutated by a failed batched
+    /// proposal before retrying `seq_id` solo via [`Self::propose_scheduled`].
+    fn restore_scheduled_draft_handles(&mut self, _seq_id: SeqId) {}
+    /// Pre-validate a single row before submitting a packed speculative verify
+    /// wave so one lane's frontier or draft-owner mismatch fails only that
+    /// lane instead of aborting healthy peers in the same wave.
+    fn validate_scheduled_verify_row(&mut self, _row: &ScheduledVerifyRow) -> Result<()> {
+        #[cfg(test)]
+        if let Some(hook) = TEST_VALIDATE_SCHEDULED_VERIFY_ROW.with(|cell| cell.borrow().clone()) {
+            return hook(self.paged_adapter(), _row);
+        }
+        Ok(())
     }
     fn run_scheduled_verify(&mut self, _rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
         Err(Error::from_reason("scheduled verification is unavailable"))
@@ -3912,6 +3973,16 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         Ok(self.idle_reclaim_made_progress(seq_id, victim))
     }
 
+    /// Synchronizes all active scheduled sequence IDs (`Waiting`, `Running`, `WaitingForSsd`)
+    /// into the backend so auxiliary KV reclaim (e.g. Group 1 SWA) never evicts a live lane.
+    fn sync_active_scheduled_seqs(&mut self) {
+        let mut active = self.scheduler.live_seq_ids();
+        active.extend(self.pending_restores.keys().copied());
+        active.sort_unstable();
+        active.dedup();
+        self.inner.set_active_scheduled_seqs(&active);
+    }
+
     /// Idle owners, one at a time, until one gives back pool blocks or a
     /// parked row (a speculative step's fit counts idle rows). True only
     /// when free plus reclaimable blocks grew or the parked rows shrank, so
@@ -4093,6 +4164,15 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.yield_lane(yielding, target, failure);
             return false;
         }
+        // An executor-reported BlockRefusal (e.g. Inkling2 Group 1 SWA shortfall after
+        // Group 0's ledger claim passed) must reclaim idle owners even when active peer
+        // lanes progressed in this step, otherwise decoding peers starve the blocked prefill.
+        if let Some(&(seq_id, _)) = blocked.iter().find(|(_, denial)| {
+            denial.blocks == Some(BlockRefusal::default()) && denial.failure.is_none()
+        }) && self.reclaim_idle_owners(seq_id)
+        {
+            return false;
+        }
         if progressed {
             return false;
         }
@@ -4123,7 +4203,18 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 };
                 self.yield_lane(yielding, target, denial.failure);
             }
-            Verdict::Fail => self.fail_refused(victim, &denial),
+            Verdict::Fail => {
+                // An executor-reported BlockRefusal (e.g. Inkling2 Group 1 SWA shortfall after
+                // Group 0's ledger claim passed) may be satisfied by reclaiming an idle owner
+                // before failing `capacity_exhausted`.
+                if denial.blocks == Some(BlockRefusal::default())
+                    && denial.failure.is_none()
+                    && self.reclaim_idle_owners(victim)
+                {
+                    return false;
+                }
+                self.fail_refused(victim, &denial);
+            }
         }
         false
     }
@@ -5949,6 +6040,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         mark(progress.as_ref(), Waiting::Prepare);
         let installed = engine::progress::install_prepare_progress(progress);
         let reuse_cache = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
+        self.sync_active_scheduled_seqs();
         let prefix_admission = if self.scheduler.has_live_turns() {
             #[cfg(test)]
             {
@@ -5997,6 +6089,11 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     None => match self.prefix_refused(seq_id, &mut prepared.resource_wait, false) {
                         Some(Err(failed)) => failed,
                         Some(Ok(())) => return Err(prepared),
+                        None if is_paged_allocation_blocked(&error.reason)
+                            && self.scheduler.has_live_turns() =>
+                        {
+                            return Err(prepared);
+                        }
                         None => error,
                     },
                 };
@@ -6414,6 +6511,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 continue;
             };
             let started = self.prefix_clock();
+            self.sync_active_scheduled_seqs();
             let landed = self.land_parked_restore(seq_id, |inner, prompt, history, replay| {
                 inner.land_scheduled_restore(seq_id, &mut restore, prompt, history, replay)
             });
@@ -6651,9 +6749,13 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if mode == PreemptionMode::Ssd && !self.inner.scheduler_has_cold_tier() {
             mode = PreemptionMode::Recompute;
         }
-        let lifecycle =
-            self.inner
-                .preempt_scheduled_cache(turn.seq_id, turn.payload.params.cache_salt, mode);
+        let original_prompt_tokens = u32::try_from(prompt_tokens.len()).unwrap_or(u32::MAX);
+        let lifecycle = self.inner.preempt_scheduled_cache_with_prompt(
+            turn.seq_id,
+            original_prompt_tokens,
+            turn.payload.params.cache_salt,
+            mode,
+        );
         self.inner.release_scheduled_recurrent_for(turn.seq_id);
         self.inner.release_scheduled_speculation(turn.seq_id);
         if let Err(error) = lifecycle {
@@ -6854,6 +6956,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let progress = reply_progress(&turn.payload.response).cloned();
         mark(progress.as_ref(), Waiting::Prepare);
         let installed = engine::progress::install_prepare_progress(progress.clone());
+        self.sync_active_scheduled_seqs();
         let prefix_admission = self.inner.prepare_scheduled_prefix(
             turn.seq_id,
             &replay_tokens,
@@ -8673,6 +8776,7 @@ pub(crate) mod tests {
                     think_end_str: None,
                     thinking_end: Arc::from(Vec::new()),
                     think_end_extra_ids: Vec::new(),
+                    think_open_id: None,
                 },
                 config,
                 params,
@@ -10568,6 +10672,76 @@ pub(crate) mod tests {
         assert_eq!(governor.suspensions(7), 0);
     }
 
+    /// An executor-reported `BlockRefusal::default()` (with `failure: None`, e.g.
+    /// Inkling2 Group 1 SWA shortfall after Group 0's ledger claim passed) must
+    /// reclaim idle owners immediately even when `progressed == true`, so decoding
+    /// peers cannot starve a blocked prefill until they finish.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn settle_blocked_reclaims_idle_owner_for_default_block_refusal_even_when_progressed() {
+        let Some((mut state, governor, mut replies)) = judged_state(&[1, 2]) else {
+            return;
+        };
+        drop(speculative::tests::request(
+            &mut state.inner,
+            99,
+            (0..16).map(|token| 900 + token).collect(),
+            false,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        state.owner_sequences.insert("idle-swa-owner".into(), 99);
+
+        let free_and_reclaimable = |s: &HybridSchedulerState<Qwen35Inner>| {
+            let snap = s
+                .inner
+                .scheduler_cache_snapshot()
+                .expect("snapshot")
+                .expect("adapter");
+            snap.blocks.free_blocks + snap.blocks.reclaimable_blocks
+        };
+        let available_before = free_and_reclaimable(&state);
+        assert_eq!(state.idle_memory_victim(2), Some(99));
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("adapter")
+                .block_table_for(99)
+                .is_some()
+        );
+
+        let swa_denial = Denial {
+            failure: None,
+            pending: false,
+            blocks: Some(BlockRefusal::default()),
+            settled: false,
+        };
+        assert!(!state.settle_blocked(vec![(2, swa_denial)], true, &[1, 2]));
+        assert!(
+            state
+                .inner
+                .paged_adapter()
+                .expect("adapter")
+                .block_table_for(99)
+                .is_none(),
+            "idle owner's KV table must be reclaimed immediately when progressed == true"
+        );
+        assert_eq!(
+            state.idle_memory_victim(2),
+            None,
+            "reclaimed idle owner must no longer hold reclaimable resources"
+        );
+        assert!(
+            free_and_reclaimable(&state) > available_before,
+            "reclaiming the idle owner must free blocks"
+        );
+        assert!(replies[0].try_recv().is_err(), "lane 1 keeps running");
+        assert!(replies[1].try_recv().is_err(), "lane 2 keeps running");
+        assert_eq!(state.scheduler.running_len(), 2);
+        assert_eq!(state.scheduler.stats().preemptions, 0);
+        assert_eq!(governor.suspensions(7), 0);
+    }
+
     /// Splash `Engine::prepare`: before a step that ran no row refuses its
     /// lanes, a refusal that is not KV and that nothing returns yields the
     /// lane to yield first when that lane is outside the plan and yields
@@ -10756,6 +10930,7 @@ pub(crate) mod tests {
                     think_end_str: None,
                     thinking_end: Arc::from(Vec::new()),
                     think_end_extra_ids: Vec::new(),
+                    think_open_id: None,
                 },
                 config,
                 params,

@@ -827,6 +827,11 @@ export declare class Inkling2Model {
   modelAssetsPath(): string;
   /** Active persistent StateDisk namespace directory name, or `null` for temp/off/closed caches. */
   stateTierNamespace(): string | null;
+  /**
+   * The stored states' SSD cache mode: `'persistent'` or `'temp'` while open,
+   * `'off'` without one, after `closeCache`, or after a non-space write error.
+   */
+  stateTierMode(): 'persistent' | 'temp' | 'off';
   /** Whether weights are initialized (always `true` for instances returned by `Inkling2Model.load`). */
   get isInitialized(): boolean;
   /** Whether the block-paged hybrid KV cache coordinator is active on this instance. */
@@ -7387,6 +7392,18 @@ export interface UnwarpResult {
   /** Unwarped image as PNG bytes */
   image: Buffer;
 }
+
+/**
+ * Validate raw encoded image bytes before starting inference or committing SSE
+ * headers (exported to JS as `validateImageBytes`).
+ */
+export declare function validateImageBytes(data: Uint8Array): void;
+
+/**
+ * Validate raw encoded image bytes on libuv's worker thread pool without
+ * blocking the JS event loop (exported to JS as `validateImageBytesAsync`).
+ */
+export declare function validateImageBytesAsync(data: Uint8Array): Promise<void>;
 
 /** Vision encoder configuration */
 export interface VisionConfig {

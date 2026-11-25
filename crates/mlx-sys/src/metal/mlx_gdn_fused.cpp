@@ -394,6 +394,19 @@ struct GdnPrefillParams {
   float qk_eps;
 };
 
+// Mirrors `GdnPrefillConvParams` in `gdn_prefill_row_scan.metal.inc`.
+struct GdnPrefillConvParams {
+  int T;
+  int hk;
+  int hv;
+  int has_history;
+  int qkv_stride_t;
+  int hist_stride_r;
+  int a_stride_t;
+  int b_stride_t;
+  float qk_eps;
+};
+
 // Product: state rows of a value head split over threadgroups. Head: one
 // value head per 1024-thread threadgroup, the bit reference for tests.
 enum class GdnPrefillGeometry { Rows, Head };
@@ -405,6 +418,7 @@ constexpr size_t kGdnRowSideThreads = 256;
 struct GdnPrefillPipelines {
   MTL::ComputePipelineState* head = nullptr;
   MTL::ComputePipelineState* prologue = nullptr;
+  MTL::ComputePipelineState* prologue_conv = nullptr;
   MTL::ComputePipelineState* scan = nullptr;
   MTL::ComputePipelineState* tail = nullptr;
 };
@@ -421,7 +435,8 @@ MTL::ComputePipelineState* checked_pipeline(MTL::ComputePipelineState* p,
 
 GdnPrefillPipelines gdn_prefill_pipelines(metal::Device& device,
                                           GdnPrefillGeometry geometry, int dk,
-                                          int dv, bool bf16_scalars) {
+                                          int dv, bool bf16_scalars,
+                                          bool with_conv = false) {
   GdnPrefillPipelines out;
   if (geometry == GdnPrefillGeometry::Head) {
     const std::string lib_name = "mlx_node_gdn_fused_prefill_dk" +
@@ -439,12 +454,21 @@ GdnPrefillPipelines gdn_prefill_pipelines(metal::Device& device,
   auto* library = device.get_library("mlx_node_gdn_prefill_rows", [] {
     return std::string(metal::utils()) + "\n" + kGdnPrefillRowBody;
   });
-  out.prologue = checked_pipeline(
-      device.get_kernel(bf16_scalars
-                            ? "mlx_node_gdn_prefill_prologue_bf16_scalars"
-                            : "mlx_node_gdn_prefill_prologue",
-                        library),
-      kGdnRowSideThreads);
+  if (with_conv) {
+    out.prologue_conv = checked_pipeline(
+        device.get_kernel(
+            bf16_scalars ? "mlx_node_gdn_prefill_prologue_conv_bf16_scalars"
+                         : "mlx_node_gdn_prefill_prologue_conv",
+            library),
+        kGdnRowSideThreads);
+  } else {
+    out.prologue = checked_pipeline(
+        device.get_kernel(bf16_scalars
+                              ? "mlx_node_gdn_prefill_prologue_bf16_scalars"
+                              : "mlx_node_gdn_prefill_prologue",
+                          library),
+        kGdnRowSideThreads);
+  }
   out.scan = checked_pipeline(
       device.get_kernel("mlx_node_gdn_prefill_scan", library), kGdnRowThreads);
   out.tail = checked_pipeline(
@@ -511,7 +535,16 @@ class GdnFusedPrefill final : public fast::Custom {
       const array& x = inputs[i];
       const bool strided =
           (i <= 4) || (int(i) == z_at);  // q/k/v/a/b rows and z rows
-      if (strided || x.flags().row_contiguous) {
+      // The 8-lanes/row scan issues vectorized bfloat4 loads from `v` (8B
+      // aligned, stride divisible by 4 elements) and float4 loads from
+      // `state_in` (16B aligned). Copy contiguous when a view violates either.
+      const bool need_v_align = geometry_ == GdnPrefillGeometry::Rows &&
+          i == 2 &&
+          (x.offset() % 8 != 0 || x.strides(1) < 0 || x.strides(1) % 4 != 0);
+      const bool need_state_align = geometry_ == GdnPrefillGeometry::Rows &&
+          has_state_ && i == 7 && (x.offset() % 16 != 0);
+      if ((strided || x.flags().row_contiguous) && !need_v_align &&
+          !need_state_align) {
         bound.push_back(x);
       } else {
         copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
@@ -534,12 +567,12 @@ class GdnFusedPrefill final : public fast::Custom {
     params.T = inputs[0].shape(1);
     params.hk = inputs[0].shape(2);
     params.hv = inputs[2].shape(2);
-    params.q_stride_t = int(inputs[0].strides(1));
-    params.k_stride_t = int(inputs[1].strides(1));
-    params.v_stride_t = int(inputs[2].strides(1));
-    params.a_stride_t = int(inputs[3].strides(1));
-    params.b_stride_t = int(inputs[4].strides(1));
-    params.z_stride_t = int(inputs[z_at].strides(1));
+    params.q_stride_t = int(bound[0].strides(1));
+    params.k_stride_t = int(bound[1].strides(1));
+    params.v_stride_t = int(bound[2].strides(1));
+    params.a_stride_t = int(bound[3].strides(1));
+    params.b_stride_t = int(bound[4].strides(1));
+    params.z_stride_t = int(bound[10].strides(1));
 
     if (geometry_ == GdnPrefillGeometry::Head) {
       encoder.set_compute_pipeline_state(pipelines.head);
@@ -656,6 +689,246 @@ void expect_prefill(bool ok, const char* what) {
     throw std::invalid_argument(std::string("mlx_gdn_fused_prefill: ") + what);
   }
 }
+
+void expect_prefill_conv(bool ok, const char* what) {
+  if (!ok) {
+    throw std::invalid_argument(
+        std::string("mlx_gdn_fused_prefill_with_conv: ") + what);
+  }
+}
+
+// Input layout: qkv, conv_w, a, b, a_log, dt_bias, wq, wk, z, w
+//   [, conv_state (when has_history_)] [, state_in (when has_state_)].
+// Outputs:
+//   out            [1, T, Hv * 128] bf16
+//   out_state      [1, Hv, 128, 128] f32
+//   out_conv_state [1, 3, W] bf16
+class GdnFusedPrefillWithConv final : public fast::Custom {
+ public:
+  GdnFusedPrefillWithConv(Stream stream, int hk, int hv, int dk, int dv,
+                          float eps, float qk_eps, bool tiled, bool has_state,
+                          bool has_history, bool bf16_scalars)
+      : Custom(stream,
+               [](std::vector<array>) -> std::vector<array> {
+                 throw std::runtime_error(
+                     "GdnFusedPrefillWithConv has no fallback");
+               }),
+        hk_(hk),
+        hv_(hv),
+        dk_(dk),
+        dv_(dv),
+        eps_(eps),
+        qk_eps_(qk_eps),
+        tiled_(tiled),
+        has_state_(has_state),
+        has_history_(has_history),
+        bf16_scalars_(bf16_scalars) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("GdnFusedPrefillWithConv requires Metal");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs,
+                std::vector<array>& outputs) override {
+    bridge_testing::record("gdn_prefill_row_scan");
+    auto& stream = this->stream();
+    auto& device = metal::device(stream.device);
+    auto& encoder = metal::get_command_encoder(stream);
+    const auto pipelines = gdn_prefill_pipelines(
+        device, GdnPrefillGeometry::Rows, dk_, dv_, bf16_scalars_,
+        /*with_conv=*/true);
+
+    const int T = inputs[0].shape(1);
+    std::vector<array> copies;
+    auto copy_contiguous = [&](const array& x) -> array {
+      copies.push_back(array(x.shape(), x.dtype(), nullptr, {}));
+      copy_gpu(x, copies.back(), CopyType::General, stream);
+      return copies.back();
+    };
+    auto contiguous = [&](const array& x) -> array {
+      return x.flags().row_contiguous ? x : copy_contiguous(x);
+    };
+    auto strided_row = [&](const array& x) -> array {
+      if (x.strides(2) == 1 && (T == 1 || x.strides(1) >= 0)) {
+        return x;
+      }
+      return copy_contiguous(x);
+    };
+
+    const array bound_qkv = strided_row(inputs[0]);
+    const array bound_conv_w = contiguous(inputs[1]);
+    const array bound_a = strided_row(inputs[2]);
+    const array bound_b = strided_row(inputs[3]);
+    const array bound_a_log = contiguous(inputs[4]);
+    const array bound_dt_bias = contiguous(inputs[5]);
+    const array bound_wq = contiguous(inputs[6]);
+    const array bound_wk = contiguous(inputs[7]);
+    const array bound_z = strided_row(inputs[8]);
+    const array bound_w = contiguous(inputs[9]);
+
+    int hist_stride_r = 0;
+    array bound_hist = [&]() -> array {
+      if (!has_history_) {
+        copies.push_back(array({1}, bfloat16, nullptr, {}));
+        copies.back().set_data(allocator::malloc(2));
+        return copies.back();
+      }
+      const array& h = inputs[10];
+      const int r_axis = h.ndim() == 3 ? 1 : 0;
+      const int c_axis = h.ndim() == 3 ? 2 : 1;
+      const array bh =
+          (h.strides(c_axis) == 1 && h.strides(r_axis) >= 0)
+              ? h
+              : copy_contiguous(h);
+      hist_stride_r = int(bh.strides(r_axis));
+      return bh;
+    }();
+
+    array bound_state = [&]() -> array {
+      if (!has_state_) {
+        copies.push_back(array({1}, float32, nullptr, {}));
+        copies.back().set_data(allocator::malloc(4));
+        return copies.back();
+      }
+      const array& st = inputs[10 + (has_history_ ? 1 : 0)];
+      if (st.flags().row_contiguous && st.offset() % 16 == 0) {
+        return st;
+      }
+      return copy_contiguous(st);
+    }();
+
+    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+    outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+    outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
+
+    auto scratch = [](Shape shape, Dtype dtype) {
+      array a(std::move(shape), dtype, nullptr, {});
+      a.set_data(allocator::malloc(a.nbytes()));
+      return a;
+    };
+    array qn = scratch(Shape{T, hk_, dk_}, bfloat16);
+    array kn = scratch(Shape{T, hk_, dk_}, bfloat16);
+    array v_out = scratch(Shape{T, hv_, dv_}, bfloat16);
+    array g = scratch(Shape{T, hv_}, float32);
+    array beta = scratch(Shape{T, hv_}, bfloat16);
+    copies.insert(copies.end(), {qn, kn, v_out, g, beta});
+
+    GdnPrefillConvParams conv_params{};
+    conv_params.T = T;
+    conv_params.hk = hk_;
+    conv_params.hv = hv_;
+    conv_params.has_history = has_history_ ? 1 : 0;
+    conv_params.qkv_stride_t = int(bound_qkv.strides(1));
+    conv_params.hist_stride_r = hist_stride_r;
+    conv_params.a_stride_t = int(bound_a.strides(1));
+    conv_params.b_stride_t = int(bound_b.strides(1));
+    conv_params.qk_eps = qk_eps_;
+
+    GdnPrefillParams scan_params{};
+    scan_params.T = T;
+    scan_params.hk = hk_;
+    scan_params.hv = hv_;
+    scan_params.tiled = tiled_ ? 1 : 0;
+    scan_params.has_state = has_state_ ? 1 : 0;
+    scan_params.q_stride_t = hk_ * dk_;
+    scan_params.k_stride_t = hk_ * dk_;
+    scan_params.v_stride_t = hv_ * dv_;
+    scan_params.a_stride_t = int(bound_a.strides(1));
+    scan_params.b_stride_t = int(bound_b.strides(1));
+    scan_params.z_stride_t = int(bound_z.strides(1));
+    scan_params.eps = eps_;
+    scan_params.qk_eps = qk_eps_;
+
+    const size_t Tu = size_t(T);
+    const size_t Hku = size_t(hk_);
+    const size_t Hvu = size_t(hv_);
+
+    encoder.set_compute_pipeline_state(pipelines.prologue_conv);
+    encoder.set_input_array(bound_qkv, 0);
+    encoder.set_input_array(bound_conv_w, 1);
+    encoder.set_input_array(bound_hist, 2);
+    encoder.set_input_array(bound_a, 3);
+    encoder.set_input_array(bound_b, 4);
+    encoder.set_input_array(bound_a_log, 5);
+    encoder.set_input_array(bound_dt_bias, 6);
+    encoder.set_input_array(bound_wq, 7);
+    encoder.set_input_array(bound_wk, 8);
+    encoder.set_output_array(qn, 9);
+    encoder.set_output_array(kn, 10);
+    encoder.set_output_array(v_out, 11);
+    encoder.set_output_array(g, 12);
+    encoder.set_output_array(beta, 13);
+    encoder.set_output_array(outputs[2], 14);
+    encoder.set_bytes(conv_params, 15);
+    encoder.dispatch_threadgroups(
+        MTL::Size(ceil_groups(
+                      std::max((2 * Hku + Hvu) * Tu * 32, Tu * Hvu),
+                      kGdnRowSideThreads),
+                  1, 1),
+        MTL::Size(kGdnRowSideThreads, 1, 1));
+
+    encoder.set_compute_pipeline_state(pipelines.scan);
+    encoder.set_input_array(qn, 0);
+    encoder.set_input_array(kn, 1);
+    encoder.set_input_array(v_out, 2);
+    encoder.set_input_array(g, 3);
+    encoder.set_input_array(beta, 4);
+    encoder.set_input_array(bound_state, 5);
+    encoder.set_output_array(outputs[0], 6);
+    encoder.set_output_array(outputs[1], 7);
+    encoder.set_bytes(scan_params, 8);
+    encoder.dispatch_threadgroups(
+        MTL::Size(Hvu * (size_t(dv_) / kGdnRowsPerGroup), 1, 1),
+        MTL::Size(kGdnRowThreads, 1, 1));
+
+    encoder.set_compute_pipeline_state(pipelines.tail);
+    encoder.set_output_array(outputs[0], 0);
+    encoder.set_input_array(bound_z, 1);
+    encoder.set_input_array(bound_w, 2);
+    encoder.set_bytes(scan_params, 3);
+    encoder.dispatch_threadgroups(
+        MTL::Size(ceil_groups(Tu * Hvu * 32, kGdnRowSideThreads), 1, 1),
+        MTL::Size(kGdnRowSideThreads, 1, 1));
+    encoder.add_temporaries(std::move(copies));
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const auto& qkv = inputs[0];
+    return {
+        Shape{1, qkv.shape(1), hv_ * dv_},
+        Shape{1, hv_, dv_, dk_},
+        Shape{1, 3, qkv.shape(2)},
+    };
+  }
+
+  std::vector<array> vjp(const std::vector<array>&, const std::vector<array>&,
+                         const std::vector<int>&,
+                         const std::vector<array>&) override {
+    throw std::runtime_error("GdnFusedPrefillWithConv is inference-only");
+  }
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& o = static_cast<const GdnFusedPrefillWithConv&>(other);
+    return hk_ == o.hk_ && hv_ == o.hv_ && dk_ == o.dk_ && dv_ == o.dv_ &&
+        eps_ == o.eps_ && qk_eps_ == o.qk_eps_ && tiled_ == o.tiled_ &&
+        has_state_ == o.has_state_ && has_history_ == o.has_history_ &&
+        bf16_scalars_ == o.bf16_scalars_;
+  }
+
+  DEFINE_NAME(GdnFusedPrefillWithConv);
+
+ private:
+  int hk_;
+  int hv_;
+  int dk_;
+  int dv_;
+  float eps_;
+  float qk_eps_;
+  bool tiled_;
+  bool has_state_;
+  bool has_history_;
+  bool bf16_scalars_;
+};
 #endif
 
 }  // namespace
@@ -1055,4 +1328,149 @@ extern "C" bool mlx_gdn_fused_prefill_head_reference(
   return gdn_fused_prefill_entry(true, q, k, v, a, b, a_log, dt_bias, state,
                                  wq, wk, z, w, eps, qk_eps, tiled, out,
                                  out_state);
+}
+
+// Fused GDN prefill with 4-tap depthwise conv1d + SiLU + conv_state update
+// folded into the prologue (3 dispatches total: prologue_conv -> scan -> tail,
+// zero intermediate [1, T, W] conv output allocation).
+//
+//   qkv        [1, T, W] bf16, strides(2) == 1 (rows may be strided),
+//              W == (2 * hk + hv) * 128
+//   conv_w     [W, 4] f32 tap-major
+//   conv_state [1, 3, W] (or [3, W]) bf16, or null -> in-kernel zero init
+//   a, b       [1, T, hv] bf16, strides(2) == 1 (rows may be strided)
+//   a_log, dt_bias [hv] both f32 or both bf16
+//   state      [1, hv, 128, 128] f32, or null -> in-kernel zero init
+//   wq, wk     [128] bf16 folded q/k rms_norm weights
+//   z          [1, T, hv * 128] bf16, strides(2) == 1 (rows may be strided)
+//   w          [128] bf16 gated-norm weight
+//
+// Writes `*out` [1, T, hv * 128] bf16, `*out_state` [1, hv, 128, 128] f32,
+// `*out_conv_state` [1, 3, W] bf16.
+extern "C" bool mlx_gdn_fused_prefill_with_conv(
+    mlx_array* qkv, mlx_array* conv_w, mlx_array* conv_state, mlx_array* a,
+    mlx_array* b, mlx_array* a_log, mlx_array* dt_bias, mlx_array* state,
+    mlx_array* wq, mlx_array* wk, mlx_array* z, mlx_array* w, int hk, int hv,
+    float eps, float qk_eps, int tiled, mlx_array** out, mlx_array** out_state,
+    mlx_array** out_conv_state) {
+  if (out) *out = nullptr;
+  if (out_state) *out_state = nullptr;
+  if (out_conv_state) *out_conv_state = nullptr;
+#ifdef MLX_NODE_METAL_ENABLED
+  try {
+    expect_prefill_conv(qkv && conv_w && a && b && a_log && dt_bias && wq &&
+                            wk && z && w && out && out_state && out_conv_state,
+                        "null argument");
+    expect_prefill_conv(
+        metal::is_available() && default_device() == Device::gpu,
+        "requires the Metal device");
+    const auto& qkva = *reinterpret_cast<array*>(qkv);
+    const auto& cwa = *reinterpret_cast<array*>(conv_w);
+    const auto& aa = *reinterpret_cast<array*>(a);
+    const auto& ba = *reinterpret_cast<array*>(b);
+    const auto& ala = *reinterpret_cast<array*>(a_log);
+    const auto& dta = *reinterpret_cast<array*>(dt_bias);
+    const auto& wqa = *reinterpret_cast<array*>(wq);
+    const auto& wka = *reinterpret_cast<array*>(wk);
+    const auto& za = *reinterpret_cast<array*>(z);
+    const auto& wa = *reinterpret_cast<array*>(w);
+    constexpr int Dk = 128;
+    constexpr int Dv = 128;
+    expect_prefill_conv(hk > 0 && hv > 0 && hv % hk == 0,
+                        "hv must be a positive multiple of hk");
+    expect_prefill_conv(qkva.ndim() == 3 && aa.ndim() == 3 && ba.ndim() == 3 &&
+                            za.ndim() == 3,
+                        "ranks");
+    const int T = qkva.shape(1);
+    const int W = qkva.shape(2);
+    expect_prefill_conv(T >= 1, "T");
+    expect_prefill_conv(W == (2 * hk + hv) * Dk, "qkv width");
+    expect_prefill_conv(qkva.shape(0) == 1 && aa.shape(0) == 1 &&
+                            ba.shape(0) == 1 && za.shape(0) == 1,
+                        "batch must be 1");
+    expect_prefill_conv(aa.shape() == Shape{1, T, hv} &&
+                            ba.shape() == Shape{1, T, hv} &&
+                            za.shape() == Shape{1, T, hv * Dv},
+                        "shapes");
+    expect_prefill_conv(qkva.strides(2) == 1 && aa.strides(2) == 1 &&
+                            ba.strides(2) == 1 && za.strides(2) == 1,
+                        "channel strides");
+    expect_prefill_conv(qkva.dtype() == bfloat16 && aa.dtype() == bfloat16 &&
+                            ba.dtype() == bfloat16 && za.dtype() == bfloat16 &&
+                            wqa.dtype() == bfloat16 && wka.dtype() == bfloat16 &&
+                            wa.dtype() == bfloat16,
+                        "dtypes (activations and weights bf16)");
+    expect_prefill_conv(cwa.ndim() == 2 && cwa.shape() == Shape{W, 4} &&
+                            cwa.dtype() == float32,
+                        "conv_w must be [W, 4] f32");
+    expect_prefill_conv(wqa.shape() == Shape{Dk} && wka.shape() == Shape{Dk} &&
+                            wa.shape() == Shape{Dv},
+                        "norm weight shapes");
+    expect_prefill_conv(ala.ndim() == 1 && dta.ndim() == 1 &&
+                            ala.size() == size_t(hv) &&
+                            dta.size() == size_t(hv),
+                        "gate scalar shapes");
+    expect_prefill_conv(ala.strides(0) == 1 && dta.strides(0) == 1,
+                        "gate scalar strides");
+    const bool bf16_scalars = ala.dtype() == bfloat16;
+    expect_prefill_conv(ala.dtype() == dta.dtype() &&
+                            (bf16_scalars || ala.dtype() == float32),
+                        "a_log and dt_bias must both be f32 or both bf16");
+    expect_prefill_conv(std::isfinite(eps) && std::isfinite(qk_eps), "eps");
+
+    std::optional<array> hist_opt;
+    if (conv_state) {
+      const auto& ha = *reinterpret_cast<array*>(conv_state);
+      const bool ok3 = ha.ndim() == 3 && ha.shape(0) == 1 &&
+          ha.shape(1) == 3 && ha.shape(2) == W;
+      const bool ok2 = ha.ndim() == 2 && ha.shape(0) == 3 && ha.shape(1) == W;
+      expect_prefill_conv((ok3 || ok2) && ha.dtype() == bfloat16,
+                          "conv_state must be [1, 3, W] or [3, W] bf16");
+      hist_opt = ha;
+    }
+
+    std::optional<array> state_opt;
+    Shape state_shape{1, hv, Dv, Dk};
+    if (state) {
+      const auto& sa = *reinterpret_cast<array*>(state);
+      expect_prefill_conv(sa.shape() == state_shape && sa.dtype() == float32,
+                          "state must be [1, Hv, Dv, Dk] f32");
+      state_opt = sa;
+    }
+
+    std::vector<array> inputs{qkva, cwa, aa, ba, ala, dta, wqa, wka, za, wa};
+    if (hist_opt) {
+      inputs.push_back(*hist_opt);
+    }
+    if (state_opt) {
+      inputs.push_back(*state_opt);
+    }
+
+    auto stream = default_stream(Device::gpu);
+    gdn_prefill_pipelines(metal::device(stream.device),
+                          GdnPrefillGeometry::Rows, Dk, Dv, bf16_scalars,
+                          /*with_conv=*/true);
+    auto primitive = std::make_shared<GdnFusedPrefillWithConv>(
+        stream, hk, hv, Dk, Dv, eps, qk_eps, tiled != 0, state_opt.has_value(),
+        hist_opt.has_value(), bf16_scalars);
+    auto outputs = array::make_arrays(
+        {Shape{1, T, hv * Dv}, state_shape, Shape{1, 3, W}},
+        {bfloat16, float32, bfloat16}, primitive, std::move(inputs));
+    auto out_h = std::make_unique<array>(std::move(outputs[0]));
+    auto state_h = std::make_unique<array>(std::move(outputs[1]));
+    auto conv_h = std::make_unique<array>(std::move(outputs[2]));
+    *out = reinterpret_cast<mlx_array*>(out_h.release());
+    *out_state = reinterpret_cast<mlx_array*>(state_h.release());
+    *out_conv_state = reinterpret_cast<mlx_array*>(conv_h.release());
+    return true;
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_gdn_fused_prefill_with_conv: %s\n", e.what());
+    return false;
+  }
+#else
+  (void)qkv; (void)conv_w; (void)conv_state; (void)a; (void)b;
+  (void)a_log; (void)dt_bias; (void)state; (void)wq; (void)wk;
+  (void)z; (void)w; (void)hk; (void)hv; (void)eps; (void)qk_eps; (void)tiled;
+  return false;
+#endif
 }

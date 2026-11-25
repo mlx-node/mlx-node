@@ -257,6 +257,15 @@ impl DFlash2TargetView for DenseTargetView<'_> {
     }
 }
 
+/// One lane in a batched multi-lane [`DFlash2Model::propose_with_batched`] wave.
+pub(crate) struct DFlash2BatchProposalLane<'a> {
+    pub(crate) context: &'a mut DFlash2ContextCache,
+    pub(crate) anchor: u32,
+    pub(crate) temperature: f64,
+    pub(crate) device_path: bool,
+    pub(crate) want_confidence: bool,
+}
+
 pub(crate) struct DFlash2Model {
     execution_policy: DraftExecutionPolicy,
     compiled: CompiledDraft,
@@ -389,7 +398,7 @@ impl DFlash2Model {
         self.mask_embedding.as_ref()
     }
 
-    /// Build `[1, 1 + mask_rows, hidden]` block embeddings from a `[1, 1, hidden]`
+    /// Build `[B, 1 + mask_rows, hidden]` block embeddings from a `[B, 1, hidden]`
     /// anchor embedding and this draft's optional `mask_embedding`. Returns
     /// `Ok(None)` when the checkpoint does not ship a dedicated `mask_embedding`.
     pub(crate) fn build_block_with_mask_embedding(
@@ -403,6 +412,7 @@ impl DFlash2Model {
         if mask_rows <= 0 {
             return Ok(Some(anchor_embedded.clone()));
         }
+        let batch = anchor_embedded.shape_at(0)?;
         let hidden = anchor_embedded.shape_at(2)?;
         let dtype = anchor_embedded.dtype()?;
         let mask = if mask.dtype()? == dtype {
@@ -412,12 +422,12 @@ impl DFlash2Model {
         };
         let repeated = mask
             .reshape(&[1, 1, hidden])?
-            .broadcast_to(&[1, mask_rows, hidden])?;
+            .broadcast_to(&[batch, mask_rows, hidden])?;
         Ok(Some(MxArray::concatenate(anchor_embedded, &repeated, 1)?))
     }
 
     /// If this checkpoint ships a dedicated `mask_embedding`, replace rows
-    /// `1..rows` of `[1, rows, hidden]` block embeddings with it; otherwise
+    /// `1..rows` of `[B, rows, hidden]` block embeddings with it; otherwise
     /// return `embedded` unchanged.
     pub(crate) fn splice_mask_embedding(&self, embedded: &MxArray) -> Result<MxArray> {
         if self.mask_embedding.is_none() {
@@ -764,6 +774,118 @@ impl DFlash2Model {
             .collect())
     }
 
+    /// Batched context K/V projection across `N` lanes whose kept fused context
+    /// rows are concatenated along axis 1 into `fused_all` (`[1, total_keep, H]`).
+    ///
+    /// Runs ONE merged `context_kv` matmul across all layers when available and
+    /// `total_keep <= 32` (Metal 4 NAX decode tier), else per-layer `k_proj` /
+    /// `v_proj` over `[1, total_keep, H]`, applies `k_norm` once per layer, then
+    /// slices each lane's `(base_i, keep_i)` segment and applies RoPE at `base_i`.
+    pub(super) fn project_context_batched(
+        &self,
+        fused_all: &MxArray,
+        segments: &[(i32, usize)],
+    ) -> Result<Vec<Vec<(MxArray, MxArray)>>> {
+        let num_lanes = segments.len();
+        let num_layers = self.layers.len();
+        if num_lanes == 0 {
+            return Ok(Vec::new());
+        }
+        if num_layers == 0 {
+            return Ok(vec![Vec::new(); num_lanes]);
+        }
+        let total_keep = fused_all.shape_at(1)?;
+        let expected_total: i64 = segments.iter().map(|&(_, keep)| keep as i64).sum();
+        if fused_all.shape_at(0)? != 1 || total_keep != expected_total {
+            return Err(Error::from_reason(format!(
+                "DFlash2 project_context_batched shape {:?} does not match [1, {expected_total}, _]",
+                fused_all.shape()?.as_ref()
+            )));
+        }
+
+        let mut normed_keys = Vec::with_capacity(num_layers);
+        let mut values = Vec::with_capacity(num_layers);
+        let use_merged_kv = self.context_kv.is_some() && total_keep <= 32;
+        if use_merged_kv && let Some(context_kv) = self.context_kv.as_ref() {
+            let first = &self.layers[0];
+            let kv_width = first.attention.num_kv_heads * first.attention.head_dim;
+            let bounds = (1..2 * num_layers as i64)
+                .map(|i| i * kv_width)
+                .collect::<Vec<_>>();
+            let parts = context_kv.forward(fused_all)?.split_sections(&bounds, -1)?;
+            for (layer, pair) in self.layers.iter().zip(parts.as_chunks::<2>().0) {
+                let attention = &layer.attention;
+                let k_normed = attention
+                    .k_norm
+                    .forward(&pair[0].reshape(&[
+                        1,
+                        total_keep,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                    ])?)?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                normed_keys.push(k_normed);
+                values.push(attention.finish_values(&pair[1])?);
+            }
+        } else {
+            for layer in &self.layers {
+                let attention = &layer.attention;
+                let k_raw = attention.k_proj.forward(fused_all)?;
+                let k_normed = attention
+                    .k_norm
+                    .forward(&k_raw.reshape(&[
+                        1,
+                        total_keep,
+                        attention.num_kv_heads,
+                        attention.head_dim,
+                    ])?)?
+                    .transpose(Some(&[0, 2, 1, 3]))?;
+                let v_raw = attention.v_proj.forward(fused_all)?;
+                normed_keys.push(k_normed);
+                values.push(attention.finish_values(&v_raw)?);
+            }
+        }
+
+        let mut per_lane = Vec::with_capacity(num_lanes);
+        let mut off = 0i64;
+        for &(base, keep) in segments {
+            let end = off + keep as i64;
+            let lane_kv = if use_merged_kv && num_layers > 1 {
+                let first = &self.layers[0].attention;
+                let mut lane_keys = Vec::with_capacity(num_layers);
+                let mut lane_vals = Vec::with_capacity(num_layers);
+                for layer_idx in 0..num_layers {
+                    lane_keys.push(normed_keys[layer_idx].slice_axis(2, off, end)?);
+                    lane_vals.push(values[layer_idx].slice_axis(2, off, end)?);
+                }
+                let roped = first.rope.forward(
+                    &MxArray::concatenate_many(lane_keys.iter().collect(), Some(1))?,
+                    Some(base),
+                )?;
+                let head_bounds = (1..num_layers as i64)
+                    .map(|i| i * first.num_kv_heads)
+                    .collect::<Vec<_>>();
+                roped
+                    .split_sections(&head_bounds, 1)?
+                    .into_iter()
+                    .zip(lane_vals)
+                    .collect()
+            } else {
+                let mut lane_kv = Vec::with_capacity(num_layers);
+                for (layer_idx, layer) in self.layers.iter().enumerate() {
+                    let k_i = normed_keys[layer_idx].slice_axis(2, off, end)?;
+                    let v_i = values[layer_idx].slice_axis(2, off, end)?;
+                    let k_roped = layer.attention.rope.forward(&k_i, Some(base))?;
+                    lane_kv.push((k_roped, v_i));
+                }
+                lane_kv
+            };
+            per_lane.push(lane_kv);
+            off = end;
+        }
+        Ok(per_lane)
+    }
+
     #[cfg(test)]
     fn forward_hidden(
         &self,
@@ -807,6 +929,75 @@ impl DFlash2Model {
             };
             let next =
                 layer.forward(input, window, query_base, mask.as_ref(), self.merged_rows())?;
+            pending = Some(next);
+        }
+        match &pending {
+            Some(output) => Ok(output.hidden_and_normalized(&self.norm)?.1),
+            None => self.norm.forward(embedded),
+        }
+    }
+
+    /// Batched multi-lane draft transformer and final norm over `[N, rows, hidden]`
+    /// embedded blocks with independent per-lane [`DFlash2ContextCache`]s.
+    fn forward_embedded_batched(
+        &self,
+        embedded: &MxArray,
+        contexts: &mut [&mut DFlash2ContextCache],
+    ) -> Result<MxArray> {
+        let n = contexts.len();
+        if embedded.shape_at(0)? as usize != n {
+            return Err(Error::from_reason(format!(
+                "DFlash2 forward_embedded_batched batch {} != contexts len {n}",
+                embedded.shape_at(0)?
+            )));
+        }
+        let num_layers = self.layers.len();
+        let seq_len = embedded.shape_at(1)?;
+        let mut query_bases = Vec::with_capacity(n);
+        let mut masks = Vec::with_capacity(n);
+        for ctx in contexts.iter_mut() {
+            if ctx.layers.len() != num_layers {
+                return Err(Error::from_reason(format!(
+                    "DFlash2 context layer count {} != model layers {num_layers}",
+                    ctx.layers.len()
+                )));
+            }
+            let query_base = ctx.logical_len;
+            query_bases.push(query_base);
+            let DFlash2ContextCache {
+                layers: windows,
+                mask_memo,
+                ..
+            } = &mut **ctx;
+            let mask = match windows.first() {
+                Some(window) => window.block_mask(
+                    mask_memo,
+                    query_base,
+                    seq_len,
+                    self.config.sliding_window as i64,
+                )?,
+                None => None,
+            };
+            masks.push(mask);
+        }
+        let offsets = MxArray::from_int32(&query_bases, &[n as i64])?;
+        let mut pending: Option<DraftLayerOutput> = None;
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let mut layer_windows = contexts
+                .iter_mut()
+                .map(|ctx| &mut ctx.layers[layer_idx])
+                .collect::<Vec<_>>();
+            let input = match &pending {
+                Some(output) => output.as_input(),
+                None => DraftResidual::Hidden(embedded),
+            };
+            let next = layer.forward_batched(
+                input,
+                &mut layer_windows,
+                &offsets,
+                &masks,
+                self.merged_rows(),
+            )?;
             pending = Some(next);
         }
         match &pending {
@@ -1120,6 +1311,7 @@ impl DFlash2Model {
         // Observe the current anchor (prefill first token or previous boundary
         // token) before deciding narrow vs full draft head.
         context.observe_token(anchor);
+        context.clear_pre_propose_handles();
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
@@ -1282,5 +1474,957 @@ impl DFlash2Model {
             eprintln!("[dflash2-phase] draft+selector: {:?}", t.elapsed());
         }
         Ok(out)
+    }
+
+    /// Validate that `cache` can accept `keep` new context rows for this model
+    /// before entering a multi-lane batched append (so one malformed lane cannot
+    /// reject healthy peers during `DFlash2ContextCache::append_batched`'s pre-check).
+    pub(crate) fn validate_context_for_append(
+        &self,
+        cache: &DFlash2ContextCache,
+        keep: usize,
+    ) -> Result<()> {
+        if keep == 0 {
+            return Err(Error::from_reason(
+                "DFlash2ContextCache::append_batched requires non-empty token_ids per lane",
+            ));
+        }
+        if usize::try_from(cache.logical_len).ok() != Some(cache.token_history.len()) {
+            return Err(Error::from_reason(format!(
+                "DFlash2 context provenance length {} does not match logical length {}",
+                cache.token_history.len(),
+                cache.logical_len
+            )));
+        }
+        if cache.layers.len() != self.layers.len() {
+            return Err(Error::from_reason(format!(
+                "DFlash2 context layer count {} != model layers {}",
+                cache.layers.len(),
+                self.layers.len()
+            )));
+        }
+        let keep_i32 = i32::try_from(keep).map_err(|_| {
+            Error::from_reason(format!(
+                "DFlash2 context append row count {keep} exceeds i32"
+            ))
+        })?;
+        cache
+            .logical_len
+            .checked_add(keep_i32)
+            .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
+        Ok(())
+    }
+
+    /// Snapshot each layer's ring `end` cursor so a batched-append error handler
+    /// can distinguish untouched lanes from a partially mutated failing lane.
+    pub(crate) fn context_window_ends(cache: &DFlash2ContextCache) -> Vec<i64> {
+        cache.layers.iter().map(|window| window.end).collect()
+    }
+
+    /// Test-only fault injector: replaces `cache.layers[layer].keys` with a 1×1×1×1
+    /// buffer so the next `append` to that layer fails deterministically inside
+    /// `DraftKvWindow::store_rows` after earlier layers have already mutated.
+    #[cfg(test)]
+    pub(crate) fn corrupt_window_buffer_for_test(cache: &mut DFlash2ContextCache, layer: usize) {
+        let idx = layer.min(cache.layers.len().saturating_sub(1));
+        if let Some(window) = cache.layers.get_mut(idx) {
+            window.keys = Some(MxArray::zeros(&[1, 1, 1, 1], Some(DType::BFloat16)).unwrap());
+        }
+    }
+
+    /// Batched multi-lane proposal over a [`DFlash2TargetView`]: runs ONE
+    /// `[N, block_len + 1]` embed, ONE batched 5-layer draft pass (with exact
+    /// per-lane KV windows & RoPE offsets), ONE `[N, head_len, valid_vocab]`
+    /// `lm_head` matmul, and per-lane candidate selection returning one `Result`
+    /// per lane so a fault on one lane never aborts healthy peers.
+    ///
+    /// Keeps `N == 1` on [`Self::propose_with`] (preserving the compiled solo
+    /// graph) and falls back per-lane on CUDA `wide_vocab` mismatch or if the
+    /// shared batched forward stage errors.
+    pub(crate) fn propose_with_batched(
+        &self,
+        target: &mut dyn DFlash2TargetView,
+        lanes: &mut [DFlash2BatchProposalLane<'_>],
+        rngs: &mut [&mut dyn Rng],
+        block_len: usize,
+    ) -> Vec<Result<(SelectorPath, Vec<SparseDistribution>, Option<MxArray>)>> {
+        if lanes.len() != rngs.len() {
+            let reason = format!(
+                "DFlash2 propose_with_batched lanes ({}) != rngs ({})",
+                lanes.len(),
+                rngs.len()
+            );
+            return (0..lanes.len())
+                .map(|_| Err(Error::from_reason(reason.clone())))
+                .collect();
+        }
+        if block_len == 0 {
+            return (0..lanes.len())
+                .map(|_| {
+                    Err(Error::from_reason(
+                        "DFlash2 propose_with_batched requires block_len > 0",
+                    ))
+                })
+                .collect();
+        }
+        if lanes.is_empty() {
+            return Vec::new();
+        }
+        let run_per_lane = |target: &mut dyn DFlash2TargetView,
+                            lanes: &mut [DFlash2BatchProposalLane<'_>],
+                            rngs: &mut [&mut dyn Rng]| {
+            lanes
+                .iter_mut()
+                .zip(rngs.iter_mut())
+                .map(|(lane, rng)| {
+                    let mut conf = None;
+                    let (path, sparse) = self.propose_with(
+                        target,
+                        lane.context,
+                        lane.anchor,
+                        block_len,
+                        lane.temperature,
+                        lane.device_path,
+                        lane.want_confidence.then_some(&mut conf),
+                        *rng,
+                    )?;
+                    Ok((path, sparse, conf))
+                })
+                .collect::<Vec<_>>()
+        };
+        if lanes.len() == 1 {
+            return run_per_lane(target, lanes, rngs);
+        }
+
+        for lane in lanes.iter_mut() {
+            lane.context.observe_token(lane.anchor);
+        }
+
+        // On CUDA, lanes with mismatched `wide_vocab` select different spanned vs
+        // full draft heads, so run each lane independently through `propose_with`.
+        if crate::accelerator::cuda_ops_available()
+            && lanes
+                .windows(2)
+                .any(|w| w[0].context.wide_vocab() != w[1].context.wide_vocab())
+        {
+            return run_per_lane(target, lanes, rngs);
+        }
+
+        // Snapshot committed ring handles before `forward_embedded_batched` mutates
+        // `DraftKvWindow` via `with_block` so a failed build or deferred eval can
+        // restore clean committed buffers before retrying solo.
+        for lane in lanes.iter_mut() {
+            lane.context.save_pre_propose_handles();
+        }
+
+        let shared =
+            (|| -> Result<(MxArray, MxArray, Option<spanned_head::SpannedVocabLayout>)> {
+                let head_len = target
+                    .proposal_head_limit()
+                    .map_or(block_len, |limit| limit.clamp(1, block_len));
+                let draft_head_source = target
+                    .traced()
+                    .and_then(|(_, head)| head.map(EmbeddedLmHead::Proj))
+                    .or_else(|| EmbeddedLmHead::from_target(target));
+                let draft_head =
+                    self.resolve_draft_head(draft_head_source, lanes[0].context.wide_vocab())?;
+
+                let n = lanes.len();
+                let seq_len = block_len + 1;
+                let mut all_ids = Vec::with_capacity(n * seq_len);
+                for lane in lanes.iter() {
+                    all_ids.extend_from_slice(&parallel_query_ids(
+                        lane.anchor,
+                        self.config.mask_token_id,
+                        block_len,
+                    ));
+                }
+                let stacked_block = MxArray::from_int32(&all_ids, &[n as i64, seq_len as i64])?;
+                let embedded =
+                    self.apply_mask_embedding(target.embed(&stacked_block, &all_ids)?)?;
+
+                let mut contexts = lanes
+                    .iter_mut()
+                    .map(|lane| &mut *lane.context)
+                    .collect::<Vec<_>>();
+                let hidden = self.forward_embedded_batched(&embedded, &mut contexts)?;
+
+                let rows = head_len as i64 + 1;
+                let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+                let (draft_logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
+                    (head.forward_logits(&draft_hidden)?, head.spanned_layout())
+                } else if target.project_proposals_only()
+                    || crate::accelerator::cuda_ops_available()
+                {
+                    (target.logits(&draft_hidden)?, None)
+                } else {
+                    let logits = target.logits(&hidden)?;
+                    (logits.slice_axis(1, 1, rows)?, None)
+                };
+                Ok((draft_hidden, draft_logits, spanned_layout))
+            })();
+
+        let (draft_hidden, draft_logits, spanned_layout) = match shared {
+            Ok(tuple) => tuple,
+            Err(_) => {
+                for lane in lanes.iter_mut() {
+                    lane.context.restore_pre_propose_handles();
+                }
+                return run_per_lane(target, lanes, rngs);
+            }
+        };
+
+        let mut out = Vec::with_capacity(lanes.len());
+        for (i, (lane, rng)) in lanes.iter().zip(rngs.iter_mut()).enumerate() {
+            let bi = i as i64;
+            let lane_res = (|| {
+                let hidden_i = draft_hidden.slice_axis(0, bi, bi + 1)?;
+                let logits_i = draft_logits.slice_axis(0, bi, bi + 1)?;
+                let mut conf = None;
+                let (path, sparse) = self.selector.select_spanned(
+                    &hidden_i,
+                    &logits_i,
+                    lane.anchor,
+                    lane.temperature,
+                    lane.device_path,
+                    spanned_layout,
+                    lane.want_confidence.then_some(&mut conf),
+                    *rng,
+                )?;
+                Ok((path, sparse, conf))
+            })();
+            out.push(lane_res);
+        }
+        if lanes.len() > 1 && out.iter().all(Result::is_err) {
+            drop(out);
+            drop((draft_hidden, draft_logits));
+            for lane in lanes.iter_mut() {
+                lane.context.restore_pre_propose_handles();
+            }
+            return run_per_lane(target, lanes, rngs);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod batched_tests {
+    use super::*;
+    use crate::nn::Linear;
+
+    fn det_bf16(shape: &[i64], seed: u64, scale: f32) -> MxArray {
+        let len = shape.iter().product::<i64>() as usize;
+        let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut vals = Vec::with_capacity(len);
+        for _ in 0..len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((s >> 33) as f32) / ((1u64 << 31) as f32) - 1.0;
+            vals.push(u * scale);
+        }
+        MxArray::from_float32(&vals, shape)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn build_two_layer_dense_dflash2(with_mask_embedding: bool) -> (DFlash2Model, Embedding) {
+        let config = DFlash2Config {
+            block_size: 7,
+            mask_token_id: 0,
+            target_layers: vec![0, 1],
+            target_num_layers: 2,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 32,
+            vocab_size: 32,
+            rms_norm_eps: 1e-5,
+            max_position_embeddings: 128,
+            sliding_window: 12,
+            conv_group_size: 16,
+            conv_kernel_size: 2,
+            selector_rank: 8,
+            selector_top_k: 4,
+            rope_theta: 10_000.0,
+            final_logit_softcapping: None,
+            selector_softcap_mode: None,
+            valid_vocab_size: None,
+            capture_final_norm: None,
+            embedding_normalization: None,
+        };
+        let seed = std::cell::Cell::new(100u64);
+        let next_seed = || {
+            let next = seed.get() + 1;
+            seed.set(next);
+            next
+        };
+        let mk_linear = |in_f: usize, out_f: usize| -> LinearProj {
+            let w = det_bf16(&[out_f as i64, in_f as i64], next_seed(), 0.25);
+            LinearProj::Standard(Linear::from_weights(&w, None).unwrap())
+        };
+        let mk_norm = |size: usize| -> RMSNorm {
+            let w = MxArray::ones(&[size as i64], Some(DType::BFloat16)).unwrap();
+            RMSNorm::from_weight(&w, Some(config.rms_norm_eps)).unwrap()
+        };
+        let mk_embed = |rows: usize, width: usize| -> Embedding {
+            let w = det_bf16(&[rows as i64, width as i64], next_seed(), 0.4);
+            Embedding::from_weight(&w).unwrap()
+        };
+        let mk_conv = || -> GroupedDynamicCausalConv {
+            let groups = config.hidden_size / config.conv_group_size;
+            GroupedDynamicCausalConv {
+                base_kernel: det_bf16(
+                    &[2, config.conv_kernel_size as i64, config.hidden_size as i64],
+                    next_seed(),
+                    0.2,
+                ),
+                kernel_projection: mk_linear(
+                    config.hidden_size,
+                    2 * config.conv_kernel_size * groups,
+                ),
+                kernel_size: config.conv_kernel_size,
+                group_size: config.conv_group_size,
+            }
+        };
+
+        let mut layers = Vec::with_capacity(config.num_hidden_layers);
+        for _ in 0..config.num_hidden_layers {
+            let attention = DFlash2Attention {
+                tensor_attention_enabled: false,
+                q_proj: mk_linear(
+                    config.hidden_size,
+                    config.num_attention_heads * config.head_dim,
+                ),
+                k_proj: mk_linear(
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                ),
+                v_proj: mk_linear(
+                    config.hidden_size,
+                    config.num_key_value_heads * config.head_dim,
+                ),
+                o_proj: mk_linear(
+                    config.num_attention_heads * config.head_dim,
+                    config.hidden_size,
+                ),
+                qkv_proj: None,
+                q_norm: mk_norm(config.head_dim),
+                k_norm: mk_norm(config.head_dim),
+                rope: crate::nn::RoPE::new(
+                    config.head_dim as i32,
+                    Some(false),
+                    Some(config.rope_theta),
+                    None,
+                ),
+                num_heads: config.num_attention_heads as i64,
+                num_kv_heads: config.num_key_value_heads as i64,
+                head_dim: config.head_dim as i64,
+            };
+            layers.push(DFlash2Layer {
+                attention,
+                mlp: DFlash2Mlp {
+                    gate_proj: mk_linear(config.hidden_size, config.intermediate_size),
+                    up_proj: mk_linear(config.hidden_size, config.intermediate_size),
+                    down_proj: mk_linear(config.intermediate_size, config.hidden_size),
+                    gate_up: None,
+                },
+                input_norm: mk_norm(config.hidden_size),
+                post_attention_norm: mk_norm(config.hidden_size),
+                attention_conv: mk_conv(),
+                mlp_conv: mk_conv(),
+            });
+        }
+        let target_embed = mk_embed(config.vocab_size, config.hidden_size);
+        let mask_embedding =
+            with_mask_embedding.then(|| det_bf16(&[config.hidden_size as i64], next_seed(), 0.3));
+        let model = DFlash2Model {
+            execution_policy: DraftExecutionPolicy::capture(),
+            compiled: CompiledDraft::default(),
+            fc: mk_linear(
+                config.hidden_size * config.target_layers.len(),
+                config.hidden_size,
+            ),
+            hidden_norm: mk_norm(config.hidden_size),
+            layers,
+            norm: mk_norm(config.hidden_size),
+            selector: CandidateSelector {
+                predecessor_codebook: mk_embed(config.vocab_size, config.selector_rank),
+                successor_codebook: mk_embed(config.vocab_size, config.selector_rank),
+                hidden_projection: mk_linear(config.hidden_size, config.selector_rank),
+                top_k: config.selector_top_k,
+                rank: config.selector_rank,
+                vocab_size: config.vocab_size,
+                valid_vocab_size: None,
+                post_softcap: None,
+            },
+            mask_embedding,
+            context_kv: None,
+            config,
+            weight_bytes: 0,
+        };
+        (model, target_embed)
+    }
+
+    fn path_to_ids(path: SelectorPath) -> Vec<i32> {
+        match path {
+            SelectorPath::Host(ids) => ids,
+            SelectorPath::Device(arr) => arr.to_int32().unwrap().to_vec(),
+            SelectorPath::Sampled { ids, .. } => ids.to_int32().unwrap().to_vec(),
+        }
+    }
+
+    fn assert_close_f32(a: &MxArray, b: &MxArray, tol: f32, label: &str) {
+        assert_eq!(
+            a.shape().unwrap().as_ref(),
+            b.shape().unwrap().as_ref(),
+            "{label}: shape"
+        );
+        let av = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bv = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let mut max_diff = 0.0f32;
+        for (&x, &y) in av.iter().zip(bv.iter()) {
+            max_diff = max_diff.max((x - y).abs());
+        }
+        assert!(
+            max_diff <= tol,
+            "{label}: max_diff={max_diff} exceeds tol={tol}"
+        );
+    }
+
+    #[test]
+    fn batched_dflash2_propose_and_tap_append_match_sequential_n2_and_n3() {
+        let (model, target_embed) = build_two_layer_dense_dflash2(true);
+        let h = model.config.hidden_size as i64;
+        let block_len = model.config.block_size;
+
+        for (n_lanes, init_lens, keeps, anchors1, anchors2) in [
+            (
+                2usize,
+                vec![3usize, 9],
+                vec![4usize, 5],
+                vec![5u32, 11],
+                vec![7u32, 19],
+            ),
+            (
+                3usize,
+                vec![0usize, 5, 13],
+                vec![2usize, 8, 4],
+                vec![2u32, 14, 27],
+                vec![9u32, 3, 21],
+            ),
+        ] {
+            let mut seq_caches = Vec::with_capacity(n_lanes);
+            let mut bat_caches = Vec::with_capacity(n_lanes);
+
+            // Seed each lane with its own distinct initial context length (covering empty,
+            // linear, and wrapped sliding windows simultaneously!).
+            for (lane_idx, &init_len) in init_lens.iter().enumerate() {
+                let mut sc = DFlash2ContextCache::new(&model.config);
+                let mut bc = DFlash2ContextCache::new(&model.config);
+                if init_len > 0 {
+                    let tokens: Vec<u32> = (0..init_len)
+                        .map(|t| ((lane_idx * 7 + t + 1) % model.config.vocab_size) as u32)
+                        .collect();
+                    let t0 = det_bf16(&[1, init_len as i64, h], 1000 + lane_idx as u64 * 10, 0.3);
+                    let t1 = det_bf16(&[1, init_len as i64, h], 1001 + lane_idx as u64 * 10, 0.3);
+                    let fused = model.fuse_context(&[t0, t1]).unwrap();
+                    sc.append(&model, &fused, 0, &tokens).unwrap();
+                    bc.append(&model, &fused, 0, &tokens).unwrap();
+                }
+                seq_caches.push(sc);
+                bat_caches.push(bc);
+            }
+
+            let mut view = DenseTargetView {
+                embedding: &target_embed,
+                lm_head: None,
+            };
+
+            // Cycle 1: compare batched propose vs sequential propose (both device_path=true + confidence
+            // and device_path=false!).
+            for device_path in [true, false] {
+                let mut seq_ids = Vec::with_capacity(n_lanes);
+                let mut seq_confs = Vec::with_capacity(n_lanes);
+                for (i, sc) in seq_caches.iter_mut().enumerate() {
+                    let mut rng = rand::rng();
+                    let mut conf = None;
+                    let (path, _) = model
+                        .propose_with(
+                            &mut view,
+                            sc,
+                            anchors1[i],
+                            block_len,
+                            0.0,
+                            device_path,
+                            device_path.then_some(&mut conf),
+                            &mut rng,
+                        )
+                        .unwrap();
+                    seq_ids.push(path_to_ids(path));
+                    seq_confs.push(conf);
+                }
+
+                let mut rngs_owned: Vec<_> = (0..n_lanes).map(|_| rand::rng()).collect();
+                let mut rng_refs: Vec<&mut dyn Rng> =
+                    rngs_owned.iter_mut().map(|r| r as &mut dyn Rng).collect();
+                let mut batch_lanes: Vec<DFlash2BatchProposalLane<'_>> = bat_caches
+                    .iter_mut()
+                    .enumerate()
+                    .map(|(i, ctx)| DFlash2BatchProposalLane {
+                        context: ctx,
+                        anchor: anchors1[i],
+                        temperature: 0.0,
+                        device_path,
+                        want_confidence: device_path,
+                    })
+                    .collect();
+                let bat_out = model.propose_with_batched(
+                    &mut view,
+                    &mut batch_lanes,
+                    &mut rng_refs,
+                    block_len,
+                );
+
+                for (i, res) in bat_out.into_iter().enumerate() {
+                    let (path, _, conf) = res.unwrap();
+                    assert_eq!(
+                        path_to_ids(path),
+                        seq_ids[i],
+                        "cycle 1 N={n_lanes} lane={i} device_path={device_path} draft ids mismatch"
+                    );
+                    if let (Some(sc), Some(bc)) = (&seq_confs[i], &conf) {
+                        assert_close_f32(
+                            sc,
+                            bc,
+                            2e-2,
+                            &format!("cycle 1 N={n_lanes} lane={i} confidence"),
+                        );
+                    }
+                }
+            }
+
+            // Batched tap append with DIFFERENT keep lengths per lane!
+            let mut per_lane_taps: Vec<[MxArray; 2]> = Vec::with_capacity(n_lanes);
+            let mut per_lane_tokens: Vec<Vec<u32>> = Vec::with_capacity(n_lanes);
+            for (i, &keep) in keeps.iter().enumerate() {
+                let t0 = det_bf16(&[1, keep as i64, h], 2000 + i as u64 * 10, 0.35);
+                let t1 = det_bf16(&[1, keep as i64, h], 2001 + i as u64 * 10, 0.35);
+                let tokens: Vec<u32> = (0..keep)
+                    .map(|t| ((i * 11 + t + 3) % model.config.vocab_size) as u32)
+                    .collect();
+                let fused = model.fuse_context(&[t0.clone(), t1.clone()]).unwrap();
+                let base = seq_caches[i].logical_len();
+                seq_caches[i].append(&model, &fused, base, &tokens).unwrap();
+                per_lane_taps.push([t0, t1]);
+                per_lane_tokens.push(tokens);
+            }
+
+            let t0_refs: Vec<&MxArray> = per_lane_taps.iter().map(|t| &t[0]).collect();
+            let t1_refs: Vec<&MxArray> = per_lane_taps.iter().map(|t| &t[1]).collect();
+            let stacked_t0 = MxArray::concatenate_many(t0_refs, Some(1)).unwrap();
+            let stacked_t1 = MxArray::concatenate_many(t1_refs, Some(1)).unwrap();
+            let fused_all = model.fuse_context(&[stacked_t0, stacked_t1]).unwrap();
+            {
+                let mut append_lanes: Vec<(&mut DFlash2ContextCache, &[u32])> = bat_caches
+                    .iter_mut()
+                    .zip(per_lane_tokens.iter())
+                    .map(|(c, toks)| (c, toks.as_slice()))
+                    .collect();
+                DFlash2ContextCache::append_batched(&model, &fused_all, &mut append_lanes).unwrap();
+            }
+
+            // Verify every lane's logical_len, provenance, wide_vocab, and KV window contents!
+            for i in 0..n_lanes {
+                assert_eq!(bat_caches[i].logical_len(), seq_caches[i].logical_len());
+                assert_eq!(bat_caches[i].token_history(), seq_caches[i].token_history());
+                assert_eq!(bat_caches[i].wide_vocab(), seq_caches[i].wide_vocab());
+                let seq_views = seq_caches[i].window_views();
+                let bat_views = bat_caches[i].window_views();
+                assert_eq!(seq_views.len(), bat_views.len());
+                for (l, (sv, bv)) in seq_views.into_iter().zip(bat_views).enumerate() {
+                    let (sk, sv_arr) = sv.unwrap();
+                    let (bk, bv_arr) = bv.unwrap();
+                    assert_close_f32(
+                        &sk,
+                        &bk,
+                        2e-2,
+                        &format!("N={n_lanes} lane={i} layer={l} K window"),
+                    );
+                    assert_close_f32(
+                        &sv_arr,
+                        &bv_arr,
+                        2e-2,
+                        &format!("N={n_lanes} lane={i} layer={l} V window"),
+                    );
+                }
+            }
+
+            // Cycle 2: second batched propose AFTER batched tap append (with wrapped rings)!
+            let mut seq_ids2 = Vec::with_capacity(n_lanes);
+            for (i, sc) in seq_caches.iter_mut().enumerate() {
+                let mut rng = rand::rng();
+                let (path, _) = model
+                    .propose_with(
+                        &mut view,
+                        sc,
+                        anchors2[i],
+                        block_len,
+                        0.0,
+                        true,
+                        None,
+                        &mut rng,
+                    )
+                    .unwrap();
+                seq_ids2.push(path_to_ids(path));
+            }
+            let mut rngs_owned: Vec<_> = (0..n_lanes).map(|_| rand::rng()).collect();
+            let mut rng_refs: Vec<&mut dyn Rng> =
+                rngs_owned.iter_mut().map(|r| r as &mut dyn Rng).collect();
+            let mut batch_lanes: Vec<DFlash2BatchProposalLane<'_>> = bat_caches
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ctx)| DFlash2BatchProposalLane {
+                    context: ctx,
+                    anchor: anchors2[i],
+                    temperature: 0.0,
+                    device_path: true,
+                    want_confidence: false,
+                })
+                .collect();
+            let bat_out2 =
+                model.propose_with_batched(&mut view, &mut batch_lanes, &mut rng_refs, block_len);
+            for (i, res) in bat_out2.into_iter().enumerate() {
+                let (path, _, _) = res.unwrap();
+                assert_eq!(
+                    path_to_ids(path),
+                    seq_ids2[i],
+                    "cycle 2 N={n_lanes} lane={i} draft ids mismatch after batched tap append"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batched_dflash2_quantized_merged_projections_n2_and_n3() {
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-dflash2-batched-quant-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let cfg = serde_json::json!({
+            "architectures": ["DFlash2DraftModel"],
+            "hidden_size": 256,
+            "intermediate_size": 256,
+            "num_hidden_layers": 2,
+            "num_target_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 1,
+            "head_dim": 64,
+            "vocab_size": 32,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 128,
+            "sliding_window": 12,
+            "layer_types": ["sliding_attention", "sliding_attention"],
+            "rope_theta": 10_000.0,
+            "dflash_config": {
+                "block_size": 8,
+                "conv_group_size": 16,
+                "conv_kernel_size": 2,
+                "mask_token_id": 0,
+                "selector_rank": 8,
+                "selector_top_k": 4,
+                "target_layer_ids": [0, 1],
+            },
+        });
+        write_test_checkpoint(&dir, &cfg).unwrap();
+        let loaded = load_dflash2(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        let (model, _) = loaded.unwrap();
+
+        let h = model.config.hidden_size as i64;
+        let target_embed = Embedding::from_weight(&det_bf16(&[32, h], 777, 0.3)).unwrap();
+        let mut view = DenseTargetView {
+            embedding: &target_embed,
+            lm_head: None,
+        };
+
+        for (n_lanes, keeps, anchors) in [
+            (2usize, vec![3usize, 5], vec![4u32, 12]),
+            (3usize, vec![2usize, 6, 4], vec![1u32, 15, 29]),
+        ] {
+            let mut seq_caches: Vec<_> = (0..n_lanes)
+                .map(|_| DFlash2ContextCache::new(&model.config))
+                .collect();
+            let mut bat_caches: Vec<_> = (0..n_lanes)
+                .map(|_| DFlash2ContextCache::new(&model.config))
+                .collect();
+
+            // Different initial bases via sequential prefill on lane 1..N so every lane has a
+            // distinct query_base when entering batched append & batched propose.
+            for i in 0..n_lanes {
+                let init_len = (i + 1) * 3;
+                let t0 = det_bf16(&[1, init_len as i64, h], 3000 + i as u64 * 10, 0.25);
+                let t1 = det_bf16(&[1, init_len as i64, h], 3001 + i as u64 * 10, 0.25);
+                let fused = model.fuse_context(&[t0, t1]).unwrap();
+                let toks: Vec<u32> = (0..init_len).map(|k| ((i + k) % 32) as u32).collect();
+                seq_caches[i].append(&model, &fused, 0, &toks).unwrap();
+                bat_caches[i].append(&model, &fused, 0, &toks).unwrap();
+            }
+
+            // Batched append through merged `context_kv` (when tiled/CUDA) vs sequential append.
+            let mut per_lane_taps = Vec::with_capacity(n_lanes);
+            let mut per_lane_toks = Vec::with_capacity(n_lanes);
+            for (i, &keep) in keeps.iter().enumerate() {
+                let t0 = det_bf16(&[1, keep as i64, h], 4000 + i as u64 * 10, 0.25);
+                let t1 = det_bf16(&[1, keep as i64, h], 4001 + i as u64 * 10, 0.25);
+                let toks: Vec<u32> = (0..keep).map(|k| ((i * 5 + k + 1) % 32) as u32).collect();
+                let fused = model.fuse_context(&[t0.clone(), t1.clone()]).unwrap();
+                let base = seq_caches[i].logical_len();
+                seq_caches[i].append(&model, &fused, base, &toks).unwrap();
+                per_lane_taps.push([t0, t1]);
+                per_lane_toks.push(toks);
+            }
+            let t0_refs: Vec<&MxArray> = per_lane_taps.iter().map(|t| &t[0]).collect();
+            let t1_refs: Vec<&MxArray> = per_lane_taps.iter().map(|t| &t[1]).collect();
+            let fused_all = model
+                .fuse_context(&[
+                    MxArray::concatenate_many(t0_refs, Some(1)).unwrap(),
+                    MxArray::concatenate_many(t1_refs, Some(1)).unwrap(),
+                ])
+                .unwrap();
+            {
+                let mut lanes: Vec<(&mut DFlash2ContextCache, &[u32])> = bat_caches
+                    .iter_mut()
+                    .zip(per_lane_toks.iter())
+                    .map(|(c, t)| (c, t.as_slice()))
+                    .collect();
+                DFlash2ContextCache::append_batched(&model, &fused_all, &mut lanes).unwrap();
+            }
+
+            for i in 0..n_lanes {
+                assert_eq!(bat_caches[i].logical_len(), seq_caches[i].logical_len());
+                assert_eq!(bat_caches[i].token_history(), seq_caches[i].token_history());
+                for (l, (sv, bv)) in seq_caches[i]
+                    .window_views()
+                    .into_iter()
+                    .zip(bat_caches[i].window_views())
+                    .enumerate()
+                {
+                    let (sk, sv_arr) = sv.unwrap();
+                    let (bk, bv_arr) = bv.unwrap();
+                    assert_close_f32(
+                        &sk,
+                        &bk,
+                        5e-2,
+                        &format!("quant N={n_lanes} lane={i} layer={l} K window"),
+                    );
+                    assert_close_f32(
+                        &sv_arr,
+                        &bv_arr,
+                        5e-2,
+                        &format!("quant N={n_lanes} lane={i} layer={l} V window"),
+                    );
+                }
+            }
+
+            // Batched propose through merged `qkv_proj` + `gate_up` across N lanes.
+            let mut rngs_owned: Vec<_> = (0..n_lanes).map(|_| rand::rng()).collect();
+            let mut rng_refs: Vec<&mut dyn Rng> =
+                rngs_owned.iter_mut().map(|r| r as &mut dyn Rng).collect();
+            let mut batch_lanes: Vec<DFlash2BatchProposalLane<'_>> = bat_caches
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ctx)| DFlash2BatchProposalLane {
+                    context: ctx,
+                    anchor: anchors[i],
+                    temperature: 0.0,
+                    device_path: true,
+                    want_confidence: false,
+                })
+                .collect();
+            let bat_out = model.propose_with_batched(
+                &mut view,
+                &mut batch_lanes,
+                &mut rng_refs,
+                model.config.block_size,
+            );
+            assert_eq!(bat_out.len(), n_lanes);
+            for res in bat_out {
+                let (path, _, _) = res.unwrap();
+                assert_eq!(path_to_ids(path).len(), model.config.block_size);
+            }
+        }
+    }
+
+    #[test]
+    fn batched_dflash2_restore_pre_propose_handles_recovers_committed_ring_for_solo_retry() {
+        let (model, target_embed) = build_two_layer_dense_dflash2(true);
+        let h = model.config.hidden_size as i64;
+        let block_len = model.config.block_size;
+        let init_lens = [4usize, 13usize];
+        let anchors = [6u32, 17u32];
+
+        let mut seq_caches = Vec::with_capacity(init_lens.len());
+        let mut bat_caches = Vec::with_capacity(init_lens.len());
+        for (lane_idx, &init_len) in init_lens.iter().enumerate() {
+            let mut sc = DFlash2ContextCache::new(&model.config);
+            let mut bc = DFlash2ContextCache::new(&model.config);
+            let tokens: Vec<u32> = (0..init_len)
+                .map(|t| ((lane_idx * 9 + t + 2) % model.config.vocab_size) as u32)
+                .collect();
+            let t0 = det_bf16(&[1, init_len as i64, h], 6100 + lane_idx as u64 * 10, 0.3);
+            let t1 = det_bf16(&[1, init_len as i64, h], 6101 + lane_idx as u64 * 10, 0.3);
+            let fused = model.fuse_context(&[t0, t1]).unwrap();
+            sc.append(&model, &fused, 0, &tokens).unwrap();
+            bc.append(&model, &fused, 0, &tokens).unwrap();
+            sc.eval().unwrap();
+            bc.eval().unwrap();
+            seq_caches.push(sc);
+            bat_caches.push(bc);
+        }
+
+        let pre_ptrs: Vec<Vec<(usize, usize)>> = bat_caches
+            .iter()
+            .map(|cache| {
+                cache
+                    .layers
+                    .iter()
+                    .map(|window| {
+                        (
+                            window.keys.as_ref().expect("committed keys").as_raw_ptr() as usize,
+                            window
+                                .values
+                                .as_ref()
+                                .expect("committed values")
+                                .as_raw_ptr() as usize,
+                        )
+                    })
+                    .collect()
+            })
+            .collect();
+
+        let mut view = DenseTargetView {
+            embedding: &target_embed,
+            lm_head: None,
+        };
+
+        // Compute bit-exact solo references before batched mutation.
+        let mut seq_ids = Vec::with_capacity(init_lens.len());
+        for (i, sc) in seq_caches.iter_mut().enumerate() {
+            let mut rng = rand::rng();
+            let (path, _) = model
+                .propose_with(
+                    &mut view, sc, anchors[i], block_len, 0.0, true, None, &mut rng,
+                )
+                .unwrap();
+            seq_ids.push(path_to_ids(path));
+        }
+
+        // Run batched proposal (device_path=true leaves lazy graph attached to ring handles),
+        // then drop the lazy batch outputs as if deferred GPU evaluation failed.
+        {
+            let mut rngs_owned: Vec<_> = (0..init_lens.len()).map(|_| rand::rng()).collect();
+            let mut rng_refs: Vec<&mut dyn Rng> =
+                rngs_owned.iter_mut().map(|r| r as &mut dyn Rng).collect();
+            let mut batch_lanes: Vec<DFlash2BatchProposalLane<'_>> = bat_caches
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ctx)| DFlash2BatchProposalLane {
+                    context: ctx,
+                    anchor: anchors[i],
+                    temperature: 0.0,
+                    device_path: true,
+                    want_confidence: false,
+                })
+                .collect();
+            let bat_out =
+                model.propose_with_batched(&mut view, &mut batch_lanes, &mut rng_refs, block_len);
+            assert_eq!(bat_out.len(), init_lens.len());
+            for res in bat_out {
+                assert!(res.is_ok(), "lazy batched proposal build should succeed");
+            }
+        }
+
+        // `with_block` must have replaced every layer's committed ring handle while keeping
+        // the pre-proposal snapshot available for restoration.
+        for (i, cache) in bat_caches.iter().enumerate() {
+            assert!(
+                cache.pre_propose_handles.is_some(),
+                "lane {i} must retain pre_propose_handles after propose_with_batched"
+            );
+            for (l, window) in cache.layers.iter().enumerate() {
+                let mutated = (
+                    window.keys.as_ref().expect("mutated keys").as_raw_ptr() as usize,
+                    window.values.as_ref().expect("mutated values").as_raw_ptr() as usize,
+                );
+                assert_ne!(
+                    mutated, pre_ptrs[i][l],
+                    "lane {i} layer {l} ring handles must mutate during with_block"
+                );
+            }
+        }
+
+        // Restoring pre-proposal handles recovers exact committed ring handle identity,
+        // and solo retry matches solo reference output bit-for-bit.
+        for (i, cache) in bat_caches.iter_mut().enumerate() {
+            cache.restore_pre_propose_handles();
+            assert!(
+                cache.pre_propose_handles.is_none(),
+                "restore_pre_propose_handles must consume the snapshot"
+            );
+            for (l, window) in cache.layers.iter().enumerate() {
+                let restored = (
+                    window.keys.as_ref().expect("restored keys").as_raw_ptr() as usize,
+                    window
+                        .values
+                        .as_ref()
+                        .expect("restored values")
+                        .as_raw_ptr() as usize,
+                );
+                assert_eq!(
+                    restored, pre_ptrs[i][l],
+                    "lane {i} layer {l} must restore exact pre-proposal raw handles"
+                );
+            }
+            let mut rng = rand::rng();
+            let (path, _) = model
+                .propose_with(
+                    &mut view, cache, anchors[i], block_len, 0.0, true, None, &mut rng,
+                )
+                .unwrap();
+            assert_eq!(
+                path_to_ids(path),
+                seq_ids[i],
+                "solo retry after restore must match solo reference bit-for-bit on lane {i}"
+            );
+        }
+
+        // Mutating lifecycle methods must clear any saved snapshot so stale handles cannot linger.
+        let cache = &mut bat_caches[0];
+        cache.save_pre_propose_handles();
+        assert!(cache.pre_propose_handles.is_some());
+        let t0 = det_bf16(&[1, 1, h], 6900, 0.3);
+        let t1 = det_bf16(&[1, 1, h], 6901, 0.3);
+        let fused = model.fuse_context(&[t0, t1]).unwrap();
+        let base = cache.logical_len();
+        cache.append(&model, &fused, base, &[3]).unwrap();
+        assert!(cache.pre_propose_handles.is_none());
+
+        cache.save_pre_propose_handles();
+        assert!(cache.pre_propose_handles.is_some());
+        cache.record_only(&[4]).unwrap();
+        assert!(cache.pre_propose_handles.is_none());
+
+        cache.save_pre_propose_handles();
+        assert!(cache.pre_propose_handles.is_some());
+        cache.reset();
+        assert!(cache.pre_propose_handles.is_none());
     }
 }

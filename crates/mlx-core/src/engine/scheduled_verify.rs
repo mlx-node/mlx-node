@@ -96,6 +96,25 @@ pub(crate) trait ScheduledDraftVerify: Sized {
         failure.map_or(Ok(()), Err)
     }
 
+    fn validate_scheduled_verify_row(&mut self, row: &ScheduledVerifyRow) -> Result<()> {
+        if row.tokens.is_empty() {
+            return Err(Error::from_reason("empty scheduled verifier row"));
+        }
+        let frontier = self
+            .verify_cache()
+            .frontier(row.seq_id)
+            .ok_or_else(|| Error::from_reason("scheduled verifier has no target frontier"))?;
+        if frontier.attn_tokens != u64::from(row.first_position) {
+            return Err(Error::from_reason(
+                "scheduled verifier target frontier mismatch",
+            ));
+        }
+        self.validate_draft_owner(row)?;
+        let _ = u32::try_from(row.tokens.len())
+            .map_err(|_| Error::from_reason("verifier width overflow"))?;
+        Ok(())
+    }
+
     fn verify_scheduled_rows(&mut self, rows: &[ScheduledVerifyRow]) -> Result<MxArray> {
         if let Some(abandoned) = self.take_verify_batch() {
             self.retract_verify_batch(abandoned)?;
@@ -114,16 +133,7 @@ pub(crate) trait ScheduledDraftVerify: Sized {
                     "duplicate or empty scheduled verifier row",
                 ));
             }
-            let frontier = self
-                .verify_cache()
-                .frontier(row.seq_id)
-                .ok_or_else(|| Error::from_reason("scheduled verifier has no target frontier"))?;
-            if frontier.attn_tokens != u64::from(row.first_position) {
-                return Err(Error::from_reason(
-                    "scheduled verifier target frontier mismatch",
-                ));
-            }
-            self.validate_draft_owner(row)?;
+            self.validate_scheduled_verify_row(row)?;
             packed.push((
                 PagedRaggedRow {
                     seq_id: row.seq_id,
@@ -596,5 +606,54 @@ mod tests {
             partition_verify_wave_groups(&rows, 2, |&ok| ok),
             vec![vec![0, 2], vec![3, 5], vec![6, 7]]
         );
+    }
+
+    #[test]
+    fn validate_scheduled_verify_row_isolates_mismatched_lane_while_healthy_peer_commits() {
+        let (mut model, mut rows) = fixture("");
+        // Desync lane 1's target frontier (`first_position` 7 vs actual cursor 5).
+        model.cursors.insert(1, 5);
+
+        let err = model
+            .validate_scheduled_verify_row(&rows[0])
+            .expect_err("mismatched frontier must fail pre-validation");
+        assert!(
+            err.reason
+                .contains("scheduled verifier target frontier mismatch"),
+            "{}",
+            err.reason
+        );
+        assert!(
+            model.validate_scheduled_verify_row(&rows[1]).is_ok(),
+            "healthy peer row must pass pre-validation"
+        );
+
+        // Also check empty tokens and missing frontier.
+        let mut empty_row = ScheduledVerifyRow {
+            seq_id: 2,
+            first_position: 9,
+            tokens: Vec::new(),
+            speculative: true,
+        };
+        assert!(model.validate_scheduled_verify_row(&empty_row).is_err());
+        empty_row.seq_id = 999;
+        empty_row.tokens = vec![1];
+        assert!(model.validate_scheduled_verify_row(&empty_row).is_err());
+
+        // Filter out the bad lane and verify + commit only the healthy peer.
+        rows.retain(|row| model.validate_scheduled_verify_row(row).is_ok());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].seq_id, 2);
+
+        model.verify_scheduled_rows(&rows).unwrap().eval();
+        let results = model
+            .commit_scheduled_rows(&[ScheduledVerifyCommit { seq_id: 2, keep: 1 }])
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].is_ok());
+        assert_eq!(model.cursors[&2], 10);
+        assert_eq!(model.cursors[&1], 5, "bad lane was never touched");
+        assert!(model.events.contains(&"settle:2".into()));
+        assert!(!model.events.contains(&"record:1".into()));
     }
 }

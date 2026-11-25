@@ -191,6 +191,15 @@ pub(crate) struct ReasoningTracker {
     /// blocks per turn but the model may close with a different member
     /// of the family.
     extra_think_end_ids: Vec<u32>,
+    /// Optional dynamic thinking-open token id (e.g. Inkling2 `<|content_thought|>`).
+    /// When `Some`, the tracker starts outside thinking and enters thinking upon
+    /// observing this token instead of assuming the prompt opened `<think>`.
+    open_id: Option<u32>,
+    /// Whether observing `open_id` transitions into thinking (`setup.enabled && open_id.is_some()`).
+    allow_dynamic_open: bool,
+    /// Preserved from `ThinkingSetup::cycle_guard` so dynamic open-token blocks can
+    /// arm a fresh [`CycleDetector`] when thinking opens.
+    cycle_guard_enabled: bool,
     /// The budget ran out and thinking has not closed yet.
     cut: bool,
     /// End tokens handed out, and end tokens observed, since the cut.
@@ -205,13 +214,25 @@ pub(crate) struct ReasoningTracker {
 }
 
 impl ReasoningTracker {
+    #[cfg(test)]
     fn with_end(
         setup: &crate::engine::backend::ThinkingSetup,
         end: Arc<[u32]>,
         extra_think_end_ids: Vec<u32>,
     ) -> Self {
-        let starts_in_thinking = setup.enabled;
-        // Budget 0 ends thinking before any thinking token.
+        Self::with_end_and_open(setup, end, extra_think_end_ids, None)
+    }
+
+    fn with_end_and_open(
+        setup: &crate::engine::backend::ThinkingSetup,
+        end: Arc<[u32]>,
+        extra_think_end_ids: Vec<u32>,
+        open_id: Option<u32>,
+    ) -> Self {
+        let allow_dynamic_open = setup.enabled && open_id.is_some();
+        let starts_in_thinking = setup.enabled && open_id.is_none();
+        // Budget 0 ends thinking before any thinking token (static prompt-opened thinking only;
+        // dynamic open-token models cut immediately once `open_id` is observed).
         let cut = starts_in_thinking && setup.budget == Some(0) && !end.is_empty();
         let cycles = (setup.cycle_guard && starts_in_thinking && !end.is_empty() && !cut)
             .then(|| Box::new(CycleDetector::new()));
@@ -222,6 +243,9 @@ impl ReasoningTracker {
             budget: setup.budget,
             end,
             extra_think_end_ids,
+            open_id,
+            allow_dynamic_open,
+            cycle_guard_enabled: setup.cycle_guard,
             cut,
             taken: 0,
             observed: 0,
@@ -266,10 +290,11 @@ impl ReasoningTracker {
         setup: &crate::engine::backend::ThinkingSetup,
         close: &crate::engine::backend::ThinkEndResolution,
     ) -> Self {
-        Self::with_end(
+        Self::with_end_and_open(
             setup,
             close.thinking_end.clone(),
             close.think_end_extra_ids.clone(),
+            close.think_open_id,
         )
     }
 
@@ -282,7 +307,30 @@ impl ReasoningTracker {
     /// Call AFTER extracting the token ID from the GPU each decode step.
     pub fn observe_token(&mut self, token_id: u32) -> bool {
         if !self.in_thinking {
-            if self.started_in_thinking && !self.end.is_empty() && self.is_close(token_id) {
+            if self.allow_dynamic_open && self.open_id == Some(token_id) {
+                self.in_thinking = true;
+                self.started_in_thinking = true;
+                self.close = None;
+                self.taken = 0;
+                self.observed = 0;
+                if self
+                    .budget
+                    .is_some_and(|budget| self.thinking_token_count >= budget)
+                    && !self.end.is_empty()
+                {
+                    self.cut = true;
+                    self.cut_at.get_or_insert(self.thinking_token_count as u32);
+                    self.cycles = None;
+                } else if self.cycle_guard_enabled && !self.end.is_empty() {
+                    self.cycles = Some(Box::new(CycleDetector::new()));
+                }
+                return true;
+            }
+            if self.open_id.is_none()
+                && self.started_in_thinking
+                && !self.end.is_empty()
+                && self.is_close(token_id)
+            {
                 self.stray_closes += 1;
             }
             return false;
@@ -307,6 +355,10 @@ impl ReasoningTracker {
             if self.end.get(self.observed) == Some(&token_id) {
                 self.observed += 1;
                 self.taken = self.taken.max(self.observed);
+            } else if self.open_id.is_some() && self.taken == 0 && self.observed == 0 {
+                // Dynamic open-token speculative waves can open thinking and cross a small
+                // budget within one already-verified wave before the next wave reads
+                // `thinking_cut()`. Stay armed at `observed == 0` so the next step forces `end`.
             } else {
                 debug_assert!(false, "thinking went past its budget");
             }
@@ -326,7 +378,7 @@ impl ReasoningTracker {
                 && self.thinking_token_count >= budget
             {
                 self.cut = true;
-                self.cut_at = Some(self.thinking_token_count as u32);
+                self.cut_at.get_or_insert(self.thinking_token_count as u32);
                 self.cycles = None;
             }
         }
@@ -393,6 +445,67 @@ impl ReasoningTracker {
             from,
             extra: self.extra_think_end_ids.clone(),
         })
+    }
+
+    /// Provisional thinking-budget cap for one already-accepted speculative wave.
+    ///
+    /// [`Self::thinking_cut`] is computed before proposal/verify and only covers
+    /// turns that already entered thinking before the wave began. For dynamic
+    /// open-token families (`self.allow_dynamic_open`), a wave that starts
+    /// outside thinking (or closes and re-opens thinking mid-wave) can accept
+    /// the open marker AND thought tokens past `self.budget` (including any
+    /// budget lowered by the cycle guard) in a single wave.
+    ///
+    /// Simulates [`Self::observe_token`] across `tokens` without mutating
+    /// `self` or allocating, returning the prefix length
+    /// `1 <= len <= tokens.len()` before the first token that would violate the
+    /// live budget or skip remaining forced `self.end` tokens.
+    pub(crate) fn speculative_wave_limit(&self, tokens: &[u32]) -> usize {
+        if !self.allow_dynamic_open || self.end.is_empty() {
+            return tokens.len();
+        }
+        let mut in_thinking = self.in_thinking;
+        let mut thinking_token_count = self.thinking_token_count;
+        let mut cut = self.cut;
+        let mut observed = self.observed;
+        let budget = self.budget;
+
+        for (idx, &token_id) in tokens.iter().enumerate() {
+            if in_thinking && cut {
+                if let Some(&forced) = self.end.get(observed)
+                    && token_id != forced
+                {
+                    return idx.max(1);
+                }
+            }
+            if !in_thinking {
+                if self.open_id == Some(token_id) {
+                    in_thinking = true;
+                    observed = 0;
+                    if budget == Some(0) || budget.is_some_and(|b| thinking_token_count >= b) {
+                        cut = true;
+                    }
+                }
+                continue;
+            }
+            if self.is_close(token_id) {
+                in_thinking = false;
+                cut = false;
+                observed = 0;
+                continue;
+            }
+            thinking_token_count += 1;
+            if cut {
+                if self.end.get(observed) == Some(&token_id) {
+                    observed += 1;
+                } else {
+                    return idx.max(1);
+                }
+            } else if budget.is_some_and(|b| thinking_token_count >= b) {
+                cut = true;
+            }
+        }
+        tokens.len()
     }
 
     /// The turn's thinking as it stands.
@@ -1077,5 +1190,308 @@ mod tests {
             let close = (!end.is_empty()).then_some(ReasoningClose::Open);
             assert_eq!(outcome.close, close);
         }
+    }
+
+    const OPEN_THOUGHT_ID: u32 = 200_050;
+    const END_MESSAGE_ID: u32 = 200_051;
+    const CONTENT_TEXT_ID: u32 = 200_052;
+
+    fn open_token_tracker(
+        enabled: bool,
+        budget: Option<i32>,
+        end: &[u32],
+        cycle_guard: bool,
+    ) -> ReasoningTracker {
+        let setup = crate::engine::backend::ThinkingSetup {
+            enabled,
+            budget,
+            cycle_guard,
+        };
+        let close = crate::engine::backend::ThinkEndResolution::with_open_token(
+            OPEN_THOUGHT_ID,
+            Arc::from(end),
+        );
+        ReasoningTracker::from_setup(&setup, &close)
+    }
+
+    #[test]
+    fn dynamic_open_token_without_thought_block_has_no_close_and_zero_strays() {
+        let mut tracker = open_token_tracker(true, Some(10), &[END_MESSAGE_ID], true);
+        assert!(!tracker.ending());
+        assert_eq!(tracker.peek_forced_token(), None);
+        assert_eq!(tracker.take_forced_token(), None);
+        assert_eq!(tracker.unforced_token_budget(), None);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        for token in [CONTENT_TEXT_ID, 10, 11, END_MESSAGE_ID] {
+            assert!(!tracker.observe_token(token));
+            assert_eq!(tracker.take_forced_token(), None);
+            assert_eq!(tracker.thinking_cut(), None);
+        }
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 0);
+        assert_eq!(outcome.close, None);
+        assert_eq!(outcome.cut_at, None);
+        assert_eq!(outcome.cycle_period, None);
+        assert_eq!(outcome.stray_closes, 0);
+    }
+
+    #[test]
+    fn dynamic_open_token_budget_cut_and_following_text_block_record_zero_strays() {
+        let mut tracker = open_token_tracker(true, Some(3), &[END_MESSAGE_ID], false);
+        assert_eq!(tracker.unforced_token_budget(), None);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        // Entering thought block dynamically.
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(!tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(3));
+        assert_eq!(tracker.thinking_cut().map(|c| c.row), Some(3));
+        assert_eq!(tracker.peek_forced_token(), None);
+
+        assert!(tracker.observe_token(100)); // count = 1
+        assert!(tracker.observe_token(101)); // count = 2
+        assert_eq!(tracker.unforced_token_budget(), Some(1));
+        assert!(tracker.observe_token(102)); // count = 3 -> cut starts!
+        assert!(tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(0));
+        assert_eq!(tracker.peek_forced_token(), Some(END_MESSAGE_ID));
+        assert_eq!(
+            tracker.thinking_cut().map(|c| (c.row, c.from)),
+            Some((0, 0))
+        );
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert_eq!(tracker.peek_forced_token(), None); // in flight
+        assert_eq!(tracker.take_forced_token(), None);
+
+        // Observe forced close -> exits thinking.
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert!(!tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), None);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        // Text block follows and closes with the SAME `<|end_message|>` token -> 0 stray closes!
+        for token in [CONTENT_TEXT_ID, 200, 201, END_MESSAGE_ID] {
+            assert!(!tracker.observe_token(token));
+        }
+
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 3);
+        assert_eq!(outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(outcome.cut_at, Some(3));
+        assert_eq!(outcome.stray_closes, 0);
+        assert_eq!(outcome.reported_stray_closes(), Some(0));
+    }
+
+    #[test]
+    fn dynamic_open_token_budget_zero_waits_for_open_then_cuts_immediately() {
+        let mut tracker = open_token_tracker(true, Some(0), &[8, END_MESSAGE_ID], false);
+        assert!(!tracker.ending());
+        assert_eq!(tracker.peek_forced_token(), None);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        // Model opens a thought block -> immediate cut on 0 budget.
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(0));
+        assert_eq!(tracker.peek_forced_token(), Some(8));
+        assert_eq!(tracker.take_forced_token(), Some(8));
+        assert!(tracker.observe_token(8));
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert!(!tracker.ending());
+
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 1);
+        assert_eq!(outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(outcome.cut_at, Some(0));
+        assert_eq!(outcome.stray_closes, 0);
+    }
+
+    #[test]
+    fn dynamic_open_token_second_thought_block_respects_cumulative_budget() {
+        // Case 1: block 1 uses 2 of 4 tokens and closes naturally; block 2 gets remaining 2.
+        let mut tracker = open_token_tracker(true, Some(4), &[END_MESSAGE_ID], false);
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(tracker.observe_token(100)); // 1
+        assert!(tracker.observe_token(101)); // 2
+        assert!(tracker.observe_token(END_MESSAGE_ID)); // model closes block 1
+        assert_eq!(tracker.outcome().close, Some(ReasoningClose::Model));
+        assert!(!tracker.observe_token(CONTENT_TEXT_ID));
+        assert!(!tracker.observe_token(200));
+        assert!(!tracker.observe_token(END_MESSAGE_ID));
+
+        // Block 2 re-enters with 2 tokens left in cumulative budget.
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(!tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(2));
+        assert_eq!(tracker.outcome().close, Some(ReasoningClose::Open));
+        assert!(tracker.observe_token(300)); // 3
+        assert!(!tracker.ending());
+        assert!(tracker.observe_token(301)); // 4 -> hits cumulative budget!
+        assert!(tracker.ending());
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 4);
+        assert_eq!(outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(outcome.cut_at, Some(4));
+        assert_eq!(outcome.stray_closes, 0);
+
+        // Block 3 re-enters after budget is already exhausted -> cuts immediately!
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(tracker.ending());
+        assert_eq!(tracker.unforced_token_budget(), Some(0));
+        assert_eq!(tracker.peek_forced_token(), Some(END_MESSAGE_ID));
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        let outcome3 = tracker.outcome();
+        assert_eq!(outcome3.tokens, 4);
+        assert_eq!(outcome3.close, Some(ReasoningClose::Budget));
+        assert_eq!(outcome3.cut_at, Some(4));
+        assert_eq!(outcome3.stray_closes, 0);
+    }
+
+    #[test]
+    fn dynamic_open_token_cycle_guard_triggers_inside_thought_block() {
+        let mut tracker = open_token_tracker(true, None, &[8, END_MESSAGE_ID], true);
+        // Non-thinking preamble does not arm or trip the cycle guard.
+        for _ in 0..600 {
+            assert!(!tracker.observe_token(500));
+        }
+        assert_eq!(tracker.outcome().cycle_period, None);
+        assert_eq!(tracker.outcome().close, None);
+
+        // First short thinking block closes normally; second thinking block loops.
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(tracker.observe_token(42));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert!(!tracker.observe_token(CONTENT_TEXT_ID));
+        assert!(!tracker.observe_token(END_MESSAGE_ID));
+
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        let emitted = run_lane(&mut tracker, looping_thought(), 2000);
+        assert_eq!(emitted.len(), 766);
+        assert_eq!(&emitted[764..], &[8, END_MESSAGE_ID]);
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.close, Some(ReasoningClose::Cycle));
+        assert_eq!(outcome.cycle_period, Some(300));
+        assert_eq!(outcome.cut_at, Some(765)); // 1 from block 1 + 764 in block 2
+        assert_eq!(outcome.tokens, 1 + 764 + 1);
+        assert_eq!(outcome.stray_closes, 0);
+    }
+
+    #[test]
+    fn dynamic_open_token_disabled_ignores_open_token() {
+        let mut tracker = open_token_tracker(false, Some(2), &[END_MESSAGE_ID], true);
+        for token in [OPEN_THOUGHT_ID, 100, 101, 102, END_MESSAGE_ID] {
+            assert!(!tracker.observe_token(token));
+            assert_eq!(tracker.take_forced_token(), None);
+            assert_eq!(tracker.thinking_cut(), None);
+        }
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 0);
+        assert_eq!(outcome.close, None);
+        assert_eq!(outcome.stray_closes, 0);
+    }
+
+    #[test]
+    fn dynamic_open_token_speculative_wave_overshoot_stays_armed_for_next_cut() {
+        // Speculative verify wave started outside thinking (`thinking_cut() == None`) and
+        // emitted `[OPEN_THOUGHT_ID, 100, 101]` in a single committed wave under budget=0.
+        let mut tracker = open_token_tracker(true, Some(0), &[8, END_MESSAGE_ID], false);
+        assert_eq!(tracker.thinking_cut(), None);
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+        assert!(tracker.observe_token(100));
+        assert!(tracker.observe_token(101));
+        // Next wave sees `row == 0, from == 0` and forces the entire `end` sequence cleanly.
+        let cut = tracker.thinking_cut().expect("cut armed for next wave");
+        assert_eq!((cut.row, cut.from, cut.left()), (0, 0, 2));
+        assert_eq!(tracker.take_forced_token(), Some(8));
+        assert!(tracker.observe_token(8));
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+        assert_eq!(tracker.outcome().cut_at, Some(0));
+    }
+
+    #[test]
+    fn speculative_wave_limit_preserves_cycle_guard_lowered_budget_across_reopen() {
+        // Unbounded dynamic-open thinking with cycle guard enabled.
+        let mut tracker = open_token_tracker(true, None, &[8, END_MESSAGE_ID], true);
+        assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+
+        // Feed 762 tokens of a 300-period loop: cycle guard triggers at token 700,
+        // lowering live `self.budget` to `Some(764)` (`700 + CYCLE_CUT_GRACE`),
+        // leaving 2 tokens before the cut starts (`cut == false`, `cut_at == None`).
+        for token in looping_thought().take(762) {
+            assert!(tracker.observe_token(token));
+        }
+        assert!(!tracker.ending());
+        assert_eq!(tracker.outcome().cycle_period, Some(300));
+        assert_eq!(tracker.outcome().cut_at, None);
+
+        // Model closes naturally BEFORE hitting `cut_at`, then emits normal text.
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert!(!tracker.observe_token(CONTENT_TEXT_ID));
+        assert_eq!(tracker.outcome().close, Some(ReasoningClose::Model));
+        assert_eq!(tracker.outcome().cut_at, None);
+        assert_eq!(tracker.thinking_cut(), None);
+
+        // A later speculative wave starts outside thinking (`thinking_cut() == None`),
+        // re-opens thinking, and tries to commit 4 thought tokens past the lowered budget.
+        // Only `[OPEN_THOUGHT_ID, 1001, 1002]` (2 remaining tokens -> 764) may commit.
+        let wave = [OPEN_THOUGHT_ID, 1001, 1002, 1003, 1004];
+        assert_eq!(tracker.speculative_wave_limit(&wave), 3);
+
+        for &token in &wave[..3] {
+            assert!(tracker.observe_token(token));
+        }
+        assert!(tracker.ending());
+        let cut = tracker
+            .thinking_cut()
+            .expect("cut must arm at lowered budget");
+        assert_eq!((cut.row, cut.from, cut.left()), (0, 0, 2));
+        assert_eq!(tracker.take_forced_token(), Some(8));
+        assert!(tracker.observe_token(8));
+        assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+        assert!(tracker.observe_token(END_MESSAGE_ID));
+        assert_eq!(tracker.outcome().close, Some(ReasoningClose::Cycle));
+        assert_eq!(tracker.outcome().cut_at, Some(764));
+    }
+
+    #[test]
+    fn speculative_wave_limit_forces_multitoken_ending_before_close_marker() {
+        // Multi-token ending `[8, END_MESSAGE_ID]` under zero budget: a premature close
+        // marker right after `OPEN_THOUGHT_ID` must NOT skip forced ending token `8`.
+        let tracker = open_token_tracker(true, Some(0), &[8, END_MESSAGE_ID], false);
+        assert_eq!(
+            tracker.speculative_wave_limit(&[OPEN_THOUGHT_ID, END_MESSAGE_ID, 500]),
+            1,
+            "close marker at cut with observed==0 must truncate so next wave forces `8` first"
+        );
+        // Emitting the exact forced ending sequence `[8, END_MESSAGE_ID]` is accepted in full.
+        assert_eq!(
+            tracker.speculative_wave_limit(&[OPEN_THOUGHT_ID, 8, END_MESSAGE_ID, 500]),
+            4
+        );
+        // Emitting `8` then a non-close token truncates before the unexpected token.
+        assert_eq!(
+            tracker.speculative_wave_limit(&[OPEN_THOUGHT_ID, 8, 999]),
+            2
+        );
+
+        // Positive budget hitting cut mid-wave: close marker immediately after reaching
+        // budget must also truncate before skipping `8`, while closing BEFORE the budget
+        // is still allowed naturally.
+        let budgeted = open_token_tracker(true, Some(2), &[8, END_MESSAGE_ID], false);
+        assert_eq!(
+            budgeted.speculative_wave_limit(&[OPEN_THOUGHT_ID, 100, 101, END_MESSAGE_ID, 500]),
+            3
+        );
+        assert_eq!(
+            budgeted.speculative_wave_limit(&[OPEN_THOUGHT_ID, 100, END_MESSAGE_ID, 500]),
+            4
+        );
     }
 }

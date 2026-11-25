@@ -33,7 +33,8 @@ use crate::cold_tier::{
     CheckpointFiles, CheckpointLoadGuard, ColdTierGeometry, build_model_fingerprint,
 };
 use crate::disk_tier::state_disk::{
-    KvPoolHandle, Reclaimed, Staged, StateDiskCodec, StateDiskEngine, Tick, state_context,
+    KvPoolHandle, PersistStatus, Reclaimed, Staged, StateDiskCodec, StateDiskEngine, Tick,
+    WriteBehind, state_context,
 };
 use crate::disk_tier::store::{
     DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass, StoreHit,
@@ -62,14 +63,14 @@ use super::short_conv::{Inkling2ShortConvState, VisitShortConvState};
 /// Default rolling prefill checkpoint spacing (tokens).
 pub(crate) const INKLING2_CHECKPOINT_INTERVAL: u32 = 4096;
 
-/// Default minimum prefix depth eligible for background write-behind.
+/// Default minimum prefix depth / reply length (tokens) for write-behind & long-reply preemption.
 pub(crate) const INKLING2_WRITE_BEHIND_MIN_TOKENS: usize = 2048;
 
-/// Default write-behind delay (seconds) after ordinary publication before spilling to SSD.
-pub(crate) const INKLING2_WRITE_BEHIND_DELAY_SECS: f64 = 10.0;
-
-/// Default hard cap on the number of Inkling2 state anchors kept resident in host RAM.
+/// Default hard cap on RAM-resident state anchors in `Inkling2StateStore`.
 pub(crate) const INKLING2_DEFAULT_RAM_STATES: usize = 16;
+
+/// Default backoff delay (seconds) after a failed/refused SSD spill or upgrade before retrying.
+const INKLING2_SPILL_BACKOFF_SECS: f64 = 10.0;
 
 #[cfg(test)]
 thread_local! {
@@ -89,24 +90,16 @@ pub(crate) fn checkpoint_interval_tokens() -> u32 {
     INKLING2_CHECKPOINT_INTERVAL
 }
 
-fn write_behind_min_tokens() -> usize {
-    #[cfg(test)]
-    if let Some(v) = WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(std::cell::Cell::get) {
-        return v;
-    }
-    INKLING2_WRITE_BEHIND_MIN_TOKENS
-}
-
-fn write_behind_delay_secs() -> f64 {
+fn spill_backoff_secs() -> f64 {
     #[cfg(test)]
     if let Some(v) = WRITE_BEHIND_DELAY_OVERRIDE.with(std::cell::Cell::get) {
         return v;
     }
-    INKLING2_WRITE_BEHIND_DELAY_SECS
+    INKLING2_SPILL_BACKOFF_SECS
 }
 
 fn upgrade_retry_after() -> Instant {
-    Instant::now() + Duration::from_secs_f64(write_behind_delay_secs().max(0.0))
+    Instant::now() + Duration::from_secs_f64(spill_backoff_secs().max(0.0))
 }
 
 /// Shared host-heap payload for one [`PackedDraftWindow`].
@@ -941,10 +934,33 @@ pub(crate) struct Inkling2DiskCounters {
     pub adopted: u64,
 }
 
-/// Pending write-behind entry awaiting delay expiry.
-struct WriteBehindEntry {
-    id: EntryId,
-    published_at: Instant,
+/// Policy flags for [`Inkling2StateStore::capture_boundary_with_options`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CaptureOptions {
+    /// When `true` (publishing a prompt junction / head / turn end), detach `seq_checkpoints`
+    /// without retiring the prior rolling checkpoint so another conversation sharing the
+    /// earlier prefix still hits it as a disposable `Checkpoint`.
+    pub(crate) keep_prev_checkpoint: bool,
+    /// When `true` and publishing `StateClass::Ordinary`, enqueue into background `WriteBehind`.
+    /// Set `false` for preempted long replies (`Reply::Kept` semantics: protected from
+    /// Checkpoint-first eviction and spilled on reclaim, without eager write-behind).
+    pub(crate) enqueue_write_behind: bool,
+    /// Persistent prompt head (`Splash Cache::persist(..., head = true)`): survives superseding
+    /// ordinary turns on a persistent SSD tier.
+    pub(crate) is_head: bool,
+    /// Governor clock timestamp (`governor.now()`) for `WriteBehind::record_published`.
+    pub(crate) now: f64,
+}
+
+impl Default for CaptureOptions {
+    fn default() -> Self {
+        Self {
+            keep_prev_checkpoint: false,
+            enqueue_write_behind: true,
+            is_head: false,
+            now: 0.0,
+        }
+    }
 }
 
 /// Inkling2 codec for the shared governor-driven [`StateDiskEngine`].
@@ -994,10 +1010,12 @@ impl StateDiskCodec for Inkling2StateCodec {
 
 /// Model-owned StateDisk tier for Inkling-2-Mini backed by the shared
 /// [`StateDiskEngine`] (single reusable host staging buffer, dual-lane
-/// `ColdCacheManager` writer, 8-layer Global KV chain cursor, write-behind).
+/// `ColdCacheManager` writer, 8-layer Global KV chain cursor, shared `WriteBehind`).
 pub(crate) struct Inkling2StateDisk {
     pub(crate) engine: StateDiskEngine<Inkling2StateCodec>,
-    write_behind: Vec<WriteBehindEntry>,
+    pub(crate) write_behind: WriteBehind,
+    /// The landing pages the governor last read from this tier.
+    pub(crate) published_landing: u32,
     pub(crate) counters: Inkling2DiskCounters,
 }
 
@@ -1023,6 +1041,7 @@ impl Inkling2StateDisk {
     ) -> Result<Self> {
         let spans = geometry.spans();
         let geometry_str = geometry.geometry_string();
+        let write_behind = WriteBehind::new(tier.persistent);
         let engine = StateDiskEngine::new(
             tier,
             spans,
@@ -1033,7 +1052,8 @@ impl Inkling2StateDisk {
         .ok_or_else(|| Error::from_reason("Inkling2 StateDisk staging size overflows usize"))?;
         Ok(Self {
             engine,
-            write_behind: Vec::new(),
+            write_behind,
+            published_landing: 0,
             counters: Inkling2DiskCounters::default(),
         })
     }
@@ -1227,8 +1247,7 @@ pub(crate) struct Inkling2StateStore {
     /// Shared host-budget account charging both `self.store`'s non-draft-window bytes and all
     /// live [`TrackedPackedBytes`] draft windows into `CacheLimitCoordinator`.
     host_budget: Arc<HostBudgetAccount>,
-    /// Most recent rolling prefill checkpoint published per active sequence (retired on next
-    /// checkpoint or ordinary publication).
+    /// Most recent rolling prefill checkpoint published per active sequence.
     seq_checkpoints: HashMap<SeqId, EntryId>,
     /// Entries known to lack a `PackedDraftWindow` (`draft_window == None`, either captured
     /// without one or decoded from SSD with `valid_flag == 0`) under a v2 draft-window geometry.
@@ -1322,6 +1341,15 @@ impl Inkling2StateStore {
         self.sync_host_budget();
     }
 
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn attach_host_budget_local(
+        &mut self,
+        coord: Arc<crate::cache_limit::CacheLimitCoordinator>,
+    ) {
+        self.attach_host_budget_to(coord);
+    }
+
     /// Exact deduplicated host-heap bytes owned directly by `self.store` excluding
     /// [`TrackedPackedBytes`] draft windows tracked by `self.host_budget` (lineage vectors plus
     /// unique RAM anchor `swa_data` and `conv_data` buffers).
@@ -1405,9 +1433,6 @@ impl Inkling2StateStore {
         for id in ready {
             self.demote_ram_on_durable.remove(&id);
             self.spill_backoff.remove(&id);
-            if let Some(disk) = self.disk.as_mut() {
-                disk.write_behind.retain(|w| w.id != id);
-            }
             self.store.drop_ram(id);
         }
         self.sync_host_budget();
@@ -1439,27 +1464,12 @@ impl Inkling2StateStore {
         }
     }
 
-    fn enqueue_write_behind_entry_if_missing(&mut self, entry: WriteBehindEntry) {
-        if let Some(disk) = self.disk.as_mut()
-            && !disk.write_behind.iter().any(|w| w.id == entry.id)
-        {
-            disk.write_behind.push(entry);
-        }
-    }
-
-    fn enqueue_write_behind_if_missing(&mut self, id: EntryId) {
-        self.enqueue_write_behind_entry_if_missing(WriteBehindEntry {
-            id,
-            published_at: Instant::now(),
-        });
-    }
-
     /// When the SSD writer has stopped accepting tracked writes (`!disk.writable()`, e.g. after a
     /// non-space I/O error tripped `ColdCacheManager::tracked_failed`), no remaining `chain_owed`
     /// Global KV blocks can ever be persisted. Retire incomplete disk copies so they never keep
     /// Global KV pages pinned indefinitely, while preserving every already-durable SSD entry
     /// (`landed && !chain_owed`) and every live RAM copy.
-    fn retire_unwritable_incomplete_disk_copies(&mut self) -> bool {
+    pub(crate) fn retire_unwritable_incomplete_disk_copies(&mut self) -> bool {
         let (unwritable, writing) = match self.disk.as_ref() {
             Some(d) => (!d.writable(), d.writing()),
             None => return false,
@@ -1545,9 +1555,6 @@ impl Inkling2StateStore {
                         });
                     }
                     self.seq_checkpoints.retain(|_, v| *v != id);
-                    if let Some(disk) = self.disk.as_mut() {
-                        disk.write_behind.retain(|w| w.id != id);
-                    }
                     self.clear_window_tracking(id);
                     self.clear_upgrade_tracking(id);
                     self.store.remove(id);
@@ -1571,7 +1578,6 @@ impl Inkling2StateStore {
             .insert(id, PendingDiskUpgrade::Repair { retry_after: retry });
         self.spill_backoff.insert(id, retry);
         self.recent_failed_upgrades.insert(id);
-        self.enqueue_write_behind_if_missing(id);
     }
 
     /// Clear `Repair` entries once both their replacement state blob AND complete Global KV chain
@@ -1613,13 +1619,12 @@ impl Inkling2StateStore {
                 disk.tier.manager.remove(&key);
             }
             self.store.set_disk(id, None);
-            if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
-                self.enqueue_write_behind_if_missing(id);
-            }
         }
     }
 
     fn prune_entry_tracking(&mut self) {
+        self.seq_checkpoints
+            .retain(|_, id| self.store.get(*id).is_some());
         self.entries_missing_draft_window
             .retain(|id| self.store.get(*id).is_some());
         self.adopted_unverified_window
@@ -1627,7 +1632,6 @@ impl Inkling2StateStore {
         // Retain pending upgrades/repairs while their RAM anchor is alive. If an `InPlace`
         // upgrade lost its old SSD blob (e.g. via LRU eviction), transition it to `Repair`
         // instead of dropping upgrade tracking.
-        let mut evicted_in_place = Vec::new();
         self.pending_disk_upgrades.retain(|&id, kind| {
             let Some(entry) = self.store.get(id) else {
                 return false;
@@ -1639,13 +1643,9 @@ impl Inkling2StateStore {
                 *kind = PendingDiskUpgrade::Repair {
                     retry_after: Instant::now(),
                 };
-                evicted_in_place.push(id);
             }
             true
         });
-        for id in evicted_in_place {
-            self.enqueue_write_behind_if_missing(id);
-        }
         self.recent_failed_upgrades
             .retain(|id| self.store.get(*id).is_some());
         self.recent_failed_spills
@@ -1699,6 +1699,32 @@ impl Inkling2StateStore {
         })
     }
 
+    /// Whether an ordinary (non-upgrade) RAM entry is eligible to retry background `WriteBehind`
+    /// after a transient headroom/writer failure or `gone` invalidation.
+    fn is_retryable_ordinary_wb(
+        &self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        id: EntryId,
+    ) -> bool {
+        let Some(entry) = self.store.get(id) else {
+            return false;
+        };
+        !entry.checkpoint()
+            && entry.ram().is_some()
+            && entry.disk().is_none()
+            && !self.pending_disk_upgrades.contains_key(&id)
+            && self
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_none_or(|u| u.id != id)
+            && entry.depth() >= crate::disk_tier::state_disk::MINIMUM_TOKENS as usize
+            && self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.writable() && d.entry_fits_tier_limit(entry))
+            && self.chain_recoverable(coordinator, id)
+    }
+
     /// Reconcile an in-flight ordinary, repair, or upgrade spill after `StateDiskEngine::poll_offload`,
     /// `chain_step`, or `tick` (called BEFORE `reconcile_in_flight_disk_upgrade`, which may restore
     /// `old_copy`):
@@ -1737,26 +1763,30 @@ impl Inkling2StateStore {
                     .in_flight_disk_upgrade
                     .as_ref()
                     .is_none_or(|u| u.id != id)
-                && let Some(entry) = this.store.get(id)
-                && !entry.checkpoint()
-                && entry.ram().is_some()
-                && entry.disk().is_none()
+                && this
+                    .store
+                    .get(id)
+                    .is_some_and(|e| !e.checkpoint() && e.ram().is_some() && e.disk().is_none())
             {
-                let requeue = entry.depth() >= write_behind_min_tokens()
-                    && this
-                        .disk
-                        .as_ref()
-                        .is_some_and(|d| d.writable() && d.entry_fits_tier_limit(entry))
-                    && this.chain_recoverable(coordinator, id);
-                if requeue {
-                    let delay = Duration::from_secs_f64(write_behind_delay_secs().max(0.0));
-                    let published_at = Instant::now()
-                        .checked_sub(delay)
-                        .unwrap_or_else(Instant::now);
-                    this.enqueue_write_behind_entry_if_missing(WriteBehindEntry {
+                let requeue = this.is_retryable_ordinary_wb(coordinator, id);
+                if requeue
+                    && let Some(depth) = this
+                        .store
+                        .get(id)
+                        .and_then(|e| u32::try_from(e.depth()).ok())
+                    && let Some(disk) = this.disk.as_mut()
+                {
+                    let writable = disk.writable();
+                    let persistent = disk.tier.persistent;
+                    disk.write_behind.record_published(
+                        &this.store,
+                        writable,
+                        persistent,
                         id,
-                        published_at,
-                    });
+                        depth,
+                        0.0,
+                        false,
+                    );
                 }
                 this.recent_failed_spills.insert(id);
             }
@@ -1873,7 +1903,6 @@ impl Inkling2StateStore {
                     },
                 );
                 self.recent_failed_upgrades.insert(id);
-                self.enqueue_write_behind_if_missing(id);
             } else if self
                 .resolve_geometry()
                 .is_some_and(|g| g.draft_window_span_bytes > 0)
@@ -1979,9 +2008,6 @@ impl Inkling2StateStore {
                 .map(Entry::id);
             if let Some(id) = cp_victim {
                 self.seq_checkpoints.retain(|_, v| *v != id);
-                if let Some(disk) = self.disk.as_mut() {
-                    disk.write_behind.retain(|w| w.id != id);
-                }
                 self.retire_entry(id);
                 changed = true;
                 continue;
@@ -2105,9 +2131,6 @@ impl Inkling2StateStore {
                 self.pending_disk_upgrades.remove(&id);
                 self.recent_failed_upgrades.remove(&id);
                 self.demote_ram_on_durable.remove(&id);
-                if let Some(disk) = self.disk.as_mut() {
-                    disk.write_behind.retain(|w| w.id != id);
-                }
                 if self
                     .resolve_geometry()
                     .is_some_and(|g| g.draft_window_span_bytes > 0)
@@ -2122,11 +2145,13 @@ impl Inkling2StateStore {
                 if disk.chain.as_ref().is_some_and(|c| c.id == id) {
                     disk.chain = None;
                 }
-                disk.write_behind.retain(|w| w.id != id);
+                disk.engine.erase(&mut self.store, id);
+            } else {
+                self.store.remove(id);
             }
+            self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
-            self.store.remove(id);
             changed = true;
         }
         if changed {
@@ -2177,6 +2202,7 @@ impl Inkling2StateStore {
                 }
                 self.store.drop_ram(id);
             } else {
+                self.seq_checkpoints.retain(|_, v| *v != id);
                 self.clear_window_tracking(id);
                 self.clear_upgrade_tracking(id);
                 self.store.remove(id);
@@ -2279,7 +2305,7 @@ impl Inkling2StateStore {
 
     /// Capture `(40 SWA trailing blocks + 48 ShortConv states + optional DFlash2 DraftContextWindow)`
     /// at block-aligned `boundary` and publish into `HybridStateStore` as `class`
-    /// (`Ordinary` or `Checkpoint`).
+    /// (`Ordinary` or `Checkpoint`) with default [`CaptureOptions`].
     #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_boundary(
@@ -2303,14 +2329,14 @@ impl Inkling2StateStore {
             class,
             draft_window.map(DraftWindowInput::Packed),
             None,
+            CaptureOptions::default(),
         )
     }
 
     /// Capture `(40 SWA trailing blocks + 48 ShortConv states + optional DFlash2 BoundaryDraftWindow)`
     /// at block-aligned `boundary` and publish into `HybridStateStore` as `class`
-    /// (`Ordinary` or `Checkpoint`), deferring GPU-to-host [`PackedDraftWindow::from_window`]
-    /// serialization until publication actually occurs and checking Governor admission before
-    /// allocating host RAM for new or upgraded anchors.
+    /// (`Ordinary` or `Checkpoint`) with default [`CaptureOptions`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_boundary_with_window(
         &mut self,
@@ -2324,6 +2350,69 @@ impl Inkling2StateStore {
         draft_window: Option<&BoundaryDraftWindow>,
         governor: Option<(&Governor, u64)>,
     ) -> Result<Option<EntryId>> {
+        self.capture_boundary_with_window_and_options(
+            coordinator,
+            conv_state,
+            seq_id,
+            tokens,
+            boundary,
+            cache_salt,
+            class,
+            draft_window,
+            governor,
+            CaptureOptions::default(),
+        )
+    }
+
+    /// Capture `(40 SWA trailing blocks + 48 ShortConv states)` at block-aligned `boundary`
+    /// and publish into `HybridStateStore` as `class` (`Ordinary` or `Checkpoint`) with explicit
+    /// checkpoint retention, write-behind, and persistent-head options (no draft window).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_boundary_with_options(
+        &mut self,
+        coordinator: &mut Inkling2KVCacheCoordinator,
+        conv_state: &Inkling2ShortConvState,
+        seq_id: SeqId,
+        tokens: &[u32],
+        boundary: u32,
+        cache_salt: u64,
+        class: StateClass,
+        opts: CaptureOptions,
+    ) -> Result<Option<EntryId>> {
+        self.capture_boundary_with_window_and_options(
+            coordinator,
+            conv_state,
+            seq_id,
+            tokens,
+            boundary,
+            cache_salt,
+            class,
+            None,
+            None,
+            opts,
+        )
+    }
+
+    /// Capture `(40 SWA trailing blocks + 48 ShortConv states + optional DFlash2 BoundaryDraftWindow)`
+    /// at block-aligned `boundary` and publish into `HybridStateStore` as `class`
+    /// (`Ordinary` or `Checkpoint`), deferring GPU-to-host [`PackedDraftWindow::from_window`]
+    /// serialization until publication actually occurs, checking Governor admission before
+    /// allocating host RAM for new or upgraded anchors, and honoring explicit [`CaptureOptions`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_boundary_with_window_and_options(
+        &mut self,
+        coordinator: &mut Inkling2KVCacheCoordinator,
+        conv_state: &Inkling2ShortConvState,
+        seq_id: SeqId,
+        tokens: &[u32],
+        boundary: u32,
+        cache_salt: u64,
+        class: StateClass,
+        draft_window: Option<&BoundaryDraftWindow>,
+        governor: Option<(&Governor, u64)>,
+        opts: CaptureOptions,
+    ) -> Result<Option<EntryId>> {
         self.capture_boundary_inner(
             coordinator,
             conv_state,
@@ -2334,6 +2423,7 @@ impl Inkling2StateStore {
             class,
             draft_window.map(DraftWindowInput::Boundary),
             governor,
+            opts,
         )
     }
 
@@ -2344,15 +2434,12 @@ impl Inkling2StateStore {
         old_id: EntryId,
         boundary: u32,
         effective_class: StateClass,
+        opts: CaptureOptions,
     ) -> EntryId {
-        let needs_write_behind = self.store.get(old_id).is_some_and(|existing| {
-            existing.ram().is_some()
-                && (existing.disk().is_none()
-                    || self
-                        .pending_disk_upgrades
-                        .get(&old_id)
-                        .is_some_and(PendingDiskUpgrade::is_in_place))
-        });
+        let needs_write_behind = self
+            .store
+            .get(old_id)
+            .is_some_and(|existing| existing.ram().is_some() && existing.disk().is_none());
         self.store
             .reuse(old_id, effective_class == StateClass::Checkpoint);
         self.demote_ram_on_durable.remove(&old_id);
@@ -2364,17 +2451,22 @@ impl Inkling2StateStore {
             StateClass::Ordinary => {
                 self.ordinary_published += 1;
                 self.seq_checkpoints.retain(|_, v| *v != old_id);
-                let wb_eligible = boundary as usize >= write_behind_min_tokens()
-                    || self.pending_disk_upgrades.contains_key(&old_id);
-                if needs_write_behind
-                    && wb_eligible
+                if opts.enqueue_write_behind
+                    && needs_write_behind
+                    && !self.pending_disk_upgrades.contains_key(&old_id)
                     && let Some(disk) = self.disk.as_mut()
-                    && !disk.write_behind.iter().any(|w| w.id == old_id)
                 {
-                    disk.write_behind.push(WriteBehindEntry {
-                        id: old_id,
-                        published_at: Instant::now(),
-                    });
+                    let writable = disk.writable();
+                    let persistent = disk.tier.persistent;
+                    disk.write_behind.record_published(
+                        &self.store,
+                        writable,
+                        persistent,
+                        old_id,
+                        boundary,
+                        opts.now,
+                        opts.is_head,
+                    );
                 }
             }
         }
@@ -2396,6 +2488,7 @@ impl Inkling2StateStore {
         class: StateClass,
         draft_window: Option<DraftWindowInput<'_>>,
         governor: Option<(&Governor, u64)>,
+        opts: CaptureOptions,
     ) -> Result<Option<EntryId>> {
         let bs = coordinator.block_size().max(1);
         if boundary == 0 || !boundary.is_multiple_of(bs) || boundary as usize > tokens.len() {
@@ -2451,6 +2544,7 @@ impl Inkling2StateStore {
                         .map_err(Error::from_reason)?;
                 }
                 if let Some(prev_cp) = self.seq_checkpoints.remove(&seq_id)
+                    && !opts.keep_prev_checkpoint
                     && prev_cp != old_id
                 {
                     self.retire_entry(prev_cp);
@@ -2461,6 +2555,7 @@ impl Inkling2StateStore {
                     old_id,
                     boundary,
                     effective_class,
+                    opts,
                 )));
             }
         }
@@ -2593,11 +2688,11 @@ impl Inkling2StateStore {
             cached_bytes,
         };
 
-        // Retire any previous rolling checkpoint for this sequence ONLY when advancing to a
-        // different lineage. Recapturing the exact same boundary (e.g. scheduled preemption or
-        // turn-end promotion after a rolling checkpoint) must never discard an already stored
-        // complete checkpoint before checking whether it can be reused or upgraded in place.
+        // Detach any previous rolling checkpoint for this sequence; only retire it when
+        // `!keep_prev_checkpoint` (e.g. a deeper rolling checkpoint replacing an older one)
+        // and never retire `existing_id` itself when recapturing the exact same boundary.
         if let Some(prev_cp) = self.seq_checkpoints.remove(&seq_id)
+            && !opts.keep_prev_checkpoint
             && Some(prev_cp) != existing_id
         {
             self.retire_entry(prev_cp);
@@ -2637,6 +2732,7 @@ impl Inkling2StateStore {
                     old_id,
                     boundary,
                     effective_class,
+                    opts,
                 )));
             }
         }
@@ -2675,7 +2771,6 @@ impl Inkling2StateStore {
                                 tier.manager.remove(&copy.key);
                             });
                         }
-                        disk.write_behind.retain(|w| w.id != old_id);
                     }
                     self.store.set_disk(old_id, None);
                     self.clear_upgrade_tracking(old_id);
@@ -2729,9 +2824,21 @@ impl Inkling2StateStore {
                         };
                         if let Some(kind) = upgrade {
                             self.pending_disk_upgrades.insert(old_id, kind);
-                            self.enqueue_write_behind_if_missing(old_id);
-                        } else if disk_unusable && boundary as usize >= write_behind_min_tokens() {
-                            self.enqueue_write_behind_if_missing(old_id);
+                        } else if disk_unusable
+                            && opts.enqueue_write_behind
+                            && let Some(disk) = self.disk.as_mut()
+                        {
+                            let writable = disk.writable();
+                            let persistent = disk.tier.persistent;
+                            disk.write_behind.record_published(
+                                &self.store,
+                                writable,
+                                persistent,
+                                old_id,
+                                boundary,
+                                opts.now,
+                                opts.is_head,
+                            );
                         }
                     }
                 }
@@ -2764,8 +2871,7 @@ impl Inkling2StateStore {
                 if old_disk_copy.is_some() {
                     // Preserve `old_id` and its existing `DiskCopy` in-place! Atomically
                     // replace its RAM anchor (updating `cached_bytes`), preserve/upgrade
-                    // `Ordinary` class and recency, record the pending disk upgrade, and
-                    // queue SSD write-behind.
+                    // `Ordinary` class and recency, and record the pending disk upgrade.
                     self.store.replace_ram(old_id, anchor);
                     if let Some(dw) = self
                         .store
@@ -2794,14 +2900,6 @@ impl Inkling2StateStore {
                         StateClass::Ordinary => {
                             self.ordinary_published += 1;
                             self.seq_checkpoints.retain(|_, v| *v != old_id);
-                            if let Some(disk) = self.disk.as_mut()
-                                && !disk.write_behind.iter().any(|w| w.id == old_id)
-                            {
-                                disk.write_behind.push(WriteBehindEntry {
-                                    id: old_id,
-                                    published_at: Instant::now(),
-                                });
-                            }
                         }
                     }
                     self.sync_marks(coordinator);
@@ -2812,11 +2910,10 @@ impl Inkling2StateStore {
                 }
                 // RAM-only entry (`disk().is_none()`): safe to replace directly in RAM.
                 self.seq_checkpoints.retain(|_, v| *v != old_id);
-                if let Some(disk) = self.disk.as_mut() {
-                    if disk.chain.as_ref().is_some_and(|c| c.id == old_id) {
-                        disk.chain = None;
-                    }
-                    disk.write_behind.retain(|w| w.id != old_id);
+                if let Some(disk) = self.disk.as_mut()
+                    && disk.chain.as_ref().is_some_and(|c| c.id == old_id)
+                {
+                    disk.chain = None;
                 }
                 self.clear_window_tracking(old_id);
                 self.clear_upgrade_tracking(old_id);
@@ -2860,14 +2957,20 @@ impl Inkling2StateStore {
             StateClass::Ordinary => {
                 self.ordinary_published += 1;
                 self.seq_checkpoints.retain(|_, v| *v != inserted.id);
-                if let Some(disk) = self.disk.as_mut()
-                    && boundary as usize >= write_behind_min_tokens()
-                    && !disk.write_behind.iter().any(|w| w.id == inserted.id)
+                if opts.enqueue_write_behind
+                    && let Some(disk) = self.disk.as_mut()
                 {
-                    disk.write_behind.push(WriteBehindEntry {
-                        id: inserted.id,
-                        published_at: Instant::now(),
-                    });
+                    let writable = disk.writable();
+                    let persistent = disk.tier.persistent;
+                    disk.write_behind.record_published(
+                        &self.store,
+                        writable,
+                        persistent,
+                        inserted.id,
+                        boundary,
+                        opts.now,
+                        opts.is_head,
+                    );
                 }
             }
         }
@@ -2905,6 +3008,7 @@ impl Inkling2StateStore {
                 });
             }
         }
+        self.seq_checkpoints.retain(|_, v| *v != id);
         self.clear_window_tracking(id);
         self.clear_upgrade_tracking(id);
         self.store.remove(id);
@@ -3065,6 +3169,7 @@ impl Inkling2StateStore {
         };
         match staged {
             Staged::Started => {
+                self.spill_backoff.remove(&id);
                 self.recent_failed_spills.remove(&id);
                 if let Some((old_copy, fallback_hold)) = upgrade_in_place {
                     self.pending_disk_upgrades.remove(&id);
@@ -3123,15 +3228,16 @@ impl Inkling2StateStore {
 
     fn erase_reclaimed_entry(&mut self, coordinator: &Inkling2KVCacheCoordinator, id: EntryId) {
         self.seq_checkpoints.retain(|_, v| *v != id);
+        self.clear_window_tracking(id);
+        self.clear_upgrade_tracking(id);
         if let Some(disk) = self.disk.as_mut() {
             if disk.chain.as_ref().is_some_and(|c| c.id == id) {
                 disk.chain = None;
             }
-            disk.write_behind.retain(|w| w.id != id);
+            disk.engine.erase(&mut self.store, id);
+        } else {
+            self.store.remove(id);
         }
-        self.clear_window_tracking(id);
-        self.clear_upgrade_tracking(id);
-        self.store.remove(id);
         self.sync_marks(coordinator);
         self.sync_host_budget();
     }
@@ -3188,14 +3294,8 @@ impl Inkling2StateStore {
             .resolve_geometry()
             .is_some_and(|g| g.draft_window_span_bytes > 0);
         if self.disk.is_none() {
-            if let Some(entry) = self.store.get(id)
-                && entry.ram().is_some()
-            {
-                self.clear_window_tracking(id);
-                self.clear_upgrade_tracking(id);
-                self.store.remove(id);
-                self.sync_marks(coordinator);
-                self.sync_host_budget();
+            if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+                self.erase_reclaimed_entry(coordinator, id);
             }
             return ReclaimOutcome::Erased;
         }
@@ -3233,9 +3333,6 @@ impl Inkling2StateStore {
                 self.recent_failed_spills.remove(&id);
                 self.spill_backoff.remove(&id);
                 self.demote_ram_on_durable.remove(&id);
-                if let Some(disk) = self.disk.as_mut() {
-                    disk.write_behind.retain(|w| w.id != id);
-                }
                 self.store.drop_ram(id);
                 self.sync_marks(coordinator);
                 self.sync_host_budget();
@@ -3263,9 +3360,6 @@ impl Inkling2StateStore {
                 self.recent_failed_spills.remove(&id);
                 self.spill_backoff.remove(&id);
                 self.demote_ram_on_durable.remove(&id);
-                if let Some(disk) = self.disk.as_mut() {
-                    disk.write_behind.retain(|w| w.id != id);
-                }
                 self.store.drop_ram(id);
                 self.sync_marks(coordinator);
                 self.sync_host_budget();
@@ -3289,7 +3383,6 @@ impl Inkling2StateStore {
                     .stage(&mut self.store, id, MakeRoom::Evict, false, ())
                 {
                     Staged::Started => {
-                        disk.write_behind.retain(|w| w.id != id);
                         self.clear_upgrade_tracking(id);
                         self.sync_marks(coordinator);
                         self.sync_host_budget();
@@ -3324,8 +3417,8 @@ impl Inkling2StateStore {
                         tier.manager.remove(&key);
                     });
                 }
-                disk.write_behind.retain(|w| w.id != id);
             }
+            self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
             self.store.remove(id);
@@ -3426,29 +3519,23 @@ impl Inkling2StateStore {
             self.demote_ram_on_durable.remove(&id);
             if let Some(removed) = self.pending_disk_upgrades.remove(&id) {
                 self.recent_failed_upgrades.remove(&id);
-                if let Some(disk) = self.disk.as_mut() {
-                    disk.write_behind.retain(|w| w.id != id);
-                }
                 if removed.is_in_place() && has_dw_span {
                     self.entries_missing_draft_window.insert(id);
                 }
             }
         }
         if step.outcome == Reclaimed::Written {
-            if let Some(disk) = self.disk.as_mut() {
-                disk.write_behind.retain(|w| w.id != id);
-            }
             self.clear_upgrade_tracking(id);
         }
         if self.store.get(id).is_none() {
-            if let Some(disk) = self.disk.as_mut() {
-                disk.write_behind.retain(|w| w.id != id);
-            }
+            self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
         }
         if step.resync {
+            self.prune_entry_tracking();
             self.sync_marks(coordinator);
+            self.sync_host_budget();
         }
         self.sync_host_budget();
         match step.outcome {
@@ -3457,6 +3544,90 @@ impl Inkling2StateStore {
             Reclaimed::Pending => ReclaimOutcome::Pending,
             Reclaimed::Erased | Reclaimed::Nothing => ReclaimOutcome::Erased,
         }
+    }
+
+    /// Persist `id`'s RAM copy and Global KV chain via shared [`StateDiskEngine::persist`].
+    /// When `head == true`, persists even after deeper ordinary turns supersede `id`.
+    pub(crate) fn persist_entry(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        id: EntryId,
+        head: bool,
+    ) -> PersistStatus {
+        self.persist_entry_inner(coordinator, id, head, false)
+    }
+
+    fn persist_entry_inner(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        id: EntryId,
+        head: bool,
+        force: bool,
+    ) -> PersistStatus {
+        // Queued or in-flight SSD upgrades/repairs are owned by `drive_pending_disk_upgrades_inner`
+        // (which holds `ColdKeyHold` + rollback fallbacks via `stage_entry`).
+        if self.pending_disk_upgrades.contains_key(&id)
+            || self
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_some_and(|u| u.id == id)
+        {
+            return PersistStatus::Unneeded;
+        }
+        if !force
+            && self
+                .spill_backoff
+                .get(&id)
+                .is_some_and(|&retry_after| Instant::now() < retry_after)
+        {
+            return PersistStatus::Busy;
+        }
+        let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
+        let step = {
+            let Some(disk) = self.disk.as_mut() else {
+                return PersistStatus::Refused;
+            };
+            let step = disk
+                .engine
+                .persist(&mut self.store, Some(&kv), id, head, ());
+            disk.counters.offload_failures += step.offload_failures;
+            step
+        };
+        if step.staged {
+            self.spill_backoff.remove(&id);
+            self.recent_failed_spills.remove(&id);
+        }
+        if step.resync {
+            self.prune_entry_tracking();
+            self.sync_marks(coordinator);
+            self.sync_host_budget();
+        }
+        if step.status == PersistStatus::Refused
+            && self
+                .store
+                .get(id)
+                .is_some_and(|e| !e.checkpoint() && e.ram().is_some() && e.disk().is_none())
+        {
+            let retryable = self.is_retryable_ordinary_wb(coordinator, id);
+            if retryable {
+                self.spill_backoff.insert(id, upgrade_retry_after());
+                self.recent_failed_spills.insert(id);
+                if !force {
+                    // Transient headroom refusal on background `WriteBehind::step`: keep the
+                    // point queued in `WriteBehind` behind `spill_backoff` instead of dropping it.
+                    return PersistStatus::Busy;
+                }
+            } else if self.disk.as_ref().is_some_and(|d| {
+                self.store
+                    .get(id)
+                    .is_some_and(|e| d.entry_fits_tier_limit(e))
+            }) {
+                // Entry fits the tier limit but cannot persist (e.g. lost KV chain or unwritable
+                // disk): record as failed so `flush_to_disk` surfaces `false`.
+                self.recent_failed_spills.insert(id);
+            }
+        }
+        step.status
     }
 
     /// Poll completed SSD writes & LRU evictions from `ColdCacheManager`.
@@ -3519,6 +3690,7 @@ impl Inkling2StateStore {
         if progressed {
             self.prune_entry_tracking();
             self.sync_marks(coordinator);
+            self.sync_host_budget();
         }
         if out.landed {
             self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
@@ -3582,13 +3754,14 @@ impl Inkling2StateStore {
         out.step.enqueued > 0 || out.step.landed_all || out.step.failed || demoted
     }
 
-    /// Drive write-behind for eligible ordinary states whose delay has elapsed (and queued SSD
-    /// upgrades/repairs on temporary tiers).
+    /// Drive queued SSD upgrades/repairs (`PendingDiskUpgrade::InPlace` and `Repair`) whose
+    /// backoff has elapsed (or unconditionally when `force == true`).
     ///
-    /// When `skip` is provided (during `flush_to_disk` or after a same-tick failure), entries
-    /// already refused in the current pass are skipped so `flush_to_disk` never tight-spins on a
-    /// blocked upgrade/repair while still keeping it queued in `write_behind` for backoff retries.
-    fn drive_write_behind_inner(
+    /// Unlike ordinary `WriteBehind` (driven by the governor-clocked `scheduler.rs` loop via
+    /// `WriteBehind::step`), upgrades and repairs run even on temporary tiers below `ram_cap`
+    /// without triggering ordinary copy-ahead, and use `stage_entry`'s `ColdKeyHold` + rollback
+    /// machinery to preserve durable SSD fallbacks.
+    fn drive_pending_disk_upgrades_inner(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
         force: bool,
@@ -3603,51 +3776,45 @@ impl Inkling2StateStore {
             ),
             None => return false,
         };
-        if !writable || writing || (!force && has_waiters) {
-            return false;
-        }
-        let upgrades_only = !persistent && !force;
-        if upgrades_only && self.pending_disk_upgrades.is_empty() {
+        if !writable || writing || (!force && has_waiters) || self.pending_disk_upgrades.is_empty()
+        {
             return false;
         }
         let now = Instant::now();
-        let delay = Duration::from_secs_f64(write_behind_delay_secs());
-        let candidate = {
-            let pending_upgrades = &self.pending_disk_upgrades;
-            let spill_backoff = &self.spill_backoff;
-            let Some(disk) = self.disk.as_mut() else {
-                return false;
-            };
-            disk.write_behind.retain(|w| {
-                self.store.get(w.id).is_some_and(|e| {
-                    e.ram().is_some()
-                        && (e.disk().is_none()
-                            || pending_upgrades
-                                .get(&w.id)
-                                .is_some_and(PendingDiskUpgrade::is_in_place))
-                })
-            });
-            let skip_ref = skip.as_deref();
-            disk.write_behind
-                .iter()
-                .position(|w| {
-                    (!upgrades_only || pending_upgrades.contains_key(&w.id))
-                        && (force
-                            || (now.duration_since(w.published_at) >= delay
-                                && spill_backoff
-                                    .get(&w.id)
-                                    .is_none_or(|&retry_after| now >= retry_after)
-                                && pending_upgrades
-                                    .get(&w.id)
-                                    .is_none_or(|pending| now >= pending.retry_after())))
-                        && skip_ref.is_none_or(|s| !s.contains(&w.id))
-                })
-                .map(|idx| disk.write_behind.remove(idx))
-        };
-        let Some(wb_entry) = candidate else {
+        let skip_ref = skip.as_deref();
+        let candidate = self
+            .pending_disk_upgrades
+            .iter()
+            .filter_map(|(&id, &kind)| {
+                let entry = self.store.get(id)?;
+                if entry.ram().is_none() {
+                    return None;
+                }
+                if !kind.is_in_place() && entry.disk().is_some() {
+                    return None;
+                }
+                if !force {
+                    if now < kind.retry_after() {
+                        return None;
+                    }
+                    if self
+                        .spill_backoff
+                        .get(&id)
+                        .is_some_and(|&retry_after| now < retry_after)
+                    {
+                        return None;
+                    }
+                }
+                if skip_ref.is_some_and(|s| s.contains(&id)) {
+                    return None;
+                }
+                Some((entry.last_used(), id))
+            })
+            .min()
+            .map(|(_, id)| id);
+        let Some(id) = candidate else {
             return false;
         };
-        let id = wb_entry.id;
         let room = if persistent {
             MakeRoom::Evict
         } else {
@@ -3656,43 +3823,30 @@ impl Inkling2StateStore {
         // Always keep RAM warm until both the state blob AND its complete Global KV chain
         // have landed on SSD; `trim_ram_to_cap` drops RAM once `entry_disk_restorable` is true.
         let staged = self.stage_entry(coordinator, id, room, true);
-        if !staged {
-            if self.pending_disk_upgrades.contains_key(&id) {
-                self.enqueue_write_behind_entry_if_missing(wb_entry);
-                if let Some(s) = skip {
-                    s.insert(id);
-                }
-            } else if let Some(entry) = self.store.get(id)
-                && entry.ram().is_some()
-                && entry.disk().is_none()
-            {
-                let (fits_tier, is_writing) = self.disk.as_ref().map_or((false, false), |d| {
-                    (d.entry_fits_tier_limit(entry), d.writing())
-                });
-                if fits_tier {
-                    if !is_writing {
-                        self.spill_backoff.insert(id, upgrade_retry_after());
-                    }
-                    self.enqueue_write_behind_entry_if_missing(wb_entry);
-                    if let Some(s) = skip {
-                        s.insert(id);
-                    }
-                }
-            }
+        if !staged
+            && self.pending_disk_upgrades.contains_key(&id)
+            && let Some(s) = skip
+        {
+            s.insert(id);
         }
         staged
     }
 
     #[cfg(test)]
-    fn drive_write_behind(
+    fn drive_pending_disk_upgrades(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
         force: bool,
     ) -> bool {
-        self.drive_write_behind_inner(coordinator, force, None)
+        self.drive_pending_disk_upgrades_inner(coordinator, force, None)
     }
 
-    /// One tick of the StateDisk tier (called on scheduler drive passes and allocations).
+    /// One engine tick of the StateDisk tier (polls landings, advances owed chains, reconciles
+    /// upgrades/repairs, requested RAM demotions & unwritable copies, drives queued SSD upgrades,
+    /// and enforces `ram_cap`).
+    ///
+    /// Governor-clocked `WriteBehind::step`, `monitor::set_next_wakeup`, `publish_landing_pages`,
+    /// and `signal_progress` are driven by [`super::model::Inkling2Inner::tick_state_disk`].
     pub(crate) fn tick(&mut self, coordinator: &Inkling2KVCacheCoordinator, tick: Tick) -> bool {
         let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
         let (pending_before, chain_before) = self.disk.as_ref().map_or((None, None), |d| {
@@ -3755,115 +3909,107 @@ impl Inkling2StateStore {
         if out.resync || failed_upgrade.is_some() || retired || demoted {
             self.prune_entry_tracking();
             self.sync_marks(coordinator);
+            self.sync_host_budget();
         }
-        if out.state_landed_ok > 0 || out.progressed {
+        if out.state_landed_ok > 0 || out.progressed || self.ram_len() > self.ram_cap {
             self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
         }
         if matches!(tick, Tick::Full { .. }) {
             let mut tick_skip: HashSet<EntryId> = failed_ids.into_iter().collect();
             let skip_opt = (!tick_skip.is_empty()).then_some(&mut tick_skip);
-            progressed |= self.drive_write_behind_inner(coordinator, false, skip_opt);
+            progressed |= self.drive_pending_disk_upgrades_inner(coordinator, false, skip_opt);
             progressed |= self.poll_offload(coordinator);
         }
         self.sync_host_budget();
         progressed
     }
 
-    /// Synchronously flush all pending write-behind ordinary states & owed Global KV chains
-    /// to SSD until `deadline` (used by `close_cache`, `Drop`, and restart tests).
+    /// Synchronously flush all waiting `WriteBehind` points, pending SSD upgrades/repairs, & owed
+    /// Global KV chains to SSD until `deadline` (used by `close_cache`, `Drop`, and restart tests).
     pub(crate) fn flush_to_disk(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
         deadline: Instant,
     ) -> bool {
         self.reconcile_completed_disk_repairs();
-        // Ensure every pending SSD upgrade/repair needing a state write with a live RAM anchor is
-        // queued in `write_behind` before flushing.
-        if let Some(disk) = self.disk.as_mut() {
-            let now = Instant::now();
-            for (&id, kind) in &self.pending_disk_upgrades {
-                if self.store.get(id).is_some_and(|e| {
-                    e.ram().is_some() && (kind.is_in_place() || e.disk().is_none())
-                }) && !disk.write_behind.iter().any(|w| w.id == id)
-                {
-                    disk.write_behind.push(WriteBehindEntry {
-                        id,
-                        published_at: now,
-                    });
-                }
-            }
-        }
 
+        let has_pending_upgrades = |this: &Self, skipped: &HashSet<EntryId>| {
+            this.pending_disk_upgrades.iter().any(|(&id, kind)| {
+                !skipped.contains(&id)
+                    && this.store.get(id).is_some_and(|e| {
+                        e.ram().is_some() && (kind.is_in_place() || e.disk().is_none())
+                    })
+            })
+        };
         let has_work = |this: &Self, skipped: &HashSet<EntryId>| {
             let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
             let has_owed_chain = this
                 .store
                 .entries()
                 .any(|e| e.disk().is_some_and(|c| c.chain_owed));
-            let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
-                d.write_behind.iter().any(|w| {
-                    !skipped.contains(&w.id)
-                        && this.store.get(w.id).is_some_and(|e| {
-                            e.ram().is_some()
-                                && (e.disk().is_none()
-                                    || this
-                                        .pending_disk_upgrades
-                                        .get(&w.id)
-                                        .is_some_and(PendingDiskUpgrade::is_in_place))
-                        })
-                })
-            });
-            has_pending_write || has_owed_chain || has_waiting_wb
+            let has_waiting_wb = this
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.writable() && d.write_behind.snapshot().waiting > 0);
+            has_pending_write
+                || has_owed_chain
+                || has_waiting_wb
+                || has_pending_upgrades(this, skipped)
         };
-        let all_flushed = |this: &Self, failed: &HashSet<EntryId>| {
-            let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
-            let has_owed_chain = this
-                .store
-                .entries()
-                .any(|e| e.disk().is_some_and(|c| c.chain_owed));
-            let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
-                d.write_behind.iter().any(|w| {
-                    this.store.get(w.id).is_some_and(|e| {
-                        e.ram().is_some()
-                            && (e.disk().is_none()
-                                || this
-                                    .pending_disk_upgrades
-                                    .get(&w.id)
-                                    .is_some_and(PendingDiskUpgrade::is_in_place))
-                    })
-                })
-            });
-            let disk_writable = this.disk.as_ref().is_none_or(|d| d.writable());
-            disk_writable
-                && failed.is_empty()
-                && !has_pending_write
-                && !has_owed_chain
-                && !has_waiting_wb
-                && this.pending_disk_upgrades.is_empty()
-                && this.in_flight_disk_upgrade.is_none()
-        };
+        let finalize_and_check =
+            |this: &mut Self, failed: &HashSet<EntryId>, retryable_wb: &[(EntryId, u32, bool)]| {
+                if !retryable_wb.is_empty()
+                    && let Some(disk) = this.disk.as_mut()
+                {
+                    let writable = disk.writable();
+                    let persistent = disk.tier.persistent;
+                    for &(id, depth, head) in retryable_wb {
+                        disk.write_behind.record_published(
+                            &this.store,
+                            writable,
+                            persistent,
+                            id,
+                            depth,
+                            0.0,
+                            head,
+                        );
+                    }
+                }
+                let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
+                let has_owed_chain = this
+                    .store
+                    .entries()
+                    .any(|e| e.disk().is_some_and(|c| c.chain_owed));
+                let has_waiting_wb = this
+                    .disk
+                    .as_ref()
+                    .is_some_and(|d| d.write_behind.snapshot().waiting > 0);
+                let disk_writable = this.disk.as_ref().is_none_or(|d| d.writable());
+                disk_writable
+                    && failed.is_empty()
+                    && !has_pending_write
+                    && !has_owed_chain
+                    && !has_waiting_wb
+                    && this.pending_disk_upgrades.is_empty()
+                    && this.in_flight_disk_upgrade.is_none()
+            };
 
-        // Clear stale failure markers from earlier passes so retryable entries (still queued in
-        // `write_behind` or `pending_disk_upgrades`) get a fresh attempt once space has recovered.
-        // Then poll any already-completed landings/evictions: failures that are still retryable
-        // are cleared so this flush retries them, while unrecoverable invalidations (not queued
-        // in `write_behind`) are preserved in `failed_upgrades` so `flush_to_disk` never falsely
-        // returns `true`.
+        // Clear stale failure markers from earlier passes so retryable entries get a fresh
+        // attempt once space has recovered, while preserving unrecoverable invalidations in
+        // `failed_entries` so `flush_to_disk` never falsely returns `true`.
         self.recent_failed_upgrades.clear();
         self.recent_failed_spills.clear();
         self.poll_offload(coordinator);
         self.recent_failed_upgrades.clear();
-        let mut failed_upgrades: HashSet<EntryId> = HashSet::new();
-        for id in self.recent_failed_spills.drain() {
-            let queued_for_retry = self
-                .disk
-                .as_ref()
-                .is_some_and(|d| d.write_behind.iter().any(|w| w.id == id));
-            if !queued_for_retry {
-                failed_upgrades.insert(id);
+        let mut failed_entries: HashSet<EntryId> = HashSet::new();
+        let recent_spills: Vec<EntryId> = self.recent_failed_spills.drain().collect();
+        for id in recent_spills {
+            if !self.is_retryable_ordinary_wb(coordinator, id) {
+                failed_entries.insert(id);
             }
         }
-        let mut skipped_upgrades: HashSet<EntryId> = failed_upgrades.clone();
+        let mut skipped_upgrades: HashSet<EntryId> = failed_entries.clone();
+        let mut retryable_wb_refusals: Vec<(EntryId, u32, bool)> = Vec::new();
         loop {
             self.poll_offload(coordinator);
             for id in self
@@ -3871,27 +4017,66 @@ impl Inkling2StateStore {
                 .drain()
                 .chain(self.recent_failed_spills.drain())
             {
-                failed_upgrades.insert(id);
+                failed_entries.insert(id);
                 skipped_upgrades.insert(id);
             }
             if !has_work(self, &skipped_upgrades) {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
             if Instant::now() >= deadline {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
             let (writable, writing) = self
                 .disk
                 .as_ref()
                 .map_or((false, false), |d| (d.writable(), d.writing()));
             if !writable && !writing {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
-            let wb_before = self.disk.as_ref().map_or(0, |d| d.write_behind.len());
+            let wb_waiting_before = self
+                .disk
+                .as_ref()
+                .map_or(0, |d| d.write_behind.snapshot().waiting);
             let skipped_before = skipped_upgrades.len();
             let offloads_before = self.disk.as_ref().map_or(0, |d| d.counters.offloads);
-            let staged =
-                self.drive_write_behind_inner(coordinator, true, Some(&mut skipped_upgrades));
+            let staged_upgrade = self.drive_pending_disk_upgrades_inner(
+                coordinator,
+                true,
+                Some(&mut skipped_upgrades),
+            );
+            if let Some(disk) = self.disk.as_mut()
+                && disk.writable()
+            {
+                let mut behind = std::mem::take(&mut disk.write_behind);
+                let _ = behind.flush(self, |store, id, head| {
+                    if failed_entries.contains(&id) {
+                        if store.is_retryable_ordinary_wb(coordinator, id)
+                            && let Some(depth) = store
+                                .store
+                                .get(id)
+                                .and_then(|e| u32::try_from(e.depth()).ok())
+                        {
+                            retryable_wb_refusals.push((id, depth, head));
+                        }
+                        return PersistStatus::Refused;
+                    }
+                    let status = store.persist_entry_inner(coordinator, id, head, true);
+                    if status == PersistStatus::Refused
+                        && store.is_retryable_ordinary_wb(coordinator, id)
+                        && let Some(depth) = store
+                            .store
+                            .get(id)
+                            .and_then(|e| u32::try_from(e.depth()).ok())
+                    {
+                        failed_entries.insert(id);
+                        retryable_wb_refusals.push((id, depth, head));
+                    }
+                    status
+                });
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind = behind;
+                }
+            }
             let chained = self.chain_step(coordinator, deadline);
             let polled = self.poll_offload(coordinator);
             for id in self
@@ -3899,34 +4084,38 @@ impl Inkling2StateStore {
                 .drain()
                 .chain(self.recent_failed_spills.drain())
             {
-                failed_upgrades.insert(id);
+                failed_entries.insert(id);
                 skipped_upgrades.insert(id);
             }
             let offloads_after = self.disk.as_ref().map_or(0, |d| d.counters.offloads);
             if chained || offloads_after > offloads_before {
-                skipped_upgrades.retain(|id| failed_upgrades.contains(id));
+                skipped_upgrades.retain(|id| failed_entries.contains(id));
             }
-            let wb_progressed = staged
-                || self.disk.as_ref().map_or(0, |d| d.write_behind.len()) < wb_before
+            let wb_waiting_after = self
+                .disk
+                .as_ref()
+                .map_or(0, |d| d.write_behind.snapshot().waiting);
+            let wb_progressed = staged_upgrade
+                || wb_waiting_after < wb_waiting_before
                 || skipped_upgrades.len() > skipped_before;
 
             if !has_work(self, &skipped_upgrades) {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
             if Instant::now() >= deadline {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
             if polled || chained || wb_progressed {
                 continue;
             }
             let Some(disk) = self.disk.as_ref() else {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             };
             if !disk.writable() && !disk.writing() {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
             if !disk.engine.await_landing(deadline) {
-                return all_flushed(self, &failed_upgrades);
+                return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
         }
     }
@@ -3945,6 +4134,7 @@ impl Inkling2StateStore {
         if let Some(disk) = self.disk.as_ref() {
             all_flushed &= disk.tier.close(deadline);
         }
+        let _ = self.poll_offload(coordinator);
         if !persistent && let Some(disk) = self.disk.as_mut() {
             disk.engine.strip_disk_copies(&mut self.store);
             disk.preserve_entry_on_state_failure = None;
@@ -3954,6 +4144,8 @@ impl Inkling2StateStore {
             self.recent_failed_spills.clear();
             self.spill_backoff.clear();
             self.demote_ram_on_durable.clear();
+            self.prune_entry_tracking();
+            self.sync_marks(coordinator);
         }
         self.sync_host_budget();
         all_flushed
@@ -4112,7 +4304,7 @@ impl Inkling2Restore {
 ///
 /// Bump whenever fused Metal kernels or projection/norm rounding order change so cached SSD
 /// prefixes produced by an older build are never adopted and extended under different arithmetic.
-const INKLING2_FORWARD_ARITH_VERSION: &str = "v4";
+const INKLING2_FORWARD_ARITH_VERSION: &str = "v5";
 
 fn query_precision_tag(int8_query_from: Option<u32>) -> String {
     match int8_query_from {
@@ -4708,9 +4900,6 @@ mod tests {
         }
         use crate::disk_tier::{CacheDisk, DiskTierOptions};
 
-        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(32)));
-        WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(Some(0.0)));
-
         let cfg = tiny_inkling2_config();
         let dflash_cfg =
             crate::models::qwen3_5::dflash2::dflash2_config_with_context(cfg.hidden_size, 16);
@@ -5020,8 +5209,6 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&temp_root);
-        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
-        WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(None));
     }
 
     #[cfg(target_os = "macos")]
@@ -5410,6 +5597,36 @@ mod tests {
             self.capture(conv, seq, tokens, boundary, salt, StateClass::Ordinary, dw)
         }
 
+        fn capture_ord_no_wb(
+            &mut self,
+            conv: &Inkling2ShortConvState,
+            seq: u32,
+            tokens: &[u32],
+            boundary: u32,
+            salt: u64,
+        ) -> EntryId {
+            self.coord.reset_scheduled_request(seq).expect("reset seq");
+            self.coord.record_tokens_all(seq, tokens).expect("record");
+            self.store
+                .capture_boundary_with_options(
+                    &mut self.coord,
+                    conv,
+                    seq,
+                    tokens,
+                    boundary,
+                    salt,
+                    StateClass::Ordinary,
+                    CaptureOptions {
+                        keep_prev_checkpoint: false,
+                        enqueue_write_behind: false,
+                        is_head: false,
+                        now: 0.0,
+                    },
+                )
+                .expect("capture_boundary_with_options")
+                .expect("entry_id")
+        }
+
         fn stage(&mut self, id: EntryId) -> bool {
             self.store
                 .stage_entry(&self.coord, id, MakeRoom::Evict, true)
@@ -5423,8 +5640,13 @@ mod tests {
             self.store.close_cache(&self.coord, test_deadline(10))
         }
 
-        fn has_wb(&self, id: EntryId) -> bool {
-            self.disk().write_behind.iter().any(|w| w.id == id)
+        fn wb_waiting(&self) -> u32 {
+            self.disk().write_behind.snapshot().waiting
+        }
+
+        fn clear_wb(&mut self) {
+            let persistent = self.disk().tier.persistent;
+            self.disk_mut().write_behind = WriteBehind::new(persistent);
         }
 
         fn await_writing(&mut self, msg: &str) {
@@ -6098,12 +6320,10 @@ mod tests {
 
         // 2a. Temporary staging refusal (`ReadWait` held -> `Staged::Busy`).
         let read_wait = s2.disk().acquire_read_wait();
-        assert!(!s2.store.drive_write_behind(&s2.coord, true));
+        assert!(!s2.store.drive_pending_disk_upgrades(&s2.coord, true));
         assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
-        assert!(s2.has_wb(upgraded_id));
         s2.assert_flush_fails_promptly("blocked upgrade");
         assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
-        assert!(s2.has_wb(upgraded_id));
         drop(read_wait);
 
         // 2b. Simulate recoverable writer failure -> `poll_offload` reconciles & re-queues.
@@ -6111,13 +6331,12 @@ mod tests {
         s2.store
             .set_in_flight_upgrade_for_test(upgraded_id, old_copy);
         s2.store.store.set_disk(upgraded_id, None);
-        s2.disk_mut().write_behind.clear();
+        s2.clear_wb();
 
         assert!(s2.store.poll_offload(&s2.coord));
         assert!(s2.store.in_flight_disk_upgrade.is_none());
         assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
         assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
-        assert!(s2.has_wb(upgraded_id));
 
         // 2c. Once cleared, `tick` retries and `flush_to_disk` lands the upgraded window.
         let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
@@ -6349,7 +6568,7 @@ mod tests {
 
         // 2. Reclaiming SSD-backed A credits exact freed RAM bytes (excluding retained lineage).
         let taken_a =
-            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, upgraded_entry));
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, upgraded_entry), &[]);
         assert_eq!(taken_a.outcome, FreeOutcome::Met);
         assert_eq!(taken_a.now_bytes, upgraded_ram);
         {
@@ -6387,7 +6606,7 @@ mod tests {
             (id_b, rt.state_store.store.get(id_b).unwrap().state_bytes())
         };
         let taken_b =
-            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, b_full_bytes));
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, b_full_bytes), &[]);
         assert_eq!(taken_b.outcome, FreeOutcome::Met);
         assert_eq!(taken_b.now_bytes, b_full_bytes);
         assert!(
@@ -6434,8 +6653,7 @@ mod tests {
         let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 81, Some(&packed_dw));
         assert_eq!(upgraded_id, adopted_id);
 
-        let other_id = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 82, None);
-        s2.disk_mut().write_behind.retain(|w| w.id != other_id);
+        let other_id = s2.capture_ord_no_wb(&fx.conv, 2, &tokens_b, 64, 82);
         let other_mark = s2.entry(other_id).mark();
         s2.store.store.use_state(other_mark);
         s2.store.set_ram_cap(1);
@@ -6691,7 +6909,7 @@ mod tests {
 
         let states_before_a = inner.memory_accounts().expect("accounts").states;
         let taken_a =
-            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, full_entry_a));
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, full_entry_a), &[]);
         assert_eq!(taken_a.outcome, FreeOutcome::Met);
         assert_eq!(taken_a.now_bytes, swa_conv_a);
         assert_eq!(
@@ -6748,7 +6966,7 @@ mod tests {
             (id_b, swa_conv, entry.state_bytes())
         };
         let taken_b =
-            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, full_entry_b));
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, full_entry_b), &[]);
         assert_eq!(taken_b.outcome, FreeOutcome::Met);
         assert_eq!(taken_b.now_bytes, swa_conv_b + dw_len);
 
@@ -6788,7 +7006,7 @@ mod tests {
             (id_c, swa_conv, lineage, entry.state_bytes())
         };
         let taken_c =
-            inner.inkling2_take_victim(&patient_query, &store_victim(id_c, 3, full_entry_c));
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_c, 3, full_entry_c), &[]);
         assert_eq!(taken_c.outcome, FreeOutcome::Met);
         assert_eq!(taken_c.now_bytes, swa_conv_c + lineage_c);
 
@@ -6914,7 +7132,7 @@ mod tests {
             local_coord.registered_pool_bytes(),
             swa_conv_a + dw_len + lin_a
         );
-        let taken_a = inner.inkling2_take_victim(&query, &store_victim(id_a, 1, full_a));
+        let taken_a = inner.inkling2_take_victim(&query, &store_victim(id_a, 1, full_a), &[]);
         assert_eq!(
             (taken_a.outcome, taken_a.now_bytes),
             (FreeOutcome::Met, swa_conv_a)
@@ -6942,7 +7160,7 @@ mod tests {
             local_coord.registered_pool_bytes(),
             swa_conv_b + dw_len + lin_b
         );
-        let taken_b = inner.inkling2_take_victim(&query, &store_victim(id_b, 2, full_b));
+        let taken_b = inner.inkling2_take_victim(&query, &store_victim(id_b, 2, full_b), &[]);
         assert_eq!(
             (taken_b.outcome, taken_b.now_bytes),
             (FreeOutcome::Met, swa_conv_b + lin_b)
@@ -6994,7 +7212,6 @@ mod tests {
             s2.store.pending_disk_upgrades.get(&upgraded_id),
             Some(PendingDiskUpgrade::Repair { .. })
         ));
-        assert!(s2.has_wb(upgraded_id));
 
         s2.clear_space_override(false);
         assert!(s2.flush(10));
@@ -7042,8 +7259,7 @@ mod tests {
         let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 99, Some(&packed_dw));
         assert_eq!(upgraded_id, adopted_id);
 
-        let other_id = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 100, None);
-        s2.disk_mut().write_behind.retain(|w| w.id != other_id);
+        let other_id = s2.capture_ord_no_wb(&fx.conv, 2, &tokens_b, 64, 100);
         let other_mark = s2.entry(other_id).mark();
         s2.store.store.use_state(other_mark);
         s2.store.set_ram_cap(1);
@@ -7449,19 +7665,14 @@ mod tests {
                 .expect("capture")
                 .expect("id_a");
             rt.coordinator.release_request_all(1).expect("release");
-            let past = Instant::now()
-                .checked_sub(Duration::from_secs(20))
-                .unwrap_or_else(Instant::now);
             let disk = rt.state_store.disk.as_mut().expect("disk");
-            for w in &mut disk.write_behind {
-                w.published_at = past;
-            }
             disk.tier
                 .manager
                 .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
-            let _ = rt
-                .state_store
-                .tick(&rt.coordinator, Tick::Full { command_pages: 0 });
+            assert_eq!(
+                rt.state_store.persist_entry(&rt.coordinator, id_a, false),
+                PersistStatus::Busy
+            );
             assert!(!rt.state_store.disk.as_ref().expect("disk").writing());
             assert!(rt.state_store.spill_backoff.contains_key(&id_a));
             let entry = rt.state_store.store.get(id_a).expect("id_a");
@@ -7542,31 +7753,36 @@ mod tests {
         let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 201, None);
         assert!(s.store.pending_disk_upgrades.is_empty());
         assert_eq!(s.store.ram_len(), 1);
-        let past_pub = Instant::now()
-            .checked_sub(Duration::from_secs(20))
-            .unwrap_or_else(Instant::now);
-        for w in &mut s.disk_mut().write_behind {
-            w.published_at = past_pub;
-        }
+        assert_eq!(s.wb_waiting(), 1);
 
         s.manager()
             .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
-        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
-        assert!(s.has_wb(id_a));
+        assert_eq!(
+            s.store.persist_entry(&s.coord, id_a, false),
+            PersistStatus::Busy
+        );
+        assert_eq!(s.wb_waiting(), 1);
         assert!(s.store.spill_backoff.contains_key(&id_a));
         assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
 
         s.assert_flush_fails_promptly("transient ordinary refusal");
-        assert!(s.has_wb(id_a));
+        assert_eq!(s.wb_waiting(), 1);
 
         s.clear_space_override(false);
-        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert_eq!(
+            s.store.persist_entry(&s.coord, id_a, false),
+            PersistStatus::Busy,
+            "non-forced persist_entry must respect spill_backoff"
+        );
         assert!(
             !s.disk().writing(),
-            "normal tick must respect spill_backoff"
+            "normal persist_entry must respect spill_backoff"
         );
         s.expire_backoff(id_a);
-        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert_eq!(
+            s.store.persist_entry(&s.coord, id_a, false),
+            PersistStatus::Started
+        );
         assert!(s.disk().writing() || s.entry(id_a).disk().is_some());
         assert!(s.flush(10));
         assert!(!s.store.spill_backoff.contains_key(&id_a));
@@ -7589,7 +7805,7 @@ mod tests {
             (1..=2).contains(&failures_delta) && enqueued_delta <= 3,
             "failures_delta={failures_delta}, enqueued_delta={enqueued_delta}"
         );
-        assert!(s.has_wb(id_b));
+        assert_eq!(s.wb_waiting(), 1);
         assert!(s.store.spill_backoff.contains_key(&id_b));
 
         s.clear_space_override(true);
@@ -7606,7 +7822,7 @@ mod tests {
         let t2 = Instant::now();
         assert!(s_tiny.flush(3));
         assert!(t2.elapsed() < Duration::from_millis(500));
-        assert!(s_tiny.disk().write_behind.is_empty());
+        assert_eq!(s_tiny.wb_waiting(), 0);
         assert!(s_tiny.entry(id_c).ram().is_some() && s_tiny.entry(id_c).disk().is_none());
         assert!(s_tiny.close());
     }
@@ -7855,7 +8071,7 @@ mod tests {
 
         // Part 1: `gone` in `chain_step` (`offload_failures == 0`, hot KV resident).
         let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 931, None);
-        s.disk_mut().write_behind.clear();
+        s.clear_wb();
         assert!(s.stage(id_a));
         s.await_writing("landing A");
         let copy_a = s.disk_copy(id_a);
@@ -7868,7 +8084,7 @@ mod tests {
         assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
         assert!(s.store.spill_backoff.contains_key(&id_a));
         assert!(s.store.recent_failed_spills.contains(&id_a));
-        assert!(s.has_wb(id_a));
+        assert_eq!(s.wb_waiting(), 1);
 
         s.manager()
             .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
@@ -7888,7 +8104,7 @@ mod tests {
 
         // Part 2: `lost` in `chain_step` (KV missing from both tiers).
         let id_b = s.capture_ord(&fx.conv, 2, &tokens_b, 64, 932, None);
-        s.disk_mut().write_behind.clear();
+        s.clear_wb();
         assert!(s.stage(id_b));
         s.await_writing("landing B");
         assert!(
@@ -7899,7 +8115,7 @@ mod tests {
 
         s.coord.release_all_and_purge().expect("purge hot B");
         s.assert_flush_fails_promptly("lost chain");
-        assert!(!s.has_wb(id_b));
+        assert_eq!(s.wb_waiting(), 0);
         assert!(s.entry(id_b).ram().is_some() && s.entry(id_b).disk().is_none());
         assert!(s.close());
 
@@ -7914,7 +8130,7 @@ mod tests {
         st.store.set_ram_cap(16);
 
         let id_c = st.capture_ord(&fx.conv, 1, &tokens_c, 64, 933, None);
-        st.disk_mut().write_behind.clear();
+        st.clear_wb();
         assert!(st.stage(id_c));
         st.await_writing("landing C");
         let copy_c = st.disk_copy(id_c);
@@ -7949,7 +8165,7 @@ mod tests {
         assert!(st.entry(id_c).ram().is_some() && st.entry(id_c).disk().is_none());
         assert!(st.store.spill_backoff.contains_key(&id_c));
         assert!(st.store.recent_failed_spills.contains(&id_c));
-        assert!(st.has_wb(id_c));
+        assert_eq!(st.wb_waiting(), 1);
         let _ = st.close();
     }
 
@@ -8035,9 +8251,8 @@ mod tests {
             ..ChatConfig::default()
         };
 
-        // Enable low write-behind threshold/delay so StateDisk persists promptly during the test.
-        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
-        WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(Some(0.0)));
+        // Shared WriteBehind uses `MINIMUM_TOKENS = 32` under `#[cfg(test)]` and `flush_to_disk`
+        // flushes regardless of the 10s delay.
 
         // =====================================================================
         // Phase 1: Fresh cold baseline (no reuse) on real model
@@ -8445,8 +8660,6 @@ mod tests {
         let _ = Inkling2LoadOptions::default();
         drop(sched2);
         let _ = std::fs::remove_dir_all(&temp_root);
-        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
-        WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(None));
     }
 
     #[test]
@@ -8831,7 +9044,7 @@ mod tests {
 
         // Spill A to the temporary SSD tier, drop RAM, and evict one of its Global KV blocks.
         let id_a = s.capture_ord(&fx.conv, 1, &toks_a, 64, 951, Some(&dw));
-        s.disk_mut().write_behind.clear();
+        s.clear_wb();
         assert!(s.stage(id_a));
         s.await_landed(id_a, "initial temporary-tier spill of A");
         assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
@@ -8840,10 +9053,10 @@ mod tests {
         s.evict_kv_block(id_a, 0);
         assert!(!s.disk().entry_disk_restorable(s.entry(id_a)));
 
-        // Publish unrelated ordinary anchor B first (below `ram_cap`) so B sits ahead of A in
+        // Publish unrelated ordinary anchor B first (below `ram_cap`) so B sits in
         // `write_behind`, then recapture A into RAM (below `ram_cap`, queuing `Repair`).
         let id_b = s.capture_ord(&fx.conv, 2, &toks_b, 64, 952, Some(&dw));
-        assert!(s.entry(id_b).disk().is_none() && s.has_wb(id_b));
+        assert!(s.entry(id_b).disk().is_none() && s.wb_waiting() == 1);
         assert!(!s.store.pending_disk_upgrades.contains_key(&id_b));
 
         let got_a = s.capture_ord(&fx.conv, 1, &toks_a, 64, 951, Some(&dw));
@@ -8853,7 +9066,6 @@ mod tests {
             Some(PendingDiskUpgrade::Repair { .. })
         ));
         assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
-        assert!(s.has_wb(id_a));
 
         // Drive normal scheduler ticks (`Tick::Full`, `force = false`) until A's repair finishes.
         let dl = test_deadline(10);
@@ -8884,5 +9096,416 @@ mod tests {
         s.drop_ram_and_purge();
         s.assert_ssd_restores(&query_a, 951, Some(id_a), Some(&dw));
         assert!(s.close());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_host_budget_excludes_mlx_conv_and_trims_to_ram_cap() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+
+        let cfg = tiny_inkling2_config();
+        let paged_cfg = Inkling2PagedConfig::default_for_config(&cfg)
+            .with_kv_format(KvFormat::Int8)
+            .with_max_model_len(512)
+            .with_max_concurrent_sequences(8);
+        let recency = Arc::new(CacheRecency::new());
+        let mut coord = Inkling2KVCacheCoordinator::new_for_config_with_recency(
+            &cfg,
+            paged_cfg,
+            Arc::clone(&recency),
+        )
+        .expect("coord");
+
+        let geom = Inkling2StateGeometry::from_coordinator(&cfg, &coord).unwrap();
+        let local_limit = Arc::new(CacheLimitCoordinator::new_for_test());
+        let mut store = Inkling2StateStore::new(coord.block_size(), Arc::clone(&recency));
+        store.set_geometry(geom.clone());
+        store.attach_host_budget_to(Arc::clone(&local_limit));
+        store.set_ram_cap(2);
+
+        let conv = Inkling2ShortConvState::new(
+            cfg.num_layer_visits(),
+            cfg.sconv_kernel_size,
+            cfg.num_key_value_heads * cfg.head_dim,
+            cfg.hidden_size,
+            DType::BFloat16,
+        )
+        .expect("conv");
+
+        // 1. Insert 1 Checkpoint and verify HostPool matches host_resident_bytes exactly
+        //    (flat host-packed `swa_data + conv_data + lineage`, zero live MLX arrays retained).
+        let seq_tokens = |seed: u32| -> Vec<u32> { (0..32u32).map(|i| seed * 100 + i).collect() };
+        let t_cp = seq_tokens(1);
+        coord.reset_scheduled_request(1).unwrap();
+        coord.record_tokens_all(1, &t_cp).unwrap();
+        let cp_id = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                1,
+                &t_cp,
+                32,
+                0,
+                StateClass::Checkpoint,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let expected_host = store.host_resident_bytes();
+        assert_eq!(
+            local_limit.registered_pool_bytes(),
+            expected_host,
+            "HostPool must match host_resident_bytes exactly"
+        );
+        assert_eq!(
+            store.total_ram_bytes(),
+            expected_host,
+            "flat host-packed anchor bytes must equal host_resident_bytes exactly"
+        );
+
+        // 2. RAM-only Tier 1 (Checkpoint first) & Tier 4 (strict ram_cap = 2 without disk).
+        let t_o1 = seq_tokens(2);
+        coord.reset_scheduled_request(2).unwrap();
+        coord.record_tokens_all(2, &t_o1).unwrap();
+        let o1 = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                2,
+                &t_o1,
+                32,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.ram_len(), 2);
+
+        let t_o2 = seq_tokens(3);
+        coord.reset_scheduled_request(3).unwrap();
+        coord.record_tokens_all(3, &t_o2).unwrap();
+        let o2 = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                3,
+                &t_o2,
+                32,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.ram_len(), 2, "Tier 1 must retire Checkpoint first");
+        assert!(store.store.get(cp_id).is_none(), "Checkpoint retired first");
+        assert!(store.store.get(o1).is_some() && store.store.get(o2).is_some());
+
+        // Inserting a 3rd Ordinary without disk enforces strict `ram_cap = 2` (Tier 4 erases LRU o1).
+        let t_o3 = seq_tokens(4);
+        coord.reset_scheduled_request(4).unwrap();
+        coord.record_tokens_all(4, &t_o3).unwrap();
+        let o3 = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                4,
+                &t_o3,
+                32,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.ram_len(), 2);
+        assert!(
+            store.store.get(o1).is_none(),
+            "Tier 4 erases LRU Ordinary without disk"
+        );
+        assert!(store.store.get(o2).is_some() && store.store.get(o3).is_some());
+        assert_eq!(
+            local_limit.registered_pool_bytes(),
+            store.host_resident_bytes()
+        );
+
+        // 3. Attach StateDisk and verify Tier 2 (drop RAM on durable SSD), Tier 3 (stage Ordinary
+        //    keeping bounded slack <= ram_cap + 2), and Tier 4 (erase past ram_cap + 2).
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-ram-cap-trim-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(512u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+        let pid = compute_path_identity(&temp_root, &cfg, &coord, &geom, Some(1024), None);
+        let (ctx, disk) = open_inkling2_state_disk(&cfg, &coord, None, &disk_opts, move || pid, 0)
+            .expect("open disk");
+        coord.set_full_cold_tier(ctx);
+        store.disk = Some(disk);
+
+        // `o2` and `o3` were captured before `store.disk` was attached; record them into
+        // `write_behind` now and flush to SSD so both have durable disk copies.
+        if let Some(d) = store.disk.as_mut() {
+            let writable = d.writable();
+            let persistent = d.tier.persistent;
+            d.write_behind
+                .record_published(&store.store, writable, persistent, o2, 32, 0.0, false);
+            d.write_behind
+                .record_published(&store.store, writable, persistent, o3, 32, 0.0, false);
+        }
+        assert!(store.flush_to_disk(&coord, Instant::now() + Duration::from_secs(10)));
+        assert!(
+            store
+                .store
+                .get(o2)
+                .unwrap()
+                .disk()
+                .is_some_and(|d| d.landed && !d.chain_owed)
+        );
+
+        // Insert o4: exceeds ram_cap=2 -> Tier 2 drops RAM on durable LRU o2 (keeps SSD copy!).
+        let t_o4 = seq_tokens(5);
+        coord.reset_scheduled_request(5).unwrap();
+        coord.record_tokens_all(5, &t_o4).unwrap();
+        let _o4 = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                5,
+                &t_o4,
+                32,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.ram_len(), 2);
+        assert!(
+            store
+                .store
+                .get(o2)
+                .is_some_and(|e| e.ram().is_none() && e.disk().is_some()),
+            "Tier 2 must drop RAM on durable SSD Ordinary while keeping disk copy"
+        );
+        // Drop o3 RAM too by inserting o5 (o3 is durable).
+        let t_o5 = seq_tokens(6);
+        coord.reset_scheduled_request(6).unwrap();
+        coord.record_tokens_all(6, &t_o5).unwrap();
+        let _o5 = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                6,
+                &t_o5,
+                32,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.ram_len(), 2);
+
+        // Hold staging so writes stall (testing Tier 3 / Tier 4 bounded slack `ram_cap + 2 = 4`):
+        let held_staging = store.disk.as_mut().unwrap().engine.staging.take();
+        for seed in 7..12u32 {
+            let t = seq_tokens(seed);
+            let s = seed;
+            coord.reset_scheduled_request(s).unwrap();
+            coord.record_tokens_all(s, &t).unwrap();
+            let _ = store
+                .capture_boundary(&mut coord, &conv, s, &t, 32, 0, StateClass::Ordinary, None)
+                .unwrap()
+                .unwrap();
+            assert!(
+                store.ram_len() <= 4,
+                "Tier 4 must enforce bounded slack ram_cap + 2 = 4 while writes stall, got {}",
+                store.ram_len()
+            );
+        }
+        store.disk.as_mut().unwrap().engine.staging = held_staging;
+
+        // Dropping store must unregister host budget back to 0.
+        drop(store);
+        assert_eq!(local_limit.registered_pool_bytes(), 0);
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn keep_prev_checkpoint_preserves_rolling_checkpoint_below_junction_and_retires_on_deeper_checkpoint()
+     {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+
+        let cfg = tiny_inkling2_config();
+        let paged_cfg = Inkling2PagedConfig::default_for_config(&cfg)
+            .with_kv_format(KvFormat::Int8)
+            .with_max_model_len(256)
+            .with_max_concurrent_sequences(2);
+        let recency = Arc::new(CacheRecency::new());
+        let mut coord = Inkling2KVCacheCoordinator::new_for_config_with_recency(
+            &cfg,
+            paged_cfg,
+            Arc::clone(&recency),
+        )
+        .expect("coord");
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-keep-prev-cp-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(64u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+        let geom = Inkling2StateGeometry::from_coordinator(&cfg, &coord).unwrap();
+        let pid = compute_path_identity(&temp_root, &cfg, &coord, &geom, Some(1024), None);
+        let (ctx, disk) = open_inkling2_state_disk(&cfg, &coord, None, &disk_opts, move || pid, 0)
+            .expect("open disk");
+        coord.set_full_cold_tier(ctx);
+
+        let mut store = Inkling2StateStore::new(coord.block_size(), recency);
+        store.set_geometry(geom);
+        store.disk = Some(disk);
+        let conv = Inkling2ShortConvState::new(
+            cfg.num_layer_visits(),
+            cfg.sconv_kernel_size,
+            cfg.num_key_value_heads * cfg.head_dim,
+            cfg.hidden_size,
+            DType::BFloat16,
+        )
+        .expect("conv");
+
+        let tokens_a: Vec<u32> = (1000u32..1160u32).collect();
+        coord.reset_scheduled_request(1).unwrap();
+        coord.record_tokens_all(1, &tokens_a).unwrap();
+
+        // 1. Publish rolling Checkpoint at block 2 (64 tokens), then Ordinary prompt junction at
+        //    block 4 (128 tokens) with `keep_prev_checkpoint = true`: 64 must stay cached as
+        //    disposable Checkpoint and NOT be queued in write_behind!
+        let cp64 = store
+            .capture_boundary_with_options(
+                &mut coord,
+                &conv,
+                1,
+                &tokens_a,
+                64,
+                0,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: false,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let ord128 = store
+            .capture_boundary_with_options(
+                &mut coord,
+                &conv,
+                1,
+                &tokens_a,
+                128,
+                0,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            store.store.get(cp64).is_some_and(|e| e.checkpoint()),
+            "rolling checkpoint below prompt junction must remain cached as Checkpoint"
+        );
+        assert!(
+            store.store.get(ord128).is_some_and(|e| !e.checkpoint()),
+            "prompt junction must be cached as Ordinary"
+        );
+        assert_eq!(
+            store.disk.as_ref().unwrap().write_behind.snapshot().waiting,
+            1,
+            "only Ordinary junction (not disposable Checkpoint) enters write_behind"
+        );
+
+        // Second prompt sharing first 96 tokens (diverging before 128) resumes at 64!
+        let mut tokens_b = tokens_a[..96].to_vec();
+        tokens_b.extend(9000u32..9040u32);
+        let hit = store
+            .lookup_deepest_restorable(&coord, &tokens_b, 0)
+            .expect("diverging prompt must hit kept checkpoint");
+        assert_eq!(hit.id, cp64);
+        assert_eq!(hit.depth, 64);
+
+        // 2. On a fresh sequence, a deeper rolling Checkpoint (`keep_prev_checkpoint = false`)
+        //    DOES retire the earlier rolling Checkpoint.
+        let tokens_c: Vec<u32> = (2000u32..2160u32).collect();
+        coord.reset_scheduled_request(2).unwrap();
+        coord.record_tokens_all(2, &tokens_c).unwrap();
+        let cp_old = store
+            .capture_boundary_with_options(
+                &mut coord,
+                &conv,
+                2,
+                &tokens_c,
+                64,
+                0,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: false,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let cp_new = store
+            .capture_boundary_with_options(
+                &mut coord,
+                &conv,
+                2,
+                &tokens_c,
+                128,
+                0,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: false,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(
+            store.store.get(cp_old).is_none(),
+            "deeper rolling Checkpoint must retire prior rolling Checkpoint"
+        );
+        assert!(store.store.get(cp_new).is_some_and(|e| e.checkpoint()));
+
+        let _ = store.close_cache(&coord, Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
     }
 }

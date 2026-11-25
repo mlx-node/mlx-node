@@ -27,6 +27,18 @@ struct GdnPrefillParams {
   float qk_eps;
 };
 
+struct GdnPrefillConvParams {
+  int T;
+  int hk;
+  int hv;
+  int has_history;
+  int qkv_stride_t;
+  int hist_stride_r;
+  int a_stride_t;
+  int b_stride_t;
+  float qk_eps;
+};
+
 template <typename T>
 inline T gdn_prefill_sigmoid(T x) {
   auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
@@ -134,6 +146,152 @@ inline void gdn_prefill_prologue_body(
 GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue, float)
 GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue_bf16_scalars, bfloat16_t)
 
+// Fused 4-tap depthwise conv1d + SiLU + q/k RMSNorm + decay/beta gates +
+// conv_state carry. Preserves `conv1d_silu_k4.metal.inc` and
+// `mlx_node_gdn_prefill_prologue` arithmetic bit for bit.
+template <typename ScalarT>
+inline void gdn_prefill_prologue_conv_body(
+    const device bfloat16_t* qkv,
+    const device float* conv_w,
+    const device bfloat16_t* history,
+    const device bfloat16_t* a,
+    const device bfloat16_t* b,
+    const device ScalarT* a_log,
+    const device ScalarT* dt_bias,
+    const device bfloat16_t* wq,
+    const device bfloat16_t* wk,
+    device bfloat16_t* qn,
+    device bfloat16_t* kn,
+    device bfloat16_t* v_out,
+    device float* g,
+    device bfloat16_t* beta,
+    device bfloat16_t* history_out,
+    constant GdnPrefillConvParams& p,
+    uint gid,
+    uint lane) {
+  const uint T = uint(p.T);
+  const uint Hk = uint(p.hk);
+  const uint Hv = uint(p.hv);
+  const uint num_vecs = 2 * Hk + Hv;
+  const uint W = num_vecs * kGdnDk;
+  const uint task = gid / 32;
+  if (task < num_vecs * T) {
+    // `vec` outer, `t` inner so adjacent simdgroups in a threadgroup share the
+    // same 4-tap filter weights in L1 across consecutive tokens.
+    const uint vec = task / T;
+    const uint t = task % T;
+    bfloat16_t acts[kGdnPerLane];
+    for (int i = 0; i < kGdnPerLane; ++i) {
+      const uint s_idx = kGdnPerLane * lane + i;
+      const uint ch = vec * kGdnDk + s_idx;
+      float total = 0.0f;
+      {
+        #pragma clang fp contract(off)
+        #pragma clang fp reassociate(off)
+        for (uint tap = 0; tap < 4u; ++tap) {
+          const uint row = t + tap;
+          const bfloat16_t tap_val = (row < 3u)
+              ? (p.has_history
+                     ? history[ulong(row) * ulong(uint(p.hist_stride_r)) +
+                               ulong(ch)]
+                     : static_cast<bfloat16_t>(0.0f))
+              : qkv[ulong(row - 3u) * ulong(uint(p.qkv_stride_t)) + ulong(ch)];
+          const float product = static_cast<float>(tap_val) *
+              conv_w[ulong(ch) * ulong(4) + ulong(tap)];
+          total = product + total;
+        }
+      }
+      const bfloat16_t raw = static_cast<bfloat16_t>(total);
+      acts[i] = raw * gdn_prefill_sigmoid(raw);
+      if (t == 0u) {
+        for (uint row = 0; row < 3u; ++row) {
+          const uint source = T + row;
+          history_out[ulong(row) * ulong(W) + ulong(ch)] = (source < 3u)
+              ? (p.has_history
+                     ? history[ulong(source) * ulong(uint(p.hist_stride_r)) +
+                               ulong(ch)]
+                     : static_cast<bfloat16_t>(0.0f))
+              : qkv[ulong(source - 3u) * ulong(uint(p.qkv_stride_t)) +
+                    ulong(ch)];
+        }
+      }
+    }
+    if (vec < 2 * Hk) {
+      float fx[kGdnPerLane];
+      float acc = 0.0f;
+      for (int i = 0; i < kGdnPerLane; ++i) {
+        fx[i] = static_cast<float>(acts[i]);
+        acc += fx[i] * fx[i];
+      }
+      acc = simd_sum(acc);
+      acc = simd_sum(lane == 0 ? acc : 0.0f);
+      const float inv = metal::precise::rsqrt(acc / float(kGdnDk) + p.qk_eps);
+      const bool is_q = vec < Hk;
+      const device bfloat16_t* wt = (is_q ? wq : wk) + lane * 4;
+      const uint kh = is_q ? vec : (vec - Hk);
+      device bfloat16_t* dst = (is_q ? qn : kn) +
+          (ulong(t) * ulong(Hk) + ulong(kh)) * ulong(kGdnDk);
+      for (int i = 0; i < kGdnPerLane; ++i) {
+        const uint s_idx = kGdnPerLane * lane + i;
+        dst[s_idx] = wt[i] * static_cast<bfloat16_t>(fx[i] * inv);
+      }
+    } else {
+      const uint vh = vec - 2 * Hk;
+      device bfloat16_t* dst =
+          v_out + (ulong(t) * ulong(Hv) + ulong(vh)) * ulong(kGdnDv);
+      for (int i = 0; i < kGdnPerLane; ++i) {
+        const uint s_idx = kGdnPerLane * lane + i;
+        dst[s_idx] = acts[i];
+      }
+    }
+  }
+  if (gid < T * Hv) {
+    const uint t = gid / Hv;
+    const uint hv_idx = gid % Hv;
+    float b_val = static_cast<float>(
+        b[ulong(t) * ulong(uint(p.b_stride_t)) + ulong(hv_idx)]);
+    float beta_val = 1.0f / (1.0f + exp(-b_val));
+    float a_val = static_cast<float>(
+        a[ulong(t) * ulong(uint(p.a_stride_t)) + ulong(hv_idx)]);
+    float a_log_val = static_cast<float>(a_log[hv_idx]);
+    float dt_bias_val = static_cast<float>(dt_bias[hv_idx]);
+    float sp_input = a_val + dt_bias_val;
+    float softplus_val =
+        (sp_input > 20.0f) ? sp_input : log(1.0f + exp(sp_input));
+    g[gid] = exp(-exp(a_log_val) * softplus_val);
+    beta[gid] = static_cast<bfloat16_t>(beta_val);
+  }
+}
+
+#define GDN_PREFILL_PROLOGUE_CONV(name, ScalarT)                              \
+  [[kernel]] void name(                                                       \
+      const device bfloat16_t* qkv [[buffer(0)]],                             \
+      const device float* conv_w [[buffer(1)]],                               \
+      const device bfloat16_t* history [[buffer(2)]],                         \
+      const device bfloat16_t* a [[buffer(3)]],                               \
+      const device bfloat16_t* b [[buffer(4)]],                               \
+      const device ScalarT* a_log [[buffer(5)]],                              \
+      const device ScalarT* dt_bias [[buffer(6)]],                            \
+      const device bfloat16_t* wq [[buffer(7)]],                              \
+      const device bfloat16_t* wk [[buffer(8)]],                              \
+      device bfloat16_t* qn [[buffer(9)]],                                    \
+      device bfloat16_t* kn [[buffer(10)]],                                   \
+      device bfloat16_t* v_out [[buffer(11)]],                                \
+      device float* g [[buffer(12)]],                                         \
+      device bfloat16_t* beta [[buffer(13)]],                                 \
+      device bfloat16_t* history_out [[buffer(14)]],                          \
+      constant GdnPrefillConvParams& p [[buffer(15)]],                        \
+      uint gid [[thread_position_in_grid]],                                   \
+      uint lane [[thread_index_in_simdgroup]]) {                              \
+    gdn_prefill_prologue_conv_body<ScalarT>(                                  \
+        qkv, conv_w, history, a, b, a_log, dt_bias, wq, wk, qn, kn, v_out, g, \
+        beta, history_out, p, gid, lane);                                     \
+  }
+
+GDN_PREFILL_PROLOGUE_CONV(mlx_node_gdn_prefill_prologue_conv, float)
+GDN_PREFILL_PROLOGUE_CONV(
+    mlx_node_gdn_prefill_prologue_conv_bf16_scalars, bfloat16_t)
+
 [[kernel]] void mlx_node_gdn_prefill_scan(
     const device bfloat16_t* qn [[buffer(0)]],
     const device bfloat16_t* kn [[buffer(1)]],
@@ -151,13 +309,21 @@ GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue_bf16_scalars, bfloat16_t)
   constexpr uint Rows = kGdnScanRows;
   constexpr uint Threads = kGdnScanThreads;
   constexpr uint Block = kGdnScanBlock;
-  constexpr uint QK4 = Block * kGdnDk / (4 * Threads);
+  constexpr uint Columns = 16;
+  constexpr uint LanesPerRow = kGdnDk / Columns;
   constexpr uint GroupsPerHead = kGdnDv / Rows;
-  static_assert(QK4 * 4 * Threads == Block * kGdnDk, "q/k block per thread");
-  static_assert(Block * Rows <= 4 * Threads, "value block per thread");
-  threadgroup bfloat16_t k_sh[Block * kGdnDk];
-  threadgroup bfloat16_t q_sh[Block * kGdnDk];
-  threadgroup float v_sh[Block * Rows];
+  static_assert(Rows == (Threads / 32) * (32 / LanesPerRow),
+                "simdgroups cover threadgroup state rows");
+  static_assert(Block * kGdnDk == Threads * 16,
+                "every thread stages 16 keys and 16 queries");
+  static_assert(Block * Rows == 32 * 8,
+                "first simdgroup stages the value block");
+
+  // 17,536 B threadgroup staging: pre-widened float4 k/q (16 KiB), float4 v
+  // (1 KiB), and scalar gates (128 B).
+  threadgroup float4 k_sh[Block * (kGdnDk / 4)];
+  threadgroup float4 q_sh[Block * (kGdnDk / 4)];
+  threadgroup float4 v_sh[Block * (Rows / 4)];
   threadgroup float g_sh[Block];
   threadgroup float beta_sh[Block];
 
@@ -166,91 +332,90 @@ GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue_bf16_scalars, bfloat16_t)
   const uint Hv = uint(p.hv);
   const uint hv_idx = group / GroupsPerHead;
   const uint row_base = (group % GroupsPerHead) * Rows;
-  const uint hk_idx = p.tiled ? hv_idx % Hk : hv_idx / (Hv / Hk);
+  const uint hk_idx = p.tiled ? (hv_idx % Hk) : (hv_idx / (Hv / Hk));
 
-  const uint dv_A = row_base + 4 * sg;
-  const uint dv_B = dv_A + 1;
-  const uint dv_C = dv_A + 2;
-  const uint dv_D = dv_A + 3;
-  const device float* i_state_A = state_in + (hv_idx * kGdnDv + dv_A) * kGdnDk;
-  const device float* i_state_B = state_in + (hv_idx * kGdnDv + dv_B) * kGdnDk;
-  const device float* i_state_C = state_in + (hv_idx * kGdnDv + dv_C) * kGdnDk;
-  const device float* i_state_D = state_in + (hv_idx * kGdnDv + dv_D) * kGdnDk;
-  device float* o_state_A = state_out + (hv_idx * kGdnDv + dv_A) * kGdnDk;
-  device float* o_state_B = state_out + (hv_idx * kGdnDv + dv_B) * kGdnDk;
-  device float* o_state_C = state_out + (hv_idx * kGdnDv + dv_C) * kGdnDk;
-  device float* o_state_D = state_out + (hv_idx * kGdnDv + dv_D) * kGdnDk;
+  // 8 lanes per row, 4 rows per simdgroup: lane q owns contiguous columns
+  // [q*16 .. q*16+15], matching 4 old 32-lane chunks so (s0+s1)+(s2+s3) plus
+  // 3 xor shuffles reproduces AGX 32-lane simd_sum bit for bit.
+  const uint row = sg * 4 + (lane >> 3);
+  const uint q = lane & 7u;
+  const uint col_base = q * Columns;
+  const ulong state_offset =
+      (ulong(hv_idx) * ulong(kGdnDv) + ulong(row_base + row)) * ulong(kGdnDk) +
+      ulong(col_base);
 
-  float state_A[kGdnPerLane];
-  float state_B[kGdnPerLane];
-  float state_C[kGdnPerLane];
-  float state_D[kGdnPerLane];
-  for (int i = 0; i < kGdnPerLane; ++i) {
-    const int s_idx = kGdnPerLane * lane + i;
-    state_A[i] = p.has_state ? i_state_A[s_idx] : 0.0f;
-    state_B[i] = p.has_state ? i_state_B[s_idx] : 0.0f;
-    state_C[i] = p.has_state ? i_state_C[s_idx] : 0.0f;
-    state_D[i] = p.has_state ? i_state_D[s_idx] : 0.0f;
-  }
-
-  bfloat16_t k_fetch[QK4][4];
-  bfloat16_t q_fetch[QK4][4];
-  bfloat16_t v_fetch[4];
-  float g_fetch = 0.0f;
-  bfloat16_t beta_fetch = static_cast<bfloat16_t>(0.0f);
-  for (uint n = 0; n < QK4; ++n) {
-    for (uint j = 0; j < 4; ++j) {
-      k_fetch[n][j] = static_cast<bfloat16_t>(0.0f);
-      q_fetch[n][j] = static_cast<bfloat16_t>(0.0f);
+  float4 state[4];
+  if (p.has_state != 0) {
+    const device float4* st_in =
+        reinterpret_cast<const device float4*>(state_in + state_offset);
+    #pragma unroll
+    for (uint c = 0; c < 4; ++c) {
+      state[c] = st_in[c];
+    }
+  } else {
+    #pragma unroll
+    for (uint c = 0; c < 4; ++c) {
+      state[c] = float4(0.0f);
     }
   }
-  for (uint j = 0; j < 4; ++j) {
-    v_fetch[j] = static_cast<bfloat16_t>(0.0f);
-  }
+
+  bfloat4 key_fetch[2][2] = {};
+  bfloat4 query_fetch[2][2] = {};
+  bfloat4 value_fetch[2] = {};
+  float g_fetch = 0.0f;
+  float beta_fetch = 0.0f;
+
   auto fetch = [&](uint start) {
-    for (uint n = 0; n < QK4; ++n) {
-      const uint e = (n * Threads + tid) * 4;
-      const uint token = start + e / kGdnDk;
+    for (uint n = 0; n < 2; ++n) {
+      const uint element = (n * Threads + tid) * 8;
+      const uint token = start + element / kGdnDk;
       if (token < T) {
-        const uint base = (token * Hk + hk_idx) * kGdnDk + e % kGdnDk;
-        for (uint j = 0; j < 4; ++j) {
-          k_fetch[n][j] = kn[base + j];
-          q_fetch[n][j] = qn[base + j];
-        }
+        const ulong base =
+            (ulong(token) * ulong(Hk) + ulong(hk_idx)) * ulong(kGdnDk) +
+            ulong(element % kGdnDk);
+        const device bfloat4* kp =
+            reinterpret_cast<const device bfloat4*>(kn + base);
+        const device bfloat4* qp =
+            reinterpret_cast<const device bfloat4*>(qn + base);
+        key_fetch[n][0] = kp[0];
+        key_fetch[n][1] = kp[1];
+        query_fetch[n][0] = qp[0];
+        query_fetch[n][1] = qp[1];
       }
     }
-    if (tid * 4 < Block * Rows) {
-      const uint e = tid * 4;
-      const uint token = start + e / Rows;
+    if (tid < 32u) {
+      const uint element = tid * 8;
+      const uint token = start + element / Rows;
       if (token < T) {
-        const uint base =
-            token * uint(p.v_stride_t) + hv_idx * kGdnDv + row_base + e % Rows;
-        for (uint j = 0; j < 4; ++j) {
-          v_fetch[j] = v[base + j];
-        }
+        const ulong base = ulong(token) * ulong(uint(p.v_stride_t)) +
+            ulong(hv_idx * kGdnDv + row_base + (element % Rows));
+        const device bfloat4* vp =
+            reinterpret_cast<const device bfloat4*>(v + base);
+        value_fetch[0] = vp[0];
+        value_fetch[1] = vp[1];
       }
     }
     if (tid < Block && start + tid < T) {
-      g_fetch = g[(start + tid) * Hv + hv_idx];
-      beta_fetch = beta[(start + tid) * Hv + hv_idx];
+      const ulong gate_idx = ulong(start + tid) * ulong(Hv) + ulong(hv_idx);
+      g_fetch = g[gate_idx];
+      beta_fetch = static_cast<float>(beta[gate_idx]);
     }
   };
   auto stage = [&]() {
-    for (uint n = 0; n < QK4; ++n) {
-      const uint e = (n * Threads + tid) * 4;
-      for (uint j = 0; j < 4; ++j) {
-        k_sh[e + j] = k_fetch[n][j];
-        q_sh[e + j] = q_fetch[n][j];
-      }
+    for (uint n = 0; n < 2; ++n) {
+      const uint idx4 = (n * Threads + tid) * 2;
+      k_sh[idx4 + 0] = float4(key_fetch[n][0]);
+      k_sh[idx4 + 1] = float4(key_fetch[n][1]);
+      q_sh[idx4 + 0] = float4(query_fetch[n][0]);
+      q_sh[idx4 + 1] = float4(query_fetch[n][1]);
     }
-    if (tid * 4 < Block * Rows) {
-      for (uint j = 0; j < 4; ++j) {
-        v_sh[tid * 4 + j] = static_cast<float>(v_fetch[j]);
-      }
+    if (tid < 32u) {
+      v_sh[tid * 2 + 0] = float4(value_fetch[0]);
+      v_sh[tid * 2 + 1] = float4(value_fetch[1]);
     }
     if (tid < Block) {
       g_sh[tid] = g_fetch;
-      beta_sh[tid] = static_cast<float>(beta_fetch);
+      beta_sh[tid] = beta_fetch;
     }
   };
 
@@ -263,60 +428,82 @@ GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue_bf16_scalars, bfloat16_t)
       fetch(start + Block);
     }
     const uint count = min(Block, T - start);
-    for (uint t = 0; t < count; ++t) {
-      const float g_val = g_sh[t];
-      const float beta_val = beta_sh[t];
-      const threadgroup bfloat16_t* k_ = k_sh + t * kGdnDk;
-      const threadgroup bfloat16_t* q_ = q_sh + t * kGdnDk;
-      const threadgroup float* v_row = v_sh + t * Rows + 4 * sg;
+    for (uint j = 0; j < count; ++j) {
+      const float decay = g_sh[j];
+      const float bt = beta_sh[j];
+      const float val =
+          reinterpret_cast<const threadgroup float*>(v_sh)[j * Rows + row];
+      const threadgroup float4* key_ptr = k_sh + j * (kGdnDk / 4) + q * 4;
+      const float4 key[4] = {key_ptr[0], key_ptr[1], key_ptr[2], key_ptr[3]};
 
-      float kv_mem_A = 0.0f, kv_mem_B = 0.0f, kv_mem_C = 0.0f, kv_mem_D = 0.0f;
-      for (int i = 0; i < kGdnPerLane; ++i) {
-        const int s_idx = kGdnPerLane * lane + i;
-        state_A[i] = state_A[i] * g_val;
-        state_B[i] = state_B[i] * g_val;
-        state_C[i] = state_C[i] * g_val;
-        state_D[i] = state_D[i] * g_val;
-        const float k_val = static_cast<float>(k_[s_idx]);
-        kv_mem_A += state_A[i] * k_val;
-        kv_mem_B += state_B[i] * k_val;
-        kv_mem_C += state_C[i] * k_val;
-        kv_mem_D += state_D[i] * k_val;
+      #pragma unroll
+      for (uint c = 0; c < 4; ++c) {
+        state[c] *= decay;
       }
-      kv_mem_A = simd_sum(kv_mem_A);
-      kv_mem_B = simd_sum(kv_mem_B);
-      kv_mem_C = simd_sum(kv_mem_C);
-      kv_mem_D = simd_sum(kv_mem_D);
 
-      const float delta_A = (v_row[0] - kv_mem_A) * beta_val;
-      const float delta_B = (v_row[1] - kv_mem_B) * beta_val;
-      const float delta_C = (v_row[2] - kv_mem_C) * beta_val;
-      const float delta_D = (v_row[3] - kv_mem_D) * beta_val;
-
-      float out_A = 0.0f, out_B = 0.0f, out_C = 0.0f, out_D = 0.0f;
-      for (int i = 0; i < kGdnPerLane; ++i) {
-        const int s_idx = kGdnPerLane * lane + i;
-        const float k_val = static_cast<float>(k_[s_idx]);
-        const float q_val = static_cast<float>(q_[s_idx]);
-        state_A[i] = state_A[i] + k_val * delta_A;
-        state_B[i] = state_B[i] + k_val * delta_B;
-        state_C[i] = state_C[i] + k_val * delta_C;
-        state_D[i] = state_D[i] + k_val * delta_D;
-        out_A += state_A[i] * q_val;
-        out_B += state_B[i] * q_val;
-        out_C += state_C[i] * q_val;
-        out_D += state_D[i] * q_val;
+      float kv;
+      {
+        #pragma clang fp reassociate(off)
+        float s0 = 0.0f, s1 = 0.0f, s2 = 0.0f, s3 = 0.0f;
+        s0 += state[0].x * key[0].x;
+        s1 += state[1].x * key[1].x;
+        s2 += state[2].x * key[2].x;
+        s3 += state[3].x * key[3].x;
+        s0 += state[0].y * key[0].y;
+        s1 += state[1].y * key[1].y;
+        s2 += state[2].y * key[2].y;
+        s3 += state[3].y * key[3].y;
+        s0 += state[0].z * key[0].z;
+        s1 += state[1].z * key[1].z;
+        s2 += state[2].z * key[2].z;
+        s3 += state[3].z * key[3].z;
+        s0 += state[0].w * key[0].w;
+        s1 += state[1].w * key[1].w;
+        s2 += state[2].w * key[2].w;
+        s3 += state[3].w * key[3].w;
+        kv = (s0 + s1) + (s2 + s3);
       }
-      out_A = simd_sum(out_A);
-      out_B = simd_sum(out_B);
-      out_C = simd_sum(out_C);
-      out_D = simd_sum(out_D);
-      if (lane == 0) {
-        device bfloat16_t* y_row = out + ((start + t) * Hv + hv_idx) * kGdnDv;
-        y_row[dv_A] = static_cast<bfloat16_t>(out_A);
-        y_row[dv_B] = static_cast<bfloat16_t>(out_B);
-        y_row[dv_C] = static_cast<bfloat16_t>(out_C);
-        y_row[dv_D] = static_cast<bfloat16_t>(out_D);
+      kv += simd_shuffle_xor(kv, ushort(1));
+      kv += simd_shuffle_xor(kv, ushort(2));
+      kv += simd_shuffle_xor(kv, ushort(4));
+      const float delta = (val - kv) * bt;
+
+      const threadgroup float4* query_ptr = q_sh + j * (kGdnDk / 4) + q * 4;
+      const float4 query[4] = {
+          query_ptr[0], query_ptr[1], query_ptr[2], query_ptr[3]};
+
+      float out_val;
+      {
+        #pragma clang fp reassociate(off)
+        state[0] = state[0] + key[0] * delta;
+        state[1] = state[1] + key[1] * delta;
+        state[2] = state[2] + key[2] * delta;
+        state[3] = state[3] + key[3] * delta;
+        float o0 = 0.0f, o1 = 0.0f, o2 = 0.0f, o3 = 0.0f;
+        o0 += state[0].x * query[0].x;
+        o1 += state[1].x * query[1].x;
+        o2 += state[2].x * query[2].x;
+        o3 += state[3].x * query[3].x;
+        o0 += state[0].y * query[0].y;
+        o1 += state[1].y * query[1].y;
+        o2 += state[2].y * query[2].y;
+        o3 += state[3].y * query[3].y;
+        o0 += state[0].z * query[0].z;
+        o1 += state[1].z * query[1].z;
+        o2 += state[2].z * query[2].z;
+        o3 += state[3].z * query[3].z;
+        o0 += state[0].w * query[0].w;
+        o1 += state[1].w * query[1].w;
+        o2 += state[2].w * query[2].w;
+        o3 += state[3].w * query[3].w;
+        out_val = (o0 + o1) + (o2 + o3);
+      }
+      out_val += simd_shuffle_xor(out_val, ushort(1));
+      out_val += simd_shuffle_xor(out_val, ushort(2));
+      out_val += simd_shuffle_xor(out_val, ushort(4));
+      if (q == 0u) {
+        out[(ulong(start + j) * ulong(Hv) + ulong(hv_idx)) * ulong(kGdnDv) +
+            ulong(row_base + row)] = static_cast<bfloat16_t>(out_val);
       }
     }
     if (more) {
@@ -326,12 +513,11 @@ GDN_PREFILL_PROLOGUE(mlx_node_gdn_prefill_prologue_bf16_scalars, bfloat16_t)
     }
   }
 
-  for (int i = 0; i < kGdnPerLane; ++i) {
-    const int s_idx = kGdnPerLane * lane + i;
-    o_state_A[s_idx] = state_A[i];
-    o_state_B[s_idx] = state_B[i];
-    o_state_C[s_idx] = state_C[i];
-    o_state_D[s_idx] = state_D[i];
+  device float4* st_out =
+      reinterpret_cast<device float4*>(state_out + state_offset);
+  #pragma unroll
+  for (uint c = 0; c < 4; ++c) {
+    st_out[c] = state[c];
   }
 }
 

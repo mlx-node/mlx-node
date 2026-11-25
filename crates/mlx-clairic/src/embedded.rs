@@ -17,9 +17,8 @@ use super::{
     settings::{MAX_IMAGE_BYTES, MAX_IMAGES, MAX_IMAGES_BYTES, MAX_PIXELS},
 };
 
-static STRICT_DATA_URI: LazyLock<Option<Regex>> = LazyLock::new(|| {
-    Regex::new(r"(?i)^data:(image/(?:png|jpe?g|webp));base64,([A-Za-z0-9+/]*={0,2})$").ok()
-});
+static STRICT_DATA_URI: LazyLock<Option<Regex>> =
+    LazyLock::new(|| Regex::new(r"(?is)^data:(image/(?:png|jpe?g|webp));base64,(.*)$").ok());
 
 static PERMISSIVE_DATA_URL: LazyLock<Option<Regex>> =
     LazyLock::new(|| Regex::new(r"(?s)^data:([^;,]+);base64,(.*)$").ok());
@@ -136,9 +135,7 @@ impl ValidatedImage {
     /// 2. Composites any alpha channel onto a solid white `(255, 255, 255)` RGB background.
     /// 3. Applies explicit clockwise rotation if provided, otherwise runs [`orient_document`].
     pub fn to_rgb_image(&self) -> Result<RgbImage> {
-        let bytes = BASE64_STANDARD
-            .decode(&self.base64)
-            .map_err(|_| EmbeddedImageError::new("invalid_image", "image base64 is malformed"))?;
+        let bytes = decode_flexible_base64(&self.base64)?;
         let rgb = decode_bytes_to_rgb(&bytes, MAX_PIXELS)?;
         if let Some(deg) = self.rotation {
             Ok(if deg == 0 { rgb } else { rotate_cw(&rgb, deg) })
@@ -228,12 +225,54 @@ pub fn encode_rgb_png_to_validated(image: &RgbImage) -> Result<ValidatedImage> {
     })
 }
 
-/// Compute decoded byte length of already-validated canonical base64 without decoding again.
+/// Compute decoded byte length of base64 (canonical, wrapped, unpadded, or URL-safe)
+/// without decoding again.
 pub fn decoded_base64_size(encoded: &str) -> usize {
-    let len = encoded.len();
-    let trimmed = encoded.trim_end_matches('=').len();
-    let padding = len - trimmed;
-    (len * 3 / 4).saturating_sub(padding)
+    let mut non_ws_unpadded = 0usize;
+    for &b in encoded.as_bytes() {
+        if !matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'=') {
+            non_ws_unpadded += 1;
+        }
+    }
+    (non_ws_unpadded * 3) / 4
+}
+
+/// Decode standard, whitespace-wrapped (` `, `\t`, `\r`, `\n`), unpadded, or
+/// URL-safe (`-`, `_`) base64 while still rejecting invalid characters,
+/// `len % 4 == 1`, interior/excess padding, or non-canonical trailing bits.
+fn decode_flexible_base64(encoded: &str) -> std::result::Result<Vec<u8>, EmbeddedImageError> {
+    let malformed = || EmbeddedImageError::new("invalid_image", "image base64 is malformed");
+    let mut normalized = Vec::with_capacity(encoded.len() + 2);
+    for &b in encoded.as_bytes() {
+        match b {
+            b' ' | b'\t' | b'\n' | b'\r' => continue,
+            b'-' => normalized.push(b'+'),
+            b'_' => normalized.push(b'/'),
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/' | b'=' => normalized.push(b),
+            _ => return Err(malformed()),
+        }
+    }
+    if normalized.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(eq_pos) = normalized.iter().position(|&b| b == b'=') {
+        let pad_len = normalized.len() - eq_pos;
+        if pad_len > 2
+            || normalized.len() % 4 != 0
+            || !normalized[eq_pos..].iter().all(|&b| b == b'=')
+        {
+            return Err(malformed());
+        }
+    } else {
+        match normalized.len() % 4 {
+            0 => {}
+            1 => return Err(malformed()),
+            rem => {
+                normalized.resize(normalized.len() + (4 - rem), b'=');
+            }
+        }
+    }
+    BASE64_STANDARD.decode(&normalized).map_err(|_| malformed())
 }
 
 /// Enforce the maximum count of images (or images + PDF pages combined).
@@ -428,9 +467,7 @@ fn normalize_parts(
 ) -> std::result::Result<ValidatedImage, EmbeddedImageError> {
     let (canonical_type, expected_format) = canonical_content_type(content_type)?;
 
-    let decoded = BASE64_STANDARD
-        .decode(encoded)
-        .map_err(|_| EmbeddedImageError::new("invalid_image", "image base64 is malformed"))?;
+    let decoded = decode_flexible_base64(encoded)?;
     if decoded.is_empty() {
         return Err(EmbeddedImageError::new(
             "invalid_image",
@@ -710,5 +747,74 @@ mod tests {
             page_index: 0,
         };
         assert!(bad.to_rgb_image().is_err());
+    }
+
+    #[test]
+    fn accepts_wrapped_unpadded_and_urlsafe_base64_and_rejects_malformed() {
+        // Choose dimensions/pixels whose PNG encoding includes '+', '/', and '=' padding.
+        let mut img = RgbImage::new(11, 9);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            *px = Rgb([
+                ((x * 23 + y * 11) % 256) as u8,
+                ((x * 37 + y * 53) % 256) as u8,
+                ((x * 71 + y * 17) % 256) as u8,
+            ]);
+        }
+        let png_bytes = encode_rgb(&img, ImageFormat::Png);
+        let canonical_b64 = BASE64_STANDARD.encode(&png_bytes);
+
+        // 1. Whitespace-wrapped (CRLF, LF, spaces, tabs)
+        let wrapped_b64: String = canonical_b64
+            .as_bytes()
+            .chunks(16)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n \t");
+        assert_eq!(decoded_base64_size(&wrapped_b64), png_bytes.len());
+
+        // 2. Unpadded
+        let unpadded_b64 = canonical_b64.trim_end_matches('=').to_string();
+        assert_eq!(decoded_base64_size(&unpadded_b64), png_bytes.len());
+
+        // 3. URL-safe (- and _) + unpadded + wrapped
+        let urlsafe_b64 = wrapped_b64
+            .trim_end_matches('=')
+            .replace('+', "-")
+            .replace('/', "_");
+        assert_eq!(decoded_base64_size(&urlsafe_b64), png_bytes.len());
+
+        for variant in [&wrapped_b64, &unpadded_b64, &urlsafe_b64] {
+            // Data URI form
+            let uri = format!("data:image/png;base64,{variant}");
+            let from_uri = ValidatedImage::from_json(&json!(uri)).unwrap();
+            assert_eq!(from_uri.content_type, "image/png");
+            assert_eq!(from_uri.base64, canonical_b64);
+            assert_eq!(from_uri.to_rgb_image().unwrap().dimensions(), (11, 9));
+
+            // Object form
+            let from_obj = ValidatedImage::from_json(&json!({
+                "content_type": "image/png",
+                "base64": variant,
+                "rotation": 0
+            }))
+            .unwrap();
+            assert_eq!(from_obj.base64, canonical_b64);
+            assert_eq!(from_obj.to_rgb_image().unwrap().dimensions(), (11, 9));
+        }
+
+        // Reject genuinely malformed base64 variants
+        for bad_b64 in ["!!!", "A", "A=BC", "AA===", "AA="] {
+            let uri_err =
+                ValidatedImage::from_json(&json!(format!("data:image/png;base64,{bad_b64}")))
+                    .unwrap_err();
+            assert_eq!(uri_err.code, "invalid_image", "bad uri {bad_b64}");
+
+            let obj_err = ValidatedImage::from_json(&json!({
+                "content_type": "image/png",
+                "base64": bad_b64
+            }))
+            .unwrap_err();
+            assert_eq!(obj_err.code, "invalid_image", "bad obj {bad_b64}");
+        }
     }
 }

@@ -286,6 +286,34 @@ std::string qmm_t_nax_t64_epilogue(Mode m, StoreEpilogue ep) {
   return name;
 }
 
+// Standalone Metal 4 BM=128 BF16 prefill kernels (`kquant_prefill_nax.metal`).
+std::string qmm_t_nax_t64_p128_bf16(Mode m) {
+  std::string name;
+  concatenate(name, mode_name(m), "_qmm_t_nax_t64_p128_bf16");
+  return name;
+}
+std::string qmm_t_nax_t64_p128_epilogue(Mode m, StoreEpilogue ep) {
+  std::string name;
+  concatenate(name, mode_name(m),
+              ep == StoreEpilogue::Residual ? "_qmm_t_nax_t64_p128_res_bf16"
+                                            : "_qmm_t_nax_t64_p128_swiglu_bf16");
+  return name;
+}
+
+// Standalone Metal 4 INT8-activation NAX prefill kernels
+// (`kquant_prefill_int8_nax.metal`).
+constexpr Mode kInt8PrefillModes[] = {Mode::IQ4XS, Mode::IQ4NL, Mode::Q4K,
+                                      Mode::Q5K};
+std::string qmm_t_nax_t64_i8_bf16(Mode m, int epilogue) {
+  std::string name;
+  const char *suffix = epilogue == 0
+                           ? "_qmm_t_nax_t64_i8_bf16"
+                           : (epilogue == 1 ? "_qmm_t_nax_t64_i8_res_bf16"
+                                            : "_qmm_t_nax_t64_i8_swiglu_bf16");
+  concatenate(name, mode_name(m), suffix);
+  return name;
+}
+
 } // namespace kernels
 
 std::vector<KernelName> metal_kernel_names() {
@@ -367,6 +395,25 @@ std::vector<KernelName> metal_kernel_names() {
   for (Mode m : kEpilogueModes) {
     for (StoreEpilogue ep : {StoreEpilogue::Residual, StoreEpilogue::Swiglu}) {
       add(qmm_t_nax_t64_epilogue(m, ep), true);
+    }
+  }
+  // Standalone Metal 4 BM=128 BF16 prefill kernels (17 plain + 14 epilogue).
+  for (Mode m : kModes) {
+    add(qmm_t_nax_t64_p128_bf16(m), true);
+  }
+  for (Mode m : kAffineModes) {
+    add(qmm_t_nax_t64_p128_bf16(m), true);
+  }
+  for (Mode m : kEpilogueModes) {
+    for (StoreEpilogue ep : {StoreEpilogue::Residual, StoreEpilogue::Swiglu}) {
+      add(qmm_t_nax_t64_p128_epilogue(m, ep), true);
+    }
+  }
+  // Standalone Metal 4 INT8-activation NAX prefill kernels (1 quantizer + 12 GEMMs).
+  add("kquant_quantize_prefill_int8", true);
+  for (Mode m : kInt8PrefillModes) {
+    for (int ep : {0, 1, 2}) {
+      add(qmm_t_nax_t64_i8_bf16(m, ep), true);
     }
   }
   // Head-only M8 instantiation stores the same tensor-op accumulator as F32.
@@ -460,6 +507,66 @@ inline array ensure_row_contiguous_matrix(const array &x, const Stream &s) {
   array x_copy = contiguous_copy_gpu(x, s);
   metal::get_command_encoder(s).add_temporary(x_copy);
   return x_copy;
+}
+
+// Ensures a row-contiguous matrix has a 16-byte-aligned buffer offset so
+// vectorized uint4 / uint2 / half2 loads in `kquant_prefill_nax.h` never fault
+// on sliced views with nonzero offsets.
+inline array ensure_aligned16_matrix(const array &x, const Stream &s) {
+  if (x.offset() % 16 != 0) {
+    array x_copy = contiguous_copy_gpu(x, s);
+    metal::get_command_encoder(s).add_temporary(x_copy);
+    return x_copy;
+  }
+  return x;
+}
+
+struct PrefillMetallibCaps {
+  bool has_p128 = false;
+  bool has_int8 = false;
+};
+
+PrefillMetallibCaps kquant_prefill_caps(metal::Device &d) {
+  auto *lib = fast::paged::get_paged_attn_library(d);
+  static std::mutex mu;
+  static MTL::Library *cached_lib = nullptr;
+  static PrefillMetallibCaps cached{};
+  std::lock_guard<std::mutex> lock(mu);
+  if (lib == cached_lib) {
+    return cached;
+  }
+  PrefillMetallibCaps caps{};
+  if (lib != nullptr) {
+    auto *names = lib->functionNames();
+    if (names != nullptr) {
+      for (NS::UInteger i = 0; i < names->count(); ++i) {
+        auto *name = names->object<NS::String>(i);
+        if (name == nullptr) {
+          continue;
+        }
+        std::string_view sv(name->utf8String());
+        if (sv == "q4k_qmm_t_nax_t64_p128_bf16") {
+          caps.has_p128 = true;
+        } else if (sv == "kquant_quantize_prefill_int8") {
+          caps.has_int8 = true;
+        }
+        if (caps.has_p128 && caps.has_int8) {
+          break;
+        }
+      }
+    }
+  }
+  cached_lib = lib;
+  cached = caps;
+  return caps;
+}
+
+inline bool metallib_has_kquant_prefill128(metal::Device &d) {
+  return kquant_prefill_caps(d).has_p128;
+}
+
+inline bool metallib_has_kquant_prefill_int8(metal::Device &d) {
+  return kquant_prefill_caps(d).has_int8;
 }
 
 inline int get_qmv_batch_limit(int D, int O, metal::Device &d) {
@@ -1064,18 +1171,26 @@ void qvm(const Operands &o, int M, int N, int K) {
 void qmm_nax(const Operands &o, int M, int N, int K) {
   int B = o.out.size() / M / N;
   constexpr auto tile = kernels::kNaxTile;
-  MTL::Size group_dims(32, tile.wn, tile.wm);
-  MTL::Size grid_dims((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm,
-                      B);
+  const bool prefill_128 = o.tiled && o.x.dtype() == bfloat16 && M >= 65 &&
+                           metallib_has_kquant_prefill128(o.d);
+  MTL::Size group_dims =
+      prefill_128 ? MTL::Size(128, 1, 1) : MTL::Size(32, tile.wn, tile.wm);
+  MTL::Size grid_dims = prefill_128
+      ? MTL::Size((M + 127) / 128, N / 64, 1)
+      : MTL::Size((N + tile.bn - 1) / tile.bn, (M + tile.bm - 1) / tile.bm, B);
 
   bool aligned = N % tile.bn == 0;
-  auto kernel = get_kernel(
-      o.d, family_of("qmm_t_nax", o.tiled),
-      kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1, o.tiled), M, N,
-      K);
+  std::string kname = prefill_128
+      ? kernels::qmm_t_nax_t64_p128_bf16(o.mode)
+      : kernels::qmm_t_nax(o.mode, o.x.dtype(), aligned, B > 1, o.tiled);
+  std::string family = family_of("qmm_t_nax", o.tiled);
+  auto kernel = get_kernel(o.d, family, kname, M, N, K);
+  array w = prefill_128 ? ensure_aligned16_matrix(o.w, o.s) : o.w;
+  array scales = prefill_128 ? ensure_aligned16_matrix(o.scales, o.s) : o.scales;
+  array biases = prefill_128 ? ensure_aligned16_matrix(o.biases, o.s) : o.biases;
   auto &enc = metal::get_command_encoder(o.s);
   enc.set_compute_pipeline_state(kernel);
-  set_weights(enc, o.w, o.scales, o.biases);
+  set_weights(enc, w, scales, biases);
   enc.set_input_array(o.x, 3);
   enc.set_output_array(o.out, 4);
   enc.set_bytes(K, 5);
@@ -1122,6 +1237,9 @@ void qmm(const Operands &o, bool transpose, int M, int N, int K) {
 
 // The K partitions qmm_splitk runs; 1 sends it to qmm.
 int splitk_count(int group_size, int M, int N, int K) {
+  if (M >= 65 && (K % 64 == 0) && metal::is_nax_available()) {
+    return 1;
+  }
   // Target ~512 threadgroups.
   int bm = 32, bn = 32;
   int n_tiles = (N + bn - 1) / bn;
@@ -1719,13 +1837,24 @@ void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &inputs,
         "[quantized_matmul] The K-quant store epilogue left the tensor-op GEMM.");
   }
   constexpr auto tile = kernels::kNaxTile;
-  MTL::Size group_dims(32, tile.wn, tile.wm);
-  MTL::Size grid_dims(N / tile.bn, (M + tile.bm - 1) / tile.bm, 1);
-  auto kernel = get_kernel(
-      d,
-      epilogue_ == StoreEpilogue::Residual ? "qmm_t_nax_t64_res"
-                                           : "qmm_t_nax_t64_swiglu",
-      kernels::qmm_t_nax_t64_epilogue(mode_, epilogue_), M, N, K);
+  const bool prefill_128 = M >= 65 && metallib_has_kquant_prefill128(d);
+  MTL::Size group_dims =
+      prefill_128 ? MTL::Size(128, 1, 1) : MTL::Size(32, tile.wn, tile.wm);
+  MTL::Size grid_dims = prefill_128
+      ? MTL::Size((M + 127) / 128, N / 64, 1)
+      : MTL::Size(N / tile.bn, (M + tile.bm - 1) / tile.bm, 1);
+  std::string_view family = epilogue_ == StoreEpilogue::Residual
+      ? "qmm_t_nax_t64_res"
+      : "qmm_t_nax_t64_swiglu";
+  std::string kname = prefill_128
+      ? kernels::qmm_t_nax_t64_p128_epilogue(mode_, epilogue_)
+      : kernels::qmm_t_nax_t64_epilogue(mode_, epilogue_);
+  auto kernel = get_kernel(d, family, kname, M, N, K);
+  if (prefill_128) {
+    w = ensure_aligned16_matrix(w, s);
+    scales = ensure_aligned16_matrix(scales, s);
+    biases = ensure_aligned16_matrix(biases, s);
+  }
   auto &enc = metal::get_command_encoder(s);
   enc.set_compute_pipeline_state(kernel);
   set_weights(enc, w, scales, biases);
@@ -1736,6 +1865,199 @@ void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &inputs,
   enc.set_bytes(M, 7);
   enc.set_input_array(aux, 8);
   enc.dispatch_threadgroups(grid_dims, group_dims);
+}
+
+std::optional<std::tuple<array, array, array>>
+quantize_prefill_int8(const array &x, StreamOrDevice s) {
+  if (detail::in_grad_tracing()) {
+    return std::nullopt;
+  }
+  auto st = to_stream(s);
+  if (!(st.device == Device::gpu) || !metal::is_nax_available()) {
+    return std::nullopt;
+  }
+  auto &d = metal::device(st.device);
+  if (!metallib_has_kquant_prefill_int8(d)) {
+    return std::nullopt;
+  }
+  if (x.dtype() != bfloat16 || x.ndim() < 2) {
+    return std::nullopt;
+  }
+  const int K = x.shape(-1);
+  if (K <= 0 || K % 256 != 0 || x.size() == 0) {
+    return std::nullopt;
+  }
+  const int64_t M = x.size() / K;
+  if (M < 1 || M > std::numeric_limits<int>::max() - 31) {
+    return std::nullopt;
+  }
+  const int M_pad = static_cast<int>(((M + 31) / 32) * 32);
+  const int U_pad = (((K / 32) + 15) / 16) * 16;
+  auto outputs = array::make_arrays(
+      {Shape{M_pad, K}, Shape{K / 64, M_pad}, Shape{M_pad, U_pad}},
+      {int8, float32, float32},
+      std::make_shared<KQuantQuantizePrefillInt8>(st), {x});
+  return std::make_tuple(std::move(outputs[0]), std::move(outputs[1]),
+                         std::move(outputs[2]));
+}
+
+void KQuantQuantizePrefillInt8::eval_gpu(const std::vector<array> &inputs,
+                                         std::vector<array> &outputs) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  array x = ensure_row_contiguous(inputs[0], s);
+  outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+  outputs[1].set_data(allocator::malloc(outputs[1].nbytes()));
+  outputs[2].set_data(allocator::malloc(outputs[2].nbytes()));
+
+  const int K = x.shape(-1);
+  const int M = static_cast<int>(x.size() / K);
+  const int M_pad = outputs[0].shape(0);
+
+  auto kernel = get_kernel(d, "kquant_quantize_prefill_int8",
+                           "kquant_quantize_prefill_int8", M, M_pad, K);
+  auto &enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  enc.set_input_array(x, 0);
+  enc.set_output_array(outputs[0], 1);
+  enc.set_output_array(outputs[1], 2);
+  enc.set_output_array(outputs[2], 3);
+  enc.set_bytes(K, 4);
+  enc.set_bytes(M, 5);
+  enc.set_bytes(M_pad, 6);
+  enc.dispatch_threadgroups(MTL::Size(K / 256, M_pad / 8, 1),
+                            MTL::Size(32, 4, 1));
+}
+
+std::optional<array> quantized_matmul_int8(
+    const array &xq, const array &x_sa, const array &x_ysum, const array &w,
+    const array &scales, const array &biases, const std::optional<array> &aux,
+    const Shape &orig_shape, Mode mode, int epilogue, StreamOrDevice s) {
+  if (detail::in_grad_tracing() || !is_int8_prefill_mode(mode) ||
+      epilogue < 0 || epilogue > 2 || (epilogue != 0) != aux.has_value()) {
+    return std::nullopt;
+  }
+  auto st = to_stream(s);
+  if (!(st.device == Device::gpu) || !metal::is_nax_available()) {
+    return std::nullopt;
+  }
+  auto &d = metal::device(st.device);
+  if (!metallib_has_kquant_prefill_int8(d)) {
+    return std::nullopt;
+  }
+  if (xq.dtype() != int8 || xq.ndim() != 2 || x_sa.dtype() != float32 ||
+      x_sa.ndim() != 2 || x_ysum.dtype() != float32 || x_ysum.ndim() != 2 ||
+      w.dtype() != uint32 || w.ndim() != 2 ||
+      scales.dtype() != scales_dtype(mode) || scales.ndim() != 2 ||
+      biases.dtype() != biases_dtype(mode) || biases.ndim() != 2) {
+    return std::nullopt;
+  }
+  const int bits = default_bits(mode);
+  const int gs = default_group_size(mode);
+  const int sr = super_ratio(mode);
+  const int M_pad = xq.shape(0);
+  const int K = xq.shape(1);
+  const int N = w.shape(0);
+  if (M_pad <= 0 || M_pad % 32 != 0 || K <= 0 || K % 256 != 0 || N <= 0 ||
+      N % kTileRows != 0) {
+    return std::nullopt;
+  }
+  const int64_t expected_w_cols = (static_cast<int64_t>(K) * bits) / 32;
+  const int64_t expected_scale_cols =
+      (static_cast<int64_t>(K) / gs) * scale_bytes_per_group(mode);
+  const int64_t expected_bias_cols =
+      (static_cast<int64_t>(K) / (static_cast<int64_t>(gs) * sr)) *
+      bias_entries_per_super_block(mode);
+  if (static_cast<int64_t>(w.shape(1)) != expected_w_cols ||
+      scales.shape(0) != N || biases.shape(0) != N ||
+      static_cast<int64_t>(scales.shape(1)) != expected_scale_cols ||
+      static_cast<int64_t>(biases.shape(1)) != expected_bias_cols) {
+    return std::nullopt;
+  }
+  const int64_t U_pad = (((static_cast<int64_t>(K) / 32) + 15) / 16) * 16;
+  if (x_sa.shape(0) != K / 64 || x_sa.shape(1) != M_pad ||
+      x_ysum.shape(0) != M_pad ||
+      static_cast<int64_t>(x_ysum.shape(1)) != U_pad) {
+    return std::nullopt;
+  }
+  if (orig_shape.size() < 2 || orig_shape.back() != K) {
+    return std::nullopt;
+  }
+  int64_t M = 1;
+  for (size_t i = 0; i + 1 < orig_shape.size(); ++i) {
+    const int64_t dim = orig_shape[i];
+    if (dim <= 0 || dim > static_cast<int64_t>(M_pad) / M) {
+      return std::nullopt;
+    }
+    M *= dim;
+  }
+  if (M < 1 || ((M + 31) / 32) * 32 != static_cast<int64_t>(M_pad)) {
+    return std::nullopt;
+  }
+  Shape out_shape = orig_shape;
+  out_shape.back() = N;
+  if (aux.has_value() &&
+      (aux->dtype() != bfloat16 || aux->shape() != out_shape)) {
+    return std::nullopt;
+  }
+  std::vector<array> inputs = {xq, x_sa, x_ysum, w, scales, biases};
+  if (aux.has_value()) {
+    inputs.push_back(*aux);
+  }
+  return array(out_shape, bfloat16,
+               std::make_shared<KQuantMatmulInt8>(st, gs, bits, mode, epilogue,
+                                                  out_shape),
+               std::move(inputs));
+}
+
+void KQuantMatmulInt8::eval_gpu(const std::vector<array> &inputs, array &out) {
+  auto &s = stream();
+  auto &d = metal::device(s.device);
+  out.set_data(allocator::malloc(out.nbytes()));
+
+  array xq = ensure_aligned16_matrix(ensure_row_contiguous(inputs[0], s), s);
+  array x_sa = ensure_aligned16_matrix(ensure_row_contiguous(inputs[1], s), s);
+  array x_ysum =
+      ensure_aligned16_matrix(ensure_row_contiguous(inputs[2], s), s);
+  array w =
+      ensure_aligned16_matrix(ensure_row_contiguous_matrix(inputs[3], s), s);
+  array scales =
+      ensure_aligned16_matrix(ensure_row_contiguous_matrix(inputs[4], s), s);
+  array biases =
+      ensure_aligned16_matrix(ensure_row_contiguous_matrix(inputs[5], s), s);
+
+  const int M_pad = xq.shape(0);
+  const int K = xq.shape(1);
+  const int N = out.shape(-1);
+  const int M = static_cast<int>(out.size() / N);
+
+  std::string_view family = epilogue_ == 0
+      ? "qmm_t_nax_t64_i8"
+      : (epilogue_ == 1 ? "qmm_t_nax_t64_i8_res" : "qmm_t_nax_t64_i8_swiglu");
+  auto kernel =
+      get_kernel(d, family, kernels::qmm_t_nax_t64_i8_bf16(mode_, epilogue_), M,
+                 N, K);
+  auto &enc = metal::get_command_encoder(s);
+  enc.set_compute_pipeline_state(kernel);
+  set_weights(enc, w, scales, biases);
+  enc.set_input_array(xq, 3);
+  enc.set_input_array(x_sa, 4);
+  enc.set_input_array(x_ysum, 5);
+  enc.set_output_array(out, 6);
+  enc.set_bytes(K, 7);
+  enc.set_bytes(N, 8);
+  enc.set_bytes(M, 9);
+  enc.set_bytes(M_pad, 10);
+  if (epilogue_ != 0) {
+    array aux =
+        ensure_aligned16_matrix(ensure_row_contiguous(inputs[6], s), s);
+    enc.set_input_array(aux, 11);
+  }
+  const uint32_t col_tiles = static_cast<uint32_t>(N / 64);
+  const uint32_t row_tiles = static_cast<uint32_t>((M + 31) / 32);
+  const uint32_t total_tiles = col_tiles * row_tiles;
+  enc.dispatch_threadgroups(MTL::Size(16, (total_tiles + 15) / 16, 1),
+                            MTL::Size(64, 1, 1));
 }
 
 void KQuantGatherQMM::eval_gpu(const std::vector<array> &inputs, array &out) {
@@ -1844,11 +2166,37 @@ extern "C" int mlx_kquant_tiled_splits(int n, int k, int cores) {
 
 #else
 
+#include <cstdint>
 #include <stdexcept>
+
+struct mlx_array;
 
 extern "C" int mlx_gpu_core_count() { return 0; }
 extern "C" int mlx_gpu_reported_core_count() { return 0; }
 extern "C" int mlx_kquant_tiled_splits(int, int, int) { return 0; }
+
+// Non-Metal stubs for the Qwen3.5 paged-prefill fusion FFI symbols (defined in
+// `mlx_paged_ops.cpp` when Metal is enabled; `mlx_paged_ops.cpp` is excluded
+// under `MLX_DISABLE_METAL=1`). Keeping them here ensures CPU-only macOS builds
+// link cleanly and decline fusion without touching `mlx_paged_stubs.cpp`.
+extern "C" bool mlx_paged_prefill_scope_arm(
+    mlx_array *, mlx_array *, int, int, int, int, int) {
+  return false;
+}
+extern "C" int32_t mlx_paged_prefill_scope_disarm() { return 0; }
+extern "C" bool mlx_qwen35_paged_qkv_prep_forward(
+    mlx_array *, mlx_array *, mlx_array *, mlx_array *, mlx_array *,
+    mlx_array *, mlx_array *, mlx_array *, mlx_array *, mlx_array *,
+    int, int, int, int, int, int, float, float, float, uint32_t,
+    mlx_array **out_q_staged, mlx_array **out_k_pool, mlx_array **out_v_pool,
+    mlx_array **out_k_scale, mlx_array **out_v_scale) {
+  if (out_q_staged) *out_q_staged = nullptr;
+  if (out_k_pool) *out_k_pool = nullptr;
+  if (out_v_pool) *out_v_pool = nullptr;
+  if (out_k_scale) *out_k_scale = nullptr;
+  if (out_v_scale) *out_v_scale = nullptr;
+  return false;
+}
 
 namespace mlx::core::kquant {
 
@@ -1870,6 +2218,29 @@ std::optional<array> quantized_matmul_epilogue(const array &, const array &,
 void KQuantMatmulEpilogue::eval_gpu(const std::vector<array> &, array &) {
   throw std::runtime_error(
       "[quantized_matmul] The K-quant store epilogue needs Metal.");
+}
+
+std::optional<std::tuple<array, array, array>>
+quantize_prefill_int8(const array &, StreamOrDevice) {
+  return std::nullopt;
+}
+
+std::optional<array> quantized_matmul_int8(
+    const array &, const array &, const array &, const array &, const array &,
+    const array &, const std::optional<array> &, const Shape &, Mode, int,
+    StreamOrDevice) {
+  return std::nullopt;
+}
+
+void KQuantQuantizePrefillInt8::eval_gpu(const std::vector<array> &,
+                                         std::vector<array> &) {
+  throw std::runtime_error(
+      "[kquant_quantize_prefill_int8] INT8 prefill quantization needs Metal.");
+}
+
+void KQuantMatmulInt8::eval_gpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[kquant_matmul_int8] INT8 prefill matmul needs Metal.");
 }
 
 } // namespace mlx::core::kquant

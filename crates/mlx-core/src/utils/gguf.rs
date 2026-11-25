@@ -238,6 +238,14 @@ impl GgufTensorType {
         matches!(self, Self::NVFP4)
     }
 
+    /// Whether the blocks repack into MLX's native `mxfp8` pair
+    /// (`weight`, uint8 E8M0 `scales`, group_size 32, no biases): ggml's
+    /// `block_mxfp8` (33 bytes / 32 elements: `[u8 e (E8M0 bias 127), u8 qs[32]]`)
+    /// matches MLX `mxfp8` bit-for-bit.
+    pub(crate) fn is_mlx_mxfp8_quantized(&self) -> bool {
+        matches!(self, Self::MXFP8)
+    }
+
     /// The repacker format for the ggml K-quants, `None` for everything else.
     ///
     /// Deliberately exhaustive for the same reason as `block_size()`: a K-quant
@@ -1372,6 +1380,23 @@ pub fn decode_mxfp8_rows(blocks: &[u8], out: &mut [f32]) -> Result<()> {
 /// of stored (see [`symmetric_zero_point`]). MXFP4 yields `(weight, uint8
 /// scales)` for MLX's native `mxfp4` mode, which has no offset at all.
 #[cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+/// True for the gather-only 202 GB DeepSeek-V4.1 MXFP8 engram table, which must
+/// never be loaded or imported as a whole tensor.
+pub(crate) fn is_gather_only_mxfp8(tensor: &GgufTensorInfo) -> bool {
+    tensor.tensor_type == GgufTensorType::MXFP8 && tensor.name == "per_layer_token_embd.weight"
+}
+
+/// Repack one 33-byte ggml `block_mxfp8` (`[u8 e (E8M0 bias 127), u8 qs[32]]`)
+/// into MLX `mxfp8` layout: 8 little-endian `u32` words (32 sequential OCP FP8
+/// E4M3FN bytes) and the verbatim E8M0 scale byte.
+pub(crate) fn mxfp8_repack_block(block: &[u8], words: &mut [u32; 8]) -> u8 {
+    for j in 0..8 {
+        let off = 1 + j * 4;
+        words[j] = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+    }
+    block[0]
+}
+
 pub(super) fn load_quantized_tensor(
     reader: &mut (impl Read + Seek),
     gguf: &GgufFile,
@@ -1394,7 +1419,7 @@ pub(super) fn load_quantized_tensor(
     let words_per_block: usize = match tensor.tensor_type {
         GgufTensorType::Q4_0 | GgufTensorType::Q4_1 | GgufTensorType::MXFP4 => 4, // 32 x 4-bit
         GgufTensorType::Q5_0 | GgufTensorType::Q5_1 => 5, // 32 x 5-bit = 160 bits
-        GgufTensorType::Q8_0 => 8,                        // 32 x 8-bit = 256 bits
+        GgufTensorType::Q8_0 | GgufTensorType::MXFP8 => 8, // 32 x 8-bit = 256 bits
         GgufTensorType::NVFP4 => 8,                       // 64 x 4-bit = 256 bits
         GgufTensorType::PQ2_0 => 8,
         other => {
@@ -1606,6 +1631,24 @@ pub(super) fn load_quantized_tensor(
                 e8m0_scales[i * 4..(i + 1) * 4].copy_from_slice(&sub_scales);
             }
         }
+        GgufTensorType::MXFP8 => {
+            // Block: 1 byte E8M0 exponent (bias 127), 32 sequential OCP FP8 E4M3FN bytes.
+            // Matches MLX's `mxfp8` storage (uint32 [..., K/4] + uint8 [..., K/32]) verbatim.
+            e8m0_scales.try_reserve_exact(sb_elements).map_err(|e| {
+                Error::from_reason(format!(
+                    "Failed to allocate E8M0 scales for tensor '{}': {e}",
+                    tensor.name
+                ))
+            })?;
+            e8m0_scales.resize(sb_elements, 0);
+            for i in 0..n_blocks {
+                let block = &raw[i * type_size..(i + 1) * type_size];
+                let mut words = [0u32; 8];
+                e8m0_scales[i] = mxfp8_repack_block(block, &mut words);
+                let base = i * words_per_block;
+                weights_packed[base..base + 8].copy_from_slice(&words);
+            }
+        }
         GgufTensorType::Q5_1 => {
             // Block: 2 bytes f16 scale (d), 2 bytes f16 bias (m), 4 bytes of
             // high bits (qh, one bit per weight), 16 nibble bytes (qs). ggml
@@ -1707,10 +1750,11 @@ pub(super) fn load_quantized_tensor(
     let w_i64_shape: Vec<i64> = w_shape.to_vec();
     let sb_i64_shape: Vec<i64> = sb_shape.to_vec();
 
-    let is_u8_fp4_scales =
-        tensor.tensor_type.is_mlx_mxfp4_quantized() || tensor.tensor_type.is_mlx_nvfp4_quantized();
+    let is_u8_scales = tensor.tensor_type.is_mlx_mxfp4_quantized()
+        || tensor.tensor_type.is_mlx_nvfp4_quantized()
+        || tensor.tensor_type.is_mlx_mxfp8_quantized();
     let weight_arr = MxArray::from_uint32(&weights_packed, &w_i64_shape)?;
-    let scales_arr = if is_u8_fp4_scales {
+    let scales_arr = if is_u8_scales {
         MxArray::from_uint8(&e8m0_scales, &sb_i64_shape)?
     } else {
         MxArray::from_float16(&scales, &sb_i64_shape)?
@@ -1724,7 +1768,7 @@ pub(super) fn load_quantized_tensor(
         (name.clone(), weight_arr),
         (format!("{prefix}.scales"), scales_arr),
     ];
-    if symmetric_zero_point(tensor.tensor_type).is_none() && !is_u8_fp4_scales {
+    if symmetric_zero_point(tensor.tensor_type).is_none() && !is_u8_scales {
         out.push((
             format!("{prefix}.biases"),
             MxArray::from_float16(&biases, &sb_i64_shape)?,
@@ -1945,9 +1989,9 @@ pub(crate) fn load_gguf_tensor(
     tensor: &GgufTensorInfo,
     options: GgufLoadOptions,
 ) -> Result<Vec<(String, MxArray)>> {
-    if tensor.tensor_type == GgufTensorType::MXFP8 {
-        // Checked before any read: the only MXFP8 tensor in the wild is a
-        // 202 GB engram table that is gathered row by row.
+    if is_gather_only_mxfp8(tensor) {
+        // Checked before any read: DeepSeek-V4.1's 202 GB engram table is
+        // gathered row by row and must never be loaded as a whole tensor.
         return Err(Error::from_reason(format!(
             "MXFP8 tensor '{}' is gather-only: read its rows with decode_mxfp8_rows, never as a whole tensor",
             tensor.name
@@ -1983,6 +2027,7 @@ pub(crate) fn load_gguf_tensor(
     } else if tensor.tensor_type.is_mlx_affine_quantized()
         || tensor.tensor_type.is_mlx_mxfp4_quantized()
         || tensor.tensor_type.is_mlx_nvfp4_quantized()
+        || tensor.tensor_type.is_mlx_mxfp8_quantized()
     {
         load_quantized_tensor(reader, gguf, tensor)
     } else {
@@ -2119,7 +2164,7 @@ pub(crate) fn is_inkling2_dspark_gguf(metadata: &HashMap<String, GgufMetaValue>)
 /// name to decide a tensor is quantized (e.g. `embed_tokens.scales`), so a
 /// rename that moves only `.weight` strands the sidecars under their old names
 /// and the group silently degrades to a bare packed weight.
-const QUANT_GROUP_SUFFIXES: [&str; 3] = [".weight", ".scales", ".biases"];
+const QUANT_GROUP_SUFFIXES: [&str; 4] = [".weight", ".scales", ".biases", ".scale"];
 
 /// Rename `{from_base}` to `{to_base}` for a global tensor, carrying whichever
 /// of the canonical quant-group suffixes the key uses.
@@ -2422,23 +2467,28 @@ fn inkling2_name_to_hf(name: &str) -> Option<String> {
     if let Some(renamed) = rename_global_quant_group(name, "token_embd", "model.embed_tokens") {
         return Some(renamed);
     }
-    if name == "token_embd_norm.weight" {
-        return Some("model.embed_norm.weight".to_string());
+    if let Some(renamed) = rename_global_quant_group(name, "token_embd_norm", "model.embed_norm") {
+        return Some(renamed);
     }
     if let Some(renamed) = rename_global_quant_group(name, "output", "lm_head") {
         return Some(renamed);
     }
-    if name == "output_norm.weight" {
-        return Some("model.norm.weight".to_string());
+    if let Some(renamed) = rename_global_quant_group(name, "output_norm", "model.norm") {
+        return Some(renamed);
     }
-    if name == "output_res_query.weight" {
-        return Some("model.output_res_query.weight".to_string());
+    if let Some(renamed) =
+        rename_global_quant_group(name, "output_res_query", "model.output_res_query")
+    {
+        return Some(renamed);
     }
-    if name == "loop_res_query.weight" {
-        return Some("model.loop_res_query.weight".to_string());
+    if let Some(renamed) = rename_global_quant_group(name, "loop_res_query", "model.loop_res_query")
+    {
+        return Some(renamed);
     }
-    if name == "loop_kv_res_query.weight" {
-        return Some("model.loop_kv_res_query.weight".to_string());
+    if let Some(renamed) =
+        rename_global_quant_group(name, "loop_kv_res_query", "model.loop_kv_res_query")
+    {
+        return Some(renamed);
     }
 
     if let Some(rest) = name.strip_prefix("blk.") {
@@ -4012,6 +4062,30 @@ pub(super) fn qwen35_kquant_dense_fixup_target(
     })
 }
 
+pub(super) fn qwen35_mxfp8_dense_fixup_target(
+    gguf: &GgufFile,
+) -> Option<(&GgufTensorInfo, String)> {
+    const DENSE_FIXUP_SUFFIXES: &[&str] = &[
+        ".linear_attn.in_proj_a.weight",
+        ".linear_attn.in_proj_b.weight",
+        ".linear_attn.in_proj_z.weight",
+        ".linear_attn.out_proj.weight",
+        ".linear_attn.in_proj_qkv.weight",
+        ".linear_attn.conv1d.weight",
+    ];
+
+    gguf.tensors.iter().find_map(|tensor| {
+        if !tensor.tensor_type.is_mlx_mxfp8_quantized() {
+            return None;
+        }
+        let mapped = gguf_name_to_hf_for_metadata(&tensor.name, &gguf.metadata)?;
+        DENSE_FIXUP_SUFFIXES
+            .iter()
+            .any(|suffix| mapped.ends_with(suffix))
+            .then_some((tensor, mapped))
+    })
+}
+
 /// GGUF has no HuggingFace `model_type`, so require both a known llama.cpp
 /// Qwen3.5 architecture tag and the characteristic mixed full-attention/GDN
 /// tensor shape before enabling the fixed Unsloth MXFP map. `qwen3` is kept
@@ -4053,9 +4127,10 @@ pub(super) fn plain_qwen3_quantized_source(gguf: &GgufFile) -> Option<&GgufTenso
         return None;
     }
 
-    gguf.tensors
-        .iter()
-        .find(|tensor| SourceQuantProfile::for_gguf_type(tensor.tensor_type).is_some())
+    gguf.tensors.iter().find(|tensor| {
+        !is_gather_only_mxfp8(tensor)
+            && SourceQuantProfile::for_gguf_type(tensor.tensor_type).is_some()
+    })
 }
 
 // ── Config Extraction ───────────────────────────────────────────────────────
@@ -4471,9 +4546,15 @@ impl SourceQuantProfile {
                 symmetric_zero_point: None,
                 layout: KQuantLayout::RowMajor,
             }),
-            // Gather-only rows (the DeepSeek-V4.1 engram table); no MLX
-            // quantized layout, and `load_gguf_tensor` refuses a whole load.
-            GgufTensorType::MXFP8 => None,
+            // MLX's native OCP MXFP8 block: 8-bit E4M3FN codes under a uint8
+            // E8M0 scale (bias 127) per 32 values, no biases.
+            GgufTensorType::MXFP8 => Some(Self {
+                bits: 8,
+                group_size: 32,
+                mode: "mxfp8",
+                symmetric_zero_point: None,
+                layout: KQuantLayout::RowMajor,
+            }),
             GgufTensorType::PQ2_0 => Some(Self {
                 bits: 2,
                 group_size: 128,
@@ -5331,6 +5412,9 @@ pub(super) const KQUANT_TILED_DISK_PROJECTIONS: [&str; 13] = [
 /// (a tied checkpoint reads the embedding table as its head, and a loader
 /// that drops `lm_head.*` under `tie_word_embeddings` never sees the marker).
 fn kquant_tiled_disk_candidate(prefix: &str, tie_word_embeddings: bool) -> bool {
+    if prefix.contains(".loop_ctrl.") {
+        return false;
+    }
     let last = prefix.rsplit('.').next().unwrap_or(prefix);
     if last == "lm_head" {
         return !tie_word_embeddings;
@@ -5500,6 +5584,9 @@ pub(super) fn source_quantization_profiles(
 ) -> Result<std::collections::BTreeMap<String, SourceQuantProfile>> {
     let mut profiles = std::collections::BTreeMap::new();
     for tensor in &gguf.tensors {
+        if is_gather_only_mxfp8(tensor) {
+            continue;
+        }
         if !import_k_quants && tensor.tensor_type.k_quant_format().is_some() {
             continue;
         }
@@ -8575,9 +8662,33 @@ fn muse_glimmer_native_preflight(input: &Path) -> Result<(PathBuf, Option<PathBu
     Ok((input, draft))
 }
 
+/// Deterministic dtype preference for Inkling2 vision projectors:
+/// `BF16` > `F32` > `F16` > `Q8_0` > anything else (matching Splash's
+/// `("BF16", "F32", "F16", "Q8_0")` order).
+fn inkling2_mmproj_dtype_tier(path: &Path) -> u8 {
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name.contains("bf16") {
+        0
+    } else if name.contains("f32") {
+        1
+    } else if name.contains("f16") {
+        2
+    } else if name.contains("q8_0") || name.contains("q8") {
+        3
+    } else {
+        4
+    }
+}
+
 /// Locate an optional Inkling2 vision projector (`mmproj-*.gguf` with
 /// `clip.vision.projector_type == "inkling2v"`) beside `input`.
-/// Ignores DSpark draft GGUFs or unrelated projectors in the same directory.
+/// Ignores DSpark draft GGUFs or unrelated projectors in the same directory,
+/// and degrades cleanly to `None` with a warning on corrupt/unreadable or
+/// ambiguous candidates so the text model still boots.
 fn inkling2_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
     let parent = input.parent().unwrap_or(Path::new("."));
     let exact = parent.join(format!(
@@ -8592,41 +8703,93 @@ fn inkling2_native_mmproj(input: &Path) -> Result<Option<PathBuf>> {
             })?
             .to_string_lossy()
     ));
-    if exact.is_file() && is_inkling2_mmproj_gguf(&parse_gguf(&exact)?.metadata) {
-        return Ok(Some(exact.canonicalize()?));
+    if exact.is_file() {
+        match parse_gguf(&exact) {
+            Ok(parsed) if is_inkling2_mmproj_gguf(&parsed.metadata) => match exact.canonicalize() {
+                Ok(canon) => return Ok(Some(canon)),
+                Err(err) => warn!(
+                    "Inkling2: failed to canonicalize vision projector '{}': {err}; skipping",
+                    exact.display()
+                ),
+            },
+            Ok(_) => {}
+            Err(err) => warn!(
+                "Inkling2: ignoring unreadable vision projector '{}': {err}",
+                exact.display()
+            ),
+        }
     }
+    let entries = match fs::read_dir(parent) {
+        Ok(entries) => entries,
+        Err(err) => {
+            warn!(
+                "Inkling2: failed to scan '{}' for vision projectors ({err}); continuing in text-only mode",
+                parent.display()
+            );
+            return Ok(None);
+        }
+    };
     let mut candidates = Vec::new();
-    for entry in fs::read_dir(parent)? {
-        let path = entry?.path();
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let path = entry.path();
         let name = path.file_name().unwrap_or_default().to_string_lossy();
         if path.is_file()
             && name.to_ascii_lowercase().starts_with("mmproj-")
             && name.to_ascii_lowercase().ends_with(".gguf")
-            && is_inkling2_mmproj_gguf(&parse_gguf(&path)?.metadata)
         {
-            candidates.push(path.canonicalize()?);
+            match parse_gguf(&path) {
+                Ok(parsed) if is_inkling2_mmproj_gguf(&parsed.metadata) => {
+                    match path.canonicalize() {
+                        Ok(canon) => candidates.push(canon),
+                        Err(err) => warn!(
+                            "Inkling2: failed to canonicalize vision projector '{}': {err}; skipping",
+                            path.display()
+                        ),
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => warn!(
+                    "Inkling2: skipping corrupt/unreadable vision projector '{}': {err}",
+                    path.display()
+                ),
+            }
         }
     }
+    candidates.sort();
     match candidates.len() {
         0 => Ok(None),
         1 => Ok(candidates.pop()),
         _ => {
             let best = candidates
                 .iter()
-                .map(|path| mmproj_dtype_tier(path))
+                .map(|path| inkling2_mmproj_dtype_tier(path))
                 .min()
-                .ok_or_else(|| Error::from_reason("Inkling2 mmproj candidate list went empty"))?;
+                .unwrap_or(u8::MAX);
             let mut preferred: Vec<PathBuf> = candidates
                 .iter()
-                .filter(|path| mmproj_dtype_tier(path) == best)
+                .filter(|path| inkling2_mmproj_dtype_tier(path) == best)
                 .cloned()
                 .collect();
             if preferred.len() > 1 {
-                return Err(Error::from_reason(format!(
-                    "Ambiguous Inkling2 vision projectors beside '{}'; name the matching companion '{}'",
+                let names: Vec<String> = preferred
+                    .iter()
+                    .map(|p| {
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .into_owned()
+                    })
+                    .collect();
+                warn!(
+                    "Inkling2: ambiguous vision projectors beside '{}' ({}); continuing in text-only mode (name the desired companion '{}')",
                     input.display(),
+                    names.join(", "),
                     exact.display()
-                )));
+                );
+                return Ok(None);
             }
             Ok(preferred.pop())
         }
@@ -8948,7 +9111,16 @@ pub(crate) async fn prepare_gguf_assets_in(
     })?;
     let cache_root = cache_root.as_path();
     let main = open_gguf_main(&parts)?;
-    let companion = companion.as_deref().map(open_gguf_source).transpose()?;
+    let mut companion = match companion.as_deref().map(open_gguf_source).transpose() {
+        Ok(c) => c,
+        Err(err) if family == NativeGgufFamily::Inkling2 => {
+            warn!(
+                "Inkling2: failed to open optional vision projector companion ({err}); continuing in text-only mode"
+            );
+            None
+        }
+        Err(err) => return Err(err),
+    };
     let input_path = main.path().to_path_buf();
     let part_paths: Vec<PathBuf> = main.parts.iter().map(|(path, _, _)| path.clone()).collect();
     let part_identities: Vec<String> = main
@@ -8956,8 +9128,41 @@ pub(crate) async fn prepare_gguf_assets_in(
         .iter()
         .map(|(_, _, identity)| identity.source_identity.clone())
         .collect();
-    let companion_path = companion.as_ref().map(|(path, _, _)| path.clone());
     let source_identity_digest = parts_identity_digest(&main.identities());
+
+    let prism_contract = if family == NativeGgufFamily::Qwen35 {
+        prism_hadamard_config(&main.header)?
+    } else {
+        None
+    };
+    if prism_contract.is_some() && companion.is_some() {
+        return Err(Error::from_reason(
+            "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
+        ));
+    }
+    let parent = input_path.parent().unwrap_or(Path::new("."));
+    let asset_digest = qwen35_native_asset_digest(parent)?;
+    let (opts, main_plan, companion_plan) = match native_import_plans(
+        family,
+        (main.path(), &main.header),
+        companion
+            .as_ref()
+            .map(|(path, header, _)| (path.as_path(), &**header)),
+    ) {
+        Ok(plans) => plans,
+        Err(err) if family == NativeGgufFamily::Inkling2 && companion.is_some() => {
+            warn!(
+                "Inkling2: optional vision projector planning failed ({err}); retrying in text-only mode"
+            );
+            companion = None;
+            native_import_plans(family, (main.path(), &main.header), None)?
+        }
+        Err(err) => return Err(err),
+    };
+    if companion_plan.is_none() {
+        companion = None;
+    }
+    let companion_path = companion.as_ref().map(|(path, _, _)| path.clone());
     let companion_digest = companion
         .as_ref()
         .map(|(_, _, identity)| identity.source_identity.clone())
@@ -8981,26 +9186,6 @@ pub(crate) async fn prepare_gguf_assets_in(
                 None => true,
             })
     };
-
-    let prism_contract = if family == NativeGgufFamily::Qwen35 {
-        prism_hadamard_config(&main.header)?
-    } else {
-        None
-    };
-    if prism_contract.is_some() && companion.is_some() {
-        return Err(Error::from_reason(
-            "prism.hadamard sources are text-only and cannot be paired with a companion GGUF",
-        ));
-    }
-    let parent = input_path.parent().unwrap_or(Path::new("."));
-    let asset_digest = qwen35_native_asset_digest(parent)?;
-    let (opts, main_plan, companion_plan) = native_import_plans(
-        family,
-        (main.path(), &main.header),
-        companion
-            .as_ref()
-            .map(|(path, header, _)| (path.as_path(), &**header)),
-    )?;
     #[cfg(test)]
     run_native_gguf_post_plan_test_hook(&input_path);
     if qwen35_native_asset_digest(parent)? != asset_digest {
@@ -19401,9 +19586,14 @@ mod tests {
         assert_eq!(t, GgufTensorType::MXFP8);
         assert_eq!((t.type_size(), t.block_size(), t.name()), (33, 32, "MXFP8"));
         assert!(t.is_quantized());
+        assert!(t.is_mlx_mxfp8_quantized());
         assert!(!t.is_mlx_affine_quantized() && !t.is_mlx_mxfp4_quantized());
         assert!(t.k_quant_format().is_none());
-        assert!(SourceQuantProfile::for_gguf_type(t).is_none());
+        let profile = SourceQuantProfile::for_gguf_type(t).expect("MXFP8 source quant profile");
+        assert_eq!(
+            (profile.bits, profile.group_size, profile.mode),
+            (8, 32, "mxfp8")
+        );
         assert!(symmetric_zero_point(t).is_none());
         assert!(GgufTensorType::recognized_list().contains("MXFP8(43)"));
         // the real engram table: [256, 768,022,850] -> 202,758,032,400 bytes
@@ -19414,6 +19604,15 @@ mod tests {
             tensor_type: t,
             offset: 0,
         };
+        assert!(is_gather_only_mxfp8(&info));
+        let non_engram = GgufTensorInfo {
+            name: "blk.20.ffn_down_exps.weight".into(),
+            n_dims: 3,
+            dims: vec![64, 64, 4],
+            tensor_type: t,
+            offset: 0,
+        };
+        assert!(!is_gather_only_mxfp8(&non_engram));
         assert_eq!(info.data_size().unwrap(), 202_758_032_400);
         let mut out = vec![0f32; 32];
         assert!(
@@ -20552,5 +20751,171 @@ mod tests {
             native_gguf_preflight(&part1, NativeGgufFamily::Inkling2).is_err(),
             "incomplete split set must fail preflight"
         );
+    }
+
+    #[test]
+    fn inkling2_global_quant_group_remapping_and_loop_ctrl_t64_exclusion() {
+        // All 7 global Inkling2 tensors must rename `.weight`, `.scales`, `.biases`, `.scale`.
+        let global_pairs = [
+            ("token_embd", "model.embed_tokens"),
+            ("token_embd_norm", "model.embed_norm"),
+            ("output", "lm_head"),
+            ("output_norm", "model.norm"),
+            ("output_res_query", "model.output_res_query"),
+            ("loop_res_query", "model.loop_res_query"),
+            ("loop_kv_res_query", "model.loop_kv_res_query"),
+        ];
+        for (src_base, dst_base) in global_pairs {
+            for sfx in [".weight", ".scales", ".biases", ".scale"] {
+                let got = inkling2_name_to_hf(&format!("{src_base}{sfx}")).unwrap();
+                assert_eq!(got, format!("{dst_base}{sfx}"));
+            }
+        }
+
+        // Loop controller `down_proj` MUST be excluded from Tiled64 disk candidacy,
+        // while ordinary `mlp.down_proj` remains eligible.
+        for stream in ["q", "k", "v", "mlp"] {
+            assert!(
+                !kquant_tiled_disk_candidate(
+                    &format!("model.layers.6.loop_ctrl.{stream}.down_proj"),
+                    false
+                ),
+                "loop_ctrl.{stream}.down_proj must be excluded from Tiled64"
+            );
+        }
+        assert!(kquant_tiled_disk_candidate(
+            "model.layers.6.mlp.down_proj",
+            false
+        ));
+
+        // Cross-check `plan_tiled_kquant` agrees on an Inkling2 GGUF header with a 64x4608 K-quant
+        // `loop_q_ctrl_down.weight` vs `attn_output.weight`.
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("inkling2_loop".to_string()),
+        );
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 2,
+            metadata,
+            tensors: vec![
+                GgufTensorInfo {
+                    name: "blk.6.loop_q_ctrl_down.weight".to_string(),
+                    n_dims: 2,
+                    dims: vec![4608, 64],
+                    tensor_type: GgufTensorType::Q4K,
+                    offset: 0,
+                },
+                GgufTensorInfo {
+                    name: "blk.6.attn_output.weight".to_string(),
+                    n_dims: 2,
+                    dims: vec![256, 64],
+                    tensor_type: GgufTensorType::Q4K,
+                    offset: 0,
+                },
+            ],
+            data_offset: 0,
+            alignment: 32,
+        };
+        let profiles = source_quantization_profiles(&gguf, true).unwrap();
+        let (tiled_names, tiled_prefixes) =
+            crate::utils::gguf_plan::plan_tiled_kquant(&gguf, &profiles, false).unwrap();
+        assert!(!tiled_names.contains("blk.6.loop_q_ctrl_down.weight"));
+        assert!(!tiled_prefixes.contains("language_model.model.layers.6.loop_ctrl.q.down_proj"));
+        assert!(tiled_names.contains("blk.6.attn_output.weight"));
+        assert!(tiled_prefixes.contains("language_model.model.layers.6.self_attn.o_proj"));
+    }
+
+    #[tokio::test]
+    async fn inkling2_unsupported_q4_0_mmproj_drops_companion_before_cache_identity() {
+        use super::super::gguf_test_fixtures::build_minimal_gguf;
+
+        let dir = std::env::temp_dir().join(format!(
+            "mlx-inkling2-q40-mmproj-test-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        let src = dir.join("src");
+        let cache = dir.join("cache");
+        fs::create_dir_all(&src).expect("create temp src dir");
+        struct DirGuard(PathBuf);
+        impl Drop for DirGuard {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _guard = DirGuard(dir.clone());
+
+        let main_path = src.join("Inkling-2-Mini.gguf");
+        let main_bytes = build_minimal_gguf(
+            &[
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("inkling2".into()),
+                ),
+                ("inkling2.embedding_length", GgufMetaValue::Uint32(64)),
+                ("inkling2.block_count", GgufMetaValue::Uint32(1)),
+                ("inkling2.attention.head_count", GgufMetaValue::Uint32(2)),
+                ("inkling2.attention.head_count_kv", GgufMetaValue::Uint32(2)),
+                ("inkling2.attention.key_length", GgufMetaValue::Uint32(32)),
+                ("inkling2.feed_forward_length", GgufMetaValue::Uint32(64)),
+            ],
+            &[(
+                "token_embd.weight",
+                &[64, 4],
+                GgufTensorType::F32,
+                &[0u8; 64 * 4 * 4],
+            )],
+        );
+        fs::write(&main_path, &main_bytes).expect("write main gguf");
+
+        // Unsupported Q4_0 Inkling2 vision projector beside the text GGUF.
+        let bad_mmproj = src.join("mmproj-Q4_0.gguf");
+        let mmproj_bytes = build_minimal_gguf(
+            &[
+                ("general.architecture", GgufMetaValue::String("clip".into())),
+                (
+                    "clip.vision.projector_type",
+                    GgufMetaValue::String("inkling2v".into()),
+                ),
+            ],
+            &[(
+                "v.blk.0.attn_q.weight",
+                &[64, 4],
+                GgufTensorType::Q4_0,
+                &[0u8; (64 * 4 / 32) * 18],
+            )],
+        );
+        fs::write(&bad_mmproj, &mmproj_bytes).expect("write unsupported Q4_0 mmproj");
+
+        // Startup must succeed in text-only mode and clear the companion before cache identity.
+        let ckpt_with_bad = prepare_gguf_assets_in(&main_path, NativeGgufFamily::Inkling2, &cache)
+            .await
+            .expect("unsupported Q4_0 companion must not abort Inkling2 text startup");
+        assert!(ckpt_with_bad.companion.is_none());
+        assert!(ckpt_with_bad.plans.1.is_none());
+        let source_json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(ckpt_with_bad.asset_dir.join("gguf-source.json"))
+                .expect("read gguf-source.json"),
+        )
+        .expect("parse gguf-source.json");
+        assert!(
+            source_json["companion"].is_null(),
+            "dropped companion must be recorded as null in gguf-source.json"
+        );
+        let dir_with_bad = ckpt_with_bad.asset_dir.clone();
+        native_gguf_unlease_in_use(&ckpt_with_bad.asset_dir);
+
+        // Removing the unsupported companion must hash to the exact same text-only cache key.
+        fs::remove_file(&bad_mmproj).expect("remove unsupported mmproj");
+        let ckpt_text_only = prepare_gguf_assets_in(&main_path, NativeGgufFamily::Inkling2, &cache)
+            .await
+            .expect("text-only Inkling2 prepare");
+        assert_eq!(
+            ckpt_text_only.asset_dir, dir_with_bad,
+            "dropped companion must not pollute companion_digest / cache key"
+        );
+        native_gguf_unlease_in_use(&ckpt_text_only.asset_dir);
     }
 }

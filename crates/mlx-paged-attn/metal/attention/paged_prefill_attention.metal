@@ -56,6 +56,27 @@ struct PagedPrefillParams {
   uint kv_heads;
 };
 
+// Mirrored by the host's PagedPrefillGateParams (mlx_paged_dispatch.cpp).
+struct PagedPrefillGateParams {
+  uint has_gate;
+  uint gate_row_stride;
+};
+
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+// Bit-exact match for MLX's `unary_ops.h::Sigmoid` on `bfloat16_t` (with
+// `bf16_math.h`, where `abs`, `precise::exp`, `+`, `/`, and `-` each round
+// back to `bfloat`).
+inline bfloat paged_prefill_sigmoid_bf16(bfloat x) {
+  const bfloat ax = bfloat(abs(float(x)));
+  const bfloat ex = bfloat(precise::exp(float(ax)));
+  const bfloat denom = bfloat(1.0f + float(ex));
+  const bfloat y = bfloat(precise::divide(1.0f, float(denom)));
+  return float(x) < 0.0f ? y : bfloat(1.0f - float(y));
+}
+#pragma clang fp reassociate(on)
+#pragma clang fp contract(fast)
+
 // Splash SPLASH_ATTENTION_TILE_PARTS: the fewest parts of the 8-row tile with
 // at most 64 fused rows each.
 constexpr uint paged_prefill_tile_parts(uint group) {
@@ -245,7 +266,7 @@ inline float paged_prefill_query_codes(device const bfloat *queries,
 // is one 32-token block and `key_scales` / `value_scales` already point to the
 // page's 32 scales.
 template <uint Group, uint Rows, uint HeadDim, bool Quantized, typename Score,
-          bool KeysTokenMajor = false>
+          bool KeysTokenMajor = false, bool Masked = true>
 inline void paged_prefill_page_softmax(
     threadgroup const Score *scores, float score_scale,
     threadgroup bfloat *probabilities,
@@ -266,10 +287,13 @@ inline void paged_prefill_page_softmax(
     return;
   const uint fused_row = thread_index / LanesPerRow;
   const uint column = thread_index % LanesPerRow * TokensPerLane;
-  const uint query_row = fused_row / Group;
-  const uint causal_end = committed_tokens + min(query_row, active_rows - 1) + 1;
-  const uint limit = min(visible_tokens, causal_end);
   const uint token = token_start + column;
+  uint limit = 0u;
+  if constexpr (Masked) {
+    const uint query_row = fused_row / Group;
+    const uint causal_end = committed_tokens + min(query_row, active_rows - 1) + 1;
+    limit = min(visible_tokens, causal_end);
+  }
   device const float4 *key_scales4 = nullptr;
   device const float4 *value_scales4 = nullptr;
   if constexpr (KeysTokenMajor) {
@@ -278,8 +302,10 @@ inline void paged_prefill_page_softmax(
   } else if constexpr (Quantized) {
     const uint block_size = params.block_size;
     uint logical = token / block_size;
-    if (logical >= visible_blocks)
-      logical = token_start / block_size;
+    if constexpr (Masked) {
+      if (logical >= visible_blocks)
+        logical = token_start / block_size;
+    }
     const ulong slot =
         (ulong(uint(table[logical])) * params.kv_heads + kv_head) * block_size +
         token % block_size;
@@ -303,7 +329,9 @@ inline void paged_prefill_page_softmax(
   float local_max = -INFINITY;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    score[j] = token + j < limit ? score[j] : -INFINITY;
+    if constexpr (Masked) {
+      score[j] = token + j < limit ? score[j] : -INFINITY;
+    }
     local_max = max(local_max, score[j]);
   }
   local_max = max(local_max, simd_shuffle_xor(local_max, 1));
@@ -314,7 +342,11 @@ inline void paged_prefill_page_softmax(
   float local_sum = 0.0f;
 #pragma unroll
   for (uint j = 0; j < TokensPerLane; ++j) {
-    probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+    if constexpr (Masked) {
+      probability[j] = token + j < limit ? fast::exp(score[j] - next_max) : 0.0f;
+    } else {
+      probability[j] = fast::exp(score[j] - next_max);
+    }
     local_sum += probability[j];
   }
   local_sum += simd_shuffle_xor(local_sum, 1);
@@ -329,20 +361,30 @@ inline void paged_prefill_page_softmax(
     if (scale != 1.0f)
       atomic_store_explicit(rescale, 1u, memory_order_relaxed);
   }
-  // Masked tokens stay exactly zero whatever their stored value scale holds.
-  float4 low_scales(1.0f), high_scales(1.0f);
-  if constexpr (Quantized) {
-    low_scales = value_scales4[0];
-    high_scales = value_scales4[1];
+  float4 low, high;
+  if constexpr (Masked) {
+    // Masked tokens stay exactly zero whatever their stored value scale holds.
+    float4 low_scales(1.0f), high_scales(1.0f);
+    if constexpr (Quantized) {
+      low_scales = value_scales4[0];
+      high_scales = value_scales4[1];
+    }
+    low = float4(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
+                 token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
+                 token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
+                 token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
+    high = float4(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
+                  token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
+                  token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
+                  token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
+  } else {
+    low = float4(probability[0], probability[1], probability[2], probability[3]);
+    high = float4(probability[4], probability[5], probability[6], probability[7]);
+    if constexpr (Quantized) {
+      low *= value_scales4[0];
+      high *= value_scales4[1];
+    }
   }
-  const float4 low(token + 0 < limit ? probability[0] * low_scales.x : 0.0f,
-                   token + 1 < limit ? probability[1] * low_scales.y : 0.0f,
-                   token + 2 < limit ? probability[2] * low_scales.z : 0.0f,
-                   token + 3 < limit ? probability[3] * low_scales.w : 0.0f);
-  const float4 high(token + 4 < limit ? probability[4] * high_scales.x : 0.0f,
-                    token + 5 < limit ? probability[5] * high_scales.y : 0.0f,
-                    token + 6 < limit ? probability[6] * high_scales.z : 0.0f,
-                    token + 7 < limit ? probability[7] * high_scales.w : 0.0f);
   threadgroup bfloat4 *probabilities4 =
       reinterpret_cast<threadgroup bfloat4 *>(probabilities + fused_row * N + column);
   probabilities4[0] = bfloat4(low);
@@ -356,7 +398,9 @@ inline void paged_prefill_page_softmax(
 // a page is one 32-token pool block and K/V are read directly in place without
 // threadgroup staging (`keys` is unused/null). With Int8Queries the query
 // codes live in the threadgroup's own partials slot, which it writes only
-// after its last page.
+// after its last page. When `splits == 1`, the split normalizes and writes
+// BF16 directly to `output` (with optional fused `sigmoid(gate)`) and skips
+// writing FP32 partials/statistics.
 template <uint Group, uint Rows, uint HeadDim, typename CacheElement,
           bool Int8Queries, bool KeysTokenMajor = false>
 inline void paged_prefill_page_loop(
@@ -364,8 +408,10 @@ inline void paged_prefill_page_loop(
     device CacheElement *key_pool, device CacheElement *value_pool,
     device const float *key_scales, device const float *value_scales,
     constant PagedPrefillParams &params, uint kv_head, uint committed_tokens,
-    uint active_rows, uint splits, uint split, device float *partials,
-    device float *statistics, ulong slot, threadgroup float *scores,
+    uint tile_first_row, uint active_rows, uint splits, uint split,
+    device float *partials, device float *statistics, device bfloat *output,
+    device const bfloat *gate, constant PagedPrefillGateParams &gate_params,
+    ulong slot, threadgroup float *scores,
     threadgroup bfloat *probabilities, threadgroup CacheElement *keys,
     threadgroup float *row_max, threadgroup float *row_sum,
     threadgroup float *previous_scale, threadgroup atomic_uint *rescale,
@@ -392,9 +438,22 @@ inline void paged_prefill_page_loop(
   const uint pages = paged_prefill_pages(visible_tokens);
   const uint per_split = paged_prefill_pages_per_split(pages, splits);
   const uint page_begin = split * per_split;
-  if (page_begin >= pages)
+  if (page_begin >= pages) {
+    if (splits == 1u) {
+      const uint query_heads = kv_heads * Group;
+      const uint total_elems = active_rows * Group * HeadDim;
+      for (uint idx = thread_index; idx < total_elems; idx += PAGED_PREFILL_THREADS) {
+        const uint d = idx % HeadDim;
+        const uint fused_r = idx / HeadDim;
+        const uint row = tile_first_row + fused_r / Group;
+        const uint q_head = kv_head * Group + fused_r % Group;
+        output[(ulong(row) * query_heads + q_head) * HeadDim + d] = bfloat(0.0f);
+      }
+    }
     return;
+  }
   const uint page_end = min(pages, page_begin + per_split);
+  const uint whole_end = committed_tokens / N;
   static_assert(Quantized || !Int8Queries, "INT8 queries take INT8 keys");
   using QueryElement = conditional_t<Int8Queries, int8_t, bfloat>;
   using Score = conditional_t<Int8Queries, int, float>;
@@ -485,14 +544,25 @@ inline void paged_prefill_page_loop(
     if (thread_index == 0)
       atomic_store_explicit(rescale, 0u, memory_order_relaxed);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score,
-                               KeysTokenMajor>(
-        page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale,
-        rescale, table,
-        KeysTokenMajor ? (key_scales + ktm_first) : key_scales,
-        KeysTokenMajor ? (value_scales + ktm_first) : value_scales,
-        params, kv_head, token_start, visible_tokens,
-        visible_blocks, committed_tokens, active_rows, thread_index);
+    if (page < whole_end) {
+      paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score,
+                                 KeysTokenMajor, false>(
+          page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale,
+          rescale, table,
+          KeysTokenMajor ? (key_scales + ktm_first) : key_scales,
+          KeysTokenMajor ? (value_scales + ktm_first) : value_scales,
+          params, kv_head, token_start, visible_tokens,
+          visible_blocks, committed_tokens, active_rows, thread_index);
+    } else {
+      paged_prefill_page_softmax<Group, Rows, HeadDim, Quantized, Score,
+                                 KeysTokenMajor, true>(
+          page_score_tile, score_scale, probabilities, row_max, row_sum, previous_scale,
+          rescale, table,
+          KeysTokenMajor ? (key_scales + ktm_first) : key_scales,
+          KeysTokenMajor ? (value_scales + ktm_first) : value_scales,
+          params, kv_head, token_start, visible_tokens,
+          visible_blocks, committed_tokens, active_rows, thread_index);
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (atomic_load_explicit(rescale, memory_order_relaxed)) {
 #pragma unroll
@@ -525,6 +595,33 @@ inline void paged_prefill_page_loop(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
   }
+  if (splits == 1u) {
+    const uint query_heads = kv_heads * Group;
+    const bool has_gate = gate_params.has_gate != 0u;
+#pragma unroll
+    for (ushort index = 0; index < running.get_capacity(); ++index) {
+      if (!running_full && !running.is_valid_element(index))
+        continue;
+      auto coordinates = running.get_multidimensional_index(index);
+      const uint d = uint(coordinates[0]);
+      const uint fused_row = uint(coordinates[1]);
+      const uint local_row = fused_row / Group;
+      if (local_row >= active_rows)
+        continue;
+      const float denom = row_sum[fused_row];
+      bfloat out_val = bfloat(denom > 0.0f ? running[index] / denom : 0.0f);
+      const uint row = tile_first_row + local_row;
+      const uint q_head = kv_head * Group + (fused_row % Group);
+      if (has_gate) {
+        const ulong gate_idx = ulong(row) * ulong(gate_params.gate_row_stride) +
+                               ulong(q_head) * HeadDim + ulong(d);
+        const bfloat g_sig = paged_prefill_sigmoid_bf16(gate[gate_idx]);
+        out_val = bfloat(float(out_val) * float(g_sig));
+      }
+      output[(ulong(row) * query_heads + q_head) * HeadDim + d] = out_val;
+    }
+    return;
+  }
   auto target = tensor(partials + slot * M * D, dextents<int, 2>{D, M},
                        array<int, 2>{1, D});
   running.store(target.slice<D, M>(0, 0));
@@ -543,6 +640,8 @@ inline void paged_prefill_split_phase(
     device const int *table, device CacheElement *key_pool,
     device CacheElement *value_pool, device const float *key_scales,
     device const float *value_scales, constant PagedPrefillParams &params,
+    device bfloat *output, device const bfloat *gate,
+    constant PagedPrefillGateParams &gate_params,
     threadgroup float *scores, threadgroup bfloat *probabilities,
     threadgroup CacheElement *keys, threadgroup float *row_max,
     threadgroup float *row_sum, threadgroup float *previous_scale,
@@ -558,9 +657,10 @@ inline void paged_prefill_split_phase(
   paged_prefill_page_loop<Group, PAGED_PREFILL_TILE_ROWS / Parts, HeadDim, CacheElement,
                           Int8Queries, KeysTokenMajor>(
       queries + tile.offset, table, key_pool, value_pool, key_scales, value_scales,
-      params, kv_head, tile.first_position, tile.active_rows, tile.splits, split,
-      partials, statistics, tile.first_slot + split, scores, probabilities, keys,
-      row_max, row_sum, previous_scale, rescale, thread_index);
+      params, kv_head, tile.first_position, tile.first_row, tile.active_rows,
+      tile.splits, split, partials, statistics, output, gate, gate_params,
+      tile.first_slot + split, scores, probabilities, keys, row_max, row_sum,
+      previous_scale, rescale, thread_index);
 }
 
 // Splash splash_attention_combine_splits: one fused row's first `written`
@@ -568,8 +668,9 @@ inline void paged_prefill_split_phase(
 template <uint Group, uint Rows, uint HeadDim>
 inline void paged_prefill_combine_splits(
     device const float *partials, device const float *statistics,
-    device bfloat *row_output, uint active_rows, uint written, ulong head_slot,
-    uint fused_row, uint thread_index, threadgroup float *weights,
+    device bfloat *row_output, device const bfloat *row_gate, bool has_gate,
+    uint active_rows, uint written, ulong head_slot, uint fused_row,
+    uint thread_index, threadgroup float *weights,
     threadgroup float *group_values) {
   constexpr uint M = Rows * Group;
   constexpr uint D = HeadDim;
@@ -598,20 +699,24 @@ inline void paged_prefill_combine_splits(
     numerator += weight * partials[slot * D + thread_index];
     denominator += weight * statistics[slot * 2 + 1];
   }
-  row_output[thread_index] = bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+  bfloat out_val = bfloat(denominator > 0.0f ? numerator / denominator : 0.0f);
+  if (has_gate) {
+    const bfloat g_sig = paged_prefill_sigmoid_bf16(row_gate[thread_index]);
+    out_val = bfloat(float(out_val) * float(g_sig));
+  }
+  row_output[thread_index] = out_val;
 }
 
 // Splash splash_prefill_attention_reduce_phase + splash_attention_reduce_row:
 // a threadgroup of HeadDim threads per fused row of a whole tile; the row
 // finds its part and recomputes that part's split partition.
 template <uint Group, uint HeadDim>
-inline void paged_prefill_reduce_phase(device const float *partials,
-                                       device const float *statistics,
-                                       device bfloat *output,
-                                       constant PagedPrefillParams &params,
-                                       uint3 group, uint thread_index,
-                                       threadgroup float *weights,
-                                       threadgroup float *group_values) {
+inline void paged_prefill_reduce_phase(
+    device const float *partials, device const float *statistics,
+    device bfloat *output, constant PagedPrefillParams &params,
+    device const bfloat *gate, constant PagedPrefillGateParams &gate_params,
+    uint3 group, uint thread_index, threadgroup float *weights,
+    threadgroup float *group_values) {
   constexpr uint M = PAGED_PREFILL_TILE_ROWS * Group;
   constexpr uint Parts = paged_prefill_tile_parts(Group);
   constexpr uint PartRows = PAGED_PREFILL_TILE_ROWS / Parts;
@@ -624,8 +729,15 @@ inline void paged_prefill_reduce_phase(device const float *partials,
   if (row >= params.rows)
     return;
   const uint query_heads = params.kv_heads * Group;
+  const uint q_head = group.x * Group + fused_row % Group;
   device bfloat *row_output =
-      output + (ulong(row) * query_heads + group.x * Group + fused_row % Group) * HeadDim;
+      output + (ulong(row) * query_heads + q_head) * HeadDim;
+  const bool has_gate = gate_params.has_gate != 0u;
+  device const bfloat *row_gate =
+      has_gate
+          ? (gate + ulong(row) * ulong(gate_params.gate_row_stride) +
+             ulong(q_head) * HeadDim)
+          : nullptr;
   const PagedPrefillTile tile = paged_prefill_tile_part<Group, Parts, HeadDim>(
       whole, fused_row / PartM, params.split_count);
   if (!tile.active) {
@@ -636,8 +748,9 @@ inline void paged_prefill_reduce_phase(device const float *partials,
   const uint per_split = paged_prefill_pages_per_split(pages, tile.splits);
   const uint written = (pages + per_split - 1) / per_split;
   paged_prefill_combine_splits<Group, PartRows, HeadDim>(
-      partials, statistics, row_output, tile.active_rows, written, tile.first_slot,
-      fused_row % PartM, thread_index, weights, group_values);
+      partials, statistics, row_output, row_gate, has_gate, tile.active_rows,
+      written, tile.first_slot, fused_row % PartM, thread_index, weights,
+      group_values);
 }
 
 #define PAGED_PREFILL_SPLIT(Name, Group, HeadDim, CacheElement, Int8Queries)    \
@@ -651,6 +764,9 @@ inline void paged_prefill_reduce_phase(device const float *partials,
       device const float *key_scales [[buffer(6)]],                            \
       device const float *value_scales [[buffer(7)]],                          \
       constant PagedPrefillParams &params [[buffer(8)]],                       \
+      device bfloat *output [[buffer(9)]],                                     \
+      device const bfloat *gate [[buffer(10)]],                                \
+      constant PagedPrefillGateParams &gate_params [[buffer(11)]],             \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS /                       \
@@ -665,8 +781,9 @@ inline void paged_prefill_reduce_phase(device const float *partials,
     threadgroup atomic_uint rescale;                                           \
     paged_prefill_split_phase<Group, HeadDim, CacheElement, Int8Queries>(      \
         queries, partials, statistics, table, key_pool, value_pool,            \
-        key_scales, value_scales, params, scores, probabilities, keys,         \
-        row_max, row_sum, previous_scale, &rescale, group, thread_index);      \
+        key_scales, value_scales, params, output, gate, gate_params, scores,   \
+        probabilities, keys, row_max, row_sum, previous_scale, &rescale,       \
+        group, thread_index);                                                  \
   }
 
 #define PAGED_PREFILL_REDUCE(Name, Group, HeadDim)                              \
@@ -675,13 +792,15 @@ inline void paged_prefill_reduce_phase(device const float *partials,
       device const float *statistics [[buffer(1)]],                            \
       device bfloat *output [[buffer(2)]],                                     \
       constant PagedPrefillParams &params [[buffer(3)]],                       \
+      device const bfloat *gate [[buffer(4)]],                                 \
+      constant PagedPrefillGateParams &gate_params [[buffer(5)]],              \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     threadgroup float weights[PAGED_PREFILL_MAX_SPLITS];                       \
     threadgroup float group_values[HeadDim / 32];                              \
-    paged_prefill_reduce_phase<Group, HeadDim>(partials, statistics, output,   \
-                                               params, group, thread_index,    \
-                                               weights, group_values);         \
+    paged_prefill_reduce_phase<Group, HeadDim>(                                \
+        partials, statistics, output, params, gate, gate_params, group,        \
+        thread_index, weights, group_values);                                  \
   }
 
 #define PAGED_PREFILL_INSTANCES(Group, HeadDim)                                 \
@@ -773,6 +892,9 @@ PAGED_QUERY_CODES(256)
       device const float *key_scales [[buffer(6)]],                            \
       device const float *value_scales [[buffer(7)]],                          \
       constant PagedPrefillParams &params [[buffer(8)]],                       \
+      device bfloat *output [[buffer(9)]],                                     \
+      device const bfloat *gate [[buffer(10)]],                                \
+      constant PagedPrefillGateParams &gate_params [[buffer(11)]],             \
       uint3 group [[threadgroup_position_in_grid]],                            \
       uint thread_index [[thread_index_in_threadgroup]]) {                     \
     constexpr uint M = Group * PAGED_PREFILL_TILE_ROWS /                       \
@@ -786,11 +908,286 @@ PAGED_QUERY_CODES(256)
     threadgroup atomic_uint rescale;                                           \
     paged_prefill_split_phase<Group, HeadDim, int8_t, Int8Queries, true>(      \
         queries, partials, statistics, table, key_pool, value_pool,            \
-        key_scales, value_scales, params, scores, probabilities,               \
-        static_cast<threadgroup int8_t *>(nullptr), row_max, row_sum,          \
-        previous_scale, &rescale, group, thread_index);                        \
+        key_scales, value_scales, params, output, gate, gate_params, scores,   \
+        probabilities, static_cast<threadgroup int8_t *>(nullptr), row_max,    \
+        row_sum, previous_scale, &rescale, group, thread_index);               \
   }
 
 PAGED_PREFILL_KTM_SPLIT(paged_prefill_attention_q8_split_g6_d256_ktm, 6, 256, false)
 PAGED_PREFILL_KTM_SPLIT(paged_prefill_attention_q8q_split_g6_d256_ktm, 6, 256, true)
+
+// =============================================================================
+// Qwen3.5 Fused QK-Norm + Partial RoPE + Q Staging + Paged KV Write (D = 256)
+// =============================================================================
+// Distinct kernel prefix `qwen35_qkv_prep_*` (outside `paged_prefill_attention_`).
+// Mirrored by host `Qwen35QkvPrepParams` (64 bytes).
+struct Qwen35QkvPrepParams {
+  uint num_tokens;
+  uint chunk_stride;
+  uint num_q_heads;
+  uint num_kv_heads;
+  uint block_size;
+  uint rope_dims;
+  int rope_offset;
+  float eps;
+  float log2_base;
+  float rope_scale;
+  uint q_row_stride;
+  uint q_head_stride;
+  uint k_row_stride;
+  uint k_head_stride;
+  uint v_row_stride;
+  uint v_head_stride;
+};
+
+#pragma clang fp reassociate(off)
+#pragma clang fp contract(off)
+
+// RMSNorm + partial NeoX half-split RoPE for one 256-dim BF16 vector (256 threads).
+// Mirrors MLX `fast::rms_norm` + `fast::rope(traditional=false)` rounding normed
+// values to BF16 before rotation.
+inline bfloat qwen35_qkv_prep_rmsnorm_rope_d256(
+    float x_f,
+    bfloat w_d,
+    uint t,
+    uint d,
+    uint simd_lane,
+    uint simd_group,
+    constant Qwen35QkvPrepParams &params,
+    threadgroup float *tg_reduce,
+    threadgroup float *tg_inv_rms,
+    threadgroup bfloat *normed) {
+  float acc = simd_sum(x_f * x_f);
+  if (simd_lane == 0u) {
+    tg_reduce[simd_group] = acc;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group == 0u) {
+    const float partial = simd_lane < 8u ? tg_reduce[simd_lane] : 0.0f;
+    const float sum = simd_sum(partial);
+    if (simd_lane == 0u) {
+      *tg_inv_rms = precise::rsqrt(sum * (1.0f / 256.0f) + params.eps);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const bfloat normed_d = w_d * bfloat(x_f * (*tg_inv_rms));
+  normed[d] = normed_d;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+
+  if (params.rope_dims > 0u && d < params.rope_dims) {
+    const uint half_rot = params.rope_dims >> 1u;
+    const uint p = d < half_rot ? d : d - half_rot;
+    const float dd = precise::divide(float(p), float(half_rot));
+    const float inv_freq = precise::exp2(-dd * params.log2_base);
+    const float L = params.rope_scale * float(int(t) + params.rope_offset);
+    const float theta = L * inv_freq;
+    const float costheta = fast::cos(theta);
+    const float sintheta = fast::sin(theta);
+    const float x1 = float(normed[p]);
+    const float x2 = float(normed[p + half_rot]);
+    const float r = d < half_rot ? (x1 * costheta - x2 * sintheta)
+                                 : (x1 * sintheta + x2 * costheta);
+    return bfloat(r);
+  }
+  return normed_d;
+}
+
+// Per-row symmetric INT8 quantization bit-identical to `kv_int8_store.metal`
+// (`-fno-fast-math`, `precise::divide`, 8-simdgroup max reduction).
+inline int8_t qwen35_qkv_prep_quantize_int8_d256(
+    float val_f,
+    uint simd_lane,
+    uint simd_group,
+    threadgroup float *tg_reduce,
+    thread float &out_scale) {
+  const float local_maximum = simd_max(abs(val_f));
+  if (simd_lane == 0u) {
+    tg_reduce[simd_group] = local_maximum;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (simd_group == 0u) {
+    for (uint offset = 4u; offset != 0u; offset >>= 1u) {
+      if (simd_lane < offset) {
+        tg_reduce[simd_lane] = max(tg_reduce[simd_lane], tg_reduce[simd_lane + offset]);
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  const float maximum = tg_reduce[0];
+  out_scale = maximum == 0.0f ? 0.0f : precise::divide(maximum, 127.0f);
+  const int quantized =
+      maximum == 0.0f
+          ? 0
+          : clamp(int(precise::rint(precise::divide(val_f * 127.0f, maximum))), -127, 127);
+  return int8_t(quantized);
+}
+
+template <bool IsInt8Ktm>
+inline void qwen35_qkv_prep_impl(
+    device const bfloat *q_raw,
+    device const bfloat *k_raw,
+    device const bfloat *v_raw,
+    device const bfloat *wq,
+    device const bfloat *wk,
+    device const int64_t *slot_mapping,
+    device bfloat *q_staged,
+    device conditional_t<IsInt8Ktm, int8_t, bfloat> *k_pool,
+    device conditional_t<IsInt8Ktm, int8_t, bfloat> *v_pool,
+    device float *k_scale,
+    device float *v_scale,
+    constant Qwen35QkvPrepParams &params,
+    threadgroup float *tg_reduce,
+    threadgroup float *tg_inv_rms,
+    threadgroup bfloat *normed,
+    uint group_id,
+    uint d,
+    uint simd_lane,
+    uint simd_group) {
+  constexpr uint D = 256u;
+
+  const uint q_groups = params.chunk_stride * params.num_q_heads;
+  const uint kv_groups = params.num_tokens * params.num_kv_heads;
+
+  if (group_id < q_groups) {
+    const uint t = group_id % params.chunk_stride;
+    const uint q_head = group_id / params.chunk_stride;
+    const uint group = params.num_q_heads / params.num_kv_heads;
+    const uint kv_head = q_head / group;
+    const uint g_in_kv = q_head % group;
+    const ulong dst = ((ulong(kv_head) * ulong(params.chunk_stride) + ulong(t)) *
+                           ulong(group) +
+                       ulong(g_in_kv)) *
+                          ulong(D) +
+                      ulong(d);
+    if (t >= params.num_tokens) {
+      q_staged[dst] = bfloat(0.0f);
+      return;
+    }
+    const ulong src = ulong(t) * ulong(params.q_row_stride) +
+                      ulong(q_head) * ulong(params.q_head_stride) + ulong(d);
+    const bfloat q_rot = qwen35_qkv_prep_rmsnorm_rope_d256(
+        float(q_raw[src]), wq[d], t, d, simd_lane, simd_group, params, tg_reduce,
+        tg_inv_rms, normed);
+    q_staged[dst] = q_rot;
+    return;
+  }
+
+  const uint kv_id = group_id - q_groups;
+  const bool is_value = kv_id >= kv_groups;
+  const uint row = is_value ? (kv_id - kv_groups) : kv_id;
+  if (row >= kv_groups) {
+    return;
+  }
+  const uint t = row % params.num_tokens;
+  const uint kv_head = row / params.num_tokens;
+  const int64_t slot = slot_mapping[t];
+  if (slot < 0) {
+    return;
+  }
+  const ulong block = ulong(slot / int64_t(params.block_size));
+  const ulong page_token = ulong(slot % int64_t(params.block_size));
+  const ulong block_head = block * ulong(params.num_kv_heads) + ulong(kv_head);
+  const ulong scale_index = block_head * ulong(params.block_size) + page_token;
+
+  if (!is_value) {
+    const ulong src = ulong(t) * ulong(params.k_row_stride) +
+                      ulong(kv_head) * ulong(params.k_head_stride) + ulong(d);
+    const bfloat k_rot = qwen35_qkv_prep_rmsnorm_rope_d256(
+        float(k_raw[src]), wk[d], t, d, simd_lane, simd_group, params, tg_reduce,
+        tg_inv_rms, normed);
+    if constexpr (IsInt8Ktm) {
+      float scale = 0.0f;
+      const int8_t q_code = qwen35_qkv_prep_quantize_int8_d256(
+          float(k_rot), simd_lane, simd_group, tg_reduce, scale);
+      k_pool[scale_index * ulong(D) + ulong(d)] = q_code;
+      if (d == 0u) {
+        k_scale[scale_index] = scale;
+      }
+    } else {
+      // BF16 vLLM layout: [num_blocks, num_kv_heads, 256/8, block_size, 8]
+      constexpr uint X = 8u;
+      constexpr uint Chunks = D / X;
+      const ulong dst =
+          ((block_head * ulong(Chunks) + ulong(d / X)) * ulong(params.block_size) +
+           page_token) *
+              ulong(X) +
+          ulong(d % X);
+      k_pool[dst] = k_rot;
+    }
+  } else {
+    const ulong src = ulong(t) * ulong(params.v_row_stride) +
+                      ulong(kv_head) * ulong(params.v_head_stride) + ulong(d);
+    const bfloat v_val = v_raw[src];
+    const ulong v_dst =
+        (block_head * ulong(D) + ulong(d)) * ulong(params.block_size) + page_token;
+    if constexpr (IsInt8Ktm) {
+      float scale = 0.0f;
+      const int8_t q_code = qwen35_qkv_prep_quantize_int8_d256(
+          float(v_val), simd_lane, simd_group, tg_reduce, scale);
+      v_pool[v_dst] = q_code;
+      if (d == 0u) {
+        v_scale[scale_index] = scale;
+      }
+    } else {
+      v_pool[v_dst] = v_val;
+    }
+  }
+}
+
+#pragma clang fp reassociate(on)
+#pragma clang fp contract(fast)
+
+[[kernel, max_total_threads_per_threadgroup(256)]] void qwen35_qkv_prep_int8_ktm_d256(
+    device const bfloat *q_raw [[buffer(0)]],
+    device const bfloat *k_raw [[buffer(1)]],
+    device const bfloat *v_raw [[buffer(2)]],
+    device const bfloat *wq [[buffer(3)]],
+    device const bfloat *wk [[buffer(4)]],
+    device const int64_t *slot_mapping [[buffer(5)]],
+    device bfloat *q_staged [[buffer(6)]],
+    device int8_t *k_pool [[buffer(7)]],
+    device int8_t *v_pool [[buffer(8)]],
+    device float *k_scale [[buffer(9)]],
+    device float *v_scale [[buffer(10)]],
+    constant Qwen35QkvPrepParams &params [[buffer(11)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint d [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float tg_reduce[8];
+  threadgroup float tg_inv_rms;
+  threadgroup bfloat normed[256];
+  qwen35_qkv_prep_impl<true>(
+      q_raw, k_raw, v_raw, wq, wk, slot_mapping, q_staged, k_pool, v_pool,
+      k_scale, v_scale, params, tg_reduce, &tg_inv_rms, normed, group_id, d,
+      simd_lane, simd_group);
+}
+
+[[kernel, max_total_threads_per_threadgroup(256)]] void qwen35_qkv_prep_bf16_vllm_d256(
+    device const bfloat *q_raw [[buffer(0)]],
+    device const bfloat *k_raw [[buffer(1)]],
+    device const bfloat *v_raw [[buffer(2)]],
+    device const bfloat *wq [[buffer(3)]],
+    device const bfloat *wk [[buffer(4)]],
+    device const int64_t *slot_mapping [[buffer(5)]],
+    device bfloat *q_staged [[buffer(6)]],
+    device bfloat *k_pool [[buffer(7)]],
+    device bfloat *v_pool [[buffer(8)]],
+    device float *k_scale [[buffer(9)]],
+    device float *v_scale [[buffer(10)]],
+    constant Qwen35QkvPrepParams &params [[buffer(11)]],
+    uint group_id [[threadgroup_position_in_grid]],
+    uint d [[thread_position_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float tg_reduce[8];
+  threadgroup float tg_inv_rms;
+  threadgroup bfloat normed[256];
+  qwen35_qkv_prep_impl<false>(
+      q_raw, k_raw, v_raw, wq, wk, slot_mapping, q_staged, k_pool, v_pool,
+      k_scale, v_scale, params, tg_reduce, &tg_inv_rms, normed, group_id, d,
+      simd_lane, simd_group);
+}
+
 #include "paged_prefill_attention_inkling2.h"

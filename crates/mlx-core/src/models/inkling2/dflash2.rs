@@ -17,8 +17,8 @@ use crate::engine::backend::DsparkProposal;
 use crate::engine::params::ChatParams;
 use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::dflash2::{
-    DFlash2Config, DFlash2ContextCache, DFlash2Model, DFlash2TargetShape, DFlash2TargetView,
-    SelectorPath, read_dflash2_config,
+    DFlash2BatchProposalLane, DFlash2Config, DFlash2ContextCache, DFlash2Model, DFlash2TargetShape,
+    DFlash2TargetView, SelectorPath, read_dflash2_config,
 };
 use crate::models::qwen3_5::verify_tree::{
     DRAFT_SLOTS, DraftLattice, LookupAcceptance, LookupIndex, MAX_TREE_NODES, TreeCostModel,
@@ -361,18 +361,22 @@ pub(crate) struct Inkling2TargetView<'a> {
 impl DFlash2TargetView for Inkling2TargetView<'_> {
     fn embed(&mut self, block: &MxArray, _ids: &[i32]) -> Result<MxArray> {
         let raw = self.embed_tokens.forward(block)?;
+        let batch = raw.shape_at(0)?;
         let rows = raw.shape_at(1)?;
         let hidden = raw.shape_at(2)?;
-        let flat = raw.reshape(&[rows, hidden])?;
+        let total_rows = batch * rows;
+        let flat = raw.reshape(&[total_rows, hidden])?;
         let normed =
             apply_sublayer_rms_norm(&flat, self.embed_norm, self.rms_norm_eps, DType::BFloat16)?;
-        normed.reshape(&[1, rows, hidden])
+        normed.reshape(&[batch, rows, hidden])
     }
 
     fn logits(&mut self, hidden: &MxArray) -> Result<MxArray> {
+        let batch = hidden.shape_at(0)?;
         let rows = hidden.shape_at(1)?;
         let dim = hidden.shape_at(2)?;
-        let x2d_raw = hidden.reshape(&[rows, dim])?;
+        let total_rows = batch * rows;
+        let x2d_raw = hidden.reshape(&[total_rows, dim])?;
         let x2d = if x2d_raw.dtype()? == DType::BFloat16 {
             x2d_raw
         } else {
@@ -383,7 +387,7 @@ impl DFlash2TargetView for Inkling2TargetView<'_> {
         if let LinearProj::Quantized(ql) = self.lm_head
             && ql.is_symmetric_q8()
             && unsafe { mlx_sys::mlx_metal_is_available() }
-            && (1..=32).contains(&rows)
+            && (1..=32).contains(&total_rows)
             && dim > 0
             && dim % 32 == 0
         {
@@ -399,14 +403,14 @@ impl DFlash2TargetView for Inkling2TargetView<'_> {
                 0.0,
                 DType::Float32,
             )?;
-            return logits_2d.reshape(&[1, rows, out_cols as i64]);
+            return logits_2d.reshape(&[batch, rows, out_cols as i64]);
         }
 
         #[cfg(target_os = "macos")]
         if let LinearProj::Standard(lin) = self.lm_head
             && lin.get_bias().is_none()
             && unsafe { mlx_sys::mlx_metal_is_available() }
-            && (1..=32).contains(&rows)
+            && (1..=32).contains(&total_rows)
             && dim > 0
             && dim % 4 == 0
         {
@@ -426,7 +430,7 @@ impl DFlash2TargetView for Inkling2TargetView<'_> {
                     &w
                 };
                 let logits_2d = super::kernels::inkling2_bf16_linear(&x2d, w_unpadded)?;
-                return logits_2d.reshape(&[1, rows, out_cols as i64]);
+                return logits_2d.reshape(&[batch, rows, out_cols as i64]);
             }
         }
 
@@ -438,7 +442,7 @@ impl DFlash2TargetView for Inkling2TargetView<'_> {
         } else {
             raw_2d
         };
-        sliced.reshape(&[1, rows, out_cols as i64])
+        sliced.reshape(&[batch, rows, out_cols as i64])
     }
 
     fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)> {
@@ -458,6 +462,15 @@ pub(crate) struct Inkling2Dflash2Context {
     pub(crate) lookup: LookupIndex,
     pub(crate) lookup_acc: LookupAcceptance,
     pub(crate) verify_budget: VerifyBudget,
+}
+
+/// One lane participating in [`Inkling2Dflash2Context::propose_blocks_batched`].
+pub(crate) struct BatchedDflash2Lane<'a> {
+    pub(crate) ctx: &'a mut Inkling2Dflash2Context,
+    pub(crate) anchor_id: u32,
+    pub(crate) max_drafts: usize,
+    pub(crate) params: &'a ChatParams,
+    pub(crate) confidence: bool,
 }
 
 impl Inkling2Dflash2Context {
@@ -605,6 +618,236 @@ impl Inkling2Dflash2Context {
         let fused = draft.fuse_context(&taps_3d)?;
         self.cache.append(draft, &fused, base, token_ids)?;
         Ok(Some(fused))
+    }
+
+    /// Batched counterpart to [`Self::append_taps`] across `N` lanes: stacks all
+    /// healthy `keep > 0` lanes' kept tap rows along axis 0 (`[1, sum(keep_i), H]`),
+    /// runs ONE `draft.fuse_context` and ONE batched K/V projection via
+    /// [`DFlash2ContextCache::append_batched`], and returns one `Result<Option<MxArray>>`
+    /// per lane (`Ok(None)` when `keep_i == 0`, `Ok(Some(fused_i))` for PR #408 live
+    /// `DraftContextWindow` capture) so a fault on one lane NEVER aborts healthy peers.
+    pub(crate) fn append_taps_batched(
+        draft: &DFlash2Model,
+        items: &mut [(&mut Inkling2Dflash2Context, &[MxArray], &[u32])],
+    ) -> Vec<Result<Option<MxArray>>> {
+        let mut results: Vec<Option<Result<Option<MxArray>>>> =
+            (0..items.len()).map(|_| None).collect();
+        let expected = draft.config.target_layers.len();
+        let hidden_size = draft.config.hidden_size;
+
+        // 1. Pre-validate every lane independently so a malformed lane gets its own `Err`
+        //    without aborting healthy peers in the wave.
+        let mut valid_indices = Vec::with_capacity(items.len());
+        for (idx, (ctx, taps, token_ids)) in items.iter().enumerate() {
+            if token_ids.is_empty() {
+                results[idx] = Some(Ok(None));
+                continue;
+            }
+            let keep = token_ids.len();
+            let check = (|| -> Result<()> {
+                if expected == 0 {
+                    return Err(Error::from_reason(
+                        "Inkling2 DFlash2 append_taps_batched: empty target_layers",
+                    ));
+                }
+                if taps.len() != expected {
+                    return Err(Error::from_reason(format!(
+                        "Inkling2 DFlash2 append_taps_batched expected {expected} taps, got {}",
+                        taps.len()
+                    )));
+                }
+                for tap in *taps {
+                    if tap.ndim()? != 2 {
+                        return Err(Error::from_reason(format!(
+                            "Inkling2 DFlash2 append_taps_batched expected 2D tap, got {}D",
+                            tap.ndim()?
+                        )));
+                    }
+                    let total_rows = tap.shape_at(0)? as usize;
+                    if keep > total_rows {
+                        return Err(Error::from_reason(format!(
+                            "Inkling2 DFlash2 append_taps_batched keep={keep} exceeds tap rows {total_rows}"
+                        )));
+                    }
+                    let cols = tap.shape_at(1)? as usize;
+                    if cols != hidden_size {
+                        return Err(Error::from_reason(format!(
+                            "Inkling2 DFlash2 append_taps_batched tap hidden {cols} != {hidden_size}"
+                        )));
+                    }
+                }
+                draft.validate_context_for_append(&ctx.cache, keep)?;
+                Ok(())
+            })();
+            match check {
+                Ok(()) => valid_indices.push(idx),
+                Err(err) => results[idx] = Some(Err(err)),
+            }
+        }
+
+        let finish = |results: Vec<Option<Result<Option<MxArray>>>>| {
+            results
+                .into_iter()
+                .map(|slot| {
+                    slot.unwrap_or_else(|| {
+                        Err(Error::from_reason(
+                            "Inkling2 DFlash2 append_taps_batched missing slot",
+                        ))
+                    })
+                })
+                .collect::<Vec<_>>()
+        };
+
+        if valid_indices.is_empty() {
+            return finish(results);
+        }
+        if valid_indices.len() == 1 {
+            let idx = valid_indices[0];
+            let (ctx, taps, token_ids) = &mut items[idx];
+            results[idx] = Some(ctx.append_taps(draft, taps, token_ids));
+            return finish(results);
+        }
+
+        // 2. Slice and BF16-cast each healthy lane's taps individually (isolating any per-lane
+        //    slice/cast error before concatenating).
+        let mut prepared_lanes: Vec<(usize, Vec<MxArray>)> =
+            Vec::with_capacity(valid_indices.len());
+        for &idx in &valid_indices {
+            let (_, taps, token_ids) = &items[idx];
+            let keep = token_ids.len() as i64;
+            let lane_slices = (|| -> Result<Vec<MxArray>> {
+                let mut slices = Vec::with_capacity(expected);
+                for tap in *taps {
+                    let rows = tap.shape_at(0)?;
+                    let sliced = if keep < rows {
+                        tap.slice_axis(0, 0, keep)?
+                    } else {
+                        tap.clone()
+                    };
+                    let bf16 = if sliced.dtype()? == DType::BFloat16 {
+                        sliced
+                    } else {
+                        sliced.astype(DType::BFloat16)?
+                    };
+                    slices.push(bf16);
+                }
+                Ok(slices)
+            })();
+            match lane_slices {
+                Ok(slices) => prepared_lanes.push((idx, slices)),
+                Err(err) => results[idx] = Some(Err(err)),
+            }
+        }
+
+        if prepared_lanes.is_empty() {
+            return finish(results);
+        }
+        if prepared_lanes.len() == 1 {
+            let idx = prepared_lanes[0].0;
+            let (ctx, taps, token_ids) = &mut items[idx];
+            results[idx] = Some(ctx.append_taps(draft, taps, token_ids));
+            return finish(results);
+        }
+
+        // 3. Stack & run ONE `draft.fuse_context`; on shared error, fall back per-lane so
+        //    healthy peers still commit their draft caches.
+        let fused_all_res = (|| -> Result<MxArray> {
+            let mut stacked_taps = Vec::with_capacity(expected);
+            for tap_idx in 0..expected {
+                let refs = prepared_lanes
+                    .iter()
+                    .map(|(_, slices)| &slices[tap_idx])
+                    .collect::<Vec<_>>();
+                stacked_taps.push(MxArray::concatenate_many(refs, Some(0))?.expand_dims(0)?);
+            }
+            draft.fuse_context(&stacked_taps)
+        })();
+        let fused_all = match fused_all_res {
+            Ok(fused) => fused,
+            Err(_) => {
+                for (idx, _) in prepared_lanes {
+                    let (ctx, taps, token_ids) = &mut items[idx];
+                    results[idx] = Some(ctx.append_taps(draft, taps, token_ids));
+                }
+                return finish(results);
+            }
+        };
+
+        // 4. Run ONE batched KV projection + ring append. Snapshot every lane's `logical_len`
+        //    and per-layer ring `end` cursors beforehand so if `append_batched` fails:
+        //    - earlier lanes that already advanced `logical_len` stay `Ok(Some(fused_i))`,
+        //    - any partially mutated lane (ring `end` moved without advancing `logical_len`) or
+        //      the first unadvanced lane after a succeeded lane gets `Err(batch_err)` and is NEVER
+        //      retried (caller discards its draft owner),
+        //    - untouched lanes (either after the failing lane, or when `project_context_batched`
+        //      failed before any ring write) commit independently via `cache.append`.
+        let mut active_mask = vec![false; items.len()];
+        let mut before_lens = Vec::with_capacity(prepared_lanes.len());
+        let mut before_ends = Vec::with_capacity(prepared_lanes.len());
+        let mut active_keeps = Vec::with_capacity(prepared_lanes.len());
+        for &(idx, _) in &prepared_lanes {
+            active_mask[idx] = true;
+            before_lens.push(items[idx].0.cache.logical_len());
+            before_ends.push(DFlash2Model::context_window_ends(&items[idx].0.cache));
+            active_keeps.push(items[idx].2.len());
+        }
+
+        let batch_res = {
+            let mut cache_lanes: Vec<(&mut DFlash2ContextCache, &[u32])> = items
+                .iter_mut()
+                .enumerate()
+                .filter(|(idx, _)| active_mask[*idx])
+                .map(|(_, (ctx, _, token_ids))| (&mut ctx.cache, *token_ids))
+                .collect();
+            DFlash2ContextCache::append_batched(draft, &fused_all, &mut cache_lanes)
+        };
+
+        match batch_res {
+            Ok(()) => {
+                let mut off = 0i64;
+                for (&(idx, _), &keep) in prepared_lanes.iter().zip(&active_keeps) {
+                    let keep_i64 = keep as i64;
+                    results[idx] = Some(fused_all.slice_axis(1, off, off + keep_i64).map(Some));
+                    off += keep_i64;
+                }
+            }
+            Err(batch_err) => {
+                let mut off = 0i64;
+                let mut any_advanced = false;
+                let mut seen_failed = false;
+                for (((&(idx, _), &before_len), before_end), &keep) in prepared_lanes
+                    .iter()
+                    .zip(&before_lens)
+                    .zip(&before_ends)
+                    .zip(&active_keeps)
+                {
+                    let keep_i64 = keep as i64;
+                    let (ctx, _, token_ids) = &mut items[idx];
+                    if ctx.cache.logical_len() == before_len + keep as i32 {
+                        any_advanced = true;
+                        results[idx] = Some(fused_all.slice_axis(1, off, off + keep_i64).map(Some));
+                    } else if DFlash2Model::context_window_ends(&ctx.cache) != *before_end
+                        || (any_advanced && !seen_failed)
+                    {
+                        seen_failed = true;
+                        results[idx] = Some(Err(Error::from_reason(batch_err.reason.clone())));
+                    } else {
+                        let lane_res = (|| -> Result<Option<MxArray>> {
+                            let fused_i = fused_all.slice_axis(1, off, off + keep_i64)?;
+                            ctx.cache.append(draft, &fused_i, before_len, token_ids)?;
+                            Ok(Some(fused_i))
+                        })();
+                        if lane_res.is_err() {
+                            seen_failed = true;
+                        }
+                        results[idx] = Some(lane_res);
+                    }
+                    off += keep_i64;
+                }
+            }
+        }
+
+        finish(results)
     }
 
     /// Tree-verify counterpart to [`Self::append_taps`]: reuses contiguous prefix slicing
@@ -823,6 +1066,174 @@ impl Inkling2Dflash2Context {
         }
     }
 
+    /// Batched multi-lane DFlash2 proposal over `2..=4` active lanes: runs ONE
+    /// `[N, block_size + 1]` embed, ONE batched 5-layer draft pass, ONE
+    /// `[N, block_size, valid_vocab]` `lm_head` matmul, and per-lane candidate
+    /// selection + truncation to each lane's `max_drafts.min(block_size)`,
+    /// returning one `Result<DsparkProposal>` per lane so a single-lane selector
+    /// or conversion failure never aborts healthy peers.
+    ///
+    /// Keeps `<= 1` active lane on [`Self::propose_block`] so single-lane turns
+    /// stay on their compiled solo Metal graph.
+    pub(crate) fn propose_blocks_batched(
+        draft: &DFlash2Model,
+        view: &mut Inkling2TargetView<'_>,
+        lanes: &mut [BatchedDflash2Lane<'_>],
+        rngs: &mut [&mut dyn rand::Rng],
+    ) -> Vec<Result<DsparkProposal>> {
+        if lanes.len() != rngs.len() {
+            let reason = format!(
+                "Inkling2Dflash2Context::propose_blocks_batched: lanes ({}) != rngs ({})",
+                lanes.len(),
+                rngs.len()
+            );
+            return (0..lanes.len())
+                .map(|_| Err(Error::from_reason(reason.clone())))
+                .collect();
+        }
+        let active_count = lanes.iter().filter(|lane| lane.max_drafts > 0).count();
+        if active_count == 0 {
+            return (0..lanes.len()).map(|_| Ok(empty_proposal())).collect();
+        }
+        if active_count == 1 {
+            let mut out = Vec::with_capacity(lanes.len());
+            for (lane, rng) in lanes.iter_mut().zip(rngs.iter_mut()) {
+                if lane.max_drafts == 0 {
+                    out.push(Ok(empty_proposal()));
+                } else {
+                    out.push(lane.ctx.propose_block(
+                        draft,
+                        view,
+                        lane.anchor_id,
+                        lane.max_drafts,
+                        lane.params,
+                        *rng,
+                        lane.confidence,
+                    ));
+                }
+            }
+            return out;
+        }
+
+        let full_len = draft.config.block_size;
+        let mut active_indices = Vec::with_capacity(active_count);
+        let mut active_caps = Vec::with_capacity(active_count);
+        let mut active_greedy = Vec::with_capacity(active_count);
+        let mut dflash_lanes = Vec::with_capacity(active_count);
+        let mut active_rngs: Vec<&mut dyn rand::Rng> = Vec::with_capacity(active_count);
+        for (idx, (lane, rng)) in lanes.iter_mut().zip(rngs.iter_mut()).enumerate() {
+            if lane.max_drafts == 0 {
+                continue;
+            }
+            let temperature = lane
+                .params
+                .sampling_config
+                .unwrap_or_default()
+                .temperature
+                .unwrap_or(1.0);
+            let greedy = is_greedy_temperature(temperature);
+            let device_path = lane.params.repetition_penalty == 1.0
+                && lane.params.presence_penalty == 0.0
+                && lane.params.frequency_penalty == 0.0;
+            active_indices.push(idx);
+            active_caps.push(lane.max_drafts.min(full_len));
+            active_greedy.push(greedy);
+            dflash_lanes.push(DFlash2BatchProposalLane {
+                context: &mut lane.ctx.cache,
+                anchor: lane.anchor_id,
+                temperature,
+                device_path,
+                want_confidence: greedy && lane.confidence,
+            });
+            active_rngs.push(&mut **rng);
+        }
+
+        let raw_outputs =
+            draft.propose_with_batched(view, &mut dflash_lanes, &mut active_rngs, full_len);
+
+        // Best-effort single-sync eval for all healthy confidence tensors; if the batch eval
+        // fails on one broken lane, each lane's individual `to_float32()` below isolates it.
+        let conf_refs: Vec<&MxArray> = raw_outputs
+            .iter()
+            .filter_map(|res| res.as_ref().ok().and_then(|(_, _, conf)| conf.as_ref()))
+            .collect();
+        if !conf_refs.is_empty() {
+            let _ = MxArray::eval_arrays(&conf_refs);
+        }
+
+        let mut out: Vec<Result<DsparkProposal>> =
+            (0..lanes.len()).map(|_| Ok(empty_proposal())).collect();
+        for (((orig_idx, cap), greedy), raw_res) in active_indices
+            .into_iter()
+            .zip(active_caps)
+            .zip(active_greedy)
+            .zip(raw_outputs)
+        {
+            out[orig_idx] = raw_res.and_then(|(path, draft_sparse_dists, conf_arr)| {
+                let keep_probabilities = match conf_arr {
+                    Some(arr) => {
+                        let mut probs = arr.to_float32()?.to_vec();
+                        probs.truncate(cap);
+                        Some(probs)
+                    }
+                    None => None,
+                };
+                let mut proposal = if greedy {
+                    match path {
+                        SelectorPath::Device(ids) => DsparkProposal {
+                            draft_ids: Vec::new(),
+                            device_draft_ids: Some(ids),
+                            device_draft_sparse: None,
+                            draft_dists: Vec::new(),
+                            draft_sparse_dists: Vec::new(),
+                            keep_probabilities,
+                        },
+                        SelectorPath::Host(ids) => DsparkProposal {
+                            draft_ids: ids,
+                            device_draft_ids: None,
+                            device_draft_sparse: None,
+                            draft_dists: Vec::new(),
+                            draft_sparse_dists: Vec::new(),
+                            keep_probabilities,
+                        },
+                        SelectorPath::Sampled { .. } => {
+                            return Err(Error::from_reason(
+                                "Inkling2 DFlash2 greedy proposal unexpectedly returned a sampled path",
+                            ));
+                        }
+                    }
+                } else {
+                    match path {
+                        SelectorPath::Sampled { ids, rows } => DsparkProposal {
+                            draft_ids: Vec::new(),
+                            device_draft_ids: Some(ids),
+                            device_draft_sparse: Some(rows),
+                            draft_dists: Vec::new(),
+                            draft_sparse_dists: Vec::new(),
+                            keep_probabilities: None,
+                        },
+                        SelectorPath::Host(ids) => DsparkProposal {
+                            draft_ids: ids,
+                            device_draft_ids: None,
+                            device_draft_sparse: None,
+                            draft_dists: Vec::new(),
+                            draft_sparse_dists,
+                            keep_probabilities: None,
+                        },
+                        SelectorPath::Device(_) => {
+                            return Err(Error::from_reason(
+                                "Inkling2 DFlash2 sampled proposal unexpectedly returned a greedy device path",
+                            ));
+                        }
+                    }
+                };
+                truncate_proposal(&mut proposal, cap)?;
+                Ok(proposal)
+            });
+        }
+        out
+    }
+
     /// Draft unevaluated `(candidates [1, L, K] Int32, scores [L, K, K] Float32)`
     /// transition lattice arrays for verify-tree construction.
     pub(crate) fn propose_tree_lattice(
@@ -879,7 +1290,7 @@ impl Inkling2DraftContext {
     }
 }
 
-fn empty_proposal() -> DsparkProposal {
+pub(super) fn empty_proposal() -> DsparkProposal {
     DsparkProposal {
         draft_ids: Vec::new(),
         device_draft_ids: None,
@@ -1223,5 +1634,607 @@ impl Inkling2Inner {
 
         final_logits
             .ok_or_else(|| Error::from_reason("Inkling2 DFlash2 prefill produced no final logits"))
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use crate::models::qwen3_5::config::Qwen3_5Config;
+    use crate::models::qwen3_5::dflash2::tiny_dflash2_model_with_block;
+    use crate::nn::Linear;
+    use crate::sampling::SamplingConfig;
+
+    fn det_bf16(shape: &[i64], seed: u64, scale: f32) -> MxArray {
+        let len = shape.iter().product::<i64>() as usize;
+        let mut s = seed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut vals = Vec::with_capacity(len);
+        for _ in 0..len {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((s >> 33) as f32) / ((1u64 << 31) as f32) - 1.0;
+            vals.push(u * scale);
+        }
+        MxArray::from_float32(&vals, shape)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn assert_close(a: &MxArray, b: &MxArray, tol: f32, label: &str) {
+        assert_eq!(
+            a.shape().unwrap().as_ref(),
+            b.shape().unwrap().as_ref(),
+            "{label}: shape"
+        );
+        let av = a.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let bv = b.astype(DType::Float32).unwrap().to_float32().unwrap();
+        let max_diff = av
+            .iter()
+            .zip(bv.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff <= tol,
+            "{label}: max_diff={max_diff} exceeds tol={tol}"
+        );
+    }
+
+    #[test]
+    fn inkling2_target_view_batch_embed_and_logits_match_solo() {
+        let hidden = 64i64;
+        let padded_vocab = 64i64;
+        let unpadded_vocab = 50usize;
+        let embed_w = det_bf16(&[padded_vocab, hidden], 11, 0.4);
+        let embed_tokens = Embedding::from_weight(&embed_w).unwrap();
+        let embed_norm = det_bf16(&[hidden], 12, 0.5)
+            .add_scalar(1.0)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let lm_head_w = det_bf16(&[padded_vocab, hidden], 13, 0.3);
+        let lm_head = LinearProj::Standard(Linear::from_weights(&lm_head_w, None).unwrap());
+        let lm_head_unpadded = lm_head_w.slice_axis(0, 0, unpadded_vocab as i64).unwrap();
+        let mut view = Inkling2TargetView {
+            embed_tokens: &embed_tokens,
+            embed_norm: &embed_norm,
+            lm_head: &lm_head,
+            lm_head_bf16_unpadded: Some(&lm_head_unpadded),
+            rms_norm_eps: 1e-6,
+            unpadded_vocab_size: unpadded_vocab,
+        };
+
+        for batch in [1usize, 2, 3, 4] {
+            let rows = 7usize;
+            let ids: Vec<i32> = (0..batch * rows)
+                .map(|i| ((i * 7 + 3) % unpadded_vocab) as i32)
+                .collect();
+            let block = MxArray::from_int32(&ids, &[batch as i64, rows as i64]).unwrap();
+            let emb_b = view.embed(&block, &ids).unwrap();
+            assert_eq!(
+                emb_b.shape().unwrap().as_ref(),
+                &[batch as i64, rows as i64, hidden]
+            );
+
+            let logits_b = view.logits(&emb_b).unwrap();
+            assert_eq!(
+                logits_b.shape().unwrap().as_ref(),
+                &[batch as i64, rows as i64, unpadded_vocab as i64]
+            );
+
+            for b in 0..batch {
+                let ids_i = &ids[b * rows..(b + 1) * rows];
+                let block_i = MxArray::from_int32(ids_i, &[1, rows as i64]).unwrap();
+                let emb_solo = view.embed(&block_i, ids_i).unwrap();
+                let logits_solo = view.logits(&emb_solo).unwrap();
+                assert_close(
+                    &emb_b.slice_axis(0, b as i64, b as i64 + 1).unwrap(),
+                    &emb_solo,
+                    1e-3,
+                    &format!("embed B={batch} slice={b}"),
+                );
+                assert_close(
+                    &logits_b.slice_axis(0, b as i64, b as i64 + 1).unwrap(),
+                    &logits_solo,
+                    2e-2,
+                    &format!("logits B={batch} slice={b}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inkling2_dflash2_batched_propose_and_append_taps_match_sequential() {
+        let target_cfg = Qwen3_5Config {
+            vocab_size: 48,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 32,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 1.0,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            rope_scaling: None,
+        };
+
+        let draft = tiny_dflash2_model_with_block(&target_cfg, 7).unwrap();
+        let h = target_cfg.hidden_size as i64;
+        let padded_vocab = 64i64;
+        let unpadded_vocab = target_cfg.vocab_size as usize;
+
+        let embed_w = det_bf16(&[padded_vocab, h], 21, 0.35);
+        let embed_tokens = Embedding::from_weight(&embed_w).unwrap();
+        let embed_norm = MxArray::ones(&[h], Some(DType::BFloat16)).unwrap();
+        let lm_head_w = det_bf16(&[padded_vocab, h], 22, 0.3);
+        let lm_head = LinearProj::Standard(Linear::from_weights(&lm_head_w, None).unwrap());
+        let lm_head_unpadded = lm_head_w.slice_axis(0, 0, unpadded_vocab as i64).unwrap();
+        let mut view = Inkling2TargetView {
+            embed_tokens: &embed_tokens,
+            embed_norm: &embed_norm,
+            lm_head: &lm_head,
+            lm_head_bf16_unpadded: Some(&lm_head_unpadded),
+            rms_norm_eps: 1e-6,
+            unpadded_vocab_size: unpadded_vocab,
+        };
+
+        let greedy_params = ChatParams {
+            cache_salt: 0,
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+            max_new_tokens: 32,
+            repetition_penalty: 1.0,
+            repetition_context_size: 0,
+            presence_penalty: 0.0,
+            presence_context_size: 0,
+            frequency_penalty: 0.0,
+            frequency_context_size: 0,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                ..SamplingConfig::default()
+            }),
+            report_performance: false,
+            reuse_cache: true,
+            include_reasoning: false,
+            extra_eos_ids: Vec::new(),
+            enable_mtp: true,
+            mtp_depth: 7,
+            mtp_adaptive_depth: false,
+        };
+
+        for (n_lanes, init_lens, keeps, max_drafts_list, anchors) in [
+            (
+                2usize,
+                vec![2usize, 6],
+                vec![3usize, 5],
+                vec![7usize, 4],
+                vec![5u32, 17],
+            ),
+            (
+                3usize,
+                vec![0usize, 4, 9],
+                vec![2usize, 6, 3],
+                vec![7usize, 5, 3],
+                vec![3u32, 19, 41],
+            ),
+        ] {
+            let mut seq_ctxs: Vec<_> = (0..n_lanes)
+                .map(|_| Inkling2Dflash2Context::new(&draft.config))
+                .collect();
+            let mut bat_ctxs: Vec<_> = (0..n_lanes)
+                .map(|_| Inkling2Dflash2Context::new(&draft.config))
+                .collect();
+
+            for (i, &init_len) in init_lens.iter().enumerate() {
+                if init_len > 0 {
+                    let taps = vec![
+                        det_bf16(&[init_len as i64, h], 500 + i as u64 * 10, 0.3),
+                        det_bf16(&[init_len as i64, h], 501 + i as u64 * 10, 0.3),
+                    ];
+                    let toks: Vec<u32> = (0..init_len)
+                        .map(|t| ((i * 7 + t + 1) % unpadded_vocab) as u32)
+                        .collect();
+                    seq_ctxs[i].append_taps(&draft, &taps, &toks).unwrap();
+                    bat_ctxs[i].append_taps(&draft, &taps, &toks).unwrap();
+                }
+            }
+
+            // 1. Batched propose vs sequential propose with different max_drafts + confidence=true.
+            let mut seq_props = Vec::with_capacity(n_lanes);
+            for i in 0..n_lanes {
+                let mut rng = rand::rng();
+                let mut prop = seq_ctxs[i]
+                    .propose_block(
+                        &draft,
+                        &mut view,
+                        anchors[i],
+                        max_drafts_list[i],
+                        &greedy_params,
+                        &mut rng,
+                        true,
+                    )
+                    .unwrap();
+                prop.materialize_draft_ids().unwrap();
+                seq_props.push(prop);
+            }
+
+            let mut rngs_owned: Vec<_> = (0..n_lanes).map(|_| rand::rng()).collect();
+            let mut rng_refs: Vec<&mut dyn rand::Rng> = rngs_owned
+                .iter_mut()
+                .map(|r| r as &mut dyn rand::Rng)
+                .collect();
+            let mut bat_lanes: Vec<BatchedDflash2Lane<'_>> = bat_ctxs
+                .iter_mut()
+                .enumerate()
+                .map(|(i, ctx)| BatchedDflash2Lane {
+                    ctx,
+                    anchor_id: anchors[i],
+                    max_drafts: max_drafts_list[i],
+                    params: &greedy_params,
+                    confidence: true,
+                })
+                .collect();
+            let mut bat_props: Vec<DsparkProposal> =
+                Inkling2Dflash2Context::propose_blocks_batched(
+                    &draft,
+                    &mut view,
+                    &mut bat_lanes,
+                    &mut rng_refs,
+                )
+                .into_iter()
+                .map(Result::unwrap)
+                .collect();
+            for (i, bp) in bat_props.iter_mut().enumerate() {
+                bp.materialize_draft_ids().unwrap();
+                assert_eq!(bp.draft_ids.len(), max_drafts_list[i]);
+                assert_eq!(
+                    bp.draft_ids, seq_props[i].draft_ids,
+                    "Inkling2 N={n_lanes} lane={i} draft_ids mismatch"
+                );
+                let sp = seq_props[i].keep_probabilities.as_ref().unwrap();
+                let kp = bp.keep_probabilities.as_ref().unwrap();
+                assert_eq!(kp.len(), max_drafts_list[i]);
+                for (a, b) in sp.iter().zip(kp.iter()) {
+                    assert!((a - b).abs() <= 2e-2, "confidence diff: {a} vs {b}");
+                }
+            }
+
+            // 2. Batched tap append vs sequential tap append (including fused_kept slices!).
+            let mut lane_taps = Vec::with_capacity(n_lanes);
+            let mut lane_toks = Vec::with_capacity(n_lanes);
+            let mut seq_fused = Vec::with_capacity(n_lanes);
+            for (i, &keep) in keeps.iter().enumerate() {
+                let taps = vec![
+                    det_bf16(&[8, h], 700 + i as u64 * 10, 0.3),
+                    det_bf16(&[8, h], 701 + i as u64 * 10, 0.3),
+                ];
+                let toks: Vec<u32> = (0..keep)
+                    .map(|t| ((i * 9 + t + 2) % unpadded_vocab) as u32)
+                    .collect();
+                let fused = seq_ctxs[i]
+                    .append_taps(&draft, &taps, &toks)
+                    .unwrap()
+                    .unwrap();
+                seq_fused.push(fused);
+                lane_taps.push(taps);
+                lane_toks.push(toks);
+            }
+            let bat_fused: Vec<Option<MxArray>> = {
+                let mut items: Vec<(&mut Inkling2Dflash2Context, &[MxArray], &[u32])> = bat_ctxs
+                    .iter_mut()
+                    .zip(lane_taps.iter())
+                    .zip(lane_toks.iter())
+                    .map(|((ctx, taps), toks)| (ctx, taps.as_slice(), toks.as_slice()))
+                    .collect();
+                Inkling2Dflash2Context::append_taps_batched(&draft, &mut items)
+                    .into_iter()
+                    .map(Result::unwrap)
+                    .collect()
+            };
+
+            for i in 0..n_lanes {
+                assert_eq!(bat_ctxs[i].committed_len(), seq_ctxs[i].committed_len());
+                assert_eq!(
+                    bat_ctxs[i].cache.token_history(),
+                    seq_ctxs[i].cache.token_history()
+                );
+                assert_close(
+                    bat_fused[i].as_ref().unwrap(),
+                    &seq_fused[i],
+                    2e-2,
+                    &format!("Inkling2 N={n_lanes} lane={i} fused_kept"),
+                );
+                for (l, (sv, bv)) in seq_ctxs[i]
+                    .cache
+                    .window_views()
+                    .into_iter()
+                    .zip(bat_ctxs[i].cache.window_views())
+                    .enumerate()
+                {
+                    let (sk, sv_arr) = sv.unwrap();
+                    let (bk, bv_arr) = bv.unwrap();
+                    assert_close(&sk, &bk, 2e-2, &format!("N={n_lanes} lane={i} layer={l} K"));
+                    assert_close(
+                        &sv_arr,
+                        &bv_arr,
+                        2e-2,
+                        &format!("N={n_lanes} lane={i} layer={l} V"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn inkling2_dflash2_batched_mid_append_and_selector_fault_isolation() {
+        let target_cfg = Qwen3_5Config {
+            vocab_size: 48,
+            hidden_size: 64,
+            num_layers: 4,
+            num_heads: 2,
+            num_kv_heads: 1,
+            intermediate_size: 128,
+            rms_norm_eps: 1e-6,
+            head_dim: 32,
+            tie_word_embeddings: false,
+            attention_bias: false,
+            max_position_embeddings: 128,
+            pad_token_id: 0,
+            eos_token_id: 1,
+            bos_token_id: 2,
+            linear_num_value_heads: 2,
+            linear_num_key_heads: 1,
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            linear_conv_kernel_dim: 4,
+            full_attention_interval: 4,
+            partial_rotary_factor: 1.0,
+            rope_theta: 10_000.0,
+            paged_cache_memory_mb: None,
+            paged_block_size: None,
+            n_mtp_layers: 0,
+            qwen35_gguf_gdn_layout: None,
+            kv_format: None,
+            rope_scaling: None,
+        };
+
+        let draft = tiny_dflash2_model_with_block(&target_cfg, 7).unwrap();
+        let h = target_cfg.hidden_size as i64;
+        let padded_vocab = 64i64;
+        let unpadded_vocab = target_cfg.vocab_size as usize;
+        let n_taps = draft.config.target_layers.len();
+
+        let embed_w = det_bf16(&[padded_vocab, h], 31, 0.35);
+        let embed_tokens = Embedding::from_weight(&embed_w).unwrap();
+        let embed_norm = MxArray::ones(&[h], Some(DType::BFloat16)).unwrap();
+        let lm_head_w = det_bf16(&[padded_vocab, h], 32, 0.3);
+        let lm_head = LinearProj::Standard(Linear::from_weights(&lm_head_w, None).unwrap());
+        let lm_head_unpadded = lm_head_w.slice_axis(0, 0, unpadded_vocab as i64).unwrap();
+        let mut view = Inkling2TargetView {
+            embed_tokens: &embed_tokens,
+            embed_norm: &embed_norm,
+            lm_head: &lm_head,
+            lm_head_bf16_unpadded: Some(&lm_head_unpadded),
+            rms_norm_eps: 1e-6,
+            unpadded_vocab_size: unpadded_vocab,
+        };
+
+        let greedy_params = ChatParams {
+            cache_salt: 0,
+            cache_owner_id: String::new(),
+            cache_root_owner_id: None,
+            max_new_tokens: 32,
+            repetition_penalty: 1.0,
+            repetition_context_size: 0,
+            presence_penalty: 0.0,
+            presence_context_size: 0,
+            frequency_penalty: 0.0,
+            frequency_context_size: 0,
+            max_consecutive_tokens: 0,
+            max_ngram_repeats: 0,
+            ngram_size: 0,
+            sampling_config: Some(SamplingConfig {
+                temperature: Some(0.0),
+                ..SamplingConfig::default()
+            }),
+            report_performance: false,
+            reuse_cache: true,
+            include_reasoning: false,
+            extra_eos_ids: Vec::new(),
+            enable_mtp: true,
+            mtp_depth: 7,
+            mtp_adaptive_depth: false,
+        };
+        let mut host_sampled_params = greedy_params.clone();
+        host_sampled_params.repetition_penalty = 1.1;
+        host_sampled_params.sampling_config = Some(SamplingConfig {
+            temperature: Some(0.8),
+            ..SamplingConfig::default()
+        });
+
+        // 1. Mid-`append_batched` ring-store failure on lane 1 of 3: lane 0 already committed,
+        //    lane 1 fails on its corrupted layer buffer, lane 2 still commits independently and
+        //    matches sequential K/V + fused slices.
+        let mut seq_ctxs: Vec<_> = (0..3)
+            .map(|_| Inkling2Dflash2Context::new(&draft.config))
+            .collect();
+        let mut bat_ctxs: Vec<_> = (0..3)
+            .map(|_| Inkling2Dflash2Context::new(&draft.config))
+            .collect();
+        for i in 0..3 {
+            let init_len = 3 + i;
+            let taps: Vec<MxArray> = (0..n_taps)
+                .map(|t| det_bf16(&[init_len as i64, h], 900 + i as u64 * 10 + t as u64, 0.25))
+                .collect();
+            let toks: Vec<u32> = (0..init_len)
+                .map(|k| ((i * 7 + k + 1) % unpadded_vocab) as u32)
+                .collect();
+            seq_ctxs[i].append_taps(&draft, &taps, &toks).unwrap();
+            bat_ctxs[i].append_taps(&draft, &taps, &toks).unwrap();
+        }
+        // Corrupt the last layer's ring buffer on lane 1 so `store_rows` fails mid-batch.
+        let last_layer = draft.config.num_hidden_layers.saturating_sub(1);
+        DFlash2Model::corrupt_window_buffer_for_test(&mut bat_ctxs[1].cache, last_layer);
+
+        let keeps = [3usize, 4, 2];
+        let mut lane_taps = Vec::with_capacity(3);
+        let mut lane_toks = Vec::with_capacity(3);
+        let mut seq_fused = Vec::with_capacity(3);
+        for (i, &keep) in keeps.iter().enumerate() {
+            let taps: Vec<MxArray> = (0..n_taps)
+                .map(|t| det_bf16(&[8, h], 1100 + i as u64 * 10 + t as u64, 0.25))
+                .collect();
+            let toks: Vec<u32> = (0..keep)
+                .map(|k| ((i * 5 + k + 2) % unpadded_vocab) as u32)
+                .collect();
+            let fused = seq_ctxs[i]
+                .append_taps(&draft, &taps, &toks)
+                .unwrap()
+                .unwrap();
+            seq_fused.push(fused);
+            lane_taps.push(taps);
+            lane_toks.push(toks);
+        }
+        let bat_results = {
+            let mut items: Vec<(&mut Inkling2Dflash2Context, &[MxArray], &[u32])> = bat_ctxs
+                .iter_mut()
+                .zip(lane_taps.iter())
+                .zip(lane_toks.iter())
+                .map(|((ctx, taps), toks)| (ctx, taps.as_slice(), toks.as_slice()))
+                .collect();
+            Inkling2Dflash2Context::append_taps_batched(&draft, &mut items)
+        };
+        assert!(
+            bat_results[0].is_ok(),
+            "lane 0 must commit: {:?}",
+            bat_results[0].as_ref().err()
+        );
+        assert!(
+            bat_results[1].is_err(),
+            "corrupted lane 1 must return per-lane Err"
+        );
+        assert!(
+            bat_results[2].is_ok(),
+            "lane 2 must recover and commit: {:?}",
+            bat_results[2].as_ref().err()
+        );
+        for i in [0usize, 2] {
+            assert_eq!(bat_ctxs[i].committed_len(), seq_ctxs[i].committed_len());
+            assert_eq!(
+                bat_ctxs[i].cache.token_history(),
+                seq_ctxs[i].cache.token_history()
+            );
+            let fused = bat_results[i].as_ref().unwrap().as_ref().unwrap();
+            assert_close(
+                fused,
+                &seq_fused[i],
+                2e-2,
+                &format!("healthy lane {i} fused"),
+            );
+            for (l, (sv, bv)) in seq_ctxs[i]
+                .cache
+                .window_views()
+                .into_iter()
+                .zip(bat_ctxs[i].cache.window_views())
+                .enumerate()
+            {
+                let (sk, sv_arr) = sv.unwrap();
+                let (bk, bv_arr) = bv.unwrap();
+                assert_close(&sk, &bk, 2e-2, &format!("healthy lane {i} layer {l} K"));
+                assert_close(
+                    &sv_arr,
+                    &bv_arr,
+                    2e-2,
+                    &format!("healthy lane {i} layer {l} V"),
+                );
+            }
+        }
+
+        // 2. Per-lane selector fault during `propose_blocks_batched`: poison lane 0 with NaN
+        //    context + host sampling (`temperature=0.8, repetition_penalty=1.1`), while healthy
+        //    lane 2 stays bit-identical to solo `propose_block`.
+        let nan_vals = vec![f32::NAN; 2 * h as usize];
+        let nan_tap = MxArray::from_float32(&nan_vals, &[2, h])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let nan_taps: Vec<MxArray> = (0..n_taps).map(|_| nan_tap.clone()).collect();
+        let mut bad_ctx = Inkling2Dflash2Context::new(&draft.config);
+        bad_ctx.append_taps(&draft, &nan_taps, &[1, 2]).unwrap();
+
+        let mut solo_rng = rand::rng();
+        let mut expected_healthy = seq_ctxs[2]
+            .propose_block(
+                &draft,
+                &mut view,
+                11,
+                5,
+                &greedy_params,
+                &mut solo_rng,
+                true,
+            )
+            .unwrap();
+        expected_healthy.materialize_draft_ids().unwrap();
+
+        let mut rngs_owned: Vec<_> = (0..2).map(|_| rand::rng()).collect();
+        let mut rng_refs: Vec<&mut dyn rand::Rng> = rngs_owned
+            .iter_mut()
+            .map(|r| r as &mut dyn rand::Rng)
+            .collect();
+        let mut prop_lanes = vec![
+            BatchedDflash2Lane {
+                ctx: &mut bad_ctx,
+                anchor_id: 3,
+                max_drafts: 7,
+                params: &host_sampled_params,
+                confidence: false,
+            },
+            BatchedDflash2Lane {
+                ctx: &mut bat_ctxs[2],
+                anchor_id: 11,
+                max_drafts: 5,
+                params: &greedy_params,
+                confidence: true,
+            },
+        ];
+        let mut prop_iter = Inkling2Dflash2Context::propose_blocks_batched(
+            &draft,
+            &mut view,
+            &mut prop_lanes,
+            &mut rng_refs,
+        )
+        .into_iter();
+        assert!(
+            prop_iter.next().unwrap().is_err(),
+            "NaN-poisoned host-sampled lane must fail selection cleanly"
+        );
+        let mut healthy_prop = prop_iter
+            .next()
+            .unwrap()
+            .expect("healthy peer must succeed despite sibling selector error");
+        healthy_prop.materialize_draft_ids().unwrap();
+        assert_eq!(healthy_prop.draft_ids, expected_healthy.draft_ids);
     }
 }
