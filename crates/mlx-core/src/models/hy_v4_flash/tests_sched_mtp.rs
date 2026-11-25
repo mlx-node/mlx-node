@@ -262,159 +262,174 @@ fn the_paged_plan_takes_the_scheduled_lane() {
 /// 3. Committed `decode_rows` (non-speculative) and `spec::Paged::forward_with_hidden`
 ///    still capture on `32k`, while `spec::Paged::verify_step` + `rollback`
 ///    preserves prior `held` on `keep < 4` and captures on `{29,30,31}` landing on `32k`.
-#[test]
-fn speculative_verify_and_cut_owner_preserve_and_capture_turn_states() {
+fn build_paged_inner(
+    with_mtp: bool,
+    want_lanes: usize,
+) -> (
+    super::chat::Inner,
+    super::config::HyV4FlashConfig,
+    super::test_support::Temp,
+) {
     use std::collections::HashMap;
     use std::sync::Arc;
 
     use super::bank::KqBank;
     use super::chat::Inner;
     use super::config::{Attn, LayerConfig};
-    use super::ladder::RAM_STATES;
     use super::model::Model;
     use super::moe::ExpertSource;
     use super::mtp::MtpLayer;
     use super::prefill::Grid;
     use super::rows::F8Table;
     use super::scan::{ENGRAM_TABLE, ExpertLayer, Located, Scan};
-    use super::sched::{Paged, paged_ram_states};
+    use super::sched::Paged;
     use super::store::{Classes, Lease, Sizes, Store, profile};
     use super::test_support::{
         Rng, TINY_CLASSES, Temp, TinyWeightsOpts, kquant_layer, mini_mtp_weights, tiny_cfg,
         tiny_engram_table, tiny_weights_opts,
     };
+    use crate::moe_stream::budget::ModelSize;
+    use crate::moe_stream::io::{IoPool, ShardSet};
+    use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+
+    let mut cfg = tiny_cfg();
+    cfg.context_length = 256;
+    // kv_row = kv_lora_rank + rope_dim = 56 + 8 = 64 -> half = 32 (valid paged head_size).
+    cfg.mla.kv_lora_rank = 56;
+    cfg.mla.rope_dim = 8;
+    if with_mtp {
+        cfg.layers.push(LayerConfig {
+            attn: Attn::Indexed,
+            n_heads: 2,
+            rope_theta: 1e7,
+            swiglu_limit: 0.5,
+            dense_ffn: false,
+            engram: None,
+            mtp: true,
+        });
+    }
+    let cfg_out = cfg.clone();
+    let mut rng = Rng::new(77);
+    let mut exp_file = rng.bytes(1024);
+    let experts: Vec<Option<ExpertLayer>> = TINY_CLASSES
+        .iter()
+        .enumerate()
+        .map(|(il, c)| c.map(|c| kquant_layer(&mut rng, &cfg.moe, il, c, 32, &mut exp_file)))
+        .collect();
+    let tmp = Temp::new("sched-mtp-turn");
+    let exp_path = tmp.write("experts.bin", &exp_file);
+    let engram_rows: u64 = cfg.engram.head_vocab_sizes.iter().sum();
+    let engram_path = tmp.write(
+        "engram.bin",
+        &vec![0u8; engram_rows as usize * cfg.engram.head_dim],
+    );
+    let paths = vec![exp_path, engram_path];
+    let shards = Arc::new(ShardSet::open(&paths).unwrap());
+    let engram_loc = Located {
+        shard: 1,
+        data_offset: 0,
+        info: GgufTensorInfo {
+            name: ENGRAM_TABLE.into(),
+            n_dims: 2,
+            dims: vec![cfg.engram.head_dim as u64, engram_rows],
+            tensor_type: GgufTensorType::MXFP8,
+            offset: 0,
+        },
+    };
+    let table = Arc::new(
+        F8Table::open_with_options(Arc::clone(&shards), 1, &engram_loc, &cfg.engram, 1, 1).unwrap(),
+    );
+    let bank = Arc::new(
+        KqBank::new_direct(
+            IoPool::new(Arc::clone(&shards), 2).unwrap(),
+            &cfg.moe,
+            &experts,
+        )
+        .unwrap(),
+    );
+    let classes = Classes {
+        layers: [2, 1],
+        slot: bank.slot_bytes(),
+    };
+    let p = profile(15_812);
+    let size = ModelSize {
+        dense: 4 << 20,
+        slot: classes.slot[0].max(classes.slot[1]),
+        n_experts: cfg.moe.n_experts as u64,
+        ctx: cfg.context_length as u64,
+    };
+    let b_ref = Arc::clone(&bank);
+    let model = Model::new(
+        cfg.clone(),
+        Box::new(tiny_weights_opts(&cfg, TinyWeightsOpts::default())),
+        move |_| Ok(ExpertSource::Bank(Arc::clone(&b_ref))),
+        Box::new(tiny_engram_table(&cfg.engram, 19)),
+    )
+    .unwrap();
+    let mtp = with_mtp.then(|| {
+        let mw = mini_mtp_weights(&cfg, 91, 24, 0);
+        MtpLayer::new(&cfg, mw, model.weights().token_embd()).unwrap()
+    });
+    let lease = Lease::new(p, size, 64, classes, None, None, &bank);
+    let store = Store {
+        model,
+        bank,
+        table,
+        scan: Scan {
+            paths,
+            cfg,
+            tensors: HashMap::new(),
+            experts,
+            engram_table: engram_loc,
+            mtp: None,
+        },
+        shards,
+        dense_read: 0,
+        dense_bytes: size.dense,
+        sizes: Sizes {
+            dense_trunk: size.dense,
+            dense_mtp: 0,
+            classes,
+            n_experts: 8,
+        },
+        size,
+        profile: p,
+        ctx: 256,
+        chunk: 64,
+        lanes: want_lanes,
+        row_cap: 12,
+        mtp: with_mtp,
+        bank_alloc_s: 0.0,
+        max_memory: None,
+        direct_budget: Some(1 << 30),
+        rset_bounded: false,
+        lease,
+    };
+    let paged = Paged::open(&store).unwrap();
+    let grid = Grid::new(64, Vec::new()).unwrap();
+    let inner = Inner::for_paged_test(store, mtp, grid, paged).unwrap();
+    (inner, cfg_out, tmp)
+}
+
+#[test]
+fn speculative_verify_and_cut_owner_preserve_and_capture_turn_states() {
+    use super::chat::Inner;
+    use super::ladder::RAM_STATES;
+    use super::sched::paged_ram_states;
     use crate::array::MxArray;
     use crate::engine::backend::{MtpStepper, PagedBackend, PagedPrefix};
     use crate::engine::hybrid_scheduler::{
         HybridSchedulerBackend, ScheduledVerifyCommit, ScheduledVerifyRow,
     };
-    use crate::moe_stream::budget::ModelSize;
-    use crate::moe_stream::io::{IoPool, ShardSet};
     use crate::stream::Stream;
-    use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
 
     // SAFETY: pure process-wide Metal availability probe.
     if !unsafe { mlx_sys::mlx_metal_is_available() } {
         return;
     }
 
-    let build_inner = |with_mtp: bool, want_lanes: usize| -> (Inner, Temp) {
-        let mut cfg = tiny_cfg();
-        cfg.context_length = 256;
-        // kv_row = kv_lora_rank + rope_dim = 56 + 8 = 64 -> half = 32 (valid paged head_size).
-        cfg.mla.kv_lora_rank = 56;
-        cfg.mla.rope_dim = 8;
-        if with_mtp {
-            cfg.layers.push(LayerConfig {
-                attn: Attn::Indexed,
-                n_heads: 2,
-                rope_theta: 1e7,
-                swiglu_limit: 0.5,
-                dense_ffn: false,
-                engram: None,
-                mtp: true,
-            });
-        }
-        let mut rng = Rng::new(77);
-        let mut exp_file = rng.bytes(1024);
-        let experts: Vec<Option<ExpertLayer>> = TINY_CLASSES
-            .iter()
-            .enumerate()
-            .map(|(il, c)| c.map(|c| kquant_layer(&mut rng, &cfg.moe, il, c, 32, &mut exp_file)))
-            .collect();
-        let tmp = Temp::new("sched-mtp-turn");
-        let exp_path = tmp.write("experts.bin", &exp_file);
-        let engram_rows: u64 = cfg.engram.head_vocab_sizes.iter().sum();
-        let engram_path = tmp.write(
-            "engram.bin",
-            &vec![0u8; engram_rows as usize * cfg.engram.head_dim],
-        );
-        let paths = vec![exp_path, engram_path];
-        let shards = Arc::new(ShardSet::open(&paths).unwrap());
-        let engram_loc = Located {
-            shard: 1,
-            data_offset: 0,
-            info: GgufTensorInfo {
-                name: ENGRAM_TABLE.into(),
-                n_dims: 2,
-                dims: vec![cfg.engram.head_dim as u64, engram_rows],
-                tensor_type: GgufTensorType::MXFP8,
-                offset: 0,
-            },
-        };
-        let table = Arc::new(
-            F8Table::open_with_options(Arc::clone(&shards), 1, &engram_loc, &cfg.engram, 1, 1)
-                .unwrap(),
-        );
-        let bank = Arc::new(
-            KqBank::new_direct(
-                IoPool::new(Arc::clone(&shards), 2).unwrap(),
-                &cfg.moe,
-                &experts,
-            )
-            .unwrap(),
-        );
-        let classes = Classes {
-            layers: [2, 1],
-            slot: bank.slot_bytes(),
-        };
-        let p = profile(15_812);
-        let size = ModelSize {
-            dense: 4 << 20,
-            slot: classes.slot[0].max(classes.slot[1]),
-            n_experts: cfg.moe.n_experts as u64,
-            ctx: cfg.context_length as u64,
-        };
-        let b_ref = Arc::clone(&bank);
-        let model = Model::new(
-            cfg.clone(),
-            Box::new(tiny_weights_opts(&cfg, TinyWeightsOpts::default())),
-            move |_| Ok(ExpertSource::Bank(Arc::clone(&b_ref))),
-            Box::new(tiny_engram_table(&cfg.engram, 19)),
-        )
-        .unwrap();
-        let mtp = with_mtp.then(|| {
-            let mw = mini_mtp_weights(&cfg, 91, 24, 0);
-            MtpLayer::new(&cfg, mw, model.weights().token_embd()).unwrap()
-        });
-        let lease = Lease::new(p, size, 64, classes, None, None, &bank);
-        let store = Store {
-            model,
-            bank,
-            table,
-            scan: Scan {
-                paths,
-                cfg,
-                tensors: HashMap::new(),
-                experts,
-                engram_table: engram_loc,
-                mtp: None,
-            },
-            shards,
-            dense_read: 0,
-            dense_bytes: size.dense,
-            sizes: Sizes {
-                dense_trunk: size.dense,
-                dense_mtp: 0,
-                classes,
-                n_experts: 8,
-            },
-            size,
-            profile: p,
-            ctx: 256,
-            chunk: 64,
-            lanes: want_lanes,
-            row_cap: 12,
-            mtp: with_mtp,
-            bank_alloc_s: 0.0,
-            max_memory: None,
-            direct_budget: Some(1 << 30),
-            rset_bounded: false,
-            lease,
-        };
-        let paged = Paged::open(&store).unwrap();
-        let grid = Grid::new(64, Vec::new()).unwrap();
-        let inner = Inner::for_paged_test(store, mtp, grid, paged).unwrap();
+    let build_inner = |with_mtp: bool, want_lanes: usize| {
+        let (inner, _, tmp) = build_paged_inner(with_mtp, want_lanes);
         (inner, tmp)
     };
 
@@ -651,6 +666,167 @@ fn speculative_verify_and_cut_owner_preserve_and_capture_turn_states() {
         held_row(&ar_inner, 1),
         Some(64),
         "committed AR decode_rows must still capture Turn state at 64"
+    );
+}
+
+/// Pre-decode budget skips in `resume_from_disk` must not consume the 2-read
+/// SSD attempt cap: when the two deepest disk-only candidates exceed the
+/// remaining budget, a third shallower candidate that fits is still restored.
+#[test]
+fn resume_from_disk_budget_skips_do_not_exhaust_read_limit() {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use mlx_paged_attn::{ColdCacheFingerprint, ColdLayerBlock};
+
+    use super::config::Attn;
+    use super::indexer::{IndexerGeometry, PagedIndexerState, TokTail};
+    use super::ladder::Kind;
+    use super::owner::{CellLayer, OwnerCell};
+    use super::paged::PageGeometry;
+    use super::persist::{Blocks, Disk, MINIMUM_ROWS};
+    use super::persist_codec::{StateShape, split_block};
+    use super::persist_writer::Telemetry;
+    use super::prefill::BLOCK_ROWS;
+    use super::prefix_state::{Key, PrefixState, States, written_key};
+    use super::sched::{RestoreBudget, resume_from_disk};
+    use super::test_support::Temp;
+    use crate::array::{DType, MxArray};
+    use crate::disk_tier::{CacheDisk, DiskTierOptions, PersistentIdentity, open_disk_tier};
+
+    // SAFETY: pure process-wide Metal availability probe.
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+
+    struct ZeroBlocks(PageGeometry);
+    impl Blocks for ZeroBlocks {
+        fn begin(&mut self, _: &[u32]) -> bool {
+            true
+        }
+        fn block(&mut self, _: usize, _: u64) -> Option<Vec<ColdLayerBlock>> {
+            let half = self.0.half as usize;
+            let lat = vec![0u16; BLOCK_ROWS * 2 * half];
+            let pool = vec![0u16; (self.0.index_rows * self.0.index_dim) as usize];
+            Some(vec![split_block(&lat, &pool, half); self.0.layers as usize])
+        }
+    }
+
+    let (mut inner, cfg, _model_tmp) = build_paged_inner(false, 1);
+    let page = PageGeometry::of(&cfg).unwrap();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let root = Temp::new("sched-resume-budget-skip");
+    let open_disk = || {
+        let tmp = root.join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(2 << 30),
+            persistent: true,
+            cache_dir: Some(root.join("cache")),
+            temp_root: Some(tmp),
+        };
+        let fp = ColdCacheFingerprint::from_components([b"hy4-resume-budget-skip".as_slice()]);
+        let id = PersistentIdentity {
+            namespace: "22223333444455556666777788889999".into(),
+            state: fp,
+            kv: fp,
+        };
+        let tier = open_disk_tier(&opts, || Some(id), shape.span_bytes()).unwrap();
+        Disk::open(tier, Arc::new(Telemetry::default()), shape.clone(), page).unwrap()
+    };
+
+    let row_fit = MINIMUM_ROWS;
+    let row_big1 = MINIMUM_ROWS + BLOCK_ROWS;
+    let row_big2 = MINIMUM_ROWS + 2 * BLOCK_ROWS;
+    let full: Vec<u32> = (0..row_big2 + 16).map(|i| 11 + (i % 251) as u32).collect();
+    let keys: Vec<Vec<u64>> = (0..row_big2 / BLOCK_ROWS)
+        .map(|b| written_key(&full, b, 77))
+        .collect();
+
+    let mk_state = |row: usize| -> PrefixState {
+        let width = cfg.mla.kv_row();
+        let il = cfg
+            .trunk()
+            .iter()
+            .position(|l| l.attn == Attn::Indexed)
+            .unwrap();
+        let idx_g = IndexerGeometry::of(&cfg, il).unwrap();
+        let mut cell = OwnerCell::new(&cfg, None).unwrap();
+        let kv = MxArray::zeros(&[row as i64, width as i64], Some(DType::Float16)).unwrap();
+        for part in cell.layers_mut() {
+            match part {
+                CellLayer::Window(ring) => {
+                    ring.append(&kv, 0).unwrap();
+                }
+                CellLayer::Index(ix) => {
+                    let held = (idx_g.kpool - 1 + WINDOW_SLACK).min(row);
+                    let r =
+                        MxArray::zeros(&[held as i64, idx_g.head_dim as i64], Some(DType::Float32))
+                            .unwrap();
+                    *ix = PagedIndexerState::at(
+                        ix.layer(),
+                        TokTail::of_rows(&idx_g, Some(r), row).unwrap(),
+                    );
+                }
+            }
+        }
+        cell.advance(&full[..row]).unwrap();
+        cell.state().unwrap().unwrap()
+    };
+
+    // Session 1: persist 3 disk states along the same lineage (2048, 2080, 2112).
+    {
+        let mut disk = open_disk();
+        let mut st = States::<PrefixState>::with_cap(8);
+        for (seq, row) in [(1, row_fit), (2, row_big1), (3, row_big2)] {
+            let blocks = row / BLOCK_ROWS;
+            let hot = vec![0u64; blocks];
+            disk.start(seq, &full[..row], &keys[..blocks], &hot, 0);
+            let k = Key {
+                tokens: &full[..row],
+                keys: &keys[..blocks],
+                salt: 0,
+            };
+            let id = st.publish(k, mk_state(row), Kind::Prompt).unwrap().unwrap();
+            disk.published(st.store(), seq, row, None, Some(id));
+        }
+        let ddl = Instant::now() + Duration::from_secs(30);
+        assert!(disk.flush_points(st.store_mut(), &mut ZeroBlocks(page), ddl));
+    }
+
+    // Session 2: attach persistent disk to live `Paged` (adopts all 3 as disk-only),
+    // set a budget where 2112 and 2080 fail `reserve_for_promote` while 2048 fits,
+    // and verify `resume_from_disk` skips the two oversized entries and restores 2048.
+    let p = inner.paged_mut().unwrap();
+    assert_eq!(p.attach_disk(open_disk()).unwrap(), 3);
+    let prompt = Key {
+        tokens: &full,
+        keys: &[],
+        salt: 0,
+    };
+    let found = p.states.disk_only_above(prompt, 0);
+    assert_eq!(
+        found.iter().map(|&(_, r)| r).collect::<Vec<_>>(),
+        vec![row_big2, row_big1, row_fit]
+    );
+    let (big2_id, big1_id, fit_id) = (found[0].0, found[1].0, found[2].0);
+
+    let need = p.disk.as_ref().unwrap().state_bytes_at(row_fit);
+    let mtp_row = 1_000u64;
+    let budget = RestoreBudget {
+        total: p.owners.bytes() + need + mtp_row * row_fit as u64,
+        owner_base: 0,
+        mtp_row,
+    };
+    let resumed = resume_from_disk(p, 1, prompt, None, budget);
+    assert_eq!(resumed, Some((fit_id, row_fit)));
+    assert!(
+        p.states.get(fit_id).is_some(),
+        "fitting 3rd candidate restored"
+    );
+    assert!(
+        p.states.get(big1_id).is_none() && p.states.get(big2_id).is_none(),
+        "oversized candidates stayed disk-only"
     );
 }
 

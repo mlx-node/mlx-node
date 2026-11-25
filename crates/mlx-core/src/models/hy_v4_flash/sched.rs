@@ -1126,8 +1126,10 @@ pub(crate) struct RestoreBudget {
 /// The deepest state on disk only that `prompt` resumes from past `hit`,
 /// whose chain is whole, read back and given its RAM copy within `budget`
 /// (accounting for both the restored state and live owner cell, and never
-/// evicting `hit`'s RAM fallback); two at most are tried, one that does not
-/// read back going with its object. `None` keeps `hit`.
+/// evicting `hit`'s RAM fallback); at most two disk reads are attempted
+/// (metadata-only discards and pre-decode budget skips do not consume read
+/// attempts), and one that does not read back goes with its object. `None`
+/// keeps `hit`.
 pub(crate) fn resume_from_disk(
     p: &mut Paged,
     seq: SeqId,
@@ -1138,7 +1140,11 @@ pub(crate) fn resume_from_disk(
     let floor = hit.map_or(0, |h| h.1);
     let protect = hit.map(|h| h.0);
     let found = p.states.disk_only_above(prompt, floor);
-    for (id, row) in found.into_iter().take(2) {
+    let mut tried_reads = 0usize;
+    for (id, row) in found {
+        if tried_reads >= 2 {
+            break;
+        }
         let (key, extra) = {
             let entry = p.states.store().get(id)?;
             (entry.disk()?.key, entry.extra_keys().to_vec())
@@ -1166,6 +1172,7 @@ pub(crate) fn resume_from_disk(
         if !p.states.reserve_for_promote(id, need, cap, protect) {
             continue;
         }
+        tried_reads += 1;
         let Paged { disk, states, .. } = &mut *p;
         let disk = disk.as_mut()?;
         match disk.read_state(
