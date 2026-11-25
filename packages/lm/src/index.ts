@@ -168,6 +168,8 @@ export {
 // addon; see family-data.ts).
 export {
   CHAT_FAMILY_IDS,
+  chatFamilyIdFor,
+  defaultThinkingBudgetForEffort,
   FAMILY_LOAD_OPTION_SPECS,
   familyDataFor,
   familyTraitsFor,

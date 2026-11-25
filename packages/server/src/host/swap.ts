@@ -340,7 +340,8 @@ export function makeSwapController(
     return ordered.map((entry) => {
       const window =
         registry.servedContext(entry.name)?.windowTokens ?? estimatedWindow?.(entry.name) ?? entry.contextWindow;
-      const reasoningEfforts = entry.reasoningEfforts ?? reasoningEffortsFor(entry.modelType);
+      const reasoningEfforts =
+        registry.reasoningEfforts?.(entry.name) ?? entry.reasoningEfforts ?? reasoningEffortsFor(entry.modelType);
       return {
         id: entry.name,
         object: 'model',

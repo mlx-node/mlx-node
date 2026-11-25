@@ -41,7 +41,12 @@ import type { ChatConfig } from '@mlx-node/core';
 import type { SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { contextLane, getLoadedModelPath } from '@mlx-node/lm';
-import { reasoningEffortsFor, type ChatFamilyId, type ReasoningEffortOption } from '@mlx-node/lm/family-data';
+import {
+  chatFamilyIdFor,
+  reasoningEffortsFor,
+  type ChatFamilyId,
+  type ReasoningEffortOption,
+} from '@mlx-node/lm/family-data';
 import { readModelChatTemplateSync } from '@mlx-node/lm/model-detection';
 
 import { AudioRegistry } from './audio-registry.js';
@@ -94,8 +99,12 @@ function modelTypeFromInstance(model: ServableModel): ChatFamilyId | undefined {
 }
 
 function readChatTemplateForModel(model: ServableModel): string | undefined {
-  const modelPath = getLoadedModelPath(model);
-  return modelPath !== undefined ? readModelChatTemplateSync(modelPath) : undefined;
+  try {
+    const modelPath = getLoadedModelPath(model);
+    return modelPath !== undefined ? readModelChatTemplateSync(modelPath) : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Minimal contract for a model that can be served via chat sessions. */
@@ -167,6 +176,8 @@ interface SessionRegistryBinding {
   context?: { limits: SessionContextLimits };
   /** Resolved family id for `/v1/models`, cached once with the binding. */
   modelFamily?: string;
+  /** Canonical validated chat family id, cached once with the binding. */
+  chatFamily?: ChatFamilyId;
   /** Resolved reasoning-effort options for `/v1/models`, cached once with the binding. */
   reasoningEfforts?: readonly ReasoningEffortOption[];
 }
@@ -387,7 +398,6 @@ export class ModelRegistry {
    * true.
    */
   register(name: string, model: ServableModel, opts?: RegisterOptions): void {
-    if (this.decisions.get(name)) this.unregister(name);
     const samplingDefaults = opts?.samplingDefaults;
     const maxOutputTokens = opts?.maxOutputTokens;
     const existing = this.models.get(name);
@@ -407,32 +417,28 @@ export class ModelRegistry {
       this.modelLoadAdmissionCoordinator?.bindRequestLoadAdmissions(name, existing.sessionRegistry);
       return;
     }
-    if (existing) {
-      // Same name, different model: release the old model's refcount
-      // before installing the new binding.
-      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, existing.sessionRegistry);
-      this.dropNameReference(existing.model);
-    }
 
-    // Look up or allocate the shared binding. If it is still alive
-    // but flagged `pendingTeardown`, clear the flag and reuse it —
-    // the fresh registration revives the binding before teardown
-    // runs so the shared `SessionRegistry` / mutex chain stays
-    // identical and any new dispatch serializes behind the
-    // in-flight one.
+    // Look up or construct the replacement binding BEFORE mutating or dropping
+    // any existing registration for `name`. If `contextLimits()`,
+    // `concurrentDispatchCapacity()`, or `SessionRegistry` construction throws,
+    // the previous model stays registered and dispatchable instead of being
+    // stranded without a binding.
     let binding = this.sessionRegistriesByModel.get(model);
+    const createdBinding = !binding;
     if (!binding) {
       const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
+      const maxConcurrentDispatches = concurrentDispatchCapacity(model);
       const modelFamily = opts?.identity?.modelType ?? modelTypeFromInstance(model);
+      const chatFamily = modelFamily !== undefined ? chatFamilyIdFor(modelFamily) : undefined;
       const chatTemplate =
-        modelFamily === 'qwen3_5' || modelFamily === 'qwen3_5_moe' ? readChatTemplateForModel(model) : undefined;
+        chatFamily === 'qwen3_5' || chatFamily === 'qwen3_5_moe' ? readChatTemplateForModel(model) : undefined;
       const reasoningEfforts =
         modelFamily !== undefined ? reasoningEffortsFor(modelFamily, { chatTemplate }) : undefined;
       binding = {
         registry: new SessionRegistry({
           model,
           maxQueueDepth: this.maxQueueDepth,
-          maxConcurrentDispatches: concurrentDispatchCapacity(model),
+          maxConcurrentDispatches,
           samplingDefaults,
           maxOutputTokens,
           // Resolve the trace name per turn — requests stamp their own alias,
@@ -447,9 +453,21 @@ export class ModelRegistry {
         pendingTeardown: false,
         disposeOnTeardown: false,
         ...(modelFamily !== undefined ? { modelFamily } : {}),
+        ...(chatFamily !== undefined ? { chatFamily } : {}),
         ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
       };
       if (limits !== undefined) binding.context = { limits };
+    }
+
+    // Commit phase (infallible): tear down any previous registration under
+    // `name` only now that the replacement binding is ready.
+    if (this.decisions.get(name)) this.unregister(name);
+    if (existing) {
+      this.modelLoadAdmissionCoordinator?.unbindRequestLoadAdmissions(name, existing.sessionRegistry);
+      this.dropNameReference(existing.model);
+    }
+
+    if (createdBinding) {
       this.sessionRegistriesByModel.set(model, binding);
     } else {
       // Registering the object revives it, including swap-error recovery while
@@ -660,7 +678,9 @@ export class ModelRegistry {
    */
   acquireDispatchLease(
     name: string,
-  ): { model: ServableModel; registry: SessionRegistry; instanceId: number } | undefined {
+  ):
+    | { model: ServableModel; registry: SessionRegistry; instanceId: number; modelFamily: ChatFamilyId | undefined }
+    | undefined {
     const entry = this.models.get(name);
     if (!entry) return undefined;
     const binding = this.sessionRegistriesByModel.get(entry.model);
@@ -668,7 +688,12 @@ export class ModelRegistry {
     const instanceId = this.instanceIds.get(entry.model);
     if (instanceId === undefined) return undefined;
     binding.inFlight += 1;
-    return { model: entry.model, registry: binding.registry, instanceId };
+    return {
+      model: entry.model,
+      registry: binding.registry,
+      instanceId,
+      modelFamily: binding.chatFamily,
+    };
   }
 
   /**
@@ -906,6 +931,24 @@ export class ModelRegistry {
       ...(lane.kvFormat !== undefined ? { kvFormat: lane.kvFormat } : {}),
       ...(governorModelId != null ? { governorModelId } : {}),
     };
+  }
+
+  /**
+   * Reasoning-effort options resolved for the loaded chat model under `name`,
+   * or `undefined` when `name` is not a resident chat model with known efforts.
+   */
+  reasoningEfforts(name: string): readonly ReasoningEffortOption[] | undefined {
+    const entry = this.models.get(name);
+    return entry && this.sessionRegistriesByModel.get(entry.model)?.reasoningEfforts;
+  }
+
+  /**
+   * Canonical chat family id of the loaded chat model under `name`, or
+   * `undefined` when `name` is not a resident chat model with a known family.
+   */
+  modelFamily(name: string): ChatFamilyId | undefined {
+    const entry = this.models.get(name);
+    return entry && this.sessionRegistriesByModel.get(entry.model)?.chatFamily;
   }
 
   /**

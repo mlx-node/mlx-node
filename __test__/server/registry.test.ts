@@ -769,9 +769,75 @@ describe('ModelRegistry.servedContext', () => {
       expect(byId.get('foreign-model')?.api_backend).toBe('messages');
       expect('reasoning_efforts' in byId.get('foreign-model')!).toBe(false);
       expect('reasoning_efforts' in byId.get('clef-decision')!).toBe(false);
+
+      expect(registry.modelFamily('Qwen3.8-27B-UD-Q4_K_XL')).toBe('qwen3_5');
+      expect(registry.modelFamily('hy4-direct')).toBe('hy_v4_flash');
+      expect(registry.modelFamily('bare-mock')).toBeUndefined();
+      expect(registry.modelFamily('foreign-model')).toBeUndefined();
+      expect(registry.reasoningEfforts('Qwen3.8-27B-UD-Q4_K_XL')).toEqual(
+        byId.get('Qwen3.8-27B-UD-Q4_K_XL')?.reasoning_efforts,
+      );
+      expect(registry.reasoningEfforts('bare-mock')).toBeUndefined();
     } finally {
       rmSync(qwen36Dir, { recursive: true, force: true });
       rmSync(qwen38Dir, { recursive: true, force: true });
     }
+  });
+
+  it('survives throwing modelAssetsPath() with fallback metadata and preserves the existing binding when contextLimits() throws during replacement', () => {
+    const registry = new ModelRegistry();
+
+    const original = createMockSessionModel();
+    registry.register('slot', original, {
+      identity: { modelId: 'slot', modelType: 'hy_v4_flash', contextWindow: 262144 },
+    });
+    const originalInstanceId = registry.getInstanceId('slot');
+
+    // A replacement whose `contextLimits()` throws must leave the previous
+    // registration intact, listed, and able to acquire a dispatch lease.
+    const throwingLimits = Object.assign(createMockSessionModel(), {
+      contextLimits: () => {
+        throw new Error('native contextLimits failure');
+      },
+    });
+    expect(() =>
+      registry.register('slot', throwingLimits, {
+        identity: { modelId: 'slot', modelType: 'qwen3_5', contextWindow: 262144 },
+      }),
+    ).toThrow('native contextLimits failure');
+
+    expect(registry.get('slot')).toBe(original);
+    expect(registry.getInstanceId('slot')).toBe(originalInstanceId);
+    expect(registry.modelFamily('slot')).toBe('hy_v4_flash');
+    expect(registry.list().map((entry) => entry.id)).toEqual(['slot']);
+    const originalLease = registry.acquireDispatchLease('slot');
+    expect(originalLease).toBeDefined();
+    expect(originalLease!.model).toBe(original);
+    expect(originalLease!.instanceId).toBe(originalInstanceId);
+    expect(originalLease!.modelFamily).toBe('hy_v4_flash');
+    registry.releaseDispatchLease(originalLease!.model);
+
+    // A replacement whose optional `modelAssetsPath()` throws still registers
+    // cleanly, falling back to the family's default binary reasoning efforts.
+    const throwingAssets = Object.assign(createMockSessionModel(), {
+      modelAssetsPath: () => {
+        throw new Error('assets path unavailable');
+      },
+    });
+    registry.register('slot', throwingAssets, {
+      identity: { modelId: 'slot', modelType: 'qwen3_5', contextWindow: 262144 },
+    });
+
+    expect(registry.get('slot')).toBe(throwingAssets);
+    expect(registry.modelFamily('slot')).toBe('qwen3_5');
+    expect(registry.reasoningEfforts('slot')).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    const replacementLease = registry.acquireDispatchLease('slot');
+    expect(replacementLease).toBeDefined();
+    expect(replacementLease!.model).toBe(throwingAssets);
+    expect(replacementLease!.modelFamily).toBe('qwen3_5');
+    registry.releaseDispatchLease(replacementLease!.model);
   });
 });

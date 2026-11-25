@@ -26,6 +26,7 @@ interface FakeRegistry {
   listSessionRegistries: () => [];
   settleModelDisposals: ReturnType<typeof vi.fn<() => Promise<void>>>;
   servedContext: () => undefined;
+  reasoningEfforts: () => undefined;
 }
 
 function fakeRegistry(): FakeRegistry {
@@ -48,6 +49,7 @@ function fakeRegistry(): FakeRegistry {
     listSessionRegistries: () => [],
     settleModelDisposals: vi.fn(async () => undefined),
     servedContext: () => undefined,
+    reasoningEfforts: () => undefined,
   };
 }
 
@@ -606,6 +608,50 @@ describe('makeSwapController', () => {
       ]);
     } finally {
       await rm(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prefers the resident model's resolved reasoning_efforts over discovery while loaded", async () => {
+    const assetsDir = await mkdtemp(join(tmpdir(), 'mlx-swap-resident-efforts-'));
+    try {
+      await writeFile(
+        join(assetsDir, 'chat_template.jinja'),
+        "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+      );
+      const registry = new ModelRegistry();
+      const loadedModel = {
+        chatSessionStart: vi.fn(),
+        chatStreamSessionStart: vi.fn(),
+        modelAssetsPath: () => assetsDir,
+      };
+      // Discovery entry carries only binary default efforts (e.g. before native asset extraction).
+      const ctrl = makeSwapController(
+        discovered(['qwen-model']),
+        registry,
+        vi.fn(async () => loadedModel as unknown as LoadableModel),
+      );
+
+      expect(ctrl.listModels()[0]?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'high', label: 'High', default: true },
+      ]);
+
+      await ctrl.resolveModel('qwen-model');
+      expect(ctrl.listModels()[0]?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High', default: true },
+        { value: 'xhigh', label: 'X-High' },
+      ]);
+
+      registry.unregister('qwen-model');
+      expect(ctrl.listModels()[0]?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'high', label: 'High', default: true },
+      ]);
+    } finally {
+      await rm(assetsDir, { recursive: true, force: true });
     }
   });
 

@@ -7863,6 +7863,133 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
     });
   });
 
+  it('preserves AlwaysOnBudgetFromEffort 256-token low budget under agent host thinking cap and respects tighter host or explicit request caps', async () => {
+    const runFor = async (
+      modelCtorName: 'Lfm2Model' | 'MuseGlimmerModel' | 'K2HorizonModel' | 'Qwen35Model',
+      extra: Record<string, unknown>,
+      server: ServerThinking | undefined,
+    ): Promise<Record<string, unknown>> => {
+      const registry = new ModelRegistry();
+      const base = createMockModel();
+      const proto = { constructor: { name: modelCtorName } };
+      const model = Object.assign(Object.create(proto), base) as typeof base;
+      registry.register('model', model);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        server,
+      );
+      const config = ((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] ?? {}) as Record<
+        string,
+        unknown
+      >;
+      return {
+        budget: config.thinkingTokenBudget,
+        guard: config.thinkingCycleGuard,
+        endText: config.thinkingEndText,
+        from: (config.turnMeta as { thinkingBudgetFrom?: string } | undefined)?.thinkingBudgetFrom,
+      };
+    };
+
+    const host: ServerThinking = {
+      tokenBudget: AGENT_HOST_THINKING.tokenBudget,
+      cycleGuard: AGENT_HOST_THINKING.cycleGuard,
+      endText: AGENT_HOST_THINKING.endText,
+    };
+
+    // Lfm2Model and MuseGlimmerModel: `low` keeps its 256-token cap instead of 12,000; `high` gets 12,000.
+    for (const ctor of ['Lfm2Model', 'MuseGlimmerModel'] as const) {
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'low' } }, host), `${ctor} low`).toEqual({
+        budget: 256,
+        guard: true,
+        endText: AGENT_HOST_THINKING.endText,
+        from: 'request',
+      });
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'high' } }, host), `${ctor} high`).toEqual({
+        budget: 12_000,
+        guard: true,
+        endText: AGENT_HOST_THINKING.endText,
+        from: 'server',
+      });
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'none' } }, host), `${ctor} none`).toEqual({
+        budget: undefined,
+        guard: undefined,
+        endText: undefined,
+        from: undefined,
+      });
+    }
+
+    // K2HorizonModel: `low` and `none` (always-think, normalizes to low) get 256; tighter host cap bounds both.
+    expect(await runFor('K2HorizonModel', { extra_body: { reasoning_effort: 'low' } }, host)).toEqual({
+      budget: 256,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+    expect(
+      await runFor(
+        'K2HorizonModel',
+        { extra_body: { reasoning_effort: 'none' } },
+        { tokenBudget: 100, cycleGuard: true },
+      ),
+    ).toEqual({
+      budget: 100,
+      guard: true,
+      endText: undefined,
+      from: 'server',
+    });
+
+    // Tighter host cap (100 < 256) acts as an upper bound; 0 disables cycleGuard & endText.
+    expect(
+      await runFor('Lfm2Model', { extra_body: { reasoning_effort: 'low' } }, { tokenBudget: 100, cycleGuard: true }),
+    ).toEqual({
+      budget: 100,
+      guard: true,
+      endText: undefined,
+      from: 'server',
+    });
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' } },
+        { tokenBudget: 0, cycleGuard: true, endText: AGENT_HOST_THINKING.endText },
+      ),
+    ).toEqual({
+      budget: 0,
+      guard: undefined,
+      endText: undefined,
+      from: 'server',
+    });
+
+    // Explicit request `thinking.budget_tokens` still overrides both effort default and host cap.
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' }, thinking: { type: 'enabled', budget_tokens: 4096 } },
+        host,
+      ),
+    ).toEqual({
+      budget: 4096,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+
+    // Template-honoring families (Qwen35Model) keep the host's 12,000 safety cap on `low`.
+    expect(await runFor('Qwen35Model', { extra_body: { reasoning_effort: 'low' } }, host)).toEqual({
+      budget: 12_000,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'server',
+    });
+  });
+
   // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function
   // is text. Mutation: drop the nameless call's raw text → red (empty text).
   it('returns a tool call that names no function as text', async () => {

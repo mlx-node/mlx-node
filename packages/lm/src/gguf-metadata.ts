@@ -84,6 +84,14 @@ abstract class HeaderCursor {
     return new TextDecoder('utf-8', { fatal: true }).decode(await this.bytes(await this.length()));
   }
 
+  async skipArrayBody(element: number, count: number, depth = 0): Promise<void> {
+    if (depth > 16) throw new Error('Unsupported GGUF metadata type');
+    const elementSize = SCALAR_BYTES.get(element);
+    if (elementSize !== undefined) return this.skip(count * elementSize);
+    if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
+    for (let index = 0; index < count; index++) await this.skipValue(element, depth + 1);
+  }
+
   async skipValue(type: number, depth = 0): Promise<void> {
     const size = SCALAR_BYTES.get(type);
     if (size !== undefined) return this.skip(size);
@@ -91,10 +99,7 @@ abstract class HeaderCursor {
     if (type !== 9 || depth > 16) throw new Error('Unsupported GGUF metadata type');
     const element = await this.u32();
     const count = await this.length();
-    const elementSize = SCALAR_BYTES.get(element);
-    if (elementSize !== undefined) return this.skip(count * elementSize);
-    if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
-    for (let index = 0; index < count; index++) await this.skipValue(element, depth + 1);
+    await this.skipArrayBody(element, count, depth);
   }
 }
 
@@ -196,10 +201,21 @@ export async function readGgufHeader(read: GgufByteSource, size: number, chunk =
 
 /** Maximum length of `tokenizer.chat_template` decoded during lightweight discovery. */
 const MAX_CHAT_TEMPLATE_BYTES = 1024 * 1024;
+/** Maximum length of `tokenizer.ggml.model` decoded during lightweight discovery (`"gpt2"` is 4 bytes). */
+const MAX_TOKENIZER_MODEL_BYTES = 64;
+const GGUF_TYPE_INT32 = 5;
+const GGUF_TYPE_STRING = 8;
+const GGUF_TYPE_ARRAY = 9;
 
 export interface GgufDiscoveryMetadata {
   architecture: string;
   chatTemplate?: string;
+  /**
+   * Whether the GGUF carries the embedded GPT-2 BPE metadata that native
+   * `write_embedded_gpt2_tokenizer` (`crates/mlx-core/src/utils/gguf.rs`)
+   * reconstructs when no sidecar `tokenizer.json` is present.
+   */
+  hasEmbeddedGpt2Tokenizer?: boolean;
 }
 
 export async function readGgufDiscoveryMetadata(path: string): Promise<GgufDiscoveryMetadata> {
@@ -219,7 +235,7 @@ export async function readGgufArchitecture(path: string): Promise<string> {
   return (await readGgufDiscoveryMetadata(path)).architecture;
 }
 
-/** `general.architecture` (and optional `tokenizer.chat_template`) of a GGUF source, read in one pass. */
+/** `general.architecture` (plus lightweight tokenizer/template metadata) of a GGUF source, read in one pass. */
 export async function readGgufSourceDiscoveryMetadata(
   read: GgufByteSource,
   size: number,
@@ -233,6 +249,10 @@ export async function readGgufSourceDiscoveryMetadata(
   checkHeaderCounts(tensors, count);
   let architecture: string | undefined;
   let chatTemplate: string | undefined;
+  let tokenizerModel: string | undefined;
+  let tokensCount: number | undefined;
+  let tokenTypeCount: number | undefined;
+  let hasMerges = false;
   const keys = new Set<string>();
   for (let index = 0; index < count; index++) {
     const key = await reader.string();
@@ -240,21 +260,53 @@ export async function readGgufSourceDiscoveryMetadata(
     keys.add(key);
     const type = await reader.u32();
     if (key === 'general.architecture') {
-      architecture = type === 8 ? await reader.string() : undefined;
-      if (type !== 8) await reader.skipValue(type);
-    } else if (key === 'tokenizer.chat_template' && type === 8) {
+      architecture = type === GGUF_TYPE_STRING ? await reader.string() : undefined;
+      if (type !== GGUF_TYPE_STRING) await reader.skipValue(type);
+    } else if (key === 'tokenizer.chat_template' && type === GGUF_TYPE_STRING) {
       const length = await reader.length();
       if (length <= MAX_CHAT_TEMPLATE_BYTES) {
         chatTemplate = new TextDecoder('utf-8').decode(await reader.bytes(length));
       } else {
         reader.skip(length);
       }
+    } else if (key === 'tokenizer.ggml.model' && type === GGUF_TYPE_STRING) {
+      const length = await reader.length();
+      if (length <= MAX_TOKENIZER_MODEL_BYTES) {
+        tokenizerModel = new TextDecoder('utf-8').decode(await reader.bytes(length));
+      } else {
+        reader.skip(length);
+      }
+    } else if (key === 'tokenizer.ggml.tokens' && type === GGUF_TYPE_ARRAY) {
+      const element = await reader.u32();
+      const length = await reader.length();
+      if (element === GGUF_TYPE_STRING) tokensCount = length;
+      await reader.skipArrayBody(element, length);
+    } else if (key === 'tokenizer.ggml.token_type' && type === GGUF_TYPE_ARRAY) {
+      const element = await reader.u32();
+      const length = await reader.length();
+      if (element === GGUF_TYPE_INT32) tokenTypeCount = length;
+      await reader.skipArrayBody(element, length);
+    } else if (key === 'tokenizer.ggml.merges' && type === GGUF_TYPE_ARRAY) {
+      const element = await reader.u32();
+      const length = await reader.length();
+      if (element === GGUF_TYPE_STRING) hasMerges = true;
+      await reader.skipArrayBody(element, length);
     } else {
       await reader.skipValue(type);
     }
   }
   if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
-  return chatTemplate !== undefined ? { architecture, chatTemplate } : { architecture };
+  const hasEmbeddedGpt2Tokenizer =
+    tokenizerModel === 'gpt2' &&
+    tokensCount !== undefined &&
+    tokenTypeCount !== undefined &&
+    tokensCount === tokenTypeCount &&
+    hasMerges;
+  return {
+    architecture,
+    ...(chatTemplate !== undefined ? { chatTemplate } : {}),
+    ...(hasEmbeddedGpt2Tokenizer ? { hasEmbeddedGpt2Tokenizer: true } : {}),
+  };
 }
 
 /** `general.architecture` of a GGUF source, read through one `chunk`-byte window. */
@@ -326,6 +378,14 @@ class SyncWindowReader {
     return new TextDecoder('utf-8', { fatal: true }).decode(this.bytes(this.length()));
   }
 
+  skipArrayBody(element: number, count: number, depth = 0): void {
+    if (depth > 16) throw new Error('Unsupported GGUF metadata type');
+    const elementSize = SCALAR_BYTES.get(element);
+    if (elementSize !== undefined) return this.skip(count * elementSize);
+    if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
+    for (let index = 0; index < count; index++) this.skipValue(element, depth + 1);
+  }
+
   skipValue(type: number, depth = 0): void {
     const size = SCALAR_BYTES.get(type);
     if (size !== undefined) return this.skip(size);
@@ -333,10 +393,7 @@ class SyncWindowReader {
     if (type !== 9 || depth > 16) throw new Error('Unsupported GGUF metadata type');
     const element = this.u32();
     const count = this.length();
-    const elementSize = SCALAR_BYTES.get(element);
-    if (elementSize !== undefined) return this.skip(count * elementSize);
-    if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
-    for (let index = 0; index < count; index++) this.skipValue(element, depth + 1);
+    this.skipArrayBody(element, count, depth);
   }
 }
 
@@ -354,6 +411,10 @@ export function readGgufDiscoveryMetadataSync(path: string): GgufDiscoveryMetada
     checkHeaderCounts(tensors, count);
     let architecture: string | undefined;
     let chatTemplate: string | undefined;
+    let tokenizerModel: string | undefined;
+    let tokensCount: number | undefined;
+    let tokenTypeCount: number | undefined;
+    let hasMerges = false;
     const keys = new Set<string>();
     for (let index = 0; index < count; index++) {
       const key = reader.string();
@@ -361,21 +422,53 @@ export function readGgufDiscoveryMetadataSync(path: string): GgufDiscoveryMetada
       keys.add(key);
       const type = reader.u32();
       if (key === 'general.architecture') {
-        architecture = type === 8 ? reader.string() : undefined;
-        if (type !== 8) reader.skipValue(type);
-      } else if (key === 'tokenizer.chat_template' && type === 8) {
+        architecture = type === GGUF_TYPE_STRING ? reader.string() : undefined;
+        if (type !== GGUF_TYPE_STRING) reader.skipValue(type);
+      } else if (key === 'tokenizer.chat_template' && type === GGUF_TYPE_STRING) {
         const length = reader.length();
         if (length <= MAX_CHAT_TEMPLATE_BYTES) {
           chatTemplate = new TextDecoder('utf-8').decode(reader.bytes(length));
         } else {
           reader.skip(length);
         }
+      } else if (key === 'tokenizer.ggml.model' && type === GGUF_TYPE_STRING) {
+        const length = reader.length();
+        if (length <= MAX_TOKENIZER_MODEL_BYTES) {
+          tokenizerModel = new TextDecoder('utf-8').decode(reader.bytes(length));
+        } else {
+          reader.skip(length);
+        }
+      } else if (key === 'tokenizer.ggml.tokens' && type === GGUF_TYPE_ARRAY) {
+        const element = reader.u32();
+        const length = reader.length();
+        if (element === GGUF_TYPE_STRING) tokensCount = length;
+        reader.skipArrayBody(element, length);
+      } else if (key === 'tokenizer.ggml.token_type' && type === GGUF_TYPE_ARRAY) {
+        const element = reader.u32();
+        const length = reader.length();
+        if (element === GGUF_TYPE_INT32) tokenTypeCount = length;
+        reader.skipArrayBody(element, length);
+      } else if (key === 'tokenizer.ggml.merges' && type === GGUF_TYPE_ARRAY) {
+        const element = reader.u32();
+        const length = reader.length();
+        if (element === GGUF_TYPE_STRING) hasMerges = true;
+        reader.skipArrayBody(element, length);
       } else {
         reader.skipValue(type);
       }
     }
     if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
-    return chatTemplate !== undefined ? { architecture, chatTemplate } : { architecture };
+    const hasEmbeddedGpt2Tokenizer =
+      tokenizerModel === 'gpt2' &&
+      tokensCount !== undefined &&
+      tokenTypeCount !== undefined &&
+      tokensCount === tokenTypeCount &&
+      hasMerges;
+    return {
+      architecture,
+      ...(chatTemplate !== undefined ? { chatTemplate } : {}),
+      ...(hasEmbeddedGpt2Tokenizer ? { hasEmbeddedGpt2Tokenizer: true } : {}),
+    };
   } finally {
     closeSync(fd);
   }

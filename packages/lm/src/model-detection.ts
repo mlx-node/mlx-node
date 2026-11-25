@@ -1,10 +1,10 @@
 /** Shared filesystem-only model detection for inference and control-panel discovery. */
-import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync, statSync } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { dirname, extname, join } from 'node:path';
 
 import { MODEL_FAMILY_DATA, matchFamily, type ModelType } from './family-data.js';
-import { readGgufArchitecture, readGgufDiscoveryMetadataSync } from './gguf-metadata.js';
+import { readGgufArchitecture, readGgufDiscoveryMetadataSync, type GgufDiscoveryMetadata } from './gguf-metadata.js';
 
 export {
   readGgufArchitecture,
@@ -83,20 +83,39 @@ export function readDirectoryChatTemplateSync(modelDir: string): string | undefi
   return readRegularTextFileSync(join(modelDir, 'chat_template.jinja'), MAX_CHAT_TEMPLATE_BYTES);
 }
 
+function hasRegularFileSync(path: string): boolean {
+  try {
+    return statSync(path).isFile();
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Read a checkpoint's Jinja chat template synchronously from either a model
- * directory or a `.gguf` file (sibling sidecars first, then embedded GGUF
- * `tokenizer.chat_template`). Returns `undefined` when unavailable.
+ * directory or a `.gguf` file. Mirrors native `gguf_plan.rs` +
+ * `write_embedded_gpt2_tokenizer`: when a GGUF carries embedded GPT-2
+ * tokenizer metadata + `tokenizer.chat_template` and no sidecar
+ * `tokenizer.json` exists, the embedded template overwrites sidecars at load
+ * time and takes precedence here too. Returns `undefined` when unavailable.
  */
 export function readModelChatTemplateSync(modelPath: string): string | undefined {
   if (extname(modelPath).toLowerCase() === '.gguf') {
-    const fromSidecars = readDirectoryChatTemplateSync(dirname(modelPath));
-    if (fromSidecars !== undefined) return fromSidecars;
+    const sidecarDir = dirname(modelPath);
+    let ggufMetadata: GgufDiscoveryMetadata | undefined;
     try {
-      return readGgufDiscoveryMetadataSync(modelPath).chatTemplate;
+      ggufMetadata = readGgufDiscoveryMetadataSync(modelPath);
     } catch {
-      return undefined;
+      ggufMetadata = undefined;
     }
+    if (
+      ggufMetadata?.hasEmbeddedGpt2Tokenizer === true &&
+      ggufMetadata.chatTemplate !== undefined &&
+      !hasRegularFileSync(join(sidecarDir, 'tokenizer.json'))
+    ) {
+      return ggufMetadata.chatTemplate;
+    }
+    return readDirectoryChatTemplateSync(sidecarDir) ?? ggufMetadata?.chatTemplate;
   }
   return readDirectoryChatTemplateSync(modelPath);
 }

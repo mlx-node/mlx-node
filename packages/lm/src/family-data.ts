@@ -990,6 +990,38 @@ export function rawModelTypeToCanonical(rawModelType: string): ModelType | undef
   return FAMILY_DATA_INDEX.byRawModelType.get(rawModelType)?.id as ModelType | undefined;
 }
 
+/** Canonical `ChatFamilyId` for `modelType`, or `undefined` for non-chat or unknown model types. */
+export function chatFamilyIdFor(modelType: string): ChatFamilyId | undefined {
+  return chatFamilyDataFor(modelType)?.id as ChatFamilyId | undefined;
+}
+
+/**
+ * Default thinking-token budget implied by `reasoningEffort` for families
+ * whose native `ThinkingPolicy` is `AlwaysOnBudgetFromEffort`
+ * (`crates/mlx-core/src/engine/params.rs` and `models/k2_horizon/model.rs`).
+ *
+ * Returns `undefined` when the family honors effort via its chat template or
+ * leaves thinking uncapped at this effort level.
+ */
+export function defaultThinkingBudgetForEffort(
+  family: ChatFamilyId | undefined,
+  reasoningEffort: string | undefined,
+): number | undefined {
+  if (family === undefined || reasoningEffort === undefined) return undefined;
+  if (family === 'lfm2' || family === 'lfm2_moe' || family === 'muse_glimmer') {
+    if (reasoningEffort === 'none') return 0;
+    if (reasoningEffort === 'minimal' || reasoningEffort === 'low') return 256;
+    return undefined;
+  }
+  if (family === 'k2_horizon') {
+    if (reasoningEffort === 'none' || reasoningEffort === 'minimal' || reasoningEffort === 'low') {
+      return 256;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 /** Agent discovery traits for a chat-capable family. */
 export function familyTraitsFor(modelType: string): FamilyTraits | undefined {
   return chatFamilyDataFor(modelType)?.traits;

@@ -67,6 +67,7 @@ import {
 } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamControl, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
+import { defaultThinkingBudgetForEffort, type ChatFamilyId } from '@mlx-node/lm/family-data';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {
@@ -232,22 +233,44 @@ export interface ServerThinking {
 export function applyServerThinking(
   config: ChatConfig,
   server: ServerThinking | undefined,
+  modelFamily?: ChatFamilyId,
 ): { config: ChatConfig; from: TurnBudgetFrom | undefined } {
   const own = config.thinkingTokenBudget !== undefined;
-  if (server === undefined || config.reasoningEffort === 'none') {
+  const effortBudget = own ? undefined : defaultThinkingBudgetForEffort(modelFamily, config.reasoningEffort);
+  // Effort `none` disables thinking on template-honoring families and caps
+  // LFM2/Muse-Glimmer at 0 tokens; skip server thinking options unless the
+  // family still thinks on `none` (K2-Horizon normalizes `none`→`low`=256).
+  if (
+    server === undefined ||
+    (config.reasoningEffort === 'none' && !(effortBudget !== undefined && effortBudget > 0))
+  ) {
     return { config, from: own ? 'request' : undefined };
   }
-  const budget = !own && server.tokenBudget !== undefined;
-  const effectiveBudget = own ? config.thinkingTokenBudget : server.tokenBudget;
-  const zeroBudget = effectiveBudget === 0;
+  const serverBudget = server.tokenBudget;
+  const resolvedBudget = own
+    ? config.thinkingTokenBudget
+    : effortBudget !== undefined
+      ? serverBudget !== undefined
+        ? Math.min(effortBudget, serverBudget)
+        : effortBudget
+      : serverBudget;
+  const budget = !own && resolvedBudget !== undefined;
+  const zeroBudget = resolvedBudget === 0;
   const guard = !zeroBudget && server.cycleGuard === true;
   const endText = !zeroBudget && server.endText !== undefined && server.endText !== '' ? server.endText : undefined;
   if (!budget && !guard && endText === undefined) return { config, from: own ? 'request' : undefined };
   const out: ChatConfig = { ...config };
-  if (budget) out.thinkingTokenBudget = server.tokenBudget;
+  if (budget) out.thinkingTokenBudget = resolvedBudget;
   if (guard) out.thinkingCycleGuard = true;
   if (endText !== undefined) out.thinkingEndText = endText;
-  return { config: out, from: own ? 'request' : budget ? 'server' : undefined };
+  const from: TurnBudgetFrom | undefined = own
+    ? 'request'
+    : !budget
+      ? undefined
+      : effortBudget !== undefined && (serverBudget === undefined || effortBudget <= serverBudget)
+        ? 'request'
+        : 'server';
+  return { config: out, from };
 }
 
 // Non-streaming path
@@ -1333,9 +1356,11 @@ export async function handleCreateMessage(
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;
   }
-  mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
-  const thinking = applyServerThinking(mappedConfig, serverThinking);
-  mappedConfig = thinking.config;
+  const baseMappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
+  // Pre-load quarantine fingerprint stays independent of whether the target
+  // model is already loaded (retries after a crash must match before load).
+  const preflightThinking = applyServerThinking(baseMappedConfig, serverThinking);
+  mappedConfig = preflightThinking.config;
   const turnFingerprint =
     turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
   // Splash `_admit`: refused before admission and before any model load or swap.
@@ -1572,7 +1597,12 @@ export async function handleCreateMessage(
     }
 
     const sessionReg: SessionRegistry = lease.registry;
-    mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
+    // Resolve server/effort thinking budgets against the leased model's
+    // canonical family so `AlwaysOnBudgetFromEffort` families (LFM2,
+    // Muse-Glimmer, K2-Horizon) keep their 256-token `low` cap instead of
+    // having the host's 12,000-token safety cap override it.
+    const thinking = applyServerThinking(baseMappedConfig, serverThinking, lease.modelFamily);
+    mappedConfig = applyOutputTokenLimit(thinking.config, sessionReg.outputTokenLimit);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check

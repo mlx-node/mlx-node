@@ -1060,6 +1060,45 @@ describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reas
     { value: 'xhigh', label: 'X-High' },
   ];
 
+  function gpt2Gguf(architecture: string, opts: { chatTemplate: string; tokenTypes?: number[] }): Buffer {
+    const str = (value: string): Buffer => {
+      const bytes = Buffer.from(value, 'utf8');
+      const length = Buffer.alloc(8);
+      length.writeBigUInt64LE(BigInt(bytes.length));
+      return Buffer.concat([length, bytes]);
+    };
+    const u32 = (value: number): Buffer => {
+      const buf = Buffer.alloc(4);
+      buf.writeUInt32LE(value);
+      return buf;
+    };
+    const u64 = (value: number): Buffer => {
+      const buf = Buffer.alloc(8);
+      buf.writeBigUInt64LE(BigInt(value));
+      return buf;
+    };
+    const strArray = (items: string[]): Buffer => Buffer.concat([u32(9), u32(8), u64(items.length), ...items.map(str)]);
+    const i32Array = (items: number[]): Buffer => {
+      const payload = Buffer.alloc(items.length * 4);
+      items.forEach((value, idx) => payload.writeInt32LE(value, idx * 4));
+      return Buffer.concat([u32(9), u32(5), u64(items.length), payload]);
+    };
+    const tokenTypes = opts.tokenTypes ?? [1, 1];
+    const entries: Buffer[] = [
+      Buffer.concat([str('general.architecture'), u32(8), str(architecture)]),
+      Buffer.concat([str('tokenizer.ggml.model'), u32(8), str('gpt2')]),
+      Buffer.concat([str('tokenizer.ggml.tokens'), strArray(['a', 'b'])]),
+      Buffer.concat([str('tokenizer.ggml.token_type'), i32Array(tokenTypes)]),
+      Buffer.concat([str('tokenizer.ggml.merges'), strArray(['a b'])]),
+      Buffer.concat([str('tokenizer.chat_template'), u32(8), str(opts.chatTemplate)]),
+    ];
+    const header = Buffer.alloc(24);
+    header.write('GGUF');
+    header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(BigInt(entries.length), 16);
+    return Buffer.concat([header, ...entries]);
+  }
+
   it('resolves binary vs multi-level reasoningEfforts from chat_template.jinja, tokenizer_config.json, and GGUF metadata', async () => {
     const dir = modelsDir('qwen35-vs-qwen38-efforts', {
       'qwen36-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
@@ -1083,5 +1122,30 @@ describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reas
     expect(byName.get('Qwen3.6-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
     expect(byName.get('Qwen3.8-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
     expect(byName.get('Qwen3.5-9B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+  });
+
+  it('mirrors native GGUF embedded GPT-2 tokenizer template overwrite precedence based on tokenizer.json presence', async () => {
+    const dir = modelsDir('qwen38-gguf-embedded-precedence', {
+      // No tokenizer.json: native write_embedded_gpt2_tokenizer overwrites sidecar template with GGUF template.
+      'no-tok-json/Qwen3.8-NoTok-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'no-tok-json/chat_template.jinja': QWEN36_TEMPLATE,
+      // With tokenizer.json: native skips write_embedded_gpt2_tokenizer, so sidecar template wins.
+      'with-tok-json/Qwen3.8-WithTok-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'with-tok-json/chat_template.jinja': QWEN36_TEMPLATE,
+      'with-tok-json/tokenizer.json': '{}',
+      // Mismatched tokens/token_type counts: embedded GPT-2 check fails, so sidecar template wins.
+      'bad-tok-len/Qwen3.8-BadLen-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN38_TEMPLATE,
+        tokenTypes: [1],
+      }),
+      'bad-tok-len/chat_template.jinja': QWEN36_TEMPLATE,
+    });
+
+    const found = await discoverLocalChatModels(dir);
+    const byName = new Map(found.map((model) => [model.name, model]));
+
+    expect(byName.get('Qwen3.8-NoTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.8-WithTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-BadLen-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
   });
 });

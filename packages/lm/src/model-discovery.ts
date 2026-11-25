@@ -21,6 +21,7 @@ import {
   readDirectoryChatTemplate,
   readGgufDiscoveryMetadata,
   readModelConfig,
+  type GgufDiscoveryMetadata,
 } from './model-detection.js';
 import {
   folderVariant,
@@ -106,6 +107,14 @@ export function bareGgufFamily(name: string, architecture: string): ModelType | 
   const modelType = ggufArchitectureModelType(architecture);
   if (modelType === undefined || familyDataFor(modelType)?.ggufDiscovery?.requiresAssets) return undefined;
   return supportedGgufName(name, modelType) ? modelType : undefined;
+}
+
+async function hasRegularFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {
@@ -349,7 +358,7 @@ export async function discoverLocalChatModels(
     format: ModelFormat,
     splitFileId: string | undefined,
     naming: (config: unknown, id: string) => ModelVariantName,
-    ggufChatTemplate?: string,
+    ggufMetadata?: Pick<GgufDiscoveryMetadata, 'chatTemplate' | 'hasEmbeddedGpt2Tokenizer'>,
   ): Promise<void> => {
     const decision = familyDataFor(modelType)?.kind === 'decision' && opts?.includeDecisions === true;
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
@@ -372,12 +381,20 @@ export async function discoverLocalChatModels(
     }
 
     // Qwen3.5/3.6 and Qwen3.8 share `qwen3_5` (and potentially `qwen3_5_moe`).
-    // Inspect the checkpoint's chat template (sidecar files first, then GGUF
-    // metadata) so only templates implementing Qwen3.8's multi-level protocol
-    // advertise Low/Medium/High/X-High instead of binary Off/High.
+    // Mirror native GGUF preparation (`gguf_plan.rs` + `write_embedded_gpt2_tokenizer`):
+    // when a GGUF carries embedded GPT-2 tokenizer metadata + `tokenizer.chat_template`
+    // and no sidecar `tokenizer.json` exists, native overwrites sidecar templates
+    // from the GGUF. Otherwise sidecar files take precedence over GGUF metadata.
     let traits = baseTraits;
     if (!decision && (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe')) {
-      const chatTemplate = (await readDirectoryChatTemplate(metadataRoot)) ?? ggufChatTemplate;
+      const ggufOverwritesTemplate =
+        format === 'gguf' &&
+        ggufMetadata?.hasEmbeddedGpt2Tokenizer === true &&
+        ggufMetadata.chatTemplate !== undefined &&
+        !(await hasRegularFile(join(metadataRoot, 'tokenizer.json')));
+      const chatTemplate = ggufOverwritesTemplate
+        ? ggufMetadata.chatTemplate
+        : ((await readDirectoryChatTemplate(metadataRoot)) ?? ggufMetadata?.chatTemplate);
       const resolvedEfforts = reasoningEffortsFor(modelType, { chatTemplate });
       if (resolvedEfforts !== baseTraits.reasoningEfforts) {
         traits = { ...baseTraits, reasoningEfforts: resolvedEfforts };
@@ -474,7 +491,7 @@ export async function discoverLocalChatModels(
         'gguf',
         splitFileId,
         (_config, id) => ggufVariant(names.stem, repoFolder, variantFolder, id),
-        ggufMetadata.chatTemplate,
+        ggufMetadata,
       );
     } catch (err) {
       reportFailure(err, path);
