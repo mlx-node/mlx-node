@@ -269,6 +269,91 @@ fn grid_rules() {
     assert_eq!(g.replay_row(&first_only), 32);
 }
 
+/// Multi-turn conversations keep every earlier assistant opening's block row
+/// as a chunk end in `Grid::ends` so chunking is prefix-monotonic across turns,
+/// while `Grid::states` still only takes checkpoints + the final replay row.
+#[test]
+fn multi_turn_boundaries_keep_grid_ends_prefix_monotonic() {
+    for chunk in [2048, 4096, 8192] {
+        let g = grid(chunk);
+        // Turn 1: len 5000, opening at 4995 -> replay_row = 4992.
+        let p1 = prompt_of(5000);
+        let r1 = g.replay_row(&p1);
+        assert_eq!(r1, 4992);
+        assert_eq!(g.boundaries(&p1), vec![r1]);
+        let e1 = g.ends(0, &p1);
+
+        // Turn 2: extends Turn 1 (even rewriting tokens after OPEN to mimic
+        // <think> stripping), adding a second opening at 6495 -> replay_row = 6496.
+        let mut p2 = p1.clone();
+        p2[4998] = 88;
+        p2.extend((0..1500).map(|i| FILL + ((i + 13) % 89) as u32));
+        let len2 = p2.len();
+        p2[len2 - GEN.len()..].copy_from_slice(&GEN);
+        let r2 = g.replay_row(&p2);
+        assert_eq!(r2, (len2 - GEN.len()) - (len2 - GEN.len()) % BLOCK_ROWS);
+        assert_eq!(g.boundaries(&p2), vec![r1, r2]);
+        let e2 = g.ends(0, &p2);
+        assert!(
+            e2.contains(&r1),
+            "chunk {chunk}: Turn 2 must cut at Turn 1 replay row {r1}"
+        );
+        assert_eq!(
+            e1.iter().copied().filter(|&e| e <= r1).collect::<Vec<_>>(),
+            e2.iter().copied().filter(|&e| e <= r1).collect::<Vec<_>>(),
+            "chunk {chunk}: Turn 1..=r1 ends must be a prefix of Turn 2 ends"
+        );
+        // Cold prefill of Turn 2 must NOT snapshot at historical Turn 1 boundary r1.
+        let st2 = g.states(0, &p2);
+        assert!(
+            !st2.iter().any(|s| s.row == r1),
+            "no redundant state at {r1}"
+        );
+        assert_eq!(
+            st2.last(),
+            Some(&StateRow {
+                row: r2,
+                kind: Kind::Prompt
+            })
+        );
+
+        // Turn 3: crosses 8192 checkpoint, adding a third opening at 10995 -> 10976.
+        let mut p3 = p2.clone();
+        p3.extend((0..4500).map(|i| FILL + ((i + 37) % 83) as u32));
+        let len3 = p3.len();
+        p3[len3 - GEN.len()..].copy_from_slice(&GEN);
+        let r3 = g.replay_row(&p3);
+        assert_eq!(g.boundaries(&p3), vec![r1, r2, r3]);
+        let e3 = g.ends(0, &p3);
+        assert!(e3.contains(&r1) && e3.contains(&r2));
+        assert_eq!(
+            e2.iter().copied().filter(|&e| e <= r2).collect::<Vec<_>>(),
+            e3.iter().copied().filter(|&e| e <= r2).collect::<Vec<_>>(),
+            "chunk {chunk}: Turn 2..=r2 ends must be a prefix of Turn 3 ends"
+        );
+        // Absolute resume property still holds on multi-turn prompts.
+        for start in [r1, r2, 4096, 8192] {
+            if start < len3 {
+                let tail: Vec<usize> = e3.iter().copied().filter(|&e| e > start).collect();
+                assert_eq!(g.ends(start, &p3), tail, "chunk {chunk} start {start}");
+            }
+        }
+    }
+
+    // Edge cases: opening at 0 ignored, opening in block 0 (row 0) ignored,
+    // two openings in the same 32-row block deduplicated, empty `open` yields empty.
+    let g = grid(4096);
+    let mut edge = vec![FILL; 200];
+    edge[0..3].copy_from_slice(&OPEN);
+    edge[10..13].copy_from_slice(&OPEN);
+    edge[65..68].copy_from_slice(&OPEN);
+    edge[75..78].copy_from_slice(&OPEN);
+    edge[130..133].copy_from_slice(&OPEN);
+    assert_eq!(g.boundaries(&edge), vec![64, 128]);
+    let raw = Grid::new(4096, Vec::new()).unwrap();
+    assert!(raw.boundaries(&edge).is_empty());
+}
+
 /// The truncate rules of `WindowRing` and `IndexerState`.
 #[test]
 fn truncate_rules() {

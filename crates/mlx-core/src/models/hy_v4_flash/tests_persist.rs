@@ -819,3 +819,301 @@ fn fast_decode_turn_does_not_supersede_prompt_end_state() {
         );
     }
 }
+
+/// Multi-turn cold `Kind::Prompt` states (`!any_written`) stay resumable across
+/// Turn 1 -> Turn 2 -> Turn 3 because `Grid::ends` preserves earlier assistant
+/// opening boundaries so `pass_keys` is prefix-monotonic.
+#[test]
+fn cold_prompt_state_resumes_across_multi_turn_prompts() {
+    use super::prefill::Grid;
+    use super::sched::pass_keys;
+
+    const OPEN: [u32; 3] = [120_000, 611, 10_372];
+    const GEN: [u32; 5] = [120_000, 611, 10_372, 120_001, 120_029];
+    const CHUNK: usize = 4096;
+    const SALT: u64 = 19;
+
+    let g = Grid::new(CHUNK, OPEN.to_vec()).unwrap();
+    let mut st = States::<PrefixState>::with_cap(8);
+
+    // Turn 1: 5000 tokens ending in GEN (opening at 4995 -> replay_row 4992).
+    let mut p1: Vec<u32> = (0..5000).map(|i| 17 + (i % 97) as u32).collect();
+    p1[5000 - GEN.len()..].copy_from_slice(&GEN);
+    let r1 = g.replay_row(&p1);
+    assert_eq!(r1, 4992);
+    let ends1 = g.ends(0, &p1);
+    let pass1 = pass_keys(&p1, &ends1, CHUNK);
+    assert!(!any_written(&pass1));
+    let id1 = st
+        .publish(
+            Key {
+                tokens: &p1[..r1],
+                keys: &pass1[..r1 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(r1),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Turn 2: extends Turn 1 (mutating post-OPEN token 4998 to simulate think
+    // stripping) + assistant reply + user msg + GEN -> len 6500, r2 = 6464.
+    let mut p2 = p1.clone();
+    p2[4998] = 999;
+    p2.extend((0..1500).map(|i| 31 + (i % 89) as u32));
+    let len2 = p2.len();
+    p2[len2 - GEN.len()..].copy_from_slice(&GEN);
+    let r2 = g.replay_row(&p2);
+    assert_eq!(r2, 6464);
+    let ends2 = g.ends(0, &p2);
+    let pass2 = pass_keys(&p2, &ends2, CHUNK);
+    assert!(
+        ends2.contains(&r1),
+        "Turn 2 grid ends must contain Turn 1 replay_row"
+    );
+    assert_eq!(&pass2[..r1 / BLOCK_ROWS], &pass1[..r1 / BLOCK_ROWS]);
+
+    let pk2 = Key {
+        tokens: &p2,
+        keys: &pass2,
+        salt: SALT,
+    };
+    assert!(
+        resumes(st.store().get(id1).unwrap(), pk2),
+        "cold Turn 1 Kind::Prompt (!any_written) must resume on Turn 2"
+    );
+    assert_eq!(st.lookup(pk2, &|_| true), Some((id1, r1)));
+
+    // Resuming Turn 2 from id1 at r1 (a cold end!) keeps Turn 2's Prompt cold too.
+    let line1 = st.keys_of(id1).unwrap();
+    let keys2 = prompt_keys(&p2, r1, &line1, &pass2, ends2.contains(&r1), 42);
+    assert!(
+        !any_written(&keys2),
+        "resuming at cold boundary must remain cold"
+    );
+    let id2 = st
+        .publish(
+            Key {
+                tokens: &p2[..r2],
+                keys: &keys2[..r2 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(r2),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Turn 3: crosses 8192 checkpoint -> len 11_000, r3 = 10_976.
+    let mut p3 = p2.clone();
+    p3.extend((0..4500).map(|i| 53 + (i % 79) as u32));
+    let len3 = p3.len();
+    p3[len3 - GEN.len()..].copy_from_slice(&GEN);
+    let ends3 = g.ends(0, &p3);
+    let pass3 = pass_keys(&p3, &ends3, CHUNK);
+    assert!(ends3.contains(&r1) && ends3.contains(&r2));
+    let pk3 = Key {
+        tokens: &p3,
+        keys: &pass3,
+        salt: SALT,
+    };
+    assert!(resumes(st.store().get(id1).unwrap(), pk3));
+    assert!(resumes(st.store().get(id2).unwrap(), pk3));
+    assert_eq!(st.lookup(pk3, &|_| true), Some((id2, r2)));
+}
+
+/// Warm `Kind::Prompt` states (`any_written == true`, e.g. Turn 2+ resumed from
+/// a prior `Kind::Turn`) and `Checkpoint -> Prompt` upgrades must NOT be
+/// superseded by a fast `< DELAY` `Kind::Turn`, while linear `Turn -> Turn`
+/// still supersedes.
+#[test]
+fn warm_prompt_and_upgraded_checkpoint_are_not_superseded_by_fast_turn() {
+    let root = Temp::new("persist-warm-prompt");
+    let cfg = tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let pid = Some((
+        "00112233445566778899aabbccddeeff",
+        b"hy4-warm-prompt-supersede".as_slice(),
+    ));
+
+    let prompt_row = MINIMUM_ROWS + 256;
+    let turn_row = prompt_row + 256;
+    let turn2_row = turn_row + 256;
+    let full = tokens(turn2_row + 32);
+
+    // Warm keys: Turn 2 resumed from a Turn 1 write-path state, so block 0..
+    // already carries WRITE_TAG -> `any_written(&warm_prompt_keys)` is TRUE.
+    let pass: Vec<Vec<u64>> = (0..MINIMUM_ROWS / BLOCK_ROWS)
+        .map(|b| vec![0x6000_0000 + b as u64])
+        .collect();
+    let prev_turn_keys = turn_keys(&full, &pass[..1], MINIMUM_ROWS, 333);
+    let warm_prompt_keys = prompt_keys(
+        &full[..prompt_row],
+        MINIMUM_ROWS,
+        &prev_turn_keys,
+        &[],
+        false,
+        444,
+    );
+    assert!(
+        any_written(&warm_prompt_keys),
+        "warm Turn 2 prompt keys must carry write-path keys"
+    );
+    let fast_turn_keys = turn_keys(&full, &warm_prompt_keys, turn_row, 555);
+    let turn2_keys = turn_keys(&full, &fast_turn_keys, turn2_row, 666);
+    let mk = |row: usize| make_cell_state(&cfg, &full[..row], &[row], false).1;
+
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(8);
+
+    // 1. Warm `Kind::Prompt` (`any_written == true`) followed immediately (< DELAY)
+    //    by `Kind::Turn` on the same lineage: Prompt must NOT be superseded.
+    let p_id = rig.publish(
+        &mut st,
+        1,
+        &full[..prompt_row],
+        &warm_prompt_keys,
+        0,
+        mk(prompt_row),
+        Kind::Prompt,
+    );
+    let t_id = rig.publish(
+        &mut st,
+        1,
+        &full[..turn_row],
+        &fast_turn_keys,
+        0,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    assert!(
+        st.store().superseded(p_id),
+        "raw store sees Turn descendant"
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed),
+        0,
+        "warm Kind::Prompt must not be superseded by fast Kind::Turn"
+    );
+    for (id, label) in [(p_id, "warm prompt"), (t_id, "fast turn")] {
+        assert!(
+            st.store()
+                .get(id)
+                .and_then(|e| e.disk())
+                .is_some_and(|d| d.landed),
+            "{label} must land on disk"
+        );
+    }
+
+    // 2. Checkpoint at `prompt_row` upgraded to `Kind::Prompt` at the exact same
+    //    block (and never downgraded by a subsequent Checkpoint/Turn at the same
+    //    block) must ALSO be protected from superseding by a deeper `Kind::Turn`.
+    let ck_id = st
+        .publish(
+            Key {
+                tokens: &full[..prompt_row],
+                keys: &warm_prompt_keys,
+                salt: 9,
+            },
+            mk(prompt_row),
+            Kind::Checkpoint,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        st.store().get(ck_id).unwrap().ram().unwrap().kind,
+        Kind::Checkpoint
+    );
+    let upgraded_id = rig.publish(
+        &mut st,
+        2,
+        &full[..prompt_row],
+        &warm_prompt_keys,
+        9,
+        mk(prompt_row),
+        Kind::Prompt,
+    );
+    assert_eq!(upgraded_id, ck_id, "reuses existing entry on same block");
+    assert_eq!(
+        st.store().get(ck_id).unwrap().ram().unwrap().kind,
+        Kind::Prompt,
+        "Checkpoint must upgrade to Kind::Prompt"
+    );
+    assert!(!st.store().get(ck_id).unwrap().checkpoint());
+    // Publishing Checkpoint or Turn on the same block must NEVER downgrade Prompt.
+    for downgrade in [Kind::Checkpoint, Kind::Turn] {
+        let same = st
+            .publish(
+                Key {
+                    tokens: &full[..prompt_row],
+                    keys: &warm_prompt_keys,
+                    salt: 9,
+                },
+                mk(prompt_row),
+                downgrade,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(same, ck_id);
+        assert_eq!(
+            st.store().get(ck_id).unwrap().ram().unwrap().kind,
+            Kind::Prompt
+        );
+    }
+    let t9_id = rig.publish(
+        &mut st,
+        2,
+        &full[..turn_row],
+        &fast_turn_keys,
+        9,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed),
+        0,
+        "Checkpoint upgraded to Prompt must not be superseded"
+    );
+    assert!(
+        st.store()
+            .get(ck_id)
+            .and_then(|e| e.disk())
+            .is_some_and(|d| d.landed)
+    );
+    assert!(
+        st.store()
+            .get(t9_id)
+            .and_then(|e| e.disk())
+            .is_some_and(|d| d.landed)
+    );
+
+    // 3. Linear Turn 1 -> Turn 2 on a fresh salt still supersedes Turn 1.
+    let before_unneeded = rig.telem.unneeded.load(Ordering::Relaxed);
+    rig.publish(
+        &mut st,
+        3,
+        &full[..turn_row],
+        &fast_turn_keys,
+        11,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    rig.publish(
+        &mut st,
+        3,
+        &full[..turn2_row],
+        &turn2_keys,
+        11,
+        mk(turn2_row),
+        Kind::Turn,
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed) - before_unneeded,
+        1,
+        "linear Turn -> Turn must still supersede"
+    );
+}

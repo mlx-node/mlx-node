@@ -10,11 +10,13 @@ use std::path::PathBuf;
 use napi::Result;
 
 use super::chat::{MTP_DEPTH_MAX, generation_defaults, resolve};
+use super::ladder::RAM_STATES;
 use super::prefill::{BLOCK_ROWS, Grid, NEAR_EVERY};
 use super::sched::{
-    Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, pass_keys, preempt,
-    prefill_ends, readmit, slice_breaks,
+    Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, paged_ram_states,
+    pass_keys, preempt, prefill_ends, readmit, slice_breaks,
 };
+use super::store::{LADDER_BYTES, ladder_bytes_for};
 use crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for;
 use crate::engine::types::ChatConfig;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
@@ -46,6 +48,26 @@ fn lanes_are_the_admitted_ones_within_the_row_cap() {
     assert_eq!(lanes(4, 3), 3);
     assert_eq!(lanes(1, 12), 1);
     assert_eq!(lanes(0, 12), 1);
+}
+
+#[test]
+fn paged_ram_states_and_ladder_budget_scale_with_lanes() {
+    assert_eq!(paged_ram_states(0), RAM_STATES);
+    assert_eq!(paged_ram_states(1), RAM_STATES);
+    assert_eq!(paged_ram_states(2), 2 * RAM_STATES);
+    assert_eq!(paged_ram_states(4), 4 * RAM_STATES);
+    assert_eq!(ladder_bytes_for(0), LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(1), LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(2), 2 * LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(4), 4 * LADDER_BYTES);
+    // Real Hy4-flash per-state own bytes (30 sliding * 515 * 576 * 2 +
+    // 12 indexed * 6 * 128 * 4 + draft open/tail/seed 52,864) = 17,888,128 B.
+    let hy4_state_own_bytes: u64 = 30 * 515 * 576 * 2 + 12 * 6 * 128 * 4 + 52_864;
+    assert_eq!(hy4_state_own_bytes, 17_888_128);
+    assert!(
+        (paged_ram_states(4) as u64) * hy4_state_own_bytes < ladder_bytes_for(4),
+        "4-lane RAM state cap must stay within 4-lane ladder budget"
+    );
 }
 
 /// Force serial reads 1; otherwise the engine's cap over the lanes.

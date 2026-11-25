@@ -35,7 +35,7 @@ use super::attention::PagedPool;
 use super::batch::{Core, MIN_Q8_ROWS, Owners as WaveOwners, Wave};
 use super::chat::{Inner, PREFILL_CANCELLED};
 use super::indexer::PagedIndexing;
-use super::ladder::Kind;
+use super::ladder::{Kind, RAM_STATES};
 use super::model::{Logits, Model, Output, Want};
 use super::moe::RowKind;
 use super::mtp::{MtpLayer, lag_chunk};
@@ -46,7 +46,7 @@ use super::prefill::{BLOCK_ROWS, Grid};
 use super::prefix_state::{Key, States, Turn, prompt_keys, turn_keys};
 use super::spec::{self, LOOKAHEAD_MAX};
 use super::stats::{self, Counters, WaveSample};
-use super::store::{LADDER_BYTES, SPLITK_ENV, Store, kv_per_token, lane_bytes, splitk_min_m};
+use super::store::{SPLITK_ENV, Store, kv_per_token, ladder_bytes_for, lane_bytes, splitk_min_m};
 use crate::array::{DType, MxArray};
 use crate::cache_limit::{PoolCacheLimitGuard, coordinator};
 use crate::engine::backend::{DsparkProposal, PagedBackend, PagedPrefix, PagedSpeculativeArgs};
@@ -100,6 +100,13 @@ pub fn paged_mode(serial: bool, row_cap: usize) -> bool {
 /// decode rows one wave holds.
 pub fn lanes(admitted: usize, row_cap: usize) -> usize {
     admitted.min(row_cap).max(1)
+}
+
+/// RAM prefix-state capacity for a paged load of `lanes` concurrent lanes:
+/// each lane gets `RAM_STATES` slots so multi-lane workloads do not evict
+/// each other's un-landed states before `DELAY`.
+pub fn paged_ram_states(lanes: usize) -> usize {
+    RAM_STATES.saturating_mul(lanes.max(1))
 }
 
 /// `maxConcurrentSequences`: 1 under `MLX_SERVE_FORCE_SERIAL`, else the
@@ -609,7 +616,7 @@ impl Paged {
             owners: Owners::new(),
             saved: Vec::new(),
             turns: HashMap::new(),
-            states: States::new(),
+            states: States::with_cap(paged_ram_states(lanes)),
             busy: Busy::default(),
             safe: SafePoint::new(READMIT_EVERY),
             lanes,
@@ -674,6 +681,51 @@ impl Paged {
 
     fn live_tokens(&self, seq: SeqId) -> &[u32] {
         self.adapter.request_tokens_for(seq).unwrap_or(&[])
+    }
+
+    /// `seq`'s pool rows and cell cut to `len`, capturing any newly committed
+    /// block-row turn state; an owner that cannot go there is dropped. Returns
+    /// the number of rows cut.
+    pub(crate) fn cut_owner(&mut self, seq: SeqId, len: usize, mtp_loaded: bool) -> Result<usize> {
+        let was = self.owners.active();
+        let held = self.adapter.request_tokens_for(seq).map_or(0, <[u32]>::len);
+        let cell = self.owners.get(seq).map_or(0, OwnerCell::len);
+        if held == len && cell == len {
+            if let Some(c) = self.owners.get_mut(seq) {
+                c.drop_mark();
+            }
+            hold_turn_state(self, seq, mtp_loaded);
+            return Ok(0);
+        }
+        let cut = if held != cell || len > held {
+            Err(bad(format!(
+                "owner {seq}: a cut to {len} of {held} pool rows and a cell of {cell}"
+            )))
+        } else {
+            forget_above(self, seq, len);
+            Self::cut_rows(self, seq, held - len, len)
+        };
+        match &cut {
+            Ok(()) => {
+                if let Some(c) = self.owners.get_mut(seq) {
+                    c.drop_mark();
+                }
+                hold_turn_state(self, seq, mtp_loaded);
+            }
+            Err(_) => lose(self, seq, was == Some(seq)),
+        }
+        reactivate(self, was)?;
+        cut.map(|()| held - len)
+    }
+
+    fn cut_rows(p: &mut Paged, seq: SeqId, back: usize, len: usize) -> Result<()> {
+        let back = u32::try_from(back).map_err(|_| bad("rows exceed u32"))?;
+        p.adapter.rollback_last_tokens_for(seq, back).map_err(bad)?;
+        let history = p.adapter.request_tokens_for(seq).unwrap_or(&[]);
+        match p.owners.get_mut(seq) {
+            Some(c) => c.truncate(len, history),
+            None => Err(bad(format!("owner {seq} has no cell"))),
+        }
     }
 }
 
@@ -1085,14 +1137,14 @@ fn forget_above(p: &mut Paged, seq: SeqId, len: usize) {
 
 /// A publishing turn of `seq` whose cell stands at a block row keeps the
 /// cell's state there as its turn state candidate.
-fn hold_turn_state(p: &mut Paged, seq: SeqId, mtp_loaded: bool) {
+pub(super) fn hold_turn_state(p: &mut Paged, seq: SeqId, mtp_loaded: bool) {
     let Some(plan) = p.turns.get_mut(&seq).filter(|t| t.publish) else {
         return;
     };
     let Some(cell) = p.owners.get_mut(seq) else {
         return;
     };
-    if cell.is_empty() || !cell.len().is_multiple_of(BLOCK_ROWS) {
+    if cell.is_empty() || !cell.len().is_multiple_of(BLOCK_ROWS) || !plan.turn.wants(cell.len()) {
         return;
     }
     match cell.state() {
@@ -1159,14 +1211,18 @@ impl Inner {
     /// Runs one step over `rows` (distinct owners) with the cells out of the
     /// table. On error every owner goes back to its start; an owner whose
     /// cell cannot is released. A verify owner keeps its mark until its cut.
+    /// `hold_turn` captures a block-row turn state candidate after the wave;
+    /// speculative verify waves pass `false` and capture in [`Self::cut_owner`]
+    /// once acceptance is decided.
     fn wave_rows(
         &mut self,
         rows: &[Rows<'_>],
         kind: RowKind,
         run_mtp: bool,
+        hold_turn: bool,
         cancel: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<Output>> {
-        let out = self.wave_once(rows, kind, run_mtp, cancel);
+        let out = self.wave_once(rows, kind, run_mtp, hold_turn, cancel);
         if kind.is_decode() {
             self.publish(None);
         }
@@ -1178,6 +1234,7 @@ impl Inner {
         rows: &[Rows<'_>],
         kind: RowKind,
         run_mtp: bool,
+        hold_turn: bool,
         cancel: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<Vec<Output>> {
         let mut seen = HashSet::new();
@@ -1241,7 +1298,7 @@ impl Inner {
         for seq in lost {
             lose(p, seq, was == Some(seq));
         }
-        if out.is_ok() && kind == RowKind::Decode {
+        if out.is_ok() && kind == RowKind::Decode && hold_turn {
             let mtp_loaded = mtp.is_some();
             for r in rows {
                 hold_turn_state(p, r.seq, mtp_loaded);
@@ -1423,7 +1480,13 @@ impl Inner {
                         Logits::None
                     },
                 }];
-                let outs = match self.wave_rows(&rows, RowKind::Prefill, true, Some(layer_cancel)) {
+                let outs = match self.wave_rows(
+                    &rows,
+                    RowKind::Prefill,
+                    true,
+                    false,
+                    Some(layer_cancel),
+                ) {
                     Ok(o) => o,
                     Err(_) if cancelled(&self.cancel) => {
                         return Err(Error::from_reason(PREFILL_CANCELLED));
@@ -1506,7 +1569,7 @@ impl Inner {
                 logits: Logits::Last,
             })
             .collect();
-        let outs = self.wave_rows(&wave, RowKind::Decode, false, None)?;
+        let outs = self.wave_rows(&wave, RowKind::Decode, false, true, None)?;
         let mut logits = Vec::with_capacity(outs.len());
         for o in outs {
             let l = o
@@ -1785,10 +1848,10 @@ impl Inner {
     fn state_budget(&self) -> u64 {
         let cfg = self.store.model.cfg();
         let mtp = self.mtp.is_some();
-        let lanes = self.paged.as_ref().map_or(1, |p| p.lanes) as u64;
+        let lanes = self.paged.as_ref().map_or(1, |p| p.lanes);
         let mtp_row = kv_per_token(cfg, mtp).saturating_sub(kv_per_token(cfg, false));
-        lanes * lane_bytes(cfg, mtp, self.store.ctx)
-            + LADDER_BYTES
+        (lanes as u64) * lane_bytes(cfg, mtp, self.store.ctx)
+            + ladder_bytes_for(lanes)
             + mtp_row * self.store.ctx as u64
     }
 
@@ -2285,11 +2348,14 @@ impl Inner {
     }
 
     /// One decode wave of `rows` (distinct owners) on settled drafts: every
-    /// owner's trunk rows and the MTP rows they close.
+    /// owner's trunk rows and the MTP rows they close. `hold_turn` is true for
+    /// committed steps (`spec::Paged::forward_with_hidden`) and false for
+    /// speculative verify waves (`verify_scheduled`, `spec::Paged::verify_step`).
     pub(super) fn mtp_wave(
         &mut self,
         rows: &[(SeqId, &[u32])],
         logits: Logits,
+        hold_turn: bool,
     ) -> Result<Vec<Output>> {
         let lanes = self.paged()?.lanes;
         if rows.len() > lanes {
@@ -2306,53 +2372,18 @@ impl Inner {
             .iter()
             .map(|&(seq, ids)| Rows { seq, ids, logits })
             .collect();
-        self.wave_rows(&wave, RowKind::Decode, true, None)
+        self.wave_rows(&wave, RowKind::Decode, true, hold_turn, None)
     }
 
     /// `seq`'s pool rows and cell cut to `len`; an owner that cannot go
     /// there is dropped.
     pub(super) fn cut_owner(&mut self, seq: SeqId, len: usize) -> Result<()> {
-        let p = self.paged_mut()?;
-        let was = p.owners.active();
-        let held = p.adapter.request_tokens_for(seq).map_or(0, <[u32]>::len);
-        let cell = p.owners.get(seq).map_or(0, OwnerCell::len);
-        if held == len && cell == len {
-            if let Some(c) = p.owners.get_mut(seq) {
-                c.drop_mark();
-            }
-            return Ok(());
+        let mtp_loaded = self.mtp.is_some();
+        let cut = self.paged_mut()?.cut_owner(seq, len, mtp_loaded)?;
+        if cut > 0 {
+            self.waves.cut(seq, cut);
         }
-        let cut = if held != cell || len > held {
-            Err(bad(format!(
-                "owner {seq}: a cut to {len} of {held} pool rows and a cell of {cell}"
-            )))
-        } else {
-            forget_above(p, seq, len);
-            Self::cut_rows(p, seq, held - len, len)
-        };
-        match &cut {
-            Ok(()) => {
-                if let Some(c) = p.owners.get_mut(seq) {
-                    c.drop_mark();
-                }
-            }
-            Err(_) => lose(p, seq, was == Some(seq)),
-        }
-        reactivate(p, was)?;
-        if cut.is_ok() {
-            self.waves.cut(seq, held - len);
-        }
-        cut
-    }
-
-    fn cut_rows(p: &mut Paged, seq: SeqId, back: usize, len: usize) -> Result<()> {
-        let back = u32::try_from(back).map_err(|_| bad("rows exceed u32"))?;
-        p.adapter.rollback_last_tokens_for(seq, back).map_err(bad)?;
-        let history = p.adapter.request_tokens_for(seq).unwrap_or(&[]);
-        match p.owners.get_mut(seq) {
-            Some(c) => c.truncate(len, history),
-            None => Err(bad(format!("owner {seq} has no cell"))),
-        }
+        Ok(())
     }
 
     /// Reserves `rows` more pool rows for `seq`; false when they do not
@@ -2394,7 +2425,7 @@ impl Inner {
             }
             spans.push((r.seq_id, r.tokens.as_slice()));
         }
-        let outs = self.mtp_wave(&spans, Logits::All)?;
+        let outs = self.mtp_wave(&spans, Logits::All, false)?;
         let joined = join_logits(outs, rows);
         let p = self.paged_mut()?;
         for r in rows {

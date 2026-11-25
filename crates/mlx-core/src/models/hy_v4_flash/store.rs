@@ -97,8 +97,14 @@ pub const DIRECT_MARGIN: u64 = 4 * GIB;
 /// Upfront KV token allowance for direct full-expert residency; the paged KV
 /// pool still serves up to `max_ctx` dynamically as memory allows.
 pub const DIRECT_KV_ALLOWANCE_TOKENS: usize = 65_536;
-/// RAM ladder entries (window clones and tails).
+/// RAM ladder entries (window clones and tails) per lane (`RAM_STATES` states).
 pub const LADDER_BYTES: u64 = 150 * MIB;
+
+/// RAM state budget for `lanes` concurrent lanes (`LADDER_BYTES` per lane,
+/// matching [`super::sched::paged_ram_states`]).
+pub fn ladder_bytes_for(lanes: usize) -> u64 {
+    (lanes.max(1) as u64).saturating_mul(LADDER_BYTES)
+}
 const HY4_COMPUTE_BASE: u64 = 512 * MIB;
 const HY4_COMPUTE_PER_ROW: u64 = 320 * 1024;
 /// Gathered keys of the sparse attention core.
@@ -2267,16 +2273,17 @@ impl Store {
                     ExpertResidency::Mmap { chunk, gate } => {
                         let ctx = max_ctx;
                         let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                        let extra_lane = floor.saturating_add(LADDER_BYTES);
                         let mtp_row = kv_per_token(&scan.cfg, mtp)
                             .saturating_sub(kv_per_token(&scan.cfg, false));
                         let page_bytes = super::paged::PageGeometry::of(&scan.cfg)
                             .and_then(|g| g.block_bytes())
                             .unwrap_or(0);
                         let rset_reserve_for = |n: usize| {
-                            let extra = n.saturating_sub(1) as u64 * floor;
+                            let extra = n.saturating_sub(1) as u64 * extra_lane;
                             let state = (n as u64)
                                 .saturating_mul(floor)
-                                .saturating_add(LADDER_BYTES)
+                                .saturating_add(ladder_bytes_for(n))
                                 .saturating_add(mtp_row.saturating_mul(ctx as u64));
                             let full_kv =
                                 mmap_full_kv_bytes(&one_lane, ctx, n, page_bytes, extra, state);
@@ -2290,13 +2297,13 @@ impl Store {
                                 n == 1
                                     || (gate
                                         .need
-                                        .saturating_add(n.saturating_sub(1) as u64 * floor)
+                                        .saturating_add(n.saturating_sub(1) as u64 * extra_lane)
                                         <= gate.budget
                                         && (opts.mmap != MmapMode::Auto
                                             || rset_reserve_for(n) <= gate.budget))
                             })
                             .unwrap_or(1);
-                        let extra_lanes = lanes.saturating_sub(1) as u64 * floor;
+                        let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
                         let kv_total = kv_initial.saturating_add(extra_lanes);
                         let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
                         let mmap_fixed = gate.dense_bytes.saturating_add(kv_scratch);
@@ -2373,15 +2380,18 @@ impl Store {
                     ExpertResidency::Direct { chunk, gate } => {
                         let ctx = max_ctx;
                         let floor = lane_bytes(&scan.cfg, mtp, ctx);
+                        let extra_lane = floor.saturating_add(LADDER_BYTES);
                         let lanes = (1..=want)
                             .rev()
                             .find(|&n| {
                                 n == 1
-                                    || gate.need.saturating_add(n.saturating_sub(1) as u64 * floor)
+                                    || gate
+                                        .need
+                                        .saturating_add(n.saturating_sub(1) as u64 * extra_lane)
                                         <= gate.budget
                             })
                             .unwrap_or(1);
-                        let extra_lanes = lanes.saturating_sub(1) as u64 * floor;
+                        let extra_lanes = lanes.saturating_sub(1) as u64 * extra_lane;
                         let kv_scratch = gate.kv_and_scratch.saturating_add(extra_lanes);
                         let direct_fixed = gate.dense_bytes.saturating_add(kv_scratch);
                         let total_slots = sizes.total_experts();
@@ -2476,7 +2486,8 @@ impl Store {
                             ctx: one.ctx as u64,
                             ..base
                         };
-                        let floor = lane_bytes(&scan.cfg, mtp, one.ctx);
+                        let floor =
+                            lane_bytes(&scan.cfg, mtp, one.ctx).saturating_add(LADDER_BYTES);
                         let (lanes, p) = lanes_at(one, want, |n| {
                             let lp = lane_profile(&one_lane, n, floor);
                             admit_with(&lp, &at, one.chunk as u64, l, &h, &own, ws)
@@ -2528,7 +2539,11 @@ impl Store {
                 },
             ),
         };
-        let profile = lane_profile(&one_lane, lanes, lane_bytes(&scan.cfg, mtp, ctx));
+        let profile = lane_profile(
+            &one_lane,
+            lanes,
+            lane_bytes(&scan.cfg, mtp, ctx).saturating_add(LADDER_BYTES),
+        );
         // the re-admission charges the rows the load admitted, the env only
         // lowers the chunk the driver runs
         let rows = admitted as u64;
