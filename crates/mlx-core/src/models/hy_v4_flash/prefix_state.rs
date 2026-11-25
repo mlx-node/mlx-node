@@ -350,10 +350,8 @@ impl<S: Stored> States<S> {
     }
 
     /// The RAM copy that goes first: a checkpoint (oldest publication), else
-    /// the least recently used durable state (whose disk copy and chain
-    /// landed, so dropping RAM keeps it resumable from disk), else the least
-    /// recently used remaining state; never one with a disk write in flight or
-    /// in use.
+    /// the least recently used; never one with a disk write in flight or in
+    /// use.
     fn victim(&self) -> Option<u64> {
         let free = || {
             self.store.entries().filter(|e| {
@@ -365,7 +363,6 @@ impl<S: Stored> States<S> {
         free()
             .filter(|e| e.checkpoint())
             .min_by_key(|e| e.publication())
-            .or_else(|| free().filter(|e| durable(e)).min_by_key(|e| e.last_used()))
             .or_else(|| free().min_by_key(|e| e.last_used()))
             .map(|e| e.id())
     }

@@ -270,15 +270,17 @@ fn held_bytes_count_shared_parts_once() {
     );
 }
 
-/// Eviction prefers dropping RAM of a durable ordinary state (keeping its
-/// disk-only entry resumable and `dropped == 0`) over permanently removing an
-/// un-landed non-durable state, while still evicting checkpoints first.
+/// Ordinary eviction follows pure LRU (checkpoints still go first): with 7
+/// idle short non-durable states and 1 hot durable state `A` in an 8-slot
+/// store, promoting a second hot durable state `B` from disk evicts the oldest
+/// idle short state rather than `A`, so alternating between `A` and `B` stays
+/// in RAM instead of thrashing SSD.
 #[test]
-fn victim_prefers_durable_over_non_durable_and_checkpoints_first() {
-    use crate::disk_tier::store::DiskCopy;
+fn lru_evicts_idle_short_state_instead_of_thrashing_hot_durable_prefixes() {
+    use crate::disk_tier::store::{DiskCopy, Lineage, StateClass};
     use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
 
-    let disk_copy = |seed: u64, landed: bool, chain_owed: bool| DiskCopy {
+    let disk_copy = |seed: u64| DiskCopy {
         key: ColdCacheKey::chain(
             ColdGroup::DFlash2State,
             ColdCacheFingerprint::from_components([&seed.to_le_bytes()[..]]),
@@ -289,81 +291,65 @@ fn victim_prefers_durable_over_non_durable_and_checkpoints_first() {
             0,
         ),
         bytes: 64,
-        landed,
+        landed: true,
         window_begin: 0,
-        chain_owed,
+        chain_owed: false,
     };
 
-    // 1. Durable ordinary state (even newer than a non-durable one) loses RAM
-    //    first, stays on disk (`disk_only_above`), and does not bump `dropped`.
-    let mut st = States::<Fake>::with_cap(3);
-    let (a, b, c, d) = (
-        lineage(10, 1),
-        lineage(11, 1),
-        lineage(12, 1),
-        lineage(13, 1),
-    );
-    let id_a = publish(&mut st, &a, Kind::Prompt, 10).unwrap(); // oldest, non-durable
-    let id_b = publish(&mut st, &b, Kind::Prompt, 10).unwrap(); // newer, durable
-    let id_c = publish(&mut st, &c, Kind::Prompt, 10).unwrap(); // newest, chain still owed
-    st.store_mut()
-        .set_disk(id_b, Some(disk_copy(1, true, false)));
-    st.store_mut()
-        .set_disk(id_c, Some(disk_copy(2, true, true)));
-    st.touch(id_b); // make durable `b` MORE recently used than non-durable `a`
+    let mut st = States::<Fake>::with_cap(RAM_STATES);
+    let idle: Vec<Vec<u32>> = (1..=7u32).map(|n| lineage(n, 1)).collect();
+    let idle_ids: Vec<u64> = idle
+        .iter()
+        .map(|l| publish(&mut st, l, Kind::Prompt, 10).unwrap())
+        .collect();
+    let a = lineage(100, 1);
+    let b = lineage(101, 1);
+    let id_a = publish(&mut st, &a, Kind::Prompt, 10).unwrap();
+    st.store_mut().set_disk(id_a, Some(disk_copy(1)));
+    assert_eq!(st.ram_len(), RAM_STATES);
 
-    publish(&mut st, &d, Kind::Prompt, 10).unwrap();
-    assert_eq!(st.ram_len(), 3);
-    assert_eq!(st.dropped(), 0, "durable eviction must not bump dropped");
-    assert!(st.get(id_a).is_some(), "non-durable `a` must stay in RAM");
-    assert!(st.get(id_c).is_some(), "chain-owed `c` must stay in RAM");
-    assert!(st.get(id_b).is_none(), "durable `b` must drop RAM first");
-    assert_eq!(
-        st.disk_only_above(Key::text(&longer(&b), SALT), 0),
-        vec![(id_b, BLOCK_ROWS)],
-        "durable `b` remains resumable from disk"
-    );
+    // Park a second durable state `B` as disk-only (as after adoption or drop_ram).
+    let id_b = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&b, SALT),
+            10,
+            StateClass::Ordinary,
+            disk_copy(2),
+        )
+        .unwrap();
+    st.touch(id_a);
+    assert!(st.get(id_a).is_some() && st.get(id_b).is_none());
 
-    // 2. Among multiple durable states, the least recently used durable goes first.
-    let mut st2 = States::<Fake>::with_cap(3);
-    let (u, v, w, x) = (
-        lineage(20, 1),
-        lineage(21, 1),
-        lineage(22, 1),
-        lineage(23, 1),
-    );
-    let id_u = publish(&mut st2, &u, Kind::Prompt, 10).unwrap(); // oldest, non-durable
-    let id_v = publish(&mut st2, &v, Kind::Prompt, 10).unwrap(); // older durable
-    let id_w = publish(&mut st2, &w, Kind::Prompt, 10).unwrap(); // newer durable
-    st2.store_mut()
-        .set_disk(id_v, Some(disk_copy(3, true, false)));
-    st2.store_mut()
-        .set_disk(id_w, Some(disk_copy(4, true, false)));
-    publish(&mut st2, &x, Kind::Prompt, 10).unwrap();
-    assert_eq!(st2.dropped(), 0);
-    assert!(st2.get(id_u).is_some());
-    assert!(st2.get(id_v).is_none(), "oldest durable `v` goes first");
-    assert!(st2.get(id_w).is_some(), "newer durable `w` stays in RAM");
-
-    // 3. Checkpoints still go BEFORE durable ordinary states.
-    let mut st3 = States::<Fake>::with_cap(3);
-    let (p, dur, ck, q) = (
-        lineage(30, 1),
-        lineage(31, 1),
-        lineage(32, 1),
-        lineage(33, 1),
-    );
-    let id_p = publish(&mut st3, &p, Kind::Prompt, 10).unwrap();
-    let id_dur = publish(&mut st3, &dur, Kind::Prompt, 10).unwrap();
-    let id_ck = publish(&mut st3, &ck, Kind::Checkpoint, 10).unwrap();
-    st3.store_mut()
-        .set_disk(id_dur, Some(disk_copy(5, true, false)));
-    publish(&mut st3, &q, Kind::Prompt, 10).unwrap();
-    assert!(st3.get(id_ck).is_none(), "checkpoint must still go first");
+    // Promoting `B` evicts the oldest idle short state (`idle_ids[0]`), NOT hot `A`.
+    assert!(st.promote(id_b, fake(10)));
+    assert_eq!(st.ram_len(), RAM_STATES);
     assert!(
-        st3.get(id_dur).is_some(),
-        "durable ordinary survives checkpoint eviction"
+        st.get(idle_ids[0]).is_none(),
+        "oldest idle short state goes"
     );
-    assert!(st3.get(id_p).is_some());
-    assert_eq!(st3.dropped(), 1);
+    assert!(st.get(id_a).is_some(), "hot durable `A` stays in RAM");
+    assert!(st.get(id_b).is_some(), "promoted durable `B` is in RAM");
+
+    // Alternating lookups between `A` and `B` hit RAM without SSD thrashing.
+    for _ in 0..4 {
+        assert_eq!(
+            st.lookup(Key::text(&longer(&a), SALT), &|_| true),
+            Some((id_a, BLOCK_ROWS))
+        );
+        st.touch(id_a);
+        assert_eq!(
+            st.lookup(Key::text(&longer(&b), SALT), &|_| true),
+            Some((id_b, BLOCK_ROWS))
+        );
+        st.touch(id_b);
+        assert!(
+            st.disk_only_above(Key::text(&longer(&a), SALT), 0)
+                .is_empty()
+        );
+        assert!(
+            st.disk_only_above(Key::text(&longer(&b), SALT), 0)
+                .is_empty()
+        );
+    }
 }

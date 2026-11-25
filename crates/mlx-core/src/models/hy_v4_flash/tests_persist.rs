@@ -820,9 +820,11 @@ fn fast_decode_turn_does_not_supersede_prompt_end_state() {
     }
 }
 
-/// Multi-turn cold `Kind::Prompt` states (`!any_written`) stay resumable across
-/// Turn 1 -> Turn 2 -> Turn 3 because `Grid::ends` preserves earlier assistant
-/// opening boundaries so `pass_keys` is prefix-monotonic.
+/// Cold `Kind::Prompt` states resume cleanly across Turn 1 -> Turn 2 -> Turn 3
+/// for BOTH non-grid `replay_row` (canonical `!is_written` keys on permanent
+/// grid/checkpoint chunks + deterministic `[WRITE_TAG, key]` on the trailing
+/// non-grid chunk, still protected from fast `Kind::Turn` superseding) AND
+/// grid-aligned `replay_row` (`!any_written`, matching Turn 2 via `agrees()`).
 #[test]
 fn cold_prompt_state_resumes_across_multi_turn_prompts() {
     use super::prefill::Grid;
@@ -836,14 +838,43 @@ fn cold_prompt_state_resumes_across_multi_turn_prompts() {
     let g = Grid::new(CHUNK, OPEN.to_vec()).unwrap();
     let mut st = States::<PrefixState>::with_cap(8);
 
-    // Turn 1: 5000 tokens ending in GEN (opening at 4995 -> replay_row 4992).
-    let mut p1: Vec<u32> = (0..5000).map(|i| 17 + (i % 97) as u32).collect();
-    p1[5000 - GEN.len()..].copy_from_slice(&GEN);
+    // 1. Non-grid replay_row (8704): 0..8192 is permanent (grid + checkpoint),
+    //    8192..8704 is a non-grid trailing chunk carrying deterministic
+    //    `[WRITE_TAG, key]`.
+    let mut p1: Vec<u32> = (0..8709).map(|i| 17 + (i % 97) as u32).collect();
+    p1[8709 - GEN.len()..].copy_from_slice(&GEN);
     let r1 = g.replay_row(&p1);
-    assert_eq!(r1, 4992);
+    assert_eq!(r1, 8704);
     let ends1 = g.ends(0, &p1);
+    assert_eq!(ends1, vec![4096, 8192, 8704, 8709]);
     let pass1 = pass_keys(&p1, &ends1, CHUNK);
-    assert!(!any_written(&pass1));
+    assert_eq!(pass1.len(), r1 / BLOCK_ROWS);
+    assert!(
+        !any_written(&pass1[..8192 / BLOCK_ROWS]),
+        "permanent grid/checkpoint chunks 0..8192 must stay canonical (!is_written)"
+    );
+    assert!(
+        pass1[8192 / BLOCK_ROWS..].iter().all(|k| is_written(k)),
+        "non-grid trailing chunk 8192..8704 must carry deterministic WRITE_TAG keys"
+    );
+    assert_eq!(
+        pass_keys(&p1, &ends1, CHUNK),
+        pass1,
+        "concurrent cold prefills of the same prompt deduplicate identically"
+    );
+
+    let ck_id = st
+        .publish(
+            Key {
+                tokens: &p1[..8192],
+                keys: &pass1[..8192 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(8192),
+            Kind::Checkpoint,
+        )
+        .unwrap()
+        .unwrap();
     let id1 = st
         .publish(
             Key {
@@ -857,22 +888,19 @@ fn cold_prompt_state_resumes_across_multi_turn_prompts() {
         .unwrap()
         .unwrap();
 
-    // Turn 2: extends Turn 1 (mutating post-OPEN token 4998 to simulate think
-    // stripping) + assistant reply + user msg + GEN -> len 6500, r2 = 6464.
+    // Turn 2: extends Turn 1 (mutating post-OPEN token to mimic <think>
+    // stripping) + reply + user msg + GEN -> len 10_000, r2 = 9984.
     let mut p2 = p1.clone();
-    p2[4998] = 999;
-    p2.extend((0..1500).map(|i| 31 + (i % 89) as u32));
+    p2[8707] = 999;
+    p2.extend((0..1291).map(|i| 31 + (i % 89) as u32));
     let len2 = p2.len();
     p2[len2 - GEN.len()..].copy_from_slice(&GEN);
     let r2 = g.replay_row(&p2);
-    assert_eq!(r2, 6464);
+    assert_eq!(r2, 9984);
     let ends2 = g.ends(0, &p2);
+    assert_eq!(ends2, vec![4096, 8192, 9984, 10_000]);
     let pass2 = pass_keys(&p2, &ends2, CHUNK);
-    assert!(
-        ends2.contains(&r1),
-        "Turn 2 grid ends must contain Turn 1 replay_row"
-    );
-    assert_eq!(&pass2[..r1 / BLOCK_ROWS], &pass1[..r1 / BLOCK_ROWS]);
+    assert_eq!(&pass2[..8192 / BLOCK_ROWS], &pass1[..8192 / BLOCK_ROWS]);
 
     let pk2 = Key {
         tokens: &p2,
@@ -880,18 +908,19 @@ fn cold_prompt_state_resumes_across_multi_turn_prompts() {
         salt: SALT,
     };
     assert!(
+        resumes(st.store().get(ck_id).unwrap(), pk2),
+        "cold Checkpoint at 8192 (!any_written) resumes Turn 2 via agrees()"
+    );
+    assert!(
         resumes(st.store().get(id1).unwrap(), pk2),
-        "cold Turn 1 Kind::Prompt (!any_written) must resume on Turn 2"
+        "Turn 1 Kind::Prompt at non-grid row 8704 resumes Turn 2"
     );
     assert_eq!(st.lookup(pk2, &|_| true), Some((id1, r1)));
 
-    // Resuming Turn 2 from id1 at r1 (a cold end!) keeps Turn 2's Prompt cold too.
+    // Turn 2 resumes from id1 at 8704, keeps line1[..272], and publishes Prompt at r2.
     let line1 = st.keys_of(id1).unwrap();
     let keys2 = prompt_keys(&p2, r1, &line1, &pass2, ends2.contains(&r1), 42);
-    assert!(
-        !any_written(&keys2),
-        "resuming at cold boundary must remain cold"
-    );
+    assert_eq!(&keys2[..r1 / BLOCK_ROWS], &line1[..]);
     let id2 = st
         .publish(
             Key {
@@ -905,22 +934,111 @@ fn cold_prompt_state_resumes_across_multi_turn_prompts() {
         .unwrap()
         .unwrap();
 
-    // Turn 3: crosses 8192 checkpoint -> len 11_000, r3 = 10_976.
+    // Turn 3 extends Turn 2 -> len 12_500; resumes at deepest Turn 2 Prompt (r2).
     let mut p3 = p2.clone();
-    p3.extend((0..4500).map(|i| 53 + (i % 79) as u32));
+    p3.extend((0..2500).map(|i| 53 + (i % 79) as u32));
     let len3 = p3.len();
     p3[len3 - GEN.len()..].copy_from_slice(&GEN);
     let ends3 = g.ends(0, &p3);
     let pass3 = pass_keys(&p3, &ends3, CHUNK);
-    assert!(ends3.contains(&r1) && ends3.contains(&r2));
     let pk3 = Key {
         tokens: &p3,
         keys: &pass3,
         salt: SALT,
     };
+    assert!(resumes(st.store().get(ck_id).unwrap(), pk3));
     assert!(resumes(st.store().get(id1).unwrap(), pk3));
     assert!(resumes(st.store().get(id2).unwrap(), pk3));
     assert_eq!(st.lookup(pk3, &|_| true), Some((id2, r2)));
+
+    // Non-grid cold Turn 1 Prompt (`[WRITE_TAG, key]`, `Kind::Prompt`) is NOT
+    // superseded by a fast `< DELAY` `Kind::Turn` on the disk tier.
+    {
+        let root = Temp::new("persist-nongrid-prompt");
+        let cfg = tiny_cfg();
+        let shape = StateShape::of(&cfg, false).unwrap();
+        let pid = Some((
+            "11223344556677889900aabbccddeeff",
+            b"hy4-nongrid-prompt-supersede".as_slice(),
+        ));
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut disk_st = States::<PrefixState>::with_cap(8);
+        let p_row = MINIMUM_ROWS + 64; // non-grid for chunk 4096
+        let t_row = p_row + 128;
+        let mut full: Vec<u32> = (0..t_row + 16).map(|i| 23 + (i % 97) as u32).collect();
+        let p_len = p_row + GEN.len();
+        full[p_row..p_len].copy_from_slice(&GEN);
+        let e = g.ends(0, &full[..p_len]);
+        let pk = pass_keys(&full[..p_len], &e, CHUNK);
+        assert!(any_written(&pk));
+        let tk = turn_keys(&full, &pk, t_row, 777);
+        let mk = |row: usize| make_cell_state(&cfg, &full[..row], &[row], false).1;
+        let p_id = rig.publish(
+            &mut disk_st,
+            1,
+            &full[..p_row],
+            &pk,
+            0,
+            mk(p_row),
+            Kind::Prompt,
+        );
+        let t_id = rig.publish(
+            &mut disk_st,
+            1,
+            &full[..t_row],
+            &tk,
+            0,
+            mk(t_row),
+            Kind::Turn,
+        );
+        assert!(rig.flush(&mut disk_st, 30));
+        assert_eq!(
+            rig.telem.unneeded.load(Ordering::Relaxed),
+            0,
+            "non-grid Kind::Prompt with deterministic WRITE_TAG must not be superseded"
+        );
+        assert!(disk_st.store().get(p_id).unwrap().disk().unwrap().landed);
+        assert!(disk_st.store().get(t_id).unwrap().disk().unwrap().landed);
+    }
+
+    // 2. Grid-aligned replay_row (8192): stays completely `!any_written` AND
+    //    resumes cleanly on Turn 2 via `agrees()` and `ends2.contains(&8192)`.
+    let mut st_grid = States::<PrefixState>::with_cap(8);
+    let mut g1: Vec<u32> = (0..8197).map(|i| 41 + (i % 83) as u32).collect();
+    g1[8192..8197].copy_from_slice(&GEN);
+    assert_eq!(g.replay_row(&g1), 8192);
+    let g_ends1 = g.ends(0, &g1);
+    assert_eq!(g_ends1, vec![4096, 8192, 8197]);
+    let g_pass1 = pass_keys(&g1, &g_ends1, CHUNK);
+    assert!(!any_written(&g_pass1));
+    let gid1 = st_grid
+        .publish(
+            Key {
+                tokens: &g1[..8192],
+                keys: &g_pass1,
+                salt: SALT,
+            },
+            bare(8192),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    let mut g2 = g1.clone();
+    g2.extend((0..1500).map(|i| 61 + (i % 73) as u32));
+    let g2_len = g2.len();
+    g2[g2_len - GEN.len()..].copy_from_slice(&GEN);
+    let g_ends2 = g.ends(0, &g2);
+    assert!(g_ends2.contains(&8192));
+    let g_pass2 = pass_keys(&g2, &g_ends2, CHUNK);
+    assert_eq!(&g_pass2[..8192 / BLOCK_ROWS], &g_pass1[..]);
+    let g_pk2 = Key {
+        tokens: &g2,
+        keys: &g_pass2,
+        salt: SALT,
+    };
+    assert!(resumes(st_grid.store().get(gid1).unwrap(), g_pk2));
+    assert_eq!(st_grid.lookup(g_pk2, &|_| true), Some((gid1, 8192)));
 }
 
 /// Warm `Kind::Prompt` states (`any_written == true`, e.g. Turn 2+ resumed from

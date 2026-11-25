@@ -42,8 +42,8 @@ use super::mtp::{MtpLayer, lag_chunk};
 use super::owner::{CellLayer, OwnerCell, Owners};
 use super::paged::{BLOCK, PageGeometry, SlotMap, create};
 use super::persist::{Disk, FlatTier, PoolBlocks, Read, SEGMENT_BOUND};
-use super::prefill::{BLOCK_ROWS, Grid};
-use super::prefix_state::{Key, States, Turn, prompt_keys, turn_keys};
+use super::prefill::{BLOCK_ROWS, Grid, is_checkpoint};
+use super::prefix_state::{Key, States, Turn, WRITE_TAG, prompt_keys, turn_keys};
 use super::spec::{self, LOOKAHEAD_MAX};
 use super::stats::{self, Counters, WaveSample};
 use super::store::{SPLITK_ENV, Store, kv_per_token, ladder_bytes_for, lane_bytes, splitk_min_m};
@@ -162,15 +162,26 @@ pub fn slice_breaks(
 /// `i` carries the hash of the chunk that wrote it (its tokens, its start
 /// and end, the grid and the ends inside it), so a cached block matches
 /// only one written by the same chunk over the same tokens. Blocks of the
-/// last chunk get none. Flash Next's `pass_keys`.
+/// last chunk get none.
+///
+/// Chunks whose bounds and interior cuts are all permanent across strict
+/// prompt extensions (`0`, multiples of `grid`, or checkpoint rows) get the
+/// canonical key `[key]`. Chunks ending at or split on a transient boundary
+/// (such as a prompt's non-grid `replay_row`, which disappears once a later
+/// turn extends the conversation) get the deterministic write-path key
+/// `[WRITE_TAG, key]`: identical cold prefills still deduplicate their blocks,
+/// while later turns can still resume from the published `Kind::Prompt` state
+/// without forcing cold prefills to split at every historical turn boundary.
 pub fn pass_keys(tokens: &[u32], ends: &[usize], grid: usize) -> Vec<Vec<u64>> {
     let Some(&last) = ends.last() else {
         return Vec::new();
     };
+    let permanent =
+        |row: usize| row == 0 || (grid > 0 && row.is_multiple_of(grid)) || is_checkpoint(row);
     let mut keys = Vec::new();
     let mut before = 0;
     let mut after = 0;
-    let mut memo: Option<(usize, usize, u64)> = None;
+    let mut memo: Option<(usize, usize, u64, bool)> = None;
     for block in 0.. {
         let (low, high) = (block * BLOCK_ROWS, (block + 1) * BLOCK_ROWS);
         while ends.get(before).is_some_and(|&end| end <= low) {
@@ -186,22 +197,27 @@ pub fn pass_keys(tokens: &[u32], ends: &[usize], grid: usize) -> Vec<Vec<u64>> {
             break;
         }
         let start = before.checked_sub(1).map_or(0, |i| ends[i]);
-        let key = match memo {
-            Some((s, e, key)) if s == start && e == end => key,
+        let (key, cold_grid) = match memo {
+            Some((s, e, key, cold)) if s == start && e == end => (key, cold),
             _ => {
                 let mut extra = vec![grid as u64, start as u64, end as u64];
-                extra.extend(
-                    ends[before..after]
-                        .iter()
-                        .filter(|&&row| row > start && row < end)
-                        .map(|&row| row as u64),
-                );
+                let mut cold = permanent(start) && permanent(end);
+                for &row in &ends[before..after] {
+                    if row > start && row < end {
+                        extra.push(row as u64);
+                        cold &= permanent(row);
+                    }
+                }
                 let key = mlx_paged_attn::hash_tokens(&tokens[start..end], 0, &extra);
-                memo = Some((start, end, key));
-                key
+                memo = Some((start, end, key, cold));
+                (key, cold)
             }
         };
-        keys.push(vec![key]);
+        keys.push(if cold_grid {
+            vec![key]
+        } else {
+            vec![WRITE_TAG, key]
+        });
     }
     keys
 }

@@ -7,12 +7,11 @@
 //!               ─► chunks on the grid ─► snapshots at state rows ─► last-row output
 //! ```
 //!
-//! Chunk ends are absolute: every multiple of `C` past the start, every
-//! assistant-opening boundary, every state row, and the prompt end. State rows:
-//! every 8,192 rows below 32,768 and every 32,768 from there, below the replay
-//! row; the replay row is the block row before the generation prompt (the last
-//! assistant opening). A prompt resumed anywhere cuts where a cold prefill of
-//! it cuts.
+//! Chunk ends are absolute: every multiple of `C` past the start, every state
+//! row, and the prompt end. State rows: every 8,192 rows below 32,768 and
+//! every 32,768 from there, below the replay row; the replay row is the block
+//! row before the generation prompt (the last assistant opening). A prompt
+//! resumed anywhere cuts where a cold prefill of it cuts.
 //!
 //! A cancelled chunk leaves the sequence at its start (`Model::step` puts
 //! it back): the finished chunks stay and a ladder entry marks the point.
@@ -272,27 +271,6 @@ impl Grid {
         at - at % BLOCK_ROWS
     }
 
-    /// The block rows before every assistant opening (`open`) past position 0,
-    /// excluding row 0, ascending and without repeats. Keeping every earlier
-    /// turn's replay row as a chunk end makes [`Self::ends`] and cold
-    /// `pass_keys` prefix-monotonic across turns.
-    pub fn boundaries(&self, prompt: &[u32]) -> Vec<usize> {
-        let Some(&first) = self.open.first() else {
-            return Vec::new();
-        };
-        let mut rows = Vec::new();
-        for (at, &token) in prompt.iter().enumerate().skip(1) {
-            if token != first || !prompt[at..].starts_with(&self.open) {
-                continue;
-            }
-            let row = at - at % BLOCK_ROWS;
-            if row > 0 && rows.last() != Some(&row) {
-                rows.push(row);
-            }
-        }
-        rows
-    }
-
     /// State rows of a prefill of `prompt` from `start`: checkpoints below
     /// the replay row, then the replay row, all past `start`.
     pub fn states(&self, start: usize, prompt: &[u32]) -> Vec<StateRow> {
@@ -315,8 +293,7 @@ impl Grid {
     }
 
     /// Chunk ends of a prefill of `prompt` from `start`, ascending: the
-    /// multiples of C past `start`, every assistant-opening boundary, the
-    /// state rows, and the prompt end.
+    /// multiples of C past `start`, the state rows, the prompt end.
     pub fn ends(&self, start: usize, prompt: &[u32]) -> Vec<usize> {
         let len = prompt.len();
         if start >= len {
@@ -328,11 +305,6 @@ impl Grid {
             ends.push(g);
             g += self.chunk;
         }
-        ends.extend(
-            self.boundaries(prompt)
-                .into_iter()
-                .filter(|&row| row > start && row < len),
-        );
         ends.extend(self.states(start, prompt).iter().map(|s| s.row));
         ends.push(len);
         ends.sort_unstable();
