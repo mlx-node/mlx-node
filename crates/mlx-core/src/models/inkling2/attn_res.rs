@@ -516,6 +516,21 @@ impl LoopController {
     pub fn weight_refs(&self) -> [&MxArray; 2] {
         [&self.down_proj_w, &self.gain_forget_w]
     }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        let mut promoted = 0usize;
+        let db = self.down_proj_w.promote_cuda_device()?;
+        if db > 0 {
+            self.down_proj_t = self.down_proj_w.transpose(None)?;
+            promoted += db;
+        }
+        let gfb = self.gain_forget_w.promote_cuda_device()?;
+        if gfb > 0 {
+            self.gain_forget_proj_t = self.gain_forget_w.transpose(None)?;
+            promoted += gfb;
+        }
+        Ok(promoted)
+    }
 }
 
 /// Cross-pass message queries + 4 rank-64 controllers for one physical core layer (`6..17`).
@@ -731,6 +746,57 @@ impl LoopLayerControllers {
         refs.push(&self.qkv_gain_forget_w);
         refs.extend_from_slice(&self.mlp_ctrl.weight_refs());
         refs
+    }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        let mqb = self.msg_queries.promote_cuda_device()?;
+        if mqb > 0 {
+            self.msg_queries_t = self.msg_queries.transpose(None)?;
+            promoted += mqb;
+        }
+        let db = self.qkv_down_w.promote_cuda_device()?;
+        if db > 0 {
+            self.qkv_down_proj_t = self.qkv_down_w.transpose(Some(&[0, 2, 1]))?;
+            promoted += db;
+        }
+        let gfb = self.qkv_gain_forget_w.promote_cuda_device()?;
+        if gfb > 0 {
+            self.qkv_gain_forget_proj_t = self.qkv_gain_forget_w.transpose(Some(&[0, 2, 1]))?;
+            promoted += gfb;
+        }
+        if db > 0 || gfb > 0 {
+            let down_shape = self.qkv_down_w.shape()?;
+            let gf_shape = self.qkv_gain_forget_w.shape()?;
+            let dim = self.q_ctrl.dim;
+            let slice_stream = |idx: i64| -> Result<LoopController> {
+                let down_w = self
+                    .qkv_down_w
+                    .slice(&[idx, 0, 0], &[idx + 1, down_shape[1], down_shape[2]])?
+                    .squeeze(Some(&[0]))?;
+                let down_t = down_w.transpose(None)?;
+                let gf_w = self
+                    .qkv_gain_forget_w
+                    .slice(&[idx, 0, 0], &[idx + 1, gf_shape[1], gf_shape[2]])?
+                    .squeeze(Some(&[0]))?;
+                let gf_t = gf_w.transpose(None)?;
+                Ok(LoopController {
+                    down_proj_w: down_w,
+                    down_proj_t: down_t,
+                    gain_forget_w: gf_w,
+                    gain_forget_proj_t: gf_t,
+                    dim,
+                })
+            };
+            self.q_ctrl = slice_stream(0)?;
+            self.k_ctrl = slice_stream(1)?;
+            self.v_ctrl = slice_stream(2)?;
+        }
+        promoted += self.mlp_ctrl.ensure_cuda_device()?;
+        Ok(promoted)
     }
 }
 

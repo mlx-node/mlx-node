@@ -163,6 +163,12 @@ function readGgufDraftMetadataSync(path: string): GgufDraftMetadata | undefined 
         if (meta.architecture !== 'dflash') break;
       } else if (key === 'dflash.dspark.markov_rank') {
         meta.hasMarkovRank = readPositiveInt(type);
+      } else if (key === 'dflash.has_markov_context') {
+        if (type === 7) {
+          meta.hasMarkovRank = bytes(1)[0] !== 0 || meta.hasMarkovRank === true;
+        } else {
+          skipValue(type);
+        }
       } else if (type === 8 && key === 'tokenizer.ggml.pre') {
         meta.tokenizerPre = str();
       } else if (type === 9 && key === 'dflash.target_layers') {

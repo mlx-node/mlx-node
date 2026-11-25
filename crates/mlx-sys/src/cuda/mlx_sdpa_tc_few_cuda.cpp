@@ -30,11 +30,17 @@ constexpr char sdpa_prefill_d256_source[] =
 
 class SdpaTcFewCuda : public UnaryPrimitive {
 public:
-  SdpaTcFewCuda(Stream stream, float scale, int mask_mode, int cache_len = 0)
+  SdpaTcFewCuda(
+      Stream stream,
+      float scale,
+      int mask_mode,
+      int cache_len = 0,
+      bool out_bthd = false)
       : UnaryPrimitive(stream),
         scale_(scale),
         mask_mode_(mask_mode),
-        cache_len_(cache_len) {}
+        cache_len_(cache_len),
+        out_bthd_(out_bthd) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
     throw std::runtime_error("SdpaTcFewCuda requires CUDA");
@@ -78,6 +84,7 @@ public:
     const int num_warps = (M_tile + 15) / 16;
     if (static_cast<int64_t>(B) * num_q_tiles > 65535 ||
         (D != 128 && D != 256) || K_len < 1 ||
+        (out_bthd_ && Hq > std::numeric_limits<int>::max() / D) ||
         M < 1 || (num_q_tiles == 2 && (Q_len <= 8 || M_tile > 96)) ||
         num_warps < 1 || num_warps > 6) {
       throw std::invalid_argument("SdpaTcFewCuda: unsupported replay shape");
@@ -194,12 +201,15 @@ public:
     encoder.set_input_array(partial_m);
     encoder.set_input_array(partial_l);
     encoder.set_output_array(out);
-    static constexpr const char* kReduceEntries[2] = {
-        "mlx_node_sdpa_tc_reduce<128>",
-        "mlx_node_sdpa_tc_reduce<256>",
+    static constexpr const char* kReduceEntries[2][2] = {
+        {"mlx_node_sdpa_tc_reduce<128,false>",
+         "mlx_node_sdpa_tc_reduce<128,true>"},
+        {"mlx_node_sdpa_tc_reduce<256,false>",
+         "mlx_node_sdpa_tc_reduce<256,true>"},
     };
     auto reduce_kernel = cu::jit_kernel(
-        encoder.device(), sdpa_tc_few_source, kReduceEntries[d_idx]);
+        encoder.device(), sdpa_tc_few_source,
+        kReduceEntries[d_idx][out_bthd_ ? 1 : 0]);
     cu::KernelArgs rargs;
     rargs.append(partial_o);
     rargs.append(partial_m);
@@ -208,6 +218,8 @@ public:
     rargs.append<int32_t>(Hkv);
     rargs.append<int32_t>(M);
     rargs.append<int32_t>(num_splits);
+    rargs.append<int32_t>(gqa);
+    rargs.append<int32_t>(Q_len);
     encoder.add_kernel_node_raw(
         reduce_kernel, dim3(M, Hkv, B), dim3(32, 1, 1), {}, 0, rargs.args());
   }
@@ -216,9 +228,13 @@ public:
   bool is_equivalent(const Primitive& other) const override {
     const auto* rhs = dynamic_cast<const SdpaTcFewCuda*>(&other);
     return rhs && rhs->scale_ == scale_ && rhs->mask_mode_ == mask_mode_ &&
-        rhs->cache_len_ == cache_len_;
+        rhs->cache_len_ == cache_len_ && rhs->out_bthd_ == out_bthd_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    if (out_bthd_) {
+      const auto& q = inputs[0];
+      return {Shape{q.shape(0), q.shape(2), q.shape(1) * q.shape(3)}};
+    }
     return {inputs[0].shape()};
   }
 
@@ -226,6 +242,7 @@ private:
   float scale_;
   int mask_mode_;
   int cache_len_;
+  bool out_bthd_;
 };
 
 class SdpaPrefillD256Cuda : public UnaryPrimitive {
@@ -538,14 +555,11 @@ mlx_array* sdpa_prefill_d256_dispatch(
   return nullptr;
 }
 
-} // namespace
-} // namespace mlx::core::sdpa_few
-
-extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
+mlx_array* sdpa_tc_few_masked_dispatch(
     mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
-    mlx_array* mask_handle, float scale, bool is_causal) {
+    mlx_array* mask_handle, float scale, bool is_causal, bool out_bthd,
+    const char* op_name) {
   try {
-    using namespace mlx::core;
     if (!q_handle || !k_handle || !v_handle ||
         default_device() != Device::gpu ||
         cu::device(Device::gpu).compute_capability_major() < 8) {
@@ -572,7 +586,9 @@ extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
     const int K_len = k.shape(2);
     if (B <= 0 || B > 65535 || Hkv <= 0 || Hkv > 65535 ||
         Hq < Hkv || Hq % Hkv != 0 ||
-        (D != 128 && D != 256) || Q_len < 1 || Q_len > 16 ||
+        (D != 128 && D != 256) ||
+        (out_bthd && Hq > std::numeric_limits<int>::max() / D) ||
+        Q_len < 1 || Q_len > 16 ||
         k.shape(0) != B || k.shape(3) != D || v.shape() != k.shape()) {
       return nullptr;
     }
@@ -612,16 +628,37 @@ extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
       }
       mask_mode = 1;
     }
+    const Shape out_shape =
+        out_bthd ? Shape{B, Q_len, Hq * D} : q.shape();
     auto result = array(
-        q.shape(), bfloat16,
-        std::make_shared<sdpa_few::SdpaTcFewCuda>(
-            default_stream(Device::gpu), scale, mask_mode),
+        out_shape, bfloat16,
+        std::make_shared<SdpaTcFewCuda>(
+            default_stream(Device::gpu), scale, mask_mode, 0, out_bthd),
         std::move(inputs));
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   } catch (const std::exception& e) {
-    std::cerr << "mlx_sdpa_tc_few_masked_cuda error: " << e.what() << std::endl;
+    std::cerr << op_name << " error: " << e.what() << std::endl;
   }
   return nullptr;
+}
+
+} // namespace
+} // namespace mlx::core::sdpa_few
+
+extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* mask_handle, float scale, bool is_causal) {
+  return mlx::core::sdpa_few::sdpa_tc_few_masked_dispatch(
+      q_handle, k_handle, v_handle, mask_handle, scale, is_causal, false,
+      "mlx_sdpa_tc_few_masked_cuda");
+}
+
+extern "C" mlx_array* mlx_sdpa_tc_few_masked_bthd_cuda(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* mask_handle, float scale, bool is_causal) {
+  return mlx::core::sdpa_few::sdpa_tc_few_masked_dispatch(
+      q_handle, k_handle, v_handle, mask_handle, scale, is_causal, true,
+      "mlx_sdpa_tc_few_masked_bthd_cuda");
 }
 
 extern "C" mlx_array* mlx_sdpa_tc_few_cuda(
@@ -728,6 +765,18 @@ extern "C" mlx_array* mlx_cuda_sdpa_prefill_d256_gated(
 #else
 
 extern "C" mlx_array* mlx_sdpa_tc_few_masked_cuda(
+    mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
+    mlx_array* mask_handle, float scale, bool is_causal) {
+  (void)q_handle;
+  (void)k_handle;
+  (void)v_handle;
+  (void)mask_handle;
+  (void)scale;
+  (void)is_causal;
+  return nullptr;
+}
+
+extern "C" mlx_array* mlx_sdpa_tc_few_masked_bthd_cuda(
     mlx_array* q_handle, mlx_array* k_handle, mlx_array* v_handle,
     mlx_array* mask_handle, float scale, bool is_causal) {
   (void)q_handle;

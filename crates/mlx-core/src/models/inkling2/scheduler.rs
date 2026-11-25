@@ -80,6 +80,9 @@ pub(crate) struct Inkling2OwnerState {
     pub cached_token_history: Vec<u32>,
     pub cached_image_key: Option<u64>,
     pub flat_cache: Option<Inkling2FlatCache>,
+    pub cuda_cache: Option<super::cuda_kv::Inkling2CudaCache>,
+    pub cuda_dflash2_ctx: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    pub cuda_dspark_ctx: Option<super::dspark::Inkling2DsparkContext>,
 }
 
 impl DualLaneChatBarrier for Inkling2Inner {
@@ -100,6 +103,10 @@ impl DualLaneChatBarrier for Inkling2Inner {
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
+        if let Some(ref mut ctx) = self.cuda_dflash2_ctx {
+            ctx.reset();
+        }
+        self.cuda_dspark_ctx = None;
     }
 
     fn finish_ownerless_barrier(&mut self, flat_lane: bool) {
@@ -109,11 +116,14 @@ impl DualLaneChatBarrier for Inkling2Inner {
     }
 
     fn owner_has_flat_state(state: &Self::OwnerState) -> bool {
-        state.flat_cache.is_some()
+        state.flat_cache.is_some() || state.cuda_cache.is_some()
     }
 
     fn install_flat_owner_state(&mut self, state: Self::OwnerState) {
         self.flat_cache = state.flat_cache;
+        self.cuda_cache = state.cuda_cache;
+        self.cuda_dflash2_ctx = state.cuda_dflash2_ctx;
+        self.cuda_dspark_ctx = state.cuda_dspark_ctx;
         self.cached_token_history = state.cached_token_history;
         self.cached_image_key = state.cached_image_key;
     }
@@ -123,6 +133,9 @@ impl DualLaneChatBarrier for Inkling2Inner {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
             flat_cache: self.flat_cache.take(),
+            cuda_cache: self.cuda_cache.take(),
+            cuda_dflash2_ctx: self.cuda_dflash2_ctx.take(),
+            cuda_dspark_ctx: self.cuda_dspark_ctx.take(),
         }
     }
 
@@ -139,6 +152,9 @@ impl DualLaneChatBarrier for Inkling2Inner {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
             flat_cache: None,
+            cuda_cache: None,
+            cuda_dflash2_ctx: None,
+            cuda_dspark_ctx: None,
         }
     }
 
@@ -1152,6 +1168,9 @@ impl HybridSchedulerBackend for Inkling2Inner {
             cached_token_history: self.cached_token_history.clone(),
             cached_image_key: self.cached_image_key,
             flat_cache: None,
+            cuda_cache: None,
+            cuda_dflash2_ctx: None,
+            cuda_dspark_ctx: None,
         }
     }
 

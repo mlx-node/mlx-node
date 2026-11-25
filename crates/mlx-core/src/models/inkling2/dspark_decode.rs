@@ -519,46 +519,97 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
 
 impl DsparkBackend for Inkling2Inner {
     type DsparkDecode<'a>
-        = Inkling2DsparkStepper<'a>
+        = super::cuda_spec::Inkling2SpecStepper<'a>
     where
         Self: 'a;
 
     fn begin_dspark_decode(&mut self, block_size: usize) -> Result<Self::DsparkDecode<'_>> {
-        let draft = self
-            .dspark
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2 has no loaded DSpark draft model"))?;
-        let expected = draft.config.num_draft_tokens();
-        if block_size != expected {
-            return Err(Error::from_reason(format!(
-                "Inkling2 DSpark block_size {block_size} != draft checkpoint {expected}"
-            )));
+        if self.paged.is_some() {
+            let draft = self
+                .dspark
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Inkling2 has no loaded DSpark draft model"))?;
+            let expected = draft.config.num_draft_tokens();
+            if block_size != expected {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 DSpark block_size {block_size} != draft checkpoint {expected}"
+                )));
+            }
+            let tap_visits = draft.config.target_layer_ids.clone();
+            let seq_id = self
+                .paged
+                .as_ref()
+                .ok_or_else(|| Error::from_reason("Inkling2 DSpark requires paged runtime"))?
+                .active_seq;
+            let ctx = self.dspark_turn_contexts.remove(&seq_id).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Inkling2 DSpark turn context missing for seq {seq_id} (prefill did not seed it)"
+                ))
+            })?;
+            return Ok(super::cuda_spec::Inkling2SpecStepper::PagedDspark(
+                Inkling2DsparkStepper {
+                    inner: self,
+                    seq_id,
+                    ctx,
+                    adaptive_depth: AdaptiveDraftDepth::new(expected),
+                    tap_visits,
+                    ar_fallback: false,
+                    open_ticket: None,
+                    open_tape: None,
+                    open_taps: None,
+                    open_device_ids: None,
+                    ar_probe_pending: false,
+                    ar_probe_taps: None,
+                },
+            ));
         }
-        let tap_visits = draft.config.target_layer_ids.clone();
-        let seq_id = self
-            .paged
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2 DSpark requires paged runtime"))?
-            .active_seq;
-        let ctx = self.dspark_turn_contexts.remove(&seq_id).ok_or_else(|| {
-            Error::from_reason(format!(
-                "Inkling2 DSpark turn context missing for seq {seq_id} (prefill did not seed it)"
-            ))
-        })?;
-        Ok(Inkling2DsparkStepper {
-            inner: self,
-            seq_id,
-            ctx,
-            adaptive_depth: AdaptiveDraftDepth::new(expected),
-            tap_visits,
-            ar_fallback: false,
-            open_ticket: None,
-            open_tape: None,
-            open_taps: None,
-            open_device_ids: None,
-            ar_probe_pending: false,
-            ar_probe_taps: None,
-        })
+
+        if !self.use_cuda_fast() {
+            return Err(Error::from_reason(
+                "Inkling2 speculative decode requires paged Metal runtime or CUDA fast path",
+            ));
+        }
+
+        if let Some(ref draft) = self.dflash2 {
+            let expected = draft.config.block_size;
+            if block_size != expected {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 CUDA DFlash2 block_size {block_size} != draft checkpoint {expected}"
+                )));
+            }
+            let ctx = self.cuda_dflash2_ctx.take().ok_or_else(|| {
+                Error::from_reason(
+                    "Inkling2 CUDA DFlash2 turn context missing (prefill did not seed it)",
+                )
+            })?;
+            return Ok(super::cuda_spec::Inkling2SpecStepper::CudaDFlash2(
+                Box::new(super::cuda_spec::Inkling2CudaDFlash2Stepper::new(
+                    self, ctx,
+                )?),
+            ));
+        }
+
+        if let Some(ref draft) = self.dspark {
+            let expected =
+                super::cuda_spec::clamp_cuda_dspark_max_draft(draft.config.num_draft_tokens());
+            if block_size != expected {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 CUDA DSpark block_size {block_size} != draft checkpoint {expected}"
+                )));
+            }
+            let ctx = self.cuda_dspark_ctx.take().ok_or_else(|| {
+                Error::from_reason(
+                    "Inkling2 CUDA DSpark turn context missing (prefill did not seed it)",
+                )
+            })?;
+            return Ok(super::cuda_spec::Inkling2SpecStepper::CudaDspark(
+                super::cuda_spec::Inkling2CudaDsparkStepper::new(self, ctx, expected)?,
+            ));
+        }
+
+        Err(Error::from_reason(
+            "Inkling2 has no loaded DFlash2 or DSpark draft model",
+        ))
     }
 }
 

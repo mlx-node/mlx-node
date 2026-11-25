@@ -300,15 +300,80 @@ pub(crate) fn decode_transient_bytes(config: &Inkling2Config, lanes: u32) -> u64
     .max(16 << 20)
 }
 
-/// Parse and validate `kvFormat` load option (defaults to INT8 on Metal, BF16 elsewhere).
+/// Parse and validate `kvFormat` load option (defaults to INT8 on Metal paged, BF16 on CUDA and
+/// CPU; explicit `'int8'` remains supported on both Metal paged and the CUDA Inkling2 fast backend).
 pub(crate) fn resolve_kv_format(label: &str, requested: Option<&str>) -> Result<KvFormat> {
+    let metal_paged = crate::engine::persistence::compiled_forward_backend_available();
+    let int8_supported = metal_paged || super::cuda_forward::cuda_fast_enabled();
+    let default_fmt = if metal_paged {
+        KvFormat::Int8
+    } else {
+        default_inkling2_kv_format()
+    };
     resolve_kv_format_shared(
         &format!("{label} load"),
         requested,
-        default_inkling2_kv_format(),
-        crate::engine::persistence::compiled_forward_backend_available(),
-        || "int8 K/V requires the Metal paged backend; load with kvFormat 'bf16'".to_string(),
+        default_fmt,
+        int8_supported,
+        || {
+            "int8 K/V requires the Metal paged or CUDA Inkling2 fast backend; load with kvFormat 'bf16'"
+                .to_string()
+        },
     )
+}
+
+/// Resolve the effective `(KvFormat, Inkling2CudaKvFormat)` once the model config has been loaded
+/// and we know whether `metal_paged` or `cuda_fast` is actually active for this checkpoint.
+///
+/// - On Metal paged (`metal_paged = true`): preserves Metal INT8 default and explicit overrides
+///   without consulting `MLX_INKLING2_CUDA_KV_FORMAT`.
+/// - On CUDA Inkling2 fast (`!metal_paged && cuda_fast`): honors explicit `'int8'`/`'bf16'` and
+///   `MLX_INKLING2_CUDA_KV_FORMAT`, returning the same effective format for both
+///   `Inkling2ContextLimits.kv_format` and `inner.cuda_kv_format`.
+/// - On legacy flat fallback (`!metal_paged && !cuda_fast`): rejects explicit `'int8'` and stays
+///   BF16 regardless of `MLX_INKLING2_CUDA_KV_FORMAT`.
+pub(crate) fn resolve_effective_kv_format(
+    label: &str,
+    requested: Option<&str>,
+    metal_paged: bool,
+    cuda_fast: bool,
+) -> Result<(KvFormat, super::cuda_kv::Inkling2CudaKvFormat)> {
+    let env = std::env::var("MLX_INKLING2_CUDA_KV_FORMAT").ok();
+    resolve_effective_kv_format_with_env(label, requested, metal_paged, cuda_fast, env.as_deref())
+}
+
+pub(crate) fn resolve_effective_kv_format_with_env(
+    label: &str,
+    requested: Option<&str>,
+    metal_paged: bool,
+    cuda_fast: bool,
+    cuda_env_override: Option<&str>,
+) -> Result<(KvFormat, super::cuda_kv::Inkling2CudaKvFormat)> {
+    let int8_supported = metal_paged || cuda_fast;
+    let default_fmt = if metal_paged {
+        KvFormat::Int8
+    } else {
+        KvFormat::Bf16
+    };
+    let parsed = resolve_kv_format_shared(
+        &format!("{label} load"),
+        requested,
+        default_fmt,
+        int8_supported,
+        || {
+            "int8 K/V requires the Metal paged or CUDA Inkling2 fast backend; load with kvFormat 'bf16'"
+                .to_string()
+        },
+    )?;
+    if metal_paged {
+        Ok((parsed, super::cuda_kv::Inkling2CudaKvFormat::Bf16))
+    } else if cuda_fast {
+        let cuda_fmt =
+            super::cuda_kv::Inkling2CudaKvFormat::resolve_with_env(Some(parsed), cuda_env_override);
+        Ok((cuda_fmt.as_kv_format(), cuda_fmt))
+    } else {
+        Ok((KvFormat::Bf16, super::cuda_kv::Inkling2CudaKvFormat::Bf16))
+    }
 }
 
 /// Parse and validate `activations` load option (`'auto'` default on Metal, or `'bf16'`).
@@ -560,5 +625,84 @@ mod tests {
         .expect("bf16 plan");
         assert!(bf16_plan.global_max_blocks < plan.global_max_blocks);
         assert_eq!(bf16_plan.state_staging_bytes, 0);
+    }
+
+    #[test]
+    fn resolve_effective_kv_format_respects_backend_and_cuda_env_override() {
+        use super::super::cuda_kv::Inkling2CudaKvFormat;
+
+        // 1. Legacy flat fallback (`!metal_paged && !cuda_fast`): explicit int8 is rejected.
+        let err =
+            resolve_effective_kv_format_with_env("Inkling2", Some("int8"), false, false, None)
+                .expect_err("legacy flat fallback must reject explicit int8");
+        assert!(
+            err.to_string().contains("int8"),
+            "unexpected error message: {err}"
+        );
+
+        // 2. Legacy flat fallback ignores CUDA env override and always reports BF16.
+        assert_eq!(
+            resolve_effective_kv_format_with_env("Inkling2", None, false, false, Some("int8"))
+                .unwrap(),
+            (KvFormat::Bf16, Inkling2CudaKvFormat::Bf16)
+        );
+        assert_eq!(
+            resolve_effective_kv_format_with_env(
+                "Inkling2",
+                Some("bf16"),
+                false,
+                false,
+                Some("int8")
+            )
+            .unwrap(),
+            (KvFormat::Bf16, Inkling2CudaKvFormat::Bf16)
+        );
+
+        // 3. CUDA fast path: env override `int8` updates BOTH reported KvFormat and cuda_kv_format.
+        assert_eq!(
+            resolve_effective_kv_format_with_env("Inkling2", None, false, true, Some("int8"))
+                .unwrap(),
+            (KvFormat::Int8, Inkling2CudaKvFormat::Int8)
+        );
+
+        // 4. CUDA fast path: env override `bf16` overrides explicit `int8` for BOTH fields.
+        assert_eq!(
+            resolve_effective_kv_format_with_env(
+                "Inkling2",
+                Some("int8"),
+                false,
+                true,
+                Some("bf16")
+            )
+            .unwrap(),
+            (KvFormat::Bf16, Inkling2CudaKvFormat::Bf16)
+        );
+        assert_eq!(
+            resolve_effective_kv_format_with_env("Inkling2", Some("int8"), false, true, None)
+                .unwrap(),
+            (KvFormat::Int8, Inkling2CudaKvFormat::Int8)
+        );
+        assert_eq!(
+            resolve_effective_kv_format_with_env("Inkling2", None, false, true, None).unwrap(),
+            (KvFormat::Bf16, Inkling2CudaKvFormat::Bf16)
+        );
+
+        // 5. Metal paged path: defaults to INT8 and ignores CUDA env overrides.
+        assert_eq!(
+            resolve_effective_kv_format_with_env("Inkling2", None, true, false, Some("bf16"))
+                .unwrap(),
+            (KvFormat::Int8, Inkling2CudaKvFormat::Bf16)
+        );
+        assert_eq!(
+            resolve_effective_kv_format_with_env(
+                "Inkling2",
+                Some("bf16"),
+                true,
+                false,
+                Some("int8")
+            )
+            .unwrap(),
+            (KvFormat::Bf16, Inkling2CudaKvFormat::Bf16)
+        );
     }
 }

@@ -3,7 +3,7 @@ R"cuda(
 
 // Fast coalesced CUDA GGUF repack kernels matching gguf_repack.metal and
 // gguf_cpu_repack.rs byte-for-byte for Q4_K, Q5_K (RowMajor + Tiled64),
-// Q5_1, Q8_0, and Q8_0_bias.
+// Q5_1, Q8_0, Q8_0_bias, and NVFP4.
 
 __device__ __forceinline__ unsigned int gr_nib8(unsigned int a, unsigned int b) {
   unsigned int x = a & 0x0F0F0F0Fu;
@@ -463,5 +463,66 @@ extern "C" __global__ __launch_bounds__(256) void mlx_node_gguf_repack_q8_0_bias
     unsigned int kb,
     unsigned int row0) {
   gr_q8_0_impl<true>(staging, weight, scales, biases, src_off, nb, kb, row0);
+}
+
+// ---------------------------------------------------------------- NVFP4
+// 36-byte blocks (9 uint32, 4-byte aligned): d[4] UE4M3 scales @0, qs[32] @4.
+// Grid: ceil(nb / 256), Block: 256 (8 warps x 32 blocks).
+extern "C" __global__ __launch_bounds__(256) void mlx_node_gguf_repack_nvfp4(
+    const unsigned char* __restrict__ staging,
+    unsigned int* __restrict__ weight,
+    unsigned char* __restrict__ scales,
+    unsigned long long src_off,
+    unsigned int nb,
+    unsigned int kb,
+    unsigned int row0) {
+  const unsigned int warp = threadIdx.x >> 5;
+  const unsigned int lane = threadIdx.x & 31u;
+  const unsigned int b0 = (blockIdx.x * 8u + warp) * 32u;
+  if (b0 >= nb) return;
+  const unsigned int cnt = (nb - b0 < 32u) ? (nb - b0) : 32u;
+
+  __shared__ uint4 s_in[8][72];   // 32 * 36 B = 1152 B = 72 uint4 (9216 B)
+  __shared__ uint4 s_out[8][64];  // 32 * 32 B = 1024 B = 64 uint4 (8192 B)
+
+  const unsigned char* src_b = staging + src_off + static_cast<unsigned long long>(b0) * 36ull;
+  const unsigned long long align = reinterpret_cast<unsigned long long>(src_b);
+  if ((align & 15u) == 0u && cnt == 32u) {
+    const uint4* src4 = reinterpret_cast<const uint4*>(src_b);
+    for (unsigned int i = lane; i < 72u; i += 32u) {
+      s_in[warp][i] = src4[i];
+    }
+  } else {
+    const unsigned int* src32 = reinterpret_cast<const unsigned int*>(src_b);
+    unsigned int* dst32 = reinterpret_cast<unsigned int*>(s_in[warp]);
+    const unsigned int n32 = cnt * 9u;
+    for (unsigned int i = lane; i < n32; i += 32u) {
+      dst32[i] = src32[i];
+    }
+  }
+  __syncwarp();
+
+  const unsigned long long gb0 = static_cast<unsigned long long>(row0) * kb + b0;
+  if (lane < cnt) {
+    const unsigned int* blk = reinterpret_cast<const unsigned int*>(s_in[warp]) + lane * 9u;
+    const unsigned int b1 = blk[1], b2 = blk[2];
+    const unsigned int b3 = blk[3], b4 = blk[4];
+    const unsigned int b5 = blk[5], b6 = blk[6];
+    const unsigned int b7 = blk[7], b8 = blk[8];
+    s_out[warp][lane * 2u + 0u] = make_uint4(
+        gr_nib8(b1, b2), gr_nib8(b1 >> 4, b2 >> 4),
+        gr_nib8(b3, b4), gr_nib8(b3 >> 4, b4 >> 4));
+    s_out[warp][lane * 2u + 1u] = make_uint4(
+        gr_nib8(b5, b6), gr_nib8(b5 >> 4, b6 >> 4),
+        gr_nib8(b7, b8), gr_nib8(b7 >> 4, b8 >> 4));
+    reinterpret_cast<unsigned int*>(scales)[gb0 + lane] = blk[0];
+  }
+  __syncwarp();
+
+  uint4* w4 = reinterpret_cast<uint4*>(weight) + gb0 * 2ull;
+  const unsigned int n_out = cnt * 2u;
+  for (unsigned int i = lane; i < n_out; i += 32u) {
+    w4[i] = s_out[warp][i];
+  }
 }
 )cuda"

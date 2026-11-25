@@ -272,6 +272,33 @@ impl Linear {
             quantized: None,
         })
     }
+
+    /// Promote settled CUDA pinned-host linear weights into GPU device memory
+    /// and refresh derived `weight_t` views. Returns total promoted bytes.
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        if let Some(ref mut q) = self.quantized {
+            // Keep dense placeholder lazy — only promote the active packed backend.
+            promoted += q.weight.promote_cuda_device()?;
+            promoted += q.scales.promote_cuda_device()?;
+            if let Some(ref mut b) = q.biases {
+                promoted += b.promote_cuda_device()?;
+            }
+        } else {
+            let w_bytes = self.weight.promote_cuda_device()?;
+            if w_bytes > 0 {
+                self.weight_t = self.weight.transpose(Some(&[1, 0]))?;
+                promoted += w_bytes;
+            }
+        }
+        if let Some(ref mut b) = self.bias {
+            promoted += b.promote_cuda_device()?;
+        }
+        Ok(promoted)
+    }
 }
 
 #[cfg(test)]

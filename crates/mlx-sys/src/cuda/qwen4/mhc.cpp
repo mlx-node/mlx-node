@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -533,7 +534,8 @@ class Qwen4StreamMeanCuda final : public Primitive {
 
 class Qwen4DequantQ8Bf16Cuda final : public Primitive {
  public:
-  explicit Qwen4DequantQ8Bf16Cuda(Stream stream) : Primitive(stream) {}
+  Qwen4DequantQ8Bf16Cuda(Stream stream, bool symmetric)
+      : Primitive(stream), symmetric_(symmetric) {}
 
   void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
     throw std::runtime_error("Qwen4DequantQ8Bf16Cuda requires CUDA");
@@ -542,49 +544,79 @@ class Qwen4DequantQ8Bf16Cuda final : public Primitive {
   void eval_gpu(
       const std::vector<array>& inputs, std::vector<array>& outputs) override {
     auto& encoder = cu::get_command_encoder(stream());
-    array w = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
-    array sc = cu::ensure_row_contiguous_aligned<4>(inputs[1], stream(), encoder);
-    array bi = cu::ensure_row_contiguous_aligned<4>(inputs[2], stream(), encoder);
-    const int N = w.shape(0);
-    const int K = w.shape(1) * 4;
-    if (N <= 0 || K < 32 || (K & 31) != 0 || sc.dtype() != bi.dtype()) {
-      throw std::invalid_argument("Qwen4DequantQ8Bf16Cuda: unsupported shape");
+    if ((symmetric_ && inputs.size() < 2) || (!symmetric_ && inputs.size() < 3)) {
+      throw std::invalid_argument("Qwen4DequantQ8Bf16Cuda: missing inputs");
     }
     const int sb_dtype =
-        (sc.dtype() == float16) ? 0 : (sc.dtype() == bfloat16 ? 1 : 2);
-    static constexpr const char* kEntries[3] = {
-        "qwen4_dequant_q8_bf16_cuda<0>",
-        "qwen4_dequant_q8_bf16_cuda<1>",
-        "qwen4_dequant_q8_bf16_cuda<2>",
+        (inputs[1].dtype() == float16) ? 0
+                                       : (inputs[1].dtype() == bfloat16 ? 1 : 2);
+    array w = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    array sc = (sb_dtype == 2)
+        ? cu::ensure_row_contiguous_aligned<4>(inputs[1], stream(), encoder)
+        : cu::ensure_row_contiguous_aligned<2>(inputs[1], stream(), encoder);
+    std::optional<array> bi;
+    if (!symmetric_) {
+      bi = (sb_dtype == 2)
+          ? cu::ensure_row_contiguous_aligned<4>(inputs[2], stream(), encoder)
+          : cu::ensure_row_contiguous_aligned<2>(inputs[2], stream(), encoder);
+    }
+    const int N = w.shape(0);
+    const int K = w.shape(1) * 4;
+    const uint32_t grid_k = static_cast<uint32_t>(((K >> 3) + 255) / 256);
+    if (N <= 0 || K < 32 || (K & 31) != 0 || grid_k == 0 || grid_k > 65535 ||
+        (!symmetric_ && sc.dtype() != bi->dtype())) {
+      throw std::invalid_argument("Qwen4DequantQ8Bf16Cuda: unsupported shape");
+    }
+    static constexpr const char* kEntries[2][3] = {
+        {
+            "qwen4_dequant_q8_bf16_cuda<0, false>",
+            "qwen4_dequant_q8_bf16_cuda<1, false>",
+            "qwen4_dequant_q8_bf16_cuda<2, false>",
+        },
+        {
+            "qwen4_dequant_q8_bf16_cuda<0, true>",
+            "qwen4_dequant_q8_bf16_cuda<1, true>",
+            "qwen4_dequant_q8_bf16_cuda<2, true>",
+        },
     };
     auto& out = outputs[0];
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     encoder.set_input_array(w);
     encoder.set_input_array(sc);
-    encoder.set_input_array(bi);
+    if (!symmetric_) {
+      encoder.set_input_array(*bi);
+    }
     encoder.set_output_array(out);
     auto fn = cu::jit_kernel(
-        encoder.device(), qwen4_mhc_source, kEntries[sb_dtype]);
+        encoder.device(), qwen4_mhc_source,
+        kEntries[symmetric_ ? 1 : 0][sb_dtype]);
     cu::KernelArgs args;
     args.append(w);
     args.append(sc);
-    args.append(bi);
+    if (!symmetric_) {
+      args.append(*bi);
+    } else {
+      args.append<CUdeviceptr>(0);
+    }
     args.append(out);
     args.append<int32_t>(N);
     args.append<int32_t>(K);
-    const uint32_t grid_x = static_cast<uint32_t>(((K >> 3) + 255) / 256);
     encoder.add_kernel_node_raw(
-        fn, dim3(grid_x, static_cast<uint32_t>(N), 1), dim3(256, 1, 1), {}, 0,
+        fn, dim3(static_cast<uint32_t>(N), grid_k, 1), dim3(256, 1, 1), {}, 0,
         args.args());
   }
 
   DEFINE_NAME(Qwen4DequantQ8Bf16Cuda)
   bool is_equivalent(const Primitive& other) const override {
-    return dynamic_cast<const Qwen4DequantQ8Bf16Cuda*>(&other) != nullptr;
+    const auto* rhs = dynamic_cast<const Qwen4DequantQ8Bf16Cuda*>(&other);
+    return rhs && rhs->symmetric_ == symmetric_;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     return {Shape{inputs[0].shape(0), inputs[0].shape(1) * 4}};
   }
+
+ private:
+  bool symmetric_;
 };
 
 }  // namespace
@@ -941,30 +973,42 @@ extern "C" mlx_array* mlx_qwen4_dequant_q8_bf16_cuda(
   try {
     using namespace mlx::core;
     using namespace mlx::core::qwen4_ops;
-    if (!w_h || !scales_h || !biases_h || default_device() != Device::gpu ||
+    if (!w_h || !scales_h || default_device() != Device::gpu ||
         cu::device(Device::gpu).compute_capability_major() < 8) {
       return nullptr;
     }
+    const bool symmetric = (biases_h == nullptr);
     const auto& w = *reinterpret_cast<array*>(w_h);
     const auto& sc = *reinterpret_cast<array*>(scales_h);
-    const auto& bi = *reinterpret_cast<array*>(biases_h);
-    if (w.dtype() != uint32 || w.ndim() != 2 || sc.ndim() != 2 || bi.ndim() != 2 ||
-        sc.dtype() != bi.dtype() ||
-        (sc.dtype() != float16 && sc.dtype() != bfloat16 && sc.dtype() != float32)) {
+    if (w.dtype() != uint32 || w.ndim() != 2 || sc.ndim() != 2 ||
+        (sc.dtype() != float16 && sc.dtype() != bfloat16 &&
+         sc.dtype() != float32)) {
       return nullptr;
     }
     const int N = w.shape(0);
     const int K = w.shape(1) * 4;
-    if (N <= 0 || N > 65535 || K < 32 || (K & 31) != 0 ||
-        sc.shape(0) != N || sc.shape(1) != (K >> 5) ||
-        bi.shape(0) != N || bi.shape(1) != (K >> 5)) {
+    const uint32_t grid_k = static_cast<uint32_t>(((K >> 3) + 255) / 256);
+    if (N <= 0 || K < 32 || (K & 31) != 0 || grid_k == 0 || grid_k > 65535 ||
+        sc.shape(0) != N || sc.shape(1) != (K >> 5)) {
       return nullptr;
+    }
+    std::vector<array> inputs;
+    inputs.reserve(symmetric ? 2 : 3);
+    inputs.push_back(w);
+    inputs.push_back(sc);
+    if (!symmetric) {
+      const auto& bi = *reinterpret_cast<array*>(biases_h);
+      if (bi.ndim() != 2 || bi.dtype() != sc.dtype() ||
+          bi.shape(0) != N || bi.shape(1) != (K >> 5)) {
+        return nullptr;
+      }
+      inputs.push_back(bi);
     }
     auto stream = default_stream(Device::gpu);
     auto result = array(
         Shape{N, K}, bfloat16,
-        std::make_shared<Qwen4DequantQ8Bf16Cuda>(stream),
-        {w, sc, bi});
+        std::make_shared<Qwen4DequantQ8Bf16Cuda>(stream, symmetric),
+        std::move(inputs));
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   } catch (const std::exception& e) {
     std::fprintf(stderr, "mlx_qwen4_dequant_q8_bf16_cuda: %s\n", e.what());

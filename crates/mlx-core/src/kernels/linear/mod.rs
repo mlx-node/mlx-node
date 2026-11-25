@@ -26,24 +26,53 @@ pub(crate) fn bf16_matmul_few(
 
 /// Small-row BF16-in / BF16-out affine quantized matmul (Metal `M in 2..=8`
 /// `mlx_quantized_matmul_affine_bf16` with F32 sidecars, or CUDA `M in 1..=16`
-/// `Q8_0` fast path with F32/BF16/F16 sidecars).
+/// `Q8_0` fast path with F32/BF16/F16 sidecars, supporting `biases = None`
+/// for symmetric Q8_0).
 #[inline]
 pub(crate) fn affine_bf16_matmul_few(
     x: &MxArray,
     weight: &MxArray,
     scales: &MxArray,
-    biases: &MxArray,
+    biases: Option<&MxArray>,
     group_size: i32,
     bits: i32,
 ) -> Result<Option<MxArray>> {
     match active_backend() {
-        ActiveBackend::MetalGpu => {
-            metal::affine_bf16_matmul_few(x, weight, scales, biases, group_size, bits)
-        }
+        ActiveBackend::MetalGpu => match biases {
+            Some(biases) => {
+                metal::affine_bf16_matmul_few(x, weight, scales, biases, group_size, bits)
+            }
+            None => Ok(None),
+        },
         ActiveBackend::CudaGpu if bits == 8 && group_size == 32 => {
             cuda::affine_q8_matmul_few(x, weight, scales, biases)
         }
         ActiveBackend::CudaGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
+/// Paired small-row (`M in 1..=16`) BF16-in / BF16-out Q8_0 (`bits=8, group_size=32`)
+/// quantized matmul on CUDA (`(x0 @ W0^T, x1 @ W1^T)` in 1 kernel launch).
+/// Supports symmetric (`b0 = None, b1 = None`) and affine (`b0 = Some, b1 = Some`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn affine_bf16_matmul_few_pair_cuda(
+    x0: &MxArray,
+    w0: &MxArray,
+    s0: &MxArray,
+    b0: Option<&MxArray>,
+    x1: &MxArray,
+    w1: &MxArray,
+    s1: &MxArray,
+    b1: Option<&MxArray>,
+    group_size: i32,
+    bits: i32,
+) -> Result<Option<(MxArray, MxArray)>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu if bits == 8 && group_size == 32 => {
+            cuda::affine_q8_matmul_few_pair(x0, w0, s0, b0, x1, w1, s1, b1, group_size)
+        }
+        ActiveBackend::CudaGpu | ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
     }
 }
 
@@ -108,13 +137,14 @@ pub(crate) fn affine_q4_g64_matmul_few(
     }
 }
 
-/// 1-pass affine Q8_0 (`bits=8, group_size=32`) -> BF16 dequantization on CUDA.
+/// 1-pass affine or symmetric (`biases = None`) Q8_0 (`bits=8, group_size=32`)
+/// -> BF16 dequantization on CUDA.
 #[inline]
 #[allow(dead_code)]
 pub(crate) fn dequant_q8_bf16_cuda(
     w: &MxArray,
     scales: &MxArray,
-    biases: &MxArray,
+    biases: Option<&MxArray>,
 ) -> Result<Option<MxArray>> {
     match active_backend() {
         ActiveBackend::CudaGpu => cuda::dequant_q8_bf16_cuda(w, scales, biases),
@@ -122,8 +152,8 @@ pub(crate) fn dequant_q8_bf16_cuda(
     }
 }
 
-/// Direct fused `Q8_0` (`bits=8, group_size=32, f16 scales/biases`) Tensor-Core
-/// prefill GEMM on CUDA (eliminates BF16 dense weight cache allocation).
+/// Direct fused `Q8_0` (`bits=8, group_size=32, f16 scales` + optional `biases`)
+/// Tensor-Core prefill GEMM on CUDA (eliminates BF16 dense weight cache allocation).
 ///
 /// `gs_shift`: `0` = per-row INT8, `7` = GS=128 INT8, `8` = GS=256 INT8,
 /// `-1` = auto-grouped (`8` if `K%256==0`, else `7` if `K%128==0`, else `0`),
@@ -134,7 +164,7 @@ pub(crate) fn q8_prefill_cuda(
     x: &MxArray,
     w: &MxArray,
     scales: &MxArray,
-    biases: &MxArray,
+    biases: Option<&MxArray>,
     gs_shift: i32,
     general_bias: bool,
 ) -> Result<Option<MxArray>> {

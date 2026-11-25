@@ -551,14 +551,16 @@ R"cuda(
 )cuda"
 R"cuda(
 // Vectorized 1-warp-per-row BF16 partial_O reduction in log2 space.
+// OUT_BTHD=false: writes [B, Hq, Q_len, D].
+// OUT_BTHD=true:  writes [B, Q_len, Hq * D] directly (zero transpose copy).
 // Grid: (M, Hkv, B), Block: (32, 1, 1).
-template <int D>
+template <int D, bool OUT_BTHD>
 __global__ void mlx_node_sdpa_tc_reduce(
     const nv_bfloat16* __restrict__ partial_O,
     const float* __restrict__ partial_m,
     const float* __restrict__ partial_l,
     nv_bfloat16* __restrict__ out,
-    int Hkv, int M, int num_splits) {
+    int Hkv, int M, int num_splits, int gqa, int Q_len) {
   const int row = blockIdx.x;
   const int hkv = blockIdx.y;
   const int b = blockIdx.z;
@@ -604,7 +606,19 @@ __global__ void mlx_node_sdpa_tc_reduce(
     }
   }
   const float inv = (l_sum > 0.0f) ? (1.0f / l_sum) : 0.0f;
-  nv_bfloat16* dst = out + (bh * M + row) * D + lane * ELEMS;
+  long long out_row_idx;
+  if constexpr (OUT_BTHD) {
+    const int gqa_head = row / Q_len;
+    const int q_pos = row - gqa_head * Q_len;
+    const int hq = hkv * gqa + gqa_head;
+    const int Hq = Hkv * gqa;
+    out_row_idx = ((long long)b * Q_len + q_pos) * (long long)Hq + hq;
+  } else {
+    (void)gqa;
+    (void)Q_len;
+    out_row_idx = bh * M + row;
+  }
+  nv_bfloat16* dst = out + out_row_idx * D + lane * ELEMS;
   if constexpr (ELEMS == 8) {
     uint4 packed;
     unsigned int* u = reinterpret_cast<unsigned int*>(&packed);

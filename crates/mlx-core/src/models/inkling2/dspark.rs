@@ -81,7 +81,7 @@ impl Inkling2DsparkDraftConfig {
     ) -> Result<Self> {
         if !is_inkling2_dspark_gguf(meta) {
             return Err(Error::from_reason(
-                "GGUF file is not an Inkling2 DSpark draft checkpoint (expected general.architecture=\"dflash\" with dflash.dspark.markov_rank)",
+                "GGUF file is not an Inkling2 DSpark draft checkpoint (expected general.architecture=\"dflash\" with dflash.dspark.markov_rank or dflash.has_markov_context=true)",
             ));
         }
         let get_u = |k: &str| {
@@ -646,6 +646,83 @@ impl Inkling2DsparkLayer {
         super::attention::push_linear_proj_arrays(&self.down_proj, &mut out);
         out
     }
+
+    fn ensure_cuda_device(
+        &mut self,
+        d: usize,
+        q_dim: usize,
+        kv_dim: usize,
+        ffn: usize,
+    ) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        promoted += self.input_layernorm.promote_cuda_device()?;
+        promoted += self.post_attention_layernorm.promote_cuda_device()?;
+        promoted += self.dflare_norm.promote_cuda_device()?;
+        promoted += self.q_norm.promote_cuda_device()?;
+        promoted += self.k_norm.promote_cuda_device()?;
+        promoted += self.k_ctx_norm.promote_cuda_device()?;
+
+        let slice_proj = |proj: &LinearProj, start: i64, end: i64| -> Result<LinearProj> {
+            match proj {
+                LinearProj::Standard(lin) => {
+                    let w = lin.get_weight();
+                    let sub = w.slice(&[start, 0], &[end, d as i64])?;
+                    Ok(LinearProj::Standard(Linear::from_weights(&sub, None)?))
+                }
+                LinearProj::Quantized(ql) => Ok(LinearProj::Quantized(ql.slice_rows(start, end)?)),
+            }
+        };
+
+        if let Some(ref mut f) = self.fused_qkv {
+            let b = f.ensure_cuda_device()?;
+            if b > 0 {
+                let q_i64 = q_dim as i64;
+                let kv_i64 = kv_dim as i64;
+                self.q_proj = slice_proj(f, 0, q_i64)?;
+                self.k_proj = slice_proj(f, q_i64, q_i64 + kv_i64)?;
+                self.v_proj = slice_proj(f, q_i64 + kv_i64, q_i64 + 2 * kv_i64)?;
+                promoted += b;
+            }
+        } else {
+            promoted += self.q_proj.ensure_cuda_device()?;
+            promoted += self.k_proj.ensure_cuda_device()?;
+            promoted += self.v_proj.ensure_cuda_device()?;
+        }
+
+        if let Some(ref mut f) = self.fused_kv_ctx {
+            let b = f.ensure_cuda_device()?;
+            if b > 0 {
+                let kv_i64 = kv_dim as i64;
+                self.k_ctx_proj = slice_proj(f, 0, kv_i64)?;
+                self.v_ctx_proj = slice_proj(f, kv_i64, 2 * kv_i64)?;
+                promoted += b;
+            }
+        } else {
+            promoted += self.k_ctx_proj.ensure_cuda_device()?;
+            promoted += self.v_ctx_proj.ensure_cuda_device()?;
+        }
+
+        promoted += self.o_proj.ensure_cuda_device()?;
+
+        if let Some(ref mut f) = self.fused_gate_up {
+            let b = f.ensure_cuda_device()?;
+            if b > 0 {
+                let ffn_i64 = ffn as i64;
+                self.gate_proj = slice_proj(f, 0, ffn_i64)?;
+                self.up_proj = slice_proj(f, ffn_i64, 2 * ffn_i64)?;
+                promoted += b;
+            }
+        } else {
+            promoted += self.gate_proj.ensure_cuda_device()?;
+            promoted += self.up_proj.ensure_cuda_device()?;
+        }
+
+        promoted += self.down_proj.ensure_cuda_device()?;
+        Ok(promoted)
+    }
 }
 
 /// Q8_0 (`group_size=32, bits=8`, affine) quantized folded Markov projection weight `[V_unpadded, R]`.
@@ -834,6 +911,29 @@ impl Inkling2MarkovHead {
             out.push(fw_t.clone());
         }
         out
+    }
+
+    fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        promoted += self.dflare_norm.promote_cuda_device()?;
+        promoted += self.markov_w1.promote_cuda_device()?;
+        promoted += self.rnn_bias_f32.promote_cuda_device()?;
+        promoted += self.rnn_proj_rec_w_t.promote_cuda_device()?;
+        promoted += self.rnn_proj_ctx_w_t.promote_cuda_device()?;
+        promoted += self.fold_bias.promote_cuda_device()?;
+        promoted += self.one_scalar.promote_cuda_device()?;
+        if let Some(ref mut q8) = self.fold_weight_q8 {
+            promoted += q8.weight.promote_cuda_device()?;
+            promoted += q8.scales.promote_cuda_device()?;
+            promoted += q8.biases.promote_cuda_device()?;
+        }
+        if let Some(ref mut fw_t) = self.fold_weight_t {
+            promoted += fw_t.promote_cuda_device()?;
+        }
+        Ok(promoted)
     }
 }
 
@@ -1109,16 +1209,28 @@ impl Inkling2DsparkModel {
         })
     }
 
-    /// Load `dspark-Inkling-2-Mini-Q8_0.gguf` and fold its Markov head into `target_lm_head`
-    /// in FP64 -> BF16 (chunked so peak RAM stays small).
+    /// Load `dspark-Inkling-2-Mini-Q8_0.gguf` (v1 unfused or v2 pre-folded `markov_w2`).
+    /// For v1 checkpoints, folds `dspark_hidden_out` into `target_lm_head` in FP64/FP32 -> BF16;
+    /// for v2 checkpoints (`markov_w2.weight` + `markov_w2.bias`), loads the pre-folded head directly.
     pub fn load_gguf(
         draft_path: &Path,
         target_config: &Inkling2Config,
         target_lm_head: &LinearProj,
     ) -> Result<Self> {
         let gguf = parse_gguf(draft_path)?;
-        let config = Inkling2DsparkDraftConfig::from_gguf_metadata(&gguf.metadata, target_config)?;
+        let mut config =
+            Inkling2DsparkDraftConfig::from_gguf_metadata(&gguf.metadata, target_config)?;
         let tensors = load_gguf_tensors(draft_path, &gguf, GgufLoadOptions::default())?;
+
+        // v2 DSpark GGUFs omit `dflash.dspark.markov_rank`; infer it directly from `markov_w1.weight`.
+        let markov_w1 =
+            require_draft_tensor(&tensors, "markov_w1.weight")?.astype(DType::BFloat16)?;
+        if !gguf.metadata.contains_key("dflash.dspark.markov_rank") {
+            let mw1_shape = markov_w1.shape()?;
+            if mw1_shape.len() == 2 && mw1_shape[1] > 0 {
+                config.markov_rank = mw1_shape[1] as usize;
+            }
+        }
 
         let d = config.hidden_size;
         let q_dim = config.num_attention_heads * config.head_dim;
@@ -1126,23 +1238,47 @@ impl Inkling2DsparkModel {
         let ffn = config.intermediate_size;
         let rank = config.markov_rank;
 
-        // 1. Softmax fuse weights `[num_layers + 1, num_taps]`
-        let fuse_raw = require_draft_tensor(&tensors, "dspark_fuse.weight")?.to_float32()?;
+        // 1. Fuse weights `[num_layers + 1, num_taps]`:
+        // - v1: single `dspark_fuse.weight` logits -> row-wise softmax.
+        // - v2: per-layer `blk.{i}.ctx_mix.weight` + `markov_ctx_mix.weight` (already softmax-normalized).
         let n_rows = config.num_hidden_layers + 1;
         let n_taps = config.target_layer_ids.len();
-        if fuse_raw.len() != n_rows * n_taps {
-            return Err(Error::from_reason(format!(
-                "dspark_fuse.weight has {} elems, expected {n_rows}x{n_taps}",
-                fuse_raw.len()
-            )));
-        }
         let mut fuse_alpha = Vec::with_capacity(n_rows);
-        for r in 0..n_rows {
-            let row = &fuse_raw[r * n_taps..(r + 1) * n_taps];
-            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let exps: Vec<f32> = row.iter().map(|&v| (v - max_v).exp()).collect();
-            let sum: f32 = exps.iter().sum();
-            fuse_alpha.push(exps.into_iter().map(|e| e / sum).collect());
+        if let Some(fuse_tensor) = tensors.get("dspark_fuse.weight") {
+            let fuse_raw = fuse_tensor.to_float32()?;
+            if fuse_raw.len() != n_rows * n_taps {
+                return Err(Error::from_reason(format!(
+                    "dspark_fuse.weight has {} elems, expected {n_rows}x{n_taps}",
+                    fuse_raw.len()
+                )));
+            }
+            for r in 0..n_rows {
+                let row = &fuse_raw[r * n_taps..(r + 1) * n_taps];
+                let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let exps: Vec<f32> = row.iter().map(|&v| (v - max_v).exp()).collect();
+                let sum: f32 = exps.iter().sum();
+                fuse_alpha.push(exps.into_iter().map(|e| e / sum).collect());
+            }
+        } else {
+            for i in 0..config.num_hidden_layers {
+                let key = format!("blk.{i}.ctx_mix.weight");
+                let row = require_draft_tensor(&tensors, &key)?.to_float32()?;
+                if row.len() != n_taps {
+                    return Err(Error::from_reason(format!(
+                        "{key} has {} elems, expected {n_taps}",
+                        row.len()
+                    )));
+                }
+                fuse_alpha.push(row.to_vec());
+            }
+            let m_row = require_draft_tensor(&tensors, "markov_ctx_mix.weight")?.to_float32()?;
+            if m_row.len() != n_taps {
+                return Err(Error::from_reason(format!(
+                    "markov_ctx_mix.weight has {} elems, expected {n_taps}",
+                    m_row.len()
+                )));
+            }
+            fuse_alpha.push(m_row.to_vec());
         }
 
         // 2. Load 3 Q8_0 transformer layers (hoisting Q8_0 Float16 sidecars to F32 BEFORE row-concat fusion!)
@@ -1166,6 +1302,12 @@ impl Inkling2DsparkModel {
             let fused_kv_ctx = k_ctx_proj.concat_rows(&v_ctx_proj)?;
             let fused_gate_up = gate_proj.concat_rows(&up_proj)?;
 
+            let dflare_norm = match tensors.get(&format!("{p}.dflare_norm.weight")) {
+                Some(t) => t,
+                None => require_draft_tensor(&tensors, &format!("{p}.ctx_norm.weight"))?,
+            }
+            .astype(DType::Float32)?;
+
             layers.push(Inkling2DsparkLayer {
                 is_local,
                 input_layernorm: require_draft_tensor(&tensors, &format!("{p}.attn_norm.weight"))?
@@ -1175,8 +1317,7 @@ impl Inkling2DsparkModel {
                     &format!("{p}.ffn_norm.weight"),
                 )?
                 .astype(DType::Float32)?,
-                dflare_norm: require_draft_tensor(&tensors, &format!("{p}.dflare_norm.weight"))?
-                    .astype(DType::Float32)?,
+                dflare_norm,
                 q_norm: require_draft_tensor(&tensors, &format!("{p}.attn_q_norm.weight"))?
                     .astype(DType::Float32)?,
                 k_norm: require_draft_tensor(&tensors, &format!("{p}.attn_k_norm.weight"))?
@@ -1198,18 +1339,24 @@ impl Inkling2DsparkModel {
             });
         }
 
-        // 3. Global output norm + mask embedding
+        // 3. Global output norm + mask embedding (`[H]`/`[1, H]` in v1, `[7, H]` identical rows in v2)
         let output_norm =
             require_draft_tensor(&tensors, "output_norm.weight")?.astype(DType::Float32)?;
-        let mask_embd = require_draft_tensor(&tensors, "mask_embd.weight")?
-            .astype(DType::BFloat16)?
-            .reshape(&[1, d as i64])?;
+        let mask_raw =
+            require_draft_tensor(&tensors, "mask_embd.weight")?.astype(DType::BFloat16)?;
+        let mask_shape = mask_raw.shape()?;
+        let mask_embd = if mask_shape.len() == 2 && mask_shape[0] > 1 && mask_shape[1] == d as i64 {
+            mask_raw.slice(&[0, 0], &[1, d as i64])?
+        } else {
+            mask_raw.reshape(&[1, d as i64])?
+        };
 
-        // 4. Markov RNN head + FP64 fold into target `lm_head`
-        let dspark_norm =
-            require_draft_tensor(&tensors, "dspark_norm.weight")?.astype(DType::Float32)?;
-        let markov_w1 =
-            require_draft_tensor(&tensors, "markov_w1.weight")?.astype(DType::BFloat16)?;
+        // 4. Markov RNN head + v2 pre-folded `markov_w2` or v1 FP64/FP32 fold into target `lm_head`
+        let dspark_norm = match tensors.get("dspark_norm.weight") {
+            Some(t) => t,
+            None => require_draft_tensor(&tensors, "markov_ctx_norm.weight")?,
+        }
+        .astype(DType::Float32)?;
         let joint_w =
             require_draft_tensor(&tensors, "joint_proj.weight")?.astype(DType::BFloat16)?;
         let joint_b = require_draft_tensor(&tensors, "joint_proj.bias")?
@@ -1233,16 +1380,41 @@ impl Inkling2DsparkModel {
             .slice(&[0, split_col], &[expected_out, expected_in])?
             .transpose(None)?;
 
-        let hidden_out_w = require_draft_tensor(&tensors, "dspark_hidden_out.weight")?;
-        let hidden_out_b = require_draft_tensor(&tensors, "dspark_hidden_out.bias")?;
-        let (fold_weight_bf16_t, fold_bias) = fold_markov_head_f64(
-            target_lm_head,
-            hidden_out_w,
-            hidden_out_b,
-            config.vocab_size,
-            d,
-            rank,
-        )?;
+        let (fold_weight_bf16_t, fold_bias) = if let (Some(w2), Some(b2)) = (
+            tensors.get("markov_w2.weight"),
+            tensors.get("markov_w2.bias"),
+        ) {
+            let w2_shape = w2.shape()?;
+            let b2_shape = b2.shape()?;
+            let min_v = config.unpadded_vocab_size as i64;
+            if w2_shape.len() != 2
+                || w2_shape[1] != rank as i64
+                || w2_shape[0] < min_v
+                || b2_shape.as_ref() != [w2_shape[0]]
+            {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 DSpark v2 markov_w2 shape mismatch: weight={:?}, bias={:?}, expected [>={min_v}, {rank}]",
+                    w2_shape.as_ref(),
+                    b2_shape.as_ref()
+                )));
+            }
+            let v_cols = w2_shape[0];
+            let fw_t = w2.astype(DType::BFloat16)?.transpose(None)?;
+            let fb = b2.astype(DType::BFloat16)?.reshape(&[1, v_cols])?;
+            MxArray::eval_arrays(&[&fw_t, &fb])?;
+            (fw_t, fb)
+        } else {
+            let hidden_out_w = require_draft_tensor(&tensors, "dspark_hidden_out.weight")?;
+            let hidden_out_b = require_draft_tensor(&tensors, "dspark_hidden_out.bias")?;
+            fold_markov_head_f64(
+                target_lm_head,
+                hidden_out_w,
+                hidden_out_b,
+                config.vocab_size,
+                d,
+                rank,
+            )?
+        };
 
         let use_metal_q8 = {
             #[cfg(target_os = "macos")]
@@ -1255,7 +1427,11 @@ impl Inkling2DsparkModel {
             }
         };
         let (fold_weight_q8, fold_weight_t) = if use_metal_q8 {
-            let unpadded_v = config.unpadded_vocab_size.min(config.vocab_size);
+            let fold_v = fold_weight_bf16_t.shape()?[1] as usize;
+            let unpadded_v = config
+                .unpadded_vocab_size
+                .min(config.vocab_size)
+                .min(fold_v);
             let fw_unpadded = fold_weight_bf16_t
                 .transpose(None)?
                 .slice(&[0, 0], &[unpadded_v as i64, rank as i64])?;
@@ -1316,6 +1492,25 @@ impl Inkling2DsparkModel {
             .iter()
             .map(|a| a.nbytes() as u64)
             .sum::<u64>()
+    }
+
+    /// Promote all resident DSpark weights to CUDA GPU device memory (`device == 0`).
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let d = self.config.hidden_size;
+        let q_dim = self.config.num_attention_heads * self.config.head_dim;
+        let kv_dim = self.config.num_key_value_heads * self.config.head_dim;
+        let ffn = self.config.intermediate_size;
+        let mut promoted = 0usize;
+        for layer in &mut self.layers {
+            promoted += layer.ensure_cuda_device(d, q_dim, kv_dim, ffn)?;
+        }
+        promoted += self.output_norm.promote_cuda_device()?;
+        promoted += self.mask_embd.promote_cuda_device()?;
+        promoted += self.markov_head.ensure_cuda_device()?;
+        Ok(promoted)
     }
 }
 
@@ -2632,27 +2827,45 @@ pub(crate) fn markov_add_softcap_slice(
     unpadded_vocab: i64,
     softcap: f64,
 ) -> Result<MxArray> {
+    let n = base_logits.shape()?[0];
+    let base_cols = base_logits.shape()?[1];
+    let bias_cols = bias.shape()?[1];
+    let cols = unpadded_vocab.min(base_cols).min(bias_cols);
     #[cfg(target_os = "macos")]
     if unsafe { mlx_sys::mlx_metal_is_available() } {
+        let base_m = if base_cols != bias_cols && cols < base_cols {
+            base_logits.slice(&[0, 0], &[n, cols])?
+        } else {
+            base_logits.clone()
+        };
+        let bias_m = if base_cols != bias_cols && cols < bias_cols {
+            bias.slice(&[0, 0], &[n, cols])?
+        } else {
+            bias.clone()
+        };
         return super::kernels::inkling2_lm_head_softcap(
-            base_logits,
-            Some(bias),
-            unpadded_vocab as usize,
+            &base_m,
+            Some(&bias_m),
+            cols as usize,
             softcap as f32,
             true,
         );
     }
-    let summed = base_logits
-        .astype(DType::Float32)?
-        .add(&bias.astype(DType::Float32)?)?
-        .astype(DType::BFloat16)?;
-    let n = summed.shape()?[0];
-    let sliced = if unpadded_vocab < summed.shape()?[1] {
-        summed.slice(&[0, 0], &[n, unpadded_vocab])?
+    let base_s = if cols < base_cols {
+        base_logits.slice(&[0, 0], &[n, cols])?
     } else {
-        summed
+        base_logits.clone()
     };
-    let mut logits = sliced.astype(DType::Float32)?;
+    let bias_s = if cols < bias_cols {
+        bias.slice(&[0, 0], &[n, cols])?
+    } else {
+        bias.clone()
+    };
+    let summed = base_s
+        .astype(DType::Float32)?
+        .add(&bias_s.astype(DType::Float32)?)?
+        .astype(DType::BFloat16)?;
+    let mut logits = summed.astype(DType::Float32)?;
     if softcap > 0.0 {
         logits = logits
             .mul_scalar(1.0 / softcap)?
@@ -2690,86 +2903,139 @@ pub(crate) fn fold_markov_head_f64(
         )));
     }
 
-    let proj_f32 = hidden_out_w.astype(DType::Float32)?.to_float32()?;
-    let bias_f32 = hidden_out_b.astype(DType::Float32)?.to_float32()?;
-    let proj_f64: Vec<f64> = proj_f32.iter().map(|&v| f64::from(v)).collect();
-    let bias_f64: Vec<f64> = bias_f32.iter().map(|&v| f64::from(v)).collect();
+    // Non-macOS (CUDA / CPU): fold via chunked FP32 `MxArray::matmul` -> BF16 (~0.2s on GPU vs
+    // ~90s scalar CPU f64 triple loop, with identical BF16 rounded output!).
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = rank;
+        let proj_f32 = hidden_out_w.astype(DType::Float32)?; // [H, R]
+        let bias_col_f32 = hidden_out_b
+            .astype(DType::Float32)?
+            .reshape(&[hidden_size as i64, 1])?; // [H, 1]
+        MxArray::eval_arrays(&[&proj_f32, &bias_col_f32])?;
 
-    let mut fold_weight_chunks: Vec<MxArray> =
-        Vec::with_capacity(vocab_size.div_ceil(FOLD_CHUNK_ROWS));
-    let mut fold_bias_f32: Vec<f32> = Vec::with_capacity(vocab_size);
-    let mut chunk_head_f64: Vec<f64> = Vec::new();
-    let mut chunk_out_f64: Vec<f64> = Vec::new();
-    let mut chunk_out_f32: Vec<f32> = Vec::new();
+        let mut fold_weight_chunks: Vec<MxArray> =
+            Vec::with_capacity(vocab_size.div_ceil(FOLD_CHUNK_ROWS));
+        let mut fold_bias_chunks: Vec<MxArray> =
+            Vec::with_capacity(vocab_size.div_ceil(FOLD_CHUNK_ROWS));
 
-    let mut start = 0usize;
-    while start < vocab_size {
-        let end = (start + FOLD_CHUNK_ROWS).min(vocab_size);
-        let rows = end - start;
-
-        let head_slice = match target_lm_head {
-            LinearProj::Quantized(_) => target_lm_head
-                .slice_rows(start as i64, end as i64)?
-                .dequantized_weight()?
-                .astype(DType::Float32)?,
-            LinearProj::Standard(lin) => lin
-                .get_weight()
-                .slice(&[start as i64, 0], &[end as i64, hidden_size as i64])?
-                .astype(DType::Float32)?,
-        };
-        let head_f32 = head_slice.to_float32()?;
-        if head_f32.len() != rows * hidden_size {
-            return Err(Error::from_reason(format!(
-                "fold_markov_head_f64: lm_head chunk [{start}..{end}) has {} elems, expected {}",
-                head_f32.len(),
-                rows * hidden_size
-            )));
+        let mut start = 0usize;
+        while start < vocab_size {
+            let end = (start + FOLD_CHUNK_ROWS).min(vocab_size);
+            let rows = (end - start) as i64;
+            let head_slice = match target_lm_head {
+                LinearProj::Quantized(_) => target_lm_head
+                    .slice_rows(start as i64, end as i64)?
+                    .dequantized_weight()?
+                    .astype(DType::Float32)?,
+                LinearProj::Standard(lin) => lin
+                    .get_weight()
+                    .slice(&[start as i64, 0], &[end as i64, hidden_size as i64])?
+                    .astype(DType::Float32)?,
+            };
+            let chunk_bf16 = head_slice.matmul(&proj_f32)?.astype(DType::BFloat16)?;
+            let bias_bf16 = head_slice
+                .matmul(&bias_col_f32)?
+                .reshape(&[1, rows])?
+                .astype(DType::BFloat16)?;
+            MxArray::eval_arrays(&[&chunk_bf16, &bias_bf16])?;
+            fold_weight_chunks.push(chunk_bf16);
+            fold_bias_chunks.push(bias_bf16);
+            start = end;
         }
 
-        chunk_head_f64.clear();
-        chunk_head_f64.extend(head_f32.iter().map(|&v| f64::from(v)));
-        drop(head_f32);
-        drop(head_slice);
-
-        // 1. `chunk_out_f64 = head_f64 [rows, H] @ proj_f64 [H, R]` -> `[rows, R]`
-        chunk_out_f64.resize(rows * rank, 0.0);
-        f64_gemm_nn(
-            rows,
-            rank,
-            hidden_size,
-            &chunk_head_f64,
-            &proj_f64,
-            &mut chunk_out_f64,
-        );
-
-        chunk_out_f32.clear();
-        chunk_out_f32.extend(chunk_out_f64.iter().map(|&v| v as f32));
-        let chunk_bf16 = MxArray::from_float32(&chunk_out_f32, &[rows as i64, rank as i64])?
-            .astype(DType::BFloat16)?;
-        chunk_bf16.eval();
-        fold_weight_chunks.push(chunk_bf16);
-
-        // 2. `fold_bias[start..end] = head_f64 [rows, H] @ bias_f64 [H]` -> `[rows]`
-        let mut bias_chunk_f64 = vec![0.0_f64; rows];
-        f64_gemv_n(
-            rows,
-            hidden_size,
-            &chunk_head_f64,
-            &bias_f64,
-            &mut bias_chunk_f64,
-        );
-        fold_bias_f32.extend(bias_chunk_f64.iter().map(|&v| v as f32));
-
-        start = end;
+        let w_refs: Vec<&MxArray> = fold_weight_chunks.iter().collect();
+        let b_refs: Vec<&MxArray> = fold_bias_chunks.iter().collect();
+        let fold_weight = MxArray::concatenate_many(w_refs, Some(0))?; // [V, R] BF16
+        let fold_weight_t = fold_weight.transpose(None)?; // [R, V] BF16
+        let fold_bias = MxArray::concatenate_many(b_refs, Some(1))?; // [1, V] BF16
+        MxArray::eval_arrays(&[&fold_weight_t, &fold_bias])?;
+        Ok((fold_weight_t, fold_bias))
     }
 
-    let refs: Vec<&MxArray> = fold_weight_chunks.iter().collect();
-    let fold_weight = MxArray::concatenate_many(refs, Some(0))?; // [V, R] BF16
-    let fold_weight_t = fold_weight.transpose(None)?; // [R, V] BF16
-    let fold_bias =
-        MxArray::from_float32(&fold_bias_f32, &[1, vocab_size as i64])?.astype(DType::BFloat16)?;
-    MxArray::eval_arrays(&[&fold_weight_t, &fold_bias])?;
-    Ok((fold_weight_t, fold_bias))
+    #[cfg(target_os = "macos")]
+    {
+        let proj_f32 = hidden_out_w.astype(DType::Float32)?.to_float32()?;
+        let bias_f32 = hidden_out_b.astype(DType::Float32)?.to_float32()?;
+        let proj_f64: Vec<f64> = proj_f32.iter().map(|&v| f64::from(v)).collect();
+        let bias_f64: Vec<f64> = bias_f32.iter().map(|&v| f64::from(v)).collect();
+
+        let mut fold_weight_chunks: Vec<MxArray> =
+            Vec::with_capacity(vocab_size.div_ceil(FOLD_CHUNK_ROWS));
+        let mut fold_bias_f32: Vec<f32> = Vec::with_capacity(vocab_size);
+        let mut chunk_head_f64: Vec<f64> = Vec::new();
+        let mut chunk_out_f64: Vec<f64> = Vec::new();
+        let mut chunk_out_f32: Vec<f32> = Vec::new();
+
+        let mut start = 0usize;
+        while start < vocab_size {
+            let end = (start + FOLD_CHUNK_ROWS).min(vocab_size);
+            let rows = end - start;
+
+            let head_slice = match target_lm_head {
+                LinearProj::Quantized(_) => target_lm_head
+                    .slice_rows(start as i64, end as i64)?
+                    .dequantized_weight()?
+                    .astype(DType::Float32)?,
+                LinearProj::Standard(lin) => lin
+                    .get_weight()
+                    .slice(&[start as i64, 0], &[end as i64, hidden_size as i64])?
+                    .astype(DType::Float32)?,
+            };
+            let head_f32 = head_slice.to_float32()?;
+            if head_f32.len() != rows * hidden_size {
+                return Err(Error::from_reason(format!(
+                    "fold_markov_head_f64: lm_head chunk [{start}..{end}) has {} elems, expected {}",
+                    head_f32.len(),
+                    rows * hidden_size
+                )));
+            }
+
+            chunk_head_f64.clear();
+            chunk_head_f64.extend(head_f32.iter().map(|&v| f64::from(v)));
+            drop(head_f32);
+            drop(head_slice);
+
+            // 1. `chunk_out_f64 = head_f64 [rows, H] @ proj_f64 [H, R]` -> `[rows, R]`
+            chunk_out_f64.resize(rows * rank, 0.0);
+            f64_gemm_nn(
+                rows,
+                rank,
+                hidden_size,
+                &chunk_head_f64,
+                &proj_f64,
+                &mut chunk_out_f64,
+            );
+
+            chunk_out_f32.clear();
+            chunk_out_f32.extend(chunk_out_f64.iter().map(|&v| v as f32));
+            let chunk_bf16 = MxArray::from_float32(&chunk_out_f32, &[rows as i64, rank as i64])?
+                .astype(DType::BFloat16)?;
+            chunk_bf16.eval();
+            fold_weight_chunks.push(chunk_bf16);
+
+            // 2. `fold_bias[start..end] = head_f64 [rows, H] @ bias_f64 [H]` -> `[rows]`
+            let mut bias_chunk_f64 = vec![0.0_f64; rows];
+            f64_gemv_n(
+                rows,
+                hidden_size,
+                &chunk_head_f64,
+                &bias_f64,
+                &mut bias_chunk_f64,
+            );
+            fold_bias_f32.extend(bias_chunk_f64.iter().map(|&v| v as f32));
+
+            start = end;
+        }
+
+        let refs: Vec<&MxArray> = fold_weight_chunks.iter().collect();
+        let fold_weight = MxArray::concatenate_many(refs, Some(0))?; // [V, R] BF16
+        let fold_weight_t = fold_weight.transpose(None)?; // [R, V] BF16
+        let fold_bias = MxArray::from_float32(&fold_bias_f32, &[1, vocab_size as i64])?
+            .astype(DType::BFloat16)?;
+        MxArray::eval_arrays(&[&fold_weight_t, &fold_bias])?;
+        Ok((fold_weight_t, fold_bias))
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -2832,22 +3098,6 @@ fn f64_gemm_nn(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]
     }
 }
 
-#[cfg(not(target_os = "macos"))]
-fn f64_gemm_nn(m: usize, n: usize, k: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
-    c.fill(0.0);
-    for i in 0..m {
-        let a_row = &a[i * k..(i + 1) * k];
-        let c_row = &mut c[i * n..(i + 1) * n];
-        for p in 0..k {
-            let av = a_row[p];
-            let b_row = &b[p * n..(p + 1) * n];
-            for j in 0..n {
-                c_row[j] += av * b_row[j];
-            }
-        }
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn f64_gemv_n(m: usize, k: usize, a: &[f64], x: &[f64], y: &mut [f64]) {
     const CBLAS_ROW_MAJOR: i32 = 101;
@@ -2868,18 +3118,6 @@ fn f64_gemv_n(m: usize, k: usize, a: &[f64], x: &[f64], y: &mut [f64]) {
             y.as_mut_ptr(),
             1,
         );
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn f64_gemv_n(m: usize, k: usize, a: &[f64], x: &[f64], y: &mut [f64]) {
-    for i in 0..m {
-        let a_row = &a[i * k..(i + 1) * k];
-        let mut acc = 0.0_f64;
-        for p in 0..k {
-            acc += a_row[p] * x[p];
-        }
-        y[i] = acc;
     }
 }
 
@@ -2984,8 +3222,54 @@ pub(crate) fn project_draft_lm_head_bf16(
             return super::kernels::inkling2_bf16_linear(hidden, &w_unpadded);
         }
     }
-    #[cfg(not(target_os = "macos"))]
-    let _ = unpadded_vocab_size;
+    // CUDA fast BF16 LM head (single pass up to `unpadded_vocab_size` for SymQ8 / AffineQ8 / BF16).
+    if crate::kernels::inkling2::sm80_available() && hidden.dtype()? == DType::BFloat16 {
+        let xs = hidden.shape()?;
+        if xs.len() == 2 && (1..=16).contains(&xs[0]) {
+            let unpadded_i32 = i32::try_from(unpadded_vocab_size).unwrap_or(i32::MAX);
+            let fast = match target_lm_head {
+                LinearProj::Quantized(ql)
+                    if ql.grouped_moe_plain_projection()
+                        && ql.mode() == DEFAULT_QUANT_MODE
+                        && ql.bits() == 8
+                        && ql.group_size() == 32 =>
+                {
+                    let biases = if ql.is_symmetric_q8() {
+                        None
+                    } else {
+                        ql.get_biases()
+                    };
+                    crate::kernels::inkling2::lm_head_softcap_cuda(
+                        hidden,
+                        ql.get_weight(),
+                        Some(ql.get_scales()),
+                        biases,
+                        unpadded_i32,
+                        0.0,
+                        crate::kernels::inkling2::LmHeadOutMode::LogitsBf16,
+                    )?
+                }
+                LinearProj::Standard(lin)
+                    if lin.get_bias().is_none() && lin.get_weight().dtype()? == DType::BFloat16 =>
+                {
+                    let w = lin.get_weight();
+                    crate::kernels::inkling2::lm_head_softcap_cuda(
+                        hidden,
+                        &w,
+                        None,
+                        None,
+                        unpadded_i32,
+                        0.0,
+                        crate::kernels::inkling2::LmHeadOutMode::LogitsBf16,
+                    )?
+                }
+                _ => None,
+            };
+            if let Some(res) = fast {
+                return Ok(res);
+            }
+        }
+    }
     let raw = super::attention::forward_linear_proj_fast(target_lm_head, hidden)?;
     if raw.dtype()? == DType::BFloat16 {
         Ok(raw)

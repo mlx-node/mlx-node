@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use mlx_paged_attn::CacheRecency;
 use napi::bindgen_prelude::{Error, Result};
 
-use crate::array::memory::{materialize_weights, synchronize_and_clear_cache};
+use crate::array::memory::{WeightsResident, materialize_weights, synchronize_and_clear_cache};
 use crate::array::{DType, MxArray};
 use crate::cache_limit;
 use crate::cold_tier::{CheckpointFiles, CheckpointLoadGuard};
@@ -39,7 +39,8 @@ use super::dspark::{Inkling2DsparkModel, resolve_inkling2_dspark_candidates};
 use super::kv_cache::{Inkling2KVCacheCoordinator, Inkling2PagedConfig};
 use super::memory::{
     Inkling2ContextLimits, evaluate_inkling2_plan, inkling2_scheduler_lanes, resolve_activations,
-    resolve_decode_share, resolve_kv_format, resolve_max_context, resolve_max_memory,
+    resolve_decode_share, resolve_effective_kv_format, resolve_kv_format, resolve_max_context,
+    resolve_max_memory,
 };
 use super::model::{
     AttnInputNorm, Inkling2Inner, Inkling2LoadOptions, Inkling2Model, Inkling2PhysicalLayer,
@@ -127,7 +128,8 @@ pub(crate) async fn load_model_with_options(
     let auto_load_draft = options.auto_load_draft.unwrap_or(true);
     let draft_is_explicit = explicit_draft_path.is_some();
     let disk_options = options.disk_tier("Inkling2")?;
-    let kv_format = resolve_kv_format("Inkling2", options.kv_format.as_deref())?;
+    let requested_kv_format = options.kv_format.clone();
+    let _ = resolve_kv_format("Inkling2", requested_kv_format.as_deref())?;
     let activations = resolve_activations("Inkling2", options.activations.as_deref())?;
     let max_memory_bytes = resolve_max_memory("Inkling2", options.max_memory_bytes)?;
     let decode_share = resolve_decode_share("Inkling2", options.decode_share)?;
@@ -154,17 +156,33 @@ pub(crate) async fn load_model_with_options(
             (Some(checkpoint.preload_input(true)), companion_meta, true)
         }
     };
-    let draft_candidates = if draft_is_explicit {
-        resolve_inkling2_dspark_candidates(
-            &source_dir,
-            &asset_dir,
-            is_gguf,
-            explicit_draft_path.as_deref(),
-        )?
+    let (explicit_dflash2_dir, draft_candidates) = if let Some(ref raw) = explicit_draft_path {
+        let trimmed = raw.trim();
+        let path = Path::new(trimmed);
+        if !trimmed.is_empty()
+            && !trimmed.eq_ignore_ascii_case("none")
+            && !trimmed.eq_ignore_ascii_case("off")
+            && super::cuda_spec::is_dflash2_draft_dir(path)
+        {
+            (Some(path.to_path_buf()), Vec::new())
+        } else {
+            (
+                None,
+                resolve_inkling2_dspark_candidates(
+                    &source_dir,
+                    &asset_dir,
+                    is_gguf,
+                    Some(trimmed),
+                )?,
+            )
+        }
     } else if auto_load_draft {
-        resolve_inkling2_dspark_candidates(&source_dir, &asset_dir, is_gguf, None)?
+        (
+            None,
+            resolve_inkling2_dspark_candidates(&source_dir, &asset_dir, is_gguf, None)?,
+        )
     } else {
-        Vec::new()
+        (None, Vec::new())
     };
 
     struct InitMeta {
@@ -197,7 +215,36 @@ pub(crate) async fn load_model_with_options(
                 gguf_vision_meta.as_ref(),
                 is_gguf,
             )?;
-            if !draft_candidates.is_empty() {
+            let metal_paged = crate::engine::persistence::compiled_forward_backend_available();
+            let cuda_fast = !metal_paged && inner.use_cuda_fast();
+            let (kv_format, cuda_kv_format) = resolve_effective_kv_format(
+                "Inkling2",
+                requested_kv_format.as_deref(),
+                metal_paged,
+                cuda_fast,
+            )?;
+            inner.cuda_kv_format = cuda_kv_format;
+            if let Some(ref dflash2_dir) = explicit_dflash2_dir {
+                if metal_paged || !inner.use_cuda_fast() {
+                    return Err(Error::from_reason(
+                        "Inkling2 DFlash2 draft companions require the CUDA fast backend (use a DSpark draft on Metal)",
+                    ));
+                }
+                let t_draft = std::time::Instant::now();
+                let draft = super::cuda_spec::load_inkling2_dflash2(dflash2_dir, &inner.config)?;
+                tracing::info!(
+                    "Inkling2 DFlash2 loaded from {} in {:.2}s (block_size={}, taps={:?}, weights={:.1} MiB)",
+                    dflash2_dir.display(),
+                    t_draft.elapsed().as_secs_f64(),
+                    draft.config.block_size,
+                    draft.config.target_layers,
+                    draft.weight_bytes as f64 / (1024.0 * 1024.0),
+                );
+                inner.dflash2 = Some(draft);
+            } else if !draft_candidates.is_empty() {
+                // Promote `lm_head` to CUDA GPU memory before folding the DSpark Markov head
+                // so chunked FP32 matmul reads `lm_head` straight from device memory.
+                inner.lm_head.ensure_cuda_device()?;
                 let mut last_err: Option<Error> = None;
                 for draft_path in &draft_candidates {
                     let t_draft = std::time::Instant::now();
@@ -235,9 +282,7 @@ pub(crate) async fn load_model_with_options(
                 }
             }
             load_guard.record_read();
-            let weight_arrays = inner.weight_arrays();
-            let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-            let resident = materialize_weights(&weight_refs)?;
+            let resident = materialize_and_promote_weights(&mut inner)?;
             let weight_bytes = inner.weight_bytes();
             synchronize_and_clear_cache();
 
@@ -374,7 +419,7 @@ pub(crate) async fn load_model_with_options(
                 paged_active: inner.paged.is_some(),
                 scheduled_lanes,
                 vision_active: inner.vision_encoder.is_some(),
-                dspark_active: inner.dspark.is_some(),
+                dspark_active: inner.has_mtp_weights(),
                 context_limits,
                 state_tier,
                 weight_guard,
@@ -444,13 +489,30 @@ fn load_sync(
             Arc::clone(&model.cache_recency),
         )?);
     }
+    if !model.use_cuda_fast() {
+        model.cuda_kv_format = super::cuda_kv::Inkling2CudaKvFormat::Bf16;
+    }
 
-    // Materialize all weights cleanly without Metal watchdog timeout.
-    let weight_arrays = model.weight_arrays();
-    let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-    let _resident = materialize_weights(&weight_refs)?;
+    // Materialize all weights cleanly without Metal watchdog timeout, dropping
+    // cloned host-backed handles before promoting weights to CUDA device memory.
+    let _resident = materialize_and_promote_weights(&mut model)?;
+    synchronize_and_clear_cache();
 
     Ok(model)
+}
+
+/// Materialize all resident weights and immediately drop the temporary cloned
+/// `MxArray` handles before calling `ensure_cuda_device_weights()` so old
+/// host-backed buffers can be freed incrementally during promotion instead of
+/// holding both host and device copies simultaneously (~2x peak load RAM).
+fn materialize_and_promote_weights(inner: &mut Inkling2Inner) -> Result<WeightsResident> {
+    let resident = {
+        let weight_arrays = inner.weight_arrays();
+        let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
+        materialize_weights(&weight_refs)?
+    };
+    inner.ensure_cuda_device_weights()?;
+    Ok(resident)
 }
 
 fn load_weights_sync(
@@ -601,6 +663,12 @@ fn load_weights_sync(
         None
     };
 
+    let cuda_kv_format = if super::cuda_forward::cuda_fast_supported_for(&config) {
+        super::cuda_kv::Inkling2CudaKvFormat::resolve(None)
+    } else {
+        super::cuda_kv::Inkling2CudaKvFormat::Bf16
+    };
+
     let model = Inkling2Inner {
         config,
         embed_tokens,
@@ -613,10 +681,17 @@ fn load_weights_sync(
         vision_encoder,
         tokenizer,
         dspark: None,
+        dflash2: None,
         dspark_turn_contexts: HashMap::new(),
+        cuda_dflash2_ctx: None,
+        cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+        cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+        cuda_dspark_ctx: None,
         scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
         paged: None,
         flat_cache: None,
+        cuda_cache: None,
+        cuda_kv_format,
         cached_token_history: Vec::new(),
         cached_image_key: None,
         turn_cancel: None,
@@ -734,9 +809,12 @@ fn build_physical_layer(
     let sink_proj = load_proj("sink_proj", d, n_heads)?;
     let o_proj = load_proj("o_proj", q_dim, d)?;
 
-    let k_conv = require_tensor(params, &format!("{prefix}.self_attn.k_conv.weight"))?;
-    let v_conv = require_tensor(params, &format!("{prefix}.self_attn.v_conv.weight"))?;
-    let post_conv = require_tensor(params, &format!("{prefix}.self_attn.post_conv.weight"))?;
+    let k_conv = require_tensor(params, &format!("{prefix}.self_attn.k_conv.weight"))?
+        .astype(DType::Float32)?;
+    let v_conv = require_tensor(params, &format!("{prefix}.self_attn.v_conv.weight"))?
+        .astype(DType::Float32)?;
+    let post_conv = require_tensor(params, &format!("{prefix}.self_attn.post_conv.weight"))?
+        .astype(DType::Float32)?;
 
     let (k_conv_proj, v_conv_proj) = if !is_local {
         let dyn_out = n_kv * config.sconv_kernel_size;
@@ -838,7 +916,10 @@ fn build_physical_layer(
     // falling back to BF16 sidecar hoisting for non-symmetric affine Q8_0.
     gate_up_proj.try_compact_symmetric_q8_or_promote_bf16()?;
     down_proj.try_compact_symmetric_q8_or_promote_bf16()?;
-    let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?;
+    gate_up_proj.promote_outer_scale_to_f32()?;
+    down_proj.promote_outer_scale_to_f32()?;
+    let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?
+        .astype(DType::Float32)?;
     let moe = Inkling2MoE::new(
         config.num_experts,
         config.num_experts_per_tok,
@@ -1652,5 +1733,86 @@ mod tests {
             mm_parser.content(),
             mm_raw
         );
+    }
+
+    #[test]
+    fn materialize_and_promote_weights_drops_host_clones_and_promotes_to_device() {
+        let hidden = 16usize;
+        let vocab = 32usize;
+        let cfg_raw = serde_json::json!({
+            "model_type": "inkling2",
+            "hidden_size": hidden,
+            "num_hidden_layers": 1,
+            "num_physical_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": vocab,
+            "sliding_window": 16,
+            "n_layers_per_attn_res_block": 1
+        })
+        .to_string();
+        let config = Inkling2Config::from_json_str(&cfg_raw, true).unwrap();
+
+        let (embed_w, _, _) =
+            MxArray::alloc_uninit(&[vocab as i64, hidden as i64], DType::BFloat16).unwrap();
+        let (embed_norm, _, _) = MxArray::alloc_uninit(&[hidden as i64], DType::Float32).unwrap();
+        let (output_res_query, _, _) =
+            MxArray::alloc_uninit(&[1, hidden as i64], DType::Float32).unwrap();
+        let output_res_query_t = output_res_query.transpose(None).unwrap();
+        let (output_norm, _, _) = MxArray::alloc_uninit(&[hidden as i64], DType::Float32).unwrap();
+        let (lm_w, _, _) =
+            MxArray::alloc_uninit(&[vocab as i64, hidden as i64], DType::BFloat16).unwrap();
+
+        let mut inner = Inkling2Inner {
+            config,
+            embed_tokens: Embedding::from_weight(&embed_w).unwrap(),
+            embed_norm,
+            layers: Vec::new(),
+            output_res_query,
+            output_res_query_t,
+            output_norm,
+            lm_head: LinearProj::Standard(Linear::from_weights(&lm_w, None).unwrap()),
+            vision_encoder: None,
+            tokenizer: None,
+            dspark: None,
+            dflash2: None,
+            dspark_turn_contexts: HashMap::new(),
+            cuda_dflash2_ctx: None,
+            cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+            cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+            cuda_dspark_ctx: None,
+            scheduled_dspark:
+                super::super::scheduled_dspark::Inkling2ScheduledDsparkStates::default(),
+            paged: None,
+            flat_cache: None,
+            cuda_cache: None,
+            cuda_kv_format: super::super::cuda_kv::Inkling2CudaKvFormat::Bf16,
+            cached_token_history: Vec::new(),
+            cached_image_key: None,
+            turn_cancel: None,
+            model_id: next_inkling2_model_id(),
+            memory_plan: None,
+            memory_registration: None,
+            wired: None,
+            cache_recency: Arc::new(CacheRecency::new()),
+            decode_share: default_decode_share(),
+            max_context: None,
+            activations: Activations::Auto,
+            disk_options: DiskTierOptions::default(),
+            prefill_runs: HashMap::new(),
+        };
+        drop(embed_w);
+        drop(lm_w);
+
+        let resident = materialize_and_promote_weights(&mut inner).unwrap();
+        assert!(resident.arrays() > 0);
+        assert!(resident.bytes() > 0);
+        if crate::accelerator::cuda_ops_available() {
+            assert_eq!(inner.embed_norm.cuda_host_bytes(), 0);
+            assert_eq!(inner.output_res_query.cuda_host_bytes(), 0);
+            assert_eq!(inner.output_norm.cuda_host_bytes(), 0);
+            assert_eq!(inner.lm_head.get_weight().cuda_host_bytes(), 0);
+        }
     }
 }

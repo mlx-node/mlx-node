@@ -2,7 +2,7 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use rand::{Rng, RngExt};
 
-use super::spanned_head::remap_spanned_candidate_ids;
+use super::spanned_head::{SpannedVocabLayout, remap_spanned_candidate_ids};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::Embedding;
@@ -15,6 +15,21 @@ pub(super) struct CandidateSelector {
     pub(super) top_k: usize,
     pub(super) rank: usize,
     pub(super) vocab_size: usize,
+    pub(super) valid_vocab_size: Option<usize>,
+    pub(super) post_softcap: Option<f32>,
+}
+
+/// Apply post-correction logit softcap `softcap * tanh(score / softcap)` on
+/// FP32 edge scores, preserving `-inf` entries (matching Splash
+/// `sampling.metal:1670-1675`). Identity when `softcap <= 0.0`.
+pub(super) fn apply_post_edge_softcap(scores: &MxArray, softcap: f32) -> Result<MxArray> {
+    if !softcap.is_finite() || softcap <= 0.0 {
+        return Ok(scores.clone());
+    }
+    let cap = f64::from(softcap);
+    let capped = scores.div_scalar(cap)?.tanh()?.mul_scalar(cap)?;
+    let neg_inf = MxArray::from_float32(&[f32::NEG_INFINITY], &[1])?;
+    scores.greater(&neg_inf)?.where_(&capped, scores)
 }
 
 pub(super) fn normalized_selector_probs(scores: &[f32], temperature: f64) -> Result<Vec<f64>> {
@@ -138,7 +153,12 @@ impl CandidateSelector {
         // lossless, so casting back restores bit-parity: `scores`' add then
         // runs in the model dtype instead of promoting to f32 before the
         // final astype — a different rounding that flips near-tie picks.
-        let values = values.astype(logits.dtype().ok()?).ok()?;
+        let logits_dtype = logits.dtype().ok()?;
+        let values = if values.dtype().ok()? == logits_dtype {
+            values
+        } else {
+            values.astype(logits_dtype).ok()?
+        };
         let dims = [1, shape[1], self.top_k as i64];
         Some((ids.reshape(&dims).ok()?, values.reshape(&dims).ok()?))
     }
@@ -218,7 +238,7 @@ impl CandidateSelector {
             anchor,
             temperature,
             device_path,
-            false,
+            None,
             confidence,
             rng,
         )
@@ -232,7 +252,7 @@ impl CandidateSelector {
         anchor: u32,
         temperature: f64,
         device_path: bool,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
@@ -243,10 +263,14 @@ impl CandidateSelector {
             &anchor_ids,
             temperature,
             device_path,
-            spanned,
+            spanned_layout,
             confidence,
             rng,
         )
+    }
+
+    fn effective_valid_vocab_size(&self) -> usize {
+        self.valid_vocab_size.unwrap_or(self.vocab_size)
     }
 
     /// Compute top-K candidate vocabulary IDs (`[1, L, K]` Int32) and
@@ -256,17 +280,27 @@ impl CandidateSelector {
         hidden: &MxArray,
         logits: &MxArray,
         anchor_ids: &MxArray,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
     ) -> Result<(MxArray, MxArray)> {
         let length = hidden.shape_at(1)? as usize;
-        let (candidates, unary) = match self.fused_topk16(logits) {
+        let sliced_logits;
+        let effective_logits = if spanned_layout.is_none()
+            && let Some(valid_vocab) = self.valid_vocab_size
+            && (valid_vocab as i64) < logits.shape_at(2)?
+        {
+            sliced_logits = logits.slice_axis(2, 0, valid_vocab as i64)?;
+            &sliced_logits
+        } else {
+            logits
+        };
+        let (candidates, unary) = match self.fused_topk16(effective_logits) {
             Some((ids, values)) => (ids, values),
             None => {
-                let vocab = logits.shape_at(2)?;
-                let candidates = logits
+                let vocab = effective_logits.shape_at(2)?;
+                let candidates = effective_logits
                     .argpartition(-(self.top_k as i32), Some(-1))?
                     .slice_axis(2, vocab - self.top_k as i64, vocab)?;
-                let unary = logits.take_along_axis(&candidates, -1)?;
+                let unary = effective_logits.take_along_axis(&candidates, -1)?;
                 (candidates, unary)
             }
         };
@@ -276,8 +310,8 @@ impl CandidateSelector {
             self.rank as i64,
         ])?;
         let candidates = candidates.astype(DType::Int32)?;
-        let candidates = if spanned {
-            remap_spanned_candidate_ids(&candidates)?
+        let candidates = if let Some(layout) = spanned_layout {
+            remap_spanned_candidate_ids(&candidates, layout)?
         } else {
             candidates
         };
@@ -293,13 +327,13 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         temperature: f64,
         device_path: bool,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let length = hidden.shape_at(1)? as usize;
         let (candidates, scores) =
-            self.select_lattice_arrays(hidden, logits, anchor_ids, spanned)?;
+            self.select_lattice_arrays(hidden, logits, anchor_ids, spanned_layout)?;
 
         let greedy = is_greedy_temperature(temperature);
         if greedy && device_path {
@@ -319,10 +353,11 @@ impl CandidateSelector {
             };
             return Ok((SelectorPath::Device(path), Vec::new()));
         }
+        let effective_vocab = self.effective_valid_vocab_size();
         if !greedy
             && device_path
             && let Some(path) =
-                device_sampled_path(&candidates, &scores, self.vocab_size, temperature, rng)
+                device_sampled_path(&candidates, &scores, effective_vocab, temperature, rng)
         {
             return Ok((path, Vec::new()));
         }
@@ -349,7 +384,7 @@ impl CandidateSelector {
                 rows.push(SparseDistribution::from_parts(
                     candidate_ids[support_start..support_start + self.top_k].to_vec(),
                     probs.clone(),
-                    self.vocab_size,
+                    effective_vocab,
                 )?);
                 sample_selector_index(&probs, rng)
             };
@@ -368,6 +403,7 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         length: usize,
     ) -> Result<MxArray> {
+        let softcap = self.post_softcap.filter(|&c| c > 0.0).unwrap_or(0.0);
         let use_cuda = crate::accelerator::cuda_ops_available();
         let use_metal = !use_cuda
             && std::env::var("MLX_DFLASH2_SELECTOR_EDGES_FP32").is_ok_and(|v| v == "1")
@@ -375,25 +411,37 @@ impl CandidateSelector {
         if self.top_k == 16 && self.rank == 256 && (use_cuda || use_metal) {
             let predecessor = self.predecessor_codebook.get_weight();
             let successor = self.successor_codebook.get_weight();
-            let unary_arg;
-            let unary_ref = if use_cuda {
-                unary
+            if use_cuda {
+                let scores = unsafe {
+                    sys::mlx_dflash2_selector_edges_cuda_softcap(
+                        candidates.as_raw_ptr(),
+                        unary.as_raw_ptr(),
+                        projected.as_raw_ptr(),
+                        predecessor.as_raw_ptr(),
+                        successor.as_raw_ptr(),
+                        anchor_ids.as_raw_ptr(),
+                        softcap,
+                    )
+                };
+                if !scores.is_null() {
+                    return MxArray::from_handle(scores, "dflash2_selector_edges");
+                }
             } else {
-                unary_arg = unary.astype(DType::Float32)?;
-                &unary_arg
-            };
-            let scores = unsafe {
-                sys::mlx_dflash2_selector_edges(
-                    candidates.as_raw_ptr(),
-                    unary_ref.as_raw_ptr(),
-                    projected.as_raw_ptr(),
-                    predecessor.as_raw_ptr(),
-                    successor.as_raw_ptr(),
-                    anchor_ids.as_raw_ptr(),
-                )
-            };
-            if !scores.is_null() {
-                return MxArray::from_handle(scores, "dflash2_selector_edges");
+                let unary_arg = unary.astype(DType::Float32)?;
+                let scores = unsafe {
+                    sys::mlx_dflash2_selector_edges(
+                        candidates.as_raw_ptr(),
+                        unary_arg.as_raw_ptr(),
+                        projected.as_raw_ptr(),
+                        predecessor.as_raw_ptr(),
+                        successor.as_raw_ptr(),
+                        anchor_ids.as_raw_ptr(),
+                    )
+                };
+                if !scores.is_null() {
+                    let scores = MxArray::from_handle(scores, "dflash2_selector_edges")?;
+                    return apply_post_edge_softcap(&scores, softcap);
+                }
             }
         }
         let candidate_flat = candidates.reshape(&[(length * self.top_k) as i64])?;
@@ -423,7 +471,9 @@ impl CandidateSelector {
         let edges = predecessors
             .mul(projected)?
             .matmul(&successors.transpose(Some(&[0, 2, 1]))?)?;
-        let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
-        scores.astype(DType::Float32)
+        let scores = edges
+            .add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?
+            .astype(DType::Float32)?;
+        apply_post_edge_softcap(&scores, softcap)
     }
 }

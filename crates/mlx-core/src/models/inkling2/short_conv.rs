@@ -31,6 +31,15 @@ impl VisitShortConvState {
             mlp_post: MxArray::zeros(&[h, d], Some(dtype))?,
         })
     }
+
+    pub(crate) fn promote_cuda_device(&mut self) -> Result<usize> {
+        let mut promoted = 0usize;
+        promoted += self.k.promote_cuda_device()?;
+        promoted += self.v.promote_cuda_device()?;
+        promoted += self.attn_post.promote_cuda_device()?;
+        promoted += self.mlp_post.promote_cuda_device()?;
+        Ok(promoted)
+    }
 }
 
 /// Collection of per-visit ShortConv states across all logical visits (48 for Inkling-2-Mini).
@@ -67,6 +76,14 @@ impl Inkling2ShortConvState {
             visits,
             kernel_size,
         })
+    }
+
+    pub(crate) fn promote_cuda_device(&mut self) -> Result<usize> {
+        let mut promoted = 0usize;
+        for visit in &mut self.visits {
+            promoted += visit.promote_cuda_device()?;
+        }
+        Ok(promoted)
     }
 }
 
@@ -301,6 +318,63 @@ impl StreamShortConvTape {
         };
         MxArray::concatenate(&hist_cast, &rows_head, 0)
     }
+
+    /// Compute the exact `[history_len, C]` rolling ShortConv history after accepting an
+    /// arbitrary tree path `accepted_nodes` (ordered oldest-to-newest along the winning branch).
+    ///
+    /// When `is_contiguous` is `true` (meaning `accepted_nodes == [0, 1, ..., keep - 1]`),
+    /// delegates to the zero-gather [`Self::commit_prefix`] fast path.
+    pub fn commit_tree(&self, accepted_nodes: &[u32], is_contiguous: bool) -> Result<MxArray> {
+        if is_contiguous {
+            return self.commit_prefix(accepted_nodes.len());
+        }
+        let hist_len = self.hist_before.shape()?[0] as usize;
+        let total_rows = self.rows.shape()?[0] as usize;
+        let c = self.rows.shape()?[1];
+        let keep = accepted_nodes.len();
+        if keep == 0 {
+            return Ok(self.hist_before.clone());
+        }
+        for &node in accepted_nodes {
+            if (node as usize) >= total_rows {
+                return Err(Error::from_reason(format!(
+                    "StreamShortConvTape::commit_tree: node index {node} out of range (rows={total_rows})"
+                )));
+            }
+        }
+        if keep >= hist_len {
+            let tail = &accepted_nodes[keep - hist_len..keep];
+            let mut idx_i32 = Vec::with_capacity(hist_len);
+            for &node in tail {
+                idx_i32.push(i32::try_from(node).map_err(|_| {
+                    Error::from_reason(format!(
+                        "StreamShortConvTape::commit_tree: node index {node} exceeds i32::MAX"
+                    ))
+                })?);
+            }
+            let idx = MxArray::from_int32(&idx_i32, &[hist_len as i64])?;
+            return self.rows.take(&idx, 0);
+        }
+        let hist_tail = self
+            .hist_before
+            .slice(&[keep as i64, 0], &[hist_len as i64, c])?;
+        let mut idx_i32 = Vec::with_capacity(keep);
+        for &node in accepted_nodes {
+            idx_i32.push(i32::try_from(node).map_err(|_| {
+                Error::from_reason(format!(
+                    "StreamShortConvTape::commit_tree: node index {node} exceeds i32::MAX"
+                ))
+            })?);
+        }
+        let idx = MxArray::from_int32(&idx_i32, &[keep as i64])?;
+        let rows_sel = self.rows.take(&idx, 0)?;
+        let hist_cast = if hist_tail.dtype()? != rows_sel.dtype()? {
+            hist_tail.astype(rows_sel.dtype()?)?
+        } else {
+            hist_tail
+        };
+        MxArray::concatenate(&hist_cast, &rows_sel, 0)
+    }
 }
 
 /// Per-visit ShortConv rollback tape across all 4 streams (`k`, `v`, `attn_post`, `mlp_post`).
@@ -337,12 +411,118 @@ impl VisitShortConvTape {
         }
         Ok(())
     }
+
+    pub fn commit_tree(
+        &self,
+        accepted_nodes: &[u32],
+        is_contiguous: bool,
+        dst: &mut VisitShortConvState,
+    ) -> Result<()> {
+        if let Some(ref t) = self.k {
+            dst.k = t.commit_tree(accepted_nodes, is_contiguous)?;
+        }
+        if let Some(ref t) = self.v {
+            dst.v = t.commit_tree(accepted_nodes, is_contiguous)?;
+        }
+        if let Some(ref t) = self.attn_post {
+            dst.attn_post = t.commit_tree(accepted_nodes, is_contiguous)?;
+        }
+        if let Some(ref t) = self.mlp_post {
+            dst.mlp_post = t.commit_tree(accepted_nodes, is_contiguous)?;
+        }
+        Ok(())
+    }
 }
 
 /// Complete 48-visit ShortConv rollback tape for one speculative verify cycle.
 #[derive(Clone)]
 pub struct Inkling2ShortConvTape {
     pub visits: Vec<VisitShortConvTape>,
+}
+
+/// Batch-commit a homogeneous channel-width group of `k=4` ShortConv rollback tapes on CUDA
+/// (`<= 96` streams per single kernel launch -> guarantees contiguous `[3, C]` BF16 outputs with
+/// zero `copy_g_nd` or per-stream gathers). Returns `Ok(false)` off CUDA or on non-uniform /
+/// non-BF16 inputs so callers fall back cleanly per stream.
+fn try_commit_stream_group_cuda(
+    streams: &mut [(&StreamShortConvTape, &mut MxArray)],
+    nodes_arr: Option<&MxArray>,
+    accepted_nodes: Option<&[u32]>,
+    contiguous_keep: usize,
+) -> Result<bool> {
+    if !crate::kernels::inkling2::available() || streams.is_empty() {
+        return Ok(false);
+    }
+    let first_h = streams[0].0.hist_before.shape()?;
+    let first_r = streams[0].0.rows.shape()?;
+    if first_h.len() != 2
+        || first_r.len() != 2
+        || first_h[0] != 3
+        || first_h[1] < 1
+        || first_r[0] < 1
+        || first_r[1] != first_h[1]
+    {
+        return Ok(false);
+    }
+    let expected_c = first_h[1];
+    let expected_t = first_r[0];
+    let expected_t_usize = expected_t as usize;
+
+    // Validate bounds BEFORE launching CUDA so invalid indices error identically to the CPU path.
+    if let Some(nodes) = accepted_nodes {
+        for &node in nodes {
+            if (node as usize) >= expected_t_usize {
+                return Err(Error::from_reason(format!(
+                    "StreamShortConvTape::commit_tree: node index {node} out of range (rows={expected_t_usize})"
+                )));
+            }
+        }
+    } else if contiguous_keep > expected_t_usize {
+        return Err(Error::from_reason(format!(
+            "StreamShortConvTape::commit_prefix: keep={contiguous_keep} exceeds verified rows={expected_t_usize}"
+        )));
+    }
+
+    for (tape, _) in streams.iter() {
+        let hs = tape.hist_before.shape()?;
+        let rs = tape.rows.shape()?;
+        if hs.len() != 2
+            || rs.len() != 2
+            || hs[0] != 3
+            || hs[1] != expected_c
+            || rs[0] != expected_t
+            || rs[1] != expected_c
+            || tape.hist_before.dtype()? != DType::BFloat16
+            || tape.rows.dtype()? != DType::BFloat16
+        {
+            return Ok(false);
+        }
+    }
+
+    const MAX_CHUNK: usize = 96;
+    let mut new_hists: Vec<MxArray> = Vec::with_capacity(streams.len());
+    for chunk in streams.chunks(MAX_CHUNK) {
+        let h_refs: Vec<&MxArray> = chunk.iter().map(|(t, _)| &t.hist_before).collect();
+        let r_refs: Vec<&MxArray> = chunk.iter().map(|(t, _)| &t.rows).collect();
+        let Some(outs) = crate::kernels::inkling2::commit_short_conv_tapes_cuda(
+            &h_refs,
+            &r_refs,
+            nodes_arr,
+            contiguous_keep,
+        )?
+        else {
+            return Ok(false);
+        };
+        if outs.len() != chunk.len() {
+            return Ok(false);
+        }
+        new_hists.extend(outs);
+    }
+
+    for ((_, dst), hist) in streams.iter_mut().zip(new_hists) {
+        **dst = hist;
+    }
+    Ok(true)
 }
 
 impl Inkling2ShortConvTape {
@@ -355,6 +535,10 @@ impl Inkling2ShortConvTape {
     }
 
     /// Commit ONLY the accepted prefix (`0..=verify_rows`) into `state` across all 48 visits.
+    ///
+    /// On CUDA (`kernel_size == 4`), batches all `k` + `v` (`C=1024`, 96 streams) into 1 launch
+    /// and all `attn_post` + `mlp_post` (`C=2304`, 96 streams) into 1 launch — guaranteeing
+    /// contiguous `[3, C]` histories with zero `copy_g_nd` on the next step.
     pub fn commit_prefix(&self, keep: usize, state: &mut Inkling2ShortConvState) -> Result<()> {
         if self.visits.len() != state.visits.len() {
             return Err(Error::from_reason(format!(
@@ -363,8 +547,124 @@ impl Inkling2ShortConvTape {
                 state.visits.len()
             )));
         }
+        if crate::kernels::inkling2::available() && state.kernel_size == 4 {
+            let mut kv_streams: Vec<(&StreamShortConvTape, &mut MxArray)> =
+                Vec::with_capacity(self.visits.len() * 2);
+            let mut hidden_streams: Vec<(&StreamShortConvTape, &mut MxArray)> =
+                Vec::with_capacity(self.visits.len() * 2);
+            for (tape_v, state_v) in self.visits.iter().zip(state.visits.iter_mut()) {
+                if let Some(ref t) = tape_v.k {
+                    kv_streams.push((t, &mut state_v.k));
+                }
+                if let Some(ref t) = tape_v.v {
+                    kv_streams.push((t, &mut state_v.v));
+                }
+                if let Some(ref t) = tape_v.attn_post {
+                    hidden_streams.push((t, &mut state_v.attn_post));
+                }
+                if let Some(ref t) = tape_v.mlp_post {
+                    hidden_streams.push((t, &mut state_v.mlp_post));
+                }
+            }
+            if !kv_streams.is_empty()
+                && !try_commit_stream_group_cuda(&mut kv_streams, None, None, keep)?
+            {
+                for (t, dst) in kv_streams {
+                    *dst = t.commit_prefix(keep)?;
+                }
+            }
+            if !hidden_streams.is_empty()
+                && !try_commit_stream_group_cuda(&mut hidden_streams, None, None, keep)?
+            {
+                for (t, dst) in hidden_streams {
+                    *dst = t.commit_prefix(keep)?;
+                }
+            }
+            return Ok(());
+        }
         for (tape_v, state_v) in self.visits.iter().zip(state.visits.iter_mut()) {
             tape_v.commit_prefix(keep, state_v)?;
+        }
+        Ok(())
+    }
+
+    /// Commit an arbitrary accepted tree path `accepted_nodes` into `state` across all 48 visits.
+    ///
+    /// On CUDA (`kernel_size == 4`), batches all 96 `k`/`v` streams into 1 launch and all 96
+    /// `attn_post`/`mlp_post` streams into 1 launch (both contiguous prefix & non-contiguous
+    /// tree branches), eliminating 196 gather kernels + 40 `copy_g_nd` copies.
+    pub fn commit_tree(
+        &self,
+        accepted_nodes: &[u32],
+        is_contiguous: bool,
+        state: &mut Inkling2ShortConvState,
+    ) -> Result<()> {
+        if self.visits.len() != state.visits.len() {
+            return Err(Error::from_reason(format!(
+                "Inkling2ShortConvTape visit count mismatch: tape={} state={}",
+                self.visits.len(),
+                state.visits.len()
+            )));
+        }
+        if is_contiguous || accepted_nodes.is_empty() {
+            return self.commit_prefix(accepted_nodes.len(), state);
+        }
+        if crate::kernels::inkling2::available() && state.kernel_size == 4 {
+            let mut idx_i32 = Vec::with_capacity(accepted_nodes.len());
+            for &node in accepted_nodes {
+                idx_i32.push(i32::try_from(node).map_err(|_| {
+                    Error::from_reason(format!(
+                        "StreamShortConvTape::commit_tree: node index {node} exceeds i32::MAX"
+                    ))
+                })?);
+            }
+            let nodes_arr = MxArray::from_int32(&idx_i32, &[idx_i32.len() as i64])?;
+            let mut kv_streams: Vec<(&StreamShortConvTape, &mut MxArray)> =
+                Vec::with_capacity(self.visits.len() * 2);
+            let mut hidden_streams: Vec<(&StreamShortConvTape, &mut MxArray)> =
+                Vec::with_capacity(self.visits.len() * 2);
+            for (tape_v, state_v) in self.visits.iter().zip(state.visits.iter_mut()) {
+                if let Some(ref t) = tape_v.k {
+                    kv_streams.push((t, &mut state_v.k));
+                }
+                if let Some(ref t) = tape_v.v {
+                    kv_streams.push((t, &mut state_v.v));
+                }
+                if let Some(ref t) = tape_v.attn_post {
+                    hidden_streams.push((t, &mut state_v.attn_post));
+                }
+                if let Some(ref t) = tape_v.mlp_post {
+                    hidden_streams.push((t, &mut state_v.mlp_post));
+                }
+            }
+            if !kv_streams.is_empty()
+                && !try_commit_stream_group_cuda(
+                    &mut kv_streams,
+                    Some(&nodes_arr),
+                    Some(accepted_nodes),
+                    0,
+                )?
+            {
+                for (t, dst) in kv_streams {
+                    *dst = t.commit_tree(accepted_nodes, false)?;
+                }
+            }
+            if !hidden_streams.is_empty()
+                && !try_commit_stream_group_cuda(
+                    &mut hidden_streams,
+                    Some(&nodes_arr),
+                    Some(accepted_nodes),
+                    0,
+                )?
+            {
+                for (t, dst) in hidden_streams {
+                    *dst = t.commit_tree(accepted_nodes, false)?;
+                }
+            }
+            return Ok(());
+        }
+        for (tape_v, state_v) in self.visits.iter().zip(state.visits.iter_mut()) {
+            tape_v.commit_tree(accepted_nodes, is_contiguous, state_v)?;
         }
         Ok(())
     }
@@ -983,5 +1283,160 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_short_conv_tape_commit_tree_matches_branch_execution() {
+        let c = 6usize;
+        let hist_len = 3usize;
+        let verify_rows = 8usize;
+
+        let init_hist_vals: Vec<f32> = (0..(hist_len * c))
+            .map(|i| -10.0 - i as f32 * 0.25)
+            .collect();
+        let x_vals: Vec<f32> = (0..(verify_rows * c))
+            .map(|i| 1.0 + i as f32 * 0.5)
+            .collect();
+        let w_vals: Vec<f32> = (0..(c * 4)).map(|i| (i % 5) as f32 * 0.1).collect();
+
+        let init_hist = MxArray::from_float32(&init_hist_vals, &[hist_len as i64, c as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let rows = MxArray::from_float32(&x_vals, &[verify_rows as i64, c as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let w = MxArray::from_float32(&w_vals, &[c as i64, 4]).unwrap();
+
+        let tape = StreamShortConvTape {
+            hist_before: init_hist.clone(),
+            rows: rows.clone(),
+        };
+
+        let cases: &[(&[u32], bool)] = &[
+            (&[], false),
+            (&[0, 1, 2], true),
+            (&[0, 1, 2, 3], true),
+            (&[0], false),
+            (&[0, 3], false),
+            (&[0, 2, 5], false),
+            (&[0, 2, 5, 7], false),
+            (&[1, 4, 6, 7], false),
+        ];
+
+        for &(path, is_contiguous) in cases {
+            let mut ref_hist = init_hist.clone();
+            for &node in path {
+                let row = rows
+                    .slice(&[node as i64, 0], &[node as i64 + 1, c as i64])
+                    .unwrap();
+                let _ = static_short_conv(&row, &w, &mut ref_hist).unwrap();
+            }
+            let got = tape
+                .commit_tree(path, is_contiguous)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            let exp = ref_hist
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            assert_eq!(got.len(), exp.len());
+            for (idx, (a, b)) in got.iter().zip(exp.iter()).enumerate() {
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "path={path:?} idx={idx}: got {a} != exp {b}"
+                );
+            }
+        }
+
+        assert!(tape.commit_tree(&[0, 8], false).is_err());
+    }
+
+    #[test]
+    fn test_full_48_visit_tape_batched_commit_prefix_and_tree_parity() {
+        let num_visits = 48usize;
+        let kv_dim = 16usize;
+        let hidden = 32usize;
+        let verify_rows = 8usize;
+
+        let mut tape = Inkling2ShortConvTape::new(num_visits);
+        let init_state =
+            Inkling2ShortConvState::new(num_visits, 4, kv_dim, hidden, DType::BFloat16).unwrap();
+
+        for (v_idx, tv) in tape.visits.iter_mut().enumerate() {
+            let base = (v_idx as f32) * 0.1;
+            let make_pair = |c: usize, salt: f32| {
+                let h_vals: Vec<f32> = (0..(3 * c))
+                    .map(|i| base + salt - (i as f32) * 0.05)
+                    .collect();
+                let r_vals: Vec<f32> = (0..(verify_rows * (c + 8)))
+                    .map(|i| base + salt + (i as f32) * 0.025)
+                    .collect();
+                let h = MxArray::from_float32(&h_vals, &[3, c as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                // Use strided column slices to verify strided rows_in handling!
+                let big = MxArray::from_float32(&r_vals, &[verify_rows as i64, (c + 8) as i64])
+                    .unwrap()
+                    .astype(DType::BFloat16)
+                    .unwrap();
+                let r = big
+                    .slice(&[0, 4], &[verify_rows as i64, (4 + c) as i64])
+                    .unwrap();
+                StreamShortConvTape {
+                    hist_before: h,
+                    rows: r,
+                }
+            };
+            tv.k = Some(make_pair(kv_dim, 1.0));
+            tv.v = Some(make_pair(kv_dim, 2.0));
+            tv.attn_post = Some(make_pair(hidden, 3.0));
+            tv.mlp_post = Some(make_pair(hidden, 4.0));
+        }
+
+        for &(path, is_contiguous) in &[
+            (&[][..], false),
+            (&[0, 1][..], true),
+            (&[0, 1, 2, 3, 4][..], true),
+            (&[0, 3][..], false),
+            (&[0, 2, 5, 7][..], false),
+        ] {
+            let mut got_state = init_state.clone();
+            tape.commit_tree(path, is_contiguous, &mut got_state)
+                .unwrap();
+
+            for (v_idx, (tv, sv)) in tape.visits.iter().zip(got_state.visits.iter()).enumerate() {
+                let mut ref_v = init_state.visits[v_idx].clone();
+                tv.commit_tree(path, is_contiguous, &mut ref_v).unwrap();
+                for (name, got, want) in [
+                    ("k", &sv.k, &ref_v.k),
+                    ("v", &sv.v, &ref_v.v),
+                    ("attn_post", &sv.attn_post, &ref_v.attn_post),
+                    ("mlp_post", &sv.mlp_post, &ref_v.mlp_post),
+                ] {
+                    let g = got.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    let w = want.astype(DType::Float32).unwrap().to_float32().unwrap();
+                    assert_eq!(
+                        g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        w.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                        "visit={v_idx} stream={name} path={path:?}"
+                    );
+                }
+            }
+        }
+
+        let mut err_state = init_state.clone();
+        assert!(tape.commit_prefix(verify_rows + 1, &mut err_state).is_err());
+        assert!(
+            tape.commit_tree(&[0, verify_rows as u32], false, &mut err_state)
+                .is_err()
+        );
     }
 }

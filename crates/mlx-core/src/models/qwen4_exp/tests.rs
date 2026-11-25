@@ -11305,7 +11305,7 @@ fn cuda_phase3a_new_kernels_parity() {
     for sb_dtype in [DType::Float16, DType::BFloat16, DType::Float32] {
         let sc = scales_f32.astype(sb_dtype).unwrap();
         let bi = biases_f32.astype(sb_dtype).unwrap();
-        let got = crate::kernels::linear::dequant_q8_bf16_cuda(&packed_w, &sc, &bi)
+        let got = crate::kernels::linear::dequant_q8_bf16_cuda(&packed_w, &sc, Some(&bi))
             .unwrap()
             .expect("dequant_q8_bf16_cuda must admit");
         let mode = std::ffi::CString::new("affine").unwrap();

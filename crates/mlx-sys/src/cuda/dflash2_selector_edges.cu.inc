@@ -4,7 +4,10 @@ R"cuda(
 // Fused DFlash2 selector edge scoring for fixed K=16, Rank=256.
 // Replaces 8 unfused CUDA kernels (3x take, concat, mul, batched matmul, add, astype)
 // with a single launch. Grid: dim3(length), Block: dim3(256) (8 warps per position).
-// Matches the native BF16 graph rounding (BF16 prod -> FP32 dot -> BF16 + unary -> FP32).
+// Matches the native BF16 graph rounding (BF16 prod -> FP32 dot -> BF16 + unary -> FP32)
+// when `softcap == 0.0f` (bit-identical for Qwen3.8). When `softcap > 0.0f`, keeps
+// `float sum = unary + edge` in FP32 before `softcap * tanhf(sum / softcap)` (matching
+// Splash `sampling.metal:1670-1675`, preserving `-INFINITY`).
 extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cuda_kernel(
     const int* __restrict__ candidates,
     const unsigned char* __restrict__ unary_raw,
@@ -14,7 +17,8 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cud
     const int* __restrict__ anchor,
     float* __restrict__ scores,
     int vocab,
-    int unary_is_bf16) {
+    int unary_is_bf16,
+    float softcap) {
   constexpr int K = 16;
   constexpr int Rank = 256;
   const int pos = blockIdx.x;
@@ -66,12 +70,21 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cud
         acc += __shfl_xor_sync(0xffffffffu, acc, sh, 32);
       }
       if (lane == 0) {
-        const float edge_bf = __bfloat162float(__float2bfloat16_rn(acc));
         const float u_val = unary_is_bf16
             ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(unary_raw)[pos * K + j])
-            : __bfloat162float(__float2bfloat16_rn(
-                  reinterpret_cast<const float*>(unary_raw)[pos * K + j]));
-        const float combined = __bfloat162float(__float2bfloat16_rn(edge_bf + u_val));
+            : reinterpret_cast<const float*>(unary_raw)[pos * K + j];
+        const float neg_inf = -__int_as_float(0x7f800000);
+        float combined;
+        if (softcap > 0.0f) {
+          const float sum = u_val + acc;
+          combined = (sum > neg_inf) ? (softcap * tanhf(sum / softcap)) : sum;
+        } else {
+          const float edge_bf = __bfloat162float(__float2bfloat16_rn(acc));
+          const float u_bf = unary_is_bf16
+              ? u_val
+              : __bfloat162float(__float2bfloat16_rn(u_val));
+          combined = __bfloat162float(__float2bfloat16_rn(edge_bf + u_bf));
+        }
         if (pos > 0) {
           scores[((size_t)pos * K + prev) * K + j] = combined;
         } else {

@@ -50,7 +50,6 @@ pub(crate) use selector::SelectorPath;
 pub(crate) use selector::device_sampled_path;
 #[cfg(test)]
 use selector::normalized_selector_probs;
-use spanned_head::cuda_spanned_head_enabled;
 #[cfg(test)]
 pub(crate) use test_helpers::{
     dflash2_config_with_context, tiny_dflash2_config, tiny_dflash2_model_for_stepper_test,
@@ -90,6 +89,72 @@ impl From<&super::config::Qwen3_5Config> for DFlash2TargetShape {
     }
 }
 
+/// Full target contract validated against a loaded DFlash2 companion: core
+/// geometry plus optional unpadded valid vocabulary size, post-correction
+/// logit softcapping, and whether `layer == num_layers` (final-norm tap) is
+/// supported by the target (e.g. Inkling-2-Mini).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct DFlash2TargetContract {
+    pub(crate) hidden_size: usize,
+    pub(crate) vocab_size: usize,
+    pub(crate) num_layers: usize,
+    pub(crate) valid_vocab_size: Option<usize>,
+    pub(crate) final_logit_softcapping: Option<f32>,
+    pub(crate) allow_final_norm_tap: bool,
+}
+
+impl From<DFlash2TargetShape> for DFlash2TargetContract {
+    fn from(shape: DFlash2TargetShape) -> Self {
+        Self {
+            hidden_size: shape.hidden_size,
+            vocab_size: shape.vocab_size,
+            num_layers: shape.num_layers,
+            valid_vocab_size: None,
+            final_logit_softcapping: None,
+            allow_final_norm_tap: false,
+        }
+    }
+}
+
+impl From<&super::config::Qwen3_5Config> for DFlash2TargetContract {
+    fn from(target: &super::config::Qwen3_5Config) -> Self {
+        DFlash2TargetShape::from(target).into()
+    }
+}
+
+/// Borrowed resident target `lm_head` passed into compiled embedded-input draft
+/// graphs, supporting both `LinearProj` (`Standard` BF16 or `Quantized`) and
+/// legacy `&QuantizedLinear` views (`qwen4_exp`).
+#[derive(Clone, Copy)]
+pub(super) enum EmbeddedLmHead<'a> {
+    Proj(&'a LinearProj),
+    Quantized(&'a QuantizedLinear),
+}
+
+impl<'a> EmbeddedLmHead<'a> {
+    fn from_target(target: &'a dyn DFlash2TargetView) -> Option<Self> {
+        if let Some(proj) = target.target_lm_head_proj() {
+            Some(Self::Proj(proj))
+        } else {
+            target.target_lm_head_qlinear().map(Self::Quantized)
+        }
+    }
+
+    fn as_quantized(self) -> Option<&'a QuantizedLinear> {
+        match self {
+            Self::Proj(proj) => proj.as_quantized(),
+            Self::Quantized(ql) => Some(ql),
+        }
+    }
+
+    pub(super) fn forward_logits(self, hidden: &MxArray) -> Result<MxArray> {
+        match self {
+            Self::Proj(proj) => proj.forward_logits(hidden),
+            Self::Quantized(ql) => ql.forward(hidden),
+        }
+    }
+}
+
 /// The target's token table and vocabulary head as the draft reads them
 /// (Splash `DFlashDraft::addDecode` takes `vocabularyProjection`).
 pub(crate) trait DFlash2TargetView {
@@ -99,9 +164,16 @@ pub(crate) trait DFlash2TargetView {
     /// The head's logits of the draft's normed hidden rows.
     fn logits(&mut self, hidden: &MxArray) -> Result<MxArray>;
     /// The table and head as arrays a compiled draft may capture; `None`
-    /// keeps every proposal eager unless [`Self::target_lm_head_qlinear`]
-    /// provides a resident quantized head for embedded-input compilation.
+    /// keeps every proposal eager unless [`Self::target_lm_head_proj`] or
+    /// [`Self::target_lm_head_qlinear`] provides a resident head for
+    /// embedded-input compilation.
     fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)>;
+    /// Resident `lm_head` projection (`Standard` BF16 or `Quantized`) when
+    /// [`Self::traced`] is `None`, enabling compiled embedded-input draft
+    /// graphs for both GGUF quantized and SafeTensors dense targets.
+    fn target_lm_head_proj(&self) -> Option<&LinearProj> {
+        None
+    }
     /// Resident quantized `lm_head` projection when [`Self::traced`] is `None`
     /// (e.g., external row-table embeddings), enabling CUDA spanned draft
     /// heads and compiled embedded-input draft graphs.
@@ -150,6 +222,10 @@ pub(crate) struct DFlash2Model {
     layers: Vec<DFlash2Layer>,
     norm: RMSNorm,
     selector: CandidateSelector,
+    /// Optional `[hidden_size]` BF16 mask-token embedding shipped by a DFlash2
+    /// checkpoint (`mask_embedding` in `model.safetensors` or sidecar
+    /// `mask_embedding.safetensors`), spliced onto rows `1..rows` of each block.
+    mask_embedding: Option<MxArray>,
     /// Every layer's `k|v` context projection row-merged (`k0|v0|k1|v1|…`):
     /// the accepted rows' draft K/V for all layers in one quantized matmul.
     /// `None` when the packed formats do not merge (per-layer projections).
@@ -191,8 +267,84 @@ impl DFlash2Model {
         }
     }
 
-    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
-        self.config.validate_target(target.into())
+    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetContract>) -> Result<()> {
+        self.config.validate_target(target)
+    }
+
+    /// Validate `target` and apply target-supplied contract parameters (such as
+    /// `valid_vocab_size` or `final_logit_softcapping` when a checkpoint's
+    /// `config.json` omits them, e.g. `incoai/Inkling-2-Mini-DFlash2`).
+    #[allow(dead_code)]
+    pub(crate) fn configure_target_contract(
+        &mut self,
+        target: impl Into<DFlash2TargetContract>,
+    ) -> Result<()> {
+        let contract = target.into();
+        self.config.validate_target(contract)?;
+        self.invalidate_compiled();
+        if let Some(valid_vocab) = contract.valid_vocab_size {
+            self.config.valid_vocab_size = Some(valid_vocab);
+            self.selector.valid_vocab_size = Some(valid_vocab);
+        }
+        if let Some(cap) = contract.final_logit_softcapping.filter(|&c| c > 0.0) {
+            if self.config.final_logit_softcapping.is_none() {
+                self.config.final_logit_softcapping = Some(cap);
+            }
+            if self.config.selector_softcap_mode.is_none() {
+                self.config.selector_softcap_mode = Some("after_correction".to_string());
+            }
+            self.selector.post_softcap = self.config.post_edge_softcap();
+        }
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn mask_embedding(&self) -> Option<&MxArray> {
+        self.mask_embedding.as_ref()
+    }
+
+    /// Build `[1, 1 + mask_rows, hidden]` block embeddings from a `[1, 1, hidden]`
+    /// anchor embedding and this draft's optional `mask_embedding`. Returns
+    /// `Ok(None)` when the checkpoint does not ship a dedicated `mask_embedding`.
+    pub(crate) fn build_block_with_mask_embedding(
+        &self,
+        anchor_embedded: &MxArray,
+        mask_rows: i64,
+    ) -> Result<Option<MxArray>> {
+        let Some(mask) = self.mask_embedding.as_ref() else {
+            return Ok(None);
+        };
+        if mask_rows <= 0 {
+            return Ok(Some(anchor_embedded.clone()));
+        }
+        let hidden = anchor_embedded.shape_at(2)?;
+        let dtype = anchor_embedded.dtype()?;
+        let mask = if mask.dtype()? == dtype {
+            mask.clone()
+        } else {
+            mask.astype(dtype)?
+        };
+        let repeated = mask
+            .reshape(&[1, 1, hidden])?
+            .broadcast_to(&[1, mask_rows, hidden])?;
+        Ok(Some(MxArray::concatenate(anchor_embedded, &repeated, 1)?))
+    }
+
+    /// If this checkpoint ships a dedicated `mask_embedding`, replace rows
+    /// `1..rows` of `[1, rows, hidden]` block embeddings with it; otherwise
+    /// return `embedded` unchanged.
+    pub(crate) fn splice_mask_embedding(&self, embedded: &MxArray) -> Result<MxArray> {
+        if self.mask_embedding.is_none() {
+            return Ok(embedded.clone());
+        }
+        let rows = embedded.shape_at(1)?;
+        if rows <= 1 {
+            return Ok(embedded.clone());
+        }
+        let anchor_row = embedded.slice_axis(1, 0, 1)?;
+        Ok(self
+            .build_block_with_mask_embedding(&anchor_row, rows - 1)?
+            .unwrap_or_else(|| embedded.clone()))
     }
 
     pub(crate) fn fuse_context(&self, taps: &[MxArray]) -> Result<MxArray> {
@@ -392,7 +544,7 @@ impl DFlash2Model {
         query_base: i32,
         context: &mut DFlash2ContextCache,
     ) -> Result<MxArray> {
-        let embedded = target_embedding.forward(block_ids)?;
+        let embedded = self.splice_mask_embedding(&target_embedding.forward(block_ids)?)?;
         self.forward_embedded(&embedded, query_base, context)
     }
 
@@ -454,17 +606,13 @@ impl DFlash2Model {
                 "DFlash2 propose_tree_lattice_arrays requires max_len > 0",
             ));
         }
-        context.observe_tokens(&[anchor]);
+        context.observe_token(anchor);
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        let use_spanned_head = crate::accelerator::cuda_ops_available()
-            && cuda_spanned_head_enabled()
-            && !context.wide_vocab();
-        let spanned_heads = if use_spanned_head {
-            self.spanned_draft_heads(target_lm_head)?
-        } else {
-            None
-        };
+        let draft_head = self.resolve_draft_head(
+            target_lm_head.map(EmbeddedLmHead::Proj),
+            context.wide_vocab(),
+        )?;
         let compile = max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
             && self.execution_policy.compile_draft();
@@ -472,7 +620,7 @@ impl DFlash2Model {
             match self.propose_tree_lattice_compiled(
                 target_embedding,
                 target_lm_head,
-                spanned_heads.as_deref(),
+                draft_head.as_ref(),
                 context,
                 &block,
             ) {
@@ -489,29 +637,31 @@ impl DFlash2Model {
             pair
         } else {
             let query_base = context.logical_len;
-            let embedded = target_embedding.forward(&block)?;
+            let embedded = self.splice_mask_embedding(&target_embedding.forward(&block)?)?;
             let hidden = self.forward_embedded(&embedded, query_base, context)?;
             let rows = max_len as i64 + 1;
-            let (draft_hidden, draft_logits, is_spanned) =
-                if let Some(spanned) = spanned_heads.as_deref() {
-                    let draft_hidden = hidden.slice_axis(1, 1, rows)?;
-                    let draft_logits = spanned.forward_logits(&draft_hidden)?;
-                    (draft_hidden, draft_logits, true)
-                } else {
-                    let logits = match target_lm_head {
-                        Some(head) => head.forward_logits(&hidden)?,
-                        None => target_embedding.as_linear(&hidden)?,
-                    };
-                    let draft_hidden = hidden.slice_axis(1, 1, rows)?;
-                    let draft_logits = logits.slice_axis(1, 1, rows)?;
-                    (draft_hidden, draft_logits, false)
+            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+            let (draft_logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
+                (head.forward_logits(&draft_hidden)?, head.spanned_layout())
+            } else if crate::accelerator::cuda_ops_available() {
+                let draft_logits = match target_lm_head {
+                    Some(head) => head.forward_logits(&draft_hidden)?,
+                    None => target_embedding.as_linear(&draft_hidden)?,
                 };
+                (draft_logits, None)
+            } else {
+                let logits = match target_lm_head {
+                    Some(head) => head.forward_logits(&hidden)?,
+                    None => target_embedding.as_linear(&hidden)?,
+                };
+                (logits.slice_axis(1, 1, rows)?, None)
+            };
             let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
             self.selector.select_lattice_arrays(
                 &draft_hidden,
                 &draft_logits,
                 &anchor_ids,
-                is_spanned,
+                spanned_layout,
             )?
         };
         if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
@@ -540,36 +690,30 @@ impl DFlash2Model {
                 "DFlash2 propose_tree_lattice_arrays_embedded requires max_len > 0",
             ));
         }
-        context.observe_tokens(&[anchor]);
+        context.observe_token(anchor);
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let block = MxArray::from_int32(&ids, &[1, ids.len() as i64])?;
-        let use_spanned_head = crate::accelerator::cuda_ops_available()
-            && cuda_spanned_head_enabled()
-            && !context.wide_vocab();
-        let spanned_heads = if use_spanned_head {
-            if let Some(ql) = target.target_lm_head_qlinear() {
-                self.spanned_draft_heads_ql(ql)?
-            } else if let Some((_, head)) = target.traced() {
-                self.spanned_draft_heads(head)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let embedded_head = EmbeddedLmHead::from_target(target);
+        let has_embedded_head = embedded_head.is_some();
+        let draft_head_source = embedded_head.or_else(|| {
+            target
+                .traced()
+                .and_then(|(_, head)| head.map(EmbeddedLmHead::Proj))
+        });
+        let draft_head = self.resolve_draft_head(draft_head_source, context.wide_vocab())?;
         let compile = crate::accelerator::cuda_ops_available()
-            && target.target_lm_head_qlinear().is_some()
+            && has_embedded_head
             && max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
             && self.execution_policy.compile_draft();
-        let embedded = target.embed(&block, &ids)?;
+        let embedded = self.splice_mask_embedding(&target.embed(&block, &ids)?)?;
         let compiled_pair = if compile && self.compiled.prepared.load(Ordering::Relaxed) {
-            if let Some(ql) = target.target_lm_head_qlinear() {
+            if let Some(head) = EmbeddedLmHead::from_target(target) {
                 match self.propose_tree_lattice_compiled_embedded(
                     &embedded,
                     anchor,
-                    ql,
-                    spanned_heads.as_deref(),
+                    head,
+                    draft_head.as_ref(),
                     context,
                 ) {
                     Ok(pair) => pair,
@@ -591,20 +735,25 @@ impl DFlash2Model {
             let hidden = self.forward_embedded(&embedded, query_base, context)?;
             let rows = max_len as i64 + 1;
             let draft_hidden = hidden.slice_axis(1, 1, rows)?;
-            let (draft_logits, is_spanned) = if let Some(spanned) = spanned_heads.as_deref() {
-                (spanned.forward_logits(&draft_hidden)?, true)
+            let (draft_logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
+                (head.forward_logits(&draft_hidden)?, head.spanned_layout())
+            } else if crate::accelerator::cuda_ops_available() {
+                // On CUDA, project only the `block_size` proposal rows (skipping anchor
+                // row 0) to match `propose_tree_lattice_compiled_embedded` and hit M=7
+                // directly without computing or slicing an unused anchor row.
+                (target.logits(&draft_hidden)?, None)
             } else {
                 // Match `propose_tree_lattice_compiled_embedded`: run the full-vocab
                 // head on the whole block (anchor + proposals, M=8) so Metal keeps its
                 // K-quant M = 8 NAX route and eager/compiled stay bit-identical.
-                (target.logits(&hidden)?.slice_axis(1, 1, rows)?, false)
+                (target.logits(&hidden)?.slice_axis(1, 1, rows)?, None)
             };
             let anchor_ids = MxArray::from_int32(&[anchor as i32], &[1])?;
             self.selector.select_lattice_arrays(
                 &draft_hidden,
                 &draft_logits,
                 &anchor_ids,
-                is_spanned,
+                spanned_layout,
             )?
         };
         if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
@@ -722,7 +871,7 @@ impl DFlash2Model {
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         // Observe the current anchor (prefill first token or previous boundary
         // token) before deciding narrow vs full draft head.
-        context.observe_tokens(&[anchor]);
+        context.observe_token(anchor);
         let ids = parallel_query_ids(anchor, self.config.mask_token_id, max_len);
         let phase_time = std::env::var("MLX_DFLASH2_PHASE_TIME").is_ok();
         let t0 = std::time::Instant::now();
@@ -730,23 +879,14 @@ impl DFlash2Model {
         let head_len = target
             .proposal_head_limit()
             .map_or(max_len, |limit| limit.clamp(1, max_len));
-        let use_spanned_head = crate::accelerator::cuda_ops_available()
-            && cuda_spanned_head_enabled()
-            && !context.wide_vocab();
         let has_traced = target.traced().is_some();
-        let has_target_ql = !has_traced && target.target_lm_head_qlinear().is_some();
-        let spanned_heads = if use_spanned_head {
-            if let Some((_, head)) = target.traced() {
-                self.spanned_draft_heads(head)?
-            } else if let Some(ql) = target.target_lm_head_qlinear() {
-                self.spanned_draft_heads_ql(ql)?
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let compile_embedded = has_target_ql && crate::accelerator::cuda_ops_available();
+        let has_embedded_head = !has_traced && EmbeddedLmHead::from_target(target).is_some();
+        let draft_head_source = target
+            .traced()
+            .and_then(|(_, head)| head.map(EmbeddedLmHead::Proj))
+            .or_else(|| EmbeddedLmHead::from_target(target));
+        let draft_head = self.resolve_draft_head(draft_head_source, context.wide_vocab())?;
+        let compile_embedded = has_embedded_head && crate::accelerator::cuda_ops_available();
         let compile = device_path
             && (has_traced || compile_embedded)
             && is_greedy_temperature(temperature)
@@ -763,7 +903,7 @@ impl DFlash2Model {
                 match self.propose_compiled(
                     target_embedding,
                     target_lm_head,
-                    spanned_heads.as_deref(),
+                    draft_head.as_ref(),
                     context,
                     &block,
                     confidence.is_some(),
@@ -781,13 +921,13 @@ impl DFlash2Model {
                     }
                 }
             } else if compile_embedded {
-                let embedded = target.embed(&block, &ids)?;
-                let compiled_res = if let Some(ql) = target.target_lm_head_qlinear() {
+                let embedded = self.splice_mask_embedding(&target.embed(&block, &ids)?)?;
+                let compiled_res = if let Some(head) = EmbeddedLmHead::from_target(target) {
                     self.propose_compiled_embedded(
                         &embedded,
                         anchor,
-                        ql,
-                        spanned_heads.as_deref(),
+                        head,
+                        draft_head.as_ref(),
                         context,
                         head_len as i64,
                         confidence.is_some(),
@@ -815,27 +955,27 @@ impl DFlash2Model {
         let query_base = context.logical_len;
         let embedded = match pre_embedded {
             Some(e) => e,
-            None => target.embed(&block, &ids)?,
+            None => self.splice_mask_embedding(&target.embed(&block, &ids)?)?,
         };
         let hidden = self.forward_embedded(&embedded, query_base, context)?;
         let rows = head_len as i64 + 1;
-        let (hidden, logits, is_spanned) = if let Some(spanned) = spanned_heads.as_deref() {
-            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
-            let draft_logits = spanned.forward_logits(&draft_hidden)?;
-            (draft_hidden, draft_logits, true)
-        } else if head_len < max_len && crate::accelerator::cuda_ops_available() {
-            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+        let draft_hidden = hidden.slice_axis(1, 1, rows)?;
+        let (hidden, logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
+            let draft_logits = head.forward_logits(&draft_hidden)?;
+            (draft_hidden, draft_logits, head.spanned_layout())
+        } else if crate::accelerator::cuda_ops_available() {
+            // On CUDA, project only the proposal rows (skipping unused anchor row 0)
+            // so eager and compiled stay bit-identical and avoid projecting row 0.
             let draft_logits = target.logits(&draft_hidden)?;
-            (draft_hidden, draft_logits, false)
+            (draft_hidden, draft_logits, None)
         } else {
             // The head runs on the whole block (anchor + proposals, 8 rows), the
             // height its K-quant M = 8 route serves, and the anchor row's logits
             // are dropped: at 7 rows the head took the per-row kernel and cost
             // more than at 8.
             let logits = target.logits(&hidden)?;
-            let draft_hidden = hidden.slice_axis(1, 1, rows)?;
             let draft_logits = logits.slice_axis(1, 1, rows)?;
-            (draft_hidden, draft_logits, false)
+            (draft_hidden, draft_logits, None)
         };
         let out = self.selector.select_spanned(
             &hidden,
@@ -843,7 +983,7 @@ impl DFlash2Model {
             anchor,
             temperature,
             device_path,
-            is_spanned,
+            spanned_layout,
             confidence,
             rng,
         )?;
