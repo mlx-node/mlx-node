@@ -10,6 +10,7 @@ import { ReleaseVersionError } from '../scripts/release-version.js';
 import {
   buildWindowsMsix,
   DEFAULT_MSIX_IDENTITY,
+  encodeMsixPartName,
   escapeXml,
   findWindowsSdkTool,
   MAX_MSIX_ASSET_BYTES,
@@ -188,7 +189,7 @@ describe('MakeAppx mapping generation', () => {
 });
 
 describe('MSIX entry verification', () => {
-  const completeEntries = [
+  const rawCompleteEntries = [
     'AppxManifest.xml',
     'resources.pri',
     'Assets/StoreLogo.png',
@@ -206,13 +207,41 @@ describe('MSIX entry verification', () => {
     'app/resources/www/index.html',
     ...runtimeFiles.map((file) => `app/resources/native/${file}`),
   ];
+  const completeEntries = rawCompleteEntries.map(encodeMsixPartName);
 
-  it('accepts a complete MSIX member list with either slash direction', () => {
+  it('accepts a complete OPC-encoded MSIX member list with either slash direction', () => {
+    expect(completeEntries.some((entry) => entry.includes('%40napi-rs'))).toBe(true);
     expect(missingWindowsMsixEntries(completeEntries, runtimeFiles)).toEqual([]);
     expect(
       missingWindowsMsixEntries(
         completeEntries.map((entry) => entry.replaceAll('/', '\\')),
         runtimeFiles,
+      ),
+    ).toEqual([]);
+  });
+
+  it('rejects unencoded, noncanonical, spoofed, and literal-percent-colliding OPC escapes', () => {
+    expect(missingWindowsMsixEntries(rawCompleteEntries, runtimeFiles)).toEqual(
+      WINDOWS_APP_RUNTIME_FILES.filter((file) => file.includes('@')).map((file) => `app/resources/app/${file}`),
+    );
+
+    const noncanonical = completeEntries.map((entry) => (entry === 'app/mlx-node.exe' ? 'app/mlx-node%2Eexe' : entry));
+    expect(missingWindowsMsixEntries(noncanonical, runtimeFiles)).toEqual(['app/mlx-node.exe']);
+
+    const spoofed = completeEntries.map((entry) => (entry === 'app/mlx-node.exe' ? 'app%2Fmlx-node.exe' : entry));
+    expect(missingWindowsMsixEntries(spoofed, runtimeFiles)).toEqual(['app/mlx-node.exe']);
+
+    const plusDll = 'nvrtc-builtins64_130+0.dll';
+    const literalPercentDll = 'nvrtc-builtins64_130%2B0.dll';
+    const runtimeWithBoth = [...runtimeFiles, plusDll, literalPercentDll];
+    const onlyPlusMember = [...completeEntries, 'app/resources/native/nvrtc-builtins64_130%2B0.dll'];
+    expect(missingWindowsMsixEntries(onlyPlusMember, runtimeWithBoth)).toEqual([
+      `app/resources/native/${literalPercentDll}`,
+    ]);
+    expect(
+      missingWindowsMsixEntries(
+        [...onlyPlusMember, 'app/resources/native/nvrtc-builtins64_130%252B0.dll'],
+        runtimeWithBoth,
       ),
     ).toEqual([]);
   });
@@ -230,7 +259,7 @@ describe('MSIX entry verification', () => {
   });
 
   it.each(WINDOWS_APP_RUNTIME_FILES)('reports missing required app runtime file %s', (file) => {
-    const pruned = completeEntries.filter((entry) => entry !== `app/resources/app/${file}`);
+    const pruned = completeEntries.filter((entry) => entry !== encodeMsixPartName(`app/resources/app/${file}`));
     expect(missingWindowsMsixEntries(pruned, runtimeFiles)).toEqual([`app/resources/app/${file}`]);
   });
 

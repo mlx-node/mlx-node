@@ -93,9 +93,14 @@ The [desktop release workflow](../../.github/workflows/desktop-release.yml) prod
 - `mlx-node-<version>-darwin-arm64.zip` for automatic updates.
 - `mlx-node-<version>-darwin-arm64.zip.blockmap` for differential downloads.
 - `latest-mac.yml` with the update version, archive size/hash, minimum macOS, and rollout percentage.
-- `mlx-node-<version>-win32-arm64.zip`, an unsigned portable Windows ARM64 app
-  with the native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it
-  and run `mlx-node.exe`; no Apple signing or automatic update feed is used.
+- `mlx-node-<version>-win32-arm64.zip`, a portable Windows ARM64 app with the
+  native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it and run
+  `mlx-node.exe`; no automatic update feed is used. When the `ES_USERNAME`,
+  `ES_PASSWORD`, `CREDENTIAL_ID` and `ES_TOTP_SECRET` secrets are set, every
+  `.exe`, `.dll` and `.node` in it without an existing valid, timestamped
+  signature (NVIDIA's DLLs already carry one) is Authenticode-signed and
+  timestamped through SSL.com eSigner (via pinned `CodeSignTool` v1.3.2) before
+  the ZIP is built; without them the ZIP ships unsigned, with a warning.
 
 Stable Windows ARM64 builds also produce two workflow artifacts (kept off GitHub Releases):
 

@@ -1,9 +1,12 @@
 name: Desktop Release
 
 # Signing cannot live in ci.yml's `publish` job: that one runs on ubuntu-latest,
-# and codesign/notarytool/stapler are macOS-only. This is a separate workflow on a
-# macOS runner rather than another job in ci.yml because it needs Apple secrets
-# that no PR-triggered job should ever be able to read.
+# while codesign/notarytool/stapler are macOS-only and Authenticode signing runs
+# on Windows. This is a separate workflow rather than jobs in ci.yml because it
+# needs Apple and SSL.com signing secrets that no PR-triggered job should ever
+# be able to read. `windows` and `macos` build and sign in parallel; `publish`
+# (`ubuntu-latest`) downloads and verifies all assets, publishes the GitHub
+# Release, and bumps the Homebrew cask; `winget` submits the WinGet update.
 #
 # `dry_run` builds, packages and signs but does NOT notarize or publish. That path
 # needs only CSC_LINK + CSC_KEY_PASSWORD, so the pipeline is exercisable before the
@@ -20,6 +23,12 @@ name: Desktop Release
 # Optional:
 #   HOMEBREW_TAP_TOKEN           PAT with contents:write on the tap repo
 #   WINGET_TOKEN                 PAT with public_repo scope for winget-pkgs PRs
+#   ES_USERNAME                  SSL.com account user name    } Windows Authenticode
+#   ES_PASSWORD                  SSL.com account password     } signing via pinned
+#   CREDENTIAL_ID                eSigner credential ID        } SSL.com CodeSignTool
+#   ES_TOTP_SECRET               eSigner TOTP secret          } v1.3.2 (eSigner).
+#                                All four, or none: without them the Windows ZIP
+#                                ships unsigned, with a warning, exactly as before.
 #
 # Notarization authenticates with an App Store Connect API key rather than
 # `--apple-id` + an app-specific password. The key belongs to the organization
@@ -46,6 +55,13 @@ on:
         description: 'Release tag, e.g. v0.0.14 (required to publish; optional for a dry run)'
         type: string
         default: ''
+      # Every eSigner signature counts against the SSL.com plan's signing quota,
+      # so a dry run can opt out. Public releases (tag pushes or dry_run=false)
+      # always sign when the secrets exist.
+      sign_windows:
+        description: 'Dry runs only: sign Windows binaries with SSL.com eSigner (public releases always sign when secrets are set)'
+        type: boolean
+        default: true
       staging_percentage:
         description: 'Percentage of installed apps offered the update (0-100)'
         type: string
@@ -72,18 +88,31 @@ jobs:
     # mlx-prebuilt.yml); no GPU is required. No Apple signing secrets are used.
     runs-on: windows-11-arm
     outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
       windows_zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
     permissions:
       contents: read
-      actions: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+          ref: ${{ inputs.dry_run && github.sha || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
           submodules: recursive
+
+      - name: Record checked-out commit
+        id: commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = ((git rev-parse HEAD) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Failed to resolve checked-out commit SHA: $sha"
+          }
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -198,6 +227,7 @@ jobs:
           key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
 
       - name: Check the Windows build environment
+        id: winenv
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -208,7 +238,7 @@ jobs:
           if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\include\cuda_runtime.h" -PathType Leaf)) { throw 'CUDA_PATH is missing include\cuda_runtime.h.' }
           if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\bin\arm64\cudnn64_9.dll" -PathType Leaf)) { throw 'CUDNN_PATH has no ARM64 cuDNN 9 runtime.' }
           if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\lib\arm64\cudnn.lib" -PathType Leaf)) { throw 'CUDNN_PATH is missing lib\arm64\cudnn.lib.' }
-          foreach ($tool in 'makepri.exe', 'makeappx.exe') {
+          foreach ($tool in 'makepri.exe', 'makeappx.exe', 'signtool.exe') {
             $found = $null
             if (-not [string]::IsNullOrWhiteSpace($env:WindowsSdkVerBinPath)) {
               foreach ($candidate in @(
@@ -237,8 +267,11 @@ jobs:
               $cmd = Get-Command $tool -ErrorAction SilentlyContinue
               if ($cmd) { $found = $cmd.Source }
             }
-            if (-not $found) { throw "Windows SDK MSIX tool not found: $tool" }
+            if (-not $found) { throw "Windows SDK tool not found: $tool" }
             Write-Host "Found ${tool}: $found"
+            if ($tool -eq 'signtool.exe') {
+              "signtool=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            }
           }
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize
 
@@ -252,6 +285,37 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
         run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$env:TAG" --manifest packages/desktop/package.json
 
+      - name: Verify release tag is publishable
+        if: inputs.dry_run != true
+        shell: pwsh
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:TAG)) {
+            throw 'A release tag is required for publication'
+          }
+          $tagCommit = ((& git rev-parse --verify "refs/tags/$($env:TAG)^{commit}" 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $($env:TAG) was not found in git checkout: $tagCommit"
+          }
+          $headCommit = ((& git rev-parse HEAD 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $headCommit) {
+            throw "The checkout ($headCommit) does not match release tag $($env:TAG) ($tagCommit)"
+          }
+          $relOut = (@(& gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:TAG)" 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+          $relExit = $LASTEXITCODE
+          if ($relExit -eq 0) {
+            throw "Release $($env:TAG) is already published; refusing to rebuild or modify a public release"
+          } elseif ($relOut -notmatch 'HTTP 404|"status":\s*"404"') {
+            Write-Host $relOut
+            throw "Failed to check release state for $($env:TAG)"
+          }
+          $global:LASTEXITCODE = 0
+          exit 0
+
       # Match the macOS job: a release packages a fresh addon and its matching
       # runtime rather than reusing a stale CI artifact.
       - name: Build native + TypeScript
@@ -260,18 +324,342 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
-      - name: Package Windows ARM64 (ZIP + MSIX)
-        id: package
+      # Packaging is split in two so the PE files are Authenticode-signed inside
+      # the app directory BEFORE the ZIP/MSIX are built from it (the ZIP hash
+      # feeds the release notes and the WinGet manifest, so it must be final).
+      - name: Package the Windows ARM64 app
+        id: app
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          yarn oxnode packages/desktop/scripts/package-windows.ts --app-version "$env:APP_VERSION"
+          yarn oxnode packages/desktop/scripts/package-windows.ts --app-version "$env:APP_VERSION" --app-only
+          if ($LASTEXITCODE -ne 0) { throw 'Windows app packaging failed.' }
+          $resultPath = 'packages/desktop/out/windows-app-result.json'
+          if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
+          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
+          "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # All four eSigner secrets, or the ZIP ships unsigned exactly as before.
+      # Forks and repositories without the secrets keep a green release run.
+      - name: Check the Windows signing secrets
+        id: signing
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          # Only dry runs may opt out via sign_windows=false; public releases
+          # (tag pushes or workflow_dispatch with dry_run=false) always sign when
+          # secrets are set. Use format('{0}', ...) because before this PR merges
+          # to main `inputs.sign_windows` can be empty and GitHub coerces '' == false.
+          SIGN_REQUESTED: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true || format('{0}', inputs.sign_windows) != 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $secretNames = @('ES_USERNAME', 'ES_PASSWORD', 'CREDENTIAL_ID', 'ES_TOTP_SECRET')
+          $missing = @($secretNames |
+            Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($env:SIGN_REQUESTED -ne 'true') {
+            Write-Host '::notice title=Windows signing skipped::sign_windows is off for this dry run; the Windows ZIP is unsigned.'
+            $enabled = 'false'
+          } elseif ($missing.Count -eq $secretNames.Count) {
+            Write-Host "::warning title=Windows signing skipped::None of $($secretNames -join ', ') are set. The Windows ZIP is unsigned."
+            $enabled = 'false'
+          } elseif ($missing.Count -gt 0) {
+            throw "Partial Windows eSigner secret configuration; missing: $($missing -join ', '). Set all four secrets or remove all of them."
+          } else {
+            $enabled = 'true'
+          }
+          "enabled=$enabled" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # eSigner's batch_sign takes one flat directory (at most 100 files) and only
+      # recognises some extensions: `.node` is not one of them, although a `.node`
+      # addon is an ordinary PE DLL. Use `signtool verify /pa /tw /v` (no `/a`) so
+      # only embedded, timestamped Authenticode signatures count — never runner-local
+      # Windows catalogs (which also mask Electron's already-embedded d3dcompiler_47.dll
+      # under Get-AuthenticodeSignature). Copy everything else into a flat directory
+      # under neutral names, giving `.node` files a `.dll` name, and keep a map back.
+      - name: Collect the Windows binaries to sign
+        id: collect
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          APP: ${{ steps.app.outputs.app }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          $root = Join-Path $env:RUNNER_TEMP 'esigner'
+          $inDir = Join-Path $root 'in'
+          $outDir = Join-Path $root 'out'
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $inDir, $outDir | Out-Null
+          $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File |
+            Where-Object { $_.Extension -in '.exe', '.dll', '.node' } |
+            Sort-Object FullName)
+          $map = @()
+          $index = 0
+          foreach ($file in $pe) {
+            $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $file.FullName 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+            $verifyExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($verifyExit -eq 0 -and $verifyOut -match 'The signature is timestamped:') { continue }
+            $status = if ($verifyOut -match 'No signature found') {
+              'NotSigned'
+            } elseif ($verifyExit -eq 2 -or ($verifyExit -eq 0 -and $verifyOut -notmatch 'The signature is timestamped:')) {
+              'NoTimestamp'
+            } else {
+              "VerifyExit$verifyExit"
+            }
+            $index += 1
+            $extension = if ($file.Extension -eq '.exe') { '.exe' } else { '.dll' }
+            $name = '{0:D4}{1}' -f $index, $extension
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $inDir $name)
+            $map += [pscustomobject]@{ name = $name; path = $file.FullName; status = $status }
+          }
+          if ($map.Count -eq 0) { throw "Found no PE files needing signing under $env:APP" }
+          if ($map.Count -gt 100) { throw "eSigner batch_sign takes at most 100 files; found $($map.Count)" }
+          $map | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $root 'map.json') -Encoding utf8
+          $map | Format-Table name, status, path -AutoSize | Out-String -Width 400 | Write-Host
+          Write-Host "Signing $($map.Count) of $($pe.Count) PE files"
+          "in=$inDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "out=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "map=$(Join-Path $root 'map.json')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0
+
+      # CodeSignTool is a Java program. Install a native ARM64 JDK 21 (Temurin)
+      # with up-to-date CA roots so we invoke CodeSignTool's JAR directly via JAVA_HOME.
+      - name: Setup Java for CodeSignTool
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+
+      # Credential-free pinned download (matching Komac in jobs.winget).
+      - name: Install pinned CodeSignTool
+        id: codesigntool
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          CODESIGNTOOL_VERSION: '1.3.2'
+          CODESIGNTOOL_URL: 'https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2.zip'
+          CODESIGNTOOL_SHA256: 'F14B1E1EF14BFA1FD00279C363AAB0DEBBF5DCFBA0E4BCDCE5D22BB771DE0E3A'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP "CodeSignTool-v${env:CODESIGNTOOL_VERSION}.zip"
+          $dir = Join-Path $env:RUNNER_TEMP 'codesigntool'
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $env:CODESIGNTOOL_URL -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actualSha256 -ne $env:CODESIGNTOOL_SHA256) {
+            Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+            throw "CodeSignTool archive SHA-256 mismatch: expected $env:CODESIGNTOOL_SHA256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $dir -Force
+          Remove-Item -LiteralPath $archive -Force
+          Remove-Item -LiteralPath (Join-Path $dir '__MACOSX') -Recurse -Force -ErrorAction SilentlyContinue
+          $jar = Join-Path $dir "jar\code_sign_tool-${env:CODESIGNTOOL_VERSION}.jar"
+          $conf = Join-Path $dir 'conf\code_sign_tool.properties'
+          if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) { throw "CodeSignTool JAR not found: $jar" }
+          if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) { throw "CodeSignTool config not found: $conf" }
+          "dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "jar=$jar" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Invoke CodeSignTool directly through java.exe (no cmd.exe wrapper).
+      # $CODE_SIGN_TOOL_PATH tells CodeSignTool where conf/code_sign_tool.properties
+      # lives, -Xmx4G prevents heap OOM on 200+ MB PE files like mlx-node.exe, and
+      # CodeSignTool can exit 0 on error so we also fail closed if any expected
+      # output file is missing or empty in $env:OUT_DIR.
+      - name: Sign the Windows binaries (SSL.com eSigner)
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          CODE_SIGN_TOOL_PATH: ${{ steps.codesigntool.outputs.dir }}
+          CODESIGNTOOL_JAR: ${{ steps.codesigntool.outputs.jar }}
+          IN_DIR: ${{ steps.collect.outputs.in }}
+          OUT_DIR: ${{ steps.collect.outputs.out }}
+          MAP: ${{ steps.collect.outputs.map }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { throw 'JAVA_HOME is not set' }
+          $java = Join-Path $env:JAVA_HOME 'bin\java.exe'
+          if (-not (Test-Path -LiteralPath $java -PathType Leaf)) { throw "Java executable not found: $java" }
+          $toolArgs = @('-Xmx4G', '-jar', $env:CODESIGNTOOL_JAR)
+          $authArgs = @(
+            "-username=$env:ES_USERNAME",
+            "-password=$env:ES_PASSWORD",
+            "-credential_id=$env:CREDENTIAL_ID"
+          )
+          function Invoke-CodeSignTool([string[]] $commandArgs) {
+            $lines = @(& $java @toolArgs @commandArgs 2>&1 | ForEach-Object { $_.ToString() })
+            $exitCode = $LASTEXITCODE
+            $output = $lines -join "`n"
+            if ($output.Length -gt 0) { Write-Host $output }
+            return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+          }
+          try {
+            # Query eSigner's scan policy first. When malware blocker is enabled
+            # (mandatory on many SSL.com credentials), batch_sign refuses any hash
+            # not pre-scanned via scan_code (hash-only, no binary upload, no OTP).
+            $scanRequired = $null
+            for ($attempt = 1; $attempt -le 3; $attempt += 1) {
+              $scanSettings = Invoke-CodeSignTool (@('get_scan_settings') + $authArgs)
+              if ($scanSettings.ExitCode -eq 0 -and $scanSettings.Output -match 'malware scan settings enabled:\s*(true|false)') {
+                $scanRequired = $Matches[1].ToLowerInvariant() -eq 'true'
+                break
+              }
+              if ($attempt -lt 3) {
+                Write-Warning "CodeSignTool get_scan_settings failed (attempt $attempt/3); retrying in 10s..."
+                Start-Sleep -Seconds 10
+              }
+            }
+            if ($null -eq $scanRequired) {
+              throw 'CodeSignTool get_scan_settings failed after 3 attempts'
+            }
+            if ($scanRequired) {
+              $files = @(Get-ChildItem -LiteralPath $env:IN_DIR -File | Sort-Object Name)
+              foreach ($file in $files) {
+                $scanned = $false
+                for ($attempt = 1; $attempt -le 3; $attempt += 1) {
+                  Write-Host "Malware scan ($attempt/3): $($file.Name)"
+                  $res = Invoke-CodeSignTool (@('scan_code') + $authArgs + @("-input_file_path=$($file.FullName)"))
+                  if ($res.Output -match 'code object is a malware') {
+                    throw "eSigner malware scanner rejected $($file.Name)"
+                  }
+                  if ($res.ExitCode -eq 0 -and $res.Output -match 'code object is not a malware\. You can proceed signing this code object') {
+                    $scanned = $true
+                    break
+                  }
+                  if ($attempt -lt 3) {
+                    Write-Warning "CodeSignTool scan_code for $($file.Name) did not confirm a clean scan (attempt $attempt/3); retrying in 10s..."
+                    Start-Sleep -Seconds 10
+                  }
+                }
+                if (-not $scanned) {
+                  throw "CodeSignTool scan_code failed for $($file.Name) after 3 attempts"
+                }
+              }
+            }
+            $batch = Invoke-CodeSignTool (@('batch_sign') + $authArgs + @(
+              "-totp_secret=$env:ES_TOTP_SECRET",
+              "-input_dir_path=$env:IN_DIR",
+              "-output_dir_path=$env:OUT_DIR"
+            ))
+            if ($batch.ExitCode -ne 0) { throw "CodeSignTool batch_sign failed with exit code $($batch.ExitCode)" }
+            if ($batch.Output -match '(?m)^\s*(Error|Exception)\b') {
+              throw 'CodeSignTool batch_sign reported an error (see above)'
+            }
+            $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
+            $missing = @()
+            foreach ($entry in $map) {
+              $signedCopy = Join-Path $env:OUT_DIR $entry.name
+              if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf) -or (Get-Item -LiteralPath $signedCopy).Length -eq 0) {
+                $missing += "$($entry.name) ($($entry.path))"
+              }
+            }
+            if ($missing.Count -gt 0) {
+              throw "CodeSignTool left missing or empty signed outputs in $($env:OUT_DIR):`n$($missing -join "`n")"
+            }
+          } finally {
+            if (-not [string]::IsNullOrWhiteSpace($env:CODE_SIGN_TOOL_PATH)) {
+              Remove-Item -LiteralPath (Join-Path $env:CODE_SIGN_TOOL_PATH 'logs') -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      # Put every signed copy back under its real name and check with signtool
+      # (/pa /tw /v, no /a) that every PE file carries a valid, embedded,
+      # timestamped Authenticode signature (never relying on runner catalogs).
+      - name: Install and verify the signed Windows binaries
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          OUT_DIR: ${{ steps.collect.outputs.out }}
+          MAP: ${{ steps.collect.outputs.map }}
+          APP: ${{ steps.app.outputs.app }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
+          foreach ($entry in $map) {
+            $signedCopy = Join-Path $env:OUT_DIR $entry.name
+            if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf)) { throw "eSigner returned no $($entry.name) for $($entry.path)" }
+            Copy-Item -LiteralPath $signedCopy -Destination $entry.path -Force
+          }
+          $bad = @()
+          $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll', '.node' })
+          if ($pe.Count -eq 0) { throw "Found no PE files under $env:APP" }
+          foreach ($file in $pe) {
+            $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $file.FullName 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+            $verifyExit = $LASTEXITCODE
+            if ($verifyExit -ne 0) {
+              Write-Host $verifyOut
+              $bad += "VerifyExit${verifyExit}: $($file.FullName)"
+            } elseif ($verifyOut -notmatch 'The signature is timestamped:') {
+              Write-Host $verifyOut
+              $bad += "NoTimestamp: $($file.FullName)"
+            }
+          }
+          if ($bad.Count -gt 0) { throw "Windows binaries without a valid, embedded, timestamped signature:`n$($bad -join "`n")" }
+          $exePath = Join-Path $env:APP 'mlx-node.exe'
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing signed executable: $exePath" }
+          $exe = Get-AuthenticodeSignature -LiteralPath $exePath
+          if ($null -eq $exe.SignerCertificate -or [string]::IsNullOrWhiteSpace($exe.SignerCertificate.Subject)) {
+            throw 'mlx-node.exe is missing a signer certificate subject'
+          }
+          Write-Host "mlx-node.exe signed by: $($exe.SignerCertificate.Subject)"
+          Write-Host "All $($pe.Count) PE files carry a valid, embedded, timestamped signature"
+
+      - name: Clean up temporary Windows signing files
+        if: always() && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'esigner'),
+            (Join-Path $env:RUNNER_TEMP 'codesigntool'),
+            (Join-Path $env:RUNNER_TEMP 'CodeSignTool-v1.3.2.zip')
+          )) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package Windows ARM64 (ZIP + MSIX)
+        id: package
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.app.outputs.app }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'oxnode', 'packages/desktop/scripts/package-windows.ts',
+            '--app-version', $env:APP_VERSION,
+            '--from-app', $env:APP
+          )
+          if ($env:SIGNED -eq 'true') { $argsList += '--signed' }
+          & yarn @argsList
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed.' }
           $resultPath = 'packages/desktop/out/windows-package-result.json'
           if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
           $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if ($env:SIGNED -eq 'true' -and $result.signed -ne $true) {
+            throw 'Expected signed Windows package result, got signed=false'
+          }
           if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
           if (-not (Test-Path -LiteralPath $result.zipPath -PathType Leaf)) { throw "Missing Windows ZIP: $($result.zipPath)" }
           "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
@@ -357,26 +745,38 @@ jobs:
           path: packages/desktop/out/winget
           if-no-files-found: error
 
-  release:
-    name: Sign, notarize, publish
-    needs: windows
+  macos:
+    name: Package and sign macOS ARM64
     runs-on: macos-26
     outputs:
+      commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
       release_tag: ${{ steps.version.outputs.release_tag }}
+      dmg_name: ${{ steps.version.outputs.dmg_name }}
+      zip_name: ${{ steps.version.outputs.zip_name }}
       windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
-      published: ${{ steps.publish.outputs.published }}
+      dmg_sha256: ${{ steps.hashes.outputs.dmg_sha256 }}
+      zip_sha256: ${{ steps.hashes.outputs.zip_sha256 }}
+      blockmap_sha256: ${{ steps.hashes.outputs.blockmap_sha256 }}
+      manifest_sha256: ${{ steps.hashes.outputs.manifest_sha256 }}
     permissions:
-      contents: write
-      actions: read
-    env:
-      # Hoisted so the cask step's `if` can test it — see the comment there.
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+          ref: ${{ inputs.dry_run && github.sha || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
           submodules: recursive
+
+      - name: Record checked-out commit
+        id: commit
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve checked-out commit SHA: $SHA"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -433,11 +833,35 @@ jobs:
           yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare draft release
+      - name: Verify release tag is publishable
         if: inputs.dry_run != true
         env:
+          TAG: ${{ env.RELEASE_TAG }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: yarn oxnode packages/desktop/scripts/publish-release.ts prepare --tag "$RELEASE_TAG"
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "::error::A release tag is required for publication"
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "::error::The checkout ($HEAD_COMMIT) does not match release tag $TAG ($TAG_COMMIT)"
+            exit 1
+          fi
+          set +e
+          rel_out="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>&1)"
+          rel_exit=$?
+          set -e
+          if [ "$rel_exit" -eq 0 ]; then
+            echo "::error::Release $TAG is already published; refusing to rebuild or modify a public release"
+            exit 1
+          elif ! grep -Eq 'HTTP 404|"status":[[:space:]]*"404"' <<< "$rel_out"; then
+            printf '%s\n' "$rel_out"
+            echo "::error::Failed to check release state for $TAG"
+            exit 1
+          fi
 
       # Deliberately a fresh build, not a `gh run download` of ci.yml's artifacts.
       # A release is rare and the ~16 min is worth it: artifact reuse is exactly how
@@ -637,28 +1061,19 @@ jobs:
           hdiutil create -volname "mlx-node" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
-      # Publish the Windows ZIP in the same draft transaction as the macOS
-      # assets. The Windows job has already verified its packaged app and archive.
-      - name: Download the Windows ARM64 artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: mlx-node-desktop-windows-arm64
-          path: packages/desktop/out/windows-release
-
       # Re-derives nothing. It reads CFBundleShortVersionString and CFBundleVersion
       # out of the plist that was actually written and the version out of the DMG's
       # actual filename, and fails unless they and the tag and the manifest are one
       # version. `resolve` above only proved the INPUTS agreed; this proves the
       # artifacts do. Runs before the DMG is notarized — the expensive step.
-      - name: Validate artifact versions
+      - name: Validate macOS artifact versions
         env:
           TAG: ${{ env.RELEASE_TAG }}
-          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \
             --app "${{ steps.package.outputs.app }}" --dmg "${{ steps.dmg.outputs.path }}" \
-            --zip "${{ steps.zip.outputs.path }}" --windows-zip "$WINDOWS_ZIP"
+            --zip "${{ steps.zip.outputs.path }}"
 
       # The DMG is a separate distributable and Gatekeeper assesses it on its own,
       # so it needs its own signature, notarization and ticket. Skipping this is the
@@ -678,10 +1093,42 @@ jobs:
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
 
+      # Hash the final (signed/notarized on real releases) macOS artifacts right
+      # before upload so `publish` can verify every downloaded file bit-for-bit.
+      - name: Compute macOS artifact SHA-256 digests
+        id: hashes
+        env:
+          DMG: ${{ steps.dmg.outputs.path }}
+          ZIP: ${{ steps.zip.outputs.path }}
+          BLOCKMAP: ${{ steps.update.outputs.blockmap }}
+          MANIFEST: ${{ steps.update.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          hash_artifact() {
+            local key="$1"
+            local path="$2"
+            if [ ! -f "$path" ] || [ ! -s "$path" ]; then
+              echo "::error::Missing or empty macOS artifact for $key: $path"
+              exit 1
+            fi
+            local digest
+            digest="$(shasum -a 256 "$path" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid SHA-256 digest for $path: $digest"
+              exit 1
+            fi
+            echo "${key}=${digest}" >> "$GITHUB_OUTPUT"
+          }
+          hash_artifact dmg_sha256 "$DMG"
+          hash_artifact zip_sha256 "$ZIP"
+          hash_artifact blockmap_sha256 "$BLOCKMAP"
+          hash_artifact manifest_sha256 "$MANIFEST"
+
       - uses: actions/upload-artifact@v7
         with:
           name: mlx-node-desktop-dmg
           path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v7
         with:
@@ -690,6 +1137,222 @@ jobs:
             ${{ steps.zip.outputs.path }}
             ${{ steps.update.outputs.blockmap }}
             ${{ steps.update.outputs.manifest }}
+          if-no-files-found: error
+
+      # `always()` so a failure anywhere above still removes the private key from
+      # the runner. The runner is ephemeral, but a leaked key outliving the job on a
+      # reused runner is not a risk worth carrying for one line.
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
+
+  publish:
+    name: Publish desktop release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+      windows_zip_name: ${{ steps.verify.outputs.windows_zip_name }}
+      published: ${{ steps.publish.outputs.published }}
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Require both builders to agree on one commit SHA BEFORE checking out or
+      # running any repository code (including Yarn).
+      - name: Verify build jobs produced the same commit
+        id: target
+        env:
+          WINDOWS_COMMIT: ${{ needs.windows.outputs.commit }}
+          MACOS_COMMIT: ${{ needs.macos.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WINDOWS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$MACOS_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid build commit SHA: windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+          if [ "$WINDOWS_COMMIT" != "$MACOS_COMMIT" ]; then
+            echo "::error::Build jobs checked out different commits: windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+          echo "sha=$WINDOWS_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      - name: Verify checked-out commit and release tag
+        env:
+          EXPECTED_SHA: ${{ steps.target.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Publish checkout ($HEAD_SHA) does not match verified build commit ($EXPECTED_SHA)"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ]; then
+            if [ -z "$TAG" ]; then
+              echo "::error::A release tag is required for publication"
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+            TAG_SHA="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+            if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+              echo "::error::Release tag $TAG ($TAG_SHA) no longer matches verified build commit ($EXPECTED_SHA)"
+              exit 1
+            fi
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Download the macOS DMG artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-dmg
+          path: packages/desktop/out/release-artifacts/dmg
+
+      - name: Download the macOS update artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-update
+          path: packages/desktop/out/release-artifacts/update
+
+      - name: Download the Windows ARM64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-windows-arm64
+          path: packages/desktop/out/release-artifacts/windows
+
+      - name: Verify cross-platform commits, versions, and artifact digests
+        id: verify
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          WINDOWS_COMMIT: ${{ needs.windows.outputs.commit }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          WINDOWS_ZIP_NAME_IN: ${{ needs.windows.outputs.windows_zip_name }}
+          WINDOWS_ZIP_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          MACOS_COMMIT: ${{ needs.macos.outputs.commit }}
+          MACOS_VERSION: ${{ needs.macos.outputs.version }}
+          MACOS_RELEASE_TAG: ${{ needs.macos.outputs.release_tag }}
+          MACOS_DMG_NAME: ${{ needs.macos.outputs.dmg_name }}
+          MACOS_ZIP_NAME: ${{ needs.macos.outputs.zip_name }}
+          MACOS_WINDOWS_ZIP_NAME: ${{ needs.macos.outputs.windows_zip_name }}
+          MACOS_DMG_SHA256: ${{ needs.macos.outputs.dmg_sha256 }}
+          MACOS_ZIP_SHA256: ${{ needs.macos.outputs.zip_sha256 }}
+          MACOS_BLOCKMAP_SHA256: ${{ needs.macos.outputs.blockmap_sha256 }}
+          MACOS_MANIFEST_SHA256: ${{ needs.macos.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve publish checkout commit SHA: $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$WINDOWS_COMMIT" != "$HEAD_SHA" ] || [ "$MACOS_COMMIT" != "$HEAD_SHA" ]; then
+            echo "::error::Cross-platform commit mismatch: publish=$HEAD_SHA windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+
+          RESOLVED="$(mktemp "$RUNNER_TEMP/resolved-version.XXXXXX")"
+          trap 'rm -f "$RESOLVED"' EXIT
+          GITHUB_OUTPUT="$RESOLVED" yarn oxnode packages/desktop/scripts/check-release.ts resolve \
+            --tag "$TAG" --manifest packages/desktop/package.json
+          version=""
+          dmg_name=""
+          zip_name=""
+          windows_zip_name=""
+          while IFS='=' read -r key val; do
+            case "$key" in
+              version) version="$val" ;;
+              dmg_name) dmg_name="$val" ;;
+              zip_name) zip_name="$val" ;;
+              windows_zip_name) windows_zip_name="$val" ;;
+            esac
+          done < "$RESOLVED"
+          if [ -z "$version" ] || [ -z "$dmg_name" ] || [ -z "$zip_name" ] || [ -z "$windows_zip_name" ]; then
+            echo "::error::check-release.ts resolve did not emit all expected outputs"
+            exit 1
+          fi
+
+          if [ "$WINDOWS_VERSION" != "$version" ] || [ "$MACOS_VERSION" != "$version" ]; then
+            echo "::error::Cross-platform version mismatch: resolved=$version windows=$WINDOWS_VERSION macos=$MACOS_VERSION"
+            exit 1
+          fi
+          if [ "$WINDOWS_ZIP_NAME_IN" != "$windows_zip_name" ] || [ "$MACOS_WINDOWS_ZIP_NAME" != "$windows_zip_name" ]; then
+            echo "::error::Windows ZIP name mismatch: resolved=$windows_zip_name windows=$WINDOWS_ZIP_NAME_IN macos=$MACOS_WINDOWS_ZIP_NAME"
+            exit 1
+          fi
+          if [ "$MACOS_DMG_NAME" != "$dmg_name" ] || [ "$MACOS_ZIP_NAME" != "$zip_name" ]; then
+            echo "::error::macOS artifact name mismatch: expected dmg=$dmg_name zip=$zip_name, got dmg=$MACOS_DMG_NAME zip=$MACOS_ZIP_NAME"
+            exit 1
+          fi
+          if [ "$MACOS_RELEASE_TAG" != "$TAG" ]; then
+            echo "::error::Release tag mismatch: publish=$TAG macos=$MACOS_RELEASE_TAG"
+            exit 1
+          fi
+
+          DMG="packages/desktop/out/release-artifacts/dmg/$dmg_name"
+          ZIP="packages/desktop/out/release-artifacts/update/$zip_name"
+          BLOCKMAP="packages/desktop/out/release-artifacts/update/${zip_name}.blockmap"
+          MANIFEST="packages/desktop/out/release-artifacts/update/latest-mac.yml"
+          WINDOWS_ZIP="packages/desktop/out/release-artifacts/windows/$windows_zip_name"
+
+          verify_artifact() {
+            local label="$1"
+            local path="$2"
+            local expected="$3"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "::error::Expected SHA-256 for $label is not a valid 64-character hex digest: $expected"
+              exit 1
+            fi
+            if [ ! -f "$path" ] || [ ! -s "$path" ]; then
+              echo "::error::Missing or empty $label artifact: $path"
+              exit 1
+            fi
+            local expected_lower actual_lower
+            expected_lower="${expected,,}"
+            actual_lower="$(sha256sum "$path" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')"
+            if [ "$actual_lower" != "$expected_lower" ]; then
+              echo "::error::SHA-256 mismatch for $label ($path): expected $expected_lower, got $actual_lower"
+              exit 1
+            fi
+            echo "Verified $label: $path ($actual_lower)"
+          }
+
+          verify_artifact "macOS DMG" "$DMG" "$MACOS_DMG_SHA256"
+          verify_artifact "macOS update ZIP" "$ZIP" "$MACOS_ZIP_SHA256"
+          verify_artifact "macOS blockmap" "$BLOCKMAP" "$MACOS_BLOCKMAP_SHA256"
+          verify_artifact "macOS update manifest" "$MANIFEST" "$MACOS_MANIFEST_SHA256"
+          verify_artifact "Windows ZIP" "$WINDOWS_ZIP" "$WINDOWS_ZIP_SHA256"
+
+          {
+            echo "version=$version"
+            echo "release_tag=$TAG"
+            echo "windows_zip_name=$windows_zip_name"
+            echo "dmg=$DMG"
+            echo "zip=$ZIP"
+            echo "blockmap=$BLOCKMAP"
+            echo "manifest=$MANIFEST"
+            echo "windows_zip=$WINDOWS_ZIP"
+            echo "dmg_sha256=${MACOS_DMG_SHA256,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare draft release
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: yarn oxnode packages/desktop/scripts/publish-release.ts prepare --tag "$RELEASE_TAG"
 
       - name: Upload artifacts and publish the draft release
         id: publish
@@ -699,11 +1362,11 @@ jobs:
         timeout-minutes: 190
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DMG: ${{ steps.dmg.outputs.path }}
-          ZIP: ${{ steps.zip.outputs.path }}
-          BLOCKMAP: ${{ steps.update.outputs.blockmap }}
-          MANIFEST: ${{ steps.update.outputs.manifest }}
-          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
+          DMG: ${{ steps.verify.outputs.dmg }}
+          ZIP: ${{ steps.verify.outputs.zip }}
+          BLOCKMAP: ${{ steps.verify.outputs.blockmap }}
+          MANIFEST: ${{ steps.verify.outputs.manifest }}
+          WINDOWS_ZIP: ${{ steps.verify.outputs.windows_zip }}
         run: |
           set -euo pipefail
           yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
@@ -711,45 +1374,48 @@ jobs:
             --windows-zip "$WINDOWS_ZIP"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
-      # The `secrets` context is NOT available in a step `if` — only github, needs,
-      # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
-      # `secrets.HOMEBREW_TAP_TOKEN != ''` there parses but never fires, so the cask
-      # would silently stop being bumped. The token is hoisted to job-level `env`
-      # (which IS in scope) and tested there instead.
+      # Scoped only to this step (not job-level env) so earlier steps never see
+      # HOMEBREW_TAP_TOKEN; empty-token opt-out is checked inside the step body.
       - name: Bump the Homebrew cask
-        if: inputs.dry_run != true && !contains(steps.version.outputs.version, '-') && !contains(steps.version.outputs.version, '+') && env.HOMEBREW_TAP_TOKEN != ''
+        if: inputs.dry_run != true && !contains(steps.verify.outputs.version, '-') && !contains(steps.verify.outputs.version, '+')
         env:
-          GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           # From the tag, via the same validated value the DMG was named with —
           # NOT re-read from the private manifest, which does not advance.
-          VERSION: ${{ steps.version.outputs.version }}
-          DMG: ${{ steps.dmg.outputs.path }}
+          VERSION: ${{ steps.verify.outputs.version }}
+          DMG: ${{ steps.verify.outputs.dmg }}
+          EXPECTED_DMG_SHA256: ${{ steps.verify.outputs.dmg_sha256 }}
         run: |
           set -euo pipefail
-          SHA256="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping Homebrew cask bump."
+            exit 0
+          fi
+          SHA256="$(sha256sum "$DMG" | cut -d' ' -f1)"
+          if [ "$SHA256" != "$EXPECTED_DMG_SHA256" ]; then
+            echo "::error::DMG SHA-256 mismatch before Homebrew cask bump: expected $EXPECTED_DMG_SHA256, got $SHA256"
+            exit 1
+          fi
           git clone --depth 1 "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY_OWNER/homebrew-tap.git" "$RUNNER_TEMP/tap"
           CASK="$RUNNER_TEMP/tap/Casks/mlx-node.rb"
           # Anchored to the field names so a version string appearing elsewhere in
           # the cask (a caveat, a zap path) is not rewritten too.
-          sed -i '' -e "s|^  version \".*\"|  version \"$VERSION\"|" \
-                    -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          sed -i -e "s|^  version \".*\"|  version \"$VERSION\"|" \
+                 -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          grep -Fxq "  version \"$VERSION\"" "$CASK" \
+            || { echo "::error::Failed to update version line in $CASK"; exit 1; }
+          grep -Fxq "  sha256 \"$SHA256\"" "$CASK" \
+            || { echo "::error::Failed to update sha256 line in $CASK"; exit 1; }
           git -C "$RUNNER_TEMP/tap" add Casks/mlx-node.rb
           git -C "$RUNNER_TEMP/tap" -c user.name=github-actions \
             -c user.email=github-actions@github.com commit -m "mlx-node $VERSION"
           git -C "$RUNNER_TEMP/tap" push
 
-      # `always()` so a failure anywhere above still removes the private key from
-      # the runner. The runner is ephemeral, but a leaked key outliving the job on a
-      # reused runner is not a risk worth carrying for one line.
-      - name: Remove the signing keychain
-        if: always()
-        run: security delete-keychain "$KEYCHAIN" || true
-
   winget:
     name: Submit WinGet update
-    needs: [windows, release]
+    needs: [windows, publish]
     runs-on: ubuntu-latest
-    if: always() && needs.release.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.release.outputs.version, '-') && !contains(needs.release.outputs.version, '+')
+    if: always() && needs.publish.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.publish.outputs.version, '-') && !contains(needs.publish.outputs.version, '+')
     permissions:
       contents: read
     steps:
@@ -773,9 +1439,9 @@ jobs:
       - name: Verify published Windows ZIP asset
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
           EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
         run: |
           set -euo pipefail
@@ -837,9 +1503,9 @@ jobs:
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
         run: |
           set -euo pipefail
           if [ -z "$WINGET_TOKEN" ]; then
@@ -875,9 +1541,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
           EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
           PR_NUMBER: ${{ steps.submit.outputs.pr_number }}
         run: |
