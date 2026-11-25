@@ -4691,6 +4691,28 @@ pub(crate) struct Inkling2FlatDecode<'a> {
 
 impl DecodeStep for Inkling2FlatDecode<'_> {
     fn forward(&mut self, input_ids: &MxArray) -> Result<(MxArray, bool)> {
+        if self.model.use_cuda_fast() {
+            let mut cache = self
+                .model
+                .cuda_cache
+                .take()
+                .ok_or_else(|| Error::from_reason("Inkling2 CUDA decode: cache missing"))?;
+            let res = self.model.forward_cuda_ids(
+                input_ids,
+                None,
+                &mut cache,
+                None,
+                None,
+                false,
+                super::cuda_forward::CudaLmHeadMode::LogitsF32,
+            );
+            self.model.cuda_cache = Some(cache);
+            let out = res?;
+            let logits = out
+                .logits_or_tokens
+                .ok_or_else(|| Error::from_reason("Inkling2 CUDA decode: missing logits"))?;
+            return Ok((logits, false));
+        }
         let tok = input_ids.item_at_int32(0)? as u32;
         let mut cache = self
             .model
@@ -4703,11 +4725,70 @@ impl DecodeStep for Inkling2FlatDecode<'_> {
         Ok((logits, false))
     }
 
-    fn eval_step(&mut self, next_token: &MxArray, _logits: &MxArray, _budget_forced: bool) {
-        MxArray::async_eval_arrays(&[next_token]);
+    fn eval_step(&mut self, next_token: &MxArray, logits: &MxArray, budget_forced: bool) {
+        if let Some(ref cache) = self.model.cuda_cache {
+            let mut pending: Vec<&MxArray> = Vec::with_capacity(cache.visits.len() * 8 + 2);
+            pending.push(next_token);
+            if budget_forced {
+                pending.push(logits);
+            }
+            cache.collect_pending_state_arrays(&mut pending);
+            MxArray::async_eval_arrays(&pending);
+            return;
+        }
+        if budget_forced {
+            MxArray::async_eval_arrays(&[next_token, logits]);
+        } else {
+            MxArray::async_eval_arrays(&[next_token]);
+        }
+    }
+
+    fn maintain_cache(&mut self, step: i32) {
+        if (step + 1) % 256 == 0 {
+            if self.model.cuda_cache.is_some() {
+                if crate::array::get_cache_memory()
+                    > crate::accelerator::cuda_cache_clear_threshold_bytes()
+                {
+                    crate::array::clear_cache();
+                }
+            } else {
+                crate::array::clear_cache();
+            }
+        }
+    }
+
+    fn end_decode(&mut self) -> Result<()> {
+        if let Some(ref cache) = self.model.cuda_cache {
+            cache.eval_pending_state()?;
+        }
+        Ok(())
     }
 
     fn materialize_final(&mut self, token_id: u32) -> Result<()> {
+        if self.model.use_cuda_fast() {
+            let mut cache = self.model.cuda_cache.take().ok_or_else(|| {
+                Error::from_reason("Inkling2 CUDA materialize_final: cache missing")
+            })?;
+            let ids = MxArray::from_int32(&[token_id as i32], &[1])?;
+            let res = self.model.forward_cuda_ids(
+                &ids,
+                None,
+                &mut cache,
+                None,
+                None,
+                false,
+                super::cuda_forward::CudaLmHeadMode::Skip,
+            );
+            let eval_res = if res.is_ok() {
+                cache.eval_pending_state()
+            } else {
+                Ok(())
+            };
+            self.model.cuda_cache = Some(cache);
+            let _ = res?;
+            eval_res?;
+            return Ok(());
+        }
         let mut cache =
             self.model.flat_cache.take().ok_or_else(|| {
                 Error::from_reason("Inkling2 flat materialize_final: cache missing")
@@ -5229,7 +5310,7 @@ impl ChatBackend for Inkling2Inner {
                 || (rt.coordinator.is_live_all(rt.active_seq)
                     && rt.conv_states.contains_key(&rt.active_seq))
         } else {
-            self.flat_cache.is_some()
+            self.flat_cache.is_some() || self.cuda_cache.is_some()
         }
     }
 
@@ -5268,6 +5349,11 @@ impl ChatBackend for Inkling2Inner {
     fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
         self.prefill_runs.clear();
         self.flat_cache = None;
+        self.cuda_cache = None;
+        if let Some(ref mut ctx) = self.cuda_dflash2_ctx {
+            ctx.reset();
+        }
+        self.cuda_dspark_ctx = None;
         self.cached_token_history.clear();
         self.cached_image_key = None;
         let _ = self.retract_open_dspark_wave();
@@ -5319,7 +5405,7 @@ impl ChatBackend for Inkling2Inner {
             }
             return 0;
         }
-        if self.flat_cache.is_some() {
+        if self.flat_cache.is_some() || self.cuda_cache.is_some() {
             cached.len()
         } else {
             0
@@ -5341,11 +5427,17 @@ impl ChatBackend for Inkling2Inner {
         if let Some(ref cache) = self.flat_cache {
             cache.eval_state()?;
         }
+        if let Some(ref cache) = self.cuda_cache {
+            cache.eval_pending_state()?;
+        }
         Ok(())
     }
 
     fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
         let _ctx = StreamContext::new(stream);
+        if self.use_cuda_fast() {
+            return self.prefill_cuda_flat(prompt_tokens);
+        }
         let mut cache = match self.flat_cache.take() {
             Some(c) => c,
             None => self.new_cache()?,
@@ -5373,23 +5465,29 @@ impl ChatBackend for Inkling2Inner {
 
     fn resolve_params(&self, config: &ChatConfig) -> crate::engine::params::ChatParams {
         let mut p = crate::engine::extract_chat_params(config);
-        if let Some(ref draft) = self.dflash2 {
-            let max_draft = draft.config.block_size.max(1);
-            p.mtp_depth = match config.mtp_depth {
-                Some(d) => (d.max(1) as usize).min(max_draft),
-                None => max_draft,
-            };
-            p.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
-        } else if let Some(ref draft) = self.dspark {
-            let max_draft = draft.config.num_draft_tokens();
-            p.mtp_depth = match config.mtp_depth {
-                Some(d) => (d.max(1) as usize).min(max_draft),
-                None => max_draft,
-            };
-            p.mtp_adaptive_depth = match config.mtp_adaptive_depth {
-                Some(enabled) => enabled,
-                None => config.mtp_depth.is_none(),
-            };
+        if self.paged.is_some() || self.use_cuda_fast() {
+            if let Some(ref draft) = self.dflash2 {
+                let max_draft = draft.config.block_size.max(1);
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(max_draft),
+                    None => max_draft,
+                };
+                p.mtp_adaptive_depth = config.mtp_adaptive_depth.unwrap_or(false);
+            } else if let Some(ref draft) = self.dspark {
+                let max_draft = if self.paged.is_some() {
+                    draft.config.num_draft_tokens()
+                } else {
+                    super::cuda_spec::clamp_cuda_dspark_max_draft(draft.config.num_draft_tokens())
+                };
+                p.mtp_depth = match config.mtp_depth {
+                    Some(d) => (d.max(1) as usize).min(max_draft),
+                    None => max_draft,
+                };
+                p.mtp_adaptive_depth = match config.mtp_adaptive_depth {
+                    Some(enabled) => enabled,
+                    None => config.mtp_depth.is_none(),
+                };
+            }
         }
         p
     }
@@ -5400,12 +5498,15 @@ impl ChatBackend for Inkling2Inner {
         } else {
             MediaPlan::NONE
         };
-        let speculative = if self.has_speculative_draft() && self.paged.is_some() {
+        let paged_spec = self.paged.is_some() && self.has_speculative_draft();
+        let cuda_spec =
+            self.paged.is_none() && self.use_cuda_fast() && self.has_speculative_draft();
+        let speculative = if paged_spec || cuda_spec {
             Some(SpeculativePlan {
                 kind: SpeculativeKind::DraftModel,
                 supported_input_media: MediaCapabilities::NONE,
                 supported_context_media: MediaCapabilities::NONE,
-                supports_paged_attention: true,
+                supports_paged_attention: paged_spec,
                 supports_streaming: true,
             })
         } else {
@@ -5438,7 +5539,15 @@ impl ChatBackend for Inkling2Inner {
     }
 
     fn run_speculative_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
-        crate::engine::dspark_turn::run_paged_dspark_turn(self, args)
+        if self.paged.is_some() && self.has_speculative_draft() {
+            crate::engine::dspark_turn::run_paged_dspark_turn(self, args)
+        } else if self.paged.is_none() && self.use_cuda_fast() && self.has_speculative_draft() {
+            crate::engine::dspark_turn::run_flat_dspark_turn(self, args)
+        } else {
+            Err(Error::from_reason(
+                "Inkling2 speculative turn requires paged Metal runtime or CUDA fast path with a loaded draft model",
+            ))
+        }
     }
 
     /// Execute an image-bearing turn on the exclusive barrier lane:
@@ -5494,8 +5603,38 @@ impl ChatBackend for Inkling2Inner {
                 let (logits_2d, _) =
                     self.paged_prefill_sequence(seq_id, &expanded_tokens, all_emb.as_ref())?;
                 logits_2d.squeeze(Some(&[0]))?
+            } else if self.use_cuda_fast() {
+                let _ctx = StreamContext::new(generation_stream);
+                // Release any prior flat/CUDA KV cache and stale draft context BEFORE allocating
+                // the replacement GPU cache to avoid doubling peak KV VRAM.
+                self.flat_cache = None;
+                self.cuda_cache = None;
+                if let Some(ref mut ctx) = self.cuda_dflash2_ctx {
+                    ctx.reset();
+                }
+                self.cuda_dspark_ctx = None;
+                self.cached_token_history.clear();
+                self.cached_image_key = None;
+                let mut cache = self.new_cuda_cache()?;
+                let (logits_2d, _) = self.prefill_cuda_tokens(
+                    &expanded_tokens,
+                    all_emb.as_ref(),
+                    &mut cache,
+                    None,
+                    None,
+                )?;
+                self.cuda_cache = Some(cache);
+                logits_2d.squeeze(Some(&[0]))?
             } else {
                 let _ctx = StreamContext::new(generation_stream);
+                self.flat_cache = None;
+                self.cuda_cache = None;
+                if let Some(ref mut ctx) = self.cuda_dflash2_ctx {
+                    ctx.reset();
+                }
+                self.cuda_dspark_ctx = None;
+                self.cached_token_history.clear();
+                self.cached_image_key = None;
                 let mut cache = self.new_cache()?;
                 let logits_2d =
                     self.forward_tokens(&expanded_tokens, all_emb.as_ref(), &mut cache)?;
@@ -5591,6 +5730,7 @@ impl ChatBackend for Inkling2Inner {
                     },
                     streaming_ctx,
                 )?;
+                stepper.end_decode()?;
             }
 
             // Hash image payloads so session media tracking stays distinct from text-only turns.
@@ -5684,6 +5824,11 @@ impl ChatBackend for Inkling2Inner {
                 self.abort_paged_turn();
             } else {
                 self.flat_cache = None;
+                self.cuda_cache = None;
+                if let Some(ref mut ctx) = self.cuda_dflash2_ctx {
+                    ctx.reset();
+                }
+                self.cuda_dspark_ctx = None;
                 self.cached_token_history.clear();
                 self.cached_image_key = None;
             }
@@ -7435,9 +7580,15 @@ mod dflash2_plan_tests {
             dflash2: Some(draft),
             dflash2_identity: None,
             dspark_turn_contexts: HashMap::new(),
+            cuda_dflash2_ctx: None,
+            cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+            cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+            cuda_dspark_ctx: None,
             scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
             paged: None,
             flat_cache: None,
+            cuda_cache: None,
+            cuda_kv_format: crate::models::inkling2::cuda_kv::Inkling2CudaKvFormat::Bf16,
             cached_token_history: Vec::new(),
             cached_image_key: None,
             turn_cancel: None,
@@ -7804,55 +7955,58 @@ mod dflash2_plan_tests {
                     }
                 }
 
-                // Publish via `capture_boundary_with_window` and confirm exact persisted PackedDraftWindow.
-                rt.coordinator
-                    .reset_scheduled_request(seq_id)
-                    .expect("reset seq");
-                rt.coordinator
-                    .record_tokens_all(seq_id, tokens)
-                    .expect("record tokens");
-                let bwin_ref = rt
-                    .block_boundary_draft_window
-                    .get(&seq_id)
-                    .filter(|(wb, _)| *wb == 64)
-                    .map(|(_, w)| w);
-                let id = rt
-                    .state_store
-                    .capture_boundary_with_window(
-                        &mut rt.coordinator,
-                        &conv,
-                        seq_id,
-                        tokens,
-                        64,
-                        salt,
-                        StateClass::Ordinary,
-                        bwin_ref,
-                        None,
-                    )
-                    .expect("capture_boundary_with_window")
-                    .expect("entry id");
-                let stored = rt
-                    .state_store
-                    .store
-                    .get(id)
-                    .expect("stored entry")
-                    .ram()
-                    .expect("ram anchor")
-                    .draft_window
-                    .as_ref()
-                    .expect("stored draft_window");
-                assert_eq!(
-                    stored, &expected_packed_64,
-                    "seq {seq_id} capture_boundary_with_window must publish exact PackedDraftWindow at 64"
-                );
-                // Release this sequence's KV blocks & anchor before testing the next sequence so
-                // the compact 4-block synthetic test pool has room for seq 2.
-                let _ = rt
-                    .state_store
-                    .reclaim_entry_with_options(&rt.coordinator, id, false, true);
-                rt.coordinator
-                    .release_request_all(seq_id)
-                    .expect("release seq");
+                if metal_available {
+                    // Publish via `capture_boundary_with_window` and confirm exact persisted PackedDraftWindow.
+                    // (`LayerKVPool::read_block_all_layers_into` is Metal-only on macOS.)
+                    rt.coordinator
+                        .reset_scheduled_request(seq_id)
+                        .expect("reset seq");
+                    rt.coordinator
+                        .record_tokens_all(seq_id, tokens)
+                        .expect("record tokens");
+                    let bwin_ref = rt
+                        .block_boundary_draft_window
+                        .get(&seq_id)
+                        .filter(|(wb, _)| *wb == 64)
+                        .map(|(_, w)| w);
+                    let id = rt
+                        .state_store
+                        .capture_boundary_with_window(
+                            &mut rt.coordinator,
+                            &conv,
+                            seq_id,
+                            tokens,
+                            64,
+                            salt,
+                            StateClass::Ordinary,
+                            bwin_ref,
+                            None,
+                        )
+                        .expect("capture_boundary_with_window")
+                        .expect("entry id");
+                    let stored = rt
+                        .state_store
+                        .store
+                        .get(id)
+                        .expect("stored entry")
+                        .ram()
+                        .expect("ram anchor")
+                        .draft_window
+                        .as_ref()
+                        .expect("stored draft_window");
+                    assert_eq!(
+                        stored, &expected_packed_64,
+                        "seq {seq_id} capture_boundary_with_window must publish exact PackedDraftWindow at 64"
+                    );
+                    // Release this sequence's KV blocks & anchor before testing the next sequence so
+                    // the compact 4-block synthetic test pool has room for seq 2.
+                    let _ =
+                        rt.state_store
+                            .reclaim_entry_with_options(&rt.coordinator, id, false, true);
+                    rt.coordinator
+                        .release_request_all(seq_id)
+                        .expect("release seq");
+                }
             }
         }
     }

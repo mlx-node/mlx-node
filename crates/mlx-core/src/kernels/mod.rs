@@ -10,6 +10,7 @@
 pub(crate) mod attention;
 pub(crate) mod dflash2;
 pub(crate) mod gdn;
+pub mod inkling2;
 pub(crate) mod kv;
 pub(crate) mod linear;
 pub(crate) mod qwen4;

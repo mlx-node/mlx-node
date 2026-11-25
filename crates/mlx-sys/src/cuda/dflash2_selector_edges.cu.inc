@@ -4,7 +4,10 @@ R"cuda(
 // Fused DFlash2 selector edge scoring for fixed K=16, Rank=256.
 // Replaces 8 unfused CUDA kernels (3x take, concat, mul, batched matmul, add, astype)
 // with a single launch. Grid: dim3(length), Block: dim3(256) (8 warps per position).
-// Matches the native BF16 graph rounding (BF16 prod -> FP32 dot -> BF16 + unary -> FP32).
+// Matches the native BF16 graph rounding (BF16 prod -> FP32 dot -> BF16 + unary -> FP32)
+// when `softcap == 0.0f` (bit-identical for Qwen3.8). When `softcap > 0.0f`, keeps
+// `float sum = unary + edge` in FP32 before `softcap * tanhf(sum / softcap)` (matching
+// Splash `sampling.metal:1670-1675`, preserving `-INFINITY`).
 extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cuda_kernel(
     const int* __restrict__ candidates,
     const unsigned char* __restrict__ unary_raw,

@@ -75,6 +75,25 @@ impl AttnInputNorm {
             } => vec![q_norm, k_norm, v_norm, qkv_norm],
         }
     }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        match self {
+            Self::Local(w) => w.promote_cuda_device(),
+            Self::Global {
+                q_norm,
+                k_norm,
+                v_norm,
+                qkv_norm,
+            } => {
+                let mut promoted = 0usize;
+                promoted += qkv_norm.promote_cuda_device()?;
+                promoted += q_norm.promote_cuda_device()?;
+                promoted += k_norm.promote_cuda_device()?;
+                promoted += v_norm.promote_cuda_device()?;
+                Ok(promoted)
+            }
+        }
+    }
 }
 
 /// One physical transformer layer (`0..23` for Inkling-2-Mini).
@@ -334,6 +353,33 @@ impl Inkling2PhysicalLayer {
         }
         arrays
     }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        if let Some(ref mut q) = self.attn_res_query {
+            let b = q.promote_cuda_device()?;
+            if b > 0 {
+                self.attn_res_query_t = Some(q.transpose(None)?);
+                promoted += b;
+            }
+        }
+        let fb = self.ffn_res_query.promote_cuda_device()?;
+        if fb > 0 {
+            self.ffn_res_query_t = self.ffn_res_query.transpose(None)?;
+            promoted += fb;
+        }
+        promoted += self.attn_inp_norm.ensure_cuda_device()?;
+        promoted += self.ffn_norm.promote_cuda_device()?;
+        promoted += self.self_attn.ensure_cuda_device()?;
+        promoted += self.moe.ensure_cuda_device()?;
+        if let Some(ref mut ctrl) = self.loop_ctrl {
+            promoted += ctrl.ensure_cuda_device()?;
+        }
+        Ok(promoted)
+    }
 }
 
 /// Complete flat inference cache for one Inkling2 sequence across all 48 logical visits.
@@ -417,6 +463,16 @@ pub struct Inkling2Inner {
     pub(crate) dflash2_identity: Option<Vec<u8>>,
     /// Per-sequence whole-turn speculative draft contexts (DSpark or DFlash2, keyed by `SeqId`).
     pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DraftContext>,
+    /// Flat CUDA DFlash2 per-turn draft context cache.
+    pub(crate) cuda_dflash2_ctx: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
+    /// Persistent online DFlash2 verify-tree probability calibrator across turns
+    /// (reset only on model reload, not per turn).
+    pub(crate) cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget,
+    /// Persistent online SAM lookup acceptance estimator across turns
+    /// (reset only on model reload, not per turn).
+    pub(crate) cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance,
+    /// Flat CUDA DSpark per-turn draft context cache.
+    pub(crate) cuda_dspark_ctx: Option<super::dspark::Inkling2DsparkContext>,
     /// Scheduled continuous-batching speculative lane contexts + verify wave state.
     pub(crate) scheduled_dspark: Inkling2ScheduledDsparkStates,
     /// Block-paged hybrid KV cache runtime (8 Global + 40 SWA, default INT8 32-token KTM on Metal)
@@ -424,6 +480,10 @@ pub struct Inkling2Inner {
     pub paged: Option<Inkling2PagedRuntime>,
     /// Flat fallback cache & session history used by [`crate::engine::backend::ChatBackend`].
     pub(crate) flat_cache: Option<Inkling2FlatCache>,
+    /// Pre-allocated GPU-resident CUDA fast KV + ShortConv cache (40 SWA rings + 8 Global slabs).
+    pub(crate) cuda_cache: Option<super::cuda_kv::Inkling2CudaCache>,
+    /// Active CUDA KV format (`Bf16` default, overridable via `MLX_INKLING2_CUDA_KV_FORMAT` or load options).
+    pub(crate) cuda_kv_format: super::cuda_kv::Inkling2CudaKvFormat,
     pub(crate) cached_token_history: Vec<u32>,
     pub(crate) cached_image_key: Option<u64>,
     pub(crate) turn_cancel: Option<Arc<AtomicBool>>,
@@ -449,9 +509,83 @@ impl Drop for Inkling2Inner {
 }
 
 impl Inkling2Inner {
+    /// Returns `true` when the active turn's cancellation flag has been raised.
+    #[inline]
+    pub(crate) fn is_turn_cancelled(&self) -> bool {
+        self.turn_cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+    }
+
     /// Allocate a fresh flat cache for one sequence.
     pub fn new_cache(&self) -> Result<Inkling2FlatCache> {
         Inkling2FlatCache::new(&self.config, DType::BFloat16)
+    }
+
+    /// Allocate a fresh pre-allocated CUDA GPU KV + ShortConv cache for one sequence.
+    pub(crate) fn new_cuda_cache(&self) -> Result<super::cuda_kv::Inkling2CudaCache> {
+        super::cuda_kv::Inkling2CudaCache::new(&self.config, self.cuda_kv_format)
+    }
+
+    /// Promote every resident weight array (backbone, `embed_tokens`, `lm_head`, optional
+    /// `vision_encoder`, and optional `dspark`) from CUDA pinned-host memory (`device == -1`)
+    /// into GPU device memory (`device == 0`).
+    ///
+    /// Flushes MLX's allocator cache every 256 MiB promoted so peak unified/host RAM stays tight.
+    /// No-op on non-CUDA builds or when weights are already device-resident.
+    pub(crate) fn ensure_cuda_device_weights(&mut self) -> Result<()> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(());
+        }
+        const FLUSH_BYTES: usize = 256 << 20;
+        let started = Instant::now();
+        let mut total_promoted = 0usize;
+        let mut since_flush = 0usize;
+
+        let mut account = |bytes: usize| {
+            total_promoted += bytes;
+            since_flush += bytes;
+            if since_flush >= FLUSH_BYTES {
+                crate::array::clear_cache();
+                since_flush = 0;
+            }
+        };
+
+        account(self.embed_tokens.ensure_cuda_device()?);
+        account(self.embed_norm.promote_cuda_device()?);
+        for layer in &mut self.layers {
+            account(layer.ensure_cuda_device()?);
+        }
+        let orq = self.output_res_query.promote_cuda_device()?;
+        if orq > 0 {
+            self.output_res_query_t = self.output_res_query.transpose(None)?;
+            account(orq);
+        }
+        account(self.output_norm.promote_cuda_device()?);
+        let lm_promoted = self.lm_head.ensure_cuda_device()?;
+        account(lm_promoted);
+        if lm_promoted > 0
+            && let Some(ref existing) = self.lm_head_bf16_unpadded
+            && let LinearProj::Standard(ref lin) = self.lm_head
+        {
+            let cols = existing.shape_at(0)?;
+            self.lm_head_bf16_unpadded = Some(lin.get_weight().slice_axis(0, 0, cols)?);
+        }
+        if let Some(ref mut ve) = self.vision_encoder {
+            account(ve.ensure_cuda_device()?);
+        }
+        if let Some(ref mut dspark) = self.dspark {
+            account(dspark.ensure_cuda_device()?);
+        }
+        if total_promoted > 0 {
+            crate::array::clear_cache();
+            tracing::info!(
+                "Inkling2 CUDA weight residency: promoted {:.1} MiB to GPU device in {:.2}s",
+                total_promoted as f64 / (1024.0 * 1024.0),
+                started.elapsed().as_secs_f64(),
+            );
+        }
+        Ok(())
     }
 
     /// Initialize or replace the block-paged KV runtime (e.g. to switch between INT8 KTM and BF16).
@@ -773,6 +907,17 @@ impl Inkling2Inner {
     /// True when either an external DFlash2 or DSpark drafter is loaded.
     pub(crate) fn has_speculative_draft(&self) -> bool {
         self.dflash2.is_some() || self.dspark.is_some()
+    }
+
+    /// Whether an active external speculative drafter (DFlash2 or DSpark on paged Metal
+    /// or the CUDA fast path) is attached.
+    #[inline]
+    pub fn has_mtp_weights(&self) -> bool {
+        if self.paged.is_some() || self.use_cuda_fast() {
+            self.has_speculative_draft()
+        } else {
+            false
+        }
     }
 
     /// Target visit indices tapped by the active speculative drafter (`[5, 23, 41, 48]`),

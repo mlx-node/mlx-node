@@ -79,9 +79,11 @@ __device__ __forceinline__ void topk16_reduce_block(
 // Single-stage fallback for small vocab (<= 8192).
 extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_topk16_cuda_kernel(
     const unsigned char* __restrict__ logits, int dtype, int vocab,
+    long long row_stride,
     int* __restrict__ out_ids, float* __restrict__ out_values) {
   const int row = blockIdx.x;
   const int tid = threadIdx.x;
+  const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(row_stride);
   float values[16];
   unsigned int ids[16];
   const float negative_inf = -__int_as_float(0x7f800000);
@@ -94,12 +96,12 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_topk16_cuda_kernel
     float value;
     if (dtype == 0) {
       value = __bfloat162float(
-          reinterpret_cast<const nv_bfloat16*>(logits)[(size_t)row * vocab + token]);
+          reinterpret_cast<const nv_bfloat16*>(logits)[row_off + token]);
     } else if (dtype == 1) {
       value = __half2float(
-          reinterpret_cast<const __half*>(logits)[(size_t)row * vocab + token]);
+          reinterpret_cast<const __half*>(logits)[row_off + token]);
     } else {
-      value = reinterpret_cast<const float*>(logits)[(size_t)row * vocab + token];
+      value = reinterpret_cast<const float*>(logits)[row_off + token];
     }
     if (topk16_beats(value, token, values[15], ids[15])) {
       topk16_insert(values, ids, value, token);
@@ -109,17 +111,18 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_topk16_cuda_kernel
 }
 
 // Stage 1 (Split-V): each CTA scans one 8192-token slice with vectorized loads
-// across all SMs, outputting its exact local top-16.
+// across all SMs, outputting its exact local top-16. Supports zero-copy strided rows.
 template <int DTYPE>
 __global__ __launch_bounds__(256, 2) void mlx_dflash2_topk16_slice(
     const unsigned char* __restrict__ logits,
-    int vocab, int slice_size, int num_slices,
+    int vocab, long long row_stride, int slice_size, int num_slices,
     int* __restrict__ part_ids, float* __restrict__ part_values) {
   const int slice = blockIdx.x;
   const int row = blockIdx.y;
   const int tid = threadIdx.x;
   const int start = slice * slice_size;
   const int end = min(start + slice_size, vocab);
+  const size_t row_off = static_cast<size_t>(row) * static_cast<size_t>(row_stride);
 
   float values[16];
   unsigned int ids[16];
@@ -132,10 +135,21 @@ __global__ __launch_bounds__(256, 2) void mlx_dflash2_topk16_slice(
 
   if constexpr (DTYPE == 0) {
     const nv_bfloat16* row_ptr =
-        reinterpret_cast<const nv_bfloat16*>(logits) + (size_t)row * vocab;
-    const bool aligned = ((reinterpret_cast<unsigned long long>(row_ptr + start) & 15ull) == 0);
-    const int vec_end = aligned ? (start + ((end - start) & ~7)) : start;
-    for (int base = start + tid * 8; base < vec_end; base += 256 * 8) {
+        reinterpret_cast<const nv_bfloat16*>(logits) + row_off;
+    const unsigned long long addr = reinterpret_cast<unsigned long long>(row_ptr + start);
+    const bool can_vec = ((addr & 1ull) == 0);
+    const int mis_bytes = static_cast<int>(addr & 15ull);
+    const int prologue =
+        can_vec ? ((mis_bytes == 0) ? 0 : ((16 - mis_bytes) >> 1)) : (end - start);
+    const int vec_start = min(start + prologue, end);
+    const int vec_end = can_vec ? (vec_start + ((end - vec_start) & ~7)) : end;
+    for (int token = start + tid; token < vec_start; token += 256) {
+      const float value = __bfloat162float(row_ptr[token]);
+      if (topk16_beats(value, static_cast<unsigned int>(token), values[15], ids[15])) {
+        topk16_insert(values, ids, value, static_cast<unsigned int>(token));
+      }
+    }
+    for (int base = vec_start + tid * 8; base < vec_end; base += 256 * 8) {
       const uint4 raw = *reinterpret_cast<const uint4*>(row_ptr + base);
       const __nv_bfloat162* pairs = reinterpret_cast<const __nv_bfloat162*>(&raw);
 #pragma unroll
@@ -159,10 +173,21 @@ __global__ __launch_bounds__(256, 2) void mlx_dflash2_topk16_slice(
     }
   } else if constexpr (DTYPE == 1) {
     const __half* row_ptr =
-        reinterpret_cast<const __half*>(logits) + (size_t)row * vocab;
-    const bool aligned = ((reinterpret_cast<unsigned long long>(row_ptr + start) & 15ull) == 0);
-    const int vec_end = aligned ? (start + ((end - start) & ~7)) : start;
-    for (int base = start + tid * 8; base < vec_end; base += 256 * 8) {
+        reinterpret_cast<const __half*>(logits) + row_off;
+    const unsigned long long addr = reinterpret_cast<unsigned long long>(row_ptr + start);
+    const bool can_vec = ((addr & 1ull) == 0);
+    const int mis_bytes = static_cast<int>(addr & 15ull);
+    const int prologue =
+        can_vec ? ((mis_bytes == 0) ? 0 : ((16 - mis_bytes) >> 1)) : (end - start);
+    const int vec_start = min(start + prologue, end);
+    const int vec_end = can_vec ? (vec_start + ((end - vec_start) & ~7)) : end;
+    for (int token = start + tid; token < vec_start; token += 256) {
+      const float value = __half2float(row_ptr[token]);
+      if (topk16_beats(value, static_cast<unsigned int>(token), values[15], ids[15])) {
+        topk16_insert(values, ids, value, static_cast<unsigned int>(token));
+      }
+    }
+    for (int base = vec_start + tid * 8; base < vec_end; base += 256 * 8) {
       const uint4 raw = *reinterpret_cast<const uint4*>(row_ptr + base);
       const __half2* pairs = reinterpret_cast<const __half2*>(&raw);
 #pragma unroll
@@ -186,7 +211,7 @@ __global__ __launch_bounds__(256, 2) void mlx_dflash2_topk16_slice(
     }
   } else {
     const float* row_ptr =
-        reinterpret_cast<const float*>(logits) + (size_t)row * vocab;
+        reinterpret_cast<const float*>(logits) + row_off;
     for (int token = start + tid; token < end; token += 256) {
       const float value = row_ptr[token];
       if (topk16_beats(value, static_cast<unsigned int>(token), values[15], ids[15])) {

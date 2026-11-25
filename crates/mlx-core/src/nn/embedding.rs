@@ -59,6 +59,21 @@ struct GgufQ8_0MmapEmbedding {
     byte_offset: u64,
 }
 
+/// Borrowed view of an [`Embedding`]'s raw storage when it can be consumed directly
+/// by fused lookup kernels (plain dense table or packed-quantized table without
+/// sharding, mmap, or Hadamard rotation).
+pub(crate) enum EmbeddingRawView<'a> {
+    Dense(&'a MxArray),
+    QuantizedPacked {
+        weight: &'a MxArray,
+        scales: &'a MxArray,
+        biases: Option<&'a MxArray>,
+        group_size: i32,
+        bits: i32,
+        mode: &'a str,
+    },
+}
+
 pub struct Embedding {
     /// Dense (bf16) weight. For a plain bf16 embedding this is the lookup
     /// table. For a PACKED-quantized embedding (`quantized_packed` set) this is
@@ -502,6 +517,29 @@ impl Embedding {
         Ok(())
     }
 
+    /// Promote settled CUDA pinned-host embedding weights into GPU device memory.
+    /// Returns the total promoted byte count (`0` on non-CUDA builds or when already resident).
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        if let Some(ref mut q) = self.quantized_packed {
+            promoted += q.weight.promote_cuda_device()?;
+            promoted += q.scales.promote_cuda_device()?;
+            if let Some(ref mut b) = q.biases {
+                promoted += b.promote_cuda_device()?;
+            }
+        } else if let Some(ref mut sh) = self.sharded {
+            for shard in &mut sh.shards {
+                promoted += shard.promote_cuda_device()?;
+            }
+        } else if self.gguf_q8_0_mmap.is_none() {
+            promoted += self.weight.promote_cuda_device()?;
+        }
+        Ok(promoted)
+    }
+
     /// Get the embedding weight matrix (always returns dense bf16).
     ///
     /// - Plain bf16 / LEGACY pre-dequantized embeddings: returns the dense
@@ -562,6 +600,26 @@ impl Embedding {
     /// that constructs a full-table dequantization graph on demand.
     pub fn is_packed_quantized(&self) -> bool {
         self.quantized_packed.is_some()
+    }
+
+    /// Borrow the raw underlying dense or packed-quantized tensors when no
+    /// sharding, mmap, or Hadamard post-transform is active. Never triggers
+    /// full-table dequantization.
+    pub(crate) fn raw_view(&self) -> Option<EmbeddingRawView<'_>> {
+        if self.gguf_q8_0_mmap.is_some() || self.sharded.is_some() || self.hadamard.is_some() {
+            return None;
+        }
+        if let Some(ref q) = self.quantized_packed {
+            return Some(EmbeddingRawView::QuantizedPacked {
+                weight: &q.weight,
+                scales: &q.scales,
+                biases: q.biases.as_ref(),
+                group_size: q.group_size,
+                bits: q.bits,
+                mode: q.mode.as_str(),
+            });
+        }
+        Some(EmbeddingRawView::Dense(&self.weight))
     }
 
     /// Number of packed full-table dequantization graphs requested through

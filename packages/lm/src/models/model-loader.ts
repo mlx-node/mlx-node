@@ -212,6 +212,7 @@ export function supportsAutomaticDFlash2(modelType: ModelType): boolean {
   const caps = getRuntimeCapabilities();
   if (modelType === 'qwen3_5') return caps.supportsDenseDflash2;
   if (modelType === 'qwen3_5_moe') return caps.supportsMoeDflash2;
+  if (modelType === 'inkling2') return caps.backend === 'metal' || caps.backend === 'cuda';
   return caps.backend === 'metal';
 }
 

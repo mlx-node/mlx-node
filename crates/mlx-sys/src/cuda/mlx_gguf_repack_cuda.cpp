@@ -65,6 +65,11 @@ class GgufRepackBandCuda final : public Primitive {
         throw std::runtime_error(
             "GgufRepackBandCuda: Q6_K scales/biases destination alignment error");
       }
+    } else if (kernel_ == 19) {
+      if ((reinterpret_cast<uintptr_t>(gpu_ptr<void>(outputs[1])) & 3u) != 0u) {
+        throw std::runtime_error(
+            "GgufRepackBandCuda: NVFP4 scales destination alignment error");
+      }
     }
     array st = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
     encoder.set_input_array(st);
@@ -152,6 +157,7 @@ bool cuda_repack_supports_kernel(int kernel) noexcept {
     case 14:  // mlx_node_gguf_repack_q8_0
     case 17:  // mlx_node_gguf_repack_q5_1
     case 18:  // mlx_node_gguf_repack_q8_0_bias
+    case 19:  // mlx_node_gguf_repack_nvfp4
       return true;
     default:
       return false;

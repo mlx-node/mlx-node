@@ -73,6 +73,13 @@ impl ExpertSwitchProj {
         }
         Ok(())
     }
+
+    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
+        if let Self::Quantized(q) = self {
+            q.promote_outer_scale_to_f32()?;
+        }
+        Ok(())
+    }
 }
 
 impl From<ExpertSwitchProj> for SwitchProj {
@@ -190,9 +197,9 @@ impl Inkling2MoE {
         })
     }
 
-    /// Forward pass for `[T, D]` normalized MLP input.
-    /// Returns `[T, D]` in `x`'s dtype (BF16), after `ffn_post_conv`.
-    pub fn forward(&self, x: &MxArray, conv_state: &mut VisitShortConvState) -> Result<MxArray> {
+    /// Forward pass for `[T, D]` normalized MLP input up to pre-`ffn_post_conv` combined output
+    /// (`[T, D]` in `x`'s dtype, typically BF16).
+    pub(crate) fn forward_pre_conv(&self, x: &MxArray) -> Result<MxArray> {
         let shape = x.shape()?;
         if shape.len() != 2 {
             return Err(Error::from_reason(format!(
@@ -224,11 +231,6 @@ impl Inkling2MoE {
         )?;
 
         // 2. Prepare inputs for `QuantizedSwitchLinear`.
-        // At `total_slots >= 64` (M>=8 verify/prefill), sorting by expert id keeps adjacent
-        // `gather_qmm` threadgroups hitting the same expert weights in GPU L2/SLC cache
-        // (measured -1.0 ms net on M5 Max M=8 vs unsorted). For M=1..4 (`total_slots < 64`),
-        // pass `[T, 1, 1, D]` with `indices = [T, K]` and `lhs_indices = None` — zero sort,
-        // zero `take` 8x copying of `x`!
         let total_slots = t * k;
         let do_sort = total_slots >= 64;
 
@@ -315,14 +317,36 @@ impl Inkling2MoE {
         let combined = down_tkd
             .mul(&gamma.expand_dims(-1)?)?
             .sum(Some(&[1]), Some(false))?;
-        let moe_out = if act_dtype != DType::Float32 {
-            combined.astype(act_dtype)?
+        if act_dtype != DType::Float32 {
+            combined.astype(act_dtype)
         } else {
-            combined
-        };
+            Ok(combined)
+        }
+    }
 
+    /// Forward pass for `[T, D]` normalized MLP input.
+    /// Returns `[T, D]` in `x`'s dtype (BF16), after `ffn_post_conv`.
+    pub fn forward(&self, x: &MxArray, conv_state: &mut VisitShortConvState) -> Result<MxArray> {
+        let moe_out = self.forward_pre_conv(x)?;
         // 7. Post-MoE static ShortConv (k = 4)
         static_short_conv(&moe_out, &self.post_conv, &mut conv_state.mlp_post)
+    }
+
+    /// Promote all resident MoE weights to CUDA device memory, refreshing derived transposes.
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        let mut promoted = 0usize;
+        let rw = self.router_weight_f32.promote_cuda_device()?;
+        if rw > 0 {
+            self.router_weight_t_f32 = self.router_weight_f32.transpose(None)?;
+            promoted += rw;
+        }
+        if let Some(ref mut rb) = self.router_bias_f32 {
+            promoted += rb.promote_cuda_device()?;
+        }
+        promoted += self.gate_up_proj.ensure_cuda_device()?;
+        promoted += self.down_proj.ensure_cuda_device()?;
+        promoted += self.post_conv.promote_cuda_device()?;
+        Ok(promoted)
     }
 
     /// Fused Metal paged forward pass for `[T, D]` normalized MLP input across one or more

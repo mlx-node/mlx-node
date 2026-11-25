@@ -321,7 +321,7 @@ impl DFlash2Attention {
         let batch = queries.shape_at(0)?;
         let seq = queries.shape_at(2)?;
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let attended = match crate::kernels::attention::sdpa_draft_masked(
+        let attended = if let Some(out_bthd) = crate::kernels::attention::sdpa_draft_masked_bthd(
             queries,
             keys,
             values,
@@ -331,15 +331,33 @@ impl DFlash2Attention {
             self.num_kv_heads,
             seq,
             scale as f32,
-            self.tensor_attention_enabled,
         )? {
-            Some(out) => out,
-            None => {
-                scaled_dot_product_attention(queries, keys, values, scale, broadcast_mask.or(mask))?
+            out_bthd
+        } else {
+            match crate::kernels::attention::sdpa_draft_masked(
+                queries,
+                keys,
+                values,
+                mask,
+                self.head_dim,
+                self.num_heads,
+                self.num_kv_heads,
+                seq,
+                scale as f32,
+                self.tensor_attention_enabled,
+            )? {
+                Some(out) => out,
+                None => scaled_dot_product_attention(
+                    queries,
+                    keys,
+                    values,
+                    scale,
+                    broadcast_mask.or(mask),
+                )?,
             }
-        }
-        .transpose(Some(&[0, 2, 1, 3]))?
-        .reshape(&[batch, seq, self.num_heads * self.head_dim])?;
+            .transpose(Some(&[0, 2, 1, 3]))?
+            .reshape(&[batch, seq, self.num_heads * self.head_dim])?
+        };
         self.o_proj.forward(&attended)
     }
 }

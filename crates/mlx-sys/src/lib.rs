@@ -2692,14 +2692,31 @@ unsafe extern "C-unwind" {
         out_handles: *mut *mut mlx_array,
     ) -> bool;
 
-    /// Direct BF16 -> BF16 small-row (M in 2..=8) affine 8-bit group_size=32
-    /// quantized matmul with FP32 scales and biases on CUDA.
+    /// Direct BF16 -> BF16 small-row (M in 1..=16) affine/symmetric 8-bit group_size=32
+    /// quantized matmul with F32/BF16/F16 scales and optional biases on CUDA.
     pub fn mlx_affine_q8_few_cuda(
         x: *mut mlx_array,
         w: *mut mlx_array,
         scales: *mut mlx_array,
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
+
+    /// Direct BF16 -> BF16 paired small-row (M in 1..=16) affine/symmetric 8-bit
+    /// group_size=32 quantized matmul for two independent `(x0 @ W0^T, x1 @ W1^T)`
+    /// projections with matching `(M, N, K)` in a single CUDA launch.
+    pub fn mlx_affine_q8_few_pair_cuda(
+        x0: *mut mlx_array,
+        w0: *mut mlx_array,
+        s0: *mut mlx_array,
+        b0: *mut mlx_array,
+        x1: *mut mlx_array,
+        w1: *mut mlx_array,
+        s1: *mut mlx_array,
+        b1: *mut mlx_array,
+        group_size: i32,
+        out0: *mut *mut mlx_array,
+        out1: *mut *mut mlx_array,
+    ) -> bool;
 
     /// Direct BF16 -> BF16 small-row (M in 1..=8) affine 4-bit group_size=64
     /// quantized matmul with BF16 scales and biases on CUDA (8-warp split-K MMA).
@@ -2710,8 +2727,19 @@ unsafe extern "C-unwind" {
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
 
-    /// Bandwidth-bound BF16 small-row (M in 1..=8) linear projection Y = X @ W^T on CUDA.
+    /// Bandwidth-bound BF16 small-row (M in 1..=16) linear projection Y = X @ W^T on CUDA.
     pub fn mlx_bf16_gemm_few_cuda(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    /// Bandwidth-bound paired BF16 small-row (M in 1..=16) linear projections
+    /// `(x0 @ W0^T, x1 @ W1^T)` with matching `(M, N, K)` in a single CUDA launch.
+    pub fn mlx_bf16_gemm_few_pair_cuda(
+        x0: *mut mlx_array,
+        w0: *mut mlx_array,
+        x1: *mut mlx_array,
+        w1: *mut mlx_array,
+        out0: *mut *mut mlx_array,
+        out1: *mut *mut mlx_array,
+    ) -> bool;
 
     /// Tensor-Core split-KV causal Flash-Decoding for D=256, GQA folded M=gqa*Q<=64 on CUDA.
     pub fn mlx_sdpa_tc_few_cuda(
@@ -2723,6 +2751,17 @@ unsafe extern "C-unwind" {
 
     /// Tensor-Core split-KV Flash-Decoding for D in {128, 256} with optional [1,1,Q,K] bool mask.
     pub fn mlx_sdpa_tc_few_masked_cuda(
+        q: *mut mlx_array,
+        k: *mut mlx_array,
+        v: *mut mlx_array,
+        mask: *mut mlx_array,
+        scale: f32,
+        is_causal: bool,
+    ) -> *mut mlx_array;
+
+    /// Tensor-Core split-KV Flash-Decoding for D in {128, 256} with optional [1,1,Q,K] bool mask,
+    /// outputting directly in fused `[B, Q, Hq * D]` (BTHD) layout (zero output transpose copy).
+    pub fn mlx_sdpa_tc_few_masked_bthd_cuda(
         q: *mut mlx_array,
         k: *mut mlx_array,
         v: *mut mlx_array,
@@ -4587,6 +4626,265 @@ unsafe extern "C" {
         out_normed: *mut *mut mlx_array,
         out_xq: *mut *mut mlx_array,
         out_sx: *mut *mut mlx_array,
+    ) -> bool;
+
+    // =========================================================================
+    // Inkling-2-Mini CUDA primitives (`cuda/inkling2/{ops,sdpa,moe}.cpp`).
+    // All return null/false on non-CUDA builds or off-contract inputs.
+    // =========================================================================
+
+    /// Block AttnRes over `n_sources` in `1..=8` `[T, D]` BF16/FP32 sources with
+    /// FP32 `queries [Q, D]` and optional fused sublayer RMSNorm (`norm_weights`
+    /// FP32 `[D]` or `[1|Q, D]`). Returns FP32 (no norm) or BF16 (with norm),
+    /// shaped `[T, D]` when `Q == 1 && squeeze_q1` else `[Q, T, D]`.
+    pub fn mlx_inkling2_block_attn_res_norm_cuda(
+        sources: *const *mut mlx_array,
+        n_sources: usize,
+        queries: *mut mlx_array,
+        norm_weights: *mut mlx_array,
+        eps: f32,
+        squeeze_q1: bool,
+    ) -> *mut mlx_array;
+
+    /// Fused rank-64 LoopController + sublayer RMSNorm (`g_count` in `{1, 3}`).
+    /// Returns BF16 `[T, D]` when `g_count == 1 && squeeze_g1` else `[G, T, D]`.
+    pub fn mlx_inkling2_loop_ctrl_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        down_w: *mut mlx_array,
+        gain_forget_w: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        eps: f32,
+        g_count: i32,
+        squeeze_g1: bool,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController stage 1: fused weightless RMSNorm + concat
+    /// `[rms_norm(dest, eps), rms_norm(msg, eps)]` -> `[T, 2*D]` (`g_count == 1`) or
+    /// `[3, T, 2*D]` (`g_count == 3`) in BF16 (`out_is_bf16 != 0`) or FP32.
+    pub fn mlx_inkling2_loop_pair_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
+        out_is_bf16: i32,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController stage 3: fused `(1 - tanh(forget)) * dest + tanh(gain) * msg`
+    /// + sublayer RMSNorm -> `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+    pub fn mlx_inkling2_loop_blend_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        gf: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController fused stage 2b+3: Tensor Core `h @ gf_w.T` +
+    /// `(1 - tanh(forget)) * dest + tanh(gain) * msg` + sublayer RMSNorm ->
+    /// `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+    pub fn mlx_inkling2_loop_up_blend_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        h: *mut mlx_array,
+        gf_w: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    /// Fused Q/R L2-clip + K/V ShortConv (static SWA or dynamic Global, linear
+    /// or tree `conv_taps`) + K L2-clip + V RMSNorm + Global `tau(p)` + in-place
+    /// BF16/INT8 KV cache store (linear flat or circular SWA ring).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_kv_conv_prep_store_cuda(
+        q_raw: *mut mlx_array,
+        r_raw: *mut mlx_array,
+        k_raw: *mut mlx_array,
+        v_raw: *mut mlx_array,
+        q_clip: *mut mlx_array,
+        rel_clip: *mut mlx_array,
+        k_conv_w: *mut mlx_array,
+        v_conv_w: *mut mlx_array,
+        dyn_k: *mut mlx_array,
+        dyn_v: *mut mlx_array,
+        k_hist_in: *mut mlx_array,
+        v_hist_in: *mut mlx_array,
+        kv_k_cache: *mut mlx_array,
+        kv_v_cache: *mut mlx_array,
+        kv_k_scales: *mut mlx_array,
+        kv_v_scales: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        depths: *mut mlx_array,
+        start_pos: i32,
+        write_offset: i32,
+        ring_cap: i32,
+        is_global: bool,
+        log_n_floor: f32,
+        log_alpha: f32,
+        update_hist: bool,
+        out_q: *mut *mut mlx_array,
+        out_r: *mut *mut mlx_array,
+        out_k_hist: *mut *mut mlx_array,
+        out_v_hist: *mut *mut mlx_array,
+        out_kv_k_alias: *mut *mut mlx_array,
+        out_kv_v_alias: *mut *mut mlx_array,
+        out_ks_alias: *mut *mut mlx_array,
+        out_vs_alias: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Static ShortConv `k=4` + optional FP32/BF16 residual add (linear or tree
+    /// `conv_taps`) + optional rolling `[3, C]` history update.
+    pub fn mlx_inkling2_sconv_k4_residual_cuda(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+        hist_in: *mut mlx_array,
+        residual: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        update_hist: bool,
+        out_y: *mut *mut mlx_array,
+        out_hist: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Fused SymQ8 / AffineQ8 / BF16 LM head + softcap (`M in 1..=16`,
+    /// `unpadded_vocab <= V_pad`). `out_mode`: `0 = FP32 [M, V]`,
+    /// `1 = Int32 [M]` greedy argmax, `2 = BF16 [M, V]`.
+    pub fn mlx_inkling2_lm_head_softcap_cuda(
+        x: *mut mlx_array,
+        w: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        unpadded_vocab: i32,
+        softcap: f32,
+        out_mode: i32,
+    ) -> *mut mlx_array;
+
+    /// Inkling-2-Mini Flash-Decoding Split-K Tensor Core SDPA (`T in 1..=16`,
+    /// `D = 128`, relative bias `R @ W_rel^T`, fused gate + sink epilogue,
+    /// BF16 or INT8 KV, linear or circular ring, causal or speculative tree).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_sdpa_few_cuda(
+        q: *mut mlx_array,
+        r: *mut mlx_array,
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        k_scales: *mut mlx_array,
+        v_scales: *mut mlx_array,
+        rel_bias_w: *mut mlx_array,
+        gate: *mut mlx_array,
+        sink: *mut mlx_array,
+        tree_depths: *mut mlx_array,
+        tree_mask: *mut mlx_array,
+        start_pos: i32,
+        cache_len: i32,
+        kv_start_pos: i32,
+        kv_phys_base: i32,
+        write_offset: i32,
+        ring_cap: i32,
+        is_local: bool,
+        sliding_window: i32,
+    ) -> *mut mlx_array;
+
+    /// Inkling-2-Mini FlashAttention Prefill Tensor Core SDPA (`T >= 1`,
+    /// `D = 128`, relative bias `R @ W_rel^T`, fused gate + sink epilogue,
+    /// BF16 or INT8 KV, linear or circular ring, causal or SWA).
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_sdpa_prefill_cuda(
+        q: *mut mlx_array,
+        r: *mut mlx_array,
+        k_cache: *mut mlx_array,
+        v_cache: *mut mlx_array,
+        k_scales: *mut mlx_array,
+        v_scales: *mut mlx_array,
+        rel_bias_w: *mut mlx_array,
+        gate: *mut mlx_array,
+        sink: *mut mlx_array,
+        start_pos: i32,
+        cache_len: i32,
+        kv_start_pos: i32,
+        kv_phys_base: i32,
+        write_offset: i32,
+        ring_cap: i32,
+        is_local: bool,
+        sliding_window: i32,
+    ) -> *mut mlx_array;
+
+    /// Inkling-2-Mini fused MoE (`E=128, top_k=8, H=2304, I=1152`): router GEMV/GEMM,
+    /// top-8 routing, grouped gate/up/SiTU(4,25), grouped down, combine, and optional
+    /// fused post ShortConv `k=4` (linear or tree) with residual and tape outputs.
+    ///
+    /// Modes: `0=NVFP4, 1=SymQ8, 2=AffineQ8, 3=Q5_K (gate_up only), 4=MXFP8`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mlx_inkling2_moe_forward_cuda(
+        x: *mut mlx_array,
+        router_w: *mut mlx_array,
+        router_bias: *mut mlx_array,
+        gu_w: *mut mlx_array,
+        gu_scales: *mut mlx_array,
+        gu_biases: *mut mlx_array,
+        gu_outer_scale: *mut mlx_array,
+        gu_mode: i32,
+        gu_interleaved: bool,
+        dn_w: *mut mlx_array,
+        dn_scales: *mut mlx_array,
+        dn_biases: *mut mlx_array,
+        dn_outer_scale: *mut mlx_array,
+        dn_mode: i32,
+        route_scale: f32,
+        post_conv_w: *mut mlx_array,
+        hist_in: *mut mlx_array,
+        residual: *mut mlx_array,
+        conv_taps: *mut mlx_array,
+        update_hist: bool,
+        emit_pre_conv: bool,
+        out_y: *mut *mut mlx_array,
+        out_hist: *mut *mut mlx_array,
+        out_pre_conv: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// High-occupancy small-N BF16 projection (`N in 1..=128`, `M in 1..=16`, `K % 8 == 0`,
+    /// `K >= 8`): 1 CTA per output row with cache-streaming 128-bit weight loads and exact FP32
+    /// accumulation (`sink_proj [24, 2304]`, Global `{k,v}_conv_proj [32, 2304]`).
+    pub fn mlx_inkling2_small_bf16_proj_cuda(
+        x: *mut mlx_array,
+        weight: *mut mlx_array,
+    ) -> *mut mlx_array;
+
+    /// Batched ShortConv rollback tape commit (1 launch for `<= 96` streams, up to `128` streams):
+    /// reads strided `rows_in[s]` (`[T, C]` BF16) and `hists_in[s]` (`[3, C]` BF16) and writes
+    /// contiguous `[3, C]` BF16 outputs into `hists_out[s]`.
+    pub fn mlx_inkling2_commit_short_conv_tapes_cuda(
+        hists_in: *const *mut mlx_array,
+        rows_in: *const *mut mlx_array,
+        n_streams: usize,
+        accepted_nodes: *mut mlx_array,
+        contiguous_keep: i32,
+        hists_out: *mut *mut mlx_array,
+    ) -> bool;
+
+    /// Fused token embedding lookup + precise FP32 RMSNorm -> BF16.
+    /// - Dense BF16: `scales = null`, `biases = null`
+    /// - Symmetric Q8_0 (`bits=8, group_size=32`): `scales != null`, `biases = null`
+    /// - Affine Q8_0 (`bits=8, group_size=32`): `scales != null`, `biases != null`
+    pub fn mlx_inkling2_embed_rmsnorm_cuda(
+        token_ids: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        norm_weight: *mut mlx_array,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    /// Batched race-free in-place KV cache compaction across up to 192 non-overlapping caches
+    /// (mixed BF16/F16/INT8/F32, 4D `[1, H_kv, cap, D]` or 3D `[1, H_kv, cap]`, 1 launch per
+    /// `<= 96` caches). Outputs are graph-dependency aliases of `caches[0..n_caches]`.
+    pub fn mlx_inkling2_compact_kv_batch_cuda(
+        caches: *const *mut mlx_array,
+        n_caches: usize,
+        write_offsets: *const i32,
+        accepted_nodes: *mut mlx_array,
+        caches_out: *mut *mut mlx_array,
     ) -> bool;
 }
 

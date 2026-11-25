@@ -606,6 +606,13 @@ impl LinearProj {
         }
     }
 
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        match self {
+            LinearProj::Standard(l) => l.ensure_cuda_device(),
+            LinearProj::Quantized(ql) => ql.ensure_cuda_device(),
+        }
+    }
+
     /// Dense `[out, in]` weight regardless of backend. Callers that treat the
     /// projection as a weight matrix (the CLEF joint head's output-embedding
     /// gather) must use this over `get_weight`, which returns packed storage
@@ -3753,23 +3760,28 @@ impl QuantizedLinear {
             return Ok(output);
         }
 
-        // CUDA affine Q8_0 (bits=8, group_size=32) fast path with BF16 `x` and
-        // F32 / BF16 / F16 sidecars: small-row (M in 1..=16) stays packed in
-        // `mlx_affine_q8_few_cuda`; M >= 17 with F16 sidecars uses the direct
-        // Q8_0 Tensor-Core prefill kernel (`q8_prefill_cuda`, zero retained
-        // dense BF16 weight cache — exact BF16 MMA below M=128 and auto-grouped
-        // INT8 TC at M >= 128), falling back cleanly to `dequant_q8_bf16_cuda`
-        // + cuBLAS when declined (e.g. odd N) or for non-F16 sidecars.
+        // CUDA affine / symmetric (`biases == None, symmetric_q8 == true`) Q8_0
+        // (bits=8, group_size=32) fast path with BF16 `x` and F32 / BF16 / F16
+        // sidecars: small-row (M in 1..=16) stays packed in `mlx_affine_q8_few_cuda`;
+        // M >= 17 with F16 sidecars uses the direct Q8_0 Tensor-Core prefill kernel
+        // (`q8_prefill_cuda`, zero retained dense BF16 weight cache — exact BF16 MMA
+        // below M=128 and auto-grouped INT8 TC at M >= 128), falling back cleanly to
+        // `dequant_q8_bf16_cuda` + cuBLAS when declined (e.g. odd N) or for non-F16
+        // sidecars.
         if round_affine_to_act
             && crate::accelerator::cuda_ops_available()
             && activation_dtype == Some(crate::array::DType::BFloat16)
             && self.bits == 8
             && self.group_size == 32
             && self.bias.is_none()
-            && let Some(biases) = &self.biases
+            && (self.biases.is_some() || self.symmetric_q8)
         {
             let scale_dtype = self.scales.dtype()?;
-            if scale_dtype == biases.dtype()?
+            let biases_dtype_ok = match &self.biases {
+                Some(b) => b.dtype()? == scale_dtype,
+                None => true,
+            };
+            if biases_dtype_ok
                 && matches!(
                     scale_dtype,
                     crate::array::DType::Float32
@@ -3786,7 +3798,7 @@ impl QuantizedLinear {
                         x,
                         &self.weight,
                         &self.scales,
-                        biases,
+                        self.biases.as_ref(),
                         32,
                         8,
                     )?
@@ -3802,9 +3814,9 @@ impl QuantizedLinear {
                             x,
                             &self.weight,
                             &self.scales,
-                            biases,
+                            self.biases.as_ref(),
                             if rows < 128 { -2 } else { -1 },
-                            !self.q8_symmetric_128,
+                            !(self.q8_symmetric_128 || self.symmetric_q8),
                         )?
                     {
                         return Ok(out);
@@ -3823,7 +3835,7 @@ impl QuantizedLinear {
                     let weight = if let Some(fast) = crate::kernels::linear::dequant_q8_bf16_cuda(
                         &self.weight,
                         &self.scales,
-                        biases,
+                        self.biases.as_ref(),
                     )? {
                         fast
                     } else {
@@ -3869,7 +3881,7 @@ impl QuantizedLinear {
                     x,
                     &self.weight,
                     &self.scales,
-                    biases,
+                    Some(biases),
                     self.group_size,
                     self.bits,
                 )?
@@ -4655,6 +4667,43 @@ impl QuantizedLinear {
             && self.output_layout == QuantizedOutputLayout::Native
     }
 
+    /// Promote settled CUDA pinned-host packed weights & sidecars into GPU device memory.
+    /// Returns total promoted bytes (`0` on non-CUDA builds or when already resident).
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        promoted += self.weight.promote_cuda_device()?;
+        promoted += self.scales.promote_cuda_device()?;
+        if let Some(ref mut b) = self.biases {
+            promoted += b.promote_cuda_device()?;
+        }
+        if let Some(ref mut bias) = self.bias {
+            promoted += bias.promote_cuda_device()?;
+        }
+        if let Some(ref mut s_w) = self.s_w {
+            promoted += s_w.promote_cuda_device()?;
+        }
+        if let Some(ref mut ds) = self.decode_sidecars {
+            promoted += ds.0.promote_cuda_device()?;
+            if let Some(ref mut b) = ds.1 {
+                promoted += b.promote_cuda_device()?;
+            }
+        }
+        if let Some(ref mut fp8) = self.fp8_dequant_weight {
+            match fp8 {
+                PlainFp8Weight::Transposed(w) | PlainFp8Weight::Source(w) => {
+                    promoted += w.promote_cuda_device()?;
+                }
+            }
+        }
+        if promoted > 0 {
+            self.clear_cuda_dense_prefill();
+        }
+        Ok(promoted)
+    }
+
     /// Test-scope accessor for the sym8 operands
     /// `(w_nk [N,K] checkpoint, s_w [N])`.
     /// Used by the routing/parity unit tests to call the reference kernels with
@@ -4881,6 +4930,16 @@ impl QuantizedSwitchLinear {
     /// Optional per-expert F32 outer scale `[num_experts]`.
     pub fn outer_scale(&self) -> Option<&MxArray> {
         self.outer_scale.as_ref()
+    }
+
+    /// Ensure optional per-expert `outer_scale` is stored as `Float32` once at load.
+    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
+        if let Some(ref mut os) = self.outer_scale
+            && os.dtype()? != crate::array::DType::Float32
+        {
+            *os = os.astype(crate::array::DType::Float32)?;
+        }
+        Ok(())
     }
 
     /// Forward pass using gather_qmm, applying the optional per-expert
@@ -5119,6 +5178,27 @@ impl QuantizedSwitchLinear {
 
     pub(crate) fn group_size(&self) -> i32 {
         self.group_size
+    }
+
+    /// Promote settled CUDA pinned-host expert weights & sidecars into GPU device memory.
+    /// Returns total promoted bytes (`0` on non-CUDA builds or when already resident).
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        promoted += self.weight.promote_cuda_device()?;
+        promoted += self.scales.promote_cuda_device()?;
+        if let Some(ref mut b) = self.biases {
+            promoted += b.promote_cuda_device()?;
+        }
+        if let Some(ref mut os) = self.outer_scale {
+            promoted += os.promote_cuda_device()?;
+        }
+        if let Some(ref mut fp8) = self.fp8_dequant_weight_t {
+            promoted += fp8.promote_cuda_device()?;
+        }
+        Ok(promoted)
     }
 }
 

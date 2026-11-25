@@ -2,7 +2,7 @@ use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use rand::{Rng, RngExt};
 
-use super::spanned_head::remap_spanned_candidate_ids;
+use super::spanned_head::{SpannedVocabLayout, remap_spanned_candidate_ids};
 use crate::array::{DType, MxArray};
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::Embedding;
@@ -15,11 +15,14 @@ pub(super) struct CandidateSelector {
     pub(super) top_k: usize,
     pub(super) rank: usize,
     pub(super) vocab_size: usize,
-    pub(super) active_vocab_size: usize,
-    pub(super) final_logit_softcapping: Option<f32>,
+    pub(super) valid_vocab_size: Option<usize>,
+    pub(super) post_softcap: Option<f32>,
 }
 
-fn apply_selector_softcap(scores: &MxArray, softcap: f32) -> Result<MxArray> {
+/// Apply post-correction logit softcap `cap * tanh(clamp(score / cap, -20.0, 20.0))`
+/// on FP32 edge scores, preserving `-inf` and non-finite sentinels (matching
+/// Splash `sampling.metal:1670-1675`). Identity when `softcap <= 0.0`.
+pub(super) fn apply_post_edge_softcap(scores: &MxArray, softcap: f32) -> Result<MxArray> {
     if !softcap.is_finite() || softcap <= 0.0 {
         return Ok(scores.clone());
     }
@@ -159,7 +162,12 @@ impl CandidateSelector {
         // lossless, so casting back restores bit-parity: `scores`' add then
         // runs in the model dtype instead of promoting to f32 before the
         // final astype — a different rounding that flips near-tie picks.
-        let values = values.astype(logits.dtype().ok()?).ok()?;
+        let logits_dtype = logits.dtype().ok()?;
+        let values = if values.dtype().ok()? == logits_dtype {
+            values
+        } else {
+            values.astype(logits_dtype).ok()?
+        };
         let dims = [1, shape[1], self.top_k as i64];
         Some((ids.reshape(&dims).ok()?, values.reshape(&dims).ok()?))
     }
@@ -239,7 +247,7 @@ impl CandidateSelector {
             anchor,
             temperature,
             device_path,
-            false,
+            None,
             confidence,
             rng,
         )
@@ -253,7 +261,7 @@ impl CandidateSelector {
         anchor: u32,
         temperature: f64,
         device_path: bool,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
@@ -264,10 +272,16 @@ impl CandidateSelector {
             &anchor_ids,
             temperature,
             device_path,
-            spanned,
+            spanned_layout,
             confidence,
             rng,
         )
+    }
+
+    fn effective_valid_vocab_size(&self) -> usize {
+        self.valid_vocab_size
+            .unwrap_or(self.vocab_size)
+            .min(self.vocab_size)
     }
 
     /// Compute top-K candidate vocabulary IDs (`[1, L, K]` Int32) and
@@ -277,13 +291,13 @@ impl CandidateSelector {
         hidden: &MxArray,
         logits: &MxArray,
         anchor_ids: &MxArray,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
     ) -> Result<(MxArray, MxArray)> {
         let length = hidden.shape_at(1)? as usize;
         let logits_vocab = logits.shape_at(2)? as usize;
-        let active_vocab = self.active_vocab_size.min(self.vocab_size);
+        let active_vocab = self.effective_valid_vocab_size();
         let logits_sliced;
-        let active_logits = if !spanned && logits_vocab > active_vocab {
+        let active_logits = if spanned_layout.is_none() && logits_vocab > active_vocab {
             logits_sliced = logits.slice_axis(2, 0, active_vocab as i64)?;
             &logits_sliced
         } else {
@@ -306,8 +320,8 @@ impl CandidateSelector {
             self.rank as i64,
         ])?;
         let candidates = candidates.astype(DType::Int32)?;
-        let candidates = if spanned {
-            remap_spanned_candidate_ids(&candidates)?
+        let candidates = if let Some(layout) = spanned_layout {
+            remap_spanned_candidate_ids(&candidates, layout)?
         } else {
             candidates
         };
@@ -323,13 +337,13 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         temperature: f64,
         device_path: bool,
-        spanned: bool,
+        spanned_layout: Option<SpannedVocabLayout>,
         confidence: Option<&mut Option<MxArray>>,
         rng: &mut R,
     ) -> Result<(SelectorPath, Vec<SparseDistribution>)> {
         let length = hidden.shape_at(1)? as usize;
         let (candidates, scores) =
-            self.select_lattice_arrays(hidden, logits, anchor_ids, spanned)?;
+            self.select_lattice_arrays(hidden, logits, anchor_ids, spanned_layout)?;
 
         let greedy = is_greedy_temperature(temperature);
         if greedy && device_path {
@@ -349,11 +363,11 @@ impl CandidateSelector {
             };
             return Ok((SelectorPath::Device(path), Vec::new()));
         }
-        let active_vocab = self.active_vocab_size.min(self.vocab_size);
+        let effective_vocab = self.effective_valid_vocab_size();
         if !greedy
             && device_path
             && let Some(path) =
-                device_sampled_path(&candidates, &scores, active_vocab, temperature, rng)
+                device_sampled_path(&candidates, &scores, effective_vocab, temperature, rng)
         {
             return Ok((path, Vec::new()));
         }
@@ -380,7 +394,7 @@ impl CandidateSelector {
                 rows.push(SparseDistribution::from_parts(
                     candidate_ids[support_start..support_start + self.top_k].to_vec(),
                     probs.clone(),
-                    active_vocab,
+                    effective_vocab,
                 )?);
                 sample_selector_index(&probs, rng)
             };
@@ -399,7 +413,7 @@ impl CandidateSelector {
         anchor_ids: &MxArray,
         length: usize,
     ) -> Result<MxArray> {
-        let softcap = self.final_logit_softcapping.unwrap_or(0.0);
+        let softcap = self.post_softcap.filter(|&c| c > 0.0).unwrap_or(0.0);
         let use_cuda = crate::accelerator::cuda_ops_available();
         let use_metal = !use_cuda
             && (softcap > 0.0
@@ -459,7 +473,7 @@ impl CandidateSelector {
                 .reshape(&[length as i64, 1, self.top_k as i64])?
                 .astype(DType::Float32)?;
             let scores_f32 = edges.astype(DType::Float32)?.add(&unary_f32)?;
-            apply_selector_softcap(&scores_f32, softcap)
+            apply_post_edge_softcap(&scores_f32, softcap)
         } else {
             let scores = edges.add(&unary.reshape(&[length as i64, 1, self.top_k as i64])?)?;
             scores.astype(DType::Float32)

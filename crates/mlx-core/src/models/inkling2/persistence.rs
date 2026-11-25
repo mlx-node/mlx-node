@@ -24,7 +24,9 @@ use crate::models::quant_dispatch::{
     effective_plq_for, load_embedding_affine_or_bf16, load_linear_proj_quantized_or_bf16,
     load_quant_settings_from_disk,
 };
-use crate::models::quantized_linear::{LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedSwitchLinear};
+use crate::models::quantized_linear::{
+    DEFAULT_QUANT_MODE, LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedLinear, QuantizedSwitchLinear,
+};
 use crate::nn::{Embedding, LayerNorm, Linear};
 use crate::stream::WiredResidency;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -40,7 +42,8 @@ use super::dspark::{Inkling2DsparkModel, resolve_inkling2_dspark_candidates};
 use super::kv_cache::{Inkling2KVCacheCoordinator, Inkling2PagedConfig};
 use super::memory::{
     Inkling2ContextLimits, evaluate_inkling2_plan, inkling2_scheduler_lanes, resolve_activations,
-    resolve_decode_share, resolve_kv_format, resolve_max_context, resolve_max_memory,
+    resolve_decode_share, resolve_effective_kv_format, resolve_kv_format, resolve_max_context,
+    resolve_max_memory,
 };
 use super::model::{
     AttnInputNorm, Inkling2Inner, Inkling2LoadOptions, Inkling2Model, Inkling2PhysicalLayer,
@@ -129,7 +132,8 @@ pub(crate) async fn load_model_with_options(
     let auto_draft_path = options.auto_draft_model_path.clone();
     let auto_load_draft = options.auto_load_draft.unwrap_or(true);
     let disk_options = options.disk_tier("Inkling2")?;
-    let kv_format = resolve_kv_format("Inkling2", options.kv_format.as_deref())?;
+    let requested_kv_format = options.kv_format.clone();
+    let _ = resolve_kv_format("Inkling2", requested_kv_format.as_deref())?;
     let activations = resolve_activations("Inkling2", options.activations.as_deref())?;
     let max_memory_bytes = resolve_max_memory("Inkling2", options.max_memory_bytes)?;
     let decode_share = resolve_decode_share("Inkling2", options.decode_share)?;
@@ -189,11 +193,19 @@ pub(crate) async fn load_model_with_options(
                 gguf_vision_meta.as_ref(),
                 is_gguf,
             )?;
-            let mut resident = {
-                let weight_arrays = inner.weight_arrays();
-                let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-                materialize_weights(&weight_refs)?
-            };
+            let metal_paged = crate::engine::persistence::compiled_forward_backend_available();
+            let cuda_fast = !metal_paged && inner.use_cuda_fast();
+            let (kv_format, cuda_kv_format) = resolve_effective_kv_format(
+                "Inkling2",
+                requested_kv_format.as_deref(),
+                metal_paged,
+                cuda_fast,
+            )?;
+            inner.cuda_kv_format = cuda_kv_format;
+            // Drop cloned host-backed `weight_arrays` handles BEFORE promoting weights to CUDA
+            // device memory (and before step 2 so `inner.lm_head` is already device-resident for
+            // DSpark Markov folding).
+            let mut resident = materialize_and_promote_weights(&mut inner)?;
             synchronize_and_clear_cache();
 
             // 2. Load & materialize optional DFlash2 / DSpark drafter weights.
@@ -234,7 +246,7 @@ pub(crate) async fn load_model_with_options(
             // 3. Plan & allocate extent-grown Group 0 + Group 1 KV pools under Governor Ledger.
             // If an auto-discovered draft does not fit the KV/memory budget, step down cleanly
             // (`AutoDflash2 -> AutoDspark -> pure AR`) while keeping explicit drafts strict.
-            if crate::engine::persistence::compiled_forward_backend_available() {
+            if metal_paged {
                 struct KvPlanFallbackCtx<'a> {
                     inner: &'a mut Inkling2Inner,
                     extra_resident: Option<WeightsResident>,
@@ -395,7 +407,7 @@ pub(crate) async fn load_model_with_options(
                 paged_active: inner.paged.is_some(),
                 scheduled_lanes,
                 vision_active: inner.vision_encoder.is_some(),
-                dspark_active: inner.has_speculative_draft(),
+                dspark_active: inner.has_mtp_weights(),
                 context_limits,
                 state_tier,
                 weight_guard,
@@ -605,13 +617,16 @@ fn load_auto_dspark_into_with(
     for draft_path in &dspark_candidates {
         let t_draft = std::time::Instant::now();
         match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head) {
-            Ok(draft) => {
+            Ok(mut draft) => {
                 let mat_res = {
                     let dspark_arrays = draft.weight_arrays();
                     let dspark_refs: Vec<&MxArray> = dspark_arrays.iter().collect();
                     materialize_dspark(&dspark_refs)
                 };
-                match mat_res {
+                match mat_res.and_then(|res| {
+                    draft.ensure_cuda_device()?;
+                    Ok(res)
+                }) {
                     Ok(dspark_resident) => {
                         synchronize_and_clear_cache();
                         tracing::info!(
@@ -725,6 +740,9 @@ fn load_inkling2_draft_into_with(
             };
             draft.validate_target(target_shape)?;
             draft.configure_inkling2_execution(target_shape);
+            if crate::accelerator::cuda_ops_available() {
+                draft.configure_dense_execution();
+            }
             synchronize_and_clear_cache();
             let verified_identity = match draft.context_fusion_fingerprint() {
                 Ok(fp) => Some(fp),
@@ -756,13 +774,16 @@ fn load_inkling2_draft_into_with(
         for draft_path in &candidates {
             let t_draft = std::time::Instant::now();
             match Inkling2DsparkModel::load_auto(draft_path, &inner.config, &inner.lm_head) {
-                Ok(draft) => {
+                Ok(mut draft) => {
                     let mat_res = {
                         let dspark_arrays = draft.weight_arrays();
                         let dspark_refs: Vec<&MxArray> = dspark_arrays.iter().collect();
                         materialize_dspark(&dspark_refs)
                     };
-                    let dspark_resident = match mat_res {
+                    let dspark_resident = match mat_res.and_then(|res| {
+                        draft.ensure_cuda_device()?;
+                        Ok(res)
+                    }) {
                         Ok(res) => res,
                         Err(err) => {
                             drop(draft);
@@ -816,6 +837,9 @@ fn load_inkling2_draft_into_with(
             .and_then(|(mut draft, bytes)| {
                 draft.validate_target(target_shape)?;
                 draft.configure_inkling2_execution(target_shape);
+                if crate::accelerator::cuda_ops_available() {
+                    draft.configure_dense_execution();
+                }
                 Ok((draft, bytes))
             }) {
             Ok((draft, bytes)) => {
@@ -873,13 +897,10 @@ fn load_sync(
 ) -> Result<Inkling2Inner> {
     let mut model = load_weights_sync(asset_dir, preload_input, gguf_vision_meta, is_gguf)?;
 
-    // Materialize target backbone weights cleanly without Metal watchdog timeout before
+    // Materialize target backbone weights cleanly without Metal watchdog timeout, dropping
+    // cloned host-backed handles before promoting weights to CUDA device memory, before
     // attaching any auto-discovered draft.
-    let _resident = {
-        let weight_arrays = model.weight_arrays();
-        let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
-        materialize_weights(&weight_refs)?
-    };
+    let _resident = materialize_and_promote_weights(&mut model)?;
     synchronize_and_clear_cache();
 
     // Auto-discover DFlash2 (`draft/` -> sibling `inkling-2-mini-dflash2/`) before bundled DSpark
@@ -904,8 +925,169 @@ fn load_sync(
         rt.state_store.set_geometry(geom);
         model.paged = Some(rt);
     }
+    if !model.use_cuda_fast() {
+        model.cuda_kv_format = super::cuda_kv::Inkling2CudaKvFormat::Bf16;
+    }
 
     Ok(model)
+}
+
+/// Materialize all resident weights and immediately drop the temporary cloned
+/// `MxArray` handles before calling `ensure_cuda_device_weights()` so old
+/// host-backed buffers can be freed incrementally during promotion instead of
+/// holding both host and device copies simultaneously (~2x peak load RAM).
+fn materialize_and_promote_weights(inner: &mut Inkling2Inner) -> Result<WeightsResident> {
+    let resident = {
+        let weight_arrays = inner.weight_arrays();
+        let weight_refs: Vec<&MxArray> = weight_arrays.iter().collect();
+        materialize_weights(&weight_refs)?
+    };
+    inner.ensure_cuda_device_weights()?;
+    Ok(resident)
+}
+
+/// Opt-in Splash-style CUDA load-time quantization of dense BF16 attention projections
+/// (`q/k/v/rel/gate/o_proj`) and `lm_head` to exact symmetric `Q8_0` (`SymQ8`, Float16
+/// scales, zero biases).
+///
+/// Active ONLY when CUDA is available AND `MLX_INKLING2_BF16_PROJ_Q8` is set to
+/// `1|true|on|yes` (default OFF -> 100% lossless BF16). Never touches macOS Metal.
+#[inline]
+fn bf16_proj_q8_cuda_enabled() -> bool {
+    if !crate::accelerator::cuda_ops_available() {
+        return false;
+    }
+    std::env::var("MLX_INKLING2_BF16_PROJ_Q8").is_ok_and(|v| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        )
+    })
+}
+
+/// Quantize a bias-free dense BF16 [`Linear`] `[N, K]` (`N >= 256`, `K >= 256`, `K % 32 == 0`)
+/// into exact symmetric `Q8_0` (`QuantizedLinear` with `bits=8, group_size=32, mode="affine"`,
+/// `Float16` scales, `biases=None`, `is_symmetric_q8() == true`), evaluating in row chunks of at
+/// most `chunk_rows` to cap transient VRAM on large matrices such as `lm_head` (`[201024, 2304]`).
+///
+/// Byte encoding matches CUDA `SymQ8` (`affine_q8_few.cu.inc`, `inkling2_lm_head.cu.inc`):
+/// `byte = (clamp(round(w / scale), -127, 127) + 128) as u8` packed little-endian into `Uint32`
+/// (`w_i8 = (int8_t)(byte ^ 0x80)`, `val = scale * w_i8`). Returns `Ok(None)` when ineligible
+/// (tiny projections like `sink_proj`/`k_conv_proj`/`v_conv_proj`, biased, non-BF16, or scales
+/// outside exact F16 symmetric range).
+fn quantize_bf16_linear_to_symq8_with_chunk(
+    lin: &Linear,
+    chunk_rows: i64,
+) -> Result<Option<QuantizedLinear>> {
+    if lin.get_bias().is_some() || chunk_rows <= 0 {
+        return Ok(None);
+    }
+    let w = lin.get_weight();
+    if w.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let shape = w.shape()?;
+    if shape.len() != 2 {
+        return Ok(None);
+    }
+    let n = shape[0];
+    let k = shape[1];
+    if n < 256 || k < 256 || k % 32 != 0 {
+        return Ok(None);
+    }
+
+    const GROUP_SIZE: i64 = 32;
+    let groups = k / GROUP_SIZE;
+    let zero_f32 = MxArray::scalar_float(0.0)?;
+    let one_f32 = MxArray::scalar_float(1.0)?;
+
+    let quantize_chunk = |w_chunk: &MxArray, rows: i64| -> Result<(MxArray, MxArray)> {
+        let w_g = w_chunk
+            .astype(DType::Float32)?
+            .reshape(&[rows, groups, GROUP_SIZE])?;
+        let amax = w_g.abs()?.max(Some(&[-1]), Some(true))?;
+        let scale_f16_3d = amax.div_scalar(127.0)?.astype(DType::Float16)?;
+        let scale_f32 = scale_f16_3d.astype(DType::Float32)?;
+        let has_scale = scale_f32.greater(&zero_f32)?;
+        let safe_scale = has_scale.where_(&scale_f32, &one_f32)?;
+        let q_scaled = has_scale.where_(&w_g.div(&safe_scale)?, &zero_f32)?;
+        let q_u8 = q_scaled
+            .round()?
+            .clip(Some(-127.0), Some(127.0))?
+            .add_scalar(128.0)?
+            .astype(DType::Uint8)?
+            .reshape(&[rows, k])?;
+        let w_u32 = q_u8.view(DType::Uint32)?;
+        let scales_2d = scale_f16_3d.reshape(&[rows, groups])?;
+        Ok((w_u32, scales_2d))
+    };
+
+    let (weight, scales) = if n <= chunk_rows {
+        let (w_u32, s_f16) = quantize_chunk(&w, n)?;
+        MxArray::eval_arrays(&[&w_u32, &s_f16])?;
+        (w_u32, s_f16)
+    } else {
+        let n_chunks = (n as usize).div_ceil(chunk_rows as usize);
+        let mut w_chunks = Vec::with_capacity(n_chunks);
+        let mut s_chunks = Vec::with_capacity(n_chunks);
+        let mut start = 0i64;
+        while start < n {
+            let end = (start + chunk_rows).min(n);
+            let sub = w.slice_axis(0, start, end)?;
+            let (w_c, s_c) = quantize_chunk(&sub, end - start)?;
+            MxArray::eval_arrays(&[&w_c, &s_c])?;
+            w_chunks.push(w_c);
+            s_chunks.push(s_c);
+            start = end;
+        }
+        let w_refs: Vec<&MxArray> = w_chunks.iter().collect();
+        let s_refs: Vec<&MxArray> = s_chunks.iter().collect();
+        let w_cat = MxArray::concatenate_many(w_refs, Some(0))?;
+        let s_cat = MxArray::concatenate_many(s_refs, Some(0))?;
+        MxArray::eval_arrays(&[&w_cat, &s_cat])?;
+        (w_cat, s_cat)
+    };
+
+    let biases = scales
+        .astype(DType::Float32)?
+        .mul_scalar(-128.0)?
+        .astype(DType::Float16)?;
+    let mut ql = QuantizedLinear::new(
+        weight,
+        scales,
+        Some(biases),
+        None,
+        32,
+        8,
+        DEFAULT_QUANT_MODE.to_string(),
+    );
+    if !ql.try_compact_symmetric_q8_f16()? {
+        return Ok(None);
+    }
+    Ok(Some(ql))
+}
+
+/// Quantize a bias-free dense BF16 [`Linear`] `[N, K]` (`N >= 256`, `K >= 256`, `K % 32 == 0`)
+/// into exact symmetric `Q8_0` (`SymQ8`) using a 16384-row chunk cap.
+fn quantize_bf16_linear_to_symq8(lin: &Linear) -> Result<Option<QuantizedLinear>> {
+    quantize_bf16_linear_to_symq8_with_chunk(lin, 16384)
+}
+
+/// On CUDA with `MLX_INKLING2_BF16_PROJ_Q8=1`, quantize eligible dense BF16 `LinearProj`
+/// instances (`N >= 256`, `K >= 256`, `K % 32 == 0`, bias-free) to exact `SymQ8` at load time.
+/// No-op off CUDA, on macOS Metal, when unset (default), on already-quantized weights, or on
+/// tiny projections (`sink_proj`, `k_conv_proj`, `v_conv_proj`).
+fn maybe_quantize_bf16_proj_to_symq8_cuda(proj: &mut LinearProj) -> Result<()> {
+    if !bf16_proj_q8_cuda_enabled() {
+        return Ok(());
+    }
+    let LinearProj::Standard(lin) = proj else {
+        return Ok(());
+    };
+    if let Some(ql) = quantize_bf16_linear_to_symq8(lin)? {
+        *proj = LinearProj::Quantized(ql);
+    }
+    Ok(())
 }
 
 fn load_weights_sync(
@@ -1010,6 +1192,7 @@ fn load_weights_sync(
     // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) to native Float16 scales
     // with zero biases (4x less sidecar DRAM), falling back to F32 hoisting for asymmetric affine.
     lm_head.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
+    maybe_quantize_bf16_proj_to_symq8_cuda(&mut lm_head)?;
     let lm_head_bf16_unpadded = if let LinearProj::Standard(ref lin) = lm_head
         && lin.get_bias().is_none()
     {
@@ -1070,6 +1253,12 @@ fn load_weights_sync(
         None
     };
 
+    let cuda_kv_format = if super::cuda_forward::cuda_fast_supported_for(&config) {
+        super::cuda_kv::Inkling2CudaKvFormat::resolve(None)
+    } else {
+        super::cuda_kv::Inkling2CudaKvFormat::Bf16
+    };
+
     let model = Inkling2Inner {
         config,
         embed_tokens,
@@ -1086,9 +1275,15 @@ fn load_weights_sync(
         dflash2: None,
         dflash2_identity: None,
         dspark_turn_contexts: HashMap::new(),
+        cuda_dflash2_ctx: None,
+        cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+        cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+        cuda_dspark_ctx: None,
         scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
         paged: None,
         flat_cache: None,
+        cuda_cache: None,
+        cuda_kv_format,
         cached_token_history: Vec::new(),
         cached_image_key: None,
         turn_cancel: None,
@@ -1195,6 +1390,7 @@ fn build_physical_layer(
             FAMILY_NAME,
         )?;
         proj.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
+        maybe_quantize_bf16_proj_to_symq8_cuda(&mut proj)?;
         Ok(proj)
     };
 
@@ -1206,9 +1402,12 @@ fn build_physical_layer(
     let sink_proj = load_proj("sink_proj", d, n_heads)?;
     let o_proj = load_proj("o_proj", q_dim, d)?;
 
-    let k_conv = require_tensor(params, &format!("{prefix}.self_attn.k_conv.weight"))?;
-    let v_conv = require_tensor(params, &format!("{prefix}.self_attn.v_conv.weight"))?;
-    let post_conv = require_tensor(params, &format!("{prefix}.self_attn.post_conv.weight"))?;
+    let k_conv = require_tensor(params, &format!("{prefix}.self_attn.k_conv.weight"))?
+        .astype(DType::Float32)?;
+    let v_conv = require_tensor(params, &format!("{prefix}.self_attn.v_conv.weight"))?
+        .astype(DType::Float32)?;
+    let post_conv = require_tensor(params, &format!("{prefix}.self_attn.post_conv.weight"))?
+        .astype(DType::Float32)?;
 
     let (k_conv_proj, v_conv_proj) = if !is_local {
         let dyn_out = n_kv * config.sconv_kernel_size;
@@ -1310,7 +1509,10 @@ fn build_physical_layer(
     // falling back to BF16 sidecar hoisting for non-symmetric affine Q8_0.
     gate_up_proj.try_compact_symmetric_q8_or_promote_bf16()?;
     down_proj.try_compact_symmetric_q8_or_promote_bf16()?;
-    let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?;
+    gate_up_proj.promote_outer_scale_to_f32()?;
+    down_proj.promote_outer_scale_to_f32()?;
+    let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?
+        .astype(DType::Float32)?;
     let moe = Inkling2MoE::new(
         config.num_experts,
         config.num_experts_per_tok,
@@ -2126,6 +2328,88 @@ mod tests {
         );
     }
 
+    #[test]
+    fn materialize_and_promote_weights_drops_host_clones_and_promotes_to_device() {
+        let hidden = 16usize;
+        let vocab = 32usize;
+        let cfg_raw = serde_json::json!({
+            "model_type": "inkling2",
+            "hidden_size": hidden,
+            "num_hidden_layers": 1,
+            "num_physical_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 8,
+            "vocab_size": vocab,
+            "sliding_window": 16,
+            "n_layers_per_attn_res_block": 1
+        })
+        .to_string();
+        let config = Inkling2Config::from_json_str(&cfg_raw, true).unwrap();
+
+        let (embed_w, _, _) =
+            MxArray::alloc_uninit(&[vocab as i64, hidden as i64], DType::BFloat16).unwrap();
+        let (embed_norm, _, _) = MxArray::alloc_uninit(&[hidden as i64], DType::Float32).unwrap();
+        let (output_res_query, _, _) =
+            MxArray::alloc_uninit(&[1, hidden as i64], DType::Float32).unwrap();
+        let output_res_query_t = output_res_query.transpose(None).unwrap();
+        let (output_norm, _, _) = MxArray::alloc_uninit(&[hidden as i64], DType::Float32).unwrap();
+        let (lm_w, _, _) =
+            MxArray::alloc_uninit(&[vocab as i64, hidden as i64], DType::BFloat16).unwrap();
+
+        let mut inner = Inkling2Inner {
+            config,
+            embed_tokens: Embedding::from_weight(&embed_w).unwrap(),
+            embed_norm,
+            layers: Vec::new(),
+            output_res_query,
+            output_res_query_t,
+            output_norm,
+            lm_head: LinearProj::Standard(Linear::from_weights(&lm_w, None).unwrap()),
+            lm_head_bf16_unpadded: None,
+            vision_encoder: None,
+            tokenizer: None,
+            dspark: None,
+            dflash2: None,
+            dflash2_identity: None,
+            dspark_turn_contexts: HashMap::new(),
+            cuda_dflash2_ctx: None,
+            cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+            cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+            cuda_dspark_ctx: None,
+            scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
+            paged: None,
+            flat_cache: None,
+            cuda_cache: None,
+            cuda_kv_format: super::super::cuda_kv::Inkling2CudaKvFormat::Bf16,
+            cached_token_history: Vec::new(),
+            cached_image_key: None,
+            turn_cancel: None,
+            model_id: next_inkling2_model_id(),
+            memory_plan: None,
+            memory_registration: None,
+            wired: None,
+            cache_recency: Arc::new(CacheRecency::new()),
+            decode_share: default_decode_share(),
+            max_context: None,
+            activations: Activations::Auto,
+            disk_options: DiskTierOptions::default(),
+            prefill_runs: HashMap::new(),
+        };
+        drop(embed_w);
+        drop(lm_w);
+
+        let resident = materialize_and_promote_weights(&mut inner).unwrap();
+        assert!(resident.arrays() > 0);
+        assert!(resident.bytes() > 0);
+        if crate::accelerator::cuda_ops_available() {
+            assert_eq!(inner.embed_norm.cuda_host_bytes(), 0);
+            assert_eq!(inner.output_res_query.cuda_host_bytes(), 0);
+            assert_eq!(inner.output_norm.cuda_host_bytes(), 0);
+            assert_eq!(inner.lm_head.get_weight().cuda_host_bytes(), 0);
+        }
+    }
+
     struct TempDirGuard(PathBuf);
 
     impl TempDirGuard {
@@ -2221,9 +2505,15 @@ mod tests {
             dflash2: None,
             dflash2_identity: None,
             dspark_turn_contexts: HashMap::new(),
+            cuda_dflash2_ctx: None,
+            cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+            cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(),
+            cuda_dspark_ctx: None,
             scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
             paged: None,
             flat_cache: None,
+            cuda_cache: None,
+            cuda_kv_format: super::super::cuda_kv::Inkling2CudaKvFormat::Bf16,
             cached_token_history: Vec::new(),
             cached_image_key: None,
             turn_cancel: None,
@@ -3596,5 +3886,204 @@ mod tests {
             "same-size/same-mtime hidden_norm.weight mutation MUST change context_fusion_fingerprint / dflash2_identity"
         );
         assert_ne!(fp_norm_exp, fp_fc_exp);
+    }
+
+    #[test]
+    fn quantize_bf16_linear_to_symq8_parity() {
+        let mut seed: u64 = 0x51A5_8001;
+        let mut next_f32 = |scale: f32| -> f32 {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((seed >> 40) as f32) / 16_777_216.0;
+            (2.0 * u - 1.0) * scale
+        };
+
+        let m = 4usize;
+        let n = 256usize;
+        let k = 2304usize;
+
+        // 1. Ineligible shapes/dtypes/biased linears must decline cleanly (`Ok(None)`).
+        let tiny_w = MxArray::zeros(&[24, k as i64], Some(DType::BFloat16)).unwrap();
+        let tiny_lin = Linear::from_weights(&tiny_w, None).unwrap();
+        assert!(
+            quantize_bf16_linear_to_symq8(&tiny_lin).unwrap().is_none(),
+            "tiny projection (N=24, e.g. sink_proj) must stay dense BF16"
+        );
+        let conv_w = MxArray::zeros(&[32, k as i64], Some(DType::BFloat16)).unwrap();
+        let conv_lin = Linear::from_weights(&conv_w, None).unwrap();
+        assert!(
+            quantize_bf16_linear_to_symq8(&conv_lin).unwrap().is_none(),
+            "tiny projection (N=32, e.g. k_conv_proj/v_conv_proj) must stay dense BF16"
+        );
+        let f32_w = MxArray::zeros(&[n as i64, k as i64], Some(DType::Float32)).unwrap();
+        let f32_lin = Linear::from_weights(&f32_w, None).unwrap();
+        assert!(
+            quantize_bf16_linear_to_symq8(&f32_lin).unwrap().is_none(),
+            "non-BF16 projection must decline"
+        );
+        let biased_w = MxArray::zeros(&[n as i64, k as i64], Some(DType::BFloat16)).unwrap();
+        let bias = MxArray::zeros(&[n as i64], Some(DType::BFloat16)).unwrap();
+        let biased_lin = Linear::from_weights(&biased_w, Some(&bias)).unwrap();
+        assert!(
+            quantize_bf16_linear_to_symq8(&biased_lin)
+                .unwrap()
+                .is_none(),
+            "biased projection must decline"
+        );
+
+        // 2. Eligible BF16 `[256, 2304]` linear (including an all-zero 32-element group).
+        let mut w_vals: Vec<f32> = (0..n * k).map(|_| next_f32(0.04)).collect();
+        for elem in &mut w_vals[0..32] {
+            *elem = 0.0;
+        }
+        let w_bits: Vec<u16> = w_vals
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let w_bf16 = MxArray::from_bfloat16(&w_bits, &[n as i64, k as i64]).unwrap();
+        let lin = Linear::from_weights(&w_bf16, None).unwrap();
+
+        let ql = quantize_bf16_linear_to_symq8(&lin)
+            .unwrap()
+            .expect("eligible [256, 2304] BF16 linear must quantize to SymQ8");
+        assert!(ql.is_symmetric_q8(), "expected is_symmetric_q8() == true");
+        assert!(ql.get_biases().is_none(), "expected biases == None");
+        assert_eq!(ql.get_scales().dtype().unwrap(), DType::Float16);
+        assert_eq!(ql.get_weight().dtype().unwrap(), DType::Uint32);
+        assert_eq!(
+            ql.get_weight().shape().unwrap().as_ref(),
+            &[n as i64, (k / 4) as i64]
+        );
+        assert_eq!(
+            ql.get_scales().shape().unwrap().as_ref(),
+            &[n as i64, (k / 32) as i64]
+        );
+
+        // Chunked path (non-divisible chunk size 100 -> 100 + 100 + 56) must be bit-identical.
+        let ql_chunked = quantize_bf16_linear_to_symq8_with_chunk(&lin, 100)
+            .unwrap()
+            .expect("chunked [256, 2304] SymQ8 quantization must succeed");
+        assert_eq!(
+            ql_chunked.get_weight().to_uint32().unwrap().as_ref(),
+            ql.get_weight().to_uint32().unwrap().as_ref(),
+            "chunked weight packing must be bit-identical to single-shot"
+        );
+        assert_eq!(
+            ql_chunked
+                .get_scales()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            ql.get_scales()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            "chunked F16 scales must be bit-identical to single-shot"
+        );
+
+        // 3. Parity against FP32 `X @ W^T` on `[4, 2304] @ [256, 2304]^T`.
+        let x_vals: Vec<f32> = (0..m * k).map(|_| next_f32(0.35)).collect();
+        let x_bits: Vec<u16> = x_vals
+            .iter()
+            .map(|&v| half::bf16::from_f32(v).to_bits())
+            .collect();
+        let x_bf16 = MxArray::from_bfloat16(&x_bits, &[m as i64, k as i64]).unwrap();
+
+        let ref_f32 = x_bf16
+            .astype(DType::Float32)
+            .unwrap()
+            .matmul(
+                &w_bf16
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .transpose(None)
+                    .unwrap(),
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        let got_fwd = ql
+            .forward(&x_bf16)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let max_abs_fwd = got_fwd
+            .as_ref()
+            .iter()
+            .zip(ref_f32.as_ref().iter())
+            .map(|(&g, &w)| {
+                assert!(g.is_finite(), "non-finite SymQ8 forward output: {g}");
+                (g - w).abs()
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_fwd < 2e-2,
+            "SymQ8 forward max abs diff {max_abs_fwd:.6} >= 2e-2"
+        );
+
+        if crate::kernels::inkling2::sm80_available() {
+            let got_lm = crate::kernels::inkling2::lm_head_softcap_cuda(
+                &x_bf16,
+                ql.get_weight(),
+                Some(ql.get_scales()),
+                ql.get_biases(),
+                n as i32,
+                0.0,
+                crate::kernels::inkling2::LmHeadOutMode::LogitsF32,
+            )
+            .unwrap()
+            .expect("lm_head_softcap_cuda must accept SymQ8 projection on SM >= 8.0");
+            let got_lm_f = got_lm.to_float32().unwrap();
+            let max_abs_lm = got_lm_f
+                .as_ref()
+                .iter()
+                .zip(ref_f32.as_ref().iter())
+                .map(|(&g, &w)| {
+                    assert!(g.is_finite(), "non-finite SymQ8 lm_head output: {g}");
+                    (g - w).abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_lm < 2e-2,
+                "SymQ8 lm_head_softcap_cuda (uncapped) max abs diff {max_abs_lm:.6} >= 2e-2"
+            );
+
+            let softcap = 30.0f32;
+            let got_cap = crate::kernels::inkling2::lm_head_softcap_cuda(
+                &x_bf16,
+                ql.get_weight(),
+                Some(ql.get_scales()),
+                ql.get_biases(),
+                n as i32,
+                softcap,
+                crate::kernels::inkling2::LmHeadOutMode::LogitsF32,
+            )
+            .unwrap()
+            .expect("lm_head_softcap_cuda (softcap=30) must accept SymQ8 projection");
+            let got_cap_f = got_cap.to_float32().unwrap();
+            let max_abs_cap = got_cap_f
+                .as_ref()
+                .iter()
+                .zip(ref_f32.as_ref().iter())
+                .map(|(&g, &w)| {
+                    let want = softcap * (w / softcap).tanh();
+                    (g - want).abs()
+                })
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_abs_cap < 2e-2,
+                "SymQ8 lm_head_softcap_cuda (softcap=30) max abs diff {max_abs_cap:.6} >= 2e-2"
+            );
+        }
+
+        crate::array::clear_cache();
     }
 }

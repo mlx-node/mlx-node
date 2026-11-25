@@ -352,8 +352,8 @@ pub(crate) fn gpu_repack_available() -> bool {
 }
 
 /// Whether the active GPU backend implements a repack kernel for `kind`.
-/// Metal supports all 12 kinds; CUDA implements the 6 Qwen3.8/GGUF kinds
-/// (`Q4K`, `Q5K`, `Q6K`, `Q5_1`, `Q8_0`, `Q8_0Bias`) and falls back to CPU for others.
+/// Metal supports all 13 kinds; CUDA implements `Q4K`, `Q5K`, `Q6K`, `Q5_1`,
+/// `Q8_0`, `Q8_0Bias`, and `Nvfp4`, and falls back to CPU for others.
 pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
     if crate::accelerator::host_has_metal() {
         true
@@ -366,6 +366,7 @@ pub(crate) fn gpu_repack_supports_kind(kind: GpuRepackKind) -> bool {
                 | GpuRepackKind::Q5_1
                 | GpuRepackKind::Q8_0
                 | GpuRepackKind::Q8_0Bias
+                | GpuRepackKind::Nvfp4
         )
     } else {
         false
@@ -2405,6 +2406,57 @@ mod tests {
                     err.reason.contains("past the end of the staging"),
                     "{}",
                     err.reason
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cuda_nvfp4_repack_matches_cpu_and_tail_safe() {
+        if !crate::accelerator::host_has_cuda() || !gpu_repack_available() {
+            return;
+        }
+        assert!(gpu_repack_supports_kind(GpuRepackKind::Nvfp4));
+        assert_eq!(
+            gpu_kind_for(GgufTensorType::NVFP4),
+            Some(GpuRepackKind::Nvfp4)
+        );
+        row_major_cases(GpuRepackKind::Nvfp4);
+        bands_of_one_staging(
+            GpuRepackKind::Nvfp4,
+            OutLayout::RowMajor,
+            &[3, 5, 1],
+            192,
+            4,
+        );
+
+        // Exercise both 16B-aligned uint4 fast path (cnt == 32, pad = 0) and
+        // 4B-aligned uint32 fallback (pad = 4, 8, 12 and partial warps).
+        for (rows, k) in [(1usize, 64usize), (3, 192), (33, 256), (64, 512)] {
+            let blocks = random_bytes(rows * row_bytes(GpuRepackKind::Nvfp4, k), 91 + rows as u64);
+            for pad in [0usize, 4, 8, 12] {
+                let staging = staging_exact(&blocks, pad, 17);
+                let (dst, _) = RepackDst::alloc_gpu_for_kind(
+                    &tensor_info(GpuRepackKind::Nvfp4, rows, k),
+                    GpuRepackKind::Nvfp4,
+                    OutLayout::RowMajor,
+                )
+                .unwrap();
+                let out = gpu_repack_band(
+                    &staging,
+                    pad as u64,
+                    GpuRepackKind::Nvfp4,
+                    OutLayout::RowMajor,
+                    k as u32,
+                    0,
+                    rows as u32,
+                    dst,
+                )
+                .unwrap();
+                assert_same(
+                    &read(&out),
+                    &oracle(GpuRepackKind::Nvfp4, OutLayout::RowMajor, &blocks, rows, k),
+                    &format!("CUDA NVFP4 exact tail rows={rows} k={k} pad={pad}"),
                 );
             }
         }

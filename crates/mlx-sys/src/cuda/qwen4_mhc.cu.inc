@@ -1128,14 +1128,17 @@ extern "C" __global__ __launch_bounds__(320) void qwen4_stream_mean_cuda(
   }
   reinterpret_cast<uint4*>(out + static_cast<size_t>(m) * 2560)[c8] = out_v;
 }
-
+)cuda"
+R"cuda(
 // ----------------------------------------------------------------------------
-// Kernel 8: qwen4_dequant_q8_bf16_cuda (1-pass Affine Q8_0 g32 -> BF16)
+// Kernel 8: qwen4_dequant_q8_bf16_cuda (1-pass Affine/Symmetric Q8_0 g32 -> BF16)
 // Eliminates the intermediate FP16 allocation + astype(BF16) copy on cold prefill!
 // SB_DTYPE: 0 = float16, 1 = bfloat16, 2 = float32.
-// Grid: dim3((K/8 + 255) / 256, N), Block: dim3(256).
+// SYM: false = affine (q_u8 * sc + bi), true = symmetric Q8_0 (int8(q_u8 ^ 0x80) * sc).
+// Grid: dim3(N, (K/8 + 255) / 256, 1), Block: dim3(256).
+// (row in blockIdx.x supports N > 65535 such as lm_head N = 201024.)
 // ----------------------------------------------------------------------------
-template <int SB_DTYPE>
+template <int SB_DTYPE, bool SYM>
 __global__ __launch_bounds__(256) void qwen4_dequant_q8_bf16_cuda(
     const unsigned int* __restrict__ w,
     const void* __restrict__ scales,
@@ -1143,44 +1146,68 @@ __global__ __launch_bounds__(256) void qwen4_dequant_q8_bf16_cuda(
     nv_bfloat16* __restrict__ out,
     int N,
     int K) {
-  const int row = static_cast<int>(blockIdx.y);
-  const int c8 = static_cast<int>(blockIdx.x) * 256 + static_cast<int>(threadIdx.x);
+  const int row = static_cast<int>(blockIdx.x);
+  const int c8 = static_cast<int>(blockIdx.y) * 256 + static_cast<int>(threadIdx.x);
   const int k8 = K >> 3;
   if (row >= N || c8 >= k8) return;
 
   const int groups = K >> 5;
   const int grp = c8 >> 2;
   const size_t sb_idx = static_cast<size_t>(row) * groups + grp;
-  float sc, bi;
+  float sc = 0.0f;
+  [[maybe_unused]] float bi = 0.0f;
   if constexpr (SB_DTYPE == 0) {
     sc = __half2float(static_cast<const __half*>(scales)[sb_idx]);
-    bi = __half2float(static_cast<const __half*>(biases)[sb_idx]);
+    if constexpr (!SYM) {
+      bi = __half2float(static_cast<const __half*>(biases)[sb_idx]);
+    }
   } else if constexpr (SB_DTYPE == 1) {
     sc = __bfloat162float(static_cast<const nv_bfloat16*>(scales)[sb_idx]);
-    bi = __bfloat162float(static_cast<const nv_bfloat16*>(biases)[sb_idx]);
+    if constexpr (!SYM) {
+      bi = __bfloat162float(static_cast<const nv_bfloat16*>(biases)[sb_idx]);
+    }
   } else {
     sc = static_cast<const float*>(scales)[sb_idx];
-    bi = static_cast<const float*>(biases)[sb_idx];
+    if constexpr (!SYM) {
+      bi = static_cast<const float*>(biases)[sb_idx];
+    }
   }
 
   const uint2 w2 = reinterpret_cast<const uint2*>(
       w + static_cast<size_t>(row) * (K >> 2))[c8];
-  const unsigned int u0 = w2.x;
-  const unsigned int u1 = w2.y;
   uint4 out_v;
   __nv_bfloat162* op = reinterpret_cast<__nv_bfloat162*>(&out_v);
-  op[0] = __floats2bfloat162_rn(
-      fmaf(sc, static_cast<float>(u0 & 0xFFu), bi),
-      fmaf(sc, static_cast<float>((u0 >> 8) & 0xFFu), bi));
-  op[1] = __floats2bfloat162_rn(
-      fmaf(sc, static_cast<float>((u0 >> 16) & 0xFFu), bi),
-      fmaf(sc, static_cast<float>(u0 >> 24), bi));
-  op[2] = __floats2bfloat162_rn(
-      fmaf(sc, static_cast<float>(u1 & 0xFFu), bi),
-      fmaf(sc, static_cast<float>((u1 >> 8) & 0xFFu), bi));
-  op[3] = __floats2bfloat162_rn(
-      fmaf(sc, static_cast<float>((u1 >> 16) & 0xFFu), bi),
-      fmaf(sc, static_cast<float>(u1 >> 24), bi));
+  if constexpr (SYM) {
+    const unsigned int u0 = w2.x ^ 0x80808080u;
+    const unsigned int u1 = w2.y ^ 0x80808080u;
+    op[0] = __floats2bfloat162_rn(
+        sc * static_cast<float>(static_cast<signed char>(u0 & 0xFFu)),
+        sc * static_cast<float>(static_cast<signed char>((u0 >> 8) & 0xFFu)));
+    op[1] = __floats2bfloat162_rn(
+        sc * static_cast<float>(static_cast<signed char>((u0 >> 16) & 0xFFu)),
+        sc * static_cast<float>(static_cast<signed char>(u0 >> 24)));
+    op[2] = __floats2bfloat162_rn(
+        sc * static_cast<float>(static_cast<signed char>(u1 & 0xFFu)),
+        sc * static_cast<float>(static_cast<signed char>((u1 >> 8) & 0xFFu)));
+    op[3] = __floats2bfloat162_rn(
+        sc * static_cast<float>(static_cast<signed char>((u1 >> 16) & 0xFFu)),
+        sc * static_cast<float>(static_cast<signed char>(u1 >> 24)));
+  } else {
+    const unsigned int u0 = w2.x;
+    const unsigned int u1 = w2.y;
+    op[0] = __floats2bfloat162_rn(
+        fmaf(sc, static_cast<float>(u0 & 0xFFu), bi),
+        fmaf(sc, static_cast<float>((u0 >> 8) & 0xFFu), bi));
+    op[1] = __floats2bfloat162_rn(
+        fmaf(sc, static_cast<float>((u0 >> 16) & 0xFFu), bi),
+        fmaf(sc, static_cast<float>(u0 >> 24), bi));
+    op[2] = __floats2bfloat162_rn(
+        fmaf(sc, static_cast<float>(u1 & 0xFFu), bi),
+        fmaf(sc, static_cast<float>((u1 >> 8) & 0xFFu), bi));
+    op[3] = __floats2bfloat162_rn(
+        fmaf(sc, static_cast<float>((u1 >> 16) & 0xFFu), bi),
+        fmaf(sc, static_cast<float>(u1 >> 24), bi));
+  }
   reinterpret_cast<uint4*>(out + static_cast<size_t>(row) * K)[c8] = out_v;
 }
 )cuda"

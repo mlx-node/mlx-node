@@ -32,6 +32,7 @@ fn checkpoint_inventory_config() -> DFlash2Config {
         selector_top_k: 4,
         rope_theta: 10_000.0,
         final_logit_softcapping: None,
+        selector_softcap_mode: None,
         valid_vocab_size: None,
         capture_final_norm: None,
         embedding_normalization: None,
@@ -369,8 +370,8 @@ fn test_selector(vocab: usize, top_k: usize, rank: usize, hidden: usize) -> Cand
         top_k,
         rank,
         vocab_size: vocab,
-        active_vocab_size: vocab,
-        final_logit_softcapping: None,
+        valid_vocab_size: None,
+        post_softcap: None,
     }
 }
 
@@ -1095,6 +1096,7 @@ fn record_only_advances_context_without_kv() {
         selector_top_k: 4,
         rope_theta: 10_000.0,
         final_logit_softcapping: None,
+        selector_softcap_mode: None,
         valid_vocab_size: None,
         capture_final_norm: None,
         embedding_normalization: None,
@@ -1510,6 +1512,7 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         selector_top_k: 4,
         rope_theta: 10_000_000.0,
         final_logit_softcapping: None,
+        selector_softcap_mode: None,
         valid_vocab_size: None,
         capture_final_norm: None,
         embedding_normalization: None,
@@ -1521,6 +1524,7 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         hidden_norm: norm(hidden as i64),
         norm: norm(hidden as i64),
         selector: test_selector(64, 4, 8, hidden),
+        mask_embedding: None,
         layers: (0..layers)
             .map(|_| DFlash2Layer {
                 attention: DFlash2Attention {
@@ -1552,7 +1556,6 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         config,
         weight_bytes: 0,
         context_kv: None,
-        mask_embedding: None,
         compiled: super::CompiledDraft::default(),
     }
 }
@@ -2845,4 +2848,1462 @@ mod adaptive_budget_tests {
         assert_eq!(all.item_at_int32(0)?, 8);
         Ok(())
     }
+}
+
+#[test]
+fn inkling2_dflash2_config_parses_and_validates_target_contract() {
+    let parse_json = |value: &serde_json::Value| {
+        let dir =
+            std::env::temp_dir().join(format!("mlx-dflash2-inkling2-cfg-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.json"), value.to_string()).unwrap();
+        let result = super::read_dflash2_config(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+        result
+    };
+
+    let mut inkling2_json = serde_json::json!({
+        "architectures": ["DFlash2DraftModel"],
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "bos_token_id": null,
+        "dflash_config": {
+            "block_size": 8,
+            "conv_group_size": 16,
+            "conv_kernel_size": 2,
+            "final_logit_softcapping": 30.0,
+            "mask_token_id": 200056,
+            "selector_rank": 256,
+            "selector_softcap_mode": "after_correction",
+            "selector_top_k": 16,
+            "target_layer_ids": [5, 23, 41, 48]
+        },
+        "dtype": "bfloat16",
+        "eos_token_id": null,
+        "head_dim": 128,
+        "hidden_act": "silu",
+        "hidden_size": 2304,
+        "initializer_range": 0.02,
+        "intermediate_size": 6912,
+        "is_causal": false,
+        "layer_types": [
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention",
+            "sliding_attention"
+        ],
+        "max_position_embeddings": 1048576,
+        "max_window_layers": 5,
+        "model_type": "qwen3",
+        "num_attention_heads": 32,
+        "num_hidden_layers": 5,
+        "num_key_value_heads": 8,
+        "num_target_layers": 48,
+        "pad_token_id": null,
+        "rms_norm_eps": 1e-6,
+        "rope_parameters": {
+            "rope_theta": 10000.0,
+            "rope_type": "default"
+        },
+        "sliding_window": 2048,
+        "tie_word_embeddings": false,
+        "use_cache": false,
+        "use_sliding_window": true,
+        "vocab_size": 201024
+    });
+
+    let config = parse_json(&inkling2_json).expect("Inkling-2-Mini DFlash2 config must parse");
+    assert_eq!(config.target_layers, vec![5, 23, 41, 48]);
+    assert_eq!(config.target_num_layers, 48);
+    assert_eq!(config.capture_final_norm, None);
+    assert_eq!(config.final_logit_softcapping, Some(30.0));
+    assert_eq!(
+        config.selector_softcap_mode.as_deref(),
+        Some("after_correction")
+    );
+    assert_eq!(config.post_edge_softcap(), Some(30.0));
+    assert_eq!(config.valid_vocab_size, None);
+    assert_eq!(config.effective_valid_vocab_size(), 201024);
+    assert_eq!(config.hidden_size, 2304);
+    assert_eq!(config.intermediate_size, 6912);
+    assert_eq!(config.num_hidden_layers, 5);
+    assert_eq!(config.num_attention_heads, 32);
+    assert_eq!(config.num_key_value_heads, 8);
+    assert_eq!(config.head_dim, 128);
+    assert_eq!(config.sliding_window, 2048);
+    assert_eq!(config.vocab_size, 201024);
+    assert_eq!(config.mask_token_id, 200056);
+
+    let contract = super::DFlash2TargetContract {
+        hidden_size: 2304,
+        vocab_size: 201024,
+        num_layers: 48,
+        valid_vocab_size: Some(200058),
+        final_logit_softcapping: Some(30.0),
+        allow_final_norm_tap: true,
+    };
+    config.validate_target(contract).unwrap();
+
+    // Targets that do not support a final-norm tap (e.g. Qwen3.5/Qwen4) must
+    // reject `layer == num_layers` (`48 == 48`).
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetContract {
+                allow_final_norm_tap: false,
+                ..contract
+            })
+            .is_err()
+    );
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetShape::new(2304, 201024, 48))
+            .is_err()
+    );
+
+    // Softcap mismatch, missing softcap, or wrong layer count are rejected.
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetContract {
+                final_logit_softcapping: Some(50.0),
+                ..contract
+            })
+            .is_err()
+    );
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetContract {
+                final_logit_softcapping: None,
+                ..contract
+            })
+            .is_err()
+    );
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetContract {
+                num_layers: 47,
+                ..contract
+            })
+            .is_err()
+    );
+    assert!(
+        config
+            .validate_target(super::DFlash2TargetContract {
+                valid_vocab_size: Some(201025),
+                ..contract
+            })
+            .is_err()
+    );
+
+    // Omitting `final_logit_softcapping` in draft config passes target validation
+    // so `configure_target_contract` can inherit target softcapping.
+    let mut omitted_softcap_json = inkling2_json.clone();
+    omitted_softcap_json["dflash_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("final_logit_softcapping");
+    omitted_softcap_json["dflash_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("selector_softcap_mode");
+    let omitted_softcap = parse_json(&omitted_softcap_json).expect("omitted softcap must parse");
+    assert_eq!(omitted_softcap.final_logit_softcapping, None);
+    assert_eq!(omitted_softcap.selector_softcap_mode, None);
+    omitted_softcap.validate_target(contract).unwrap();
+    omitted_softcap
+        .validate_target(super::DFlash2TargetContract {
+            final_logit_softcapping: None,
+            ..contract
+        })
+        .unwrap();
+
+    // Explicit `final_logit_softcapping: 0.0` (disabled) parses as `Some(0.0)`,
+    // fails against a target with positive softcapping, and passes against `None`.
+    let mut disabled_softcap_json = omitted_softcap_json.clone();
+    disabled_softcap_json["dflash_config"]["final_logit_softcapping"] = serde_json::json!(0.0);
+    let disabled_softcap = parse_json(&disabled_softcap_json).expect("0.0 softcap must parse");
+    assert_eq!(disabled_softcap.final_logit_softcapping, Some(0.0));
+    assert_eq!(disabled_softcap.post_edge_softcap(), None);
+    assert!(disabled_softcap.validate_target(contract).is_err());
+    disabled_softcap
+        .validate_target(super::DFlash2TargetContract {
+            final_logit_softcapping: None,
+            ..contract
+        })
+        .unwrap();
+
+    // Explicit mismatched positive softcap (`15.0` vs target `30.0`) still fails.
+    let mut wrong_softcap_json = inkling2_json.clone();
+    wrong_softcap_json["dflash_config"]["final_logit_softcapping"] = serde_json::json!(15.0);
+    let wrong_softcap = parse_json(&wrong_softcap_json).expect("15.0 softcap must parse");
+    assert!(wrong_softcap.validate_target(contract).is_err());
+
+    // Explicit preview fields (`valid_vocab_size`, `capture_final_norm`) parse
+    // and enforce strict agreement with the target contract.
+    inkling2_json["dflash_config"]["valid_vocab_size"] = serde_json::json!(200058);
+    inkling2_json["dflash_config"]["capture_final_norm"] = serde_json::json!(true);
+    let preview = parse_json(&inkling2_json).expect("preview config must parse");
+    assert_eq!(preview.valid_vocab_size, Some(200058));
+    assert_eq!(preview.effective_valid_vocab_size(), 200058);
+    assert_eq!(preview.capture_final_norm, Some(true));
+    preview.validate_target(contract).unwrap();
+    assert!(
+        preview
+            .validate_target(super::DFlash2TargetContract {
+                valid_vocab_size: Some(201024),
+                ..contract
+            })
+            .is_err()
+    );
+
+    // Reject layer_id > num_target_layers (`49 > 48`).
+    let mut bad_tap = inkling2_json.clone();
+    bad_tap["dflash_config"]["target_layer_ids"] = serde_json::json!([5, 23, 41, 49]);
+    assert!(parse_json(&bad_tap).is_err());
+
+    // Reject conflicting capture_final_norm=false when layer 48 == num_target_layers.
+    let mut bad_capture = inkling2_json.clone();
+    bad_capture["dflash_config"]["capture_final_norm"] = serde_json::json!(false);
+    assert!(parse_json(&bad_capture).is_err());
+
+    // Reject unsupported selector_softcap_mode.
+    let mut bad_mode = inkling2_json.clone();
+    bad_mode["dflash_config"]["selector_softcap_mode"] = serde_json::json!("before_correction");
+    assert!(parse_json(&bad_mode).is_err());
+
+    // Reject missing selector_softcap_mode when final_logit_softcapping > 0.
+    let mut missing_mode = inkling2_json.clone();
+    missing_mode["dflash_config"]
+        .as_object_mut()
+        .unwrap()
+        .remove("selector_softcap_mode");
+    assert!(parse_json(&missing_mode).is_err());
+}
+
+#[test]
+fn valid_vocab_size_excludes_padded_token_ids_from_topk16() {
+    let vocab = 96usize;
+    let valid_vocab = 64usize;
+    let length = 7usize;
+
+    for (top_k, rank, hidden, bf16) in [
+        (16usize, 256usize, 64usize, true),
+        (4usize, 8usize, 16usize, false),
+    ] {
+        let mut selector = test_selector(vocab, top_k, rank, hidden);
+        selector.valid_vocab_size = Some(valid_vocab);
+        if bf16 {
+            selector.predecessor_codebook = Embedding::from_weight(
+                &selector
+                    .predecessor_codebook
+                    .get_weight()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+            selector.successor_codebook = Embedding::from_weight(
+                &selector
+                    .successor_codebook
+                    .get_weight()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+            selector.hidden_projection = LinearProj::Standard(
+                Linear::from_weights(
+                    &selector
+                        .hidden_projection
+                        .get_weight()
+                        .astype(DType::BFloat16)
+                        .unwrap(),
+                    None,
+                )
+                .unwrap(),
+            );
+        }
+
+        // Fill valid tokens [0..valid_vocab) with distinct modest scores and
+        // padded tokens [valid_vocab..vocab) with huge +1000.0 logits.
+        let mut logits_data = vec![-10.0f32; length * vocab];
+        for pos in 0..length {
+            for tok in 0..valid_vocab {
+                logits_data[pos * vocab + tok] = ((tok * 13 + pos * 7) % valid_vocab) as f32 * 0.1;
+            }
+            for pad_tok in valid_vocab..vocab {
+                logits_data[pos * vocab + pad_tok] = 1000.0 + pad_tok as f32;
+            }
+        }
+        let mut logits =
+            MxArray::from_float32(&logits_data, &[1, length as i64, vocab as i64]).unwrap();
+        let mut hidden_arr = MxArray::random_normal(
+            &[1, length as i64, hidden as i64],
+            0.0,
+            0.2,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        if bf16 {
+            logits = logits.astype(DType::BFloat16).unwrap();
+            hidden_arr = hidden_arr.astype(DType::BFloat16).unwrap();
+        }
+        let anchor_ids = MxArray::from_int32(&[3], &[1]).unwrap();
+        let (candidates, scores) = selector
+            .select_lattice_arrays(&hidden_arr, &logits, &anchor_ids, None)
+            .unwrap();
+        MxArray::eval_arrays(&[&candidates, &scores]).unwrap();
+        let cand_ids = candidates.to_int32().unwrap();
+        assert_eq!(cand_ids.len(), length * top_k);
+        for &id in cand_ids.as_ref() {
+            assert!(
+                id >= 0 && (id as usize) < valid_vocab,
+                "padded token id {id} leaked past valid_vocab_size={valid_vocab} (top_k={top_k})"
+            );
+        }
+
+        // Sampled host path also uses `valid_vocab` for SparseDistribution so
+        // acceptance checks against unpadded target distributions succeed.
+        let (path, sparse_rows) = selector
+            .select(&hidden_arr, &logits, 3, 0.8, false, None, &mut rand::rng())
+            .unwrap();
+        let SelectorPath::Host(tokens) = path else {
+            panic!("expected host path");
+        };
+        assert_eq!(tokens.len(), length);
+        assert_eq!(sparse_rows.len(), length);
+        let target_dist = crate::sampling::SparseDistribution::from_parts(
+            (0..valid_vocab as i32).collect(),
+            vec![1.0 / valid_vocab as f64; valid_vocab],
+            valid_vocab,
+        )
+        .unwrap();
+        for (&tok, row) in tokens.iter().zip(&sparse_rows) {
+            assert!(tok >= 0 && (tok as usize) < valid_vocab);
+            let (support, _) = row.candidates();
+            assert!(
+                support
+                    .iter()
+                    .all(|&id| id >= 0 && (id as usize) < valid_vocab)
+            );
+            // Verifies `row.vocab_size == valid_vocab`.
+            crate::sampling::accept_with_residual_sparse(
+                target_dist.as_row(),
+                row.as_row(),
+                tok,
+                &mut rand::rng(),
+            )
+            .expect("sparse draft vocab must match unpadded valid_vocab_size");
+        }
+    }
+}
+
+#[test]
+fn post_edge_softcap_matches_tanh_formula_and_preserves_zero_softcap_bits() {
+    let softcap = 30.0f32;
+    let length = 7usize;
+
+    // Exercise both the MLX fallback path (top_k=4, rank=8, Float32) and the
+    // production BF16 K=16, Rank=256 path (fused `mlx_dflash2_selector_edges`
+    // on CUDA/Metal, MLX fallback on CPU).
+    for (top_k, rank, bf16) in [(4usize, 8usize, false), (16usize, 256usize, true)] {
+        let vocab = 64usize;
+        let mut selector = test_selector(vocab, top_k, rank, 32);
+        if bf16 {
+            selector.predecessor_codebook = Embedding::from_weight(
+                &selector
+                    .predecessor_codebook
+                    .get_weight()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+            selector.successor_codebook = Embedding::from_weight(
+                &selector
+                    .successor_codebook
+                    .get_weight()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+            )
+            .unwrap();
+        }
+        let cand_vals: Vec<i32> = (0..length * top_k)
+            .map(|i| ((i * 7 + 3) % vocab) as i32)
+            .collect();
+        let candidates =
+            MxArray::from_int32(&cand_vals, &[1, length as i64, top_k as i64]).unwrap();
+        // Large magnitudes span [-60, +60] so softcap(30) visibly compresses scores,
+        // plus one explicit -inf entry to verify -inf preservation (matching Splash).
+        let mut unary_vals: Vec<f32> = (0..length * top_k)
+            .map(|i| ((i as f32 * 5.3) % 120.0) - 60.0)
+            .collect();
+        unary_vals[top_k + 2] = f32::NEG_INFINITY;
+        let mut unary =
+            MxArray::from_float32(&unary_vals, &[1, length as i64, top_k as i64]).unwrap();
+        let mut projected = MxArray::random_normal(
+            &[length as i64, 1, rank as i64],
+            0.0,
+            0.5,
+            Some(DType::Float32),
+        )
+        .unwrap();
+        if bf16 {
+            unary = unary.astype(DType::BFloat16).unwrap();
+            projected = projected.astype(DType::BFloat16).unwrap();
+        }
+        let anchor = MxArray::from_int32(&[5], &[1]).unwrap();
+
+        selector.post_softcap = None;
+        let raw_none = selector
+            .edge_scores(&candidates, &unary, &projected, &anchor, length)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        selector.post_softcap = Some(0.0);
+        let raw_zero = selector
+            .edge_scores(&candidates, &unary, &projected, &anchor, length)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        assert_eq!(
+            raw_none.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            raw_zero.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "softcap=0.0 must be bit-identical to None (top_k={top_k}, bf16={bf16})"
+        );
+
+        selector.post_softcap = Some(softcap);
+        let capped = selector
+            .edge_scores(&candidates, &unary, &projected, &anchor, length)
+            .unwrap()
+            .to_float32()
+            .unwrap()
+            .to_vec();
+
+        // When `bf16 == true`, softcapped edge scoring keeps `sum = u_val + edge`
+        // in FP32 before `softcap * tanh(clamp(sum / softcap, -20.0, 20.0))`
+        // (matching Splash `sampling.metal:1670-1675`). The fused CUDA/Metal
+        // kernel (`top_k=16, rank=256`) also keeps `pred * hidden` and the dot
+        // product in FP32, whereas the CPU BF16 fallback rounds `pred * hidden`
+        // and the matmul output to BF16 before promoting to FP32 for `+ unary`.
+        let use_gpu_edges = bf16
+            && top_k == 16
+            && rank == 256
+            && (crate::accelerator::cuda_ops_available()
+                || unsafe {
+                    mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_default_device() == 1
+                });
+        let expected_raw: Vec<f32> = if bf16 {
+            let pred_w = selector
+                .predecessor_codebook
+                .get_weight()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let succ_w = selector
+                .successor_codebook
+                .get_weight()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let proj_f = projected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let unary_f = unary
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let anchor_id = 5usize;
+            let mut sums = vec![0.0f32; length * top_k * top_k];
+            for pos in 0..length {
+                let h_row = &proj_f[pos * rank..(pos + 1) * rank];
+                let num_prev = if pos > 0 { top_k } else { 1 };
+                for prev in 0..num_prev {
+                    let pid = if pos > 0 {
+                        cand_vals[(pos - 1) * top_k + prev] as usize
+                    } else {
+                        anchor_id
+                    };
+                    let p_row = &pred_w[pid * rank..(pid + 1) * rank];
+                    let ctx: Vec<f32> = (0..rank)
+                        .map(|d| {
+                            let prod = p_row[d] * h_row[d];
+                            if use_gpu_edges {
+                                prod
+                            } else {
+                                half::bf16::from_f32(prod).to_f32()
+                            }
+                        })
+                        .collect();
+                    for j in 0..top_k {
+                        let cid = cand_vals[pos * top_k + j] as usize;
+                        let s_row = &succ_w[cid * rank..(cid + 1) * rank];
+                        let mut dot = 0.0f32;
+                        for d in 0..rank {
+                            dot = ctx[d].mul_add(s_row[d], dot);
+                        }
+                        let edge = if use_gpu_edges {
+                            dot
+                        } else {
+                            half::bf16::from_f32(dot).to_f32()
+                        };
+                        let sum = unary_f[pos * top_k + j] + edge;
+                        if pos > 0 {
+                            sums[(pos * top_k + prev) * top_k + j] = sum;
+                        } else {
+                            for p in 0..top_k {
+                                sums[p * top_k + j] = sum;
+                            }
+                        }
+                    }
+                }
+            }
+            sums
+        } else {
+            raw_none.clone()
+        };
+
+        assert_eq!(capped.len(), expected_raw.len());
+        let mut saw_neg_inf = false;
+        let mut saw_compressed = false;
+        for (idx, (&raw, &got)) in expected_raw.iter().zip(&capped).enumerate() {
+            if raw == f32::NEG_INFINITY {
+                assert_eq!(
+                    got,
+                    f32::NEG_INFINITY,
+                    "idx {idx}: -inf must stay -inf under softcap (top_k={top_k}, bf16={bf16})"
+                );
+                saw_neg_inf = true;
+            } else {
+                let expected = softcap * (raw / softcap).clamp(-20.0, 20.0).tanh();
+                if raw.abs() > 35.0 {
+                    saw_compressed = true;
+                }
+                assert!(
+                    (got - expected).abs() <= 2e-5,
+                    "idx {idx}: raw={raw} got={got} expected={expected} (top_k={top_k}, bf16={bf16})"
+                );
+            }
+        }
+        assert!(saw_neg_inf, "fixture must exercise -inf preservation");
+        assert!(
+            saw_compressed,
+            "fixture must exercise non-linear softcap compression"
+        );
+    }
+}
+
+#[test]
+fn optional_mask_embedding_loads_and_splices_block_rows() {
+    let config = checkpoint_inventory_config();
+    let hidden = config.hidden_size as i64;
+    let write_base_checkpoint = |dir: &std::path::Path, include_inline_mask: bool| {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::json!({
+                "architectures": ["DFlash2DraftModel"],
+                "hidden_size": config.hidden_size,
+                "intermediate_size": config.intermediate_size,
+                "num_hidden_layers": config.num_hidden_layers,
+                "num_target_layers": config.target_num_layers,
+                "num_attention_heads": config.num_attention_heads,
+                "num_key_value_heads": config.num_key_value_heads,
+                "head_dim": config.head_dim,
+                "vocab_size": config.vocab_size,
+                "rms_norm_eps": config.rms_norm_eps,
+                "max_position_embeddings": config.max_position_embeddings,
+                "sliding_window": config.sliding_window,
+                "layer_types": ["sliding_attention"],
+                "rope_theta": config.rope_theta,
+                "dflash_config": {
+                    "block_size": config.block_size + 1,
+                    "conv_group_size": config.conv_group_size,
+                    "conv_kernel_size": config.conv_kernel_size,
+                    "mask_token_id": config.mask_token_id,
+                    "selector_rank": config.selector_rank,
+                    "selector_top_k": config.selector_top_k,
+                    "target_layer_ids": config.target_layers,
+                },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut tensors = super::expected_tensor_shapes(&config)
+            .into_iter()
+            .map(|(name, shape)| {
+                let array =
+                    MxArray::random_normal(&shape, 0.0, 0.02, Some(DType::BFloat16)).unwrap();
+                (name, array)
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        if include_inline_mask {
+            let mask_vals: Vec<f32> = (0..hidden).map(|i| (i as f32 + 1.0) * 0.25).collect();
+            let mask = MxArray::from_float32(&mask_vals, &[hidden])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            tensors.insert("mask_embedding".into(), mask);
+        }
+        crate::utils::safetensors::save_safetensors(
+            dir.join("model.safetensors"),
+            &mut tensors,
+            None,
+        )
+        .unwrap();
+    };
+
+    // Case 1: inline `mask_embedding` in `model.safetensors`.
+    let inline_dir =
+        std::env::temp_dir().join(format!("mlx-dflash2-mask-inline-{}", uuid::Uuid::new_v4()));
+    write_base_checkpoint(&inline_dir, true);
+    let (model, _bytes) = super::load_dflash2(&inline_dir).unwrap();
+    let _ = std::fs::remove_dir_all(&inline_dir);
+    let mask = model
+        .mask_embedding()
+        .expect("inline mask_embedding must load");
+    assert_eq!(mask.shape().unwrap().as_ref(), &[hidden]);
+    if crate::accelerator::cuda_ops_available() {
+        assert_eq!(
+            mask.cuda_host_bytes(),
+            0,
+            "mask_embedding must be promoted to CUDA device memory"
+        );
+    }
+
+    // Splicing preserves row 0 (anchor) and overwrites rows 1..8 with `mask_embedding`.
+    let block_emb = MxArray::zeros(&[1, 8, hidden], Some(DType::BFloat16)).unwrap();
+    let anchor_row = MxArray::ones(&[1, 1, hidden], Some(DType::BFloat16)).unwrap();
+    let input_emb =
+        MxArray::concatenate(&anchor_row, &block_emb.slice_axis(1, 1, 8).unwrap(), 1).unwrap();
+    let spliced = model.splice_mask_embedding(&input_emb).unwrap();
+    assert_eq!(
+        bits(&spliced.slice_axis(1, 0, 1).unwrap()),
+        bits(&anchor_row)
+    );
+    let want_mask = bits(mask);
+    for row in 1..8i64 {
+        assert_eq!(
+            bits(&spliced.slice_axis(1, row, row + 1).unwrap()),
+            want_mask,
+            "row {row} must equal mask_embedding"
+        );
+    }
+
+    // Case 2: sidecar `mask_embedding.safetensors`.
+    let sidecar_dir =
+        std::env::temp_dir().join(format!("mlx-dflash2-mask-sidecar-{}", uuid::Uuid::new_v4()));
+    write_base_checkpoint(&sidecar_dir, false);
+    let mut sidecar_map = std::collections::HashMap::from([(
+        "mask_embedding".to_string(),
+        MxArray::ones(&[hidden], Some(DType::BFloat16)).unwrap(),
+    )]);
+    crate::utils::safetensors::save_safetensors(
+        sidecar_dir.join("mask_embedding.safetensors"),
+        &mut sidecar_map,
+        None,
+    )
+    .unwrap();
+    let (sidecar_model, _) = super::load_dflash2(&sidecar_dir).unwrap();
+    assert!(sidecar_model.mask_embedding().is_some());
+    let _ = std::fs::remove_dir_all(&sidecar_dir);
+
+    // Case 3: duplicate `mask_embedding` in both files is rejected.
+    let dup_dir =
+        std::env::temp_dir().join(format!("mlx-dflash2-mask-dup-{}", uuid::Uuid::new_v4()));
+    write_base_checkpoint(&dup_dir, true);
+    let mut dup_map = std::collections::HashMap::from([(
+        "mask_embedding".to_string(),
+        MxArray::ones(&[hidden], Some(DType::BFloat16)).unwrap(),
+    )]);
+    crate::utils::safetensors::save_safetensors(
+        dup_dir.join("mask_embedding.safetensors"),
+        &mut dup_map,
+        None,
+    )
+    .unwrap();
+    assert!(super::load_dflash2(&dup_dir).is_err());
+    let _ = std::fs::remove_dir_all(&dup_dir);
+
+    // Case 4: wrong shape for `mask_embedding` is rejected before GPU eval.
+    let mut bad_params = checkpoint_inventory();
+    bad_params.insert(
+        "mask_embedding".into(),
+        MxArray::zeros(&[hidden / 2], Some(DType::BFloat16)).unwrap(),
+    );
+    assert!(
+        super::validate_tensor_inventory(&bad_params, &config)
+            .unwrap_err()
+            .to_string()
+            .contains("mask_embedding")
+    );
+}
+
+#[test]
+fn propose_tree_lattice_embedded_compiled_supports_standard_bf16_lm_head() {
+    if !crate::accelerator::cuda_ops_available() {
+        return;
+    }
+    struct EmbeddedStandardLinearView<'a> {
+        embedding: &'a Embedding,
+        lm_head: &'a LinearProj,
+    }
+    impl super::DFlash2TargetView for EmbeddedStandardLinearView<'_> {
+        fn embed(&mut self, block: &MxArray, _ids: &[i32]) -> napi::Result<MxArray> {
+            self.embedding.forward(block)
+        }
+        fn logits(&mut self, hidden: &MxArray) -> napi::Result<MxArray> {
+            self.lm_head.forward_logits(hidden)
+        }
+        fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)> {
+            None
+        }
+        fn target_lm_head_proj(&self) -> Option<&LinearProj> {
+            Some(self.lm_head)
+        }
+    }
+
+    let target = crate::models::qwen3_5::config::Qwen3_5Config {
+        rope_scaling: None,
+        qwen35_gguf_gdn_layout: None,
+        kv_format: None,
+        vocab_size: 64,
+        hidden_size: 256,
+        num_layers: 4,
+        num_heads: 4,
+        num_kv_heads: 2,
+        intermediate_size: 512,
+        rms_norm_eps: 1e-6,
+        head_dim: 128,
+        tie_word_embeddings: false,
+        attention_bias: false,
+        max_position_embeddings: 512,
+        pad_token_id: 0,
+        eos_token_id: 2,
+        bos_token_id: 1,
+        linear_num_value_heads: 2,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 8,
+        linear_value_head_dim: 8,
+        linear_conv_kernel_dim: 4,
+        full_attention_interval: 4,
+        partial_rotary_factor: 0.25,
+        rope_theta: 10_000.0,
+        paged_cache_memory_mb: None,
+        paged_block_size: None,
+        n_mtp_layers: 0,
+    };
+    let mut model = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
+    model.config.sliding_window = 64;
+    model.config.selector_top_k = 16;
+    model.config.final_logit_softcapping = Some(30.0);
+    model.config.selector_softcap_mode = Some("after_correction".to_string());
+    model.selector.top_k = 16;
+    model.selector.post_softcap = Some(30.0);
+    model
+        .configure_target_contract(super::DFlash2TargetContract {
+            hidden_size: 256,
+            vocab_size: 64,
+            num_layers: 4,
+            valid_vocab_size: Some(48),
+            final_logit_softcapping: Some(30.0),
+            allow_final_norm_tap: false,
+        })
+        .unwrap();
+    model.configure_dense_execution();
+
+    let mut embedding = Embedding::new(64, 256).unwrap();
+    embedding
+        .load_weight(&MxArray::random_normal(&[64, 256], 0.0, 0.5, Some(DType::BFloat16)).unwrap())
+        .unwrap();
+    let dense_head = MxArray::random_normal(&[64, 256], 0.0, 0.5, Some(DType::BFloat16)).unwrap();
+    dense_head.eval();
+    let lm_head = LinearProj::Standard(Linear::from_weights(&dense_head, None).unwrap());
+
+    let fused = MxArray::random_normal(&[1, 16, 256], 0.0, 1.0, Some(DType::BFloat16)).unwrap();
+    let tokens: Vec<u32> = (0..16).map(|t| 1 + (t % 20)).collect();
+    let mut ctx_compiled = super::DFlash2ContextCache::new(&model.config);
+    let mut ctx_eager = super::DFlash2ContextCache::new(&model.config);
+    ctx_compiled.append(&model, &fused, 0, &tokens).unwrap();
+    ctx_eager.append(&model, &fused, 0, &tokens).unwrap();
+    ctx_compiled.eval().unwrap();
+    ctx_eager.eval().unwrap();
+
+    let mut view = EmbeddedStandardLinearView {
+        embedding: &embedding,
+        lm_head: &lm_head,
+    };
+    let (c0, s0) = model
+        .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_compiled, 5, 7)
+        .unwrap();
+    MxArray::eval_arrays(&[&c0, &s0]).unwrap();
+    assert!(model.compiled.prepared.load(super::Ordering::Relaxed));
+
+    for anchor in [7u32, 11u32] {
+        let (cc, cs) = model
+            .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_compiled, anchor, 7)
+            .unwrap();
+        MxArray::eval_arrays(&[&cc, &cs]).unwrap();
+
+        model
+            .compiled
+            .disabled
+            .store(true, super::Ordering::Relaxed);
+        let (ec, es) = model
+            .propose_tree_lattice_arrays_embedded(&mut view, &mut ctx_eager, anchor, 7)
+            .unwrap();
+        MxArray::eval_arrays(&[&ec, &es]).unwrap();
+        model
+            .compiled
+            .disabled
+            .store(false, super::Ordering::Relaxed);
+
+        let cc_ids = cc.to_int32().unwrap();
+        let cs_vals = cs.to_float32().unwrap();
+        assert_eq!(cc_ids.as_ref(), ec.to_int32().unwrap().as_ref());
+        assert_eq!(cs_vals.as_ref(), es.to_float32().unwrap().as_ref());
+        assert!(
+            cc_ids.as_ref().iter().all(|&id| (0..48).contains(&id)),
+            "compiled Standard BF16 lm_head must honor valid_vocab_size=48"
+        );
+        assert!(
+            cs_vals.as_ref().iter().all(|&s| s.abs() <= 30.0001),
+            "compiled Standard BF16 lm_head must honor post-edge softcap=30.0"
+        );
+    }
+    assert_eq!(
+        model.compiled.traces.load(super::Ordering::Relaxed),
+        1,
+        "Standard BF16 compiled embedded lattice must trace once and replay"
+    );
+}
+
+#[test]
+fn inkling2_spanned_layout_wide_tokens_and_candidate_remap() {
+    use super::spanned_head::{
+        INKLING2_DEFAULT_LOW_END, INKLING2_TAIL_TILE_END, INKLING2_TAIL_TILE_START,
+        INKLING2_VALID_VOCAB_SIZE, INKLING2_VOCAB_SIZE, is_wide_vocab_token_for,
+        parse_inkling2_spanned_low_end, remap_spanned_candidate_ids, spanned_vocab_layout_for,
+    };
+
+    // Env override parser enforces 64-aligned values strictly inside [64, 199_936).
+    assert_eq!(
+        parse_inkling2_spanned_low_end(None),
+        INKLING2_DEFAULT_LOW_END
+    );
+    assert_eq!(parse_inkling2_spanned_low_end(Some("98304")), 98_304);
+    assert_eq!(parse_inkling2_spanned_low_end(Some("131072")), 131_072);
+    assert_eq!(
+        parse_inkling2_spanned_low_end(Some("100000")),
+        INKLING2_DEFAULT_LOW_END
+    );
+    assert_eq!(
+        parse_inkling2_spanned_low_end(Some("0")),
+        INKLING2_DEFAULT_LOW_END
+    );
+    assert_eq!(
+        parse_inkling2_spanned_low_end(Some("199936")),
+        INKLING2_DEFAULT_LOW_END
+    );
+    assert_eq!(
+        parse_inkling2_spanned_low_end(Some("bad")),
+        INKLING2_DEFAULT_LOW_END
+    );
+
+    // Default Inkling-2-Mini 131K layout (`[0, 131_072) U [199_936, 200_058)`).
+    let layout = spanned_vocab_layout_for(
+        INKLING2_VOCAB_SIZE as usize,
+        Some(INKLING2_VALID_VOCAB_SIZE as usize),
+        Some(INKLING2_DEFAULT_LOW_END),
+    )
+    .expect("Inkling-2-Mini layout must resolve");
+    assert_eq!(layout.vocab_size, INKLING2_VOCAB_SIZE);
+    assert_eq!(layout.valid_vocab_size, INKLING2_VALID_VOCAB_SIZE);
+    assert_eq!(layout.low_end, 131_072);
+    assert_eq!(layout.high_start, 199_936);
+    assert_eq!(layout.tail_tile_start, INKLING2_TAIL_TILE_START);
+    assert_eq!(layout.tail_tile_end, INKLING2_TAIL_TILE_END);
+    assert_eq!(layout.tail_skip_front, 0);
+    assert_eq!(layout.tail_keep_end, 122);
+    assert_eq!(layout.id_shift, 68_864);
+    assert_eq!(layout.packed_vocab_size(), 131_194);
+
+    // Narrow tokens: `< 131_072` and `>= 199_936` (including all 60 special tokens).
+    for narrow in [0u32, 1, 98_304, 131_071, 199_936, 199_998, 200_056, 200_057] {
+        assert!(
+            !layout.is_wide_token(narrow),
+            "token {narrow} must be narrow for Inkling-2-Mini"
+        );
+    }
+    // Wide tokens: `[131_072, 199_936)`.
+    for wide in [131_072u32, 150_000, 199_935] {
+        assert!(
+            layout.is_wide_token(wide),
+            "token {wide} must be wide for Inkling-2-Mini"
+        );
+    }
+
+    // Verify `is_wide_vocab_token_for` and `DFlash2ContextCache` tracking when
+    // default low_end is active (no `MLX_DFLASH2_SPANNED_LOW_END` override).
+    if std::env::var("MLX_DFLASH2_SPANNED_LOW_END").is_err() {
+        assert!(!is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            98_304
+        ));
+        assert!(!is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            131_071
+        ));
+        assert!(is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            131_072
+        ));
+        assert!(is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            199_935
+        ));
+        assert!(!is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            199_936
+        ));
+        assert!(!is_wide_vocab_token_for(
+            INKLING2_VOCAB_SIZE as usize,
+            200_056
+        ));
+
+        let inkling_cfg = DFlash2Config {
+            vocab_size: INKLING2_VOCAB_SIZE as usize,
+            valid_vocab_size: Some(INKLING2_VALID_VOCAB_SIZE as usize),
+            ..checkpoint_inventory_config()
+        };
+        let mut ctx = DFlash2ContextCache::new(&inkling_cfg);
+        assert!(!ctx.wide_vocab());
+        ctx.observe_tokens(&[0, 100, 98_304, 131_071, 199_936, 199_998, 200_056, 200_057]);
+        assert!(
+            !ctx.wide_vocab(),
+            "o200k BPE (<131072) and special tokens (>=199936) must stay narrow"
+        );
+        ctx.observe_token(131_072);
+        assert!(
+            ctx.wide_vocab(),
+            "token 131_072 must permanently widen the turn"
+        );
+        ctx.observe_token(42);
+        assert!(ctx.wide_vocab());
+        ctx.reset();
+        assert!(!ctx.wide_vocab());
+        ctx.observe_token(200_056);
+        assert!(!ctx.wide_vocab());
+        ctx.observe_token(199_935);
+        assert!(ctx.wide_vocab());
+    }
+
+    // Candidate ID remapping: `< 131_072` unchanged, `131_072 + k -> 199_936 + k`.
+    let raw = MxArray::from_int32(
+        &[
+            0, 1, 98_304, 131_071, 131_072, 131_073, 131_134, 131_192, 131_193,
+        ],
+        &[1, 1, 9],
+    )
+    .unwrap();
+    let remapped = remap_spanned_candidate_ids(&raw, layout)
+        .unwrap()
+        .to_int32()
+        .unwrap();
+    assert_eq!(
+        remapped.as_ref(),
+        &[
+            0, 1, 98_304, 131_071, 199_936, 199_937, 199_998, 200_056, 200_057
+        ]
+    );
+
+    // Override low_end=98_304 (`[0, 98_304) U [199_936, 200_058)`, shift +101_632).
+    let layout_98k = spanned_vocab_layout_for(
+        INKLING2_VOCAB_SIZE as usize,
+        Some(INKLING2_VALID_VOCAB_SIZE as usize),
+        Some(98_304),
+    )
+    .unwrap();
+    assert_eq!(layout_98k.low_end, 98_304);
+    assert_eq!(layout_98k.id_shift, 101_632);
+    assert_eq!(layout_98k.packed_vocab_size(), 98_426);
+    assert!(!layout_98k.is_wide_token(98_303));
+    assert!(layout_98k.is_wide_token(98_304));
+    let raw_98k = MxArray::from_int32(&[98_303, 98_304, 98_425], &[1, 1, 3]).unwrap();
+    let remapped_98k = remap_spanned_candidate_ids(&raw_98k, layout_98k)
+        .unwrap()
+        .to_int32()
+        .unwrap();
+    assert_eq!(remapped_98k.as_ref(), &[98_303, 199_936, 200_057]);
+}
+
+#[test]
+fn qwen38_spanned_layout_remains_unchanged() {
+    use super::spanned_head::{
+        QWEN38_SPANNED_HIGH_START, QWEN38_SPANNED_LOW_END, QWEN38_SPANNED_TAIL_TILE_START,
+        QWEN38_SPANNED_VOCAB_SIZE, is_wide_vocab_token, is_wide_vocab_token_for,
+        remap_spanned_candidate_ids, spanned_vocab_layout_for,
+    };
+
+    // Even if an Inkling-2-Mini low_end override is passed, Qwen3.8 stays fixed at 98_304.
+    let layout = spanned_vocab_layout_for(QWEN38_SPANNED_VOCAB_SIZE as usize, None, Some(131_072))
+        .expect("Qwen3.8 spanned layout must resolve");
+    assert_eq!(layout.vocab_size, QWEN38_SPANNED_VOCAB_SIZE);
+    assert_eq!(layout.valid_vocab_size, QWEN38_SPANNED_VOCAB_SIZE);
+    assert_eq!(layout.low_end, QWEN38_SPANNED_LOW_END);
+    assert_eq!(layout.high_start, QWEN38_SPANNED_HIGH_START);
+    assert_eq!(layout.tail_tile_start, QWEN38_SPANNED_TAIL_TILE_START);
+    assert_eq!(layout.tail_tile_end, QWEN38_SPANNED_VOCAB_SIZE);
+    assert_eq!(layout.tail_skip_front, 32);
+    assert_eq!(layout.tail_keep_end, 320);
+    assert_eq!(layout.id_shift, 149_728);
+    assert_eq!(layout.packed_vocab_size(), 98_592);
+
+    // Narrower `valid_vocab_size < 248_320` stays declined for Qwen3.8.
+    assert!(
+        spanned_vocab_layout_for(QWEN38_SPANNED_VOCAB_SIZE as usize, Some(240_000), None).is_none()
+    );
+
+    for tok in [0u32, 98_303, 98_304, 131_072, 248_031, 248_032, 248_319] {
+        assert_eq!(
+            is_wide_vocab_token_for(QWEN38_SPANNED_VOCAB_SIZE as usize, tok),
+            is_wide_vocab_token(tok),
+            "Qwen3.8 wide check mismatch for token {tok}"
+        );
+    }
+    assert!(!is_wide_vocab_token_for(
+        QWEN38_SPANNED_VOCAB_SIZE as usize,
+        98_303
+    ));
+    assert!(is_wide_vocab_token_for(
+        QWEN38_SPANNED_VOCAB_SIZE as usize,
+        98_304
+    ));
+    assert!(is_wide_vocab_token_for(
+        QWEN38_SPANNED_VOCAB_SIZE as usize,
+        248_031
+    ));
+    assert!(!is_wide_vocab_token_for(
+        QWEN38_SPANNED_VOCAB_SIZE as usize,
+        248_032
+    ));
+
+    let raw = MxArray::from_int32(&[0, 98_303, 98_304, 98_591], &[1, 1, 4]).unwrap();
+    let remapped = remap_spanned_candidate_ids(&raw, layout)
+        .unwrap()
+        .to_int32()
+        .unwrap();
+    assert_eq!(remapped.as_ref(), &[0, 98_303, 248_032, 248_319]);
+}
+
+#[test]
+fn draft_af4g64_head_matches_bf16_and_q8_topk16_and_excludes_padding() {
+    use super::EmbeddedLmHead;
+    use super::spanned_head::{SpannedVocabLayout, build_draft_af4g64_head};
+    use crate::models::quantized_linear::QuantizedLinear;
+
+    // Scaled Inkling-2-Mini geometry:
+    // - vocab_size = 512, valid_vocab_size = 442 (+6 zero-pad rows -> 448 = 7 * 64)
+    // - hidden_size = 1024 (hits CUDA `mlx_affine_q4_g64_few_cuda` when run on CUDA!)
+    // - spanned layout: [0, 256) U [384, 442), tail tile [384, 448) (64 rows, drop last 6)
+    const VOCAB: usize = 512;
+    const VALID_VOCAB: usize = 442;
+    const PADDED_VALID: usize = 448;
+    const LOW_END: usize = 256;
+    const TAIL_START: usize = 384;
+    const HIDDEN: usize = 1024;
+    const ROWS: usize = 7;
+
+    let spanned_layout = SpannedVocabLayout {
+        vocab_size: VOCAB as i64,
+        valid_vocab_size: VALID_VOCAB as i64,
+        low_end: LOW_END as i64,
+        high_start: TAIL_START as i64,
+        tail_tile_start: TAIL_START as i64,
+        tail_tile_end: PADDED_VALID as i64,
+        tail_skip_front: 0,
+        tail_keep_end: (VALID_VOCAB - TAIL_START) as i64,
+        id_shift: (TAIL_START - LOW_END) as i32,
+    };
+
+    // Deterministic well-conditioned hidden activations (`[1, 7, 1024]`) and weights (`[512, 1024]`).
+    // Give padding rows `[442..512)` huge positive weights aligned with `x` so any
+    // padding leak would immediately dominate top-16.
+    let mut state = 0x51A8_5B01u64;
+    let mut next_f32 = || -> f32 {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let u = ((state >> 40) as f32) / 16_777_216.0;
+        u * 2.0 - 1.0
+    };
+    let mut x_vals = Vec::with_capacity(ROWS * HIDDEN);
+    for _ in 0..ROWS * HIDDEN {
+        x_vals.push(next_f32() * 0.5 + 0.25);
+    }
+    let x = MxArray::from_float32(&x_vals, &[1, ROWS as i64, HIDDEN as i64])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+
+    let mut w_vals = vec![0.0f32; VOCAB * HIDDEN];
+    for row in 0..VALID_VOCAB {
+        // Give each valid row a distinct scale so top-16 ordering is well separated.
+        let scale = 0.08 + ((row * 37) % 100) as f32 * 0.004;
+        for col in 0..HIDDEN {
+            w_vals[row * HIDDEN + col] = next_f32() * scale;
+        }
+    }
+    // Deliberately make rows in the spanned tail `[384..442)` strong candidates too
+    // so selector remapping of tail IDs is exercised alongside low-span IDs.
+    for (k, row) in (TAIL_START..TAIL_START + 4).enumerate() {
+        for col in 0..HIDDEN {
+            w_vals[row * HIDDEN + col] = x_vals[k * HIDDEN + col] * 0.45;
+        }
+    }
+    // Poison padding rows `[442..512)` with huge logits aligned with `x`.
+    for row in VALID_VOCAB..VOCAB {
+        for col in 0..HIDDEN {
+            w_vals[row * HIDDEN + col] = 10.0;
+        }
+    }
+    let w_bf16 = MxArray::from_float32(&w_vals, &[VOCAB as i64, HIDDEN as i64])
+        .unwrap()
+        .astype(DType::BFloat16)
+        .unwrap();
+    w_bf16.eval();
+
+    // Source 1: Standard BF16 `lm_head`.
+    let std_head = LinearProj::Standard(Linear::from_weights(&w_bf16, None).unwrap());
+
+    // Source 2: Symmetric Q8_0 (`bits=8, group_size=32, F16 scales, biases=None`),
+    // matching Inkling-2-Mini GGUF `lm_head` after `try_compact_symmetric_q8_f16()`.
+    let groups_q8 = HIDDEN / 32;
+    let mut q8_words = vec![0u32; VOCAB * (HIDDEN / 4)];
+    let mut q8_scales = vec![0.0f32; VOCAB * groups_q8];
+    for row in 0..VOCAB {
+        for g in 0..groups_q8 {
+            let base = row * HIDDEN + g * 32;
+            let amax = w_vals[base..base + 32]
+                .iter()
+                .fold(0.0f32, |m, &v| m.max(v.abs()));
+            let sc = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            q8_scales[row * groups_q8 + g] = sc;
+            for q in 0..8 {
+                let mut word = 0u32;
+                for b in 0..4 {
+                    let v = w_vals[base + q * 4 + b];
+                    let qi = (v / sc).round().clamp(-127.0, 127.0) as i8;
+                    let byte = (qi as u8) ^ 0x80;
+                    word |= u32::from(byte) << (b * 8);
+                }
+                q8_words[row * (HIDDEN / 4) + g * 8 + q] = word;
+            }
+        }
+    }
+    let q8_w = MxArray::from_uint32(&q8_words, &[VOCAB as i64, (HIDDEN / 4) as i64]).unwrap();
+    let q8_s = MxArray::from_float32(&q8_scales, &[VOCAB as i64, groups_q8 as i64])
+        .unwrap()
+        .astype(DType::Float16)
+        .unwrap();
+    let q8_b = q8_s
+        .mul_scalar(-128.0)
+        .unwrap()
+        .astype(DType::Float16)
+        .unwrap();
+    let mut q8_ql = QuantizedLinear::new(q8_w, q8_s, Some(q8_b), None, 32, 8, "affine".to_string());
+    assert!(q8_ql.try_compact_symmetric_q8_f16().unwrap());
+    assert!(q8_ql.is_symmetric_q8());
+    let q8_head = LinearProj::Quantized(q8_ql);
+
+    let top16_indices = |row: &[f32]| -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..row.len()).collect();
+        idx.sort_by(|&a, &b| row[b].total_cmp(&row[a]).then_with(|| a.cmp(&b)));
+        idx.truncate(16);
+        idx
+    };
+
+    for (label, target_head) in [("bf16", &std_head), ("sym_q8", &q8_head)] {
+        let cached = build_draft_af4g64_head(
+            EmbeddedLmHead::Proj(target_head),
+            VALID_VOCAB as i64,
+            HIDDEN as i64,
+            Some(spanned_layout),
+            128, // exercises 4 chunks (128, 128, 128, 58 + 6 zero-pad)
+        )
+        .unwrap()
+        .expect("af4g64 draft head must build");
+
+        let full = cached.full_linear();
+        assert_eq!(full.mode(), "affine", "{label}");
+        assert_eq!(full.bits(), 4, "{label}");
+        assert_eq!(full.group_size(), 64, "{label}");
+        assert_eq!(
+            full.get_weight().shape().unwrap().as_ref(),
+            &[PADDED_VALID as i64, (HIDDEN / 8) as i64],
+            "{label}"
+        );
+        assert_eq!(full.get_scales().dtype().unwrap(), DType::BFloat16);
+        assert_eq!(full.get_biases().unwrap().dtype().unwrap(), DType::BFloat16);
+        if crate::accelerator::cuda_ops_available() {
+            assert_eq!(full.get_weight().cuda_host_bytes(), 0, "{label}");
+            assert_eq!(full.get_scales().cuda_host_bytes(), 0, "{label}");
+            assert_eq!(full.get_biases().unwrap().cuda_host_bytes(), 0, "{label}");
+        }
+
+        // 1. Full valid af4g64 logits exclude `[442..512)` padding and closely match reference top-16.
+        let ref_logits_full = target_head
+            .forward_logits(&x)
+            .unwrap()
+            .slice_axis(2, 0, VALID_VOCAB as i64)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let af4_logits_arr = cached.forward_full_logits(&x).unwrap();
+        assert_eq!(
+            af4_logits_arr.shape().unwrap().as_ref(),
+            &[1, ROWS as i64, VALID_VOCAB as i64],
+            "{label}: full af4g64 logits must exclude zero-padding columns"
+        );
+        let af4_logits = af4_logits_arr
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let mut total_overlap = 0usize;
+        for r in 0..ROWS {
+            let ref_row = &ref_logits_full[r * VALID_VOCAB..(r + 1) * VALID_VOCAB];
+            let got_row = &af4_logits[r * VALID_VOCAB..(r + 1) * VALID_VOCAB];
+            let mut dot = 0.0f64;
+            let mut nr = 0.0f64;
+            let mut ng = 0.0f64;
+            for (&a, &b) in ref_row.iter().zip(got_row.iter()) {
+                dot += f64::from(a) * f64::from(b);
+                nr += f64::from(a) * f64::from(a);
+                ng += f64::from(b) * f64::from(b);
+            }
+            let cos = dot / (nr.sqrt() * ng.sqrt()).max(1e-12);
+            assert!(
+                cos > 0.99,
+                "{label} row {r}: af4g64 cosine similarity {cos:.4} too low"
+            );
+            let ref_top = top16_indices(ref_row);
+            let got_top = top16_indices(got_row);
+            let overlap = got_top.iter().filter(|id| ref_top.contains(id)).count();
+            total_overlap += overlap;
+            assert!(
+                overlap >= 10,
+                "{label} row {r}: af4g64 top-16 overlap {overlap}/16 too low"
+            );
+        }
+        assert!(
+            total_overlap >= 12 * ROWS,
+            "{label}: mean af4g64 top-16 overlap {:.1}/16 too low",
+            total_overlap as f64 / ROWS as f64
+        );
+
+        // 2. Spanned zero-copy views match the exact columns `[0..256) U [384..442)` of full af4g64.
+        let spanned = cached
+            .spanned_heads()
+            .expect("spanned zero-copy views must be attached");
+        assert_eq!(spanned.layout(), spanned_layout);
+        let spanned_logits_arr = spanned.forward_logits(&x).unwrap();
+        let expected_packed = spanned_layout.packed_vocab_size() as usize;
+        assert_eq!(
+            spanned_logits_arr.shape().unwrap().as_ref(),
+            &[1, ROWS as i64, expected_packed as i64],
+            "{label}: spanned logits width mismatch"
+        );
+        let spanned_logits = spanned_logits_arr
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        for r in 0..ROWS {
+            let full_row = &af4_logits[r * VALID_VOCAB..(r + 1) * VALID_VOCAB];
+            let sp_row = &spanned_logits[r * expected_packed..(r + 1) * expected_packed];
+            for c in 0..LOW_END {
+                let tol = 1e-2 + 1e-2 * full_row[c].abs();
+                assert!(
+                    (sp_row[c] - full_row[c]).abs() <= tol,
+                    "{label} row {r} low col {c}: {} vs {} (tol={tol})",
+                    sp_row[c],
+                    full_row[c]
+                );
+            }
+            for k in 0..(VALID_VOCAB - TAIL_START) {
+                let tol = 1e-2 + 1e-2 * full_row[TAIL_START + k].abs();
+                assert!(
+                    (sp_row[LOW_END + k] - full_row[TAIL_START + k]).abs() <= tol,
+                    "{label} row {r} tail col {k}: {} vs {} (tol={tol})",
+                    sp_row[LOW_END + k],
+                    full_row[TAIL_START + k]
+                );
+            }
+        }
+
+        // 3. Selector consumes spanned logits without re-slicing to `valid_vocab_size`
+        //    and remaps tail candidates `[256..314)` -> `[384..442)`.
+        let mut selector = test_selector(VOCAB, 16, 32, HIDDEN);
+        selector.valid_vocab_size = Some(VALID_VOCAB);
+        selector.predecessor_codebook = Embedding::from_weight(
+            &selector
+                .predecessor_codebook
+                .get_weight()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        )
+        .unwrap();
+        selector.successor_codebook = Embedding::from_weight(
+            &selector
+                .successor_codebook
+                .get_weight()
+                .astype(DType::BFloat16)
+                .unwrap(),
+        )
+        .unwrap();
+        selector.hidden_projection = LinearProj::Standard(
+            Linear::from_weights(
+                &selector
+                    .hidden_projection
+                    .get_weight()
+                    .astype(DType::BFloat16)
+                    .unwrap(),
+                None,
+            )
+            .unwrap(),
+        );
+        let anchor_ids = MxArray::from_int32(&[5], &[1]).unwrap();
+        let (cands, scores) = selector
+            .select_lattice_arrays(&x, &spanned_logits_arr, &anchor_ids, Some(spanned_layout))
+            .unwrap();
+        MxArray::eval_arrays(&[&cands, &scores]).unwrap();
+        let cand_ids = cands.to_int32().unwrap();
+        assert_eq!(cand_ids.len(), ROWS * 16);
+        let mut saw_tail_candidate = false;
+        for &id in cand_ids.as_ref() {
+            assert!(
+                (0..LOW_END as i32).contains(&id)
+                    || (TAIL_START as i32..VALID_VOCAB as i32).contains(&id),
+                "{label}: spanned candidate {id} outside [0,{LOW_END}) U [{TAIL_START},{VALID_VOCAB})"
+            );
+            if id >= TAIL_START as i32 {
+                saw_tail_candidate = true;
+            }
+        }
+        assert!(
+            saw_tail_candidate,
+            "{label}: fixture must select at least one remapped tail candidate"
+        );
+    }
+}
+
+#[test]
+fn configure_target_contract_inherits_omitted_softcap_and_rejects_qwen_final_norm_tap() {
+    let target = crate::models::qwen3_5::config::Qwen3_5Config {
+        rope_scaling: None,
+        qwen35_gguf_gdn_layout: None,
+        kv_format: None,
+        vocab_size: 64,
+        hidden_size: 256,
+        num_layers: 4,
+        num_heads: 4,
+        num_kv_heads: 2,
+        intermediate_size: 512,
+        rms_norm_eps: 1e-6,
+        head_dim: 128,
+        tie_word_embeddings: false,
+        attention_bias: false,
+        max_position_embeddings: 512,
+        pad_token_id: 0,
+        eos_token_id: 2,
+        bos_token_id: 1,
+        linear_num_value_heads: 2,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 8,
+        linear_value_head_dim: 8,
+        linear_conv_kernel_dim: 4,
+        full_attention_interval: 4,
+        partial_rotary_factor: 0.25,
+        rope_theta: 10_000.0,
+        paged_cache_memory_mb: None,
+        paged_block_size: None,
+        n_mtp_layers: 0,
+    };
+
+    // 1. Omitted draft softcapping (`None`) passes `validate_target` against a target
+    //    with `final_logit_softcapping = Some(30.0)`, and `configure_target_contract`
+    //    populates `config.final_logit_softcapping`, `selector_softcap_mode`, and
+    //    `selector.post_softcap`.
+    let mut model = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
+    model.config.selector_top_k = 16;
+    model.selector.top_k = 16;
+    model.config.final_logit_softcapping = None;
+    model.config.selector_softcap_mode = None;
+    model.selector.post_softcap = None;
+
+    let inkling_like = super::DFlash2TargetContract {
+        hidden_size: 256,
+        vocab_size: 64,
+        num_layers: 4,
+        valid_vocab_size: Some(48),
+        final_logit_softcapping: Some(30.0),
+        allow_final_norm_tap: true,
+    };
+    model.validate_target(inkling_like).unwrap();
+    model.configure_target_contract(inkling_like).unwrap();
+    assert_eq!(model.config.final_logit_softcapping, Some(30.0));
+    assert_eq!(
+        model.config.selector_softcap_mode.as_deref(),
+        Some("after_correction")
+    );
+    assert_eq!(model.selector.post_softcap, Some(30.0));
+    assert_eq!(model.config.valid_vocab_size, Some(48));
+    assert_eq!(model.selector.valid_vocab_size, Some(48));
+
+    // Once configured with `Some(30.0)`, target `None` (e.g. Qwen) must reject it.
+    assert!(model.validate_target(&target).is_err());
+
+    // 2. Explicit `Some(0.0)` (disabled) or `Some(15.0)` in draft must fail against
+    //    target `Some(30.0)`, while explicit `Some(0.0)` succeeds against target `None`.
+    let mut disabled = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
+    disabled.config.selector_top_k = 16;
+    disabled.config.final_logit_softcapping = Some(0.0);
+    disabled.config.selector_softcap_mode = None;
+    assert!(disabled.configure_target_contract(inkling_like).is_err());
+    disabled.validate_target(&target).unwrap();
+
+    disabled.config.final_logit_softcapping = Some(15.0);
+    disabled.config.selector_softcap_mode = Some("after_correction".into());
+    assert!(disabled.configure_target_contract(inkling_like).is_err());
+
+    // 3. Final-norm tap (`layer == num_layers`) is rejected for Qwen targets
+    //    (`allow_final_norm_tap = false`) and accepted only when `allow_final_norm_tap = true`.
+    let mut final_tap = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
+    final_tap.config.selector_top_k = 16;
+    final_tap.config.target_layers = vec![0, 4];
+    final_tap.config.capture_final_norm = Some(true);
+    assert!(final_tap.validate_target(&target).is_err());
+    assert!(
+        final_tap
+            .validate_target(super::DFlash2TargetShape::from(&target))
+            .is_err()
+    );
+    final_tap.validate_target(inkling_like).unwrap();
+
+    // Even with `allow_final_norm_tap = true`, `layer > num_layers` (`5 > 4`) is rejected.
+    final_tap.config.target_layers = vec![0, 5];
+    assert!(final_tap.validate_target(inkling_like).is_err());
 }

@@ -95,6 +95,10 @@ impl SwitchLinear {
     pub fn set_weight(&mut self, weight: &MxArray) {
         self.weight = weight.clone();
     }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        self.weight.promote_cuda_device()
+    }
 }
 
 impl Clone for SwitchLinear {
@@ -194,6 +198,13 @@ impl SwitchProj {
                 refs
             }
             Self::Standard(l) => vec![l.weight_ref()],
+        }
+    }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        match self {
+            Self::Standard(l) => l.ensure_cuda_device(),
+            Self::Quantized(q) => q.ensure_cuda_device(),
         }
     }
 }

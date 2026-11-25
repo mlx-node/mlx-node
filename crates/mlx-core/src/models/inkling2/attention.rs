@@ -1,7 +1,7 @@
 use napi::bindgen_prelude::{Error, Result};
 
 use crate::array::{DType, MxArray};
-use crate::models::quantized_linear::LinearProj;
+use crate::models::quantized_linear::{DEFAULT_QUANT_MODE, LinearProj};
 use crate::nn::Activations;
 use crate::nn::normalization::rms_norm_unscaled;
 
@@ -288,6 +288,24 @@ pub(crate) fn forward_linear_proj_fast_ex(
             }
         }
     }
+    if crate::kernels::inkling2::available()
+        && let LinearProj::Standard(lin) = proj
+        && lin.get_bias().is_none()
+        && x.dtype()? == DType::BFloat16
+    {
+        let xs = x.shape()?;
+        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= 16 && xs[1] >= 8 && xs[1] % 8 == 0 {
+            let w = lin.get_weight();
+            if w.dtype()? == DType::BFloat16 {
+                let n = w.shape_at(0)?;
+                if (1..=128).contains(&n)
+                    && let Some(out) = crate::kernels::inkling2::small_bf16_proj_cuda(x, &w)?
+                {
+                    return Ok(out);
+                }
+            }
+        }
+    }
     proj.forward(x)
 }
 
@@ -334,6 +352,123 @@ pub(crate) fn try_forward_q8_sym_with_bf16_aux(
     #[cfg(not(target_os = "macos"))]
     let _ = (main, aux, x);
     Ok(None)
+}
+
+/// Paired single-launch CUDA Q8_0 (`bits=8, group_size=32, mode="affine"`) projection for
+/// independent `(x_k @ W_k^T, x_v @ W_v^T)` when `M in 1..=16` and both projections match
+/// `(N, K)` and symmetric/biased mode — turns 4 launches + 2 Split-K partial allocs into 1 launch.
+pub(crate) fn try_forward_q8_pair_cuda(
+    k_proj: &LinearProj,
+    x_k: &MxArray,
+    v_proj: &LinearProj,
+    x_v: &MxArray,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    let (LinearProj::Quantized(qk), LinearProj::Quantized(qv)) = (k_proj, v_proj) else {
+        return Ok(None);
+    };
+    if !qk.grouped_moe_plain_projection()
+        || !qv.grouped_moe_plain_projection()
+        || qk.mode() != DEFAULT_QUANT_MODE
+        || qv.mode() != DEFAULT_QUANT_MODE
+        || qk.bits() != 8
+        || qv.bits() != 8
+        || qk.group_size() != 32
+        || qv.group_size() != 32
+    {
+        return Ok(None);
+    }
+    let both_sym = qk.is_symmetric_q8()
+        && qv.is_symmetric_q8()
+        && qk.get_biases().is_none()
+        && qv.get_biases().is_none();
+    let both_biased = qk.get_biases().is_some() && qv.get_biases().is_some();
+    if !both_sym && !both_biased {
+        return Ok(None);
+    }
+    if x_k.dtype()? != DType::BFloat16 || x_v.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let nd_k = x_k.ndim()?;
+    let nd_v = x_v.ndim()?;
+    if nd_k < 2 || nd_v < 2 {
+        return Ok(None);
+    }
+    let k_dim = x_k.shape_at(nd_k - 1)?;
+    if k_dim < 256 || k_dim % 32 != 0 || x_v.shape_at(nd_v - 1)? != k_dim {
+        return Ok(None);
+    }
+    let m_k = x_k.size()? as i64 / k_dim;
+    let m_v = x_v.size()? as i64 / k_dim;
+    if !(1..=16).contains(&m_k) || m_v != m_k {
+        return Ok(None);
+    }
+    let n_k = qk.get_weight().shape_at(0)?;
+    let n_v = qv.get_weight().shape_at(0)?;
+    if n_k < 16 || n_k % 16 != 0 || n_v != n_k {
+        return Ok(None);
+    }
+    crate::kernels::linear::affine_bf16_matmul_few_pair_cuda(
+        x_k,
+        qk.get_weight(),
+        qk.get_scales(),
+        qk.get_biases(),
+        x_v,
+        qv.get_weight(),
+        qv.get_scales(),
+        qv.get_biases(),
+        32,
+        8,
+    )
+}
+
+/// Paired single-launch CUDA BF16 (`LinearProj::Standard`, bias-free) projection for
+/// independent `(x0 @ W0^T, x1 @ W1^T)` when `M in 1..=16`, matching `N`, and `K % 8 == 0`.
+pub(crate) fn try_forward_bf16_pair_cuda(
+    x0: &MxArray,
+    proj0: &LinearProj,
+    x1: &MxArray,
+    proj1: &LinearProj,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    let (LinearProj::Standard(lin0), LinearProj::Standard(lin1)) = (proj0, proj1) else {
+        return Ok(None);
+    };
+    if lin0.get_bias().is_some() || lin1.get_bias().is_some() {
+        return Ok(None);
+    }
+    if x0.dtype()? != DType::BFloat16 || x1.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let w0 = lin0.get_weight();
+    let w1 = lin1.get_weight();
+    if w0.dtype()? != DType::BFloat16 || w1.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let nd0 = x0.ndim()?;
+    let nd1 = x1.ndim()?;
+    if nd0 < 2 || nd1 < 2 || w0.ndim()? != 2 || w1.ndim()? != 2 {
+        return Ok(None);
+    }
+    let k_dim = x0.shape_at(nd0 - 1)?;
+    if k_dim < 8 || k_dim % 8 != 0 || x1.shape_at(nd1 - 1)? != k_dim {
+        return Ok(None);
+    }
+    let m0 = x0.size()? as i64 / k_dim;
+    let m1 = x1.size()? as i64 / k_dim;
+    if !(1..=16).contains(&m0) || m1 != m0 {
+        return Ok(None);
+    }
+    let n0 = w0.shape_at(0)?;
+    let n1 = w1.shape_at(0)?;
+    if n0 < 1 || n1 != n0 || w0.shape_at(1)? != k_dim || w1.shape_at(1)? != k_dim {
+        return Ok(None);
+    }
+    crate::kernels::linear::bf16_gemm_few_pair_cuda(x0, &w0, x1, &w1)
 }
 
 /// Row-concatenate two compatible `LinearProj` weights (`Quantized` via `LinearProj::concat_rows`
@@ -647,39 +782,75 @@ impl Inkling2Attention {
                 )
             };
             let (x_k, x_v) = x_k_v.unwrap_or((x_q, x_q));
-            let (k_p, dk_opt) = if let Some(ref fused_k) = self.fused_k_with_conv {
-                let kc = forward_linear_proj_fast(fused_k, x_k)?;
-                let mut parts = kc.split_sections(&[kv_dim], -1)?;
-                let dk = parts
+            let (k_p, v_p, dk_opt, dv_opt) = if let (Some(fk), Some(fv)) =
+                (&self.fused_k_with_conv, &self.fused_v_with_conv)
+                && let Some((kc, vc)) = try_forward_bf16_pair_cuda(x_k, fk, x_v, fv)?
+            {
+                let mut k_parts = kc.split_sections(&[kv_dim], -1)?;
+                let dk = k_parts
                     .pop()
                     .ok_or_else(|| Error::from_reason("split k_conv: dk"))?;
-                let kp = parts
+                let kp = k_parts
                     .pop()
                     .ok_or_else(|| Error::from_reason("split k_conv: k"))?;
-                (kp, Some(dk))
-            } else if let Some(ref k_cp) = self.k_conv_proj
-                && let Some((kp, dk)) = try_forward_q8_sym_with_bf16_aux(&self.k_proj, k_cp, x_k)?
-            {
-                (kp, Some(dk))
-            } else {
-                (forward_linear_proj_fast(&self.k_proj, x_k)?, None)
-            };
-            let (v_p, dv_opt) = if let Some(ref fused_v) = self.fused_v_with_conv {
-                let vc = forward_linear_proj_fast(fused_v, x_v)?;
-                let mut parts = vc.split_sections(&[kv_dim], -1)?;
-                let dv = parts
+                let mut v_parts = vc.split_sections(&[kv_dim], -1)?;
+                let dv = v_parts
                     .pop()
                     .ok_or_else(|| Error::from_reason("split v_conv: dv"))?;
-                let vp = parts
+                let vp = v_parts
                     .pop()
                     .ok_or_else(|| Error::from_reason("split v_conv: v"))?;
-                (vp, Some(dv))
-            } else if let Some(ref v_cp) = self.v_conv_proj
-                && let Some((vp, dv)) = try_forward_q8_sym_with_bf16_aux(&self.v_proj, v_cp, x_v)?
+                (kp, vp, Some(dk), Some(dv))
+            } else if self.fused_k_with_conv.is_none()
+                && self.fused_v_with_conv.is_none()
+                && let Some((kp, vp)) = if x_k_v.is_some() {
+                    match try_forward_q8_pair_cuda(&self.k_proj, x_k, &self.v_proj, x_v)? {
+                        Some(pair) => Some(pair),
+                        None => try_forward_bf16_pair_cuda(x_k, &self.k_proj, x_v, &self.v_proj)?,
+                    }
+                } else {
+                    try_forward_bf16_pair_cuda(x_k, &self.k_proj, x_v, &self.v_proj)?
+                }
             {
-                (vp, Some(dv))
+                (kp, vp, None, None)
             } else {
-                (forward_linear_proj_fast(&self.v_proj, x_v)?, None)
+                let (k_p, dk_opt) = if let Some(ref fused_k) = self.fused_k_with_conv {
+                    let kc = forward_linear_proj_fast(fused_k, x_k)?;
+                    let mut parts = kc.split_sections(&[kv_dim], -1)?;
+                    let dk = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split k_conv: dk"))?;
+                    let kp = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split k_conv: k"))?;
+                    (kp, Some(dk))
+                } else if let Some(ref k_cp) = self.k_conv_proj
+                    && let Some((kp, dk)) =
+                        try_forward_q8_sym_with_bf16_aux(&self.k_proj, k_cp, x_k)?
+                {
+                    (kp, Some(dk))
+                } else {
+                    (forward_linear_proj_fast(&self.k_proj, x_k)?, None)
+                };
+                let (v_p, dv_opt) = if let Some(ref fused_v) = self.fused_v_with_conv {
+                    let vc = forward_linear_proj_fast(fused_v, x_v)?;
+                    let mut parts = vc.split_sections(&[kv_dim], -1)?;
+                    let dv = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split v_conv: dv"))?;
+                    let vp = parts
+                        .pop()
+                        .ok_or_else(|| Error::from_reason("split v_conv: v"))?;
+                    (vp, Some(dv))
+                } else if let Some(ref v_cp) = self.v_conv_proj
+                    && let Some((vp, dv)) =
+                        try_forward_q8_sym_with_bf16_aux(&self.v_proj, v_cp, x_v)?
+                {
+                    (vp, Some(dv))
+                } else {
+                    (forward_linear_proj_fast(&self.v_proj, x_v)?, None)
+                };
+                (k_p, v_p, dk_opt, dv_opt)
             };
             (q_p, r_p, g_p, k_p, v_p, s_opt, dk_opt, dv_opt)
         };
@@ -913,10 +1084,17 @@ impl Inkling2Attention {
             if !self.fused_qrg_has_sink {
                 push_linear_proj_arrays(&self.sink_proj, &mut arrays);
             }
-        } else if let Some(ref f) = self.fused_qrg {
-            // `q/r/g/(sink)` alias `fused_qrg`; `k` & `v` (or `fused_{k,v}_with_conv`) are separate.
-            push_linear_proj_arrays(f, &mut arrays);
-            if !self.fused_qrg_has_sink {
+        } else {
+            if let Some(ref f) = self.fused_qrg {
+                // `q/r/g/(sink)` alias `fused_qrg`.
+                push_linear_proj_arrays(f, &mut arrays);
+                if !self.fused_qrg_has_sink {
+                    push_linear_proj_arrays(&self.sink_proj, &mut arrays);
+                }
+            } else {
+                push_linear_proj_arrays(&self.q_proj, &mut arrays);
+                push_linear_proj_arrays(&self.rel_proj, &mut arrays);
+                push_linear_proj_arrays(&self.gate_proj, &mut arrays);
                 push_linear_proj_arrays(&self.sink_proj, &mut arrays);
             }
             if let Some(ref fk) = self.fused_k_with_conv {
@@ -935,19 +1113,6 @@ impl Inkling2Attention {
                     push_linear_proj_arrays(p, &mut arrays);
                 }
             }
-        } else {
-            push_linear_proj_arrays(&self.q_proj, &mut arrays);
-            push_linear_proj_arrays(&self.k_proj, &mut arrays);
-            push_linear_proj_arrays(&self.v_proj, &mut arrays);
-            push_linear_proj_arrays(&self.rel_proj, &mut arrays);
-            push_linear_proj_arrays(&self.gate_proj, &mut arrays);
-            push_linear_proj_arrays(&self.sink_proj, &mut arrays);
-            if let Some(ref p) = self.k_conv_proj {
-                push_linear_proj_arrays(p, &mut arrays);
-            }
-            if let Some(ref p) = self.v_conv_proj {
-                push_linear_proj_arrays(p, &mut arrays);
-            }
         }
         push_linear_proj_arrays(&self.o_proj, &mut arrays);
         arrays.push(self.k_conv.clone());
@@ -961,6 +1126,129 @@ impl Inkling2Attention {
         arrays.push(self.rel_thresh_scalar.clone());
         arrays.push(self.one_scalar.clone());
         arrays
+    }
+
+    /// Promote all resident attention weights to CUDA device memory while preserving zero-copy
+    /// row slices from `fused_qrgkv`, `fused_qrg`, `fused_k_with_conv`, and `fused_v_with_conv`.
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        let q_dim = (self.num_heads * self.head_dim) as i64;
+        let r_dim = (self.num_heads * self.d_rel) as i64;
+        let g_dim = q_dim;
+        let s_dim = self.num_heads as i64;
+        let kv_dim = (self.num_kv_heads * self.head_dim) as i64;
+        let has_sink = self.fused_qrg_has_sink;
+        let qrg_dim = q_dim + r_dim + g_dim + if has_sink { s_dim } else { 0 };
+
+        let slice_proj = |proj: &LinearProj, start: i64, end: i64| -> Result<LinearProj> {
+            match proj {
+                LinearProj::Standard(lin) => {
+                    let w = lin.get_weight();
+                    let d = w.shape()?[1];
+                    let sub = w.slice(&[start, 0], &[end, d])?;
+                    Ok(LinearProj::Standard(crate::nn::Linear::from_weights(
+                        &sub, None,
+                    )?))
+                }
+                LinearProj::Quantized(ql) => Ok(LinearProj::Quantized(ql.slice_rows(start, end)?)),
+            }
+        };
+
+        if let Some(ref mut fused) = self.fused_qrgkv {
+            let bytes = fused.ensure_cuda_device()?;
+            if bytes > 0 {
+                let o1 = q_dim;
+                let o2 = o1 + r_dim;
+                let o3 = o2 + g_dim;
+                let o_sink = if has_sink { o3 + s_dim } else { o3 };
+                let o4 = o_sink + kv_dim;
+                let o5 = o4 + kv_dim;
+                self.q_proj = slice_proj(fused, 0, o1)?;
+                self.rel_proj = slice_proj(fused, o1, o2)?;
+                self.gate_proj = slice_proj(fused, o2, o3)?;
+                if has_sink {
+                    self.sink_proj = slice_proj(fused, o3, o_sink)?;
+                }
+                self.k_proj = slice_proj(fused, o_sink, o4)?;
+                self.v_proj = slice_proj(fused, o4, o5)?;
+                self.fused_qrg = Some(slice_proj(fused, 0, qrg_dim)?);
+                promoted += bytes;
+            }
+            if !has_sink {
+                promoted += self.sink_proj.ensure_cuda_device()?;
+            }
+        } else {
+            if let Some(ref mut fused) = self.fused_qrg {
+                let bytes = fused.ensure_cuda_device()?;
+                if bytes > 0 {
+                    let o1 = q_dim;
+                    let o2 = o1 + r_dim;
+                    let o3 = o2 + g_dim;
+                    self.q_proj = slice_proj(fused, 0, o1)?;
+                    self.rel_proj = slice_proj(fused, o1, o2)?;
+                    self.gate_proj = slice_proj(fused, o2, o3)?;
+                    if has_sink {
+                        self.sink_proj = slice_proj(fused, o3, o3 + s_dim)?;
+                    }
+                    promoted += bytes;
+                }
+                if !has_sink {
+                    promoted += self.sink_proj.ensure_cuda_device()?;
+                }
+            } else {
+                promoted += self.q_proj.ensure_cuda_device()?;
+                promoted += self.rel_proj.ensure_cuda_device()?;
+                promoted += self.gate_proj.ensure_cuda_device()?;
+                promoted += self.sink_proj.ensure_cuda_device()?;
+            }
+            if let Some(ref mut fk) = self.fused_k_with_conv {
+                let kb = fk.ensure_cuda_device()?;
+                if kb > 0 {
+                    let total_rows = fk.get_weight().shape()?[0];
+                    self.k_proj = slice_proj(fk, 0, kv_dim)?;
+                    self.k_conv_proj = Some(slice_proj(fk, kv_dim, total_rows)?);
+                    promoted += kb;
+                }
+            } else {
+                promoted += self.k_proj.ensure_cuda_device()?;
+                if let Some(ref mut p) = self.k_conv_proj {
+                    promoted += p.ensure_cuda_device()?;
+                }
+            }
+            if let Some(ref mut fv) = self.fused_v_with_conv {
+                let vb = fv.ensure_cuda_device()?;
+                if vb > 0 {
+                    let total_rows = fv.get_weight().shape()?[0];
+                    self.v_proj = slice_proj(fv, 0, kv_dim)?;
+                    self.v_conv_proj = Some(slice_proj(fv, kv_dim, total_rows)?);
+                    promoted += vb;
+                }
+            } else {
+                promoted += self.v_proj.ensure_cuda_device()?;
+                if let Some(ref mut p) = self.v_conv_proj {
+                    promoted += p.ensure_cuda_device()?;
+                }
+            }
+        }
+
+        promoted += self.o_proj.ensure_cuda_device()?;
+        promoted += self.k_conv.promote_cuda_device()?;
+        promoted += self.v_conv.promote_cuda_device()?;
+        promoted += self.post_conv.promote_cuda_device()?;
+        promoted += self.q_clip.promote_cuda_device()?;
+        promoted += self.rel_clip.promote_cuda_device()?;
+        let rb = self.rel_bias_w.promote_cuda_device()?;
+        if rb > 0 {
+            self.rel_bias_t = self.rel_bias_w.transpose(None)?;
+            promoted += rb;
+        }
+        promoted += self.qk_thresh_scalar.promote_cuda_device()?;
+        promoted += self.rel_thresh_scalar.promote_cuda_device()?;
+        promoted += self.one_scalar.promote_cuda_device()?;
+        Ok(promoted)
     }
 }
 

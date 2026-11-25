@@ -131,7 +131,7 @@ impl Weight {
                         x,
                         &self.values,
                         scales,
-                        biases,
+                        Some(biases),
                         gs_shift,
                         !self.q8_symmetric_128,
                     )? {

@@ -248,6 +248,38 @@ pub(crate) fn sdpa_draft_masked(
     }
 }
 
+/// DFlash2 masked/unmasked small-query attention fast path outputting `[B, T, Hq * D]`
+/// (BTHD) directly on CUDA via `mlx_sdpa_tc_few_masked_bthd_cuda`, eliminating the
+/// post-SDPA `[B, Hq, T, D] -> [B, T, Hq, D]` transpose copy.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn sdpa_draft_masked_bthd(
+    queries: &MxArray,
+    keys: &MxArray,
+    values: &MxArray,
+    mask: Option<&MxArray>,
+    head_dim: i64,
+    num_heads: i64,
+    num_kv_heads: i64,
+    seq_len: i64,
+    scale: f32,
+) -> Result<Option<MxArray>> {
+    match active_backend() {
+        ActiveBackend::CudaGpu => cuda::sdpa_draft_masked_bthd(
+            queries,
+            keys,
+            values,
+            mask,
+            head_dim,
+            num_heads,
+            num_kv_heads,
+            seq_len,
+            scale,
+        ),
+        ActiveBackend::MetalGpu | ActiveBackend::Cpu => Ok(None),
+    }
+}
+
 /// Fused Q/K RMSNorm + non-traditional partial RoPE with per-batch `offsets`
 /// (`int32[B]`, or scalar for `B == 1`).
 ///

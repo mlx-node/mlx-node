@@ -21,6 +21,8 @@ struct RawDFlashConfig {
     #[serde(default)]
     valid_vocab_size: Option<usize>,
     #[serde(default)]
+    unpadded_vocab_size: Option<usize>,
+    #[serde(default)]
     embedding_normalization: Option<String>,
     #[serde(default)]
     capture_final_norm: Option<bool>,
@@ -49,6 +51,16 @@ pub(super) struct RawConfig {
     rope_theta: Option<f64>,
     #[serde(default)]
     rope_parameters: Option<serde_json::Value>,
+    #[serde(default)]
+    final_logit_softcapping: Option<f32>,
+    #[serde(default)]
+    selector_softcap_mode: Option<String>,
+    #[serde(default)]
+    valid_vocab_size: Option<usize>,
+    #[serde(default)]
+    unpadded_vocab_size: Option<usize>,
+    #[serde(default)]
+    capture_final_norm: Option<bool>,
     dflash_config: RawDFlashConfig,
 }
 
@@ -75,13 +87,36 @@ pub(crate) struct DFlash2Config {
     pub(super) selector_top_k: usize,
     pub(super) rope_theta: f64,
     pub(crate) final_logit_softcapping: Option<f32>,
+    pub(crate) selector_softcap_mode: Option<String>,
     pub(crate) valid_vocab_size: Option<usize>,
     pub(crate) capture_final_norm: Option<bool>,
     pub(crate) embedding_normalization: Option<String>,
 }
 
 impl DFlash2Config {
-    pub(crate) fn validate_target(&self, target: DFlash2TargetShape) -> Result<()> {
+    /// Active vocabulary width visible to the selector (`valid_vocab_size` when
+    /// narrower than padded `vocab_size`, otherwise `vocab_size`).
+    #[allow(dead_code)]
+    pub(crate) fn effective_valid_vocab_size(&self) -> usize {
+        self.valid_vocab_size.unwrap_or(self.vocab_size)
+    }
+
+    /// Post-correction selector softcap (`Some(cap)` when `cap > 0.0` and
+    /// `selector_softcap_mode` is `"after_correction"` or unset).
+    pub(crate) fn post_edge_softcap(&self) -> Option<f32> {
+        if self
+            .selector_softcap_mode
+            .as_deref()
+            .is_none_or(|mode| mode == "after_correction")
+        {
+            self.final_logit_softcapping.filter(|&c| c > 0.0)
+        } else {
+            None
+        }
+    }
+
+    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
+        let target = target.into();
         let readable_layers = target.readable_layers();
         let invalid_tap = self
             .target_layers
@@ -102,11 +137,19 @@ impl DFlash2Config {
             || self
                 .valid_vocab_size
                 .is_some_and(|v| v != target.valid_vocab_size);
-        let softcap_mismatch = match (self.final_logit_softcapping, target.final_logit_softcapping)
-        {
-            (Some(d), Some(t)) => (d - t).abs() > 1e-4,
-            (None, None) => false,
-            _ => true,
+        let invalid_draft_softcap = self
+            .final_logit_softcapping
+            .is_some_and(|dc| !dc.is_finite() || dc < 0.0);
+        let invalid_target_softcap = target
+            .final_logit_softcapping
+            .is_some_and(|tc| !tc.is_finite() || tc < 0.0);
+        let target_cap = target.final_logit_softcapping.filter(|&c| c > 0.0);
+        let softcap_mismatch = match (self.final_logit_softcapping, target_cap) {
+            (Some(dc), Some(tc)) => dc <= 0.0 || (dc - tc).abs() > 1e-4,
+            (Some(dc), None) => dc > 0.0,
+            // Omitted draft softcap (`None`) inherits `target.final_logit_softcapping`
+            // in `DFlash2Model::configure_target_contract` / `configure_inkling2_execution`.
+            (None, _) => false,
         };
         if self.hidden_size != target.hidden_size
             || self.vocab_size != target.vocab_size
@@ -116,6 +159,8 @@ impl DFlash2Config {
             || invalid_final_norm
             || invalid_embed_norm
             || invalid_valid_vocab
+            || invalid_draft_softcap
+            || invalid_target_softcap
             || softcap_mismatch
         {
             return Err(Error::from_reason(format!(
@@ -148,24 +193,6 @@ impl DFlash2Config {
             ));
         }
         let draft = raw.dflash_config;
-        let final_logit_softcapping = match draft.final_logit_softcapping {
-            Some(cap) => {
-                if !cap.is_finite() || cap < 0.0 {
-                    return Err(Error::from_reason(format!(
-                        "unsupported DFlash2 final_logit_softcapping {cap}"
-                    )));
-                }
-                (cap > 0.0).then_some(cap)
-            }
-            None => None,
-        };
-        if let Some(ref mode) = draft.selector_softcap_mode
-            && mode != "after_correction"
-        {
-            return Err(Error::from_reason(format!(
-                "unsupported DFlash2 selector_softcap_mode '{mode}' (only 'after_correction' is supported)"
-            )));
-        }
         if let Some(ref mode) = draft.embedding_normalization
             && mode != "none"
             && mode != "folded_rmsnorm"
@@ -181,17 +208,85 @@ impl DFlash2Config {
                 "unsupported DFlash2 target_hidden_reduction '{reduction}'"
             )));
         }
-        if let Some(valid_vocab) = draft.valid_vocab_size
+        if let (Some(a), Some(b)) = (draft.final_logit_softcapping, raw.final_logit_softcapping)
+            && (!a.is_finite() || !b.is_finite() || (a - b).abs() > 1e-4)
+        {
+            return Err(Error::from_reason(format!(
+                "conflicting DFlash2 final_logit_softcapping values: {a} vs {b}"
+            )));
+        }
+        let final_logit_softcapping = match draft
+            .final_logit_softcapping
+            .or(raw.final_logit_softcapping)
+        {
+            Some(cap) if !cap.is_finite() || cap < 0.0 => {
+                return Err(Error::from_reason(format!(
+                    "unsupported DFlash2 final_logit_softcapping {cap}"
+                )));
+            }
+            Some(cap) => Some(cap),
+            None => None,
+        };
+        if let (Some(a), Some(b)) = (&draft.selector_softcap_mode, &raw.selector_softcap_mode)
+            && a != b
+        {
+            return Err(Error::from_reason(format!(
+                "conflicting DFlash2 selector_softcap_mode values: '{a}' vs '{b}'"
+            )));
+        }
+        let selector_softcap_mode = draft.selector_softcap_mode.or(raw.selector_softcap_mode);
+        if let Some(ref mode) = selector_softcap_mode
+            && mode != "after_correction"
+        {
+            return Err(Error::from_reason(format!(
+                "unsupported DFlash2 selector_softcap_mode '{mode}' (only 'after_correction' is supported)"
+            )));
+        }
+        if final_logit_softcapping.is_some_and(|cap| cap > 0.0)
+            && selector_softcap_mode.as_deref() != Some("after_correction")
+        {
+            return Err(Error::from_reason(
+                "DFlash2 final_logit_softcapping requires selector_softcap_mode = \"after_correction\"",
+            ));
+        }
+        let mut valid_vocab_size: Option<usize> = None;
+        for candidate in [
+            draft.valid_vocab_size,
+            draft.unpadded_vocab_size,
+            raw.valid_vocab_size,
+            raw.unpadded_vocab_size,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(prev) = valid_vocab_size
+                && prev != candidate
+            {
+                return Err(Error::from_reason(format!(
+                    "conflicting DFlash2 valid_vocab_size/unpadded_vocab_size values: {prev} vs {candidate}"
+                )));
+            }
+            valid_vocab_size = Some(candidate);
+        }
+        if let Some(valid_vocab) = valid_vocab_size
             && (valid_vocab == 0
                 || valid_vocab > raw.vocab_size
                 || draft.selector_top_k > valid_vocab)
         {
             return Err(Error::from_reason(format!(
-                "invalid DFlash2 valid_vocab_size {valid_vocab} for vocab_size={} top_k={}",
+                "invalid DFlash2 valid_vocab_size={valid_vocab} for vocab_size={} selector_top_k={}",
                 raw.vocab_size, draft.selector_top_k
             )));
         }
-        let max_tap_exclusive = if draft.capture_final_norm == Some(false) {
+        if let (Some(a), Some(b)) = (draft.capture_final_norm, raw.capture_final_norm)
+            && a != b
+        {
+            return Err(Error::from_reason(format!(
+                "conflicting DFlash2 capture_final_norm values: {a} vs {b}"
+            )));
+        }
+        let capture_final_norm = draft.capture_final_norm.or(raw.capture_final_norm);
+        let max_tap_exclusive = if capture_final_norm == Some(false) {
             raw.num_target_layers
         } else {
             raw.num_target_layers.saturating_add(1)
@@ -280,8 +375,9 @@ impl DFlash2Config {
             selector_top_k: draft.selector_top_k,
             rope_theta,
             final_logit_softcapping,
-            valid_vocab_size: draft.valid_vocab_size,
-            capture_final_norm: draft.capture_final_norm,
+            selector_softcap_mode,
+            valid_vocab_size,
+            capture_final_norm,
             embedding_normalization: draft.embedding_normalization,
         })
     }
@@ -411,7 +507,7 @@ impl DraftExecutionPolicy {
     pub(super) fn default_for_config(config: &DFlash2Config) -> Self {
         let policy = Self::capture();
         if config.supports_inkling2_execution_defaults()
-            && config.final_logit_softcapping.is_some()
+            && config.post_edge_softcap().is_some()
             && unsafe { sys::mlx_metal_is_available() }
         {
             let nax = unsafe { sys::mlx_metal_is_nax_available() };

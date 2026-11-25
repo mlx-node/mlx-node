@@ -3,7 +3,7 @@ use napi::bindgen_prelude::*;
 use super::DFlash2Model;
 use super::config::DFlash2Config;
 use super::layers::{SlidingMaskMemo, memo_ring_mask, memo_sliding_mask};
-use super::spanned_head::is_wide_vocab_token;
+use super::spanned_head::is_wide_vocab_token_for;
 use crate::array::MxArray;
 use crate::models::quantized_linear::QuantizedLinear;
 use crate::models::qwen3_5::draft_context::DraftContextWindow;
@@ -362,8 +362,12 @@ pub(crate) struct DFlash2ContextCache {
     /// end at the same position. Keep the ids beside the draft K/V so a warm
     /// DFlash2 continuation is admitted only for the prefix that produced it.
     pub(super) token_history: Vec<u32>,
-    /// True once any prompt, accepted, or anchor token falls outside the
-    /// spanned draft vocabulary `[0, 98_304) U [248_032, 248_320)`.
+    /// Target vocabulary size (`config.vocab_size`), used to select the
+    /// model-appropriate adaptive spanned vocabulary range.
+    vocab_size: usize,
+    /// True once any prompt, accepted, or anchor token falls outside this
+    /// model's spanned draft vocabulary (e.g. Qwen3.8 `[0, 98_304) U [248_032, 248_320)`
+    /// or Inkling-2-Mini `[0, low_end) U [199_936, 200_058)`).
     wide_vocab: bool,
 }
 
@@ -379,12 +383,23 @@ impl DFlash2ContextCache {
             logical_len: 0,
             kv_end: 0,
             token_history: Vec::new(),
+            vocab_size: config.vocab_size,
             wide_vocab: false,
         }
     }
 
+    pub(crate) fn observe_token(&mut self, token: u32) {
+        if !self.wide_vocab && is_wide_vocab_token_for(self.vocab_size, token) {
+            self.wide_vocab = true;
+        }
+    }
+
     pub(crate) fn observe_tokens(&mut self, token_ids: &[u32]) {
-        if !self.wide_vocab && token_ids.iter().any(|&t| is_wide_vocab_token(t)) {
+        if !self.wide_vocab
+            && token_ids
+                .iter()
+                .any(|&t| is_wide_vocab_token_for(self.vocab_size, t))
+        {
             self.wide_vocab = true;
         }
     }

@@ -2094,14 +2094,18 @@ pub(crate) fn is_inkling2_mmproj_gguf(metadata: &HashMap<String, GgufMetaValue>)
 }
 
 /// Inkling2 DSpark parallel block drafter GGUF (`dspark-Inkling-2-Mini-Q8_0.gguf`):
-/// `general.architecture = "dflash"` with `dflash.dspark.markov_rank` and
-/// `tokenizer.ggml.pre = "inkling2"`.
+/// `general.architecture = "dflash"` with `dflash.dspark.markov_rank` (v1) or
+/// `dflash.has_markov_context = true` (v2 pre-folded) and `tokenizer.ggml.pre = "inkling2"`.
 pub(crate) fn is_inkling2_dspark_gguf(metadata: &HashMap<String, GgufMetaValue>) -> bool {
     metadata
         .get("general.architecture")
         .and_then(GgufMetaValue::as_str)
         == Some("dflash")
-        && metadata.contains_key("dflash.dspark.markov_rank")
+        && (metadata.contains_key("dflash.dspark.markov_rank")
+            || matches!(
+                metadata.get("dflash.has_markov_context"),
+                Some(GgufMetaValue::Bool(true))
+            ))
         && metadata
             .get("tokenizer.ggml.pre")
             .and_then(GgufMetaValue::as_str)

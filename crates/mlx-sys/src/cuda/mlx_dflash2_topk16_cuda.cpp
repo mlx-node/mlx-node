@@ -5,6 +5,8 @@
 #include "mlx/primitives.h"
 
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 
 namespace mlx::core {
@@ -18,6 +20,39 @@ constexpr char dflash2_selector_edges_source[] =
 #include "cuda/dflash2_selector_edges.cu.inc"
     ;
 
+bool try_uniform_row_stride(const array& a, int64_t& row_stride) noexcept {
+  const int ndim = static_cast<int>(a.ndim());
+  if (ndim < 2 || a.strides(ndim - 1) != 1) {
+    return false;
+  }
+  const int64_t vocab = a.shape(ndim - 1);
+  bool has_row_dim = false;
+  int64_t expected_stride = 0;
+  row_stride = vocab;
+  for (int d = ndim - 2; d >= 0; --d) {
+    const int64_t dim = a.shape(d);
+    if (dim <= 1) {
+      continue;
+    }
+    const int64_t st = a.strides(d);
+    if (!has_row_dim) {
+      if (st < 0 || st > std::numeric_limits<int64_t>::max() / dim) {
+        return false;
+      }
+      row_stride = st;
+      expected_stride = st * dim;
+      has_row_dim = true;
+    } else {
+      if (st != expected_stride ||
+          expected_stride > std::numeric_limits<int64_t>::max() / dim) {
+        return false;
+      }
+      expected_stride *= dim;
+    }
+  }
+  return true;
+}
+
 class DFlash2Topk16Cuda : public Primitive {
 public:
   explicit DFlash2Topk16Cuda(Stream stream) : Primitive(stream) {}
@@ -28,14 +63,19 @@ public:
 
   void eval_gpu(const std::vector<array>& inputs, std::vector<array>& outputs) override {
     auto& encoder = cu::get_command_encoder(stream());
-    auto owned = cu::contiguous_inputs(inputs, stream(), encoder);
-    const auto& input = owned[0];
+    int64_t row_stride = 0;
+    array input = inputs[0];
+    if (!try_uniform_row_stride(input, row_stride)) {
+      auto owned = cu::contiguous_inputs(inputs, stream(), encoder);
+      input = std::move(owned[0]);
+      row_stride = input.shape(-1);
+    }
     auto& ids = outputs[0];
     auto& values = outputs[1];
     ids.set_data(cu::malloc_async(ids.nbytes(), encoder));
     values.set_data(cu::malloc_async(values.nbytes(), encoder));
     const int vocab = input.shape(-1);
-    const int rows = input.size() / vocab;
+    const int rows = static_cast<int>(input.size() / vocab);
     const int dtype = input.dtype() == bfloat16 ? 0 : input.dtype() == float16 ? 1 : 2;
     constexpr int kSliceSize = 8192;
     if (vocab > kSliceSize) {
@@ -61,6 +101,7 @@ public:
       cu::KernelArgs sargs;
       sargs.append(input);
       sargs.append<int32_t>(vocab);
+      sargs.append<int64_t>(row_stride);
       sargs.append<int32_t>(kSliceSize);
       sargs.append<int32_t>(num_slices);
       sargs.append(part_ids);
@@ -92,6 +133,7 @@ public:
     args.append(input);
     args.append<int32_t>(dtype);
     args.append<int32_t>(vocab);
+    args.append<int64_t>(row_stride);
     args.append(ids);
     args.append(values);
     auto kernel = cu::jit_kernel(
@@ -105,7 +147,8 @@ public:
     return true;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
-    const int rows = inputs[0].size() / inputs[0].shape(-1);
+    const int rows = static_cast<int>(
+        inputs[0].size() / static_cast<size_t>(inputs[0].shape(-1)));
     return {{rows, 16}, {rows, 16}};
   }
 };
@@ -156,8 +199,14 @@ public:
 
   DEFINE_NAME(DFlash2SelectorEdgesCuda)
   bool is_equivalent(const Primitive& other) const override {
-    const auto& o = static_cast<const DFlash2SelectorEdgesCuda&>(other);
-    return softcap_ == o.softcap_;
+    const auto* rhs = dynamic_cast<const DFlash2SelectorEdgesCuda*>(&other);
+    if (!rhs) {
+      return false;
+    }
+    uint32_t lhs_bits = 0, rhs_bits = 0;
+    std::memcpy(&lhs_bits, &softcap_, sizeof(lhs_bits));
+    std::memcpy(&rhs_bits, &rhs->softcap_, sizeof(rhs_bits));
+    return lhs_bits == rhs_bits;
   }
   std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
     return {{inputs[0].shape(1), 16, 16}};
@@ -237,9 +286,9 @@ extern "C" int mlx_dflash2_topk16_cuda(
                        input.dtype() != float32)) {
       return 0;
     }
-    const int64_t rows = input.size() / vocab;
+    const int64_t rows = static_cast<int64_t>(input.size() / static_cast<size_t>(vocab));
     if (rows < 1 || rows > std::numeric_limits<int>::max() ||
-        input.size() != rows * vocab) {
+        input.size() != static_cast<size_t>(rows) * static_cast<size_t>(vocab)) {
       return 0;
     }
     auto outputs = array::make_arrays(

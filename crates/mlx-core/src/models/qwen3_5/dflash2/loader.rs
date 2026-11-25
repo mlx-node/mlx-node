@@ -15,6 +15,14 @@ use crate::models::quantized_linear::{LinearProj, QuantizedLinear};
 use crate::nn::{Embedding, Linear, RMSNorm, RoPE};
 use crate::utils::safetensors::load_safetensors_lazy;
 
+const MASK_EMBEDDING_KEY: &str = "mask_embedding";
+
+/// Promote a settled array from CUDA pinned-host memory (`device == -1`) into
+/// CUDA device memory (`device >= 0`). No-op on Metal/CPU or arrays already on GPU.
+fn promote_cuda_device(array: MxArray) -> Result<MxArray> {
+    Ok(array.ensure_cuda_device()?.unwrap_or(array))
+}
+
 fn required(params: &mut HashMap<String, MxArray>, key: &str, shape: &[i64]) -> Result<MxArray> {
     let value = params
         .remove(key)
@@ -90,6 +98,9 @@ fn quantize_affine(
     packed.eval();
     scales.eval();
     biases.eval();
+    let packed = promote_cuda_device(packed)?;
+    let scales = promote_cuda_device(scales)?;
+    let biases = promote_cuda_device(biases)?;
     Ok((packed, scales, biases))
 }
 
@@ -154,11 +165,11 @@ pub(super) fn dense_linear(
     input: usize,
     output: usize,
 ) -> Result<LinearProj> {
-    let weight = required(
+    let weight = promote_cuda_device(required(
         params,
         &format!("{prefix}.weight"),
         &[output as i64, input as i64],
-    )?;
+    )?)?;
     Ok(LinearProj::Standard(Linear::from_weights(&weight, None)?))
 }
 
@@ -168,7 +179,8 @@ fn norm(
     size: usize,
     eps: f64,
 ) -> Result<RMSNorm> {
-    RMSNorm::from_weight(&required(params, key, &[size as i64])?, Some(eps))
+    let weight = promote_cuda_device(required(params, key, &[size as i64])?)?;
+    RMSNorm::from_weight(&weight, Some(eps))
 }
 
 fn codebook(
@@ -177,7 +189,7 @@ fn codebook(
     vocab: usize,
     rank: usize,
 ) -> Result<Embedding> {
-    let weight = required(params, key, &[vocab as i64, rank as i64])?;
+    let weight = promote_cuda_device(required(params, key, &[vocab as i64, rank as i64])?)?;
     let mut embedding = Embedding::new_uninitialized(vocab as u32, rank as u32)?;
     embedding.load_weight(&weight)?;
     Ok(embedding)
@@ -193,11 +205,11 @@ fn grouped_conv(
     let hidden = config.hidden_size;
     let groups = hidden / config.conv_group_size;
     Ok(GroupedDynamicCausalConv {
-        base_kernel: required(
+        base_kernel: promote_cuda_device(required(
             params,
             &format!("{base}.{name}.base_kernel"),
             &[2, config.conv_kernel_size as i64, hidden as i64],
-        )?,
+        )?)?,
         kernel_projection: draft_linear(
             params,
             &format!("{base}.{name}.kernel_projection"),
@@ -341,9 +353,14 @@ pub(super) fn validate_tensor_inventory(
         };
         validate_tensor(array, name, shape)?;
     }
+    if let Some(mask_emb) = params.get(MASK_EMBEDDING_KEY) {
+        validate_tensor(mask_emb, MASK_EMBEDDING_KEY, &[config.hidden_size as i64])?;
+    }
     let mut unexpected = params
         .keys()
-        .filter(|name| !expected_names.contains(name.as_str()))
+        .filter(|name| {
+            !expected_names.contains(name.as_str()) && name.as_str() != MASK_EMBEDDING_KEY
+        })
         .cloned()
         .collect::<Vec<_>>();
     unexpected.sort();
@@ -373,47 +390,25 @@ pub(crate) fn read_dflash2_config(path: &Path) -> Result<DFlash2Config> {
     DFlash2Config::from_raw(raw)
 }
 
-/// Optional sidecar `mask_embedding.safetensors` shipping a single
-/// `mask_embedding` BF16 vector `[hidden_size]` (Splash `DraftCheckpoint`).
-fn load_optional_mask_embedding(path: &Path, hidden_size: usize) -> Result<Option<MxArray>> {
-    let mask_path = path.join("mask_embedding.safetensors");
-    if !mask_path.is_file() {
-        return Ok(None);
-    }
-    let mut mask_params = load_safetensors_lazy(&mask_path)?;
-    let raw = required(&mut mask_params, "mask_embedding", &[hidden_size as i64])?;
-    if !mask_params.is_empty() {
-        let mut unexpected = mask_params.keys().cloned().collect::<Vec<_>>();
-        unexpected.sort();
-        return Err(Error::from_reason(format!(
-            "DFlash2 mask_embedding.safetensors contains unexpected tensors: {unexpected:?}"
-        )));
-    }
-    let bf16 = if raw.dtype()? == DType::BFloat16 {
-        raw
-    } else {
-        raw.astype(DType::BFloat16)?
-    };
-    Ok(Some(bf16.reshape(&[1, 1, hidden_size as i64])?))
-}
-
 /// Bytes of the DFlash2 checkpoint file in `path`, before it loads.
 pub(crate) fn dflash2_file_bytes(path: &Path) -> Result<u64> {
     let tensor_path = resolve_safetensors(path)?;
-    let base = fs::metadata(&tensor_path)
+    let mut bytes = fs::metadata(&tensor_path)
         .map(|metadata| metadata.len())
         .map_err(|error| {
             Error::from_reason(format!("Failed to stat {}: {error}", tensor_path.display()))
         })?;
-    let mask_path = path.join("mask_embedding.safetensors");
-    let mask_bytes = if mask_path.is_file() {
-        fs::metadata(&mask_path)
-            .map(|metadata| metadata.len())
-            .unwrap_or(0)
-    } else {
-        0
-    };
-    Ok(base.saturating_add(mask_bytes))
+    let sidecar = path.join("mask_embedding.safetensors");
+    if sidecar.is_file() {
+        bytes = bytes.saturating_add(
+            fs::metadata(&sidecar)
+                .map(|metadata| metadata.len())
+                .map_err(|error| {
+                    Error::from_reason(format!("Failed to stat {}: {error}", sidecar.display()))
+                })?,
+        );
+    }
+    Ok(bytes)
 }
 
 pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
@@ -426,18 +421,49 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     // valid but incomplete companion must fail before any target or draft
     // state can be mutated.
     validate_tensor_inventory(&params, &config)?;
-    let mask_embedding = load_optional_mask_embedding(path, config.hidden_size)?;
-    let mut weight_bytes = params.values().fold(0u64, |total, array| {
-        total.saturating_add(array.nbytes() as u64)
-    });
-    if let Some(ref mask_emb) = mask_embedding {
-        weight_bytes = weight_bytes.saturating_add(mask_emb.nbytes() as u64);
-    }
-    let mut arrays = params.values().collect::<Vec<_>>();
-    if let Some(ref mask_emb) = mask_embedding {
-        arrays.push(mask_emb);
-    }
+    let sidecar_mask_path = path.join("mask_embedding.safetensors");
+    let mut sidecar_mask = if sidecar_mask_path.is_file() {
+        if params.contains_key(MASK_EMBEDDING_KEY) {
+            return Err(Error::from_reason(
+                "DFlash2 checkpoint defines 'mask_embedding' in both model.safetensors and mask_embedding.safetensors",
+            ));
+        }
+        let sidecar = load_safetensors_lazy(&sidecar_mask_path)?;
+        if sidecar.len() != 1 || !sidecar.contains_key(MASK_EMBEDDING_KEY) {
+            let mut keys = sidecar.keys().cloned().collect::<Vec<_>>();
+            keys.sort();
+            return Err(Error::from_reason(format!(
+                "DFlash2 mask_embedding.safetensors must contain only '{MASK_EMBEDDING_KEY}', found {keys:?}"
+            )));
+        }
+        if let Some(arr) = sidecar.get(MASK_EMBEDDING_KEY) {
+            validate_tensor(arr, MASK_EMBEDDING_KEY, &[config.hidden_size as i64])?;
+        }
+        Some(sidecar)
+    } else {
+        None
+    };
+    let weight_bytes = params
+        .values()
+        .chain(sidecar_mask.iter().flat_map(HashMap::values))
+        .fold(0u64, |total, array| {
+            total.saturating_add(array.nbytes() as u64)
+        });
+    let arrays = params
+        .values()
+        .chain(sidecar_mask.iter().flat_map(HashMap::values))
+        .collect::<Vec<_>>();
     let _resident = crate::array::memory::materialize_weights(&arrays)?;
+    let mask_embedding = if let Some(arr) = params.remove(MASK_EMBEDDING_KEY) {
+        Some(promote_cuda_device(arr)?)
+    } else if let Some(mut sidecar) = sidecar_mask.take() {
+        sidecar
+            .remove(MASK_EMBEDDING_KEY)
+            .map(promote_cuda_device)
+            .transpose()?
+    } else {
+        None
+    };
 
     let hidden = config.hidden_size;
     let mut savings = 0u64;
@@ -596,8 +622,8 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         top_k: config.selector_top_k,
         rank: config.selector_rank,
         vocab_size: config.vocab_size,
-        active_vocab_size: config.valid_vocab_size.unwrap_or(config.vocab_size),
-        final_logit_softcapping: config.final_logit_softcapping,
+        valid_vocab_size: config.valid_vocab_size,
+        post_softcap: config.post_edge_softcap(),
     };
     if !params.is_empty() {
         let mut unexpected = params.keys().cloned().collect::<Vec<_>>();
@@ -616,8 +642,8 @@ pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
         layers,
         norm: final_norm,
         selector,
-        context_kv: None,
         mask_embedding,
+        context_kv: None,
         compiled: CompiledDraft::default(),
     };
     model.merge_projections()?;

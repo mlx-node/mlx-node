@@ -51,6 +51,7 @@ fn draft_execution_defaults_require_the_measured_moe_structure() {
         selector_top_k: 16,
         rope_theta: 10000000.0,
         final_logit_softcapping: None,
+        selector_softcap_mode: None,
         valid_vocab_size: None,
         capture_final_norm: None,
         embedding_normalization: None,

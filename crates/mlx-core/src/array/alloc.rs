@@ -143,6 +143,28 @@ impl MxArray {
         self.is_available() && self.cuda_host_bytes() > 0
     }
 
+    /// Evaluate if lazy, and if settled in CUDA pinned-host memory (`device < 0`),
+    /// copy into CUDA device memory (`device >= 0`), replacing `self` in place and
+    /// returning the promoted byte count (`0` if already on device or non-CUDA).
+    pub(crate) fn promote_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        if !self.is_available() {
+            self.eval();
+        }
+        let bytes = self.cuda_host_bytes();
+        if bytes == 0 {
+            return Ok(0);
+        }
+        if let Some(dev) = self.ensure_cuda_device()? {
+            *self = dev;
+            Ok(bytes)
+        } else {
+            Ok(0)
+        }
+    }
+
     /// Wrap a page-aligned read-only mmap slice as a zero-copy `uint8`
     /// `[n_pages, page_size]` Metal array without charging MLX active memory.
     /// `release_fn(ctx)` is invoked once after the last array and in-flight
