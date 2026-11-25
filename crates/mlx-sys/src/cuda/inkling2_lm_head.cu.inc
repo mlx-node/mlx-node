@@ -620,9 +620,44 @@ __global__ __launch_bounds__(256, 2) void ink2_lm_head_q8_mma(
 R"cuda(
 // ============================================================================
 // 3. BF16 Dense Streaming uint4 Kernel for M in 1..=2 (1 warp/row, 8 warps/CTA)
+//    2x software-pipelined ld.global.cs.v4.u32 with dual accumulators for ILP.
 //    OUT_MODE 0/2: Grid dim3((V + 7) / 8), Block dim3(32, 8)
 //    OUT_MODE 1:   Grid dim3(num_ctas),    Block dim3(32, 8)
 // ============================================================================
+template <int M_CAP>
+__device__ __forceinline__ void ink2_lm_bf16_u4_step(
+    const uint4& wv,
+    const uint4* __restrict__ x_u4,
+    size_t x_stride_u4,
+    int kv,
+    int M,
+    float acc[M_CAP]) {
+  const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
+  const float2 wf0 = __bfloat1622float2(wb[0]);
+  const float2 wf1 = __bfloat1622float2(wb[1]);
+  const float2 wf2 = __bfloat1622float2(wb[2]);
+  const float2 wf3 = __bfloat1622float2(wb[3]);
+#pragma unroll
+  for (int m = 0; m < M_CAP; ++m) {
+    if (m < M) {
+      const uint4 xv = x_u4[static_cast<size_t>(m) * x_stride_u4 + kv];
+      const __nv_bfloat162* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
+      const float2 xf0 = __bfloat1622float2(xb[0]);
+      const float2 xf1 = __bfloat1622float2(xb[1]);
+      const float2 xf2 = __bfloat1622float2(xb[2]);
+      const float2 xf3 = __bfloat1622float2(xb[3]);
+      acc[m] = fmaf(xf0.x, wf0.x,
+               fmaf(xf0.y, wf0.y,
+               fmaf(xf1.x, wf1.x,
+               fmaf(xf1.y, wf1.y, acc[m]))));
+      acc[m] = fmaf(xf2.x, wf2.x,
+               fmaf(xf2.y, wf2.y,
+               fmaf(xf3.x, wf3.x,
+               fmaf(xf3.y, wf3.y, acc[m]))));
+    }
+  }
+}
+
 template <int M_CAP, int OUT_MODE>
 __global__ __launch_bounds__(256, 4) void ink2_lm_head_bf16_u4(
     const nv_bfloat16* __restrict__ x,
@@ -633,6 +668,8 @@ __global__ __launch_bounds__(256, 4) void ink2_lm_head_bf16_u4(
   const int lane = static_cast<int>(threadIdx.x);
   const int warp = static_cast<int>(threadIdx.y);
   const int k_vec = K >> 3;  // K / 8 (each uint4 = 8 BF16s)
+  const uint4* x_u4 = reinterpret_cast<const uint4*>(x);
+  const size_t x_stride_u4 = static_cast<size_t>(k_vec);
 
   const int n_start = static_cast<int>(blockIdx.x) * 8 + warp;
   if constexpr (OUT_MODE != 1) {
@@ -656,44 +693,30 @@ __global__ __launch_bounds__(256, 4) void ink2_lm_head_bf16_u4(
     const uint4* w_row = reinterpret_cast<const uint4*>(
         w + static_cast<size_t>(n) * static_cast<size_t>(K));
 
-    float acc[M_CAP];
+    float acc0[M_CAP];
+    float acc1[M_CAP];
 #pragma unroll
     for (int m = 0; m < M_CAP; ++m) {
-      acc[m] = 0.0f;
+      acc0[m] = 0.0f;
+      acc1[m] = 0.0f;
     }
 
-    for (int kv = lane; kv < k_vec; kv += 32) {
-      const uint4 wv = ptx_ld_cs_u4(w_row + kv);
-      const __nv_bfloat162* wb = reinterpret_cast<const __nv_bfloat162*>(&wv);
-      const float2 wf0 = __bfloat1622float2(wb[0]);
-      const float2 wf1 = __bfloat1622float2(wb[1]);
-      const float2 wf2 = __bfloat1622float2(wb[2]);
-      const float2 wf3 = __bfloat1622float2(wb[3]);
-
-#pragma unroll
-      for (int m = 0; m < M_CAP; ++m) {
-        if (m < M) {
-          const uint4 xv = reinterpret_cast<const uint4*>(
-              x + static_cast<size_t>(m) * static_cast<size_t>(K))[kv];
-          const __nv_bfloat162* xb = reinterpret_cast<const __nv_bfloat162*>(&xv);
-          const float2 xf0 = __bfloat1622float2(xb[0]);
-          const float2 xf1 = __bfloat1622float2(xb[1]);
-          const float2 xf2 = __bfloat1622float2(xb[2]);
-          const float2 xf3 = __bfloat1622float2(xb[3]);
-          float s = 0.0f;
-          s = fmaf(xf0.x, wf0.x, fmaf(xf0.y, wf0.y, s));
-          s = fmaf(xf1.x, wf1.x, fmaf(xf1.y, wf1.y, s));
-          s = fmaf(xf2.x, wf2.x, fmaf(xf2.y, wf2.y, s));
-          s = fmaf(xf3.x, wf3.x, fmaf(xf3.y, wf3.y, s));
-          acc[m] += s;
-        }
-      }
+    int kv = lane;
+    for (; kv + 32 < k_vec; kv += 64) {
+      const uint4 wv0 = ptx_ld_cs_u4(w_row + kv);
+      const uint4 wv1 = ptx_ld_cs_u4(w_row + kv + 32);
+      ink2_lm_bf16_u4_step<M_CAP>(wv0, x_u4, x_stride_u4, kv, M, acc0);
+      ink2_lm_bf16_u4_step<M_CAP>(wv1, x_u4, x_stride_u4, kv + 32, M, acc1);
+    }
+    if (kv < k_vec) {
+      const uint4 wv0 = ptx_ld_cs_u4(w_row + kv);
+      ink2_lm_bf16_u4_step<M_CAP>(wv0, x_u4, x_stride_u4, kv, M, acc0);
     }
 
 #pragma unroll
     for (int m = 0; m < M_CAP; ++m) {
       if (m < M) {
-        float v = acc[m];
+        float v = acc0[m] + acc1[m];
 #pragma unroll
         for (int off = 16; off > 0; off >>= 1) {
           v += __shfl_xor_sync(0xffffffffu, v, off);
@@ -753,13 +776,14 @@ __global__ __launch_bounds__(256, 4) void ink2_lm_head_bf16_u4(
 )cuda"
 R"cuda(
 // ============================================================================
-// 4. BF16 Dense 2-Stage cp.async.cg + Tensor Core MMA for M in 3..=16
-//    K_TILE = 128 BF16s (16 uint4s/row x 16 rows = 4096 B/stage)
+// 4. BF16 Dense 2-Stage cp.async.cg + Tensor Core MMA for M in 1..=16
+//    K_TILE = 256 BF16s (32 uint4s/row x 16 rows = 8192 B/stage, 16 KB SMEM)
+//    128-bit LDG.128 (X) + bank-conflict-free LDS.128 (W), 2x MMAs per stage.
 //    OUT_MODE 0/2: Grid dim3((V + 15) / 16), Block dim3(32, 8)
 //    OUT_MODE 1:   Grid dim3(num_ctas),      Block dim3(32, 8)
 // ============================================================================
 template <int M_TILES, int OUT_MODE>
-__global__ __launch_bounds__(256, 2) void ink2_lm_head_bf16_mma(
+__global__ __launch_bounds__(256, M_TILES == 1 ? 4 : 2) void ink2_lm_head_bf16_mma(
     const nv_bfloat16* __restrict__ x,
     const nv_bfloat16* __restrict__ w,
     void* __restrict__ out,
@@ -771,26 +795,32 @@ __global__ __launch_bounds__(256, 2) void ink2_lm_head_bf16_mma(
   const int g = lane >> 2;
   const int t = lane & 3;
 
-  const int num_tiles = K >> 7;   // full 128-BF16 tiles
-  const int tail_k = K & 127;     // multiple of 8
+  const int num_tiles = K >> 8;   // full 256-BF16 tiles (9 exact tiles for K=2304)
+  const int tail_k = K & 255;     // multiple of 8
   const size_t w_stride_u4 = static_cast<size_t>(K) >> 3;
 
   union SharedBuf {
-    uint4 w[2][16][16];           // 8192 B (XOR swizzled)
+    uint4 w[2][16][32];           // 16384 B (bank-conflict-free LDS.128 swizzle)
     float reduce[8][M_TILES * 8][17];
   };
   __shared__ SharedBuf sh;
 
-  const int ld_row = tid >> 4;
-  const int ld_col = tid & 15;
-  const int ld_swz = ld_col ^ ld_row;
+  const int ld_row = tid >> 4;    // 0..15
+  const int ld_col = tid & 15;    // 0..15
+  const int ld_rperm = ((ld_row & 1) << 2) | ((ld_row >> 1) & 3);
+  const int ld_swz0 = ld_col ^ ld_rperm;
+  const int ld_swz1 = (16 + ld_col) ^ ld_rperm;
 
   const bool valid_m0 = (g < M);
   [[maybe_unused]] const bool valid_m1 = (M_TILES == 2) && (g + 8 < M);
-  const int col_u4 = warp * 2 + (t >> 1);
-  const int half_u2 = t & 1;
-  const int swz_r0 = col_u4 ^ g;
-  const int swz_r1 = col_u4 ^ (g + 8);
+  const int col_u4 = warp * 4 + t;
+  const int g_rperm = ((g & 1) << 2) | (g >> 1);
+  const int swz_col = col_u4 ^ g_rperm;
+
+  const uint4* x0_row_u4 = reinterpret_cast<const uint4*>(x) +
+      static_cast<size_t>(valid_m0 ? g : 0) * w_stride_u4 + col_u4;
+  [[maybe_unused]] const uint4* x1_row_u4 = reinterpret_cast<const uint4*>(x) +
+      static_cast<size_t>(valid_m1 ? (g + 8) : 0) * w_stride_u4 + col_u4;
 
   const int row_start = static_cast<int>(blockIdx.x) * 16;
   if constexpr (OUT_MODE != 1) {
@@ -814,7 +844,8 @@ __global__ __launch_bounds__(256, 2) void ink2_lm_head_bf16_mma(
     [[maybe_unused]] float total1[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
     if (num_tiles > 0) {
-      ptx_cp_async16_cg(&sh.w[0][ld_row][ld_swz], w_load_ptr);
+      ptx_cp_async16_cg(&sh.w[0][ld_row][ld_swz0], w_load_ptr);
+      ptx_cp_async16_cg(&sh.w[0][ld_row][ld_swz1], w_load_ptr + 16);
       ptx_cp_commit();
       ptx_cp_wait<0>();
       __syncthreads();
@@ -823,30 +854,30 @@ __global__ __launch_bounds__(256, 2) void ink2_lm_head_bf16_mma(
         const int cur = tile & 1;
         const int nxt = cur ^ 1;
         if (tile + 1 < num_tiles) {
-          ptx_cp_async16_cg(
-              &sh.w[nxt][ld_row][ld_swz],
-              w_load_ptr + static_cast<size_t>(tile + 1) * 16);
+          const uint4* w_nxt = w_load_ptr + static_cast<size_t>(tile + 1) * 32;
+          ptx_cp_async16_cg(&sh.w[nxt][ld_row][ld_swz0], w_nxt);
+          ptx_cp_async16_cg(&sh.w[nxt][ld_row][ld_swz1], w_nxt + 16);
           ptx_cp_commit();
         }
 
-        const uint2 w0 =
-            reinterpret_cast<const uint2*>(&sh.w[cur][g][swz_r0])[half_u2];
-        const uint2 w1 =
-            reinterpret_cast<const uint2*>(&sh.w[cur][g + 8][swz_r1])[half_u2];
-        const int k_off = tile * 128 + warp * 16 + t * 4;
-        const uint2 xb0 = valid_m0
-            ? *reinterpret_cast<const uint2*>(x + static_cast<size_t>(g) * K + k_off)
-            : make_uint2(0, 0);
+        const uint4 w0 = sh.w[cur][g][swz_col];
+        const uint4 w1 = sh.w[cur][g + 8][swz_col];
+        const size_t x_tile_off = static_cast<size_t>(tile) * 32;
+        const uint4 xv0 = valid_m0 ? x0_row_u4[x_tile_off] : make_uint4(0, 0, 0, 0);
         ptx_mma_m16n8k16_bf16_v(
             total0[0], total0[1], total0[2], total0[3],
-            w0.x, w1.x, w0.y, w1.y, xb0.x, xb0.y);
+            w0.x, w1.x, w0.y, w1.y, xv0.x, xv0.y);
+        ptx_mma_m16n8k16_bf16_v(
+            total0[0], total0[1], total0[2], total0[3],
+            w0.z, w1.z, w0.w, w1.w, xv0.z, xv0.w);
         if constexpr (M_TILES == 2) {
-          const uint2 xb1 = valid_m1
-              ? *reinterpret_cast<const uint2*>(x + static_cast<size_t>(g + 8) * K + k_off)
-              : make_uint2(0, 0);
+          const uint4 xv1 = valid_m1 ? x1_row_u4[x_tile_off] : make_uint4(0, 0, 0, 0);
           ptx_mma_m16n8k16_bf16_v(
               total1[0], total1[1], total1[2], total1[3],
-              w0.x, w1.x, w0.y, w1.y, xb1.x, xb1.y);
+              w0.x, w1.x, w0.y, w1.y, xv1.x, xv1.y);
+          ptx_mma_m16n8k16_bf16_v(
+              total1[0], total1[1], total1[2], total1[3],
+              w0.z, w1.z, w0.w, w1.w, xv1.z, xv1.w);
         }
 
         if (tile + 1 < num_tiles) {
@@ -857,10 +888,9 @@ __global__ __launch_bounds__(256, 2) void ink2_lm_head_bf16_mma(
     }
 
     if (tail_k > 0) {
-      const int k_base = num_tiles * 128 + warp * 16;
-      if (k_base < K) {
-        const int r0 = (row0 + g < V) ? (row0 + g) : (V - 1);
-        const int r1 = (row0 + g + 8 < V) ? (row0 + g + 8) : (V - 1);
+      const int r0 = (row0 + g < V) ? (row0 + g) : (V - 1);
+      const int r1 = (row0 + g + 8 < V) ? (row0 + g + 8) : (V - 1);
+      for (int k_base = num_tiles * 256 + warp * 16; k_base < K; k_base += 128) {
         const int k_off = k_base + t * 4;
         const uint2 w0 = (k_off < K)
             ? *reinterpret_cast<const uint2*>(w + static_cast<size_t>(r0) * K + k_off)

@@ -254,19 +254,55 @@ pub struct LoopController {
     pub dim: i64,
 }
 
-/// LoopController weight dtype: preserves the checkpoint's native precision (BF16 for original
-/// SafeTensors where controllers are natively BF16 -> 2x less DRAM with zero precision loss;
-/// FP32 for GGUF where controllers are natively FP32). Honors explicit `MLX_INKLING2_LOOP_BF16`
-/// override when set (`1`/`true`/`bf16` or `0`/`false`/`f32`).
-pub(crate) fn loop_controller_weight_dtype(source_dtype: DType) -> DType {
+/// Return `true` iff every element in `w` round-trips through `DType::BFloat16`
+/// without losing any bits (e.g. GGUF F32 tensors widened from native BF16 by
+/// `convert_hf_to_gguf.py`). Fails closed (`false`) on NaN or non-BF16-exact F32 values.
+fn is_exact_bf16_roundtrip(w: &MxArray) -> Result<bool> {
+    if w.dtype()? == DType::BFloat16 {
+        return Ok(true);
+    }
+    if w.dtype()? != DType::Float32 {
+        return Ok(false);
+    }
+    if w.size()? == 0 {
+        return Ok(true);
+    }
+    let roundtripped = w.astype(DType::BFloat16)?.astype(DType::Float32)?;
+    let all_eq = roundtripped
+        .equal(w)?
+        .astype(DType::Int32)?
+        .min(None, None)?;
+    Ok(all_eq.item_at_int32(0)? != 0)
+}
+
+/// LoopController weight dtype:
+/// - Always honors explicit `MLX_INKLING2_LOOP_BF16` override (`1`/`true`/`bf16` or `0`/`false`/`f32`).
+/// - Preserves native BF16 checkpoints (`down_proj.dtype() == BFloat16`) on all backends.
+/// - On the CUDA fast path (`cuda_fast_enabled()`), compacts F32 controller tensors back to
+///   `DType::BFloat16` ONLY when all three tensors (`down_proj`, `gain_proj`, `forget_proj`)
+///   round-trip through BF16 bit-for-bit losslessly (e.g. GGUF exports widened from BF16).
+/// - Preserves native FP32 precision whenever any tensor has non-BF16-exact FP32 values, when
+///   `MLX_INKLING2_CUDA_FAST=0`, or on macOS Metal / CPU.
+pub(crate) fn loop_controller_weight_dtype(
+    down_proj: &MxArray,
+    gain_proj: &MxArray,
+    forget_proj: &MxArray,
+) -> Result<DType> {
     match loop_bf16_override_tag() {
-        "bf16" => DType::BFloat16,
-        "f32" => DType::Float32,
+        "bf16" => Ok(DType::BFloat16),
+        "f32" => Ok(DType::Float32),
         _ => {
-            if source_dtype == DType::BFloat16 {
-                DType::BFloat16
+            if down_proj.dtype()? == DType::BFloat16 {
+                return Ok(DType::BFloat16);
+            }
+            if super::cuda_forward::cuda_fast_enabled()
+                && is_exact_bf16_roundtrip(down_proj)?
+                && is_exact_bf16_roundtrip(gain_proj)?
+                && is_exact_bf16_roundtrip(forget_proj)?
+            {
+                Ok(DType::BFloat16)
             } else {
-                DType::Float32
+                Ok(DType::Float32)
             }
         }
     }
@@ -274,8 +310,17 @@ pub(crate) fn loop_controller_weight_dtype(source_dtype: DType) -> DType {
 
 impl LoopController {
     pub fn new(down_proj: MxArray, gain_proj: MxArray, forget_proj: MxArray) -> Result<Self> {
+        let w_dtype = loop_controller_weight_dtype(&down_proj, &gain_proj, &forget_proj)?;
+        Self::new_with_dtype(down_proj, gain_proj, forget_proj, w_dtype)
+    }
+
+    pub(crate) fn new_with_dtype(
+        down_proj: MxArray,
+        gain_proj: MxArray,
+        forget_proj: MxArray,
+        w_dtype: DType,
+    ) -> Result<Self> {
         let dim = gain_proj.shape()?[0];
-        let w_dtype = loop_controller_weight_dtype(down_proj.dtype()?);
         let down_proj_w = if down_proj.dtype()? == w_dtype {
             down_proj
         } else {
@@ -855,6 +900,41 @@ mod tests {
         let dest_v = dest.to_float32().unwrap();
         for (a, b) in out.iter().zip(dest_v.iter()) {
             assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn loop_controller_auto_dtype_preserves_native_f32_and_compacts_exact_bf16() {
+        let d = 4i64;
+        let r = 2i64;
+        // Native FP32 value `0.1234567_f32` is NOT exact in BF16 -> must stay FP32.
+        let non_bf16 =
+            MxArray::from_float32(&vec![0.123_456_7_f32; (r * 2 * d) as usize], &[r, 2 * d])
+                .unwrap();
+        let exact_g = MxArray::from_float32(&vec![0.5_f32; (d * r) as usize], &[d, r]).unwrap();
+        let exact_f = MxArray::from_float32(&vec![-0.25_f32; (d * r) as usize], &[d, r]).unwrap();
+        assert!(!is_exact_bf16_roundtrip(&non_bf16).unwrap());
+        assert!(is_exact_bf16_roundtrip(&exact_g).unwrap());
+        assert!(is_exact_bf16_roundtrip(&exact_f).unwrap());
+
+        let ctrl_f32 = LoopController::new(non_bf16, exact_g.clone(), exact_f.clone()).unwrap();
+        if loop_bf16_override_tag() == "auto" {
+            assert_eq!(ctrl_f32.down_proj_w.dtype().unwrap(), DType::Float32);
+            assert_eq!(ctrl_f32.gain_forget_w.dtype().unwrap(), DType::Float32);
+        }
+
+        // Exact BF16-representable F32 tensors compact to BF16 iff CUDA fast path is active.
+        let exact_d =
+            MxArray::from_float32(&vec![1.25_f32; (r * 2 * d) as usize], &[r, 2 * d]).unwrap();
+        let ctrl_exact = LoopController::new(exact_d, exact_g, exact_f).unwrap();
+        if loop_bf16_override_tag() == "auto" {
+            let expected = if super::super::cuda_forward::cuda_fast_enabled() {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            };
+            assert_eq!(ctrl_exact.down_proj_w.dtype().unwrap(), expected);
+            assert_eq!(ctrl_exact.gain_forget_w.dtype().unwrap(), expected);
         }
     }
 }

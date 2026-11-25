@@ -527,8 +527,9 @@ impl Inkling2Inner {
         super::cuda_kv::Inkling2CudaCache::new(&self.config, self.cuda_kv_format)
     }
 
-    /// Promote every resident weight array (backbone, `embed_tokens`, `lm_head`, and optional
-    /// `dspark`) from CUDA pinned-host memory (`device == -1`) into GPU device memory (`device == 0`).
+    /// Promote every resident weight array (backbone, `embed_tokens`, `lm_head`, optional
+    /// `vision_encoder`, and optional `dspark`) from CUDA pinned-host memory (`device == -1`)
+    /// into GPU device memory (`device == 0`).
     ///
     /// Flushes MLX's allocator cache every 256 MiB promoted so peak unified/host RAM stays tight.
     /// No-op on non-CUDA builds or when weights are already device-resident.
@@ -569,6 +570,9 @@ impl Inkling2Inner {
         {
             let cols = existing.shape_at(0)?;
             self.lm_head_bf16_unpadded = Some(lin.get_weight().slice_axis(0, 0, cols)?);
+        }
+        if let Some(ref mut ve) = self.vision_encoder {
+            account(ve.ensure_cuda_device()?);
         }
         if let Some(ref mut dspark) = self.dspark {
             account(dspark.ensure_cuda_device()?);

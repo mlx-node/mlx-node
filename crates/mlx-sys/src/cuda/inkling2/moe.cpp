@@ -432,6 +432,73 @@ class Inkling2MoeCuda final : public Primitive {
       args.append(mid);
       encoder.add_kernel_node_raw(
           k_gu, dim3(kInter / 16, P, 1), dim3(32, 9, 1), {}, 0, args.args());
+    } else if (cfg_.gu_mode == 1 && m_bucket > 0) {
+      encoder.set_input_array(in.gu_w);
+      encoder.set_input_array(in.gu_scales);
+      if (in.gu_outer_scale) encoder.set_input_array(*in.gu_outer_scale);
+      encoder.set_input_array(in.x);
+      encoder.set_input_array(unique_experts);
+      encoder.set_input_array(bucket_offsets);
+      encoder.set_input_array(pair_indices);
+      encoder.set_input_array(num_unique);
+      encoder.set_output_array(mid);
+      static constexpr const char* kSymQ8GuEntries[2][2] = {
+          {"inkling2_moe_gate_up_situ_symq8_few<false, false>",
+           "inkling2_moe_gate_up_situ_symq8_few<false, true>"},
+          {"inkling2_moe_gate_up_situ_symq8_few<true, false>",
+           "inkling2_moe_gate_up_situ_symq8_few<true, true>"},
+      };
+      auto k_gu = cu::jit_kernel(
+          encoder.device(), inkling2_moe_few_source,
+          kSymQ8GuEntries[cfg_.gu_interleaved ? 1 : 0][allow_hi ? 1 : 0]);
+      ensure_smem_carveout(k_gu, 50);
+      cu::KernelArgs args;
+      args.append(in.gu_w);
+      args.append(in.gu_scales);
+      if (in.gu_outer_scale) args.append(*in.gu_outer_scale);
+      else args.append<CUdeviceptr>(0);
+      args.append(in.x);
+      args.append(unique_experts);
+      args.append(bucket_offsets);
+      args.append(pair_indices);
+      args.append(num_unique);
+      args.append(mid);
+      args.append<int32_t>(gu_sb_bf16);
+      encoder.add_kernel_node_raw(
+          k_gu, dim3(kInter / 16, P, 1), dim3(32, 9, 1), {}, 0, args.args());
+    } else if (cfg_.gu_mode == 4 && m_bucket > 0) {
+      encoder.set_input_array(in.gu_w);
+      encoder.set_input_array(in.gu_scales);
+      if (in.gu_outer_scale) encoder.set_input_array(*in.gu_outer_scale);
+      encoder.set_input_array(in.x);
+      encoder.set_input_array(unique_experts);
+      encoder.set_input_array(bucket_offsets);
+      encoder.set_input_array(pair_indices);
+      encoder.set_input_array(num_unique);
+      encoder.set_output_array(mid);
+      static constexpr const char* kMxfp8GuEntries[2][2] = {
+          {"inkling2_moe_gate_up_situ_mxfp8_few<false, false>",
+           "inkling2_moe_gate_up_situ_mxfp8_few<false, true>"},
+          {"inkling2_moe_gate_up_situ_mxfp8_few<true, false>",
+           "inkling2_moe_gate_up_situ_mxfp8_few<true, true>"},
+      };
+      auto k_gu = cu::jit_kernel(
+          encoder.device(), inkling2_moe_few_source,
+          kMxfp8GuEntries[cfg_.gu_interleaved ? 1 : 0][allow_hi ? 1 : 0]);
+      ensure_smem_carveout(k_gu, 50);
+      cu::KernelArgs args;
+      args.append(in.gu_w);
+      args.append(in.gu_scales);
+      if (in.gu_outer_scale) args.append(*in.gu_outer_scale);
+      else args.append<CUdeviceptr>(0);
+      args.append(in.x);
+      args.append(unique_experts);
+      args.append(bucket_offsets);
+      args.append(pair_indices);
+      args.append(num_unique);
+      args.append(mid);
+      encoder.add_kernel_node_raw(
+          k_gu, dim3(kInter / 16, P, 1), dim3(32, 9, 1), {}, 0, args.args());
     } else {
       encoder.set_input_array(in.gu_w);
       encoder.set_input_array(in.gu_scales);
@@ -546,6 +613,32 @@ class Inkling2MoeCuda final : public Primitive {
       args.append<int32_t>(dn_sb_bf16);
       encoder.add_kernel_node_raw(
           k_dn, dim3(kHidden / 32, P, 1), dim3(32, 9, 1), {}, 0, args.args());
+    } else if (cfg_.dn_mode == 4 && m_bucket > 0) {
+      encoder.set_input_array(in.dn_w);
+      encoder.set_input_array(in.dn_scales);
+      encoder.set_input_array(mid);
+      encoder.set_input_array(unique_experts);
+      encoder.set_input_array(bucket_offsets);
+      encoder.set_input_array(pair_indices);
+      encoder.set_input_array(num_unique);
+      encoder.set_output_array(down_pairs);
+      const char* dn_entry = allow_hi
+          ? "inkling2_moe_down_mxfp8_few<true>"
+          : "inkling2_moe_down_mxfp8_few<false>";
+      auto k_dn = cu::jit_kernel(
+          encoder.device(), inkling2_moe_few_source, dn_entry);
+      ensure_smem_carveout(k_dn, 50);
+      cu::KernelArgs args;
+      args.append(in.dn_w);
+      args.append(in.dn_scales);
+      args.append(mid);
+      args.append(unique_experts);
+      args.append(bucket_offsets);
+      args.append(pair_indices);
+      args.append(num_unique);
+      args.append(down_pairs);
+      encoder.add_kernel_node_raw(
+          k_dn, dim3(kHidden / 32, P, 1), dim3(32, 9, 1), {}, 0, args.args());
     } else {
       encoder.set_input_array(in.dn_w);
       encoder.set_input_array(in.dn_scales);
@@ -654,11 +747,13 @@ class Inkling2MoeCuda final : public Primitive {
       const UnpackedInputs& in, int M, array& out_y, array* out_hist,
       array* out_pre_conv, cu::CommandEncoder& encoder) {
     const int P = M * kTopK;
-    const int max_tiles = (P + 31) / 32 + kNumExperts;
+    const bool is_q5k = (cfg_.gu_mode == 3);
+    const int bm_shift = is_q5k ? 5 : 6;
+    const int bm = 1 << bm_shift;
+    const int max_tiles = (P + bm - 1) / bm + kNumExperts;
     if (max_tiles > 65535) {
       throw std::invalid_argument("Inkling2MoeCuda: prefill max_tiles > 65535");
     }
-    const bool is_q5k = (cfg_.gu_mode == 3);
     const int gu_sb_bf16 = (in.gu_scales.dtype() == bfloat16) ? 1 : 0;
     const int dn_sb_bf16 = (in.dn_scales.dtype() == bfloat16) ? 1 : 0;
 
@@ -728,7 +823,7 @@ class Inkling2MoeCuda final : public Primitive {
           k_tk, dim3((M + 7) / 8, 1, 1), dim3(32, 8, 1), {}, 0, args.args());
     }
 
-    // 2B. Counting Sort + BM=32 Tile Table
+    // 2B. Counting Sort + Variable BM (32 for Q5_K, 64 for NVFP4/SymQ8/AffineQ8/MXFP8) Tile Table
     {
       encoder.set_input_array(expert_ids);
       encoder.set_output_array(sorted_pairs);
@@ -749,6 +844,7 @@ class Inkling2MoeCuda final : public Primitive {
       args.append(tile_end);
       args.append(num_tiles);
       args.append<int32_t>(P);
+      args.append<int32_t>(bm_shift);
       encoder.add_kernel_node_raw(
           k_rs, dim3(1, 1, 1), dim3(256, 1, 1), {}, 0, args.args());
     }
@@ -825,19 +921,20 @@ class Inkling2MoeCuda final : public Primitive {
       encoder.set_input_array(num_tiles);
       encoder.set_output_array(mid);
       static constexpr const char* kPreGuEntries[4][2] = {
-          {"inkling2_moe_prefill_gate_up_situ_bm32<0, false>",
-           "inkling2_moe_prefill_gate_up_situ_bm32<0, true>"},
-          {"inkling2_moe_prefill_gate_up_situ_bm32<1, false>",
-           "inkling2_moe_prefill_gate_up_situ_bm32<1, true>"},
-          {"inkling2_moe_prefill_gate_up_situ_bm32<2, false>",
-           "inkling2_moe_prefill_gate_up_situ_bm32<2, true>"},
-          {"inkling2_moe_prefill_gate_up_situ_bm32<4, false>",
-           "inkling2_moe_prefill_gate_up_situ_bm32<4, true>"},
+          {"inkling2_moe_prefill_gate_up_situ_bm64<0, false>",
+           "inkling2_moe_prefill_gate_up_situ_bm64<0, true>"},
+          {"inkling2_moe_prefill_gate_up_situ_bm64<1, false>",
+           "inkling2_moe_prefill_gate_up_situ_bm64<1, true>"},
+          {"inkling2_moe_prefill_gate_up_situ_bm64<2, false>",
+           "inkling2_moe_prefill_gate_up_situ_bm64<2, true>"},
+          {"inkling2_moe_prefill_gate_up_situ_bm64<4, false>",
+           "inkling2_moe_prefill_gate_up_situ_bm64<4, true>"},
       };
       const int gm = nonq5k_mode_index(cfg_.gu_mode);
       auto k_gu = cu::jit_kernel(
           encoder.device(), inkling2_moe_prefill_source,
           kPreGuEntries[gm][cfg_.gu_interleaved ? 1 : 0]);
+      ensure_smem_carveout(k_gu, cfg_.gu_mode == 0 ? 50 : 100);
       cu::KernelArgs args;
       args.append(in.gu_w);
       args.append(in.gu_scales);
@@ -854,11 +951,11 @@ class Inkling2MoeCuda final : public Primitive {
       args.append(mid);
       args.append<int32_t>(gu_sb_bf16);
       encoder.add_kernel_node_raw(
-          k_gu, dim3(kInter / 64, max_tiles, 1), dim3(32, 4, 1), {}, 0,
+          k_gu, dim3(kInter / 128, max_tiles, 1), dim3(32, 8, 1), {}, 0,
           args.args());
     }
 
-    // 4. Grouped Prefill BM=32 Down Projection -> down_out[P, 2304] BF16
+    // 4. Grouped Prefill BM=64/BN=128 Down Projection -> down_out[P, 2304] BF16
     {
       encoder.set_input_array(in.dn_w);
       encoder.set_input_array(in.dn_scales);
@@ -870,14 +967,15 @@ class Inkling2MoeCuda final : public Primitive {
       encoder.set_input_array(num_tiles);
       encoder.set_output_array(down_out);
       static constexpr const char* kPreDnEntries[4] = {
-          "inkling2_moe_prefill_down_bm32<0>",
-          "inkling2_moe_prefill_down_bm32<1>",
-          "inkling2_moe_prefill_down_bm32<2>",
-          "inkling2_moe_prefill_down_bm32<4>",
+          "inkling2_moe_prefill_down_bm64<0>",
+          "inkling2_moe_prefill_down_bm64<1>",
+          "inkling2_moe_prefill_down_bm64<2>",
+          "inkling2_moe_prefill_down_bm64<4>",
       };
       const int dm = nonq5k_mode_index(cfg_.dn_mode);
       auto k_dn = cu::jit_kernel(
           encoder.device(), inkling2_moe_prefill_source, kPreDnEntries[dm]);
+      ensure_smem_carveout(k_dn, 100);
       cu::KernelArgs args;
       args.append(in.dn_w);
       args.append(in.dn_scales);
@@ -891,7 +989,7 @@ class Inkling2MoeCuda final : public Primitive {
       args.append(down_out);
       args.append<int32_t>(dn_sb_bf16);
       encoder.add_kernel_node_raw(
-          k_dn, dim3(kHidden / 64, max_tiles, 1), dim3(32, 4, 1), {}, 0,
+          k_dn, dim3(kHidden / 128, max_tiles, 1), dim3(32, 8, 1), {}, 0,
           args.args());
     }
 

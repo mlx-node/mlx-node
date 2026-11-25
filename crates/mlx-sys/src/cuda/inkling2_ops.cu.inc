@@ -1731,3 +1731,563 @@ __global__ __launch_bounds__(128, 4) void ink2_compact_kv_batch_cuda(
   }
 }
 )cuda"
+R"cuda(
+// ============================================================================
+// 9. LoopCtrl Prefill Helpers (G=1 or G=3, Grid dim3(G, min(T, 65535), 1))
+//    Adjacent blockIdx.x = g keeps broadcast SWA dest[t] hot in L2 across G=3.
+//    9a. ink2_loop_pair_rms_norm_cuda:     [G, T, D] x 2 -> [G, T, 2*D] (BF16 or F32)
+//    9b. ink2_loop_blend_rms_norm_cuda:    dest, msg, gf[2*D], norm_w -> [G, T, D] BF16
+//    9c. ink2_loop_up_blend_rms_norm_cuda: fused BF16 TC up-proj + blend + RMSNorm
+// ============================================================================
+
+template <bool OUT_BF16, bool VEC4>
+__global__ __launch_bounds__(256, 3) void ink2_loop_pair_rms_norm_cuda(
+    const char* __restrict__ dest,
+    const char* __restrict__ msg,
+    void* __restrict__ out,
+    int T,
+    int D,
+    int dest_bcast,
+    int msg_bcast,
+    int dest_is_f32,
+    int msg_is_f32,
+    float eps) {
+  const int g = static_cast<int>(blockIdx.x);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const bool d_f32 = (dest_is_f32 != 0);
+  const bool m_f32 = (msg_is_f32 != 0);
+
+  __shared__ float s_sq_d[8];
+  __shared__ float s_sq_m[8];
+
+  for (int t = static_cast<int>(blockIdx.y); t < T; t += static_cast<int>(gridDim.y)) {
+    const size_t d_row =
+        dest_bcast ? static_cast<size_t>(t)
+                   : static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const size_t m_row =
+        msg_bcast ? static_cast<size_t>(t)
+                  : static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const size_t out_row =
+        static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const char* d_ptr =
+        dest + d_row * static_cast<size_t>(D) * (d_f32 ? 4u : 2u);
+    const char* m_ptr =
+        msg + m_row * static_cast<size_t>(D) * (m_f32 ? 4u : 2u);
+
+    if constexpr (VEC4) {
+      const int D4 = D >> 2;
+      const size_t out_off4 = out_row * static_cast<size_t>(D4) * 2;
+      const bool fits_regs = (D4 <= 768);  // covers D <= 3072 (incl. D=2304) in 1 DRAM pass
+
+      float4 d0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 d1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 d2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 m0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 m1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 m2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float sq_d = 0.0f;
+      float sq_m = 0.0f;
+
+      int step = 0;
+      for (int i4 = tid; i4 < D4; i4 += 256, ++step) {
+        const float4 dv = ink2_load_f4(d_ptr, static_cast<size_t>(i4), d_f32);
+        const float4 mv = ink2_load_f4(m_ptr, static_cast<size_t>(i4), m_f32);
+        sq_d += (dv.x * dv.x + dv.y * dv.y) + (dv.z * dv.z + dv.w * dv.w);
+        sq_m += (mv.x * mv.x + mv.y * mv.y) + (mv.z * mv.z + mv.w * mv.w);
+        if (fits_regs) {
+          if (step == 0) {
+            d0 = dv;
+            m0 = mv;
+          } else if (step == 1) {
+            d1 = dv;
+            m1 = mv;
+          } else {
+            d2 = dv;
+            m2 = mv;
+          }
+        }
+      }
+      sq_d = ink2_warp_sum(sq_d);
+      sq_m = ink2_warp_sum(sq_m);
+      if (lane == 0) {
+        s_sq_d[warp] = sq_d;
+        s_sq_m[warp] = sq_m;
+      }
+      __syncthreads();
+      if (warp == 0 && lane == 0) {
+        float tot_d = 0.0f;
+        float tot_m = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          tot_d += s_sq_d[w];
+          tot_m += s_sq_m[w];
+        }
+        const float inv_dim = 1.0f / static_cast<float>(D);
+        s_sq_d[0] = rsqrtf(tot_d * inv_dim + eps);
+        s_sq_m[0] = rsqrtf(tot_m * inv_dim + eps);
+      }
+      __syncthreads();
+      const float inv_d = s_sq_d[0];
+      const float inv_m = s_sq_m[0];
+
+      step = 0;
+      for (int i4 = tid; i4 < D4; i4 += 256, ++step) {
+        const float4 dv = fits_regs
+            ? ((step == 0) ? d0 : ((step == 1) ? d1 : d2))
+            : ink2_load_f4(d_ptr, static_cast<size_t>(i4), d_f32);
+        const float4 mv = fits_regs
+            ? ((step == 0) ? m0 : ((step == 1) ? m1 : m2))
+            : ink2_load_f4(m_ptr, static_cast<size_t>(i4), m_f32);
+        const float4 dn = make_float4(dv.x * inv_d, dv.y * inv_d, dv.z * inv_d, dv.w * inv_d);
+        const float4 mn = make_float4(mv.x * inv_m, mv.y * inv_m, mv.z * inv_m, mv.w * inv_m);
+        if constexpr (OUT_BF16) {
+          nv_bfloat16* out_bf = reinterpret_cast<nv_bfloat16*>(out);
+          ink2_store_bf16x4(out_bf, out_off4 + i4, dn);
+          ink2_store_bf16x4(out_bf, out_off4 + D4 + i4, mn);
+        } else {
+          float4* out_f4 = reinterpret_cast<float4*>(out);
+          out_f4[out_off4 + i4] = dn;
+          out_f4[out_off4 + D4 + i4] = mn;
+        }
+      }
+    } else {
+      const size_t out_off = out_row * static_cast<size_t>(D) * 2;
+      float sq_d = 0.0f;
+      float sq_m = 0.0f;
+      for (int i = tid; i < D; i += 256) {
+        const float dv = ink2_load_f1(d_ptr, static_cast<size_t>(i), d_f32);
+        const float mv = ink2_load_f1(m_ptr, static_cast<size_t>(i), m_f32);
+        sq_d += dv * dv;
+        sq_m += mv * mv;
+      }
+      sq_d = ink2_warp_sum(sq_d);
+      sq_m = ink2_warp_sum(sq_m);
+      if (lane == 0) {
+        s_sq_d[warp] = sq_d;
+        s_sq_m[warp] = sq_m;
+      }
+      __syncthreads();
+      if (warp == 0 && lane == 0) {
+        float tot_d = 0.0f;
+        float tot_m = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          tot_d += s_sq_d[w];
+          tot_m += s_sq_m[w];
+        }
+        const float inv_dim = 1.0f / static_cast<float>(D);
+        s_sq_d[0] = rsqrtf(tot_d * inv_dim + eps);
+        s_sq_m[0] = rsqrtf(tot_m * inv_dim + eps);
+      }
+      __syncthreads();
+      const float inv_d = s_sq_d[0];
+      const float inv_m = s_sq_m[0];
+      for (int i = tid; i < D; i += 256) {
+        const float dn = ink2_load_f1(d_ptr, static_cast<size_t>(i), d_f32) * inv_d;
+        const float mn = ink2_load_f1(m_ptr, static_cast<size_t>(i), m_f32) * inv_m;
+        if constexpr (OUT_BF16) {
+          nv_bfloat16* out_bf = reinterpret_cast<nv_bfloat16*>(out);
+          out_bf[out_off + i] = __float2bfloat16_rn(dn);
+          out_bf[out_off + D + i] = __float2bfloat16_rn(mn);
+        } else {
+          float* out_f = reinterpret_cast<float*>(out);
+          out_f[out_off + i] = dn;
+          out_f[out_off + D + i] = mn;
+        }
+      }
+    }
+    if (t + static_cast<int>(gridDim.y) < T) {
+      __syncthreads();
+    }
+  }
+}
+
+__device__ __forceinline__ float ink2_loop_blend_elem(
+    float dv, float mv, float gain_raw, float forget_raw) {
+  const float g_val = tanhf(fminf(fmaxf(gain_raw, -20.0f), 20.0f));
+  const float f_val = tanhf(fminf(fmaxf(forget_raw, -20.0f), 20.0f));
+  const float kept = __fmul_rn(1.0f - f_val, dv);
+  const float added = __fmul_rn(g_val, mv);
+  return __fadd_rn(kept, added);
+}
+
+template <bool VEC4>
+__global__ __launch_bounds__(256, 3) void ink2_loop_blend_rms_norm_cuda(
+    const char* __restrict__ dest,
+    const char* __restrict__ msg,
+    const char* __restrict__ gf,
+    const float* __restrict__ norm_w,
+    nv_bfloat16* __restrict__ out,
+    int T,
+    int D,
+    int dest_bcast,
+    int msg_bcast,
+    int norm_w_bcast,
+    int dest_is_f32,
+    int msg_is_f32,
+    int gf_is_f32,
+    float eps) {
+  const int g = static_cast<int>(blockIdx.x);
+  const int tid = static_cast<int>(threadIdx.x);
+  const int lane = tid & 31;
+  const int warp = tid >> 5;
+  const bool d_f32 = (dest_is_f32 != 0);
+  const bool m_f32 = (msg_is_f32 != 0);
+  const bool g_f32 = (gf_is_f32 != 0);
+
+  __shared__ float s_sq[8];
+
+  for (int t = static_cast<int>(blockIdx.y); t < T; t += static_cast<int>(gridDim.y)) {
+    const size_t d_row =
+        dest_bcast ? static_cast<size_t>(t)
+                   : static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const size_t m_row =
+        msg_bcast ? static_cast<size_t>(t)
+                  : static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const size_t out_row =
+        static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t);
+    const char* d_ptr =
+        dest + d_row * static_cast<size_t>(D) * (d_f32 ? 4u : 2u);
+    const char* m_ptr =
+        msg + m_row * static_cast<size_t>(D) * (m_f32 ? 4u : 2u);
+    const char* gf_ptr =
+        gf + out_row * static_cast<size_t>(D) * 2 * (g_f32 ? 4u : 2u);
+
+    if constexpr (VEC4) {
+      const int D4 = D >> 2;
+      const size_t out_off4 = out_row * static_cast<size_t>(D4);
+      const bool fits_regs = (D4 <= 1024);  // covers D <= 4096 (incl. D=2304) in registers
+
+      float4 b0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 b1 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 b2 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float4 b3 = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+      float sq = 0.0f;
+
+      int step = 0;
+      for (int i4 = tid; i4 < D4; i4 += 256, ++step) {
+        const float4 dv = ink2_load_f4(d_ptr, static_cast<size_t>(i4), d_f32);
+        const float4 mv = ink2_load_f4(m_ptr, static_cast<size_t>(i4), m_f32);
+        const float4 gv = ink2_load_f4(gf_ptr, static_cast<size_t>(i4), g_f32);
+        const float4 fv = ink2_load_f4(gf_ptr, static_cast<size_t>(D4 + i4), g_f32);
+        const float4 b = make_float4(
+            ink2_loop_blend_elem(dv.x, mv.x, gv.x, fv.x),
+            ink2_loop_blend_elem(dv.y, mv.y, gv.y, fv.y),
+            ink2_loop_blend_elem(dv.z, mv.z, gv.z, fv.z),
+            ink2_loop_blend_elem(dv.w, mv.w, gv.w, fv.w));
+        sq += (b.x * b.x + b.y * b.y) + (b.z * b.z + b.w * b.w);
+        if (fits_regs) {
+          if (step == 0) b0 = b;
+          else if (step == 1) b1 = b;
+          else if (step == 2) b2 = b;
+          else b3 = b;
+        }
+      }
+      sq = ink2_warp_sum(sq);
+      if (lane == 0) {
+        s_sq[warp] = sq;
+      }
+      __syncthreads();
+      if (warp == 0 && lane == 0) {
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          total += s_sq[w];
+        }
+        s_sq[0] = rsqrtf(total / static_cast<float>(D) + eps);
+      }
+      __syncthreads();
+      const float inv_rms = s_sq[0];
+
+      const float4* w4 = reinterpret_cast<const float4*>(norm_w) +
+          (norm_w_bcast ? 0 : static_cast<size_t>(g) * static_cast<size_t>(D4));
+      step = 0;
+      for (int i4 = tid; i4 < D4; i4 += 256, ++step) {
+        float4 b;
+        if (fits_regs) {
+          b = (step == 0) ? b0 : ((step == 1) ? b1 : ((step == 2) ? b2 : b3));
+        } else {
+          const float4 dv = ink2_load_f4(d_ptr, static_cast<size_t>(i4), d_f32);
+          const float4 mv = ink2_load_f4(m_ptr, static_cast<size_t>(i4), m_f32);
+          const float4 gv = ink2_load_f4(gf_ptr, static_cast<size_t>(i4), g_f32);
+          const float4 fv = ink2_load_f4(gf_ptr, static_cast<size_t>(D4 + i4), g_f32);
+          b = make_float4(
+              ink2_loop_blend_elem(dv.x, mv.x, gv.x, fv.x),
+              ink2_loop_blend_elem(dv.y, mv.y, gv.y, fv.y),
+              ink2_loop_blend_elem(dv.z, mv.z, gv.z, fv.z),
+              ink2_loop_blend_elem(dv.w, mv.w, gv.w, fv.w));
+        }
+        const float4 wv = w4[i4];
+        const float4 res = make_float4(
+            (b.x * inv_rms) * wv.x,
+            (b.y * inv_rms) * wv.y,
+            (b.z * inv_rms) * wv.z,
+            (b.w * inv_rms) * wv.w);
+        ink2_store_bf16x4(out, out_off4 + i4, res);
+      }
+    } else {
+      const size_t out_off = out_row * static_cast<size_t>(D);
+      float sq = 0.0f;
+      for (int i = tid; i < D; i += 256) {
+        const float dv = ink2_load_f1(d_ptr, static_cast<size_t>(i), d_f32);
+        const float mv = ink2_load_f1(m_ptr, static_cast<size_t>(i), m_f32);
+        const float gv = ink2_load_f1(gf_ptr, static_cast<size_t>(i), g_f32);
+        const float fv = ink2_load_f1(gf_ptr, static_cast<size_t>(D + i), g_f32);
+        const float b = ink2_loop_blend_elem(dv, mv, gv, fv);
+        sq += b * b;
+      }
+      sq = ink2_warp_sum(sq);
+      if (lane == 0) {
+        s_sq[warp] = sq;
+      }
+      __syncthreads();
+      if (warp == 0 && lane == 0) {
+        float total = 0.0f;
+#pragma unroll
+        for (int w = 0; w < 8; ++w) {
+          total += s_sq[w];
+        }
+        s_sq[0] = rsqrtf(total / static_cast<float>(D) + eps);
+      }
+      __syncthreads();
+      const float inv_rms = s_sq[0];
+      const float* w_row = norm_w +
+          (norm_w_bcast ? 0 : static_cast<size_t>(g) * static_cast<size_t>(D));
+      for (int i = tid; i < D; i += 256) {
+        const float dv = ink2_load_f1(d_ptr, static_cast<size_t>(i), d_f32);
+        const float mv = ink2_load_f1(m_ptr, static_cast<size_t>(i), m_f32);
+        const float gv = ink2_load_f1(gf_ptr, static_cast<size_t>(i), g_f32);
+        const float fv = ink2_load_f1(gf_ptr, static_cast<size_t>(D + i), g_f32);
+        const float b = ink2_loop_blend_elem(dv, mv, gv, fv);
+        out[out_off + i] = __float2bfloat16_rn((b * inv_rms) * w_row[i]);
+      }
+    }
+    if (t + static_cast<int>(gridDim.y) < T) {
+      __syncthreads();
+    }
+  }
+}
+)cuda"
+R"cuda(
+// ============================================================================
+// 9c. Fused LoopCtrl Up-Proj (BF16 TC MMA) + Tanh Gate + Exact No-FMA Blend
+//     + Sublayer RMSNorm -> BF16 (G=1 or G=3, rank=64, D <= 2304, D % 16 == 0)
+//     Eliminates [G, T, 2*D] gf DRAM materialization and [G, T, D] F32 blended.
+//     Grid: dim3(G, (T + 7) / 8, 1), Block: dim3(32, 8, 1)
+//     Dynamic SMEM: s_blend[8][D + 4] + s_h[8][72] + s_sq[8][8] + s_inv[8]
+// ============================================================================
+__global__ __launch_bounds__(256, 1) void ink2_loop_up_blend_rms_norm_cuda(
+    const char* __restrict__ dest,
+    const char* __restrict__ msg,
+    const char* __restrict__ h,
+    const nv_bfloat16* __restrict__ gf_w,
+    const float* __restrict__ norm_w,
+    nv_bfloat16* __restrict__ out,
+    int T,
+    int D,
+    int dest_bcast,
+    int msg_bcast,
+    int norm_w_bcast,
+    int dest_is_f32,
+    int msg_is_f32,
+    int h_is_f32,
+    float eps) {
+  const int g = static_cast<int>(blockIdx.x);
+  const int t0 = static_cast<int>(blockIdx.y) * 8;
+  if (t0 >= T) {
+    return;
+  }
+  const int n_rows = (T - t0 < 8) ? (T - t0) : 8;
+  const int lane = static_cast<int>(threadIdx.x);
+  const int warp = static_cast<int>(threadIdx.y);
+  const int tid = warp * 32 + lane;
+
+  extern __shared__ char smem_raw[];
+  const int blend_stride = D + 4;
+  const size_t blend_bytes =
+      static_cast<size_t>(8) * static_cast<size_t>(blend_stride) * sizeof(float);
+  constexpr size_t kHBytes = 8 * 72 * sizeof(nv_bfloat16);
+  constexpr size_t kSqBytes = 8 * 8 * sizeof(float);
+
+  float* s_blend = reinterpret_cast<float*>(smem_raw);
+  nv_bfloat16* s_h = reinterpret_cast<nv_bfloat16*>(smem_raw + blend_bytes);
+  float* s_sq = reinterpret_cast<float*>(smem_raw + blend_bytes + kHBytes);
+  float* s_inv =
+      reinterpret_cast<float*>(smem_raw + blend_bytes + kHBytes + kSqBytes);
+
+  // Cooperatively load h[g, t0..t0+8, 0..64] into padded s_h[8][72] (0 bank conflicts).
+  const bool h_f32 = (h_is_f32 != 0);
+  if (tid < 128) {
+    const int r = tid >> 4;
+    const int c4 = tid & 15;
+    nv_bfloat16* sh_row = s_h + r * 72;
+    if (r < n_rows) {
+      const size_t h_row =
+          static_cast<size_t>(g) * static_cast<size_t>(T) +
+          static_cast<size_t>(t0 + r);
+      if (h_f32) {
+        const float4 hv = reinterpret_cast<const float4*>(h)[h_row * 16 + c4];
+        ink2_store_bf16x4(sh_row, static_cast<size_t>(c4), hv);
+      } else {
+        reinterpret_cast<uint2*>(sh_row)[c4] =
+            reinterpret_cast<const uint2*>(h)[h_row * 16 + c4];
+      }
+    } else {
+      reinterpret_cast<uint2*>(sh_row)[c4] = make_uint2(0u, 0u);
+    }
+  }
+  __syncthreads();
+
+  // Preload this lane's 8 uint32 B-fragments from s_h[g_m][0..63] once for all c0 tiles.
+  const int g_m = lane >> 2;
+  const int t_m = lane & 3;
+  const int tok0 = 2 * t_m;
+  const int tok1 = tok0 + 1;
+  const unsigned int* hb =
+      reinterpret_cast<const unsigned int*>(s_h + g_m * 72) + t_m;
+  const unsigned int b0_0 = hb[0];
+  const unsigned int b1_0 = hb[4];
+  const unsigned int b0_1 = hb[8];
+  const unsigned int b1_1 = hb[12];
+  const unsigned int b0_2 = hb[16];
+  const unsigned int b1_2 = hb[20];
+  const unsigned int b0_3 = hb[24];
+  const unsigned int b1_3 = hb[28];
+
+  const bool d_f32 = (dest_is_f32 != 0);
+  const bool m_f32 = (msg_is_f32 != 0);
+  const size_t d_row_base0 =
+      (dest_bcast ? static_cast<size_t>(t0)
+                  : static_cast<size_t>(g) * static_cast<size_t>(T) +
+                        static_cast<size_t>(t0)) *
+      static_cast<size_t>(D);
+  const size_t m_row_base0 =
+      (msg_bcast ? static_cast<size_t>(t0)
+                 : static_cast<size_t>(g) * static_cast<size_t>(T) +
+                       static_cast<size_t>(t0)) *
+      static_cast<size_t>(D);
+  const size_t d_off0 =
+      d_row_base0 + static_cast<size_t>(tok0) * static_cast<size_t>(D);
+  const size_t m_off0 =
+      m_row_base0 + static_cast<size_t>(tok0) * static_cast<size_t>(D);
+  const size_t d_off1 =
+      d_row_base0 + static_cast<size_t>(tok1) * static_cast<size_t>(D);
+  const size_t m_off1 =
+      m_row_base0 + static_cast<size_t>(tok1) * static_cast<size_t>(D);
+
+  const unsigned int* gf_g_u32 =
+      reinterpret_cast<const unsigned int*>(gf_w) +
+      static_cast<size_t>(g) * static_cast<size_t>(D) * 64 + t_m;
+  const unsigned int* gf_f_u32 = gf_g_u32 + static_cast<size_t>(D) * 32;
+
+  float sq_even = 0.0f;
+  float sq_odd = 0.0f;
+
+  // Pass 1: MMA up-proj (gain & forget) + tanh + exact no-FMA blend -> s_blend + sum_sq.
+  for (int c0 = warp * 16; c0 < D; c0 += 128) {
+    const int r0 = c0 + g_m;
+    const int r1 = r0 + 8;
+
+    const unsigned int* wg0 = gf_g_u32 + static_cast<size_t>(r0) * 32;
+    const unsigned int* wg1 = gf_g_u32 + static_cast<size_t>(r1) * 32;
+    float dg0 = 0.0f, dg1 = 0.0f, dg2 = 0.0f, dg3 = 0.0f;
+    ink2_mma_m16n8k16_bf16(
+        dg0, dg1, dg2, dg3, wg0[0], wg1[0], wg0[4], wg1[4], b0_0, b1_0);
+    ink2_mma_m16n8k16_bf16(
+        dg0, dg1, dg2, dg3, wg0[8], wg1[8], wg0[12], wg1[12], b0_1, b1_1);
+    ink2_mma_m16n8k16_bf16(
+        dg0, dg1, dg2, dg3, wg0[16], wg1[16], wg0[20], wg1[20], b0_2, b1_2);
+    ink2_mma_m16n8k16_bf16(
+        dg0, dg1, dg2, dg3, wg0[24], wg1[24], wg0[28], wg1[28], b0_3, b1_3);
+
+    const unsigned int* wf0 = gf_f_u32 + static_cast<size_t>(r0) * 32;
+    const unsigned int* wf1 = gf_f_u32 + static_cast<size_t>(r1) * 32;
+    float df0 = 0.0f, df1 = 0.0f, df2 = 0.0f, df3 = 0.0f;
+    ink2_mma_m16n8k16_bf16(
+        df0, df1, df2, df3, wf0[0], wf1[0], wf0[4], wf1[4], b0_0, b1_0);
+    ink2_mma_m16n8k16_bf16(
+        df0, df1, df2, df3, wf0[8], wf1[8], wf0[12], wf1[12], b0_1, b1_1);
+    ink2_mma_m16n8k16_bf16(
+        df0, df1, df2, df3, wf0[16], wf1[16], wf0[20], wf1[20], b0_2, b1_2);
+    ink2_mma_m16n8k16_bf16(
+        df0, df1, df2, df3, wf0[24], wf1[24], wf0[28], wf1[28], b0_3, b1_3);
+
+    if (tok0 < n_rows) {
+      const float dv0 = ink2_load_f1(dest, d_off0 + static_cast<size_t>(r0), d_f32);
+      const float mv0 = ink2_load_f1(msg, m_off0 + static_cast<size_t>(r0), m_f32);
+      const float b0 = ink2_loop_blend_elem(dv0, mv0, dg0, df0);
+      s_blend[tok0 * blend_stride + r0] = b0;
+      sq_even = fmaf(b0, b0, sq_even);
+
+      const float dv2 = ink2_load_f1(dest, d_off0 + static_cast<size_t>(r1), d_f32);
+      const float mv2 = ink2_load_f1(msg, m_off0 + static_cast<size_t>(r1), m_f32);
+      const float b2 = ink2_loop_blend_elem(dv2, mv2, dg2, df2);
+      s_blend[tok0 * blend_stride + r1] = b2;
+      sq_even = fmaf(b2, b2, sq_even);
+    }
+    if (tok1 < n_rows) {
+      const float dv1 = ink2_load_f1(dest, d_off1 + static_cast<size_t>(r0), d_f32);
+      const float mv1 = ink2_load_f1(msg, m_off1 + static_cast<size_t>(r0), m_f32);
+      const float b1 = ink2_loop_blend_elem(dv1, mv1, dg1, df1);
+      s_blend[tok1 * blend_stride + r0] = b1;
+      sq_odd = fmaf(b1, b1, sq_odd);
+
+      const float dv3 = ink2_load_f1(dest, d_off1 + static_cast<size_t>(r1), d_f32);
+      const float mv3 = ink2_load_f1(msg, m_off1 + static_cast<size_t>(r1), m_f32);
+      const float b3 = ink2_loop_blend_elem(dv3, mv3, dg3, df3);
+      s_blend[tok1 * blend_stride + r1] = b3;
+      sq_odd = fmaf(b3, b3, sq_odd);
+    }
+  }
+
+  // Reduce sq_even / sq_odd across the 8 g_m lanes sharing the same t_m.
+  sq_even += __shfl_xor_sync(0xffffffffu, sq_even, 16);
+  sq_even += __shfl_xor_sync(0xffffffffu, sq_even, 8);
+  sq_even += __shfl_xor_sync(0xffffffffu, sq_even, 4);
+  sq_odd += __shfl_xor_sync(0xffffffffu, sq_odd, 16);
+  sq_odd += __shfl_xor_sync(0xffffffffu, sq_odd, 8);
+  sq_odd += __shfl_xor_sync(0xffffffffu, sq_odd, 4);
+  if (g_m == 0) {
+    s_sq[tok0 * 8 + warp] = sq_even;
+    s_sq[tok1 * 8 + warp] = sq_odd;
+  }
+  __syncthreads();
+
+  if (warp == 0 && lane < 8) {
+    float tot = 0.0f;
+#pragma unroll
+    for (int w = 0; w < 8; ++w) {
+      tot += s_sq[lane * 8 + w];
+    }
+    s_inv[lane] = rsqrtf(tot / static_cast<float>(D) + eps);
+  }
+  __syncthreads();
+
+  // Pass 2: RMSNorm + coalesced BF16x4 store.
+  const int D4 = D >> 2;
+  const float4* w4 = reinterpret_cast<const float4*>(norm_w) +
+      (norm_w_bcast ? 0 : static_cast<size_t>(g) * static_cast<size_t>(D4));
+  const size_t out_base4 =
+      (static_cast<size_t>(g) * static_cast<size_t>(T) + static_cast<size_t>(t0)) *
+      static_cast<size_t>(D4);
+  for (int tok = 0; tok < n_rows; ++tok) {
+    const float inv_rms = s_inv[tok];
+    const float4* b4 =
+        reinterpret_cast<const float4*>(s_blend + tok * blend_stride);
+    const size_t row_out4 =
+        out_base4 + static_cast<size_t>(tok) * static_cast<size_t>(D4);
+    for (int i4 = tid; i4 < D4; i4 += 256) {
+      const float4 b = b4[i4];
+      const float4 wv = w4[i4];
+      const float4 res = make_float4(
+          (b.x * inv_rms) * wv.x,
+          (b.y * inv_rms) * wv.y,
+          (b.z * inv_rms) * wv.z,
+          (b.w * inv_rms) * wv.w);
+      ink2_store_bf16x4(out, row_out4 + i4, res);
+    }
+  }
+}
+)cuda"

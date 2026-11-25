@@ -7,7 +7,8 @@ R"cuda(
 //   E = 128, top_k = 8, H = 2304, I = 1152, route_scale = 8.0, no shared expert
 //   Self-contained NVRTC CUDA (zero CuTe headers; safe on Windows CUDA!)
 //   Modes: 0=NVFP4, 1=SymQ8, 2=AffineQ8, 3=Q5_K (gate_up only), 4=MXFP8
-//   BM = 32, BN = 64, 4 warps/CTA, 2-stage cp.async.cg + Tensor Core MMA, 0 B spills
+//   BM = 64, BN = 128, BK = 64, 8 warps/CTA (Q5_K uses BM=32/BN=64), 2-stage
+//   cp.async.cg/ca + HW FP4/FP8 PTX cvt + Tensor Core MMA, 0 B spills
 // ============================================================================
 
 __device__ __forceinline__ unsigned int i2p_pack_bf16x2(float f0, float f1) {
@@ -24,14 +25,28 @@ __device__ __forceinline__ float i2p_sum_bf16x8(const uint4& v) {
   return ((f0.x + f0.y) + (f1.x + f1.y)) + ((f2.x + f2.y) + (f3.x + f3.y));
 }
 
-__device__ __forceinline__ float i2p_decode_fp8_e4m3(unsigned int bits) {
-  const unsigned int v = bits & 127u;
-  const unsigned int sign_bit = (bits & 128u) << 8;
-  const unsigned int u = (v << 7) | (((v + 1u) >> 7) << 14) | sign_bit;
-  return __half2float(__ushort_as_half(static_cast<unsigned short>(u))) * 256.0f;
-}
+// PTX ISA 9.2 (CUDA 13.2+) Blackwell arch-specific direct FP4/FP8 -> bf16x2 conversions.
+// Earlier toolchains (e.g. CUDA 13.0 on Blackwell) fall back to PTX 8.1 cvt.rn.f16x2.e4m3x2
+// for FP8 and the SMEM E2M1 LUT for NVFP4 so NVRTC never emits unsupported PTX 9.2 ops.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
+    (defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__)) && \
+    defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2))
+#define I2P_HAS_HW_FP4_CVT 1
+#else
+#define I2P_HAS_HW_FP4_CVT 0
+#endif
 
-__device__ __forceinline__ unsigned int i2p_decode_fp8_e4m3x2_bf16x2(unsigned int pair16) {
+// PTX ISA 8.1 (CUDA 12.1+) Ada/Hopper/Blackwell FP8 E4M3FN -> f16x2 conversion.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && \
+    defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 1))
+#define I2P_HAS_HW_FP8_F16_CVT 1
+#else
+#define I2P_HAS_HW_FP8_F16_CVT 0
+#endif
+
+__device__ __forceinline__ float2 i2p_decode_fp8_e4m3x2_unscaled(unsigned int pair16) {
   const unsigned int b0 = pair16 & 0xFFu;
   const unsigned int b1 = (pair16 >> 8) & 0xFFu;
   const unsigned int v0 = b0 & 127u;
@@ -39,8 +54,42 @@ __device__ __forceinline__ unsigned int i2p_decode_fp8_e4m3x2_bf16x2(unsigned in
   const unsigned int h0 = (v0 << 7) | (((v0 + 1u) >> 7) << 14) | ((b0 & 128u) << 8);
   const unsigned int h1 = (v1 << 7) | (((v1 + 1u) >> 7) << 14) | ((b1 & 128u) << 8);
   const unsigned int h2 = h0 | (h1 << 16);
+  return __half22float2(*reinterpret_cast<const __half2*>(&h2));
+}
+
+// Exact 0-ULP 2x FP8 E4M3FN -> float2 (1-instr HW PTX on Ada/Hopper/Blackwell).
+__device__ __forceinline__ float2 i2p_fast_e4m3x2_to_f2(unsigned short pair16) {
+#if I2P_HAS_HW_FP4_CVT
+  unsigned int bf2;
+  asm("{ cvt.rn.bf16x2.e4m3x2 %0, %1; }" : "=r"(bf2) : "h"(pair16));
+  return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bf2));
+#elif I2P_HAS_HW_FP8_F16_CVT
+  unsigned int h2;
+  asm("{ cvt.rn.f16x2.e4m3x2 %0, %1; }" : "=r"(h2) : "h"(pair16));
+  return __half22float2(*reinterpret_cast<const __half2*>(&h2));
+#else
+  const float2 f = i2p_decode_fp8_e4m3x2_unscaled(pair16);
+  return make_float2(f.x * 256.0f, f.y * 256.0f);
+#endif
+}
+
+// Exact 0-ULP 2x FP8 E4M3FN -> bf16x2 (scale 1.0) for BF16 Tensor Cores.
+__device__ __forceinline__ unsigned int i2p_decode_fp8_e4m3x2_bf16x2(unsigned int pair16) {
+#if I2P_HAS_HW_FP4_CVT
+  unsigned int bf2;
+  const unsigned short p16 = static_cast<unsigned short>(pair16);
+  asm("{ cvt.rn.bf16x2.e4m3x2 %0, %1; }" : "=r"(bf2) : "h"(p16));
+  return bf2;
+#elif I2P_HAS_HW_FP8_F16_CVT
+  unsigned int h2;
+  const unsigned short p16 = static_cast<unsigned short>(pair16);
+  asm("{ cvt.rn.f16x2.e4m3x2 %0, %1; }" : "=r"(h2) : "h"(p16));
   const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+  return i2p_pack_bf16x2(f.x, f.y);
+#else
+  const float2 f = i2p_decode_fp8_e4m3x2_unscaled(pair16);
   return i2p_pack_bf16x2(f.x * 256.0f, f.y * 256.0f);
+#endif
 }
 
 __device__ __forceinline__ float i2p_decode_ue8m0(unsigned int b) {
@@ -56,6 +105,19 @@ __device__ __forceinline__ unsigned int i2p_e2m1_to_bf16(unsigned int nib) {
 
 __device__ __forceinline__ unsigned int i2p_e2m1x2_to_bf16x2(unsigned int byte8) {
   return i2p_e2m1_to_bf16(byte8 & 0xFu) | (i2p_e2m1_to_bf16((byte8 >> 4) & 0xFu) << 16);
+}
+
+// Bit-exact 2x E2M1 -> bf16x2 (1-instr hardware PTX on Blackwell sm_100a/120a/121a).
+__device__ __forceinline__ unsigned int i2p_fast_e2m1x2_to_bf16x2(unsigned int byte8) {
+#if I2P_HAS_HW_FP4_CVT
+  unsigned int out;
+  const unsigned short tmp = static_cast<unsigned short>(byte8);
+  asm("{ .reg .b8 b0, b1; mov.b16 {b0, b1}, %1; cvt.rn.bf16x2.e2m1x2 %0, b0; }"
+      : "=r"(out) : "h"(tmp));
+  return out;
+#else
+  return i2p_e2m1x2_to_bf16x2(byte8);
+#endif
 }
 
 __device__ __forceinline__ float i2p_read_f16_or_bf16(unsigned short raw, int is_bf16) {
@@ -266,7 +328,7 @@ extern "C" __global__ __launch_bounds__(256, 4) void inkling2_moe_prefill_topk(
 }
 
 // ---------------------------------------------------------------------------
-// 2B. Prefill Counting Sort + BM=32 Tile Table (E = 128)
+// 2B. Prefill Counting Sort + Variable BM (32 or 64) Tile Table (E = 128)
 //     Grid: 1, Block: 256.
 // ---------------------------------------------------------------------------
 extern "C" __global__ __launch_bounds__(256) void inkling2_moe_prefill_route_sort(
@@ -277,10 +339,13 @@ extern "C" __global__ __launch_bounds__(256) void inkling2_moe_prefill_route_sor
     int* __restrict__ tile_begin,
     int* __restrict__ tile_end,
     int* __restrict__ num_tiles,
-    int P) {
+    int P,
+    int bm_shift) {
   const int tid = threadIdx.x;
   const int lane = tid & 31;
   const int warp = tid >> 5;
+  const int bm = 1 << bm_shift;
+  const int bm_mask = bm - 1;
 
   __shared__ int s_cnt[128];
   __shared__ int s_cursor[128];
@@ -298,7 +363,7 @@ extern "C" __global__ __launch_bounds__(256) void inkling2_moe_prefill_route_sor
   int c = 0, nt = 0, scan_c = 0, scan_t = 0;
   if (tid < 128) {
     c = s_cnt[tid];
-    nt = (c + 31) >> 5;
+    nt = (c + bm_mask) >> bm_shift;
     scan_c = c;
     scan_t = nt;
 #pragma unroll
@@ -337,8 +402,8 @@ extern "C" __global__ __launch_bounds__(256) void inkling2_moe_prefill_route_sor
     if (c > 0) {
       const int ts = s_wt[warp] + (scan_t - nt);
       for (int k = 0; k < nt; ++k) {
-        const int b = row_start + k * 32;
-        const int en = (b + 32 < row_start + c) ? (b + 32) : (row_start + c);
+        const int b = row_start + (k << bm_shift);
+        const int en = (b + bm < row_start + c) ? (b + bm) : (row_start + c);
         tile_expert[ts + k] = tid;
         tile_begin[ts + k] = b;
         tile_end[ts + k] = en;
@@ -406,13 +471,14 @@ extern "C" __global__ __launch_bounds__(256) void inkling2_moe_prefill_quantize_
 )cuda"
 R"cuda(
 // ---------------------------------------------------------------------------
-// 3A. Prefill Gate + Up + SiTU(4, 25) BM=32, BN=64, BK=64 (NVFP4/SymQ8/AffineQ8/MXFP8)
-//     2-stage double-buffered cp.async.cg/ca weights + x, BF16 Tensor Core MMA.
-//     13.5..18.0 KB SMEM => 4 CTAs/SM (192 CTAs in flight!), 0 B register spills!
-//     Grid: dim3(18, max_tiles, 1), Block: dim3(32, 4).
+// 3A. Prefill Gate + Up + SiTU(4, 25) BM=64, BN=128, BK=64 (NVFP4/SymQ8/AffineQ8/MXFP8)
+//     8 warps (256 thr), 2-stage double-buffered cp.async.cg/ca weights + x +
+//     async MXFP8 scales, 1-instr HW FP4/FP8 PTX decode, 0 bank conflicts, 0 B spills!
+//     NVFP4: 25.25 KB SMEM (2 CTAs/SM <= 64 KB); 8-bit: 33.3..34.3 KB (2 CTAs/SM <= 100 KB).
+//     Grid: dim3(9, max_tiles, 1), Block: dim3(32, 8).
 // ---------------------------------------------------------------------------
 template <int MODE, bool INTERLEAVED>
-__global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32(
+__global__ __launch_bounds__(256, 2) void inkling2_moe_prefill_gate_up_situ_bm64(
     const unsigned int* __restrict__ gu_w,
     const void* __restrict__ gu_scales,
     const void* __restrict__ gu_biases,
@@ -435,9 +501,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
 
   constexpr int I = 1152;
   constexpr int N2 = 2304;
+  constexpr int BN = 128;
   constexpr int W_U4 = (MODE == 0) ? 2 : 4;
   constexpr int ROW_W_U4 = (MODE == 0) ? 72 : 144;
-  const int base_row = blockIdx.x * 64;
+  constexpr int X_SWIZ_SHIFT = (MODE == 0) ? 1 : 2;
+  constexpr int X_SWIZ_MASK = (MODE == 0) ? 3 : 1;
+  const int base_row = blockIdx.x * BN;
 
   const int lane = threadIdx.x;
   const int warp = threadIdx.y;
@@ -445,19 +514,27 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
   const int g = lane >> 2;
   const int t = lane & 3;
 
-  union SharedGu32 {
+  union SharedGu64 {
     struct {
-      alignas(16) uint4 w[2][64][W_U4];
-      alignas(16) uint4 x[2][32][8];
-      alignas(16) unsigned int sc[2][64];
-      alignas(16) unsigned int bi[MODE == 2 ? 2 : 1][64];
-      alignas(16) int tok[32];
+      alignas(16) uint4 w[2][BN][W_U4];
+      alignas(16) uint4 x[2][64][8];
+      alignas(16) unsigned int sc[2][BN];
+      alignas(16) unsigned int bi[MODE == 2 ? 2 : 1][BN];
+      alignas(16) int tok[64];
     } pipe;
-    alignas(16) nv_bfloat16 s_out[4][16][16];
+    alignas(16) nv_bfloat16 s_out[8][16][16];
   };
-  __shared__ SharedGu32 sh;
+  __shared__ SharedGu64 sh;
+#if !I2P_HAS_HW_FP4_CVT
+  __shared__ unsigned int s_e2m1_lut[MODE == 0 ? 256 : 1];
+  if constexpr (MODE == 0) {
+    s_e2m1_lut[tid] = i2p_e2m1x2_to_bf16x2(static_cast<unsigned int>(tid));
+  } else {
+    (void)s_e2m1_lut;
+  }
+#endif
 
-  if (tid < 32) sh.pipe.tok[tid] = (tid < cnt) ? (sorted_pairs[begin + tid] >> 3) : -1;
+  if (tid < 64) sh.pipe.tok[tid] = (tid < cnt) ? (sorted_pairs[begin + tid] >> 3) : -1;
   __syncthreads();
 
   const size_t exp_base = static_cast<size_t>(expert) * N2;
@@ -476,8 +553,8 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
       const int r = tid >> 1;
       const int c = tid & 1;
       const size_t ri = row_idx_of(r, is_up);
-      ptx_cp_async16_cg(&sh.pipe.w[wst][r][c ^ (r & 1)], w_u4 + ri * ROW_W_U4 + step * 2 + c);
-      if (tid < 64) {
+      ptx_cp_async16_cg(&sh.pipe.w[wst][r][c ^ ((r >> 2) & 1)], w_u4 + ri * ROW_W_U4 + step * 2 + c);
+      if (tid < BN) {
         const size_t sr = row_idx_of(tid, is_up);
         ptx_cp_async4_ca(&sh.pipe.sc[wst][tid],
                          reinterpret_cast<const unsigned int*>(gu_scales) + sr * 36 + step);
@@ -485,23 +562,25 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
     } else {
 #pragma unroll
       for (int iter = 0; iter < 2; ++iter) {
-        const int idx = tid + iter * 128;
+        const int idx = tid + iter * 256;
         const int r = idx >> 2;
         const int c = idx & 3;
         const size_t ri = row_idx_of(r, is_up);
         ptx_cp_async16_cg(&sh.pipe.w[wst][r][c ^ (r & 3)], w_u4 + ri * ROW_W_U4 + step * 4 + c);
       }
-      if (tid < 64) {
+      if (tid < BN) {
         const size_t sr = row_idx_of(tid, is_up);
         if constexpr (MODE == 4) {
-          sh.pipe.sc[wst][tid] = static_cast<unsigned int>(
-              reinterpret_cast<const unsigned short*>(gu_scales)[sr * 36 + step]);
+          if ((step & 1) == 0) {
+            ptx_cp_async4_ca(&sh.pipe.sc[wst][tid],
+                             reinterpret_cast<const unsigned int*>(gu_scales) + sr * 18 + (step >> 1));
+          }
         } else {
           ptx_cp_async4_ca(&sh.pipe.sc[wst][tid],
                            reinterpret_cast<const unsigned int*>(gu_scales) + sr * 36 + step);
         }
       } else if constexpr (MODE == 2) {
-        const int r = tid - 64;
+        const int r = tid - BN;
         const size_t sr = row_idx_of(r, is_up);
         ptx_cp_async4_ca(&sh.pipe.bi[wst][r],
                          reinterpret_cast<const unsigned int*>(gu_biases) + sr * 36 + step);
@@ -511,11 +590,11 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
 
   auto load_x = [&](int xst, int step) {
     const int total_x = load_x_rows * 8;
-    for (int idx = tid; idx < total_x; idx += 128) {
+    for (int idx = tid; idx < total_x; idx += 256) {
       const int r = idx >> 3;
       const int c = idx & 7;
       const int tok = sh.pipe.tok[r];
-      uint4* dst = &sh.pipe.x[xst][r][c ^ (r & 7)];
+      uint4* dst = &sh.pipe.x[xst][r][c ^ ((r & X_SWIZ_MASK) << X_SWIZ_SHIFT)];
       if (tok >= 0) ptx_cp_async16_ca(dst, x_u4 + static_cast<size_t>(tok) * 288 + step * 8 + c);
       else *dst = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -529,50 +608,68 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
 
   const int r0 = warp * 16 + g;
   const int r1 = r0 + 8;
-  float g_tot[4][4] = {{0.0f}};
-  float u_tot[4][4] = {{0.0f}};
+  float g_tot[8][4];
+  float u_tot[8][4];
+#pragma unroll
+  for (int ms = 0; ms < 8; ++ms) {
+    g_tot[ms][0] = g_tot[ms][1] = g_tot[ms][2] = g_tot[ms][3] = 0.0f;
+    u_tot[ms][0] = u_tot[ms][1] = u_tot[ms][2] = u_tot[ms][3] = 0.0f;
+  }
 
-  auto compute_mat = [&](int wst, int xst, float tot[4][4]) {
+  auto compute_mat = [&](int wst, int xst, int step, float tot[8][4]) {
     if constexpr (MODE == 0) {
       const unsigned int sc_w0 = sh.pipe.sc[wst][r0];
       const unsigned int sc_w1 = sh.pipe.sc[wst][r1];
+      const int sw0 = (r0 >> 2) & 1;
+      const int sw1 = (r1 >> 2) & 1;
+#pragma unroll 1
+      for (int lg2 = 0; lg2 < 2; ++lg2) {
+        const float2 sf0 = i2p_fast_e4m3x2_to_f2(static_cast<unsigned short>(sc_w0 >> (lg2 * 16)));
+        const float2 sf1 = i2p_fast_e4m3x2_to_f2(static_cast<unsigned short>(sc_w1 >> (lg2 * 16)));
+        const unsigned short* wp0 = reinterpret_cast<const unsigned short*>(&sh.pipe.w[wst][r0][lg2 ^ sw0]);
+        const unsigned short* wp1 = reinterpret_cast<const unsigned short*>(&sh.pipe.w[wst][r1][lg2 ^ sw1]);
 #pragma unroll
-      for (int lg = 0; lg < 4; ++lg) {
-        const int col_u4 = lg >> 1;
-        const int sub_u16 = (lg & 1) * 4 + t;
-        const unsigned short w0 = reinterpret_cast<const unsigned short*>(
-            &sh.pipe.w[wst][r0][col_u4 ^ (r0 & 1)])[sub_u16];
-        const unsigned short w1 = reinterpret_cast<const unsigned short*>(
-            &sh.pipe.w[wst][r1][col_u4 ^ (r1 & 1)])[sub_u16];
-        const unsigned int a0 = i2p_e2m1x2_to_bf16x2(w0 & 0xFFu);
-        const unsigned int a2 = i2p_e2m1x2_to_bf16x2(w0 >> 8);
-        const unsigned int a1 = i2p_e2m1x2_to_bf16x2(w1 & 0xFFu);
-        const unsigned int a3 = i2p_e2m1x2_to_bf16x2(w1 >> 8);
-        const float sc0 = i2p_decode_fp8_e4m3((sc_w0 >> (lg * 8)) & 0xFFu);
-        const float sc1 = i2p_decode_fp8_e4m3((sc_w1 >> (lg * 8)) & 0xFFu);
-        const int x_col = lg * 2 + (t >> 1);
-        const int x_hf = t & 1;
+        for (int sub = 0; sub < 2; ++sub) {
+          const int lg = lg2 * 2 + sub;
+          const unsigned short w0 = wp0[sub * 4 + t];
+          const unsigned short w1 = wp1[sub * 4 + t];
+#if I2P_HAS_HW_FP4_CVT
+          const unsigned int a0 = i2p_fast_e2m1x2_to_bf16x2(w0 & 0xFFu);
+          const unsigned int a2 = i2p_fast_e2m1x2_to_bf16x2(w0 >> 8);
+          const unsigned int a1 = i2p_fast_e2m1x2_to_bf16x2(w1 & 0xFFu);
+          const unsigned int a3 = i2p_fast_e2m1x2_to_bf16x2(w1 >> 8);
+#else
+          const unsigned int a0 = s_e2m1_lut[w0 & 0xFFu];
+          const unsigned int a2 = s_e2m1_lut[w0 >> 8];
+          const unsigned int a1 = s_e2m1_lut[w1 & 0xFFu];
+          const unsigned int a3 = s_e2m1_lut[w1 >> 8];
+#endif
+          const float sc0 = (sub == 0) ? sf0.x : sf0.y;
+          const float sc1 = (sub == 0) ? sf1.x : sf1.y;
+          const int x_col = (lg * 2 + (t >> 1)) ^ ((g & 3) << 1);
+          const int x_hf = t & 1;
 #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
-          if (ms < n_slices) {
-            const int rx = ms * 8 + g;
-            const uint2 xv = reinterpret_cast<const uint2*>(
-                &sh.pipe.x[xst][rx][x_col ^ (rx & 7)])[x_hf];
-            float d0, d1, d2, d3;
-            ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, a0, a1, a2, a3, xv.x, xv.y);
-            tot[ms][0] = fmaf(sc0, d0, tot[ms][0]);
-            tot[ms][1] = fmaf(sc0, d1, tot[ms][1]);
-            tot[ms][2] = fmaf(sc1, d2, tot[ms][2]);
-            tot[ms][3] = fmaf(sc1, d3, tot[ms][3]);
+          for (int ms = 0; ms < 8; ++ms) {
+            if (ms < n_slices) {
+              const int rx = ms * 8 + g;
+              const uint2 xv = reinterpret_cast<const uint2*>(
+                  &sh.pipe.x[xst][rx][x_col])[x_hf];
+              float d0, d1, d2, d3;
+              ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, a0, a1, a2, a3, xv.x, xv.y);
+              tot[ms][0] = fmaf(sc0, d0, tot[ms][0]);
+              tot[ms][1] = fmaf(sc0, d1, tot[ms][1]);
+              tot[ms][2] = fmaf(sc1, d2, tot[ms][2]);
+              tot[ms][3] = fmaf(sc1, d3, tot[ms][3]);
+            }
           }
         }
       }
     } else {
       const unsigned int sc_w0 = sh.pipe.sc[wst][r0];
       const unsigned int sc_w1 = sh.pipe.sc[wst][r1];
-      const unsigned int bi_w0 = (MODE == 2) ? sh.pipe.bi[wst][r0] : 0u;
-      const unsigned int bi_w1 = (MODE == 2) ? sh.pipe.bi[wst][r1] : 0u;
-      (void)bi_w0; (void)bi_w1;
+      [[maybe_unused]] const unsigned int bi_w0 = (MODE == 2) ? sh.pipe.bi[wst][r0] : 0u;
+      [[maybe_unused]] const unsigned int bi_w1 = (MODE == 2) ? sh.pipe.bi[wst][r1] : 0u;
+      [[maybe_unused]] const int sc_half_sh = (step & 1) * 16;
 #pragma unroll
       for (int lg = 0; lg < 2; ++lg) {
         const int col_u4 = lg * 2 + (t >> 1);
@@ -585,11 +682,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
         i2p_unpack8_to_bf16x2<MODE>(w0, wb0);
         i2p_unpack8_to_bf16x2<MODE>(w1, wb1);
 
-        float sc0, sc1, bi0 = 0.0f, bi1 = 0.0f;
-        (void)bi0; (void)bi1;
+        float sc0, sc1;
+        [[maybe_unused]] float bi0 = 0.0f;
+        [[maybe_unused]] float bi1 = 0.0f;
         if constexpr (MODE == 4) {
-          sc0 = i2p_decode_ue8m0((sc_w0 >> (lg * 8)) & 0xFFu);
-          sc1 = i2p_decode_ue8m0((sc_w1 >> (lg * 8)) & 0xFFu);
+          sc0 = i2p_decode_ue8m0((sc_w0 >> (sc_half_sh + lg * 8)) & 0xFFu);
+          sc1 = i2p_decode_ue8m0((sc_w1 >> (sc_half_sh + lg * 8)) & 0xFFu);
         } else {
           sc0 = i2p_read_f16_or_bf16(static_cast<unsigned short>(sc_w0 >> (lg * 16)), sb_is_bf16);
           sc1 = i2p_read_f16_or_bf16(static_cast<unsigned short>(sc_w1 >> (lg * 16)), sb_is_bf16);
@@ -598,12 +696,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
             bi1 = i2p_read_f16_or_bf16(static_cast<unsigned short>(bi_w1 >> (lg * 16)), sb_is_bf16);
           }
         }
-        const int x_col = lg * 4 + t;
+        const int x_col = (lg * 4 + t) ^ ((g & 1) << 2);
 #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
+        for (int ms = 0; ms < 8; ++ms) {
           if (ms < n_slices) {
             const int rx = ms * 8 + g;
-            const uint4 xv = sh.pipe.x[xst][rx][x_col ^ (rx & 7)];
+            const uint4 xv = sh.pipe.x[xst][rx][x_col];
             float d0, d1, d2, d3;
             ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, wb0[0], wb1[0], wb0[1], wb1[1], xv.x, xv.y);
             ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, wb0[2], wb1[2], wb0[3], wb1[3], xv.z, xv.w);
@@ -642,7 +740,7 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
       ptx_cp_commit();
     }
 
-    compute_mat(0, cur_x, g_tot);
+    compute_mat(0, cur_x, step, g_tot);
 
     if (has_nxt) ptx_cp_wait<1>();
     else ptx_cp_wait<0>();
@@ -653,7 +751,7 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
       ptx_cp_commit();
     }
 
-    compute_mat(1, cur_x, u_tot);
+    compute_mat(1, cur_x, step, u_tot);
 
     if (has_nxt) {
       ptx_cp_wait<0>();
@@ -663,9 +761,9 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_gate_up_situ_bm32
   __syncthreads();
 
   const int w_col0 = base_row + warp * 16;
-  const int n_passes = (cnt > 16) ? 2 : 1;
+  const int n_passes = (cnt + 15) >> 4;
 #pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
+  for (int pass = 0; pass < 4; ++pass) {
     if (pass < n_passes) {
       const int s0 = pass * 2;
       const int s1 = s0 + 1;
@@ -922,12 +1020,14 @@ __global__ __launch_bounds__(128, 2) void inkling2_moe_prefill_gate_up_situ_q5k_
 )cuda"
 R"cuda(
 // ---------------------------------------------------------------------------
-// 4. Prefill Down Projection BM=32, BN=64, BK=64 (NVFP4/SymQ8/AffineQ8/MXFP8)
-//    K = 1152 (18 steps), N = 2304 (36 N-tiles), 2-stage cp.async + BF16 MMA!
-//    Grid: dim3(36, max_tiles, 1), Block: dim3(32, 4).
+// 4. Prefill Down Projection BM=64, BN=128, BK=64 (NVFP4/SymQ8/AffineQ8/MXFP8)
+//    K = 1152 (18 steps), N = 2304 (18 N-tiles), 8 warps (256 thr), 2-stage
+//    cp.async + async MXFP8 scales + HW FP4/FP8 PTX decode + BF16 MMA, 0 spills!
+//    Handles both BM=64 and BM=32 tiles (via dynamic n_slices / n_passes).
+//    Grid: dim3(18, max_tiles, 1), Block: dim3(32, 8).
 // ---------------------------------------------------------------------------
 template <int MODE>
-__global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
+__global__ __launch_bounds__(256, MODE == 0 ? 3 : 2) void inkling2_moe_prefill_down_bm64(
     const unsigned int* __restrict__ dn_w,
     const void* __restrict__ dn_scales,
     const void* __restrict__ dn_biases,
@@ -947,9 +1047,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
   if (cnt <= 0) return;
 
   constexpr int N = 2304;
+  constexpr int BN = 128;
   constexpr int W_U4 = (MODE == 0) ? 2 : 4;
   constexpr int ROW_W_U4 = (MODE == 0) ? 36 : 72;
-  const int base_row = blockIdx.x * 64;
+  constexpr int X_SWIZ_SHIFT = (MODE == 0) ? 1 : 2;
+  constexpr int X_SWIZ_MASK = (MODE == 0) ? 3 : 1;
+  const int base_row = blockIdx.x * BN;
 
   const int lane = threadIdx.x;
   const int warp = threadIdx.y;
@@ -957,17 +1060,25 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
   const int g = lane >> 2;
   const int t = lane & 3;
 
-  struct StageDn32 {
-    alignas(16) uint4 x[32][8];
-    alignas(16) uint4 w[64][W_U4];
-    alignas(16) unsigned int sc[64];
-    alignas(16) unsigned int bi[MODE == 2 ? 64 : 1];
+  struct StageDn64 {
+    alignas(16) uint4 x[64][8];
+    alignas(16) uint4 w[BN][W_U4];
+    alignas(16) unsigned int sc[BN];
+    alignas(16) unsigned int bi[MODE == 2 ? BN : 1];
   };
-  union SharedDn32 {
-    StageDn32 st[2];
-    alignas(16) nv_bfloat16 s_out[4][16][16];
+  union SharedDn64 {
+    StageDn64 st[2];
+    alignas(16) nv_bfloat16 s_out[8][16][16];
   };
-  __shared__ SharedDn32 sh;
+  __shared__ SharedDn64 sh;
+#if !I2P_HAS_HW_FP4_CVT
+  __shared__ unsigned int s_e2m1_lut[MODE == 0 ? 256 : 1];
+  if constexpr (MODE == 0) {
+    s_e2m1_lut[tid] = i2p_e2m1x2_to_bf16x2(static_cast<unsigned int>(tid));
+  } else {
+    (void)s_e2m1_lut;
+  }
+#endif
 
   const size_t exp_row0 = static_cast<size_t>(expert) * N + base_row;
   const uint4* w_u4 = reinterpret_cast<const uint4*>(dn_w) + exp_row0 * ROW_W_U4;
@@ -979,40 +1090,42 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
     if constexpr (MODE == 0) {
       const int r = tid >> 1;
       const int c = tid & 1;
-      ptx_cp_async16_cg(&sh.st[s_idx].w[r][c ^ (r & 1)],
+      ptx_cp_async16_cg(&sh.st[s_idx].w[r][c ^ ((r >> 2) & 1)],
                         w_u4 + static_cast<size_t>(r) * ROW_W_U4 + step * 2 + c);
-      if (tid < 64) {
+      if (tid < BN) {
         ptx_cp_async4_ca(&sh.st[s_idx].sc[tid],
                          reinterpret_cast<const unsigned int*>(dn_scales) + (exp_row0 + tid) * 18 + step);
       }
     } else {
 #pragma unroll
       for (int iter = 0; iter < 2; ++iter) {
-        const int idx = tid + iter * 128;
+        const int idx = tid + iter * 256;
         const int r = idx >> 2;
         const int c = idx & 3;
         ptx_cp_async16_cg(&sh.st[s_idx].w[r][c ^ (r & 3)],
                           w_u4 + static_cast<size_t>(r) * ROW_W_U4 + step * 4 + c);
       }
-      if (tid < 64) {
+      if (tid < BN) {
         if constexpr (MODE == 4) {
-          sh.st[s_idx].sc[tid] = static_cast<unsigned int>(
-              reinterpret_cast<const unsigned short*>(dn_scales)[(exp_row0 + tid) * 18 + step]);
+          if ((step & 1) == 0) {
+            ptx_cp_async4_ca(&sh.st[(step >> 1) & 1].sc[tid],
+                             reinterpret_cast<const unsigned int*>(dn_scales) + (exp_row0 + tid) * 9 + (step >> 1));
+          }
         } else {
           ptx_cp_async4_ca(&sh.st[s_idx].sc[tid],
                            reinterpret_cast<const unsigned int*>(dn_scales) + (exp_row0 + tid) * 18 + step);
         }
       } else if constexpr (MODE == 2) {
-        const int r = tid - 64;
+        const int r = tid - BN;
         ptx_cp_async4_ca(&sh.st[s_idx].bi[r],
                          reinterpret_cast<const unsigned int*>(dn_biases) + (exp_row0 + r) * 18 + step);
       }
     }
     const int total_x = load_x_rows * 8;
-    for (int idx = tid; idx < total_x; idx += 128) {
+    for (int idx = tid; idx < total_x; idx += 256) {
       const int r = idx >> 3;
       const int c = idx & 7;
-      uint4* dst = &sh.st[s_idx].x[r][c ^ (r & 7)];
+      uint4* dst = &sh.st[s_idx].x[r][c ^ ((r & X_SWIZ_MASK) << X_SWIZ_SHIFT)];
       if (r < cnt) ptx_cp_async16_ca(dst, mid_u4 + static_cast<size_t>(begin + r) * 144 + step * 8 + c);
       else *dst = make_uint4(0u, 0u, 0u, 0u);
     }
@@ -1021,7 +1134,11 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
 
   load_stage(0, 0);
 
-  float tot[4][4] = {{0.0f}};
+  float tot[8][4];
+#pragma unroll
+  for (int ms = 0; ms < 8; ++ms) {
+    tot[ms][0] = tot[ms][1] = tot[ms][2] = tot[ms][3] = 0.0f;
+  }
   const int r0 = warp * 16 + g;
   const int r1 = r0 + 8;
 
@@ -1040,43 +1157,57 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
     if constexpr (MODE == 0) {
       const unsigned int sc_w0 = sh.st[cur].sc[r0];
       const unsigned int sc_w1 = sh.st[cur].sc[r1];
+      const int sw0 = (r0 >> 2) & 1;
+      const int sw1 = (r1 >> 2) & 1;
+#pragma unroll 1
+      for (int lg2 = 0; lg2 < 2; ++lg2) {
+        const float2 sf0 = i2p_fast_e4m3x2_to_f2(static_cast<unsigned short>(sc_w0 >> (lg2 * 16)));
+        const float2 sf1 = i2p_fast_e4m3x2_to_f2(static_cast<unsigned short>(sc_w1 >> (lg2 * 16)));
+        const unsigned short* wp0 = reinterpret_cast<const unsigned short*>(&sh.st[cur].w[r0][lg2 ^ sw0]);
+        const unsigned short* wp1 = reinterpret_cast<const unsigned short*>(&sh.st[cur].w[r1][lg2 ^ sw1]);
 #pragma unroll
-      for (int lg = 0; lg < 4; ++lg) {
-        const int col_u4 = lg >> 1;
-        const int sub_u16 = (lg & 1) * 4 + t;
-        const unsigned short w0 = reinterpret_cast<const unsigned short*>(
-            &sh.st[cur].w[r0][col_u4 ^ (r0 & 1)])[sub_u16];
-        const unsigned short w1 = reinterpret_cast<const unsigned short*>(
-            &sh.st[cur].w[r1][col_u4 ^ (r1 & 1)])[sub_u16];
-        const unsigned int a0 = i2p_e2m1x2_to_bf16x2(w0 & 0xFFu);
-        const unsigned int a2 = i2p_e2m1x2_to_bf16x2(w0 >> 8);
-        const unsigned int a1 = i2p_e2m1x2_to_bf16x2(w1 & 0xFFu);
-        const unsigned int a3 = i2p_e2m1x2_to_bf16x2(w1 >> 8);
-        const float sc0 = i2p_decode_fp8_e4m3((sc_w0 >> (lg * 8)) & 0xFFu);
-        const float sc1 = i2p_decode_fp8_e4m3((sc_w1 >> (lg * 8)) & 0xFFu);
-        const int x_col = lg * 2 + (t >> 1);
-        const int x_hf = t & 1;
+        for (int sub = 0; sub < 2; ++sub) {
+          const int lg = lg2 * 2 + sub;
+          const unsigned short w0 = wp0[sub * 4 + t];
+          const unsigned short w1 = wp1[sub * 4 + t];
+#if I2P_HAS_HW_FP4_CVT
+          const unsigned int a0 = i2p_fast_e2m1x2_to_bf16x2(w0 & 0xFFu);
+          const unsigned int a2 = i2p_fast_e2m1x2_to_bf16x2(w0 >> 8);
+          const unsigned int a1 = i2p_fast_e2m1x2_to_bf16x2(w1 & 0xFFu);
+          const unsigned int a3 = i2p_fast_e2m1x2_to_bf16x2(w1 >> 8);
+#else
+          const unsigned int a0 = s_e2m1_lut[w0 & 0xFFu];
+          const unsigned int a2 = s_e2m1_lut[w0 >> 8];
+          const unsigned int a1 = s_e2m1_lut[w1 & 0xFFu];
+          const unsigned int a3 = s_e2m1_lut[w1 >> 8];
+#endif
+          const float sc0 = (sub == 0) ? sf0.x : sf0.y;
+          const float sc1 = (sub == 0) ? sf1.x : sf1.y;
+          const int x_col = (lg * 2 + (t >> 1)) ^ ((g & 3) << 1);
+          const int x_hf = t & 1;
 #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
-          if (ms < n_slices) {
-            const int rx = ms * 8 + g;
-            const uint2 xv = reinterpret_cast<const uint2*>(
-                &sh.st[cur].x[rx][x_col ^ (rx & 7)])[x_hf];
-            float d0, d1, d2, d3;
-            ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, a0, a1, a2, a3, xv.x, xv.y);
-            tot[ms][0] = fmaf(sc0, d0, tot[ms][0]);
-            tot[ms][1] = fmaf(sc0, d1, tot[ms][1]);
-            tot[ms][2] = fmaf(sc1, d2, tot[ms][2]);
-            tot[ms][3] = fmaf(sc1, d3, tot[ms][3]);
+          for (int ms = 0; ms < 8; ++ms) {
+            if (ms < n_slices) {
+              const int rx = ms * 8 + g;
+              const uint2 xv = reinterpret_cast<const uint2*>(
+                  &sh.st[cur].x[rx][x_col])[x_hf];
+              float d0, d1, d2, d3;
+              ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, a0, a1, a2, a3, xv.x, xv.y);
+              tot[ms][0] = fmaf(sc0, d0, tot[ms][0]);
+              tot[ms][1] = fmaf(sc0, d1, tot[ms][1]);
+              tot[ms][2] = fmaf(sc1, d2, tot[ms][2]);
+              tot[ms][3] = fmaf(sc1, d3, tot[ms][3]);
+            }
           }
         }
       }
     } else {
-      const unsigned int sc_w0 = sh.st[cur].sc[r0];
-      const unsigned int sc_w1 = sh.st[cur].sc[r1];
-      const unsigned int bi_w0 = (MODE == 2) ? sh.st[cur].bi[r0] : 0u;
-      const unsigned int bi_w1 = (MODE == 2) ? sh.st[cur].bi[r1] : 0u;
-      (void)bi_w0; (void)bi_w1;
+      const int sc_st = (MODE == 4) ? ((step >> 1) & 1) : cur;
+      const unsigned int sc_w0 = sh.st[sc_st].sc[r0];
+      const unsigned int sc_w1 = sh.st[sc_st].sc[r1];
+      [[maybe_unused]] const unsigned int bi_w0 = (MODE == 2) ? sh.st[cur].bi[r0] : 0u;
+      [[maybe_unused]] const unsigned int bi_w1 = (MODE == 2) ? sh.st[cur].bi[r1] : 0u;
+      [[maybe_unused]] const int sc_half_sh = (step & 1) * 16;
 #pragma unroll
       for (int lg = 0; lg < 2; ++lg) {
         const int col_u4 = lg * 2 + (t >> 1);
@@ -1089,11 +1220,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
         i2p_unpack8_to_bf16x2<MODE>(w0, wb0);
         i2p_unpack8_to_bf16x2<MODE>(w1, wb1);
 
-        float sc0, sc1, bi0 = 0.0f, bi1 = 0.0f;
-        (void)bi0; (void)bi1;
+        float sc0, sc1;
+        [[maybe_unused]] float bi0 = 0.0f;
+        [[maybe_unused]] float bi1 = 0.0f;
         if constexpr (MODE == 4) {
-          sc0 = i2p_decode_ue8m0((sc_w0 >> (lg * 8)) & 0xFFu);
-          sc1 = i2p_decode_ue8m0((sc_w1 >> (lg * 8)) & 0xFFu);
+          sc0 = i2p_decode_ue8m0((sc_w0 >> (sc_half_sh + lg * 8)) & 0xFFu);
+          sc1 = i2p_decode_ue8m0((sc_w1 >> (sc_half_sh + lg * 8)) & 0xFFu);
         } else {
           sc0 = i2p_read_f16_or_bf16(static_cast<unsigned short>(sc_w0 >> (lg * 16)), sb_is_bf16);
           sc1 = i2p_read_f16_or_bf16(static_cast<unsigned short>(sc_w1 >> (lg * 16)), sb_is_bf16);
@@ -1102,12 +1234,12 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
             bi1 = i2p_read_f16_or_bf16(static_cast<unsigned short>(bi_w1 >> (lg * 16)), sb_is_bf16);
           }
         }
-        const int x_col = lg * 4 + t;
+        const int x_col = (lg * 4 + t) ^ ((g & 1) << 2);
 #pragma unroll
-        for (int ms = 0; ms < 4; ++ms) {
+        for (int ms = 0; ms < 8; ++ms) {
           if (ms < n_slices) {
             const int rx = ms * 8 + g;
-            const uint4 xv = sh.st[cur].x[rx][x_col ^ (rx & 7)];
+            const uint4 xv = sh.st[cur].x[rx][x_col];
             float d0, d1, d2, d3;
             ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, wb0[0], wb1[0], wb0[1], wb1[1], xv.x, xv.y);
             ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, wb0[2], wb1[2], wb0[3], wb1[3], xv.z, xv.w);
@@ -1135,9 +1267,9 @@ __global__ __launch_bounds__(128, 3) void inkling2_moe_prefill_down_bm32(
   }
 
   const int w_col0 = base_row + warp * 16;
-  const int n_passes = (cnt > 16) ? 2 : 1;
+  const int n_passes = (cnt + 15) >> 4;
 #pragma unroll
-  for (int pass = 0; pass < 2; ++pass) {
+  for (int pass = 0; pass < 4; ++pass) {
     if (pass < n_passes) {
       const int s0 = pass * 2;
       const int s1 = s0 + 1;

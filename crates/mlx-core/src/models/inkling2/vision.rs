@@ -297,6 +297,35 @@ impl Inkling2VisionBlock {
         arrays.push(self.ls2.clone());
         arrays
     }
+
+    pub(crate) fn ensure_cuda_device(&mut self, layer_norm_eps: f64) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = 0usize;
+        promoted += promote_layer_norm_cuda(&mut self.norm1, layer_norm_eps)?;
+        promoted += self.q_proj.ensure_cuda_device()?;
+        promoted += self.k_proj.ensure_cuda_device()?;
+        promoted += self.v_proj.ensure_cuda_device()?;
+        promoted += self.o_proj.ensure_cuda_device()?;
+        promoted += self.ls1.promote_cuda_device()?;
+        promoted += promote_layer_norm_cuda(&mut self.norm2, layer_norm_eps)?;
+        promoted += self.fc1.ensure_cuda_device()?;
+        promoted += self.fc2.ensure_cuda_device()?;
+        promoted += self.ls2.promote_cuda_device()?;
+        Ok(promoted)
+    }
+}
+
+fn promote_layer_norm_cuda(ln: &mut LayerNorm, eps: f64) -> Result<usize> {
+    let mut w = ln.get_weight();
+    let mut b = ln.get_bias();
+    let wb = w.promote_cuda_device()?;
+    let bb = b.promote_cuda_device()?;
+    if wb > 0 || bb > 0 {
+        *ln = LayerNorm::from_weights(&w, Some(&b), Some(eps))?;
+    }
+    Ok(wb + bb)
 }
 
 /// Complete PE-Lang ViT + 2×2 spatial merge projector (`mmproj-BF16.gguf`).
@@ -419,8 +448,33 @@ impl Inkling2VisionEncoder {
             arrays.extend(b.weight_arrays());
         }
         arrays.push(self.proj_fc1.get_weight());
+        if let Some(b) = self.proj_fc1.get_bias() {
+            arrays.push(b);
+        }
         arrays.push(self.proj_fc2.get_weight());
+        if let Some(b) = self.proj_fc2.get_bias() {
+            arrays.push(b);
+        }
         arrays
+    }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let eps = self.config.layer_norm_eps;
+        let mut promoted = 0usize;
+        promoted += self.class_embedding.promote_cuda_device()?;
+        promoted += self.class_position_embedding.promote_cuda_device()?;
+        promoted += self.patch_weight_flat.promote_cuda_device()?;
+        promoted += self.position_embedding.promote_cuda_device()?;
+        promoted += promote_layer_norm_cuda(&mut self.pre_ln, eps)?;
+        for blk in &mut self.blocks {
+            promoted += blk.ensure_cuda_device(eps)?;
+        }
+        promoted += self.proj_fc1.ensure_cuda_device()?;
+        promoted += self.proj_fc2.ensure_cuda_device()?;
+        Ok(promoted)
     }
 }
 

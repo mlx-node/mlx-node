@@ -323,6 +323,115 @@ pub fn loop_ctrl_norm_cuda(
     }
 }
 
+/// 2a. Prefill LoopController stage 1: fused weightless RMSNorm + concat
+/// `[rms_norm(dest, eps), rms_norm(msg, eps)]` -> `[T, 2*D]` (`g_count == 1`) or
+/// `[3, T, 2*D]` (`g_count == 3`) in BF16 (`out_is_bf16 == true`) or FP32.
+#[inline]
+pub fn loop_pair_rms_norm_cuda(
+    dest: &MxArray,
+    msg: &MxArray,
+    g_count: i32,
+    eps: f32,
+    out_is_bf16: bool,
+) -> Result<Option<MxArray>> {
+    if !available() || (g_count != 1 && g_count != 3) {
+        return Ok(None);
+    }
+    let handle = unsafe {
+        sys::mlx_inkling2_loop_pair_rms_norm_cuda(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            g_count,
+            eps,
+            i32::from(out_is_bf16),
+        )
+    };
+    if handle.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "inkling2_loop_pair_rms_norm_cuda",
+        )?))
+    }
+}
+
+/// 2b. Prefill LoopController stage 3: fused `(1 - tanh(forget)) * dest + tanh(gain) * msg`
+/// + sublayer RMSNorm -> `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+#[inline]
+pub fn loop_blend_rms_norm_cuda(
+    dest: &MxArray,
+    msg: &MxArray,
+    gf: &MxArray,
+    norm_w: &MxArray,
+    g_count: i32,
+    eps: f32,
+) -> Result<Option<MxArray>> {
+    if !available() || (g_count != 1 && g_count != 3) {
+        return Ok(None);
+    }
+    let handle = unsafe {
+        sys::mlx_inkling2_loop_blend_rms_norm_cuda(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            gf.as_raw_ptr(),
+            norm_w.as_raw_ptr(),
+            g_count,
+            eps,
+        )
+    };
+    if handle.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "inkling2_loop_blend_rms_norm_cuda",
+        )?))
+    }
+}
+
+/// 2c. Prefill LoopController fused stage 2b+3: Tensor Core `h @ gf_w.T` +
+/// `(1 - tanh(forget)) * dest + tanh(gain) * msg` + sublayer RMSNorm ->
+/// `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+///
+/// Eliminates the `[G, T, 2*D]` `gf` DRAM intermediate and second cuBLAS call
+/// when `gf_w` is BF16 and `D <= 2304` on SM >= 8.0; returns `Ok(None)` off CUDA
+/// or when C++ declines (e.g. FP32 `gf_w` or `D > 2304`).
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn loop_up_blend_rms_norm_cuda(
+    dest: &MxArray,
+    msg: &MxArray,
+    h: &MxArray,
+    gf_w: &MxArray,
+    norm_w: &MxArray,
+    g_count: i32,
+    eps: f32,
+) -> Result<Option<MxArray>> {
+    if !available() || !sm80_available() || (g_count != 1 && g_count != 3) {
+        return Ok(None);
+    }
+    let handle = unsafe {
+        sys::mlx_inkling2_loop_up_blend_rms_norm_cuda(
+            dest.as_raw_ptr(),
+            msg.as_raw_ptr(),
+            h.as_raw_ptr(),
+            gf_w.as_raw_ptr(),
+            norm_w.as_raw_ptr(),
+            g_count,
+            eps,
+        )
+    };
+    if handle.is_null() {
+        Ok(None)
+    } else {
+        Ok(Some(MxArray::from_handle(
+            handle,
+            "inkling2_loop_up_blend_rms_norm_cuda",
+        )?))
+    }
+}
+
 /// 3. Fused Q/R L2-clip + K/V ShortConv + K L2-clip + V RMSNorm + Global `tau(p)`
 ///    + in-place BF16/INT8 KV cache store (linear flat or circular ring, linear or tree).
 pub fn kv_conv_prep_store_cuda(params: &KvConvPrepParams<'_>) -> Result<Option<KvConvPrepOutput>> {
@@ -1496,11 +1605,16 @@ mod tests {
                     f32_arr(vals, shape)
                 }
             };
+            let w_dtype = if w_bf16 {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            };
             let make_ctrl = |rng: &mut Rng| -> LoopController {
                 let down = make_w(&rng.vec(rank * 2 * d, 0.04), &[rank as i64, (2 * d) as i64]);
                 let gain = make_w(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
                 let forget = make_w(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
-                LoopController::new(down, gain, forget).unwrap()
+                LoopController::new_with_dtype(down, gain, forget, w_dtype).unwrap()
             };
             let q_ctrl = make_ctrl(&mut rng);
             let k_ctrl = make_ctrl(&mut rng);
@@ -4417,6 +4531,873 @@ mod tests {
             }
         }
 
+        unsafe { sys::mlx_clear_cache() };
+    }
+
+    // Shared FP32 MoE fixture builder for focused 9-warp MXFP8 & SymQ8 parity tests.
+    fn build_moe_router_and_inputs(
+        rng: &mut Rng,
+        max_m: usize,
+        e: usize,
+        h: usize,
+    ) -> (Vec<f32>, MxArray, MxArray, MxArray) {
+        let mut x_vals = rng.vec(max_m * h, 0.45);
+        let mut rw_vals = rng.vec(e * h, 0.004);
+        let rb_vals: Vec<f32> = (0..e).map(|i| -0.05 + (i % 13) as f32 * 0.008).collect();
+        for tok in 0..max_m {
+            for col in 0..max_m {
+                x_vals[tok * h + col] = if col == tok { 1.0 } else { 0.0 };
+            }
+            let hot = [0usize, 1, 2, 127];
+            let cold = [
+                10 + (tok * 3) % 90,
+                11 + (tok * 3) % 90,
+                100 + (tok / 2) % 12,
+                112 + (tok % 15),
+            ];
+            for (rank_i, &exp_id) in hot.iter().chain(cold.iter()).enumerate() {
+                rw_vals[exp_id * h + tok] = 3.5 - (rank_i as f32) * 0.25;
+            }
+        }
+        let router_w = f32_arr(&rw_vals, &[e as i64, h as i64]);
+        let router_w_t = router_w.transpose(None).unwrap();
+        let router_bias = f32_arr(&rb_vals, &[e as i64]);
+        (x_vals, router_w, router_w_t, router_bias)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ref_moe_fp32(
+        x: &MxArray,
+        router_w_t: &MxArray,
+        router_bias: &MxArray,
+        deq_gu_t: &[MxArray],
+        deq_dn_t: &[MxArray],
+        gu_interleaved: bool,
+        top_k: usize,
+        h: usize,
+        inter: usize,
+        route_scale: f32,
+    ) -> Vec<f32> {
+        let m = x.shape().unwrap()[0] as usize;
+        let e_base = deq_gu_t.len();
+        let n2 = 2 * inter;
+        let x_f32 = x.astype(DType::Float32).unwrap();
+        let logits = x_f32.matmul(router_w_t).unwrap();
+        let (gamma, topk) = sigmoid_biased_topk_from_logits(
+            &logits,
+            Some(router_bias),
+            top_k as i32,
+            1e-20,
+            f64::from(route_scale),
+            true,
+            true,
+        )
+        .unwrap();
+        let gamma_f = gamma.to_float32().unwrap();
+        let topk_i = topk.to_int32().unwrap();
+
+        let mut buckets: Vec<Vec<(usize, f32)>> = vec![Vec::new(); e_base];
+        for tok in 0..m {
+            for k_i in 0..top_k {
+                let slot = tok * top_k + k_i;
+                let exp_id = topk_i[slot] as usize;
+                buckets[exp_id % e_base].push((tok, gamma_f[slot]));
+            }
+        }
+
+        let mut acc = vec![0.0f32; m * h];
+        for (be, entries) in buckets.iter().enumerate() {
+            if entries.is_empty() {
+                continue;
+            }
+            let cnt = entries.len();
+            let tok_ids: Vec<i32> = entries.iter().map(|&(tok, _)| tok as i32).collect();
+            let tok_idx = MxArray::from_int32(&tok_ids, &[cnt as i64]).unwrap();
+            let x_be = x_f32.take(&tok_idx, 0).unwrap();
+            let gu_be = x_be.matmul(&deq_gu_t[be]).unwrap();
+            let (gate, up) = if gu_interleaved {
+                let paired = gu_be.reshape(&[cnt as i64, inter as i64, 2]).unwrap();
+                let g = paired
+                    .slice(&[0, 0, 0], &[cnt as i64, inter as i64, 1])
+                    .unwrap()
+                    .squeeze(Some(&[-1]))
+                    .unwrap();
+                let u = paired
+                    .slice(&[0, 0, 1], &[cnt as i64, inter as i64, 2])
+                    .unwrap()
+                    .squeeze(Some(&[-1]))
+                    .unwrap();
+                (g, u)
+            } else {
+                let g = gu_be.slice(&[0, 0], &[cnt as i64, inter as i64]).unwrap();
+                let u = gu_be
+                    .slice(&[0, inter as i64], &[cnt as i64, n2 as i64])
+                    .unwrap();
+                (g, u)
+            };
+            let act = situ_activation(&gate, &up, 4.0, 25.0).unwrap();
+            let dn_be = act.matmul(&deq_dn_t[be]).unwrap().to_float32().unwrap();
+            for (row_i, &(tok, g_val)) in entries.iter().enumerate() {
+                let src_row = &dn_be.as_ref()[row_i * h..(row_i + 1) * h];
+                let dst_row = &mut acc[tok * h..(tok + 1) * h];
+                for d in 0..h {
+                    dst_row[d] += src_row[d] * g_val;
+                }
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn cuda_inkling2_moe_mxfp8_9warp_parity() {
+        if !available() || !sm80_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x0E04_9AF8);
+        let e = 128usize;
+        let e_base = 8usize;
+        let top_k = 8usize;
+        let h = 2304usize;
+        let inter = 1152usize;
+        let n2 = 2 * inter;
+        let route_scale = 8.0f32;
+        let tile_reps = [(e / e_base) as i32, 1, 1];
+
+        let (x40_vals, router_w, router_w_t, router_bias) =
+            build_moe_router_and_inputs(&mut rng, 40, e, h);
+        let base_gu = bf16_arr(
+            &rng.vec(e_base * n2 * h, 0.035),
+            &[e_base as i64, n2 as i64, h as i64],
+        );
+        let base_dn = bf16_arr(
+            &rng.vec(e_base * h * inter, 0.035),
+            &[e_base as i64, h as i64, inter as i64],
+        );
+        MxArray::eval_arrays(&[&base_gu, &base_dn]).unwrap();
+
+        let (gw_b, gs_b, _) = quantize_mlx(&base_gu, 32, 8, c"mxfp8");
+        let (dw_b, ds_b, _) = quantize_mlx(&base_dn, 32, 8, c"mxfp8");
+        let deq_gu = dequantize_mlx(&gw_b, &gs_b, None, 32, 8, c"mxfp8");
+        let deq_dn = dequantize_mlx(&dw_b, &ds_b, None, 32, 8, c"mxfp8");
+        let deq_gu_t: Vec<MxArray> = (0..e_base)
+            .map(|be| {
+                deq_gu
+                    .slice(&[be as i64, 0, 0], &[(be + 1) as i64, n2 as i64, h as i64])
+                    .unwrap()
+                    .squeeze(Some(&[0]))
+                    .unwrap()
+                    .transpose(None)
+                    .unwrap()
+            })
+            .collect();
+        let deq_dn_t: Vec<MxArray> = (0..e_base)
+            .map(|be| {
+                deq_dn
+                    .slice(
+                        &[be as i64, 0, 0],
+                        &[(be + 1) as i64, h as i64, inter as i64],
+                    )
+                    .unwrap()
+                    .squeeze(Some(&[0]))
+                    .unwrap()
+                    .transpose(None)
+                    .unwrap()
+            })
+            .collect();
+
+        let gw = gw_b.tile(&tile_reps).unwrap();
+        let gs = gs_b.tile(&tile_reps).unwrap();
+        let dw = dw_b.tile(&tile_reps).unwrap();
+        let ds = ds_b.tile(&tile_reps).unwrap();
+
+        for &gu_interleaved in &[false, true] {
+            for &t in &[1usize, 8, 16, 40] {
+                let x = bf16_arr(&x40_vals[..t * h], &[t as i64, h as i64]);
+                let want = ref_moe_fp32(
+                    &x,
+                    &router_w_t,
+                    &router_bias,
+                    &deq_gu_t,
+                    &deq_dn_t,
+                    gu_interleaved,
+                    top_k,
+                    h,
+                    inter,
+                    route_scale,
+                );
+                let rms = (want
+                    .iter()
+                    .map(|&v| f64::from(v) * f64::from(v))
+                    .sum::<f64>()
+                    / want.len() as f64)
+                    .sqrt();
+                assert!(
+                    rms > 0.02,
+                    "MXFP8 reference output unexpectedly near zero: rms={rms}"
+                );
+
+                let out = moe_forward_cuda(&MoeForwardParams {
+                    x: &x,
+                    router_w: &router_w,
+                    router_bias: Some(&router_bias),
+                    gu_w: &gw,
+                    gu_scales: &gs,
+                    gu_biases: None,
+                    gu_outer_scale: None,
+                    gu_mode: MoeQuantMode::Mxfp8,
+                    gu_interleaved,
+                    dn_w: &dw,
+                    dn_scales: &ds,
+                    dn_biases: None,
+                    dn_outer_scale: None,
+                    dn_mode: MoeQuantMode::Mxfp8,
+                    route_scale,
+                    post_conv_w: None,
+                    hist_in: None,
+                    residual: None,
+                    conv_taps: None,
+                    update_hist: false,
+                    emit_pre_conv: false,
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("moe_forward_cuda MXFP8 declined (interleaved={gu_interleaved}, T={t})")
+                });
+                assert_eq!(out.y.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(out.y.shape().unwrap().as_ref(), &[t as i64, h as i64]);
+                assert_close(
+                    &format!("moe_9warp MXFP8 interleaved={gu_interleaved} T={t}"),
+                    out.y.to_float32().unwrap().as_ref(),
+                    &want,
+                    2e-2,
+                    2e-2,
+                );
+            }
+        }
+        unsafe { sys::mlx_clear_cache() };
+    }
+
+    #[test]
+    fn cuda_inkling2_moe_symq8_9warp_parity() {
+        if !available() || !sm80_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x0E01_9A08);
+        let e = 128usize;
+        let e_base = 8usize;
+        let top_k = 8usize;
+        let h = 2304usize;
+        let inter = 1152usize;
+        let n2 = 2 * inter;
+        let route_scale = 8.0f32;
+        let tile_reps = [(e / e_base) as i32, 1, 1];
+
+        let (x16_vals, router_w, router_w_t, router_bias) =
+            build_moe_router_and_inputs(&mut rng, 16, e, h);
+        let base_gu_vals = rng.vec(e_base * n2 * h, 0.035);
+        let base_dn_vals = rng.vec(e_base * h * inter, 0.035);
+
+        let (gw_2d, gs_2d, gb_2d) = quantize_sym_q8_f16(&base_gu_vals, e_base * n2, h);
+        let (dw_2d, ds_2d, db_2d) = quantize_sym_q8_f16(&base_dn_vals, e_base * h, inter);
+        let gw_b = gw_2d
+            .reshape(&[e_base as i64, n2 as i64, (h / 4) as i64])
+            .unwrap();
+        let gs_b = gs_2d
+            .reshape(&[e_base as i64, n2 as i64, (h / 32) as i64])
+            .unwrap();
+        let gb_b = gb_2d
+            .reshape(&[e_base as i64, n2 as i64, (h / 32) as i64])
+            .unwrap();
+        let dw_b = dw_2d
+            .reshape(&[e_base as i64, h as i64, (inter / 4) as i64])
+            .unwrap();
+        let ds_b = ds_2d
+            .reshape(&[e_base as i64, h as i64, (inter / 32) as i64])
+            .unwrap();
+        let db_b = db_2d
+            .reshape(&[e_base as i64, h as i64, (inter / 32) as i64])
+            .unwrap();
+
+        let deq_gu = dequantize_mlx(&gw_b, &gs_b, Some(&gb_b), 32, 8, c"affine");
+        let deq_dn = dequantize_mlx(&dw_b, &ds_b, Some(&db_b), 32, 8, c"affine");
+        let deq_gu_t: Vec<MxArray> = (0..e_base)
+            .map(|be| {
+                deq_gu
+                    .slice(&[be as i64, 0, 0], &[(be + 1) as i64, n2 as i64, h as i64])
+                    .unwrap()
+                    .squeeze(Some(&[0]))
+                    .unwrap()
+                    .transpose(None)
+                    .unwrap()
+            })
+            .collect();
+        let deq_dn_t: Vec<MxArray> = (0..e_base)
+            .map(|be| {
+                deq_dn
+                    .slice(
+                        &[be as i64, 0, 0],
+                        &[(be + 1) as i64, h as i64, inter as i64],
+                    )
+                    .unwrap()
+                    .squeeze(Some(&[0]))
+                    .unwrap()
+                    .transpose(None)
+                    .unwrap()
+            })
+            .collect();
+
+        let gw = gw_b.tile(&tile_reps).unwrap();
+        let gs = gs_b.tile(&tile_reps).unwrap();
+        let dw = dw_b.tile(&tile_reps).unwrap();
+        let ds = ds_b.tile(&tile_reps).unwrap();
+
+        for &gu_interleaved in &[false, true] {
+            for &t in &[1usize, 8, 16] {
+                let x = bf16_arr(&x16_vals[..t * h], &[t as i64, h as i64]);
+                let want = ref_moe_fp32(
+                    &x,
+                    &router_w_t,
+                    &router_bias,
+                    &deq_gu_t,
+                    &deq_dn_t,
+                    gu_interleaved,
+                    top_k,
+                    h,
+                    inter,
+                    route_scale,
+                );
+                let rms = (want
+                    .iter()
+                    .map(|&v| f64::from(v) * f64::from(v))
+                    .sum::<f64>()
+                    / want.len() as f64)
+                    .sqrt();
+                assert!(
+                    rms > 0.02,
+                    "SymQ8 reference output unexpectedly near zero: rms={rms}"
+                );
+
+                let out = moe_forward_cuda(&MoeForwardParams {
+                    x: &x,
+                    router_w: &router_w,
+                    router_bias: Some(&router_bias),
+                    gu_w: &gw,
+                    gu_scales: &gs,
+                    gu_biases: None,
+                    gu_outer_scale: None,
+                    gu_mode: MoeQuantMode::SymQ8,
+                    gu_interleaved,
+                    dn_w: &dw,
+                    dn_scales: &ds,
+                    dn_biases: None,
+                    dn_outer_scale: None,
+                    dn_mode: MoeQuantMode::SymQ8,
+                    route_scale,
+                    post_conv_w: None,
+                    hist_in: None,
+                    residual: None,
+                    conv_taps: None,
+                    update_hist: false,
+                    emit_pre_conv: false,
+                })
+                .unwrap()
+                .unwrap_or_else(|| {
+                    panic!("moe_forward_cuda SymQ8 declined (interleaved={gu_interleaved}, T={t})")
+                });
+                assert_eq!(out.y.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(out.y.shape().unwrap().as_ref(), &[t as i64, h as i64]);
+                assert_close(
+                    &format!("moe_9warp SymQ8 interleaved={gu_interleaved} T={t}"),
+                    out.y.to_float32().unwrap().as_ref(),
+                    &want,
+                    2e-2,
+                    2e-2,
+                );
+            }
+        }
+        unsafe { sys::mlx_clear_cache() };
+    }
+
+    #[test]
+    fn cuda_inkling2_bf16_lm_head_softcap_parity() {
+        if !available() || !sm80_available() {
+            return;
+        }
+        let mut rng = Rng::new(0xBF16_13AD);
+        let k = 2304usize;
+        let v_pad = 4096usize;
+        let v_unpad = 3973usize;
+        let softcap = 30.0f32;
+
+        let mut w_vals = rng.vec(v_pad * k, 0.08);
+        // Huge decoy values in padded tail rows so any OOB read hijacks argmax.
+        for row in v_unpad..v_pad {
+            for col in 0..k {
+                w_vals[row * k + col] = 0.9;
+            }
+        }
+        let winners: [usize; 16] = [
+            19, 1025, 3972, 0, 517, 2048, 3003, 779, 127, 2501, 3971, 43, 889, 1997, 3331, 65,
+        ];
+        let mut x16_vals = rng.vec(16 * k, 0.35);
+        for (m, &win) in winners.iter().enumerate() {
+            let blk = (m * 64) % k;
+            for j in 0..64 {
+                x16_vals[m * k + blk + j] = 1.2;
+                w_vals[win * k + blk + j] = 0.55;
+            }
+        }
+
+        let w_bf16 = bf16_arr(&w_vals, &[v_pad as i64, k as i64]);
+        let w_ref_t = w_bf16
+            .slice(&[0, 0], &[v_unpad as i64, k as i64])
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .transpose(None)
+            .unwrap();
+
+        for &m in &[1usize, 2, 8, 16] {
+            let x = bf16_arr(&x16_vals[..m * k], &[m as i64, k as i64]);
+            let raw_ref = x.astype(DType::Float32).unwrap().matmul(&w_ref_t).unwrap();
+            let cap_ref = raw_ref
+                .mul_scalar(1.0 / f64::from(softcap))
+                .unwrap()
+                .tanh()
+                .unwrap()
+                .mul_scalar(f64::from(softcap))
+                .unwrap();
+            let cap_ref_f = cap_ref.to_float32().unwrap();
+            let cap_ref_bf_f = cap_ref
+                .astype(DType::BFloat16)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            let raw_ref_bf_f = raw_ref
+                .astype(DType::BFloat16)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            let mut ref_argmax = Vec::with_capacity(m);
+            for (r, &expected_winner) in winners.iter().enumerate().take(m) {
+                let row = &cap_ref_f.as_ref()[r * v_unpad..(r + 1) * v_unpad];
+                let (best_i, _) = row.iter().enumerate().fold(
+                    (0usize, f32::NEG_INFINITY),
+                    |(bi, bv), (i, &v)| {
+                        if v > bv { (i, v) } else { (bi, bv) }
+                    },
+                );
+                assert_eq!(best_i, expected_winner);
+                ref_argmax.push(best_i as i32);
+            }
+
+            // OUT_MODE = 0: softcapped FP32 [M, V_unpad]
+            let out0 = lm_head_softcap_cuda(
+                &x,
+                &w_bf16,
+                None,
+                None,
+                v_unpad as i32,
+                softcap,
+                LmHeadOutMode::LogitsF32,
+            )
+            .unwrap()
+            .expect("BF16 lm_head_softcap_cuda OUT_MODE=0 must run on CUDA");
+            assert_eq!(out0.dtype().unwrap(), DType::Float32);
+            assert_eq!(out0.shape().unwrap().as_ref(), &[m as i64, v_unpad as i64]);
+            assert_close(
+                &format!("bf16_lm_head M={m} OUT_MODE=0 cap={softcap}"),
+                out0.to_float32().unwrap().as_ref(),
+                cap_ref_f.as_ref(),
+                0.05,
+                3e-3,
+            );
+
+            // OUT_MODE = 1: zero-DRAM greedy argmax Int32 [M]
+            let out1 = lm_head_softcap_cuda(
+                &x,
+                &w_bf16,
+                None,
+                None,
+                v_unpad as i32,
+                softcap,
+                LmHeadOutMode::GreedyArgmax,
+            )
+            .unwrap()
+            .expect("BF16 lm_head_softcap_cuda OUT_MODE=1 must run on CUDA");
+            assert_eq!(out1.dtype().unwrap(), DType::Int32);
+            assert_eq!(out1.shape().unwrap().as_ref(), &[m as i64]);
+            assert_eq!(
+                out1.to_int32().unwrap().as_ref(),
+                ref_argmax.as_slice(),
+                "bf16_lm_head M={m} OUT_MODE=1 argmax mismatch"
+            );
+
+            // OUT_MODE = 2 with softcap = 30.0: softcapped BF16 [M, V_unpad]
+            let out2_cap = lm_head_softcap_cuda(
+                &x,
+                &w_bf16,
+                None,
+                None,
+                v_unpad as i32,
+                softcap,
+                LmHeadOutMode::LogitsBf16,
+            )
+            .unwrap()
+            .expect("BF16 lm_head_softcap_cuda OUT_MODE=2 (capped) must run on CUDA");
+            assert_eq!(out2_cap.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(
+                out2_cap.shape().unwrap().as_ref(),
+                &[m as i64, v_unpad as i64]
+            );
+            assert_close(
+                &format!("bf16_lm_head M={m} OUT_MODE=2 cap={softcap}"),
+                out2_cap.to_float32().unwrap().as_ref(),
+                cap_ref_bf_f.as_ref(),
+                0.15,
+                6e-3,
+            );
+
+            // OUT_MODE = 2 with softcap = 0.0: uncapped BF16 [M, V_unpad]
+            let out2_raw = lm_head_softcap_cuda(
+                &x,
+                &w_bf16,
+                None,
+                None,
+                v_unpad as i32,
+                0.0,
+                LmHeadOutMode::LogitsBf16,
+            )
+            .unwrap()
+            .expect("BF16 lm_head_softcap_cuda OUT_MODE=2 (uncapped) must run on CUDA");
+            assert_eq!(out2_raw.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(
+                out2_raw.shape().unwrap().as_ref(),
+                &[m as i64, v_unpad as i64]
+            );
+            assert_close(
+                &format!("bf16_lm_head M={m} OUT_MODE=2 uncapped"),
+                out2_raw.to_float32().unwrap().as_ref(),
+                raw_ref_bf_f.as_ref(),
+                0.15,
+                6e-3,
+            );
+        }
+        unsafe { sys::mlx_clear_cache() };
+    }
+
+    #[test]
+    fn cuda_inkling2_loop_prefill_pipeline_parity() {
+        if !available() {
+            return;
+        }
+        let mut rng = Rng::new(0x100B_BEEF);
+        let d = 2304usize;
+        let rank = 64usize;
+
+        for &w_bf16 in &[false, true] {
+            let w_dtype = if w_bf16 {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            };
+            let make_w = |vals: &[f32], shape: &[i64]| -> MxArray {
+                if w_bf16 {
+                    bf16_arr(vals, shape)
+                } else {
+                    f32_arr(vals, shape)
+                }
+            };
+            let make_ctrl = |rng: &mut Rng| -> LoopController {
+                let down = make_w(&rng.vec(rank * 2 * d, 0.04), &[rank as i64, (2 * d) as i64]);
+                let gain = make_w(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
+                let forget = make_w(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
+                LoopController::new_with_dtype(down, gain, forget, w_dtype).unwrap()
+            };
+            let q_ctrl = make_ctrl(&mut rng);
+            let k_ctrl = make_ctrl(&mut rng);
+            let v_ctrl = make_ctrl(&mut rng);
+            let mlp_ctrl = make_ctrl(&mut rng);
+            let msg_q = f32_arr(&rng.vec(4 * d, 0.1), &[4, d as i64]);
+            let layer_ctrls =
+                LoopLayerControllers::new(msg_q, q_ctrl, k_ctrl, v_ctrl, mlp_ctrl).unwrap();
+
+            let norm_1d = f32_arr(
+                &(0..d).map(|_| rng.uniform(0.7, 1.1)).collect::<Vec<_>>(),
+                &[d as i64],
+            );
+            let norm_3d = f32_arr(
+                &(0..3 * d)
+                    .map(|_| rng.uniform(0.7, 1.1))
+                    .collect::<Vec<_>>(),
+                &[3, d as i64],
+            );
+
+            for &t in &[32usize, 64] {
+                let dest_2d = f32_arr(&rng.vec(t * d, 1.2), &[t as i64, d as i64]);
+                let msg_2d = f32_arr(&rng.vec(t * d, 1.2), &[t as i64, d as i64]);
+
+                // --- g_count = 1 (MLP prefill fast path) ---
+                let pair_1 = loop_pair_rms_norm_cuda(&dest_2d, &msg_2d, 1, ATTN_RES_EPS, w_bf16)
+                    .unwrap()
+                    .expect("loop_pair_rms_norm_cuda G=1 must run on CUDA");
+                assert_eq!(pair_1.dtype().unwrap(), w_dtype);
+                assert_eq!(
+                    pair_1.shape().unwrap().as_ref(),
+                    &[t as i64, (2 * d) as i64]
+                );
+                let h_1 = pair_1.matmul(&layer_ctrls.mlp_ctrl.down_proj_t).unwrap();
+                let gf_1 = h_1
+                    .matmul(&layer_ctrls.mlp_ctrl.gain_forget_proj_t)
+                    .unwrap();
+                let got_1 =
+                    loop_blend_rms_norm_cuda(&dest_2d, &msg_2d, &gf_1, &norm_1d, 1, ATTN_RES_EPS)
+                        .unwrap()
+                        .expect("loop_blend_rms_norm_cuda G=1 must run on CUDA");
+                assert_eq!(got_1.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(got_1.shape().unwrap().as_ref(), &[t as i64, d as i64]);
+
+                let ref_1 = loop_ctrl_norm_cuda(
+                    &dest_2d,
+                    &msg_2d,
+                    &layer_ctrls.mlp_ctrl.down_proj_w,
+                    &layer_ctrls.mlp_ctrl.gain_forget_w,
+                    &norm_1d,
+                    ATTN_RES_EPS,
+                    1,
+                    true,
+                )
+                .unwrap()
+                .expect("loop_ctrl_norm_cuda G=1 reference must run on CUDA");
+                assert_close(
+                    &format!("loop_prefill G=1 bf16={w_bf16} T={t}"),
+                    got_1.to_float32().unwrap().as_ref(),
+                    ref_1.to_float32().unwrap().as_ref(),
+                    2e-2,
+                    5e-3,
+                );
+
+                // --- g_count = 3 (Attention prefill fast path: broadcast 2D & full 3D) ---
+                let msgs_3d = f32_arr(&rng.vec(3 * t * d, 1.2), &[3, t as i64, d as i64]);
+                let dest_3d = f32_arr(&rng.vec(3 * t * d, 1.2), &[3, t as i64, d as i64]);
+                for (mode_lbl, d_arr, nw_arr) in [
+                    ("bcast2d", &dest_2d, &norm_1d),
+                    ("full3d", &dest_3d, &norm_3d),
+                ] {
+                    let pair_3 = loop_pair_rms_norm_cuda(d_arr, &msgs_3d, 3, ATTN_RES_EPS, w_bf16)
+                        .unwrap()
+                        .expect("loop_pair_rms_norm_cuda G=3 must run on CUDA");
+                    assert_eq!(pair_3.dtype().unwrap(), w_dtype);
+                    assert_eq!(
+                        pair_3.shape().unwrap().as_ref(),
+                        &[3, t as i64, (2 * d) as i64]
+                    );
+                    let h_3 = pair_3.matmul(&layer_ctrls.qkv_down_proj_t).unwrap();
+                    let gf_3 = h_3.matmul(&layer_ctrls.qkv_gain_forget_proj_t).unwrap();
+                    let got_3 =
+                        loop_blend_rms_norm_cuda(d_arr, &msgs_3d, &gf_3, nw_arr, 3, ATTN_RES_EPS)
+                            .unwrap()
+                            .expect("loop_blend_rms_norm_cuda G=3 must run on CUDA");
+                    assert_eq!(got_3.dtype().unwrap(), DType::BFloat16);
+                    assert_eq!(got_3.shape().unwrap().as_ref(), &[3, t as i64, d as i64]);
+
+                    let ref_3 = loop_ctrl_norm_cuda(
+                        d_arr,
+                        &msgs_3d,
+                        &layer_ctrls.qkv_down_w,
+                        &layer_ctrls.qkv_gain_forget_w,
+                        nw_arr,
+                        ATTN_RES_EPS,
+                        3,
+                        false,
+                    )
+                    .unwrap()
+                    .expect("loop_ctrl_norm_cuda G=3 reference must run on CUDA");
+                    assert_close(
+                        &format!("loop_prefill G=3({mode_lbl}) bf16={w_bf16} T={t}"),
+                        got_3.to_float32().unwrap().as_ref(),
+                        ref_3.to_float32().unwrap().as_ref(),
+                        2e-2,
+                        5e-3,
+                    );
+                }
+            }
+        }
+
+        // Guard checks: unsupported g_count declines cleanly.
+        let dummy = f32_arr(&vec![0.1; 32 * d], &[32, d as i64]);
+        let dummy_gf = f32_arr(&vec![0.1; 32 * 2 * d], &[32, (2 * d) as i64]);
+        let dummy_nw = f32_arr(&vec![1.0; d], &[d as i64]);
+        assert!(
+            loop_pair_rms_norm_cuda(&dummy, &dummy, 2, ATTN_RES_EPS, true)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            loop_blend_rms_norm_cuda(&dummy, &dummy, &dummy_gf, &dummy_nw, 2, ATTN_RES_EPS)
+                .unwrap()
+                .is_none()
+        );
+        unsafe { sys::mlx_clear_cache() };
+    }
+
+    #[test]
+    fn cuda_inkling2_loop_up_blend_rms_norm_prefill_parity() {
+        if !available() || !sm80_available() {
+            return;
+        }
+        let mut rng = Rng::new(0x100B_CAFE);
+        let d = 2304usize;
+        let rank = 64usize;
+
+        let make_ctrl = |rng: &mut Rng| -> LoopController {
+            let down = bf16_arr(&rng.vec(rank * 2 * d, 0.04), &[rank as i64, (2 * d) as i64]);
+            let gain = bf16_arr(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
+            let forget = bf16_arr(&rng.vec(d * rank, 0.04), &[d as i64, rank as i64]);
+            LoopController::new_with_dtype(down, gain, forget, DType::BFloat16).unwrap()
+        };
+        let q_ctrl = make_ctrl(&mut rng);
+        let k_ctrl = make_ctrl(&mut rng);
+        let v_ctrl = make_ctrl(&mut rng);
+        let mlp_ctrl = make_ctrl(&mut rng);
+        let msg_q = f32_arr(&rng.vec(4 * d, 0.1), &[4, d as i64]);
+        let layer_ctrls =
+            LoopLayerControllers::new(msg_q, q_ctrl, k_ctrl, v_ctrl, mlp_ctrl).unwrap();
+
+        let norm_1d = f32_arr(
+            &(0..d).map(|_| rng.uniform(0.7, 1.1)).collect::<Vec<_>>(),
+            &[d as i64],
+        );
+        let norm_3d = f32_arr(
+            &(0..3 * d)
+                .map(|_| rng.uniform(0.7, 1.1))
+                .collect::<Vec<_>>(),
+            &[3, d as i64],
+        );
+
+        for &t in &[17usize, 32, 64] {
+            let dest_2d = f32_arr(&rng.vec(t * d, 1.2), &[t as i64, d as i64]);
+            let msg_2d = f32_arr(&rng.vec(t * d, 1.2), &[t as i64, d as i64]);
+
+            // --- g_count = 1 (MLP prefill fused up+blend+RMSNorm) ---
+            let pair_1 = loop_pair_rms_norm_cuda(&dest_2d, &msg_2d, 1, ATTN_RES_EPS, true)
+                .unwrap()
+                .expect("loop_pair_rms_norm_cuda G=1 must run on CUDA");
+            let h_1 = pair_1.matmul(&layer_ctrls.mlp_ctrl.down_proj_t).unwrap();
+            let got_1 = loop_up_blend_rms_norm_cuda(
+                &dest_2d,
+                &msg_2d,
+                &h_1,
+                &layer_ctrls.mlp_ctrl.gain_forget_w,
+                &norm_1d,
+                1,
+                ATTN_RES_EPS,
+            )
+            .unwrap()
+            .expect("loop_up_blend_rms_norm_cuda G=1 must run on CUDA");
+            assert_eq!(got_1.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(got_1.shape().unwrap().as_ref(), &[t as i64, d as i64]);
+
+            let ref_1 = loop_ctrl_norm_cuda(
+                &dest_2d,
+                &msg_2d,
+                &layer_ctrls.mlp_ctrl.down_proj_w,
+                &layer_ctrls.mlp_ctrl.gain_forget_w,
+                &norm_1d,
+                ATTN_RES_EPS,
+                1,
+                true,
+            )
+            .unwrap()
+            .expect("loop_ctrl_norm_cuda G=1 reference must run on CUDA");
+            assert_close(
+                &format!("loop_up_blend_prefill G=1 T={t}"),
+                got_1.to_float32().unwrap().as_ref(),
+                ref_1.to_float32().unwrap().as_ref(),
+                2e-2,
+                5e-3,
+            );
+
+            // --- g_count = 3 (Attention prefill: SWA dest_bcast=1 & Global dest_bcast=0) ---
+            let msgs_3d = f32_arr(&rng.vec(3 * t * d, 1.2), &[3, t as i64, d as i64]);
+            let dest_3d = f32_arr(&rng.vec(3 * t * d, 1.2), &[3, t as i64, d as i64]);
+            for (mode_lbl, d_arr, nw_arr) in [
+                ("bcast2d", &dest_2d, &norm_1d),
+                ("full3d", &dest_3d, &norm_3d),
+            ] {
+                let pair_3 = loop_pair_rms_norm_cuda(d_arr, &msgs_3d, 3, ATTN_RES_EPS, true)
+                    .unwrap()
+                    .expect("loop_pair_rms_norm_cuda G=3 must run on CUDA");
+                let h_3 = pair_3.matmul(&layer_ctrls.qkv_down_proj_t).unwrap();
+                let got_3 = loop_up_blend_rms_norm_cuda(
+                    d_arr,
+                    &msgs_3d,
+                    &h_3,
+                    &layer_ctrls.qkv_gain_forget_w,
+                    nw_arr,
+                    3,
+                    ATTN_RES_EPS,
+                )
+                .unwrap()
+                .expect("loop_up_blend_rms_norm_cuda G=3 must run on CUDA");
+                assert_eq!(got_3.dtype().unwrap(), DType::BFloat16);
+                assert_eq!(got_3.shape().unwrap().as_ref(), &[3, t as i64, d as i64]);
+
+                let ref_3 = loop_ctrl_norm_cuda(
+                    d_arr,
+                    &msgs_3d,
+                    &layer_ctrls.qkv_down_w,
+                    &layer_ctrls.qkv_gain_forget_w,
+                    nw_arr,
+                    ATTN_RES_EPS,
+                    3,
+                    false,
+                )
+                .unwrap()
+                .expect("loop_ctrl_norm_cuda G=3 reference must run on CUDA");
+                assert_close(
+                    &format!("loop_up_blend_prefill G=3({mode_lbl}) T={t}"),
+                    got_3.to_float32().unwrap().as_ref(),
+                    ref_3.to_float32().unwrap().as_ref(),
+                    2e-2,
+                    5e-3,
+                );
+            }
+        }
+
+        // Guard checks: unsupported g_count and FP32 gf_w decline cleanly.
+        let dummy = f32_arr(&vec![0.1; 32 * d], &[32, d as i64]);
+        let dummy_h_bf16 = bf16_arr(&vec![0.1; 32 * rank], &[32, rank as i64]);
+        let dummy_h_f32 = f32_arr(&vec![0.1; 32 * rank], &[32, rank as i64]);
+        let dummy_gfw_f32 = f32_arr(&vec![0.1; 2 * d * rank], &[(2 * d) as i64, rank as i64]);
+        let dummy_nw = f32_arr(&vec![1.0; d], &[d as i64]);
+        assert!(
+            loop_up_blend_rms_norm_cuda(
+                &dummy,
+                &dummy,
+                &dummy_h_bf16,
+                &layer_ctrls.mlp_ctrl.gain_forget_w,
+                &dummy_nw,
+                2,
+                ATTN_RES_EPS,
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            loop_up_blend_rms_norm_cuda(
+                &dummy,
+                &dummy,
+                &dummy_h_f32,
+                &dummy_gfw_f32,
+                &dummy_nw,
+                1,
+                ATTN_RES_EPS,
+            )
+            .unwrap()
+            .is_none()
+        );
         unsafe { sys::mlx_clear_cache() };
     }
 }

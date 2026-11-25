@@ -39,6 +39,70 @@ int sidecar_dtype_code(Dtype dt) noexcept {
   return -1;
 }
 
+int ops_sm_count(int dev_ordinal) {
+  static std::mutex mu;
+  static std::unordered_map<int, int> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cache.find(dev_ordinal);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  int sms = 48;
+  CUdevice dev = 0;
+  if (cuDeviceGet(&dev, dev_ordinal) == CUDA_SUCCESS) {
+    int val = 0;
+    if (cuDeviceGetAttribute(
+            &val, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS &&
+        val > 0) {
+      sms = val;
+    }
+  }
+  cache[dev_ordinal] = sms;
+  return sms;
+}
+
+void ops_ensure_smem_carveout(CUfunction fn, int carveout_pct) {
+  static std::mutex mu;
+  static std::unordered_map<CUfunction, int> configured;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = configured.find(fn);
+  if (it != configured.end() && it->second == carveout_pct) {
+    return;
+  }
+  (void)cuFuncSetAttribute(
+      fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, carveout_pct);
+  configured[fn] = carveout_pct;
+}
+
+// Compute 1 exact full resident wave (active_blocks_per_sm * num_sms) for
+// persistent BF16 LM-head argmax kernels after carveout is configured.
+int ops_persistent_ctas(
+    CUfunction fn, int block_size, int dev_ordinal, int max_tiles) {
+  static std::mutex mu;
+  static std::unordered_map<CUfunction, int> active_cache;
+  int active_per_sm = 0;
+  {
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = active_cache.find(fn);
+    if (it != active_cache.end()) {
+      active_per_sm = it->second;
+    } else {
+      int blocks = 0;
+      if (cuOccupancyMaxActiveBlocksPerMultiprocessor(
+              &blocks, fn, block_size, 0) == CUDA_SUCCESS &&
+          blocks > 0) {
+        active_per_sm = blocks;
+      } else {
+        active_per_sm = 4;
+      }
+      active_cache[fn] = active_per_sm;
+    }
+  }
+  const int num_sms = ops_sm_count(dev_ordinal);
+  const int target = active_per_sm * num_sms;
+  return std::max(1, std::min(max_tiles, target));
+}
+
 array ensure_2d_last_contiguous(
     const array& x, const Stream& stream, cu::CommandEncoder& encoder) {
   if (x.ndim() == 2 && x.strides(1) == 1) {
@@ -932,18 +996,18 @@ class Inkling2LmHeadSoftcapCuda final : public UnaryPrimitive {
       return v && v[0] == '1';
     }();
     const bool use_u4 = force_u4 && (M <= 2);
-    const int num_ctas = (out_mode_ == 1)
+    int num_ctas = (out_mode_ == 1)
         ? (use_u4 ? std::min(384, (V + 7) / 8) : std::min(384, (V + 15) / 16))
         : (use_u4 ? ((V + 7) / 8) : ((V + 15) / 16));
 
     std::optional<array> partial_vals;
     std::optional<array> partial_idxs;
-    if (out_mode_ == 1) {
-      partial_vals = alloc_temp({M, num_ctas}, float32, encoder);
-      partial_idxs = alloc_temp({M, num_ctas}, int32, encoder);
-    }
 
     if (is_q8_) {
+      if (out_mode_ == 1) {
+        partial_vals = alloc_temp({M, num_ctas}, float32, encoder);
+        partial_idxs = alloc_temp({M, num_ctas}, int32, encoder);
+      }
       const int sb_dtype = sidecar_dtype_code(inputs[2].dtype());
       if (sb_dtype < 0 || (!symmetric_ && inputs[3].dtype() != inputs[2].dtype())) {
         throw std::invalid_argument("Inkling2LmHeadSoftcapCuda: unsupported sidecar dtype");
@@ -1038,15 +1102,6 @@ class Inkling2LmHeadSoftcapCuda final : public UnaryPrimitive {
           fn, dim3(static_cast<uint32_t>(num_ctas), 1, 1), dim3(32, 8, 1), {},
           0, args.args());
     } else {
-      encoder.set_input_array(x);
-      encoder.set_input_array(w);
-      if (out_mode_ == 1) {
-        encoder.set_output_array(*partial_vals);
-        encoder.set_output_array(*partial_idxs);
-      } else {
-        encoder.set_output_array(out);
-      }
-
       const char* entry = nullptr;
       if (use_u4) {
         static constexpr const char* kBf16U4[2][3] = {
@@ -1063,6 +1118,29 @@ class Inkling2LmHeadSoftcapCuda final : public UnaryPrimitive {
       }
 
       auto fn = cu::jit_kernel(encoder.device(), inkling2_lm_head_source, entry);
+      // Carveout tuning for BF16 LM head:
+      // - u4: 0% SMEM (full 128 KB L1 for x)
+      // - MMA M<=8 (x <= 37 KB): 50% (64 KB SMEM -> 4 CTAs/SM, 64 KB L1)
+      // - MMA M=9..16 (x <= 74 KB): 25% (32 KB SMEM -> 2 CTAs/SM, 96 KB L1 -> 0 L1 thrash)
+      const int carveout = use_u4 ? 0 : ((M <= 8) ? 50 : 25);
+      ops_ensure_smem_carveout(fn, carveout);
+      if (out_mode_ == 1) {
+        const int max_tiles = use_u4 ? ((V + 7) / 8) : ((V + 15) / 16);
+        num_ctas = ops_persistent_ctas(
+            fn, 256, encoder.device().cuda_device(), max_tiles);
+        partial_vals = alloc_temp({M, num_ctas}, float32, encoder);
+        partial_idxs = alloc_temp({M, num_ctas}, int32, encoder);
+      }
+
+      encoder.set_input_array(x);
+      encoder.set_input_array(w);
+      if (out_mode_ == 1) {
+        encoder.set_output_array(*partial_vals);
+        encoder.set_output_array(*partial_idxs);
+      } else {
+        encoder.set_output_array(out);
+      }
+
       cu::KernelArgs args;
       args.append(x);
       args.append(w);
@@ -1644,6 +1722,290 @@ class Inkling2CompactKvBatchCuda final : public Primitive {
  private:
   size_t n_caches_;
   std::vector<int> write_offsets_;
+};
+
+// ============================================================================
+// 10. LoopCtrl Prefill Helpers: Pair RMSNorm & Blend+RMSNorm (G=1 or G=3)
+// ============================================================================
+class Inkling2LoopPairRmsNormCuda final : public UnaryPrimitive {
+ public:
+  Inkling2LoopPairRmsNormCuda(
+      Stream stream, int g_count, float eps, bool out_is_bf16)
+      : UnaryPrimitive(stream),
+        g_count_(g_count),
+        eps_(eps),
+        out_is_bf16_(out_is_bf16) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("Inkling2LoopPairRmsNormCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    if (T < 1 || D < 1 || (g_count_ != 1 && g_count_ != 3)) {
+      throw std::invalid_argument("Inkling2LoopPairRmsNormCuda: invalid shape");
+    }
+
+    const bool vec4 = (D & 3) == 0;
+    auto align_in = [&](const array& a) -> array {
+      if (vec4) {
+        return cu::ensure_row_contiguous_aligned<16>(a, stream(), encoder);
+      }
+      return (a.dtype() == float32)
+          ? cu::ensure_row_contiguous_aligned<4>(a, stream(), encoder)
+          : cu::ensure_row_contiguous_aligned<2>(a, stream(), encoder);
+    };
+    array dest = align_in(inputs[0]);
+    array msg = align_in(inputs[1]);
+
+    const int dest_bcast = (dest.ndim() == 2 || dest.shape(0) == 1) ? 1 : 0;
+    const int msg_bcast = (msg.ndim() == 2 || msg.shape(0) == 1) ? 1 : 0;
+    const int dest_is_f32 = (dest.dtype() == float32) ? 1 : 0;
+    const int msg_is_f32 = (msg.dtype() == float32) ? 1 : 0;
+
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    encoder.set_input_array(dest);
+    encoder.set_input_array(msg);
+    encoder.set_output_array(out);
+
+    static constexpr const char* kEntries[2][2] = {
+        {"ink2_loop_pair_rms_norm_cuda<false, false>",
+         "ink2_loop_pair_rms_norm_cuda<false, true>"},
+        {"ink2_loop_pair_rms_norm_cuda<true, false>",
+         "ink2_loop_pair_rms_norm_cuda<true, true>"},
+    };
+    auto fn = cu::jit_kernel(
+        encoder.device(), inkling2_ops_source,
+        kEntries[out_is_bf16_ ? 1 : 0][vec4 ? 1 : 0]);
+    cu::KernelArgs args;
+    args.append(dest);
+    args.append(msg);
+    args.append(out);
+    args.append<int32_t>(T);
+    args.append<int32_t>(D);
+    args.append<int32_t>(dest_bcast);
+    args.append<int32_t>(msg_bcast);
+    args.append<int32_t>(dest_is_f32);
+    args.append<int32_t>(msg_is_f32);
+    args.append<float>(eps_);
+
+    encoder.add_kernel_node_raw(
+        fn,
+        dim3(static_cast<uint32_t>(g_count_),
+             static_cast<uint32_t>(std::min(T, 65535)), 1),
+        dim3(256, 1, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(Inkling2LoopPairRmsNormCuda)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const Inkling2LoopPairRmsNormCuda*>(&other);
+    return rhs && rhs->g_count_ == g_count_ && rhs->eps_ == eps_ &&
+        rhs->out_is_bf16_ == out_is_bf16_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    if (g_count_ == 1) {
+      return {Shape{T, 2 * D}};
+    }
+    return {Shape{g_count_, T, 2 * D}};
+  }
+
+ private:
+  int g_count_;
+  float eps_;
+  bool out_is_bf16_;
+};
+
+class Inkling2LoopBlendRmsNormCuda final : public UnaryPrimitive {
+ public:
+  Inkling2LoopBlendRmsNormCuda(Stream stream, int g_count, float eps)
+      : UnaryPrimitive(stream), g_count_(g_count), eps_(eps) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("Inkling2LoopBlendRmsNormCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    if (T < 1 || D < 1 || (g_count_ != 1 && g_count_ != 3)) {
+      throw std::invalid_argument("Inkling2LoopBlendRmsNormCuda: invalid shape");
+    }
+
+    const bool vec4 = (D & 3) == 0;
+    auto align_in = [&](const array& a) -> array {
+      if (vec4) {
+        return cu::ensure_row_contiguous_aligned<16>(a, stream(), encoder);
+      }
+      return (a.dtype() == float32)
+          ? cu::ensure_row_contiguous_aligned<4>(a, stream(), encoder)
+          : cu::ensure_row_contiguous_aligned<2>(a, stream(), encoder);
+    };
+    array dest = align_in(inputs[0]);
+    array msg = align_in(inputs[1]);
+    array gf = align_in(inputs[2]);
+    array norm_w = vec4
+        ? cu::ensure_row_contiguous_aligned<16>(inputs[3], stream(), encoder)
+        : cu::ensure_row_contiguous_aligned<4>(inputs[3], stream(), encoder);
+
+    const int dest_bcast = (dest.ndim() == 2 || dest.shape(0) == 1) ? 1 : 0;
+    const int msg_bcast = (msg.ndim() == 2 || msg.shape(0) == 1) ? 1 : 0;
+    const int norm_w_bcast = (norm_w.ndim() == 1 || norm_w.shape(0) == 1) ? 1 : 0;
+    const int dest_is_f32 = (dest.dtype() == float32) ? 1 : 0;
+    const int msg_is_f32 = (msg.dtype() == float32) ? 1 : 0;
+    const int gf_is_f32 = (gf.dtype() == float32) ? 1 : 0;
+
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    encoder.set_input_array(dest);
+    encoder.set_input_array(msg);
+    encoder.set_input_array(gf);
+    encoder.set_input_array(norm_w);
+    encoder.set_output_array(out);
+
+    auto fn = cu::jit_kernel(
+        encoder.device(), inkling2_ops_source,
+        vec4 ? "ink2_loop_blend_rms_norm_cuda<true>"
+             : "ink2_loop_blend_rms_norm_cuda<false>");
+    cu::KernelArgs args;
+    args.append(dest);
+    args.append(msg);
+    args.append(gf);
+    args.append(norm_w);
+    args.append(out);
+    args.append<int32_t>(T);
+    args.append<int32_t>(D);
+    args.append<int32_t>(dest_bcast);
+    args.append<int32_t>(msg_bcast);
+    args.append<int32_t>(norm_w_bcast);
+    args.append<int32_t>(dest_is_f32);
+    args.append<int32_t>(msg_is_f32);
+    args.append<int32_t>(gf_is_f32);
+    args.append<float>(eps_);
+
+    encoder.add_kernel_node_raw(
+        fn,
+        dim3(static_cast<uint32_t>(g_count_),
+             static_cast<uint32_t>(std::min(T, 65535)), 1),
+        dim3(256, 1, 1), {}, 0, args.args());
+  }
+
+  DEFINE_NAME(Inkling2LoopBlendRmsNormCuda)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const Inkling2LoopBlendRmsNormCuda*>(&other);
+    return rhs && rhs->g_count_ == g_count_ && rhs->eps_ == eps_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    if (g_count_ == 1) {
+      return {Shape{T, D}};
+    }
+    return {Shape{g_count_, T, D}};
+  }
+
+ private:
+  int g_count_;
+  float eps_;
+};
+
+class Inkling2LoopUpBlendRmsNormCuda final : public UnaryPrimitive {
+ public:
+  Inkling2LoopUpBlendRmsNormCuda(Stream stream, int g_count, float eps)
+      : UnaryPrimitive(stream), g_count_(g_count), eps_(eps) {}
+
+  void eval_cpu(const std::vector<array>&, array&) override {
+    throw std::runtime_error("Inkling2LoopUpBlendRmsNormCuda requires CUDA");
+  }
+
+  void eval_gpu(const std::vector<array>& inputs, array& out) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    if (inputs.size() != 5u) {
+      throw std::invalid_argument("Inkling2LoopUpBlendRmsNormCuda: invalid arity");
+    }
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    const int t_blocks = (T + 7) / 8;
+    if (T < 1 || t_blocks > 65535 || D < 16 || D > 2304 || (D & 15) != 0 ||
+        (g_count_ != 1 && g_count_ != 3) || inputs[3].dtype() != bfloat16 ||
+        encoder.device().compute_capability_major() < 8) {
+      throw std::invalid_argument("Inkling2LoopUpBlendRmsNormCuda: unsupported shape");
+    }
+
+    array dest = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    array msg = cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
+    array h = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
+    array gf_w = cu::ensure_row_contiguous_aligned<16>(inputs[3], stream(), encoder);
+    array norm_w = cu::ensure_row_contiguous_aligned<16>(inputs[4], stream(), encoder);
+
+    const int dest_bcast = (dest.ndim() == 2 || dest.shape(0) == 1) ? 1 : 0;
+    const int msg_bcast = (msg.ndim() == 2 || msg.shape(0) == 1) ? 1 : 0;
+    const int norm_w_bcast = (norm_w.ndim() == 1 || norm_w.shape(0) == 1) ? 1 : 0;
+    const int dest_is_f32 = (dest.dtype() == float32) ? 1 : 0;
+    const int msg_is_f32 = (msg.dtype() == float32) ? 1 : 0;
+    const int h_is_f32 = (h.dtype() == float32) ? 1 : 0;
+
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    encoder.set_input_array(dest);
+    encoder.set_input_array(msg);
+    encoder.set_input_array(h);
+    encoder.set_input_array(gf_w);
+    encoder.set_input_array(norm_w);
+    encoder.set_output_array(out);
+
+    auto fn = cu::jit_kernel(
+        encoder.device(), inkling2_ops_source, "ink2_loop_up_blend_rms_norm_cuda");
+    const int blend_stride = D + 4;
+    const int smem_bytes =
+        8 * blend_stride * static_cast<int>(sizeof(float)) +
+        8 * 72 * static_cast<int>(sizeof(uint16_t)) +
+        8 * 8 * static_cast<int>(sizeof(float)) +
+        8 * static_cast<int>(sizeof(float));
+    ensure_dynamic_smem(fn, smem_bytes);
+
+    cu::KernelArgs args;
+    args.append(dest);
+    args.append(msg);
+    args.append(h);
+    args.append(gf_w);
+    args.append(norm_w);
+    args.append(out);
+    args.append<int32_t>(T);
+    args.append<int32_t>(D);
+    args.append<int32_t>(dest_bcast);
+    args.append<int32_t>(msg_bcast);
+    args.append<int32_t>(norm_w_bcast);
+    args.append<int32_t>(dest_is_f32);
+    args.append<int32_t>(msg_is_f32);
+    args.append<int32_t>(h_is_f32);
+    args.append<float>(eps_);
+
+    encoder.add_kernel_node_raw(
+        fn,
+        dim3(static_cast<uint32_t>(g_count_), static_cast<uint32_t>(t_blocks), 1),
+        dim3(32, 8, 1), {}, static_cast<uint32_t>(smem_bytes), args.args());
+  }
+
+  DEFINE_NAME(Inkling2LoopUpBlendRmsNormCuda)
+  bool is_equivalent(const Primitive& other) const override {
+    const auto* rhs = dynamic_cast<const Inkling2LoopUpBlendRmsNormCuda*>(&other);
+    return rhs && rhs->g_count_ == g_count_ && rhs->eps_ == eps_;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const int T = (inputs[0].ndim() == 2) ? inputs[0].shape(0) : inputs[0].shape(1);
+    const int D = inputs[0].shape(-1);
+    if (g_count_ == 1) {
+      return {Shape{T, D}};
+    }
+    return {Shape{g_count_, T, D}};
+  }
+
+ private:
+  int g_count_;
+  float eps_;
 };
 
 }  // namespace
@@ -2498,6 +2860,199 @@ extern "C" bool mlx_inkling2_compact_kv_batch_cuda(
   }
 }
 
+extern "C" mlx_array* mlx_inkling2_loop_pair_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    int g_count,
+    float eps,
+    int out_is_bf16) {
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!dest || !msg || (g_count != 1 && g_count != 3) || std::isnan(eps) ||
+        default_device() != Device::gpu) {
+      return nullptr;
+    }
+    const auto& da = *reinterpret_cast<array*>(dest);
+    const auto& ma = *reinterpret_cast<array*>(msg);
+    if ((da.dtype() != float32 && da.dtype() != bfloat16) ||
+        (ma.dtype() != float32 && ma.dtype() != bfloat16) ||
+        (da.ndim() != 2 && da.ndim() != 3) ||
+        (ma.ndim() != 2 && ma.ndim() != 3)) {
+      return nullptr;
+    }
+    const int T = (da.ndim() == 2) ? da.shape(0) : da.shape(1);
+    const int D = da.shape(-1);
+    const int mT = (ma.ndim() == 2) ? ma.shape(0) : ma.shape(1);
+    if (T < 1 || D < 1 || mT != T || ma.shape(-1) != D ||
+        (da.ndim() == 3 && da.shape(0) != 1 && da.shape(0) != g_count) ||
+        (ma.ndim() == 3 && ma.shape(0) != 1 && ma.shape(0) != g_count)) {
+      return nullptr;
+    }
+    const bool bf16_out = (out_is_bf16 != 0);
+    Shape out_shape = (g_count == 1) ? Shape{T, 2 * D} : Shape{g_count, T, 2 * D};
+    const Dtype out_dtype = bf16_out ? bfloat16 : float32;
+    auto result = array(
+        std::move(out_shape), out_dtype,
+        std::make_shared<Inkling2LoopPairRmsNormCuda>(
+            default_stream(Device::gpu), g_count, eps, bf16_out),
+        {da, ma});
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "mlx_inkling2_loop_pair_rms_norm_cuda: %s\n", e.what());
+    return nullptr;
+  } catch (...) {
+    std::fprintf(
+        stderr, "mlx_inkling2_loop_pair_rms_norm_cuda: unknown exception\n");
+    return nullptr;
+  }
+}
+
+extern "C" mlx_array* mlx_inkling2_loop_blend_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    mlx_array* gf,
+    mlx_array* norm_w,
+    int g_count,
+    float eps) {
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    if (!dest || !msg || !gf || !norm_w || (g_count != 1 && g_count != 3) ||
+        std::isnan(eps) || default_device() != Device::gpu) {
+      return nullptr;
+    }
+    const auto& da = *reinterpret_cast<array*>(dest);
+    const auto& ma = *reinterpret_cast<array*>(msg);
+    const auto& gfa = *reinterpret_cast<array*>(gf);
+    const auto& nwa = *reinterpret_cast<array*>(norm_w);
+    if ((da.dtype() != float32 && da.dtype() != bfloat16) ||
+        (ma.dtype() != float32 && ma.dtype() != bfloat16) ||
+        (gfa.dtype() != float32 && gfa.dtype() != bfloat16) ||
+        nwa.dtype() != float32) {
+      return nullptr;
+    }
+    if ((da.ndim() != 2 && da.ndim() != 3) ||
+        (ma.ndim() != 2 && ma.ndim() != 3)) {
+      return nullptr;
+    }
+    const int T = (da.ndim() == 2) ? da.shape(0) : da.shape(1);
+    const int D = da.shape(-1);
+    const int mT = (ma.ndim() == 2) ? ma.shape(0) : ma.shape(1);
+    if (T < 1 || D < 1 || mT != T || ma.shape(-1) != D ||
+        (da.ndim() == 3 && da.shape(0) != 1 && da.shape(0) != g_count) ||
+        (ma.ndim() == 3 && ma.shape(0) != 1 && ma.shape(0) != g_count)) {
+      return nullptr;
+    }
+    const bool valid_gf = (g_count == 1)
+        ? ((gfa.ndim() == 2 && gfa.shape(0) == T && gfa.shape(1) == 2 * D) ||
+           (gfa.ndim() == 3 && gfa.shape(0) == 1 && gfa.shape(1) == T &&
+            gfa.shape(2) == 2 * D))
+        : (gfa.ndim() == 3 && gfa.shape(0) == g_count && gfa.shape(1) == T &&
+           gfa.shape(2) == 2 * D);
+    const bool valid_nw =
+        (nwa.ndim() == 1 && nwa.shape(0) == D) ||
+        (nwa.ndim() == 2 && (nwa.shape(0) == 1 || nwa.shape(0) == g_count) &&
+         nwa.shape(1) == D);
+    if (!valid_gf || !valid_nw) {
+      return nullptr;
+    }
+    Shape out_shape = (g_count == 1) ? Shape{T, D} : Shape{g_count, T, D};
+    auto result = array(
+        std::move(out_shape), bfloat16,
+        std::make_shared<Inkling2LoopBlendRmsNormCuda>(
+            default_stream(Device::gpu), g_count, eps),
+        {da, ma, gfa, nwa});
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::fprintf(
+        stderr, "mlx_inkling2_loop_blend_rms_norm_cuda: %s\n", e.what());
+    return nullptr;
+  } catch (...) {
+    std::fprintf(
+        stderr, "mlx_inkling2_loop_blend_rms_norm_cuda: unknown exception\n");
+    return nullptr;
+  }
+}
+
+extern "C" mlx_array* mlx_inkling2_loop_up_blend_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    mlx_array* h,
+    mlx_array* gf_w,
+    mlx_array* norm_w,
+    int g_count,
+    float eps) {
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::inkling2_ops;
+    using namespace mlx_node::inkling2_cuda;
+    if (!dest || !msg || !h || !gf_w || !norm_w ||
+        (g_count != 1 && g_count != 3) || std::isnan(eps) ||
+        default_device() != Device::gpu ||
+        cu::device(Device::gpu).compute_capability_major() < 8) {
+      return nullptr;
+    }
+    const auto& da = *reinterpret_cast<array*>(dest);
+    const auto& ma = *reinterpret_cast<array*>(msg);
+    const auto& ha = *reinterpret_cast<array*>(h);
+    const auto& gfw = *reinterpret_cast<array*>(gf_w);
+    const auto& nwa = *reinterpret_cast<array*>(norm_w);
+    if ((da.dtype() != float32 && da.dtype() != bfloat16) ||
+        (ma.dtype() != float32 && ma.dtype() != bfloat16) ||
+        (ha.dtype() != float32 && ha.dtype() != bfloat16) ||
+        gfw.dtype() != bfloat16 || nwa.dtype() != float32) {
+      return nullptr;
+    }
+    if ((da.ndim() != 2 && da.ndim() != 3) ||
+        (ma.ndim() != 2 && ma.ndim() != 3)) {
+      return nullptr;
+    }
+    const int T = (da.ndim() == 2) ? da.shape(0) : da.shape(1);
+    const int D = da.shape(-1);
+    const int mT = (ma.ndim() == 2) ? ma.shape(0) : ma.shape(1);
+    if (T < 1 || ((T + 7) / 8) > 65535 || D < 16 || D > 2304 || (D & 15) != 0 ||
+        mT != T || ma.shape(-1) != D ||
+        (da.ndim() == 3 && da.shape(0) != 1 && da.shape(0) != g_count) ||
+        (ma.ndim() == 3 && ma.shape(0) != 1 && ma.shape(0) != g_count)) {
+      return nullptr;
+    }
+    const bool valid_h = (g_count == 1)
+        ? ((ha.ndim() == 2 && ha.shape(0) == T && ha.shape(1) == kLoopRank) ||
+           (ha.ndim() == 3 && ha.shape(0) == 1 && ha.shape(1) == T &&
+            ha.shape(2) == kLoopRank))
+        : (ha.ndim() == 3 && ha.shape(0) == g_count && ha.shape(1) == T &&
+           ha.shape(2) == kLoopRank);
+    const bool valid_gfw =
+        (g_count == 1 && gfw.ndim() == 2 && gfw.shape(0) == 2 * D &&
+         gfw.shape(1) == kLoopRank) ||
+        (gfw.ndim() == 3 && gfw.shape(0) == g_count &&
+         gfw.shape(1) == 2 * D && gfw.shape(2) == kLoopRank);
+    const bool valid_nw =
+        (nwa.ndim() == 1 && nwa.shape(0) == D) ||
+        (nwa.ndim() == 2 && (nwa.shape(0) == 1 || nwa.shape(0) == g_count) &&
+         nwa.shape(1) == D);
+    if (!valid_h || !valid_gfw || !valid_nw) {
+      return nullptr;
+    }
+    Shape out_shape = (g_count == 1) ? Shape{T, D} : Shape{g_count, T, D};
+    auto result = array(
+        std::move(out_shape), bfloat16,
+        std::make_shared<Inkling2LoopUpBlendRmsNormCuda>(
+            default_stream(Device::gpu), g_count, eps),
+        {da, ma, ha, gfw, nwa});
+    return reinterpret_cast<mlx_array*>(new array(std::move(result)));
+  } catch (const std::exception& e) {
+    std::fprintf(
+        stderr, "mlx_inkling2_loop_up_blend_rms_norm_cuda: %s\n", e.what());
+    return nullptr;
+  } catch (...) {
+    std::fprintf(
+        stderr, "mlx_inkling2_loop_up_blend_rms_norm_cuda: unknown exception\n");
+    return nullptr;
+  }
+}
+
 #else
 
 // ============================================================================
@@ -2706,6 +3261,54 @@ extern "C" bool mlx_inkling2_compact_kv_batch_cuda(
     }
   }
   return false;
+}
+
+extern "C" mlx_array* mlx_inkling2_loop_pair_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    int g_count,
+    float eps,
+    int out_is_bf16) {
+  (void)dest;
+  (void)msg;
+  (void)g_count;
+  (void)eps;
+  (void)out_is_bf16;
+  return nullptr;
+}
+
+extern "C" mlx_array* mlx_inkling2_loop_blend_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    mlx_array* gf,
+    mlx_array* norm_w,
+    int g_count,
+    float eps) {
+  (void)dest;
+  (void)msg;
+  (void)gf;
+  (void)norm_w;
+  (void)g_count;
+  (void)eps;
+  return nullptr;
+}
+
+extern "C" mlx_array* mlx_inkling2_loop_up_blend_rms_norm_cuda(
+    mlx_array* dest,
+    mlx_array* msg,
+    mlx_array* h,
+    mlx_array* gf_w,
+    mlx_array* norm_w,
+    int g_count,
+    float eps) {
+  (void)dest;
+  (void)msg;
+  (void)h;
+  (void)gf_w;
+  (void)norm_w;
+  (void)g_count;
+  (void)eps;
+  return nullptr;
 }
 
 #endif  // MLX_NODE_CUDA_ENABLED

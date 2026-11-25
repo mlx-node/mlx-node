@@ -24,6 +24,20 @@ pub(crate) fn bf16_matmul_few(
     }
 }
 
+/// Paired small-row (`M in 1..=16`) BF16 GEMM (`(x0 @ W0^T, x1 @ W1^T)`) on CUDA in 1 launch.
+#[inline]
+pub(crate) fn bf16_gemm_few_pair_cuda(
+    x0: &MxArray,
+    w0: &MxArray,
+    x1: &MxArray,
+    w1: &MxArray,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    cuda::bf16_gemm_few_pair(x0, w0, x1, w1)
+}
+
 /// Small-row BF16-in / BF16-out affine quantized matmul (Metal `M in 2..=8`
 /// `mlx_quantized_matmul_affine_bf16` with F32 sidecars, or CUDA `M in 1..=16`
 /// `Q8_0` fast path with F32/BF16/F16 sidecars, supporting `biases = None`

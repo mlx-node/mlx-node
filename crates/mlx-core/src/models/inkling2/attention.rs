@@ -424,6 +424,53 @@ pub(crate) fn try_forward_q8_pair_cuda(
     )
 }
 
+/// Paired single-launch CUDA BF16 (`LinearProj::Standard`, bias-free) projection for
+/// independent `(x0 @ W0^T, x1 @ W1^T)` when `M in 1..=16`, matching `N`, and `K % 8 == 0`.
+pub(crate) fn try_forward_bf16_pair_cuda(
+    x0: &MxArray,
+    proj0: &LinearProj,
+    x1: &MxArray,
+    proj1: &LinearProj,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    let (LinearProj::Standard(lin0), LinearProj::Standard(lin1)) = (proj0, proj1) else {
+        return Ok(None);
+    };
+    if lin0.get_bias().is_some() || lin1.get_bias().is_some() {
+        return Ok(None);
+    }
+    if x0.dtype()? != DType::BFloat16 || x1.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let w0 = lin0.get_weight();
+    let w1 = lin1.get_weight();
+    if w0.dtype()? != DType::BFloat16 || w1.dtype()? != DType::BFloat16 {
+        return Ok(None);
+    }
+    let nd0 = x0.ndim()?;
+    let nd1 = x1.ndim()?;
+    if nd0 < 2 || nd1 < 2 || w0.ndim()? != 2 || w1.ndim()? != 2 {
+        return Ok(None);
+    }
+    let k_dim = x0.shape_at(nd0 - 1)?;
+    if k_dim < 8 || k_dim % 8 != 0 || x1.shape_at(nd1 - 1)? != k_dim {
+        return Ok(None);
+    }
+    let m0 = x0.size()? as i64 / k_dim;
+    let m1 = x1.size()? as i64 / k_dim;
+    if !(1..=16).contains(&m0) || m1 != m0 {
+        return Ok(None);
+    }
+    let n0 = w0.shape_at(0)?;
+    let n1 = w1.shape_at(0)?;
+    if n0 < 1 || n1 != n0 || w0.shape_at(1)? != k_dim || w1.shape_at(1)? != k_dim {
+        return Ok(None);
+    }
+    crate::kernels::linear::bf16_gemm_few_pair_cuda(x0, &w0, x1, &w1)
+}
+
 /// Row-concatenate two compatible `LinearProj` weights (`Quantized` via `LinearProj::concat_rows`
 /// OR bias-free `Standard` dense BF16/F32 weights) into a single `[N1 + N2, K]` projection.
 pub(crate) fn concat_linear_proj_rows(
@@ -735,15 +782,36 @@ impl Inkling2Attention {
                 )
             };
             let (x_k, x_v) = x_k_v.unwrap_or((x_q, x_q));
-            let paired_kv = if x_k_v.is_some()
-                && self.fused_k_with_conv.is_none()
-                && self.fused_v_with_conv.is_none()
+            let (k_p, v_p, dk_opt, dv_opt) = if let (Some(fk), Some(fv)) =
+                (&self.fused_k_with_conv, &self.fused_v_with_conv)
+                && let Some((kc, vc)) = try_forward_bf16_pair_cuda(x_k, fk, x_v, fv)?
             {
-                try_forward_q8_pair_cuda(&self.k_proj, x_k, &self.v_proj, x_v)?
-            } else {
-                None
-            };
-            let (k_p, v_p, dk_opt, dv_opt) = if let Some((kp, vp)) = paired_kv {
+                let mut k_parts = kc.split_sections(&[kv_dim], -1)?;
+                let dk = k_parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split k_conv: dk"))?;
+                let kp = k_parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split k_conv: k"))?;
+                let mut v_parts = vc.split_sections(&[kv_dim], -1)?;
+                let dv = v_parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split v_conv: dv"))?;
+                let vp = v_parts
+                    .pop()
+                    .ok_or_else(|| Error::from_reason("split v_conv: v"))?;
+                (kp, vp, Some(dk), Some(dv))
+            } else if self.fused_k_with_conv.is_none()
+                && self.fused_v_with_conv.is_none()
+                && let Some((kp, vp)) = if x_k_v.is_some() {
+                    match try_forward_q8_pair_cuda(&self.k_proj, x_k, &self.v_proj, x_v)? {
+                        Some(pair) => Some(pair),
+                        None => try_forward_bf16_pair_cuda(x_k, &self.k_proj, x_v, &self.v_proj)?,
+                    }
+                } else {
+                    try_forward_bf16_pair_cuda(x_k, &self.k_proj, x_v, &self.v_proj)?
+                }
+            {
                 (kp, vp, None, None)
             } else {
                 let (k_p, dk_opt) = if let Some(ref fused_k) = self.fused_k_with_conv {
@@ -1016,10 +1084,17 @@ impl Inkling2Attention {
             if !self.fused_qrg_has_sink {
                 push_linear_proj_arrays(&self.sink_proj, &mut arrays);
             }
-        } else if let Some(ref f) = self.fused_qrg {
-            // `q/r/g/(sink)` alias `fused_qrg`; `k` & `v` (or `fused_{k,v}_with_conv`) are separate.
-            push_linear_proj_arrays(f, &mut arrays);
-            if !self.fused_qrg_has_sink {
+        } else {
+            if let Some(ref f) = self.fused_qrg {
+                // `q/r/g/(sink)` alias `fused_qrg`.
+                push_linear_proj_arrays(f, &mut arrays);
+                if !self.fused_qrg_has_sink {
+                    push_linear_proj_arrays(&self.sink_proj, &mut arrays);
+                }
+            } else {
+                push_linear_proj_arrays(&self.q_proj, &mut arrays);
+                push_linear_proj_arrays(&self.rel_proj, &mut arrays);
+                push_linear_proj_arrays(&self.gate_proj, &mut arrays);
                 push_linear_proj_arrays(&self.sink_proj, &mut arrays);
             }
             if let Some(ref fk) = self.fused_k_with_conv {
@@ -1037,19 +1112,6 @@ impl Inkling2Attention {
                 if let Some(ref p) = self.v_conv_proj {
                     push_linear_proj_arrays(p, &mut arrays);
                 }
-            }
-        } else {
-            push_linear_proj_arrays(&self.q_proj, &mut arrays);
-            push_linear_proj_arrays(&self.k_proj, &mut arrays);
-            push_linear_proj_arrays(&self.v_proj, &mut arrays);
-            push_linear_proj_arrays(&self.rel_proj, &mut arrays);
-            push_linear_proj_arrays(&self.gate_proj, &mut arrays);
-            push_linear_proj_arrays(&self.sink_proj, &mut arrays);
-            if let Some(ref p) = self.k_conv_proj {
-                push_linear_proj_arrays(p, &mut arrays);
-            }
-            if let Some(ref p) = self.v_conv_proj {
-                push_linear_proj_arrays(p, &mut arrays);
             }
         }
         push_linear_proj_arrays(&self.o_proj, &mut arrays);
@@ -1118,21 +1180,28 @@ impl Inkling2Attention {
             if !has_sink {
                 promoted += self.sink_proj.ensure_cuda_device()?;
             }
-        } else if let Some(ref mut fused) = self.fused_qrg {
-            let bytes = fused.ensure_cuda_device()?;
-            if bytes > 0 {
-                let o1 = q_dim;
-                let o2 = o1 + r_dim;
-                let o3 = o2 + g_dim;
-                self.q_proj = slice_proj(fused, 0, o1)?;
-                self.rel_proj = slice_proj(fused, o1, o2)?;
-                self.gate_proj = slice_proj(fused, o2, o3)?;
-                if has_sink {
-                    self.sink_proj = slice_proj(fused, o3, o3 + s_dim)?;
+        } else {
+            if let Some(ref mut fused) = self.fused_qrg {
+                let bytes = fused.ensure_cuda_device()?;
+                if bytes > 0 {
+                    let o1 = q_dim;
+                    let o2 = o1 + r_dim;
+                    let o3 = o2 + g_dim;
+                    self.q_proj = slice_proj(fused, 0, o1)?;
+                    self.rel_proj = slice_proj(fused, o1, o2)?;
+                    self.gate_proj = slice_proj(fused, o2, o3)?;
+                    if has_sink {
+                        self.sink_proj = slice_proj(fused, o3, o3 + s_dim)?;
+                    }
+                    promoted += bytes;
                 }
-                promoted += bytes;
-            }
-            if !has_sink {
+                if !has_sink {
+                    promoted += self.sink_proj.ensure_cuda_device()?;
+                }
+            } else {
+                promoted += self.q_proj.ensure_cuda_device()?;
+                promoted += self.rel_proj.ensure_cuda_device()?;
+                promoted += self.gate_proj.ensure_cuda_device()?;
                 promoted += self.sink_proj.ensure_cuda_device()?;
             }
             if let Some(ref mut fk) = self.fused_k_with_conv {
@@ -1162,19 +1231,6 @@ impl Inkling2Attention {
                 if let Some(ref mut p) = self.v_conv_proj {
                     promoted += p.ensure_cuda_device()?;
                 }
-            }
-        } else {
-            promoted += self.q_proj.ensure_cuda_device()?;
-            promoted += self.k_proj.ensure_cuda_device()?;
-            promoted += self.v_proj.ensure_cuda_device()?;
-            promoted += self.rel_proj.ensure_cuda_device()?;
-            promoted += self.gate_proj.ensure_cuda_device()?;
-            promoted += self.sink_proj.ensure_cuda_device()?;
-            if let Some(ref mut p) = self.k_conv_proj {
-                promoted += p.ensure_cuda_device()?;
-            }
-            if let Some(ref mut p) = self.v_conv_proj {
-                promoted += p.ensure_cuda_device()?;
             }
         }
 

@@ -35,6 +35,76 @@ pub(super) fn bf16_matmul_few(
 }
 
 #[inline]
+pub(super) fn bf16_gemm_few_pair(
+    x0: &MxArray,
+    w0: &MxArray,
+    x1: &MxArray,
+    w1: &MxArray,
+) -> Result<Option<(MxArray, MxArray)>> {
+    if !crate::accelerator::cuda_ops_available() {
+        return Ok(None);
+    }
+    if x0.dtype()? != DType::BFloat16
+        || w0.dtype()? != DType::BFloat16
+        || x1.dtype()? != DType::BFloat16
+        || w1.dtype()? != DType::BFloat16
+    {
+        return Ok(None);
+    }
+    let nd0 = x0.ndim()?;
+    let nd1 = x1.ndim()?;
+    if nd0 < 2 || nd1 < 2 || w0.ndim()? != 2 || w1.ndim()? != 2 {
+        return Ok(None);
+    }
+    let k = x0.shape_at(nd0 - 1)?;
+    if k < 8 || k % 8 != 0 || x1.shape_at(nd1 - 1)? != k {
+        return Ok(None);
+    }
+    let m0 = x0.size()? as i64 / k;
+    let m1 = x1.size()? as i64 / k;
+    if !(1..=16).contains(&m0) || m1 != m0 {
+        return Ok(None);
+    }
+    let n0 = w0.shape_at(0)?;
+    let n1 = w1.shape_at(0)?;
+    if n0 < 1 || n1 != n0 || w0.shape_at(1)? != k || w1.shape_at(1)? != k {
+        return Ok(None);
+    }
+    let mut out0 = std::ptr::null_mut();
+    let mut out1 = std::ptr::null_mut();
+    let ok = unsafe {
+        sys::mlx_bf16_gemm_few_pair_cuda(
+            x0.as_raw_ptr(),
+            w0.as_raw_ptr(),
+            x1.as_raw_ptr(),
+            w1.as_raw_ptr(),
+            &mut out0,
+            &mut out1,
+        )
+    };
+    if !ok || out0.is_null() || out1.is_null() {
+        unsafe {
+            if !out0.is_null() {
+                sys::mlx_array_delete(out0);
+            }
+            if !out1.is_null() {
+                sys::mlx_array_delete(out1);
+            }
+        }
+        return Ok(None);
+    }
+    let arr0 = match MxArray::from_handle(out0, "bf16_gemm_few_pair_cuda:0") {
+        Ok(arr) => arr,
+        Err(err) => {
+            unsafe { sys::mlx_array_delete(out1) };
+            return Err(err);
+        }
+    };
+    let arr1 = MxArray::from_handle(out1, "bf16_gemm_few_pair_cuda:1")?;
+    Ok(Some((arr0, arr1)))
+}
+
+#[inline]
 pub(super) fn affine_q8_matmul_few(
     x: &MxArray,
     weight: &MxArray,
@@ -333,8 +403,8 @@ pub(super) fn q8_prefill_cuda(
 #[cfg(test)]
 mod tests {
     use super::super::{
-        affine_bf16_matmul_few, affine_bf16_matmul_few_pair_cuda, dequant_q8_bf16_cuda,
-        q8_prefill_cuda,
+        affine_bf16_matmul_few, affine_bf16_matmul_few_pair_cuda, bf16_gemm_few_pair_cuda,
+        bf16_matmul_few, dequant_q8_bf16_cuda, q8_prefill_cuda,
     };
     use crate::accelerator::{ActiveBackend, active_backend};
     use crate::array::{DType, MxArray};
@@ -777,5 +847,180 @@ mod tests {
             .unwrap()
             .is_none()
         );
+    }
+
+    fn make_bf16_weight(rng: &mut Lcg, n: usize, k: usize, bound: f32) -> MxArray {
+        let vals: Vec<f32> = (0..n * k).map(|_| rng.uniform(-bound, bound)).collect();
+        MxArray::from_float32(&vals, &[n as i64, k as i64])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap()
+    }
+
+    fn max_abs_diff(got: &[f32], want: &[f32]) -> f32 {
+        assert_eq!(got.len(), want.len());
+        got.iter()
+            .zip(want.iter())
+            .map(|(&g, &w)| {
+                assert!(g.is_finite(), "non-finite output: {g}");
+                (g - w).abs()
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn cuda_bf16_gemm_few_parity() {
+        if active_backend() != ActiveBackend::CudaGpu || !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let mut rng = Lcg::new(0xBF16_FE01);
+        for &k in &[2304usize, 3072] {
+            for &n in &[1056usize, 2304, 3072] {
+                let w = make_bf16_weight(&mut rng, n, k, 0.05);
+                let w_f32_t = w.astype(DType::Float32).unwrap().transpose(None).unwrap();
+                for &m in &[1usize, 2, 3, 4, 8, 12, 16] {
+                    let x3d = make_bf16_input(&mut rng, m, k);
+                    let x2d = x3d.reshape(&[m as i64, k as i64]).unwrap();
+
+                    for (rank_lbl, x, exp_shape) in [
+                        ("2d", &x2d, vec![m as i64, n as i64]),
+                        ("3d", &x3d, vec![1, m as i64, n as i64]),
+                    ] {
+                        let got = bf16_matmul_few(x, &w, n as i64)
+                            .unwrap()
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "bf16_matmul_few must admit ({rank_lbl} M={m}, N={n}, K={k})"
+                                )
+                            });
+                        assert_eq!(got.dtype().unwrap(), DType::BFloat16);
+                        assert_eq!(got.shape().unwrap().as_ref(), exp_shape.as_slice());
+
+                        let ref_f32 = x
+                            .astype(DType::Float32)
+                            .unwrap()
+                            .matmul(&w_f32_t)
+                            .unwrap()
+                            .to_float32()
+                            .unwrap();
+                        let got_f32 = read_bf16_f32(&got);
+                        let err = nrmse(&got_f32, ref_f32.as_ref());
+                        let mad = max_abs_diff(&got_f32, ref_f32.as_ref());
+                        assert!(
+                            err <= 5e-3 && mad <= 0.05,
+                            "bf16_matmul_few mismatch ({rank_lbl} M={m}, N={n}, K={k}): nrmse={err:.3e}, max_abs={mad:.5}"
+                        );
+                    }
+                }
+            }
+        }
+        crate::array::clear_cache();
+    }
+
+    #[test]
+    fn cuda_bf16_gemm_few_pair_parity() {
+        if active_backend() != ActiveBackend::CudaGpu || !crate::accelerator::cuda_ops_available() {
+            return;
+        }
+        let mut rng = Lcg::new(0xBF16_BA12);
+        for &(n, k) in &[
+            (512usize, 2304usize),
+            (1024usize, 2304usize),
+            (1056, 2304),
+            (2304, 2304),
+            (3072, 2304),
+            (2304, 3072),
+        ] {
+            let w0 = make_bf16_weight(&mut rng, n, k, 0.05);
+            let w1 = make_bf16_weight(&mut rng, n, k, 0.05);
+            let w0_f32_t = w0.astype(DType::Float32).unwrap().transpose(None).unwrap();
+            let w1_f32_t = w1.astype(DType::Float32).unwrap().transpose(None).unwrap();
+
+            for &m in &[1usize, 2, 3, 4, 8, 12, 16] {
+                let x0_3d = make_bf16_input(&mut rng, m, k);
+                let x1_3d = make_bf16_input(&mut rng, m, k);
+                let x0_2d = x0_3d.reshape(&[m as i64, k as i64]).unwrap();
+                let x1_2d = x1_3d.reshape(&[m as i64, k as i64]).unwrap();
+
+                for (rank_lbl, x0, x1, exp_shape) in [
+                    ("2d", &x0_2d, &x1_2d, vec![m as i64, n as i64]),
+                    ("3d", &x0_3d, &x1_3d, vec![1, m as i64, n as i64]),
+                ] {
+                    let (p0, p1) = bf16_gemm_few_pair_cuda(x0, &w0, x1, &w1)
+                        .unwrap()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "bf16_gemm_few_pair_cuda must admit ({rank_lbl} M={m}, N={n}, K={k})"
+                            )
+                        });
+                    assert_eq!(p0.dtype().unwrap(), DType::BFloat16);
+                    assert_eq!(p1.dtype().unwrap(), DType::BFloat16);
+                    assert_eq!(p0.shape().unwrap().as_ref(), exp_shape.as_slice());
+                    assert_eq!(p1.shape().unwrap().as_ref(), exp_shape.as_slice());
+
+                    let ref0 = x0
+                        .astype(DType::Float32)
+                        .unwrap()
+                        .matmul(&w0_f32_t)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap();
+                    let ref1 = x1
+                        .astype(DType::Float32)
+                        .unwrap()
+                        .matmul(&w1_f32_t)
+                        .unwrap()
+                        .to_float32()
+                        .unwrap();
+                    let g0 = read_bf16_f32(&p0);
+                    let g1 = read_bf16_f32(&p1);
+                    assert_ne!(g0, g1, "pair outputs must reflect distinct inputs/weights");
+
+                    let err0 = nrmse(&g0, ref0.as_ref());
+                    let err1 = nrmse(&g1, ref1.as_ref());
+                    let mad0 = max_abs_diff(&g0, ref0.as_ref());
+                    let mad1 = max_abs_diff(&g1, ref1.as_ref());
+                    assert!(
+                        err0 <= 5e-3 && err1 <= 5e-3 && mad0 <= 0.05 && mad1 <= 0.05,
+                        "bf16_gemm_few_pair mismatch ({rank_lbl} M={m}, N={n}, K={k}): err0={err0:.3e} mad0={mad0:.5}, err1={err1:.3e} mad1={mad1:.5}"
+                    );
+                }
+            }
+        }
+
+        // Guard checks: M > 16, mismatched N, mismatched M, and FP32 input decline cleanly.
+        let w_a = make_bf16_weight(&mut rng, 1024, 2304, 0.05);
+        let w_b = make_bf16_weight(&mut rng, 1056, 2304, 0.05);
+        let x4 = make_bf16_input(&mut rng, 4, 2304)
+            .reshape(&[4, 2304])
+            .unwrap();
+        let x8 = make_bf16_input(&mut rng, 8, 2304)
+            .reshape(&[8, 2304])
+            .unwrap();
+        let x17 = make_bf16_input(&mut rng, 17, 2304)
+            .reshape(&[17, 2304])
+            .unwrap();
+        let x4_f32 = x4.astype(DType::Float32).unwrap();
+        assert!(
+            bf16_gemm_few_pair_cuda(&x17, &w_a, &x17, &w_a)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bf16_gemm_few_pair_cuda(&x4, &w_a, &x4, &w_b)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bf16_gemm_few_pair_cuda(&x4, &w_a, &x8, &w_a)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            bf16_gemm_few_pair_cuda(&x4_f32, &w_a, &x4, &w_a)
+                .unwrap()
+                .is_none()
+        );
+        crate::array::clear_cache();
     }
 }

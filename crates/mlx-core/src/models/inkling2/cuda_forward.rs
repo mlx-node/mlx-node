@@ -18,7 +18,8 @@ use crate::array::{DType, MxArray};
 use crate::kernels::inkling2::{
     KvConvPrepParams, LmHeadOutMode, MoeForwardParams, MoeQuantMode, SdpaParams,
     block_attn_res_norm_cuda, embed_rmsnorm_cuda, kv_conv_prep_store_cuda, lm_head_softcap_cuda,
-    loop_ctrl_norm_cuda, moe_forward_cuda, sconv_k4_residual_cuda, sdpa_few_cuda,
+    loop_blend_rms_norm_cuda, loop_ctrl_norm_cuda, loop_pair_rms_norm_cuda,
+    loop_up_blend_rms_norm_cuda, moe_forward_cuda, sconv_k4_residual_cuda, sdpa_few_cuda,
     sdpa_prefill_cuda,
 };
 use crate::models::quantized_linear::{
@@ -234,8 +235,9 @@ struct ChunkImageSplice<'a> {
 
 /// Single-launch fused token embedding lookup + precise FP32 RMSNorm -> BF16 on CUDA
 /// (`embed_rmsnorm_cuda`), supporting dense BF16 and packed affine Q8_0 (`bits == 8,
-/// group_size == 32, mode == "affine"`). Returns `Ok(None)` cleanly off CUDA or for
-/// unsupported embedding backends so callers fall back to `embed.forward` + RMSNorm.
+/// group_size == 32, mode == "affine"`, explicit `biases: Some(...)`). Returns `Ok(None)`
+/// cleanly off CUDA or for unsupported/incomplete embedding backends so callers fall back
+/// to `embed.forward` + RMSNorm (never assuming missing affine biases are symmetric Q8).
 pub(crate) fn try_embed_rmsnorm_cuda(
     embed: &Embedding,
     token_ids: &MxArray,
@@ -350,6 +352,69 @@ fn slice_stream_2d(stacked: &MxArray, idx: i64, t: i64, d: i64) -> Result<MxArra
         .squeeze(Some(&[0]))
 }
 
+/// Run LoopController + sublayer RMSNorm on CUDA:
+/// - `t_usize <= 16` (decode & verify tree): single-launch fused `loop_ctrl_norm_cuda`.
+/// - `t_usize > 16` (prefill): `loop_pair_rms_norm_cuda` -> cuBLAS `h = pair @ down_proj_t` ->
+///   fused `loop_up_blend_rms_norm_cuda` (eliminating the `[G, T, 2*D]` `gf` DRAM intermediate
+///   and second cuBLAS launch for BF16 weights on SM >= 8.0), falling back cleanly to
+///   `gf = h @ gain_forget_proj_t` -> `loop_blend_rms_norm_cuda` when declined (e.g. FP32
+///   loop controller weights via `MLX_INKLING2_LOOP_BF16=0`).
+#[allow(clippy::too_many_arguments)]
+fn run_cuda_loop_ctrl_norm(
+    dest: &MxArray,
+    msg: &MxArray,
+    down_w: &MxArray,
+    down_proj_t: &MxArray,
+    gain_forget_w: &MxArray,
+    gain_forget_proj_t: &MxArray,
+    norm_w: &MxArray,
+    norm_eps: f32,
+    g_count: i32,
+    squeeze_g1: bool,
+    t_usize: usize,
+) -> Result<Option<MxArray>> {
+    if t_usize > 16 && (g_count == 3 || (g_count == 1 && squeeze_g1)) {
+        let w_dtype = down_proj_t.dtype()?;
+        if (w_dtype == DType::BFloat16 || w_dtype == DType::Float32)
+            && gain_forget_proj_t.dtype()? == w_dtype
+        {
+            let out_is_bf16 = w_dtype == DType::BFloat16;
+            if let Some(pair) =
+                loop_pair_rms_norm_cuda(dest, msg, g_count, ATTN_RES_EPS, out_is_bf16)?
+            {
+                let h = pair.matmul(down_proj_t)?;
+                if let Some(out) = loop_up_blend_rms_norm_cuda(
+                    dest,
+                    msg,
+                    &h,
+                    gain_forget_w,
+                    norm_w,
+                    g_count,
+                    norm_eps,
+                )? {
+                    return Ok(Some(out));
+                }
+                let gf = h.matmul(gain_forget_proj_t)?;
+                if let Some(out) =
+                    loop_blend_rms_norm_cuda(dest, msg, &gf, norm_w, g_count, norm_eps)?
+                {
+                    return Ok(Some(out));
+                }
+            }
+        }
+    }
+    loop_ctrl_norm_cuda(
+        dest,
+        msg,
+        down_w,
+        gain_forget_w,
+        norm_w,
+        norm_eps,
+        g_count,
+        squeeze_g1,
+    )
+}
+
 /// Execute one logical visit (`0..48`) on CUDA using all Wave 2 fused primitives.
 #[allow(clippy::too_many_arguments)]
 fn forward_cuda_visit(
@@ -440,15 +505,18 @@ fn forward_cuda_visit(
                 AttnInputNorm::Local(w) => w,
                 AttnInputNorm::Global { qkv_norm, .. } => qkv_norm,
             };
-            let x_qkv = loop_ctrl_norm_cuda(
+            let x_qkv = run_cuda_loop_ctrl_norm(
                 &attn_dest,
                 &msgs_qkv,
                 &ctrl.qkv_down_w,
+                &ctrl.qkv_down_proj_t,
                 &ctrl.qkv_gain_forget_w,
+                &ctrl.qkv_gain_forget_proj_t,
                 norm_w,
                 layer.rms_norm_eps,
                 3,
                 false,
+                t_usize,
             )?
             .ok_or_else(|| {
                 Error::from_reason(format!(
@@ -830,15 +898,18 @@ fn forward_cuda_visit(
         }
         let t_lc = profile.is_some().then(Instant::now);
         let msg_mlp = slice_stream_2d(msgs, 3, t_i64, d_i64)?;
-        let out = loop_ctrl_norm_cuda(
+        let out = run_cuda_loop_ctrl_norm(
             &dest_mlp,
             &msg_mlp,
             &ctrl.mlp_ctrl.down_proj_w,
+            &ctrl.mlp_ctrl.down_proj_t,
             &ctrl.mlp_ctrl.gain_forget_w,
+            &ctrl.mlp_ctrl.gain_forget_proj_t,
             &layer.ffn_norm,
             layer.rms_norm_eps,
             1,
             true,
+            t_usize,
         )?
         .ok_or_else(|| {
             Error::from_reason(format!(
@@ -1047,7 +1118,9 @@ fn run_cuda_lm_head(
         }
     }
 
-    // Fallback (M > 16 full-sequence logits or unsupported lm_head quant format).
+    // Fallback (M > 16 full-sequence logits or unsupported lm_head quant format):
+    // always stay packed and keep full FP32 logit precision via `forward_logits_keep_f32`
+    // (avoids materializing a dense BF16 copy of `lm_head` or rounding logits before softcap).
     let logits_full = lm_head.forward_logits_keep_f32(normed_out)?;
     let vocab_cols = logits_full.shape()?[1];
     let unpadded_i64 = unpadded_vocab as i64;
@@ -1876,5 +1949,68 @@ mod tests {
             Some(0..500)
         );
         assert_eq!(chunk_tap_slice_range(0, 500, 500, Some(0)), None);
+    }
+
+    #[test]
+    fn try_embed_rmsnorm_cuda_declines_affine_without_biases() {
+        let vocab = 16u32;
+        let d = 64u32;
+        let mut emb = Embedding::new_uninitialized(vocab, d).unwrap();
+        let w = MxArray::zeros(&[i64::from(vocab), i64::from(d / 4)], Some(DType::Uint32)).unwrap();
+        let s =
+            MxArray::ones(&[i64::from(vocab), i64::from(d / 32)], Some(DType::Float16)).unwrap();
+        emb.load_quantized_packed(&w, &s, None, 32, 8, DEFAULT_QUANT_MODE)
+            .unwrap();
+        let ids = MxArray::from_int32(&[0, 1], &[2]).unwrap();
+        let norm_w = MxArray::ones(&[i64::from(d)], Some(DType::Float32)).unwrap();
+        // Missing affine biases must NEVER be silently decoded as symmetric Q8 (`q - 128`).
+        assert!(
+            try_embed_rmsnorm_cuda(&emb, &ids, &norm_w, 1e-6)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn run_cuda_lm_head_m17_q8_preserves_f32_logit_precision() {
+        use crate::models::quantized_linear::QuantizedLinear;
+
+        // Construct an asymmetric Q8_0 (bits=8, group_size=32) head with FP32 sidecars
+        // where row 1 exceeds row 0 by 0.02 at magnitude ~16.0 (BF16 ULP at 16.0 is 0.125,
+        // so routing M=17 through BF16 `forward` would collapse row 0 and row 1 to a tie!).
+        let m = 17usize;
+        let d = 64usize;
+        let v = 8usize;
+        let g = d / 32;
+        let w = MxArray::zeros(&[v as i64, (d / 4) as i64], Some(DType::Uint32)).unwrap();
+        let s = MxArray::ones(&[v as i64, g as i64], Some(DType::Float32)).unwrap();
+        let mut biases_f32 = vec![0.0f32; v * g];
+        // x is all 1.0 (sum = 64), so with q == 0, logit[row] = sum_g (32 * bias[row, g]).
+        // Row 0: 64 * 0.25 = 16.000; Row 1: 32 * 0.25 + 32 * 0.250625 = 16.020 -> winner is 1.
+        biases_f32[0] = 0.25;
+        biases_f32[1] = 0.25;
+        biases_f32[g] = 0.25;
+        biases_f32[g + 1] = 0.250_625;
+        let b = MxArray::from_float32(&biases_f32, &[v as i64, g as i64]).unwrap();
+        let ql = QuantizedLinear::new(w, s, Some(b), None, 32, 8, DEFAULT_QUANT_MODE.to_string());
+        let lm_head = LinearProj::Quantized(ql);
+        let x = MxArray::ones(&[m as i64, d as i64], Some(DType::BFloat16)).unwrap();
+
+        let logits = run_cuda_lm_head(&lm_head, &x, v, 0.0, false).unwrap();
+        assert_eq!(logits.dtype().unwrap(), DType::Float32);
+        let vals = logits.to_float32().unwrap();
+        for row in 0..m {
+            let l0 = vals[row * v];
+            let l1 = vals[row * v + 1];
+            assert!(
+                (l0 - 16.0).abs() < 1e-4 && (l1 - 16.02).abs() < 1e-4 && l1 > l0,
+                "row {row}: expected l0=16.0, l1=16.02 (FP32 preserved), got l0={l0}, l1={l1}"
+            );
+        }
+        let argmax = run_cuda_lm_head(&lm_head, &x, v, 0.0, true)
+            .unwrap()
+            .to_int32()
+            .unwrap();
+        assert_eq!(argmax.as_ref(), vec![1i32; m].as_slice());
     }
 }

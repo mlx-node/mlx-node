@@ -2727,8 +2727,19 @@ unsafe extern "C-unwind" {
         biases: *mut mlx_array,
     ) -> *mut mlx_array;
 
-    /// Bandwidth-bound BF16 small-row (M in 1..=8) linear projection Y = X @ W^T on CUDA.
+    /// Bandwidth-bound BF16 small-row (M in 1..=16) linear projection Y = X @ W^T on CUDA.
     pub fn mlx_bf16_gemm_few_cuda(x: *mut mlx_array, w: *mut mlx_array) -> *mut mlx_array;
+
+    /// Bandwidth-bound paired BF16 small-row (M in 1..=16) linear projections
+    /// `(x0 @ W0^T, x1 @ W1^T)` with matching `(M, N, K)` in a single CUDA launch.
+    pub fn mlx_bf16_gemm_few_pair_cuda(
+        x0: *mut mlx_array,
+        w0: *mut mlx_array,
+        x1: *mut mlx_array,
+        w1: *mut mlx_array,
+        out0: *mut *mut mlx_array,
+        out1: *mut *mut mlx_array,
+    ) -> bool;
 
     /// Tensor-Core split-KV causal Flash-Decoding for D=256, GQA folded M=gqa*Q<=64 on CUDA.
     pub fn mlx_sdpa_tc_few_cuda(
@@ -4646,6 +4657,41 @@ unsafe extern "C" {
         eps: f32,
         g_count: i32,
         squeeze_g1: bool,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController stage 1: fused weightless RMSNorm + concat
+    /// `[rms_norm(dest, eps), rms_norm(msg, eps)]` -> `[T, 2*D]` (`g_count == 1`) or
+    /// `[3, T, 2*D]` (`g_count == 3`) in BF16 (`out_is_bf16 != 0`) or FP32.
+    pub fn mlx_inkling2_loop_pair_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
+        out_is_bf16: i32,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController stage 3: fused `(1 - tanh(forget)) * dest + tanh(gain) * msg`
+    /// + sublayer RMSNorm -> `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+    pub fn mlx_inkling2_loop_blend_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        gf: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
+    ) -> *mut mlx_array;
+
+    /// Prefill LoopController fused stage 2b+3: Tensor Core `h @ gf_w.T` +
+    /// `(1 - tanh(forget)) * dest + tanh(gain) * msg` + sublayer RMSNorm ->
+    /// `[T, D]` (`g_count == 1`) or `[3, T, D]` (`g_count == 3`) BF16.
+    pub fn mlx_inkling2_loop_up_blend_rms_norm_cuda(
+        dest: *mut mlx_array,
+        msg: *mut mlx_array,
+        h: *mut mlx_array,
+        gf_w: *mut mlx_array,
+        norm_w: *mut mlx_array,
+        g_count: i32,
+        eps: f32,
     ) -> *mut mlx_array;
 
     /// Fused Q/R L2-clip + K/V ShortConv (static SWA or dynamic Global, linear

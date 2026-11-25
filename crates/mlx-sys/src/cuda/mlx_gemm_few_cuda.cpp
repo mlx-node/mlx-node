@@ -11,8 +11,10 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace mlx::core::gemm_few {
 namespace {
@@ -488,6 +490,66 @@ private:
   bool symmetric_;
 };
 
+int bf16_sm_count(int dev_ordinal) {
+  static std::mutex mu;
+  static std::unordered_map<int, int> cache;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = cache.find(dev_ordinal);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  int sms = 48;
+  CUdevice dev = 0;
+  if (cuDeviceGet(&dev, dev_ordinal) == CUDA_SUCCESS) {
+    int val = 0;
+    if (cuDeviceGetAttribute(
+            &val, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev) == CUDA_SUCCESS &&
+        val > 0) {
+      sms = val;
+    }
+  }
+  cache[dev_ordinal] = sms;
+  return sms;
+}
+
+void bf16_ensure_carveout(CUfunction fn, int carveout_pct) {
+  static std::mutex mu;
+  static std::unordered_map<CUfunction, int> configured;
+  std::lock_guard<std::mutex> lock(mu);
+  auto it = configured.find(fn);
+  if (it != configured.end() && it->second == carveout_pct) {
+    return;
+  }
+  (void)cuFuncSetAttribute(
+      fn, CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT, carveout_pct);
+  configured[fn] = carveout_pct;
+}
+
+int bf16_choose_split_k(
+    int grid_ctas, int num_units, int num_sms, int target_ctas_per_sm) noexcept {
+  const int target = num_sms * target_ctas_per_sm;
+  if (grid_ctas <= 0 || grid_ctas >= target || num_units < 4) {
+    return 1;
+  }
+  const int max_sk = std::min(8, num_units / 2);
+  if (max_sk < 2) {
+    return 1;
+  }
+  const int needed = (target + grid_ctas - 1) / grid_ctas;
+  if (needed <= 1) {
+    return 1;
+  }
+  if (needed >= max_sk) {
+    return max_sk;
+  }
+  for (int sk = needed; sk <= std::min(needed + 1, max_sk); ++sk) {
+    if ((num_units % sk) == 0) {
+      return sk;
+    }
+  }
+  return needed;
+}
+
 class Bf16GemmFew : public UnaryPrimitive {
 public:
   explicit Bf16GemmFew(Stream stream) : UnaryPrimitive(stream) {}
@@ -500,10 +562,6 @@ public:
     auto& encoder = cu::get_command_encoder(stream());
     array x = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
     array w = cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
-    encoder.set_input_array(x);
-    encoder.set_input_array(w);
-    out.set_data(cu::malloc_async(out.nbytes(), encoder));
-    encoder.set_output_array(out);
 
     const int K = x.shape(-1);
     const int M = (K > 0) ? static_cast<int>(x.size() / K) : 0;
@@ -511,34 +569,157 @@ public:
     if (M < 1 || M > 16 || N <= 0 || K < 8 || K % 8 != 0) {
       throw std::invalid_argument("Bf16GemmFew: unsupported replay shape");
     }
-    static constexpr const char* kBf16Entries[16] = {
-        "mlx_node_bf16_gemm_few<1>",
-        "mlx_node_bf16_gemm_few<2>",
-        "mlx_node_bf16_gemm_few<3>",
-        "mlx_node_bf16_gemm_few<4>",
-        "mlx_node_bf16_gemm_few<5>",
-        "mlx_node_bf16_gemm_few<6>",
-        "mlx_node_bf16_gemm_few<7>",
-        "mlx_node_bf16_gemm_few<8>",
-        "mlx_node_bf16_gemm_few<9>",
-        "mlx_node_bf16_gemm_few<10>",
-        "mlx_node_bf16_gemm_few<11>",
-        "mlx_node_bf16_gemm_few<12>",
-        "mlx_node_bf16_gemm_few<13>",
-        "mlx_node_bf16_gemm_few<14>",
-        "mlx_node_bf16_gemm_few<15>",
-        "mlx_node_bf16_gemm_few<16>",
+
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    const int num_sms = bf16_sm_count(encoder.device().cuda_device());
+
+    auto bind_and_build_args = [&](const array& target_out) {
+      encoder.set_input_array(x);
+      encoder.set_input_array(w);
+      encoder.set_output_array(target_out);
+      cu::KernelArgs args;
+      args.append(x);
+      args.append(w);
+      args.append(target_out);
+      args.append<int32_t>(M);
+      args.append<int32_t>(N);
+      args.append<int32_t>(K);
+      return args;
     };
+
+    auto launch_reduce = [&](const array& partials, int split_k) {
+      encoder.set_input_array(partials);
+      encoder.set_output_array(out);
+      auto red_kernel = cu::jit_kernel(
+          encoder.device(), bf16_gemm_few_source,
+          "mlx_node_bf16_gemm_few_reduce");
+      cu::KernelArgs red_args;
+      red_args.append(partials);
+      red_args.append(out);
+      red_args.append<int32_t>(M);
+      red_args.append<int32_t>(N);
+      red_args.append<int32_t>(split_k);
+      const int total = M * N;
+      const int work = ((total & 3) == 0) ? (total >> 2) : total;
+      encoder.add_kernel_node_raw(
+          red_kernel, dim3(static_cast<uint32_t>((work + 127) / 128)),
+          dim3(128), {}, 0, red_args.args());
+    };
+
+    if (M <= 3) {
+      // M in 1..=3: 2-rows-per-warp, 4-warp/CTA (8 rows/CTA, 0 B SMEM) streaming
+      // uint4 kernel sharing L1-cached X across 2 weight rows per warp.
+      static constexpr const char* kU4TwoRowEntries[3][2] = {
+          {"mlx_node_bf16_gemm_few_u4_2row<1, false>",
+           "mlx_node_bf16_gemm_few_u4_2row<1, true>"},
+          {"mlx_node_bf16_gemm_few_u4_2row<2, false>",
+           "mlx_node_bf16_gemm_few_u4_2row<2, true>"},
+          {"mlx_node_bf16_gemm_few_u4_2row<3, false>",
+           "mlx_node_bf16_gemm_few_u4_2row<3, true>"},
+      };
+      const int grid_n = (N + 7) / 8;
+      const int k_chunks = ((K >> 3) + 31) >> 5;
+      const int split_k = bf16_choose_split_k(grid_n, k_chunks, num_sms, 2);
+
+      auto kernel = cu::jit_kernel(
+          encoder.device(), bf16_gemm_few_source,
+          kU4TwoRowEntries[M - 1][split_k > 1 ? 1 : 0]);
+      bf16_ensure_carveout(kernel, 0);
+
+      if (split_k > 1) {
+        array partials(Shape{split_k, M, N}, float32, nullptr, {});
+        partials.set_data(cu::malloc_async(partials.nbytes(), encoder));
+        encoder.add_temporary(partials);
+        auto args = bind_and_build_args(partials);
+        encoder.add_kernel_node_raw(
+            kernel,
+            dim3(static_cast<uint32_t>(grid_n), static_cast<uint32_t>(split_k)),
+            dim3(32, 4), {}, 0, args.args());
+        launch_reduce(partials, split_k);
+        return;
+      }
+
+      auto args = bind_and_build_args(out);
+      encoder.add_kernel_node_raw(
+          kernel, dim3(static_cast<uint32_t>(grid_n)), dim3(32, 4), {}, 0,
+          args.args());
+      return;
+    }
+
+    const bool has_mma = encoder.device().compute_capability_major() >= 8;
+    const bool use_mma = has_mma && (M >= 9) && (K >= 128) && ((K & 15) == 0);
+
+    if (use_mma) {
+      static constexpr const char* kMma2Entries[2] = {
+          "mlx_node_bf16_gemm_few_mma<2, false>",
+          "mlx_node_bf16_gemm_few_mma<2, true>",
+      };
+      const int row_blocks = (N + 15) / 16;
+      const int num_tiles = K >> 7;
+      // MMA uses 8-warp (256-thread) CTAs; >= 2 CTAs/SM already saturates DRAM
+      // bandwidth without paying Split-K partial alloc + reduce overhead.
+      const int split_k = bf16_choose_split_k(row_blocks, num_tiles, num_sms, 2);
+
+      auto kernel = cu::jit_kernel(
+          encoder.device(), bf16_gemm_few_source,
+          kMma2Entries[split_k > 1 ? 1 : 0]);
+      bf16_ensure_carveout(kernel, 25);
+
+      if (split_k > 1) {
+        array partials(Shape{split_k, M, N}, float32, nullptr, {});
+        partials.set_data(cu::malloc_async(partials.nbytes(), encoder));
+        encoder.add_temporary(partials);
+        auto args = bind_and_build_args(partials);
+        encoder.add_kernel_node_raw(
+            kernel,
+            dim3(static_cast<uint32_t>(row_blocks), static_cast<uint32_t>(split_k)),
+            dim3(32, 8), {}, 0, args.args());
+        launch_reduce(partials, split_k);
+        return;
+      }
+
+      auto args = bind_and_build_args(out);
+      encoder.add_kernel_node_raw(
+          kernel, dim3(static_cast<uint32_t>(row_blocks)), dim3(32, 8), {}, 0,
+          args.args());
+      return;
+    }
+
+    // M in 4..=8 (and M in 9..=16 fallback when sm < 80, K < 128, or K % 16 != 0):
+    // 1-row-per-warp 4-warp streaming uint4 (0 B SMEM, 0 barriers, sk=1 for N >= 384).
+    static constexpr const char* kU4Entries[2][2] = {
+        {"mlx_node_bf16_gemm_few_u4<8, 4, false>",
+         "mlx_node_bf16_gemm_few_u4<8, 4, true>"},
+        {"mlx_node_bf16_gemm_few_u4<16, 4, false>",
+         "mlx_node_bf16_gemm_few_u4<16, 4, true>"},
+    };
+    const int m_idx = (M <= 8) ? 0 : 1;
+    const int grid_n = (N + 3) / 4;
+    const int k_chunks = ((K >> 3) + 31) >> 5;
+    const int split_k = bf16_choose_split_k(grid_n, k_chunks, num_sms, 2);
+
     auto kernel = cu::jit_kernel(
-        encoder.device(), bf16_gemm_few_source, kBf16Entries[M - 1]);
-    cu::KernelArgs args;
-    args.append(x);
-    args.append(w);
-    args.append(out);
-    args.append<int32_t>(N);
-    args.append<int32_t>(K);
+        encoder.device(), bf16_gemm_few_source,
+        kU4Entries[m_idx][split_k > 1 ? 1 : 0]);
+    bf16_ensure_carveout(kernel, 0);
+
+    if (split_k > 1) {
+      array partials(Shape{split_k, M, N}, float32, nullptr, {});
+      partials.set_data(cu::malloc_async(partials.nbytes(), encoder));
+      encoder.add_temporary(partials);
+      auto args = bind_and_build_args(partials);
+      encoder.add_kernel_node_raw(
+          kernel,
+          dim3(static_cast<uint32_t>(grid_n), static_cast<uint32_t>(split_k)),
+          dim3(32, 4), {}, 0, args.args());
+      launch_reduce(partials, split_k);
+      return;
+    }
+
+    auto args = bind_and_build_args(out);
     encoder.add_kernel_node_raw(
-        kernel, dim3((N + 7) / 8), dim3(32, 4), {}, 0, args.args());
+        kernel, dim3(static_cast<uint32_t>(grid_n)), dim3(32, 4), {}, 0,
+        args.args());
   }
 
   DEFINE_NAME(Bf16GemmFew)
@@ -549,6 +730,221 @@ public:
     auto shape = inputs[0].shape();
     shape.back() = inputs[1].shape(0);
     return {std::move(shape)};
+  }
+};
+
+class Bf16GemmFewPair : public Primitive {
+public:
+  explicit Bf16GemmFewPair(Stream stream) : Primitive(stream) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Bf16GemmFewPair requires CUDA");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs, std::vector<array>& outputs) override {
+    auto& encoder = cu::get_command_encoder(stream());
+    if (inputs.size() != 4u || outputs.size() != 2u) {
+      throw std::invalid_argument("Bf16GemmFewPair: invalid input/output count");
+    }
+    array x0 = cu::ensure_row_contiguous_aligned<16>(inputs[0], stream(), encoder);
+    array w0 = cu::ensure_row_contiguous_aligned<16>(inputs[1], stream(), encoder);
+    array x1 = cu::ensure_row_contiguous_aligned<16>(inputs[2], stream(), encoder);
+    array w1 = cu::ensure_row_contiguous_aligned<16>(inputs[3], stream(), encoder);
+
+    const int K = x0.shape(-1);
+    const int M = (K > 0) ? static_cast<int>(x0.size() / K) : 0;
+    const int N = w0.shape(0);
+    if (M < 1 || M > 16 || N <= 0 || K < 8 || (K % 8) != 0 ||
+        x1.shape(-1) != K || static_cast<int>(x1.size() / K) != M ||
+        w1.shape(0) != N) {
+      throw std::invalid_argument("Bf16GemmFewPair: unsupported replay shape");
+    }
+
+    auto& out0 = outputs[0];
+    auto& out1 = outputs[1];
+    out0.set_data(cu::malloc_async(out0.nbytes(), encoder));
+    out1.set_data(cu::malloc_async(out1.nbytes(), encoder));
+    const int num_sms = bf16_sm_count(encoder.device().cuda_device());
+
+    auto bind_and_build_args = [&](const array& dst0, const array& dst1) {
+      encoder.set_input_array(x0);
+      encoder.set_input_array(w0);
+      encoder.set_input_array(x1);
+      encoder.set_input_array(w1);
+      encoder.set_output_array(dst0);
+      encoder.set_output_array(dst1);
+      cu::KernelArgs args;
+      args.append(x0);
+      args.append(w0);
+      args.append(dst0);
+      args.append(x1);
+      args.append(w1);
+      args.append(dst1);
+      args.append<int32_t>(M);
+      args.append<int32_t>(N);
+      args.append<int32_t>(K);
+      return args;
+    };
+
+    auto launch_reduce_pair =
+        [&](const array& p0, const array& p1, int split_k) {
+          encoder.set_input_array(p0);
+          encoder.set_input_array(p1);
+          encoder.set_output_array(out0);
+          encoder.set_output_array(out1);
+          auto red_kernel = cu::jit_kernel(
+              encoder.device(), bf16_gemm_few_source,
+              "mlx_node_bf16_gemm_few_reduce_pair");
+          cu::KernelArgs red_args;
+          red_args.append(p0);
+          red_args.append(out0);
+          red_args.append(p1);
+          red_args.append(out1);
+          red_args.append<int32_t>(M);
+          red_args.append<int32_t>(N);
+          red_args.append<int32_t>(split_k);
+          const int total = M * N;
+          const int work = ((total & 3) == 0) ? (total >> 2) : total;
+          encoder.add_kernel_node_raw(
+              red_kernel,
+              dim3(static_cast<uint32_t>((work + 127) / 128), 2, 1),
+              dim3(128), {}, 0, red_args.args());
+        };
+
+    if (M <= 3) {
+      static constexpr const char* kU4TwoRowPairEntries[3][2] = {
+          {"mlx_node_bf16_gemm_few_u4_2row_pair<1, false>",
+           "mlx_node_bf16_gemm_few_u4_2row_pair<1, true>"},
+          {"mlx_node_bf16_gemm_few_u4_2row_pair<2, false>",
+           "mlx_node_bf16_gemm_few_u4_2row_pair<2, true>"},
+          {"mlx_node_bf16_gemm_few_u4_2row_pair<3, false>",
+           "mlx_node_bf16_gemm_few_u4_2row_pair<3, true>"},
+      };
+      const int grid_n = (N + 7) / 8;
+      const int k_chunks = ((K >> 3) + 31) >> 5;
+      const int split_k = bf16_choose_split_k(grid_n * 2, k_chunks, num_sms, 2);
+
+      auto kernel = cu::jit_kernel(
+          encoder.device(), bf16_gemm_few_source,
+          kU4TwoRowPairEntries[M - 1][split_k > 1 ? 1 : 0]);
+      bf16_ensure_carveout(kernel, 0);
+
+      if (split_k > 1) {
+        array p0(Shape{split_k, M, N}, float32, nullptr, {});
+        array p1(Shape{split_k, M, N}, float32, nullptr, {});
+        p0.set_data(cu::malloc_async(p0.nbytes(), encoder));
+        p1.set_data(cu::malloc_async(p1.nbytes(), encoder));
+        encoder.add_temporary(p0);
+        encoder.add_temporary(p1);
+        auto args = bind_and_build_args(p0, p1);
+        encoder.add_kernel_node_raw(
+            kernel,
+            dim3(static_cast<uint32_t>(grid_n), static_cast<uint32_t>(split_k), 2),
+            dim3(32, 4, 1), {}, 0, args.args());
+        launch_reduce_pair(p0, p1, split_k);
+        return;
+      }
+
+      auto args = bind_and_build_args(out0, out1);
+      encoder.add_kernel_node_raw(
+          kernel, dim3(static_cast<uint32_t>(grid_n), 1, 2), dim3(32, 4, 1), {},
+          0, args.args());
+      return;
+    }
+
+    const bool has_mma = encoder.device().compute_capability_major() >= 8;
+    const bool use_mma = has_mma && (M >= 9) && (K >= 128) && ((K & 15) == 0);
+
+    if (use_mma) {
+      static constexpr const char* kMma2PairEntries[2] = {
+          "mlx_node_bf16_gemm_few_mma_pair<2, false>",
+          "mlx_node_bf16_gemm_few_mma_pair<2, true>",
+      };
+      const int row_blocks = (N + 15) / 16;
+      const int num_tiles = K >> 7;
+      const int split_k =
+          bf16_choose_split_k(row_blocks * 2, num_tiles, num_sms, 2);
+
+      auto kernel = cu::jit_kernel(
+          encoder.device(), bf16_gemm_few_source,
+          kMma2PairEntries[split_k > 1 ? 1 : 0]);
+      bf16_ensure_carveout(kernel, 25);
+
+      if (split_k > 1) {
+        array p0(Shape{split_k, M, N}, float32, nullptr, {});
+        array p1(Shape{split_k, M, N}, float32, nullptr, {});
+        p0.set_data(cu::malloc_async(p0.nbytes(), encoder));
+        p1.set_data(cu::malloc_async(p1.nbytes(), encoder));
+        encoder.add_temporary(p0);
+        encoder.add_temporary(p1);
+        auto args = bind_and_build_args(p0, p1);
+        encoder.add_kernel_node_raw(
+            kernel,
+            dim3(
+                static_cast<uint32_t>(row_blocks),
+                static_cast<uint32_t>(split_k),
+                2),
+            dim3(32, 8, 1), {}, 0, args.args());
+        launch_reduce_pair(p0, p1, split_k);
+        return;
+      }
+
+      auto args = bind_and_build_args(out0, out1);
+      encoder.add_kernel_node_raw(
+          kernel, dim3(static_cast<uint32_t>(row_blocks), 1, 2),
+          dim3(32, 8, 1), {}, 0, args.args());
+      return;
+    }
+
+    static constexpr const char* kU4PairEntries[2][2] = {
+        {"mlx_node_bf16_gemm_few_u4_pair<8, 4, false>",
+         "mlx_node_bf16_gemm_few_u4_pair<8, 4, true>"},
+        {"mlx_node_bf16_gemm_few_u4_pair<16, 4, false>",
+         "mlx_node_bf16_gemm_few_u4_pair<16, 4, true>"},
+    };
+    const int m_idx = (M <= 8) ? 0 : 1;
+    const int grid_n = (N + 3) / 4;
+    const int k_chunks = ((K >> 3) + 31) >> 5;
+    const int split_k = bf16_choose_split_k(grid_n * 2, k_chunks, num_sms, 2);
+
+    auto kernel = cu::jit_kernel(
+        encoder.device(), bf16_gemm_few_source,
+        kU4PairEntries[m_idx][split_k > 1 ? 1 : 0]);
+    bf16_ensure_carveout(kernel, 0);
+
+    if (split_k > 1) {
+      array p0(Shape{split_k, M, N}, float32, nullptr, {});
+      array p1(Shape{split_k, M, N}, float32, nullptr, {});
+      p0.set_data(cu::malloc_async(p0.nbytes(), encoder));
+      p1.set_data(cu::malloc_async(p1.nbytes(), encoder));
+      encoder.add_temporary(p0);
+      encoder.add_temporary(p1);
+      auto args = bind_and_build_args(p0, p1);
+      encoder.add_kernel_node_raw(
+          kernel,
+          dim3(static_cast<uint32_t>(grid_n), static_cast<uint32_t>(split_k), 2),
+          dim3(32, 4, 1), {}, 0, args.args());
+      launch_reduce_pair(p0, p1, split_k);
+      return;
+    }
+
+    auto args = bind_and_build_args(out0, out1);
+    encoder.add_kernel_node_raw(
+        kernel, dim3(static_cast<uint32_t>(grid_n), 1, 2), dim3(32, 4, 1), {},
+        0, args.args());
+  }
+
+  DEFINE_NAME(Bf16GemmFewPair)
+  bool is_equivalent(const Primitive& other) const override {
+    return dynamic_cast<const Bf16GemmFewPair*>(&other) != nullptr;
+  }
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    auto s0 = inputs[0].shape();
+    s0.back() = inputs[1].shape(0);
+    auto s1 = inputs[2].shape();
+    s1.back() = inputs[3].shape(0);
+    return {std::move(s0), std::move(s1)};
   }
 };
 
@@ -746,6 +1142,60 @@ extern "C" mlx_array* mlx_bf16_gemm_few_cuda(
   return nullptr;
 }
 
+extern "C" bool mlx_bf16_gemm_few_pair_cuda(
+    mlx_array* x0_handle, mlx_array* w0_handle,
+    mlx_array* x1_handle, mlx_array* w1_handle,
+    mlx_array** out0_handle, mlx_array** out1_handle) {
+  if (out0_handle) {
+    *out0_handle = nullptr;
+  }
+  if (out1_handle) {
+    *out1_handle = nullptr;
+  }
+  try {
+    using namespace mlx::core;
+    if (!x0_handle || !w0_handle || !x1_handle || !w1_handle ||
+        !out0_handle || !out1_handle || default_device() != Device::gpu) {
+      return false;
+    }
+    const auto& x0 = *reinterpret_cast<array*>(x0_handle);
+    const auto& w0 = *reinterpret_cast<array*>(w0_handle);
+    const auto& x1 = *reinterpret_cast<array*>(x1_handle);
+    const auto& w1 = *reinterpret_cast<array*>(w1_handle);
+    if (x0.dtype() != bfloat16 || w0.dtype() != bfloat16 ||
+        x1.dtype() != bfloat16 || w1.dtype() != bfloat16 ||
+        x0.ndim() < 2 || x1.ndim() < 2 || w0.ndim() != 2 || w1.ndim() != 2) {
+      return false;
+    }
+    const int K = x0.shape(-1);
+    const int N = w0.shape(0);
+    if (K < 8 || (K % 8) != 0 || x1.shape(-1) != K ||
+        w0.shape(1) != K || w1.shape(1) != K || N <= 0 || w1.shape(0) != N) {
+      return false;
+    }
+    const int64_t rows0 = static_cast<int64_t>(x0.size()) / K;
+    const int64_t rows1 = static_cast<int64_t>(x1.size()) / K;
+    if (rows0 < 1 || rows0 > 16 || rows1 != rows0) {
+      return false;
+    }
+    auto shape0 = x0.shape();
+    shape0.back() = N;
+    auto shape1 = x1.shape();
+    shape1.back() = N;
+    auto outputs = array::make_arrays(
+        {std::move(shape0), std::move(shape1)}, {bfloat16, bfloat16},
+        std::make_shared<gemm_few::Bf16GemmFewPair>(
+            default_stream(Device::gpu)),
+        {x0, w0, x1, w1});
+    *out0_handle = reinterpret_cast<mlx_array*>(new array(std::move(outputs[0])));
+    *out1_handle = reinterpret_cast<mlx_array*>(new array(std::move(outputs[1])));
+    return true;
+  } catch (const std::exception& e) {
+    std::cerr << "mlx_bf16_gemm_few_pair_cuda error: " << e.what() << std::endl;
+  }
+  return false;
+}
+
 #else
 
 extern "C" mlx_array* mlx_affine_q8_few_cuda(
@@ -786,6 +1236,23 @@ extern "C" mlx_array* mlx_bf16_gemm_few_cuda(
   (void)x_handle;
   (void)w_handle;
   return nullptr;
+}
+
+extern "C" bool mlx_bf16_gemm_few_pair_cuda(
+    mlx_array* x0_handle, mlx_array* w0_handle,
+    mlx_array* x1_handle, mlx_array* w1_handle,
+    mlx_array** out0_handle, mlx_array** out1_handle) {
+  (void)x0_handle;
+  (void)w0_handle;
+  (void)x1_handle;
+  (void)w1_handle;
+  if (out0_handle) {
+    *out0_handle = nullptr;
+  }
+  if (out1_handle) {
+    *out1_handle = nullptr;
+  }
+  return false;
 }
 
 #endif

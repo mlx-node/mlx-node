@@ -50,10 +50,45 @@ __device__ __forceinline__ float2 i2_decode_fp8_e4m3x2_unscaled(unsigned int pai
   return __half22float2(*reinterpret_cast<const __half2*>(&h2));
 }
 
+// PTX ISA 9.2 (CUDA 13.2+) Blackwell arch-specific direct FP4/FP8 -> bf16x2 conversions.
+// Earlier toolchains (e.g. CUDA 13.0 on Blackwell) fall back to PTX 8.1 cvt.rn.f16x2.e4m3x2
+// for FP8 and the SMEM E2M1 LUT for NVFP4 so NVRTC never emits unsupported PTX 9.2 ops.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
+    (defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__)) && \
+    defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 13) || (__CUDACC_VER_MAJOR__ == 13 && __CUDACC_VER_MINOR__ >= 2))
+#define I2_HAS_HW_FP4_CVT 1
+#else
+#define I2_HAS_HW_FP4_CVT 0
+#endif
+
+// PTX ISA 8.1 (CUDA 12.1+) Ada/Hopper/Blackwell FP8 E4M3FN -> f16x2 conversion.
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890) && \
+    defined(__CUDACC_VER_MAJOR__) && defined(__CUDACC_VER_MINOR__) && \
+    ((__CUDACC_VER_MAJOR__ > 12) || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 1))
+#define I2_HAS_HW_FP8_F16_CVT 1
+#else
+#define I2_HAS_HW_FP8_F16_CVT 0
+#endif
+
 // Exact 0-ULP 2x FP8 E4M3FN -> bf16x2 (scale 1.0) for BF16 Tensor Cores.
+// Uses 1-instr Blackwell cvt.rn.bf16x2.e4m3x2 (CUDA 13.2+), Ada/Hopper/Blackwell cvt.rn.f16x2.e4m3x2, or SW fallback.
 __device__ __forceinline__ unsigned int i2_decode_fp8_e4m3x2_bf16x2(unsigned int pair16) {
+#if I2_HAS_HW_FP4_CVT
+  unsigned int bf2;
+  const unsigned short p16 = static_cast<unsigned short>(pair16);
+  asm("{ cvt.rn.bf16x2.e4m3x2 %0, %1; }" : "=r"(bf2) : "h"(p16));
+  return bf2;
+#elif I2_HAS_HW_FP8_F16_CVT
+  unsigned int h2;
+  const unsigned short p16 = static_cast<unsigned short>(pair16);
+  asm("{ cvt.rn.f16x2.e4m3x2 %0, %1; }" : "=r"(h2) : "h"(p16));
+  const float2 f = __half22float2(*reinterpret_cast<const __half2*>(&h2));
+  return i2_pack_bf16x2(f.x, f.y);
+#else
   const float2 f = i2_decode_fp8_e4m3x2_unscaled(pair16);
   return i2_pack_bf16x2(f.x * 256.0f, f.y * 256.0f);
+#endif
 }
 
 // Exact UE8M0 scale decode (matches inkling2_moe.metal:116-119).
@@ -72,13 +107,6 @@ __device__ __forceinline__ unsigned int i2_e2m1_to_bf16(unsigned int nib) {
 __device__ __forceinline__ unsigned int i2_e2m1x2_to_bf16x2(unsigned int byte8) {
   return i2_e2m1_to_bf16(byte8 & 0xFu) | (i2_e2m1_to_bf16((byte8 >> 4) & 0xFu) << 16);
 }
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && \
-    (defined(__CUDA_ARCH_SPECIFIC__) || defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
-#define I2_HAS_HW_FP4_CVT 1
-#else
-#define I2_HAS_HW_FP4_CVT 0
-#endif
 
 // Bit-exact 2x E2M1 -> bf16x2 (1-instr hardware PTX on Blackwell sm_100a/120a/121a).
 __device__ __forceinline__ unsigned int i2_fast_e2m1x2_to_bf16x2(unsigned int byte8) {
@@ -99,7 +127,7 @@ __device__ __forceinline__ float2 i2_fast_e4m3x2_to_f2(unsigned short pair16) {
   unsigned int bf2;
   asm("{ cvt.rn.bf16x2.e4m3x2 %0, %1; }" : "=r"(bf2) : "h"(pair16));
   return __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&bf2));
-#elif defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+#elif I2_HAS_HW_FP8_F16_CVT
   unsigned int h2;
   asm("{ cvt.rn.f16x2.e4m3x2 %0, %1; }" : "=r"(h2) : "h"(pair16));
   return __half22float2(*reinterpret_cast<const __half2*>(&h2));
@@ -107,6 +135,14 @@ __device__ __forceinline__ float2 i2_fast_e4m3x2_to_f2(unsigned short pair16) {
   const float2 f = i2_decode_fp8_e4m3x2_unscaled(pair16);
   return make_float2(f.x * 256.0f, f.y * 256.0f);
 #endif
+}
+
+__device__ __forceinline__ uint2 i2_ld_cs_u2(const uint2* ptr) {
+  uint2 v;
+  asm("ld.global.cs.v2.u32 {%0, %1}, [%2];\n"
+      : "=r"(v.x), "=r"(v.y)
+      : "l"(ptr));
+  return v;
 }
 
 __device__ __forceinline__ float4 i2_ld_cs_f4(const float4* ptr) {
@@ -184,7 +220,8 @@ __device__ __forceinline__ nv_bfloat16 i2_situ_epilogue(
   const float g_sig = 1.0f / (1.0f + expf(-g));
   return __float2bfloat16_rn(g_sc * g_sig * u_sc);
 }
-
+)cuda"
+R"cuda(
 // Unpack 8 quantized weights in uint2 into 4 bf16x2 regs for BF16 MMA (SymQ8/AffineQ8/MXFP8).
 template <int MODE>
 __device__ __forceinline__ void i2_unpack8_to_bf16x2(const uint2& w, unsigned int out[4]) {
@@ -1215,6 +1252,481 @@ void inkling2_moe_gate_up_situ_nvfp4_few(
   __syncthreads();
 
   compute_all_16(p1_lo, p1_hi);
+  __syncthreads();
+
+  if constexpr (!INTERLEAVED) {
+    smem.red.gate[warp][2 * t][g] = p0_lo[0];
+    smem.red.gate[warp][2 * t + 1][g] = p0_lo[1];
+    smem.red.gate[warp][2 * t][g + 8] = p0_lo[2];
+    smem.red.gate[warp][2 * t + 1][g + 8] = p0_lo[3];
+    smem.red.up[warp][2 * t][g] = p1_lo[0];
+    smem.red.up[warp][2 * t + 1][g] = p1_lo[1];
+    smem.red.up[warp][2 * t][g + 8] = p1_lo[2];
+    smem.red.up[warp][2 * t + 1][g + 8] = p1_lo[3];
+    if constexpr (ALLOW_HI) {
+      if (do_hi) {
+        smem.red.gate[warp][8 + 2 * t][g] = p0_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g] = p0_hi[1];
+        smem.red.gate[warp][8 + 2 * t][g + 8] = p0_hi[2];
+        smem.red.gate[warp][8 + 2 * t + 1][g + 8] = p0_hi[3];
+        smem.red.up[warp][8 + 2 * t][g] = p1_hi[0];
+        smem.red.up[warp][8 + 2 * t + 1][g] = p1_hi[1];
+        smem.red.up[warp][8 + 2 * t][g + 8] = p1_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g + 8] = p1_hi[3];
+      }
+    }
+  } else {
+    smem.red.gate[warp][2 * t][g] = p0_lo[0];
+    smem.red.gate[warp][2 * t + 1][g] = p0_lo[1];
+    smem.red.up[warp][2 * t][g] = p0_lo[2];
+    smem.red.up[warp][2 * t + 1][g] = p0_lo[3];
+    smem.red.gate[warp][2 * t][g + 8] = p1_lo[0];
+    smem.red.gate[warp][2 * t + 1][g + 8] = p1_lo[1];
+    smem.red.up[warp][2 * t][g + 8] = p1_lo[2];
+    smem.red.up[warp][2 * t + 1][g + 8] = p1_lo[3];
+    if constexpr (ALLOW_HI) {
+      if (do_hi) {
+        smem.red.gate[warp][8 + 2 * t][g] = p0_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g] = p0_hi[1];
+        smem.red.up[warp][8 + 2 * t][g] = p0_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g] = p0_hi[3];
+        smem.red.gate[warp][8 + 2 * t][g + 8] = p1_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g + 8] = p1_hi[1];
+        smem.red.up[warp][8 + 2 * t][g + 8] = p1_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g + 8] = p1_hi[3];
+      }
+    }
+  }
+  __syncthreads();
+
+  const int total_out = cnt * 16;
+  for (int idx = tid; idx < total_out; idx += 288) {
+    const int c = idx >> 4;
+    const int r = idx & 15;
+    float gv = 0.0f;
+    float uv = 0.0f;
+#pragma unroll
+    for (int ww = 0; ww < 9; ++ww) {
+      gv += smem.red.gate[ww][c][r];
+      uv += smem.red.up[ww][c][r];
+    }
+    mid[static_cast<size_t>(s_pair[c]) * I + row0 + r] = i2_situ_epilogue(gv, uv, outer_s);
+  }
+}
+)cuda"
+R"cuda(
+// ---------------------------------------------------------------------------
+// 2A-SYMQ8. Silicon-Roofline Linear-18KB K-Half SymQ8 Gate + Up + SiTU(4, 25)
+//           9 warps (288 thr), 2 passes x 2 K-halves of 18KB W (9 cache lines/row,
+//           100% coalesced ld.global.cs.v4.u32) + 2.25KB contiguous S,
+//           0 bank conflicts, 0 spills, 20.9 KB SMEM (3 CTAs/SM <= 64 KB carveout
+//           -> full 64 KB L1 for x reuse). Supports INTERL=false/true & F16/BF16 sc.
+//           0-ULP batch-invariant across M in 1..=16.
+//           Grid: dim3(72, M * 8), Block: dim3(32, 9) -> BN = 16, K = 2304.
+// ---------------------------------------------------------------------------
+template <bool INTERLEAVED, bool ALLOW_HI>
+__global__ __launch_bounds__(288, 3)
+void inkling2_moe_gate_up_situ_symq8_few(
+    const unsigned int* __restrict__ gu_w,
+    const unsigned short* __restrict__ gu_scales,
+    const float* __restrict__ gu_outer_scale,
+    const nv_bfloat16* __restrict__ x,
+    const int* __restrict__ unique_experts,
+    const int* __restrict__ bucket_offsets,
+    const int* __restrict__ pair_indices,
+    const int* __restrict__ num_unique,
+    nv_bfloat16* __restrict__ mid,
+    int sb_is_bf16) {
+  const int u_idx = blockIdx.y;
+  if (u_idx >= num_unique[0]) return;
+  const int expert = unique_experts[u_idx];
+  const int first = bucket_offsets[u_idx];
+  const int cnt = bucket_offsets[u_idx + 1] - first;
+  if (cnt <= 0) return;
+
+  constexpr int I = 1152;
+  constexpr int N2 = 2304;
+  const int row0 = blockIdx.x * 16;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int tid = warp * 32 + lane;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const size_t exp_base = static_cast<size_t>(expert) * N2;
+  const float outer_s = gu_outer_scale ? gu_outer_scale[expert] : 1.0f;
+
+  union SharedSymQ8Gu {
+    struct {
+      alignas(16) uint4 w[16][74]; // 18,944 B (74*4 == 8 mod 32 -> 0 LDS.64 bank conflicts)
+      alignas(16) uint4 sc[16][9]; //  2,304 B (9*4  == 4 mod 32 -> 0 bank conflicts)
+    } buf;
+    struct {
+      float gate[9][ALLOW_HI ? 16 : 8][17];
+      float up[9][ALLOW_HI ? 16 : 8][17];
+    } red;
+  };
+  __shared__ SharedSymQ8Gu smem;
+  __shared__ int s_tok[16];
+  __shared__ int s_pair[16];
+
+  if (tid < cnt) {
+    const int p = pair_indices[first + tid];
+    s_pair[tid] = p;
+    s_tok[tid] = p >> 3;
+  } else if (tid < 16) {
+    s_pair[tid] = 0;
+    s_tok[tid] = -1;
+  }
+
+  // Division-free mapping: tid in 0..287 -> (lr in 0..3, lc in 0..71); tid in 0..143 -> (sr, sc_c)
+  const int r_hi = (tid >= 144) ? 2 : 0;
+  const int rem = tid - r_hi * 72;
+  const int r_lo = (rem >= 72) ? 1 : 0;
+  const int lr = r_hi + r_lo;
+  const int lc = rem - r_lo * 72;
+  const int sr = (tid * 57) >> 9;
+  const int sc_c = tid - sr * 9;
+
+  const uint4* w_u4 = reinterpret_cast<const uint4*>(gu_w);
+  const uint4* s_u4 = reinterpret_cast<const uint4*>(gu_scales);
+
+  auto load_kh = [&](int pass, int kh) {
+    const size_t base_r = INTERLEAVED
+        ? (exp_base + 2 * row0 + (pass ? 16 : 0))
+        : (exp_base + (pass ? I : 0) + row0);
+    const uint4* wp = w_u4 + base_r * 144 + kh * 72 + lr * 144 + lc;
+    const uint4 v0 = ptx_ld_cs_u4(wp);
+    const uint4 v1 = ptx_ld_cs_u4(wp + 576);
+    const uint4 v2 = ptx_ld_cs_u4(wp + 1152);
+    const uint4 v3 = ptx_ld_cs_u4(wp + 1728);
+    uint4 sv;
+    if (kh == 0 && tid < 144) sv = ptx_ld_cs_u4(s_u4 + base_r * 9 + tid);
+    if constexpr (!INTERLEAVED) {
+      smem.buf.w[lr][lc] = v0;
+      smem.buf.w[4 + lr][lc] = v1;
+      smem.buf.w[8 + lr][lc] = v2;
+      smem.buf.w[12 + lr][lc] = v3;
+      if (kh == 0 && tid < 144) smem.buf.sc[sr][sc_c] = sv;
+    } else {
+      const int d_odd = (lr & 1) << 3;
+      const int d_half = lr >> 1;
+      smem.buf.w[d_odd + d_half][lc] = v0;
+      smem.buf.w[d_odd + 2 + d_half][lc] = v1;
+      smem.buf.w[d_odd + 4 + d_half][lc] = v2;
+      smem.buf.w[d_odd + 6 + d_half][lc] = v3;
+      if (kh == 0 && tid < 144) smem.buf.sc[((sr & 1) << 3) | (sr >> 1)][sc_c] = sv;
+    }
+  };
+
+  load_kh(0, 0);
+  __syncthreads();
+
+  const int tok_g_lo = s_tok[g];
+  const uint4* x_lo_p = (tok_g_lo >= 0)
+      ? reinterpret_cast<const uint4*>(x + static_cast<size_t>(tok_g_lo) * 2304) : nullptr;
+  [[maybe_unused]] const int tok_g_hi = ALLOW_HI ? s_tok[8 + g] : -1;
+  [[maybe_unused]] const bool do_hi = ALLOW_HI && (cnt > 8);
+  [[maybe_unused]] const uint4* x_hi_p = (ALLOW_HI && tok_g_hi >= 0)
+      ? reinterpret_cast<const uint4*>(x + static_cast<size_t>(tok_g_hi) * 2304) : nullptr;
+
+  const uint2* w_r0 = reinterpret_cast<const uint2*>(&smem.buf.w[g][warp * 8]);
+  const uint2* w_r1 = reinterpret_cast<const uint2*>(&smem.buf.w[g + 8][warp * 8]);
+
+  auto compute_kh = [&](int kh, float acc_lo[4], float acc_hi[4]) {
+    const uint2 sc0_u2 = reinterpret_cast<const uint2*>(smem.buf.sc[g])[kh * 9 + warp];
+    const uint2 sc1_u2 = reinterpret_cast<const uint2*>(smem.buf.sc[g + 8])[kh * 9 + warp];
+    const int grp_base = kh * 36 + warp * 4;
+#pragma unroll 1
+    for (int kg = 0; kg < 4; ++kg) {
+      const int grp32 = grp_base + kg;
+      unsigned int wb0[4], wb1[4];
+      i2_unpack8_to_bf16x2<1>(w_r0[kg * 4 + t], wb0);
+      i2_unpack8_to_bf16x2<1>(w_r1[kg * 4 + t], wb1);
+
+      const uint4 xv0 = x_lo_p ? x_lo_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+      float d0, d1, d2, d3;
+      ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, wb0[0], wb1[0], wb0[1], wb1[1], xv0.x, xv0.y);
+      ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, wb0[2], wb1[2], wb0[3], wb1[3], xv0.z, xv0.w);
+
+      const unsigned short s0h = static_cast<unsigned short>(((kg < 2) ? sc0_u2.x : sc0_u2.y) >> ((kg & 1) * 16));
+      const unsigned short s1h = static_cast<unsigned short>(((kg < 2) ? sc1_u2.x : sc1_u2.y) >> ((kg & 1) * 16));
+      const float sc0 = i2_read_f16_or_bf16(s0h, sb_is_bf16);
+      const float sc1 = i2_read_f16_or_bf16(s1h, sb_is_bf16);
+      acc_lo[0] = fmaf(sc0, d0, acc_lo[0]);
+      acc_lo[1] = fmaf(sc0, d1, acc_lo[1]);
+      acc_lo[2] = fmaf(sc1, d2, acc_lo[2]);
+      acc_lo[3] = fmaf(sc1, d3, acc_lo[3]);
+
+      if constexpr (ALLOW_HI) {
+        if (do_hi) {
+          const uint4 xv1 = x_hi_p ? x_hi_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+          float h0, h1, h2, h3;
+          ptx_mma_m16n8k16_bf16_z(h0, h1, h2, h3, wb0[0], wb1[0], wb0[1], wb1[1], xv1.x, xv1.y);
+          ptx_mma_m16n8k16_bf16(h0, h1, h2, h3, wb0[2], wb1[2], wb0[3], wb1[3], xv1.z, xv1.w);
+          acc_hi[0] = fmaf(sc0, h0, acc_hi[0]);
+          acc_hi[1] = fmaf(sc0, h1, acc_hi[1]);
+          acc_hi[2] = fmaf(sc1, h2, acc_hi[2]);
+          acc_hi[3] = fmaf(sc1, h3, acc_hi[3]);
+        }
+      }
+    }
+  };
+
+  float p0_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float p1_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  [[maybe_unused]] float p0_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  [[maybe_unused]] float p1_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  compute_kh(0, p0_lo, p0_hi);
+  __syncthreads();
+  load_kh(0, 1);
+  __syncthreads();
+  compute_kh(1, p0_lo, p0_hi);
+  __syncthreads();
+
+  load_kh(1, 0);
+  __syncthreads();
+  compute_kh(0, p1_lo, p1_hi);
+  __syncthreads();
+  load_kh(1, 1);
+  __syncthreads();
+  compute_kh(1, p1_lo, p1_hi);
+  __syncthreads();
+
+  if constexpr (!INTERLEAVED) {
+    smem.red.gate[warp][2 * t][g] = p0_lo[0];
+    smem.red.gate[warp][2 * t + 1][g] = p0_lo[1];
+    smem.red.gate[warp][2 * t][g + 8] = p0_lo[2];
+    smem.red.gate[warp][2 * t + 1][g + 8] = p0_lo[3];
+    smem.red.up[warp][2 * t][g] = p1_lo[0];
+    smem.red.up[warp][2 * t + 1][g] = p1_lo[1];
+    smem.red.up[warp][2 * t][g + 8] = p1_lo[2];
+    smem.red.up[warp][2 * t + 1][g + 8] = p1_lo[3];
+    if constexpr (ALLOW_HI) {
+      if (do_hi) {
+        smem.red.gate[warp][8 + 2 * t][g] = p0_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g] = p0_hi[1];
+        smem.red.gate[warp][8 + 2 * t][g + 8] = p0_hi[2];
+        smem.red.gate[warp][8 + 2 * t + 1][g + 8] = p0_hi[3];
+        smem.red.up[warp][8 + 2 * t][g] = p1_hi[0];
+        smem.red.up[warp][8 + 2 * t + 1][g] = p1_hi[1];
+        smem.red.up[warp][8 + 2 * t][g + 8] = p1_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g + 8] = p1_hi[3];
+      }
+    }
+  } else {
+    smem.red.gate[warp][2 * t][g] = p0_lo[0];
+    smem.red.gate[warp][2 * t + 1][g] = p0_lo[1];
+    smem.red.up[warp][2 * t][g] = p0_lo[2];
+    smem.red.up[warp][2 * t + 1][g] = p0_lo[3];
+    smem.red.gate[warp][2 * t][g + 8] = p1_lo[0];
+    smem.red.gate[warp][2 * t + 1][g + 8] = p1_lo[1];
+    smem.red.up[warp][2 * t][g + 8] = p1_lo[2];
+    smem.red.up[warp][2 * t + 1][g + 8] = p1_lo[3];
+    if constexpr (ALLOW_HI) {
+      if (do_hi) {
+        smem.red.gate[warp][8 + 2 * t][g] = p0_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g] = p0_hi[1];
+        smem.red.up[warp][8 + 2 * t][g] = p0_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g] = p0_hi[3];
+        smem.red.gate[warp][8 + 2 * t][g + 8] = p1_hi[0];
+        smem.red.gate[warp][8 + 2 * t + 1][g + 8] = p1_hi[1];
+        smem.red.up[warp][8 + 2 * t][g + 8] = p1_hi[2];
+        smem.red.up[warp][8 + 2 * t + 1][g + 8] = p1_hi[3];
+      }
+    }
+  }
+  __syncthreads();
+
+  const int total_out = cnt * 16;
+  for (int idx = tid; idx < total_out; idx += 288) {
+    const int c = idx >> 4;
+    const int r = idx & 15;
+    float gv = 0.0f;
+    float uv = 0.0f;
+#pragma unroll
+    for (int ww = 0; ww < 9; ++ww) {
+      gv += smem.red.gate[ww][c][r];
+      uv += smem.red.up[ww][c][r];
+    }
+    mid[static_cast<size_t>(s_pair[c]) * I + row0 + r] = i2_situ_epilogue(gv, uv, outer_s);
+  }
+}
+)cuda"
+R"cuda(
+// ---------------------------------------------------------------------------
+// 2A-MXFP8. Silicon-Roofline Linear-18KB K-Half MXFP8 Gate + Up + SiTU(4, 25)
+//           9 warps (288 thr), 2 passes x 2 K-halves of 18KB W + 1.125KB UE8M0 S
+//           (vectorized uint2 loads + 1-instr HW cvt.rn.bf16x2.e4m3x2 / f16x2!),
+//           0 bank conflicts, 0 spills, 19.8 KB SMEM (3 CTAs/SM <= 64 KB carveout
+//           -> full 64 KB L1 for x reuse). Supports INTERL=false and INTERL=true.
+//           0-ULP batch-invariant across M in 1..=16.
+//           Grid: dim3(72, M * 8), Block: dim3(32, 9) -> BN = 16, K = 2304.
+// ---------------------------------------------------------------------------
+template <bool INTERLEAVED, bool ALLOW_HI>
+__global__ __launch_bounds__(288, 3)
+void inkling2_moe_gate_up_situ_mxfp8_few(
+    const unsigned int* __restrict__ gu_w,
+    const unsigned char* __restrict__ gu_scales,
+    const float* __restrict__ gu_outer_scale,
+    const nv_bfloat16* __restrict__ x,
+    const int* __restrict__ unique_experts,
+    const int* __restrict__ bucket_offsets,
+    const int* __restrict__ pair_indices,
+    const int* __restrict__ num_unique,
+    nv_bfloat16* __restrict__ mid) {
+  const int u_idx = blockIdx.y;
+  if (u_idx >= num_unique[0]) return;
+  const int expert = unique_experts[u_idx];
+  const int first = bucket_offsets[u_idx];
+  const int cnt = bucket_offsets[u_idx + 1] - first;
+  if (cnt <= 0) return;
+
+  constexpr int I = 1152;
+  constexpr int N2 = 2304;
+  const int row0 = blockIdx.x * 16;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int tid = warp * 32 + lane;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const size_t exp_base = static_cast<size_t>(expert) * N2;
+  const float outer_s = gu_outer_scale ? gu_outer_scale[expert] : 1.0f;
+
+  union SharedMxfp8Gu {
+    struct {
+      alignas(16) uint4 w[16][74]; // 18,944 B (74*4 == 8 mod 32 -> 0 LDS.64 bank conflicts)
+      alignas(16) uint2 sc[16][9]; //  1,152 B (18 u32/row -> gcd(18,32)=2 -> 0 conflicts for g=0..7)
+    } buf;
+    struct {
+      float gate[9][ALLOW_HI ? 16 : 8][17];
+      float up[9][ALLOW_HI ? 16 : 8][17];
+    } red;
+  };
+  __shared__ SharedMxfp8Gu smem;
+  __shared__ int s_tok[16];
+  __shared__ int s_pair[16];
+
+  if (tid < cnt) {
+    const int p = pair_indices[first + tid];
+    s_pair[tid] = p;
+    s_tok[tid] = p >> 3;
+  } else if (tid < 16) {
+    s_pair[tid] = 0;
+    s_tok[tid] = -1;
+  }
+
+  // Division-free mapping: tid in 0..287 -> (lr in 0..3, lc in 0..71); tid in 0..143 -> (sr, sc_c)
+  const int r_hi = (tid >= 144) ? 2 : 0;
+  const int rem = tid - r_hi * 72;
+  const int r_lo = (rem >= 72) ? 1 : 0;
+  const int lr = r_hi + r_lo;
+  const int lc = rem - r_lo * 72;
+  const int sr = (tid * 57) >> 9;
+  const int sc_c = tid - sr * 9;
+
+  const uint4* w_u4 = reinterpret_cast<const uint4*>(gu_w);
+  const uint2* s_u2 = reinterpret_cast<const uint2*>(gu_scales);
+
+  auto load_kh = [&](int pass, int kh) {
+    const size_t base_r = INTERLEAVED
+        ? (exp_base + 2 * row0 + (pass ? 16 : 0))
+        : (exp_base + (pass ? I : 0) + row0);
+    const uint4* wp = w_u4 + base_r * 144 + kh * 72 + lr * 144 + lc;
+    const uint4 v0 = ptx_ld_cs_u4(wp);
+    const uint4 v1 = ptx_ld_cs_u4(wp + 576);
+    const uint4 v2 = ptx_ld_cs_u4(wp + 1152);
+    const uint4 v3 = ptx_ld_cs_u4(wp + 1728);
+    uint2 sv;
+    if (kh == 0 && tid < 144) sv = i2_ld_cs_u2(s_u2 + base_r * 9 + tid);
+    if constexpr (!INTERLEAVED) {
+      smem.buf.w[lr][lc] = v0;
+      smem.buf.w[4 + lr][lc] = v1;
+      smem.buf.w[8 + lr][lc] = v2;
+      smem.buf.w[12 + lr][lc] = v3;
+      if (kh == 0 && tid < 144) smem.buf.sc[sr][sc_c] = sv;
+    } else {
+      const int d_odd = (lr & 1) << 3;
+      const int d_half = lr >> 1;
+      smem.buf.w[d_odd + d_half][lc] = v0;
+      smem.buf.w[d_odd + 2 + d_half][lc] = v1;
+      smem.buf.w[d_odd + 4 + d_half][lc] = v2;
+      smem.buf.w[d_odd + 6 + d_half][lc] = v3;
+      if (kh == 0 && tid < 144) smem.buf.sc[((sr & 1) << 3) | (sr >> 1)][sc_c] = sv;
+    }
+  };
+
+  load_kh(0, 0);
+  __syncthreads();
+
+  const int tok_g_lo = s_tok[g];
+  const uint4* x_lo_p = (tok_g_lo >= 0)
+      ? reinterpret_cast<const uint4*>(x + static_cast<size_t>(tok_g_lo) * 2304) : nullptr;
+  [[maybe_unused]] const int tok_g_hi = ALLOW_HI ? s_tok[8 + g] : -1;
+  [[maybe_unused]] const bool do_hi = ALLOW_HI && (cnt > 8);
+  [[maybe_unused]] const uint4* x_hi_p = (ALLOW_HI && tok_g_hi >= 0)
+      ? reinterpret_cast<const uint4*>(x + static_cast<size_t>(tok_g_hi) * 2304) : nullptr;
+
+  const uint2* w_r0 = reinterpret_cast<const uint2*>(&smem.buf.w[g][warp * 8]);
+  const uint2* w_r1 = reinterpret_cast<const uint2*>(&smem.buf.w[g + 8][warp * 8]);
+
+  auto compute_kh = [&](int kh, float acc_lo[4], float acc_hi[4]) {
+    const unsigned int sc0_u32 = reinterpret_cast<const unsigned int*>(smem.buf.sc[g])[kh * 9 + warp];
+    const unsigned int sc1_u32 = reinterpret_cast<const unsigned int*>(smem.buf.sc[g + 8])[kh * 9 + warp];
+    const int grp_base = kh * 36 + warp * 4;
+#pragma unroll 1
+    for (int kg = 0; kg < 4; ++kg) {
+      const int grp32 = grp_base + kg;
+      unsigned int wb0[4], wb1[4];
+      i2_unpack8_to_bf16x2<4>(w_r0[kg * 4 + t], wb0);
+      i2_unpack8_to_bf16x2<4>(w_r1[kg * 4 + t], wb1);
+
+      const uint4 xv0 = x_lo_p ? x_lo_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+      float d0, d1, d2, d3;
+      ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, wb0[0], wb1[0], wb0[1], wb1[1], xv0.x, xv0.y);
+      ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, wb0[2], wb1[2], wb0[3], wb1[3], xv0.z, xv0.w);
+
+      const float sc0 = i2_decode_ue8m0((sc0_u32 >> (kg * 8)) & 0xFFu);
+      const float sc1 = i2_decode_ue8m0((sc1_u32 >> (kg * 8)) & 0xFFu);
+      acc_lo[0] = fmaf(sc0, d0, acc_lo[0]);
+      acc_lo[1] = fmaf(sc0, d1, acc_lo[1]);
+      acc_lo[2] = fmaf(sc1, d2, acc_lo[2]);
+      acc_lo[3] = fmaf(sc1, d3, acc_lo[3]);
+
+      if constexpr (ALLOW_HI) {
+        if (do_hi) {
+          const uint4 xv1 = x_hi_p ? x_hi_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+          float h0, h1, h2, h3;
+          ptx_mma_m16n8k16_bf16_z(h0, h1, h2, h3, wb0[0], wb1[0], wb0[1], wb1[1], xv1.x, xv1.y);
+          ptx_mma_m16n8k16_bf16(h0, h1, h2, h3, wb0[2], wb1[2], wb0[3], wb1[3], xv1.z, xv1.w);
+          acc_hi[0] = fmaf(sc0, h0, acc_hi[0]);
+          acc_hi[1] = fmaf(sc0, h1, acc_hi[1]);
+          acc_hi[2] = fmaf(sc1, h2, acc_hi[2]);
+          acc_hi[3] = fmaf(sc1, h3, acc_hi[3]);
+        }
+      }
+    }
+  };
+
+  float p0_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float p1_lo[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  [[maybe_unused]] float p0_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+  [[maybe_unused]] float p1_hi[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+  compute_kh(0, p0_lo, p0_hi);
+  __syncthreads();
+  load_kh(0, 1);
+  __syncthreads();
+  compute_kh(1, p0_lo, p0_hi);
+  __syncthreads();
+
+  load_kh(1, 0);
+  __syncthreads();
+  compute_kh(0, p1_lo, p1_hi);
+  __syncthreads();
+  load_kh(1, 1);
+  __syncthreads();
+  compute_kh(1, p1_lo, p1_hi);
   __syncthreads();
 
   if constexpr (!INTERLEAVED) {
@@ -2620,6 +3132,194 @@ void inkling2_moe_down_symq8_few(
 
       const float sc0 = i2_read_f16_or_bf16(sc_r0[kg], sb_is_bf16);
       const float sc1 = i2_read_f16_or_bf16(sc_r1[kg], sb_is_bf16);
+      acc_lo[0] = fmaf(sc0, d0, acc_lo[0]);
+      acc_lo[1] = fmaf(sc0, d1, acc_lo[1]);
+      acc_lo[2] = fmaf(sc1, d2, acc_lo[2]);
+      acc_lo[3] = fmaf(sc1, d3, acc_lo[3]);
+
+      if constexpr (ALLOW_HI) {
+        if (do_hi) {
+          const uint4 xv1 = m_hi_p ? m_hi_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+          float h0, h1, h2, h3;
+          ptx_mma_m16n8k16_bf16_z(h0, h1, h2, h3, wb0[0], wb1[0], wb0[1], wb1[1], xv1.x, xv1.y);
+          ptx_mma_m16n8k16_bf16(h0, h1, h2, h3, wb0[2], wb1[2], wb0[3], wb1[3], xv1.z, xv1.w);
+          acc_hi[0] = fmaf(sc0, h0, acc_hi[0]);
+          acc_hi[1] = fmaf(sc0, h1, acc_hi[1]);
+          acc_hi[2] = fmaf(sc1, h2, acc_hi[2]);
+          acc_hi[3] = fmaf(sc1, h3, acc_hi[3]);
+        }
+      }
+    }
+  };
+
+  float t0_lo[4], t1_lo[4];
+  [[maybe_unused]] float t0_hi[4], t1_hi[4];
+  compute_half(t0_lo, t0_hi);
+  __syncthreads();
+
+  load_half(1);
+  __syncthreads();
+
+  compute_half(t1_lo, t1_hi);
+  __syncthreads();
+
+  smem.red.t0[warp][2 * t][g] = t0_lo[0];
+  smem.red.t0[warp][2 * t + 1][g] = t0_lo[1];
+  smem.red.t0[warp][2 * t][g + 8] = t0_lo[2];
+  smem.red.t0[warp][2 * t + 1][g + 8] = t0_lo[3];
+  smem.red.t1[warp][2 * t][g] = t1_lo[0];
+  smem.red.t1[warp][2 * t + 1][g] = t1_lo[1];
+  smem.red.t1[warp][2 * t][g + 8] = t1_lo[2];
+  smem.red.t1[warp][2 * t + 1][g + 8] = t1_lo[3];
+  if constexpr (ALLOW_HI) {
+    if (do_hi) {
+      smem.red.t0[warp][8 + 2 * t][g] = t0_hi[0];
+      smem.red.t0[warp][8 + 2 * t + 1][g] = t0_hi[1];
+      smem.red.t0[warp][8 + 2 * t][g + 8] = t0_hi[2];
+      smem.red.t0[warp][8 + 2 * t + 1][g + 8] = t0_hi[3];
+      smem.red.t1[warp][8 + 2 * t][g] = t1_hi[0];
+      smem.red.t1[warp][8 + 2 * t + 1][g] = t1_hi[1];
+      smem.red.t1[warp][8 + 2 * t][g + 8] = t1_hi[2];
+      smem.red.t1[warp][8 + 2 * t + 1][g + 8] = t1_hi[3];
+    }
+  }
+  __syncthreads();
+
+  const int total_out = cnt * BN;
+  for (int idx = tid; idx < total_out; idx += 288) {
+    const int c = idx >> 5;
+    const int r = idx & 31;
+    float val = 0.0f;
+    if (r < 16) {
+#pragma unroll
+      for (int ww = 0; ww < 9; ++ww) val += smem.red.t0[ww][c][r];
+    } else {
+#pragma unroll
+      for (int ww = 0; ww < 9; ++ww) val += smem.red.t1[ww][c][r - 16];
+    }
+    down_pairs[static_cast<size_t>(s_pair[c]) * N + row0 + r] = __float2bfloat16_rn(val);
+  }
+}
+)cuda"
+R"cuda(
+// ---------------------------------------------------------------------------
+// 3-MXFP8. Silicon-Roofline Linear-18KB Full-Row MXFP8 Down Projection
+//          Unified BN=32 across M in 1..=16: Grid(72, P), 9w (288 thr),
+//          2 passes x (18KB W + 576B UE8M0 S contiguous ld.global.cs.v4.u32),
+//          1-instr HW cvt.rn.bf16x2.e4m3x2 / f16x2 + 1 u32 UE8M0 LDS per row,
+//          5 barriers total (down from 24), 0 B spills, 19.2 KB SMEM
+//          (3 CTAs/SM = 58.9 KB <= 64 KB carveout -> full 64 KB L1 for mid).
+//          0-ULP batch-invariant across M in 1..=16.
+// ---------------------------------------------------------------------------
+template <bool ALLOW_HI>
+__global__ __launch_bounds__(288, 3)
+void inkling2_moe_down_mxfp8_few(
+    const unsigned int* __restrict__ dn_w,
+    const unsigned char* __restrict__ dn_scales,
+    const nv_bfloat16* __restrict__ mid,
+    const int* __restrict__ unique_experts,
+    const int* __restrict__ bucket_offsets,
+    const int* __restrict__ pair_indices,
+    const int* __restrict__ num_unique,
+    nv_bfloat16* __restrict__ down_pairs) {
+  const int u_idx = blockIdx.y;
+  if (u_idx >= num_unique[0]) return;
+  const int expert = unique_experts[u_idx];
+  const int first = bucket_offsets[u_idx];
+  const int cnt = bucket_offsets[u_idx + 1] - first;
+  if (cnt <= 0) return;
+
+  constexpr int N = 2304;
+  constexpr int K = 1152;
+  constexpr int BN = 32;
+  const int row0 = blockIdx.x * BN;
+  const int lane = threadIdx.x;
+  const int warp = threadIdx.y;
+  const int tid = warp * 32 + lane;
+  const int g = lane >> 2;
+  const int t = lane & 3;
+  const size_t base_r = static_cast<size_t>(expert) * N + row0;
+
+  union SharedMxfp8Dn {
+    struct {
+      alignas(16) uint4 w[16][74]; // 18,944 B (74*4 == 8 mod 32 -> 0 LDS.64 bank conflicts)
+      alignas(16) uint4 sc[36];    //    576 B (9 u32/row -> gcd(9,32)=1 -> 0 bank conflicts)
+    } buf;
+    struct {
+      float t0[9][ALLOW_HI ? 16 : 8][17];
+      float t1[9][ALLOW_HI ? 16 : 8][17];
+    } red;
+  };
+  __shared__ SharedMxfp8Dn smem;
+  __shared__ int s_pair[16];
+
+  if (tid < cnt) s_pair[tid] = pair_indices[first + tid];
+  else if (tid < 16) s_pair[tid] = -1;
+
+  // Division-free mapping: tid in 0..287 -> (lr in 0..3, lc in 0..71)
+  const int r_hi = (tid >= 144) ? 2 : 0;
+  const int rem = tid - r_hi * 72;
+  const int r_lo = (rem >= 72) ? 1 : 0;
+  const int lr = r_hi + r_lo;
+  const int lc = rem - r_lo * 72;
+
+  const uint4* w_u4 = reinterpret_cast<const uint4*>(dn_w);
+  const uint4* s_u4 = reinterpret_cast<const uint4*>(dn_scales);
+
+  auto load_half = [&](int half) {
+    const size_t r_off = base_r + (half ? 16 : 0);
+    const uint4* wp = w_u4 + r_off * 72;
+    const uint4* sp = s_u4 + (r_off * 36) / 16;
+    const uint4 v0 = ptx_ld_cs_u4(wp + tid);
+    const uint4 v1 = ptx_ld_cs_u4(wp + 288 + tid);
+    const uint4 v2 = ptx_ld_cs_u4(wp + 576 + tid);
+    const uint4 v3 = ptx_ld_cs_u4(wp + 864 + tid);
+    uint4 sv;
+    if (tid < 36) sv = ptx_ld_cs_u4(sp + tid);
+    smem.buf.w[lr][lc] = v0;
+    smem.buf.w[4 + lr][lc] = v1;
+    smem.buf.w[8 + lr][lc] = v2;
+    smem.buf.w[12 + lr][lc] = v3;
+    if (tid < 36) smem.buf.sc[tid] = sv;
+  };
+
+  load_half(0);
+  __syncthreads();
+
+  const int pair_g_lo = s_pair[g];
+  const uint4* m_lo_p = (pair_g_lo >= 0)
+      ? reinterpret_cast<const uint4*>(mid + static_cast<size_t>(pair_g_lo) * K) : nullptr;
+  [[maybe_unused]] const int pair_g_hi = ALLOW_HI ? s_pair[8 + g] : -1;
+  [[maybe_unused]] const bool do_hi = ALLOW_HI && (cnt > 8);
+  [[maybe_unused]] const uint4* m_hi_p = (ALLOW_HI && pair_g_hi >= 0)
+      ? reinterpret_cast<const uint4*>(mid + static_cast<size_t>(pair_g_hi) * K) : nullptr;
+
+  const uint2* w_r0 = reinterpret_cast<const uint2*>(&smem.buf.w[g][warp * 8]);
+  const uint2* w_r1 = reinterpret_cast<const uint2*>(&smem.buf.w[g + 8][warp * 8]);
+  const unsigned int* sc_u32 = reinterpret_cast<const unsigned int*>(smem.buf.sc);
+  const int grp_base = warp * 4;
+
+  auto compute_half = [&](float acc_lo[4], float acc_hi[4]) {
+    acc_lo[0] = acc_lo[1] = acc_lo[2] = acc_lo[3] = 0.0f;
+    if constexpr (ALLOW_HI) {
+      acc_hi[0] = acc_hi[1] = acc_hi[2] = acc_hi[3] = 0.0f;
+    }
+    const unsigned int sc0_w = sc_u32[g * 9 + warp];
+    const unsigned int sc1_w = sc_u32[(g + 8) * 9 + warp];
+#pragma unroll 1
+    for (int kg = 0; kg < 4; ++kg) {
+      const int grp32 = grp_base + kg;
+      unsigned int wb0[4], wb1[4];
+      i2_unpack8_to_bf16x2<4>(w_r0[kg * 4 + t], wb0);
+      i2_unpack8_to_bf16x2<4>(w_r1[kg * 4 + t], wb1);
+
+      const uint4 xv0 = m_lo_p ? m_lo_p[grp32 * 4 + t] : make_uint4(0u, 0u, 0u, 0u);
+      float d0, d1, d2, d3;
+      ptx_mma_m16n8k16_bf16_z(d0, d1, d2, d3, wb0[0], wb1[0], wb0[1], wb1[1], xv0.x, xv0.y);
+      ptx_mma_m16n8k16_bf16(d0, d1, d2, d3, wb0[2], wb1[2], wb0[3], wb1[3], xv0.z, xv0.w);
+
+      const float sc0 = i2_decode_ue8m0((sc0_w >> (kg * 8)) & 0xFFu);
+      const float sc1 = i2_decode_ue8m0((sc1_w >> (kg * 8)) & 0xFFu);
       acc_lo[0] = fmaf(sc0, d0, acc_lo[0]);
       acc_lo[1] = fmaf(sc0, d1, acc_lo[1]);
       acc_lo[2] = fmaf(sc1, d2, acc_lo[2]);
