@@ -40,8 +40,9 @@
 import type { ChatConfig } from '@mlx-node/core';
 import type { SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
-import { contextLane } from '@mlx-node/lm';
+import { contextLane, getLoadedModelPath } from '@mlx-node/lm';
 import { reasoningEffortsFor, type ChatFamilyId, type ReasoningEffortOption } from '@mlx-node/lm/family-data';
+import { readModelChatTemplateSync } from '@mlx-node/lm/model-detection';
 
 import { AudioRegistry } from './audio-registry.js';
 import { DecisionRegistry, type ResidentDecisionBinding, type SystemOneModel } from './decision-registry.js';
@@ -90,6 +91,11 @@ function modelTypeFromInstance(model: ServableModel): ChatFamilyId | undefined {
     }
   }
   return undefined;
+}
+
+function readChatTemplateForModel(model: ServableModel): string | undefined {
+  const modelPath = getLoadedModelPath(model);
+  return modelPath !== undefined ? readModelChatTemplateSync(modelPath) : undefined;
 }
 
 /** Minimal contract for a model that can be served via chat sessions. */
@@ -159,6 +165,10 @@ interface SessionRegistryBinding {
   disposeOnTeardown: boolean;
   /** The model's load-time context snapshot, read once with the binding. */
   context?: { limits: SessionContextLimits };
+  /** Resolved family id for `/v1/models`, cached once with the binding. */
+  modelFamily?: string;
+  /** Resolved reasoning-effort options for `/v1/models`, cached once with the binding. */
+  reasoningEfforts?: readonly ReasoningEffortOption[];
 }
 
 /**
@@ -413,6 +423,11 @@ export class ModelRegistry {
     let binding = this.sessionRegistriesByModel.get(model);
     if (!binding) {
       const limits = typeof model.contextLimits === 'function' ? model.contextLimits() : undefined;
+      const modelFamily = opts?.identity?.modelType ?? modelTypeFromInstance(model);
+      const chatTemplate =
+        modelFamily === 'qwen3_5' || modelFamily === 'qwen3_5_moe' ? readChatTemplateForModel(model) : undefined;
+      const reasoningEfforts =
+        modelFamily !== undefined ? reasoningEffortsFor(modelFamily, { chatTemplate }) : undefined;
       binding = {
         registry: new SessionRegistry({
           model,
@@ -431,6 +446,8 @@ export class ModelRegistry {
         pendingPersists: 0,
         pendingTeardown: false,
         disposeOnTeardown: false,
+        ...(modelFamily !== undefined ? { modelFamily } : {}),
+        ...(reasoningEfforts !== undefined ? { reasoningEfforts } : {}),
       };
       if (limits !== undefined) binding.context = { limits };
       this.sessionRegistriesByModel.set(model, binding);
@@ -893,14 +910,16 @@ export class ModelRegistry {
 
   /**
    * List all registered models in the OpenAI /v1/models format. A loaded
-   * chat model with a load-time context also carries its served window, and
-   * one with a known family carries `model_family` and `reasoning_efforts`.
+   * chat model always pins `api_backend: 'messages'` (matching `swap.ts`),
+   * carries its served window when available, and emits `model_family` and
+   * `reasoning_efforts` when its family is known.
    */
   list(): {
     id: string;
     object: string;
     created: number;
     owned_by: string;
+    api_backend?: 'messages' | 'responses';
     context_window?: number;
     max_model_len?: number;
     context_length?: number;
@@ -912,6 +931,7 @@ export class ModelRegistry {
       object: string;
       created: number;
       owned_by: string;
+      api_backend?: 'messages' | 'responses';
       context_window?: number;
       max_model_len?: number;
       context_length?: number;
@@ -920,15 +940,17 @@ export class ModelRegistry {
     }[] = [];
     for (const entry of this.models.values()) {
       const window = this.servedContext(entry.id)?.windowTokens;
-      const modelType = entry.sessionRegistry.identity?.modelType ?? modelTypeFromInstance(entry.model);
-      const reasoningEfforts = modelType !== undefined ? reasoningEffortsFor(modelType) : undefined;
+      const binding = this.sessionRegistriesByModel.get(entry.model);
+      const modelFamily = binding?.modelFamily;
+      const reasoningEfforts = binding?.reasoningEfforts;
       result.push({
         id: entry.id,
         object: 'model',
         created: entry.createdAt,
         owned_by: 'mlx-node',
+        api_backend: 'messages',
         ...(window !== undefined ? { context_window: window, max_model_len: window, context_length: window } : {}),
-        ...(modelType !== undefined ? { model_family: modelType } : {}),
+        ...(modelFamily !== undefined ? { model_family: modelFamily } : {}),
         ...(reasoningEfforts !== undefined ? { reasoning_efforts: reasoningEfforts } : {}),
       });
     }

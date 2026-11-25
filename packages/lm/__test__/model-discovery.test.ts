@@ -13,11 +13,12 @@ afterAll(() => rmSync(tmp, { recursive: true, force: true }));
 // chmod 000 yields EACCES only on POSIX for a non-root user.
 const canChmod = process.platform !== 'win32' && process.getuid?.() !== 0;
 
-function minimalGguf(architecture: string): Buffer {
+function minimalGguf(architecture: string, extraStrings: Record<string, string> = {}): Buffer {
+  const entries = [['general.architecture', architecture] as const, ...Object.entries(extraStrings)];
   const header = Buffer.alloc(24);
   header.write('GGUF');
   header.writeUInt32LE(3, 4);
-  header.writeBigUInt64LE(1n, 16);
+  header.writeBigUInt64LE(BigInt(entries.length), 16);
   const string = (value: string): Buffer => {
     const bytes = Buffer.from(value);
     const length = Buffer.alloc(8);
@@ -26,7 +27,7 @@ function minimalGguf(architecture: string): Buffer {
   };
   const stringType = Buffer.alloc(4);
   stringType.writeUInt32LE(8);
-  return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
+  return Buffer.concat([header, ...entries.flatMap(([key, value]) => [string(key), stringType, string(value)])]);
 }
 
 /** Write `files` (path → contents) under a fresh `<tmp>/<name>` models dir; returns the dir. */
@@ -1041,5 +1042,46 @@ describe('bareGgufFamily — a GGUF with no config.json beside it', () => {
     expect(bareGgufFamily('gemma-4-UD-Q4_K_XL.gguf', 'gemma4')).toBeUndefined();
     expect(bareGgufFamily('Model-Q4_K_M.gguf', 'llama')).toBeUndefined();
     expect(bareGgufFamily('Hy4-flash-Q4_K_M-00002-of-00002.gguf', 'hy_v4_flash')).toBeUndefined();
+  });
+});
+
+describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reasoningEfforts', () => {
+  const QWEN36_TEMPLATE = '{%- if enable_thinking is false -%}<think>\n\n</think>{%- endif -%}';
+  const QWEN38_TEMPLATE = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}";
+  const BINARY = [
+    { value: 'none', label: 'Off' },
+    { value: 'high', label: 'High', default: true },
+  ];
+  const FIVE_LEVEL = [
+    { value: 'none', label: 'Off' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High', default: true },
+    { value: 'xhigh', label: 'X-High' },
+  ];
+
+  it('resolves binary vs multi-level reasoningEfforts from chat_template.jinja, tokenizer_config.json, and GGUF metadata', async () => {
+    const dir = modelsDir('qwen35-vs-qwen38-efforts', {
+      'qwen36-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
+      'qwen36-mlx/chat_template.jinja': QWEN36_TEMPLATE,
+      'qwen38-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
+      'qwen38-mlx/tokenizer_config.json': JSON.stringify({ chat_template: QWEN38_TEMPLATE }),
+      'qwen36-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf': minimalGguf('qwen35', {
+        'tokenizer.chat_template': QWEN36_TEMPLATE,
+      }),
+      'qwen38-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf': minimalGguf('qwen35', {
+        'tokenizer.chat_template': QWEN38_TEMPLATE,
+      }),
+      'qwen35-bare-gguf/Qwen3.5-9B-UD-Q4_K_XL.gguf': minimalGguf('qwen35'),
+    });
+
+    const found = await discoverLocalChatModels(dir);
+    const byName = new Map(found.map((model) => [model.name, model]));
+
+    expect(byName.get('qwen36-mlx')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('qwen38-mlx')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.6-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.5-9B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
   });
 });

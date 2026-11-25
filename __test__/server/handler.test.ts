@@ -17,7 +17,10 @@ process.env.MLX_POST_COMMIT_PERSIST_TIMEOUT_MS = '50';
 // save/restore.
 process.env.MLX_POST_COMMIT_PERSIST_HARD_TIMEOUT_MS = '0';
 
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import type { IncomingMessage, ServerResponse } from 'node:http';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Writable } from 'node:stream';
 
 import type { ChatMessage, ChatResult, ToolCallResult } from '@mlx-node/core';
@@ -10468,51 +10471,86 @@ describe('createHandler', () => {
       expect(parsed.data[1].id).toBe('model-b');
     });
 
-    it('serializes reasoning_efforts for known chat families and omits it when unsupported', async () => {
-      const registry = new ModelRegistry();
-      registry.register('Qwen3.8-27B-UD-Q4_K_XL', createMockModel(), {
-        identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
-      });
-      registry.register('k2-horizon', createMockModel(), {
-        identity: { modelId: 'k2-horizon', modelType: 'k2_horizon', contextWindow: 524288 },
-      });
-      registry.register('plain-mock', createMockModel());
+    it('serializes api_backend and reasoning_efforts for known chat families and omits efforts when unsupported', async () => {
+      const qwen38Dir = mkdtempSync(join(tmpdir(), 'mlx-handler-qwen38-'));
+      try {
+        writeFileSync(
+          join(qwen38Dir, 'chat_template.jinja'),
+          "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+        );
 
-      const handler = createHandler(registry);
-      const req = createMockReq('GET', '/v1/models');
-      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+        const registry = new ModelRegistry();
+        registry.register(
+          'Qwen3.8-27B-UD-Q4_K_XL',
+          Object.assign(createMockModel(), { modelAssetsPath: () => qwen38Dir }),
+          {
+            identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
+          },
+        );
+        registry.register('Qwen3.6-27B', createMockModel(), {
+          identity: { modelId: 'Qwen3.6-27B', modelType: 'qwen3_5', contextWindow: 262144 },
+        });
+        registry.register('k2-horizon', createMockModel(), {
+          identity: { modelId: 'k2-horizon', modelType: 'k2_horizon', contextWindow: 524288 },
+        });
+        registry.register('plain-mock', createMockModel());
 
-      await handler(req, res);
-      await waitForEnd();
+        const handler = createHandler(registry);
+        const req = createMockReq('GET', '/v1/models');
+        const { res, getStatus, getBody, waitForEnd } = createMockRes();
 
-      expect(getStatus()).toBe(200);
-      const parsed = JSON.parse(getBody()) as {
-        object: string;
-        data: Array<{ id: string; owned_by: string; model_family?: string; reasoning_efforts?: unknown }>;
-      };
-      const byId = new Map(parsed.data.map((row) => [row.id, row]));
+        await handler(req, res);
+        await waitForEnd();
 
-      expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
-        owned_by: 'mlx-node',
-        model_family: 'qwen3_5',
-        reasoning_efforts: [
-          { value: 'none', label: 'Off' },
-          { value: 'low', label: 'Low' },
-          { value: 'medium', label: 'Medium' },
-          { value: 'high', label: 'High', default: true },
-          { value: 'xhigh', label: 'X-High' },
-        ],
-      });
-      expect(byId.get('k2-horizon')).toMatchObject({
-        owned_by: 'mlx-node',
-        model_family: 'k2_horizon',
-        reasoning_efforts: [
-          { value: 'low', label: 'Low' },
-          { value: 'medium', label: 'Medium' },
-          { value: 'high', label: 'High', default: true },
-        ],
-      });
-      expect('reasoning_efforts' in byId.get('plain-mock')!).toBe(false);
+        expect(getStatus()).toBe(200);
+        const parsed = JSON.parse(getBody()) as {
+          object: string;
+          data: Array<{
+            id: string;
+            owned_by: string;
+            api_backend?: string;
+            model_family?: string;
+            reasoning_efforts?: unknown;
+          }>;
+        };
+        const byId = new Map(parsed.data.map((row) => [row.id, row]));
+
+        expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
+          owned_by: 'mlx-node',
+          api_backend: 'messages',
+          model_family: 'qwen3_5',
+          reasoning_efforts: [
+            { value: 'none', label: 'Off' },
+            { value: 'low', label: 'Low' },
+            { value: 'medium', label: 'Medium' },
+            { value: 'high', label: 'High', default: true },
+            { value: 'xhigh', label: 'X-High' },
+          ],
+        });
+        expect(byId.get('Qwen3.6-27B')).toMatchObject({
+          owned_by: 'mlx-node',
+          api_backend: 'messages',
+          model_family: 'qwen3_5',
+          reasoning_efforts: [
+            { value: 'none', label: 'Off' },
+            { value: 'high', label: 'High', default: true },
+          ],
+        });
+        expect(byId.get('k2-horizon')).toMatchObject({
+          owned_by: 'mlx-node',
+          api_backend: 'messages',
+          model_family: 'k2_horizon',
+          reasoning_efforts: [
+            { value: 'low', label: 'Low' },
+            { value: 'medium', label: 'Medium' },
+            { value: 'high', label: 'High', default: true },
+          ],
+        });
+        expect(byId.get('plain-mock')?.api_backend).toBe('messages');
+        expect('reasoning_efforts' in byId.get('plain-mock')!).toBe(false);
+      } finally {
+        rmSync(qwen38Dir, { recursive: true, force: true });
+      }
     });
 
     it('forwards reasoning_efforts from custom listModels (swap controller) over GET /v1/models', async () => {

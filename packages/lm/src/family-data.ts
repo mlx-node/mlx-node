@@ -135,7 +135,12 @@ const FOUR_LEVEL_MAX_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
   EFFORT_MAX,
 ]);
 
-/** Five-level families defaulting to `high` (Qwen3.5/3.8 dense where `high` aliases `xhigh`, Inkling2 where `0.9` is default). */
+/**
+ * Five-level families defaulting to `high`:
+ * - Inkling2 (`0.0`/`0.2`/`0.7`/`0.9` default/`0.99`),
+ * - Qwen3.8 checkpoints under `qwen3_5` / `qwen3_5_moe` (whose template checks
+ *   `resolved_reasoning_effort` with `xhigh` default and `high`→`xhigh` alias).
+ */
 const FIVE_LEVEL_HIGH_DEFAULT_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
   EFFORT_OFF,
   EFFORT_LOW,
@@ -152,6 +157,30 @@ const FIVE_LEVEL_XHIGH_DEFAULT_EFFORTS: readonly ReasoningEffortOption[] = Objec
   EFFORT_HIGH,
   EFFORT_XHIGH_DEFAULT,
 ]);
+
+/**
+ * Whether a Jinja chat template implements the Qwen3.8 multi-level
+ * `reasoning_effort` protocol (`low` / `medium` / `xhigh`). Matches the native
+ * renderer gate in `crates/mlx-core/src/tokenizer.rs`.
+ */
+export function hasQwen38ReasoningEffortTemplate(chatTemplate: string | undefined): boolean {
+  return (
+    typeof chatTemplate === 'string' &&
+    chatTemplate.includes('resolved_reasoning_effort') &&
+    chatTemplate.includes('xhigh')
+  );
+}
+
+/** Optional checkpoint context for resolving per-checkpoint reasoning efforts. */
+export interface ReasoningEffortsOptions {
+  /**
+   * Raw Jinja chat template from the checkpoint (`tokenizer_config.json`,
+   * `chat_template.jinja`, or GGUF `tokenizer.chat_template`). Used for
+   * families that host both binary-thinking and multi-level checkpoints
+   * (`qwen3_5` and `qwen3_5_moe`: Qwen3.5/3.6 vs Qwen3.8).
+   */
+  readonly chatTemplate?: string;
+}
 
 /**
  * Sampling defaults from Unsloth's Qwen3.6 guide:
@@ -609,7 +638,7 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl', split: true },
-    traits: { reasoning: true, reasoningEfforts: FIVE_LEVEL_HIGH_DEFAULT_EFFORTS, fallbackContextWindow: 262144 },
+    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 81920,
@@ -970,11 +999,24 @@ export function familyTraitsFor(modelType: string): FamilyTraits | undefined {
  * Ordered reasoning-effort options advertised by `GET /v1/models` for
  * `modelType`, or `undefined` when the family does not support reasoning
  * effort (decision, embedding, VLM, rerank, or unknown foreign families).
+ *
+ * Families shared by binary-thinking (Qwen3.5/3.6) and multi-level (Qwen3.8)
+ * checkpoints default to binary `[Off, High]` and upgrade to 5-level efforts
+ * only when `opts.chatTemplate` matches the Qwen3.8 template protocol.
  */
-export function reasoningEffortsFor(modelType: string): readonly ReasoningEffortOption[] | undefined {
+export function reasoningEffortsFor(
+  modelType: string,
+  opts?: ReasoningEffortsOptions,
+): readonly ReasoningEffortOption[] | undefined {
   const traits = familyTraitsFor(modelType);
   if (!traits?.reasoning || !traits.reasoningEfforts || traits.reasoningEfforts.length === 0) {
     return undefined;
+  }
+  if (
+    (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') &&
+    hasQwen38ReasoningEffortTemplate(opts?.chatTemplate)
+  ) {
+    return FIVE_LEVEL_HIGH_DEFAULT_EFFORTS;
   }
   return traits.reasoningEfforts;
 }

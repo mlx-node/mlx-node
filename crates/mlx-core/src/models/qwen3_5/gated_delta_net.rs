@@ -5197,6 +5197,12 @@ mod tests {
             eprintln!("SKIP fused_prefill_with_conv_layer_capture_and_no_cache");
             return Ok(());
         }
+        // `gdn_prefill_head_scan` requires a larger threadgroup than `gdn_prefill_row_scan`
+        // and can decline on smaller GPUs (e.g. virtualized CI runners) where row_scan runs.
+        let head_scan_launches = {
+            let _g = HeadScanGuard::set(true);
+            crate::models::qwen3_5::gated_delta::tests::fused_prefill_launches()
+        };
         let cuts: &[usize] = &[1, 2, 3, 16, 17, 64, 65];
         for (hv, tiled, scalars) in [
             (48i64, true, DType::Float32),
@@ -5221,7 +5227,7 @@ mod tests {
             unsafe { sys::mlx_test_kquant_counting(false) };
             assert_eq!(scans, 1, "hv={hv} tiled={tiled} {scalars:?} cache=None");
 
-            let ref_nocache = if scalars == DType::Float32 {
+            let ref_nocache = if scalars == DType::Float32 && head_scan_launches {
                 let _g = HeadScanGuard::set(true);
                 unsafe { sys::mlx_test_kquant_counting(true) };
                 let y = net.forward(&x, None, None, true)?;

@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { ModelRegistry } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
@@ -673,60 +677,101 @@ describe('ModelRegistry.servedContext', () => {
     expect(registry.getSessionRegistry('bare')!.servedWindowTokens).toBeUndefined();
   });
 
-  it('emits model_family and reasoning_efforts in registry.list() from identity or model class, and omits them when unsupported', () => {
-    const registry = new ModelRegistry();
+  it('emits api_backend, model_family, and reasoning_efforts in registry.list() from identity/class/template, and omits efforts when unsupported', () => {
+    const qwen36Dir = mkdtempSync(join(tmpdir(), 'mlx-reg-qwen36-'));
+    const qwen38Dir = mkdtempSync(join(tmpdir(), 'mlx-reg-qwen38-'));
+    try {
+      writeFileSync(
+        join(qwen36Dir, 'chat_template.jinja'),
+        '{%- if enable_thinking is false -%}<think>\n</think>{%- endif -%}',
+      );
+      writeFileSync(
+        join(qwen38Dir, 'chat_template.jinja'),
+        "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+      );
 
-    const qwenMock = createMockSessionModel();
-    registry.register('Qwen3.8-27B-UD-Q4_K_XL', qwenMock, {
-      identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
-    });
-    registry.register('claude-sonnet-4-5', qwenMock);
+      const registry = new ModelRegistry();
 
-    // Direct registration without explicit identity infers family from the known wrapper class name.
-    class HyV4FlashModel {}
-    const hy4 = Object.assign(Object.create(HyV4FlashModel.prototype), createMockSessionModel()) as SessionCapableModel;
-    registry.register('hy4-direct', hy4);
+      // Qwen3.8 checkpoint (template has resolved_reasoning_effort + xhigh) → 5-level efforts.
+      const qwen38Mock = Object.assign(createMockSessionModel(), { modelAssetsPath: () => qwen38Dir });
+      registry.register('Qwen3.8-27B-UD-Q4_K_XL', qwen38Mock, {
+        identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
+      });
+      registry.register('claude-sonnet-4-5', qwen38Mock);
 
-    // Unknown identity modelType and bare plain-object mocks must not advertise reasoning_efforts.
-    registry.register('bare-mock', createMockSessionModel());
-    registry.register('foreign-model', createMockSessionModel(), {
-      identity: { modelId: 'foreign-model', modelType: 'unknown_family', contextWindow: 8192 },
-    });
+      // Qwen3.6 checkpoint (binary enable_thinking template) → binary [Off, High] efforts.
+      class Qwen35Model {}
+      const qwen36Mock = Object.assign(Object.create(Qwen35Model.prototype), createMockSessionModel(), {
+        modelAssetsPath: () => qwen36Dir,
+      }) as SessionCapableModel;
+      registry.register('Qwen3.6-27B', qwen36Mock);
 
-    // Decision models must never advertise reasoning_efforts.
-    registry.registerDecision('clef-decision', { kind: 'decision', decideRaw: vi.fn() } as never, {
-      identity: { modelId: 'clef-decision', modelType: 'clef', contextWindow: 16384 },
-    });
+      // Direct registration without explicit identity infers family from the known wrapper class name.
+      class HyV4FlashModel {}
+      const hy4 = Object.assign(
+        Object.create(HyV4FlashModel.prototype),
+        createMockSessionModel(),
+      ) as SessionCapableModel;
+      registry.register('hy4-direct', hy4);
 
-    const byId = new Map(registry.list().map((entry) => [entry.id, entry]));
+      // Unknown identity modelType and bare plain-object mocks must still pin api_backend='messages'
+      // without advertising reasoning_efforts.
+      registry.register('bare-mock', createMockSessionModel());
+      registry.register('foreign-model', createMockSessionModel(), {
+        identity: { modelId: 'foreign-model', modelType: 'unknown_family', contextWindow: 8192 },
+      });
 
-    expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
-      owned_by: 'mlx-node',
-      model_family: 'qwen3_5',
-      reasoning_efforts: [
-        { value: 'none', label: 'Off' },
-        { value: 'low', label: 'Low' },
-        { value: 'medium', label: 'Medium' },
-        { value: 'high', label: 'High', default: true },
-        { value: 'xhigh', label: 'X-High' },
-      ],
-    });
-    expect(byId.get('claude-sonnet-4-5')?.reasoning_efforts).toEqual(
-      byId.get('Qwen3.8-27B-UD-Q4_K_XL')?.reasoning_efforts,
-    );
-    expect(byId.get('hy4-direct')).toMatchObject({
-      owned_by: 'mlx-node',
-      model_family: 'hy_v4_flash',
-      reasoning_efforts: [
-        { value: 'none', label: 'Off' },
-        { value: 'low', label: 'Low' },
-        { value: 'high', label: 'High', default: true },
-        { value: 'max', label: 'Max' },
-      ],
-    });
-    expect('reasoning_efforts' in byId.get('bare-mock')!).toBe(false);
-    expect('model_family' in byId.get('bare-mock')!).toBe(false);
-    expect('reasoning_efforts' in byId.get('foreign-model')!).toBe(false);
-    expect('reasoning_efforts' in byId.get('clef-decision')!).toBe(false);
+      // Decision models must never advertise reasoning_efforts.
+      registry.registerDecision('clef-decision', { kind: 'decision', decideRaw: vi.fn() } as never, {
+        identity: { modelId: 'clef-decision', modelType: 'clef', contextWindow: 16384 },
+      });
+
+      const byId = new Map(registry.list().map((entry) => [entry.id, entry]));
+
+      expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
+        owned_by: 'mlx-node',
+        api_backend: 'messages',
+        model_family: 'qwen3_5',
+        reasoning_efforts: [
+          { value: 'none', label: 'Off' },
+          { value: 'low', label: 'Low' },
+          { value: 'medium', label: 'Medium' },
+          { value: 'high', label: 'High', default: true },
+          { value: 'xhigh', label: 'X-High' },
+        ],
+      });
+      expect(byId.get('claude-sonnet-4-5')?.reasoning_efforts).toEqual(
+        byId.get('Qwen3.8-27B-UD-Q4_K_XL')?.reasoning_efforts,
+      );
+      expect(byId.get('Qwen3.6-27B')).toMatchObject({
+        owned_by: 'mlx-node',
+        api_backend: 'messages',
+        model_family: 'qwen3_5',
+        reasoning_efforts: [
+          { value: 'none', label: 'Off' },
+          { value: 'high', label: 'High', default: true },
+        ],
+      });
+      expect(byId.get('hy4-direct')).toMatchObject({
+        owned_by: 'mlx-node',
+        api_backend: 'messages',
+        model_family: 'hy_v4_flash',
+        reasoning_efforts: [
+          { value: 'none', label: 'Off' },
+          { value: 'low', label: 'Low' },
+          { value: 'high', label: 'High', default: true },
+          { value: 'max', label: 'Max' },
+        ],
+      });
+      expect(byId.get('bare-mock')?.api_backend).toBe('messages');
+      expect('reasoning_efforts' in byId.get('bare-mock')!).toBe(false);
+      expect('model_family' in byId.get('bare-mock')!).toBe(false);
+      expect(byId.get('foreign-model')?.api_backend).toBe('messages');
+      expect('reasoning_efforts' in byId.get('foreign-model')!).toBe(false);
+      expect('reasoning_efforts' in byId.get('clef-decision')!).toBe(false);
+    } finally {
+      rmSync(qwen36Dir, { recursive: true, force: true });
+      rmSync(qwen38Dir, { recursive: true, force: true });
+    }
   });
 });

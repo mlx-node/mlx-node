@@ -194,25 +194,37 @@ export async function readGgufHeader(read: GgufByteSource, size: number, chunk =
   return reader.slice(0, reader.position);
 }
 
-export async function readGgufArchitecture(path: string): Promise<string> {
+/** Maximum length of `tokenizer.chat_template` decoded during lightweight discovery. */
+const MAX_CHAT_TEMPLATE_BYTES = 1024 * 1024;
+
+export interface GgufDiscoveryMetadata {
+  architecture: string;
+  chatTemplate?: string;
+}
+
+export async function readGgufDiscoveryMetadata(path: string): Promise<GgufDiscoveryMetadata> {
   // O_NONBLOCK plus the descriptor type check prevents a renamed FIFO from
   // hanging model discovery in the control-panel worker.
   const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const info = await file.stat();
     if (!info.isFile()) throw new Error('GGUF path must be a regular file');
-    return await readGgufSourceArchitecture(fileSource(file), info.size);
+    return await readGgufSourceDiscoveryMetadata(fileSource(file), info.size);
   } finally {
     await file.close();
   }
 }
 
-/** `general.architecture` of a GGUF source, read through one `chunk`-byte window. */
-export async function readGgufSourceArchitecture(
+export async function readGgufArchitecture(path: string): Promise<string> {
+  return (await readGgufDiscoveryMetadata(path)).architecture;
+}
+
+/** `general.architecture` (and optional `tokenizer.chat_template`) of a GGUF source, read in one pass. */
+export async function readGgufSourceDiscoveryMetadata(
   read: GgufByteSource,
   size: number,
   chunk = 64 * 1024,
-): Promise<string> {
+): Promise<GgufDiscoveryMetadata> {
   const reader = new WindowReader(read, size, chunk);
   if ((await reader.bytes(4)).toString() !== 'GGUF') throw new Error('Not a GGUF file');
   if ((await reader.u32()) < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
@@ -220,6 +232,7 @@ export async function readGgufSourceArchitecture(
   const count = await reader.u64();
   checkHeaderCounts(tensors, count);
   let architecture: string | undefined;
+  let chatTemplate: string | undefined;
   const keys = new Set<string>();
   for (let index = 0; index < count; index++) {
     const key = await reader.string();
@@ -229,12 +242,28 @@ export async function readGgufSourceArchitecture(
     if (key === 'general.architecture') {
       architecture = type === 8 ? await reader.string() : undefined;
       if (type !== 8) await reader.skipValue(type);
+    } else if (key === 'tokenizer.chat_template' && type === 8) {
+      const length = await reader.length();
+      if (length <= MAX_CHAT_TEMPLATE_BYTES) {
+        chatTemplate = new TextDecoder('utf-8').decode(await reader.bytes(length));
+      } else {
+        reader.skip(length);
+      }
     } else {
       await reader.skipValue(type);
     }
   }
   if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
-  return architecture;
+  return chatTemplate !== undefined ? { architecture, chatTemplate } : { architecture };
+}
+
+/** `general.architecture` of a GGUF source, read through one `chunk`-byte window. */
+export async function readGgufSourceArchitecture(
+  read: GgufByteSource,
+  size: number,
+  chunk = 64 * 1024,
+): Promise<string> {
+  return (await readGgufSourceDiscoveryMetadata(read, size, chunk)).architecture;
 }
 
 /**
@@ -311,8 +340,8 @@ class SyncWindowReader {
   }
 }
 
-/** {@link readGgufArchitecture} without waiting, for a synchronous caller: the same answer and the same refusals. */
-export function readGgufArchitectureSync(path: string): string {
+/** {@link readGgufDiscoveryMetadata} without waiting, for a synchronous caller. */
+export function readGgufDiscoveryMetadataSync(path: string): GgufDiscoveryMetadata {
   const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
   try {
     const info = fstatSync(fd);
@@ -324,6 +353,7 @@ export function readGgufArchitectureSync(path: string): string {
     const count = reader.u64();
     checkHeaderCounts(tensors, count);
     let architecture: string | undefined;
+    let chatTemplate: string | undefined;
     const keys = new Set<string>();
     for (let index = 0; index < count; index++) {
       const key = reader.string();
@@ -333,13 +363,25 @@ export function readGgufArchitectureSync(path: string): string {
       if (key === 'general.architecture') {
         architecture = type === 8 ? reader.string() : undefined;
         if (type !== 8) reader.skipValue(type);
+      } else if (key === 'tokenizer.chat_template' && type === 8) {
+        const length = reader.length();
+        if (length <= MAX_CHAT_TEMPLATE_BYTES) {
+          chatTemplate = new TextDecoder('utf-8').decode(reader.bytes(length));
+        } else {
+          reader.skip(length);
+        }
       } else {
         reader.skipValue(type);
       }
     }
     if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
-    return architecture;
+    return chatTemplate !== undefined ? { architecture, chatTemplate } : { architecture };
   } finally {
     closeSync(fd);
   }
+}
+
+/** {@link readGgufArchitecture} without waiting, for a synchronous caller: the same answer and the same refusals. */
+export function readGgufArchitectureSync(path: string): string {
+  return readGgufDiscoveryMetadataSync(path).architecture;
 }

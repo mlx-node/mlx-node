@@ -128,6 +128,21 @@ export interface ChatStreamControl {
 const modelPathsForTokenizers = new WeakMap<object, string>();
 const tokenizerPromises = new WeakMap<object, Promise<Qwen3Tokenizer>>();
 
+/**
+ * Return the recorded checkpoint or prepared-assets directory for a loaded
+ * streaming model instance, if available.
+ */
+export function getLoadedModelPath(model: object): string | undefined {
+  const recorded = modelPathsForTokenizers.get(model);
+  if (recorded !== undefined) return recorded;
+  const nativeAssets = (model as { modelAssetsPath?: () => unknown }).modelAssetsPath;
+  if (typeof nativeAssets === 'function') {
+    const value = nativeAssets.call(model);
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
 type TemplateContentOrder = 'textThenMedia' | 'imagesThenText';
 
 interface TemplateContentPolicy {

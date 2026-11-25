@@ -106,7 +106,7 @@ export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent, ChatStreamContr
 // `makeStreamingModel` is the factory that builds each family's wrapper
 // subclass from its native class; the VLM package reuses it to build
 // `QianfanOCRModel`.
-export { _runChatStream, makeStreamingModel } from './stream.js';
+export { _runChatStream, getLoadedModelPath, makeStreamingModel } from './stream.js';
 export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance, StreamingModel } from './stream.js';
 // Cross-model chat session wrapper (see chat-session.ts for design notes).
 // `SessionCapableModel` is the structural interface matched by every
@@ -186,6 +186,7 @@ export {
   NON_GENERATIVE_FAMILY_IDS,
   QWEN4_EXP_SAMPLING_DEFAULTS,
   QWEN_SAMPLING_DEFAULTS,
+  hasQwen38ReasoningEffortTemplate,
   rawModelTypeToCanonical,
   reasoningEffortsFor,
   validateFamilyLoadOptions,
@@ -202,6 +203,7 @@ export {
   type ModelType,
   type ReasoningEffortLevel,
   type ReasoningEffortOption,
+  type ReasoningEffortsOptions,
   type TrainableFamilyId,
 } from './family-data.js';
 

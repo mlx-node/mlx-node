@@ -1,12 +1,105 @@
 /** Shared filesystem-only model detection for inference and control-panel discovery. */
-import { constants } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readFileSync } from 'node:fs';
 import { open, stat } from 'node:fs/promises';
 import { dirname, extname, join } from 'node:path';
 
 import { MODEL_FAMILY_DATA, matchFamily, type ModelType } from './family-data.js';
-import { readGgufArchitecture } from './gguf-metadata.js';
+import { readGgufArchitecture, readGgufDiscoveryMetadataSync } from './gguf-metadata.js';
 
-export { readGgufArchitecture } from './gguf-metadata.js';
+export {
+  readGgufArchitecture,
+  readGgufDiscoveryMetadata,
+  readGgufDiscoveryMetadataSync,
+  type GgufDiscoveryMetadata,
+} from './gguf-metadata.js';
+
+const MAX_TOKENIZER_CONFIG_BYTES = 16 * 1024 * 1024;
+const MAX_CHAT_TEMPLATE_BYTES = 1024 * 1024;
+
+async function readRegularTextFile(path: string, maxBytes: number): Promise<string | undefined> {
+  try {
+    const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      const info = await file.stat();
+      if (!info.isFile() || info.size > maxBytes) return undefined;
+      return await file.readFile('utf8');
+    } finally {
+      await file.close();
+    }
+  } catch {
+    return undefined;
+  }
+}
+
+function readRegularTextFileSync(path: string, maxBytes: number): string | undefined {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    const info = fstatSync(fd);
+    if (!info.isFile() || info.size > maxBytes) return undefined;
+    return readFileSync(fd, 'utf8');
+  } catch {
+    return undefined;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        /* best-effort close */
+      }
+    }
+  }
+}
+
+function extractChatTemplateFromTokenizerConfig(content: string | undefined): string | undefined {
+  if (content === undefined) return undefined;
+  try {
+    const parsed = JSON.parse(content) as { chat_template?: unknown };
+    return typeof parsed?.chat_template === 'string' ? parsed.chat_template : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Read a checkpoint directory's Jinja chat template using the same precedence
+ * as native `Qwen3Tokenizer::load_chat_template`: `tokenizer_config.json`'s
+ * string `chat_template` first, then standalone `chat_template.jinja`.
+ */
+export async function readDirectoryChatTemplate(modelDir: string): Promise<string | undefined> {
+  const fromConfig = extractChatTemplateFromTokenizerConfig(
+    await readRegularTextFile(join(modelDir, 'tokenizer_config.json'), MAX_TOKENIZER_CONFIG_BYTES),
+  );
+  if (fromConfig !== undefined) return fromConfig;
+  return await readRegularTextFile(join(modelDir, 'chat_template.jinja'), MAX_CHAT_TEMPLATE_BYTES);
+}
+
+/** Synchronous counterpart of {@link readDirectoryChatTemplate}. */
+export function readDirectoryChatTemplateSync(modelDir: string): string | undefined {
+  const fromConfig = extractChatTemplateFromTokenizerConfig(
+    readRegularTextFileSync(join(modelDir, 'tokenizer_config.json'), MAX_TOKENIZER_CONFIG_BYTES),
+  );
+  if (fromConfig !== undefined) return fromConfig;
+  return readRegularTextFileSync(join(modelDir, 'chat_template.jinja'), MAX_CHAT_TEMPLATE_BYTES);
+}
+
+/**
+ * Read a checkpoint's Jinja chat template synchronously from either a model
+ * directory or a `.gguf` file (sibling sidecars first, then embedded GGUF
+ * `tokenizer.chat_template`). Returns `undefined` when unavailable.
+ */
+export function readModelChatTemplateSync(modelPath: string): string | undefined {
+  if (extname(modelPath).toLowerCase() === '.gguf') {
+    const fromSidecars = readDirectoryChatTemplateSync(dirname(modelPath));
+    if (fromSidecars !== undefined) return fromSidecars;
+    try {
+      return readGgufDiscoveryMetadataSync(modelPath).chatTemplate;
+    } catch {
+      return undefined;
+    }
+  }
+  return readDirectoryChatTemplateSync(modelPath);
+}
 
 const GGUF_ARCHITECTURE_MODEL_TYPES = new Map<string, ModelType>(
   MODEL_FAMILY_DATA.flatMap((row) =>

@@ -9,6 +9,7 @@ import {
   familyTraitsFor,
   NON_GENERATIVE_FAMILY_IDS,
   familyDataFor,
+  reasoningEffortsFor,
   type FamilyTraits,
   type LaunchPreset,
   type ModelType,
@@ -17,7 +18,8 @@ import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGguf
 import {
   detectModelType,
   ggufArchitectureModelType,
-  readGgufArchitecture,
+  readDirectoryChatTemplate,
+  readGgufDiscoveryMetadata,
   readModelConfig,
 } from './model-detection.js';
 import {
@@ -347,6 +349,7 @@ export async function discoverLocalChatModels(
     format: ModelFormat,
     splitFileId: string | undefined,
     naming: (config: unknown, id: string) => ModelVariantName,
+    ggufChatTemplate?: string,
   ): Promise<void> => {
     const decision = familyDataFor(modelType)?.kind === 'decision' && opts?.includeDecisions === true;
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
@@ -360,12 +363,25 @@ export async function discoverLocalChatModels(
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;
     }
-    const traits = decision
+    const baseTraits = decision
       ? { reasoning: false, fallbackContextWindow: decisionContextCap }
       : familyTraitsFor(modelType);
-    if (!traits) {
+    if (!baseTraits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
       return;
+    }
+
+    // Qwen3.5/3.6 and Qwen3.8 share `qwen3_5` (and potentially `qwen3_5_moe`).
+    // Inspect the checkpoint's chat template (sidecar files first, then GGUF
+    // metadata) so only templates implementing Qwen3.8's multi-level protocol
+    // advertise Low/Medium/High/X-High instead of binary Off/High.
+    let traits = baseTraits;
+    if (!decision && (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe')) {
+      const chatTemplate = (await readDirectoryChatTemplate(metadataRoot)) ?? ggufChatTemplate;
+      const resolvedEfforts = reasoningEffortsFor(modelType, { chatTemplate });
+      if (resolvedEfforts !== baseTraits.reasoningEfforts) {
+        traits = { ...baseTraits, reasoningEfforts: resolvedEfforts };
+      }
     }
 
     const metadata = await readDiscoveryMetadata(metadataRoot, modelType, traits.fallbackContextWindow);
@@ -437,7 +453,8 @@ export async function discoverLocalChatModels(
       const family = familyDataFor(ggufPolicyModelType);
       if (!supportedGgufName(name, ggufPolicyModelType)) return;
       // A sibling config must agree with the target header, never a projector.
-      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(canonical))) return;
+      const ggufMetadata = await readGgufDiscoveryMetadata(canonical);
+      if (!family?.ggufArchitectures?.includes(ggufMetadata.architecture)) return;
       if (
         family.ggufDiscovery?.requiresAssets &&
         !(await hasGgufAssets(assetsRoot, (error) => reportFailure(error, path)))
@@ -448,8 +465,16 @@ export async function discoverLocalChatModels(
       }
       const names = ggufNames(name, repoFolder, variantFolder);
       const splitFileId = names.split ? name.slice(0, -'.gguf'.length) : undefined;
-      await append(names.id, path, assetsRoot, modelType, scopeName, 'gguf', splitFileId, (_config, id) =>
-        ggufVariant(names.stem, repoFolder, variantFolder, id),
+      await append(
+        names.id,
+        path,
+        assetsRoot,
+        modelType,
+        scopeName,
+        'gguf',
+        splitFileId,
+        (_config, id) => ggufVariant(names.stem, repoFolder, variantFolder, id),
+        ggufMetadata.chatTemplate,
       );
     } catch (err) {
       reportFailure(err, path);

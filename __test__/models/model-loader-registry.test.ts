@@ -324,5 +324,30 @@ describe('declarative model loader registry', () => {
     }
     expect(reasoningEffortsFor('unknown_family')).toBeUndefined();
     expect(reasoningEffortsFor('')).toBeUndefined();
+
+    // Qwen3.5/3.6 defaults to binary [Off, High]; only Qwen3.8 templates unlock 5-level efforts.
+    expect(reasoningEffortsFor('qwen3_5')).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    expect(
+      reasoningEffortsFor('qwen3_5', {
+        chatTemplate: '{%- if enable_thinking is false -%}<think>\n\n</think>{%- endif -%}',
+      }),
+    ).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    expect(
+      reasoningEffortsFor('qwen3_5', {
+        chatTemplate: "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+      }),
+    ).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'xhigh', label: 'X-High' },
+    ]);
   });
 });

@@ -1,5 +1,9 @@
+import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import type { LoadableModel } from '@mlx-node/lm';
-import { MODEL_FAMILY_DATA, familyDataFor } from '@mlx-node/lm/family-data';
+import { MODEL_FAMILY_DATA, familyDataFor, reasoningEffortsFor } from '@mlx-node/lm/family-data';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import {
@@ -7,7 +11,7 @@ import {
   withCapabilityModels,
   type CapabilityAdapter,
 } from '../../../packages/server/src/host/capability-models.js';
-import type { DiscoveredModel } from '../../../packages/server/src/host/discover.js';
+import { discoverModels, type DiscoveredModel } from '../../../packages/server/src/host/discover.js';
 import { makeSwapController } from '../../../packages/server/src/host/swap.js';
 import { ModelWorkCoordinator } from '../../../packages/server/src/model-work-coordinator.js';
 import { ModelRegistry } from '../../../packages/server/src/registry.js';
@@ -471,28 +475,36 @@ describe('makeSwapController', () => {
 
   it('advertises per-family reasoning_efforts on chat models and omits it on decision models', () => {
     const reg = fakeRegistry();
-    const entries: DiscoveredModel[] = (
-      [
-        ['Qwen3.8-27B-UD-Q4_K_XL', 'qwen3_5'],
-        ['Qwen3.8-Flash-Next', 'qwen4_exp'],
-        ['Inkling-2-Mini', 'inkling2'],
-        ['Hy4-flash', 'hy_v4_flash'],
-        ['DeepSeek-V4.1-Flash', 'deepseek_v41'],
-        ['Gemma4-12B', 'gemma4'],
-        ['K2-Horizon-7B', 'k2_horizon'],
-        ['Qwen3-8B', 'qwen3'],
-        ['Qwen3.6-35B-A3B', 'qwen3_5_moe'],
-        ['Nemotron-3.5', 'nemotron_h'],
-        ['LFM2.5-1.2B', 'lfm2'],
-        ['LFM2.5-8B-A1B', 'lfm2_moe'],
-        ['Muse-Glimmer-30B', 'muse_glimmer'],
-        ['clef-decision', 'clef'],
-        ['clairic-decision', 'clairic'],
-      ] as const
-    ).map(([name, modelType]) => ({
-      ...discovered([name])[0]!,
-      modelType,
-    }));
+    const qwen38Template = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}";
+    const entries: DiscoveredModel[] = [
+      {
+        ...discovered(['Qwen3.8-27B-UD-Q4_K_XL'])[0]!,
+        modelType: 'qwen3_5',
+        reasoningEfforts: reasoningEffortsFor('qwen3_5', { chatTemplate: qwen38Template }),
+      },
+      ...(
+        [
+          ['Qwen3.6-27B', 'qwen3_5'],
+          ['Qwen3.8-Flash-Next', 'qwen4_exp'],
+          ['Inkling-2-Mini', 'inkling2'],
+          ['Hy4-flash', 'hy_v4_flash'],
+          ['DeepSeek-V4.1-Flash', 'deepseek_v41'],
+          ['Gemma4-12B', 'gemma4'],
+          ['K2-Horizon-7B', 'k2_horizon'],
+          ['Qwen3-8B', 'qwen3'],
+          ['Qwen3.6-35B-A3B', 'qwen3_5_moe'],
+          ['Nemotron-3.5', 'nemotron_h'],
+          ['LFM2.5-1.2B', 'lfm2'],
+          ['LFM2.5-8B-A1B', 'lfm2_moe'],
+          ['Muse-Glimmer-30B', 'muse_glimmer'],
+          ['clef-decision', 'clef'],
+          ['clairic-decision', 'clairic'],
+        ] as const
+      ).map(([name, modelType]) => ({
+        ...discovered([name])[0]!,
+        modelType,
+      })),
+    ];
 
     const ctrl = makeSwapController(entries, reg as unknown as ModelRegistry, vi.fn());
     const byId = new Map(ctrl.listModels().map((row) => [row.id, row]));
@@ -503,6 +515,10 @@ describe('makeSwapController', () => {
       { value: 'medium', label: 'Medium' },
       { value: 'high', label: 'High', default: true },
       { value: 'xhigh', label: 'X-High' },
+    ]);
+    expect(byId.get('Qwen3.6-27B')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
     ]);
     expect(byId.get('Qwen3.8-Flash-Next')?.reasoning_efforts).toEqual([
       { value: 'none', label: 'Off' },
@@ -552,6 +568,44 @@ describe('makeSwapController', () => {
       const row = byId.get(decisionId);
       expect(row, decisionId).toBeDefined();
       expect('reasoning_efforts' in row!, decisionId).toBe(false);
+    }
+  });
+
+  it('distinguishes binary Qwen3.5/3.6 from multi-level Qwen3.8 during disk discovery and swap listing', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'mlx-swap-qwen-efforts-'));
+    try {
+      const qwen36Dir = join(dir, 'qwen3.6-27b');
+      const qwen38Dir = join(dir, 'qwen3.8-27b');
+      await mkdir(qwen36Dir, { recursive: true });
+      await mkdir(qwen38Dir, { recursive: true });
+      await writeFile(join(qwen36Dir, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      await writeFile(
+        join(qwen36Dir, 'chat_template.jinja'),
+        '{%- if enable_thinking is false -%}<think>\n</think>{%- endif -%}',
+      );
+      await writeFile(join(qwen38Dir, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+      await writeFile(
+        join(qwen38Dir, 'chat_template.jinja'),
+        "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+      );
+
+      const found = await discoverModels(dir);
+      const ctrl = makeSwapController(found, fakeRegistry() as unknown as ModelRegistry, vi.fn());
+      const byId = new Map(ctrl.listModels().map((row) => [row.id, row]));
+
+      expect(byId.get('qwen3.6-27b')?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'high', label: 'High', default: true },
+      ]);
+      expect(byId.get('qwen3.8-27b')?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High', default: true },
+        { value: 'xhigh', label: 'X-High' },
+      ]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

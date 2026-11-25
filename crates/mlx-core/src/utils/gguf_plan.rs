@@ -478,12 +478,14 @@ pub(crate) fn plan_gguf_import(
             gguf.metadata.get("tokenizer.ggml.merges"),
             Some(GgufMetaValue::ArrayString(_))
         );
+        let will_reconstruct_tokenizer =
+            has_embedded_gpt2_tokenizer && !asset_dir.join("tokenizer.json").exists();
         for &filename in GGUF_RUNTIME_ASSET_FILES {
             let src = asset_dir.join(filename);
             if src.exists() {
                 asset_copies.push((src, filename));
             } else if matches!(filename, "tokenizer.json" | "tokenizer_config.json") {
-                if has_embedded_gpt2_tokenizer {
+                if will_reconstruct_tokenizer {
                     debug!(
                         "{filename} not found in asset source directory {}; will reconstruct from embedded GGUF tokenizer metadata.",
                         asset_dir.display()
