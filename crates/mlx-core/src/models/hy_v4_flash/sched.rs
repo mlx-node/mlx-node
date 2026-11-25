@@ -695,6 +695,13 @@ impl Paged {
         self.owners.bytes() + self.states.held_bytes() + held
     }
 
+    /// Byte budget left for RAM prefix states under `total_budget`, after
+    /// subtracting live owner cells and open turns' held turn candidates.
+    pub fn state_ram_budget(&self, total_budget: u64) -> u64 {
+        let held: u64 = self.turns.values().map(|t| t.turn.held_bytes()).sum();
+        total_budget.saturating_sub(self.owners.bytes().saturating_add(held))
+    }
+
     fn live_tokens(&self, seq: SeqId) -> &[u32] {
         self.adapter.request_tokens_for(seq).unwrap_or(&[])
     }
@@ -1032,7 +1039,7 @@ fn disk_start(p: &mut Paged, seq: SeqId, tokens: &[u32], keys: &[Vec<u64>], salt
 /// `seq`'s turn ended: its turn state publishes under write-path keys, its
 /// blocks below registered under them, and the owner keeps the keys of its
 /// cell's whole blocks for its next turn.
-fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan) {
+fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan, state_budget: u64) {
     let Some(kv_end) = p.owners.get(seq).map(OwnerCell::len) else {
         return;
     };
@@ -1059,7 +1066,8 @@ fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan) {
         keys: &keys[..blocks],
         salt,
     };
-    match p.states.publish(key, state, Kind::Turn) {
+    let cap = p.state_ram_budget(state_budget);
+    match p.states.publish_within(key, state, Kind::Turn, Some(cap)) {
         Ok(Some(id)) => {
             p.published += 1;
             disk_start(p, seq, &tokens, &keys, salt, row);
@@ -1071,13 +1079,14 @@ fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan) {
 }
 
 /// The deepest state on disk only that `prompt` resumes from past `hit`,
-/// whose chain is whole, read back and given its RAM copy; two at most are
-/// tried, one that does not read back going with its object. `None`
-/// keeps `hit`.
+/// whose chain is whole, read back and given its RAM copy within
+/// `state_budget`; two at most are tried, one that does not read back going
+/// with its object. `None` keeps `hit`.
 fn resume_from_disk(
     p: &mut Paged,
     prompt: Key<'_>,
     hit: Option<(u64, usize)>,
+    state_budget: u64,
 ) -> Option<(u64, usize)> {
     let floor = hit.map_or(0, |h| h.1);
     let found = p.states.disk_only_above(prompt, floor);
@@ -1086,20 +1095,30 @@ fn resume_from_disk(
             let entry = p.states.store().get(id)?;
             (entry.disk()?.key, entry.extra_keys().to_vec())
         };
-        let Paged {
-            disk,
-            states,
-            adapter,
-            ..
-        } = &mut *p;
-        let disk = disk.as_mut()?;
-        let segments = disk.chain_whole(prompt.tokens, &extra, prompt.salt, row, &|h| {
-            adapter.prefix_cached(h)
-        });
-        let Some(segments) = segments else {
-            disk.discard(states.store_mut(), id);
-            continue;
+        let segments = {
+            let Paged {
+                disk,
+                states,
+                adapter,
+                ..
+            } = &mut *p;
+            let disk = disk.as_mut()?;
+            let segments = disk.chain_whole(prompt.tokens, &extra, prompt.salt, row, &|h| {
+                adapter.prefix_cached(h)
+            });
+            let Some(segments) = segments else {
+                disk.discard(states.store_mut(), id);
+                continue;
+            };
+            segments
         };
+        let need = p.disk.as_ref()?.state_bytes_at(row);
+        let cap = p.state_ram_budget(state_budget);
+        if !p.states.reserve_for_promote(id, need, cap) {
+            continue;
+        }
+        let Paged { disk, states, .. } = &mut *p;
+        let disk = disk.as_mut()?;
         match disk.read_state(
             states.store_mut(),
             key,
@@ -1109,8 +1128,8 @@ fn resume_from_disk(
             SEGMENT_BOUND,
         ) {
             Read::State(s) => {
-                if !states.promote(id, s) {
-                    return None;
+                if !states.promote_within(id, s, Some(cap)) {
+                    continue;
                 }
                 tracing::debug!(
                     row,
@@ -1525,6 +1544,7 @@ impl Inner {
     /// below `row` and publishes its cell there. A refusal costs reuse only.
     fn publish_at(&mut self, seq: SeqId, row: usize) {
         let mtp_loaded = self.mtp.is_some();
+        let state_budget = self.state_budget();
         let Some(p) = self.paged.as_mut() else {
             return;
         };
@@ -1557,7 +1577,8 @@ impl Inner {
             keys: &plan.keys[..blocks],
             salt: plan.salt,
         };
-        match p.states.publish(key, state, kind) {
+        let cap = p.state_ram_budget(state_budget);
+        match p.states.publish_within(key, state, kind, Some(cap)) {
             Ok(Some(id)) => {
                 p.published += 1;
                 let replay = (kind != Kind::Checkpoint).then_some(id);
@@ -1628,6 +1649,7 @@ impl Inner {
         let ends = self.grid.ends(0, tokens);
         let pass = pass_keys(tokens, &ends, self.grid.chunk());
         let nonce = rand::random::<u64>();
+        let state_budget = self.state_budget();
         let Inner {
             store,
             mtp,
@@ -1651,12 +1673,12 @@ impl Inner {
         let skip_disk = p.disk.as_mut().is_some_and(Disk::take_skip);
         let mut from_disk = None;
         let hit = if reuse && !warm && !skip_disk && p.disk.is_some() {
-            match resume_from_disk(p, prompt, hit) {
+            match resume_from_disk(p, prompt, hit, state_budget) {
                 Some(deeper) => {
                     from_disk = Some(deeper.0);
                     Some(deeper)
                 }
-                None => hit,
+                None => hit.filter(|&(id, _)| p.states.get(id).is_some()),
             }
         } else {
             hit
@@ -1744,6 +1766,7 @@ impl Inner {
     /// publishes under write-path keys and the owner keeps the keys of its
     /// cell's blocks; its plan goes.
     fn close_turn(&mut self, reuse: bool) {
+        let state_budget = self.state_budget();
         let Some(p) = self.paged.as_mut() else {
             return;
         };
@@ -1754,7 +1777,7 @@ impl Inner {
             return;
         };
         if reuse && plan.publish {
-            publish_turn(p, seq, &mut plan);
+            publish_turn(p, seq, &mut plan, state_budget);
         }
         if let Some(disk) = p.disk.as_mut() {
             disk.close(seq);

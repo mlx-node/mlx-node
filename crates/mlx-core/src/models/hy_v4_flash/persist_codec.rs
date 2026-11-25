@@ -161,6 +161,18 @@ impl StateShape {
         }
         bytes as u64
     }
+
+    /// Resident RAM bytes a decoded state at `row` holds: its fixed state
+    /// span plus all whole MTP draft segments when `draft` is present.
+    pub fn resident_bytes_at(&self, row: usize) -> u64 {
+        let segments = self.draft.as_ref().map_or(0, |d| {
+            let per = BLOCK_ROWS / d.index.kpool.max(1);
+            let segment_bytes =
+                (BLOCK_ROWS * d.width as usize * 2 + per * d.index.head_dim * 2) as u64;
+            super::persist::segments_at(row) as u64 * segment_bytes
+        });
+        self.span_bytes().saturating_add(segments)
+    }
 }
 
 /// Most `tok_k` rows a tail holds (`TokTail::keep`).

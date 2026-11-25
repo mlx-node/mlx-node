@@ -17,8 +17,8 @@ use super::ladder::Kind;
 use super::owner::{CellLayer, OwnerCell};
 use super::paged::PageGeometry;
 use super::persist::{
-    Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, chain, disk_plan, fingerprint,
-    identity_text, segment_key, segments_at,
+    Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, Read, SEGMENT_BOUND, chain,
+    disk_plan, fingerprint, identity_text, segment_key, segments_at,
 };
 use super::persist_codec::{
     StateShape, block_layout, decode_state, encode_state_into, join_block, split_block,
@@ -26,8 +26,8 @@ use super::persist_codec::{
 use super::persist_writer::Telemetry;
 use super::prefill::BLOCK_ROWS;
 use super::prefix_state::{
-    Key, PrefixState, StateLayer, States, WRITE_TAG, any_written, is_written, prompt_keys, resumes,
-    turn_keys, written_key,
+    DraftState, Key, OpenRows, PrefixState, Segment, StateLayer, States, Stored, WRITE_TAG,
+    any_written, is_written, prompt_keys, resumes, turn_keys, written_key,
 };
 use super::sched::lookup_bounds;
 use super::test_support::{Temp, arr, tiny_cfg};
@@ -1234,4 +1234,219 @@ fn warm_prompt_and_upgraded_checkpoint_are_not_superseded_by_fast_turn() {
         1,
         "linear Turn -> Turn must still supersede"
     );
+}
+
+/// Adopting an MTP state from SSD must account for all decoded draft segments
+/// (`StateShape::resident_bytes_at(row)`), not only the trunk `span_bytes()`.
+#[test]
+fn adopt_resident_bytes_include_mtp_draft_segments() {
+    let root = Temp::new("persist-mtp-resident-bytes");
+    let mut cfg = tiny_cfg();
+    let mut mtp_layer = cfg.layers[1].clone();
+    mtp_layer.mtp = true;
+    mtp_layer.engram = None;
+    cfg.layers.push(mtp_layer);
+    let shape = StateShape::of(&cfg, true).unwrap();
+    let draft_shape = shape.draft.as_ref().unwrap();
+    let pid = Some((
+        "1234567890abcdef1234567890abcdef",
+        b"hy4-mtp-resident-bytes".as_slice(),
+    ));
+
+    let row = MINIMUM_ROWS;
+    let tok = tokens(row + 16);
+    let (_, mut state) = make_cell_state(&cfg, &tok[..row], &[row], false);
+    let whole = segments_at(row);
+    let m = row - 1;
+    let open_rows = m - whole * BLOCK_ROWS;
+    let per = BLOCK_ROWS / draft_shape.index.kpool.max(1);
+    let seg = Arc::new(Segment {
+        kv: MxArray::zeros(
+            &[BLOCK_ROWS as i64, draft_shape.width],
+            Some(DType::Float16),
+        )
+        .unwrap(),
+        pooled: MxArray::zeros(
+            &[per as i64, draft_shape.index.head_dim as i64],
+            Some(DType::Float16),
+        )
+        .unwrap(),
+    });
+    let expected_resident = shape.span_bytes() + whole as u64 * seg.nbytes() as u64;
+    assert_eq!(shape.resident_bytes_at(row), expected_resident);
+    assert!(expected_resident > shape.span_bytes());
+
+    let open_pooled_groups = open_rows / draft_shape.index.kpool.max(1);
+    let open = OpenRows {
+        kv: MxArray::zeros(&[open_rows as i64, draft_shape.width], Some(DType::Float16)).unwrap(),
+        pooled: (open_pooled_groups > 0).then(|| {
+            MxArray::zeros(
+                &[open_pooled_groups as i64, draft_shape.index.head_dim as i64],
+                Some(DType::Float16),
+            )
+            .unwrap()
+        }),
+    };
+    let tail_rows = (draft_shape.index.kpool.saturating_sub(1) + WINDOW_SLACK).min(m);
+    let tail_arr = MxArray::zeros(
+        &[tail_rows as i64, draft_shape.index.head_dim as i64],
+        Some(DType::Float32),
+    )
+    .unwrap();
+    let tail = TokTail::of_rows(&draft_shape.index, Some(tail_arr), m).unwrap();
+    let seed = MxArray::zeros(&[1, draft_shape.dim], Some(DType::Float32)).unwrap();
+    state.draft = Some(DraftState {
+        segments: vec![Arc::clone(&seg); whole],
+        open: Some(open),
+        tail,
+        seed,
+    });
+    assert!(state.bytes() <= shape.resident_bytes_at(row));
+
+    let keys: Vec<Vec<u64>> = (0..row / BLOCK_ROWS)
+        .map(|b| vec![0x7000_0000 + b as u64])
+        .collect();
+    {
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(4);
+        let hot = vec![0u64; row / BLOCK_ROWS];
+        rig.disk.start(1, &tok[..row], &keys, &hot, 0);
+        let k = Key {
+            tokens: &tok[..row],
+            keys: &keys,
+            salt: 0,
+        };
+        let id = st.publish(k, state, Kind::Prompt).unwrap().unwrap();
+        let draft = st.get(id).and_then(|s| s.draft.as_ref());
+        rig.disk.published(st.store(), 1, row, draft, Some(id));
+        assert!(rig.flush(&mut st, 30));
+    }
+
+    // Session 2: adopt and verify cached resident bytes include all draft segments.
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(4);
+    assert_eq!(rig.disk.adopt(st.store_mut()), 1);
+    assert_eq!(rig.disk.state_bytes_at(row), expected_resident);
+    let entry = st.store().entries().next().unwrap();
+    let cached_bytes = entry.resident_bytes().saturating_sub(entry.state_bytes());
+    assert_eq!(
+        cached_bytes, expected_resident,
+        "adopted entry cached_bytes must include MTP draft segments"
+    );
+}
+
+/// Pre-upgrade SSD cold replay entries stored 1-element `[k]` extra keys on
+/// non-grid replay chunks where the upgraded `pass_keys` now emits
+/// `[WRITE_TAG, k]`. Adopted legacy entries must still match identical prompts
+/// and restore their original SSD KV block chain, while rejecting mismatched
+/// hashes.
+#[test]
+fn legacy_ssd_cold_replay_entry_resumes_under_new_pass_keys() {
+    use super::prefill::Grid;
+    use super::sched::pass_keys;
+
+    const OPEN: [u32; 3] = [120_000, 611, 10_372];
+    const GEN: [u32; 5] = [120_000, 611, 10_372, 120_001, 120_029];
+    const CHUNK: usize = 4096;
+
+    let root = Temp::new("persist-legacy-pass-keys");
+    let cfg = tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let pid = Some((
+        "abcdef0123456789abcdef0123456789",
+        b"hy4-legacy-pass-keys".as_slice(),
+    ));
+
+    let g = Grid::new(CHUNK, OPEN.to_vec()).unwrap();
+    let p_row = MINIMUM_ROWS + 256; // 2304: non-grid replay_row
+    let mut prompt: Vec<u32> = (0..p_row + GEN.len())
+        .map(|i| 19 + (i % 101) as u32)
+        .collect();
+    prompt[p_row..].copy_from_slice(&GEN);
+    assert_eq!(g.replay_row(&prompt), p_row);
+
+    let ends = g.ends(0, &prompt);
+    let new_pass = pass_keys(&prompt, &ends, CHUNK);
+    assert_eq!(new_pass.len(), p_row / BLOCK_ROWS);
+    assert!(new_pass.iter().all(|k| is_written(k)));
+
+    // Legacy pre-upgrade pass_keys emitted the bare 1-element `[k]` hash.
+    let legacy_pass: Vec<Vec<u64>> = new_pass.iter().map(|k| vec![k[1]]).collect();
+    assert!(!any_written(&legacy_pass));
+
+    // Session 1 (pre-upgrade): persist cold replay state under legacy `[k]` keys.
+    {
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(4);
+        let (_, state) = make_cell_state(&cfg, &prompt[..p_row], &[p_row], false);
+        let id = rig.publish(
+            &mut st,
+            1,
+            &prompt[..p_row],
+            &legacy_pass,
+            0,
+            state,
+            Kind::Prompt,
+        );
+        assert!(rig.flush(&mut st, 30));
+        assert!(st.store().get(id).unwrap().disk().unwrap().landed);
+    }
+
+    // Session 2 (post-upgrade): adopt legacy entry, look up with new `[WRITE_TAG, k]`
+    // pass_keys, verify hit + SSD chain/state restore + mismatch rejection.
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(4);
+    assert_eq!(rig.disk.adopt(st.store_mut()), 1);
+
+    let pk_new = Key {
+        tokens: &prompt,
+        keys: &new_pass,
+        salt: 0,
+    };
+    let found = st.disk_only_above(pk_new, 0);
+    assert_eq!(found.len(), 1);
+    let (id, row) = found[0];
+    assert_eq!(row, p_row);
+    assert!(!any_written(st.store().get(id).unwrap().extra_keys()));
+    assert_eq!(st.keys_of(id).unwrap(), legacy_pass);
+
+    // Mismatched hash `[WRITE_TAG, k ^ 1]` must still be rejected.
+    let mut bad_pass = new_pass.clone();
+    bad_pass[0][1] ^= 1;
+    assert!(
+        st.disk_only_above(
+            Key {
+                tokens: &prompt,
+                keys: &bad_pass,
+                salt: 0,
+            },
+            0
+        )
+        .is_empty()
+    );
+
+    // Original legacy SSD KV chain and state decode cleanly under stored legacy keys.
+    let (disk_key, extra) = {
+        let e = st.store().get(id).unwrap();
+        (e.disk().unwrap().key, e.extra_keys().to_vec())
+    };
+    let segments = rig
+        .disk
+        .chain_whole(&prompt, &extra, 0, row, &|_| false)
+        .expect("legacy SSD KV chain must remain whole");
+    match rig.disk.read_state(
+        st.store_mut(),
+        disk_key,
+        row,
+        &extra,
+        &segments,
+        SEGMENT_BOUND,
+    ) {
+        Read::State(restored) => {
+            assert_eq!(restored.row, p_row);
+            assert!(st.promote(id, restored));
+            assert_eq!(st.lookup(pk_new, &|_| true), Some((id, p_row)));
+        }
+        Read::Busy | Read::Failed => panic!("legacy SSD replay state failed to read back"),
+    }
 }

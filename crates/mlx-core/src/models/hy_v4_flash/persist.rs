@@ -567,8 +567,14 @@ impl Disk {
     }
 
     pub(crate) fn adopt(&mut self, store: &mut Store) -> u64 {
-        let span = self.0.codec.shape.span_bytes();
-        self.0.adopt(store, |_| span)
+        let shape = self.0.codec.shape.clone();
+        self.0.adopt(store, |row| shape.resident_bytes_at(row))
+    }
+
+    /// Resident RAM bytes a decoded state at `row` holds (state span plus all
+    /// whole MTP draft segments when MTP is enabled).
+    pub(crate) fn state_bytes_at(&self, row: usize) -> u64 {
+        self.0.codec.shape.resident_bytes_at(row)
     }
 
     pub(crate) fn read_state(

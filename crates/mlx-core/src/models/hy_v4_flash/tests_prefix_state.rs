@@ -353,3 +353,141 @@ fn lru_evicts_idle_short_state_instead_of_thrashing_hot_durable_prefixes() {
         );
     }
 }
+
+/// Multi-lane RAM state budget enforcement: `reserve_bytes`,
+/// `reserve_for_promote`, `promote_within`, and `publish_within` bound
+/// resident bytes (counting shared segments once), evict LRU entries *before*
+/// decoding from SSD, and refuse an entry that cannot fit without wiping out
+/// healthy RAM states.
+#[test]
+fn byte_cap_enforces_pre_decode_reservation_and_unshared_mtp_segment_budget() {
+    use crate::disk_tier::store::{DiskCopy, Lineage, StateClass};
+    use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
+
+    let disk_copy = |seed: u64| DiskCopy {
+        key: ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            ColdCacheFingerprint::from_components([&seed.to_le_bytes()[..]]),
+            None,
+            &[seed as u32],
+            &[],
+            0,
+            0,
+        ),
+        bytes: 64,
+        landed: true,
+        window_begin: 0,
+        chain_owed: false,
+    };
+    let mtp_fake = |own: u64, seg_id: usize, seg_bytes: u64| Fake {
+        own,
+        shared: vec![(seg_id, seg_bytes)],
+    };
+
+    // 4-lane slot cap (32) with a tight byte cap (300 B) where each unshared
+    // MTP state costs 100 B (10 B own + 90 B unshared segments).
+    let mut st = States::<Fake>::with_cap(RAM_STATES * 4);
+    let mut ids = Vec::new();
+    for i in 1..=3u32 {
+        let id = st
+            .publish_within(
+                Key::text(&lineage(i, 1), SALT),
+                mtp_fake(10, i as usize, 90),
+                Kind::Prompt,
+                Some(300),
+            )
+            .unwrap()
+            .unwrap();
+        ids.push(id);
+    }
+    assert_eq!(st.ram_len(), 3);
+    assert_eq!(st.held_bytes(), 300);
+
+    // Sharing an existing segment (`seg_id = 3`) only adds `own` (10 B), so
+    // `added_bytes` deduplicates it and fits under a 310 B cap without evicting.
+    let shared_state = mtp_fake(10, 3, 90);
+    assert_eq!(st.added_bytes(&shared_state), 10);
+    let shared_id = st
+        .publish_within(
+            Key::text(&lineage(4, 1), SALT),
+            shared_state,
+            Kind::Prompt,
+            Some(310),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(st.ram_len(), 4);
+    assert_eq!(st.held_bytes(), 310);
+
+    // Park two disk-only MTP states: one that fits after evicting LRU entries
+    // (`disk_fit`, 100 B unshared) and one larger than the entire byte cap
+    // (`disk_huge`, 400 B unshared).
+    let disk_fit = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&lineage(10, 1), SALT),
+            100,
+            StateClass::Ordinary,
+            disk_copy(10),
+        )
+        .unwrap();
+    let disk_huge = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&lineage(11, 1), SALT),
+            400,
+            StateClass::Ordinary,
+            disk_copy(11),
+        )
+        .unwrap();
+
+    // Oversized SSD candidate is rejected pre-decode WITHOUT evicting any RAM entry.
+    assert!(!st.reserve_bytes(400, 300));
+    assert!(!st.reserve_for_promote(disk_huge, 400, 300));
+    assert_eq!(st.ram_len(), 4);
+    assert_eq!(st.held_bytes(), 310);
+
+    // Fitting SSD candidate evicts oldest LRU entries BEFORE decoding so
+    // `held_bytes() + 100 <= 300`, then `promote_within` lands within cap.
+    assert!(st.reserve_for_promote(disk_fit, 100, 300));
+    assert!(st.held_bytes() + 100 <= 300);
+    assert!(st.get(ids[0]).is_none(), "oldest LRU entry evicted first");
+    assert!(
+        st.get(ids[1]).is_none(),
+        "second oldest evicted to fit 100 B"
+    );
+    assert!(st.get(ids[2]).is_some() && st.get(shared_id).is_some());
+    assert!(st.promote_within(disk_fit, mtp_fake(10, 10, 90), Some(300)));
+    assert!(st.held_bytes() <= 300);
+    assert!(st.get(disk_fit).is_some());
+
+    // `reserve_bytes` evicts until `held_bytes() + incoming <= byte_cap`.
+    assert!(st.reserve_bytes(100, 200));
+    assert!(st.held_bytes() + 100 <= 200);
+
+    // Publishing another unshared 100 B state evicts LRU entries to stay within
+    // `byte_cap = 200`, while an oversized publish returns `Ok(None)` without
+    // wiping existing RAM states.
+    let before = st.ram_len();
+    assert!(
+        st.publish_within(
+            Key::text(&lineage(12, 1), SALT),
+            mtp_fake(10, 12, 250),
+            Kind::Turn,
+            Some(200),
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(st.ram_len(), before);
+    let fit_pub = st
+        .publish_within(
+            Key::text(&lineage(13, 1), SALT),
+            mtp_fake(10, 13, 90),
+            Kind::Turn,
+            Some(200),
+        )
+        .unwrap();
+    assert!(fit_pub.is_some());
+    assert!(st.held_bytes() <= 200);
+}
