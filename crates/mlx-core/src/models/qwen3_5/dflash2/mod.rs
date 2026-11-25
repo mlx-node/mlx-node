@@ -57,7 +57,7 @@ pub(crate) use test_helpers::{
     tiny_dflash2_model_with_block, write_test_checkpoint,
 };
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 #[cfg(test)]
 use crate::engine::dspark_turn::non_causal_sliding_mask;
 use crate::engine::dspark_turn::parallel_query_ids;
@@ -265,6 +265,148 @@ impl DFlash2Model {
 
     pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
         self.config.validate_target(target.into())
+    }
+
+    /// Content-bound fingerprint of the loaded, materialized fusion weights
+    /// (`self.fc` + `self.hidden_norm`) and the config parameters that govern
+    /// [`crate::models::qwen3_5::draft_context::DraftContextWindow`].
+    ///
+    /// Computed strictly from in-memory tensors so persistent SSD caches
+    /// cannot suffer TOCTOU races or miss same-size/same-mtime weight edits.
+    pub(crate) fn context_fusion_fingerprint(&self) -> Result<Vec<u8>> {
+        fn push_array_bytes(
+            components: &mut Vec<Vec<u8>>,
+            tag: &[u8],
+            arr: &MxArray,
+        ) -> Result<()> {
+            let dtype = arr.dtype()?;
+            let shape = arr.shape()?;
+            let mut meta = Vec::with_capacity(tag.len() + 12 + shape.len() * 8);
+            meta.extend_from_slice(tag);
+            meta.extend_from_slice(&(dtype as i32).to_le_bytes());
+            meta.extend_from_slice(&(shape.len() as u64).to_le_bytes());
+            for &dim in shape.as_ref() {
+                meta.extend_from_slice(&dim.to_le_bytes());
+            }
+            components.push(meta);
+
+            let raw = match dtype {
+                DType::Uint8 => arr.to_uint8()?,
+                DType::Int8 => arr.to_int8()?.into_iter().map(|v| v as u8).collect(),
+                DType::Float16 | DType::BFloat16 => {
+                    let vals = arr.to_uint16_native()?;
+                    let mut out = Vec::with_capacity(vals.len() * 2);
+                    for v in vals {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Uint32 => {
+                    let vals = arr.to_uint32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Int32 => {
+                    let vals = arr.to_int32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Float32 => {
+                    let vals = arr.to_float32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    out
+                }
+            };
+            components.push(raw);
+            Ok(())
+        }
+
+        let mut components: Vec<Vec<u8>> = Vec::with_capacity(16);
+        components.push(b"dflash2-fusion-weights:v1".to_vec());
+
+        // Canonical config bytes governing `DraftContextWindow` tap extraction and fusion.
+        let mut cfg_bytes = Vec::with_capacity(64 + self.config.target_layers.len() * 8);
+        cfg_bytes.extend_from_slice(&(self.config.hidden_size as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.sliding_window as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.block_size as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.target_num_layers as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&self.config.rms_norm_eps.to_bits().to_le_bytes());
+        cfg_bytes.push(match self.config.capture_final_norm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        });
+        match self.config.embedding_normalization.as_deref() {
+            None => cfg_bytes.push(0),
+            Some(mode) => {
+                cfg_bytes.push(1);
+                cfg_bytes.extend_from_slice(&(mode.len() as u64).to_le_bytes());
+                cfg_bytes.extend_from_slice(mode.as_bytes());
+            }
+        }
+        cfg_bytes.extend_from_slice(&(self.config.target_layers.len() as u64).to_le_bytes());
+        for &layer in &self.config.target_layers {
+            cfg_bytes.extend_from_slice(&(layer as u64).to_le_bytes());
+        }
+        components.push(cfg_bytes);
+
+        // `self.fc` projection metadata and exact materialized tensor bytes.
+        match &self.fc {
+            LinearProj::Quantized(q) => {
+                let mut fc_meta = Vec::with_capacity(32 + q.mode().len());
+                fc_meta.extend_from_slice(b"fc:quantized");
+                fc_meta.extend_from_slice(&q.bits().to_le_bytes());
+                fc_meta.extend_from_slice(&q.group_size().to_le_bytes());
+                fc_meta.extend_from_slice(&(q.mode().len() as u64).to_le_bytes());
+                fc_meta.extend_from_slice(q.mode().as_bytes());
+                components.push(fc_meta);
+                push_array_bytes(&mut components, b"fc.weight", q.get_weight())?;
+                push_array_bytes(&mut components, b"fc.scales", q.get_scales())?;
+                if let Some(biases) = q.get_biases() {
+                    components.push(vec![1u8]);
+                    push_array_bytes(&mut components, b"fc.biases", biases)?;
+                } else {
+                    components.push(vec![0u8]);
+                }
+            }
+            LinearProj::Standard(lin) => {
+                components.push(b"fc:standard".to_vec());
+                let w = lin.get_weight();
+                push_array_bytes(&mut components, b"fc.weight", &w)?;
+                if let Some(b) = lin.get_bias() {
+                    components.push(vec![1u8]);
+                    push_array_bytes(&mut components, b"fc.bias", &b)?;
+                } else {
+                    components.push(vec![0u8]);
+                }
+            }
+        }
+
+        // `self.hidden_norm` policy, epsilon, and exact materialized scale bytes.
+        let mut norm_meta = Vec::with_capacity(16);
+        norm_meta.extend_from_slice(b"hidden_norm");
+        norm_meta.extend_from_slice(&self.hidden_norm.eps_f32().to_bits().to_le_bytes());
+        norm_meta.push(u8::from(self.hidden_norm.is_precise_f32()));
+        components.push(norm_meta);
+        push_array_bytes(
+            &mut components,
+            b"hidden_norm.weight",
+            self.hidden_norm.weight(),
+        )?;
+
+        let fp = mlx_paged_attn::ColdCacheFingerprint::from_components(
+            components.iter().map(Vec::as_slice),
+        );
+        Ok(fp.as_bytes().to_vec())
     }
 
     pub(crate) fn fuse_context(&self, taps: &[MxArray]) -> Result<MxArray> {

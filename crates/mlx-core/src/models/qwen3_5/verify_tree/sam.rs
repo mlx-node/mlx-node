@@ -67,19 +67,31 @@ impl LookupIndex {
     pub(crate) fn new() -> Self {
         Self {
             tokens: Vec::new(),
-            states: vec![SamState {
-                length: 0,
-                link: Self::NONE,
-                edges: Self::NONE,
-                recent: 0,
-            }],
+            states: Vec::new(),
             edges: Vec::new(),
-            slots: vec![0; Self::INITIAL_SLOTS],
+            slots: Vec::new(),
             last: 0,
             capped: 0,
             match_len: 0,
             match_end: 0,
         }
+    }
+
+    /// Total heap allocation capacity (in bytes) currently retained by this index.
+    pub(crate) fn heap_bytes(&self) -> u64 {
+        (self.tokens.capacity() as u64)
+            .saturating_mul(std::mem::size_of::<u32>() as u64)
+            .saturating_add(
+                (self.states.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<SamState>() as u64),
+            )
+            .saturating_add(
+                (self.edges.capacity() as u64)
+                    .saturating_mul(std::mem::size_of::<SamEdge>() as u64),
+            )
+            .saturating_add(
+                (self.slots.capacity() as u64).saturating_mul(std::mem::size_of::<u32>() as u64),
+            )
     }
 
     /// Clear all indexed tokens and automaton states, keeping backing allocations
@@ -127,6 +139,17 @@ impl LookupIndex {
     }
 
     pub(crate) fn push(&mut self, token: u32) {
+        if self.states.is_empty() {
+            self.states.push(SamState {
+                length: 0,
+                link: Self::NONE,
+                edges: Self::NONE,
+                recent: 0,
+            });
+        }
+        if self.slots.is_empty() {
+            self.slots.resize(Self::INITIAL_SLOTS, 0);
+        }
         let position = self.tokens.len() as u32;
         self.tokens.push(token);
 

@@ -252,6 +252,7 @@ pub(crate) async fn load_model_with_options(
                         |ctx, _kind| {
                             let recency = Arc::clone(&ctx.inner.cache_recency);
                             let cfg_ref = &ctx.inner.config;
+                            let dflash2_cfg = ctx.inner.dflash2.as_ref().map(|d| &d.config);
                             start_under_growth_lock(memory_governor(), || {
                                 let live = live_memory().ok_or_else(|| {
                                     Error::from_reason(
@@ -267,6 +268,7 @@ pub(crate) async fn load_model_with_options(
                                     max_context,
                                     max_lanes,
                                     disk_options.cache_disk,
+                                    dflash2_cfg,
                                 )?;
                                 let (reg_guard, coord) =
                                     Inkling2KVCacheCoordinator::new_with_memory_plan(
@@ -282,6 +284,7 @@ pub(crate) async fn load_model_with_options(
                         },
                         |ctx| {
                             ctx.inner.dflash2 = None;
+                            ctx.inner.dflash2_identity = None;
                             synchronize_and_clear_cache();
                         },
                         |ctx| {
@@ -329,6 +332,7 @@ pub(crate) async fn load_model_with_options(
                     Some(model_id),
                 );
                 let max_chunk = pool_plan.max_chunk;
+                let ram_cap = (pool_plan.lanes.max(1) as usize * 4).clamp(8, 32);
                 inner.memory_plan = Some(pool_plan.memory_plan);
                 inner.memory_registration = Some(guard);
                 inner.wired = Some(WiredResidency::new(WiredResidency::working_set_minus_pools));
@@ -338,16 +342,26 @@ pub(crate) async fn load_model_with_options(
                     Arc::clone(&inner.cache_recency),
                 ));
 
-                // 3. Attach StateDisk SSD tier & adopt persistent entries on restart.
-                let geom_opt = inner.paged.as_ref().and_then(|rt| {
-                    super::state_disk::Inkling2StateGeometry::from_coordinator(
-                        &inner.config,
-                        &rt.coordinator,
-                    )
-                    .ok()
+                // 3. Configure StateStore geometry + RAM cap, attach StateDisk SSD tier & adopt
+                //    persistent entries on restart.
+                let dflash2_cfg = inner.dflash2.as_ref().map(|d| &d.config);
+                let geom_opt = inner.paged.as_mut().and_then(|rt| {
+                    rt.state_store.attach_host_budget();
+                    rt.state_store.set_ram_cap(ram_cap);
+                    let geom =
+                        super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+                            &inner.config,
+                            &rt.coordinator,
+                            dflash2_cfg,
+                        )
+                        .ok()?;
+                    rt.state_store.set_geometry(geom.clone());
+                    Some(geom)
                 });
                 if let Some(geom) = geom_opt {
-                    let persistent_id = if disk_options.reads_identity() {
+                    let draft_id_ready =
+                        inner.dflash2.is_none() || inner.dflash2_identity.is_some();
+                    let persistent_id = if disk_options.reads_identity() && draft_id_ready {
                         inner.paged.as_ref().and_then(|rt_ref| {
                             compute_persistent_identity(
                                 &inner.config,
@@ -357,6 +371,7 @@ pub(crate) async fn load_model_with_options(
                                 ckpt_files,
                                 &resident,
                                 &load_guard,
+                                inner.dflash2_identity.as_deref(),
                             )
                         })
                     } else {
@@ -711,6 +726,16 @@ fn load_inkling2_draft_into_with(
             draft.validate_target(target_shape)?;
             draft.configure_inkling2_execution(target_shape);
             synchronize_and_clear_cache();
+            let verified_identity = match draft.context_fusion_fingerprint() {
+                Ok(fp) => Some(fp),
+                Err(err) => {
+                    tracing::warn!(
+                        "Inkling2 DFlash2 failed to fingerprint loaded fusion weights from '{}': {err}; disabling persistent StateDisk identity",
+                        explicit_path.display()
+                    );
+                    None
+                }
+            };
             tracing::info!(
                 "Inkling2 DFlash2 loaded from {} in {:.2}s (block_size={}, taps={:?}, softcap={:?}, weights={:.1} MiB)",
                 explicit_path.display(),
@@ -721,6 +746,7 @@ fn load_inkling2_draft_into_with(
                 bytes as f64 / (1024.0 * 1024.0),
             );
             inner.dflash2 = Some(draft);
+            inner.dflash2_identity = verified_identity;
             return Ok((LoadedDraftKind::Explicit, None));
         }
 
@@ -794,6 +820,16 @@ fn load_inkling2_draft_into_with(
             }) {
             Ok((draft, bytes)) => {
                 synchronize_and_clear_cache();
+                let verified_identity = match draft.context_fusion_fingerprint() {
+                    Ok(fp) => Some(fp),
+                    Err(err) => {
+                        tracing::warn!(
+                            "Inkling2 DFlash2 failed to fingerprint auto-loaded fusion weights from '{}': {err}; disabling persistent StateDisk identity",
+                            dflash_path.display()
+                        );
+                        None
+                    }
+                };
                 tracing::info!(
                     "Inkling2 DFlash2 auto-loaded from {} in {:.2}s (block_size={}, taps={:?}, softcap={:?}, weights={:.1} MiB)",
                     dflash_path.display(),
@@ -804,6 +840,7 @@ fn load_inkling2_draft_into_with(
                     bytes as f64 / (1024.0 * 1024.0),
                 );
                 inner.dflash2 = Some(draft);
+                inner.dflash2_identity = verified_identity;
                 return Ok((LoadedDraftKind::AutoDflash2, None));
             }
             Err(err) => {
@@ -854,11 +891,18 @@ fn load_sync(
     if crate::engine::persistence::compiled_forward_backend_available() {
         let effective_cfg =
             paged_cfg.unwrap_or_else(|| Inkling2PagedConfig::default_for_config(&model.config));
-        model.paged = Some(Inkling2PagedRuntime::new_with_recency(
+        let mut rt = Inkling2PagedRuntime::new_with_recency(
             &model.config,
             effective_cfg,
             Arc::clone(&model.cache_recency),
-        )?);
+        )?;
+        let geom = super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+            &model.config,
+            &rt.coordinator,
+            model.dflash2.as_ref().map(|d| &d.config),
+        )?;
+        rt.state_store.set_geometry(geom);
+        model.paged = Some(rt);
     }
 
     Ok(model)
@@ -1040,6 +1084,7 @@ fn load_weights_sync(
         tokenizer,
         dspark: None,
         dflash2: None,
+        dflash2_identity: None,
         dspark_turn_contexts: HashMap::new(),
         scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
         paged: None,
@@ -2174,6 +2219,7 @@ mod tests {
             tokenizer: None,
             dspark: None,
             dflash2: None,
+            dflash2_identity: None,
             dspark_turn_contexts: HashMap::new(),
             scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
             paged: None,
@@ -3355,5 +3401,200 @@ mod tests {
         assert_eq!(st.dropped_dflash2, 1);
         assert_eq!(st.tried_load_dspark, 1);
         assert_eq!(st.dropped_dspark, 1);
+    }
+
+    #[test]
+    fn dflash2_identity_binds_to_loaded_fusion_weights_across_same_size_same_mtime_edits() {
+        let root = TempDirGuard::new("dflash2-fusion-fp");
+        let model_dir = root.path().join("inkling-2-mini");
+        fs::create_dir_all(&model_dir).expect("create model_dir");
+
+        // Helper: clone `src_dir` into `dst_dir`, mutate one named BF16 tensor in
+        // `model.safetensors` in-place while preserving exact file size and exact file mtime.
+        let copy_and_mutate_tensor = |src_dir: &Path, dst_dir: &Path, tensor_name: &str| {
+            fs::create_dir_all(dst_dir).expect("create dst_dir");
+            for file in ["config.json", "model.safetensors"] {
+                fs::copy(src_dir.join(file), dst_dir.join(file)).expect("copy checkpoint file");
+            }
+            let st_path = dst_dir.join("model.safetensors");
+            let orig_meta = fs::metadata(src_dir.join("model.safetensors")).expect("src meta");
+            let orig_mtime = orig_meta.modified().expect("src mtime");
+            let cfg_mtime = fs::metadata(src_dir.join("config.json"))
+                .expect("cfg meta")
+                .modified()
+                .expect("cfg mtime");
+
+            let mut bytes = fs::read(&st_path).expect("read safetensors");
+            let hdr_len = u64::from_le_bytes(bytes[..8].try_into().unwrap()) as usize;
+            let header: serde_json::Value =
+                serde_json::from_slice(&bytes[8..8 + hdr_len]).expect("parse safetensors header");
+            let offsets = header
+                .get(tensor_name)
+                .and_then(|v| v.get("data_offsets"))
+                .and_then(serde_json::Value::as_array)
+                .expect("tensor data_offsets");
+            let start = 8 + hdr_len + offsets[0].as_u64().unwrap() as usize;
+            let end = 8 + hdr_len + offsets[1].as_u64().unwrap() as usize;
+            assert!(end > start + 16, "tensor {tensor_name} payload too small");
+            // Replace the first 32 BF16 values with large distinct finite values (`+3.0` / `-3.0`)
+            // so both BF16 weights (`hidden_norm`) and affine Q4-quantized weights (`fc`) change.
+            let stride_end = (start + 64).min(end);
+            for (idx, chunk) in bytes[start..stride_end]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+                .enumerate()
+            {
+                let val = if idx % 2 == 0 { 3.5f32 } else { -3.5f32 };
+                let bits = half::bf16::from_f32(val).to_bits();
+                chunk.copy_from_slice(&bits.to_le_bytes());
+            }
+            fs::write(&st_path, &bytes).expect("write mutated safetensors");
+
+            // Restore exact file mtimes on both `model.safetensors` and `config.json`.
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&st_path)
+                .expect("open mutated safetensors")
+                .set_modified(orig_mtime)
+                .expect("set safetensors mtime");
+            fs::OpenOptions::new()
+                .write(true)
+                .open(dst_dir.join("config.json"))
+                .expect("open config.json")
+                .set_modified(cfg_mtime)
+                .expect("set config mtime");
+
+            // Verify exact file size AND exact mtime match the original directory.
+            let mut_meta = fs::metadata(&st_path).expect("mut meta");
+            assert_eq!(mut_meta.len(), orig_meta.len());
+            assert_eq!(mut_meta.modified().expect("mut mtime"), orig_mtime);
+        };
+
+        let dir_base = root.path().join("dflash2-base");
+        let cfg_json = dflash2_config_json(256, 2, 64, 60);
+        crate::models::qwen3_5::dflash2::write_test_checkpoint(&dir_base, &cfg_json)
+            .expect("write baseline DFlash2 checkpoint");
+
+        let dir_fc_mut = root.path().join("dflash2-fc-mut");
+        copy_and_mutate_tensor(&dir_base, &dir_fc_mut, "fc.weight");
+
+        let dir_norm_mut = root.path().join("dflash2-norm-mut");
+        copy_and_mutate_tensor(&dir_base, &dir_norm_mut, "hidden_norm.weight");
+
+        // Load baseline on BOTH explicit and auto-discovered paths.
+        let mut base_explicit = build_synthetic_draft_target_inner();
+        let (kind_base_exp, _) = load_inkling2_draft_into_with(
+            &mut base_explicit,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&dir_base.to_string_lossy()),
+            None,
+            true,
+            load_dflash2,
+            materialize_weights,
+        )
+        .expect("baseline explicit load");
+        assert_eq!(kind_base_exp, LoadedDraftKind::Explicit);
+        let fp_base_exp = base_explicit
+            .dflash2_identity
+            .clone()
+            .expect("baseline explicit identity");
+        assert_eq!(
+            fp_base_exp,
+            base_explicit
+                .dflash2
+                .as_ref()
+                .unwrap()
+                .context_fusion_fingerprint()
+                .expect("baseline context_fusion_fingerprint"),
+            "dflash2_identity must match loaded DFlash2Model::context_fusion_fingerprint()"
+        );
+
+        let mut base_auto = build_synthetic_draft_target_inner();
+        let (kind_base_auto, _) = load_inkling2_draft_into_with(
+            &mut base_auto,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&dir_base.to_string_lossy()),
+            true,
+            load_dflash2,
+            materialize_weights,
+        )
+        .expect("baseline auto load");
+        assert_eq!(kind_base_auto, LoadedDraftKind::AutoDflash2);
+        assert_eq!(
+            base_auto.dflash2_identity.as_deref(),
+            Some(fp_base_exp.as_slice()),
+            "explicit and auto-discovered loads of identical weights must produce identical identity"
+        );
+
+        // Load same-size, same-mtime `fc.weight`-mutated checkpoint (explicit + auto).
+        let mut fc_explicit = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into_with(
+            &mut fc_explicit,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&dir_fc_mut.to_string_lossy()),
+            None,
+            true,
+            load_dflash2,
+            materialize_weights,
+        )
+        .expect("fc-mutated explicit load");
+        let fp_fc_exp = fc_explicit
+            .dflash2_identity
+            .clone()
+            .expect("fc-mutated explicit identity");
+        assert_ne!(
+            fp_fc_exp, fp_base_exp,
+            "same-size/same-mtime fc.weight mutation MUST change context_fusion_fingerprint / dflash2_identity"
+        );
+
+        let mut fc_auto = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into_with(
+            &mut fc_auto,
+            &model_dir,
+            &model_dir,
+            false,
+            None,
+            Some(&dir_fc_mut.to_string_lossy()),
+            true,
+            load_dflash2,
+            materialize_weights,
+        )
+        .expect("fc-mutated auto load");
+        assert_eq!(
+            fc_auto.dflash2_identity.as_deref(),
+            Some(fp_fc_exp.as_slice())
+        );
+
+        // Load same-size, same-mtime `hidden_norm.weight`-mutated checkpoint.
+        let mut norm_explicit = build_synthetic_draft_target_inner();
+        load_inkling2_draft_into_with(
+            &mut norm_explicit,
+            &model_dir,
+            &model_dir,
+            false,
+            Some(&dir_norm_mut.to_string_lossy()),
+            None,
+            true,
+            load_dflash2,
+            materialize_weights,
+        )
+        .expect("norm-mutated explicit load");
+        let fp_norm_exp = norm_explicit
+            .dflash2_identity
+            .clone()
+            .expect("norm-mutated explicit identity");
+        assert_ne!(
+            fp_norm_exp, fp_base_exp,
+            "same-size/same-mtime hidden_norm.weight mutation MUST change context_fusion_fingerprint / dflash2_identity"
+        );
+        assert_ne!(fp_norm_exp, fp_fc_exp);
     }
 }

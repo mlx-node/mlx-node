@@ -509,6 +509,24 @@ impl Inkling2Dflash2Context {
         self.cache.logical_len()
     }
 
+    /// Total resident device + host bytes held by this DFlash2 context:
+    /// sliding draft KV ring buffers + host `token_history` capacity + SAM `LookupIndex` heap.
+    pub(crate) fn resident_bytes(&self) -> u64 {
+        self.cache
+            .buffer_bytes()
+            .saturating_add(self.cache.host_bytes())
+            .saturating_add(self.lookup.heap_bytes())
+    }
+
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        self.resident_bytes()
+    }
+
+    /// MLX GPU buffer bytes held by the sliding draft KV ring (freed from MLX active memory on drop).
+    pub(crate) fn mlx_buffer_bytes(&self) -> u64 {
+        self.cache.buffer_bytes()
+    }
+
     pub(crate) fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {
         self.cache.collect_arrays(out);
     }
@@ -519,15 +537,18 @@ impl Inkling2Dflash2Context {
 
     /// Convert Inkling-2-Mini's 2D `[T, hidden]` target taps into `[1, keep, hidden]` BF16,
     /// fuse via `draft.fuse_context`, and append to the sliding DFlash2 KV ring.
+    ///
+    /// Returns the `[1, keep, D]` fused context tensor for live 4-bit [`DraftContextWindow`]
+    /// capture without running a second `fc` + `hidden_norm` pass.
     pub(crate) fn append_taps(
         &mut self,
         draft: &DFlash2Model,
         taps: &[MxArray],
         token_ids: &[u32],
-    ) -> Result<()> {
+    ) -> Result<Option<MxArray>> {
         let keep = token_ids.len();
         if keep == 0 {
-            return Ok(());
+            return Ok(None);
         }
         let expected = draft.config.target_layers.len();
         if taps.len() != expected {
@@ -557,9 +578,14 @@ impl Inkling2Dflash2Context {
                 taps_3d.push(bf16.expand_dims(0)?);
             }
             let fused = draft.fuse_context(&taps_3d)?;
-            return self
-                .cache
-                .append_full_width_prefix(draft, &fused, base, token_ids);
+            self.cache
+                .append_full_width_prefix(draft, &fused, base, token_ids)?;
+            let fused_kept = if keep < 8 {
+                fused.slice_axis(1, 0, keep as i64)?
+            } else {
+                fused
+            };
+            return Ok(Some(fused_kept));
         }
 
         let mut taps_3d = Vec::with_capacity(taps.len());
@@ -577,7 +603,8 @@ impl Inkling2Dflash2Context {
             taps_3d.push(bf16.expand_dims(0)?);
         }
         let fused = draft.fuse_context(&taps_3d)?;
-        self.cache.append(draft, &fused, base, token_ids)
+        self.cache.append(draft, &fused, base, token_ids)?;
+        Ok(Some(fused))
     }
 
     /// Tree-verify counterpart to [`Self::append_taps`]: reuses contiguous prefix slicing
@@ -589,7 +616,7 @@ impl Inkling2Dflash2Context {
         taps: &[MxArray],
         accepted_rows: &[usize],
         accepted_tokens: &[u32],
-    ) -> Result<()> {
+    ) -> Result<Option<MxArray>> {
         if accepted_rows.len() != accepted_tokens.len() {
             return Err(Error::from_reason(format!(
                 "Inkling2 DFlash2 append_taps_path row count {} != token count {}",
@@ -598,7 +625,7 @@ impl Inkling2Dflash2Context {
             )));
         }
         if accepted_rows.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let is_contiguous_prefix = accepted_rows
             .iter()
@@ -640,7 +667,8 @@ impl Inkling2Dflash2Context {
         }
         let base = self.cache.logical_len();
         let fused = draft.fuse_context(&taps_3d)?;
-        self.cache.append(draft, &fused, base, accepted_tokens)
+        self.cache.append(draft, &fused, base, accepted_tokens)?;
+        Ok(Some(fused))
     }
 
     /// Draft a greedy chain of up to `max_len` tokens, keeping the draft block at full
@@ -819,6 +847,20 @@ impl Inkling2DraftContext {
         match self {
             Self::Dspark(ctx) => ctx.committed_len,
             Self::Dflash2(ctx) => ctx.committed_len(),
+        }
+    }
+
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        match self {
+            Self::Dspark(ctx) => ctx.buffer_bytes(),
+            Self::Dflash2(ctx) => ctx.buffer_bytes(),
+        }
+    }
+
+    pub(crate) fn mlx_buffer_bytes(&self) -> u64 {
+        match self {
+            Self::Dspark(ctx) => ctx.buffer_bytes(),
+            Self::Dflash2(ctx) => ctx.mlx_buffer_bytes(),
         }
     }
 
@@ -1004,17 +1046,21 @@ impl Inkling2Inner {
     }
 
     /// Chunked whole-turn paged prefill that seeds a DFlash2 context cache with
-    /// target hidden taps (`[5, 23, 41, 48]`) on the final sliding window tail.
+    /// target hidden taps (`[5, 23, 41, 48]`), splits at rolling checkpoints and
+    /// prompt junction via `prefill_sub_boundaries`, captures live 4-bit
+    /// [`DraftContextWindow`] snapshots at every block boundary, and publishes
+    /// rolling/junction checkpoints into [`Inkling2StateStore`].
     pub(crate) fn paged_prefill_dflash2_with_taps(
         &mut self,
         seq_id: SeqId,
         tokens: &[u32],
+        prefix: &super::paged_forward::Inkling2PrefixState,
         ctx: &mut Inkling2Dflash2Context,
     ) -> Result<MxArray> {
         if tokens.is_empty() {
             return Err(Error::from_reason("Inkling2 DFlash2 prefill: empty tokens"));
         }
-        let chunk_limit = {
+        let (chunk_limit, bs) = {
             let rt = self.paged.as_ref().ok_or_else(|| {
                 Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing")
             })?;
@@ -1031,7 +1077,7 @@ impl Inkling2Inner {
                      paged cache capacity is {capacity} tokens"
                 )));
             }
-            rt.prefill_chunk_size
+            (rt.prefill_chunk_size, rt.coordinator.block_size().max(1))
         };
         let (tap_visits, sliding_window) = {
             let draft = self.dflash2.as_ref().ok_or_else(|| {
@@ -1043,68 +1089,136 @@ impl Inkling2Inner {
             )
         };
 
+        let abs_base = prefix.effective_cached_prefix_len;
+        let full_tokens = &prefix.full_tokens;
+        let full_prompt_len = full_tokens.len();
+        let cache_salt = prefix.cache_salt;
+        let reuse_cache = prefix.reuse_cache;
+
+        // Collect all capture/end targets where a complete `sliding_window`-long
+        // draft window or live draft KV ring is required: planned 4096 rolling
+        // checkpoints and prompt junction (only when `reuse_cache` permits shared
+        // StateStore publication) plus the final prompt end.
+        let mut targets: Vec<usize> = Vec::new();
+        if reuse_cache
+            && let (Ok(prompt_u32), Ok(base_u32)) =
+                (u32::try_from(full_prompt_len), u32::try_from(abs_base))
+        {
+            for cp in super::state_disk::planned_rolling_checkpoints(prompt_u32, base_u32, bs) {
+                let cp_us = cp as usize;
+                if cp_us > abs_base && cp_us < full_prompt_len {
+                    targets.push(cp_us);
+                }
+            }
+            let junction = ((prompt_u32.saturating_sub(1) / bs) * bs) as usize;
+            if junction > abs_base && junction < full_prompt_len {
+                targets.push(junction);
+            }
+        }
+        targets.push(full_prompt_len);
+        targets.sort_unstable();
+        targets.dedup();
+
         let total_len = tokens.len();
         let mut offset = 0usize;
         let mut final_logits = None;
 
         while offset < total_len {
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let end = (offset + chunk_limit).min(total_len);
-            let chunk = &tokens[offset..end];
-            let is_final_chunk = end == total_len;
-            // Rows strictly older than `sliding_window` behind `total_len` are
-            // evicted unread before the first draft cycle: skip tap fusion for them.
-            let needs_taps = total_len.saturating_sub(end) < sliding_window;
-
-            let first_pos = {
-                let rt = self.paged.as_mut().ok_or_else(|| {
-                    Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing")
-                })?;
-                rt.ensure_conv_state(seq_id, &self.config)?;
-                rt.coordinator
-                    .request_token_count_all(seq_id)
-                    .map_err(Error::from_reason)?
+            let chunk_end = (offset + chunk_limit).min(total_len);
+            let abs_chunk_start = abs_base + offset;
+            let abs_chunk_end = abs_base + chunk_end;
+            let subs = if reuse_cache {
+                super::paged_forward::prefill_sub_boundaries(
+                    abs_chunk_start,
+                    abs_chunk_end,
+                    full_prompt_len,
+                    bs,
+                )
+            } else {
+                vec![abs_chunk_end]
             };
-            self.record_tokens_all_exclusive(seq_id, chunk)
-                .map_err(Error::from_reason)?;
+            let mut abs_sub_start = abs_chunk_start;
 
-            let tap_arg: &[usize] = if needs_taps { &tap_visits } else { &[] };
-            let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
-                seq_id,
-                chunk,
-                None,
-                first_pos,
-                is_final_chunk,
-                tap_arg,
-            )?;
+            for abs_sub_end in subs {
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
+                let sub_start = abs_sub_start - abs_base;
+                let sub_end = abs_sub_end - abs_base;
+                let sub_chunk = &tokens[sub_start..sub_end];
+                let is_final_chunk = sub_end == total_len;
+                // Tap whenever `[abs_sub_start..abs_sub_end)` overlaps the
+                // `[target - sliding_window .. target)` window of ANY planned rolling
+                // checkpoint, prompt junction, or final prompt end.
+                let needs_taps = targets.iter().any(|&target| {
+                    abs_sub_end > target.saturating_sub(sliding_window) && abs_sub_start < target
+                });
 
-            let _ = self.settle_paged_step(seq_id)?;
-            if needs_taps {
-                let draft = self.dflash2.as_ref().ok_or_else(|| {
-                    Error::from_reason("Inkling2 DFlash2 prefill: DFlash2 draft model disappeared")
-                })?;
-                ctx.append_taps(draft, &taps, chunk)?;
-            } else {
-                ctx.cache.record_only(chunk)?;
-            }
-            if let Some(rt) = self.paged.as_mut()
-                && let Ok(pos_after) = u32::try_from(first_pos as usize + chunk.len())
-            {
-                rt.record_block_boundary_conv(seq_id, pos_after);
-            }
+                let first_pos = {
+                    let rt = self.paged.as_mut().ok_or_else(|| {
+                        Error::from_reason("Inkling2 DFlash2 prefill: paged runtime missing")
+                    })?;
+                    rt.ensure_conv_state(seq_id, &self.config)?;
+                    rt.coordinator
+                        .request_token_count_all(seq_id)
+                        .map_err(Error::from_reason)?
+                };
+                self.record_tokens_all_exclusive(seq_id, sub_chunk)
+                    .map_err(Error::from_reason)?;
 
-            if is_final_chunk {
-                final_logits = logits_opt;
-            } else {
-                crate::array::clear_cache();
+                let tap_arg: &[usize] = if needs_taps { &tap_visits } else { &[] };
+                let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
+                    seq_id,
+                    sub_chunk,
+                    None,
+                    first_pos,
+                    is_final_chunk,
+                    tap_arg,
+                )?;
+
+                let _ = self.settle_paged_step(seq_id)?;
+                if needs_taps {
+                    let fused = {
+                        let draft = self.dflash2.as_ref().ok_or_else(|| {
+                            Error::from_reason(
+                                "Inkling2 DFlash2 prefill: DFlash2 draft model disappeared",
+                            )
+                        })?;
+                        ctx.append_taps(draft, &taps, sub_chunk)?
+                    };
+                    if reuse_cache && let Some(fused) = fused {
+                        self.record_fused_to_draft_window_best_effort(seq_id, first_pos, &fused);
+                    }
+                } else {
+                    ctx.cache.record_only(sub_chunk)?;
+                }
+                if let Ok(pos_after) = u32::try_from(first_pos as usize + sub_chunk.len()) {
+                    if let Some(rt) = self.paged.as_mut() {
+                        rt.record_block_boundary_conv(seq_id, pos_after);
+                    }
+                    if reuse_cache && pos_after as usize <= full_tokens.len() {
+                        self.maybe_capture_rolling_checkpoint_best_effort(
+                            seq_id,
+                            full_tokens,
+                            pos_after as usize,
+                            cache_salt,
+                            "DFlash2 prefill",
+                        );
+                    }
+                }
+
+                if is_final_chunk {
+                    final_logits = logits_opt;
+                } else {
+                    crate::array::clear_cache();
+                }
+                abs_sub_start = abs_sub_end;
             }
-            offset = end;
+            offset = chunk_end;
         }
 
         final_logits

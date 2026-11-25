@@ -4735,8 +4735,16 @@ fn run_single_dflash2(
             Inkling2Dflash2Context::new(&d.config),
         )
     };
+    let bench_prefix = crate::models::inkling2::paged_forward::Inkling2PrefixState {
+        effective_cached_prefix_len: 0,
+        suffix_len: prompt_ids.len(),
+        full_tokens: prompt_ids.to_vec(),
+        cache_salt: 0,
+        live_continuation: false,
+        reuse_cache: true,
+    };
     let first_logits = inner
-        .paged_prefill_dflash2_with_taps(seq_id, prompt_ids, &mut draft_ctx)
+        .paged_prefill_dflash2_with_taps(seq_id, prompt_ids, &bench_prefix, &mut draft_ctx)
         .expect("dflash2 prefill");
     draft_ctx.eval_state().expect("eval dflash2 ctx");
     let mut anchor = first_logits
@@ -5105,8 +5113,16 @@ fn profile_dflash2_propose(
             Inkling2Dflash2Context::new(&d.config),
         )
     };
+    let bench_prefix = crate::models::inkling2::paged_forward::Inkling2PrefixState {
+        effective_cached_prefix_len: 0,
+        suffix_len: ctx_prompt.len(),
+        full_tokens: ctx_prompt.to_vec(),
+        cache_salt: 0,
+        live_continuation: false,
+        reuse_cache: true,
+    };
     let first_logits = inner
-        .paged_prefill_dflash2_with_taps(seq_id, ctx_prompt, &mut draft_ctx)
+        .paged_prefill_dflash2_with_taps(seq_id, ctx_prompt, &bench_prefix, &mut draft_ctx)
         .expect("dflash2 prefill");
     draft_ctx.eval_state().expect("eval ctx");
     let anchor = first_logits
@@ -5852,6 +5868,7 @@ fn build_tiny_synthetic_inkling2_inner() -> Inkling2Inner {
         tokenizer: None,
         dspark: None,
         dflash2: None,
+        dflash2_identity: None,
         dspark_turn_contexts: HashMap::new(),
         scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
         paged: None,

@@ -311,6 +311,34 @@ impl HybridKVCacheCoordinator {
         adapter.restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, raw_blocks)
     }
 
+    /// Read raw physical sliding-window blocks covering the live window ending at block-aligned
+    /// `boundary` into one contiguous flat buffer (`live_blocks * num_layers * (key_blob + value_blob)`).
+    pub fn read_sliding_raw_blocks_flat_for(
+        &self,
+        seq_id: u32,
+        boundary: u32,
+    ) -> std::result::Result<Vec<u8>, String> {
+        let adapter = self
+            .sliding_adapter()
+            .ok_or_else(|| "Hybrid KV coordinator has no sliding group".to_string())?;
+        adapter.read_sliding_raw_blocks_flat_for(seq_id, boundary)
+    }
+
+    /// Restore raw physical sliding-window blocks from a contiguous flat buffer into the sliding
+    /// group at block-aligned `boundary`.
+    pub fn restore_sliding_raw_blocks_flat_for(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        flat_bytes: &[u8],
+    ) -> std::result::Result<(), String> {
+        let adapter = self
+            .sliding_adapter_mut()
+            .ok_or_else(|| "Hybrid KV coordinator has no sliding group".to_string())?;
+        adapter.restore_sliding_raw_blocks_flat_for(seq_id, prompt_tokens, boundary, flat_bytes)
+    }
+
     pub fn adapter(&self, group_id: usize) -> std::result::Result<&PagedKVCacheAdapter, String> {
         if group_id == self.full_group_id {
             return Ok(&self.full_adapter);

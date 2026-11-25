@@ -40,6 +40,7 @@ use crate::engine::plan::{
 };
 use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
 use crate::models::qwen3_5::dflash2_state::store::StateClass;
+use crate::models::qwen3_5::draft_context::DraftContextWindow;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::inkling::{
@@ -53,6 +54,7 @@ use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRagge
 use super::attention::global_log_scale_tau_for_positions;
 use super::attn_res::{ATTN_RES_EPS, apply_sublayer_rms_norm};
 use super::config::Inkling2Config;
+use super::dflash2::Inkling2DraftContext;
 use super::dspark::Inkling2DsparkModel;
 use super::kernels::{
     Inkling2KvDtype, inkling2_block_attn_res, inkling2_lm_head_softcap,
@@ -73,7 +75,9 @@ use super::short_conv::{
     VisitShortConvTape, fused_short_conv_kv_prep_taped_tree,
     fused_short_conv_ragged_residual_taped_tree,
 };
-use super::state_disk::{Inkling2StateStore, planned_rolling_checkpoints};
+use super::state_disk::{
+    BoundaryDraftWindow, Inkling2StateStore, PackedDraftWindow, planned_rolling_checkpoints,
+};
 use super::vision::expand_image_tokens;
 
 /// Per-run performance summary returned by [`Inkling2Model::generate_greedy_paged`].
@@ -88,6 +92,23 @@ pub struct Inkling2PagedPerf {
     pub swa_blocks_pruned: u32,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test-only hook: force `record_fused_draft_window` to return an error for one `SeqId`
+    /// so unit tests can verify best-effort AR draft-window isolation without touching target logits.
+    pub(crate) static FAIL_DRAFT_WINDOW_CAPTURE_SEQ: std::cell::Cell<Option<SeqId>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Restored 4-bit DFlash2 context window handed from `install_state_hit_sync` to either
+/// `prime_dspark_prefix_state` (exclusive lane) or `begin_scheduled_dspark` (scheduled lane).
+#[derive(Clone, Debug)]
+pub(crate) struct RestoredDraftContext {
+    pub depth: u32,
+    pub suffix_len: usize,
+    pub window: Option<PackedDraftWindow>,
+}
+
 /// Runtime state owned by [`Inkling2Inner`] for block-paged hybrid inference.
 pub struct Inkling2PagedRuntime {
     pub coordinator: Inkling2KVCacheCoordinator,
@@ -99,6 +120,20 @@ pub struct Inkling2PagedRuntime {
     /// Exact ShortConv snapshot at the deepest complete `block_size` boundary reached by `seq_id`,
     /// so `StateClass::Ordinary` / preemption capture pairs exact SWA blocks with exact ShortConv.
     pub(crate) block_boundary_conv: HashMap<SeqId, (u32, Inkling2ShortConvState)>,
+    /// Live per-sequence 4-bit quantized DFlash2 fused context ring buffer.
+    pub(crate) draft_windows: HashMap<SeqId, DraftContextWindow>,
+    /// Exact 4-bit DFlash2 context window snapshotted at the deepest complete `block_size`
+    /// boundary reached by `seq_id`, paired with `block_boundary_conv` on state capture.
+    /// Live prefill/decode stores a detached device-side [`DraftContextWindow`] and defers
+    /// host serialization to `capture_boundary_with_window`; restored turns store the already-packed
+    /// [`PackedDraftWindow`].
+    pub(crate) block_boundary_draft_window: HashMap<SeqId, (u32, BoundaryDraftWindow)>,
+    /// Restored DFlash2 context window metadata staged by `install_state_hit_sync` for the
+    /// speculative draft lane to consume when initializing at `depth > 0`.
+    pub(crate) restored_draft_windows: HashMap<SeqId, RestoredDraftContext>,
+    /// Per-sequence cache publication policy (`reuse_cache`) recorded when preparing a turn so
+    /// preemption never publishes checkpoints or prefix blocks for opted-out (`false`) turns.
+    pub(crate) seq_reuse_cache: HashMap<SeqId, bool>,
     /// Qwen 3.8-style hybrid prefix state store (RAM + optional StateDisk SSD cache).
     pub(crate) state_store: Inkling2StateStore,
     pub active_seq: SeqId,
@@ -127,12 +162,22 @@ impl Inkling2PagedRuntime {
             Arc::clone(&recency),
         )?;
         let block_size = coordinator.block_size();
+        let mut state_store = Inkling2StateStore::new(block_size, recency);
+        if let Ok(geom) =
+            super::state_disk::Inkling2StateGeometry::from_coordinator(config, &coordinator)
+        {
+            state_store.set_geometry(geom);
+        }
         Ok(Self {
             coordinator,
             conv_states: HashMap::new(),
             prev_conv_snapshots: HashMap::new(),
             block_boundary_conv: HashMap::new(),
-            state_store: Inkling2StateStore::new(block_size, recency),
+            draft_windows: HashMap::new(),
+            block_boundary_draft_window: HashMap::new(),
+            restored_draft_windows: HashMap::new(),
+            seq_reuse_cache: HashMap::new(),
+            state_store,
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
@@ -153,12 +198,161 @@ impl Inkling2PagedRuntime {
             conv_states: HashMap::new(),
             prev_conv_snapshots: HashMap::new(),
             block_boundary_conv: HashMap::new(),
+            draft_windows: HashMap::new(),
+            block_boundary_draft_window: HashMap::new(),
+            restored_draft_windows: HashMap::new(),
+            seq_reuse_cache: HashMap::new(),
             state_store: Inkling2StateStore::new(block_size, recency),
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
             exclusive_turn_active: false,
         }
+    }
+
+    /// Total bytes held by live per-sequence 4-bit [`DraftContextWindow`] rings and
+    /// block-boundary [`BoundaryDraftWindow`] snapshots that are not already accounted for
+    /// inside `state_store` (deduplicating shared `PackedDraftWindow` `Arc<[u8]>` allocations
+    /// by pointer).
+    pub(crate) fn draft_windows_bytes(&self) -> u64 {
+        let live = self
+            .draft_windows
+            .values()
+            .fold(0u64, |sum, w| sum.saturating_add(w.nbytes()));
+        let mut seen_ptrs: HashSet<*const u8> = self
+            .state_store
+            .store
+            .entries()
+            .filter_map(crate::disk_tier::store::Entry::ram)
+            .filter_map(|anchor| anchor.draft_window.as_ref())
+            .map(PackedDraftWindow::ptr_id)
+            .collect();
+        let boundary =
+            self.block_boundary_draft_window
+                .values()
+                .fold(0u64, |sum, (_, w)| match w {
+                    BoundaryDraftWindow::Device(win) => sum.saturating_add(win.nbytes()),
+                    BoundaryDraftWindow::Packed(packed) => {
+                        if seen_ptrs.insert(packed.ptr_id()) {
+                            sum.saturating_add(packed.bytes.len() as u64)
+                        } else {
+                            sum
+                        }
+                    }
+                });
+        live.saturating_add(boundary)
+    }
+
+    /// Whether `seq_id` is allowed to publish shared prefix-cache / draft-window snapshots.
+    /// Defaults to `true` when no explicit opt-out has been recorded.
+    pub(crate) fn seq_reuse_cache(&self, seq_id: SeqId) -> bool {
+        self.seq_reuse_cache.get(&seq_id).copied().unwrap_or(true)
+    }
+
+    /// Invalidate `seq_id`'s optional DFlash2 draft context windows so a best-effort AR capture
+    /// failure can never leave stale or gapped window state behind for a later DFlash2 restore.
+    pub(crate) fn invalidate_draft_window(&mut self, seq_id: SeqId) {
+        self.draft_windows.remove(&seq_id);
+        self.block_boundary_draft_window.remove(&seq_id);
+    }
+
+    /// Append `fused_kept` (`[keep, width]` or `[1, keep, width]`) starting at logical position
+    /// `first_pos` into `seq_id`'s live 4-bit [`DraftContextWindow`] ring, detaching a device-side
+    /// [`DraftContextWindow`] snapshot into `block_boundary_draft_window` (with zero CPU/GPU wait
+    /// or host copy) whenever the write reaches or crosses a `block_size` boundary with a complete
+    /// trailing window.
+    pub(crate) fn record_fused_draft_window(
+        &mut self,
+        seq_id: SeqId,
+        first_pos: u32,
+        fused_kept: &MxArray,
+        width: u32,
+        slots: u32,
+    ) -> Result<()> {
+        #[cfg(test)]
+        if FAIL_DRAFT_WINDOW_CAPTURE_SEQ.with(std::cell::Cell::get) == Some(seq_id) {
+            return Err(Error::from_reason(format!(
+                "injected draft-window capture failure for seq {seq_id}"
+            )));
+        }
+        let ndim = fused_kept.ndim()?;
+        let (fused, keep) = match ndim {
+            2 => {
+                let k = fused_kept.shape_at(0)? as usize;
+                if k == 0 {
+                    return Ok(());
+                }
+                (fused_kept.expand_dims(0)?, k)
+            }
+            3 => {
+                let k = fused_kept.shape_at(1)? as usize;
+                if k == 0 {
+                    return Ok(());
+                }
+                (fused_kept.clone(), k)
+            }
+            _ => {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 record_fused_draft_window expects 2D or 3D fused context, got {ndim}D"
+                )));
+            }
+        };
+        let keep_u32 = u32::try_from(keep).map_err(|_| {
+            Error::from_reason("Inkling2 record_fused_draft_window keep overflows u32")
+        })?;
+        let pos_after = first_pos.checked_add(keep_u32).ok_or_else(|| {
+            Error::from_reason("Inkling2 record_fused_draft_window position overflows u32")
+        })?;
+
+        let bs = self.coordinator.block_size().max(1);
+        let boundary = (pos_after / bs) * bs;
+        let window = match self.draft_windows.entry(seq_id) {
+            Entry::Occupied(entry)
+                if entry.get().width() == width && entry.get().slots() == slots =>
+            {
+                entry.into_mut()
+            }
+            Entry::Occupied(mut entry) => {
+                let mut win = DraftContextWindow::new(width, slots)?;
+                win.restart(first_pos);
+                entry.insert(win);
+                entry.into_mut()
+            }
+            Entry::Vacant(entry) => {
+                let mut win = DraftContextWindow::new(width, slots)?;
+                win.restart(first_pos);
+                entry.insert(win)
+            }
+        };
+        if window.end() != first_pos {
+            window.restart(first_pos);
+        }
+
+        if boundary == 0 || boundary <= first_pos {
+            window.store_rows(&fused, first_pos)?;
+        } else if boundary == pos_after {
+            window.store_rows(&fused, first_pos)?;
+            if window.end() == boundary && window.begin() == boundary.saturating_sub(slots) {
+                let snap = window.detach_snapshot()?;
+                self.block_boundary_draft_window
+                    .insert(seq_id, (boundary, BoundaryDraftWindow::Device(snap)));
+            }
+        } else {
+            // `first_pos < boundary && boundary < pos_after`: store head up to `boundary`,
+            // detach a device-side snapshot at `boundary` BEFORE tail overwrites ring slots,
+            // then store tail into the newly detached live buffer.
+            let offset = i64::from(boundary - first_pos);
+            let head = fused.slice_axis(1, 0, offset)?;
+            window.store_rows(&head, first_pos)?;
+            if window.end() == boundary && window.begin() == boundary.saturating_sub(slots) {
+                let snap = window.detach_snapshot()?;
+                self.block_boundary_draft_window
+                    .insert(seq_id, (boundary, BoundaryDraftWindow::Device(snap)));
+            }
+            let tail = fused.slice_axis(1, offset, keep as i64)?;
+            window.store_rows(&tail, boundary)?;
+        }
+        Ok(())
     }
 
     /// Record `seq_id`'s current ShortConv state if `pos_after` is an exact block boundary.
@@ -269,6 +463,10 @@ impl Inkling2PagedRuntime {
         self.conv_states.insert(seq_id, fresh);
         self.prev_conv_snapshots.remove(&seq_id);
         self.block_boundary_conv.remove(&seq_id);
+        self.draft_windows.remove(&seq_id);
+        self.block_boundary_draft_window.remove(&seq_id);
+        self.restored_draft_windows.remove(&seq_id);
+        self.seq_reuse_cache.remove(&seq_id);
         Ok(())
     }
 
@@ -277,6 +475,10 @@ impl Inkling2PagedRuntime {
         self.conv_states.remove(&seq_id);
         self.prev_conv_snapshots.remove(&seq_id);
         self.block_boundary_conv.remove(&seq_id);
+        self.draft_windows.remove(&seq_id);
+        self.block_boundary_draft_window.remove(&seq_id);
+        self.restored_draft_windows.remove(&seq_id);
+        self.seq_reuse_cache.remove(&seq_id);
     }
 
     pub fn snapshot_conv_state(&self, seq_id: SeqId) -> Option<Inkling2ShortConvState> {
@@ -666,6 +868,7 @@ pub(crate) struct Inkling2PrefillRun {
     rows: u32,
     compute_last_logits: bool,
     cache_salt: u64,
+    reuse_cache: bool,
     next_visit: usize,
     blocks: Vec<MxArray>,
     partial: MxArray,
@@ -703,7 +906,7 @@ impl Inkling2PrefillRun {
 /// Internal sub-slice ends within `[start..end)` so rolling checkpoints (every 4096 tokens) and
 /// the prompt's deepest block junction `((prompt_len - 1) / bs) * bs` are always hit with exact
 /// ShortConv + SWA state even when `MeasuredConfig` chooses arbitrary prefill cut sizes.
-fn prefill_sub_boundaries(
+pub(crate) fn prefill_sub_boundaries(
     start: usize,
     end: usize,
     prompt_len: usize,
@@ -762,6 +965,225 @@ impl Inkling2Inner {
         rt.reset_sequence(seq_id, &self.config)
     }
 
+    /// Record an already-fused DFlash2 context slice (`[keep, D]` or `[1, keep, D]`) starting at
+    /// `first_pos` into `seq_id`'s live 4-bit [`DraftContextWindow`] ring.
+    pub(crate) fn record_fused_to_draft_window(
+        &mut self,
+        seq_id: SeqId,
+        first_pos: u32,
+        fused_kept: &MxArray,
+    ) -> Result<()> {
+        let Some(ref draft) = self.dflash2 else {
+            return Ok(());
+        };
+        let width = draft.config.context_width();
+        let slots = draft.config.sliding_window as u32;
+        if width == 0 || slots == 0 {
+            return Ok(());
+        }
+        if let Some(ref mut rt) = self.paged {
+            rt.record_fused_draft_window(seq_id, first_pos, fused_kept, width, slots)?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort DFlash2 draft-window capture for already-fused context rows: on any error,
+    /// logs a warning and invalidates `seq_id`'s optional draft windows without failing the
+    /// already-committed target KV, ShortConv, and live draft ring step.
+    pub(crate) fn record_fused_to_draft_window_best_effort(
+        &mut self,
+        seq_id: SeqId,
+        first_pos: u32,
+        fused_kept: &MxArray,
+    ) {
+        if let Err(err) = self.record_fused_to_draft_window(seq_id, first_pos, fused_kept) {
+            tracing::warn!(
+                target: "mlx_core::inkling2::paged",
+                "Inkling2: optional DFlash2 draft window capture failed for seq {seq_id} at pos {first_pos} ({err}); invalidating draft window"
+            );
+            if let Some(rt) = self.paged.as_mut() {
+                rt.invalidate_draft_window(seq_id);
+            }
+        }
+    }
+
+    /// Fuse the first `keep` rows of target `taps` (`[T, D]` per tapped visit) via the loaded
+    /// DFlash2 draft model and store them starting at `first_pos` into `seq_id`'s live 4-bit
+    /// [`DraftContextWindow`] ring (used on AR prefill/decode/peer paths when DFlash2 is loaded).
+    pub(crate) fn record_taps_to_draft_window(
+        &mut self,
+        seq_id: SeqId,
+        first_pos: u32,
+        taps: &[MxArray],
+        keep: usize,
+    ) -> Result<()> {
+        if keep == 0 || taps.is_empty() {
+            return Ok(());
+        }
+        let (fused, width, slots) = {
+            let Some(ref draft) = self.dflash2 else {
+                return Ok(());
+            };
+            let expected = draft.config.target_layers.len();
+            if taps.len() != expected {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 record_taps_to_draft_window expected {expected} taps, got {}",
+                    taps.len()
+                )));
+            }
+            let total_rows = taps[0].shape_at(0)? as usize;
+            if keep > total_rows {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 record_taps_to_draft_window keep={keep} exceeds tap rows {total_rows}"
+                )));
+            }
+            let mut taps_3d = Vec::with_capacity(taps.len());
+            for tap in taps {
+                let sliced = if keep < total_rows {
+                    tap.slice_axis(0, 0, keep as i64)?
+                } else {
+                    tap.clone()
+                };
+                let bf16 = if sliced.dtype()? == DType::BFloat16 {
+                    sliced
+                } else {
+                    sliced.astype(DType::BFloat16)?
+                };
+                taps_3d.push(bf16.expand_dims(0)?);
+            }
+            let fused = draft.fuse_context(&taps_3d)?;
+            (
+                fused,
+                draft.config.context_width(),
+                draft.config.sliding_window as u32,
+            )
+        };
+        if width == 0 || slots == 0 {
+            return Ok(());
+        }
+        if let Some(ref mut rt) = self.paged {
+            rt.record_fused_draft_window(seq_id, first_pos, &fused, width, slots)?;
+        }
+        Ok(())
+    }
+
+    /// Best-effort AR draft-window capture: on any error, logs a warning and invalidates
+    /// `seq_id`'s optional draft windows without failing the already-committed AR step.
+    pub(crate) fn record_taps_to_draft_window_best_effort(
+        &mut self,
+        seq_id: SeqId,
+        first_pos: u32,
+        taps: &[MxArray],
+        keep: usize,
+        context: &str,
+    ) {
+        if let Err(err) = self.record_taps_to_draft_window(seq_id, first_pos, taps, keep) {
+            tracing::warn!(
+                target: "mlx_core::inkling2::paged",
+                "Inkling2 {context}: optional DFlash2 draft window capture failed for seq {seq_id} ({err}); invalidating draft window"
+            );
+            if let Some(rt) = self.paged.as_mut() {
+                rt.invalidate_draft_window(seq_id);
+            }
+        }
+    }
+
+    /// Best-effort batched AR draft-window capture after target KV + ShortConv have committed.
+    ///
+    /// - If fusing the batch fails, warns and invalidates every row in `planned_rows`.
+    /// - If slicing or storing an individual row fails, warns and invalidates ONLY that row,
+    ///   leaving unaffected peer rows' draft windows intact.
+    fn record_batched_taps_to_draft_windows_best_effort(
+        &mut self,
+        planned_rows: &[(SeqId, u32)],
+        taps: &[MxArray],
+    ) {
+        if taps.is_empty() || self.cached_image_key.is_some() {
+            return;
+        }
+        let any_reuse = self
+            .paged
+            .as_ref()
+            .is_some_and(|rt| planned_rows.iter().any(|&(sid, _)| rt.seq_reuse_cache(sid)));
+        if !any_reuse {
+            return;
+        }
+        let Some(ref draft) = self.dflash2 else {
+            return;
+        };
+        let fuse_res: Result<(MxArray, u32, u32)> = (|| {
+            let expected = draft.config.target_layers.len();
+            if taps.len() != expected {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 batched draft window capture expected {expected} taps, got {}",
+                    taps.len()
+                )));
+            }
+            let total_rows = taps[0].shape_at(0)? as usize;
+            if total_rows != planned_rows.len() {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 batched draft window capture tap rows {total_rows} != batch {}",
+                    planned_rows.len()
+                )));
+            }
+            let mut taps_3d = Vec::with_capacity(taps.len());
+            for tap in taps {
+                let bf16 = if tap.dtype()? == DType::BFloat16 {
+                    tap.clone()
+                } else {
+                    tap.astype(DType::BFloat16)?
+                };
+                taps_3d.push(bf16.expand_dims(0)?);
+            }
+            let fused = draft.fuse_context(&taps_3d)?;
+            Ok((
+                fused,
+                draft.config.context_width(),
+                draft.config.sliding_window as u32,
+            ))
+        })();
+        let (fused, width, slots) = match fuse_res {
+            Ok(out) => out,
+            Err(err) => {
+                tracing::warn!(
+                    target: "mlx_core::inkling2::paged",
+                    "Inkling2 batched AR decode: optional DFlash2 draft window fuse failed ({err}); invalidating {} row(s)",
+                    planned_rows.len()
+                );
+                if let Some(rt) = self.paged.as_mut() {
+                    for &(seq_id, _) in planned_rows {
+                        if rt.seq_reuse_cache(seq_id) {
+                            rt.invalidate_draft_window(seq_id);
+                        }
+                    }
+                }
+                return;
+            }
+        };
+        if width == 0 || slots == 0 {
+            return;
+        }
+        let Some(rt) = self.paged.as_mut() else {
+            return;
+        };
+        for (i, &(seq_id, pos)) in planned_rows.iter().enumerate() {
+            if !rt.seq_reuse_cache(seq_id) {
+                continue;
+            }
+            let row_res = (|| -> Result<()> {
+                let row_fused = fused.slice_axis(1, i as i64, (i + 1) as i64)?;
+                rt.record_fused_draft_window(seq_id, pos, &row_fused, width, slots)
+            })();
+            if let Err(err) = row_res {
+                tracing::warn!(
+                    target: "mlx_core::inkling2::paged",
+                    "Inkling2 batched AR decode: optional DFlash2 draft window capture failed for seq {seq_id} ({err}); invalidating draft window"
+                );
+                rt.invalidate_draft_window(seq_id);
+            }
+        }
+    }
+
     /// Evaluate pending pool writes, asynchronously schedule updated ShortConv states,
     /// and prune expired SWA blocks for `seq_id`.
     /// Returns the number of SWA physical blocks reclaimed.
@@ -775,6 +1197,13 @@ impl Inkling2Inner {
             .map_err(Error::from_reason)?;
         if let Some(conv) = rt.conv_states.get(&seq_id) {
             async_eval_conv_state(conv);
+        }
+        if let Some(dw) = rt.draft_windows.get(&seq_id) {
+            let mut arrays = Vec::with_capacity(1);
+            dw.collect_arrays(&mut arrays);
+            if !arrays.is_empty() {
+                MxArray::async_eval_arrays(&arrays);
+            }
         }
         rt.coordinator
             .prune_sliding_all(seq_id)
@@ -832,6 +1261,7 @@ impl Inkling2Inner {
         start: usize,
         end: usize,
         cache_salt: u64,
+        reuse_cache: bool,
         generation_stream: Stream,
         budget_ms: Option<f64>,
     ) -> Result<ScheduledPrefillPass> {
@@ -850,13 +1280,25 @@ impl Inkling2Inner {
             .block_size();
 
         // Fast path: unbounded slice with no active run executes sub-slices (splitting at any
-        // internal rolling checkpoint or prompt junction so ShortConv + SWA are captured bit-exact).
+        // internal rolling checkpoint or prompt junction when `reuse_cache` permits publication).
         if budget_ms.is_none() && !self.prefill_runs.contains_key(&seq_id) {
-            let subs = prefill_sub_boundaries(start, end, source.len(), bs);
-            let tap_visits = self
-                .active_draft_tap_visits()
-                .and_then(|taps| self.scheduled_dspark.tap_visits_for(seq_id, taps))
-                .unwrap_or_default();
+            let subs = if reuse_cache {
+                prefill_sub_boundaries(start, end, source.len(), bs)
+            } else {
+                vec![end]
+            };
+            let tap_visits = if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+                self.active_draft_tap_visits()
+                    .map(|taps| taps.to_vec())
+                    .unwrap_or_default()
+            } else if reuse_cache
+                && self.cached_image_key.is_none()
+                && let Some(ref draft) = self.dflash2
+            {
+                draft.config.target_layers.clone()
+            } else {
+                Vec::new()
+            };
             let mut sub_start = start;
             let mut final_logits_opt = None;
             for sub_end in subs {
@@ -885,14 +1327,37 @@ impl Inkling2Inner {
                 )?;
                 let _ = self.settle_paged_step(seq_id)?;
                 if !tap_visits.is_empty() {
-                    self.append_scheduled_dspark_prefill(seq_id, first_pos, &taps, chunk.len())?;
+                    if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+                        self.append_scheduled_dspark_prefill(
+                            seq_id,
+                            first_pos,
+                            &taps,
+                            chunk.len(),
+                        )?;
+                    } else if reuse_cache && self.dflash2.is_some() && !taps.is_empty() {
+                        self.record_taps_to_draft_window_best_effort(
+                            seq_id,
+                            first_pos,
+                            &taps,
+                            chunk.len(),
+                            "scheduled AR prefill",
+                        );
+                    }
                 }
                 if let Some(rt) = self.paged.as_mut()
                     && let Ok(sub_end_u32) = u32::try_from(sub_end)
                 {
                     rt.record_block_boundary_conv(seq_id, sub_end_u32);
                 }
-                self.maybe_capture_rolling_checkpoint(seq_id, source, sub_end, cache_salt)?;
+                if reuse_cache {
+                    self.maybe_capture_rolling_checkpoint_best_effort(
+                        seq_id,
+                        source,
+                        sub_end,
+                        cache_salt,
+                        "scheduled prefill",
+                    );
+                }
                 if sub_end == end {
                     final_logits_opt = logits_opt;
                 }
@@ -908,12 +1373,22 @@ impl Inkling2Inner {
         // Resumable pass path: either resume an existing run for `[start..end)` or initialize one
         // starting at the first internal sub-boundary.
         let mut run = match self.prefill_runs.remove(&seq_id) {
-            Some(existing) if existing.unit_start == start && existing.unit_end == end => existing,
+            Some(existing)
+                if existing.unit_start == start
+                    && existing.unit_end == end
+                    && existing.reuse_cache == reuse_cache =>
+            {
+                existing
+            }
             Some(stale) => {
                 // Unit changed (e.g. after replay); roll back stale unit cleanly.
                 self.prefill_runs.insert(seq_id, stale);
                 self.abort_prefill_run(seq_id);
-                let first_sub_end = prefill_sub_boundaries(start, end, source.len(), bs)[0];
+                let first_sub_end = if reuse_cache {
+                    prefill_sub_boundaries(start, end, source.len(), bs)[0]
+                } else {
+                    end
+                };
                 self.init_prefill_run(
                     seq_id,
                     source,
@@ -922,12 +1397,17 @@ impl Inkling2Inner {
                     start,
                     first_sub_end,
                     cache_salt,
+                    reuse_cache,
                     first_sub_end == source.len(),
                     None,
                 )?
             }
             None => {
-                let first_sub_end = prefill_sub_boundaries(start, end, source.len(), bs)[0];
+                let first_sub_end = if reuse_cache {
+                    prefill_sub_boundaries(start, end, source.len(), bs)[0]
+                } else {
+                    end
+                };
                 self.init_prefill_run(
                     seq_id,
                     source,
@@ -936,6 +1416,7 @@ impl Inkling2Inner {
                     start,
                     first_sub_end,
                     cache_salt,
+                    reuse_cache,
                     first_sub_end == source.len(),
                     None,
                 )?
@@ -1179,19 +1660,38 @@ impl Inkling2Inner {
                 }
             };
             if !run.tap_visits.is_empty() {
-                self.append_scheduled_dspark_prefill(
-                    seq_id,
-                    run.first_pos,
-                    &run.captured_taps,
-                    run.rows as usize,
-                )?;
+                if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+                    self.append_scheduled_dspark_prefill(
+                        seq_id,
+                        run.first_pos,
+                        &run.captured_taps,
+                        run.rows as usize,
+                    )?;
+                } else if run.reuse_cache && self.dflash2.is_some() && !run.captured_taps.is_empty()
+                {
+                    self.record_taps_to_draft_window_best_effort(
+                        seq_id,
+                        run.first_pos,
+                        &run.captured_taps,
+                        run.rows as usize,
+                        "scheduled AR prefill pass",
+                    );
+                }
             }
             if let Some(rt) = self.paged.as_mut()
                 && let Ok(sub_end_u32) = u32::try_from(run.end)
             {
                 rt.record_block_boundary_conv(seq_id, sub_end_u32);
             }
-            self.maybe_capture_rolling_checkpoint(seq_id, source, run.end, run.cache_salt)?;
+            if run.reuse_cache {
+                self.maybe_capture_rolling_checkpoint_best_effort(
+                    seq_id,
+                    source,
+                    run.end,
+                    run.cache_salt,
+                    "scheduled prefill pass",
+                );
+            }
 
             if run.end >= run.unit_end {
                 return Ok(ScheduledPrefillPass::Done(logits));
@@ -1200,7 +1700,11 @@ impl Inkling2Inner {
             // Sub-slice 1 is already settled (KV pruned, DSpark fed, boundary conv recorded),
             // so pass `None` to capture the exact post-sub-slice ShortConv snapshot for rollback!
             let next_start = run.end;
-            let next_end = prefill_sub_boundaries(next_start, run.unit_end, source.len(), bs)[0];
+            let next_end = if run.reuse_cache {
+                prefill_sub_boundaries(next_start, run.unit_end, source.len(), bs)[0]
+            } else {
+                run.unit_end
+            };
             run = self.init_prefill_run(
                 seq_id,
                 source,
@@ -1209,6 +1713,7 @@ impl Inkling2Inner {
                 next_start,
                 next_end,
                 run.cache_salt,
+                run.reuse_cache,
                 next_end == source.len(),
                 None,
             )?;
@@ -1225,6 +1730,7 @@ impl Inkling2Inner {
         start: usize,
         end: usize,
         cache_salt: u64,
+        reuse_cache: bool,
         compute_last_logits: bool,
         preserved_unit_conv: Option<Inkling2ShortConvState>,
     ) -> Result<Inkling2PrefillRun> {
@@ -1337,10 +1843,18 @@ impl Inkling2Inner {
             self.config.log_scaling_alpha,
         )?;
 
-        let tap_visits = self
-            .active_draft_tap_visits()
-            .and_then(|taps| self.scheduled_dspark.tap_visits_for(seq_id, taps))
-            .unwrap_or_default();
+        let tap_visits = if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+            self.active_draft_tap_visits()
+                .map(|taps| taps.to_vec())
+                .unwrap_or_default()
+        } else if reuse_cache
+            && self.cached_image_key.is_none()
+            && let Some(ref draft) = self.dflash2
+        {
+            draft.config.target_layers.clone()
+        } else {
+            Vec::new()
+        };
 
         Ok(Inkling2PrefillRun {
             unit_start,
@@ -1351,6 +1865,7 @@ impl Inkling2Inner {
             rows,
             compute_last_logits,
             cache_salt,
+            reuse_cache,
             next_visit: 0,
             blocks: Vec::new(),
             partial,
@@ -1373,13 +1888,17 @@ impl Inkling2Inner {
         })
     }
 
-    fn maybe_capture_rolling_checkpoint(
+    pub(crate) fn maybe_capture_rolling_checkpoint(
         &mut self,
         seq_id: SeqId,
         source: &[u32],
         end: usize,
         cache_salt: u64,
     ) -> Result<()> {
+        let governor = self
+            .memory_registration
+            .as_ref()
+            .map(|g| (g.governor(), g.model_id()));
         let Some(rt) = self.paged.as_mut() else {
             return Ok(());
         };
@@ -1404,7 +1923,12 @@ impl Inkling2Inner {
         let Some(conv) = rt.conv_states.get(&seq_id).cloned() else {
             return Ok(());
         };
-        let _ = rt.state_store.capture_boundary(
+        let draft_win = rt
+            .block_boundary_draft_window
+            .get(&seq_id)
+            .filter(|(wb, _)| *wb == end_u32)
+            .map(|(_, w)| w);
+        let _ = rt.state_store.capture_boundary_with_window(
             &mut rt.coordinator,
             &conv,
             seq_id,
@@ -1412,8 +1936,30 @@ impl Inkling2Inner {
             end_u32,
             cache_salt,
             class,
+            draft_win,
+            governor,
         )?;
         Ok(())
+    }
+
+    pub(crate) fn maybe_capture_rolling_checkpoint_best_effort(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        end: usize,
+        cache_salt: u64,
+        context: &'static str,
+    ) {
+        if let Err(err) = self.maybe_capture_rolling_checkpoint(seq_id, source, end, cache_salt) {
+            tracing::warn!(
+                target: "mlx_core::inkling2::state_disk",
+                seq_id,
+                end,
+                context,
+                error = %err,
+                "Inkling2 {context}: rolling checkpoint capture failed; continuing without caching boundary"
+            );
+        }
     }
 
     /// Compute final output AttnRes -> `output_norm` -> optional `lm_head` + softcap.
@@ -1660,6 +2206,26 @@ impl Inkling2Inner {
             }
         }
 
+        let allow_draft_window = self
+            .paged
+            .as_ref()
+            .is_some_and(|rt| rt.seq_reuse_cache(seq_id));
+        let dflash2_ar_taps: Vec<usize> = if tap_visit_indices.is_empty()
+            && allow_draft_window
+            && image_embeddings.is_none()
+            && self.cached_image_key.is_none()
+            && let Some(ref draft) = self.dflash2
+        {
+            draft.config.target_layers.clone()
+        } else {
+            Vec::new()
+        };
+        let effective_tap_visits: &[usize] = if !tap_visit_indices.is_empty() {
+            tap_visit_indices
+        } else {
+            &dflash2_ar_taps
+        };
+
         let total_len = tokens.len();
         let mut offset = 0usize;
         let mut total_pruned = 0u32;
@@ -1715,7 +2281,7 @@ impl Inkling2Inner {
                 chunk_img.as_ref(),
                 first_pos,
                 /* compute_last_logits */ is_final_chunk,
-                tap_visit_indices,
+                effective_tap_visits,
             )?;
 
             // Materialize pending pool writes + ShortConv state and prune expired SWA blocks
@@ -1726,6 +2292,14 @@ impl Inkling2Inner {
                 && let Some(ref draft) = self.dspark
             {
                 on_chunk_taps(draft, &taps, chunk.len())?;
+            } else if allow_draft_window && !dflash2_ar_taps.is_empty() && !taps.is_empty() {
+                self.record_taps_to_draft_window_best_effort(
+                    seq_id,
+                    first_pos,
+                    &taps,
+                    chunk.len(),
+                    "AR prefill",
+                );
             }
             if let Some(rt) = self.paged.as_mut()
                 && let Ok(pos_after) = u32::try_from(first_pos as usize + chunk.len())
@@ -1760,13 +2334,14 @@ impl Inkling2Inner {
         self.paged_decode_step_inner(seq_id, token_id, LogitsOutput::GreedyArgmax, true)
     }
 
-    fn paged_decode_step_inner(
+    fn paged_decode_step_with_taps(
         &mut self,
         seq_id: SeqId,
         token_id: u32,
         logits_output: LogitsOutput,
         save_prev_snapshot: bool,
-    ) -> Result<MxArray> {
+        tap_visits: &[usize],
+    ) -> Result<(MxArray, u32, Vec<MxArray>)> {
         let first_pos = {
             let rt = self.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2Model: paged runtime not initialized")
@@ -1809,12 +2384,12 @@ impl Inkling2Inner {
             /* compute_logits */ true,
             logits_output,
             /* last_only */ true,
-            &[],
+            tap_visits,
             None,
             /* save_pre_wave_convs */ true,
         );
-        let logits = match forward_res {
-            Ok((Some(l), _)) => l,
+        let (logits, taps) = match forward_res {
+            Ok((Some(l), taps)) => (l, taps),
             Ok((None, _)) => {
                 if let Some(rt) = self.paged.as_mut() {
                     let _ = rt.coordinator.rollback_last_tokens_all(seq_id, 1);
@@ -1844,6 +2419,44 @@ impl Inkling2Inner {
         };
         if let Some(rt) = self.paged.as_mut() {
             rt.record_block_boundary_conv(seq_id, first_pos.saturating_add(1));
+        }
+        Ok((logits, first_pos, taps))
+    }
+
+    fn paged_decode_step_inner(
+        &mut self,
+        seq_id: SeqId,
+        token_id: u32,
+        logits_output: LogitsOutput,
+        save_prev_snapshot: bool,
+    ) -> Result<MxArray> {
+        let allow_draft_window = self
+            .paged
+            .as_ref()
+            .is_some_and(|rt| rt.seq_reuse_cache(seq_id));
+        let tap_visits = if allow_draft_window
+            && self.cached_image_key.is_none()
+            && let Some(ref draft) = self.dflash2
+        {
+            draft.config.target_layers.clone()
+        } else {
+            Vec::new()
+        };
+        let (logits, first_pos, taps) = self.paged_decode_step_with_taps(
+            seq_id,
+            token_id,
+            logits_output,
+            save_prev_snapshot,
+            &tap_visits,
+        )?;
+        if allow_draft_window && !taps.is_empty() {
+            self.record_taps_to_draft_window_best_effort(
+                seq_id,
+                first_pos,
+                &taps,
+                1,
+                "AR single decode",
+            );
         }
         Ok(logits)
     }
@@ -1926,8 +2539,20 @@ impl Inkling2Inner {
         let positions: Vec<u32> = planned_rows.iter().map(|&(_, pos)| pos).collect();
         let cu_seqlens_q: Vec<usize> = (0..=rows.len()).collect();
         let seq_q_lens: Vec<(SeqId, u32)> = seq_ids.iter().map(|&sid| (sid, 1)).collect();
+        let any_reuse = self
+            .paged
+            .as_ref()
+            .is_some_and(|rt| seq_ids.iter().any(|&sid| rt.seq_reuse_cache(sid)));
+        let tap_visits = if self.cached_image_key.is_none()
+            && any_reuse
+            && let Some(ref draft) = self.dflash2
+        {
+            draft.config.target_layers.clone()
+        } else {
+            Vec::new()
+        };
 
-        let (logits_opt, _) = match self.forward_paged_wave_inner(
+        let (logits_opt, taps) = match self.forward_paged_wave_inner(
             WaveTokenIds::Host(&token_ids),
             None,
             &seq_ids,
@@ -1940,7 +2565,7 @@ impl Inkling2Inner {
             /* compute_logits */ true,
             logits_output,
             /* last_only */ false,
-            &[],
+            &tap_visits,
             None,
             /* save_pre_wave_convs */ true,
         ) {
@@ -1967,6 +2592,7 @@ impl Inkling2Inner {
                 rt.record_block_boundary_conv(seq_id, pos.saturating_add(1));
             }
         }
+        self.record_batched_taps_to_draft_windows_best_effort(&planned_rows, &taps);
         Ok(logits)
     }
 
@@ -4099,6 +4725,16 @@ pub(crate) struct Inkling2PagedDecode<'a> {
     pending_cache_error: Option<String>,
 }
 
+#[cfg(test)]
+impl<'a> Inkling2PagedDecode<'a> {
+    pub(crate) fn new(model: &'a mut Inkling2Inner) -> Self {
+        Self {
+            model,
+            pending_cache_error: None,
+        }
+    }
+}
+
 impl PagedStepModel for Inkling2PagedDecode<'_> {
     const EVAL: EvalPolicy = EvalPolicy::AsyncToken;
     const FINAL_TOKEN_POLICY: FinalTokenPolicy = FinalTokenPolicy::KeepAllOnLength;
@@ -4138,14 +4774,174 @@ impl PagedStepModel for Inkling2PagedDecode<'_> {
     }
 
     fn materialize_final_token(&mut self, token_id: u32) -> Result<()> {
-        let seq_id = self
+        let (seq_id, first_pos) = {
+            let rt = self.model.paged.as_ref().ok_or_else(|| {
+                Error::from_reason("Inkling2 paged materialize_final: runtime missing")
+            })?;
+            let seq_id = rt.active_seq;
+            let pos = rt
+                .coordinator
+                .request_token_count_all(seq_id)
+                .map_err(Error::from_reason)?;
+            (seq_id, pos)
+        };
+        let no_image = self.model.cached_image_key.is_none();
+        let reuse_cache = self
             .model
             .paged
             .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2 paged materialize_final: runtime missing"))?
-            .active_seq;
-        let _ = self.model.paged_decode_step(seq_id, token_id)?;
+            .is_some_and(|rt| rt.seq_reuse_cache(seq_id));
+        let has_matching_dflash2 = no_image
+            && self.model.dflash2.is_some()
+            && matches!(
+                self.model.dspark_turn_contexts.get(&seq_id),
+                Some(Inkling2DraftContext::Dflash2(dctx))
+                    if dctx.committed_len() as u32 == first_pos
+            );
+        let has_matching_dspark = no_image
+            && self.model.dspark.is_some()
+            && matches!(
+                self.model.dspark_turn_contexts.get(&seq_id),
+                Some(Inkling2DraftContext::Dspark(dctx))
+                    if dctx.committed_len as u32 == first_pos
+            );
+        let tap_visits =
+            if has_matching_dflash2 || (no_image && reuse_cache && self.model.dflash2.is_some()) {
+                self.model
+                    .dflash2
+                    .as_ref()
+                    .map(|d| d.config.target_layers.clone())
+                    .unwrap_or_default()
+            } else if has_matching_dspark {
+                self.model
+                    .dspark
+                    .as_ref()
+                    .map(|d| d.config.target_layer_ids.clone())
+                    .unwrap_or_default()
+            } else {
+                Vec::new()
+            };
+
+        let (_, step_pos, taps) = self.model.paged_decode_step_with_taps(
+            seq_id,
+            token_id,
+            LogitsOutput::FullSoftcap,
+            true,
+            &tap_visits,
+        )?;
         let _ = self.model.settle_paged_step(seq_id)?;
+
+        // Target KV & ShortConv have already committed `first_pos + 1`: all optional draft-side
+        // updates below are strictly best-effort so a draft-only failure never aborts completed
+        // generation. On any failure (or missing taps), drop the parked draft context and
+        // invalidate the sequence's draft window so no desynchronized draft state survives.
+        let drop_draft_state = |model: &mut Inkling2Inner, seq: SeqId| {
+            model.dspark_turn_contexts.remove(&seq);
+            if let Some(rt) = model.paged.as_mut() {
+                rt.invalidate_draft_window(seq);
+            }
+        };
+
+        if has_matching_dflash2 {
+            if taps.is_empty() {
+                tracing::warn!(
+                    target: "mlx_core::inkling2::paged",
+                    seq_id,
+                    step_pos,
+                    "Inkling2 materialize_final_token: missing DFlash2 taps after target commit; dropping parked draft context and invalidating draft window"
+                );
+                drop_draft_state(self.model, seq_id);
+            } else {
+                let draft_res: Result<Option<MxArray>> = (|| {
+                    let draft = self.model.dflash2.as_ref().ok_or_else(|| {
+                        Error::from_reason("Inkling2 materialize_final: DFlash2 model missing")
+                    })?;
+                    let Some(Inkling2DraftContext::Dflash2(dctx)) =
+                        self.model.dspark_turn_contexts.get_mut(&seq_id)
+                    else {
+                        return Err(Error::from_reason(
+                            "Inkling2 materialize_final: DFlash2 context missing",
+                        ));
+                    };
+                    let fused = dctx.append_taps(draft, &taps, &[token_id])?;
+                    dctx.eval_state()?;
+                    Ok(fused)
+                })();
+                match draft_res {
+                    Ok(Some(fused)) => {
+                        if reuse_cache {
+                            self.model
+                                .record_fused_to_draft_window_best_effort(seq_id, step_pos, &fused);
+                        }
+                    }
+                    Ok(None) => {
+                        if reuse_cache && let Some(rt) = self.model.paged.as_mut() {
+                            rt.invalidate_draft_window(seq_id);
+                        }
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "mlx_core::inkling2::paged",
+                            seq_id,
+                            step_pos,
+                            error = %err,
+                            "Inkling2 materialize_final_token: optional DFlash2 draft update failed after target commit; dropping parked draft context and invalidating draft window"
+                        );
+                        drop_draft_state(self.model, seq_id);
+                    }
+                }
+            }
+        } else if has_matching_dspark {
+            if taps.is_empty() {
+                tracing::warn!(
+                    target: "mlx_core::inkling2::paged",
+                    seq_id,
+                    step_pos,
+                    "Inkling2 materialize_final_token: missing DSpark taps after target commit; dropping parked draft context and invalidating draft window"
+                );
+                drop_draft_state(self.model, seq_id);
+            } else {
+                let draft_res: Result<()> = (|| {
+                    let draft = self.model.dspark.as_ref().ok_or_else(|| {
+                        Error::from_reason("Inkling2 materialize_final: DSpark model missing")
+                    })?;
+                    let Some(Inkling2DraftContext::Dspark(dctx)) =
+                        self.model.dspark_turn_contexts.get_mut(&seq_id)
+                    else {
+                        return Err(Error::from_reason(
+                            "Inkling2 materialize_final: DSpark context missing",
+                        ));
+                    };
+                    dctx.append_taps(draft, &taps, 1)?;
+                    dctx.eval_state()?;
+                    Ok(())
+                })();
+                if let Err(err) = draft_res {
+                    tracing::warn!(
+                        target: "mlx_core::inkling2::paged",
+                        seq_id,
+                        step_pos,
+                        error = %err,
+                        "Inkling2 materialize_final_token: optional DSpark draft update failed after target commit; dropping parked draft context and invalidating draft window"
+                    );
+                    drop_draft_state(self.model, seq_id);
+                }
+            }
+        } else if no_image && reuse_cache && self.model.dflash2.is_some() {
+            if taps.is_empty() {
+                if let Some(rt) = self.model.paged.as_mut() {
+                    rt.invalidate_draft_window(seq_id);
+                }
+            } else {
+                self.model.record_taps_to_draft_window_best_effort(
+                    seq_id,
+                    step_pos,
+                    &taps,
+                    1,
+                    "AR materialize_final_token",
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -4160,6 +4956,8 @@ pub(crate) struct Inkling2PrefixState {
     /// `true` only when `prepare_prefix_sync` continued a live in-memory sequence on `seq_id`
     /// (never `true` for cold starts or RAM/SSD `StateStore` restores).
     pub live_continuation: bool,
+    /// Whether this turn is allowed to publish checkpoints/states into the shared `StateStore`.
+    pub reuse_cache: bool,
 }
 
 impl PagedPrefix for Inkling2PrefixState {
@@ -4484,11 +5282,16 @@ impl ChatBackend for Inkling2Inner {
                 rt.conv_states.clear();
                 rt.prev_conv_snapshots.clear();
                 rt.block_boundary_conv.clear();
+                rt.draft_windows.clear();
+                rt.block_boundary_draft_window.clear();
+                rt.restored_draft_windows.clear();
+                rt.seq_reuse_cache.clear();
             } else {
                 let seq = rt.active_seq;
                 self.dspark_turn_contexts.remove(&seq);
                 self.scheduled_dspark.seq_lanes.remove(&seq);
                 self.scheduled_dspark.peer_tapes.remove(&seq);
+                self.scheduled_dspark.sync_decode_limit();
                 rt.state_store.clear_seq_checkpoint(seq);
                 rt.release_sequence(seq);
             }
@@ -4909,7 +5712,11 @@ impl PagedBackend for Inkling2Inner {
             .as_ref()
             .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?
             .active_seq;
-        self.prepare_prefix_sync(seq_id, plan, reuse_cache, cache_salt)
+        let prefix = self.prepare_prefix_sync(seq_id, plan, reuse_cache, cache_salt)?;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.seq_reuse_cache.insert(seq_id, prefix.reuse_cache);
+        }
+        Ok(prefix)
     }
 
     fn paged_prefill(
@@ -4928,6 +5735,7 @@ impl PagedBackend for Inkling2Inner {
         // draft context on `seq_id` so a future DSpark turn cannot attach to it.
         self.dspark_turn_contexts.remove(&seq_id);
         self.scheduled_dspark.seq_lanes.remove(&seq_id);
+        self.scheduled_dspark.sync_decode_limit();
         let (logits, _) = self.paged_prefill_sequence(seq_id, suffix_tokens, None)?;
         // `run_paged_turn` expects `[vocab]` (or `[1, vocab]`; `squeeze([0])` matches gemma4).
         logits.squeeze(Some(&[0]))
@@ -4941,11 +5749,16 @@ impl PagedBackend for Inkling2Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
+        let governor = self
+            .memory_registration
+            .as_ref()
+            .map(|g| (g.governor(), g.model_id()));
         let Some(ref mut rt) = self.paged else {
             return;
         };
         rt.paged_finalize_error = None;
         let seq_id = rt.active_seq;
+        rt.restored_draft_windows.remove(&seq_id);
         let res = (|| -> std::result::Result<(), String> {
             rt.coordinator.activate_request_all(seq_id)?;
             rt.coordinator.eval_pending_pool_writes_all()?;
@@ -4954,8 +5767,9 @@ impl PagedBackend for Inkling2Inner {
                     .finalize_keep_live_all(seq_id, &[], cache_salt)?;
 
                 // Capture turn-end ordinary state (`StateClass::Ordinary`) into the hybrid
-                // StateStore (40 SWA trailing blocks + 48 ShortConv states) anchored on the exact
-                // deepest complete `block_size` boundary where ShortConv was snapshotted!
+                // StateStore (40 SWA trailing blocks + 48 ShortConv states + optional DFlash2
+                // 4-bit DraftContextWindow) anchored on the exact deepest complete `block_size`
+                // boundary where ShortConv was snapshotted!
                 if self.cached_image_key.is_none() {
                     let recorded = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
                     let bs = rt.coordinator.block_size().max(1);
@@ -4969,7 +5783,13 @@ impl PagedBackend for Inkling2Inner {
                             .request_tokens_for(seq_id)
                             .map(|t| t.to_vec())
                         && tokens.len() >= boundary as usize
-                        && let Err(err) = rt.state_store.capture_boundary(
+                    {
+                        let draft_win = rt
+                            .block_boundary_draft_window
+                            .get(&seq_id)
+                            .filter(|(wb, _)| *wb == boundary)
+                            .map(|(_, w)| w);
+                        if let Err(err) = rt.state_store.capture_boundary_with_window(
                             &mut rt.coordinator,
                             &conv,
                             seq_id,
@@ -4977,12 +5797,14 @@ impl PagedBackend for Inkling2Inner {
                             boundary,
                             cache_salt,
                             StateClass::Ordinary,
-                        )
-                    {
-                        tracing::warn!(
-                            target: "mlx_core::inkling2::paged",
-                            "Inkling2 finalize StateStore capture at boundary={boundary} failed: {err}"
-                        );
+                            draft_win,
+                            governor,
+                        ) {
+                            tracing::warn!(
+                                target: "mlx_core::inkling2::paged",
+                                "Inkling2 finalize StateStore capture at boundary={boundary} failed: {err}"
+                            );
+                        }
                     }
                 }
             } else {
@@ -4991,12 +5813,17 @@ impl PagedBackend for Inkling2Inner {
                 rt.conv_states.remove(&seq_id);
                 rt.prev_conv_snapshots.remove(&seq_id);
                 rt.block_boundary_conv.remove(&seq_id);
+                rt.draft_windows.remove(&seq_id);
+                rt.block_boundary_draft_window.remove(&seq_id);
+                rt.restored_draft_windows.remove(&seq_id);
+                rt.seq_reuse_cache.remove(&seq_id);
             }
             Ok(())
         })();
         if !reuse_cache {
             self.dspark_turn_contexts.remove(&seq_id);
             self.scheduled_dspark.seq_lanes.remove(&seq_id);
+            self.scheduled_dspark.sync_decode_limit();
         }
         if let Err(error) = res {
             tracing::warn!(
@@ -5007,6 +5834,7 @@ impl PagedBackend for Inkling2Inner {
             rt.release_sequence(seq_id);
             self.dspark_turn_contexts.remove(&seq_id);
             self.scheduled_dspark.seq_lanes.remove(&seq_id);
+            self.scheduled_dspark.sync_decode_limit();
         }
     }
 
@@ -5091,6 +5919,7 @@ impl PagedBackend for Inkling2Inner {
             rt.release_sequence(seq);
             self.dspark_turn_contexts.remove(&seq);
             self.scheduled_dspark.seq_lanes.remove(&seq);
+            self.scheduled_dspark.sync_decode_limit();
         }
         self.cached_token_history.clear();
         self.cached_image_key = None;
@@ -6604,6 +7433,7 @@ mod dflash2_plan_tests {
             tokenizer: None,
             dspark: None,
             dflash2: Some(draft),
+            dflash2_identity: None,
             dspark_turn_contexts: HashMap::new(),
             scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
             paged: None,
@@ -6769,5 +7599,261 @@ mod dflash2_plan_tests {
             },
         );
         assert_eq!(no_draft_plan.decoder, DecoderPlan::Autoregressive);
+    }
+
+    #[test]
+    fn ar_batched_draft_window_capture_error_invalidates_affected_rows_only() {
+        struct FailSeqGuard;
+        impl Drop for FailSeqGuard {
+            fn drop(&mut self) {
+                FAIL_DRAFT_WINDOW_CAPTURE_SEQ.with(|c| c.set(None));
+            }
+        }
+        let _fail_guard = FailSeqGuard;
+
+        let mut backend = build_dflash2_only_inner();
+        let (width, slots, n_taps, hidden) = {
+            let draft = backend.dflash2.as_ref().expect("dflash2");
+            (
+                draft.config.context_width(),
+                draft.config.sliding_window as u32,
+                draft.config.target_layers.len(),
+                backend.config.hidden_size as i64,
+            )
+        };
+
+        // Pre-populate live + block-boundary draft windows for both `seq_a` (1) and `seq_b` (2).
+        {
+            let rt = backend.paged.as_mut().expect("paged");
+            let seed = MxArray::zeros(&[1, 32, i64::from(width)], Some(DType::BFloat16))
+                .expect("seed fused");
+            rt.record_fused_draft_window(1, 0, &seed, width, slots)
+                .expect("seed seq 1");
+            rt.record_fused_draft_window(2, 0, &seed, width, slots)
+                .expect("seed seq 2");
+            assert_eq!(rt.draft_windows.get(&1).map(|w| w.end()), Some(32));
+            assert_eq!(rt.draft_windows.get(&2).map(|w| w.end()), Some(32));
+            assert!(rt.block_boundary_draft_window.contains_key(&1));
+            assert!(rt.block_boundary_draft_window.contains_key(&2));
+        }
+
+        // 1. Per-row failure on seq 2: seq 2 is invalidated, seq 1 advances cleanly to 33!
+        let valid_taps: Vec<MxArray> = (0..n_taps)
+            .map(|_| MxArray::zeros(&[2, hidden], Some(DType::BFloat16)).expect("tap"))
+            .collect();
+        FAIL_DRAFT_WINDOW_CAPTURE_SEQ.with(|c| c.set(Some(2)));
+        backend.record_batched_taps_to_draft_windows_best_effort(&[(1, 32), (2, 32)], &valid_taps);
+        FAIL_DRAFT_WINDOW_CAPTURE_SEQ.with(|c| c.set(None));
+        {
+            let rt = backend.paged.as_ref().expect("paged");
+            assert_eq!(rt.draft_windows.get(&1).map(|w| w.end()), Some(33));
+            assert!(rt.block_boundary_draft_window.contains_key(&1));
+            assert!(!rt.draft_windows.contains_key(&2));
+            assert!(!rt.block_boundary_draft_window.contains_key(&2));
+        }
+
+        // 2. Batch fuse failure (mismatched tap count): invalidates all participating rows safely.
+        let bad_taps = vec![MxArray::zeros(&[2, hidden], Some(DType::BFloat16)).expect("bad tap")];
+        backend.record_batched_taps_to_draft_windows_best_effort(&[(1, 33), (2, 33)], &bad_taps);
+        {
+            let rt = backend.paged.as_ref().expect("paged");
+            assert!(!rt.draft_windows.contains_key(&1));
+            assert!(!rt.block_boundary_draft_window.contains_key(&1));
+        }
+    }
+
+    /// Round-10 Finding 3 regression:
+    /// Advancing a cache-enabled sequence across multiple 32-token block boundaries (both exact
+    /// hits `0 -> 32 -> 64 -> 70` and multi-token chunks crossing boundaries mid-chunk
+    /// `0 -> 28 -> 36 -> 60 -> 68 -> 70`):
+    /// 1. Stores a detached device-side [`BoundaryDraftWindow::Device`] at the latest boundary
+    ///    (`64`) with exact bounds `[64 - slots, 64)` and ZERO synchronous host waits during
+    ///    `record_fused_draft_window` on Metal.
+    /// 2. Subsequent tokens `64..70` written into `draft_windows` NEVER overwrite or corrupt the
+    ///    detached snapshot at `64`.
+    /// 3. `draft_windows_bytes()` accounts cleanly for both the live window and the detached
+    ///    device boundary snapshot.
+    /// 4. Deferring packing to `capture_boundary_with_window` produces a [`PackedDraftWindow`]
+    ///    byte-identical to a ground-truth window containing strictly rows `0..64`.
+    #[test]
+    fn block_boundary_draft_window_detaches_device_snapshot_without_host_stalls() {
+        use super::super::state_disk::Inkling2StateGeometry;
+
+        let mut backend = build_dflash2_only_inner();
+        let (draft_cfg, width, slots) = {
+            let draft = backend.dflash2.as_ref().expect("dflash2");
+            (
+                draft.config.clone(),
+                draft.config.context_width(),
+                draft.config.sliding_window as u32,
+            )
+        };
+        {
+            let rt = backend.paged.as_mut().expect("paged");
+            let geom = Inkling2StateGeometry::from_coordinator_with_draft(
+                &backend.config,
+                &rt.coordinator,
+                Some(&draft_cfg),
+            )
+            .expect("geom");
+            assert!(geom.draft_window_span_bytes > 0);
+            rt.state_store.set_geometry(geom);
+        }
+
+        // Build 70 distinct BF16 rows so overwriting ring slots with 64..70 is unmistakably visible.
+        let total_rows = 70usize;
+        let all_rows = MxArray::random_normal(
+            &[1, total_rows as i64, i64::from(width)],
+            0.0,
+            1.0,
+            Some(DType::BFloat16),
+        )
+        .expect("all_rows");
+        MxArray::eval_arrays(&[&all_rows]).expect("eval all_rows");
+
+        // Independent ground-truth PackedDraftWindow covering strictly rows `0..64`.
+        let rows_0_64 = all_rows.slice_axis(1, 0, 64).expect("slice 0..64");
+        let mut truth_win = DraftContextWindow::new(width, slots).expect("truth_win");
+        truth_win.store_rows(&rows_0_64, 0).expect("truth store");
+        let expected_packed_64 = PackedDraftWindow::from_window(&truth_win).expect("truth packed");
+        assert!(expected_packed_64.is_complete_for(64));
+
+        // Pre-slice chunks outside the host_waits window so we measure ONLY `record_fused_draft_window`.
+        let exact_chunks: Vec<(u32, MxArray)> = [(0u32, 32i64), (32, 64), (64, 70)]
+            .into_iter()
+            .map(|(start, end)| {
+                let slice = all_rows
+                    .slice_axis(1, i64::from(start), end)
+                    .expect("exact chunk");
+                (start, slice)
+            })
+            .collect();
+        let crossing_chunks: Vec<(u32, MxArray)> =
+            [(0u32, 28i64), (28, 36), (36, 60), (60, 68), (68, 70)]
+                .into_iter()
+                .map(|(start, end)| {
+                    let slice = all_rows
+                        .slice_axis(1, i64::from(start), end)
+                        .expect("crossing chunk");
+                    (start, slice)
+                })
+                .collect();
+
+        let metal_available = unsafe { mlx_sys::mlx_metal_is_available() };
+        if metal_available {
+            crate::array::host_waits::start();
+        }
+        {
+            let rt = backend.paged.as_mut().expect("paged");
+            // Seq 1: exact boundary hits 0 -> 32 -> 64 -> 70.
+            for (pos, chunk) in &exact_chunks {
+                rt.record_fused_draft_window(1, *pos, chunk, width, slots)
+                    .expect("record exact chunk");
+            }
+            // Seq 2: multi-token chunks crossing boundaries 32 and 64 mid-chunk.
+            for (pos, chunk) in &crossing_chunks {
+                rt.record_fused_draft_window(2, *pos, chunk, width, slots)
+                    .expect("record crossing chunk");
+            }
+        }
+        if metal_available {
+            let waits = crate::array::host_waits::take();
+            assert!(
+                waits.is_empty(),
+                "record_fused_draft_window must trigger ZERO synchronous host waits across block boundaries on Metal (got {waits:?})"
+            );
+        }
+
+        // Verify live windows ended at 70, boundary windows are `Device` snapshots at 64,
+        // `draft_windows_bytes()` accounts for all 4 device windows (2 live + 2 boundary),
+        // and both detached snapshots match ground truth at 64 byte-for-byte despite 64..70 writes!
+        let one_win_bytes = DraftContextWindow::bytes(width, slots);
+        let conv = Inkling2ShortConvState::new(
+            backend.config.num_layer_visits(),
+            backend.config.sconv_kernel_size,
+            backend.config.num_key_value_heads * backend.config.head_dim,
+            backend.config.hidden_size,
+            DType::BFloat16,
+        )
+        .expect("conv");
+        let tokens_1: Vec<u32> = (10u32..80u32).collect();
+        let tokens_2: Vec<u32> = (110u32..180u32).collect();
+        {
+            let rt = backend.paged.as_mut().expect("paged");
+            assert_eq!(rt.draft_windows_bytes(), 4 * one_win_bytes);
+
+            for (seq_id, tokens, salt) in [(1u32, &tokens_1, 701u64), (2u32, &tokens_2, 702u64)] {
+                assert_eq!(rt.draft_windows.get(&seq_id).map(|w| w.end()), Some(70));
+                let (boundary, bwin) = rt
+                    .block_boundary_draft_window
+                    .get(&seq_id)
+                    .expect("boundary snapshot present");
+                assert_eq!(*boundary, 64);
+                match bwin {
+                    BoundaryDraftWindow::Device(dev) => {
+                        assert_eq!(dev.end(), 64);
+                        assert_eq!(dev.begin(), 64u32.saturating_sub(slots));
+                        let packed = PackedDraftWindow::from_window(dev).expect("pack device snap");
+                        assert_eq!(
+                            packed, expected_packed_64,
+                            "seq {seq_id} detached snapshot at 64 must match ground truth 0..64 despite 64..70 writes"
+                        );
+                    }
+                    BoundaryDraftWindow::Packed(_) => {
+                        panic!("live decode boundary snapshot must stay device-side, not Packed");
+                    }
+                }
+
+                // Publish via `capture_boundary_with_window` and confirm exact persisted PackedDraftWindow.
+                rt.coordinator
+                    .reset_scheduled_request(seq_id)
+                    .expect("reset seq");
+                rt.coordinator
+                    .record_tokens_all(seq_id, tokens)
+                    .expect("record tokens");
+                let bwin_ref = rt
+                    .block_boundary_draft_window
+                    .get(&seq_id)
+                    .filter(|(wb, _)| *wb == 64)
+                    .map(|(_, w)| w);
+                let id = rt
+                    .state_store
+                    .capture_boundary_with_window(
+                        &mut rt.coordinator,
+                        &conv,
+                        seq_id,
+                        tokens,
+                        64,
+                        salt,
+                        StateClass::Ordinary,
+                        bwin_ref,
+                        None,
+                    )
+                    .expect("capture_boundary_with_window")
+                    .expect("entry id");
+                let stored = rt
+                    .state_store
+                    .store
+                    .get(id)
+                    .expect("stored entry")
+                    .ram()
+                    .expect("ram anchor")
+                    .draft_window
+                    .as_ref()
+                    .expect("stored draft_window");
+                assert_eq!(
+                    stored, &expected_packed_64,
+                    "seq {seq_id} capture_boundary_with_window must publish exact PackedDraftWindow at 64"
+                );
+                // Release this sequence's KV blocks & anchor before testing the next sequence so
+                // the compact 4-block synthetic test pool has room for seq 2.
+                let _ = rt
+                    .state_store
+                    .reclaim_entry_with_options(&rt.coordinator, id, false, true);
+                rt.coordinator
+                    .release_request_all(seq_id)
+                    .expect("release seq");
+            }
+        }
     }
 }

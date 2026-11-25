@@ -400,6 +400,101 @@ impl Inkling2KVCacheCoordinator {
         .map_err(Error::from_reason)
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_extent_grown_for_test(
+        config: &Inkling2Config,
+        kv_format: KvFormat,
+        block_size: u32,
+        max_model_len: u32,
+        max_chunk: u32,
+        max_concurrent_sequences: u32,
+        full_initial_blocks: u32,
+        full_max_blocks: u32,
+        full_extent_blocks: u32,
+        cache_recency: Arc<CacheRecency>,
+    ) -> Result<Self> {
+        let (specs, groups) =
+            compute_visit_kv_cache_groups(config, block_size, kv_format, max_model_len, max_chunk)
+                .map_err(Error::from_reason)?;
+        let (metal_dtype, page_layout, kv_dtype) = kv_format_metal_layout(kv_format);
+        let mut adapters = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let (initial_blocks, max_blocks) = match group.attention_kind {
+                AttentionKind::Full => (full_initial_blocks, full_max_blocks),
+                AttentionKind::SlidingWindow { .. } => {
+                    let b = group_reserved_blocks(
+                        group.attention_kind,
+                        group.max_admission_blocks,
+                        max_concurrent_sequences,
+                        block_size,
+                    );
+                    (b, b)
+                }
+            };
+            let num_layers = u32::try_from(group.physical_layer_indices.len())
+                .map_err(|_| Error::from_reason("Inkling2 KV group layer count overflows u32"))?;
+            let pa_config = PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb: MIN_POOL_MEMORY_MB as u32,
+                head_size: group.physical_layout.head_size,
+                num_kv_heads: group.physical_layout.num_kv_heads,
+                num_layers,
+                max_seq_len: Some(max_model_len),
+                max_batch_size: Some(max_concurrent_sequences),
+            };
+            let allocator =
+                match group.attention_kind {
+                    AttentionKind::Full => Arc::new(Mutex::new(BlockAllocator::with_recency(
+                        initial_blocks,
+                        max_blocks,
+                        block_size,
+                        Arc::clone(&cache_recency),
+                    ))),
+                    AttentionKind::SlidingWindow { .. } => Arc::new(Mutex::new(
+                        BlockAllocator::new(initial_blocks, max_blocks, block_size),
+                    )),
+                };
+            let pool = LayerKVPool::new_with_layout(
+                pa_config,
+                initial_blocks,
+                max_blocks,
+                metal_dtype,
+                page_layout,
+            )
+            .map_err(Error::from_reason)?;
+            let mut adapter = match group.attention_kind {
+                AttentionKind::Full => {
+                    PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                }
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    PagedKVCacheAdapter::new_sliding(
+                        allocator,
+                        Arc::new(pool),
+                        block_size,
+                        sliding_window,
+                        max_model_len,
+                    )
+                }
+            }
+            .map_err(Error::from_reason)?;
+            if matches!(group.attention_kind, AttentionKind::Full) && initial_blocks < max_blocks {
+                adapter.set_extent_growth(full_extent_blocks.max(1));
+            }
+            adapters.push(adapter);
+        }
+        Self::from_adapters(
+            &specs,
+            groups,
+            adapters,
+            kv_format,
+            kv_dtype,
+            block_size,
+            max_concurrent_sequences,
+        )
+        .map_err(Error::from_reason)
+    }
+
     /// Construct a new coordinator sized from a unified [`Inkling2PoolPlan`], registering
     /// the Global extent-grown pool with [`Governor`] (`load_pool`), sharing `cache_recency`
     /// with Group 0's `BlockAllocator`, configuring extent growth + memory ceiling + activations,
@@ -572,6 +667,30 @@ impl Inkling2KVCacheCoordinator {
     ) -> std::result::Result<(), String> {
         self.inner
             .restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, raw_blocks)
+    }
+
+    /// Read raw physical SWA blocks covering the live window ending at block-aligned `boundary`
+    /// into one contiguous flat buffer (`live_blocks * num_layers * (key_blob + value_blob)`).
+    pub fn read_sliding_raw_blocks_flat_for(
+        &self,
+        seq_id: u32,
+        boundary: u32,
+    ) -> std::result::Result<Vec<u8>, String> {
+        self.inner
+            .read_sliding_raw_blocks_flat_for(seq_id, boundary)
+    }
+
+    /// Restore raw physical SWA blocks from a contiguous flat buffer into Group 1 at block-aligned
+    /// `boundary`.
+    pub fn restore_sliding_raw_blocks_flat_for(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        flat_bytes: &[u8],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .restore_sliding_raw_blocks_flat_for(seq_id, prompt_tokens, boundary, flat_bytes)
     }
 
     /// Register Group 0 (8 Global visits) committed blocks up to `boundary` in the prefix cache.

@@ -913,7 +913,8 @@ impl Qwen35Inner {
             | UnitKey::Extent
             | UnitKey::DeadLeaves
             | UnitKey::Vision(_)
-            | UnitKey::StoreChain(_) => {}
+            | UnitKey::StoreChain(_)
+            | UnitKey::DraftContext(_) => {}
         }
     }
 
@@ -997,7 +998,8 @@ impl Qwen35Inner {
             | UnitKey::Extent
             | UnitKey::DeadLeaves
             | UnitKey::Vision(_)
-            | UnitKey::StoreChain(_) => false,
+            | UnitKey::StoreChain(_)
+            | UnitKey::DraftContext(_) => false,
         };
         if dropped {
             self.sync_gdn_state_marks();

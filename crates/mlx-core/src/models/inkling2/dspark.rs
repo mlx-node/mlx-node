@@ -1340,6 +1340,12 @@ impl DraftLayerKV {
         self.end - self.start
     }
 
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        let k = self.k_buf.as_ref().map_or(0, |a| a.nbytes() as u64);
+        let v = self.v_buf.as_ref().map_or(0, |a| a.nbytes() as u64);
+        k.saturating_add(v)
+    }
+
     /// Zero-copy slice view of committed `[1, H_kv, len, D]` BF16 K/V tensors.
     pub(crate) fn view(&self) -> Result<Option<(MxArray, MxArray)>> {
         if self.end <= self.start {
@@ -1465,6 +1471,15 @@ impl Inkling2DsparkContext {
             last_f_rnn: None,
             committed_len: 0,
         }
+    }
+
+    pub(crate) fn buffer_bytes(&self) -> u64 {
+        let layers_bytes = self
+            .layers
+            .iter()
+            .fold(0u64, |sum, layer| sum.saturating_add(layer.buffer_bytes()));
+        let f_rnn_bytes = self.last_f_rnn.as_ref().map_or(0, |a| a.nbytes() as u64);
+        layers_bytes.saturating_add(f_rnn_bytes)
     }
 
     pub fn collect_arrays<'a>(&'a self, out: &mut Vec<&'a MxArray>) {

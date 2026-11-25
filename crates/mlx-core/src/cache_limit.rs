@@ -257,10 +257,23 @@ impl AppliedCacheLimit {
 /// register/unregister happen once per model load/drop, not per request.
 pub struct CacheLimitCoordinator {
     state: Mutex<CoordState>,
+    /// Only the process-wide singleton pushes FFI `set_cache_limit` and
+    /// notifies the process-wide memory governor. Local test coordinators
+    /// run identical pool accounting without mutating global allocator state.
+    global: bool,
 }
 
 impl CacheLimitCoordinator {
+    #[cfg(test)]
     fn new() -> Self {
+        Self::with_global(false)
+    }
+
+    fn new_global() -> Self {
+        Self::with_global(true)
+    }
+
+    fn with_global(global: bool) -> Self {
         Self {
             state: Mutex::new(CoordState {
                 next_id: 1,
@@ -269,6 +282,20 @@ impl CacheLimitCoordinator {
                 decode_limits: HashMap::new(),
                 limit: AppliedCacheLimit::default(),
             }),
+            global,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test() -> Self {
+        Self::new()
+    }
+
+    fn finish_pool_mutation(&self, mut state: std::sync::MutexGuard<'_, CoordState>) {
+        if self.global {
+            recompute_locked(&mut state);
+            drop(state);
+            pools_changed();
         }
     }
 
@@ -453,6 +480,65 @@ impl CacheLimitCoordinator {
         pools_changed();
     }
 
+    /// Register a host-resident memory pool (e.g. Inkling2's flat host-RAM state
+    /// store) without adding paged-KV `RESTORE_STAGING_BYTES`. Its exact byte
+    /// total is included in [`Self::registered_pool_bytes`] so both the MLX
+    /// cache ceiling and the memory governor charge it alongside private Metal
+    /// pools.
+    pub fn register_host_pool(&self, bytes: u64) -> HostPoolCacheLimitGuard {
+        debug_assert!(
+            self.global,
+            "use register_host_pool_local for non-global test coordinators"
+        );
+        let id = self.insert_host_pool_entry(bytes);
+        HostPoolCacheLimitGuard {
+            owner: HostPoolOwner::Global,
+            id,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_host_pool_local(
+        self: &std::sync::Arc<Self>,
+        bytes: u64,
+    ) -> HostPoolCacheLimitGuard {
+        let id = self.insert_host_pool_entry(bytes);
+        HostPoolCacheLimitGuard {
+            owner: HostPoolOwner::Local(std::sync::Arc::clone(self)),
+            id,
+        }
+    }
+
+    fn insert_host_pool_entry(&self, bytes: u64) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.pools.insert(id, bytes);
+        info!(
+            "[cache_limit] register host pool guard={} bytes={:.2} MiB (live_pools={})",
+            id,
+            bytes as f64 / (1u64 << 20) as f64,
+            state.pools.len(),
+        );
+        self.finish_pool_mutation(state);
+        id
+    }
+
+    /// Replace a live host pool's exact byte accounting in place (without
+    /// adding `RESTORE_STAGING_BYTES`). No-op when the id is unknown (guard
+    /// already dropped) or the byte total is unchanged.
+    pub fn update_host_pool(&self, id: u64, new_bytes: u64) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = state.pools.get_mut(&id) else {
+            return;
+        };
+        if *bytes == new_bytes {
+            return;
+        }
+        *bytes = new_bytes;
+        self.finish_pool_mutation(state);
+    }
+
     fn unregister(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.profiles.remove(&id).is_some() {
@@ -465,9 +551,7 @@ impl CacheLimitCoordinator {
     fn unregister_pool(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.pools.remove(&id).is_some() {
-            recompute_locked(&mut state);
-            drop(state);
-            pools_changed();
+            self.finish_pool_mutation(state);
         }
     }
 }
@@ -507,6 +591,40 @@ impl PoolCacheLimitGuard {
 impl Drop for PoolCacheLimitGuard {
     fn drop(&mut self) {
         coordinator().unregister_pool(self.id);
+    }
+}
+
+enum HostPoolOwner {
+    Global,
+    #[cfg(test)]
+    Local(std::sync::Arc<CacheLimitCoordinator>),
+}
+
+/// RAII token returned from [`CacheLimitCoordinator::register_host_pool`].
+/// Tracks exact host-resident pool bytes (without `RESTORE_STAGING_BYTES`)
+/// and unregisters on drop.
+pub struct HostPoolCacheLimitGuard {
+    owner: HostPoolOwner,
+    id: u64,
+}
+
+impl HostPoolCacheLimitGuard {
+    pub(crate) fn update(&self, bytes: u64) {
+        match &self.owner {
+            HostPoolOwner::Global => coordinator().update_host_pool(self.id, bytes),
+            #[cfg(test)]
+            HostPoolOwner::Local(coord) => coord.update_host_pool(self.id, bytes),
+        }
+    }
+}
+
+impl Drop for HostPoolCacheLimitGuard {
+    fn drop(&mut self) {
+        match &self.owner {
+            HostPoolOwner::Global => coordinator().unregister_pool(self.id),
+            #[cfg(test)]
+            HostPoolOwner::Local(coord) => coord.unregister_pool(self.id),
+        }
     }
 }
 
@@ -580,7 +698,7 @@ pub const DECODE_CACHE_LIMIT_FLOOR: u64 = 128 << 20;
 /// Access the process-wide coordinator, initializing it on first use.
 pub fn coordinator() -> &'static CacheLimitCoordinator {
     static INSTANCE: OnceLock<CacheLimitCoordinator> = OnceLock::new();
-    INSTANCE.get_or_init(CacheLimitCoordinator::new)
+    INSTANCE.get_or_init(CacheLimitCoordinator::new_global)
 }
 
 /// Process-wide lock serializing paged-KV pool growth AND load-time pool
@@ -1279,6 +1397,39 @@ mod tests {
             coordinator().registered_pool_bytes(),
             before,
             "dropping the guard must unregister the updated entry"
+        );
+    }
+
+    #[test]
+    fn host_pool_guard_tracks_exact_bytes_without_restore_staging() {
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let guard = coordinator().register_host_pool(64 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            64 << 20,
+            "register_host_pool must charge exact bytes without RESTORE_STAGING_BYTES"
+        );
+        guard.update(96 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            96 << 20
+        );
+        guard.update(96 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            96 << 20
+        );
+        guard.update(16 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            16 << 20
+        );
+        drop(guard);
+        assert_eq!(
+            coordinator().registered_pool_bytes(),
+            before,
+            "dropping HostPoolCacheLimitGuard must unregister exact bytes"
         );
     }
 

@@ -6861,7 +6861,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .get(&turn.payload.owner_id)
                 .map(B::owner_tokens)
                 .unwrap_or_default(),
-            !self.scratch,
+            turn.payload.reuse_cache && !self.scratch,
             turn.payload.params.cache_salt,
             turn.block_size,
         );
@@ -8596,6 +8596,7 @@ pub(crate) mod tests {
                 tokenizer: None,
                 dspark,
                 dflash2,
+                dflash2_identity: None,
                 dspark_turn_contexts: HashMap::new(),
                 scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
                 paged: None,

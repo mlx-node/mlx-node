@@ -412,6 +412,9 @@ pub struct Inkling2Inner {
     pub dspark: Option<Inkling2DsparkModel>,
     /// Optional external DFlash2 speculative drafter (`incoai/Inkling-2-Mini-DFlash2`).
     pub(crate) dflash2: Option<DFlash2Model>,
+    /// Content-bound identity digest for the loaded DFlash2 draft directory, folded into
+    /// persistent StateDisk fingerprints so SSD caches invalidate if draft weights change.
+    pub(crate) dflash2_identity: Option<Vec<u8>>,
     /// Per-sequence whole-turn speculative draft contexts (DSpark or DFlash2, keyed by `SeqId`).
     pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DraftContext>,
     /// Scheduled continuous-batching speculative lane contexts + verify wave state.
@@ -457,11 +460,21 @@ impl Inkling2Inner {
         self.prefill_runs.clear();
         self.paged = None;
         crate::array::clear_cache();
-        self.paged = Some(Inkling2PagedRuntime::new_with_recency(
+        let mut rt = Inkling2PagedRuntime::new_with_recency(
             &self.config,
             paged_cfg,
             Arc::clone(&self.cache_recency),
-        )?);
+        )?;
+        let geom = super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+            &self.config,
+            &rt.coordinator,
+            self.dflash2.as_ref().map(|d| &d.config),
+        )?;
+        rt.state_store.set_geometry(geom);
+        if self.memory_registration.is_some() {
+            rt.state_store.attach_host_budget();
+        }
+        self.paged = Some(rt);
         Ok(())
     }
 
@@ -500,16 +513,19 @@ impl Inkling2Inner {
         options: &DiskTierOptions,
         identity: impl FnOnce() -> Option<crate::disk_tier::PersistentIdentity>,
     ) -> Option<TierHandle> {
+        let dflash2_cfg = self.dflash2.as_ref().map(|d| &d.config);
         let rt = self.paged.as_mut()?;
         let (context, disk) = super::state_disk::open_inkling2_state_disk(
             &self.config,
             &rt.coordinator,
+            dflash2_cfg,
             options,
             identity,
             self.model_id,
         )?;
         let handle = TierHandle::of(Some(&disk.tier));
         rt.coordinator.set_full_cold_tier(context);
+        rt.state_store.set_geometry(disk.codec.geometry.clone());
         rt.state_store.disk = Some(disk);
         let adopted = rt.state_store.adopt_all();
         if adopted > 0 {
@@ -726,6 +742,7 @@ impl Inkling2Inner {
 
     pub fn weight_arrays(&self) -> Vec<MxArray> {
         let mut arrays = Vec::new();
+        arrays.extend(self.embed_tokens.resident_weight_arrays());
         arrays.push(self.embed_norm.clone());
         for l in &self.layers {
             arrays.extend(l.weight_arrays());

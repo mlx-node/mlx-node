@@ -152,6 +152,9 @@ pub(crate) struct EngineChainStep {
     pub(crate) step: ChainStep,
     pub(crate) invalidations: u64,
     pub(crate) offload_failures: u64,
+    /// Entry ID whose chain failed (`lost || failed`) during this step, even when
+    /// `self.chain` was `None` before the call.
+    pub(crate) failed_id: Option<EntryId>,
 }
 
 /// Counters and flags returned by [`StateDiskEngine::poll_offload`].
@@ -161,6 +164,10 @@ pub(crate) struct PollOutcome {
     pub(crate) state_landed_ok: u64,
     pub(crate) offload_failures: u64,
     pub(crate) resync: bool,
+    /// Entry ID whose in-flight state blob write failed during this poll.
+    pub(crate) state_failed_id: Option<EntryId>,
+    /// Entry ID whose in-flight KV chain block failed during this poll.
+    pub(crate) chain_failed_id: Option<EntryId>,
 }
 
 /// Combined outcome returned by [`StateDiskEngine::tick`].
@@ -171,6 +178,24 @@ pub(crate) struct EngineTickOutcome {
     pub(crate) state_landed_ok: u64,
     pub(crate) invalidations: u64,
     pub(crate) offload_failures: u64,
+    /// Entry ID whose in-flight state blob write failed during this tick.
+    pub(crate) state_failed_id: Option<EntryId>,
+    /// Entry IDs whose KV chain failed during this tick (up to one per poll/chain sub-step).
+    pub(crate) chain_failed_ids: [Option<EntryId>; 3],
+}
+
+impl EngineTickOutcome {
+    fn record_chain_failed(&mut self, id: Option<EntryId>) {
+        let Some(id) = id else {
+            return;
+        };
+        if self.chain_failed_ids.contains(&Some(id)) {
+            return;
+        }
+        if let Some(slot) = self.chain_failed_ids.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(id);
+        }
+    }
 }
 
 /// What `persist` did with a point (Splash `PersistStatus`).
@@ -509,6 +534,9 @@ pub(crate) struct StateDiskEngine<C: StateDiskCodec> {
     pub(crate) landed_rx: Receiver<Landed>,
     /// The state write in flight (Splash `StateCache::pending_`).
     pub(crate) pending: Option<PendingWrite>,
+    /// Optional entry ID whose store entry stays indexed on state-write failure even when its RAM
+    /// copy was dropped (used for in-place SSD upgrades with a durable fallback copy to restore).
+    pub(crate) preserve_entry_on_state_failure: Option<EntryId>,
     /// The chain the tier copies under a disk state (Splash
     /// `Cache::persisting_`).
     pub(crate) chain: Option<ChainCursor>,
@@ -539,6 +567,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             landed_tx,
             landed_rx,
             pending: None,
+            preserve_entry_on_state_failure: None,
             chain: None,
             read_waiters: Arc::new(AtomicU32::new(0)),
             #[cfg(test)]
@@ -865,6 +894,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                     out.offload_failures += 1;
                     drop_disk_copy(store, &self.tier, id);
                     self.chain = None;
+                    out.chain_failed_id = Some(id);
                     out.resync = true;
                     continue;
                 }
@@ -873,6 +903,10 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             let Some(write) = self.pending.take_if(|write| write.key == key) else {
                 continue;
             };
+            let preserve_on_failure = self
+                .preserve_entry_on_state_failure
+                .take_if(|id| *id == write.id)
+                .is_some();
             if ok {
                 #[cfg(test)]
                 self.landed_states.push(key);
@@ -900,11 +934,20 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                 continue;
             }
             out.offload_failures += 1;
+            out.state_failed_id = Some(write.id);
             out.resync = true;
+            if self
+                .chain
+                .as_ref()
+                .is_some_and(|cursor| cursor.id == write.id)
+            {
+                self.chain = None;
+            }
             store.set_disk(write.id, None);
-            if store
-                .get(write.id)
-                .is_some_and(|entry| entry.ram().is_none())
+            if !preserve_on_failure
+                && store
+                    .get(write.id)
+                    .is_some_and(|entry| entry.ram().is_none())
             {
                 store.remove(write.id);
             }
@@ -1054,6 +1097,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             drop_disk_copy(store, &self.tier, id);
             self.chain = None;
             out.step.failed = true;
+            out.failed_id = Some(id);
         } else if copy.landed && !missing && !in_flight {
             if let Some(copy) = store.disk_mut(id) {
                 copy.chain_owed = false;
@@ -1078,6 +1122,10 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
         out.resync |= first.resync;
         out.state_landed_ok += first.state_landed_ok;
         out.offload_failures += first.offload_failures;
+        if first.state_failed_id.is_some() {
+            out.state_failed_id = first.state_failed_id;
+        }
+        out.record_chain_failed(first.chain_failed_id);
 
         let deadline = match tick {
             Tick::Poll => None,
@@ -1092,6 +1140,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                 out.resync |= settled;
                 out.invalidations += step.invalidations;
                 out.offload_failures += step.offload_failures;
+                out.record_chain_failed(step.failed_id);
             }
             if matches!(tick, Tick::Wait { .. }) {
                 let second = self.poll_offload(store);
@@ -1099,6 +1148,10 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                 out.resync |= second.resync;
                 out.state_landed_ok += second.state_landed_ok;
                 out.offload_failures += second.offload_failures;
+                if second.state_failed_id.is_some() {
+                    out.state_failed_id = second.state_failed_id;
+                }
+                out.record_chain_failed(second.chain_failed_id);
             }
         }
         if matches!(tick, Tick::Full { .. }) {
