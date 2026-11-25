@@ -115,7 +115,7 @@ export function readModelChatTemplateSync(modelPath: string): string | undefined
     ) {
       return ggufMetadata.chatTemplate;
     }
-    return readDirectoryChatTemplateSync(sidecarDir) ?? ggufMetadata?.chatTemplate;
+    return readDirectoryChatTemplateSync(sidecarDir);
   }
   return readDirectoryChatTemplateSync(modelPath);
 }

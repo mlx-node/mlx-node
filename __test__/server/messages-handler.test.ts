@@ -7868,12 +7868,13 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       modelCtorName: 'Lfm2Model' | 'MuseGlimmerModel' | 'K2HorizonModel' | 'Qwen35Model',
       extra: Record<string, unknown>,
       server: ServerThinking | undefined,
+      samplingDefaults?: { thinkingTokenBudget?: number },
     ): Promise<Record<string, unknown>> => {
       const registry = new ModelRegistry();
       const base = createMockModel();
       const proto = { constructor: { name: modelCtorName } };
       const model = Object.assign(Object.create(proto), base) as typeof base;
-      registry.register('model', model);
+      registry.register('model', model, samplingDefaults ? { samplingDefaults } : undefined);
       const { res } = createMockRes();
       await handleCreateMessage(
         res,
@@ -7987,6 +7988,22 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       guard: true,
       endText: AGENT_HOST_THINKING.endText,
       from: 'server',
+    });
+
+    // Without a host tokenBudget cap, leave the request overlay untouched so a
+    // per-model `samplingDefaults.thinkingTokenBudget` (e.g. 64) still wins on `low`.
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' } },
+        { cycleGuard: false },
+        { thinkingTokenBudget: 64 },
+      ),
+    ).toEqual({
+      budget: 64,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
     });
   });
 

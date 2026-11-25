@@ -382,19 +382,21 @@ export async function discoverLocalChatModels(
 
     // Qwen3.5/3.6 and Qwen3.8 share `qwen3_5` (and potentially `qwen3_5_moe`).
     // Mirror native GGUF preparation (`gguf_plan.rs` + `write_embedded_gpt2_tokenizer`):
-    // when a GGUF carries embedded GPT-2 tokenizer metadata + `tokenizer.chat_template`
-    // and no sidecar `tokenizer.json` exists, native overwrites sidecar templates
-    // from the GGUF. Otherwise sidecar files take precedence over GGUF metadata.
+    // native only materializes the GGUF's embedded `tokenizer.chat_template` when
+    // `tokenizer.json` is absent and embedded GPT-2 tokenizer metadata is present
+    // (overwriting any sidecar template). When `tokenizer.json` exists or embedded
+    // reconstruction cannot run, native never extracts the GGUF template and only
+    // reads directory sidecars.
     let traits = baseTraits;
     if (!decision && (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe')) {
-      const ggufOverwritesTemplate =
+      const ggufMaterializesTemplate =
         format === 'gguf' &&
         ggufMetadata?.hasEmbeddedGpt2Tokenizer === true &&
         ggufMetadata.chatTemplate !== undefined &&
         !(await hasRegularFile(join(metadataRoot, 'tokenizer.json')));
-      const chatTemplate = ggufOverwritesTemplate
+      const chatTemplate = ggufMaterializesTemplate
         ? ggufMetadata.chatTemplate
-        : ((await readDirectoryChatTemplate(metadataRoot)) ?? ggufMetadata?.chatTemplate);
+        : await readDirectoryChatTemplate(metadataRoot);
       const resolvedEfforts = reasoningEffortsFor(modelType, { chatTemplate });
       if (resolvedEfforts !== baseTraits.reasoningEfforts) {
         traits = { ...baseTraits, reasoningEfforts: resolvedEfforts };

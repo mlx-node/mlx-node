@@ -1105,11 +1105,11 @@ describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reas
       'qwen36-mlx/chat_template.jinja': QWEN36_TEMPLATE,
       'qwen38-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
       'qwen38-mlx/tokenizer_config.json': JSON.stringify({ chat_template: QWEN38_TEMPLATE }),
-      'qwen36-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf': minimalGguf('qwen35', {
-        'tokenizer.chat_template': QWEN36_TEMPLATE,
+      'qwen36-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN36_TEMPLATE,
       }),
-      'qwen38-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf': minimalGguf('qwen35', {
-        'tokenizer.chat_template': QWEN38_TEMPLATE,
+      'qwen38-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN38_TEMPLATE,
       }),
       'qwen35-bare-gguf/Qwen3.5-9B-UD-Q4_K_XL.gguf': minimalGguf('qwen35'),
     });
@@ -1133,6 +1133,9 @@ describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reas
       'with-tok-json/Qwen3.8-WithTok-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
       'with-tok-json/chat_template.jinja': QWEN36_TEMPLATE,
       'with-tok-json/tokenizer.json': '{}',
+      // With tokenizer.json and NO template sidecars: native never extracts the GGUF template.
+      'with-tok-no-tpl/Qwen3.8-TokNoTpl-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'with-tok-no-tpl/tokenizer.json': '{}',
       // Mismatched tokens/token_type counts: embedded GPT-2 check fails, so sidecar template wins.
       'bad-tok-len/Qwen3.8-BadLen-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
         chatTemplate: QWEN38_TEMPLATE,
@@ -1146,6 +1149,7 @@ describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reas
 
     expect(byName.get('Qwen3.8-NoTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
     expect(byName.get('Qwen3.8-WithTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-TokNoTpl-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
     expect(byName.get('Qwen3.8-BadLen-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
   });
 });

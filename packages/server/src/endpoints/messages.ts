@@ -247,13 +247,17 @@ export function applyServerThinking(
     return { config, from: own ? 'request' : undefined };
   }
   const serverBudget = server.tokenBudget;
+  // Apply the effort-derived minimum only when the host actually configured a
+  // thinking token cap; with no host cap, leave `thinkingTokenBudget` absent
+  // from the request overlay so per-model `samplingDefaults` or native
+  // `AlwaysOnBudgetFromEffort` resolves the budget directly.
   const resolvedBudget = own
     ? config.thinkingTokenBudget
-    : effortBudget !== undefined
-      ? serverBudget !== undefined
+    : serverBudget === undefined
+      ? undefined
+      : effortBudget !== undefined
         ? Math.min(effortBudget, serverBudget)
-        : effortBudget
-      : serverBudget;
+        : serverBudget;
   const budget = !own && resolvedBudget !== undefined;
   const zeroBudget = resolvedBudget === 0;
   const guard = !zeroBudget && server.cycleGuard === true;
@@ -267,7 +271,7 @@ export function applyServerThinking(
     ? 'request'
     : !budget
       ? undefined
-      : effortBudget !== undefined && (serverBudget === undefined || effortBudget <= serverBudget)
+      : effortBudget !== undefined && serverBudget !== undefined && effortBudget <= serverBudget
         ? 'request'
         : 'server';
   return { config: out, from };
