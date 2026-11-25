@@ -20,6 +20,12 @@ name: Desktop Release
 # Optional:
 #   HOMEBREW_TAP_TOKEN           PAT with contents:write on the tap repo
 #   WINGET_TOKEN                 PAT with public_repo scope for winget-pkgs PRs
+#   ES_USERNAME                  SSL.com account user name    } Windows Authenticode
+#   ES_PASSWORD                  SSL.com account password     } signing via pinned
+#   CREDENTIAL_ID                eSigner credential ID        } SSL.com CodeSignTool
+#   ES_TOTP_SECRET               eSigner TOTP secret          } v1.3.2 (eSigner).
+#                                All four, or none: without them the Windows ZIP
+#                                ships unsigned, with a warning, exactly as before.
 #
 # Notarization authenticates with an App Store Connect API key rather than
 # `--apple-id` + an app-specific password. The key belongs to the organization
@@ -46,6 +52,13 @@ on:
         description: 'Release tag, e.g. v0.0.14 (required to publish; optional for a dry run)'
         type: string
         default: ''
+      # Every eSigner signature counts against the SSL.com plan's signing quota,
+      # so a dry run can opt out. Public releases (tag pushes or dry_run=false)
+      # always sign when the secrets exist.
+      sign_windows:
+        description: 'Dry runs only: sign Windows binaries with SSL.com eSigner (public releases always sign when secrets are set)'
+        type: boolean
+        default: true
       staging_percentage:
         description: 'Percentage of installed apps offered the update (0-100)'
         type: string
@@ -198,6 +211,7 @@ jobs:
           key: mlx-prebuilt-${{ runner.os }}-${{ hashFiles('crates/mlx-sys/mlx-prebuilt.json') }}
 
       - name: Check the Windows build environment
+        id: winenv
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -208,7 +222,7 @@ jobs:
           if (-not (Test-Path -LiteralPath "$env:CUDA_PATH\include\cuda_runtime.h" -PathType Leaf)) { throw 'CUDA_PATH is missing include\cuda_runtime.h.' }
           if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\bin\arm64\cudnn64_9.dll" -PathType Leaf)) { throw 'CUDNN_PATH has no ARM64 cuDNN 9 runtime.' }
           if (-not (Test-Path -LiteralPath "$env:CUDNN_PATH\lib\arm64\cudnn.lib" -PathType Leaf)) { throw 'CUDNN_PATH is missing lib\arm64\cudnn.lib.' }
-          foreach ($tool in 'makepri.exe', 'makeappx.exe') {
+          foreach ($tool in 'makepri.exe', 'makeappx.exe', 'signtool.exe') {
             $found = $null
             if (-not [string]::IsNullOrWhiteSpace($env:WindowsSdkVerBinPath)) {
               foreach ($candidate in @(
@@ -237,8 +251,11 @@ jobs:
               $cmd = Get-Command $tool -ErrorAction SilentlyContinue
               if ($cmd) { $found = $cmd.Source }
             }
-            if (-not $found) { throw "Windows SDK MSIX tool not found: $tool" }
+            if (-not $found) { throw "Windows SDK tool not found: $tool" }
             Write-Host "Found ${tool}: $found"
+            if ($tool -eq 'signtool.exe') {
+              "signtool=$found" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+            }
           }
           Get-PSDrive -PSProvider FileSystem | Select-Object Name, @{n='FreeGB';e={[math]::Round($_.Free/1GB,2)}} | Format-Table -AutoSize
 
@@ -260,18 +277,342 @@ jobs:
       - name: Build dashboard UI
         run: yarn workspace @mlx-node/dashboard build:ui
 
-      - name: Package Windows ARM64 (ZIP + MSIX)
-        id: package
+      # Packaging is split in two so the PE files are Authenticode-signed inside
+      # the app directory BEFORE the ZIP/MSIX are built from it (the ZIP hash
+      # feeds the release notes and the WinGet manifest, so it must be final).
+      - name: Package the Windows ARM64 app
+        id: app
         shell: pwsh
         env:
           APP_VERSION: ${{ steps.version.outputs.version }}
         run: |
           $ErrorActionPreference = 'Stop'
-          yarn oxnode packages/desktop/scripts/package-windows.ts --app-version "$env:APP_VERSION"
+          yarn oxnode packages/desktop/scripts/package-windows.ts --app-version "$env:APP_VERSION" --app-only
+          if ($LASTEXITCODE -ne 0) { throw 'Windows app packaging failed.' }
+          $resultPath = 'packages/desktop/out/windows-app-result.json'
+          if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
+          $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
+          "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # All four eSigner secrets, or the ZIP ships unsigned exactly as before.
+      # Forks and repositories without the secrets keep a green release run.
+      - name: Check the Windows signing secrets
+        id: signing
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          # Only dry runs may opt out via sign_windows=false; public releases
+          # (tag pushes or workflow_dispatch with dry_run=false) always sign when
+          # secrets are set. Use format('{0}', ...) because before this PR merges
+          # to main `inputs.sign_windows` can be empty and GitHub coerces '' == false.
+          SIGN_REQUESTED: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true || format('{0}', inputs.sign_windows) != 'false' }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $secretNames = @('ES_USERNAME', 'ES_PASSWORD', 'CREDENTIAL_ID', 'ES_TOTP_SECRET')
+          $missing = @($secretNames |
+            Where-Object { [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($_)) })
+          if ($env:SIGN_REQUESTED -ne 'true') {
+            Write-Host '::notice title=Windows signing skipped::sign_windows is off for this dry run; the Windows ZIP is unsigned.'
+            $enabled = 'false'
+          } elseif ($missing.Count -eq $secretNames.Count) {
+            Write-Host "::warning title=Windows signing skipped::None of $($secretNames -join ', ') are set. The Windows ZIP is unsigned."
+            $enabled = 'false'
+          } elseif ($missing.Count -gt 0) {
+            throw "Partial Windows eSigner secret configuration; missing: $($missing -join ', '). Set all four secrets or remove all of them."
+          } else {
+            $enabled = 'true'
+          }
+          "enabled=$enabled" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # eSigner's batch_sign takes one flat directory (at most 100 files) and only
+      # recognises some extensions: `.node` is not one of them, although a `.node`
+      # addon is an ordinary PE DLL. Use `signtool verify /pa /tw /v` (no `/a`) so
+      # only embedded, timestamped Authenticode signatures count — never runner-local
+      # Windows catalogs (which also mask Electron's already-embedded d3dcompiler_47.dll
+      # under Get-AuthenticodeSignature). Copy everything else into a flat directory
+      # under neutral names, giving `.node` files a `.dll` name, and keep a map back.
+      - name: Collect the Windows binaries to sign
+        id: collect
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          APP: ${{ steps.app.outputs.app }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          $root = Join-Path $env:RUNNER_TEMP 'esigner'
+          $inDir = Join-Path $root 'in'
+          $outDir = Join-Path $root 'out'
+          Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path $inDir, $outDir | Out-Null
+          $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File |
+            Where-Object { $_.Extension -in '.exe', '.dll', '.node' } |
+            Sort-Object FullName)
+          $map = @()
+          $index = 0
+          foreach ($file in $pe) {
+            $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $file.FullName 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+            $verifyExit = $LASTEXITCODE
+            $global:LASTEXITCODE = 0
+            if ($verifyExit -eq 0 -and $verifyOut -match 'The signature is timestamped:') { continue }
+            $status = if ($verifyOut -match 'No signature found') {
+              'NotSigned'
+            } elseif ($verifyExit -eq 2 -or ($verifyExit -eq 0 -and $verifyOut -notmatch 'The signature is timestamped:')) {
+              'NoTimestamp'
+            } else {
+              "VerifyExit$verifyExit"
+            }
+            $index += 1
+            $extension = if ($file.Extension -eq '.exe') { '.exe' } else { '.dll' }
+            $name = '{0:D4}{1}' -f $index, $extension
+            Copy-Item -LiteralPath $file.FullName -Destination (Join-Path $inDir $name)
+            $map += [pscustomobject]@{ name = $name; path = $file.FullName; status = $status }
+          }
+          if ($map.Count -eq 0) { throw "Found no PE files needing signing under $env:APP" }
+          if ($map.Count -gt 100) { throw "eSigner batch_sign takes at most 100 files; found $($map.Count)" }
+          $map | ConvertTo-Json -AsArray | Set-Content -LiteralPath (Join-Path $root 'map.json') -Encoding utf8
+          $map | Format-Table name, status, path -AutoSize | Out-String -Width 400 | Write-Host
+          Write-Host "Signing $($map.Count) of $($pe.Count) PE files"
+          "in=$inDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "out=$outDir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "map=$(Join-Path $root 'map.json')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0
+
+      # CodeSignTool is a Java program. Install a native ARM64 JDK 21 (Temurin)
+      # with up-to-date CA roots so we invoke CodeSignTool's JAR directly via JAVA_HOME.
+      - name: Setup Java for CodeSignTool
+        if: steps.signing.outputs.enabled == 'true'
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '21'
+          architecture: aarch64
+
+      # Credential-free pinned download (matching Komac in jobs.winget).
+      - name: Install pinned CodeSignTool
+        id: codesigntool
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          CODESIGNTOOL_VERSION: '1.3.2'
+          CODESIGNTOOL_URL: 'https://github.com/SSLcom/CodeSignTool/releases/download/v1.3.2/CodeSignTool-v1.3.2.zip'
+          CODESIGNTOOL_SHA256: 'F14B1E1EF14BFA1FD00279C363AAB0DEBBF5DCFBA0E4BCDCE5D22BB771DE0E3A'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $archive = Join-Path $env:RUNNER_TEMP "CodeSignTool-v${env:CODESIGNTOOL_VERSION}.zip"
+          $dir = Join-Path $env:RUNNER_TEMP 'codesigntool'
+          Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+          Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+          Invoke-WebRequest -Uri $env:CODESIGNTOOL_URL -OutFile $archive
+          $actualSha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToUpperInvariant()
+          if ($actualSha256 -ne $env:CODESIGNTOOL_SHA256) {
+            Remove-Item -LiteralPath $archive -Force -ErrorAction SilentlyContinue
+            throw "CodeSignTool archive SHA-256 mismatch: expected $env:CODESIGNTOOL_SHA256, got $actualSha256"
+          }
+          Expand-Archive -LiteralPath $archive -DestinationPath $dir -Force
+          Remove-Item -LiteralPath $archive -Force
+          Remove-Item -LiteralPath (Join-Path $dir '__MACOSX') -Recurse -Force -ErrorAction SilentlyContinue
+          $jar = Join-Path $dir "jar\code_sign_tool-${env:CODESIGNTOOL_VERSION}.jar"
+          $conf = Join-Path $dir 'conf\code_sign_tool.properties'
+          if (-not (Test-Path -LiteralPath $jar -PathType Leaf)) { throw "CodeSignTool JAR not found: $jar" }
+          if (-not (Test-Path -LiteralPath $conf -PathType Leaf)) { throw "CodeSignTool config not found: $conf" }
+          "dir=$dir" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "jar=$jar" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      # Invoke CodeSignTool directly through java.exe (no cmd.exe wrapper).
+      # $CODE_SIGN_TOOL_PATH tells CodeSignTool where conf/code_sign_tool.properties
+      # lives, -Xmx4G prevents heap OOM on 200+ MB PE files like mlx-node.exe, and
+      # CodeSignTool can exit 0 on error so we also fail closed if any expected
+      # output file is missing or empty in $env:OUT_DIR.
+      - name: Sign the Windows binaries (SSL.com eSigner)
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          ES_USERNAME: ${{ secrets.ES_USERNAME }}
+          ES_PASSWORD: ${{ secrets.ES_PASSWORD }}
+          CREDENTIAL_ID: ${{ secrets.CREDENTIAL_ID }}
+          ES_TOTP_SECRET: ${{ secrets.ES_TOTP_SECRET }}
+          CODE_SIGN_TOOL_PATH: ${{ steps.codesigntool.outputs.dir }}
+          CODESIGNTOOL_JAR: ${{ steps.codesigntool.outputs.jar }}
+          IN_DIR: ${{ steps.collect.outputs.in }}
+          OUT_DIR: ${{ steps.collect.outputs.out }}
+          MAP: ${{ steps.collect.outputs.map }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandArgumentPassing = 'Standard'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:JAVA_HOME)) { throw 'JAVA_HOME is not set' }
+          $java = Join-Path $env:JAVA_HOME 'bin\java.exe'
+          if (-not (Test-Path -LiteralPath $java -PathType Leaf)) { throw "Java executable not found: $java" }
+          $toolArgs = @('-Xmx4G', '-jar', $env:CODESIGNTOOL_JAR)
+          $authArgs = @(
+            "-username=$env:ES_USERNAME",
+            "-password=$env:ES_PASSWORD",
+            "-credential_id=$env:CREDENTIAL_ID"
+          )
+          function Invoke-CodeSignTool([string[]] $commandArgs) {
+            $lines = @(& $java @toolArgs @commandArgs 2>&1 | ForEach-Object { $_.ToString() })
+            $exitCode = $LASTEXITCODE
+            $output = $lines -join "`n"
+            if ($output.Length -gt 0) { Write-Host $output }
+            return [pscustomobject]@{ ExitCode = $exitCode; Output = $output }
+          }
+          try {
+            # Query eSigner's scan policy first. When malware blocker is enabled
+            # (mandatory on many SSL.com credentials), batch_sign refuses any hash
+            # not pre-scanned via scan_code (hash-only, no binary upload, no OTP).
+            $scanRequired = $null
+            for ($attempt = 1; $attempt -le 3; $attempt += 1) {
+              $scanSettings = Invoke-CodeSignTool (@('get_scan_settings') + $authArgs)
+              if ($scanSettings.ExitCode -eq 0 -and $scanSettings.Output -match 'malware scan settings enabled:\s*(true|false)') {
+                $scanRequired = $Matches[1].ToLowerInvariant() -eq 'true'
+                break
+              }
+              if ($attempt -lt 3) {
+                Write-Warning "CodeSignTool get_scan_settings failed (attempt $attempt/3); retrying in 10s..."
+                Start-Sleep -Seconds 10
+              }
+            }
+            if ($null -eq $scanRequired) {
+              throw 'CodeSignTool get_scan_settings failed after 3 attempts'
+            }
+            if ($scanRequired) {
+              $files = @(Get-ChildItem -LiteralPath $env:IN_DIR -File | Sort-Object Name)
+              foreach ($file in $files) {
+                $scanned = $false
+                for ($attempt = 1; $attempt -le 3; $attempt += 1) {
+                  Write-Host "Malware scan ($attempt/3): $($file.Name)"
+                  $res = Invoke-CodeSignTool (@('scan_code') + $authArgs + @("-input_file_path=$($file.FullName)"))
+                  if ($res.Output -match 'code object is a malware') {
+                    throw "eSigner malware scanner rejected $($file.Name)"
+                  }
+                  if ($res.ExitCode -eq 0 -and $res.Output -match 'code object is not a malware\. You can proceed signing this code object') {
+                    $scanned = $true
+                    break
+                  }
+                  if ($attempt -lt 3) {
+                    Write-Warning "CodeSignTool scan_code for $($file.Name) did not confirm a clean scan (attempt $attempt/3); retrying in 10s..."
+                    Start-Sleep -Seconds 10
+                  }
+                }
+                if (-not $scanned) {
+                  throw "CodeSignTool scan_code failed for $($file.Name) after 3 attempts"
+                }
+              }
+            }
+            $batch = Invoke-CodeSignTool (@('batch_sign') + $authArgs + @(
+              "-totp_secret=$env:ES_TOTP_SECRET",
+              "-input_dir_path=$env:IN_DIR",
+              "-output_dir_path=$env:OUT_DIR"
+            ))
+            if ($batch.ExitCode -ne 0) { throw "CodeSignTool batch_sign failed with exit code $($batch.ExitCode)" }
+            if ($batch.Output -match '(?m)^\s*(Error|Exception)\b') {
+              throw 'CodeSignTool batch_sign reported an error (see above)'
+            }
+            $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
+            $missing = @()
+            foreach ($entry in $map) {
+              $signedCopy = Join-Path $env:OUT_DIR $entry.name
+              if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf) -or (Get-Item -LiteralPath $signedCopy).Length -eq 0) {
+                $missing += "$($entry.name) ($($entry.path))"
+              }
+            }
+            if ($missing.Count -gt 0) {
+              throw "CodeSignTool left missing or empty signed outputs in $($env:OUT_DIR):`n$($missing -join "`n")"
+            }
+          } finally {
+            if (-not [string]::IsNullOrWhiteSpace($env:CODE_SIGN_TOOL_PATH)) {
+              Remove-Item -LiteralPath (Join-Path $env:CODE_SIGN_TOOL_PATH 'logs') -Recurse -Force -ErrorAction SilentlyContinue
+            }
+          }
+
+      # Put every signed copy back under its real name and check with signtool
+      # (/pa /tw /v, no /a) that every PE file carries a valid, embedded,
+      # timestamped Authenticode signature (never relying on runner catalogs).
+      - name: Install and verify the signed Windows binaries
+        if: steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        env:
+          OUT_DIR: ${{ steps.collect.outputs.out }}
+          MAP: ${{ steps.collect.outputs.map }}
+          APP: ${{ steps.app.outputs.app }}
+          SIGNTOOL: ${{ steps.winenv.outputs.signtool }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if (-not (Test-Path -LiteralPath $env:SIGNTOOL -PathType Leaf)) { throw "signtool.exe not found: $env:SIGNTOOL" }
+          $map = Get-Content -LiteralPath $env:MAP -Raw | ConvertFrom-Json
+          foreach ($entry in $map) {
+            $signedCopy = Join-Path $env:OUT_DIR $entry.name
+            if (-not (Test-Path -LiteralPath $signedCopy -PathType Leaf)) { throw "eSigner returned no $($entry.name) for $($entry.path)" }
+            Copy-Item -LiteralPath $signedCopy -Destination $entry.path -Force
+          }
+          $bad = @()
+          $pe = @(Get-ChildItem -LiteralPath $env:APP -Recurse -File | Where-Object { $_.Extension -in '.exe', '.dll', '.node' })
+          if ($pe.Count -eq 0) { throw "Found no PE files under $env:APP" }
+          foreach ($file in $pe) {
+            $verifyOut = (@(& $env:SIGNTOOL verify /pa /tw /v $file.FullName 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+            $verifyExit = $LASTEXITCODE
+            if ($verifyExit -ne 0) {
+              Write-Host $verifyOut
+              $bad += "VerifyExit${verifyExit}: $($file.FullName)"
+            } elseif ($verifyOut -notmatch 'The signature is timestamped:') {
+              Write-Host $verifyOut
+              $bad += "NoTimestamp: $($file.FullName)"
+            }
+          }
+          if ($bad.Count -gt 0) { throw "Windows binaries without a valid, embedded, timestamped signature:`n$($bad -join "`n")" }
+          $exePath = Join-Path $env:APP 'mlx-node.exe'
+          if (-not (Test-Path -LiteralPath $exePath -PathType Leaf)) { throw "Missing signed executable: $exePath" }
+          $exe = Get-AuthenticodeSignature -LiteralPath $exePath
+          if ($null -eq $exe.SignerCertificate -or [string]::IsNullOrWhiteSpace($exe.SignerCertificate.Subject)) {
+            throw 'mlx-node.exe is missing a signer certificate subject'
+          }
+          Write-Host "mlx-node.exe signed by: $($exe.SignerCertificate.Subject)"
+          Write-Host "All $($pe.Count) PE files carry a valid, embedded, timestamped signature"
+
+      - name: Clean up temporary Windows signing files
+        if: always() && steps.signing.outputs.enabled == 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          foreach ($path in @(
+            (Join-Path $env:RUNNER_TEMP 'esigner'),
+            (Join-Path $env:RUNNER_TEMP 'codesigntool'),
+            (Join-Path $env:RUNNER_TEMP 'CodeSignTool-v1.3.2.zip')
+          )) {
+            Remove-Item -LiteralPath $path -Recurse -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Package Windows ARM64 (ZIP + MSIX)
+        id: package
+        shell: pwsh
+        env:
+          APP_VERSION: ${{ steps.version.outputs.version }}
+          APP: ${{ steps.app.outputs.app }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $argsList = @(
+            'oxnode', 'packages/desktop/scripts/package-windows.ts',
+            '--app-version', $env:APP_VERSION,
+            '--from-app', $env:APP
+          )
+          if ($env:SIGNED -eq 'true') { $argsList += '--signed' }
+          & yarn @argsList
           if ($LASTEXITCODE -ne 0) { throw 'Windows packaging failed.' }
           $resultPath = 'packages/desktop/out/windows-package-result.json'
           if (-not (Test-Path -LiteralPath $resultPath)) { throw "Packaging produced no $resultPath" }
           $result = Get-Content -LiteralPath $resultPath -Raw | ConvertFrom-Json
+          if ($env:SIGNED -eq 'true' -and $result.signed -ne $true) {
+            throw 'Expected signed Windows package result, got signed=false'
+          }
           if (-not (Test-Path -LiteralPath $result.appPath -PathType Container)) { throw "Missing packaged app: $($result.appPath)" }
           if (-not (Test-Path -LiteralPath $result.zipPath -PathType Leaf)) { throw "Missing Windows ZIP: $($result.zipPath)" }
           "app=$($result.appPath)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
