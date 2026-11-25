@@ -1453,7 +1453,9 @@ impl Inkling2Inner {
     /// Processes `CUDA_PREFILL_CHUNK = 1024` tokens per chunk (matching SWA `ring_cap = 2048`),
     /// skips LM head on intermediate chunks, evaluates KV + conv state cleanly between chunks so
     /// peak memory stays flat, and concatenates captured taps across chunks when `tap_visits` is
-    /// requested.
+    /// requested. When `tap_tail_limit` is `Some(max_rows)` (e.g. DFlash2's bounded sliding
+    /// window `sliding_window - 1`), chunks completely before `total_len - max_rows` skip tap
+    /// capture altogether and only the trailing `min(total_len, max_rows)` rows are retained.
     ///
     /// Returns `(last_logits, taps)` where `last_logits` has shape `[1, unpadded_vocab]` FP32.
     pub(crate) fn prefill_cuda_tokens(
@@ -1462,6 +1464,7 @@ impl Inkling2Inner {
         image_embeddings: Option<&MxArray>,
         cache: &mut Inkling2CudaCache,
         tap_visits: Option<&[usize]>,
+        tap_tail_limit: Option<usize>,
     ) -> Result<(MxArray, Vec<MxArray>)> {
         if prompt_tokens.is_empty() {
             return Err(Error::from_reason(
@@ -1536,22 +1539,40 @@ impl Inkling2Inner {
                 CudaLmHeadMode::Skip
             };
 
+            let tap_range = if want_taps {
+                chunk_tap_slice_range(offset, end, total_len, tap_tail_limit)
+            } else {
+                None
+            };
+            let chunk_tap_visits = tap_range.as_ref().and(tap_visits);
+
             let out = self.forward_cuda_ids_inner(
-                &ids_arr, splice, cache, tap_visits, None, false, lm_mode,
+                &ids_arr,
+                splice,
+                cache,
+                chunk_tap_visits,
+                None,
+                false,
+                lm_mode,
             )?;
 
-            if want_taps {
+            if let Some(ref range) = tap_range {
                 if tap_chunks.is_empty() {
                     tap_chunks.resize_with(out.taps.len(), Vec::new);
                 }
                 for (dst, tap) in tap_chunks.iter_mut().zip(out.taps) {
-                    dst.push(tap);
+                    let kept = if range.start > 0 {
+                        tap.slice_axis(0, range.start as i64, range.end as i64)?
+                    } else {
+                        tap
+                    };
+                    dst.push(kept);
                 }
             }
 
             if !is_last {
                 cache.eval_state()?;
-                if want_taps {
+                if tap_range.is_some() {
                     let tap_refs: Vec<&MxArray> =
                         tap_chunks.iter().filter_map(|v| v.last()).collect();
                     if !tap_refs.is_empty() {
@@ -1618,10 +1639,34 @@ impl Inkling2Inner {
             Some(c) => c,
             None => self.new_cuda_cache()?,
         };
-        let (logits, _) = self.prefill_cuda_tokens(prompt_tokens, None, &mut cache, None)?;
+        let (logits, _) = self.prefill_cuda_tokens(prompt_tokens, None, &mut cache, None, None)?;
         self.cuda_cache = Some(cache);
         Ok(logits)
     }
+}
+
+/// Compute the local row range `[local_start..chunk_len]` of a prefill chunk `[offset..end]`
+/// that falls within the trailing `tap_tail_limit` rows of a `total_len`-token prefill.
+///
+/// Returns `None` when the chunk lies completely before the retained tail so tap capture
+/// can be skipped altogether for earlier chunks.
+#[inline]
+fn chunk_tap_slice_range(
+    offset: usize,
+    end: usize,
+    total_len: usize,
+    tap_tail_limit: Option<usize>,
+) -> Option<std::ops::Range<usize>> {
+    let tap_start = match tap_tail_limit {
+        Some(limit) => total_len.saturating_sub(limit),
+        None => 0,
+    };
+    if end <= tap_start {
+        return None;
+    }
+    let local_start = tap_start.saturating_sub(offset);
+    let chunk_len = end - offset;
+    (local_start < chunk_len).then_some(local_start..chunk_len)
 }
 
 #[cfg(test)]
@@ -1784,5 +1829,52 @@ mod tests {
         let mut zero_window = base.clone();
         zero_window.sliding_window = 0;
         assert!(!cuda_fast_config_supported(&zero_window));
+    }
+
+    #[test]
+    fn chunk_tap_slice_range_bounds_dflash2_tail_and_preserves_full_dspark() {
+        // 10,000-token prompt chunked by 1024 with DFlash2 ring_rows = 2047 (tap_start = 7953).
+        let total_len = 10_000usize;
+        let ring_rows = 2047usize;
+        let mut retained = Vec::new();
+        let mut offset = 0usize;
+        let mut skipped_chunks = 0usize;
+        while offset < total_len {
+            let end = (offset + CUDA_PREFILL_CHUNK).min(total_len);
+            match chunk_tap_slice_range(offset, end, total_len, Some(ring_rows)) {
+                None => skipped_chunks += 1,
+                Some(r) => {
+                    for local in r {
+                        retained.push(offset + local);
+                    }
+                }
+            }
+            offset = end;
+        }
+        // Chunks 0..7 ([0..7168]) lie completely before tap_start=7953 -> skipped.
+        assert_eq!(skipped_chunks, 7);
+        assert_eq!(retained.len(), ring_rows);
+        assert_eq!(retained.first().copied(), Some(total_len - ring_rows));
+        assert_eq!(retained.last().copied(), Some(total_len - 1));
+
+        // DSpark (`None`) keeps every row across all chunks.
+        let mut full_rows = 0usize;
+        let mut off = 0usize;
+        while off < total_len {
+            let end = (off + CUDA_PREFILL_CHUNK).min(total_len);
+            let r = chunk_tap_slice_range(off, end, total_len, None)
+                .expect("unbounded capture must keep every chunk");
+            assert_eq!(r, 0..(end - off));
+            full_rows += r.len();
+            off = end;
+        }
+        assert_eq!(full_rows, total_len);
+
+        // Short prompt (< ring_rows) keeps all rows; zero limit skips all chunks.
+        assert_eq!(
+            chunk_tap_slice_range(0, 500, 500, Some(ring_rows)),
+            Some(0..500)
+        );
+        assert_eq!(chunk_tap_slice_range(0, 500, 500, Some(0)), None);
     }
 }

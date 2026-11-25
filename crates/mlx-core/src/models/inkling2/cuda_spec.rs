@@ -1820,22 +1820,31 @@ impl FlatDsparkBackend for Inkling2Inner {
             self.cuda_cache = None;
             return Err(Error::from_reason("prefill cancelled"));
         }
-        let tap_visits: Vec<usize> = if let Some(ref draft) = self.dflash2 {
-            draft.config.target_layers.clone()
-        } else if let Some(ref draft) = self.dspark {
-            draft.config.target_layer_ids.clone()
-        } else {
-            return Err(Error::from_reason(
-                "Inkling2 CUDA speculative prefill: no draft model loaded",
-            ));
-        };
+        let (tap_visits, tap_tail_limit): (Vec<usize>, Option<usize>) =
+            if let Some(ref draft) = self.dflash2 {
+                (
+                    draft.config.target_layers.clone(),
+                    Some(draft.config.sliding_window.saturating_sub(1)),
+                )
+            } else if let Some(ref draft) = self.dspark {
+                (draft.config.target_layer_ids.clone(), None)
+            } else {
+                return Err(Error::from_reason(
+                    "Inkling2 CUDA speculative prefill: no draft model loaded",
+                ));
+            };
 
         let mut cache = match self.cuda_cache.take() {
             Some(c) => c,
             None => self.new_cuda_cache()?,
         };
-        let (logits_2d, taps) =
-            self.prefill_cuda_tokens(&prefix.prefill_tokens, None, &mut cache, Some(&tap_visits))?;
+        let (logits_2d, taps) = self.prefill_cuda_tokens(
+            &prefix.prefill_tokens,
+            None,
+            &mut cache,
+            Some(&tap_visits),
+            tap_tail_limit,
+        )?;
         if self.is_turn_cancelled() {
             return Err(Error::from_reason("prefill cancelled"));
         }
@@ -1859,12 +1868,13 @@ impl FlatDsparkBackend for Inkling2Inner {
                 let d = self.config.hidden_size as i64;
                 let mut taps_3d = Vec::with_capacity(taps.len());
                 for tap in &taps {
-                    let sliced = if skip > 0 {
-                        tap.slice(&[skip as i64, 0], &[n as i64, d])?
-                    } else {
-                        tap.clone()
-                    };
-                    taps_3d.push(sliced.reshape(&[1, keep as i64, d])?);
+                    let rows = tap.shape_at(0)? as usize;
+                    if rows != keep {
+                        return Err(Error::from_reason(format!(
+                            "Inkling2 CUDA DFlash2 prefill tap row count mismatch: got {rows}, expected {keep}"
+                        )));
+                    }
+                    taps_3d.push(tap.reshape(&[1, keep as i64, d])?);
                 }
                 let fused = draft.fuse_context(&taps_3d)?;
                 let base = (prefix.cached_prefix_len + skip) as i32;
@@ -2468,7 +2478,7 @@ mod tests {
         let mut cache = inner.new_cuda_cache().unwrap();
         assert_eq!(cache.pos_offset, 0);
         let err = inner
-            .prefill_cuda_tokens(&[1, 2, 3], None, &mut cache, None)
+            .prefill_cuda_tokens(&[1, 2, 3], None, &mut cache, None, None)
             .err()
             .expect("pre-cancelled prefill_cuda_tokens must fail");
         assert!(

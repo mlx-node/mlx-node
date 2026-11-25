@@ -5616,8 +5616,13 @@ impl ChatBackend for Inkling2Inner {
                 self.cached_token_history.clear();
                 self.cached_image_key = None;
                 let mut cache = self.new_cuda_cache()?;
-                let (logits_2d, _) =
-                    self.prefill_cuda_tokens(&expanded_tokens, all_emb.as_ref(), &mut cache, None)?;
+                let (logits_2d, _) = self.prefill_cuda_tokens(
+                    &expanded_tokens,
+                    all_emb.as_ref(),
+                    &mut cache,
+                    None,
+                    None,
+                )?;
                 self.cuda_cache = Some(cache);
                 logits_2d.squeeze(Some(&[0]))?
             } else {
