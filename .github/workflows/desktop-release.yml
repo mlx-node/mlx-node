@@ -13,7 +13,8 @@ name: Desktop Release
 # notarization secrets exist — which matters, because notarization is the step with
 # the slowest feedback loop and the least reproducible failures.
 #
-# Required secrets:
+# Required secrets (stored in the protected `desktop-release` GitHub Environment,
+# restricted to `v*` tags and `main` so feature/PR branches cannot read them):
 #   CSC_LINK                     base64 of the Developer ID Application .p12
 #   CSC_KEY_PASSWORD             its export password
 #   APPLE_TEAM_ID                10-char Team ID
@@ -87,6 +88,7 @@ jobs:
     # Install CUDA 13.4 + cuDNN 9 on GitHub-hosted windows-11-arm (matching
     # mlx-prebuilt.yml); no GPU is required. No Apple signing secrets are used.
     runs-on: windows-11-arm
+    environment: desktop-release
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
@@ -748,6 +750,7 @@ jobs:
   macos:
     name: Package and sign macOS ARM64
     runs-on: macos-26
+    environment: desktop-release
     outputs:
       commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
@@ -1150,6 +1153,7 @@ jobs:
     name: Publish desktop release
     needs: [windows, macos]
     runs-on: ubuntu-latest
+    environment: desktop-release
     outputs:
       version: ${{ steps.verify.outputs.version }}
       release_tag: ${{ steps.verify.outputs.release_tag }}
@@ -1415,6 +1419,7 @@ jobs:
     name: Submit WinGet update
     needs: [windows, publish]
     runs-on: ubuntu-latest
+    environment: desktop-release
     if: always() && needs.publish.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.publish.outputs.version, '-') && !contains(needs.publish.outputs.version, '+')
     permissions:
       contents: read
