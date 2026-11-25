@@ -234,29 +234,25 @@ export function applyServerThinking(
   config: ChatConfig,
   server: ServerThinking | undefined,
   modelFamily?: ChatFamilyId,
+  modelDefaultBudget?: number,
 ): { config: ChatConfig; from: TurnBudgetFrom | undefined } {
   const own = config.thinkingTokenBudget !== undefined;
-  const effortBudget = own ? undefined : defaultThinkingBudgetForEffort(modelFamily, config.reasoningEffort);
-  // Effort `none` disables thinking on template-honoring families and caps
-  // LFM2/Muse-Glimmer at 0 tokens; skip server thinking options unless the
-  // family still thinks on `none` (K2-Horizon normalizes `none`→`low`=256).
-  if (
-    server === undefined ||
-    (config.reasoningEffort === 'none' && !(effortBudget !== undefined && effortBudget > 0))
-  ) {
+  if (server === undefined || config.reasoningEffort === 'none') {
     return { config, from: own ? 'request' : undefined };
   }
+  const effortBudget = own ? undefined : defaultThinkingBudgetForEffort(modelFamily, config.reasoningEffort);
   const serverBudget = server.tokenBudget;
-  // Apply the effort-derived minimum only when the host actually configured a
-  // thinking token cap; with no host cap, leave `thinkingTokenBudget` absent
-  // from the request overlay so per-model `samplingDefaults` or native
-  // `AlwaysOnBudgetFromEffort` resolves the budget directly.
+  // Apply the host cap as an upper bound over any operator-configured per-model
+  // budget first, then over any family effort default (`AlwaysOnBudgetFromEffort`).
+  // When `server.tokenBudget` is unset, leave `thinkingTokenBudget` absent from
+  // the request overlay so `samplingDefaults` or native policy resolves it directly.
+  const baseBudget = modelDefaultBudget ?? effortBudget;
   const resolvedBudget = own
     ? config.thinkingTokenBudget
     : serverBudget === undefined
       ? undefined
-      : effortBudget !== undefined
-        ? Math.min(effortBudget, serverBudget)
+      : baseBudget !== undefined
+        ? Math.min(baseBudget, serverBudget)
         : serverBudget;
   const budget = !own && resolvedBudget !== undefined;
   const zeroBudget = resolvedBudget === 0;
@@ -271,8 +267,10 @@ export function applyServerThinking(
     ? 'request'
     : !budget
       ? undefined
-      : effortBudget !== undefined && serverBudget !== undefined && effortBudget <= serverBudget
-        ? 'request'
+      : baseBudget !== undefined && serverBudget !== undefined && baseBudget <= serverBudget
+        ? modelDefaultBudget !== undefined
+          ? undefined
+          : 'request'
         : 'server';
   return { config: out, from };
 }
@@ -1362,11 +1360,22 @@ export async function handleCreateMessage(
   }
   const baseMappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
   // Pre-load quarantine fingerprint stays independent of whether the target
-  // model is already loaded (retries after a crash must match before load).
+  // model is already loaded (retries after a crash must match before load),
+  // while distinguishing client-supplied budgets from host-injected defaults
+  // so `low` (no explicit budget → 256 on LFM2) and explicit `budget_tokens: 12000`
+  // do not collide in quarantine.
   const preflightThinking = applyServerThinking(baseMappedConfig, serverThinking);
   mappedConfig = preflightThinking.config;
   const turnFingerprint =
-    turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
+    turnJournal === undefined
+      ? null
+      : requestFingerprint(
+          body.model,
+          mappedMessages,
+          preflightThinking.from !== undefined
+            ? ({ ...mappedConfig, thinkingBudgetFrom: preflightThinking.from } as ChatConfig)
+            : mappedConfig,
+        );
   // Splash `_admit`: refused before admission and before any model load or swap.
   if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
     sendAnthropicError(res, 400, 'invalid_request_error', QUARANTINE_MESSAGE);
@@ -1605,7 +1614,12 @@ export async function handleCreateMessage(
     // canonical family so `AlwaysOnBudgetFromEffort` families (LFM2,
     // Muse-Glimmer, K2-Horizon) keep their 256-token `low` cap instead of
     // having the host's 12,000-token safety cap override it.
-    const thinking = applyServerThinking(baseMappedConfig, serverThinking, lease.modelFamily);
+    const thinking = applyServerThinking(
+      baseMappedConfig,
+      serverThinking,
+      lease.modelFamily,
+      sessionReg.defaultSamplingConfig?.thinkingTokenBudget,
+    );
     mappedConfig = applyOutputTokenLimit(thinking.config, sessionReg.outputTokenLimit);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike

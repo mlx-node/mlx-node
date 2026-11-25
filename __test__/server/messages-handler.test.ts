@@ -7926,7 +7926,8 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       });
     }
 
-    // K2HorizonModel: `low` and `none` (always-think, normalizes to low) get 256; tighter host cap bounds both.
+    // K2HorizonModel: `low` gets 256 (bounded by tighter host cap); `thinking.type: disabled`
+    // (`reasoning_effort: none`) preserves a registered per-model zero budget instead of injecting 256.
     expect(await runFor('K2HorizonModel', { extra_body: { reasoning_effort: 'low' } }, host)).toEqual({
       budget: 256,
       guard: true,
@@ -7936,7 +7937,7 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
     expect(
       await runFor(
         'K2HorizonModel',
-        { extra_body: { reasoning_effort: 'none' } },
+        { extra_body: { reasoning_effort: 'low' } },
         { tokenBudget: 100, cycleGuard: true },
       ),
     ).toEqual({
@@ -7944,6 +7945,23 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       guard: true,
       endText: undefined,
       from: 'server',
+    });
+    expect(
+      await runFor('K2HorizonModel', { thinking: { type: 'disabled' } }, host, { thinkingTokenBudget: 0 }),
+    ).toEqual({
+      budget: 0,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+    // Per-model default budget (e.g. 64) also stays below the 256 effort default under a 12,000 host cap.
+    expect(
+      await runFor('Lfm2Model', { extra_body: { reasoning_effort: 'low' } }, host, { thinkingTokenBudget: 64 }),
+    ).toEqual({
+      budget: 64,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: undefined,
     });
 
     // Tighter host cap (100 < 256) acts as an upper bound; 0 disables cycleGuard & endText.
@@ -8005,6 +8023,48 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       endText: undefined,
       from: undefined,
     });
+
+    // Crash quarantine fingerprints distinguish client-supplied budget_tokens: 12000
+    // from host-injected 12000 (which dispatches as 256 on LFM2 `low`), and stay
+    // identical across cold (pre-load) and resident dispatch.
+    const seenKeys: string[] = [];
+    const journal = {
+      refuses: vi.fn((fp: string) => {
+        seenKeys.push(fp);
+        return false;
+      }),
+      begin: vi.fn(() => () => {}),
+    } as never;
+    const coldRegistry = new ModelRegistry();
+    const baseModel = createMockModel();
+    const lfm2 = Object.assign(Object.create({ constructor: { name: 'Lfm2Model' } }), baseModel) as typeof baseModel;
+    const sendWithJournal = async (extra: Record<string, unknown>, lazyLoad: boolean): Promise<void> => {
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'lfm2', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        coldRegistry,
+        undefined,
+        undefined,
+        lazyLoad
+          ? async () => {
+              coldRegistry.register('lfm2', lfm2);
+            }
+          : undefined,
+        undefined,
+        host,
+        journal,
+      );
+    };
+    await sendWithJournal({ extra_body: { reasoning_effort: 'low' } }, true);
+    await sendWithJournal({ extra_body: { reasoning_effort: 'low' } }, false);
+    await sendWithJournal(
+      { extra_body: { reasoning_effort: 'low' }, thinking: { type: 'enabled', budget_tokens: 12_000 } },
+      false,
+    );
+    expect(seenKeys).toHaveLength(3);
+    expect(seenKeys[0]).toBe(seenKeys[1]);
+    expect(seenKeys[0]).not.toBe(seenKeys[2]);
   });
 
   // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function

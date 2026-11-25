@@ -1789,7 +1789,7 @@ export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_ED
  * both fit in it.
  */
 export async function stopServe(child: ChildProcess, signal: NodeJS.Signals, graceMs = STOP_MS): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.exitCode != null || child.signalCode != null) return;
   const exited = new Promise<void>((resolvePromise) => child.once('exit', () => resolvePromise()));
   child.kill(signal);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1826,6 +1826,7 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   // signal then must not leave serve holding the model.
   let serveChild: ChildProcess | undefined;
   let agent: ChildProcess | undefined;
+  let agentStopping: Promise<void> | undefined;
   let tearingDown: Promise<void> | undefined;
   const removeHandlers = (): void => {
     process.removeListener('SIGINT', forward);
@@ -1839,7 +1840,8 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       return;
     }
     tearingDown = (async () => {
-      agent?.kill(signal);
+      if (agentStopping) await agentStopping;
+      else agent?.kill(signal);
       if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs);
       removeHandlers();
       process.kill(process.pid, signal);
@@ -1891,39 +1893,29 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     agent = spawnedAgent;
     let agentSettled = false;
     let serveCrashed = false;
-    let agentKillTimer: ReturnType<typeof setTimeout> | undefined;
     const onServeExit = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
       if (tearingDown || agentSettled) return;
       serveCrashed = true;
       const reason = signal ? `signal ${signal}` : `code ${exitCode ?? 'unknown'}`;
       console.error(`[mlx] inference server (mlx serve) exited unexpectedly (${reason}); stopping agent.`);
-      spawnedAgent.kill('SIGTERM');
-      agentKillTimer = setTimeout(() => {
-        if (!agentSettled && spawnedAgent.exitCode == null && spawnedAgent.signalCode == null) {
-          spawnedAgent.kill('SIGKILL');
-        }
-      }, opts.serveStopGraceMs ?? STOP_MS);
-      agentKillTimer.unref?.();
+      agentStopping = stopServe(spawnedAgent, 'SIGTERM', opts.serveStopGraceMs);
     };
     serveChild?.once('exit', onServeExit);
     try {
       code = await new Promise<number>((resolvePromise, reject) => {
         spawnedAgent.once('exit', (c, signal) => {
           agentSettled = true;
-          clearTimeout(agentKillTimer);
           resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1));
         });
         // A spawn failure emits 'error' with no 'exit' — rejecting routes it
         // through the same teardown so the serve child is never orphaned.
         spawnedAgent.once('error', (err) => {
           agentSettled = true;
-          clearTimeout(agentKillTimer);
           reject(err);
         });
       });
       if (serveCrashed && code === 0) code = 1;
     } finally {
-      clearTimeout(agentKillTimer);
       serveChild?.removeListener('exit', onServeExit);
     }
   } finally {
