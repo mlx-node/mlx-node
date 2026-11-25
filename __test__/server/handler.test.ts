@@ -10467,6 +10467,102 @@ describe('createHandler', () => {
       expect(parsed.data[0].id).toBe('model-a');
       expect(parsed.data[1].id).toBe('model-b');
     });
+
+    it('serializes reasoning_efforts for known chat families and omits it when unsupported', async () => {
+      const registry = new ModelRegistry();
+      registry.register('Qwen3.8-27B-UD-Q4_K_XL', createMockModel(), {
+        identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
+      });
+      registry.register('k2-horizon', createMockModel(), {
+        identity: { modelId: 'k2-horizon', modelType: 'k2_horizon', contextWindow: 524288 },
+      });
+      registry.register('plain-mock', createMockModel());
+
+      const handler = createHandler(registry);
+      const req = createMockReq('GET', '/v1/models');
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody()) as {
+        object: string;
+        data: Array<{ id: string; owned_by: string; model_family?: string; reasoning_efforts?: unknown }>;
+      };
+      const byId = new Map(parsed.data.map((row) => [row.id, row]));
+
+      expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
+        owned_by: 'mlx-node',
+        model_family: 'qwen3_5',
+        reasoning_efforts: [
+          { value: 'none', label: 'Off' },
+          { value: 'low', label: 'Low' },
+          { value: 'medium', label: 'Medium' },
+          { value: 'high', label: 'High', default: true },
+          { value: 'xhigh', label: 'X-High' },
+        ],
+      });
+      expect(byId.get('k2-horizon')).toMatchObject({
+        owned_by: 'mlx-node',
+        model_family: 'k2_horizon',
+        reasoning_efforts: [
+          { value: 'low', label: 'Low' },
+          { value: 'medium', label: 'Medium' },
+          { value: 'high', label: 'High', default: true },
+        ],
+      });
+      expect('reasoning_efforts' in byId.get('plain-mock')!).toBe(false);
+    });
+
+    it('forwards reasoning_efforts from custom listModels (swap controller) over GET /v1/models', async () => {
+      const registry = new ModelRegistry();
+      const handler = createHandler(registry, {
+        listModels: () => [
+          {
+            id: 'Qwen3.8-27B-UD-Q4_K_XL',
+            object: 'model',
+            created: 1,
+            owned_by: 'mlx-node',
+            api_backend: 'messages',
+            model_family: 'qwen3_5',
+            reasoning_efforts: [
+              { value: 'none', label: 'Off' },
+              { value: 'low', label: 'Low' },
+              { value: 'medium', label: 'Medium' },
+              { value: 'high', label: 'High', default: true },
+              { value: 'xhigh', label: 'X-High' },
+            ],
+          },
+          {
+            id: 'clef-decision',
+            object: 'model',
+            created: 1,
+            owned_by: 'mlx-node',
+            api_backend: 'messages',
+            model_family: 'clef',
+          },
+        ],
+      });
+
+      const req = createMockReq('GET', '/v1/models');
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await handler(req, res);
+      await waitForEnd();
+
+      expect(getStatus()).toBe(200);
+      const parsed = JSON.parse(getBody()) as {
+        data: Array<{ id: string; reasoning_efforts?: unknown }>;
+      };
+      expect(parsed.data[0]?.reasoning_efforts).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High', default: true },
+        { value: 'xhigh', label: 'X-High' },
+      ]);
+      expect('reasoning_efforts' in parsed.data[1]!).toBe(false);
+    });
   });
 
   describe('routing', () => {

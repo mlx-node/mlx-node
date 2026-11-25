@@ -3787,9 +3787,7 @@ impl Inkling2StateStore {
             .iter()
             .filter_map(|(&id, &kind)| {
                 let entry = self.store.get(id)?;
-                if entry.ram().is_none() {
-                    return None;
-                }
+                entry.ram()?;
                 if !kind.is_in_place() && entry.disk().is_some() {
                     return None;
                 }

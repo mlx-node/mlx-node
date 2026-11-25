@@ -593,10 +593,8 @@ impl DFlash2ContextCache {
         }
 
         let per_lane_kv = model.project_context_batched(fused_all, &segments)?;
-        for (((cache, token_ids), &(base, keep)), kv) in lanes
-            .iter_mut()
-            .zip(segments.iter())
-            .zip(per_lane_kv.into_iter())
+        for (((cache, token_ids), &(base, keep)), kv) in
+            lanes.iter_mut().zip(segments.iter()).zip(per_lane_kv)
         {
             cache.append_projected(
                 ProjectedContext {

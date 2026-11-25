@@ -11386,9 +11386,7 @@ pub(super) mod tests {
         // Build a 40-token expanded multimodal prompt (>= 1 full 32-token block) containing
         // 4 IMAGE_PAD_ID placeholders at positions 4..8 inside block 0.
         let mut expanded_tokens: Vec<u32> = (100..140).collect();
-        for pos in 4..8 {
-            expanded_tokens[pos] = IMAGE_PAD_ID;
-        }
+        expanded_tokens[4..8].fill(IMAGE_PAD_ID);
         let img_a: Vec<Vec<u8>> = vec![b"image-A-bytes".to_vec()];
         let img_b: Vec<Vec<u8>> = vec![b"image-B-bytes".to_vec()];
         let (key_a, digests_a) = crate::engine::compute_image_cache_keys(&img_a);

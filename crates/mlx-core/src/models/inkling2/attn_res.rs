@@ -1059,10 +1059,10 @@ mod tests {
             .unwrap();
 
         let gain_vals: Vec<f32> = (0..(d * r) as usize)
-            .map(|i| 0.123456789 + (i as f32) * 0.0001379)
+            .map(|i| 0.1234568 + (i as f32) * 0.0001379)
             .collect();
         let forget_vals: Vec<f32> = (0..(d * r) as usize)
-            .map(|i| -0.098765432 + (i as f32) * 0.0002713)
+            .map(|i| -0.0987654 + (i as f32) * 0.0002713)
             .collect();
         let gain_f32 = MxArray::from_float32(&gain_vals, &[d, r]).unwrap();
         let forget_f32 = MxArray::from_float32(&forget_vals, &[d, r]).unwrap();

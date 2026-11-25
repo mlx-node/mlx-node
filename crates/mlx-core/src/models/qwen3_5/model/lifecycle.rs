@@ -1467,10 +1467,23 @@ impl Qwen35Inner {
     }
 
     pub(super) fn invalidate_dense_paged_session(&mut self, context: &str) {
-        tracing::warn!(
-            target: "mlx_core::qwen3_5::paged",
-            "invalidating dense paged session after {context}",
-        );
+        if context == "generic paged turn abort" {
+            // `PagedBackend::abort_paged_turn` runs on expected load-time
+            // warmup and client cancellations as well as error paths (where
+            // the failing caller already surfaces the underlying error);
+            // keep it at `debug!` while adapter release errors inside
+            // `discard_dense_paged_session` and explicit failure contexts
+            // remain `warn!`.
+            tracing::debug!(
+                target: "mlx_core::qwen3_5::paged",
+                "invalidating dense paged session after {context}",
+            );
+        } else {
+            tracing::warn!(
+                target: "mlx_core::qwen3_5::paged",
+                "invalidating dense paged session after {context}",
+            );
+        }
         self.discard_dense_paged_session();
     }
 

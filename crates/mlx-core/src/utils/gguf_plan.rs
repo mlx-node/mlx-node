@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::gguf::{
     GGUF_RUNTIME_ASSET_FILES, GgufFile, GgufMetaValue, GgufTensorType,
@@ -465,15 +465,35 @@ pub(crate) fn plan_gguf_import(
         }
         config = Some(config_json);
 
+        let has_embedded_gpt2_tokenizer = matches!(
+            gguf.metadata.get("tokenizer.ggml.model"),
+            Some(GgufMetaValue::String(model)) if model == "gpt2"
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.tokens"),
+            Some(GgufMetaValue::ArrayString(_))
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.token_type"),
+            Some(GgufMetaValue::ArrayI32(_))
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.merges"),
+            Some(GgufMetaValue::ArrayString(_))
+        );
         for &filename in GGUF_RUNTIME_ASSET_FILES {
             let src = asset_dir.join(filename);
             if src.exists() {
                 asset_copies.push((src, filename));
             } else if matches!(filename, "tokenizer.json" | "tokenizer_config.json") {
-                warn!(
-                    "{filename} not found in asset source directory {}. You may need to download it separately.",
-                    asset_dir.display()
-                );
+                if has_embedded_gpt2_tokenizer {
+                    debug!(
+                        "{filename} not found in asset source directory {}; will reconstruct from embedded GGUF tokenizer metadata.",
+                        asset_dir.display()
+                    );
+                } else {
+                    warn!(
+                        "{filename} not found in asset source directory {}. You may need to download it separately.",
+                        asset_dir.display()
+                    );
+                }
             }
         }
     }
@@ -2062,9 +2082,11 @@ mod tests {
         // config.json never drops the explicit `mxfp8` profile for skipped packed tensors.
         let mut attn_q_gguf = gguf;
         attn_q_gguf.tensors[0].name = "blk.0.attn_q.weight".to_string();
-        let mut q_opts = ImportOptions::default();
-        q_opts.quantize = true;
-        q_opts.native_qwen35_layout = true;
+        let q_opts = ImportOptions {
+            quantize: true,
+            native_qwen35_layout: true,
+            ..ImportOptions::default()
+        };
         let q_err = plan_gguf_import(
             &attn_q_gguf,
             Path::new("qwen35.gguf"),

@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  CHAT_FAMILY_IDS,
   detectModelType,
   Gemma4Model,
   Inkling2Model,
   loadModel,
   loadSession,
   MuseGlimmerModel,
+  NON_GENERATIVE_FAMILY_IDS,
   Qwen35Model,
+  reasoningEffortsFor,
   type ModelType,
 } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -297,5 +300,29 @@ describe('declarative model loader registry', () => {
 
     await writeConfig({ model_type: 42, text_config: { model_type: 'inkling2_loop_text' } });
     await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "42" in ${tempDir}/config.json`);
+  });
+
+  it('defines valid reasoningEfforts for every chat family and omits them for non-generative or unknown families', () => {
+    const allowedValues = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+    for (const familyId of CHAT_FAMILY_IDS) {
+      const efforts = reasoningEffortsFor(familyId);
+      expect(efforts, familyId).toBeDefined();
+      expect(efforts!.length, familyId).toBeGreaterThanOrEqual(2);
+      const values = efforts!.map((option) => option.value);
+      expect(new Set(values).size, familyId).toBe(values.length);
+      for (const option of efforts!) {
+        expect(allowedValues.has(option.value), `${familyId}:${option.value}`).toBe(true);
+        expect(option.label.length, `${familyId}:${option.value}`).toBeGreaterThan(0);
+      }
+      const defaults = efforts!.filter((option) => option.default === true);
+      expect(defaults, `${familyId} must mark exactly one default effort`).toHaveLength(1);
+    }
+
+    for (const familyId of NON_GENERATIVE_FAMILY_IDS) {
+      expect(reasoningEffortsFor(familyId), familyId).toBeUndefined();
+    }
+    expect(reasoningEffortsFor('unknown_family')).toBeUndefined();
+    expect(reasoningEffortsFor('')).toBeUndefined();
   });
 });

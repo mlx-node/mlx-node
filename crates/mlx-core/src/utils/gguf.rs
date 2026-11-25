@@ -1390,9 +1390,9 @@ pub(crate) fn is_gather_only_mxfp8(tensor: &GgufTensorInfo) -> bool {
 /// into MLX `mxfp8` layout: 8 little-endian `u32` words (32 sequential OCP FP8
 /// E4M3FN bytes) and the verbatim E8M0 scale byte.
 pub(crate) fn mxfp8_repack_block(block: &[u8], words: &mut [u32; 8]) -> u8 {
-    for j in 0..8 {
+    for (j, word) in words.iter_mut().enumerate() {
         let off = 1 + j * 4;
-        words[j] = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
+        *word = u32::from_le_bytes([block[off], block[off + 1], block[off + 2], block[off + 3]]);
     }
     block[0]
 }

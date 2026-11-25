@@ -1402,7 +1402,7 @@ mod tests {
                 let mut blk = [0u8; 33];
                 blk[0] = 123 + ((b + seed) % 4) as u8; // E8M0 scale ~ 2^-4..2^-1
                 for j in 0..32 {
-                    let sign = if (b + j + seed) % 3 == 0 {
+                    let sign = if (b + j + seed).is_multiple_of(3) {
                         0x80u8
                     } else {
                         0x00u8

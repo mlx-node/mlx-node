@@ -187,6 +187,7 @@ export {
   QWEN4_EXP_SAMPLING_DEFAULTS,
   QWEN_SAMPLING_DEFAULTS,
   rawModelTypeToCanonical,
+  reasoningEffortsFor,
   validateFamilyLoadOptions,
   type ChatFamilyId,
   type FamilyLoadOptionFlag,
@@ -199,6 +200,8 @@ export {
   type ModelFamilyData,
   type ModelFamilyKind,
   type ModelType,
+  type ReasoningEffortLevel,
+  type ReasoningEffortOption,
   type TrainableFamilyId,
 } from './family-data.js';
 

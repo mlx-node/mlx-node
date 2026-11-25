@@ -98,6 +98,7 @@ pub struct DecodeProfiler {
     /// first token belongs to TTFT.
     num_tokens: u64,
     prompt_tokens: u32,
+    first_prefill_start: Option<Instant>,
     prefill_start: Option<Instant>,
     prefill_ms: f64,
     first_token_time: Option<Instant>,
@@ -171,6 +172,7 @@ impl DecodeProfiler {
             loop_start: enabled.then(Instant::now),
             num_tokens: 0,
             prompt_tokens: 0,
+            first_prefill_start: None,
             prefill_start: None,
             prefill_ms: 0.0,
             first_token_time: None,
@@ -208,26 +210,39 @@ impl DecodeProfiler {
         self.prompt_tokens = n;
     }
 
-    /// Start timing the prefill phase.
+    /// Start timing a prefill slice.
+    ///
+    /// Multi-slice scheduled turns call `begin_prefill` / `end_prefill` once per
+    /// chunk: `first_prefill_start` stays pinned to the first slice so `ttft_ms`
+    /// measures full wall time from prefill entry to the first emitted token,
+    /// while `prefill_ms` accumulates every slice before the first token.
     #[inline]
     pub fn begin_prefill(&mut self) {
-        if !self.enabled {
+        if !self.enabled || self.first_token_marked {
             return;
         }
-        self.prefill_start = Some(Instant::now());
+        let now = Instant::now();
+        self.first_prefill_start.get_or_insert(now);
+        self.prefill_start = Some(now);
     }
 
-    /// End timing the prefill phase.
+    /// End timing the current prefill slice and accumulate its duration into
+    /// `prefill_ms`.
     #[inline]
     pub fn end_prefill(&mut self) {
         if !self.enabled {
             return;
         }
+        if self.first_token_marked {
+            self.prefill_start = None;
+            return;
+        }
+        let now = Instant::now();
         if let Some(start) = self.prefill_start.take() {
-            self.prefill_ms = start.elapsed().as_secs_f64() * 1000.0;
+            self.prefill_ms += now.saturating_duration_since(start).as_secs_f64() * 1000.0;
         }
         // Reset loop_start to measure decode time from here
-        self.loop_start = Some(Instant::now());
+        self.loop_start = Some(now);
     }
 
     /// Take a memory snapshot before generation.
@@ -580,10 +595,12 @@ impl DecodeProfiler {
         let ttft_ms = self
             .first_token_time
             .map(|t| {
-                // TTFT = prefill time + time from decode loop start to first token
-                let from_loop_start =
-                    t.saturating_duration_since(loop_start).as_secs_f64() * 1000.0;
-                self.prefill_ms + from_loop_start
+                // TTFT measures wall time from the first prefill slice start
+                // (or decode loop start when no prefill slice ran) to the first
+                // emitted token, so multi-slice prefills include all slices and
+                // any inter-slice scheduling/sync gaps.
+                let origin = self.first_prefill_start.unwrap_or(loop_start);
+                t.saturating_duration_since(origin).as_secs_f64() * 1000.0
             })
             .unwrap_or(0.0);
         let total_ms = if self.first_token_time.is_some() {
@@ -1538,6 +1555,121 @@ mod tests {
             assert_eq!(p2.label, "gen2");
             assert_eq!(p2.num_tokens, 10);
             assert_eq!(p2.prompt_tokens, 20);
+        });
+    }
+
+    #[test]
+    fn test_multi_slice_prefill_accumulates_prefill_ms_and_ttft_from_first_slice() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_multi_slice_prefill", "qwen3_5");
+
+            // Slice 1 (~15ms)
+            profiler.begin_prefill();
+            thread::sleep(Duration::from_millis(15));
+            profiler.end_prefill();
+            let after_slice1 = profiler.prefill_ms;
+            assert!(
+                after_slice1 >= 10.0,
+                "slice 1 prefill_ms {after_slice1} should be >= 10ms"
+            );
+
+            // Inter-slice gap (~15ms, e.g. scheduler interleaving / sync)
+            thread::sleep(Duration::from_millis(15));
+
+            // Slice 2 (~15ms)
+            profiler.begin_prefill();
+            thread::sleep(Duration::from_millis(15));
+            profiler.end_prefill();
+            let after_slice2 = profiler.prefill_ms;
+            assert!(
+                after_slice2 >= after_slice1 + 10.0,
+                "slice 2 must accumulate onto slice 1: after_slice1={after_slice1}, after_slice2={after_slice2}"
+            );
+
+            // Short tail slice (~2ms) must accumulate, never overwrite earlier slices
+            profiler.begin_prefill();
+            thread::sleep(Duration::from_millis(2));
+            profiler.end_prefill();
+            assert!(
+                profiler.prefill_ms >= after_slice2,
+                "short final slice must not overwrite prior prefill_ms: {} < {}",
+                profiler.prefill_ms,
+                after_slice2
+            );
+
+            // Delay before first emitted token (~5ms), then decode
+            thread::sleep(Duration::from_millis(5));
+            profiler.mark_first_token();
+            profiler.step();
+            thread::sleep(Duration::from_millis(5));
+            profiler.step();
+            profiler.report();
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+            assert!(
+                last.prefill_ms >= 25.0,
+                "accumulated prefill_ms {} should reflect all slices (>= 25ms)",
+                last.prefill_ms
+            );
+            assert!(
+                last.time_to_first_token_ms >= last.prefill_ms + 10.0,
+                "ttft_ms {} must measure from first slice start (including inter-slice gap) >= prefill_ms {} + 10ms",
+                last.time_to_first_token_ms,
+                last.prefill_ms
+            );
+            let expected_total = last.time_to_first_token_ms + last.decode_ms;
+            assert!(
+                (last.total_ms - expected_total).abs() < 0.01,
+                "total_ms {} should equal ttft_ms {} + decode_ms {}",
+                last.total_ms,
+                last.time_to_first_token_ms,
+                last.decode_ms
+            );
+        });
+    }
+
+    #[test]
+    fn test_post_first_token_replay_prefill_does_not_overwrite_prefill_or_ttft() {
+        with_profiling(|| {
+            let mut profiler = DecodeProfiler::new("test_replay_prefill", "qwen3_5");
+
+            profiler.begin_prefill();
+            thread::sleep(Duration::from_millis(10));
+            profiler.end_prefill();
+            profiler.mark_first_token();
+            profiler.step();
+
+            let initial_prefill_ms = profiler.prefill_ms;
+            let initial_first_prefill = profiler.first_prefill_start;
+            let initial_loop_start = profiler.loop_start;
+
+            // Preemption replay after first token is already emitted: time belongs
+            // to decode_ms, not initial prefill_ms / ttft_ms.
+            profiler.begin_prefill();
+            thread::sleep(Duration::from_millis(15));
+            profiler.end_prefill();
+            profiler.step();
+            profiler.report();
+
+            assert_eq!(profiler.prefill_ms, initial_prefill_ms);
+            assert_eq!(profiler.first_prefill_start, initial_first_prefill);
+            assert_eq!(profiler.loop_start, initial_loop_start);
+
+            let store = profiling::PROFILING_STORE.lock().unwrap();
+            let last = store.last().unwrap();
+            assert_eq!(last.prefill_ms, initial_prefill_ms);
+            assert!(
+                last.time_to_first_token_ms >= last.prefill_ms,
+                "ttft_ms {} must stay >= prefill_ms {}",
+                last.time_to_first_token_ms,
+                last.prefill_ms
+            );
+            assert!(
+                last.decode_ms >= 10.0,
+                "post-first-token replay should remain accounted in decode_ms, got {}",
+                last.decode_ms
+            );
         });
     }
 }

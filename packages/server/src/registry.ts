@@ -41,6 +41,7 @@ import type { ChatConfig } from '@mlx-node/core';
 import type { SessionContextLimits } from '@mlx-node/lm';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { contextLane } from '@mlx-node/lm';
+import { reasoningEffortsFor, type ChatFamilyId, type ReasoningEffortOption } from '@mlx-node/lm/family-data';
 
 import { AudioRegistry } from './audio-registry.js';
 import { DecisionRegistry, type ResidentDecisionBinding, type SystemOneModel } from './decision-registry.js';
@@ -59,6 +60,36 @@ function concurrentDispatchCapacity(model: ServableModel): number {
   const reported = model.maxConcurrentSequences?.();
   if (reported === undefined || !Number.isSafeInteger(reported) || reported < 2) return 1;
   return reported;
+}
+
+const MODEL_CLASS_TO_FAMILY: Readonly<Record<string, ChatFamilyId>> = {
+  Qwen3Model: 'qwen3',
+  Qwen35Model: 'qwen3_5',
+  Qwen35MoeModel: 'qwen3_5_moe',
+  Qwen4ExpModel: 'qwen4_exp',
+  DeepseekV41Model: 'deepseek_v41',
+  HyV4FlashModel: 'hy_v4_flash',
+  Inkling2Model: 'inkling2',
+  Lfm2Model: 'lfm2',
+  NemotronHModel: 'nemotron_h',
+  K2HorizonModel: 'k2_horizon',
+  Gemma4Model: 'gemma4',
+  MuseGlimmerModel: 'muse_glimmer',
+};
+
+function modelTypeFromInstance(model: ServableModel): ChatFamilyId | undefined {
+  for (
+    let proto = Object.getPrototypeOf(model) as { constructor?: { name?: unknown } } | null;
+    proto !== null && proto !== Object.prototype;
+    proto = Object.getPrototypeOf(proto) as { constructor?: { name?: unknown } } | null
+  ) {
+    const name = proto.constructor?.name;
+    if (typeof name === 'string') {
+      const family = MODEL_CLASS_TO_FAMILY[name];
+      if (family !== undefined) return family;
+    }
+  }
+  return undefined;
 }
 
 /** Minimal contract for a model that can be served via chat sessions. */
@@ -862,7 +893,8 @@ export class ModelRegistry {
 
   /**
    * List all registered models in the OpenAI /v1/models format. A loaded
-   * chat model with a load-time context also carries its served window.
+   * chat model with a load-time context also carries its served window, and
+   * one with a known family carries `model_family` and `reasoning_efforts`.
    */
   list(): {
     id: string;
@@ -872,6 +904,8 @@ export class ModelRegistry {
     context_window?: number;
     max_model_len?: number;
     context_length?: number;
+    model_family?: string;
+    reasoning_efforts?: readonly ReasoningEffortOption[];
   }[] {
     const result: {
       id: string;
@@ -881,15 +915,21 @@ export class ModelRegistry {
       context_window?: number;
       max_model_len?: number;
       context_length?: number;
+      model_family?: string;
+      reasoning_efforts?: readonly ReasoningEffortOption[];
     }[] = [];
     for (const entry of this.models.values()) {
       const window = this.servedContext(entry.id)?.windowTokens;
+      const modelType = entry.sessionRegistry.identity?.modelType ?? modelTypeFromInstance(entry.model);
+      const reasoningEfforts = modelType !== undefined ? reasoningEffortsFor(modelType) : undefined;
       result.push({
         id: entry.id,
         object: 'model',
         created: entry.createdAt,
         owned_by: 'mlx-node',
         ...(window !== undefined ? { context_window: window, max_model_len: window, context_length: window } : {}),
+        ...(modelType !== undefined ? { model_family: modelType } : {}),
+        ...(reasoningEfforts !== undefined ? { reasoning_efforts: reasoningEfforts } : {}),
       });
     }
     return [...result, ...this.decisions.list(), ...this.audio.list(), ...this.rerank.list()];

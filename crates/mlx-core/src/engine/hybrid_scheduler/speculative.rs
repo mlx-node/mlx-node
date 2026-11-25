@@ -239,13 +239,19 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             let cut = turn.payload.reasoning_tracker.thinking_cut();
             let think_close = {
                 #[cfg(test)]
-                let test_override = TEST_THINK_END_OVERRIDE.with(|c| c.borrow().clone());
+                {
+                    TEST_THINK_END_OVERRIDE
+                        .with(|c| c.borrow().clone())
+                        .unwrap_or_else(|| {
+                            self.inner
+                                .think_end_for_turn(&turn.payload.config, &turn.payload.tokenizer)
+                        })
+                }
                 #[cfg(not(test))]
-                let test_override: Option<ThinkEndResolution> = None;
-                test_override.unwrap_or_else(|| {
+                {
                     self.inner
                         .think_end_for_turn(&turn.payload.config, &turn.payload.tokenizer)
-                })
+                }
             };
             // Reserve before proposal construction. On pressure retry only the
             // known anchor; the scheduler can preempt if even that cannot fit.

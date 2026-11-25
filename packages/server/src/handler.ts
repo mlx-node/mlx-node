@@ -3,6 +3,7 @@
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ResponseStore } from '@mlx-node/core';
+import type { ReasoningEffortOption } from '@mlx-node/lm/family-data';
 
 import { AudioService, AUDIO_EXPOSE_HEADERS, type AudioServiceOptions } from './audio-service.js';
 import { hasCredential, isAuthorized, sendUnauthorized } from './auth.js';
@@ -62,6 +63,14 @@ export interface PublicModelEntry {
   supports_images?: boolean;
   /** Body cap of the Anthropic routes; the agent keeps its resent history under it. */
   max_request_bytes?: number;
+  /**
+   * Ordered reasoning-effort levels accepted by this model on `/v1/messages`
+   * (`extra_body.reasoning_effort`) and `/v1/responses` (`reasoning.effort`).
+   * Read by `mlx-agent` (`grok-build`) together with `owned_by: "mlx-node"` to
+   * enable `--reasoning-effort` / `/effort` and forward `extra_body.reasoning_effort`.
+   * Omitted for models that do not support reasoning effort.
+   */
+  reasoning_efforts?: readonly ReasoningEffortOption[];
   modality?: 'audio' | 'text';
   task?: 'asr' | 'tts' | 'rerank';
   capabilities?: Record<string, unknown>;

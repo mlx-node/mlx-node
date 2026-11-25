@@ -672,4 +672,61 @@ describe('ModelRegistry.servedContext', () => {
     registry.register('bare', createMockSessionModel());
     expect(registry.getSessionRegistry('bare')!.servedWindowTokens).toBeUndefined();
   });
+
+  it('emits model_family and reasoning_efforts in registry.list() from identity or model class, and omits them when unsupported', () => {
+    const registry = new ModelRegistry();
+
+    const qwenMock = createMockSessionModel();
+    registry.register('Qwen3.8-27B-UD-Q4_K_XL', qwenMock, {
+      identity: { modelId: 'Qwen3.8-27B-UD-Q4_K_XL', modelType: 'qwen3_5', contextWindow: 262144 },
+    });
+    registry.register('claude-sonnet-4-5', qwenMock);
+
+    // Direct registration without explicit identity infers family from the known wrapper class name.
+    class HyV4FlashModel {}
+    const hy4 = Object.assign(Object.create(HyV4FlashModel.prototype), createMockSessionModel()) as SessionCapableModel;
+    registry.register('hy4-direct', hy4);
+
+    // Unknown identity modelType and bare plain-object mocks must not advertise reasoning_efforts.
+    registry.register('bare-mock', createMockSessionModel());
+    registry.register('foreign-model', createMockSessionModel(), {
+      identity: { modelId: 'foreign-model', modelType: 'unknown_family', contextWindow: 8192 },
+    });
+
+    // Decision models must never advertise reasoning_efforts.
+    registry.registerDecision('clef-decision', { kind: 'decision', decideRaw: vi.fn() } as never, {
+      identity: { modelId: 'clef-decision', modelType: 'clef', contextWindow: 16384 },
+    });
+
+    const byId = new Map(registry.list().map((entry) => [entry.id, entry]));
+
+    expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')).toMatchObject({
+      owned_by: 'mlx-node',
+      model_family: 'qwen3_5',
+      reasoning_efforts: [
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High', default: true },
+        { value: 'xhigh', label: 'X-High' },
+      ],
+    });
+    expect(byId.get('claude-sonnet-4-5')?.reasoning_efforts).toEqual(
+      byId.get('Qwen3.8-27B-UD-Q4_K_XL')?.reasoning_efforts,
+    );
+    expect(byId.get('hy4-direct')).toMatchObject({
+      owned_by: 'mlx-node',
+      model_family: 'hy_v4_flash',
+      reasoning_efforts: [
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'high', label: 'High', default: true },
+        { value: 'max', label: 'Max' },
+      ],
+    });
+    expect('reasoning_efforts' in byId.get('bare-mock')!).toBe(false);
+    expect('model_family' in byId.get('bare-mock')!).toBe(false);
+    expect('reasoning_efforts' in byId.get('foreign-model')!).toBe(false);
+    expect('reasoning_efforts' in byId.get('clef-decision')!).toBe(false);
+  });
 });

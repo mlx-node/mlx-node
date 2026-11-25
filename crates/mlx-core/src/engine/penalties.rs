@@ -471,12 +471,12 @@ impl ReasoningTracker {
         let budget = self.budget;
 
         for (idx, &token_id) in tokens.iter().enumerate() {
-            if in_thinking && cut {
-                if let Some(&forced) = self.end.get(observed)
-                    && token_id != forced
-                {
-                    return idx.max(1);
-                }
+            if in_thinking
+                && cut
+                && let Some(&forced) = self.end.get(observed)
+                && token_id != forced
+            {
+                return idx.max(1);
             }
             if !in_thinking {
                 if self.open_id == Some(token_id) {

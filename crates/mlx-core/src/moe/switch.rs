@@ -440,8 +440,7 @@ mod tests {
         assert!(proj.outer_scale().is_some());
         assert_eq!(proj.weight_refs().len(), 2);
 
-        let x =
-            MxArray::from_float32(&vec![16.0f32; 16], &[1, 1, 1, 16])?.astype(DType::Float16)?;
+        let x = MxArray::from_float32(&[16.0f32; 16], &[1, 1, 1, 16])?.astype(DType::Float16)?;
         let idx = MxArray::from_int32(&[0, 1], &[1, 2])?;
         let y = proj.forward(&x, &idx, false)?;
         assert_eq!(y.dtype()?, DType::Float16);

@@ -469,6 +469,92 @@ describe('makeSwapController', () => {
     expect(ctrl.listModels().map((entry) => entry.max_request_bytes)).toEqual([16_777_216, 16_777_216]);
   });
 
+  it('advertises per-family reasoning_efforts on chat models and omits it on decision models', () => {
+    const reg = fakeRegistry();
+    const entries: DiscoveredModel[] = (
+      [
+        ['Qwen3.8-27B-UD-Q4_K_XL', 'qwen3_5'],
+        ['Qwen3.8-Flash-Next', 'qwen4_exp'],
+        ['Inkling-2-Mini', 'inkling2'],
+        ['Hy4-flash', 'hy_v4_flash'],
+        ['DeepSeek-V4.1-Flash', 'deepseek_v41'],
+        ['Gemma4-12B', 'gemma4'],
+        ['K2-Horizon-7B', 'k2_horizon'],
+        ['Qwen3-8B', 'qwen3'],
+        ['Qwen3.6-35B-A3B', 'qwen3_5_moe'],
+        ['Nemotron-3.5', 'nemotron_h'],
+        ['LFM2.5-1.2B', 'lfm2'],
+        ['LFM2.5-8B-A1B', 'lfm2_moe'],
+        ['Muse-Glimmer-30B', 'muse_glimmer'],
+        ['clef-decision', 'clef'],
+        ['clairic-decision', 'clairic'],
+      ] as const
+    ).map(([name, modelType]) => ({
+      ...discovered([name])[0]!,
+      modelType,
+    }));
+
+    const ctrl = makeSwapController(entries, reg as unknown as ModelRegistry, vi.fn());
+    const byId = new Map(ctrl.listModels().map((row) => [row.id, row]));
+
+    expect(byId.get('Qwen3.8-27B-UD-Q4_K_XL')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'xhigh', label: 'X-High' },
+    ]);
+    expect(byId.get('Qwen3.8-Flash-Next')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High' },
+      { value: 'xhigh', label: 'X-High', default: true },
+    ]);
+    expect(byId.get('Inkling-2-Mini')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'xhigh', label: 'X-High' },
+    ]);
+    expect(byId.get('Hy4-flash')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'max', label: 'Max' },
+    ]);
+    expect(byId.get('DeepSeek-V4.1-Flash')?.reasoning_efforts).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'max', label: 'Max' },
+    ]);
+    expect(byId.get('K2-Horizon-7B')?.reasoning_efforts).toEqual([
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    for (const binaryId of ['Gemma4-12B', 'Qwen3-8B', 'Qwen3.6-35B-A3B', 'Nemotron-3.5']) {
+      expect(byId.get(binaryId)?.reasoning_efforts, binaryId).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'high', label: 'High', default: true },
+      ]);
+    }
+    for (const budgetId of ['LFM2.5-1.2B', 'LFM2.5-8B-A1B', 'Muse-Glimmer-30B']) {
+      expect(byId.get(budgetId)?.reasoning_efforts, budgetId).toEqual([
+        { value: 'none', label: 'Off' },
+        { value: 'low', label: 'Low' },
+        { value: 'high', label: 'High', default: true },
+      ]);
+    }
+    for (const decisionId of ['clef-decision', 'clairic-decision']) {
+      const row = byId.get(decisionId);
+      expect(row, decisionId).toBeDefined();
+      expect('reasoning_efforts' in row!, decisionId).toBe(false);
+    }
+  });
+
   it('disposeAll empties the registry and the aliases but keeps the selection for the next unknown name', async () => {
     const reg = fakeRegistry();
     const loader = vi.fn(async (path: string) => ({ marker: path }) as unknown as LoadableModel);

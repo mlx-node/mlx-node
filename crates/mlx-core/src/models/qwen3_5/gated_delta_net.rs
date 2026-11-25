@@ -486,10 +486,11 @@ unsafe extern "C-unwind" {
     ) -> bool;
 }
 
-/// One primitive for a whole prompt window including the 4-tap depthwise conv1d
-/// + SiLU + `conv_state` update, q/k RMSNorm, decay/beta gating, 8-lanes/row
-/// recurrence scan, and gated RMSNorm + z gate. Returns `(gated_out, new_state,
-/// next_conv_state)` or `Ok(None)` when off-contract / declined.
+/// One primitive for a whole prompt window including the 4-tap depthwise
+/// conv1d + SiLU + `conv_state` update, q/k RMSNorm, decay/beta gating,
+/// 8-lanes/row recurrence scan, and gated RMSNorm + z gate. Returns
+/// `(gated_out, new_state, next_conv_state)` or `Ok(None)` when
+/// off-contract / declined.
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_fused_prefill_with_conv(
     qkv: &MxArray,

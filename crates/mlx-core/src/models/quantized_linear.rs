@@ -10875,7 +10875,7 @@ mod clef_row_gather_tests {
         // 2D NVFP4: N=8, K=64 -> weight [8, 8] uint32 (code 2 = E2M1 1.0), scales [8, 4] uint8 (0x38 = E4M3 1.0).
         // Unscaled W is all 1.0, so x = ones([1, 64]) -> raw matmul = 64.0.
         let w = MxArray::from_uint32(&vec![0x2222_2222u32; 8 * 8], &[8, 8])?;
-        let s = MxArray::from_uint8(&vec![0x38u8; 8 * 4], &[8, 4])?;
+        let s = MxArray::from_uint8(&[0x38u8; 8 * 4], &[8, 4])?;
         let bias = MxArray::from_float32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[8])?;
 
         // 1. Upstream MLX `.global_scale` (= amax): multiplies by amax / 2688.0.
@@ -10982,7 +10982,7 @@ mod clef_row_gather_tests {
         //    With K=64 and x = 50 / 64 in F16, raw dot = 50 * 2688 = 134400 (overflows F16 to Inf!).
         //    With global_scale = 1.0 (outer_scale = 1 / 2688.0), true y = 50.0 (fits F16!).
         let w_max = MxArray::from_uint32(&vec![0x7777_7777u32; 8 * 8], &[8, 8])?;
-        let s_max = MxArray::from_uint8(&vec![0x7Eu8; 8 * 4], &[8, 4])?;
+        let s_max = MxArray::from_uint8(&[0x7Eu8; 8 * 4], &[8, 4])?;
         let mut p_ovf = HashMap::new();
         p_ovf.insert("ovf.weight".to_string(), w_max);
         p_ovf.insert("ovf.scales".to_string(), s_max);
@@ -11016,7 +11016,7 @@ mod clef_row_gather_tests {
         use crate::array::DType;
         // 3D NVFP4: E=2, N=4, K=64, max E2M1 (6.0) * max E4M3 (448.0) = 2688.0 per weight.
         let w_max = MxArray::from_uint32(&vec![0x7777_7777u32; 2 * 4 * 8], &[2, 4, 8])?;
-        let s_max = MxArray::from_uint8(&vec![0x7Eu8; 2 * 4 * 4], &[2, 4, 4])?;
+        let s_max = MxArray::from_uint8(&[0x7Eu8; 2 * 4 * 4], &[2, 4, 4])?;
 
         // Upstream MLX `.global_scale` [E, 1] + F16 overflow test (true output = 50.0 and 0.0)
         let mut p = HashMap::new();

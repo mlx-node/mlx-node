@@ -307,8 +307,11 @@ fn resize_rgba_premultiplied_bilinear_inner(
                 }
             }
 
-            while active.front().is_some_and(|row| y + 1 >= row.v_right) {
-                let row = active.pop_front().unwrap();
+            while let Some(row) = active.pop_front() {
+                if y + 1 < row.v_right {
+                    active.push_front(row);
+                    break;
+                }
                 for (outx, &px) in row.accum.iter().enumerate() {
                     out.put_pixel(outx as u32, row.outy, unpremultiply_rgba_pixel(px));
                 }
@@ -1366,14 +1369,14 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
         };
         let d = 16i64;
-        let ones_d = MxArray::from_float32(&vec![1.0f32; 16], &[d]).unwrap();
-        let zeros_d = MxArray::from_float32(&vec![0.0f32; 16], &[d]).unwrap();
+        let ones_d = MxArray::from_float32(&[1.0f32; 16], &[d]).unwrap();
+        let zeros_d = MxArray::from_float32(&[0.0f32; 16], &[d]).unwrap();
         // Pre-LN bias = 2.0 pushes every hidden channel to ~2.0 (BF16 ULP = 0.015625).
-        let pre_ln_bias = MxArray::from_float32(&vec![2.0f32; 16], &[d]).unwrap();
+        let pre_ln_bias = MxArray::from_float32(&[2.0f32; 16], &[d]).unwrap();
         let zeros_mat_bf16 = MxArray::zeros(&[d, d], Some(DType::BFloat16)).unwrap();
         // Constant +1.0 bias on o_proj and fc2 ensures each sublayer contributes `+1.0 * 1e-4` in FP32.
-        let one_bias_f32 = MxArray::from_float32(&vec![1.0f32; 16], &[d]).unwrap();
-        let ls_small = MxArray::from_float32(&vec![1e-4_f32; 16], &[d]).unwrap();
+        let one_bias_f32 = MxArray::from_float32(&[1.0f32; 16], &[d]).unwrap();
+        let ls_small = MxArray::from_float32(&[1e-4_f32; 16], &[d]).unwrap();
 
         let make_block = |ls: &MxArray| -> Inkling2VisionBlock {
             Inkling2VisionBlock {

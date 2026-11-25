@@ -1950,9 +1950,7 @@ fn load_dense_or_dequant_tensor(
     let w = require_tensor(params, &key)?;
     ensure_dense_weight_floating(&key, &w)?;
     let dt = w.dtype()?;
-    if preserve_bf16 && dt == DType::BFloat16 {
-        Ok(w)
-    } else if dt == DType::Float32 {
+    if (preserve_bf16 && dt == DType::BFloat16) || dt == DType::Float32 {
         Ok(w)
     } else {
         w.astype(DType::Float32)
@@ -7919,7 +7917,7 @@ mod tests {
         );
         raw_release.insert(
             "model.llm.layers.0.attn.wo_ud.weight_scale".to_string(),
-            MxArray::from_uint8(&vec![0x38u8; 32 * 2], &[32, 2]).unwrap(),
+            MxArray::from_uint8(&[0x38u8; 32 * 2], &[32, 2]).unwrap(),
         );
         raw_release.insert(
             "model.llm.layers.0.attn.wo_ud.weight_scale_2".to_string(),
@@ -8057,7 +8055,7 @@ mod tests {
         );
         raw_omlx_fused_q.insert(
             "model.layers.1.attn.k_proj.weight_scale".to_string(),
-            MxArray::from_uint8(&vec![0x38u8; 40 * 2], &[40, 2]).unwrap(),
+            MxArray::from_uint8(&[0x38u8; 40 * 2], &[40, 2]).unwrap(),
         );
         let mut p_omlx_fq = strip_inkling2_wrapper_prefixes(raw_omlx_fused_q);
         normalize_inkling2_safetensors_params(&mut p_omlx_fq, Inkling2CheckpointLayout::OMlx, &cfg)
@@ -8623,7 +8621,7 @@ mod tests {
                 w.insert(k, v);
             }
             crate::utils::safetensors::save_safetensors(
-                &dir.0.join("model.safetensors"),
+                dir.0.join("model.safetensors"),
                 &mut w,
                 None,
             )
@@ -8845,8 +8843,7 @@ mod tests {
                 &per_layer_quant,
                 default_plq,
             )
-            .err()
-            .expect("NVFP4-only global_scale on MXFP projection must fail loudly");
+            .expect_err("NVFP4-only global_scale on MXFP projection must fail loudly");
             assert!(
                 err.reason.contains("unsupported NVFP4 outer scale tensor"),
                 "unexpected error: {}",

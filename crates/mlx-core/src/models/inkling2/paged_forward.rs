@@ -9724,7 +9724,7 @@ mod dflash2_plan_tests {
             let rt = inner.paged.as_ref().unwrap();
             assert_eq!(rt.coordinator.request_token_count_all(seq_id).unwrap(), 31);
             assert!(
-                rt.block_boundary_conv.get(&seq_id).is_none(),
+                !rt.block_boundary_conv.contains_key(&seq_id),
                 "rolling back 32->31 with previous=None must clear block_boundary_conv"
             );
         }
