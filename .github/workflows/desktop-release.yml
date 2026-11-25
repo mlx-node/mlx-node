@@ -1,9 +1,12 @@
 name: Desktop Release
 
 # Signing cannot live in ci.yml's `publish` job: that one runs on ubuntu-latest,
-# and codesign/notarytool/stapler are macOS-only. This is a separate workflow on a
-# macOS runner rather than another job in ci.yml because it needs Apple secrets
-# that no PR-triggered job should ever be able to read.
+# while codesign/notarytool/stapler are macOS-only and Authenticode signing runs
+# on Windows. This is a separate workflow rather than jobs in ci.yml because it
+# needs Apple and SSL.com signing secrets that no PR-triggered job should ever
+# be able to read. `windows` and `macos` build and sign in parallel; `publish`
+# (`ubuntu-latest`) downloads and verifies all assets, publishes the GitHub
+# Release, and bumps the Homebrew cask; `winget` submits the WinGet update.
 #
 # `dry_run` builds, packages and signs but does NOT notarize or publish. That path
 # needs only CSC_LINK + CSC_KEY_PASSWORD, so the pipeline is exercisable before the
@@ -85,18 +88,31 @@ jobs:
     # mlx-prebuilt.yml); no GPU is required. No Apple signing secrets are used.
     runs-on: windows-11-arm
     outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
       windows_zip_sha256: ${{ steps.package.outputs.zip_sha256 }}
     permissions:
       contents: read
-      actions: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+          ref: ${{ inputs.dry_run && github.sha || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
           submodules: recursive
+
+      - name: Record checked-out commit
+        id: commit
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = ((git rev-parse HEAD) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $sha -notmatch '^[0-9a-f]{40}$') {
+            throw "Failed to resolve checked-out commit SHA: $sha"
+          }
+          "sha=$sha" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -268,6 +284,37 @@ jobs:
         env:
           TAG: ${{ env.RELEASE_TAG }}
         run: yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$env:TAG" --manifest packages/desktop/package.json
+
+      - name: Verify release tag is publishable
+        if: inputs.dry_run != true
+        shell: pwsh
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          if ([string]::IsNullOrWhiteSpace($env:TAG)) {
+            throw 'A release tag is required for publication'
+          }
+          $tagCommit = ((& git rev-parse --verify "refs/tags/$($env:TAG)^{commit}" 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "Release tag $($env:TAG) was not found in git checkout: $tagCommit"
+          }
+          $headCommit = ((& git rev-parse HEAD 2>&1) | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0 -or $tagCommit -ne $headCommit) {
+            throw "The checkout ($headCommit) does not match release tag $($env:TAG) ($tagCommit)"
+          }
+          $relOut = (@(& gh api "repos/$($env:GITHUB_REPOSITORY)/releases/tags/$($env:TAG)" 2>&1 | ForEach-Object { $_.ToString() })) -join "`n"
+          $relExit = $LASTEXITCODE
+          if ($relExit -eq 0) {
+            throw "Release $($env:TAG) is already published; refusing to rebuild or modify a public release"
+          } elseif ($relOut -notmatch 'HTTP 404|"status":\s*"404"') {
+            Write-Host $relOut
+            throw "Failed to check release state for $($env:TAG)"
+          }
+          $global:LASTEXITCODE = 0
+          exit 0
 
       # Match the macOS job: a release packages a fresh addon and its matching
       # runtime rather than reusing a stale CI artifact.
@@ -698,26 +745,38 @@ jobs:
           path: packages/desktop/out/winget
           if-no-files-found: error
 
-  release:
-    name: Sign, notarize, publish
-    needs: windows
+  macos:
+    name: Package and sign macOS ARM64
     runs-on: macos-26
     outputs:
+      commit: ${{ steps.commit.outputs.sha }}
       version: ${{ steps.version.outputs.version }}
       release_tag: ${{ steps.version.outputs.release_tag }}
+      dmg_name: ${{ steps.version.outputs.dmg_name }}
+      zip_name: ${{ steps.version.outputs.zip_name }}
       windows_zip_name: ${{ steps.version.outputs.windows_zip_name }}
-      published: ${{ steps.publish.outputs.published }}
+      dmg_sha256: ${{ steps.hashes.outputs.dmg_sha256 }}
+      zip_sha256: ${{ steps.hashes.outputs.zip_sha256 }}
+      blockmap_sha256: ${{ steps.hashes.outputs.blockmap_sha256 }}
+      manifest_sha256: ${{ steps.hashes.outputs.manifest_sha256 }}
     permissions:
-      contents: write
-      actions: read
-    env:
-      # Hoisted so the cask step's `if` can test it — see the comment there.
-      HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ inputs.dry_run && github.ref || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
+          ref: ${{ inputs.dry_run && github.sha || (inputs.release_tag && format('refs/tags/{0}', inputs.release_tag)) || github.ref }}
           submodules: recursive
+
+      - name: Record checked-out commit
+        id: commit
+        run: |
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          if [[ ! "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve checked-out commit SHA: $SHA"
+            exit 1
+          fi
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
       - name: Setup Node.js
         uses: actions/setup-node@v7
@@ -774,11 +833,35 @@ jobs:
           yarn oxnode packages/desktop/scripts/check-release.ts resolve --tag "$TAG" --manifest packages/desktop/package.json
           echo "release_tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Prepare draft release
+      - name: Verify release tag is publishable
         if: inputs.dry_run != true
         env:
+          TAG: ${{ env.RELEASE_TAG }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: yarn oxnode packages/desktop/scripts/publish-release.ts prepare --tag "$RELEASE_TAG"
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            echo "::error::A release tag is required for publication"
+            exit 1
+          fi
+          TAG_COMMIT="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+          HEAD_COMMIT="$(git rev-parse HEAD)"
+          if [ "$TAG_COMMIT" != "$HEAD_COMMIT" ]; then
+            echo "::error::The checkout ($HEAD_COMMIT) does not match release tag $TAG ($TAG_COMMIT)"
+            exit 1
+          fi
+          set +e
+          rel_out="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" 2>&1)"
+          rel_exit=$?
+          set -e
+          if [ "$rel_exit" -eq 0 ]; then
+            echo "::error::Release $TAG is already published; refusing to rebuild or modify a public release"
+            exit 1
+          elif ! grep -Eq 'HTTP 404|"status":[[:space:]]*"404"' <<< "$rel_out"; then
+            printf '%s\n' "$rel_out"
+            echo "::error::Failed to check release state for $TAG"
+            exit 1
+          fi
 
       # Deliberately a fresh build, not a `gh run download` of ci.yml's artifacts.
       # A release is rare and the ~16 min is worth it: artifact reuse is exactly how
@@ -978,28 +1061,19 @@ jobs:
           hdiutil create -volname "mlx-node" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
-      # Publish the Windows ZIP in the same draft transaction as the macOS
-      # assets. The Windows job has already verified its packaged app and archive.
-      - name: Download the Windows ARM64 artifact
-        uses: actions/download-artifact@v8
-        with:
-          name: mlx-node-desktop-windows-arm64
-          path: packages/desktop/out/windows-release
-
       # Re-derives nothing. It reads CFBundleShortVersionString and CFBundleVersion
       # out of the plist that was actually written and the version out of the DMG's
       # actual filename, and fails unless they and the tag and the manifest are one
       # version. `resolve` above only proved the INPUTS agreed; this proves the
       # artifacts do. Runs before the DMG is notarized — the expensive step.
-      - name: Validate artifact versions
+      - name: Validate macOS artifact versions
         env:
           TAG: ${{ env.RELEASE_TAG }}
-          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
         run: |
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json \
             --app "${{ steps.package.outputs.app }}" --dmg "${{ steps.dmg.outputs.path }}" \
-            --zip "${{ steps.zip.outputs.path }}" --windows-zip "$WINDOWS_ZIP"
+            --zip "${{ steps.zip.outputs.path }}"
 
       # The DMG is a separate distributable and Gatekeeper assesses it on its own,
       # so it needs its own signature, notarization and ticket. Skipping this is the
@@ -1019,10 +1093,42 @@ jobs:
           xcrun stapler staple "$DMG"
           xcrun stapler validate "$DMG"
 
+      # Hash the final (signed/notarized on real releases) macOS artifacts right
+      # before upload so `publish` can verify every downloaded file bit-for-bit.
+      - name: Compute macOS artifact SHA-256 digests
+        id: hashes
+        env:
+          DMG: ${{ steps.dmg.outputs.path }}
+          ZIP: ${{ steps.zip.outputs.path }}
+          BLOCKMAP: ${{ steps.update.outputs.blockmap }}
+          MANIFEST: ${{ steps.update.outputs.manifest }}
+        run: |
+          set -euo pipefail
+          hash_artifact() {
+            local key="$1"
+            local path="$2"
+            if [ ! -f "$path" ] || [ ! -s "$path" ]; then
+              echo "::error::Missing or empty macOS artifact for $key: $path"
+              exit 1
+            fi
+            local digest
+            digest="$(shasum -a 256 "$path" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')"
+            if [[ ! "$digest" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Invalid SHA-256 digest for $path: $digest"
+              exit 1
+            fi
+            echo "${key}=${digest}" >> "$GITHUB_OUTPUT"
+          }
+          hash_artifact dmg_sha256 "$DMG"
+          hash_artifact zip_sha256 "$ZIP"
+          hash_artifact blockmap_sha256 "$BLOCKMAP"
+          hash_artifact manifest_sha256 "$MANIFEST"
+
       - uses: actions/upload-artifact@v7
         with:
           name: mlx-node-desktop-dmg
           path: ${{ steps.dmg.outputs.path }}
+          if-no-files-found: error
 
       - uses: actions/upload-artifact@v7
         with:
@@ -1031,6 +1137,222 @@ jobs:
             ${{ steps.zip.outputs.path }}
             ${{ steps.update.outputs.blockmap }}
             ${{ steps.update.outputs.manifest }}
+          if-no-files-found: error
+
+      # `always()` so a failure anywhere above still removes the private key from
+      # the runner. The runner is ephemeral, but a leaked key outliving the job on a
+      # reused runner is not a risk worth carrying for one line.
+      - name: Remove the signing keychain
+        if: always()
+        run: security delete-keychain "$KEYCHAIN" || true
+
+  publish:
+    name: Publish desktop release
+    needs: [windows, macos]
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.verify.outputs.version }}
+      release_tag: ${{ steps.verify.outputs.release_tag }}
+      windows_zip_name: ${{ steps.verify.outputs.windows_zip_name }}
+      published: ${{ steps.publish.outputs.published }}
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      # Require both builders to agree on one commit SHA BEFORE checking out or
+      # running any repository code (including Yarn).
+      - name: Verify build jobs produced the same commit
+        id: target
+        env:
+          WINDOWS_COMMIT: ${{ needs.windows.outputs.commit }}
+          MACOS_COMMIT: ${{ needs.macos.outputs.commit }}
+        run: |
+          set -euo pipefail
+          if [[ ! "$WINDOWS_COMMIT" =~ ^[0-9a-f]{40}$ ]] || [[ ! "$MACOS_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Invalid build commit SHA: windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+          if [ "$WINDOWS_COMMIT" != "$MACOS_COMMIT" ]; then
+            echo "::error::Build jobs checked out different commits: windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+          echo "sha=$WINDOWS_COMMIT" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ steps.target.outputs.sha }}
+
+      - name: Verify checked-out commit and release tag
+        env:
+          EXPECTED_SHA: ${{ steps.target.outputs.sha }}
+          DRY_RUN: ${{ inputs.dry_run }}
+          TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [ "$HEAD_SHA" != "$EXPECTED_SHA" ]; then
+            echo "::error::Publish checkout ($HEAD_SHA) does not match verified build commit ($EXPECTED_SHA)"
+            exit 1
+          fi
+          if [ "$DRY_RUN" != "true" ]; then
+            if [ -z "$TAG" ]; then
+              echo "::error::A release tag is required for publication"
+              exit 1
+            fi
+            git fetch --no-tags --depth=1 origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+            TAG_SHA="$(git rev-parse --verify "refs/tags/${TAG}^{commit}")"
+            if [ "$TAG_SHA" != "$EXPECTED_SHA" ]; then
+              echo "::error::Release tag $TAG ($TAG_SHA) no longer matches verified build commit ($EXPECTED_SHA)"
+              exit 1
+            fi
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '26'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: yarn install --immutable
+
+      - name: Download the macOS DMG artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-dmg
+          path: packages/desktop/out/release-artifacts/dmg
+
+      - name: Download the macOS update artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-update
+          path: packages/desktop/out/release-artifacts/update
+
+      - name: Download the Windows ARM64 artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: mlx-node-desktop-windows-arm64
+          path: packages/desktop/out/release-artifacts/windows
+
+      - name: Verify cross-platform commits, versions, and artifact digests
+        id: verify
+        env:
+          TAG: ${{ env.RELEASE_TAG }}
+          WINDOWS_COMMIT: ${{ needs.windows.outputs.commit }}
+          WINDOWS_VERSION: ${{ needs.windows.outputs.version }}
+          WINDOWS_ZIP_NAME_IN: ${{ needs.windows.outputs.windows_zip_name }}
+          WINDOWS_ZIP_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
+          MACOS_COMMIT: ${{ needs.macos.outputs.commit }}
+          MACOS_VERSION: ${{ needs.macos.outputs.version }}
+          MACOS_RELEASE_TAG: ${{ needs.macos.outputs.release_tag }}
+          MACOS_DMG_NAME: ${{ needs.macos.outputs.dmg_name }}
+          MACOS_ZIP_NAME: ${{ needs.macos.outputs.zip_name }}
+          MACOS_WINDOWS_ZIP_NAME: ${{ needs.macos.outputs.windows_zip_name }}
+          MACOS_DMG_SHA256: ${{ needs.macos.outputs.dmg_sha256 }}
+          MACOS_ZIP_SHA256: ${{ needs.macos.outputs.zip_sha256 }}
+          MACOS_BLOCKMAP_SHA256: ${{ needs.macos.outputs.blockmap_sha256 }}
+          MACOS_MANIFEST_SHA256: ${{ needs.macos.outputs.manifest_sha256 }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA="$(git rev-parse HEAD)"
+          if [[ ! "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Failed to resolve publish checkout commit SHA: $HEAD_SHA"
+            exit 1
+          fi
+          if [ "$WINDOWS_COMMIT" != "$HEAD_SHA" ] || [ "$MACOS_COMMIT" != "$HEAD_SHA" ]; then
+            echo "::error::Cross-platform commit mismatch: publish=$HEAD_SHA windows=$WINDOWS_COMMIT macos=$MACOS_COMMIT"
+            exit 1
+          fi
+
+          RESOLVED="$(mktemp "$RUNNER_TEMP/resolved-version.XXXXXX")"
+          trap 'rm -f "$RESOLVED"' EXIT
+          GITHUB_OUTPUT="$RESOLVED" yarn oxnode packages/desktop/scripts/check-release.ts resolve \
+            --tag "$TAG" --manifest packages/desktop/package.json
+          version=""
+          dmg_name=""
+          zip_name=""
+          windows_zip_name=""
+          while IFS='=' read -r key val; do
+            case "$key" in
+              version) version="$val" ;;
+              dmg_name) dmg_name="$val" ;;
+              zip_name) zip_name="$val" ;;
+              windows_zip_name) windows_zip_name="$val" ;;
+            esac
+          done < "$RESOLVED"
+          if [ -z "$version" ] || [ -z "$dmg_name" ] || [ -z "$zip_name" ] || [ -z "$windows_zip_name" ]; then
+            echo "::error::check-release.ts resolve did not emit all expected outputs"
+            exit 1
+          fi
+
+          if [ "$WINDOWS_VERSION" != "$version" ] || [ "$MACOS_VERSION" != "$version" ]; then
+            echo "::error::Cross-platform version mismatch: resolved=$version windows=$WINDOWS_VERSION macos=$MACOS_VERSION"
+            exit 1
+          fi
+          if [ "$WINDOWS_ZIP_NAME_IN" != "$windows_zip_name" ] || [ "$MACOS_WINDOWS_ZIP_NAME" != "$windows_zip_name" ]; then
+            echo "::error::Windows ZIP name mismatch: resolved=$windows_zip_name windows=$WINDOWS_ZIP_NAME_IN macos=$MACOS_WINDOWS_ZIP_NAME"
+            exit 1
+          fi
+          if [ "$MACOS_DMG_NAME" != "$dmg_name" ] || [ "$MACOS_ZIP_NAME" != "$zip_name" ]; then
+            echo "::error::macOS artifact name mismatch: expected dmg=$dmg_name zip=$zip_name, got dmg=$MACOS_DMG_NAME zip=$MACOS_ZIP_NAME"
+            exit 1
+          fi
+          if [ "$MACOS_RELEASE_TAG" != "$TAG" ]; then
+            echo "::error::Release tag mismatch: publish=$TAG macos=$MACOS_RELEASE_TAG"
+            exit 1
+          fi
+
+          DMG="packages/desktop/out/release-artifacts/dmg/$dmg_name"
+          ZIP="packages/desktop/out/release-artifacts/update/$zip_name"
+          BLOCKMAP="packages/desktop/out/release-artifacts/update/${zip_name}.blockmap"
+          MANIFEST="packages/desktop/out/release-artifacts/update/latest-mac.yml"
+          WINDOWS_ZIP="packages/desktop/out/release-artifacts/windows/$windows_zip_name"
+
+          verify_artifact() {
+            local label="$1"
+            local path="$2"
+            local expected="$3"
+            if [[ ! "$expected" =~ ^[0-9a-fA-F]{64}$ ]]; then
+              echo "::error::Expected SHA-256 for $label is not a valid 64-character hex digest: $expected"
+              exit 1
+            fi
+            if [ ! -f "$path" ] || [ ! -s "$path" ]; then
+              echo "::error::Missing or empty $label artifact: $path"
+              exit 1
+            fi
+            local expected_lower actual_lower
+            expected_lower="${expected,,}"
+            actual_lower="$(sha256sum "$path" | cut -d' ' -f1 | tr '[:upper:]' '[:lower:]')"
+            if [ "$actual_lower" != "$expected_lower" ]; then
+              echo "::error::SHA-256 mismatch for $label ($path): expected $expected_lower, got $actual_lower"
+              exit 1
+            fi
+            echo "Verified $label: $path ($actual_lower)"
+          }
+
+          verify_artifact "macOS DMG" "$DMG" "$MACOS_DMG_SHA256"
+          verify_artifact "macOS update ZIP" "$ZIP" "$MACOS_ZIP_SHA256"
+          verify_artifact "macOS blockmap" "$BLOCKMAP" "$MACOS_BLOCKMAP_SHA256"
+          verify_artifact "macOS update manifest" "$MANIFEST" "$MACOS_MANIFEST_SHA256"
+          verify_artifact "Windows ZIP" "$WINDOWS_ZIP" "$WINDOWS_ZIP_SHA256"
+
+          {
+            echo "version=$version"
+            echo "release_tag=$TAG"
+            echo "windows_zip_name=$windows_zip_name"
+            echo "dmg=$DMG"
+            echo "zip=$ZIP"
+            echo "blockmap=$BLOCKMAP"
+            echo "manifest=$MANIFEST"
+            echo "windows_zip=$WINDOWS_ZIP"
+            echo "dmg_sha256=${MACOS_DMG_SHA256,,}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Prepare draft release
+        if: inputs.dry_run != true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: yarn oxnode packages/desktop/scripts/publish-release.ts prepare --tag "$RELEASE_TAG"
 
       - name: Upload artifacts and publish the draft release
         id: publish
@@ -1040,11 +1362,11 @@ jobs:
         timeout-minutes: 190
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          DMG: ${{ steps.dmg.outputs.path }}
-          ZIP: ${{ steps.zip.outputs.path }}
-          BLOCKMAP: ${{ steps.update.outputs.blockmap }}
-          MANIFEST: ${{ steps.update.outputs.manifest }}
-          WINDOWS_ZIP: packages/desktop/out/windows-release/${{ steps.version.outputs.windows_zip_name }}
+          DMG: ${{ steps.verify.outputs.dmg }}
+          ZIP: ${{ steps.verify.outputs.zip }}
+          BLOCKMAP: ${{ steps.verify.outputs.blockmap }}
+          MANIFEST: ${{ steps.verify.outputs.manifest }}
+          WINDOWS_ZIP: ${{ steps.verify.outputs.windows_zip }}
         run: |
           set -euo pipefail
           yarn oxnode packages/desktop/scripts/publish-release.ts publish --tag "$RELEASE_TAG" \
@@ -1052,45 +1374,48 @@ jobs:
             --windows-zip "$WINDOWS_ZIP"
           echo "published=true" >> "$GITHUB_OUTPUT"
 
-      # The `secrets` context is NOT available in a step `if` — only github, needs,
-      # strategy, matrix, job, runner, env, vars, steps and inputs are. Writing
-      # `secrets.HOMEBREW_TAP_TOKEN != ''` there parses but never fires, so the cask
-      # would silently stop being bumped. The token is hoisted to job-level `env`
-      # (which IS in scope) and tested there instead.
+      # Scoped only to this step (not job-level env) so earlier steps never see
+      # HOMEBREW_TAP_TOKEN; empty-token opt-out is checked inside the step body.
       - name: Bump the Homebrew cask
-        if: inputs.dry_run != true && !contains(steps.version.outputs.version, '-') && !contains(steps.version.outputs.version, '+') && env.HOMEBREW_TAP_TOKEN != ''
+        if: inputs.dry_run != true && !contains(steps.verify.outputs.version, '-') && !contains(steps.verify.outputs.version, '+')
         env:
-          GH_TOKEN: ${{ env.HOMEBREW_TAP_TOKEN }}
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           # From the tag, via the same validated value the DMG was named with —
           # NOT re-read from the private manifest, which does not advance.
-          VERSION: ${{ steps.version.outputs.version }}
-          DMG: ${{ steps.dmg.outputs.path }}
+          VERSION: ${{ steps.verify.outputs.version }}
+          DMG: ${{ steps.verify.outputs.dmg }}
+          EXPECTED_DMG_SHA256: ${{ steps.verify.outputs.dmg_sha256 }}
         run: |
           set -euo pipefail
-          SHA256="$(shasum -a 256 "$DMG" | cut -d' ' -f1)"
+          if [ -z "$GH_TOKEN" ]; then
+            echo "HOMEBREW_TAP_TOKEN is not set; skipping Homebrew cask bump."
+            exit 0
+          fi
+          SHA256="$(sha256sum "$DMG" | cut -d' ' -f1)"
+          if [ "$SHA256" != "$EXPECTED_DMG_SHA256" ]; then
+            echo "::error::DMG SHA-256 mismatch before Homebrew cask bump: expected $EXPECTED_DMG_SHA256, got $SHA256"
+            exit 1
+          fi
           git clone --depth 1 "https://x-access-token:$GH_TOKEN@github.com/$GITHUB_REPOSITORY_OWNER/homebrew-tap.git" "$RUNNER_TEMP/tap"
           CASK="$RUNNER_TEMP/tap/Casks/mlx-node.rb"
           # Anchored to the field names so a version string appearing elsewhere in
           # the cask (a caveat, a zap path) is not rewritten too.
-          sed -i '' -e "s|^  version \".*\"|  version \"$VERSION\"|" \
-                    -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          sed -i -e "s|^  version \".*\"|  version \"$VERSION\"|" \
+                 -e "s|^  sha256 \".*\"|  sha256 \"$SHA256\"|" "$CASK"
+          grep -Fxq "  version \"$VERSION\"" "$CASK" \
+            || { echo "::error::Failed to update version line in $CASK"; exit 1; }
+          grep -Fxq "  sha256 \"$SHA256\"" "$CASK" \
+            || { echo "::error::Failed to update sha256 line in $CASK"; exit 1; }
           git -C "$RUNNER_TEMP/tap" add Casks/mlx-node.rb
           git -C "$RUNNER_TEMP/tap" -c user.name=github-actions \
             -c user.email=github-actions@github.com commit -m "mlx-node $VERSION"
           git -C "$RUNNER_TEMP/tap" push
 
-      # `always()` so a failure anywhere above still removes the private key from
-      # the runner. The runner is ephemeral, but a leaked key outliving the job on a
-      # reused runner is not a risk worth carrying for one line.
-      - name: Remove the signing keychain
-        if: always()
-        run: security delete-keychain "$KEYCHAIN" || true
-
   winget:
     name: Submit WinGet update
-    needs: [windows, release]
+    needs: [windows, publish]
     runs-on: ubuntu-latest
-    if: always() && needs.release.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.release.outputs.version, '-') && !contains(needs.release.outputs.version, '+')
+    if: always() && needs.publish.outputs.published == 'true' && inputs.dry_run != true && !contains(needs.publish.outputs.version, '-') && !contains(needs.publish.outputs.version, '+')
     permissions:
       contents: read
     steps:
@@ -1114,9 +1439,9 @@ jobs:
       - name: Verify published Windows ZIP asset
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
           EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
         run: |
           set -euo pipefail
@@ -1178,9 +1503,9 @@ jobs:
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
         run: |
           set -euo pipefail
           if [ -z "$WINGET_TOKEN" ]; then
@@ -1216,9 +1541,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
-          VERSION: ${{ needs.release.outputs.version }}
-          RELEASE_TAG: ${{ needs.release.outputs.release_tag }}
-          WINDOWS_ZIP_NAME: ${{ needs.release.outputs.windows_zip_name }}
+          VERSION: ${{ needs.publish.outputs.version }}
+          RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
+          WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
           EXPECTED_SHA256: ${{ needs.windows.outputs.windows_zip_sha256 }}
           PR_NUMBER: ${{ steps.submit.outputs.pr_number }}
         run: |
