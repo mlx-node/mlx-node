@@ -698,7 +698,22 @@ export function readMsixManifest(msixPath: string): ParsedAppxManifest {
   return parseAppxManifest(xml);
 }
 
-/** Return any required archive members missing from an MSIX entry list. */
+/**
+ * Encode a package-relative POSIX path to the canonical OPC part name written
+ * by `MakeAppx.exe` (Microsoft MSIX SDK `Encoding.cpp`: percent-encodes `@` as
+ * `%40`, `%` as `%25`, spaces as `%20`, etc., while keeping `/` and unreserved
+ * characters intact).
+ */
+export function encodeMsixPartName(path: string): string {
+  return path
+    .split('/')
+    .map((segment) =>
+      encodeURIComponent(segment).replace(/[!'()]/g, (ch) => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`),
+    )
+    .join('/');
+}
+
+/** Return any required archive members missing from an MSIX OPC entry list. */
 export function missingWindowsMsixEntries(entries: readonly string[], runtimeFiles: readonly string[]): string[] {
   const normalizedList = entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, ''));
   const normalized = new Set(normalizedList);
@@ -713,11 +728,11 @@ export function missingWindowsMsixEntries(entries: readonly string[], runtimeFil
     'app/resources/native/include/cuda_runtime.h',
     'app/resources/www/index.html',
   ];
-  const missing = required.filter((entry) => !normalized.has(entry));
+  const missing = required.filter((entry) => !normalized.has(encodeMsixPartName(entry)));
   for (const dir of WINDOWS_APP_RUNTIME_DIRS) {
-    const prefix = `app/resources/app/${dir}/`;
+    const encodedPrefix = `${encodeMsixPartName(`app/resources/app/${dir}`)}/`;
     const hasFile = normalizedList.some(
-      (entry) => entry.startsWith(prefix) && entry.length > prefix.length && !entry.endsWith('/'),
+      (entry) => entry.startsWith(encodedPrefix) && entry.length > encodedPrefix.length && !entry.endsWith('/'),
     );
     if (!hasFile) {
       missing.push(`app/resources/app/${dir}`);
