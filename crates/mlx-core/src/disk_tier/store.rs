@@ -777,11 +777,26 @@ impl<S: StateBytes> HybridStateStore<S> {
     pub(crate) fn promote(&mut self, id: EntryId, state: S) -> bool {
         match self.get_mut(id) {
             Some(entry) if entry.ram.is_none() => {
+                entry.cached_bytes = state.state_bytes();
                 entry.ram = Some(state);
                 self.changed();
                 true
             }
             _ => false,
+        }
+    }
+
+    /// Installs or replaces `id`'s RAM copy and updates `cached_bytes`
+    /// atomically; false when `id` is gone.
+    pub(crate) fn replace_ram(&mut self, id: EntryId, state: S) -> bool {
+        match self.get_mut(id) {
+            Some(entry) => {
+                entry.cached_bytes = state.state_bytes();
+                entry.ram = Some(state);
+                self.changed();
+                true
+            }
+            None => false,
         }
     }
 
@@ -1353,5 +1368,75 @@ mod tests {
     fn new_store_keeps_the_block_size() {
         assert_eq!(Store::new(16).block_size(), 16);
         assert_eq!(Store::new(0).block_size(), 1);
+    }
+
+    #[test]
+    fn promote_and_replace_ram_update_cached_bytes() {
+        let fx = Fixture::new();
+        let mut store = Store::new(BS);
+        let a = lineage(1, 32);
+        let copy = DiskCopy {
+            key: mlx_paged_attn::ColdCacheKey::chain(
+                mlx_paged_attn::ColdGroup::DFlash2State,
+                mlx_paged_attn::ColdCacheFingerprint::from_components([b"store-test".as_slice()]),
+                None,
+                &a[..16],
+                &[],
+                0,
+                0,
+            ),
+            bytes: 1_000,
+            landed: true,
+            window_begin: 0,
+            chain_owed: false,
+        };
+        let id = store
+            .adopt_disk(Lineage::text(&a, 0), 900, StateClass::Ordinary, copy, 1)
+            .unwrap();
+        let lin = lineage_bytes(a.len(), 2);
+        assert_eq!(store.get(id).unwrap().state_bytes(), lin);
+        assert_eq!(store.get(id).unwrap().resident_bytes(), 900 + lin);
+
+        let smaller = TestState {
+            name: "smaller".to_owned(),
+            bytes: 250,
+            log: fx.log.clone(),
+        };
+        assert!(store.promote(id, smaller));
+        assert_eq!(store.get(id).unwrap().state_bytes(), 250 + lin);
+        assert_eq!(store.get(id).unwrap().resident_bytes(), 250 + lin);
+        assert_eq!(store.bytes().state_bytes, 250 + lin);
+
+        // `promote` refuses when RAM is already present, leaving bytes unchanged.
+        let rejected = TestState {
+            name: "rejected".to_owned(),
+            bytes: 500,
+            log: fx.log.clone(),
+        };
+        assert!(!store.promote(id, rejected));
+        assert_eq!(store.get(id).unwrap().state_bytes(), 250 + lin);
+
+        // `replace_ram` atomically swaps RAM and updates `cached_bytes`.
+        let larger = TestState {
+            name: "larger".to_owned(),
+            bytes: 420,
+            log: fx.log.clone(),
+        };
+        assert!(store.replace_ram(id, larger));
+        assert_eq!(store.get(id).unwrap().state_bytes(), 420 + lin);
+        assert_eq!(store.bytes().state_bytes, 420 + lin);
+        assert!(!store.replace_ram(999, fx.state("missing")));
+
+        // `replace_ram` also works on a disk-only entry (`ram.is_none()`).
+        let _ = store.drop_ram(id);
+        assert_eq!(store.get(id).unwrap().state_bytes(), lin);
+        let reinstalled = TestState {
+            name: "reinstalled".to_owned(),
+            bytes: 310,
+            log: fx.log.clone(),
+        };
+        assert!(store.replace_ram(id, reinstalled));
+        assert_eq!(store.get(id).unwrap().state_bytes(), 310 + lin);
+        assert_eq!(store.bytes().state_bytes, 310 + lin);
     }
 }

@@ -560,6 +560,11 @@ impl DFlash2ContextCache {
         })
     }
 
+    /// Host heap capacity (in bytes) held by the token provenance history.
+    pub(crate) fn host_bytes(&self) -> u64 {
+        (self.token_history.capacity() as u64).saturating_mul(std::mem::size_of::<u32>() as u64)
+    }
+
     /// Drops every row and the provenance; the ring buffers stay for the
     /// next lane (Splash `QwenStateStorage::releaseLane`).
     pub(crate) fn reset(&mut self) {

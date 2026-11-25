@@ -4429,31 +4429,27 @@ impl PagedKVCacheAdapter {
         Ok(())
     }
 
-    /// Read the raw physical blocks (all layers, exact INT8 KTM + scales or BF16 bytes)
-    /// covering the live sliding window ending at block-aligned `boundary` for `seq_id`.
-    ///
-    /// Returns `live_blocks` entries in logical block order `[first_live_block .. boundary/bs)`,
-    /// each entry containing `num_layers` pairs of `(key_blob, value_blob)`.
-    pub fn read_sliding_raw_blocks_for(
+    fn validate_read_sliding_raw_args(
         &self,
+        context: &str,
         seq_id: SeqId,
         boundary: u32,
-    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, String> {
+    ) -> Result<(&SequenceBlockTable, u32, u32, u32), String> {
         if self.sliding_window == 0 {
-            return Err("read_sliding_raw_blocks_for requires a sliding adapter".to_string());
+            return Err(format!("{context} requires a sliding adapter"));
         }
         if boundary == 0 || !boundary.is_multiple_of(self.block_size) {
             return Err(format!(
-                "read_sliding_raw_blocks_for requires a positive multiple of block_size={}, got {boundary}",
+                "{context} requires a positive multiple of block_size={}, got {boundary}",
                 self.block_size
             ));
         }
         let table = self
             .block_table_for(seq_id)
-            .ok_or_else(|| format!("read_sliding_raw_blocks_for: missing seq {seq_id}"))?;
+            .ok_or_else(|| format!("{context}: missing seq {seq_id}"))?;
         if table.num_tokens() < boundary {
             return Err(format!(
-                "read_sliding_raw_blocks_for: boundary {boundary} exceeds seq {seq_id} tokens {}",
+                "{context}: boundary {boundary} exceeds seq {seq_id} tokens {}",
                 table.num_tokens()
             ));
         }
@@ -4464,6 +4460,21 @@ impl PagedKVCacheAdapter {
             .ok_or_else(|| "sliding adapter is missing its reserved null block".to_string())?;
         let first_live_block = boundary.saturating_sub(self.sliding_window) / self.block_size;
         let total_blocks = boundary / self.block_size;
+        Ok((table, first_live_block, total_blocks, null_id))
+    }
+
+    /// Read the raw physical blocks (all layers, exact INT8 KTM + scales or BF16 bytes)
+    /// covering the live sliding window ending at block-aligned `boundary` for `seq_id`.
+    ///
+    /// Returns `live_blocks` entries in logical block order `[first_live_block .. boundary/bs)`,
+    /// each entry containing `num_layers` pairs of `(key_blob, value_blob)`.
+    pub fn read_sliding_raw_blocks_for(
+        &self,
+        seq_id: SeqId,
+        boundary: u32,
+    ) -> Result<Vec<Vec<(Vec<u8>, Vec<u8>)>>, String> {
+        let (table, first_live_block, total_blocks, null_id) =
+            self.validate_read_sliding_raw_args("read_sliding_raw_blocks_for", seq_id, boundary)?;
         let live_blocks = total_blocks.saturating_sub(first_live_block) as usize;
         let mut out = Vec::with_capacity(live_blocks);
         for b_idx in first_live_block as usize..total_blocks as usize {
@@ -4481,27 +4492,80 @@ impl PagedKVCacheAdapter {
         Ok(out)
     }
 
-    /// Restore a sliding-window cache group at block-aligned `boundary` directly from raw
-    /// physical block payloads (`live_blocks` × `num_layers` × `(key_blob, value_blob)`).
+    /// Read the raw physical blocks (all layers, exact INT8 KTM + scales or BF16 bytes)
+    /// covering the live sliding window ending at block-aligned `boundary` for `seq_id`
+    /// into ONE contiguous buffer of length `live_blocks * num_layers * (key_blob + value_blob)`.
     ///
-    /// Preserves bit-exact INT8 KTM codes + scale planes or BF16 blocks without dequantization,
-    /// placing the reserved null sentinel in logical blocks `[0 .. first_live_block)`.
-    pub fn restore_sliding_raw_blocks_for(
-        &mut self,
+    /// Layout: logical live block `i` in `[0..live_blocks)` occupies
+    /// `[i * block_stride .. (i + 1) * block_stride)`, layer `l` in `[0..num_layers)` occupies
+    /// `[l * (k + v) .. (l + 1) * (k + v))`, with keys at `[0..k)` and values at `[k..k + v)`.
+    pub fn read_sliding_raw_blocks_flat_for(
+        &self,
         seq_id: SeqId,
+        boundary: u32,
+    ) -> Result<Vec<u8>, String> {
+        let (table, first_live_block, total_blocks, null_id) = self
+            .validate_read_sliding_raw_args("read_sliding_raw_blocks_flat_for", seq_id, boundary)?;
+        let live_blocks = total_blocks.saturating_sub(first_live_block) as usize;
+        let (key_blob, value_blob) = self.layer_kv_pool.block_blob_bytes()?;
+        let num_layers = self.layer_kv_pool.num_layers();
+        let per_layer_u64 = key_blob.checked_add(value_blob).ok_or_else(|| {
+            "read_sliding_raw_blocks_flat_for: per-layer size overflows u64".to_string()
+        })?;
+        let block_stride_u64 = per_layer_u64
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| {
+                "read_sliding_raw_blocks_flat_for: block stride overflows u64".to_string()
+            })?;
+        let total_bytes_u64 = block_stride_u64
+            .checked_mul(live_blocks as u64)
+            .ok_or_else(|| {
+                "read_sliding_raw_blocks_flat_for: total size overflows u64".to_string()
+            })?;
+        let block_stride = usize::try_from(block_stride_u64).map_err(|_| {
+            "read_sliding_raw_blocks_flat_for: block stride overflows usize".to_string()
+        })?;
+        let total_bytes = usize::try_from(total_bytes_u64).map_err(|_| {
+            "read_sliding_raw_blocks_flat_for: total size overflows usize".to_string()
+        })?;
+
+        // Validate every live block slot before allocating the flat buffer.
+        for b_idx in first_live_block as usize..total_blocks as usize {
+            let block = table.blocks().get(b_idx).ok_or_else(|| {
+                format!("read_sliding_raw_blocks_flat_for: missing block {b_idx} for seq {seq_id}")
+            })?;
+            if block.block_id == null_id {
+                return Err(format!(
+                    "read_sliding_raw_blocks_flat_for: live block {b_idx} was already pruned to null"
+                ));
+            }
+        }
+
+        let mut out = vec![0u8; total_bytes];
+        for (slot_idx, b_idx) in (first_live_block as usize..total_blocks as usize).enumerate() {
+            let block_id = table.blocks()[b_idx].block_id;
+            let start = slot_idx * block_stride;
+            self.layer_kv_pool
+                .read_block_all_layers_into(block_id, &mut out[start..start + block_stride])?;
+        }
+        Ok(out)
+    }
+
+    fn validate_restore_sliding_raw_args(
+        &self,
+        context: &str,
         prompt_tokens: &[u32],
         boundary: u32,
-        raw_blocks: &[Vec<(Vec<u8>, Vec<u8>)>],
-    ) -> Result<(), String> {
+    ) -> Result<(u32, u32), String> {
         if self.sliding_window == 0 {
-            return Err("restore_sliding_raw_blocks_for requires a sliding adapter".to_string());
+            return Err(format!("{context} requires a sliding adapter"));
         }
         if boundary == 0
             || !boundary.is_multiple_of(self.block_size)
             || boundary as usize > prompt_tokens.len()
         {
             return Err(format!(
-                "restore_sliding_raw_blocks_for: invalid boundary {boundary} for block_size={} prompt_len={}",
+                "{context}: invalid boundary {boundary} for block_size={} prompt_len={}",
                 self.block_size,
                 prompt_tokens.len()
             ));
@@ -4509,12 +4573,22 @@ impl PagedKVCacheAdapter {
         let first_live_block = boundary.saturating_sub(self.sliding_window) / self.block_size;
         let total_blocks = boundary / self.block_size;
         let live_blocks = total_blocks.saturating_sub(first_live_block);
-        if raw_blocks.len() != live_blocks as usize {
-            return Err(format!(
-                "restore_sliding_raw_blocks_for: expected {live_blocks} live blocks, got {}",
-                raw_blocks.len()
-            ));
-        }
+        Ok((first_live_block, live_blocks))
+    }
+
+    fn restore_sliding_raw_blocks_inner<'a, F>(
+        &mut self,
+        context: &str,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        first_live_block: u32,
+        live_blocks: u32,
+        build_uploads: F,
+    ) -> Result<(), String>
+    where
+        F: FnOnce(&[u32]) -> Vec<(u32, Vec<(&'a [u8], &'a [u8])>)>,
+    {
         let null_block = self
             .null_block
             .as_ref()
@@ -4548,7 +4622,7 @@ impl PagedKVCacheAdapter {
                         Err(allocated_count) => {
                             let _ = self.release_request_for(seq_id);
                             return Err(format!(
-                                "restore_sliding_raw_blocks_for could allocate only {allocated_count} of \
+                                "{context} could allocate only {allocated_count} of \
                                  {live_blocks} live blocks after pool growth"
                             ));
                         }
@@ -4556,7 +4630,7 @@ impl PagedKVCacheAdapter {
                 } else {
                     let _ = self.release_request_for(seq_id);
                     return Err(format!(
-                        "restore_sliding_raw_blocks_for could allocate only {shortfall_held} of \
+                        "{context} could allocate only {shortfall_held} of \
                          {live_blocks} live blocks"
                     ));
                 }
@@ -4564,17 +4638,7 @@ impl PagedKVCacheAdapter {
         };
 
         let block_ids: Vec<u32> = allocated.iter().map(|b| b.block_id).collect();
-        let uploads: Vec<(u32, Vec<(&[u8], &[u8])>)> = block_ids
-            .iter()
-            .zip(raw_blocks.iter())
-            .map(|(&block_id, layer_blobs)| {
-                let refs = layer_blobs
-                    .iter()
-                    .map(|(k, v)| (k.as_slice(), v.as_slice()))
-                    .collect::<Vec<_>>();
-                (block_id, refs)
-            })
-            .collect();
+        let uploads = build_uploads(&block_ids);
         if let Err(error) = self.layer_kv_pool.write_blocks_all_layers(&uploads) {
             if let Ok(mut guard) = self.allocator.lock() {
                 for block in allocated {
@@ -4582,9 +4646,7 @@ impl PagedKVCacheAdapter {
                 }
             }
             let _ = self.release_request_for(seq_id);
-            return Err(format!(
-                "restore_sliding_raw_blocks_for failed to upload blocks: {error}"
-            ));
+            return Err(format!("{context} failed to upload blocks: {error}"));
         }
 
         let Some(table) = self.block_table.as_mut() else {
@@ -4594,10 +4656,9 @@ impl PagedKVCacheAdapter {
                 }
             }
             let _ = self.release_request_for(seq_id);
-            return Err(
-                "restore_sliding_raw_blocks_for: begin_request did not install a block table"
-                    .to_string(),
-            );
+            return Err(format!(
+                "{context}: begin_request did not install a block table"
+            ));
         };
         for _ in 0..first_live_block {
             table.add_block(Arc::clone(&null_block));
@@ -4616,6 +4677,137 @@ impl PagedKVCacheAdapter {
         #[cfg(target_os = "macos")]
         self.meta.invalidate(MetadataClear::AttentionInputs);
         Ok(())
+    }
+
+    /// Restore a sliding-window cache group at block-aligned `boundary` directly from raw
+    /// physical block payloads (`live_blocks` × `num_layers` × `(key_blob, value_blob)`).
+    ///
+    /// Preserves bit-exact INT8 KTM codes + scale planes or BF16 blocks without dequantization,
+    /// placing the reserved null sentinel in logical blocks `[0 .. first_live_block)`.
+    pub fn restore_sliding_raw_blocks_for(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        raw_blocks: &[Vec<(Vec<u8>, Vec<u8>)>],
+    ) -> Result<(), String> {
+        let (first_live_block, live_blocks) = self.validate_restore_sliding_raw_args(
+            "restore_sliding_raw_blocks_for",
+            prompt_tokens,
+            boundary,
+        )?;
+        if raw_blocks.len() != live_blocks as usize {
+            return Err(format!(
+                "restore_sliding_raw_blocks_for: expected {live_blocks} live blocks, got {}",
+                raw_blocks.len()
+            ));
+        }
+        self.restore_sliding_raw_blocks_inner(
+            "restore_sliding_raw_blocks_for",
+            seq_id,
+            prompt_tokens,
+            boundary,
+            first_live_block,
+            live_blocks,
+            |block_ids| {
+                block_ids
+                    .iter()
+                    .zip(raw_blocks.iter())
+                    .map(|(&block_id, layer_blobs)| {
+                        let refs = layer_blobs
+                            .iter()
+                            .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                            .collect::<Vec<_>>();
+                        (block_id, refs)
+                    })
+                    .collect()
+            },
+        )
+    }
+
+    /// Restore a sliding-window cache group at block-aligned `boundary` directly from one
+    /// contiguous flat buffer (`live_blocks * num_layers * (key_blob + value_blob)`).
+    ///
+    /// Preserves bit-exact INT8 KTM codes + scale planes or BF16 blocks without dequantization
+    /// and without copying block payloads on the heap, placing the reserved null sentinel in
+    /// logical blocks `[0 .. first_live_block)`.
+    pub fn restore_sliding_raw_blocks_flat_for(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        flat_bytes: &[u8],
+    ) -> Result<(), String> {
+        let (first_live_block, live_blocks) = self.validate_restore_sliding_raw_args(
+            "restore_sliding_raw_blocks_flat_for",
+            prompt_tokens,
+            boundary,
+        )?;
+        let (key_blob, value_blob) = self.layer_kv_pool.block_blob_bytes()?;
+        let num_layers = self.layer_kv_pool.num_layers();
+        let per_layer_u64 = key_blob.checked_add(value_blob).ok_or_else(|| {
+            "restore_sliding_raw_blocks_flat_for: per-layer size overflows u64".to_string()
+        })?;
+        let block_stride_u64 = per_layer_u64
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| {
+                "restore_sliding_raw_blocks_flat_for: block stride overflows u64".to_string()
+            })?;
+        let expected_bytes_u64 = block_stride_u64
+            .checked_mul(u64::from(live_blocks))
+            .ok_or_else(|| {
+                "restore_sliding_raw_blocks_flat_for: total size overflows u64".to_string()
+            })?;
+        let key_len = usize::try_from(key_blob).map_err(|_| {
+            "restore_sliding_raw_blocks_flat_for: key blob size overflows usize".to_string()
+        })?;
+        let value_len = usize::try_from(value_blob).map_err(|_| {
+            "restore_sliding_raw_blocks_flat_for: value blob size overflows usize".to_string()
+        })?;
+        let layer_stride = usize::try_from(per_layer_u64).map_err(|_| {
+            "restore_sliding_raw_blocks_flat_for: per-layer size overflows usize".to_string()
+        })?;
+        let block_stride = usize::try_from(block_stride_u64).map_err(|_| {
+            "restore_sliding_raw_blocks_flat_for: block stride overflows usize".to_string()
+        })?;
+        let expected_bytes = usize::try_from(expected_bytes_u64).map_err(|_| {
+            "restore_sliding_raw_blocks_flat_for: total size overflows usize".to_string()
+        })?;
+        if flat_bytes.len() != expected_bytes {
+            return Err(format!(
+                "restore_sliding_raw_blocks_flat_for: expected {expected_bytes} bytes \
+                 ({live_blocks} live blocks x {num_layers} layers x ({key_blob} + {value_blob}) bytes), \
+                 got {}",
+                flat_bytes.len()
+            ));
+        }
+
+        self.restore_sliding_raw_blocks_inner(
+            "restore_sliding_raw_blocks_flat_for",
+            seq_id,
+            prompt_tokens,
+            boundary,
+            first_live_block,
+            live_blocks,
+            |block_ids| {
+                block_ids
+                    .iter()
+                    .enumerate()
+                    .map(|(b_idx, &block_id)| {
+                        let block_base = b_idx * block_stride;
+                        let mut refs = Vec::with_capacity(num_layers);
+                        for layer in 0..num_layers {
+                            let layer_base = block_base + layer * layer_stride;
+                            let k = &flat_bytes[layer_base..layer_base + key_len];
+                            let v =
+                                &flat_bytes[layer_base + key_len..layer_base + key_len + value_len];
+                            refs.push((k, v));
+                        }
+                        (block_id, refs)
+                    })
+                    .collect()
+            },
+        )
     }
 
     /// Record tokens emitted/consumed in this request. Updates
@@ -20667,6 +20859,128 @@ mod tests {
                 "restored V differs at layer {layer}"
             );
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_read_and_restore_sliding_raw_blocks_flat_roundtrip() {
+        let block_size = 32u32;
+        let sliding_window = 64u32; // 2 live blocks
+        let boundary = 96u32; // 3 total blocks -> logical block 0 pruned to null, [1..3) live
+        let num_layers = 3u32;
+        let num_blocks = 8u32;
+        let config = PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: 256,
+            head_size: 64,
+            num_kv_heads: 2,
+            num_layers,
+            max_seq_len: Some(128),
+            max_batch_size: Some(2),
+        };
+        let layout = mlx_paged_attn::PageLayout {
+            keys_token_major: true,
+            ..mlx_paged_attn::PageLayout::default()
+        };
+        let pool = match LayerKVPool::new_with_layout(
+            config,
+            num_blocks,
+            num_blocks,
+            mlx_paged_attn::metal::MetalDtype::Int8,
+            layout,
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(error) if error.contains("No Metal device found") => {
+                eprintln!(
+                    "skipping test_read_and_restore_sliding_raw_blocks_flat_roundtrip: {error}"
+                );
+                return;
+            }
+            Err(error) => panic!("create int8 sliding test pool: {error}"),
+        };
+        let (key_blob, value_blob) = pool.block_blob_bytes().expect("block_blob_bytes");
+        let k_len = key_blob as usize;
+        let v_len = value_blob as usize;
+        let live_blocks = 2usize;
+        let expected_flat_len = live_blocks * num_layers as usize * (k_len + v_len);
+
+        let allocator = Arc::new(Mutex::new(BlockAllocator::new(
+            num_blocks, num_blocks, block_size,
+        )));
+        let mut adapter = PagedKVCacheAdapter::new_sliding(
+            allocator,
+            Arc::clone(&pool),
+            block_size,
+            sliding_window,
+            128,
+        )
+        .expect("create sliding adapter");
+
+        let mut flat_payload = Vec::with_capacity(expected_flat_len);
+        for b in 0..live_blocks {
+            for l in 0..num_layers as usize {
+                for i in 0..k_len {
+                    flat_payload.push(((i * 5 + l * 31 + b * 73 + 11) % 251) as u8);
+                }
+                for i in 0..v_len {
+                    flat_payload.push(((i * 9 + l * 43 + b * 89 + 19) % 251) as u8);
+                }
+            }
+        }
+        let prompt_tokens: Vec<u32> = (0..boundary).collect();
+
+        // Wrong byte length is rejected before mutating any sequence.
+        assert!(
+            adapter
+                .restore_sliding_raw_blocks_flat_for(
+                    1,
+                    &prompt_tokens,
+                    boundary,
+                    &flat_payload[..expected_flat_len - 1]
+                )
+                .is_err()
+        );
+        assert!(adapter.block_table_for(1).is_none());
+
+        // Restore via flat path into seq 1.
+        adapter
+            .restore_sliding_raw_blocks_flat_for(1, &prompt_tokens, boundary, &flat_payload)
+            .expect("restore_sliding_raw_blocks_flat_for");
+
+        let table = adapter.block_table_for(1).expect("seq 1 table");
+        assert_eq!(table.num_tokens(), boundary);
+        assert_eq!(table.blocks().len(), 3);
+        let null_id = adapter.null_block.as_ref().expect("null block").block_id;
+        assert_eq!(table.blocks()[0].block_id, null_id);
+        assert_ne!(table.blocks()[1].block_id, null_id);
+        assert_ne!(table.blocks()[2].block_id, null_id);
+
+        // Read back via both flat and nested paths and verify byte-for-byte equality.
+        let read_flat = adapter
+            .read_sliding_raw_blocks_flat_for(1, boundary)
+            .expect("read_sliding_raw_blocks_flat_for");
+        assert_eq!(read_flat, flat_payload);
+
+        let read_nested = adapter
+            .read_sliding_raw_blocks_for(1, boundary)
+            .expect("read_sliding_raw_blocks_for");
+        let mut flattened_nested = Vec::with_capacity(expected_flat_len);
+        for block in &read_nested {
+            for (k, v) in block {
+                flattened_nested.extend_from_slice(k);
+                flattened_nested.extend_from_slice(v);
+            }
+        }
+        assert_eq!(flattened_nested, flat_payload);
+
+        // Cross-check: nested restore followed by flat readback matches bit-for-bit.
+        adapter
+            .restore_sliding_raw_blocks_for(2, &prompt_tokens, boundary, &read_nested)
+            .expect("restore_sliding_raw_blocks_for");
+        let read_flat_seq2 = adapter
+            .read_sliding_raw_blocks_flat_for(2, boundary)
+            .expect("read_sliding_raw_blocks_flat_for seq 2");
+        assert_eq!(read_flat_seq2, flat_payload);
     }
 
     /// `finalize_turn_keep_live` registers full blocks but does NOT

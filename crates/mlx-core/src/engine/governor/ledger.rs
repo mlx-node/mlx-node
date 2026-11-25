@@ -148,6 +148,9 @@ pub(crate) enum UnitKey {
     Vision(u64),
     /// A disk-only state's chain blocks still to reach the SSD tier.
     StoreChain(EntryId),
+    /// A parked speculative draft KV ring (disposable MLX GPU cache; target KV and compact
+    /// `DraftContextWindow` stay intact so the owner restores cleanly on next turn).
+    DraftContext(SeqId),
 }
 
 /// One unit a source would give up. `bytes` and `pages` may over-count

@@ -42,6 +42,7 @@ pub(crate) struct Inkling2DsparkStepper<'a> {
     inner: &'a mut Inkling2Inner,
     seq_id: SeqId,
     ctx: Inkling2DraftContext,
+    _decode_limit: crate::cache_limit::DecodeCacheLimitGuard,
     adaptive_depth: AdaptiveDraftDepth,
     tap_visits: Vec<usize>,
     tree_policy: Inkling2VerifyTreePolicy,
@@ -344,7 +345,7 @@ impl Inkling2DsparkStepper<'_> {
                     }
                 }
                 Inkling2DraftContext::Dflash2(dctx) => {
-                    if let Some(ref draft) = self.inner.dflash2 {
+                    let fused_kept = if let Some(ref draft) = self.inner.dflash2 {
                         let kept_ids: &[u32] = patch_ids
                             .or(verified_ids)
                             .or(host_ids_saved.as_deref())
@@ -359,8 +360,25 @@ impl Inkling2DsparkStepper<'_> {
                                 kept_ids.len()
                             )));
                         }
-                        dctx.append_taps(draft, &taps, &kept_ids[..keep])?;
+                        let fused = dctx.append_taps(draft, &taps, &kept_ids[..keep])?;
                         debug_assert_eq!(dctx.committed_len() as u32, committed_tokens);
+                        fused
+                    } else {
+                        None
+                    };
+                    if let Some(fused_kept) = fused_kept
+                        && self
+                            .inner
+                            .paged
+                            .as_ref()
+                            .is_some_and(|rt| rt.seq_reuse_cache(self.seq_id))
+                    {
+                        let prev_pos = committed_tokens.saturating_sub(keep as u32);
+                        self.inner.record_fused_to_draft_window_best_effort(
+                            self.seq_id,
+                            prev_pos,
+                            &fused_kept,
+                        );
                     }
                 }
             }
@@ -516,11 +534,27 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
                     }
                 }
                 Inkling2DraftContext::Dflash2(dctx) => {
-                    if let Some(ref draft) = self.inner.dflash2 {
+                    let prev_pos = dctx.committed_len() as u32;
+                    let fused_kept = if let Some(ref draft) = self.inner.dflash2 {
                         let tok = probe_tok.ok_or_else(|| {
                             Error::from_reason("Inkling2 DFlash2 AR probe missing anchor token")
                         })?;
-                        dctx.append_taps(draft, &taps, &[tok])?;
+                        dctx.append_taps(draft, &taps, &[tok])?
+                    } else {
+                        None
+                    };
+                    if let Some(fused_kept) = fused_kept
+                        && self
+                            .inner
+                            .paged
+                            .as_ref()
+                            .is_some_and(|rt| rt.seq_reuse_cache(self.seq_id))
+                    {
+                        self.inner.record_fused_to_draft_window_best_effort(
+                            self.seq_id,
+                            prev_pos,
+                            &fused_kept,
+                        );
                     }
                 }
             }
@@ -566,9 +600,7 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
     fn finish(self) -> Result<()> {
         self.ensure_clean("finish")?;
         if !self.ar_fallback {
-            self.inner
-                .dspark_turn_contexts
-                .insert(self.seq_id, self.ctx);
+            self.inner.park_turn_draft_context(self.seq_id, self.ctx);
         } else {
             self.inner.dspark_turn_contexts.remove(&self.seq_id);
         }
@@ -1161,18 +1193,36 @@ impl DsparkStepper for Inkling2DsparkStepper<'_> {
         // 5. Gather and fuse ONLY the accepted path's target taps into the DFlash2 KV ring.
         if !self.ar_fallback
             && let Inkling2DraftContext::Dflash2(dctx) = &mut self.ctx
-            && let Some(ref draft) = self.inner.dflash2
         {
-            let kept_tokens: Vec<u32> = if contiguous {
-                open.tree_tokens[..keep].to_vec()
+            let fused_kept = if let Some(ref draft) = self.inner.dflash2 {
+                let kept_tokens: Vec<u32> = if contiguous {
+                    open.tree_tokens[..keep].to_vec()
+                } else {
+                    accepted_nodes
+                        .iter()
+                        .map(|&row| open.tree_tokens[row])
+                        .collect()
+                };
+                let fused =
+                    dctx.append_taps_path(draft, &open.taps, accepted_nodes, &kept_tokens)?;
+                debug_assert_eq!(dctx.committed_len() as u32, committed_tokens);
+                fused
             } else {
-                accepted_nodes
-                    .iter()
-                    .map(|&row| open.tree_tokens[row])
-                    .collect()
+                None
             };
-            dctx.append_taps_path(draft, &open.taps, accepted_nodes, &kept_tokens)?;
-            debug_assert_eq!(dctx.committed_len() as u32, committed_tokens);
+            if let Some(fused_kept) = fused_kept
+                && self
+                    .inner
+                    .paged
+                    .as_ref()
+                    .is_some_and(|rt| rt.seq_reuse_cache(self.seq_id))
+            {
+                self.inner.record_fused_to_draft_window_best_effort(
+                    self.seq_id,
+                    open.anchor_pos,
+                    &fused_kept,
+                );
+            }
         }
         Ok(())
     }
@@ -1214,10 +1264,16 @@ impl DsparkBackend for Inkling2Inner {
             // populates the full conversation history without duplicating prior turns.
             dctx.reset_lookup_for_turn();
         }
+        let decode_limit = crate::cache_limit::coordinator().push_decode_limit(
+            crate::cache_limit::decode_cache_limit(
+                super::memory::decode_transient_bytes(&self.config, 1).max(64 << 20),
+            ),
+        );
         Ok(Inkling2DsparkStepper {
             inner: self,
             seq_id,
             ctx,
+            _decode_limit: decode_limit,
             adaptive_depth: AdaptiveDraftDepth::new(expected),
             tap_visits,
             tree_policy: Inkling2VerifyTreePolicy::from_env(),
@@ -1275,9 +1331,6 @@ impl PagedDsparkBackend for Inkling2Inner {
             .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?
             .active_seq;
 
-        // Only reuse a cached prefix on the whole-turn speculative path when `seq_id` already holds
-        // a matching live draft context at the exact prefix boundary; otherwise start fresh from
-        // position 0 so the draft context receives every token's tapped hiddens.
         let prefix = self.prime_prefix_state(tokens, reuse_cache, 0, &[], cache_salt)?;
         let boundary = prefix.effective_cached_prefix_len;
         let has_matching_draft_ctx = boundary > 0
@@ -1294,10 +1347,117 @@ impl PagedDsparkBackend for Inkling2Inner {
             return Ok(prefix);
         }
 
-        // Prefix hit had no matching draft context (e.g. cold SSD restore): restart fresh so
-        // speculative prefill seeds the draft context cleanly from position 0.
+        // Prefix hit restored from RAM/SSD StateStore (or a live continuation whose prior
+        // turn ran AR without a draft context): restore DFlash2 KV from the captured 4-bit
+        // DraftContextWindow, or skip straight to `record_only` when the suffix alone fills
+        // the entire DFlash2 sliding window (avoiding a full cold re-prefill from 0!).
+        if boundary > 0
+            && let Some(ref draft) = self.dflash2
+        {
+            let restored = self
+                .paged
+                .as_mut()
+                .and_then(|rt| rt.restored_draft_windows.remove(&seq_id))
+                .filter(|r| r.depth as usize == boundary);
+            let suffix_len = tokens.len().saturating_sub(boundary);
+            if suffix_len >= draft.config.sliding_window {
+                let mut dctx = Inkling2Dflash2Context::new(&draft.config);
+                match dctx.cache.record_only(&tokens[..boundary]) {
+                    Ok(()) => {
+                        self.dspark_turn_contexts
+                            .insert(seq_id, Inkling2DraftContext::Dflash2(Box::new(dctx)));
+                        return Ok(prefix);
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Inkling2 exclusive DFlash2 record_only failed for seq {seq_id} at \
+                             boundary {boundary} (falling back to cold prefill): {err}"
+                        );
+                        if let Some(rt) = self.paged.as_mut() {
+                            rt.invalidate_draft_window(seq_id);
+                        }
+                    }
+                }
+            } else {
+                let boundary_u32 = u32::try_from(boundary).ok();
+                let expected_slots = u32::try_from(draft.config.sliding_window).ok();
+                let packed = restored.and_then(|r| r.window);
+                let can_use_live = packed.is_some() || prefix.live_continuation;
+                let restore_res: Result<Option<Inkling2Dflash2Context>> = (|| {
+                    // Prefer an already-materialized live `DraftContextWindow` at exact
+                    // `boundary` (avoiding a duplicate `packed.to_window()` allocation when
+                    // `install_state_hit_sync` already materialized `rt.draft_windows[seq_id]`).
+                    let live_win = boundary_u32.filter(|_| can_use_live).and_then(|b| {
+                        self.paged.as_ref().and_then(|rt| {
+                            rt.draft_windows.get(&seq_id).filter(|w| {
+                                expected_slots.is_none_or(|s| w.slots() == s)
+                                    && w.width() == draft.config.context_width()
+                                    && w.end() == b
+                                    && w.begin() == b.saturating_sub(w.slots())
+                            })
+                        })
+                    });
+                    let maybe_owned_win;
+                    let win_ref = if let Some(live) = live_win {
+                        Some(live)
+                    } else if let Some(ref packed) = packed {
+                        maybe_owned_win = Some(packed.to_window()?);
+                        maybe_owned_win.as_ref()
+                    } else {
+                        None
+                    };
+                    let Some(win) = win_ref else {
+                        return Ok(None);
+                    };
+                    #[cfg(test)]
+                    if super::scheduler::FAIL_DRAFT_KV_RESTORE_SEQ.with(std::cell::Cell::get)
+                        == Some(seq_id)
+                    {
+                        super::scheduler::DRAFT_KV_RESTORE_INJECTED_COUNT
+                            .with(|c| c.set(c.get().saturating_add(1)));
+                        return Err(Error::from_reason(format!(
+                            "injected DFlash2 draft KV restore failure for seq {seq_id}"
+                        )));
+                    }
+                    let mut dctx = Inkling2Dflash2Context::new(&draft.config);
+                    dctx.cache = crate::models::qwen3_5::dflash2::DFlash2ContextCache::restore(
+                        dctx.cache,
+                        draft,
+                        win,
+                        &tokens[..boundary],
+                    )?;
+                    Ok(Some(dctx))
+                })();
+                match restore_res {
+                    Ok(Some(dctx)) => {
+                        self.dspark_turn_contexts
+                            .insert(seq_id, Inkling2DraftContext::Dflash2(Box::new(dctx)));
+                        return Ok(prefix);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "Inkling2 exclusive DFlash2 context restore failed for seq {seq_id} \
+                             at boundary {boundary} (falling back to cold prefill): {err}"
+                        );
+                        if let Some(rt) = self.paged.as_mut() {
+                            rt.invalidate_draft_window(seq_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Prefix hit had no matching draft context (e.g. bundled DSpark on a cold restore,
+        // or a legacy anchor without a draft window when `suffix_len < sliding_window`):
+        // restart fresh so speculative prefill seeds the draft context cleanly from position 0,
+        // preserving the caller's `reuse_cache` publication policy on the returned prefix state.
         self.dspark_turn_contexts.remove(&seq_id);
-        let fresh = self.prime_prefix_state(tokens, false, 0, &[], cache_salt)?;
+        let mut fresh = self.prime_prefix_state(tokens, false, 0, &[], cache_salt)?;
+        fresh.reuse_cache = reuse_cache;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.seq_reuse_cache.insert(seq_id, reuse_cache);
+        }
         let ctx = self.new_turn_draft_context()?;
         self.dspark_turn_contexts.insert(seq_id, ctx);
         Ok(fresh)
@@ -1306,7 +1466,7 @@ impl PagedDsparkBackend for Inkling2Inner {
     fn paged_prefill_with_draft_state(
         &mut self,
         suffix_tokens: &[u32],
-        _prefix: &Self::PrefixState,
+        prefix: &Self::PrefixState,
         stream: Stream,
     ) -> Result<MxArray> {
         let _ctx = StreamContext::new(stream);
@@ -1325,8 +1485,12 @@ impl PagedDsparkBackend for Inkling2Inner {
                     Box::new(Inkling2Dflash2Context::new(&draft.config))
                 }
             };
-            let logits_2d =
-                self.paged_prefill_dflash2_with_taps(seq_id, suffix_tokens, &mut draft_ctx)?;
+            let logits_2d = self.paged_prefill_dflash2_with_taps(
+                seq_id,
+                suffix_tokens,
+                prefix,
+                &mut draft_ctx,
+            )?;
             draft_ctx.eval_state()?;
             self.dspark_turn_contexts
                 .insert(seq_id, Inkling2DraftContext::Dflash2(draft_ctx));

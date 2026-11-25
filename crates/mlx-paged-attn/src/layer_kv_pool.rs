@@ -608,22 +608,13 @@ impl LayerKVPool {
     /// one machine and a crash on another is the worst pair of outcomes to
     /// choose between, so the range is checked here in ordinary Rust.
     #[cfg(target_os = "macos")]
-    fn check_slot_fits(
-        &self,
+    fn check_slot_fits_layer(
         context: &str,
         layer_idx: usize,
+        layer: &LayerPlanes,
         block_id: u32,
         bytes: &PlaneBytes,
     ) -> Result<(), String> {
-        let layer = {
-            let inner = self.inner_read();
-            inner.layers.get(layer_idx).cloned().ok_or_else(|| {
-                format!(
-                    "{context}: layer_idx {layer_idx} out of range (num_layers = {})",
-                    inner.layers.len()
-                )
-            })?
-        };
         for (plane, buffer) in layer.planes() {
             let block_bytes = bytes.of(plane);
             let slot_end = Self::block_slot_end(block_id, block_bytes).ok_or_else(|| {
@@ -644,6 +635,26 @@ impl LayerKVPool {
             }
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_slot_fits(
+        &self,
+        context: &str,
+        layer_idx: usize,
+        block_id: u32,
+        bytes: &PlaneBytes,
+    ) -> Result<(), String> {
+        let layer = {
+            let inner = self.inner_read();
+            inner.layers.get(layer_idx).cloned().ok_or_else(|| {
+                format!(
+                    "{context}: layer_idx {layer_idx} out of range (num_layers = {})",
+                    inner.layers.len()
+                )
+            })?
+        };
+        Self::check_slot_fits_layer(context, layer_idx, &layer, block_id, bytes)
     }
 
     /// [`Self::check_slot_fits`] for every layer, for the whole-block entry
@@ -2098,6 +2109,87 @@ impl LayerKVPool {
         Err("read_blocks_to_host is only supported on macOS (Metal backend)".to_string())
     }
 
+    /// Private-storage blit fallback shared by [`Self::read_block_all_layers`]
+    /// and [`Self::read_block_all_layers_into`]. Allocates exactly two staging
+    /// buffers (keys and values) for the whole block, blits every layer and
+    /// plane into its disjoint window, waits for completion, and observes the
+    /// command buffer before returning.
+    #[cfg(target_os = "macos")]
+    fn blit_block_all_layers_to_staging(
+        &self,
+        context: &'static str,
+        layers: &[LayerPlanes],
+        block_id: u32,
+        bytes: &PlaneBytes,
+    ) -> Result<(Buffer, Buffer), String> {
+        use crate::metal::MetalState;
+        use crate::metal::command_buffer::observe;
+        use metal::MTLResourceOptions;
+
+        let (key_blob, value_blob) = bytes.blob();
+        let num_layers = layers.len();
+
+        // Exactly two staging buffers for the whole block; layer `i` owns the
+        // blob window at `i * blob_bytes` in each.
+        let staging_overflow = |side: &str, per_layer: u64| {
+            format!(
+                "{context}: {side} staging size overflows u64 \
+                 ({per_layer} bytes x {num_layers} layers)"
+            )
+        };
+        let key_staging_size = key_blob
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| staging_overflow("key", key_blob))?;
+        let value_staging_size = value_blob
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| staging_overflow("value", value_blob))?;
+
+        let state = MetalState::get()?;
+        let key_staging = state
+            .device
+            .try_new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                format!("{context}: Metal device failed to allocate key staging buffer")
+            })?;
+        let value_staging = state
+            .device
+            .try_new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared)
+            .ok_or_else(|| {
+                format!("{context}: Metal device failed to allocate value staging buffer")
+            })?;
+
+        let command_buffer = state
+            .command_queue
+            .try_new_command_buffer()
+            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
+        let blit = command_buffer
+            .try_new_blit_command_encoder()
+            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            for (plane, buffer) in layer.planes() {
+                let (staging, blob) = if plane.is_key_side() {
+                    (&key_staging, key_blob)
+                } else {
+                    (&value_staging, value_blob)
+                };
+                blit.copy_from_buffer(
+                    buffer,
+                    block_id as u64 * bytes.of(plane),
+                    staging,
+                    layer_idx as u64 * blob + bytes.blob_offset(plane),
+                    bytes.of(plane),
+                );
+            }
+        }
+        blit.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        // Checked before the staging buffers are copied out, so an aborted
+        // read exposes no uninitialized bytes to callers.
+        observe(&command_buffer, context)?;
+        Ok((key_staging, value_staging))
+    }
+
     /// Capture one physical block's native packed bytes for every layer.
     /// Returns `(keys, values)` by layer, byte-identical to
     /// [`Self::read_blocks_to_host`]. Shared buffers are copied on the CPU;
@@ -2116,9 +2208,7 @@ impl LayerKVPool {
     /// GPU work at all.
     #[cfg(target_os = "macos")]
     pub fn read_block_all_layers(&self, block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
-        use crate::metal::command_buffer::observe;
-        use crate::metal::{MetalState, is_metal_extraction_supported};
-        use metal::MTLResourceOptions;
+        use crate::metal::is_metal_extraction_supported;
 
         if !is_metal_extraction_supported() {
             return Err("Metal GPU not available".to_string());
@@ -2177,70 +2267,12 @@ impl LayerKVPool {
             return Ok(result);
         }
 
-        // Exactly two staging buffers for the whole block; layer `i` owns the
-        // blob window at `i * blob_bytes` in each.
-        let staging_overflow = |side: &str, per_layer: u64| {
-            format!(
-                "LayerKVPool::read_block_all_layers: {side} staging size overflows u64 \
-                 ({per_layer} bytes x {num_layers} layers)"
-            )
-        };
-        let key_staging_size = key_blob
-            .checked_mul(num_layers as u64)
-            .ok_or_else(|| staging_overflow("key", key_blob))?;
-        let value_staging_size = value_blob
-            .checked_mul(num_layers as u64)
-            .ok_or_else(|| staging_overflow("value", value_blob))?;
-
-        let state = MetalState::get()?;
-        let key_staging = state
-            .device
-            .try_new_buffer(key_staging_size, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| {
-                "LayerKVPool::read_block_all_layers: Metal device failed to allocate key staging \
-                 buffer"
-                    .to_string()
-            })?;
-        let value_staging = state
-            .device
-            .try_new_buffer(value_staging_size, MTLResourceOptions::StorageModeShared)
-            .ok_or_else(|| {
-                "LayerKVPool::read_block_all_layers: Metal device failed to allocate value \
-                 staging buffer"
-                    .to_string()
-            })?;
-
-        let command_buffer = state
-            .command_queue
-            .try_new_command_buffer()
-            .ok_or_else(|| "Metal command queue returned no command buffer".to_string())?;
-        let blit = command_buffer
-            .try_new_blit_command_encoder()
-            .ok_or_else(|| "Metal command buffer returned no blit encoder".to_string())?;
-        for (layer_idx, layer) in layers.iter().enumerate() {
-            for (plane, buffer) in layer.planes() {
-                let (staging, blob) = if plane.is_key_side() {
-                    (&key_staging, key_blob)
-                } else {
-                    (&value_staging, value_blob)
-                };
-                blit.copy_from_buffer(
-                    buffer,
-                    block_id as u64 * bytes.of(plane),
-                    staging,
-                    layer_idx as u64 * blob + bytes.blob_offset(plane),
-                    bytes.of(plane),
-                );
-            }
-        }
-        blit.end_encoding();
-        command_buffer.commit();
-        command_buffer.wait_until_completed();
-        // Checked before the staging buffers are copied out, so an aborted
-        // read builds no `BlockLayerBytes` at all. The cold tier persists what
-        // this returns, and a half-read block written to disk as valid would
-        // be restored as corruption by some later process.
-        observe(&command_buffer, "LayerKVPool::read_block_all_layers")?;
+        let (key_staging, value_staging) = self.blit_block_all_layers_to_staging(
+            "LayerKVPool::read_block_all_layers",
+            &layers,
+            block_id,
+            &bytes,
+        )?;
 
         let key_bytes = key_blob as usize;
         let value_bytes = value_blob as usize;
@@ -2269,6 +2301,157 @@ impl LayerKVPool {
     #[cfg(not(target_os = "macos"))]
     pub fn read_block_all_layers(&self, _block_id: u32) -> Result<Vec<BlockLayerBytes>, String> {
         Err("read_block_all_layers is only supported on macOS (Metal backend)".to_string())
+    }
+
+    /// Capture one physical block's native packed bytes for every layer directly
+    /// into caller-owned flat buffer `dst` with zero per-layer allocations.
+    ///
+    /// `dst.len()` must equal `num_layers * (key_blob + value_blob)`. Layer `l`
+    /// occupies `[l * (k + v) .. (l + 1) * (k + v))`, with keys at `[0..k)` and
+    /// values at `[k..k + v)` — byte-identical to flattening
+    /// [`Self::read_block_all_layers`].
+    ///
+    /// Shared buffers are copied directly on the CPU into `dst`; private buffers
+    /// use the two-staging-buffer blit path and copy directly from staging into
+    /// `dst`. All validation and command-buffer observation run before writing
+    /// any byte of `dst`.
+    #[cfg(target_os = "macos")]
+    pub fn read_block_all_layers_into(&self, block_id: u32, dst: &mut [u8]) -> Result<(), String> {
+        use crate::metal::is_metal_extraction_supported;
+
+        if !is_metal_extraction_supported() {
+            return Err("Metal GPU not available".to_string());
+        }
+        let (layers, num_blocks) = {
+            let inner = self.inner_read();
+            (inner.layers.clone(), inner.num_blocks)
+        };
+        if layers.is_empty() {
+            return Err(
+                "LayerKVPool::read_block_all_layers_into: pool has zero layers".to_string(),
+            );
+        }
+        if block_id >= num_blocks {
+            return Err(format!(
+                "LayerKVPool::read_block_all_layers_into: block_id {} >= num_blocks {} \
+                 (out-of-range physical block)",
+                block_id, num_blocks
+            ));
+        }
+        let bytes = self.plane_bytes()?;
+        let (key_blob, value_blob) = bytes.blob();
+        let num_layers = layers.len();
+        let per_layer_bytes = key_blob.checked_add(value_blob).ok_or_else(|| {
+            format!(
+                "LayerKVPool::read_block_all_layers_into: per-layer size overflows u64 \
+                 (key_blob={key_blob}, value_blob={value_blob})"
+            )
+        })?;
+        let expected_len_u64 = per_layer_bytes
+            .checked_mul(num_layers as u64)
+            .ok_or_else(|| {
+                format!(
+                    "LayerKVPool::read_block_all_layers_into: total block size overflows u64 \
+                     ({per_layer_bytes} bytes x {num_layers} layers)"
+                )
+            })?;
+        let expected_len = usize::try_from(expected_len_u64).map_err(|_| {
+            format!(
+                "LayerKVPool::read_block_all_layers_into: total block size {expected_len_u64} \
+                 overflows usize"
+            )
+        })?;
+        if dst.len() != expected_len {
+            return Err(format!(
+                "LayerKVPool::read_block_all_layers_into: destination length {} != expected {} \
+                 ({num_layers} layers x ({key_blob} + {value_blob}) bytes)",
+                dst.len(),
+                expected_len
+            ));
+        }
+        for (layer_idx, layer) in layers.iter().enumerate() {
+            Self::check_slot_fits_layer(
+                "LayerKVPool::read_block_all_layers_into",
+                layer_idx,
+                layer,
+                block_id,
+                &bytes,
+            )?;
+        }
+
+        let key_bytes = key_blob as usize;
+        let value_bytes = value_blob as usize;
+        let layer_stride = key_bytes + value_bytes;
+
+        if layers.iter().all(LayerPlanes::all_shared) {
+            let _copy_guard = self
+                .restore_staging
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for (layer_idx, layer) in layers.iter().enumerate() {
+                let layer_dst = &mut dst[layer_idx * layer_stride..(layer_idx + 1) * layer_stride];
+                let (key_dst, value_dst) = layer_dst.split_at_mut(key_bytes);
+                for (plane, buffer) in layer.planes() {
+                    let blob = if plane.is_key_side() {
+                        &mut *key_dst
+                    } else {
+                        &mut *value_dst
+                    };
+                    let offset = bytes.blob_offset(plane) as usize;
+                    let len = bytes.of(plane) as usize;
+                    // SAFETY: the shared buffers are retained, their complete
+                    // slots were checked above, `dst.len()` matches
+                    // `num_layers * (key_bytes + value_bytes)`, and the
+                    // completed-write/pin contract plus this transfer lease
+                    // excludes mutation.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            (buffer.contents() as *const u8).add(block_id as usize * len),
+                            blob[offset..offset + len].as_mut_ptr(),
+                            len,
+                        );
+                    }
+                }
+            }
+            return Ok(());
+        }
+
+        let (key_staging, value_staging) = self.blit_block_all_layers_to_staging(
+            "LayerKVPool::read_block_all_layers_into",
+            &layers,
+            block_id,
+            &bytes,
+        )?;
+
+        // SAFETY: the shared staging buffers are CPU-accessible now that the
+        // blit has completed, they stay alive for this whole loop, and each
+        // layer reads its own disjoint window into its disjoint slice of `dst`,
+        // whose exact length `num_layers * (key_bytes + value_bytes)` was
+        // validated above.
+        unsafe {
+            let mut key_cursor = key_staging.contents() as *const u8;
+            let mut value_cursor = value_staging.contents() as *const u8;
+            let mut dst_cursor = dst.as_mut_ptr();
+            for _ in 0..num_layers {
+                std::ptr::copy_nonoverlapping(key_cursor, dst_cursor, key_bytes);
+                dst_cursor = dst_cursor.add(key_bytes);
+                std::ptr::copy_nonoverlapping(value_cursor, dst_cursor, value_bytes);
+                dst_cursor = dst_cursor.add(value_bytes);
+                key_cursor = key_cursor.add(key_bytes);
+                value_cursor = value_cursor.add(value_bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Non-macOS stub.
+    #[cfg(not(target_os = "macos"))]
+    pub fn read_block_all_layers_into(
+        &self,
+        _block_id: u32,
+        _dst: &mut [u8],
+    ) -> Result<(), String> {
+        Err("read_block_all_layers_into is only supported on macOS (Metal backend)".to_string())
     }
 
     /// Restore raw cache-layout bytes for physical blocks in one layer.
@@ -4087,6 +4270,151 @@ mod tests {
             LAYERS
         );
         drop(armed);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_read_block_all_layers_into_matches_vec_shared_private_and_int8() {
+        use crate::metal::command_buffer::arm_failure;
+
+        const LAYERS: usize = 3;
+        let cases: &[(&str, MetalDtype, PageLayout, bool)] = &[
+            (
+                "bf16-shared",
+                MetalDtype::BFloat16,
+                PageLayout::default(),
+                true,
+            ),
+            (
+                "bf16-private",
+                MetalDtype::BFloat16,
+                PageLayout::default(),
+                false,
+            ),
+            (
+                "int8-ktm-shared",
+                MetalDtype::Int8,
+                PageLayout {
+                    keys_token_major: true,
+                    ..PageLayout::default()
+                },
+                true,
+            ),
+            (
+                "int8-ktm-private",
+                MetalDtype::Int8,
+                PageLayout {
+                    keys_token_major: true,
+                    ..PageLayout::default()
+                },
+                false,
+            ),
+        ];
+
+        for &(label, dtype, layout, cpu_access) in cases {
+            let mut cfg = base_config(LAYERS as u32);
+            if layout.keys_token_major {
+                cfg.block_size = 32;
+            }
+            let pool = match LayerKVPool::new_inner_with_layout(
+                cfg,
+                4,
+                4,
+                dtype,
+                layout,
+                MetalDtype::BFloat16,
+                cpu_access,
+            ) {
+                Ok(pool) => pool,
+                Err(e) if e.contains("No Metal device found") => {
+                    eprintln!("skipping test_read_block_all_layers_into ({label}): {e}");
+                    return;
+                }
+                Err(e) => panic!("unexpected LayerKVPool construction failure ({label}): {e}"),
+            };
+
+            let (k_len, v_len) = pool.block_blob_bytes().unwrap();
+            let k_len = k_len as usize;
+            let v_len = v_len as usize;
+            let expected_len = LAYERS * (k_len + v_len);
+
+            let payload: Vec<BlockLayerBytes> = (0..LAYERS)
+                .map(|layer| {
+                    let k: Vec<u8> = (0..k_len)
+                        .map(|i| ((i * 7 + layer * 41 + 13) % 251) as u8)
+                        .collect();
+                    let v: Vec<u8> = (0..v_len)
+                        .map(|i| ((i * 11 + layer * 53 + 29) % 251) as u8)
+                        .collect();
+                    (k, v)
+                })
+                .collect();
+            let borrowed: Vec<(&[u8], &[u8])> = payload
+                .iter()
+                .map(|(k, v)| (k.as_slice(), v.as_slice()))
+                .collect();
+            pool.write_block_all_layers(2, &borrowed).unwrap();
+
+            let nested = pool.read_block_all_layers(2).unwrap();
+            assert_eq!(nested, payload, "{label}: read_block_all_layers mismatch");
+
+            let mut expected_flat = Vec::with_capacity(expected_len);
+            for (k, v) in &nested {
+                expected_flat.extend_from_slice(k);
+                expected_flat.extend_from_slice(v);
+            }
+
+            let mut actual_flat = vec![0xAAu8; expected_len];
+            pool.read_block_all_layers_into(2, &mut actual_flat)
+                .unwrap();
+            assert_eq!(
+                actual_flat, expected_flat,
+                "{label}: read_block_all_layers_into must match flattened read_block_all_layers"
+            );
+
+            // Wrong length and out-of-range block_id must fail without mutating `dst`.
+            let mut short = vec![0xCCu8; expected_len - 1];
+            assert!(pool.read_block_all_layers_into(2, &mut short).is_err());
+            assert!(
+                short.iter().all(|&b| b == 0xCC),
+                "{label}: short dst mutated"
+            );
+
+            let mut long = vec![0xDDu8; expected_len + 1];
+            assert!(pool.read_block_all_layers_into(2, &mut long).is_err());
+            assert!(long.iter().all(|&b| b == 0xDD), "{label}: long dst mutated");
+
+            let mut untouched = vec![0xEEu8; expected_len];
+            assert!(
+                pool.read_block_all_layers_into(pool.num_blocks(), &mut untouched)
+                    .is_err()
+            );
+            assert!(
+                untouched.iter().all(|&b| b == 0xEE),
+                "{label}: out-of-range dst mutated"
+            );
+
+            // Private blit path must reject an aborted command buffer without writing `dst`.
+            if !cpu_access {
+                let mut aborted_dst = vec![0x5Au8; expected_len];
+                let armed = arm_failure("LayerKVPool::read_block_all_layers_into");
+                let err = pool
+                    .read_block_all_layers_into(2, &mut aborted_dst)
+                    .expect_err("aborted blit must fail");
+                assert!(
+                    err.contains("LayerKVPool::read_block_all_layers_into"),
+                    "{label}: error must name read_block_all_layers_into: {err}"
+                );
+                assert!(
+                    aborted_dst.iter().all(|&b| b == 0x5A),
+                    "{label}: aborted blit must leave dst untouched"
+                );
+                pool.read_block_all_layers_into(2, &mut aborted_dst)
+                    .expect("arm fires once");
+                assert_eq!(aborted_dst, expected_flat, "{label}: post-arm readback");
+                drop(armed);
+            }
+        }
     }
 
     /// Every other byte-level test in this module uses `head_size = 64`, so the
