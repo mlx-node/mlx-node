@@ -30,8 +30,9 @@
  *     on a token-prefix hit. Prompt structure is never reconstructed
  *     from Rust string literals.
  *
- *   - `sendToolResult` always dispatches `chatSessionContinueTool`,
- *     since tool turns never change image state. The session enforces
+ *   - `sendToolResult` dispatches `chatSessionContinueTool` for text-only
+ *     tool results and routes image-bearing tool results through the full
+ *     start/replay path so attached images are never dropped. The session enforces
  *     a strict unresolved-ok-tool-call contract at runtime, driven by
  *     `unresolvedOkToolCallCount` (derived from `ChatResult.toolCalls`
  *     after each turn via `countOkToolCalls` /
@@ -87,6 +88,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 
+import * as core from '@mlx-node/core';
 import type { ChatConfig, ChatMessage, ChatResult, ToolCall, ToolCallResult, ToolDefinition } from '@mlx-node/core';
 
 import type { ChatStreamControl, ChatStreamEvent } from './stream.js';
@@ -193,6 +195,599 @@ export function isContextCapacityError(error: unknown): boolean {
     error instanceof ContextCapacityError ||
     (error instanceof Error && error.message.startsWith('context_length_exceeded:'))
   );
+}
+
+/** Structured prefix shared with Rust vision decode/validation errors. */
+export const IMAGE_PROCESSING_ERROR_PREFIX = 'image_processing_error:';
+
+/**
+ * Deterministic request error raised when an input image is corrupt, truncated,
+ * empty, oversized, or in an unsupported format (e.g. BMP, TIFF, HEIC).
+ */
+export class ImageProcessingError extends Error {
+  readonly code = 'image_processing_error';
+
+  constructor(detail = 'Could not process image') {
+    super(detail.startsWith(IMAGE_PROCESSING_ERROR_PREFIX) ? detail : `${IMAGE_PROCESSING_ERROR_PREFIX} ${detail}`);
+    this.name = 'ImageProcessingError';
+  }
+}
+
+/** Recognize both the typed JS preflight and native image decode failures. */
+export function isImageProcessingError(error: unknown): boolean {
+  return error instanceof ImageProcessingError || errorText(error).startsWith(IMAGE_PROCESSING_ERROR_PREFIX);
+}
+
+const MAX_IMAGE_BYTES = 32 * 1024 * 1024;
+const MAX_IMAGE_PIXELS = 32_000_000;
+
+function validatePngBytes(data: Uint8Array): boolean {
+  if (data.byteLength < 33) return false;
+  if (
+    data[0] !== 0x89 ||
+    data[1] !== 0x50 ||
+    data[2] !== 0x4e ||
+    data[3] !== 0x47 ||
+    data[4] !== 0x0d ||
+    data[5] !== 0x0a ||
+    data[6] !== 0x1a ||
+    data[7] !== 0x0a
+  ) {
+    return false;
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let pos = 8;
+  let sawIhdr = false;
+  let sawIdat = false;
+  let sawIend = false;
+  while (pos + 12 <= data.byteLength) {
+    const chunkLen = view.getUint32(pos, false);
+    const t0 = data[pos + 4]!;
+    const t1 = data[pos + 5]!;
+    const t2 = data[pos + 6]!;
+    const t3 = data[pos + 7]!;
+    const nextPos = pos + 12 + chunkLen;
+    if (nextPos > data.byteLength) return false;
+    if (!sawIhdr) {
+      if (t0 !== 0x49 || t1 !== 0x48 || t2 !== 0x44 || t3 !== 0x52 || chunkLen !== 13) return false;
+      const width = view.getUint32(pos + 8, false);
+      const height = view.getUint32(pos + 12, false);
+      if (width === 0 || height === 0 || width * height > MAX_IMAGE_PIXELS) return false;
+      sawIhdr = true;
+    } else if (t0 === 0x49 && t1 === 0x44 && t2 === 0x41 && t3 === 0x54) {
+      sawIdat = true;
+    } else if (t0 === 0x49 && t1 === 0x45 && t2 === 0x4e && t3 === 0x44) {
+      if (chunkLen !== 0) return false;
+      sawIend = true;
+      break;
+    }
+    pos = nextPos;
+  }
+  return sawIhdr && sawIdat && sawIend;
+}
+
+function validateJpegBytes(data: Uint8Array): boolean {
+  if (data.byteLength < 4 || data[0] !== 0xff || data[1] !== 0xd8 || data[2] !== 0xff) {
+    return false;
+  }
+  let pos = 2;
+  let sawSof = false;
+  let sawSos = false;
+  while (pos < data.byteLength) {
+    if (data[pos] !== 0xff) return false;
+    while (pos < data.byteLength && data[pos] === 0xff) pos++;
+    if (pos >= data.byteLength) return false;
+    const marker = data[pos++]!;
+    if (marker === 0xd9) {
+      return sawSof && sawSos;
+    }
+    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd8)) {
+      continue;
+    }
+    if (pos + 2 > data.byteLength) return false;
+    const segLen = (data[pos]! << 8) | data[pos + 1]!;
+    if (segLen < 2 || pos + segLen > data.byteLength) return false;
+    if (
+      (marker >= 0xc0 && marker <= 0xc3) ||
+      (marker >= 0xc5 && marker <= 0xc7) ||
+      (marker >= 0xc9 && marker <= 0xcb) ||
+      (marker >= 0xcd && marker <= 0xcf)
+    ) {
+      if (segLen < 7) return false;
+      const height = (data[pos + 3]! << 8) | data[pos + 4]!;
+      const width = (data[pos + 5]! << 8) | data[pos + 6]!;
+      if (width === 0 || height === 0 || width * height > MAX_IMAGE_PIXELS) return false;
+      sawSof = true;
+    }
+    pos += segLen;
+    if (marker === 0xda) {
+      sawSos = true;
+      let foundNextMarker = false;
+      while (pos < data.byteLength) {
+        if (data[pos] !== 0xff) {
+          pos++;
+          continue;
+        }
+        let next = pos + 1;
+        while (next < data.byteLength && data[next] === 0xff) next++;
+        if (next >= data.byteLength) return false;
+        const code = data[next]!;
+        if (code === 0x00 || (code >= 0xd0 && code <= 0xd7)) {
+          pos = next + 1;
+          continue;
+        }
+        pos = next - 1;
+        foundNextMarker = true;
+        break;
+      }
+      if (!foundNextMarker) return false;
+    }
+  }
+  return false;
+}
+
+function validateGifBytes(data: Uint8Array): boolean {
+  if (data.byteLength < 14) return false;
+  if (
+    data[0] !== 0x47 ||
+    data[1] !== 0x49 ||
+    data[2] !== 0x46 ||
+    data[3] !== 0x38 ||
+    (data[4] !== 0x37 && data[4] !== 0x39) ||
+    data[5] !== 0x61
+  ) {
+    return false;
+  }
+  const width = data[6]! | (data[7]! << 8);
+  const height = data[8]! | (data[9]! << 8);
+  if (width === 0 || height === 0 || width * height > MAX_IMAGE_PIXELS) return false;
+  return data[data.byteLength - 1] === 0x3b;
+}
+
+function validateWebpBytes(data: Uint8Array): boolean {
+  if (data.byteLength < 20) return false;
+  if (
+    data[0] !== 0x52 ||
+    data[1] !== 0x49 ||
+    data[2] !== 0x46 ||
+    data[3] !== 0x46 ||
+    data[8] !== 0x57 ||
+    data[9] !== 0x45 ||
+    data[10] !== 0x42 ||
+    data[11] !== 0x50
+  ) {
+    return false;
+  }
+  const riffSize = (data[4]! | (data[5]! << 8) | (data[6]! << 16) | (data[7]! << 24)) >>> 0;
+  if (riffSize < 12 || 8 + riffSize > data.byteLength) return false;
+  if (data[12] !== 0x56 || data[13] !== 0x50 || data[14] !== 0x38) return false;
+  const variant = data[15]!;
+  if (variant !== 0x20 && variant !== 0x4c && variant !== 0x58) return false;
+  const chunkSize = (data[16]! | (data[17]! << 8) | (data[18]! << 16) | (data[19]! << 24)) >>> 0;
+  return 20 + chunkSize <= data.byteLength;
+}
+
+function validateImageBytesFallback(data: Uint8Array): void {
+  if (!(data instanceof Uint8Array) || data.byteLength === 0 || data.byteLength > MAX_IMAGE_BYTES) {
+    throw new ImageProcessingError();
+  }
+  if (validatePngBytes(data) || validateJpegBytes(data) || validateGifBytes(data) || validateWebpBytes(data)) {
+    return;
+  }
+  throw new ImageProcessingError();
+}
+
+/**
+ * Preflight-validate every image attached to `messages` before committing HTTP
+ * SSE headers or starting inference. Calls native `validateImageBytes` when
+ * exposed by `@mlx-node/core`, falling back to strict pure-TS structural
+ * validation for JPEG/PNG/GIF/WebP so corrupt, truncated, or unsupported
+ * payloads (BMP, TIFF, HEIC, garbage) fail cleanly with `ImageProcessingError`.
+ */
+export function validateRequestImages(messages: readonly ChatMessage[], validator?: (data: Uint8Array) => void): void {
+  const nativeValidate = (core as unknown as { validateImageBytes?: (data: Uint8Array) => void }).validateImageBytes;
+  const validate = validator ?? nativeValidate ?? validateImageBytesFallback;
+  for (const msg of messages) {
+    if (!msg.images || msg.images.length === 0) continue;
+    for (const img of msg.images) {
+      try {
+        validate(img);
+      } catch (err) {
+        if (err instanceof ImageProcessingError) throw err;
+        throw new ImageProcessingError(err instanceof Error ? err.message : 'Could not process image');
+      }
+    }
+  }
+}
+
+/** Options for {@link validateRequestImagesAsync}. */
+export interface ValidateRequestImagesOptions {
+  /**
+   * Custom per-image validator (sync or async). Intended for tests; bypasses
+   * the process-wide validated-image digest cache.
+   */
+  validator?: (data: Uint8Array) => void | Promise<void>;
+  /**
+   * Maximum number of images validated concurrently for this request (default 4).
+   * Also capped by the process-wide shared concurrency gate
+   * (`GLOBAL_IMAGE_VALIDATION_CONCURRENCY`) so concurrent HTTP requests cannot
+   * oversubscribe libuv's worker pool or spike decoded-bitmap memory.
+   */
+  concurrency?: number;
+  /**
+   * Optional client-disconnect / cancellation signal. When aborted, queued
+   * validation work is evicted from the shared concurrency queue before
+   * creating native tasks and the returned promise rejects immediately.
+   */
+  signal?: AbortSignal;
+}
+
+const GLOBAL_IMAGE_VALIDATION_CONCURRENCY = 4;
+const IMAGE_VALIDATION_DEFAULT_CONCURRENCY = 4;
+const VALIDATED_IMAGE_CACHE_MAX_ENTRIES = 512;
+
+function createImageValidationAbortError(signal?: AbortSignal): Error {
+  const reason: unknown = signal?.reason;
+  if (reason instanceof Error) return reason;
+  const err = new Error(typeof reason === 'string' && reason.length > 0 ? reason : 'Image validation aborted');
+  err.name = 'AbortError';
+  return err;
+}
+
+interface ImageValidationSemaphoreWaiter {
+  resolve: () => void;
+  reject: (err: unknown) => void;
+  signal?: AbortSignal;
+  onAbort?: () => void;
+  settled: boolean;
+}
+
+/**
+ * Process-wide FIFO async semaphore bounding total concurrent image decodes
+ * across all HTTP endpoints (`/v1/responses`, `/v1/messages`,
+ * `/v1/messages/count_tokens`) and direct callers. Queued waiters support
+ * immediate `AbortSignal` eviction so disconnected requests release their queue
+ * position without creating native `Vec<u8>` copies or scheduling libuv work.
+ */
+class AsyncImageValidationSemaphore {
+  private active = 0;
+  private readonly queue: ImageValidationSemaphoreWaiter[] = [];
+
+  constructor(private readonly maxConcurrent: number) {}
+
+  acquire(signal?: AbortSignal): Promise<() => void> {
+    if (signal?.aborted) {
+      return Promise.reject(createImageValidationAbortError(signal));
+    }
+    if (this.active < this.maxConcurrent) {
+      this.active++;
+      return Promise.resolve(this.makeRelease());
+    }
+    return new Promise<() => void>((resolve, reject) => {
+      const waiter: ImageValidationSemaphoreWaiter = {
+        resolve: () => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          if (waiter.signal && waiter.onAbort) {
+            waiter.signal.removeEventListener('abort', waiter.onAbort);
+          }
+          resolve(this.makeRelease());
+        },
+        reject: (err: unknown) => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          if (waiter.signal && waiter.onAbort) {
+            waiter.signal.removeEventListener('abort', waiter.onAbort);
+          }
+          reject(err);
+        },
+        signal,
+        settled: false,
+      };
+      if (signal) {
+        const onAbort = (): void => {
+          const idx = this.queue.indexOf(waiter);
+          if (idx !== -1) {
+            this.queue.splice(idx, 1);
+          }
+          waiter.reject(createImageValidationAbortError(signal));
+        };
+        waiter.onAbort = onAbort;
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+      this.queue.push(waiter);
+    });
+  }
+
+  private makeRelease(): () => void {
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      this.releaseOne();
+    };
+  }
+
+  private releaseOne(): void {
+    while (this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      if (next.settled) continue;
+      if (next.signal?.aborted) {
+        next.reject(createImageValidationAbortError(next.signal));
+        continue;
+      }
+      // Transfer the active slot directly so a newcomer cannot bypass FIFO order.
+      next.resolve();
+      return;
+    }
+    this.active--;
+  }
+}
+
+const globalImageValidationSemaphore = new AsyncImageValidationSemaphore(GLOBAL_IMAGE_VALIDATION_CONCURRENCY);
+
+/**
+ * Per-validator bounded LRU of SHA-256 digests of already-validated images.
+ * Keyed on the validator function reference via a `WeakMap` so swapping in a
+ * test spy or upgrading from the pure-TS fallback to native full decode gets
+ * an isolated cache without cross-test or cross-validator contamination.
+ */
+const validatedImageCaches = new WeakMap<object, Map<string, true>>();
+
+let imageValidatorOverrideForTests: ((data: Uint8Array) => void | Promise<void>) | null = null;
+
+/**
+ * @internal Test-only hook to observe or simulate async image validation across
+ * server endpoints without patching `@mlx-node/core` module bindings.
+ */
+export function __setImageValidatorForTests(fn: ((data: Uint8Array) => void | Promise<void>) | null): void {
+  imageValidatorOverrideForTests = fn;
+}
+
+function getValidatedImageCache(validatorKey: object): Map<string, true> {
+  let cache = validatedImageCaches.get(validatorKey);
+  if (!cache) {
+    cache = new Map();
+    validatedImageCaches.set(validatorKey, cache);
+  }
+  return cache;
+}
+
+function hasValidatedImageDigest(cache: Map<string, true>, digest: string): boolean {
+  if (!cache.has(digest)) return false;
+  cache.delete(digest);
+  cache.set(digest, true);
+  return true;
+}
+
+function recordValidatedImageDigest(cache: Map<string, true>, digest: string): void {
+  if (cache.has(digest)) {
+    cache.delete(digest);
+  } else if (cache.size >= VALIDATED_IMAGE_CACHE_MAX_ENTRIES) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(digest, true);
+}
+
+function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
+}
+
+function hashImageBytes(data: Uint8Array): string {
+  return createHash('sha256').update(data).digest('hex');
+}
+
+/**
+ * Non-blocking preflight image validator for HTTP endpoints.
+ *
+ * Uses native libuv-backed `validateImageBytesAsync` when available, gated by a
+ * process-wide shared concurrency semaphore (`GLOBAL_IMAGE_VALIDATION_CONCURRENCY`,
+ * default 4) so concurrent HTTP requests cannot oversubscribe libuv's worker
+ * pool or spike decoded-bitmap memory. Honors `signal` (`AbortSignal`) before
+ * hashing, while queued in the shared semaphore, and between items so
+ * disconnected clients stop scheduling native decode work immediately. Falls
+ * back cleanly to sync `validateImageBytes` or pure-TS structural validation
+ * (yielding between images) when running against an older native addon. Caches
+ * validated image digests in a bounded per-validator LRU so unchanged
+ * multi-turn images (e.g. stateless `/v1/messages` resends and
+ * `/v1/messages/count_tokens`) are not decoded repeatedly.
+ */
+export async function validateRequestImagesAsync(
+  messages: readonly ChatMessage[],
+  options?: ValidateRequestImagesOptions | ((data: Uint8Array) => void | Promise<void>),
+): Promise<void> {
+  const opts: ValidateRequestImagesOptions = typeof options === 'function' ? { validator: options } : (options ?? {});
+  const signal = opts.signal;
+  if (signal?.aborted) {
+    throw createImageValidationAbortError(signal);
+  }
+
+  const images: Uint8Array[] = [];
+  for (const msg of messages) {
+    if (!msg.images || msg.images.length === 0) continue;
+    for (const img of msg.images) {
+      images.push(img);
+    }
+  }
+  if (images.length === 0) return;
+
+  const customValidator = opts.validator;
+  if (!customValidator) {
+    // Fast-fail empty / non-Uint8Array / oversized payloads before hashing or
+    // queuing libuv work.
+    for (const img of images) {
+      if (!(img instanceof Uint8Array) || img.byteLength === 0 || img.byteLength > MAX_IMAGE_BYTES) {
+        throw new ImageProcessingError();
+      }
+    }
+  }
+
+  const coreBindings = core as unknown as {
+    validateImageBytesAsync?: (data: Uint8Array) => Promise<void>;
+    validateImageBytes?: (data: Uint8Array) => void;
+  };
+  const overrideValidator = customValidator ? undefined : (imageValidatorOverrideForTests ?? undefined);
+  const nativeAsync =
+    customValidator || overrideValidator
+      ? undefined
+      : typeof coreBindings.validateImageBytesAsync === 'function'
+        ? coreBindings.validateImageBytesAsync
+        : undefined;
+  const syncValidator =
+    customValidator || overrideValidator || nativeAsync
+      ? undefined
+      : typeof coreBindings.validateImageBytes === 'function'
+        ? coreBindings.validateImageBytes
+        : validateImageBytesFallback;
+
+  const validatorKey: object | null = customValidator
+    ? null
+    : (overrideValidator ?? nativeAsync ?? syncValidator ?? null);
+  const cache = validatorKey ? getValidatedImageCache(validatorKey) : null;
+
+  let workItems: Array<{ img: Uint8Array; digest?: string }>;
+  if (cache) {
+    workItems = [];
+    const seenInRequest = new Set<string>();
+    let hashedSinceYield = 0;
+    for (const img of images) {
+      if (signal?.aborted) {
+        throw createImageValidationAbortError(signal);
+      }
+      if (hashedSinceYield >= IMAGE_VALIDATION_DEFAULT_CONCURRENCY) {
+        hashedSinceYield = 0;
+        await yieldToEventLoop();
+        if (signal?.aborted) {
+          throw createImageValidationAbortError(signal);
+        }
+      }
+      const digest = hashImageBytes(img);
+      hashedSinceYield++;
+      if (seenInRequest.has(digest) || hasValidatedImageDigest(cache, digest)) {
+        continue;
+      }
+      seenInRequest.add(digest);
+      workItems.push({ img, digest });
+    }
+  } else {
+    workItems = images.map((img) => ({ img }));
+  }
+
+  if (workItems.length === 0) return;
+
+  const rawConcurrency = opts.concurrency ?? IMAGE_VALIDATION_DEFAULT_CONCURRENCY;
+  const requestedConcurrency = Math.max(
+    1,
+    Math.min(workItems.length, GLOBAL_IMAGE_VALIDATION_CONCURRENCY, Math.floor(rawConcurrency) || 1),
+  );
+  // On the synchronous fallback path, running >1 JS worker provides zero
+  // parallelism and would execute multiple sync decodes back-to-back in one
+  // turn. Serialize with an event-loop yield before each image instead.
+  const workerCount = syncValidator ? 1 : requestedConcurrency;
+
+  let nextIndex = 0;
+  let firstError: ImageProcessingError | null = null;
+  // Internal per-request abort controller: fires on either caller `signal`
+  // abort OR the first validation failure so queued sibling workers leave the
+  // shared semaphore immediately without waiting behind other requests.
+  const requestAbort = new AbortController();
+  let onExternalAbort: (() => void) | null = null;
+  let externalAbortPromise: Promise<never> | null = null;
+  if (signal) {
+    externalAbortPromise = new Promise<never>((_resolve, reject) => {
+      onExternalAbort = () => {
+        const err = createImageValidationAbortError(signal);
+        requestAbort.abort(err);
+        reject(err);
+      };
+      if (signal.aborted) {
+        onExternalAbort();
+      } else {
+        signal.addEventListener('abort', onExternalAbort, { once: true });
+      }
+    });
+    // Avoid unhandled rejection if `workersPromise` settles first.
+    externalAbortPromise.catch(() => {});
+  }
+
+  const runWorker = async (): Promise<void> => {
+    while (firstError === null && !requestAbort.signal.aborted) {
+      const idx = nextIndex++;
+      if (idx >= workItems.length) return;
+      const item = workItems[idx]!;
+      let release: (() => void) | null = null;
+      try {
+        release = await globalImageValidationSemaphore.acquire(requestAbort.signal);
+        if (firstError !== null || requestAbort.signal.aborted) return;
+
+        if (customValidator) {
+          const res = customValidator(item.img);
+          if (res && typeof (res as Promise<void>).then === 'function') {
+            await res;
+          } else {
+            await yieldToEventLoop();
+          }
+        } else if (overrideValidator) {
+          const res = overrideValidator(item.img);
+          if (res && typeof (res as Promise<void>).then === 'function') {
+            await res;
+          } else {
+            await yieldToEventLoop();
+          }
+        } else if (nativeAsync) {
+          await nativeAsync(item.img);
+        } else if (syncValidator) {
+          await yieldToEventLoop();
+          if (firstError !== null || requestAbort.signal.aborted) return;
+          syncValidator(item.img);
+        }
+        if (cache && item.digest !== undefined) {
+          recordValidatedImageDigest(cache, item.digest);
+        }
+      } catch (err) {
+        if (requestAbort.signal.aborted) {
+          return;
+        }
+        if (firstError === null) {
+          firstError =
+            err instanceof ImageProcessingError
+              ? err
+              : new ImageProcessingError(err instanceof Error ? err.message : 'Could not process image');
+          requestAbort.abort(firstError);
+        }
+        return;
+      } finally {
+        release?.();
+      }
+    }
+  };
+
+  const workersPromise = Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+  // Avoid unhandled rejection if `externalAbortPromise` wins the race while an
+  // already-running worker finishes and releases its semaphore slot.
+  workersPromise.catch(() => {});
+
+  try {
+    if (externalAbortPromise) {
+      await Promise.race([workersPromise, externalAbortPromise]);
+    } else {
+      await workersPromise;
+    }
+  } finally {
+    if (signal && onExternalAbort) {
+      signal.removeEventListener('abort', onExternalAbort);
+    }
+  }
+
+  if (signal?.aborted) {
+    throw createImageValidationAbortError(signal);
+  }
+  if (firstError !== null) {
+    throw firstError;
+  }
 }
 
 /**
@@ -1372,7 +1967,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async sendToolResult(
     toolCallId: string,
     content: string,
-    opts: { isError?: boolean; config?: ChatConfig; signal?: AbortSignal } = {},
+    opts: { isError?: boolean; images?: Uint8Array[]; config?: ChatConfig; signal?: AbortSignal } = {},
   ): Promise<ChatResult> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -1380,29 +1975,27 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResult');
     this.inFlight = true;
     try {
-      const { isError, config, signal } = opts;
+      const { isError, images, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
+      const hasImages = images != null && images.length > 0;
       const toolMsg: ChatMessage = {
         role: 'tool',
         content,
         toolCallId,
         isError,
+        ...(hasImages ? { images } : {}),
       };
+      // A cold native session (turnCount===0), a recovery replay, or a tool
+      // result carrying image(s) cannot delta against the live cache (native
+      // `TurnKind::Continue` rejects media-bearing pending messages with
+      // `IMAGE_CHANGE_REQUIRES_SESSION_RESTART:`). Route through the cold
+      // start path so the full history plus this tool message (including any
+      // attached images) is rendered and `lastImagesKey` is updated on commit.
+      if (this.turnCount === 0 || this.needsFullReplay || hasImages) {
+        return await this.replayToolResultThroughStartPath(toolMsg, mergedConfig, signal);
+      }
       const pendingHistory = this.historyWithPending(toolMsg);
       const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
-      // A cold native session (turnCount===0) has no live KV to delta
-      // against — the typical cause is an interrupted media-held replay
-      // whose rollback wiped the cache and reset the counter while
-      // leaving the unresolved tool-call flag set. Mirror `send()`'s
-      // turn-0 routing: replay the preserved history through the cold
-      // start path instead of dispatching a delta that the native side
-      // would reject with an un-prefixed "requires an initialized
-      // session" error. A normal tool result always follows a prior
-      // tool-call turn (turnCount>=1), so this never fires on the happy
-      // path.
-      if (this.turnCount === 0 || this.needsFullReplay) {
-        return await this.replayToolResultThroughStartPath(toolMsg, constrainedConfig, signal);
-      }
       try {
         const result = await this.runNonStreamingNative(
           'continueTool',
@@ -1452,11 +2045,11 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
    * full preserved history (including the prior media turn and the
    * unresolved tool-call assistant turn) plus this tool message. Used
    * when the native session is cold (turnCount===0 — e.g. after an
-   * interrupted media-held replay rolled the cache back) and by the
-   * media-held rejection catch. `mediaChanged=true` forces a
-   * native cache invalidation so the prefill starts from a guaranteed-clean
-   * owner; `isFirstTurn=false` because a tool result always follows a prior
-   * tool-call turn.
+   * interrupted media-held replay rolled the cache back), when a tool
+   * result carries images, and by the media-held rejection catch.
+   * `mediaChanged=true` forces a native cache invalidation so the prefill
+   * starts from a guaranteed-clean owner; `isFirstTurn=false` because a
+   * tool result always follows a prior tool-call turn.
    */
   private async replayToolResultThroughStartPath(
     toolMsg: ChatMessage,
@@ -1479,7 +2072,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   async *sendToolResultStream(
     toolCallId: string,
     content: string,
-    opts: { isError?: boolean; config?: ChatConfig; signal?: AbortSignal } = {},
+    opts: { isError?: boolean; images?: Uint8Array[]; config?: ChatConfig; signal?: AbortSignal } = {},
   ): AsyncGenerator<ChatStreamEvent> {
     if (this.inFlight) {
       throw new Error('ChatSession: concurrent send() not allowed; await the previous call first');
@@ -1487,30 +2080,26 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
     this.assertCanSendToolResult('sendToolResultStream');
     this.inFlight = true;
     try {
-      const { isError, config, signal } = opts;
+      const { isError, images, config, signal } = opts;
       const mergedConfig = this.mergeConfig(config);
+      const hasImages = images != null && images.length > 0;
       const toolMsg: ChatMessage = {
         role: 'tool',
         content,
         toolCallId,
         isError,
+        ...(hasImages ? { images } : {}),
       };
-      const pendingHistory = this.historyWithPending(toolMsg);
-      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
-      // A cold native session (turnCount===0) has no live KV to delta
-      // against — typically the residue of an interrupted media-held
-      // replay whose rollback wiped the cache and reset the counter
-      // while leaving the unresolved tool-call flag set. Mirror
-      // `sendStream()`'s turn-0 routing: replay the preserved history
-      // through the cold start stream and return before the
-      // delta/commit machinery so the start path owns the history push,
-      // turnCount increment, and media-key rehydration. A normal tool
-      // result always follows a prior tool-call turn (turnCount>=1), so
-      // this never fires on the happy path.
-      if (this.turnCount === 0 || this.needsFullReplay) {
-        yield* this.replayToolResultThroughStartStreamPath(toolMsg, constrainedConfig, signal);
+      // Mirror `sendToolResult`: a cold session, recovery replay, or
+      // image-bearing tool result routes through the cold start stream so the
+      // full history plus this tool message (including any attached images) is
+      // rendered and `lastImagesKey` is updated on commit.
+      if (this.turnCount === 0 || this.needsFullReplay || hasImages) {
+        yield* this.replayToolResultThroughStartStreamPath(toolMsg, mergedConfig, signal);
         return;
       }
+      const pendingHistory = this.historyWithPending(toolMsg);
+      const constrainedConfig = await this.constrainToContextCapacity(pendingHistory, mergedConfig);
       let sawFinal = false;
       let accumulated = '';
       let accumulatedVisible = '';
@@ -2195,6 +2784,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
       budget != null &&
       Number.isSafeInteger(budget) &&
       budget > 0 &&
+      Number.isSafeInteger(requested) &&
       Number.isSafeInteger(maxNewTokens) &&
       maxNewTokens > 0
     ) {
@@ -2514,7 +3104,7 @@ export class ChatSession<M extends SessionCapableModel = SessionCapableModel> {
   private computeTrailingImagesKey(): string | null {
     for (let i = this.history.length - 1; i >= 0; i--) {
       const msg = this.history[i];
-      if (msg?.role === 'user' && msg.images && msg.images.length > 0) {
+      if ((msg?.role === 'user' || msg?.role === 'tool') && msg.images && msg.images.length > 0) {
         return computeByteListKey(msg.images);
       }
     }

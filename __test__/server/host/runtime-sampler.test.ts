@@ -334,6 +334,30 @@ describe('runtime sampler', () => {
     });
   });
 
+  it('wakes up at SCHED_IDLE_SETTLE_MS so brief idle gaps (< 5 s) still capture scheduler stats', async () => {
+    const binding = fakeBinding();
+    binding.state.begun = 1;
+    binding.state.live = 1;
+    const records = start([binding.entry]);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(binding.schedulerStats).not.toHaveBeenCalled();
+
+    // Burst ends right before the next busy tick (750 ms after settle would still beat HEARTBEAT_IDLE_MS = 5 s).
+    binding.state.live = 0;
+    binding.state.lastSettleAt = Date.now() + 750;
+    await vi.advanceTimersByTimeAsync(1_000);
+    // At tick time (lastSettleAt + 250 ms < 500 ms), snapshot must wait for settle.
+    expect(binding.schedulerStats).not.toHaveBeenCalled();
+    const samplesBefore = samples(records).length;
+
+    // 250 ms later (at lastSettleAt + 500 ms, well under the 5 s idle heartbeat), the settle wakeup fires.
+    await vi.advanceTimersByTimeAsync(250);
+    expect(binding.schedulerStats).toHaveBeenCalledTimes(1);
+    expect(records.filter((r) => r.k === 'sched')).toHaveLength(1);
+    // The settle tick must not emit an extra sample record inside SAMPLE_IDLE_MS.
+    expect(samples(records)).toHaveLength(samplesBefore);
+  });
+
   it('writes the turns sent to the model when the stats call was sent', async () => {
     const waiting: Array<() => void> = [];
     const release = () => waiting.shift()?.();

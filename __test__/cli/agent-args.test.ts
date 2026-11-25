@@ -908,7 +908,7 @@ describe('run() argv routing', () => {
   // Mutation: drop the `maxContextInvalid` usage check in `run` → red (a bad
   // count launches). Mutation: drop the launcher pass-through → red.
   it('exits 1 on a bad --max-context and hands a good one to the launcher', async () => {
-    for (const argv of [['--max-context', '0'], ['--max-context'], ['--max-context=1010001']]) {
+    for (const argv of [['--max-context', '0'], ['--max-context'], ['--max-context=1048577']]) {
       const { deps, calls } = makeDeps();
       const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
       const prevExitCode = process.exitCode;
@@ -916,7 +916,7 @@ describe('run() argv routing', () => {
         await run(argv, deps);
         expect(process.exitCode).toBe(1);
         expect(errorSpy.mock.calls.flat().join('\n')).toContain(
-          "--max-context must be 'auto' or a token count up to 1010000, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
+          "--max-context must be 'auto' or a token count up to 1048576, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
         );
       } finally {
         process.exitCode = prevExitCode;

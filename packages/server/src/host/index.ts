@@ -944,7 +944,7 @@ function startContextEstimates(
 export { discoverModels, type DiscoveredModel } from './discover.js';
 export { DECODE_SHARE_ERROR, DEFAULT_DECODE_SHARE, parseDecodeShare } from './decode-share.js';
 export { DEFAULT_IDLE_RELEASE_SECONDS, IDLE_RELEASE_ERROR, idleReleaseText, parseIdleRelease } from './idle-release.js';
-export { MAX_CONTEXT_ERROR, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
+export { MAX_CONTEXT_ERROR, MAX_CONTEXT_TOKENS, MAX_YARN_CONTEXT_TOKENS, parseMaxContext } from './max-context.js';
 export { AGENT_HOST_THINKING, parseThinkingEndText, THINKING_END_TEXT_MAX } from './agent-thinking.js';
 export { MAX_MEMORY_ERROR, parseMaxMemory } from './max-memory.js';
 export {

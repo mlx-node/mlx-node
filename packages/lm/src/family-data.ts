@@ -16,6 +16,7 @@ export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | '
 export interface NormalizedModelConfig {
   readonly usesDefaultModelType: boolean;
   readonly rawModelType: string | undefined;
+  readonly textModelType: string | undefined;
   readonly rawModelTypeLabel: string;
   readonly architectures: ReadonlySet<string>;
 }
@@ -623,7 +624,34 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     ggufArchitectures: ['inkling2', 'inkling2_loop'],
     ggufDiscovery: { variants: 'all', split: true },
-    match: { rawModelTypes: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'] },
+    match: {
+      rawModelTypes: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'],
+      architectureProbe: ({ architectures, modelType, rawModelType, textModelType, usesDefaultModelType }) => {
+        if (
+          architectures.has('Inkling2LoopForConditionalGeneration') ||
+          architectures.has('Inkling2ForConditionalGeneration') ||
+          architectures.has('Inkling2LoopForCausalLM') ||
+          architectures.has('Inkling2ForCausalLM')
+        ) {
+          return true;
+        }
+        const isInkling2TextType =
+          textModelType === 'inkling2' ||
+          textModelType === 'inkling2_loop' ||
+          textModelType === 'inkling2_text' ||
+          textModelType === 'inkling2_loop_text';
+        if (
+          isInkling2TextType &&
+          (usesDefaultModelType ||
+            (modelType === undefined &&
+              rawModelType !== undefined &&
+              rawModelType.toLowerCase().startsWith('inkling2')))
+        ) {
+          return true;
+        }
+        return false;
+      },
+    },
     acceptsDraftModel: true,
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
@@ -905,8 +933,22 @@ function normalizeConfig(modelPath: string, config: unknown): NormalizedModelCon
     : typeof rawArchitectures === 'string'
       ? [rawArchitectures]
       : [];
+  const rawTextConfig = object.text_config;
+  const textModelType =
+    typeof rawTextConfig === 'object' &&
+    rawTextConfig !== null &&
+    !Array.isArray(rawTextConfig) &&
+    typeof (rawTextConfig as Record<string, unknown>).model_type === 'string'
+      ? ((rawTextConfig as Record<string, unknown>).model_type as string)
+      : undefined;
 
-  return { usesDefaultModelType, rawModelType, rawModelTypeLabel, architectures: new Set(architectures) };
+  return {
+    usesDefaultModelType,
+    rawModelType,
+    textModelType,
+    rawModelTypeLabel,
+    architectures: new Set(architectures),
+  };
 }
 
 /**
@@ -988,8 +1030,9 @@ export interface LoadModelOptions {
    */
   maxMemoryBytes?: number;
   /**
-   * Context token limit for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
-   * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
+   * Context token limit for `qwen3_5`, `qwen3_5_moe`, `qwen4_exp`, and
+   * `inkling2` targets (`--max-context`), 1 to 1,048,576 (YaRN targets capped
+   * at 1,010,000): every turn holds at most this many
    * tokens, and the load fails when its memory plan holds fewer. Past the
    * native window the target's RoPE takes YaRN, which is static and changes
    * answers at every length. `hy_v4_flash` takes it too, capped at 262,144

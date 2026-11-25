@@ -384,6 +384,46 @@ describe('renderClairicDocuments', () => {
         fields: {},
       }),
     ).rejects.toThrow(/PDF cannot be opened or rendered/);
+
+    // Invalid len % 4 === 1 base64 still rejected
+    await expect(
+      renderClairicDocuments({
+        documents: [{ content_type: 'application/pdf', base64: 'JVBER' }],
+        fields: {},
+      }),
+    ).rejects.toThrow(/base64 is malformed/);
+  });
+
+  it('accepts whitespace-wrapped, unpadded, and URL-safe base64 for PDFs and images', async () => {
+    const pdfBytes = makeOnePagePdf(200, 100);
+    const stdB64 = pdfBytes.toString('base64');
+    // Line-wrapped with CRLF + spaces, unpadded, URL-safe
+    const unpaddedUrlSafeWrapped = stdB64
+      .replace(/=+$/, '')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/(.{40})/g, '$1\r\n ');
+
+    // Also use wrapped + unpadded + URL-safe image base64
+    const imgBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0xfb, 0xff, 0x00]);
+    const imgB64 = imgBytes.toString('base64').replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+    const wrappedImgUri = `data:image/png;base64,${imgB64.slice(0, 6)}\r\n ${imgB64.slice(6)}`;
+
+    const pagesFromUri = await renderClairicDocuments({
+      images: [wrappedImgUri],
+      documents: [`data:application/pdf;base64,${unpaddedUrlSafeWrapped}`],
+      fields: {},
+    });
+    expect(pagesFromUri).toHaveLength(1);
+    expect(pagesFromUri![0].width).toBe(400);
+    expect(pagesFromUri![0].height).toBe(200);
+
+    const pagesFromObj = await renderClairicDocuments({
+      documents: [{ content_type: 'application/pdf', base64: unpaddedUrlSafeWrapped }],
+      fields: {},
+    });
+    expect(pagesFromObj).toHaveLength(1);
+    expect(pagesFromObj![0].width).toBe(400);
   });
 
   it('enforces 4 MiB single PDF limit and 8 MiB combined images + documents limit', async () => {

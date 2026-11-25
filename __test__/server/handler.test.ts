@@ -31,6 +31,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test'
 // live tier-2 entry in production. Tests reach it via the source path
 // so the "this is internal, do not use" signal is loud at the call
 // site.
+import { __setImageValidatorForTests } from '../../packages/lm/src/chat-session.js';
 import { __resetPromptCacheKeyNonceForTests } from '../../packages/server/src/session-registry.js';
 
 // ---------------------------------------------------------------------------
@@ -578,8 +579,11 @@ describe('createHandler', () => {
     });
 
     it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
+      const validPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const expectedPngBytes = new Uint8Array(Buffer.from(validPng, 'base64'));
       const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
-        expect(messages[0]?.images?.[0]).toEqual(new Uint8Array([1, 2, 3]));
+        expect(messages[0]?.images?.[0]).toEqual(expectedPngBytes);
         return 65;
       });
       const model = Object.assign(createMockStreamModel([]), {
@@ -591,6 +595,7 @@ describe('createHandler', () => {
         }),
         applyChatTemplate: vi.fn(() => new Uint32Array(4)),
         expandedPromptTokenCount,
+        supportsImages: () => true,
       });
       const registry = new ModelRegistry();
       registry.register('test-model', model);
@@ -602,7 +607,7 @@ describe('createHandler', () => {
             role: 'user',
             content: [
               { type: 'input_text', text: 'describe' },
-              { type: 'input_image', image_url: 'data:image/png;base64,AQID' },
+              { type: 'input_image', image_url: `data:image/png;base64,${validPng}` },
             ],
           },
         ],
@@ -764,8 +769,11 @@ describe('createHandler', () => {
       });
 
       it('returns a JSON 400 before SSE for an image prompt above the window with generation_mode=mtp', async () => {
+        const validPng =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
         const model = createLaneWindowModel(4, {
           expandedPromptTokenCount: vi.fn(() => 80),
+          supportsImages: () => true,
         });
         const registry = new ModelRegistry();
         registry.register('test-model', model);
@@ -776,7 +784,7 @@ describe('createHandler', () => {
               role: 'user',
               content: [
                 { type: 'input_text', text: 'describe' },
-                { type: 'input_image', image_url: 'data:image/png;base64,AQID' },
+                { type: 'input_image', image_url: `data:image/png;base64,${validPng}` },
               ],
             },
           ],
@@ -14405,5 +14413,833 @@ describe('POST /v1/responses trace metadata', () => {
       ...(mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>).mock.calls,
     ] as Array<[unknown, { clientSession?: string }]>;
     expect(calls.map(([, config]) => config.clientSession)).toEqual(['acp-1', undefined]);
+  });
+});
+
+describe('POST /v1/responses reasoning_returns SSE and image preflight', () => {
+  function parseResponsesSSE(body: string): Array<{ event: string; data: Record<string, unknown> }> {
+    const events: Array<{ event: string; data: Record<string, unknown> }> = [];
+    for (const line of body.split('\n')) {
+      if (line.startsWith('event: ')) {
+        events.push({ event: line.slice(7).trim(), data: {} });
+      } else if (line.startsWith('data: ') && events.length > 0) {
+        events[events.length - 1]!.data = JSON.parse(line.slice(6));
+      }
+    }
+    return events;
+  }
+
+  function assertMonotonicSingleOpenItem(events: Array<{ event: string; data: Record<string, unknown> }>) {
+    let open: { index: number; id: string; type: string } | null = null;
+    let nextIdx = 0;
+    for (const e of events) {
+      if (e.event === 'response.output_item.added') {
+        expect(open).toBeNull();
+        const idx = e.data.output_index as number;
+        const item = e.data.item as { id: string; type: string };
+        expect(idx).toBe(nextIdx++);
+        open = { index: idx, id: item.id, type: item.type };
+      } else if (
+        e.event === 'response.reasoning_summary_text.delta' ||
+        e.event === 'response.reasoning_summary_text.done' ||
+        e.event === 'response.output_text.delta' ||
+        e.event === 'response.output_text.done' ||
+        e.event === 'response.content_part.added' ||
+        e.event === 'response.content_part.done' ||
+        e.event === 'response.function_call_arguments.delta' ||
+        e.event === 'response.function_call_arguments.done'
+      ) {
+        expect(open).not.toBeNull();
+        expect(e.data.output_index).toBe(open!.index);
+        expect(e.data.item_id).toBe(open!.id);
+      } else if (e.event === 'response.output_item.done') {
+        expect(open).not.toBeNull();
+        expect(e.data.output_index).toBe(open!.index);
+        open = null;
+      }
+    }
+    expect(open).toBeNull();
+  }
+
+  it('handles Think1 -> Text1 -> Think2 -> Text2 -> ToolCall without duplicating Think1 or Text1 on done', async () => {
+    const streamEvents = [
+      { done: false, text: 'Think1', isReasoning: true },
+      { done: false, text: 'Text1', isReasoning: false },
+      { done: false, text: 'Think2', isReasoning: true },
+      { done: false, text: 'Text2', isReasoning: false },
+      {
+        done: true,
+        text: 'Text1Text2',
+        thinking: 'Think1Think2',
+        thinkingEnabled: true,
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'call_1', name: 'lookup', arguments: '{"k":"v"}', status: 'ok', rawContent: '' }],
+        rawText: '',
+        numTokens: 12,
+        promptTokens: 4,
+        reasoningTokens: 4,
+        cachedTokens: 0,
+      },
+    ];
+    const registry = new ModelRegistry();
+    registry.register('m', createMockStreamModel(streamEvents));
+    const stored: any[] = [];
+    const mockStore = {
+      store: vi.fn().mockImplementation((rec: any) => {
+        stored.push(rec);
+        return Promise.resolve();
+      }),
+      getChain: vi.fn().mockResolvedValue([]),
+      cleanupExpired: vi.fn(),
+    };
+    const handler = createHandler(registry, { store: mockStore as any });
+    const req = createMockReq('POST', '/v1/responses', {
+      model: 'm',
+      input: 'hi',
+      stream: true,
+      tools: [{ type: 'function', name: 'lookup' }],
+    });
+    const { res, getBody, waitForEnd } = createMockRes();
+    await handler(req, res);
+    await waitForEnd();
+
+    const events = parseResponsesSSE(getBody());
+    assertMonotonicSingleOpenItem(events);
+
+    const completed = events.find((e) => e.event === 'response.completed')!.data.response as {
+      output: Array<{
+        type: string;
+        summary?: Array<{ text: string }>;
+        content?: Array<{ text: string }>;
+        name?: string;
+      }>;
+      output_text: string;
+    };
+    expect(completed.output.map((i) => i.type)).toEqual([
+      'reasoning',
+      'message',
+      'reasoning',
+      'message',
+      'function_call',
+    ]);
+    expect(completed.output[0]!.summary).toEqual([{ type: 'summary_text', text: 'Think1' }]);
+    expect(completed.output[1]!.content![0]!.text).toBe('Text1');
+    expect(completed.output[2]!.summary).toEqual([{ type: 'summary_text', text: 'Think2' }]);
+    expect(completed.output[3]!.content![0]!.text).toBe('Text2');
+    expect(completed.output[4]!.name).toBe('lookup');
+    expect(completed.output_text).toBe('Text1Text2');
+    expect(stored).toHaveLength(1);
+    expect(JSON.parse(stored[0].outputJson)).toEqual(completed.output);
+  });
+
+  it('handles Text1 -> Think1 -> Text2 and Text1 -> Think1 (ending on thinking) with exact output_index parity', async () => {
+    const seq1 = [
+      { done: false, text: 'Text1', isReasoning: false },
+      { done: false, text: 'Think1', isReasoning: true },
+      { done: false, text: 'Text2', isReasoning: false },
+      {
+        done: true,
+        text: 'Text1Text2',
+        thinking: 'Think1',
+        thinkingEnabled: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        rawText: '',
+        numTokens: 6,
+        promptTokens: 2,
+        reasoningTokens: 2,
+        cachedTokens: 0,
+      },
+    ];
+    const reg1 = new ModelRegistry();
+    reg1.register('m', createMockStreamModel(seq1));
+    const res1 = createMockRes();
+    await createHandler(reg1)(
+      createMockReq('POST', '/v1/responses', { model: 'm', input: 'hi', stream: true }),
+      res1.res,
+    );
+    await res1.waitForEnd();
+    const events1 = parseResponsesSSE(res1.getBody());
+    assertMonotonicSingleOpenItem(events1);
+    const out1 = (
+      events1.find((e) => e.event === 'response.completed')!.data.response as { output: Array<{ type: string }> }
+    ).output;
+    expect(out1.map((i) => i.type)).toEqual(['message', 'reasoning', 'message']);
+
+    // Ending on thinking: output_index MUST be 1 for both reasoning_summary_text.done and output_item.done
+    const seq2 = [
+      { done: false, text: 'Text1', isReasoning: false },
+      { done: false, text: 'Think1', isReasoning: true },
+      {
+        done: true,
+        text: 'Text1',
+        thinking: 'Think1',
+        thinkingEnabled: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        rawText: '',
+        numTokens: 4,
+        promptTokens: 2,
+        reasoningTokens: 2,
+        cachedTokens: 0,
+      },
+    ];
+    const reg2 = new ModelRegistry();
+    reg2.register('m', createMockStreamModel(seq2));
+    const res2 = createMockRes();
+    await createHandler(reg2)(
+      createMockReq('POST', '/v1/responses', { model: 'm', input: 'hi', stream: true }),
+      res2.res,
+    );
+    await res2.waitForEnd();
+    const events2 = parseResponsesSSE(res2.getBody());
+    assertMonotonicSingleOpenItem(events2);
+    const rsDone = events2.find((e) => e.event === 'response.reasoning_summary_text.done')!;
+    expect(rsDone.data.output_index).toBe(1);
+    expect(rsDone.data.text).toBe('Think1');
+  });
+
+  it('keeps Think1 -> "\\n" -> Think2 in one reasoning item and opens no empty message on Think1 -> ToolCall', async () => {
+    const wsSeq = [
+      { done: false, text: 'Think1', isReasoning: true },
+      { done: false, text: '\n', isReasoning: false },
+      { done: false, text: 'Think2', isReasoning: true },
+      {
+        done: true,
+        text: '',
+        thinking: 'Think1Think2',
+        thinkingEnabled: true,
+        finishReason: 'stop',
+        toolCalls: [],
+        rawText: '',
+        numTokens: 4,
+        promptTokens: 2,
+        reasoningTokens: 4,
+        cachedTokens: 0,
+      },
+    ];
+    const reg1 = new ModelRegistry();
+    reg1.register('m', createMockStreamModel(wsSeq));
+    const res1 = createMockRes();
+    await createHandler(reg1)(
+      createMockReq('POST', '/v1/responses', { model: 'm', input: 'hi', stream: true }),
+      res1.res,
+    );
+    await res1.waitForEnd();
+    const events1 = parseResponsesSSE(res1.getBody());
+    assertMonotonicSingleOpenItem(events1);
+    const completed1 = events1.find((e) => e.event === 'response.completed')!.data.response as {
+      output: Array<{ type: string; summary?: Array<{ text: string }> }>;
+    };
+    expect(completed1.output).toHaveLength(1);
+    expect(completed1.output[0]!.summary).toEqual([{ type: 'summary_text', text: 'Think1Think2' }]);
+
+    const toolSeq = [
+      { done: false, text: 'Think1', isReasoning: true },
+      {
+        done: true,
+        text: '',
+        thinking: 'Think1',
+        thinkingEnabled: true,
+        finishReason: 'tool_calls',
+        toolCalls: [{ id: 'call_1', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+        rawText: '',
+        numTokens: 3,
+        promptTokens: 2,
+        reasoningTokens: 2,
+        cachedTokens: 0,
+      },
+    ];
+    const reg2 = new ModelRegistry();
+    reg2.register('m', createMockStreamModel(toolSeq));
+    const res2 = createMockRes();
+    await createHandler(reg2)(
+      createMockReq('POST', '/v1/responses', {
+        model: 'm',
+        input: 'hi',
+        stream: true,
+        tools: [{ type: 'function', name: 'fn' }],
+      }),
+      res2.res,
+    );
+    await res2.waitForEnd();
+    const events2 = parseResponsesSSE(res2.getBody());
+    assertMonotonicSingleOpenItem(events2);
+    const completed2 = events2.find((e) => e.event === 'response.completed')!.data.response as {
+      output: Array<{ type: string }>;
+    };
+    expect(completed2.output.map((i) => i.type)).toEqual(['reasoning', 'function_call']);
+  });
+
+  it('closes open reasoning item cleanly on mid-stream throw during Think2', async () => {
+    const model = createMockModel();
+    model.chatStreamSessionStart = vi.fn(async function* () {
+      yield { done: false as const, text: 'Text1', isReasoning: false };
+      yield { done: false as const, text: 'Think2', isReasoning: true };
+      throw new Error('stream failure');
+    }) as unknown as SessionCapableModel['chatStreamSessionStart'];
+    const registry = new ModelRegistry();
+    registry.register('m', model);
+    const resBox = createMockRes();
+    await createHandler(registry)(
+      createMockReq('POST', '/v1/responses', { model: 'm', input: 'hi', stream: true }),
+      resBox.res,
+    );
+    await resBox.waitForEnd();
+    const events = parseResponsesSSE(resBox.getBody());
+    assertMonotonicSingleOpenItem(events);
+    expect(events[events.length - 1]!.event).toBe('response.failed');
+  });
+
+  it('rejects corrupt/unsupported images and text-only image requests with HTTP 400 before SSE', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const pngBytes = Buffer.from(validPng, 'base64');
+    const badPayloads = [
+      pngBytes.subarray(0, Math.floor(pngBytes.length / 2)).toString('base64'),
+      Buffer.from('garbage').toString('base64'),
+      Buffer.from([0x42, 0x4d, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00]).toString(
+        'base64',
+      ),
+      Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]).toString('base64'),
+      Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]).toString('base64'),
+    ];
+
+    // Text-only model rejects valid image
+    {
+      const textModel = createMockModel();
+      const reg = new ModelRegistry();
+      reg.register('text-only', textModel);
+      const box = createMockRes();
+      await createHandler(reg)(
+        createMockReq('POST', '/v1/responses', {
+          model: 'text-only',
+          input: [{ role: 'user', content: [{ type: 'input_image', image_url: `data:image/png;base64,${validPng}` }] }],
+          stream: true,
+        }),
+        box.res,
+      );
+      await box.waitForEnd();
+      expect(box.getStatus()).toBe(400);
+      expect(box.getBody()).not.toContain('event:');
+      expect(JSON.parse(box.getBody()).error.message).toContain('Could not process image');
+      expect((textModel.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+    }
+
+    // Vision model rejects every corrupt/unsupported payload before SSE (stream false and true)
+    for (const badData of badPayloads) {
+      for (const stream of [false, true]) {
+        const visionModel = Object.assign(createMockModel(), { supportsImages: () => true });
+        const reg = new ModelRegistry();
+        reg.register('vision', visionModel);
+        const box = createMockRes();
+        await createHandler(reg)(
+          createMockReq('POST', '/v1/responses', {
+            model: 'vision',
+            stream,
+            input: [
+              { role: 'user', content: [{ type: 'input_image', image_url: `data:image/png;base64,${badData}` }] },
+            ],
+          }),
+          box.res,
+        );
+        await box.waitForEnd();
+        expect(box.getStatus()).toBe(400);
+        expect(box.getHeaders()['content-type']).toContain('application/json');
+        expect(box.getBody()).not.toContain('event:');
+        expect(JSON.parse(box.getBody()).error.message).toBe('Could not process image');
+        expect((visionModel.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+        expect((visionModel.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+      }
+    }
+  });
+
+  it('delivers identical tool images on both warm hits and cold misses in non-streaming and streaming modes', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const expectedPngBytes = Array.from(Buffer.from(validPng, 'base64'));
+    const tools = [{ type: 'function' as const, name: 'screenshot' }];
+
+    for (const stream of [false, true]) {
+      for (const mode of ['warm', 'cold'] as const) {
+        const startCalls: ChatMessage[][] = [];
+        const continueCalls: ChatMessage[][] = [];
+        const continueToolSpy = vi.fn();
+        let startIdx = 0;
+
+        const mockModel = {
+          supportsImages: () => true,
+          chatSessionStart: vi.fn(async (msgs: ChatMessage[]) => {
+            startCalls.push(msgs.map((m) => ({ ...m })));
+            const idx = startIdx++;
+            if (idx === 0) {
+              return makeChatResult({
+                text: '',
+                finishReason: 'tool_calls',
+                toolCalls: [{ id: 'call_shot', name: 'screenshot', arguments: '{}', status: 'ok', rawContent: '' }],
+                rawText: '<tool_call>screenshot</tool_call>',
+              });
+            }
+            return makeChatResult({ text: `seen-${mode}-${stream ? 'stream' : 'sync'}` });
+          }),
+          chatSessionContinue: vi.fn(async (msgs: ChatMessage[]) => {
+            continueCalls.push(msgs.map((m) => ({ ...m })));
+            return makeChatResult({ text: 'turn3-ok' });
+          }),
+          chatSessionContinueTool: continueToolSpy,
+          chatStreamSessionStart: vi.fn((msgs: ChatMessage[]) => {
+            startCalls.push(msgs.map((m) => ({ ...m })));
+            const idx = startIdx++;
+            async function* gen() {
+              if (idx === 0) {
+                yield {
+                  done: true,
+                  text: '',
+                  finishReason: 'tool_calls',
+                  toolCalls: [{ id: 'call_shot', name: 'screenshot', arguments: '{}', status: 'ok', rawContent: '' }],
+                  thinking: null,
+                  thinkingEnabled: false,
+                  numTokens: 2,
+                  promptTokens: 2,
+                  reasoningTokens: 0,
+                  rawText: '<tool_call>screenshot</tool_call>',
+                };
+                return;
+              }
+              const reply = `seen-${mode}-${stream ? 'stream' : 'sync'}`;
+              yield { done: false, text: reply };
+              yield {
+                done: true,
+                text: reply,
+                finishReason: 'stop',
+                toolCalls: [],
+                thinking: null,
+                thinkingEnabled: false,
+                numTokens: 3,
+                promptTokens: 5,
+                reasoningTokens: 0,
+                rawText: reply,
+              };
+            }
+            return gen();
+          }),
+          chatStreamSessionContinue: vi.fn((msgs: ChatMessage[]) => {
+            continueCalls.push(msgs.map((m) => ({ ...m })));
+            async function* gen() {
+              yield { done: false, text: 'turn3-ok' };
+              yield {
+                done: true,
+                text: 'turn3-ok',
+                finishReason: 'stop',
+                toolCalls: [],
+                thinking: null,
+                thinkingEnabled: false,
+                numTokens: 2,
+                promptTokens: 6,
+                reasoningTokens: 0,
+                rawText: 'turn3-ok',
+              };
+            }
+            return gen();
+          }),
+          chatStreamSessionContinueTool: continueToolSpy,
+          resetCaches: vi.fn().mockResolvedValue(undefined),
+        } as unknown as SessionCapableModel;
+
+        const reg = new ModelRegistry();
+        reg.register('vision', mockModel);
+        const storedRecords = new Map<string, any>();
+        const mockStore = {
+          store: vi.fn((record: any) => {
+            storedRecords.set(record.id, record);
+            return Promise.resolve();
+          }),
+          getChain: vi.fn((id: string) => {
+            const out: any[] = [];
+            let cursor: string | undefined = id;
+            while (cursor) {
+              const rec = storedRecords.get(cursor);
+              if (!rec) break;
+              out.unshift(rec);
+              cursor = rec.previousResponseId;
+            }
+            return Promise.resolve(out);
+          }),
+          cleanupExpired: vi.fn(),
+        };
+        const handler = createHandler(reg, { store: mockStore as any });
+
+        // Turn 1: user asks for a screenshot -> model emits single tool call `call_shot`
+        const res1 = createMockRes();
+        await handler(
+          createMockReq('POST', '/v1/responses', {
+            model: 'vision',
+            input: 'take a screenshot',
+            tools,
+            stream,
+          }),
+          res1.res,
+        );
+        await res1.waitForEnd();
+        expect(res1.getStatus()).toBe(200);
+        const resp1Id = stream
+          ? ((parseResponsesSSE(res1.getBody()).find((e) => e.event === 'response.completed')!.data.response as any)
+              .id as string)
+          : (JSON.parse(res1.getBody()).id as string);
+
+        if (mode === 'cold') {
+          // Force cold miss so Turn 2 replays from ResponseStore
+          reg.getSessionRegistry('vision')!.drop(resp1Id);
+        }
+
+        // Turn 2: single function_call_output carrying both text and an input_image
+        const res2 = createMockRes();
+        await handler(
+          createMockReq('POST', '/v1/responses', {
+            model: 'vision',
+            previous_response_id: resp1Id,
+            stream,
+            input: [
+              {
+                type: 'function_call_output',
+                call_id: 'call_shot',
+                output: [
+                  { type: 'input_text', text: 'captured screenshot' },
+                  { type: 'input_image', image_url: `data:image/png;base64,${validPng}` },
+                ],
+              },
+            ],
+          }),
+          res2.res,
+        );
+        await res2.waitForEnd();
+        expect(res2.getStatus()).toBe(200);
+        expect(res2.getHeaders()['x-session-cache']).toBe(mode === 'warm' ? 'hit' : 'cold_replay');
+        expect(continueToolSpy).not.toHaveBeenCalled();
+        expect(startCalls).toHaveLength(2);
+
+        const turn2Messages = startCalls[1]!;
+        const toolMsg = turn2Messages.at(-1)!;
+        expect(toolMsg.role).toBe('tool');
+        expect(toolMsg.toolCallId).toBe('call_shot');
+        expect(toolMsg.content).toBe('captured screenshot');
+        expect(toolMsg.images).toHaveLength(1);
+        expect(Array.from(toolMsg.images![0]!)).toEqual(expectedPngBytes);
+
+        // Turn 3 text-only follow-up still sees Turn 2's tool image in session history
+        const resp2Id = stream
+          ? ((parseResponsesSSE(res2.getBody()).find((e) => e.event === 'response.completed')!.data.response as any)
+              .id as string)
+          : (JSON.parse(res2.getBody()).id as string);
+        const res3 = createMockRes();
+        await handler(
+          createMockReq('POST', '/v1/responses', {
+            model: 'vision',
+            previous_response_id: resp2Id,
+            stream,
+            input: 'describe the button',
+          }),
+          res3.res,
+        );
+        await res3.waitForEnd();
+        expect(res3.getStatus()).toBe(200);
+        expect(continueCalls).toHaveLength(1);
+        const carriedTool = continueCalls[0]!.find((m) => m.role === 'tool');
+        expect(carriedTool?.images).toHaveLength(1);
+        expect(Array.from(carriedTool!.images![0]!)).toEqual(expectedPngBytes);
+      }
+    }
+  });
+
+  it('rejects corrupt tool images on warm Responses continuations with 400 before SSE', async () => {
+    const tools = [{ type: 'function' as const, name: 'screenshot' }];
+    const badData = Buffer.from('corrupt-tool-image').toString('base64');
+
+    for (const stream of [false, true]) {
+      const startSpy = vi.fn().mockResolvedValueOnce(
+        makeChatResult({
+          text: '',
+          finishReason: 'tool_calls',
+          toolCalls: [{ id: 'call_shot', name: 'screenshot', arguments: '{}', status: 'ok', rawContent: '' }],
+          rawText: '<tool_call>screenshot</tool_call>',
+        }),
+      );
+      const streamStartSpy = vi.fn();
+      const continueToolSpy = vi.fn();
+      const mockModel = {
+        supportsImages: () => true,
+        chatSessionStart: startSpy,
+        chatSessionContinue: vi.fn(),
+        chatSessionContinueTool: continueToolSpy,
+        chatStreamSessionStart: streamStartSpy,
+        chatStreamSessionContinue: vi.fn(),
+        chatStreamSessionContinueTool: continueToolSpy,
+        resetCaches: vi.fn().mockResolvedValue(undefined),
+      } as unknown as SessionCapableModel;
+
+      const reg = new ModelRegistry();
+      reg.register('vision', mockModel);
+      const storedRecords = new Map<string, any>();
+      const mockStore = {
+        store: vi.fn((record: any) => {
+          storedRecords.set(record.id, record);
+          return Promise.resolve();
+        }),
+        getChain: vi.fn((id: string) => {
+          const out: any[] = [];
+          let cursor: string | undefined = id;
+          while (cursor) {
+            const rec = storedRecords.get(cursor);
+            if (!rec) break;
+            out.unshift(rec);
+            cursor = rec.previousResponseId;
+          }
+          return Promise.resolve(out);
+        }),
+        cleanupExpired: vi.fn(),
+      };
+      const handler = createHandler(reg, { store: mockStore as any });
+
+      const res1 = createMockRes();
+      await handler(createMockReq('POST', '/v1/responses', { model: 'vision', input: 'snap', tools }), res1.res);
+      await res1.waitForEnd();
+      const resp1 = JSON.parse(res1.getBody());
+
+      const res2 = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          previous_response_id: resp1.id,
+          stream,
+          input: [
+            {
+              type: 'function_call_output',
+              call_id: 'call_shot',
+              output: [{ type: 'input_image', image_url: `data:image/png;base64,${badData}` }],
+            },
+          ],
+        }),
+        res2.res,
+      );
+      await res2.waitForEnd();
+
+      expect(res2.getStatus()).toBe(400);
+      expect(res2.getHeaders()['content-type']).toContain('application/json');
+      expect(res2.getBody()).not.toContain('event:');
+      expect(JSON.parse(res2.getBody()).error.message).toBe('Could not process image');
+      expect(startSpy).toHaveBeenCalledTimes(1);
+      expect(streamStartSpy).not.toHaveBeenCalled();
+      expect(continueToolSpy).not.toHaveBeenCalled();
+    }
+  });
+
+  it('keeps HTTP event loop responsive during async image preflight and skips re-validating stored history images on follow-ups', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const validGif = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+    const gifBytes = Array.from(Buffer.from(validGif, 'base64'));
+
+    const model = Object.assign(createMockModel(makeChatResult({ text: 'ok' })), {
+      supportsImages: () => true,
+    });
+    const reg = new ModelRegistry();
+    reg.register('vision', model);
+    const storedRecords = new Map<string, any>();
+    const mockStore = {
+      store: vi.fn((record: any) => {
+        storedRecords.set(record.id, record);
+        return Promise.resolve();
+      }),
+      getChain: vi.fn((id: string) => {
+        const out: any[] = [];
+        let cursor: string | undefined = id;
+        while (cursor) {
+          const rec = storedRecords.get(cursor);
+          if (!rec) break;
+          out.unshift(rec);
+          cursor = rec.previousResponseId;
+        }
+        return Promise.resolve(out);
+      }),
+      cleanupExpired: vi.fn(),
+    };
+    const handler = createHandler(reg, { store: mockStore as any });
+
+    // Gate async image validation so we can verify unrelated HTTP work completes while it is in flight.
+    let releaseValidation!: () => void;
+    let enteredValidation!: () => void;
+    const validationEntered = new Promise<void>((resolve) => {
+      enteredValidation = resolve;
+    });
+    const validationGate = new Promise<void>((resolve) => {
+      releaseValidation = resolve;
+    });
+
+    const turn1Validator = vi.fn(async () => {
+      enteredValidation();
+      await validationGate;
+    });
+    __setImageValidatorForTests(turn1Validator);
+    let resp1Id: string;
+    try {
+      const box1 = createMockRes();
+      const req1Promise = handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          input: [
+            {
+              role: 'user',
+              content: [
+                { type: 'input_text', text: 'describe' },
+                { type: 'input_image', image_url: `data:image/png;base64,${validPng}` },
+              ],
+            },
+          ],
+        }),
+        box1.res,
+      );
+
+      await validationEntered;
+
+      // While Turn 1's image validation is awaiting, an unrelated GET /v1/models request
+      // and an event-loop timer must both complete without being blocked.
+      let timerFired = false;
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          timerFired = true;
+          resolve();
+        }, 0);
+      });
+      expect(timerFired).toBe(true);
+
+      const modelsBox = createMockRes();
+      await handler(createMockReq('GET', '/v1/models'), modelsBox.res);
+      await modelsBox.waitForEnd();
+      expect(modelsBox.getStatus()).toBe(200);
+      expect(box1.res.headersSent).toBe(false);
+
+      releaseValidation();
+      await req1Promise;
+      await box1.waitForEnd();
+      expect(box1.getStatus()).toBe(200);
+      expect(turn1Validator).toHaveBeenCalledTimes(1);
+      resp1Id = JSON.parse(box1.getBody()).id as string;
+
+      // Install a brand-new validator spy (empty cache!) for Turn 2 & Turn 3 so any
+      // re-validation of stored history images would be caught immediately.
+      const followUpValidator = vi.fn(async (_data: Uint8Array) => {});
+      __setImageValidatorForTests(followUpValidator);
+
+      // Turn 2a (warm hit, text-only follow-up): stored Turn 1 image must NOT be re-validated.
+      const box2Warm = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          previous_response_id: resp1Id,
+          input: 'what is in the corner?',
+        }),
+        box2Warm.res,
+      );
+      await box2Warm.waitForEnd();
+      expect(box2Warm.getStatus()).toBe(200);
+      expect(followUpValidator).toHaveBeenCalledTimes(0);
+
+      // Turn 2b (cold miss, text-only follow-up): stored Turn 1 image must STILL NOT be re-validated.
+      reg.getSessionRegistry('vision')!.drop(resp1Id);
+      const box2Cold = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          previous_response_id: resp1Id,
+          input: 'cold text follow-up',
+        }),
+        box2Cold.res,
+      );
+      await box2Cold.waitForEnd();
+      expect(box2Cold.getStatus()).toBe(200);
+      expect(followUpValidator).toHaveBeenCalledTimes(0);
+
+      // Turn 3 (follow-up with a NEW image): validates ONLY the newly submitted GIF, not the stored PNG.
+      const box3 = createMockRes();
+      await handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          previous_response_id: resp1Id,
+          input: [
+            {
+              role: 'user',
+              content: [{ type: 'input_image', image_url: `data:image/gif;base64,${validGif}` }],
+            },
+          ],
+        }),
+        box3.res,
+      );
+      await box3.waitForEnd();
+      expect(box3.getStatus()).toBe(200);
+      expect(followUpValidator).toHaveBeenCalledTimes(1);
+      expect(Array.from(followUpValidator.mock.calls[0]![0] as Uint8Array)).toEqual(gifBytes);
+    } finally {
+      __setImageValidatorForTests(null);
+    }
+  });
+
+  it('cancels remaining image preflight validations on client disconnect and releases permits and leases', async () => {
+    const model = Object.assign(createMockModel(makeChatResult({ text: 'ok' })), {
+      supportsImages: () => true,
+    });
+    const reg = new ModelRegistry({ maxQueueDepth: 0 });
+    reg.register('vision', model);
+    const handler = createHandler(reg);
+
+    let enteredCount = 0;
+    let firstEntered!: () => void;
+    const firstEnteredPromise = new Promise<void>((resolve) => {
+      firstEntered = resolve;
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const validator = vi.fn(async () => {
+      enteredCount++;
+      if (enteredCount === 4) firstEntered();
+      await gate;
+    });
+
+    __setImageValidatorForTests(validator);
+    try {
+      const box1 = createMockRes();
+      const images = Array.from({ length: 10 }, (_, i) => ({
+        type: 'input_image' as const,
+        image_url: `data:image/png;base64,${Buffer.from(`resp-img-${i}`).toString('base64')}`,
+      }));
+      const req1 = handler(
+        createMockReq('POST', '/v1/responses', {
+          model: 'vision',
+          input: [{ role: 'user', content: images }],
+        }),
+        box1.res,
+      );
+
+      await firstEnteredPromise;
+      // Simulate client disconnect while 4 images are in flight and 6 remain unscheduled.
+      box1.res.emit('close');
+      await req1;
+
+      expect(box1.res.headersSent).toBe(false);
+      expect(reg.getSessionRegistry('vision')!.preDispatchAdmitCount).toBe(0);
+      expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+
+      releaseGate();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      // Remaining 6 images must never have been validated.
+      expect(validator).toHaveBeenCalledTimes(4);
+
+      // Permits, leases, and semaphore slots are all released: a follow-up request succeeds.
+      const box2 = createMockRes();
+      await handler(createMockReq('POST', '/v1/responses', { model: 'vision', input: 'hello' }), box2.res);
+      await box2.waitForEnd();
+      expect(box2.getStatus()).toBe(200);
+    } finally {
+      releaseGate();
+      __setImageValidatorForTests(null);
+    }
   });
 });

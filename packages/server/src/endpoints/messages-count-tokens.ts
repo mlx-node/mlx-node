@@ -1,8 +1,8 @@
 /** POST /v1/messages/count_tokens — Anthropic Messages token-count endpoint. */
 
-import type { ServerResponse } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 
-import { countPromptTokens } from '@mlx-node/lm';
+import { countPromptTokens, isImageProcessingError, validateRequestImagesAsync } from '@mlx-node/lm';
 
 import {
   sendAnthropicBadRequest,
@@ -87,7 +87,57 @@ export async function handleCountMessageTokens(
   const sessionReg = lease.registry;
   const preLockInstanceId = lease.instanceId;
 
+  const abortController = new AbortController();
+  const abortSocket = res.socket;
+  const abortReq = (res as { req?: IncomingMessage }).req;
+  const onAbortClose = (): void => {
+    abortController.abort();
+  };
+  const onAbortReqClose = (): void => {
+    if (abortReq?.complete !== true) {
+      abortController.abort();
+    }
+  };
+  const onAbortError = (_err: unknown): void => {
+    abortController.abort();
+  };
+  let abortListenersAttached = false;
+  const armAbortListeners = (): void => {
+    if (abortListenersAttached) return;
+    res.once('close', onAbortClose);
+    res.once('error', onAbortError);
+    if (abortSocket != null) {
+      abortSocket.once('close', onAbortClose);
+    }
+    if (abortReq) {
+      abortReq.once('close', onAbortReqClose);
+      abortReq.once('error', onAbortError);
+    }
+    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+      abortController.abort();
+    }
+    abortListenersAttached = true;
+  };
+
   try {
+    const hasImages = mapped.messages.some((message) => (message.images?.length ?? 0) > 0);
+    if (hasImages && leaseModel.supportsImages?.() !== true) {
+      sendAnthropicBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`);
+      return;
+    }
+    if (hasImages) {
+      armAbortListeners();
+      try {
+        await validateRequestImagesAsync(mapped.messages, { signal: abortController.signal });
+      } catch {
+        if (abortController.signal.aborted) {
+          return;
+        }
+        sendAnthropicBadRequest(res, 'Could not process image');
+        return;
+      }
+    }
+
     // Token counting is a pure-CPU tokenize-and-template operation; it must NOT
     // queue behind the per-model generation FIFO (`sessionReg.withExclusive`)
     // because that serializes against multi-minute decode passes and turns a
@@ -118,6 +168,9 @@ export async function handleCountMessageTokens(
     };
 
     const runCountWithModelRead = async () => {
+      if (abortController.signal.aborted) {
+        return;
+      }
       if (!bindingStillMatchesLease()) {
         rejectChangedBinding('waiting for the model-load reader gate');
         return;
@@ -141,21 +194,52 @@ export async function handleCountMessageTokens(
           tools: mapped.config.tools,
           reasoningEffort: effort,
         });
+        if (abortController.signal.aborted) {
+          return;
+        }
         if (!bindingStillMatchesLease()) {
           rejectChangedBinding('running');
           return;
         }
         endJson(res, { input_tokens: inputTokens });
       } catch (err) {
-        sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
+        if (abortController.signal.aborted) {
+          return;
+        }
+        if (isImageProcessingError(err)) {
+          sendAnthropicBadRequest(res, 'Could not process image');
+        } else {
+          sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
+        }
       }
     };
 
-    if (modelWorkCoordinator) await modelWorkCoordinator.withInference(runCountWithModelRead);
-    else await runCountWithModelRead();
+    armAbortListeners();
+    if (abortController.signal.aborted) {
+      return;
+    }
+    if (modelWorkCoordinator) {
+      await modelWorkCoordinator.withInference(runCountWithModelRead, abortController.signal);
+    } else {
+      await runCountWithModelRead();
+    }
   } catch (err) {
+    if (abortController.signal.aborted) {
+      return;
+    }
     sendAnthropicInternalError(res, err instanceof Error ? err.message : 'Failed to count tokens');
   } finally {
+    if (abortListenersAttached) {
+      res.removeListener('close', onAbortClose);
+      res.removeListener('error', onAbortError);
+      if (abortSocket != null) {
+        abortSocket.removeListener('close', onAbortClose);
+      }
+      if (abortReq) {
+        abortReq.removeListener('close', onAbortReqClose);
+        abortReq.removeListener('error', onAbortError);
+      }
+    }
     registry.releaseDispatchLease(leaseModel);
   }
 }

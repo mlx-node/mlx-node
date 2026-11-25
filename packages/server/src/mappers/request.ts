@@ -2,10 +2,23 @@
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
+import { decodeBase64Strict, isAllowedImageMediaType, MAX_REQUEST_IMAGES } from '../base64.js';
 import { stringifyStrictJson } from '../strict-json.js';
 import type { ContentPart, ResponsesAPIRequest, ResponsesToolDefinition } from '../types.js';
 
+export { MAX_REQUEST_IMAGES };
+
 export const MAX_CACHE_SALT_BYTES = 256;
+
+export const VALID_REASONING_EFFORTS: ReadonlySet<string> = new Set([
+  'none',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh',
+  'max',
+]);
 
 /**
  * A forced tool call (named function, `required`, or Anthropic `any`) is
@@ -42,6 +55,29 @@ export function validateCacheSalt(cacheSalt: unknown): asserts cacheSalt is stri
   if (Buffer.byteLength(cacheSalt, 'utf8') > MAX_CACHE_SALT_BYTES) {
     throw new Error(`cache_salt must be at most ${MAX_CACHE_SALT_BYTES} UTF-8 bytes`);
   }
+}
+
+function decodeInputImagePart(p: Extract<ContentPart, { type: 'input_image' }>): Uint8Array {
+  if (p.file_id) {
+    throw new Error('input_image.file_id is not supported — inline the image as a data URL');
+  }
+  if (!p.image_url) {
+    throw new Error('input_image is missing image_url');
+  }
+  const match = /^data:([^;,]+)(?:;[^;,]+)*;base64,(.*)$/is.exec(p.image_url);
+  if (!match) {
+    throw new Error(
+      'input_image.image_url must be a base64 data URL (data:<mime>;base64,<payload>); ' +
+        'remote http(s) URLs are not fetched by this server',
+    );
+  }
+  if (!isAllowedImageMediaType(match[1])) {
+    throw new Error('Could not process image');
+  }
+  // `decodeBase64Strict` returns a plain `Uint8Array` (not a `Buffer`) so
+  // `JSON.stringify` does not invoke `Buffer.prototype.toJSON` before the
+  // `__u8__` sentinel replacer in `stringifyStoredInputMessages`.
+  return decodeBase64Strict(match[2], 'Could not process image');
 }
 
 /**
@@ -94,28 +130,7 @@ function resolveMessageContent(
       if (role !== 'user') {
         throw new Error(`input_image content parts are only allowed on user messages (got role="${role}")`);
       }
-      if (p.file_id) {
-        throw new Error('input_image.file_id is not supported — inline the image as a data URL');
-      }
-      if (!p.image_url) {
-        throw new Error('input_image is missing image_url');
-      }
-      const match = /^data:[^;,]+;base64,(.+)$/s.exec(p.image_url);
-      if (!match) {
-        throw new Error(
-          'input_image.image_url must be a base64 data URL (data:<mime>;base64,<payload>); ' +
-            'remote http(s) URLs are not fetched by this server',
-        );
-      }
-      // Wrap as a plain `Uint8Array` rather than storing the raw
-      // `Buffer`. `Buffer` is a `Uint8Array` subclass, but it defines
-      // its own `toJSON()` that `JSON.stringify` calls BEFORE any
-      // replacer runs — so a Buffer-backed value would serialise as
-      // `{type:"Buffer",data:[...]}` and skip the `__u8__` sentinel in
-      // `stringifyStoredInputMessages`, corrupting image round-trip
-      // through `previous_response_id` chains. A plain `Uint8Array`
-      // has no `toJSON`, so the replacer fires as intended.
-      images.push(new Uint8Array(Buffer.from(match[1], 'base64')));
+      images.push(decodeInputImagePart(p));
       seenImage = true;
     } else {
       throw new Error(`Unsupported content part type: "${(p as { type: string }).type}"`);
@@ -125,6 +140,28 @@ function resolveMessageContent(
   const out: { text: string; images?: Uint8Array[] } = { text: parts.join('') };
   if (images.length > 0) out.images = images;
   return out;
+}
+
+function resolveFunctionCallOutput(output: unknown): { text: string; images?: Uint8Array[] } {
+  if (typeof output === 'string') return { text: output };
+  if (!Array.isArray(output)) {
+    throw new Error('function_call_output.output must be a string or an array of content parts');
+  }
+  const parts: string[] = [];
+  const images: Uint8Array[] = [];
+  for (const part of output as ContentPart[]) {
+    if (part == null || typeof part !== 'object') {
+      throw new Error('Each function_call_output content part must be an object');
+    }
+    if (part.type === 'input_text' || part.type === 'output_text' || part.type === 'summary_text') {
+      parts.push(part.text);
+    } else if (part.type === 'input_image') {
+      images.push(decodeInputImagePart(part));
+    } else {
+      throw new Error(`Unsupported function_call_output part type: "${(part as { type: string }).type}"`);
+    }
+  }
+  return images.length > 0 ? { text: parts.join(''), images } : { text: parts.join('') };
 }
 
 /** NAPI `ToolDefinition` requires `parameters.properties` to be a JSON string. */
@@ -207,6 +244,41 @@ export function applyExtraBodyMtpOverrides(
 }
 
 export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage[]): MappedRequest {
+  let totalImageCount = 0;
+  if (priorMessages) {
+    for (const m of priorMessages) {
+      totalImageCount += m.images?.length ?? 0;
+    }
+  }
+  if (Array.isArray(req.input)) {
+    for (const item of req.input) {
+      if (item == null || typeof item !== 'object') continue;
+      const itemType = (item as { type?: string }).type ?? 'message';
+      if (itemType === 'message') {
+        const content = (item as { content?: unknown }).content;
+        if (Array.isArray(content)) {
+          for (const part of content) {
+            if (part != null && typeof part === 'object' && (part as { type?: unknown }).type === 'input_image') {
+              totalImageCount++;
+            }
+          }
+        }
+      } else if (itemType === 'function_call_output') {
+        const output = (item as { output?: unknown }).output;
+        if (Array.isArray(output)) {
+          for (const part of output) {
+            if (part != null && typeof part === 'object' && (part as { type?: unknown }).type === 'input_image') {
+              totalImageCount++;
+            }
+          }
+        }
+      }
+    }
+  }
+  if (totalImageCount > MAX_REQUEST_IMAGES) {
+    throw new Error(`input: requests support at most ${MAX_REQUEST_IMAGES} images`);
+  }
+
   const messages: ChatMessage[] = [];
 
   if (req.instructions) {
@@ -286,13 +358,16 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
         a.toolCalls.push({ name: fc.name, arguments: fc.arguments, id: fc.call_id });
         assistantHasToolCalls = true;
       } else if (itemType === 'function_call_output') {
-        const fco = item as { call_id: string; output: string };
+        const fco = item as { call_id: string; output: string | ContentPart[] };
         flushAssistant();
-        messages.push({
+        const resolved = resolveFunctionCallOutput(fco.output);
+        const toolMsg: ChatMessage = {
           role: 'tool',
-          content: fco.output,
+          content: resolved.text,
           toolCallId: fco.call_id,
-        });
+        };
+        if (resolved.images) toolMsg.images = resolved.images;
+        messages.push(toolMsg);
       } else {
         throw new Error(`Unsupported input item type: "${itemType as string}"`);
       }
@@ -318,8 +393,11 @@ export function mapRequest(req: ResponsesAPIRequest, priorMessages?: ChatMessage
   if (req.top_p != null) {
     config.topP = req.top_p;
   }
-  if (req.reasoning?.effort) {
-    config.reasoningEffort = req.reasoning.effort;
+  if (req.reasoning?.effort != null) {
+    if (typeof req.reasoning.effort !== 'string' || !VALID_REASONING_EFFORTS.has(req.reasoning.effort)) {
+      throw new Error('Invalid reasoning.effort');
+    }
+    config.reasoningEffort = req.reasoning.effort as ChatConfig['reasoningEffort'];
   }
   validateToolChoice(req);
   if (req.tools && req.tools.length > 0) {

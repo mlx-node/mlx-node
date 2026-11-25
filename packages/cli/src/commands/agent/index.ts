@@ -736,7 +736,7 @@ mlx options (handled before the agent binary sees the args):
                             automatic budget (default: auto).
   --max-context <tokens>    Context token limit, e.g. 100K or 1M (K = 1024 tokens,
                             M = 1000000 tokens), up to the model's limit, at most
-                            1010000; past its native window a model with YaRN
+                            1048576; past its native window a model with YaRN
                             turns it on, which is static and changes answers at
                             every length, so pass more than the native window
                             only when a request needs it (default: auto, the

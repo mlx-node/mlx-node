@@ -2,6 +2,7 @@
 
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
+import { decodeBase64Strict, isAllowedImageMediaType, MAX_REQUEST_IMAGES } from '../base64.js';
 import { MAX_STOP_SEQUENCE_CHARACTERS, MAX_STOP_SEQUENCES } from '../stop-sequence-buffer.js';
 import type {
   AnthropicContentBlock,
@@ -13,7 +14,14 @@ import type {
   SystemBlock,
 } from '../types-anthropic.js';
 import { anthropicToolUseIdToInternal } from './anthropic-response.js';
-import { applyExtraBodyMtpOverrides, disableThinkingForForcedToolCall, validateCacheSalt } from './request.js';
+import {
+  applyExtraBodyMtpOverrides,
+  disableThinkingForForcedToolCall,
+  VALID_REASONING_EFFORTS,
+  validateCacheSalt,
+} from './request.js';
+
+export { MAX_REQUEST_IMAGES };
 
 export interface MappedAnthropicRequest {
   messages: ChatMessage[];
@@ -78,34 +86,45 @@ export function canonicalizeSystemForCacheKey(system: AnthropicMessagesRequest['
   return parts.join('');
 }
 
+function decodeAnthropicImageBlock(block: AnthropicImageContentBlock): Uint8Array {
+  const source = (block as { source?: unknown }).source;
+  if (source == null || typeof source !== 'object') {
+    throw new Error('Image block is missing a valid source object');
+  }
+  const src = source as { type?: unknown; media_type?: unknown; data?: unknown };
+  if (src.type !== 'base64') {
+    throw new Error(`Unsupported image source type: "${String(src.type)}"`);
+  }
+  if (typeof src.media_type !== 'string' || !isAllowedImageMediaType(src.media_type)) {
+    throw new Error('Could not process image');
+  }
+  if (typeof src.data !== 'string') {
+    throw new Error('Could not process image');
+  }
+  return decodeBase64Strict(src.data, 'Could not process image');
+}
+
 /**
- * Resolve the text content of a `tool_result` block. The internal `ChatMessage`
- * shape (NAPI-generated) has no `images` field on `role: 'tool'`, so nested
- * images are rejected outright — any hoist-to-trailing-user workaround loses
- * both declared order and per-tool association once downstream canonicalization
- * reorders the tool rows. Callers must send images as a top-level image block
- * in a separate user turn.
+ * Resolve the text and optional image content of a `tool_result` block.
  */
 function resolveToolResultContent(content?: string | (AnthropicTextContentBlock | AnthropicImageContentBlock)[]): {
   text: string;
+  images?: Uint8Array[];
 } {
   if (content == null) return { text: '' };
   if (typeof content === 'string') return { text: content };
   const parts: string[] = [];
+  const images: Uint8Array[] = [];
   for (const b of content) {
     if (b.type === 'text') {
       parts.push(b.text);
     } else if (b.type === 'image') {
-      throw new Error(
-        'Unsupported: nested image content in tool_result blocks is not representable in the internal ' +
-          'message model. Send the image as a top-level image block in a separate user turn, and reference ' +
-          'it from the tool_result via text.',
-      );
+      images.push(decodeAnthropicImageBlock(b));
     } else {
       throw new Error(`Unsupported tool_result content type: "${(b as { type: string }).type}"`);
     }
   }
-  return { text: parts.join('') };
+  return images.length > 0 ? { text: parts.join(''), images } : { text: parts.join('') };
 }
 
 /** NAPI `ToolDefinition` requires `parameters.properties` to be a JSON string. */
@@ -128,6 +147,31 @@ function mapTool(tool: AnthropicToolDefinition): ToolDefinition {
 export function mapAnthropicRequest(
   req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
 ): MappedAnthropicRequest {
+  // Enforce the 64-image request cap before decoding any base64 payload, naming
+  // the oldest image block path (Splash `dialects/anthropic.py` parity).
+  const imagePaths: string[] = [];
+  for (let i = 0; i < req.messages.length; i++) {
+    const msg = req.messages[i];
+    if (msg == null || typeof msg !== 'object' || !Array.isArray(msg.content)) continue;
+    for (let j = 0; j < msg.content.length; j++) {
+      const block = msg.content[j];
+      if (block == null || typeof block !== 'object') continue;
+      if (block.type === 'image') {
+        imagePaths.push(`messages.${i}.content.${j}.image`);
+      } else if (block.type === 'tool_result' && Array.isArray(block.content)) {
+        for (let k = 0; k < block.content.length; k++) {
+          const inner = block.content[k];
+          if (inner != null && typeof inner === 'object' && inner.type === 'image') {
+            imagePaths.push(`messages.${i}.content.${j}.tool_result.content.${k}.image`);
+          }
+        }
+      }
+    }
+  }
+  if (imagePaths.length > MAX_REQUEST_IMAGES) {
+    throw new Error(`${imagePaths[0]}: requests support at most ${MAX_REQUEST_IMAGES} images`);
+  }
+
   const messages: ChatMessage[] = [];
 
   // The leading system message is assembled and `unshift`ed AFTER the message
@@ -191,6 +235,7 @@ export function mapAnthropicRequest(
           toolCallId: string;
           content: string;
           isError: boolean;
+          images?: Uint8Array[];
         }[] = [];
         const trailingText: string[] = [];
         const trailingImages: Uint8Array[] = [];
@@ -228,6 +273,7 @@ export function mapAnthropicRequest(
               toolCallId: anthropicToolUseIdToInternal(block.tool_use_id),
               content: resolved.text,
               isError: block.is_error === true,
+              ...(resolved.images ? { images: resolved.images } : {}),
             });
           } else if (block.type === 'text') {
             if (seenImage) {
@@ -240,10 +286,10 @@ export function mapAnthropicRequest(
             }
             seenNonToolResult = true;
             trailingText.push(block.text);
-          } else if (block.type === 'image' && block.source.type === 'base64') {
+          } else if (block.type === 'image') {
             seenNonToolResult = true;
             seenImage = true;
-            trailingImages.push(Buffer.from(block.source.data, 'base64'));
+            trailingImages.push(decodeAnthropicImageBlock(block));
           } else {
             throw new Error(`Unsupported content block type: "${block.type}"`);
           }
@@ -275,31 +321,15 @@ export function mapAnthropicRequest(
             if (tr.isError) {
               msg.isError = true;
             }
+            if (tr.images && tr.images.length > 0) {
+              msg.images = tr.images;
+            }
             messages.push(msg);
           }
-          // Trailing suffix after a tool_result prefix: accept either
-          // (a) text-only (concatenated) or (b) exactly one image block.
-          // Mixing text+image or multiple images would silently reorder
-          // content in the flat NAPI `ChatMessage` shape.
+          // Trailing suffix after a tool_result prefix: emit as a follow-up user
+          // message using the same text-before-images rules as pure user turns.
           const hasTrailingText = trailingText.length > 0;
           const hasTrailingImages = trailingImages.length > 0;
-          if (hasTrailingText && hasTrailingImages) {
-            throw new Error(
-              'Unsupported: mixing trailing text and image blocks after a tool_result prefix is not ' +
-                'representable in the internal message model. The flat ChatMessage shape cannot preserve ' +
-                'the caller-declared relative order of interleaved text and images, so any mapping would ' +
-                'silently reorder your content. Send any commentary as part of the tool_result text, and ' +
-                'deliver additional images in a separate follow-up user turn.',
-            );
-          }
-          if (hasTrailingImages && trailingImages.length > 1) {
-            throw new Error(
-              'Unsupported: multiple trailing image blocks after a tool_result prefix are not ' +
-                'representable in the internal message model without silently reordering the images ' +
-                'relative to any surrounding text. Send at most one trailing image block, and deliver ' +
-                'additional images in a separate follow-up user turn.',
-            );
-          }
           if (hasTrailingText || hasTrailingImages) {
             const trailingMsg: ChatMessage = { role: 'user', content: trailingText.join('') };
             if (hasTrailingImages) {
@@ -428,15 +458,12 @@ export function mapAnthropicRequest(
 
   const effort = req.extra_body?.reasoning_effort;
   if (effort !== undefined) {
-    if (!['none', 'low', 'medium', 'high', 'xhigh', 'max'].includes(effort)) {
+    if (typeof effort !== 'string' || !VALID_REASONING_EFFORTS.has(effort)) {
       throw new Error('Invalid extra_body.reasoning_effort');
     }
     config.reasoningEffort = effort as ChatConfig['reasoningEffort'];
   }
-  const budgetTokens = enabledThinkingBudget(req.thinking);
-  if (budgetTokens !== undefined) {
-    config.thinkingTokenBudget = budgetTokens;
-  }
+  applyAnthropicThinking(config, req.thinking);
   const thinkingBudget = req.extra_body?.thinking_budget;
   if (thinkingBudget !== undefined) {
     if (!Number.isSafeInteger(thinkingBudget) || thinkingBudget < 0 || thinkingBudget > 2_147_483_647) {
@@ -500,19 +527,52 @@ export function mapAnthropicRequest(
 }
 
 /**
- * The `budget_tokens` of enabled thinking (Splash `_thinking_budget`): at least
- * 1024, as Messages requires. Adaptive or absent thinking sets none.
+ * Validate and apply Anthropic `thinking` (`type`, `budget_tokens`, `display`).
+ *
+ * - `type: 'enabled'` requires integer `budget_tokens >= 1024`.
+ * - `type: 'disabled'` sets `reasoningEffort = 'none'` (when not explicitly set
+ *   via `extra_body.reasoning_effort`) and `includeReasoning = false`, keeping
+ *   `thinkingTokenBudget = undefined` so `applyServerThinking` leaves it off.
+ * - `display` (`'summarized' | 'omitted' | 'updates' | null`) is rejected when
+ *   `type === 'disabled'`; `'omitted'` and `'updates'` hide reasoning from
+ *   client output (`includeReasoning = false`) while still allowing internal
+ *   thought capture for replay.
  */
-function enabledThinkingBudget(thinking: unknown): number | undefined {
-  if (thinking == null || typeof thinking !== 'object' || (thinking as { type?: unknown }).type !== 'enabled') {
-    return undefined;
+function applyAnthropicThinking(config: ChatConfig, thinking: unknown): void {
+  if (thinking == null) return;
+  if (typeof thinking !== 'object' || Array.isArray(thinking)) {
+    throw new Error('thinking must be an object');
   }
-  const budget = (thinking as { budget_tokens?: unknown }).budget_tokens;
-  if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1024) {
-    throw new Error('thinking.budget_tokens must be an integer of at least 1024');
+  const t = thinking as { type?: unknown; budget_tokens?: unknown; display?: unknown };
+  if (t.type !== 'enabled' && t.type !== 'disabled' && t.type !== 'adaptive') {
+    throw new Error('thinking.type must be enabled, disabled, or adaptive');
   }
-  // Native `thinking_token_budget` is i32; a budget past `max_tokens` caps nothing.
-  return Math.min(budget, 2_147_483_647);
+  if (t.display !== undefined && t.display !== null) {
+    if (t.type === 'disabled') {
+      throw new Error('thinking.display requires enabled or adaptive thinking');
+    }
+    if (t.display !== 'summarized' && t.display !== 'omitted' && t.display !== 'updates') {
+      throw new Error('thinking.display must be summarized, omitted, updates, or null');
+    }
+  }
+  if (t.type === 'disabled') {
+    if (config.reasoningEffort === undefined) {
+      config.reasoningEffort = 'none';
+    }
+    config.includeReasoning = false;
+    return;
+  }
+  if (t.type === 'enabled') {
+    const budget = t.budget_tokens;
+    if (typeof budget !== 'number' || !Number.isInteger(budget) || budget < 1024) {
+      throw new Error('thinking.budget_tokens must be an integer of at least 1024');
+    }
+    // Native `thinking_token_budget` is i32; a budget past `max_tokens` caps nothing.
+    config.thinkingTokenBudget = Math.min(budget, 2_147_483_647);
+  }
+  if (t.display === 'omitted' || t.display === 'updates') {
+    config.includeReasoning = false;
+  }
 }
 
 /**

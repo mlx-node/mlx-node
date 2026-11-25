@@ -116,10 +116,12 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 export {
   ChatSession,
   ContextCapacityError,
+  ImageProcessingError,
   contextLane,
   countPromptTokens,
   isCapacityExhaustedError,
   isContextCapacityError,
+  isImageProcessingError,
   isMediaHeldRestartError,
   isMetalOutOfMemoryError,
   isResourceTimeoutError,
@@ -127,6 +129,8 @@ export {
   mtpOnByDefault,
   retryableErrorCode,
   selectCommittedStreamText,
+  validateRequestImages,
+  validateRequestImagesAsync,
 } from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
 export type {
@@ -135,6 +139,7 @@ export type {
   SendOptions,
   SessionCapableModel,
   SessionContextLimits,
+  ValidateRequestImagesOptions,
 } from './chat-session.js';
 
 // Model utilities (TypeScript-only)

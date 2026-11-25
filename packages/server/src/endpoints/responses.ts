@@ -12,7 +12,13 @@ import { randomUUID } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 
 import type { ChatConfig, ChatMessage, ChatResult, ResponseStore, StoredResponseRecord } from '@mlx-node/core';
-import { isCapacityExhaustedError, isContextCapacityError, retryableErrorCode } from '@mlx-node/lm';
+import {
+  isCapacityExhaustedError,
+  isContextCapacityError,
+  isImageProcessingError,
+  retryableErrorCode,
+  validateRequestImagesAsync,
+} from '@mlx-node/lm';
 import type { ChatSession, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
 
@@ -434,36 +440,153 @@ async function handleStreamingNativeWithAbort(
   };
 
   const outputItems: OutputItem[] = [];
-  let outputIndex = 0;
 
-  // State tracking for streaming
-  let reasoningItemId: string | null = null;
-  let reasoningText = '';
-  let messageItemId: string | null = null;
-  let messageText = '';
+  // Single-open-item state machine supporting arbitrarily interleaved
+  // reasoning/message items (`reasoning_returns` on Inkling2 / Gemma4).
+  // Turn-cumulative text trackers stay separate from per-item `openItem.text`
+  // so `done` reconciliation never duplicates earlier blocks into later items.
+  type OpenItem =
+    | { kind: 'reasoning'; id: string; index: number; text: string }
+    | { kind: 'message'; id: string; index: number; text: string; emittedLeadingWs: string };
+  // Held in a box so TypeScript's control-flow analysis does not narrow
+  // `open` to `null` across closure mutations in `ensureOpen*`/`closeOpenItem`.
+  const itemState: { open: OpenItem | null } = { open: null };
+  let totalEmittedReasoningText = '';
+  let totalEmittedMessageText = '';
+  let everEmittedReasoning = false;
+  let everEmittedMessage = false;
   // Whitespace-only text before any content is parked, not emitted: the
   // native side outer-trims `final.text`, so eagerly emitted leading
   // whitespace would leave the delta stream ahead of `output_text.done`
   // whenever a suppressed tool call follows it.
   let pendingLeadingWhitespace = '';
-  // The leading-whitespace run that DID reach the wire (flushed with the
-  // first real text). When a later tool call trims it from `final.text`,
-  // the done text keeps it anyway — emitted bytes can't be un-sent, and
-  // the delta stream must sum to `output_text.done`.
-  let emittedLeadingWs = '';
-  let hasEmittedMessage = false;
-  let hasEmittedReasoning = false;
-  // Tracks whether the reasoning output item's `response.output_item.done`
-  // has already been emitted. We close it eagerly on the reasoning→text
-  // transition (before opening the message item) so OpenAI Responses
-  // clients can populate their `thinkingSignature` via the `done`
-  // event's `currentBlock?.type === 'thinking'` guard. The terminal and
-  // failure paths check this flag to avoid double-emitting.
-  let hasClosedReasoning = false;
+  // The leading-whitespace run that DID reach the wire on the first message
+  // item. When a later tool call trims it from `final.text`, the done
+  // reconciliation keeps it anyway — emitted bytes can't be un-sent.
+  let firstEmittedLeadingWs = '';
   let suppressedMessageIndex = -1;
   const tagBuffer = new ToolCallTagBuffer();
   const allowToolUse = requestAllowsToolUse(req);
   let suppressedToolCalls = false;
+
+  const closeOpenItem = (messageStatus: 'completed' | 'incomplete' = 'completed'): void => {
+    if (itemState.open === null) return;
+    const closing = itemState.open;
+    itemState.open = null;
+    if (closing.kind === 'reasoning') {
+      writeSSEEvent(res, 'response.reasoning_summary_text.done', {
+        item_id: closing.id,
+        output_index: closing.index,
+        summary_index: 0,
+        text: closing.text,
+      });
+      const reasoningItem: ReasoningOutputItem = {
+        id: closing.id,
+        type: 'reasoning',
+        summary: [{ type: 'summary_text', text: closing.text }],
+      };
+      outputItems[closing.index] = reasoningItem;
+      writeSSEEvent(res, 'response.output_item.done', {
+        output_index: closing.index,
+        item: reasoningItem,
+      });
+    } else {
+      writeSSEEvent(res, 'response.output_text.done', {
+        item_id: closing.id,
+        output_index: closing.index,
+        content_index: 0,
+        text: closing.text,
+      });
+      const textPart = { type: 'output_text' as const, text: closing.text, annotations: [] as never[] };
+      writeSSEEvent(res, 'response.content_part.done', {
+        item_id: closing.id,
+        output_index: closing.index,
+        content_index: 0,
+        part: textPart,
+      });
+      const messageItem: MessageOutputItem = {
+        id: closing.id,
+        type: 'message',
+        role: 'assistant',
+        status: messageStatus,
+        content: messageStatus === 'incomplete' && !closing.text ? [] : [textPart],
+      };
+      outputItems[closing.index] = messageItem;
+      writeSSEEvent(res, 'response.output_item.done', {
+        output_index: closing.index,
+        item: messageItem,
+      });
+    }
+  };
+
+  const ensureOpenReasoning = (): Extract<OpenItem, { kind: 'reasoning' }> => {
+    if (itemState.open?.kind === 'reasoning') return itemState.open;
+    closeOpenItem('completed');
+    everEmittedReasoning = true;
+    const id = genId('rs_');
+    const index = outputItems.length;
+    const reasoningItem: ReasoningOutputItem = {
+      id,
+      type: 'reasoning',
+      summary: [],
+    };
+    outputItems.push(reasoningItem);
+    writeSSEEvent(res, 'response.output_item.added', { output_index: index, item: reasoningItem });
+    const created: Extract<OpenItem, { kind: 'reasoning' }> = { kind: 'reasoning', id, index, text: '' };
+    itemState.open = created;
+    return created;
+  };
+
+  const ensureOpenMessage = (): Extract<OpenItem, { kind: 'message' }> => {
+    if (itemState.open?.kind === 'message') return itemState.open;
+    closeOpenItem('completed');
+    everEmittedMessage = true;
+    const id = genId('msg_');
+    const index = outputItems.length;
+    const messageItem: MessageOutputItem = {
+      id,
+      type: 'message',
+      role: 'assistant',
+      status: 'in_progress',
+      content: [],
+    };
+    outputItems.push(messageItem);
+    writeSSEEvent(res, 'response.output_item.added', { output_index: index, item: messageItem });
+    const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
+    writeSSEEvent(res, 'response.content_part.added', {
+      item_id: id,
+      output_index: index,
+      content_index: 0,
+      part: textPart,
+    });
+    const created: Extract<OpenItem, { kind: 'message' }> = {
+      kind: 'message',
+      id,
+      index,
+      text: '',
+      emittedLeadingWs: '',
+    };
+    itemState.open = created;
+    return created;
+  };
+
+  const appendMessageDelta = (delta: string): void => {
+    const msg = ensureOpenMessage();
+    if (!firstEmittedLeadingWs && !totalEmittedMessageText) {
+      firstEmittedLeadingWs = delta.match(/^\s+/)?.[0] ?? '';
+    }
+    if (!msg.emittedLeadingWs && !msg.text) {
+      msg.emittedLeadingWs = delta.match(/^\s+/)?.[0] ?? '';
+    }
+    msg.text += delta;
+    totalEmittedMessageText += delta;
+    writeSSEEvent(res, 'response.output_text.delta', {
+      item_id: msg.id,
+      output_index: msg.index,
+      content_index: 0,
+      delta,
+    });
+  };
 
   // Terminal response is captured in the done branch but emitted AFTER
   // the loop drains — `wasCommitted()` only reads authoritative
@@ -502,338 +625,152 @@ async function handleStreamingNativeWithAbort(
         // Final event -- close open items and emit completed
 
         // Flush any remaining pending text (no tool call tag was found).
-        // flush() resolves the LFM2 paired-sentinel state machine first, so
-        // a same-chunk `<|tool_call_end|>prose` tail still releases its
-        // prose — whatever it returns is safe to emit regardless of the
-        // still-suppressed post-call echo watch.
+        // `appendMessageDelta` closes any open reasoning item FIRST before
+        // opening a message item, preserving single-open-item ordering.
         const remainingText = pendingLeadingWhitespace + tagBuffer.flush();
-        if (remainingText.trim() === '' && messageText === '') {
+        if (remainingText.trim() === '' && itemState.open?.kind !== 'message') {
           // Still only leading whitespace — keep it parked; the terminal
           // recovery below decides whether it lands inside finalText.
           pendingLeadingWhitespace = remainingText;
         } else if (remainingText) {
           pendingLeadingWhitespace = '';
-          if (!hasEmittedMessage) {
-            hasEmittedMessage = true;
-            messageItemId = genId('msg_');
-            const messageItem: MessageOutputItem = {
-              id: messageItemId,
-              type: 'message',
-              role: 'assistant',
-              status: 'in_progress',
-              content: [],
-            };
-            const miIndex = outputItems.length;
-            outputItems.push(messageItem);
-            outputIndex = miIndex;
-            writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-            const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-            writeSSEEvent(res, 'response.content_part.added', {
-              item_id: messageItemId,
-              output_index: miIndex,
-              content_index: 0,
-              part: textPart,
-            });
-          }
-          messageText += remainingText;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: outputItems.findIndex((i) => i.id === messageItemId),
-            content_index: 0,
-            delta: remainingText,
-          });
+          appendMessageDelta(remainingText);
         }
 
-        // Close reasoning item if still open (already closed eagerly on
-        // reasoning→text transition for most turns — this branch covers
-        // the reasoning-only shape where no text deltas ever arrived).
-        if (hasEmittedReasoning && !hasClosedReasoning && reasoningItemId) {
-          hasClosedReasoning = true;
-          const finalReasoningText = event.thinking ?? reasoningText;
-          writeSSEEvent(res, 'response.reasoning_summary_text.done', {
-            item_id: reasoningItemId,
-            output_index: outputItems.length - (hasEmittedMessage ? 1 : 0) - 1,
+        // If reasoning was never streamed via deltas but arrived on `done`
+        // (e.g. Muse-Glimmer), emit a single reasoning item cleanly. If a
+        // reasoning item is still open and `event.thinking` extends past
+        // turn-cumulative `totalEmittedReasoningText`, append only the unsent
+        // suffix so earlier reasoning items are never duplicated into `rs_2`.
+        if (!everEmittedReasoning && event.thinking) {
+          const rs = ensureOpenReasoning();
+          rs.text = event.thinking;
+          totalEmittedReasoningText = event.thinking;
+          writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
+            item_id: rs.id,
+            output_index: rs.index,
             summary_index: 0,
-            text: finalReasoningText,
+            delta: event.thinking,
           });
-          const reasoningItem: ReasoningOutputItem = {
-            id: reasoningItemId,
-            type: 'reasoning',
-            summary: [{ type: 'summary_text', text: finalReasoningText }],
-          };
-          const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
-          if (riIndex >= 0) {
-            outputItems[riIndex] = reasoningItem;
-          }
-          writeSSEEvent(res, 'response.output_item.done', {
-            output_index: riIndex >= 0 ? riIndex : 0,
-            item: reasoningItem,
+          closeOpenItem('completed');
+        } else if (
+          itemState.open?.kind === 'reasoning' &&
+          event.thinking &&
+          event.thinking.length > totalEmittedReasoningText.length &&
+          event.thinking.startsWith(totalEmittedReasoningText)
+        ) {
+          const tail = event.thinking.slice(totalEmittedReasoningText.length);
+          itemState.open.text += tail;
+          totalEmittedReasoningText += tail;
+          writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
+            item_id: itemState.open.id,
+            output_index: itemState.open.index,
+            summary_index: 0,
+            delta: tail,
           });
         }
 
-        // Close message item if open.
-        // Use the final event's parsed text (markup-stripped) as the authoritative content.
-        // If the parsed text is empty and there are tool calls, skip the message item entirely
-        // (matching the non-streaming buildOutputItems behavior).
+        // Reconcile terminal parsed text against turn-cumulative streamed text
+        // (`totalEmittedMessageText`, NOT `openItem.text`) so interleaved
+        // multi-message turns never duplicate earlier blocks on `done`.
         const parsedToolCalls = event.toolCalls.filter((t) => t.status === 'ok');
         suppressedToolCalls = !allowToolUse && parsedToolCalls.length > 0;
         const okToolCalls = allowToolUse ? parsedToolCalls : [];
         let finalText = allowToolUse ? event.text : visibleAnswerText(event, false);
-        // Leading whitespace that already reached the wire stays in the
-        // done text — a later tool call may have trimmed it from
-        // `final.text`, but emitted bytes can't be un-sent and the delta
-        // stream must sum to `output_text.done`.
-        if (emittedLeadingWs && !finalText.startsWith(emittedLeadingWs)) {
-          finalText = emittedLeadingWs + finalText;
+        if (firstEmittedLeadingWs && !finalText.startsWith(firstEmittedLeadingWs)) {
+          finalText = firstEmittedLeadingWs + finalText;
         }
         const hasToolCalls = okToolCalls.length > 0;
         const skipMessageItem = !finalText && hasToolCalls;
 
         // Recovery: if tool-call suppression was triggered but the final event has no
         // parsed tool calls (false alarm — e.g., literal "<tool_call>" in model output),
-        // create a message item using the final parsed text.
-        if (tagBuffer.suppressed && !hasToolCalls && finalText && !hasEmittedMessage) {
-          hasEmittedMessage = true;
-          messageItemId = genId('msg_');
-          const messageItem: MessageOutputItem = {
-            id: messageItemId,
-            type: 'message',
-            role: 'assistant',
-            status: 'in_progress',
-            content: [],
-          };
-          const miIndex = outputItems.length;
-          outputItems.push(messageItem);
-          outputIndex = miIndex;
-          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-          writeSSEEvent(res, 'response.content_part.added', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            part: textPart,
-          });
-          messageText = finalText;
-          writeSSEEvent(res, 'response.output_text.delta', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            delta: finalText,
-          });
+        // emit the unsent final parsed text.
+        if (tagBuffer.suppressed && !hasToolCalls && finalText && !everEmittedMessage) {
+          pendingLeadingWhitespace = '';
+          appendMessageDelta(finalText);
         } else if (
           tagBuffer.suppressed &&
           !hasToolCalls &&
           finalText &&
-          hasEmittedMessage &&
-          !(messageText + pendingLeadingWhitespace).includes(finalText)
+          everEmittedMessage &&
+          !(totalEmittedMessageText + pendingLeadingWhitespace).includes(finalText)
         ) {
-          // Recovery: streaming text was cut off by a false-alarm `<tool_call>` tag.
-          //
-          // The previous `finalText.slice(messageText.length)` is wrong: when the
-          // streamed text contains post-</think> whitespace (or any prefix the
-          // native side trimmed via `split_at_think_end` / `parse_tool_calls`),
-          // `messageText.length` indexes into the streamed buffer while
-          // `finalText` starts at the post-trim cleaned position — the two
-          // prefixes diverge (e.g. messageText=`"\n\n"`, finalText=`"<tool_call>..."`)
-          // and a length-based slice chops `<t` off `<tool_call>`, emitting
-          // `"ool_call>\n<function=..."` as visible text.
-          //
-          // Find the longest streamed-suffix == finalText-prefix overlap and emit
-          // whatever finalText has BEYOND that overlap.
-          //
-          // The `!messageText.includes(finalText)` guard distinguishes:
-          //   (a) duplicate-trim case: streamed "Let me check. " + closed
-          //       non-ok tool_call → finalText="Let me check." (trimmed). The
-          //       trimmed text IS a substring of the streamed text → skip
-          //       (otherwise we'd duplicate "Let me check.").
-          //   (b) unclosed-tool case: streamed `\n\n` + unclosed
-          //       `<tool_call>...` → finalText=`<tool_call>...`. The malformed
-          //       tag is NOT a substring of the streamed whitespace → emit
-          //       (this is the original `<t`-strip bug we're fixing).
-          // Length-based guards (`finalText.length > messageText.length`)
-          // misclassify case (b) when the streamed whitespace is long.
-          let overlap = longestSuffixPrefixOverlap(messageText + pendingLeadingWhitespace, finalText);
+          let overlap = longestSuffixPrefixOverlap(totalEmittedMessageText + pendingLeadingWhitespace, finalText);
           if (overlap < pendingLeadingWhitespace.length) {
-            // The parked leading whitespace never reached the wire and the
-            // authoritative text doesn't carry it — drop it and recompute
-            // the tail against only what was actually emitted.
             pendingLeadingWhitespace = '';
-            overlap = longestSuffixPrefixOverlap(messageText, finalText);
+            overlap = longestSuffixPrefixOverlap(totalEmittedMessageText, finalText);
           }
           const unsent = pendingLeadingWhitespace + finalText.slice(overlap);
           pendingLeadingWhitespace = '';
           if (unsent) {
-            messageText += unsent;
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
-              content_index: 0,
-              delta: unsent,
-            });
+            appendMessageDelta(unsent);
           }
         }
 
-        // Emit any unsent suffix when final text extends past what was
-        // streamed. Same divergence concern as above (post-</think> trim
-        // can leave `messageText` longer than the matching prefix of
-        // `finalText`), so we use the same overlap-based slice instead of
-        // a length-based one. When the overlap covers all of `finalText`
-        // (i.e. nothing more to emit) `unsent` is empty and we skip.
-        //
-        // The `!messageText.includes(finalText)` guard skips the
-        // duplicate-trim case where finalText is a substring of the
-        // streamed text (e.g. native `.trim()` shrinkage). See the
-        // companion comment above for the case-distinction rationale.
-        //
-        // `suppressed` alone is not disqualifying: LFM2's start sentinel
-        // suppresses to stream end (the interior could still fail parsing),
-        // so a successful call leaves post-call prose held in the buffer.
-        // When the final event DID parse calls, emit the held tail so the
-        // delta stream still sums to `output_text.done` — as the Messages
-        // and agent terminal-recovery paths already do.
+        // Emit any unsent suffix when final text extends past what was streamed.
         if (
-          hasEmittedMessage &&
+          everEmittedMessage &&
           finalText &&
           (!tagBuffer.suppressed || hasToolCalls) &&
-          !(messageText + pendingLeadingWhitespace).includes(finalText)
+          !(totalEmittedMessageText + pendingLeadingWhitespace).includes(finalText)
         ) {
-          let overlap = longestSuffixPrefixOverlap(messageText + pendingLeadingWhitespace, finalText);
+          let overlap = longestSuffixPrefixOverlap(totalEmittedMessageText + pendingLeadingWhitespace, finalText);
           if (overlap < pendingLeadingWhitespace.length) {
             pendingLeadingWhitespace = '';
-            overlap = longestSuffixPrefixOverlap(messageText, finalText);
+            overlap = longestSuffixPrefixOverlap(totalEmittedMessageText, finalText);
           }
           const unsent = pendingLeadingWhitespace + finalText.slice(overlap);
           pendingLeadingWhitespace = '';
           if (unsent) {
-            messageText += unsent;
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
-              content_index: 0,
-              delta: unsent,
-            });
+            appendMessageDelta(unsent);
           }
         }
 
         // Recovery: text was never emitted during streaming but final has text
-        // (possible if all text arrived in the final event only). An empty
-        // message item stands in when no other item exists: cold replay
-        // rebuilds a turn only from its items.
-        if (!hasEmittedMessage && (finalText || (!hasEmittedReasoning && !hasToolCalls))) {
-          hasEmittedMessage = true;
-          // Nothing reached the wire yet — emit the authoritative text once.
-          // When it still carries the parked leading whitespace those bytes
-          // are already inside `finalText`; otherwise the parked bytes were
-          // trimmed upstream and must be dropped.
+        // (or no reasoning and no tool calls exist, so an empty message item
+        // stands in for cold replay).
+        if (!everEmittedMessage && (finalText || (!everEmittedReasoning && !hasToolCalls))) {
           pendingLeadingWhitespace = '';
-          messageItemId = genId('msg_');
-          const messageItem: MessageOutputItem = {
-            id: messageItemId,
-            type: 'message',
-            role: 'assistant',
-            status: 'in_progress',
-            content: [],
-          };
-          const miIndex = outputItems.length;
-          outputItems.push(messageItem);
-          outputIndex = miIndex;
-          writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-          const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-          writeSSEEvent(res, 'response.content_part.added', {
-            item_id: messageItemId,
-            output_index: miIndex,
-            content_index: 0,
-            part: textPart,
-          });
-          messageText = finalText;
+          ensureOpenMessage();
           if (finalText) {
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: miIndex,
-              content_index: 0,
-              delta: finalText,
-            });
+            appendMessageDelta(finalText);
           }
         }
 
-        if (hasEmittedMessage && messageText !== finalText) {
-          finalText = messageText;
-        }
-
-        if (hasEmittedMessage && messageItemId && !skipMessageItem) {
-          const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
-          const contentIndex = 0;
-
+        // Close whichever item is still open (reasoning or message) using its
+        // own per-item `itemState.open.text` and `itemState.open.index`.
+        if (itemState.open?.kind === 'message' && skipMessageItem) {
+          const closing = itemState.open;
+          itemState.open = null;
           writeSSEEvent(res, 'response.output_text.done', {
-            item_id: messageItemId,
-            output_index: miIndex >= 0 ? miIndex : outputIndex,
-            content_index: contentIndex,
-            text: finalText,
-          });
-
-          const textPart = { type: 'output_text' as const, text: finalText, annotations: [] as never[] };
-          writeSSEEvent(res, 'response.content_part.done', {
-            item_id: messageItemId,
-            output_index: miIndex >= 0 ? miIndex : outputIndex,
-            content_index: contentIndex,
-            part: textPart,
-          });
-
-          const messageItem: MessageOutputItem = {
-            id: messageItemId,
-            type: 'message',
-            role: 'assistant',
-            status: mapFinishReasonToStatus(event.finishReason),
-            content: [textPart],
-          };
-          if (miIndex >= 0) {
-            outputItems[miIndex] = messageItem;
-          }
-          writeSSEEvent(res, 'response.output_item.done', {
-            output_index: miIndex >= 0 ? miIndex : outputIndex,
-            item: messageItem,
-          });
-        } else if (hasEmittedMessage && messageItemId && skipMessageItem) {
-          // A message item was started (output_item.added / content_part.added events already
-          // sent to the client) but we now know it should be suppressed because the final
-          // text is empty and there are tool calls.  Send proper done events to close out
-          // the item gracefully so clients do not see a dangling in-progress item, then
-          // remove it from outputItems so it does not appear in the completed response.
-          const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
-          const miOutputIndex = miIndex >= 0 ? miIndex : outputIndex;
-
-          writeSSEEvent(res, 'response.output_text.done', {
-            item_id: messageItemId,
-            output_index: miOutputIndex,
+            item_id: closing.id,
+            output_index: closing.index,
             content_index: 0,
             text: '',
           });
-
           const emptyTextPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
           writeSSEEvent(res, 'response.content_part.done', {
-            item_id: messageItemId,
-            output_index: miOutputIndex,
+            item_id: closing.id,
+            output_index: closing.index,
             content_index: 0,
             part: emptyTextPart,
           });
-
           const closedMessageItem: MessageOutputItem = {
-            id: messageItemId,
+            id: closing.id,
             type: 'message',
             role: 'assistant',
             status: 'completed',
             content: [],
           };
+          outputItems[closing.index] = closedMessageItem;
           writeSSEEvent(res, 'response.output_item.done', {
-            output_index: miOutputIndex,
+            output_index: closing.index,
             item: closedMessageItem,
           });
-
-          // Track suppressed index for exclusion from final response
-          // but keep in array so subsequent output_index values remain unique.
-          if (miIndex >= 0) {
-            suppressedMessageIndex = miIndex;
-          }
+          suppressedMessageIndex = closing.index;
+        } else {
+          closeOpenItem(mapFinishReasonToStatus(event.finishReason));
         }
 
         // Collect function_call items but defer SSE emission until
@@ -900,147 +837,50 @@ async function handleStreamingNativeWithAbort(
         const deltaText = withoutReasoningClose(event.text);
         if (!deltaText) continue;
 
-        if (!hasEmittedReasoning) {
-          // First reasoning chunk -- add reasoning item
-          hasEmittedReasoning = true;
-          reasoningItemId = genId('rs_');
-          const reasoningItem: ReasoningOutputItem = {
-            id: reasoningItemId,
-            type: 'reasoning',
-            summary: [],
-          };
-          const riIndex = outputItems.length;
-          outputItems.push(reasoningItem);
-
-          writeSSEEvent(res, 'response.output_item.added', { output_index: riIndex, item: reasoningItem });
+        if (itemState.open?.kind === 'message') {
+          const tagResidual = tagBuffer.flush();
+          if (tagResidual) {
+            appendMessageDelta(tagResidual);
+          }
         }
-        reasoningText += deltaText;
+        const rs = ensureOpenReasoning();
+        rs.text += deltaText;
+        totalEmittedReasoningText += deltaText;
         writeSSEEvent(res, 'response.reasoning_summary_text.delta', {
-          item_id: reasoningItemId,
-          output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
+          item_id: rs.id,
+          output_index: rs.index,
           summary_index: 0,
           delta: deltaText,
         });
       } else {
-        // Transition from reasoning to assistant text: close the reasoning
-        // output item BEFORE emitting any `response.output_item.added` for
-        // the message. OpenAI Responses clients maintain a
-        // single `currentBlock` state — opening the message item while the
-        // reasoning item is still "in progress" overwrites that state, so
-        // the later `output_item.done` for reasoning fails its
-        // `currentBlock?.type === 'thinking'` guard and never sets
-        // `thinkingSignature`. Without the signature the next turn cannot
-        // echo the reasoning item back, and any thinking-model agent loses
-        // its chain of thought on each turn. Must run before the first
-        // message write on this branch.
-        if (hasEmittedReasoning && !hasClosedReasoning && reasoningItemId) {
-          hasClosedReasoning = true;
-          const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
-          writeSSEEvent(res, 'response.reasoning_summary_text.done', {
-            item_id: reasoningItemId,
-            output_index: riIndex,
-            summary_index: 0,
-            text: reasoningText,
-          });
-          const reasoningItem: ReasoningOutputItem = {
-            id: reasoningItemId,
-            type: 'reasoning',
-            summary: [{ type: 'summary_text', text: reasoningText }],
-          };
-          if (riIndex >= 0) {
-            outputItems[riIndex] = reasoningItem;
-          }
-          writeSSEEvent(res, 'response.output_item.done', {
-            output_index: riIndex >= 0 ? riIndex : 0,
-            item: reasoningItem,
-          });
-        }
-        // Text delta with tool_call tag buffering
+        // Do NOT close an open reasoning item eagerly before checking
+        // whitespace parking and structural tag buffering: `Think1 -> "\n" ->
+        // Think2` or `Think1 -> "\n<tool_call>"` must not split or prematurely
+        // close reasoning. `appendMessageDelta` -> `ensureOpenMessage` closes
+        // any open reasoning item right before opening the message item.
         const { safeText, tagFound, cleanPrefix } = tagBuffer.push(event.text);
         if (tagFound) {
-          // Emit any clean text before the tag.
-          // Trim whitespace-only prefixes: whitespace immediately before <tool_call>
-          // is always markup-related (e.g. "\n<tool_call>"), not user-visible content.
-          // Emitting it would create a dangling message item that needs special-casing
-          // at finalization when skipMessageItem is true.
+          // Emit any clean non-whitespace text before the tag.
           if (cleanPrefix.trim()) {
-            if (!hasEmittedMessage) {
-              hasEmittedMessage = true;
-              messageItemId = genId('msg_');
-              const messageItem: MessageOutputItem = {
-                id: messageItemId,
-                type: 'message',
-                role: 'assistant',
-                status: 'in_progress',
-                content: [],
-              };
-              const miIndex = outputItems.length;
-              outputItems.push(messageItem);
-              outputIndex = miIndex;
-              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-              writeSSEEvent(res, 'response.content_part.added', {
-                item_id: messageItemId,
-                output_index: miIndex,
-                content_index: 0,
-                part: textPart,
-              });
-            }
             const deltaText = pendingLeadingWhitespace + cleanPrefix;
             pendingLeadingWhitespace = '';
-            if (!emittedLeadingWs && !messageText) {
-              emittedLeadingWs = deltaText.match(/^\s+/)?.[0] ?? '';
-            }
-            messageText += deltaText;
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
-              content_index: 0,
-              delta: deltaText,
-            });
+            appendMessageDelta(deltaText);
           }
         } else if (safeText) {
-          const combined = pendingLeadingWhitespace + safeText;
-          if (combined.trim() === '' && messageText === '') {
-            // Whitespace-only chunks before any content park instead of
-            // reaching the wire — the native side outer-trims `final.text`,
-            // so emitted leading whitespace would leave the delta stream
-            // ahead of `output_text.done` when suppression follows.
-            pendingLeadingWhitespace = combined;
+          if (itemState.open?.kind !== 'message') {
+            const combined = pendingLeadingWhitespace + safeText;
+            if (combined.trim() === '') {
+              // Whitespace-only chunks before a message item opens park instead
+              // of reaching the wire (and leave any open reasoning item intact).
+              pendingLeadingWhitespace = combined;
+            } else {
+              pendingLeadingWhitespace = '';
+              appendMessageDelta(combined);
+            }
           } else {
+            const deltaText = pendingLeadingWhitespace + safeText;
             pendingLeadingWhitespace = '';
-            if (!hasEmittedMessage) {
-              hasEmittedMessage = true;
-              messageItemId = genId('msg_');
-              const messageItem: MessageOutputItem = {
-                id: messageItemId,
-                type: 'message',
-                role: 'assistant',
-                status: 'in_progress',
-                content: [],
-              };
-              const miIndex = outputItems.length;
-              outputItems.push(messageItem);
-              outputIndex = miIndex;
-              writeSSEEvent(res, 'response.output_item.added', { output_index: miIndex, item: messageItem });
-              const textPart = { type: 'output_text' as const, text: '', annotations: [] as never[] };
-              writeSSEEvent(res, 'response.content_part.added', {
-                item_id: messageItemId,
-                output_index: miIndex,
-                content_index: 0,
-                part: textPart,
-              });
-            }
-            if (!emittedLeadingWs && !messageText) {
-              emittedLeadingWs = combined.match(/^\s+/)?.[0] ?? '';
-            }
-            messageText += combined;
-            writeSSEEvent(res, 'response.output_text.delta', {
-              item_id: messageItemId,
-              output_index: outputItems.findIndex((i) => i.id === messageItemId),
-              content_index: 0,
-              delta: combined,
-            });
+            appendMessageDelta(deltaText);
           }
         }
       }
@@ -1140,64 +980,13 @@ async function handleStreamingNativeWithAbort(
     total_tokens: 0,
   };
 
+  // Close any still-open item before the failure terminal. On the `sawDone`
+  // path `done` already closed `itemState.open` (`null`), so this never
+  // double-closes.
+  if (!sawDone && itemState.open !== null) {
+    closeOpenItem('incomplete');
+  }
   const finalOutput = outputItems.filter((_, idx) => idx !== suppressedMessageIndex);
-
-  // Flush still-open message items before the terminal. Only on the
-  // non-sawDone path — the done branch emits its own closes before
-  // breaking out.
-  if (!sawDone && hasEmittedMessage && messageItemId != null) {
-    const miIndex = outputItems.findIndex((i) => i.id === messageItemId);
-    writeSSEEvent(res, 'response.output_text.done', {
-      item_id: messageItemId,
-      output_index: miIndex >= 0 ? miIndex : outputIndex,
-      content_index: 0,
-      text: messageText,
-    });
-    const textPart = { type: 'output_text' as const, text: messageText, annotations: [] as never[] };
-    writeSSEEvent(res, 'response.content_part.done', {
-      item_id: messageItemId,
-      output_index: miIndex >= 0 ? miIndex : outputIndex,
-      content_index: 0,
-      part: textPart,
-    });
-    const closedMessageItem: MessageOutputItem = {
-      id: messageItemId,
-      type: 'message',
-      role: 'assistant',
-      status: 'incomplete',
-      content: messageText ? [textPart] : [],
-    };
-    if (miIndex >= 0) {
-      outputItems[miIndex] = closedMessageItem;
-      finalOutput[miIndex] = closedMessageItem;
-    }
-    writeSSEEvent(res, 'response.output_item.done', {
-      output_index: miIndex >= 0 ? miIndex : outputIndex,
-      item: closedMessageItem,
-    });
-  }
-  if (!sawDone && hasEmittedReasoning && !hasClosedReasoning && reasoningItemId != null) {
-    // No `status` field on reasoning items — just emit closes so
-    // client-side output_index bookkeeping stays consistent.
-    hasClosedReasoning = true;
-    writeSSEEvent(res, 'response.reasoning_summary_text.done', {
-      item_id: reasoningItemId,
-      output_index: outputItems.findIndex((i) => i.id === reasoningItemId),
-      summary_index: 0,
-      text: reasoningText,
-    });
-    const riIndex = outputItems.findIndex((i) => i.id === reasoningItemId);
-    if (riIndex >= 0) {
-      const reasoningItem: ReasoningOutputItem = {
-        id: reasoningItemId,
-        type: 'reasoning',
-        summary: [{ type: 'summary_text', text: reasoningText }],
-      };
-      outputItems[riIndex] = reasoningItem;
-      finalOutput[riIndex] = reasoningItem;
-      writeSSEEvent(res, 'response.output_item.done', { output_index: riIndex, item: reasoningItem });
-    }
-  }
 
   await drainPending();
 
@@ -1395,14 +1184,17 @@ async function runSessionNonStreaming(
         throw new Error('tool message missing toolCallId');
       }
       const initialTurns = session.turns;
+      const images = last.images && last.images.length > 0 ? last.images : undefined;
       // Forward the structured `isError` field through to the native
       // renderer so the wire-format `[tool error]` marker stays in sync
       // with the Anthropic `tool_result.is_error === true` source field
       // (the structured channel is the authoritative signal — see
-      // `ChatMessage.isError` rustdoc).
+      // `ChatMessage.isError` rustdoc), and forward any attached tool images
+      // so warm continuations match cold replay byte-for-byte.
       const result = await session.sendToolResult(last.toolCallId, last.content, {
         config,
         isError: last.isError,
+        ...(images ? { images } : {}),
         signal,
       });
       return { result, committed: session.turns > initialTurns };
@@ -1504,15 +1296,18 @@ async function runSessionStreaming(
       }
       const constrainedConfig = await session.preflightPendingContextCapacity(last, config);
       const initialTurns = session.turns;
+      const images = last.images && last.images.length > 0 ? last.images : undefined;
       return {
         // Forward the structured `isError` field through to the native
         // renderer so the streaming wire-format `[tool error]` marker
         // stays in sync with the Anthropic `tool_result.is_error === true`
-        // source field — same contract as the non-streaming path above.
+        // source field — same contract as the non-streaming path above,
+        // along with any attached tool images.
         stream: session.sendToolResultStream(last.toolCallId, last.content, {
           config: constrainedConfig,
           signal,
           isError: last.isError,
+          ...(images ? { images } : {}),
         }),
         wasCommitted: () => session.turns > initialTurns,
       };
@@ -2414,12 +2209,6 @@ export async function handleCreateResponse(
       sendBadRequest(res, err instanceof Error ? err.message : 'Invalid request input', 'input');
       return;
     }
-    // Stamp the requesting alias so the shared model wrapper attributes the
-    // turn to the name the client used, not the binding's first registration.
-    (config as TracedChatConfig).modelAlias = body.model;
-    const clientSession = clientSessionOf(httpReq?.headers);
-    if (clientSession !== undefined) (config as TracedChatConfig).clientSession = clientSession;
-
     // New-only messages (what this request added). Instructions are
     // stored separately — persisting them as input messages would
     // replay stale system messages on cold chain. Mirror `mapRequest`'s
@@ -2427,6 +2216,58 @@ export async function handleCreateResponse(
     const instructionsOffset = mappedBody.instructions ? 1 : 0;
     const priorOffset = instructionsOffset + (priorMessages?.length ?? 0);
     let newInputMessages = messages.slice(priorOffset);
+
+    const hasImages = messages.some((message) => (message.images?.length ?? 0) > 0);
+    if (hasImages && leaseModel.supportsImages?.() !== true) {
+      sendBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`, 'input');
+      return;
+    }
+    // Only preflight-validate newly submitted images in this request. Images
+    // reconstructed from `priorMessages` (stored `ResponseStore` history) were
+    // already validated when originally accepted — re-decoding them on every
+    // text-only `previous_response_id` follow-up wastes CPU and stalls latency.
+    const armAbortListeners = (): void => {
+      if (abortListenersAttached) return;
+      res.once('close', onAbortClose);
+      res.once('error', onAbortError);
+      if (abortSocket != null) {
+        abortSocket.once('close', onAbortClose);
+      }
+      if (httpReq) {
+        httpReq.once('close', onAbortClose);
+        httpReq.once('error', onAbortError);
+      }
+      // Catch-up abort: a response torn down BEFORE the attach above has
+      // already emitted its terminal event, so the `once('close')`
+      // listeners will never fire. Consult the response-side socket state
+      // directly (the REQUEST side is deliberately excluded — a fully
+      // consumed IncomingMessage auto-destroys after 'end' on every normal
+      // request, so `httpReq.destroyed` is not a disconnect signal). This
+      // makes `streamSignal.aborted` authoritative for the H2 pre-dispatch
+      // disconnect check inside the mutex callback.
+      if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+        abortController.abort();
+      }
+      abortListenersAttached = true;
+    };
+    const hasNewImages = newInputMessages.some((message) => (message.images?.length ?? 0) > 0);
+    if (hasNewImages) {
+      armAbortListeners();
+      try {
+        await validateRequestImagesAsync(newInputMessages, { signal: abortController.signal });
+      } catch {
+        if (abortController.signal.aborted) {
+          return;
+        }
+        sendBadRequest(res, 'Could not process image', 'input');
+        return;
+      }
+    }
+    // Stamp the requesting alias so the shared model wrapper attributes the
+    // turn to the name the client used, not the binding's first registration.
+    (config as TracedChatConfig).modelAlias = body.model;
+    const clientSession = clientSessionOf(httpReq?.headers);
+    if (clientSession !== undefined) (config as TracedChatConfig).clientSession = clientSession;
 
     // Every tool message in the continuation delta must carry a
     // non-empty `tool_call_id`. Correctness-critical: the id-set gate
@@ -2452,33 +2293,11 @@ export async function handleCreateResponse(
     const preLockSessionReg = sessionReg;
     const preLockInstanceId = currentInstanceId;
 
-    // Arm the abort listeners. `@mlx-node/lm`'s streaming wrappers
-    // plumb the signal into `_runChatStream`, which calls
-    // `handle.cancel()` on the native stream handle AND pushes a
-    // synthetic marker to unblock the next `waitForItem()`. Attached
-    // here (not at function entry) so early-return validation gates
-    // above don't need paired detach calls.
-    res.once('close', onAbortClose);
-    res.once('error', onAbortError);
-    if (abortSocket != null) {
-      abortSocket.once('close', onAbortClose);
-    }
-    if (httpReq) {
-      httpReq.once('close', onAbortClose);
-      httpReq.once('error', onAbortError);
-    }
-    // Catch-up abort: a response torn down BEFORE the attach above has
-    // already emitted its terminal event, so the `once('close')`
-    // listeners will never fire. Consult the response-side socket state
-    // directly (the REQUEST side is deliberately excluded — a fully
-    // consumed IncomingMessage auto-destroys after 'end' on every normal
-    // request, so `httpReq.destroyed` is not a disconnect signal). This
-    // makes `streamSignal.aborted` authoritative for the H2 pre-dispatch
-    // disconnect check inside the mutex callback.
-    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
-      abortController.abort();
-    }
-    abortListenersAttached = true;
+    // Arm the abort listeners (no-op if already armed for image preflight).
+    // `@mlx-node/lm`'s streaming wrappers plumb the signal into
+    // `_runChatStream`, which calls `handle.cancel()` on the native stream
+    // handle AND pushes a synthetic marker to unblock the next `waitForItem()`.
+    armAbortListeners();
     const streamSignal: AbortSignal = abortController.signal;
 
     // Persistence is a two-step dance.
@@ -3629,7 +3448,9 @@ export async function handleCreateResponse(
               // before native cache mutation. Keep them out of the generic
               // 500 path so clients can compact/truncate and retry.
               const retryable = retryableErrorCode(err);
-              if (isContextCapacityError(err)) {
+              if (isImageProcessingError(err)) {
+                sendBadRequest(res, 'Could not process image', 'input');
+              } else if (isContextCapacityError(err)) {
                 sendBadRequest(res, message);
               } else if (isCapacityExhaustedError(err)) {
                 sendCapacityExhausted(res, message);

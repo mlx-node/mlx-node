@@ -728,7 +728,7 @@ describe('the attachment input', () => {
         'y'.repeat(10_001),
       ],
       ['bad base64', [image('iVBORw0KGgo!AAAA')]],
-      ['base64 without padding', [image('iVBORw0KGgo')]],
+      ['bad base64 length (len % 4 === 1)', [image('iVBORw0KGgoAA')]],
       ['too short', [image('iVB')]],
       ['1,000,001 picture bytes', [image(png(1_000_001))]],
       ['over the base64 length', [image(`${png(1_000_000)}AAAA`)]],
@@ -743,6 +743,18 @@ describe('the attachment input', () => {
     }
     expect(reasonOf(() => create('a.txt'))).toBe('E_BAD_REQUEST');
     expect(reasonOf(() => prompt({ 0: file('a') }))).toBe('E_BAD_REQUEST');
+  });
+
+  it('accepts wrapped, unpadded, and URL-safe base64 images on both routes', () => {
+    const unpaddedPng = png(64).replaceAll('=', '');
+    const wrappedPng = `  ${unpaddedPng.slice(0, 12)}\r\n${unpaddedPng.slice(12)} `;
+    const urlSafeJpeg = '_9j_4AAQ';
+    expect(reasonOf(() => create([image(unpaddedPng), image(wrappedPng), image(urlSafeJpeg, 'image/jpeg')]))).toBe(
+      'ok',
+    );
+    expect(reasonOf(() => prompt([image(unpaddedPng), image(wrappedPng), image(urlSafeJpeg, 'image/jpeg')]))).toBe(
+      'ok',
+    );
   });
 });
 

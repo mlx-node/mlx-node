@@ -6,6 +6,8 @@ import type { SessionCapableModel } from '@mlx-node/lm';
 import { createHandler, ModelRegistry, ModelWorkCoordinator } from '@mlx-node/server';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { __setImageValidatorForTests } from '../../packages/lm/src/chat-session.js';
+
 function createMockReq(method: string, url: string, body?: object): IncomingMessage {
   const req = new Readable({
     read() {
@@ -221,10 +223,11 @@ describe('POST /v1/messages/count_tokens', () => {
   // widened and the request's effort applied. Mutation: count the bare
   // template length (old `applyChatTemplate(messages, true, tools)`) → red.
   it('counts through the context clamp: images widened, effort passed', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
     const registry = new ModelRegistry();
     const model = createCountingModel(4);
     const expandedPromptTokenCount = vi.fn(() => 300);
-    Object.assign(model, { expandedPromptTokenCount });
+    Object.assign(model, { expandedPromptTokenCount, supportsImages: () => true });
     registry.register('vision-model', model);
     const handler = createHandler(registry);
     const req = createMockReq('POST', '/v1/messages/count_tokens', {
@@ -235,7 +238,7 @@ describe('POST /v1/messages/count_tokens', () => {
           role: 'user',
           content: [
             { type: 'text', text: 'describe' },
-            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } },
           ],
         },
       ],
@@ -250,6 +253,113 @@ describe('POST /v1/messages/count_tokens', () => {
     expect(expandedPromptTokenCount).toHaveBeenCalledOnce();
     const call = model.applyChatTemplate.mock.calls[0] as unknown[];
     expect(call.slice(1)).toEqual([true, null, true, 'low']);
+  });
+
+  it('rejects images on text-only models, corrupt/unsupported images, and >64 images with 400', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const pngBytes = Buffer.from(validPng, 'base64');
+    const halfPng = pngBytes.subarray(0, Math.floor(pngBytes.length / 2)).toString('base64');
+    const bmpB64 = Buffer.from([
+      0x42, 0x4d, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00,
+    ]).toString('base64');
+    const tiffB64 = Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]).toString('base64');
+    const heicB64 = Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]).toString(
+      'base64',
+    );
+    const garbageB64 = Buffer.from('not-an-image-at-all').toString('base64');
+
+    // Text-only model rejects valid image with 400
+    const textRegistry = new ModelRegistry();
+    const textModel = createCountingModel(4);
+    textRegistry.register('text-model', textModel);
+    const textHandler = createHandler(textRegistry);
+    {
+      const req = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'text-model',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+          },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await textHandler(req, res);
+      await waitForEnd();
+      expect(getStatus()).toBe(400);
+      expect(JSON.parse(getBody()).error.message).toContain('Could not process image');
+      expect(textModel.applyChatTemplate).not.toHaveBeenCalled();
+    }
+
+    // Vision model rejects corrupt / BMP / TIFF / HEIC / garbage with 400
+    const visionRegistry = new ModelRegistry();
+    const visionModel = Object.assign(createCountingModel(4), { supportsImages: () => true });
+    visionRegistry.register('vision-model', visionModel);
+    const visionHandler = createHandler(visionRegistry);
+    for (const badData of [halfPng, bmpB64, tiffB64, heicB64, garbageB64]) {
+      const req = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision-model',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: badData } }],
+          },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await visionHandler(req, res);
+      await waitForEnd();
+      expect(getStatus()).toBe(400);
+      expect(JSON.parse(getBody()).error).toMatchObject({
+        type: 'invalid_request_error',
+        message: 'Could not process image',
+      });
+      expect(visionModel.applyChatTemplate).not.toHaveBeenCalled();
+    }
+
+    // 65 images -> 400 naming oldest block path
+    {
+      const req = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision-model',
+        messages: [
+          {
+            role: 'user',
+            content: Array.from({ length: 65 }, () => ({
+              type: 'image',
+              source: { type: 'base64', media_type: 'image/png', data: validPng },
+            })),
+          },
+        ],
+      });
+      const { res, getStatus, getBody, waitForEnd } = createMockRes();
+      await visionHandler(req, res);
+      await waitForEnd();
+      expect(getStatus()).toBe(400);
+      expect(JSON.parse(getBody()).error.message).toBe(
+        'messages.0.content.0.image: requests support at most 64 images',
+      );
+    }
+  });
+
+  it('passes reasoningEffort none when thinking.type is disabled', async () => {
+    const registry = new ModelRegistry();
+    const model = createCountingModel(11);
+    registry.register('test-model', model);
+    const handler = createHandler(registry);
+    const req = createMockReq('POST', '/v1/messages/count_tokens', {
+      model: 'test-model',
+      thinking: { type: 'disabled' },
+      messages: [{ role: 'user', content: 'Hello' }],
+    });
+    const { res, getStatus, getBody, waitForEnd } = createMockRes();
+
+    await handler(req, res);
+    await waitForEnd();
+
+    expect(getStatus()).toBe(200);
+    expect(JSON.parse(getBody())).toEqual({ input_tokens: 11 });
+    const call = model.applyChatTemplate.mock.calls[0] as unknown[];
+    expect(call.slice(1)).toEqual([true, null, false, 'none']);
   });
 
   it('routes the handler thinking budget default to /v1/messages', async () => {
@@ -437,5 +547,247 @@ describe('POST /v1/messages/count_tokens beside a running answer', () => {
 
     expect(getStatus()).toBe(400);
     expect(JSON.parse(getBody()).error.message).toContain('binding changed');
+  });
+
+  it('validates images asynchronously without blocking timers and caches repeat payloads', async () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const registry = new ModelRegistry();
+    const model = Object.assign(createCountingModel(7), { supportsImages: () => true });
+    registry.register('vision', model);
+    const handler = createHandler(registry);
+
+    let entered!: () => void;
+    let release!: () => void;
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve;
+    });
+    const gatePromise = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const validator = vi.fn(async () => {
+      if (validator.mock.calls.length === 1) {
+        entered();
+        await gatePromise;
+      }
+    });
+
+    __setImageValidatorForTests(validator);
+    try {
+      const req1 = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+          },
+        ],
+      });
+      const r1 = createMockRes();
+      const firstPromise = handler(req1, r1.res);
+      await enteredPromise;
+
+      let timerRan = false;
+      await new Promise<void>((resolve) => {
+        setTimeout(() => {
+          timerRan = true;
+          resolve();
+        }, 0);
+      });
+      expect(timerRan).toBe(true);
+
+      release();
+      await firstPromise;
+      await r1.waitForEnd();
+      expect(r1.getStatus()).toBe(200);
+      expect(JSON.parse(r1.getBody())).toEqual({ input_tokens: 7 });
+      expect(validator).toHaveBeenCalledTimes(1);
+
+      // Second count_tokens call with identical image hits digest cache
+      const req2 = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision',
+        messages: [
+          {
+            role: 'user',
+            content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+          },
+        ],
+      });
+      const r2 = createMockRes();
+      await handler(req2, r2.res);
+      await r2.waitForEnd();
+      expect(r2.getStatus()).toBe(200);
+      expect(validator).toHaveBeenCalledTimes(1);
+    } finally {
+      __setImageValidatorForTests(null);
+    }
+  });
+
+  it('bounds concurrent count_tokens image validations globally and cancels remaining work on disconnect', async () => {
+    const registry = new ModelRegistry();
+    const model = Object.assign(createCountingModel(5), { supportsImages: () => true });
+    registry.register('vision', model);
+    const handler = createHandler(registry);
+
+    // 1. Concurrent count_tokens requests share the global concurrency ceiling of 4.
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const boundedValidator = vi.fn(async () => {
+      inFlight++;
+      maxInFlight = Math.max(maxInFlight, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+    });
+    __setImageValidatorForTests(boundedValidator);
+    try {
+      await Promise.all(
+        Array.from({ length: 3 }, (_, rIdx) => {
+          const req = createMockReq('POST', '/v1/messages/count_tokens', {
+            model: 'vision',
+            messages: [
+              {
+                role: 'user',
+                content: Array.from({ length: 4 }, (_, iIdx) => ({
+                  type: 'image',
+                  source: {
+                    type: 'base64',
+                    media_type: 'image/png',
+                    data: Buffer.from(`ct-global-${rIdx}-${iIdx}`).toString('base64'),
+                  },
+                })),
+              },
+            ],
+          });
+          const resBox = createMockRes();
+          return handler(req, resBox.res).then(async () => {
+            await resBox.waitForEnd();
+            expect(resBox.getStatus()).toBe(200);
+          });
+        }),
+      );
+      expect(boundedValidator).toHaveBeenCalledTimes(12);
+      expect(maxInFlight).toBe(4);
+    } finally {
+      __setImageValidatorForTests(null);
+    }
+
+    // 2. Client disconnect during count_tokens image preflight stops remaining images and skips applyChatTemplate.
+    model.applyChatTemplate.mockClear();
+    let entered = 0;
+    let fourEntered!: () => void;
+    const fourEnteredPromise = new Promise<void>((resolve) => {
+      fourEntered = resolve;
+    });
+    let releaseGate!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releaseGate = resolve;
+    });
+    const gatedValidator = vi.fn(async () => {
+      entered++;
+      if (entered === 4) fourEntered();
+      await gate;
+    });
+
+    __setImageValidatorForTests(gatedValidator);
+    try {
+      const req = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision',
+        messages: [
+          {
+            role: 'user',
+            content: Array.from({ length: 10 }, (_, i) => ({
+              type: 'image',
+              source: {
+                type: 'base64',
+                media_type: 'image/png',
+                data: Buffer.from(`ct-abort-${i}`).toString('base64'),
+              },
+            })),
+          },
+        ],
+      });
+      const r1 = createMockRes();
+      const pending = handler(req, r1.res);
+      await fourEnteredPromise;
+      r1.res.emit('close');
+      await pending;
+
+      expect(r1.getBody()).toBe('');
+      expect(model.applyChatTemplate).not.toHaveBeenCalled();
+
+      releaseGate();
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(gatedValidator).toHaveBeenCalledTimes(4);
+
+      // Follow-up text count_tokens succeeds cleanly (lease and global slots intact).
+      const req2 = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+      const r2 = createMockRes();
+      await handler(req2, r2.res);
+      await r2.waitForEnd();
+      expect(r2.getStatus()).toBe(200);
+      expect(JSON.parse(r2.getBody())).toEqual({ input_tokens: 5 });
+    } finally {
+      releaseGate();
+      __setImageValidatorForTests(null);
+    }
+  });
+
+  it('aborts acquireRead and releases the dispatch lease immediately on disconnect while parked behind withModelLoad', async () => {
+    const registry = new ModelRegistry();
+    const model = createCountingModel(9);
+    registry.register('vision', model);
+    const coordinator = new ModelWorkCoordinator(registry.queueDepthLimit);
+    const releaseSpy = vi.spyOn(registry, 'releaseDispatchLease');
+    const handler = createHandler(registry, { modelWorkCoordinator: coordinator });
+
+    let writerEntered!: () => void;
+    const writerEnteredPromise = new Promise<void>((resolve) => {
+      writerEntered = resolve;
+    });
+    let releaseWriter!: () => void;
+    const writerGate = new Promise<void>((resolve) => {
+      releaseWriter = resolve;
+    });
+    const activeLoad = coordinator.withModelLoad(async () => {
+      writerEntered();
+      await writerGate;
+    });
+    await writerEnteredPromise;
+    expect(coordinator.writerActive).toBe(true);
+
+    try {
+      const req = createMockReq('POST', '/v1/messages/count_tokens', {
+        model: 'vision',
+        messages: [{ role: 'user', content: 'hello' }],
+      });
+      const r1 = createMockRes();
+      const pending = handler(req, r1.res);
+
+      // Wait until the handler has acquired the dispatch lease and parked in withInference -> acquireRead.
+      await vi.waitFor(() => {
+        expect(r1.res.listenerCount('close')).toBeGreaterThan(0);
+      });
+      expect(releaseSpy).not.toHaveBeenCalled();
+
+      // Disconnect while withModelLoad writer is still held.
+      r1.res.emit('close');
+      await pending;
+
+      // Request must settle and release its dispatch lease BEFORE the writer completes!
+      expect(coordinator.writerActive).toBe(true);
+      expect(releaseSpy).toHaveBeenCalledTimes(1);
+      expect(releaseSpy).toHaveBeenCalledWith(model);
+      expect(r1.getBody()).toBe('');
+      expect(model.applyChatTemplate).not.toHaveBeenCalled();
+    } finally {
+      releaseWriter();
+      await activeLoad;
+    }
+
+    // Even after the writer completes, the aborted request must never wake up and run applyChatTemplate.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(model.applyChatTemplate).not.toHaveBeenCalled();
   });
 });

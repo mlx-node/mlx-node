@@ -264,4 +264,38 @@ describe('declarative model loader registry', () => {
       cacheDisk: 'auto',
     });
   });
+
+  it.each([
+    [
+      'missing model_type + Inkling2LoopForConditionalGeneration',
+      { architectures: ['Inkling2LoopForConditionalGeneration'] },
+    ],
+    ['missing model_type + Inkling2ForConditionalGeneration', { architectures: ['Inkling2ForConditionalGeneration'] }],
+    ['missing model_type + Inkling2LoopForCausalLM', { architectures: ['Inkling2LoopForCausalLM'] }],
+    ['missing model_type + Inkling2ForCausalLM', { architectures: ['Inkling2ForCausalLM'] }],
+    [
+      'null model_type + text_config.model_type inkling2_loop_text',
+      { model_type: null, text_config: { model_type: 'inkling2_loop_text' } },
+    ],
+    ['missing model_type + text_config.model_type inkling2_text', { text_config: { model_type: 'inkling2_text' } }],
+    [
+      'wrapper inkling2_vl + architectures',
+      { model_type: 'inkling2_vl', architectures: ['Inkling2LoopForConditionalGeneration'] },
+    ],
+    [
+      'wrapper inkling2_vl + text_config.model_type',
+      { model_type: 'inkling2_vl', text_config: { model_type: 'inkling2_loop_text' } },
+    ],
+  ] as const)('detects Inkling2 via architecture probe and text_config (%s)', async (_label, config) => {
+    await writeConfig({ ...config });
+    await expect(detectModelType(tempDir)).resolves.toBe('inkling2');
+  });
+
+  it('keeps fail-closed rejection for explicit non-inkling model_type even with inkling text_config', async () => {
+    await writeConfig({ model_type: 'llama', text_config: { model_type: 'inkling2_loop_text' } });
+    await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "llama" in ${tempDir}/config.json`);
+
+    await writeConfig({ model_type: 42, text_config: { model_type: 'inkling2_loop_text' } });
+    await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "42" in ${tempDir}/config.json`);
+  });
 });
