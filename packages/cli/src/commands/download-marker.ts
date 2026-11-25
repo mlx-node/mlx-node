@@ -37,6 +37,18 @@ export interface DownloadCompletion {
   assetsRevision?: string;
   /** ISO timestamp of the last successful download/sync. */
   completedAt: string;
+  /**
+   * Written only by the dashboard's Update, which adopted a folder it did not create: the files it may delete there
+   * later. It must survive every rewrite, or the dashboard's next update removes the user's own files with the
+   * folder. The dashboard checks its shape; the CLI carries any value as it is, because a dropped one, even a
+   * malformed one, would let the dashboard remove the folder whole.
+   */
+  adopted?: Record<string, { size: number; mtimeNs: string }>;
+  /**
+   * Written only by the dashboard's Locate: the folder's weight files are second names of, or links to, files in
+   * `from`. The dashboard checks its shape; the CLI carries any value as it is.
+   */
+  located?: { from: string; mode: 'shared' | 'linked' };
 }
 
 /**
@@ -79,6 +91,8 @@ export async function readCompletion(dir: string): Promise<DownloadCompletion | 
     ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
     ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
+    ...(marker.adopted !== undefined ? { adopted: marker.adopted as DownloadCompletion['adopted'] } : {}),
+    ...(marker.located !== undefined ? { located: marker.located as DownloadCompletion['located'] } : {}),
   };
 }
 

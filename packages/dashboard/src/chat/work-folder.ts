@@ -7,7 +7,7 @@
 
 import { constants, realpathSync, statSync } from 'node:fs';
 import { access, lstat, readdir, readlink, realpath, stat } from 'node:fs/promises';
-import { basename, dirname, isAbsolute, join, resolve } from 'node:path';
+import { basename, dirname, isAbsolute, join, resolve, sep } from 'node:path';
 
 import { ApiError } from '../api/errors.js';
 import type { AllowedRoot } from './agent/roots.js';
@@ -102,8 +102,10 @@ export async function checkWorkFolder(path: string, rules: WorkFolderRules): Pro
     return { ok: false, problem: 'unreadable' };
   }
   if (real === '/' || dirname(real) === real) return { ok: false, problem: 'root' };
-  const volume = await identity(DATA_VOLUME);
-  if (volume !== null && (await identity(real)) === volume) return { ok: false, problem: 'root' };
+  if (process.platform === 'darwin') {
+    const volume = await identity(DATA_VOLUME);
+    if (volume !== null && (await identity(real)) === volume) return { ok: false, problem: 'root' };
+  }
   const problem = await placeProblem(path, real, rules);
   return problem === null ? { ok: true, path: real } : { ok: false, problem };
 }
@@ -147,7 +149,8 @@ export async function landingPath(path: string): Promise<string | null> {
     if (info !== null) {
       if (!info.isSymbolicLink()) return null;
       const target = await readlink(current);
-      current = isAbsolute(target) ? target : `${dirname(current)}/${target}`;
+      const base = dirname(current);
+      current = isAbsolute(target) ? target : `${base.endsWith(sep) ? base : `${base}${sep}`}${target}`;
       continue;
     }
     const parent = dirname(current);
@@ -217,7 +220,7 @@ function realOrNull(path: string): string | null {
 }
 
 function within(path: string, top: string): boolean {
-  return path === top || path.startsWith(top.endsWith('/') ? top : `${top}/`);
+  return path === top || path.startsWith(top.endsWith(sep) ? top : `${top}${sep}`);
 }
 
 /**

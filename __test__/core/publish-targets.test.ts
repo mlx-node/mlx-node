@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { describe, it, expect } from 'vite-plus/test';
@@ -8,8 +8,8 @@ import { resolvePublishedTargets } from '../../packages/core/publish-targets';
 const CORE = 'packages/core';
 const NAME = '@mlx-node/core';
 
-// The shape CI actually publishes today: napi.targets carries the hand-built
-// DGX Spark target too, but only darwin-arm64 is an optional package.
+// Minimal fixture: napi.targets carries an extra unpublished target alongside
+// darwin-arm64, while only darwin-arm64 is declared as a published package.
 const REPO_SHAPE = {
   packageName: NAME,
   configuredTargets: ['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu'],
@@ -18,21 +18,26 @@ const REPO_SHAPE = {
 };
 
 describe('resolvePublishedTargets', () => {
-  it('keeps the unpublished DGX Spark target out of the publish job', () => {
+  it('keeps an unpublished target out of the publish job', () => {
     expect(resolvePublishedTargets(REPO_SHAPE)).toEqual(['aarch64-apple-darwin']);
   });
 
   it('matches the real packages/core manifest', () => {
     const manifest = JSON.parse(readFileSync(join(CORE, 'package.json'), 'utf-8'));
-    expect(manifest.napi.targets).toContain('aarch64-unknown-linux-gnu');
+    const npmDir = join(CORE, 'npm');
+    const platformPackageDirs = readdirSync(npmDir, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory() && existsSync(join(npmDir, entry.name, 'package.json')))
+      .map((entry) => entry.name);
+
+    expect(manifest.napi.targets).toContain('aarch64-pc-windows-msvc');
     expect(
       resolvePublishedTargets({
         packageName: manifest.name,
         configuredTargets: manifest.napi.targets,
         optionalDependencies: Object.keys(manifest.optionalDependencies ?? {}),
-        platformPackageDirs: ['darwin-arm64'],
+        platformPackageDirs,
       }),
-    ).toEqual(['aarch64-apple-darwin']);
+    ).toEqual(['aarch64-apple-darwin', 'aarch64-unknown-linux-gnu']);
   });
 
   // The whole point of deriving rather than committing a second target list:

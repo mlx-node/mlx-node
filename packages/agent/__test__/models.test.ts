@@ -363,6 +363,57 @@ describe('discoverMlxModels', () => {
     }
   });
 
+  // MUTATION: count the sibling config.json's vision marker for these GGUFs again -> the no-mmproj rows go red.
+  it.each([
+    ['qwen3_5', 'qwen35', 'Qwen3.8-27B-UD-Q4_K_XL.gguf', true],
+    ['gemma4', 'gemma4', 'gemma-4-12b-Q6_K.gguf', true],
+    ['qwen3_5_moe', 'qwen35moe', 'Qwen3.8-35B-A3B-UD-Q4_K_XL.gguf', false],
+  ])(
+    'a %s GGUF sees images only with a sibling mmproj the load can use, not from config.json alone',
+    async (model_type, architecture, file, withMmproj) => {
+      const root = await mkdtemp(join(tmpdir(), 'mlx-gguf-images-'));
+      try {
+        const repo = join(root, 'repo');
+        await mkdir(repo);
+        await writeFile(
+          join(repo, 'config.json'),
+          JSON.stringify({ model_type, vision_config: { model_type, hidden_size: 1152 } }),
+        );
+        await writeFile(join(repo, 'tokenizer.json'), '{}');
+        await writeFile(join(repo, file), minimalGguf(architecture));
+        const inputs = async () => (await discoverMlxModels(root)).map((entry) => entry.agentModel.input);
+        expect(await inputs()).toEqual([['text']]);
+        await writeFile(join(repo, 'mmproj-F16.gguf'), minimalGguf('clip'));
+        expect(await inputs()).toEqual([withMmproj ? ['text', 'image'] : ['text']]);
+      } finally {
+        await rm(root, { recursive: true, force: true });
+      }
+    },
+  );
+
+  // A Gemma4 GGUF load looks for a projector only when config.json declares a vision tower.
+  it.each([
+    ['a text-only config', { model_type: 'gemma4_text' }, ['text']],
+    [
+      'vision_config',
+      { model_type: 'gemma4', vision_config: { model_type: 'gemma4_vision', hidden_size: 768 } },
+      ['text', 'image'],
+    ],
+  ])('a gemma4 GGUF with %s and a sibling mmproj', async (_label, config, input) => {
+    const root = await mkdtemp(join(tmpdir(), 'mlx-gguf-gemma4-images-'));
+    try {
+      const repo = join(root, 'repo');
+      await mkdir(repo);
+      await writeFile(join(repo, 'config.json'), JSON.stringify(config));
+      await writeFile(join(repo, 'tokenizer.json'), '{}');
+      await writeFile(join(repo, 'gemma-4-12b-Q6_K.gguf'), minimalGguf('gemma4'));
+      await writeFile(join(repo, 'mmproj-BF16.gguf'), minimalGguf('clip'));
+      expect((await discoverMlxModels(root)).map((entry) => entry.agentModel.input)).toEqual([input]);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
   it.each(['top-level', 'nested'])('rejects %s GGUF headers that disagree with sibling assets', async (layout) => {
     const root = await mkdtemp(join(tmpdir(), 'mlx-mixed-gguf-'));
     try {

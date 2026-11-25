@@ -61,11 +61,12 @@ const GGUF: ModelsResponse = {
       sizeBytes: 1,
       fileCount: 1,
       servedIds: ['qwen3-8b'],
+      located: null,
+      link: false,
     },
   ],
   warnings: [],
   dir: '/models',
-  host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
 };
 
 function routes(overrides: Record<string, unknown> = {}): Record<string, unknown> {

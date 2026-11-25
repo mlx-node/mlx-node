@@ -385,36 +385,147 @@ fn str_format_fills_positional_fields_like_python() {
 }
 
 #[test]
-fn tojson_takes_only_the_byte_preserving_kwargs() {
-    let ctx = || json!({"v": {"城市": "北京", "days": [3, 4]}});
+fn tojson_supports_sort_keys_and_separators_and_rejects_unsupported_kwargs() {
+    let ctx = || json!({"v": {"城市": "北京", "days": [3, 4], "nested": {"b": 1, "a": 2}}});
     let plain = render_expr("{{ v | tojson }}", ctx()).unwrap();
-    assert_eq!(plain, r#"{"城市": "北京", "days": [3, 4]}"#);
+    assert_eq!(
+        plain,
+        r#"{"城市": "北京", "days": [3, 4], "nested": {"b": 1, "a": 2}}"#
+    );
     for same in [
         "{{ v | tojson(ensure_ascii=False) }}",
         "{{ v | tojson(ensure_ascii=false) }}",
         "{{ v | tojson(indent=none) }}",
         "{{ v | tojson(ensure_ascii=False, indent=None) }}",
+        "{{ v | tojson(sort_keys=false) }}",
+        "{{ v | tojson(separators=none) }}",
     ] {
         assert_eq!(render_expr(same, ctx()).unwrap(), plain, "{same}");
     }
+    assert_eq!(
+        render_expr("{{ v | tojson(sort_keys=true) }}", ctx()).unwrap(),
+        r#"{"days": [3, 4], "nested": {"a": 2, "b": 1}, "城市": "北京"}"#
+    );
+    assert_eq!(
+        render_expr(r#"{{ v | tojson(separators=(",", ":")) }}"#, ctx()).unwrap(),
+        r#"{"城市":"北京","days":[3,4],"nested":{"b":1,"a":2}}"#
+    );
+    assert_eq!(
+        render_expr(
+            r#"{{ v | tojson(sort_keys=true, separators=(",", ":")) }}"#,
+            ctx()
+        )
+        .unwrap(),
+        r#"{"days":[3,4],"nested":{"a":2,"b":1},"城市":"北京"}"#
+    );
     for bad in [
         "{{ v | tojson(ensure_ascii=True) }}",
         "{{ v | tojson(indent=2) }}",
-        "{{ v | tojson(sort_keys=false) }}",
-        "{{ v | tojson(separators=none) }}",
-        "{{ v | tojson(2) }}",
-    ] {
-        assert!(render_expr(bad, ctx()).is_err(), "{bad}");
-    }
-    for bad in [
-        "{{ v | tojson(ensure_ascii=True) }}",
-        "{{ v | tojson(indent=2) }}",
-        "{{ v | tojson(sort_keys=false) }}",
+        r#"{{ v | tojson(separators=",:") }}"#,
+        r#"{{ v | tojson(separators=(",",)) }}"#,
+        "{{ v | tojson(separators=(1, 2)) }}",
+        "{{ v | tojson(unknown_kwarg=1) }}",
         "{{ v | tojson(2) }}",
     ] {
         let e = render_expr(bad, ctx()).unwrap_err();
         assert!(e.contains("too many arguments"), "{bad}: {e}");
     }
+}
+
+#[test]
+fn tojson_renders_inkling2_jinja_tool_declare_and_tool_call_patterns() {
+    let tmpl = r#"{%- if tools -%}
+{%- set tool_state = namespace(specs=[]) -%}
+{%- for tool in tools -%}
+{%- set fn = tool.function if tool.function is defined else tool -%}
+{%- set spec = {"description": (fn.description if fn.description is defined and fn.description else ""), "name": fn.name, "parameters": (fn.parameters if fn.parameters is defined and fn.parameters else {}), "type": (tool.type if tool.type is defined and tool.type else "function")} -%}
+{%- set tool_state.specs = tool_state.specs + [spec] -%}
+{%- endfor -%}
+{{- "<|message_system|>tool_declare<|content_xml|>" -}}
+{{- tool_state.specs | tojson(sort_keys=true, separators=(",", ":")) -}}
+{{- "<|end_message|>" -}}
+{%- endif -%}
+{%- for message in messages -%}
+{%- if message.role == "user" -%}
+{{- "<|message_user|><|content_text|>" ~ message.content ~ "<|end_message|>" -}}
+{%- elif message.role == "assistant" and message.tool_calls -%}
+{%- for tc in message.tool_calls -%}
+{%- set fn = tc.function -%}
+{%- set args = fn.arguments if fn.arguments is defined and fn.arguments else {} -%}
+{{- "<|message_model|>" ~ fn.name ~ "<|content_invoke_tool_json|>" -}}
+{{- '{"name":' ~ (fn.name | tojson(sort_keys=true, separators=(",", ":"))) ~ ',"args":{' -}}
+{%- for key, value in args | dictsort(case_sensitive=true) -%}
+{{- (key | tojson) ~ ":" ~ (value | tojson(separators=(",", ":"))) -}}
+{%- if not loop.last -%},{%- endif -%}
+{%- endfor -%}
+{{- "}}<|end_message|>" -}}
+{%- endfor -%}
+{{- "<|content_model_end_sampling|>" -}}
+{%- endif -%}
+{%- endfor -%}"#;
+
+    let tools = vec![crate::tokenizer::ToolDefinition {
+        r#type: "function".to_string(),
+        function: crate::tokenizer::FunctionDefinition {
+            name: "lookup".to_string(),
+            description: Some("Find".to_string()),
+            parameters: Some(crate::tokenizer::FunctionParameters {
+                r#type: "object".to_string(),
+                properties: Some(r#"{"z":{"type":"int"},"a":{"type":"str"}}"#.to_string()),
+                required: Some(vec!["a".to_string()]),
+            }),
+        },
+    }];
+    let messages = vec![
+        ChatMessage {
+            role: "user".to_string(),
+            content: "find it".to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        },
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: String::new(),
+            tool_calls: Some(vec![crate::tokenizer::ToolCall {
+                id: Some("call_1".to_string()),
+                name: "lookup".to_string(),
+                arguments: r#"{"z":[1,2],"a":{"y":1,"x":2}}"#.to_string(),
+            }]),
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        },
+    ];
+    let rendered = Qwen3Tokenizer::render_chat_template_jinja2(
+        tmpl,
+        &messages,
+        Some(&tools),
+        true,
+        None,
+        "",
+        "",
+    )
+    .unwrap();
+    assert_eq!(
+        rendered,
+        concat!(
+            "<|message_system|>tool_declare<|content_xml|>",
+            r#"[{"description":"Find","name":"lookup","parameters":{"properties":{"a":{"type":"str"},"z":{"type":"int"}},"required":["a"],"type":"object"},"type":"function"}]"#,
+            "<|end_message|>",
+            "<|message_user|><|content_text|>find it<|end_message|>",
+            "<|message_model|>lookup<|content_invoke_tool_json|>",
+            r#"{"name":"lookup","args":{"a":{"y":1,"x":2},"z":[1,2]}}"#,
+            "<|end_message|><|content_model_end_sampling|>",
+        )
+    );
 }
 
 fn tokenizer_with(vocab_len: u32, added: &[(u32, String, bool)]) -> Tokenizer {

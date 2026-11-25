@@ -2,6 +2,7 @@
 name = "mlx-clairic"
 version.workspace = true
 edition.workspace = true
+license = "MIT"
 
 [lib]
 crate-type = ["rlib"]

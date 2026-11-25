@@ -5,12 +5,13 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
-import { Configuration, Project, Workspace } from '@yarnpkg/core';
+import { Configuration, Project, structUtils, Workspace } from '@yarnpkg/core';
 import { npath } from '@yarnpkg/fslib';
 import semver, { type ReleaseType } from 'semver';
 
 const __dirname = npath.dirname(fileURLToPath(import.meta.url));
 const projectRoot = npath.join(__dirname, '..', '..');
+const PRIVATE_VERSIONED_WORKSPACES = new Set(['@mlx-node/desktop', '@mlx-node/dashboard']);
 
 const args = parseArgs({
   options: {
@@ -52,7 +53,11 @@ switch (subcommand) {
       await Configuration.find(npath.toPortablePath(projectRoot), null, { strict: false }),
       npath.toPortablePath(projectRoot),
     );
-    const workspaces = project.workspaces.filter((pkg) => pkg.manifest.private !== true);
+    const workspaces = project.workspaces.filter(
+      (pkg) =>
+        pkg.manifest.private !== true ||
+        (pkg.manifest.name != null && PRIVATE_VERSIONED_WORKSPACES.has(structUtils.stringifyIdent(pkg.manifest.name))),
+    );
     await bumpVersion(newVersion, workspaces);
     await import('../core/build');
     execSync(`git add .`, {

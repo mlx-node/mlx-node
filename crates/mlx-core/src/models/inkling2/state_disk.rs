@@ -14,16 +14,16 @@
 //! - **Restart survival**: persistent `DiskTier` (`persistPagedCache` / `MLX_PERSIST_PAGED_CACHE=1`)
 //!   adopts complete `(state blob + 8-layer Global KV chain)` entries via `adopt_states` on startup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 #[cfg(test)]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
-    CacheRecency, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdStateLabel, MakeRoom,
-    block_object_bytes,
+    CacheRecency, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdKeyHold, ColdStateLabel,
+    MakeRoom, block_object_bytes,
 };
 use napi::bindgen_prelude::{Error, Result};
 
@@ -36,9 +36,13 @@ use crate::disk_tier::state_disk::{
     KvPoolHandle, Reclaimed, Staged, StateDiskCodec, StateDiskEngine, Tick, state_context,
 };
 use crate::disk_tier::store::{
-    Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass, StoreHit,
+    DiskCopy, Entry, EntryId, HybridStateStore, Lineage, StateBytes, StateClass, StoreHit,
 };
 use crate::disk_tier::{DiskTier, DiskTierOptions, PersistentIdentity, open_disk_tier};
+use crate::engine::governor::governor::{Governor, Scope};
+use crate::engine::governor::ledger::{ClaimClass, ClaimRank, ClaimSpec, NeedTiming, ReachClass};
+use crate::models::qwen3_5::dflash2::DFlash2Config;
+use crate::models::qwen3_5::draft_context::DraftContextWindow;
 use crate::transformer::KvFormat;
 use crate::transformer::paged_kv_cache_adapter::{
     ChainPrefetch, ChainPrefetchStart, ColdTierContext, PagedKVCacheAdapter, RestoreUploadBudget,
@@ -50,7 +54,8 @@ pub(crate) use crate::disk_tier::state_disk::ReadWait;
 use super::config::Inkling2Config;
 use super::kv_cache::Inkling2KVCacheCoordinator;
 use super::memory::{
-    global_visit_count, short_conv_state_bytes, swa_visit_count, swa_window_blocks,
+    DRAFT_WINDOW_HEADER_BYTES, draft_window_span_bytes, global_visit_count, short_conv_state_bytes,
+    swa_visit_count, swa_window_blocks,
 };
 use super::short_conv::{Inkling2ShortConvState, VisitShortConvState};
 
@@ -62,6 +67,9 @@ pub(crate) const INKLING2_WRITE_BEHIND_MIN_TOKENS: usize = 2048;
 
 /// Default write-behind delay (seconds) after ordinary publication before spilling to SSD.
 pub(crate) const INKLING2_WRITE_BEHIND_DELAY_SECS: f64 = 10.0;
+
+/// Default hard cap on the number of Inkling2 state anchors kept resident in host RAM.
+pub(crate) const INKLING2_DEFAULT_RAM_STATES: usize = 16;
 
 #[cfg(test)]
 thread_local! {
@@ -97,11 +105,402 @@ fn write_behind_delay_secs() -> f64 {
     INKLING2_WRITE_BEHIND_DELAY_SECS
 }
 
+fn upgrade_retry_after() -> Instant {
+    Instant::now() + Duration::from_secs_f64(write_behind_delay_secs().max(0.0))
+}
+
+/// Shared host-heap payload for one [`PackedDraftWindow`].
+///
+/// Once attached to an [`Inkling2StateStore`]'s [`HostBudgetAccount`], its exact byte charge stays
+/// live across both `self.store` and any live sequence clones (e.g. `block_boundary_draft_window`),
+/// releasing automatically when the final `Arc<TrackedPackedBytes>` drops.
+pub(crate) struct TrackedPackedBytes {
+    bytes: Vec<u8>,
+    account: OnceLock<Arc<HostBudgetAccount>>,
+}
+
+impl std::fmt::Debug for TrackedPackedBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TrackedPackedBytes")
+            .field("len", &self.bytes.len())
+            .field("tracked", &self.account.get().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for TrackedPackedBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for TrackedPackedBytes {}
+
+impl Deref for TrackedPackedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes
+    }
+}
+
+impl Drop for TrackedPackedBytes {
+    fn drop(&mut self) {
+        if let Some(account) = self.account.get() {
+            account.sub_packed_dw_bytes(self.bytes.len() as u64);
+        }
+    }
+}
+
+impl TrackedPackedBytes {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            account: OnceLock::new(),
+        }
+    }
+
+    pub(crate) fn attach_to(&self, account: &Arc<HostBudgetAccount>) {
+        if !self.bytes.is_empty() && self.account.set(Arc::clone(account)).is_ok() {
+            account.add_packed_dw_bytes(self.bytes.len() as u64);
+        }
+    }
+
+    pub(crate) fn is_tracked_by(&self, account: &Arc<HostBudgetAccount>) -> bool {
+        self.account
+            .get()
+            .is_some_and(|bound| Arc::ptr_eq(bound, account))
+    }
+}
+
+/// Flat, host-resident snapshot of one DFlash2 4-bit [`DraftContextWindow`] ring buffer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PackedDraftWindow {
+    pub bytes: Arc<TrackedPackedBytes>,
+    pub width: u32,
+    pub slots: u32,
+    pub begin: u32,
+    pub end: u32,
+}
+
+impl PackedDraftWindow {
+    /// Snapshot a live [`DraftContextWindow`] into one flat host `Arc<TrackedPackedBytes>` buffer.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn from_window(window: &DraftContextWindow) -> Result<Self> {
+        let nbytes = usize::try_from(window.nbytes())
+            .map_err(|_| Error::from_reason("Inkling2 draft window size overflows usize"))?;
+        let buf = window.host_bytes()?;
+        if buf.len() != nbytes {
+            return Err(Error::from_reason(
+                "Inkling2 PackedDraftWindow::from_window failed to serialize window bytes",
+            ));
+        }
+        Ok(Self {
+            bytes: Arc::new(TrackedPackedBytes::new(buf)),
+            width: window.width(),
+            slots: window.slots(),
+            begin: window.begin(),
+            end: window.end(),
+        })
+    }
+
+    /// Stable pointer identity of the underlying packed byte buffer for deduplication.
+    pub(crate) fn ptr_id(&self) -> *const u8 {
+        self.bytes.as_ptr()
+    }
+
+    pub(crate) fn attach_to(&self, account: &Arc<HostBudgetAccount>) {
+        self.bytes.attach_to(account);
+    }
+
+    pub(crate) fn is_tracked_by(&self, account: &Arc<HostBudgetAccount>) -> bool {
+        self.bytes.is_tracked_by(account)
+    }
+
+    /// Materialize a fresh [`DraftContextWindow`] populated from this packed snapshot.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn to_window(&self) -> Result<DraftContextWindow> {
+        let mut window = DraftContextWindow::new(self.width, self.slots)?;
+        if !window.read_bytes(&self.bytes, self.begin, self.end)? {
+            return Err(Error::from_reason(
+                "Inkling2 PackedDraftWindow::to_window failed to restore window bytes",
+            ));
+        }
+        Ok(window)
+    }
+
+    /// Load this packed snapshot directly into an existing [`DraftContextWindow`] in place.
+    /// Returns `Ok(false)` on geometry, length, or bounds mismatch.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn load_into(&self, dst: &mut DraftContextWindow) -> Result<bool> {
+        if dst.width() != self.width || dst.slots() != self.slots {
+            return Ok(false);
+        }
+        dst.read_bytes(&self.bytes, self.begin, self.end)
+    }
+
+    /// True iff this packed window covers the complete trailing
+    /// `[boundary.saturating_sub(slots), boundary)` range with an exact 4-bit payload.
+    pub(crate) fn is_complete_for(&self, boundary: u32) -> bool {
+        self.width > 0
+            && self.slots > 0
+            && self.end == boundary
+            && self.begin == boundary.saturating_sub(self.slots)
+            && self.bytes.len() as u64 == DraftContextWindow::bytes(self.width, self.slots)
+    }
+}
+
+/// Block-boundary DFlash2 context window snapshot held per live sequence until a
+/// checkpoint or turn-end state is actually published into [`Inkling2StateStore`].
+///
+/// - Live prefill/decode stores [`BoundaryDraftWindow::Device`] (detached MLX GPU
+///   buffer) so crossing 32-token boundaries never stalls decode or copies 2.53 MiB
+///   to host RAM unless `capture_boundary` actually publishes a state.
+/// - Restored sequences from `StateStore` retain [`BoundaryDraftWindow::Packed`]
+///   (`Arc<TrackedPackedBytes>`) without an unnecessary GPU upload when the suffix will refill
+///   the ring before the next boundary.
+pub(crate) enum BoundaryDraftWindow {
+    Device(DraftContextWindow),
+    Packed(PackedDraftWindow),
+}
+
+impl BoundaryDraftWindow {
+    fn to_packed_for(
+        &self,
+        geom: &Inkling2StateGeometry,
+        boundary: u32,
+        pack_device: impl FnOnce(&DraftContextWindow) -> Result<PackedDraftWindow>,
+    ) -> Result<Option<PackedDraftWindow>> {
+        if geom.draft_window_span_bytes == 0
+            || geom.draft_window_width == 0
+            || geom.draft_window_slots == 0
+        {
+            return Ok(None);
+        }
+        match self {
+            BoundaryDraftWindow::Packed(dw) => {
+                if dw.width == geom.draft_window_width
+                    && dw.slots == geom.draft_window_slots
+                    && dw.is_complete_for(boundary)
+                {
+                    Ok(Some(dw.clone()))
+                } else {
+                    Ok(None)
+                }
+            }
+            BoundaryDraftWindow::Device(dw) => {
+                if dw.width() == geom.draft_window_width
+                    && dw.slots() == geom.draft_window_slots
+                    && dw.end() == boundary
+                    && dw.begin() == boundary.saturating_sub(geom.draft_window_slots)
+                {
+                    pack_device(dw).map(|packed| packed.is_complete_for(boundary).then_some(packed))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+}
+
+enum DraftWindowInput<'a> {
+    #[cfg(test)]
+    Packed(&'a PackedDraftWindow),
+    Boundary(&'a BoundaryDraftWindow),
+}
+
+impl DraftWindowInput<'_> {
+    fn matches_geometry_for(&self, geom: &Inkling2StateGeometry, boundary: u32) -> bool {
+        if geom.draft_window_span_bytes == 0
+            || geom.draft_window_width == 0
+            || geom.draft_window_slots == 0
+        {
+            return false;
+        }
+        match *self {
+            #[cfg(test)]
+            DraftWindowInput::Packed(dw) => {
+                dw.width == geom.draft_window_width
+                    && dw.slots == geom.draft_window_slots
+                    && dw.is_complete_for(boundary)
+            }
+            DraftWindowInput::Boundary(BoundaryDraftWindow::Packed(dw)) => {
+                dw.width == geom.draft_window_width
+                    && dw.slots == geom.draft_window_slots
+                    && dw.is_complete_for(boundary)
+            }
+            DraftWindowInput::Boundary(BoundaryDraftWindow::Device(dw)) => {
+                dw.width() == geom.draft_window_width
+                    && dw.slots() == geom.draft_window_slots
+                    && dw.end() == boundary
+                    && dw.begin() == boundary.saturating_sub(geom.draft_window_slots)
+            }
+        }
+    }
+
+    fn new_host_bytes_for(
+        &self,
+        geom: &Inkling2StateGeometry,
+        boundary: u32,
+        account: &Arc<HostBudgetAccount>,
+    ) -> u64 {
+        if !self.matches_geometry_for(geom, boundary) {
+            return 0;
+        }
+        match *self {
+            #[cfg(test)]
+            DraftWindowInput::Packed(dw) => {
+                if dw.is_tracked_by(account) {
+                    0
+                } else {
+                    dw.bytes.len() as u64
+                }
+            }
+            DraftWindowInput::Boundary(BoundaryDraftWindow::Packed(dw)) => {
+                if dw.is_tracked_by(account) {
+                    0
+                } else {
+                    dw.bytes.len() as u64
+                }
+            }
+            DraftWindowInput::Boundary(BoundaryDraftWindow::Device(_)) => {
+                DraftContextWindow::bytes(geom.draft_window_width, geom.draft_window_slots)
+            }
+        }
+    }
+}
+
+/// Pack a 48-visit [`Inkling2ShortConvState`] into a flat little-endian BF16 byte buffer
+/// (`geom.conv_span_bytes` long) so RAM anchors hold pure host bytes with zero pinned GPU arrays.
+pub(crate) fn pack_short_conv_state(
+    geom: &Inkling2StateGeometry,
+    conv: &Inkling2ShortConvState,
+) -> std::result::Result<Arc<Vec<u8>>, String> {
+    if conv.visits.len() != geom.num_visits as usize {
+        return Err(format!(
+            "Inkling2 ShortConv visit count {} != {}",
+            conv.visits.len(),
+            geom.num_visits
+        ));
+    }
+    let conv_len = usize::try_from(geom.conv_span_bytes)
+        .map_err(|_| "Inkling2 ShortConv span overflows usize".to_string())?;
+    let mut conv_buf = vec![0u8; conv_len];
+    let hist = geom.conv_history as usize;
+    let kv_elems = hist * geom.kv_dim as usize;
+    let hidden_elems = hist * geom.hidden_size as usize;
+    let mut cursor = 0usize;
+    let mut write_bf16 =
+        |arr: &MxArray, expected_elems: usize| -> std::result::Result<(), String> {
+            let dt = arr
+                .dtype()
+                .map_err(|e| format!("Inkling2 ShortConv dtype failed: {e}"))?;
+            let bf16 = if dt == DType::BFloat16 {
+                arr.clone()
+            } else {
+                arr.astype(DType::BFloat16)
+                    .map_err(|e| format!("Inkling2 ShortConv cast to bf16 failed: {e}"))?
+            };
+            let raw = bf16
+                .to_uint16_native()
+                .map_err(|e| format!("Inkling2 ShortConv readback failed: {e}"))?;
+            if raw.len() != expected_elems {
+                return Err(format!(
+                    "Inkling2 ShortConv element count {} != {expected_elems}",
+                    raw.len()
+                ));
+            }
+            let byte_len = expected_elems * 2;
+            let dst = conv_buf
+                .get_mut(cursor..cursor + byte_len)
+                .ok_or_else(|| "Inkling2 ShortConv buffer overflow".to_string())?;
+            for (i, val) in raw.into_iter().enumerate() {
+                dst[i * 2..i * 2 + 2].copy_from_slice(&val.to_le_bytes());
+            }
+            cursor += byte_len;
+            Ok(())
+        };
+    for visit in &conv.visits {
+        write_bf16(&visit.k, kv_elems)?;
+        write_bf16(&visit.v, kv_elems)?;
+        write_bf16(&visit.attn_post, hidden_elems)?;
+        write_bf16(&visit.mlp_post, hidden_elems)?;
+    }
+    if cursor != conv_buf.len() {
+        return Err(format!(
+            "Inkling2 ShortConv packed bytes {cursor} != expected {}",
+            conv_buf.len()
+        ));
+    }
+    Ok(Arc::new(conv_buf))
+}
+
+/// Unpack a flat little-endian BF16 ShortConv byte buffer (`geom.conv_span_bytes` long) back into
+/// a live 48-visit [`Inkling2ShortConvState`].
+pub(crate) fn unpack_short_conv_state(
+    geom: &Inkling2StateGeometry,
+    conv_data: &[u8],
+) -> std::result::Result<Inkling2ShortConvState, String> {
+    let expected_len = usize::try_from(geom.conv_span_bytes)
+        .map_err(|_| "Inkling2 ShortConv span overflows usize".to_string())?;
+    if conv_data.len() != expected_len {
+        return Err(format!(
+            "Inkling2 ShortConv payload length {} != expected {expected_len}",
+            conv_data.len()
+        ));
+    }
+    let hist = geom.conv_history as i64;
+    let kv_cols = geom.kv_dim as i64;
+    let hidden_cols = geom.hidden_size as i64;
+    let kv_elems = (geom.conv_history as usize) * (geom.kv_dim as usize);
+    let hidden_elems = (geom.conv_history as usize) * (geom.hidden_size as usize);
+    let mut cursor = 0usize;
+    let mut read_bf16 = |elems: usize, shape: &[i64]| -> std::result::Result<MxArray, String> {
+        let byte_len = elems * 2;
+        let src = conv_data
+            .get(cursor..cursor + byte_len)
+            .ok_or_else(|| "Inkling2 ShortConv payload truncated".to_string())?;
+        cursor += byte_len;
+        let mut raw = Vec::with_capacity(elems);
+        for pair in src.as_chunks::<2>().0 {
+            raw.push(u16::from_le_bytes(*pair));
+        }
+        MxArray::from_bfloat16(&raw, shape)
+            .map_err(|e| format!("Inkling2 ShortConv decode array failed: {e}"))
+    };
+
+    let mut visits = Vec::with_capacity(geom.num_visits as usize);
+    for _ in 0..geom.num_visits {
+        let k = read_bf16(kv_elems, &[hist, kv_cols])?;
+        let v = read_bf16(kv_elems, &[hist, kv_cols])?;
+        let attn_post = read_bf16(hidden_elems, &[hist, hidden_cols])?;
+        let mlp_post = read_bf16(hidden_elems, &[hist, hidden_cols])?;
+        visits.push(VisitShortConvState {
+            k,
+            v,
+            attn_post,
+            mlp_post,
+        });
+    }
+    if cursor != conv_data.len() {
+        return Err(format!(
+            "Inkling2 ShortConv unpacked bytes {cursor} != expected {}",
+            conv_data.len()
+        ));
+    }
+    Ok(Inkling2ShortConvState {
+        visits,
+        kernel_size: (geom.conv_history as usize) + 1,
+    })
+}
+
 /// Exact geometry of Inkling-2-Mini's 1 content-keyed state blob:
 /// - Span 0: `max_swa_blocks` raw physical blocks across all `swa_layers` (`40`) SWA visits
 ///   (INT8 KTM codes + fp32 scales, or BF16; zero-padded when `boundary < sliding_window`).
 /// - Span 1: all `num_visits` (`48`) ShortConv(`k=4`) rolling states (`k, v, attn_post, mlp_post`)
 ///   in BF16.
+/// - Span 2 (optional, when DFlash2 is attached): `[valid_flag: u32, window_begin: u32]` header
+///   followed by the 4-bit [`DraftContextWindow`] ring buffer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Inkling2StateGeometry {
     pub swa_layers: u32,
@@ -114,6 +513,9 @@ pub(crate) struct Inkling2StateGeometry {
     pub kv_dim: u32,
     pub hidden_size: u32,
     pub conv_span_bytes: u64,
+    pub draft_window_width: u32,
+    pub draft_window_slots: u32,
+    pub draft_window_span_bytes: u64,
     pub block_size: u32,
     pub sliding_window: u32,
     pub kv_format: KvFormat,
@@ -123,6 +525,14 @@ impl Inkling2StateGeometry {
     pub(crate) fn from_coordinator(
         config: &Inkling2Config,
         coordinator: &Inkling2KVCacheCoordinator,
+    ) -> Result<Self> {
+        Self::from_coordinator_with_draft(config, coordinator, None)
+    }
+
+    pub(crate) fn from_coordinator_with_draft(
+        config: &Inkling2Config,
+        coordinator: &Inkling2KVCacheCoordinator,
+        dflash2: Option<&DFlash2Config>,
     ) -> Result<Self> {
         let block_size = coordinator.block_size().max(1);
         let sliding_window = u32::try_from(config.sliding_window)
@@ -161,6 +571,18 @@ impl Inkling2StateGeometry {
             .map_err(|_| Error::from_reason("Inkling2 hidden_size overflows u32"))?;
         let conv_span_bytes = short_conv_state_bytes(config);
 
+        let (draft_window_width, draft_window_slots, draft_window_span_bytes) = match dflash2 {
+            Some(cfg) => {
+                let width = cfg.context_width();
+                let slots = u32::try_from(cfg.sliding_window).map_err(|_| {
+                    Error::from_reason("Inkling2 DFlash2 sliding_window overflows u32")
+                })?;
+                let span = draft_window_span_bytes(Some(cfg));
+                (width, slots, span)
+            }
+            None => (0, 0, 0),
+        };
+
         Ok(Self {
             swa_layers,
             max_swa_blocks,
@@ -172,6 +594,9 @@ impl Inkling2StateGeometry {
             kv_dim,
             hidden_size,
             conv_span_bytes,
+            draft_window_width,
+            draft_window_slots,
+            draft_window_span_bytes,
             block_size,
             sliding_window,
             kv_format: coordinator.kv_format(),
@@ -179,35 +604,59 @@ impl Inkling2StateGeometry {
     }
 
     pub(crate) fn spans(&self) -> Vec<u64> {
-        let mut s = Vec::with_capacity(2);
+        let mut s = Vec::with_capacity(3);
         if self.swa_span_bytes > 0 {
             s.push(self.swa_span_bytes);
         }
         if self.conv_span_bytes > 0 {
             s.push(self.conv_span_bytes);
         }
+        if self.draft_window_span_bytes > 0 {
+            s.push(self.draft_window_span_bytes);
+        }
         s
     }
 
     pub(crate) fn payload_bytes(&self) -> u64 {
-        self.swa_span_bytes.saturating_add(self.conv_span_bytes)
+        self.swa_span_bytes
+            .saturating_add(self.conv_span_bytes)
+            .saturating_add(self.draft_window_span_bytes)
     }
 
     pub(crate) fn geometry_string(&self) -> String {
-        format!(
-            "inkling2-state:v1 swa={}:{}:{}:{}:{} conv={}:{}:{}:{} bs={} fmt={}",
-            self.swa_layers,
-            self.max_swa_blocks,
-            self.swa_key_blob_bytes,
-            self.swa_value_blob_bytes,
-            self.sliding_window,
-            self.num_visits,
-            self.conv_history,
-            self.kv_dim,
-            self.hidden_size,
-            self.block_size,
-            self.kv_format.as_str(),
-        )
+        if self.draft_window_span_bytes > 0 {
+            format!(
+                "inkling2-state:v2 swa={}:{}:{}:{}:{} conv={}:{}:{}:{} bs={} fmt={} dw={}:{}",
+                self.swa_layers,
+                self.max_swa_blocks,
+                self.swa_key_blob_bytes,
+                self.swa_value_blob_bytes,
+                self.sliding_window,
+                self.num_visits,
+                self.conv_history,
+                self.kv_dim,
+                self.hidden_size,
+                self.block_size,
+                self.kv_format.as_str(),
+                self.draft_window_width,
+                self.draft_window_slots,
+            )
+        } else {
+            format!(
+                "inkling2-state:v1 swa={}:{}:{}:{}:{} conv={}:{}:{}:{} bs={} fmt={}",
+                self.swa_layers,
+                self.max_swa_blocks,
+                self.swa_key_blob_bytes,
+                self.swa_value_blob_bytes,
+                self.sliding_window,
+                self.num_visits,
+                self.conv_history,
+                self.kv_dim,
+                self.hidden_size,
+                self.block_size,
+                self.kv_format.as_str(),
+            )
+        }
     }
 
     /// Number of live SWA physical blocks at block-aligned `boundary_tokens`.
@@ -220,7 +669,36 @@ impl Inkling2StateGeometry {
         total.saturating_sub(first_live)
     }
 
-    /// Encode an [`Inkling2StateAnchor`] into the fixed-size `into` staging buffer.
+    /// Exact flat SWA byte length for the live blocks at `boundary_tokens`.
+    pub(crate) fn live_swa_bytes(
+        &self,
+        boundary_tokens: u32,
+    ) -> std::result::Result<usize, String> {
+        if self.swa_span_bytes == 0 {
+            return Ok(0);
+        }
+        let live_blocks = self.live_swa_blocks(boundary_tokens);
+        if live_blocks > self.max_swa_blocks {
+            return Err(format!(
+                "Inkling2 SWA live_blocks {live_blocks} exceeds max {}",
+                self.max_swa_blocks
+            ));
+        }
+        let per_layer = self
+            .swa_key_blob_bytes
+            .checked_add(self.swa_value_blob_bytes)
+            .ok_or_else(|| "Inkling2 SWA per-layer bytes overflow".to_string())?;
+        let per_block = u64::from(self.swa_layers)
+            .checked_mul(per_layer)
+            .ok_or_else(|| "Inkling2 SWA per-block bytes overflow".to_string())?;
+        let live_bytes = u64::from(live_blocks)
+            .checked_mul(per_block)
+            .ok_or_else(|| "Inkling2 SWA live bytes overflow".to_string())?;
+        usize::try_from(live_bytes)
+            .map_err(|_| "Inkling2 SWA live bytes overflow usize".to_string())
+    }
+
+    /// Encode a flat [`Inkling2StateAnchor`] into the fixed-size `into` staging buffer.
     pub(crate) fn encode_into(
         &self,
         boundary_tokens: u32,
@@ -237,108 +715,79 @@ impl Inkling2StateGeometry {
         }
         let swa_len = usize::try_from(self.swa_span_bytes)
             .map_err(|_| "Inkling2 SWA span overflows usize".to_string())?;
-        let (swa_buf, conv_buf) = into.split_at_mut(swa_len);
+        let conv_len = usize::try_from(self.conv_span_bytes)
+            .map_err(|_| "Inkling2 ShortConv span overflows usize".to_string())?;
+        let (swa_buf, rest) = into.split_at_mut(swa_len);
+        let (conv_buf, dw_buf) = rest.split_at_mut(conv_len);
 
-        // Span 0: SWA trailing window raw blocks (zero-padded to fixed span length).
+        // Span 0: flat SWA trailing window raw blocks (zero-padded to fixed span length).
         if swa_len > 0 {
-            let expected_live = self.live_swa_blocks(boundary_tokens) as usize;
-            if anchor.swa_blocks.len() != expected_live
-                || expected_live > self.max_swa_blocks as usize
-            {
+            let expected_live_bytes = self.live_swa_bytes(boundary_tokens)?;
+            if anchor.swa_data.len() != expected_live_bytes || expected_live_bytes > swa_len {
                 return Err(format!(
-                    "Inkling2 SWA block count {} != expected {expected_live} (max {})",
-                    anchor.swa_blocks.len(),
-                    self.max_swa_blocks
+                    "Inkling2 SWA flat byte length {} != expected {expected_live_bytes} (span {swa_len})",
+                    anchor.swa_data.len()
                 ));
             }
-            let k_len = self.swa_key_blob_bytes as usize;
-            let v_len = self.swa_value_blob_bytes as usize;
-            let mut cursor = 0usize;
-            for block in &anchor.swa_blocks {
-                if block.len() != self.swa_layers as usize {
-                    return Err(format!(
-                        "Inkling2 SWA block layer count {} != {}",
-                        block.len(),
-                        self.swa_layers
-                    ));
-                }
-                for (k, v) in block {
-                    if k.len() != k_len || v.len() != v_len {
-                        return Err(format!(
-                            "Inkling2 SWA blob length mismatch: ({}, {}) != ({k_len}, {v_len})",
-                            k.len(),
-                            v.len()
-                        ));
-                    }
-                    swa_buf[cursor..cursor + k_len].copy_from_slice(k);
-                    cursor += k_len;
-                    swa_buf[cursor..cursor + v_len].copy_from_slice(v);
-                    cursor += v_len;
-                }
+            swa_buf[..expected_live_bytes].copy_from_slice(&anchor.swa_data);
+            if expected_live_bytes < swa_len {
+                swa_buf[expected_live_bytes..].fill(0);
             }
-            if cursor < swa_len {
-                swa_buf[cursor..].fill(0);
-            }
+        } else if !anchor.swa_data.is_empty() {
+            return Err(format!(
+                "Inkling2 SWA flat bytes non-empty ({}) for zero-SWA geometry",
+                anchor.swa_data.len()
+            ));
         }
 
-        // Span 1: 48-visit ShortConv(k=4) ring states in BF16 little-endian u16.
-        if anchor.conv_state.visits.len() != self.num_visits as usize {
+        // Span 1: flat 48-visit ShortConv(k=4) ring states in BF16 little-endian u16.
+        if anchor.conv_data.len() != conv_buf.len() {
             return Err(format!(
-                "Inkling2 ShortConv visit count {} != {}",
-                anchor.conv_state.visits.len(),
-                self.num_visits
-            ));
-        }
-        let hist = self.conv_history as usize;
-        let kv_elems = hist * self.kv_dim as usize;
-        let hidden_elems = hist * self.hidden_size as usize;
-        let mut cursor = 0usize;
-        let mut write_bf16 =
-            |arr: &MxArray, expected_elems: usize| -> std::result::Result<(), String> {
-                let dt = arr
-                    .dtype()
-                    .map_err(|e| format!("Inkling2 ShortConv dtype failed: {e}"))?;
-                let bf16 = if dt == DType::BFloat16 {
-                    arr.clone()
-                } else {
-                    arr.astype(DType::BFloat16)
-                        .map_err(|e| format!("Inkling2 ShortConv cast to bf16 failed: {e}"))?
-                };
-                let raw = bf16
-                    .to_uint16_native()
-                    .map_err(|e| format!("Inkling2 ShortConv readback failed: {e}"))?;
-                if raw.len() != expected_elems {
-                    return Err(format!(
-                        "Inkling2 ShortConv element count {} != {expected_elems}",
-                        raw.len()
-                    ));
-                }
-                let byte_len = expected_elems * 2;
-                let dst = conv_buf
-                    .get_mut(cursor..cursor + byte_len)
-                    .ok_or_else(|| "Inkling2 ShortConv buffer overflow".to_string())?;
-                for (i, val) in raw.into_iter().enumerate() {
-                    dst[i * 2..i * 2 + 2].copy_from_slice(&val.to_le_bytes());
-                }
-                cursor += byte_len;
-                Ok(())
-            };
-        for visit in &anchor.conv_state.visits {
-            write_bf16(&visit.k, kv_elems)?;
-            write_bf16(&visit.v, kv_elems)?;
-            write_bf16(&visit.attn_post, hidden_elems)?;
-            write_bf16(&visit.mlp_post, hidden_elems)?;
-        }
-        if cursor != conv_buf.len() {
-            return Err(format!(
-                "Inkling2 ShortConv encoded bytes {cursor} != expected {}",
+                "Inkling2 ShortConv flat byte length {} != expected {}",
+                anchor.conv_data.len(),
                 conv_buf.len()
             ));
+        }
+        conv_buf.copy_from_slice(&anchor.conv_data);
+
+        // Span 2: optional DFlash2 DraftContextWindow `[valid_flag: u32, window_begin: u32, raw_4bit_bytes]`.
+        if self.draft_window_span_bytes > 0 {
+            let header_len = DRAFT_WINDOW_HEADER_BYTES as usize;
+            let raw_len = dw_buf
+                .len()
+                .checked_sub(header_len)
+                .ok_or_else(|| "Inkling2 draft window span smaller than header".to_string())?;
+            if let Some(dw) = anchor.draft_window.as_ref() {
+                if dw.width != self.draft_window_width
+                    || dw.slots != self.draft_window_slots
+                    || dw.bytes.len() != raw_len
+                    || dw.end != boundary_tokens
+                    || dw.begin > dw.end
+                    || dw.end - dw.begin > dw.slots
+                {
+                    return Err(format!(
+                        "Inkling2 draft window mismatch: got {}x{} [{}, {}) ({} B) for boundary \
+                         {boundary_tokens} (expected {}x{}, {raw_len} B)",
+                        dw.width,
+                        dw.slots,
+                        dw.begin,
+                        dw.end,
+                        dw.bytes.len(),
+                        self.draft_window_width,
+                        self.draft_window_slots
+                    ));
+                }
+                dw_buf[0..4].copy_from_slice(&1u32.to_le_bytes());
+                dw_buf[4..8].copy_from_slice(&dw.begin.to_le_bytes());
+                dw_buf[header_len..].copy_from_slice(&dw.bytes);
+            } else {
+                dw_buf.fill(0);
+            }
         }
         Ok(())
     }
 
-    /// Decode an [`Inkling2StateAnchor`] from a validated state blob payload.
+    /// Decode a flat [`Inkling2StateAnchor`] from a validated state blob payload.
     pub(crate) fn decode_from(
         &self,
         boundary_tokens: u32,
@@ -354,100 +803,123 @@ impl Inkling2StateGeometry {
         }
         let swa_len = usize::try_from(self.swa_span_bytes)
             .map_err(|_| "Inkling2 SWA span overflows usize".to_string())?;
-        let (swa_buf, conv_buf) = payload.split_at(swa_len);
+        let conv_len = usize::try_from(self.conv_span_bytes)
+            .map_err(|_| "Inkling2 ShortConv span overflows usize".to_string())?;
+        let (swa_buf, rest) = payload.split_at(swa_len);
+        let (conv_buf, dw_buf) = rest.split_at(conv_len);
 
-        // Decode Span 0: live SWA blocks.
-        let mut swa_blocks = Vec::new();
-        let mut swa_ram_bytes = 0u64;
-        if swa_len > 0 {
-            let live_blocks = self.live_swa_blocks(boundary_tokens) as usize;
-            if live_blocks > self.max_swa_blocks as usize {
+        // Span 0: live flat SWA bytes.
+        let swa_data: Arc<Vec<u8>> = if swa_len > 0 {
+            let expected_live_bytes = self.live_swa_bytes(boundary_tokens)?;
+            if expected_live_bytes > swa_len {
                 return Err(format!(
-                    "Inkling2 SWA live_blocks {live_blocks} exceeds max {}",
-                    self.max_swa_blocks
+                    "Inkling2 SWA live bytes {expected_live_bytes} exceed span {swa_len}"
                 ));
             }
-            let k_len = self.swa_key_blob_bytes as usize;
-            let v_len = self.swa_value_blob_bytes as usize;
-            let mut cursor = 0usize;
-            swa_blocks.reserve(live_blocks);
-            for _ in 0..live_blocks {
-                let mut layers = Vec::with_capacity(self.swa_layers as usize);
-                for _ in 0..self.swa_layers {
-                    let k = swa_buf
-                        .get(cursor..cursor + k_len)
-                        .ok_or_else(|| "Inkling2 SWA payload truncated on keys".to_string())?
-                        .to_vec();
-                    cursor += k_len;
-                    let v = swa_buf
-                        .get(cursor..cursor + v_len)
-                        .ok_or_else(|| "Inkling2 SWA payload truncated on values".to_string())?
-                        .to_vec();
-                    cursor += v_len;
-                    swa_ram_bytes = swa_ram_bytes.saturating_add((k_len + v_len) as u64);
-                    layers.push((k, v));
+            Arc::new(swa_buf[..expected_live_bytes].to_vec())
+        } else {
+            Arc::new(Vec::new())
+        };
+
+        // Span 1: flat ShortConv bytes.
+        let conv_data: Arc<Vec<u8>> = Arc::new(conv_buf.to_vec());
+
+        // Span 2: optional DFlash2 DraftContextWindow.
+        let draft_window = if self.draft_window_span_bytes > 0 {
+            let header_len = DRAFT_WINDOW_HEADER_BYTES as usize;
+            if dw_buf.len() < header_len {
+                return Err("Inkling2 draft window span truncated".to_string());
+            }
+            let valid_flag = u32::from_le_bytes([dw_buf[0], dw_buf[1], dw_buf[2], dw_buf[3]]);
+            let window_begin = u32::from_le_bytes([dw_buf[4], dw_buf[5], dw_buf[6], dw_buf[7]]);
+            match valid_flag {
+                0 => None,
+                1 => {
+                    let raw = &dw_buf[header_len..];
+                    let expected_raw = usize::try_from(DraftContextWindow::bytes(
+                        self.draft_window_width,
+                        self.draft_window_slots,
+                    ))
+                    .map_err(|_| "Inkling2 draft window size overflows usize".to_string())?;
+                    if raw.len() != expected_raw
+                        || window_begin > boundary_tokens
+                        || boundary_tokens - window_begin > self.draft_window_slots
+                    {
+                        return Err(format!(
+                            "Inkling2 draft window decode invalid bounds [{window_begin}, \
+                             {boundary_tokens}) for slots={} (raw {} != {expected_raw})",
+                            self.draft_window_slots,
+                            raw.len()
+                        ));
+                    }
+                    Some(PackedDraftWindow {
+                        bytes: Arc::new(TrackedPackedBytes::new(raw.to_vec())),
+                        width: self.draft_window_width,
+                        slots: self.draft_window_slots,
+                        begin: window_begin,
+                        end: boundary_tokens,
+                    })
                 }
-                swa_blocks.push(layers);
+                other => {
+                    return Err(format!("Inkling2 draft window invalid valid_flag={other}"));
+                }
             }
-        }
-
-        // Decode Span 1: 48-visit ShortConv states.
-        let hist = self.conv_history as i64;
-        let kv_cols = self.kv_dim as i64;
-        let hidden_cols = self.hidden_size as i64;
-        let kv_elems = (self.conv_history as usize) * (self.kv_dim as usize);
-        let hidden_elems = (self.conv_history as usize) * (self.hidden_size as usize);
-        let mut cursor = 0usize;
-        let mut read_bf16 = |elems: usize, shape: &[i64]| -> std::result::Result<MxArray, String> {
-            let byte_len = elems * 2;
-            let src = conv_buf
-                .get(cursor..cursor + byte_len)
-                .ok_or_else(|| "Inkling2 ShortConv payload truncated".to_string())?;
-            cursor += byte_len;
-            let mut raw = Vec::with_capacity(elems);
-            for pair in src.as_chunks::<2>().0 {
-                raw.push(u16::from_le_bytes(*pair));
-            }
-            MxArray::from_bfloat16(&raw, shape)
-                .map_err(|e| format!("Inkling2 ShortConv decode array failed: {e}"))
+        } else {
+            None
         };
 
-        let mut visits = Vec::with_capacity(self.num_visits as usize);
-        for _ in 0..self.num_visits {
-            let k = read_bf16(kv_elems, &[hist, kv_cols])?;
-            let v = read_bf16(kv_elems, &[hist, kv_cols])?;
-            let attn_post = read_bf16(hidden_elems, &[hist, hidden_cols])?;
-            let mlp_post = read_bf16(hidden_elems, &[hist, hidden_cols])?;
-            visits.push(VisitShortConvState {
-                k,
-                v,
-                attn_post,
-                mlp_post,
-            });
-        }
-        let conv_state = Inkling2ShortConvState {
-            visits,
-            kernel_size: (self.conv_history as usize) + 1,
-        };
+        let cached_bytes = (swa_data.len() as u64)
+            .saturating_add(conv_data.len() as u64)
+            .saturating_add(draft_window.as_ref().map_or(0, |d| d.bytes.len() as u64));
         Ok(Inkling2StateAnchor {
-            swa_blocks,
-            conv_state,
-            cached_bytes: swa_ram_bytes.saturating_add(self.conv_span_bytes),
+            swa_data,
+            conv_data,
+            draft_window,
+            cached_bytes,
         })
     }
 }
 
 /// In-memory hybrid state snapshot at one block-aligned prefix boundary:
-/// - `swa_blocks`: raw physical blocks for Group 1 (40 SWA visits, `<= 32` blocks).
-/// - `conv_state`: 48-visit ShortConv(`k=4`) rolling states in BF16.
+/// - `swa_data`: flat raw physical block buffer for Group 1 (40 SWA visits, `<= 32` blocks).
+/// - `conv_data`: flat little-endian BF16 buffer for 48-visit ShortConv(`k=4`) rolling states.
+/// - `draft_window`: optional flat 4-bit DFlash2 [`PackedDraftWindow`] snapshot.
 ///
-/// Holds NO Global (Group 0) KV copy: Group 0 blocks stay content-addressed in the Global
-/// `PagedKVCacheAdapter` and are kept resident via `set_state_marks`.
+/// Holds NO Global (Group 0) KV copy and NO live MLX GPU tensors: Group 0 blocks stay
+/// content-addressed in the Global `PagedKVCacheAdapter` and are kept resident via
+/// `set_state_marks`, while `Arc<Vec<u8>>` moves readback buffers in O(1) with zero copy.
 #[derive(Clone)]
 pub(crate) struct Inkling2StateAnchor {
-    pub swa_blocks: Vec<Vec<(Vec<u8>, Vec<u8>)>>,
-    pub conv_state: Inkling2ShortConvState,
+    pub swa_data: Arc<Vec<u8>>,
+    pub conv_data: Arc<Vec<u8>>,
+    pub draft_window: Option<PackedDraftWindow>,
     pub cached_bytes: u64,
+}
+
+impl Inkling2StateAnchor {
+    /// Host RAM bytes exclusively owned by this anchor (`Arc::strong_count == 1`).
+    ///
+    /// Shared `Arc<[u8]>` buffers (such as a `PackedDraftWindow` still cloned inside a live
+    /// sequence's `block_boundary_draft_window`) remain resident when this anchor drops and must
+    /// not be credited to the governor as reclaimed RAM.
+    pub(crate) fn exclusive_ram_bytes(&self) -> u64 {
+        let swa = if Arc::strong_count(&self.swa_data) == 1 {
+            self.swa_data.len() as u64
+        } else {
+            0
+        };
+        let conv = if Arc::strong_count(&self.conv_data) == 1 {
+            self.conv_data.len() as u64
+        } else {
+            0
+        };
+        let dw = self
+            .draft_window
+            .as_ref()
+            .filter(|dw| Arc::strong_count(&dw.bytes) == 1)
+            .map_or(0, |dw| dw.bytes.len() as u64);
+        swa.saturating_add(conv).saturating_add(dw)
+    }
 }
 
 impl StateBytes for Inkling2StateAnchor {
@@ -502,15 +974,21 @@ impl StateDiskCodec for Inkling2StateCodec {
             );
             return None;
         }
-        Some(depth.saturating_sub(self.geometry.sliding_window))
+        let window_begin = state.draft_window.as_ref().map_or_else(
+            || depth.saturating_sub(self.geometry.sliding_window),
+            |dw| dw.begin,
+        );
+        Some(window_begin)
     }
 
     fn adopt_copy(&self, _spans: &[u64], label: &ColdStateLabel) -> Option<(u64, u32)> {
         let row = u32::try_from(label.tokens.len()).ok()?;
-        Some((
-            self.geometry.payload_bytes(),
-            row.saturating_sub(self.geometry.sliding_window),
-        ))
+        let window_begin = if self.geometry.draft_window_slots > 0 {
+            row.saturating_sub(self.geometry.draft_window_slots)
+        } else {
+            row.saturating_sub(self.geometry.sliding_window)
+        };
+        Some((self.geometry.payload_bytes(), window_begin))
     }
 }
 
@@ -571,19 +1049,232 @@ impl Inkling2StateDisk {
                 && self.engine.chain_on_disk(entry)
         })
     }
+
+    /// Whether `entry`'s state object plus its complete Global KV chain can ever fit within
+    /// `self.tier.limit` (distinguishing permanently un-fittable entries from transient volume
+    /// headroom or writer refusals).
+    pub(crate) fn entry_fits_tier_limit(&self, entry: &Entry<Inkling2StateAnchor>) -> bool {
+        let Some(layout) = self.engine.layout(entry.depth()) else {
+            return false;
+        };
+        let state = mlx_paged_attn::state_object_bytes(
+            &layout,
+            &crate::disk_tier::state_disk::label_of(entry),
+        );
+        let blocks = entry.chain().len() as u64;
+        blocks
+            .saturating_mul(self.engine.block_bytes)
+            .saturating_add(state)
+            <= self.tier.limit
+    }
+}
+
+/// Queued SSD upgrade or repair for a RAM-resident entry:
+/// - `InPlace`: entry still holds an intact old `DiskCopy` on SSD that must be preserved on
+///   failure (`MakeRoom::Refuse` + rollback).
+/// - `Repair`: the old SSD blob or its Global KV chain was already evicted (or an upgrade
+///   landed with `chain_owed == true`), so a fresh replacement blob AND its full Global KV
+///   chain must land (`landed && !chain_owed && entry_disk_restorable`) before the repair
+///   is complete.
+#[derive(Clone, Copy, Debug)]
+enum PendingDiskUpgrade {
+    InPlace { retry_after: Instant },
+    Repair { retry_after: Instant },
+}
+
+impl PendingDiskUpgrade {
+    fn retry_after(self) -> Instant {
+        match self {
+            Self::InPlace { retry_after } | Self::Repair { retry_after } => retry_after,
+        }
+    }
+
+    fn set_retry_after(&mut self, retry: Instant) {
+        match self {
+            Self::InPlace { retry_after } | Self::Repair { retry_after } => *retry_after = retry,
+        }
+    }
+
+    fn is_in_place(&self) -> bool {
+        matches!(self, Self::InPlace { .. })
+    }
+}
+
+/// Active in-place SSD upgrade write: retains the previous durable `DiskCopy` alongside a
+/// `ColdKeyHold` pinning both `old_copy.key` and its entire Global KV chain against LRU eviction
+/// by competing writes until the replacement lands or rolls back.
+struct InFlightDiskUpgrade {
+    id: EntryId,
+    old_copy: DiskCopy,
+    _fallback_hold: ColdKeyHold,
+}
+
+/// Target coordinator charging Inkling2's host-heap state store into
+/// `CacheLimitCoordinator::registered_pool_bytes()` (and thus `Governor::charge()`).
+enum HostBudgetTarget {
+    Global,
+    #[cfg(test)]
+    Local(Arc<crate::cache_limit::CacheLimitCoordinator>),
+}
+
+struct HostBudgetAccountInner {
+    target: Option<HostBudgetTarget>,
+    guard: Option<crate::cache_limit::HostPoolCacheLimitGuard>,
+    store_non_dw_bytes: u64,
+    packed_dw_bytes: u64,
+    reported_bytes: u64,
+}
+
+/// Shared host-budget accounting owner for one [`Inkling2StateStore`] and all live
+/// [`TrackedPackedBytes`] allocations published or loaded through it.
+pub(crate) struct HostBudgetAccount {
+    inner: Mutex<HostBudgetAccountInner>,
+}
+
+impl HostBudgetAccount {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(HostBudgetAccountInner {
+                target: None,
+                guard: None,
+                store_non_dw_bytes: 0,
+                packed_dw_bytes: 0,
+                reported_bytes: 0,
+            }),
+        })
+    }
+
+    fn sync_locked(inner: &mut HostBudgetAccountInner) {
+        let Some(target) = inner.target.as_ref() else {
+            inner.guard = None;
+            inner.reported_bytes = 0;
+            return;
+        };
+        let total = inner
+            .store_non_dw_bytes
+            .saturating_add(inner.packed_dw_bytes);
+        if total == 0 {
+            inner.guard = None;
+            inner.reported_bytes = 0;
+            return;
+        }
+        if total == inner.reported_bytes && inner.guard.is_some() {
+            return;
+        }
+        if let Some(guard) = inner.guard.as_ref() {
+            guard.update(total);
+        } else {
+            let guard = match target {
+                HostBudgetTarget::Global => {
+                    crate::cache_limit::coordinator().register_host_pool(total)
+                }
+                #[cfg(test)]
+                HostBudgetTarget::Local(coord) => coord.register_host_pool_local(total),
+            };
+            inner.guard = Some(guard);
+        }
+        inner.reported_bytes = total;
+    }
+
+    fn set_target(&self, target: HostBudgetTarget) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if matches!(target, HostBudgetTarget::Global)
+            && matches!(inner.target, Some(HostBudgetTarget::Global))
+        {
+            Self::sync_locked(&mut inner);
+            return;
+        }
+        inner.guard = None;
+        inner.reported_bytes = 0;
+        inner.target = Some(target);
+        Self::sync_locked(&mut inner);
+    }
+
+    fn set_store_non_dw_bytes(&self, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.store_non_dw_bytes = bytes;
+        Self::sync_locked(&mut inner);
+    }
+
+    fn add_packed_dw_bytes(&self, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.packed_dw_bytes = inner.packed_dw_bytes.saturating_add(bytes);
+        Self::sync_locked(&mut inner);
+    }
+
+    fn sub_packed_dw_bytes(&self, bytes: u64) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.packed_dw_bytes = inner.packed_dw_bytes.saturating_sub(bytes);
+        Self::sync_locked(&mut inner);
+    }
+
+    fn packed_dw_bytes(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .packed_dw_bytes
+    }
 }
 
 /// Complete Inkling-2-Mini hybrid prefix state store (in-memory RAM store + optional StateDisk).
 pub(crate) struct Inkling2StateStore {
     pub(crate) store: HybridStateStore<Inkling2StateAnchor>,
     pub(crate) disk: Option<Inkling2StateDisk>,
+    /// Hard cap on the number of state anchors kept resident in host RAM.
+    pub(crate) ram_cap: usize,
+    /// Active state-blob geometry (SWA + ShortConv + optional DFlash2 draft context window).
+    pub(crate) geometry: Option<Inkling2StateGeometry>,
+    /// Shared host-budget account charging both `self.store`'s non-draft-window bytes and all
+    /// live [`TrackedPackedBytes`] draft windows into `CacheLimitCoordinator`.
+    host_budget: Arc<HostBudgetAccount>,
     /// Most recent rolling prefill checkpoint published per active sequence (retired on next
     /// checkpoint or ordinary publication).
     seq_checkpoints: HashMap<SeqId, EntryId>,
+    /// Entries known to lack a `PackedDraftWindow` (`draft_window == None`, either captured
+    /// without one or decoded from SSD with `valid_flag == 0`) under a v2 draft-window geometry.
+    entries_missing_draft_window: HashSet<EntryId>,
+    /// SSD-only entries adopted on startup whose on-disk `valid_flag` has not yet been decoded.
+    adopted_unverified_window: HashSet<EntryId>,
+    /// Entries with an upgraded RAM anchor (carrying a complete `PackedDraftWindow`) awaiting
+    /// either in-place SSD overwrite (`InPlace`) or full blob+chain rewrite (`Repair`), paired
+    /// with a `retry_after` backoff instant so failed/refused upgrades are not immediately
+    /// re-staged by `trim_ram_to_cap`.
+    pending_disk_upgrades: HashMap<EntryId, PendingDiskUpgrade>,
+    /// In-flight SSD upgrade write: retains the previous durable `DiskCopy` and holds both
+    /// `old_copy.key` and its Global KV chain against LRU eviction so a failed replacement write
+    /// (even after urgent RAM drop) immediately restores the old SSD hit without data loss.
+    in_flight_disk_upgrade: Option<InFlightDiskUpgrade>,
+    /// Upgrade/repair entry IDs whose recent staging, write, or KV chain capture failed;
+    /// drained by `flush_to_disk` into its per-pass failed-upgrade skip set so a repeatedly
+    /// failing upgrade/repair never tight-spins until deadline.
+    recent_failed_upgrades: HashSet<EntryId>,
+    /// Ordinary (non-upgrade) entry IDs whose recent staging, write, or KV chain capture failed;
+    /// drained alongside `recent_failed_upgrades` by `flush_to_disk` so transient failures return
+    /// `false` promptly without tight-spinning while remaining queued in `write_behind`.
+    recent_failed_spills: HashSet<EntryId>,
+    /// Backoff deadline per entry whose recent SSD spill failed or was refused by the writer,
+    /// so `trim_ram_to_cap` (and non-forced write-behind) do not tight-loop re-staging the same
+    /// refused ordinary entry.
+    spill_backoff: HashMap<EntryId, Instant>,
+    /// RAM-backed entries whose reclaim was deferred while awaiting SSD state/KV chain durability;
+    /// once both state blob and Global KV chain are restorable on SSD (with no pending/in-flight
+    /// upgrade or active use), drop RAM automatically even when `ram_len() <= ram_cap` so pinned
+    /// Global KV pages become evictable immediately.
+    demote_ram_on_durable: HashSet<EntryId>,
     /// Counters tracked even when `disk` is disabled.
     pub(crate) ram_hits: u64,
     pub(crate) checkpoints_published: u64,
     pub(crate) ordinary_published: u64,
+    /// Test-only fault-injection flag: forces the next deferred `BoundaryDraftWindow::Device`
+    /// serialization inside `capture_boundary_with_window` to fail.
+    #[cfg(test)]
+    pub(crate) fail_next_draft_window_pack: bool,
+}
+
+impl Drop for Inkling2StateStore {
+    fn drop(&mut self) {
+        self.host_budget.set_store_non_dw_bytes(0);
+    }
 }
 
 impl Inkling2StateStore {
@@ -593,24 +1284,883 @@ impl Inkling2StateStore {
         Self {
             store,
             disk: None,
+            ram_cap: INKLING2_DEFAULT_RAM_STATES,
+            geometry: None,
+            host_budget: HostBudgetAccount::new(),
             seq_checkpoints: HashMap::new(),
+            entries_missing_draft_window: HashSet::new(),
+            adopted_unverified_window: HashSet::new(),
+            pending_disk_upgrades: HashMap::new(),
+            in_flight_disk_upgrade: None,
+            recent_failed_upgrades: HashSet::new(),
+            recent_failed_spills: HashSet::new(),
+            spill_backoff: HashMap::new(),
+            demote_ram_on_durable: HashSet::new(),
             ram_hits: 0,
             checkpoints_published: 0,
             ordinary_published: 0,
+            #[cfg(test)]
+            fail_next_draft_window_pack: false,
+        }
+    }
+
+    /// Wire this state store to charge its resident host-RAM bytes into the process-wide
+    /// [`crate::cache_limit::coordinator()`] (and therefore into `Governor::charge()`).
+    pub(crate) fn attach_host_budget(&mut self) {
+        self.host_budget.set_target(HostBudgetTarget::Global);
+        self.sync_host_budget();
+    }
+
+    /// Test-only: wire this state store to an isolated [`crate::cache_limit::CacheLimitCoordinator`]
+    /// so parallel tests never interfere on process-wide pool totals.
+    #[cfg(test)]
+    pub(crate) fn attach_host_budget_to(
+        &mut self,
+        coord: Arc<crate::cache_limit::CacheLimitCoordinator>,
+    ) {
+        self.host_budget.set_target(HostBudgetTarget::Local(coord));
+        self.sync_host_budget();
+    }
+
+    /// Exact deduplicated host-heap bytes owned directly by `self.store` excluding
+    /// [`TrackedPackedBytes`] draft windows tracked by `self.host_budget` (lineage vectors plus
+    /// unique RAM anchor `swa_data` and `conv_data` buffers).
+    fn store_non_dw_host_bytes(&self) -> u64 {
+        let mut seen_ptrs: HashSet<*const u8> = HashSet::new();
+        let mut total = 0u64;
+        for entry in self.store.entries() {
+            let ram_bytes = entry.ram().map_or(0, StateBytes::state_bytes);
+            let lineage = entry.state_bytes().saturating_sub(ram_bytes);
+            total = total.saturating_add(lineage);
+            if let Some(anchor) = entry.ram() {
+                if !anchor.swa_data.is_empty() && seen_ptrs.insert(anchor.swa_data.as_ptr()) {
+                    total = total.saturating_add(anchor.swa_data.len() as u64);
+                }
+                if !anchor.conv_data.is_empty() && seen_ptrs.insert(anchor.conv_data.as_ptr()) {
+                    total = total.saturating_add(anchor.conv_data.len() as u64);
+                }
+            }
+        }
+        total
+    }
+
+    /// Exact deduplicated host-heap bytes accounted to this state store: `self.store`'s lineage +
+    /// `swa_data` + `conv_data` plus all live [`TrackedPackedBytes`] draft windows attached to
+    /// `self.host_budget` (whether currently in `self.store`, cloned in a live sequence's
+    /// `block_boundary_draft_window`, or both — never double-counted).
+    pub(crate) fn host_resident_bytes(&self) -> u64 {
+        self.store_non_dw_host_bytes()
+            .saturating_add(self.host_budget.packed_dw_bytes())
+    }
+
+    /// Synchronize the registered host-pool budget with `self.store_non_dw_host_bytes()` +
+    /// `self.host_budget.packed_dw_bytes()`.
+    pub(crate) fn sync_host_budget(&mut self) {
+        let non_dw = self.store_non_dw_host_bytes();
+        self.host_budget.set_store_non_dw_bytes(non_dw);
+    }
+
+    pub(crate) fn request_ram_demote_on_durable(&mut self, id: EntryId) {
+        if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+            self.demote_ram_on_durable.insert(id);
+        }
+    }
+
+    /// Drop RAM copies for entries in `demote_ram_on_durable` that are now durably restorable on
+    /// SSD, even when `ram_len() <= ram_cap`. Returns `true` if any RAM copy was dropped so the
+    /// caller can prune tracking and resync Global KV state marks.
+    fn demote_requested_ram(&mut self) -> bool {
+        if self.demote_ram_on_durable.is_empty() {
+            return false;
+        }
+        let pending_id = self
+            .disk
+            .as_ref()
+            .and_then(|d| d.pending.as_ref().map(|p| p.id));
+        let ready: Vec<EntryId> = self
+            .demote_ram_on_durable
+            .iter()
+            .copied()
+            .filter(|&id| {
+                !self.pending_disk_upgrades.contains_key(&id)
+                    && self
+                        .in_flight_disk_upgrade
+                        .as_ref()
+                        .is_none_or(|u| u.id != id)
+                    && pending_id != Some(id)
+                    && self.store.get(id).is_some_and(|entry| {
+                        entry.ram().is_some()
+                            && entry.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                            && !self.store.in_use(entry.mark())
+                            && self
+                                .disk
+                                .as_ref()
+                                .is_some_and(|d| d.entry_disk_restorable(entry))
+                    })
+            })
+            .collect();
+        if ready.is_empty() {
+            return false;
+        }
+        for id in ready {
+            self.demote_ram_on_durable.remove(&id);
+            self.spill_backoff.remove(&id);
+            if let Some(disk) = self.disk.as_mut() {
+                disk.write_behind.retain(|w| w.id != id);
+            }
+            self.store.drop_ram(id);
+        }
+        self.sync_host_budget();
+        true
+    }
+
+    fn clear_window_tracking(&mut self, id: EntryId) {
+        self.entries_missing_draft_window.remove(&id);
+        self.adopted_unverified_window.remove(&id);
+    }
+
+    fn clear_upgrade_tracking(&mut self, id: EntryId) {
+        self.pending_disk_upgrades.remove(&id);
+        self.recent_failed_upgrades.remove(&id);
+        self.recent_failed_spills.remove(&id);
+        self.spill_backoff.remove(&id);
+        self.demote_ram_on_durable.remove(&id);
+        if self
+            .in_flight_disk_upgrade
+            .as_ref()
+            .is_some_and(|u| u.id == id)
+        {
+            self.in_flight_disk_upgrade = None;
+        }
+        if let Some(disk) = self.disk.as_mut()
+            && disk.preserve_entry_on_state_failure == Some(id)
+        {
+            disk.preserve_entry_on_state_failure = None;
+        }
+    }
+
+    fn enqueue_write_behind_entry_if_missing(&mut self, entry: WriteBehindEntry) {
+        if let Some(disk) = self.disk.as_mut()
+            && !disk.write_behind.iter().any(|w| w.id == entry.id)
+        {
+            disk.write_behind.push(entry);
+        }
+    }
+
+    fn enqueue_write_behind_if_missing(&mut self, id: EntryId) {
+        self.enqueue_write_behind_entry_if_missing(WriteBehindEntry {
+            id,
+            published_at: Instant::now(),
+        });
+    }
+
+    /// When the SSD writer has stopped accepting tracked writes (`!disk.writable()`, e.g. after a
+    /// non-space I/O error tripped `ColdCacheManager::tracked_failed`), no remaining `chain_owed`
+    /// Global KV blocks can ever be persisted. Retire incomplete disk copies so they never keep
+    /// Global KV pages pinned indefinitely, while preserving every already-durable SSD entry
+    /// (`landed && !chain_owed`) and every live RAM copy.
+    fn retire_unwritable_incomplete_disk_copies(&mut self) -> bool {
+        let (unwritable, writing) = match self.disk.as_ref() {
+            Some(d) => (!d.writable(), d.writing()),
+            None => return false,
+        };
+        if !unwritable {
+            return false;
+        }
+        let mut changed = false;
+        if let Some(disk) = self.disk.as_mut()
+            && disk.chain.take().is_some()
+        {
+            changed = true;
+        }
+        enum Action {
+            MarkDurable,
+            DropDiskKeepRam(Option<ColdCacheKey>),
+            RemoveEntry(Option<ColdCacheKey>),
+        }
+        let actions: Vec<(EntryId, Action)> = {
+            let Some(disk) = self.disk.as_ref() else {
+                return changed;
+            };
+            self.store
+                .entries()
+                .filter_map(|entry| {
+                    let copy = entry.disk()?;
+                    let id = entry.id();
+                    if copy.landed && !copy.chain_owed {
+                        return None;
+                    }
+                    if copy.landed && copy.chain_owed {
+                        if disk.entry_disk_restorable(entry) {
+                            return Some((id, Action::MarkDurable));
+                        }
+                        return if entry.ram().is_none() {
+                            Some((id, Action::RemoveEntry(Some(copy.key))))
+                        } else {
+                            Some((id, Action::DropDiskKeepRam(Some(copy.key))))
+                        };
+                    }
+                    if !writing {
+                        return if entry.ram().is_none() {
+                            Some((id, Action::RemoveEntry(None)))
+                        } else {
+                            Some((id, Action::DropDiskKeepRam(None)))
+                        };
+                    }
+                    None
+                })
+                .collect()
+        };
+        if actions.is_empty() {
+            return changed;
+        }
+        for (id, action) in actions {
+            match action {
+                Action::MarkDurable => {
+                    if let Some(copy) = self.store.disk_mut(id) {
+                        copy.chain_owed = false;
+                        changed = true;
+                    }
+                }
+                Action::DropDiskKeepRam(key) => {
+                    if let Some(key) = key
+                        && let Some(disk) = self.disk.as_ref()
+                    {
+                        let tier = Arc::clone(&disk.tier);
+                        let _ = tier.while_held(|| {
+                            tier.manager.remove(&key);
+                        });
+                    }
+                    self.store.set_disk(id, None);
+                    self.clear_upgrade_tracking(id);
+                    changed = true;
+                }
+                Action::RemoveEntry(key) => {
+                    if let Some(key) = key
+                        && let Some(disk) = self.disk.as_ref()
+                    {
+                        let tier = Arc::clone(&disk.tier);
+                        let _ = tier.while_held(|| {
+                            tier.manager.remove(&key);
+                        });
+                    }
+                    self.seq_checkpoints.retain(|_, v| *v != id);
+                    if let Some(disk) = self.disk.as_mut() {
+                        disk.write_behind.retain(|w| w.id != id);
+                    }
+                    self.clear_window_tracking(id);
+                    self.clear_upgrade_tracking(id);
+                    self.store.remove(id);
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            self.sync_host_budget();
+        }
+        changed
+    }
+
+    fn mark_repair_failed(&mut self, id: EntryId, retry: Instant) {
+        if !self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+            self.pending_disk_upgrades.remove(&id);
+            self.recent_failed_upgrades.remove(&id);
+            return;
+        }
+        self.pending_disk_upgrades
+            .insert(id, PendingDiskUpgrade::Repair { retry_after: retry });
+        self.spill_backoff.insert(id, retry);
+        self.recent_failed_upgrades.insert(id);
+        self.enqueue_write_behind_if_missing(id);
+    }
+
+    /// Clear `Repair` entries once both their replacement state blob AND complete Global KV chain
+    /// are landed and restorable on SSD. If a landed `Repair` copy already lost its blob or chain
+    /// before repair completion, strip the dead copy and re-queue it for fresh repair.
+    fn reconcile_completed_disk_repairs(&mut self) {
+        let mut completed = Vec::new();
+        let mut stale_landed = Vec::new();
+        for (&id, kind) in &self.pending_disk_upgrades {
+            if kind.is_in_place() {
+                continue;
+            }
+            let Some(entry) = self.store.get(id) else {
+                continue;
+            };
+            let Some(copy) = entry.disk().copied() else {
+                continue;
+            };
+            if !copy.landed || copy.chain_owed {
+                continue;
+            }
+            if self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.entry_disk_restorable(entry))
+            {
+                completed.push(id);
+            } else {
+                stale_landed.push((id, copy.key));
+            }
+        }
+        for id in completed {
+            self.pending_disk_upgrades.remove(&id);
+            self.recent_failed_upgrades.remove(&id);
+            self.spill_backoff.remove(&id);
+        }
+        for (id, key) in stale_landed {
+            if let Some(disk) = self.disk.as_ref() {
+                disk.tier.manager.remove(&key);
+            }
+            self.store.set_disk(id, None);
+            if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+                self.enqueue_write_behind_if_missing(id);
+            }
+        }
+    }
+
+    fn prune_entry_tracking(&mut self) {
+        self.entries_missing_draft_window
+            .retain(|id| self.store.get(*id).is_some());
+        self.adopted_unverified_window
+            .retain(|id| self.store.get(*id).is_some());
+        // Retain pending upgrades/repairs while their RAM anchor is alive. If an `InPlace`
+        // upgrade lost its old SSD blob (e.g. via LRU eviction), transition it to `Repair`
+        // instead of dropping upgrade tracking.
+        let mut evicted_in_place = Vec::new();
+        self.pending_disk_upgrades.retain(|&id, kind| {
+            let Some(entry) = self.store.get(id) else {
+                return false;
+            };
+            if entry.ram().is_none() {
+                return false;
+            }
+            if kind.is_in_place() && entry.disk().is_none() {
+                *kind = PendingDiskUpgrade::Repair {
+                    retry_after: Instant::now(),
+                };
+                evicted_in_place.push(id);
+            }
+            true
+        });
+        for id in evicted_in_place {
+            self.enqueue_write_behind_if_missing(id);
+        }
+        self.recent_failed_upgrades
+            .retain(|id| self.store.get(*id).is_some());
+        self.recent_failed_spills
+            .retain(|id| self.store.get(*id).is_some());
+        self.spill_backoff
+            .retain(|id, _| self.store.get(*id).is_some_and(|e| e.ram().is_some()));
+        self.demote_ram_on_durable
+            .retain(|id| self.store.get(*id).is_some_and(|e| e.ram().is_some()));
+    }
+
+    /// Snapshot ordinary RAM-backed entries whose landed SSD blob still owes its Global KV chain
+    /// (excluding pending/in-flight upgrades) before polling or ticking `StateDiskEngine`, so an
+    /// eviction of that `chain_owed` state blob via `ColdCacheManager::take_evicted` is reconciled
+    /// identically to a chain-step failure.
+    fn ordinary_chain_owed_ids(&self) -> Vec<EntryId> {
+        self.store
+            .entries()
+            .filter(|entry| {
+                let id = entry.id();
+                !entry.checkpoint()
+                    && entry.ram().is_some()
+                    && entry.disk().is_some_and(|c| c.chain_owed)
+                    && !self.pending_disk_upgrades.contains_key(&id)
+                    && self
+                        .in_flight_disk_upgrade
+                        .as_ref()
+                        .is_none_or(|u| u.id != id)
+            })
+            .map(Entry::id)
+            .collect()
+    }
+
+    /// Whether every block of `id`'s Global KV chain is still available in either hot GPU RAM
+    /// or SSD (the exact condition under which retrying an invalidated spill can succeed).
+    fn chain_recoverable(&self, coordinator: &Inkling2KVCacheCoordinator, id: EntryId) -> bool {
+        let Some(entry) = self.store.get(id) else {
+            return false;
+        };
+        if entry.chain().is_empty() {
+            return false;
+        }
+        let full = coordinator.full_adapter();
+        let disk = self.disk.as_ref();
+        let kv_keys = disk.map(|d| d.engine.kv_chain_keys(entry));
+        entry.chain().iter().enumerate().all(|(idx, &hash)| {
+            full.prefix_cached(hash)
+                || disk.zip(kv_keys.as_ref()).is_some_and(|(d, keys)| {
+                    keys.get(idx)
+                        .is_some_and(|key| d.tier.manager.contains_in(key, ColdGroup::Kv))
+                })
+        })
+    }
+
+    /// Reconcile an in-flight ordinary, repair, or upgrade spill after `StateDiskEngine::poll_offload`,
+    /// `chain_step`, or `tick` (called BEFORE `reconcile_in_flight_disk_upgrade`, which may restore
+    /// `old_copy`):
+    /// - If `pending_before` landed cleanly, clear any `spill_backoff` for it.
+    /// - For every entry whose state write or Global KV chain failed or was invalidated (including
+    ///   `gone` / `lost` invalidations with `offload_failures == 0` and evicted `chain_owed` state
+    ///   blobs), record `spill_backoff`, update any pending `Repair` tracking (or re-queue
+    ///   recoverable ordinary RAM entries onto `write_behind` and record them in
+    ///   `recent_failed_spills`), and return all failed IDs so `trim_ram_to_cap_inner` skips them.
+    fn reconcile_spill_outcome(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        pending_before: Option<EntryId>,
+        chain_before: Option<EntryId>,
+        state_failed_id: Option<EntryId>,
+        chain_failed_ids: &[Option<EntryId>],
+        ordinary_owed_before: &[EntryId],
+    ) -> Vec<EntryId> {
+        let mut failed_ids = Vec::new();
+        let retry = upgrade_retry_after();
+        let mut record_failure = |this: &mut Self, id: EntryId| {
+            if failed_ids.contains(&id) {
+                return;
+            }
+            failed_ids.push(id);
+            if this.store.get(id).is_some() {
+                this.spill_backoff.insert(id, retry);
+            }
+            if matches!(
+                this.pending_disk_upgrades.get(&id),
+                Some(PendingDiskUpgrade::Repair { .. })
+            ) {
+                this.mark_repair_failed(id, retry);
+            } else if !this.pending_disk_upgrades.contains_key(&id)
+                && this
+                    .in_flight_disk_upgrade
+                    .as_ref()
+                    .is_none_or(|u| u.id != id)
+                && let Some(entry) = this.store.get(id)
+                && !entry.checkpoint()
+                && entry.ram().is_some()
+                && entry.disk().is_none()
+            {
+                let requeue = entry.depth() >= write_behind_min_tokens()
+                    && this
+                        .disk
+                        .as_ref()
+                        .is_some_and(|d| d.writable() && d.entry_fits_tier_limit(entry))
+                    && this.chain_recoverable(coordinator, id);
+                if requeue {
+                    let delay = Duration::from_secs_f64(write_behind_delay_secs().max(0.0));
+                    let published_at = Instant::now()
+                        .checked_sub(delay)
+                        .unwrap_or_else(Instant::now);
+                    this.enqueue_write_behind_entry_if_missing(WriteBehindEntry {
+                        id,
+                        published_at,
+                    });
+                }
+                this.recent_failed_spills.insert(id);
+            }
+        };
+
+        if let Some(pid) = pending_before {
+            let still_pending = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == pid));
+            if !still_pending {
+                let landed_cleanly = self
+                    .store
+                    .get(pid)
+                    .is_some_and(|e| e.disk().is_some_and(|c| c.landed));
+                if landed_cleanly {
+                    self.spill_backoff.remove(&pid);
+                } else {
+                    record_failure(self, pid);
+                }
+            }
+        }
+        if let Some(sid) = state_failed_id {
+            record_failure(self, sid);
+        }
+        for cid in chain_failed_ids.iter().copied().flatten() {
+            record_failure(self, cid);
+        }
+        if let Some(cid) = chain_before {
+            let still_chaining = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.chain.as_ref().is_some_and(|c| c.id == cid));
+            if !still_chaining && self.store.get(cid).is_some_and(|e| e.disk().is_none()) {
+                record_failure(self, cid);
+            }
+        }
+        for &oid in ordinary_owed_before {
+            if self
+                .store
+                .get(oid)
+                .is_some_and(|e| e.ram().is_some() && e.disk().is_none())
+            {
+                record_failure(self, oid);
+            }
+        }
+        failed_ids
+    }
+
+    /// Reconcile `in_flight_disk_upgrade` after `StateDiskEngine::poll_offload` or `tick`:
+    /// - If the replacement write landed and its Global KV chain is restorable, drop `old_copy`.
+    /// - If the replacement write landed with `chain_owed == true` (or missing KV blocks),
+    ///   transition to `PendingDiskUpgrade::Repair` until the chain completes too.
+    /// - If the replacement write failed while the old SSD blob is still intact on disk,
+    ///   restore `old_copy` onto `self.store` immediately so no durable SSD hit is lost,
+    ///   re-queue the upgrade with backoff, and return `Some(id)`.
+    /// - If the replacement write failed AND the old SSD blob was also evicted, transition to
+    ///   `PendingDiskUpgrade::Repair` with backoff and return `Some(id)`.
+    fn reconcile_in_flight_disk_upgrade(&mut self) -> Option<EntryId> {
+        let id = self.in_flight_disk_upgrade.as_ref()?.id;
+        let still_pending = self
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == id));
+        if still_pending {
+            return None;
+        }
+        let InFlightDiskUpgrade {
+            id,
+            mut old_copy,
+            _fallback_hold,
+        } = self.in_flight_disk_upgrade.take()?;
+        if let Some(disk) = self.disk.as_mut()
+            && disk.preserve_entry_on_state_failure == Some(id)
+        {
+            disk.preserve_entry_on_state_failure = None;
+        }
+        if let Some(entry) = self.store.get(id)
+            && let Some(copy) = entry.disk()
+            && copy.landed
+        {
+            self.recent_failed_upgrades.remove(&id);
+            let restorable = !copy.chain_owed
+                && self
+                    .disk
+                    .as_ref()
+                    .is_some_and(|d| d.entry_disk_restorable(entry));
+            if !restorable && entry.ram().is_some() {
+                self.pending_disk_upgrades.insert(
+                    id,
+                    PendingDiskUpgrade::Repair {
+                        retry_after: Instant::now(),
+                    },
+                );
+            }
+            return None;
+        }
+        let old_still_on_disk = self.disk.as_ref().is_some_and(|d| {
+            d.tier
+                .manager
+                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+        });
+        if old_still_on_disk && let Some(entry) = self.store.get(id) {
+            if let Some(disk) = self.disk.as_ref() {
+                old_copy.chain_owed = !disk.engine.chain_on_disk(entry);
+            }
+            let has_ram = entry.ram().is_some();
+            self.store.set_disk(id, Some(old_copy));
+            if has_ram {
+                self.pending_disk_upgrades.insert(
+                    id,
+                    PendingDiskUpgrade::InPlace {
+                        retry_after: upgrade_retry_after(),
+                    },
+                );
+                self.recent_failed_upgrades.insert(id);
+                self.enqueue_write_behind_if_missing(id);
+            } else if self
+                .resolve_geometry()
+                .is_some_and(|g| g.draft_window_span_bytes > 0)
+            {
+                self.entries_missing_draft_window.insert(id);
+            }
+            return Some(id);
+        }
+        if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+            self.mark_repair_failed(id, upgrade_retry_after());
+            return Some(id);
+        }
+        // Neither RAM nor the fallback SSD copy survived: remove the now-empty entry cleanly.
+        if self.store.get(id).is_some_and(|e| e.disk().is_none()) {
+            self.clear_window_tracking(id);
+            self.clear_upgrade_tracking(id);
+            self.store.remove(id);
+            self.sync_host_budget();
+            return Some(id);
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn set_in_flight_upgrade_for_test(&mut self, id: EntryId, old_copy: DiskCopy) {
+        let disk = self
+            .disk
+            .as_ref()
+            .expect("set_in_flight_upgrade_for_test requires attached disk");
+        let entry = self
+            .store
+            .get(id)
+            .expect("set_in_flight_upgrade_for_test requires existing entry");
+        let mut keys = disk.engine.kv_chain_keys(entry);
+        keys.push(old_copy.key);
+        let fallback_hold = disk.tier.manager.hold_keys(keys);
+        self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
+            id,
+            old_copy,
+            _fallback_hold: fallback_hold,
+        });
+    }
+
+    pub(crate) fn set_ram_cap(&mut self, cap: usize) {
+        self.ram_cap = cap;
+    }
+
+    pub(crate) fn set_geometry(&mut self, geom: Inkling2StateGeometry) {
+        self.geometry = Some(geom);
+    }
+
+    pub(crate) fn resolve_geometry(&self) -> Option<&Inkling2StateGeometry> {
+        self.geometry
+            .as_ref()
+            .or_else(|| self.disk.as_ref().map(|d| &d.codec.geometry))
+    }
+
+    /// Number of entries currently holding a host-RAM anchor copy.
+    pub(crate) fn ram_len(&self) -> usize {
+        self.store
+            .entries()
+            .filter(|entry| entry.ram().is_some())
+            .count()
+    }
+
+    /// Enforce [`Self::ram_cap`] by retiring checkpoints, dropping RAM on landed SSD copies,
+    /// spilling unlanded ordinary entries to SSD, or removing LRU ordinary entries as a last
+    /// resort. Never touches `protect`, entries whose block is `in_use`, or an in-flight SSD
+    /// state write (`disk.pending`).
+    pub(crate) fn trim_ram_to_cap(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        protect: Option<EntryId>,
+    ) {
+        self.trim_ram_to_cap_inner(coordinator, protect, &[]);
+    }
+
+    fn trim_ram_to_cap_inner(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        protect: Option<EntryId>,
+        skip_stage: &[EntryId],
+    ) {
+        let mut changed = false;
+        while self.ram_len() > self.ram_cap {
+            let pending_id = self
+                .disk
+                .as_ref()
+                .and_then(|d| d.pending.as_ref().map(|p| p.id));
+
+            // Priority 1: oldest Checkpoint with RAM copy -> retire completely.
+            let cp_victim = self
+                .store
+                .entries()
+                .filter(|entry| {
+                    entry.checkpoint()
+                        && entry.ram().is_some()
+                        && Some(entry.id()) != protect
+                        && !self.store.in_use(entry.mark())
+                        && pending_id != Some(entry.id())
+                })
+                .min_by_key(|entry| (entry.last_used(), entry.id()))
+                .map(Entry::id);
+            if let Some(id) = cp_victim {
+                self.seq_checkpoints.retain(|_, v| *v != id);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind.retain(|w| w.id != id);
+                }
+                self.retire_entry(id);
+                changed = true;
+                continue;
+            }
+
+            // Priority 2: LRU Ordinary with RAM copy AND a fully SSD-restorable copy
+            // (BOTH state blob landed AND complete Global KV chain on disk — never drop RAM
+            // while `chain_owed` is true or while an upgraded RAM window is awaiting SSD write!).
+            let landed_victim = self
+                .store
+                .entries()
+                .filter(|entry| {
+                    !entry.checkpoint()
+                        && entry.ram().is_some()
+                        && entry.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                        && !self.pending_disk_upgrades.contains_key(&entry.id())
+                        && self
+                            .in_flight_disk_upgrade
+                            .as_ref()
+                            .is_none_or(|u| u.id != entry.id())
+                        && self
+                            .disk
+                            .as_ref()
+                            .is_some_and(|d| d.entry_disk_restorable(entry))
+                        && Some(entry.id()) != protect
+                        && !self.store.in_use(entry.mark())
+                        && pending_id != Some(entry.id())
+                })
+                .min_by_key(|entry| (entry.last_used(), entry.id()))
+                .map(Entry::id);
+            if let Some(id) = landed_victim {
+                self.demote_ram_on_durable.remove(&id);
+                self.store.drop_ram(id);
+                changed = true;
+                continue;
+            }
+
+            // Priority 3: if disk is writable, not writing, and no restore is waiting on the
+            // staging buffer, stage LRU Ordinary with no disk copy (or an eligible pending SSD
+            // upgrade past its backoff window) while keeping RAM warm (`keep_ram = true`) until
+            // both state blob and Global KV chain have landed on SSD.
+            let (disk_writable, disk_writing, has_read_waiters) =
+                self.disk.as_ref().map_or((false, false, false), |d| {
+                    (d.writable(), d.writing(), d.has_read_waiters())
+                });
+            if disk_writable && !disk_writing && !has_read_waiters {
+                let now = Instant::now();
+                let spill_victim = self
+                    .store
+                    .entries()
+                    .filter(|entry| {
+                        let id = entry.id();
+                        let backed_off = skip_stage.contains(&id)
+                            || self
+                                .spill_backoff
+                                .get(&id)
+                                .is_some_and(|&retry_after| now < retry_after)
+                            || self
+                                .pending_disk_upgrades
+                                .get(&id)
+                                .is_some_and(|pending| now < pending.retry_after());
+                        let needs_stage = match self.pending_disk_upgrades.get(&id) {
+                            Some(PendingDiskUpgrade::InPlace { .. }) => true,
+                            Some(PendingDiskUpgrade::Repair { .. }) | None => {
+                                entry.disk().is_none()
+                            }
+                        };
+                        !entry.checkpoint()
+                            && entry.ram().is_some()
+                            && !backed_off
+                            && needs_stage
+                            && Some(id) != protect
+                            && !self.store.in_use(entry.mark())
+                            && pending_id != Some(id)
+                    })
+                    .min_by_key(|entry| (entry.last_used(), entry.id()))
+                    .map(Entry::id);
+                if let Some(id) = spill_victim
+                    && self.stage_entry(coordinator, id, MakeRoom::Evict, true)
+                {
+                    changed = true;
+                    continue;
+                }
+            }
+
+            // Priority 4: still above cap — without a writable disk, enforce `ram_cap` strictly;
+            // with a writable disk, allow a bounded in-flight slack (`ram_cap + 2`) while blob and
+            // KV chain writes finish, and only erase LRU eligible Ordinary entries past that
+            // ceiling so a stalled/failing SSD cannot grow RAM without bound.
+            if disk_writable && self.ram_len() <= self.ram_cap.saturating_add(2) {
+                break;
+            }
+            let erase_victim = self
+                .store
+                .entries()
+                .filter(|entry| {
+                    !entry.checkpoint()
+                        && entry.ram().is_some()
+                        && Some(entry.id()) != protect
+                        && !self.store.in_use(entry.mark())
+                        && pending_id != Some(entry.id())
+                })
+                .min_by_key(|entry| (entry.last_used(), entry.id()))
+                .map(Entry::id);
+            let Some(id) = erase_victim else {
+                break;
+            };
+            // If `id` has a pending in-place disk upgrade whose previous SSD copy is still durable
+            // and restorable, fall back cleanly to that old SSD copy by dropping only RAM.
+            let keep_durable_old_ssd = self
+                .pending_disk_upgrades
+                .get(&id)
+                .is_some_and(PendingDiskUpgrade::is_in_place)
+                && self.disk.as_ref().is_some_and(|d| {
+                    self.store.get(id).is_some_and(|e| {
+                        e.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                            && d.entry_disk_restorable(e)
+                    })
+                });
+            if keep_durable_old_ssd {
+                self.pending_disk_upgrades.remove(&id);
+                self.recent_failed_upgrades.remove(&id);
+                self.demote_ram_on_durable.remove(&id);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind.retain(|w| w.id != id);
+                }
+                if self
+                    .resolve_geometry()
+                    .is_some_and(|g| g.draft_window_span_bytes > 0)
+                {
+                    self.entries_missing_draft_window.insert(id);
+                }
+                self.store.drop_ram(id);
+                changed = true;
+                continue;
+            }
+            if let Some(disk) = self.disk.as_mut() {
+                if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                    disk.chain = None;
+                }
+                disk.write_behind.retain(|w| w.id != id);
+            }
+            self.clear_window_tracking(id);
+            self.clear_upgrade_tracking(id);
+            self.store.remove(id);
+            changed = true;
+        }
+        if changed {
+            self.sync_marks(coordinator);
+            self.sync_host_budget();
         }
     }
 
     pub(crate) fn clear_ram_and_checkpoints(&mut self) {
         self.seq_checkpoints.clear();
+        self.entries_missing_draft_window.clear();
+        self.adopted_unverified_window.clear();
+        self.pending_disk_upgrades.clear();
+        self.in_flight_disk_upgrade = None;
+        self.recent_failed_upgrades.clear();
+        self.recent_failed_spills.clear();
+        self.spill_backoff.clear();
+        self.demote_ram_on_durable.clear();
+        if let Some(disk) = self.disk.as_mut() {
+            disk.preserve_entry_on_state_failure = None;
+        }
         let ids: Vec<EntryId> = self.store.entries().map(Entry::id).collect();
         for id in ids {
             self.store.remove(id);
         }
+        self.sync_host_budget();
     }
 
     /// Clear only RAM copies of entries that have a durable disk copy (and remove entries without one).
     #[cfg(test)]
     pub(crate) fn drop_all_ram_keeping_disk(&mut self) {
+        let has_dw_span = self
+            .resolve_geometry()
+            .is_some_and(|g| g.draft_window_span_bytes > 0);
         let ids: Vec<(EntryId, bool)> = self
             .store
             .entries()
@@ -618,11 +2168,29 @@ impl Inkling2StateStore {
             .collect();
         for (id, has_durable_disk) in ids {
             if has_durable_disk {
+                if matches!(
+                    self.pending_disk_upgrades.remove(&id),
+                    Some(PendingDiskUpgrade::InPlace { .. })
+                ) && has_dw_span
+                {
+                    self.entries_missing_draft_window.insert(id);
+                }
                 self.store.drop_ram(id);
             } else {
+                self.clear_window_tracking(id);
+                self.clear_upgrade_tracking(id);
                 self.store.remove(id);
             }
         }
+        self.in_flight_disk_upgrade = None;
+        self.recent_failed_upgrades.clear();
+        self.recent_failed_spills.clear();
+        self.spill_backoff.clear();
+        self.demote_ram_on_durable.clear();
+        if let Some(disk) = self.disk.as_mut() {
+            disk.preserve_entry_on_state_failure = None;
+        }
+        self.sync_host_budget();
     }
 
     pub(crate) fn total_ram_bytes(&self) -> u64 {
@@ -709,8 +2277,10 @@ impl Inkling2StateStore {
         !entry.chain().is_empty() && entry.chain().iter().all(|&h| full.prefix_cached(h))
     }
 
-    /// Capture `(40 SWA trailing blocks + 48 ShortConv states)` at block-aligned `boundary`
-    /// and publish into `HybridStateStore` as `class` (`Ordinary` or `Checkpoint`).
+    /// Capture `(40 SWA trailing blocks + 48 ShortConv states + optional DFlash2 DraftContextWindow)`
+    /// at block-aligned `boundary` and publish into `HybridStateStore` as `class`
+    /// (`Ordinary` or `Checkpoint`).
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn capture_boundary(
         &mut self,
@@ -721,11 +2291,238 @@ impl Inkling2StateStore {
         boundary: u32,
         cache_salt: u64,
         class: StateClass,
+        draft_window: Option<&PackedDraftWindow>,
+    ) -> Result<Option<EntryId>> {
+        self.capture_boundary_inner(
+            coordinator,
+            conv_state,
+            seq_id,
+            tokens,
+            boundary,
+            cache_salt,
+            class,
+            draft_window.map(DraftWindowInput::Packed),
+            None,
+        )
+    }
+
+    /// Capture `(40 SWA trailing blocks + 48 ShortConv states + optional DFlash2 BoundaryDraftWindow)`
+    /// at block-aligned `boundary` and publish into `HybridStateStore` as `class`
+    /// (`Ordinary` or `Checkpoint`), deferring GPU-to-host [`PackedDraftWindow::from_window`]
+    /// serialization until publication actually occurs and checking Governor admission before
+    /// allocating host RAM for new or upgraded anchors.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn capture_boundary_with_window(
+        &mut self,
+        coordinator: &mut Inkling2KVCacheCoordinator,
+        conv_state: &Inkling2ShortConvState,
+        seq_id: SeqId,
+        tokens: &[u32],
+        boundary: u32,
+        cache_salt: u64,
+        class: StateClass,
+        draft_window: Option<&BoundaryDraftWindow>,
+        governor: Option<(&Governor, u64)>,
+    ) -> Result<Option<EntryId>> {
+        self.capture_boundary_inner(
+            coordinator,
+            conv_state,
+            seq_id,
+            tokens,
+            boundary,
+            cache_salt,
+            class,
+            draft_window.map(DraftWindowInput::Boundary),
+            governor,
+        )
+    }
+
+    fn reuse_existing_entry(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        seq_id: SeqId,
+        old_id: EntryId,
+        boundary: u32,
+        effective_class: StateClass,
+    ) -> EntryId {
+        let needs_write_behind = self.store.get(old_id).is_some_and(|existing| {
+            existing.ram().is_some()
+                && (existing.disk().is_none()
+                    || self
+                        .pending_disk_upgrades
+                        .get(&old_id)
+                        .is_some_and(PendingDiskUpgrade::is_in_place))
+        });
+        self.store
+            .reuse(old_id, effective_class == StateClass::Checkpoint);
+        self.demote_ram_on_durable.remove(&old_id);
+        match effective_class {
+            StateClass::Checkpoint => {
+                self.checkpoints_published += 1;
+                self.seq_checkpoints.insert(seq_id, old_id);
+            }
+            StateClass::Ordinary => {
+                self.ordinary_published += 1;
+                self.seq_checkpoints.retain(|_, v| *v != old_id);
+                let wb_eligible = boundary as usize >= write_behind_min_tokens()
+                    || self.pending_disk_upgrades.contains_key(&old_id);
+                if needs_write_behind
+                    && wb_eligible
+                    && let Some(disk) = self.disk.as_mut()
+                    && !disk.write_behind.iter().any(|w| w.id == old_id)
+                {
+                    disk.write_behind.push(WriteBehindEntry {
+                        id: old_id,
+                        published_at: Instant::now(),
+                    });
+                }
+            }
+        }
+        self.sync_marks(coordinator);
+        self.sync_host_budget();
+        self.trim_ram_to_cap(coordinator, Some(old_id));
+        old_id
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn capture_boundary_inner(
+        &mut self,
+        coordinator: &mut Inkling2KVCacheCoordinator,
+        conv_state: &Inkling2ShortConvState,
+        seq_id: SeqId,
+        tokens: &[u32],
+        boundary: u32,
+        cache_salt: u64,
+        class: StateClass,
+        draft_window: Option<DraftWindowInput<'_>>,
+        governor: Option<(&Governor, u64)>,
     ) -> Result<Option<EntryId>> {
         let bs = coordinator.block_size().max(1);
         if boundary == 0 || !boundary.is_multiple_of(bs) || boundary as usize > tokens.len() {
             return Ok(None);
         }
+        let geom = self.resolve_geometry().cloned().ok_or_else(|| {
+            Error::from_reason(
+                "Inkling2StateStore::capture_boundary: state geometry is not initialized",
+            )
+        })?;
+
+        let lineage = Lineage::text(&tokens[..boundary as usize], cache_salt);
+        let (_mark, existing_id) = self.store.locate(lineage);
+
+        // 1. Early reuse fast-path BEFORE any SWA/conv/draft readback, host allocation, or
+        //    Governor reservation: if `lineage` ALREADY holds a reusable anchor and this capture
+        //    cannot upgrade it with a missing draft window, reuse it in place with zero readback.
+        let incoming_matches_dw = draft_window
+            .as_ref()
+            .is_some_and(|w| w.matches_geometry_for(&geom, boundary));
+        if let Some(old_id) = existing_id
+            && let Some(existing) = self.store.get(old_id)
+        {
+            let existing_has_ram = existing.ram().is_some();
+            let existing_disk_durable = existing.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                && self
+                    .disk
+                    .as_ref()
+                    .is_some_and(|d| d.entry_disk_restorable(existing));
+            let existing_missing_dw = geom.draft_window_span_bytes > 0
+                && (existing.ram().is_some_and(|a| a.draft_window.is_none())
+                    || (!existing_has_ram
+                        && (self.entries_missing_draft_window.contains(&old_id)
+                            || self.adopted_unverified_window.contains(&old_id))));
+            let pending_same = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+            let incoming_can_upgrade = existing_missing_dw && incoming_matches_dw && !pending_same;
+            let existing_reusable = existing_has_ram || existing_disk_durable;
+            if existing_reusable && !incoming_can_upgrade {
+                let effective_class = if existing.checkpoint() {
+                    class
+                } else {
+                    StateClass::Ordinary
+                };
+                if !self.chain_is_hot(coordinator, old_id) {
+                    coordinator
+                        .eval_pending_pool_writes_all()
+                        .map_err(Error::from_reason)?;
+                    coordinator
+                        .register_full_committed_blocks(seq_id, boundary, cache_salt)
+                        .map_err(Error::from_reason)?;
+                }
+                if let Some(prev_cp) = self.seq_checkpoints.remove(&seq_id)
+                    && prev_cp != old_id
+                {
+                    self.retire_entry(prev_cp);
+                }
+                return Ok(Some(self.reuse_existing_entry(
+                    coordinator,
+                    seq_id,
+                    old_id,
+                    boundary,
+                    effective_class,
+                )));
+            }
+        }
+
+        // 2. Governor admission BEFORE allocating SWA/ShortConv/draft-window host RAM.
+        let swa_bytes = if coordinator.sliding_adapter().is_some() {
+            geom.live_swa_bytes(boundary).map_err(Error::from_reason)? as u64
+        } else {
+            0
+        };
+        let dw_bytes = draft_window.as_ref().map_or(0, |w| {
+            w.new_host_bytes_for(&geom, boundary, &self.host_budget)
+        });
+        let lineage_bytes = if existing_id.is_none() {
+            crate::disk_tier::store::lineage_bytes(boundary as usize, (boundary / bs) as usize)
+        } else {
+            0
+        };
+        let peak_bytes = swa_bytes
+            .saturating_add(geom.conv_span_bytes)
+            .saturating_add(dw_bytes)
+            .saturating_add(lineage_bytes);
+        let reservation = if let Some((gov, model_id)) = governor
+            && peak_bytes > 0
+        {
+            let parent_spec = gov.scope_claim().and_then(|id| gov.spec(id));
+            let (request_id, rank) = parent_spec.map_or((0, ClaimRank::default()), |spec| {
+                (spec.request_id, spec.rank)
+            });
+            let opt_claim = gov.open(
+                ClaimSpec {
+                    cls: ClaimClass::Optional,
+                    request_id,
+                    rank,
+                    reach: ReachClass::Ordinary,
+                    timing: NeedTiming::Immediate,
+                },
+                model_id,
+            );
+            let res = {
+                let _opt_scope = Scope::enter(opt_claim.claim());
+                gov.try_reserve(peak_bytes)
+            };
+            drop(opt_claim);
+            match res {
+                Ok(reservation) => Some(reservation),
+                Err(failure) => {
+                    gov.publication_refused(model_id);
+                    tracing::debug!(
+                        seq_id,
+                        boundary,
+                        peak_bytes,
+                        ?failure,
+                        "Inkling2StateStore::capture_boundary: governor refused optional checkpoint reservation"
+                    );
+                    return Ok(None);
+                }
+            }
+        } else {
+            None
+        };
+
         // Ensure all Metal pool writes & ShortConv arrays are materialized before readback.
         coordinator
             .eval_pending_pool_writes_all()
@@ -737,47 +2534,332 @@ impl Inkling2StateStore {
             .register_full_committed_blocks(seq_id, boundary, cache_salt)
             .map_err(Error::from_reason)?;
 
-        // Snapshot raw SWA blocks covering `[max(0, boundary - sliding_window) .. boundary)`.
-        let swa_blocks = if coordinator.sliding_adapter().is_some() {
-            coordinator
-                .read_sliding_raw_blocks_for(seq_id, boundary)
-                .map_err(Error::from_reason)?
+        // Snapshot flat raw SWA blocks covering `[max(0, boundary - sliding_window) .. boundary)`.
+        let swa_data: Arc<Vec<u8>> = if coordinator.sliding_adapter().is_some() {
+            let flat = coordinator
+                .read_sliding_raw_blocks_flat_for(seq_id, boundary)
+                .map_err(Error::from_reason)?;
+            Arc::new(flat)
         } else {
-            Vec::new()
+            Arc::new(Vec::new())
         };
-        let swa_bytes: u64 = swa_blocks
-            .iter()
-            .flat_map(|b| b.iter())
-            .map(|(k, v)| (k.len() + v.len()) as u64)
-            .sum();
-        let conv_bytes = conv_state
-            .visits
-            .iter()
-            .map(|v| {
-                (v.k.nbytes() + v.v.nbytes() + v.attn_post.nbytes() + v.mlp_post.nbytes()) as u64
-            })
-            .sum::<u64>();
+        let conv_data = pack_short_conv_state(&geom, conv_state).map_err(Error::from_reason)?;
+        let packed_dw = match draft_window {
+            #[cfg(test)]
+            Some(DraftWindowInput::Packed(dw)) => {
+                if geom.draft_window_span_bytes > 0
+                    && dw.width == geom.draft_window_width
+                    && dw.slots == geom.draft_window_slots
+                    && dw.is_complete_for(boundary)
+                {
+                    Some(dw.clone())
+                } else {
+                    None
+                }
+            }
+            Some(DraftWindowInput::Boundary(dw)) => {
+                #[cfg(test)]
+                let fail_pack = &mut self.fail_next_draft_window_pack;
+                match dw.to_packed_for(&geom, boundary, |win| {
+                    #[cfg(test)]
+                    if std::mem::take(fail_pack) {
+                        return Err(Error::from_reason(
+                            "injected draft-window serialization failure",
+                        ));
+                    }
+                    PackedDraftWindow::from_window(win)
+                }) {
+                    Ok(packed) => packed,
+                    Err(err) => {
+                        tracing::warn!(
+                            seq_id,
+                            boundary,
+                            error = %err,
+                            "Inkling2StateStore::capture_boundary: optional draft-window serialization failed (publishing target checkpoint without draft window)"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let cached_bytes = (swa_data.len() as u64)
+            .saturating_add(conv_data.len() as u64)
+            .saturating_add(packed_dw.as_ref().map_or(0, |d| d.bytes.len() as u64));
         let anchor = Inkling2StateAnchor {
-            swa_blocks,
-            conv_state: conv_state.clone(),
-            cached_bytes: swa_bytes.saturating_add(conv_bytes),
+            swa_data,
+            conv_data,
+            draft_window: packed_dw,
+            cached_bytes,
         };
 
-        // Retire any previous rolling checkpoint for this sequence when publishing a newer point.
-        if let Some(prev_cp) = self.seq_checkpoints.remove(&seq_id) {
+        // Retire any previous rolling checkpoint for this sequence ONLY when advancing to a
+        // different lineage. Recapturing the exact same boundary (e.g. scheduled preemption or
+        // turn-end promotion after a rolling checkpoint) must never discard an already stored
+        // complete checkpoint before checking whether it can be reused or upgraded in place.
+        if let Some(prev_cp) = self.seq_checkpoints.remove(&seq_id)
+            && Some(prev_cp) != existing_id
+        {
             self.retire_entry(prev_cp);
         }
 
-        let lineage = Lineage::text(&tokens[..boundary as usize], cache_salt);
-        let inserted = self.store.insert(lineage, anchor, class)?;
+        let mut effective_class = class;
+        if existing_id
+            .and_then(|id| self.store.get(id))
+            .is_some_and(|e| !e.checkpoint())
+        {
+            effective_class = StateClass::Ordinary;
+        }
+        let has_draft_window = anchor.draft_window.is_some();
 
-        match class {
+        // Post-pack fallback: if an entry at `lineage` already holds a complete draft window and
+        // this recapture ended up without one (e.g. `to_packed_for` failed), preserve and reuse
+        // the existing complete entry in place rather than overwriting it.
+        if !has_draft_window
+            && let Some(old_id) = existing_id
+            && let Some(existing) = self.store.get(old_id)
+        {
+            let existing_has_complete_dw = existing.ram().is_some_and(|a| a.draft_window.is_some())
+                || (existing.ram().is_none()
+                    && existing.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                    && self
+                        .disk
+                        .as_ref()
+                        .is_some_and(|d| d.entry_disk_restorable(existing))
+                    && !self.entries_missing_draft_window.contains(&old_id)
+                    && !self.adopted_unverified_window.contains(&old_id));
+            if existing_has_complete_dw {
+                drop(anchor);
+                drop(reservation);
+                return Ok(Some(self.reuse_existing_entry(
+                    coordinator,
+                    seq_id,
+                    old_id,
+                    boundary,
+                    effective_class,
+                )));
+            }
+        }
+
+        // Never let a disk-only `existing_id` (`ram().is_none()`) fall through to
+        // `HybridStateStore::insert`, which discards duplicate `anchor` payloads.
+        if let Some(old_id) = existing_id
+            && self.store.get(old_id).is_some_and(|e| e.ram().is_none())
+        {
+            let pending_same = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+            let old_disk_copy = self.store.get(old_id).and_then(|e| e.disk().copied());
+            let disk_restorable = self.store.get(old_id).is_some_and(|e| {
+                self.disk
+                    .as_ref()
+                    .is_some_and(|d| d.entry_disk_restorable(e))
+            });
+            let was_missing_dw = self.entries_missing_draft_window.contains(&old_id)
+                || self.adopted_unverified_window.contains(&old_id);
+            let wants_in_place_upgrade =
+                !pending_same && disk_restorable && has_draft_window && was_missing_dw;
+            if !wants_in_place_upgrade {
+                let disk_unusable = !pending_same && !disk_restorable;
+                if disk_unusable {
+                    if let Some(disk) = self.disk.as_mut() {
+                        if disk.chain.as_ref().is_some_and(|c| c.id == old_id) {
+                            disk.chain = None;
+                        }
+                        if let Some(copy) = old_disk_copy
+                            && copy.landed
+                        {
+                            let tier = Arc::clone(&disk.tier);
+                            let _ = tier.while_held(|| {
+                                tier.manager.remove(&copy.key);
+                            });
+                        }
+                        disk.write_behind.retain(|w| w.id != old_id);
+                    }
+                    self.store.set_disk(old_id, None);
+                    self.clear_upgrade_tracking(old_id);
+                } else if !pending_same
+                    && disk_restorable
+                    && old_disk_copy.is_some_and(|c| c.landed && c.chain_owed)
+                    && let Some(copy) = self.store.disk_mut(old_id)
+                {
+                    copy.chain_owed = false;
+                }
+                self.store.replace_ram(old_id, anchor);
+                if let Some(dw) = self
+                    .store
+                    .get(old_id)
+                    .and_then(Entry::ram)
+                    .and_then(|a| a.draft_window.as_ref())
+                {
+                    dw.attach_to(&self.host_budget);
+                }
+                self.store
+                    .reuse(old_id, effective_class == StateClass::Checkpoint);
+                self.demote_ram_on_durable.remove(&old_id);
+                self.spill_backoff.remove(&old_id);
+                self.recent_failed_upgrades.remove(&old_id);
+                self.recent_failed_spills.remove(&old_id);
+                if geom.draft_window_span_bytes > 0 {
+                    if has_draft_window {
+                        self.clear_window_tracking(old_id);
+                    } else {
+                        self.adopted_unverified_window.remove(&old_id);
+                        self.entries_missing_draft_window.insert(old_id);
+                    }
+                }
+                if effective_class == StateClass::Checkpoint {
+                    self.checkpoints_published += 1;
+                    self.seq_checkpoints.insert(seq_id, old_id);
+                } else {
+                    self.ordinary_published += 1;
+                    self.seq_checkpoints.retain(|_, v| *v != old_id);
+                    if self.disk.as_ref().is_some_and(|d| d.writable()) {
+                        let upgrade = if disk_unusable && old_disk_copy.is_some() {
+                            Some(PendingDiskUpgrade::Repair {
+                                retry_after: Instant::now(),
+                            })
+                        } else if pending_same && has_draft_window && was_missing_dw {
+                            Some(PendingDiskUpgrade::InPlace {
+                                retry_after: Instant::now(),
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(kind) = upgrade {
+                            self.pending_disk_upgrades.insert(old_id, kind);
+                            self.enqueue_write_behind_if_missing(old_id);
+                        } else if disk_unusable && boundary as usize >= write_behind_min_tokens() {
+                            self.enqueue_write_behind_if_missing(old_id);
+                        }
+                    }
+                }
+                self.sync_marks(coordinator);
+                self.sync_host_budget();
+                drop(reservation);
+                self.trim_ram_to_cap(coordinator, Some(old_id));
+                return Ok(Some(old_id));
+            }
+        }
+
+        // If an entry ALREADY exists at `lineage` without a draft window (either RAM-resident or
+        // SSD-only/adopted-unverified) and our new capture has one (and is not currently in flight
+        // on SSD), upgrade it without downgrading an Ordinary entry and WITHOUT losing its
+        // durable `DiskCopy` before the upgraded blob atomically replaces it on SSD.
+        if has_draft_window && let Some(old_id) = existing_id {
+            let pending_same = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+            let can_upgrade = !pending_same
+                && self.store.get(old_id).is_some_and(|e| {
+                    e.ram().is_some_and(|a| a.draft_window.is_none())
+                        || (e.ram().is_none()
+                            && (self.entries_missing_draft_window.contains(&old_id)
+                                || self.adopted_unverified_window.contains(&old_id)))
+                });
+            if can_upgrade {
+                let old_disk_copy = self.store.get(old_id).and_then(|e| e.disk().copied());
+                if old_disk_copy.is_some() {
+                    // Preserve `old_id` and its existing `DiskCopy` in-place! Atomically
+                    // replace its RAM anchor (updating `cached_bytes`), preserve/upgrade
+                    // `Ordinary` class and recency, record the pending disk upgrade, and
+                    // queue SSD write-behind.
+                    self.store.replace_ram(old_id, anchor);
+                    if let Some(dw) = self
+                        .store
+                        .get(old_id)
+                        .and_then(Entry::ram)
+                        .and_then(|a| a.draft_window.as_ref())
+                    {
+                        dw.attach_to(&self.host_budget);
+                    }
+                    self.store
+                        .reuse(old_id, effective_class == StateClass::Checkpoint);
+                    self.clear_window_tracking(old_id);
+                    self.demote_ram_on_durable.remove(&old_id);
+                    self.pending_disk_upgrades.insert(
+                        old_id,
+                        PendingDiskUpgrade::InPlace {
+                            retry_after: Instant::now(),
+                        },
+                    );
+                    self.recent_failed_upgrades.remove(&old_id);
+                    match effective_class {
+                        StateClass::Checkpoint => {
+                            self.checkpoints_published += 1;
+                            self.seq_checkpoints.insert(seq_id, old_id);
+                        }
+                        StateClass::Ordinary => {
+                            self.ordinary_published += 1;
+                            self.seq_checkpoints.retain(|_, v| *v != old_id);
+                            if let Some(disk) = self.disk.as_mut()
+                                && !disk.write_behind.iter().any(|w| w.id == old_id)
+                            {
+                                disk.write_behind.push(WriteBehindEntry {
+                                    id: old_id,
+                                    published_at: Instant::now(),
+                                });
+                            }
+                        }
+                    }
+                    self.sync_marks(coordinator);
+                    self.sync_host_budget();
+                    drop(reservation);
+                    self.trim_ram_to_cap(coordinator, Some(old_id));
+                    return Ok(Some(old_id));
+                }
+                // RAM-only entry (`disk().is_none()`): safe to replace directly in RAM.
+                self.seq_checkpoints.retain(|_, v| *v != old_id);
+                if let Some(disk) = self.disk.as_mut() {
+                    if disk.chain.as_ref().is_some_and(|c| c.id == old_id) {
+                        disk.chain = None;
+                    }
+                    disk.write_behind.retain(|w| w.id != old_id);
+                }
+                self.clear_window_tracking(old_id);
+                self.clear_upgrade_tracking(old_id);
+                self.store.remove(old_id);
+            }
+        }
+
+        let inserted = self.store.insert(lineage, anchor, effective_class)?;
+        if let Some(dw) = self
+            .store
+            .get(inserted.id)
+            .and_then(Entry::ram)
+            .and_then(|a| a.draft_window.as_ref())
+        {
+            dw.attach_to(&self.host_budget);
+        }
+        self.demote_ram_on_durable.remove(&inserted.id);
+        if geom.draft_window_span_bytes > 0 {
+            if inserted.new {
+                if has_draft_window {
+                    self.clear_window_tracking(inserted.id);
+                } else {
+                    self.adopted_unverified_window.remove(&inserted.id);
+                    self.entries_missing_draft_window.insert(inserted.id);
+                }
+            } else if self
+                .store
+                .get(inserted.id)
+                .and_then(Entry::ram)
+                .is_some_and(|a| a.draft_window.is_some())
+            {
+                self.clear_window_tracking(inserted.id);
+            }
+        }
+
+        match effective_class {
             StateClass::Checkpoint => {
                 self.checkpoints_published += 1;
                 self.seq_checkpoints.insert(seq_id, inserted.id);
             }
             StateClass::Ordinary => {
                 self.ordinary_published += 1;
+                self.seq_checkpoints.retain(|_, v| *v != inserted.id);
                 if let Some(disk) = self.disk.as_mut()
                     && boundary as usize >= write_behind_min_tokens()
                     && !disk.write_behind.iter().any(|w| w.id == inserted.id)
@@ -790,6 +2872,9 @@ impl Inkling2StateStore {
             }
         }
         self.sync_marks(coordinator);
+        self.sync_host_budget();
+        drop(reservation);
+        self.trim_ram_to_cap(coordinator, Some(inserted.id));
         Ok(Some(inserted.id))
     }
 
@@ -820,7 +2905,10 @@ impl Inkling2StateStore {
                 });
             }
         }
+        self.clear_window_tracking(id);
+        self.clear_upgrade_tracking(id);
         self.store.remove(id);
+        self.sync_host_budget();
     }
 
     /// Stage `id`'s RAM anchor into the reusable host buffer and enqueue its SSD write.
@@ -831,57 +2919,538 @@ impl Inkling2StateStore {
         room: MakeRoom,
         keep_ram: bool,
     ) -> bool {
-        let Some(disk) = self.disk.as_mut() else {
+        let Some(entry) = self.store.get(id) else {
             return false;
         };
-        if !disk.writable() || disk.writing() {
+        let pending_kind = self.pending_disk_upgrades.get(&id).copied();
+        let upgrade_old_copy = match pending_kind {
+            Some(PendingDiskUpgrade::InPlace { .. }) => entry.disk().copied(),
+            Some(PendingDiskUpgrade::Repair { .. }) | None => None,
+        };
+        let (writable, writing) = match self.disk.as_ref() {
+            Some(disk) => (disk.writable(), disk.writing()),
+            None => return false,
+        };
+        if !writable || writing {
             return false;
+        }
+        // Acquire a `ColdKeyHold` pinning `old_copy.key` and its entire Global KV chain BEFORE
+        // checking presence so a competing writer job cannot evict the SSD fallback after our
+        // pre-check passes. The hold is dropped automatically on any early return / refusal and
+        // moved into `in_flight_disk_upgrade` once `stage` starts.
+        let mut upgrade_in_place: Option<(DiskCopy, ColdKeyHold)> = None;
+        let mut stale_upgrade_copy: Option<DiskCopy> = None;
+        if let Some(old_copy) = upgrade_old_copy
+            && old_copy.landed
+            && let Some(disk) = self.disk.as_ref()
+        {
+            let mut hold_keys = disk.engine.kv_chain_keys(entry);
+            hold_keys.push(old_copy.key);
+            let hold = disk.tier.manager.hold_keys(hold_keys);
+            let intact = disk
+                .tier
+                .manager
+                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+                && disk.engine.chain_on_disk(entry);
+            if intact {
+                upgrade_in_place = Some((old_copy, hold));
+            } else {
+                drop(hold);
+                stale_upgrade_copy = Some(old_copy);
+            }
+        }
+        let mut transitioned_to_repair = false;
+        if matches!(pending_kind, Some(PendingDiskUpgrade::InPlace { .. }))
+            && upgrade_old_copy.is_none()
+        {
+            self.pending_disk_upgrades.insert(
+                id,
+                PendingDiskUpgrade::Repair {
+                    retry_after: Instant::now(),
+                },
+            );
+            transitioned_to_repair = true;
+        }
+        if let Some(old_copy) = stale_upgrade_copy {
+            // The old SSD blob's Global KV chain (or blob itself) was already evicted from SSD,
+            // so the old SSD copy is no longer restorable. Remove the dead old SSD blob, transition
+            // upgrade tracking to `Repair` (never drop it!), and fall through to the normal
+            // fresh-write path (`chain_owed = true`) so both the upgraded blob AND its missing
+            // Global KV chain are repaired before the upgrade is marked complete.
+            if let Some(disk) = self.disk.as_mut() {
+                if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                    disk.chain = None;
+                }
+                disk.tier.manager.remove(&old_copy.key);
+            }
+            self.store.set_disk(id, None);
+            self.pending_disk_upgrades.insert(
+                id,
+                PendingDiskUpgrade::Repair {
+                    retry_after: Instant::now(),
+                },
+            );
+            self.recent_failed_upgrades.remove(&id);
+            transitioned_to_repair = true;
         }
         let Some(entry) = self.store.get(id) else {
             return false;
         };
-        if entry.disk().is_some() || !disk.point_fits(entry, room) {
+        let can_stage = self.disk.as_ref().is_some_and(|disk| {
+            if let Some((old_copy, _)) = upgrade_in_place.as_ref() {
+                // An in-place upgrade of an already-landed state blob whose KV chain is already
+                // on disk only charges the net delta `(new_state - old_copy.bytes)` against the
+                // logical quota, so it fits whenever the post-overwrite total stays within
+                // `tier.limit` and the volume has `new_state` bytes free above reserve for the
+                // replacement `.tmp` file. Never fall back to `point_fits(entry, room)`: under
+                // `MakeRoom::Evict`, `point_fits` can return `true` when `free < new_state` and
+                // cause `ColdCacheManager::persist_with` to evict live KV blocks (including this
+                // anchor's own Global KV chain) while chasing volume headroom.
+                old_copy.landed
+                    && disk.engine.chain_on_disk(entry)
+                    && disk
+                        .engine
+                        .layout(entry.depth())
+                        .and_then(|layout| {
+                            let new_state = mlx_paged_attn::state_object_bytes(
+                                &layout,
+                                &crate::disk_tier::state_disk::label_of(entry),
+                            );
+                            let free = disk.tier.manager.room_above_reserve()?;
+                            let taken = disk.tier.manager.total_bytes();
+                            let projected = taken
+                                .saturating_sub(old_copy.bytes)
+                                .saturating_add(new_state);
+                            Some(projected <= disk.tier.limit && new_state <= free)
+                        })
+                        .unwrap_or(false)
+            } else {
+                entry.disk().is_none() && disk.point_fits(entry, room)
+            }
+        });
+        if !can_stage {
+            if transitioned_to_repair {
+                self.sync_marks(coordinator);
+            }
+            if self.disk.as_ref().is_none_or(|d| !d.writing())
+                && let Some(pending) = self.pending_disk_upgrades.get_mut(&id)
+            {
+                pending.set_retry_after(upgrade_retry_after());
+            }
             return false;
         }
-        match disk.engine.stage(&mut self.store, id, room, keep_ram, ()) {
+        if upgrade_in_place.is_some() {
+            self.store.set_disk(id, None);
+        }
+        let is_pending_upgrade = self.pending_disk_upgrades.contains_key(&id);
+        // Always enqueue in-place SSD upgrades with `MakeRoom::Refuse`: even if volume headroom or
+        // quota changes between this model-thread pre-check and async writer execution, the writer
+        // must NEVER evict any object (including the old blob's Global KV chain) — it cleanly
+        // refuses, rolls back `old_copy`, and preserves the old durable SSD hit.
+        let effective_room = if upgrade_in_place.is_some() {
+            MakeRoom::Refuse
+        } else {
+            room
+        };
+        let effective_keep_ram = keep_ram || is_pending_upgrade;
+        let staged = {
+            let Some(disk) = self.disk.as_mut() else {
+                if let Some((old_copy, _)) = upgrade_in_place {
+                    self.store.set_disk(id, Some(old_copy));
+                }
+                return false;
+            };
+            disk.engine
+                .stage(&mut self.store, id, effective_room, effective_keep_ram, ())
+        };
+        match staged {
             Staged::Started => {
+                self.recent_failed_spills.remove(&id);
+                if let Some((old_copy, fallback_hold)) = upgrade_in_place {
+                    self.pending_disk_upgrades.remove(&id);
+                    self.recent_failed_upgrades.remove(&id);
+                    self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
+                        id,
+                        old_copy,
+                        _fallback_hold: fallback_hold,
+                    });
+                    if let Some(disk) = self.disk.as_mut() {
+                        disk.preserve_entry_on_state_failure = Some(id);
+                    }
+                } else if is_pending_upgrade {
+                    // Keep `PendingDiskUpgrade::Repair` tracked until BOTH the replacement state
+                    // blob AND its complete Global KV chain land!
+                    self.recent_failed_upgrades.remove(&id);
+                }
                 self.sync_marks(coordinator);
+                self.sync_host_budget();
                 true
             }
-            Staged::Busy => false,
+            Staged::Busy => {
+                if let Some((old_copy, _)) = upgrade_in_place {
+                    self.store.set_disk(id, Some(old_copy));
+                } else if transitioned_to_repair {
+                    self.sync_marks(coordinator);
+                }
+                if let Some(pending) = self.pending_disk_upgrades.get_mut(&id) {
+                    pending.set_retry_after(upgrade_retry_after());
+                }
+                false
+            }
             Staged::Refused => {
-                disk.counters.offload_failures += 1;
+                let retry = upgrade_retry_after();
+                if let Some((old_copy, _)) = upgrade_in_place {
+                    self.store.set_disk(id, Some(old_copy));
+                } else if transitioned_to_repair {
+                    self.sync_marks(coordinator);
+                }
+                if let Some(pending) = self.pending_disk_upgrades.get_mut(&id) {
+                    pending.set_retry_after(retry);
+                    self.recent_failed_upgrades.insert(id);
+                } else if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
+                    self.recent_failed_spills.insert(id);
+                }
+                if self.store.get(id).is_some() {
+                    self.spill_backoff.insert(id, retry);
+                }
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.counters.offload_failures += 1;
+                }
                 false
             }
         }
     }
 
-    /// Reclaim RAM for `id` under governor pressure:
-    /// - If it already has a landed disk copy, drop RAM immediately.
-    /// - If SSD is writable and not busy, spill it to SSD (`MakeRoom::Evict`) and drop RAM.
-    /// - If a write is already in flight, return `Pending` so the ledger tries another victim.
-    /// - If no SSD tier or point doesn't fit, remove the entry.
+    fn erase_reclaimed_entry(&mut self, coordinator: &Inkling2KVCacheCoordinator, id: EntryId) {
+        self.seq_checkpoints.retain(|_, v| *v != id);
+        if let Some(disk) = self.disk.as_mut() {
+            if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                disk.chain = None;
+            }
+            disk.write_behind.retain(|w| w.id != id);
+        }
+        self.clear_window_tracking(id);
+        self.clear_upgrade_tracking(id);
+        self.store.remove(id);
+        self.sync_marks(coordinator);
+        self.sync_host_budget();
+    }
+
+    /// Reclaim RAM for `id` under governor pressure (patient default: `allow_wait = true`).
     pub(crate) fn reclaim_entry(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
         id: EntryId,
     ) -> ReclaimOutcome {
-        let Some(disk) = self.disk.as_mut() else {
+        self.reclaim_entry_with_options(coordinator, id, true, false)
+    }
+
+    /// Reclaim RAM for `id` under governor pressure (`need_pages = false` convenience wrapper).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn reclaim_entry_with_wait(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        id: EntryId,
+        allow_wait: bool,
+    ) -> ReclaimOutcome {
+        self.reclaim_entry_with_options(coordinator, id, allow_wait, false)
+    }
+
+    /// Reclaim RAM (and, when `need_pages == true`, Global KV pages) for `id` under governor
+    /// pressure:
+    /// - When `allow_wait == true` (patient claim):
+    ///   - If it has a landed disk copy whose Global KV chain is still owed, return `Pending`
+    ///     without dropping RAM until the chain lands (if the chain fails, RAM stays intact).
+    ///   - If it already has a landed, restorable disk copy, drop RAM immediately.
+    ///   - If SSD is writable and not busy, spill it to SSD (`MakeRoom::Evict`) and drop RAM.
+    ///   - If a write is already in flight, return `Pending` so the ledger tries another victim.
+    ///   - If no SSD tier or point doesn't fit, remove the entry.
+    /// - When `allow_wait == false` (urgent/immediate claim):
+    ///   - If it already has a landed, restorable disk copy (`!chain_owed`), drop RAM immediately.
+    ///   - If an in-place SSD upgrade is in flight (`in_flight_disk_upgrade`) and either
+    ///     `!need_pages` or `!chain_owed`, drop RAM immediately while keeping the entry indexed so
+    ///     the upgrade or fallback `old_copy` survives.
+    ///   - If it has no disk copy yet, SSD can stage immediately without waiting, AND either
+    ///     `!need_pages` or the entry's complete Global KV chain is already on SSD with no chain
+    ///     cursor in flight (so `stage` leaves `chain_owed == false` and immediately unmarks KV
+    ///     pages), spill and drop RAM immediately.
+    ///   - Otherwise (incomplete `chain_owed` SSD copy, fresh RAM anchor whose spill would owe a
+    ///     KV chain under `need_pages`, in-flight write, busy staging buffer, or unfit point),
+    ///     discard any incomplete cache copy and erase `id` immediately to free RAM & KV pages.
+    pub(crate) fn reclaim_entry_with_options(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        id: EntryId,
+        allow_wait: bool,
+        need_pages: bool,
+    ) -> ReclaimOutcome {
+        let has_dw_span = self
+            .resolve_geometry()
+            .is_some_and(|g| g.draft_window_span_bytes > 0);
+        if self.disk.is_none() {
             if let Some(entry) = self.store.get(id)
                 && entry.ram().is_some()
             {
+                self.clear_window_tracking(id);
+                self.clear_upgrade_tracking(id);
                 self.store.remove(id);
                 self.sync_marks(coordinator);
+                self.sync_host_budget();
             }
             return ReclaimOutcome::Erased;
+        }
+
+        if self.retire_unwritable_incomplete_disk_copies() {
+            self.prune_entry_tracking();
+            self.sync_marks(coordinator);
+            self.sync_host_budget();
+        }
+
+        let (disk_writable, has_ram, disk_copy, disk_restorable) =
+            match (self.disk.as_ref(), self.store.get(id)) {
+                (Some(disk), Some(entry)) => (
+                    disk.writable(),
+                    entry.ram().is_some(),
+                    entry.disk().copied(),
+                    disk.entry_disk_restorable(entry),
+                ),
+                _ => (false, false, None, false),
+            };
+
+        if !allow_wait {
+            if !has_ram {
+                return ReclaimOutcome::Erased;
+            }
+            if disk_copy.is_some_and(|c| c.landed && !c.chain_owed) && disk_restorable {
+                if matches!(
+                    self.pending_disk_upgrades.remove(&id),
+                    Some(PendingDiskUpgrade::InPlace { .. })
+                ) && has_dw_span
+                {
+                    self.entries_missing_draft_window.insert(id);
+                }
+                self.recent_failed_upgrades.remove(&id);
+                self.recent_failed_spills.remove(&id);
+                self.spill_backoff.remove(&id);
+                self.demote_ram_on_durable.remove(&id);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind.retain(|w| w.id != id);
+                }
+                self.store.drop_ram(id);
+                self.sync_marks(coordinator);
+                self.sync_host_budget();
+                return ReclaimOutcome::RamDropped;
+            }
+            if let Some(in_flight) = self.in_flight_disk_upgrade.as_ref().filter(|u| u.id == id)
+                && (!need_pages || !disk_copy.is_some_and(|c| c.chain_owed))
+                && self.disk.as_ref().is_some_and(|d| {
+                    d.tier
+                        .manager
+                        .contains_in(&in_flight.old_copy.key, ColdGroup::DFlash2State)
+                        && self
+                            .store
+                            .get(id)
+                            .is_some_and(|e| d.engine.chain_on_disk(e))
+                })
+            {
+                // An in-place upgrade write is in flight over a pinned, already-durable SSD prefix
+                // (`old_copy` + its Global KV chain held by `_fallback_hold`): drop ONLY RAM
+                // immediately while keeping the store entry indexed and `in_flight_disk_upgrade`
+                // intact so `poll_offload` / `tick` keeps the upgraded blob on success or restores
+                // `old_copy` on failure. When `need_pages` is true, this path only runs when
+                // `!chain_owed` so dropping RAM immediately unmarks the entry's Global KV pages too.
+                self.recent_failed_upgrades.remove(&id);
+                self.recent_failed_spills.remove(&id);
+                self.spill_backoff.remove(&id);
+                self.demote_ram_on_durable.remove(&id);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind.retain(|w| w.id != id);
+                }
+                self.store.drop_ram(id);
+                self.sync_marks(coordinator);
+                self.sync_host_budget();
+                return ReclaimOutcome::RamDropped;
+            }
+            let can_immediate_spill = disk_copy.is_none()
+                && self.disk.as_ref().is_some_and(|d| {
+                    !d.writing()
+                        && !d.has_read_waiters()
+                        && d.engine.reclaim_writes(&self.store, id)
+                        && (!need_pages
+                            || (d.chain.is_none()
+                                && self
+                                    .store
+                                    .get(id)
+                                    .is_some_and(|e| d.engine.chain_on_disk(e))))
+                });
+            if can_immediate_spill && let Some(disk) = self.disk.as_mut() {
+                match disk
+                    .engine
+                    .stage(&mut self.store, id, MakeRoom::Evict, false, ())
+                {
+                    Staged::Started => {
+                        disk.write_behind.retain(|w| w.id != id);
+                        self.clear_upgrade_tracking(id);
+                        self.sync_marks(coordinator);
+                        self.sync_host_budget();
+                        return ReclaimOutcome::Spilled;
+                    }
+                    Staged::Busy => {}
+                    Staged::Refused => {
+                        disk.counters.offload_failures += 1;
+                    }
+                }
+            }
+            if let Some(in_flight) = self.in_flight_disk_upgrade.take_if(|u| u.id == id)
+                && in_flight.old_copy.landed
+                && let Some(disk) = self.disk.as_ref()
+            {
+                let tier = Arc::clone(&disk.tier);
+                let key = in_flight.old_copy.key;
+                let _ = tier.while_held(|| {
+                    tier.manager.remove(&key);
+                });
+            }
+            if let Some(disk) = self.disk.as_mut() {
+                if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                    disk.chain = None;
+                }
+                if let Some(copy) = disk_copy
+                    && copy.landed
+                {
+                    let tier = Arc::clone(&disk.tier);
+                    let key = copy.key;
+                    let _ = tier.while_held(|| {
+                        tier.manager.remove(&key);
+                    });
+                }
+                disk.write_behind.retain(|w| w.id != id);
+            }
+            self.clear_window_tracking(id);
+            self.clear_upgrade_tracking(id);
+            self.store.remove(id);
+            self.sync_marks(coordinator);
+            self.sync_host_budget();
+            return ReclaimOutcome::Erased;
+        }
+
+        if has_ram && let Some(copy) = disk_copy {
+            if copy.landed && copy.chain_owed {
+                if disk_writable {
+                    self.demote_ram_on_durable.insert(id);
+                    return ReclaimOutcome::Pending;
+                }
+                if let Some(disk) = self.disk.as_mut() {
+                    if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                        disk.chain = None;
+                    }
+                    disk.tier.manager.remove(&copy.key);
+                }
+                self.store.set_disk(id, None);
+                self.pending_disk_upgrades.remove(&id);
+                self.recent_failed_upgrades.remove(&id);
+            } else if copy.landed && !copy.chain_owed && !disk_restorable {
+                if let Some(disk) = self.disk.as_ref() {
+                    disk.tier.manager.remove(&copy.key);
+                }
+                self.store.set_disk(id, None);
+                if matches!(
+                    self.pending_disk_upgrades.get(&id),
+                    Some(PendingDiskUpgrade::InPlace { .. })
+                ) {
+                    if disk_writable {
+                        self.pending_disk_upgrades.insert(
+                            id,
+                            PendingDiskUpgrade::Repair {
+                                retry_after: Instant::now(),
+                            },
+                        );
+                    } else {
+                        self.pending_disk_upgrades.remove(&id);
+                    }
+                }
+                self.recent_failed_upgrades.remove(&id);
+            }
+        }
+
+        // Under patient reclaim, only return `Pending` when concrete I/O is actually in flight
+        // (an active writer job, parked restore holding the staging buffer, or a newly started
+        // `stage_entry` write). Backed-off entries or refused repairs with `!disk.writing()` must
+        // NOT stall Governor claims waiting on a 10-second backoff timer — erase them immediately.
+        let disk_writing = self.disk.as_ref().is_some_and(|d| d.writing());
+        if has_ram
+            && disk_writable
+            && !disk_writing
+            && self.store.get(id).is_some_and(|e| e.disk().is_none())
+        {
+            let now = Instant::now();
+            let backed_off = self
+                .spill_backoff
+                .get(&id)
+                .is_some_and(|&retry_after| now < retry_after)
+                || self
+                    .pending_disk_upgrades
+                    .get(&id)
+                    .is_some_and(|pending| now < pending.retry_after());
+            if backed_off {
+                self.erase_reclaimed_entry(coordinator, id);
+                return ReclaimOutcome::Erased;
+            }
+            if matches!(
+                self.pending_disk_upgrades.get(&id),
+                Some(PendingDiskUpgrade::Repair { .. })
+            ) {
+                if self.disk.as_ref().is_some_and(|d| d.has_read_waiters()) {
+                    return ReclaimOutcome::Pending;
+                }
+                if self.stage_entry(coordinator, id, MakeRoom::Evict, true) {
+                    self.demote_ram_on_durable.insert(id);
+                    return ReclaimOutcome::Pending;
+                }
+                self.erase_reclaimed_entry(coordinator, id);
+                return ReclaimOutcome::Erased;
+            }
+        }
+
+        let step = {
+            let Some(disk) = self.disk.as_mut() else {
+                return ReclaimOutcome::Erased;
+            };
+            let step = disk.engine.reclaim(&mut self.store, id, ());
+            if step.encode_or_enqueue_failed {
+                disk.counters.offload_failures += 1;
+            }
+            step
         };
-        let step = disk.engine.reclaim(&mut self.store, id, ());
-        if step.encode_or_enqueue_failed {
-            disk.counters.offload_failures += 1;
+        if step.outcome == Reclaimed::RamDropped {
+            self.demote_ram_on_durable.remove(&id);
+            if let Some(removed) = self.pending_disk_upgrades.remove(&id) {
+                self.recent_failed_upgrades.remove(&id);
+                if let Some(disk) = self.disk.as_mut() {
+                    disk.write_behind.retain(|w| w.id != id);
+                }
+                if removed.is_in_place() && has_dw_span {
+                    self.entries_missing_draft_window.insert(id);
+                }
+            }
+        }
+        if step.outcome == Reclaimed::Written {
+            if let Some(disk) = self.disk.as_mut() {
+                disk.write_behind.retain(|w| w.id != id);
+            }
+            self.clear_upgrade_tracking(id);
+        }
+        if self.store.get(id).is_none() {
+            if let Some(disk) = self.disk.as_mut() {
+                disk.write_behind.retain(|w| w.id != id);
+            }
+            self.clear_window_tracking(id);
+            self.clear_upgrade_tracking(id);
         }
         if step.resync {
             self.sync_marks(coordinator);
         }
+        self.sync_host_budget();
         match step.outcome {
             Reclaimed::Written => ReclaimOutcome::Spilled,
             Reclaimed::RamDropped => ReclaimOutcome::RamDropped,
@@ -892,16 +3461,69 @@ impl Inkling2StateStore {
 
     /// Poll completed SSD writes & LRU evictions from `ColdCacheManager`.
     pub(crate) fn poll_offload(&mut self, coordinator: &Inkling2KVCacheCoordinator) -> bool {
-        let Some(disk) = self.disk.as_mut() else {
-            return false;
+        let (pending_before, chain_before) = self.disk.as_ref().map_or((None, None), |d| {
+            (
+                d.pending.as_ref().map(|p| p.id),
+                d.chain.as_ref().map(|c| c.id),
+            )
+        });
+        let repairs_with_disk_before: Vec<EntryId> = self
+            .pending_disk_upgrades
+            .iter()
+            .filter_map(|(&id, kind)| {
+                (!kind.is_in_place() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
+                    .then_some(id)
+            })
+            .collect();
+        let ordinary_owed_before = self.ordinary_chain_owed_ids();
+        let out = {
+            let Some(disk) = self.disk.as_mut() else {
+                return false;
+            };
+            let out = disk.engine.poll_offload(&mut self.store);
+            disk.counters.offloads += out.state_landed_ok;
+            disk.counters.offload_failures += out.offload_failures;
+            out
         };
-        let out = disk.engine.poll_offload(&mut self.store);
-        disk.counters.offloads += out.state_landed_ok;
-        disk.counters.offload_failures += out.offload_failures;
-        let progressed = out.landed || out.resync;
+        let mut failed_ids = self.reconcile_spill_outcome(
+            coordinator,
+            pending_before,
+            chain_before,
+            out.state_failed_id,
+            &[out.chain_failed_id],
+            &ordinary_owed_before,
+        );
+        let failed_upgrade = self.reconcile_in_flight_disk_upgrade();
+        if let Some(uid) = failed_upgrade
+            && !failed_ids.contains(&uid)
+        {
+            failed_ids.push(uid);
+        }
+        self.reconcile_completed_disk_repairs();
+        let retry = upgrade_retry_after();
+        for id in repairs_with_disk_before {
+            if !failed_ids.contains(&id)
+                && matches!(
+                    self.pending_disk_upgrades.get(&id),
+                    Some(PendingDiskUpgrade::Repair { .. })
+                )
+                && self.store.get(id).is_some_and(|e| e.disk().is_none())
+            {
+                self.mark_repair_failed(id, retry);
+                failed_ids.push(id);
+            }
+        }
+        let retired = self.retire_unwritable_incomplete_disk_copies();
+        let demoted = self.demote_requested_ram();
+        let progressed = out.landed || out.resync || failed_upgrade.is_some() || retired || demoted;
         if progressed {
+            self.prune_entry_tracking();
             self.sync_marks(coordinator);
         }
+        if out.landed {
+            self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
+        }
+        self.sync_host_budget();
         progressed
     }
 
@@ -911,26 +3533,66 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         deadline: Instant,
     ) -> bool {
-        let Some(disk) = self.disk.as_mut() else {
-            return false;
-        };
-        if !disk.writable() {
+        if self.disk.as_ref().is_some_and(|d| !d.writable()) {
+            if self.retire_unwritable_incomplete_disk_copies() {
+                self.prune_entry_tracking();
+                self.sync_marks(coordinator);
+                return true;
+            }
             return false;
         }
-        let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
-        let out = disk.engine.chain_step(&mut self.store, &kv, deadline);
-        disk.counters.offload_failures += out.offload_failures;
-        if out.step.failed || out.step.landed_all {
+        let chain_before = self
+            .disk
+            .as_ref()
+            .and_then(|d| d.chain.as_ref().map(|c| c.id));
+        let out = {
+            let Some(disk) = self.disk.as_mut() else {
+                return false;
+            };
+            let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
+            let out = disk.engine.chain_step(&mut self.store, &kv, deadline);
+            disk.counters.offload_failures += out.offload_failures;
+            out
+        };
+        let failed_ids = if out.step.failed {
+            self.reconcile_spill_outcome(
+                coordinator,
+                None,
+                chain_before,
+                None,
+                &[out.failed_id],
+                &[],
+            )
+        } else {
+            Vec::new()
+        };
+        let mut demoted = false;
+        if out.step.landed_all {
+            self.reconcile_completed_disk_repairs();
+            demoted = self.demote_requested_ram();
+        }
+        if out.step.failed || out.step.landed_all || demoted {
+            self.prune_entry_tracking();
             self.sync_marks(coordinator);
         }
-        out.step.enqueued > 0 || out.step.landed_all || out.step.failed
+        if out.step.landed_all {
+            self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
+        }
+        self.sync_host_budget();
+        out.step.enqueued > 0 || out.step.landed_all || out.step.failed || demoted
     }
 
-    /// Drive write-behind for eligible ordinary states whose delay has elapsed.
-    fn drive_write_behind(
+    /// Drive write-behind for eligible ordinary states whose delay has elapsed (and queued SSD
+    /// upgrades/repairs on temporary tiers).
+    ///
+    /// When `skip` is provided (during `flush_to_disk` or after a same-tick failure), entries
+    /// already refused in the current pass are skipped so `flush_to_disk` never tight-spins on a
+    /// blocked upgrade/repair while still keeping it queued in `write_behind` for backoff retries.
+    fn drive_write_behind_inner(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
         force: bool,
+        skip: Option<&mut HashSet<EntryId>>,
     ) -> bool {
         let (writable, writing, persistent, has_waiters) = match self.disk.as_ref() {
             Some(d) => (
@@ -944,36 +3606,110 @@ impl Inkling2StateStore {
         if !writable || writing || (!force && has_waiters) {
             return false;
         }
-        if !persistent && !force {
+        let upgrades_only = !persistent && !force;
+        if upgrades_only && self.pending_disk_upgrades.is_empty() {
             return false;
         }
         let now = Instant::now();
         let delay = Duration::from_secs_f64(write_behind_delay_secs());
         let candidate = {
+            let pending_upgrades = &self.pending_disk_upgrades;
+            let spill_backoff = &self.spill_backoff;
             let Some(disk) = self.disk.as_mut() else {
                 return false;
             };
-            disk.write_behind
-                .retain(|w| self.store.get(w.id).is_some_and(|e| e.disk().is_none()));
+            disk.write_behind.retain(|w| {
+                self.store.get(w.id).is_some_and(|e| {
+                    e.ram().is_some()
+                        && (e.disk().is_none()
+                            || pending_upgrades
+                                .get(&w.id)
+                                .is_some_and(PendingDiskUpgrade::is_in_place))
+                })
+            });
+            let skip_ref = skip.as_deref();
             disk.write_behind
                 .iter()
-                .position(|w| force || now.duration_since(w.published_at) >= delay)
-                .map(|idx| disk.write_behind.remove(idx).id)
+                .position(|w| {
+                    (!upgrades_only || pending_upgrades.contains_key(&w.id))
+                        && (force
+                            || (now.duration_since(w.published_at) >= delay
+                                && spill_backoff
+                                    .get(&w.id)
+                                    .is_none_or(|&retry_after| now >= retry_after)
+                                && pending_upgrades
+                                    .get(&w.id)
+                                    .is_none_or(|pending| now >= pending.retry_after())))
+                        && skip_ref.is_none_or(|s| !s.contains(&w.id))
+                })
+                .map(|idx| disk.write_behind.remove(idx))
         };
-        let Some(id) = candidate else {
+        let Some(wb_entry) = candidate else {
             return false;
         };
+        let id = wb_entry.id;
         let room = if persistent {
             MakeRoom::Evict
         } else {
             MakeRoom::Refuse
         };
-        self.stage_entry(coordinator, id, room, true)
+        // Always keep RAM warm until both the state blob AND its complete Global KV chain
+        // have landed on SSD; `trim_ram_to_cap` drops RAM once `entry_disk_restorable` is true.
+        let staged = self.stage_entry(coordinator, id, room, true);
+        if !staged {
+            if self.pending_disk_upgrades.contains_key(&id) {
+                self.enqueue_write_behind_entry_if_missing(wb_entry);
+                if let Some(s) = skip {
+                    s.insert(id);
+                }
+            } else if let Some(entry) = self.store.get(id)
+                && entry.ram().is_some()
+                && entry.disk().is_none()
+            {
+                let (fits_tier, is_writing) = self.disk.as_ref().map_or((false, false), |d| {
+                    (d.entry_fits_tier_limit(entry), d.writing())
+                });
+                if fits_tier {
+                    if !is_writing {
+                        self.spill_backoff.insert(id, upgrade_retry_after());
+                    }
+                    self.enqueue_write_behind_entry_if_missing(wb_entry);
+                    if let Some(s) = skip {
+                        s.insert(id);
+                    }
+                }
+            }
+        }
+        staged
+    }
+
+    #[cfg(test)]
+    fn drive_write_behind(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        force: bool,
+    ) -> bool {
+        self.drive_write_behind_inner(coordinator, force, None)
     }
 
     /// One tick of the StateDisk tier (called on scheduler drive passes and allocations).
     pub(crate) fn tick(&mut self, coordinator: &Inkling2KVCacheCoordinator, tick: Tick) -> bool {
         let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
+        let (pending_before, chain_before) = self.disk.as_ref().map_or((None, None), |d| {
+            (
+                d.pending.as_ref().map(|p| p.id),
+                d.chain.as_ref().map(|c| c.id),
+            )
+        });
+        let repairs_with_disk_before: Vec<EntryId> = self
+            .pending_disk_upgrades
+            .iter()
+            .filter_map(|(&id, kind)| {
+                (!kind.is_in_place() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
+                    .then_some(id)
+            })
+            .collect();
+        let ordinary_owed_before = self.ordinary_chain_owed_ids();
         let out = {
             let Some(disk) = self.disk.as_mut() else {
                 return false;
@@ -984,14 +3720,52 @@ impl Inkling2StateStore {
             disk.counters.offload_failures += out.offload_failures;
             out
         };
-        let mut progressed = out.progressed || out.resync;
-        if out.resync {
+        let mut failed_ids = self.reconcile_spill_outcome(
+            coordinator,
+            pending_before,
+            chain_before,
+            out.state_failed_id,
+            &out.chain_failed_ids,
+            &ordinary_owed_before,
+        );
+        let failed_upgrade = self.reconcile_in_flight_disk_upgrade();
+        if let Some(uid) = failed_upgrade
+            && !failed_ids.contains(&uid)
+        {
+            failed_ids.push(uid);
+        }
+        self.reconcile_completed_disk_repairs();
+        let retry = upgrade_retry_after();
+        for id in repairs_with_disk_before {
+            if !failed_ids.contains(&id)
+                && matches!(
+                    self.pending_disk_upgrades.get(&id),
+                    Some(PendingDiskUpgrade::Repair { .. })
+                )
+                && self.store.get(id).is_some_and(|e| e.disk().is_none())
+            {
+                self.mark_repair_failed(id, retry);
+                failed_ids.push(id);
+            }
+        }
+        let retired = self.retire_unwritable_incomplete_disk_copies();
+        let demoted = self.demote_requested_ram();
+        let mut progressed =
+            out.progressed || out.resync || failed_upgrade.is_some() || retired || demoted;
+        if out.resync || failed_upgrade.is_some() || retired || demoted {
+            self.prune_entry_tracking();
             self.sync_marks(coordinator);
         }
+        if out.state_landed_ok > 0 || out.progressed {
+            self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
+        }
         if matches!(tick, Tick::Full { .. }) {
-            progressed |= self.drive_write_behind(coordinator, false);
+            let mut tick_skip: HashSet<EntryId> = failed_ids.into_iter().collect();
+            let skip_opt = (!tick_skip.is_empty()).then_some(&mut tick_skip);
+            progressed |= self.drive_write_behind_inner(coordinator, false, skip_opt);
             progressed |= self.poll_offload(coordinator);
         }
+        self.sync_host_budget();
         progressed
     }
 
@@ -1002,48 +3776,157 @@ impl Inkling2StateStore {
         coordinator: &Inkling2KVCacheCoordinator,
         deadline: Instant,
     ) -> bool {
-        let has_work = |this: &Self| {
+        self.reconcile_completed_disk_repairs();
+        // Ensure every pending SSD upgrade/repair needing a state write with a live RAM anchor is
+        // queued in `write_behind` before flushing.
+        if let Some(disk) = self.disk.as_mut() {
+            let now = Instant::now();
+            for (&id, kind) in &self.pending_disk_upgrades {
+                if self.store.get(id).is_some_and(|e| {
+                    e.ram().is_some() && (kind.is_in_place() || e.disk().is_none())
+                }) && !disk.write_behind.iter().any(|w| w.id == id)
+                {
+                    disk.write_behind.push(WriteBehindEntry {
+                        id,
+                        published_at: now,
+                    });
+                }
+            }
+        }
+
+        let has_work = |this: &Self, skipped: &HashSet<EntryId>| {
             let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
             let has_owed_chain = this
                 .store
                 .entries()
                 .any(|e| e.disk().is_some_and(|c| c.chain_owed));
             let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
-                d.write_behind
-                    .iter()
-                    .any(|w| this.store.get(w.id).is_some_and(|e| e.disk().is_none()))
+                d.write_behind.iter().any(|w| {
+                    !skipped.contains(&w.id)
+                        && this.store.get(w.id).is_some_and(|e| {
+                            e.ram().is_some()
+                                && (e.disk().is_none()
+                                    || this
+                                        .pending_disk_upgrades
+                                        .get(&w.id)
+                                        .is_some_and(PendingDiskUpgrade::is_in_place))
+                        })
+                })
             });
             has_pending_write || has_owed_chain || has_waiting_wb
         };
+        let all_flushed = |this: &Self, failed: &HashSet<EntryId>| {
+            let has_pending_write = this.disk.as_ref().is_some_and(|d| d.writing());
+            let has_owed_chain = this
+                .store
+                .entries()
+                .any(|e| e.disk().is_some_and(|c| c.chain_owed));
+            let has_waiting_wb = this.disk.as_ref().is_some_and(|d| {
+                d.write_behind.iter().any(|w| {
+                    this.store.get(w.id).is_some_and(|e| {
+                        e.ram().is_some()
+                            && (e.disk().is_none()
+                                || this
+                                    .pending_disk_upgrades
+                                    .get(&w.id)
+                                    .is_some_and(PendingDiskUpgrade::is_in_place))
+                    })
+                })
+            });
+            let disk_writable = this.disk.as_ref().is_none_or(|d| d.writable());
+            disk_writable
+                && failed.is_empty()
+                && !has_pending_write
+                && !has_owed_chain
+                && !has_waiting_wb
+                && this.pending_disk_upgrades.is_empty()
+                && this.in_flight_disk_upgrade.is_none()
+        };
+
+        // Clear stale failure markers from earlier passes so retryable entries (still queued in
+        // `write_behind` or `pending_disk_upgrades`) get a fresh attempt once space has recovered.
+        // Then poll any already-completed landings/evictions: failures that are still retryable
+        // are cleared so this flush retries them, while unrecoverable invalidations (not queued
+        // in `write_behind`) are preserved in `failed_upgrades` so `flush_to_disk` never falsely
+        // returns `true`.
+        self.recent_failed_upgrades.clear();
+        self.recent_failed_spills.clear();
+        self.poll_offload(coordinator);
+        self.recent_failed_upgrades.clear();
+        let mut failed_upgrades: HashSet<EntryId> = HashSet::new();
+        for id in self.recent_failed_spills.drain() {
+            let queued_for_retry = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.write_behind.iter().any(|w| w.id == id));
+            if !queued_for_retry {
+                failed_upgrades.insert(id);
+            }
+        }
+        let mut skipped_upgrades: HashSet<EntryId> = failed_upgrades.clone();
         loop {
             self.poll_offload(coordinator);
-            if !has_work(self) {
-                return true;
+            for id in self
+                .recent_failed_upgrades
+                .drain()
+                .chain(self.recent_failed_spills.drain())
+            {
+                failed_upgrades.insert(id);
+                skipped_upgrades.insert(id);
+            }
+            if !has_work(self, &skipped_upgrades) {
+                return all_flushed(self, &failed_upgrades);
             }
             if Instant::now() >= deadline {
-                return false;
+                return all_flushed(self, &failed_upgrades);
+            }
+            let (writable, writing) = self
+                .disk
+                .as_ref()
+                .map_or((false, false), |d| (d.writable(), d.writing()));
+            if !writable && !writing {
+                return all_flushed(self, &failed_upgrades);
             }
             let wb_before = self.disk.as_ref().map_or(0, |d| d.write_behind.len());
-            let staged = self.drive_write_behind(coordinator, true);
+            let skipped_before = skipped_upgrades.len();
+            let offloads_before = self.disk.as_ref().map_or(0, |d| d.counters.offloads);
+            let staged =
+                self.drive_write_behind_inner(coordinator, true, Some(&mut skipped_upgrades));
             let chained = self.chain_step(coordinator, deadline);
             let polled = self.poll_offload(coordinator);
-            let wb_progressed =
-                staged || self.disk.as_ref().map_or(0, |d| d.write_behind.len()) < wb_before;
+            for id in self
+                .recent_failed_upgrades
+                .drain()
+                .chain(self.recent_failed_spills.drain())
+            {
+                failed_upgrades.insert(id);
+                skipped_upgrades.insert(id);
+            }
+            let offloads_after = self.disk.as_ref().map_or(0, |d| d.counters.offloads);
+            if chained || offloads_after > offloads_before {
+                skipped_upgrades.retain(|id| failed_upgrades.contains(id));
+            }
+            let wb_progressed = staged
+                || self.disk.as_ref().map_or(0, |d| d.write_behind.len()) < wb_before
+                || skipped_upgrades.len() > skipped_before;
 
-            if !has_work(self) {
-                return true;
+            if !has_work(self, &skipped_upgrades) {
+                return all_flushed(self, &failed_upgrades);
             }
             if Instant::now() >= deadline {
-                return false;
+                return all_flushed(self, &failed_upgrades);
             }
             if polled || chained || wb_progressed {
                 continue;
             }
             let Some(disk) = self.disk.as_ref() else {
-                return false;
+                return all_flushed(self, &failed_upgrades);
             };
+            if !disk.writable() && !disk.writing() {
+                return all_flushed(self, &failed_upgrades);
+            }
             if !disk.engine.await_landing(deadline) {
-                return false;
+                return all_flushed(self, &failed_upgrades);
             }
         }
     }
@@ -1064,7 +3947,15 @@ impl Inkling2StateStore {
         }
         if !persistent && let Some(disk) = self.disk.as_mut() {
             disk.engine.strip_disk_copies(&mut self.store);
+            disk.preserve_entry_on_state_failure = None;
+            self.pending_disk_upgrades.clear();
+            self.in_flight_disk_upgrade = None;
+            self.recent_failed_upgrades.clear();
+            self.recent_failed_spills.clear();
+            self.spill_backoff.clear();
+            self.demote_ram_on_durable.clear();
         }
+        self.sync_host_budget();
         all_flushed
     }
 
@@ -1076,9 +3967,14 @@ impl Inkling2StateStore {
         id: EntryId,
     ) -> Option<(Inkling2StateAnchor, bool)> {
         if let Some(ram) = self.store.get(id).and_then(Entry::ram).cloned() {
+            self.demote_ram_on_durable.remove(&id);
             self.ram_hits += 1;
             return Some((ram, false));
         }
+        // Register a `ReadWait` guard before polling/waiting so any `poll_offload` ->
+        // `trim_ram_to_cap` or background spill yields the reusable staging buffer to this
+        // synchronous SSD restore (reads before writes).
+        let _read_wait = self.disk.as_ref()?.engine.acquire_read_wait();
         // Wait for an in-flight state write to hand back the staging buffer.
         let deadline = Instant::now()
             + Duration::from_secs_f64(crate::engine::governor::wait::RESOURCE_WAIT_SECONDS);
@@ -1095,17 +3991,35 @@ impl Inkling2StateStore {
             }
             self.poll_offload(coordinator);
         }
-        let disk = self.disk.as_mut()?;
-        let decoded = disk.engine.read_into_staging(
-            &self.store,
-            id,
-            |codec, _spans, entry, _copy, staging| {
-                let depth = u32::try_from(entry.depth()).ok()?;
-                codec.geometry.decode_from(depth, staging).ok()
-            },
-        );
+        let has_dw_span = self
+            .resolve_geometry()
+            .is_some_and(|g| g.draft_window_span_bytes > 0);
+        let decoded = {
+            let disk = self.disk.as_mut()?;
+            disk.engine.read_into_staging(
+                &self.store,
+                id,
+                |codec, _spans, entry, _copy, staging| {
+                    let depth = u32::try_from(entry.depth()).ok()?;
+                    codec.geometry.decode_from(depth, staging).ok()
+                },
+            )
+        };
         if let Some(anchor) = decoded {
-            disk.counters.ssd_hits += 1;
+            if let Some(dw) = anchor.draft_window.as_ref() {
+                dw.attach_to(&self.host_budget);
+            }
+            if let Some(disk) = self.disk.as_mut() {
+                disk.counters.ssd_hits += 1;
+            }
+            if has_dw_span {
+                self.adopted_unverified_window.remove(&id);
+                if anchor.draft_window.is_none() {
+                    self.entries_missing_draft_window.insert(id);
+                } else {
+                    self.entries_missing_draft_window.remove(&id);
+                }
+            }
             Some((anchor, true))
         } else {
             None
@@ -1115,11 +4029,31 @@ impl Inkling2StateStore {
     /// Adopt complete `(state blob + 8-layer Global KV chain)` entries from a persistent tier
     /// on startup using the shared [`StateDiskEngine::adopt_all`].
     pub(crate) fn adopt_all(&mut self) -> u64 {
-        let Some(disk) = self.disk.as_mut() else {
-            return 0;
+        let has_dw_span = self
+            .resolve_geometry()
+            .is_some_and(|g| g.draft_window_span_bytes > 0);
+        let existing: HashSet<EntryId> = if has_dw_span {
+            self.store.entries().map(Entry::id).collect()
+        } else {
+            HashSet::new()
         };
-        let adopted = disk.engine.adopt_all(&mut self.store, false);
-        disk.counters.adopted += adopted;
+        let adopted = {
+            let Some(disk) = self.disk.as_mut() else {
+                return 0;
+            };
+            let count = disk.engine.adopt_all(&mut self.store, false);
+            disk.counters.adopted += count;
+            count
+        };
+        if has_dw_span && adopted > 0 {
+            for entry in self.store.entries() {
+                let id = entry.id();
+                if !existing.contains(&id) {
+                    self.adopted_unverified_window.insert(id);
+                }
+            }
+        }
+        self.sync_host_budget();
         adopted
     }
 }
@@ -1268,7 +4202,9 @@ fn forward_arithmetic_tag() -> String {
 }
 
 /// Compute deterministic `PersistentIdentity` for an Inkling-2-Mini checkpoint + KV/state geometry
-/// + resolved prefill query precision policy (`activations`) + forward arithmetic epoch.
+/// + resolved prefill query precision policy (`activations`) + forward arithmetic epoch
+/// + optional DFlash2 draft directory identity.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn compute_persistent_identity(
     config: &Inkling2Config,
     coordinator: &Inkling2KVCacheCoordinator,
@@ -1277,6 +4213,7 @@ pub(crate) fn compute_persistent_identity(
     files: CheckpointFiles<'_>,
     weights: &WeightsResident,
     guard: &CheckpointLoadGuard<'_>,
+    draft_identity: Option<&[u8]>,
 ) -> Option<PersistentIdentity> {
     let config_json = serde_json::to_vec(config).ok()?;
     let global_layers = u64::try_from(global_visit_count(config)).ok()?;
@@ -1313,11 +4250,21 @@ pub(crate) fn compute_persistent_identity(
         return None;
     }
     let state_desc = geometry.geometry_string();
-    let state_fp = ColdCacheFingerprint::from_components([
-        b"inkling2-state-fp:v2".as_slice(),
-        kv_fp.as_bytes().as_slice(),
-        state_desc.as_bytes(),
-    ]);
+    let state_fp = if let Some(draft_id) = draft_identity {
+        ColdCacheFingerprint::from_components([
+            b"inkling2-state-fp:v2".as_slice(),
+            kv_fp.as_bytes().as_slice(),
+            state_desc.as_bytes(),
+            b"dflash2-draft:v1".as_slice(),
+            draft_id,
+        ])
+    } else {
+        ColdCacheFingerprint::from_components([
+            b"inkling2-state-fp:v2".as_slice(),
+            kv_fp.as_bytes().as_slice(),
+            state_desc.as_bytes(),
+        ])
+    };
     let namespace = state_fp.to_hex().get(..32)?.to_string();
     Some(PersistentIdentity {
         namespace,
@@ -1335,6 +4282,7 @@ pub(crate) fn compute_path_identity(
     coordinator: &Inkling2KVCacheCoordinator,
     geometry: &Inkling2StateGeometry,
     int8_query_from: Option<u32>,
+    draft_identity: Option<&[u8]>,
 ) -> Option<PersistentIdentity> {
     compute_path_identity_with_arith(
         model_dir,
@@ -1343,6 +4291,7 @@ pub(crate) fn compute_path_identity(
         geometry,
         int8_query_from,
         ForwardArithmeticSettings::current(),
+        draft_identity,
     )
 }
 
@@ -1354,6 +4303,7 @@ fn compute_path_identity_with_arith(
     geometry: &Inkling2StateGeometry,
     int8_query_from: Option<u32>,
     arith: ForwardArithmeticSettings,
+    draft_identity: Option<&[u8]>,
 ) -> Option<PersistentIdentity> {
     let config_json = serde_json::to_vec(config).ok()?;
     let canon = model_dir
@@ -1371,11 +4321,21 @@ fn compute_path_identity_with_arith(
         &coordinator.block_size().to_le_bytes(),
     ]);
     let state_desc = geometry.geometry_string();
-    let state_fp = ColdCacheFingerprint::from_components([
-        b"inkling2-path-state:v2".as_slice(),
-        kv_fp.as_bytes().as_slice(),
-        state_desc.as_bytes(),
-    ]);
+    let state_fp = if let Some(draft_id) = draft_identity {
+        ColdCacheFingerprint::from_components([
+            b"inkling2-path-state:v2".as_slice(),
+            kv_fp.as_bytes().as_slice(),
+            state_desc.as_bytes(),
+            b"dflash2-draft:v1".as_slice(),
+            draft_id,
+        ])
+    } else {
+        ColdCacheFingerprint::from_components([
+            b"inkling2-path-state:v2".as_slice(),
+            kv_fp.as_bytes().as_slice(),
+            state_desc.as_bytes(),
+        ])
+    };
     let namespace = state_fp.to_hex().get(..32)?.to_string();
     Some(PersistentIdentity {
         namespace,
@@ -1389,11 +4349,13 @@ fn compute_path_identity_with_arith(
 pub(crate) fn open_inkling2_state_disk(
     config: &Inkling2Config,
     coordinator: &Inkling2KVCacheCoordinator,
+    dflash2: Option<&DFlash2Config>,
     options: &DiskTierOptions,
     identity: impl FnOnce() -> Option<PersistentIdentity>,
     model_id: u64,
 ) -> Option<(ColdTierContext, Inkling2StateDisk)> {
-    let geometry = Inkling2StateGeometry::from_coordinator(config, coordinator).ok()?;
+    let geometry =
+        Inkling2StateGeometry::from_coordinator_with_draft(config, coordinator, dflash2).ok()?;
     let state_bytes = geometry.payload_bytes();
     if state_bytes == 0 {
         return None;
@@ -1444,23 +4406,25 @@ fn eval_conv_state_arrays(state: &Inkling2ShortConvState) -> Result<()> {
     MxArray::eval_arrays(&arrays)
 }
 
-/// Helper: restore an [`Inkling2StateAnchor`] onto `seq_id` across Group 1 (SWA raw blocks)
+/// Helper: restore a flat [`Inkling2StateAnchor`] onto `seq_id` across Group 1 (SWA raw blocks)
 /// and `conv_states` (48-visit ShortConv state). Caller has already restored Group 0 (Global KV)
 /// at `boundary`.
 pub(crate) fn install_anchor_swa_and_conv(
     coordinator: &mut Inkling2KVCacheCoordinator,
     conv_states: &mut HashMap<SeqId, Inkling2ShortConvState>,
+    geometry: &Inkling2StateGeometry,
     seq_id: SeqId,
     prompt_tokens: &[u32],
     boundary: u32,
-    anchor: Inkling2StateAnchor,
+    anchor: &Inkling2StateAnchor,
 ) -> Result<()> {
     if coordinator.sliding_adapter().is_some() {
         coordinator
-            .restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, &anchor.swa_blocks)
+            .restore_sliding_raw_blocks_flat_for(seq_id, prompt_tokens, boundary, &anchor.swa_data)
             .map_err(Error::from_reason)?;
     }
-    conv_states.insert(seq_id, anchor.conv_state);
+    let conv = unpack_short_conv_state(geometry, &anchor.conv_data).map_err(Error::from_reason)?;
+    conv_states.insert(seq_id, conv);
     Ok(())
 }
 
@@ -1553,6 +4517,9 @@ mod tests {
             return;
         }
         let cfg = tiny_inkling2_config();
+        let dflash_cfg =
+            crate::models::qwen3_5::dflash2::dflash2_config_with_context(cfg.hidden_size, 16);
+
         for kv_format in [KvFormat::Int8, KvFormat::Bf16] {
             let paged_cfg = Inkling2PagedConfig::default_for_config(&cfg)
                 .with_kv_format(kv_format)
@@ -1560,31 +4527,40 @@ mod tests {
                 .with_max_concurrent_sequences(2);
             let coord =
                 Inkling2KVCacheCoordinator::new_for_config(&cfg, paged_cfg).expect("coordinator");
-            let geom = Inkling2StateGeometry::from_coordinator(&cfg, &coord).expect("geometry");
-            assert_eq!(geom.swa_layers, 5);
-            assert_eq!(geom.max_swa_blocks, 2); // sliding_window=64, bs=32
-            assert_eq!(geom.num_visits, 6);
+
+            // 1. Plain v1 geometry (no DFlash2 draft).
+            let geom_v1 =
+                Inkling2StateGeometry::from_coordinator(&cfg, &coord).expect("geometry v1");
+            assert_eq!(geom_v1.swa_layers, 5);
+            assert_eq!(geom_v1.max_swa_blocks, 2); // sliding_window=64, bs=32
+            assert_eq!(geom_v1.num_visits, 6);
+            assert_eq!(geom_v1.draft_window_span_bytes, 0);
+            assert!(geom_v1.geometry_string().starts_with("inkling2-state:v1 "));
+            assert_eq!(geom_v1.spans().len(), 2);
+
+            // 2. DFlash2 v2 geometry (with Span 2 draft context window).
+            let geom_v2 =
+                Inkling2StateGeometry::from_coordinator_with_draft(&cfg, &coord, Some(&dflash_cfg))
+                    .expect("geometry v2");
+            assert_eq!(geom_v2.draft_window_width, cfg.hidden_size as u32);
+            assert_eq!(geom_v2.draft_window_slots, 16);
+            assert_eq!(
+                geom_v2.draft_window_span_bytes,
+                DRAFT_WINDOW_HEADER_BYTES + DraftContextWindow::bytes(cfg.hidden_size as u32, 16)
+            );
+            assert!(geom_v2.geometry_string().starts_with("inkling2-state:v2 "));
+            assert!(geom_v2.geometry_string().ends_with(" dw=64:16"));
+            assert_eq!(geom_v2.spans().len(), 3);
 
             // Test both sub-window (boundary=32 -> 1 SWA block) and full-window (boundary=128 -> 2 SWA blocks).
             for boundary in [32u32, 128u32] {
-                let live_blocks = geom.live_swa_blocks(boundary) as usize;
-                let mut swa_blocks = Vec::with_capacity(live_blocks);
-                for b in 0..live_blocks {
-                    let mut layers = Vec::with_capacity(geom.swa_layers as usize);
-                    for l in 0..geom.swa_layers as usize {
-                        let k = vec![
-                            ((b * 31 + l * 7 + 1) % 251) as u8;
-                            geom.swa_key_blob_bytes as usize
-                        ];
-                        let v = vec![
-                            ((b * 17 + l * 13 + 3) % 251) as u8;
-                            geom.swa_value_blob_bytes as usize
-                        ];
-                        layers.push((k, v));
-                    }
-                    swa_blocks.push(layers);
-                }
-                let conv = Inkling2ShortConvState::new(
+                let live_bytes = geom_v1.live_swa_bytes(boundary).expect("live_swa_bytes");
+                let swa_vec: Vec<u8> = (0..live_bytes)
+                    .map(|i| ((i * 31 + boundary as usize * 7 + 1) % 251) as u8)
+                    .collect();
+                let swa_data: Arc<Vec<u8>> = Arc::new(swa_vec);
+
+                let mut conv = Inkling2ShortConvState::new(
                     cfg.num_layer_visits(),
                     cfg.sconv_kernel_size,
                     cfg.num_key_value_heads * cfg.head_dim,
@@ -1592,17 +4568,134 @@ mod tests {
                     DType::BFloat16,
                 )
                 .expect("conv state");
-                let anchor = Inkling2StateAnchor {
-                    swa_blocks: swa_blocks.clone(),
-                    conv_state: conv,
-                    cached_bytes: geom.payload_bytes(),
+                // Populate non-zero ShortConv values on visit 0 so unpack parity checks real data.
+                let hist = (cfg.sconv_kernel_size - 1) as i64;
+                let kv_dim = (cfg.num_key_value_heads * cfg.head_dim) as i64;
+                let hidden = cfg.hidden_size as i64;
+                let kv_vals: Vec<u16> = (0..(hist * kv_dim) as usize)
+                    .map(|i| half::bf16::from_f32(((i % 19) as f32 - 9.0) * 0.25).to_bits())
+                    .collect();
+                let h_vals: Vec<u16> = (0..(hist * hidden) as usize)
+                    .map(|i| half::bf16::from_f32(((i % 13) as f32 - 6.0) * 0.5).to_bits())
+                    .collect();
+                conv.visits[0].k =
+                    MxArray::from_bfloat16(&kv_vals, &[hist, kv_dim]).expect("conv k");
+                conv.visits[0].attn_post =
+                    MxArray::from_bfloat16(&h_vals, &[hist, hidden]).expect("conv attn_post");
+
+                let conv_data = pack_short_conv_state(&geom_v1, &conv).expect("pack conv");
+                let unpacked = unpack_short_conv_state(&geom_v1, &conv_data).expect("unpack conv");
+                assert_eq!(unpacked.visits.len(), cfg.num_layer_visits());
+                assert_eq!(
+                    unpacked.visits[0].k.to_uint16_native().expect("k u16"),
+                    kv_vals
+                );
+                assert_eq!(
+                    unpacked.visits[0]
+                        .attn_post
+                        .to_uint16_native()
+                        .expect("attn_post u16"),
+                    h_vals
+                );
+
+                // v1 roundtrip (no draft window).
+                let anchor_v1 = Inkling2StateAnchor {
+                    swa_data: Arc::clone(&swa_data),
+                    conv_data: Arc::clone(&conv_data),
+                    draft_window: None,
+                    cached_bytes: (swa_data.len() + conv_data.len()) as u64,
                 };
-                let mut buf = vec![0xAAu8; geom.payload_bytes() as usize];
-                geom.encode_into(boundary, &anchor, &mut buf)
-                    .expect("encode_into");
-                let decoded = geom.decode_from(boundary, &buf).expect("decode_from");
-                assert_eq!(decoded.swa_blocks, swa_blocks);
-                assert_eq!(decoded.conv_state.visits.len(), cfg.num_layer_visits());
+                let mut buf_v1 = vec![0xAAu8; geom_v1.payload_bytes() as usize];
+                geom_v1
+                    .encode_into(boundary, &anchor_v1, &mut buf_v1)
+                    .expect("encode_into v1");
+                let decoded_v1 = geom_v1
+                    .decode_from(boundary, &buf_v1)
+                    .expect("decode_from v1");
+                assert_eq!(decoded_v1.swa_data, swa_data);
+                assert_eq!(decoded_v1.conv_data, conv_data);
+                assert!(decoded_v1.draft_window.is_none());
+                assert_eq!(decoded_v1.cached_bytes, anchor_v1.cached_bytes);
+
+                // v2 roundtrip with `draft_window = None` (valid_flag = 0).
+                let mut buf_v2_none = vec![0xCCu8; geom_v2.payload_bytes() as usize];
+                geom_v2
+                    .encode_into(boundary, &anchor_v1, &mut buf_v2_none)
+                    .expect("encode_into v2 None");
+                let decoded_v2_none = geom_v2
+                    .decode_from(boundary, &buf_v2_none)
+                    .expect("decode_from v2 None");
+                assert_eq!(decoded_v2_none.swa_data, swa_data);
+                assert_eq!(decoded_v2_none.conv_data, conv_data);
+                assert!(decoded_v2_none.draft_window.is_none());
+
+                // Corrupt `valid_flag = 2` must fail decode cleanly.
+                let dw_offset = (geom_v2.swa_span_bytes + geom_v2.conv_span_bytes) as usize;
+                let mut buf_v2_bad = buf_v2_none.clone();
+                buf_v2_bad[dw_offset..dw_offset + 4].copy_from_slice(&2u32.to_le_bytes());
+                assert!(
+                    geom_v2.decode_from(boundary, &buf_v2_bad).is_err(),
+                    "invalid valid_flag=2 must be rejected"
+                );
+
+                // v2 roundtrip with a real populated `DraftContextWindow` -> `PackedDraftWindow`.
+                let mut live_window =
+                    DraftContextWindow::new(cfg.hidden_size as u32, 16).expect("window");
+                let rows = MxArray::random_normal(
+                    &[i64::from(boundary), cfg.hidden_size as i64],
+                    0.0,
+                    1.0,
+                    Some(DType::BFloat16),
+                )
+                .expect("random rows");
+                live_window.store_rows(&rows, 0).expect("store_rows");
+                let packed_dw = PackedDraftWindow::from_window(&live_window).expect("from_window");
+                assert!(packed_dw.is_complete_for(boundary));
+                assert!(!packed_dw.is_complete_for(boundary + 32));
+                assert_eq!(packed_dw.begin, boundary.saturating_sub(16));
+                assert_eq!(packed_dw.end, boundary);
+
+                let restored_win = packed_dw.to_window().expect("to_window");
+                assert_eq!(
+                    restored_win.host_bytes().expect("restored bytes"),
+                    live_window.host_bytes().expect("live bytes")
+                );
+                assert_eq!(
+                    (restored_win.begin(), restored_win.end()),
+                    (live_window.begin(), live_window.end())
+                );
+                let mut target_win =
+                    DraftContextWindow::new(cfg.hidden_size as u32, 16).expect("target win");
+                assert!(packed_dw.load_into(&mut target_win).expect("load_into"));
+                assert_eq!(
+                    target_win.host_bytes().expect("target bytes"),
+                    live_window.host_bytes().expect("live bytes")
+                );
+                let mut wrong_geom_win =
+                    DraftContextWindow::new(cfg.hidden_size as u32, 8).expect("wrong geom");
+                assert!(
+                    !packed_dw
+                        .load_into(&mut wrong_geom_win)
+                        .expect("load_into wrong geom")
+                );
+
+                let anchor_v2 = Inkling2StateAnchor {
+                    swa_data: Arc::clone(&swa_data),
+                    conv_data: Arc::clone(&conv_data),
+                    draft_window: Some(packed_dw.clone()),
+                    cached_bytes: (swa_data.len() + conv_data.len() + packed_dw.bytes.len()) as u64,
+                };
+                let mut buf_v2 = vec![0xBBu8; geom_v2.payload_bytes() as usize];
+                geom_v2
+                    .encode_into(boundary, &anchor_v2, &mut buf_v2)
+                    .expect("encode_into v2 Some");
+                let decoded_v2 = geom_v2
+                    .decode_from(boundary, &buf_v2)
+                    .expect("decode_from v2 Some");
+                assert_eq!(decoded_v2.swa_data, swa_data);
+                assert_eq!(decoded_v2.conv_data, conv_data);
+                assert_eq!(decoded_v2.draft_window.as_ref(), Some(&packed_dw));
+                assert_eq!(decoded_v2.cached_bytes, anchor_v2.cached_bytes);
             }
         }
     }
@@ -1619,6 +4712,11 @@ mod tests {
         WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(Some(0.0)));
 
         let cfg = tiny_inkling2_config();
+        let dflash_cfg =
+            crate::models::qwen3_5::dflash2::dflash2_config_with_context(cfg.hidden_size, 16);
+        let draft_id_a = b"draft-weights-sha-aaa";
+        let draft_id_b = b"draft-weights-sha-bbb";
+
         let temp_root =
             std::env::temp_dir().join(format!("inkling2-state-disk-unit-{}", uuid::Uuid::new_v4()));
         let cache_dir = temp_root.join("cache");
@@ -1642,19 +4740,45 @@ mod tests {
             Arc::clone(&recency),
         )
         .expect("coord");
-        let geom = Inkling2StateGeometry::from_coordinator(&cfg, &coord).expect("geom");
-        let id = compute_path_identity(&temp_root, &cfg, &coord, &geom, Some(1024));
+        let geom =
+            Inkling2StateGeometry::from_coordinator_with_draft(&cfg, &coord, Some(&dflash_cfg))
+                .expect("geom");
+        let id = compute_path_identity(
+            &temp_root,
+            &cfg,
+            &coord,
+            &geom,
+            Some(1024),
+            Some(draft_id_a),
+        );
         // Switching activation policy (INT8 query threshold vs BF16 queries) must isolate SSD cache identity.
-        let id_bf16_q = compute_path_identity(&temp_root, &cfg, &coord, &geom, None)
-            .expect("bf16 query identity");
+        let id_bf16_q =
+            compute_path_identity(&temp_root, &cfg, &coord, &geom, None, Some(draft_id_a))
+                .expect("bf16 query identity");
         let id_int8_q = id.as_ref().expect("int8 query identity");
         assert_ne!(id_int8_q.namespace, id_bf16_q.namespace);
         assert_ne!(id_int8_q.kv, id_bf16_q.kv);
         assert_ne!(id_int8_q.state, id_bf16_q.state);
-        let (ctx, disk) = open_inkling2_state_disk(&cfg, &coord, &disk_opts, move || id, 0)
-            .expect("open_inkling2_state_disk");
+        // Changing DFlash2 draft identity must isolate `state` and `namespace` while keeping target `kv` unchanged.
+        let id_other_draft = compute_path_identity(
+            &temp_root,
+            &cfg,
+            &coord,
+            &geom,
+            Some(1024),
+            Some(draft_id_b),
+        )
+        .expect("other draft identity");
+        assert_eq!(id_int8_q.kv, id_other_draft.kv);
+        assert_ne!(id_int8_q.state, id_other_draft.state);
+        assert_ne!(id_int8_q.namespace, id_other_draft.namespace);
+
+        let (ctx, disk) =
+            open_inkling2_state_disk(&cfg, &coord, Some(&dflash_cfg), &disk_opts, move || id, 0)
+                .expect("open_inkling2_state_disk");
         coord.set_full_cold_tier(ctx);
         let mut store = Inkling2StateStore::new(coord.block_size(), recency);
+        store.set_geometry(geom.clone());
         store.disk = Some(disk);
 
         // Record 96 tokens (= 3 full blocks of 32) into seq 1.
@@ -1670,11 +4794,64 @@ mod tests {
         )
         .expect("conv");
 
+        // First publish an AR-only anchor (`draft_window = None`) at boundary=64, then verify a
+        // subsequent DFlash2 capture with a complete `PackedDraftWindow` upgrades the same block!
+        let ar_id = store
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                1,
+                &tokens,
+                64,
+                0,
+                StateClass::Ordinary,
+                None,
+            )
+            .expect("capture_boundary AR")
+            .expect("ar_id");
+        assert!(
+            store
+                .store
+                .get(ar_id)
+                .and_then(Entry::ram)
+                .is_some_and(|a| a.draft_window.is_none())
+        );
+
+        let mut dw = DraftContextWindow::new(cfg.hidden_size as u32, 16).expect("dw");
+        let rows = MxArray::random_normal(
+            &[64, cfg.hidden_size as i64],
+            0.0,
+            1.0,
+            Some(DType::BFloat16),
+        )
+        .expect("rows");
+        dw.store_rows(&rows, 0).expect("store_rows");
+        let packed_dw = PackedDraftWindow::from_window(&dw).expect("packed_dw");
+        assert!(packed_dw.is_complete_for(64));
+
         let entry_id = store
-            .capture_boundary(&mut coord, &conv, 1, &tokens, 64, 0, StateClass::Ordinary)
-            .expect("capture_boundary")
+            .capture_boundary(
+                &mut coord,
+                &conv,
+                1,
+                &tokens,
+                64,
+                0,
+                StateClass::Ordinary,
+                Some(&packed_dw),
+            )
+            .expect("capture_boundary upgraded")
             .expect("entry_id");
         assert!(store.is_restorable(&coord, entry_id), "restorable in RAM");
+        assert_eq!(
+            store
+                .store
+                .get(entry_id)
+                .and_then(Entry::ram)
+                .and_then(|a| a.draft_window.as_ref()),
+            Some(&packed_dw),
+            "DFlash2 capture must upgrade AR anchor on the same block"
+        );
 
         let flushed = store.flush_to_disk(&coord, Instant::now() + Duration::from_secs(10));
         let e_after_flush = store.store.get(entry_id).expect("entry exists");
@@ -1693,7 +4870,7 @@ mod tests {
             e_after_flush.disk()
         );
 
-        // Drop RAM + purge hot pool -> must still be restorable from SSD!
+        // Drop RAM + purge hot pool -> must still be restorable from SSD with PackedDraftWindow!
         store.drop_all_ram_keeping_disk();
         coord.release_all_and_purge().expect("purge hot pools");
         let query: Vec<u32> = (100u32..170u32).collect();
@@ -1702,10 +4879,15 @@ mod tests {
             .expect("SSD lookup hit");
         assert_eq!(hit.depth, 64);
         assert!(!store.chain_is_hot(&coord, hit.id));
-        let (_, from_ssd) = store
+        let (ssd_anchor, from_ssd) = store
             .load_anchor(&coord, hit.id)
             .expect("load_anchor from SSD");
         assert!(from_ssd);
+        assert_eq!(
+            ssd_anchor.draft_window.as_ref(),
+            Some(&packed_dw),
+            "SSD restore must preserve exact PackedDraftWindow bytes and bounds"
+        );
 
         // Close and reopen persistent tier -> adopt_all must recover the entry!
         assert!(store.close_cache(&coord, Instant::now() + Duration::from_secs(10)));
@@ -1719,12 +4901,21 @@ mod tests {
             Arc::clone(&recency2),
         )
         .expect("coord2");
-        let geom2 = Inkling2StateGeometry::from_coordinator(&cfg, &coord2).expect("geom2");
+        let geom2 =
+            Inkling2StateGeometry::from_coordinator_with_draft(&cfg, &coord2, Some(&dflash_cfg))
+                .expect("geom2");
         // Reopening with a different activation query policy (None = BF16) must miss the old cache!
-        let id_mismatch = compute_path_identity(&temp_root, &cfg, &coord2, &geom2, None);
-        let (_ctx_miss, disk_miss) =
-            open_inkling2_state_disk(&cfg, &coord2, &disk_opts, move || id_mismatch, 0)
-                .expect("open mismatched policy disk");
+        let id_mismatch =
+            compute_path_identity(&temp_root, &cfg, &coord2, &geom2, None, Some(draft_id_a));
+        let (_ctx_miss, disk_miss) = open_inkling2_state_disk(
+            &cfg,
+            &coord2,
+            Some(&dflash_cfg),
+            &disk_opts,
+            move || id_mismatch,
+            0,
+        )
+        .expect("open mismatched policy disk");
         let mut store_miss = Inkling2StateStore::new(coord2.block_size(), Arc::clone(&recency2));
         store_miss.disk = Some(disk_miss);
         assert_eq!(
@@ -1733,6 +4924,34 @@ mod tests {
             "different activation query precision must NOT adopt old SSD cache"
         );
         drop(store_miss);
+
+        // Reopening with a different DFlash2 draft identity must NOT adopt the old SSD cache!
+        let id_draft_miss = compute_path_identity(
+            &temp_root,
+            &cfg,
+            &coord2,
+            &geom2,
+            Some(1024),
+            Some(draft_id_b),
+        );
+        let (_ctx_draft_miss, disk_draft_miss) = open_inkling2_state_disk(
+            &cfg,
+            &coord2,
+            Some(&dflash_cfg),
+            &disk_opts,
+            move || id_draft_miss,
+            0,
+        )
+        .expect("open mismatched draft disk");
+        let mut store_draft_miss =
+            Inkling2StateStore::new(coord2.block_size(), Arc::clone(&recency2));
+        store_draft_miss.disk = Some(disk_draft_miss);
+        assert_eq!(
+            store_draft_miss.adopt_all(),
+            0,
+            "different DFlash2 draft identity must NOT adopt old SSD cache"
+        );
+        drop(store_draft_miss);
 
         // Reopening with a different AttnRes vec4 threshold (`MLX_INKLING2_ATTN_RES_VEC4_MAX_T`)
         // must also isolate the SSD namespace and reject the previous prefix!
@@ -1749,10 +4968,17 @@ mod tests {
             &geom2,
             Some(1024),
             alt_arith,
+            Some(draft_id_a),
         );
-        let (_ctx_ar_miss, disk_ar_miss) =
-            open_inkling2_state_disk(&cfg, &coord2, &disk_opts, move || id_alt_attn_res, 0)
-                .expect("open mismatched attn_res disk");
+        let (_ctx_ar_miss, disk_ar_miss) = open_inkling2_state_disk(
+            &cfg,
+            &coord2,
+            Some(&dflash_cfg),
+            &disk_opts,
+            move || id_alt_attn_res,
+            0,
+        )
+        .expect("open mismatched attn_res disk");
         let mut store_ar_miss = Inkling2StateStore::new(coord2.block_size(), Arc::clone(&recency2));
         store_ar_miss.disk = Some(disk_ar_miss);
         assert_eq!(
@@ -1762,11 +4988,20 @@ mod tests {
         );
         drop(store_ar_miss);
 
-        let id2 = compute_path_identity(&temp_root, &cfg, &coord2, &geom2, Some(1024));
-        let (ctx2, disk2) = open_inkling2_state_disk(&cfg, &coord2, &disk_opts, move || id2, 0)
-            .expect("reopen state disk");
+        let id2 = compute_path_identity(
+            &temp_root,
+            &cfg,
+            &coord2,
+            &geom2,
+            Some(1024),
+            Some(draft_id_a),
+        );
+        let (ctx2, disk2) =
+            open_inkling2_state_disk(&cfg, &coord2, Some(&dflash_cfg), &disk_opts, move || id2, 0)
+                .expect("reopen state disk");
         coord2.set_full_cold_tier(ctx2);
         let mut store2 = Inkling2StateStore::new(coord2.block_size(), recency2);
+        store2.set_geometry(geom2);
         store2.disk = Some(disk2);
         let adopted = store2.adopt_all();
         assert_eq!(adopted, 1, "expected 1 adopted state on restart");
@@ -1774,10 +5009,2948 @@ mod tests {
             .lookup_deepest_restorable(&coord2, &query, 0)
             .expect("post-restart lookup hit");
         assert_eq!(hit2.depth, 64);
+        let (adopted_anchor, adopted_from_ssd) = store2
+            .load_anchor(&coord2, hit2.id)
+            .expect("load adopted anchor from SSD");
+        assert!(adopted_from_ssd);
+        assert_eq!(
+            adopted_anchor.draft_window.as_ref(),
+            Some(&packed_dw),
+            "post-restart adopted anchor must restore exact PackedDraftWindow"
+        );
 
         let _ = std::fs::remove_dir_all(&temp_root);
         WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
         WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(None));
+    }
+
+    #[cfg(target_os = "macos")]
+    fn test_deadline(secs: u64) -> Instant {
+        Instant::now() + Duration::from_secs(secs)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_short_conv(cfg: &Inkling2Config) -> Inkling2ShortConvState {
+        Inkling2ShortConvState::new(
+            cfg.num_layer_visits(),
+            cfg.sconv_kernel_size,
+            cfg.num_key_value_heads * cfg.head_dim,
+            cfg.hidden_size,
+            DType::BFloat16,
+        )
+        .expect("conv")
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_draft_window(width: u32, slots: u32, rows: u32) -> DraftContextWindow {
+        let mut dw = DraftContextWindow::new(width, slots).expect("dw");
+        let data = MxArray::random_normal(
+            &[i64::from(rows), i64::from(width)],
+            0.0,
+            1.0,
+            Some(DType::BFloat16),
+        )
+        .expect("rows");
+        dw.store_rows(&data, 0).expect("store_rows");
+        dw
+    }
+
+    #[cfg(target_os = "macos")]
+    fn patient_victim_query() -> crate::engine::governor::ledger::VictimQuery {
+        use crate::engine::governor::ledger::{Need, TakeRights, VictimQuery};
+        VictimQuery {
+            rights: TakeRights {
+                units: true,
+                waits_for_writes: true,
+                waits_for_landings: true,
+                ..Default::default()
+            },
+            need: Need::default(),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn store_victim(
+        id: EntryId,
+        stamp: u64,
+        bytes: u64,
+    ) -> crate::engine::governor::ledger::Victim {
+        use crate::engine::governor::ledger::{Stage, UnitKey, Victim};
+        Victim {
+            key: UnitKey::Store(id),
+            stamp,
+            bytes,
+            pages: 0,
+            stage: Stage::FreeNow,
+            later: false,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn attach_synthetic_disk(
+        fx: &StateDiskTestFixture,
+        inner: &mut crate::models::inkling2::model::Inkling2Inner,
+    ) {
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(64u64 << 20),
+            persistent: true,
+            cache_dir: Some(fx.cache_dir.clone()),
+            temp_root: Some(fx.temp_root.clone()),
+        };
+        let geom = {
+            let rt = inner.paged.as_ref().expect("paged");
+            Inkling2StateGeometry::from_coordinator_with_draft(
+                &inner.config,
+                &rt.coordinator,
+                inner.dflash2.as_ref().map(|d| &d.config),
+            )
+            .expect("geom")
+        };
+        let identity = compute_path_identity(
+            &fx.temp_root,
+            &inner.config,
+            &inner.paged.as_ref().expect("paged").coordinator,
+            &geom,
+            None,
+            Some(fx.draft_id),
+        );
+        assert!(
+            inner
+                .attach_state_disk(&disk_opts, move || identity)
+                .is_some(),
+            "StateDisk must attach"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    struct StateDiskTestFixture {
+        temp_root: std::path::PathBuf,
+        cache_dir: std::path::PathBuf,
+        cfg: Inkling2Config,
+        dflash_cfg: DFlash2Config,
+        paged_cfg: Inkling2PagedConfig,
+        conv: Inkling2ShortConvState,
+        draft_id: &'static [u8],
+        chmod_dir: Option<std::path::PathBuf>,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for StateDiskTestFixture {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
+            WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(None));
+            crate::disk_tier::TEST_WRITER.with(|w| w.set(None));
+            if let Some(ref dir) = self.chmod_dir {
+                let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755));
+            }
+            let _ = std::fs::remove_dir_all(&self.temp_root);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl StateDiskTestFixture {
+        fn new(tag: &str, draft_id: &'static [u8], wb_delay: Option<f64>) -> Self {
+            if let Some(delay) = wb_delay {
+                WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(32)));
+                WRITE_BEHIND_DELAY_OVERRIDE.with(|c| c.set(Some(delay)));
+            }
+            let temp_root =
+                std::env::temp_dir().join(format!("inkling2-{tag}-{}", uuid::Uuid::new_v4()));
+            let cache_dir = temp_root.join("cache");
+            std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+            let cfg = tiny_inkling2_config();
+            let dflash_cfg =
+                crate::models::qwen3_5::dflash2::dflash2_config_with_context(cfg.hidden_size, 16);
+            let paged_cfg = Inkling2PagedConfig::default_for_config(&cfg)
+                .with_kv_format(KvFormat::Int8)
+                .with_max_model_len(2048)
+                .with_max_concurrent_sequences(2);
+            let conv = make_short_conv(&cfg);
+            Self {
+                temp_root,
+                cache_dir,
+                cfg,
+                dflash_cfg,
+                paged_cfg,
+                conv,
+                draft_id,
+                chmod_dir: None,
+            }
+        }
+
+        fn with_paged(mut self, max_model_len: u32, max_seqs: u32) -> Self {
+            self.paged_cfg = Inkling2PagedConfig::default_for_config(&self.cfg)
+                .with_kv_format(KvFormat::Int8)
+                .with_max_model_len(max_model_len)
+                .with_max_concurrent_sequences(max_seqs);
+            self
+        }
+
+        fn subdir(&self, name: &str) -> std::path::PathBuf {
+            let dir = self.temp_root.join(name);
+            std::fs::create_dir_all(&dir).expect("create subdir");
+            dir
+        }
+
+        fn packed_dw(&self, rows: u32) -> PackedDraftWindow {
+            let dw = make_draft_window(self.cfg.hidden_size as u32, 16, rows);
+            PackedDraftWindow::from_window(&dw).expect("packed_dw")
+        }
+
+        fn open_in_with_persistence(
+            &self,
+            cache_dir: std::path::PathBuf,
+            bytes: u64,
+            draft_id: &[u8],
+            reserve: Option<u64>,
+            persistent: bool,
+        ) -> TestSession {
+            use crate::disk_tier::{CacheDisk, DiskTierOptions, TEST_WRITER};
+            if let Some(r) = reserve {
+                TEST_WRITER.with(|w| w.set(Some((8, r))));
+            }
+            let disk_opts = DiskTierOptions {
+                cache_disk: CacheDisk::Bytes(bytes),
+                persistent,
+                cache_dir: persistent.then_some(cache_dir),
+                temp_root: Some(self.temp_root.clone()),
+            };
+            let recency = Arc::new(CacheRecency::new());
+            let mut coord = Inkling2KVCacheCoordinator::new_for_config_with_recency(
+                &self.cfg,
+                self.paged_cfg,
+                Arc::clone(&recency),
+            )
+            .expect("coord");
+            let geom = Inkling2StateGeometry::from_coordinator_with_draft(
+                &self.cfg,
+                &coord,
+                Some(&self.dflash_cfg),
+            )
+            .expect("geom");
+            let id = compute_path_identity(
+                &self.temp_root,
+                &self.cfg,
+                &coord,
+                &geom,
+                Some(1024),
+                Some(draft_id),
+            );
+            let (ctx, disk) = open_inkling2_state_disk(
+                &self.cfg,
+                &coord,
+                Some(&self.dflash_cfg),
+                &disk_opts,
+                move || id,
+                0,
+            )
+            .expect("open disk");
+            if reserve.is_some() {
+                TEST_WRITER.with(|w| w.set(None));
+            }
+            coord.set_full_cold_tier(ctx);
+            let mut store = Inkling2StateStore::new(coord.block_size(), recency);
+            store.set_geometry(geom.clone());
+            store.disk = Some(disk);
+            TestSession { coord, store, geom }
+        }
+
+        fn open_in(
+            &self,
+            cache_dir: std::path::PathBuf,
+            bytes: u64,
+            draft_id: &[u8],
+            reserve: Option<u64>,
+        ) -> TestSession {
+            self.open_in_with_persistence(cache_dir, bytes, draft_id, reserve, true)
+        }
+
+        fn open(&self, bytes: u64, reserve: Option<u64>) -> TestSession {
+            self.open_in(self.cache_dir.clone(), bytes, self.draft_id, reserve)
+        }
+
+        fn open_temp(&self, bytes: u64, reserve: Option<u64>) -> TestSession {
+            self.open_in_with_persistence(
+                self.cache_dir.clone(),
+                bytes,
+                self.draft_id,
+                reserve,
+                false,
+            )
+        }
+
+        fn open_adopted(&self, bytes: u64, reserve: Option<u64>, expected: u64) -> TestSession {
+            let mut s = self.open(bytes, reserve);
+            assert_eq!(s.store.adopt_all(), expected, "expected {expected} adopted");
+            s
+        }
+
+        fn seed_durable(
+            &self,
+            entries: &[(u32, &[u32], u32, u64)],
+            bytes: u64,
+            reserve: Option<u64>,
+        ) -> (u64, u64) {
+            let mut s = self.open(bytes, reserve);
+            let mut first_eid = None;
+            for &(seq, tokens, boundary, salt) in entries {
+                let eid = s.capture_ord(&self.conv, seq, tokens, boundary, salt, None);
+                assert!(s.store.entries_missing_draft_window.contains(&eid));
+                first_eid.get_or_insert(eid);
+            }
+            assert!(s.flush(10), "seed flush_to_disk");
+            let total_bytes = s.manager().total_bytes();
+            let first_disk_bytes = first_eid.map_or(0, |id| s.disk_copy(id).bytes);
+            assert!(s.close(), "seed close_cache");
+            (total_bytes, first_disk_bytes)
+        }
+
+        fn chmod_readonly(&mut self, dir: &Path) {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555))
+                .expect("chmod 0555");
+            self.chmod_dir = Some(dir.to_path_buf());
+        }
+
+        fn restore_chmod(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(dir) = self.chmod_dir.take() {
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755))
+                    .expect("restore 0755");
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    struct TestSession {
+        coord: Inkling2KVCacheCoordinator,
+        store: Inkling2StateStore,
+        geom: Inkling2StateGeometry,
+    }
+
+    #[cfg(target_os = "macos")]
+    impl TestSession {
+        fn disk(&self) -> &Inkling2StateDisk {
+            self.store.disk.as_ref().unwrap()
+        }
+
+        fn disk_mut(&mut self) -> &mut Inkling2StateDisk {
+            self.store.disk.as_mut().unwrap()
+        }
+
+        fn manager(&self) -> &mlx_paged_attn::ColdCacheManager {
+            &self.disk().tier.manager
+        }
+
+        fn entry(&self, id: EntryId) -> &Entry<Inkling2StateAnchor> {
+            self.store.store.get(id).expect("entry")
+        }
+
+        fn first_id(&self) -> EntryId {
+            self.store
+                .store
+                .entries()
+                .next()
+                .expect("adopted entry")
+                .id()
+        }
+
+        fn id_by_salt(&self, salt: u64) -> EntryId {
+            self.store
+                .store
+                .entries()
+                .find(|e| e.salt() == salt)
+                .expect("entry by salt")
+                .id()
+        }
+
+        fn disk_copy(&self, id: EntryId) -> DiskCopy {
+            *self.entry(id).disk().expect("disk copy")
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        fn capture(
+            &mut self,
+            conv: &Inkling2ShortConvState,
+            seq: u32,
+            tokens: &[u32],
+            boundary: u32,
+            salt: u64,
+            class: StateClass,
+            dw: Option<&PackedDraftWindow>,
+        ) -> EntryId {
+            self.coord.reset_scheduled_request(seq).expect("reset seq");
+            self.coord.record_tokens_all(seq, tokens).expect("record");
+            self.store
+                .capture_boundary(
+                    &mut self.coord,
+                    conv,
+                    seq,
+                    tokens,
+                    boundary,
+                    salt,
+                    class,
+                    dw,
+                )
+                .expect("capture_boundary")
+                .expect("entry_id")
+        }
+
+        fn capture_ord(
+            &mut self,
+            conv: &Inkling2ShortConvState,
+            seq: u32,
+            tokens: &[u32],
+            boundary: u32,
+            salt: u64,
+            dw: Option<&PackedDraftWindow>,
+        ) -> EntryId {
+            self.capture(conv, seq, tokens, boundary, salt, StateClass::Ordinary, dw)
+        }
+
+        fn stage(&mut self, id: EntryId) -> bool {
+            self.store
+                .stage_entry(&self.coord, id, MakeRoom::Evict, true)
+        }
+
+        fn flush(&mut self, secs: u64) -> bool {
+            self.store.flush_to_disk(&self.coord, test_deadline(secs))
+        }
+
+        fn close(&mut self) -> bool {
+            self.store.close_cache(&self.coord, test_deadline(10))
+        }
+
+        fn has_wb(&self, id: EntryId) -> bool {
+            self.disk().write_behind.iter().any(|w| w.id == id)
+        }
+
+        fn await_writing(&mut self, msg: &str) {
+            let dl = test_deadline(10);
+            while self.disk().writing() {
+                assert!(Instant::now() < dl, "timed out: {msg}");
+                let _ = self.disk().engine.await_landing(dl);
+                self.store.poll_offload(&self.coord);
+            }
+        }
+
+        fn await_landed(&mut self, id: EntryId, msg: &str) {
+            let dl = test_deadline(10);
+            while self.disk().writing()
+                || self
+                    .store
+                    .store
+                    .get(id)
+                    .is_some_and(|e| e.disk().is_none_or(|c| !c.landed || c.chain_owed))
+            {
+                assert!(Instant::now() < dl, "timed out: {msg}");
+                self.store.chain_step(&self.coord, dl);
+                let _ = self.disk().engine.await_landing(dl);
+                self.store.poll_offload(&self.coord);
+            }
+        }
+
+        fn drop_ram_and_purge(&mut self) {
+            self.store.drop_all_ram_keeping_disk();
+            self.coord.release_all_and_purge().expect("purge hot");
+        }
+
+        fn assert_ssd_restores(
+            &mut self,
+            query: &[u32],
+            salt: u64,
+            expected_id: Option<EntryId>,
+            expected_dw: Option<&PackedDraftWindow>,
+        ) -> EntryId {
+            let hit = self
+                .store
+                .lookup_deepest_restorable(&self.coord, query, salt)
+                .expect("SSD lookup hit");
+            if let Some(eid) = expected_id {
+                assert_eq!(hit.id, eid);
+            }
+            let (anchor, from_ssd) = self
+                .store
+                .load_anchor(&self.coord, hit.id)
+                .expect("load_anchor from SSD");
+            assert!(from_ssd);
+            assert_eq!(anchor.draft_window.as_ref(), expected_dw);
+            hit.id
+        }
+
+        fn assert_flush_fails_promptly(&mut self, msg: &str) {
+            let t0 = Instant::now();
+            assert!(!self.flush(3), "flush_to_disk must return false: {msg}");
+            assert!(
+                t0.elapsed() < Duration::from_millis(500),
+                "flush_to_disk must exit promptly ({:?}): {msg}",
+                t0.elapsed()
+            );
+        }
+
+        fn state_object_bytes_for(&self, id: EntryId) -> u64 {
+            let entry = self.entry(id);
+            let layout = self.disk().engine.layout(entry.depth()).unwrap();
+            mlx_paged_attn::state_object_bytes(
+                &layout,
+                &crate::disk_tier::state_disk::label_of(entry),
+            )
+        }
+
+        fn evict_kv_block(&self, id: EntryId, idx: usize) -> ColdCacheKey {
+            let kv_keys = self.disk().engine.kv_chain_keys(self.entry(id));
+            assert!(kv_keys.len() > idx, "expected > {idx} KV blocks");
+            assert!(self.manager().remove(&kv_keys[idx]));
+            kv_keys[idx]
+        }
+
+        fn set_writer_space(
+            &self,
+            model_avail: u64,
+            writer_avail: u64,
+            counter: Option<Arc<std::sync::atomic::AtomicUsize>>,
+        ) {
+            let model_tid = std::thread::current().id();
+            self.manager()
+                .set_space_override_for_test(Some(Box::new(move || {
+                    if std::thread::current().id() == model_tid {
+                        Ok((1 << 30, model_avail))
+                    } else {
+                        if let Some(ref c) = counter {
+                            c.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        Ok((1 << 30, writer_avail))
+                    }
+                })));
+        }
+
+        fn set_toggle_writer_space(
+            &self,
+            reserve: u64,
+            fail_writer: Arc<std::sync::atomic::AtomicBool>,
+        ) {
+            let model_tid = std::thread::current().id();
+            self.manager()
+                .set_space_override_for_test(Some(Box::new(move || {
+                    if std::thread::current().id() == model_tid
+                        || !fail_writer.load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        Ok((1 << 30, 64 << 20))
+                    } else {
+                        Ok((1 << 30, reserve))
+                    }
+                })));
+        }
+
+        fn clear_space_override(&self, drain: bool) -> bool {
+            let mgr = self.manager();
+            mgr.set_space_override_for_test(None);
+            if drain {
+                mgr.drain(Duration::from_secs(5))
+            } else {
+                true
+            }
+        }
+
+        fn expire_backoff(&mut self, id: EntryId) {
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .unwrap_or_else(Instant::now);
+            if let Some(p) = self.store.pending_disk_upgrades.get_mut(&id) {
+                p.set_retry_after(past);
+            }
+            self.store.spill_backoff.insert(id, past);
+        }
+
+        fn enqueue_kv_block(
+            &self,
+            seq: u32,
+            chunk: &[u32],
+            idx: usize,
+            parent: Option<ColdCacheKey>,
+        ) -> (ColdCacheKey, mlx_paged_attn::Landed) {
+            let kv = KvPoolHandle::from_adapter(self.coord.full_adapter());
+            let blk = Arc::clone(
+                &self
+                    .coord
+                    .full_adapter()
+                    .block_table_for(seq)
+                    .expect("block table")
+                    .blocks()[idx],
+            );
+            let fp = self.disk().tier.kv_fingerprint;
+            let key = ColdCacheKey::chain(ColdGroup::Kv, fp, parent, chunk, &[], 0, idx);
+            let (tx, rx) = std::sync::mpsc::channel();
+            assert!(
+                self.manager()
+                    .capture_and_enqueue_tracked(
+                        &kv.pool,
+                        &blk,
+                        key,
+                        fp,
+                        chunk,
+                        test_deadline(5),
+                        MakeRoom::Evict,
+                        tx,
+                    )
+                    .expect("enqueue KV")
+            );
+            (
+                key,
+                rx.recv_timeout(Duration::from_secs(5)).expect("settle"),
+            )
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_ram_cap_evicts_and_keeps_landed_ssd_restorable() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("ram-cap-unit", b"ram-cap-draft-v1", Some(0.0));
+        let ram_cap = 4usize;
+
+        // Part 1: Without SSD disk, inserting 30 Ordinary anchors strictly caps `ram_len() <= ram_cap`
+        // and retires disposable Checkpoints before Ordinary entries.
+        {
+            let recency = Arc::new(CacheRecency::new());
+            let mut coord = Inkling2KVCacheCoordinator::new_for_config_with_recency(
+                &fx.cfg,
+                fx.paged_cfg,
+                Arc::clone(&recency),
+            )
+            .expect("coord ram-only");
+            let geom = Inkling2StateGeometry::from_coordinator(&fx.cfg, &coord).expect("geom");
+            let mut store = Inkling2StateStore::new(coord.block_size(), recency);
+            store.set_geometry(geom);
+            store.set_ram_cap(ram_cap);
+
+            let cp_tokens: Vec<u32> = (500u32..564u32).collect();
+            coord.reset_scheduled_request(1).expect("reset cp");
+            coord.record_tokens_all(1, &cp_tokens).expect("record cp");
+            let cp_id = store
+                .capture_boundary(
+                    &mut coord,
+                    &fx.conv,
+                    1,
+                    &cp_tokens,
+                    32,
+                    999,
+                    StateClass::Checkpoint,
+                    None,
+                )
+                .expect("capture cp")
+                .expect("cp_id");
+            store.clear_seq_checkpoint(1);
+
+            for i in 1u64..=30 {
+                let base = (i as u32) * 100;
+                let tokens: Vec<u32> = (base..base + 64).collect();
+                coord.reset_scheduled_request(1).expect("reset seq 1");
+                coord.record_tokens_all(1, &tokens).expect("record tokens");
+                store
+                    .capture_boundary(
+                        &mut coord,
+                        &fx.conv,
+                        1,
+                        &tokens,
+                        32,
+                        i,
+                        StateClass::Ordinary,
+                        None,
+                    )
+                    .expect("capture ordinary");
+                assert!(
+                    store.ram_len() <= ram_cap,
+                    "RAM-only store must strictly cap ram_len={} <= {ram_cap} after insert {i}",
+                    store.ram_len()
+                );
+                if i == ram_cap as u64 {
+                    assert!(
+                        store.store.get(cp_id).is_none(),
+                        "Checkpoint must be retired first when ram_cap is exceeded"
+                    );
+                }
+            }
+            assert_eq!(store.ram_len(), ram_cap);
+        }
+
+        // Part 2: With StateDisk attached, inserting 30 Ordinary anchors caps `ram_len() <= ram_cap`,
+        // drops RAM on landed SSD copies, and keeps SSD-only entries 100% restorable!
+        let mut s = fx.open(512u64 << 20, None);
+        s.store.set_ram_cap(ram_cap);
+        let packed_dw = fx.packed_dw(32);
+
+        let mut captured: Vec<(EntryId, Vec<u32>, u64)> = Vec::new();
+        for i in 1u64..=30 {
+            let base = (i as u32) * 100;
+            let tokens: Vec<u32> = (base..base + 64).collect();
+            let eid = s.capture_ord(&fx.conv, 1, &tokens, 32, i, Some(&packed_dw));
+            captured.push((eid, tokens, i));
+            if i % 3 == 0 {
+                assert!(s.flush(10), "flush_to_disk at i={i}");
+                assert!(
+                    s.store.ram_len() <= ram_cap,
+                    "post-flush ram_len={} must be <= ram_cap={ram_cap} at i={i}",
+                    s.store.ram_len()
+                );
+            } else {
+                assert!(
+                    s.store.ram_len() <= ram_cap + 2,
+                    "in-flight burst ram_len={} must stay <= ram_cap + 2 at i={i}",
+                    s.store.ram_len()
+                );
+            }
+        }
+        assert!(s.flush(10), "final flush_to_disk");
+        assert!(s.store.ram_len() <= ram_cap);
+
+        let disk_only: Vec<_> = captured
+            .into_iter()
+            .filter(|(eid, _, _)| {
+                s.store.store.get(*eid).is_some_and(|e| {
+                    e.ram().is_none() && e.disk().is_some_and(|d| d.landed && !d.chain_owed)
+                })
+            })
+            .collect();
+        assert!(
+            disk_only.len() >= 10,
+            "expected >=10 RAM-dropped SSD-backed entries, got {}",
+            disk_only.len()
+        );
+
+        s.coord.release_all_and_purge().expect("purge hot pools");
+        for (eid, tokens, salt) in disk_only.iter().take(5) {
+            let hit = s
+                .store
+                .lookup_deepest_restorable(&s.coord, tokens, *salt)
+                .expect("SSD-only entry must remain restorable");
+            assert_eq!((hit.id, hit.depth), (*eid, 32));
+            let (anchor, from_ssd) = s.store.load_anchor(&s.coord, hit.id).expect("load SSD");
+            assert!(from_ssd);
+            assert_eq!(anchor.draft_window.as_ref(), Some(&packed_dw));
+        }
+        assert!(s.close());
+    }
+
+    /// Finding 3 regression: RAM must NOT be dropped while a state blob has landed
+    /// (`copy.landed == true`) but its Global KV chain is still owed (`copy.chain_owed == true`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_keeps_ram_until_blob_and_chain_both_land() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("chain-owed-ram", b"chain-owed-ram-v1", Some(0.0));
+        let mut s = fx.open(512u64 << 20, None);
+        s.store.set_ram_cap(1);
+
+        let tokens_a: Vec<u32> = (100u32..164u32).collect();
+        let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 32, 11, None);
+        assert!(s.stage(id_a), "staging entry A state blob must succeed");
+        s.await_writing("entry A blob landing");
+        {
+            let entry_a = s.entry(id_a);
+            assert!(entry_a.disk().is_some_and(|c| c.landed && c.chain_owed));
+            assert!(entry_a.ram().is_some());
+            assert!(!s.disk().entry_disk_restorable(entry_a));
+        }
+
+        // Capturing entry B (exceeds `ram_cap = 1`) must NOT drop A's RAM while `chain_owed`.
+        let tokens_b: Vec<u32> = (200u32..264u32).collect();
+        let _id_b = s.capture_ord(&fx.conv, 1, &tokens_b, 32, 22, None);
+        assert!(s.entry(id_a).ram().is_some());
+        assert!(s.store.is_restorable(&s.coord, id_a));
+        assert_eq!(
+            s.store
+                .lookup_deepest_restorable(&s.coord, &tokens_a, 11)
+                .expect("entry A discoverable")
+                .id,
+            id_a
+        );
+
+        // Landing A's Global KV chain drops A's RAM copy while keeping A 100% SSD-restorable.
+        s.await_landed(id_a, "entry A Global KV chain");
+        assert!(s.entry(id_a).ram().is_none());
+        assert!(s.store.ram_len() <= 1);
+        assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
+
+        s.drop_ram_and_purge();
+        s.assert_ssd_restores(&tokens_a, 11, Some(id_a), None);
+        assert!(s.close());
+    }
+
+    /// Finding 4 regression: an SSD-only v2 anchor adopted on restart with `draft_window == None`
+    /// upgrades cleanly when a subsequent DFlash2 turn captures a complete `PackedDraftWindow`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_upgrades_adopted_ssd_only_anchor_missing_draft_window() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx =
+            StateDiskTestFixture::new("upgrade-adopted-dw", b"upgrade-adopted-dw-v1", Some(0.0));
+        let tokens: Vec<u32> = (300u32..396u32).collect();
+        let query: Vec<u32> = (300u32..370u32).collect();
+        let packed_dw = fx.packed_dw(64);
+        assert!(packed_dw.is_complete_for(64));
+
+        fx.seed_durable(&[(1, &tokens, 64, 7)], 512u64 << 20, None);
+
+        {
+            let mut s2 = fx.open_adopted(512u64 << 20, None, 1);
+            let adopted_id = s2.first_id();
+            assert!(s2.entry(adopted_id).ram().is_none());
+            assert!(s2.store.adopted_unverified_window.contains(&adopted_id));
+
+            let upgraded_id = s2.capture(
+                &fx.conv,
+                1,
+                &tokens,
+                64,
+                7,
+                StateClass::Checkpoint,
+                Some(&packed_dw),
+            );
+            assert_eq!(s2.store.store.entries().count(), 1);
+            let upgraded = s2.entry(upgraded_id);
+            assert!(!upgraded.checkpoint());
+            assert_eq!(
+                upgraded.ram().and_then(|a| a.draft_window.as_ref()),
+                Some(&packed_dw)
+            );
+            assert!(
+                !s2.store.entries_missing_draft_window.contains(&upgraded_id)
+                    && !s2.store.adopted_unverified_window.contains(&upgraded_id)
+            );
+            assert!(s2.flush(10));
+            assert!(s2.close());
+        }
+
+        {
+            let mut s3 = fx.open_adopted(512u64 << 20, None, 1);
+            let hit = s3
+                .store
+                .lookup_deepest_restorable(&s3.coord, &query, 7)
+                .expect("lookup upgraded anchor after restart");
+            assert_eq!(hit.depth, 64);
+            let (anchor, from_ssd) = s3
+                .store
+                .load_anchor(&s3.coord, hit.id)
+                .expect("load upgraded anchor");
+            assert!(from_ssd);
+            assert_eq!(anchor.draft_window.as_ref(), Some(&packed_dw));
+            assert!(
+                !s3.store.adopted_unverified_window.contains(&hit.id)
+                    && !s3.store.entries_missing_draft_window.contains(&hit.id)
+            );
+            assert!(s3.close());
+        }
+    }
+
+    /// Round-2 Finding 1 regression #1: under a tight SSD quota fitting only 1 state blob + its
+    /// Global KV chain, upgrading an adopted v2-without-window anchor succeeds with ZERO evictions.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_quota_constrained_upgrade_preserves_kv_chain_and_blob() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx =
+            StateDiskTestFixture::new("tight-quota-upgrade", b"tight-quota-upgrade-v1", Some(0.0));
+        let tokens: Vec<u32> = (400u32..496u32).collect();
+        let query: Vec<u32> = (400u32..470u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        let (exact_total, state_disk_bytes) =
+            fx.seed_durable(&[(1, &tokens, 64, 9)], 512u64 << 20, None);
+        assert!(exact_total > state_disk_bytes);
+        let tight_limit = exact_total + 64;
+        assert!(tight_limit < exact_total + state_disk_bytes);
+
+        {
+            let mut s2 = fx.open_adopted(tight_limit, None, 1);
+            let adopted_id = s2.first_id();
+            let old_copy = s2.disk_copy(adopted_id);
+
+            let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens, 64, 9, Some(&packed_dw));
+            assert_eq!(upgraded_id, adopted_id);
+            assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+            assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+
+            assert!(s2.flush(10), "tight-quota flush must overwrite cleanly");
+            assert_eq!(s2.manager().stats().evictions, 0);
+            assert!(s2.disk().entry_disk_restorable(s2.entry(upgraded_id)));
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.close());
+        }
+
+        {
+            let mut s3 = fx.open_adopted(tight_limit, None, 1);
+            s3.assert_ssd_restores(&query, 9, None, Some(&packed_dw));
+            assert!(s3.close());
+        }
+    }
+
+    /// Round-2 Finding 1 regression #2: if a replacement SSD write during an anchor upgrade
+    /// fails (`Staged::Busy` or read-only dir), the old durable `DiskCopy` survives immediately
+    /// and across restart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_failed_upgrade_write_preserves_old_ssd_copy_immediately_and_after_restart() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut fx = StateDiskTestFixture::new("failed-upgrade", b"failed-upgrade-v1", Some(0.0));
+        let tokens: Vec<u32> = (500u32..596u32).collect();
+        let query: Vec<u32> = (500u32..570u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens, 64, 12)], 512u64 << 20, None);
+
+        {
+            let mut s2 = fx.open_adopted(512u64 << 20, None, 1);
+            let adopted_id = s2.first_id();
+            let old_copy = s2.disk_copy(adopted_id);
+
+            let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens, 64, 12, Some(&packed_dw));
+            assert_eq!(upgraded_id, adopted_id);
+
+            // 2a. Staging failure (`Staged::Busy` via ReadWait): old `DiskCopy` stays intact.
+            let read_wait = s2.disk().acquire_read_wait();
+            assert!(!s2.stage(upgraded_id));
+            assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+            assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            drop(read_wait);
+
+            // 2b. Writer-thread failure (read-only namespace dir): `poll_offload` restores `old_copy`.
+            let ns_dir = s2.manager().root().to_path_buf();
+            fx.chmod_readonly(&ns_dir);
+
+            assert!(s2.stage(upgraded_id));
+            assert_eq!(
+                s2.store
+                    .in_flight_disk_upgrade
+                    .as_ref()
+                    .map(|u| (u.id, u.old_copy)),
+                Some((upgraded_id, old_copy))
+            );
+            assert!(!s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+
+            s2.await_writing("failed upgrade");
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.disk_counters().offload_failures >= 1);
+            assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+            assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+            assert!(s2.disk().entry_disk_restorable(s2.entry(upgraded_id)));
+
+            s2.drop_ram_and_purge();
+            assert!(s2.store.entries_missing_draft_window.contains(&upgraded_id));
+            s2.assert_ssd_restores(&query, 12, Some(upgraded_id), None);
+
+            fx.restore_chmod();
+            assert!(
+                !s2.close(),
+                "closing drain barrier must report the injected write failure"
+            );
+        }
+
+        {
+            let mut s3 = fx.open_adopted(512u64 << 20, None, 1);
+            s3.assert_ssd_restores(&query, 12, None, None);
+            assert!(s3.close());
+        }
+    }
+
+    /// Round-2 Finding 3 regression: while `chain_owed == true`, `reclaim_entry` returns `Pending`
+    /// and keeps RAM intact; if the Global KV chain write fails, only the broken `DiskCopy` is
+    /// cleared while the RAM anchor stays restorable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reclaim_entry_keeps_ram_while_chain_owed_and_survives_chain_failure() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let mut fx =
+            StateDiskTestFixture::new("reclaim-chain-owed", b"reclaim-chain-owed-v1", None);
+        let mut s = fx.open(512u64 << 20, None);
+        let tokens: Vec<u32> = (600u32..696u32).collect();
+        let query: Vec<u32> = (600u32..670u32).collect();
+
+        let entry_id = s.capture_ord(&fx.conv, 1, &tokens, 64, 15, None);
+        assert!(s.stage(entry_id));
+        s.await_writing("state blob");
+        assert!(s.entry(entry_id).ram().is_some());
+        assert!(
+            s.entry(entry_id)
+                .disk()
+                .is_some_and(|c| c.landed && c.chain_owed)
+        );
+
+        assert_eq!(
+            s.store.reclaim_entry(&s.coord, entry_id),
+            ReclaimOutcome::Pending
+        );
+        assert!(s.entry(entry_id).ram().is_some());
+
+        let ns_dir = s.manager().root().to_path_buf();
+        fx.chmod_readonly(&ns_dir);
+        let dl = test_deadline(10);
+        while s
+            .store
+            .store
+            .get(entry_id)
+            .is_some_and(|e| e.disk().is_some())
+        {
+            assert!(Instant::now() < dl, "timed out failing KV chain write");
+            s.store.chain_step(&s.coord, dl);
+            let _ = s.disk().engine.await_landing(dl);
+            s.store.poll_offload(&s.coord);
+        }
+
+        assert!(s.entry(entry_id).ram().is_some());
+        assert!(s.entry(entry_id).disk().is_none());
+        let hit = s
+            .store
+            .lookup_deepest_restorable(&s.coord, &query, 15)
+            .expect("RAM anchor restorable after KV chain failure");
+        assert_eq!(hit.id, entry_id);
+        let (_, from_ssd) = s.store.load_anchor(&s.coord, entry_id).expect("load RAM");
+        assert!(!from_ssd);
+
+        fx.restore_chmod();
+        let _ = s.close();
+    }
+
+    /// Round-3 Finding 2 regression: when volume free space above reserve < `new_state`,
+    /// `stage_entry` defers cleanly without evicting KV blocks or losing `old_copy`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_in_place_upgrade_defers_without_eviction_when_reserve_headroom_low() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx =
+            StateDiskTestFixture::new("upgrade-low-reserve", b"low-reserve-upgrade-v1", Some(0.0));
+        let tokens: Vec<u32> = (600u32..696u32).collect();
+        let query: Vec<u32> = (600u32..670u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        let (_, old_state_bytes) = fx.seed_durable(&[(1, &tokens, 64, 21)], 64u64 << 20, None);
+
+        let available = crate::disk_tier::volume_of(&fx.cache_dir)
+            .expect("measure test volume")
+            .available;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(available.saturating_sub(1024)), 1);
+        let adopted_id = s2.first_id();
+        let old_copy = s2.disk_copy(adopted_id);
+
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens, 64, 21, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        let free = s2
+            .manager()
+            .room_above_reserve()
+            .expect("room_above_reserve");
+        assert!(free < old_state_bytes);
+        assert!(s2.disk().point_fits(s2.entry(upgraded_id), MakeRoom::Evict));
+
+        assert!(!s2.stage(upgraded_id), "must defer when free < new_state");
+        assert_eq!(s2.manager().stats().evictions, 0);
+        assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert!(s2.disk().entry_disk_restorable(s2.entry(upgraded_id)));
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query, 21, Some(upgraded_id), None);
+        let _ = s2.close();
+    }
+
+    /// Round-3 Finding 4 regression: recoverable upgrade staging refusals and failed replacement
+    /// writes keep the upgrade queued in `write_behind`, let `flush_to_disk` exit promptly, and
+    /// retry automatically once the failure clears.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_recoverable_upgrade_stays_queued_and_retries_until_landed() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx =
+            StateDiskTestFixture::new("upgrade-retry-queue", b"retry-queue-upgrade-v1", Some(0.0));
+        let tokens: Vec<u32> = (700u32..796u32).collect();
+        let query: Vec<u32> = (700u32..770u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens, 64, 33)], 64u64 << 20, None);
+
+        let mut s2 = fx.open_adopted(64u64 << 20, None, 1);
+        let adopted_id = s2.first_id();
+        let old_copy = s2.disk_copy(adopted_id);
+
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens, 64, 33, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        // 2a. Temporary staging refusal (`ReadWait` held -> `Staged::Busy`).
+        let read_wait = s2.disk().acquire_read_wait();
+        assert!(!s2.store.drive_write_behind(&s2.coord, true));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert!(s2.has_wb(upgraded_id));
+        s2.assert_flush_fails_promptly("blocked upgrade");
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert!(s2.has_wb(upgraded_id));
+        drop(read_wait);
+
+        // 2b. Simulate recoverable writer failure -> `poll_offload` reconciles & re-queues.
+        s2.store.pending_disk_upgrades.remove(&upgraded_id);
+        s2.store
+            .set_in_flight_upgrade_for_test(upgraded_id, old_copy);
+        s2.store.store.set_disk(upgraded_id, None);
+        s2.disk_mut().write_behind.clear();
+
+        assert!(s2.store.poll_offload(&s2.coord));
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert!(s2.has_wb(upgraded_id));
+
+        // 2c. Once cleared, `tick` retries and `flush_to_disk` lands the upgraded window.
+        let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
+        assert!(s2.flush(10));
+        assert!(s2.store.pending_disk_upgrades.is_empty());
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query, 33, None, Some(&packed_dw));
+        assert!(s2.close());
+    }
+
+    /// Round-4 Finding 1 regression: even if volume headroom drops between staging pre-check and
+    /// writer execution, in-place upgrades use `MakeRoom::Refuse`, evict ZERO objects, and restore
+    /// `old_copy`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_in_place_upgrade_refuses_without_eviction_on_writer_headroom_drop() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = StateDiskTestFixture::new(
+            "upgrade-writer-refuse",
+            b"writer-headroom-drop-v1",
+            Some(10.0),
+        );
+        let tokens: Vec<u32> = (800u32..896u32).collect();
+        let query: Vec<u32> = (800u32..870u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens, 64, 41)], 64u64 << 20, None);
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 1);
+        let adopted_id = s2.first_id();
+        let old_copy = s2.disk_copy(adopted_id);
+
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens, 64, 41, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        let new_state_bytes = s2.state_object_bytes_for(upgraded_id);
+        let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(upgraded_id));
+        assert_eq!(kv_keys.len(), 2);
+        assert!(s2.manager().total_bytes().saturating_sub(old_copy.bytes) > 0);
+
+        let writer_probes = Arc::new(AtomicUsize::new(0));
+        s2.set_writer_space(
+            reserve + new_state_bytes.saturating_mul(10),
+            reserve + new_state_bytes.saturating_sub(1),
+            Some(Arc::clone(&writer_probes)),
+        );
+
+        assert!(s2.stage(upgraded_id));
+        assert_eq!(
+            s2.store
+                .in_flight_disk_upgrade
+                .as_ref()
+                .map(|u| (u.id, u.old_copy)),
+            Some((upgraded_id, old_copy))
+        );
+        s2.await_writing("writer headroom drop");
+        s2.clear_space_override(false);
+
+        assert!(writer_probes.load(Ordering::Relaxed) >= 1);
+        assert_eq!(s2.manager().stats().evictions, 0);
+        assert!(s2.disk().writable());
+        assert!(s2.disk().counters.offload_failures >= 1);
+        assert!(
+            s2.manager()
+                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+        );
+        for k in &kv_keys {
+            assert!(s2.manager().contains_in(k, ColdGroup::Kv));
+        }
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert!(s2.disk().entry_disk_restorable(s2.entry(upgraded_id)));
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query, 41, Some(upgraded_id), None);
+        let _ = s2.close();
+    }
+
+    /// Round-4 Finding 2 regression (part 1): a shallow adopted SSD anchor updates
+    /// `entry.state_bytes()` and `total_ram_bytes()` to exact live RAM bytes on `promote` and
+    /// in-place `capture_boundary` upgrade.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_shallow_adopted_upgrade_updates_exact_ram_bytes() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("shallow-ram-bytes", b"shallow-ram-bytes-v1", Some(0.0))
+            .with_paged(512, 2);
+        let tokens_a: Vec<u32> = (900u32..940u32).collect();
+        let tokens_b: Vec<u32> = (950u32..990u32).collect();
+        let packed_dw32 = fx.packed_dw(32);
+
+        fx.seed_durable(
+            &[(1, &tokens_a, 32, 61), (2, &tokens_b, 32, 62)],
+            64u64 << 20,
+            None,
+        );
+
+        let mut s2 = fx.open_adopted(64u64 << 20, None, 2);
+        let id_a = s2.id_by_salt(61);
+        let id_b = s2.id_by_salt(62);
+        let lin_a = s2.entry(id_a).state_bytes();
+        let lin_b = s2.entry(id_b).state_bytes();
+        let payload = s2.geom.payload_bytes();
+        assert_eq!(s2.entry(id_a).resident_bytes(), payload + lin_a);
+        assert_eq!(s2.entry(id_b).resident_bytes(), payload + lin_b);
+
+        // 1. Promoting shallow adopted anchor A updates `cached_bytes` to exact decoded live bytes.
+        let (anchor_a, from_ssd) = s2.store.load_anchor(&s2.coord, id_a).expect("load A");
+        assert!(from_ssd);
+        let live_swa_32 = s2.geom.live_swa_bytes(32).expect("live_swa_bytes(32)") as u64;
+        let expected_a_ram = live_swa_32 + s2.geom.conv_span_bytes;
+        assert_eq!(anchor_a.cached_bytes, expected_a_ram);
+        assert!(expected_a_ram < payload);
+        assert!(s2.store.store.promote(id_a, anchor_a));
+        assert_eq!(s2.entry(id_a).state_bytes(), expected_a_ram + lin_a);
+        assert_eq!(s2.store.total_ram_bytes(), expected_a_ram + lin_a + lin_b);
+
+        // 2. Upgrading shallow adopted anchor B in place updates `cached_bytes` atomically.
+        let upgraded_b = s2.capture_ord(&fx.conv, 2, &tokens_b, 32, 62, Some(&packed_dw32));
+        assert_eq!(upgraded_b, id_b);
+        let expected_b_ram = live_swa_32 + s2.geom.conv_span_bytes + packed_dw32.bytes.len() as u64;
+        assert!(expected_b_ram < payload);
+        assert_eq!(s2.entry(id_b).state_bytes(), expected_b_ram + lin_b);
+        assert_eq!(
+            s2.store.total_ram_bytes(),
+            expected_a_ram + lin_a + expected_b_ram + lin_b
+        );
+        let _ = s2.close();
+    }
+
+    /// Round-4 Finding 2 regression (part 2): upgrading a RAM-resident anchor in-place with a
+    /// `PackedDraftWindow` increases `state_bytes()`/`total_ram_bytes()` by exact `dw_len`, and
+    /// `inkling2_take_victim` credits only the exact bytes actually freed from RAM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_ram_upgrade_updates_bytes_and_take_victim_credits_exact_freed() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::governor::ledger::FreeOutcome;
+
+        let fx = StateDiskTestFixture::new("ram-upgrade-bytes", b"ram-upgrade-bytes-v1", Some(0.0));
+        let patient_query = patient_victim_query();
+        let mut inner =
+            crate::models::inkling2::scheduler::tests::build_synthetic_dflash2_inner(256, None);
+        attach_synthetic_disk(&fx, &mut inner);
+
+        let conv = make_short_conv(&inner.config);
+        let tokens_a: Vec<u32> = (10u32..50u32).collect();
+        let tokens_b: Vec<u32> = (60u32..100u32).collect();
+        let draft_cfg = inner.dflash2.as_ref().expect("dflash2").config.clone();
+        let dw = make_draft_window(
+            draft_cfg.context_width(),
+            draft_cfg.sliding_window as u32,
+            32,
+        );
+        let dw_len =
+            DraftContextWindow::bytes(draft_cfg.context_width(), draft_cfg.sliding_window as u32);
+        assert!(dw_len > 0);
+
+        // 1. Capture A without draft window, flush to SSD, then upgrade A in-place.
+        let (id_a, before_entry, before_total) = {
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.reset_scheduled_request(1).expect("reset 1");
+            rt.coordinator
+                .record_tokens_all(1, &tokens_a)
+                .expect("record a");
+            let id_a = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &tokens_a,
+                    32,
+                    71,
+                    StateClass::Ordinary,
+                    None,
+                )
+                .expect("capture A None")
+                .expect("id_a");
+            assert!(
+                rt.state_store
+                    .flush_to_disk(&rt.coordinator, test_deadline(10))
+            );
+            let entry = rt.state_store.store.get(id_a).unwrap();
+            assert!(entry.ram().is_some() && entry.disk().is_some_and(|d| d.landed));
+            (id_a, entry.state_bytes(), rt.state_store.total_ram_bytes())
+        };
+
+        let (upgraded_entry, upgraded_ram, lineage_a) = {
+            let packed_dw_a = PackedDraftWindow::from_window(&dw).expect("packed_dw_a");
+            assert_eq!(packed_dw_a.bytes.len() as u64, dw_len);
+            let rt = inner.paged.as_mut().expect("paged");
+            let upgraded_id = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &tokens_a,
+                    32,
+                    71,
+                    StateClass::Ordinary,
+                    Some(&packed_dw_a),
+                )
+                .expect("upgrade A")
+                .expect("upgraded_id");
+            assert_eq!(upgraded_id, id_a);
+            let entry = rt.state_store.store.get(id_a).unwrap();
+            let after_entry = entry.state_bytes();
+            let after_total = rt.state_store.total_ram_bytes();
+            let ram_bytes = entry.ram().unwrap().state_bytes();
+            assert_eq!(after_entry, before_entry + dw_len);
+            assert_eq!(after_total, before_total + dw_len);
+            (after_entry, ram_bytes, after_entry - ram_bytes)
+        };
+        assert!(lineage_a > 0);
+
+        // 2. Reclaiming SSD-backed A credits exact freed RAM bytes (excluding retained lineage).
+        let taken_a =
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, upgraded_entry));
+        assert_eq!(taken_a.outcome, FreeOutcome::Met);
+        assert_eq!(taken_a.now_bytes, upgraded_ram);
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            let after = rt.state_store.store.get(id_a).expect("disk entry retained");
+            assert!(after.ram().is_none());
+            assert_eq!(after.state_bytes(), lineage_a);
+            assert_eq!(upgraded_entry - after.state_bytes(), taken_a.now_bytes);
+        }
+
+        // 3. Without a disk tier, erasing B credits full `state_bytes()` (RAM + lineage).
+        let _ = inner.close_state_disk(test_deadline(5));
+        let (id_b, b_full_bytes) = {
+            let packed_dw_b = PackedDraftWindow::from_window(&dw).expect("packed_dw_b");
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.state_store.disk = None;
+            rt.coordinator.reset_scheduled_request(2).expect("reset 2");
+            rt.coordinator
+                .record_tokens_all(2, &tokens_b)
+                .expect("record b");
+            let id_b = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    2,
+                    &tokens_b,
+                    32,
+                    72,
+                    StateClass::Ordinary,
+                    Some(&packed_dw_b),
+                )
+                .expect("capture B")
+                .expect("id_b");
+            (id_b, rt.state_store.store.get(id_b).unwrap().state_bytes())
+        };
+        let taken_b =
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, b_full_bytes));
+        assert_eq!(taken_b.outcome, FreeOutcome::Met);
+        assert_eq!(taken_b.now_bytes, b_full_bytes);
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .store
+                .get(id_b)
+                .is_none()
+        );
+    }
+
+    /// Round-4 Finding 3 regression: above `ram_cap` with a writer-side refusal on an in-place
+    /// upgrade, `poll_offload` does NOT immediately re-stage via `trim_ram_to_cap`, and
+    /// `flush_to_disk` exits promptly without spinning.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_failed_upgrade_backs_off_from_ram_trim_and_flush_exits_promptly() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = StateDiskTestFixture::new(
+            "upgrade-backoff-flush",
+            b"upgrade-backoff-flush-v1",
+            Some(10.0),
+        );
+        let tokens_a: Vec<u32> = (1000u32..1096u32).collect();
+        let tokens_b: Vec<u32> = (1100u32..1196u32).collect();
+        let query_a: Vec<u32> = (1000u32..1070u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens_a, 64, 81)], 64u64 << 20, None);
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 1);
+        s2.store.set_ram_cap(4);
+        let adopted_id = s2.first_id();
+        let old_copy = s2.disk_copy(adopted_id);
+
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 81, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        let other_id = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 82, None);
+        s2.disk_mut().write_behind.retain(|w| w.id != other_id);
+        let other_mark = s2.entry(other_id).mark();
+        s2.store.store.use_state(other_mark);
+        s2.store.set_ram_cap(1);
+        assert_eq!(s2.store.ram_len(), 2);
+
+        let new_state_bytes = s2.state_object_bytes_for(upgraded_id);
+        let writer_refusals = Arc::new(AtomicUsize::new(0));
+        s2.set_writer_space(
+            reserve + new_state_bytes.saturating_mul(10),
+            reserve + 1024,
+            Some(Arc::clone(&writer_refusals)),
+        );
+
+        // Part A: writer refuses -> `poll_offload` does NOT immediately re-stage via `trim_ram_to_cap`.
+        assert!(s2.stage(upgraded_id));
+        s2.await_writing("writer refusal");
+        assert_eq!(writer_refusals.load(Ordering::Relaxed), 1);
+        assert!(!s2.disk().writing());
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        s2.store.trim_ram_to_cap(&s2.coord, None);
+        assert!(!s2.disk().writing());
+
+        // Part B: `flush_to_disk` attempts once and exits promptly without spinning.
+        writer_refusals.store(0, Ordering::Relaxed);
+        s2.assert_flush_fails_promptly("writer refusal");
+        assert_eq!(writer_refusals.load(Ordering::Relaxed), 1);
+        assert!(!s2.disk().writing());
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert_eq!(s2.entry(upgraded_id).disk().copied(), Some(old_copy));
+        assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+        assert_eq!(s2.manager().stats().evictions, 0);
+
+        // Part C: once space recovers, drain reports prior refusals and flush lands cleanly.
+        assert!(!s2.clear_space_override(true));
+        s2.store.store.end_use(other_mark);
+        assert!(s2.flush(10));
+        assert!(s2.store.pending_disk_upgrades.is_empty());
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query_a, 81, None, Some(&packed_dw));
+        assert!(s2.close());
+    }
+
+    /// Round-5 Finding 1 regression: writer-side space refusal on an ordinary spill records
+    /// `spill_backoff` without re-staging, and `load_anchor` holds `ReadWait` so `trim_ram_to_cap`
+    /// cannot steal the staging buffer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_refused_ordinary_spill_backs_off_and_does_not_starve_load_anchor() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = StateDiskTestFixture::new(
+            "ordinary-spill-backoff",
+            b"ordinary-spill-backoff-v1",
+            Some(10.0),
+        )
+        .with_paged(2048, 4);
+        let tokens_a: Vec<u32> = (1200u32..1296u32).collect();
+        let tokens_b: Vec<u32> = (1300u32..1396u32).collect();
+        let tokens_c: Vec<u32> = (1400u32..1496u32).collect();
+        let tokens_d: Vec<u32> = (1500u32..1596u32).collect();
+        let tokens_e: Vec<u32> = (1600u32..1696u32).collect();
+        let packed_dw_c = fx.packed_dw(64);
+
+        let reserve = 4096u64;
+        let mut s = fx.open(64u64 << 20, Some(reserve));
+        s.store.set_ram_cap(8);
+
+        // Part A: writer refuses ordinary spill A above `ram_cap`.
+        let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 91, None);
+        let id_b = s.capture_ord(&fx.conv, 2, &tokens_b, 64, 92, None);
+        let mark_b = s.entry(id_b).mark();
+        s.store.store.use_state(mark_b);
+        s.store.set_ram_cap(1);
+        assert_eq!(s.store.ram_len(), 2);
+        assert!(s.store.pending_disk_upgrades.is_empty());
+
+        let state_bytes_a = s.state_object_bytes_for(id_a);
+        let writer_refusals = Arc::new(AtomicUsize::new(0));
+        s.set_writer_space(
+            reserve + state_bytes_a.saturating_mul(10),
+            reserve + 1024,
+            Some(Arc::clone(&writer_refusals)),
+        );
+
+        s.store.trim_ram_to_cap(&s.coord, None);
+        assert!(s.disk().writing());
+        s.await_writing("ordinary spill refusal");
+        assert_eq!(s.disk().counters.offload_failures, 1);
+        assert_eq!(writer_refusals.load(Ordering::Relaxed), 1);
+        assert!(!s.disk().writing());
+        assert!(s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.entry(id_a).disk().is_none() && s.entry(id_a).ram().is_some());
+
+        s.store.trim_ram_to_cap(&s.coord, None);
+        s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert!(!s.disk().writing());
+        assert_eq!(s.disk().counters.offload_failures, 1);
+        assert_eq!(writer_refusals.load(Ordering::Relaxed), 1);
+
+        // Part B: `load_anchor(id_c)` acquires `ReadWait` so E cannot steal staging buffer.
+        assert!(!s.clear_space_override(true));
+        s.store.set_ram_cap(8);
+        let id_c = s.capture_ord(&fx.conv, 3, &tokens_c, 64, 93, Some(&packed_dw_c));
+        assert!(s.stage(id_c));
+        s.await_landed(id_c, "landing C");
+        s.store.store.drop_ram(id_c);
+        assert!(s.entry(id_c).ram().is_none());
+        assert!(s.store.spill_backoff.contains_key(&id_a));
+
+        let id_d = s.capture_ord(&fx.conv, 4, &tokens_d, 64, 94, None);
+        let id_e = s.capture_ord(&fx.conv, 1, &tokens_e, 64, 95, None);
+        s.store.set_ram_cap(2);
+        assert!(s.stage(id_d));
+        assert!(s.disk().writing() && !s.disk().staging_free());
+
+        let (restored_c, from_ssd) = s.store.load_anchor(&s.coord, id_c).expect("load C");
+        assert!(from_ssd);
+        assert_eq!(restored_c.draft_window.as_ref(), Some(&packed_dw_c));
+        assert!(!s.disk().writing());
+        assert_eq!(s.disk().engine.read_waiters(), 0);
+        assert!(s.entry(id_e).disk().is_none());
+
+        s.store.store.end_use(mark_b);
+        s.store.set_ram_cap(8);
+        assert!(s.flush(10));
+        assert!(!s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.close());
+    }
+
+    /// Round-5 Finding 3 regression: when a queued SSD upgrade's old Global KV chain was evicted,
+    /// `flush_to_disk` detects it, rewrites the blob + repairs the KV chain, and survives restart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_upgrade_repairs_evicted_global_kv_chain_and_survives_restart() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "upgrade-evicted-chain",
+            b"upgrade-evicted-chain-v1",
+            Some(0.0),
+        );
+        let tokens_a: Vec<u32> = (2000u32..2096u32).collect();
+        let query_a: Vec<u32> = (2000u32..2070u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens_a, 64, 97)], 64u64 << 20, None);
+
+        {
+            let mut s2 = fx.open_adopted(64u64 << 20, None, 1);
+            let adopted_id = s2.first_id();
+            let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 97, Some(&packed_dw));
+            assert_eq!(upgraded_id, adopted_id);
+            assert!(s2.store.pending_disk_upgrades.contains_key(&upgraded_id));
+
+            let evicted_kv_key = s2.evict_kv_block(upgraded_id, 1);
+            assert!(!s2.disk().engine.chain_on_disk(s2.entry(upgraded_id)));
+
+            assert!(s2.flush(10));
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.manager().contains_in(&evicted_kv_key, ColdGroup::Kv));
+            assert!(s2.disk().engine.chain_on_disk(s2.entry(upgraded_id)));
+            assert!(
+                s2.entry(upgraded_id)
+                    .disk()
+                    .is_some_and(|c| c.landed && !c.chain_owed)
+            );
+            assert!(s2.close());
+        }
+
+        let mut s3 = fx.open_adopted(64u64 << 20, None, 1);
+        s3.assert_ssd_restores(&query_a, 97, None, Some(&packed_dw));
+        assert!(s3.close());
+    }
+
+    /// Round-5 Finding 4 regression: shared `PackedDraftWindow` `Arc<[u8]>` between live sequence
+    /// and `state_store` is never double-counted or double-credited by `inkling2_take_victim`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_take_victim_never_double_credits_shared_draft_window_arc() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::governor::ledger::FreeOutcome;
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+
+        let fx = StateDiskTestFixture::new(
+            "shared-dw-arc-credit",
+            b"shared-dw-arc-credit-v1",
+            Some(0.0),
+        );
+        let patient_query = patient_victim_query();
+        let mut inner =
+            crate::models::inkling2::scheduler::tests::build_synthetic_dflash2_inner(256, None);
+        attach_synthetic_disk(&fx, &mut inner);
+
+        let conv = make_short_conv(&inner.config);
+        let tokens_a: Vec<u32> = (10u32..50u32).collect();
+        let tokens_b: Vec<u32> = (60u32..100u32).collect();
+        let tokens_c: Vec<u32> = (110u32..150u32).collect();
+        let draft_cfg = inner.dflash2.as_ref().expect("dflash2").config.clone();
+        let dw = make_draft_window(
+            draft_cfg.context_width(),
+            draft_cfg.sliding_window as u32,
+            32,
+        );
+
+        // 1. Entry A shares its `PackedDraftWindow` `Arc` with live seq 1.
+        let (id_a, swa_conv_a, dw_len, full_entry_a) = {
+            let packed_a = PackedDraftWindow::from_window(&dw).expect("packed_a");
+            let dw_len = packed_a.bytes.len() as u64;
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.reset_scheduled_request(1).expect("reset 1");
+            rt.coordinator
+                .record_tokens_all(1, &tokens_a)
+                .expect("record a");
+            let id_a = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &tokens_a,
+                    32,
+                    111,
+                    StateClass::Ordinary,
+                    Some(&packed_a),
+                )
+                .expect("capture A")
+                .expect("id_a");
+            assert!(
+                rt.state_store
+                    .flush_to_disk(&rt.coordinator, test_deadline(10))
+            );
+            rt.block_boundary_draft_window
+                .insert(1, (32, BoundaryDraftWindow::Packed(packed_a)));
+            let entry = rt.state_store.store.get(id_a).unwrap();
+            let anchor = entry.ram().unwrap();
+            let swa_conv = (anchor.swa_data.len() + anchor.conv_data.len()) as u64;
+            assert_eq!(anchor.exclusive_ram_bytes(), swa_conv);
+            assert_eq!(anchor.cached_bytes, swa_conv + dw_len);
+            assert_eq!(rt.draft_windows_bytes(), 0);
+            (id_a, swa_conv, dw_len, entry.state_bytes())
+        };
+
+        let states_before_a = inner.memory_accounts().expect("accounts").states;
+        let taken_a =
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_a, 1, full_entry_a));
+        assert_eq!(taken_a.outcome, FreeOutcome::Met);
+        assert_eq!(taken_a.now_bytes, swa_conv_a);
+        assert_eq!(
+            states_before_a - inner.memory_accounts().expect("accounts").states,
+            swa_conv_a
+        );
+        assert_eq!(inner.paged.as_ref().unwrap().draft_windows_bytes(), dw_len);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .block_boundary_draft_window
+            .remove(&1);
+        assert_eq!(inner.paged.as_ref().unwrap().draft_windows_bytes(), 0);
+
+        // 2. Entry B releases seq 2's clone -> reclaiming credits full `swa + conv + dw_len`.
+        let (id_b, swa_conv_b, full_entry_b) = {
+            let packed_b = PackedDraftWindow::from_window(&dw).expect("packed_b");
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.reset_scheduled_request(2).expect("reset 2");
+            rt.coordinator
+                .record_tokens_all(2, &tokens_b)
+                .expect("record b");
+            let id_b = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    2,
+                    &tokens_b,
+                    32,
+                    112,
+                    StateClass::Ordinary,
+                    Some(&packed_b),
+                )
+                .expect("capture B")
+                .expect("id_b");
+            assert!(
+                rt.state_store
+                    .flush_to_disk(&rt.coordinator, test_deadline(10))
+            );
+            rt.block_boundary_draft_window
+                .insert(2, (32, BoundaryDraftWindow::Packed(packed_b)));
+            let entry = rt.state_store.store.get(id_b).unwrap();
+            let swa_conv =
+                (entry.ram().unwrap().swa_data.len() + entry.ram().unwrap().conv_data.len()) as u64;
+            assert_eq!(entry.ram().unwrap().exclusive_ram_bytes(), swa_conv);
+            rt.block_boundary_draft_window.remove(&2);
+            let entry = rt.state_store.store.get(id_b).unwrap();
+            assert_eq!(
+                entry.ram().unwrap().exclusive_ram_bytes(),
+                swa_conv + dw_len
+            );
+            (id_b, swa_conv, entry.state_bytes())
+        };
+        let taken_b =
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_b, 2, full_entry_b));
+        assert_eq!(taken_b.outcome, FreeOutcome::Met);
+        assert_eq!(taken_b.now_bytes, swa_conv_b + dw_len);
+
+        // 3. RAM-only erased entry C with shared `Arc` credits `swa + conv + lineage` only.
+        let _ = inner.close_state_disk(test_deadline(5));
+        let (id_c, swa_conv_c, lineage_c, full_entry_c) = {
+            let packed_c = PackedDraftWindow::from_window(&dw).expect("packed_c");
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.release_request_all(1).expect("release 1");
+            rt.coordinator.release_request_all(2).expect("release 2");
+            rt.state_store.disk = None;
+            rt.coordinator.reset_scheduled_request(3).expect("reset 3");
+            rt.coordinator
+                .record_tokens_all(3, &tokens_c)
+                .expect("record c");
+            let id_c = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    3,
+                    &tokens_c,
+                    32,
+                    113,
+                    StateClass::Ordinary,
+                    Some(&packed_c),
+                )
+                .expect("capture C")
+                .expect("id_c");
+            rt.block_boundary_draft_window
+                .insert(3, (32, BoundaryDraftWindow::Packed(packed_c)));
+            let entry = rt.state_store.store.get(id_c).unwrap();
+            let ram = entry.ram().unwrap();
+            let swa_conv = (ram.swa_data.len() + ram.conv_data.len()) as u64;
+            let lineage = entry.state_bytes() - ram.cached_bytes;
+            assert!(lineage > 0);
+            (id_c, swa_conv, lineage, entry.state_bytes())
+        };
+        let taken_c =
+            inner.inkling2_take_victim(&patient_query, &store_victim(id_c, 3, full_entry_c));
+        assert_eq!(taken_c.outcome, FreeOutcome::Met);
+        assert_eq!(taken_c.now_bytes, swa_conv_c + lineage_c);
+
+        // 4. `BoundaryDraftWindow::Device` packs into an exclusively-owned `PackedDraftWindow`.
+        {
+            let tokens_d: Vec<u32> = (160u32..200u32).collect();
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.block_boundary_draft_window.clear();
+            rt.draft_windows.clear();
+            rt.coordinator.release_request_all(3).expect("release 3");
+            rt.coordinator.reset_scheduled_request(4).expect("reset 4");
+            rt.coordinator
+                .record_tokens_all(4, &tokens_d)
+                .expect("record d");
+            let dev_snap = dw.snapshot().expect("dev_snap");
+            let dev_nbytes = dev_snap.nbytes();
+            rt.block_boundary_draft_window
+                .insert(4, (32, BoundaryDraftWindow::Device(dev_snap)));
+            assert_eq!(rt.draft_windows_bytes(), dev_nbytes);
+            let boundary_win = rt
+                .block_boundary_draft_window
+                .get(&4)
+                .filter(|(wb, _)| *wb == 32)
+                .map(|(_, w)| w);
+            let id_d = rt
+                .state_store
+                .capture_boundary_with_window(
+                    &mut rt.coordinator,
+                    &conv,
+                    4,
+                    &tokens_d,
+                    32,
+                    114,
+                    StateClass::Ordinary,
+                    boundary_win,
+                    None,
+                )
+                .expect("capture D")
+                .expect("id_d");
+            let ram_d = rt.state_store.store.get(id_d).unwrap().ram().unwrap();
+            let swa_conv_d = (ram_d.swa_data.len() + ram_d.conv_data.len()) as u64;
+            assert!(ram_d.draft_window.is_some());
+            assert_eq!(ram_d.exclusive_ram_bytes(), swa_conv_d + dw_len);
+            assert_eq!(rt.draft_windows_bytes(), dev_nbytes);
+        }
+    }
+
+    /// Round-13 Finding 2 regression: reclaiming an anchor from `StateStore` while a live sequence
+    /// still holds a cloned `PackedDraftWindow` in `block_boundary_draft_window` keeps those host
+    /// bytes charged in `CacheLimitCoordinator::registered_pool_bytes()` until the sequence drops it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_budget_keeps_live_packed_draft_window_charged_after_anchor_reclaim() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::engine::governor::ledger::FreeOutcome;
+
+        let fx =
+            StateDiskTestFixture::new("r13-live-dw-budget", b"r13-live-dw-budget-v1", Some(0.0));
+        let local_coord = Arc::new(CacheLimitCoordinator::new_for_test());
+        let query = patient_victim_query();
+        let mut inner =
+            crate::models::inkling2::scheduler::tests::build_synthetic_dflash2_inner(256, None);
+        attach_synthetic_disk(&fx, &mut inner);
+        inner
+            .paged
+            .as_mut()
+            .expect("paged")
+            .state_store
+            .attach_host_budget_to(Arc::clone(&local_coord));
+
+        let conv = make_short_conv(&inner.config);
+        let dcfg = inner.dflash2.as_ref().expect("dflash2").config.clone();
+        let dw = make_draft_window(dcfg.context_width(), dcfg.sliding_window as u32, 32);
+
+        let seed = |inner: &mut crate::models::inkling2::model::Inkling2Inner,
+                    seq: u32,
+                    tokens: &[u32],
+                    salt: u64,
+                    flush: bool| {
+            let packed = PackedDraftWindow::from_window(&dw).expect("packed");
+            let dw_len = packed.bytes.len() as u64;
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.reset_scheduled_request(seq).expect("reset");
+            rt.coordinator
+                .record_tokens_all(seq, tokens)
+                .expect("record");
+            let id = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    seq,
+                    tokens,
+                    32,
+                    salt,
+                    StateClass::Ordinary,
+                    Some(&packed),
+                )
+                .expect("capture")
+                .expect("id");
+            if flush {
+                assert!(
+                    rt.state_store
+                        .flush_to_disk(&rt.coordinator, test_deadline(10))
+                );
+            }
+            rt.block_boundary_draft_window
+                .insert(seq, (32, BoundaryDraftWindow::Packed(packed)));
+            let entry = rt.state_store.store.get(id).unwrap();
+            let ram = entry.ram().unwrap();
+            let swa_conv = (ram.swa_data.len() + ram.conv_data.len()) as u64;
+            let lineage = entry.state_bytes() - ram.cached_bytes;
+            (id, swa_conv, dw_len, lineage, entry.state_bytes())
+        };
+
+        // 1. SSD-backed anchor A: drop_ram frees only `swa_conv`; `dw_len` stays charged until dropped.
+        let tokens_a: Vec<u32> = (210u32..250u32).collect();
+        let (id_a, swa_conv_a, dw_len, lin_a, full_a) = seed(&mut inner, 1, &tokens_a, 211, true);
+        assert_eq!(
+            local_coord.registered_pool_bytes(),
+            swa_conv_a + dw_len + lin_a
+        );
+        let taken_a = inner.inkling2_take_victim(&query, &store_victim(id_a, 1, full_a));
+        assert_eq!(
+            (taken_a.outcome, taken_a.now_bytes),
+            (FreeOutcome::Met, swa_conv_a)
+        );
+        assert_eq!(local_coord.registered_pool_bytes(), dw_len + lin_a);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .block_boundary_draft_window
+            .remove(&1);
+        assert_eq!(local_coord.registered_pool_bytes(), lin_a);
+
+        // 2. RAM-only anchor B (erased): clearing seq 2's clone drops pool charge to 0.
+        let _ = inner.close_state_disk(test_deadline(5));
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.state_store.clear_ram_and_checkpoints();
+            rt.state_store.disk = None;
+            rt.coordinator.release_request_all(1).expect("release 1");
+        }
+        let tokens_b: Vec<u32> = (260u32..300u32).collect();
+        let (id_b, swa_conv_b, _, lin_b, full_b) = seed(&mut inner, 2, &tokens_b, 212, false);
+        assert_eq!(
+            local_coord.registered_pool_bytes(),
+            swa_conv_b + dw_len + lin_b
+        );
+        let taken_b = inner.inkling2_take_victim(&query, &store_victim(id_b, 2, full_b));
+        assert_eq!(
+            (taken_b.outcome, taken_b.now_bytes),
+            (FreeOutcome::Met, swa_conv_b + lin_b)
+        );
+        assert_eq!(local_coord.registered_pool_bytes(), dw_len);
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .block_boundary_draft_window
+            .remove(&2);
+        assert_eq!(local_coord.registered_pool_bytes(), 0);
+    }
+
+    /// Round-6 Finding 1 (part A) regression: when a queued SSD upgrade's old Global KV chain was
+    /// evicted AND staging refuses due to low room, `PendingDiskUpgrade::Repair` and `write_behind`
+    /// survive until room returns and repair finishes cleanly.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_repair_survives_stage_refusal_and_completes_when_room_returns() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "repair-stage-refusal",
+            b"repair-stage-refusal-v1",
+            Some(10.0),
+        );
+        let tokens_a: Vec<u32> = (2200u32..2296u32).collect();
+        let query_a: Vec<u32> = (2200u32..2270u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens_a, 64, 98)], 64u64 << 20, None);
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 1);
+        let adopted_id = s2.first_id();
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 98, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        let evicted_kv_key = s2.evict_kv_block(upgraded_id, 1);
+        s2.manager()
+            .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+
+        s2.assert_flush_fails_promptly("evicted-chain upgrade cannot fit");
+        assert!(s2.entry(upgraded_id).ram().is_some());
+        assert!(s2.entry(upgraded_id).disk().is_none());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&upgraded_id),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s2.has_wb(upgraded_id));
+
+        s2.clear_space_override(false);
+        assert!(s2.flush(10));
+        assert!(s2.store.pending_disk_upgrades.is_empty());
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert!(s2.manager().contains_in(&evicted_kv_key, ColdGroup::Kv));
+        assert!(
+            s2.entry(upgraded_id)
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed)
+        );
+        assert!(s2.disk().entry_disk_restorable(s2.entry(upgraded_id)));
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query_a, 98, None, Some(&packed_dw));
+        assert!(s2.close());
+    }
+
+    /// Round-6 Finding 1 (part B) regression: when a repair replacement blob lands with
+    /// `chain_owed == true` and Global KV chain capture fails, `PendingDiskUpgrade::Repair` and
+    /// `spill_backoff` stay active without re-staging until space recovers.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_repair_survives_chain_capture_failure_and_backs_off() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "repair-chain-failure",
+            b"repair-chain-failure-v1",
+            Some(10.0),
+        );
+        let tokens_a: Vec<u32> = (2400u32..2496u32).collect();
+        let tokens_b: Vec<u32> = (2500u32..2596u32).collect();
+        let query_a: Vec<u32> = (2400u32..2470u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens_a, 64, 99)], 64u64 << 20, None);
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 1);
+        s2.store.set_ram_cap(4);
+        let adopted_id = s2.first_id();
+
+        let upgraded_id = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 99, Some(&packed_dw));
+        assert_eq!(upgraded_id, adopted_id);
+
+        let other_id = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 100, None);
+        s2.disk_mut().write_behind.retain(|w| w.id != other_id);
+        let other_mark = s2.entry(other_id).mark();
+        s2.store.store.use_state(other_mark);
+        s2.store.set_ram_cap(1);
+
+        s2.evict_kv_block(upgraded_id, 1);
+
+        assert!(s2.stage(upgraded_id));
+        s2.await_writing("repair blob");
+        assert!(
+            s2.entry(upgraded_id)
+                .disk()
+                .is_some_and(|c| c.landed && c.chain_owed)
+        );
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&upgraded_id),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+
+        s2.set_writer_space(64 << 20, reserve, None);
+        s2.assert_flush_fails_promptly("repair chain failure");
+        assert!(s2.entry(upgraded_id).ram().is_some());
+        assert!(s2.entry(upgraded_id).disk().is_none());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&upgraded_id),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s2.store.spill_backoff.contains_key(&upgraded_id));
+        assert!(!s2.disk().writing());
+        s2.store.trim_ram_to_cap(&s2.coord, None);
+        assert!(!s2.disk().writing());
+
+        s2.clear_space_override(true);
+        s2.store.store.end_use(other_mark);
+        s2.store.set_ram_cap(4);
+        assert!(s2.flush(10));
+        assert!(s2.store.pending_disk_upgrades.is_empty());
+
+        s2.drop_ram_and_purge();
+        s2.assert_ssd_restores(&query_a, 99, None, Some(&packed_dw));
+        assert!(s2.close());
+    }
+
+    /// Round-6 Finding 3 regression: a first-attempt Global KV chain failure (`chain_before == None`)
+    /// inside `tick` or `chain_step` identifies the failed `EntryId`, records `spill_backoff`, and
+    /// prevents immediate re-staging.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn state_store_first_block_chain_failure_records_spill_backoff_and_prevents_immediate_restage()
+    {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "first-block-chain-backoff",
+            b"first-block-chain-backoff-v1",
+            Some(10.0),
+        )
+        .with_paged(2048, 4);
+        let mut s = fx.open(64u64 << 20, None);
+        s.store.set_ram_cap(4);
+
+        let tokens_a: Vec<u32> = (2600u32..2696u32).collect();
+        let tokens_b: Vec<u32> = (2700u32..2796u32).collect();
+        let tokens_c: Vec<u32> = (2800u32..2896u32).collect();
+
+        let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 105, None);
+        let id_b = s.capture_ord(&fx.conv, 2, &tokens_b, 64, 106, None);
+        let mark_b = s.entry(id_b).mark();
+        s.store.store.use_state(mark_b);
+        s.store.set_ram_cap(1);
+
+        assert!(s.stage(id_a));
+        s.await_writing("landing A");
+        assert!(s.disk().chain.is_none());
+        assert!(
+            s.entry(id_a)
+                .disk()
+                .is_some_and(|c| c.landed && c.chain_owed)
+        );
+        assert!(!s.store.spill_backoff.contains_key(&id_a));
+
+        s.coord.release_all_and_purge().expect("purge KV blocks");
+        assert!(s.store.tick(&s.coord, Tick::Full { command_pages: 0 }));
+        assert!(s.entry(id_a).disk().is_none() && s.entry(id_a).ram().is_some());
+        assert!(s.store.spill_backoff.contains_key(&id_a));
+        assert!(!s.disk().writing());
+
+        s.store.trim_ram_to_cap(&s.coord, None);
+        s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert!(!s.disk().writing());
+
+        // Also verify direct `chain_step` with `chain_before == None` records `spill_backoff`.
+        s.store.set_ram_cap(4);
+        let id_c = s.capture_ord(&fx.conv, 3, &tokens_c, 64, 107, None);
+        assert!(s.stage(id_c));
+        s.await_writing("landing C");
+        assert!(s.disk().chain.is_none());
+        s.coord.release_all_and_purge().expect("purge KV for C");
+        assert!(s.store.chain_step(&s.coord, test_deadline(5)));
+        assert!(s.store.spill_backoff.contains_key(&id_c));
+        assert!(s.entry(id_c).disk().is_none());
+
+        s.store.store.end_use(mark_b);
+        let _ = s.close();
+    }
+
+    /// Round-7 Finding 2 regression: urgent reclaim (`allow_wait = false`) during an in-flight
+    /// in-place SSD upgrade drops ONLY RAM and preserves a durable SSD prefix on both success
+    /// (upgraded blob) and failure (restored `old_copy`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn urgent_reclaim_during_in_place_upgrade_preserves_durable_prefix_on_success_and_failure() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "r7-urgent-upgrade",
+            b"urgent-upgrade-preserve-v1",
+            Some(10.0),
+        );
+        let tokens_a: Vec<u32> = (3000u32..3096u32).collect();
+        let query_a: Vec<u32> = (3000u32..3070u32).collect();
+        let tokens_b: Vec<u32> = (3200u32..3296u32).collect();
+        let query_b: Vec<u32> = (3200u32..3270u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(
+            &[(1, &tokens_a, 64, 111), (2, &tokens_b, 64, 112)],
+            64u64 << 20,
+            None,
+        );
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 2);
+
+        // Part A: Urgent reclaim during in-place upgrade -> replacement write SUCCEEDS.
+        let id_a = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 111, Some(&packed_dw));
+        assert!(s2.stage(id_a));
+        assert!(
+            s2.store
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_some_and(|u| u.id == id_a)
+        );
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_a, false),
+            ReclaimOutcome::RamDropped
+        );
+        assert!(s2.entry(id_a).ram().is_none() && s2.entry(id_a).disk().is_some());
+        assert!(
+            s2.store
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_some_and(|u| u.id == id_a)
+        );
+
+        s2.await_writing("upgrade A");
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert!(!s2.store.entries_missing_draft_window.contains(&id_a));
+        assert!(
+            s2.entry(id_a).ram().is_none()
+                && s2
+                    .entry(id_a)
+                    .disk()
+                    .is_some_and(|c| c.landed && !c.chain_owed)
+        );
+        s2.coord.release_all_and_purge().expect("purge hot A");
+        s2.assert_ssd_restores(&query_a, 111, Some(id_a), Some(&packed_dw));
+
+        // Part B: Urgent reclaim during in-place upgrade -> replacement write FAILS -> old_copy restored.
+        let id_b = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 112, Some(&packed_dw));
+        let old_copy_b = s2.disk_copy(id_b);
+
+        s2.set_writer_space(64 << 20, reserve, None);
+        assert!(s2.stage(id_b));
+        assert!(
+            s2.store
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_some_and(|u| u.id == id_b)
+        );
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_b, false),
+            ReclaimOutcome::RamDropped
+        );
+        assert!(s2.entry(id_b).ram().is_none());
+
+        s2.await_writing("failing upgrade B");
+        s2.clear_space_override(true);
+
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert!(s2.entry(id_b).ram().is_none());
+        assert_eq!(
+            s2.entry(id_b).disk().copied(),
+            Some(DiskCopy {
+                chain_owed: false,
+                ..old_copy_b
+            })
+        );
+        assert!(s2.store.entries_missing_draft_window.contains(&id_b));
+        s2.coord.release_all_and_purge().expect("purge hot B");
+        s2.assert_ssd_restores(&query_b, 112, Some(id_b), None);
+        assert!(s2.flush(10));
+        assert!(s2.close());
+    }
+
+    /// Round-7 Finding 3 + Round-13 Finding 3 regression:
+    /// - Background `tick` / `trim_ram_to_cap` honor active repair `spill_backoff` without
+    ///   re-staging or discarding RAM.
+    /// - Once backoff has elapsed and SSD accepts staging, patient reclaim stages the `Repair`
+    ///   with `keep_ram = true`, returns `Pending` while the write is in flight, keeps RAM +
+    ///   `Repair` tracking intact across a second async write failure, and drops RAM cleanly once
+    ///   disk room recovers and repair completes.
+    /// - When a `Repair` is still backed off (or SSD refuses synchronously) with `!disk.writing()`,
+    ///   patient Governor reclaim erases it immediately (`ReclaimOutcome::Erased`) instead of
+    ///   stalling on the 10-second backoff timer.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn patient_reclaim_respects_repair_backoff_and_keeps_ram_across_second_failure() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "r7-patient-repair-backoff",
+            b"patient-repair-backoff-v1",
+            Some(10.0),
+        );
+        let tokens_a: Vec<u32> = (3400u32..3496u32).collect();
+        let query_a: Vec<u32> = (3400u32..3470u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        fx.seed_durable(&[(1, &tokens_a, 64, 121)], 64u64 << 20, None);
+
+        let reserve = 4096u64;
+        let mut s2 = fx.open_adopted(64u64 << 20, Some(reserve), 1);
+        s2.store.set_ram_cap(16);
+
+        let id_a = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 121, Some(&packed_dw));
+        s2.evict_kv_block(id_a, 1);
+
+        s2.set_writer_space(64 << 20, reserve, None);
+        assert!(s2.stage(id_a));
+        s2.await_writing("failing repair 1");
+        assert!(s2.entry(id_a).ram().is_some() && s2.entry(id_a).disk().is_none());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&id_a),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s2.store.spill_backoff.contains_key(&id_a));
+
+        // 1. Backed off: background `tick` and `trim_ram_to_cap` honor backoff without re-staging
+        //    and keep RAM + `Repair` tracking intact.
+        let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
+        s2.store.trim_ram_to_cap(&s2.coord, None);
+        assert!(!s2.disk().writing());
+        assert!(s2.entry(id_a).ram().is_some() && s2.entry(id_a).disk().is_none());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&id_a),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s2.store.spill_backoff.contains_key(&id_a));
+
+        // 2. Expire backoff while SSD accepts staging (then fails asynchronously on writer thread):
+        //    patient reclaim starts concrete write (`keep_ram = true`), returns `Pending` while
+        //    `writing()`, and keeps RAM + `Repair` intact across the 2nd failure.
+        s2.expire_backoff(id_a);
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_a, true),
+            ReclaimOutcome::Pending
+        );
+        assert!(s2.disk().writing());
+        assert!(s2.entry(id_a).ram().is_some());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&id_a),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        s2.await_writing("failing repair 2");
+        assert!(s2.entry(id_a).ram().is_some() && s2.entry(id_a).disk().is_none());
+        assert!(matches!(
+            s2.store.pending_disk_upgrades.get(&id_a),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s2.store.spill_backoff.contains_key(&id_a));
+        let ram_hit = s2
+            .store
+            .lookup_deepest_restorable(&s2.coord, &query_a, 121)
+            .expect("prefix restorable from RAM");
+        assert_eq!(ram_hit.id, id_a);
+        let (ram_anchor, from_ssd) = s2
+            .store
+            .load_anchor(&s2.coord, ram_hit.id)
+            .expect("load RAM");
+        assert!(!from_ssd);
+        assert_eq!(ram_anchor.draft_window.as_ref(), Some(&packed_dw));
+
+        // 3. Restore space + expire backoff: patient reclaim lands blob + KV chain and drops RAM.
+        s2.clear_space_override(true);
+        s2.expire_backoff(id_a);
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_a, true),
+            ReclaimOutcome::Pending
+        );
+        s2.await_landed(id_a, "repair recovery");
+        assert!(s2.store.pending_disk_upgrades.is_empty());
+        assert!(
+            s2.entry(id_a).ram().is_none()
+                && s2
+                    .entry(id_a)
+                    .disk()
+                    .is_some_and(|c| c.landed && !c.chain_owed)
+        );
+        s2.coord.release_all_and_purge().expect("purge hot");
+        s2.assert_ssd_restores(&query_a, 121, Some(id_a), Some(&packed_dw));
+
+        // 4. Synchronously refused `Repair` (backoff elapsed, volume full, `!writing()`): patient
+        //    reclaim erases immediately instead of stalling Governor with `Pending`.
+        let tokens_b: Vec<u32> = (3500u32..3596u32).collect();
+        let id_b = s2.capture_ord(&fx.conv, 2, &tokens_b, 64, 122, Some(&packed_dw));
+        s2.store.pending_disk_upgrades.insert(
+            id_b,
+            PendingDiskUpgrade::Repair {
+                retry_after: Instant::now() - Duration::from_secs(1),
+            },
+        );
+        s2.manager()
+            .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_b, true),
+            ReclaimOutcome::Erased
+        );
+        assert!(s2.store.store.get(id_b).is_none() && !s2.disk().writing());
+        assert!(s2.close());
+    }
+
+    /// Round-13 Finding 3 regression: a full SSD placing an ordinary RAM anchor into 10-second
+    /// `spill_backoff` with `!disk.writing()` must NOT stall a patient Governor claim (`ledger::free`
+    /// with `waits_for_writes: true`) — it erases the anchor immediately (`FreeOutcome::Met`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn patient_governor_claim_erases_backed_off_anchor_instead_of_stalling() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::disk_tier::TEST_WRITER;
+        use crate::engine::governor::governor::ModelRegistration;
+        use crate::engine::governor::ledger::{
+            FreeOutcome, Need, Taken, Victim, VictimQuery, VictimSource,
+        };
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::inkling2::scheduler::tests::{
+            TestCoordGovernorIo, build_synthetic_dflash2_inner,
+        };
+
+        struct InnerSource<'a>(&'a mut crate::models::inkling2::model::Inkling2Inner);
+        impl VictimSource for InnerSource<'_> {
+            fn units(&self, query: &VictimQuery) -> Vec<Victim> {
+                self.0.victim_units(query, &[]).into_units()
+            }
+            fn take(&mut self, query: &VictimQuery, victim: &Victim) -> Taken {
+                self.0.take_victim(query, victim, &[])
+            }
+        }
+
+        let fx = StateDiskTestFixture::new(
+            "r13-patient-backoff-erase",
+            b"r13-patient-backoff-erase-v1",
+            Some(10.0),
+        );
+        let reserve = 4096u64;
+        let coord = Arc::new(CacheLimitCoordinator::new_for_test());
+        let mut inner = build_synthetic_dflash2_inner(256, None);
+        TEST_WRITER.with(|w| w.set(Some((8, reserve))));
+        attach_synthetic_disk(&fx, &mut inner);
+        TEST_WRITER.with(|w| w.set(None));
+        inner
+            .paged
+            .as_mut()
+            .expect("paged")
+            .state_store
+            .attach_host_budget_to(Arc::clone(&coord));
+
+        let conv = make_short_conv(&inner.config);
+        let tokens: Vec<u32> = (3700u32..3796u32).collect();
+        let (id_a, entry_bytes) = {
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.coordinator.reset_scheduled_request(1).expect("reset");
+            rt.coordinator
+                .record_tokens_all(1, &tokens)
+                .expect("record");
+            let id_a = rt
+                .state_store
+                .capture_boundary(
+                    &mut rt.coordinator,
+                    &conv,
+                    1,
+                    &tokens,
+                    64,
+                    371,
+                    StateClass::Ordinary,
+                    None,
+                )
+                .expect("capture")
+                .expect("id_a");
+            rt.coordinator.release_request_all(1).expect("release");
+            let past = Instant::now()
+                .checked_sub(Duration::from_secs(20))
+                .unwrap_or_else(Instant::now);
+            let disk = rt.state_store.disk.as_mut().expect("disk");
+            for w in &mut disk.write_behind {
+                w.published_at = past;
+            }
+            disk.tier
+                .manager
+                .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+            let _ = rt
+                .state_store
+                .tick(&rt.coordinator, Tick::Full { command_pages: 0 });
+            assert!(!rt.state_store.disk.as_ref().expect("disk").writing());
+            assert!(rt.state_store.spill_backoff.contains_key(&id_a));
+            let entry = rt.state_store.store.get(id_a).expect("id_a");
+            assert!(entry.ram().is_some() && entry.disk().is_none());
+            (id_a, entry.state_bytes())
+        };
+
+        let gov = Governor::new(Arc::new(TestCoordGovernorIo {
+            coord: Arc::clone(&coord),
+            active: 16 << 20,
+        }));
+        let _reg = gov
+            .register_model(ModelRegistration {
+                model_id: 91,
+                hard_budget: (16 << 20) + coord.registered_pool_bytes(),
+                untracked: 0,
+                page_bytes: 1 << 20,
+            })
+            .expect("register");
+        let claim = gov.open(
+            ClaimSpec {
+                cls: ClaimClass::InService,
+                request_id: 1,
+                rank: ClaimRank::default(),
+                reach: ReachClass::Ordinary,
+                timing: NeedTiming::CanWait,
+            },
+            91,
+        );
+        let mut src = InnerSource(&mut inner);
+        let res = gov.free(
+            claim.id(),
+            Need {
+                bytes: entry_bytes,
+                pages: 1,
+                kv: true,
+                ..Need::default()
+            },
+            &mut [&mut src],
+        );
+        assert_eq!(res.outcome, FreeOutcome::Met);
+        assert_eq!(res.now_bytes, entry_bytes);
+        assert!(res.pages >= 1);
+        assert_eq!(coord.registered_pool_bytes(), 0);
+        let rt = inner.paged.as_ref().expect("paged");
+        assert!(rt.state_store.store.get(id_a).is_none());
+        assert!(!rt.state_store.disk.as_ref().expect("disk").writing());
+        let _ = inner.close_state_disk(test_deadline(5));
+    }
+
+    /// Round-8 Finding 3 regression: ordinary write-behind retries after transient sync/async
+    /// refusals and drops permanently oversized entries cleanly without spinning.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordinary_write_behind_retries_after_transient_refusal_and_drops_oversized_entry() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = StateDiskTestFixture::new(
+            "r8-wb-transient-retry",
+            b"r8-wb-transient-retry-v1",
+            Some(10.0),
+        )
+        .with_paged(2048, 4);
+        let tokens_a: Vec<u32> = (4100u32..4196u32).collect();
+        let query_a: Vec<u32> = (4100u32..4170u32).collect();
+        let tokens_b: Vec<u32> = (4200u32..4296u32).collect();
+        let query_b: Vec<u32> = (4200u32..4270u32).collect();
+        let tokens_c: Vec<u32> = (4300u32..4396u32).collect();
+
+        let reserve = 4096u64;
+        let mut s = fx.open(64u64 << 20, Some(reserve));
+        s.store.set_ram_cap(16);
+
+        // Part 1: transient synchronous volume headroom refusal (`room_above_reserve == 0`).
+        let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 201, None);
+        assert!(s.store.pending_disk_upgrades.is_empty());
+        assert_eq!(s.store.ram_len(), 1);
+        let past_pub = Instant::now()
+            .checked_sub(Duration::from_secs(20))
+            .unwrap_or_else(Instant::now);
+        for w in &mut s.disk_mut().write_behind {
+            w.published_at = past_pub;
+        }
+
+        s.manager()
+            .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert!(s.has_wb(id_a));
+        assert!(s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
+
+        s.assert_flush_fails_promptly("transient ordinary refusal");
+        assert!(s.has_wb(id_a));
+
+        s.clear_space_override(false);
+        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert!(
+            !s.disk().writing(),
+            "normal tick must respect spill_backoff"
+        );
+        s.expire_backoff(id_a);
+        let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+        assert!(s.disk().writing() || s.entry(id_a).disk().is_some());
+        assert!(s.flush(10));
+        assert!(!s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
+        s.drop_ram_and_purge();
+        s.assert_ssd_restores(&query_a, 201, Some(id_a), None);
+
+        // Part 2: transient async writer-side space refusal during `flush_to_disk`.
+        let id_b = s.capture_ord(&fx.conv, 2, &tokens_b, 64, 202, None);
+        let writer_refusals = Arc::new(AtomicUsize::new(0));
+        let failures_before_b = s.disk().counters.offload_failures;
+        let enqueued_before_b = s.manager().stats().enqueued;
+        s.set_writer_space(64 << 20, reserve, Some(Arc::clone(&writer_refusals)));
+
+        s.assert_flush_fails_promptly("async ordinary refusal");
+        assert!(writer_refusals.load(Ordering::Relaxed) >= 1);
+        let failures_delta = s.disk().counters.offload_failures - failures_before_b;
+        let enqueued_delta = s.manager().stats().enqueued - enqueued_before_b;
+        assert!(
+            (1..=2).contains(&failures_delta) && enqueued_delta <= 3,
+            "failures_delta={failures_delta}, enqueued_delta={enqueued_delta}"
+        );
+        assert!(s.has_wb(id_b));
+        assert!(s.store.spill_backoff.contains_key(&id_b));
+
+        s.clear_space_override(true);
+        assert!(s.flush(10));
+        assert!(!s.store.spill_backoff.contains_key(&id_b));
+        s.drop_ram_and_purge();
+        s.assert_ssd_restores(&query_b, 202, Some(id_b), None);
+        assert!(s.close());
+
+        // Part 3: permanently oversized entry drops out of `write_behind` cleanly.
+        let mut s_tiny = fx.open_in(fx.subdir("tiny-cache"), 1024, b"r8-wb-oversized-v1", None);
+        let id_c = s_tiny.capture_ord(&fx.conv, 1, &tokens_c, 64, 203, None);
+        assert!(!s_tiny.disk().entry_fits_tier_limit(s_tiny.entry(id_c)));
+        let t2 = Instant::now();
+        assert!(s_tiny.flush(3));
+        assert!(t2.elapsed() < Duration::from_millis(500));
+        assert!(s_tiny.disk().write_behind.is_empty());
+        assert!(s_tiny.entry(id_c).ram().is_some() && s_tiny.entry(id_c).disk().is_none());
+        assert!(s_tiny.close());
+    }
+
+    /// Round-9 Finding 2 regression: while an in-place SSD upgrade is in flight, its `ColdKeyHold`
+    /// pins both `old_copy.key` and its Global KV chain against competing `MakeRoom::Evict` writes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_place_upgrade_holds_old_blob_and_kv_chain_against_competing_eviction() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use mlx_paged_attn::Landed;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fx = StateDiskTestFixture::new("r9-in-place-hold", b"r9-in-place-hold-v1", Some(10.0))
+            .with_paged(2048, 4);
+        let reserve = 4096u64;
+        let tokens_a: Vec<u32> = (100u32..164u32).collect();
+        let query_a: Vec<u32> = (100u32..165u32).collect();
+        let tokens_competing: Vec<u32> = (400u32..464u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        let (exact_footprint, _) =
+            fx.seed_durable(&[(1, &tokens_a, 64, 911)], 64u64 << 20, Some(reserve));
+        assert!(exact_footprint > 0);
+
+        let mut s2 = fx.open_adopted(exact_footprint, Some(reserve), 1);
+        let id_a = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 911, Some(&packed_dw));
+        let old_copy = s2.disk_copy(id_a);
+        let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(id_a));
+        assert_eq!(kv_keys.len(), 2);
+
+        let fail_writer = Arc::new(AtomicBool::new(true));
+        s2.set_toggle_writer_space(reserve, Arc::clone(&fail_writer));
+
+        assert!(s2.stage(id_a));
+        assert!(
+            s2.store
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_some_and(|u| u.id == id_a)
+        );
+        assert!(s2.manager().is_held_for_test(&old_copy.key));
+        for k in &kv_keys {
+            assert!(s2.manager().is_held_for_test(k));
+        }
+
+        assert_eq!(
+            s2.store.reclaim_entry_with_wait(&s2.coord, id_a, false),
+            ReclaimOutcome::RamDropped
+        );
+        assert!(s2.entry(id_a).ram().is_none());
+
+        // Settle the failing replacement write WITHOUT `poll_offload` so `ColdKeyHold` stays live.
+        assert!(s2.disk().engine.await_landing(test_deadline(5)));
+        let _ = s2.manager().drain(Duration::from_secs(5));
+        fail_writer.store(false, Ordering::Release);
+
+        s2.coord.reset_scheduled_request(2).expect("reset 2");
+        s2.coord
+            .record_tokens_all(2, &tokens_competing)
+            .expect("record competing");
+        let (competing_key, landed) = s2.enqueue_kv_block(2, &tokens_competing[..32], 0, None);
+        match landed {
+            Landed::Block { key, ok } => {
+                assert_eq!(key, competing_key);
+                assert!(
+                    !ok,
+                    "competing Evict write must be refused while keys are held"
+                );
+            }
+            other => panic!("expected Landed::Block, got {other:?}"),
+        }
+
+        assert_eq!(s2.manager().stats().evictions, 0);
+        assert!(
+            s2.manager()
+                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+        );
+        for k in &kv_keys {
+            assert!(s2.manager().contains_in(k, ColdGroup::Kv));
+        }
+
+        // Reconcile failed upgrade: `old_copy` restored, `ColdKeyHold` released, SSD restorable.
+        s2.clear_space_override(false);
+        assert!(s2.store.poll_offload(&s2.coord));
+        assert!(s2.store.in_flight_disk_upgrade.is_none());
+        assert!(!s2.manager().is_held_for_test(&old_copy.key));
+        for k in &kv_keys {
+            assert!(!s2.manager().is_held_for_test(k));
+        }
+        assert!(s2.entry(id_a).ram().is_none());
+        assert_eq!(
+            s2.entry(id_a).disk().copied(),
+            Some(DiskCopy {
+                chain_owed: false,
+                ..old_copy
+            })
+        );
+        s2.coord.release_all_and_purge().expect("purge hot KV");
+        s2.assert_ssd_restores(&query_a, 911, Some(id_a), None);
+        let _ = s2.close();
+    }
+
+    /// Round-10 Finding 2 companion regression: a competing `MakeRoom::Evict` write that cannot fit
+    /// quota due to an active `ColdKeyHold` refuses with ZERO evictions, preserving unrelated
+    /// unheld prefixes and keeping the writer healthy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_place_upgrade_hold_quota_blocked_write_preserves_unrelated_prefix() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use mlx_paged_attn::{
+            ColdStateLabel, ColdStateLayout, ColdStateObject, Landed, state_object_bytes,
+        };
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let fx = StateDiskTestFixture::new("r10-quota-unheld", b"r10-quota-unheld-v1", Some(10.0))
+            .with_paged(2048, 4);
+        let reserve = 4096u64;
+        let tokens_a: Vec<u32> = (100u32..164u32).collect();
+        let tokens_unrelated: Vec<u32> = (700u32..732u32).collect();
+        let packed_dw = fx.packed_dw(64);
+
+        // 1. Persist entry A + one unrelated unheld Global KV block and measure footprints.
+        let (unrelated_key, unrelated_size, total_with_unrelated) = {
+            let mut s1 = fx.open(64u64 << 20, Some(reserve));
+            let _ = s1.capture_ord(&fx.conv, 1, &tokens_a, 64, 921, None);
+            assert!(s1.flush(10));
+            let footprint_a = s1.manager().total_bytes();
+
+            s1.coord.reset_scheduled_request(2).expect("reset 2");
+            s1.coord
+                .record_tokens_all(2, &tokens_unrelated)
+                .expect("record unrelated");
+            let (unrelated_key, landed) = s1.enqueue_kv_block(2, &tokens_unrelated, 0, None);
+            assert!(matches!(landed, Landed::Block { ok: true, .. }));
+            let total = s1.manager().total_bytes();
+            let size = total - footprint_a;
+            assert!(size > 0);
+            assert!(s1.close());
+            (unrelated_key, size, total)
+        };
+
+        // 2. Reopen with exact quota, arm in-place upgrade hold on A, enqueue oversized competing state.
+        let mut s2 = fx.open_adopted(total_with_unrelated, Some(reserve), 1);
+        assert!(s2.manager().contains_in(&unrelated_key, ColdGroup::Kv));
+
+        let id_a = s2.capture_ord(&fx.conv, 1, &tokens_a, 64, 921, Some(&packed_dw));
+        let old_copy = s2.disk_copy(id_a);
+        let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(id_a));
+        let state_fp = s2.disk().tier.state_fingerprint;
+
+        let fail_writer = Arc::new(AtomicBool::new(true));
+        s2.set_toggle_writer_space(reserve, Arc::clone(&fail_writer));
+        assert!(s2.stage(id_a));
+        assert!(s2.disk().engine.await_landing(test_deadline(5)));
+        let _ = s2.manager().drain(Duration::from_secs(5));
+        fail_writer.store(false, Ordering::Release);
+
+        let competing_payload_len = unrelated_size.saturating_add(4096);
+        let competing_layout = ColdStateLayout {
+            boundary_tokens: 32,
+            spans: vec![competing_payload_len],
+            geometry: "inkling2_r10_test".to_string(),
+        };
+        let competing_label = ColdStateLabel {
+            tokens: tokens_unrelated.clone(),
+            extra_keys: vec![],
+            salt: 999,
+            last_used: 1,
+            checkpoint: false,
+        };
+        let competing_size = state_object_bytes(&competing_layout, &competing_label);
+        assert!(competing_size > unrelated_size && competing_size <= total_with_unrelated);
+        let competing_key = ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            state_fp,
+            None,
+            &tokens_unrelated,
+            &[999],
+            0,
+            0,
+        );
+        let competing_obj = ColdStateObject {
+            key: competing_key,
+            fingerprint: state_fp,
+            layout: competing_layout,
+            label: competing_label,
+            payload: vec![0xAB; competing_payload_len as usize],
+        };
+        let (ctx, crx) = std::sync::mpsc::channel::<Landed>();
+        s2.manager()
+            .enqueue_state(competing_obj, MakeRoom::Evict, ctx)
+            .expect("enqueue competing state");
+        match crx.recv_timeout(Duration::from_secs(5)).expect("settle") {
+            Landed::State { key, ok, .. } => {
+                assert_eq!(key, competing_key);
+                assert!(!ok, "quota-blocked competing state write must be refused");
+            }
+            other => panic!("expected Landed::State, got {other:?}"),
+        }
+
+        assert!(s2.manager().takes_tracked_writes());
+        assert_eq!(s2.manager().stats().evictions, 0);
+        assert!(s2.manager().contains_in(&unrelated_key, ColdGroup::Kv));
+        assert!(
+            s2.manager()
+                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+        );
+        for k in &kv_keys {
+            assert!(s2.manager().contains_in(k, ColdGroup::Kv));
+        }
+
+        s2.clear_space_override(false);
+        let _ = s2.store.poll_offload(&s2.coord);
+        let _ = s2.close();
+    }
+
+    /// Round-9 Finding 3 regression: ordinary RAM-backed spills invalidated with
+    /// `offload_failures == 0` (`gone` in `chain_step`, `lost` in `chain_step`, `take_evicted`
+    /// in `poll_offload`) are properly reconciled, retried when recoverable, and surfaced to
+    /// `flush_to_disk`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ordinary_write_behind_recovers_gone_blob_and_surfaces_lost_chain() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use mlx_paged_attn::Landed;
+
+        let fx =
+            StateDiskTestFixture::new("r9-wb-invalidation", b"r9-wb-invalidation-v1", Some(10.0))
+                .with_paged(2048, 4);
+        let reserve = 4096u64;
+        let tokens_a: Vec<u32> = (100u32..164u32).collect();
+        let query_a: Vec<u32> = (100u32..165u32).collect();
+        let tokens_b: Vec<u32> = (200u32..264u32).collect();
+        let tokens_c: Vec<u32> = (300u32..364u32).collect();
+        let tokens_d: Vec<u32> = (400u32..656u32).collect();
+
+        let mut s = fx.open(64u64 << 20, Some(reserve));
+        s.store.set_ram_cap(16);
+
+        // Part 1: `gone` in `chain_step` (`offload_failures == 0`, hot KV resident).
+        let id_a = s.capture_ord(&fx.conv, 1, &tokens_a, 64, 931, None);
+        s.disk_mut().write_behind.clear();
+        assert!(s.stage(id_a));
+        s.await_writing("landing A");
+        let copy_a = s.disk_copy(id_a);
+        assert!(copy_a.landed && copy_a.chain_owed);
+
+        assert!(s.manager().remove(&copy_a.key));
+        let failures_before = s.store.disk_counters().offload_failures;
+        assert!(s.store.chain_step(&s.coord, test_deadline(5)));
+        assert_eq!(s.store.disk_counters().offload_failures, failures_before);
+        assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
+        assert!(s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.store.recent_failed_spills.contains(&id_a));
+        assert!(s.has_wb(id_a));
+
+        s.manager()
+            .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+        assert!(!s.flush(3));
+        s.clear_space_override(false);
+
+        assert!(s.flush(10));
+        let one_full_entry_bytes = s.manager().total_bytes();
+        assert!(!s.store.spill_backoff.contains_key(&id_a));
+        assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
+        s.drop_ram_and_purge();
+        let hit_a = s
+            .store
+            .lookup_deepest_restorable(&s.coord, &query_a, 931)
+            .expect("A must restore from SSD");
+        assert_eq!(hit_a.id, id_a);
+
+        // Part 2: `lost` in `chain_step` (KV missing from both tiers).
+        let id_b = s.capture_ord(&fx.conv, 2, &tokens_b, 64, 932, None);
+        s.disk_mut().write_behind.clear();
+        assert!(s.stage(id_b));
+        s.await_writing("landing B");
+        assert!(
+            s.entry(id_b)
+                .disk()
+                .is_some_and(|c| c.landed && c.chain_owed)
+        );
+
+        s.coord.release_all_and_purge().expect("purge hot B");
+        s.assert_flush_fails_promptly("lost chain");
+        assert!(!s.has_wb(id_b));
+        assert!(s.entry(id_b).ram().is_some() && s.entry(id_b).disk().is_none());
+        assert!(s.close());
+
+        // Part 3: `take_evicted` during `poll_offload` evicts a landed `chain_owed` blob.
+        let tight_limit = one_full_entry_bytes.saturating_add(4096);
+        let mut st = fx.open_in(
+            fx.subdir("tight_cache"),
+            tight_limit,
+            b"r9-wb-evict-v1",
+            Some(reserve),
+        );
+        st.store.set_ram_cap(16);
+
+        let id_c = st.capture_ord(&fx.conv, 1, &tokens_c, 64, 933, None);
+        st.disk_mut().write_behind.clear();
+        assert!(st.stage(id_c));
+        st.await_writing("landing C");
+        let copy_c = st.disk_copy(id_c);
+        assert!(copy_c.landed && copy_c.chain_owed);
+
+        st.coord.reset_scheduled_request(2).expect("reset D");
+        st.coord.record_tokens_all(2, &tokens_d).expect("record D");
+        let mut parent_key = None;
+        for idx in 0..(tokens_d.len() / 32) {
+            if !st
+                .manager()
+                .contains_in(&copy_c.key, ColdGroup::DFlash2State)
+            {
+                break;
+            }
+            let chunk = &tokens_d[idx * 32..(idx + 1) * 32];
+            let (key_d, landed) = st.enqueue_kv_block(2, chunk, idx, parent_key);
+            parent_key = Some(key_d);
+            match landed {
+                Landed::Block { ok: true, .. } => {}
+                other => panic!("expected competing D block to land, got {other:?}"),
+            }
+        }
+        assert!(
+            !st.manager()
+                .contains_in(&copy_c.key, ColdGroup::DFlash2State)
+        );
+
+        let failures_t_before = st.store.disk_counters().offload_failures;
+        assert!(st.store.poll_offload(&st.coord));
+        assert_eq!(st.store.disk_counters().offload_failures, failures_t_before);
+        assert!(st.entry(id_c).ram().is_some() && st.entry(id_c).disk().is_none());
+        assert!(st.store.spill_backoff.contains_key(&id_c));
+        assert!(st.store.recent_failed_spills.contains(&id_c));
+        assert!(st.has_wb(id_c));
+        let _ = st.close();
     }
 
     #[cfg(target_os = "macos")]
@@ -1878,9 +8051,10 @@ mod tests {
             cache_dir: Some(cache_dir.clone()),
             temp_root: Some(temp_root.clone()),
         };
-        let geom = Inkling2StateGeometry::from_coordinator(
+        let geom = Inkling2StateGeometry::from_coordinator_with_draft(
             &inner.config,
             &inner.paged.as_ref().expect("paged").coordinator,
+            inner.dflash2.as_ref().map(|d| &d.config),
         )
         .expect("geom");
         let id = compute_path_identity(
@@ -1892,6 +8066,7 @@ mod tests {
                 inner.paged.as_ref().expect("paged").coordinator.kv_format(),
                 inner.activations,
             ),
+            inner.dflash2_identity.as_deref(),
         );
         assert!(
             inner.attach_state_disk(&disk_opts, move || id).is_some(),
@@ -2188,9 +8363,10 @@ mod tests {
         let mut restarted = load_rt
             .block_on(load_from_dir(&model_path))
             .expect("reload Inkling-2-Mini for restart adoption test");
-        let geom2 = Inkling2StateGeometry::from_coordinator(
+        let geom2 = Inkling2StateGeometry::from_coordinator_with_draft(
             &restarted.config,
             &restarted.paged.as_ref().expect("paged").coordinator,
+            restarted.dflash2.as_ref().map(|d| &d.config),
         )
         .expect("geom2");
         let id2 = compute_path_identity(
@@ -2207,6 +8383,7 @@ mod tests {
                     .kv_format(),
                 restarted.activations,
             ),
+            restarted.dflash2_identity.as_deref(),
         );
         assert!(
             restarted
@@ -2356,5 +8533,356 @@ mod tests {
             v2_kv, v3_kv,
             "current arithmetic epoch must reject stale v3 SSD prefixes"
         );
+    }
+
+    /// Round-11 Finding 2 regression:
+    /// A deferred `PackedDraftWindow::from_window` failure inside `capture_boundary_with_window`
+    /// must NOT discard the valid target SWA + ShortConv checkpoint; it logs a warning and
+    /// publishes the target anchor with `draft_window == None`, restoring bit-exact SWA +
+    /// ShortConv state.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_boundary_with_window_preserves_target_checkpoint_on_draft_pack_error() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("r11-dw-pack-err", b"r11-dw-pack-err-v1", Some(10.0));
+        let mut s = fx.open(64u64 << 20, None);
+        let boundary = 64u32;
+        let tokens: Vec<u32> = (300u32..364u32).collect();
+
+        // Populate deterministic non-zero SWA raw blocks and ShortConv values on seq 1.
+        let swa_len = s.geom.live_swa_bytes(boundary).expect("live_swa_bytes");
+        let expected_swa: Vec<u8> = (0..swa_len).map(|i| ((i * 29 + 13) % 251) as u8).collect();
+        s.coord.reset_scheduled_request(1).expect("reset seq 1");
+        s.coord.record_tokens_all(1, &tokens).expect("record seq 1");
+        s.coord
+            .restore_sliding_raw_blocks_flat_for(1, &tokens, boundary, &expected_swa)
+            .expect("seed swa seq 1");
+        let mut conv = make_short_conv(&fx.cfg);
+        let hist = (fx.cfg.sconv_kernel_size - 1) as i64;
+        let kv_dim = (fx.cfg.num_key_value_heads * fx.cfg.head_dim) as i64;
+        let hidden = fx.cfg.hidden_size as i64;
+        let kv_vals: Vec<u16> = (0..(hist * kv_dim) as usize)
+            .map(|i| half::bf16::from_f32(((i % 17) as f32 - 8.0) * 0.25).to_bits())
+            .collect();
+        let h_vals: Vec<u16> = (0..(hist * hidden) as usize)
+            .map(|i| half::bf16::from_f32(((i % 11) as f32 - 5.0) * 0.5).to_bits())
+            .collect();
+        conv.visits[0].k = MxArray::from_bfloat16(&kv_vals, &[hist, kv_dim]).expect("conv k");
+        conv.visits[0].attn_post =
+            MxArray::from_bfloat16(&h_vals, &[hist, hidden]).expect("conv attn_post");
+        let expected_conv = pack_short_conv_state(&s.geom, &conv).expect("pack expected conv");
+
+        // Inject a deferred `from_window` failure on `BoundaryDraftWindow::Device`.
+        let dev_win =
+            BoundaryDraftWindow::Device(make_draft_window(fx.cfg.hidden_size as u32, 16, boundary));
+        s.store.fail_next_draft_window_pack = true;
+        let id = s
+            .store
+            .capture_boundary_with_window(
+                &mut s.coord,
+                &conv,
+                1,
+                &tokens,
+                boundary,
+                881,
+                StateClass::Ordinary,
+                Some(&dev_win),
+                None,
+            )
+            .expect("draft-window pack error must not fail capture_boundary_with_window")
+            .expect("target checkpoint must still be published");
+        assert!(
+            !s.store.fail_next_draft_window_pack,
+            "injected draft-window pack failure must have been consumed"
+        );
+        let ram = s.entry(id).ram().expect("published RAM anchor");
+        assert!(
+            ram.draft_window.is_none(),
+            "published anchor must have draft_window == None after pack error"
+        );
+        assert_eq!(
+            ram.cached_bytes,
+            (expected_swa.len() + expected_conv.len()) as u64
+        );
+        assert!(s.store.entries_missing_draft_window.contains(&id));
+
+        // Restore `id` onto seq 2 and verify bit-exact target SWA + ShortConv state!
+        let (anchor, from_ssd) = s.store.load_anchor(&s.coord, id).expect("load_anchor");
+        assert!(!from_ssd && anchor.draft_window.is_none());
+        let mut restored_convs = HashMap::new();
+        install_anchor_swa_and_conv(
+            &mut s.coord,
+            &mut restored_convs,
+            &s.geom,
+            2,
+            &tokens,
+            boundary,
+            &anchor,
+        )
+        .expect("install_anchor_swa_and_conv");
+        let restored_swa = s
+            .coord
+            .read_sliding_raw_blocks_flat_for(2, boundary)
+            .expect("read restored swa");
+        assert_eq!(
+            restored_swa, expected_swa,
+            "SWA state must restore bit-exact"
+        );
+        let restored_conv =
+            pack_short_conv_state(&s.geom, &restored_convs[&2]).expect("pack restored conv");
+        assert_eq!(
+            restored_conv, expected_conv,
+            "ShortConv state must restore bit-exact"
+        );
+        assert!(s.close());
+    }
+
+    /// R14-1: zero-copy `Arc<Vec<u8>>`/`TrackedPackedBytes` fits within exact `1 * peak` (< 2*SWA).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn capture_boundary_zero_copy_swa_and_exact_peak_budget() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::engine::governor::governor::{
+            Governor, GovernorIo, HostSample, MemoryStats, ModelRegistration,
+        };
+        use crate::engine::governor::host::{HostMemory, Pressure, spare_reserve_bytes};
+        struct Io(Arc<CacheLimitCoordinator>);
+        impl GovernorIo for Io {
+            fn stats(&self) -> MemoryStats {
+                MemoryStats {
+                    active: 16 << 20,
+                    pools: self.0.registered_pool_bytes(),
+                    cache: 0,
+                }
+            }
+            fn host(&self) -> HostSample {
+                let s = spare_reserve_bytes(32 << 30) + (16 << 30);
+                HostSample {
+                    memory: Some(HostMemory {
+                        available: s,
+                        spare: s,
+                    }),
+                    pressure: Some(Pressure::Normal),
+                }
+            }
+            fn now(&self) -> f64 {
+                0.0
+            }
+            fn sleep(&self, _: f64) {}
+            fn clear_cache(&self) {}
+            fn set_memory_limit(&self, b: u64) -> u64 {
+                b
+            }
+            fn physical_memory(&self) -> u64 {
+                32 << 30
+            }
+        }
+        let raw_swa = vec![5u8; 4096];
+        let p = raw_swa.as_ptr();
+        assert_eq!(Arc::new(raw_swa).as_ptr(), p);
+        let raw_dw = vec![7u8; 4096];
+        let p = raw_dw.as_ptr();
+        assert_eq!(TrackedPackedBytes::new(raw_dw).as_ptr(), p);
+
+        let fx = StateDiskTestFixture::new("r14-zero-copy", b"r14-zero-copy-v1", Some(10.0));
+        let mut s = fx.open(64u64 << 20, None);
+        let hc = Arc::new(CacheLimitCoordinator::new_for_test());
+        s.store.attach_host_budget_to(Arc::clone(&hc));
+        let toks: Vec<u32> = (100u32..228u32).collect();
+        s.coord.reset_scheduled_request(1).unwrap();
+        s.coord.record_tokens_all(1, &toks).unwrap();
+        let dev =
+            BoundaryDraftWindow::Device(make_draft_window(fx.cfg.hidden_size as u32, 16, 128));
+        let swa = s.geom.live_swa_bytes(128).unwrap() as u64;
+        let peak = swa
+            + s.geom.conv_span_bytes
+            + DraftContextWindow::bytes(fx.cfg.hidden_size as u32, 16)
+            + crate::disk_tier::store::lineage_bytes(128, 4);
+        assert!(peak < 2 * swa);
+        let gov = Governor::new(Arc::new(Io(Arc::clone(&hc))));
+        let _r = gov
+            .register_model(ModelRegistration {
+                model_id: 91,
+                hard_budget: (16 << 20) + peak,
+                untracked: 0,
+                page_bytes: 1 << 20,
+            })
+            .unwrap();
+        let id = s
+            .store
+            .capture_boundary_with_window(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &toks,
+                128,
+                914,
+                StateClass::Ordinary,
+                Some(&dev),
+                Some((&gov, 91)),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (gov.publications_refused(91), hc.registered_pool_bytes()),
+            (0, peak)
+        );
+        let ram = s.entry(id).ram().unwrap();
+        let dw = ram.draft_window.as_ref().unwrap();
+        assert_eq!(
+            (
+                ram.swa_data.capacity(),
+                ram.conv_data.capacity(),
+                dw.bytes.bytes.capacity()
+            ),
+            (
+                ram.swa_data.len(),
+                ram.conv_data.len(),
+                dw.bytes.bytes.len()
+            ),
+        );
+        assert!(s.close());
+    }
+
+    /// R14-2: recapturing a disk-only complete entry with a stale SSD copy installs fresh RAM and repairs SSD.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn recapture_installs_fresh_ram_and_repairs_stale_ssd_entry() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("r14-stale-ssd", b"r14-stale-ssd-v1", Some(0.0));
+        let mut s = fx.open(64u64 << 20, None);
+        let toks: Vec<u32> = (400u32..464u32).collect();
+        let dw = fx.packed_dw(64);
+        let id = s.capture_ord(&fx.conv, 1, &toks, 64, 942, Some(&dw));
+        assert!(!s.store.entries_missing_draft_window.contains(&id) && s.flush(10));
+        s.store.drop_all_ram_keeping_disk();
+        let copy_key = s.disk_copy(id).key;
+        let kv_keys = s.disk().engine.kv_chain_keys(s.entry(id));
+        s.manager().remove(&kv_keys[0]);
+        assert!(s.manager().contains_in(&copy_key, ColdGroup::DFlash2State));
+        assert!(
+            !s.disk().entry_disk_restorable(s.entry(id)) && !s.store.is_restorable(&s.coord, id)
+        );
+
+        let dev = BoundaryDraftWindow::Device(make_draft_window(fx.cfg.hidden_size as u32, 16, 64));
+        s.coord.reset_scheduled_request(2).unwrap();
+        s.coord.record_tokens_all(2, &toks).unwrap();
+        let got = s
+            .store
+            .capture_boundary_with_window(
+                &mut s.coord,
+                &fx.conv,
+                2,
+                &toks,
+                64,
+                942,
+                StateClass::Ordinary,
+                Some(&dev),
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, id);
+        assert!(s.entry(id).ram().is_some() && s.store.is_restorable(&s.coord, id));
+        let (a, from_ssd) = s.store.load_anchor(&s.coord, id).unwrap();
+        assert!(
+            !from_ssd
+                && a.draft_window
+                    .as_ref()
+                    .is_some_and(|w| w.is_complete_for(64))
+        );
+        assert!(s.flush(10) && s.disk().entry_disk_restorable(s.entry(id)));
+        s.store.drop_all_ram_keeping_disk();
+        let (a2, from_ssd2) = s.store.load_anchor(&s.coord, id).unwrap();
+        assert!(
+            from_ssd2
+                && a2
+                    .draft_window
+                    .as_ref()
+                    .is_some_and(|w| w.is_complete_for(64))
+        );
+        assert!(s.close());
+    }
+
+    /// R15-1: temporary (non-persistent) tier normal `Tick::Full` runs queued `Repair` upgrades
+    /// below `ram_cap` while keeping ordinary copy-ahead disabled.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn temp_tier_normal_ticks_complete_queued_repair_without_copy_ahead() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("r15-temp-repair", b"r15-temp-repair-v1", Some(0.0));
+        let mut s = fx.open_temp(64u64 << 20, None);
+        assert!(!s.disk().tier.persistent);
+        s.store.set_ram_cap(16);
+
+        let toks_a: Vec<u32> = (500u32..564u32).collect();
+        let query_a: Vec<u32> = (500u32..565u32).collect();
+        let toks_b: Vec<u32> = (600u32..664u32).collect();
+        let dw = fx.packed_dw(64);
+
+        // Spill A to the temporary SSD tier, drop RAM, and evict one of its Global KV blocks.
+        let id_a = s.capture_ord(&fx.conv, 1, &toks_a, 64, 951, Some(&dw));
+        s.disk_mut().write_behind.clear();
+        assert!(s.stage(id_a));
+        s.await_landed(id_a, "initial temporary-tier spill of A");
+        assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
+
+        s.store.drop_all_ram_keeping_disk();
+        s.evict_kv_block(id_a, 0);
+        assert!(!s.disk().entry_disk_restorable(s.entry(id_a)));
+
+        // Publish unrelated ordinary anchor B first (below `ram_cap`) so B sits ahead of A in
+        // `write_behind`, then recapture A into RAM (below `ram_cap`, queuing `Repair`).
+        let id_b = s.capture_ord(&fx.conv, 2, &toks_b, 64, 952, Some(&dw));
+        assert!(s.entry(id_b).disk().is_none() && s.has_wb(id_b));
+        assert!(!s.store.pending_disk_upgrades.contains_key(&id_b));
+
+        let got_a = s.capture_ord(&fx.conv, 1, &toks_a, 64, 951, Some(&dw));
+        assert_eq!(got_a, id_a);
+        assert!(matches!(
+            s.store.pending_disk_upgrades.get(&id_a),
+            Some(PendingDiskUpgrade::Repair { .. })
+        ));
+        assert!(s.entry(id_a).ram().is_some() && s.entry(id_a).disk().is_none());
+        assert!(s.has_wb(id_a));
+
+        // Drive normal scheduler ticks (`Tick::Full`, `force = false`) until A's repair finishes.
+        let dl = test_deadline(10);
+        while s.store.pending_disk_upgrades.contains_key(&id_a) || s.disk().writing() {
+            assert!(Instant::now() < dl, "timed out driving temp-tier repair");
+            s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+            if s.disk().writing() || s.disk().chain.is_some() {
+                let _ = s.disk().engine.await_landing(dl);
+            }
+        }
+        // Extra normal ticks must still leave ordinary anchor B unspilled on the temporary tier.
+        for _ in 0..3 {
+            assert!(!s.store.tick(&s.coord, Tick::Full { command_pages: 0 }));
+        }
+
+        assert!(s.store.pending_disk_upgrades.is_empty());
+        assert!(
+            s.entry(id_a)
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed)
+        );
+        assert!(s.disk().entry_disk_restorable(s.entry(id_a)));
+        assert!(
+            s.entry(id_b).ram().is_some() && s.entry(id_b).disk().is_none(),
+            "ordinary anchor B must not be copied ahead on a temporary tier"
+        );
+
+        s.drop_ram_and_purge();
+        s.assert_ssd_restores(&query_a, 951, Some(id_a), Some(&dw));
+        assert!(s.close());
     }
 }

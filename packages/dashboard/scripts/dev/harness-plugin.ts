@@ -26,7 +26,7 @@ export const DEV_OPEN = 'mlx:dev-open';
 export const DEV_RPC = 'mlx:dev-rpc';
 export const DEV_RPC_REPLY = 'mlx:dev-rpc-reply';
 export const DEV_CLOSE = 'mlx:dev-close';
-/** The bridge asks for a Work folder (the desktop's native dialog), and the plugin answers with the harness folder. */
+/** The bridge asks for a folder (the desktop's native dialog), and the plugin answers with the harness folder. */
 export const DEV_PICK_FOLDER = 'mlx:dev-pick-folder';
 export const DEV_FOLDER = 'mlx:dev-folder';
 const CLIENT_DISCONNECT = 'vite:client:disconnect';
@@ -57,6 +57,8 @@ function isGalleryUrl(url: string | undefined): boolean {
  */
 const GUARDED: ReadonlyArray<{ method: string; path: string }> = [
   { method: 'POST', path: '/api/downloads' },
+  { method: 'POST', path: '/api/downloads/adopt-plan' },
+  { method: 'POST', path: '/api/downloads/locate-plan' },
   { method: 'GET', path: '/api/catalog/updates' },
 ];
 
@@ -76,9 +78,17 @@ export interface HarnessOptions {
   allowNetwork?: boolean;
   /** The Chat options the served runtime was built with; checked by {@link assertHarnessChat}. */
   chat: ChatRuntimeOptions;
-  /** What the folder dialog answers: a throwaway folder in the fixture home. Null answers "nothing chosen". */
-  workFolder?: string | null;
+  /** What the folder dialog answers for each purpose: a throwaway folder in the fixture home. */
+  folders?: HarnessFolders;
 }
+
+/** The folder dialog's answer per purpose; null answers "nothing chosen". */
+export interface HarnessFolders {
+  work: string | null;
+  model: string | null;
+}
+
+const NO_FOLDERS: HarnessFolders = { work: null, model: null };
 
 /** The scripted stand-in for `mlx-agent`; Chat in the harness runs only on it. */
 export const FAKE_AGENT_FILE = resolve(import.meta.dirname, '../../__test__/helpers/fake-agent.mjs');
@@ -348,7 +358,11 @@ function channelOf(data: unknown): string | null {
  * Serve `runtime` to every tab that opens a channel on `ws`. Returns the detach, which also closes every channel.
  * Messages cross as JSON: RPC requests, replies and download / live events are plain data.
  */
-export function attachHarness(ws: HarnessChannel, runtime: RpcRuntime, workFolder: string | null = null): () => void {
+export function attachHarness(
+  ws: HarnessChannel,
+  runtime: RpcRuntime,
+  folders: HarnessFolders = NO_FOLDERS,
+): () => void {
   const channels = new Map<string, Channel>();
 
   const close = (id: string): void => {
@@ -395,9 +409,11 @@ export function attachHarness(ws: HarnessChannel, runtime: RpcRuntime, workFolde
   };
 
   const onPickFolder = (data: unknown, client: HarnessClient): void => {
-    const requestId = typeof data === 'object' && data !== null ? (data as { requestId?: unknown }).requestId : null;
+    if (typeof data !== 'object' || data === null) return;
+    const { requestId, purpose } = data as { requestId?: unknown; purpose?: unknown };
     if (typeof requestId !== 'string' || requestId === '' || requestId.length > 64) return;
-    client.send(DEV_FOLDER, { requestId, path: workFolder });
+    const path = purpose === 'work' ? folders.work : purpose === 'model' ? folders.model : null;
+    client.send(DEV_FOLDER, { requestId, path });
   };
 
   const onDisconnect = (_data: unknown, client: HarnessClient): void => {
@@ -435,7 +451,7 @@ export function devHarness(runtime: RpcRuntime, options: HarnessOptions): Plugin
           : [{ tag: 'script', attrs: { type: 'module', src: `/@fs${BRIDGE_FILE}` }, injectTo: 'body' }],
     },
     configureServer(server) {
-      const detach = attachHarness(server.ws as unknown as HarnessChannel, served, options.workFolder ?? null);
+      const detach = attachHarness(server.ws as unknown as HarnessChannel, served, options.folders ?? NO_FOLDERS);
       server.httpServer?.once('close', detach);
       server.middlewares.use((request, response, next) => {
         if (request.method !== 'GET' || !isGalleryUrl(request.url)) {

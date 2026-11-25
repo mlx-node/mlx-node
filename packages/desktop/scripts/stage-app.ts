@@ -21,16 +21,27 @@ import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, write
 import { join } from 'node:path';
 
 export const RUNTIME_BUILD_FILES = ['iconTemplate.png', 'iconTemplate@2x.png'] as const;
+export const WINDOWS_RUNTIME_BUILD_FILES = ['icon.ico', 'iconTemplate.png', 'iconTemplate@2x.png'] as const;
+
+export function runtimeBuildFiles(platform: NodeJS.Platform = 'darwin'): readonly string[] {
+  return platform === 'win32' ? WINDOWS_RUNTIME_BUILD_FILES : RUNTIME_BUILD_FILES;
+}
 
 /**
- * Only the tray images are opened at runtime. `icon.icns` is installed by
- * Electron Packager, while the generator and its ignored iconset are build
- * inputs that do not belong in `Contents/Resources/app`.
+ * Only the runtime icon files are opened by the running app (`iconTemplate*.png`
+ * for the macOS menu bar, plus `icon.ico` on Windows for the tray and window
+ * icon). `icon.icns` is installed by Electron Packager on macOS, while the
+ * generator, its ignored iconset, and the Store `msix/` tiles are build inputs
+ * that do not belong in the staged app directory.
  */
-export function stageRuntimeBuildFiles(desktopDir: string, stageDir: string): void {
+export function stageRuntimeBuildFiles(
+  desktopDir: string,
+  stageDir: string,
+  platform: NodeJS.Platform = 'darwin',
+): void {
   const target = join(stageDir, 'build');
   mkdirSync(target, { recursive: true });
-  for (const name of RUNTIME_BUILD_FILES) {
+  for (const name of runtimeBuildFiles(platform)) {
     cpSync(join(desktopDir, 'build', name), join(target, name));
   }
 }
@@ -348,26 +359,30 @@ export interface StageResult {
   prunedNested: string[];
 }
 
-/**
- * Materialise the staged app at `stageDir`.
- *
- * `roots` are the runtime entry dependencies — what the three entries actually
- * import, not what `packages/desktop/package.json` happens to declare.
- */
-export function stageApp(opts: {
+export interface StageAppOptions {
   repoRoot: string;
   desktopDir: string;
   stageDir: string;
   roots: string[];
   /** Set only by the packaging command when it will Developer ID sign the app. */
   autoUpdates?: boolean;
-}): StageResult {
+  /** Target platform whose runtime build assets should be staged (defaults to `'darwin'`). */
+  platform?: NodeJS.Platform;
+}
+
+/**
+ * Materialise the staged app at `stageDir`.
+ *
+ * `roots` are the runtime entry dependencies — what the three entries actually
+ * import, not what `packages/desktop/package.json` happens to declare.
+ */
+export function stageApp(opts: StageAppOptions): StageResult {
   const { repoRoot, desktopDir, stageDir } = opts;
   rmSync(stageDir, { recursive: true, force: true });
   mkdirSync(stageDir, { recursive: true });
 
   cpSync(join(desktopDir, 'dist'), join(stageDir, 'dist'), { recursive: true });
-  stageRuntimeBuildFiles(desktopDir, stageDir);
+  stageRuntimeBuildFiles(desktopDir, stageDir, opts.platform);
 
   const source = readJson(join(desktopDir, 'package.json'));
   // Dependencies are stripped from the staged manifest on purpose. node_modules

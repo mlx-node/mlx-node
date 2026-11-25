@@ -23,6 +23,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -187,6 +188,53 @@ inline array ensure_aligned_contiguous(
   return copy;
 }
 
+MTL::ComputePipelineState* get_cached_moe_pipe(
+    metal::Device& d,
+    const char* lib,
+    const char* op,
+    const std::string& name) {
+  thread_local const void* cached_dev = nullptr;
+  thread_local std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+  const void* cur_dev = static_cast<const void*>(d.mtl_device());
+  if (cached_dev != cur_dev) {
+    cache.clear();
+    cached_dev = cur_dev;
+  }
+  auto it = cache.find(name);
+  if (it != cache.end()) {
+    return it->second;
+  }
+  auto* pipe = fast::paged::get_prebuilt_kernel(d, lib, op, name);
+  cache.emplace(name, pipe);
+  return pipe;
+}
+
+inline void bind_routed_weight(
+    metal::CommandEncoder& enc,
+    const array& weight,
+    int idx,
+    uint32_t num_experts,
+    uint32_t expert_bound) {
+  // Charge only the active-expert upper bound (`min(E, M * top_k)`) to MLX's
+  // command-buffer memory budget (matching `mlx_splash_moe.cpp`), so a single
+  // MoE visit does not exceed the 50M-element CB threshold and force 48+
+  // premature CB commits/step. Binding, barriers, and residency are unchanged.
+  const bool bounded = expert_bound < num_experts &&
+      weight.ndim() >= 2 &&
+      weight.shape(0) == static_cast<int>(num_experts) &&
+      weight.flags().row_contiguous &&
+      weight.offset() == 0 &&
+      weight.data_size() == weight.size() &&
+      weight.strides(0) > 0 &&
+      static_cast<size_t>(weight.strides(0)) * num_experts == weight.data_size();
+  if (bounded) {
+    enc.set_input_array_with_budget(
+        weight, idx, static_cast<size_t>(weight.strides(0)) * expert_bound);
+  } else {
+    enc.set_input_array(weight, idx);
+  }
+}
+
 void Inkling2GroupedMoe::eval_gpu(
     const std::vector<array>& inputs,
     std::vector<array>& outputs) {
@@ -239,7 +287,11 @@ void Inkling2GroupedMoe::eval_gpu(
 
   auto set_kernel = [&](const std::string& name) {
     enc.set_compute_pipeline_state(
-        fast::paged::get_prebuilt_kernel(d, "inkling2_moe", "grouped", name));
+        get_cached_moe_pipe(d, "inkling2_moe", "grouped", name));
+  };
+  const uint32_t expert_bound = std::min(p.experts, p.rows * p.top_k);
+  auto bind_routed = [&](const array& weight, int idx) {
+    bind_routed_weight(enc, weight, idx, p.experts, expert_bound);
   };
   auto make_temp = [&](Shape shape, Dtype dtype) {
     array tmp(std::move(shape), dtype, nullptr, {});
@@ -268,14 +320,14 @@ void Inkling2GroupedMoe::eval_gpu(
                                            : "inkling2_moe_m1_gate_up_situ_nvfp4");
     enc.set_input_array(x, 0);
     enc.set_input_array(indices, 1);
-    enc.set_input_array(gu_w, 2);
-    enc.set_input_array(gu_s, 3);
+    bind_routed(gu_w, 2);
+    bind_routed(gu_s, 3);
     if (gu_is_mxfp8) {
       enc.set_output_array(act, 4);
       enc.set_bytes(p, 5);
     } else {
       if (gu_aux) {
-        enc.set_input_array(*gu_aux, 4);
+        bind_routed(*gu_aux, 4);
       } else {
         enc.set_bytes(dummy_f32, 4);
       }
@@ -293,11 +345,11 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(act, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gamma, 2);
-    enc.set_input_array(dn_w, 3);
-    enc.set_input_array(dn_s, 4);
+    bind_routed(dn_w, 3);
+    bind_routed(dn_s, 4);
     if (dn_is_q8) {
       if (dn_aux) {
-        enc.set_input_array(*dn_aux, 5);
+        bind_routed(*dn_aux, 5);
       } else {
         enc.set_bytes(dummy_f32, 5);
       }
@@ -404,14 +456,14 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
     enc.set_input_array(routes, 4);
-    enc.set_input_array(gu_w, 5);
-    enc.set_input_array(gu_s, 6);
+    bind_routed(gu_w, 5);
+    bind_routed(gu_s, 6);
     if (gu_is_mxfp8) {
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
     } else {
       if (gu_aux) {
-        enc.set_input_array(*gu_aux, 7);
+        bind_routed(*gu_aux, 7);
       } else {
         enc.set_bytes(dummy_f32, 7);
       }
@@ -431,10 +483,10 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(gu_w, 4);
-    enc.set_input_array(gu_s, 5);
+    bind_routed(gu_w, 4);
+    bind_routed(gu_s, 5);
     if (gu_aux) {
-      enc.set_input_array(*gu_aux, 6);
+      bind_routed(*gu_aux, 6);
     } else {
       enc.set_bytes(dummy_f32, 6);
     }
@@ -456,11 +508,11 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(dn_w, 4);
-    enc.set_input_array(dn_s, 5);
+    bind_routed(dn_w, 4);
+    bind_routed(dn_s, 5);
     if (dn_is_q8) {
       if (dn_aux) {
-        enc.set_input_array(*dn_aux, 6);
+        bind_routed(*dn_aux, 6);
       } else {
         enc.set_bytes(dummy_f32, 6);
       }
@@ -483,10 +535,10 @@ void Inkling2GroupedMoe::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(dn_w, 4);
-    enc.set_input_array(dn_s, 5);
+    bind_routed(dn_w, 4);
+    bind_routed(dn_s, 5);
     if (dn_aux) {
-      enc.set_input_array(*dn_aux, 6);
+      bind_routed(*dn_aux, 6);
     } else {
       enc.set_bytes(dummy_f32, 6);
     }
@@ -560,7 +612,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
       bool has_dn_aux,
       bool has_res,
       bool emit_tape,
-      bool router_input_is_weight)
+      bool router_input_is_weight,
+      bool has_tree = false)
       : fast::Custom(
             s,
             [](std::vector<array>) -> std::vector<array> {
@@ -579,7 +632,8 @@ class Inkling2GroupedMoeFused : public fast::Custom {
         has_dn_aux_(has_dn_aux),
         has_res_(has_res),
         emit_tape_(emit_tape),
-        router_input_is_weight_(router_input_is_weight) {}
+        router_input_is_weight_(router_input_is_weight),
+        has_tree_(has_tree) {}
 
   DEFINE_NAME(Inkling2GroupedMoeFused)
 
@@ -598,6 +652,7 @@ class Inkling2GroupedMoeFused : public fast::Custom {
         has_res_ == rhs.has_res_ &&
         emit_tape_ == rhs.emit_tape_ &&
         router_input_is_weight_ == rhs.router_input_is_weight_ &&
+        has_tree_ == rhs.has_tree_ &&
         std::memcmp(&p_, &rhs.p_, sizeof(p_)) == 0;
   }
 
@@ -633,6 +688,7 @@ class Inkling2GroupedMoeFused : public fast::Custom {
   bool has_res_;
   bool emit_tape_;
   bool router_input_is_weight_;
+  bool has_tree_;
 };
 
 #ifdef MLX_NODE_METAL_ENABLED
@@ -682,6 +738,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
       hist_f32_mask |= (1u << i);
     }
   }
+  const array* tree_rows = has_tree_ ? &a[next_idx++] : nullptr;
 
   auto& out_y = outputs[0];
   auto& out_hist = outputs[1];
@@ -695,7 +752,11 @@ void Inkling2GroupedMoeFused::eval_gpu(
 
   auto set_kernel = [&](const std::string& name) {
     enc.set_compute_pipeline_state(
-        fast::paged::get_prebuilt_kernel(d, "inkling2_moe", "grouped", name));
+        get_cached_moe_pipe(d, "inkling2_moe", "grouped", name));
+  };
+  const uint32_t expert_bound = std::min(p.experts, p.rows * p.top_k);
+  auto bind_routed = [&](const array& weight, int idx) {
+    bind_routed_weight(enc, weight, idx, p.experts, expert_bound);
   };
   auto make_temp = [&](Shape shape, Dtype dtype) {
     array tmp(std::move(shape), dtype, nullptr, {});
@@ -714,7 +775,8 @@ void Inkling2GroupedMoeFused::eval_gpu(
   pc.flags = (post_w.dtype() == float32 ? 1u : 0u) |
       (has_res_ ? 2u : 0u) |
       ((has_res_ && res->dtype() == float32) ? 4u : 0u) |
-      (emit_tape_ ? 8u : 0u);
+      (emit_tape_ ? 8u : 0u) |
+      (has_tree_ ? 16u : 0u);
   pc.hist_f32_mask = hist_f32_mask;
 
   const float dummy_f32 = 0.0f;
@@ -735,14 +797,14 @@ void Inkling2GroupedMoeFused::eval_gpu(
     std::optional<array> proj_logits_opt;
     if (router_input_is_weight_) {
       proj_logits_opt = scratch(8, {1, static_cast<int>(p.experts)}, float32);
-      Inkling2MoeRouterProjParamsLocal rpp{1u, p.hidden, p.experts, p.hidden, 0u, 0u, 0u, 0u};
-      enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
-          d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
+      Inkling2MoeRouterProjParamsLocal rpp{1u, p.hidden, p.experts, p.hidden, 0u, 8u, 0u, 0u};
+      enc.set_compute_pipeline_state(
+          get_cached_moe_pipe(d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
       enc.set_input_array(x, 0);
       enc.set_input_array(router_logits, 1);
       enc.set_output_array(*proj_logits_opt, 2);
       enc.set_bytes(rpp, 3);
-      enc.dispatch_threadgroups(MTL::Size((p.experts + 3u) / 4u, 1, 1), MTL::Size(128, 1, 1));
+      enc.dispatch_threadgroups(MTL::Size((p.experts + 1u) / 2u, 1, 1), MTL::Size(64, 1, 1));
     }
     const array& logits_arr = router_input_is_weight_ ? *proj_logits_opt : router_logits;
     uint32_t rflags = (logits_arr.dtype() == float32 ? 1u : 0u);
@@ -756,8 +818,8 @@ void Inkling2GroupedMoeFused::eval_gpu(
     }
     Inkling2MoeRouteParamsLocal rp{
         1u, p.experts, p.top_k, route_scale_, rflags, p.experts, 0u, 0u};
-    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
-        d, "inkling2_ops", "moe_route", "inkling2_moe_route_f32"));
+    enc.set_compute_pipeline_state(
+        get_cached_moe_pipe(d, "inkling2_ops", "moe_route", "inkling2_moe_route_f32"));
     enc.set_input_array(logits_arr, 0);
     if (bias) enc.set_input_array(*bias, 1); else enc.set_bytes(dummy_f32, 1);
     if (down_scale) enc.set_input_array(*down_scale, 2); else enc.set_bytes(dummy_f32, 2);
@@ -773,13 +835,13 @@ void Inkling2GroupedMoeFused::eval_gpu(
                                            : "inkling2_moe_m1_gate_up_situ_nvfp4");
     enc.set_input_array(x, 0);
     enc.set_input_array(indices, 1);
-    enc.set_input_array(gu_w, 2);
-    enc.set_input_array(gu_s, 3);
+    bind_routed(gu_w, 2);
+    bind_routed(gu_s, 3);
     if (gu_is_mxfp8) {
       enc.set_output_array(act, 4);
       enc.set_bytes(p, 5);
     } else {
-      if (gu_aux) enc.set_input_array(*gu_aux, 4); else enc.set_bytes(dummy_f32, 4);
+      if (gu_aux) bind_routed(*gu_aux, 4); else enc.set_bytes(dummy_f32, 4);
       enc.set_output_array(act, 5);
       enc.set_bytes(p, 6);
     }
@@ -794,11 +856,11 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(act, 0);
     enc.set_input_array(indices, 1);
     enc.set_input_array(gamma, 2);
-    enc.set_input_array(dn_w, 3);
-    enc.set_input_array(dn_s, 4);
+    bind_routed(dn_w, 3);
+    bind_routed(dn_s, 4);
     uint32_t bidx = 5u;
     if (dn_is_q8) {
-      if (dn_aux) enc.set_input_array(*dn_aux, bidx++); else enc.set_bytes(dummy_f32, bidx++);
+      if (dn_aux) bind_routed(*dn_aux, bidx++); else enc.set_bytes(dummy_f32, bidx++);
     }
     enc.set_input_array(post_w, bidx++);
     enc.set_input_array(*hists[0], bidx++);
@@ -874,17 +936,18 @@ void Inkling2GroupedMoeFused::eval_gpu(
   std::optional<array> proj_logits_opt;
   if (router_input_is_weight_) {
     proj_logits_opt = scratch(8, {static_cast<int>(p.rows), static_cast<int>(p.experts)}, float32);
+    const uint32_t row_group = (p.rows > 8u && p.rows <= 16u) ? 16u : 8u;
     Inkling2MoeRouterProjParamsLocal rpp{
-        p.rows, p.hidden, p.experts, p.hidden, 0u, 0u, 0u, 0u};
-    enc.set_compute_pipeline_state(fast::paged::get_prebuilt_kernel(
-        d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
+        p.rows, p.hidden, p.experts, p.hidden, 0u, row_group, 0u, 0u};
+    enc.set_compute_pipeline_state(
+        get_cached_moe_pipe(d, "inkling2_ops", "moe_router_proj", "inkling2_moe_router_proj_f32"));
     enc.set_input_array(x, 0);
     enc.set_input_array(router_logits, 1);
     enc.set_output_array(*proj_logits_opt, 2);
     enc.set_bytes(rpp, 3);
     enc.dispatch_threadgroups(
-        MTL::Size((p.experts + 3u) / 4u, (p.rows + 7u) / 8u, 1),
-        MTL::Size(128, 1, 1));
+        MTL::Size((p.experts + 1u) / 2u, (p.rows + row_group - 1u) / row_group, 1),
+        MTL::Size(64, 1, 1));
   }
   const array& logits_arr = router_input_is_weight_ ? *proj_logits_opt : router_logits;
   set_kernel("inkling2_moe_route_group_small");
@@ -933,13 +996,13 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
     enc.set_input_array(routes, 4);
-    enc.set_input_array(gu_w, 5);
-    enc.set_input_array(gu_s, 6);
+    bind_routed(gu_w, 5);
+    bind_routed(gu_s, 6);
     if (gu_is_mxfp8) {
       enc.set_output_array(hidden, 7);
       enc.set_bytes(p, 8);
     } else {
-      if (gu_aux) enc.set_input_array(*gu_aux, 7); else enc.set_bytes(dummy_f32, 7);
+      if (gu_aux) bind_routed(*gu_aux, 7); else enc.set_bytes(dummy_f32, 7);
       enc.set_output_array(hidden, 8);
       enc.set_bytes(p, 9);
     }
@@ -956,9 +1019,9 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(gu_w, 4);
-    enc.set_input_array(gu_s, 5);
-    if (gu_aux) enc.set_input_array(*gu_aux, 6); else enc.set_bytes(dummy_f32, 6);
+    bind_routed(gu_w, 4);
+    bind_routed(gu_s, 5);
+    if (gu_aux) bind_routed(*gu_aux, 6); else enc.set_bytes(dummy_f32, 6);
     enc.set_output_array(hidden, 7);
     enc.set_bytes(p, 8);
     enc.dispatch_threadgroups_indirect(
@@ -977,10 +1040,10 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(dn_w, 4);
-    enc.set_input_array(dn_s, 5);
+    bind_routed(dn_w, 4);
+    bind_routed(dn_s, 5);
     if (dn_is_q8) {
-      if (dn_aux) enc.set_input_array(*dn_aux, 6); else enc.set_bytes(dummy_f32, 6);
+      if (dn_aux) bind_routed(*dn_aux, 6); else enc.set_bytes(dummy_f32, 6);
       enc.set_output_array(projected, 7);
       enc.set_bytes(p, 8);
     } else {
@@ -1000,9 +1063,9 @@ void Inkling2GroupedMoeFused::eval_gpu(
     enc.set_input_array(tiles, 1);
     enc.set_input_array(tile_lists, 2);
     enc.set_input_array(count, 3);
-    enc.set_input_array(dn_w, 4);
-    enc.set_input_array(dn_s, 5);
-    if (dn_aux) enc.set_input_array(*dn_aux, 6); else enc.set_bytes(dummy_f32, 6);
+    bind_routed(dn_w, 4);
+    bind_routed(dn_s, 5);
+    if (dn_aux) bind_routed(*dn_aux, 6); else enc.set_bytes(dummy_f32, 6);
     enc.set_output_array(projected, 7);
     enc.set_bytes(p, 8);
     enc.dispatch_threadgroups_indirect(
@@ -1034,6 +1097,7 @@ void Inkling2GroupedMoeFused::eval_gpu(
   enc.set_output_array(out_hist, 11);
   if (out_tape) enc.set_output_array(*out_tape, 12); else enc.set_bytes(dummy_f32, 12);
   enc.set_bytes(pc, 13);
+  if (tree_rows) enc.set_input_array(*tree_rows, 14); else enc.set_bytes(dummy_f32, 14);
   enc.dispatch_threadgroups(
       MTL::Size((p.hidden + 31u) / 32u, num_seqs_, 1),
       MTL::Size(256, 1, 1));
@@ -1433,6 +1497,7 @@ bool mlx_inkling2_grouped_moe_fused(
     bool round_bf16_before_situ,
     bool emit_tape,
     bool router_input_is_weight,
+    mlx_array* tree_rows_ptr,
     mlx_array** out_y,
     mlx_array** out_history,
     mlx_array** out_tape) {
@@ -1590,6 +1655,19 @@ bool mlx_inkling2_grouped_moe_fused(
       }
       inputs.push_back(h);
     }
+    const bool has_tree = tree_rows_ptr != nullptr;
+    if (has_tree) {
+      const auto& tr = *reinterpret_cast<array*>(tree_rows_ptr);
+      if (tr.ndim() != 2 || tr.dtype() != uint32 || tr.shape(0) != T || tr.shape(1) != 2) {
+        return false;
+      }
+      for (uint32_t i = 0; i < num_seqs; ++i) {
+        if (cu_seqlens_host[i + 1u] - cu_seqlens_host[i] > 16) {
+          return false;
+        }
+      }
+      inputs.push_back(tr);
+    }
 
     Inkling2MoeParams p{};
     p.rows = static_cast<uint32_t>(T);
@@ -1622,7 +1700,8 @@ bool mlx_inkling2_grouped_moe_fused(
         has_dn_aux,
         has_res,
         emit_tape,
-        router_input_is_weight);
+        router_input_is_weight,
+        has_tree);
     std::vector<Shape> out_shapes = emit_tape ? std::vector<Shape>{x.shape(), hs, x.shape()}
                                               : std::vector<Shape>{x.shape(), hs};
     std::vector<Dtype> out_dtypes = emit_tape ? std::vector<Dtype>{bfloat16, bfloat16, bfloat16}
@@ -1649,7 +1728,7 @@ bool mlx_inkling2_grouped_moe_fused(
   (void)num_hists; (void)num_seqs; (void)packed_hist; (void)top_k; (void)route_scale;
   (void)gu_quant_mode; (void)dn_quant_mode; (void)interleaved_gate_up;
   (void)gate_softcap; (void)up_softcap; (void)round_bf16_before_situ; (void)emit_tape;
-  (void)router_input_is_weight;
+  (void)router_input_is_weight; (void)tree_rows_ptr;
   return false;
 #endif
 }

@@ -201,11 +201,13 @@ fn a_paged_prefill_pipeline_failure_names_the_gpu_family() {
     );
 }
 
-/// 4 Inkling2 MPP prefill kernels + 46 fused elementwise/conv/AttnRes/LoopCtrl/MoE/softcap/markov/bf16-linear/q8-sym/kv-prep-paged kernels
+/// 8 Inkling2 MPP prefill kernels (4 r8 + 4 r16, including 2 `_q8q_`) + 50 fused
+/// elementwise/conv/AttnRes/LoopCtrl/MoE/softcap/markov/bf16-linear/q8-sym/kv-prep-paged kernels
 /// + 30 grouped/fused MoE kernels (`inkling2_*` prefix: NVFP4, Q8_0, MXFP8, and Q5_K).
-const INKLING2_PREFIX_NAMES: i64 = 4 + 46 + 30;
-/// Total Inkling2 pipelines built (including 7 `paged_attention_inkling2_*` decode kernels).
-const INKLING2_TOTAL_PIPELINES: i64 = 7 + 4 + 46 + 30;
+const INKLING2_PREFIX_NAMES: i64 = 8 + 50 + 30;
+/// Total Inkling2 pipelines built (including 13 `paged_attention_inkling2_*` decode kernels:
+/// 4 KTM + 4 BF16 bs16 + 4 BF16 bs32 + 1 v2_reduce).
+const INKLING2_TOTAL_PIPELINES: i64 = 13 + 8 + 50 + 30;
 /// 8 NAX tensor-op MoE kernels (`inkling2_moe_*_nax_*`), 3 NAX BF16 linear/lm_head kernels
 /// (`inkling2_bf16_linear_nax_m8`, `inkling2_bf16_linear_batched`,
 /// `inkling2_bf16_lm_head_softcap_argmax_p1`), and 4 NAX Q8_0 linear/lm_head kernels
@@ -228,8 +230,8 @@ fn every_inkling2_kernel_is_in_the_metallib_and_builds() {
     let apple10 = unsafe { mlx_sys::mlx_gpu_architecture_gen() } >= 17;
     let nax = unsafe { mlx_sys::mlx_metal_is_nax_available() };
     let expected_built = INKLING2_TOTAL_PIPELINES
-        - if lacks { 4 } else { 0 }
-        - if !lacks && !apple10 { 1 } else { 0 } // q8q only on Apple10+
+        - if lacks { 8 } else { 0 }
+        - if !lacks && !apple10 { 2 } else { 0 } // q8q (r8 + r16) only on Apple10+
         - if !nax { INKLING2_NAX_ONLY_PIPELINES } else { 0 };
     assert_eq!(
         c.built, expected_built,

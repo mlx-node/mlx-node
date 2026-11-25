@@ -6,6 +6,7 @@ import { NapiCli, createBuildCommand } from '@napi-rs/cli';
 import { format } from 'vite-plus/fmt';
 
 import viteConfig from '../../vite.config';
+import { LINUX_CUDA_HEADER_MARKERS, LINUX_CUDA_INCLUDE_DIRS, selectLinuxCudaIncludeDir } from './linux-cuda-include';
 import {
   assertAddonMinOs,
   assertMetallibFloor,
@@ -18,6 +19,7 @@ import {
   selectMetallib,
   selectPagedMetallib,
 } from './metallib-select';
+import { nativeAddonTriple, normalizeLineEndings, selectWindowsMlxRoot } from './windows-runtime-select.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const packageDeclarationsPath = join(__dirname, 'index.d.cts');
@@ -28,7 +30,7 @@ async function assertDeclarationCopiesMatch(phase: string): Promise<void> {
     readFile(packageDeclarationsPath, 'utf-8'),
     readFile(crateDeclarationsPath, 'utf-8'),
   ]);
-  if (packageDeclarations !== crateDeclarations) {
+  if (normalizeLineEndings(packageDeclarations) !== normalizeLineEndings(crateDeclarations)) {
     throw new Error(
       `[build.ts declaration drift] packages/core/index.d.cts and crates/mlx-core/index.d.cts differ ${phase}. ` +
         'Regenerate the native declarations, synchronize both committed copies, and retry.',
@@ -78,9 +80,12 @@ if (metalBuild) {
     assertAddonMinOs(await readFile(nodeOutput.path), nodeOutput.path);
   }
 }
-await copyNativeAddon(outputs);
-if (process.platform === 'win32' && process.arch === 'arm64') {
-  await copyWindowsCudaRuntime();
+const addonTriple = await copyNativeAddon(outputs);
+if (process.platform === 'win32' && addonTriple === 'win32-arm64-msvc') {
+  await copyWindowsCudaRuntime(outputs);
+}
+if (process.platform === 'linux' && process.arch === 'arm64') {
+  await copyLinuxCudaIncludes(outputs);
 }
 // Copy mlx.metallib for colocated Metal shader loading
 // MLX looks for metallib next to the binary, so we copy it here.
@@ -130,25 +135,7 @@ async function removeMetallibsForCpuOnlyBuild() {
   console.log('Removed stale metallibs from MLX_DISABLE_METAL CPU-only build outputs.');
 }
 
-// Derive the matching `npm/<triple>/` directory from napi-rs's actual output.
-// This must not use `process.arch`: an x64 Node under Rosetta can legitimately
-// drive the configured aarch64 Rust build.
-function nativeAddonTriple(actualName: string): string {
-  const match = /^mlx-core\.(.+)\.node$/.exec(actualName);
-  if (match == null) {
-    throw new Error(`[build.ts] unrecognized native addon output: ${actualName}`);
-  }
-  const triple = match[1];
-  if (process.platform === 'darwin' && !triple.startsWith('darwin-')) {
-    throw new Error(`[build.ts] expected a Darwin addon, got ${actualName}`);
-  }
-  if (process.platform === 'linux' && !triple.startsWith('linux-')) {
-    throw new Error(`[build.ts] expected a Linux addon, got ${actualName}`);
-  }
-  return triple;
-}
-
-async function copyNativeAddon(outputs: Awaited<typeof task>) {
+async function copyNativeAddon(outputs: Awaited<typeof task>): Promise<string> {
   const nodeOutput = outputs.find((output) => output.kind === 'node');
   if (!nodeOutput) {
     throw new Error('[build.ts smoke check] native addon output missing from napi build');
@@ -163,42 +150,43 @@ async function copyNativeAddon(outputs: Awaited<typeof task>) {
   }
 
   const npmPlatformDir = join(__dirname, 'npm', triple);
-  // The darwin platform dir is committed (it carries the metallibs + a
-  // README). The linux dir is not: its only published artifact would be a
-  // .node that CI never builds, so we don't ship it as an optional package.
-  // A from-source linux build still needs somewhere to land the .node, so
-  // create the dir on demand (no-op when it already exists, e.g. darwin).
+  // Published platform dirs (darwin-arm64, linux-arm64-gnu) are committed,
+  // whereas desktop-only targets (win32-arm64-msvc) are not. Create the dir
+  // on demand so from-source builds on unpublished targets still have
+  // somewhere to land their .node (no-op when it already exists).
   await mkdir(npmPlatformDir, { recursive: true });
   const dst = join(npmPlatformDir, expectedName);
   await copyFile(nodeOutput.path, dst);
   console.log(`Copied ${expectedName} -> ${dst}`);
+  return triple;
 }
 
-async function copyWindowsCudaRuntime() {
+async function copyWindowsCudaRuntime(outputs: Awaited<typeof task>) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (!nodeOutput) {
+    throw new Error('[build.ts smoke check] native addon output missing from napi build');
+  }
   const targetRoot = resolveTargetRoot({
     targetDir: buildOptions.targetDir,
     env: process.env,
     defaultRoot: join(__dirname, '../../target'),
   });
-  const buildRoot = join(targetRoot, 'aarch64-pc-windows-msvc', profileDirName(buildOptions), 'build');
-  const entries = await readdir(buildRoot);
-  const scriptDirs = entries.filter((name) => name.startsWith('mlx-sys-')).map((name) => join(buildRoot, name));
-  if (entries.includes('mlx-sys')) {
-    const packageDir = join(buildRoot, 'mlx-sys');
-    scriptDirs.push(...(await readdir(packageDir)).map((name) => join(packageDir, name)));
-  }
-  const installs = await Promise.all(
-    scriptDirs.map(async (dir) => {
-      const install = join(dir, 'out', 'mlx-cmake');
-      const blas = await stat(join(install, 'openblas.dll')).catch((error: unknown) => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
-        throw error;
-      });
-      return { install, mtime: blas?.mtimeMs ?? 0 };
-    }),
+  const triple = buildOptions.target ?? process.env.CARGO_BUILD_TARGET ?? 'aarch64-pc-windows-msvc';
+  const profile = profileDirName(buildOptions);
+  const selected = selectWindowsMlxRoot({
+    addonBinary: await readFile(nodeOutput.path),
+    addonPath: nodeOutput.path,
+    targetRoot,
+    triple,
+    profile,
+    warn: (msg) => console.warn(msg),
+  });
+  console.log(
+    selected.source === 'build-unit'
+      ? `Windows MLX runtime root bound via build unit ${selected.unitHash}: ${selected.mlxRoot}`
+      : `Windows MLX runtime root selected by fallback scan: ${selected.mlxRoot}`,
   );
-  const source = installs.filter(({ mtime }) => mtime > 0).sort((a, b) => b.mtime - a.mtime)[0]?.install;
-  if (!source) throw new Error(`Cannot find the Windows MLX install in ${buildRoot}`);
+  const source = selected.mlxRoot;
 
   const cudaRoot = process.env.CUDA_PATH || process.env.CUDA_HOME;
   const cudnnRoot = process.env.CUDNN_PATH;
@@ -222,6 +210,7 @@ async function copyWindowsCudaRuntime() {
   }
   const destinations = [__dirname, join(__dirname, 'npm', 'win32-arm64-msvc')];
   for (const dest of destinations) {
+    await mkdir(dest, { recursive: true });
     await copyFile(join(source, 'openblas.dll'), join(dest, 'openblas.dll'));
     for (const name of [...cudaDlls, ...nvrtcBuiltins]) {
       await copyFile(join(cudaBin, name), join(dest, name));
@@ -230,8 +219,72 @@ async function copyWindowsCudaRuntime() {
       await copyFile(join(cudnnBin, name), join(dest, name));
     }
     for (const include of ['cccl', 'cute', 'cutlass']) {
-      await cp(join(source, 'include', include), join(dest, 'include', include), { recursive: true });
+      const destInclude = join(dest, 'include', include);
+      await rm(destInclude, { recursive: true, force: true });
+      await cp(join(source, 'include', include), destInclude, { recursive: true });
     }
+  }
+}
+
+async function copyLinuxCudaIncludes(outputs: Awaited<typeof task>) {
+  const nodeOutput = outputs.find((output) => output.kind === 'node');
+  if (!nodeOutput) {
+    throw new Error('[build.ts smoke check] native addon output missing from napi build');
+  }
+  const targetRoot = resolveTargetRoot({
+    targetDir: buildOptions.targetDir,
+    env: process.env,
+    defaultRoot: join(__dirname, '../../target'),
+  });
+  const profile = profileDirName(buildOptions);
+  const triple = buildOptions.target || process.env.CARGO_BUILD_TARGET || 'aarch64-unknown-linux-gnu';
+  const picked = await selectLinuxCudaIncludeDir({
+    addonBinary: await readFile(nodeOutput.path),
+    addonPath: nodeOutput.path,
+    targetRoot,
+    buildDir: process.env.CARGO_BUILD_BUILD_DIR,
+    triple,
+    profile,
+    env: process.env,
+  });
+  console.log(
+    {
+      baked: `Linux CUDA NVRTC headers bound via the addon's baked MLX_NODE_CUDA_INCLUDE_DIR: ${picked.includeDir}`,
+      scan: `Linux CUDA NVRTC headers selected by directory scan (no baked MLX_NODE_CUDA_INCLUDE_DIR): ${picked.includeDir}`,
+    }[picked.source],
+  );
+
+  const destinations = [join(__dirname, 'include'), join(__dirname, 'npm', 'linux-arm64-gnu', 'include')];
+  for (const destRoot of destinations) {
+    await mkdir(destRoot, { recursive: true });
+    for (const name of LINUX_CUDA_INCLUDE_DIRS) {
+      const src = join(picked.includeDir, name);
+      const dst = join(destRoot, name);
+      await rm(dst, { recursive: true, force: true });
+      await cp(src, dst, { recursive: true, dereference: true, force: true });
+    }
+    console.log(`Copied Linux CUDA NVRTC headers from ${picked.includeDir} -> ${destRoot}`);
+  }
+
+  for (const destRoot of destinations) {
+    for (const marker of LINUX_CUDA_HEADER_MARKERS) {
+      const markerPath = join(destRoot, marker);
+      let isFile = false;
+      try {
+        isFile = (await stat(markerPath)).isFile();
+      } catch (error: unknown) {
+        const code = (error as NodeJS.ErrnoException).code;
+        if (code !== 'ENOENT' && code !== 'ENOTDIR') throw error;
+      }
+      if (!isFile) {
+        throw new Error(
+          `[build.ts smoke check] expected Linux CUDA NVRTC header ${marker} at ${markerPath} but it is missing. ` +
+            'If this fires, the published @mlx-node/core-linux-arm64-gnu package will be missing NVRTC headers ' +
+            'and JIT kernels will fail at runtime.',
+        );
+      }
+    }
+    console.log(`Smoke check: ${destRoot} has all ${LINUX_CUDA_HEADER_MARKERS.length} required Linux CUDA headers.`);
   }
 }
 

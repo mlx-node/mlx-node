@@ -22,7 +22,7 @@ import {
   utimesSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { tmpdir, totalmem } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
@@ -33,9 +33,10 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
 import { quantilesOf } from '../src/api/quantiles.js';
+import { ROUTES } from '../src/api/routes.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
 import { openDashboardDb } from '../src/db/open.js';
-import { DownloadsClosedError } from '../src/download.js';
+import { DownloadConflictError, DownloadsClosedError } from '../src/download.js';
 import { ingestTraces, TRACE_RETENTION_DAYS } from '../src/ingest/traces.js';
 import { createRpcClient } from '../src/rpc/client.js';
 import { serveRuntimeOverPort } from '../src/rpc/host.js';
@@ -117,6 +118,9 @@ beforeEach(() => {
     tracesDir,
     modelsDir,
     cacheRoot,
+    moveToTrash: async () => {
+      throw new Error('an API test reached the Trash');
+    },
   });
   api = createTestClient(runtime);
 });
@@ -275,9 +279,14 @@ describe('dashboard api — models & catalog', () => {
   it('serves the catalog with install state', async () => {
     const res = await api.fetch('/api/catalog');
     expect(res.status).toBe(200);
-    const body = (await res.json()) as { items: Array<{ slug: string; installed: boolean; hfRepo: string }> };
+    const body = (await res.json()) as {
+      items: Array<{ builds: Array<{ slug: string; installed: boolean; hfRepo: string }> }>;
+    };
     expect(body.items.length).toBeGreaterThan(0);
-    for (const item of body.items) expect(typeof item.installed).toBe('boolean');
+    for (const item of body.items) {
+      expect(item.builds.length).toBeGreaterThan(0);
+      for (const build of item.builds) expect(typeof build.installed).toBe('boolean');
+    }
   });
 });
 
@@ -1759,16 +1768,19 @@ describe('dashboard api — production cache root (no explicit cacheRoot)', () =
 });
 
 describe('dashboard api — downloads', () => {
-  it('lists jobs and rejects a non-catalog repo', async () => {
+  it('lists jobs and rejects a folder the catalog does not install', async () => {
     const list = (await (await api.fetch('/api/downloads')).json()) as { jobs: unknown[] };
     expect(Array.isArray(list.jobs)).toBe(true);
 
     const bad = await api.fetch('/api/downloads', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ repo: 'someone/not-in-catalog' }),
+      body: JSON.stringify({ slug: 'someone-not-in-catalog' }),
     });
     expect(bad.status).toBe(400);
+    expect(((await bad.json()) as { error: string }).error).toBe(
+      '"someone-not-in-catalog" is not a folder of the model catalog',
+    );
   });
 
   // Finding E: the cancel route is wired end-to-end through the real runtime and
@@ -1791,6 +1803,10 @@ describe('dashboard api — downloads', () => {
     expect(((await res.json()) as { error: string }).error).toContain('not available over this transport');
   });
 });
+
+/** A catalog folder (Qwen3.8-27B UD-Q4_K_XL) and the repository it installs, for the route tests below. */
+const CATALOG_SLUG = 'qwen3.8-27b-gguf';
+const CATALOG_REPO = 'unsloth/Qwen3.8-27B-GGUF';
 
 /** Dispatch one request against a stub context, with no runtime or socket. */
 function call(ctx: ApiContext, method: string, pathname: string, body?: unknown): ReturnType<typeof dispatch> {
@@ -1836,11 +1852,33 @@ describe('dashboard api — cancel download route', () => {
 // a job that has not run yet. Asserted at the route layer with a stub manager so
 // no multi-GB transfer is triggered — a live-repo POST would really download.
 describe('dashboard api — download start is 202 Accepted', () => {
-  it('answers 202 (not 200) for an accepted download start', async () => {
-    const ctx = { downloads: { start: () => 'job-1' } } as unknown as ApiContext;
-    const res = await call(ctx, 'POST', '/api/downloads', { repo: 'org/repo' });
+  it('answers 202 (not 200) for an accepted download start, with the job kind', async () => {
+    const ctx = {
+      downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO, kind: 'install' }) },
+    } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
     expect(res.status).toBe(202);
-    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', repo: 'org/repo' });
+    expect(res.ok ? res.body : null).toEqual({ id: 'job-1', slug: CATALOG_SLUG, repo: CATALOG_REPO, kind: 'install' });
+  });
+
+  it('sends the reason of a conflict beside its text', async () => {
+    const text = 'A download of this model is already in the queue. Cancel it, then use Clean up & update.';
+    const ctx = {
+      downloads: {
+        start: () => {
+          throw new DownloadConflictError(text);
+        },
+      },
+    } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
+    expect(res).toEqual({ ok: false, code: 'E_CONFLICT', message: text, status: 409 });
+  });
+
+  it('answers 400 for a body that names a repo and no folder', async () => {
+    const ctx = { downloads: { start: () => ({ id: 'job-1', repo: CATALOG_REPO }) } } as unknown as ApiContext;
+    const res = await call(ctx, 'POST', '/api/downloads', { repo: CATALOG_REPO });
+    expect(res.status).toBe(400);
+    expect(res.ok ? '' : res.message).toBe('Body must include a "slug" string');
   });
 });
 
@@ -1885,9 +1923,9 @@ describe('dashboard api — method-not-allowed vs not-found', () => {
 // manager. That refusal is a server-lifecycle condition, not a malformed request,
 // so it must not be reported as a 400 blaming the caller.
 describe('dashboard api — start download route', () => {
-  function postDownload(start: () => string): ReturnType<typeof dispatch> {
+  function postDownload(start: () => { id: string; repo: string }): ReturnType<typeof dispatch> {
     const ctx = { downloads: { start } } as unknown as ApiContext;
-    return call(ctx, 'POST', '/api/downloads', { repo: 'org/model' });
+    return call(ctx, 'POST', '/api/downloads', { slug: CATALOG_SLUG });
   }
 
   it('answers 503 once the download manager is shutting down', async () => {
@@ -1900,12 +1938,125 @@ describe('dashboard api — start download route', () => {
     expect(res.ok ? '' : res.message).toContain('shutting down');
   });
 
-  it('still answers 400 for a repo the catalog does not carry', async () => {
+  it('still answers 400 for a folder the catalog does not install', async () => {
     const res = await postDownload(() => {
-      throw new Error('Repo "org/model" is not in the model catalog');
+      throw new Error('"org-model" is not a folder of the model catalog');
     });
     expect(res.status).toBe(400);
     expect(res.ok ? '' : res.code).toBe('E_BAD_REQUEST');
+  });
+});
+
+describe('dashboard api — Update plan route', () => {
+  function postPlan(planAdoption: (slug: string) => Promise<unknown>, body: unknown = { slug: CATALOG_SLUG }) {
+    const ctx = { downloads: { planAdoption } } as unknown as ApiContext;
+    return call(ctx, 'POST', '/api/downloads/adopt-plan', body);
+  }
+
+  it('adopt-plan is a main route and maps a conflict to 409', async () => {
+    const route = ROUTES.find((r) => r.method === 'POST' && r.segments.join('/') === 'api/downloads/adopt-plan');
+    expect(route?.thread).toBe('main');
+
+    const seen: string[] = [];
+    const ok = await postPlan(async (slug) => {
+      seen.push(slug);
+      return { slug, token: 'a'.repeat(64) };
+    });
+    expect(seen).toEqual([CATALOG_SLUG]);
+    expect(ok.status).toBe(200);
+    expect(ok.ok ? ok.body : null).toEqual({ slug: CATALOG_SLUG, token: 'a'.repeat(64) });
+
+    const text = '"model" holds links or special files. Update cannot check it.';
+    const conflict = await postPlan(() => Promise.reject(new DownloadConflictError(text)));
+    expect(conflict.status).toBe(409);
+    expect(conflict.ok ? '' : conflict.message).toBe(text);
+    expect('reason' in conflict).toBe(false);
+
+    const cleanup = await postPlan(() => Promise.reject(new DownloadConflictError(text, 'needs-cleanup')));
+    expect(cleanup).toEqual({ ok: false, code: 'E_CONFLICT', message: text, status: 409, reason: 'needs-cleanup' });
+  });
+
+  it('answers 503 while shutting down, and 400 for a bad body or a failed check', async () => {
+    expect((await postPlan(() => Promise.reject(new DownloadsClosedError()))).status).toBe(503);
+    const offline = await postPlan(() => Promise.reject(new Error('Could not check the folder: fetch failed')));
+    expect(offline.status).toBe(400);
+    expect(offline.ok ? '' : offline.message).toBe('Could not check the folder: fetch failed');
+    let called = false;
+    const bad = await postPlan(async () => {
+      called = true;
+      return {};
+    }, {});
+    expect(bad.status).toBe(400);
+    expect(called).toBe(false);
+  });
+});
+
+describe('dashboard api — Update start', () => {
+  function postStart(body: unknown): { res: ReturnType<typeof dispatch>; calls: unknown[][] } {
+    const calls: unknown[][] = [];
+    const ctx = {
+      downloads: {
+        start: (...args: unknown[]) => {
+          calls.push(args);
+          return { id: 'job-1', repo: CATALOG_REPO };
+        },
+      },
+    } as unknown as ApiContext;
+    return { res: call(ctx, 'POST', '/api/downloads', body), calls };
+  }
+
+  it('passes the token of the plan to the manager', async () => {
+    const { res, calls } = postStart({ slug: CATALOG_SLUG, adopt: '0123456789abcdef'.repeat(4) });
+    expect((await res).status).toBe(202);
+    expect(calls).toEqual([[CATALOG_SLUG, { adopt: '0123456789abcdef'.repeat(4) }]]);
+  });
+
+  it('rejects adopt with replaceBlocker', async () => {
+    const { res, calls } = postStart({
+      slug: CATALOG_SLUG,
+      adopt: 'a'.repeat(64),
+      replaceBlocker: { kind: 'directory', fileCount: 1, sizeBytes: 1, truncated: false, linkTarget: null },
+    });
+    const answer = await res;
+    expect(answer.status).toBe(400);
+    expect(answer.ok ? '' : answer.message).toBe('"replaceBlocker", "adopt" and "locate" cannot come together');
+    expect(calls).toEqual([]);
+  });
+
+  it.each<[string, unknown]>([
+    ['63 chars', 'a'.repeat(63)],
+    ['65 chars', 'a'.repeat(65)],
+    ['upper case', 'A'.repeat(64)],
+    ['a char past f', `g${'a'.repeat(63)}`],
+    ['a number', 42],
+    ['null', null],
+  ])('rejects a token that is not 64 hex chars: %s', async (_name, adopt) => {
+    const { res, calls } = postStart({ slug: CATALOG_SLUG, adopt });
+    const answer = await res;
+    expect(answer.status).toBe(400);
+    expect(answer.ok ? '' : answer.message).toBe('"adopt" must be the 64-character token of an Update plan');
+    expect(calls).toEqual([]);
+  });
+});
+
+describe('dashboard api — host', () => {
+  it('answers on the transport thread with the memory, free space of the models disk, and platform', async () => {
+    const route = ROUTES.find((r) => r.method === 'GET' && r.segments.join('/') === 'api/host');
+    expect(route?.thread).toBe('main');
+    const body = await get<{ totalMemBytes: number; diskFreeBytes: number | null; platform: string }>('/api/host');
+    expect(body.totalMemBytes).toBe(totalmem());
+    expect(body.diskFreeBytes).toBeGreaterThan(0);
+    expect(body.platform).toBe(process.platform);
+  });
+
+  it('answers null free space for a models folder that is not there', async () => {
+    const ctx = { modelsDir: join(base, 'missing') } as unknown as ApiContext;
+    const res = await call(ctx, 'GET', '/api/host');
+    expect(res.ok ? res.body : null).toEqual({
+      totalMemBytes: totalmem(),
+      diskFreeBytes: null,
+      platform: process.platform,
+    });
   });
 });
 

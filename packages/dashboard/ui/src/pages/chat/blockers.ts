@@ -4,8 +4,19 @@
  * message is used only for a code this table does not know.
  */
 
+import {
+  CHAT_PICTURES_MAX_BASE64,
+  estimateTokens,
+  MESSAGE_FILES_MAX_BYTES,
+  storedPictureChars,
+  type UserAttachment,
+  utf8Bytes,
+  WINDOW_SHARE,
+} from '../../../../src/chat/attachment-rule.js';
+import { type DraftAttachment, draftInput } from '../../lib/chat-attachments';
 import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatFailure, ChatFailureCode, ChatHostState, ChatMode } from '../../lib/chat-types';
+import type { TranscriptEntry } from '../../lib/types';
 
 export type BlockActionKind =
   | 'install'
@@ -69,13 +80,13 @@ function modeTitle(mode: ChatMode): string {
   return mode === 'work' ? CHAT.modeWork : CHAT.modeChat;
 }
 
-function blockedBy(failure: ChatFailure | null, mode: ChatMode): Blocker {
+function blockedBy(failure: ChatFailure | null, mode: ChatMode, canInstall = true): Blocker {
   const b = CHAT.blockers;
   switch (failure?.code) {
     case 'inference-failed':
       return rowBlocker(b['inference-failed'], 'danger', 'unplug', 'open-engine');
     case 'agent-incompatible':
-      return rowBlocker(b['agent-incompatible'], 'danger', 'alert', 'install', {
+      return rowBlocker(b['agent-incompatible'], 'danger', 'alert', canInstall ? 'install' : null, {
         label: b.copyDetails,
         kind: 'copy-details',
       });
@@ -93,6 +104,7 @@ export function modeBlocker(connected: boolean, host: ChatHostState | null, mode
   const b = CHAT.blockers;
   if (!connected) return { reason: b.reconnecting };
   if (host === null) return { reason: CHAT.startingTip };
+  const canInstall = host.agent.canInstall !== false;
   if (host.agent.binary === 'missing') {
     if (host.agent.install === 'running') {
       const text = b['agent-installing'];
@@ -102,12 +114,17 @@ export function modeBlocker(connected: boolean, host: ChatHostState | null, mode
         panel: { title: b['agent-missing'][0], description: text, icon: 'loader' },
       };
     }
+    if (!canInstall) return rowBlocker(b['agent-install-unavailable'], 'neutral', 'alert', null);
     if (host.agent.install === 'failed') return rowBlocker(b['agent-install-failed'], 'danger', 'alert', 'install');
     return rowBlocker(b['agent-missing'], 'neutral', 'download', 'install');
   }
-  if (host.agent.binary === 'too-old') return rowBlocker(b['agent-too-old'], 'neutral', 'download', 'install');
+  if (host.agent.binary === 'too-old') {
+    return canInstall
+      ? rowBlocker(b['agent-too-old'], 'neutral', 'download', 'install')
+      : rowBlocker(b['agent-too-old-unavailable'], 'neutral', 'alert', null);
+  }
   const state = host.modes[mode];
-  if (state.state === 'blocked') return blockedBy(state.failure, mode);
+  if (state.state === 'blocked') return blockedBy(state.failure, mode, canInstall);
   if (state.state === 'failed') return rowBlocker(b['agent-failed'], 'danger', 'alert', 'restart');
   if (host.inference === 'stopped') return rowBlocker(b['inference-stopped'], 'neutral', 'power', 'open-engine');
   if (host.models.length === 0) return rowBlocker(b['no-models'], 'neutral', 'boxes', 'open-models');
@@ -164,6 +181,7 @@ export function sendFailure(
   message?: string,
   /** The conversation's model, for the sentence of a load that failed. */
   model?: string,
+  canInstall = true,
 ): { strip: StripNotice } | { toast: string } {
   const e = CHAT.sendErrors;
   const strip = (
@@ -177,7 +195,10 @@ export function sendFailure(
     case 'agent-slow':
       return strip(e['agent-slow'], 'retry');
     case 'profile-mismatch':
-      return strip(mode === 'work' ? e['profile-mismatch-work'] : e['profile-mismatch-chat'], 'install');
+      return strip(
+        mode === 'work' ? e['profile-mismatch-work'] : e['profile-mismatch-chat'],
+        canInstall ? 'install' : null,
+      );
     case 'model-unavailable':
       return strip(e['model-unavailable'], 'pick-model');
     case 'model-load-failed':
@@ -195,6 +216,10 @@ export function sendFailure(
       return strip(e['slash-text'], null);
     case 'keychain-unavailable':
       return strip(e['keychain-unavailable'], 'open-providers', 'warning');
+    case 'attachment-refused':
+      return strip(e['attachment-refused'], null);
+    case 'pictures-full':
+      return strip(e['pictures-full'], null);
     default:
       break;
   }
@@ -202,4 +227,49 @@ export function sendFailure(
   const known = reason === undefined ? undefined : BLOCKER_SENTENCES[reason as ChatFailureCode];
   if (known !== undefined) return { strip: { tone: 'danger', text: known } };
   return strip(e.other, 'retry');
+}
+
+export interface AttachFacts {
+  mode: ChatMode;
+  /** Chat and the model row has images = true. */
+  seesImages: boolean;
+  text: string;
+  files: readonly DraftAttachment[];
+  /** The model's context window in tokens; null while no agent listed the model. */
+  windowTokens: number | null;
+  /** Files of this place still being read. */
+  reading: number;
+  /** Stored base64 of the pictures the conversation already holds ({@link heldPictureChars}). */
+  heldPictures: number;
+}
+
+export function heldPictureChars(entries: readonly TranscriptEntry[]): number {
+  const items: UserAttachment[] = [];
+  for (const entry of entries)
+    if (entry.kind === 'user' && entry.attachments !== undefined) items.push(...entry.attachments);
+  return storedPictureChars(items);
+}
+
+/**
+ * Why a message with these files cannot go, first match wins; null when it can. The composer shows it beside Send,
+ * and `send()` checks it again, so Retry and Send again cannot pass it.
+ */
+export function attachProblem(facts: AttachFacts): string | null {
+  const a = CHAT.attach;
+  if (facts.reading > 0) return a.reading;
+  if (facts.files.length === 0) return null;
+  const pictures = facts.files.some((file) => file.kind === 'image');
+  if (pictures && facts.mode === 'work') return a.blockedWork;
+  if (pictures && !facts.seesImages) return a.blockedModel;
+  if (pictures && facts.heldPictures + storedPictureChars(facts.files) > CHAT_PICTURES_MAX_BASE64) {
+    return CHAT.sendErrors['pictures-full'][0];
+  }
+  let bytes = utf8Bytes(facts.text);
+  for (const file of facts.files) if (file.kind === 'file') bytes += file.numbered;
+  if (bytes > MESSAGE_FILES_MAX_BYTES) return a.blockedLong;
+  const window = facts.windowTokens;
+  if (window !== null && estimateTokens(facts.text, facts.files.map(draftInput)) > window * WINDOW_SHARE) {
+    return a.blockedWindow;
+  }
+  return null;
 }

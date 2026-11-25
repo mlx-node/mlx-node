@@ -9,10 +9,11 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import { Transcript, type TranscriptProps } from '../ui/src/components/transcript.js';
-import { formatClock } from '../ui/src/lib/format.js';
+import { CHAT } from '../ui/src/lib/chat-strings.js';
+import { formatBytes, formatClock } from '../ui/src/lib/format.js';
 import { LIVE_FRESH_MS, useFreshness } from '../ui/src/lib/sessions.js';
 import type { TranscriptEntry, TurnMetric } from '../ui/src/lib/types.js';
-import { waitFor } from './render.js';
+import { allByRole, byRole, waitFor } from './render.js';
 
 let mounted: { root: Root; container: HTMLElement } | undefined;
 
@@ -356,6 +357,55 @@ function Probe({ data }: { data: object | undefined }): ReactElement {
   const { fresh, arrivedAt } = useFreshness(data, LIVE_FRESH_MS);
   return createElement('output', null, `${String(fresh)} ${String(arrivedAt)}`);
 }
+
+describe('Transcript: files on a message', () => {
+  it('a message sent with files shows read-only chips; one with only a picture is not an empty row', () => {
+    const { entries, turns } = closedTurns(2);
+    entries[0] = {
+      kind: 'user',
+      ts: T0 + 60_000,
+      text: 'Prompt number 1',
+      promptIndex: 1,
+      attachments: [{ kind: 'file', name: 'plan.md', bytes: 2048 }],
+    };
+    entries[4] = {
+      kind: 'user',
+      ts: T0 + 120_000,
+      text: '',
+      promptIndex: 2,
+      attachments: [{ kind: 'image', mediaType: 'image/png', bytes: 4096 }],
+    };
+    const container = mount(transcript({ entries, turns }));
+    const lists = allByRole(container, 'list', CHAT.attach.list);
+    expect(lists.map((list) => allByRole(list, 'listitem').map((item) => item.textContent))).toEqual([
+      [`plan.md${formatBytes(2048)}`],
+      [`${CHAT.attach.image}PNG · ${formatBytes(4096)}`],
+    ]);
+    expect(container.textContent).toContain('Prompt number 1');
+    for (const list of lists) expect(list.querySelector('button, img')).toBeNull();
+  });
+
+  it('a message without files draws no chips', () => {
+    const container = mount(transcript(closedTurns(1)));
+    expect(byRole(container, 'list', CHAT.attach.list)).toBeNull();
+  });
+
+  it('find matches the name of an attached file', async () => {
+    const { entries, turns } = closedTurns(6);
+    entries[4] = {
+      kind: 'user',
+      ts: T0 + 120_000,
+      text: 'Prompt number 2',
+      promptIndex: 2,
+      attachments: [{ kind: 'file', name: 'budget-notes.md', bytes: 10 }],
+    };
+    const container = mount(transcript({ entries, turns }));
+    const input = container.querySelector<HTMLInputElement>('input[type="search"]')!;
+    typeInto(input, 'BUDGET-NOTES');
+    await waitFor(() => (container.textContent ?? '').includes('1 of 6 turns match'));
+    expect(container.textContent).toContain('Answer body 2');
+  });
+});
 
 describe('useFreshness', () => {
   it('is fresh for LIVE_FRESH_MS after each new body, then stale until the next one', () => {

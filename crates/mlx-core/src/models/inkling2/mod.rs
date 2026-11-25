@@ -21,6 +21,7 @@ pub mod config;
 pub(crate) mod cuda_forward;
 pub(crate) mod cuda_kv;
 pub(crate) mod cuda_spec;
+pub(crate) mod dflash2;
 pub mod dspark;
 pub(crate) mod dspark_decode;
 pub mod kernels;

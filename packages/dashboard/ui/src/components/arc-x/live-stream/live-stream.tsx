@@ -163,8 +163,8 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
   const y = linearScale([axis.min, axis.max], [height, 0]);
   const x = (t: number): number => plotWidth * (1 - (now - t) / windowMs);
   const drawn = plotPoints(points, now, windowMs, gapMs, x, y);
-  const path = linePath(drawn);
-  const area = areaPath(drawn, height);
+  const path = linePath(drawn, 'monotone');
+  const area = areaPath(drawn, height, 'monotone');
   let end: XY | null = null;
   for (let i = drawn.length - 1; i >= 0 && end === null; i -= 1) end = drawn[i] ?? null;
   const enough = inWindow.length >= 2;

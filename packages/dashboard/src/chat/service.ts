@@ -35,6 +35,12 @@ import { safeReader } from './agent/endpoint.js';
 import { ALLOW_ONCE_OPTION_ID, chatPrompt, REJECT_ONCE_OPTION_ID } from './agent/profiles.js';
 import { tempRoots, type AllowedRoot } from './agent/roots.js';
 import { UNLOAD_MAX_MS, unloadModels } from './agent/select-model.js';
+import {
+  attachmentView,
+  type AttachmentInput,
+  CHAT_PICTURES_MAX_BASE64,
+  storedPictureChars,
+} from './attachment-rule.js';
 import { Conversation, type ConversationSink, type HostView } from './conversation.js';
 import { PermissionDraft } from './draft-mode.js';
 import { readWorkIndexSync, writeWorkIndex, type WorkIndex } from './index-file.js';
@@ -107,6 +113,15 @@ function typedTop(root: AllowedRoot | undefined): string | null {
 
 function modeChanged(): ApiError {
   return new ApiError('E_CONFLICT', 'The permission mode could not be changed.', 'mode-changed');
+}
+
+/** A message with pictures is refused once the chat's stored pictures and its own pass {@link CHAT_PICTURES_MAX_BASE64}. */
+function checkPictureRoom(conversation: Conversation, attachments: readonly AttachmentInput[]): void {
+  const added = attachments.map(attachmentView);
+  if (!added.some((item) => item.kind === 'image')) return;
+  if (storedPictureChars([...conversation.userAttachments(), ...added]) > CHAT_PICTURES_MAX_BASE64) {
+    throw chatRouteError('pictures-full');
+  }
 }
 
 function isDecisionModel(model: InferenceEndpoint['models'][number]): boolean {
@@ -382,6 +397,7 @@ export class ChatService {
     if (endpoint === null) throw chatRouteError('inference-stopped');
     const modelId = input.modelId ?? (await this.state()).defaultModelId ?? undefined;
     if (modelId === undefined) throw chatRouteError('no-models');
+    await this.checkImages(mode, modelId, input.attachments);
     const host = this.hosts[mode];
     const created = host.createSession(cwd === undefined ? { modelId } : { modelId, cwd });
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -430,7 +446,7 @@ export class ChatService {
     if (grant !== null) await this.applyDraft(conversation, grant);
     let turnId: string;
     try {
-      turnId = this.startTurn(conversation, input.text).turnId;
+      turnId = this.startTurn(conversation, input.text, undefined, input.attachments).turnId;
     } catch (error) {
       if (this.modeOf(session.sessionId) !== 'ask') this.lower(conversation, 'ask', 'user');
       throw error;
@@ -517,10 +533,11 @@ export class ChatService {
     return { userHooks: await findUserHooks(place).catch(() => true) };
   }
 
-  async prompt(id: string, text: string): Promise<{ turnId: string }> {
+  async prompt(id: string, text: string, attachments: readonly AttachmentInput[] = []): Promise<{ turnId: string }> {
     this.assertOpen();
     const conversation = await this.known(id);
     const mode = conversation.info.mode;
+    await this.checkImages(mode, conversation.info.modelId, attachments);
     let cwd: string | undefined;
     if (mode === 'work') {
       const problem = await this.folderState(conversation);
@@ -532,9 +549,26 @@ export class ChatService {
     const host = this.hosts[mode];
     if (host.isBusy(id)) throw chatRouteError('conversation-busy');
     if (!conversation.hasBase()) await this.loadBase(conversation);
+    checkPictureRoom(conversation, attachments);
     if (host.isBusy(id)) throw chatRouteError('conversation-busy');
     await this.endpoint();
-    return { turnId: this.startTurn(conversation, text, cwd).turnId };
+    return { turnId: this.startTurn(conversation, text, cwd, attachments).turnId };
+  }
+
+  /**
+   * A picture goes only to a Chat conversation whose model row takes pictures (`images`, as the host state lists it).
+   * The page blocks it first; this settles a model change that landed before this check. A change still in flight is
+   * caught by the engine's 400 and the agent's retry without the pictures.
+   */
+  private async checkImages(
+    mode: ChatMode,
+    modelId: string,
+    attachments: readonly AttachmentInput[] = [],
+  ): Promise<void> {
+    if (!attachments.some((a) => a.kind === 'image')) return;
+    if (mode === 'work') throw chatRouteError('attachment-refused');
+    const row = (await this.state()).models.find((m) => m.id === modelId);
+    if (row?.images !== true) throw chatRouteError('attachment-refused');
   }
 
   async cancel(id: string): Promise<{ cancelled: boolean }> {
@@ -1293,7 +1327,12 @@ export class ChatService {
     conversation.seed(detail.transcript, detail.turns, detail.transcriptError ?? null, detail.contextUsed ?? null);
   }
 
-  private startTurn(conversation: Conversation, text: string, cwd?: string): { turnId: string } {
+  private startTurn(
+    conversation: Conversation,
+    text: string,
+    cwd?: string,
+    attachments: readonly AttachmentInput[] = [],
+  ): { turnId: string } {
     const id = conversation.info.id;
     const host = this.hosts[conversation.info.mode];
     if (host.isBusy(id) || this.deleting.has(id)) throw chatRouteError('conversation-busy');
@@ -1302,16 +1341,21 @@ export class ChatService {
     const entries = conversation.diskEntries();
     let started;
     try {
-      started = host.startTurn(id, text, {
-        modelId: conversation.info.modelId,
-        ...(cwd === undefined ? {} : { cwd }),
-        ...(entries === undefined ? {} : { entries }),
-      });
+      started = host.startTurn(
+        id,
+        text,
+        {
+          modelId: conversation.info.modelId,
+          ...(cwd === undefined ? {} : { cwd }),
+          ...(entries === undefined ? {} : { entries }),
+        },
+        attachments,
+      );
     } catch (error) {
       if (error instanceof AgentHostError) throw chatRouteError(error.code);
       throw error;
     }
-    conversation.userPrompt(text);
+    conversation.userPrompt(text, attachments.map(attachmentView));
     void started.done.catch(() => {});
     this.updateLive();
     this.busyChanged();
@@ -1520,14 +1564,6 @@ export class ChatService {
       this.sizesPid = endpoint.pid;
     }
     const sizes = await Promise.all(served.map((m) => this.diskSize(m.path)));
-    const models = served.map((m, index) => ({
-      id: m.name,
-      base: m.base,
-      variant: m.variant,
-      format: m.format,
-      contextTokens: this.windows.get(m.name) ?? null,
-      sizeBytes: sizes[index]!,
-    }));
     const inMemory = new Map<string, RuntimeLiveModel>();
     const unloaded = this.unloaded;
     for (const process of running) {
@@ -1536,6 +1572,15 @@ export class ChatService {
       for (const model of process.models)
         if (!stale || !unloaded.names.has(model.name)) inMemory.set(model.name, model);
     }
+    const models = served.map((m, index) => ({
+      id: m.name,
+      base: m.base,
+      variant: m.variant,
+      format: m.format,
+      contextTokens: this.windows.get(m.name) ?? null,
+      sizeBytes: sizes[index]!,
+      images: inMemory.get(m.name)?.images ?? m.images ?? false,
+    }));
     const resident: ChatHostState['resident'] = [];
     const answers: ChatHostState['answers'] = [];
     for (const [index, m] of served.entries()) {
@@ -1626,6 +1671,7 @@ export class ChatService {
       minTag: MLX_AGENT_MIN_RELEASE,
       versionVerified: 'failure' in launch ? false : launch.versionVerified,
       install: this.install,
+      canInstall: this.opts.installAgent !== undefined,
     };
   }
 }

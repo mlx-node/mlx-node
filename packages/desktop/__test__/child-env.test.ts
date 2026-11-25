@@ -13,7 +13,12 @@ import { extname } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { controlPanelEnvOverrides, sidecarEnvOverrides } from '../src/main/child-env.js';
+import {
+  buildControlPanelEnv,
+  controlPanelEnvOverrides,
+  sidecarEnvOverrides,
+  WINDOWS_STORE_ENV,
+} from '../src/main/child-env.js';
 import { resolveAppPaths } from '../src/main/paths.js';
 
 const ADDON = '/Applications/mlx-node.app/Contents/Resources/native/mlx-core.darwin-arm64.node';
@@ -82,6 +87,66 @@ describe('controlPanelEnvOverrides', () => {
       sidecarEnvOverrides({ nativeAddon: ADDON, modelsDir }).MLX_MODELS_DIR,
     );
     expect(controlPanelEnvOverrides({ modelsDir: null })).toEqual({});
+  });
+
+  it('propagates the Microsoft Store flag only when enabled', () => {
+    expect(controlPanelEnvOverrides({ modelsDir: null, windowsStore: true })).toEqual({
+      [WINDOWS_STORE_ENV]: '1',
+    });
+    expect(controlPanelEnvOverrides({ modelsDir: null, windowsStore: false })).toEqual({});
+    expect(controlPanelEnvOverrides({ modelsDir: '/models' })).not.toHaveProperty(WINDOWS_STORE_ENV);
+  });
+});
+
+describe('buildControlPanelEnv', () => {
+  it('strips inherited NAPI_RS_NATIVE_LIBRARY_PATH and MLX_CORE_NATIVE_LIBRARY_PATH case-insensitively', () => {
+    const env = buildControlPanelEnv({
+      baseEnv: {
+        PATH: '/usr/bin',
+        HOME: '/Users/dev',
+        NAPI_RS_NATIVE_LIBRARY_PATH: '/stale/mlx-core.darwin-arm64.node',
+        napi_rs_native_library_path: '/stale/lower.node',
+        MLX_CORE_NATIVE_LIBRARY_PATH: '/stale/core.node',
+        Mlx_Core_Native_Library_Path: '/stale/mixed.node',
+        EMPTY_UNDEFINED: undefined,
+      },
+      modelsDir: '/Volumes/ssd/models',
+      ledgerDir: '/Users/dev/.mlx-node/ledger',
+      windowsStore: true,
+      extraCaBundlePath: '/tmp/extra-ca.pem',
+      desktopCli: '{"executable":"/app/mlx-node"}',
+    });
+
+    expect(env.PATH).toBe('/usr/bin');
+    expect(env.HOME).toBe('/Users/dev');
+    expect(env.MLX_MODELS_DIR).toBe('/Volumes/ssd/models');
+    expect(env.MLX_PANEL_LEDGER_DIR).toBe('/Users/dev/.mlx-node/ledger');
+    expect(env[WINDOWS_STORE_ENV]).toBe('1');
+    expect(env.NODE_EXTRA_CA_CERTS).toBe('/tmp/extra-ca.pem');
+    expect(env.MLX_DESKTOP_CLI).toBe('{"executable":"/app/mlx-node"}');
+    expect(env).not.toHaveProperty('EMPTY_UNDEFINED');
+    for (const key of Object.keys(env)) {
+      expect(key.toUpperCase()).not.toBe('NAPI_RS_NATIVE_LIBRARY_PATH');
+      expect(key.toUpperCase()).not.toBe('MLX_CORE_NATIVE_LIBRARY_PATH');
+    }
+  });
+
+  it('preserves inherited NODE_EXTRA_CA_CERTS when extraCaBundlePath is null and replaces it when non-null', () => {
+    const preserved = buildControlPanelEnv({
+      baseEnv: { NODE_EXTRA_CA_CERTS: '/etc/ssl/corp.pem' },
+      modelsDir: null,
+      extraCaBundlePath: null,
+    });
+    expect(preserved.NODE_EXTRA_CA_CERTS).toBe('/etc/ssl/corp.pem');
+    expect(preserved).not.toHaveProperty('MLX_DESKTOP_CLI');
+
+    const replaced = buildControlPanelEnv({
+      baseEnv: { node_extra_ca_certs: '/etc/ssl/corp.pem' },
+      modelsDir: null,
+      extraCaBundlePath: '/tmp/merged-ca.pem',
+    });
+    expect(replaced.NODE_EXTRA_CA_CERTS).toBe('/tmp/merged-ca.pem');
+    expect(replaced).not.toHaveProperty('node_extra_ca_certs');
   });
 });
 

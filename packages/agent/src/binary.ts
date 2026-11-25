@@ -16,7 +16,7 @@ export const MLX_AGENT_TAG_ENV = 'MLX_AGENT_TAG';
  * Minimum release accepted: a cached binary stamped below this is treated as stale and re-downloaded, and it is the
  * last-resort tag when the `latest` pointer is unreachable.
  */
-export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.3';
+export const MLX_AGENT_MIN_RELEASE = 'mlx-agent-v0.3.4';
 
 const TAG_PREFIX = 'mlx-agent-v';
 

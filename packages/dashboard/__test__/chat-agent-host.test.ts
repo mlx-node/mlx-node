@@ -10,6 +10,7 @@ import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { AgentHostError, launchFromProbe } from '../src/chat/agent/agent-host.js';
 import { CHAT_CONFIG_TOML, CHAT_REQUIREMENTS_TOML, promptParams } from '../src/chat/agent/profiles.js';
+import type { AttachmentInput } from '../src/chat/attachment-rule.js';
 import { REDACTED } from '../src/chat/redact.js';
 import { CONTINUE_PROMPT } from '../src/chat/types.js';
 import {
@@ -24,6 +25,8 @@ import {
 import { gate } from './helpers/fake-engine.js';
 
 const MODEL = 'qwen3.5-4b';
+const FILE: AttachmentInput = { kind: 'file', name: 'notes.md', text: '# notes\n' };
+const PICTURE: AttachmentInput = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' };
 
 async function withFake(
   name: string,
@@ -82,11 +85,11 @@ describe('launchFromProbe', () => {
     ).toEqual({
       failure: 'agent-too-old',
     });
-    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.3' })).toEqual({
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.4' })).toEqual({
       command: '/m',
       args: ['--disable-web-search', 'agent', '--no-leader', 'stdio'],
       source: 'managed',
-      tag: 'mlx-agent-v0.3.3',
+      tag: 'mlx-agent-v0.3.4',
       versionVerified: true,
     });
     expect(launchFromProbe({ source: 'env', path: '/e' })).toMatchObject({
@@ -331,6 +334,35 @@ describe('Chat host', () => {
     });
   });
 
+  it('the attachments go out in the prompt, after its text block', async () => {
+    await withFake('chat-basic', async (fake) => {
+      const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+      const started = fake.host.startTurn(sessionId, 'look at these', { modelId: MODEL }, [FILE, PICTURE]);
+      expect((await started.done).outcome).toBe('completed');
+      const prompts = fake.sent().filter((m) => m.method === 'session/prompt');
+      expect(prompts.map((m) => m.params)).toEqual([promptParams(sessionId, 'look at these', [FILE, PICTURE])]);
+    });
+  });
+
+  it('an agent that does not take embedded resources: a file turn ends agent-incompatible unsent, a text turn runs', async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+        const result = await fake.host.startTurn(sessionId, 'read this', { modelId: MODEL }, [FILE]).done;
+        expect(result).toEqual({
+          turnId: expect.any(String),
+          failure: { code: 'agent-incompatible', message: 'This agent build does not match this app.' },
+          unsent: true,
+        });
+        expect(fake.sent().filter((m) => m.method === 'session/prompt')).toEqual([]);
+        expect((await fake.host.startTurn(sessionId, 'hello', { modelId: MODEL }).done).outcome).toBe('completed');
+        expect(fake.sent().filter((m) => m.method === 'session/prompt')).toHaveLength(1);
+      },
+      { mutate: (s) => (s.initialize = { ...(s.initialize as Json | undefined), embeddedContext: false }) },
+    );
+  });
+
   it('max-tokens ends as output-limit; an error text never reaches the result', async () => {
     await withFake('max-tokens', async (fake) => {
       expect((await turn(fake, 'long')).result.outcome).toBe('output-limit');
@@ -567,7 +599,8 @@ describe('Chat host: the model select call before the prompt', () => {
         expect((await answer).status).toBe(200);
       },
       {
-        timings: { modelWaitShowMs: 20 },
+        // The held answer stays held until the end, so a select that waited for it would pass this mark.
+        timings: { modelWaitShowMs: 2_000 },
         mutate: (scenario) => {
           (scenario.prompts as Json[])[0]!.steps = [{ sleepMs: 60_000 }, { end: { stopReason: 'end_turn' } }];
         },
@@ -930,6 +963,24 @@ describe('Work host: the length stop', () => {
         expect(states.slice(from, -1).every((t) => t?.phase === 'running')).toBe(true);
         expect(states.at(-1)).toBeNull();
         expect(states.at(-2)).toMatchObject({ phase: 'running', continues: 1 });
+      },
+      { ...work, mutate: (s) => setLength(s, { endAfterMs: 200 }) },
+    );
+  });
+
+  // Mutation: send the attachments again on the continue prompt → red.
+  it('the attachments go out with the first prompt only; the continue is one text block', async () => {
+    await withFake(
+      'work-length',
+      async (fake) => {
+        const created = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+        const id = created.sessionId;
+        const started = fake.host.startTurn(id, 'fix it', { modelId: MODEL, cwd: fake.project }, [FILE]);
+        expect(await started.done).toMatchObject({ outcome: 'completed', continues: 1 });
+        expect(prompts(fake).map((m) => m.params)).toEqual([
+          promptParams(id, 'fix it', [FILE]),
+          { sessionId: id, prompt: [{ type: 'text', text: CONTINUE_PROMPT }] },
+        ]);
       },
       { ...work, mutate: (s) => setLength(s, { endAfterMs: 200 }) },
     );

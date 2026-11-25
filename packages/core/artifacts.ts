@@ -36,10 +36,11 @@ for (const entry of await readdir(npmDir, { withFileTypes: true })) {
   try {
     await readFile(join(npmDir, entry.name, 'package.json'), 'utf-8');
   } catch {
-    // A from-source Linux build creates `npm/linux-arm64-gnu/` to land its
-    // addon in (see copyNativeAddon in build.ts) without ever writing a
-    // manifest there. Only a directory with a package.json is a publishable
-    // platform package.
+    // A from-source build on a desktop-only target (e.g. `win32-arm64-msvc`)
+    // creates `npm/<triple>/` to land its addon in (see copyNativeAddon in
+    // build.ts) without ever writing a manifest there. Only a directory with
+    // a package.json (such as `darwin-arm64` or `linux-arm64-gnu`) is a
+    // publishable platform package.
     continue;
   }
   platformPackageDirs.push(entry.name);

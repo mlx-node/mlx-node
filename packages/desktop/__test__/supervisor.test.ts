@@ -182,6 +182,20 @@ describe('start-up', () => {
 
     const snapshot = await waitFor(supervisor, (s) => s.state === 'failed', 'give-up');
     expect(snapshot.lastExit?.stderrTail.join('\n')).toContain('fixture: dying on purpose');
+    // No start-failure line, no reason.
+    expect(snapshot.lastExit?.startFailure).toBeNull();
+  });
+
+  // A permanent start failure (exit 78) stops at once, and its line is the reason the page shows.
+  it('carries the start-failure line as the reason of the exit', async () => {
+    const reason = 'The models folder /h/models is a link to /Volumes/Disk/models, which is not available.';
+    const { supervisor } = makeSupervisor({ mode: 'start-failed', env: { MLX_TEST_START_FAILURE: reason } });
+    await expect(supervisor.start()).rejects.toThrow(/gave up/);
+
+    const snapshot = supervisor.snapshot();
+    expect(snapshot).toMatchObject({ state: 'failed', generation: 1 });
+    expect(snapshot.lastExit?.code).toBe(78);
+    expect(snapshot.lastExit?.startFailure).toBe(reason);
   });
 });
 

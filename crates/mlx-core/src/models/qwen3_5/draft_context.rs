@@ -68,7 +68,6 @@ impl DraftContextWindow {
     }
 
     /// The rows the window holds at most.
-    #[cfg(test)]
     pub(crate) fn slots(&self) -> u32 {
         self.slots
     }
@@ -191,6 +190,25 @@ impl DraftContextWindow {
         })
     }
 
+    /// Detaches an immutable device-side snapshot of the current window without
+    /// waiting on the GPU or copying bytes to host memory.
+    ///
+    /// Replaces `self.buffer` with a lazy [`MxArray::deep_copy`] reading from
+    /// the frozen buffer, so subsequent in-place `store_rows` writes target the
+    /// fresh buffer and MLX's DAG orders the copy after prior stores and before
+    /// later stores (even across streams) with zero host synchronization stalls.
+    pub(crate) fn detach_snapshot(&mut self) -> Result<Self> {
+        let next = self.buffer.deep_copy()?;
+        let frozen = std::mem::replace(&mut self.buffer, next);
+        Ok(Self {
+            buffer: frozen,
+            width: self.width,
+            slots: self.slots,
+            begin: self.begin,
+            end: self.end,
+        })
+    }
+
     /// Takes `other`'s rows by an in-place copy into this window's buffer
     /// (Splash's restore writes into the lane's window). The bounds move
     /// only after the copy ran.
@@ -278,7 +296,6 @@ impl DraftContextWindow {
         out.push(&self.buffer);
     }
 
-    #[cfg(test)]
     pub(crate) fn host_bytes(&self) -> Result<Vec<u8>> {
         self.buffer.to_uint8()
     }

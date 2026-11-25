@@ -1,4 +1,4 @@
-import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { constants, existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
 import { readdir, copyFile, rm, mkdtemp, mkdir, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -929,11 +929,20 @@ async function fetchAssetSidecars(opts: {
         revision,
       }),
     );
-    await copyFile(snapshotPath, destPath);
+    await replaceWithCopy(snapshotPath, destPath);
     fetched.push(file.path);
   }
   console.log('');
   return { ensured: fetched, repo: opts.assetsRepo, revision: opts.plan.revision };
+}
+
+/**
+ * Put a new copy of `from` at `to`. The name at `to` is removed first and the copy is exclusive, so a write never goes
+ * through it: in a folder the dashboard's Locate made, that name is a second name of, or a link to, a user's file.
+ */
+async function replaceWithCopy(from: string, to: string): Promise<void> {
+  await rm(to, { force: true });
+  await copyFile(from, to, constants.COPYFILE_EXCL);
 }
 
 export interface GgufLoadEntry {
@@ -1530,8 +1539,9 @@ export async function run(argv: string[]) {
     );
     // A FRESH install that claims a loadable model — a catalog prescription, or
     // one that pulled sidecars — must certify a config: isModelInstalled
-    // requires one, so a marker without it can never read as installed while
-    // the wizard calls the run a success. Updates are covered by the prune
+    // requires one for every build but a catalog GGUF that installs with none
+    // (CLEF), so a marker without it can never read as installed while the
+    // wizard calls the run a success. Updates are covered by the prune
     // guard below, whose message names the removals that would break the
     // install; this gate exists for the case with nothing to prune.
     if (previousCompletion === null && (args.complete === true || assetsRepo !== undefined)) {
@@ -1617,7 +1627,7 @@ export async function run(argv: string[]) {
         }),
       );
       await ensureDir(dirname(destPath));
-      await copyFile(snapshotPath, destPath);
+      await replaceWithCopy(snapshotPath, destPath);
     }
     if (file.path.endsWith('.safetensors') || file.path.endsWith('.pdiparams')) {
       weightFiles.push(file.path);
@@ -1722,6 +1732,8 @@ export async function run(argv: string[]) {
           ? { assetsRepo: previousCompletion.assetsRepo, assetsRevision: previousCompletion.assetsRevision }
           : {}),
       completedAt: new Date().toISOString(),
+      ...(previousCompletion?.adopted !== undefined ? { adopted: previousCompletion.adopted } : {}),
+      ...(previousCompletion?.located !== undefined ? { located: previousCompletion.located } : {}),
     });
   };
 

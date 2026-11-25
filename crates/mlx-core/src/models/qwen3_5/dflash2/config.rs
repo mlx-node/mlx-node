@@ -1,7 +1,8 @@
+use mlx_sys as sys;
 use napi::bindgen_prelude::*;
 use serde::Deserialize;
 
-use super::{DFLASH2_DRAFT_PROPOSALS, DFLASH2_VERIFY_ROWS, DFlash2TargetContract};
+use super::{DFLASH2_DRAFT_PROPOSALS, DFLASH2_VERIFY_ROWS, DFlash2TargetShape};
 use crate::models::qwen3_5::draft_context::{DRAFT_CONTEXT_GROUP, DraftContextWindow};
 
 #[derive(Clone, Debug, Deserialize)]
@@ -22,7 +23,11 @@ struct RawDFlashConfig {
     #[serde(default)]
     unpadded_vocab_size: Option<usize>,
     #[serde(default)]
+    embedding_normalization: Option<String>,
+    #[serde(default)]
     capture_final_norm: Option<bool>,
+    #[serde(default)]
+    target_hidden_reduction: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -84,8 +89,8 @@ pub(crate) struct DFlash2Config {
     pub(crate) final_logit_softcapping: Option<f32>,
     pub(crate) selector_softcap_mode: Option<String>,
     pub(crate) valid_vocab_size: Option<usize>,
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub(crate) capture_final_norm: bool,
+    pub(crate) capture_final_norm: Option<bool>,
+    pub(crate) embedding_normalization: Option<String>,
 }
 
 impl DFlash2Config {
@@ -96,90 +101,83 @@ impl DFlash2Config {
         self.valid_vocab_size.unwrap_or(self.vocab_size)
     }
 
-    /// Post-correction selector softcap (`Some(cap)` when
-    /// `selector_softcap_mode == "after_correction"` and `cap > 0.0`).
+    /// Post-correction selector softcap (`Some(cap)` when `cap > 0.0` and
+    /// `selector_softcap_mode` is `"after_correction"` or unset).
     pub(crate) fn post_edge_softcap(&self) -> Option<f32> {
-        if self.selector_softcap_mode.as_deref() == Some("after_correction") {
+        if self
+            .selector_softcap_mode
+            .as_deref()
+            .is_none_or(|mode| mode == "after_correction")
+        {
             self.final_logit_softcapping.filter(|&c| c > 0.0)
         } else {
             None
         }
     }
 
-    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetContract>) -> Result<()> {
+    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
         let target = target.into();
-        let invalid_tap = self.target_layers.iter().copied().find(|&layer| {
-            if target.allow_final_norm_tap {
-                layer > target.num_layers
-            } else {
-                layer >= target.num_layers
-            }
-        });
+        let readable_layers = target.readable_layers();
+        let invalid_tap = self
+            .target_layers
+            .iter()
+            .copied()
+            .find(|&layer| layer >= readable_layers);
+        let invalid_final_norm =
+            self.capture_final_norm == Some(true) && !target.reads_layer_inputs;
+        let invalid_embed_norm = match self.embedding_normalization.as_deref() {
+            Some("folded_rmsnorm") => !target.reads_layer_inputs,
+            Some("none") => target.reads_layer_inputs,
+            None => false,
+            Some(_) => true,
+        };
+        let invalid_valid_vocab = target.valid_vocab_size == 0
+            || target.valid_vocab_size > target.vocab_size
+            || self.selector_top_k > target.valid_vocab_size
+            || self
+                .valid_vocab_size
+                .is_some_and(|v| v != target.valid_vocab_size);
+        let invalid_draft_softcap = self
+            .final_logit_softcapping
+            .is_some_and(|dc| !dc.is_finite() || dc < 0.0);
+        let invalid_target_softcap = target
+            .final_logit_softcapping
+            .is_some_and(|tc| !tc.is_finite() || tc < 0.0);
+        let target_cap = target.final_logit_softcapping.filter(|&c| c > 0.0);
+        let softcap_mismatch = match (self.final_logit_softcapping, target_cap) {
+            (Some(dc), Some(tc)) => dc <= 0.0 || (dc - tc).abs() > 1e-4,
+            (Some(dc), None) => dc > 0.0,
+            // Omitted draft softcap (`None`) inherits `target.final_logit_softcapping`
+            // in `DFlash2Model::configure_target_contract` / `configure_inkling2_execution`.
+            (None, _) => false,
+        };
         if self.hidden_size != target.hidden_size
             || self.vocab_size != target.vocab_size
             || self.mask_token_id >= self.vocab_size
             || self.target_num_layers != target.num_layers
             || invalid_tap.is_some()
-            || (!target.allow_final_norm_tap && self.capture_final_norm)
+            || invalid_final_norm
+            || invalid_embed_norm
+            || invalid_valid_vocab
+            || invalid_draft_softcap
+            || invalid_target_softcap
+            || softcap_mismatch
         {
             return Err(Error::from_reason(format!(
-                "DFlash2/target mismatch: draft hidden={} vocab={} taps={:?}; target hidden={} vocab={} layers={} allow_final_norm_tap={}",
+                "DFlash2/target mismatch: draft hidden={} vocab={} valid_vocab={:?} softcap={:?} embed_norm={:?} taps={:?}; target hidden={} vocab={} valid_vocab={} softcap={:?} layers={} readable={}",
                 self.hidden_size,
                 self.vocab_size,
+                self.valid_vocab_size,
+                self.final_logit_softcapping,
+                self.embedding_normalization,
                 self.target_layers,
                 target.hidden_size,
                 target.vocab_size,
+                target.valid_vocab_size,
+                target.final_logit_softcapping,
                 target.num_layers,
-                target.allow_final_norm_tap,
+                readable_layers,
             )));
-        }
-        if let Some(target_valid) = target.valid_vocab_size {
-            if target_valid == 0
-                || target_valid > target.vocab_size
-                || self.selector_top_k > target_valid
-            {
-                return Err(Error::from_reason(format!(
-                    "DFlash2/target invalid valid_vocab_size={target_valid} for vocab={} top_k={}",
-                    target.vocab_size, self.selector_top_k,
-                )));
-            }
-            if let Some(draft_valid) = self.valid_vocab_size
-                && draft_valid != target_valid
-            {
-                return Err(Error::from_reason(format!(
-                    "DFlash2/target valid_vocab_size mismatch: draft={draft_valid}, target={target_valid}",
-                )));
-            }
-        }
-        if let Some(dc) = self.final_logit_softcapping
-            && (!dc.is_finite() || dc < 0.0)
-        {
-            return Err(Error::from_reason(format!(
-                "DFlash2 invalid final_logit_softcapping={dc}",
-            )));
-        }
-        if let Some(tc) = target.final_logit_softcapping
-            && (!tc.is_finite() || tc < 0.0)
-        {
-            return Err(Error::from_reason(format!(
-                "DFlash2/target invalid final_logit_softcapping={tc}",
-            )));
-        }
-        let target_cap = target.final_logit_softcapping.filter(|&c| c > 0.0);
-        match (self.final_logit_softcapping, target_cap) {
-            (Some(dc), Some(tc)) if dc <= 0.0 || (dc - tc).abs() > 1e-4 => {
-                return Err(Error::from_reason(format!(
-                    "DFlash2/target final_logit_softcapping mismatch: draft={dc}, target={tc}",
-                )));
-            }
-            (Some(dc), None) if dc > 0.0 => {
-                return Err(Error::from_reason(format!(
-                    "DFlash2/target final_logit_softcapping mismatch: draft={dc}, target=none",
-                )));
-            }
-            // Omitted draft softcap (`None`) inherits `target.final_logit_softcapping`
-            // in `DFlash2Model::configure_target_contract`.
-            _ => {}
         }
         Ok(())
     }
@@ -195,67 +193,19 @@ impl DFlash2Config {
             ));
         }
         let draft = raw.dflash_config;
-        let rope_theta = raw
-            .rope_theta
-            .or_else(|| {
-                raw.rope_parameters
-                    .as_ref()
-                    .and_then(|value| value.get("rope_theta"))
-                    .and_then(serde_json::Value::as_f64)
-            })
-            .unwrap_or(10_000.0);
-        let valid = raw.hidden_size > 0
-            && raw.intermediate_size > 0
-            && raw.num_hidden_layers > 0
-            && raw.num_attention_heads > 0
-            && raw.num_key_value_heads > 0
-            && raw
-                .num_attention_heads
-                .is_multiple_of(raw.num_key_value_heads)
-            && raw.head_dim > 0
-            && raw.vocab_size > 0
-            && raw.sliding_window > 1
-            && raw.layer_types.len() == raw.num_hidden_layers
-            && raw
-                .layer_types
-                .iter()
-                .all(|kind| kind == "sliding_attention")
-            && !raw.is_causal
-            && draft.conv_kernel_size == 2
-            && draft.conv_group_size > 0
-            && raw.hidden_size.is_multiple_of(draft.conv_group_size)
-            && draft.selector_rank > 0
-            && draft.selector_top_k > 0
-            && draft.selector_top_k <= raw.vocab_size
-            && !draft.target_layer_ids.is_empty()
-            && raw.num_target_layers > 0
-            && draft
-                .target_layer_ids
-                .iter()
-                .all(|&layer| layer <= raw.num_target_layers)
-            && draft
-                .target_layer_ids
-                .windows(2)
-                .all(|pair| pair[0] < pair[1]);
-        if !valid {
-            return Err(Error::from_reason(
-                "unsupported DFlash2 configuration (requires non-causal sliding attention, two-tap grouped convolution, and a non-empty selector)",
-            ));
-        }
-        // Splash `DraftAttention::contextWindowBytes`: the 4-bit context
-        // window quantizes whole 64-value groups of a context row.
-        if !raw.hidden_size.is_multiple_of(DRAFT_CONTEXT_GROUP as usize) {
+        if let Some(ref mode) = draft.embedding_normalization
+            && mode != "none"
+            && mode != "folded_rmsnorm"
+        {
             return Err(Error::from_reason(format!(
-                "draft config hidden_size {} is not a multiple of the {DRAFT_CONTEXT_GROUP}-value context group",
-                raw.hidden_size
+                "unsupported DFlash2 embedding_normalization '{mode}'"
             )));
         }
-        // Splash `ModelDescriptor` draft check: the trained block holds the
-        // verify rows or more, and a cycle drafts the first of them.
-        if draft.block_size < DFLASH2_VERIFY_ROWS {
+        if let Some(ref reduction) = draft.target_hidden_reduction
+            && reduction != "none"
+        {
             return Err(Error::from_reason(format!(
-                "draft config dflash_config block_size {} is less than the {DFLASH2_VERIFY_ROWS} rows a cycle drafts",
-                draft.block_size
+                "unsupported DFlash2 target_hidden_reduction '{reduction}'"
             )));
         }
         if let (Some(a), Some(b)) = (draft.final_logit_softcapping, raw.final_logit_softcapping)
@@ -271,7 +221,7 @@ impl DFlash2Config {
         {
             Some(cap) if !cap.is_finite() || cap < 0.0 => {
                 return Err(Error::from_reason(format!(
-                    "invalid DFlash2 final_logit_softcapping={cap}"
+                    "unsupported DFlash2 final_logit_softcapping {cap}"
                 )));
             }
             Some(cap) => Some(cap),
@@ -335,17 +285,75 @@ impl DFlash2Config {
                 "conflicting DFlash2 capture_final_norm values: {a} vs {b}"
             )));
         }
-        let has_final_norm_tap = draft.target_layer_ids.contains(&raw.num_target_layers);
-        let explicit_capture_final_norm = draft.capture_final_norm.or(raw.capture_final_norm);
-        if let Some(explicit) = explicit_capture_final_norm
-            && explicit != has_final_norm_tap
-        {
+        let capture_final_norm = draft.capture_final_norm.or(raw.capture_final_norm);
+        let max_tap_exclusive = if capture_final_norm == Some(false) {
+            raw.num_target_layers
+        } else {
+            raw.num_target_layers.saturating_add(1)
+        };
+        let rope_theta = raw
+            .rope_theta
+            .or_else(|| {
+                raw.rope_parameters
+                    .as_ref()
+                    .and_then(|value| value.get("rope_theta"))
+                    .and_then(serde_json::Value::as_f64)
+            })
+            .unwrap_or(10_000.0);
+        let valid = raw.hidden_size > 0
+            && raw.intermediate_size > 0
+            && raw.num_hidden_layers > 0
+            && raw.num_attention_heads > 0
+            && raw.num_key_value_heads > 0
+            && raw
+                .num_attention_heads
+                .is_multiple_of(raw.num_key_value_heads)
+            && raw.head_dim > 0
+            && raw.vocab_size > 0
+            && raw.sliding_window > 1
+            && raw.layer_types.len() == raw.num_hidden_layers
+            && raw
+                .layer_types
+                .iter()
+                .all(|kind| kind == "sliding_attention")
+            && !raw.is_causal
+            && draft.conv_kernel_size == 2
+            && draft.conv_group_size > 0
+            && raw.hidden_size.is_multiple_of(draft.conv_group_size)
+            && draft.selector_rank > 0
+            && draft.selector_top_k > 0
+            && draft.selector_top_k <= raw.vocab_size
+            && !draft.target_layer_ids.is_empty()
+            && raw.num_target_layers > 0
+            && draft
+                .target_layer_ids
+                .iter()
+                .all(|&layer| layer < max_tap_exclusive)
+            && draft
+                .target_layer_ids
+                .windows(2)
+                .all(|pair| pair[0] < pair[1]);
+        if !valid {
+            return Err(Error::from_reason(
+                "unsupported DFlash2 configuration (requires non-causal sliding attention, two-tap grouped convolution, and a non-empty selector)",
+            ));
+        }
+        // Splash `DraftAttention::contextWindowBytes`: the 4-bit context
+        // window quantizes whole 64-value groups of a context row.
+        if !raw.hidden_size.is_multiple_of(DRAFT_CONTEXT_GROUP as usize) {
             return Err(Error::from_reason(format!(
-                "DFlash2 capture_final_norm={explicit} conflicts with target_layer_ids={:?} and num_target_layers={}",
-                draft.target_layer_ids, raw.num_target_layers
+                "draft config hidden_size {} is not a multiple of the {DRAFT_CONTEXT_GROUP}-value context group",
+                raw.hidden_size
             )));
         }
-        let capture_final_norm = explicit_capture_final_norm.unwrap_or(has_final_norm_tap);
+        // Splash `ModelDescriptor` draft check: the trained block holds the
+        // verify rows or more, and a cycle drafts the first of them.
+        if draft.block_size < DFLASH2_VERIFY_ROWS {
+            return Err(Error::from_reason(format!(
+                "draft config dflash_config block_size {} is less than the {DFLASH2_VERIFY_ROWS} rows a cycle drafts",
+                draft.block_size
+            )));
+        }
         Ok(Self {
             block_size: DFLASH2_DRAFT_PROPOSALS,
             mask_token_id: draft.mask_token_id,
@@ -370,6 +378,7 @@ impl DFlash2Config {
             selector_softcap_mode,
             valid_vocab_size,
             capture_final_norm,
+            embedding_normalization: draft.embedding_normalization,
         })
     }
 }
@@ -441,17 +450,29 @@ impl DFlash2Config {
             && self.selector_rank == 256
             && self.selector_top_k == 16
     }
+
+    /// Geometry eligibility for Inkling-2-Mini DFlash2 Metal NAX attention and
+    /// compiled draft-body defaults (`32Q/8KV/128D`, 8-row block, 2048 window).
+    pub(super) fn supports_inkling2_execution_defaults(&self) -> bool {
+        self.num_attention_heads == 32
+            && self.num_key_value_heads == 8
+            && self.head_dim == 128
+            && self.block_size == DFLASH2_DRAFT_PROPOSALS
+            && self.sliding_window == 2048
+    }
 }
 
-/// Captured once per loaded companion. A MoE loader may select its measured
-/// structural profile before publishing the model; later environment changes
-/// cannot alter a cached graph or another model's execution policy.
+/// Captured once per loaded companion. A MoE or Inkling2 loader may select its
+/// measured structural profile before publishing the model; later environment
+/// changes cannot alter a cached graph or another model's execution policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct DraftExecutionPolicy {
     pub(super) compile_override: Option<bool>,
     attention_override: Option<bool>,
     supported_moe: bool,
     dense_cuda: bool,
+    inkling2_compile: bool,
+    inkling2_nax: bool,
 }
 
 impl DraftExecutionPolicy {
@@ -462,6 +483,8 @@ impl DraftExecutionPolicy {
             attention_override: attention.map(|value| value == "1"),
             supported_moe: false,
             dense_cuda: false,
+            inkling2_compile: false,
+            inkling2_nax: false,
         }
     }
 
@@ -473,6 +496,24 @@ impl DraftExecutionPolicy {
                 .map(|value| value == "1"),
             supported_moe: false,
             dense_cuda: false,
+            inkling2_compile: false,
+            inkling2_nax: false,
+        }
+    }
+
+    /// Capture environment overrides and auto-enable Inkling-2-Mini Metal
+    /// compiled draft + NAX attention when the checkpoint matches Inkling-2-Mini's
+    /// softcapped `32Q/8KV/128D`, 8-row block, 2048-window draft geometry.
+    pub(super) fn default_for_config(config: &DFlash2Config) -> Self {
+        let policy = Self::capture();
+        if config.supports_inkling2_execution_defaults()
+            && config.post_edge_softcap().is_some()
+            && unsafe { sys::mlx_metal_is_available() }
+        {
+            let nax = unsafe { sys::mlx_metal_is_nax_available() };
+            policy.with_inkling2_metal_profile(true, nax)
+        } else {
+            policy
         }
     }
 
@@ -486,12 +527,19 @@ impl DraftExecutionPolicy {
         self
     }
 
+    pub(super) fn with_inkling2_metal_profile(mut self, compile: bool, nax: bool) -> Self {
+        self.inkling2_compile = compile;
+        self.inkling2_nax = nax;
+        self
+    }
+
     pub(super) fn compile_draft(self) -> bool {
         self.compile_override
-            .unwrap_or(self.supported_moe || self.dense_cuda)
+            .unwrap_or(self.supported_moe || self.dense_cuda || self.inkling2_compile)
     }
 
     pub(super) fn tensor_attention(self) -> bool {
-        self.attention_override.unwrap_or(self.supported_moe)
+        self.attention_override
+            .unwrap_or(self.supported_moe || self.inkling2_nax)
     }
 }

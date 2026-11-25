@@ -34,7 +34,8 @@ fn checkpoint_inventory_config() -> DFlash2Config {
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     }
 }
 
@@ -415,6 +416,7 @@ fn selector_fp32_edges_hook_widens_native_bf16_unary() {
                 predecessor.as_raw_ptr(),
                 successor.as_raw_ptr(),
                 anchor.as_raw_ptr(),
+                0.0,
             )
         },
         "test selector FP32 edges",
@@ -1096,7 +1098,8 @@ fn record_only_advances_context_without_kv() {
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     let mut context = DFlash2ContextCache::new(&config);
     context.record_only(&[10, 11, 12]).unwrap();
@@ -1511,7 +1514,8 @@ fn quantized_draft_model(layers: usize, intermediate: usize) -> super::DFlash2Mo
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     let execution_policy = super::DraftExecutionPolicy::capture();
     super::DFlash2Model {
@@ -2912,7 +2916,7 @@ fn inkling2_dflash2_config_parses_and_validates_target_contract() {
     let config = parse_json(&inkling2_json).expect("Inkling-2-Mini DFlash2 config must parse");
     assert_eq!(config.target_layers, vec![5, 23, 41, 48]);
     assert_eq!(config.target_num_layers, 48);
-    assert!(config.capture_final_norm);
+    assert_eq!(config.capture_final_norm, None);
     assert_eq!(config.final_logit_softcapping, Some(30.0));
     assert_eq!(
         config.selector_softcap_mode.as_deref(),
@@ -2953,11 +2957,7 @@ fn inkling2_dflash2_config_parses_and_validates_target_contract() {
     );
     assert!(
         config
-            .validate_target(super::DFlash2TargetShape {
-                hidden_size: 2304,
-                vocab_size: 201024,
-                num_layers: 48,
-            })
+            .validate_target(super::DFlash2TargetShape::new(2304, 201024, 48))
             .is_err()
     );
 
@@ -3045,7 +3045,7 @@ fn inkling2_dflash2_config_parses_and_validates_target_contract() {
     let preview = parse_json(&inkling2_json).expect("preview config must parse");
     assert_eq!(preview.valid_vocab_size, Some(200058));
     assert_eq!(preview.effective_valid_vocab_size(), 200058);
-    assert!(preview.capture_final_norm);
+    assert_eq!(preview.capture_final_norm, Some(true));
     preview.validate_target(contract).unwrap();
     assert!(
         preview
@@ -3202,8 +3202,8 @@ fn post_edge_softcap_matches_tanh_formula_and_preserves_zero_softcap_bits() {
     let length = 7usize;
 
     // Exercise both the MLX fallback path (top_k=4, rank=8, Float32) and the
-    // production BF16 K=16, Rank=256 path (CUDA `mlx_dflash2_selector_edges_cuda_softcap`
-    // on CUDA, MLX fallback on CPU/Metal).
+    // production BF16 K=16, Rank=256 path (fused `mlx_dflash2_selector_edges`
+    // on CUDA/Metal, MLX fallback on CPU).
     for (top_k, rank, bf16) in [(4usize, 8usize, false), (16usize, 256usize, true)] {
         let vocab = 64usize;
         let mut selector = test_selector(vocab, top_k, rank, 32);
@@ -3281,77 +3281,97 @@ fn post_edge_softcap_matches_tanh_formula_and_preserves_zero_softcap_bits() {
             .unwrap()
             .to_vec();
 
-        // On CUDA `bf16 == true` (`top_k=16, rank=256`), `mlx_dflash2_selector_edges_cuda_softcap`
-        // keeps `sum = u_val + dot(bf16(pred * hidden), succ)` in exact FP32 before applying
-        // `softcap * tanh(sum / softcap)` (matching Splash `sampling.metal:1670-1675`), whereas
-        // `softcap == 0` rounds `bf16(bf16(edge) + u_val)` to match the Qwen3.8 BF16 graph.
-        let expected_raw: Vec<f32> =
-            if bf16 && top_k == 16 && rank == 256 && crate::accelerator::cuda_ops_available() {
-                let pred_w = selector
-                    .predecessor_codebook
-                    .get_weight()
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-                    .to_vec();
-                let succ_w = selector
-                    .successor_codebook
-                    .get_weight()
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-                    .to_vec();
-                let proj_f = projected
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-                    .to_vec();
-                let unary_f = unary
-                    .astype(DType::Float32)
-                    .unwrap()
-                    .to_float32()
-                    .unwrap()
-                    .to_vec();
-                let anchor_id = 5usize;
-                let mut sums = vec![0.0f32; length * top_k * top_k];
-                for pos in 0..length {
-                    let h_row = &proj_f[pos * rank..(pos + 1) * rank];
-                    let num_prev = if pos > 0 { top_k } else { 1 };
-                    for prev in 0..num_prev {
-                        let pid = if pos > 0 {
-                            cand_vals[(pos - 1) * top_k + prev] as usize
-                        } else {
-                            anchor_id
-                        };
-                        let p_row = &pred_w[pid * rank..(pid + 1) * rank];
-                        let ctx: Vec<f32> = (0..rank)
-                            .map(|d| half::bf16::from_f32(p_row[d] * h_row[d]).to_f32())
-                            .collect();
-                        for j in 0..top_k {
-                            let cid = cand_vals[pos * top_k + j] as usize;
-                            let s_row = &succ_w[cid * rank..(cid + 1) * rank];
-                            let mut dot = 0.0f32;
-                            for d in 0..rank {
-                                dot = ctx[d].mul_add(s_row[d], dot);
-                            }
-                            let sum = unary_f[pos * top_k + j] + dot;
-                            if pos > 0 {
-                                sums[(pos * top_k + prev) * top_k + j] = sum;
+        // When `bf16 == true`, softcapped edge scoring keeps `sum = u_val + edge`
+        // in FP32 before `softcap * tanh(clamp(sum / softcap, -20.0, 20.0))`
+        // (matching Splash `sampling.metal:1670-1675`). The fused CUDA/Metal
+        // kernel (`top_k=16, rank=256`) also keeps `pred * hidden` and the dot
+        // product in FP32, whereas the CPU BF16 fallback rounds `pred * hidden`
+        // and the matmul output to BF16 before promoting to FP32 for `+ unary`.
+        let use_gpu_edges = bf16
+            && top_k == 16
+            && rank == 256
+            && (crate::accelerator::cuda_ops_available()
+                || unsafe {
+                    mlx_sys::mlx_metal_is_available() && mlx_sys::mlx_default_device() == 1
+                });
+        let expected_raw: Vec<f32> = if bf16 {
+            let pred_w = selector
+                .predecessor_codebook
+                .get_weight()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let succ_w = selector
+                .successor_codebook
+                .get_weight()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let proj_f = projected
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let unary_f = unary
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap()
+                .to_vec();
+            let anchor_id = 5usize;
+            let mut sums = vec![0.0f32; length * top_k * top_k];
+            for pos in 0..length {
+                let h_row = &proj_f[pos * rank..(pos + 1) * rank];
+                let num_prev = if pos > 0 { top_k } else { 1 };
+                for prev in 0..num_prev {
+                    let pid = if pos > 0 {
+                        cand_vals[(pos - 1) * top_k + prev] as usize
+                    } else {
+                        anchor_id
+                    };
+                    let p_row = &pred_w[pid * rank..(pid + 1) * rank];
+                    let ctx: Vec<f32> = (0..rank)
+                        .map(|d| {
+                            let prod = p_row[d] * h_row[d];
+                            if use_gpu_edges {
+                                prod
                             } else {
-                                for p in 0..top_k {
-                                    sums[p * top_k + j] = sum;
-                                }
+                                half::bf16::from_f32(prod).to_f32()
+                            }
+                        })
+                        .collect();
+                    for j in 0..top_k {
+                        let cid = cand_vals[pos * top_k + j] as usize;
+                        let s_row = &succ_w[cid * rank..(cid + 1) * rank];
+                        let mut dot = 0.0f32;
+                        for d in 0..rank {
+                            dot = ctx[d].mul_add(s_row[d], dot);
+                        }
+                        let edge = if use_gpu_edges {
+                            dot
+                        } else {
+                            half::bf16::from_f32(dot).to_f32()
+                        };
+                        let sum = unary_f[pos * top_k + j] + edge;
+                        if pos > 0 {
+                            sums[(pos * top_k + prev) * top_k + j] = sum;
+                        } else {
+                            for p in 0..top_k {
+                                sums[p * top_k + j] = sum;
                             }
                         }
                     }
                 }
-                sums
-            } else {
-                raw_none.clone()
-            };
+            }
+            sums
+        } else {
+            raw_none.clone()
+        };
 
         assert_eq!(capped.len(), expected_raw.len());
         let mut saw_neg_inf = false;
@@ -3365,7 +3385,7 @@ fn post_edge_softcap_matches_tanh_formula_and_preserves_zero_softcap_bits() {
                 );
                 saw_neg_inf = true;
             } else {
-                let expected = softcap * (raw / softcap).tanh();
+                let expected = softcap * (raw / softcap).clamp(-20.0, 20.0).tanh();
                 if raw.abs() > 35.0 {
                     saw_compressed = true;
                 }
@@ -4274,7 +4294,7 @@ fn configure_target_contract_inherits_omitted_softcap_and_rejects_qwen_final_nor
     let mut final_tap = super::tiny_dflash2_model_with_block(&target, 7).unwrap();
     final_tap.config.selector_top_k = 16;
     final_tap.config.target_layers = vec![0, 4];
-    final_tap.config.capture_final_norm = true;
+    final_tap.config.capture_final_norm = Some(true);
     assert!(final_tap.validate_target(&target).is_err());
     assert!(
         final_tap

@@ -17,12 +17,16 @@ import {
   assertSemver,
   assertVersionsAgree,
   dmgFileName,
+  msixPackageVersion,
+  ReleaseVersionError,
   type ReleaseVersions,
   versionFromDmgPath,
   versionFromTag,
   updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsMsixPath,
   versionFromWindowsZipPath,
+  windowsMsixFileName,
   windowsZipFileName,
 } from '../scripts/release-version.js';
 
@@ -172,6 +176,70 @@ describe('Windows ZIP release versions', () => {
     expect(versionFromWindowsZipPath('mlx-node-0.0.14-win32-x64.zip')).toBeNull();
     expect(versionFromWindowsZipPath('mlx-node-nightly-win32-arm64.zip')).toBeNull();
     expect(() => windowsZipFileName('nightly')).toThrow();
+  });
+});
+
+describe('Windows MSIX release versions', () => {
+  it('round-trips a Windows MSIX path and checks agreement with other artifacts', () => {
+    const path = `packages\\desktop\\out\\${windowsMsixFileName('0.0.21')}`;
+    expect(windowsMsixFileName('0.0.21')).toBe('mlx-node-0.0.21-win32-arm64.msix');
+    expect(versionFromWindowsMsixPath(path)).toBe('0.0.21');
+    expect(versionFromWindowsMsixPath(`/out/${windowsMsixFileName('1.2.3')}`)).toBe('1.2.3');
+    expect(assertVersionsAgree({ ...AGREED, windowsMsix: '0.0.9' })).toBe('0.0.9');
+    expect(() => assertVersionsAgree({ ...AGREED, windowsMsix: '0.0.8' })).toThrow(/Windows MSIX filename/);
+  });
+
+  it('rejects other platforms, extensions, architectures, and invalid versions', () => {
+    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-win32-arm64.zip')).toBeNull();
+    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-win32-x64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-darwin-arm64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('mlx-node-nightly-win32-arm64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('other-0.0.21-win32-arm64.msix')).toBeNull();
+    expect(() => windowsMsixFileName('nightly')).toThrow(ReleaseVersionError);
+  });
+
+  it('maps stable semver to Store-valid non-zero Major 4-part MSIX versions', () => {
+    expect(msixPackageVersion('0.0.21')).toBe('1.0.21.0');
+    expect(msixPackageVersion('0.0.22')).toBe('1.0.22.0');
+    expect(msixPackageVersion('0.1.0')).toBe('1.1.0.0');
+    expect(msixPackageVersion('1.0.0')).toBe('2.0.0.0');
+    expect(msixPackageVersion('1.2.3')).toBe('2.2.3.0');
+    expect(msixPackageVersion('65534.65535.65535')).toBe('65535.65535.65535.0');
+  });
+
+  it('preserves strict monotonic ordering across 0.x -> 1.x -> 2.x upgrades', () => {
+    const compareMsixVersion = (a: string, b: string): number => {
+      const aParts = a.split('.').map(Number);
+      const bParts = b.split('.').map(Number);
+      for (let i = 0; i < 4; i += 1) {
+        if (aParts[i] !== bParts[i]) return aParts[i] - bParts[i];
+      }
+      return 0;
+    };
+
+    const sequence = ['0.0.21', '0.0.22', '0.1.0', '0.99.99', '1.0.0', '1.0.1', '2.0.0'].map(msixPackageVersion);
+    for (let i = 1; i < sequence.length; i += 1) {
+      expect(compareMsixVersion(sequence[i - 1], sequence[i])).toBeLessThan(0);
+    }
+    for (const msixVersion of sequence) {
+      const [major, , , revision] = msixVersion.split('.').map(Number);
+      expect(major).toBeGreaterThanOrEqual(1);
+      expect(revision).toBe(0);
+    }
+  });
+
+  it('rejects prereleases, build metadata, invalid semver, and out-of-range uint16 parts', () => {
+    expect(() => msixPackageVersion('0.0.22-rc.1')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('0.0.22-rc.1')).toThrow(/prerelease/i);
+    expect(() => msixPackageVersion('1.2.3+build.4')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('1.2.3+build.4')).toThrow(/build metadata/i);
+    expect(() => msixPackageVersion('65535.0.0')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('65535.0.0')).toThrow(/0\.\.65534/);
+    expect(() => msixPackageVersion('65536.0.0')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('0.65536.0')).toThrow(/0\.\.65535/);
+    expect(() => msixPackageVersion('0.0.70000')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('nightly')).toThrow(ReleaseVersionError);
+    expect(() => msixPackageVersion('0.01.0')).toThrow(ReleaseVersionError);
   });
 });
 

@@ -5,6 +5,8 @@
  * pages consume identical types; only fields the UI reads are modelled.
  */
 
+import type { UserAttachment } from '../../../src/chat/attachment-rule.js';
+
 export interface LocalModel {
   name: string;
   path: string;
@@ -18,6 +20,20 @@ export interface LocalModel {
    * `servedIds.includes(key) || (servedIds.length === 0 && name === key)`.
    */
   servedIds: string[];
+  /** Set when Locate made the folder from model files the user already had. */
+  located: (LocatedFiles & { filesStay: boolean }) | null;
+  /** The entry in the models folder is a link: Delete removes only the link. */
+  link: boolean;
+}
+
+/** Where the model files of a folder that Locate made are. */
+export interface LocatedFiles {
+  /** The real path of the folder the user located. */
+  from: string;
+  /** `shared`: the models folder shares the files on the same disk. `linked`: it links to them on another disk. */
+  mode: 'shared' | 'linked';
+  /** The files in `from` can be reached; false while their disk is not connected. */
+  filesAvailable: boolean;
 }
 
 export interface ModelsResponse {
@@ -27,72 +43,102 @@ export interface ModelsResponse {
   warnings: string[];
   /** Absolute path of the models directory these checkpoints were discovered in. */
   dir: string;
-  host: { totalMemBytes: number; diskFreeBytes: number | null };
+}
+
+/** `GET /api/host`: this machine's memory, free space on the models disk, and OS platform. */
+export interface HostResponse {
+  totalMemBytes: number;
+  /** `null` when the models folder cannot be read. */
+  diskFreeBytes: number | null;
+  platform?: string;
 }
 
 export type RuntimeCapability = 'chat' | 'audio' | 'rerank' | 'decision';
 
-export interface CatalogItem {
-  label: string;
+/** One build of a catalog model with the state of its install folder. */
+export interface CatalogBuildItem {
+  /** The build's name on every surface: `UD-Q4_K_XL`, `Original`. */
+  id: string;
   hfRepo: string;
   sizeGb: number;
+  /** Who made the files and in which format: `Unsloth GGUF`, `Thinking Machines`. */
+  source: string;
+  /** One short fact after the source: `1.1 GB smaller`. */
+  note?: string;
+  /** What comes with the weights. */
+  included?: string;
+  /**
+   * Base-model repo the build CURRENTLY sources its tokenizer sidecars from — compared against `localAssetsRepo` so
+   * a switched source is itself an update (the marker's repo is what the probe map lacks).
+   */
+  assetsRepo?: string;
+  /** The folder under the models directory this build installs to; the key of its download. */
+  slug: string;
+  /** A dashboard-owned (completion-marker) install of this build is in its folder. */
+  installed: boolean;
+  /**
+   * A loadable checkpoint of this build is on disk regardless of the dashboard marker — true for {@link installed},
+   * and also for a build installed via the `mlx download` CLI / wizard. Gate the Install action on this (an unowned
+   * present model can't be overwritten).
+   */
+  present: boolean;
+  /**
+   * The build the folder holds when it holds another build of the same repository (`UD-Q4_K_M`), or `another model`
+   * for a loadable model that names no build. The server refuses an install into it. `null` otherwise.
+   */
+  heldBy: string | null;
+  /**
+   * The folder is occupied by something the downloader does not own and holds no loadable checkpoint (an
+   * interrupted `mlx download`, a hand-made folder, a symlink). Install is refused server-side in this state, so the
+   * card names the blockage rather than offering a button that always errors.
+   */
+  blockedByForeignDir: boolean;
+  /** What occupies the folder; non-null exactly when `blockedByForeignDir` is true. */
+  blocker: CatalogBlocker | null;
+  /**
+   * Commit sha the local bytes were pinned to, or `null` when no completion marker exists to read (hand copy,
+   * pre-marker CLI install, renamed dir). `null` means staleness is unknowable, never "up to date".
+   */
+  localRevision: string | null;
+  /**
+   * Base-model repo the install's tokenizer sidecars came from, and the commit they were pinned to — or `null` when
+   * the install used none or predates the field. Update discovery compares this pair too: a sidecar-only upstream
+   * change moves nothing in the primary repo, so without it no badge appears and the Installed button (disabled)
+   * keeps the repair job unreachable.
+   */
+  localAssetsRepo: string | null;
+  localAssetsRevision: string | null;
+  /** The folder was made by Locate from model files elsewhere on this Mac; `null` otherwise. */
+  located: LocatedFiles | null;
+  /** Local models lists the folder at `slug`. */
+  listed: boolean;
+}
+
+export interface CatalogItem {
+  label: string;
   description: string;
   category?: 'chat' | 'systemone';
   isDefault?: boolean;
   hidden?: boolean;
+  /** Platforms where this entry is supported (absent means every platform). */
+  platforms?: readonly string[];
   /** Physical RAM in GiB the model's load needs at least; the page leaves the entry out below it. */
   minMemoryGb?: number;
-  slug: string;
-  /** A dashboard-owned (completion-marker) install of this model is present. */
-  installed: boolean;
-  /**
-   * A loadable checkpoint is present on disk regardless of the dashboard marker —
-   * true for {@link installed}, and also for a model installed via the `mlx
-   * download` CLI / wizard. Gate the Install action on this (an unowned present
-   * model can't be overwritten).
-   */
-  present: boolean;
-  /**
-   * The slug directory is occupied by something the downloader does not own and
-   * holds no loadable checkpoint (an interrupted `mlx download`, a hand-made
-   * folder, a symlink). Install is refused server-side in this state, so the card
-   * names the blockage rather than offering a button that always errors.
-   */
-  blockedByForeignDir: boolean;
-  /** What occupies the slug; non-null exactly when `blockedByForeignDir` is true. */
-  blocker: CatalogBlocker | null;
-  /**
-   * Commit sha the local bytes were pinned to, or `null` when no completion
-   * marker exists to read (hand copy, pre-marker CLI install, renamed dir).
-   * `null` means staleness is unknowable, never "up to date".
-   */
-  localRevision: string | null;
-  /**
-   * Base-model repo the install's tokenizer sidecars came from, and the commit
-   * they were pinned to — or `null` when the install used none or predates the
-   * field. Update discovery compares this pair too: a sidecar-only upstream
-   * change moves nothing in the primary repo, so without it no badge appears
-   * and the Installed button (disabled) keeps the repair job unreachable.
-   */
-  localAssetsRepo: string | null;
-  localAssetsRevision: string | null;
-  /**
-   * Base-model repo the catalog entry CURRENTLY sources its tokenizer
-   * sidecars from — compared against `localAssetsRepo` so a switched source
-   * is itself an update (the marker's repo is what the probe map lacks).
-   */
-  assetsRepo?: string;
-  /** Separate optional draft weights, never a standalone chat-model entry. */
+  /** In catalog order; `builds[0]` is the build every surface chooses first. */
+  builds: CatalogBuildItem[];
+  /** Separate companion draft weights, never a standalone chat-model entry. */
   draft?: CatalogDraftItem;
-  globs?: string[];
 }
 
 export type CatalogDraftItem = Pick<
-  CatalogItem,
-  'label' | 'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
->;
+  CatalogBuildItem,
+  'hfRepo' | 'sizeGb' | 'slug' | 'installed' | 'present' | 'blockedByForeignDir' | 'blocker' | 'localRevision'
+> & { label: string; autoInstall?: boolean };
 
-/** An entry at a catalog slug that the app did not create, measured without following a link or opening a file. */
+/**
+ * An entry at a catalog slug that the app did not create, measured without following a link or opening a file. The
+ * cleanup confirmation shows these numbers, and its request echoes them back.
+ */
 export interface CatalogBlocker {
   kind: 'directory' | 'symlink' | 'file';
   /** directory: files below it. file: 1. symlink: 0. */
@@ -106,10 +152,15 @@ export interface CatalogBlocker {
   listed: boolean;
   /** A `config.json` is at its root. */
   modelLike: boolean;
-  /** `mlx serve` can list a model in it (a checkpoint or a target GGUF), so Reinstall refuses it. */
+  /** It holds model files (a checkpoint or a GGUF); for a link, the folder it points to does. */
   holdsModel: boolean;
+  /** The link text, cut to 200 characters and `…`. */
   linkTarget: string | null;
   dangling: boolean;
+  /** A link whose target is there and is not a folder. */
+  linkToFile: boolean;
+  /** A real folder the app has no write permission on: no cleanup and no Update can change it. */
+  locked: boolean;
 }
 
 export interface CatalogResponse {
@@ -127,12 +178,24 @@ export interface CatalogUpdatesResponse {
   items: CatalogUpdateItem[];
 }
 
+/** What a job does: download into a free folder, Update a folder in place, clean up an entry first, or Locate. */
+export type DownloadJobKind = 'install' | 'update' | 'cleanup' | 'locate';
+
 export interface DownloadJob {
   id: string;
+  /** The folder the job installs to; the key of a download. */
+  slug: string;
   repo: string;
+  kind: DownloadJobKind;
   state: 'running' | 'committing' | 'done' | 'error' | 'cancelled';
   receivedBytes: number;
   totalBytes: number;
+  /** A done job: where old files were kept. */
+  keptDir?: string;
+  /** A done cleanup: how the old entry went. */
+  removed?: 'link' | 'trash';
+  /** A cleanup: the entry it replaces. */
+  entry?: Pick<CatalogBlocker, 'kind' | 'linkToFile'>;
 }
 
 export interface DownloadsResponse {
@@ -141,7 +204,44 @@ export interface DownloadsResponse {
 
 export interface DownloadStartResponse {
   id: string;
+  slug: string;
   repo: string;
+  kind: DownloadJobKind;
+}
+
+/**
+ * Result of `POST /api/downloads/adopt-plan`: what Update would check, download and leave in a folder the app did not
+ * create. `token` is posted back as `adopt` to start that exact plan.
+ */
+export interface AdoptPlanResponse {
+  repo: string;
+  slug: string;
+  token: string;
+  revision: string;
+  assetsRevision: string | null;
+  check: { count: number; bytes: number };
+  download: { count: number; bytes: number };
+  /** Files that stay in the folder; `names` holds at most 3, sorted. */
+  other: { count: number; bytes: number; names: string[] };
+}
+
+/** Result of `POST /api/downloads/locate-plan`: what Locate would use from a folder, before anything changes. */
+export interface LocatePlanResponse {
+  slug: string;
+  repo: string;
+  token: string;
+  /** The real path of the folder whose files are used: the picked folder or one of its child folders. */
+  folder: string;
+  mode: 'shared' | 'linked';
+  /** The folder has this app's install record: the job checks that the files are there and reads none of them. */
+  byRecord: boolean;
+  revision: string;
+  /** The files of the folder the app uses. */
+  use: { count: number; bytes: number };
+  /** The weight files the job reads once to check their content; zeros when `byRecord`. */
+  read: { count: number; bytes: number };
+  /** The files the job downloads into the models folder. */
+  download: { count: number; bytes: number };
 }
 
 /** Result of `DELETE /api/downloads/:id` (cancel an in-flight/queued download). */
@@ -420,6 +520,8 @@ export type TranscriptEntry =
       interjection?: boolean;
       /** The `continue` prompt right after a length end: drawn as a divider, not a message. */
       continued?: true;
+      /** The files and pictures sent with the message: names and sizes only, never their content. */
+      attachments?: UserAttachment[];
     }
   /** A hidden prompt the agent wrote to itself when a background event woke it. Never a message of the user. */
   | {
@@ -639,7 +741,7 @@ interface TimelineSpanBase {
 }
 
 export type TimelineSpan =
-  | (TimelineSpanBase & { kind: 'generate'; phase: 'reasoning' | 'answer' })
+  | (TimelineSpanBase & { kind: 'generate'; phase: 'reasoning' | 'answer' | 'tool-call' })
   | (TimelineSpanBase & { kind: 'tool'; tools: string[]; calls: number; failedCalls: number })
   /** until: what ended the wait. 'open' = still waiting (running) or cut by the lane's end. */
   | (TimelineSpanBase & { kind: 'wait'; reason: 'model'; until: 'text' | 'tool' | 'open' })
@@ -1045,6 +1147,8 @@ export interface SupervisorLive {
   nativeErrorsCapped: boolean;
   lastNativeErrorContext: string | null;
   lastNativeErrorAt: number | null;
+  /** Why the last start failed, one line; set only while `restarting` or `failed`. */
+  failureReason: string | null;
   writtenAt: number;
 }
 
@@ -1169,6 +1273,8 @@ export interface SystemOneModelInfo {
   name: string;
   modelType: 'clairic' | 'clef';
   format: string;
+  /** The build discovery names the model by (`Q8_0`), the catalog's build id; `null` for a model only the running endpoint lists. */
+  variant: string | null;
   supportsImages: boolean;
   contextWindow: number;
   resident: boolean;

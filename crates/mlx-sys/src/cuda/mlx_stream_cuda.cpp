@@ -53,10 +53,38 @@ int32_t cuda_device_static_memory_info(
 
 }  // namespace mlx_node
 
+#ifdef MLX_NODE_CUDA_INCLUDE_DIR
+// Authoritative path to `<OUT_DIR>/cuda-include` read from the built `.node`
+// addon by `packages/core/linux-cuda-include.ts`. Volatile-read from the
+// exported `mlx_cuda_is_available()` below so `--gc-sections` and LTO never
+// strip the marker string.
+static const char* volatile kMlxNodeCudaIncludeDir =
+    "MLX_NODE_CUDA_INCLUDE_DIR=" MLX_NODE_CUDA_INCLUDE_DIR;
+#endif
+
+#if defined(_WIN32) && defined(MLX_NODE_WINDOWS_BUILD_UNIT)
+#define MLX_NODE_STR_IMPL(x) #x
+#define MLX_NODE_STR(x) MLX_NODE_STR_IMPL(x)
+static const char kWindowsBuildUnitMarker[] =
+    "\0MLX_NODE_WINDOWS_BUILD_UNIT=" MLX_NODE_STR(MLX_NODE_WINDOWS_BUILD_UNIT);
+#undef MLX_NODE_STR
+#undef MLX_NODE_STR_IMPL
+#endif
+
 extern "C" {
 
 // Check if CUDA backend is compiled in AND at least one CUDA GPU is visible.
 bool mlx_cuda_is_available() {
+#ifdef MLX_NODE_CUDA_INCLUDE_DIR
+  (void)kMlxNodeCudaIncludeDir;
+#endif
+#if defined(_WIN32) && defined(MLX_NODE_WINDOWS_BUILD_UNIT)
+  // Keep the NUL-framed build-unit marker live through MSVC /OPT:REF so
+  // packages/core/build.ts can bind the built .node addon to its exact mlx-sys
+  // build unit even when the linker places nonzero bytes immediately before it.
+  const volatile char* marker = kWindowsBuildUnitMarker;
+  (void)marker[1];
+#endif
 #ifdef MLX_NODE_CUDA_ENABLED
   try {
     return mlx::core::cu::is_available() && mlx::core::gpu::device_count() > 0;

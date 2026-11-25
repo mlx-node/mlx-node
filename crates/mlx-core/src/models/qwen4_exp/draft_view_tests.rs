@@ -274,11 +274,7 @@ fn the_target_view_gives_the_draft_the_qwen35_inputs() {
     let (embedding, head) = dense_target(&mut dense_side.decoder);
     assert_eq!(
         view_side.decoder.draft_target_shape(),
-        crate::models::qwen3_5::dflash2::DFlash2TargetShape {
-            hidden_size: 32,
-            vocab_size: 64,
-            num_layers: 4,
-        }
+        crate::models::qwen3_5::dflash2::DFlash2TargetShape::new(32, 64, 4)
     );
     draft
         .validate_target(view_side.decoder.draft_target_shape())

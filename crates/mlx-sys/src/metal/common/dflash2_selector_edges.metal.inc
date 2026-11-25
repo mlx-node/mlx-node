@@ -13,6 +13,7 @@ R"(
     const uint lane = thread_index_in_simdgroup;
     const uint sg = simdgroup_index_in_threadgroup;
     const uint vocabulary = predecessor_shape[0];
+    const float cap = softcap[0];
     const uint tasks = (position > 0 ? K : 1) * 2;
     for (uint task = sg; task < tasks; task += 8) {
       const uint previous = task / 2;
@@ -37,7 +38,10 @@ R"(
           score += context[i] * next[j][i];
         score = simd_sum(score);
         if (lane == 0) {
-          const float combined = score + unary[position * K + first + j];
+          float combined = score + unary[position * K + first + j];
+          if (cap > 0.0f && isfinite(combined)) {
+            combined = cap * precise::tanh(clamp(combined / cap, -20.0f, 20.0f));
+          }
           if (position > 0) {
             scores[(ulong(position) * K + previous) * K + first + j] = combined;
           } else {

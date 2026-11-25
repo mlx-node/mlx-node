@@ -1,6 +1,8 @@
 import { execFileSync } from 'node:child_process';
 import {
+  chmodSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -9,15 +11,17 @@ import {
   truncateSync,
   writeFileSync,
 } from 'node:fs';
-import { tmpdir, totalmem } from 'node:os';
-import { dirname, join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { basename, dirname, join } from 'node:path';
 
-import { catalogRepo, MODEL_CATALOG } from '@mlx-node/agent/catalog';
+import { type CatalogBuild, catalogBuildRepo, catalogBuildSlug, MODEL_CATALOG } from '@mlx-node/agent/catalog';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { afterEach, beforeEach, describe, expect, it, onTestFinished } from 'vite-plus/test';
 
+import { modelsDirUnavailableMessage } from '../../server/src/host/paths.js';
+import { ApiError } from '../src/api/errors.js';
 import { handleModels } from '../src/api/handlers/models.js';
-import { type CatalogItem, catalogSlug, catalogWithState } from '../src/catalog.js';
+import { type CatalogBuildItem, catalogWithState, heldByOtherBuild } from '../src/catalog.js';
 import {
   DOWNLOAD_COMPLETE_MARKER,
   defaultModelsDir,
@@ -27,7 +31,11 @@ import {
   isDownloaderOwned,
   isModelInstalled,
   isModelPresent,
+  locatedState,
+  modelsDirUnavailable,
   readCompletion,
+  readLinkText,
+  sameForeignEntry,
   summarizeForeignEntry,
 } from '../src/models.js';
 
@@ -140,13 +148,49 @@ describe('GET /api/models', () => {
     expect(body.warnings.some((w) => w.includes('clairic-gguf'))).toBe(false);
   });
 
-  it('host reports memory and free disk', async () => {
+  it('answers the inventory only: memory and free disk are GET /api/host', async () => {
     const body = await handleModels(paths(modelsDir));
-    expect(body.host.totalMemBytes).toBe(totalmem());
-    expect(body.host.diskFreeBytes).toBeGreaterThan(0);
+    expect(Object.keys(body).sort()).toEqual(['companions', 'dir', 'models', 'warnings']);
     const missing = await handleModels(paths(join(modelsDir, 'does-not-exist')));
     expect(missing.models).toEqual([]);
-    expect(missing.host.diskFreeBytes).toBeNull();
+  });
+});
+
+describe('a models directory that is a link to a missing disk', () => {
+  it('is an error with the plain sentence, not an empty library', async () => {
+    const link = join(modelsDir, 'models-link');
+    const target = join(modelsDir, 'Volumes', 'Disk', 'models');
+    symlinkSync(target, link);
+    // The engine and the CLI say the same words (`ModelsDirUnavailableError`).
+    const sentence = modelsDirUnavailableMessage(link, target);
+    expect(sentence).toBe(
+      `The models folder ${link} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`,
+    );
+    expect(modelsDirUnavailable(link)).toBe(sentence);
+    let caught: unknown;
+    try {
+      await handleModels({
+        modelsDir: link,
+        tracesDir: '',
+        runtimeDir: '',
+        cacheRoot: undefined,
+        prefixCacheRoot: undefined,
+      });
+    } catch (error) {
+      caught = error;
+    }
+    expect(caught).toBeInstanceOf(ApiError);
+    expect(caught).toMatchObject({ code: 'E_UNAVAILABLE', message: sentence, reason: 'models-dir-unavailable' });
+    expect(lstatSync(link).isSymbolicLink()).toBe(true);
+    expect(existsSync(join(modelsDir, 'Volumes'))).toBe(false);
+  });
+
+  it('is not raised for a missing folder, a live link or a real folder', () => {
+    expect(modelsDirUnavailable(join(modelsDir, 'does-not-exist'))).toBeNull();
+    expect(modelsDirUnavailable(modelsDir)).toBeNull();
+    const live = join(modelsDir, 'live-link');
+    symlinkSync(modelsDir, live);
+    expect(modelsDirUnavailable(live)).toBeNull();
   });
 });
 
@@ -260,6 +304,9 @@ describe('discoverLocalModels', () => {
       expect(linked.modelType).toBe('qwen3');
       expect(linked.fileCount).toBe(2);
       expect(linked.sizeBytes).toBe(Buffer.byteLength(CONFIG_A) + WEIGHT_A_BYTES);
+      // The row says it is a link, so its Delete says that only the link goes.
+      expect(linked.link).toBe(true);
+      expect(models.filter((m) => m.name !== 'linked-model').map((m) => m.link)).toEqual([false, false]);
       // And the internal no-follow walk still holds: a link inside a model dir is
       // never descended into (covered by the cycle test above).
     } finally {
@@ -708,12 +755,159 @@ describe('isDownloaderOwned', () => {
   });
 });
 
+describe('readCompletion — the adopted record', () => {
+  const BASE = {
+    repo: 'owner/repo',
+    revision: 'a'.repeat(40),
+    files: ['config.json', 'model.safetensors'],
+    scope: 'full',
+    completedAt: 'x',
+  };
+
+  function writeMarker(dir: string, body: unknown): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), JSON.stringify(body));
+  }
+
+  // A record lost in the reader would make a later owned update delete the whole old folder.
+  it('reads the adopted record of a marker', () => {
+    const dir = join(modelsDir, 'adopted');
+    const adopted = {
+      'config.json': { size: 12, mtimeNs: '1763700000123456789' },
+      'model.safetensors': { size: 0, mtimeNs: '0' },
+    };
+    writeMarker(dir, { ...BASE, adopted });
+    expect(readCompletion(dir)).toEqual({ ...BASE, adopted });
+  });
+
+  // A bad record must never unlock a delete, and must never cost the folder its owner.
+  it('reads a malformed adopted record as empty, and the marker still counts as owned', () => {
+    const good = { size: 12, mtimeNs: '1' };
+    const cases: [string, unknown][] = [
+      ['string', 'yes'],
+      ['array', [good]],
+      ['null', null],
+      ['entry-not-object', { 'config.json': 12 }],
+      ['size-string', { 'config.json': { size: '12', mtimeNs: '1' } }],
+      ['size-negative', { 'config.json': { size: -1, mtimeNs: '1' } }],
+      ['size-fraction', { 'config.json': { size: 1.5, mtimeNs: '1' } }],
+      ['size-unsafe', { 'config.json': { size: 2 ** 53, mtimeNs: '1' } }],
+      ['mtime-number', { 'config.json': { size: 12, mtimeNs: 1 } }],
+      ['mtime-empty', { 'config.json': { size: 12, mtimeNs: '' } }],
+      ['mtime-not-digits', { 'config.json': { size: 12, mtimeNs: '1e9' } }],
+      ['one-bad-entry', { 'config.json': good, 'model.safetensors': { size: 4 } }],
+    ];
+    for (const [name, adopted] of cases) {
+      const dir = join(modelsDir, `malformed-${name}`);
+      writeMarker(dir, { ...BASE, adopted });
+      expect([name, readCompletion(dir)?.adopted]).toEqual([name, {}]);
+      expect([name, isDownloaderOwned(dir)]).toEqual([name, true]);
+    }
+  });
+
+  it('a marker without the record reads as before', () => {
+    const dir = join(modelsDir, 'plain');
+    writeMarker(dir, BASE);
+    const read = readCompletion(dir);
+    expect(read).toEqual(BASE);
+    expect(read !== undefined && 'adopted' in read).toBe(false);
+  });
+});
+
+describe('readCompletion — the located record', () => {
+  const BASE = {
+    repo: 'owner/repo',
+    revision: 'a'.repeat(40),
+    files: ['config.json', 'model.gguf'],
+    scope: 'full',
+    completedAt: 'x',
+  };
+
+  function writeMarker(dir: string, body: unknown): void {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, DOWNLOAD_COMPLETE_MARKER), JSON.stringify(body));
+  }
+
+  it('reads the located record of a marker (POSIX, Windows drive, and UNC paths)', () => {
+    const dir = join(modelsDir, 'located');
+    for (const from of [
+      '/Users/me/models/qwen',
+      'C:\\Users\\me\\models\\qwen',
+      'D:/models/qwen',
+      '\\\\fileserver\\models\\qwen',
+    ]) {
+      for (const mode of ['shared', 'linked']) {
+        writeMarker(dir, { ...BASE, located: { from, mode } });
+        expect(readCompletion(dir)).toEqual({ ...BASE, located: { from, mode } });
+      }
+    }
+  });
+
+  it('reads any other shape as absent, and the marker still counts as owned', () => {
+    const cases: [string, unknown][] = [
+      ['string', '/Users/me'],
+      ['null', null],
+      ['array', ['/Users/me', 'shared']],
+      ['relative', { from: 'me/models', mode: 'shared' }],
+      ['drive-relative', { from: 'C:models', mode: 'shared' }],
+      ['root-relative-win', { from: '\\models', mode: 'shared' }],
+      ['unc-missing-share', { from: '\\\\server\\', mode: 'shared' }],
+      ['nul', { from: '/a\0b', mode: 'shared' }],
+      ['nul-win', { from: 'C:\\a\0b', mode: 'shared' }],
+      ['from-number', { from: 1, mode: 'shared' }],
+      ['mode-copy', { from: '/a', mode: 'copy' }],
+      ['mode-missing', { from: '/a' }],
+    ];
+    for (const [name, located] of cases) {
+      const dir = join(modelsDir, `located-${name}`);
+      writeMarker(dir, { ...BASE, located });
+      const read = readCompletion(dir);
+      expect([name, read !== undefined && 'located' in read]).toEqual([name, false]);
+      expect([name, isDownloaderOwned(dir)]).toEqual([name, true]);
+      expect([name, locatedState(dir)]).toEqual([name, null]);
+    }
+  });
+
+  it('reads the state of a located folder: files there, and whether a delete leaves them', () => {
+    const user = join(modelsDir, '..', `${basename(modelsDir)}-user`);
+    mkdirSync(user, { recursive: true });
+    onTestFinished(() => rmSync(user, { recursive: true, force: true }));
+    writeFileSync(join(user, 'model.gguf'), 'w');
+    const dir = join(modelsDir, 'located-state');
+    writeMarker(dir, { ...BASE, located: { from: user, mode: 'shared' } });
+    writeFileSync(join(dir, 'config.json'), '{}');
+    linkSync(join(user, 'model.gguf'), join(dir, 'model.gguf'));
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'shared', filesAvailable: true, filesStay: true });
+    // The user removed their name: the app's is the last one, so the folder is a plain install.
+    rmSync(join(user, 'model.gguf'));
+    expect(locatedState(dir)).toBeNull();
+    // A link to a file that is gone: nothing is there to free, and the files are not available.
+    rmSync(join(dir, 'model.gguf'));
+    symlinkSync(join(user, 'model.gguf'), join(dir, 'model.gguf'));
+    writeMarker(dir, { ...BASE, located: { from: user, mode: 'linked' } });
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'linked', filesAvailable: false, filesStay: true });
+    // `mlx download` put its own new copy in place of the link and kept the record: the folder is a plain install.
+    rmSync(join(dir, 'model.gguf'));
+    writeFileSync(join(dir, 'model.gguf'), 'w');
+    expect(locatedState(dir)).toBeNull();
+    // One weight file is the folder's own and one is still a link: located, and a delete frees the own one.
+    writeMarker(dir, { ...BASE, files: [...BASE.files, 'part.gguf'], located: { from: user, mode: 'linked' } });
+    writeFileSync(join(user, 'part.gguf'), 'p');
+    symlinkSync(join(user, 'part.gguf'), join(dir, 'part.gguf'));
+    expect(locatedState(dir)).toEqual({ from: user, mode: 'linked', filesAvailable: true, filesStay: false });
+    // A link at the slug is never read as a located folder.
+    symlinkSync(dir, join(modelsDir, 'located-link'));
+    expect(locatedState(join(modelsDir, 'located-link'))).toBeNull();
+  });
+});
+
 describe('catalog companion state', () => {
   it('recognizes a manual shared companion without claiming ownership or installing the target', () => {
     writeModel(modelsDir, 'qwen3.8-27b-dflash2', JSON.stringify({ architectures: ['DFlash2DraftModel'] }), 32);
     const target = catalogWithState(modelsDir).find((item) => item.label === 'Qwen3.8-27B')!;
-    expect(target.present).toBe(false);
+    expect(target.builds.some((build) => build.present)).toBe(false);
     expect(target.draft).toMatchObject({
+      autoInstall: true,
       present: true,
       installed: false,
       blockedByForeignDir: false,
@@ -729,6 +923,62 @@ describe('catalog companion state', () => {
     expect(state()).toMatchObject({ present: false, blockedByForeignDir: true });
     writeFileSync(join(draft, 'model.safetensors'), 'weights');
     expect(state()).toMatchObject({ present: true, installed: false, blockedByForeignDir: false });
+  });
+
+  it('tracks Inkling-2-Mini DFlash2 independently of bundled DSpark fallbacks', () => {
+    // Plant Inkling-2-Mini Original with bundled DSpark (`mtp.safetensors`) AND GGUF folder with a DSpark `.gguf`.
+    const origDir = join(modelsDir, 'inkling-2-mini');
+    mkdirSync(origDir);
+    writeFileSync(
+      join(origDir, 'config.json'),
+      JSON.stringify({
+        model_type: 'inkling2_loop',
+        mtp_config: { markov_rank: 256, target_layer_ids: [5, 23, 41, 48] },
+      }),
+    );
+    writeFileSync(join(origDir, 'model.safetensors'), 'target');
+    writeFileSync(join(origDir, 'mtp.safetensors'), 'dspark');
+
+    const state = () => catalogWithState(modelsDir).find((item) => item.label === 'Inkling-2-Mini')!.draft;
+    // Bundled DSpark fallback must NEVER make DFlash2 appear present.
+    expect(state()).toMatchObject({
+      slug: 'inkling-2-mini-dflash2',
+      hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+      autoInstall: true,
+      present: false,
+      installed: false,
+      blockedByForeignDir: false,
+    });
+
+    // An incomplete foreign `inkling-2-mini-dflash2` dir still reports as blocked even with bundled DSpark.
+    const draft = join(modelsDir, 'inkling-2-mini-dflash2');
+    mkdirSync(draft);
+    writeFileSync(
+      join(draft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    expect(state()).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
+
+    // Completing the DFlash2 companion marks it present (still unowned without completion marker).
+    writeFileSync(join(draft, 'model.safetensors'), 'dflash2');
+    expect(state()).toMatchObject({
+      present: true,
+      installed: false,
+      blockedByForeignDir: false,
+      localRevision: null,
+    });
+  });
+
+  it('recognizes an embedded DFlash2 draft under a non-first Inkling-2-Mini build', () => {
+    const embedded = join(modelsDir, 'inkling-2-mini', 'draft');
+    mkdirSync(embedded, { recursive: true });
+    writeFileSync(
+      join(embedded, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    writeFileSync(join(embedded, 'model.safetensors'), 'dflash2');
+    const draft = catalogWithState(modelsDir).find((item) => item.label === 'Inkling-2-Mini')!.draft;
+    expect(draft).toMatchObject({ present: true, installed: false, blockedByForeignDir: false });
   });
 });
 
@@ -746,15 +996,25 @@ describe('defaultModelsDir', () => {
   });
 });
 
-/** The default recommendation (Qwen3.8-27B) and the folder a download lands in. */
-const RECOMMENDED = MODEL_CATALOG[0]!;
-const RECOMMENDED_SLUG = catalogSlug(RECOMMENDED);
+/** The build `id` of the catalog entry `label`. */
+function catalogBuild(label: string, id: string): CatalogBuild {
+  const build = MODEL_CATALOG.find((entry) => entry.label === label)?.builds.find((candidate) => candidate.id === id);
+  if (build === undefined) throw new Error(`no build ${label} ${id}`);
+  return build;
+}
+
+/**
+ * A build whose repository no other build installs (Inkling-2-Mini Original, a safetensors checkpoint), and the
+ * folder a download lands in.
+ */
+const SOLE = catalogBuild('Inkling-2-Mini', 'Original');
+const SOLE_SLUG = catalogBuildSlug(SOLE);
 /**
  * The repo THIS platform installs. `catalogWithState` matches provenance
- * against `catalogRepo(entry)`, so a marker written with the raw `hfRepo`
+ * against `catalogBuildRepo(build)`, so a marker written with the raw `hfRepo`
  * names the macOS build and silently fails every one of these tests on Linux.
  */
-const RECOMMENDED_REPO = catalogRepo(RECOMMENDED);
+const SOLE_REPO = catalogBuildRepo(SOLE);
 /**
  * A repo that holds the SAME model but is not the one this platform installs:
  * the pre-UD-Q4_K_XL CUDA build the catalog used to recommend for this entry.
@@ -764,9 +1024,14 @@ const RECOMMENDED_REPO = catalogRepo(RECOMMENDED);
  */
 const RETIRED_PLATFORM_ALIAS = 'Brooooooklyn/Qwen3.8-27B-NVFP4-mlx';
 
-/** The catalog row for `label`, from a fresh scan of the temp models dir. */
-function catalogItem(label: string): CatalogItem {
-  return catalogWithState(modelsDir).find((entry) => entry.label === label)!;
+/** Every catalog build with its state, from a fresh scan of the temp models dir. */
+function allBuilds(): CatalogBuildItem[] {
+  return catalogWithState(modelsDir).flatMap((item) => item.builds);
+}
+
+/** The catalog build that installs to the folder `slug`, from a fresh scan of the temp models dir. */
+function buildItem(slug: string): CatalogBuildItem {
+  return allBuilds().find((build) => build.slug === slug)!;
 }
 
 /** Write a download completion marker naming `repo` into `<modelsDir>/<name>`. */
@@ -790,11 +1055,11 @@ function writeCompletion(
   );
 }
 
-describe('catalogWithState — a recommended model is identified by download provenance', () => {
-  // The Qwen3.8-27B recommendation is an mxfp4 qwen3_5 checkpoint. MX block
-  // scaling fixes the block at 32, so bits=4 / group_size=32 is a FORMAT CONSTANT
-  // shared by every mxfp4 checkpoint of the family — config shape cannot tell two
-  // different weight sets apart, only a recorded repo can.
+describe('catalogWithState — a catalog build is identified by download provenance', () => {
+  // A checkpoint of mxfp4 qwen3_5 shape. MX block scaling fixes the block at 32,
+  // so bits=4 / group_size=32 is a FORMAT CONSTANT shared by every mxfp4
+  // checkpoint of the family — config shape cannot tell two different weight
+  // sets apart, only a recorded repo can.
   const QWEN_27B_MXFP4 = JSON.stringify({
     model_type: 'qwen3_5',
     quantization: { bits: 4, mode: 'mxfp4', group_size: 32 },
@@ -805,8 +1070,8 @@ describe('catalogWithState — a recommended model is identified by download pro
     // the catalog label. Marking it present disables the ONLY Install affordance on
     // the Models page, hard-blocking the user from installing the real checkpoint.
     writeModel(modelsDir, 'qwen3.8-27b-custom', QWEN_27B_MXFP4, 2048);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
-    expect(catalogItem(RECOMMENDED.label).installed).toBe(false);
+    expect(buildItem(SOLE_SLUG).present).toBe(false);
+    expect(buildItem(SOLE_SLUG).installed).toBe(false);
   });
 
   it('marks present for a renamed folder carrying our completion marker for this repo', () => {
@@ -814,15 +1079,15 @@ describe('catalogWithState — a recommended model is identified by download pro
     // dashboard install the user renamed is still recognized, because the marker
     // pins WHICH repo those bytes came from.
     writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
-    writeCompletion('renamed-by-hand', RECOMMENDED_REPO);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
+    writeCompletion('renamed-by-hand', SOLE_REPO);
+    expect(buildItem(SOLE_SLUG).present).toBe(true);
   });
 
   it('marks present for a complete CLI install under the canonical slug', () => {
     // `mlx download` writes no marker, so provenance comes from the slug itself.
-    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
-    expect(catalogItem(RECOMMENDED.label).installed).toBe(false);
+    writeModel(modelsDir, SOLE_SLUG, QWEN_27B_MXFP4, 2048);
+    expect(buildItem(SOLE_SLUG).present).toBe(true);
+    expect(buildItem(SOLE_SLUG).installed).toBe(false);
   });
 
   it('does NOT cross-match a marker that names a different repo', () => {
@@ -833,15 +1098,15 @@ describe('catalogWithState — a recommended model is identified by download pro
     });
     writeModel(modelsDir, 'qwen3.6-35b-a3b-nvfp4-mlx', MOE_NVFP4, 2048);
     writeCompletion('qwen3.6-35b-a3b-nvfp4-mlx', 'Brooooooklyn/Qwen3.6-35B-A3B-nvfp4-mlx');
-    expect(catalogItem('Qwen-AgentWorld-35B-A3B').present).toBe(false);
+    expect(allBuilds().filter((item) => item.present)).toEqual([]);
   });
 
   it('reports the marker revision as localRevision for an owned canonical install', () => {
     // The read half of the update check: a re-upload lands new bytes at the SAME
     // repo id, so only this recorded sha can tell the user their copy is stale.
-    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
-    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED_REPO);
-    const item = catalogItem(RECOMMENDED.label);
+    writeModel(modelsDir, SOLE_SLUG, QWEN_27B_MXFP4, 2048);
+    writeCompletion(SOLE_SLUG, SOLE_REPO);
+    const item = buildItem(SOLE_SLUG);
     expect(item.installed).toBe(true);
     expect(item.localRevision).toBe('a'.repeat(40));
   });
@@ -849,8 +1114,8 @@ describe('catalogWithState — a recommended model is identified by download pro
   it('reports localRevision null for a markerless CLI install', () => {
     // No marker means the sha is genuinely unknowable. Null must read as "no
     // update badge", never as "up to date".
-    writeModel(modelsDir, RECOMMENDED_SLUG, QWEN_27B_MXFP4, 2048);
-    const item = catalogItem(RECOMMENDED.label);
+    writeModel(modelsDir, SOLE_SLUG, QWEN_27B_MXFP4, 2048);
+    const item = buildItem(SOLE_SLUG);
     expect(item.present).toBe(true);
     expect(item.localRevision).toBeNull();
   });
@@ -860,8 +1125,8 @@ describe('catalogWithState — a recommended model is identified by download pro
     // is false, and the runner would refuse to re-install over the unowned
     // canonical slug — so an update affordance here could only ever fail.
     writeModel(modelsDir, 'renamed-by-hand', QWEN_27B_MXFP4, 2048);
-    writeCompletion('renamed-by-hand', RECOMMENDED_REPO);
-    const item = catalogItem(RECOMMENDED.label);
+    writeCompletion('renamed-by-hand', SOLE_REPO);
+    const item = buildItem(SOLE_SLUG);
     expect(item.present).toBe(true);
     expect(item.installed).toBe(false);
     expect(item.localRevision).toBeNull();
@@ -881,10 +1146,10 @@ describe('catalogWithState — a recommended model is identified by download pro
     // assertion is unchanged: provenance matching is per RESOLVED repo, so a
     // checkpoint from a repo this platform does not install is never "present".
     const other = RETIRED_PLATFORM_ALIAS;
-    expect(other).not.toBe(RECOMMENDED_REPO);
+    expect(other).not.toBe(SOLE_REPO);
     writeModel(modelsDir, 'other-platform-build', QWEN_27B_MXFP4, 2048);
     writeCompletion('other-platform-build', other);
-    const item = catalogItem(RECOMMENDED.label);
+    const item = buildItem(SOLE_SLUG);
     expect(item.present).toBe(false);
     expect(item.installed).toBe(false);
     // And the card therefore still offers the install rather than a dead button.
@@ -894,8 +1159,8 @@ describe('catalogWithState — a recommended model is identified by download pro
   it('does NOT mark present when the marker survived but the checkpoint did not', () => {
     // The marker records what was published, not what is still there: a dir gutted
     // down to its marker is not a loadable checkpoint.
-    writeCompletion('gutted', RECOMMENDED_REPO);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
+    writeCompletion('gutted', SOLE_REPO);
+    expect(buildItem(SOLE_SLUG).present).toBe(false);
   });
 });
 
@@ -904,23 +1169,23 @@ describe('catalogWithState — sidecar provenance reaches update discovery', () 
     // Update discovery compares BOTH repo/revision pairs: a tokenizer fix in
     // the base model moves nothing in the primary repo, so without this
     // provenance the badge never appears and the repair job cannot run.
-    const entry = MODEL_CATALOG.find((item) => item.assetsRepo !== undefined && !item.hidden)!;
-    const slug = catalogSlug(entry);
+    const build = catalogBuild('Hy4-flash', 'Q4_K_M');
+    const slug = catalogBuildSlug(build);
     writeModel(modelsDir, slug, CONFIG_A, 2048);
-    writeCompletion(slug, catalogRepo(entry), ['config.json', 'model.safetensors'], {
-      repo: entry.assetsRepo!,
+    writeCompletion(slug, catalogBuildRepo(build), ['config.json', 'model.safetensors'], {
+      repo: build.assetsRepo!,
       revision: 'b'.repeat(40),
     });
 
-    const item = catalogWithState(modelsDir).find((candidate) => candidate.hfRepo === catalogRepo(entry))!;
-    expect(item.localAssetsRepo).toBe(entry.assetsRepo);
+    const item = buildItem(slug);
+    expect(item.localAssetsRepo).toBe(build.assetsRepo);
     expect(item.localAssetsRevision).toBe('b'.repeat(40));
 
     // A marker without the fields (pre-provenance install) reports null, never
     // a value that could compare as "up to date".
     writeModel(modelsDir, 'plain-install', CONFIG_A, 2048);
     writeCompletion('plain-install', 'owner/plain');
-    const plain = catalogWithState(modelsDir).find((candidate) => candidate.slug === 'plain-install');
+    const plain = allBuilds().find((candidate) => candidate.slug === 'plain-install');
     expect(plain).toBeUndefined();
   });
 });
@@ -944,24 +1209,24 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     // `present` is correctly false (the checkpoint cannot load), but Install would
     // hit the runner's ownership preflight and error every single time, so the card
     // must state the blockage instead of offering the button.
-    writePartialShardedInstall(RECOMMENDED_SLUG);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
+    writePartialShardedInstall(SOLE_SLUG);
+    expect(buildItem(SOLE_SLUG).present).toBe(false);
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(true);
   });
 
   it('flags an occupant with no config.json at all as blocked', () => {
     // Ctrl-C during the CLI's manifest fetch leaves a bare directory. Model
     // discovery folds it into the skipped-directories warning, so this state has no
     // Delete row to recover through — all the more reason not to offer Install.
-    mkdirSync(join(modelsDir, RECOMMENDED_SLUG), { recursive: true });
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
+    mkdirSync(join(modelsDir, SOLE_SLUG), { recursive: true });
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(true);
   });
 
   it('flags a dangling symlink at the slug as blocked (no-follow occupancy)', () => {
     // `existsSync` FOLLOWS the link and reads it as absent; the runner's preflight
     // is `lstat`-based and refuses it, so catalog state must be `lstat`-based too.
-    symlinkSync(join(modelsDir, 'no-such-target'), join(modelsDir, RECOMMENDED_SLUG));
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
+    symlinkSync(join(modelsDir, 'no-such-target'), join(modelsDir, SOLE_SLUG));
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(true);
   });
 
   it('admits a LIVE symlink to an external checkpoint as present, not blocked', () => {
@@ -972,18 +1237,18 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     const external = mkdtempSync(join(tmpdir(), 'dash-ext-ckpt-'));
     writeFileSync(join(external, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
     writeFileSync(join(external, 'model.safetensors'), Buffer.alloc(2048));
-    const link = join(modelsDir, RECOMMENDED_SLUG);
+    const link = join(modelsDir, SOLE_SLUG);
     symlinkSync(external, link);
     try {
       // The link is LIVE — without this the case would hold for the wrong reason.
       expect(existsSync(join(link, 'config.json'))).toBe(true);
       expect(isModelPresent(link)).toBe(true);
-      const item = catalogItem(RECOMMENDED.label);
+      const item = buildItem(SOLE_SLUG);
       expect(item.present).toBe(true);
       expect(item.installed).toBe(false);
       expect(item.blockedByForeignDir).toBe(false);
       // Discovery admits the same linked dir the catalog now calls present.
-      expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).toContain(RECOMMENDED_SLUG);
+      expect(discoverLocalModels(modelsDir).models.map((model) => model.name)).toContain(SOLE_SLUG);
     } finally {
       rmSync(external, { recursive: true, force: true });
     }
@@ -997,15 +1262,15 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
     const foreign = join(external, DOWNLOAD_COMPLETE_MARKER);
     writeFileSync(
       foreign,
-      JSON.stringify({ repo: RECOMMENDED_REPO, revision: 'd'.repeat(40), files: ['config.json'], completedAt: 'x' }),
+      JSON.stringify({ repo: SOLE_REPO, revision: 'd'.repeat(40), files: ['config.json'], completedAt: 'x' }),
     );
-    const victim = join(modelsDir, RECOMMENDED_SLUG);
+    const victim = join(modelsDir, SOLE_SLUG);
     mkdirSync(victim, { recursive: true });
     writeFileSync(join(victim, 'PRECIOUS.txt'), 'hand-made, not ours');
     symlinkSync(foreign, join(victim, DOWNLOAD_COMPLETE_MARKER));
 
-    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(true);
+    expect(buildItem(SOLE_SLUG).present).toBe(false);
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(true);
 
     rmSync(external, { recursive: true, force: true });
   });
@@ -1013,17 +1278,120 @@ describe('catalogWithState — an occupied, unowned slug dir blocks Install', ()
   it('leaves an OWNED but incomplete dir installable', () => {
     // Our marker is there, so the preflight permits the owned swap and a reinstall
     // genuinely works — blocking it would remove the one recovery that functions.
-    writeCompletion(RECOMMENDED_SLUG, RECOMMENDED_REPO);
-    writeFileSync(join(modelsDir, RECOMMENDED_SLUG, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
-    expect(catalogItem(RECOMMENDED.label).present).toBe(false);
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
+    writeCompletion(SOLE_SLUG, SOLE_REPO);
+    writeFileSync(join(modelsDir, SOLE_SLUG, 'config.json'), JSON.stringify({ model_type: 'qwen3_5' }));
+    expect(buildItem(SOLE_SLUG).present).toBe(false);
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(false);
   });
 
   it('is not blocked when the slug is free, nor when a complete install occupies it', () => {
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
-    writeModel(modelsDir, RECOMMENDED_SLUG, JSON.stringify({ model_type: 'qwen3_5' }), 2048);
-    expect(catalogItem(RECOMMENDED.label).present).toBe(true);
-    expect(catalogItem(RECOMMENDED.label).blockedByForeignDir).toBe(false);
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(false);
+    writeModel(modelsDir, SOLE_SLUG, JSON.stringify({ model_type: 'qwen3_5' }), 2048);
+    expect(buildItem(SOLE_SLUG).present).toBe(true);
+    expect(buildItem(SOLE_SLUG).blockedByForeignDir).toBe(false);
+  });
+});
+
+describe('catalogWithState — two builds of one repository', () => {
+  const XL = catalogBuild('Qwen3.8-27B', 'UD-Q4_K_XL');
+  const M = catalogBuild('Qwen3.8-27B', 'UD-Q4_K_M');
+  const REPO = catalogBuildRepo(XL);
+  const XL_FILE = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+  const M_FILE = 'Qwen3.8-27B-UD-Q4_K_M.gguf';
+  const QWEN38 = JSON.stringify({ model_type: 'qwen3_5' });
+
+  /** A GGUF install of `file` in the folder `name`, with the shared marker the app and the CLI write. */
+  function writeGgufInstall(name: string, file: string): void {
+    const dir = join(modelsDir, name);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, 'config.json'), QWEN38);
+    writeFileSync(join(dir, file), ggufHeader('qwen35'));
+    writeCompletion(name, REPO, ['config.json', file]);
+  }
+
+  it('an install made before a second build existed stays the first build', () => {
+    // Today's folder, file and marker: the first build of a repository keeps its folder.
+    expect(catalogBuildSlug(XL)).toBe('qwen3.8-27b-gguf');
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({
+      id: 'UD-Q4_K_XL',
+      present: true,
+      installed: true,
+      heldBy: null,
+      blocker: null,
+      localRevision: 'a'.repeat(40),
+    });
+    // A UD-Q4_K_XL marker names the repository, not the build: UD-Q4_K_M is not on disk.
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m')).toMatchObject({
+      id: 'UD-Q4_K_M',
+      present: false,
+      installed: false,
+      heldBy: null,
+      blocker: null,
+      localRevision: null,
+    });
+  });
+
+  it('a renamed install of one build makes only that build present', () => {
+    writeGgufInstall('renamed-by-hand', M_FILE);
+    expect(buildItem(catalogBuildSlug(M))).toMatchObject({ present: true, installed: false });
+    expect(buildItem(catalogBuildSlug(XL))).toMatchObject({ present: false, installed: false });
+  });
+
+  it('a folder is the build it holds', () => {
+    // A hand run of `mlx download model -m unsloth/Qwen3.8-27B-GGUF -g '*UD-Q4_K_M*'`
+    // lands in the first build's folder and writes the shared marker.
+    writeGgufInstall('qwen3.8-27b-gguf', M_FILE);
+    expect(buildItem(catalogBuildSlug(M))).toMatchObject({ present: true, installed: false, heldBy: null });
+    expect(buildItem(catalogBuildSlug(XL))).toMatchObject({
+      present: false,
+      installed: false,
+      heldBy: 'UD-Q4_K_M',
+      blockedByForeignDir: false,
+      blocker: null,
+      localRevision: null,
+    });
+    expect(heldByOtherBuild(modelsDir, 'qwen3.8-27b-gguf')).toBe('UD-Q4_K_M');
+    expect(heldByOtherBuild(modelsDir, 'qwen3.8-27b-gguf-ud-q4_k_m')).toBeNull();
+  });
+
+  it('a build whose repository is its own is never held', () => {
+    writeModel(modelsDir, SOLE_SLUG, CONFIG_A, 8);
+    expect(buildItem(SOLE_SLUG)).toMatchObject({ present: true, heldBy: null });
+    expect(heldByOtherBuild(modelsDir, SOLE_SLUG)).toBeNull();
+  });
+  it('two installed builds are two folders, and Delete of one leaves the other', () => {
+    writeGgufInstall('qwen3.8-27b-gguf', XL_FILE);
+    writeGgufInstall('qwen3.8-27b-gguf-ud-q4_k_m', M_FILE);
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ installed: true, heldBy: null });
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m')).toMatchObject({ installed: true, heldBy: null });
+    // Each folder is one Local models row, labelled by its build.
+    const rows = discoverLocalModels(modelsDir, { includeStats: false }).models.filter((row) =>
+      row.name.startsWith('qwen3.8-27b'),
+    );
+    expect(rows.map((row) => [row.name, row.quant])).toEqual([
+      ['qwen3.8-27b-gguf', 'UD-Q4_K_XL'],
+      ['qwen3.8-27b-gguf-ud-q4_k_m', 'UD-Q4_K_M'],
+    ]);
+    deleteLocalModel(modelsDir, 'qwen3.8-27b-gguf-ud-q4_k_m');
+    expect(buildItem('qwen3.8-27b-gguf')).toMatchObject({ present: true, installed: true });
+    expect(buildItem('qwen3.8-27b-gguf-ud-q4_k_m')).toMatchObject({ present: false, installed: false });
+  });
+
+  it('a folder of a model that left the catalog still lists in Local models', () => {
+    const dir = join(modelsDir, 'gemma-4-26b-a4b-it-gguf');
+    mkdirSync(dir);
+    writeFileSync(join(dir, 'config.json'), JSON.stringify({ model_type: 'gemma4' }));
+    writeFileSync(join(dir, 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'), ggufHeader('gemma4'));
+    writeCompletion('gemma-4-26b-a4b-it-gguf', 'unsloth/gemma-4-26B-A4B-it-GGUF', [
+      'config.json',
+      'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf',
+    ]);
+    expect(allBuilds().map((build) => build.slug)).not.toContain('gemma-4-26b-a4b-it-gguf');
+    const row = discoverLocalModels(modelsDir, { includeStats: false }).models.find(
+      (model) => model.name === 'gemma-4-26b-a4b-it-gguf',
+    );
+    expect(row?.quant).toBe('UD-Q4_K_XL');
   });
 });
 
@@ -1043,6 +1411,291 @@ describe('isModelPresent — a companion GGUF is not a loadable checkpoint', () 
     // The real target beside it still counts.
     writeFileSync(join(dir, 'gemma-4-26B-A4B-it-UD-Q4_K_XL.gguf'), Buffer.alloc(64));
     expect(isModelPresent(dir)).toBe(true);
+  });
+});
+
+describe('isModelPresent — a GGUF in a variant folder one level down', () => {
+  const QWEN35 = JSON.stringify({ model_type: 'qwen3_5' });
+  const TARGET = 'Qwen3.8-27B-UD-Q4_K_XL.gguf';
+  const shard = (part: number): string => `Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`;
+
+  function plant(name: string, files: Record<string, string | Buffer>): string {
+    const dir = join(modelsDir, name);
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+    return dir;
+  }
+
+  it('is present with config.json at the root and a target GGUF in the variant folder', () => {
+    expect(isModelPresent(plant('single', { 'config.json': QWEN35, [`UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(true);
+    const split = plant('split', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([1, 2, 3, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(split)).toBe(true);
+  });
+
+  it('is not present without the root config.json', () => {
+    expect(isModelPresent(plant('no-config', { [`UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(false);
+  });
+
+  it('is not present when the variant folder holds only companion files', () => {
+    const dir = plant('companions', {
+      'config.json': QWEN35,
+      'UD-Q4_K_XL/mmproj-BF16.gguf': 'x',
+      'MTP/mtp-Qwen3.8-Flash-Next-Q8_0.gguf': 'x',
+      'UD-Q4_K_XL/imatrix_unsloth.gguf_file': 'x',
+      'dspark/dspark-Inkling-2-Mini-BF16.gguf': 'x',
+    });
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('counts a split set only from its first part and only with every part beside it', () => {
+    const missing = plant('missing-part', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([1, 2, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(missing)).toBe(false);
+    const noFirst = plant('no-first-part', {
+      'config.json': QWEN35,
+      ...Object.fromEntries([2, 3, 4].map((part) => [`UD-Q4_K_XL/${shard(part)}`, 'w'])),
+    });
+    expect(isModelPresent(noFirst)).toBe(false);
+    mkdirSync(join(missing, 'UD-Q4_K_XL', shard(3)));
+    expect(isModelPresent(missing)).toBe(false);
+  });
+
+  it('follows a link to a variant folder, like the top level, and never a dangling one', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-variant-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    const dir = plant('linked', { 'config.json': QWEN35 });
+    symlinkSync(join(external, 'gone'), join(dir, 'UD-Q4_K_XL'));
+    expect(isModelPresent(dir)).toBe(false);
+    rmSync(join(dir, 'UD-Q4_K_XL'));
+    symlinkSync(external, join(dir, 'UD-Q4_K_XL'));
+    expect(isModelPresent(dir)).toBe(false);
+    writeFileSync(join(external, TARGET), 'w');
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('follows a link to a GGUF file in the variant folder', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-variant-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, 'blob'), 'w');
+    const dir = plant('linked-file', { 'config.json': QWEN35 });
+    mkdirSync(join(dir, 'UD-Q4_K_XL'));
+    symlinkSync(join(external, 'blob'), join(dir, 'UD-Q4_K_XL', TARGET));
+    expect(isModelPresent(dir)).toBe(true);
+  });
+
+  it('reads types, never names: a file named like a folder, a folder named like a GGUF', () => {
+    expect(isModelPresent(plant('file-folder', { 'config.json': QWEN35, 'UD-Q4_K_XL': 'w' }))).toBe(false);
+    const dir = plant('folder-gguf', { 'config.json': QWEN35 });
+    mkdirSync(join(dir, 'UD-Q4_K_XL', TARGET), { recursive: true });
+    expect(isModelPresent(dir)).toBe(false);
+  });
+
+  it('never reads two folders down or a dot-folder', () => {
+    expect(isModelPresent(plant('deep', { 'config.json': QWEN35, [`a/UD-Q4_K_XL/${TARGET}`]: 'w' }))).toBe(false);
+    expect(isModelPresent(plant('dot', { 'config.json': QWEN35, [`.cache/${TARGET}`]: 'w' }))).toBe(false);
+  });
+
+  it('never reads variant folders beside primary safetensors, nor a variant folder that holds them', () => {
+    const root = plant('root-shards', {
+      'config.json': QWEN35,
+      'model-00001-of-00002.safetensors': 'w',
+      [`UD-Q4_K_XL/${TARGET}`]: 'w',
+    });
+    expect(isModelPresent(root)).toBe(false);
+    const converted = plant('converted-variant', {
+      'config.json': QWEN35,
+      'mlx/model.safetensors': 'w',
+      [`mlx/${TARGET}`]: 'w',
+    });
+    expect(isModelPresent(converted)).toBe(false);
+  });
+
+  it.each<[string, Record<string, string | Buffer>]>([
+    ['a target GGUF in a variant folder', { [`UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a GGUF two folders down', { [`a/UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a GGUF in a dot-folder', { [`.cache/${TARGET}`]: ggufHeader('qwen35') }],
+    ['a projector in a variant folder', { 'UD-Q4_K_XL/mmproj-BF16.gguf': ggufHeader('clip') }],
+    [
+      'a GGUF in a variant folder beside root primary safetensors',
+      { 'model-00001-of-00002.safetensors': 'w', [`UD-Q4_K_XL/${TARGET}`]: ggufHeader('qwen35') },
+    ],
+  ])('agrees with discovery on %s', async (_name, files) => {
+    const home = mkdtempSync(join(tmpdir(), 'dash-variant-home-'));
+    onTestFinished(() => rmSync(home, { recursive: true, force: true }));
+    const entry = join(home, 'entry');
+    for (const [file, body] of Object.entries({ 'config.json': QWEN35, 'tokenizer.json': '{}', ...files })) {
+      mkdirSync(dirname(join(entry, file)), { recursive: true });
+      writeFileSync(join(entry, file), body);
+    }
+    const listsGguf = (await discoverLocalChatModels(home)).some((model) => model.format === 'gguf');
+    expect(isModelPresent(entry)).toBe(listsGguf);
+  });
+});
+
+describe('discoverLocalModels — GGUF weights take their quant label from the GGUF file name', () => {
+  /** The fields of `thinkingmachines/Inkling-2-Mini`'s config.json this list reads: a quant block, no position limit. */
+  const INKLING_BASE = JSON.stringify({
+    model_type: 'inkling2_loop',
+    quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' },
+    mtp_config: { max_position_embeddings: 1048576 },
+    text_config: { model_type: 'inkling2_loop_text', model_max_length: 1048576 },
+  });
+  const QWEN38 = JSON.stringify({ model_type: 'qwen3_5', text_config: { max_position_embeddings: 262144 } });
+
+  function plant(name: string, files: Record<string, string | Buffer>): void {
+    const dir = join(modelsDir, name);
+    for (const [file, body] of Object.entries(files)) {
+      mkdirSync(dirname(join(dir, file)), { recursive: true });
+      writeFileSync(join(dir, file), body);
+    }
+  }
+
+  function listed(name: string): { quant: string | null; contextWindow: number | null } {
+    const model = discoverLocalModels(modelsDir, { includeStats: false }).models.find((m) => m.name === name);
+    if (model === undefined) throw new Error(`${name} is not listed`);
+    return { quant: model.quant, contextWindow: model.contextWindow };
+  }
+
+  it('a root GGUF beside a base config with a quant block takes the build of the file, never the block', () => {
+    plant('inkling-2-mini-gguf', {
+      'config.json': INKLING_BASE,
+      'Inkling-2-Mini-UD-Q4_K_XL.gguf': ggufHeader('inkling2'),
+      'mmproj-BF16.gguf': '',
+      'dspark-Inkling-2-Mini-Q8_0.gguf': '',
+    });
+    expect(listed('inkling-2-mini-gguf')).toEqual({ quant: 'UD-Q4_K_XL', contextWindow: 1048576 });
+  });
+
+  it('a modelopt safetensors folder takes its algorithm in lower case', () => {
+    plant('inkling-2-mini', { 'config.json': INKLING_BASE, 'model-00001-of-00001.safetensors': Buffer.alloc(8) });
+    writeFileSync(
+      join(modelsDir, 'inkling-2-mini', 'model.safetensors.index.json'),
+      JSON.stringify({ weight_map: { 'a.weight': 'model-00001-of-00001.safetensors' } }),
+    );
+    expect(listed('inkling-2-mini')).toEqual({ quant: 'nvfp4', contextWindow: 1048576 });
+  });
+
+  it('a root GGUF beside a base config with no quant block is not full precision', () => {
+    plant('qwen3.8-27b-gguf', { 'config.json': QWEN38, 'Qwen3.8-27B-UD-Q4_K_XL.gguf': '' });
+    expect(listed('qwen3.8-27b-gguf')).toEqual({ quant: 'UD-Q4_K_XL', contextWindow: 262144 });
+  });
+
+  it('a root GGUF whose extension is upper case counts like one in a variant folder', () => {
+    plant('upper-root', { 'config.json': QWEN38, 'Qwen3.8-27B-UD-Q4_K_XL.GGUF': '' });
+    expect(listed('upper-root').quant).toBe('UD-Q4_K_XL');
+    expect(isModelPresent(join(modelsDir, 'upper-root'))).toBe(true);
+  });
+
+  it('a root GGUF that is a later split part is no build', () => {
+    plant('stray-part', {
+      'config.json': QWEN38,
+      'Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+      'Qwen3.8-27B-Q8_0-00002-of-00002.gguf': '',
+    });
+    expect(listed('stray-part').quant).toBe('UD-Q4_K_XL');
+  });
+
+  it('a split set in a variant folder takes its build, from the file name or else the folder name', () => {
+    plant('qwen3.8-flash-next-gguf', {
+      'config.json': QWEN38,
+      ...Object.fromEntries(
+        [1, 2, 3, 4].map((part) => [`UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-0000${part}-of-00004.gguf`, '']),
+      ),
+    });
+    expect(listed('qwen3.8-flash-next-gguf').quant).toBe('UD-Q4_K_XL');
+    plant('tag-only-file', { 'config.json': QWEN38, 'BF16/model-00001-of-00001.gguf': '' });
+    expect(listed('tag-only-file').quant).toBe('BF16');
+  });
+
+  it('companion GGUFs never give the label', () => {
+    plant('hy4-flash-gguf', {
+      'config.json': JSON.stringify({ model_type: 'hy_v4_flash', quantization_config: { quant_method: 'fp8' } }),
+      'Hy4-flash-Q4_K_M-00001-of-00002.gguf': '',
+      'Hy4-flash-Q4_K_M-00002-of-00002.gguf': '',
+      'mmproj-Hy4-flash-bf16.gguf': '',
+      'mtp-Hy4-flash-Q8_0.gguf': '',
+    });
+    expect(listed('hy4-flash-gguf').quant).toBe('Q4_K_M');
+    // Companions alone are no GGUF weights: the config's label stays.
+    plant('projector-only', {
+      'config.json': JSON.stringify({ model_type: 'gemma4', quantization: { mode: 'mxfp4', bits: 4 } }),
+      'mmproj-BF16.gguf': '',
+      'UD-Q4_K_XL/mmproj-F16.gguf': '',
+    });
+    expect(listed('projector-only').quant).toBe('mxfp4');
+  });
+
+  it('a folder whose weights are safetensors keeps the config label, a GGUF beside them included', () => {
+    expect(listed('model-a').quant).toBeNull();
+    expect(listed('model-b').quant).toBe('affine-4bit');
+    plant('converted', {
+      'config.json': JSON.stringify({ model_type: 'qwen3_5', quantization: { mode: 'mxfp4', bits: 4 } }),
+      'model-00001-of-00002.safetensors': '',
+      'Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+      'UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf': '',
+    });
+    expect(listed('converted').quant).toBe('mxfp4');
+  });
+
+  it('a folder with two builds names none of them, at the root or in variant folders', () => {
+    plant('two-root', { 'config.json': QWEN38, 'Qwen3.8-27B-Q4_K_M.gguf': '', 'Qwen3.8-27B-Q8_0.gguf': '' });
+    expect(listed('two-root').quant).toBe('GGUF');
+    plant('two-variants', {
+      'config.json': QWEN38,
+      'Q4_K_M/Qwen3.8-27B-Q4_K_M.gguf': '',
+      'Q8_0/Qwen3.8-27B-Q8_0.gguf': '',
+    });
+    expect(listed('two-variants').quant).toBe('GGUF');
+    // A variant folder whose split set misses a part is not a build.
+    plant('one-whole-variant', {
+      'config.json': QWEN38,
+      'Q4_K_M/Qwen3.8-27B-Q4_K_M.gguf': '',
+      'Q8_0/Qwen3.8-27B-Q8_0-00001-of-00002.gguf': '',
+    });
+    expect(listed('one-whole-variant').quant).toBe('Q4_K_M');
+    // A name that states no build.
+    plant('unnamed', { 'config.json': QWEN38, 'model.gguf': '' });
+    expect(listed('unnamed').quant).toBe('GGUF');
+  });
+
+  it.each<[string, Record<string, unknown>, number | null]>([
+    [
+      'root max_position_embeddings over everything',
+      {
+        max_position_embeddings: 40960,
+        model_max_length: 8192,
+        text_config: { max_position_embeddings: 1, model_max_length: 2 },
+      },
+      40960,
+    ],
+    [
+      'text_config max_position_embeddings over both model_max_length',
+      { model_max_length: 8192, text_config: { max_position_embeddings: 262144, model_max_length: 2 } },
+      262144,
+    ],
+    [
+      'text_config model_max_length over the root one',
+      { model_max_length: 8192, text_config: { model_max_length: 1048576 } },
+      1048576,
+    ],
+    ['root model_max_length last', { model_max_length: 8192 }, 8192],
+    [
+      'a model_max_length that is not a positive safe integer',
+      { model_max_length: 1e30, text_config: { model_max_length: 4096.5 } },
+      null,
+    ],
+    ['a zero or negative model_max_length', { model_max_length: 0, text_config: { model_max_length: -1 } }, null],
+    ['nothing stated', {}, null],
+  ])('context window: %s', (_name, fields, window) => {
+    writeModel(modelsDir, 'ctx', JSON.stringify({ model_type: 'qwen3', ...fields }), 8);
+    expect(listed('ctx').contextWindow).toBe(window);
   });
 });
 
@@ -1075,7 +1728,8 @@ describe('isWeightFile — companion GGUFs (projector, calibration, draft, MTP) 
 
 describe('catalog blocker: what is in the way, measured without following or opening', () => {
   const QWEN = MODEL_CATALOG.find((entry) => entry.label === 'Qwen3.8-27B')!;
-  const slugDir = (): string => join(modelsDir, catalogSlug(QWEN));
+  const QWEN_SLUG = catalogBuildSlug(QWEN.builds[0]);
+  const slugDir = (): string => join(modelsDir, QWEN_SLUG);
   const draftDir = (): string => join(modelsDir, QWEN.draft!.hfRepo.split('/')[1]!.toLowerCase());
 
   it.each<[string, () => void, boolean]>([
@@ -1083,10 +1737,10 @@ describe('catalog blocker: what is in the way, measured without following or ope
     ['a foreign directory', () => mkdirSync(slugDir()), true],
     [
       'an owned partial directory',
-      () => writeCompletion(catalogSlug(QWEN), catalogRepo(QWEN), ['config.json', 'model.safetensors']),
+      () => writeCompletion(QWEN_SLUG, catalogBuildRepo(QWEN.builds[0]), ['config.json', 'model.safetensors']),
       false,
     ],
-    ['a present CLI install', () => writeModel(modelsDir, catalogSlug(QWEN), CONFIG_A, 8), false],
+    ['a present CLI install', () => writeModel(modelsDir, QWEN_SLUG, CONFIG_A, 8), false],
     ['a dangling link', () => symlinkSync(join(modelsDir, 'nowhere'), slugDir()), true],
     ['a file', () => writeFileSync(slugDir(), 'x'), true],
     [
@@ -1100,9 +1754,9 @@ describe('catalog blocker: what is in the way, measured without following or ope
   ])('blocker is set exactly when blockedByForeignDir is (%s)', (name, plant, blocked) => {
     plant();
     const items = catalogWithState(modelsDir);
-    expect(items.find((item) => item.label === QWEN.label)!.blockedByForeignDir).toBe(blocked);
+    expect(items.find((item) => item.label === QWEN.label)!.builds[0].blockedByForeignDir).toBe(blocked);
     for (const item of items) {
-      expect(item.blocker !== null, item.slug).toBe(item.blockedByForeignDir);
+      for (const build of item.builds) expect(build.blocker !== null, build.slug).toBe(build.blockedByForeignDir);
       if (item.draft !== undefined)
         expect(item.draft.blocker !== null, item.draft.slug).toBe(item.draft.blockedByForeignDir);
     }
@@ -1112,7 +1766,7 @@ describe('catalog blocker: what is in the way, measured without following or ope
   it('describes a one-file leftover directory', () => {
     mkdirSync(slugDir());
     writeFileSync(join(slugDir(), 'imatrix_unsloth.gguf_file'), Buffer.alloc(183));
-    expect(catalogItem('Qwen3.8-27B').blocker).toEqual({
+    expect(buildItem(QWEN_SLUG).blocker).toEqual({
       kind: 'directory',
       fileCount: 1,
       sizeBytes: 183,
@@ -1123,7 +1777,65 @@ describe('catalog blocker: what is in the way, measured without following or ope
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     });
+  });
+
+  it.each<[string, number]>([
+    ['cannot be read or written', 0o000],
+    ['can be read but not written', 0o500],
+  ])('marks a folder the app has no write permission on as locked: one that %s', (_name, mode) => {
+    mkdirSync(slugDir());
+    writeFileSync(join(slugDir(), 'notes.txt'), 'x');
+    chmodSync(slugDir(), mode);
+    try {
+      expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'directory', locked: true });
+    } finally {
+      chmodSync(slugDir(), 0o755);
+    }
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'directory', locked: false });
+  });
+
+  it('never marks a link or a file as locked, whatever its target or mode', () => {
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => {
+      chmodSync(external, 0o755);
+      rmSync(external, { recursive: true, force: true });
+    });
+    chmodSync(external, 0o500);
+    symlinkSync(external, slugDir());
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'symlink', locked: false, linkTarget: external });
+    rmSync(slugDir());
+    writeFileSync(slugDir(), 'x');
+    chmodSync(slugDir(), 0o400);
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'file', locked: false });
+  });
+
+  it('cuts the link text at 200 characters, and compares it when it matches an echo', () => {
+    const long = `${'a'.repeat(250)}`;
+    symlinkSync(long, slugDir());
+    expect(readLinkText(slugDir())).toBe(`${'a'.repeat(200)}…`);
+    expect(readLinkText(modelsDir)).toBeNull();
+    const now = buildItem(QWEN_SLUG).blocker!;
+    expect(now.linkTarget).toBe(`${'a'.repeat(200)}…`);
+    expect(sameForeignEntry(now, { ...now })).toBe(true);
+    expect(sameForeignEntry(now, { ...now, linkTarget: 'b' })).toBe(false);
+    expect(sameForeignEntry(now, { ...now, linkTarget: null })).toBe(false);
+  });
+
+  it('says whether Local models lists the folder of a build', () => {
+    expect(buildItem(QWEN_SLUG).listed).toBe(false);
+    writeModel(modelsDir, QWEN_SLUG, CONFIG_A, 8);
+    expect(buildItem(QWEN_SLUG).listed).toBe(true);
+    rmSync(slugDir(), { recursive: true });
+    const external = mkdtempSync(join(tmpdir(), 'dash-ext-'));
+    onTestFinished(() => rmSync(external, { recursive: true, force: true }));
+    writeFileSync(join(external, GGUF), ggufHeader('gemma4'));
+    symlinkSync(external, slugDir());
+    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: false, blocker: { kind: 'symlink', listed: false } });
+    writeFileSync(join(external, GGUF), ggufHeader('qwen35'));
+    expect(buildItem(QWEN_SLUG)).toMatchObject({ listed: true, present: true, blocker: null });
   });
 
   it('names up to three files, sorted, with their relative paths; none for four', () => {
@@ -1293,15 +2005,16 @@ describe('catalog blocker: what is in the way, measured without following or ope
 
   it('describes a file at the slug path by its own size', () => {
     writeFileSync(slugDir(), Buffer.alloc(40));
-    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({ kind: 'file', fileCount: 1, sizeBytes: 40, names: [] });
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({ kind: 'file', fileCount: 1, sizeBytes: 40, names: [] });
   });
 
   it('never follows a link: dangling or live, its counts are 0', () => {
     const target = join(modelsDir, 'nowhere');
     symlinkSync(target, slugDir());
-    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
       kind: 'symlink',
       dangling: true,
+      linkToFile: false,
       linkTarget: target,
       fileCount: 0,
       sizeBytes: 0,
@@ -1311,9 +2024,19 @@ describe('catalog blocker: what is in the way, measured without following or ope
     onTestFinished(() => rmSync(external, { recursive: true, force: true }));
     writeFileSync(join(external, 'big.bin'), Buffer.alloc(1024 * 1024));
     symlinkSync(external, slugDir());
-    expect(catalogItem('Qwen3.8-27B').blocker).toMatchObject({
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
       kind: 'symlink',
       dangling: false,
+      linkToFile: false,
+      fileCount: 0,
+      sizeBytes: 0,
+    });
+    rmSync(slugDir());
+    symlinkSync(join(external, 'big.bin'), slugDir());
+    expect(buildItem(QWEN_SLUG).blocker).toMatchObject({
+      kind: 'symlink',
+      dangling: false,
+      linkToFile: true,
       fileCount: 0,
       sizeBytes: 0,
     });

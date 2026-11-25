@@ -23,10 +23,11 @@ function models(count: number, warnings: string[] = []): ModelsResponse {
       sizeBytes: 1,
       fileCount: 1,
       servedIds: [],
+      located: null,
+      link: false,
     })),
     warnings,
     dir: '/models',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
 }
 

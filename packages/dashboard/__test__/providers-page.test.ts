@@ -11,6 +11,7 @@ import {
   BILLING_PAGES,
   chatLines,
   checkKeyFormat,
+  crawlerOffNote,
   fill,
   KEY_PAGES,
   progressOf,
@@ -181,12 +182,22 @@ function leaks(text: string): string[] {
   return windows().filter((w) => text.includes(w));
 }
 
-const radios = (): HTMLElement[] => allByRole(page!.container, 'radio');
+/** The radios of one option list of the Use panel: the search provider list unless named. */
+const radios = (group: string = PROVIDERS.searchProvider): HTMLElement[] => {
+  const list = byRole(page!.container, 'radiogroup', group);
+  return list === null ? [] : allByRole(list, 'radio');
+};
 const radioTitle = (radio: Element): string => radio.children[1]?.children[0]?.textContent ?? '';
-const radioNames = (): string[] => radios().map(radioTitle);
-const checkedRadio = (): string | undefined => {
-  const checked = radios().find((r) => r.getAttribute('aria-checked') === 'true');
+const radioNote = (radio: Element): string => radio.children[1]?.children[1]?.textContent ?? '';
+const radioNames = (group?: string): string[] => radios(group).map(radioTitle);
+const checkedRadio = (group?: string): string | undefined => {
+  const checked = radios(group).find((r) => r.getAttribute('aria-checked') === 'true');
   return checked === undefined ? undefined : radioTitle(checked);
+};
+const crawlerRadio = (title: string): HTMLElement => {
+  const found = radios(PROVIDERS.crawler).find((r) => radioTitle(r) === title);
+  if (found === undefined) throw new Error(`no crawler option ${title}`);
+  return found;
 };
 
 describe('Now sentences', () => {
@@ -253,20 +264,18 @@ describe('Now sentences', () => {
 });
 
 describe('Web Search page', () => {
-  it('with no keys: four "No key" cards, no radios, the Firecrawl switch off, the always-on notice', async () => {
+  it('with no keys: four "No key" cards, no radios, no crawler to pick, the always-on notice', async () => {
     await open({ '/providers': response() }, PROVIDERS.noneConfigured);
     const text = page!.text();
     expect(page!.container.querySelector('h1')?.textContent).toBe('Web Search');
     expect(text).toContain(PROVIDERS.chatOff);
     expect(text).toContain(PROVIDERS.workNone);
-    expect(radios()).toHaveLength(0);
+    expect(allByRole(page!.container, 'radio')).toHaveLength(0);
     for (const name of ['Exa', 'DeepSeek', 'Brave', 'Firecrawl']) {
       expect(card(name).textContent).toContain(PROVIDERS.badgeNoKey);
       expect(keyField(card(name)).type).toBe('password');
     }
-    const sw = byRole(page!.container, 'switch');
-    expect(sw?.getAttribute('aria-checked')).toBe('false');
-    expect((sw as HTMLButtonElement).disabled).toBe(true);
+    expect(byRole(page!.container, 'switch')).toBeNull();
     expect(text).toContain(PROVIDERS.firecrawlNoKey);
     expect(text).toContain(PROVIDERS.leavesTitle);
     expect(text).not.toContain(PROVIDERS.historyTitle);
@@ -532,8 +541,8 @@ describe('Web Search page', () => {
 
   it('the radio group: arrow keys move focus and never select; Space selects and installs', async () => {
     const calls: ApiCall[] = [];
-    const before = response({ search: 'exa', configured: ['brave'] });
-    const after = response({ search: 'brave', configured: ['exa'] });
+    const before = response({ search: 'exa', configured: ['brave', 'firecrawl'] });
+    const after = response({ search: 'brave', configured: ['exa', 'firecrawl'] });
     const held = deferred(after);
     await open({ '/providers': before, '/providers/selection': held.body }, PROVIDERS.keySaved, calls);
     expect(radioNames()).toEqual(['Exa', 'Brave', 'Off']);
@@ -553,7 +562,7 @@ describe('Web Search page', () => {
 
     await key(brave!, ' ');
     await waitFor(() => page!.text().includes(PROVIDERS.installing));
-    expect(byRole(page!.container, 'switch')?.hasAttribute('disabled')).toBe(true);
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.crawler)?.getAttribute('aria-disabled')).toBe('true');
     expect(calls.filter((call) => call.method === 'PUT')).toEqual([
       { method: 'PUT', path: '/api/providers/selection', body: { search: 'brave' } },
     ]);
@@ -578,16 +587,16 @@ describe('Web Search page', () => {
     expect(page!.container.querySelector('[role="status"][aria-live="polite"]')?.textContent).toBe(PROVIDERS.offStatus);
   });
 
-  it('the Firecrawl switch installs its skills; a missing CLI changes its words and shows the install line', async () => {
+  it('picking Firecrawl installs its skills; a missing CLI changes its words and shows the install line', async () => {
     const calls: ApiCall[] = [];
     const missing = { work: { ready: false, missing: 'firecrawl-cli' as const } };
     const before = response({ configured: ['firecrawl'], over: { firecrawl: missing } });
     const after = response({ firecrawl: true, over: { firecrawl: missing } });
     await open({ '/providers': before, '/providers/selection': after }, PROVIDERS.keySaved, calls);
-    expect(page!.text()).toContain(PROVIDERS.firecrawlOff);
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.off);
     const fire = card('Firecrawl');
     expect(shownText(fire)).not.toContain(PROVIDERS.firecrawlCli);
-    await click(byRole(page!.container, 'switch')!);
+    await click(crawlerRadio('Firecrawl'));
     await waitFor(() => page!.text().includes('Installed: 5 Firecrawl skills'));
     expect(calls.filter((call) => call.method === 'PUT')[0]?.body).toEqual({ firecrawl: true });
     expect(page!.text()).toContain(PROVIDERS.firecrawlOnNoCli);
@@ -596,7 +605,7 @@ describe('Web Search page', () => {
     expect(shownText(card('Firecrawl'))).toContain(PROVIDERS.firecrawlCliChat);
     expect(shownText(card('Firecrawl'))).not.toContain(PROVIDERS.workKeyNotice);
     expect(page!.text()).toContain(`Work${PROVIDERS.workNoCli}.`);
-    expect(byRole(page!.container, 'switch')?.getAttribute('aria-checked')).toBe('true');
+    expect(checkedRadio(PROVIDERS.crawler)).toBe('Firecrawl');
   });
 
   it('removing the selected key: the confirm says so, then Off, the removed line and a toast', async () => {
@@ -659,7 +668,10 @@ describe('Web Search page', () => {
   });
 
   it('the Keychain cannot be reached: one alert, and every control is off', async () => {
-    await open({ '/providers': response({ search: 'exa', keychain: 'unavailable' }) }, PROVIDERS.keychainTitle);
+    await open(
+      { '/providers': response({ search: 'exa', configured: ['firecrawl'], keychain: 'unavailable' }) },
+      PROVIDERS.keychainTitle,
+    );
     expect(page!.text()).toContain(PROVIDERS.keychainText);
     expect(maybeButton(page!.container, PROVIDERS.tryAgain)).toBeDefined();
     for (const label of [PROVIDERS.check, PROVIDERS.replace, PROVIDERS.remove, PROVIDERS.save]) {
@@ -668,8 +680,8 @@ describe('Web Search page', () => {
         expect((b as HTMLButtonElement).disabled || b.getAttribute('aria-disabled') === 'true').toBe(true);
       }
     }
-    expect(byRole(page!.container, 'radiogroup')?.getAttribute('aria-disabled')).toBe('true');
-    expect(byRole(page!.container, 'switch')?.hasAttribute('disabled')).toBe(true);
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.searchProvider)?.getAttribute('aria-disabled')).toBe('true');
+    expect(byRole(page!.container, 'radiogroup', PROVIDERS.crawler)?.getAttribute('aria-disabled')).toBe('true');
     expect(button(page!.container, PROVIDERS.checkAll).disabled).toBe(true);
   });
 
@@ -780,5 +792,57 @@ describe('Web Search page', () => {
       '/api/providers/exa/validate',
       '/api/providers/firecrawl/validate',
     ]);
+  });
+});
+
+describe('the Crawler list', () => {
+  it('the Off note names who reads pages: the search provider, Brave excerpts, or nobody', () => {
+    expect(crawlerOffNote('exa')).toBe('Exa reads pages for Chat.');
+    expect(crawlerOffNote('deepseek')).toBe('DeepSeek reads pages for Chat.');
+    expect(crawlerOffNote('brave')).toBe(PROVIDERS.crawlerOffExcerpts);
+    expect(crawlerOffNote(null)).toBe(PROVIDERS.crawlerOffNone);
+  });
+
+  it('lists Firecrawl and Off only with a Firecrawl key', async () => {
+    const names = async (setup: Setup): Promise<string[]> => {
+      await open({ '/providers': response(setup) }, PROVIDERS.leavesTitle);
+      const out = radioNames(PROVIDERS.crawler);
+      page!.unmount();
+      dispose!();
+      page = undefined;
+      dispose = undefined;
+      return out;
+    };
+    expect(await names({ configured: ['firecrawl'] })).toEqual(['Firecrawl', PROVIDERS.off]);
+    expect(await names({ search: 'exa' })).toEqual([]);
+    expect(await names({})).toEqual([]);
+  });
+
+  it('each pick sends only `firecrawl`; the Off note follows the search provider', async () => {
+    const calls: ApiCall[] = [];
+    const before = response({ search: 'brave', configured: ['firecrawl'] });
+    const after = response({ search: 'brave', firecrawl: true });
+    await open({ '/providers': before, '/providers/selection': after }, PROVIDERS.keySaved, calls);
+    expect(checkedRadio(PROVIDERS.crawler)).toBe(PROVIDERS.off);
+    expect(radioNote(crawlerRadio(PROVIDERS.off))).toBe(PROVIDERS.crawlerOffExcerpts);
+    await click(crawlerRadio('Firecrawl'));
+    await waitFor(() => checkedRadio(PROVIDERS.crawler) === 'Firecrawl');
+    expect(page!.text()).toContain(fill(PROVIDERS.firecrawlOn, { n: 5 }));
+    expect(calls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([{ firecrawl: true }]);
+    page!.unmount();
+    dispose!();
+
+    const offCalls: ApiCall[] = [];
+    await open(
+      { '/providers': response({ firecrawl: true }), '/providers/selection': response({ configured: ['firecrawl'] }) },
+      PROVIDERS.keySaved,
+      offCalls,
+    );
+    expect(checkedRadio(PROVIDERS.crawler)).toBe('Firecrawl');
+    expect(radioNote(crawlerRadio(PROVIDERS.off))).toBe(PROVIDERS.crawlerOffNone);
+    await click(crawlerRadio(PROVIDERS.off));
+    await waitFor(() => checkedRadio(PROVIDERS.crawler) === PROVIDERS.off);
+    expect(page!.text()).not.toContain(fill(PROVIDERS.firecrawlOn, { n: 5 }));
+    expect(offCalls.filter((call) => call.method === 'PUT').map((call) => call.body)).toEqual([{ firecrawl: false }]);
   });
 });

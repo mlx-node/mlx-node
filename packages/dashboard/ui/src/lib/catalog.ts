@@ -1,58 +1,72 @@
 /** Pure helpers for catalog cards (Models) and the first-model choice (Onboarding). */
 
-import type { CatalogItem, ModelsResponse } from './types';
+import type { CatalogBuildItem, CatalogItem, HostResponse } from './types';
 
 const GIB = 2 ** 30;
 
-const BUILD_NAMES = new Set(['mxfp', 'mxfp4', 'mxfp8', 'nvfp', 'nvfp4', 'nvfp8']);
-
-/** The text between the stars of a glob like `*UD-Q4_K_XL*`, or null for any other shape. */
-function starredBuild(glob: string): string | null {
-  if (glob.length < 3 || !glob.startsWith('*') || !glob.endsWith('*')) return null;
-  const inner = glob.slice(1, -1);
-  if (inner.includes('.') || inner.includes('*')) return null;
-  return inner;
-}
-
-/** "UD-Q4_K_XL" from globs ['*UD-Q4_K_XL*', …]; else "MXFP4" / "NVFP4" / "MXFP8" from the repo name; else null. */
-export function catalogBuildLabel(item: Pick<CatalogItem, 'hfRepo' | 'globs'>): string | null {
-  for (const glob of item.globs ?? []) {
-    const build = starredBuild(glob);
-    if (build !== null) return build;
-  }
-  const slash = item.hfRepo.lastIndexOf('/');
-  const base = slash === -1 ? item.hfRepo : item.hfRepo.slice(slash + 1);
-  for (const part of base.split('-')) {
-    const lower = part.toLowerCase();
-    if (BUILD_NAMES.has(lower)) return part.toUpperCase();
-  }
-  return null;
-}
-
 /**
- * Whether the page offers `item` on this Mac: not hidden, and its memory floor met. An entry with a floor waits
- * for the host reading.
+ * Whether the page offers `item` on this machine: not hidden, platform supported, and memory floor met. An entry
+ * with a platform restriction or memory floor waits for the host reading.
  */
 export function offeredOnHost(
-  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb'>,
-  host: ModelsResponse['host'] | undefined,
+  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb' | 'platforms'>,
+  host: HostResponse | undefined,
 ): boolean {
   if (item.hidden === true) return false;
+  if (item.platforms !== undefined) {
+    if (host === undefined) return false;
+    if (host.platform !== undefined && !item.platforms.includes(host.platform)) return false;
+  }
   if (item.minMemoryGb === undefined) return true;
   return host !== undefined && host.totalMemBytes >= item.minMemoryGb * GIB;
 }
 
+/** The build that installs to the folder `slug`, from any entry. */
+export function catalogBuildAt(items: readonly CatalogItem[], slug: string): CatalogBuildItem | undefined {
+  for (const item of items) {
+    const build = item.builds.find((candidate) => candidate.slug === slug);
+    if (build !== undefined) return build;
+  }
+  return undefined;
+}
+
+/** A model counts as on this Mac when at least one of its builds is on disk. */
+export function modelPresent(item: Pick<CatalogItem, 'builds'>): boolean {
+  return item.builds.some((build) => build.present);
+}
+
+/** The build Onboarding stands a model for: the one with a job, else the first on disk, else the first. */
+export function onboardingBuild(item: Pick<CatalogItem, 'builds'>, activeSlugs: readonly string[]): CatalogBuildItem {
+  return (
+    item.builds.find((build) => activeSlugs.includes(build.slug)) ??
+    item.builds.find((build) => build.present) ??
+    item.builds[0]
+  );
+}
+
+/**
+ * The build a catalog card shows: the one the user chose on this page visit, else the one with a job, else the first
+ * on disk, else the first. `chosen` maps an entry label to a build folder.
+ */
+export function shownBuild(
+  item: Pick<CatalogItem, 'label' | 'builds'>,
+  chosen: Readonly<Record<string, string>>,
+  active: Readonly<Record<string, unknown>>,
+): CatalogBuildItem {
+  const picked = Object.hasOwn(chosen, item.label)
+    ? item.builds.find((build) => build.slug === chosen[item.label])
+    : undefined;
+  return picked ?? onboardingBuild(item, Object.keys(active));
+}
+
 /** One plain sentence about a catalog model. */
 export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'isDefault'>): string {
-  const label = item.label.toLowerCase();
-  if (label.includes('agentworld')) return 'Tuned for agent workflows, with fast responses.';
-  if (label.includes('gemma-4-26b')) return 'Fast responses, with a smaller download to get started.';
   if (item.isDefault === true) return 'Our recommended starting point for working with tools.';
   return item.description;
 }
 
 /**
- * Whether an installed catalog model has newer bytes upstream.
+ * Whether an installed catalog build has newer bytes upstream.
  *
  * Gated on `installed`, never `present`: only a dashboard-owned install at the
  * canonical slug carries a revision to compare AND can actually be re-installed.
@@ -60,7 +74,7 @@ export function modelBlurb(item: Pick<CatalogItem, 'label' | 'description' | 'is
  */
 export function hasUpdate(
   item: Pick<
-    CatalogItem,
+    CatalogBuildItem,
     'hfRepo' | 'installed' | 'localRevision' | 'assetsRepo' | 'localAssetsRepo' | 'localAssetsRevision'
   >,
   remoteRevisions: ReadonlyMap<string, string | null>,

@@ -20,6 +20,8 @@ use crate::engine::memory_plan::{
     lane_ceiling_for_physical_memory, max_memory_option,
     resolve_kv_format as resolve_kv_format_shared, select_max_lanes_preserving_window,
 };
+use crate::models::qwen3_5::dflash2::DFlash2Config;
+use crate::models::qwen3_5::draft_context::DraftContextWindow;
 use crate::transformer::{Activations, KvFormat};
 
 use super::config::Inkling2Config;
@@ -33,6 +35,10 @@ const LARGE_MACHINE_LANES: usize = 8;
 
 /// Target bytes per extent growth step for Inkling2's extent-grown Global KV pool (128 MiB).
 pub(crate) const INKLING2_EXTENT_TARGET_BYTES: u64 = 128 << 20;
+
+/// Fixed little-endian header prefix of Span 2 (`DraftContextWindow`) in a StateDisk blob:
+/// `[valid_flag: u32, window_begin: u32]`.
+pub(crate) const DRAFT_WINDOW_HEADER_BYTES: u64 = 8;
 
 /// Trained and physically available active-context limits for a loaded Inkling-2-Mini model.
 #[napi(object)]
@@ -179,18 +185,46 @@ pub(crate) fn swa_window_blob_bytes(
     Ok(blocks.saturating_mul(swa_bpb))
 }
 
+/// Exact byte size of Span 2 (`DraftContextWindow`) in a StateDisk blob:
+/// `0` when no DFlash2 draft is attached, else
+/// `DRAFT_WINDOW_HEADER_BYTES + DraftContextWindow::bytes(width, slots)`.
+pub(crate) fn draft_window_span_bytes(dflash2: Option<&DFlash2Config>) -> u64 {
+    match dflash2 {
+        Some(cfg) => DRAFT_WINDOW_HEADER_BYTES.saturating_add(DraftContextWindow::bytes(
+            cfg.context_width(),
+            cfg.sliding_window as u32,
+        )),
+        None => 0,
+    }
+}
+
 /// Exact byte size of one content-keyed Inkling2 state blob:
-/// `[40 SWA(1024) trailing KV window] + [48 ShortConv(k=4) ring states]`.
+/// `[40 SWA(1024) trailing KV window] + [48 ShortConv(k=4) ring states]` plus optional
+/// `[DraftContextWindow header + 4-bit ring]` when DFlash2 is attached.
 ///
-/// Constant regardless of context length (~84.3 MiB INT8 KTM on Inkling-2-Mini).
+/// Constant regardless of context length (~84.3 MiB INT8 KTM without DFlash2, ~86.8 MiB with
+/// DFlash2 on Inkling-2-Mini).
+pub(crate) fn state_blob_bytes_with_draft(
+    config: &Inkling2Config,
+    kv_format: KvFormat,
+    block_size: u32,
+    dflash2: Option<&DFlash2Config>,
+) -> Result<u64> {
+    let swa = swa_window_blob_bytes(config, kv_format, block_size)?;
+    let conv = short_conv_state_bytes(config);
+    Ok(swa
+        .saturating_add(conv)
+        .saturating_add(draft_window_span_bytes(dflash2)))
+}
+
+/// Exact byte size of one content-keyed Inkling2 state blob without a DFlash2 draft span.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn state_blob_bytes(
     config: &Inkling2Config,
     kv_format: KvFormat,
     block_size: u32,
 ) -> Result<u64> {
-    let swa = swa_window_blob_bytes(config, kv_format, block_size)?;
-    let conv = short_conv_state_bytes(config);
-    Ok(swa.saturating_add(conv))
+    state_blob_bytes_with_draft(config, kv_format, block_size, None)
 }
 
 /// Compute the initial runway blocks and max ceiling blocks for Group 1 (40 SWA visits).
@@ -434,6 +468,7 @@ pub(crate) fn evaluate_inkling2_plan(
     max_context_tokens: Option<u32>,
     max_lanes: u32,
     cache_disk: CacheDisk,
+    dflash2: Option<&DFlash2Config>,
 ) -> Result<Inkling2PoolPlan> {
     let block_size = INKLING2_PAGED_BLOCK_SIZE;
     let max_chunk = INKLING2_PAGED_PREFILL_MAX_CHUNK;
@@ -448,7 +483,7 @@ pub(crate) fn evaluate_inkling2_plan(
     let swa_bpb = group_bytes_per_block(config, swa_layers, kv_format, block_size)?;
     let conv_bytes = short_conv_state_bytes(config);
     let state_staging_bytes = if cache_disk != CacheDisk::Off {
-        state_blob_bytes(config, kv_format, block_size)?
+        state_blob_bytes_with_draft(config, kv_format, block_size, dflash2)?
     } else {
         0
     };
@@ -603,6 +638,7 @@ mod tests {
             None,
             4,
             CacheDisk::Auto,
+            None,
         )
         .expect("plan on 96 GiB");
         assert_eq!(plan.lanes, 4);
@@ -610,6 +646,33 @@ mod tests {
         assert!(plan.swa_max_blocks >= plan.swa_runway_blocks);
         assert!(plan.effective_window_tokens >= 131_072);
         assert_eq!(plan.state_staging_bytes, blob);
+
+        // With DFlash2 attached, `state_staging_bytes` includes the Span 2 draft window header + 4-bit ring.
+        let dflash_cfg =
+            crate::models::qwen3_5::dflash2::dflash2_config_with_context(cfg.hidden_size, 2048);
+        let dw_span = draft_window_span_bytes(Some(&dflash_cfg));
+        assert_eq!(draft_window_span_bytes(None), 0);
+        assert_eq!(
+            dw_span,
+            DRAFT_WINDOW_HEADER_BYTES + DraftContextWindow::bytes(cfg.hidden_size as u32, 2048)
+        );
+        let blob_with_draft =
+            state_blob_bytes_with_draft(&cfg, KvFormat::Int8, 32, Some(&dflash_cfg))
+                .expect("state blob bytes with draft");
+        assert_eq!(blob_with_draft, blob + dw_span);
+        let dflash_plan = evaluate_inkling2_plan(
+            "Inkling2",
+            &cfg,
+            KvFormat::Int8,
+            live,
+            None,
+            None,
+            4,
+            CacheDisk::Auto,
+            Some(&dflash_cfg),
+        )
+        .expect("dflash2 plan on 96 GiB");
+        assert_eq!(dflash_plan.state_staging_bytes, blob_with_draft);
 
         // BF16 fallback halves global block capacity vs INT8.
         let bf16_plan = evaluate_inkling2_plan(
@@ -621,6 +684,7 @@ mod tests {
             None,
             4,
             CacheDisk::Off,
+            Some(&dflash_cfg),
         )
         .expect("bf16 plan");
         assert!(bf16_plan.global_max_blocks < plan.global_max_blocks);

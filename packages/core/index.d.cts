@@ -840,6 +840,17 @@ export declare class Inkling2Model {
   /** Synchronous snapshot of trained and memory-planned context limits. */
   contextLimits(): Inkling2ContextLimits;
   /**
+   * Render chat messages to Inkling2 native wire token IDs using the loaded tokenizer
+   * without touching the GPU scheduler thread or inference caches.
+   */
+  applyChatTemplate(
+    messages: Array<ChatMessage>,
+    addGenerationPrompt?: boolean | undefined | null,
+    tools?: Array<ToolDefinition> | undefined | null,
+    enableThinking?: boolean | undefined | null,
+    reasoningEffort?: string | undefined | null,
+  ): Promise<Uint32Array>;
+  /**
    * Compute the exact prompt length after Inkling2 image-placeholder expansion without
    * running the vision encoder or touching GPU inference caches.
    */
@@ -4963,6 +4974,11 @@ export interface HyV4FlashLoadOptions {
 
 /** The load-time and latest per-turn admission, and the expert bank. */
 export interface HyV4FlashResidencyInfo {
+  /**
+   * Where the routed experts live: zero-copy file-backed mmap, anonymous
+   * full-expert direct banks, or partial streamed cache banks.
+   */
+  residency: 'mmap' | 'direct' | 'streamed';
   denseBytes: number;
   physicalBytes?: number;
   /** Other processes' (and other models') bytes at the last admission. */
@@ -4974,6 +4990,8 @@ export interface HyV4FlashResidencyInfo {
   fixedBytes?: number;
   /** Expert cache slots of both classes. */
   expertCacheSlots: number;
+  /** Total routed experts across all trunk MoE layers. */
+  totalExpertSlots: number;
   /** Expert cache slots per class (Q6_K down, Q4_K down). */
   expertCacheSlotsByClass: Array<number>;
   expertCacheBytes?: number;
@@ -5084,9 +5102,20 @@ export interface Inkling2ContextLimits {
 
 /** Optional load-time configuration for [`Inkling2Model::load`]. */
 export interface Inkling2LoadOptions {
-  /** Optional external DSpark drafter checkpoint path. */
+  /**
+   * Optional explicit external speculative drafter checkpoint path (DFlash2 directory or DSpark GGUF/SafeTensors).
+   * Strict: fails hard on load or validation error; pass `"none"` / `"off"` / `""` to disable all drafts.
+   */
   draftModelPath?: string;
-  /** Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`). */
+  /**
+   * Optional auto-discovered external DFlash2 companion candidate path tried with soft fallback
+   * (falls through to sibling DFlash2, bundled DSpark, or pure AR on load/validation error)
+   * when `draft_model_path` is unset and `auto_load_draft != Some(false)`. Ignored when
+   * `draft_model_path` is set or `auto_load_draft == Some(false)`; whereas `draft_model_path`
+   * remains strict/explicit.
+   */
+  autoDraftModelPath?: string;
+  /** Auto-discover a colocated/sibling DFlash2 or bundled DSpark drafter when `draft_model_path` is unset (default `true`). */
   autoLoadDraft?: boolean;
   /** KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`. */
   kvFormat?: 'int8' | 'bf16' | undefined;

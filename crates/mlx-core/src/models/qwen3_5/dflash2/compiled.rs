@@ -286,7 +286,7 @@ impl DFlash2Model {
             |args: &[MxArray]| -> Result<Vec<MxArray>> {
                 #[cfg(test)]
                 self.compiled.traces.fetch_add(1, Ordering::Relaxed);
-                let embedded = self.splice_mask_embedding(&target_embedding.forward(&args[0])?)?;
+                let embedded = self.apply_mask_embedding(target_embedding.forward(&args[0])?)?;
                 let mut pending: Option<DraftLayerOutput> = None;
                 let mut buffers = Vec::with_capacity(self.layers.len() * 2);
                 for (i, layer) in self.layers.iter().enumerate() {
@@ -613,7 +613,7 @@ impl DFlash2Model {
         let mut builder = |args: &[MxArray]| -> Result<Vec<MxArray>> {
             #[cfg(test)]
             self.compiled.traces.fetch_add(1, Ordering::Relaxed);
-            let embedded = self.splice_mask_embedding(&target_embedding.forward(&args[0])?)?;
+            let embedded = self.apply_mask_embedding(target_embedding.forward(&args[0])?)?;
             let mut pending: Option<DraftLayerOutput> = None;
             let mut buffers = Vec::with_capacity(self.layers.len() * 2);
             for (i, layer) in self.layers.iter().enumerate() {
@@ -852,6 +852,117 @@ impl DFlash2Model {
             window.values = Some(pair[1].clone());
         }
         Ok(Some((outputs[0].clone(), outputs[1].clone())))
+    }
+
+    /// Compiled draft transformer body taking pre-embedded `[1, rows, hidden]`
+    /// BF16 rows and returning final-normed `[1, rows, hidden]` BF16 rows while
+    /// updating every layer's KV window tail.
+    ///
+    /// Used on Metal for targets whose `embed()` and `lm_head` run outside
+    /// `mlx::compile` (e.g. Inkling-2-Mini with `embed_norm` + custom Metal
+    /// Sym-Q8_0 / BF16 `lm_head`). Uses `(1 << 10) | (1 << 8)` under
+    /// `COMPILED_DRAFT_TAG`, which is disjoint from all existing compiled
+    /// draft graph IDs and automatically erased by `invalidate_compiled`/`Drop`.
+    pub(super) fn forward_embedded_compiled(
+        &self,
+        embedded: &MxArray,
+        context: &mut DFlash2ContextCache,
+    ) -> Result<Option<MxArray>> {
+        if self.compiled.disabled.load(Ordering::Relaxed)
+            || unsafe { sys::mlx_default_device() } != 1
+            || self.layers.is_empty()
+            || context.layers.len() != self.layers.len()
+            || embedded.dtype()? != DType::BFloat16
+        {
+            return Ok(None);
+        }
+        let rows = embedded.shape_at(1)?;
+        if !(2..=256).contains(&rows) || embedded.shape_at(0)? != 1 {
+            return Ok(None);
+        }
+        let mut inputs = vec![
+            embedded.clone(),
+            MxArray::from_int32(&[context.logical_len], &[1])?,
+        ];
+        let Some((has_mask, windows_at)) =
+            self.prepare_compiled_window_inputs(context, rows, &mut inputs)?
+        else {
+            return Ok(None);
+        };
+        const COMPILED_BODY_BITS: u64 = (1u64 << 10) | (1u64 << 8);
+        let fn_id = COMPILED_DRAFT_TAG
+            | ((self.compiled.id & 0xffff_ffff) << 16)
+            | COMPILED_BODY_BITS
+            | ((has_mask as u64) << 9)
+            | (rows - 1) as u64;
+        let cache_output_at = 1;
+        let mut builder = |args: &[MxArray]| -> Result<Vec<MxArray>> {
+            #[cfg(test)]
+            self.compiled.traces.fetch_add(1, Ordering::Relaxed);
+            let mut pending: Option<DraftLayerOutput> = None;
+            let mut buffers = Vec::with_capacity(self.layers.len() * 2);
+            for (i, layer) in self.layers.iter().enumerate() {
+                let input = match &pending {
+                    Some(output) => output.as_input(),
+                    None => DraftResidual::Hidden(&args[0]),
+                };
+                let at = windows_at + i * 4;
+                let (output, keys, values) = layer.forward_compiled(
+                    input,
+                    &args[at..at + 4],
+                    &args[1],
+                    has_mask.then(|| &args[2]),
+                    has_mask.then(|| &args[3]),
+                    self.merged_rows(),
+                )?;
+                pending = Some(output);
+                buffers.extend([keys, values]);
+            }
+            let output =
+                pending.ok_or_else(|| Error::from_reason("compiled draft body has no layers"))?;
+            let hidden = output.hidden_and_normalized(&self.norm)?.1;
+            let mut outputs = vec![hidden];
+            outputs.extend(buffers);
+            Ok(outputs)
+        };
+        let outputs = crate::compiled_graph::invoke_compiled_graph_with_mode(
+            fn_id,
+            &inputs.iter().collect::<Vec<_>>(),
+            cache_output_at + self.layers.len() * 2,
+            true,
+            crate::accelerator::cuda_draft_no_fuse(),
+            &mut builder,
+        )?
+        .ok_or_else(|| Error::from_reason("compiled draft body invocation failed"))?;
+        for (window, pair) in context
+            .layers
+            .iter()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            let (Some(keys), Some(values)) = (&window.keys, &window.values) else {
+                return Err(Error::from_reason(
+                    "compiled draft body returned incompatible cache buffers",
+                ));
+            };
+            if pair[0].shape()?.as_ref() != keys.shape()?.as_ref()
+                || pair[1].shape()?.as_ref() != values.shape()?.as_ref()
+                || pair[0].dtype()? != DType::BFloat16
+                || pair[1].dtype()? != DType::BFloat16
+            {
+                return Err(Error::from_reason(
+                    "compiled draft body returned incompatible cache buffers",
+                ));
+            }
+        }
+        for (window, pair) in context
+            .layers
+            .iter_mut()
+            .zip(outputs[cache_output_at..].as_chunks::<2>().0)
+        {
+            window.keys = Some(pair[0].clone());
+            window.values = Some(pair[1].clone());
+        }
+        Ok(Some(outputs[0].clone()))
     }
 }
 

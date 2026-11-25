@@ -28,9 +28,17 @@ import { LEDGER_DIR_ENV } from '../panel-ledger.js';
  * binds a port, answers `/health` with `ok`, and has no `loadModel`.
  */
 const NATIVE_LIBRARY_PATH = 'NAPI_RS_NATIVE_LIBRARY_PATH';
+const CORE_NATIVE_LIBRARY_PATH = 'MLX_CORE_NATIVE_LIBRARY_PATH';
+const STRIPPED_CONTROL_PANEL_ENV_KEYS = new Set([
+  NATIVE_LIBRARY_PATH.toUpperCase(),
+  CORE_NATIVE_LIBRARY_PATH.toUpperCase(),
+]);
 
 /** Read by `resolveModelsDir` (INFERENCE) and `defaultModelsDir` (CONTROL PANEL) alike. */
 const MODELS_DIR = 'MLX_MODELS_DIR';
+
+/** Set to `'1'` in CONTROL PANEL when running inside a packaged Microsoft Store (MSIX) container. */
+export const WINDOWS_STORE_ENV = 'MLX_DESKTOP_WINDOWS_STORE';
 
 export interface ChildEnvInput {
   /** `AppPaths.nativeAddon` — the `.node` file, never its directory. */
@@ -89,12 +97,66 @@ export function controlPanelEnvOverrides(
   input: Pick<ChildEnvInput, 'modelsDir'> & {
     /** MAIN's ledger folder: the panel reads the ends of earlier panel lives from it at start. */
     ledgerDir?: string;
+    /** True when running inside a Microsoft Store (MSIX) container; disables external binary downloads. */
+    windowsStore?: boolean;
   },
 ): Record<string, string> {
   return {
     ...modelsDirEnv(input.modelsDir),
     ...(input.ledgerDir === undefined ? {} : { [LEDGER_DIR_ENV]: input.ledgerDir }),
+    ...(input.windowsStore === true ? { [WINDOWS_STORE_ENV]: '1' } : {}),
   };
+}
+
+export interface ControlPanelEnvInput {
+  baseEnv?: NodeJS.ProcessEnv;
+  modelsDir: string | null;
+  ledgerDir?: string;
+  windowsStore?: boolean;
+  extraCaBundlePath?: string | null;
+  desktopCli?: string;
+}
+
+function setEnvCaseInsensitive(env: Record<string, string>, key: string, value: string): void {
+  const upper = key.toUpperCase();
+  for (const existing of Object.keys(env)) {
+    if (existing !== key && existing.toUpperCase() === upper) {
+      delete env[existing];
+    }
+  }
+  env[key] = value;
+}
+
+/**
+ * Assemble the complete environment for the CONTROL PANEL child.
+ *
+ * Strips any inherited `NAPI_RS_NATIVE_LIBRARY_PATH` and
+ * `MLX_CORE_NATIVE_LIBRARY_PATH` (case-insensitively, for Windows) so a
+ * developer shell's override cannot hijack other NAPI-RS addons such as
+ * `@napi-rs/keyring` or silently let CONTROL PANEL load `@mlx-node/core`.
+ */
+export function buildControlPanelEnv(input: ControlPanelEnvInput): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const [key, value] of Object.entries(input.baseEnv ?? process.env)) {
+    if (value === undefined) continue;
+    if (STRIPPED_CONTROL_PANEL_ENV_KEYS.has(key.toUpperCase())) continue;
+    env[key] = value;
+  }
+  if (input.extraCaBundlePath != null) {
+    setEnvCaseInsensitive(env, 'NODE_EXTRA_CA_CERTS', input.extraCaBundlePath);
+  }
+  const overrides = controlPanelEnvOverrides({
+    modelsDir: input.modelsDir,
+    ledgerDir: input.ledgerDir,
+    windowsStore: input.windowsStore,
+  });
+  for (const [key, value] of Object.entries(overrides)) {
+    setEnvCaseInsensitive(env, key, value);
+  }
+  if (input.desktopCli !== undefined) {
+    setEnvCaseInsensitive(env, 'MLX_DESKTOP_CLI', input.desktopCli);
+  }
+  return env;
 }
 
 function modelsDirEnv(modelsDir: string | null): Record<string, string> {

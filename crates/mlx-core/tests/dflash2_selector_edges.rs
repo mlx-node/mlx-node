@@ -110,9 +110,15 @@ impl Fixture {
         scores
     }
 
-    fn call(&self) -> Raw {
+    fn call_with_softcap(&self, softcap: f32) -> Raw {
         let a: Vec<_> = self.arrays.iter().map(MxArray::as_raw_ptr).collect();
-        Raw::new(unsafe { mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5]) })
+        Raw::new(unsafe {
+            mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5], softcap)
+        })
+    }
+
+    fn call(&self) -> Raw {
+        self.call_with_softcap(0.0)
     }
 
     fn check(&self, scores: &Raw) {
@@ -226,7 +232,8 @@ unsafe extern "C" fn build(
         .iter()
         .map(|h| h.cast_mut())
         .collect();
-    let out = unsafe { mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5]) };
+    let out =
+        unsafe { mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5], 0.0) };
     for handle in a {
         unsafe { mlx_sys::mlx_array_delete(handle) };
     }
@@ -294,8 +301,40 @@ fn selector_edges_reject_bad_dtype_and_shape() {
         let mut a: Vec<_> = f.arrays.iter().map(MxArray::as_raw_ptr).collect();
         a[2] = replacement.as_raw_ptr();
         assert!(
-            unsafe { mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5]) }
+            unsafe { mlx_sys::mlx_dflash2_selector_edges(a[0], a[1], a[2], a[3], a[4], a[5], 0.0) }
                 .is_null()
         );
+    }
+}
+
+#[test]
+fn selector_edges_apply_post_correction_softcap_and_preserve_neg_inf() {
+    if !unsafe { mlx_sys::mlx_metal_is_available() } {
+        return;
+    }
+    let mut f = Fixture::new(7, 83, false, 12);
+    // Inject large finite values and a -INFINITY sentinel into unary logits.
+    f.unary[0] = 95.0;
+    f.unary[1] = -95.0;
+    f.unary[2] = f32::NEG_INFINITY;
+    f.arrays[1] = MxArray::from_float32(&f.unary, &[1, f.rows as i64, K as i64]).unwrap();
+
+    let cap = 30.0_f32;
+    let actual = f.call_with_softcap(cap).floats();
+    let raw_expected = f.oracle();
+    assert_eq!(actual.len(), raw_expected.len());
+    for (idx, (&got, &sum)) in actual.iter().zip(&raw_expected).enumerate() {
+        if sum.is_finite() {
+            let want = f64::from(cap) * (sum / f64::from(cap)).clamp(-20.0, 20.0).tanh();
+            assert!(
+                (f64::from(got) - want).abs() <= 2e-5,
+                "idx={idx} got={got} want={want} sum={sum}"
+            );
+        } else {
+            assert!(
+                got.is_infinite() && got.is_sign_negative(),
+                "idx={idx} expected -inf, got {got}"
+            );
+        }
     }
 }

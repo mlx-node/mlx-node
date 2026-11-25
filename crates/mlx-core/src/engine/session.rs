@@ -876,6 +876,9 @@ fn render_live_continuation<B: ChatBackend>(
     full_tokens: &[u32],
     preserve_thinking: bool,
 ) -> Result<Option<Vec<u32>>> {
+    if !backend.uses_jinja_continuation() {
+        return Ok(None);
+    }
     let Some((_pending, completed_history)) = messages.split_last() else {
         return Ok(None);
     };

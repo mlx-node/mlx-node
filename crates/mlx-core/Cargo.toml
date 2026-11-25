@@ -43,6 +43,12 @@ unicode-normalization.workspace = true
 workspace = true
 features = ["skip_collect_on_exit", "v3"]
 
+# Linux `.node` addons loaded via `dlopen` into Node.js overflow glibc's static
+# TLS surplus if mimalloc uses `initial-exec` TLS (`R_AARCH64_TLS_TPREL64`).
+[target.'cfg(target_os = "linux")'.dependencies.mimalloc-safe]
+workspace = true
+features = ["local_dynamic_tls"]
+
 [dev-dependencies]
 criterion = { workspace = true }
 mlx-paged-attn = { workspace = true, features = ["test-hooks"] }

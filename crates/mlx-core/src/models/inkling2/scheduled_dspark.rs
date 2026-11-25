@@ -21,6 +21,7 @@ use crate::engine::scheduled_verify::{ScheduledDraftVerify, ScheduledVerifyBatch
 use crate::engine::spec_paged::SpecPagedCache;
 use crate::transformer::paged_kv_cache_adapter::{PagedRaggedRow, SeqId};
 
+use super::dflash2::{Inkling2Dflash2Context, Inkling2DraftContext, Inkling2TargetView};
 use super::dspark::{AdaptiveDraftDepth, BatchedDsparkLane, Inkling2DsparkContext};
 use super::kv_cache::Inkling2KVCacheCoordinator;
 use super::model::Inkling2Inner;
@@ -31,25 +32,26 @@ pub(crate) const INKLING2_WAVE_LANES: usize = 4;
 
 fn missing_lane(seq: SeqId) -> Error {
     Error::from_reason(format!(
-        "scheduled Inkling2 DSpark sequence {seq} has no lane"
+        "scheduled Inkling2 speculative sequence {seq} has no lane"
     ))
 }
 
 fn missing_draft() -> Error {
-    Error::from_reason("scheduled Inkling2 DSpark has no draft model")
+    Error::from_reason("scheduled Inkling2 speculation has no draft model")
 }
 
 /// Open verify state held between `run_scheduled_verify` and `commit_scheduled_verify`.
 pub(crate) struct OpenInkling2Verify {
     pub tape: Inkling2ShortConvTape,
     pub tapped: Vec<MxArray>,
+    pub verify_tokens: Vec<u32>,
     pub lanes_in_wave: usize,
     pub drafted: usize,
 }
 
-/// Per-sequence scheduled DSpark lane state.
+/// Per-sequence scheduled speculative lane state (DSpark or DFlash2).
 pub(crate) struct Inkling2ScheduledDsparkLane {
-    pub ctx: Inkling2DsparkContext,
+    pub ctx: Inkling2DraftContext,
     pub adaptive_depth: AdaptiveDraftDepth,
     pub open: Option<OpenInkling2Verify>,
     pub total_verifies: u64,
@@ -60,9 +62,12 @@ pub(crate) struct Inkling2ScheduledDsparkLane {
 #[derive(Default)]
 pub(crate) struct Inkling2ScheduledDsparkStates {
     pub seq_lanes: HashMap<SeqId, Inkling2ScheduledDsparkLane>,
-    /// Open ShortConv rollback tapes for non-speculative AR peer rows verified alongside DSpark lanes.
-    pub peer_tapes: HashMap<SeqId, Inkling2ShortConvTape>,
+    /// Open ShortConv rollback tapes (plus optional DFlash2 target taps) for non-speculative AR
+    /// peer rows verified alongside DSpark/DFlash2 lanes.
+    pub peer_tapes: HashMap<SeqId, (Inkling2ShortConvTape, Vec<MxArray>)>,
     pub lane_batch: Option<ScheduledVerifyBatch>,
+    /// Turn-scoped MLX allocator free-pool cap held while speculative verify lanes are active.
+    pub lane_decode_limit: Option<crate::cache_limit::DecodeCacheLimitGuard>,
     /// Diagnostic counters for tests & telemetry.
     pub total_verify_waves: u64,
     pub multi_lane_verify_waves: u64,
@@ -74,12 +79,13 @@ impl Inkling2ScheduledDsparkStates {
         self.seq_lanes.clear();
         self.peer_tapes.clear();
         self.lane_batch = None;
+        self.lane_decode_limit = None;
     }
 
-    pub fn tap_visits_for(&self, seq_id: SeqId, draft_taps: &[usize]) -> Option<Vec<usize>> {
-        self.seq_lanes
-            .contains_key(&seq_id)
-            .then(|| draft_taps.to_vec())
+    pub fn sync_decode_limit(&mut self) {
+        if self.seq_lanes.is_empty() {
+            self.lane_decode_limit = None;
+        }
     }
 }
 
@@ -141,19 +147,26 @@ impl Inkling2Inner {
     pub(crate) fn begin_scheduled_dspark(&mut self, seq_id: SeqId, position: u32) -> Result<bool> {
         if self.scheduled_dspark.lane_batch.is_some() {
             return Err(Error::from_reason(
-                "cannot begin scheduled Inkling2 DSpark during an open verify batch",
+                "cannot begin scheduled Inkling2 speculation during an open verify batch",
             ));
         }
-        let Some(ref draft) = self.dspark else {
+        let Some(max_spec) = self.active_draft_block_size() else {
             return Ok(false);
         };
-        let max_spec = draft.config.num_draft_tokens();
         if position == 0 {
-            let n_layers = draft.config.num_hidden_layers;
+            let ctx = if let Some(ref draft) = self.dflash2 {
+                Inkling2DraftContext::Dflash2(Box::new(Inkling2Dflash2Context::new(&draft.config)))
+            } else if let Some(ref draft) = self.dspark {
+                Inkling2DraftContext::Dspark(Inkling2DsparkContext::new(
+                    draft.config.num_hidden_layers,
+                ))
+            } else {
+                return Ok(false);
+            };
             self.scheduled_dspark.seq_lanes.insert(
                 seq_id,
                 Inkling2ScheduledDsparkLane {
-                    ctx: Inkling2DsparkContext::new(n_layers),
+                    ctx,
                     adaptive_depth: AdaptiveDraftDepth::new(max_spec),
                     open: None,
                     total_verifies: 0,
@@ -166,12 +179,12 @@ impl Inkling2Inner {
         // Check if `seq_id` already owns a matching draft context at exact `position`.
         if let Some(lane) = self.scheduled_dspark.seq_lanes.get_mut(&seq_id)
             && lane.open.is_none()
-            && lane.ctx.committed_len as u32 == position
+            && lane.ctx.committed_len() as u32 == position
         {
             return Ok(true);
         }
         if let Some(ctx) = self.dspark_turn_contexts.remove(&seq_id)
-            && ctx.committed_len as u32 == position
+            && ctx.committed_len() as u32 == position
         {
             self.scheduled_dspark.seq_lanes.insert(
                 seq_id,
@@ -186,8 +199,177 @@ impl Inkling2Inner {
             return Ok(true);
         }
 
+        // Restored from RAM/SSD StateStore (or live continuation after an AR turn on a
+        // DFlash2-loaded model): restore the DFlash2 sliding ring from the captured 4-bit
+        // DraftContextWindow, or skip straight to `record_only` when the suffix alone fills
+        // the entire DFlash2 sliding window!
+        if let Some(ref draft) = self.dflash2 {
+            let restored = self
+                .paged
+                .as_mut()
+                .and_then(|rt| rt.restored_draft_windows.remove(&seq_id))
+                .filter(|r| r.depth == position);
+            let lineage: Option<Vec<u32>> = self.paged.as_ref().and_then(|rt| {
+                let tokens = rt.coordinator.full_adapter().request_tokens_for(seq_id)?;
+                tokens.get(..position as usize).map(|s| s.to_vec())
+            });
+            if let (Some(restored), Some(lineage)) = (restored, lineage.as_ref()) {
+                if restored.suffix_len >= draft.config.sliding_window {
+                    let mut dctx = Inkling2Dflash2Context::new(&draft.config);
+                    match dctx.cache.record_only(lineage) {
+                        Ok(()) => {
+                            self.scheduled_dspark.seq_lanes.insert(
+                                seq_id,
+                                Inkling2ScheduledDsparkLane {
+                                    ctx: Inkling2DraftContext::Dflash2(Box::new(dctx)),
+                                    adaptive_depth: AdaptiveDraftDepth::new(max_spec),
+                                    open: None,
+                                    total_verifies: 0,
+                                    multi_lane_wave_verifies: 0,
+                                },
+                            );
+                            return Ok(true);
+                        }
+                        Err(err) => {
+                            tracing::warn!(
+                                "Inkling2 scheduled DFlash2 record_only failed for seq {seq_id} \
+                                 at position {position} (falling back to scheduled AR): {err}"
+                            );
+                            if let Some(rt) = self.paged.as_mut() {
+                                rt.invalidate_draft_window(seq_id);
+                            }
+                        }
+                    }
+                } else {
+                    let expected_slots = u32::try_from(draft.config.sliding_window).ok();
+                    let restore_res: Result<Option<Inkling2Dflash2Context>> = (|| {
+                        // Prefer the already-materialized live `DraftContextWindow` at exact
+                        // `position` (avoiding a duplicate `packed.to_window()` allocation).
+                        let live_win = self.paged.as_ref().and_then(|rt| {
+                            rt.draft_windows.get(&seq_id).filter(|w| {
+                                expected_slots.is_none_or(|s| w.slots() == s)
+                                    && w.width() == draft.config.context_width()
+                                    && w.end() == position
+                                    && w.begin() == position.saturating_sub(w.slots())
+                            })
+                        });
+                        let maybe_owned_win;
+                        let win_ref = if let Some(live) = live_win {
+                            Some(live)
+                        } else if let Some(ref packed) = restored.window {
+                            maybe_owned_win = Some(packed.to_window()?);
+                            maybe_owned_win.as_ref()
+                        } else {
+                            None
+                        };
+                        let Some(win) = win_ref else {
+                            return Ok(None);
+                        };
+                        #[cfg(test)]
+                        if super::scheduler::FAIL_DRAFT_KV_RESTORE_SEQ.with(std::cell::Cell::get)
+                            == Some(seq_id)
+                        {
+                            super::scheduler::DRAFT_KV_RESTORE_INJECTED_COUNT
+                                .with(|c| c.set(c.get().saturating_add(1)));
+                            return Err(Error::from_reason(format!(
+                                "injected DFlash2 draft KV restore failure for seq {seq_id}"
+                            )));
+                        }
+                        let mut dctx = Inkling2Dflash2Context::new(&draft.config);
+                        dctx.cache = crate::models::qwen3_5::dflash2::DFlash2ContextCache::restore(
+                            dctx.cache, draft, win, lineage,
+                        )?;
+                        Ok(Some(dctx))
+                    })(
+                    );
+                    match restore_res {
+                        Ok(Some(dctx)) => {
+                            self.scheduled_dspark.seq_lanes.insert(
+                                seq_id,
+                                Inkling2ScheduledDsparkLane {
+                                    ctx: Inkling2DraftContext::Dflash2(Box::new(dctx)),
+                                    adaptive_depth: AdaptiveDraftDepth::new(max_spec),
+                                    open: None,
+                                    total_verifies: 0,
+                                    multi_lane_wave_verifies: 0,
+                                },
+                            );
+                            return Ok(true);
+                        }
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!(
+                                "Inkling2 scheduled DFlash2 context restore failed for seq \
+                                 {seq_id} at position {position} (falling back to scheduled AR): \
+                                 {err}"
+                            );
+                            if let Some(rt) = self.paged.as_mut() {
+                                rt.invalidate_draft_window(seq_id);
+                            }
+                        }
+                    }
+                }
+            } else if let Some(lineage) = lineage.as_ref() {
+                let expected_slots = u32::try_from(draft.config.sliding_window).ok();
+                let restore_res: Result<Option<Inkling2Dflash2Context>> = (|| {
+                    let Some(win) = self.paged.as_ref().and_then(|rt| {
+                        rt.draft_windows.get(&seq_id).filter(|w| {
+                            expected_slots.is_none_or(|s| w.slots() == s)
+                                && w.width() == draft.config.context_width()
+                                && w.end() == position
+                                && w.begin() == position.saturating_sub(w.slots())
+                        })
+                    }) else {
+                        return Ok(None);
+                    };
+                    #[cfg(test)]
+                    if super::scheduler::FAIL_DRAFT_KV_RESTORE_SEQ.with(std::cell::Cell::get)
+                        == Some(seq_id)
+                    {
+                        super::scheduler::DRAFT_KV_RESTORE_INJECTED_COUNT
+                            .with(|c| c.set(c.get().saturating_add(1)));
+                        return Err(Error::from_reason(format!(
+                            "injected DFlash2 draft KV restore failure for seq {seq_id}"
+                        )));
+                    }
+                    let mut dctx = Inkling2Dflash2Context::new(&draft.config);
+                    dctx.cache = crate::models::qwen3_5::dflash2::DFlash2ContextCache::restore(
+                        dctx.cache, draft, win, lineage,
+                    )?;
+                    Ok(Some(dctx))
+                })();
+                match restore_res {
+                    Ok(Some(dctx)) => {
+                        self.scheduled_dspark.seq_lanes.insert(
+                            seq_id,
+                            Inkling2ScheduledDsparkLane {
+                                ctx: Inkling2DraftContext::Dflash2(Box::new(dctx)),
+                                adaptive_depth: AdaptiveDraftDepth::new(max_spec),
+                                open: None,
+                                total_verifies: 0,
+                                multi_lane_wave_verifies: 0,
+                            },
+                        );
+                        return Ok(true);
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        tracing::warn!(
+                            "Inkling2 scheduled DFlash2 live-window restore failed for seq \
+                             {seq_id} at position {position} (falling back to scheduled AR): \
+                             {err}"
+                        );
+                        if let Some(rt) = self.paged.as_mut() {
+                            rt.invalidate_draft_window(seq_id);
+                        }
+                    }
+                }
+            }
+        }
+
         // Restored from cold RAM/SSD state without draft context: keep target prefix and run AR.
         self.scheduled_dspark.seq_lanes.remove(&seq_id);
+        self.scheduled_dspark.sync_decode_limit();
         Ok(false)
     }
 
@@ -198,14 +380,14 @@ impl Inkling2Inner {
         queries: usize,
     ) -> Result<bool> {
         let rt = self.paged.as_mut().ok_or_else(|| {
-            Error::from_reason("scheduled Inkling2 DSpark reservation has no paged runtime")
+            Error::from_reason("scheduled Inkling2 speculative reservation has no paged runtime")
         })?;
         rt.coordinator
             .reserve_lookahead(seq_id, queries)
             .map_err(Error::from_reason)
     }
 
-    /// Propose up to `max_drafts` tokens from `seq_id`'s DSpark context.
+    /// Propose up to `max_drafts` tokens from `seq_id`'s DFlash2 or DSpark context.
     pub(crate) fn propose_scheduled_dspark(
         &mut self,
         seq_id: SeqId,
@@ -213,43 +395,62 @@ impl Inkling2Inner {
         max_drafts: usize,
         params: &ChatParams,
         rng: &mut dyn rand::Rng,
+        confidence: bool,
     ) -> Result<DsparkProposal> {
-        let draft = self.dspark.as_ref().ok_or_else(missing_draft)?;
         let lane = self
             .scheduled_dspark
             .seq_lanes
-            .get(&seq_id)
+            .get_mut(&seq_id)
             .ok_or_else(|| missing_lane(seq_id))?;
         if lane.open.is_some() {
             return Err(Error::from_reason(
-                "scheduled Inkling2 DSpark propose: prior verify was not committed",
+                "scheduled Inkling2 propose: prior verify was not committed",
             ));
         }
-        let effective_drafts = if params.mtp_adaptive_depth {
-            lane.adaptive_depth.current_depth(max_drafts)
-        } else {
-            max_drafts
-        };
-        lane.ctx.propose_block(
-            draft,
-            &self.embed_tokens,
-            &self.embed_norm,
-            &self.lm_head,
-            anchor,
-            effective_drafts,
-            params,
-            rng,
-        )
+        match &mut lane.ctx {
+            Inkling2DraftContext::Dflash2(dctx) => {
+                let draft = self.dflash2.as_ref().ok_or_else(missing_draft)?;
+                let mut view = Inkling2TargetView {
+                    embed_tokens: &self.embed_tokens,
+                    embed_norm: &self.embed_norm,
+                    lm_head: &self.lm_head,
+                    lm_head_bf16_unpadded: self.lm_head_bf16_unpadded.as_ref(),
+                    rms_norm_eps: self.config.rms_norm_eps as f32,
+                    unpadded_vocab_size: self.config.effective_unpadded_vocab_size(),
+                };
+                dctx.propose_block(
+                    draft, &mut view, anchor, max_drafts, params, rng, confidence,
+                )
+            }
+            Inkling2DraftContext::Dspark(dctx) => {
+                let draft = self.dspark.as_ref().ok_or_else(missing_draft)?;
+                let effective_drafts = if params.mtp_adaptive_depth {
+                    lane.adaptive_depth.current_depth(max_drafts)
+                } else {
+                    max_drafts
+                };
+                dctx.propose_block(
+                    draft,
+                    &self.embed_tokens,
+                    &self.embed_norm,
+                    &self.lm_head,
+                    anchor,
+                    effective_drafts,
+                    params,
+                    rng,
+                )
+            }
+        }
     }
 
-    /// Batched multi-lane scheduled DSpark proposal: stacks valid lanes through
-    /// [`super::dspark::Inkling2DsparkModel::propose_blocks_batched`] so all `N` lanes share
-    /// 1 draft-layer pass, 1 `lm_head` pass, and 1 folded Markov head read per step.
+    /// Batched multi-lane scheduled proposal: stacks DSpark lanes through
+    /// [`super::dspark::Inkling2DsparkModel::propose_blocks_batched`], and runs
+    /// DFlash2 lanes sequentially through each lane's compiled 8-row draft graph.
     pub(crate) fn propose_scheduled_dspark_batch(
         &mut self,
         requests: &mut [ScheduledProposalRequest<'_>],
     ) -> Vec<Result<DsparkProposal>> {
-        if requests.len() <= 1 {
+        if requests.len() <= 1 || self.dflash2.is_some() {
             return requests
                 .iter_mut()
                 .map(|req| {
@@ -259,6 +460,7 @@ impl Inkling2Inner {
                         req.max_drafts,
                         req.params,
                         req.rng,
+                        false,
                     )
                 })
                 .collect();
@@ -280,20 +482,27 @@ impl Inkling2Inner {
                         "scheduled Inkling2 DSpark propose: prior verify was not committed",
                     )));
                 }
-                Some(lane) => {
-                    let effective_drafts = if req.params.mtp_adaptive_depth {
-                        lane.adaptive_depth.current_depth(req.max_drafts)
-                    } else {
-                        req.max_drafts
-                    };
-                    valid_indices.push(i);
-                    lanes.push(BatchedDsparkLane {
-                        ctx: &lane.ctx,
-                        anchor_id: req.anchor,
-                        max_drafts: effective_drafts,
-                        params: req.params,
-                    });
-                }
+                Some(lane) => match &lane.ctx {
+                    Inkling2DraftContext::Dspark(dctx) => {
+                        let effective_drafts = if req.params.mtp_adaptive_depth {
+                            lane.adaptive_depth.current_depth(req.max_drafts)
+                        } else {
+                            req.max_drafts
+                        };
+                        valid_indices.push(i);
+                        lanes.push(BatchedDsparkLane {
+                            ctx: dctx,
+                            anchor_id: req.anchor,
+                            max_drafts: effective_drafts,
+                            params: req.params,
+                        });
+                    }
+                    Inkling2DraftContext::Dflash2(_) => {
+                        results[i] = Some(Err(Error::from_reason(
+                            "scheduled Inkling2 DSpark batch encountered DFlash2 lane",
+                        )));
+                    }
+                },
             }
         }
 
@@ -338,7 +547,7 @@ impl Inkling2Inner {
             .collect()
     }
 
-    /// Feed prefill tapped hidden states (`[5, 23, 41, 48]`) into `seq_id`'s scheduled DSpark lane.
+    /// Feed prefill tapped hidden states (`[5, 23, 41, 48]`) into `seq_id`'s scheduled lane.
     pub(crate) fn append_scheduled_dspark_prefill(
         &mut self,
         seq_id: SeqId,
@@ -346,19 +555,53 @@ impl Inkling2Inner {
         taps: &[MxArray],
         count: usize,
     ) -> Result<()> {
-        let Some(ref draft) = self.dspark else {
-            return Ok(());
+        let fused_to_record = {
+            let Some(lane) = self.scheduled_dspark.seq_lanes.get_mut(&seq_id) else {
+                return Ok(());
+            };
+            if lane.ctx.committed_len() as u32 != first_pos {
+                return Err(Error::from_reason(format!(
+                    "scheduled Inkling2 prefill cursor mismatch for seq {seq_id}: draft={} target={first_pos}",
+                    lane.ctx.committed_len()
+                )));
+            }
+            match &mut lane.ctx {
+                Inkling2DraftContext::Dspark(dctx) => {
+                    let Some(ref draft) = self.dspark else {
+                        return Ok(());
+                    };
+                    dctx.append_taps(draft, taps, count)?;
+                    None
+                }
+                Inkling2DraftContext::Dflash2(dctx) => {
+                    let Some(ref draft) = self.dflash2 else {
+                        return Ok(());
+                    };
+                    let start = first_pos as usize;
+                    let end = start.saturating_add(count);
+                    let token_slice: Vec<u32> = self
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.coordinator.full_adapter().request_tokens_for(seq_id))
+                        .and_then(|tokens| tokens.get(start..end).map(|s| s.to_vec()))
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "scheduled Inkling2 DFlash2 prefill missing recorded tokens [{start}..{end}) for seq {seq_id}"
+                            ))
+                        })?;
+                    dctx.append_taps(draft, taps, &token_slice)?
+                }
+            }
         };
-        let Some(lane) = self.scheduled_dspark.seq_lanes.get_mut(&seq_id) else {
-            return Ok(());
-        };
-        if lane.ctx.committed_len as u32 != first_pos {
-            return Err(Error::from_reason(format!(
-                "scheduled Inkling2 DSpark prefill cursor mismatch for seq {seq_id}: draft={} target={first_pos}",
-                lane.ctx.committed_len
-            )));
+        if let Some(fused_kept) = fused_to_record
+            && self
+                .paged
+                .as_ref()
+                .is_some_and(|rt| rt.seq_reuse_cache(seq_id))
+        {
+            self.record_fused_to_draft_window_best_effort(seq_id, first_pos, &fused_kept);
         }
-        lane.ctx.append_taps(draft, taps, count)
+        Ok(())
     }
 
     /// Execute one scheduled verify step across speculative lanes (grouping 2..=4 full 8-row lanes
@@ -376,20 +619,23 @@ impl Inkling2Inner {
         rows: &[ScheduledVerifyCommit],
     ) -> Result<Vec<Result<()>>> {
         let results = LaneVerify(self).commit_scheduled_rows(rows)?;
-        // Queue async eval of committed ShortConv + DSpark context arrays for overlap.
+        // Queue async eval of committed ShortConv + DraftContextWindow + DSpark/DFlash2 context arrays.
         let mut arrays: Vec<&MxArray> = Vec::new();
         for (row, res) in rows.iter().zip(&results) {
             if res.is_err() || row.keep == 0 {
                 continue;
             }
-            if let Some(ref rt) = self.paged
-                && let Some(conv) = rt.conv_states.get(&row.seq_id)
-            {
-                for v in &conv.visits {
-                    arrays.push(&v.k);
-                    arrays.push(&v.v);
-                    arrays.push(&v.attn_post);
-                    arrays.push(&v.mlp_post);
+            if let Some(ref rt) = self.paged {
+                if let Some(conv) = rt.conv_states.get(&row.seq_id) {
+                    for v in &conv.visits {
+                        arrays.push(&v.k);
+                        arrays.push(&v.v);
+                        arrays.push(&v.attn_post);
+                        arrays.push(&v.mlp_post);
+                    }
+                }
+                if let Some(dw) = rt.draft_windows.get(&row.seq_id) {
+                    dw.collect_arrays(&mut arrays);
                 }
             }
             if let Some(lane) = self.scheduled_dspark.seq_lanes.get(&row.seq_id) {
@@ -410,6 +656,67 @@ impl Inkling2Inner {
         }
     }
 
+    /// Park `seq_id`'s live draft context into `dspark_turn_contexts` while capping idle
+    /// residency to `max_concurrent_sequences` (evicting the oldest idle peer by
+    /// `turn_end_stamp`, tie-broken by `SeqId`). For DFlash2, `rt.draft_windows[other_seq]`
+    /// stays intact so an evicted owner can still restore its ring on `SessionContinue`.
+    pub(crate) fn park_turn_draft_context(&mut self, seq_id: SeqId, mut ctx: Inkling2DraftContext) {
+        if let Inkling2DraftContext::Dflash2(ref mut dctx) = ctx {
+            // Drop the multi-MiB SAM `LookupIndex` immediately on park; the next turn
+            // rebuilds it from conversation history anyway.
+            dctx.reset_lookup_for_turn();
+        }
+        self.dspark_turn_contexts.insert(seq_id, ctx);
+        let cap = self.paged.as_ref().map_or(4, |rt| {
+            rt.coordinator.max_concurrent_sequences().max(1) as usize
+        });
+        while self.dspark_turn_contexts.len() > cap {
+            let victim = self
+                .dspark_turn_contexts
+                .keys()
+                .copied()
+                .filter(|&other_seq| other_seq != seq_id)
+                .min_by_key(|&other_seq| {
+                    let stamp = self
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.coordinator.full_adapter().turn_end_stamp(other_seq))
+                        .unwrap_or(0);
+                    (stamp, other_seq)
+                });
+            let Some(victim_seq) = victim else {
+                break;
+            };
+            self.dspark_turn_contexts.remove(&victim_seq);
+        }
+    }
+
+    /// Park `seq_id`'s clean scheduled speculative lane back into `dspark_turn_contexts` so a
+    /// subsequent `SessionContinue` reuses the live draft context without re-projecting. If an
+    /// open verify batch involves `seq_id`, retract it and drop the dirty lane instead of parking.
+    pub(crate) fn park_scheduled_dspark(&mut self, seq_id: SeqId) {
+        if self.scheduled_dspark.lane_batch.is_some()
+            && (self.scheduled_dspark.seq_lanes.contains_key(&seq_id)
+                || self.scheduled_dspark.peer_tapes.contains_key(&seq_id))
+        {
+            let _ = self.retract_open_dspark_wave();
+            self.scheduled_dspark.seq_lanes.remove(&seq_id);
+            self.scheduled_dspark.peer_tapes.remove(&seq_id);
+            self.dspark_turn_contexts.remove(&seq_id);
+            self.scheduled_dspark.sync_decode_limit();
+            return;
+        }
+        if let Some(lane) = self.scheduled_dspark.seq_lanes.remove(&seq_id) {
+            if lane.open.is_none() {
+                self.park_turn_draft_context(seq_id, lane.ctx);
+            } else {
+                self.dspark_turn_contexts.remove(&seq_id);
+            }
+        }
+        self.scheduled_dspark.peer_tapes.remove(&seq_id);
+        self.scheduled_dspark.sync_decode_limit();
+    }
+
     /// Release scheduled DSpark lane state for `seq_id`.
     pub(crate) fn release_scheduled_dspark(&mut self, seq_id: SeqId) {
         if self.scheduled_dspark.lane_batch.is_some()
@@ -421,6 +728,7 @@ impl Inkling2Inner {
         self.scheduled_dspark.seq_lanes.remove(&seq_id);
         self.scheduled_dspark.peer_tapes.remove(&seq_id);
         self.dspark_turn_contexts.remove(&seq_id);
+        self.scheduled_dspark.sync_decode_limit();
     }
 }
 
@@ -485,10 +793,12 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
             .seq_lanes
             .get(&row.seq_id)
             .ok_or_else(|| missing_lane(row.seq_id))?;
-        if lane.open.is_some() || lane.ctx.committed_len as u32 != row.first_position {
+        if lane.open.is_some() || lane.ctx.committed_len() as u32 != row.first_position {
             return Err(Error::from_reason(format!(
-                "scheduled Inkling2 DSpark lane/verify cursor mismatch for seq {}: draft={} target={}",
-                row.seq_id, lane.ctx.committed_len, row.first_position
+                "scheduled Inkling2 lane/verify cursor mismatch for seq {}: draft={} target={}",
+                row.seq_id,
+                lane.ctx.committed_len(),
+                row.first_position
             )));
         }
         Ok(())
@@ -500,12 +810,25 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
     ) -> Result<(MxArray, Vec<MxArray>)> {
         let inner = &mut *self.0;
         let tap_visits = inner
-            .dspark
-            .as_ref()
+            .active_draft_tap_visits()
             .ok_or_else(missing_draft)?
-            .config
-            .target_layer_ids
-            .clone();
+            .to_vec();
+        let drafting = rows
+            .iter()
+            .any(|(row, _)| inner.scheduled_dspark.seq_lanes.contains_key(&row.seq_id));
+        if drafting && inner.scheduled_dspark.lane_decode_limit.is_none() {
+            inner.scheduled_dspark.lane_decode_limit = Some(
+                crate::cache_limit::coordinator().push_decode_limit(
+                    crate::cache_limit::decode_cache_limit(
+                        super::memory::decode_transient_bytes(
+                            &inner.config,
+                            INKLING2_WAVE_LANES as u32,
+                        )
+                        .max(64 << 20),
+                    ),
+                ),
+            );
+        }
 
         let mut outputs: Vec<Option<MxArray>> = rows.iter().map(|_| None).collect();
 
@@ -538,6 +861,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                 lane.open = Some(OpenInkling2Verify {
                     tape,
                     tapped: lane_taps,
+                    verify_tokens: ids.clone(),
                     lanes_in_wave: n_lanes,
                     drafted: ids.len().saturating_sub(1),
                 });
@@ -557,7 +881,17 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
             }
             let seq_id = row.seq_id;
             let is_spec = inner.scheduled_dspark.seq_lanes.contains_key(&seq_id);
-            let taps_arg: &[usize] = if is_spec { &tap_visits } else { &[] };
+            let peer_reuse_cache = inner
+                .paged
+                .as_ref()
+                .is_some_and(|rt| rt.seq_reuse_cache(seq_id));
+            let taps_arg: &[usize] = if is_spec
+                || (peer_reuse_cache && inner.dflash2.is_some() && inner.cached_image_key.is_none())
+            {
+                &tap_visits
+            } else {
+                &[]
+            };
             let single = [(*row, ids.clone())];
             let (logits_2d, taps, mut tapes) =
                 inner.paged_verify_ragged_taped(&single, taps_arg)?;
@@ -576,6 +910,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                 lane.open = Some(OpenInkling2Verify {
                     tape,
                     tapped: taps,
+                    verify_tokens: ids.clone(),
                     lanes_in_wave: 1,
                     drafted: ids.len().saturating_sub(1),
                 });
@@ -583,7 +918,10 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                 inner.scheduled_dspark.max_verify_wave_lanes =
                     inner.scheduled_dspark.max_verify_wave_lanes.max(1);
             } else {
-                inner.scheduled_dspark.peer_tapes.insert(seq_id, tape);
+                inner
+                    .scheduled_dspark
+                    .peer_tapes
+                    .insert(seq_id, (tape, taps));
             }
             *out_slot = Some(logits_3d);
         }
@@ -600,7 +938,8 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
     }
 
     fn commit_target_state(&mut self, seq: u32, keep: usize) -> Result<()> {
-        if let Some(peer_tape) = self.0.scheduled_dspark.peer_tapes.remove(&seq) {
+        if let Some((peer_tape, peer_taps)) = self.0.scheduled_dspark.peer_tapes.remove(&seq) {
+            let mut committed_pos = None;
             if let Some(ref mut rt) = self.0.paged
                 && let Some(conv) = rt.conv_states.get_mut(&seq)
             {
@@ -609,7 +948,26 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
                     && let Ok(committed) = rt.coordinator.request_token_count_all(seq)
                 {
                     rt.record_block_boundary_conv_from_tape(seq, committed, keep, &peer_tape)?;
+                    committed_pos = Some(committed);
                 }
+            }
+            if keep > 0
+                && !peer_taps.is_empty()
+                && self
+                    .0
+                    .paged
+                    .as_ref()
+                    .is_some_and(|rt| rt.seq_reuse_cache(seq))
+                && let Some(committed) = committed_pos
+            {
+                let first_pos = committed.saturating_sub(keep as u32);
+                self.0.record_taps_to_draft_window_best_effort(
+                    seq,
+                    first_pos,
+                    &peer_taps,
+                    keep,
+                    "scheduled AR peer verify",
+                );
             }
             return Ok(());
         }
@@ -647,7 +1005,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
     }
 
     fn abort_target_state(&mut self, seq: u32) {
-        if let Some(peer_tape) = self.0.scheduled_dspark.peer_tapes.remove(&seq) {
+        if let Some((peer_tape, _)) = self.0.scheduled_dspark.peer_tapes.remove(&seq) {
             if let Some(ref mut rt) = self.0.paged
                 && let Some(conv) = rt.conv_states.get_mut(&seq)
             {
@@ -676,7 +1034,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
         &mut self,
         items: &[(u32, &[MxArray], usize)],
     ) -> Vec<Result<()>> {
-        if items.len() <= 1 {
+        if items.len() <= 1 || self.0.dflash2.is_some() {
             return items
                 .iter()
                 .map(|&(seq, taps, keep)| self.append_committed_taps(seq, taps, keep))
@@ -720,10 +1078,25 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
 
         if !extracted.is_empty() {
             let batch_res = {
-                let mut call_args: Vec<(&mut Inkling2DsparkContext, &[MxArray], usize)> = extracted
-                    .iter_mut()
-                    .map(|e| (&mut e.lane.ctx, e.open.tapped.as_slice(), e.keep))
-                    .collect();
+                let mut call_args: Vec<(&mut Inkling2DsparkContext, &[MxArray], usize)> =
+                    Vec::with_capacity(extracted.len());
+                for e in &mut extracted {
+                    match &mut e.lane.ctx {
+                        Inkling2DraftContext::Dspark(dctx) => {
+                            call_args.push((dctx, e.open.tapped.as_slice(), e.keep));
+                        }
+                        Inkling2DraftContext::Dflash2(_) => {
+                            return items
+                                .iter()
+                                .map(|_| {
+                                    Err(Error::from_reason(
+                                        "scheduled Inkling2 DSpark batch encountered DFlash2 lane",
+                                    ))
+                                })
+                                .collect();
+                        }
+                    }
+                }
                 Inkling2DsparkContext::append_taps_batched(draft, &mut call_args)
             };
             match batch_res {
@@ -774,24 +1147,53 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
             .take()
             .ok_or_else(|| {
                 Error::from_reason(format!(
-                    "scheduled Inkling2 DSpark commit missing open taps for seq {seq}"
+                    "scheduled Inkling2 commit missing open taps for seq {seq}"
                 ))
             })?;
-        let draft = self.0.dspark.as_ref().ok_or_else(missing_draft)?;
-        let lane = self
-            .0
-            .scheduled_dspark
-            .seq_lanes
-            .get_mut(&seq)
-            .ok_or_else(|| missing_lane(seq))?;
-        lane.ctx.append_taps(draft, &open.tapped, keep)?;
-        lane.total_verifies += 1;
-        if open.lanes_in_wave >= 2 {
-            lane.multi_lane_wave_verifies += 1;
-        }
-        if open.drafted > 0 {
-            lane.adaptive_depth
-                .observe(open.drafted, keep.saturating_sub(1));
+        let (prev_pos, fused_kept) = {
+            let lane = self
+                .0
+                .scheduled_dspark
+                .seq_lanes
+                .get_mut(&seq)
+                .ok_or_else(|| missing_lane(seq))?;
+            let prev_pos = lane.ctx.committed_len() as u32;
+            let fused = match &mut lane.ctx {
+                Inkling2DraftContext::Dspark(dctx) => {
+                    let draft = self.0.dspark.as_ref().ok_or_else(missing_draft)?;
+                    dctx.append_taps(draft, &open.tapped, keep)?;
+                    None
+                }
+                Inkling2DraftContext::Dflash2(dctx) => {
+                    let draft = self.0.dflash2.as_ref().ok_or_else(missing_draft)?;
+                    if open.verify_tokens.len() < keep {
+                        return Err(Error::from_reason(format!(
+                            "scheduled Inkling2 DFlash2 commit token provenance len {} < keep {keep}",
+                            open.verify_tokens.len()
+                        )));
+                    }
+                    dctx.append_taps(draft, &open.tapped, &open.verify_tokens[..keep])?
+                }
+            };
+            lane.total_verifies += 1;
+            if open.lanes_in_wave >= 2 {
+                lane.multi_lane_wave_verifies += 1;
+            }
+            if open.drafted > 0 {
+                lane.adaptive_depth
+                    .observe(open.drafted, keep.saturating_sub(1));
+            }
+            (prev_pos, fused)
+        };
+        if let Some(fused_kept) = fused_kept
+            && self
+                .0
+                .paged
+                .as_ref()
+                .is_some_and(|rt| rt.seq_reuse_cache(seq))
+        {
+            self.0
+                .record_fused_to_draft_window_best_effort(seq, prev_pos, &fused_kept);
         }
         Ok(())
     }
@@ -799,6 +1201,7 @@ impl ScheduledDraftVerify for LaneVerify<'_> {
     fn discard_draft_owner(&mut self, seq: u32) {
         self.0.scheduled_dspark.seq_lanes.remove(&seq);
         self.0.scheduled_dspark.peer_tapes.remove(&seq);
+        self.0.scheduled_dspark.sync_decode_limit();
     }
 }
 
@@ -808,11 +1211,12 @@ mod unit_tests {
 
     fn mk_lane(open: bool) -> Inkling2ScheduledDsparkLane {
         Inkling2ScheduledDsparkLane {
-            ctx: Inkling2DsparkContext::new(3),
+            ctx: Inkling2DraftContext::Dspark(Inkling2DsparkContext::new(3)),
             adaptive_depth: AdaptiveDraftDepth::new(7),
             open: open.then(|| OpenInkling2Verify {
                 tape: Inkling2ShortConvTape::new(0),
                 tapped: Vec::new(),
+                verify_tokens: Vec::new(),
                 lanes_in_wave: 1,
                 drafted: 0,
             }),
@@ -1714,6 +2118,7 @@ mod tests {
 mod wave_grouper_tests {
     use std::collections::HashMap;
 
+    use crate::models::inkling2::dflash2::Inkling2DraftContext;
     use crate::models::inkling2::dspark::{AdaptiveDraftDepth, Inkling2DsparkContext};
     use crate::models::inkling2::short_conv::Inkling2ShortConvTape;
     use crate::transformer::paged_kv_cache_adapter::PagedRaggedRow;
@@ -1724,13 +2129,14 @@ mod wave_grouper_tests {
 
     fn make_lane(open: bool) -> Inkling2ScheduledDsparkLane {
         Inkling2ScheduledDsparkLane {
-            ctx: Inkling2DsparkContext::new(3),
+            ctx: Inkling2DraftContext::Dspark(Inkling2DsparkContext::new(3)),
             adaptive_depth: AdaptiveDraftDepth::new(7),
             open: open.then(|| OpenInkling2Verify {
                 tape: Inkling2ShortConvTape::new(0),
                 tapped: Vec::new(),
                 lanes_in_wave: 1,
                 drafted: 4,
+                verify_tokens: Vec::new(),
             }),
             total_verifies: 0,
             multi_lane_wave_verifies: 0,

@@ -632,7 +632,11 @@ export const MODEL_FAMILY_DATA = [
     acceptsDecodeShare: true,
     acceptsActivations: true,
     acceptsCacheDisk: true,
-    streamOpts: { recordModelPath: true },
+    /**
+     * Retains the native wire-renderer `Inkling2Model#applyChatTemplate`
+     * instead of installing the factory's path-backed Jinja tokenizer.
+     */
+    streamOpts: { recordModelPath: false, applyTemplate: false },
     traits: { reasoning: true, fallbackContextWindow: 1048576 },
     launchPreset: {
       sampling: INKLING2_SAMPLING_DEFAULTS,
@@ -935,6 +939,11 @@ export interface LoadModelOptions {
   /** Discover a Qwen DFlash2 companion on disk (default true). Explicit draftModelPath wins. */
   autoLoadDraft?: boolean;
   /**
+   * Optional auto-discovered external draft checkpoint path for `inkling2`
+   * (soft fallback on load failure when `autoLoadDraft` is enabled).
+   */
+  autoDraftModelPath?: string;
+  /**
    * Directory of an external draft checkpoint (config.json +
    * model.safetensors) loaded alongside the target for speculative decoding.
    * Gemma4 accepts either a DSpark draft or a Google gemma-4 assistant draft
@@ -1020,7 +1029,7 @@ export interface LoadModelOptions {
 export type FamilyLoadOptionFlag = Extract<keyof ModelFamilyData, `accepts${string}`>;
 
 /** Keys of {@link LoadModelOptions} gated by a per-family `accepts*` capability flag. */
-export type GatedLoadOptionKey = Exclude<keyof LoadModelOptions, 'autoLoadDraft'>;
+export type GatedLoadOptionKey = Exclude<keyof LoadModelOptions, 'autoLoadDraft' | 'autoDraftModelPath'>;
 
 /**
  * Single declarative table mapping every `accepts*` capability flag on

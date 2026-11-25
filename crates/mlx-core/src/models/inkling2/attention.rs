@@ -253,14 +253,17 @@ pub(crate) fn forward_linear_proj_fast_ex(
         } else {
             32
         };
-        let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 32 == 0 {
-            return super::kernels::inkling2_q8_sym_matmul_bf16(
-                x,
-                ql.get_weight(),
-                ql.get_scales(),
-                DType::BFloat16,
-            );
+        if x.ndim()? == 2 {
+            let m = x.shape_at(0)?;
+            let k = x.shape_at(1)?;
+            if m >= 1 && m <= max_m && k > 0 && k % 32 == 0 {
+                return super::kernels::inkling2_q8_sym_matmul_bf16(
+                    x,
+                    ql.get_weight(),
+                    ql.get_scales(),
+                    DType::BFloat16,
+                );
+            }
         }
     }
     #[cfg(target_os = "macos")]
@@ -274,11 +277,14 @@ pub(crate) fn forward_linear_proj_fast_ex(
         } else {
             32
         };
-        let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 4 == 0 {
-            let w = lin.get_weight();
-            if w.dtype()? == DType::BFloat16 && (include_tiny || w.shape()?[0] >= 256) {
-                return super::kernels::inkling2_bf16_linear(x, &w);
+        if x.ndim()? == 2 {
+            let m = x.shape_at(0)?;
+            let k = x.shape_at(1)?;
+            if m >= 1 && m <= max_m && k > 0 && k % 4 == 0 {
+                let w = lin.get_weight();
+                if w.dtype()? == DType::BFloat16 && (include_tiny || w.shape_at(0)? >= 256) {
+                    return super::kernels::inkling2_bf16_linear(x, &w);
+                }
             }
         }
     }
@@ -326,17 +332,20 @@ pub(crate) fn try_forward_q8_sym_with_bf16_aux(
         } else {
             32
         };
-        let xs = x.shape()?;
-        if xs.len() == 2 && xs[0] >= 1 && xs[0] <= max_m && xs[1] > 0 && xs[1] % 32 == 0 {
-            let w_aux = aux_lin.get_weight();
-            if w_aux.dtype()? == DType::BFloat16 {
-                return Ok(Some(super::kernels::inkling2_q8_sym_matmul_bf16_with_aux(
-                    x,
-                    ql.get_weight(),
-                    ql.get_scales(),
-                    &w_aux,
-                    DType::BFloat16,
-                )?));
+        if x.ndim()? == 2 {
+            let m = x.shape_at(0)?;
+            let k = x.shape_at(1)?;
+            if m >= 1 && m <= max_m && k > 0 && k % 32 == 0 {
+                let w_aux = aux_lin.get_weight();
+                if w_aux.dtype()? == DType::BFloat16 {
+                    return Ok(Some(super::kernels::inkling2_q8_sym_matmul_bf16_with_aux(
+                        x,
+                        ql.get_weight(),
+                        ql.get_scales(),
+                        &w_aux,
+                        DType::BFloat16,
+                    )?));
+                }
             }
         }
     }
@@ -609,7 +618,7 @@ impl Inkling2Attention {
         Option<MxArray>,
         Option<MxArray>,
     )> {
-        let t_i64 = x_q.shape()?[0];
+        let t_i64 = x_q.shape_at(0)?;
         let q_dim = (self.num_heads * self.head_dim) as i64;
         let r_dim = (self.num_heads * self.d_rel) as i64;
         let g_dim = q_dim;
@@ -784,26 +793,26 @@ impl Inkling2Attention {
         };
         let (x_k_inp, x_v_inp) = x_k_v.unwrap_or((x_q, x_q));
         let dyn_k = if let Some(dk) = dyn_k_flat {
-            Some(dk.reshape(&[t_i64, self.num_kv_heads as i64, self.k_conv.shape()?[1]])?)
+            Some(dk.reshape(&[t_i64, self.num_kv_heads as i64, self.k_conv.shape_at(1)?])?)
         } else if let Some(ref k_cp) = self.k_conv_proj {
             Some(
                 forward_linear_proj_fast_ex(k_cp, x_k_inp, dense_bf16)?.reshape(&[
                     t_i64,
                     self.num_kv_heads as i64,
-                    self.k_conv.shape()?[1],
+                    self.k_conv.shape_at(1)?,
                 ])?,
             )
         } else {
             None
         };
         let dyn_v = if let Some(dv) = dyn_v_flat {
-            Some(dv.reshape(&[t_i64, self.num_kv_heads as i64, self.v_conv.shape()?[1]])?)
+            Some(dv.reshape(&[t_i64, self.num_kv_heads as i64, self.v_conv.shape_at(1)?])?)
         } else if let Some(ref v_cp) = self.v_conv_proj {
             Some(
                 forward_linear_proj_fast_ex(v_cp, x_v_inp, dense_bf16)?.reshape(&[
                     t_i64,
                     self.num_kv_heads as i64,
-                    self.v_conv.shape()?[1],
+                    self.v_conv.shape_at(1)?,
                 ])?,
             )
         } else {

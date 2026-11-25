@@ -15,6 +15,7 @@ import { Button } from '../../components/arc/button/button';
 import { CopyButton } from '../../components/arc/copy-button/copy-button';
 import { DashboardApiError, mutate } from '../../lib/api';
 import { formatBytes, formatCount, formatNumber, formatRelativeTime, formatTps } from '../../lib/format';
+import { truncateMiddle } from '../../lib/labels';
 import { modelColor } from '../../lib/model-colors';
 import { dailyTurns, matchesModel, usageKeys, type ModelUsage } from '../../lib/model-usage';
 import { formatModelFamily, isSystemOneModelType } from '../../lib/system-one';
@@ -28,11 +29,13 @@ import {
   type ModelsResponse,
   type RuntimeLive,
 } from '../../lib/types';
+import { reloadMountedQueries } from '../../lib/use-api';
 
 const NO_USAGE = 'No recorded turns for this model in the last 30 days';
 const USAGE_FAILED = 'Usage could not be loaded';
 const DAILY_FAILED = 'Daily turns could not be loaded';
 const SEGMENT_CAP = 8;
+const LOCATED_MAX_CHARS = 48;
 
 /** The key a folder's usage and color go by: the busiest served id, else its first usage key. */
 export function usageKeyOf(model: Pick<LocalModel, 'name' | 'servedIds'>, usage: ModelUsage | undefined): string {
@@ -57,6 +60,24 @@ export function liveStateOf(model: Pick<LocalModel, 'name' | 'servedIds'>, live:
     if (process.loading.some((load) => matchesModel(model, load.model))) loading = true;
   }
   return { resident, loading };
+}
+
+/** "Linked" for a model whose files are on another disk, "Not connected" while that disk is away. */
+export function LocatedBadge({ located }: { located: LocalModel['located'] }): ReactElement | null {
+  if (located === null) return null;
+  if (!located.filesAvailable) {
+    return (
+      <Badge tone="warning" size="sm" title={located.from}>
+        Not connected
+      </Badge>
+    );
+  }
+  if (located.mode !== 'linked') return null;
+  return (
+    <Badge size="sm" outline title={located.from}>
+      Linked
+    </Badge>
+  );
 }
 
 export function LiveBadge({ state }: { state: LiveState }): ReactElement | null {
@@ -87,6 +108,10 @@ export interface DeleteTarget {
   name: string;
   sizeBytes: number;
   companion?: boolean;
+  /** A folder that Locate made: when its model files stay on disk, the delete only removes the model from the app. */
+  located?: LocalModel['located'];
+  /** The entry in the models folder is a link: the delete removes only the link. */
+  link?: boolean;
 }
 
 export interface DeleteHandlers {
@@ -107,34 +132,101 @@ const goneBeforeDelete = new Set<string>();
  * not-found answer means the entry left another way (Finder, the CLI, a lost answer), so it runs the success path and
  * the row leaves.
  */
+/**
+ * The delete of `target` only removes it from the app: Locate made its folder and its model files stay on disk. False
+ * when the folder holds the last name of a weight file, because then the delete frees its bytes.
+ */
+export function removesOnlyFromApp(target: DeleteTarget): boolean {
+  return target.companion !== true && target.located?.filesStay === true;
+}
+
 export function deleteContent(target: DeleteTarget, handlers: DeleteHandlers): ConfirmContent {
   const companion = target.companion === true;
+  const located = removesOnlyFromApp(target) ? (target.located ?? null) : null;
+  const name = <span className="font-medium text-foreground">{target.name}</span>;
+  const notice =
+    !companion && handlers.loaded === true
+      ? 'This model is loaded. It keeps working until inference restarts. After that it is gone.'
+      : undefined;
+  const remove = async (): Promise<void> => {
+    goneBeforeDelete.delete(target.name);
+    try {
+      // The Remove text is a promise: the server checks it again and answers a conflict when it no longer holds.
+      await mutate<DeleteModelResponse>(
+        'DELETE',
+        `/models/${encodeURIComponent(target.name)}`,
+        located !== null ? { keepsFiles: true } : undefined,
+      );
+    } catch (err) {
+      if (err instanceof DashboardApiError && err.code === 'E_CONFLICT') {
+        // The list read again turns this form into the danger Delete, which the user confirms anew.
+        reloadMountedQueries();
+        throw err;
+      }
+      if (!(err instanceof DashboardApiError) || err.code !== 'E_NOT_FOUND') throw err;
+      goneBeforeDelete.add(target.name);
+    }
+  };
+  if (located !== null) {
+    return {
+      title: 'Remove model?',
+      description: (
+        <>
+          This removes {name} from the app. Its model files stay on disk; you located them in{' '}
+          <span className="font-medium text-foreground" title={located.from}>
+            {truncateMiddle(located.from, LOCATED_MAX_CHARS)}
+          </span>
+          .
+        </>
+      ),
+      notice,
+      confirmLabel: 'Remove',
+      workingLabel: 'Removing…',
+      successLabel: 'Removed',
+      tone: 'neutral',
+      errorTitle: 'Failed to remove model',
+      onConfirm: remove,
+      onDone: () => {
+        const gone = goneBeforeDelete.delete(target.name);
+        toast.success(gone ? 'Model was already gone' : 'Model removed', { description: target.name });
+        handlers.onDeleted(target.name);
+      },
+    };
+  }
+  if (target.link === true) {
+    return {
+      title: 'Remove link?',
+      description: (
+        <>This removes the link {name} from the models folder. Its folder and the model files in it are not changed.</>
+      ),
+      notice,
+      confirmLabel: 'Remove link',
+      workingLabel: 'Removing…',
+      successLabel: 'Removed',
+      tone: 'neutral',
+      errorTitle: 'Failed to remove link',
+      onConfirm: remove,
+      onDone: () => {
+        const gone = goneBeforeDelete.delete(target.name);
+        toast.success(gone ? 'Link was already gone' : 'Link removed', { description: target.name });
+        handlers.onDeleted(target.name);
+      },
+    };
+  }
   return {
     title: companion ? 'Delete companion weights?' : 'Delete model?',
     description: (
       <>
-        This permanently removes <span className="font-medium text-foreground">{target.name}</span> (
-        {formatBytes(target.sizeBytes)}) from disk. This cannot be undone.
+        This permanently removes {name} ({formatBytes(target.sizeBytes)}) from disk. This cannot be undone.
       </>
     ),
-    notice:
-      !companion && handlers.loaded === true
-        ? 'This model is loaded. It keeps working until inference restarts. After that it is gone.'
-        : undefined,
+    notice,
     confirmLabel: 'Delete',
     workingLabel: 'Deleting…',
     successLabel: 'Deleted',
     tone: 'danger',
     errorTitle: companion ? 'Failed to delete companion' : 'Failed to delete model',
-    onConfirm: async () => {
-      goneBeforeDelete.delete(target.name);
-      try {
-        await mutate<DeleteModelResponse>('DELETE', `/models/${encodeURIComponent(target.name)}`);
-      } catch (err) {
-        if (!(err instanceof DashboardApiError) || err.code !== 'E_NOT_FOUND') throw err;
-        goneBeforeDelete.add(target.name);
-      }
-    },
+    onConfirm: remove,
     onDone: () => {
       const gone = goneBeforeDelete.delete(target.name);
       const what = companion ? 'Companion' : 'Model';
@@ -232,6 +324,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
               showLogo
               maxChars={30}
             />
+            <LocatedBadge located={model.located} />
             <LiveBadge state={state} />
           </span>
         );
@@ -255,7 +348,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
     {
       id: 'quant',
       header: 'Quant',
-      width: 104,
+      width: 124,
       sortValue: (model) => model.quant ?? '',
       cell: (model) =>
         model.quant === null ? (
@@ -270,7 +363,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
       id: 'context',
       header: 'Context',
       align: 'end',
-      width: 84,
+      width: 96,
       minTableWidth: 800,
       sortValue: (model) => model.contextWindow,
       cell: (model) => (
@@ -373,7 +466,7 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
         <ConfirmPopover
           trigger={{
             kind: 'icon',
-            label: `Delete ${model.name}`,
+            label: `${removesOnlyFromApp(model) ? 'Remove' : 'Delete'} ${model.name}`,
             icon: <Trash2 size={16} strokeWidth={1.75} aria-hidden="true" />,
             size: 'sm',
           }}

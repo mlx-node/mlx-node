@@ -4,6 +4,7 @@
  * or predicted, and every edge that was not recorded is flagged as inferred.
  */
 
+import type { EventSegment } from './events.js';
 import type { ParsedUpdates } from './transcript.js';
 import type {
   SessionTimelineResponse,
@@ -58,6 +59,8 @@ export interface LaneSource {
   entries: DigestEntry[];
   retries: RetryLine[];
   lastTs: number;
+  /** Phase timings from sibling `events.jsonl`, when present. */
+  eventSpans?: readonly EventSegment[];
 }
 
 /** Facts about one child id from the parent's folder, known without reading the child's events. */
@@ -220,7 +223,7 @@ export interface LaneSpan {
   status: TimelineSpan['status'];
   /** Recorded with zero length: kept, never cut away. */
   zero: boolean;
-  phase: 'reasoning' | 'answer';
+  phase: 'reasoning' | 'answer' | 'tool-call';
   until: 'text' | 'tool' | 'open';
   tools: string[];
   calls: number;
@@ -508,8 +511,290 @@ export function placeRetries(spans: readonly LaneSpan[], retries: readonly Retry
   return unplaced;
 }
 
-function isActivityOrPrompt(e: DigestEntry): boolean {
-  return e.kind === 'user' || e.kind === 'wake' || e.kind === 'assistant' || e.kind === 'thinking' || e.kind === 'tool';
+/** Max ms delta between an `events.jsonl` stream end and its coalesced `updates.jsonl` flush. */
+const EVENT_MATCH_TOLERANCE_MS = 500;
+
+type TimedItem =
+  | DigestEntry
+  | { kind: 'event-gen'; ts: number; end: number; phase: 'reasoning' | 'answer' | 'tool-call' };
+
+/** Causal tie-breaker when items from `updates.jsonl` and `events.jsonl` share the exact same millisecond. */
+function timedSortRank(item: TimedItem): number {
+  switch (item.kind) {
+    case 'user':
+    case 'wake':
+    case 'model':
+      return 0;
+    case 'thinking':
+      return 1;
+    case 'assistant':
+      return 2;
+    case 'event-gen':
+      return item.phase === 'reasoning' ? 1 : item.phase === 'answer' ? 2 : 3;
+    case 'plan':
+      return 3;
+    case 'tool':
+      return 4;
+    case 'subagent':
+      return 5;
+    case 'turn-end':
+      return 6;
+  }
+}
+
+function isActivityOrPrompt(e: { kind: string }): boolean {
+  return (
+    e.kind === 'user' ||
+    e.kind === 'wake' ||
+    e.kind === 'assistant' ||
+    e.kind === 'thinking' ||
+    e.kind === 'tool' ||
+    e.kind === 'event-gen'
+  );
+}
+
+function segmentOverlaps(seg: EventSegment, lo: number, hi: number, running: boolean): boolean {
+  const end = seg.end ?? (running ? Infinity : seg.lastEnd);
+  if (seg.start === end) return seg.start >= lo && seg.start <= hi;
+  return end > lo && seg.start < hi;
+}
+
+type GenEventSegment = EventSegment & { kind: 'reasoning' | 'answer' | 'tool-call' };
+
+interface ResolvedGenEvent {
+  kind: 'reasoning' | 'answer' | 'tool-call';
+  start: number;
+  end: number;
+}
+
+interface Barrier {
+  ts: number;
+  /**
+   * Causal side at `ts`: `false` precedes same-ms generation (`user`, `wake`, tool completion);
+   * `true` follows same-ms generation (`tool` start, `subagent` spawn, `turn-end`).
+   */
+  afterGen: boolean;
+}
+
+interface PhaseIndex {
+  segs: ResolvedGenEvent[];
+  /** `prefixMaxEnd[i] = max(segs[0..i].end)`, monotonically non-decreasing. */
+  prefixMaxEnd: number[];
+}
+
+interface GenEventIndex {
+  reasoning: PhaseIndex;
+  answer: PhaseIndex;
+}
+
+function buildBarriers(rawTimed: readonly DigestEntry[]): Barrier[] {
+  const barriers: Barrier[] = [];
+  for (const e of rawTimed) {
+    if (e.kind === 'tool') {
+      barriers.push({ ts: e.ts, afterGen: true });
+      if (e.endTs !== null && e.endTs > e.ts) barriers.push({ ts: e.endTs, afterGen: false });
+    } else if (e.kind === 'subagent') {
+      if (!e.noSpawn) barriers.push({ ts: e.ts, afterGen: true });
+    } else if (e.kind === 'user' || e.kind === 'wake') {
+      barriers.push({ ts: e.ts, afterGen: false });
+    } else if (e.kind === 'turn-end') {
+      barriers.push({ ts: e.ts, afterGen: true });
+    }
+  }
+  barriers.sort((a, b) => a.ts - b.ts || (a.afterGen ? 1 : 0) - (b.afterGen ? 1 : 0));
+  return barriers;
+}
+
+/** Whether any loop-separating barrier lies causally between a generation boundary at `loTs` and one at `hiTs`. */
+function hasBarrierBetween(barriers: readonly Barrier[], loTs: number, hiTs: number): boolean {
+  if (barriers.length === 0 || loTs >= hiTs) return false;
+  const idx = firstIndex(barriers, (b) => b.ts > loTs || (b.ts === loTs && b.afterGen));
+  if (idx >= barriers.length) return false;
+  const b = barriers[idx]!;
+  return b.ts < hiTs || (b.ts === hiTs && !b.afterGen);
+}
+
+function buildPhaseIndex(segs: ResolvedGenEvent[]): PhaseIndex {
+  segs.sort((a, b) => a.start - b.start || a.end - b.end);
+  const prefixMaxEnd: number[] = Array.from({ length: segs.length }, () => -Infinity);
+  let maxEnd = -Infinity;
+  for (let i = 0; i < segs.length; i += 1) {
+    if (segs[i]!.end > maxEnd) maxEnd = segs[i]!.end;
+    prefixMaxEnd[i] = maxEnd;
+  }
+  return { segs, prefixMaxEnd };
+}
+
+function buildGenEventIndex(genEvents: readonly ResolvedGenEvent[]): GenEventIndex {
+  const reasoning: ResolvedGenEvent[] = [];
+  const answer: ResolvedGenEvent[] = [];
+  for (const seg of genEvents) {
+    if (seg.kind === 'reasoning') reasoning.push(seg);
+    else if (seg.kind === 'answer') answer.push(seg);
+  }
+  return { reasoning: buildPhaseIndex(reasoning), answer: buildPhaseIndex(answer) };
+}
+
+function segmentCoversEntry(
+  seg: ResolvedGenEvent,
+  entryTs: number,
+  entryEnd: number,
+  barriers: readonly Barrier[],
+): boolean {
+  if (entryTs < seg.start - EVENT_MATCH_TOLERANCE_MS || entryEnd > seg.end + EVENT_MATCH_TOLERANCE_MS) {
+    return false;
+  }
+  if (entryTs > seg.end) return !hasBarrierBetween(barriers, seg.end, entryTs);
+  if (entryEnd < seg.start) return !hasBarrierBetween(barriers, entryEnd, seg.start);
+  return true;
+}
+
+/** Whether a coalesced `updates.jsonl` thinking/assistant entry is already represented by an `events.jsonl` segment. */
+function coveredByEvent(
+  entry: Extract<DigestEntry, { kind: 'assistant' | 'thinking' }>,
+  index: GenEventIndex,
+  barriers: readonly Barrier[],
+): boolean {
+  const { segs, prefixMaxEnd } = entry.kind === 'thinking' ? index.reasoning : index.answer;
+  if (segs.length === 0) return false;
+  const entryEnd = Math.max(entry.ts, entry.endTs);
+  const minEnd = entryEnd - EVENT_MATCH_TOLERANCE_MS;
+  const maxStart = entry.ts + EVENT_MATCH_TOLERANCE_MS;
+  const nextBarrierIdx = firstIndex(barriers, (b) => b.ts > entry.ts || (b.ts === entry.ts && b.afterGen));
+  const prevBarrier = nextBarrierIdx > 0 ? barriers[nextBarrierIdx - 1]! : null;
+  const lo = firstIndex(
+    prefixMaxEnd,
+    (maxEnd) =>
+      maxEnd >= minEnd &&
+      (prevBarrier === null ||
+        maxEnd >= entry.ts ||
+        maxEnd > prevBarrier.ts ||
+        (maxEnd === prevBarrier.ts && !prevBarrier.afterGen)),
+  );
+  for (let j = lo; j < segs.length; j += 1) {
+    const seg = segs[j]!;
+    if (seg.start > maxStart) break;
+    if (seg.start > entryEnd && hasBarrierBetween(barriers, entryEnd, seg.start)) break;
+    if (segmentCoversEntry(seg, entry.ts, entryEnd, barriers)) return true;
+  }
+  return false;
+}
+
+/**
+ * Earliest timestamp in `rawTimed` that cannot belong to an open `events.jsonl` segment (e.g. `events.jsonl` lagged
+ * behind `updates.jsonl` while a tool, prompt, turn end, or opposite text phase already landed).
+ */
+function openEventCap(
+  seg: EventSegment,
+  rawTimed: readonly DigestEntry[],
+  closedIndex: GenEventIndex,
+  barriers: readonly Barrier[],
+): number | null {
+  const lastEnd = Math.max(seg.start, seg.lastEnd);
+  const startIdx = firstIndex(rawTimed, (e) => e.ts >= seg.start);
+  for (let i = startIdx; i < rawTimed.length; i += 1) {
+    const e = rawTimed[i]!;
+    let incompatible = false;
+    switch (e.kind) {
+      case 'tool':
+        incompatible = e.ts > seg.start || (e.ts === seg.start && (e.endTs === null || e.endTs > seg.start));
+        break;
+      case 'subagent':
+        incompatible =
+          !e.noSpawn && (e.ts > seg.start || (e.ts === seg.start && (e.endTs === null || e.endTs > seg.start)));
+        break;
+      case 'turn-end':
+        incompatible = e.ts >= seg.start;
+        break;
+      case 'wake':
+        incompatible = e.ts > seg.start;
+        break;
+      case 'user':
+        incompatible = e.interjection ? e.ts > lastEnd : e.ts > seg.start;
+        break;
+      case 'assistant':
+        incompatible =
+          seg.kind !== 'answer' &&
+          (seg.kind === 'reasoning' || seg.kind === 'wait-model' ? e.ts >= seg.start : e.ts > seg.start) &&
+          !coveredByEvent(e, closedIndex, barriers);
+        break;
+      case 'thinking':
+        incompatible =
+          seg.kind !== 'reasoning' &&
+          (seg.kind === 'wait-model' ? e.ts >= seg.start : e.ts > seg.start) &&
+          !coveredByEvent(e, closedIndex, barriers);
+        break;
+      case 'plan':
+      case 'model':
+        break;
+    }
+    if (incompatible) return e.ts;
+  }
+  return null;
+}
+
+/** Resolve generation segments from `events.jsonl`, bounding any open segment before later incompatible work. */
+function resolveGenEvents(
+  genEvents: readonly GenEventSegment[],
+  rawTimed: readonly DigestEntry[],
+  running: boolean,
+  barriers: readonly Barrier[],
+): ResolvedGenEvent[] {
+  let closedIndex: GenEventIndex | null = null;
+  const getClosedIndex = (): GenEventIndex => {
+    if (closedIndex === null) {
+      const closed: ResolvedGenEvent[] = [];
+      for (const seg of genEvents) {
+        if (seg.end !== null) closed.push({ kind: seg.kind, start: seg.start, end: Math.max(seg.start, seg.end) });
+      }
+      closedIndex = buildGenEventIndex(closed);
+    }
+    return closedIndex;
+  };
+  const resolved: ResolvedGenEvent[] = [];
+  for (const seg of genEvents) {
+    if (seg.end !== null) {
+      let end = Math.max(seg.start, seg.end);
+      if (seg.kind === 'tool-call' && end > seg.start) {
+        for (let bIdx = firstIndex(barriers, (b) => b.ts >= seg.start); bIdx < barriers.length; bIdx += 1) {
+          const b = barriers[bIdx]!;
+          if (b.ts >= end) break;
+          if (b.afterGen) {
+            end = b.ts;
+            break;
+          }
+        }
+        if (end <= seg.start) continue;
+      }
+      resolved.push({ kind: seg.kind, start: seg.start, end });
+      continue;
+    }
+    const index = getClosedIndex();
+    const capTs = openEventCap(seg, rawTimed, index, barriers);
+    if (capTs === null) {
+      const end = running ? Infinity : Math.max(seg.start, seg.lastEnd);
+      resolved.push({ kind: seg.kind, start: seg.start, end });
+      continue;
+    }
+    let end = Math.max(seg.start, Math.min(capTs, seg.lastEnd));
+    const matchingKind = seg.kind === 'reasoning' ? 'thinking' : seg.kind === 'answer' ? 'assistant' : null;
+    if (matchingKind !== null) {
+      let matchedEnd = -Infinity;
+      const lo = firstIndex(rawTimed, (e) => e.ts >= seg.start - EVENT_MATCH_TOLERANCE_MS);
+      for (let i = lo; i < rawTimed.length; i += 1) {
+        const e = rawTimed[i]!;
+        if (e.ts > capTs) break;
+        if (e.kind !== matchingKind) continue;
+        if (coveredByEvent(e, index, barriers)) continue;
+        matchedEnd = Math.max(matchedEnd, Math.min(capTs, Math.max(e.ts, e.endTs)));
+      }
+      if (matchedEnd > end + EVENT_MATCH_TOLERANCE_MS) {
+        end = Math.max(seg.start, Math.min(capTs, matchedEnd));
+      }
+    }
+    resolved.push({ kind: seg.kind, start: seg.start, end });
+  }
+  return resolved;
 }
 
 interface Activity {
@@ -522,35 +807,93 @@ interface Activity {
 
 /**
  * The spans of one lane from its own entries, by one cursor walk: the model was asked (`request`) or was streaming
- * (`stream`). Retries are model request retries of the same lane.
+ * (`stream`). Retries are model request retries of the same lane. When `eventSpans` from sibling `events.jsonl` are
+ * provided, they supply exact wait/reasoning/answer/tool-call timings instead of `updates.jsonl`'s coalesced end times.
  */
 export function laneSpans(
   entries: readonly DigestEntry[],
   retries: readonly RetryLine[],
   bounds: LaneBounds,
+  eventSpans: readonly EventSegment[] = [],
 ): LaneResult {
-  const timed = entries.filter((e) => e.ts > 0).sort((a, b) => a.ts - b.ts);
+  const rawTimed = entries.filter((e) => e.ts > 0).sort((a, b) => a.ts - b.ts);
 
-  const nextNonTool: Array<number | null> = Array.from({ length: timed.length }, () => null);
-  const nextNonSpawn: Array<number | null> = Array.from({ length: timed.length }, () => null);
-  const nextOwn: Array<number | null> = Array.from({ length: timed.length }, () => null);
-  let lastWork = -1;
-  for (let i = timed.length - 1; i >= 0; i -= 1) {
-    const after = timed[i + 1];
-    nextNonTool[i] = after === undefined ? null : after.kind === 'tool' ? nextNonTool[i + 1]! : after.ts;
-    // A spawn line is part of the spawn call that runs around it: it never ends a spawn tool.
-    nextNonSpawn[i] =
-      after === undefined ? null : after.kind === 'tool' || after.kind === 'subagent' ? nextNonSpawn[i + 1]! : after.ts;
-    nextOwn[i] = after === undefined ? null : isActivityOrPrompt(after) ? after.ts : nextOwn[i + 1]!;
-    const kind = timed[i]!.kind;
-    if (lastWork === -1 && (isActivityOrPrompt(timed[i]!) || kind === 'subagent' || kind === 'turn-end')) lastWork = i;
+  let rawLastWork = -1;
+  for (let i = rawTimed.length - 1; i >= 0; i -= 1) {
+    const kind = rawTimed[i]!.kind;
+    if (isActivityOrPrompt(rawTimed[i]!) || kind === 'subagent' || kind === 'turn-end') {
+      rawLastWork = i;
+      break;
+    }
   }
   // A lane whose last line is its own turn end has nothing under way, even while its session runs: it ends there.
-  const stopMs = lastWork !== -1 && timed[lastWork]!.kind === 'turn-end' ? timed[lastWork]!.ts : null;
+  const stopMs = rawLastWork !== -1 && rawTimed[rawLastWork]!.kind === 'turn-end' ? rawTimed[rawLastWork]!.ts : null;
   const laneStop = bounds.end ?? (stopMs === null ? null : { ms: stopMs, exact: true });
   const running = laneStop === null;
   const laneEnd = laneStop === null ? Infinity : laneStop.ms;
   const laneEndExact = laneStop === null || laneStop.exact;
+
+  const windowEvents =
+    eventSpans.length === 0 ? [] : eventSpans.filter((seg) => segmentOverlaps(seg, bounds.fromMs, laneEnd, running));
+  const barriers = windowEvents.length === 0 ? [] : buildBarriers(rawTimed);
+  const genEvents = windowEvents.filter((seg): seg is GenEventSegment => seg.kind !== 'wait-model');
+  const resolvedGenEvents = genEvents.length === 0 ? [] : resolveGenEvents(genEvents, rawTimed, running, barriers);
+
+  let timed: TimedItem[];
+  if (resolvedGenEvents.length === 0) {
+    timed = rawTimed;
+  } else {
+    const resolvedIndex = buildGenEventIndex(resolvedGenEvents);
+    const cursors = { reasoning: 0, answer: 0 };
+    timed = [];
+    for (const e of rawTimed) {
+      if (e.kind === 'assistant' || e.kind === 'thinking') {
+        const phase = e.kind === 'thinking' ? 'reasoning' : 'answer';
+        const { segs, prefixMaxEnd } = resolvedIndex[phase];
+        let cursor = cursors[phase];
+        while (
+          cursor < segs.length &&
+          (prefixMaxEnd[cursor]! < e.ts - EVENT_MATCH_TOLERANCE_MS ||
+            (prefixMaxEnd[cursor]! < e.ts && hasBarrierBetween(barriers, prefixMaxEnd[cursor]!, e.ts)))
+        ) {
+          cursor += 1;
+        }
+        cursors[phase] = cursor;
+        const entryEnd = Math.max(e.ts, e.endTs);
+        let covered = false;
+        for (let j = cursor; j < segs.length; j += 1) {
+          const seg = segs[j]!;
+          if (seg.start > e.ts + EVENT_MATCH_TOLERANCE_MS) break;
+          if (seg.start > entryEnd && hasBarrierBetween(barriers, entryEnd, seg.start)) break;
+          if (segmentCoversEntry(seg, e.ts, entryEnd, barriers)) {
+            covered = true;
+            break;
+          }
+        }
+        if (covered) continue;
+      }
+      timed.push(e);
+    }
+    for (const seg of resolvedGenEvents) {
+      timed.push({ kind: 'event-gen', ts: seg.start, end: seg.end, phase: seg.kind });
+    }
+    timed.sort((a, b) => a.ts - b.ts || timedSortRank(a) - timedSortRank(b));
+  }
+
+  const nextNonToolIdx: number[] = Array.from({ length: timed.length }, () => -1);
+  const nextNonSpawnIdx: number[] = Array.from({ length: timed.length }, () => -1);
+  const nextOwn: Array<number | null> = Array.from({ length: timed.length }, () => null);
+  let lastWork = -1;
+  for (let i = timed.length - 1; i >= 0; i -= 1) {
+    const after = timed[i + 1];
+    nextNonToolIdx[i] = after === undefined ? -1 : after.kind === 'tool' ? nextNonToolIdx[i + 1]! : i + 1;
+    // A spawn line is part of the spawn call that runs around it: it never ends a spawn tool.
+    nextNonSpawnIdx[i] =
+      after === undefined ? -1 : after.kind === 'tool' || after.kind === 'subagent' ? nextNonSpawnIdx[i + 1]! : i + 1;
+    nextOwn[i] = after === undefined ? null : isActivityOrPrompt(after) ? after.ts : nextOwn[i + 1]!;
+    const kind = timed[i]!.kind;
+    if (lastWork === -1 && (isActivityOrPrompt(timed[i]!) || kind === 'subagent' || kind === 'turn-end')) lastWork = i;
+  }
 
   const generate: LaneSpan[] = [];
   const tools: Array<{ span: LaneSpan; spawn: boolean; order: number }> = [];
@@ -558,14 +901,27 @@ export function laneSpans(
   const lineWaits: LaneSpan[] = [];
 
   timed.forEach((e, i) => {
-    if (e.kind === 'assistant' || e.kind === 'thinking') {
+    if (e.kind === 'event-gen') {
+      generate.push(draft('generate', e.ts, e.end, { phase: e.phase }));
+      activities.push({ type: 'text', start: e.ts, end: e.end, endInferred: false, order: i });
+    } else if (e.kind === 'assistant' || e.kind === 'thinking') {
       const open = running && i === lastWork;
       const end = open ? Infinity : Math.max(e.ts, e.endTs);
       generate.push(draft('generate', e.ts, end, { phase: e.kind === 'thinking' ? 'reasoning' : 'answer' }));
       activities.push({ type: 'text', start: e.ts, end, endInferred: false, order: i });
     } else if (e.kind === 'tool') {
       const spawn = SPAWN_TOOL_NAMES.has(e.name);
-      const next = spawn ? nextNonSpawn[i]! : nextNonTool[i]!;
+      const nextIdx = spawn ? nextNonSpawnIdx : nextNonToolIdx;
+      let j = nextIdx[i]!;
+      while (j !== -1) {
+        const cand = timed[j]!;
+        if (cand.kind === 'event-gen' && cand.end <= e.ts) {
+          j = nextIdx[j]!;
+          continue;
+        }
+        break;
+      }
+      const next = j === -1 ? null : timed[j]!.ts;
       let end: number;
       let inferredEnd = false;
       if (e.endTs !== null) {
@@ -677,6 +1033,32 @@ export function laneSpans(
   }
   if (running && after === 'request' && cursor !== Infinity) {
     modelWaits.push(draft('wait-model', cursor, Infinity, { inferredStart: !exact, until: 'open' }));
+  }
+  let closedResolvedIndex: GenEventIndex | null = null;
+  for (const seg of windowEvents) {
+    if (seg.kind !== 'wait-model') continue;
+    const open = seg.end === null;
+    let capTs: number | null = null;
+    if (open) {
+      closedResolvedIndex ??= buildGenEventIndex(resolvedGenEvents.filter((s) => s.end !== Infinity));
+      capTs = openEventCap(seg, rawTimed, closedResolvedIndex, barriers);
+    }
+    if (capTs !== null && capTs <= seg.start) continue;
+    const end = open
+      ? capTs !== null
+        ? capTs
+        : running
+          ? Infinity
+          : Math.max(seg.start, laneEnd)
+      : Math.max(seg.start, seg.end!);
+    const inferredEnd = open && capTs === null && !running && !laneEndExact;
+    modelWaits.push(
+      draft('wait-model', seg.start, end, {
+        inferredEnd,
+        status: end === Infinity ? 'running' : inferredEnd ? 'unfinished' : 'ok',
+        until: seg.until ?? 'open',
+      }),
+    );
   }
 
   let spans = stack([...generate, ...blockSpans, ...mergeTouching(lineWaits), ...modelWaits]);
@@ -1001,7 +1383,9 @@ export function buildTimeline(
       clips: [{ lo: U, hi: E ?? (running ? Infinity : p.closeMs), window: true }],
       nextOwnMs,
     },
+    input.parent.eventSpans ?? [],
   );
+  for (const span of main.spans) if (span.end !== Infinity) lastEventMs = Math.max(lastEventMs, span.end);
   unplacedRetries += main.unplacedRetries;
   if (S < U) main.spans.unshift(draft('idle', S, U));
   const mainStatus: TimelineLaneStatus =
@@ -1067,7 +1451,7 @@ export function buildTimeline(
       else if (!source.ok) {
         bar(source.noSteps);
         if (source.fileBytes !== null) fileBytes = source.fileBytes;
-      } else if (source.source.entries.length === 0) {
+      } else if (source.source.entries.length === 0 && (source.source.eventSpans?.length ?? 0) === 0) {
         bar('empty');
       } else {
         const spawn = run.spawn;
@@ -1076,7 +1460,10 @@ export function buildTimeline(
           const stop = 'endTs' in e && e.endTs !== null ? Math.max(e.ts, e.endTs) : e.ts;
           return e.ts <= runHi && stop >= spawn;
         });
-        if (inRun.length === 0) {
+        const childEvents = source.source.eventSpans ?? [];
+        const inRunEvents =
+          childEvents.length === 0 ? [] : childEvents.filter((seg) => segmentOverlaps(seg, spawn, runHi, runRunning));
+        if (inRun.length === 0 && inRunEvents.length === 0) {
           bar('out-of-range');
         } else {
           allBars = false;
@@ -1095,6 +1482,7 @@ export function buildTimeline(
               ],
               nextOwnMs: null,
             },
+            inRunEvents,
           );
           if (lane.cut[0] === true) clamped = true;
           unplacedRetries += lane.unplacedRetries;

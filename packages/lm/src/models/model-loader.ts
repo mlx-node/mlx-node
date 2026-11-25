@@ -142,6 +142,7 @@ const LOADER_BINDINGS = {
     load: (modelPath: string, options?: LoadModelOptions) => {
       const filtered: Inkling2LoadOptions = {
         ...filterFamilyLoadOptions('inkling2', options),
+        ...(options?.autoDraftModelPath !== undefined ? { autoDraftModelPath: options.autoDraftModelPath } : {}),
         ...(options?.autoLoadDraft !== undefined ? { autoLoadDraft: options.autoLoadDraft } : {}),
       };
       return Inkling2Model.load(modelPath, Object.keys(filtered).length === 0 ? null : filtered);
@@ -227,11 +228,12 @@ function dispatchLoad(
 ): Promise<unknown> {
   validateFamilyLoadOptions(modelType, modelPath, options);
   const binding: LoaderBinding = LOADER_BINDINGS[modelType];
-  // Inkling2 discovers colocated DSpark companions natively with soft fallback on
-  // incompatible drafts; forwarding an automatic pick as `draftModelPath` would
-  // elevate it to an explicit draft whose failure aborts startup. Instead honor
-  // explicit `draftModelPath` directly and propagate `autoLoadDraft: false` when
-  // opted out or unsupported on the active backend.
+  // Inkling2 discovers colocated/sibling DFlash2 (`draft/`, `inkling-2-mini-dflash2/`)
+  // and bundled DSpark (`mtp.safetensors`, `dspark-*.gguf`) natively with soft fallback
+  // on incompatible drafts; forwarding an automatic local pick as `draftModelPath` would
+  // elevate it to an explicit draft whose failure aborts startup. Instead honor explicit
+  // `draftModelPath` directly and propagate `autoLoadDraft: false` when opted out or
+  // unsupported on the active backend.
   if (modelType === 'inkling2') {
     if (options?.draftModelPath !== undefined) {
       return binding.load(modelPath, options);

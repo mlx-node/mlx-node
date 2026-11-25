@@ -97,6 +97,74 @@ The [desktop release workflow](../../.github/workflows/desktop-release.yml) prod
   with the native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it
   and run `mlx-node.exe`; no Apple signing or automatic update feed is used.
 
+Stable Windows ARM64 builds also produce two workflow artifacts (kept off GitHub Releases):
+
+- `mlx-node-desktop-windows-arm64-msix`: unsigned `mlx-node-<version>-win32-arm64.msix`
+  for Microsoft Store Partner Center ingestion.
+- `mlx-node-desktop-winget-manifests`: WinGet 1.12.0 multi-file manifests pointing at
+  the GitHub Release `win32-arm64.zip` archive.
+
+## Microsoft Store (Windows ARM64 MSIX)
+
+Stable `package:windows` runs invoke the Windows SDK's `MakePri.exe` and `MakeAppx.exe`
+to produce `mlx-node-<version>-win32-arm64.msix` using the Partner Center Store identity
+`LongYinan.Portato` (reserved Store display name `Portato`, `runFullTrust`, `arm64`,
+`Windows.Desktop` `MinVersion="10.0.26100.0"`, and `Microsoft.VCLibs.140.00.UWPDesktop`).
+Because Microsoft Store Partner Center rejects packages whose `<Identity Version>` starts
+with `0.` (Major must be `1..65535`, Minor/Build `0..65535`, Revision `0`), each stable
+semver `MAJOR.MINOR.PATCH` (`MAJOR <= 65534`) is mapped to Store identity version
+`(MAJOR + 1).MINOR.PATCH.0` (for example, `0.0.21` → `1.0.21.0`, `0.1.0` → `1.1.0.0`,
+`1.0.0` → `2.0.0.0`) so Store versions stay strictly monotonic across `0.x` and `1.x+`.
+Prerelease and `+build` versions skip MSIX packaging because the Microsoft Store forbids
+prerelease identifiers and build metadata. Pass `--skip-msix` for local portable-only
+builds, or override identity fields via `MSIX_IDENTITY_NAME`, `MSIX_PUBLISHER`,
+`MSIX_PUBLISHER_DISPLAY_NAME`, and `MSIX_DISPLAY_NAME`.
+
+To submit a release to the Microsoft Store:
+
+1. Download the `mlx-node-desktop-windows-arm64-msix` artifact from the tagged
+   **Desktop Release** workflow run.
+2. Upload the `.msix` directly to Partner Center for **Portato**; Partner Center signs
+   the package with Microsoft's Store certificate during ingestion. The unsigned `.msix`
+   is intentionally excluded from GitHub Releases because Windows refuses to sideload
+   unsigned packages.
+3. Disclose the runtime system requirements in the Partner Center Store listing:
+   Windows 11 24H2 (OS build `26100` or newer) on ARM64 and an NVIDIA RTX Spark GPU
+   with NVIDIA R615+ drivers (required by CUDA 13.4 on Windows on Arm).
+
+When running inside a Store MSIX container (`process.windowsStore === true`), the app
+disables in-app auto-updates, hides update menu items, and disables external `mlx agent`
+binary downloads/updates so updates flow exclusively through the Microsoft Store.
+
+## WinGet (Windows Package Manager)
+
+WinGet distributes the portable `mlx-node-<version>-win32-arm64.zip` release asset as a
+nested portable package (`ArchiveBinariesDependOnPath: true`, `mlx-node` command alias).
+
+For the one-time initial submission to `microsoft/winget-pkgs`:
+
+1. Download the `mlx-node-desktop-winget-manifests` artifact from a stable release run,
+   or generate the manifests locally (pass `--tag <release-tag>` if the GitHub release
+   tag omits the default `v` prefix):
+
+   ```bash
+   yarn workspace @mlx-node/desktop winget:manifests \
+     --version <version> \
+     --zip packages/desktop/out/mlx-node-<version>-win32-arm64.zip
+   ```
+
+2. Copy the generated `manifests/<letter>/<Publisher>/<App>/<version>/` directory into
+   a fork of `microsoft/winget-pkgs`, verify with `winget validate --manifest <dir>`,
+   and open the initial PR.
+
+For automatic WinGet PRs on every subsequent stable release, configure the repository
+secret `WINGET_TOKEN` (a GitHub PAT with `public_repo` scope) and optionally set the
+`WINGET_PACKAGE_ID` repository variable (defaults to `mlx-node.mlx-node`). Once the
+GitHub release is published (even if the subsequent Homebrew cask bump fails), the
+workflow's `winget` job installs a pinned, SHA-256-verified Komac binary in a
+credential-free step, then runs `komac update <package-id> --version <version> --urls <exact-release-tag-zip-url> --submit`
+with `WINGET_TOKEN` scoped strictly to that submission step via `GITHUB_TOKEN`.
+
 The macOS DMG and update ZIP contain the same Developer ID signed, notarized, and stapled app. The ZIP is
 created after stapling, then extracted to verify its signature, ticket, and version
 before publication. Dry runs build and verify the macOS and Windows archives but

@@ -574,11 +574,11 @@ describe('palette contents', () => {
         sizeBytes: 5 * 1024 ** 3,
         fileCount: 3,
         servedIds: [],
+        located: null,
       },
     ],
     warnings: [],
     dir: '/m',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
   const SESSION_ID = '019a0000-0000-7000-8000-00000000abcd';
   const SESSIONS = {
@@ -655,6 +655,8 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: ['gguf-dir/q8', 'gguf-dir/q4'],
+        located: null,
+        link: false,
       },
       {
         name: 'b-plain',
@@ -665,6 +667,8 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: [],
+        located: null,
+        link: false,
       },
       {
         name: 'zeta-7b',
@@ -675,11 +679,12 @@ describe('model colors', () => {
         sizeBytes: 1,
         fileCount: 1,
         servedIds: ['zeta-7b'],
+        located: null,
+        link: false,
       },
     ],
     warnings: [],
     dir: '/m',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
 
   beforeEach(() => resetModelColors());

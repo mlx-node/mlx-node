@@ -423,13 +423,28 @@ describe('Clairic System One', () => {
     expect(native.extractRaw).toHaveBeenCalledTimes(1);
   });
 
+  // MUTATION: the Anthropic body cap back to 10 MiB -> the 12 MiB bodies get 'Request body too large'.
+  it('reads a 12 MiB body on /v1/messages and /v1/messages/count_tokens', async () => {
+    const base = await start(new ModelRegistry());
+    const twelveMiB = JSON.stringify({ data: 'x'.repeat(12 * 1024 * 1024) });
+    for (const route of ['/v1/messages', '/v1/messages/count_tokens']) {
+      const response = await fetch(`${base}${route}`, { method: 'POST', body: twelveMiB });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toMatchObject({ error: { message: 'Missing required field: model' } });
+    }
+  });
+
   it('closes keep-alive connections after oversized bodies on /v1/responses, /v1/messages, and /v1/messages/count_tokens', async () => {
     const registry = new ModelRegistry();
     const base = await start(registry);
-    const elevenMiB = JSON.stringify({ data: 'x'.repeat(11 * 1024 * 1024) });
     const agent = new Agent({ keepAlive: true, maxSockets: 1 });
     try {
-      for (const route of ['/v1/responses', '/v1/messages', '/v1/messages/count_tokens']) {
+      for (const [route, mebibytes] of [
+        ['/v1/responses', 11],
+        ['/v1/messages', 17],
+        ['/v1/messages/count_tokens', 17],
+      ] as const) {
+        const oversized = JSON.stringify({ data: 'x'.repeat(mebibytes * 1024 * 1024) });
         const rejected = await new Promise<{ status: number; connection: string | undefined; body: unknown }>(
           (resolve, reject) => {
             let settled = false;
@@ -438,7 +453,7 @@ describe('Clairic System One', () => {
               {
                 method: 'POST',
                 agent,
-                headers: { 'Content-Length': Buffer.byteLength(elevenMiB) },
+                headers: { 'Content-Length': Buffer.byteLength(oversized) },
               },
               (res) => {
                 let text = '';
@@ -470,7 +485,7 @@ describe('Clairic System One', () => {
               }
             });
             req.setTimeout(5000, () => req.destroy(new Error(`oversized request timed out on ${route}`)));
-            req.end(elevenMiB);
+            req.end(oversized);
           },
         );
         expect(rejected.status).toBe(400);

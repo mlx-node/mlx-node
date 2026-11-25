@@ -22,6 +22,7 @@ import {
   createFolderPicker,
   FOLDER_DIALOG_OPTIONS,
   windowBackground,
+  windowChromeOptions,
 } from '../src/main/window-policy.js';
 import * as windowPolicy from '../src/main/window-policy.js';
 
@@ -125,9 +126,12 @@ describe('the preload contract', () => {
     expect(source).toContain(`'${FOLDER_PICKED_MESSAGE}'`);
   });
 
-  it('passes only the request id of a folder request to MAIN', () => {
-    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId)`);
-    expect(source).toContain(`type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId)`);
+  it('passes only the request id and a fixed purpose word of a folder request to MAIN', () => {
+    expect(source).toContain(`ipcRenderer.send(CONTROL_PANEL_PICK_FOLDER_CHANNEL, message.requestId, message.purpose)`);
+    expect(source).toContain(
+      `type === PICK_FOLDER_MESSAGE && isRequestId(message.requestId) && isFolderPurpose(message.purpose)`,
+    );
+    expect(source).toContain(`return value === 'work' || value === 'model';`);
     expect(source).toContain(`window.postMessage({ type: FOLDER_PICKED_MESSAGE, requestId, path: folder }, '*')`);
   });
 
@@ -187,6 +191,15 @@ describe('window chrome', () => {
   it('centres the traffic lights in the 40 px title bar', () => {
     expect(TRAFFIC_LIGHT_POSITION).toEqual({ x: 14, y: 14 });
   });
+
+  it('uses hiddenInset traffic lights on macOS and native frame controls on Windows and Linux', () => {
+    expect(windowChromeOptions('darwin')).toEqual({
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: TRAFFIC_LIGHT_POSITION,
+    });
+    expect(windowChromeOptions('win32')).toEqual({ autoHideMenuBar: true });
+    expect(windowChromeOptions('linux')).toEqual({ autoHideMenuBar: true });
+  });
 });
 
 describe('the folder dialog', () => {
@@ -245,11 +258,11 @@ describe('the folder dialog', () => {
 
   const settle = () => new Promise((resolve) => setImmediate(resolve));
 
-  it('opens the fixed dialog on our window and answers the asking sender with the chosen folder', async () => {
+  it('opens the fixed dialog of each purpose on our window and answers the asking sender with the chosen folder', async () => {
     const t = setup();
-    t.pick({ sender: t.contents }, 'req-1');
-    expect(t.calls).toEqual([{ win: t.win, options: FOLDER_DIALOG_OPTIONS }]);
-    expect(FOLDER_DIALOG_OPTIONS).toEqual({
+    t.pick({ sender: t.contents }, 'req-1', 'work');
+    expect(t.calls).toEqual([{ win: t.win, options: FOLDER_DIALOG_OPTIONS.work }]);
+    expect(FOLDER_DIALOG_OPTIONS.work).toEqual({
       title: 'Choose a folder for Work',
       buttonLabel: 'Choose',
       properties: ['openDirectory', 'createDirectory'],
@@ -257,34 +270,71 @@ describe('the folder dialog', () => {
     t.answer({ canceled: false, filePaths: ['/Users/me/code/app'] });
     await settle();
     expect(t.sent).toEqual([{ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['req-1', '/Users/me/code/app'] }]);
+
+    t.pick({ sender: t.contents }, 'req-2', 'model');
+    expect(t.calls.at(-1)).toEqual({ win: t.win, options: FOLDER_DIALOG_OPTIONS.model });
+    expect(FOLDER_DIALOG_OPTIONS.model).toEqual({
+      title: 'Locate model files',
+      message: 'Choose the folder that holds the model files.',
+      buttonLabel: 'Locate',
+      properties: ['openDirectory', 'showHiddenFiles'],
+    });
+    t.answer({ canceled: false, filePaths: ['/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF'] });
+    await settle();
+    expect(t.sent.at(-1)).toEqual({
+      channel: CONTROL_PANEL_FOLDER_CHANNEL,
+      args: ['req-2', '/Users/me/.lmstudio/models/unsloth/Qwen3.8-27B-GGUF'],
+    });
   });
 
-  it('answers null on cancel, on a dialog failure, and to a second request while one is open', async () => {
+  it('answers null on cancel, on a dialog failure, and to a second request of either purpose while one is open', async () => {
     const t = setup();
-    t.pick({ sender: t.contents }, 'a');
-    t.pick({ sender: t.contents }, 'b');
+    t.pick({ sender: t.contents }, 'a', 'work');
+    t.pick({ sender: t.contents }, 'b', 'work');
+    t.pick({ sender: t.contents }, 'b2', 'model');
     expect(t.calls).toHaveLength(1);
-    expect(t.sent).toEqual([{ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['b', null] }]);
+    expect(t.sent).toEqual([
+      { channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['b', null] },
+      { channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['b2', null] },
+    ]);
     t.answer({ canceled: true, filePaths: ['/ignored'] });
     await settle();
     expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['a', null] });
-    t.pick({ sender: t.contents }, 'c');
+    t.pick({ sender: t.contents }, 'm', 'model');
+    t.pick({ sender: t.contents }, 'w', 'work');
+    expect(t.calls).toHaveLength(2);
+    expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['w', null] });
+    t.answer({ canceled: true, filePaths: [] });
+    await settle();
+    expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['m', null] });
+    t.pick({ sender: t.contents }, 'c', 'work');
     t.fail();
     await settle();
     expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['c', null] });
-    t.pick({ sender: t.contents }, 'd');
+    t.pick({ sender: t.contents }, 'd', 'model');
     t.answer({ canceled: false, filePaths: [] });
     await settle();
     expect(t.sent.at(-1)).toEqual({ channel: CONTROL_PANEL_FOLDER_CHANNEL, args: ['d', null] });
   });
 
+  it('opens nothing for an unknown purpose and answers it null', async () => {
+    const t = setup();
+    for (const purpose of [undefined, '', 'Work', 'models', 7, { title: 'x' }]) {
+      t.pick({ sender: t.contents }, 'p', purpose);
+    }
+    await settle();
+    expect(t.calls).toEqual([]);
+    expect(t.sent).toHaveLength(6);
+    expect(t.sent.every((sent) => sent.args[1] === null)).toBe(true);
+  });
+
   it('ignores another sender, a bad request id, and a request with no window', async () => {
     const t = setup();
     const otherSent: Sent[] = [];
-    t.pick({ sender: sender(otherSent) }, 'x');
-    for (const id of ['', 'x'.repeat(65), 42, null, { path: '/etc' }]) t.pick({ sender: t.contents }, id);
+    t.pick({ sender: sender(otherSent) }, 'x', 'work');
+    for (const id of ['', 'x'.repeat(65), 42, null, { path: '/etc' }]) t.pick({ sender: t.contents }, id, 'model');
     t.noWindow();
-    t.pick({ sender: t.contents }, 'y');
+    t.pick({ sender: t.contents }, 'y', 'work');
     await settle();
     expect(t.calls).toEqual([]);
     expect(t.sent).toEqual([]);

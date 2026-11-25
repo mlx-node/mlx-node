@@ -14,7 +14,7 @@ export interface LiveSample {
   t: number;
   /** The process these values belong to; null = no process was running. */
   pid: number | null;
-  /** 0 = running and idle. */
+  /** 0 = running and idle; null = no running process, or turns in flight without decode yet (e.g. prefilling). */
   outTps: number | null;
   memActive: number | null;
   memCache: number | null;
@@ -62,7 +62,7 @@ function samplesOf(snapshot: RuntimeLive): LiveSample[] {
     out.push({
       t: snapshot.now,
       pid: process.pid,
-      outTps: process.decodeTps ?? 0,
+      outTps: process.decodeTps ?? (inFlight > 0 ? null : 0),
       memActive: process.mem.active,
       memCache: process.mem.cache,
       inFlight,

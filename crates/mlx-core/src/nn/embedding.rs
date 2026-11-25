@@ -343,6 +343,30 @@ impl Embedding {
         }
     }
 
+    /// Return the resident MLX weight arrays actually backing this embedding
+    /// without triggering on-demand full-table dequantization for packed
+    /// quantized embeddings.
+    pub(crate) fn resident_weight_arrays(&self) -> Vec<MxArray> {
+        let mut arrays = Vec::new();
+        if let Some(ref m) = self.gguf_q8_0_mmap {
+            arrays.push(m.buf.clone());
+        } else if let Some(ref q) = self.quantized_packed {
+            arrays.push(q.weight.clone());
+            arrays.push(q.scales.clone());
+            if let Some(ref b) = q.biases {
+                arrays.push(b.clone());
+            }
+        } else if let Some(ref sh) = self.sharded {
+            arrays.extend(sh.shards.iter().cloned());
+        } else {
+            arrays.push(self.weight.clone());
+        }
+        if let Some(ref h) = self.hadamard {
+            arrays.push(h.signs.clone());
+        }
+        arrays
+    }
+
     /// Load quantized embedding weights (LEGACY pre-dequantized path).
     ///
     /// Pre-dequantizes the full table into `self.weight` — the packed
@@ -1381,5 +1405,38 @@ mod tests {
         let mut emb = Embedding::new(5, 3).expect("emb");
         emb.set_sharded(vec![z(2, 3), z(2, 3), z(1, 3)], 2)
             .expect("well-formed shards must install");
+    }
+
+    #[test]
+    fn resident_weight_arrays_never_dequantizes_packed_embeddings() {
+        let vocab = 8i64;
+        let hidden = 64i64;
+        let n = (vocab * hidden) as usize;
+        let data: Vec<f32> = (0..n).map(|i| ((i % 11) as f32 - 5.0) * 0.02).collect();
+        let dense = MxArray::from_float32(&data, &[vocab, hidden])
+            .expect("from_float32")
+            .astype(DType::BFloat16)
+            .expect("bf16");
+        let (qw, qs, qb) = quantize_affine(&dense, 64, 4);
+
+        let mut emb = Embedding::new(vocab as u32, hidden as u32).expect("new");
+        emb.load_quantized_packed(&qw, &qs, Some(&qb), 64, 4, "affine")
+            .expect("load packed affine");
+
+        let arrays = emb.resident_weight_arrays();
+        assert_eq!(
+            arrays.len(),
+            3,
+            "packed affine returns weight+scales+biases"
+        );
+        assert_eq!(
+            emb.packed_full_dequant_calls(),
+            0,
+            "resident_weight_arrays must never call get_weight() or trigger full dequant"
+        );
+
+        let mut dense_emb = Embedding::new(vocab as u32, hidden as u32).expect("new dense");
+        dense_emb.load_weight(&dense).expect("load dense");
+        assert_eq!(dense_emb.resident_weight_arrays().len(), 1);
     }
 }

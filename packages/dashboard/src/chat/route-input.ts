@@ -1,10 +1,27 @@
 /**
  * The input law of the Chat routes: every body is checked against its exact field list, and nothing from the page
- * is passed through. Only the message text (and, in Work, the folder) reach the agent, and the text never starts
- * with `/`: the agent runs such text as a slash command (`/yolo` turns every permission prompt off).
+ * is passed through. Only the message text, its checked attachments (and, in Work, the folder) reach the agent, and
+ * the text never starts with `/`: the agent runs such text as a slash command (`/yolo` turns every permission prompt
+ * off).
  */
 
 import { ApiError } from '../api/errors.js';
+import {
+  ATTACH_MAX,
+  base64Bytes,
+  FILE_NUMBERED_MAX_BYTES,
+  IMAGE_MAX_BASE64_CHARS,
+  IMAGE_MAX_BYTES,
+  isBase64,
+  magicMatches,
+  MESSAGE_FILES_MAX_BYTES,
+  NAME_IN_MAX_CHARS,
+  numberedBytes,
+  safeName,
+  wellFormed,
+  utf8Bytes,
+  type AttachmentInput,
+} from './attachment-rule.js';
 import { isProviderId, isSearchProviderId } from './providers/settings.js';
 import type { ProviderId, ProviderSelectionInput } from './providers/types.js';
 import { chatRouteError } from './route-errors.js';
@@ -48,7 +65,7 @@ function bad(message: string): ApiError {
   return ApiError.badRequest(message);
 }
 
-type FieldKind = 'string' | 'boolean';
+type FieldKind = 'string' | 'boolean' | 'array';
 
 /**
  * The body as a plain object whose keys are all in `allowed` with the listed types, and every `required` key set.
@@ -64,7 +81,8 @@ function exactBody(
   for (const key of Object.keys(record)) {
     const kind = Object.hasOwn(allowed, key) ? allowed[key] : undefined;
     if (kind === undefined) throw bad(`Unknown field "${fieldName(key)}".`);
-    if (typeof record[key] !== kind) throw bad(`Field "${fieldName(key)}" has the wrong type.`);
+    const fits = kind === 'array' ? Array.isArray(record[key]) : typeof record[key] === kind;
+    if (!fits) throw bad(`Field "${fieldName(key)}" has the wrong type.`);
   }
   for (const key of required) if (!Object.hasOwn(record, key)) throw bad(`Field "${key}" is required.`);
   return record;
@@ -93,6 +111,58 @@ function checkMode(value: unknown): ChatMode {
   return value;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]): boolean {
+  const own = Object.keys(record);
+  return own.length === keys.length && keys.every((key) => Object.hasOwn(record, key));
+}
+
+function checkAttachment(item: unknown): { attachment: AttachmentInput; textBytes: number } {
+  const refused = chatRouteError('attachment-refused');
+  if (!isPlainObject(item)) throw refused;
+  if (item.kind === 'file') {
+    if (!hasExactKeys(item, ['kind', 'name', 'text'])) throw refused;
+    const { name, text } = item;
+    if (typeof name !== 'string' || name.length === 0 || name.length > NAME_IN_MAX_CHARS) throw refused;
+    if (typeof text !== 'string' || !wellFormed(text) || text.includes('\0') || text.trim() === '') throw refused;
+    const textBytes = numberedBytes(text);
+    if (textBytes > FILE_NUMBERED_MAX_BYTES) throw refused;
+    return { attachment: { kind: 'file', name: safeName(name), text }, textBytes };
+  }
+  if (item.kind === 'image') {
+    if (!hasExactKeys(item, ['kind', 'mediaType', 'data'])) throw refused;
+    const { mediaType, data } = item;
+    if (mediaType !== 'image/png' && mediaType !== 'image/jpeg') throw refused;
+    if (typeof data !== 'string' || data.length < 4 || data.length > IMAGE_MAX_BASE64_CHARS) throw refused;
+    if (!isBase64(data) || base64Bytes(data) > IMAGE_MAX_BYTES || !magicMatches(mediaType, data)) throw refused;
+    return { attachment: { kind: 'image', mediaType, data }, textBytes: 0 };
+  }
+  throw refused;
+}
+
+/**
+ * The attachments of a message, every limit checked: at most {@link ATTACH_MAX}; a file is well-formed text with no
+ * NUL and a cleaned name; a picture is PNG or JPEG base64 whose first bytes match its type; the message text and the
+ * numbered file text together stay under the agent's prompt cut. Empty is no attachments. Any failure is
+ * `attachment-refused`.
+ */
+export function checkAttachments(value: unknown[], text: string): AttachmentInput[] | undefined {
+  if (value.length === 0) return undefined;
+  if (value.length > ATTACH_MAX) throw chatRouteError('attachment-refused');
+  let bytes = utf8Bytes(text);
+  const out: AttachmentInput[] = [];
+  for (const item of value) {
+    const { attachment, textBytes } = checkAttachment(item);
+    bytes += textBytes;
+    out.push(attachment);
+  }
+  if (bytes > MESSAGE_FILES_MAX_BYTES) throw chatRouteError('attachment-refused');
+  return out;
+}
+
 function checkModelId(value: string): string {
   if (value === '' || value.length > MAX_MODEL_ID_CHARS) throw bad('Field "modelId" is not a model id.');
   return value;
@@ -105,12 +175,13 @@ export interface CreateConversationInput {
   cwd?: string;
   /** Work: the New screen's draft id. The mode picked for it is the Control Panel's record, never the page's word. */
   draft?: string;
+  attachments?: AttachmentInput[];
 }
 
 export function createConversationInput(body: unknown): CreateConversationInput {
   const record = exactBody(
     body,
-    { mode: 'string', text: 'string', modelId: 'string', cwd: 'string', draft: 'string' },
+    { mode: 'string', text: 'string', modelId: 'string', cwd: 'string', draft: 'string', attachments: 'array' },
     ['mode', 'text'],
   );
   const mode = checkMode(record.mode);
@@ -128,12 +199,20 @@ export function createConversationInput(body: unknown): CreateConversationInput 
     if (!isIdShape(draft)) throw bad('Field "draft" is not a draft id.');
     input.draft = draft;
   }
+  const attachments = attachmentsOf(record.attachments, input.text);
+  if (attachments !== undefined) input.attachments = attachments;
   return input;
 }
 
-export function promptInput(body: unknown): { text: string } {
-  const record = exactBody(body, { text: 'string' }, ['text']);
-  return { text: checkText(record.text as string) };
+function attachmentsOf(value: unknown, text: string): AttachmentInput[] | undefined {
+  return value === undefined ? undefined : checkAttachments(value as unknown[], text);
+}
+
+export function promptInput(body: unknown): { text: string; attachments?: AttachmentInput[] } {
+  const record = exactBody(body, { text: 'string', attachments: 'array' }, ['text']);
+  const text = checkText(record.text as string);
+  const attachments = attachmentsOf(record.attachments, text);
+  return attachments === undefined ? { text } : { text, attachments };
 }
 
 export type InteractionAnswerInput = { optionId: string } | { decision: 'approved' | 'rejected'; feedback?: string };

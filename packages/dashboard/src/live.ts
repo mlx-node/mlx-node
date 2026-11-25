@@ -55,6 +55,8 @@ export interface RuntimeLiveModel {
   } | null;
   /** Routed experts per layer held in memory; null when the model reports none or the engine is older. */
   experts: { inMemory: number; total: number; streaming: boolean } | null;
+  /** The loaded model's own answer to whether it takes pictures; null when it could not be asked or the engine is older. */
+  images: boolean | null;
 }
 
 export interface RuntimeLiveTurn {
@@ -133,8 +135,13 @@ export interface SupervisorLive {
   nativeErrorsCapped: boolean;
   lastNativeErrorContext: string | null;
   lastNativeErrorAt: number | null;
+  /** Why the last start failed, one line; set only while `restarting` or `failed`. */
+  failureReason: string | null;
   writtenAt: number;
 }
+
+/** The writer caps `failureReason` at 300 characters; a longer one is dropped, not shown. */
+const FAILURE_REASON_MAX = 300;
 
 export interface RuntimeLive {
   now: number;
@@ -292,6 +299,7 @@ function parseModel(value: unknown): RuntimeLiveModel | null {
     queueLimit,
     pool,
     experts: parseExperts(value.experts),
+    images: typeof value.images === 'boolean' ? value.images : null,
   };
 }
 
@@ -436,11 +444,13 @@ export function parseSupervisorFile(value: unknown, isAlive: (pid: number) => bo
   const lastNativeErrorAt = finOrNull(value.lastNativeErrorAt);
   const lastNativeErrorContext = strOrNull(value.lastNativeErrorContext);
   const healthStatus = value.healthStatus === null ? null : oneOf(value.healthStatus, HEALTH);
+  const failureReason = value.failureReason === undefined ? null : strOrNull(value.failureReason);
   if (mainPid === null || writtenAt === null || state === null || pid === undefined || generation === null) return null;
   if (streak === null || shortLivedFailures === null) return null;
   if (nativeErrorCount === null || lastNativeErrorAt === undefined) return null;
   if (lastNativeErrorContext === undefined || typeof value.nativeErrorsCapped !== 'boolean') return null;
   if (value.healthStatus !== null && healthStatus === null) return null;
+  if (failureReason === undefined) return null;
   let lastExit: SupervisorLive['lastExit'] = null;
   if (value.lastExit !== null) {
     const exit = value.lastExit;
@@ -465,6 +475,7 @@ export function parseSupervisorFile(value: unknown, isAlive: (pid: number) => bo
     nativeErrorsCapped: value.nativeErrorsCapped,
     lastNativeErrorContext,
     lastNativeErrorAt,
+    failureReason: failureReason !== null && failureReason.length <= FAILURE_REASON_MAX ? failureReason : null,
     writtenAt,
   };
 }

@@ -93,7 +93,7 @@ describe('the rule on a models folder', () => {
       const tag = splitNameTail(model.path).tag;
       return tag !== undefined && tag !== 'BF16' && tag !== 'F16' && tag !== 'F32';
     });
-    expect(tagged).toHaveLength(14);
+    expect(tagged).toHaveLength(15);
     for (const model of tagged) expect(configQuantLabel(model.config)).toBe(splitNameTail(model.path).tag);
   });
 });
@@ -148,12 +148,28 @@ describe('the config label', () => {
     );
   });
 
-  it('reads a foreign quantization_config only for the gemma and float-quantized methods', () => {
+  it('reads a foreign quantization_config only for the gemma, float-quantized and modelopt methods', () => {
     expect(configQuantLabel({ quantization_config: { quant_method: 'gemma', num_bits: 4 } })).toBe('4-bit');
     expect(
       configQuantLabel({ quantization_config: { quant_method: 'compressed-tensors', format: 'float-quantized' } }),
     ).toBe('FP8');
     expect(configQuantLabel({ quantization_config: { quant_method: 'modelopt' } })).toBeUndefined();
+    expect(configQuantLabel({ quantization_config: { quant_method: 'modelopt', quant_algo: 7 } })).toBeUndefined();
+    expect(configQuantLabel({ quantization_config: { quant_method: 'awq', bits: 4 } })).toBeUndefined();
+  });
+
+  it('reads modelopt as its algorithm', () => {
+    expect(configQuantLabel({ quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' } })).toBe('NVFP4');
+    expect(configQuantLabel({ quantization_config: { quant_method: 'modelopt', quant_algo: 'fp8' } })).toBe('FP8');
+    expect(
+      folderVariant('heron-2-mini', {
+        torch_dtype: 'bfloat16',
+        quantization_config: { quant_method: 'modelopt', quant_algo: 'NVFP4' },
+      }),
+    ).toEqual({ base: 'heron-2-mini', variant: 'NVFP4' });
+  });
+
+  it('is undefined for a config with no quantization', () => {
     expect(configQuantLabel({ torch_dtype: 'bfloat16' })).toBeUndefined();
     expect(configQuantLabel(undefined)).toBeUndefined();
   });

@@ -27,6 +27,7 @@
  */
 
 import type {
+  CatalogItem,
   CatalogResponse,
   DownloadsResponse,
   LocalModel,
@@ -154,7 +155,43 @@ function localModel(overrides: Partial<LocalModel>): LocalModel {
     sizeBytes: 4_800_000_000,
     fileCount: 7,
     servedIds: [],
+    located: null,
+    link: false,
     ...overrides,
+  };
+}
+
+/** A catalog entry of one build that is not on disk. */
+function catalogItem(
+  label: string,
+  description: string,
+  hfRepo: string,
+  sizeGb: number,
+  isDefault?: true,
+): CatalogItem {
+  return {
+    label,
+    description,
+    ...(isDefault === undefined ? {} : { isDefault }),
+    builds: [
+      {
+        id: 'UD-Q4_K_XL',
+        hfRepo,
+        sizeGb,
+        source: 'GGUF',
+        slug: hfRepo.slice(hfRepo.indexOf('/') + 1).toLowerCase(),
+        installed: false,
+        present: false,
+        heldBy: null,
+        blockedByForeignDir: false,
+        blocker: null,
+        localRevision: null,
+        localAssetsRepo: null,
+        localAssetsRevision: null,
+        located: null,
+        listed: false,
+      },
+    ],
   };
 }
 
@@ -164,58 +201,26 @@ function modelsRoutes(): Record<string, unknown> {
     models: [localModel({}), localModel({ name: 'gemma-4-12b', modelType: 'gemma4', quant: null })],
     warnings: [],
     dir: '/models',
-    host: { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
   };
-  // Three visible entries, matching the served catalog — one of them the default.
+  // As served below 96 GiB: two chat entries, one of them the default, and a System One entry in its own section.
   const catalog: CatalogResponse = {
     items: [
+      catalogItem('Qwen3.8-27B', 'Best tool use — recommended default', 'unsloth/Qwen3.8-27B-GGUF', 17.7, true),
+      catalogItem('Inkling-2-Mini', 'Vision MoE, fast decode', 'unsloth/Inkling-2-Mini-GGUF', 18.7),
       {
-        label: 'Qwen3.8-27B',
-        hfRepo: 'Brooooooklyn/Qwen3.8-27B-MXFP4-mlx',
-        sizeGb: 23.3,
-        description: 'Best tool use — recommended default',
-        slug: 'qwen3.8-27b-mxfp4-mlx',
-        isDefault: true,
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
-      },
-      {
-        label: 'Qwen-AgentWorld-35B-A3B',
-        hfRepo: 'Brooooooklyn/Qwen-AgentWorld-35B-A3B-mxfp4-mlx',
-        sizeGb: 23.3,
-        description: 'Agent-tuned MoE, fast decode',
-        slug: 'qwen-agentworld-35b-a3b-mxfp4-mlx',
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
-      },
-      {
-        label: 'Gemma-4-26B-A4B',
-        hfRepo: 'Brooooooklyn/Gemma-4-26B-A4B-Unsloth-MXFP4-mlx',
-        sizeGb: 16.2,
-        description: 'MoE, fast decode',
-        slug: 'gemma-4-26b-a4b-unsloth-mxfp4-mlx',
-        installed: false,
-        present: false,
-        blockedByForeignDir: false,
-        blocker: null,
-        localRevision: null,
-        localAssetsRepo: null,
-        localAssetsRevision: null,
+        ...catalogItem('Clairic Flash (9B)', 'Structured extraction', 'Brooooooklyn/Clairic-Flash-GGUF', 7.6),
+        category: 'systemone',
       },
     ],
   };
   const downloads: DownloadsResponse = { jobs: [] };
-  return { '/models': models, '/catalog': catalog, '/catalog/updates': { items: [] }, '/downloads': downloads };
+  return {
+    '/models': models,
+    '/host': { totalMemBytes: 64 * 1024 ** 3, diskFreeBytes: null },
+    '/catalog': catalog,
+    '/catalog/updates': { items: [] },
+    '/downloads': downloads,
+  };
 }
 
 const MODEL_HEADS = ['Model', 'Family', 'Quant', 'Context', 'Size', 'Activity (30 d)', 'Decode', 'Last used', ''];
@@ -248,10 +253,10 @@ describe('Models page — the loading tree holds the loaded page’s box', () =>
 
   it('builds the recommended-models placeholders out of the same panels', async () => {
     const { loading, loaded } = await shapesAcrossLoad(page(), modelsRoutes(), (text) =>
-      text.includes('Qwen-AgentWorld-35B-A3B'),
+      text.includes('Clairic Flash (9B)'),
     );
     expect(loading.skeletons).toBeGreaterThan(0);
-    expect(loaded.catalogCards).toBe(3);
+    expect(loaded.catalogCards).toBe(2);
     expect(loading.catalogCards).toBe(loaded.catalogCards);
   });
 });

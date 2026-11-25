@@ -5,10 +5,14 @@
  * Model metadata (family label, quantization, context window) is parsed from
  * each checkpoint's `config.json`; the family label runs the registry's own
  * `matchFamily`, reached through the native-free `@mlx-node/agent/catalog`
- * subpath.
+ * subpath. A folder whose weights are GGUF takes its quantization from the
+ * GGUF file name instead, by the engine's name parser
+ * (`@mlx-node/lm/model-variant`, native-free). A GGUF folder with no `config.json`
+ * takes its family from the GGUF header (`@mlx-node/lm/gguf-metadata`, native-free).
  */
 
 import {
+  accessSync,
   closeSync,
   constants,
   type Dir,
@@ -21,6 +25,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
 } from 'node:fs';
@@ -28,18 +33,24 @@ import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 
 import { matchFamily } from '@mlx-node/agent/catalog';
-import { isGgufCompanionName } from '@mlx-node/lm/model-discovery';
+import { readGgufArchitectureSync } from '@mlx-node/lm/gguf-metadata';
+import { bareGgufFamily, ggufSplitPartNames, isGgufCompanionName } from '@mlx-node/lm/model-discovery';
+import { ggufNames, ggufVariant } from '@mlx-node/lm/model-variant';
 
 export interface LocalModel {
   /** Checkpoint directory name under `modelsDir` (the model's local id). */
   name: string;
   /** Absolute path to the checkpoint directory. */
   path: string;
-  /** Family label from `config.json` (`qwen3`, `qwen3_5`, `gemma4`, …). */
+  /** Family label from `config.json` (`qwen3`, `qwen3_5`, `gemma4`, …), or from the GGUF header without one. */
   modelType: string;
-  /** Quantization label (`mxfp4`, `affine-4bit`, …), or `null` for full-precision. */
+  /**
+   * Quantization label. For GGUF weights ({@link ggufBuildLabel}) the build the file name states (`UD-Q4_K_XL`,
+   * `Q4_K_M`, `BF16`), or `GGUF` when the folder holds several builds or the name states none. Otherwise from the
+   * `config.json` quant block (`mxfp4`, `affine-4bit`, …), or `null` for full-precision.
+   */
   quant: string | null;
-  /** Trained context window from `max_position_embeddings`, or `null` if absent. */
+  /** Trained context window from `config.json` ({@link detectContextWindow}), or `null` if absent. */
   contextWindow: number | null;
   /** Total size on disk of the checkpoint directory, recursively. */
   sizeBytes: number;
@@ -51,18 +62,21 @@ export interface LocalModel {
    * directory serves nothing, or when discovery could not run.
    */
   servedIds: string[];
+  /** Set when Locate made the folder from files the user already had ({@link locatedState}). */
+  located: LocatedState | null;
+  /** The entry at {@link path} is a link: Delete removes only the link ({@link deleteLocalModel}). */
+  link: boolean;
 }
 
 /** Draft-only storage, managed on disk but excluded from standalone model lists. */
 export type LocalCompanion = Pick<LocalModel, 'name' | 'path' | 'sizeBytes' | 'fileCount'>;
 
-/** `/api/models`: the inventory plus what the host can say about room to grow it. */
+/** `/api/models`: the inventory of the models folder. This Mac's memory and free disk are `/api/host`. */
 export interface ModelsResponse {
   models: LocalModel[];
   companions: LocalCompanion[];
   warnings: string[];
   dir: string;
-  host: { totalMemBytes: number; diskFreeBytes: number | null };
 }
 
 /**
@@ -102,6 +116,79 @@ export interface DownloadCompletion {
   assetsRevision?: string;
   /** ISO timestamp of the atomic publish. */
   completedAt: string;
+  /**
+   * Written only by Update, which adds a marker to a folder the app did not create: the `lstat` size and
+   * `mtimeNs` (decimal digits) of every listed file as Update proved it. Any other file in that folder is the
+   * user's. A later owned update, backup recovery and the sidecar refresh read it: they delete a file of such a
+   * folder only when this record lists it and its size and `mtimeNs` still match, and keep everything else. A
+   * record in any other shape reads as `{}`, which proves nothing, so nothing is deleted. The mlx CLI carries it
+   * when it rewrites the marker.
+   */
+  adopted?: Record<string, { size: number; mtimeNs: string }>;
+  /**
+   * Written only by Locate: the weight-like files of this folder ({@link isLinkableFile}) are second names of files
+   * in `from` (`shared`, same disk) or links to them (`linked`, another disk). Every other file is the app's own.
+   * The mlx CLI carries it when it rewrites the marker.
+   */
+  located?: LocatedRecord;
+}
+
+/** The `located` record of a marker written by Locate. */
+export interface LocatedRecord {
+  /** The real path of the folder the user located. */
+  from: string;
+  mode: 'shared' | 'linked';
+}
+
+/** Whether `from` is an absolute POSIX, Windows drive (`C:\` / `C:/`), or UNC (`\\server\share`) path without NULs. */
+function isAbsoluteLocatedPath(from: string): boolean {
+  if (from.includes('\0')) return false;
+  return from.startsWith('/') || /^[a-zA-Z]:[\\/]/.test(from) || /^\\\\[^\\]+[\\/][^\\]+/.test(from);
+}
+
+/** The `located` record of a marker, or `undefined` when it is absent or in any other shape. */
+function readLocated(value: unknown): LocatedRecord | undefined {
+  const record = asObject(value);
+  if (record === undefined) return undefined;
+  const { from, mode } = record;
+  if (typeof from !== 'string' || !isAbsoluteLocatedPath(from)) return undefined;
+  if (mode !== 'shared' && mode !== 'linked') return undefined;
+  return { from, mode };
+}
+
+/**
+ * A file Locate gives a second name or a link instead of a copy: its path ends in `.gguf`, `.safetensors` or
+ * `.pdiparams`, in any case. Split parts, projectors, drafts and heads included.
+ */
+export function isLinkableFile(path: string): boolean {
+  const lower = path.toLowerCase();
+  return lower.endsWith('.gguf') || lower.endsWith('.safetensors') || lower.endsWith('.pdiparams');
+}
+
+/** The `adopted` record of a marker: `undefined` when absent, `{}` when present in any shape but the one Update writes. */
+function readAdopted(value: unknown): DownloadCompletion['adopted'] {
+  if (value === undefined) return undefined;
+  const record = asObject(value);
+  if (record === undefined) return {};
+  const entries: [string, { size: number; mtimeNs: string }][] = [];
+  for (const [path, entry] of Object.entries(record)) {
+    const fields = asObject(entry);
+    if (fields === undefined) return {};
+    const { size, mtimeNs } = fields;
+    if (typeof size !== 'number' || !Number.isSafeInteger(size) || size < 0) return {};
+    if (typeof mtimeNs !== 'string' || !isDecimalDigits(mtimeNs)) return {};
+    entries.push([path, { size, mtimeNs }]);
+  }
+  // `fromEntries` defines own properties, so a path named `__proto__` stays a key and never sets the prototype.
+  return Object.fromEntries(entries);
+}
+
+function isDecimalDigits(text: string): boolean {
+  if (text.length === 0) return false;
+  for (const ch of text) {
+    if (ch < '0' || ch > '9') return false;
+  }
+  return true;
 }
 
 /**
@@ -117,6 +204,32 @@ export function isWeightFile(path: string): boolean {
   return path.endsWith('.safetensors') || path.endsWith('.pdiparams');
 }
 
+// Glob matching below is byte-identical to the CLI's (`globToRegex` /
+// `matchesAnyGlob` in `packages/cli/src/commands/download-model.ts`). The CLI
+// does not export them and the dashboard must not depend on the CLI package,
+// so the mirror lives here — keep the two in sync: a divergence would make
+// the wizard's `mlx download model -g …` select a different file set than a
+// dashboard install of the same catalog entry.
+/** Convert a simple glob pattern (with * wildcards) to a RegExp. */
+export function globToRegex(pattern: string): RegExp {
+  const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*');
+  return new RegExp(`^${escaped}$`, 'i');
+}
+
+/** Check if a filename matches any of the glob patterns. */
+export function matchesAnyGlob(filename: string, patterns: RegExp[]): boolean {
+  return patterns.some((re) => re.test(filename));
+}
+
+/**
+ * A catalog build that installs with no `config.json` (`configlessBuildOf` in `catalog.ts`): the family its GGUF
+ * header states, and the globs of its files (`undefined`: every file, as for a job with no globs).
+ */
+export interface ConfiglessBuild {
+  family: string;
+  globs: readonly string[] | undefined;
+}
+
 /**
  * A checkpoint counts as installed only when its atomic-publish completion
  * marker is present, parses, lists BOTH a `config.json` and at least one weight
@@ -125,8 +238,12 @@ export function isWeightFile(path: string): boolean {
  * missing weights) nor a one-sided manifest (config-only or weights-only), both
  * of which `loadModel` would reject yet a laxer check would falsely report as
  * installed, hiding the retry.
+ *
+ * For a build that installs with no `config.json` (`configless`) the marker lists none, every weight file it lists
+ * is one the build's globs select, and a GGUF it lists loads with no `config.json` as the build's family
+ * ({@link bareGgufFiles}).
  */
-export function isModelInstalled(modelDir: string): boolean {
+export function isModelInstalled(modelDir: string, configless?: ConfiglessBuild): boolean {
   const marker = readCompletion(modelDir);
   if (marker === undefined || marker.scope === 'partial') return false;
   const files = marker.files;
@@ -134,13 +251,26 @@ export function isModelInstalled(modelDir: string): boolean {
   // describes a hollow/one-sided publish that must NOT read as installed.
   const hasConfig = files.some((file) => file === 'config.json');
   const hasWeight = files.some((file) => typeof file === 'string' && isWeightFile(file));
-  if (!hasConfig || !hasWeight) return false;
-  return files.every((file) => typeof file === 'string' && isRegularFile(join(modelDir, file)));
+  if (hasConfig === (configless !== undefined) || !hasWeight) return false;
+  if (!files.every((file) => typeof file === 'string' && isRegularFile(join(modelDir, file)))) return false;
+  if (configless === undefined) return true;
+  const globs = configless.globs?.map(globToRegex);
+  const selected = (file: string): boolean =>
+    globs === undefined || matchesAnyGlob(basename(file), globs) || matchesAnyGlob(file, globs);
+  if (!files.filter(isWeightFile).every(selected)) return false;
+  return bareGgufFiles(modelDir).some(
+    (file) =>
+      file.family === configless.family &&
+      files.includes(file.folder === undefined ? file.name : `${file.folder}/${file.name}`),
+  );
 }
 
 /**
  * Whether `modelDir` holds a loadable checkpoint ON DISK — a `config.json` plus at
- * least one weight file — regardless of the dashboard completion marker. Unlike
+ * least one weight file, at the root or as a GGUF in a variant folder one level
+ * down ({@link variantFolderGgufs}), or, with no `config.json`, a GGUF the engine
+ * loads without asset files ({@link bareGgufFiles}) — regardless of the dashboard
+ * completion marker. Unlike
  * {@link isModelInstalled} (downloader-OWNED, marker-gated) this also recognizes a
  * checkpoint installed by the agent wizard or an older `mlx download` CLI, which
  * did not write the marker (the current CLI writes the shared marker, making its
@@ -164,7 +294,7 @@ export function isModelPresent(modelDir: string): boolean {
   } catch {
     return false;
   }
-  if (!isRegularFile(join(modelDir, 'config.json'))) return false;
+  if (!isRegularFile(join(modelDir, 'config.json'))) return bareGgufFiles(modelDir).length > 0;
   let entries: string[];
   try {
     entries = readdirSync(modelDir);
@@ -185,16 +315,217 @@ export function isModelPresent(modelDir: string): boolean {
   // A companion `.gguf` (mmproj/imatrix/dflash/draft) is NOT a loadable model:
   // counting one as present disables Install on the card for a directory the
   // loader never lists.
-  if (
-    entries.some((file) => file.endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)))
-  ) {
-    return true;
-  }
+  if (rootGgufNames(modelDir, entries).length > 0) return true;
+  if (variantFolderGgufs(modelDir, entries).length > 0) return true;
   // Sharded safetensors: every shard the index references must exist on disk —
   // otherwise an interrupted download that landed the index + only the first
   // shard would falsely read as present (matches the CLI's completeness check,
   // `isModelAlreadyDownloaded`). A lone shard without its index is not complete.
   return shardsComplete(modelDir);
+}
+
+/**
+ * A primary safetensors name of the native loaders, the same set discovery reads (`PRIMARY_SAFETENSORS` in
+ * `packages/lm/src/model-discovery.ts`): `model.safetensors`, `weights.safetensors`, or `model-…-of-….safetensors` /
+ * `model.safetensors-…-of-….safetensors`.
+ */
+function isPrimarySafetensorsName(name: string): boolean {
+  if (name === 'model.safetensors' || name === 'weights.safetensors') return true;
+  const suffix = '.safetensors';
+  if (!name.endsWith(suffix)) return false;
+  let prefix: string;
+  if (name.startsWith('model.safetensors-')) prefix = 'model.safetensors-';
+  else if (name.startsWith('model-')) prefix = 'model-';
+  else return false;
+  const middle = name.slice(prefix.length, name.length - suffix.length);
+  const of = middle.indexOf('-of-', 1);
+  return of > 0 && of + '-of-'.length < middle.length;
+}
+
+/** Whether any of `names` in `dir` is a primary safetensors name on a regular file. */
+function holdsPrimarySafetensors(dir: string, names: readonly string[]): boolean {
+  return names.some((name) => isPrimarySafetensorsName(name) && isRegularFile(join(dir, name)));
+}
+
+/** The target GGUFs at the root of `modelDir` among its `entries`: regular files (links followed) ending in `.gguf` in any case, not companions. */
+function rootGgufNames(modelDir: string, entries: readonly string[]): string[] {
+  return entries.filter(
+    (file) => file.toLowerCase().endsWith('.gguf') && !isGgufCompanionName(file) && isRegularFile(join(modelDir, file)),
+  );
+}
+
+/**
+ * The loadable GGUFs one level down in `modelDir`, in variant folders such as `UD-Q4_K_XL/`, which is how downloads
+ * lay out a GGUF repository that keeps each build in its own folder. The walk is discovery's for a GGUF repository
+ * folder (`appendVariantGguf` in `packages/lm/src/model-discovery.ts`: which folders, which companions, split sets);
+ * its family name, header and sibling-asset checks are not applied. Only when the root holds no primary safetensors;
+ * never a folder whose name starts with `.`; a folder, or a link to one, that holds primary safetensors is skipped;
+ * nothing deeper is read. A target is a regular file (links followed) whose name ends in `.gguf` in any case and is
+ * not a companion, and that the loader can open: a split set counts from its first part, and only with every part
+ * beside it ({@link ggufSplitPartNames}).
+ */
+function variantFolderGgufs(modelDir: string, rootEntries: readonly string[]): (GgufFile & { folder: string })[] {
+  const found: (GgufFile & { folder: string })[] = [];
+  if (holdsPrimarySafetensors(modelDir, rootEntries)) return found;
+  for (const folder of rootEntries) {
+    if (folder.startsWith('.')) continue;
+    const variantDir = join(modelDir, folder);
+    let names: string[];
+    try {
+      if (!statSync(variantDir).isDirectory()) continue;
+      names = readdirSync(variantDir);
+    } catch {
+      continue;
+    }
+    if (holdsPrimarySafetensors(variantDir, names)) continue;
+    for (const name of names) {
+      if (!name.toLowerCase().endsWith('.gguf') || isGgufCompanionName(name)) continue;
+      const parts = ggufSplitPartNames(name, names);
+      if (parts !== undefined && parts.every((part) => isRegularFile(join(variantDir, part))))
+        found.push({ folder, name, parts });
+    }
+  }
+  return found;
+}
+
+/**
+ * The builds of the GGUF weights of `modelDir` (listed as `folderName`), each once, in file order; empty when its
+ * weights are not GGUF: the root holds primary safetensors, or no GGUF counts by the rule of {@link isModelPresent}
+ * (the root GGUFs, else the variant-folder ones). A root file is a build only by the variant walk's split rule
+ * ({@link ggufSplitPartNames}: a first part with every part beside it). Each file's build is the one discovery names
+ * it by (`ggufVariant`: the file name's quant tag, else its variant folder's).
+ */
+export function ggufBuilds(modelDir: string, folderName: string): string[] {
+  return buildsOf(ggufWeightFiles(modelDir), folderName);
+}
+
+/**
+ * A GGUF of a model folder: its name, the variant folder it is in (`undefined` at the root), and the files the loader
+ * opens for it in that folder ({@link ggufSplitPartNames}).
+ */
+interface GgufFile {
+  folder: string | undefined;
+  name: string;
+  parts: string[];
+}
+
+/**
+ * The GGUFs {@link ggufBuilds} names builds from: none beside primary safetensors, else the root ones, else the ones in
+ * variant folders.
+ */
+function ggufWeightFiles(modelDir: string): GgufFile[] {
+  let entries: string[];
+  try {
+    entries = readdirSync(modelDir);
+  } catch {
+    return [];
+  }
+  if (holdsPrimarySafetensors(modelDir, entries)) return [];
+  const root = rootGgufNames(modelDir, entries);
+  if (root.length === 0) return variantFolderGgufs(modelDir, entries);
+  return root.flatMap((name) => {
+    const parts = ggufSplitPartNames(name, entries);
+    return parts === undefined ? [] : [{ folder: undefined, name, parts }];
+  });
+}
+
+/** The build of each of `files` (listed as `folderName`), each once, in file order. */
+function buildsOf(files: readonly GgufFile[], folderName: string): string[] {
+  const builds = new Set<string>();
+  for (const { folder, name } of files) {
+    const names = ggufNames(name, folderName, folder);
+    builds.add(ggufVariant(names.stem, folderName, folder, names.id).variant);
+  }
+  return [...builds];
+}
+
+/**
+ * The quant label of GGUF weights of these builds, or `undefined` for none. One build gives that build; several give
+ * `GGUF`, because the folder is one row that serves each build under its own id. A `config.json` beside GGUF weights
+ * is the base model's, so its quant block never applies.
+ */
+function ggufBuildLabel(builds: readonly string[]): string | undefined {
+  if (builds.length === 0) return undefined;
+  return builds.length === 1 ? builds[0]! : 'GGUF';
+}
+
+/** Header reads by path, kept while the file's `dev`, `ino`, size, `mtime` and `ctime` (a mode change) stay. */
+const ggufArchitectures = new Map<string, { stamp: string; architecture: string | null }>();
+const GGUF_ARCHITECTURE_CACHE_MAX = 256;
+
+/** The `general.architecture` of the GGUF at `path` (a link followed), or `null` when its header cannot be read. */
+function ggufArchitecture(path: string): string | null {
+  let stamp: string;
+  try {
+    const stat = statSync(path, { bigint: true });
+    stamp = `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`;
+  } catch {
+    return null;
+  }
+  const known = ggufArchitectures.get(path);
+  if (known?.stamp === stamp) return known.architecture;
+  let architecture: string | null;
+  try {
+    architecture = readGgufArchitectureSync(path);
+  } catch {
+    architecture = null;
+  }
+  if (ggufArchitectures.size >= GGUF_ARCHITECTURE_CACHE_MAX) ggufArchitectures.clear();
+  ggufArchitectures.set(path, { stamp, architecture });
+  return architecture;
+}
+
+/**
+ * The GGUFs of `modelDir` that the engine loads with no asset file beside them, each with its family: the folder has
+ * no `config.json` (a dangling link counts as none, as for the engine), every part of the GGUF
+ * ({@link ggufWeightFiles}) is a regular file (links followed), the real folder of the GGUF (where the engine looks
+ * for its `config.json`) has no `config.json` either, and its header names a family whose GGUF discovery needs no
+ * `config.json` or `tokenizer.json` and admits the file name (`bareGgufFamily`). A header that cannot be read admits
+ * nothing.
+ */
+function bareGgufFiles(modelDir: string): (GgufFile & { family: string })[] {
+  if (existsSync(join(modelDir, 'config.json'))) return [];
+  const found: (GgufFile & { family: string })[] = [];
+  for (const file of ggufWeightFiles(modelDir)) {
+    const dir = file.folder === undefined ? modelDir : join(modelDir, file.folder);
+    if (!file.parts.every((part) => isRegularFile(join(dir, part)))) continue;
+    const path = join(dir, file.name);
+    let realDir: string;
+    try {
+      realDir = dirname(realpathSync(path));
+    } catch {
+      continue;
+    }
+    if (existsSync(join(realDir, 'config.json'))) continue;
+    const architecture = ggufArchitecture(path);
+    const family = architecture === null ? undefined : bareGgufFamily(file.name, architecture);
+    if (family !== undefined) found.push({ ...file, family });
+  }
+  return found;
+}
+
+/**
+ * The model in `modelDir` (listed as `folderName`) as a catalog entry whose GGUF builds are of `family` reads it
+ * (`undefined`: the entry names none), or `undefined` when there is none: {@link isModelPresent}, then with a
+ * `config.json` the builds of {@link ggufBuilds} (no model for a build that installs with no `config.json`,
+ * `configlessBuild`: the engine then reads the folder as another model); without one (`configless`), only the builds
+ * of the GGUFs of {@link bareGgufFiles} whose header states `family`, and no model when there are none.
+ */
+export function catalogFolderModel(
+  modelDir: string,
+  folderName: string,
+  family: string | undefined,
+  configlessBuild: boolean,
+): { configless: boolean; builds: string[] } | undefined {
+  if (!isModelPresent(modelDir)) return undefined;
+  if (existsSync(join(modelDir, 'config.json'))) {
+    return configlessBuild ? undefined : { configless: false, builds: ggufBuilds(modelDir, folderName) };
+  }
+  const builds = buildsOf(
+    bareGgufFiles(modelDir).filter((file) => file.family === family),
+    folderName,
+  );
+  return builds.length > 0 ? { configless: true, builds } : undefined;
 }
 
 /** Entries {@link holdsModelFiles} reads before it gives up and answers "holds model files". */
@@ -203,7 +534,7 @@ export const HELD_SCAN_MAX_ENTRIES = 20_000;
 /** File name endings of weights that discovery, the loaders or `mlx convert` read, compared in lower case. */
 const MODEL_FILE_SUFFIXES = ['.safetensors', '.gguf', '.pdiparams', '.pdparams', '.npz', '.bin', '.pt', '.pth', '.pkl'];
 
-function isModelFileName(name: string): boolean {
+export function isModelFileName(name: string): boolean {
   // Lower case: on a case-insensitive volume discovery and Delete open `Config.json` as `config.json`.
   const lower = name.toLowerCase();
   if (lower === 'config.json') return true;
@@ -211,7 +542,7 @@ function isModelFileName(name: string): boolean {
 }
 
 /**
- * Whether `dir` holds model files, so Reinstall must never replace it: an entry named `config.json`, or named like
+ * Whether `dir` holds model files, so the catalog card offers Update for it: an entry named `config.json`, or named like
  * weights (see {@link MODEL_FILE_SUFFIXES}, companion GGUFs included), of any type, at any depth. Every layout that
  * discovery lists or the loader opens has one of these, so this cannot fall behind either of them.
  *
@@ -305,7 +636,12 @@ function shardsComplete(modelDir: string): boolean {
  * files still exist on disk (that is `isModelInstalled`'s job); callers pair the two.
  */
 export function readCompletion(finalDir: string): DownloadCompletion | undefined {
-  const marker = asObject(readMarkerFile(finalDir));
+  return parseCompletion(readMarkerFile(finalDir));
+}
+
+/** The parsed JSON of a completion marker as its typed shape, by the rules of {@link readCompletion}. */
+export function parseCompletion(value: unknown): DownloadCompletion | undefined {
+  const marker = asObject(value);
   if (
     marker === undefined ||
     typeof marker.repo !== 'string' ||
@@ -321,6 +657,8 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
   ) {
     return undefined;
   }
+  const adopted = readAdopted(marker.adopted);
+  const located = readLocated(marker.located);
   return {
     repo: marker.repo,
     revision: marker.revision,
@@ -332,7 +670,47 @@ export function readCompletion(finalDir: string): DownloadCompletion | undefined
     ...(typeof marker.assetsRepo === 'string' ? { assetsRepo: marker.assetsRepo } : {}),
     ...(typeof marker.assetsRevision === 'string' ? { assetsRevision: marker.assetsRevision } : {}),
     completedAt: marker.completedAt,
+    ...(adopted !== undefined ? { adopted } : {}),
+    ...(located !== undefined ? { located } : {}),
   };
+}
+
+/** What a folder that Locate made uses, for the Models page and Local models. */
+export interface LocatedState extends LocatedRecord {
+  /** Every file the marker lists is there: the weights in `from` can be reached. */
+  filesAvailable: boolean;
+  /**
+   * Deleting the folder leaves the model files on disk: each of its weight-like files is a link or has another name.
+   * False when the folder holds the last name of one, so a delete frees its bytes.
+   */
+  filesStay: boolean;
+}
+
+/**
+ * The {@link LocatedState} of `dir`, or `null` when it is not a real folder whose marker Locate wrote, or when none of
+ * its weight-like files is a link or has another name any more. `configless` as for {@link isModelInstalled}.
+ */
+export function locatedState(dir: string, configless?: ConfiglessBuild): LocatedState | null {
+  try {
+    if (!lstatSync(dir).isDirectory()) return null;
+  } catch {
+    return null;
+  }
+  const completion = readCompletion(dir);
+  if (completion?.located === undefined) return null;
+  const { from, mode } = completion.located;
+  const elsewhere = completion.files.filter(isLinkableFile).map((file) => {
+    try {
+      const stat = lstatSync(join(dir, file));
+      return stat.isSymbolicLink() || stat.nlink >= 2;
+    } catch {
+      return false;
+    }
+  });
+  // Every weight file is the folder's own (`mlx download` wrote new copies, or the located originals were removed):
+  // the folder no longer uses the located files.
+  if (!elsewhere.includes(true)) return null;
+  return { from, mode, filesAvailable: isModelInstalled(dir, configless), filesStay: !elsewhere.includes(false) };
 }
 
 /**
@@ -383,8 +761,8 @@ export function isPathOccupied(path: string): boolean {
  * The shape test is {@link readCompletion}, our FULL marker, not merely "carries a
  * `files` array". For a plain install this is the only gate between `POST /api/downloads`
  * and a `rename(finalDir → backup)` + `rm(backup, { recursive: true })`; only a
- * Reinstall (`replaceBlocker`) passes an unowned entry, and only one that still matches
- * the numbers the user confirmed. A `{"files":[]}` file is not something we ever wrote — the marker has been the same
+ * cleanup (`replaceBlocker`) passes an unowned entry, which it never removes with `rm`, and only one that still
+ * matches what the user confirmed. A `{"files":[]}` file is not something we ever wrote — the marker has been the same
  * four fields since the first commit that emitted one — so accepting it authorized
  * the destructive swap on a directory we do not own. Going through the same reader
  * as every other ownership, identity and completeness check is also what stops those
@@ -543,6 +921,19 @@ function isClairicGgufDir(dir: string): boolean {
 }
 
 /**
+ * The family and builds of GGUF weights in `dir` that load without a `config.json`: a Clairic GGUF dir, or
+ * {@link bareGgufFiles} (`bare`). `undefined` when there are none.
+ */
+function configlessGguf(
+  dir: string,
+  folderName: string,
+): { modelType: string; builds: string[]; bare: boolean } | undefined {
+  if (isClairicGgufDir(dir)) return { modelType: 'clairic', builds: ggufBuilds(dir, folderName), bare: false };
+  const bare = bareGgufFiles(dir);
+  return bare.length > 0 ? { modelType: bare[0]!.family, builds: buildsOf(bare, folderName), bare: true } : undefined;
+}
+
+/**
  * Family label from `config.json` via the registry's `matchFamily`, refined by
  * Qwen3.5 Clairic / CLEF head sidecars. A viewer must label, never throw, so
  * the shapes the loader fails closed on fall back to the raw `model_type`
@@ -563,13 +954,17 @@ function detectModelTypeLabel(modelDir: string, config: Record<string, unknown>)
 
 /**
  * Quantization label from `quantization` / `quantization_config`. Micro-scaling
- * and NVFP modes surface by name (`mxfp4`, `mxfp8`, `nvfp4`, `sym8`); affine
+ * and NVFP modes surface by name (`mxfp4`, `mxfp8`, `nvfp4`, `sym8`); a
+ * modelopt checkpoint by its algorithm in lower case (`nvfp4`); affine
  * folds bits into the label (`affine-4bit`); a config with no quant block is
  * full-precision (`null`).
  */
 function detectQuantLabel(config: Record<string, unknown>): string | null {
   const quant = asObject(config.quantization) ?? asObject(config.quantization_config);
   if (quant === undefined) return null;
+  if (quant.quant_method === 'modelopt' && typeof quant.quant_algo === 'string' && quant.quant_algo !== '') {
+    return quant.quant_algo.toLowerCase();
+  }
   const mode =
     typeof quant.mode === 'string'
       ? quant.mode
@@ -587,16 +982,24 @@ function positiveInteger(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
 }
 
-/** Root `max_position_embeddings` first, then the `text_config` nesting, else `null`. */
+/** `value` when it is a positive safe integer: the `int(1e30)` "no limit" sentinel of tokenizer configs is not one. */
+function positiveSafeInteger(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * `max_position_embeddings` at the root, then in `text_config`; without either, `model_max_length` in `text_config`
+ * (Inkling-2 states its window only there), then at the root; else `null`.
+ */
 function detectContextWindow(config: Record<string, unknown>): number | null {
-  const root = positiveInteger(config.max_position_embeddings);
-  if (root !== undefined) return root;
   const textConfig = asObject(config.text_config);
-  if (textConfig !== undefined) {
-    const nested = positiveInteger(textConfig.max_position_embeddings);
-    if (nested !== undefined) return nested;
-  }
-  return null;
+  return (
+    positiveInteger(config.max_position_embeddings) ??
+    positiveInteger(textConfig?.max_position_embeddings) ??
+    positiveSafeInteger(textConfig?.model_max_length) ??
+    positiveSafeInteger(config.model_max_length) ??
+    null
+  );
 }
 
 /**
@@ -821,19 +1224,21 @@ function readCheckpointConfig(dir: string): { config: Record<string, unknown> } 
 
 /**
  * Discovery's rule for one entry of the models directory: a usable directory (real, or a live link to one) whose
- * name does not start with `.`, carrying a `config.json` that is a readable regular file with a JSON object root.
+ * name does not start with `.`, carrying a `config.json` that is a readable regular file with a JSON object root,
+ * or a GGUF the engine loads without one ({@link bareGgufFiles}).
  */
 function isListedEntry(path: string, kind: Pick<Dirent, 'isDirectory' | 'isSymbolicLink'>): boolean {
   return (
     !basename(path).startsWith('.') &&
     isUsableDir(path, kind) &&
-    ('config' in readCheckpointConfig(path) || isClairicGgufDir(path))
+    ('config' in readCheckpointConfig(path) || configlessGguf(path, basename(path)) !== undefined)
   );
 }
 
 /**
  * Scan `modelsDir` for checkpoint subdirectories. A subdirectory is a model
- * only when it carries a readable `config.json`; anything else is reported as
+ * only when it carries a readable `config.json`, or holds a GGUF the engine loads
+ * without one ({@link bareGgufFiles}); anything else is reported as
  * a warning and skipped (never guessed). A missing `modelsDir` yields empty
  * results with no warning. Draft-only checkpoints have a separate inventory
  * for storage accounting and deletion, never contributing to model counts.
@@ -868,25 +1273,29 @@ export function discoverLocalModels(
     if (entry.name.startsWith('.')) continue;
     const read = readCheckpointConfig(full);
     if ('problem' in read) {
-      if (isClairicGgufDir(full)) {
-        const { sizeBytes, fileCount, truncated } =
-          options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
-        if (truncated) {
-          warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
-        }
-        models.push({
-          name: entry.name,
-          path: full,
-          modelType: 'clairic',
-          quant: null,
-          contextWindow: null,
-          sizeBytes,
-          fileCount,
-          servedIds: [],
-        });
+      const label = configlessGguf(full, entry.name);
+      if (label === undefined) {
+        warnings.push(`${entry.name}: ${read.problem}; skipped`);
         continue;
       }
-      warnings.push(`${entry.name}: ${read.problem}; skipped`);
+      const { sizeBytes, fileCount, truncated } =
+        options.includeStats === false ? { sizeBytes: 0, fileCount: 0, truncated: false } : walkDirStats(full);
+      if (truncated) {
+        warnings.push(`${entry.name}: directory too large to size fully; reported size is a lower bound`);
+      }
+      models.push({
+        name: entry.name,
+        path: full,
+        modelType: label.modelType,
+        quant: ggufBuildLabel(label.builds) ?? null,
+        contextWindow: null,
+        sizeBytes,
+        fileCount,
+        servedIds: [],
+        // A row has no build: the files of a Locate of a GGUF that loads alone are there when that GGUF is.
+        located: locatedState(full, label.bare ? { family: label.modelType, globs: undefined } : undefined),
+        link: entry.isSymbolicLink(),
+      });
       continue;
     }
     const { config } = read;
@@ -904,11 +1313,13 @@ export function discoverLocalModels(
       name: entry.name,
       path: full,
       modelType: detectModelTypeLabel(full, config),
-      quant: detectQuantLabel(config),
+      quant: ggufBuildLabel(ggufBuilds(full, entry.name)) ?? detectQuantLabel(config),
       contextWindow: detectContextWindow(config),
       sizeBytes,
       fileCount,
       servedIds: [],
+      located: locatedState(full),
+      link: entry.isSymbolicLink(),
     });
   }
 
@@ -919,7 +1330,7 @@ export function discoverLocalModels(
 
 /**
  * The path of `name` as a SINGLE direct child of `modelsDir`, the gate every removal under the models directory goes
- * through (a delete by route name, a reinstall over a catalog slug). Throws `Refusing to {verb} "{name}": …` when
+ * through (a delete by route name, a cleanup of a catalog slug). Throws `Refusing to {verb} "{name}": …` when
  * `name` could reach anything else.
  */
 export function modelsChildPath(modelsDir: string, name: string, verb: string): string {
@@ -950,7 +1361,8 @@ const LINK_TARGET_MAX_CHARS = 200;
 
 /**
  * What occupies a path the app did not create. The counts come from `lstat` and never follow a link or open a file;
- * `listed` reads the root `config.json` and `holdsModel` lists the whole tree (both through a link at the root too).
+ * `listed` reads the root `config.json` (or GGUF headers without one) and `holdsModel` lists the whole tree (both
+ * through a link at the root too).
  */
 export interface ForeignEntrySummary {
   /** `lstat` of the path, never followed. `file` = not a directory and not a link. */
@@ -967,17 +1379,40 @@ export interface ForeignEntrySummary {
   listed: boolean;
   /** A `config.json` of any type is at the root of the entry. */
   modelLike: boolean;
-  /** {@link holdsModelFiles}: it holds a config or weights, so Reinstall refuses to replace it. */
+  /** {@link holdsModelFiles}: it holds a config or weights, so Update may check it in place. */
   holdsModel: boolean;
-  /** symlink: the `readlink` text (at most 200 characters), else `null`. */
+  /** symlink: {@link readLinkText}, else `null`. */
   linkTarget: string | null;
   /** symlink whose target does not exist. */
   dangling: boolean;
+  /** symlink whose target exists and is not a folder. */
+  linkToFile: boolean;
+  /** A real directory the app has no write permission on: nothing can move it or add files to it. */
+  locked: boolean;
+}
+
+/** The `readlink` text of `path`, cut to 200 characters plus `…`, or `null` when it is not a readable link. */
+export function readLinkText(path: string): string | null {
+  try {
+    const text = readlinkSync(path);
+    return text.length > LINK_TARGET_MAX_CHARS ? `${text.slice(0, LINK_TARGET_MAX_CHARS)}…` : text;
+  } catch {
+    return null;
+  }
+}
+
+/** Whether Local models lists the entry at `path`, by discovery's own rule. */
+export function isListedFolder(path: string): boolean {
+  try {
+    return isListedEntry(path, lstatSync(path));
+  } catch {
+    return false;
+  }
 }
 
 /**
- * Measure what is at `path`, or `null` when nothing is. The walk never follows a link and never opens a file; the
- * one read is the root `config.json`, to decide `listed`, and `holdsModel` lists the tree by file names.
+ * Measure what is at `path`, or `null` when nothing is. The walk never follows a link and never opens a file; to
+ * decide `listed`, it reads the root `config.json`, or without one GGUF headers; `holdsModel` goes by file names.
  */
 export function summarizeForeignEntry(
   path: string,
@@ -989,27 +1424,27 @@ export function summarizeForeignEntry(
   } catch {
     return null;
   }
-  const listed = isListedEntry(path, stat);
   if (stat.isSymbolicLink()) {
-    let linkTarget: string | null = null;
-    try {
-      const text = readlinkSync(path);
-      linkTarget = text.length > LINK_TARGET_MAX_CHARS ? `${text.slice(0, LINK_TARGET_MAX_CHARS)}…` : text;
-    } catch {
-      linkTarget = null;
-    }
+    const linkTarget = readLinkText(path);
     const dangling = !existsSync(path);
+    let linkToFile = false;
+    try {
+      linkToFile = !statSync(path).isDirectory();
+    } catch {}
+    const holdsModel = holdsModelFiles(path);
     return {
       kind: 'symlink',
       fileCount: 0,
       sizeBytes: 0,
       truncated: false,
       names: [],
-      listed,
+      listed: holdsModel && isListedEntry(path, stat),
       modelLike: !dangling && existsSync(join(path, 'config.json')),
-      holdsModel: holdsModelFiles(path),
+      holdsModel,
       linkTarget,
       dangling,
+      linkToFile,
+      locked: false,
     };
   }
   if (!stat.isDirectory()) {
@@ -1024,9 +1459,20 @@ export function summarizeForeignEntry(
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     };
   }
+  let locked = false;
+  try {
+    accessSync(path, constants.W_OK);
+  } catch {
+    locked = true;
+  }
   const walk = walkDirStats(path, maxEntries, { noFollow: true, keepNames: BLOCKER_MAX_NAMES + 1 });
+  // `listed` lists folders without a budget, so the bounded walk of `holdsModel` (it counts every `config.json` and
+  // `.gguf`) goes first.
+  const holdsModel = holdsModelFiles(path);
   const names =
     !walk.truncated && walk.fileCount <= BLOCKER_MAX_NAMES
       ? [...walk.names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
@@ -1037,24 +1483,35 @@ export function summarizeForeignEntry(
     sizeBytes: walk.sizeBytes,
     truncated: walk.truncated,
     names,
-    listed,
+    listed: holdsModel && isListedEntry(path, stat),
     modelLike: isPathOccupied(join(path, 'config.json')),
-    holdsModel: holdsModelFiles(path),
+    holdsModel,
     linkTarget: null,
     dangling: false,
+    linkToFile: false,
+    locked,
   };
 }
 
-/** The entry still matches what the user was shown. A truncated walk is compared by kind only. */
+/** The entry still matches what the user was shown. A truncated walk is compared by kind and link text only. */
 export function sameForeignEntry(
-  a: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
-  b: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated'>,
+  a: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated' | 'linkTarget'>,
+  b: Pick<ForeignEntrySummary, 'kind' | 'fileCount' | 'sizeBytes' | 'truncated' | 'linkTarget'>,
 ): boolean {
   return (
     a.kind === b.kind &&
     a.truncated === b.truncated &&
+    a.linkTarget === b.linkTarget &&
     (a.truncated || (a.fileCount === b.fileCount && a.sizeBytes === b.sizeBytes))
   );
+}
+
+/** A Remove that promised the model files stay on disk, when the folder now holds the last name of one. */
+export class FilesNoLongerStayError extends Error {
+  constructor(name: string) {
+    super(`The model files of "${name}" are no longer anywhere else on disk. Delete now removes them.`);
+    this.name = 'FilesNoLongerStayError';
+  }
 }
 
 /**
@@ -1066,8 +1523,12 @@ export function sameForeignEntry(
  * it — but ONLY the link itself is removed (a non-recursive `rmSync` unlinks a
  * symlink rather than following it), so the foreign target outside the store is
  * never touched.
+ *
+ * `keepsFiles` is read once the name is found, so an unknown name stays "not found" before a bad request. When it
+ * answers true (the Remove form told the user the model files stay on disk), the delete is refused with
+ * {@link FilesNoLongerStayError} unless {@link locatedState} still says so.
  */
-export function deleteLocalModel(modelsDir: string, name: string): void {
+export function deleteLocalModel(modelsDir: string, name: string, keepsFiles: () => boolean = () => false): void {
   const target = modelsChildPath(modelsDir, name, 'delete');
 
   let stat;
@@ -1076,11 +1537,12 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   } catch {
     throw new Error(`Model "${name}" not found`);
   }
+  if (keepsFiles() && locatedState(target)?.filesStay !== true) throw new FilesNoLongerStayError(name);
   if (stat.isSymbolicLink()) {
     // A linked-in checkpoint is deletable like a real one — but only the LINK
     // is removed, never the foreign target it names. The checkpoint gate below
     // still applies through the link, so a link to a non-checkpoint is refused.
-    if (!existsSync(join(target, 'config.json')) && !isClairicGgufDir(target)) {
+    if (!existsSync(join(target, 'config.json')) && configlessGguf(target, name) === undefined) {
       throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
     }
     // Non-recursive `rmSync` unlinks a symlink — it never descends into the
@@ -1089,7 +1551,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
     return;
   }
   // Only delete a real checkpoint directory — a model or companion (a dir
-  // carrying a `config.json`, or a GGUF Clairic dir with head sidecars). The route takes an arbitrary name, so without
+  // carrying a `config.json`, or GGUF weights that load without one). The route takes an arbitrary name, so without
   // this a typo or hand-crafted request could `rmSync` an unrelated regular file
   // or non-model directory that merely happens to sit under `modelsDir`.
   //
@@ -1097,7 +1559,7 @@ export function deleteLocalModel(modelsDir: string, name: string): void {
   // this is the guard on the only route that can CLEAR a malformed checkpoint,
   // so a `config.json` that is a directory must still be deletable. Tightening
   // it here would make the wreckage those checks now report permanent.
-  if (!stat.isDirectory() || (!existsSync(join(target, 'config.json')) && !isClairicGgufDir(target))) {
+  if (!stat.isDirectory() || (!existsSync(join(target, 'config.json')) && configlessGguf(target, name) === undefined)) {
     throw new Error(`Refusing to delete "${name}": not a model checkpoint directory`);
   }
   rmSync(target, { recursive: true, force: true });
@@ -1119,6 +1581,32 @@ export function defaultModelsDir(): string {
   if (fromConfig !== undefined) return resolve(fromConfig);
 
   return join(home, 'models');
+}
+
+/**
+ * The plain sentence for a models directory that is a link whose target is missing (a folder on a disk that is not
+ * connected); null for anything else, including a directory that does not exist yet. The same text as
+ * `ModelsDirUnavailableError` in `@mlx-node/server/host/paths`, which the engine and the CLI throw.
+ */
+export function modelsDirUnavailable(modelsDir: string): string | null {
+  try {
+    if (!lstatSync(modelsDir).isSymbolicLink()) return null;
+  } catch {
+    return null;
+  }
+  try {
+    statSync(modelsDir);
+    return null;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== 'ENOENT') return null;
+  }
+  let target: string;
+  try {
+    target = resolve(dirname(modelsDir), readlinkSync(modelsDir));
+  } catch {
+    return null;
+  }
+  return `The models folder ${modelsDir} is a link to ${target}, which is not available. Connect that disk, or change the link, then try again.`;
 }
 
 function readModelsDirFromConfig(configPath: string): string | undefined {

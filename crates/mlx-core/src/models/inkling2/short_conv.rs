@@ -264,7 +264,7 @@ pub fn fused_short_conv_k4(
 ) -> Result<MxArray> {
     #[cfg(target_os = "macos")]
     {
-        if unsafe { mlx_sys::mlx_metal_is_available() } && weight.shape()?[1] == 4 {
+        if unsafe { mlx_sys::mlx_metal_is_available() } && weight.shape_at(1)? == 4 {
             let (y, hist_out) = super::kernels::inkling2_sconv_k4(x, weight, history, dyn_taps)?;
             *history = hist_out;
             return Ok(y);
@@ -292,9 +292,9 @@ impl StreamShortConvTape {
     /// Compute the exact `[history_len, C]` rolling ShortConv history after committing `keep`
     /// tokens (`0 <= keep <= rows.shape()[0]`).
     pub fn commit_prefix(&self, keep: usize) -> Result<MxArray> {
-        let hist_len = self.hist_before.shape()?[0] as usize;
-        let total_rows = self.rows.shape()?[0] as usize;
-        let c = self.rows.shape()?[1];
+        let hist_len = self.hist_before.shape_at(0)? as usize;
+        let total_rows = self.rows.shape_at(0)? as usize;
+        let c = self.rows.shape_at(1)?;
         if keep > total_rows {
             return Err(Error::from_reason(format!(
                 "StreamShortConvTape::commit_prefix: keep={keep} exceeds verified rows={total_rows}"
@@ -328,9 +328,9 @@ impl StreamShortConvTape {
         if is_contiguous {
             return self.commit_prefix(accepted_nodes.len());
         }
-        let hist_len = self.hist_before.shape()?[0] as usize;
-        let total_rows = self.rows.shape()?[0] as usize;
-        let c = self.rows.shape()?[1];
+        let hist_len = self.hist_before.shape_at(0)? as usize;
+        let total_rows = self.rows.shape_at(0)? as usize;
+        let c = self.rows.shape_at(1)?;
         let keep = accepted_nodes.len();
         if keep == 0 {
             return Ok(self.hist_before.clone());
@@ -374,6 +374,54 @@ impl StreamShortConvTape {
             hist_tail
         };
         MxArray::concatenate(&hist_cast, &rows_sel, 0)
+    }
+
+    /// Compute the exact `[history_len, C]` rolling ShortConv history after committing a
+    /// strictly-increasing speculative verify-tree path `accepted_rows` (root-to-accepted-node).
+    pub fn commit_path(&self, accepted_rows: &[usize]) -> Result<MxArray> {
+        let hist_len = self.hist_before.shape_at(0)? as usize;
+        let total_rows = self.rows.shape_at(0)? as usize;
+        let c = self.rows.shape_at(1)?;
+        for (d, &row) in accepted_rows.iter().enumerate() {
+            if row >= total_rows {
+                return Err(Error::from_reason(format!(
+                    "StreamShortConvTape::commit_path: accepted_rows[{d}]={row} >= verified rows={total_rows}"
+                )));
+            }
+            if d > 0 && row <= accepted_rows[d - 1] {
+                return Err(Error::from_reason(format!(
+                    "StreamShortConvTape::commit_path: accepted_rows must be strictly increasing (got {} then {row})",
+                    accepted_rows[d - 1]
+                )));
+            }
+        }
+        let keep = accepted_rows.len();
+        if keep == 0 {
+            return Ok(self.hist_before.clone());
+        }
+        if accepted_rows.iter().enumerate().all(|(d, &row)| row == d) {
+            return self.commit_prefix(keep);
+        }
+        if keep >= hist_len {
+            let tail: Vec<i32> = accepted_rows[keep - hist_len..]
+                .iter()
+                .map(|&r| r as i32)
+                .collect();
+            let idx = MxArray::from_int32(&tail, &[hist_len as i64])?;
+            return self.rows.take(&idx, 0);
+        }
+        let hist_tail = self
+            .hist_before
+            .slice(&[keep as i64, 0], &[hist_len as i64, c])?;
+        let indices: Vec<i32> = accepted_rows.iter().map(|&r| r as i32).collect();
+        let idx = MxArray::from_int32(&indices, &[keep as i64])?;
+        let rows_path = self.rows.take(&idx, 0)?;
+        let hist_cast = if hist_tail.dtype()? != rows_path.dtype()? {
+            hist_tail.astype(rows_path.dtype()?)?
+        } else {
+            hist_tail
+        };
+        MxArray::concatenate(&hist_cast, &rows_path, 0)
     }
 }
 
@@ -429,6 +477,26 @@ impl VisitShortConvTape {
         }
         if let Some(ref t) = self.mlp_post {
             dst.mlp_post = t.commit_tree(accepted_nodes, is_contiguous)?;
+        }
+        Ok(())
+    }
+
+    pub fn commit_path(
+        &self,
+        accepted_rows: &[usize],
+        dst: &mut VisitShortConvState,
+    ) -> Result<()> {
+        if let Some(ref t) = self.k {
+            dst.k = t.commit_path(accepted_rows)?;
+        }
+        if let Some(ref t) = self.v {
+            dst.v = t.commit_path(accepted_rows)?;
+        }
+        if let Some(ref t) = self.attn_post {
+            dst.attn_post = t.commit_path(accepted_rows)?;
+        }
+        if let Some(ref t) = self.mlp_post {
+            dst.mlp_post = t.commit_path(accepted_rows)?;
         }
         Ok(())
     }
@@ -668,6 +736,26 @@ impl Inkling2ShortConvTape {
         }
         Ok(())
     }
+
+    /// Commit ONLY the accepted tree path (`accepted_rows`, strictly increasing) into `state`
+    /// across all 48 visits.
+    pub fn commit_path(
+        &self,
+        accepted_rows: &[usize],
+        state: &mut Inkling2ShortConvState,
+    ) -> Result<()> {
+        if self.visits.len() != state.visits.len() {
+            return Err(Error::from_reason(format!(
+                "Inkling2ShortConvTape visit count mismatch: tape={} state={}",
+                self.visits.len(),
+                state.visits.len()
+            )));
+        }
+        for (tape_v, state_v) in self.visits.iter().zip(state.visits.iter_mut()) {
+            tape_v.commit_path(accepted_rows, state_v)?;
+        }
+        Ok(())
+    }
 }
 
 /// Apply fused ShortConv over a packed multi-sequence batch partitioned by `cu_seqlens_q`
@@ -817,10 +905,10 @@ fn dispatch_ragged_kv_histories<R>(
 }
 
 /// Single-dispatch ragged causal `k=4` ShortConv across `N >= 1` packed sequences with optional
-/// FP32 residual epilogue (`res_a` + optional `res_b` + `conv_out`) and optional speculative
-/// rollback tape capture (`hist_before`, pre-conv `rows`).
+/// FP32 residual epilogue (`res_a` + optional `res_b` + `conv_out`), optional speculative rollback
+/// tape capture (`hist_before`, pre-conv `rows`), and optional verify `tree_rows`.
 #[allow(clippy::too_many_arguments)]
-pub fn fused_short_conv_ragged_residual_taped(
+pub fn fused_short_conv_ragged_residual_taped_tree(
     x: &MxArray,
     weight: &MxArray,
     dyn_taps: Option<&MxArray>,
@@ -830,6 +918,7 @@ pub fn fused_short_conv_ragged_residual_taped(
     cu_seqlens_q: &[usize],
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] cu_seqlens_arr: Option<&MxArray>,
     mut tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    tree_rows: Option<&MxArray>,
 ) -> Result<MxArray> {
     let num_seqs = histories.len();
     if num_seqs == 0 || cu_seqlens_q.len() != num_seqs + 1 {
@@ -838,22 +927,27 @@ pub fn fused_short_conv_ragged_residual_taped(
             cu_seqlens_q.len()
         )));
     }
-    let c = x.shape()?[1];
+    let c = x.shape_at(1)?;
     #[cfg(target_os = "macos")]
     let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
 
     #[cfg(target_os = "macos")]
-    if unsafe { mlx_sys::mlx_metal_is_available() } && weight.shape()?[1] == 4 && all_non_empty {
+    if unsafe { mlx_sys::mlx_metal_is_available() } && weight.shape_at(1)? == 4 && all_non_empty {
         record_ragged_tapes(x, histories, cu_seqlens_q, c, tapes)?;
         if num_seqs == 1 && res_a.is_none() && res_b.is_none() {
-            let (y, hist_out) =
-                super::kernels::inkling2_sconv_k4(x, weight, histories[0], dyn_taps)?;
+            let (y, hist_out) = super::kernels::inkling2_sconv_k4_tree(
+                x,
+                weight,
+                histories[0],
+                dyn_taps,
+                tree_rows,
+            )?;
             *histories[0] = hist_out;
             return Ok(y);
         }
         let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
         return dispatch_ragged_history(histories, c, |h_refs, stacked| {
-            super::kernels::inkling2_sconv_k4_ragged(
+            super::kernels::inkling2_sconv_k4_ragged_tree(
                 x,
                 weight,
                 dyn_taps,
@@ -863,8 +957,15 @@ pub fn fused_short_conv_ragged_residual_taped(
                 h_refs,
                 num_seqs,
                 stacked,
+                tree_rows,
             )
         });
+    }
+
+    if tree_rows.is_some() {
+        return Err(Error::from_reason(
+            "fused_short_conv_ragged_residual_taped_tree: tree_rows requires Metal k=4 kernel",
+        ));
     }
 
     // Fallback (non-Metal, kernel_size != 4, or empty sequences)
@@ -927,6 +1028,128 @@ pub fn fused_short_conv_ragged_residual_taped(
     }
 }
 
+/// Single-dispatch ragged causal `k=4` ShortConv across `N >= 1` packed sequences with optional
+/// FP32 residual epilogue (`res_a` + optional `res_b` + `conv_out`) and optional speculative
+/// rollback tape capture (`hist_before`, pre-conv `rows`).
+#[allow(clippy::too_many_arguments)]
+pub fn fused_short_conv_ragged_residual_taped(
+    x: &MxArray,
+    weight: &MxArray,
+    dyn_taps: Option<&MxArray>,
+    res_a: Option<&MxArray>,
+    res_b: Option<&MxArray>,
+    histories: &mut [&mut MxArray],
+    cu_seqlens_q: &[usize],
+    cu_seqlens_arr: Option<&MxArray>,
+    tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+) -> Result<MxArray> {
+    fused_short_conv_ragged_residual_taped_tree(
+        x,
+        weight,
+        dyn_taps,
+        res_a,
+        res_b,
+        histories,
+        cu_seqlens_q,
+        cu_seqlens_arr,
+        tapes,
+        None,
+    )
+}
+
+/// Single-dispatch fused K+V causal `k=4` ShortConv + K L2-clip + V weightless RMSNorm across
+/// `N >= 1` packed sequences with optional speculative verify `tree_rows`.
+#[allow(clippy::too_many_arguments)]
+pub fn fused_short_conv_kv_prep_taped_tree(
+    k_raw: &MxArray,
+    v_raw: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    k_histories: &mut [&mut MxArray],
+    v_histories: &mut [&mut MxArray],
+    cu_seqlens_q: &[usize],
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] cu_seqlens_arr: Option<&MxArray>,
+    k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    num_kv_heads: usize,
+    head_dim: usize,
+    qk_thresh: f32,
+    v_eps: f32,
+    tree_rows: Option<&MxArray>,
+) -> Result<(MxArray, MxArray)> {
+    let num_seqs = k_histories.len();
+    if num_seqs == 0 || v_histories.len() != num_seqs || cu_seqlens_q.len() != num_seqs + 1 {
+        return Err(Error::from_reason(
+            "fused_short_conv_kv_prep_taped: invalid sequence count",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    let kv_dim = (num_kv_heads * head_dim) as i64;
+    #[cfg(target_os = "macos")]
+    let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
+
+    #[cfg(target_os = "macos")]
+    if unsafe { mlx_sys::mlx_metal_is_available() }
+        && k_weight.shape_at(1)? == 4
+        && v_weight.shape_at(1)? == 4
+        && all_non_empty
+    {
+        record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
+        record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
+        let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
+        return dispatch_ragged_kv_histories(
+            k_histories,
+            v_histories,
+            kv_dim,
+            |kh, vh, stacked| {
+                let (k_cur, v_cur, kh_out, vh_out) =
+                    super::kernels::inkling2_sconv_k4_kv_prep_tree(
+                        k_raw,
+                        v_raw,
+                        k_weight,
+                        v_weight,
+                        dyn_k,
+                        dyn_v,
+                        cu_arr.as_ref(),
+                        kh,
+                        vh,
+                        num_seqs,
+                        stacked,
+                        num_kv_heads,
+                        head_dim,
+                        qk_thresh,
+                        v_eps,
+                        1e-6,
+                        tree_rows,
+                    )?;
+                Ok(((k_cur, v_cur), kh_out, vh_out))
+            },
+        );
+    }
+
+    if tree_rows.is_some() {
+        return Err(Error::from_reason(
+            "fused_short_conv_kv_prep_taped_tree: tree_rows requires Metal k=4 kernel",
+        ));
+    }
+
+    // Fallback
+    let t_i64 = k_raw.shape()?[0];
+    let act_dtype = k_raw.dtype()?;
+    let k_conv_out =
+        fused_short_conv_ragged_taped(k_raw, k_weight, dyn_k, k_histories, cu_seqlens_q, k_tapes)?;
+    let v_conv_out =
+        fused_short_conv_ragged_taped(v_raw, v_weight, dyn_v, v_histories, cu_seqlens_q, v_tapes)?;
+    let k_3d = k_conv_out.reshape(&[t_i64, num_kv_heads as i64, head_dim as i64])?;
+    let v_3d = v_conv_out.reshape(&[t_i64, num_kv_heads as i64, head_dim as i64])?;
+    let k_cur = super::attention::l2_clip(&k_3d, None, f64::from(qk_thresh), act_dtype)?;
+    let v_cur = crate::nn::normalization::rms_norm_unscaled(&v_3d.astype(DType::Float32)?, v_eps)?
+        .astype(act_dtype)?;
+    Ok((k_cur, v_cur))
+}
+
 /// Single-dispatch fused K+V causal `k=4` ShortConv + K L2-clip + V weightless RMSNorm across
 /// `N >= 1` packed sequences with zero DRAM roundtrip between ShortConv and K/V norm/clip.
 #[allow(clippy::too_many_arguments)]
@@ -948,67 +1171,112 @@ pub fn fused_short_conv_kv_prep_taped(
     qk_thresh: f32,
     v_eps: f32,
 ) -> Result<(MxArray, MxArray)> {
+    fused_short_conv_kv_prep_taped_tree(
+        k_raw,
+        v_raw,
+        k_weight,
+        v_weight,
+        dyn_k,
+        dyn_v,
+        k_histories,
+        v_histories,
+        cu_seqlens_q,
+        cu_seqlens_arr,
+        k_tapes,
+        v_tapes,
+        num_kv_heads,
+        head_dim,
+        qk_thresh,
+        v_eps,
+        None,
+    )
+}
+
+/// Fused K+V ShortConv + K L2-clip + V RMSNorm + in-place PagedKVWrite (INT8-KTM & BF16)
+/// with optional speculative verify `tree_rows`.
+#[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
+pub fn fused_short_conv_kv_prep_paged_taped_tree(
+    k_raw: &MxArray,
+    v_raw: &MxArray,
+    k_weight: &MxArray,
+    v_weight: &MxArray,
+    dyn_k: Option<&MxArray>,
+    dyn_v: Option<&MxArray>,
+    k_histories: &mut [&mut MxArray],
+    v_histories: &mut [&mut MxArray],
+    cu_seqlens_q: &[usize],
+    cu_seqlens_arr: Option<&MxArray>,
+    k_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    v_tapes: Option<&mut [&mut Option<StreamShortConvTape>]>,
+    k_pool: &MxArray,
+    v_pool: &MxArray,
+    k_scale: &MxArray,
+    v_scale: &MxArray,
+    slot_mapping: &MxArray,
+    num_kv_heads: usize,
+    head_dim: usize,
+    block_size: usize,
+    kv_mode: u32,
+    qk_thresh: f32,
+    v_eps: f32,
+    tree_rows: Option<&MxArray>,
+) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
     let num_seqs = k_histories.len();
     if num_seqs == 0 || v_histories.len() != num_seqs || cu_seqlens_q.len() != num_seqs + 1 {
         return Err(Error::from_reason(
-            "fused_short_conv_kv_prep_taped: invalid sequence count",
+            "fused_short_conv_kv_prep_paged_taped: invalid sequence count",
         ));
     }
     #[cfg(target_os = "macos")]
     let kv_dim = (num_kv_heads * head_dim) as i64;
     #[cfg(target_os = "macos")]
     let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
-
-    #[cfg(target_os = "macos")]
-    if unsafe { mlx_sys::mlx_metal_is_available() }
-        && k_weight.shape()?[1] == 4
-        && v_weight.shape()?[1] == 4
-        && all_non_empty
+    if !unsafe { mlx_sys::mlx_metal_is_available() }
+        || k_raw.dtype()? != DType::BFloat16
+        || v_raw.dtype()? != DType::BFloat16
+        || k_weight.shape_at(1)? != 4
+        || v_weight.shape_at(1)? != 4
+        || !all_non_empty
     {
-        record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
-        record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
-        let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
-        return dispatch_ragged_kv_histories(
-            k_histories,
-            v_histories,
-            kv_dim,
-            |kh, vh, stacked| {
-                let (k_cur, v_cur, kh_out, vh_out) = super::kernels::inkling2_sconv_k4_kv_prep(
-                    k_raw,
-                    v_raw,
-                    k_weight,
-                    v_weight,
-                    dyn_k,
-                    dyn_v,
-                    cu_arr.as_ref(),
-                    kh,
-                    vh,
-                    num_seqs,
-                    stacked,
-                    num_kv_heads,
-                    head_dim,
-                    qk_thresh,
-                    v_eps,
-                    1e-6,
-                )?;
-                Ok(((k_cur, v_cur), kh_out, vh_out))
-            },
-        );
+        return Ok(None);
     }
 
-    // Fallback
-    let t_i64 = k_raw.shape()?[0];
-    let act_dtype = k_raw.dtype()?;
-    let k_conv_out =
-        fused_short_conv_ragged_taped(k_raw, k_weight, dyn_k, k_histories, cu_seqlens_q, k_tapes)?;
-    let v_conv_out =
-        fused_short_conv_ragged_taped(v_raw, v_weight, dyn_v, v_histories, cu_seqlens_q, v_tapes)?;
-    let k_3d = k_conv_out.reshape(&[t_i64, num_kv_heads as i64, head_dim as i64])?;
-    let v_3d = v_conv_out.reshape(&[t_i64, num_kv_heads as i64, head_dim as i64])?;
-    let k_cur = super::attention::l2_clip(&k_3d, None, f64::from(qk_thresh), act_dtype)?;
-    let v_cur = crate::nn::normalization::rms_norm_unscaled(&v_3d.astype(DType::Float32)?, v_eps)?
-        .astype(act_dtype)?;
-    Ok((k_cur, v_cur))
+    record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
+    record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
+    let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
+
+    let out = dispatch_ragged_kv_histories(k_histories, v_histories, kv_dim, |kh, vh, stacked| {
+        let (kp_out, vp_out, ks_out, vs_out, kh_out, vh_out) =
+            super::kernels::inkling2_sconv_k4_kv_prep_paged_tree(
+                k_raw,
+                v_raw,
+                k_weight,
+                v_weight,
+                dyn_k,
+                dyn_v,
+                cu_arr.as_ref(),
+                kh,
+                vh,
+                k_pool,
+                v_pool,
+                k_scale,
+                v_scale,
+                slot_mapping,
+                num_seqs,
+                stacked,
+                num_kv_heads,
+                head_dim,
+                block_size,
+                kv_mode,
+                qk_thresh,
+                v_eps,
+                1e-6,
+                tree_rows,
+            )?;
+        Ok(((kp_out, vp_out, ks_out, vs_out), kh_out, vh_out))
+    })?;
+    Ok(Some(out))
 }
 
 /// Fused K+V ShortConv + K L2-clip + V RMSNorm + in-place PagedKVWrite (INT8-KTM & BF16)
@@ -1043,58 +1311,32 @@ pub fn fused_short_conv_kv_prep_paged_taped(
     qk_thresh: f32,
     v_eps: f32,
 ) -> Result<Option<(MxArray, MxArray, MxArray, MxArray)>> {
-    let num_seqs = k_histories.len();
-    if num_seqs == 0 || v_histories.len() != num_seqs || cu_seqlens_q.len() != num_seqs + 1 {
-        return Err(Error::from_reason(
-            "fused_short_conv_kv_prep_paged_taped: invalid sequence count",
-        ));
-    }
-    let kv_dim = (num_kv_heads * head_dim) as i64;
-    let all_non_empty = (0..num_seqs).all(|s| cu_seqlens_q[s + 1] > cu_seqlens_q[s]);
-    if !unsafe { mlx_sys::mlx_metal_is_available() }
-        || k_raw.dtype()? != DType::BFloat16
-        || v_raw.dtype()? != DType::BFloat16
-        || k_weight.shape()?[1] != 4
-        || v_weight.shape()?[1] != 4
-        || !all_non_empty
-    {
-        return Ok(None);
-    }
-
-    record_ragged_tapes(k_raw, k_histories, cu_seqlens_q, kv_dim, k_tapes)?;
-    record_ragged_tapes(v_raw, v_histories, cu_seqlens_q, kv_dim, v_tapes)?;
-    let cu_arr = prepare_cu_seqlens(num_seqs, cu_seqlens_q, cu_seqlens_arr)?;
-
-    let out = dispatch_ragged_kv_histories(k_histories, v_histories, kv_dim, |kh, vh, stacked| {
-        let (kp_out, vp_out, ks_out, vs_out, kh_out, vh_out) =
-            super::kernels::inkling2_sconv_k4_kv_prep_paged(
-                k_raw,
-                v_raw,
-                k_weight,
-                v_weight,
-                dyn_k,
-                dyn_v,
-                cu_arr.as_ref(),
-                kh,
-                vh,
-                k_pool,
-                v_pool,
-                k_scale,
-                v_scale,
-                slot_mapping,
-                num_seqs,
-                stacked,
-                num_kv_heads,
-                head_dim,
-                block_size,
-                kv_mode,
-                qk_thresh,
-                v_eps,
-                1e-6,
-            )?;
-        Ok(((kp_out, vp_out, ks_out, vs_out), kh_out, vh_out))
-    })?;
-    Ok(Some(out))
+    fused_short_conv_kv_prep_paged_taped_tree(
+        k_raw,
+        v_raw,
+        k_weight,
+        v_weight,
+        dyn_k,
+        dyn_v,
+        k_histories,
+        v_histories,
+        cu_seqlens_q,
+        cu_seqlens_arr,
+        k_tapes,
+        v_tapes,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        num_kv_heads,
+        head_dim,
+        block_size,
+        kv_mode,
+        qk_thresh,
+        v_eps,
+        None,
+    )
 }
 
 #[cfg(test)]

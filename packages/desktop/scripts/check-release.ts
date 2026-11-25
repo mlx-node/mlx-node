@@ -3,11 +3,12 @@
  *
  *   check-release.ts resolve --tag <tag> --manifest <package.json>
  *   check-release.ts verify  --tag <tag> --manifest <package.json> --app <.app> [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>]
- *   check-release.ts verify-windows --tag <tag> --manifest <package.json> --app <packaged-dir> --zip <zip>
+ *   check-release.ts verify-windows --tag <tag> --manifest <package.json> --app <packaged-dir> --zip <zip> [--msix <msix>]
  *
  * `resolve` runs BEFORE the ~16-minute build so a stale manifest costs a minute
- * instead of a full release cycle, and emits `version`, `dmg_name`, `zip_name`, and `windows_zip_name` to
- * `$GITHUB_OUTPUT` so every later step reads one value rather than re-deriving it.
+ * instead of a full release cycle, and emits `version`, `dmg_name`, `zip_name`,
+ * `windows_zip_name`, and `windows_msix_name` to `$GITHUB_OUTPUT` so every later
+ * step reads one value rather than re-deriving it.
  *
  * `verify` runs after the artifacts exist and re-checks the same thing against
  * what was actually produced — the plist inside the `.app` and the archive filenames.
@@ -19,7 +20,7 @@
 
 import { execFileSync } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { basename, join, resolve as resolvePath } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { PayloadError } from './payload.js';
@@ -31,10 +32,13 @@ import {
   versionFromTag,
   updateZipFileName,
   versionFromUpdateZipPath,
+  versionFromWindowsMsixPath,
   versionFromWindowsZipPath,
+  windowsMsixFileName,
   windowsZipFileName,
 } from './release-version.js';
-import { readPackagedWindowsApp } from './windows-payload.js';
+import { verifyWindowsMsix } from './windows-msix.js';
+import { missingWindowsZipEntries, readPackagedWindowsApp } from './windows-payload.js';
 
 const { positionals, values } = parseArgs({
   allowPositionals: true,
@@ -45,13 +49,14 @@ const { positionals, values } = parseArgs({
     dmg: { type: 'string', default: '' },
     zip: { type: 'string', default: '' },
     'windows-zip': { type: 'string', default: '' },
+    msix: { type: 'string', default: '' },
   },
 });
 
 const command = positionals[0];
 if (command !== 'resolve' && command !== 'verify' && command !== 'verify-windows') {
   console.error(
-    'usage: check-release.ts <resolve|verify|verify-windows> --tag <tag> --manifest <package.json> [--app <path>] [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>]',
+    'usage: check-release.ts <resolve|verify|verify-windows> --tag <tag> --manifest <package.json> [--app <path>] [--dmg <dmg>] [--zip <zip>] [--windows-zip <zip>] [--msix <msix>]',
   );
   process.exit(2);
 }
@@ -101,7 +106,7 @@ function resolve(): string {
   if (output !== undefined && output !== '') {
     appendFileSync(
       output,
-      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\nwindows_zip_name=${windowsZipFileName(version)}\n`,
+      `version=${version}\ndmg_name=${dmgFileName(version)}\nzip_name=${updateZipFileName(version)}\nwindows_zip_name=${windowsZipFileName(version)}\nwindows_msix_name=${windowsMsixFileName(version)}\n`,
     );
   }
   return version;
@@ -156,8 +161,13 @@ function verifyWindows(): string {
     console.error(`::error::Windows ZIP ${zip} must exist and be named mlx-node-<version>-win32-arm64.zip`);
     process.exit(1);
   }
+  const msix = values.msix.trim();
+  if (msix !== '' && (versionFromWindowsMsixPath(msix) === null || !existsSync(msix))) {
+    console.error(`::error::Windows MSIX ${msix} must exist and be named mlx-node-<version>-win32-arm64.msix`);
+    process.exit(1);
+  }
   const app = readPackagedWindowsApp(values.app);
-  return assertVersionsAgree({
+  const version = assertVersionsAgree({
     tag,
     manifest,
     bundleShort: app.version,
@@ -165,7 +175,31 @@ function verifyWindows(): string {
     dmg: null,
     zip: null,
     windowsZip: versionFromWindowsZipPath(zip),
+    windowsMsix: msix === '' ? null : versionFromWindowsMsixPath(msix),
   });
+  const tar =
+    process.platform === 'win32' ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe') : 'tar';
+  const zipEntries = execFileSync(tar, ['-tf', zip], {
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  })
+    .split(/\r?\n/)
+    .filter(Boolean);
+  const missingZip = missingWindowsZipEntries(zipEntries, basename(resolvePath(values.app)), app.runtimeFiles);
+  if (missingZip.length > 0) {
+    throw new PayloadError(
+      `Windows ZIP is missing required entries:\n${missingZip.join('\n')}`,
+      'repackage the Windows ZIP',
+    );
+  }
+  if (msix !== '') {
+    verifyWindowsMsix({
+      msixPath: msix,
+      expectedVersion: version,
+      runtimeFiles: app.runtimeFiles,
+    });
+  }
+  return version;
 }
 
 /**

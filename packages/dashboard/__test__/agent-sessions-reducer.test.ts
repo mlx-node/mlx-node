@@ -110,7 +110,7 @@ function live(traffic: Recorded[]): { reducer: TranscriptReducer; ops: Transcrip
     if (dir === 'out' && msg.method === 'session/prompt') {
       promptId = msg.id;
       const block = ((msg.params as Json).prompt as Json[])[0]!;
-      ops.push(...reducer.userPrompt(block.text as string, 1));
+      ops.push(...reducer.userPrompt(block.text as string, [], 1));
       continue;
     }
     if (dir === 'in' && msg.id === promptId && msg.method === undefined) {
@@ -272,7 +272,7 @@ describe('seed', () => {
       [],
     );
     const ops = [
-      ...r.userPrompt('new', 9),
+      ...r.userPrompt('new', [], 9),
       ...r.apply({
         xai: false,
         update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'a' } },
@@ -331,7 +331,7 @@ describe('context use: params._meta.totalTokens', () => {
       { op: 'context', used: 11971 },
     ]);
     r.apply({ xai: true, update: { sessionUpdate: 'turn_completed', stop_reason: 'end_turn' }, meta: undefined });
-    r.userPrompt('next', 6);
+    r.userPrompt('next', [], 6);
     r.apply(line('user_message_chunk'));
     expect(r.context()).toBe(11971);
   });

@@ -857,8 +857,77 @@ describe('createInferenceHost — out-of-band loadModel', () => {
     expect(calls[0].options).toEqual(
       supportsAutomaticDFlash2(family as 'qwen3_5' | 'qwen3_5_moe') ? { draftModelPath: draft } : undefined,
     );
+    expect(calls[0].options?.autoDraftModelPath).toBeUndefined();
     expect(calls[0].path).toBe(join(modelsDir, name));
     expect(host.health().models.resident).toEqual([name]);
+  });
+
+  it('routes an external inkling2 DFlash2 companion through autoDraftModelPath and leaves native layouts unset', async () => {
+    const modelsDir = await makeModelsDir([]);
+    const externalDraft = join(modelsDir, 'inkling-2-mini-dflash2');
+    await mkdir(externalDraft);
+    await writeFile(
+      join(externalDraft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    await writeFile(join(externalDraft, 'model.safetensors'), 'dflash2-weights');
+
+    // 1. Direct sibling directory under modelsDir: native load discovers sibling inkling-2-mini-dflash2 directly.
+    const siblingDir = join(modelsDir, 'inkling-2-mini');
+    await mkdir(siblingDir);
+    await writeFile(join(siblingDir, 'config.json'), JSON.stringify({ model_type: 'inkling2_loop' }));
+    await writeFile(join(siblingDir, 'model.safetensors'), 'weights');
+
+    // 2. Variant-folder GGUF (mlx download layout): modelsDir is outside dirname(modelDir), so host forwards via autoDraftModelPath.
+    const variantDir = join(modelsDir, 'inkling-2-mini-gguf', 'UD-Q4_K_M');
+    await mkdir(variantDir, { recursive: true });
+    const variantGguf = join(variantDir, 'Inkling-2-Mini-UD-Q4_K_M.gguf');
+    await writeFile(variantGguf, ggufHeader('inkling2'));
+
+    // 3. Variant-folder GGUF with a colocated draft/: native load discovers draft/ directly, so host leaves both unset.
+    const colocatedDir = join(modelsDir, 'inkling-2-mini-gguf', 'UD-Q6_K_M');
+    await mkdir(colocatedDir, { recursive: true });
+    const colocatedGguf = join(colocatedDir, 'Inkling-2-Mini-UD-Q6_K_M.gguf');
+    await writeFile(colocatedGguf, ggufHeader('inkling2'));
+    const colocatedDraft = join(colocatedDir, 'draft');
+    await mkdir(colocatedDraft);
+    await writeFile(
+      join(colocatedDraft, 'config.json'),
+      JSON.stringify({ architectures: ['DFlash2DraftModel'], hidden_size: 2304, num_target_layers: 48 }),
+    );
+    await writeFile(join(colocatedDraft, 'model.safetensors'), 'colocated-weights');
+
+    const calls: Array<{ path: string; options?: LoadModelOptions }> = [];
+    const host = await start({
+      modelsDir,
+      loadModel: async (path, options) => {
+        calls.push({ path, options });
+        return fakeModel();
+      },
+    });
+
+    const autoEnabled = supportsAutomaticDFlash2('inkling2');
+    await host.loadModel('Inkling-2-Mini-UD-Q4_K_M');
+    await host.loadModel('inkling-2-mini');
+    await host.loadModel('Inkling-2-Mini-UD-Q6_K_M');
+
+    expect(calls).toEqual([
+      {
+        path: variantGguf,
+        options: autoEnabled ? { autoDraftModelPath: externalDraft } : { autoLoadDraft: false },
+      },
+      {
+        path: siblingDir,
+        options: autoEnabled ? undefined : { autoLoadDraft: false },
+      },
+      {
+        path: colocatedGguf,
+        options: autoEnabled ? undefined : { autoLoadDraft: false },
+      },
+    ]);
+    for (const call of calls) {
+      expect(call.options?.draftModelPath).toBeUndefined();
+    }
   });
 
   it.each([

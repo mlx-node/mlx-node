@@ -252,3 +252,59 @@ describe('managed instruction block', () => {
     expect(await readFile(claude, 'utf8')).toBe(before);
   });
 });
+
+describe('coding agents on Windows', () => {
+  it.each([
+    ['drive path', 'C:\\Users\\me\\.mlx-node\\bin\\mlx.cmd'],
+    ['drive path with spaces and apostrophe', "C:\\Users\\O'Brien\\.mlx-node\\bin\\mlx.cmd"],
+    ['forward-slash drive path', 'D:/Tools/mlx-node/mlx.cmd'],
+    ['UNC path', '\\\\server\\share\\mlx.cmd'],
+  ])('accepts a Windows %s, formats PowerShell instructions, and installs', async (_, winCommand) => {
+    const home = await mkdtemp(join(tmpdir(), 'mlx-coding-agents-win-'));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const env: NodeJS.ProcessEnv = { CLAUDE_CONFIG_DIR: '~\\claude-win' };
+    const service = new CodingAgentsService({
+      home,
+      env,
+      platform: 'win32',
+      listModels: async () => ['local-model'],
+      prepareCommand: async () => winCommand,
+    });
+    cleanup.push(() => service.close());
+
+    const state = await service.state();
+    expect(state.available).toBe(true);
+    expect(state.command).toBe(winCommand);
+    expect(state.block).toBe(managedBlock(winCommand, 'win32'));
+    expect(state.block).toContain(`\`& '${winCommand.replaceAll("'", "''")}' delegate`);
+    expect(state.agents[0].path).toBe(join(home, 'claude-win', 'CLAUDE.md'));
+
+    const after = await service.install('claude');
+    expect(after.agents[0].status).toBe('installed');
+    expect(await readFile(join(home, 'claude-win', 'CLAUDE.md'), 'utf8')).toBe(
+      `${managedBlock(winCommand, 'win32')}\n`,
+    );
+  });
+
+  it.each([
+    ['relative backslash path', 'bin\\mlx.cmd'],
+    ['drive-relative path', 'C:mlx.cmd'],
+    ['root-relative path without drive', '\\mlx.cmd'],
+    ['POSIX path on win32', '/usr/local/bin/mlx'],
+  ])('rejects a non-absolute Windows command: %s', async (_, badCommand) => {
+    const home = await mkdtemp(join(tmpdir(), 'mlx-coding-agents-win-bad-'));
+    cleanup.push(() => rm(home, { recursive: true, force: true }));
+    const service = new CodingAgentsService({
+      home,
+      env: {},
+      platform: 'win32',
+      listModels: async () => ['local-model'],
+      prepareCommand: async () => badCommand,
+    });
+    cleanup.push(() => service.close());
+
+    const state = await service.state();
+    expect(state).toMatchObject({ available: false, command: null });
+    expect(state.unavailableReason).toContain('absolute path');
+  });
+});

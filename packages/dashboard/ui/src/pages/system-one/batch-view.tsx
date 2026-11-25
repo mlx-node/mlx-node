@@ -627,14 +627,15 @@ export function BatchView({
                 : 'Updates live with thresholds'
             }
             footer={
+              // Before the first result the bar is an empty track of the batch size: an unknown value adds a caption
+              // line, and the tile would change height when the first case ends.
               <Meter
                 label="Auto-routed cases"
-                value={kpis.doneCount > 0 ? kpis.autoRoutedRows : null}
-                max={kpis.doneCount > 0 ? kpis.doneCount : null}
+                value={kpis.doneCount > 0 ? kpis.autoRoutedRows : 0}
+                max={kpis.doneCount > 0 ? kpis.doneCount : rows.length}
                 warnAt={1.1}
                 dangerAt={1.1}
                 size="dense"
-                unknownLabel="Run batch to measure"
               />
             }
           />

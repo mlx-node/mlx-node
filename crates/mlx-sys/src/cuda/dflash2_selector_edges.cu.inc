@@ -52,10 +52,12 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cud
 #pragma unroll
     for (int i = 0; i < 8; ++i) {
       const int d = lane + i * 32;
-      const nv_bfloat16 prod = __float2bfloat16_rn(
+      const float prod_f32 =
           __bfloat162float(predecessor[(size_t)pid * Rank + d]) *
-          __bfloat162float(s_h[d]));
-      ctx[i] = __bfloat162float(prod);
+          __bfloat162float(s_h[d]);
+      ctx[i] = (softcap > 0.0f)
+          ? prod_f32
+          : __bfloat162float(__float2bfloat16_rn(prod_f32));
     }
 
 #pragma unroll
@@ -70,20 +72,22 @@ extern "C" __global__ __launch_bounds__(256) void mlx_dflash2_selector_edges_cud
         acc += __shfl_xor_sync(0xffffffffu, acc, sh, 32);
       }
       if (lane == 0) {
-        const float u_val = unary_is_bf16
-            ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(unary_raw)[pos * K + j])
-            : reinterpret_cast<const float*>(unary_raw)[pos * K + j];
-        const float neg_inf = -__int_as_float(0x7f800000);
         float combined;
         if (softcap > 0.0f) {
-          const float sum = u_val + acc;
-          combined = (sum > neg_inf) ? (softcap * tanhf(sum / softcap)) : sum;
+          const float u_val = unary_is_bf16
+              ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(unary_raw)[pos * K + j])
+              : reinterpret_cast<const float*>(unary_raw)[pos * K + j];
+          combined = acc + u_val;
+          if (isfinite(combined)) {
+            combined = softcap * tanhf(fminf(fmaxf(combined / softcap, -20.0f), 20.0f));
+          }
         } else {
           const float edge_bf = __bfloat162float(__float2bfloat16_rn(acc));
-          const float u_bf = unary_is_bf16
-              ? u_val
-              : __bfloat162float(__float2bfloat16_rn(u_val));
-          combined = __bfloat162float(__float2bfloat16_rn(edge_bf + u_bf));
+          const float u_val = unary_is_bf16
+              ? __bfloat162float(reinterpret_cast<const nv_bfloat16*>(unary_raw)[pos * K + j])
+              : __bfloat162float(__float2bfloat16_rn(
+                    reinterpret_cast<const float*>(unary_raw)[pos * K + j]));
+          combined = __bfloat162float(__float2bfloat16_rn(edge_bf + u_val));
         }
         if (pos > 0) {
           scores[((size_t)pos * K + prev) * K + j] = combined;

@@ -18,7 +18,7 @@ import {
   type ChatThreadProps,
 } from '../ui/src/components/chat-thread.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
-import { formatClock } from '../ui/src/lib/format.js';
+import { formatBytes, formatClock } from '../ui/src/lib/format.js';
 import type { TranscriptEntry } from '../ui/src/lib/types.js';
 import {
   CITED_ANSWER,
@@ -115,6 +115,66 @@ function waitText(line: Element | null | undefined): string | undefined {
 function anchors(container: HTMLElement): string[] {
   return [...container.querySelectorAll('a[href]')].map((a) => a.getAttribute('href') ?? '');
 }
+
+describe('ChatThread: files on a message', () => {
+  it('a message sent with files shows read-only chips; one without draws none', () => {
+    const sample: ThreadSample = {
+      mode: 'chat',
+      entries: [
+        {
+          kind: 'user',
+          ts: T0,
+          text: 'Look at these',
+          promptIndex: 1,
+          attachments: [
+            { kind: 'file', name: 'notes.md', bytes: 2048 },
+            { kind: 'image', mediaType: 'image/png', bytes: 4096 },
+          ],
+        },
+        answer('Seen'),
+        end(),
+        user('And now?'),
+        answer('Nothing attached'),
+        end(),
+      ],
+      turns: [],
+      turn: null,
+      lastEnd: null,
+    };
+    const container = mount(threadOf(sample));
+    const lists = allByRole(container, 'list', CHAT.attach.list);
+    expect(lists).toHaveLength(1);
+    expect(allByRole(lists[0]!, 'listitem').map((item) => item.textContent)).toEqual([
+      `notes.md${formatBytes(2048)}`,
+      `${CHAT.attach.image}PNG · ${formatBytes(4096)}`,
+    ]);
+    expect(lists[0]!.querySelector('button, img')).toBeNull();
+    expect(container.textContent).toContain('Look at these');
+  });
+
+  it('a message with only a picture still draws its row', () => {
+    const container = mount(
+      threadOf({
+        mode: 'chat',
+        entries: [
+          {
+            kind: 'user',
+            ts: T0,
+            text: '',
+            promptIndex: 1,
+            attachments: [{ kind: 'image', mediaType: 'image/jpeg', bytes: 100 }],
+          },
+          answer('A dog'),
+          end(),
+        ],
+        turns: [],
+        turn: null,
+        lastEnd: null,
+      }),
+    );
+    expect(allByRole(byRole(container, 'list', CHAT.attach.list)!, 'listitem')).toHaveLength(1);
+  });
+});
 
 describe('ChatThread: sources and citations', () => {
   it('cited sources become chips, the written Sources block is replaced, a chip opens and focuses its source', async () => {
@@ -502,6 +562,31 @@ describe('ChatThread: outcomes and actions', () => {
     expect(onTurnAction).toHaveBeenCalledWith({ kind: 'send-again', text: 'Write a poem' });
     rerender(threadOf(UNFINISHED, { onTurnAction, actionDisabledReason: 'The engine is stopped.' }));
     expect((byRole(container, 'button', 'Send again') as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('Send again names a lost file: the label says it goes without them unless the page still holds them', async () => {
+    const withFiles: ThreadSample = {
+      ...UNFINISHED,
+      entries: [
+        {
+          kind: 'user',
+          ts: T0,
+          text: 'Write a poem',
+          promptIndex: null,
+          attachments: [{ kind: 'file', name: 'poem.txt', bytes: 12 }],
+        },
+        answer('Roses'),
+      ],
+    };
+    const onTurnAction = vi.fn();
+    const container = mount(threadOf(withFiles, { onTurnAction }));
+    expect(byRole(container, 'button', CHAT.sendAgain)).toBeNull();
+    act(() => byRole(container, 'button', CHAT.sendAgainNoFiles)!.click());
+    expect(onTurnAction).toHaveBeenCalledWith({ kind: 'send-again', text: 'Write a poem' });
+    rerender(threadOf(withFiles, { onTurnAction, keptFor: 'Write a poem' }));
+    await waitFor(() => byRole(container, 'button', CHAT.sendAgain) !== null);
+    rerender(threadOf(UNFINISHED, { onTurnAction, keptFor: null }));
+    await waitFor(() => byRole(container, 'button', CHAT.sendAgain) !== null);
   });
 
   it('a model switch after an unfinished turn is drawn below its footer', () => {

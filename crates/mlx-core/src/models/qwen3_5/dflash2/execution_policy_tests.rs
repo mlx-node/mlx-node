@@ -53,7 +53,8 @@ fn draft_execution_defaults_require_the_measured_moe_structure() {
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     assert!(config.supports_moe_execution_defaults(target));
     for index in 0..target.len() {

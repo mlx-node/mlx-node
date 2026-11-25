@@ -311,7 +311,7 @@ export function SummaryTab(): ReactElement {
                 label={chart.title}
                 unit={chart.unit}
                 height={240}
-                curve="linear"
+                curve={kpi === 'decode' ? 'monotone' : 'linear'}
                 data={chart.data}
                 series={chart.series}
                 band={model === null ? undefined : { lowKey: 'p05', highKey: 'p95' }}

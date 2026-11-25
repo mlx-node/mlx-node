@@ -60,7 +60,8 @@ pub(crate) fn tiny_dflash2_config() -> DFlash2Config {
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     }
 }
 
@@ -104,7 +105,8 @@ pub(crate) fn tiny_dflash2_model_with_block(
         final_logit_softcapping: None,
         selector_softcap_mode: None,
         valid_vocab_size: None,
-        capture_final_norm: false,
+        capture_final_norm: None,
+        embedding_normalization: None,
     };
     if config
         .target_layers

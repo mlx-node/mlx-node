@@ -204,6 +204,8 @@ export interface ExitRecord {
   atMs: number;
   /** Last lines the child wrote before dying, newest last. Best effort. */
   stderrTail: readonly string[];
+  /** The message of the child's start-failure line (`STARTUP_FAILURE_PREFIX`), or null when it wrote none. */
+  startFailure: string | null;
 }
 
 /** Everything the tray and Control Panel need, in one object that cannot get out of sync. */

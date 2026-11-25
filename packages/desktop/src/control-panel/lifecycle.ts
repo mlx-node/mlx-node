@@ -9,6 +9,7 @@ import { MAX_CONVS, SLOW_CALL_REPORT_MS, type PanelMessage, type SlowCall } from
 
 export { readPing } from './liveness.js';
 export { LEDGER_DIR_ENV, readAppEnds } from '../panel-ledger.js';
+export { WINDOWS_STORE_ENV } from '../main/child-env.js';
 
 /** The part of the runtime a pong reads: in-memory lookups, no worker call, no fs. */
 export interface PongRuntime {

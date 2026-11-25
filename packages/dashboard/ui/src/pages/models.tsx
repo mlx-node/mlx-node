@@ -7,16 +7,16 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { offeredOnHost } from '../lib/catalog';
+import { modelPresent, offeredOnHost } from '../lib/catalog';
 import { formatBytes, formatBytesParts, formatCount } from '../lib/format';
 import { useHomeDir } from '../lib/home-dir';
+import { useHost } from '../lib/host';
 import { useDataVersion, useRuntimeLive } from '../lib/live';
 import { joinModelUsage } from '../lib/model-usage';
 import { tildePath } from '../lib/paths';
 import { alignedRange } from '../lib/range';
 import { toast } from '../lib/toast';
 import type {
-  CatalogItem,
   CatalogResponse,
   CatalogUpdatesResponse,
   MetricsSummary,
@@ -27,10 +27,18 @@ import type {
 import { useJson } from '../lib/use-api';
 import { useCommands, type AppCommand } from '../shell/commands';
 import { Page, PageHeader, PageSection } from '../shell/page';
-import { CatalogCard, CatalogCardPlaceholder, CatalogDownloadAction, CatalogGrid } from './models/catalog';
+import {
+  buildFullName,
+  CatalogCardPlaceholder,
+  CatalogDownloadAction,
+  CatalogEntryCard,
+  CatalogGrid,
+  JobFollower,
+  useChosenBuilds,
+} from './models/catalog';
 import { LocalModels, type UsageView } from './models/local-models';
 import { ModelDrawer } from './models/model-drawer';
-import { useModelDownloads } from './models/use-model-downloads';
+import { entryDownloads, useModelDownloads } from './models/use-model-downloads';
 import Onboarding from './onboarding';
 
 export type { ModelDownloadError } from './models/use-model-downloads';
@@ -84,44 +92,76 @@ function useCheckNote(updates: { refreshing: boolean; loading: boolean; error: E
 }
 
 export default function Models({ onboarding = false }: { onboarding?: boolean }): ReactElement {
-  const models = useJson<ModelsResponse>('/models');
+  // Declared before `/models`: both are worker routes, and the walk of every model folder behind `/models` is slow.
   const catalog = useJson<CatalogResponse>('/catalog');
+  const host = useHost();
+  const models = useJson<ModelsResponse>('/models');
   // A separate request on purpose: it dials Hugging Face and may fail; a failure only means no update badge.
   const updates = useJson<CatalogUpdatesResponse>('/catalog/updates');
-  const downloads = useModelDownloads(models, catalog, updates);
+  const downloads = useModelDownloads(models, catalog, updates, host);
 
   if (onboarding) {
     return (
       <Onboarding
         catalog={catalog}
         models={models}
-        activeRepos={Object.keys(downloads.active)}
+        host={host}
+        activeSlugs={Object.keys(downloads.active)}
         downloadError={downloads.downloadError}
         downloadsLoading={downloads.downloadsLoading}
         downloadsError={downloads.downloadsError}
         reloadDownloads={downloads.reloadDownloads}
-        renderDownload={(item) => (
-          <CatalogDownloadAction
-            {...downloads.downloadProps(item)}
-            prominent
-            installLabel="Download model"
-            settlingLabel="Checking download…"
-          />
-        )}
+        renderDownload={(build, entry, modelName) => {
+          const buildProps = downloads.downloadProps(build);
+          const draftProps = entry.draft === undefined ? undefined : entryDownloads(downloads, entry).draft;
+          return (
+            <>
+              {buildProps.job !== undefined && draftProps?.job !== undefined ? (
+                <JobFollower download={draftProps} />
+              ) : null}
+              {buildProps.job === undefined && draftProps?.job !== undefined && entry.draft !== undefined ? (
+                <CatalogDownloadAction
+                  key={entry.draft.slug}
+                  {...draftProps}
+                  buildName={entry.draft.label}
+                  modelName={entry.draft.label}
+                  cleanupName={entry.draft.label}
+                  host={host.data}
+                  prominent
+                  installLabel="Download companion"
+                  settlingLabel="Checking download…"
+                />
+              ) : (
+                <CatalogDownloadAction
+                  key={build.slug}
+                  {...buildProps}
+                  buildName={build.id}
+                  modelName={modelName}
+                  cleanupName={buildFullName(entry, build)}
+                  host={host.data}
+                  prominent
+                  installLabel="Download model"
+                  settlingLabel="Checking download…"
+                />
+              )}
+            </>
+          );
+        }}
       />
     );
   }
-  return <ModelsPage models={models} catalog={catalog} updates={updates} downloads={downloads} />;
+  return <ModelsPage models={models} catalog={catalog} host={host} updates={updates} downloads={downloads} />;
 }
 
 interface ModelsPageProps {
   models: ReturnType<typeof useJson<ModelsResponse>>;
   catalog: ReturnType<typeof useJson<CatalogResponse>>;
+  host: ReturnType<typeof useHost>;
   updates: ReturnType<typeof useJson<CatalogUpdatesResponse>>;
   downloads: ReturnType<typeof useModelDownloads>;
 }
 
-function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): ReactElement {
+function ModelsPage({ models, catalog, host: hostState, updates, downloads }: ModelsPageProps): ReactElement {
   const dataVersion = useDataVersion();
   const range = useMemo(() => alignedRange('30d'), [dataVersion]);
   const scope = `from=${String(range.from)}&to=${String(range.to)}`;
@@ -152,12 +192,15 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
     },
   };
   const focused = focus === null ? undefined : localModels.find((model) => model.name === focus);
-  const host = models.data?.host;
-  const catalogItems = (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host));
+  const host = hostState.data;
+  // Until the host answers, the memory filter is not known: the cards stay in their loading shape and there is no count.
+  const catalogReady = catalog.data !== undefined && !hostState.loading;
+  const catalogItems = catalogReady ? (catalog.data?.items ?? []).filter((item) => offeredOnHost(item, host)) : [];
   const chatCatalogItems = catalogItems.filter((item) => item.category !== 'systemone');
   const systemOneCatalogItems = catalogItems.filter((item) => item.category === 'systemone');
-  const present = chatCatalogItems.filter((item) => item.present).length;
-  const systemOnePresent = systemOneCatalogItems.filter((item) => item.present).length;
+  const present = chatCatalogItems.filter(modelPresent).length;
+  const systemOnePresent = systemOneCatalogItems.filter(modelPresent).length;
+  const { chosen, choose } = useChosenBuilds();
   const activeCount = Object.keys(downloads.active).length;
 
   const setFocus = (name: string | null): void => {
@@ -178,6 +221,7 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
 
   const { reload: reloadCatalog } = catalog;
   const { reload: reloadUpdates } = updates;
+  const { reload: reloadHost } = hostState;
   const onDeleted = (name: string): void => {
     if (focus === name) {
       deletedRef.current = true;
@@ -186,6 +230,7 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
     models.patch((body) => withoutEntry(body, name));
     reloadCatalog();
     reloadUpdates();
+    reloadHost();
   };
 
   const checkUpdates = (): void => {
@@ -194,32 +239,30 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
   };
   const dir = models.data?.dir ?? '';
   const home = useHomeDir();
-  const settlingRepos = catalogItems
-    .filter((item) => {
-      const props = downloads.downloadProps(item);
+  const settlingSlugs = catalogItems
+    .flatMap((item) => item.builds)
+    .filter((build) => {
+      const props = downloads.downloadProps(build);
       return props.settling || props.updateSettling;
     })
-    .map((item) => item.hfRepo)
+    .map((build) => build.slug)
     .join('\n');
   const commands = useMemo((): AppCommand[] => {
     const list: AppCommand[] = [];
     for (const item of catalogItems) {
-      const props = downloads.downloadProps(item);
-      if (props.job !== undefined || props.settling) continue;
-      if (!item.present && !item.blockedByForeignDir) {
-        list.push({
-          id: `models:install:${item.hfRepo}`,
-          label: `Install ${item.label}`,
-          group: 'Models',
-          run: props.onInstall,
-        });
-      } else if (item.present && props.updateAvailable && !props.updateSettling) {
-        list.push({
-          id: `models:update:${item.hfRepo}`,
-          label: `Update ${item.label}`,
-          group: 'Models',
-          run: props.onInstall,
-        });
+      for (const build of item.builds) {
+        const props = downloads.downloadProps(build);
+        if (props.job !== undefined || props.settling) continue;
+        const name = item.builds.length > 1 ? `${item.label} (${build.id})` : item.label;
+        const run = (): Promise<void> => {
+          choose(item.label, build.slug);
+          return props.onInstall();
+        };
+        if (!build.present && !build.blockedByForeignDir && build.heldBy === null) {
+          list.push({ id: `models:install:${build.slug}`, label: `Install ${name}`, group: 'Models', run });
+        } else if (build.present && props.updateAvailable && !props.updateSettling) {
+          list.push({ id: `models:update:${build.slug}`, label: `Update ${name}`, group: 'Models', run });
+        }
       }
     }
     list.push({ id: 'models:check-updates', label: 'Check for updates', group: 'Models', run: checkUpdates });
@@ -236,7 +279,17 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
       });
     }
     return list;
-  }, [catalog.data, updates.data, updates.error, downloads.active, settlingRepos, dir, home]);
+  }, [
+    catalog.data,
+    hostState.data,
+    hostState.loading,
+    updates.data,
+    updates.error,
+    downloads.active,
+    settlingSlugs,
+    dir,
+    home,
+  ]);
   useCommands(commands);
 
   const totalBytes = [...localModels, ...companions].reduce((sum, model) => sum + model.sizeBytes, 0);
@@ -342,7 +395,7 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           description="Curated checkpoints. Install downloads into the models directory."
           actions={
             <span className="flex flex-wrap items-center justify-end gap-2">
-              {catalog.data !== undefined ? (
+              {catalogReady ? (
                 <span className="text-body text-secondary tabular-nums">
                   {`${formatCount(present)} of ${formatCount(chatCatalogItems.length)} installed`}
                 </span>
@@ -374,11 +427,11 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
               </span>
             </Alert>
           ) : null}
-          {catalog.data === undefined ? (
+          {!catalogReady ? (
             catalog.error !== undefined ? null : (
               <CatalogGrid>
-                {[0, 1, 2].map((index) => (
-                  <CatalogCardPlaceholder key={index} withDraft={index === 0} />
+                {[0, 1].map((index) => (
+                  <CatalogCardPlaceholder key={index} />
                 ))}
               </CatalogGrid>
             )
@@ -390,16 +443,13 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
           ) : (
             <CatalogGrid>
               {chatCatalogItems.map((item) => (
-                <CatalogCardEntry
-                  key={item.hfRepo}
+                <CatalogEntryCard
+                  key={item.label}
                   item={item}
                   downloads={downloads}
                   host={host}
-                  detailsTo={
-                    localModels.some((model) => model.name === item.slug)
-                      ? `/models?focus=${encodeURIComponent(item.slug)}`
-                      : undefined
-                  }
+                  chosen={chosen}
+                  choose={choose}
                 />
               ))}
             </CatalogGrid>
@@ -407,16 +457,18 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
         </PageSection>
       </div>
 
-      {systemOneCatalogItems.length > 0 ? (
+      {systemOneCatalogItems.length > 0 || (!catalogReady && catalog.error === undefined) ? (
         <div id="system-one-models" className="min-w-0">
           <PageSection
             title="System One models"
             description="Clairic & CLEF checkpoints for structured extraction, forecasting, and calibrated decisions."
             actions={
               <span className="flex flex-wrap items-center justify-end gap-3">
-                <span className="text-body text-secondary tabular-nums">
-                  {`${formatCount(systemOnePresent)} of ${formatCount(systemOneCatalogItems.length)} installed`}
-                </span>
+                {catalogReady ? (
+                  <span className="text-body text-secondary tabular-nums">
+                    {`${formatCount(systemOnePresent)} of ${formatCount(systemOneCatalogItems.length)} installed`}
+                  </span>
+                ) : null}
                 <Link className="link text-body" to="/system-one">
                   Open System One
                 </Link>
@@ -424,20 +476,19 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
             }
           >
             <CatalogGrid>
-              {systemOneCatalogItems.map((item) => (
-                <CatalogCardEntry
-                  key={item.hfRepo}
-                  item={item}
-                  downloads={downloads}
-                  host={host}
-                  detailsTo={
-                    localModels.some((model) => model.name === item.slug)
-                      ? `/models?focus=${encodeURIComponent(item.slug)}`
-                      : undefined
-                  }
-                  openTo={item.present ? `/system-one?model=${encodeURIComponent(item.slug)}` : undefined}
-                />
-              ))}
+              {catalogReady
+                ? systemOneCatalogItems.map((item) => (
+                    <CatalogEntryCard
+                      key={item.label}
+                      item={item}
+                      downloads={downloads}
+                      host={host}
+                      chosen={chosen}
+                      choose={choose}
+                      systemOne
+                    />
+                  ))
+                : [0, 1].map((index) => <CatalogCardPlaceholder key={index} />)}
             </CatalogGrid>
           </PageSection>
         </div>
@@ -455,34 +506,5 @@ function ModelsPage({ models, catalog, updates, downloads }: ModelsPageProps): R
         deletedRef={deletedRef}
       />
     </Page>
-  );
-}
-
-function CatalogCardEntry(props: {
-  item: CatalogItem;
-  downloads: ReturnType<typeof useModelDownloads>;
-  host: ModelsResponse['host'] | undefined;
-  detailsTo: string | undefined;
-  openTo?: string | undefined;
-}): ReactElement {
-  const { item, downloads } = props;
-  const download = downloads.downloadProps(item);
-  const draft =
-    item.draft === undefined
-      ? undefined
-      : // Drafts carry no tokenizer sidecars of their own.
-        downloads.downloadProps({ ...item.draft, localAssetsRepo: null, localAssetsRevision: null });
-  const busy = download.job !== undefined || draft?.job !== undefined;
-  return (
-    <div className="min-w-0" data-downloading={busy ? '' : undefined}>
-      <CatalogCard
-        {...download}
-        item={item}
-        draftDownload={draft}
-        host={props.host}
-        detailsTo={props.detailsTo}
-        openTo={props.openTo}
-      />
-    </div>
   );
 }

@@ -1,0 +1,142 @@
+.panel.panel {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 14rem;
+  max-height: var(--radix-popover-content-available-height, 100vh);
+  overflow-y: auto;
+  padding: var(--space-1);
+}
+
+.row {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  min-height: var(--control-height-md);
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-inset);
+  padding: var(--space-1) var(--space-2-5);
+  background: transparent;
+  color: var(--foreground);
+  font: inherit;
+  font-size: var(--text-sm);
+  text-align: start;
+  cursor: pointer;
+  transition: background-color var(--duration-fast) var(--ease-standard);
+}
+
+/* foundation.css removes the outline of menu items; this fill is the highlight. */
+.row:focus {
+  background: var(--row-hover);
+}
+
+.row[aria-expanded='true'] {
+  background: var(--row-active);
+}
+
+.row[aria-disabled='true'] {
+  color: var(--text-secondary);
+  cursor: default;
+}
+
+.icon {
+  display: inline-flex;
+  width: 14px;
+  flex: none;
+}
+
+.icon > svg {
+  width: 14px;
+  height: 14px;
+}
+
+.text {
+  display: grid;
+  min-width: 0;
+  flex: 1;
+}
+
+.label {
+  overflow: hidden;
+  font-weight: 500;
+  line-height: var(--leading-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.end {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1-5);
+  margin-inline-start: var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.end[data-tone] {
+  color: var(--foreground);
+}
+
+.dot {
+  width: 6px;
+  height: 6px;
+  flex: none;
+  border-radius: var(--radius-pill);
+}
+
+.end[data-tone='warning'] > .dot {
+  background: var(--warning);
+}
+
+.end[data-tone='danger'] > .dot {
+  background: var(--danger);
+}
+
+.check {
+  flex: none;
+  margin-inline-start: var(--space-2);
+  color: var(--foreground);
+}
+
+.chev {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.row[aria-expanded='true'] > .chev {
+  color: var(--foreground);
+}
+
+.sub.sub {
+  box-sizing: border-box;
+  width: 18rem;
+  min-width: 0;
+  max-width: min(18rem, var(--radix-popover-content-available-width, 100vw));
+  padding: var(--space-1);
+}
+
+.list,
+.group {
+  display: grid;
+}
+
+.separator {
+  height: 1px;
+  margin: var(--space-1) 0;
+  background: var(--border-subtle);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .row {
+    transition: none;
+  }
+}

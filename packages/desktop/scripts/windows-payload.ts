@@ -7,6 +7,67 @@ import { PayloadError } from './payload.js';
 
 export const WINDOWS_ADDON = 'mlx-core.win32-arm64-msvc.node';
 
+/** Required native addons and pdfjs-dist entry scripts inside a staged Windows ARM64 app. */
+export const WINDOWS_APP_RUNTIME_FILES = [
+  'node_modules/@napi-rs/canvas-win32-arm64-msvc/skia.win32-arm64-msvc.node',
+  'node_modules/@napi-rs/keyring-win32-arm64-msvc/keyring.win32-arm64-msvc.node',
+  'node_modules/pdfjs-dist/legacy/build/pdf.mjs',
+  'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
+] as const;
+
+/** Required pdfjs-dist runtime asset directories inside a staged Windows ARM64 app. */
+export const WINDOWS_APP_RUNTIME_DIRS = [
+  'node_modules/pdfjs-dist/wasm',
+  'node_modules/pdfjs-dist/cmaps',
+  'node_modules/pdfjs-dist/standard_fonts',
+] as const;
+
+function hasNonEmptyRegularFile(dir: string): boolean {
+  const stack: string[] = [dir];
+  for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && statSync(fullPath).size > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Fail closed if the staged/packaged Windows ARM64 app is missing required
+ * native `.node` addons or `pdfjs-dist` runtime assets.
+ */
+export function assertWindowsAppRuntimeAssets(appDir: string): void {
+  const missing: string[] = [];
+  for (const relPath of WINDOWS_APP_RUNTIME_FILES) {
+    const fullPath = join(appDir, relPath);
+    if (!existsSync(fullPath)) {
+      missing.push(relPath);
+      continue;
+    }
+    const stat = statSync(fullPath);
+    if (!stat.isFile() || stat.size === 0) {
+      missing.push(`${relPath}${stat.isFile() ? ' (empty)' : ' (not a file)'}`);
+    }
+  }
+  for (const relDir of WINDOWS_APP_RUNTIME_DIRS) {
+    const fullDir = join(appDir, relDir);
+    if (!existsSync(fullDir) || !statSync(fullDir).isDirectory() || !hasNonEmptyRegularFile(fullDir)) {
+      missing.push(relDir);
+    }
+  }
+  if (missing.length > 0) {
+    throw new PayloadError(
+      `Packaged Windows app is missing required runtime assets in ${appDir}:\n  ${missing.join('\n  ')}`,
+      'vp install on Windows ARM64 and repackage',
+    );
+  }
+}
+
 /** Keep the fixed names in sync with copyWindowsCudaRuntime in packages/core/build.ts. */
 export const WINDOWS_RUNTIME_DLLS = [
   'cudart64_13.dll',
@@ -161,6 +222,7 @@ export function readPackagedWindowsApp(appPath: string): { version: string; runt
       throw new PayloadError(`Packaged NVRTC header is missing: ${join(nativeDir, 'include', header)}`, 'repackage');
     }
   }
+  assertWindowsAppRuntimeAssets(join(appPath, 'resources', 'app'));
   return { version, runtimeFiles };
 }
 
@@ -170,13 +232,25 @@ export function missingWindowsZipEntries(
   appDirectoryName: string,
   runtimeFiles: readonly string[],
 ): string[] {
-  const normalized = new Set(entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, '')));
+  const normalizedList = entries.map((entry) => entry.replaceAll('\\', '/').replace(/^\.\//, ''));
+  const normalized = new Set(normalizedList);
   const required = [
     'mlx-node.exe',
     'resources/app/package.json',
+    ...WINDOWS_APP_RUNTIME_FILES.map((file) => `resources/app/${file}`),
     ...runtimeFiles.map((file) => `resources/native/${file}`),
     'resources/native/include/cuda_runtime.h',
     'resources/www/index.html',
   ];
-  return required.filter((file) => !normalized.has(`${appDirectoryName}/${file}`));
+  const missing = required.filter((file) => !normalized.has(`${appDirectoryName}/${file}`));
+  for (const dir of WINDOWS_APP_RUNTIME_DIRS) {
+    const prefix = `${appDirectoryName}/resources/app/${dir}/`;
+    const hasFile = normalizedList.some(
+      (entry) => entry.startsWith(prefix) && entry.length > prefix.length && !entry.endsWith('/'),
+    );
+    if (!hasFile) {
+      missing.push(`resources/app/${dir}`);
+    }
+  }
+  return missing;
 }

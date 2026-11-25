@@ -6,7 +6,7 @@
  * discover after a 16-minute build and a notarization round trip.
  */
 
-import { existsSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import {
@@ -177,4 +177,121 @@ export function codesignArgs(opts: {
   if (opts.entitlements !== undefined) args.push('--entitlements', opts.entitlements);
   args.push(opts.file);
   return args;
+}
+
+/** Required native addons and pdfjs-dist entry scripts inside a staged macOS app. */
+export const DARWIN_APP_RUNTIME_FILES = [
+  'node_modules/@napi-rs/canvas-darwin-arm64/skia.darwin-arm64.node',
+  'node_modules/@napi-rs/keyring-darwin-arm64/keyring.darwin-arm64.node',
+  'node_modules/pdfjs-dist/legacy/build/pdf.mjs',
+  'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs',
+] as const;
+
+/** Required pdfjs-dist runtime asset directories inside a staged app. */
+export const APP_PDFJS_RUNTIME_DIRS = [
+  'node_modules/pdfjs-dist/wasm',
+  'node_modules/pdfjs-dist/cmaps',
+  'node_modules/pdfjs-dist/standard_fonts',
+] as const;
+
+function hasNonEmptyRegularFile(dir: string): boolean {
+  const stack: string[] = [dir];
+  for (let current = stack.pop(); current !== undefined; current = stack.pop()) {
+    for (const entry of readdirSync(current, { withFileTypes: true })) {
+      const fullPath = join(current, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && statSync(fullPath).size > 0) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Fail closed if the staged macOS app is missing native `.node` addons or
+ * `pdfjs-dist` runtime assets needed by Keyring and Clairic PDF rendering.
+ */
+export function assertDarwinAppRuntimeAssets(appDir: string): void {
+  const missing: string[] = [];
+  for (const relPath of DARWIN_APP_RUNTIME_FILES) {
+    const fullPath = join(appDir, relPath);
+    if (!existsSync(fullPath)) {
+      missing.push(relPath);
+      continue;
+    }
+    const stat = statSync(fullPath);
+    if (!stat.isFile() || stat.size === 0) {
+      missing.push(`${relPath}${stat.isFile() ? ' (empty)' : ' (not a file)'}`);
+    }
+  }
+  for (const relDir of APP_PDFJS_RUNTIME_DIRS) {
+    const fullDir = join(appDir, relDir);
+    if (!existsSync(fullDir) || !statSync(fullDir).isDirectory() || !hasNonEmptyRegularFile(fullDir)) {
+      missing.push(relDir);
+    }
+  }
+  if (missing.length > 0) {
+    throw new PayloadError(
+      `Staged macOS app is missing required runtime assets in ${appDir}:\n  ${missing.join('\n  ')}`,
+      'vp install',
+    );
+  }
+}
+
+/**
+ * Walk `nodeModulesDir` for regular `*.node` files, returning sorted paths and
+ * skipping symlinks (both symlinked files and symlinked directories).
+ */
+export function findStagedNativeAddons(nodeModulesDir: string): string[] {
+  if (!existsSync(nodeModulesDir)) return [];
+  const addons: string[] = [];
+  const stack: string[] = [nodeModulesDir];
+  for (let dir = stack.pop(); dir !== undefined; dir = stack.pop()) {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const fullPath = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(fullPath);
+      } else if (entry.isFile() && entry.name.endsWith('.node')) {
+        addons.push(fullPath);
+      }
+    }
+  }
+  return addons.sort();
+}
+
+/**
+ * Extract every `LC_ID_DYLIB` install name from `otool -l` output.
+ *
+ * A universal Mach-O yields one entry per slice; an `MH_BUNDLE` or non-Mach-O
+ * (ELF/PE32+) yields an empty array.
+ */
+export function parseDylibIds(otoolLoadCommands: string): string[] {
+  const ids: string[] = [];
+  let inIdDylib = false;
+  for (const line of otoolLoadCommands.split(/\r?\n/)) {
+    if (/^\s*Load command\b/.test(line)) {
+      inIdDylib = false;
+      continue;
+    }
+    const cmdMatch = /^\s*cmd\s+(\S+)\s*$/.exec(line);
+    if (cmdMatch !== null) {
+      inIdDylib = cmdMatch[1] === 'LC_ID_DYLIB';
+      continue;
+    }
+    if (inIdDylib) {
+      const nameMatch = /^\s*name (.+) \(offset\b/.exec(line);
+      if (nameMatch !== null) {
+        ids.push(nameMatch[1]);
+        inIdDylib = false;
+      }
+    }
+  }
+  return ids;
+}
+
+/** Whether any `LC_ID_DYLIB` install name needs rewriting to `@rpath/<basename>`. */
+export function needsDylibIdRewrite(dylibIds: readonly string[]): boolean {
+  return dylibIds.some((id) => !id.startsWith('@rpath/') || id.includes('/target/'));
 }

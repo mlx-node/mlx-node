@@ -8,7 +8,7 @@
 
 import { constants } from 'node:os';
 
-import { EXIT_STARTUP_FAILED } from '../../inference/exit-codes.js';
+import { EXIT_STARTUP_FAILED, STARTUP_FAILURE_PREFIX } from '../../inference/exit-codes.js';
 import type { ChildExit, Lifecycle, SupervisorState } from './types.js';
 
 const osSignals: Readonly<Record<string, number | undefined>> = constants.signals;
@@ -166,6 +166,15 @@ export function stopCause(policy: RestartPolicy, permanent: boolean, reason: str
  */
 export function isPermanentExit(exit: ChildExit, entryMissing: boolean): boolean {
   return entryMissing || exit.code === EXIT_STARTUP_FAILED;
+}
+
+/** The message of the child's start-failure line in `stderrTail`, the newest one; null when it wrote none. */
+export function startFailureText(stderrTail: readonly string[]): string | null {
+  for (let i = stderrTail.length - 1; i >= 0; i--) {
+    const line = stderrTail[i]!;
+    if (line.startsWith(STARTUP_FAILURE_PREFIX)) return line.slice(STARTUP_FAILURE_PREFIX.length);
+  }
+  return null;
 }
 
 /** Splash `Quarantine`. Sets are replaced, never changed in place. */

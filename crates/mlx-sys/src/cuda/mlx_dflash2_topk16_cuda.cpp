@@ -155,7 +155,7 @@ public:
 
 class DFlash2SelectorEdgesCuda : public UnaryPrimitive {
 public:
-  explicit DFlash2SelectorEdgesCuda(Stream stream, float softcap = 0.0f)
+  DFlash2SelectorEdgesCuda(Stream stream, float softcap)
       : UnaryPrimitive(stream), softcap_(softcap) {}
 
   void eval_cpu(const std::vector<array>&, array&) override {
@@ -220,7 +220,7 @@ private:
 } // namespace mlx::core
 #endif
 
-extern "C" mlx_array* mlx_dflash2_selector_edges_cuda_softcap(
+extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
     mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
     mlx_array* predecessor, mlx_array* successor, mlx_array* anchor,
     float softcap) {
@@ -228,7 +228,7 @@ extern "C" mlx_array* mlx_dflash2_selector_edges_cuda_softcap(
   try {
     using namespace mlx::core;
     if (!candidates || !unary || !hidden || !predecessor || !successor || !anchor ||
-        default_device() != Device::gpu || !(softcap >= 0.0f && std::isfinite(softcap))) {
+        default_device() != Device::gpu) {
       return nullptr;
     }
     const auto& c = *reinterpret_cast<array*>(candidates);
@@ -246,13 +246,14 @@ extern "C" mlx_array* mlx_dflash2_selector_edges_cuda_softcap(
         s.shape() != p.shape() || a.shape() != Shape{1}) {
       return nullptr;
     }
+    const float cap = (std::isfinite(softcap) && softcap > 0.0f) ? softcap : 0.0f;
     auto result = array(
         Shape{c.shape(1), 16, 16}, float32,
-        std::make_shared<DFlash2SelectorEdgesCuda>(default_stream(Device::gpu), softcap),
+        std::make_shared<DFlash2SelectorEdgesCuda>(default_stream(Device::gpu), cap),
         {c, u, h, p, s, a});
     return reinterpret_cast<mlx_array*>(new array(std::move(result)));
   } catch (const std::exception& error) {
-    std::fprintf(stderr, "mlx_dflash2_selector_edges_cuda_softcap: %s\n", error.what());
+    std::fprintf(stderr, "mlx_dflash2_selector_edges_cuda: %s\n", error.what());
     return nullptr;
   }
 #else
@@ -260,13 +261,6 @@ extern "C" mlx_array* mlx_dflash2_selector_edges_cuda_softcap(
   (void)softcap;
   return nullptr;
 #endif
-}
-
-extern "C" mlx_array* mlx_dflash2_selector_edges_cuda(
-    mlx_array* candidates, mlx_array* unary, mlx_array* hidden,
-    mlx_array* predecessor, mlx_array* successor, mlx_array* anchor) {
-  return mlx_dflash2_selector_edges_cuda_softcap(
-      candidates, unary, hidden, predecessor, successor, anchor, 0.0f);
 }
 
 extern "C" int mlx_dflash2_topk16_cuda(

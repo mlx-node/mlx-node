@@ -470,6 +470,16 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn supports_adaptive_scheduled_speculation(&self) -> bool {
         false
     }
+    /// Whether a scheduled-eligible speculative chat turn with these resolved
+    /// parameters must use the exclusive whole-turn speculative lane instead of
+    /// the multi-lane scheduled verifier (e.g. Inkling-2-Mini DFlash2 greedy
+    /// verify-tree / SAM turns, which run in the whole-turn stepper).
+    fn speculative_turn_requires_exclusive_lane(
+        &self,
+        _params: &engine::params::ChatParams,
+    ) -> bool {
+        false
+    }
     /// Whether the target rows of this backend's sampled, unpenalized
     /// speculative lanes come from the device row kernels
     /// ([`engine::dspark_turn::submit_sampled_rows`]).
@@ -2342,9 +2352,12 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .and_then(|logits| Self::prepare_sample_next(turn, logits));
                 pending.push(sample);
             }
-            let started = Instant::now();
+            let started = running
+                .iter()
+                .any(|turn| turn.payload.profiler.is_enabled())
+                .then(Instant::now);
             let sampled = engine::batch_sampling::evaluate_pending_samples(pending);
-            sampling_eval_time = Some(started.elapsed());
+            sampling_eval_time = started.map(|t| t.elapsed());
             sampled.into_iter().map(Some).collect()
         } else {
             Vec::new()
@@ -2458,14 +2471,11 @@ impl<B: HybridSchedulerBackend> StepExecutor<ScheduledTurn<B::PrefixState>>
     ) -> std::result::Result<StepResult, Self::Error> {
         let mut rows = Vec::with_capacity(plan.rows.len());
         rows.resize_with(plan.rows.len(), || None);
-        let decode_started = Instant::now();
+        let has_decode = plan.rows.iter().any(|row| row.kind == StepKind::Decode);
+        let decode_started = has_decode.then(Instant::now);
         let (decode_results, executed_decode_batch, executed_greedy_epilogue_batch) =
             self.execute_decode_rows(plan, running)?;
-        let decode_wall_micros = if plan.rows.iter().any(|row| row.kind == StepKind::Decode) {
-            Self::elapsed_micros(decode_started)
-        } else {
-            0
-        };
+        let decode_wall_micros = decode_started.map_or(0, Self::elapsed_micros);
         let mut prefill_started = None;
         let batched_decode_blocked = decode_results
             .iter()
@@ -3164,14 +3174,27 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 ))
     }
 
+    fn speculative_turn_requires_exclusive_lane(
+        &self,
+        params: &engine::params::ChatParams,
+        streaming: bool,
+    ) -> bool {
+        self.inner
+            .execution_plan()
+            .speculative
+            .is_some_and(|speculative| speculative.admits_streaming(streaming))
+            && self.inner.speculative_turn_requires_exclusive_lane(params)
+    }
+
     fn chat_requires_barrier(&self, command: &ChatCmd) -> bool {
         if Self::chat_config(command).is_some_and(|config| {
+            let streaming = Self::chat_is_streaming(command);
             config.enable_mtp == Some(true)
-                && (self.speculation_requires_exclusive_lane(Self::chat_is_streaming(command))
-                    || self.adaptive_requires_exclusive_lane(
-                        &self.inner.resolve_params(config),
-                        Self::chat_is_streaming(command),
-                    ))
+                && (self.speculation_requires_exclusive_lane(streaming) || {
+                    let params = self.inner.resolve_params(config);
+                    self.adaptive_requires_exclusive_lane(&params, streaming)
+                        || self.speculative_turn_requires_exclusive_lane(&params, streaming)
+                })
         }) {
             return true;
         }
@@ -3488,7 +3511,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 admitted.plan.decoder,
                 engine::plan::DecoderPlan::Speculative(_)
             ) && (self.speculation_requires_exclusive_lane(streaming)
-                || self.adaptive_requires_exclusive_lane(&admitted.params, streaming)))
+                || self.adaptive_requires_exclusive_lane(&admitted.params, streaming)
+                || self.speculative_turn_requires_exclusive_lane(&admitted.params, streaming)))
         {
             if newly_assigned {
                 self.owner_sequences.remove(&owner_id);
@@ -5046,6 +5070,20 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if reset {
             self.owner_sequences.clear();
             self.owner_states.clear();
+            self.owner_last_used.clear();
+        } else {
+            let live: HashSet<SeqId> = self.owner_sequences.values().copied().collect();
+            self.owner_last_used
+                .retain(|seq_id, _| live.contains(seq_id));
+            if let Some(adapter) = self.inner.paged_adapter() {
+                for &seq_id in &live {
+                    if let Some(stamp) = adapter.turn_end_stamp(seq_id) {
+                        self.owner_last_used.insert(seq_id, stamp);
+                    } else if adapter.block_table_for(seq_id).is_none() {
+                        self.owner_last_used.remove(&seq_id);
+                    }
+                }
+            }
         }
         self.close_pass(&mut []);
         None
@@ -6823,7 +6861,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 .get(&turn.payload.owner_id)
                 .map(B::owner_tokens)
                 .unwrap_or_default(),
-            !self.scratch,
+            turn.payload.reuse_cache && !self.scratch,
             turn.payload.params.cache_salt,
             turn.block_size,
         );
@@ -8364,6 +8402,496 @@ pub(crate) mod tests {
         let mut nemotron = NemotronHInner::new(tiny_nemotron_paged_mtp_config()).unwrap();
         nemotron.mtp_weights_loaded = true;
         check(nemotron, true);
+    }
+
+    #[test]
+    fn inkling2_dflash2_verify_tree_exclusive_lane_and_prepare_admitted() {
+        use std::collections::HashMap;
+
+        use crate::array::DType;
+        use crate::disk_tier::DiskTierOptions;
+        use crate::models::gemma4::dspark_decode::tests::tiny_qwen_tokenizer;
+        use crate::models::inkling2::config::Inkling2Config;
+        use crate::models::inkling2::dflash2::Inkling2VerifyTreePolicy;
+        use crate::models::inkling2::dspark::{
+            Inkling2DsparkDraftConfig, Inkling2DsparkModel, Inkling2MarkovHead,
+        };
+        use crate::models::inkling2::kv_cache::{Inkling2PagedConfig, default_inkling2_kv_format};
+        use crate::models::inkling2::model::{
+            Inkling2Inner, default_decode_share, next_inkling2_model_id,
+        };
+        use crate::models::inkling2::scheduled_dspark::Inkling2ScheduledDsparkStates;
+        use crate::models::quantized_linear::LinearProj;
+        use crate::models::qwen3_5::dflash2::{
+            DFLASH2_DRAFT_PROPOSALS, tiny_dflash2_model_with_block,
+        };
+        use crate::nn::{Embedding, Linear, RoPE};
+        use crate::transformer::Activations;
+        use mlx_paged_attn::CacheRecency;
+
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+
+        let d = 256usize;
+        let vocab = 64usize;
+        let unpadded_vocab = 60usize;
+        let make_inner = |with_dflash2: bool, with_dspark: bool| -> Inkling2Inner {
+            let config = Inkling2Config {
+                model_type: "inkling2".to_string(),
+                hidden_size: d,
+                num_hidden_layers: 2,
+                num_physical_layers: Some(2),
+                num_attention_heads: 2,
+                num_key_value_heads: 1,
+                head_dim: 128,
+                value_head_dim: None,
+                vocab_size: vocab,
+                padded_vocab_size: Some(vocab),
+                unpadded_vocab_size: Some(unpadded_vocab),
+                rms_norm_eps: 1e-6,
+                max_position_embeddings: 256,
+                sliding_window: 64,
+                sliding_window_pattern: vec![true, false],
+                local_layer_ids: vec![0],
+                sconv_kernel_size: 4,
+                n_layers_per_attn_res_block: 2,
+                d_rel: 16,
+                rel_extent: 64,
+                qk_l2_clip_threshold: 16.0,
+                rel_l2_clip_threshold: 8.0,
+                log_scaling_n_floor: 4,
+                log_scaling_alpha: 0.25,
+                num_experts: 4,
+                num_experts_per_tok: 2,
+                moe_intermediate_size: Some(64),
+                intermediate_size: Some(64),
+                route_scale: 1.0,
+                mlp_gate_softcap: 15.0,
+                mlp_up_softcap: 15.0,
+                final_logit_softcapping: 30.0,
+                loop_config: None,
+                vision_config: None,
+                dspark_config: None,
+                eos_token_id: 2,
+                pad_token_id: 0,
+                gate_up_interleaved: false,
+            };
+            let emb_w =
+                MxArray::zeros(&[vocab as i64, d as i64], Some(DType::BFloat16)).expect("emb");
+            let embed_tokens = Embedding::from_weight(&emb_w).expect("Embedding::from_weight");
+            let embed_norm = MxArray::ones(&[d as i64], Some(DType::Float32)).expect("embed_norm");
+            let output_res_query =
+                MxArray::zeros(&[1, d as i64], Some(DType::Float32)).expect("out_q");
+            let output_res_query_t = output_res_query.transpose(None).expect("out_q_t");
+            let output_norm = MxArray::ones(&[d as i64], Some(DType::Float32)).expect("out_norm");
+            let lm_w =
+                MxArray::zeros(&[vocab as i64, d as i64], Some(DType::BFloat16)).expect("lm_w");
+            let lm_head = LinearProj::Standard(Linear::from_weights(&lm_w, None).expect("lm_head"));
+
+            let dflash2 = with_dflash2.then(|| {
+                let draft_target = Qwen3_5Config {
+                    rope_scaling: None,
+                    qwen35_gguf_gdn_layout: None,
+                    kv_format: None,
+                    vocab_size: vocab as i32,
+                    hidden_size: d as i32,
+                    num_layers: 4,
+                    num_heads: 2,
+                    num_kv_heads: 1,
+                    intermediate_size: 512,
+                    rms_norm_eps: 1e-6,
+                    head_dim: 128,
+                    tie_word_embeddings: false,
+                    attention_bias: false,
+                    max_position_embeddings: 256,
+                    pad_token_id: 0,
+                    eos_token_id: 2,
+                    bos_token_id: 1,
+                    linear_num_value_heads: 2,
+                    linear_num_key_heads: 2,
+                    linear_key_head_dim: 8,
+                    linear_value_head_dim: 8,
+                    linear_conv_kernel_dim: 4,
+                    full_attention_interval: 4,
+                    partial_rotary_factor: 0.25,
+                    rope_theta: 10_000.0,
+                    paged_cache_memory_mb: None,
+                    paged_block_size: None,
+                    n_mtp_layers: 0,
+                };
+                tiny_dflash2_model_with_block(&draft_target, DFLASH2_DRAFT_PROPOSALS)
+                    .expect("tiny DFlash2 draft")
+            });
+
+            let dspark = with_dspark.then(|| {
+                let rank = 16usize;
+                let draft_cfg = Inkling2DsparkDraftConfig {
+                    hidden_size: d,
+                    intermediate_size: d,
+                    num_hidden_layers: 1,
+                    num_attention_heads: 2,
+                    num_key_value_heads: 1,
+                    head_dim: 128,
+                    rope_theta: 1_000_000.0,
+                    rms_norm_eps: 1e-6,
+                    vocab_size: vocab,
+                    unpadded_vocab_size: unpadded_vocab,
+                    block_size: 8,
+                    target_layer_ids: vec![0, 1],
+                    markov_rank: rank,
+                    sliding_window: 64,
+                    sliding_window_pattern: vec![true],
+                    final_logit_softcapping: 30.0,
+                    max_position_embeddings: 256,
+                };
+                Inkling2DsparkModel {
+                    config: draft_cfg,
+                    layers: Vec::new(),
+                    output_norm: MxArray::ones(&[d as i64], Some(DType::Float32)).expect("norm"),
+                    mask_embd: MxArray::zeros(&[1, d as i64], Some(DType::BFloat16)).expect("mask"),
+                    fuse_alpha: vec![vec![0.5, 0.5], vec![0.5, 0.5]],
+                    markov_head: Inkling2MarkovHead {
+                        markov_rank: rank,
+                        dflare_norm: MxArray::ones(&[d as i64], Some(DType::Float32))
+                            .expect("dflare"),
+                        markov_w1: MxArray::zeros(
+                            &[vocab as i64, rank as i64],
+                            Some(DType::BFloat16),
+                        )
+                        .expect("w1"),
+                        rnn_bias_f32: MxArray::zeros(&[1, (3 * rank) as i64], Some(DType::Float32))
+                            .expect("bias"),
+                        rnn_proj_rec_w_t: MxArray::zeros(
+                            &[(2 * rank) as i64, (3 * rank) as i64],
+                            Some(DType::BFloat16),
+                        )
+                        .expect("rec"),
+                        rnn_proj_ctx_w_t: MxArray::zeros(
+                            &[(2 * d) as i64, (3 * rank) as i64],
+                            Some(DType::BFloat16),
+                        )
+                        .expect("ctx"),
+                        fold_weight_q8: None,
+                        fold_weight_t: None,
+                        fold_bias: MxArray::zeros(&[1, vocab as i64], Some(DType::BFloat16))
+                            .expect("fold_bias"),
+                        one_scalar: MxArray::scalar_float(1.0).expect("one"),
+                    },
+                    rope: RoPE::new(128, Some(false), Some(1_000_000.0), Some(1.0)),
+                }
+            });
+
+            let mut inner = Inkling2Inner {
+                config,
+                embed_tokens,
+                embed_norm,
+                layers: Vec::new(),
+                output_res_query,
+                output_res_query_t,
+                output_norm,
+                lm_head,
+                lm_head_bf16_unpadded: None,
+                vision_encoder: None,
+                tokenizer: None,
+                dspark,
+                dflash2,
+                dflash2_identity: None,
+                dspark_turn_contexts: HashMap::new(),
+                cuda_dflash2_ctx: None,
+                cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),
+                cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance::new(
+                ),
+                cuda_dspark_ctx: None,
+                scheduled_dspark: Inkling2ScheduledDsparkStates::default(),
+                paged: None,
+                flat_cache: None,
+                cuda_cache: None,
+                cuda_kv_format: crate::models::inkling2::cuda_kv::Inkling2CudaKvFormat::Bf16,
+                cached_token_history: Vec::new(),
+                cached_image_key: None,
+                turn_cancel: None,
+                model_id: next_inkling2_model_id(),
+                memory_plan: None,
+                memory_registration: None,
+                wired: None,
+                cache_recency: Arc::new(CacheRecency::new()),
+                decode_share: default_decode_share(),
+                max_context: None,
+                activations: Activations::Auto,
+                disk_options: DiskTierOptions::default(),
+                prefill_runs: HashMap::new(),
+            };
+            inner
+                .enable_paged(Inkling2PagedConfig {
+                    kv_format: default_inkling2_kv_format(),
+                    block_size: 32,
+                    max_model_len: 128,
+                    max_chunk: 64,
+                    max_concurrent_sequences: 2,
+                    gpu_memory_mb: None,
+                })
+                .expect("enable_paged");
+            inner
+        };
+
+        let check_turn = |state: &mut HybridSchedulerState<Inkling2Inner>,
+                          config: ChatConfig,
+                          streaming: bool,
+                          expect_barrier: bool,
+                          label: &str| {
+            let (command, _keepalive): (ChatCmd, Box<dyn std::any::Any>) = if streaming {
+                let (cmd, rx) = streaming_start(config.clone());
+                (cmd, Box::new(rx))
+            } else {
+                let (cmd, rx) = sync_start(config.clone());
+                (cmd, Box::new(rx))
+            };
+            assert_eq!(
+                state.chat_requires_barrier(&command),
+                expect_barrier,
+                "{label} (streaming={streaming}): chat_requires_barrier mismatch"
+            );
+
+            let params = state.inner.resolve_params(&config);
+            let plan = TurnPlan::resolve(
+                state.inner.execution_plan(),
+                TurnRequest {
+                    is_delta: false,
+                    input_media: MediaCapabilities::NONE,
+                    context_media: MediaCapabilities::NONE,
+                    speculative_requested: params.enable_mtp,
+                    streaming,
+                },
+            );
+            let thinking = state.inner.thinking_setup(&config);
+            let admitted = engine::session::AdmittedPagedTurn {
+                tokenizer: tiny_qwen_tokenizer(),
+                eos_id: 2,
+                close: engine::backend::ThinkEndResolution {
+                    think_end_id: None,
+                    think_end_str: None,
+                    thinking_end: Arc::from(Vec::new()),
+                    think_end_extra_ids: Vec::new(),
+                },
+                config,
+                params,
+                thinking,
+                template_thinking_enabled: false,
+                tokens: vec![1, 2, 3, 4],
+                images: Vec::new(),
+                audio: Vec::new(),
+                plan,
+            };
+            let owner_id = format!("owner-{label}-{streaming}");
+            let seq_id = state.next_seq_id;
+            state.next_seq_id = state.next_seq_id.saturating_add(1);
+            state.owner_sequences.insert(owner_id.clone(), seq_id);
+
+            let (response, sync_rx, stream_rx) = if streaming {
+                let (tx, rx) = crate::model_thread::stream_channel(4);
+                (ScheduledReply::Stream(tx), None, Some(rx))
+            } else {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                (ScheduledReply::Sync(tx), Some(rx), None)
+            };
+            let prepared = state.prepare_admitted(
+                admitted,
+                TurnRoute {
+                    response,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    owner_id: owner_id.clone(),
+                    seq_id,
+                    newly_assigned: true,
+                    arrival: Arrival {
+                        at: Instant::now(),
+                        mark: state.timeline,
+                    },
+                    extra_breaks: Vec::new(),
+                },
+            );
+            if expect_barrier {
+                assert!(
+                    prepared.is_none(),
+                    "{label} (streaming={streaming}): prepare_admitted must reject exclusive turn"
+                );
+                assert!(
+                    !state.owner_sequences.contains_key(&owner_id),
+                    "{label} (streaming={streaming}): rejected turn must clean up new owner"
+                );
+                if let Some(mut rx) = sync_rx {
+                    assert!(matches!(rx.try_recv(), Ok(Err(_))));
+                }
+                if let Some(mut rx) = stream_rx {
+                    assert!(matches!(rx.try_recv(), Ok(Err(_))));
+                }
+            } else {
+                assert!(
+                    prepared.is_some(),
+                    "{label} (streaming={streaming}): prepare_admitted must admit scheduled turn"
+                );
+                state.owner_sequences.remove(&owner_id);
+                state.owner_states.remove(&owner_id);
+            }
+        };
+
+        let expected_tree = Inkling2VerifyTreePolicy::from_env().tree_path_active();
+        if std::env::var_os("MLX_INKLING2_VERIFY_TREE").is_none() {
+            assert!(
+                expected_tree,
+                "default MLX_INKLING2_VERIFY_TREE=auto must activate verify-tree routing"
+            );
+        }
+
+        // 1. DFlash2-backed Inkling2Inner.
+        let mut dflash_state =
+            HybridSchedulerState::new(make_inner(true, false)).expect("dflash2 scheduler");
+        let base_greedy = ChatConfig {
+            enable_mtp: Some(true),
+            max_new_tokens: Some(16),
+            temperature: Some(0.0),
+            ..ChatConfig::default()
+        };
+        for streaming in [false, true] {
+            check_turn(
+                &mut dflash_state,
+                base_greedy.clone(),
+                streaming,
+                expected_tree,
+                "dflash2-greedy-unpenalized",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some(DFLASH2_DRAFT_PROPOSALS as i32),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                expected_tree,
+                "dflash2-greedy-full-depth",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some(1),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-pinned-depth-1",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    mtp_depth: Some((DFLASH2_DRAFT_PROPOSALS - 1) as i32),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-pinned-depth-6",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    temperature: Some(1.0),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-sampled",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    temperature: None,
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-default-temp-sampled",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    repetition_penalty: Some(1.1),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-rep-penalty",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    presence_penalty: Some(0.2),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-presence-penalty",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    frequency_penalty: Some(0.2),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-frequency-penalty",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    enable_mtp: Some(false),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-mtp-disabled",
+            );
+            check_turn(
+                &mut dflash_state,
+                ChatConfig {
+                    enable_mtp: None,
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dflash2-greedy-mtp-unset",
+            );
+        }
+
+        // Without paged runtime (`execution_plan().speculative.is_none()`), the
+        // scheduler helper must never claim exclusive routing.
+        let greedy_params = dflash_state.inner.resolve_params(&base_greedy);
+        let saved_paged = dflash_state.inner.paged.take();
+        assert!(!dflash_state.speculative_turn_requires_exclusive_lane(&greedy_params, false));
+        assert!(!dflash_state.speculative_turn_requires_exclusive_lane(&greedy_params, true));
+        dflash_state.inner.paged = saved_paged;
+
+        // 2. DSpark-only (`dflash2 = None, dspark = Some(_)`): greedy stays on scheduled lane.
+        let mut dspark_state =
+            HybridSchedulerState::new(make_inner(false, true)).expect("dspark scheduler");
+        for streaming in [false, true] {
+            check_turn(
+                &mut dspark_state,
+                ChatConfig {
+                    mtp_adaptive_depth: Some(false),
+                    ..base_greedy.clone()
+                },
+                streaming,
+                false,
+                "dspark-only-greedy-fixed",
+            );
+            check_turn(
+                &mut dspark_state,
+                base_greedy.clone(),
+                streaming,
+                false,
+                "dspark-only-greedy-default-adaptive",
+            );
+        }
     }
 
     #[test]

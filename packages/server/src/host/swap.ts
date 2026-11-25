@@ -17,6 +17,7 @@ import { familyDataFor } from '@mlx-node/lm/family-data';
 import type { SystemOneModel } from '../decision-registry.js';
 import type { PublicModelEntry } from '../handler.js';
 import type { ModelRegistry } from '../registry.js';
+import { ANTHROPIC_MAX_BODY_BYTES } from '../request-validation.js';
 import { FLUSH_MS } from '../supervision.js';
 import type { ModelIdentity } from '../turn-trace.js';
 import type { DiscoveredModel } from './discover.js';
@@ -354,6 +355,7 @@ export function makeSwapController(
         api_backend: 'messages',
         model_family: String(entry.modelType),
         supports_images: entry.supportsImages,
+        max_request_bytes: ANTHROPIC_MAX_BODY_BYTES,
       };
     });
   }

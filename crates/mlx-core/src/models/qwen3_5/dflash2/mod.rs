@@ -56,7 +56,7 @@ pub(crate) use test_helpers::{
     tiny_dflash2_model_with_block, write_test_checkpoint,
 };
 
-use crate::array::MxArray;
+use crate::array::{DType, MxArray};
 #[cfg(test)]
 use crate::engine::dspark_turn::non_causal_sliding_mask;
 use crate::engine::dspark_turn::parallel_query_ids;
@@ -72,20 +72,43 @@ pub(crate) const DFLASH2_DRAFT_PROPOSALS: usize = 7;
 pub(crate) const DFLASH2_VERIFY_ROWS: usize = DFLASH2_DRAFT_PROPOSALS + 1;
 
 /// What a draft must match in its target.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct DFlash2TargetShape {
     pub(crate) hidden_size: usize,
     pub(crate) vocab_size: usize,
+    pub(crate) valid_vocab_size: usize,
     pub(crate) num_layers: usize,
+    pub(crate) final_logit_softcapping: Option<f32>,
+    pub(crate) reads_layer_inputs: bool,
+}
+
+impl DFlash2TargetShape {
+    pub(crate) const fn new(hidden_size: usize, vocab_size: usize, num_layers: usize) -> Self {
+        Self {
+            hidden_size,
+            vocab_size,
+            valid_vocab_size: vocab_size,
+            num_layers,
+            final_logit_softcapping: None,
+            reads_layer_inputs: false,
+        }
+    }
+
+    /// Number of target layer indices a draft may tap (`num_layers`, or
+    /// `num_layers + 1` when the target reads pre-layer inputs and exposes
+    /// the post-final-norm residual at index `num_layers`).
+    pub(crate) const fn readable_layers(self) -> usize {
+        self.num_layers + self.reads_layer_inputs as usize
+    }
 }
 
 impl From<&super::config::Qwen3_5Config> for DFlash2TargetShape {
     fn from(target: &super::config::Qwen3_5Config) -> Self {
-        Self {
-            hidden_size: target.hidden_size as usize,
-            vocab_size: target.vocab_size as usize,
-            num_layers: target.num_layers as usize,
-        }
+        Self::new(
+            target.hidden_size as usize,
+            target.vocab_size as usize,
+            target.num_layers as usize,
+        )
     }
 }
 
@@ -109,9 +132,23 @@ impl From<DFlash2TargetShape> for DFlash2TargetContract {
             hidden_size: shape.hidden_size,
             vocab_size: shape.vocab_size,
             num_layers: shape.num_layers,
-            valid_vocab_size: None,
-            final_logit_softcapping: None,
-            allow_final_norm_tap: false,
+            valid_vocab_size: (shape.valid_vocab_size != shape.vocab_size)
+                .then_some(shape.valid_vocab_size),
+            final_logit_softcapping: shape.final_logit_softcapping,
+            allow_final_norm_tap: shape.reads_layer_inputs,
+        }
+    }
+}
+
+impl From<DFlash2TargetContract> for DFlash2TargetShape {
+    fn from(contract: DFlash2TargetContract) -> Self {
+        Self {
+            hidden_size: contract.hidden_size,
+            vocab_size: contract.vocab_size,
+            valid_vocab_size: contract.valid_vocab_size.unwrap_or(contract.vocab_size),
+            num_layers: contract.num_layers,
+            final_logit_softcapping: contract.final_logit_softcapping,
+            reads_layer_inputs: contract.allow_final_norm_tap,
         }
     }
 }
@@ -166,7 +203,8 @@ pub(crate) trait DFlash2TargetView {
     /// The table and head as arrays a compiled draft may capture; `None`
     /// keeps every proposal eager unless [`Self::target_lm_head_proj`] or
     /// [`Self::target_lm_head_qlinear`] provides a resident head for
-    /// embedded-input compilation.
+    /// embedded-input compilation or the compiled draft body runs on
+    /// pre-embedded rows.
     fn traced(&self) -> Option<(&Embedding, Option<&LinearProj>)>;
     /// Resident `lm_head` projection (`Standard` BF16 or `Quantized`) when
     /// [`Self::traced`] is `None`, enabling compiled embedded-input draft
@@ -186,6 +224,13 @@ pub(crate) trait DFlash2TargetView {
     /// left-to-right causal across positions.
     fn proposal_head_limit(&self) -> Option<usize> {
         None
+    }
+    /// When `true`, [`Self::logits`] is invoked on ONLY the `head_len`
+    /// proposal rows `[1, head_len, hidden]` instead of the full `1 + head_len`
+    /// anchor+proposal block (used by targets whose `lm_head` kernel natively
+    /// projects `M = 7` without wasted anchor compute, e.g. Inkling-2-Mini).
+    fn project_proposals_only(&self) -> bool {
+        false
     }
 }
 
@@ -241,6 +286,46 @@ impl DFlash2Model {
         self.execution_policy = self.execution_policy.with_dense_cuda_profile(cuda);
     }
 
+    /// Called by the Inkling-2-Mini loader after `validate_target`: binds the
+    /// target's unpadded active vocabulary (`200058` of `201024`) and softcap
+    /// onto the selector and enables Metal compiled draft body + NAX attention
+    /// (or compiled CUDA execution on CUDA hosts) when supported.
+    pub(crate) fn configure_inkling2_execution(&mut self, target: DFlash2TargetShape) {
+        let valid_vocab = target.valid_vocab_size.min(self.selector.vocab_size);
+        if valid_vocab < self.config.vocab_size && self.config.valid_vocab_size.is_none() {
+            self.config.valid_vocab_size = Some(valid_vocab);
+        }
+        self.selector.valid_vocab_size = Some(valid_vocab);
+        if let Some(cap) = target.final_logit_softcapping.filter(|&c| c > 0.0) {
+            if self.config.final_logit_softcapping.is_none() {
+                self.config.final_logit_softcapping = Some(cap);
+            }
+            if self.config.selector_softcap_mode.is_none() {
+                self.config.selector_softcap_mode = Some("after_correction".to_string());
+            }
+            self.selector.post_softcap = self.config.post_edge_softcap();
+        }
+        let supported = self.config.supports_inkling2_execution_defaults();
+        let metal = unsafe { sys::mlx_metal_is_available() };
+        let cuda = crate::accelerator::cuda_ops_available();
+        let nax = supported && metal && unsafe { sys::mlx_metal_is_nax_available() };
+        self.invalidate_compiled();
+        self.execution_policy = self
+            .execution_policy
+            .with_inkling2_metal_profile(supported && metal, nax)
+            .with_dense_cuda_profile(cuda);
+        for layer in &mut self.layers {
+            layer.attention.tensor_attention_enabled = self.execution_policy.tensor_attention();
+        }
+    }
+
+    pub(super) fn apply_mask_embedding(&self, embedded: MxArray) -> Result<MxArray> {
+        if self.mask_embedding.is_none() {
+            return Ok(embedded);
+        }
+        self.splice_mask_embedding(&embedded)
+    }
+
     /// Called only by the MoE loader after target validation and before the
     /// companion is published. Dense loaders retain the captured unset-off
     /// policy. Runtime hardware, dtype, shape and gradient guards still apply.
@@ -267,7 +352,7 @@ impl DFlash2Model {
         }
     }
 
-    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetContract>) -> Result<()> {
+    pub(crate) fn validate_target(&self, target: impl Into<DFlash2TargetShape>) -> Result<()> {
         self.config.validate_target(target)
     }
 
@@ -277,16 +362,17 @@ impl DFlash2Model {
     #[allow(dead_code)]
     pub(crate) fn configure_target_contract(
         &mut self,
-        target: impl Into<DFlash2TargetContract>,
+        target: impl Into<DFlash2TargetShape>,
     ) -> Result<()> {
-        let contract = target.into();
-        self.config.validate_target(contract)?;
+        let shape = target.into();
+        self.config.validate_target(shape)?;
         self.invalidate_compiled();
-        if let Some(valid_vocab) = contract.valid_vocab_size {
+        let valid_vocab = shape.valid_vocab_size.min(self.selector.vocab_size);
+        if valid_vocab < self.config.vocab_size || self.config.valid_vocab_size.is_some() {
             self.config.valid_vocab_size = Some(valid_vocab);
             self.selector.valid_vocab_size = Some(valid_vocab);
         }
-        if let Some(cap) = contract.final_logit_softcapping.filter(|&c| c > 0.0) {
+        if let Some(cap) = shape.final_logit_softcapping.filter(|&c| c > 0.0) {
             if self.config.final_logit_softcapping.is_none() {
                 self.config.final_logit_softcapping = Some(cap);
             }
@@ -345,6 +431,148 @@ impl DFlash2Model {
         Ok(self
             .build_block_with_mask_embedding(&anchor_row, rows - 1)?
             .unwrap_or_else(|| embedded.clone()))
+    }
+
+    /// Content-bound fingerprint of the loaded, materialized fusion weights
+    /// (`self.fc` + `self.hidden_norm`) and the config parameters that govern
+    /// [`crate::models::qwen3_5::draft_context::DraftContextWindow`].
+    ///
+    /// Computed strictly from in-memory tensors so persistent SSD caches
+    /// cannot suffer TOCTOU races or miss same-size/same-mtime weight edits.
+    pub(crate) fn context_fusion_fingerprint(&self) -> Result<Vec<u8>> {
+        fn push_array_bytes(
+            components: &mut Vec<Vec<u8>>,
+            tag: &[u8],
+            arr: &MxArray,
+        ) -> Result<()> {
+            let dtype = arr.dtype()?;
+            let shape = arr.shape()?;
+            let mut meta = Vec::with_capacity(tag.len() + 12 + shape.len() * 8);
+            meta.extend_from_slice(tag);
+            meta.extend_from_slice(&(dtype as i32).to_le_bytes());
+            meta.extend_from_slice(&(shape.len() as u64).to_le_bytes());
+            for &dim in shape.as_ref() {
+                meta.extend_from_slice(&dim.to_le_bytes());
+            }
+            components.push(meta);
+
+            let raw = match dtype {
+                DType::Uint8 => arr.to_uint8()?,
+                DType::Int8 => arr.to_int8()?.into_iter().map(|v| v as u8).collect(),
+                DType::Float16 | DType::BFloat16 => {
+                    let vals = arr.to_uint16_native()?;
+                    let mut out = Vec::with_capacity(vals.len() * 2);
+                    for v in vals {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Uint32 => {
+                    let vals = arr.to_uint32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Int32 => {
+                    let vals = arr.to_int32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_le_bytes());
+                    }
+                    out
+                }
+                DType::Float32 => {
+                    let vals = arr.to_float32()?;
+                    let mut out = Vec::with_capacity(vals.len() * 4);
+                    for &v in vals.as_ref() {
+                        out.extend_from_slice(&v.to_bits().to_le_bytes());
+                    }
+                    out
+                }
+            };
+            components.push(raw);
+            Ok(())
+        }
+
+        let mut components: Vec<Vec<u8>> = Vec::with_capacity(16);
+        components.push(b"dflash2-fusion-weights:v1".to_vec());
+
+        // Canonical config bytes governing `DraftContextWindow` tap extraction and fusion.
+        let mut cfg_bytes = Vec::with_capacity(64 + self.config.target_layers.len() * 8);
+        cfg_bytes.extend_from_slice(&(self.config.hidden_size as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.sliding_window as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.block_size as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&(self.config.target_num_layers as u64).to_le_bytes());
+        cfg_bytes.extend_from_slice(&self.config.rms_norm_eps.to_bits().to_le_bytes());
+        cfg_bytes.push(match self.config.capture_final_norm {
+            None => 0,
+            Some(false) => 1,
+            Some(true) => 2,
+        });
+        match self.config.embedding_normalization.as_deref() {
+            None => cfg_bytes.push(0),
+            Some(mode) => {
+                cfg_bytes.push(1);
+                cfg_bytes.extend_from_slice(&(mode.len() as u64).to_le_bytes());
+                cfg_bytes.extend_from_slice(mode.as_bytes());
+            }
+        }
+        cfg_bytes.extend_from_slice(&(self.config.target_layers.len() as u64).to_le_bytes());
+        for &layer in &self.config.target_layers {
+            cfg_bytes.extend_from_slice(&(layer as u64).to_le_bytes());
+        }
+        components.push(cfg_bytes);
+
+        // `self.fc` projection metadata and exact materialized tensor bytes.
+        match &self.fc {
+            LinearProj::Quantized(q) => {
+                let mut fc_meta = Vec::with_capacity(32 + q.mode().len());
+                fc_meta.extend_from_slice(b"fc:quantized");
+                fc_meta.extend_from_slice(&q.bits().to_le_bytes());
+                fc_meta.extend_from_slice(&q.group_size().to_le_bytes());
+                fc_meta.extend_from_slice(&(q.mode().len() as u64).to_le_bytes());
+                fc_meta.extend_from_slice(q.mode().as_bytes());
+                components.push(fc_meta);
+                push_array_bytes(&mut components, b"fc.weight", q.get_weight())?;
+                push_array_bytes(&mut components, b"fc.scales", q.get_scales())?;
+                if let Some(biases) = q.get_biases() {
+                    components.push(vec![1u8]);
+                    push_array_bytes(&mut components, b"fc.biases", biases)?;
+                } else {
+                    components.push(vec![0u8]);
+                }
+            }
+            LinearProj::Standard(lin) => {
+                components.push(b"fc:standard".to_vec());
+                let w = lin.get_weight();
+                push_array_bytes(&mut components, b"fc.weight", &w)?;
+                if let Some(b) = lin.get_bias() {
+                    components.push(vec![1u8]);
+                    push_array_bytes(&mut components, b"fc.bias", &b)?;
+                } else {
+                    components.push(vec![0u8]);
+                }
+            }
+        }
+
+        // `self.hidden_norm` policy, epsilon, and exact materialized scale bytes.
+        let mut norm_meta = Vec::with_capacity(16);
+        norm_meta.extend_from_slice(b"hidden_norm");
+        norm_meta.extend_from_slice(&self.hidden_norm.eps_f32().to_bits().to_le_bytes());
+        norm_meta.push(u8::from(self.hidden_norm.is_precise_f32()));
+        components.push(norm_meta);
+        push_array_bytes(
+            &mut components,
+            b"hidden_norm.weight",
+            self.hidden_norm.weight(),
+        )?;
+
+        let fp = mlx_paged_attn::ColdCacheFingerprint::from_components(
+            components.iter().map(Vec::as_slice),
+        );
+        Ok(fp.as_bytes().to_vec())
     }
 
     pub(crate) fn fuse_context(&self, taps: &[MxArray]) -> Result<MxArray> {
@@ -637,7 +865,7 @@ impl DFlash2Model {
             pair
         } else {
             let query_base = context.logical_len;
-            let embedded = self.splice_mask_embedding(&target_embedding.forward(&block)?)?;
+            let embedded = self.apply_mask_embedding(target_embedding.forward(&block)?)?;
             let hidden = self.forward_embedded(&embedded, query_base, context)?;
             let rows = max_len as i64 + 1;
             let draft_hidden = hidden.slice_axis(1, 1, rows)?;
@@ -673,11 +901,11 @@ impl DFlash2Model {
 
     /// Run DFlash2 draft + selector over a [`DFlash2TargetView`] (such as
     /// `qwen4_exp`'s external embedding row store + resident quantized
-    /// `lm_head`) and return unevaluated `(candidates [1, L, K] Int32,
-    /// scores [L, K, K] Float32)`.
+    /// `lm_head`, or `inkling2`'s `embed_norm` + custom Metal `lm_head`) and
+    /// return unevaluated `(candidates [1, L, K] Int32, scores [L, K, K] Float32)`.
     ///
     /// Always runs at full `max_len == self.config.block_size` (`7`, `rows = 8`)
-    /// so the compiled embedded lattice graph never retraces.
+    /// so the compiled embedded lattice / body graph never retraces.
     pub(crate) fn propose_tree_lattice_arrays_embedded(
         &self,
         target: &mut dyn DFlash2TargetView,
@@ -701,13 +929,17 @@ impl DFlash2Model {
                 .and_then(|(_, head)| head.map(EmbeddedLmHead::Proj))
         });
         let draft_head = self.resolve_draft_head(draft_head_source, context.wide_vocab())?;
-        let compile = crate::accelerator::cuda_ops_available()
-            && has_embedded_head
-            && max_len == self.config.block_size
+        let gpu_compile = max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
             && self.execution_policy.compile_draft();
-        let embedded = self.splice_mask_embedding(&target.embed(&block, &ids)?)?;
-        let compiled_pair = if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+        let compile_cuda_embedded = crate::accelerator::cuda_ops_available() && has_embedded_head;
+        let compile_body = !compile_cuda_embedded && target.traced().is_none() && gpu_compile;
+        let compile = (compile_cuda_embedded || compile_body) && gpu_compile;
+        let embedded = self.apply_mask_embedding(target.embed(&block, &ids)?)?;
+        let compiled_pair = if compile_cuda_embedded
+            && gpu_compile
+            && self.compiled.prepared.load(Ordering::Relaxed)
+        {
             if let Some(head) = EmbeddedLmHead::from_target(target) {
                 match self.propose_tree_lattice_compiled_embedded(
                     &embedded,
@@ -732,15 +964,31 @@ impl DFlash2Model {
             pair
         } else {
             let query_base = context.logical_len;
-            let hidden = self.forward_embedded(&embedded, query_base, context)?;
+            let compiled_hidden = if compile_body && self.compiled.prepared.load(Ordering::Relaxed)
+            {
+                match self.forward_embedded_compiled(&embedded, context) {
+                    Ok(hidden) => hidden,
+                    Err(error) => {
+                        self.compiled.disabled.store(true, Ordering::Relaxed);
+                        return Err(error);
+                    }
+                }
+            } else {
+                None
+            };
+            let hidden = match compiled_hidden {
+                Some(h) => h,
+                None => self.forward_embedded(&embedded, query_base, context)?,
+            };
             let rows = max_len as i64 + 1;
             let draft_hidden = hidden.slice_axis(1, 1, rows)?;
             let (draft_logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
                 (head.forward_logits(&draft_hidden)?, head.spanned_layout())
-            } else if crate::accelerator::cuda_ops_available() {
-                // On CUDA, project only the `block_size` proposal rows (skipping anchor
-                // row 0) to match `propose_tree_lattice_compiled_embedded` and hit M=7
-                // directly without computing or slicing an unused anchor row.
+            } else if target.project_proposals_only() || crate::accelerator::cuda_ops_available() {
+                // Project only the `block_size` proposal rows (skipping unused anchor
+                // row 0) when the target requests proposal-only logits (e.g. Metal
+                // Inkling-2-Mini) or on CUDA (matching `propose_tree_lattice_compiled_embedded`
+                // and hitting M=7 directly without computing or slicing row 0).
                 (target.logits(&draft_hidden)?, None)
             } else {
                 // Match `propose_tree_lattice_compiled_embedded`: run the full-vocab
@@ -886,19 +1134,22 @@ impl DFlash2Model {
             .and_then(|(_, head)| head.map(EmbeddedLmHead::Proj))
             .or_else(|| EmbeddedLmHead::from_target(target));
         let draft_head = self.resolve_draft_head(draft_head_source, context.wide_vocab())?;
-        let compile_embedded = has_embedded_head && crate::accelerator::cuda_ops_available();
-        let compile = device_path
-            && (has_traced || compile_embedded)
-            && is_greedy_temperature(temperature)
-            && max_len == self.config.block_size
+        let gpu_compile = max_len == self.config.block_size
             && unsafe { sys::mlx_default_device() } == 1
             && self.execution_policy.compile_draft();
+        let compile_embedded = has_embedded_head && crate::accelerator::cuda_ops_available();
+        let compile_full = device_path
+            && (has_traced || compile_embedded)
+            && is_greedy_temperature(temperature)
+            && gpu_compile;
+        let compile_body = !has_traced && !compile_embedded && gpu_compile;
+        let compile = compile_full || compile_body;
         // Only full proposals compile: a budget-limited tail would otherwise
         // pay for a new graph used once. The first full proposal runs eager
         // and is explicitly evaluated below before prepared becomes true, so
         // even a failed verification leaves materialized captured weights.
         let mut pre_embedded: Option<MxArray> = None;
-        if compile && self.compiled.prepared.load(Ordering::Relaxed) {
+        if compile_full && self.compiled.prepared.load(Ordering::Relaxed) {
             if let Some((target_embedding, target_lm_head)) = target.traced() {
                 match self.propose_compiled(
                     target_embedding,
@@ -921,7 +1172,7 @@ impl DFlash2Model {
                     }
                 }
             } else if compile_embedded {
-                let embedded = self.splice_mask_embedding(&target.embed(&block, &ids)?)?;
+                let embedded = self.apply_mask_embedding(target.embed(&block, &ids)?)?;
                 let compiled_res = if let Some(head) = EmbeddedLmHead::from_target(target) {
                     self.propose_compiled_embedded(
                         &embedded,
@@ -955,17 +1206,32 @@ impl DFlash2Model {
         let query_base = context.logical_len;
         let embedded = match pre_embedded {
             Some(e) => e,
-            None => self.splice_mask_embedding(&target.embed(&block, &ids)?)?,
+            None => self.apply_mask_embedding(target.embed(&block, &ids)?)?,
         };
-        let hidden = self.forward_embedded(&embedded, query_base, context)?;
+        let compiled_hidden = if compile_body && self.compiled.prepared.load(Ordering::Relaxed) {
+            match self.forward_embedded_compiled(&embedded, context) {
+                Ok(h) => h,
+                Err(error) => {
+                    self.compiled.disabled.store(true, Ordering::Relaxed);
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
+        let hidden = match compiled_hidden {
+            Some(h) => h,
+            None => self.forward_embedded(&embedded, query_base, context)?,
+        };
         let rows = head_len as i64 + 1;
         let draft_hidden = hidden.slice_axis(1, 1, rows)?;
         let (hidden, logits, spanned_layout) = if let Some(head) = draft_head.as_ref() {
             let draft_logits = head.forward_logits(&draft_hidden)?;
             (draft_hidden, draft_logits, head.spanned_layout())
-        } else if crate::accelerator::cuda_ops_available() {
-            // On CUDA, project only the proposal rows (skipping unused anchor row 0)
-            // so eager and compiled stay bit-identical and avoid projecting row 0.
+        } else if target.project_proposals_only() || crate::accelerator::cuda_ops_available() {
+            // Project only the proposal rows (skipping unused anchor row 0) when
+            // the target requests proposal-only logits or on CUDA (keeping eager
+            // and compiled bit-identical without projecting row 0).
             let draft_logits = target.logits(&draft_hidden)?;
             (draft_hidden, draft_logits, None)
         } else {
@@ -990,9 +1256,19 @@ impl DFlash2Model {
         if compile && !self.compiled.prepared.load(Ordering::Relaxed) {
             // This one-time boundary also makes direct Rust callers safe when
             // they propose again before consuming the previous path.
-            if let SelectorPath::Device(path) = &out.0 {
-                MxArray::eval_arrays(&[path])?;
-                self.compiled.prepared.store(true, Ordering::Relaxed);
+            match &out.0 {
+                SelectorPath::Device(path) => {
+                    MxArray::eval_arrays(&[path])?;
+                    self.compiled.prepared.store(true, Ordering::Relaxed);
+                }
+                SelectorPath::Sampled { ids, .. } => {
+                    MxArray::eval_arrays(&[ids])?;
+                    self.compiled.prepared.store(true, Ordering::Relaxed);
+                }
+                SelectorPath::Host(_) if compile_body => {
+                    self.compiled.prepared.store(true, Ordering::Relaxed);
+                }
+                SelectorPath::Host(_) => {}
             }
         }
         if phase_time {

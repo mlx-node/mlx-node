@@ -352,5 +352,6 @@ describe('the page copies of the Chat types', () => {
     expectTypeOf<Page.ChatHostEvent>().toEqualTypeOf<Server.ChatHostEvent>();
     expectTypeOf<PageProviders.ProviderState>().toEqualTypeOf<ServerProviders.ProviderState>();
     expectTypeOf<PageProviders.ProvidersResponse>().toEqualTypeOf<ServerProviders.ProvidersResponse>();
+    expectTypeOf<PageProviders.ProviderSelectionInput>().toEqualTypeOf<ServerProviders.ProviderSelectionInput>();
   });
 });

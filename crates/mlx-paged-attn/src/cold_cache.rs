@@ -1447,8 +1447,12 @@ impl RootDir {
     }
 }
 
-#[cfg(test)]
-type TestSpaceOverride = Mutex<Option<Box<dyn Fn() -> Result<(u64, u64), String> + Send>>>;
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub type SpaceOverrideHook = Box<dyn Fn() -> Result<(u64, u64), String> + Send>;
+
+#[cfg(any(test, feature = "test-hooks"))]
+type TestSpaceOverride = Mutex<Option<SpaceOverrideHook>>;
 
 #[cfg(test)]
 type TestSyncOverride = Mutex<Option<Box<dyn Fn() -> Result<(), String> + Send>>>;
@@ -1469,7 +1473,7 @@ struct Shared {
     failed_open_identity_hook: Mutex<Option<Box<dyn Fn() + Send>>>,
     /// Replaces filesystem space probes so reserve-floor decisions are
     /// deterministic under test.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     space_override: TestSpaceOverride,
     /// Forces the writer commit's directory fsync to fail so tests can drive
     /// a post-rename dir-sync error and assert index accounting stays
@@ -1512,7 +1516,7 @@ type LandingWake = Arc<dyn Fn() + Send + Sync>;
 impl Shared {
     /// Filesystem `(total, available)` bytes backing eviction decisions.
     fn space(&self) -> Result<(u64, u64), String> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if let Ok(hook) = self.space_override.lock()
             && let Some(hook) = hook.as_ref()
         {
@@ -1639,7 +1643,7 @@ impl ColdCacheManager {
             failed_load_cleanup_hook: Mutex::new(None),
             #[cfg(test)]
             failed_open_identity_hook: Mutex::new(None),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             space_override: Mutex::new(None),
             #[cfg(test)]
             dir_sync_override: Mutex::new(None),
@@ -2066,6 +2070,16 @@ impl ColdCacheManager {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .contains_key(key)
+    }
+
+    /// Test-only: replace filesystem space probes so reserve-headroom drops between
+    /// staging and writer execution are deterministic under test.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn set_space_override_for_test(&self, hook: Option<SpaceOverrideHook>) {
+        if let Ok(mut slot) = self.shared.space_override.lock() {
+            *slot = hook;
+        }
     }
 
     /// Drops `key`'s object from the index and the disk (Splash
@@ -3146,8 +3160,12 @@ fn persist_with(
     write: impl FnOnce(&mut File) -> std::io::Result<()>,
 ) -> Result<(), PersistError> {
     match room {
-        MakeRoom::Evict => evict_for_write(shared, size).map_err(PersistError::space)?,
-        MakeRoom::Refuse => refuse_unless_room(shared, size).map_err(PersistError::space)?,
+        MakeRoom::Evict => {
+            evict_for_write_for(shared, Some(key), size).map_err(PersistError::space)?
+        }
+        MakeRoom::Refuse => {
+            refuse_unless_room_for(shared, Some(key), size).map_err(PersistError::space)?
+        }
     }
     let destination = object_file_name(&key, group);
     let temp = format!(
@@ -3224,16 +3242,27 @@ fn persist_with(
 
 /// [`MakeRoom::Refuse`]: the write fits under the quota and above the free
 /// reserve as things stand, or it fails without evicting anything.
-fn refuse_unless_room(shared: &Shared, incoming: u64) -> Result<(), String> {
+///
+/// When `replace_key` is already indexed, only the net delta against its
+/// existing indexed size is charged against `quota_bytes`.
+fn refuse_unless_room_for(
+    shared: &Shared,
+    replace_key: Option<ColdCacheKey>,
+    incoming: u64,
+) -> Result<(), String> {
     let (_, available) = shared.space()?;
-    let taken = shared
+    let index = shared
         .index
         .lock()
-        .map_err(|_| "cold-cache index mutex poisoned".to_string())?
-        .total_bytes;
-    if taken.saturating_add(incoming) > shared.quota_bytes
-        || available < shared.reserve_bytes.saturating_add(incoming)
-    {
+        .map_err(|_| "cold-cache index mutex poisoned".to_string())?;
+    let existing_size = replace_key
+        .and_then(|key| index.entries.get(&key))
+        .map_or(0, |entry| entry.size);
+    let projected = index
+        .total_bytes
+        .saturating_sub(existing_size)
+        .saturating_add(incoming);
+    if projected > shared.quota_bytes || available < shared.reserve_bytes.saturating_add(incoming) {
         return Err(format!(
             "cold-cache write of {incoming} bytes does not fit and may not make room"
         ));
@@ -3745,7 +3774,16 @@ fn read_state_header(
 /// availability is re-sampled (statvfs) after every clearing, so entries
 /// that free no bytes — already missing, or quarantined rather than
 /// deleted — can never admit a write that would breach the reserve floor.
+#[cfg(test)]
 fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
+    evict_for_write_for(shared, None, incoming)
+}
+
+fn evict_for_write_for(
+    shared: &Shared,
+    replace_key: Option<ColdCacheKey>,
+    incoming: u64,
+) -> Result<(), String> {
     let (_, mut available) = shared.space()?;
     let mut index = shared
         .index
@@ -3766,6 +3804,14 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
             shared.quota_bytes
         ));
     }
+    // When overwriting an existing key, charge only the net delta against the
+    // logical quota and never evict `replace_key` itself: its old file stays
+    // intact on disk until the replacement temp file atomically renames over
+    // it, and replacing an identical-size state blob evicts zero objects even
+    // at full quota.
+    let existing_size = replace_key
+        .and_then(|key| index.entries.get(&key))
+        .map_or(0, |entry| entry.size);
     // Everything still indexed and not yet ruled out is the most this eviction
     // can reclaim — an UPPER bound, not a promise. An entry whose file another
     // process already deleted counts its size here and frees nothing when
@@ -3775,6 +3821,11 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
     // own size whether that entry was cleared or found unclearable, so it
     // converges on the truth as stale entries are discovered.
     let mut unclearable = held_keys(shared);
+    if let Some(key) = replace_key
+        && !unclearable.contains(&key)
+    {
+        unclearable.push(key);
+    }
     let mut reclaimable = index.total_bytes.saturating_sub(
         unclearable
             .iter()
@@ -3782,16 +3833,27 @@ fn evict_for_write(shared: &Shared, incoming: u64) -> Result<(), String> {
             .map(|entry| entry.size)
             .sum::<u64>(),
     );
-    while index.total_bytes.saturating_add(incoming) > shared.quota_bytes
+    while index
+        .total_bytes
+        .saturating_sub(existing_size)
+        .saturating_add(incoming)
+        > shared.quota_bytes
         || available < shared.reserve_bytes.saturating_add(incoming)
     {
         // Refuse before destroying one more live entry for a write the
-        // survivors can no longer make room for. Past this point every
-        // eviction is pure loss: the write fails either way, and what it
-        // takes with it is warm cache someone was about to reuse. Guards the
-        // free-space axis only — under quota pressure alone `available`
-        // already clears `reserve + incoming`, so this cannot fire and
-        // mislabel a quota eviction as a disk-space failure.
+        // survivors can no longer make room for on either axis (quota or
+        // free disk space). Past this point every eviction is pure loss: the
+        // write fails either way, and what it takes with it is warm cache
+        // someone was about to reuse.
+        if index
+            .total_bytes
+            .saturating_sub(existing_size)
+            .saturating_sub(reclaimable)
+            .saturating_add(incoming)
+            > shared.quota_bytes
+        {
+            return Err("insufficient cold-cache quota for write".to_string());
+        }
         if available.saturating_add(reclaimable) < shared.reserve_bytes.saturating_add(incoming) {
             return Err("insufficient disk space for cold-cache write".to_string());
         }
@@ -5309,7 +5371,7 @@ mod write_decomposition_bench {
         let size = bytes.len() as u64;
 
         let t = Instant::now();
-        evict_for_write(shared, size)?;
+        evict_for_write_for(shared, Some(key), size)?;
         phases.evict = ms(t.elapsed());
 
         let destination = object_file_name(&key, group);
@@ -8308,6 +8370,179 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// Round-10 Finding 2 regression:
+    /// When `ColdKeyHold` pins enough bytes that even evicting every unheld
+    /// entry cannot make `incoming` fit `quota_bytes`, `evict_for_write_for`
+    /// must refuse UP FRONT with zero evictions — leaving unrelated unheld
+    /// prefixes intact and readable, without tripping `tracked_failed` — while
+    /// replacement writes whose net delta fits still succeed.
+    #[cfg(unix)]
+    #[test]
+    fn quota_blocked_write_with_held_keys_refuses_without_evicting_unrelated_entries() {
+        let root = temp_root("evict-quota-blocked-held");
+        let fp = fingerprint();
+        let skey = |extra: u64| {
+            ColdCacheKey::chain(
+                ColdGroup::DFlash2State,
+                fp,
+                None,
+                &[1, 2, 3, 4],
+                &[extra],
+                0,
+                0,
+            )
+        };
+
+        let held_a = state_object(skey(1), vec![2048]);
+        let held_a_size = state_object_bytes(&held_a.layout, &held_a.label);
+        let held_b = state_object(skey(2), vec![1024]);
+        let held_b_size = state_object_bytes(&held_b.layout, &held_b.label);
+        let unheld_obj = state_object(skey(3), vec![256]);
+        let unheld_size = state_object_bytes(&unheld_obj.layout, &unheld_obj.label);
+        let blocked_obj = state_object(skey(4), vec![1024]);
+        let blocked_size = state_object_bytes(&blocked_obj.layout, &blocked_obj.label);
+        assert!(
+            blocked_size > unheld_size,
+            "blocked write ({blocked_size}) must exceed reclaimable unheld entry ({unheld_size})"
+        );
+
+        // Quota fits `held_a + held_b + unheld_obj` exactly, so holding `held_a` and `held_b`
+        // leaves only `unheld_size` reclaimable — never enough for `blocked_size`.
+        let quota = held_a_size + held_b_size + unheld_size;
+        assert!(
+            blocked_size <= quota,
+            "blocked write must pass the `incoming <= quota` check and hit the held-key quota guard"
+        );
+        let manager = ColdCacheManager::open_at(root.clone(), quota, 0, 2).unwrap();
+        let base = Arc::new(AtomicU64::new(GIB));
+        install_space_override(&manager, &root, &base);
+
+        assert!(persist_tracked(&manager.shared, || persist_state(
+            &manager.shared,
+            &held_a,
+            MakeRoom::Evict
+        )));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(persist_tracked(&manager.shared, || persist_state(
+            &manager.shared,
+            &held_b,
+            MakeRoom::Evict
+        )));
+        std::thread::sleep(Duration::from_millis(2));
+        assert!(persist_tracked(&manager.shared, || persist_state(
+            &manager.shared,
+            &unheld_obj,
+            MakeRoom::Evict
+        )));
+        assert_eq!(manager.total_bytes(), quota);
+
+        let hold = manager.hold_keys(vec![held_a.key, held_b.key]);
+
+        // 1. Quota-blocked new write must fail cleanly as a space refusal (NOT a
+        //    terminal writer I/O error) and evict ZERO unrelated entries.
+        let ok = persist_tracked(&manager.shared, || {
+            persist_state(&manager.shared, &blocked_obj, MakeRoom::Evict)
+        });
+        assert!(!ok, "quota-blocked write under ColdKeyHold must be refused");
+        assert!(
+            manager.takes_tracked_writes(),
+            "quota refusal must NOT trip tracked_failed"
+        );
+        assert_eq!(
+            manager.stats().evictions,
+            0,
+            "quota-blocked write must perform zero evictions"
+        );
+        assert!(
+            manager.contains_in(&held_a.key, ColdGroup::DFlash2State)
+                && manager.contains_in(&held_b.key, ColdGroup::DFlash2State),
+            "held entries must survive"
+        );
+        assert!(
+            manager.contains_in(&unheld_obj.key, ColdGroup::DFlash2State),
+            "unheld unrelated entry must survive when even evicting it cannot fit quota"
+        );
+        let mut readback = vec![0u8; unheld_obj.payload.len()];
+        assert!(
+            manager
+                .load_state(unheld_obj.key, fp, &unheld_obj.layout, &[], &mut readback)
+                .is_some(),
+            "unheld unrelated entry must remain readable on disk"
+        );
+        assert_eq!(readback, unheld_obj.payload);
+
+        // 2. Replacement write on `held_b` (`replace_key == Some(held_b.key)`) that fits
+        //    alone under `quota` yet whose net delta exceeds `unheld_size` (so even evicting
+        //    `unheld_obj` leaves `held_a_size + replace_size > quota`) must refuse with ZERO
+        //    evictions!
+        let oversized_replace = state_object(held_b.key, vec![1024 + unheld_size + 512]);
+        let oversized_replace_size =
+            state_object_bytes(&oversized_replace.layout, &oversized_replace.label);
+        assert!(
+            oversized_replace_size <= quota && held_a_size + oversized_replace_size > quota,
+            "replacement must test held-key net-delta quota floor (rep={oversized_replace_size}, held_a={held_a_size}, quota={quota})"
+        );
+        let ok_big_rep = persist_tracked(&manager.shared, || {
+            persist_state(&manager.shared, &oversized_replace, MakeRoom::Evict)
+        });
+        assert!(!ok_big_rep);
+        assert!(manager.takes_tracked_writes());
+        assert_eq!(manager.stats().evictions, 0);
+        assert!(manager.contains_in(&unheld_obj.key, ColdGroup::DFlash2State));
+
+        // 3. Same-size replacement write on `held_b` fits via net-delta (0 evictions!).
+        let same_size_replace = state_object(held_b.key, vec![1024]);
+        assert!(
+            persist_tracked(&manager.shared, || persist_state(
+                &manager.shared,
+                &same_size_replace,
+                MakeRoom::Evict
+            )),
+            "same-size replacement of held key must succeed with zero evictions"
+        );
+        assert_eq!(manager.stats().evictions, 0);
+        assert!(manager.contains_in(&unheld_obj.key, ColdGroup::DFlash2State));
+
+        // 4. Slightly larger replacement on `held_b` whose net delta fits by evicting
+        //    `unheld_obj` still succeeds cleanly!
+        let grow_replace = state_object(held_b.key, vec![1024 + 128]);
+        let grow_replace_size = state_object_bytes(&grow_replace.layout, &grow_replace.label);
+        assert!(
+            grow_replace_size > held_b_size && held_a_size + grow_replace_size <= quota,
+            "replacement net delta must fit after evicting unheld_obj"
+        );
+        assert!(
+            persist_tracked(&manager.shared, || persist_state(
+                &manager.shared,
+                &grow_replace,
+                MakeRoom::Evict
+            )),
+            "replacement write whose net delta fits after evicting unheld entry must succeed"
+        );
+        assert_eq!(manager.stats().evictions, 1);
+        assert!(
+            manager.contains_in(&held_a.key, ColdGroup::DFlash2State)
+                && manager.contains_in(&held_b.key, ColdGroup::DFlash2State)
+        );
+        assert!(!manager.contains_in(&unheld_obj.key, ColdGroup::DFlash2State));
+
+        // 5. After dropping the hold, a previously blocked write succeeds (confirming
+        //    writer stayed healthy).
+        drop(hold);
+        assert!(
+            persist_tracked(&manager.shared, || persist_state(
+                &manager.shared,
+                &blocked_obj,
+                MakeRoom::Evict
+            )),
+            "write must succeed once hold drops"
+        );
+        assert!(manager.contains_in(&blocked_obj.key, ColdGroup::DFlash2State));
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn startup_rebuild_ignores_quarantined_directories() {
         let root = temp_root("quarantine-rebuild");
@@ -10737,5 +10972,107 @@ mod tests {
         drop(tight);
         let _ = fs::remove_dir_all(tight_root);
         allocator.lock().unwrap().free(source);
+    }
+
+    // Overwriting an existing state blob of the same size at full quota must
+    // charge 0 net quota bytes, evict neither the old blob nor its KV chain,
+    // and leave the old blob intact if a replacement write fails.
+    #[test]
+    fn overwrite_existing_state_at_full_quota_evicts_nothing_and_preserves_old_on_failure() {
+        let root = temp_root("overwrite-state-full-quota");
+        let fp = fingerprint();
+        let state_k = state_key(41);
+        let kv_tokens = vec![10, 20, 30, 40];
+        let kv_k = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &kv_tokens, &[], 0, 0);
+
+        let mut kv_blk = block(kv_k);
+        kv_blk.tokens = kv_tokens;
+        let kv_bytes = encode_block(&kv_blk).unwrap().len() as u64;
+
+        let mut old_state = state_object(state_k, vec![96, 64]);
+        old_state.payload.fill(0x11);
+        let state_layout = old_state.layout.clone();
+        let old_payload = old_state.payload.clone();
+        let state_bytes = state_object_bytes(&old_state.layout, &old_state.label);
+
+        // Set quota to the exact sum of the KV block + state blob (zero spare quota).
+        let exact_quota = kv_bytes + state_bytes;
+        let manager = ColdCacheManager::open_at(root.clone(), exact_quota, 0, 4).unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        persist_block(&manager.shared, &kv_blk).unwrap();
+        manager
+            .enqueue_state(old_state, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+        assert_eq!(manager.total_bytes(), exact_quota);
+        assert_eq!(manager.stats().evictions, 0);
+
+        // 1. Overwrite `state_k` with same-size upgraded payload under BOTH
+        //    `MakeRoom::Evict` and `MakeRoom::Refuse`: zero evictions, KV block
+        //    stays intact, and new payload lands atomically.
+        for (room, fill) in [(MakeRoom::Evict, 0x22u8), (MakeRoom::Refuse, 0x33u8)] {
+            let mut upgraded = state_object(state_k, vec![96, 64]);
+            upgraded.payload.fill(fill);
+            let expected_payload = upgraded.payload.clone();
+            manager.enqueue_state(upgraded, room, tx.clone()).unwrap();
+            assert!(
+                matches!(landed(&rx), Landed::State { key, ok: true, .. } if key == state_k),
+                "same-size overwrite under {room:?} must succeed at exact full quota"
+            );
+            assert_eq!(
+                manager.stats().evictions,
+                0,
+                "same-size overwrite under {room:?} must evict zero entries"
+            );
+            assert!(
+                manager.contains_in(&kv_k, ColdGroup::Kv),
+                "KV chain block must remain intact after state overwrite"
+            );
+            assert!(manager.contains_in(&state_k, ColdGroup::DFlash2State));
+            assert_eq!(manager.total_bytes(), exact_quota);
+            let mut loaded = vec![0u8; 160];
+            assert!(
+                manager
+                    .load_state(state_k, fp, &state_layout, &[], &mut loaded)
+                    .is_some()
+            );
+            assert_eq!(loaded, expected_payload);
+        }
+
+        // 2. If an overwrite write fails mid-flight (e.g., payload length mismatch
+        //    inside `persist_with`), neither `state_k` nor `kv_k` is evicted and
+        //    the previous committed blob (0x33) remains completely intact!
+        let fail_res = persist_with(
+            &manager.shared,
+            state_k,
+            ColdGroup::DFlash2State,
+            state_bytes,
+            MakeRoom::Evict,
+            |_file| Err(std::io::Error::other("injected overwrite write failure")),
+        );
+        assert!(fail_res.is_err(), "injected write failure must return Err");
+        assert_eq!(
+            manager.stats().evictions,
+            0,
+            "failed overwrite must not have evicted state_k or kv_k"
+        );
+        assert!(manager.contains_in(&kv_k, ColdGroup::Kv));
+        assert!(manager.contains_in(&state_k, ColdGroup::DFlash2State));
+        assert_eq!(manager.total_bytes(), exact_quota);
+        let mut preserved = vec![0u8; 160];
+        assert!(
+            manager
+                .load_state(state_k, fp, &state_layout, &[], &mut preserved)
+                .is_some()
+        );
+        assert_eq!(
+            preserved,
+            vec![0x33u8; old_payload.len()],
+            "old committed blob must stay intact after failed overwrite"
+        );
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
     }
 }

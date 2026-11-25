@@ -141,13 +141,15 @@ export const RESIDENCY_DELTA_FIELDS = [
 export type ResidencyDeltaField = (typeof RESIDENCY_DELTA_FIELDS)[number];
 
 /** Where a model's routed experts live (`residencyInfo().residency`). */
-export type ExpertResidency = Qwen4ExpResidencyInfo['residency'];
+export type ExpertResidency = Qwen4ExpResidencyInfo['residency'] | 'mmap' | 'streamed';
 
 export const EXPERT_RESIDENCIES = [
   'direct',
   'host-gate',
   'store-plan',
   'rows',
+  'mmap',
+  'streamed',
 ] as const satisfies readonly ExpertResidency[];
 
 export type TurnOutcome = 'ok' | 'error' | 'cancelled';

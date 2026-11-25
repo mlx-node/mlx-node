@@ -5,8 +5,12 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
+  draftCompanionForModel,
   findDFlash2Draft,
+  findExternalInkling2DFlash2Draft,
   findInkling2DSparkDraft,
+  INKLING2_DFLASH2,
+  isDFlash2Companion,
   isDFlash2DraftDirectory,
   isInkling2DSparkGguf,
   isInkling2MtpSafetensors,
@@ -346,13 +350,19 @@ describe('Inkling2 DSpark GGUF companion discovery', () => {
   });
 
   it('discovers the real on-disk dspark-Inkling-2-Mini-Q8_0.gguf when present', () => {
-    const modelDir = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini-gguf');
+    const modelsRoot = join(homedir(), '.mlx-node', 'models');
+    const modelDir = join(modelsRoot, 'inkling-2-mini-gguf');
     const targetGguf = join(modelDir, 'Inkling-2-Mini-UD-Q4_K_XL.gguf');
     const expectedDraft = join(modelDir, 'dspark-Inkling-2-Mini-Q8_0.gguf');
     if (!existsSync(targetGguf) || !existsSync(expectedDraft)) return;
     expect(isInkling2DSparkGguf(expectedDraft)).toBe(true);
-    expect(findDFlash2Draft(targetGguf, 'inkling2')).toBe(expectedDraft);
     expect(findInkling2DSparkDraft(modelDir)).toBe(expectedDraft);
+    const siblingDflash2 = join(modelsRoot, 'inkling-2-mini-dflash2');
+    const expectsSiblingDflash2 = existsSync(join(modelDir, 'config.json')) && isDFlash2Companion(siblingDflash2);
+    expect(findDFlash2Draft(targetGguf, 'inkling2')).toBe(expectsSiblingDflash2 ? siblingDflash2 : expectedDraft);
+    if (isDFlash2Companion(siblingDflash2)) {
+      expect(findDFlash2Draft(targetGguf, 'inkling2', modelsRoot)).toBe(siblingDflash2);
+    }
   });
 
   it('discovers a colocated mtp.safetensors paired with config.json mtp_config', () => {
@@ -386,19 +396,162 @@ describe('Inkling2 DSpark GGUF companion discovery', () => {
     expect(isInkling2MtpSafetensors(mtpPath)).toBe(false);
     expect(findInkling2DSparkDraft(root)).toBeUndefined();
 
-    writeFileSync(
-      join(root, 'config.json'),
-      JSON.stringify({ mtp_config: { markov_rank: 0, target_layer_ids: [] } }),
-    );
+    writeFileSync(join(root, 'config.json'), JSON.stringify({ mtp_config: { markov_rank: 0, target_layer_ids: [] } }));
     expect(isInkling2MtpSafetensors(mtpPath)).toBe(false);
   });
 
   it('discovers the real on-disk mtp.safetensors in inkling-2-mini when present', () => {
-    const modelDir = join(homedir(), '.mlx-node', 'models', 'inkling-2-mini');
+    const modelsRoot = join(homedir(), '.mlx-node', 'models');
+    const modelDir = join(modelsRoot, 'inkling-2-mini');
     const expectedDraft = join(modelDir, 'mtp.safetensors');
     if (!existsSync(expectedDraft)) return;
     expect(isInkling2MtpSafetensors(expectedDraft)).toBe(true);
-    expect(findDFlash2Draft(modelDir, 'inkling2')).toBe(expectedDraft);
     expect(findInkling2DSparkDraft(modelDir)).toBe(expectedDraft);
+    const siblingDflash2 = join(modelsRoot, 'inkling-2-mini-dflash2');
+    expect(findDFlash2Draft(modelDir, 'inkling2')).toBe(
+      isDFlash2Companion(siblingDflash2) ? siblingDflash2 : expectedDraft,
+    );
+  });
+});
+
+describe('Inkling-2-Mini DFlash2 companion discovery and precedence', () => {
+  let root: string;
+  let modelsStore: string;
+  let targetDir: string;
+  let siblingDflash2: string;
+
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), 'mlx-inkling2-dflash2-'));
+    modelsStore = join(root, 'models');
+    targetDir = join(modelsStore, 'inkling-2-mini');
+    siblingDflash2 = join(modelsStore, 'inkling-2-mini-dflash2');
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(
+      join(targetDir, 'config.json'),
+      JSON.stringify({
+        model_type: 'inkling2_loop',
+        mtp_config: {
+          num_hidden_layers: 3,
+          block_size: 8,
+          markov_rank: 256,
+          target_layer_ids: [5, 23, 41, 48],
+        },
+      }),
+    );
+  });
+
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  function writeInkling2DFlash2(path: string, overrides: Record<string, unknown> = {}): void {
+    mkdirSync(path, { recursive: true });
+    writeFileSync(
+      join(path, 'config.json'),
+      JSON.stringify({
+        architectures: ['DFlash2DraftModel'],
+        hidden_size: 2304,
+        num_target_layers: 48,
+        ...overrides,
+      }),
+    );
+    writeFileSync(join(path, 'model.safetensors'), 'dflash2-weights');
+  }
+
+  it('exposes INKLING2_DFLASH2 metadata and pairs Inkling-2-Mini targets via draftCompanionForModel', () => {
+    expect(INKLING2_DFLASH2).toEqual({
+      label: 'Inkling-2-Mini DFlash2',
+      hfRepo: 'incoai/Inkling-2-Mini-DFlash2',
+      sizeGb: 1.0,
+    });
+
+    expect(draftCompanionForModel(targetDir, 'inkling2')).toBe(INKLING2_DFLASH2);
+    expect(
+      draftCompanionForModel(join(modelsStore, 'inkling-2-mini-gguf', 'Inkling-2-Mini-UD-Q4_K_M.gguf'), 'inkling2'),
+    ).toBe(INKLING2_DFLASH2);
+    expect(draftCompanionForModel(join(modelsStore, 'inkling2-mini-bf16'), 'inkling2')).toBe(INKLING2_DFLASH2);
+
+    // Must never pair non-Inkling-2-Mini targets or wrong families.
+    expect(draftCompanionForModel(targetDir, 'qwen3_5')).toBeUndefined();
+    expect(draftCompanionForModel(targetDir, 'qwen3_5_moe')).toBeUndefined();
+    expect(draftCompanionForModel(join(modelsStore, 'inkling-2-large'), 'inkling2')).toBeUndefined();
+    expect(draftCompanionForModel(join(modelsStore, 'other-model'), 'inkling2')).toBeUndefined();
+  });
+
+  it('enforces <modelDir>/draft/ > <modelsDir>/inkling-2-mini-dflash2/ > bundled DSpark precedence', () => {
+    const mtpPath = join(targetDir, 'mtp.safetensors');
+    writeFileSync(mtpPath, 'mtp-weights');
+
+    // 3. Only bundled DSpark present -> falls back to mtp.safetensors.
+    expect(findDFlash2Draft(targetDir, 'inkling2')).toBe(mtpPath);
+    expect(findDFlash2Draft(targetDir, 'inkling2', modelsStore)).toBe(mtpPath);
+
+    // 2. Shared companion <modelsDir>/inkling-2-mini-dflash2/ overrides bundled DSpark.
+    writeInkling2DFlash2(siblingDflash2);
+    expect(findDFlash2Draft(targetDir, 'inkling2')).toBe(siblingDflash2);
+    expect(findDFlash2Draft(targetDir, 'inkling2', modelsStore)).toBe(siblingDflash2);
+
+    // 1. Explicit colocated <modelDir>/draft/ overrides shared companion AND bundled DSpark.
+    const embeddedDraft = join(targetDir, 'draft');
+    writeInkling2DFlash2(embeddedDraft);
+    expect(findDFlash2Draft(targetDir, 'inkling2')).toBe(embeddedDraft);
+    expect(findDFlash2Draft(targetDir, 'inkling2', modelsStore)).toBe(embeddedDraft);
+  });
+
+  it('applies the same precedence for Inkling-2-Mini GGUFs and guards standalone-store draft/ geometry', () => {
+    const ggufDir = join(modelsStore, 'inkling-2-mini-gguf');
+    mkdirSync(ggufDir, { recursive: true });
+    const targetGguf = join(ggufDir, 'Inkling-2-Mini-UD-Q4_K_M.gguf');
+    const dsparkGguf = join(ggufDir, 'dspark-Inkling-2-Mini-Q8_0.gguf');
+    writeFileSync(targetGguf, ggufStringKv([['general.architecture', 'inkling2']]));
+    writeFileSync(dsparkGguf, validInkling2DSparkHeader());
+
+    // Bundled DSpark GGUF when no DFlash2 companion exists.
+    expect(findDFlash2Draft(targetGguf, 'inkling2', modelsStore)).toBe(dsparkGguf);
+
+    // Shared sibling companion in modelsStore beats bundled DSpark GGUF.
+    writeInkling2DFlash2(siblingDflash2);
+    expect(findDFlash2Draft(targetGguf, 'inkling2', modelsStore)).toBe(siblingDflash2);
+
+    // Wrong-geometry `draft/` inside a standalone GGUF dir (no config.json) must NOT hijack Inkling2.
+    const embeddedDraft = join(ggufDir, 'draft');
+    writeInkling2DFlash2(embeddedDraft, { hidden_size: 5120, num_target_layers: 64 });
+    expect(findDFlash2Draft(targetGguf, 'inkling2', modelsStore)).toBe(siblingDflash2);
+
+    // Inkling-2-Mini geometry `draft/` inside the GGUF dir wins over shared companion.
+    writeInkling2DFlash2(embeddedDraft, { hidden_size: 2304, num_target_layers: 48 });
+    expect(findDFlash2Draft(targetGguf, 'inkling2', modelsStore)).toBe(embeddedDraft);
+  });
+
+  it('returns external DFlash2 path from findExternalInkling2DFlash2Draft only when outside native roots', () => {
+    const mtpPath = join(targetDir, 'mtp.safetensors');
+    writeFileSync(mtpPath, 'mtp-weights');
+
+    // Without modelsDir, native discovery owns everything.
+    expect(findExternalInkling2DFlash2Draft(targetDir)).toBeUndefined();
+
+    // When only bundled DSpark exists, external helper returns undefined.
+    const externalStore = join(root, 'external-models');
+    mkdirSync(externalStore, { recursive: true });
+    expect(findExternalInkling2DFlash2Draft(targetDir, externalStore)).toBeUndefined();
+
+    // Companion in a separate external modelsDir is returned even when bundled DSpark exists.
+    const externalDflash2 = join(externalStore, 'Inkling-2-Mini-DFlash2');
+    writeInkling2DFlash2(externalDflash2);
+    expect(findExternalInkling2DFlash2Draft(targetDir, externalStore)).toBe(externalDflash2);
+
+    // Companion in dirname(modelDir) is already discovered natively -> returns undefined.
+    writeInkling2DFlash2(siblingDflash2);
+    expect(findExternalInkling2DFlash2Draft(targetDir, modelsStore)).toBeUndefined();
+
+    // Explicit colocated <modelDir>/draft/ is already discovered natively -> returns undefined.
+    writeInkling2DFlash2(join(targetDir, 'draft'));
+    expect(findExternalInkling2DFlash2Draft(targetDir, externalStore)).toBeUndefined();
+  });
+
+  it('discovers the real on-disk inkling-2-mini-dflash2 companion when present', () => {
+    const modelsRoot = join(homedir(), '.mlx-node', 'models');
+    const realDflash2 = join(modelsRoot, 'inkling-2-mini-dflash2');
+    const realTargetDir = join(modelsRoot, 'inkling-2-mini');
+    if (!isDFlash2Companion(realDflash2) || !existsSync(realTargetDir)) return;
+    expect(findDFlash2Draft(realTargetDir, 'inkling2', modelsRoot)).toBe(realDflash2);
   });
 });

@@ -1,10 +1,17 @@
 export type { DiscoveredModelLike } from './types.js';
 
 export {
+  type CatalogBuild,
   type CatalogEntry,
-  catalogRepo,
-  catalogRepoFor,
-  catalogSelectionForRepo,
+  type CatalogTarget,
+  catalogBuildRepo,
+  catalogBuildSlug,
+  catalogDraftSlug,
+  catalogSharesRepo,
+  catalogSupportedOnPlatform,
+  catalogTargetForSlug,
+  catalogTargets,
+  catalogUpdateRepos,
   MODEL_CATALOG,
   visibleCatalog,
   visibleSystemOneCatalog,

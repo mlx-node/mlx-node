@@ -82,6 +82,7 @@ struct Inkling2MoePostConvParams {
   //   bit 1 (2u): has_res (1 = add FP32 residual)
   //   bit 2 (4u): res_f32 (1 = res is F32, 0 = BF16)
   //   bit 3 (8u): write_tape (1 = write pre-conv moe_out BF16 to tape_out)
+  //   bit 4 (16u): has_tree (1 = verify tree with tree_rows [T, 2] u32 at buffer(14))
   uint32_t flags;
   uint32_t hist_f32_mask; // bit s = 1 if hist[s] is f32
 };

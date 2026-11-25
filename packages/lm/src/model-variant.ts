@@ -271,6 +271,9 @@ export function configQuantLabel(config: unknown): string | undefined {
   if (!isRecord(foreign)) return undefined;
   if (foreign.quant_method === 'gemma' && typeof foreign.num_bits === 'number') return `${foreign.num_bits}-bit`;
   if (foreign.quant_method === 'compressed-tensors' && foreign.format === 'float-quantized') return 'FP8';
+  if (foreign.quant_method === 'modelopt' && typeof foreign.quant_algo === 'string' && foreign.quant_algo !== '') {
+    return modeWord(foreign.quant_algo);
+  }
   return undefined;
 }
 

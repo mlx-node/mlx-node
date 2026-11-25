@@ -59,11 +59,7 @@ pub(crate) fn read_dflash2_header(path: &Path) -> Result<DFlash2Config> {
 
 /// Qwen3.8-Flash-Next as its GGUF header gives it: `qwen4exp.block_count`
 /// 48, `qwen4exp.embedding_length` 2560, 248,320 tokens.
-const FLASH_NEXT: DFlash2TargetShape = DFlash2TargetShape {
-    hidden_size: 2560,
-    vocab_size: 248_320,
-    num_layers: 48,
-};
+const FLASH_NEXT: DFlash2TargetShape = DFlash2TargetShape::new(2560, 248_320, 48);
 
 /// The draft's `config.json` keys, as the release writes them, at the tiny
 /// geometry (hidden 256, 2 layers, vocab 32, 4 target layers).
@@ -221,11 +217,7 @@ fn a_draft_of_the_flash_next_layout_is_accepted_and_loads() {
     assert_eq!((config.selector_rank, config.selector_top_k), (8, 4));
     assert_eq!(config.rope_theta, 10_000.0);
 
-    let target = DFlash2TargetShape {
-        hidden_size: 256,
-        vocab_size: 32,
-        num_layers: 4,
-    };
+    let target = DFlash2TargetShape::new(256, 32, 4);
     if unsafe { sys::mlx_metal_is_available() } {
         let (model, bytes) = load_dflash2(&dir.0).unwrap();
         assert!(bytes > 0);
@@ -335,10 +327,6 @@ fn the_flash_next_draft_header_is_accepted() {
     }
 
     config.validate_target(FLASH_NEXT).unwrap();
-    let qwen38_27b = DFlash2TargetShape {
-        hidden_size: 5120,
-        vocab_size: 248_320,
-        num_layers: 64,
-    };
+    let qwen38_27b = DFlash2TargetShape::new(5120, 248_320, 64);
     assert!(config.validate_target(qwen38_27b).is_err());
 }

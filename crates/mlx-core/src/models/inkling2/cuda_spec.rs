@@ -6,6 +6,7 @@
 //! - Unified [`Inkling2SpecStepper`] + [`FlatDsparkBackend`] implementation routing flat CUDA
 //!   speculative turns through [`crate::engine::dspark_turn::run_flat_dspark_turn`].
 
+#[cfg(test)]
 use std::fs;
 use std::path::Path;
 use std::time::Instant;
@@ -21,7 +22,7 @@ use crate::engine::dspark_turn::{FlatDsparkBackend, FlatDsparkPrefix};
 use crate::engine::params::ChatParams;
 use crate::models::quantized_linear::LinearProj;
 use crate::models::qwen3_5::dflash2::{
-    DFlash2ContextCache, DFlash2Model, DFlash2TargetContract, DFlash2TargetView, SelectorPath,
+    DFlash2ContextCache, DFlash2Model, DFlash2TargetShape, DFlash2TargetView, SelectorPath,
     load_dflash2, read_dflash2_config,
 };
 use crate::models::qwen3_5::verify_tree::cuda::{
@@ -156,6 +157,7 @@ pub(crate) fn env_inkling2_tree_fixed_max_nodes() -> Option<usize> {
 
 /// True when `path` is a directory containing a DFlash2 `config.json` declaring
 /// `"DFlash2DraftModel"` in `architectures`.
+#[cfg(test)]
 pub(crate) fn is_dflash2_draft_dir(path: &Path) -> bool {
     if !path.is_dir() {
         return false;
@@ -175,21 +177,23 @@ pub(crate) fn is_dflash2_draft_dir(path: &Path) -> bool {
         })
 }
 
-/// Build the full [`DFlash2TargetContract`] for an Inkling-2-Mini target checkpoint.
-pub(crate) fn inkling2_dflash2_contract(config: &Inkling2Config) -> DFlash2TargetContract {
-    DFlash2TargetContract {
+/// Build the [`DFlash2TargetShape`] contract for an Inkling-2-Mini target checkpoint.
+#[allow(dead_code)]
+pub(crate) fn inkling2_dflash2_target_shape(config: &Inkling2Config) -> DFlash2TargetShape {
+    DFlash2TargetShape {
         hidden_size: config.hidden_size,
         vocab_size: config.effective_padded_vocab_size(),
+        valid_vocab_size: config.effective_unpadded_vocab_size(),
         num_layers: config.num_layer_visits(),
-        valid_vocab_size: Some(config.effective_unpadded_vocab_size()),
         final_logit_softcapping: (config.final_logit_softcapping > 0.0)
             .then_some(config.final_logit_softcapping as f32),
-        allow_final_norm_tap: true,
+        reads_layer_inputs: true,
     }
 }
 
 /// Load and validate a DFlash2 draft directory (e.g. `incoai/Inkling-2-Mini-DFlash2`)
-/// against `config`, configuring the target contract and compiled CUDA execution profile.
+/// against `config`, configuring the Inkling-2-Mini execution profile and compiled CUDA draft.
+#[allow(dead_code)]
 pub(crate) fn load_inkling2_dflash2(dir: &Path, config: &Inkling2Config) -> Result<DFlash2Model> {
     let refused = |reason: String| {
         Error::from_reason(format!(
@@ -197,16 +201,19 @@ pub(crate) fn load_inkling2_dflash2(dir: &Path, config: &Inkling2Config) -> Resu
             dir.display()
         ))
     };
-    let contract = inkling2_dflash2_contract(config);
+    let target_shape = inkling2_dflash2_target_shape(config);
     let parsed_cfg = read_dflash2_config(dir).map_err(|e| refused(e.reason))?;
     parsed_cfg
-        .validate_target(contract)
+        .validate_target(target_shape)
         .map_err(|e| refused(e.reason))?;
     let (mut model, _) = load_dflash2(dir).map_err(|e| refused(e.reason))?;
     model
-        .configure_target_contract(contract)
+        .validate_target(target_shape)
         .map_err(|e| refused(e.reason))?;
-    model.configure_dense_execution();
+    model.configure_inkling2_execution(target_shape);
+    if crate::accelerator::cuda_ops_available() {
+        model.configure_dense_execution();
+    }
     Ok(model)
 }
 
@@ -1505,9 +1512,9 @@ impl DsparkStepper for Inkling2CudaDsparkStepper<'_> {
 /// Unified Inkling-2-Mini speculative stepper across Metal paged DSpark, CUDA DFlash2+Tree+SAM,
 /// and CUDA native DSpark.
 pub(crate) enum Inkling2SpecStepper<'a> {
-    PagedDspark(Inkling2DsparkStepper<'a>),
+    PagedDspark(Box<Inkling2DsparkStepper<'a>>),
     CudaDFlash2(Box<Inkling2CudaDFlash2Stepper<'a>>),
-    CudaDspark(Inkling2CudaDsparkStepper<'a>),
+    CudaDspark(Box<Inkling2CudaDsparkStepper<'a>>),
 }
 
 impl DsparkStepper for Inkling2SpecStepper<'_> {
@@ -2152,12 +2159,13 @@ mod tests {
         })
         .to_string();
         let cfg = Inkling2Config::from_json_str(&raw, true).unwrap();
-        let contract = inkling2_dflash2_contract(&cfg);
-        assert!(contract.allow_final_norm_tap);
-        assert_eq!(contract.num_layers, 48);
-        assert_eq!(contract.vocab_size, 201024);
-        assert_eq!(contract.valid_vocab_size, Some(200058));
-        assert_eq!(contract.final_logit_softcapping, Some(30.0));
+        let shape = inkling2_dflash2_target_shape(&cfg);
+        assert!(shape.reads_layer_inputs);
+        assert_eq!(shape.readable_layers(), 49);
+        assert_eq!(shape.num_layers, 48);
+        assert_eq!(shape.vocab_size, 201024);
+        assert_eq!(shape.valid_vocab_size, 200058);
+        assert_eq!(shape.final_logit_softcapping, Some(30.0));
     }
 
     fn make_test_dspark_inner() -> Inkling2Inner {
@@ -2262,10 +2270,12 @@ mod tests {
             output_res_query_t,
             output_norm,
             lm_head,
+            lm_head_bf16_unpadded: None,
             vision_encoder: None,
             tokenizer: None,
             dspark: Some(dspark),
             dflash2: None,
+            dflash2_identity: None,
             dspark_turn_contexts: HashMap::new(),
             cuda_dflash2_ctx: None,
             cuda_verify_budget: crate::models::qwen3_5::verify_tree::VerifyBudget::new(),

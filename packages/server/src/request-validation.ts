@@ -12,6 +12,12 @@ import type { ChatMessage } from '@mlx-node/core';
 export const MAX_OUTPUT_TOKENS = 2147483647; // i32::MAX — native ChatConfig.max_new_tokens is i32
 
 /**
+ * Body cap of `/v1/messages` and `/v1/messages/count_tokens`: every request resends the whole history, pictures
+ * included. `/v1/models` lists it as `max_request_bytes`, so the agent drops old pictures before it is reached.
+ */
+export const ANTHROPIC_MAX_BODY_BYTES = 16 * 1024 * 1024;
+
+/**
  * Reorder tool messages in `messages[startOffset, blockEnd)` to match
  * `expectedOrder`. Replay correctness for a multi-call fan-out depends
  * on POSITION — several native backends drop the id on the wire and

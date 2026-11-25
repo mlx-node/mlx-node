@@ -50,6 +50,7 @@ const SUPERVISOR: SupervisorLive = {
   nativeErrorsCapped: true,
   lastNativeErrorContext: 'metal_kernel',
   lastNativeErrorAt: Date.now() - 30_000,
+  failureReason: null,
   writtenAt: Date.now(),
 };
 
@@ -165,6 +166,50 @@ describe('Engine page', () => {
     const panel = byRole(mounted!.container, 'region', 'Supervisor') ?? mounted!.container;
     expect(panel.textContent).toContain('20+');
     expect(mounted?.text()).toContain('not trustworthy');
+  });
+
+  it('names the reason in the restarting and failed alerts, and shows none after a good start', async () => {
+    const reason =
+      'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.';
+    await mountEngine();
+    const restarting = { ...SUPERVISOR, state: 'restarting' as const, streak: 3, failureReason: reason };
+    await push(live({ status: 'restarting', supervisor: restarting, processes: [] }), (text) =>
+      text.includes('Inference is restarting'),
+    );
+    expect(mounted?.text()).toContain(`Failures in a row: 3. Reason: ${reason}`);
+
+    const failed = { ...SUPERVISOR, state: 'failed' as const, streak: 0, shortLivedFailures: 0, failureReason: reason };
+    failed.lastExit = { verdict: 'crash', code: 78, signal: null, atMs: Date.now() - 60_000 };
+    await push(live({ status: 'failed', supervisor: failed, processes: [] }), (text) =>
+      text.includes('Inference failed'),
+    );
+    expect(byRole(document.body, 'alert')?.textContent).toContain(
+      `It stopped and was not restarted. Reason: ${reason} Last exit: crash, code 78`,
+    );
+
+    // A reason without a closing period gets one.
+    await push(
+      live({ status: 'failed', supervisor: { ...failed, failureReason: 'database is locked' }, processes: [] }),
+      (text) => text.includes('database is locked'),
+    );
+    expect(byRole(document.body, 'alert')?.textContent).toContain('Reason: database is locked. Last exit');
+    // A reason cut short with an ellipsis gets none.
+    await push(
+      live({
+        status: 'failed',
+        supervisor: { ...failed, failureReason: 'mkdir failed at /Volumes/Di…' },
+        processes: [],
+      }),
+      (text) => text.includes('/Volumes/Di…'),
+    );
+    expect(byRole(document.body, 'alert')?.textContent).toContain('Reason: mkdir failed at /Volumes/Di… Last exit');
+
+    // The writer clears the reason on a good start; the running page has no alert and no reason.
+    await push(live({ supervisor: { ...SUPERVISOR, state: 'running', failureReason: null } }), (text) =>
+      text.includes('Output rate'),
+    );
+    expect(mounted?.text()).not.toContain('Reason:');
+    expect(mounted?.text()).not.toContain('Inference failed');
   });
 
   it('follows the live snapshot in the Now items', async () => {

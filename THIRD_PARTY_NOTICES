@@ -257,6 +257,32 @@ and cancellation. Small reference-generated test fixtures and their source
 revision are in __test__/fixtures/clef; the upstream license is reproduced at
 __test__/fixtures/clef/LICENSE. No released model weights are redistributed.
 
+Cloudflare Clairic / Clairic Flash
+https://huggingface.co/Cloudflare/clairic
+https://huggingface.co/Cloudflare/clairic-flash
+https://huggingface.co/mlx-community/clairic-flash-4bit
+https://huggingface.co/mlx-community/clairic-4bit
+
+Copyright 2026 Cloudflare, Inc. (derived from Alibaba Cloud's Qwen3.5 and
+Qwen3.8 base model architectures), licensed under the Apache License, Version
+2.0. The full Apache-2.0 license text is reproduced in
+__test__/fixtures/clef/LICENSE.
+
+The pure-Rust extraction pipeline and constrained decoding rules in
+crates/mlx-clairic/ (src/{ar,completion,contracts,decimal_util,embedded,errors,
+grounding,head_config,html_rows,identifier_spelling,image_rows,json_validate,
+lists,media,media_cache,media_state_prompt,orchestrator,orientation,
+printed_numbers,printed_temporal,profile,row_omission,schema,scopes,settings,
+source_dates,source_rows,table_rows,typed_decode,typed_prompt,types}.rs,
+src/crops/, src/grammar/, src/receipt/) and the MLX runtime integration in
+crates/mlx-core/src/models/clairic/{ar_engine,head,mod,persistent_cache}.rs are
+ported from Cloudflare's Clairic reference runtime. Local changes port
+execution to native Rust and MLX with N-API bindings, translate Clairic EBNF
+grammars to Lark for llguidance constrained decoding, add persistent prefix
+state caching and cooperative cancellation, and delegate PDF page rasterization
+to host-side pdfjs-dist / @napi-rs/canvas. No released model weights are
+redistributed.
+
 Arc (https://github.com/kuratlielia/arc-library), MIT
 
 The Control Panel components in packages/dashboard/ui/src/components/arc/ are
@@ -318,3 +344,86 @@ packages/dashboard/ui/src/components/arc-x/wait-orb/LICENSE:
    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
    SOFTWARE.
+
+Vendored Dashboard Skills
+
+brave-search-skills (https://github.com/brave/brave-search-skills), MIT
+
+The Brave Search skills in packages/dashboard/skills/vendor/brave/ are copied
+from brave-search-skills. Upstream commit details are recorded in
+packages/dashboard/skills/vendor/brave/PROVENANCE.md, and the license is
+reproduced at packages/dashboard/skills/vendor/brave/LICENSE:
+
+   MIT License
+
+   Copyright (c) 2026 Brave Software
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+Exa agent-skills (https://github.com/exa-labs/agent-skills), MIT
+
+The Exa skills in packages/dashboard/skills/vendor/exa/ are copied from
+exa-labs/agent-skills. Upstream commit details are recorded in
+packages/dashboard/skills/vendor/exa/PROVENANCE.md, and the license is
+reproduced at packages/dashboard/skills/vendor/exa/LICENSE:
+
+   MIT License
+
+   Copyright (c) 2026 Exa Labs, Inc.
+
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+Firecrawl skills (https://github.com/firecrawl/skills), ISC
+
+The Firecrawl skills in packages/dashboard/skills/vendor/firecrawl/ are copied
+from firecrawl/skills. Upstream commit details and local changes are recorded
+in packages/dashboard/skills/vendor/firecrawl/PROVENANCE.md, and the license is
+reproduced at packages/dashboard/skills/vendor/firecrawl/LICENSE:
+
+   ISC License
+
+   Copyright (c) Firecrawl
+
+   Permission to use, copy, modify, and/or distribute this software for any
+   purpose with or without fee is hereby granted, provided that the above
+   copyright notice and this permission notice appear in all copies.
+
+   THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+   REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY
+   AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+   INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM
+   LOSS OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR
+   OTHER TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR
+   PERFORMANCE OF THIS SOFTWARE.

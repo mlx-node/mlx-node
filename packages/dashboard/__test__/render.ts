@@ -91,7 +91,7 @@ export function stubError(code: ApiErrorCode, message: string, reason?: string):
 /** What a Chat host stream answers first when a test sets nothing: an engine and an agent that are ready. */
 /** A host state model that is its own base, with no size on disk. */
 export function hostModel(id: string, contextTokens: number | null): ChatHostState['models'][number] {
-  return { id, base: id, variant: 'MLX', format: 'mlx', contextTokens, sizeBytes: null };
+  return { id, base: id, variant: 'MLX', format: 'mlx', contextTokens, sizeBytes: null, images: false };
 }
 
 export const READY_CHAT_HOST: ChatHostState = {
@@ -105,8 +105,8 @@ export const READY_CHAT_HOST: ChatHostState = {
   agent: {
     binary: 'ok',
     source: 'bundled',
-    tag: 'mlx-agent-v0.3.3',
-    minTag: 'mlx-agent-v0.3.3',
+    tag: 'mlx-agent-v0.3.4',
+    minTag: 'mlx-agent-v0.3.4',
     versionVerified: true,
     install: 'idle',
   },
@@ -212,10 +212,18 @@ export interface StubbedApi {
   chatWatchers(conversationId?: string): number;
   /** Close the runtime's end of the port, as a crashed control panel service does. Every stream ends with it. */
   dropPort(): void;
+  /**
+   * Settles when the SPA's end of the port has closed, which is when the client fails the calls still in flight. A
+   * test that ends with a call in flight awaits it after the disposer, or that failure lands in the next test.
+   */
+  closed: Promise<void>;
 }
 
 export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedApi {
   const { port1, port2 } = new MessageChannel();
+  const closed = new Promise<void>((resolve) => {
+    port1.once('close', resolve);
+  });
   // Never hold the runner open on the channel's account.
   port1.unref();
   port2.unref();
@@ -263,20 +271,19 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedA
         const path = Object.hasOwn(routes, keyed) ? keyed : bare0;
         if (!Object.hasOwn(routes, path)) return Promise.resolve(failure('E_NOT_FOUND', `no stub for ${path}`));
         const body = bodyFor(path);
-        if (body === STUB_FAILURE) return Promise.resolve(failure('E_UNAVAILABLE', `stubbed failure for ${path}`));
-        if (typeof body === 'object' && body !== null && STUB_ERROR in body) {
-          const e = (body as Record<symbol, { code: ApiErrorCode; message: string; reason?: string }>)[STUB_ERROR];
-          return Promise.resolve(failure(e.code, e.message, e.reason));
-        }
+        const answer = (body: unknown) => {
+          if (body === STUB_FAILURE) return failure('E_UNAVAILABLE', `stubbed failure for ${path}`);
+          if (typeof body === 'object' && body !== null && STUB_ERROR in body) {
+            const e = (body as Record<symbol, { code: ApiErrorCode; message: string; reason?: string }>)[STUB_ERROR];
+            return failure(e.code, e.message, e.reason);
+          }
+          return { ok: true as const, status: 200, body };
+        };
         if (typeof body === 'object' && body !== null && DEFERRED in body) {
           const held = (body as Record<symbol, unknown>)[DEFERRED] as { body: unknown; gate: Promise<void> };
-          return held.gate.then(() =>
-            held.body === STUB_FAILURE
-              ? failure('E_UNAVAILABLE', `stubbed failure for ${path}`)
-              : { ok: true as const, status: 200, body: held.body },
-          );
+          return held.gate.then(() => answer(held.body));
         }
-        return Promise.resolve({ ok: true as const, status: 200, body });
+        return Promise.resolve(answer(body));
       },
       subscribe: options.subscribe ?? (() => () => {}),
       watchLive: (listener: (event: RuntimeLiveEvent) => void) => {
@@ -300,6 +307,7 @@ export function stubApi(routes: ApiStub, options: ApiStubOptions = {}): StubbedA
     port2.close();
   };
   return Object.assign(stop, {
+    closed,
     emitLive(event: LiveEvent): void {
       // The SPA's copy of the type omits writer-only fields the SPA never reads.
       for (const listener of liveListeners) listener(event as RuntimeLiveEvent);

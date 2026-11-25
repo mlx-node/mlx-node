@@ -1191,7 +1191,6 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         timeline::mark(Mark::StopChecks);
         let _stream_ctx = crate::stream::StreamContext::new(generation_stream);
         profiler.begin_cycle("dspark_cycle");
-        let cycle_started_at = Instant::now();
 
         // Per-cycle draft cap. `remaining >= 1` here (the length check above
         // broke otherwise). `remaining - 1` reserves the boundary token's
@@ -1219,6 +1218,12 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         } else {
             break_even.plan_cycle(normal_l_cap)
         };
+        let cycle_started_at = (measurement_cycle != DsparkMeasurementCycle::None
+            || verification_budget.is_some()
+            || (p.mtp_adaptive_depth && tree_greedy_unpenalized)
+            || step.device_verification_budget().is_some()
+            || tf.is_forcing())
+        .then(Instant::now);
 
         // Per-cycle speculative admission: every committed token moves the
         // frontier, so the lookahead region is re-reserved for THIS cycle (a
@@ -1366,20 +1371,20 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                     proposal.replace_prefix(c.proposals(proposed_len))?;
                 }
 
-                let proposal_ns = cycle_started_at
-                    .elapsed()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64;
                 if measurement_cycle == DsparkMeasurementCycle::None
                     && proposed_len > 0
                     && let (Some(policy), Some(confidence)) =
                         (&mut verification_budget, &proposal.keep_probabilities)
-                    && let Some(keep) = policy.choose(confidence, proposal_ns)
                 {
-                    if keep == 0 {
-                        step.enter_ar_fallback()?;
+                    let proposal_ns = cycle_started_at.map_or(0, |t| {
+                        t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                    });
+                    if let Some(keep) = policy.choose(confidence, proposal_ns) {
+                        if keep == 0 {
+                            step.enter_ar_fallback()?;
+                        }
+                        proposal.truncate(keep);
                     }
-                    proposal.truncate(keep);
                 }
                 let draft_len = proposal.draft_len()?;
                 let replaced = cut.as_ref().map_or(0, |c| c.replaced(draft_len));
@@ -1392,9 +1397,11 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 // timer immediately before that method: target graph construction and
                 // dispatch, GPU force, and sampling are measured; only draft-context
                 // fusion in `commit_ar_probe` remains outside it.
-                let verify_started_at = Instant::now();
+                let verify_started_at =
+                    (measurement_cycle != DsparkMeasurementCycle::None).then(Instant::now);
                 let ar_probe_started_at = (measurement_cycle == DsparkMeasurementCycle::ArProbe)
-                    .then_some(verify_started_at);
+                    .then_some(verify_started_at)
+                    .flatten();
                 // Teacher forcing: the reference continuation replaces the drafts as
                 // the verify input, through the same host verify path.
                 let tf_ids = tf.verify_ids(generated, anchor, draft_len)?;
@@ -1506,20 +1513,24 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 // of reading the concatenated verify input from the device again. The
                 // ordinary accept paths already did this.
                 proposal.materialize_draft_ids()?;
-                let verify_ns = verify_started_at
-                    .elapsed()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64;
+                let verify_ns = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+                    verify_started_at.map_or(0, |t| {
+                        t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                    })
+                } else {
+                    0
+                };
                 // Acceptance's token read has now fully forced the target graph.
                 // AR measures from immediately before its dedicated target forward;
                 // speculative probes retain the whole-cycle propose+verify timer.
                 // Both stop before their respective commit/materialization handling.
-                let measured_before_commit_started_at =
-                    ar_probe_started_at.unwrap_or(cycle_started_at);
-                let precommit_wall_ns = measured_before_commit_started_at
-                    .elapsed()
-                    .as_nanos()
-                    .min(u128::from(u64::MAX)) as u64;
+                let precommit_wall_ns = if measurement_cycle == DsparkMeasurementCycle::ArProbe {
+                    ar_probe_started_at.or(cycle_started_at).map_or(0, |t| {
+                        t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                    })
+                } else {
+                    0
+                };
 
                 let mut accepted: Vec<u32> = Vec::with_capacity(accepted_drafts_k + 1);
                 accepted.extend(
@@ -1593,13 +1604,16 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                         step.eval_boundary(&boundary);
                         profiler.end();
                         crate::array::synchronize();
-                        let milliseconds = cycle_started_at.elapsed().as_secs_f64() * 1000.0;
+                        let milliseconds =
+                            cycle_started_at.map_or(0.0, |t| t.elapsed().as_secs_f64() * 1000.0);
                         Some((rows, raw_matches, milliseconds))
                     }
                     None => None,
                 };
                 if tf.is_forcing() {
-                    tf.end_cycle(cycle_started_at.elapsed());
+                    tf.end_cycle(
+                        cycle_started_at.map_or_else(std::time::Duration::default, |t| t.elapsed()),
+                    );
                 }
                 let break_even_decision = if stop.is_some() {
                     None
@@ -1631,18 +1645,14 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                                 // steady-state proposals retain their asynchronous graph.
                                 policy.record(
                                     draft_len,
-                                    verify_started_at
-                                        .elapsed()
-                                        .as_nanos()
-                                        .min(u128::from(u64::MAX))
-                                        as u64,
+                                    verify_started_at.map_or(0, |t| {
+                                        t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                                    }),
                                 );
                             }
-                            let wall_ns = cycle_started_at
-                                .elapsed()
-                                .as_nanos()
-                                .min(u128::from(u64::MAX))
-                                as u64;
+                            let wall_ns = cycle_started_at.map_or(0, |t| {
+                                t.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64
+                            });
                             break_even.record_cycle(
                                 measurement_cycle,
                                 wall_ns,

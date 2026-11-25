@@ -1,5 +1,5 @@
 import { FolderOpen } from 'lucide-react';
-import { type ReactElement, useState } from 'react';
+import { type ReactElement, useRef, useState } from 'react';
 
 import { OptionList } from '../../../components/arc-x/option-list/option-list';
 import { PathText } from '../../../components/arc-x/path-text/path-text';
@@ -28,11 +28,19 @@ export interface NewFolderChipProps {
   onChoose: (path: string) => void;
   /** Open the native folder dialog. */
   onPick: () => void;
+  /** The composer's tool row (popover above) or the bar (popover below, at the end). */
+  place: 'composer' | 'header';
 }
 
-/** The New screen's folder chip: recent folders, then the native dialog. With no recent folder the dialog opens at once. */
-export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChipProps): ReactElement {
+/**
+ * A new Work conversation's folder chip: recent folders, then the native dialog. With no recent folder the dialog
+ * opens at once. It sits in the composer while no folder is chosen and in the bar once one is.
+ */
+export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFolderChipProps): ReactElement {
+  const header = place === 'header';
   const [open, setOpen] = useState(false);
+  // A pick leaves focus to the page (the composer); Radix's return to the chip after the exit animation would undo it.
+  const pickedRef = useRef(false);
   const home = useHomeDir();
   const options = recent.map((path) => ({
     value: path,
@@ -48,6 +56,7 @@ export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChi
           onPick();
           return;
         }
+        if (next) pickedRef.current = false;
         setOpen(next);
       }}
     >
@@ -61,13 +70,21 @@ export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChi
           aria-label={folder === null ? CHAT.folderChoose : fill(CHAT.folderLabel, { folder: tildePath(folder, home) })}
         />
       </PopoverTrigger>
-      <PopoverContent side="top" align="start" aria-label={CHAT.folderRecent}>
+      <PopoverContent
+        side={header ? 'bottom' : 'top'}
+        align={header ? 'end' : 'start'}
+        aria-label={CHAT.folderRecent}
+        onCloseAutoFocus={(event) => {
+          if (pickedRef.current) event.preventDefault();
+        }}
+      >
         <div className="grid w-[18.75rem] max-w-full gap-2">
           <p className="m-0 text-caption font-medium text-secondary">{CHAT.folderRecent}</p>
           <OptionList
             label={CHAT.folderRecent}
             value={folder ?? ''}
             onValueChange={(path) => {
+              pickedRef.current = true;
               onChoose(path);
               setOpen(false);
             }}
@@ -79,6 +96,7 @@ export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChi
               variant="secondary"
               size="sm"
               onClick={() => {
+                pickedRef.current = true;
                 setOpen(false);
                 onPick();
               }}
@@ -92,7 +110,7 @@ export function NewFolderChip({ folder, recent, onChoose, onPick }: NewFolderChi
   );
 }
 
-/** An open Work conversation's folder: fixed for its life. The popover shows the whole path and copies it. */
+/** An open Work conversation's folder in the bar: fixed for its life. The popover shows the whole path and copies it. */
 export function OpenFolderChip({ folder }: { folder: string }): ReactElement {
   const home = useHomeDir();
   const shown = tildePath(folder, home);

@@ -24,6 +24,7 @@ import { toMinimalHealth, type ServerHealth } from './health.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import type { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
+import { ANTHROPIC_MAX_BODY_BYTES } from './request-validation.js';
 import type { RerankService } from './rerank-service.js';
 import { stringifyStrictJson } from './strict-json.js';
 import { QUARANTINE_MESSAGE, rawRequestFingerprint, type TurnJournal } from './turn-journal.js';
@@ -354,7 +355,7 @@ export async function routeRequest(
 
     let body: AnthropicCountTokensRequest;
     try {
-      const raw = await readBody(req, res);
+      const raw = await readBody(req, res, ANTHROPIC_MAX_BODY_BYTES);
       body = JSON.parse(raw) as AnthropicCountTokensRequest;
     } catch (err) {
       const msg =
@@ -384,7 +385,7 @@ export async function routeRequest(
 
     let body: AnthropicMessagesRequest;
     try {
-      const raw = await readBody(req, res);
+      const raw = await readBody(req, res, ANTHROPIC_MAX_BODY_BYTES);
       body = JSON.parse(raw) as AnthropicMessagesRequest;
     } catch (err) {
       const msg =

@@ -6,7 +6,7 @@ import { join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
-import { findOnPath } from '../src/chat/skills/cli-check.js';
+import { findOnPath, readPathEnv } from '../src/chat/skills/cli-check.js';
 
 let root: string;
 
@@ -59,5 +59,35 @@ describe('findOnPath', () => {
     expect(await findOnPath('firecrawl', join(root, 'missing'))).toBeNull();
     expect(await findOnPath('good/firecrawl', root)).toBeNull();
     expect(await findOnPath('', good)).toBeNull();
+  });
+
+  it('readPathEnv looks up PATH case-insensitively', () => {
+    expect(readPathEnv({ PATH: '/usr/bin' })).toBe('/usr/bin');
+    expect(readPathEnv({ Path: 'C:\\Windows\\System32' })).toBe('C:\\Windows\\System32');
+    expect(readPathEnv({ path: 'D:\\bin' })).toBe('D:\\bin');
+    expect(readPathEnv({})).toBeUndefined();
+  });
+
+  it('on win32 splits on ;, strips quotes, honors PATHEXT, skips POSIX shims and directories, and rejects \\ and :', async () => {
+    const shimOnly = dir('shim-only');
+    // Extensionless POSIX shim (as npm -g creates alongside .cmd) must be skipped when PATHEXT is non-empty.
+    file(join(shimOnly, 'firecrawl'), 0o755);
+    const dirNamed = dir('dir-named');
+    mkdirSync(join(dirNamed, 'firecrawl.exe'));
+    const good = dir('good space');
+    writeFileSync(join(good, 'firecrawl.cmd'), '@echo off\r\n');
+    const later = dir('later');
+    writeFileSync(join(later, 'firecrawl.exe'), 'mz');
+
+    const path = ['', 'relative\\bin', shimOnly, dirNamed, `"${good}"`, later].join(';');
+    expect(await findOnPath('firecrawl', path, { platform: 'win32' })).toBe(join(good, 'firecrawl.cmd'));
+    expect(await findOnPath('firecrawl', path, { platform: 'win32', pathExt: '.EXE' })).toBe(
+      join(later, 'firecrawl.exe'),
+    );
+    expect(await findOnPath('firecrawl', shimOnly, { platform: 'win32', pathExt: '' })).toBe(
+      join(shimOnly, 'firecrawl'),
+    );
+    expect(await findOnPath('sub\\firecrawl', good, { platform: 'win32' })).toBeNull();
+    expect(await findOnPath('C:firecrawl', good, { platform: 'win32' })).toBeNull();
   });
 });

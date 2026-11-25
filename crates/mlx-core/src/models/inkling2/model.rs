@@ -19,7 +19,7 @@ use crate::model_thread::ModelThread;
 use crate::models::quantized_linear::LinearProj;
 use crate::nn::Embedding;
 use crate::stream::WiredResidency;
-use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::inkling::IMAGE_PAD_ID;
 use crate::transformer::Activations;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
@@ -30,7 +30,8 @@ use super::attn_res::{
     block_attn_res_mix_single_q_prenormed, normalize_attn_res_source, stack_normed_sources_tnd,
 };
 use super::config::{Inkling2Config, Inkling2VisionConfig};
-use super::dspark::{Inkling2DsparkContext, Inkling2DsparkModel};
+use super::dflash2::Inkling2DraftContext;
+use super::dspark::Inkling2DsparkModel;
 use super::kv_cache::Inkling2PagedConfig;
 use super::memory::Inkling2ContextLimits;
 use super::moe::Inkling2MoE;
@@ -39,6 +40,7 @@ use super::scheduled_dspark::Inkling2ScheduledDsparkStates;
 use super::scheduler::{Inkling2Cmd, Inkling2FamilyCommand, Inkling2SchedulerState};
 use super::short_conv::Inkling2ShortConvState;
 use super::vision::{Inkling2VisionEncoder, preprocess_image_bytes};
+use crate::models::qwen3_5::dflash2::{DFlash2Model, DFlash2TargetShape};
 use crate::nn::normalization::rms_norm_unscaled;
 
 static INKLING2_MODEL_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -447,14 +449,20 @@ pub struct Inkling2Inner {
     pub output_res_query_t: MxArray,
     pub output_norm: MxArray,
     pub lm_head: LinearProj,
+    /// Cached unpadded `[unpadded_vocab_size, hidden_size]` BF16 view of `lm_head`
+    /// when `lm_head` is a standard BF16 projection (avoids per-cycle slicing in DFlash2).
+    pub(crate) lm_head_bf16_unpadded: Option<MxArray>,
     pub vision_encoder: Option<Inkling2VisionEncoder>,
     pub tokenizer: Option<Arc<Qwen3Tokenizer>>,
     /// Optional external DSpark speculative drafter (`dspark-Inkling-2-Mini-Q8_0.gguf` / `mtp.safetensors`).
     pub dspark: Option<Inkling2DsparkModel>,
     /// Optional external DFlash2 speculative drafter (`incoai/Inkling-2-Mini-DFlash2`).
-    pub(crate) dflash2: Option<crate::models::qwen3_5::dflash2::DFlash2Model>,
-    /// Per-sequence whole-turn DSpark draft contexts (keyed by `SeqId`).
-    pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DsparkContext>,
+    pub(crate) dflash2: Option<DFlash2Model>,
+    /// Content-bound identity digest for the loaded DFlash2 draft directory, folded into
+    /// persistent StateDisk fingerprints so SSD caches invalidate if draft weights change.
+    pub(crate) dflash2_identity: Option<Vec<u8>>,
+    /// Per-sequence whole-turn speculative draft contexts (DSpark or DFlash2, keyed by `SeqId`).
+    pub(crate) dspark_turn_contexts: HashMap<SeqId, Inkling2DraftContext>,
     /// Flat CUDA DFlash2 per-turn draft context cache.
     pub(crate) cuda_dflash2_ctx: Option<crate::models::qwen3_5::dflash2::DFlash2ContextCache>,
     /// Persistent online DFlash2 verify-tree probability calibrator across turns
@@ -464,8 +472,8 @@ pub struct Inkling2Inner {
     /// (reset only on model reload, not per turn).
     pub(crate) cuda_lookup_acceptance: crate::models::qwen3_5::verify_tree::LookupAcceptance,
     /// Flat CUDA DSpark per-turn draft context cache.
-    pub(crate) cuda_dspark_ctx: Option<Inkling2DsparkContext>,
-    /// Scheduled continuous-batching DSpark lane contexts + verify wave state.
+    pub(crate) cuda_dspark_ctx: Option<super::dspark::Inkling2DsparkContext>,
+    /// Scheduled continuous-batching speculative lane contexts + verify wave state.
     pub(crate) scheduled_dspark: Inkling2ScheduledDsparkStates,
     /// Block-paged hybrid KV cache runtime (8 Global + 40 SWA, default INT8 32-token KTM on Metal)
     /// + Qwen 3.8-style StateDisk store.
@@ -553,7 +561,15 @@ impl Inkling2Inner {
             account(orq);
         }
         account(self.output_norm.promote_cuda_device()?);
-        account(self.lm_head.ensure_cuda_device()?);
+        let lm_promoted = self.lm_head.ensure_cuda_device()?;
+        account(lm_promoted);
+        if lm_promoted > 0
+            && let Some(ref existing) = self.lm_head_bf16_unpadded
+            && let LinearProj::Standard(ref lin) = self.lm_head
+        {
+            let cols = existing.shape_at(0)?;
+            self.lm_head_bf16_unpadded = Some(lin.get_weight().slice_axis(0, 0, cols)?);
+        }
         if let Some(ref mut dspark) = self.dspark {
             account(dspark.ensure_cuda_device()?);
         }
@@ -574,11 +590,21 @@ impl Inkling2Inner {
         self.prefill_runs.clear();
         self.paged = None;
         crate::array::clear_cache();
-        self.paged = Some(Inkling2PagedRuntime::new_with_recency(
+        let mut rt = Inkling2PagedRuntime::new_with_recency(
             &self.config,
             paged_cfg,
             Arc::clone(&self.cache_recency),
-        )?);
+        )?;
+        let geom = super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+            &self.config,
+            &rt.coordinator,
+            self.dflash2.as_ref().map(|d| &d.config),
+        )?;
+        rt.state_store.set_geometry(geom);
+        if self.memory_registration.is_some() {
+            rt.state_store.attach_host_budget();
+        }
+        self.paged = Some(rt);
         Ok(())
     }
 
@@ -617,16 +643,19 @@ impl Inkling2Inner {
         options: &DiskTierOptions,
         identity: impl FnOnce() -> Option<crate::disk_tier::PersistentIdentity>,
     ) -> Option<TierHandle> {
+        let dflash2_cfg = self.dflash2.as_ref().map(|d| &d.config);
         let rt = self.paged.as_mut()?;
         let (context, disk) = super::state_disk::open_inkling2_state_disk(
             &self.config,
             &rt.coordinator,
+            dflash2_cfg,
             options,
             identity,
             self.model_id,
         )?;
         let handle = TierHandle::of(Some(&disk.tier));
         rt.coordinator.set_full_cold_tier(context);
+        rt.state_store.set_geometry(disk.codec.geometry.clone());
         rt.state_store.disk = Some(disk);
         let adopted = rt.state_store.adopt_all();
         if adopted > 0 {
@@ -843,6 +872,7 @@ impl Inkling2Inner {
 
     pub fn weight_arrays(&self) -> Vec<MxArray> {
         let mut arrays = Vec::new();
+        arrays.extend(self.embed_tokens.resident_weight_arrays());
         arrays.push(self.embed_norm.clone());
         for l in &self.layers {
             arrays.extend(l.weight_arrays());
@@ -867,20 +897,58 @@ impl Inkling2Inner {
             .iter()
             .map(|a| a.nbytes() as u64)
             .sum::<u64>();
-        let dflash2_bytes = self.dflash2.as_ref().map_or(0, |d| d.weight_bytes);
-        base.saturating_add(dflash2_bytes)
+        base.saturating_add(self.dflash2.as_ref().map_or(0, |d| d.weight_bytes))
     }
 
-    /// Whether an active external speculative drafter (DSpark on paged Metal, or
-    /// DSpark/DFlash2 on the CUDA fast path) is attached.
+    /// True when either an external DFlash2 or DSpark drafter is loaded.
+    pub(crate) fn has_speculative_draft(&self) -> bool {
+        self.dflash2.is_some() || self.dspark.is_some()
+    }
+
+    /// Whether an active external speculative drafter (DFlash2 or DSpark on paged Metal
+    /// or the CUDA fast path) is attached.
     #[inline]
     pub fn has_mtp_weights(&self) -> bool {
-        if self.paged.is_some() {
-            self.dspark.is_some()
-        } else if self.use_cuda_fast() {
-            self.dspark.is_some() || self.dflash2.is_some()
+        if self.paged.is_some() || self.use_cuda_fast() {
+            self.has_speculative_draft()
         } else {
             false
+        }
+    }
+
+    /// Target visit indices tapped by the active speculative drafter (`[5, 23, 41, 48]`),
+    /// preferring DFlash2 when attached.
+    pub(crate) fn active_draft_tap_visits(&self) -> Option<&[usize]> {
+        if let Some(ref draft) = self.dflash2 {
+            Some(&draft.config.target_layers)
+        } else {
+            self.dspark
+                .as_ref()
+                .map(|draft| draft.config.target_layer_ids.as_slice())
+        }
+    }
+
+    /// Number of proposal tokens drafted per speculative cycle by the active drafter.
+    pub(crate) fn active_draft_block_size(&self) -> Option<usize> {
+        if let Some(ref draft) = self.dflash2 {
+            Some(draft.config.block_size)
+        } else {
+            self.dspark
+                .as_ref()
+                .map(|draft| draft.config.num_draft_tokens())
+        }
+    }
+
+    /// Target shape contract validated against an Inkling-2-Mini DFlash2 checkpoint.
+    pub(crate) fn draft_target_shape(&self) -> DFlash2TargetShape {
+        DFlash2TargetShape {
+            hidden_size: self.config.hidden_size,
+            vocab_size: self.config.effective_padded_vocab_size(),
+            valid_vocab_size: self.config.effective_unpadded_vocab_size(),
+            num_layers: self.config.num_layer_visits(),
+            final_logit_softcapping: (self.config.final_logit_softcapping > 0.0)
+                .then_some(self.config.final_logit_softcapping as f32),
+            reads_layer_inputs: true,
         }
     }
 }
@@ -889,9 +957,16 @@ impl Inkling2Inner {
 #[napi(object)]
 #[derive(Debug, Clone, Default)]
 pub struct Inkling2LoadOptions {
-    /// Optional external DSpark drafter checkpoint path.
+    /// Optional explicit external speculative drafter checkpoint path (DFlash2 directory or DSpark GGUF/SafeTensors).
+    /// Strict: fails hard on load or validation error; pass `"none"` / `"off"` / `""` to disable all drafts.
     pub draft_model_path: Option<String>,
-    /// Auto-discover a colocated DSpark GGUF (`dspark-*.gguf`) when `draft_model_path` is unset (default `true`).
+    /// Optional auto-discovered external DFlash2 companion candidate path tried with soft fallback
+    /// (falls through to sibling DFlash2, bundled DSpark, or pure AR on load/validation error)
+    /// when `draft_model_path` is unset and `auto_load_draft != Some(false)`. Ignored when
+    /// `draft_model_path` is set or `auto_load_draft == Some(false)`; whereas `draft_model_path`
+    /// remains strict/explicit.
+    pub auto_draft_model_path: Option<String>,
+    /// Auto-discover a colocated/sibling DFlash2 or bundled DSpark drafter when `draft_model_path` is unset (default `true`).
     pub auto_load_draft: Option<bool>,
     /// KV cache format: `'int8'` (default on Metal: 32-token KTM) or `'bf16'`.
     #[napi(ts_type = "'int8' | 'bf16' | undefined")]
@@ -945,6 +1020,7 @@ pub struct Inkling2Model {
     #[allow(dead_code)]
     pub(crate) config: Inkling2Config,
     pub(crate) vision_config: Option<Inkling2VisionConfig>,
+    pub(crate) tokenizer: Option<Arc<Qwen3Tokenizer>>,
     pub(crate) paged_active: bool,
     pub(crate) scheduled_lanes: u32,
     pub(crate) vision_active: bool,
@@ -1014,6 +1090,38 @@ impl Inkling2Model {
     #[napi]
     pub fn context_limits(&self) -> Inkling2ContextLimits {
         self.context_limits.clone()
+    }
+
+    /// Render chat messages to Inkling2 native wire token IDs using the loaded tokenizer
+    /// without touching the GPU scheduler thread or inference caches.
+    #[napi]
+    pub async fn apply_chat_template(
+        &self,
+        messages: Vec<ChatMessage>,
+        add_generation_prompt: Option<bool>,
+        tools: Option<Vec<ToolDefinition>>,
+        enable_thinking: Option<bool>,
+        reasoning_effort: Option<String>,
+    ) -> Result<Uint32Array> {
+        let _ = add_generation_prompt;
+        let tokenizer = self
+            .tokenizer
+            .clone()
+            .ok_or_else(|| Error::from_reason("Inkling2 tokenizer not loaded"))?;
+        let ids = tokio::task::spawn_blocking(move || {
+            super::paged_forward::render_inkling2_prompt(
+                &tokenizer,
+                &messages,
+                tools.as_deref(),
+                enable_thinking,
+                reasoning_effort.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| {
+            Error::from_reason(format!("Inkling2 apply_chat_template join error: {e}"))
+        })??;
+        Ok(Uint32Array::new(ids))
     }
 
     /// Compute the exact prompt length after Inkling2 image-placeholder expansion without

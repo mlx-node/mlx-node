@@ -60,7 +60,7 @@ import {
   type LoadableModel,
   type LoadModelOptions,
 } from '@mlx-node/lm';
-import { findDFlash2Draft } from '@mlx-node/lm/draft-companion';
+import { findDFlash2Draft, findExternalInkling2DFlash2Draft } from '@mlx-node/lm/draft-companion';
 import { familyDataFor, filterFamilyLoadOptions } from '@mlx-node/lm/family-data';
 import { discoverRerankers, type DiscoveredReranker } from '@mlx-node/rerank/catalog';
 import { validateRerankerFamilies, familyLoadOptions } from '@mlx-node/rerank/protocol';
@@ -551,7 +551,14 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     const entry = models.find((model) => model.path === path)!;
     // Resolve against the source directory before creating the paged config overlay.
     // The host's explicit draft option would otherwise bypass automatic-DFlash2 capability gating.
-    // Inkling2 discovers colocated DSpark companions natively with soft fallback on bad drafts.
+    // Inkling2 discovers colocated/sibling DFlash2 and bundled DSpark natively
+    // with soft fallback on bad drafts. Forward ONLY a DFlash2 companion found
+    // in an external `modelsDir != parent(modelPath)` that native load cannot see
+    // via `autoDraftModelPath`, keeping explicit `draftModelPath` strictly user-supplied.
+    const autoDraftModelPath =
+      entry.modelType === 'inkling2' && supportsAutomaticDFlash2(entry.modelType)
+        ? findExternalInkling2DFlash2Draft(path, modelsDir)
+        : undefined;
     const draftModelPath =
       entry.modelType === 'inkling2' || !supportsAutomaticDFlash2(entry.modelType)
         ? undefined
@@ -564,6 +571,7 @@ export async function createInferenceHost(opts: InferenceHostOptions = {}): Prom
     // those assets from stale/debris cleanup until process exit.
     const leasedDir = pagedConfigOverrides.claimPreparedLease(resolvedPath);
     const options: LoadModelOptions = {
+      ...(autoDraftModelPath !== undefined ? { autoDraftModelPath } : {}),
       ...(draftModelPath !== undefined ? { draftModelPath } : {}),
       ...(entry.modelType === 'inkling2' && !supportsAutomaticDFlash2(entry.modelType) ? { autoLoadDraft: false } : {}),
       ...filterFamilyLoadOptions(entry.modelType, opts),

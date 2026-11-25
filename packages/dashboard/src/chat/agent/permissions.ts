@@ -4,7 +4,7 @@
  * never by kind: the agent offers `enable-always-approve` with kind `allow_once`.
  */
 
-import { posix } from 'node:path';
+import { posix, win32 } from 'node:path';
 
 import type { PermissionRequest, PromptResultFacts } from '../acp/messages.js';
 import { redactText } from '../redact.js';
@@ -20,6 +20,7 @@ import {
   isWorkGuardHook,
   WEB_TOOL_KEYS,
 } from './profiles.js';
+import { isWinPath } from './roots.js';
 import { readToolInputText, webInputKeys } from './tool-input.js';
 import { visibleText } from './visible-text.js';
 
@@ -298,7 +299,8 @@ export function workInteraction(
     else if (landing === null) flags = ['outside-folder'];
     else {
       flags = landsOutside(landing, place) ? ['outside-folder'] : [];
-      if (landing !== posix.normalize(agentPath(target.path, place))) resolvedPath = landing;
+      const normalize = isWinPath(place.cwd) ? win32.normalize : posix.normalize;
+      if (landing !== normalize(agentPath(target.path, place))) resolvedPath = landing;
     }
   }
   const shown = (text: string | null): string | null => (text === null ? null : visibleText(redactText(text, needles)));

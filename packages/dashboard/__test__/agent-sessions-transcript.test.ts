@@ -13,6 +13,8 @@ import {
   wakeCause,
 } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
+import { promptParams } from '../src/chat/agent/profiles.js';
+import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import { redactEntry } from '../src/chat/redact.js';
 import { HIDDEN_TEXT, WOKEN_PHASES, WOKEN_REPORT, WOKEN_RUN, WOKEN_T, wokenParentText } from './helpers/woken-turn.js';
 
@@ -222,8 +224,14 @@ describe('parseUpdates', () => {
     });
     expect(sub2).not.toHaveProperty('status');
     expect(end0).toEqual({ kind: 'turn-end', ts: 1791643300080, stopReason: 'end_turn', elapsedMs: 6082 });
-    // Two content blocks of one prompt merge; the image becomes a placeholder.
-    expect(u1).toMatchObject({ kind: 'user', text: 'Look at this screenshot\n[image]', promptIndex: 1 });
+    // Two content blocks of one prompt merge; the image is an attachment of the message, not a text line.
+    expect(u1).toEqual({
+      kind: 'user',
+      ts: expect.any(Number),
+      text: 'Look at this screenshot',
+      promptIndex: 1,
+      attachments: [{ kind: 'image', mediaType: 'image/png', bytes: 8 }],
+    });
     expect(model).toMatchObject({ kind: 'model', modelId: 'qwen3.5-0.8b-mlx-bf16' });
     expect(end1).toMatchObject({
       stopReason: 'error',
@@ -944,7 +952,7 @@ describe('the length stop and the automatic continue', () => {
       ).params;
       const content = params.update.content as { text?: string } | undefined;
       if (params.update.sessionUpdate === 'user_message_chunk') {
-        ops.push(...reducer.userPrompt(content?.text ?? '', params._meta.agentTimestampMs as number));
+        ops.push(...reducer.userPrompt(content?.text ?? '', [], params._meta.agentTimestampMs as number));
       } else {
         const isXai = (JSON.parse(text) as { method: string }).method === '_x.ai/session/update';
         ops.push(...reducer.apply({ xai: isXai, update: params.update, meta: params._meta }));
@@ -993,5 +1001,109 @@ describe('the length stop and the automatic continue', () => {
     expect(split).toHaveLength(1);
     expect(split[0]).toMatchObject({ kind: 'thinking', text: 'ab' });
     expect(split[0]).not.toHaveProperty('timed');
+  });
+});
+
+describe('parseUpdates: attachments of a user message', () => {
+  const PNG = 'iVBORw0KGgoAAAANSUhEUg==';
+  const FILES: AttachmentInput[] = [
+    { kind: 'file', name: 'notes#1.md', text: 'línea uno\nline two\n' },
+    { kind: 'image', mediaType: 'image/png', data: PNG },
+  ];
+  const block = (content: object, promptIndex: number | null, n: number, extra: object = {}) =>
+    acp(
+      {
+        sessionUpdate: 'user_message_chunk',
+        content,
+        ...(promptIndex === null ? {} : { _meta: { promptIndex, ...extra } }),
+      },
+      n,
+    );
+  /** The prompt as the agent stores it: one user chunk per block the app sent, all of one prompt index. */
+  const stored = (text: string, attachments: AttachmentInput[], promptIndex = 0) =>
+    (promptParams('sid', text, attachments).prompt as object[]).map((b, i) => block(b, promptIndex, i + 1));
+  const users = (lines: string[]) => parseUpdates(`${lines.join('\n')}\n`).transcript.filter((e) => e.kind === 'user');
+
+  // Mutation: the reader drops `resource` / `image` chunks of a stored user message → red.
+  it('a stored text, file and picture of one prompt are one user entry with the views, and no placeholder text', () => {
+    expect(users(stored('look at these', FILES))).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'look at these',
+        promptIndex: 0,
+        attachments: [
+          { kind: 'file', name: 'notes_1.md', bytes: 20 },
+          { kind: 'image', mediaType: 'image/png', bytes: 16 },
+        ],
+      },
+    ]);
+  });
+
+  it('a resource with a blob counts its bytes; one with neither text nor blob stays a placeholder line', () => {
+    const lines = [
+      user('two files', 2),
+      block({ type: 'resource', resource: { uri: 'file:///attached/a.bin', blob: PNG } }, 2, 2),
+      block({ type: 'resource', resource: { uri: 'file:///attached/b.txt' } }, 2, 3),
+    ];
+    expect(users(lines)).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'two files\n[resource]',
+        promptIndex: 2,
+        attachments: [{ kind: 'file', name: 'a.bin', bytes: 16 }],
+      },
+    ]);
+  });
+
+  it('a picture with no text before it is an entry with empty text; the text after it joins without a blank line', () => {
+    const lines = [block({ type: 'image', mimeType: 'image/jpeg', data: PNG }, 4, 1), user('what is this', 4)];
+    expect(users(lines)).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'what is this',
+        promptIndex: 4,
+        attachments: [{ kind: 'image', mediaType: 'image/jpeg', bytes: 16 }],
+      },
+    ]);
+    const alone = users([block({ type: 'image', data: PNG }, null, 1)]);
+    expect(alone).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: '',
+        promptIndex: null,
+        attachments: [{ kind: 'image', mediaType: 'image', bytes: 16 }],
+      },
+    ]);
+  });
+
+  it('a hidden picture chunk is still the placeholder text of its wake entry', () => {
+    const lines = [
+      block({ type: 'text', text: 'woke' }, 1, 1, { hideFromScrollback: true }),
+      block({ type: 'image', mimeType: 'image/png', data: PNG }, 1, 2, { hideFromScrollback: true }),
+    ];
+    const parsed = parseUpdates(`${lines.join('\n')}\n`).transcript;
+    expect(parsed).toEqual([{ kind: 'wake', ts: expect.any(Number), cause: 'unknown', text: 'woke\n[image]' }]);
+  });
+
+  it('live, the pushed prompt carries the same views the reader makes from the stored blocks, in the ops the page gets', () => {
+    const reducer = new TranscriptReducer();
+    const ops = reducer.userPrompt('look at these', FILES.map(attachmentView), 5);
+    const [entry] = reducer.snapshot().entries;
+    const [read] = users(stored('look at these', FILES));
+    expect(entry).toEqual({
+      kind: 'user',
+      ts: 5,
+      text: 'look at these',
+      promptIndex: null,
+      attachments: read!.kind === 'user' ? read.attachments : [],
+    });
+    expect(ops.at(-1)).toEqual({ op: 'set', index: 0, entry });
+    expect(new TranscriptReducer().userPrompt('plain', [], 5)).toEqual([
+      { op: 'push', entry: { kind: 'user', ts: 5, text: 'plain', promptIndex: null } },
+    ]);
   });
 });

@@ -26,6 +26,14 @@ import {
 } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 
+import {
+  ATTACH_MAX,
+  type AttachmentInput,
+  attachmentView,
+  estimateTokens,
+  WINDOW_SHARE,
+} from '../../../src/chat/attachment-rule.js';
+import { type AttachmentChipItem, AttachmentStrip } from '../components/arc-x/attachment-strip/attachment-strip';
 import { ChatFrame, JumpButton, useChatDocked } from '../components/arc-x/chat-frame/chat-frame';
 import {
   Composer,
@@ -43,6 +51,7 @@ import { Button } from '../components/arc/button/button';
 import { ChatThread, ConversationNotices, type TurnAction } from '../components/chat-thread';
 import { UnloadButton } from '../components/unload-button';
 import { DashboardApiError, mutate } from '../lib/api';
+import { type DraftAttachment, draftInput } from '../lib/chat-attachments';
 import { isSlashText } from '../lib/chat-input';
 import type { ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
@@ -57,7 +66,7 @@ import type {
   TurnState,
 } from '../lib/chat-types';
 import { getTransportUp, subscribeConnection } from '../lib/connection';
-import { formatBytes } from '../lib/format';
+import { formatBytes, formatNumber } from '../lib/format';
 import { folderName, modeRank, settingsToast, tempFor } from '../lib/permission-text';
 import { pickFolder } from '../lib/pick-folder';
 import { useStickToBottom } from '../lib/stick-to-bottom';
@@ -68,10 +77,20 @@ import { type AppCommand, useCommands } from '../shell/commands';
 import { useCrumbs } from '../shell/crumbs';
 import { type Hotkey, useHotkeys, usePageSearch } from '../shell/hotkeys';
 import { useScrollRoot } from '../shell/scroll-root';
-import { type BlockAction, copyDetails, infoNotice, modeBlocker, sendFailure, type StripNotice } from './chat/blockers';
-import { modelBases, startModel, WebChip } from './chat/composer-tools';
+import {
+  attachProblem,
+  heldPictureChars,
+  type BlockAction,
+  copyDetails,
+  infoNotice,
+  modeBlocker,
+  sendFailure,
+  type StripNotice,
+} from './chat/blockers';
+import { ComposerMenu, modelBases, startModel } from './chat/composer-tools';
 import { conversationPath, deleteContent, RenameDialog, type RenameTarget } from './chat/conversation-actions';
 import {
+  attachDrafts,
   chooseFolder,
   chosenFolder,
   folderTooLong,
@@ -80,7 +99,10 @@ import {
   lastPlaceOf,
   NEW_PLACE,
   pickedVariants,
+  placeEpoch,
+  readAttachments,
   readDraft,
+  readFailed,
   recentFolders,
   rememberPlace,
   storedMode,
@@ -88,7 +110,10 @@ import {
   storeMode,
   storeModel,
   storeVariant,
+  subscribeDrafts,
+  writeAttachments,
   writeDraft,
+  writeFailed,
 } from './chat/drafts';
 import { ListPane } from './chat/list-pane';
 import { NewScreen } from './chat/new-screen';
@@ -125,12 +150,39 @@ interface Sending {
   conversationId: string | null;
   mode: ChatMode;
   text: string;
+  files: readonly DraftAttachment[];
   /** Entries of the conversation when it was sent: the stream has it once there are more. */
   base: number;
   lastEnd: ConversationState['lastEnd'];
   ts: number;
   /** A Work create: the mode the chip showed when Send was pressed, and the draft and folder the create named. */
   permission: { shown: PermissionMode; draft: string; cwd: string } | null;
+}
+
+/** The last message sent: Send again sends it with its files. */
+interface Resend {
+  place: string;
+  text: string;
+  files: readonly DraftAttachment[];
+}
+
+/** A failed message comes back only to an empty composer: no text, no files, and no file still being read. */
+function restorable(place: string, reading: ReadonlyMap<string, number>): boolean {
+  return readDraft(place) === '' && readAttachments(place).length === 0 && !reading.has(place);
+}
+
+/**
+ * The user acted on what a failed send's strip asked (a folder, a model, an update): the strip goes. A message the
+ * composer holds needs no record; one it does not keeps a Retry strip.
+ */
+function settleFailed(place: string): void {
+  const record = readFailed(place);
+  if (record === null || record.strip === null || record.strip.action?.kind === 'retry') return;
+  const [text, label] = CHAT.sendErrors.other;
+  writeFailed(
+    place,
+    record.restored ? null : { ...record, strip: { tone: 'danger', text, action: { label, kind: 'retry' } } },
+  );
 }
 
 const NO_RAISED: ChatHostState['permissionRaised'] = [];
@@ -244,12 +296,20 @@ export default function Chat(): ReactElement {
   const [createdId, setCreatedId] = useState<string | null>(null);
   const [threadKey, setThreadKey] = useState(place);
   const [stripError, setStripError] = useState<StripNotice | null>(null);
-  const [failedText, setFailedText] = useState<{ place: string; text: string } | null>(null);
+  const failed = useSyncExternalStore(subscribeDrafts, () => readFailed(place));
+  const held = useSyncExternalStore(subscribeDrafts, () => readAttachments(place));
+  /** Why the last files picked, pasted or dropped on a place were not added. */
+  const [attachNote, setAttachNote] = useState<{ place: string; text: string } | null>(null);
+  /** Files still being read, per place. */
+  const [reading, setReading] = useState<ReadonlyMap<string, number>>(() => new Map());
+  /** The same counts for a send or a turn that ends between renders. */
+  const readingNow = useRef(new Map<string, number>());
+  /** The last message sent: Send again sends its files with it while this window holds them. */
+  const [lastSent, setLastSent] = useState<Resend | null>(null);
   if (shownPlace !== place) {
     setShownPlace(place);
     setDraftState(readDraft(place));
     setStripError(null);
-    setFailedText(null);
     // The created conversation keeps the New screen's thread cell: the bubble stays where it was drawn.
     if (shownPlace !== NEW_PLACE || createdId !== place) {
       newVisits += 1;
@@ -297,7 +357,7 @@ export default function Chat(): ReactElement {
   const [dismissedEnd, setDismissedEnd] = useState<ConversationState['lastEnd']>(null);
 
   // The bubble leaves once the stream carries the message, or the turn ended without it. A turn that failed before
-  // it ran never carried the message: its text comes back for Retry.
+  // it ran never carried the message: its text and files come back for Retry.
   useEffect(() => {
     if (sending === null || sending.conversationId === null || sending.conversationId !== conversationId) return;
     if (gone !== null) {
@@ -309,11 +369,14 @@ export default function Chat(): ReactElement {
       setSending(null);
       const end = conv.lastEnd;
       if (conv.entries.length <= sending.base && end?.failure !== undefined && end.outcome === undefined) {
-        setFailedText({ place: sending.conversationId, text: sending.text });
-        if (readDraft(sending.conversationId) === '') {
-          writeDraft(sending.conversationId, sending.text);
+        const id = sending.conversationId;
+        const restored = restorable(id, readingNow.current);
+        if (restored) {
+          writeDraft(id, sending.text);
+          writeAttachments(id, sending.files);
           setDraftState(sending.text);
         }
+        writeFailed(id, { text: sending.text, files: sending.files, strip: null, restored });
       }
     }
   }, [sending, conv, conversationId, gone]);
@@ -337,6 +400,9 @@ export default function Chat(): ReactElement {
   const chosenNew =
     newModel !== null && host?.models.some((model) => model.id === newModel) === true ? newModel : startsOn;
   const modelValue = isNew ? chosenNew : (conv?.conversation.modelId ?? null);
+  const modelRow = host?.models.find((model) => model.id === modelValue);
+  const seesImages = mode === 'chat' && modelRow?.images === true;
+  const windowTokens = modelRow?.contextTokens ?? null;
   const bases = useMemo(
     () => (host === null ? [] : modelBases(host, resident, mode, modelValue, picked)),
     [host, resident, mode, modelValue, picked],
@@ -405,6 +471,7 @@ export default function Chat(): ReactElement {
   };
 
   // Why Send is off.
+  const canInstallAgent = host?.agent.canInstall !== false;
   const blocker = modeBlocker(connected, host, mode);
   let blocked = blocker?.reason;
   if (blocked === undefined && isNew && mode === 'work' && newFolder === null) blocked = CHAT.folderNeeded;
@@ -412,6 +479,16 @@ export default function Chat(): ReactElement {
     blocked = CHAT.folderTooLong;
   if (blocked === undefined && cwdProblem !== undefined) blocked = CHAT.cwdProblems[cwdProblem];
   if (blocked === undefined && isSlashText(draft)) blocked = CHAT.slashText;
+  const readingHere = reading.get(place) ?? 0;
+  const threadEntries = isNew ? undefined : conv?.entries;
+  const heldPictures = useMemo(
+    () => (threadEntries === undefined ? 0 : heldPictureChars(threadEntries)),
+    [threadEntries],
+  );
+  if (blocked === undefined)
+    blocked =
+      attachProblem({ mode, seesImages, text: draft, files: held, windowTokens, reading: readingHere, heldPictures }) ??
+      undefined;
   const panelShown = isNew && blocker?.panel !== undefined;
 
   const composerRef = useRef<HTMLTextAreaElement | null>(null);
@@ -422,22 +499,50 @@ export default function Chat(): ReactElement {
   const root = useScrollRoot();
   const stick = useStickToBottom(root, threadKey);
 
-  const send = async (text: string): Promise<void> => {
+  /** Files still being read count only for a send from the composer: Retry and Send again send finished files. */
+  const send = async (
+    text: string,
+    files: readonly DraftAttachment[] = [],
+    from: 'composer' | 'resend' = 'resend',
+  ): Promise<void> => {
     if (text.trim() === '' || isSlashText(text) || phase !== 'idle') return;
     if (modeBlocker(connected, host, mode) !== null) return;
     if (isNew && mode === 'work' && (newFolder === null || folderTooLong(newFolder))) return;
     if (!isNew && cwdProblem !== undefined) return;
+    const problem = attachProblem({
+      mode,
+      seesImages,
+      text,
+      files,
+      windowTokens,
+      reading: from === 'composer' ? readingHere : 0,
+      heldPictures,
+    });
+    if (problem !== null) {
+      setStripError({ tone: 'warning', text: problem });
+      return;
+    }
     setStripError(null);
-    setFailedText(null);
+    setAttachNote(null);
     setDismissedEnd(conv?.lastEnd ?? null);
     const fromNew = isNew;
     const target = fromNew ? null : conversationId;
     const origin = place;
+    const epoch = placeEpoch(origin);
+    // Retry takes the failed message; another send leaves it until this one goes through, unless the composer has it.
+    const prior = readFailed(origin);
+    if (prior !== null && (prior.restored || (prior.text === text && prior.files === files))) {
+      writeFailed(origin, null, epoch);
+    }
+    const sent = (): void => {
+      if (prior !== null && readFailed(origin) === prior) writeFailed(origin, null, epoch);
+    };
     const base = fromNew ? 0 : (conv?.entries.length ?? 0);
     const next: Sending = {
       conversationId: target,
       mode,
       text,
+      files,
       base,
       lastEnd: fromNew ? null : (conv?.lastEnd ?? null),
       ts: Date.now(),
@@ -447,8 +552,13 @@ export default function Chat(): ReactElement {
           : null,
     };
     setSending(next);
-    // A Retry of a failed message leaves text typed since then in the composer.
+    // A Retry of a failed message leaves text typed and files attached since then in the composer.
     if (readDraft(origin) === text) setDraft('');
+    const stored = readAttachments(origin);
+    if (files.length > 0 && stored.length === files.length && stored.every((item, i) => item.id === files[i]!.id)) {
+      writeAttachments(origin, []);
+    }
+    const attachments: AttachmentInput[] | undefined = files.length > 0 ? files.map(draftInput) : undefined;
     stick.pin();
     announce(CHAT.status.sent);
     // The reply belongs to the place it was sent from; the user may be elsewhere by the time it arrives.
@@ -456,8 +566,16 @@ export default function Chat(): ReactElement {
     const drop = (): void => setSending((current) => (current === next ? null : current));
     try {
       if (fromNew) {
-        const body: { mode: ChatMode; text: string; modelId?: string; cwd?: string; draft?: string } = { mode, text };
+        const body: {
+          mode: ChatMode;
+          text: string;
+          modelId?: string;
+          cwd?: string;
+          draft?: string;
+          attachments?: AttachmentInput[];
+        } = { mode, text };
         if (chosenNew !== null) body.modelId = chosenNew;
+        if (attachments !== undefined) body.attachments = attachments;
         if (next.permission !== null) {
           body.cwd = next.permission.cwd;
           body.draft = next.permission.draft;
@@ -471,6 +589,8 @@ export default function Chat(): ReactElement {
           throw err;
         }
         const id = reply.conversation.id;
+        sent();
+        setLastSent({ place: id, text, files });
         const answered = reply.conversation.permissionMode;
         if (next.permission !== null) {
           if (modeRank(answered) < modeRank(startShown.current)) toast.error(CHAT.permission.failed);
@@ -487,37 +607,120 @@ export default function Chat(): ReactElement {
           drop();
         }
       } else if (target !== null) {
-        await mutate('POST', `${conversationPath(target)}/prompt`, { text });
+        await mutate(
+          'POST',
+          `${conversationPath(target)}/prompt`,
+          attachments === undefined ? { text } : { text, attachments },
+        );
+        sent();
+        setLastSent({ place: target, text, files });
       }
     } catch (err) {
       drop();
-      // Text typed while the send was pending stays; Retry still sends the failed text.
-      const restore = readDraft(origin) === '';
-      if (restore) writeDraft(origin, text);
+      // Text typed or files attached while the send was pending stay; the place keeps the failed message for Retry.
+      const restored = restorable(origin, readingNow.current);
+      if (restored) {
+        writeDraft(origin, text);
+        writeAttachments(origin, files, epoch);
+        if (stillShown()) setDraftState(text);
+      }
       const reason = err instanceof DashboardApiError ? err.reason : undefined;
       const code = err instanceof DashboardApiError ? err.code : undefined;
-      const outcome = sendFailure(reason, code, mode, err instanceof Error ? err.message : undefined);
-      if ('toast' in outcome) toast.error(outcome.toast);
-      else if (stillShown()) {
-        if (restore) setDraftState(text);
-        setStripError(outcome.strip);
-        setFailedText({ place: origin, text });
-      } else {
-        toast.error(outcome.strip.text);
+      const outcome = sendFailure(
+        reason,
+        code,
+        mode,
+        err instanceof Error ? err.message : undefined,
+        undefined,
+        canInstallAgent,
+      );
+      if ('toast' in outcome && restored) {
+        toast.error(outcome.toast);
+        return;
       }
+      const failure: StripNotice =
+        'toast' in outcome
+          ? { tone: 'danger', text: outcome.toast, action: { label: CHAT.tryAgain, kind: 'retry' } }
+          : outcome.strip;
+      writeFailed(origin, { text, files, strip: failure, restored }, epoch);
+      if (!stillShown()) toast.error(failure.text);
     }
   };
+
+  const alive = useRef(true);
+  useEffect(() => {
+    alive.current = true;
+    return () => {
+      alive.current = false;
+    };
+  }, []);
+  // A read keeps the place it started in: the user may be elsewhere, or Chat may be closed, by the time it ends.
+  const addFiles = (files: readonly File[]): void => {
+    if (files.length === 0) return;
+    const origin = place;
+    const epoch = placeEpoch(origin);
+    const count = (step: number): void => {
+      const now = readingNow.current;
+      const n = (now.get(origin) ?? 0) + step;
+      if (n === 0) now.delete(origin);
+      else now.set(origin, n);
+      setReading(new Map(now));
+    };
+    setAttachNote(null);
+    count(1);
+    attachDrafts(
+      files,
+      { mode, seesImages },
+      { read: () => readAttachments(origin), write: (items) => writeAttachments(origin, items, epoch) },
+    )
+      .then(
+        (result) => {
+          const first = result.refused[0];
+          if (first === undefined) return;
+          const text =
+            result.refused.length > 1
+              ? fill(CHAT.attach.more, { text: first, n: files.length - result.added.length - 1 })
+              : first;
+          if (alive.current && placeRef.current === origin) setAttachNote({ place: origin, text });
+          else toast.error(text);
+        },
+        () => undefined,
+      )
+      .finally(() => count(-1));
+  };
+  const removeAttachment = (id: string): void => {
+    writeAttachments(
+      place,
+      readAttachments(place).filter((item) => item.id !== id),
+    );
+    setAttachNote(null);
+  };
+  const pickerInput = useRef<HTMLInputElement | null>(null);
+  const bindPicker = useCallback(
+    (node: HTMLInputElement | null) => {
+      pickerInput.current = node;
+      if (node === null) return;
+      node.addEventListener('cancel', focusComposer);
+      return () => {
+        node.removeEventListener('cancel', focusComposer);
+        pickerInput.current = null;
+      };
+    },
+    [focusComposer],
+  );
+  const openPicker = useCallback(() => pickerInput.current?.click(), []);
 
   const picking = useRef(false);
   const pickAndChoose = useCallback(async () => {
     if (picking.current) return;
     picking.current = true;
     try {
-      const path = await pickFolder();
+      const path = await pickFolder('work');
       if (path !== null) {
         chooseFolder(path);
         setFolderChoice(path);
         setStripError(null);
+        settleFailed(placeRef.current);
       }
     } finally {
       picking.current = false;
@@ -529,6 +732,7 @@ export default function Chat(): ReactElement {
       chooseFolder(path);
       setFolderChoice(path);
       setStripError(null);
+      settleFailed(placeRef.current);
       focusComposer();
     },
     [focusComposer],
@@ -556,10 +760,12 @@ export default function Chat(): ReactElement {
     [conversationId],
   );
 
-  const runAction = (action: BlockAction): void => {
+  const runAction = (action: BlockAction, fromFailed = false): void => {
     setStripError(null);
+    if (fromFailed) settleFailed(place);
     switch (action.kind) {
       case 'install':
+        if (!canInstallAgent) return;
         mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
         return;
       case 'restart':
@@ -583,7 +789,7 @@ export default function Chat(): ReactElement {
         return;
       case 'retry':
         if (turnStrip !== null && conv !== null) setDismissedEnd(conv.lastEnd);
-        if (retryText !== null) void send(retryText);
+        if (failed !== null) void send(failed.text, failed.files);
         return;
       case 'pick-model':
         pickerRef.current?.querySelector('button')?.click();
@@ -599,33 +805,60 @@ export default function Chat(): ReactElement {
     text: strip.text,
     working: strip.working,
     action:
-      strip.action === undefined ? undefined : { label: strip.action.label, onSelect: () => runAction(strip.action!) },
+      strip.action === undefined
+        ? undefined
+        : { label: strip.action.label, onSelect: () => runAction(strip.action!, strip === failed?.strip) },
     secondary:
       strip.secondary === undefined
         ? undefined
         : { label: strip.secondary.label, onSelect: () => runAction(strip.secondary!) },
   });
 
-  const retryText = failedText !== null && failedText.place === place ? failedText.text : null;
   const endFailure = conv?.lastEnd?.failure;
   const turnStrip =
     conv !== null && endFailure !== undefined && conv.lastEnd?.outcome === undefined && dismissedEnd !== conv.lastEnd
       ? (() => {
-          const outcome = sendFailure(endFailure.code, undefined, mode, undefined, conv.conversation.modelId);
+          const outcome = sendFailure(
+            endFailure.code,
+            undefined,
+            mode,
+            undefined,
+            conv.conversation.modelId,
+            canInstallAgent,
+          );
           if (!('strip' in outcome)) return null;
           // Retry needs the text of the message that never ran; without it the strip has no button.
           const strip = outcome.strip;
-          return strip.action?.kind === 'retry' && retryText === null ? { ...strip, action: undefined } : strip;
+          return strip.action?.kind === 'retry' && failed === null ? { ...strip, action: undefined } : strip;
         })()
       : null;
   const modeStrip = panelShown ? undefined : blocker?.notice;
   const folderStrip: StripNotice | null =
     cwdProblem !== undefined ? { tone: 'danger', text: CHAT.cwdProblems[cwdProblem] } : null;
-  const strip: StripNotice | null = modeStrip ?? stripError ?? folderStrip ?? turnStrip ?? infoNotice(host, mode);
+  const convEntries = conv?.entries;
+  const sentPictures = useMemo(
+    () =>
+      convEntries?.some(
+        (entry) => entry.kind === 'user' && entry.attachments?.some((item) => item.kind === 'image') === true,
+      ) === true,
+    [convEntries],
+  );
+  const unseenStrip: StripNotice | null =
+    conv !== null &&
+    conv.conversation.mode === 'chat' &&
+    sentPictures &&
+    host !== null &&
+    host.models.find((model) => model.id === conv.conversation.modelId)?.images !== true
+      ? { tone: 'warning', text: CHAT.attach.imagesUnseen }
+      : null;
+  const strip: StripNotice | null =
+    modeStrip ?? stripError ?? failed?.strip ?? folderStrip ?? turnStrip ?? unseenStrip ?? infoNotice(host, mode);
 
   const onDraftChange = (text: string): void => {
     setDraft(text);
     if (stripError !== null) setStripError(null);
+    if (failed?.restored === true) writeFailed(place, null);
+    if (attachNote !== null) setAttachNote(null);
     if (turnStrip !== null && conv !== null) setDismissedEnd(conv.lastEnd);
   };
 
@@ -1134,7 +1367,9 @@ export default function Chat(): ReactElement {
   let lastEnd: ConversationState['lastEnd'] = conv?.lastEnd ?? null;
   if (sendingHere && sending !== null) {
     if (entries.length <= sending.base) {
-      entries = [...entries, { kind: 'user', ts: sending.ts, text: sending.text, promptIndex: null }];
+      const sent: TranscriptEntry = { kind: 'user', ts: sending.ts, text: sending.text, promptIndex: null };
+      if (sending.files.length > 0) sent.attachments = sending.files.map((file) => attachmentView(draftInput(file)));
+      entries = [...entries, sent];
     }
     threadTurn = turn ?? STARTING;
     if (turn === null) lastEnd = null;
@@ -1142,16 +1377,31 @@ export default function Chat(): ReactElement {
   const engineReason =
     host?.inference === 'stopped' ? CHAT.blockers['inference-stopped'][1] : (blocker?.reason ?? undefined);
 
-  const sendRef = useRef(send);
+  // Send again carries the files while this window still holds the message it was sent with.
+  const keptFor =
+    lastSent !== null && lastSent.place === conversationId && lastSent.files.length > 0 ? lastSent.text : null;
+  const resend = (action: Exclude<TurnAction, { kind: 'update-agent' }>): void => {
+    const files =
+      action.kind === 'send-again' && keptFor !== null && keptFor === action.text && lastSent !== null
+        ? lastSent.files
+        : [];
+    void send(action.text, files);
+  };
+  const resendRef = useRef(resend);
   useLayoutEffect(() => {
-    sendRef.current = send;
+    resendRef.current = resend;
+  });
+  const canInstallRef = useRef(canInstallAgent);
+  useLayoutEffect(() => {
+    canInstallRef.current = canInstallAgent;
   });
   const onTurnAction = useCallback((action: TurnAction) => {
     if (action.kind === 'update-agent') {
+      if (!canInstallRef.current) return;
       mutate('POST', '/chat/agent', { action: 'install' }).catch(() => undefined);
       return;
     }
-    void sendRef.current(action.text);
+    resendRef.current(action);
   }, []);
 
   let body: ReactNode;
@@ -1226,6 +1476,8 @@ export default function Chat(): ReactElement {
           conversationId === null ? undefined : `/sessions/${encodeURIComponent(conversationId)}?tab=activity`
         }
         onTurnAction={onTurnAction}
+        canInstallAgent={canInstallAgent}
+        keptFor={keptFor}
         actionDisabledReason={engineReason}
         onStatus={announce}
         contentRef={stick.contentRef}
@@ -1247,20 +1499,64 @@ export default function Chat(): ReactElement {
       ? deleteContent({ id: conversationId, title, mode, folder: conv?.conversation.cwd ?? null }, onDeleted)
       : null;
 
-  const placeholder = !isNew
-    ? permissionMode === 'bypass'
-      ? CHAT.permission.bypass.placeholder
-      : CHAT.placeholderReply
-    : mode === 'work'
-      ? newFolder === null
-        ? CHAT.placeholderWorkNoFolder
-        : fill(permissionMode === 'bypass' ? CHAT.permission.bypass.placeholderNew : CHAT.placeholderWork, {
-            folder: folderName(newFolder),
-          })
-      : CHAT.placeholderChat;
+  const placeholder =
+    held.length > 0
+      ? CHAT.attach.placeholder
+      : !isNew
+        ? permissionMode === 'bypass'
+          ? CHAT.permission.bypass.placeholder
+          : CHAT.placeholderReply
+        : mode === 'work'
+          ? newFolder === null
+            ? CHAT.placeholderWorkNoFolder
+            : fill(permissionMode === 'bypass' ? CHAT.permission.bypass.placeholderNew : CHAT.placeholderWork, {
+                folder: folderName(newFolder),
+              })
+          : CHAT.placeholderChat;
+
+  const full = held.length >= ATTACH_MAX;
+  const attachRow = {
+    open: openPicker,
+    full,
+    note: full
+      ? CHAT.attach.noteFull
+      : mode === 'work'
+        ? CHAT.attach.noteWork
+        : seesImages
+          ? undefined
+          : CHAT.attach.noteNoImages,
+  };
+  const pictureProblem = seesImages ? undefined : mode === 'work' ? CHAT.attach.chipWork : CHAT.attach.chipModel;
+  const chips = held.map((item): AttachmentChipItem =>
+    item.kind === 'file'
+      ? { id: item.id, kind: 'file', name: item.name, bytes: item.bytes }
+      : {
+          id: item.id,
+          kind: 'image',
+          name: item.name,
+          mediaType: item.mediaType,
+          bytes: item.bytes,
+          thumbnail: item.dataUrl,
+          problem: pictureProblem,
+        },
+  );
+  const estimate = held.length > 0 ? estimateTokens(draft, held.map(draftInput)) : 0;
+  const nearFull = windowTokens !== null && (contextUsed ?? 0) + estimate > windowTokens * WINDOW_SHARE;
+  const attachStrip = (
+    <AttachmentStrip
+      items={chips}
+      onRemove={removeAttachment}
+      note={attachNote !== null && attachNote.place === place ? attachNote.text : undefined}
+      caption={{
+        text: fill(nearFull ? CHAT.attach.tokensNearFull : CHAT.attach.tokens, { n: formatNumber(estimate) }),
+        tone: nearFull ? 'warning' : 'muted',
+      }}
+    />
+  );
 
   const tools = (
     <>
+      <ComposerMenu providers={host?.providers ?? null} mode={mode} attach={attachRow} />
       <span ref={pickerRef} className="inline-flex min-w-0" data-give="3">
         <ModelPicker
           value={modelValue}
@@ -1282,12 +1578,15 @@ export default function Chat(): ReactElement {
           memory={memory}
         />
       </span>
-      {mode !== 'work' ? null : isNew ? (
-        <NewFolderChip folder={newFolder} recent={recent} onChoose={chooseRecent} onPick={() => void pickAndChoose()} />
-      ) : openFolder !== null ? (
-        <OpenFolderChip folder={openFolder} />
+      {mode === 'work' && isNew && newFolder === null ? (
+        <NewFolderChip
+          place="composer"
+          folder={null}
+          recent={recent}
+          onChoose={chooseRecent}
+          onPick={() => void pickAndChoose()}
+        />
       ) : null}
-      {host !== null ? <WebChip providers={host.providers} mode={mode} /> : null}
       {mode === 'work' ? (
         <PermissionModeChip
           key={chipKey}
@@ -1326,7 +1625,19 @@ export default function Chat(): ReactElement {
               if (conversationId !== null) renameItem({ id: conversationId, title });
             }}
             trailing={docked ? null : newButton}
-            folder={openFolder !== null ? <OpenFolderChip folder={openFolder} /> : null}
+            folder={
+              openFolder !== null ? (
+                <OpenFolderChip folder={openFolder} />
+              ) : mode === 'work' && isNew && newFolder !== null ? (
+                <NewFolderChip
+                  place="header"
+                  folder={newFolder}
+                  recent={recent}
+                  onChoose={chooseRecent}
+                  onPick={() => void pickAndChoose()}
+                />
+              ) : null
+            }
             permission={
               subject?.kind === 'conversation' && permissionMode !== 'ask' ? (
                 <PermissionModeChip
@@ -1390,13 +1701,29 @@ export default function Chat(): ReactElement {
               onValueChange={onDraftChange}
               placeholder={placeholder}
               phase={phase}
-              onSend={() => void send(draft)}
+              onSend={() => void send(draft, held, 'composer')}
               onStop={stop}
               blocked={blocked}
               notice={strip === null ? undefined : toNotice(strip)}
               tools={tools}
               context={context}
               textareaRef={composerRef}
+              attachments={attachStrip}
+              onFiles={addFiles}
+            />
+            <input
+              ref={bindPicker}
+              type="file"
+              multiple
+              className="sr-only"
+              tabIndex={-1}
+              aria-label={CHAT.attach.row}
+              onChange={(event) => {
+                const input = event.currentTarget;
+                addFiles(Array.from(input.files ?? []));
+                input.value = '';
+                focusComposer();
+              }}
             />
           </div>
         }

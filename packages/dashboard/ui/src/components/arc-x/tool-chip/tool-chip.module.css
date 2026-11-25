@@ -26,9 +26,18 @@
 }
 
 .root[data-compact] {
+  position: relative;
   width: var(--control-height-sm);
   justify-content: center;
   padding: 0;
+}
+
+/* A corner mark on an icon-only chip, so the dot never moves the icon or the row. */
+.root[data-compact] > .dot {
+  position: absolute;
+  top: 1px;
+  inset-inline-end: 1px;
+  box-shadow: 0 0 0 2px var(--surface);
 }
 
 .root:hover {

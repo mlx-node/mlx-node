@@ -1,7 +1,7 @@
 import { constants } from 'node:fs';
 import { mkdir, open, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, posix } from 'node:path';
 
 import { delegationCommand, delegationPrompt, expandHome, preferredLocalModel } from '@mlx-node/agent/delegate';
 
@@ -30,13 +30,21 @@ export interface CodingAgentsOptions {
   listModels(): Promise<string[]>;
   home?: string;
   env?: NodeJS.ProcessEnv;
+  platform?: NodeJS.Platform;
 }
 
 export const MANAGED_BEGIN = '<!-- portato managed instructions: begin -->';
 export const MANAGED_END = '<!-- portato managed instructions: end -->';
 
-export function managedBlock(command: string): string {
-  return `${MANAGED_BEGIN}\n${delegationPrompt(command)}\n${MANAGED_END}`;
+export function managedBlock(command: string, platform: NodeJS.Platform = process.platform): string {
+  return `${MANAGED_BEGIN}\n${delegationPrompt(command, platform)}\n${MANAGED_END}`;
+}
+
+function isAbsoluteCommandPath(path: string, platform: NodeJS.Platform): boolean {
+  if (platform === 'win32') {
+    return /^[a-zA-Z]:[\\/]/.test(path) || /^\\\\[^\\]+[\\/][^\\]+/.test(path);
+  }
+  return posix.isAbsolute(path);
 }
 
 type Block = { start: number; end: number } | null | 'invalid';
@@ -62,6 +70,7 @@ const INVALID_BLOCK =
 export class CodingAgentsService {
   private readonly home: string;
   private readonly env: NodeJS.ProcessEnv;
+  private readonly platform: NodeJS.Platform;
   private readonly rows = new Map<CodingAgentId, CodingAgentRow>();
   private chain: Promise<unknown> = Promise.resolve();
   private model: string | null = null;
@@ -72,6 +81,7 @@ export class CodingAgentsService {
   constructor(private readonly options: CodingAgentsOptions) {
     this.home = options.home ?? homedir();
     this.env = options.env ?? process.env;
+    this.platform = options.platform ?? process.platform;
     for (const [id, name] of [
       ['claude', 'Claude Code'],
       ['codex', 'Codex'],
@@ -82,8 +92,11 @@ export class CodingAgentsService {
   }
 
   private async paths(): Promise<void> {
-    const claude = join(expandHome(this.env.CLAUDE_CONFIG_DIR || join(this.home, '.claude'), this.home), 'CLAUDE.md');
-    const codexDir = expandHome(this.env.CODEX_HOME || join(this.home, '.codex'), this.home);
+    const claude = join(
+      expandHome(this.env.CLAUDE_CONFIG_DIR || join(this.home, '.claude'), this.home, this.platform),
+      'CLAUDE.md',
+    );
+    const codexDir = expandHome(this.env.CODEX_HOME || join(this.home, '.codex'), this.home, this.platform);
     let codex = join(codexDir, 'AGENTS.md');
     try {
       if ((await this.read(join(codexDir, 'AGENTS.override.md'))).trim()) codex = join(codexDir, 'AGENTS.override.md');
@@ -91,7 +104,10 @@ export class CodingAgentsService {
       // An unreadable override must produce a per-agent error, never an install into the shadowed base file.
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') codex = join(codexDir, 'AGENTS.override.md');
     }
-    const grok = join(expandHome(this.env.GROK_HOME || join(this.home, '.grok'), this.home), 'AGENTS.md');
+    const grok = join(
+      expandHome(this.env.GROK_HOME || join(this.home, '.grok'), this.home, this.platform),
+      'AGENTS.md',
+    );
     this.rows.get('claude')!.path = claude;
     this.rows.get('codex')!.path = codex;
     this.rows.get('grok')!.path = grok;
@@ -116,7 +132,7 @@ export class CodingAgentsService {
         const before = await this.read(row.path);
         const block = findManagedBlock(before);
         if (block === 'invalid') throw new Error(INVALID_BLOCK);
-        const managed = managedBlock(this.command!);
+        const managed = managedBlock(this.command!, this.platform);
         const after = block
           ? before.slice(0, block.start) + managed + before.slice(block.end)
           : `${before}${before && !before.endsWith('\n') ? '\n' : ''}${before ? '\n' : ''}${managed}\n`;
@@ -154,8 +170,10 @@ export class CodingAgentsService {
       try {
         if (!this.options.prepareCommand) throw new Error('Open the updated mlx-node app to set up its command.');
         command = await this.options.prepareCommand();
-        if (!command.startsWith('/')) throw new Error('The app command must use an absolute path.');
-        delegationCommand(command);
+        if (!isAbsoluteCommandPath(command, this.platform)) {
+          throw new Error('The app command must use an absolute path.');
+        }
+        delegationCommand(command, this.platform);
       } catch (error) {
         command = null;
         commandError =
@@ -179,7 +197,7 @@ export class CodingAgentsService {
         const block = findManagedBlock(text);
         if (block === 'invalid') Object.assign(row, { status: 'error', detail: INVALID_BLOCK });
         else if (!block) Object.assign(row, { status: 'not-installed', detail: null });
-        else if (text.slice(block.start, block.end) === managedBlock(command))
+        else if (text.slice(block.start, block.end) === managedBlock(command, this.platform))
           Object.assign(row, {
             status: 'installed',
             detail: 'GitHub delegation is configured. Start a new agent session to load the instructions.',
@@ -200,7 +218,7 @@ export class CodingAgentsService {
     return {
       model: this.model,
       command: this.command,
-      block: this.command !== null ? managedBlock(this.command) : null,
+      block: this.command !== null ? managedBlock(this.command, this.platform) : null,
       available: this.model !== null && this.command !== null,
       unavailableReason: this.unavailableReason,
       agents: [...this.rows.values()].map((row) => ({ ...row })),
@@ -210,7 +228,7 @@ export class CodingAgentsService {
   private async read(path: string): Promise<string> {
     try {
       // O_NONBLOCK keeps a FIFO at the instruction path from hanging the control panel.
-      const file = await open(path, constants.O_RDONLY | constants.O_NONBLOCK);
+      const file = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
       try {
         if (!(await file.stat()).isFile()) throw new Error('The instruction path must point to a regular file.');
         return await file.readFile('utf8');
@@ -218,7 +236,9 @@ export class CodingAgentsService {
         await file.close();
       }
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
+      const code = (error as NodeJS.ErrnoException).code;
+      if (code === 'ENOENT') return '';
+      if (code === 'EISDIR') throw new Error('The instruction path must point to a regular file.');
       throw error;
     }
   }

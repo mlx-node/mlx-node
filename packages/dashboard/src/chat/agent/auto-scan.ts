@@ -9,7 +9,7 @@
  */
 
 import { KEY_VARIABLES, type WorkPlace } from './command-flags.js';
-import { rootText } from './roots.js';
+import { isWinPath, rootText } from './roots.js';
 
 /** A path the disk check must follow, in the order the command uses it. `part` is the simple command's index. */
 export type PathCheck =
@@ -2118,6 +2118,12 @@ function scanRun(
   const meter: Meter = { steps: 0, budget };
   const dirs: string[][] = [];
   try {
+    if (isWinPath(place.cwd)) {
+      scan.unread = true;
+      scan.checks = null;
+      scan.targets = null;
+      return { scan, dirs: [] };
+    }
     const parts = lex(command, meter);
     const ctx: Ctx = {
       place,

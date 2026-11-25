@@ -4560,9 +4560,11 @@ pub(crate) fn take_state_unit<T: DFlash2Target>(target: &mut T, key: &UnitKey) -
             });
             StateTake::Took
         }
-        UnitKey::Owner(_) | UnitKey::Extent | UnitKey::DeadLeaves | UnitKey::Vision(_) => {
-            StateTake::Nothing
-        }
+        UnitKey::Owner(_)
+        | UnitKey::Extent
+        | UnitKey::DeadLeaves
+        | UnitKey::Vision(_)
+        | UnitKey::DraftContext(_) => StateTake::Nothing,
     }
 }
 

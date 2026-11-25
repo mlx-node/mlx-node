@@ -153,6 +153,8 @@ Run mlx launch <subcommand> --help for more information.
 }
 
 main().catch((error) => {
-  console.error(error);
+  // The message of this error is a full sentence for the user; a stack adds nothing.
+  if (error instanceof Error && error.name === 'ModelsDirUnavailableError') console.error(error.message);
+  else console.error(error);
   process.exit(1);
 });

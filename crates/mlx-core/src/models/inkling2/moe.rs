@@ -390,17 +390,41 @@ impl Inkling2MoE {
         mlp_post_histories: &mut [&mut MxArray],
         cu_seqlens_q: &[usize],
         cu_seqlens_arr: Option<&MxArray>,
-        mut mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
+        mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
     ) -> Result<MxArray> {
-        let shape = x.shape()?;
-        if shape.len() != 2 {
+        self.forward_fused_residual_taped_tree(
+            x,
+            residual,
+            mlp_post_histories,
+            cu_seqlens_q,
+            cu_seqlens_arr,
+            mlp_post_tapes,
+            None,
+        )
+    }
+
+    /// Tree-aware variant of [`Self::forward_fused_residual_taped`], routing `tree_rows` into
+    /// fused `inkling2_grouped_moe_fused_tree` (when per-sequence `len <= 16`) and fallback
+    /// `fused_short_conv_ragged_residual_taped_tree`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward_fused_residual_taped_tree(
+        &self,
+        x: &MxArray,
+        residual: Option<&MxArray>,
+        mlp_post_histories: &mut [&mut MxArray],
+        cu_seqlens_q: &[usize],
+        cu_seqlens_arr: Option<&MxArray>,
+        mut mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
+        tree_rows: Option<&MxArray>,
+    ) -> Result<MxArray> {
+        if x.ndim()? != 2 {
             return Err(Error::from_reason(format!(
                 "Inkling2MoE::forward_fused: expected 2D [T, D], got {:?}",
-                shape.as_ref()
+                x.shape()?.as_ref()
             )));
         }
-        let t = shape[0];
-        let d = shape[1];
+        let t = x.shape_at(0)?;
+        let d = x.shape_at(1)?;
         let k = self.top_k as i64;
         let inter = self.intermediate_size as i64;
         let act_dtype = x.dtype()?;
@@ -431,6 +455,7 @@ impl Inkling2MoE {
                 mlp_post_histories,
                 cu_seqlens_q,
                 mlp_post_tapes.as_deref_mut(),
+                tree_rows,
             )?
         {
             return Ok(y);
@@ -458,6 +483,7 @@ impl Inkling2MoE {
                 mlp_post_histories,
                 cu_seqlens_q,
                 mlp_post_tapes.as_deref_mut(),
+                tree_rows,
             )?
         {
             return Ok(y);
@@ -581,7 +607,7 @@ impl Inkling2MoE {
         };
 
         // 5. Post-MoE fused static ShortConv (k = 4) + optional FP32 residual epilogue & rollback tape
-        super::short_conv::fused_short_conv_ragged_residual_taped(
+        super::short_conv::fused_short_conv_ragged_residual_taped_tree(
             &moe_out,
             &self.post_conv,
             None,
@@ -591,6 +617,7 @@ impl Inkling2MoE {
             cu_seqlens_q,
             cu_seqlens_arr,
             mlp_post_tapes,
+            tree_rows,
         )
     }
 
@@ -772,9 +799,8 @@ impl Inkling2MoE {
         if !down_scale_folded || x.dtype()? != DType::BFloat16 {
             return Ok(None);
         }
-        let shape = x.shape()?;
-        let t = shape[0] as usize;
-        let d = shape[1] as usize;
+        let t = x.shape_at(0)? as usize;
+        let d = x.shape_at(1)? as usize;
         if t == 0
             || t > 8192
             || d < 64
@@ -833,13 +859,13 @@ impl Inkling2MoE {
         mlp_post_histories: &mut [&mut MxArray],
         cu_seqlens_q: &[usize],
         mut mlp_post_tapes: Option<&mut [&mut Option<super::short_conv::StreamShortConvTape>]>,
+        tree_rows: Option<&MxArray>,
     ) -> Result<Option<MxArray>> {
         if x.dtype()? != DType::BFloat16 {
             return Ok(None);
         }
-        let shape = x.shape()?;
-        let t = shape[0] as usize;
-        let d = shape[1] as usize;
+        let t = x.shape_at(0)? as usize;
+        let d = x.shape_at(1)? as usize;
         let num_seqs = mlp_post_histories.len();
         if num_seqs == 0
             || cu_seqlens_q.len() != num_seqs + 1
@@ -847,6 +873,9 @@ impl Inkling2MoE {
             || cu_seqlens_q.last() != Some(&t)
             || !cu_seqlens_q.windows(2).all(|w| w[1] > w[0])
         {
+            return Ok(None);
+        }
+        if tree_rows.is_some() && !cu_seqlens_q.windows(2).all(|w| w[1] - w[0] <= 16) {
             return Ok(None);
         }
         if t == 0
@@ -887,7 +916,7 @@ impl Inkling2MoE {
         };
 
         let emit_tape = mlp_post_tapes.is_some();
-        let (y, hist_out, tape_out) = super::kernels::inkling2_grouped_moe_fused(
+        let (y, hist_out, tape_out) = super::kernels::inkling2_grouped_moe_fused_tree(
             x,
             router_input,
             self.router_bias_f32.as_ref(),
@@ -914,6 +943,7 @@ impl Inkling2MoE {
             true,
             emit_tape,
             router_input_is_weight,
+            tree_rows,
         )?;
 
         if let Some(ref mut tapes) = mlp_post_tapes

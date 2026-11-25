@@ -1,5 +1,5 @@
 /** Read GGUF metadata without linking the native addon or loading tensor weights. */
-import { constants } from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync } from 'node:fs';
 import { open, type FileHandle } from 'node:fs/promises';
 
 const MAX_GGUF_LENGTH = 256 * 1024 * 1024;
@@ -24,6 +24,18 @@ const MAX_HEADER_COUNT = 16384;
 /** Splash `install/hub.py` `HubRepo.open` block size: a header costs a few range reads. */
 const HUB_READ_BYTES = 8 * 1024 * 1024;
 
+/** Refuses a header that counts more keys or tensors than {@link MAX_HEADER_COUNT}, as the native parser does. */
+function checkHeaderCounts(tensors: number, keys: number): void {
+  if (tensors > MAX_HEADER_COUNT || keys > MAX_HEADER_COUNT) {
+    throw new Error(`implausible GGUF header counts: ${tensors} tensors, ${keys} keys`);
+  }
+}
+
+/** Refuses a header read past {@link MAX_HEADER_BYTES}. */
+function checkHeaderEnd(position: number): void {
+  if (position > MAX_HEADER_BYTES) throw new Error(`GGUF header exceeds ${MAX_HEADER_BYTES} bytes`);
+}
+
 /** `length` bytes of the source from `position` (fewer only at its end). */
 export type GgufByteSource = (position: number, length: number) => Promise<Uint8Array>;
 
@@ -35,7 +47,6 @@ abstract class HeaderCursor {
     protected readonly read: GgufByteSource,
     protected readonly size: number,
     protected readonly chunk: number,
-    private readonly limit = Number.POSITIVE_INFINITY,
   ) {}
 
   /** Bytes `[position, position + length)`, already bounds-checked by `skip`. */
@@ -46,7 +57,7 @@ abstract class HeaderCursor {
       throw new Error('Truncated or oversized GGUF metadata');
     }
     this.position += length;
-    if (this.position > this.limit) throw new Error(`GGUF header exceeds ${this.limit} bytes`);
+    checkHeaderEnd(this.position);
   }
 
   async bytes(length: number): Promise<Buffer> {
@@ -163,14 +174,12 @@ function fileSource(file: FileHandle): GgufByteSource {
  * 16384 keys and 16384 tensors, 128 MiB in all; reads of `chunk` bytes.
  */
 export async function readGgufHeader(read: GgufByteSource, size: number, chunk = HUB_READ_BYTES): Promise<Uint8Array> {
-  const reader = new HeaderReader(read, size, chunk, MAX_HEADER_BYTES);
+  const reader = new HeaderReader(read, size, chunk);
   if ((await reader.bytes(4)).toString() !== 'GGUF') throw new Error('Not a GGUF file');
   if ((await reader.u32()) < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
   const tensors = await reader.u64();
   const keys = await reader.u64();
-  if (tensors > MAX_HEADER_COUNT || keys > MAX_HEADER_COUNT) {
-    throw new Error(`implausible GGUF header counts: ${tensors} tensors, ${keys} keys`);
-  }
+  checkHeaderCounts(tensors, keys);
   for (let index = 0; index < keys; index++) {
     reader.skip(await reader.length());
     await reader.skipValue(await reader.u32());
@@ -207,8 +216,9 @@ export async function readGgufSourceArchitecture(
   const reader = new WindowReader(read, size, chunk);
   if ((await reader.bytes(4)).toString() !== 'GGUF') throw new Error('Not a GGUF file');
   if ((await reader.u32()) < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
-  await reader.u64(); // Tensor count: discovery only needs the metadata section.
+  const tensors = await reader.u64();
   const count = await reader.u64();
+  checkHeaderCounts(tensors, count);
   let architecture: string | undefined;
   const keys = new Set<string>();
   for (let index = 0; index < count; index++) {
@@ -225,4 +235,111 @@ export async function readGgufSourceArchitecture(
   }
   if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
   return architecture;
+}
+
+/**
+ * {@link HeaderCursor} for a caller that cannot wait: the same checks, over a descriptor read with `readSync` through
+ * one `chunk`-byte window.
+ */
+class SyncWindowReader {
+  position = 0;
+  private window: Buffer = Buffer.alloc(0);
+  private start = 0;
+
+  constructor(
+    private readonly fd: number,
+    private readonly size: number,
+    private readonly chunk: number,
+  ) {}
+
+  skip(length: number): void {
+    if (!Number.isSafeInteger(length) || length < 0 || length > this.size - this.position) {
+      throw new Error('Truncated or oversized GGUF metadata');
+    }
+    this.position += length;
+    checkHeaderEnd(this.position);
+  }
+
+  bytes(length: number): Buffer {
+    const position = this.position;
+    this.skip(length);
+    if (length > MAX_GGUF_LENGTH) throw new Error('GGUF string exceeds maximum length');
+    const end = position + length;
+    if (position < this.start || end > this.start + this.window.length) {
+      const window = Buffer.alloc(Math.min(Math.max(this.chunk, length), this.size - position));
+      let at = 0;
+      while (at < window.length) {
+        const read = readSync(this.fd, window, at, window.length - at, position + at);
+        if (read === 0) break;
+        at += read;
+      }
+      if (position + at < end) throw new Error('Truncated GGUF metadata');
+      this.window = window.subarray(0, at);
+      this.start = position;
+    }
+    return this.window.subarray(position - this.start, end - this.start);
+  }
+
+  u32(): number {
+    return this.bytes(4).readUInt32LE();
+  }
+  u64(): number {
+    const value = this.bytes(8).readBigUInt64LE();
+    if (value > BigInt(Number.MAX_SAFE_INTEGER)) throw new Error('Oversized GGUF metadata length');
+    return Number(value);
+  }
+  length(): number {
+    const length = this.u64();
+    if (length > MAX_GGUF_LENGTH) throw new Error('GGUF metadata exceeds maximum length');
+    return length;
+  }
+  string(): string {
+    return new TextDecoder('utf-8', { fatal: true }).decode(this.bytes(this.length()));
+  }
+
+  skipValue(type: number, depth = 0): void {
+    const size = SCALAR_BYTES.get(type);
+    if (size !== undefined) return this.skip(size);
+    if (type === 8) return this.skip(this.length());
+    if (type !== 9 || depth > 16) throw new Error('Unsupported GGUF metadata type');
+    const element = this.u32();
+    const count = this.length();
+    const elementSize = SCALAR_BYTES.get(element);
+    if (elementSize !== undefined) return this.skip(count * elementSize);
+    if (element !== 8 && element !== 9) throw new Error('Unsupported GGUF array element type');
+    for (let index = 0; index < count; index++) this.skipValue(element, depth + 1);
+  }
+}
+
+/** {@link readGgufArchitecture} without waiting, for a synchronous caller: the same answer and the same refusals. */
+export function readGgufArchitectureSync(path: string): string {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const info = fstatSync(fd);
+    if (!info.isFile()) throw new Error('GGUF path must be a regular file');
+    const reader = new SyncWindowReader(fd, info.size, 64 * 1024);
+    if (reader.bytes(4).toString() !== 'GGUF') throw new Error('Not a GGUF file');
+    if (reader.u32() < 3) throw new Error('Unsupported GGUF version (only v3+ supported)');
+    const tensors = reader.u64();
+    const count = reader.u64();
+    checkHeaderCounts(tensors, count);
+    let architecture: string | undefined;
+    const keys = new Set<string>();
+    for (let index = 0; index < count; index++) {
+      const key = reader.string();
+      if (keys.has(key)) throw new Error(`duplicate GGUF metadata key: ${key}`);
+      keys.add(key);
+      const type = reader.u32();
+      if (key === 'general.architecture') {
+        architecture = type === 8 ? reader.string() : undefined;
+        if (type !== 8) reader.skipValue(type);
+      } else {
+        reader.skipValue(type);
+      }
+    }
+    if (!architecture) throw new Error('GGUF does not declare a non-empty general.architecture');
+    return architecture;
+  } finally {
+    closeSync(fd);
+  }
 }

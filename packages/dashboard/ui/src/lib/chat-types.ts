@@ -24,6 +24,8 @@ export type ChatFailureCode =
   | 'conversation-busy'
   | 'engine-busy'
   | 'slash-text'
+  | 'attachment-refused'
+  | 'pictures-full'
   | 'keychain-unavailable'
   | 'skill-bundle-corrupt';
 /** `message` is fixed text per code, never data from the agent. */
@@ -360,7 +362,8 @@ export interface ChatHostState {
    * The chat models the engine serves. `base` groups the builds of one model (equal strings, letter for letter);
    * `variant` names the build, unique inside its base; `sizeBytes` is the size on disk (every part of a split GGUF), null
    * when unknown; `contextTokens` is the window an agent process last listed for the model (kept on disk, so known
-   * while no agent runs), null before any agent listed one.
+   * while no agent runs), null before any agent listed one. `images`: the model takes pictures, by the loaded model's
+   * own answer while it is in memory, else by its files on disk.
    */
   models: Array<{
     id: string;
@@ -369,6 +372,7 @@ export interface ChatHostState {
     format: 'gguf' | 'mlx';
     contextTokens: number | null;
     sizeBytes: number | null;
+    images: boolean;
   }>;
   /** The resident chat model when one is in `models`, else the first of `models`. */
   defaultModelId: string | null;
@@ -379,6 +383,8 @@ export interface ChatHostState {
     minTag: string;
     versionVerified: boolean;
     install: 'idle' | 'running' | 'failed';
+    /** False when in-app agent installation/updates are unavailable in this build. */
+    canInstall?: boolean;
   };
   modes: { chat: AgentModeState; work: AgentModeState };
   providers: {

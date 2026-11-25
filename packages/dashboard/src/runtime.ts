@@ -17,6 +17,7 @@
  */
 
 import { existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -37,6 +38,7 @@ import { ProvidersService } from './chat/providers/service.js';
 import type { ProviderId } from './chat/providers/types.js';
 import { redactDeep, redactEntry } from './chat/redact.js';
 import { ChatService, webServerScript, type AgentResolution } from './chat/service.js';
+import { readPathEnv } from './chat/skills/cli-check.js';
 import type { AppEnd, ChatHostEvent, ConversationEvent } from './chat/types.js';
 import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
@@ -83,6 +85,11 @@ export interface ChatRuntimeOptions {
   homeDir?: string;
   /** Work: the environment the agent inherits. Default: this process's. Tests and the dev harness pass a throwaway home. */
   baseEnv?: NodeJS.ProcessEnv;
+  /**
+   * Work: the `PATH` a command of the agent gets, for `baseEnv` and `homeDir`. Default: the `PATH` of `baseEnv`. The
+   * Control Panel passes `workCommandPath`, which asks the user's login shell.
+   */
+  workPath?: (base: NodeJS.ProcessEnv, home: string) => string | undefined | Promise<string | undefined>;
   /** Work: the temp roots Auto covers. Default: `/tmp` when the resolver accepts it. Tests pass `[]` or a throwaway root. */
   tempRoots?: readonly AllowedRoot[];
   /** With no window attached for this long, open Work requests are denied. */
@@ -133,6 +140,8 @@ export interface DashboardRuntimeOptions {
   chat?: ChatRuntimeOptions;
   /** System One history file override (tests / dev harness). Default `~/.mlx-node/desktop/systemone-history.json`. */
   systemOneHistoryPath?: string;
+  /** How a cleanup moves an old entry to the Trash. Default `/usr/bin/trash`; tests and the dev harness pass a fake. */
+  moveToTrash?: (path: string) => Promise<void>;
 }
 
 /** One API call, addressed the way `fetch` would address it. */
@@ -314,7 +323,10 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
   });
-  const downloads = new DownloadManager({ modelsDir });
+  const downloads = new DownloadManager({
+    modelsDir,
+    ...(opts.moveToTrash === undefined ? {} : { moveToTrash: opts.moveToTrash }),
+  });
 
   const codingAgents = new CodingAgentsService({
     ...opts.codingAgents,
@@ -330,10 +342,13 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     supervisorPath: opts.supervisorPath ?? desktopSupervisorStatePath(),
     ingest: () => worker.ingest(),
   });
+  const workBase = chatOpts.baseEnv ?? process.env;
+  const workHome = chatOpts.homeDir ?? homedir();
   const providers = new ProvidersService({
     paths,
     secrets: chatOpts.secrets ?? new KeyringSecretStore(),
     baseUrls: chatOpts.providerBaseUrls,
+    workPath: () => (chatOpts.workPath === undefined ? readPathEnv(workBase) : chatOpts.workPath(workBase, workHome)),
   });
   const readEndpoint = chatOpts.readEndpoint ?? (() => readDesktopEndpoint());
   const chat = new ChatService({

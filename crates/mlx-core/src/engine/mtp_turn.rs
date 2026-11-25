@@ -343,7 +343,7 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
     // the next cycle's first MTP draft.
     // The gap between `mtp_cycle` and this floor is the headroom
     // available to algorithmic work.
-    let verify_only_t0 = std::time::Instant::now();
+    let verify_only_t0 = profiler.is_enabled().then(std::time::Instant::now);
     profiler.begin("mtp_verify_dispatch");
     let trace_acceptance = mtp_trace_acceptance();
     let verify_step_res = step.verify_step(&verify_ids, embedding, effective_depth);
@@ -402,7 +402,9 @@ pub(crate) fn run_mtp_cycle<S: MtpStepper>(
         "async_eval verify logits; the hidden slice rides the lazy graph"
     );
     profiler.end();
-    profiler.record_duration("mtp_verify_floor", verify_only_t0.elapsed());
+    if let Some(t0) = verify_only_t0 {
+        profiler.record_duration("mtp_verify_floor", t0.elapsed());
+    }
     let vocab = verify_logits.shape_at(2)?;
 
     // Step 3: per-position accept/reject. Build extended history as
@@ -1712,7 +1714,6 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // drafter state.
         step.begin_cycle(cycle_seed_was_chained && step.committed_history_active());
         profiler.begin("mtp_cycle");
-        let cycle_started_at = std::time::Instant::now();
         let commit_anchor = if cycle_seed_was_chained && step.committed_history_active() {
             MtpCommitAnchor::SkipAlreadyCommittedAnchor
         } else {
@@ -1729,6 +1730,13 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         };
         let cut = tracker.thinking_cut();
         let replaced = cut.as_ref().map_or(0, |c| c.replaced(cycle_depth));
+        let measure_throughput_cycle = p.mtp_adaptive_depth
+            && replaced == 0
+            && matches!(
+                mtp_adaptive_depth_mode,
+                crate::engine::adaptive_depth::AdaptiveDepthMode::Throughput
+            );
+        let cycle_started_at = measure_throughput_cycle.then(std::time::Instant::now);
         let cycle_res = run_mtp_cycle(
             &mut step,
             prev_h,
@@ -1758,20 +1766,12 @@ pub(crate) fn run_mtp_turn<B: MtpBackend, R: rand::Rng>(
         // EOS / length / cancel). `committed` is the number
         // of tokens the cycle actually produced (drafts accepted +
         // residual/bonus); range `[1, depth+1]`.
-        let cycle_wall_ns: u64 = cycle_started_at
-            .elapsed()
-            .as_nanos()
-            .min(u128::from(u64::MAX)) as u64;
         let cycle_committed: u32 = outcome.tokens.len() as u32;
         // A cycle whose proposals are end tokens says nothing about the
         // drafter.
-        if p.mtp_adaptive_depth
-            && replaced == 0
-            && matches!(
-                mtp_adaptive_depth_mode,
-                crate::engine::adaptive_depth::AdaptiveDepthMode::Throughput
-            )
-        {
+        if let Some(started_at) = cycle_started_at {
+            let cycle_wall_ns: u64 =
+                started_at.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64;
             mtp_depth_policy.record_cycle(crate::engine::adaptive_depth::CycleStats {
                 depth: outcome.effective_depth as u8,
                 committed: cycle_committed,

@@ -15,10 +15,10 @@ import {
   CONTROL_PANEL_PICK_FOLDER_CHANNEL,
   CONTROL_PANEL_READY_CHANNEL,
   CONTROL_PANEL_URL,
-  TRAFFIC_LIGHT_POSITION,
   classifyNavigation,
   createFolderPicker,
   windowBackground,
+  windowChromeOptions,
 } from './window-policy.js';
 
 /** Below this the dashboard's own layout collapses; the user cannot recover it by dragging. */
@@ -35,6 +35,8 @@ const BOUNDS_SAVE_DEBOUNCE_MS = 500;
 export interface ControlPanelWindowOptions {
   /** Absolute path to `dist/preload/index.cjs`. */
   preload: string;
+  /** Optional window icon path (`icon.ico` on Windows; omitted/null on macOS). */
+  windowIcon?: string | null;
   /**
    * Where to put the window. Read at each create, not captured: the window is
    * destroyed and rebuilt if its renderer dies, and it must come back where the
@@ -141,11 +143,11 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       minWidth: MIN_WIDTH,
       minHeight: MIN_HEIGHT,
       title: 'mlx-node',
+      ...(options.windowIcon ? { icon: options.windowIcon } : {}),
       // Painted before the SPA's first frame; without it the window opens as a
       // white flash even in dark mode.
       backgroundColor: windowBackground(nativeTheme.shouldUseDarkColors),
-      titleBarStyle: 'hiddenInset',
-      trafficLightPosition: TRAFFIC_LIGHT_POSITION,
+      ...windowChromeOptions(process.platform),
       // Shown from `ready-to-show` instead, so the first thing the user sees is
       // rendered content rather than an empty frame.
       show: false,

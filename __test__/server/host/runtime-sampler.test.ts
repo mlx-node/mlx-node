@@ -188,25 +188,30 @@ async function flushIo(): Promise<void> {
 }
 
 /**
- * Wait until the live body built at time `builtAt` is on disk. The write runs on
- * the thread pool, and a tick that finds a write still in flight writes nothing,
- * so reading or advancing the clock before it lands sees a stale file.
+ * Wait until the live body built at time `builtAt` is on disk and the sampler's write has settled. The file shows on
+ * disk before the write's promise settles, and a tick that finds a write still in flight writes nothing, so a clock
+ * advance in that window leaves a stale file.
  */
-async function liveLanded(file: string, builtAt: number | null): Promise<void> {
+async function liveLanded(sampler: RuntimeSampler | null, file: string, builtAt: number | null): Promise<void> {
+  const inFlight = () => (sampler as unknown as { liveWrite: Promise<void> | null } | null)?.liveWrite ?? null;
   const deadline = performance.now() + 10_000;
   for (;;) {
+    const write = inFlight();
+    if (write !== null) {
+      await write;
+      continue;
+    }
     let ts: number | null = null;
     try {
       ts = (JSON.parse(readFileSync(file, 'utf8')) as RuntimeLiveFile).ts;
     } catch {
       // not written yet
     }
-    if (ts !== null && ts === builtAt) break;
+    if (ts !== null && ts === builtAt) return;
     if (performance.now() > deadline)
       throw new Error(`live file never reached ts ${String(builtAt)}; last ${String(ts)}`);
     await new Promise((resolve) => setImmediate(resolve));
   }
-  await new Promise((resolve) => setImmediate(resolve));
 }
 
 describe('runtime sampler', () => {
@@ -232,7 +237,7 @@ describe('runtime sampler', () => {
 
   /** When the sampler last built a live body: only that build reads `host.persistPagedCache`. */
   let liveBuiltAt: number | null = null;
-  const landed = () => liveLanded(join(dir, `live-${process.pid}.json`), liveBuiltAt);
+  const landed = () => liveLanded(sampler, join(dir, `live-${process.pid}.json`), liveBuiltAt);
   const readLive = () => JSON.parse(readFileSync(join(dir, `live-${process.pid}.json`), 'utf8')) as RuntimeLiveFile;
 
   function start(entries: ResidentModel[], overrides: Partial<RuntimeSamplerDeps> = {}) {
@@ -465,6 +470,7 @@ describe('runtime sampler', () => {
         pool: null,
         stateNamespace: null,
         experts: null,
+        images: false,
       },
     ]);
     expect(live.turns).toEqual([
@@ -575,6 +581,22 @@ describe('runtime sampler', () => {
       null,
       null,
     ]);
+  });
+
+  // MUTATION: any answer of the method counts as yes -> the 'no' row goes red.
+  it("each model row carries the loaded model's own supportsImages() answer", async () => {
+    const sees = fakeBinding();
+    (sees.entry.model as { supportsImages?: () => boolean }).supportsImages = () => true;
+    const blind = fakeBinding();
+    (blind.entry.model as { supportsImages?: () => boolean }).supportsImages = () => false;
+    const broken = fakeBinding();
+    (broken.entry.model as { supportsImages?: () => boolean }).supportsImages = () => {
+      throw new Error('gone');
+    };
+    const plain = fakeBinding();
+    start([sees.entry, blind.entry, broken.entry, plain.entry]);
+    await landed();
+    expect(readLive().models.map((model) => model.images)).toEqual([true, false, null, false]);
   });
 
   // MUTATION: `streaming: snapshot.residency === 'direct'` -> the partial row says false -> red.
@@ -723,6 +745,211 @@ describe('runtime sampler', () => {
     finishStream();
     while (!(await stream.next()).done) {
       // drains
+    }
+  });
+
+  it('smooths live decodeTps over a 5 s sliding window and stays null during prefill', async () => {
+    let generated = 0;
+    let phase: 'prefill' | 'decode' = 'prefill';
+    let finishStream!: () => void;
+    const streamGate = new Promise<void>((resolve) => {
+      finishStream = resolve;
+    });
+    const inner = {
+      chatStreamSessionStart: vi.fn(async function* (
+        _messages: unknown,
+        _config: unknown,
+        _signal: unknown,
+        ref?: { read: (() => unknown) | null },
+      ) {
+        if (ref)
+          ref.read = () => ({
+            phase,
+            prefillTotal: 100,
+            prefillDone: phase === 'decode' ? 100 : 50,
+            cachedTokens: 0,
+            generatedTokens: generated,
+          });
+        try {
+          yield { text: 'a', done: false as const };
+          await streamGate;
+          yield {
+            text: '',
+            done: true as const,
+            finishReason: 'stop',
+            toolCalls: [],
+            numTokens: generated,
+            promptTokens: 100,
+          };
+        } finally {
+          if (ref) ref.read = null;
+        }
+      }),
+      resetCaches: vi.fn(),
+    } as unknown as SessionCapableModel;
+    const traced = new TurnTraceModel(inner, {
+      modelName: 'm',
+      trace: { record: () => {} },
+      coldStats: () => undefined,
+      sidecarStats: () => undefined,
+      memory: () => undefined,
+      watermarks: { cold: {}, sidecar: {} },
+    });
+    const entry = {
+      names: ['m'],
+      model: {},
+      sessions: {
+        liveTurns: () => traced.liveTurns(),
+        turnStats: () => traced.turnStats(),
+        activeDispatches: 0,
+        queueDepth: 0,
+        queueDepthLimit: undefined,
+        concurrentAdmissionLimit: 2,
+        identity: undefined,
+      },
+    } as unknown as ResidentModel;
+    start([entry]);
+    await landed();
+
+    const stream = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await stream.next();
+    // 3 s of prefill (0 tokens) must stay null and must not dilute decode rate once tokens arrive.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await landed();
+      expect(readLive().decodeTps).toBeNull();
+    }
+
+    // Alternating 40 / 0 token bursts every second smooth to ~20 tok/s over the 5 s window (never dropping to null/0).
+    phase = 'decode';
+    const deltas = [40, 0, 40, 0, 40, 0];
+    const rates: Array<number | null> = [];
+    for (const d of deltas) {
+      generated += d;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await landed();
+      rates.push(readLive().decodeTps);
+    }
+    expect(rates[0]).toBe(40);
+    // Steady 5 s window covers 3*40 + 2*0 = 120 or 2*40 + 3*0 = 80 over 5 s => 16..24, never 0 or null.
+    expect(rates.every((r) => r !== null && r > 0)).toBe(true);
+    expect(rates.at(-1)!).toBeGreaterThanOrEqual(16);
+    expect(rates.at(-1)!).toBeLessThanOrEqual(24);
+
+    finishStream();
+    while (!(await stream.next()).done) {
+      // drains
+    }
+  });
+
+  it('clears live decodeTps immediately when a new turn enters prefill without an idle tick in between', async () => {
+    const turns: Array<{ phase: 'prefill' | 'decode'; generated: number; finish: () => void }> = [];
+    const inner = {
+      chatStreamSessionStart: vi.fn(async function* (
+        _messages: unknown,
+        _config: unknown,
+        _signal: unknown,
+        ref?: { read: (() => unknown) | null },
+      ) {
+        let finish!: () => void;
+        const gate = new Promise<void>((resolve) => {
+          finish = resolve;
+        });
+        const state = {
+          phase: (turns.length === 0 ? 'decode' : 'prefill') as 'prefill' | 'decode',
+          generated: 0,
+          finish,
+        };
+        turns.push(state);
+        if (ref)
+          ref.read = () => ({
+            phase: state.phase,
+            prefillTotal: 100,
+            prefillDone: state.phase === 'decode' ? 100 : 50,
+            cachedTokens: 0,
+            generatedTokens: state.generated,
+          });
+        try {
+          yield { text: 'a', done: false as const };
+          await gate;
+          yield {
+            text: '',
+            done: true as const,
+            finishReason: 'stop',
+            toolCalls: [],
+            numTokens: state.generated,
+            promptTokens: 100,
+          };
+        } finally {
+          if (ref) ref.read = null;
+        }
+      }),
+      resetCaches: vi.fn(),
+    } as unknown as SessionCapableModel;
+    const traced = new TurnTraceModel(inner, {
+      modelName: 'm',
+      trace: { record: () => {} },
+      coldStats: () => undefined,
+      sidecarStats: () => undefined,
+      memory: () => undefined,
+      watermarks: { cold: {}, sidecar: {} },
+    });
+    const entry = {
+      names: ['m'],
+      model: {},
+      sessions: {
+        liveTurns: () => traced.liveTurns(),
+        turnStats: () => traced.turnStats(),
+        activeDispatches: 0,
+        queueDepth: 0,
+        queueDepthLimit: undefined,
+        concurrentAdmissionLimit: 2,
+        identity: undefined,
+      },
+    } as unknown as ResidentModel;
+    start([entry]);
+    await landed();
+
+    // Turn 1 decodes at 20 tok/s over 3 s.
+    const stream1 = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await stream1.next();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await landed();
+    for (let i = 0; i < 3; i++) {
+      turns[0]!.generated += 20;
+      await vi.advanceTimersByTimeAsync(1_000);
+      await landed();
+    }
+    expect(readLive().decodeTps).toBe(20);
+
+    // Between heartbeats (no idle tick with inFlight === 0): Turn 1 finishes and Turn 2 enters prefill.
+    turns[0]!.generated += 5;
+    turns[0]!.finish();
+    while (!(await stream1.next()).done) {
+      // drains Turn 1
+    }
+    const stream2 = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await stream2.next();
+
+    // Subsequent ticks with 0 new tokens during Turn 2's prefill must immediately report null.
+    for (let i = 0; i < 2; i++) {
+      await vi.advanceTimersByTimeAsync(1_000);
+      await landed();
+      expect(readLive().turns).toHaveLength(1);
+      expect(readLive().turns[0]!.phase).toBe('prefill');
+      expect(readLive().decodeTps).toBeNull();
+    }
+
+    // Once Turn 2 begins decoding, decodeTps reflects Turn 2's own rate without carryover or prefill dilution.
+    turns[1]!.phase = 'decode';
+    turns[1]!.generated += 30;
+    await vi.advanceTimersByTimeAsync(1_000);
+    await landed();
+    expect(readLive().decodeTps).toBe(30);
+
+    turns[1]!.finish();
+    while (!(await stream2.next()).done) {
+      // drains Turn 2
     }
   });
 

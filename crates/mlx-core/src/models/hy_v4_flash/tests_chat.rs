@@ -13,7 +13,7 @@ use napi::Result;
 
 use super::chat::{
     Conv, EOS, HY_START, MTP_DEPTH_MAX, PREFILL_CANCELLED, TEMPERATURE, TOP_P, assistant_open,
-    check_eos, generation_defaults, resolve,
+    check_eos, generation_defaults, resolve, resolve_with_residency,
 };
 use super::ladder::Kind;
 use super::prefill::{Grid, Seq};
@@ -123,6 +123,23 @@ fn sampling_defaults_and_mtp_depth_clamp() {
         (Some(0.0), Some(0.5)),
         "the request wins"
     );
+
+    // Direct/mmap residency defaults mtp_depth to MTP_DEPTH_MAX (3) unless explicitly overridden.
+    assert_eq!(
+        resolve_with_residency(&ChatConfig::default(), &d, true).mtp_depth,
+        MTP_DEPTH_MAX
+    );
+    assert_eq!(
+        resolve_with_residency(&ChatConfig::default(), &d, false).mtp_depth,
+        1
+    );
+    for (asked, got) in [(1, 1), (2, 2), (3, 3), (9, 3)] {
+        let cfg = ChatConfig {
+            mtp_depth: Some(asked),
+            ..Default::default()
+        };
+        assert_eq!(resolve_with_residency(&cfg, &d, true).mtp_depth, got);
+    }
 }
 
 #[test]

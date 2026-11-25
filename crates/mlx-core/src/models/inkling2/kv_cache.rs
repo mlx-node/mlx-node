@@ -400,6 +400,101 @@ impl Inkling2KVCacheCoordinator {
         .map_err(Error::from_reason)
     }
 
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_extent_grown_for_test(
+        config: &Inkling2Config,
+        kv_format: KvFormat,
+        block_size: u32,
+        max_model_len: u32,
+        max_chunk: u32,
+        max_concurrent_sequences: u32,
+        full_initial_blocks: u32,
+        full_max_blocks: u32,
+        full_extent_blocks: u32,
+        cache_recency: Arc<CacheRecency>,
+    ) -> Result<Self> {
+        let (specs, groups) =
+            compute_visit_kv_cache_groups(config, block_size, kv_format, max_model_len, max_chunk)
+                .map_err(Error::from_reason)?;
+        let (metal_dtype, page_layout, kv_dtype) = kv_format_metal_layout(kv_format);
+        let mut adapters = Vec::with_capacity(groups.len());
+        for group in &groups {
+            let (initial_blocks, max_blocks) = match group.attention_kind {
+                AttentionKind::Full => (full_initial_blocks, full_max_blocks),
+                AttentionKind::SlidingWindow { .. } => {
+                    let b = group_reserved_blocks(
+                        group.attention_kind,
+                        group.max_admission_blocks,
+                        max_concurrent_sequences,
+                        block_size,
+                    );
+                    (b, b)
+                }
+            };
+            let num_layers = u32::try_from(group.physical_layer_indices.len())
+                .map_err(|_| Error::from_reason("Inkling2 KV group layer count overflows u32"))?;
+            let pa_config = PagedAttentionConfig {
+                block_size,
+                gpu_memory_mb: MIN_POOL_MEMORY_MB as u32,
+                head_size: group.physical_layout.head_size,
+                num_kv_heads: group.physical_layout.num_kv_heads,
+                num_layers,
+                max_seq_len: Some(max_model_len),
+                max_batch_size: Some(max_concurrent_sequences),
+            };
+            let allocator =
+                match group.attention_kind {
+                    AttentionKind::Full => Arc::new(Mutex::new(BlockAllocator::with_recency(
+                        initial_blocks,
+                        max_blocks,
+                        block_size,
+                        Arc::clone(&cache_recency),
+                    ))),
+                    AttentionKind::SlidingWindow { .. } => Arc::new(Mutex::new(
+                        BlockAllocator::new(initial_blocks, max_blocks, block_size),
+                    )),
+                };
+            let pool = LayerKVPool::new_with_layout(
+                pa_config,
+                initial_blocks,
+                max_blocks,
+                metal_dtype,
+                page_layout,
+            )
+            .map_err(Error::from_reason)?;
+            let mut adapter = match group.attention_kind {
+                AttentionKind::Full => {
+                    PagedKVCacheAdapter::new(allocator, Arc::new(pool), block_size)
+                }
+                AttentionKind::SlidingWindow { sliding_window } => {
+                    PagedKVCacheAdapter::new_sliding(
+                        allocator,
+                        Arc::new(pool),
+                        block_size,
+                        sliding_window,
+                        max_model_len,
+                    )
+                }
+            }
+            .map_err(Error::from_reason)?;
+            if matches!(group.attention_kind, AttentionKind::Full) && initial_blocks < max_blocks {
+                adapter.set_extent_growth(full_extent_blocks.max(1));
+            }
+            adapters.push(adapter);
+        }
+        Self::from_adapters(
+            &specs,
+            groups,
+            adapters,
+            kv_format,
+            kv_dtype,
+            block_size,
+            max_concurrent_sequences,
+        )
+        .map_err(Error::from_reason)
+    }
+
     /// Construct a new coordinator sized from a unified [`Inkling2PoolPlan`], registering
     /// the Global extent-grown pool with [`Governor`] (`load_pool`), sharing `cache_recency`
     /// with Group 0's `BlockAllocator`, configuring extent growth + memory ceiling + activations,
@@ -572,6 +667,30 @@ impl Inkling2KVCacheCoordinator {
     ) -> std::result::Result<(), String> {
         self.inner
             .restore_sliding_raw_blocks_for(seq_id, prompt_tokens, boundary, raw_blocks)
+    }
+
+    /// Read raw physical SWA blocks covering the live window ending at block-aligned `boundary`
+    /// into one contiguous flat buffer (`live_blocks * num_layers * (key_blob + value_blob)`).
+    pub fn read_sliding_raw_blocks_flat_for(
+        &self,
+        seq_id: u32,
+        boundary: u32,
+    ) -> std::result::Result<Vec<u8>, String> {
+        self.inner
+            .read_sliding_raw_blocks_flat_for(seq_id, boundary)
+    }
+
+    /// Restore raw physical SWA blocks from a contiguous flat buffer into Group 1 at block-aligned
+    /// `boundary`.
+    pub fn restore_sliding_raw_blocks_flat_for(
+        &mut self,
+        seq_id: u32,
+        prompt_tokens: &[u32],
+        boundary: u32,
+        flat_bytes: &[u8],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .restore_sliding_raw_blocks_flat_for(seq_id, prompt_tokens, boundary, flat_bytes)
     }
 
     /// Register Group 0 (8 Global visits) committed blocks up to `boundary` in the prefix cache.
@@ -761,6 +880,30 @@ impl Inkling2KVCacheCoordinator {
         self.inner.patch_last_recorded_tokens_all(seq_id, tokens)
     }
 
+    /// Compact accepted speculative verify-tree KV slots `[anchor + accepted_rows[d]] -> [anchor + d]`
+    /// in-place across both Global (Group 0) and SWA (Group 1) pools.
+    pub fn compact_kv_path_all(
+        &mut self,
+        seq_id: u32,
+        anchor: u32,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .compact_kv_path_all(seq_id, anchor, accepted_rows)
+    }
+
+    /// Compact the trailing `tree_len` recorded token IDs along `accepted_rows` across both KV
+    /// groups without truncating (call immediately before `commit_cycle`).
+    pub fn compact_recorded_tree_tokens_all(
+        &mut self,
+        seq_id: u32,
+        tree_len: usize,
+        accepted_rows: &[usize],
+    ) -> std::result::Result<(), String> {
+        self.inner
+            .compact_recorded_tree_tokens_all(seq_id, tree_len, accepted_rows)
+    }
+
     /// Reserve speculative lookahead rows atomically across every KV group (all or none).
     pub fn reserve_rows_all(&mut self, seq_id: u32, rows: u32) -> std::result::Result<u32, String> {
         self.inner.reserve_rows_all(seq_id, rows)
@@ -824,6 +967,140 @@ impl Inkling2KVCacheCoordinator {
     /// Common attention frontier across both Global and SWA groups for `seq_id`.
     pub(crate) fn spec_frontier(&self, seq_id: u32) -> Option<SpecFrontier> {
         self.inner.spec_frontier(seq_id)
+    }
+
+    /// Tightest logical token capacity across all KV groups (Global physical max & SWA logical max).
+    pub(crate) fn max_capacity_tokens(&self) -> u32 {
+        let mut cap = u32::MAX;
+        for gid in 0..self.groups().len() {
+            if let Ok(adapter) = self.adapter(gid) {
+                cap = cap.min(adapter.max_capacity_tokens());
+                if adapter.sliding_window() == 0
+                    && let Ok(tel) = adapter.block_telemetry()
+                {
+                    cap = cap.min(tel.max_total_blocks.saturating_mul(adapter.block_size()));
+                }
+            }
+        }
+        if cap == u32::MAX { 0 } else { cap }
+    }
+
+    /// Whether a sequence of `total_tokens` fits within the hard logical/Global capacity of every
+    /// KV group (independent of transient occupancy by other idle owners).
+    pub(crate) fn can_fit_logical_tokens(&self, total_tokens: u32) -> bool {
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter(gid) else {
+                return false;
+            };
+            if total_tokens > adapter.max_capacity_tokens() {
+                return false;
+            }
+            let bs = adapter.block_size();
+            if bs == 0 {
+                return false;
+            }
+            if adapter.sliding_window() == 0 {
+                let Ok(tel) = adapter.block_telemetry() else {
+                    return false;
+                };
+                if total_tokens.div_ceil(bs) > tel.max_total_blocks {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// Whether advancing `seq_id` to `new_total_tokens` in ONE allocation step fits within the
+    /// hard single-sequence physical capacity of every KV group (accounting for SWA's reserved
+    /// null block and already-pruned blocks on `seq_id`).
+    pub(crate) fn can_fit_single_allocation(&self, seq_id: u32, new_total_tokens: u32) -> bool {
+        if !self.can_fit_logical_tokens(new_total_tokens) {
+            return false;
+        }
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter(gid) else {
+                return false;
+            };
+            if adapter.sliding_window() == 0 {
+                continue;
+            }
+            let bs = adapter.block_size();
+            if bs == 0 {
+                return false;
+            }
+            let Ok(tel) = adapter.block_telemetry() else {
+                return false;
+            };
+            let current_logical_blocks = adapter
+                .block_table_for(seq_id)
+                .map_or(0, |t| t.num_blocks() as u32);
+            let to_allocate = new_total_tokens
+                .div_ceil(bs)
+                .saturating_sub(current_logical_blocks);
+            let held_by_seq = adapter.releasable_blocks_of(&[seq_id]).len() as u32;
+            let usable_max = tel.max_total_blocks.saturating_sub(1);
+            if held_by_seq.saturating_add(to_allocate) > usable_max {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether restoring `live_blocks` raw SWA blocks fits within the sliding pool's physical max
+    /// (excluding the reserved null block).
+    pub(crate) fn can_fit_sliding_raw_blocks(&self, live_blocks: usize) -> bool {
+        let Some(swa) = self.sliding_adapter() else {
+            return true;
+        };
+        let Ok(tel) = swa.block_telemetry() else {
+            return false;
+        };
+        let usable_max = tel.max_total_blocks.saturating_sub(1);
+        u32::try_from(live_blocks).is_ok_and(|n| n <= usable_max)
+    }
+
+    /// Grow any extent-backed KV group whose current pool lacks blocks for `rows` lookahead rows
+    /// past `seq_id`'s cursor (preserving grow-before-reclaim since `reserve_rows_all` pre-flights
+    /// without growing). Returns `true` if at least one group grew.
+    pub(crate) fn try_grow_all_for_rows(&mut self, seq_id: u32, rows: u32) -> bool {
+        let mut grew = false;
+        for gid in 0..self.groups().len() {
+            let Ok(adapter) = self.adapter_mut(gid) else {
+                continue;
+            };
+            let bs = adapter.block_size();
+            if bs == 0 {
+                continue;
+            }
+            let Some(current_tokens) = adapter
+                .request_tokens_for(seq_id)
+                .map(|tokens| tokens.len() as u32)
+            else {
+                continue;
+            };
+            let Some(new_total) = current_tokens.checked_add(rows) else {
+                continue;
+            };
+            let current_blocks = adapter
+                .block_table_for(seq_id)
+                .map_or(0, |table| table.num_blocks() as u32);
+            let needed_blocks = new_total.div_ceil(bs).saturating_sub(current_blocks);
+            if needed_blocks == 0 {
+                continue;
+            }
+            let Ok(tel) = adapter.block_telemetry() else {
+                continue;
+            };
+            let available = tel.free_blocks.saturating_add(tel.evictable_blocks);
+            if needed_blocks > available && tel.total_blocks < tel.max_total_blocks {
+                let shortfall = needed_blocks - available;
+                if adapter.try_grow_pool(shortfall) {
+                    grew = true;
+                }
+            }
+        }
+        grew
     }
 }
 

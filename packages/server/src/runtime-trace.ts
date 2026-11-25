@@ -198,6 +198,8 @@ export interface RuntimeLiveModel {
    * from the SSD; null for a model without `residencyInfo()`.
    */
   experts: { inMemory: number; total: number; streaming: boolean } | null;
+  /** The loaded model's `supportsImages()` is true; false without the method; null when the call threw. */
+  images: boolean | null;
 }
 
 export interface RuntimeLiveTurn {

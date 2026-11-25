@@ -130,5 +130,29 @@ describe('resolveAppPaths', () => {
   // is what makes macOS tint it for light/dark. Both live in the filename.
   it('points at the template icon by its template name', () => {
     expect(resolveAppPaths(DEV).trayIcon).toBe(join(DEV.appPath, 'build/iconTemplate.png'));
+    expect(resolveAppPaths(DEV).windowIcon).toBeNull();
+    expect(resolveAppPaths({ ...PACKAGED, platform: 'darwin' }).trayIcon).toBe(
+      join(PACKAGED.appPath, 'build', 'iconTemplate.png'),
+    );
+    expect(resolveAppPaths({ ...PACKAGED, platform: 'darwin' }).windowIcon).toBeNull();
+  });
+
+  it('uses icon.ico for both tray and window icons on Windows', () => {
+    const windows = resolveAppPaths({
+      appPath: 'C:\\Program Files\\mlx-node\\resources\\app',
+      resourcesPath: 'C:\\Program Files\\mlx-node\\resources',
+      packaged: true,
+      userData: 'C:\\Users\\x\\AppData\\Roaming\\mlx-node',
+      platform: 'win32',
+      arch: 'arm64',
+    });
+    const expected = join('C:\\Program Files\\mlx-node\\resources\\app', 'build', 'icon.ico');
+    expect(windows.trayIcon).toBe(expected);
+    expect(windows.windowIcon).toBe(expected);
+
+    const windowsDev = resolveAppPaths({ ...DEV, platform: 'win32' });
+    const expectedDev = join(DEV.appPath, 'build', 'icon.ico');
+    expect(windowsDev.trayIcon).toBe(expectedDev);
+    expect(windowsDev.windowIcon).toBe(expectedDev);
   });
 });

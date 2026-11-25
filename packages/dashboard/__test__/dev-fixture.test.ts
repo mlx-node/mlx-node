@@ -11,6 +11,7 @@ import {
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -22,8 +23,13 @@ import { afterEach, beforeEach, describe, expect, it } from 'vite-plus/test';
 
 import {
   assertFixtureHome,
+  assertFixtureTree,
   CATALOG_BLOCKED,
   CATALOG_INSTALL,
+  CATALOG_LINK,
+  CATALOG_LOCATED,
+  CATALOG_SECOND_BUILD,
+  CATALOG_UPDATE,
   fixtureArgs,
   fixturePaths,
   FIXTURE_MODELS,
@@ -269,16 +275,19 @@ describe('dev fixture home', () => {
     expect(read(now, { ...flight, chatModels: [] }).turns).toEqual([]);
   });
 
-  it('holds seven models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
+  it('holds ten models, two companions, a skipped folder, a cold cache and 240 cloned sessions', () => {
     writeFixtureHome(home, { now });
     const paths = fixturePaths(home);
     const models = discoverLocalModels(paths.modelsDir);
-    expect(models.models).toHaveLength(7);
+    expect(models.models).toHaveLength(10);
     expect(models.companions).toHaveLength(2);
-    expect([...models.warnings].sort()).toEqual([
-      'partial-download: no readable config.json; skipped',
-      `${CATALOG_BLOCKED.slug}: no readable config.json; skipped`,
-    ]);
+    expect([...models.warnings].sort()).toEqual(
+      [
+        'partial-download: no readable config.json; skipped',
+        `${CATALOG_BLOCKED.slug}: no readable config.json; skipped`,
+        `${CATALOG_LINK.slug}: no readable config.json; skipped`,
+      ].sort(),
+    );
     const cache = scanColdCache(paths.cacheRoot);
     expect(cache.entryCount + cache.sidecarCount).toBe(140);
     expect(cache.sidecarCount).toBeGreaterThan(0);
@@ -306,10 +315,12 @@ describe('dev fixture content for the manage pages', () => {
     ]);
   });
 
-  it('blocks one catalog slug with a one-file leftover that Reinstall can replace', () => {
+  it('blocks one catalog slug with a one-file leftover that a cleanup can replace', () => {
     writeFixtureHome(home, { now });
-    const entry = catalogWithState(fixturePaths(home).modelsDir).find((item) => item.slug === CATALOG_BLOCKED.slug);
-    expect(entry?.blocker).toEqual({
+    const build = catalogWithState(fixturePaths(home).modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_BLOCKED.slug);
+    expect(build?.blocker).toEqual({
       kind: 'directory',
       fileCount: 1,
       sizeBytes: CATALOG_BLOCKED.sizeBytes,
@@ -320,17 +331,86 @@ describe('dev fixture content for the manage pages', () => {
       holdsModel: false,
       linkTarget: null,
       dangling: false,
+      linkToFile: false,
+      locked: false,
     });
   });
 
-  it('installs one catalog entry that reads as installed with an update, with no network', () => {
+  it('makes one catalog slug a link to a folder of model files inside the home, which a cleanup removes alone', () => {
     writeFixtureHome(home, { now });
-    const entry = catalogWithState(fixturePaths(home).modelsDir).find((item) => item.slug === CATALOG_INSTALL.slug);
-    expect(entry?.installed).toBe(true);
-    expect(entry?.localRevision).not.toBeNull();
-    // The marker predates the entry's tokenizer source, which the page reads as an update.
-    expect(entry?.assetsRepo).toBeDefined();
-    expect(entry?.localAssetsRepo).toBeNull();
+    const build = catalogWithState(fixturePaths(home).modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_LINK.slug);
+    expect(build).toMatchObject({ present: false, heldBy: null, blockedByForeignDir: true, listed: false });
+    expect(build?.blocker).toMatchObject({
+      kind: 'symlink',
+      holdsModel: true,
+      linkTarget: realpathSync(join(home, CATALOG_LINK.target)),
+      dangling: false,
+      locked: false,
+    });
+    // A second run over the same home keeps the link and its folder; the tree check accepts both.
+    writeFixtureHome(home, { now });
+    expect(() => assertFixtureTree(home)).not.toThrow();
+  });
+
+  it('holds one catalog slug with a GGUF folder that Update can adopt', () => {
+    writeFixtureHome(home, { now });
+    const builds = catalogWithState(fixturePaths(home).modelsDir).flatMap((item) => item.builds);
+    const build = builds.find((item) => item.slug === CATALOG_UPDATE.slug);
+    expect(build).toMatchObject({ present: false, installed: false, blockedByForeignDir: true });
+    expect(build?.blocker).toMatchObject({ kind: 'directory', fileCount: 4, truncated: false, holdsModel: true });
+    expect(builds.find((item) => item.slug === CATALOG_BLOCKED.slug)?.blocker?.holdsModel).toBe(false);
+  });
+
+  it('installs the first build of one catalog model that reads as installed with an update, with no network', () => {
+    writeFixtureHome(home, { now });
+    const item = catalogWithState(fixturePaths(home).modelsDir).find((entry) =>
+      entry.builds.some((build) => build.slug === CATALOG_INSTALL.slug),
+    );
+    const [first, second] = item?.builds ?? [];
+    expect(first).toMatchObject({
+      slug: CATALOG_INSTALL.slug,
+      id: CATALOG_INSTALL.build,
+      hfRepo: CATALOG_INSTALL.repo,
+    });
+    expect(first?.installed).toBe(true);
+    expect(first?.localRevision).not.toBeNull();
+    // The marker predates the build's tokenizer source, which the page reads as an update.
+    expect(first?.assetsRepo).toBeDefined();
+    expect(first?.localAssetsRepo).toBeNull();
+    // The other build of the repository is in its own folder, at its build's tokenizer source: no update.
+    expect(second).toMatchObject({
+      slug: CATALOG_SECOND_BUILD.slug,
+      id: CATALOG_SECOND_BUILD.build,
+      present: true,
+      installed: true,
+      heldBy: null,
+      blocker: null,
+      localAssetsRepo: CATALOG_SECOND_BUILD.assetsRepo,
+    });
+    expect(second?.assetsRepo).toBe(second?.localAssetsRepo);
+    expect(second?.localAssetsRevision).not.toBeNull();
+  });
+
+  it('holds one catalog model that Locate made from a folder on another disk, with links inside the home', () => {
+    writeFixtureHome(home, { now });
+    writeFixtureHome(home, { now });
+    const modelsDir = fixturePaths(home).modelsDir;
+    const build = catalogWithState(modelsDir)
+      .flatMap((item) => item.builds)
+      .find((item) => item.slug === CATALOG_LOCATED.slug);
+    const source = realpathSync(join(home, CATALOG_LOCATED.source));
+    expect(build).toMatchObject({ present: true, installed: true, blocker: null });
+    expect(build?.located).toEqual({ from: source, mode: 'linked', filesAvailable: true });
+    expect(build?.assetsRepo).toBe(build?.localAssetsRepo);
+    for (const name of CATALOG_LOCATED.weights) {
+      expect(lstatSync(join(modelsDir, CATALOG_LOCATED.slug, name)).isSymbolicLink()).toBe(true);
+    }
+    expect(discoverLocalModels(modelsDir).models.find((model) => model.name === CATALOG_LOCATED.slug)?.located).toEqual(
+      { from: source, mode: 'linked', filesAvailable: true, filesStay: true },
+    );
+    expect(() => assertFixtureTree(home)).not.toThrow();
   });
 
   it('writes a long session with subagents and a live session whose last turn is still running', () => {

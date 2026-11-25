@@ -413,7 +413,7 @@ pub(crate) fn dflash2_file_bytes(path: &Path) -> Result<u64> {
 
 pub(crate) fn load_dflash2(path: &Path) -> Result<(DFlash2Model, u64)> {
     let config = read_dflash2_config(path)?;
-    let execution_policy = DraftExecutionPolicy::capture();
+    let execution_policy = DraftExecutionPolicy::default_for_config(&config);
     let tensor_path = resolve_safetensors(path)?;
     crate::engine::persistence::prewarm_checkpoint_pages(path);
     let mut params = load_safetensors_lazy(&tensor_path)?;
