@@ -702,6 +702,26 @@ impl Paged {
         total_budget.saturating_sub(self.owners.bytes().saturating_add(held))
     }
 
+    /// Byte budget left for RAM prefix states when restoring `seq` from a disk
+    /// state at `row`, also reserving the extra bytes `OwnerCell::from_state`
+    /// will materialize on `seq`'s live owner cell.
+    pub fn restore_state_ram_budget(
+        &self,
+        total_budget: u64,
+        seq: SeqId,
+        row: usize,
+        owner_base: u64,
+        mtp_row: u64,
+    ) -> u64 {
+        restore_ram_cap(
+            self.state_ram_budget(total_budget),
+            self.owners.held_bytes(seq),
+            row,
+            owner_base,
+            mtp_row,
+        )
+    }
+
     fn live_tokens(&self, seq: SeqId) -> &[u32] {
         self.adapter.request_tokens_for(seq).unwrap_or(&[])
     }
@@ -1078,17 +1098,45 @@ fn publish_turn(p: &mut Paged, seq: SeqId, plan: &mut TurnPlan, state_budget: u6
     }
 }
 
+/// Remaining RAM state byte cap during an SSD restore at `row`, after
+/// reserving the extra live owner bytes `OwnerCell::from_state` will allocate
+/// on top of `current_owner_bytes`.
+pub(crate) fn restore_ram_cap(
+    state_ram_budget: u64,
+    current_owner_bytes: u64,
+    row: usize,
+    owner_base: u64,
+    mtp_row: u64,
+) -> u64 {
+    let restored_owner_extra = owner_base
+        .saturating_add(mtp_row.saturating_mul(row as u64))
+        .saturating_sub(current_owner_bytes);
+    state_ram_budget.saturating_sub(restored_owner_extra)
+}
+
+/// Budget terms for reserving both the restored state and live owner cell
+/// during an SSD resume.
+#[derive(Clone, Copy)]
+pub(crate) struct RestoreBudget {
+    pub(crate) total: u64,
+    pub(crate) owner_base: u64,
+    pub(crate) mtp_row: u64,
+}
+
 /// The deepest state on disk only that `prompt` resumes from past `hit`,
-/// whose chain is whole, read back and given its RAM copy within
-/// `state_budget`; two at most are tried, one that does not read back going
-/// with its object. `None` keeps `hit`.
-fn resume_from_disk(
+/// whose chain is whole, read back and given its RAM copy within `budget`
+/// (accounting for both the restored state and live owner cell, and never
+/// evicting `hit`'s RAM fallback); two at most are tried, one that does not
+/// read back going with its object. `None` keeps `hit`.
+pub(crate) fn resume_from_disk(
     p: &mut Paged,
+    seq: SeqId,
     prompt: Key<'_>,
     hit: Option<(u64, usize)>,
-    state_budget: u64,
+    budget: RestoreBudget,
 ) -> Option<(u64, usize)> {
     let floor = hit.map_or(0, |h| h.1);
+    let protect = hit.map(|h| h.0);
     let found = p.states.disk_only_above(prompt, floor);
     for (id, row) in found.into_iter().take(2) {
         let (key, extra) = {
@@ -1113,8 +1161,9 @@ fn resume_from_disk(
             segments
         };
         let need = p.disk.as_ref()?.state_bytes_at(row);
-        let cap = p.state_ram_budget(state_budget);
-        if !p.states.reserve_for_promote(id, need, cap) {
+        let cap =
+            p.restore_state_ram_budget(budget.total, seq, row, budget.owner_base, budget.mtp_row);
+        if !p.states.reserve_for_promote(id, need, cap, protect) {
             continue;
         }
         let Paged { disk, states, .. } = &mut *p;
@@ -1128,7 +1177,7 @@ fn resume_from_disk(
             SEGMENT_BOUND,
         ) {
             Read::State(s) => {
-                if !states.promote_within(id, s, Some(cap)) {
+                if !states.promote_within(id, s, Some(cap), protect) {
                     continue;
                 }
                 tracing::debug!(
@@ -1649,7 +1698,15 @@ impl Inner {
         let ends = self.grid.ends(0, tokens);
         let pass = pass_keys(tokens, &ends, self.grid.chunk());
         let nonce = rand::random::<u64>();
-        let state_budget = self.state_budget();
+        let restore_budget = {
+            let cfg = self.store.model.cfg();
+            let mtp_on = self.mtp.is_some();
+            RestoreBudget {
+                total: self.state_budget(),
+                owner_base: lane_bytes(cfg, mtp_on, self.store.ctx),
+                mtp_row: kv_per_token(cfg, mtp_on).saturating_sub(kv_per_token(cfg, false)),
+            }
+        };
         let Inner {
             store,
             mtp,
@@ -1673,7 +1730,7 @@ impl Inner {
         let skip_disk = p.disk.as_mut().is_some_and(Disk::take_skip);
         let mut from_disk = None;
         let hit = if reuse && !warm && !skip_disk && p.disk.is_some() {
-            match resume_from_disk(p, prompt, hit, state_budget) {
+            match resume_from_disk(p, seq, prompt, hit, restore_budget) {
                 Some(deeper) => {
                     from_disk = Some(deeper.0);
                     Some(deeper)

@@ -370,21 +370,24 @@ impl<S: Stored> States<S> {
         Self::delta_bytes(&mut seen, state)
     }
 
-    /// Whether `e` holds a RAM copy eligible for eviction (neither in use nor
-    /// waiting for a disk write to land).
-    fn is_free(&self, e: &Entry<Held<S>>) -> bool {
-        e.ram().is_some() && e.disk().is_none_or(|d| d.landed) && !self.store.in_use(e.mark())
+    /// Whether `e` holds a RAM copy eligible for eviction (not protected, not
+    /// in use, and not waiting for a disk write to land).
+    fn is_free_excluding(&self, e: &Entry<Held<S>>, protect: Option<u64>) -> bool {
+        Some(e.id()) != protect
+            && e.ram().is_some()
+            && e.disk().is_none_or(|d| d.landed)
+            && !self.store.in_use(e.mark())
     }
 
     /// Count, resident bytes (shared parts once), and shared part ids of RAM
     /// entries that cannot currently be evicted.
-    fn pinned_ram(&self) -> (usize, u64, HashSet<usize>) {
+    fn pinned_ram_excluding(&self, protect: Option<u64>) -> (usize, u64, HashSet<usize>) {
         let mut count = 0usize;
         let mut bytes = 0u64;
         let mut seen = HashSet::new();
         for e in self.store.entries() {
             if let Some(Held { state: s, .. }) = e.ram()
-                && !self.is_free(e)
+                && !self.is_free_excluding(e, protect)
             {
                 count += 1;
                 bytes = bytes.saturating_add(Self::delta_bytes(&mut seen, s));
@@ -393,16 +396,24 @@ impl<S: Stored> States<S> {
         (count, bytes, seen)
     }
 
-    /// The RAM copy that goes first: a checkpoint (oldest publication), else
-    /// the least recently used; never one with a disk write in flight or in
-    /// use.
-    fn victim(&self) -> Option<u64> {
-        let free = || self.store.entries().filter(|e| self.is_free(e));
+    /// The RAM copy that goes first, skipping `protect`: a checkpoint (oldest
+    /// publication), else the least recently used; never one with a disk write
+    /// in flight or in use.
+    fn victim_excluding(&self, protect: Option<u64>) -> Option<u64> {
+        let free = || {
+            self.store
+                .entries()
+                .filter(|e| self.is_free_excluding(e, protect))
+        };
         free()
             .filter(|e| e.checkpoint())
             .min_by_key(|e| e.publication())
             .or_else(|| free().min_by_key(|e| e.last_used()))
             .map(|e| e.id())
+    }
+
+    fn victim(&self) -> Option<u64> {
+        self.victim_excluding(None)
     }
 
     /// Gives up the RAM copy of `id`: a state whose disk copy and chain
@@ -432,7 +443,7 @@ impl<S: Stored> States<S> {
     /// Returns `false` without evicting when pinned RAM entries leave no way
     /// to fit `incoming`.
     pub fn reserve_bytes(&mut self, incoming: u64, byte_cap: u64) -> bool {
-        let (_, pinned_bytes, _) = self.pinned_ram();
+        let (_, pinned_bytes, _) = self.pinned_ram_excluding(None);
         if pinned_bytes.saturating_add(incoming) > byte_cap {
             return false;
         }
@@ -445,22 +456,28 @@ impl<S: Stored> States<S> {
         self.held_bytes().saturating_add(incoming) <= byte_cap
     }
 
-    /// Evicts eligible victims before decoding disk-only `id` until there is
-    /// both a RAM slot and `incoming` bytes of headroom under `byte_cap`.
-    /// Returns `false` without evicting when `id` is not disk-only or pinned
-    /// RAM entries leave no way to fit it.
-    pub fn reserve_for_promote(&mut self, id: u64, incoming: u64, byte_cap: u64) -> bool {
+    /// Evicts eligible victims (never `protect`) before decoding disk-only `id`
+    /// until there is both a RAM slot and `incoming` bytes of headroom under
+    /// `byte_cap`. Returns `false` without evicting when `id` is not disk-only
+    /// or pinned/protected RAM entries leave no way to fit it.
+    pub fn reserve_for_promote(
+        &mut self,
+        id: u64,
+        incoming: u64,
+        byte_cap: u64,
+        protect: Option<u64>,
+    ) -> bool {
         if !self.store.get(id).is_some_and(|e| e.ram().is_none()) {
             return false;
         }
-        let (pinned_count, pinned_bytes, _) = self.pinned_ram();
+        let (pinned_count, pinned_bytes, _) = self.pinned_ram_excluding(protect);
         if pinned_count >= self.ram_cap || pinned_bytes.saturating_add(incoming) > byte_cap {
             return false;
         }
         while self.ram_len() >= self.ram_cap
             || self.held_bytes().saturating_add(incoming) > byte_cap
         {
-            match self.victim() {
+            match self.victim_excluding(protect) {
                 Some(v) if v != id => self.evict(v),
                 _ => return false,
             }
@@ -468,16 +485,17 @@ impl<S: Stored> States<S> {
         true
     }
 
-    /// Evicts eligible victims until there is a RAM slot and `state` fits
-    /// within `byte_cap` (when given); returns `false` without evicting if
-    /// pinned RAM entries make fitting impossible.
+    /// Evicts eligible victims (never `protect`) until there is a RAM slot and
+    /// `state` fits within `byte_cap` (when given); returns `false` without
+    /// evicting if pinned/protected RAM entries make fitting impossible.
     fn make_room_for_state(
         &mut self,
         exclude: Option<u64>,
         state: &S,
         byte_cap: Option<u64>,
+        protect: Option<u64>,
     ) -> bool {
-        let (pinned_count, pinned_bytes, mut pinned_seen) = self.pinned_ram();
+        let (pinned_count, pinned_bytes, mut pinned_seen) = self.pinned_ram_excluding(protect);
         if pinned_count >= self.ram_cap {
             return false;
         }
@@ -491,7 +509,7 @@ impl<S: Stored> States<S> {
             || byte_cap
                 .is_some_and(|cap| self.held_bytes().saturating_add(self.added_bytes(state)) > cap)
         {
-            match self.victim() {
+            match self.victim_excluding(protect) {
                 Some(v) if Some(v) != exclude => self.evict(v),
                 _ => return false,
             }
@@ -531,20 +549,16 @@ impl<S: Stored> States<S> {
             && let Some(prev) = self.store.get(id).and_then(|e| e.ram()).map(|h| h.kind)
         {
             let next_kind = upgrade_kind(prev, kind);
-            if next_kind != prev {
-                self.store.replace_ram(
-                    id,
-                    Held {
-                        state,
-                        kind: next_kind,
-                    },
-                );
+            if next_kind != prev
+                && let Some(held) = self.store.ram_mut(id)
+            {
+                held.kind = next_kind;
             }
             self.store.reuse(id, next_kind == Kind::Checkpoint);
             return Ok(Some(id));
         }
         if (there.is_none() || disk_only.is_some())
-            && !self.make_room_for_state(disk_only, &state, byte_cap)
+            && !self.make_room_for_state(disk_only, &state, byte_cap, None)
         {
             return Ok(None);
         }
@@ -591,12 +605,19 @@ impl<S: Stored> States<S> {
     /// going first when `ram_cap` are held; false when it is gone, holds
     /// one, or every held one is in use.
     pub fn promote(&mut self, id: u64, state: S) -> bool {
-        self.promote_within(id, state, None)
+        self.promote_within(id, state, None, None)
     }
 
     /// Like [`Self::promote`], also enforcing `byte_cap` on total resident
-    /// state RAM bytes (shared parts counted once).
-    pub fn promote_within(&mut self, id: u64, state: S, byte_cap: Option<u64>) -> bool {
+    /// state RAM bytes (shared parts counted once) and never evicting
+    /// `protect`.
+    pub fn promote_within(
+        &mut self,
+        id: u64,
+        state: S,
+        byte_cap: Option<u64>,
+        protect: Option<u64>,
+    ) -> bool {
         let kind = match self.store.get(id) {
             Some(e) if e.ram().is_none() => {
                 if e.checkpoint() {
@@ -609,7 +630,7 @@ impl<S: Stored> States<S> {
             }
             _ => return false,
         };
-        if !self.make_room_for_state(Some(id), &state, byte_cap) {
+        if !self.make_room_for_state(Some(id), &state, byte_cap, protect) {
             return false;
         }
         self.store.promote(id, Held { state, kind })

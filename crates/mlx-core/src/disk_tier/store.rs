@@ -800,6 +800,12 @@ impl<S: StateBytes> HybridStateStore<S> {
         }
     }
 
+    /// Mutates `id`'s resident RAM copy in place without replacing its payload
+    /// or changing `cached_bytes`; `None` when `id` is gone or disk-only.
+    pub(crate) fn ram_mut(&mut self, id: EntryId) -> Option<&mut S> {
+        self.get_mut(id).and_then(|entry| entry.ram.as_mut())
+    }
+
     /// Drops `id`'s RAM copy (Splash `StateCache::discardRam`).
     pub(crate) fn drop_ram(&mut self, id: EntryId) -> Option<S> {
         let dropped = self.get_mut(id).and_then(|entry| entry.ram.take());

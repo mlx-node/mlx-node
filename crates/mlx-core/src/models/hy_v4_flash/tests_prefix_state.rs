@@ -443,13 +443,13 @@ fn byte_cap_enforces_pre_decode_reservation_and_unshared_mtp_segment_budget() {
 
     // Oversized SSD candidate is rejected pre-decode WITHOUT evicting any RAM entry.
     assert!(!st.reserve_bytes(400, 300));
-    assert!(!st.reserve_for_promote(disk_huge, 400, 300));
+    assert!(!st.reserve_for_promote(disk_huge, 400, 300, None));
     assert_eq!(st.ram_len(), 4);
     assert_eq!(st.held_bytes(), 310);
 
     // Fitting SSD candidate evicts oldest LRU entries BEFORE decoding so
     // `held_bytes() + 100 <= 300`, then `promote_within` lands within cap.
-    assert!(st.reserve_for_promote(disk_fit, 100, 300));
+    assert!(st.reserve_for_promote(disk_fit, 100, 300, None));
     assert!(st.held_bytes() + 100 <= 300);
     assert!(st.get(ids[0]).is_none(), "oldest LRU entry evicted first");
     assert!(
@@ -457,7 +457,7 @@ fn byte_cap_enforces_pre_decode_reservation_and_unshared_mtp_segment_budget() {
         "second oldest evicted to fit 100 B"
     );
     assert!(st.get(ids[2]).is_some() && st.get(shared_id).is_some());
-    assert!(st.promote_within(disk_fit, mtp_fake(10, 10, 90), Some(300)));
+    assert!(st.promote_within(disk_fit, mtp_fake(10, 10, 90), Some(300), None));
     assert!(st.held_bytes() <= 300);
     assert!(st.get(disk_fit).is_some());
 
@@ -490,4 +490,134 @@ fn byte_cap_enforces_pre_decode_reservation_and_unshared_mtp_segment_budget() {
         .unwrap();
     assert!(fit_pub.is_some());
     assert!(st.held_bytes() <= 200);
+}
+
+/// Protecting the current request's shallow RAM fallback during a deeper SSD
+/// restore: `reserve_for_promote` and `promote_within` never evict `protect`
+/// (even when it is a checkpoint), so an SSD `Busy`/`Failed` read or a tight
+/// cap always preserves the RAM fallback.
+#[test]
+fn protected_ram_fallback_survives_tight_or_failed_ssd_promote() {
+    use crate::disk_tier::store::{DiskCopy, Lineage, StateClass};
+    use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
+
+    let disk_copy = |seed: u64| DiskCopy {
+        key: ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            ColdCacheFingerprint::from_components([&seed.to_le_bytes()[..]]),
+            None,
+            &[seed as u32],
+            &[],
+            0,
+            0,
+        ),
+        bytes: 64,
+        landed: true,
+        window_begin: 0,
+        chain_owed: false,
+    };
+
+    // 1. Even though `fallback` is a Checkpoint (normally evicted first),
+    //    `reserve_for_promote(..., Some(fallback))` evicts `other` instead and
+    //    keeps `fallback` resident if the subsequent SSD read fails/times out.
+    let mut st = States::<Fake>::with_cap(2);
+    let fallback = publish(&mut st, &lineage(1, 1), Kind::Checkpoint, 100).unwrap();
+    let other = publish(&mut st, &lineage(2, 1), Kind::Prompt, 100).unwrap();
+    let disk_deep = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&lineage(3, 2), SALT),
+            100,
+            StateClass::Ordinary,
+            disk_copy(3),
+        )
+        .unwrap();
+
+    // Tight byte cap (150 B) where `fallback` (100 B) + `disk_deep` (100 B)
+    // cannot both fit: refuses without evicting either `fallback` or `other`.
+    assert!(!st.reserve_for_promote(disk_deep, 100, 150, Some(fallback)));
+    assert!(st.get(fallback).is_some());
+    assert!(st.get(other).is_some());
+
+    // Under 200 B cap at slot limit 2: evicts `other`, NEVER `fallback`.
+    assert!(st.reserve_for_promote(disk_deep, 100, 200, Some(fallback)));
+    assert!(st.get(fallback).is_some(), "protected fallback must stay");
+    assert!(st.get(other).is_none(), "unprotected entry is evicted");
+
+    // 2. When `ram_cap == 1` and `fallback` is the sole resident entry,
+    //    neither `reserve_for_promote` nor `promote_within` may evict it.
+    let mut tiny = States::<Fake>::with_cap(1);
+    let only_fallback = publish(&mut tiny, &lineage(4, 1), Kind::Checkpoint, 50).unwrap();
+    let disk_only = tiny
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&lineage(5, 2), SALT),
+            50,
+            StateClass::Ordinary,
+            disk_copy(5),
+        )
+        .unwrap();
+    assert!(!tiny.reserve_for_promote(disk_only, 50, 500, Some(only_fallback)));
+    assert!(!tiny.promote_within(disk_only, fake(50), Some(500), Some(only_fallback)));
+    assert!(tiny.get(only_fallback).is_some());
+    assert!(tiny.get(disk_only).is_none());
+}
+
+/// Upgrading an already-resident `Kind::Checkpoint` to `Kind::Prompt` mutates
+/// `kind` in place without swapping the payload or duplicating segments, so
+/// `held_bytes()` stays unchanged even at an exact `byte_cap`.
+#[test]
+fn checkpoint_to_prompt_upgrade_mutates_kind_in_place_without_duplicating_segments() {
+    let mut st = States::<Fake>::with_cap(4);
+    let ck_tok = lineage(1, 1);
+    let turn_tok = lineage(2, 2);
+
+    // Checkpoint and deeper Turn share segment id 1 (90 B); own bytes = 10 B each.
+    let ck_id = st
+        .publish_within(
+            Key::text(&ck_tok, SALT),
+            Fake {
+                own: 10,
+                shared: vec![(1, 90)],
+            },
+            Kind::Checkpoint,
+            Some(110),
+        )
+        .unwrap()
+        .unwrap();
+    let turn_id = st
+        .publish_within(
+            Key::text(&turn_tok, SALT),
+            Fake {
+                own: 10,
+                shared: vec![(1, 90)],
+            },
+            Kind::Turn,
+            Some(110),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(st.held_bytes(), 110);
+
+    // Upgrading the checkpoint to Prompt with a fresh payload carrying a new
+    // unshared segment id 2 (90 B) must keep the original segment id 1 in place.
+    let upgraded = st
+        .publish_within(
+            Key::text(&ck_tok, SALT),
+            Fake {
+                own: 10,
+                shared: vec![(2, 90)],
+            },
+            Kind::Prompt,
+            Some(110),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(upgraded, ck_id);
+    let entry = st.store().get(ck_id).unwrap();
+    assert_eq!(entry.ram().unwrap().kind, Kind::Prompt);
+    assert!(!entry.checkpoint());
+    assert_eq!(entry.ram().unwrap().state.shared, vec![(1, 90)]);
+    assert_eq!(st.held_bytes(), 110, "in-place upgrade adds zero bytes");
+    assert!(st.get(turn_id).is_some(), "deeper Turn state stays in RAM");
 }
