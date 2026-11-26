@@ -1116,6 +1116,7 @@ pub(super) mod tests {
             params,
             thinking,
             prompt_tokens: prompt.clone(),
+            prefix_breakpoints: Vec::new(),
             prefix,
             is_delta: false,
             reuse_cache: reuse,

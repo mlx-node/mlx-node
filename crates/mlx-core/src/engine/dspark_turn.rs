@@ -27,7 +27,7 @@ use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::dspark_timeline::{self as timeline, Mark};
 use crate::engine::finalize::compute_performance_metrics;
 use crate::engine::paged_turn::FinishPagedTurnArgs;
-use crate::engine::params::{ChatParams, generated_capacity_hint, resolve_enable_thinking};
+use crate::engine::params::{ChatParams, generated_capacity_hint};
 use crate::engine::penalties::{CutTargets, ReasoningTracker, ThinkingCut, apply_all_penalties};
 use crate::engine::plan::SpeculativeDraftWidth;
 use crate::engine::spec_paged::SpecTurnEpilogue;
@@ -2206,7 +2206,7 @@ pub(crate) struct FlatDsparkPrefix {
 /// boilerplate (Gemma4 Assistant, Muse-Glimmer DFlash, Qwen4Exp flat DFlash2).
 pub(crate) trait FlatDsparkBackend: DsparkBackend {
     /// Whether [`run_flat_dspark_turn`] overwrites `result.thinking_enabled` with
-    /// `resolve_enable_thinking(args.config).unwrap_or(true)` after `finalize_turn`.
+    /// `backend.public_thinking_enabled(args.config)` after `finalize_turn`.
     /// Families under `ThinkingPolicy::AlwaysOnBudgetFromEffort` (Muse-Glimmer) set
     /// this to `false` to preserve `args.thinking.enabled`.
     const OVERWRITE_THINKING_ENABLED: bool = true;
@@ -2432,7 +2432,7 @@ pub(crate) fn run_flat_dspark_turn<B: FlatDsparkBackend>(
         reasoning,
     })?;
     if B::OVERWRITE_THINKING_ENABLED {
-        result.thinking_enabled = resolve_enable_thinking(args.config).unwrap_or(true);
+        result.thinking_enabled = backend.public_thinking_enabled(args.config);
     }
     result.cached_tokens = prefix.cached_prefix_len as u32;
 
@@ -6675,5 +6675,589 @@ mod tree_verify_tests {
                 "Cycle 2 must start from anchor 21 and force CLOSE_0"
             );
         }
+    }
+
+    #[test]
+    fn run_flat_dspark_turn_open_token_honoring_reports_public_thinking_enabled_while_cutting_thoughts()
+     {
+        use crate::engine::backend::{
+            ChunkSink, DefaultStreamEmitter, StreamEmitter, ThinkEndResolution, ThinkingSetup,
+            TurnOutput, WholeTurnArgs,
+        };
+        use crate::engine::params::ThinkingPolicy;
+        use crate::engine::plan::{
+            DecoderPlan, MediaCapabilities, MediaInputs, SpeculativeKind, TurnPlan,
+        };
+        use crate::engine::types::{ChatConfig, ChatStreamChunk};
+        use std::sync::Mutex;
+        use std::sync::atomic::AtomicUsize;
+
+        const VOCAB: usize = 16;
+        const OPEN: u32 = 8;
+        const CLOSE: u32 = 9;
+        const ANSWER: u32 = 10;
+        const EOS: u32 = 15;
+
+        fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let json = r#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {
+                        "t0": 0, "t1": 1, "t2": 2, "t3": 3,
+                        "t4": 4, "t5": 5, "t6": 6, "t7": 7,
+                        "<open>": 8, "<close>": 9, "ok": 10, "t11": 11,
+                        "t12": 12, "t13": 13, "t14": 14, "<eos>": 15
+                    },
+                    "unk_token": "t0"
+                }
+            }"#;
+            let dir = std::env::temp_dir().join(format!(
+                "mlx-node-flat-dspark-think-tok-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            let path = dir.join("tokenizer.json");
+            std::fs::write(&path, json).expect("fixture write");
+            let tok = Qwen3Tokenizer::from_file(&path).expect("fixture tokenizer");
+            let _ = std::fs::remove_dir_all(&dir);
+            Arc::new(tok)
+        }
+
+        fn one_hot_1d(tok: u32) -> MxArray {
+            let mut v = vec![-100.0f32; VOCAB];
+            v[tok as usize] = 100.0;
+            MxArray::from_float32(&v, &[VOCAB as i64]).unwrap()
+        }
+
+        fn one_hot_3d(tokens: &[u32]) -> MxArray {
+            let mut data = vec![-100.0f32; tokens.len() * VOCAB];
+            for (row, &tok) in tokens.iter().enumerate() {
+                data[row * VOCAB + tok as usize] = 100.0;
+            }
+            MxArray::from_float32(&data, &[1, tokens.len() as i64, VOCAB as i64]).unwrap()
+        }
+
+        struct RecordingSink {
+            chunks: Mutex<Vec<ChatStreamChunk>>,
+        }
+        impl ChunkSink for RecordingSink {
+            fn send(&self, item: Result<ChatStreamChunk>) {
+                if let Ok(chunk) = item {
+                    self.chunks.lock().unwrap().push(chunk);
+                }
+            }
+        }
+
+        struct DummyDecode;
+        impl crate::engine::backend::DecodeStep for DummyDecode {
+            fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+                unreachable!()
+            }
+        }
+
+        struct FlatScriptStepper {
+            step: usize,
+            emit_open_on_cycle0: bool,
+        }
+
+        impl DsparkStepper for FlatScriptStepper {
+            fn propose(
+                &mut self,
+                _anchor_id: u32,
+                max_len: usize,
+                _params: &ChatParams,
+                _rng: &mut dyn rand::Rng,
+            ) -> Result<DsparkProposal> {
+                let mut draft_ids = if self.step == 0 && self.emit_open_on_cycle0 {
+                    // Model disobeys soft hint and drafts thought tokens after OPEN.
+                    vec![OPEN as i32, 4, 5]
+                } else {
+                    vec![ANSWER as i32]
+                };
+                draft_ids.truncate(max_len);
+                Ok(DsparkProposal {
+                    draft_ids,
+                    device_draft_ids: None,
+                    device_draft_sparse: None,
+                    draft_dists: Vec::new(),
+                    draft_sparse_dists: Vec::new(),
+                    keep_probabilities: None,
+                })
+            }
+
+            fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+                let cycle = self.step;
+                self.step += 1;
+                let rows = verify_ids.len();
+                if cycle == 0 && self.emit_open_on_cycle0 && rows == 4 {
+                    // Target accepts OPEN + 4 + 5 + bonus 6; budget=0 tracker must truncate right after OPEN.
+                    Ok(DsparkVerifyOutput {
+                        logits: one_hot_3d(&[OPEN, 4, 5, 6]),
+                    })
+                } else if verify_ids.first().copied() == Some(CLOSE) {
+                    let targets: Vec<u32> = [ANSWER, EOS]
+                        .into_iter()
+                        .chain(std::iter::repeat(EOS))
+                        .take(rows)
+                        .collect();
+                    Ok(DsparkVerifyOutput {
+                        logits: one_hot_3d(&targets),
+                    })
+                } else {
+                    let targets = vec![ANSWER; rows];
+                    Ok(DsparkVerifyOutput {
+                        logits: one_hot_3d(&targets),
+                    })
+                }
+            }
+
+            fn commit(&mut self, _keep: usize, _total: usize) -> Result<()> {
+                Ok(())
+            }
+
+            fn eval_boundary(&self, _next_token: &MxArray) {}
+
+            fn finish(self) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        struct MockOpenTokenFlatBackend {
+            tok: Arc<Qwen3Tokenizer>,
+            emit_open_on_cycle0: bool,
+        }
+
+        impl ChatBackend for MockOpenTokenFlatBackend {
+            type Decode<'a>
+                = DummyDecode
+            where
+                Self: 'a;
+
+            fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+                Ok(self.tok.clone())
+            }
+            fn family_name(&self) -> &'static str {
+                "inkling2_flat_mock"
+            }
+            fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+                Ok(EOS)
+            }
+            fn policy(&self) -> ThinkingPolicy {
+                ThinkingPolicy::OpenTokenHonoring
+            }
+            fn think_end_for_turn(
+                &self,
+                _config: &ChatConfig,
+                _tok: &Qwen3Tokenizer,
+            ) -> ThinkEndResolution {
+                ThinkEndResolution::with_open_token(OPEN, Arc::from([CLOSE]))
+            }
+            fn cached_token_history(&self) -> &[u32] {
+                &[]
+            }
+            fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+                Ok(())
+            }
+            fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+                0
+            }
+            fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+            fn eval_caches(&self) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+                unreachable!()
+            }
+            fn begin_decode(&mut self, _setup: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+                Ok(DummyDecode)
+            }
+            fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
+                Box::new(DefaultStreamEmitter)
+            }
+            fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+                Ok(ChatResult {
+                    text: "ok".to_string(),
+                    tool_calls: Vec::new(),
+                    thinking: None,
+                    thinking_enabled: args.thinking_enabled,
+                    num_tokens: args.generated_tokens.len() as u32,
+                    prompt_tokens: args.prompt_tokens,
+                    reasoning_tokens: args.reasoning.tokens,
+                    reasoning_close: args.reasoning.close_name(),
+                    reasoning_cut_at: args.reasoning.cut_at,
+                    reasoning_cycle_period: args.reasoning.cycle_period,
+                    reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+                    finish_reason: args.finish_reason,
+                    raw_text: String::new(),
+                    public_raw_text: None,
+                    cached_tokens: 0,
+                    performance: None,
+                })
+            }
+        }
+
+        impl DsparkBackend for MockOpenTokenFlatBackend {
+            type DsparkDecode<'a>
+                = FlatScriptStepper
+            where
+                Self: 'a;
+
+            fn begin_dspark_decode(
+                &mut self,
+                _block_size: usize,
+            ) -> Result<Self::DsparkDecode<'_>> {
+                Ok(FlatScriptStepper {
+                    step: 0,
+                    emit_open_on_cycle0: self.emit_open_on_cycle0,
+                })
+            }
+        }
+
+        impl super::FlatDsparkBackend for MockOpenTokenFlatBackend {
+            fn prepare_flat_dspark_turn(
+                &mut self,
+                tokens: &[u32],
+                _params: &ChatParams,
+                _is_delta: bool,
+            ) -> Result<super::FlatDsparkPrefix> {
+                Ok(super::FlatDsparkPrefix {
+                    prefill_tokens: tokens.to_vec(),
+                    cached_prefix_len: 0,
+                    prior_cached_len: 0,
+                    block_size: 4,
+                })
+            }
+
+            fn flat_prefill_with_draft_state(
+                &mut self,
+                _prefix: &super::FlatDsparkPrefix,
+                _stream: Stream,
+            ) -> Result<MxArray> {
+                Ok(one_hot_1d(ANSWER))
+            }
+
+            fn fail_closed_flat_dspark(&mut self, error: Error) -> Error {
+                error
+            }
+
+            fn finish_flat_dspark_turn(
+                &mut self,
+                _tokens: &[u32],
+                _generated_tokens: &[u32],
+                _finish_reason: &str,
+                _last_in_cache: bool,
+                _is_delta: bool,
+                _reuse_cache: bool,
+                _stream: Stream,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        // Mirrors Muse-Glimmer: AlwaysOnBudgetFromEffort with OVERWRITE_THINKING_ENABLED = false.
+        struct MockAlwaysOnFlatBackend {
+            tok: Arc<Qwen3Tokenizer>,
+        }
+
+        impl ChatBackend for MockAlwaysOnFlatBackend {
+            type Decode<'a>
+                = DummyDecode
+            where
+                Self: 'a;
+
+            fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+                Ok(self.tok.clone())
+            }
+            fn family_name(&self) -> &'static str {
+                "always_on_flat_mock"
+            }
+            fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+                Ok(EOS)
+            }
+            fn policy(&self) -> ThinkingPolicy {
+                ThinkingPolicy::AlwaysOnBudgetFromEffort
+            }
+            fn cached_token_history(&self) -> &[u32] {
+                &[]
+            }
+            fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+                Ok(())
+            }
+            fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+                0
+            }
+            fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+            fn eval_caches(&self) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+                unreachable!()
+            }
+            fn begin_decode(&mut self, _setup: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+                Ok(DummyDecode)
+            }
+            fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
+                Box::new(DefaultStreamEmitter)
+            }
+            fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+                Ok(ChatResult {
+                    text: "ok".to_string(),
+                    tool_calls: Vec::new(),
+                    thinking: None,
+                    thinking_enabled: args.thinking_enabled,
+                    num_tokens: args.generated_tokens.len() as u32,
+                    prompt_tokens: args.prompt_tokens,
+                    reasoning_tokens: args.reasoning.tokens,
+                    reasoning_close: args.reasoning.close_name(),
+                    reasoning_cut_at: args.reasoning.cut_at,
+                    reasoning_cycle_period: args.reasoning.cycle_period,
+                    reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+                    finish_reason: args.finish_reason,
+                    raw_text: String::new(),
+                    public_raw_text: None,
+                    cached_tokens: 0,
+                    performance: None,
+                })
+            }
+        }
+
+        impl DsparkBackend for MockAlwaysOnFlatBackend {
+            type DsparkDecode<'a>
+                = FlatScriptStepper
+            where
+                Self: 'a;
+
+            fn begin_dspark_decode(
+                &mut self,
+                _block_size: usize,
+            ) -> Result<Self::DsparkDecode<'_>> {
+                Ok(FlatScriptStepper {
+                    step: 0,
+                    emit_open_on_cycle0: false,
+                })
+            }
+        }
+
+        impl super::FlatDsparkBackend for MockAlwaysOnFlatBackend {
+            const OVERWRITE_THINKING_ENABLED: bool = false;
+
+            fn prepare_flat_dspark_turn(
+                &mut self,
+                tokens: &[u32],
+                _params: &ChatParams,
+                _is_delta: bool,
+            ) -> Result<super::FlatDsparkPrefix> {
+                Ok(super::FlatDsparkPrefix {
+                    prefill_tokens: tokens.to_vec(),
+                    cached_prefix_len: 0,
+                    prior_cached_len: 0,
+                    block_size: 4,
+                })
+            }
+
+            fn flat_prefill_with_draft_state(
+                &mut self,
+                _prefix: &super::FlatDsparkPrefix,
+                _stream: Stream,
+            ) -> Result<MxArray> {
+                Ok(one_hot_1d(ANSWER))
+            }
+
+            fn fail_closed_flat_dspark(&mut self, error: Error) -> Error {
+                error
+            }
+
+            fn finish_flat_dspark_turn(
+                &mut self,
+                _tokens: &[u32],
+                _generated_tokens: &[u32],
+                _finish_reason: &str,
+                _last_in_cache: bool,
+                _is_delta: bool,
+                _reuse_cache: bool,
+                _stream: Stream,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let tok = tiny_tokenizer();
+        let prompt = [1u32, 2];
+        let plan = TurnPlan {
+            is_delta: false,
+            input_media: MediaCapabilities::NONE,
+            context_media: MediaCapabilities::NONE,
+            use_paged_attention: false,
+            decoder: DecoderPlan::Speculative(SpeculativeKind::DraftModel),
+        };
+        let media = MediaInputs {
+            images: &[],
+            audio: &[],
+        };
+
+        for (effort, expected_public, expect_budget_cut) in [
+            (Some("none"), false, true),
+            (Some("0"), false, true),
+            (Some("0.0"), false, true),
+            (Some("-0.0"), false, true),
+            (Some("low"), true, false),
+            (None, true, false),
+        ] {
+            let cfg = ChatConfig {
+                max_new_tokens: Some(6),
+                temperature: Some(0.0),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+                mtp_depth: Some(3),
+                reasoning_effort: effort.map(str::to_string),
+                ..ChatConfig::default()
+            };
+            let params = crate::engine::params::extract_chat_params(&cfg);
+            let mut backend = MockOpenTokenFlatBackend {
+                tok: tok.clone(),
+                emit_open_on_cycle0: expect_budget_cut,
+            };
+            let thinking: ThinkingSetup = backend.thinking_setup(&cfg);
+            assert!(
+                thinking.enabled,
+                "OpenTokenHonoring must keep tracker armed for effort={effort:?}"
+            );
+            if expect_budget_cut {
+                assert_eq!(thinking.budget, Some(0));
+            }
+
+            // Sync turn
+            let mut sync_args = WholeTurnArgs {
+                tokens: &prompt,
+                tokenizer: &tok,
+                eos_id: EOS,
+                config: &cfg,
+                params: &params,
+                thinking,
+                plan,
+                sink: None,
+                cancelled: None,
+                media,
+            };
+            let out = super::run_flat_dspark_turn(&mut backend, &mut sync_args).expect("sync turn");
+            let TurnOutput::Complete(result) = out else {
+                panic!("sync turn must return TurnOutput::Complete");
+            };
+            assert_eq!(
+                result.thinking_enabled, expected_public,
+                "sync flat DSpark thinking_enabled mismatch for effort={effort:?}"
+            );
+            if expect_budget_cut {
+                assert_eq!(
+                    result.reasoning_close.as_deref(),
+                    Some("budget"),
+                    "tracker must cut unexpected open token even when effort={effort:?}"
+                );
+                assert_eq!(result.reasoning_cut_at, Some(0));
+            }
+
+            // Streaming turn
+            let sink = RecordingSink {
+                chunks: Mutex::new(Vec::new()),
+            };
+            let cancel = AtomicBool::new(false);
+            let mut stream_args = WholeTurnArgs {
+                tokens: &prompt,
+                tokenizer: &tok,
+                eos_id: EOS,
+                config: &cfg,
+                params: &params,
+                thinking,
+                plan,
+                sink: Some(&sink),
+                cancelled: Some(&cancel),
+                media,
+            };
+            let out =
+                super::run_flat_dspark_turn(&mut backend, &mut stream_args).expect("stream turn");
+            assert!(matches!(out, TurnOutput::Streamed));
+            let chunks = sink.chunks.lock().unwrap();
+            let done = chunks.iter().find(|c| c.done).expect("terminal chunk");
+            assert_eq!(
+                done.thinking_enabled,
+                Some(expected_public),
+                "streaming flat DSpark terminal thinking_enabled mismatch for effort={effort:?}"
+            );
+            if expect_budget_cut {
+                assert_eq!(done.reasoning_close.as_deref(), Some("budget"));
+                assert_eq!(done.reasoning_cut_at, Some(0));
+            }
+        }
+
+        // Guard AlwaysOnBudgetFromEffort (Muse-Glimmer) OVERWRITE_THINKING_ENABLED = false:
+        // reasoning_effort = "none" must still report thinking_enabled = true on sync & stream.
+        let none_cfg = ChatConfig {
+            max_new_tokens: Some(2),
+            temperature: Some(0.0),
+            top_k: Some(0),
+            top_p: Some(1.0),
+            min_p: Some(0.0),
+            reasoning_effort: Some("none".to_string()),
+            ..ChatConfig::default()
+        };
+        let params = crate::engine::params::extract_chat_params(&none_cfg);
+        let mut always_on = MockAlwaysOnFlatBackend { tok: tok.clone() };
+        let thinking = always_on.thinking_setup(&none_cfg);
+        assert!(thinking.enabled);
+        let mut sync_args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tok,
+            eos_id: EOS,
+            config: &none_cfg,
+            params: &params,
+            thinking,
+            plan,
+            sink: None,
+            cancelled: None,
+            media,
+        };
+        let TurnOutput::Complete(res) =
+            super::run_flat_dspark_turn(&mut always_on, &mut sync_args).expect("always-on sync")
+        else {
+            panic!("expected Complete");
+        };
+        assert!(
+            res.thinking_enabled,
+            "AlwaysOnBudgetFromEffort with OVERWRITE_THINKING_ENABLED=false must keep thinking_enabled=true"
+        );
+
+        let sink = RecordingSink {
+            chunks: Mutex::new(Vec::new()),
+        };
+        let cancel = AtomicBool::new(false);
+        let mut stream_args = WholeTurnArgs {
+            tokens: &prompt,
+            tokenizer: &tok,
+            eos_id: EOS,
+            config: &none_cfg,
+            params: &params,
+            thinking,
+            plan,
+            sink: Some(&sink),
+            cancelled: Some(&cancel),
+            media,
+        };
+        let out = super::run_flat_dspark_turn(&mut always_on, &mut stream_args)
+            .expect("always-on stream");
+        assert!(matches!(out, TurnOutput::Streamed));
+        let chunks = sink.chunks.lock().unwrap();
+        let done = chunks.iter().find(|c| c.done).expect("terminal chunk");
+        assert_eq!(done.thinking_enabled, Some(true));
     }
 }

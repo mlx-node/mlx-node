@@ -14,8 +14,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mlx_paged_attn::{
-    BlockAllocator, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdStateLabel, ColdStateLayout,
-    ColdStateObject, EnqueueRefused, Landed, LayerKVPool, MakeRoom, state_object_bytes,
+    BlockAllocator, ColdCacheFingerprint, ColdCacheKey, ColdGroup, ColdKeyHold, ColdStateLabel,
+    ColdStateLayout, ColdStateObject, EnqueueRefused, Landed, LayerKVPool, MakeRoom,
+    state_object_bytes,
 };
 
 use crate::disk_tier::DiskTier;
@@ -75,6 +76,20 @@ impl HeldTier {
 pub(crate) struct PendingWrite {
     pub(crate) id: EntryId,
     pub(crate) key: ColdCacheKey,
+}
+
+/// Replacement metadata for an in-flight in-place SSD overwrite of an
+/// already-committed durable SSD anchor.
+///
+/// Owns the [`ColdKeyHold`] pinning both `key` and its complete Global KV chain
+/// against competing `MakeRoom::Evict` writes so clearing the in-memory store
+/// (e.g. `ResetCaches` / `clear_ram_and_checkpoints()`) neither drops the
+/// eviction hold nor causes [`StateDiskEngine::poll_offload`] to remove the
+/// freshly committed SSD anchor upon landing.
+struct PendingReplacement {
+    id: EntryId,
+    key: ColdCacheKey,
+    _fallback_hold: ColdKeyHold,
 }
 
 /// A disk state's chain on its way to the tier (Splash
@@ -534,6 +549,10 @@ pub(crate) struct StateDiskEngine<C: StateDiskCodec> {
     pub(crate) landed_rx: Receiver<Landed>,
     /// The state write in flight (Splash `StateCache::pending_`).
     pub(crate) pending: Option<PendingWrite>,
+    /// Replacement hold/flag for an in-flight in-place SSD overwrite of an
+    /// already-committed durable SSD anchor (kept beside `pending` so external
+    /// callers constructing [`PendingWrite`] remain untouched).
+    pending_replacement: Option<PendingReplacement>,
     /// Optional entry ID whose store entry stays indexed on state-write failure even when its RAM
     /// copy was dropped (used for in-place SSD upgrades with a durable fallback copy to restore).
     pub(crate) preserve_entry_on_state_failure: Option<EntryId>,
@@ -567,6 +586,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             landed_tx,
             landed_rx,
             pending: None,
+            pending_replacement: None,
             preserve_entry_on_state_failure: None,
             chain: None,
             read_waiters: Arc::new(AtomicU32::new(0)),
@@ -717,6 +737,50 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
         keep_ram: bool,
         ctx: C::EncodeCtx<'_>,
     ) -> Staged {
+        self.stage_inner(store, id, room, keep_ram, ctx, None)
+    }
+
+    /// Like [`Self::stage`], for an in-place replacement of an already-committed
+    /// durable SSD anchor. Transfers `fallback_hold` onto this engine until
+    /// [`Self::poll_offload`] processes the landing (or until
+    /// [`Self::cancel_pending_replacement`] / [`Self::strip_disk_copies`] or
+    /// drop), so clearing the in-memory store while the write is in flight
+    /// neither drops the eviction hold nor removes the committed replacement
+    /// blob upon landing.
+    pub(crate) fn stage_replacement(
+        &mut self,
+        store: &mut HybridStateStore<C::State>,
+        id: EntryId,
+        room: MakeRoom,
+        keep_ram: bool,
+        ctx: C::EncodeCtx<'_>,
+        fallback_hold: ColdKeyHold,
+    ) -> Staged {
+        self.stage_inner(store, id, room, keep_ram, ctx, Some(fallback_hold))
+    }
+
+    /// Cancels replacement tracking (and releases its [`ColdKeyHold`]) for `id`
+    /// when an in-flight replacement is explicitly discarded (e.g. urgent erase
+    /// whose Global KV chain is incomplete), so a subsequent `Ok` landing
+    /// removes any orphaned state blob.
+    pub(crate) fn cancel_pending_replacement(&mut self, id: EntryId) {
+        self.pending_replacement.take_if(|rep| rep.id == id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_pending_replacement(&self) -> bool {
+        self.pending_replacement.is_some()
+    }
+
+    fn stage_inner(
+        &mut self,
+        store: &mut HybridStateStore<C::State>,
+        id: EntryId,
+        room: MakeRoom,
+        keep_ram: bool,
+        ctx: C::EncodeCtx<'_>,
+        fallback_hold: Option<ColdKeyHold>,
+    ) -> Staged {
         let Some(entry) = store.get(id) else {
             return Staged::Refused;
         };
@@ -759,6 +823,11 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
         {
             Ok(()) => {
                 self.pending = Some(PendingWrite { id, key });
+                self.pending_replacement = fallback_hold.map(|hold| PendingReplacement {
+                    id,
+                    key,
+                    _fallback_hold: hold,
+                });
                 store.set_disk(id, Some(copy));
                 if !keep_ram {
                     store.drop_ram(id);
@@ -903,6 +972,10 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             let Some(write) = self.pending.take_if(|write| write.key == key) else {
                 continue;
             };
+            let replacement = self
+                .pending_replacement
+                .take_if(|rep| rep.id == write.id && rep.key == key);
+            let is_replacement = replacement.is_some();
             let preserve_on_failure = self
                 .preserve_entry_on_state_failure
                 .take_if(|id| *id == write.id)
@@ -926,9 +999,19 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
                         }
                         out.state_landed_ok += 1;
                     }
-                    // The point failed while its state was in flight.
+                    // The entry vanished while its state write was in flight (e.g., `ResetCaches` /
+                    // `clear_ram_and_checkpoints()` or urgent erase). For an in-place replacement
+                    // of an already-committed durable SSD anchor, treat the landing as a clean
+                    // bookkeeping no-op that preserves the freshly committed SSD anchor on disk
+                    // (releasing `replacement`'s `ColdKeyHold` when `replacement` drops); for a
+                    // non-replacement initial spill whose KV chain may never have been persisted,
+                    // delete the orphaned blob.
                     (_, None) | (None, _) => {
-                        self.tier.manager.remove(&key);
+                        if is_replacement {
+                            out.state_landed_ok += 1;
+                        } else {
+                            self.tier.manager.remove(&key);
+                        }
                     }
                 }
                 continue;
@@ -1414,6 +1497,7 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             }
         }
         self.chain = None;
+        self.pending_replacement = None;
     }
 }
 

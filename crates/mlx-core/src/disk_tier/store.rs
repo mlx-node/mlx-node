@@ -309,6 +309,13 @@ impl<S: StateBytes> HybridStateStore<S> {
         self.generation = next_generation();
     }
 
+    /// Bumps the store generation when external cache residency backing an
+    /// existing entry changes (for example, re-registering a previously cold
+    /// Global KV chain), ensuring cached prefix probes cannot stay stale.
+    pub(crate) fn mark_changed(&mut self) {
+        self.changed();
+    }
+
     /// Stamp from `recency` from now on, the clock the model's other caches
     /// share.
     pub(crate) fn share_recency(&mut self, recency: Arc<CacheRecency>) {

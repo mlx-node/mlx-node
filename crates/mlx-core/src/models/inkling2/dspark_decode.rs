@@ -1565,11 +1565,12 @@ impl PagedDsparkBackend for Inkling2Inner {
             _ => Inkling2DsparkContext::new(n_draft_layers),
         };
 
-        let (logits_2d, _) = self.paged_prefill_sequence_with_taps(
+        let (logits_2d, _) = self.paged_prefill_sequence_with_taps_and_prefix(
             seq_id,
             suffix_tokens,
             None,
             &tap_visits,
+            Some(prefix),
             |draft, taps, chunk_len| draft_ctx.append_taps(draft, taps, chunk_len),
         )?;
         draft_ctx.eval_state()?;

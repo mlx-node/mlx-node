@@ -16,7 +16,7 @@
 //! - Multi-row varlen verify (`[N * K]` rows, for Phase 5 DSpark)
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
@@ -48,6 +48,7 @@ use crate::tools::inkling::{
     Inkling2RenderOptions, InklingOutputMarkerIds, InklingParserState, InklingStreamParser,
     InklingToolSpec, count_inkling2_reasoning_tokens_with_ids, output_marker_for_token_id,
     parse_inkling2_tokens, parse_reasoning_effort, render_inkling2_chat_messages_to_ids,
+    render_inkling2_chat_messages_to_ids_with_boundaries,
 };
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 
@@ -143,6 +144,48 @@ pub(crate) struct BoundaryConvHistory {
     pub(crate) previous: Option<(u32, Inkling2ShortConvState)>,
 }
 
+/// Per-sequence normalized block-aligned extra capture boundaries, separated by provenance so
+/// dynamic shared-prefix coalescing boundaries can be unregistered without touching static
+/// structural breakpoints while enforcing [`super::scheduler::MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ`]
+/// on the union of distinct boundaries.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SeqCaptureBoundaries {
+    pub(crate) structural: BTreeSet<u32>,
+    pub(crate) shared: BTreeSet<u32>,
+}
+
+impl SeqCaptureBoundaries {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.structural.is_empty() && self.shared.is_empty()
+    }
+
+    pub(crate) fn contains(&self, boundary: &u32) -> bool {
+        self.structural.contains(boundary) || self.shared.contains(boundary)
+    }
+
+    pub(crate) fn union_len(&self) -> usize {
+        self.structural.union(&self.shared).count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.union_len()
+    }
+
+    pub(crate) fn iter(&self) -> std::collections::btree_set::Union<'_, u32> {
+        self.structural.union(&self.shared)
+    }
+}
+
+impl<'a> IntoIterator for &'a SeqCaptureBoundaries {
+    type Item = &'a u32;
+    type IntoIter = std::collections::btree_set::Union<'a, u32>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
+    }
+}
+
 /// Runtime state owned by [`Inkling2Inner`] for block-paged hybrid inference.
 pub struct Inkling2PagedRuntime {
     pub coordinator: Inkling2KVCacheCoordinator,
@@ -191,6 +234,10 @@ pub struct Inkling2PagedRuntime {
     /// (e.g. `preempt_scheduled_cache` / `maybe_capture_rolling_checkpoint`) always know whether
     /// `seq_id` carries image KV even when another owner is currently installed on `self`.
     pub(crate) seq_image_lineage: HashMap<SeqId, (u64, Vec<(u32, u64)>)>,
+    /// Per-sequence normalized block-aligned extra capture boundaries (from structural static-prefix
+    /// breakpoints or shared-prefix coalescing), captured as durable `StateClass::Ordinary` prompt
+    /// heads (`is_head = true`).
+    pub(crate) seq_extra_capture_boundaries: HashMap<SeqId, SeqCaptureBoundaries>,
 }
 
 impl Inkling2PagedRuntime {
@@ -235,6 +282,7 @@ impl Inkling2PagedRuntime {
             active_scheduled_seqs: HashSet::new(),
             cached_paged_image_token_positions: Vec::new(),
             seq_image_lineage: HashMap::new(),
+            seq_extra_capture_boundaries: HashMap::new(),
         })
     }
 
@@ -264,6 +312,7 @@ impl Inkling2PagedRuntime {
             active_scheduled_seqs: HashSet::new(),
             cached_paged_image_token_positions: Vec::new(),
             seq_image_lineage: HashMap::new(),
+            seq_extra_capture_boundaries: HashMap::new(),
         }
     }
 
@@ -580,6 +629,7 @@ impl Inkling2PagedRuntime {
     }
 
     pub fn reset_sequence(&mut self, seq_id: SeqId, config: &Inkling2Config) -> Result<()> {
+        self.state_store.end_seq_use(seq_id);
         self.coordinator
             .reset_scheduled_request(seq_id)
             .map_err(Error::from_reason)?;
@@ -599,10 +649,12 @@ impl Inkling2PagedRuntime {
         self.seq_reuse_cache.remove(&seq_id);
         self.seq_cache_salt.remove(&seq_id);
         self.seq_image_lineage.remove(&seq_id);
+        self.seq_extra_capture_boundaries.remove(&seq_id);
         Ok(())
     }
 
     pub fn release_sequence(&mut self, seq_id: SeqId) {
+        self.state_store.end_seq_use(seq_id);
         let _ = self.coordinator.release_request_all(seq_id);
         self.conv_states.remove(&seq_id);
         self.prev_conv_snapshots.remove(&seq_id);
@@ -613,6 +665,7 @@ impl Inkling2PagedRuntime {
         self.seq_reuse_cache.remove(&seq_id);
         self.seq_cache_salt.remove(&seq_id);
         self.seq_image_lineage.remove(&seq_id);
+        self.seq_extra_capture_boundaries.remove(&seq_id);
     }
 
     pub fn snapshot_conv_state(&self, seq_id: SeqId) -> Option<Inkling2ShortConvState> {
@@ -1082,17 +1135,42 @@ impl Inkling2PrefillRun {
             (self.next_visit as u64).saturating_mul(u64::from(self.rows)) / (total_visits as u64);
         completed_sub.saturating_add(u32::try_from(frac).unwrap_or(self.rows))
     }
+
+    /// End token offset of the currently executing sub-slice (`[start..end)`).
+    pub(crate) fn in_flight_end(&self) -> u32 {
+        u32::try_from(self.end).unwrap_or(u32::MAX)
+    }
+
+    /// Whether this active prefill run will publish staged boundaries to `StateStore`.
+    pub(crate) fn is_reuse_cache(&self) -> bool {
+        self.reuse_cache
+    }
+
+    /// Exact unpublished sub-slice end offsets belonging to this active run:
+    /// every buffered sub-slice in `pending_subs` plus the currently executing
+    /// sub-slice's `end`.
+    pub(crate) fn unpublished_sub_ends(&self) -> impl Iterator<Item = u32> + '_ {
+        self.pending_subs
+            .iter()
+            .filter_map(|sub| u32::try_from(sub.end).ok())
+            .chain(u32::try_from(self.end).ok())
+    }
 }
 
-/// Internal sub-slice ends within `[start..end)` so rolling checkpoints (every 4096 tokens) and
-/// the prompt's deepest block junction `((prompt_len - 1) / bs) * bs` are always hit with exact
-/// ShortConv + SWA state even when `MeasuredConfig` chooses arbitrary prefill cut sizes.
-pub(crate) fn prefill_sub_boundaries(
+/// Internal sub-slice ends within `[start..end)` so rolling checkpoints (every 4096 tokens),
+/// installed extra capture boundaries, and the prompt's deepest block junction
+/// `((prompt_len - 1) / bs) * bs` are always hit with exact ShortConv + SWA state even when
+/// `MeasuredConfig` chooses arbitrary prefill cut sizes.
+pub(crate) fn prefill_sub_boundaries_with_extra<'a, I>(
     start: usize,
     end: usize,
     prompt_len: usize,
     block_size: u32,
-) -> Vec<usize> {
+    extra: Option<I>,
+) -> Vec<usize>
+where
+    I: IntoIterator<Item = &'a u32>,
+{
     let bs = block_size.max(1);
     let mut subs = Vec::new();
     if let (Ok(prompt_u32), Ok(start_u32)) = (u32::try_from(prompt_len), u32::try_from(start)) {
@@ -1107,6 +1185,14 @@ pub(crate) fn prefill_sub_boundaries(
             subs.push(junction);
         }
     }
+    if let Some(extra) = extra {
+        for &b in extra {
+            let b_us = b as usize;
+            if b_us > start && b_us < end && b_us < prompt_len {
+                subs.push(b_us);
+            }
+        }
+    }
     subs.push(end);
     subs.sort_unstable();
     subs.dedup();
@@ -1114,6 +1200,76 @@ pub(crate) fn prefill_sub_boundaries(
 }
 
 impl Inkling2Inner {
+    /// Normalize and install per-sequence extra capture boundaries for `seq_id`.
+    ///
+    /// Floors each raw token offset to `block_size` (`(raw / bs) * bs`) and retains only
+    /// strictly positive boundaries at or before the prompt's deepest complete block junction
+    /// `((prompt_tokens - 1) / bs) * bs`.
+    pub(crate) fn set_seq_prefix_breakpoints_inner(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        breakpoints: &[u32],
+    ) {
+        let Some(rt) = self.paged.as_mut() else {
+            return;
+        };
+        let bs = rt.coordinator.block_size().max(1);
+        let junction = (prompt_tokens.saturating_sub(1) / bs) * bs;
+        let mut normalized = BTreeSet::new();
+        for &raw in breakpoints {
+            let aligned = (raw / bs) * bs;
+            if aligned > 0 && aligned <= junction {
+                normalized.insert(aligned);
+            }
+        }
+        if normalized.is_empty() {
+            rt.seq_extra_capture_boundaries.remove(&seq_id);
+        } else {
+            rt.seq_extra_capture_boundaries.insert(
+                seq_id,
+                SeqCaptureBoundaries {
+                    structural: normalized,
+                    shared: BTreeSet::new(),
+                },
+            );
+        }
+    }
+
+    /// Merge rolling checkpoints, installed `seq_extra_capture_boundaries`, and the prompt
+    /// junction strictly inside `(cached_prefix, prompt_tokens)` in strictly ascending order
+    /// without duplicates.
+    pub(crate) fn extra_prefill_breaks_for_seq(
+        &self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        cached_prefix: u32,
+    ) -> Vec<u32> {
+        let block_size = self
+            .paged
+            .as_ref()
+            .map_or(32, |rt| rt.coordinator.block_size())
+            .max(1);
+        let mut breaks = planned_rolling_checkpoints(prompt_tokens, cached_prefix, block_size);
+        let junction = (prompt_tokens.saturating_sub(1) / block_size) * block_size;
+        if junction > cached_prefix && junction > 0 && junction < prompt_tokens {
+            breaks.push(junction);
+        }
+        if let Some(extra) = self
+            .paged
+            .as_ref()
+            .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id))
+        {
+            for &b in extra {
+                if b > cached_prefix && b < prompt_tokens {
+                    breaks.push(b);
+                }
+            }
+        }
+        breaks.sort_unstable();
+        breaks.dedup();
+        breaks
+    }
     /// Access the paged KV coordinator if initialized.
     pub fn paged_coordinator(&self) -> Option<&Inkling2KVCacheCoordinator> {
         self.paged.as_ref().map(|r| &r.coordinator)
@@ -1678,7 +1834,11 @@ impl Inkling2Inner {
         // committing atomically at `end` or rolling back the entire unit to `start` on error.
         if budget_ms.is_none() && !self.prefill_runs.contains_key(&seq_id) {
             let subs = if reuse_cache {
-                prefill_sub_boundaries(start, end, source.len(), bs)
+                let extra = self
+                    .paged
+                    .as_ref()
+                    .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id));
+                prefill_sub_boundaries_with_extra(start, end, source.len(), bs, extra)
             } else {
                 vec![end]
             };
@@ -1838,7 +1998,11 @@ impl Inkling2Inner {
                 self.prefill_runs.insert(seq_id, stale);
                 self.abort_prefill_run(seq_id);
                 let first_sub_end = if reuse_cache {
-                    prefill_sub_boundaries(start, end, source.len(), bs)[0]
+                    let extra = self
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id));
+                    prefill_sub_boundaries_with_extra(start, end, source.len(), bs, extra)[0]
                 } else {
                     end
                 };
@@ -1858,7 +2022,11 @@ impl Inkling2Inner {
             }
             None => {
                 let first_sub_end = if reuse_cache {
-                    prefill_sub_boundaries(start, end, source.len(), bs)[0]
+                    let extra = self
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id));
+                    prefill_sub_boundaries_with_extra(start, end, source.len(), bs, extra)[0]
                 } else {
                     end
                 };
@@ -2202,7 +2370,11 @@ impl Inkling2Inner {
             let run_reuse_cache = run.reuse_cache;
             let next_start = run.end;
             let next_end = if run_reuse_cache {
-                prefill_sub_boundaries(next_start, unit_end, source.len(), bs)[0]
+                let extra = self
+                    .paged
+                    .as_ref()
+                    .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id));
+                prefill_sub_boundaries_with_extra(next_start, unit_end, source.len(), bs, extra)[0]
             } else {
                 unit_end
             };
@@ -2490,11 +2662,15 @@ impl Inkling2Inner {
         let Ok(prompt_u32) = u32::try_from(source.len()) else {
             return Ok(());
         };
-        if end_u32 >= prompt_u32 || !end_u32.is_multiple_of(bs) {
+        if end_u32 == 0 || end_u32 >= prompt_u32 || !end_u32.is_multiple_of(bs) {
             return Ok(());
         }
         let junction = (prompt_u32.saturating_sub(1) / bs) * bs;
-        let class = if junction > 0 && end_u32 == junction {
+        let is_extra_head = rt
+            .seq_extra_capture_boundaries
+            .get(&seq_id)
+            .is_some_and(|set| set.contains(&end_u32));
+        let class = if is_extra_head || (junction > 0 && end_u32 == junction) {
             StateClass::Ordinary
         } else if planned_rolling_checkpoints(prompt_u32, 0, bs).contains(&end_u32) {
             StateClass::Checkpoint
@@ -2520,7 +2696,7 @@ impl Inkling2Inner {
             CaptureOptions {
                 keep_prev_checkpoint: is_ordinary,
                 enqueue_write_behind: is_ordinary,
-                is_head: false,
+                is_head: is_extra_head,
                 now,
             },
         )?;
@@ -2851,6 +3027,29 @@ impl Inkling2Inner {
         tokens: &[u32],
         image_embeddings: Option<&MxArray>,
         tap_visit_indices: &[usize],
+        on_chunk_taps: impl FnMut(&Inkling2DsparkModel, &[MxArray], usize) -> Result<()>,
+    ) -> Result<(MxArray, u32)> {
+        self.paged_prefill_sequence_with_taps_and_prefix(
+            seq_id,
+            tokens,
+            image_embeddings,
+            tap_visit_indices,
+            None,
+            on_chunk_taps,
+        )
+    }
+
+    /// Chunked in-place paged prefill with optional target hidden state taps AND optional
+    /// [`Inkling2PrefixState`] boundary splitting / durable `StateStore` checkpoint & structural
+    /// prompt-head publication (mirroring `paged_prefill_dflash2_with_taps` for exclusive AR and
+    /// exclusive DSpark paths).
+    pub(crate) fn paged_prefill_sequence_with_taps_and_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        image_embeddings: Option<&MxArray>,
+        tap_visit_indices: &[usize],
+        capture_prefix: Option<&Inkling2PrefixState>,
         mut on_chunk_taps: impl FnMut(&Inkling2DsparkModel, &[MxArray], usize) -> Result<()>,
     ) -> Result<(MxArray, u32)> {
         if tokens.is_empty() {
@@ -2858,7 +3057,7 @@ impl Inkling2Inner {
                 "Inkling2Model::paged_prefill_sequence: empty tokens",
             ));
         }
-        let chunk_limit = {
+        let (chunk_limit, bs, existing) = {
             let rt = self.paged.as_ref().ok_or_else(|| {
                 Error::from_reason("Inkling2Model: paged runtime not initialized")
             })?;
@@ -2875,7 +3074,11 @@ impl Inkling2Inner {
                      paged cache capacity is {capacity} tokens"
                 )));
             }
-            rt.prefill_chunk_size
+            (
+                rt.prefill_chunk_size,
+                rt.coordinator.block_size().max(1),
+                existing,
+            )
         };
 
         // Validate total IMAGE_PAD count up front if image embeddings are supplied.
@@ -2891,6 +3094,21 @@ impl Inkling2Inner {
             }
         }
 
+        let has_image_lineage = self.seq_has_image_lineage(seq_id);
+        let capture_prefix = capture_prefix.filter(|prefix| {
+            prefix.reuse_cache
+                && image_embeddings.is_none()
+                && !has_image_lineage
+                && existing as usize == prefix.effective_cached_prefix_len
+                && existing as usize + tokens.len() <= prefix.full_tokens.len()
+        });
+        let extra_boundaries = capture_prefix.and_then(|_| {
+            self.paged
+                .as_ref()
+                .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id))
+                .cloned()
+        });
+
         let allow_draft_window = self
             .paged
             .as_ref()
@@ -2898,7 +3116,7 @@ impl Inkling2Inner {
         let dflash2_ar_taps: Vec<usize> = if tap_visit_indices.is_empty()
             && allow_draft_window
             && image_embeddings.is_none()
-            && self.cached_image_key.is_none()
+            && !has_image_lineage
             && let Some(ref draft) = self.dflash2
         {
             draft.config.target_layers.clone()
@@ -2912,106 +3130,143 @@ impl Inkling2Inner {
         };
 
         let total_len = tokens.len();
+        let abs_base = capture_prefix.map_or(existing as usize, |p| p.effective_cached_prefix_len);
+        let full_prompt_len = capture_prefix.map_or(abs_base + total_len, |p| p.full_tokens.len());
+        let capture_context = if tap_visit_indices.is_empty() {
+            "AR prefill"
+        } else {
+            "DSpark prefill"
+        };
         let mut offset = 0usize;
         let mut total_pruned = 0u32;
         let mut final_logits = None;
 
         while offset < total_len {
-            if self
-                .turn_cancel
-                .as_ref()
-                .is_some_and(|flag| flag.load(Ordering::Relaxed))
-            {
-                return Err(Error::from_reason("prefill cancelled"));
-            }
-            let end = (offset + chunk_limit).min(total_len);
-            let chunk = &tokens[offset..end];
-            let is_final_chunk = end == total_len;
-
-            // Slice image embeddings belonging to this chunk (if any).
-            let chunk_img = if let Some(img_emb) = image_embeddings {
-                let pad_count = chunk.iter().filter(|&&tok| tok == IMAGE_PAD_ID).count();
-                if pad_count > 0 {
-                    let d = img_emb.shape()?[1];
-                    let slice = img_emb.slice(
-                        &[img_cursor as i64, 0],
-                        &[(img_cursor + pad_count) as i64, d],
-                    )?;
-                    img_cursor += pad_count;
-                    Some(slice)
-                } else {
-                    None
-                }
+            let chunk_end = (offset + chunk_limit).min(total_len);
+            let abs_chunk_start = abs_base + offset;
+            let abs_chunk_end = abs_base + chunk_end;
+            let subs = if capture_prefix.is_some() {
+                prefill_sub_boundaries_with_extra(
+                    abs_chunk_start,
+                    abs_chunk_end,
+                    full_prompt_len,
+                    bs,
+                    extra_boundaries.as_ref(),
+                )
             } else {
-                None
+                vec![abs_chunk_end]
             };
+            let mut abs_sub_start = abs_chunk_start;
 
-            // Current sequence cursor BEFORE recording this chunk.
-            let (first_pos, pre_chunk_conv) = {
-                let rt = self
-                    .paged
-                    .as_mut()
-                    .ok_or_else(|| Error::from_reason("Inkling2Model: paged runtime missing"))?;
-                let pos = rt
-                    .coordinator
-                    .request_token_count_all(seq_id)
-                    .map_err(Error::from_reason)?;
-                let conv = if pos == 0 {
-                    let _ = rt.ensure_conv_state(seq_id, &self.config)?;
-                    None
+            for abs_sub_end in subs {
+                if self
+                    .turn_cancel
+                    .as_ref()
+                    .is_some_and(|flag| flag.load(Ordering::Relaxed))
+                {
+                    return Err(Error::from_reason("prefill cancelled"));
+                }
+                let sub_start = abs_sub_start - abs_base;
+                let sub_end = abs_sub_end - abs_base;
+                let chunk = &tokens[sub_start..sub_end];
+                let is_final_chunk = sub_end == total_len;
+
+                // Slice image embeddings belonging to this sub-chunk (if any).
+                let chunk_img = if let Some(img_emb) = image_embeddings {
+                    let pad_count = chunk.iter().filter(|&&tok| tok == IMAGE_PAD_ID).count();
+                    if pad_count > 0 {
+                        let d = img_emb.shape()?[1];
+                        let slice = img_emb.slice(
+                            &[img_cursor as i64, 0],
+                            &[(img_cursor + pad_count) as i64, d],
+                        )?;
+                        img_cursor += pad_count;
+                        Some(slice)
+                    } else {
+                        None
+                    }
                 } else {
-                    Some(rt.ensure_conv_state(seq_id, &self.config)?.clone())
+                    None
                 };
-                (pos, conv)
-            };
-            self.record_tokens_all_exclusive(seq_id, chunk)
-                .map_err(Error::from_reason)?;
 
-            let chunk_res = self.forward_paged_single_chunk_with_taps(
-                seq_id,
-                chunk,
-                chunk_img.as_ref(),
-                first_pos,
-                /* compute_last_logits */ is_final_chunk,
-                effective_tap_visits,
-            );
-            let (logits_opt, taps) = match chunk_res {
-                Ok(out) => out,
-                Err(err) => {
-                    self.rollback_prefill_unit(seq_id, first_pos as usize, pre_chunk_conv);
-                    return Err(err);
-                }
-            };
+                // Current sequence cursor BEFORE recording this sub-chunk.
+                let (first_pos, pre_chunk_conv) = {
+                    let rt = self.paged.as_mut().ok_or_else(|| {
+                        Error::from_reason("Inkling2Model: paged runtime missing")
+                    })?;
+                    let pos = rt
+                        .coordinator
+                        .request_token_count_all(seq_id)
+                        .map_err(Error::from_reason)?;
+                    let conv = if pos == 0 {
+                        let _ = rt.ensure_conv_state(seq_id, &self.config)?;
+                        None
+                    } else {
+                        Some(rt.ensure_conv_state(seq_id, &self.config)?.clone())
+                    };
+                    (pos, conv)
+                };
+                self.record_tokens_all_exclusive(seq_id, chunk)
+                    .map_err(Error::from_reason)?;
 
-            // Materialize pending pool writes + ShortConv state and prune expired SWA blocks
-            // before launching the next chunk (keeps SWA pool usage bounded to O(window + chunk)).
-            let pruned = self.settle_paged_step(seq_id)?;
-            total_pruned = total_pruned.saturating_add(pruned);
-            if !tap_visit_indices.is_empty()
-                && let Some(ref draft) = self.dspark
-            {
-                on_chunk_taps(draft, &taps, chunk.len())?;
-            } else if allow_draft_window && !dflash2_ar_taps.is_empty() && !taps.is_empty() {
-                self.record_taps_to_draft_window_best_effort(
+                let chunk_res = self.forward_paged_single_chunk_with_taps(
                     seq_id,
+                    chunk,
+                    chunk_img.as_ref(),
                     first_pos,
-                    &taps,
-                    chunk.len(),
-                    "AR prefill",
+                    /* compute_last_logits */ is_final_chunk,
+                    effective_tap_visits,
                 );
-            }
-            if let Some(rt) = self.paged.as_mut()
-                && let Ok(pos_after) = u32::try_from(first_pos as usize + chunk.len())
-            {
-                rt.record_block_boundary_conv(seq_id, pos_after);
-            }
+                let (logits_opt, taps) = match chunk_res {
+                    Ok(out) => out,
+                    Err(err) => {
+                        self.rollback_prefill_unit(seq_id, first_pos as usize, pre_chunk_conv);
+                        return Err(err);
+                    }
+                };
 
-            if is_final_chunk {
-                final_logits = logits_opt;
-            } else {
-                crate::array::clear_cache();
+                // Materialize pending pool writes + ShortConv state and prune expired SWA blocks
+                // before launching the next sub-chunk (keeps SWA pool usage bounded to O(window + chunk)).
+                let pruned = self.settle_paged_step(seq_id)?;
+                total_pruned = total_pruned.saturating_add(pruned);
+                if !tap_visit_indices.is_empty()
+                    && let Some(ref draft) = self.dspark
+                {
+                    on_chunk_taps(draft, &taps, chunk.len())?;
+                } else if allow_draft_window && !dflash2_ar_taps.is_empty() && !taps.is_empty() {
+                    self.record_taps_to_draft_window_best_effort(
+                        seq_id,
+                        first_pos,
+                        &taps,
+                        chunk.len(),
+                        "AR prefill",
+                    );
+                }
+                if let Ok(pos_after) = u32::try_from(first_pos as usize + chunk.len()) {
+                    if let Some(rt) = self.paged.as_mut() {
+                        rt.record_block_boundary_conv(seq_id, pos_after);
+                    }
+                    if let Some(prefix) = capture_prefix
+                        && pos_after as usize <= prefix.full_tokens.len()
+                    {
+                        self.maybe_capture_rolling_checkpoint_best_effort(
+                            seq_id,
+                            &prefix.full_tokens,
+                            pos_after as usize,
+                            prefix.cache_salt,
+                            capture_context,
+                        );
+                    }
+                }
+
+                if is_final_chunk {
+                    final_logits = logits_opt;
+                } else {
+                    crate::array::clear_cache();
+                }
+                abs_sub_start = abs_sub_end;
             }
-            offset = end;
+            offset = chunk_end;
         }
 
         let logits = final_logits.ok_or_else(|| {
@@ -4745,7 +5000,7 @@ fn dispatch_paged_attention_kernel_ex(
 
 /// Legacy wrapper returning `(attn_o, lse)` without fused gate/sink or on-the-fly rel_bias
 /// (used by unit parity tests).
-#[cfg(test)]
+#[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::too_many_arguments)]
 fn dispatch_paged_attention_kernel(
     q_cur: &MxArray,
@@ -6137,17 +6392,11 @@ pub(crate) fn resolve_inkling2_thinking_enabled(config: &ChatConfig) -> Result<b
     )? > 0.0)
 }
 
-/// Render `messages` to Inkling2 native wire token IDs matching [`Inkling2Inner::render_prompt`].
-///
-/// Shared by both [`ChatBackend::render_prompt`] and [`super::model::Inkling2Model::apply_chat_template`]
-/// so preflight context sizing, `/v1/messages/count_tokens`, and GPU inference agree identically.
-pub(crate) fn render_inkling2_prompt(
-    tok: &Qwen3Tokenizer,
-    messages: &[ChatMessage],
+fn build_inkling2_render_options(
     tools: Option<&[ToolDefinition]>,
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
-) -> Result<Vec<u32>> {
+) -> Result<Inkling2RenderOptions> {
     let effort = resolve_inkling2_effort(enable_thinking, reasoning_effort)?;
     let specs = match tools {
         Some(defs) => defs
@@ -6159,12 +6408,40 @@ pub(crate) fn render_inkling2_prompt(
             })?,
         None => Vec::new(),
     };
-    let opts = Inkling2RenderOptions {
+    Ok(Inkling2RenderOptions {
         reasoning_effort: effort,
         tools: specs,
         ..Default::default()
-    };
+    })
+}
+
+/// Render `messages` to Inkling2 native wire token IDs matching [`Inkling2Inner::render_prompt`].
+///
+/// Shared by both [`ChatBackend::render_prompt`] and [`super::model::Inkling2Model::apply_chat_template`]
+/// so preflight context sizing, `/v1/messages/count_tokens`, and GPU inference agree identically.
+pub(crate) fn render_inkling2_prompt(
+    tok: &Qwen3Tokenizer,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Result<Vec<u32>> {
+    let opts = build_inkling2_render_options(tools, enable_thinking, reasoning_effort)?;
     render_inkling2_chat_messages_to_ids(messages, tok, &opts)
+        .map_err(|e| Error::from_reason(format!("Inkling2 prompt render failed: {e}")))
+}
+
+/// Render `messages` to Inkling2 native wire token IDs along with structural
+/// static-prefix breakpoint offsets matching [`Inkling2Inner::render_prompt_with_breakpoints`].
+pub(crate) fn render_inkling2_prompt_with_breakpoints(
+    tok: &Qwen3Tokenizer,
+    messages: &[ChatMessage],
+    tools: Option<&[ToolDefinition]>,
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Result<(Vec<u32>, Vec<u32>)> {
+    let opts = build_inkling2_render_options(tools, enable_thinking, reasoning_effort)?;
+    render_inkling2_chat_messages_to_ids_with_boundaries(messages, tok, &opts)
         .map_err(|e| Error::from_reason(format!("Inkling2 prompt render failed: {e}")))
 }
 
@@ -6219,6 +6496,12 @@ impl ChatBackend for Inkling2Inner {
         let markers = InklingOutputMarkerIds::from_tokenizer(tok);
         let open_id = markers.content_thinking.unwrap_or(CONTENT_THINKING_ID);
         let close_id = markers.end_message.unwrap_or(END_MESSAGE_ID);
+        if crate::engine::params::is_open_token_thinking_disabled(config) {
+            return crate::engine::backend::ThinkEndResolution::with_open_token(
+                open_id,
+                Arc::from([close_id]),
+            );
+        }
         let mut end = match config.thinking_end_text.as_deref() {
             Some(text) if !text.is_empty() => {
                 tok.encode_sync(text, Some(false)).unwrap_or_default()
@@ -6245,6 +6528,28 @@ impl ChatBackend for Inkling2Inner {
             crate::engine::resolve_enable_thinking(config),
             config.reasoning_effort.as_deref(),
         )
+    }
+
+    fn render_prompt_with_breakpoints(
+        &self,
+        tok: &Qwen3Tokenizer,
+        messages: &[ChatMessage],
+        config: &ChatConfig,
+        _preserve_thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        render_inkling2_prompt_with_breakpoints(
+            tok,
+            messages,
+            config.tools.as_deref(),
+            crate::engine::resolve_enable_thinking(config),
+            config.reasoning_effort.as_deref(),
+        )
+    }
+
+    fn set_pending_prefix_breakpoints(&mut self, prompt_tokens: u32, breakpoints: &[u32]) {
+        if let Some(seq_id) = self.paged.as_ref().map(|rt| rt.active_seq) {
+            self.set_seq_prefix_breakpoints_inner(seq_id, prompt_tokens, breakpoints);
+        }
     }
 
     fn uses_jinja_continuation(&self) -> bool {
@@ -6284,6 +6589,7 @@ impl ChatBackend for Inkling2Inner {
                 rt.seq_reuse_cache.clear();
                 rt.seq_cache_salt.clear();
                 rt.seq_image_lineage.clear();
+                rt.seq_extra_capture_boundaries.clear();
             } else {
                 let seq = rt.active_seq;
                 self.dspark_turn_contexts.remove(&seq);
@@ -6804,7 +7110,7 @@ impl PagedBackend for Inkling2Inner {
     fn paged_prefill(
         &mut self,
         suffix_tokens: &[u32],
-        _prefix: &Self::PrefixState,
+        prefix: &Self::PrefixState,
         stream: Stream,
     ) -> Result<MxArray> {
         let _ctx = StreamContext::new(stream);
@@ -6818,7 +7124,14 @@ impl PagedBackend for Inkling2Inner {
         self.dspark_turn_contexts.remove(&seq_id);
         self.scheduled_dspark.seq_lanes.remove(&seq_id);
         self.scheduled_dspark.sync_decode_limit();
-        let (logits, _) = self.paged_prefill_sequence(seq_id, suffix_tokens, None)?;
+        let (logits, _) = self.paged_prefill_sequence_with_taps_and_prefix(
+            seq_id,
+            suffix_tokens,
+            None,
+            &[],
+            Some(prefix),
+            |_, _, _| Ok(()),
+        )?;
         // `run_paged_turn` expects `[vocab]` (or `[1, vocab]`; `squeeze([0])` matches gemma4).
         logits.squeeze(Some(&[0]))
     }
@@ -6843,7 +7156,7 @@ impl PagedBackend for Inkling2Inner {
         let res = if let Some(ref mut rt) = self.paged {
             rt.paged_finalize_error = None;
             rt.restored_draft_windows.remove(&seq_id);
-            (|| -> std::result::Result<(), String> {
+            let res = (|| -> std::result::Result<(), String> {
                 rt.coordinator.activate_request_all(seq_id)?;
                 rt.coordinator.eval_pending_pool_writes_all()?;
                 if reuse_cache {
@@ -6927,7 +7240,10 @@ impl PagedBackend for Inkling2Inner {
                     rt.seq_cache_salt.remove(&seq_id);
                 }
                 Ok(())
-            })()
+            })();
+            rt.state_store.end_seq_use(seq_id);
+            rt.seq_extra_capture_boundaries.remove(&seq_id);
+            res
         } else {
             return;
         };
@@ -8501,7 +8817,69 @@ mod stream_emitter_tests {
         assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("none"))).unwrap());
         assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("0"))).unwrap());
         assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("0.0"))).unwrap());
+        assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("-0.0"))).unwrap());
         assert_eq!(resolve_inkling2_effort(Some(false), None).unwrap(), 0.0);
+
+        // Verify ChatBackend::public_thinking_enabled agrees with resolve_inkling2_thinking_enabled
+        // across every valid effort spelling, and that finalize_inkling2_turn + Inkling2StreamEmitter
+        // propagate both false and true faithfully into ChatResult and terminal ChatStreamChunk.
+        use crate::engine::backend::ChatBackend;
+        let inner = super::dflash2_plan_tests::build_dflash2_only_inner();
+        for effort in [
+            None,
+            Some("minimal"),
+            Some("low"),
+            Some("medium"),
+            Some("high"),
+            Some("max"),
+            Some("0.25"),
+            Some("none"),
+            Some("0"),
+            Some("0.0"),
+            Some("-0.0"),
+        ] {
+            let cfg = config_with_effort(effort);
+            let expected = resolve_inkling2_thinking_enabled(&cfg).unwrap();
+            assert_eq!(
+                inner.public_thinking_enabled(&cfg),
+                expected,
+                "public_thinking_enabled must match resolve_inkling2_thinking_enabled for effort={effort:?}"
+            );
+        }
+
+        let tokenizer = build_test_tokenizer();
+        let tokens = tokenizer
+            .inner()
+            .encode(
+                "<|message_model|><|content_text|>Hi<|end_message|><|content_model_end_sampling|>",
+                false,
+            )
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        for expected in [false, true] {
+            let result = finalize_inkling2_turn(FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &tokens,
+                finish_reason: "stop".to_string(),
+                think_end_id: None,
+                think_end_str: None,
+                think_end_extra_ids: &[],
+                performance: None,
+                include_reasoning: true,
+                thinking_enabled: expected,
+                prompt_tokens: 4,
+                reasoning: ReasoningOutcome::default(),
+            })
+            .expect("finalize");
+            assert_eq!(result.thinking_enabled, expected);
+            let sink = VecSink::default();
+            let mut emitter = Inkling2StreamEmitter::with_tokenizer(tokenizer.inner_arc());
+            emitter.finish(&result, &sink);
+            let chunks = sink.chunks();
+            let (_, _, done) = collect_streamed(&chunks);
+            assert_eq!(done.thinking_enabled, Some(expected));
+        }
     }
 
     #[test]
@@ -8537,18 +8915,208 @@ mod stream_emitter_tests {
             "think_end_for_turn must NOT force <|content_text|> after <|end_message|>"
         );
 
-        // Custom `thinking_end_text`: encoded with add_special_tokens=false followed by <|end_message|>.
-        let custom_cfg = ChatConfig {
-            thinking_end_text: Some("stop".to_string()),
-            ..ChatConfig::default()
-        };
-        let custom_res = inner.think_end_for_turn(&custom_cfg, &tok);
+        // Custom `thinking_end_text` with active effort (unset or non-zero): encoded with
+        // add_special_tokens=false followed by <|end_message|>.
         let mut expected = tok.encode_sync("stop", Some(false)).unwrap();
         expected.push(close_id);
-        assert_eq!(custom_res.think_open_id, Some(open_id));
-        assert_eq!(custom_res.think_end_id, Some(close_id));
-        assert_eq!(custom_res.thinking_end.as_ref(), expected.as_slice());
-        assert!(!custom_res.thinking_end.contains(&content_text_id));
+        for effort in [None, Some("low"), Some("0.2")] {
+            let custom_cfg = ChatConfig {
+                reasoning_effort: effort.map(str::to_string),
+                thinking_end_text: Some("stop".to_string()),
+                ..ChatConfig::default()
+            };
+            let custom_res = inner.think_end_for_turn(&custom_cfg, &tok);
+            assert_eq!(custom_res.think_open_id, Some(open_id));
+            assert_eq!(custom_res.think_end_id, Some(close_id));
+            assert_eq!(
+                custom_res.thinking_end.as_ref(),
+                expected.as_slice(),
+                "effort={effort:?} must preserve custom thinking_end_text before <|end_message|>"
+            );
+            assert!(!custom_res.thinking_end.contains(&content_text_id));
+        }
+
+        // Disabled effort ("none" / numeric zero) must ignore non-empty `thinking_end_text`
+        // and resolve strictly to `[<|end_message|>]` so closing prose is never injected.
+        for effort in ["none", "0", "0.0", "-0.0", " 0.0 "] {
+            let disabled_cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                thinking_end_text: Some("Time is up, stop thinking now.".to_string()),
+                ..ChatConfig::default()
+            };
+            let disabled_res = inner.think_end_for_turn(&disabled_cfg, &tok);
+            assert_eq!(disabled_res.think_open_id, Some(open_id));
+            assert_eq!(disabled_res.think_end_id, Some(close_id));
+            assert_eq!(
+                disabled_res.thinking_end.as_ref(),
+                &[close_id],
+                "effort={effort:?} must ignore custom thinking_end_text and emit only <|end_message|>"
+            );
+            assert!(!disabled_res.thinking_end.contains(&content_text_id));
+        }
+    }
+
+    #[test]
+    fn disabled_reasoning_ignores_custom_thinking_end_text_in_ar_and_speculative_decode() {
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
+        use crate::engine::types::ChatConfig;
+        use crate::tools::inkling::InklingOutputMarkerIds;
+
+        let tok = build_test_tokenizer();
+        let markers = InklingOutputMarkerIds::from_tokenizer(&tok);
+        let open_id = markers.content_thinking.expect("content_thinking id");
+        let close_id = markers.end_message.expect("end_message id");
+        let message_model_id = markers.message_model.expect("message_model id");
+        let content_text_id = markers.content_text.expect("content_text id");
+        let end_sampling_id = markers
+            .content_model_end_sampling
+            .expect("content_model_end_sampling id");
+
+        let inner = super::dflash2_plan_tests::build_dflash2_only_inner();
+
+        let closing_text = "Time is up, stop thinking now.";
+        let closing_tokens = tok.encode_sync(closing_text, Some(false)).unwrap();
+        let max_output_tokens = 10usize;
+        assert!(
+            closing_tokens.len() > max_output_tokens,
+            "test closing text must exceed the short {max_output_tokens}-token output budget"
+        );
+
+        let thought_tokens = tok.encode_sync("secret", Some(false)).unwrap();
+        let answer_payload = tok.encode_sync("42", Some(false)).unwrap();
+        let mut answer_seq = vec![message_model_id, content_text_id];
+        answer_seq.extend_from_slice(&answer_payload);
+        answer_seq.push(close_id);
+        answer_seq.push(end_sampling_id);
+        assert_eq!(
+            2 + answer_seq.len(),
+            8,
+            "aborted [open, close] + answer must fit comfortably within the 10-token budget"
+        );
+
+        for effort in ["none", "0.0"] {
+            let cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                thinking_end_text: Some(closing_text.to_string()),
+                max_new_tokens: Some(max_output_tokens as i32),
+                ..ChatConfig::default()
+            };
+            let setup = inner.thinking_setup(&cfg);
+            let close = inner.think_end_for_turn(&cfg, &tok);
+            assert_eq!(close.think_open_id, Some(open_id));
+            assert_eq!(close.thinking_end.as_ref(), &[close_id]);
+
+            // 1. Autoregressive decode (`observe_token` / `take_forced_token`):
+            //    Model disobeys and emits `open_id`, then would emit thought tokens if not forced,
+            //    and emits the answer after `close_id`.
+            let mut ar_tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut ar_emitted = Vec::new();
+            let mut answer_idx = 0usize;
+            let mut closed_once = false;
+            let mut next_token = open_id;
+            while ar_emitted.len() < max_output_tokens {
+                ar_emitted.push(next_token);
+                let is_reasoning = ar_tracker.observe_token(next_token);
+                if ar_emitted.len() == 1 {
+                    assert!(is_reasoning, "effort={effort}: open_id enters reasoning");
+                    assert!(ar_tracker.ending(), "effort={effort}: budget=0 arms cut");
+                } else if ar_emitted.len() == 2 {
+                    assert_eq!(next_token, close_id);
+                    assert!(is_reasoning, "effort={effort}: close_id closes reasoning");
+                    assert!(!ar_tracker.ending());
+                    closed_once = true;
+                } else {
+                    assert!(
+                        !is_reasoning,
+                        "effort={effort}: answer tokens stay outside reasoning"
+                    );
+                }
+                if next_token == end_sampling_id {
+                    break;
+                }
+                next_token = if let Some(forced) = ar_tracker.take_forced_token() {
+                    forced
+                } else if !closed_once {
+                    thought_tokens[0]
+                } else {
+                    let tok_id = answer_seq[answer_idx];
+                    answer_idx += 1;
+                    tok_id
+                };
+            }
+
+            let mut expected_emitted = vec![open_id, close_id];
+            expected_emitted.extend_from_slice(&answer_seq);
+            assert_eq!(
+                ar_emitted, expected_emitted,
+                "effort={effort}: AR decode must consume only [open_id, close_id] (0 closing-text \
+                 and 0 reasoning-prose tokens) and leave budget for the full answer"
+            );
+            assert!(ar_emitted.len() <= max_output_tokens);
+            let ar_outcome = ar_tracker.outcome();
+            assert_eq!(ar_outcome.tokens, 0);
+            assert_eq!(ar_outcome.close, Some(ReasoningClose::Budget));
+            assert_eq!(ar_outcome.cut_at, Some(0));
+
+            // 2. Speculative decode (`speculative_wave_limit` + `thinking_cut` + `observe_token` /
+            //    `take_forced_token`):
+            let mut spec_tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut spec_emitted = Vec::new();
+
+            // Wave 1: model drafts `[open_id, thought_0, thought_1, thought_2]`.
+            let wave1 = [
+                open_id,
+                thought_tokens[0],
+                thought_tokens[1],
+                thought_tokens[2],
+            ];
+            let wave1_limit = spec_tracker.speculative_wave_limit(&wave1);
+            assert_eq!(
+                wave1_limit, 1,
+                "effort={effort}: speculative_wave_limit must stop immediately after open_id"
+            );
+            for &tok_id in &wave1[..wave1_limit] {
+                assert!(spec_tracker.observe_token(tok_id));
+                spec_emitted.push(tok_id);
+            }
+            assert!(spec_tracker.ending());
+
+            // The speculative cut must propose ONLY `[close_id]` (0 closing-text tokens).
+            let cut = spec_tracker
+                .thinking_cut()
+                .expect("cut must be armed immediately after open_id");
+            assert_eq!(cut.row, 0);
+            assert_eq!(cut.proposals(4), &[close_id]);
+            assert_eq!(spec_tracker.take_forced_token(), Some(close_id));
+
+            // Wave 2: forced `close_id` followed by the answer fits inside the 10-token budget.
+            let mut wave2 = vec![close_id];
+            wave2.extend_from_slice(&answer_seq);
+            let wave2_limit = spec_tracker.speculative_wave_limit(&wave2);
+            assert_eq!(
+                wave2_limit,
+                wave2.len(),
+                "effort={effort}: wave starting with close_id must accept close_id + full answer"
+            );
+            for (idx, &tok_id) in wave2[..wave2_limit].iter().enumerate() {
+                let is_reasoning = spec_tracker.observe_token(tok_id);
+                assert_eq!(is_reasoning, idx == 0);
+                spec_emitted.push(tok_id);
+            }
+            assert!(!spec_tracker.ending());
+            assert_eq!(spec_tracker.take_forced_token(), None);
+            assert_eq!(
+                spec_emitted, expected_emitted,
+                "effort={effort}: speculative decode must consume only [open_id, close_id] \
+                 (0 closing-text and 0 reasoning-prose tokens) and leave budget for the answer"
+            );
+            assert!(spec_emitted.len() <= max_output_tokens);
+            let spec_outcome = spec_tracker.outcome();
+            assert_eq!(spec_outcome.tokens, 0);
+            assert_eq!(spec_outcome.close, Some(ReasoningClose::Budget));
+            assert_eq!(spec_outcome.cut_at, Some(0));
+        }
     }
 }
 
@@ -9751,6 +10319,7 @@ mod dflash2_plan_tests {
     /// post-frontier checkpoint (`128` or `160`), WITHOUT retiring the prior checkpoint at `64`,
     /// and WITHOUT modifying Group 0 marked blocks — across BOTH fast (`budget_ms = None`) and
     /// resumable (`budget_ms = Some(0.0)`) paths.
+    #[cfg(target_os = "macos")]
     #[test]
     fn failed_prefill_draft_append_leaves_statestore_checkpoints_and_marks_untouched() {
         if !crate::engine::persistence::compiled_forward_backend_available() {
@@ -9979,5 +10548,521 @@ mod dflash2_plan_tests {
                 );
             }
         }
+    }
+
+    /// WS2: Pure sub-boundary helper check matching the live Recon/Verify offsets (cross-platform).
+    #[test]
+    fn prefill_sub_boundaries_with_extra_splits_live_offsets() {
+        let live_extra: BTreeSet<u32> = [13_472u32, 13_632u32].into_iter().collect();
+        assert_eq!(
+            prefill_sub_boundaries_with_extra(12_288, 14_143, 14_143, 32, Some(&live_extra)),
+            vec![13_472, 13_632, 14_112, 14_143],
+            "unit [12288..14143) must split at 13472, 13632, junction 14112, and unit end 14143"
+        );
+    }
+
+    /// WS2: Multiple custom extra capture boundaries inside a single `Measured` unit split cleanly
+    /// across both fast (`budget_ms = None`) and resumable (`budget_ms = Some(0.0)`) paths,
+    /// capturing every extra boundary as `StateClass::Ordinary` with `is_head = true` and complete
+    /// `PackedDraftWindow`. Also verifies that when `aligned == junction`, `is_extra_head` wins so
+    /// the captured anchor preserves `is_head = true` and `keep_prev_checkpoint = true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn extra_capture_boundaries_split_measured_unit_and_prefer_extra_head_on_junction_tie() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::ScheduledPrefillPass;
+
+        struct CheckpointIntervalGuard(Option<u32>);
+        impl CheckpointIntervalGuard {
+            fn set(interval: u32) -> Self {
+                let prev = super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE
+                    .with(|cell| cell.replace(Some(interval)));
+                Self(prev)
+            }
+        }
+        impl Drop for CheckpointIntervalGuard {
+            fn drop(&mut self) {
+                super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE
+                    .with(|cell| cell.set(self.0));
+            }
+        }
+
+        let gen_stream = Stream::generation();
+        let prompt: Vec<u32> = (0u32..192u32).map(|i| 10 + (i % 80)).collect();
+
+        let drive_unit = |inner: &mut Inkling2Inner,
+                          seq_id: SeqId,
+                          start: usize,
+                          end: usize,
+                          salt: u64,
+                          budget_ms: Option<f64>|
+         -> Result<Option<MxArray>> {
+            for _ in 0..256 {
+                match inner.run_paged_prefill_pass(
+                    seq_id, &prompt, start, end, salt, true, gen_stream, budget_ms,
+                )? {
+                    ScheduledPrefillPass::Paused => {}
+                    ScheduledPrefillPass::Done(logits) => return Ok(logits),
+                }
+            }
+            panic!("prefill pass did not terminate");
+        };
+
+        let build_ready_inner = || {
+            let mut inner =
+                super::super::scheduler::tests::build_synthetic_dflash2_inner_with_window(
+                    512, None, 64, 2,
+                );
+            inner
+                .enable_paged(Inkling2PagedConfig {
+                    kv_format: default_inkling2_kv_format(),
+                    block_size: 32,
+                    max_model_len: 512,
+                    max_chunk: 256,
+                    max_concurrent_sequences: 2,
+                    gpu_memory_mb: None,
+                })
+                .expect("enable_paged");
+            inner
+        };
+
+        // Case A: Multiple custom breakpoints (`64`, `96`) + distinct junction (`160`) inside one
+        // `Measured` unit `[32..192)`, verified on both fast (`None`) and resumable (`Some(0.0)`).
+        for (case_idx, budget_ms) in [None, Some(0.0)].into_iter().enumerate() {
+            let mut inner = build_ready_inner();
+            let seq_id = 1u32;
+            let salt = 0xE200u64 + case_idx as u64;
+
+            inner.set_seq_prefix_breakpoints_inner(seq_id, 192, &[65, 100]);
+            inner
+                .prepare_prefix_sync(seq_id, &prompt, true, salt)
+                .expect("prepare cold prefix");
+            assert!(
+                drive_unit(&mut inner, seq_id, 0, 32, salt, None)
+                    .expect("seed [0..32)")
+                    .is_none()
+            );
+            assert!(
+                drive_unit(&mut inner, seq_id, 32, 192, salt, budget_ms)
+                    .expect("unit [32..192)")
+                    .is_some()
+            );
+
+            let rt = inner.paged.as_ref().expect("paged");
+            let mut published: Vec<(usize, bool, bool, bool)> = rt
+                .state_store
+                .store
+                .entries()
+                .map(|e| {
+                    (
+                        e.depth(),
+                        e.checkpoint(),
+                        rt.state_store.is_prompt_head(e.id()),
+                        e.ram()
+                            .and_then(|r| r.draft_window.as_ref())
+                            .is_some_and(|w| w.is_complete_for(e.depth() as u32)),
+                    )
+                })
+                .collect();
+            published.sort_unstable();
+            assert_eq!(
+                published,
+                vec![
+                    (64, false, true, true),
+                    (96, false, true, true),
+                    (160, false, false, true),
+                ],
+                "case {case_idx}: all extra heads (64, 96) and junction (160) must capture cleanly \
+                 with is_head=true on extra heads and complete PackedDraftWindows"
+            );
+        }
+
+        // Case B: `aligned == junction` (`160`) installed as an extra breakpoint alongside a prior
+        // rolling checkpoint at `64`: `is_extra_head` must win over `is_junction`, preserving BOTH
+        // `is_head = true` on `160` AND `keep_prev_checkpoint = true` so `64` survives!
+        let _cp_guard = CheckpointIntervalGuard::set(64);
+        let mut inner = build_ready_inner();
+        let seq_id = 2u32;
+        let salt = 0xE299u64;
+        inner.set_seq_prefix_breakpoints_inner(seq_id, 192, &[165]); // floors to 160 == junction
+        inner
+            .prepare_prefix_sync(seq_id, &prompt, true, salt)
+            .expect("prepare cold prefix");
+        assert!(
+            drive_unit(&mut inner, seq_id, 0, 64, salt, None)
+                .expect("seed rolling checkpoint [0..64)")
+                .is_none()
+        );
+        assert!(
+            drive_unit(&mut inner, seq_id, 64, 192, salt, None)
+                .expect("unit [64..192) hitting aligned==junction")
+                .is_some()
+        );
+        let rt = inner.paged.as_ref().expect("paged");
+        let mut published: Vec<(usize, bool, bool)> = rt
+            .state_store
+            .store
+            .entries()
+            .map(|e| {
+                (
+                    e.depth(),
+                    e.checkpoint(),
+                    rt.state_store.is_prompt_head(e.id()),
+                )
+            })
+            .collect();
+        published.sort_unstable();
+        assert_eq!(
+            published,
+            vec![(128, true, false), (160, false, true)],
+            "aligned == junction must publish Ordinary with is_head = true and keep_prev_checkpoint = true"
+        );
+    }
+
+    /// C2: Exclusive AR (`PagedBackend::paged_prefill`) splits single-chunk prefills at installed
+    /// structural prefix breakpoints, publishes `StateClass::Ordinary` prompt heads (`is_head = true`)
+    /// with complete `PackedDraftWindow`s, cleans up per-seq boundaries on finalize and abort, and
+    /// lets a later diverged prompt restore that anchor with exact greedy parity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exclusive_ar_paged_prefill_honors_structural_prefix_anchors_and_matches_greedy_parity() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::{ChatBackend, PagedBackend};
+
+        let gen_stream = Stream::generation();
+        let salt = 0xC201_u64;
+        let prompt_a: Vec<u32> = (0u32..192u32).map(|i| 10 + (i % 80)).collect();
+        // Diverged prompt shares [0..96) with prompt_a and diverges at token 96 (length 160).
+        let mut prompt_b: Vec<u32> = prompt_a[..96].to_vec();
+        prompt_b.extend((0u32..64u32).map(|i| 25 + ((i * 7) % 80)));
+
+        let greedy_argmax = |logits: &MxArray| -> u32 {
+            let flat = if logits.ndim().unwrap() == 1 {
+                logits.clone()
+            } else {
+                logits.squeeze(Some(&[0])).unwrap()
+            };
+            let idx = flat.argmax(0, Some(false)).unwrap();
+            idx.eval();
+            idx.item_at_int32(0).unwrap() as u32
+        };
+
+        let run_ar_greedy = |inner: &mut Inkling2Inner,
+                             prompt: &[u32],
+                             reuse_cache: bool,
+                             breakpoints: &[u32]|
+         -> (usize, Vec<u32>) {
+            inner.set_pending_prefix_breakpoints(prompt.len() as u32, breakpoints);
+            let prefix = inner
+                .prime_prefix_state(prompt, reuse_cache, 32, &[], salt)
+                .expect("prime_prefix_state");
+            let suffix = &prompt[prefix.effective_cached_prefix_len..];
+            let first_logits = inner
+                .paged_prefill(suffix, &prefix, gen_stream)
+                .expect("exclusive paged_prefill");
+            let seq_id = inner.paged.as_ref().unwrap().active_seq;
+            let mut generated = Vec::with_capacity(5);
+            let mut tok = greedy_argmax(&first_logits);
+            generated.push(tok);
+            for _ in 0..4 {
+                let logits = inner
+                    .paged_decode_step(seq_id, tok)
+                    .expect("paged_decode_step");
+                tok = greedy_argmax(&logits);
+                generated.push(tok);
+            }
+            inner.finalize_paged_turn(reuse_cache, salt);
+            (prefix.effective_cached_prefix_len, generated)
+        };
+
+        let mut inner = super::super::scheduler::tests::build_synthetic_dflash2_inner_with_window(
+            512, None, 64, 2,
+        );
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 512,
+                max_chunk: 256,
+                max_concurrent_sequences: 2,
+                gpu_memory_mb: None,
+            })
+            .expect("enable_paged");
+
+        // 1. Cold greedy baseline for diverged prompt_b (reuse_cache = false).
+        let (baseline_cached, baseline_tokens) = run_ar_greedy(&mut inner, &prompt_b, false, &[]);
+        assert_eq!(baseline_cached, 0);
+
+        // 2. Exclusive AR turn on prompt_a with structural breakpoints [65, 100] -> [64, 96].
+        let (cached_a, _) = run_ar_greedy(&mut inner, &prompt_a, true, &[65, 100]);
+        assert_eq!(cached_a, 0);
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            assert!(
+                rt.seq_extra_capture_boundaries.is_empty(),
+                "finalize_paged_turn must clear seq_extra_capture_boundaries"
+            );
+            let mut published: Vec<(usize, bool, bool, bool)> = rt
+                .state_store
+                .store
+                .entries()
+                .map(|e| {
+                    (
+                        e.depth(),
+                        e.checkpoint(),
+                        rt.state_store.is_prompt_head(e.id()),
+                        e.ram()
+                            .and_then(|r| r.draft_window.as_ref())
+                            .is_some_and(|w| w.is_complete_for(e.depth() as u32)),
+                    )
+                })
+                .collect();
+            published.sort_unstable();
+            assert!(
+                published.contains(&(64, false, true, true)),
+                "exclusive AR must publish Ordinary+head anchor at 64 with complete draft window; got {published:?}"
+            );
+            assert!(
+                published.contains(&(96, false, true, true)),
+                "exclusive AR must publish Ordinary+head anchor at 96 with complete draft window; got {published:?}"
+            );
+            assert!(
+                published.contains(&(160, false, false, true)),
+                "exclusive AR must also publish Ordinary junction anchor at 160; got {published:?}"
+            );
+        }
+
+        // 3. Switch to a fresh seq so prompt_b restores from StateStore (not live continuation)
+        //    and verify cached == 96 + bit-exact greedy parity with cold baseline!
+        inner.paged.as_mut().unwrap().active_seq = 2;
+        let (hit_cached, hit_tokens) = run_ar_greedy(&mut inner, &prompt_b, true, &[]);
+        assert_eq!(
+            hit_cached, 96,
+            "diverged prompt_b must restore structural anchor 96 published by exclusive AR"
+        );
+        assert_eq!(
+            hit_tokens, baseline_tokens,
+            "restored exclusive AR structural anchor must produce exact greedy parity"
+        );
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .is_empty()
+        );
+
+        // 4. Verify abort_paged_turn cleans up installed pending breakpoints.
+        inner.set_pending_prefix_breakpoints(192, &[65]);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .is_empty()
+        );
+        inner.abort_paged_turn();
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .is_empty(),
+            "abort_paged_turn must clear seq_extra_capture_boundaries"
+        );
+    }
+
+    /// C2: Exclusive DSpark (`PagedDsparkBackend::paged_prefill_with_draft_state`) splits
+    /// single-chunk prefills at installed structural prefix breakpoints, feeds all tapped chunks
+    /// sequentially to `Inkling2DsparkContext`, publishes `StateClass::Ordinary` prompt heads
+    /// (`is_head = true`), and enables a subsequent diverged turn to restore the anchor with exact
+    /// greedy parity.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn exclusive_dspark_paged_prefill_honors_structural_prefix_anchors() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::{ChatBackend, PagedBackend};
+        use crate::engine::dspark_turn::PagedDsparkBackend;
+        use crate::models::inkling2::dspark::{
+            Inkling2DsparkDraftConfig, Inkling2DsparkModel, Inkling2MarkovHead,
+        };
+        use crate::nn::RoPE;
+
+        let mut inner = super::super::scheduler::tests::build_synthetic_dflash2_inner_with_window(
+            512, None, 64, 2,
+        );
+        inner.dflash2 = None;
+        let hidden = inner.config.hidden_size;
+        let vocab = inner.config.vocab_size;
+        let rank = 8usize;
+        inner.dspark = Some(Inkling2DsparkModel {
+            config: Inkling2DsparkDraftConfig {
+                hidden_size: hidden,
+                intermediate_size: hidden * 2,
+                num_hidden_layers: 0,
+                num_attention_heads: inner.config.num_attention_heads,
+                num_key_value_heads: inner.config.num_key_value_heads,
+                head_dim: inner.config.head_dim,
+                rope_theta: 10_000.0,
+                rms_norm_eps: 1e-6,
+                vocab_size: vocab,
+                unpadded_vocab_size: vocab,
+                block_size: 8,
+                target_layer_ids: vec![0],
+                markov_rank: rank,
+                sliding_window: 64,
+                sliding_window_pattern: Vec::new(),
+                final_logit_softcapping: 30.0,
+                max_position_embeddings: 512,
+            },
+            layers: Vec::new(),
+            output_norm: MxArray::ones(&[hidden as i64], Some(DType::Float32)).unwrap(),
+            mask_embd: MxArray::zeros(&[1, hidden as i64], Some(DType::BFloat16)).unwrap(),
+            fuse_alpha: vec![vec![1.0]],
+            markov_head: Inkling2MarkovHead {
+                markov_rank: rank,
+                dflare_norm: MxArray::ones(&[hidden as i64], Some(DType::Float32)).unwrap(),
+                markov_w1: MxArray::zeros(&[vocab as i64, rank as i64], Some(DType::BFloat16))
+                    .unwrap(),
+                rnn_bias_f32: MxArray::zeros(&[1, (3 * rank) as i64], Some(DType::Float32))
+                    .unwrap(),
+                rnn_proj_rec_w_t: MxArray::zeros(
+                    &[(2 * rank) as i64, (3 * rank) as i64],
+                    Some(DType::BFloat16),
+                )
+                .unwrap(),
+                rnn_proj_ctx_w_t: MxArray::zeros(
+                    &[(2 * hidden) as i64, (3 * rank) as i64],
+                    Some(DType::BFloat16),
+                )
+                .unwrap(),
+                fold_weight_q8: None,
+                fold_weight_t: None,
+                fold_bias: MxArray::zeros(&[1, vocab as i64], Some(DType::BFloat16)).unwrap(),
+                one_scalar: MxArray::scalar_float(1.0).unwrap(),
+            },
+            rope: RoPE::new(
+                inner.config.head_dim as i32,
+                Some(false),
+                Some(10_000.0),
+                Some(1.0),
+            ),
+        });
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 512,
+                max_chunk: 256,
+                max_concurrent_sequences: 2,
+                gpu_memory_mb: None,
+            })
+            .expect("enable_paged");
+
+        let gen_stream = Stream::generation();
+        let salt = 0xC2D5_u64;
+        let prompt_a: Vec<u32> = (0u32..192u32).map(|i| 12 + (i % 75)).collect();
+        let mut prompt_b: Vec<u32> = prompt_a[..96].to_vec();
+        prompt_b.extend((0u32..64u32).map(|i| 30 + ((i * 5) % 75)));
+
+        let greedy_argmax = |logits: &MxArray| -> u32 {
+            let idx = logits.argmax(0, Some(false)).unwrap();
+            idx.eval();
+            idx.item_at_int32(0).unwrap() as u32
+        };
+
+        // Cold greedy baseline for prompt_b.
+        let base_prefix = inner
+            .prime_prefix_state(&prompt_b, false, 32, &[], salt)
+            .expect("cold prime");
+        let base_logits = inner
+            .paged_prefill(&prompt_b, &base_prefix, gen_stream)
+            .expect("cold prefill");
+        let base_tok = greedy_argmax(&base_logits);
+        inner.finalize_paged_turn(false, salt);
+
+        // Exclusive DSpark prefill on prompt_a with structural breakpoints [65, 100] -> [64, 96].
+        inner.set_pending_prefix_breakpoints(prompt_a.len() as u32, &[65, 100]);
+        let dspark_prefix = inner
+            .prime_dspark_prefix_state(&prompt_a, true, salt)
+            .expect("prime_dspark_prefix_state");
+        assert_eq!(dspark_prefix.effective_cached_prefix_len, 0);
+        let suffix = &prompt_a[dspark_prefix.effective_cached_prefix_len..];
+        let _logits = inner
+            .paged_prefill_with_draft_state(suffix, &dspark_prefix, gen_stream)
+            .expect("exclusive DSpark paged_prefill_with_draft_state");
+        let seq_id = inner.paged.as_ref().unwrap().active_seq;
+        assert_eq!(
+            inner
+                .dspark_turn_contexts
+                .get(&seq_id)
+                .expect("dspark ctx seeded")
+                .committed_len(),
+            prompt_a.len() as i32,
+            "split sub-slices must feed all 192 tokens sequentially into Inkling2DsparkContext"
+        );
+        inner.finalize_paged_turn(true, salt);
+
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            assert!(
+                rt.seq_extra_capture_boundaries.is_empty(),
+                "finalize_paged_turn must clear seq_extra_capture_boundaries"
+            );
+            let mut published: Vec<(usize, bool, bool)> = rt
+                .state_store
+                .store
+                .entries()
+                .map(|e| {
+                    (
+                        e.depth(),
+                        e.checkpoint(),
+                        rt.state_store.is_prompt_head(e.id()),
+                    )
+                })
+                .collect();
+            published.sort_unstable();
+            assert!(
+                published.contains(&(64, false, true)),
+                "exclusive DSpark must publish Ordinary+head at 64; got {published:?}"
+            );
+            assert!(
+                published.contains(&(96, false, true)),
+                "exclusive DSpark must publish Ordinary+head at 96; got {published:?}"
+            );
+            assert!(
+                published.contains(&(160, false, false)),
+                "exclusive DSpark must publish Ordinary junction at 160; got {published:?}"
+            );
+        }
+
+        // Diverged prompt_b on fresh seq_id hits structural anchor 96 published by exclusive DSpark
+        // with exact greedy first-token parity!
+        inner.paged.as_mut().unwrap().active_seq = 2;
+        let hit_prefix = inner
+            .prime_prefix_state(&prompt_b, true, 32, &[], salt)
+            .expect("hit prime");
+        assert_eq!(
+            hit_prefix.effective_cached_prefix_len, 96,
+            "diverged prompt_b must hit structural anchor 96 published by exclusive DSpark"
+        );
+        let hit_logits = inner
+            .paged_prefill(&prompt_b[96..], &hit_prefix, gen_stream)
+            .expect("hit prefill");
+        assert_eq!(
+            greedy_argmax(&hit_logits),
+            base_tok,
+            "restored exclusive DSpark structural anchor must match cold greedy argmax"
+        );
+        inner.finalize_paged_turn(true, salt);
     }
 }

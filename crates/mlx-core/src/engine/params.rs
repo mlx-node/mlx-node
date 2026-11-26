@@ -251,10 +251,42 @@ pub(crate) enum ThinkingPolicy {
     /// `true`).
     AlwaysOnBudgetFromEffort,
     /// Dynamic open-token thinking policy for families whose prompt does NOT
-    /// pre-open `<think>` (e.g. Inkling2 emits `<|content_thought|>` dynamically):
+    /// pre-open `<think>` (e.g. Inkling2 emits `<|content_thinking|>` dynamically):
     /// `ReasoningTracker` starts outside thinking and enters thinking when
-    /// `ThinkEndResolution::think_open_id` is observed.
+    /// `ThinkEndResolution::think_open_id` is observed. When `reasoning_effort`
+    /// disables thinking (`"none"` or numeric `0`), `resolve` keeps `enabled: true`
+    /// with `budget: Some(0)` and `cycle_guard: false` so any dynamically opened
+    /// thinking block is immediately closed while compliant turns incur zero work.
     OpenTokenHonoring,
+}
+
+/// Whether `config` disables thinking for [`ThinkingPolicy::OpenTokenHonoring`]
+/// (`reasoning_effort = "none"` or numeric `0`).
+pub(crate) fn is_open_token_thinking_disabled(config: &ChatConfig) -> bool {
+    matches!(resolve_enable_thinking(config), Some(false))
+        || config
+            .reasoning_effort
+            .as_deref()
+            .and_then(|s| s.trim().parse::<f64>().ok())
+            .is_some_and(|v| v == 0.0)
+}
+
+/// Public `thinking_enabled` provenance reported in `ChatResult.thinking_enabled`
+/// and the terminal `ChatStreamChunk.thinking_enabled`.
+///
+/// Distinct from [`resolve`]'s `ThinkingSetup::enabled` (which controls whether
+/// `ReasoningTracker` is armed): [`ThinkingPolicy::OpenTokenHonoring`] keeps the
+/// tracker armed with `budget = Some(0)` when reasoning effort disables thinking
+/// (`"none"` or numeric `0`), while public provenance still reports `false`.
+pub(crate) fn resolve_public_thinking_enabled(policy: ThinkingPolicy, config: &ChatConfig) -> bool {
+    match policy {
+        ThinkingPolicy::OpenTokenHonoring => !is_open_token_thinking_disabled(config),
+        ThinkingPolicy::None
+        | ThinkingPolicy::TemplateHonoring
+        | ThinkingPolicy::AlwaysOnBudgetFromEffort => {
+            resolve_enable_thinking(config).unwrap_or(true)
+        }
+    }
 }
 
 /// Resolve a [`ThinkingPolicy`] + request config into the concrete
@@ -283,11 +315,21 @@ pub(crate) fn resolve(
                 .or_else(|| default_thinking_budget_for_effort(config.reasoning_effort.as_deref())),
             cycle_guard,
         },
-        ThinkingPolicy::OpenTokenHonoring => ThinkingSetup {
-            enabled: resolve_enable_thinking(config).unwrap_or(true),
-            budget: config.thinking_token_budget,
-            cycle_guard,
-        },
+        ThinkingPolicy::OpenTokenHonoring => {
+            if is_open_token_thinking_disabled(config) {
+                ThinkingSetup {
+                    enabled: true,
+                    budget: Some(0),
+                    cycle_guard: false,
+                }
+            } else {
+                ThinkingSetup {
+                    enabled: true,
+                    budget: config.thinking_token_budget,
+                    cycle_guard,
+                }
+            }
+        }
     }
 }
 
@@ -851,31 +893,186 @@ mod tests {
     #[test]
     fn open_token_honoring_policy_resolves_effort_budget_and_cycle_guard() {
         let default_cfg = ChatConfig::default();
+        assert!(!is_open_token_thinking_disabled(&default_cfg));
         let setup = resolve(ThinkingPolicy::OpenTokenHonoring, &default_cfg);
         assert!(setup.enabled);
         assert_eq!(setup.budget, None);
         assert!(!setup.cycle_guard);
 
-        let none_cfg = ChatConfig {
-            reasoning_effort: Some("none".to_string()),
-            thinking_token_budget: Some(128),
-            thinking_cycle_guard: Some(true),
-            ..ChatConfig::default()
-        };
-        let disabled = resolve(ThinkingPolicy::OpenTokenHonoring, &none_cfg);
-        assert!(!disabled.enabled);
-        assert_eq!(disabled.budget, Some(128));
-        assert!(disabled.cycle_guard);
+        // reasoning_effort = "none" keeps the dynamic-open tracker armed with budget = Some(0)
+        // and cycle_guard = false, regardless of thinking_token_budget (None, Some(0), Some(128)).
+        for (budget, guard) in [(None, None), (Some(0), None), (Some(128), Some(true))] {
+            let none_cfg = ChatConfig {
+                reasoning_effort: Some("none".to_string()),
+                thinking_token_budget: budget,
+                thinking_cycle_guard: guard,
+                ..ChatConfig::default()
+            };
+            assert!(is_open_token_thinking_disabled(&none_cfg));
+            let disabled = resolve(ThinkingPolicy::OpenTokenHonoring, &none_cfg);
+            assert!(
+                disabled.enabled,
+                "OpenTokenHonoring must stay armed to cut dynamic thought blocks when effort=none"
+            );
+            assert_eq!(disabled.budget, Some(0));
+            assert!(!disabled.cycle_guard);
+        }
 
-        let low_cfg = ChatConfig {
-            reasoning_effort: Some("low".to_string()),
-            thinking_token_budget: Some(64),
-            thinking_cycle_guard: Some(true),
+        // Numeric zero reasoning_effort spellings ("0", "0.0", "-0.0", "0.00") also enforce budget=0.
+        for effort in ["0", "0.0", "-0.0", "0.00", " 0.0 "] {
+            let zero_cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                thinking_token_budget: Some(128),
+                thinking_cycle_guard: Some(true),
+                ..ChatConfig::default()
+            };
+            assert!(
+                is_open_token_thinking_disabled(&zero_cfg),
+                "effort={effort:?} must disable open-token thinking"
+            );
+            let disabled = resolve(ThinkingPolicy::OpenTokenHonoring, &zero_cfg);
+            assert!(disabled.enabled, "effort={effort:?} must stay armed");
+            assert_eq!(disabled.budget, Some(0), "effort={effort:?} must cap to 0");
+            assert!(!disabled.cycle_guard);
+        }
+
+        // Non-zero named and numeric efforts preserve request budget and cycle_guard.
+        for effort in ["low", "0.2", "0.9"] {
+            let active_cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                thinking_token_budget: Some(64),
+                thinking_cycle_guard: Some(true),
+                ..ChatConfig::default()
+            };
+            assert!(
+                !is_open_token_thinking_disabled(&active_cfg),
+                "effort={effort:?} must not disable open-token thinking"
+            );
+            let enabled = resolve(ThinkingPolicy::OpenTokenHonoring, &active_cfg);
+            assert!(enabled.enabled);
+            assert_eq!(enabled.budget, Some(64));
+            assert!(enabled.cycle_guard);
+        }
+    }
+
+    #[test]
+    fn open_token_honoring_disabled_effort_cuts_dynamic_thought_and_noops_when_obeyed() {
+        use crate::engine::backend::ThinkEndResolution;
+        use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
+
+        const OPEN_THOUGHT_ID: u32 = 200_008;
+        const CONTENT_TEXT_ID: u32 = 200_007;
+        const END_MESSAGE_ID: u32 = 200_005;
+
+        let close = ThinkEndResolution::with_open_token(
+            OPEN_THOUGHT_ID,
+            std::sync::Arc::from([END_MESSAGE_ID]),
+        );
+
+        for effort in ["none", "0", "0.0"] {
+            let none_cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                ..ChatConfig::default()
+            };
+            let setup = resolve(ThinkingPolicy::OpenTokenHonoring, &none_cfg);
+
+            // 1. Model disobeys soft hint and emits OPEN_THOUGHT_ID -> immediate budget=0 cut.
+            let mut tracker = ReasoningTracker::from_setup(&setup, &close);
+            assert_eq!(
+                tracker.speculative_wave_limit(&[OPEN_THOUGHT_ID, 100, 101]),
+                1,
+                "effort={effort:?} must truncate speculative thought tokens immediately after open"
+            );
+            assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+            assert!(tracker.ending());
+            assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+            assert!(tracker.observe_token(END_MESSAGE_ID));
+            assert!(!tracker.ending());
+            assert_eq!(tracker.outcome().tokens, 0);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+            assert_eq!(tracker.outcome().cut_at, Some(0));
+
+            // Re-emitting OPEN_THOUGHT_ID later in the turn cuts immediately again.
+            assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+            assert!(tracker.ending());
+            assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+            assert!(tracker.observe_token(END_MESSAGE_ID));
+            assert!(!tracker.ending());
+            assert_eq!(tracker.outcome().tokens, 0);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+
+            // 2. Model obeys soft hint and never emits OPEN_THOUGHT_ID -> zero intervention.
+            let mut compliant = ReasoningTracker::from_setup(&setup, &close);
+            assert_eq!(
+                compliant.speculative_wave_limit(&[CONTENT_TEXT_ID, 100, 101, END_MESSAGE_ID]),
+                4
+            );
+            for token in [CONTENT_TEXT_ID, 100, 101, END_MESSAGE_ID] {
+                assert!(!compliant.observe_token(token));
+                assert_eq!(compliant.take_forced_token(), None);
+                assert_eq!(compliant.thinking_cut(), None);
+            }
+            let outcome = compliant.outcome();
+            assert_eq!(outcome.tokens, 0);
+            assert_eq!(outcome.close, None);
+            assert_eq!(outcome.cut_at, None);
+            assert_eq!(outcome.stray_closes, 0);
+        }
+    }
+
+    #[test]
+    fn resolve_public_thinking_enabled_matches_policy_and_keeps_open_token_tracker_armed() {
+        let cfg_for = |effort: Option<&str>| ChatConfig {
+            reasoning_effort: effort.map(str::to_string),
             ..ChatConfig::default()
         };
-        let enabled = resolve(ThinkingPolicy::OpenTokenHonoring, &low_cfg);
-        assert!(enabled.enabled);
-        assert_eq!(enabled.budget, Some(64));
-        assert!(enabled.cycle_guard);
+
+        // OpenTokenHonoring: disabled efforts report public thinking_enabled=false while
+        // keeping ThinkingSetup armed (enabled=true, budget=Some(0), cycle_guard=false).
+        for effort in ["none", "0", "0.0", "-0.0", "0.00", " 0.0 "] {
+            let cfg = cfg_for(Some(effort));
+            assert!(
+                !resolve_public_thinking_enabled(ThinkingPolicy::OpenTokenHonoring, &cfg),
+                "OpenTokenHonoring public thinking_enabled must be false for effort={effort:?}"
+            );
+            let setup = resolve(ThinkingPolicy::OpenTokenHonoring, &cfg);
+            assert!(
+                setup.enabled,
+                "tracker must stay armed for effort={effort:?}"
+            );
+            assert_eq!(setup.budget, Some(0));
+            assert!(!setup.cycle_guard);
+        }
+        for effort in [
+            None,
+            Some("minimal"),
+            Some("low"),
+            Some("0.25"),
+            Some("max"),
+        ] {
+            let cfg = cfg_for(effort);
+            assert!(
+                resolve_public_thinking_enabled(ThinkingPolicy::OpenTokenHonoring, &cfg),
+                "OpenTokenHonoring public thinking_enabled must be true for effort={effort:?}"
+            );
+        }
+
+        // Non-OpenTokenHonoring policies keep exact resolve_enable_thinking(config).unwrap_or(true).
+        for policy in [
+            || ThinkingPolicy::None,
+            || ThinkingPolicy::TemplateHonoring,
+            || ThinkingPolicy::AlwaysOnBudgetFromEffort,
+        ] {
+            assert!(!resolve_public_thinking_enabled(
+                policy(),
+                &cfg_for(Some("none"))
+            ));
+            for effort in [None, Some("low"), Some("0"), Some("0.0")] {
+                assert!(
+                    resolve_public_thinking_enabled(policy(), &cfg_for(effort)),
+                    "non-OpenTokenHonoring policy must preserve template provenance for effort={effort:?}"
+                );
+            }
+        }
     }
 }

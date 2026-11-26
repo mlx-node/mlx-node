@@ -675,11 +675,22 @@ pub fn format_inkling2_effort(reasoning_effort: f64) -> Result<String, InklingRe
 // Inkling2 wire renderer (tokens and wire text)
 // ---------------------------------------------------------------------------
 
+/// Minimum token offset (and minimum spacing between structural breakpoints)
+/// for Inkling2 static-prefix breakpoint emission.
+pub const MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS: usize = 2048;
+
 /// Internal sink abstracting token-ID emission vs wire-text emission so both
 /// rendering entry points share the exact same block structure.
 trait WireSink {
     fn push_special(&mut self, token: &'static str) -> Result<(), InklingRenderError>;
     fn push_text(&mut self, text: &str) -> Result<(), InklingRenderError>;
+    /// Invoked immediately after emitting the effort-independent preamble
+    /// (`tool_declare` and leading `system`/`developer` messages), right
+    /// before the `Thinking effort level:` block and first non-system message.
+    fn on_preamble_end(&mut self) {}
+    /// Invoked after emitting each consecutive leading `user` message before
+    /// any `assistant`, `tool`, or post-user `system`/`developer` message.
+    fn on_leading_user_end(&mut self) {}
 }
 
 struct IdSink<'a, T: InklingTokenizer> {
@@ -698,6 +709,30 @@ impl<T: InklingTokenizer> WireSink for IdSink<'_, T> {
             self.ids.extend(self.tokenizer.encode_text(text)?);
         }
         Ok(())
+    }
+}
+
+struct BoundaryIdSink<'a, T: InklingTokenizer> {
+    inner: IdSink<'a, T>,
+    preamble_end: Option<usize>,
+    leading_user_ends: Vec<usize>,
+}
+
+impl<T: InklingTokenizer> WireSink for BoundaryIdSink<'_, T> {
+    fn push_special(&mut self, token: &'static str) -> Result<(), InklingRenderError> {
+        self.inner.push_special(token)
+    }
+
+    fn push_text(&mut self, text: &str) -> Result<(), InklingRenderError> {
+        self.inner.push_text(text)
+    }
+
+    fn on_preamble_end(&mut self) {
+        self.preamble_end = Some(self.inner.ids.len());
+    }
+
+    fn on_leading_user_end(&mut self) {
+        self.leading_user_ends.push(self.inner.ids.len());
     }
 }
 
@@ -735,6 +770,61 @@ pub fn render_inkling2_messages_to_ids<T: InklingTokenizer>(
     Ok(sink.ids)
 }
 
+/// Render chat messages to Inkling2 input token IDs together with up to 2 raw
+/// structural static-prefix breakpoint offsets (`>= 2048` and `< ids.len()`):
+/// 1. End of the effort-independent preamble (`tool_declare` + leading
+///    `system`/`developer` messages, strictly before the
+///    `Thinking effort level:` block so the anchor is shared across all
+///    reasoning efforts).
+/// 2. End of the penultimate consecutive leading `user` message (strictly when
+///    there are at least 2 consecutive leading `user` messages before any
+///    `assistant`, `tool`, or post-user `system`/`developer` message).
+///
+/// When both candidates are present and within
+/// [`MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS`] (`2048`) tokens of each other,
+/// the earlier preamble breakpoint (`bp1`) is kept and `bp2` is dropped so the
+/// cross-repo / cross-effort preamble anchor is preserved.
+pub fn render_inkling2_messages_to_ids_with_boundaries<T: InklingTokenizer>(
+    messages: &[InklingMessage],
+    tokenizer: &T,
+    options: &Inkling2RenderOptions,
+) -> Result<(Vec<u32>, Vec<u32>), InklingRenderError> {
+    let mut sink = BoundaryIdSink {
+        inner: IdSink {
+            tokenizer,
+            ids: Vec::new(),
+        },
+        preamble_end: None,
+        leading_user_ends: Vec::new(),
+    };
+    render_inkling2_into(messages, options, &mut sink)?;
+    let total = sink.inner.ids.len();
+    let mut candidates: Vec<usize> = Vec::with_capacity(2);
+    if let Some(p) = sink.preamble_end
+        && p >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS
+        && p < total
+    {
+        candidates.push(p);
+    }
+    if sink.leading_user_ends.len() >= 2
+        && let Some(&penult) = sink.leading_user_ends.get(sink.leading_user_ends.len() - 2)
+        && penult >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS
+        && penult < total
+    {
+        candidates.push(penult);
+    }
+    if candidates.len() == 2
+        && candidates[1].saturating_sub(candidates[0]) < MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS
+    {
+        candidates.pop();
+    }
+    let breakpoints: Vec<u32> = candidates
+        .into_iter()
+        .filter_map(|offset| u32::try_from(offset).ok())
+        .collect();
+    Ok((sink.inner.ids, breakpoints))
+}
+
 /// Render `mlx-core` [`ChatMessage`] slices directly to Inkling2 token IDs
 /// using a [`Qwen3Tokenizer`].
 pub fn render_inkling2_chat_messages_to_ids(
@@ -747,6 +837,20 @@ pub fn render_inkling2_chat_messages_to_ids(
         .map(InklingMessage::from_chat_message)
         .collect();
     render_inkling2_messages_to_ids(&converted, tokenizer, options)
+}
+
+/// Render `mlx-core` [`ChatMessage`] slices directly to Inkling2 token IDs
+/// together with structural static-prefix breakpoint offsets.
+pub fn render_inkling2_chat_messages_to_ids_with_boundaries(
+    messages: &[ChatMessage],
+    tokenizer: &Qwen3Tokenizer,
+    options: &Inkling2RenderOptions,
+) -> Result<(Vec<u32>, Vec<u32>), InklingRenderError> {
+    let converted: Vec<InklingMessage> = messages
+        .iter()
+        .map(InklingMessage::from_chat_message)
+        .collect();
+    render_inkling2_messages_to_ids_with_boundaries(&converted, tokenizer, options)
 }
 
 /// Render chat messages to their Inkling2 wire-format text representation.
@@ -914,6 +1018,8 @@ fn render_inkling2_into<S: WireSink>(
     }
 
     let mut tool_call_id_to_name: HashMap<String, String> = HashMap::new();
+    let mut in_leading_users = false;
+    let mut leading_users_closed = false;
 
     for msg in &working {
         let _ = role_message_token(&msg.role)?;
@@ -921,7 +1027,9 @@ fn render_inkling2_into<S: WireSink>(
         if !is_system_role(&msg.role)
             && let Some(effort) = effort_text.take()
         {
+            sink.on_preamble_end();
             append_block(sink, "system", BlockKind::Text, &effort, None)?;
+            in_leading_users = true;
         }
 
         let tool_author: Option<String> = if msg.role == "tool" {
@@ -947,6 +1055,15 @@ fn render_inkling2_into<S: WireSink>(
         }
         if msg.role == "assistant" && has_blocks {
             sink.push_special(CONTENT_MODEL_END_SAMPLING)?;
+        }
+        if in_leading_users && !leading_users_closed {
+            if msg.role == "user" {
+                if has_blocks {
+                    sink.on_leading_user_end();
+                }
+            } else {
+                leading_users_closed = true;
+            }
         }
     }
 
@@ -2935,5 +3052,380 @@ mod tests {
             count_inkling2_reasoning_tokens_with_ids(&tokens, &ids),
             tok.encode_text("thought").unwrap().len()
         );
+    }
+
+    #[test]
+    fn render_with_boundaries_parity_and_structural_breakpoints() {
+        let tok = build_byte_level_inkling2_tokenizer();
+        let end_msg_id = tok.encode_special(END_MESSAGE).unwrap();
+        let msg_sys_id = tok.encode_special(MESSAGE_SYSTEM).unwrap();
+        let content_text_id = tok.encode_special(CONTENT_TEXT).unwrap();
+        let msg_user_id = tok.encode_special(MESSAGE_USER).unwrap();
+
+        let make_chat = |role: &str, content: &str| ChatMessage {
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+
+        let tools = vec![weather_tool(), search_tool()];
+        let opts_with_tools = Inkling2RenderOptions {
+            tools: tools.clone(),
+            ..Default::default()
+        };
+
+        // 1. Multi-leading-user agent prompt (Recon/Verify pattern):
+        //    [tools+system, user(CLAUDE.md), user(skills), user(task)]
+        //    Must match `render_inkling2_chat_messages_to_ids` bit-for-bit AND emit
+        //    exact `[preamble_end, skills_end]` on both Turn 1 and Turn 2+.
+        let sys_text = "S".repeat(2200);
+        let claude_md = "C".repeat(1200);
+        let skills_text = "K".repeat(1400);
+        let task_text = "T".repeat(300);
+
+        let turn1 = vec![
+            make_chat("system", &sys_text),
+            make_chat("user", &claude_md),
+            make_chat("user", &skills_text),
+            make_chat("user", &task_text),
+        ];
+        let expected_t1 =
+            render_inkling2_chat_messages_to_ids(&turn1, &tok, &opts_with_tools).unwrap();
+        let (ids_t1, breaks_t1) =
+            render_inkling2_chat_messages_to_ids_with_boundaries(&turn1, &tok, &opts_with_tools)
+                .unwrap();
+        assert_eq!(
+            ids_t1, expected_t1,
+            "Turn 1 must have bit-exact token parity"
+        );
+        assert_eq!(
+            breaks_t1.len(),
+            2,
+            "Turn 1 must emit [preamble_end, skills_end], got {breaks_t1:?}"
+        );
+        let preamble_end = breaks_t1[0] as usize;
+        let skills_end = breaks_t1[1] as usize;
+        assert!(preamble_end >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS);
+        assert!(skills_end - preamble_end >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS);
+        assert!(skills_end < ids_t1.len());
+        // `preamble_end` sits immediately after the last leading system block's `<|end_message|>`
+        // and immediately before the `Thinking effort level:` block (`<|message_system|>`).
+        // `skills_end` sits immediately after `<|end_message|>` and before the task `<|message_user|>`.
+        let effort_str = format_inkling2_effort(opts_with_tools.reasoning_effort).unwrap();
+        let mut effort_block = vec![msg_sys_id, content_text_id];
+        effort_block.extend(tok.encode_text(&effort_str).unwrap());
+        effort_block.push(end_msg_id);
+        assert_eq!(ids_t1[preamble_end - 1], end_msg_id);
+        assert_eq!(ids_t1[preamble_end], msg_sys_id);
+        assert_eq!(
+            &ids_t1[preamble_end..preamble_end + effort_block.len()],
+            effort_block.as_slice(),
+            "bp1 must sit strictly before the Thinking effort level block"
+        );
+        assert_eq!(ids_t1[preamble_end + effort_block.len()], msg_user_id);
+        assert_eq!(ids_t1[skills_end - 1], end_msg_id);
+        assert_eq!(ids_t1[skills_end], msg_user_id);
+
+        // Verify exact skills_end matches rendering just [system, claude_md, skills].
+        let prefix_through_skills =
+            render_inkling2_chat_messages_to_ids(&turn1[..3], &tok, &opts_with_tools).unwrap();
+        assert_eq!(skills_end, prefix_through_skills.len());
+        // Verify exact preamble_end matches prefix strictly before the effort block and first user message.
+        let prefix_through_sys_plus_first =
+            render_inkling2_chat_messages_to_ids(&turn1[..2], &tok, &opts_with_tools).unwrap();
+        let claude_block_len = 3 + tok.encode_text(&claude_md).unwrap().len();
+        assert_eq!(
+            preamble_end,
+            prefix_through_sys_plus_first.len() - claude_block_len - effort_block.len()
+        );
+
+        // Turn 2+: append assistant reply + follow-up user turn -> identical [preamble_end, skills_end].
+        let turn2 = vec![
+            make_chat("system", &sys_text),
+            make_chat("user", &claude_md),
+            make_chat("user", &skills_text),
+            make_chat("user", &task_text),
+            make_chat("assistant", "Checking repository files now."),
+            make_chat("user", "Proceed to verification."),
+        ];
+        let expected_t2 =
+            render_inkling2_chat_messages_to_ids(&turn2, &tok, &opts_with_tools).unwrap();
+        let (ids_t2, breaks_t2) =
+            render_inkling2_chat_messages_to_ids_with_boundaries(&turn2, &tok, &opts_with_tools)
+                .unwrap();
+        assert_eq!(
+            ids_t2, expected_t2,
+            "Turn 2+ must have bit-exact token parity"
+        );
+        assert_eq!(
+            breaks_t2, breaks_t1,
+            "Turn 2+ must preserve the exact same [preamble_end, skills_end] breakpoints"
+        );
+
+        // 2. Single-user Turn 2+ (`[system, user(u1), assistant(a1), user(u2)]`):
+        //    MUST emit ONLY `[preamble_end]`, NEVER `u1` (no single-leading-user fallback!).
+        let single_user_t2 = vec![
+            make_chat("system", &sys_text),
+            make_chat("user", &"U".repeat(2500)),
+            make_chat("assistant", "First reply."),
+            make_chat("user", "Second question."),
+        ];
+        let expected_su =
+            render_inkling2_chat_messages_to_ids(&single_user_t2, &tok, &opts_with_tools).unwrap();
+        let (ids_su, breaks_su) = render_inkling2_chat_messages_to_ids_with_boundaries(
+            &single_user_t2,
+            &tok,
+            &opts_with_tools,
+        )
+        .unwrap();
+        assert_eq!(ids_su, expected_su);
+        assert_eq!(
+            breaks_su,
+            vec![preamble_end as u32],
+            "single-user Turn 2+ must return ONLY [preamble_end], not u1"
+        );
+
+        // Post-user system message closes the leading-user run -> ONLY `[preamble_end]`.
+        let post_user_sys = vec![
+            make_chat("system", &sys_text),
+            make_chat("user", &"U".repeat(2500)),
+            make_chat("system", "Late system reminder."),
+            make_chat("user", "Follow-up."),
+        ];
+        let (_, breaks_post_sys) = render_inkling2_chat_messages_to_ids_with_boundaries(
+            &post_user_sys,
+            &tok,
+            &opts_with_tools,
+        )
+        .unwrap();
+        assert_eq!(
+            breaks_post_sys,
+            vec![preamble_end as u32],
+            "post-user system message must stop consecutive leading-user collection"
+        );
+
+        // 3. Short title-gen prompt -> returns `[]` with bit-exact parity.
+        let short_msgs = vec![
+            make_chat("system", "Summarize the conversation in 4 words."),
+            make_chat("user", "hi"),
+        ];
+        let default_opts = Inkling2RenderOptions::default();
+        let expected_short =
+            render_inkling2_chat_messages_to_ids(&short_msgs, &tok, &default_opts).unwrap();
+        let (ids_short, breaks_short) =
+            render_inkling2_chat_messages_to_ids_with_boundaries(&short_msgs, &tok, &default_opts)
+                .unwrap();
+        assert_eq!(ids_short, expected_short);
+        assert!(
+            breaks_short.is_empty(),
+            "short title-gen prompt must emit no breakpoints, got {breaks_short:?}"
+        );
+
+        // 4. Deduplication when preamble_end and penultimate user end are < 2048 apart:
+        //    keeps ONLY bp1 (preamble_end) and drops bp2 so the shared preamble anchor survives.
+        let close_msgs = vec![
+            make_chat("system", &sys_text),
+            make_chat("user", &"D".repeat(500)),
+            make_chat("user", &"E".repeat(300)),
+        ];
+        let (ids_close, breaks_close) = render_inkling2_chat_messages_to_ids_with_boundaries(
+            &close_msgs,
+            &tok,
+            &opts_with_tools,
+        )
+        .unwrap();
+        let penult_close =
+            render_inkling2_chat_messages_to_ids(&close_msgs[..2], &tok, &opts_with_tools)
+                .unwrap()
+                .len();
+        assert!(penult_close > preamble_end);
+        assert!(penult_close - preamble_end < MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS);
+        assert_eq!(
+            breaks_close,
+            vec![preamble_end as u32],
+            "offsets < 2048 apart must keep bp1 (preamble_end) and drop bp2"
+        );
+        assert!(penult_close < ids_close.len());
+
+        // 5. Short preamble (< 2048) + large leading user (>= 2048) -> keeps ONLY penultimate user end.
+        let short_sys_long_user = vec![
+            make_chat("system", "Short system."),
+            make_chat("user", &"L".repeat(2400)),
+            make_chat("user", "Task."),
+        ];
+        let (_, breaks_sslu) = render_inkling2_chat_messages_to_ids_with_boundaries(
+            &short_sys_long_user,
+            &tok,
+            &default_opts,
+        )
+        .unwrap();
+        let expected_sslu =
+            render_inkling2_chat_messages_to_ids(&short_sys_long_user[..2], &tok, &default_opts)
+                .unwrap()
+                .len() as u32;
+        assert_eq!(breaks_sslu, vec![expected_sslu]);
+
+        // 6. Empty `content: None` leading user emits zero blocks and must not fake `len >= 2`.
+        let ghost_user = vec![
+            InklingMessage::system(sys_text),
+            InklingMessage::user("U".repeat(2500)),
+            InklingMessage {
+                role: "user".to_string(),
+                content: None,
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+                tools: Vec::new(),
+            },
+            InklingMessage::assistant("done"),
+        ];
+        let (ids_ghost, breaks_ghost) =
+            render_inkling2_messages_to_ids_with_boundaries(&ghost_user, &tok, &opts_with_tools)
+                .unwrap();
+        assert_eq!(
+            ids_ghost,
+            render_inkling2_messages_to_ids(&ghost_user, &tok, &opts_with_tools).unwrap()
+        );
+        assert_eq!(
+            breaks_ghost,
+            vec![preamble_end as u32],
+            "zero-block user message must not inflate leading_user_ends"
+        );
+    }
+
+    #[test]
+    fn render_with_boundaries_preamble_breakpoint_is_effort_independent() {
+        let tok = build_byte_level_inkling2_tokenizer();
+        let tools = vec![weather_tool(), search_tool()];
+        let msgs = vec![
+            InklingMessage::system("S".repeat(2200)),
+            InklingMessage::user("C".repeat(1200)),
+            InklingMessage::user("K".repeat(1400)),
+            InklingMessage::user("Solve the task."),
+        ];
+
+        let mut rendered = Vec::new();
+        for effort in [0.9, 0.2, 0.0] {
+            let opts = Inkling2RenderOptions {
+                tools: tools.clone(),
+                reasoning_effort: effort,
+                ..Default::default()
+            };
+            rendered
+                .push(render_inkling2_messages_to_ids_with_boundaries(&msgs, &tok, &opts).unwrap());
+        }
+
+        let bp1 = rendered[0].1[0] as usize;
+        assert!(bp1 >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS);
+        assert_eq!(rendered[0].1.len(), 2);
+        for (idx, (ids, breaks)) in rendered.iter().enumerate().skip(1) {
+            assert_eq!(
+                breaks[0] as usize, bp1,
+                "effort variant {idx} must emit identical bp1"
+            );
+            assert_eq!(
+                &ids[..bp1],
+                &rendered[0].0[..bp1],
+                "effort variant {idx} must share bit-exact token IDs through bp1"
+            );
+            assert_ne!(
+                &ids[bp1..],
+                &rendered[0].0[bp1..],
+                "effort block after bp1 must reflect different reasoning efforts"
+            );
+        }
+
+        // Edge case: no leading system message, only large tool_declare >= 2048 tokens.
+        // bp1 must sit right after tool_declare (independent of both effort and tool_choice).
+        let big_tool = InklingToolSpec::function(
+            "big_tool",
+            "D".repeat(2200),
+            json!({"type": "object", "properties": {}}),
+        );
+        let no_sys_msgs = vec![InklingMessage::user("Run big_tool now.")];
+        let (ids_auto, breaks_auto) = render_inkling2_messages_to_ids_with_boundaries(
+            &no_sys_msgs,
+            &tok,
+            &Inkling2RenderOptions {
+                tools: vec![big_tool.clone()],
+                tool_choice: InklingToolChoice::Auto,
+                reasoning_effort: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (ids_req, breaks_req) = render_inkling2_messages_to_ids_with_boundaries(
+            &no_sys_msgs,
+            &tok,
+            &Inkling2RenderOptions {
+                tools: vec![big_tool],
+                tool_choice: InklingToolChoice::Required,
+                reasoning_effort: 0.0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(breaks_auto.len(), 1);
+        assert_eq!(breaks_auto, breaks_req);
+        let tool_bp1 = breaks_auto[0] as usize;
+        assert!(tool_bp1 >= MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS);
+        assert_eq!(&ids_auto[..tool_bp1], &ids_req[..tool_bp1]);
+        assert_ne!(&ids_auto[tool_bp1..], &ids_req[tool_bp1..]);
+    }
+
+    #[test]
+    fn render_with_boundaries_close_breakpoints_keep_bp1_not_bp2() {
+        let tok = build_byte_level_inkling2_tokenizer();
+        let tools = vec![weather_tool(), search_tool()];
+        let shared_sys = "G".repeat(2400);
+
+        // Two different repos with small (< 2048 tok) repo-specific context blocks and different efforts.
+        let repo_a = vec![
+            InklingMessage::system(shared_sys.clone()),
+            InklingMessage::user("REPO_A_CONTEXT ".repeat(60)),
+            InklingMessage::user("Fix bug in repo A."),
+        ];
+        let repo_b = vec![
+            InklingMessage::system(shared_sys),
+            InklingMessage::user("REPO_B_CONTEXT ".repeat(80)),
+            InklingMessage::user("Fix bug in repo B."),
+        ];
+
+        let (ids_a, breaks_a) = render_inkling2_messages_to_ids_with_boundaries(
+            &repo_a,
+            &tok,
+            &Inkling2RenderOptions {
+                tools: tools.clone(),
+                reasoning_effort: 0.9,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (ids_b, breaks_b) = render_inkling2_messages_to_ids_with_boundaries(
+            &repo_b,
+            &tok,
+            &Inkling2RenderOptions {
+                tools,
+                reasoning_effort: 0.2,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(breaks_a.len(), 1, "bp2 within 2048 of bp1 must be dropped");
+        assert_eq!(breaks_b.len(), 1, "bp2 within 2048 of bp1 must be dropped");
+        assert_eq!(
+            breaks_a, breaks_b,
+            "keeping bp1 yields the exact same cross-repo, cross-effort anchor"
+        );
+        let bp1 = breaks_a[0] as usize;
+        assert_eq!(&ids_a[..bp1], &ids_b[..bp1]);
     }
 }

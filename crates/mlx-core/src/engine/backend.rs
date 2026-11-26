@@ -801,6 +801,19 @@ pub(crate) trait ChatBackend {
         crate::engine::params::resolve(self.policy(), config)
     }
 
+    /// Public `thinking_enabled` reported in [`ChatResult::thinking_enabled`]
+    /// and the terminal [`ChatStreamChunk::thinking_enabled`].
+    ///
+    /// Default = [`crate::engine::params::resolve_public_thinking_enabled`] of
+    /// [`Self::policy`]. Kept distinct from [`Self::thinking_setup`]'s
+    /// `.enabled` so policies that arm `ReasoningTracker` with
+    /// `budget = Some(0)` when reasoning is disabled (e.g.
+    /// [`ThinkingPolicy::OpenTokenHonoring`]) still report
+    /// `thinking_enabled = false` publicly.
+    fn public_thinking_enabled(&self, config: &ChatConfig) -> bool {
+        crate::engine::params::resolve_public_thinking_enabled(self.policy(), config)
+    }
+
     /// Resolve the turn's reasoning-close resolution.
     ///
     /// Default = the tokenizer's close (`tok.think_end(config)`): every
@@ -882,6 +895,28 @@ pub(crate) trait ChatBackend {
     ) -> Result<Vec<u32>> {
         tok.apply_chat_template_with_config(messages, true, config, preserve_thinking)
     }
+
+    /// Render + tokenize the fresh-turn prompt along with any raw structural
+    /// token offsets where shared-prefix cache breakpoints should be captured.
+    ///
+    /// Default delegates to [`Self::render_prompt`] with no extra breakpoints.
+    fn render_prompt_with_breakpoints(
+        &self,
+        tok: &Qwen3Tokenizer,
+        messages: &[ChatMessage],
+        config: &ChatConfig,
+        preserve_thinking: bool,
+    ) -> Result<(Vec<u32>, Vec<u32>)> {
+        Ok((
+            self.render_prompt(tok, messages, config, preserve_thinking)?,
+            Vec::new(),
+        ))
+    }
+
+    /// Install normalized structural prefix breakpoints for the upcoming
+    /// whole-turn paged or speculative execution on the active sequence.
+    /// Default no-op.
+    fn set_pending_prefix_breakpoints(&mut self, _prompt_tokens: u32, _breakpoints: &[u32]) {}
 
     /// Whether [`crate::engine::session::render_live_continuation`] should use
     /// the tokenizer's Jinja template continuation verifier. Families that

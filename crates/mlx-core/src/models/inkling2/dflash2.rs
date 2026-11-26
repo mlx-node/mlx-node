@@ -1457,8 +1457,9 @@ impl Inkling2Inner {
     }
 
     /// Chunked whole-turn paged prefill that seeds a DFlash2 context cache with
-    /// target hidden taps (`[5, 23, 41, 48]`), splits at rolling checkpoints and
-    /// prompt junction via `prefill_sub_boundaries`, captures live 4-bit
+    /// target hidden taps (`[5, 23, 41, 48]`), splits at rolling checkpoints,
+    /// extra capture boundaries, and prompt junction via
+    /// `prefill_sub_boundaries_with_extra`, captures live 4-bit
     /// [`DraftContextWindow`] snapshots at every block boundary, and publishes
     /// rolling/junction checkpoints into [`Inkling2StateStore`].
     pub(crate) fn paged_prefill_dflash2_with_taps(
@@ -1508,8 +1509,17 @@ impl Inkling2Inner {
 
         // Collect all capture/end targets where a complete `sliding_window`-long
         // draft window or live draft KV ring is required: planned 4096 rolling
-        // checkpoints and prompt junction (only when `reuse_cache` permits shared
-        // StateStore publication) plus the final prompt end.
+        // checkpoints, installed extra capture boundaries, and prompt junction
+        // (only when `reuse_cache` permits shared StateStore publication) plus
+        // the final prompt end.
+        let extra_boundaries = if reuse_cache {
+            self.paged
+                .as_ref()
+                .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq_id))
+                .cloned()
+        } else {
+            None
+        };
         let mut targets: Vec<usize> = Vec::new();
         if reuse_cache
             && let (Ok(prompt_u32), Ok(base_u32)) =
@@ -1525,6 +1535,14 @@ impl Inkling2Inner {
             if junction > abs_base && junction < full_prompt_len {
                 targets.push(junction);
             }
+            if let Some(ref extra) = extra_boundaries {
+                for &b in extra {
+                    let b_us = b as usize;
+                    if b_us > abs_base && b_us < full_prompt_len {
+                        targets.push(b_us);
+                    }
+                }
+            }
         }
         targets.push(full_prompt_len);
         targets.sort_unstable();
@@ -1539,11 +1557,12 @@ impl Inkling2Inner {
             let abs_chunk_start = abs_base + offset;
             let abs_chunk_end = abs_base + chunk_end;
             let subs = if reuse_cache {
-                super::paged_forward::prefill_sub_boundaries(
+                super::paged_forward::prefill_sub_boundaries_with_extra(
                     abs_chunk_start,
                     abs_chunk_end,
                     full_prompt_len,
                     bs,
+                    extra_boundaries.as_ref(),
                 )
             } else {
                 vec![abs_chunk_end]
@@ -2236,5 +2255,120 @@ mod unit_tests {
             .expect("healthy peer must succeed despite sibling selector error");
         healthy_prop.materialize_draft_ids().unwrap();
         assert_eq!(healthy_prop.draft_ids, expected_healthy.draft_ids);
+    }
+
+    /// WS2: Exclusive DFlash2 `paged_prefill_dflash2_with_taps` must include installed
+    /// `seq_extra_capture_boundaries` in both `targets` (so `needs_taps` activates over
+    /// `[B - sliding_window .. B)`) and `prefill_sub_boundaries_with_extra`, capturing a
+    /// `StateClass::Ordinary` prompt head (`is_head = true`) with a complete `PackedDraftWindow`
+    /// at `B` across both small chunks (`chunk_limit = 32`, skipping `[0..32)` taps) and large
+    /// chunks (`chunk_limit = 128`, splitting `[0..128)` at `B = 96`).
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn paged_prefill_dflash2_with_taps_captures_complete_draft_window_at_extra_breakpoint() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let prompt: Vec<u32> = (0u32..256u32).map(|i| 10 + (i % 70)).collect();
+        let breakpoint_b = 96u32; // [B - sliding_window .. B) = [32..96), disjoint from junction [160..224)
+
+        for (idx, chunk_limit) in [32usize, 128usize].into_iter().enumerate() {
+            let mut inner =
+                super::super::scheduler::tests::build_synthetic_dflash2_inner_with_window(
+                    512, None, 64, 2,
+                );
+            inner.paged.as_mut().expect("paged").prefill_chunk_size = chunk_limit;
+            let seq_id = 1u32;
+            let salt = 0xDF20u64 + idx as u64;
+
+            inner.set_seq_prefix_breakpoints_inner(seq_id, prompt.len() as u32, &[breakpoint_b]);
+            let prefix = inner
+                .prepare_prefix_sync(seq_id, &prompt, true, salt)
+                .expect("prepare cold prefix");
+            assert_eq!(prefix.effective_cached_prefix_len, 0);
+
+            let mut ctx = Inkling2Dflash2Context::new(&inner.dflash2.as_ref().unwrap().config);
+            let _logits = inner
+                .paged_prefill_dflash2_with_taps(seq_id, &prompt, &prefix, &mut ctx)
+                .expect("paged_prefill_dflash2_with_taps");
+
+            let rt = inner.paged.as_ref().expect("paged");
+            let entry_b = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == breakpoint_b as usize)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "chunk_limit={chunk_limit}: must capture extra breakpoint B={breakpoint_b}"
+                    )
+                });
+            assert!(
+                !entry_b.checkpoint(),
+                "chunk_limit={chunk_limit}: extra breakpoint must publish as StateClass::Ordinary"
+            );
+            assert!(
+                rt.state_store.is_prompt_head(entry_b.id()),
+                "chunk_limit={chunk_limit}: extra breakpoint must be marked in prompt_heads"
+            );
+            let win_b = entry_b
+                .ram()
+                .expect("ram anchor at B")
+                .draft_window
+                .as_ref()
+                .expect("complete PackedDraftWindow must be captured at B");
+            assert_eq!(win_b.slots, 64);
+            assert!(
+                win_b.is_complete_for(breakpoint_b),
+                "chunk_limit={chunk_limit}: PackedDraftWindow at B={breakpoint_b} must be complete \
+                 (begin={}, end={}, slots={})",
+                win_b.begin,
+                win_b.end,
+                win_b.slots
+            );
+
+            // Junction 224 must also be captured with a complete PackedDraftWindow (non-head).
+            let entry_j = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == 224)
+                .expect("junction 224 must also be captured");
+            assert!(!rt.state_store.is_prompt_head(entry_j.id()));
+            assert!(
+                entry_j
+                    .ram()
+                    .and_then(|r| r.draft_window.as_ref())
+                    .is_some_and(|w| w.is_complete_for(224))
+            );
+        }
+
+        // Control: without installing extra breakpoint `96`, `paged_prefill_dflash2_with_taps`
+        // captures ONLY junction `224` and does NOT capture `96`.
+        let mut ctrl = super::super::scheduler::tests::build_synthetic_dflash2_inner_with_window(
+            512, None, 64, 2,
+        );
+        ctrl.paged.as_mut().expect("paged").prefill_chunk_size = 32;
+        let prefix = ctrl
+            .prepare_prefix_sync(2, &prompt, true, 0xDF99)
+            .expect("prepare control");
+        let mut ctx = Inkling2Dflash2Context::new(&ctrl.dflash2.as_ref().unwrap().config);
+        let _ = ctrl
+            .paged_prefill_dflash2_with_taps(2, &prompt, &prefix, &mut ctx)
+            .expect("control prefill");
+        let depths: Vec<usize> = ctrl
+            .paged
+            .as_ref()
+            .unwrap()
+            .state_store
+            .store
+            .entries()
+            .map(|e| e.depth())
+            .collect();
+        assert_eq!(
+            depths,
+            vec![224],
+            "control run without extra breakpoint must capture only junction 224"
+        );
     }
 }

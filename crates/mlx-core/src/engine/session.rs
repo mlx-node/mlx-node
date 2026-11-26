@@ -71,6 +71,7 @@ pub(crate) struct AdmittedPagedTurn {
     pub thinking: ThinkingSetup,
     pub template_thinking_enabled: bool,
     pub tokens: Vec<u32>,
+    pub prefix_breakpoints: Vec<u32>,
     pub images: Vec<Vec<u8>>,
     pub audio: Vec<Vec<u8>>,
     pub plan: TurnPlan,
@@ -1018,7 +1019,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
         )));
     }
 
-    let full_tokens = backend.render_prompt(
+    let (full_tokens, mut prefix_breakpoints) = backend.render_prompt_with_breakpoints(
         &setup.tokenizer,
         &messages,
         &config,
@@ -1074,6 +1075,9 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
             "{IMAGE_CHANGE_RESTART_PREFIX} this model has no audio support; audio messages are not supported",
         )));
     }
+    if is_delta || !images.is_empty() || !audio.is_empty() {
+        prefix_breakpoints.clear();
+    }
     let input_media = MediaInputs {
         images: &images,
         audio: &audio,
@@ -1094,7 +1098,7 @@ pub(crate) fn admit_paged_turn<B: ChatBackend>(
             streaming,
         },
     );
-    Ok(setup.admitted(config, tokens, images, audio, plan))
+    Ok(setup.admitted(config, tokens, prefix_breakpoints, images, audio, plan))
 }
 
 /// [`admit_paged_turn`] for a turn whose tokens are given: no render, no
@@ -1115,7 +1119,7 @@ pub(crate) fn admit_tokens<B: ChatBackend>(
             streaming: false,
         },
     );
-    Ok(setup.admitted(config, tokens, Vec::new(), Vec::new(), plan))
+    Ok(setup.admitted(config, tokens, Vec::new(), Vec::new(), Vec::new(), plan))
 }
 
 /// What a turn resolves from its config before its prompt.
@@ -1137,8 +1141,7 @@ impl AdmissionSetup {
         // effort-dependent `</ifm|think*>` variant.
         let close = backend.think_end_for_turn(config, &tokenizer);
         let params = backend.resolve_params(config);
-        let template_thinking_enabled =
-            crate::engine::params::resolve_enable_thinking(config).unwrap_or(true);
+        let template_thinking_enabled = backend.public_thinking_enabled(config);
         backend.set_cache_owner_id(
             &params.cache_owner_id,
             params.cache_root_owner_id.as_deref(),
@@ -1158,6 +1161,7 @@ impl AdmissionSetup {
         self,
         config: ChatConfig,
         tokens: Vec<u32>,
+        prefix_breakpoints: Vec<u32>,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
         plan: TurnPlan,
@@ -1171,6 +1175,7 @@ impl AdmissionSetup {
             thinking: self.thinking,
             template_thinking_enabled: self.template_thinking_enabled,
             tokens,
+            prefix_breakpoints,
             images,
             audio,
             plan,
@@ -1207,6 +1212,7 @@ fn chat_turn_core<B: ChatBackend>(
     let mut config = admitted.config;
     let mut p = admitted.params;
     let tokens = admitted.tokens;
+    let prefix_breakpoints = admitted.prefix_breakpoints;
     if let Some(window) = backend.context_window() {
         let max_output = crate::engine::scheduler::context_output_budget(tokens.len(), window)?;
         p.max_new_tokens = p
@@ -1236,6 +1242,12 @@ fn chat_turn_core<B: ChatBackend>(
 
     // --- specialized whole-turn execution ---
     {
+        if matches!(turn_plan.path(), TurnPath::Paged | TurnPath::Speculative) {
+            backend.set_pending_prefix_breakpoints(
+                u32::try_from(tokens.len()).unwrap_or(u32::MAX),
+                &prefix_breakpoints,
+            );
+        }
         let mut wt_args = WholeTurnArgs {
             tokens: &tokens,
             tokenizer: &tokenizer,
@@ -1744,5 +1756,251 @@ mod continuation_comparison_tests {
             &[boundary],
             CHANNEL_END
         ));
+    }
+
+    #[test]
+    fn flat_session_open_token_honoring_reports_public_thinking_enabled_and_arms_zero_budget_tracker()
+     {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        use napi::bindgen_prelude::Result;
+
+        use crate::array::MxArray;
+        use crate::engine::backend::{
+            ChatBackend, ChunkSink, DecodeStep, DefaultStreamEmitter, FinalizeArgs, ResetScope,
+            SaveStateArgs, StreamEmitter, ThinkEndResolution, TurnSetup,
+        };
+        use crate::engine::params::ThinkingPolicy;
+        use crate::engine::session::{session_start, session_start_stream};
+        use crate::engine::types::{ChatConfig, ChatResult, ChatStreamChunk};
+        use crate::stream::Stream;
+        use crate::tokenizer::{ChatMessage, Qwen3Tokenizer};
+
+        const VOCAB: usize = 16;
+        const OPEN: u32 = 8;
+        const CLOSE: u32 = 9;
+        const ANSWER: u32 = 10;
+        const EOS: u32 = 15;
+
+        fn tiny_tokenizer() -> Arc<Qwen3Tokenizer> {
+            static SEQ: AtomicUsize = AtomicUsize::new(0);
+            let json = r#"{
+                "version": "1.0",
+                "truncation": null,
+                "padding": null,
+                "added_tokens": [],
+                "normalizer": null,
+                "pre_tokenizer": null,
+                "post_processor": null,
+                "decoder": null,
+                "model": {
+                    "type": "WordLevel",
+                    "vocab": {
+                        "t0": 0, "t1": 1, "t2": 2, "t3": 3,
+                        "t4": 4, "t5": 5, "t6": 6, "t7": 7,
+                        "<open>": 8, "<close>": 9, "ok": 10, "t11": 11,
+                        "t12": 12, "t13": 13, "t14": 14, "<eos>": 15
+                    },
+                    "unk_token": "t0"
+                }
+            }"#;
+            let dir = std::env::temp_dir().join(format!(
+                "mlx-node-flat-session-think-tok-{}-{}",
+                std::process::id(),
+                SEQ.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir_all(&dir).expect("fixture dir");
+            let path = dir.join("tokenizer.json");
+            std::fs::write(&path, json).expect("fixture write");
+            let tok = Qwen3Tokenizer::from_file(&path).expect("fixture tokenizer");
+            let _ = std::fs::remove_dir_all(&dir);
+            Arc::new(tok)
+        }
+
+        fn one_hot_1d(tok: u32) -> MxArray {
+            let mut v = vec![-100.0f32; VOCAB];
+            v[tok as usize] = 100.0;
+            MxArray::from_float32(&v, &[VOCAB as i64]).unwrap()
+        }
+
+        struct Sink {
+            chunks: Mutex<Vec<ChatStreamChunk>>,
+        }
+        impl ChunkSink for Sink {
+            fn send(&self, item: Result<ChatStreamChunk>) {
+                if let Ok(chunk) = item {
+                    self.chunks.lock().unwrap().push(chunk);
+                }
+            }
+        }
+
+        struct ScriptDecode {
+            tokens: Vec<u32>,
+            cursor: usize,
+        }
+        impl DecodeStep for ScriptDecode {
+            fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+                let next = self.tokens.get(self.cursor).copied().unwrap_or(EOS);
+                self.cursor += 1;
+                Ok((one_hot_1d(next), false))
+            }
+        }
+
+        struct MockOpenTokenFlatArBackend {
+            tok: Arc<Qwen3Tokenizer>,
+            first_token: u32,
+            decode_tokens: Vec<u32>,
+        }
+
+        impl ChatBackend for MockOpenTokenFlatArBackend {
+            type Decode<'a>
+                = ScriptDecode
+            where
+                Self: 'a;
+
+            fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+                Ok(self.tok.clone())
+            }
+            fn family_name(&self) -> &'static str {
+                "inkling2_flat_ar_mock"
+            }
+            fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+                Ok(EOS)
+            }
+            fn policy(&self) -> ThinkingPolicy {
+                ThinkingPolicy::OpenTokenHonoring
+            }
+            fn think_end_for_turn(
+                &self,
+                _config: &ChatConfig,
+                _tok: &Qwen3Tokenizer,
+            ) -> ThinkEndResolution {
+                ThinkEndResolution::with_open_token(OPEN, Arc::from([CLOSE]))
+            }
+            fn render_prompt(
+                &self,
+                _tok: &Qwen3Tokenizer,
+                _messages: &[ChatMessage],
+                _config: &ChatConfig,
+                _preserve_thinking: bool,
+            ) -> Result<Vec<u32>> {
+                Ok(vec![1, 2])
+            }
+            fn cached_token_history(&self) -> &[u32] {
+                &[]
+            }
+            fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+                Ok(())
+            }
+            fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+                0
+            }
+            fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+            fn eval_caches(&self) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+                Ok(one_hot_1d(self.first_token))
+            }
+            fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+                Ok(ScriptDecode {
+                    tokens: self.decode_tokens.clone(),
+                    cursor: 0,
+                })
+            }
+            fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
+                Box::new(DefaultStreamEmitter)
+            }
+            fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+                Ok(ChatResult {
+                    text: "ok".to_string(),
+                    tool_calls: Vec::new(),
+                    thinking: None,
+                    thinking_enabled: args.thinking_enabled,
+                    num_tokens: args.generated_tokens.len() as u32,
+                    prompt_tokens: args.prompt_tokens,
+                    reasoning_tokens: args.reasoning.tokens,
+                    reasoning_close: args.reasoning.close_name(),
+                    reasoning_cut_at: args.reasoning.cut_at,
+                    reasoning_cycle_period: args.reasoning.cycle_period,
+                    reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+                    finish_reason: args.finish_reason,
+                    raw_text: String::new(),
+                    public_raw_text: None,
+                    cached_tokens: 0,
+                    performance: None,
+                })
+            }
+        }
+
+        let tok = tiny_tokenizer();
+        let make_msg = || {
+            vec![ChatMessage {
+                role: "user".to_string(),
+                content: "hi".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                thinking_enabled: None,
+                images: None,
+                audio: None,
+            }]
+        };
+
+        for (effort, expected_public, expect_budget_cut) in [
+            (Some("none"), false, true),
+            (Some("0"), false, true),
+            (Some("0.0"), false, true),
+            (Some("-0.0"), false, true),
+            (Some("low"), true, false),
+            (None, true, false),
+        ] {
+            let cfg = ChatConfig {
+                max_new_tokens: Some(4),
+                temperature: Some(0.0),
+                top_k: Some(0),
+                top_p: Some(1.0),
+                min_p: Some(0.0),
+                reasoning_effort: effort.map(str::to_string),
+                ..ChatConfig::default()
+            };
+            let mut backend = MockOpenTokenFlatArBackend {
+                tok: tok.clone(),
+                first_token: if expect_budget_cut { OPEN } else { ANSWER },
+                decode_tokens: vec![ANSWER, EOS],
+            };
+            let cancel = Arc::new(AtomicBool::new(false));
+
+            // Sync flat AR session turn
+            let res = session_start(&mut backend, make_msg(), cfg.clone(), &cancel)
+                .expect("flat AR sync turn");
+            assert_eq!(
+                res.thinking_enabled, expected_public,
+                "flat AR sync thinking_enabled mismatch for effort={effort:?}"
+            );
+            if expect_budget_cut {
+                assert_eq!(res.reasoning_close.as_deref(), Some("budget"));
+                assert_eq!(res.reasoning_cut_at, Some(0));
+            }
+
+            // Streaming flat AR session turn
+            let sink = Sink {
+                chunks: Mutex::new(Vec::new()),
+            };
+            session_start_stream(&mut backend, make_msg(), cfg, &sink, &cancel);
+            let chunks = sink.chunks.lock().unwrap();
+            let done = chunks.iter().find(|c| c.done).expect("terminal chunk");
+            assert_eq!(
+                done.thinking_enabled,
+                Some(expected_public),
+                "flat AR streaming terminal thinking_enabled mismatch for effort={effort:?}"
+            );
+            if expect_budget_cut {
+                assert_eq!(done.reasoning_close.as_deref(), Some("budget"));
+                assert_eq!(done.reasoning_cut_at, Some(0));
+            }
+        }
     }
 }

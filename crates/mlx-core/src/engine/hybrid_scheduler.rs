@@ -18,7 +18,7 @@ mod progress_tests;
 #[cfg(all(test, target_os = "macos"))]
 mod restore_tests;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -759,6 +759,27 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
         self.prime_prefix_state(tokens, reuse_cache, block_size as usize, &[], cache_salt)
             .map(ScheduledPrefixAdmission::Ready)
     }
+    /// A preempted turn's prefix replay: delegates to
+    /// [`Self::prepare_scheduled_prefix`] by default. Families that distinguish
+    /// preemption replays from fresh shared-prefix hits override this.
+    fn prepare_preemption_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        block_size: u32,
+    ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+        self.prepare_scheduled_prefix(
+            seq_id,
+            tokens,
+            owner_history,
+            reuse_cache,
+            cache_salt,
+            block_size,
+        )
+    }
     /// A start's prefix while other turns are admitted on the model: a
     /// family that restores beside them without holding the model thread
     /// parks the turn here. A lone start takes
@@ -821,6 +842,49 @@ pub(crate) trait HybridSchedulerBackend: PagedBackend + Sized {
     fn extra_prefill_breaks(&self, _prompt_tokens: u32, _cached_prefix: u32) -> Vec<u32> {
         Vec::new()
     }
+    /// Install raw structural prefix breakpoint offsets for `seq_id` prior to
+    /// prefix preparation so family-specific break/capture logic can align and
+    /// preserve them. Default no-op.
+    fn set_seq_prefix_breakpoints(
+        &mut self,
+        _seq_id: SeqId,
+        _prompt_tokens: u32,
+        _breakpoints: &[u32],
+    ) {
+    }
+    /// Per-sequence extra prefill breaks strictly inside
+    /// `(cached_prefix, prompt_tokens)`. Default delegates to
+    /// [`Self::extra_prefill_breaks`].
+    fn extra_prefill_breaks_for(
+        &self,
+        _seq_id: SeqId,
+        prompt_tokens: u32,
+        cached_prefix: u32,
+    ) -> Vec<u32> {
+        self.extra_prefill_breaks(prompt_tokens, cached_prefix)
+    }
+    /// Minimum uncached shared-prefix length (tokens) for opt-in concurrent
+    /// cold-prefix coalescing. `None` disables coalescing for this family.
+    fn prefix_coalesce_min_tokens(&self) -> Option<u32> {
+        None
+    }
+    /// Whether `seq_id` is eligible to lead concurrent cold-prefix coalescing
+    /// (e.g. cache reuse enabled and no multimodal image lineage).
+    fn can_lead_prefix_coalesce(&self, _seq_id: SeqId) -> bool {
+        false
+    }
+    /// Register a block-aligned shared-prefix capture boundary on an active
+    /// leader sequence so its prefill publishes a durable `Ordinary + is_head`
+    /// state anchor at `boundary`. Returns `true` iff the leader will capture
+    /// and publish `boundary` as a durable head anchor.
+    fn register_shared_prefill_break(&mut self, _leader_seq: SeqId, _boundary: u32) -> bool {
+        false
+    }
+    /// Unregister a dynamic shared-prefix capture boundary previously registered
+    /// by [`Self::register_shared_prefill_break`] when no held follower still
+    /// waits on it. Implementations must leave the leader's own static
+    /// structural breakpoints intact. Default no-op.
+    fn unregister_shared_prefill_break(&mut self, _leader_seq: SeqId, _boundary: u32) {}
     fn profiler_prefill_tokens(&self, prefix: &Self::PrefixState, _prompt_tokens: u32) -> u32 {
         prefix.suffix_len() as u32
     }
@@ -1567,6 +1631,7 @@ pub(crate) struct ScheduledTurn<P> {
     pub(crate) params: engine::params::ChatParams,
     pub(crate) thinking: ThinkingSetup,
     pub(crate) prompt_tokens: Vec<u32>,
+    pub(crate) prefix_breakpoints: Vec<u32>,
     pub(crate) prefix: P,
     pub(crate) is_delta: bool,
     pub(crate) reuse_cache: bool,
@@ -1677,6 +1742,37 @@ fn mark(progress: Option<&Arc<TurnProgress>>, waiting: Waiting) {
     }
 }
 
+const PREFIX_COALESCE_STALL_SECONDS: f64 = 10.0;
+const PREFIX_COALESCE_MAX_WAIT_SECONDS: f64 = 60.0;
+const PREFIX_COALESCE_MAX_RELINKS: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PrefixCoalesce {
+    leader_seq: SeqId,
+    target_break: u32,
+    started_at: f64,
+    last_progress_at: f64,
+    last_leader_progress: (u32, u32),
+    relinks: u8,
+}
+
+fn block_aligned_shared_prefix(a: &[u32], b: &[u32], block_size: u32) -> u32 {
+    if block_size == 0 {
+        return 0;
+    }
+    let max_strict = a.len().min(b.len()).saturating_sub(1);
+    if max_strict < block_size as usize {
+        return 0;
+    }
+    let lcp = a[..max_strict]
+        .iter()
+        .zip(&b[..max_strict])
+        .take_while(|(x, y)| x == y)
+        .count();
+    let lcp_u32 = u32::try_from(lcp).unwrap_or(u32::MAX);
+    (lcp_u32 / block_size) * block_size
+}
+
 struct PreparedTurn {
     admitted: engine::session::AdmittedPagedTurn,
     /// Prefill ends pinned beside the family's own.
@@ -1706,6 +1802,13 @@ struct PreparedTurn {
     /// The last stored-state probe of its prompt: hashing a long prompt's
     /// chain on every admission pass is the cost the generation saves.
     stored_prefix: std::cell::Cell<Option<ProbedPrefix>>,
+    /// Active opt-in concurrent cold-prefix coalescing hold state while
+    /// waiting for a leader sequence to publish a shared prefix anchor.
+    coalesce: Option<PrefixCoalesce>,
+    /// Set once a coalescing hold ends due to timeout, stall, leader refusal,
+    /// or relink exhaustion so the turn proceeds to admission without
+    /// re-pinning.
+    coalesce_exhausted: bool,
 }
 
 /// [`HybridSchedulerBackend::scheduled_prefix_probe`]'s answer at one
@@ -2863,6 +2966,10 @@ pub(crate) struct HybridSchedulerState<B: HybridSchedulerBackend> {
     /// The work end each row of the latest step claimed (Splash
     /// `Denied::workEnd`): a lane that yields resumes to its own.
     row_work_ends: HashMap<SeqId, u32>,
+    /// Active follower reference counts for dynamically registered coalescing
+    /// boundaries (`leader_seq -> (boundary -> follower_count)`), kept separate
+    /// from each leader's own static structural `prefix_breakpoints`.
+    shared_coalesce_breaks: HashMap<SeqId, BTreeMap<u32, u32>>,
     /// Splash `Engine::admissions_`.
     admissions: u64,
     /// The lanes the latest step ran (Splash's command in flight), read by
@@ -3112,6 +3219,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             owner_states: HashMap::new(),
             owner_last_used: HashMap::new(),
             row_work_ends: HashMap::new(),
+            shared_coalesce_breaks: HashMap::new(),
             admissions: 0,
             worked_lanes: Vec::new(),
             wanted_signature: Vec::new(),
@@ -3305,6 +3413,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         release(&mut self.inner, seq_id, self.owner_states.get(owner_id))?;
         if let Some(seq_id) = seq_id {
             self.pending_restores.remove(&seq_id);
+            self.shared_coalesce_breaks.remove(&seq_id);
         }
         self.owner_sequences.remove(owner_id);
         self.owner_states.remove(owner_id);
@@ -3676,6 +3785,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             order: None,
             overtaken: 0,
             stored_prefix: std::cell::Cell::new(None),
+            coalesce: None,
+            coalesce_exhausted: false,
         }))
     }
 
@@ -3741,7 +3852,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         )
     }
 
-    fn cleanup_rejected_prepared(&mut self, prepared: &PreparedTurn) {
+    fn cleanup_rejected_prepared(&mut self, prepared: &mut PreparedTurn) {
+        self.release_coalesce_pin(prepared);
         if prepared.newly_assigned {
             self.owner_states.remove(&prepared.owner_id);
             self.owner_sequences.remove(&prepared.owner_id);
@@ -5017,8 +5129,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.count_resource_timeout();
             match key {
                 None => {
-                    if let Some(prepared) = self.prepared_waiting.take() {
-                        self.cleanup_rejected_prepared(&prepared);
+                    if let Some(mut prepared) = self.prepared_waiting.take() {
+                        self.cleanup_rejected_prepared(&mut prepared);
                         prepared
                             .response
                             .send_error(Error::from_reason(error), prepared.cancelled.as_ref());
@@ -5162,6 +5274,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.owner_sequences.clear();
             self.owner_states.clear();
             self.owner_last_used.clear();
+            self.shared_coalesce_breaks.clear();
         } else {
             let live: HashSet<SeqId> = self.owner_sequences.values().copied().collect();
             self.owner_last_used
@@ -5387,8 +5500,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             }
         }
         let held = std::mem::take(&mut self.held);
-        for prepared in self.prepared_waiting.take().into_iter().chain(held) {
-            self.cleanup_rejected_prepared(&prepared);
+        for mut prepared in self.prepared_waiting.take().into_iter().chain(held) {
+            self.cleanup_rejected_prepared(&mut prepared);
             prepared.response.send_error(
                 Error::from_reason(error.clone()),
                 prepared.cancelled.as_ref(),
@@ -5400,6 +5513,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         self.owner_sequences.clear();
         self.owner_states.clear();
         self.owner_last_used.clear();
+        self.shared_coalesce_breaks.clear();
         if let Err(reset) = self.inner.reset_after_gpu_oom() {
             tracing::warn!(
                 target: "mlx_core::memory",
@@ -5849,13 +5963,379 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         }
     }
 
+    /// Attempt to discover, rank, and pin `prepared` onto an eligible active
+    /// leader sequence sharing at least `min_tokens` uncached tokens.
+    fn try_pin_coalesce_leader(
+        &mut self,
+        prepared: &mut PreparedTurn,
+        cached: u32,
+        min_tokens: u32,
+        started_at: f64,
+        now: f64,
+        relinks: u8,
+    ) -> bool {
+        let block_size = prepared.block_size;
+        let salt = prepared.admitted.params.cache_salt;
+        let follower_tokens = &prepared.admitted.tokens;
+        struct Candidate {
+            leader_seq: SeqId,
+            shared_break: u32,
+            leader_computed: u32,
+            leader_prompt: u32,
+            arrival_order: u64,
+        }
+        let mut candidates: Vec<Candidate> = self
+            .scheduler
+            .turns()
+            .filter(|turn| {
+                turn.seq_id != prepared.seq_id
+                    && matches!(turn.status, TurnStatus::Waiting | TurnStatus::Running)
+                    && !is_cancelled(turn)
+                    && turn.payload.failure.is_none()
+                    && turn.payload.preemption_replay.is_none()
+                    && turn.payload.reuse_cache
+                    && turn.payload.params.cache_salt == salt
+                    && turn.num_computed_tokens < turn.prompt_tokens
+                    && self.inner.can_lead_prefix_coalesce(turn.seq_id)
+            })
+            .filter_map(|turn| {
+                let shared_break = block_aligned_shared_prefix(
+                    &turn.payload.prompt_tokens,
+                    follower_tokens,
+                    block_size,
+                );
+                if shared_break > turn.num_computed_tokens
+                    && shared_break.saturating_sub(cached) >= min_tokens
+                {
+                    Some(Candidate {
+                        leader_seq: turn.seq_id,
+                        shared_break,
+                        leader_computed: turn.num_computed_tokens,
+                        leader_prompt: turn.prompt_tokens,
+                        arrival_order: turn.arrival_order(),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if candidates.is_empty() {
+            return false;
+        }
+        candidates.sort_by(|a, b| {
+            (
+                b.shared_break,
+                b.leader_computed,
+                std::cmp::Reverse(b.arrival_order),
+            )
+                .cmp(&(
+                    a.shared_break,
+                    a.leader_computed,
+                    std::cmp::Reverse(a.arrival_order),
+                ))
+        });
+
+        let is_measured = !self.scratch && self.inner.measured_prefill_cut().is_some();
+        for candidate in candidates {
+            let mut target_break = None;
+            if self
+                .inner
+                .register_shared_prefill_break(candidate.leader_seq, candidate.shared_break)
+            {
+                target_break = Some(candidate.shared_break);
+            } else {
+                let mut breaks = self.inner.extra_prefill_breaks_for(
+                    candidate.leader_seq,
+                    candidate.leader_prompt,
+                    candidate.leader_computed,
+                );
+                breaks.sort_unstable();
+                breaks.dedup();
+                for b in breaks.into_iter().rev() {
+                    if b <= candidate.shared_break
+                        && b > candidate.leader_computed
+                        && b.saturating_sub(cached) >= min_tokens
+                        && self
+                            .inner
+                            .register_shared_prefill_break(candidate.leader_seq, b)
+                    {
+                        target_break = Some(b);
+                        break;
+                    }
+                }
+            }
+            let Some(target_break) = target_break else {
+                continue;
+            };
+            let Some(leader) = self
+                .scheduler
+                .turns_mut()
+                .find(|turn| turn.seq_id == candidate.leader_seq)
+            else {
+                continue;
+            };
+            *self
+                .shared_coalesce_breaks
+                .entry(candidate.leader_seq)
+                .or_default()
+                .entry(target_break)
+                .or_insert(0) += 1;
+            if !is_measured
+                && target_break > leader.num_computed_tokens
+                && target_break <= leader.prompt_tokens
+                && let Err(idx) = leader.pinned_prefill_breaks.binary_search(&target_break)
+            {
+                leader.pinned_prefill_breaks.insert(idx, target_break);
+            }
+            let rows_done = self
+                .inner
+                .prefill_rows_done(candidate.leader_seq)
+                .unwrap_or(0);
+            prepared.coalesce = Some(PrefixCoalesce {
+                leader_seq: candidate.leader_seq,
+                target_break,
+                started_at,
+                last_progress_at: now,
+                last_leader_progress: (candidate.leader_computed, rows_done),
+                relinks,
+            });
+            return true;
+        }
+        false
+    }
+
+    /// Release a follower's active coalescing pin from its leader, decrementing
+    /// the dynamic boundary refcount and unregistering the boundary from the
+    /// backend (and recomputing non-Measured `pinned_prefill_breaks`) once no
+    /// follower remains pinned to it. Static structural breakpoints on the
+    /// leader are preserved.
+    fn release_coalesce_pin(&mut self, prepared: &mut PreparedTurn) {
+        let Some(state) = prepared.coalesce.take() else {
+            return;
+        };
+        let Self {
+            scheduler,
+            inner,
+            scratch,
+            shared_coalesce_breaks,
+            ..
+        } = self;
+        let is_measured = !*scratch && inner.measured_prefill_cut().is_some();
+        let (removed_last, remove_seq_map) = match shared_coalesce_breaks.get_mut(&state.leader_seq)
+        {
+            Some(breaks) => {
+                let removed_last = match breaks.get_mut(&state.target_break) {
+                    Some(count) if *count > 1 => {
+                        *count -= 1;
+                        false
+                    }
+                    Some(_) => {
+                        breaks.remove(&state.target_break);
+                        true
+                    }
+                    None => false,
+                };
+                (removed_last, breaks.is_empty())
+            }
+            None => (false, false),
+        };
+        if remove_seq_map {
+            shared_coalesce_breaks.remove(&state.leader_seq);
+        }
+        if !removed_last {
+            return;
+        }
+        let Some(leader) = scheduler
+            .turns_mut()
+            .find(|turn| turn.seq_id == state.leader_seq)
+        else {
+            return;
+        };
+        let bs = leader.block_size.max(1);
+        let is_static = leader
+            .payload
+            .prefix_breakpoints
+            .iter()
+            .any(|&raw| raw == state.target_break || (raw / bs) * bs == state.target_break);
+        if !is_static {
+            inner.unregister_shared_prefill_break(state.leader_seq, state.target_break);
+            if !is_measured && matches!(leader.status, TurnStatus::Waiting | TurnStatus::Running) {
+                let target = leader
+                    .payload
+                    .preemption_replay
+                    .as_ref()
+                    .map_or(leader.prompt_tokens, |replay| replay.tokens.len() as u32);
+                if leader.num_computed_tokens < target {
+                    let mut extra_breaks = inner.extra_prefill_breaks_for(
+                        leader.seq_id,
+                        target,
+                        leader.num_computed_tokens,
+                    );
+                    if let Some(active) = shared_coalesce_breaks.get(&leader.seq_id) {
+                        for &b in active.keys() {
+                            if b > leader.num_computed_tokens && b < target {
+                                extra_breaks.push(b);
+                            }
+                        }
+                    }
+                    extra_breaks.sort_unstable();
+                    extra_breaks.dedup();
+                    (leader.pinned_prefill_breaks, leader.whole_prompt_prefill) = prefill_breaks(
+                        inner,
+                        leader.seq_id,
+                        leader.num_computed_tokens,
+                        target,
+                        extra_breaks,
+                    );
+                }
+            }
+        }
+    }
+
+    /// Opt-in concurrent cold-prefix coalescing: holds a follower in
+    /// `self.held` while an active leader prefills and publishes their
+    /// shared prefix anchor.
+    fn coalesce_waits(&mut self, prepared: &mut PreparedTurn) -> bool {
+        let Some(min_tokens) = self.inner.prefix_coalesce_min_tokens() else {
+            self.release_coalesce_pin(prepared);
+            return false;
+        };
+        if min_tokens == 0
+            || prepared.coalesce_exhausted
+            || prepared.admitted.plan.is_delta
+            || !prepared.admitted.params.reuse_cache
+            || prepared.block_size == 0
+        {
+            self.release_coalesce_pin(prepared);
+            return false;
+        }
+        let now = self.memory_governor().now();
+        let live = live_held_prefix(
+            self.inner.paged_adapter(),
+            prepared.seq_id,
+            &prepared.admitted.tokens,
+            true,
+        )
+        .map_or(0, |kept| u32::try_from(kept).unwrap_or(u32::MAX));
+        let stored = self.stored_prefix(prepared);
+        let cached = live.max(stored);
+
+        if let Some(mut state) = prepared.coalesce {
+            // (1) Check whether the target prefix is now cached FIRST so a
+            // leader that published and already finished still wakes followers.
+            if cached >= state.target_break {
+                self.release_coalesce_pin(prepared);
+                prepared.stored_prefix.set(None);
+                return false;
+            }
+            // (2) Hard wait cap from original `started_at`.
+            if now - state.started_at >= PREFIX_COALESCE_MAX_WAIT_SECONDS {
+                self.release_coalesce_pin(prepared);
+                prepared.coalesce_exhausted = true;
+                prepared.stored_prefix.set(None);
+                return false;
+            }
+            // (3) Check whether the pinned leader is still eligible; relink up
+            // to `PREFIX_COALESCE_MAX_RELINKS` preserving original `started_at`
+            // while resetting stall progress to the new leader. A prefill
+            // preemption replay that still preserves `state.target_break` in
+            // `shared_coalesce_breaks` or static `prefix_breakpoints` stays
+            // valid so `try_resume_preempted` recovery completes for held
+            // followers.
+            let leader_info = self
+                .scheduler
+                .turns()
+                .find(|turn| turn.seq_id == state.leader_seq)
+                .and_then(|leader| {
+                    let bs = leader.block_size.max(1);
+                    let replay_invalid =
+                        leader
+                            .payload
+                            .preemption_replay
+                            .as_ref()
+                            .is_some_and(|replay| {
+                                replay.suppress_sample
+                                    || (replay.tokens.len() as u32) <= state.target_break
+                                    || !(self
+                                        .shared_coalesce_breaks
+                                        .get(&leader.seq_id)
+                                        .is_some_and(|breaks| {
+                                            breaks.contains_key(&state.target_break)
+                                        })
+                                        || leader.payload.prefix_breakpoints.iter().any(|&raw| {
+                                            raw == state.target_break
+                                                || (raw / bs) * bs == state.target_break
+                                        }))
+                            });
+                    let valid = matches!(leader.status, TurnStatus::Waiting | TurnStatus::Running)
+                        && !is_cancelled(leader)
+                        && leader.payload.failure.is_none()
+                        && !replay_invalid
+                        && self.inner.can_lead_prefix_coalesce(leader.seq_id);
+                    valid.then_some(leader.num_computed_tokens)
+                });
+            let Some(leader_computed) = leader_info else {
+                self.release_coalesce_pin(prepared);
+                if state.relinks < PREFIX_COALESCE_MAX_RELINKS
+                    && self.try_pin_coalesce_leader(
+                        prepared,
+                        cached,
+                        min_tokens,
+                        state.started_at,
+                        now,
+                        state.relinks + 1,
+                    )
+                {
+                    return true;
+                }
+                prepared.coalesce_exhausted = true;
+                prepared.stored_prefix.set(None);
+                return false;
+            };
+            // (4) Governor refusal guard: leader passed `target_break` without
+            // publishing a restorable anchor.
+            if leader_computed >= state.target_break {
+                self.release_coalesce_pin(prepared);
+                prepared.coalesce_exhausted = true;
+                prepared.stored_prefix.set(None);
+                return false;
+            }
+            // (5) Progress tracking & stall guard.
+            let rows_done = self.inner.prefill_rows_done(state.leader_seq).unwrap_or(0);
+            let progress = (leader_computed, rows_done);
+            if progress > state.last_leader_progress {
+                state.last_leader_progress = progress;
+                state.last_progress_at = now;
+                prepared.coalesce = Some(state);
+                return true;
+            }
+            // A prefill-preemption rewind lowers `num_computed_tokens`; update
+            // the baseline without refreshing `last_progress_at` so forward
+            // replay progress resets the stall timer while a stuck rewind still
+            // trips the 10s stall cap.
+            if progress.0 < state.last_leader_progress.0 {
+                state.last_leader_progress = progress;
+                prepared.coalesce = Some(state);
+            }
+            if now - state.last_progress_at >= PREFIX_COALESCE_STALL_SECONDS {
+                self.release_coalesce_pin(prepared);
+                prepared.coalesce_exhausted = true;
+                prepared.stored_prefix.set(None);
+                return false;
+            }
+            return true;
+        }
+
+        self.try_pin_coalesce_leader(prepared, cached, min_tokens, now, now, 0)
+    }
+
     fn admit_prepared(
         &mut self,
         mut prepared: Box<PreparedTurn>,
     ) -> std::result::Result<Option<TurnState<ScheduledTurn<B::PrefixState>>>, Box<PreparedTurn>>
     {
         if prepared.cancelled.load(Ordering::Relaxed) {
-            self.cleanup_rejected_prepared(&prepared);
+            self.cleanup_rejected_prepared(&mut prepared);
             let PreparedTurn {
                 response,
                 cancelled,
@@ -5866,6 +6346,17 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 cancelled.as_ref(),
             );
             return Ok(None);
+        }
+        // Opt-in concurrent cold-prefix coalescing: hold followers in
+        // `self.held` (zero lanes/KV/governor claims, zero HoL blocking)
+        // while a leader prefills and publishes their shared prefix.
+        if self.coalesce_waits(&mut prepared) {
+            prepared.held = true;
+            self.defer_admission(&mut prepared);
+            if prepared.order.is_none() {
+                prepared.order = Some(self.scheduler.reserve_order());
+            }
+            return Err(prepared);
         }
         // Splash `Scheduler::prefillAdmissionOrder`: it takes no memory
         // until the unit it would join serves it.
@@ -5880,7 +6371,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let cache_snapshot = match self.inner.scheduler_cache_snapshot() {
             Ok(snapshot) => snapshot,
             Err(error) => {
-                self.cleanup_rejected_prepared(&prepared);
+                self.cleanup_rejected_prepared(&mut prepared);
                 prepared
                     .response
                     .send_error(error, prepared.cancelled.as_ref());
@@ -5901,7 +6392,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         if cache_snapshot.as_ref().is_some_and(|snapshot| {
             exceeds_max_pool_ceiling(snapshot, prepared.reservation_blocks, pool_state_bytes)
         }) {
-            self.cleanup_rejected_prepared(&prepared);
+            self.cleanup_rejected_prepared(&mut prepared);
             let max_total_blocks = cache_snapshot.map_or(0, |snapshot| snapshot.max_total_blocks);
             prepared.response.send_error(
                 Self::context_length_exceeded_max(prepared.reservation_blocks, max_total_blocks),
@@ -5915,7 +6406,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 Admitted::Granted(reservation) => cell = reservation,
                 Admitted::Wait => return Err(prepared),
                 Admitted::Fail(error) => {
-                    self.cleanup_rejected_prepared(&prepared);
+                    self.cleanup_rejected_prepared(&mut prepared);
                     prepared
                         .response
                         .send_error(error, prepared.cancelled.as_ref());
@@ -5963,7 +6454,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                 Ok(MemoryReserveOutcome::Admitted) => {}
                 Ok(MemoryReserveOutcome::Defer) => return Err(prepared),
                 Ok(MemoryReserveOutcome::Reject { total_blocks }) => {
-                    self.cleanup_rejected_prepared(&prepared);
+                    self.cleanup_rejected_prepared(&mut prepared);
                     prepared.response.send_error(
                         Self::context_length_exceeded(prepared.reservation_blocks, total_blocks),
                         prepared.cancelled.as_ref(),
@@ -5971,7 +6462,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
                     return Ok(None);
                 }
                 Err(error) => {
-                    self.cleanup_rejected_prepared(&prepared);
+                    self.cleanup_rejected_prepared(&mut prepared);
                     prepared
                         .response
                         .send_error(error, prepared.cancelled.as_ref());
@@ -6040,6 +6531,12 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         mark(progress.as_ref(), Waiting::Prepare);
         let installed = engine::progress::install_prepare_progress(progress);
         let reuse_cache = prepared.admitted.plan.is_delta || prepared.admitted.params.reuse_cache;
+        let prompt_len = u32::try_from(prepared.admitted.tokens.len()).unwrap_or(u32::MAX);
+        self.inner.set_seq_prefix_breakpoints(
+            seq_id,
+            prompt_len,
+            &prepared.admitted.prefix_breakpoints,
+        );
         self.sync_active_scheduled_seqs();
         let prefix_admission = if self.scheduler.has_live_turns() {
             #[cfg(test)]
@@ -6204,6 +6701,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             params: admitted.params,
             thinking: admitted.thinking,
             prompt_tokens: admitted.tokens.clone(),
+            prefix_breakpoints: admitted.prefix_breakpoints,
             prefix,
             is_delta: admitted.plan.is_delta,
             reuse_cache,
@@ -6250,7 +6748,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         };
         let prompt_len = admitted.tokens.len() as u32;
         let cached_prefix = payload.prefix.effective_cached_prefix_len() as u32;
-        let mut extra_breaks = self.inner.extra_prefill_breaks(prompt_len, cached_prefix);
+        let mut extra_breaks =
+            self.inner
+                .extra_prefill_breaks_for(seq_id, prompt_len, cached_prefix);
         extra_breaks.extend(pinned_breaks);
         let (breaks, whole_prompt_prefill) =
             prefill_breaks(&self.inner, seq_id, cached_prefix, prompt_len, extra_breaks);
@@ -6353,8 +6853,8 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .into_iter()
             .partition(|prepared| prepared.cancelled.load(Ordering::Relaxed));
         self.held = held.into();
-        for prepared in cancelled {
-            self.cleanup_rejected_prepared(&prepared);
+        for mut prepared in cancelled {
+            self.cleanup_rejected_prepared(&mut prepared);
             prepared.response.send_error(
                 Error::from_reason(engine::session::CHAT_SESSION_CANCELLED),
                 prepared.cancelled.as_ref(),
@@ -6956,8 +7456,28 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let progress = reply_progress(&turn.payload.response).cloned();
         mark(progress.as_ref(), Waiting::Prepare);
         let installed = engine::progress::install_prepare_progress(progress.clone());
+        self.inner.set_seq_prefix_breakpoints(
+            turn.seq_id,
+            target,
+            &turn.payload.prefix_breakpoints,
+        );
+        if turn.payload.reuse_cache
+            && !self.scratch
+            && let Some(breaks) = self.shared_coalesce_breaks.get(&turn.seq_id)
+        {
+            let active: Vec<u32> = breaks
+                .keys()
+                .copied()
+                .filter(|&boundary| boundary < target)
+                .collect();
+            for boundary in active {
+                let _ = self
+                    .inner
+                    .register_shared_prefill_break(turn.seq_id, boundary);
+            }
+        }
         self.sync_active_scheduled_seqs();
-        let prefix_admission = self.inner.prepare_scheduled_prefix(
+        let prefix_admission = self.inner.prepare_preemption_prefix(
             turn.seq_id,
             &replay_tokens,
             self.owner_states
@@ -7037,9 +7557,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             .saturating_add(restore.as_ref().map_or(0, B::restore_reserved_blocks));
         turn.num_computed_tokens = prefix.effective_cached_prefix_len() as u32;
         turn.block_materialized_blocks = materialized_blocks;
-        let extra_breaks = self
-            .inner
-            .extra_prefill_breaks(target, turn.num_computed_tokens);
+        let extra_breaks =
+            self.inner
+                .extra_prefill_breaks_for(turn.seq_id, target, turn.num_computed_tokens);
         (turn.pinned_prefill_breaks, turn.whole_prompt_prefill) = prefill_breaks(
             &self.inner,
             turn.seq_id,
@@ -7081,6 +7601,7 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
         let claim = turn.payload.claim.take();
         let _request = claim.as_ref().map(|claim| Scope::enter(claim.claim()));
         // Every arm below ends the turn, the error returns included.
+        self.shared_coalesce_breaks.remove(&turn.seq_id);
         self.inner.scheduled_turn_closed(turn.seq_id);
         // Splash `Engine::release`: a lane, or a suspended request, gives its
         // memory back and the waits retry; only a lane ends the failure.
@@ -7286,6 +7807,9 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             return;
         };
         for prepared in &mut self.held {
+            if prepared.coalesce.is_some() {
+                continue;
+            }
             if prepared.order.is_some_and(|order| order < youngest)
                 && prepared.overtaken < engine::scheduler::MAX_OVERTAKES
             {
@@ -7417,93 +7941,180 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
             self.process_deferred_cleanup(&blocked_owner_id);
         }
         let mut lanes_or_held = false;
-        while !deferred
-            && !self.scheduler.has_pending_control()
-            && let Some(command) = self.pending.front()
-        {
-            let must_wait_for_legacy_owner = command.as_chat().is_some_and(|chat| {
-                Self::chat_requires_legacy_owner_drain(chat) && self.scheduler.has_work()
-            });
-            if must_wait_for_legacy_owner || self.waits_behind_held(command) {
-                lanes_or_held = true;
-                break;
-            }
-            let starts = command
-                .as_chat()
-                .is_some_and(|chat| !matches!(chat, ChatCmd::ReleaseCacheOwner { .. }));
-            if starts
-                && self.scheduler.waiting_len() + self.scheduler.running_len()
-                    >= self.scheduler.max_num_seqs()
-            {
-                lanes_or_held = true;
-                break;
-            }
-            // Before its render: a start the pass's prefix budget defers
-            // stays queued, never tokenized and never refused.
-            if starts && !self.prefix_unit_allowed() {
-                break;
-            }
-            let Some(Queued { command, arrival }) = self.pending.pop_front() else {
+        let mut blocked_owners: HashSet<String> = HashSet::new();
+        let mut idx = 0usize;
+        while !deferred && !self.scheduler.has_pending_control() && idx < self.pending.len() {
+            let Some(command) = self.pending.get(idx) else {
                 break;
             };
-            if (Self::force_serial() || !self.enabled)
-                && !command
-                    .as_chat()
-                    .is_some_and(|chat| matches!(chat, ChatCmd::ReleaseCacheOwner { .. }))
-            {
-                if self.scheduler.has_work() {
-                    mark(command_progress(&command), Waiting::Slot);
-                }
-                self.scheduler
-                    .enqueue_exclusive(Queued { command, arrival });
-                break;
-            }
-            match command.into_chat() {
-                Ok(ChatCmd::ReleaseCacheOwner { owner_id, reply }) => {
-                    if self.cache_owner_release_blocked(&owner_id) {
-                        self.pending.push_front(Queued {
-                            command: ModelCommand::from_chat(ChatCmd::ReleaseCacheOwner {
-                                owner_id,
-                                reply,
-                            }),
-                            arrival,
-                        });
-                        break;
-                    }
-                    let _ = reply.send(self.release_cache_owner_now(&owner_id));
-                }
-                Ok(chat) => {
-                    let is_reset = matches!(chat, ChatCmd::ResetCaches { .. });
-                    let mut exclusive = false;
-                    if !self.inner.scheduler_cache_available()
-                        || !(Self::chat_has_explicit_owner(&chat)
-                            || self.ownerless_speculation_is_scheduled(&chat))
-                        || self.chat_requires_barrier(&chat)
+            match command.as_chat() {
+                Some(ChatCmd::ReleaseCacheOwner { owner_id, .. }) => {
+                    if blocked_owners.contains(owner_id)
+                        || self.cache_owner_release_blocked(owner_id)
                     {
-                        if self.scheduler.has_work() {
-                            mark(chat.progress(), Waiting::Slot);
-                        }
-                        self.scheduler.enqueue_exclusive(Queued {
-                            command: ModelCommand::from_chat(chat),
-                            arrival,
-                        });
-                        exclusive = true;
-                    } else {
-                        if let Some(wired) = wired.as_mut() {
-                            wired.mark();
-                        }
-                        let started = self.prefix_clock();
-                        if let Some(prepared) = self.prepare_chat(chat, arrival) {
-                            deferred = self.start_prepared(prepared);
-                        }
-                        self.charge_prefix(started);
+                        blocked_owners.insert(owner_id.clone());
+                        idx += 1;
+                        continue;
                     }
-                    if is_reset || exclusive {
+                    let Some(Queued { command, .. }) = self.pending.remove(idx) else {
                         break;
+                    };
+                    if let Ok(ChatCmd::ReleaseCacheOwner { owner_id, reply }) = command.into_chat()
+                    {
+                        let _ = reply.send(self.release_cache_owner_now(&owner_id));
                     }
                 }
-                Err(barrier) => {
-                    self.scheduler.enqueue_barrier(barrier);
+                Some(ChatCmd::ResetCaches { .. }) => {
+                    if idx > 0 {
+                        break;
+                    }
+                    let must_wait_for_legacy_owner = self.scheduler.has_work();
+                    if must_wait_for_legacy_owner || self.waits_behind_held(command) {
+                        lanes_or_held = true;
+                        break;
+                    }
+                    if self.scheduler.waiting_len() + self.scheduler.running_len()
+                        >= self.scheduler.max_num_seqs()
+                    {
+                        lanes_or_held = true;
+                        break;
+                    }
+                    if !self.prefix_unit_allowed() {
+                        break;
+                    }
+                    let Some(Queued { command, arrival }) = self.pending.pop_front() else {
+                        break;
+                    };
+                    if self.scheduler.has_work() {
+                        mark(command_progress(&command), Waiting::Slot);
+                    }
+                    self.scheduler
+                        .enqueue_exclusive(Queued { command, arrival });
+                    break;
+                }
+                Some(chat) => {
+                    let is_explicit_scheduled = !Self::force_serial()
+                        && self.enabled
+                        && self.inner.scheduler_cache_available()
+                        && Self::chat_has_explicit_owner(chat)
+                        && !self.chat_requires_barrier(chat);
+                    if is_explicit_scheduled {
+                        let owner = Self::chat_config(chat)
+                            .and_then(|config| config.cache_owner_id.as_deref())
+                            .unwrap_or_default();
+                        if blocked_owners.contains(owner)
+                            || self.held.iter().any(|prepared| prepared.owner_id == owner)
+                        {
+                            blocked_owners.insert(owner.to_owned());
+                            lanes_or_held = true;
+                            idx += 1;
+                            continue;
+                        }
+                        if self.scheduler.waiting_len() + self.scheduler.running_len()
+                            >= self.scheduler.max_num_seqs()
+                        {
+                            lanes_or_held = true;
+                            break;
+                        }
+                        // Before its render: a start the pass's prefix budget defers
+                        // stays queued, never tokenized and never refused.
+                        if !self.prefix_unit_allowed() {
+                            break;
+                        }
+                        let Some(Queued { command, arrival }) = self.pending.remove(idx) else {
+                            break;
+                        };
+                        if let Ok(chat) = command.into_chat() {
+                            if let Some(wired) = wired.as_mut() {
+                                wired.mark();
+                            }
+                            let started = self.prefix_clock();
+                            if let Some(prepared) = self.prepare_chat(chat, arrival) {
+                                deferred = self.start_prepared(prepared);
+                            }
+                            self.charge_prefix(started);
+                        }
+                    } else {
+                        // Serial, ownerless/legacy-drain, or exclusive-lane barrier chat:
+                        // must not overtake any earlier skipped per-owner command.
+                        if idx > 0 {
+                            break;
+                        }
+                        let must_wait_for_legacy_owner =
+                            Self::chat_requires_legacy_owner_drain(chat)
+                                && self.scheduler.has_work();
+                        if must_wait_for_legacy_owner || self.waits_behind_held(command) {
+                            lanes_or_held = true;
+                            break;
+                        }
+                        if self.scheduler.waiting_len() + self.scheduler.running_len()
+                            >= self.scheduler.max_num_seqs()
+                        {
+                            lanes_or_held = true;
+                            break;
+                        }
+                        // Before its render: a start the pass's prefix budget defers
+                        // stays queued, never tokenized and never refused.
+                        if !self.prefix_unit_allowed() {
+                            break;
+                        }
+                        let Some(Queued { command, arrival }) = self.pending.pop_front() else {
+                            break;
+                        };
+                        if Self::force_serial() || !self.enabled {
+                            if self.scheduler.has_work() {
+                                mark(command_progress(&command), Waiting::Slot);
+                            }
+                            self.scheduler
+                                .enqueue_exclusive(Queued { command, arrival });
+                            break;
+                        }
+                        if let Ok(chat) = command.into_chat() {
+                            if !self.inner.scheduler_cache_available()
+                                || !(Self::chat_has_explicit_owner(&chat)
+                                    || self.ownerless_speculation_is_scheduled(&chat))
+                                || self.chat_requires_barrier(&chat)
+                            {
+                                if self.scheduler.has_work() {
+                                    mark(chat.progress(), Waiting::Slot);
+                                }
+                                self.scheduler.enqueue_exclusive(Queued {
+                                    command: ModelCommand::from_chat(chat),
+                                    arrival,
+                                });
+                                break;
+                            }
+                            if let Some(wired) = wired.as_mut() {
+                                wired.mark();
+                            }
+                            let started = self.prefix_clock();
+                            if let Some(prepared) = self.prepare_chat(chat, arrival) {
+                                deferred = self.start_prepared(prepared);
+                            }
+                            self.charge_prefix(started);
+                        }
+                    }
+                }
+                None => {
+                    if idx > 0 {
+                        break;
+                    }
+                    if self.waits_behind_held(command) {
+                        lanes_or_held = true;
+                        break;
+                    }
+                    let Some(Queued { command, arrival }) = self.pending.pop_front() else {
+                        break;
+                    };
+                    if Self::force_serial() || !self.enabled {
+                        if self.scheduler.has_work() {
+                            mark(command_progress(&command), Waiting::Slot);
+                        }
+                        self.scheduler
+                            .enqueue_exclusive(Queued { command, arrival });
+                        break;
+                    }
+                    self.scheduler.enqueue_barrier(command);
                     break;
                 }
             }
@@ -7647,6 +8258,30 @@ impl<B: HybridSchedulerBackend> HybridSchedulerState<B> {
     pub(crate) fn preemptions(&self) -> u64 {
         let stats = self.scheduler.stats();
         stats.preemptions_recompute + stats.preemptions_ssd
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_turn_count(&self) -> usize {
+        self.scheduler.waiting_len() + self.scheduler.running_len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_len(&self) -> usize {
+        self.held.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held_coalesce_states(&self) -> Vec<(SeqId, Option<(SeqId, u32)>, u32)> {
+        self.held
+            .iter()
+            .map(|p| {
+                (
+                    p.seq_id,
+                    p.coalesce.map(|c| (c.leader_seq, c.target_break)),
+                    p.overtaken,
+                )
+            })
+            .collect()
     }
 
     /// Admits a turn of `request.tokens` on a scratch scheduler: the
@@ -8783,6 +9418,7 @@ pub(crate) mod tests {
                 thinking,
                 template_thinking_enabled: false,
                 tokens: vec![1, 2, 3, 4],
+                prefix_breakpoints: Vec::new(),
                 images: Vec::new(),
                 audio: Vec::new(),
                 plan,
@@ -10937,6 +11573,7 @@ pub(crate) mod tests {
                 thinking,
                 template_thinking_enabled: false,
                 tokens: prompt,
+                prefix_breakpoints: Vec::new(),
                 images: Vec::new(),
                 audio: Vec::new(),
                 plan: engine::plan::TurnPlan {
@@ -10964,6 +11601,8 @@ pub(crate) mod tests {
             order: None,
             overtaken: 0,
             stored_prefix: std::cell::Cell::new(None),
+            coalesce: None,
+            coalesce_exhausted: false,
         };
         (Box::new(prepared), result)
     }
@@ -14734,5 +15373,2211 @@ mod scheduled_context_tests {
             0.0,
         );
         assert!(one_row.admitted);
+    }
+}
+
+#[cfg(test)]
+mod coalesce_tests {
+    use super::*;
+    use crate::engine::backend::{
+        ChatBackend, DecodeStep, PagedBackend, PagedPrefix, ResetScope, SaveStateArgs, TurnSetup,
+    };
+    use crate::engine::governor::governor::tests::{FakeIo, G, host, model, stats};
+    use crate::engine::plan::ExecutionPlan;
+    use crate::engine::scheduler::{RowStepResult, StepExecutor, StepPlan, StepResult};
+    use crate::models::gemma4::dspark_decode::tests::{tiny_qwen_tokenizer, tiny_turn_config};
+    use crate::tokenizer::ChatMessage;
+    use std::collections::{BTreeSet, HashMap};
+    use std::convert::Infallible;
+
+    struct DummyDecode;
+    impl DecodeStep for DummyDecode {
+        fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+            unreachable!("DummyDecode is unused in coalesce unit tests")
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct MockPrefix {
+        cached: usize,
+        suffix: usize,
+    }
+
+    impl PagedPrefix for MockPrefix {
+        fn effective_cached_prefix_len(&self) -> usize {
+            self.cached
+        }
+        fn suffix_len(&self) -> usize {
+            self.suffix
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum PublishedKind {
+        OrdinaryHead,
+        Checkpoint,
+    }
+
+    #[derive(Clone, Debug)]
+    struct PublishedAnchor {
+        tokens: Vec<u32>,
+        cache_salt: u64,
+        kind: PublishedKind,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct MockInFlightRun {
+        in_flight_end: u32,
+        unpublished_sub_ends: Vec<u32>,
+    }
+
+    struct CoalesceMockBackend {
+        tokenizer: Arc<Qwen3Tokenizer>,
+        max_num_seqs: usize,
+        block_size: u32,
+        prefill_slice: u32,
+        measured: bool,
+        coalesce_min_tokens: Option<u32>,
+        governor: &'static Governor,
+        model_guard: Option<crate::engine::governor::governor::ModelGuard<'static>>,
+        probe_generation: u64,
+        /// Published anchors in the simulated state store.
+        published: Vec<PublishedAnchor>,
+        /// Rolling checkpoint spacing (0 disables rolling checkpoints).
+        rolling_interval: u32,
+        /// Per-seq installed static structural capture boundaries (cleared on preempt/close).
+        seq_structural_breaks: HashMap<SeqId, BTreeSet<u32>>,
+        /// Per-seq dynamically registered coalescing capture boundaries (cleared on preempt/close).
+        seq_shared_breaks: HashMap<SeqId, BTreeSet<u32>>,
+        /// Optional cap on distinct extra capture boundaries per sequence (`structural ∪ shared`).
+        max_extra_breaks: Option<usize>,
+        /// Per-seq committed token count.
+        seq_committed: HashMap<SeqId, u32>,
+        /// Per-seq simulated in-flight run (for testing unpublished sub-slices).
+        seq_in_flight: HashMap<SeqId, MockInFlightRun>,
+        /// Per-seq simulated `prefill_rows_done`.
+        seq_rows_done: HashMap<SeqId, u32>,
+        /// Per-seq opt-out / image-lineage disqualifier for `can_lead_prefix_coalesce`.
+        disqualified_leaders: HashSet<SeqId>,
+        /// When `true`, `register_shared_prefill_break` always returns `false`
+        /// (simulates un-promotable disposable checkpoints).
+        reject_all_registrations: bool,
+        /// When `true`, step execution advances `num_computed_tokens` WITHOUT
+        /// publishing anchors (simulates Governor capture refusal).
+        refuse_publish: bool,
+        /// If set, each prefill slice advances by at most this many tokens
+        /// without publishing until `publish_at_or_above` or slice end.
+        pause_prefill: bool,
+        /// Recorded `(seq_id, start, end)` prefill slices executed.
+        executed_prefills: Vec<(SeqId, u32, u32)>,
+        /// Recorded `(seq_id, cached_prefix)` prepared at admission.
+        prepared_cached: HashMap<SeqId, u32>,
+        /// Recorded `(seq_id, target, breakpoints)` calls to `set_seq_prefix_breakpoints`.
+        recorded_set_breakpoints: Vec<(SeqId, u32, Vec<u32>)>,
+        /// Recorded `(leader_seq, boundary)` accepted calls to `register_shared_prefill_break`.
+        recorded_register_shared_breaks: Vec<(SeqId, u32)>,
+        /// Recorded `(leader_seq, boundary)` calls to `unregister_shared_prefill_break`.
+        recorded_unregister_shared_breaks: Vec<(SeqId, u32)>,
+        cached_history: Vec<u32>,
+    }
+
+    impl CoalesceMockBackend {
+        fn new(
+            max_num_seqs: usize,
+            measured: bool,
+            coalesce_min_tokens: Option<u32>,
+        ) -> (Self, Arc<FakeIo>) {
+            let io = FakeIo::new(
+                stats(0),
+                host(32 * G, crate::engine::governor::host::Pressure::Normal),
+            );
+            let governor: &'static Governor = Box::leak(Box::new(Governor::new(io.clone())));
+            let guard = governor
+                .register_model(model(16 * G, 0))
+                .expect("register mock model");
+            let backend = Self {
+                tokenizer: tiny_qwen_tokenizer(),
+                max_num_seqs,
+                block_size: 32,
+                prefill_slice: 4096,
+                measured,
+                coalesce_min_tokens,
+                governor,
+                model_guard: Some(guard),
+                probe_generation: 1,
+                published: Vec::new(),
+                rolling_interval: 4096,
+                seq_structural_breaks: HashMap::new(),
+                seq_shared_breaks: HashMap::new(),
+                max_extra_breaks: None,
+                seq_committed: HashMap::new(),
+                seq_in_flight: HashMap::new(),
+                seq_rows_done: HashMap::new(),
+                disqualified_leaders: HashSet::new(),
+                reject_all_registrations: false,
+                refuse_publish: false,
+                pause_prefill: false,
+                executed_prefills: Vec::new(),
+                prepared_cached: HashMap::new(),
+                recorded_set_breakpoints: Vec::new(),
+                recorded_register_shared_breaks: Vec::new(),
+                recorded_unregister_shared_breaks: Vec::new(),
+                cached_history: Vec::new(),
+            };
+            (backend, io)
+        }
+
+        fn seq_all_extra_breaks(&self, seq_id: SeqId) -> BTreeSet<u32> {
+            let mut out = self
+                .seq_structural_breaks
+                .get(&seq_id)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(shared) = self.seq_shared_breaks.get(&seq_id) {
+                out.extend(shared.iter().copied());
+            }
+            out
+        }
+
+        fn publish_anchor(&mut self, prefix: Vec<u32>, cache_salt: u64, kind: PublishedKind) {
+            self.published.push(PublishedAnchor {
+                tokens: prefix,
+                cache_salt,
+                kind,
+            });
+            self.probe_generation = self.probe_generation.saturating_add(1);
+        }
+
+        fn deepest_cached(&self, tokens: &[u32], cache_salt: u64) -> u32 {
+            let max_strict = tokens.len().saturating_sub(1);
+            self.published
+                .iter()
+                .filter(|anchor| {
+                    anchor.cache_salt == cache_salt
+                        && anchor.tokens.len() <= max_strict
+                        && tokens[..anchor.tokens.len()] == anchor.tokens[..]
+                })
+                .map(|anchor| anchor.tokens.len() as u32)
+                .max()
+                .unwrap_or(0)
+        }
+    }
+
+    struct CoalesceMockExecutor<'a> {
+        inner: &'a mut CoalesceMockBackend,
+    }
+
+    impl StepExecutor<ScheduledTurn<MockPrefix>> for CoalesceMockExecutor<'_> {
+        type Error = Error;
+
+        fn execute(
+            &mut self,
+            plan: &StepPlan,
+            running: &mut [TurnState<ScheduledTurn<MockPrefix>>],
+        ) -> Result<StepResult> {
+            let mut rows = Vec::with_capacity(plan.rows.len());
+            for row in &plan.rows {
+                let Some(turn) = running.iter_mut().find(|t| t.seq_id == row.seq_id) else {
+                    continue;
+                };
+                if row.cancel_snapshot {
+                    turn.payload.failure =
+                        Some(Error::from_reason(engine::session::CHAT_SESSION_CANCELLED));
+                    rows.push(RowStepResult {
+                        seq_id: row.seq_id,
+                        num_computed_tokens: row.num_tokens,
+                        generated_token: None,
+                        speculative: None,
+                        finished: true,
+                        allocation_blocked: false,
+                        prefill_micros: 10,
+                        prefill_in_flight: false,
+                    });
+                    continue;
+                }
+                match row.kind {
+                    StepKind::Prefill => {
+                        if self.inner.pause_prefill {
+                            rows.push(RowStepResult {
+                                seq_id: row.seq_id,
+                                num_computed_tokens: 0,
+                                generated_token: None,
+                                speculative: None,
+                                finished: false,
+                                allocation_blocked: false,
+                                prefill_micros: 10,
+                                prefill_in_flight: true,
+                            });
+                            continue;
+                        }
+                        let start = row.token_start;
+                        let end = start.saturating_add(row.num_tokens);
+                        let source = turn
+                            .payload
+                            .preemption_replay
+                            .as_ref()
+                            .map_or(turn.payload.prompt_tokens.as_slice(), |r| {
+                                r.tokens.as_slice()
+                            });
+                        self.inner.executed_prefills.push((row.seq_id, start, end));
+                        self.inner.seq_committed.insert(row.seq_id, end);
+                        self.inner.seq_in_flight.remove(&row.seq_id);
+                        self.inner.seq_rows_done.remove(&row.seq_id);
+
+                        if turn.payload.reuse_cache && !self.inner.refuse_publish {
+                            let extra_set = self.inner.seq_all_extra_breaks(row.seq_id);
+                            for &b in &extra_set {
+                                if b > start && b <= end && (b as usize) < source.len() {
+                                    self.inner.publish_anchor(
+                                        source[..b as usize].to_vec(),
+                                        turn.payload.params.cache_salt,
+                                        PublishedKind::OrdinaryHead,
+                                    );
+                                }
+                            }
+                            if self.inner.rolling_interval > 0 {
+                                let step = self
+                                    .inner
+                                    .rolling_interval
+                                    .div_ceil(self.inner.block_size.max(1))
+                                    * self.inner.block_size.max(1);
+                                let mut cp = step;
+                                while (cp as usize) < source.len() && cp <= end {
+                                    if cp > start && !extra_set.contains(&cp) {
+                                        self.inner.publish_anchor(
+                                            source[..cp as usize].to_vec(),
+                                            turn.payload.params.cache_salt,
+                                            PublishedKind::Checkpoint,
+                                        );
+                                    }
+                                    cp = cp.saturating_add(step);
+                                }
+                            }
+                        }
+
+                        if end as usize >= source.len() {
+                            turn.payload.preemption_replay = None;
+                            // Emit EOS immediately so the turn completes after prefill.
+                            let eos = turn.payload.eos_id;
+                            turn.payload.generated_tokens.push(eos);
+                            turn.payload.finish_reason = "stop".to_string();
+                            rows.push(RowStepResult {
+                                seq_id: row.seq_id,
+                                num_computed_tokens: row.num_tokens,
+                                generated_token: Some(eos),
+                                speculative: None,
+                                finished: true,
+                                allocation_blocked: false,
+                                prefill_micros: 10,
+                                prefill_in_flight: false,
+                            });
+                        } else {
+                            rows.push(RowStepResult {
+                                seq_id: row.seq_id,
+                                num_computed_tokens: row.num_tokens,
+                                generated_token: None,
+                                speculative: None,
+                                finished: false,
+                                allocation_blocked: false,
+                                prefill_micros: 10,
+                                prefill_in_flight: false,
+                            });
+                        }
+                    }
+                    StepKind::Decode => {
+                        let eos = turn.payload.eos_id;
+                        turn.payload.generated_tokens.push(eos);
+                        turn.payload.finish_reason = "stop".to_string();
+                        rows.push(RowStepResult {
+                            seq_id: row.seq_id,
+                            num_computed_tokens: 1,
+                            generated_token: Some(eos),
+                            speculative: None,
+                            finished: true,
+                            allocation_blocked: false,
+                            prefill_micros: 0,
+                            prefill_in_flight: false,
+                        });
+                    }
+                }
+            }
+            Ok(StepResult {
+                rows,
+                executed_decode_batch: 0,
+                executed_greedy_epilogue_batch: 0,
+                rows_alloc_evicted: 0,
+                prefill_wall_micros: 10,
+                decode_wall_micros: 0,
+            })
+        }
+    }
+
+    impl ChatBackend for CoalesceMockBackend {
+        type Decode<'a> = DummyDecode;
+
+        fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+            Ok(Arc::clone(&self.tokenizer))
+        }
+        fn family_name(&self) -> &'static str {
+            "coalesce_mock"
+        }
+        fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+            Ok(999)
+        }
+        fn render_prompt(
+            &self,
+            _tok: &Qwen3Tokenizer,
+            messages: &[ChatMessage],
+            _config: &ChatConfig,
+            _preserve_thinking: bool,
+        ) -> Result<Vec<u32>> {
+            let seed = messages
+                .iter()
+                .flat_map(|m| m.content.as_bytes())
+                .fold(1u32, |acc, &b| {
+                    acc.wrapping_mul(31).wrapping_add(u32::from(b))
+                });
+            Ok((0u32..64u32)
+                .map(|i| 50_000 + ((seed.wrapping_add(i)) % 10_000))
+                .collect())
+        }
+        fn cached_token_history(&self) -> &[u32] {
+            &self.cached_history
+        }
+        fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+            self.cached_history.clear();
+            Ok(())
+        }
+        fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+            0
+        }
+        fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+        fn eval_caches(&self) -> Result<()> {
+            Ok(())
+        }
+        fn prefill(&mut self, _prompt_tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+            unreachable!("sync prefill unused in coalesce tests")
+        }
+        fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+            Ok(DummyDecode)
+        }
+        fn execution_plan(&self) -> ExecutionPlan {
+            ExecutionPlan {
+                paged_attention: Some(crate::engine::plan::PagedAttentionPlan {
+                    supports_delta: false,
+                }),
+                ..ExecutionPlan::TEXT_ONLY
+            }
+        }
+    }
+
+    impl PagedBackend for CoalesceMockBackend {
+        type PagedDecode<'a> = DummyDecode;
+        type PrefixState = MockPrefix;
+
+        fn prime_prefix_state(
+            &mut self,
+            plan: &[u32],
+            reuse_cache: bool,
+            _block_size: usize,
+            _extra_keys: &[u64],
+            cache_salt: u64,
+        ) -> Result<Self::PrefixState> {
+            let cached = if reuse_cache {
+                self.deepest_cached(plan, cache_salt) as usize
+            } else {
+                0
+            };
+            Ok(MockPrefix {
+                cached,
+                suffix: plan.len().saturating_sub(cached),
+            })
+        }
+        fn paged_prefill(
+            &mut self,
+            _suffix_tokens: &[u32],
+            _prefix: &Self::PrefixState,
+            _stream: Stream,
+        ) -> Result<MxArray> {
+            unreachable!("whole-turn paged_prefill unused in coalesce tests")
+        }
+        fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+            Ok(DummyDecode)
+        }
+        fn finalize_paged_turn(&mut self, _reuse_cache: bool, _cache_salt: u64) {}
+        fn abort_paged_turn(&mut self) {}
+        fn save_paged_history(
+            &mut self,
+            _save_tokens: &[u32],
+            _generated: &[u32],
+            _keep_all: bool,
+            _reuse_cache: bool,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl HybridSchedulerBackend for CoalesceMockBackend {
+        type FamilyCommand = Infallible;
+        type RestoreTicket = ();
+        type OwnerState = Vec<u32>;
+        type StepExecutor<'a> = CoalesceMockExecutor<'a>;
+
+        const SCHEDULER_NAME: &'static str = "CoalesceMock";
+
+        fn run_paged_decode_step_batched(&mut self, _rows: &[(SeqId, u32)]) -> Result<MxArray> {
+            unreachable!("batched decode unused in coalesce tests")
+        }
+
+        fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+            None
+        }
+        fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+            None
+        }
+        fn scheduler_cache_available(&self) -> bool {
+            true
+        }
+        fn scheduler_capacity(&self) -> usize {
+            self.max_num_seqs
+        }
+        fn scheduler_block_size(&self) -> Result<u32> {
+            Ok(self.block_size)
+        }
+        fn scheduler_prefill_slice_tokens(&self) -> u32 {
+            self.prefill_slice
+        }
+        fn measured_prefill_cut(&self) -> Option<MeasuredConfig> {
+            self.measured.then_some(MeasuredConfig {
+                native_window: 32_768,
+                decode_share: 0.2,
+            })
+        }
+        fn memory_governor(&self) -> Option<&'static Governor> {
+            Some(self.governor)
+        }
+        fn memory_model(&self) -> u64 {
+            self.model_guard
+                .as_ref()
+                .map_or(0, crate::engine::governor::governor::ModelGuard::model_id)
+        }
+        fn max_position_embeddings(&self) -> i32 {
+            65_536
+        }
+        fn activate_paged_seq(&mut self, _seq_id: SeqId) -> Result<()> {
+            Ok(())
+        }
+        fn scheduled_turn_closed(&mut self, seq_id: SeqId) {
+            self.seq_structural_breaks.remove(&seq_id);
+            self.seq_shared_breaks.remove(&seq_id);
+            self.seq_in_flight.remove(&seq_id);
+            self.seq_rows_done.remove(&seq_id);
+        }
+        fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
+            self.seq_structural_breaks.remove(&seq_id);
+            self.seq_shared_breaks.remove(&seq_id);
+            self.seq_committed.remove(&seq_id);
+            self.seq_in_flight.remove(&seq_id);
+            self.seq_rows_done.remove(&seq_id);
+            Ok(())
+        }
+        fn preempt_scheduled_cache_with_prompt(
+            &mut self,
+            seq_id: SeqId,
+            _prompt_tokens: u32,
+            _cache_salt: u64,
+            _mode: PreemptionMode,
+        ) -> Result<()> {
+            // Mirrors Inkling2 `rt.release_sequence`: clears live KV & extra capture boundaries.
+            self.seq_structural_breaks.remove(&seq_id);
+            self.seq_shared_breaks.remove(&seq_id);
+            self.seq_committed.remove(&seq_id);
+            self.seq_in_flight.remove(&seq_id);
+            self.seq_rows_done.remove(&seq_id);
+            Ok(())
+        }
+        fn release_owner_resources(
+            &mut self,
+            seq_id: Option<SeqId>,
+            _state: Option<&Self::OwnerState>,
+        ) -> Result<()> {
+            if let Some(seq_id) = seq_id {
+                self.release_scheduled_cache(seq_id)?;
+            }
+            Ok(())
+        }
+        fn prefill_rows_done(&self, seq_id: SeqId) -> Option<u32> {
+            self.seq_rows_done.get(&seq_id).copied()
+        }
+        fn prepare_scheduled_prefix(
+            &mut self,
+            seq_id: SeqId,
+            tokens: &[u32],
+            _owner_history: &[u32],
+            reuse_cache: bool,
+            cache_salt: u64,
+            _block_size: u32,
+        ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+            let cached = if reuse_cache {
+                self.deepest_cached(tokens, cache_salt)
+            } else {
+                0
+            };
+            self.seq_committed.insert(seq_id, cached);
+            self.prepared_cached.insert(seq_id, cached);
+            Ok(ScheduledPrefixAdmission::Ready(MockPrefix {
+                cached: cached as usize,
+                suffix: tokens.len().saturating_sub(cached as usize),
+            }))
+        }
+        fn scheduled_prefix_probe(&self, tokens: &[u32], cache_salt: u64) -> u32 {
+            self.deepest_cached(tokens, cache_salt)
+        }
+        fn scheduled_prefix_probe_generation(&self) -> u64 {
+            self.probe_generation
+        }
+        fn set_seq_prefix_breakpoints(
+            &mut self,
+            seq_id: SeqId,
+            prompt_tokens: u32,
+            breakpoints: &[u32],
+        ) {
+            self.recorded_set_breakpoints
+                .push((seq_id, prompt_tokens, breakpoints.to_vec()));
+            let bs = self.block_size.max(1);
+            let junction = (prompt_tokens.saturating_sub(1) / bs) * bs;
+            let mut normalized = BTreeSet::new();
+            for &raw in breakpoints {
+                let aligned = (raw / bs) * bs;
+                if aligned > 0 && aligned <= junction {
+                    normalized.insert(aligned);
+                }
+            }
+            self.seq_shared_breaks.remove(&seq_id);
+            if normalized.is_empty() {
+                self.seq_structural_breaks.remove(&seq_id);
+            } else {
+                self.seq_structural_breaks.insert(seq_id, normalized);
+            }
+        }
+        fn extra_prefill_breaks_for(
+            &self,
+            seq_id: SeqId,
+            prompt_tokens: u32,
+            cached_prefix: u32,
+        ) -> Vec<u32> {
+            let bs = self.block_size.max(1);
+            let mut out = Vec::new();
+            if self.rolling_interval > 0 {
+                let step = self.rolling_interval.div_ceil(bs) * bs;
+                let mut cp = step;
+                while cp < prompt_tokens {
+                    if cp > cached_prefix {
+                        out.push(cp);
+                    }
+                    cp = cp.saturating_add(step);
+                }
+            }
+            for b in self.seq_all_extra_breaks(seq_id) {
+                if b > cached_prefix && b < prompt_tokens {
+                    out.push(b);
+                }
+            }
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+        fn prefix_coalesce_min_tokens(&self) -> Option<u32> {
+            self.coalesce_min_tokens
+        }
+        fn can_lead_prefix_coalesce(&self, seq_id: SeqId) -> bool {
+            !self.disqualified_leaders.contains(&seq_id)
+        }
+        fn register_shared_prefill_break(&mut self, leader_seq: SeqId, boundary: u32) -> bool {
+            if self.reject_all_registrations || !self.can_lead_prefix_coalesce(leader_seq) {
+                return false;
+            }
+            let bs = self.block_size.max(1);
+            if boundary == 0 || !boundary.is_multiple_of(bs) {
+                return false;
+            }
+            let committed = self.seq_committed.get(&leader_seq).copied().unwrap_or(0);
+            let (in_flight_end, matches_unpublished_sub) = match self.seq_in_flight.get(&leader_seq)
+            {
+                Some(run) => (
+                    run.in_flight_end,
+                    run.unpublished_sub_ends.contains(&boundary),
+                ),
+                None => (0, false),
+            };
+            let is_future = boundary > committed.max(in_flight_end);
+            if !is_future && !matches_unpublished_sub {
+                return false;
+            }
+            let current = self.seq_all_extra_breaks(leader_seq);
+            if current.contains(&boundary) {
+                self.recorded_register_shared_breaks
+                    .push((leader_seq, boundary));
+                return true;
+            }
+            if let Some(cap) = self.max_extra_breaks
+                && current.len() >= cap
+            {
+                return false;
+            }
+            self.seq_shared_breaks
+                .entry(leader_seq)
+                .or_default()
+                .insert(boundary);
+            self.recorded_register_shared_breaks
+                .push((leader_seq, boundary));
+            true
+        }
+        fn unregister_shared_prefill_break(&mut self, leader_seq: SeqId, boundary: u32) {
+            self.recorded_unregister_shared_breaks
+                .push((leader_seq, boundary));
+            let remove_empty = if let Some(shared) = self.seq_shared_breaks.get_mut(&leader_seq) {
+                shared.remove(&boundary);
+                shared.is_empty()
+            } else {
+                false
+            };
+            if remove_empty {
+                self.seq_shared_breaks.remove(&leader_seq);
+            }
+        }
+        fn build_scheduled_prefix(
+            &self,
+            _base: &Self::PrefixState,
+            effective_cached_prefix_len: usize,
+            suffix_len: usize,
+            _full_tokens: Vec<u32>,
+            _first_chunk: bool,
+        ) -> Self::PrefixState {
+            MockPrefix {
+                cached: effective_cached_prefix_len,
+                suffix: suffix_len,
+            }
+        }
+        fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+            self.cached_history = history;
+        }
+        fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+            state
+        }
+        fn install_owner_state(&mut self, _seq_id: SeqId, state: &Self::OwnerState) {
+            self.cached_history = state.clone();
+        }
+        fn capture_owner_state(&mut self, _seq_id: SeqId) -> Self::OwnerState {
+            self.cached_history.clone()
+        }
+        fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+            CoalesceMockExecutor { inner: self }
+        }
+    }
+
+    /// Wrapper inheriting the default opt-out `HybridSchedulerBackend` coalescing methods.
+    struct DefaultOptOutBackend(CoalesceMockBackend);
+
+    impl ChatBackend for DefaultOptOutBackend {
+        type Decode<'a> = DummyDecode;
+
+        fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+            self.0.tokenizer()
+        }
+        fn family_name(&self) -> &'static str {
+            "default_opt_out"
+        }
+        fn session_eos_id(&self, tok: &Qwen3Tokenizer) -> Result<u32> {
+            self.0.session_eos_id(tok)
+        }
+        fn cached_token_history(&self) -> &[u32] {
+            self.0.cached_token_history()
+        }
+        fn reset_caches(&mut self, scope: ResetScope) -> Result<()> {
+            self.0.reset_caches(scope)
+        }
+        fn verify_cache_prefix(&self, tokens: &[u32], reuse_cache: bool) -> usize {
+            self.0.verify_cache_prefix(tokens, reuse_cache)
+        }
+        fn save_cache_state(&mut self, args: SaveStateArgs<'_>) {
+            self.0.save_cache_state(args)
+        }
+        fn eval_caches(&self) -> Result<()> {
+            self.0.eval_caches()
+        }
+        fn prefill(&mut self, prompt_tokens: &[u32], stream: Stream) -> Result<MxArray> {
+            self.0.prefill(prompt_tokens, stream)
+        }
+        fn begin_decode(&mut self, turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+            self.0.begin_decode(turn)
+        }
+        fn execution_plan(&self) -> ExecutionPlan {
+            self.0.execution_plan()
+        }
+    }
+
+    impl PagedBackend for DefaultOptOutBackend {
+        type PagedDecode<'a> = DummyDecode;
+        type PrefixState = MockPrefix;
+
+        fn prime_prefix_state(
+            &mut self,
+            plan: &[u32],
+            reuse_cache: bool,
+            block_size: usize,
+            extra_keys: &[u64],
+            cache_salt: u64,
+        ) -> Result<Self::PrefixState> {
+            self.0
+                .prime_prefix_state(plan, reuse_cache, block_size, extra_keys, cache_salt)
+        }
+        fn paged_prefill(
+            &mut self,
+            suffix_tokens: &[u32],
+            prefix: &Self::PrefixState,
+            stream: Stream,
+        ) -> Result<MxArray> {
+            self.0.paged_prefill(suffix_tokens, prefix, stream)
+        }
+        fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+            self.0.begin_paged_decode()
+        }
+        fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
+            self.0.finalize_paged_turn(reuse_cache, cache_salt)
+        }
+        fn abort_paged_turn(&mut self) {
+            self.0.abort_paged_turn()
+        }
+        fn save_paged_history(
+            &mut self,
+            save_tokens: &[u32],
+            generated: &[u32],
+            keep_all: bool,
+            reuse_cache: bool,
+        ) -> Result<()> {
+            self.0
+                .save_paged_history(save_tokens, generated, keep_all, reuse_cache)
+        }
+    }
+
+    impl HybridSchedulerBackend for DefaultOptOutBackend {
+        type FamilyCommand = Infallible;
+        type RestoreTicket = ();
+        type OwnerState = Vec<u32>;
+        type StepExecutor<'a> = CoalesceMockExecutor<'a>;
+
+        const SCHEDULER_NAME: &'static str = "DefaultOptOut";
+
+        fn run_paged_decode_step_batched(&mut self, rows: &[(SeqId, u32)]) -> Result<MxArray> {
+            self.0.run_paged_decode_step_batched(rows)
+        }
+
+        fn paged_adapter(&self) -> Option<&PagedKVCacheAdapter> {
+            None
+        }
+        fn paged_adapter_mut(&mut self) -> Option<&mut PagedKVCacheAdapter> {
+            None
+        }
+        fn scheduler_cache_available(&self) -> bool {
+            true
+        }
+        fn scheduler_capacity(&self) -> usize {
+            self.0.max_num_seqs
+        }
+        fn scheduler_block_size(&self) -> Result<u32> {
+            Ok(self.0.block_size)
+        }
+        fn scheduler_prefill_slice_tokens(&self) -> u32 {
+            self.0.prefill_slice
+        }
+        fn measured_prefill_cut(&self) -> Option<MeasuredConfig> {
+            self.0.measured_prefill_cut()
+        }
+        fn memory_governor(&self) -> Option<&'static Governor> {
+            self.0.memory_governor()
+        }
+        fn memory_model(&self) -> u64 {
+            self.0.memory_model()
+        }
+        fn max_position_embeddings(&self) -> i32 {
+            self.0.max_position_embeddings()
+        }
+        fn activate_paged_seq(&mut self, seq_id: SeqId) -> Result<()> {
+            self.0.activate_paged_seq(seq_id)
+        }
+        fn release_scheduled_cache(&mut self, seq_id: SeqId) -> Result<()> {
+            self.0.release_scheduled_cache(seq_id)
+        }
+        fn release_owner_resources(
+            &mut self,
+            seq_id: Option<SeqId>,
+            state: Option<&Self::OwnerState>,
+        ) -> Result<()> {
+            self.0.release_owner_resources(seq_id, state)
+        }
+        fn prepare_scheduled_prefix(
+            &mut self,
+            seq_id: SeqId,
+            tokens: &[u32],
+            owner_history: &[u32],
+            reuse_cache: bool,
+            cache_salt: u64,
+            block_size: u32,
+        ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+            self.0.prepare_scheduled_prefix(
+                seq_id,
+                tokens,
+                owner_history,
+                reuse_cache,
+                cache_salt,
+                block_size,
+            )
+        }
+        fn scheduled_prefix_probe(&self, tokens: &[u32], cache_salt: u64) -> u32 {
+            self.0.scheduled_prefix_probe(tokens, cache_salt)
+        }
+        fn scheduled_prefix_probe_generation(&self) -> u64 {
+            self.0.scheduled_prefix_probe_generation()
+        }
+        fn build_scheduled_prefix(
+            &self,
+            base: &Self::PrefixState,
+            effective_cached_prefix_len: usize,
+            suffix_len: usize,
+            full_tokens: Vec<u32>,
+            first_chunk: bool,
+        ) -> Self::PrefixState {
+            self.0.build_scheduled_prefix(
+                base,
+                effective_cached_prefix_len,
+                suffix_len,
+                full_tokens,
+                first_chunk,
+            )
+        }
+        fn replace_cached_token_history(&mut self, history: Vec<u32>) {
+            self.0.replace_cached_token_history(history)
+        }
+        fn owner_tokens(state: &Self::OwnerState) -> &[u32] {
+            state
+        }
+        fn install_owner_state(&mut self, seq_id: SeqId, state: &Self::OwnerState) {
+            self.0.install_owner_state(seq_id, state)
+        }
+        fn capture_owner_state(&mut self, seq_id: SeqId) -> Self::OwnerState {
+            self.0.capture_owner_state(seq_id)
+        }
+        fn step_executor(&mut self) -> Self::StepExecutor<'_> {
+            self.0.step_executor()
+        }
+    }
+
+    fn shared_prompt(shared_len: usize, total_len: usize, suffix_tag: u32) -> Vec<u32> {
+        let mut tokens: Vec<u32> = (0..shared_len).map(|i| 10 + (i as u32 % 4000)).collect();
+        for i in shared_len..total_len {
+            tokens.push(5000 + suffix_tag * 1000 + (i - shared_len) as u32);
+        }
+        tokens
+    }
+
+    fn make_prepared<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        owner_id: &str,
+        prompt: Vec<u32>,
+    ) -> (
+        Box<PreparedTurn>,
+        Arc<AtomicBool>,
+        tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    ) {
+        make_prepared_with_breakpoints(state, owner_id, prompt, Vec::new())
+    }
+
+    fn make_prepared_with_breakpoints<B: HybridSchedulerBackend>(
+        state: &mut HybridSchedulerState<B>,
+        owner_id: &str,
+        prompt: Vec<u32>,
+        prefix_breakpoints: Vec<u32>,
+    ) -> (
+        Box<PreparedTurn>,
+        Arc<AtomicBool>,
+        tokio::sync::oneshot::Receiver<Result<ChatResult>>,
+    ) {
+        let seq_id = state.next_seq_id;
+        state.next_seq_id = state.next_seq_id.saturating_add(1);
+        state.owner_sequences.insert(owner_id.to_string(), seq_id);
+        let config = ChatConfig {
+            cache_owner_id: Some(owner_id.to_string()),
+            reuse_cache: Some(true),
+            max_new_tokens: Some(4),
+            ..tiny_turn_config(None, 4)
+        };
+        let params = state.inner.resolve_params(&config);
+        let thinking = state.inner.thinking_setup(&config);
+        let admitted = engine::session::AdmittedPagedTurn {
+            tokenizer: tiny_qwen_tokenizer(),
+            eos_id: 999,
+            close: engine::backend::ThinkEndResolution {
+                think_end_id: None,
+                think_end_str: None,
+                thinking_end: Arc::from(Vec::new()),
+                think_end_extra_ids: Vec::new(),
+                think_open_id: None,
+            },
+            config,
+            params,
+            thinking,
+            template_thinking_enabled: false,
+            tokens: prompt,
+            prefix_breakpoints,
+            images: Vec::new(),
+            audio: Vec::new(),
+            plan: engine::plan::TurnPlan {
+                is_delta: false,
+                input_media: engine::plan::MediaCapabilities::NONE,
+                context_media: engine::plan::MediaCapabilities::NONE,
+                use_paged_attention: true,
+                decoder: engine::plan::DecoderPlan::Autoregressive,
+            },
+        };
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let prepared = state
+            .prepare_admitted(
+                admitted,
+                TurnRoute {
+                    response: ScheduledReply::Sync(reply),
+                    cancelled: Arc::clone(&cancel),
+                    owner_id: owner_id.to_string(),
+                    seq_id,
+                    newly_assigned: true,
+                    arrival: Arrival {
+                        at: Instant::now(),
+                        mark: state.timeline,
+                    },
+                    extra_breaks: Vec::new(),
+                },
+            )
+            .expect("prepare_admitted");
+        (prepared, cancel, rx)
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_deduplicates_four_parallel_sjf_subagents() {
+        let (backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+        let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // 4 parallel cold turns arriving in descending length order (SJF worst case),
+        // all sharing 13,656 tokens (block_size=32 -> aligned shared_break = 13,632).
+        let lengths = [14_500usize, 14_400, 14_300, 14_200];
+        let mut replies = Vec::new();
+        let mut seq_ids = Vec::new();
+        for (idx, &len) in lengths.iter().enumerate() {
+            let (prepared, _cancel, reply) = make_prepared(
+                &mut state,
+                &format!("subagent-{idx}"),
+                shared_prompt(13_656, len, idx as u32 + 1),
+            );
+            seq_ids.push(prepared.seq_id);
+            let deferred = state.start_prepared(prepared);
+            assert!(!deferred, "coalescing hold must never set deferred=true");
+            replies.push(reply);
+        }
+
+        // Only subagent-0 admitted as leader; subagents 1, 2, 3 are held in `self.held`.
+        assert_eq!(
+            state.scheduler.waiting_len() + state.scheduler.running_len(),
+            1
+        );
+        assert_eq!(state.held.len(), 3);
+        let leader_seq = seq_ids[0];
+        for held in &state.held {
+            let c = held.coalesce.expect("follower must be coalescing");
+            assert_eq!(c.leader_seq, leader_seq);
+            assert_eq!(c.target_break, 13_632);
+            assert_eq!(held.overtaken, 0);
+        }
+        {
+            let leader = state
+                .scheduler
+                .turns()
+                .find(|t| t.seq_id == leader_seq)
+                .expect("leader waiting");
+            assert!(
+                !leader.payload.prefix_breakpoints.contains(&13_632),
+                "dynamic shared_break 13632 must stay separate from static leader.payload.prefix_breakpoints"
+            );
+            assert_eq!(
+                state
+                    .shared_coalesce_breaks
+                    .get(&leader_seq)
+                    .and_then(|m| m.get(&13_632)),
+                Some(&3),
+                "shared_break 13632 must track exact refcount=3 in state.shared_coalesce_breaks"
+            );
+        }
+
+        // Drive until all 4 subagents finish.
+        for _ in 0..32 {
+            if !state.has_turns() {
+                break;
+            }
+            assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+            for held in &state.held {
+                if held.coalesce.is_some() {
+                    assert_eq!(
+                        held.overtaken, 0,
+                        "count_held_overtakes must skip coalescing followers"
+                    );
+                }
+            }
+        }
+        assert!(!state.has_turns(), "all 4 turns must finish cleanly");
+
+        // Leader prefills from 0; all 3 followers wake with cached == 13,632!
+        assert_eq!(state.inner.prepared_cached.get(&seq_ids[0]), Some(&0));
+        for &follower_seq in &seq_ids[1..] {
+            assert_eq!(
+                state.inner.prepared_cached.get(&follower_seq),
+                Some(&13_632),
+                "follower seq {follower_seq} must restore cached == 13632"
+            );
+        }
+        // Zero duplicate cold prefill slices starting at offset 0 for followers!
+        let cold_starts: Vec<SeqId> = state
+            .inner
+            .executed_prefills
+            .iter()
+            .filter(|&&(_, start, _)| start == 0)
+            .map(|&(seq, _, _)| seq)
+            .collect();
+        assert_eq!(cold_starts, vec![leader_seq]);
+
+        for mut r in replies {
+            let res = r.try_recv().expect("reply delivered").expect("turn ok");
+            assert_eq!(res.finish_reason, "stop");
+        }
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_has_zero_hol_blocking_for_unrelated_owner() {
+        let (mut backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+        backend.pause_prefill = false;
+        let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Admit Leader #1 and coalesce Followers #2 & #3 in `self.held`.
+        let (p1, _c1, mut r1) =
+            make_prepared(&mut state, "agent-1", shared_prompt(13_656, 14_500, 1));
+        let (p2, _c2, mut r2) =
+            make_prepared(&mut state, "agent-2", shared_prompt(13_656, 14_400, 2));
+        let (p3, _c3, mut r3) =
+            make_prepared(&mut state, "agent-3", shared_prompt(13_656, 14_300, 3));
+        assert!(!state.start_prepared(p1));
+        assert!(!state.start_prepared(p2));
+        assert!(!state.start_prepared(p3));
+        assert_eq!(state.held.len(), 2);
+        assert_eq!(
+            state.scheduler.waiting_len() + state.scheduler.running_len(),
+            1
+        );
+
+        // Unrelated explicit owner arrives while Followers #2 & #3 are held.
+        let (unrelated_reply, mut unrelated_rx) = tokio::sync::oneshot::channel();
+        let unrelated_cmd = ModelCommand::from_chat(ChatCmd::SessionStart {
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: "unrelated short".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+                is_error: None,
+                reasoning_content: None,
+                thinking_enabled: None,
+                images: None,
+                audio: None,
+            }],
+            config: ChatConfig {
+                cache_owner_id: Some("unrelated-owner".to_string()),
+                reuse_cache: Some(true),
+                max_new_tokens: Some(4),
+                ..tiny_turn_config(None, 4)
+            },
+            reply: unrelated_reply,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        });
+        assert!(
+            !state.waits_behind_held(&Queued::from(unrelated_cmd)),
+            "unrelated owner must NOT wait behind coalesced followers in self.held"
+        );
+
+        // Admit unrelated short turn (`len = 128`, disjoint tokens) directly while Leader #1
+        // has not yet reached 13,632 (takes 4 chunks of 4096).
+        let (p_unrel, _cu, mut r_unrel) =
+            make_prepared(&mut state, "unrelated-owner", vec![90_000; 128]);
+        assert!(!state.start_prepared(p_unrel));
+
+        // Drive ONE pass: unrelated turn (128 tok, SJF shortest) finishes immediately while
+        // Followers #2 & #3 remain coalesced in `self.held`!
+        assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+        let unrel_res = r_unrel
+            .try_recv()
+            .expect("unrelated owner must finish immediately without HoL blocking")
+            .expect("unrelated ok");
+        assert_eq!(unrel_res.finish_reason, "stop");
+        assert_eq!(
+            state.held.len(),
+            2,
+            "coalesced followers must still be waiting while leader is < 13632"
+        );
+        let _ = (&tx, &mut unrelated_rx, &mut r1, &mut r2, &mut r3);
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_relinks_on_leader_cancel_and_resets_stall_progress() {
+        let (backend, io) = CoalesceMockBackend::new(4, true, Some(2048));
+        io.with(|fake| fake.now = 10.0);
+        let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+
+        // Leader #1 admits (24,000 tok so even after 8,192 computed, its remaining 15,808 >
+        // Follower #1's 14,400, allowing Follower #1 to admit immediately even while cancelled
+        // Leader #1 is still present in `scheduler.turns()` to exercise `is_cancelled` directly).
+        let (p1, c1, _r1) = make_prepared(&mut state, "leader-1", shared_prompt(13_656, 24_000, 1));
+        let leader1_seq = p1.seq_id;
+        assert!(!state.start_prepared(p1));
+        {
+            let t1 = state
+                .scheduler
+                .turns_mut()
+                .find(|t| t.seq_id == leader1_seq)
+                .unwrap();
+            t1.num_computed_tokens = 8192;
+        }
+        state.inner.seq_committed.insert(leader1_seq, 8192);
+
+        // Followers #1 and #2 pin to Leader #1 at t=10.0 (`last_leader_progress == (8192, 0)`).
+        let (p2, _c2, _r2) =
+            make_prepared(&mut state, "follower-1", shared_prompt(13_656, 14_400, 2));
+        let follower1_seq = p2.seq_id;
+        let (p3, _c3, _r3) =
+            make_prepared(&mut state, "follower-2", shared_prompt(13_656, 14_300, 3));
+        let follower2_seq = p3.seq_id;
+        assert!(!state.start_prepared(p2));
+        assert!(!state.start_prepared(p3));
+        assert_eq!(state.held.len(), 2);
+        assert_eq!(
+            state.held[1].coalesce.unwrap().last_leader_progress,
+            (8192, 0)
+        );
+
+        // Advance clock to t=15.0 (+5s) and cancel Leader #1.
+        io.with(|fake| fake.now = 15.0);
+        c1.store(true, Ordering::Relaxed);
+
+        // Retry held: Follower #1 promotes to new leader at (0, 0), Follower #2 relinks to it!
+        assert!(!state.retry_held(None));
+        assert!(
+            state
+                .scheduler
+                .turns()
+                .any(|t| t.seq_id == follower1_seq && t.num_computed_tokens == 0),
+            "Follower #1 must promote to new leader at (0, 0)"
+        );
+        assert_eq!(state.held.len(), 1);
+        assert_eq!(state.held[0].seq_id, follower2_seq);
+        let relinked = state.held[0].coalesce.expect("Follower #2 must relink");
+        assert_eq!(relinked.leader_seq, follower1_seq);
+        assert_eq!(relinked.relinks, 1);
+        assert_eq!(
+            relinked.started_at, 10.0,
+            "relink must preserve original started_at"
+        );
+        assert_eq!(
+            relinked.last_progress_at, 15.0,
+            "relink must reset last_progress_at to now"
+        );
+        assert_eq!(
+            relinked.last_leader_progress,
+            (0, 0),
+            "relink must reset last_leader_progress to new leader's (0, 0)"
+        );
+
+        // Advance clock +7s to t=22.0 and advance new leader to (4096, 0) (< old leader's 8192!).
+        // Because `last_leader_progress` was reset to (0, 0), this MUST register as progress
+        // and NOT trip stall!
+        io.with(|fake| fake.now = 22.0);
+        state
+            .scheduler
+            .turns_mut()
+            .find(|t| t.seq_id == follower1_seq)
+            .unwrap()
+            .num_computed_tokens = 4096;
+        assert!(!state.retry_held(None));
+        assert_eq!(state.held.len(), 1);
+        let after_prog = state.held[0].coalesce.expect("still pinned after progress");
+        assert_eq!(after_prog.last_leader_progress, (4096, 0));
+        assert_eq!(after_prog.last_progress_at, 22.0);
+
+        // Keep advancing `prefill_rows_done` every 5s (preventing 10s stall) up to t=69.0 (< 60s
+        // from original started_at=10.0), then hit t=70.0 (== 60s from original started_at=10.0,
+        // even though only 55s passed since relink at t=15.0).
+        let mut rows = 100u32;
+        for t in [27.0, 32.0, 37.0, 42.0, 47.0, 52.0, 57.0, 62.0, 67.0] {
+            io.with(|fake| fake.now = t);
+            rows += 100;
+            state.inner.seq_rows_done.insert(follower1_seq, rows);
+            assert!(!state.retry_held(None));
+            assert_eq!(state.held.len(), 1, "still pinned at t={t}");
+        }
+        io.with(|fake| fake.now = 70.0);
+        rows += 100;
+        state.inner.seq_rows_done.insert(follower1_seq, rows);
+        let mut follower2 = state.held.pop_front().unwrap();
+        follower2.stored_prefix.set(Some(ProbedPrefix {
+            generation: state.inner.probe_generation,
+            tokens: 0,
+        }));
+        assert!(
+            !state.coalesce_waits(&mut follower2),
+            "60s hard cap from original started_at must release Follower #2 at t=70.0"
+        );
+        assert!(follower2.coalesce.is_none());
+        assert!(follower2.coalesce_exhausted);
+        assert!(
+            follower2.stored_prefix.get().is_none(),
+            "release must invalidate stored_prefix"
+        );
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_survives_leader_preemption_via_prefix_breakpoints() {
+        let (backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+        let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+        let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Admit Leader #1 and coalesce Follower #2 at target_break = 13,632.
+        let (p1, _c1, mut r1) =
+            make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+        let leader_seq = p1.seq_id;
+        let (p2, _c2, mut r2) =
+            make_prepared(&mut state, "follower", shared_prompt(13_656, 14_400, 2));
+        let follower_seq = p2.seq_id;
+        assert!(!state.start_prepared(p1));
+        assert!(!state.start_prepared(p2));
+        assert_eq!(state.held.len(), 1);
+        assert_eq!(state.held[0].coalesce.unwrap().target_break, 13_632);
+
+        // Drive 1 step: Leader #1 prefills one Measured unit (PREFILL_CHUNK_ROWS = 2048 < 13,632).
+        assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+        assert_eq!(state.held.len(), 1);
+        let computed_before_preempt = state
+            .scheduler
+            .turns()
+            .find(|t| t.seq_id == leader_seq)
+            .unwrap()
+            .num_computed_tokens;
+        assert!(
+            computed_before_preempt > 0 && computed_before_preempt < 13_632,
+            "leader must make partial prefill progress below 13632 before preemption, got {computed_before_preempt}"
+        );
+
+        // Preempt Leader #1 before `target_break`: clears `seq_extra_breaks[leader_seq]`.
+        let preempted = state
+            .scheduler
+            .preempt_running(leader_seq)
+            .expect("preempt running leader");
+        state.handle_preempted(PreemptedTurn {
+            turn: preempted,
+            blocked: true,
+        });
+        assert!(state.scheduler.has_preempted());
+        assert!(
+            state.inner.seq_all_extra_breaks(leader_seq).is_empty(),
+            "preemption must have cleared live extra capture boundaries"
+        );
+
+        // Resume Leader #1 via `try_resume_preempted`: restores static breakpoints with
+        // `target == replay_tokens.len()` AND re-registers active dynamic `shared_coalesce_breaks`.
+        state.inner.recorded_set_breakpoints.clear();
+        state.inner.recorded_register_shared_breaks.clear();
+        state.try_resume_preempted();
+        assert!(!state.scheduler.has_preempted());
+        assert!(
+            state
+                .inner
+                .recorded_set_breakpoints
+                .iter()
+                .any(|(seq, target, bps)| {
+                    *seq == leader_seq && *target == 14_500 && bps.is_empty()
+                }),
+            "try_resume_preempted must restore static prefix_breakpoints using target == replay_tokens.len()"
+        );
+        assert!(
+            state
+                .inner
+                .recorded_register_shared_breaks
+                .contains(&(leader_seq, 13_632)),
+            "try_resume_preempted must re-register active shared_coalesce_breaks via register_shared_prefill_break"
+        );
+        assert!(
+            state
+                .inner
+                .seq_shared_breaks
+                .get(&leader_seq)
+                .is_some_and(|s| s.contains(&13_632)),
+            "13632 must be restored into leader's seq_shared_breaks"
+        );
+
+        // Drive to completion: Follower #2 MUST stay coalesced through Leader #1's resumed
+        // prefill replay, then wake and hit cached == 13,632!
+        for _ in 0..32 {
+            if !state.has_turns() {
+                break;
+            }
+            assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+        }
+        assert!(!state.has_turns());
+        assert_eq!(
+            state.inner.prepared_cached.get(&follower_seq),
+            Some(&13_632),
+            "held follower must wake and hit 13632 published after leader preemption recovery"
+        );
+        assert!(r1.try_recv().unwrap().is_ok());
+        assert!(r2.try_recv().unwrap().is_ok());
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_promotes_unpublished_in_flight_subslice_and_never_pins_disposable_checkpoint()
+     {
+        // Part A: un-promotable disposable rolling checkpoints -> fallback rejects them and
+        // follower admits immediately rather than pinning a disposable Checkpoint!
+        {
+            let (mut backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+            backend.reject_all_registrations = true;
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            assert!(!state.start_prepared(p1));
+
+            let (mut p2, _c2, _r2) =
+                make_prepared(&mut state, "follower", shared_prompt(13_656, 14_400, 2));
+            assert!(
+                !state.coalesce_waits(&mut p2),
+                "un-promotable rolling checkpoints must never be pinned"
+            );
+            assert!(p2.coalesce.is_none());
+        }
+
+        // Part B: active in-flight run with unpublished sub-slice ends `[4096, 8192]`.
+        // - Follower A shares `6016` (mid-sub-slice `4096 < 6016 < 8192`): direct registration
+        //   fails, fallback promotes exact unpublished `pending_subs` end `4096` to durable
+        //   `OrdinaryHead` and pins Follower A to `4096`.
+        // - Follower B shares `8192` (exact `run.end`): direct registration succeeds and
+        //   promotes `8192` to durable `OrdinaryHead`!
+        {
+            let (backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            let leader_seq = p1.seq_id;
+            assert!(!state.start_prepared(p1));
+            state.inner.seq_committed.insert(leader_seq, 8192);
+            state.inner.seq_in_flight.insert(
+                leader_seq,
+                MockInFlightRun {
+                    in_flight_end: 8192,
+                    unpublished_sub_ends: vec![4096, 8192],
+                },
+            );
+
+            // Follower A shares 6016 tokens -> falls back to unpublished pending_sub `4096`.
+            let (p_a, _ca, _ra) =
+                make_prepared(&mut state, "follower-a", shared_prompt(6_016, 10_000, 2));
+            let seq_a = p_a.seq_id;
+            assert!(!state.start_prepared(p_a));
+            assert_eq!(state.held.len(), 1);
+            assert_eq!(
+                state.held[0].coalesce.unwrap().target_break,
+                4096,
+                "fallback must promote exact unpublished pending_subs end 4096"
+            );
+
+            // Follower B shares 8192 + 10 tokens (`shared_break == 8192 == run.end`).
+            let (p_b, _cb, _rb) =
+                make_prepared(&mut state, "follower-b", shared_prompt(8_202, 10_000, 3));
+            let seq_b = p_b.seq_id;
+            assert!(!state.start_prepared(p_b));
+            assert_eq!(state.held.len(), 2);
+            assert_eq!(
+                state.held[1].coalesce.unwrap().target_break,
+                8192,
+                "exact unpublished run.end 8192 must promote directly"
+            );
+            assert!(
+                state
+                    .inner
+                    .seq_shared_breaks
+                    .get(&leader_seq)
+                    .is_some_and(|s| s.contains(&4096) && s.contains(&8192)),
+                "both 4096 and 8192 must be promoted in leader's extra capture boundaries"
+            );
+
+            // Drive leader to completion and verify both anchors published as OrdinaryHead
+            // and both followers hit 4096 / 8192!
+            for _ in 0..32 {
+                if !state.has_turns() {
+                    break;
+                }
+                assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+            }
+            assert!(
+                state
+                    .inner
+                    .published
+                    .iter()
+                    .any(|a| { a.tokens.len() == 4096 && a.kind == PublishedKind::OrdinaryHead })
+            );
+            assert!(
+                state
+                    .inner
+                    .published
+                    .iter()
+                    .any(|a| { a.tokens.len() == 8192 && a.kind == PublishedKind::OrdinaryHead })
+            );
+            assert_eq!(state.inner.prepared_cached.get(&seq_a), Some(&4096));
+            assert_eq!(state.inner.prepared_cached.get(&seq_b), Some(&8192));
+        }
+    }
+
+    #[test]
+    fn cold_prefix_coalescing_releases_on_governor_refusal_stall_hard_cap_and_ignores_non_opted_in_family()
+     {
+        // (a) `admit_prepared` called directly outside `drive_pass` reads `memory_governor().now()`
+        //     directly (even when `state.pass_start == 0.0`).
+        // (b) Non-Measured (Fixed) scheduler ALSO pins `target_break` into `leader.pinned_prefill_breaks`.
+        {
+            let (backend, io) = CoalesceMockBackend::new(4, false, Some(2048));
+            io.with(|fake| fake.now = 100.0);
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            assert_eq!(state.pass_start, 0.0, "outside drive_pass, pass_start is 0");
+
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            let leader_seq = p1.seq_id;
+            let t1 = state
+                .admit_prepared(p1)
+                .ok()
+                .flatten()
+                .expect("leader admitted");
+            state.enqueue_turn_or_reject(t1);
+
+            let (p2, _c2, _r2) =
+                make_prepared(&mut state, "follower", shared_prompt(13_656, 14_400, 2));
+            let p2 = match state.admit_prepared(p2) {
+                Err(held) => held,
+                Ok(_) => panic!("follower held by coalescing outside drive_pass"),
+            };
+            let c = p2.coalesce.expect("pinned");
+            assert_eq!(c.started_at, 100.0, "must read governor.now() directly");
+            assert_eq!(c.last_progress_at, 100.0);
+            let leader = state
+                .scheduler
+                .turns()
+                .find(|t| t.seq_id == leader_seq)
+                .unwrap();
+            assert!(
+                leader.pinned_prefill_breaks.contains(&13_632),
+                "non-Measured scheduler must pin target_break into leader.pinned_prefill_breaks"
+            );
+
+            // (b) Governor refusal guard: leader passes `target_break` without publishing.
+            state
+                .scheduler
+                .turns_mut()
+                .find(|t| t.seq_id == leader_seq)
+                .unwrap()
+                .num_computed_tokens = 13_632;
+            let mut p2 = p2;
+            p2.stored_prefix.set(Some(ProbedPrefix {
+                generation: state.inner.probe_generation,
+                tokens: 0,
+            }));
+            assert!(
+                !state.coalesce_waits(&mut p2),
+                "leader passing target_break without publishing must release follower"
+            );
+            assert!(p2.coalesce.is_none());
+            assert!(p2.coalesce_exhausted);
+            assert!(p2.stored_prefix.get().is_none());
+            assert!(
+                !state.coalesce_waits(&mut p2),
+                "coalesce_exhausted must prevent re-pinning"
+            );
+        }
+
+        // (c) 10s stall guard (including non-monotonic `prefill_rows_done` rollback oscillation).
+        {
+            let (backend, io) = CoalesceMockBackend::new(4, true, Some(2048));
+            io.with(|fake| fake.now = 50.0);
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            let leader_seq = p1.seq_id;
+            assert!(!state.start_prepared(p1));
+            let (mut p2, _c2, _r2) =
+                make_prepared(&mut state, "follower", shared_prompt(13_656, 14_400, 2));
+            assert!(state.coalesce_waits(&mut p2));
+
+            // Advance rows_done to 500 at t=52.0 -> updates last_progress_at = 52.0.
+            io.with(|fake| fake.now = 52.0);
+            state.inner.seq_rows_done.insert(leader_seq, 500);
+            assert!(state.coalesce_waits(&mut p2));
+            assert_eq!(p2.coalesce.unwrap().last_progress_at, 52.0);
+
+            // Rollback oscillation `(0, 500) -> (0, 0) -> (0, 500)` MUST NOT reset stall timer!
+            io.with(|fake| fake.now = 58.0);
+            state.inner.seq_rows_done.insert(leader_seq, 0);
+            assert!(state.coalesce_waits(&mut p2));
+            io.with(|fake| fake.now = 61.9);
+            state.inner.seq_rows_done.insert(leader_seq, 500);
+            assert!(state.coalesce_waits(&mut p2), "9.9s still within 10s stall");
+
+            io.with(|fake| fake.now = 62.0);
+            p2.stored_prefix.set(Some(ProbedPrefix {
+                generation: state.inner.probe_generation,
+                tokens: 0,
+            }));
+            assert!(!state.coalesce_waits(&mut p2), "10.0s stall must release");
+            assert!(p2.coalesce.is_none());
+            assert!(p2.coalesce_exhausted);
+            assert!(p2.stored_prefix.get().is_none());
+        }
+
+        // (d) 60s hard wait cap despite steady leader progress.
+        {
+            let (backend, io) = CoalesceMockBackend::new(4, true, Some(2048));
+            io.with(|fake| fake.now = 200.0);
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            let leader_seq = p1.seq_id;
+            assert!(!state.start_prepared(p1));
+            let (mut p2, _c2, _r2) =
+                make_prepared(&mut state, "follower", shared_prompt(13_656, 14_400, 2));
+            assert!(state.coalesce_waits(&mut p2));
+
+            let mut rows = 0u32;
+            for step in 1..=11 {
+                io.with(|fake| fake.now = 200.0 + step as f64 * 5.0);
+                rows += 100;
+                state.inner.seq_rows_done.insert(leader_seq, rows);
+                assert!(state.coalesce_waits(&mut p2));
+            }
+            io.with(|fake| fake.now = 259.9);
+            rows += 100;
+            state.inner.seq_rows_done.insert(leader_seq, rows);
+            assert!(state.coalesce_waits(&mut p2), "59.9s still within 60s cap");
+
+            io.with(|fake| fake.now = 260.0);
+            rows += 100;
+            state.inner.seq_rows_done.insert(leader_seq, rows);
+            assert!(
+                !state.coalesce_waits(&mut p2),
+                "60.0s hard cap must release"
+            );
+            assert!(p2.coalesce.is_none());
+            assert!(p2.coalesce_exhausted);
+            assert!(p2.stored_prefix.get().is_none());
+        }
+
+        // (e) `preemption_replay.is_some()` and `TurnStatus::WaitingForSsd` leader exclusion.
+        {
+            let (backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+
+            let (p1, _c1, _r1) = make_prepared(
+                &mut state,
+                "replay-leader",
+                shared_prompt(13_656, 14_500, 1),
+            );
+            let replay_seq = p1.seq_id;
+            assert!(!state.start_prepared(p1));
+            {
+                let t = state
+                    .scheduler
+                    .turns_mut()
+                    .find(|t| t.seq_id == replay_seq)
+                    .unwrap();
+                t.payload.preemption_replay = Some(crate::engine::scheduler::PreemptionReplay {
+                    tokens: t.payload.prompt_tokens.clone(),
+                    cached_prefix: 0,
+                    suppress_sample: false,
+                });
+            }
+            let (mut pf1, _cf1, _rf1) = make_prepared(
+                &mut state,
+                "follower-replay",
+                shared_prompt(13_656, 14_400, 2),
+            );
+            assert!(
+                !state.coalesce_waits(&mut pf1),
+                "unpinned follower must exclude preemption_replay leader"
+            );
+
+            // Replace with a WaitingForSsd turn and verify exclusion too.
+            let _ = state.scheduler.take_waiting(replay_seq);
+            let (p_ssd, _cs, _rs) =
+                make_prepared(&mut state, "ssd-leader", shared_prompt(13_656, 14_500, 3));
+            let ssd_seq = p_ssd.seq_id;
+            assert!(!state.start_prepared(p_ssd));
+            state
+                .scheduler
+                .park_waiting_for_ssd(ssd_seq)
+                .expect("park WaitingForSsd");
+            let (mut pf2, _cf2, _rf2) =
+                make_prepared(&mut state, "follower-ssd", shared_prompt(13_656, 14_400, 4));
+            assert!(
+                !state.coalesce_waits(&mut pf2),
+                "unpinned follower must exclude WaitingForSsd leader"
+            );
+        }
+
+        // (f) Default-trait opt-out family keeps bit-identical admission (no coalescing).
+        {
+            let (inner, _io) = CoalesceMockBackend::new(4, false, Some(2048));
+            let backend = DefaultOptOutBackend(inner);
+            assert_eq!(backend.prefix_coalesce_min_tokens(), None);
+            assert!(!backend.can_lead_prefix_coalesce(1));
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "optout-1", shared_prompt(13_656, 14_500, 1));
+            let (p2, _c2, _r2) =
+                make_prepared(&mut state, "optout-2", shared_prompt(13_656, 14_400, 2));
+            assert!(!state.start_prepared(p1));
+            assert!(!state.start_prepared(p2));
+            assert!(
+                state.held.is_empty(),
+                "non-opted-in family must never hold followers for coalescing"
+            );
+            assert_eq!(
+                state.scheduler.waiting_len() + state.scheduler.running_len(),
+                2
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_release_cache_owner_does_not_hol_block_unrelated_owner_and_preserves_order() {
+        let (backend, _io) = CoalesceMockBackend::new(4, true, Some(2048));
+        let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        // Admit Leader #1 and hold coalescing follower for owner "A" in `self.held`.
+        let (p_leader, _c_leader, mut r_leader) =
+            make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+        let (p_a, _c_a, mut r_a) =
+            make_prepared(&mut state, "owner-a", shared_prompt(13_656, 14_400, 2));
+        assert!(!state.start_prepared(p_leader));
+        assert!(!state.start_prepared(p_a));
+        assert_eq!(state.held.len(), 1);
+        assert!(state.cache_owner_release_blocked("owner-a"));
+
+        // Seed an idle owner whose release behind blocked ReleaseCacheOwner("owner-a") can run immediately.
+        state.owner_sequences.insert("owner-idle".to_string(), 900);
+        state
+            .owner_states
+            .insert("owner-idle".to_string(), vec![1, 2, 3]);
+
+        let make_short_chat = |owner: &str, text: &str| {
+            let (reply, done) = tokio::sync::oneshot::channel();
+            let cmd = ModelCommand::from_chat(ChatCmd::SessionStart {
+                messages: vec![ChatMessage {
+                    role: "user".to_string(),
+                    content: text.to_string(),
+                    tool_calls: None,
+                    tool_call_id: None,
+                    is_error: None,
+                    reasoning_content: None,
+                    thinking_enabled: None,
+                    images: None,
+                    audio: None,
+                }],
+                config: ChatConfig {
+                    cache_owner_id: Some(owner.to_string()),
+                    reuse_cache: Some(true),
+                    max_new_tokens: Some(4),
+                    ..tiny_turn_config(None, 4)
+                },
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            });
+            (cmd, done)
+        };
+
+        // Queue in `pending`:
+        // 0: ReleaseCacheOwner("owner-a")   [blocked by held follower "owner-a"]
+        // 1: Chat("owner-a") #2             [same owner -> MUST NOT overtake ReleaseCacheOwner("owner-a")]
+        // 2: Chat("owner-b")                [unrelated -> MUST admit and finish immediately!]
+        // 3: ReleaseCacheOwner("owner-idle")[unrelated -> MUST execute immediately!]
+        // 4: ResetCaches                    [global barrier -> MUST NOT overtake blocked ReleaseCacheOwner("owner-a")]
+        // 5: Chat("owner-c")                [after barrier -> MUST NOT overtake ResetCaches!]
+        let (rel_a_tx, mut rel_a_rx) = tokio::sync::oneshot::channel();
+        tx.send(ModelCommand::from_chat(ChatCmd::ReleaseCacheOwner {
+            owner_id: "owner-a".to_string(),
+            reply: rel_a_tx,
+        }))
+        .unwrap();
+        let (cmd_a2, mut rx_a2) = make_short_chat("owner-a", "second turn for owner A");
+        tx.send(cmd_a2).unwrap();
+        let (cmd_b, mut rx_b) = make_short_chat("owner-b", "unrelated short B");
+        tx.send(cmd_b).unwrap();
+        let (rel_idle_tx, mut rel_idle_rx) = tokio::sync::oneshot::channel();
+        tx.send(ModelCommand::from_chat(ChatCmd::ReleaseCacheOwner {
+            owner_id: "owner-idle".to_string(),
+            reply: rel_idle_tx,
+        }))
+        .unwrap();
+        let (reset_tx, mut reset_rx) = tokio::sync::oneshot::channel();
+        tx.send(ModelCommand::from_chat(ChatCmd::ResetCaches {
+            reply: reset_tx,
+        }))
+        .unwrap();
+        let (cmd_c, mut rx_c) = make_short_chat("owner-c", "after reset barrier C");
+        tx.send(cmd_c).unwrap();
+
+        // Pass 1: owner-b admits and finishes immediately (SJF shortest), owner-idle releases
+        // immediately, while ReleaseCacheOwner("owner-a"), Chat("owner-a")#2, ResetCaches, and
+        // Chat("owner-c") stay safely ordered in `pending`!
+        assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+        assert!(
+            matches!(rx_b.try_recv(), Ok(Ok(_))),
+            "unrelated owner-b must admit and finish immediately without HoL blocking behind ReleaseCacheOwner(owner-a)"
+        );
+        assert!(
+            matches!(rel_idle_rx.try_recv(), Ok(Ok(()))),
+            "unrelated idle ReleaseCacheOwner must run without HoL blocking"
+        );
+        assert!(
+            rel_a_rx.try_recv().is_err(),
+            "blocked ReleaseCacheOwner(owner-a) must still wait for held owner-a"
+        );
+        assert!(
+            rx_a2.try_recv().is_err(),
+            "second Chat(owner-a) must NOT overtake ReleaseCacheOwner(owner-a)"
+        );
+        assert!(
+            reset_rx.try_recv().is_err(),
+            "ResetCaches global barrier must NOT overtake blocked ReleaseCacheOwner(owner-a)"
+        );
+        assert!(
+            rx_c.try_recv().is_err(),
+            "Chat(owner-c) behind ResetCaches must NOT overtake ResetCaches"
+        );
+        assert_eq!(state.held.len(), 1, "owner-a follower still coalescing");
+
+        // Drive until ReleaseCacheOwner("owner-a") runs, and verify owner-a's second turn
+        // NEVER completes before ReleaseCacheOwner("owner-a") resolves!
+        let mut rel_a_done = false;
+        let mut a2_done = false;
+        let mut reset_done = false;
+        let mut c_done = false;
+        for _ in 0..64 {
+            if !state.has_turns() {
+                break;
+            }
+            assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+            if !rel_a_done && matches!(rel_a_rx.try_recv(), Ok(Ok(()))) {
+                rel_a_done = true;
+            }
+            if !a2_done && matches!(rx_a2.try_recv(), Ok(Ok(_))) {
+                assert!(
+                    rel_a_done,
+                    "Chat(owner-a)#2 completed before ReleaseCacheOwner(owner-a)!"
+                );
+                a2_done = true;
+            }
+            if !reset_done && matches!(reset_rx.try_recv(), Ok(Ok(()))) {
+                assert!(a2_done, "ResetCaches ran before earlier Chat(owner-a)#2!");
+                reset_done = true;
+            }
+            if !c_done && matches!(rx_c.try_recv(), Ok(Ok(_))) {
+                assert!(reset_done, "Chat(owner-c) ran before ResetCaches barrier!");
+                c_done = true;
+            }
+        }
+        assert!(!state.has_turns());
+        assert!(matches!(r_leader.try_recv(), Ok(Ok(_))));
+        assert!(matches!(r_a.try_recv(), Ok(Ok(_))));
+        assert!(rel_a_done && a2_done && reset_done && c_done);
+    }
+
+    #[test]
+    fn coalesce_follower_detach_unregisters_dynamic_breaks_and_preserves_refcounts_and_static_breaks()
+     {
+        // (a) Sole follower cancel frees 8-cap slot, drops non-Measured pinned break, and prevents
+        //     leader from capturing an orphaned OrdinaryHead anchor.
+        {
+            let (mut backend, _io) = CoalesceMockBackend::new(4, false, Some(2048));
+            backend.max_extra_breaks = Some(8);
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let (p_leader, _cl, mut r_leader) =
+                make_prepared(&mut state, "leader", shared_prompt(14_000, 14_500, 1));
+            let leader_seq = p_leader.seq_id;
+            assert!(!state.start_prepared(p_leader));
+
+            // Fill 7 distinct dynamic boundaries on leader (`2048 + 32*k` for k=0..7).
+            let mut other_cancels = Vec::new();
+            for k in 0u32..7 {
+                let shared = 2_048 + 32 * k;
+                let (pf, cf, _rf) = make_prepared(
+                    &mut state,
+                    &format!("other-{k}"),
+                    shared_prompt(shared as usize + 5, 14_400, 10 + k),
+                );
+                assert!(!state.start_prepared(pf));
+                other_cancels.push(cf);
+            }
+            // 8th distinct boundary: `13_632`.
+            let (p_cancel, c_cancel, mut r_cancel) =
+                make_prepared(&mut state, "cancel-me", shared_prompt(13_656, 14_400, 2));
+            assert!(!state.start_prepared(p_cancel));
+            assert_eq!(state.inner.seq_all_extra_breaks(leader_seq).len(), 8);
+            assert!(
+                state
+                    .scheduler
+                    .turns()
+                    .find(|t| t.seq_id == leader_seq)
+                    .unwrap()
+                    .pinned_prefill_breaks
+                    .contains(&13_632)
+            );
+
+            // At cap 8, a 9th distinct boundary (`13_664`) cannot register directly and falls back
+            // to `13_632` (or if we try directly on backend it returns false).
+            assert!(
+                !state
+                    .inner
+                    .register_shared_prefill_break(leader_seq, 13_664),
+                "9th distinct boundary must be rejected while cap 8 is full"
+            );
+
+            // Cancel the sole follower holding `13_632` and reap cancelled waiters.
+            c_cancel.store(true, Ordering::Relaxed);
+            state.reap_cancelled_waiters();
+            assert!(matches!(r_cancel.try_recv(), Ok(Err(_))));
+            assert!(
+                state
+                    .inner
+                    .recorded_unregister_shared_breaks
+                    .contains(&(leader_seq, 13_632)),
+                "cancelling sole follower must unregister 13632 from leader"
+            );
+            assert!(
+                !state
+                    .inner
+                    .seq_all_extra_breaks(leader_seq)
+                    .contains(&13_632),
+                "orphaned 13632 must be removed from backend shared breaks"
+            );
+            {
+                let leader = state
+                    .scheduler
+                    .turns()
+                    .find(|t| t.seq_id == leader_seq)
+                    .unwrap();
+                assert!(
+                    !state
+                        .shared_coalesce_breaks
+                        .get(&leader_seq)
+                        .is_some_and(|m| m.contains_key(&13_632))
+                );
+                assert!(
+                    !leader.pinned_prefill_breaks.contains(&13_632),
+                    "non-Measured leader must drop orphaned 13632 from pinned_prefill_breaks"
+                );
+            }
+
+            // The freed cap slot now accepts a new live follower at `13_664`!
+            let (p_live, _c_live, mut r_live) = make_prepared(
+                &mut state,
+                "live-follower",
+                shared_prompt(13_680, 14_400, 3),
+            );
+            let live_seq = p_live.seq_id;
+            assert!(!state.start_prepared(p_live));
+            assert_eq!(
+                state.held.back().unwrap().coalesce.unwrap().target_break,
+                13_664,
+                "freed cap slot must allow new live follower to pin 13664"
+            );
+
+            // Cancel the 7 filler followers so only `live-follower` (13_664) remains.
+            for cf in other_cancels {
+                cf.store(true, Ordering::Relaxed);
+            }
+            state.reap_cancelled_waiters();
+
+            for _ in 0..32 {
+                if !state.has_turns() {
+                    break;
+                }
+                assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+            }
+            assert!(matches!(r_leader.try_recv(), Ok(Ok(_))));
+            assert!(matches!(r_live.try_recv(), Ok(Ok(_))));
+            assert_eq!(state.inner.prepared_cached.get(&live_seq), Some(&13_664));
+            assert!(
+                !state
+                    .inner
+                    .published
+                    .iter()
+                    .any(|a| a.tokens.len() == 13_632 && a.kind == PublishedKind::OrdinaryHead),
+                "leader must NOT publish an OrdinaryHead anchor at orphaned 13632"
+            );
+            assert!(
+                state
+                    .inner
+                    .published
+                    .iter()
+                    .any(|a| a.tokens.len() == 13_664 && a.kind == PublishedKind::OrdinaryHead),
+                "leader must publish OrdinaryHead at live follower's 13664"
+            );
+        }
+
+        // (b) Stall timeout, 60s hard-cap timeout, and relink all unregister from the old leader.
+        {
+            let (backend, io) = CoalesceMockBackend::new(4, true, Some(2048));
+            io.with(|fake| fake.now = 10.0);
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (p1, _c1, _r1) =
+                make_prepared(&mut state, "leader-1", shared_prompt(13_656, 14_500, 1));
+            let leader1_seq = p1.seq_id;
+            assert!(!state.start_prepared(p1));
+
+            // Stall timeout unregisters 13_632.
+            let (mut p_stall, _cs, _rs) =
+                make_prepared(&mut state, "stall-f", shared_prompt(13_656, 14_400, 2));
+            assert!(state.coalesce_waits(&mut p_stall));
+            assert!(
+                state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_632)
+            );
+            io.with(|fake| fake.now = 20.0);
+            assert!(!state.coalesce_waits(&mut p_stall));
+            assert!(
+                !state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_632),
+                "stall timeout must unregister 13632 from leader"
+            );
+
+            // Hard-cap timeout unregisters 13_600.
+            let (mut p_cap, _cc, _rc) =
+                make_prepared(&mut state, "cap-f", shared_prompt(13_620, 14_400, 3));
+            assert!(state.coalesce_waits(&mut p_cap));
+            assert!(
+                state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_600)
+            );
+            io.with(|fake| fake.now = 80.0);
+            assert!(!state.coalesce_waits(&mut p_cap));
+            assert!(
+                !state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_600),
+                "60s hard cap must unregister 13600 from leader"
+            );
+
+            // Relink unregisters from old disqualified leader1 and registers on leader2.
+            let (mut p_rel, _cr, _rr) =
+                make_prepared(&mut state, "relink-f", shared_prompt(13_656, 14_400, 4));
+            assert!(state.coalesce_waits(&mut p_rel));
+            assert!(
+                state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_632)
+            );
+            // Admit a second eligible leader (bypassing coalescing via exhausted flag).
+            let (mut p2, _c2, _r2) =
+                make_prepared(&mut state, "leader-2", shared_prompt(13_656, 14_450, 5));
+            let leader2_seq = p2.seq_id;
+            p2.coalesce_exhausted = true;
+            assert!(!state.start_prepared(p2));
+            state.inner.disqualified_leaders.insert(leader1_seq);
+            assert!(state.coalesce_waits(&mut p_rel));
+            assert_eq!(p_rel.coalesce.unwrap().leader_seq, leader2_seq);
+            assert!(
+                !state
+                    .inner
+                    .seq_all_extra_breaks(leader1_seq)
+                    .contains(&13_632),
+                "relink must unregister 13632 from old leader1"
+            );
+            assert!(
+                state
+                    .inner
+                    .seq_all_extra_breaks(leader2_seq)
+                    .contains(&13_632),
+                "relink must register 13632 on new leader2"
+            );
+        }
+
+        // (c) Two followers share the same dynamic boundary: cancelling one keeps it pinned until
+        //     the second detaches.
+        {
+            let (backend, _io) = CoalesceMockBackend::new(4, false, Some(2048));
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (p_leader, _cl, _rl) =
+                make_prepared(&mut state, "leader", shared_prompt(13_656, 14_500, 1));
+            let leader_seq = p_leader.seq_id;
+            assert!(!state.start_prepared(p_leader));
+
+            let (pf1, cf1, _rf1) =
+                make_prepared(&mut state, "f1", shared_prompt(13_656, 14_400, 2));
+            let (pf2, cf2, _rf2) =
+                make_prepared(&mut state, "f2", shared_prompt(13_656, 14_300, 3));
+            assert!(!state.start_prepared(pf1));
+            assert!(!state.start_prepared(pf2));
+            assert_eq!(
+                state
+                    .shared_coalesce_breaks
+                    .get(&leader_seq)
+                    .and_then(|m| m.get(&13_632)),
+                Some(&2)
+            );
+
+            // Cancel f1 -> refcount 2 -> 1, boundary STAYS pinned!
+            cf1.store(true, Ordering::Relaxed);
+            state.reap_cancelled_waiters();
+            assert!(
+                state
+                    .inner
+                    .seq_all_extra_breaks(leader_seq)
+                    .contains(&13_632),
+                "boundary must stay pinned while second follower still waits"
+            );
+            {
+                let leader = state
+                    .scheduler
+                    .turns()
+                    .find(|t| t.seq_id == leader_seq)
+                    .unwrap();
+                assert_eq!(
+                    state
+                        .shared_coalesce_breaks
+                        .get(&leader_seq)
+                        .and_then(|m| m.get(&13_632)),
+                    Some(&1)
+                );
+                assert!(leader.pinned_prefill_breaks.contains(&13_632));
+            }
+
+            // Cancel f2 -> refcount 1 -> 0, boundary IS unregistered!
+            cf2.store(true, Ordering::Relaxed);
+            state.reap_cancelled_waiters();
+            assert!(
+                !state
+                    .inner
+                    .seq_all_extra_breaks(leader_seq)
+                    .contains(&13_632),
+                "boundary must be unregistered once last follower detaches"
+            );
+            {
+                let leader = state
+                    .scheduler
+                    .turns()
+                    .find(|t| t.seq_id == leader_seq)
+                    .unwrap();
+                assert!(
+                    !state
+                        .shared_coalesce_breaks
+                        .get(&leader_seq)
+                        .is_some_and(|m| m.contains_key(&13_632))
+                );
+                assert!(!leader.pinned_prefill_breaks.contains(&13_632));
+            }
+        }
+
+        // (d) Follower pins onto a boundary that is ALSO a leader static structural breakpoint
+        //     (stored raw unaligned `13_640` flooring to `13_632`) and cancels -> static structural
+        //     breakpoint is preserved and still publishes!
+        {
+            let (backend, _io) = CoalesceMockBackend::new(4, false, Some(2048));
+            let mut state = HybridSchedulerState::new(backend).expect("scheduler");
+            let (_tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+            let (p_leader, _cl, mut r_leader) = make_prepared_with_breakpoints(
+                &mut state,
+                "static-leader",
+                shared_prompt(13_656, 14_500, 1),
+                vec![13_640], // floors to 13_632 with block_size = 32
+            );
+            let leader_seq = p_leader.seq_id;
+            assert!(!state.start_prepared(p_leader));
+            assert!(
+                state
+                    .inner
+                    .seq_structural_breaks
+                    .get(&leader_seq)
+                    .is_some_and(|s| s.contains(&13_632))
+            );
+
+            let (pf, cf, _rf) = make_prepared(
+                &mut state,
+                "static-follower",
+                shared_prompt(13_656, 14_400, 2),
+            );
+            assert!(!state.start_prepared(pf));
+            cf.store(true, Ordering::Relaxed);
+            state.reap_cancelled_waiters();
+
+            assert!(
+                state
+                    .inner
+                    .seq_structural_breaks
+                    .get(&leader_seq)
+                    .is_some_and(|s| s.contains(&13_632)),
+                "cancelling follower must preserve leader's static structural breakpoint 13632"
+            );
+            assert!(
+                state
+                    .scheduler
+                    .turns()
+                    .find(|t| t.seq_id == leader_seq)
+                    .unwrap()
+                    .pinned_prefill_breaks
+                    .contains(&13_632),
+                "non-Measured leader must preserve static structural breakpoint in pinned_prefill_breaks"
+            );
+
+            for _ in 0..32 {
+                if !state.has_turns() {
+                    break;
+                }
+                assert!(matches!(state.drive(&mut rx), LoopControl::Continue));
+            }
+            assert!(matches!(r_leader.try_recv(), Ok(Ok(_))));
+            assert!(
+                state
+                    .inner
+                    .published
+                    .iter()
+                    .any(|a| a.tokens.len() == 13_632 && a.kind == PublishedKind::OrdinaryHead),
+                "leader must still publish static structural OrdinaryHead at 13632"
+            );
+        }
     }
 }

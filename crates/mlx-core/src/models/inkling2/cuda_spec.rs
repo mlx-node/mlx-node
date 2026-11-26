@@ -1799,8 +1799,6 @@ impl Inkling2Inner {
 }
 
 impl FlatDsparkBackend for Inkling2Inner {
-    const OVERWRITE_THINKING_ENABLED: bool = false;
-
     fn prepare_flat_dspark_turn(
         &mut self,
         tokens: &[u32],
@@ -2583,6 +2581,54 @@ mod tests {
             inner.cuda_cache = Some(inner.new_cuda_cache().unwrap());
             assert!(ChatBackend::prefill(&mut inner, &[], Stream::generation()).is_err());
             assert!(inner.cuda_cache.is_none());
+        }
+    }
+
+    #[test]
+    fn inkling2_flat_dspark_public_thinking_enabled_tracks_effort_while_keeping_tracker_armed() {
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::types::ChatConfig;
+
+        const {
+            assert!(
+                <Inkling2Inner as FlatDsparkBackend>::OVERWRITE_THINKING_ENABLED,
+                "Inkling2 CUDA flat speculative path must overwrite thinking_enabled from public_thinking_enabled"
+            );
+        }
+
+        let inner = make_test_dspark_inner();
+        for effort in ["none", "0", "0.0", "-0.0", "0.00"] {
+            let cfg = ChatConfig {
+                reasoning_effort: Some(effort.to_string()),
+                ..ChatConfig::default()
+            };
+            assert!(
+                !inner.public_thinking_enabled(&cfg),
+                "Inkling2 public_thinking_enabled must be false for effort={effort:?}"
+            );
+            let setup = inner.thinking_setup(&cfg);
+            assert!(
+                setup.enabled,
+                "Inkling2 tracker must remain armed for effort={effort:?}"
+            );
+            assert_eq!(setup.budget, Some(0));
+            assert!(!setup.cycle_guard);
+        }
+        for effort in [
+            None,
+            Some("minimal"),
+            Some("low"),
+            Some("0.25"),
+            Some("max"),
+        ] {
+            let cfg = ChatConfig {
+                reasoning_effort: effort.map(str::to_string),
+                ..ChatConfig::default()
+            };
+            assert!(
+                inner.public_thinking_enabled(&cfg),
+                "Inkling2 public_thinking_enabled must be true for effort={effort:?}"
+            );
         }
     }
 }
