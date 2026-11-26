@@ -254,7 +254,7 @@ jobs:
     if: >-
       github.event.action != 'labeled' ||
       github.event.label.name == 'model-e2e'
-    runs-on: ubuntu-22.04-arm
+    runs-on: ubuntu-26.04-arm
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CMAKE_GENERATOR: Ninja
