@@ -11138,7 +11138,7 @@ mod clef_row_gather_tests {
     fn int8_prefill_nax_accuracy_epilogues_and_non_finite_propagation() -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         {
-            return Ok(());
+            Ok(())
         }
         #[cfg(target_os = "macos")]
         {
@@ -11374,7 +11374,7 @@ mod clef_row_gather_tests {
     fn int8_prefill_nax_q4k_q5k_affine_cancellation_and_large_finite_activations() -> Result<()> {
         #[cfg(not(target_os = "macos"))]
         {
-            return Ok(());
+            Ok(())
         }
         #[cfg(target_os = "macos")]
         {
