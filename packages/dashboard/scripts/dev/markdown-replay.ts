@@ -14,7 +14,7 @@
  * and a later run see the same answers.
  */
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
@@ -291,9 +291,13 @@ export function loadCorpus(fresh: boolean): Doc[] {
   return docs;
 }
 
+/** Owner-only: the corpus holds the text of real answers from homes that are 0700. */
 export function writeJson(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, `${JSON.stringify(value)}\n`);
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700);
+  writeFileSync(path, `${JSON.stringify(value)}\n`, { mode: 0o600 });
+  chmodSync(path, 0o600);
 }
 
 // ---------------------------------------------------------------------------------------------------------------

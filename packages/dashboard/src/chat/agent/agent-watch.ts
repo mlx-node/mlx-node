@@ -10,7 +10,13 @@ import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import { MAX_UPDATES_BYTES } from '../../agent-sessions/reader.js';
-import { parseUpdates, storedEventIds, TranscriptReducer, type UpdateLine } from '../../agent-sessions/transcript.js';
+import {
+  counterOf,
+  parseUpdates,
+  storedEventIds,
+  TranscriptReducer,
+  type UpdateLine,
+} from '../../agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../../agent-sessions/types.js';
 import { applyOp, CHAT_FLUSH_MS, mergeTextOps } from '../conversation.js';
 import { needleList, redactEntry, StreamRedactor } from '../redact.js';
@@ -77,14 +83,6 @@ function eventIdOf(line: UpdateLine): string | null {
 interface Stored {
   ids: ReadonlySet<string>;
   seam: number;
-}
-
-/** The counter that ends an `eventId` (`<session id>-<n>`); null when it ends in none. */
-function counterOf(id: string): number | null {
-  const tail = id.slice(id.lastIndexOf('-') + 1);
-  if (tail === '') return null;
-  for (const c of tail) if (c < '0' || c > '9') return null;
-  return Number(tail);
 }
 
 function storedOf(text: string): Stored {

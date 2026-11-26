@@ -216,7 +216,8 @@ export async function routeRequest(
   extras?: RouteExtras,
 ): Promise<void> {
   const path = requestPathname(req);
-  const levelsFamily = extras?.thinkingLevels === true ? (name: string) => listedFamily(name, listModels) : undefined;
+  const levelsFamily =
+    extras?.thinkingLevels === true ? (name: string) => listedFamily(name, registry, listModels) : undefined;
   const rejectAudio = (body: unknown): boolean => {
     const name = body && typeof body === 'object' && 'model' in body ? body.model : undefined;
     if (

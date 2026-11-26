@@ -17,7 +17,7 @@ export function handleListModels(
   listModels?: () => PublicModelEntry[],
   thinkingLevels = false,
 ): void {
-  const listed: Array<{ id: string; model_family?: string }> = listModels ? listModels() : registry.list();
+  const listed = listedRows(registry, listModels);
   const models = thinkingLevels ? listed.map(withReasoningEfforts) : listed;
   const body = {
     object: 'list',
@@ -28,14 +28,25 @@ export function handleListModels(
   res.end(stringifyStrictJson(body));
 }
 
+function listedRows(
+  registry: ModelRegistry,
+  listModels?: () => PublicModelEntry[],
+): Array<{ id: string; model_family?: string }> {
+  return listModels ? listModels() : registry.list();
+}
+
 function withReasoningEfforts<T extends { model_family?: string }>(entry: T): T {
   const efforts = entry.model_family === undefined ? undefined : reasoningEffortsFor(entry.model_family);
   return efforts === undefined ? entry : { ...entry, reasoningEfforts: efforts };
 }
 
 /** The family of a name's `/v1/models` row: what a server with `thinkingLevels` maps its levels through. */
-export function listedFamily(name: string, listModels?: () => PublicModelEntry[]): string | undefined {
-  return listModels?.().find((entry) => entry.id === name)?.model_family;
+export function listedFamily(
+  name: string,
+  registry: ModelRegistry,
+  listModels?: () => PublicModelEntry[],
+): string | undefined {
+  return listedRows(registry, listModels).find((entry) => entry.id === name)?.model_family;
 }
 
 /**

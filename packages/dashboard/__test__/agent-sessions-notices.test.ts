@@ -249,6 +249,51 @@ describe('retry episodes', () => {
     expect(notices(entries)).toEqual([expect.objectContaining({ endTs: at(2), outcome: 'recovered' })]);
   });
 
+  it('output made before a try but written after it leaves the episode open; output made after the try ends it', () => {
+    // The agent writes a try at once, ahead of output it made before the try and still holds.
+    const made = (line: Line, counter: number, step: number): Line => ({
+      ...line,
+      ms: at(step),
+      meta: { eventId: `${SID}-${counter}` },
+    });
+    const gaveUp = both([
+      made(prompt('Fix it'), 1, 0),
+      made(retrying(1), 10, 3),
+      made(thought('Before the stall'), 9, 2),
+      made(failed('API error (status 500)'), 11, 4),
+      made(done(), 12, 5),
+    ]);
+    expect(kinds(gaveUp)).toEqual(['user', 'thinking', 'notice', 'turn-end']);
+    expect(notices(gaveUp)).toEqual([
+      expect.objectContaining({ ts: at(3), attempts: 1, endTs: at(4), outcome: 'gave-up' }),
+    ]);
+    const recovered = both([
+      made(prompt('Fix it'), 1, 0),
+      made(retrying(1), 10, 3),
+      made(thought('Before the stall'), 9, 2),
+      made(text('Back'), 12, 5),
+      made(done(), 13, 6),
+    ]);
+    expect(notices(recovered)).toEqual([expect.objectContaining({ ts: at(3), endTs: at(5), outcome: 'recovered' })]);
+    const lateTool = both([
+      made(prompt('Fix it'), 1, 0),
+      made(retrying(1), 10, 3),
+      made(toolCall('c1'), 9, 2),
+      made(failed('API error (status 500)'), 11, 4),
+      made(done(), 12, 5),
+    ]);
+    expect(notices(lateTool)).toEqual([expect.objectContaining({ endTs: at(4), outcome: 'gave-up' })]);
+    // Lines with no event id are ordered by their times.
+    const timed = liveRetries([
+      { ...prompt('Fix it'), ms: at(0) },
+      { ...retrying(1), ms: at(3) },
+      { ...thought('Before the stall'), ms: at(2) },
+      { ...failed('API error (status 500)'), ms: at(4) },
+    ]);
+    expect(timed[2]).not.toHaveProperty('endTs');
+    expect(timed[3]).toMatchObject({ endTs: at(4), outcome: 'gave-up' });
+  });
+
   it('failed after a try gives up with the agent words as detail; failed alone makes no entry', () => {
     const entries = both([
       prompt('Fix it'),

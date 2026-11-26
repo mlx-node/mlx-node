@@ -10,7 +10,7 @@ import { parseServeArgs } from '../../packages/cli/src/commands/serve.js';
 import { CHAT_FAMILY_IDS, THINKING_LEVELS, type ThinkingLevel } from '../../packages/lm/src/family-data.js';
 import { createHandler, type HandlerOptions, type PublicModelEntry } from '../../packages/server/src/handler.js';
 import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
-import { thinkingFor } from '../../packages/server/src/host/thinking-levels.js';
+import { reasoningEffortsFor, thinkingFor } from '../../packages/server/src/host/thinking-levels.js';
 import { mapAnthropicRequest } from '../../packages/server/src/mappers/anthropic-request.js';
 import { ModelRegistry } from '../../packages/server/src/registry.js';
 import type { AnthropicMessagesRequest } from '../../packages/server/src/types-anthropic.js';
@@ -472,5 +472,49 @@ describe('Messages effort: count_tokens', () => {
     for (const value of ['low', 'medium', 'high'] as const) {
       expect(await counted('moe', value), value).toEqual([null, null, null]);
     }
+  });
+});
+
+describe('Messages effort: a server with no model list', () => {
+  it('the registry row /v1/models lists names the family /v1/messages and count_tokens map a level by', async () => {
+    const registry = new ModelRegistry();
+    const configs: ChatConfig[] = [];
+    const renders: unknown[][] = [];
+    registry.register('q35', { ...renderingModel(renders), ...recordingModel(configs) } as SessionCapableModel, {
+      identity: { modelId: 'q35', modelType: 'qwen3_5', contextWindow: 65_536 },
+    });
+    const handler = createHandler(registry, { ...AGENT_HOST, thinkingLevels: true });
+    const server = createServer((req, res) => void handler(req, res));
+    servers.push(server);
+    await new Promise<void>((done) => server.listen(0, '127.0.0.1', () => done()));
+    const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    const listed = (await (await fetch(`${url}/v1/models`)).json()) as { data: Array<Record<string, unknown>> };
+    expect(listed.data.find((row) => row.id === 'q35')?.reasoningEfforts).toEqual(reasoningEffortsFor('qwen3_5'));
+    const post = async (path: string, effort: string): Promise<void> => {
+      const res = await fetch(`${url}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          model: 'q35',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: 'hi' }],
+          extra_body: { reasoning_effort: effort },
+        }),
+      });
+      const text = await res.text();
+      expect(res.status, text).toBe(200);
+    };
+    await post('/v1/messages', 'low');
+    expect(configs).toHaveLength(1);
+    expect(thinkingOf(configs[0]!)).toEqual({
+      effort: 'low',
+      budget: thinkingFor('qwen3_5', 'low')?.thinkingTokenBudget,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+    });
+    expect(configs[0]!.thinkingTokenBudget).toBe(1024);
+    const before = renders.length;
+    await post('/v1/messages/count_tokens', 'high');
+    expect(renders.slice(before)).toEqual([[null, null, null]]);
   });
 });

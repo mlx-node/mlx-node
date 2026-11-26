@@ -149,7 +149,7 @@ export default function Engine(): ReactElement {
                 now={live.now}
                 locals={locals.data?.models}
                 modelUrl={modelUrl}
-                unload={unload.control}
+                unload={process.host === 'desktop' ? unload.control : undefined}
               />
             </>
           )}

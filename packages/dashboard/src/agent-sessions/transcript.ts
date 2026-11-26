@@ -1185,8 +1185,13 @@ export class TranscriptReducer {
   private modeMoves = 0;
   /** The retry episode of the open turn that has no end yet. */
   private retryOpen: RetryNotice | null = null;
-  /** The open turn's last retry episode, and whether a tool call came since it ended. */
-  private retryLast: { entry: RetryNotice; toolSince: boolean } | null = null;
+  /** The open turn's last retry episode, whether a tool call came since it ended, and the order of its last try. */
+  private retryLast: {
+    entry: RetryNotice;
+    toolSince: boolean;
+    tryOrder: EventOrder | null;
+    tryTs: number;
+  } | null = null;
   /** The row of each hook failure of the session, by {@link hookKey}: a repeat counts on it. */
   private readonly hookFailures = new Map<string, HookNotice>();
   /**
@@ -1484,7 +1489,14 @@ export class TranscriptReducer {
   }
 
   /** A `retrying` try (or an auto-recovery start): the open episode takes it, else a recovered one reopens, else a new one. */
-  private retrying(attempt: number, max: number, cause: RetryCause, detail: string | undefined, ts: number): void {
+  private retrying(
+    attempt: number,
+    max: number,
+    cause: RetryCause,
+    detail: string | undefined,
+    ts: number,
+    eventId: string | null | undefined,
+  ): void {
     const last = this.retryLast;
     let entry = this.retryOpen;
     if (
@@ -1502,9 +1514,13 @@ export class TranscriptReducer {
       entry = { kind: 'notice', ts, code: 'retry', cause, attempts: attempt, max };
       if (detail !== undefined) entry.detail = detail;
       this.retryOpen = entry;
-      this.retryLast = { entry, toolSince: false };
+      this.retryLast = { entry, toolSince: false, tryOrder: eventOrder(eventId), tryTs: ts };
       this.oneShots.push(entry);
       return;
+    }
+    if (last !== null) {
+      last.tryOrder = eventOrder(eventId);
+      last.tryTs = ts;
     }
     entry.cause = cause;
     entry.attempts = attempt;
@@ -1513,6 +1529,19 @@ export class TranscriptReducer {
     else delete entry.detail;
     this.retryOpen = entry;
     this.changed(entry);
+  }
+
+  /**
+   * Whether a line was made after the last try. The agent writes a try at once, ahead of output it made before the try
+   * and still holds, so the event counters order the two; their times do when either has none.
+   */
+  private afterTry(eventId: string | null | undefined, ts: number): boolean {
+    const last = this.retryLast;
+    if (last === null) return true;
+    const order = eventOrder(eventId);
+    if (order !== null && last.tryOrder !== null && order.session === last.tryOrder.session)
+      return order.n > last.tryOrder.n;
+    return ts > last.tryTs;
   }
 
   /** Ends the open retry episode at `ts`: output came back, the agent gave up, or (no outcome) the turn ended. */
@@ -1981,7 +2010,7 @@ export class TranscriptReducer {
           if (!isRecord(content) || content.type !== 'text') break;
           const body = str(content.text) ?? '';
           if (body === '') break;
-          this.retryEnds(ts, 'recovered');
+          if (this.afterTry(n.eventId, ts)) this.retryEnds(ts, 'recovered');
           if (tag === 'agent_message_chunk' && isRecord(update._meta) && update._meta.hostTurn === true)
             this.hostTurnSaid();
           const kind = tag === 'agent_message_chunk' ? 'assistant' : 'thinking';
@@ -2006,6 +2035,7 @@ export class TranscriptReducer {
           this.placeOneShots(ts);
           if (this.tool(update, ts) === null) break;
           this.openTurn = true;
+          if (!this.afterTry(n.eventId, ts)) break;
           this.retryEnds(ts, 'recovered');
           if (this.retryLast !== null) this.retryLast.toolSince = true;
           break;
@@ -2250,12 +2280,14 @@ export class TranscriptReducer {
           cause,
           cause === 'other' ? noticeText(reason) : undefined,
           ts,
+          n.eventId,
         );
         break;
       }
       case 'auto_recovery_started': {
         const tries = countOrNull(update.attempt);
-        if (tries !== null) this.retrying(tries, countOrNull(update.max_retries) ?? 0, 'recovery', undefined, ts);
+        if (tries !== null)
+          this.retrying(tries, countOrNull(update.max_retries) ?? 0, 'recovery', undefined, ts, n.eventId);
         break;
       }
       case 'auto_recovery_exhausted':
@@ -2430,6 +2462,25 @@ export function parseUpdates(text: string, options: { helper?: boolean; sessionI
   const reducer = new TranscriptReducer(options);
   reducer.applyText(text);
   return reducer.parsed();
+}
+
+/** The counter that ends an `eventId` (`<session id>-<n>`); null when it ends in none. */
+export function counterOf(id: string): number | null {
+  const tail = id.slice(id.lastIndexOf('-') + 1);
+  if (tail === '') return null;
+  for (const c of tail) if (c < '0' || c > '9') return null;
+  return Number(tail);
+}
+
+interface EventOrder {
+  session: string;
+  n: number;
+}
+
+function eventOrder(id: string | null | undefined): EventOrder | null {
+  if (typeof id !== 'string') return null;
+  const n = counterOf(id);
+  return n === null ? null : { session: id.slice(0, id.lastIndexOf('-')), n };
 }
 
 /**

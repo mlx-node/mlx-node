@@ -73,6 +73,9 @@ afterEach(async () => {
 async function listOf(options: HandlerOptions, listModels?: () => PublicModelEntry[]): Promise<string> {
   const registry = new ModelRegistry();
   registry.register('loaded', {} as never);
+  registry.register('q35-loaded', {} as never, {
+    identity: { modelId: 'q35-loaded', modelType: 'qwen3_5', contextWindow: 65_536 },
+  });
   const handler = createHandler(registry, { ...(listModels ? { listModels } : {}), ...options });
   const server = createServer((req, res) => void handler(req, res));
   servers.push(server);
@@ -122,8 +125,13 @@ describe('GET /v1/models: thinking levels', () => {
     expect(await listOf({ thinkingTokenBudget: 12_000, thinkingCycleGuard: true }, () => ROWS)).toBe(expected);
   });
 
-  it('a registry list names no family, so it is the same with levels on', async () => {
-    expect(await listOf({ thinkingLevels: true })).toBe(await listOf({}));
+  it('a registry list: with levels its row with a family carries the levels, a row without one does not', async () => {
+    const byId = (rows: Json[]) => new Map(rows.map((entry) => [entry.id, entry]));
+    const on = byId(dataOf(await listOf({ thinkingLevels: true })));
+    const off = byId(dataOf(await listOf({})));
+    expect(on.get('q35-loaded')!.reasoningEfforts).toEqual(reasoningEffortsFor('qwen3_5'));
+    expect('reasoningEfforts' in on.get('loaded')!).toBe(false);
+    expect('reasoningEfforts' in off.get('q35-loaded')!).toBe(false);
   });
 });
 
