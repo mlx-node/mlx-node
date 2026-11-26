@@ -78,7 +78,7 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(function Com
   const [uncontrolledValue, setUncontrolledValue] = useState(defaultValue);
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
-  const [activeIndex, setActiveIndex] = useState(-1);
+  const [activeValue, setActiveValue] = useState<string | null>(null);
   const selectedValue = controlledValue ?? uncontrolledValue;
   const selectedOption = options.find((option) => option.value === selectedValue);
 
@@ -105,6 +105,8 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(function Com
       [option.label, ...(option.keywords ?? [])].some((term) => term.toLocaleLowerCase().includes(normalizedQuery)),
     );
   }, [options, query]);
+  const activeIndex = filteredOptions.findIndex((option) => option.value === activeValue);
+  const setActiveIndex = (index: number) => setActiveValue(filteredOptions[index]?.value ?? null);
 
   const enabledIndices = filteredOptions.reduce<number[]>((indices, option, index) => {
     if (!option.disabled) indices.push(index);
@@ -194,7 +196,7 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(function Com
   const activeOption = activeIndex >= 0 ? filteredOptions[activeIndex] : undefined;
 
   return (
-    <div ref={rootRef} className={styles.field}>
+    <div ref={rootRef} className={styles.field} onBlur={(event) => { if (!rootRef.current?.contains(event.relatedTarget as Node | null)) { setOpen(false); setQuery(""); } }}>
       <label htmlFor={controlId}>{label}</label>
       <div className={[styles.control, open ? styles.open : "", disabled ? styles.disabled : "", className ?? ""].filter(Boolean).join(" ")}>
         <Search className={styles.searchIcon} size={16} strokeWidth={1.75} aria-hidden="true" />
@@ -253,6 +255,7 @@ export const Combobox = forwardRef<HTMLInputElement, ComboboxProps>(function Com
             animate={{ opacity: 1, y: 0, scale: 1, transition: reduceMotion ? { duration: motionTokens.duration.instant } : { ...motionTokens.spring.snappy, opacity: { duration: motionTokens.duration.fast, ease: [...motionTokens.ease.enter] } } }}
             exit={{ opacity: 0, ...(reduceMotion ? {} : { y: -4, scale: 0.98 }), transition: { duration: motionTokens.duration.instant, ease: [...motionTokens.ease.standard] } }}
             role="presentation"
+            onMouseDown={(event) => event.preventDefault()}
           >
             <AutoHeight reduceMotion={reduceMotion}>
             <div id={listboxId} className={styles.listbox} role="listbox" aria-label={`${label} options`}>

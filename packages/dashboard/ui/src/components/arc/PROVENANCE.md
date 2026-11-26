@@ -56,8 +56,8 @@ Every `.ts` / `.tsx` file that shipped with a first line `"use client";` has tha
 module-level directives): `lib/arc-provider.tsx`, `lib/use-copy-feedback.ts`, and the `.tsx` file of every item above
 except `arc-foundation` and `arc-motion-tokens`. No other file changed except the regex replacements below
 (this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`, or a plain
-list where the pattern matched four fixed key names) and the one
-`drawer/drawer.tsx` fix in the last rows of the table.
+list where the pattern matched four fixed key names), the `number-field/number-field.tsx` draft fix in the row for
+line 400, the `combobox/combobox.tsx` fixes and the one `drawer/drawer.tsx` fix in the last rows of the table.
 
 | File | Line (here) | Upstream | Here |
 |---|---|---|---|
@@ -77,9 +77,14 @@ list where the pattern matched four fixed key names) and the one
 | `number-field/number-field.tsx` | 138 | `return digits && /\d/.test(digits) && …` | `return digits && hasAsciiDigit(digits) && …` |
 | `number-field/number-field.tsx` | 287 | `….replace(symbols.decimal, ".").replace(/[^\d.-]/g, "");` | `keepDigitsAnd(….replace(symbols.decimal, "."), ".-");` |
 | `number-field/number-field.tsx` | 288 | `if (!/\d/.test(normalized)) return null;` | `if (!hasAsciiDigit(normalized)) return null;` |
-| `number-field/number-field.tsx` | 400 | ``const allowed = new RegExp(`[^0-9${escape(symbols.group)}${decimals \|\| maxFraction ? escape(symbols.decimal) : ""}${min < 0 ? "\\-" : ""}]`, "g");`` | ``const allowed = `${symbols.group}${decimals \|\| maxFraction ? symbols.decimal : ""}${min < 0 ? "-" : ""}`;`` |
+| `number-field/number-field.tsx` | 400 | ``const allowed = new RegExp(`[^0-9${escape(symbols.group)}${decimals \|\| maxFraction ? escape(symbols.decimal) : ""}${min < 0 ? "\\-" : ""}]`, "g");`` | ``const allowed = `${symbols.group}${symbols.decimal}-`;`` (the draft keeps the decimal point and the minus sign, see below) |
 | `number-field/number-field.tsx` | 401 | `const next = text.replace(allowed, "");` | `const next = keepDigitsAnd(text, allowed);` |
 | `number-field/number-field.tsx` | 468 | `if (/^(Arrow(Up\|Down)\|Page(Up\|Down))$/.test(event.key)) stopHold();` | `if (["ArrowUp", "ArrowDown", "PageUp", "PageDown"].includes(event.key)) stopHold();` |
+| `combobox/combobox.tsx` | 81 | `const [activeIndex, setActiveIndex] = useState(-1);` | `const [activeValue, setActiveValue] = useState<string \| null>(null);` |
+| `combobox/combobox.tsx` | 108 | — | `const activeIndex = filteredOptions.findIndex((option) => option.value === activeValue);` |
+| `combobox/combobox.tsx` | 109 | — | `const setActiveIndex = (index: number) => setActiveValue(filteredOptions[index]?.value ?? null);` |
+| `combobox/combobox.tsx` | 199 | `<div ref={rootRef} className={styles.field}>` | the same `div` with `onBlur` that closes the menu and clears the query when focus moves outside it |
+| `combobox/combobox.tsx` | 258 | — | `onMouseDown={(event) => event.preventDefault()}` on the popover |
 | `drawer/drawer.tsx` | 97 | — | the comment line above the `offset` value |
 | `drawer/drawer.tsx` | 98 | `const offset = useMotionValue<number \| string>(0);` (four lines higher, above `pan`) | ``const offset = useMotionValue<number \| string>(reduced ? 0 : `${sign * 100}%`);`` |
 
@@ -87,5 +92,17 @@ The drawer fix: the panel's motion value started at 0 while the entrance starts 
 frame into the value when the panel mounts, the jump read as a velocity of 100 % in 30 ms, and the entrance spring
 inherited it, so the first open of each drawer went about 30 % of the panel width past its resting edge (143 px on a
 480 px panel) and came back. Later opens were right because the exit leaves the value at `100%`.
+
+The number field fix: upstream lets the decimal point into the draft only when `step` or `formatOptions` has fraction
+digits, and the minus sign only when `min` is below 0. With whole steps from 11, typing "13.5" left the draft "135",
+which Enter clamped to the maximum, and "-16" left "16", which applied at once. The draft now keeps both characters,
+so the commit snaps "13.5" to 14 and clamps "-16" to the minimum.
+
+The combobox fixes: upstream keeps the highlighted option as an index, so when `options` changed under an open menu
+(a list that arrives while the menu is open) Enter picked whatever option then sat at that index. The highlight is now
+kept by value, and an option that left the list has none. Upstream also closed the menu only on a pointer press
+outside it, so Tab left the open list over the next control. The menu now closes when focus moves outside the field,
+and a press on the popover (its padding, or the list's scrollbar when scroll bars always show) no longer takes focus
+from the input, so that press does not close it and the arrow keys still work after it.
 
 All files compile under `ui/tsconfig.json` as shipped; no type fix was needed.

@@ -397,7 +397,7 @@ export function NumberField({ label, value, defaultValue = 0, onValueChange, min
     if (event.key === "Escape" && editing) { event.preventDefault(); captureShift(); setEditing(false); clearUnder(); selectNext.current = true; commitValue(editStart.current, "type"); }
   }
   function onChange(text: string) {
-    const allowed = `${symbols.group}${decimals || maxFraction ? symbols.decimal : ""}${min < 0 ? "-" : ""}`;
+    const allowed = `${symbols.group}${symbols.decimal}-`;
     const next = keepDigitsAnd(text, allowed);
     if (!editing) editStart.current = current;
     captureShift();

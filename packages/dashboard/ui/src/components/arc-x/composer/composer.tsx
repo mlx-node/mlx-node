@@ -20,6 +20,7 @@ import { slashToken } from '../../../lib/chat-input';
 import { CHAT, fill } from '../../../lib/chat-strings';
 import { formatNumber } from '../../../lib/format';
 import { hasNonWhitespace } from '../../../lib/text-scan';
+import { useFonts } from '../../../theme/fonts';
 import { Button } from '../../arc/button/button';
 import { CommandMenu, commandOrder, typedInFull, type CommandRow } from '../command-menu/command-menu';
 import { ContextPopover } from '../context-panel/context-popover';
@@ -190,6 +191,7 @@ export function Composer(props: ComposerProps): ReactElement {
   const fitWatch = useRef<ResizeObserver | null>(null);
   const ring = useRef<HTMLElement | null>(null);
   const end = useRef<HTMLDivElement | null>(null);
+  const { settings: fonts } = useFonts();
   const tooLong = props.value.length > max;
   const canSend = composerCanSend(props.value, props.phase, props.blocked, max);
   const queueable = composerCanQueue(props.value, props.phase, props.blocked, max);
@@ -298,7 +300,7 @@ export function Composer(props: ComposerProps): ReactElement {
     const cap = Number.parseFloat(getComputedStyle(node).maxHeight);
     if (Number.isFinite(cap) && height > cap) node.setAttribute('data-at-max', '');
     else node.removeAttribute('data-at-max');
-  }, [props.value]);
+  }, [props.value, fonts]);
 
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
