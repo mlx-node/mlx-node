@@ -250,6 +250,18 @@ describe('hostile input', () => {
     }
   });
 
+  it('emphasis nested past the nesting cap stays its source text; within the cap it nests', () => {
+    const deep = `${'*'.repeat(20_000)}x${'*'.repeat(20_000)}`;
+    const inline = chatMd()
+      .parse(deep, {})
+      .find((t) => t.type === 'inline')!;
+    expect(inline.children!.map((c) => [c.type, c.content.length])).toEqual([['text', deep.length]]);
+    const kept = chatMd()
+      .parse(`${'*'.repeat(60)}x${'*'.repeat(60)}`, {})
+      .find((t) => t.type === 'inline')!;
+    expect(kept.children!.filter((c) => c.type === 'strong_open')).toHaveLength(30);
+  });
+
   it('a table stops growing past its cell cap', () => {
     const table = parse(`|${'h|'.repeat(60)}\n|${'-|'.repeat(60)}\n${'a\n'.repeat(5_000)}`)[0] as ParsedNode & {
       rows: Array<{ cells: unknown[] }>;

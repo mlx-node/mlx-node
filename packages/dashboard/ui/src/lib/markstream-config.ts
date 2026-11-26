@@ -46,6 +46,27 @@ export function chatMarkdownIt(md: MarkdownIt): MarkdownIt {
   // The inline 'reference' rule is markstream's `[n]` mark: its tokens stop the parser from reusing settled blocks,
   // so it is off while an answer streams (see `chatCiteMarkdownIt`).
   md.inline.ruler.disable(['reference', 'math', 'ins', 'mark', 'sub', 'sup', 'footnote_ref', 'footnote_inline'], true);
+  // Emphasis pairs after markdown-it's nesting cap, and the tree builder recurses once per level (quadratic, then a
+  // stack overflow), so a run nested deeper than the cap stays its source text.
+  md.core.ruler.push('chat_depth_cap', (state) => {
+    const max = state.md.options.maxNesting ?? 100;
+    for (const token of state.tokens) {
+      if (token.type !== 'inline' || token.children === null) continue;
+      let depth = 0;
+      let deep = false;
+      for (const child of token.children) {
+        if (child.nesting === 1 && ++depth > max) {
+          deep = true;
+          break;
+        }
+        if (child.nesting === -1) depth--;
+      }
+      if (!deep) continue;
+      const text = new state.Token('text', '', 0);
+      text.content = token.content;
+      token.children = [text];
+    }
+  });
   return md;
 }
 
