@@ -131,6 +131,8 @@ export function forkRefusal(err: unknown): string {
 export interface ForkOpener {
   /** Work: the folder both conversations work in, said in the toast. */
   folder: string | null;
+  /** The page still shows the original: only then does the copy open by itself. */
+  here: () => boolean;
   open: (copyId: string) => void;
   back: () => void;
 }
@@ -249,7 +251,8 @@ export const historyActions = {
   /**
    * Fork: a copy of the whole conversation, or (`at`) up to and with the answer of the message at `at.entry` (`at.ts`:
    * its time, as the page holds it). A toast says "Forking…" and turns into "Forked. This is the copy." with Back to
-   * the original once the copy opens; a refusal turns it into an error and the page stays.
+   * the original once the copy opens; a page that left the original stays where it is, and the toast opens the copy.
+   * A refusal turns it into an error and the page stays.
    */
   async fork(conversationId: string, at: { entry: number; ts: number } | null, then: ForkOpener): Promise<void> {
     const id = toast.loading(CHAT.history.forking);
@@ -260,13 +263,24 @@ export const historyActions = {
       toast.update(id, { type: 'error', title: forkRefusal(err) });
       return;
     }
+    const where =
+      then.folder === null
+        ? {}
+        : { description: fill(CHAT.history.forkSameFolder, { folder: `${folderName(then.folder)}/` }) };
+    if (!then.here()) {
+      toast.update(id, {
+        type: 'success',
+        title: CHAT.history.forkedAway,
+        ...where,
+        action: { label: CHAT.history.forkOpen, onClick: () => then.open(copy.id) },
+      });
+      return;
+    }
     then.open(copy.id);
     toast.update(id, {
       type: 'success',
       title: CHAT.history.forked,
-      ...(then.folder === null
-        ? {}
-        : { description: fill(CHAT.history.forkSameFolder, { folder: `${folderName(then.folder)}/` }) }),
+      ...where,
       action: { label: CHAT.history.forkBack, onClick: () => then.back() },
     });
   },

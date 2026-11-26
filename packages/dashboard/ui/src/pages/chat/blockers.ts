@@ -253,6 +253,8 @@ export function sendFailure(
       );
     case 'conversation-busy':
       return { toast: e['conversation-busy'][0] };
+    case 'folder-busy':
+      return strip(e['folder-busy'], 'retry', 'warning');
     case 'slash-text':
       return strip(e['slash-text'], null);
     case 'keychain-unavailable':

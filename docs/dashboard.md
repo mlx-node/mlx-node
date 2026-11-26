@@ -1277,7 +1277,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   the text (Queue, tooltip "Runs once the conversation is free (Enter)"), there is no Stop and Esc stops nothing; with
   an empty box the button is a still ring named "Busy". The page opens the copy (cold: its first message
   loads it), focus goes to the box, and the live region says "Opened a fork of Fix the login test."; the toast turns
-  into "Forked. This is the copy." with "Back to the original" (Work adds "Both conversations work in app/."). A
+  into "Forked. This is the copy." with "Back to the original" (Work adds "Both conversations work in app/."). A page
+  that shows another conversation by then stays there: the toast reads "Forked. The copy is in the conversation list."
+  with Open. The palette's Delete asks about the conversation it was opened in and closes when the page shows another.
+  A
   refusal turns it into an error ("Could not fork the conversation.", the busy or blocker sentence, or the fork-point
   one) and the page stays. The copy starts in Ask with an empty queue and an empty permission log; the original gets
   no mark. `ConversationInfo.forkOf` (`{id, title}`, from the session detail's `parent` when `kind` is `fork`; `title:
@@ -1660,8 +1663,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   `refused` with git's text (`error: ` / `fatal: ` cut, a last "Aborting" dropped, at most 12 lines and 2 KB, hidden
   characters shown as `\u{…}`): a branch held by another worktree, an `index.lock`, a hook that failed. A switch past
   2 minutes gets SIGTERM, then SIGKILL 2 s later: `timeout`, "Git did not finish in 2 minutes and was stopped. Check
-  the folder in a terminal." Every reply carries the read after it. A prompt to an idle conversation during the switch
-  is not blocked.
+  the folder in a terminal." Every reply carries the read after it. While `git switch` runs, a Work create, a message
+  or a queued row in that work tree is refused with 409 `folder-busy` (the page says "Git is still changing the branch
+  of this folder. Try again when it is done."; a queued row holds the list), and a create that holds a folder there
+  refuses the switch the same way. On New, Send and Try again wait while the page's own switch runs.
 - **Rows.** Shell commands (the whole command, then its output), file reads, listings, searches and edits (the change
   as `-` / `+` lines) are rows in the thread (`ui/src/lib/work-tools.ts`); an input of another shape is a plain row.
   Hidden and bidi characters in a command or change show as `\u{…}`. A row whose input or output the transcript cut at
@@ -1760,7 +1765,8 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   compared as the disk does), at most 50 per folder. It never sends the agent's `reject-always`: that ends the turn
   on every match, and ACP has no way to list or remove it. The call is answered `reject-once` with
   `_meta.followup_message` ("I never allow commands that start with `git push` in this folder. Do not run it, …"), so
-  the answer goes on; a toast "Never allow git push in this folder" offers Undo. From then on the host checks the
+  the answer goes on; a toast "Never allow git push in this folder" offers Undo, which removes the rule of the
+  conversation it was saved in, also after the page moved to another. From then on the host checks the
   rules before the mode, in Ask, Auto and Bypass and for a helper's request, for every tool that runs a shell command
   (`run_terminal_command` and `monitor`, which runs its `command` in the background terminal; `shellCommand` in
   `permissions.ts`). A command with any simple command that starts with a rule's words is denied with no card and the
@@ -2143,7 +2149,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   (Sessions too) and announced when it arrives. Like a notice it never starts a turn: the agent stores the mode line
   before the prompt's chunk, and the reducer holds it until right after that prompt, so live and disk give one list.
   A `plan: true` message that ends with no mode line, sent while the agent was not in plan mode, makes the notice
-  `no-plan-mode` "This agent version has no plan mode." and turns the chip off; the next message clears it.
+  `no-plan-mode` "This agent version has no plan mode." and turns the chip off; the next message clears it. Until the
+  stream brings the conversation the page cannot know the agent's mode, so Send, Try again and Queue wait ("Loading the
+  conversation…") rather than send `plan: false`.
 - **Thinking** (the Thinking effort column of `ui/src/components/arc-x/model-picker/model-picker.tsx`, Chat and
   Work). The model menu's last column: the levels of the quantization in view, one row each ("Off · Low · Medium ·
   High" for the Qwen line, two rows for a model with two), with a check on the level a pick of that quantization keeps
@@ -3148,7 +3156,8 @@ class of bug is deleted rather than mitigated. What remains:
   daemon. The environment is built from nothing: `HOME`, `USER`, `LOGNAME`, `TMPDIR`, the merged `PATH`, `LC_ALL=C`,
   `GIT_TERMINAL_PROMPT=0`, and for reads `GIT_OPTIONAL_LOCKS=0`; no key and no inherited `GIT_*`. Reads (`rev-parse`,
   `symbolic-ref`, `for-each-ref`, `status --porcelain=v2 -z`) share one 5 s deadline. The only write is `git switch` to
-  a local branch the host itself just listed, on a clean work tree, with no running Work conversation in it; it runs
+  a local branch the host itself just listed, on a clean work tree, with no running Work conversation and no create in
+  it, and no Work turn starts there until it ends; it runs
   the folder's hooks and filters as a terminal `git switch` would, since the user asked for it. One chain per work
   tree: reads and switches never overlap.
 - **Work without a folder writes in one place.** The app makes folders only under `~/Portato` (the scratch root,

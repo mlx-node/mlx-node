@@ -1194,6 +1194,7 @@ export const CHAT = {
     'attachment-refused': ['These files could not be sent. Remove them and try again.', ''],
     'pictures-full': ['This chat has too many pictures to keep. Start a new chat to send more.', ''],
     'folder-not-made': ['The app could not make a folder in {root}. Choose a folder instead.', 'Choose folder…'],
+    'folder-busy': ['Git is still changing the branch of this folder. Try again when it is done.', 'Try again'],
     other: ['Could not send. Try again.', 'Try again'],
   },
 
@@ -1203,6 +1204,8 @@ export const CHAT = {
   listCountOne: '1 conversation',
   groups: ['Today', 'Yesterday', 'Previous 7 days', 'Previous 30 days'],
   listLoading: 'Loading conversations…',
+  /** Why Send waits while the open conversation's stream has not loaded: Work's plan mode is not known yet. */
+  threadLoading: 'Loading the conversation…',
   listEmptyChat: ['No chats yet', 'Your chats appear here.'],
   listEmptyWork: ['No Work conversations yet', 'They appear here, grouped by folder.'],
   listNoMatch: 'No conversation matches “{query}”.',
@@ -1673,6 +1676,8 @@ export const CHAT = {
     /** Why Fork (and the other ops) are off while a fork of the conversation runs. */
     forkRunning: 'A fork is already running.',
     forkOpen: 'Open',
+    /** The fork's toast when the page had left the original by the time the copy was made. */
+    forkedAway: 'Forked. The copy is in the conversation list.',
     /** The list row's tag after the title; it is read inside the row's name. */
     forkTag: 'Fork',
     forkedStatus: 'Opened a fork of {title}.',

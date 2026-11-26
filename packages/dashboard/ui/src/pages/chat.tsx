@@ -571,6 +571,9 @@ export default function Chat(): ReactElement {
   // and it stays live while an answer runs: it only sets what the next message carries.
   const storedPlan = useSyncExternalStore(subscribeDrafts, () => readPlan(place));
   const loadedHere = !isNew && conv !== null && conv.conversation.id === conversationId;
+  // Until the stream brings a Work conversation its plan mode is unknown: a message would carry `plan: false`, and that
+  // ends plan mode.
+  const modeUnknown = !isNew && !loadedHere && (mode === 'work' || rowOf(conversationId) === undefined);
   const planEntries = loadedHere ? conv.entries : null;
   const plan = useMemo(() => planChip(planEntries ?? [], storedPlan), [planEntries, storedPlan]);
   const togglePlan = useCallback(() => writePlan(place, { next: !plan.next, seen: plan.seen }), [place, plan]);
@@ -846,6 +849,7 @@ export default function Chat(): ReactElement {
     blocked = CHAT.folderTooLong;
   if (blocked === undefined && isNew && mode === 'work' && workGit.switching !== null) blocked = CHAT.branch.switching;
   if (blocked === undefined && cwdProblem !== undefined) blocked = CHAT.cwdProblems[cwdProblem];
+  if (blocked === undefined && modeUnknown) blocked = CHAT.threadLoading;
   if (blocked === undefined && slash.kind === 'unknown') blocked = CHAT.slash.unknown;
   if (blocked === undefined && appOff !== null) blocked = appOff;
   const readingHere = reading.get(place) ?? 0;
@@ -961,6 +965,7 @@ export default function Chat(): ReactElement {
       void historyActions
         .fork(from, entry === null || message === undefined ? null : { entry, ts: message.ts }, {
           folder: openFolder,
+          here: () => placeRef.current === from,
           open: (copy) => {
             forkOpened.current = copy;
             void navigate(chatUrl(copy));
@@ -1049,7 +1054,9 @@ export default function Chat(): ReactElement {
     if (modeBlocker(connected, host, mode) !== null) return;
     if (isNew && mode === 'work' && placeBlock(newPick) !== undefined) return;
     if (isNew && mode === 'work' && newFolder !== null && folderTooLong(newFolder)) return;
+    if (isNew && mode === 'work' && workGit.switching !== null) return;
     if (!isNew && cwdProblem !== undefined) return;
+    if (modeUnknown) return;
     const problem = attachProblem({
       mode,
       seesImages,
@@ -1216,7 +1223,7 @@ export default function Chat(): ReactElement {
     }
     if (typed.kind === 'unknown') return;
     if (phase !== 'starting' && phase !== 'running' && phase !== 'op') return;
-    if (modeBlocker(connected, host, mode) !== null || cwdProblem !== undefined) return;
+    if (modeBlocker(connected, host, mode) !== null || cwdProblem !== undefined || modeUnknown) return;
     const whenBusy = now && steerOpen && files.length === 0 && !isSlashText(text) ? 'now' : 'queue';
     if (whenBusy === 'queue' && queued.count >= QUEUE_MAX) return;
     const reading = from === 'composer' ? readingHere : 0;
@@ -1780,7 +1787,10 @@ export default function Chat(): ReactElement {
   );
 
   const [renameTarget, setRenameTarget] = useState<RenameTarget | null>(null);
+  // The palette's Delete asks about the conversation it was opened in, and closes once the page shows another.
+  const [deleteTarget, setDeleteTarget] = useState<Parameters<typeof deleteContent>[0] | null>(null);
   const [deleteOpen, setDeleteOpen] = useState(false);
+  if (deleteOpen && (isNew || deleteTarget?.id !== conversationId)) setDeleteOpen(false);
   const busyOf = (id: string): boolean =>
     host?.active.some((entry) => entry.conversationId === id && (entry.busy || entry.waiting)) === true ||
     (id === conversationId && busy);
@@ -1925,6 +1935,13 @@ export default function Chat(): ReactElement {
           icon: glyph(Trash2),
           run: () => {
             focusBefore.current = document.activeElement;
+            setDeleteTarget({
+              id,
+              title,
+              mode,
+              folder: conv?.conversation.cwd ?? null,
+              noFolder: conv?.conversation.noFolder === true,
+            });
             setDeleteOpen(true);
           },
         });
@@ -2234,12 +2251,11 @@ export default function Chat(): ReactElement {
     () => ({ drafts: messageDrafts, pending: pendingMessages, onSend: messageSubagent }),
     [messageDrafts, pendingMessages, messageSubagent],
   );
-  /** Removes a never-allow rule of the open conversation's folder; false when it was not removed (said in a toast). */
+  /** Removes a never-allow rule of a Work conversation's folder; false when it was not removed (said in a toast). */
   const removeRule = useCallback(
-    async (ruleId: string): Promise<boolean> => {
-      if (conversationId === null) return false;
+    async (conversation: string, ruleId: string): Promise<boolean> => {
       try {
-        await mutate('DELETE', `${conversationPath(conversationId)}/never/${encodeURIComponent(ruleId)}`);
+        await mutate('DELETE', `${conversationPath(conversation)}/never/${encodeURIComponent(ruleId)}`);
       } catch (err) {
         if (!(err instanceof DashboardApiError && err.code === 'E_NOT_FOUND')) {
           toast.error(CHAT.never.removeFailed);
@@ -2249,21 +2265,24 @@ export default function Chat(): ReactElement {
       announce(CHAT.status.neverRemoved);
       return true;
     },
-    [conversationId, announce],
+    [announce],
   );
-  const undoRuleRef = useRef<(toastId: string, ruleId: string, words: string) => void>(() => undefined);
-  undoRuleRef.current = (toastId, ruleId, words) => {
-    toast.update(toastId, { type: 'loading', title: fill(CHAT.never.toast, { words }), action: undefined });
-    void removeRule(ruleId).then((ok) => {
-      if (ok) toast.update(toastId, { type: 'success', title: CHAT.never.undone, action: undefined });
-      else toast.dismiss(toastId);
-    });
-  };
-  const removeThreadRule = useCallback(
-    async (ruleId: string): Promise<void> => {
-      if (!(await removeRule(ruleId))) throw new Error('not removed');
+  /** The saved toast's Undo: the rule of the conversation it was saved in, whichever the page shows now. */
+  const undoRule = useCallback(
+    (toastId: string, conversation: string, ruleId: string, words: string): void => {
+      toast.update(toastId, { type: 'loading', title: fill(CHAT.never.toast, { words }), action: undefined });
+      void removeRule(conversation, ruleId).then((ok) => {
+        if (ok) toast.update(toastId, { type: 'success', title: CHAT.never.undone, action: undefined });
+        else toast.dismiss(toastId);
+      });
     },
     [removeRule],
+  );
+  const removeThreadRule = useCallback(
+    async (ruleId: string): Promise<void> => {
+      if (conversationId === null || !(await removeRule(conversationId, ruleId))) throw new Error('not removed');
+    },
+    [conversationId, removeRule],
   );
   /** Calls the user denied with "Never allow" on their card: their rule mark is not said again. */
   const ownNever = useRef(new Set<string>());
@@ -2287,7 +2306,7 @@ export default function Chat(): ReactElement {
             toast.success(fill(CHAT.never.toast, { words }), {
               action: {
                 label: CHAT.never.undo,
-                onClick: (toastId) => undoRuleRef.current(toastId, never.ruleId, words),
+                onClick: (toastId) => undoRule(toastId, conversationId, never.ruleId, words),
               },
             });
           } else {
@@ -2308,7 +2327,7 @@ export default function Chat(): ReactElement {
         throw err;
       }
     },
-    [conversationId, announce],
+    [conversationId, announce, undoRule],
   );
   // The permission mode of the open Work conversation or of the New Work screen's draft: the stream decides what is
   // shown, never this page. While the first message is on its way the chip keeps the mode it showed at Send.
@@ -2388,7 +2407,12 @@ export default function Chat(): ReactElement {
     () =>
       neverId === null || neverFolder === null
         ? undefined
-        : { count: neverCount, folder: neverFolder, load: loadRules, remove: removeRule },
+        : {
+            count: neverCount,
+            folder: neverFolder,
+            load: loadRules,
+            remove: (ruleId) => removeRule(neverId, ruleId),
+          },
     [neverId, neverFolder, neverCount, loadRules, removeRule],
   );
   const [permissionAsked, setPermissionAsked] = useState<{ id: string; target: 'auto' | 'bypass' } | null>(null);
@@ -3448,8 +3472,14 @@ export default function Chat(): ReactElement {
           onSet={setPermissionMode}
         />
       ) : null}
-      {removeContent !== null ? (
-        <ConfirmDialog {...removeContent} open={deleteOpen} onOpenChange={setDeleteOpen} returnFocus={returnFocus} />
+      {deleteTarget !== null ? (
+        <ConfirmDialog
+          key={deleteTarget.id}
+          {...deleteContent(deleteTarget, onDeleted)}
+          open={deleteOpen}
+          onOpenChange={setDeleteOpen}
+          returnFocus={returnFocus}
+        />
       ) : null}
       {paletteStop !== null ? (
         <ConfirmDialog

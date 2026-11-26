@@ -608,20 +608,29 @@ describe.runIf(POSIX)('deadlines (fake git)', () => {
 });
 
 describe.runIf(POSIX)('the busy guard (fake agent, fake git)', () => {
-  async function startWork(): Promise<{ top: string; fake: FakeGit }> {
+  /** `sleep`: git subcommands that hang until their `sleep` child is killed; `newMs`: how long `session/new` waits. */
+  async function startWork(
+    options: { sleep?: string[]; newMs?: number } = {},
+  ): Promise<{ top: string; fake: FakeGit }> {
     engine = await startFakeEngine();
     const scenario = readScenario('work-plan');
     scenario.prompts = [
       { match: 'hold', steps: [{ sleepMs: 60_000 }, { end: { stopReason: 'end_turn' } }] },
       { match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] },
     ];
+    scenario.recordTo = join(base, 'agent.jsonl');
+    if (options.newMs !== undefined) scenario.faults = { delayMs: { 'session/new': options.newMs } };
     const scenarioPath = join(base, 'scenario.json');
     writeFileSync(scenarioPath, JSON.stringify(scenario));
     const top = join(home, 'code', 'app');
     mkdirSync(join(top, '.git'), { recursive: true });
     mkdirSync(join(top, 'sub'));
     mkdirSync(join(home, 'code', 'app-wt'));
-    const fake = fakeGit({ top, refs: `refs/heads/main\x001700000000\x00\nrefs/heads/next\x001700000100\x00\n` });
+    const fake = fakeGit({
+      top,
+      refs: `refs/heads/main\x001700000000\x00\nrefs/heads/next\x001700000100\x00\n`,
+      ...(options.sleep === undefined ? {} : { sleep: options.sleep }),
+    });
     const url = engine.url;
     start({
       agentCommand: { command: process.execPath, args: [FAKE_AGENT, scenarioPath] },
@@ -676,5 +685,42 @@ describe.runIf(POSIX)('the busy guard (fake agent, fake git)', () => {
     expect(reply.ok && reply.body).toMatchObject({ outcome: 'switched' });
     expect(fake.calls().filter((c) => subcommand(c) === 'switch').length).toBe(1);
     await call('POST', `/api/chat/conversations/${sibling}/cancel`);
+  }, 60_000);
+
+  /** How many requests of `method` the agent got. */
+  function received(method: string): number {
+    const file = join(base, 'agent.jsonl');
+    if (!existsSync(file)) return 0;
+    return readFileSync(file, 'utf8')
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line) => JSON.parse(line) as { kind: string; msg?: { method?: string } })
+      .filter((entry) => entry.kind === 'in' && entry.msg?.method === method).length;
+  }
+
+  // Mutations: the create's check of a running switch removed (the session is made); the message's check removed (the
+  // turn starts); a create's folder hold not counted by the switch (git switches while the agent opens the folder).
+  it('while git switches, a create or a message in the work tree is 409 folder-busy; a create holds a switch off', async () => {
+    const { top, fake } = await startWork({ sleep: ['switch'], newMs: 1_500 });
+    const busyReply = { code: 'E_CONFLICT', reason: 'folder-busy' };
+    const creating = working(top, 'hi');
+    await until(() => received('session/new') === 1, 10_000);
+    expect(failure(await switchTo(top, 'next'))).toEqual(busyReply);
+    expect(fake.calls().some((c) => subcommand(c) === 'switch')).toBe(false);
+    const idle = await creating;
+    await busyIs(top, 0);
+
+    const switching = switchTo(top, 'next');
+    await until(() => fake.calls().some((c) => subcommand(c) === 'switch'), 10_000);
+    const create = { mode: 'work', text: 'hi', cwd: join(top, 'sub') };
+    expect(failure(await call('POST', '/api/chat/conversations', create))).toEqual(busyReply);
+    expect(failure(await call('POST', `/api/chat/conversations/${idle}/prompt`, { text: 'again' }))).toEqual(busyReply);
+    expect([received('session/new'), received('session/prompt')]).toEqual([1, 1]);
+
+    for (const pid of fake.sleepers()) process.kill(pid);
+    const ended = await switching;
+    expect(ended.ok && ended.body).toMatchObject({ outcome: 'refused' });
+    expect((await call('POST', `/api/chat/conversations/${idle}/prompt`, { text: 'again' })).ok).toBe(true);
+    expect((await call('POST', '/api/chat/conversations', create)).ok).toBe(true);
   }, 60_000);
 });

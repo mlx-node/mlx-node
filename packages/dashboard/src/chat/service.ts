@@ -130,6 +130,7 @@ import {
   switchBranch,
   type GitDeps,
   type GitRead,
+  type SwitchRun,
 } from './work-git.js';
 import { makeScratch, removeIfEmpty, ScratchFolders, scratchRoot, stampName } from './work-scratch.js';
 import { readWorkSettingsSync, type WorkSettings, writeWorkSettings } from './work-settings.js';
@@ -450,6 +451,8 @@ export class ChatService {
   private gitFinding: Promise<string | null> | null = null;
   /** One chain of git commands per work tree (`repoKey`, folded): reads and switches never overlap. */
   private readonly gitChains = new Map<string, Promise<unknown>>();
+  /** The work tree tops where `git switch` runs now: no Work conversation starts or sends in them. */
+  private readonly switching: string[] = [];
 
   constructor(options: ChatServiceOptions) {
     this.opts = options;
@@ -737,6 +740,7 @@ export class ChatService {
     onSlow: (settled: Promise<void>) => void,
   ): Promise<{ conversation: ConversationInfo; turnId: string }> {
     const host = this.hosts[mode];
+    if (cwd !== undefined) this.assertNotSwitching(cwd);
     const created = host.createSession(cwd === undefined ? { modelId } : { modelId, cwd });
     let timer: ReturnType<typeof setTimeout> | null = null;
     const budget = new Promise<'slow'>((resolve) => {
@@ -930,28 +934,34 @@ export class ChatService {
 
   /**
    * Switches the folder's work tree to a local branch the read lists, in the work tree's chain: the folder rule, then
-   * no working Work conversation in it, then the list and the change count again; a folder with uncommitted changes,
-   * or whose count is unknown, never switches. Git's refusal is an outcome, not an error.
+   * no working Work conversation and no create in it, then the list and the change count again; a folder with
+   * uncommitted changes, or whose count is unknown, never switches. Git's refusal is an outcome, not an error.
    */
   async switchWorkBranch(input: { cwd: string; branch: string }): Promise<WorkSwitchReply> {
     const folder = await checkWorkFolder(input.cwd, this.folderRules);
     if (!folder.ok) throw cwdError(folder.problem);
     const key = await repoKey(folder.path);
     return this.inGitChain(key, async () => {
-      if (overlapCount(key, this.hosts.work.workingFolders()) > 0) throw workGitError('folder-busy');
+      if (overlapCount(key, this.busyFolders()) > 0) throw workGitError('folder-busy');
       const env = await this.gitEnv();
       const bin = await this.gitBinary(env);
       if (bin === null) throw workGitError('git-unavailable');
       const read = await readRepo(bin, folder.path, env, this.gitDeps);
       if (read.kind !== 'repo') throw workGitError('git-unavailable');
-      if (overlapCount(read.top, this.hosts.work.workingFolders()) > 0) throw workGitError('folder-busy');
+      if (overlapCount(read.top, this.busyFolders()) > 0) throw workGitError('folder-busy');
       if (!read.refs.some((ref) => ref.name === input.branch)) throw workGitError('branch-unknown');
       if ('branch' in read.head && read.head.branch === input.branch) {
         return { outcome: 'switched', git: this.gitView(read) };
       }
       if (read.changes === null) throw workGitError('status-unknown');
       if (read.changes > 0) throw workGitError('dirty');
-      const run = await switchBranch(bin, read.top, input.branch, env, this.gitDeps);
+      this.switching.push(read.top);
+      let run: SwitchRun;
+      try {
+        run = await switchBranch(bin, read.top, input.branch, env, this.gitDeps);
+      } finally {
+        this.switching.splice(this.switching.indexOf(read.top), 1);
+      }
       const after = this.gitView(await readRepo(bin, folder.path, env, this.gitDeps));
       return { ...run, git: after };
     });
@@ -970,6 +980,19 @@ export class ChatService {
     const found = await finding;
     if (found !== null) this.gitBin = found;
     return found;
+  }
+
+  /**
+   * The folders a branch switch must leave alone: each working Work conversation's, and each a create or a fork holds
+   * (the agent opens it before its session counts as working).
+   */
+  private busyFolders(): string[] {
+    return [...this.hosts.work.workingFolders(), ...this.opening.keys()];
+  }
+
+  /** Work: refused while `git switch` runs in a work tree that holds `cwd` or lies in it. */
+  private assertNotSwitching(cwd: string): void {
+    if (overlapCount(cwd, this.switching) > 0) throw workGitError('folder-busy');
   }
 
   private inGitChain<T>(folder: string, run: () => Promise<T>): Promise<T> {
@@ -1077,8 +1100,8 @@ export class ChatService {
 
   /**
    * What a message must pass before its turn starts, sent by the user or by the queue: pictures, the Work folder or
-   * the Chat skill, the stored transcript, the picture room, a fresh read of the engine. `busyFails`: a busy
-   * conversation is refused before the transcript is read. Returns the Work folder.
+   * the Chat skill, the stored transcript, the picture room, a fresh read of the engine, last no branch switch in the
+   * Work folder. `busyFails`: a busy conversation is refused before the transcript is read. Returns the Work folder.
    */
   private async sendChecks(
     conversation: Conversation,
@@ -1101,6 +1124,7 @@ export class ChatService {
     checkPictureRoom(conversation, attachments, this.opts.maxPicturesBase64 ?? CHAT_PICTURES_MAX_BASE64);
     if (busyFails && host.isBusy(conversation.info.id)) throw chatRouteError('conversation-busy');
     await this.endpoint();
+    if (cwd !== undefined) this.assertNotSwitching(cwd);
     return cwd;
   }
 
