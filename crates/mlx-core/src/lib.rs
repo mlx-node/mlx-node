@@ -17,6 +17,8 @@ pub use accelerator::{RuntimeCapabilities, get_runtime_capabilities};
 pub mod array;
 pub mod audio;
 pub mod autograd;
+pub mod base64;
+pub use base64::decode_base64_strict;
 #[cfg(test)]
 mod benchmarks;
 pub mod cache_limit;

@@ -925,6 +925,7 @@ module.exports.createQianfanOcrConfig = nativeBinding.createQianfanOcrConfig;
 module.exports.createRandomQwen35Checkpoint = nativeBinding.createRandomQwen35Checkpoint;
 module.exports.createRandomQwen35MoeCheckpoint = nativeBinding.createRandomQwen35MoeCheckpoint;
 module.exports.createRandomQwen3Checkpoint = nativeBinding.createRandomQwen3Checkpoint;
+module.exports.decodeBase64Strict = nativeBinding.decodeBase64Strict;
 module.exports.documentToXlsx = nativeBinding.documentToXlsx;
 module.exports.DType = nativeBinding.DType;
 module.exports.ElementType = nativeBinding.ElementType;

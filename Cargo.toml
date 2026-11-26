@@ -38,6 +38,7 @@ rust_xlsxwriter = "0.102.0"
 image = { version = "0.25.10", default-features = false, features = ["gif", "jpeg", "png", "webp"] }
 zip = { version = "9.0", default-features = false, features = ["deflate"] }
 base64 = "0.22"
+base64-simd = "0.8.0"
 bigdecimal = "0.4.11"
 fancy-regex = "0.20.2"
 llguidance = { version = "1.9.1", default-features = false, features = ["lark", "rayon", "jsonschema_validation"] }

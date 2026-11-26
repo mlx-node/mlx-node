@@ -4025,6 +4025,17 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
 
+/**
+ * Strictly decode base64 using SIMD acceleration into a plain, tightly sized
+ * `Uint8Array` (exported to JS as `decodeBase64Strict`).
+ *
+ * Accepts ASCII whitespace (space, tab, LF, CR), unpadded or properly padded
+ * standard base64, and URL-safe base64. Rejects empty input, form feed (0x0c),
+ * vertical tab (0x0b), mixed alphabets, malformed padding, invalid characters,
+ * and non-canonical trailing bits per RFC 4648 §3.5.
+ */
+export declare function decodeBase64Strict(encoded: string, errorMessage?: string | undefined | null): Uint8Array;
+
 export interface DecodeBatchOccupancyBucket {
   occupancy: number;
   steps: number;
