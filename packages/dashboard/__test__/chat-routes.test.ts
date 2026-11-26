@@ -699,7 +699,7 @@ describe('Chat routes — Work', () => {
     });
   }, 30_000);
 
-  // Mutation: the worker without the scratch root → the list row of a No folder conversation is not marked.
+  // Mutation: the worker without the record file → the list row of a No folder conversation is not marked.
   it('a create with no folder runs in a new folder of ~/Portato, and the worker lists it as No folder', async () => {
     startWork('work-plan');
     const response = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'plan', noFolder: true });

@@ -1,6 +1,6 @@
 /** The Work list names every session of the Work index, however many terminal sessions are newer. */
 
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -9,6 +9,7 @@ import { describe, expect, it } from 'vite-plus/test';
 import type { SessionListQuery, SessionListResponse, SessionRow } from '../src/agent-sessions/types.js';
 import type { WorkerApiContext } from '../src/api/context.js';
 import { handleChatConversations } from '../src/api/handlers/chat.js';
+import { ScratchFolders } from '../src/chat/work-scratch.js';
 
 function row(id: string): SessionRow {
   return {
@@ -97,46 +98,52 @@ describe('GET /api/chat/conversations: forks', () => {
 describe('GET /api/chat/conversations: Work without a folder', () => {
   const req = { method: 'GET', path: '', params: {}, body: null, query: new URLSearchParams('mode=work') };
 
-  // Mutation: a text prefix test → the root itself, a deeper folder and a look-alike sibling read as No folder.
-  it('marks a row only when its folder sits in the real scratch root; a root behind a link counts', async () => {
+  // Mutation: the parent folder read in place of the record → a folder picked in ~/Portato reads as No folder; the
+  // record read by path alone → a new folder at a recorded path does too.
+  it('marks a row only when its folder has a record and is still the folder recorded', async () => {
     const base = mkdtempSync(join(tmpdir(), 'mlx-work-list-'));
     try {
-      const disk = join(base, 'disk', 'Portato');
-      mkdirSync(disk, { recursive: true });
-      mkdirSync(join(base, 'home'));
       const root = join(base, 'home', 'Portato');
-      symlinkSync(disk, root);
-      const real = realpathSync(disk);
+      const folder = (name: string): string => {
+        const path = join(root, name);
+        mkdirSync(path, { recursive: true });
+        return realpathSync(path);
+      };
+      const own = folder('2026-11-26-2057');
+      const replaced = folder('2026-11-26-2058');
+      const picked = folder('my-project');
+      const file = join(base, 'chat', 'scratch-folders.json');
+      const records = new ScratchFolders(file);
+      await records.add(own);
+      await records.add(replaced);
+      renameSync(replaced, `${replaced}-old`);
+      mkdirSync(replaced);
       const cwds: Array<[string, string]> = [
-        ['own', join(real, '2026-11-26-2057')],
-        ['root', real],
-        ['deeper', join(real, '2026-11-26-2057', 'src')],
-        ['sibling', `${real}-old/2026-11-26-2057`],
-        ['written', join(root, '2026-11-26-2058')],
-        ['picked', '/Users/me/code'],
+        ['own', own],
+        ['replaced', replaced],
+        ['picked', picked],
+        ['elsewhere', '/Users/me/code'],
       ];
       const sessions = cwds.map(([id, cwd]) => ({ ...row(id), cwd }));
-      const ctx = (scratchRoot: string) =>
+      const ctx = (scratchFolders: string) =>
         ({
           chatIndex: () => ({ version: 1, work: sessions.map((s, n) => ({ id: s.id, createdAt: n })) }),
           agentSessions: { list: (): SessionListResponse => ({ sessions, total: sessions.length, cwds: [] }) },
-          scratchRoot,
+          scratchFolders,
         }) as unknown as WorkerApiContext;
-      const marks = async (scratchRoot: string): Promise<Array<[string, unknown]>> => {
-        const body = (await handleChatConversations(ctx(scratchRoot), req)) as {
+      const marks = async (scratchFolders: string): Promise<Array<[string, unknown]>> => {
+        const body = (await handleChatConversations(ctx(scratchFolders), req)) as {
           conversations: Array<{ id: string; noFolder?: true }>;
         };
         return body.conversations.map((c) => [c.id, c.noFolder]);
       };
-      expect(await marks(root)).toEqual([
+      expect(await marks(file)).toEqual([
         ['own', true],
-        ['root', undefined],
-        ['deeper', undefined],
-        ['sibling', undefined],
-        ['written', undefined],
+        ['replaced', undefined],
         ['picked', undefined],
+        ['elsewhere', undefined],
       ]);
-      expect((await marks(join(base, 'home', 'missing'))).every(([, mark]) => mark === undefined)).toBe(true);
+      expect((await marks(join(base, 'missing.json'))).every(([, mark]) => mark === undefined)).toBe(true);
     } finally {
       rmSync(base, { recursive: true, force: true });
     }

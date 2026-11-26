@@ -1,18 +1,9 @@
 /**
- * Work without a folder: the scratch folders under `~/Portato` (made new per conversation, removed only when empty)
- * and the route fields that ask for one (`noFolder`, never beside `cwd`).
+ * Work without a folder: the scratch folders under `~/Portato` (made new per conversation, recorded, removed only when
+ * empty) and the route fields that ask for one (`noFolder`, never beside `cwd`).
  */
 
-import {
-  existsSync,
-  mkdirSync,
-  mkdtempSync,
-  realpathSync,
-  rmSync,
-  statSync,
-  symlinkSync,
-  writeFileSync,
-} from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -21,10 +12,11 @@ import { afterEach, describe, expect, it } from 'vite-plus/test';
 import { ApiError } from '../src/api/errors.js';
 import { createConversationInput, draftPermissionModeInput, workHooksQuery } from '../src/chat/route-input.js';
 import {
-  isScratch,
+  isOwned,
   makeScratch,
-  realScratchRoot,
+  readScratchRecordsSync,
   removeIfEmpty,
+  ScratchFolders,
   scratchRoot,
   stampName,
 } from '../src/chat/work-scratch.js';
@@ -99,23 +91,47 @@ describe('the scratch folders', () => {
     expect(existsSync(join(root, STAMP))).toBe(false);
   });
 
-  // Mutation: a text prefix test → a deeper folder or the root itself reads as a No folder folder.
-  it('marks a child of the real root only; a root behind a link counts by its real path', async () => {
+  // Mutations: the record kept in memory only (a new reader does not own it); the inode left out of the match (a new
+  // folder at the path is owned); the drop not written (the next reader owns it again).
+  it('a record names a folder the app made: it survives a new read, a new folder at its path is not owned', async () => {
     const h = home();
-    const elsewhere = join(base, 'disk', 'Portato');
-    mkdirSync(elsewhere, { recursive: true });
-    symlinkSync(elsewhere, scratchRoot(h));
-    const made = await makeScratch(scratchRoot(h), AT);
-    const real = realScratchRoot(scratchRoot(h));
-    expect(real).toBe(realpathSync(elsewhere));
-    expect(made).toBe(join(real!, STAMP));
-    expect(isScratch(made!, real)).toBe(true);
-    expect(isScratch(real!, real)).toBe(false);
-    expect(isScratch(join(made!, 'sub'), real)).toBe(false);
-    expect(isScratch(`${real!}-other/${STAMP}`, real)).toBe(false);
-    expect(isScratch(join(scratchRoot(h), STAMP), real)).toBe(false);
-    expect(isScratch(made!, null)).toBe(false);
-    expect(realScratchRoot(join(h, 'missing'))).toBeNull();
+    const file = join(base, 'chat', 'scratch-folders.json');
+    const made = (await makeScratch(scratchRoot(h), AT))!;
+    const kept = (await makeScratch(scratchRoot(h), AT))!;
+    const folders = new ScratchFolders(file);
+    await folders.add(made);
+    await folders.add(kept);
+    expect(statSync(file).mode & 0o777).toBe(0o600);
+    expect([folders.owns(made), new ScratchFolders(file).owns(made)]).toEqual([true, true]);
+    const records = readScratchRecordsSync(file);
+    const id = statSync(made, { bigint: true });
+    expect(records.get(made)).toEqual({ path: made, dev: String(id.dev), ino: String(id.ino) });
+    const picked = join(realpathSync(scratchRoot(h)), 'my-project');
+    mkdirSync(picked);
+    expect(isOwned(picked, records)).toBe(false);
+    renameSync(kept, `${kept}-moved`);
+    mkdirSync(kept);
+    expect([isOwned(kept, records), folders.owns(kept)]).toEqual([false, false]);
+    await folders.drop(made);
+    expect([...readScratchRecordsSync(file).keys()]).toEqual([kept]);
+    expect(new ScratchFolders(file).owns(made)).toBe(false);
+  });
+
+  // Mutation: a failed write left in memory → a folder the app removed reads as its own.
+  it('a record that cannot be written is not kept; a broken file has no records', async () => {
+    const h = home();
+    const held = join(base, 'held');
+    writeFileSync(held, 'x');
+    const made = (await makeScratch(scratchRoot(h), AT))!;
+    const folders = new ScratchFolders(join(held, 'scratch-folders.json'));
+    await expect(folders.add(made)).rejects.toThrow();
+    expect(folders.owns(made)).toBe(false);
+    const broken = join(base, 'broken.json');
+    writeFileSync(broken, '{"version":1,"folders":[{"path":5}]');
+    expect(readScratchRecordsSync(broken).size).toBe(0);
+    writeFileSync(broken, JSON.stringify({ version: 1, folders: [{ path: made, dev: '1' }, null] }));
+    expect(readScratchRecordsSync(broken).size).toBe(0);
+    expect(existsSync(made)).toBe(true);
   });
 
   // Mutation: a recursive remove → the user's file goes with the folder.

@@ -41,7 +41,7 @@ import {
 import type { ChatService } from '../../chat/service.js';
 import { agentTitle } from '../../chat/titles.js';
 import type { ChatMode, ConversationRow } from '../../chat/types.js';
-import { isScratch, realScratchRoot } from '../../chat/work-scratch.js';
+import { isOwned, readScratchRecordsSync, type ScratchRecord } from '../../chat/work-scratch.js';
 import type { ApiRequest, MainApiContext, WorkerApiContext } from '../context.js';
 import { requireBody } from '../context.js';
 import { ApiError } from '../errors.js';
@@ -58,20 +58,20 @@ function epochOf(iso: string): number {
 
 /**
  * A list row. `listed`: the titles of the rows of this list, by id; a fork's origin not among them reads as gone (a
- * fork's origin is a conversation of the same list). `scratch`: the real scratch root, null when it does not exist.
+ * fork's origin is a conversation of the same list). `scratch`: the folders Work without a folder made, by path.
  */
 function conversationRow(
   row: SessionRow,
   mode: ChatMode,
   listed: ReadonlyMap<string, string>,
-  scratch: string | null,
+  scratch: ReadonlyMap<string, ScratchRecord>,
 ): ConversationRow {
   return {
     id: row.id,
     mode,
     title: agentTitle(row.title),
     cwd: mode === 'work' ? row.cwd : null,
-    ...(mode === 'work' && isScratch(row.cwd, scratch) ? { noFolder: true as const } : {}),
+    ...(mode === 'work' && isOwned(row.cwd, scratch) ? { noFolder: true as const } : {}),
     modelId: row.model ?? '',
     createdAt: epochOf(row.createdAt),
     updatedAt: epochOf(row.lastActiveAt),
@@ -84,7 +84,11 @@ function conversationRow(
   };
 }
 
-function rowsOf(rows: readonly SessionRow[], mode: ChatMode, scratch: string | null = null): ConversationRow[] {
+function rowsOf(
+  rows: readonly SessionRow[],
+  mode: ChatMode,
+  scratch: ReadonlyMap<string, ScratchRecord> = new Map(),
+): ConversationRow[] {
   const listed = new Map(rows.map((row) => [row.id, agentTitle(row.title)]));
   return rows.map((row) => conversationRow(row, mode, listed, scratch));
 }
@@ -105,7 +109,7 @@ export function handleChatConversations(ctx: WorkerApiContext, req: ApiRequest):
       for (const row of page.sessions) if (work.has(row.id)) rows.push(row);
       if (offset + MAX_LIST_LIMIT >= page.total) break;
     }
-    return { conversations: rowsOf(rows.slice(0, MAX_LIST_LIMIT), 'work', realScratchRoot(ctx.scratchRoot)) };
+    return { conversations: rowsOf(rows.slice(0, MAX_LIST_LIMIT), 'work', readScratchRecordsSync(ctx.scratchFolders)) };
   });
 }
 

@@ -527,7 +527,7 @@ describe('dashboard runtime — worker death', () => {
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
-      scratchRoot: join(base, 'home', 'Portato'),
+      scratchFolders: join(base, 'chat', 'scratch-folders.json'),
     });
 
     try {
@@ -587,7 +587,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
-      scratchRoot: join(base, 'home', 'Portato'),
+      scratchFolders: join(base, 'chat', 'scratch-folders.json'),
     });
   }
 
@@ -680,7 +680,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
-      scratchRoot: join(base, 'home', 'Portato'),
+      scratchFolders: join(base, 'chat', 'scratch-folders.json'),
     });
 
     try {
@@ -765,7 +765,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
-      scratchRoot: join(base, 'home', 'Portato'),
+      scratchFolders: join(base, 'chat', 'scratch-folders.json'),
     });
     try {
       const controller = new AbortController();

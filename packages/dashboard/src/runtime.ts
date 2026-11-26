@@ -42,7 +42,6 @@ import { ChatService, webServerScript, type AgentResolution } from './chat/servi
 import { readPathEnv } from './chat/skills/cli-check.js';
 import type { AppEnd, ChatHostEvent, ConversationEvent } from './chat/types.js';
 import type { GitDeps } from './chat/work-git.js';
-import { scratchRoot } from './chat/work-scratch.js';
 import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
@@ -338,7 +337,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     agentHome,
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
-    scratchRoot: scratchRoot(chatOpts.homeDir ?? homedir()),
+    scratchFolders: paths.scratchFolders,
   };
   const worker = opts.inProcessWorker
     ? startInProcessDbWorker(workerBoot)

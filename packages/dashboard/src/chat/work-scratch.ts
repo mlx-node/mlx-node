@@ -1,12 +1,16 @@
 /**
  * Work without a folder: each such conversation gets a new empty folder of its own under the scratch root
- * (`~/Portato`), named by the local minute of its first send. The app makes these folders and removes one only when
- * it is empty (`rmdir`, never recursive): it never deletes a file in them.
+ * (`~/Portato`), named by the local minute of its first send. The app records each folder it makes
+ * (`scratch-folders.json`: real path, device and inode) and removes one only when it is empty (`rmdir`, never
+ * recursive): it never deletes a file in them. A folder with no record, or a new folder at a recorded path, is not the
+ * app's.
  */
 
-import { realpathSync } from 'node:fs';
-import { mkdir, realpath, rmdir } from 'node:fs/promises';
+import { readFileSync, statSync } from 'node:fs';
+import { mkdir, realpath, rmdir, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+
+import { writeFileAtomic } from './paths.js';
 
 /** The scratch root's name in the home folder: the app's name, so the user sees who made it. */
 export const SCRATCH_FOLDER = 'Portato';
@@ -58,18 +62,99 @@ export async function makeScratch(root: string, ms: number): Promise<string | nu
   return null;
 }
 
-/** The scratch root's real path, or null when it does not exist. */
-export function realScratchRoot(root: string): string | null {
+/** A folder the app made: its real path, and the device and inode numbers it had when made (decimal text). */
+export interface ScratchRecord {
+  path: string;
+  dev: string;
+  ino: string;
+}
+
+type Identity = Pick<ScratchRecord, 'dev' | 'ino'>;
+
+function identityOf(info: { dev: bigint; ino: bigint; isDirectory(): boolean }): Identity | null {
+  return info.isDirectory() ? { dev: String(info.dev), ino: String(info.ino) } : null;
+}
+
+function identityNow(path: string): Identity | null {
   try {
-    return realpathSync(root);
+    return identityOf(statSync(path, { bigint: true }));
   } catch {
     return null;
   }
 }
 
-/** A Work folder started without a folder: its parent is the real scratch root. `cwd` is a real path. */
-export function isScratch(cwd: string, realRoot: string | null): boolean {
-  return realRoot !== null && cwd !== realRoot && dirname(cwd) === realRoot;
+/** The records of the file by path; a missing or broken file has none. */
+export function readScratchRecordsSync(file: string): Map<string, ScratchRecord> {
+  const out = new Map<string, ScratchRecord>();
+  let raw: unknown;
+  try {
+    raw = JSON.parse(readFileSync(file, 'utf8'));
+  } catch {
+    return out;
+  }
+  if (typeof raw !== 'object' || raw === null) return out;
+  const record = raw as { version?: unknown; folders?: unknown };
+  if (record.version !== 1 || !Array.isArray(record.folders)) return out;
+  for (const item of record.folders as unknown[]) {
+    if (typeof item !== 'object' || item === null) continue;
+    const { path, dev, ino } = item as { path?: unknown; dev?: unknown; ino?: unknown };
+    if (typeof path !== 'string' || path === '' || typeof dev !== 'string' || typeof ino !== 'string') continue;
+    out.set(path, { path, dev, ino });
+  }
+  return out;
+}
+
+/** The app made `cwd`: a record names it and the folder there is still the one it made. */
+export function isOwned(cwd: string, records: ReadonlyMap<string, ScratchRecord>): boolean {
+  const record = records.get(cwd);
+  if (record === undefined) return false;
+  const now = identityNow(cwd);
+  return now !== null && now.dev === record.dev && now.ino === record.ino;
+}
+
+/** The records of the folders the app made: read once, the file written whole (mode 0600) after each change. */
+export class ScratchFolders {
+  readonly file: string;
+  private readonly records: Map<string, ScratchRecord>;
+  private chain: Promise<void> = Promise.resolve();
+
+  constructor(file: string) {
+    this.file = file;
+    this.records = readScratchRecordsSync(file);
+  }
+
+  owns(cwd: string): boolean {
+    return isOwned(cwd, this.records);
+  }
+
+  /** Records a folder just made; a write that fails takes the record out again and throws. */
+  async add(path: string): Promise<void> {
+    const identity = identityOf(await stat(path, { bigint: true }));
+    if (identity === null) throw new Error('not a folder');
+    this.records.set(path, { path, ...identity });
+    try {
+      await this.write();
+    } catch (error) {
+      this.records.delete(path);
+      throw error;
+    }
+  }
+
+  /** Forgets a folder the app removed; a write that fails leaves a record whose folder is gone. */
+  async drop(path: string): Promise<void> {
+    if (!this.records.delete(path)) return;
+    await this.write().catch(() => {});
+  }
+
+  private write(): Promise<void> {
+    const run = async (): Promise<void> => {
+      await mkdir(dirname(this.file), { recursive: true, mode: 0o700 });
+      await writeFileAtomic(this.file, `${JSON.stringify({ version: 1, folders: [...this.records.values()] })}\n`);
+    };
+    const next = this.chain.then(run, run);
+    this.chain = next.catch(() => {});
+    return next;
+  }
 }
 
 /** Removes the folder only when it is empty. True when it was removed. */

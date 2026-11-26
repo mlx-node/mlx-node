@@ -12,13 +12,14 @@ import {
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 
 import { describe, expect, it, onTestFinished } from 'vite-plus/test';
 
@@ -26,6 +27,7 @@ import { ApiError } from '../src/api/errors.js';
 import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
 import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
+import { readWorkIndexSync } from '../src/chat/index-file.js';
 import type { ChatPaths } from '../src/chat/paths.js';
 import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
 import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
@@ -33,6 +35,7 @@ import { routeError } from '../src/chat/route-errors.js';
 import type { ChatService } from '../src/chat/service.js';
 import type { ChatHostEvent, ChatHostState, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
 import { CWD_PROBLEM_MESSAGES } from '../src/chat/work-folder.js';
+import { readScratchRecordsSync, stampName } from '../src/chat/work-scratch.js';
 import type { RuntimeLive } from '../src/live.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
 import {
@@ -2414,7 +2417,8 @@ describe('Chat service — Work without a folder', () => {
     });
   }, 30_000);
 
-  // Mutation: the root read before it existed is kept after the make → the first No folder conversation is not marked.
+  // Mutation: the record written to the file only (the service reads it once at start) → the first No folder
+  // conversation is not marked.
   it('a conversation read before ~/Portato exists leaves the first No folder conversation marked', async () => {
     await withNone(async (fake, scratch) => {
       const project = join(fake.root, 'home', 'code');
@@ -2455,18 +2459,51 @@ describe('Chat service — Work without a folder', () => {
     });
   });
 
-  // Mutation: no cleanup on a failed create → an empty dated folder per failure.
-  it('session/new that never answers: the new folder is gone', async () => {
+  // Mutation: the record written once session/new answered → the agent runs in a folder the app has no record of.
+  it('the new folder is recorded (0600) before session/new, and stays while session/new hangs', async () => {
     await withNone(
       async (fake, scratch) => {
-        expect((await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }))).reason).toBe(
-          'agent-slow',
-        );
-        expect(readdirSync(scratch)).toEqual([]);
+        const create = apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+        await until(() => sessionNews(fake).length === 1, 8_000);
+        const cwd = (sessionNews(fake)[0]!.params as Json).cwd as string;
+        const id = statSync(cwd, { bigint: true });
+        expect(readScratchRecordsSync(fake.paths.scratchFolders).get(cwd)).toEqual({
+          path: cwd,
+          dev: String(id.dev),
+          ino: String(id.ino),
+        });
+        expect(statSync(fake.paths.scratchFolders).mode & 0o777).toBe(0o600);
+        expect((await create).reason).toBe('agent-slow');
+        expect(readdirSync(scratch)).toEqual([basename(cwd)]);
       },
       {
         mutate: (scenario) => void Object.assign(scenario, { prompts: [], faults: { hangOn: 'session/new' } }),
         createBudgetMs: 400,
+      },
+    );
+  }, 30_000);
+
+  // Mutation: the folder removed when the create gives up → the late session starts in a removed folder, and a retry
+  // in the same minute gets that folder again.
+  it('a create past its budget keeps its folder until the late session is deleted; a retry gets -2', async () => {
+    const start = Date.now();
+    const now = (): number => Date.now() - (start % 60_000);
+    const stamp = stampName(now());
+    await withNone(
+      async (fake, scratch) => {
+        for (let n = 0; n < 2; n += 1) {
+          const error = await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+          expect(error.reason).toBe('agent-slow');
+        }
+        expect(readdirSync(scratch).sort()).toEqual([stamp, `${stamp}-2`]);
+        await until(() => readdirSync(scratch).length === 0, 10_000);
+        expect(fake.sent().filter((m) => m.method === '_x.ai/session/delete')).toHaveLength(2);
+      },
+      {
+        mutate: (scenario) =>
+          void Object.assign(scenario, { prompts: [], faults: { delayMs: { 'session/new': 1_500 } } }),
+        createBudgetMs: 400,
+        now,
       },
     );
   }, 30_000);
@@ -2536,4 +2573,87 @@ describe('Chat service — Work without a folder', () => {
       expect(readdirSync(picked)).toEqual([]);
     });
   }, 30_000);
+
+  // Mutation: the parent folder read in place of the record → a folder picked in ~/Portato is marked and removed.
+  it('a folder picked by hand in ~/Portato is never marked and never removed', async () => {
+    await withNone(async (fake, scratch) => {
+      const picked = join(scratch, 'my-project');
+      mkdirSync(picked, { recursive: true });
+      const { conversation } = await fake.service.create({ mode: 'work', text: 'hi', cwd: picked });
+      expect([conversation.cwd, conversation.noFolder]).toEqual([realpathSync(picked), undefined]);
+      await answered(fake, conversation.id);
+      await fake.service.delete(conversation.id);
+      expect(existsSync(picked)).toBe(true);
+    });
+  }, 30_000);
+
+  // Mutation: the record matched by path alone → a new folder at the path the app made is removed.
+  it('a new folder in place of the one the app made is not its own: delete keeps it', async () => {
+    await withNone(async (fake) => {
+      const { id, cwd } = await made(fake);
+      renameSync(cwd, `${cwd}-moved`);
+      mkdirSync(cwd);
+      await fake.service.delete(id);
+      expect(existsSync(cwd)).toBe(true);
+    });
+  }, 30_000);
+
+  // Mutation: the delete's in-use check blind to the creates in flight → the new conversation loses its folder.
+  it('a delete keeps the folder while another conversation is being made in it', async () => {
+    await withNone(
+      async (fake) => {
+        const first = await made(fake);
+        const opening = fake.service.create({ mode: 'work', text: 'hi', cwd: first.cwd });
+        await until(() => sessionNews(fake).length === 2, 8_000);
+        await fake.service.delete(first.id);
+        expect(existsSync(first.cwd)).toBe(true);
+        const { conversation } = await opening;
+        expect(conversation.cwd).toBe(first.cwd);
+        await answered(fake, conversation.id);
+      },
+      {
+        mutate: (scenario) =>
+          void Object.assign(scenario, { prompts: [], faults: { delayMs: { 'session/new': 1_500 } } }),
+        createBudgetMs: 10_000,
+      },
+    );
+  }, 30_000);
+
+  describe('a fork past its soft deadline', () => {
+    function gated(run: (fake: FakeService, go: string) => Promise<void>): Promise<void> {
+      const gateDir = mkdtempSync(join(tmpdir(), 'mlx-fork-gate-'));
+      onTestFinished(() => rmSync(gateDir, { recursive: true, force: true }));
+      const go = join(gateDir, 'go');
+      return withNone((fake) => run(fake, go), {
+        timings: { forkMs: 300 },
+        mutate: (scenario) => void Object.assign(scenario, { prompts: [], fork: { holdOn: go } }),
+      });
+    }
+
+    // Mutation: the fork's hold let go at its soft deadline → a delete of the origin removes the copy's folder.
+    it('keeps the folder through a delete of the origin', async () => {
+      await gated(async (fake) => {
+        const origin = await made(fake);
+        expect((await apiError(fake.service.fork(origin.id))).reason).toBe('agent-slow');
+        await fake.service.delete(origin.id);
+        expect(existsSync(origin.cwd)).toBe(true);
+      });
+    }, 30_000);
+
+    // Mutation: a late copy that landed never lets the hold go → the folder stays after its last conversation.
+    it('lands its copy in the folder, then lets the folder go', async () => {
+      await gated(async (fake, go) => {
+        const origin = await made(fake);
+        expect((await apiError(fake.service.fork(origin.id))).reason).toBe('agent-slow');
+        writeFileSync(go, '');
+        const indexed = (): string[] => readWorkIndexSync(fake.paths.conversations).work.map((e) => e.id);
+        await until(() => indexed().length === 2, 8_000);
+        const copy = indexed().find((id) => id !== origin.id)!;
+        await fake.service.delete(origin.id);
+        expect(existsSync(origin.cwd)).toBe(true);
+        await fake.service.delete(copy);
+        expect(existsSync(origin.cwd)).toBe(false);
+      });
+    }, 30_000);
+  });
 });

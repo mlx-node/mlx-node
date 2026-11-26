@@ -409,6 +409,8 @@ export interface FakeServiceOptions {
   appEnds?: () => ChatServiceOptions['appEnds'];
   onBusyChange?: ChatServiceOptions['onBusyChange'];
   maxPicturesBase64?: ChatServiceOptions['maxPicturesBase64'];
+  /** The service's clock (default: `Date.now`). */
+  now?: () => number;
 }
 
 export interface FakeService {
@@ -507,6 +509,7 @@ export function fakeService(name: string, options: FakeServiceOptions = {}): Fak
       appEnds: options.appEnds?.(),
       onBusyChange: options.onBusyChange,
       maxPicturesBase64: options.maxPicturesBase64,
+      ...(options.now === undefined ? {} : { now: options.now }),
     });
   const records = (): Json[] => {
     try {

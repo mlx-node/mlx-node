@@ -1606,23 +1606,29 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   before each prompt. An open conversation whose folder is gone or no longer usable shows its sentence and Send is off.
   Paths show `~` for the home folder; a long one is cut in the middle and shown whole on hover and in the open
   conversation's folder popover (with Copy path).
-- **No folder.** A send with No folder posts `noFolder: true` (never with `cwd`; Work only; `false` is a 400). After
-  the command, engine, model and picture checks the Control Panel makes `~/Portato` when it is missing (mode 0700; an
-  existing one is left as it is), then a new folder in it named by the local minute, `YYYY-MM-DD-HHmm` (0700, never
-  one that exists: `-2` to `-9`, then the create fails), runs the folder rule on it as on a picked folder, and starts
-  the agent there (`src/chat/work-scratch.ts`). From then on it is a normal Work conversation with that folder for
-  life, so Auto covers that folder only (an edit in another No folder conversation's folder asks). A folder whose
-  encoded path is over 255 bytes is not made. A folder that cannot be made fails the send with `reason:
-  'folder-not-made'` ("The app could not make a folder in ~/Portato. Choose a folder instead." and Choose folder…). A
-  create that fails before the conversation is stored removes the new folder (`rmdir`, never recursive); once it is
-  stored the folder stays. A conversation is `noFolder: true` (on `ConversationInfo` and its list row) when the real
-  parent of its folder is the real `~/Portato`; nothing is stored, a fork keeps the mark with its folder, and
-  `~/Portato` picked by hand is not marked. The hero reads "Work without a folder" with its own starters, the
-  composer "Describe a task", the bar chip "No folder" (popover: the path, "This conversation has its own folder.",
-  Copy path), the palette "Work · No folder · …". Delete says the folder is removed when empty: after the agent deleted
-  the session the Control Panel calls `rmdir` on it when no other Work conversation of the index (on disk or held) has
-  that folder, so a folder with any file stays and a fork keeps it. The app never deletes a file there. The Sessions
-  page shows such a session by its real folder.
+- **No folder.** A send with No folder posts `noFolder: true` (never with `cwd`; Work only; `false` is a 400). After the
+  command, engine, model and picture checks the Control Panel makes `~/Portato` when it is missing (mode 0700; an
+  existing one is left as it is), then a new folder in it named by the local minute, `YYYY-MM-DD-HHmm` (0700, never one
+  that exists: `-2` to `-9`, then the create fails), records it in `~/.mlx-node/chat/scratch-folders.json` (its real
+  path with its device and inode numbers; 0600, written whole; a record that cannot be written removes the folder and
+  fails the send with `folder-not-made`), runs the folder rule on it as on a picked folder, and starts the agent there
+  (`src/chat/work-scratch.ts`). The record is written before `session/new`. From then on it is a normal Work
+  conversation with that folder for life, so Auto covers that folder only (an edit in another No folder conversation's
+  folder asks). A folder whose encoded path is over 255 bytes is not made. A folder that cannot be made fails the send
+  with `reason: 'folder-not-made'` ("The app could not make a folder in ~/Portato. Choose a folder instead." and Choose
+  folder…). A create that fails before the conversation is stored removes the new folder (`rmdir`, never recursive) and
+  its record; a create that gave up on a slow `session/new` does so only once that call ended (a late session is deleted
+  first), so a retry in the same minute gets `-2`. Once the conversation is stored the folder stays. A conversation is
+  `noFolder: true` (on `ConversationInfo` and its list row) only when its folder has a record and the folder at that
+  path still has the recorded device and inode: a fork keeps the mark with its folder, and a folder picked by hand
+  (`~/Portato` and the folders in it included) is never marked or removed, nor is a new folder made at a recorded path.
+  The hero reads "Work without a folder" with its own starters, the composer "Describe a task", the bar chip "No folder"
+  (popover: the path, "This conversation has its own folder.", Copy path), the palette "Work · No folder · …". Delete
+  says the folder is removed when empty: after the agent deleted the session the Control Panel calls `rmdir` on a
+  recorded folder when no other Work conversation of the index (on disk or held) has that folder and no create or fork
+  is still opening a conversation in it (a fork past its soft deadline holds it until its late copy lands), so a folder
+  with any file stays and a fork keeps it. A removed folder's record goes with it. The app never deletes a file there.
+  The Sessions page shows such a session by its real folder.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip
@@ -2516,6 +2522,7 @@ Chat and Work add, under `~/.mlx-node/chat` (0700):
 | `work-process/`                                        | the Work agent's process cwd: empty, so `$HOME` (and grok-build's `~/.grok`) is never read as a project     |
 | `chat-agent/`, `chat-home/`, `chat-workspace/`, `tmp/` | the Chat agent's own home, cwd and temp folders; the agent writes its sessions there                        |
 | `composer/<id>.json`                                   | the messages queued while an answer runs (text and files) until they are sent, and the thinking level; 0600 |
+| `scratch-folders.json`                                 | the folders Work without a folder made: real path, device and inode numbers; 0600                           |
 
 Work sessions are the agent's own, in `~/.mlx-agent/sessions/`, as from a terminal. Keys live in the Keychain only.
 

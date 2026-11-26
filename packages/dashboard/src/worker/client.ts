@@ -209,7 +209,7 @@ export function startDbWorker(opts: DbWorkerOptions): DbWorkerClient {
         agentHome: opts.agentHome,
         chatAgentHome: opts.chatAgentHome,
         chatIndexPath: opts.chatIndexPath,
-        scratchRoot: opts.scratchRoot,
+        scratchFolders: opts.scratchFolders,
         withdrawPort: withdrawals.port2,
       } satisfies DbWorkerBoot,
       transferList: [withdrawals.port2],

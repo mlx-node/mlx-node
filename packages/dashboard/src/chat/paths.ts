@@ -1,9 +1,9 @@
 /**
  * The app data folder of Chat and Work (`~/.mlx-node/chat`). Every file the app writes here is metadata or a fixed
  * text, except `web-ledger/`, which holds the web addresses of live Chat sessions, `composer/<id>.json`, which holds
- * the messages the user queued (with their files) until they are sent, and `never-allow.json`, which holds the words of
- * the commands the user never allows in a Work folder; any other chat text is written only by the agent, into its own
- * home `chat-agent/`.
+ * the messages the user queued (with their files) until they are sent, `never-allow.json`, which holds the words of
+ * the commands the user never allows in a Work folder, and `scratch-folders.json`, which holds the paths of the folders
+ * Work without a folder made; any other chat text is written only by the agent, into its own home `chat-agent/`.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -48,6 +48,8 @@ export interface ChatPaths {
   neverAllow: string;
   /** Work: the app-wide Work settings (`work-settings.ts`). */
   workSettings: string;
+  /** Work: the folders Work without a folder made (`work-scratch.ts`): real path, device and inode, mode 0600. */
+  scratchFolders: string;
 }
 
 export function chatPaths(root: string = defaultChatRoot()): ChatPaths {
@@ -72,6 +74,7 @@ export function chatPaths(root: string = defaultChatRoot()): ChatPaths {
     composer: join(root, 'composer'),
     neverAllow: join(root, 'never-allow.json'),
     workSettings: join(root, 'work-settings.json'),
+    scratchFolders: join(root, 'scratch-folders.json'),
   };
 }
 

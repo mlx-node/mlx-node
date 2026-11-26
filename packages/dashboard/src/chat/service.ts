@@ -131,7 +131,7 @@ import {
   type GitDeps,
   type GitRead,
 } from './work-git.js';
-import { isScratch, makeScratch, realScratchRoot, removeIfEmpty, scratchRoot, stampName } from './work-scratch.js';
+import { makeScratch, removeIfEmpty, ScratchFolders, scratchRoot, stampName } from './work-scratch.js';
 import { readWorkSettingsSync, type WorkSettings, writeWorkSettings } from './work-settings.js';
 
 /** create: agent start + `session/new` + guard must fit in this, inside the RPC client's 30 s deadline. */
@@ -432,8 +432,12 @@ export class ChatService {
   private readonly workHome: string;
   /** Where Work without a folder makes each conversation's own folder. */
   private readonly scratch: string;
-  /** The scratch root's real path (null: it does not exist), read once; undefined until read and after a make. */
-  private scratchReal: string | null | undefined;
+  /** The folders Work without a folder made: only these are marked and removed. */
+  private readonly scratchFolders: ScratchFolders;
+  /** The folders a create or a fork is opening, with how many: a delete keeps them. */
+  private readonly opening = new Map<string, number>();
+  /** The folders of forks past their soft deadline, by origin: held until the late copy landed. */
+  private readonly lateForkFolders = new Map<string, string[]>();
   /** Read once at start; a failed read is no ends. */
   private readonly appEnds: Promise<readonly AppEnd[]>;
   /** The app-wide Work settings: read once at start, then each save. */
@@ -491,6 +495,7 @@ export class ChatService {
     this.home = home;
     this.workHome = workHome;
     this.scratch = scratchRoot(home);
+    this.scratchFolders = new ScratchFolders(options.paths.scratchFolders);
     this.permissionLog = new PermissionLog(options.paths.permissionLog);
     this.never = new NeverRules(options.paths.neverAllow, { now: this.now });
     this.composerStore = new ComposerStore(options.paths.composer);
@@ -618,39 +623,83 @@ export class ChatService {
       const folder = await checkWorkFolder(input.cwd ?? '', this.folderRules);
       if (!folder.ok) throw cwdError(folder.problem);
       cwd = folder.path;
+      this.hold(cwd);
     } else if (mode === 'chat') {
       await this.assertChatReady();
     }
-    const endpoint = await this.endpoint();
-    if (endpoint === null) throw chatRouteError('inference-stopped');
-    const modelId = input.modelId ?? (await this.state()).defaultModelId ?? undefined;
-    if (modelId === undefined) throw chatRouteError('no-models');
-    await this.checkImages(mode, modelId, input.attachments);
-    if (none) cwd = await this.newScratch();
-    this.creates += 1;
+    const slow: { settled: Promise<void> | null } = { settled: null };
     try {
-      return await this.createIn(mode, input, modelId, cwd);
-    } catch (error) {
-      // The folder was made for this conversation alone: once the conversation is stored it is its folder for life.
-      if (none && cwd !== undefined && !this.holdsCwd(cwd)) await removeIfEmpty(cwd);
-      throw error;
+      const endpoint = await this.endpoint();
+      if (endpoint === null) throw chatRouteError('inference-stopped');
+      const modelId = input.modelId ?? (await this.state()).defaultModelId ?? undefined;
+      if (modelId === undefined) throw chatRouteError('no-models');
+      await this.checkImages(mode, modelId, input.attachments);
+      if (none) {
+        cwd = await this.newScratch();
+        this.hold(cwd);
+      }
+      this.creates += 1;
+      try {
+        return await this.createIn(mode, input, modelId, cwd, (settled) => {
+          slow.settled = settled;
+        });
+      } finally {
+        this.creates -= 1;
+        if (this.creates === 0) this.early.clear();
+      }
     } finally {
-      this.creates -= 1;
-      if (this.creates === 0) this.early.clear();
+      if (cwd !== undefined) {
+        const folder = cwd;
+        // A session that answers past the budget may still start in the folder: it is kept until that settles.
+        if (slow.settled === null) await this.leaveFolder(folder, none);
+        else void slow.settled.then(() => this.leaveFolder(folder, none)).catch(() => {});
+      }
     }
   }
 
-  /** A new empty folder under the scratch root, checked by the folder rule; it is removed when the rule refuses it. */
+  /**
+   * A new empty folder under the scratch root, recorded before the agent gets it and checked by the folder rule; it
+   * is removed when the record cannot be written or the rule refuses it.
+   */
   private async newScratch(): Promise<string> {
     const made = await makeScratch(this.scratch, this.now());
-    this.scratchReal = undefined;
     if (made === null) throw folderNotMadeError();
+    try {
+      await this.scratchFolders.add(made);
+    } catch {
+      await removeIfEmpty(made);
+      throw folderNotMadeError();
+    }
     const folder = await checkWorkFolder(made, this.folderRules);
     if (!folder.ok) {
-      await removeIfEmpty(made);
+      await this.removeScratch(made);
       throw cwdError(folder.problem);
     }
     return folder.path;
+  }
+
+  private hold(cwd: string): void {
+    this.opening.set(cwd, (this.opening.get(cwd) ?? 0) + 1);
+  }
+
+  private release(cwd: string): void {
+    const left = (this.opening.get(cwd) ?? 0) - 1;
+    if (left > 0) this.opening.set(cwd, left);
+    else this.opening.delete(cwd);
+  }
+
+  /**
+   * The end of a create's hold on its folder. A folder made for it that no conversation has is removed when empty:
+   * once the conversation is stored it is its folder for life.
+   */
+  private async leaveFolder(cwd: string, made: boolean): Promise<void> {
+    this.release(cwd);
+    if (made && !this.cwdInUse(cwd)) await this.removeScratch(cwd);
+  }
+
+  /** Removes a folder the app made when it is empty, and its record with it. */
+  private async removeScratch(cwd: string): Promise<void> {
+    if (await removeIfEmpty(cwd)) await this.scratchFolders.drop(cwd);
   }
 
   /** A conversation this service holds runs in `cwd`. */
@@ -661,10 +710,9 @@ export class ChatService {
     return false;
   }
 
-  /** A Work folder the app made for a conversation started without a folder. */
+  /** A Work folder the app made for a conversation started without a folder, and still the folder it made. */
   private isScratchFolder(cwd: string): boolean {
-    if (this.scratchReal === undefined) this.scratchReal = realScratchRoot(this.scratch);
-    return isScratch(cwd, this.scratchReal);
+    return this.scratchFolders.owns(cwd);
   }
 
   /** Where a none pick is read before its folder exists: a child of the scratch root that is not made. */
@@ -680,11 +728,13 @@ export class ChatService {
     this.early.set(id, kept);
   }
 
+  /** `onSlow`: past the budget, the late session's end (its delete included) is handed there before `agent-slow`. */
   private async createIn(
     mode: ChatMode,
     input: CreateConversationInput,
     modelId: string,
     cwd: string | undefined,
+    onSlow: (settled: Promise<void>) => void,
   ): Promise<{ conversation: ConversationInfo; turnId: string }> {
     const host = this.hosts[mode];
     const created = host.createSession(cwd === undefined ? { modelId } : { modelId, cwd });
@@ -696,9 +746,11 @@ export class ChatService {
     try {
       const raced = await Promise.race([created, budget]);
       if (raced === 'slow') {
-        created.then(
-          (late) => host.deleteSession(late.sessionId, late.cwd).catch(() => {}),
-          () => {},
+        onSlow(
+          created.then(
+            (late) => host.deleteSession(late.sessionId, late.cwd).catch(() => {}),
+            () => {},
+          ),
         );
         throw chatRouteError('agent-slow');
       }
@@ -1458,18 +1510,35 @@ export class ChatService {
       target = answerEnd(disk, found.target);
     }
     this.opWall(host, id);
-    let copy: string;
+    if (cwd !== undefined) this.hold(cwd);
+    let late = false;
     try {
-      copy = await host.fork(id, { modelId: conversation.info.modelId, ...(cwd === undefined ? {} : { cwd }) }, target);
-    } catch (error) {
-      if (!(error instanceof AgentHostError)) throw error;
-      if (error.code === 'agent-slow') this.emitHost({ type: 'conversations-changed' });
-      throw this.opRefusal(host, id, error);
+      let copy: string;
+      try {
+        copy = await host.fork(
+          id,
+          { modelId: conversation.info.modelId, ...(cwd === undefined ? {} : { cwd }) },
+          target,
+        );
+      } catch (error) {
+        if (!(error instanceof AgentHostError)) throw error;
+        if (error.code === 'agent-slow') {
+          // Held until the late copy lands (`lateFork`); a late reply that names no copy keeps it for the app run.
+          if (cwd !== undefined) {
+            this.lateForkFolders.set(id, [...(this.lateForkFolders.get(id) ?? []), cwd]);
+            late = true;
+          }
+          this.emitHost({ type: 'conversations-changed' });
+        }
+        throw this.opRefusal(host, id, error);
+      } finally {
+        void this.drainQueue(id, false);
+      }
+      await this.forkLanded(mode, copy, cwd, conversation.info.thinking);
+      return { id: copy };
     } finally {
-      void this.drainQueue(id, false);
+      if (cwd !== undefined && !late) this.release(cwd);
     }
-    await this.forkLanded(mode, copy, cwd, conversation.info.thinking);
-    return { id: copy };
   }
 
   /**
@@ -1494,12 +1563,22 @@ export class ChatService {
     this.emitHost({ type: 'conversations-changed' });
   }
 
-  /** A fork's reply that came after its soft deadline: the copy lands as an answered fork's does. */
+  /**
+   * A fork's reply that came after its soft deadline: the copy lands as an answered fork's does, in the folder the fork
+   * held (the original may be gone), which it lets go once the copy is in the index.
+   */
   private lateFork(mode: ChatMode, from: string, copy: string): void {
+    const held = this.lateForkFolders.get(from) ?? [];
+    const folder = held.shift();
+    if (held.length === 0) this.lateForkFolders.delete(from);
     if (this.closed) return;
     const original = this.conversations.get(from)?.info;
-    const cwd = mode === 'work' ? (original?.cwd ?? undefined) : undefined;
-    void this.forkLanded(mode, copy, cwd, original?.thinking).catch(() => {});
+    const cwd = mode === 'work' ? (folder ?? original?.cwd ?? undefined) : undefined;
+    void this.forkLanded(mode, copy, cwd, original?.thinking)
+      .catch(() => {})
+      .then(() => {
+        if (folder !== undefined) this.release(folder);
+      });
   }
 
   /**
@@ -2355,11 +2434,7 @@ export class ChatService {
       this.conversations.delete(id);
       this.originChanged(id, null);
       const cwd = conversation.info.cwd;
-      // A delete reads the root again: a stale real path must never pick the folder it removes.
-      this.scratchReal = undefined;
-      if (cwd !== null && this.isScratchFolder(cwd) && !this.cwdInUse(cwd, id)) {
-        await removeIfEmpty(cwd);
-      }
+      if (cwd !== null && this.isScratchFolder(cwd) && !this.cwdInUse(cwd, id)) await this.removeScratch(cwd);
       this.emitHost({ type: 'conversations-changed' });
       return {};
     } finally {
@@ -2367,9 +2442,12 @@ export class ChatService {
     }
   }
 
-  /** Another Work conversation runs in `cwd`: one this service holds, or a session of the Work index on disk. */
-  private cwdInUse(cwd: string, except: string): boolean {
-    if (this.holdsCwd(cwd, except)) return true;
+  /**
+   * Another Work conversation runs in `cwd`: one this service holds, one a create or a fork is opening, or a session
+   * of the Work index on disk.
+   */
+  private cwdInUse(cwd: string, except?: string): boolean {
+    if (this.holdsCwd(cwd, except) || (this.opening.get(cwd) ?? 0) > 0) return true;
     const sessions = this.workReader.scan().sessions;
     for (const entry of readWorkIndexSync(this.opts.paths.conversations).work) {
       if (entry.id !== except && sessions.get(entry.id)?.summary.cwd === cwd) return true;
