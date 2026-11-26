@@ -25,7 +25,7 @@ import { spawnAgent } from '../src/chat/acp/process.js';
 import { AgentHostError, launchFromProbe } from '../src/chat/agent/agent-host.js';
 import { LAUNCHD_PATH } from '../src/chat/agent/login-path.js';
 import { CHAT_CONFIG_TOML, CHAT_REQUIREMENTS_TOML, promptParams } from '../src/chat/agent/profiles.js';
-import type { AttachmentInput } from '../src/chat/attachment-rule.js';
+import { pdfNote, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import { REDACTED } from '../src/chat/redact.js';
 import { CONTINUE_PROMPT } from '../src/chat/types.js';
 import {
@@ -47,6 +47,7 @@ const STOP_RECORD = JSON.parse(
 ) as { lines: Array<{ params?: { update?: Json } }> };
 const FILE: AttachmentInput = { kind: 'file', name: 'notes.md', text: '# notes\n' };
 const PICTURE: AttachmentInput = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' };
+const PDF: AttachmentInput = { kind: 'pdf', name: 'paper.pdf', images: ['/9j/4AAQ', '/9j/4AAR'] };
 
 async function withFake(
   name: string,
@@ -105,6 +106,44 @@ function texts(fake: FakeHost): string {
     })
     .join('');
 }
+
+describe('promptParams', () => {
+  const note = (name: string, pages: number, from: number) => ({
+    type: 'resource',
+    resource: {
+      uri: `file:///attached/${name}`,
+      mimeType: 'text/plain',
+      text: pdfNote({ name, pages, way: 'message', from }),
+    },
+  });
+  const page = (data: string) => ({ type: 'image', data, mimeType: 'image/jpeg' });
+
+  // Mutation: a note's images range that leaves out the pictures before the pages → red.
+  it('sends the text, the files, a note per PDF, the pictures, then each PDF page in order', () => {
+    const second: AttachmentInput = { kind: 'pdf', name: 'b.pdf', images: ['/9j/4AAS'] };
+    expect(promptParams('s1', 'read these', [PDF, PICTURE, second, FILE])).toEqual({
+      sessionId: 's1',
+      prompt: [
+        { type: 'text', text: 'read these' },
+        {
+          type: 'resource',
+          resource: { uri: 'file:///attached/notes.md', mimeType: 'text/plain', text: '# notes\n' },
+        },
+        note('paper.pdf', 2, 2),
+        note('b.pdf', 1, 4),
+        { type: 'image', data: 'iVBORw0KGgoAAAANSUhEUg==', mimeType: 'image/png' },
+        page('/9j/4AAQ'),
+        page('/9j/4AAR'),
+        page('/9j/4AAS'),
+      ],
+    });
+    const prompt = promptParams('s1', 'read', [PICTURE, PDF]).prompt as Array<{ resource?: { text: string } }>;
+    expect(prompt[1]!.resource!.text.split('\n').slice(4)).toEqual([
+      'images: 2-3',
+      'Images 2-3 of this message are pages 1-2 of this PDF, in order.',
+    ]);
+  });
+});
 
 describe('launchFromProbe', () => {
   it('maps the probe to a launch or a typed failure', () => {
@@ -473,7 +512,7 @@ describe('Chat host', () => {
     });
   });
 
-  it('an agent that does not take embedded resources: a file turn ends agent-incompatible unsent, a text turn runs', async () => {
+  it('an agent that does not take embedded resources: a file or PDF turn ends agent-incompatible unsent, a text turn runs', async () => {
     await withFake(
       'chat-basic',
       async (fake) => {
@@ -484,6 +523,9 @@ describe('Chat host', () => {
           failure: { code: 'agent-incompatible', message: 'This agent build does not match this app.' },
           unsent: true,
         });
+        expect(fake.sent().filter((m) => m.method === 'session/prompt')).toEqual([]);
+        const pdf = await fake.host.startTurn(sessionId, 'read this', { modelId: MODEL }, [PDF]).done;
+        expect(pdf).toMatchObject({ failure: { code: 'agent-incompatible' }, unsent: true });
         expect(fake.sent().filter((m) => m.method === 'session/prompt')).toEqual([]);
         expect((await fake.host.startTurn(sessionId, 'hello', { modelId: MODEL }).done).outcome).toBe('completed');
         expect(fake.sent().filter((m) => m.method === 'session/prompt')).toHaveLength(1);

@@ -8,7 +8,7 @@
  */
 
 import { readCompaction } from '../chat/acp/messages.js';
-import { base64Bytes, nameOfUri, utf8Bytes, type UserAttachment } from '../chat/attachment-rule.js';
+import { base64Bytes, nameOfUri, readPdfNote, utf8Bytes, type UserAttachment } from '../chat/attachment-rule.js';
 import { CONTINUE_PROMPT, type TranscriptOp } from '../chat/types.js';
 import { askOf } from './ask-result.js';
 import { diffEdits, type RawDetail, type RawEdit } from './line-diff.js';
@@ -322,20 +322,30 @@ function contentBlockText(block: unknown): string {
 }
 
 /**
- * A prompt block of the user that is a file or a picture, as its view: the name from the resource uri and the sizes
- * of the stored text or base64. Null for any other block, and for a resource with neither text nor blob.
+ * A prompt block of the user that is a file, a PDF note or a picture, as its view: the name from the resource uri (a
+ * note's own name), the sizes of the stored text or base64. A message note's pages are image blocks `from` to `to`
+ * (from 1) of its message, which the reader adds to the note's view. Null for any other block, and for a resource
+ * with neither text nor blob.
  */
-function userAttachment(block: unknown): UserAttachment | null {
+function userAttachment(block: unknown): { view: UserAttachment; pages?: { from: number; to: number } } | null {
   if (!isRecord(block)) return null;
   if (block.type === 'image') {
-    return { kind: 'image', mediaType: str(block.mimeType) ?? 'image', bytes: base64Bytes(str(block.data) ?? '') };
+    return {
+      view: { kind: 'image', mediaType: str(block.mimeType) ?? 'image', bytes: base64Bytes(str(block.data) ?? '') },
+    };
   }
   if (block.type !== 'resource' || !isRecord(block.resource)) return null;
   const name = nameOfUri(str(block.resource.uri) ?? '');
   const text = str(block.resource.text);
-  if (text !== null) return { kind: 'file', name, bytes: utf8Bytes(text) };
+  if (text !== null) {
+    const note = readPdfNote(text);
+    if (note === null) return { view: { kind: 'file', name, bytes: utf8Bytes(text) } };
+    const pdf = { kind: 'pdf', name: note.name, pages: note.pages, way: note.way, bytes: 0, chars: 0 } as const;
+    if (note.way === 'tool') return { view: { ...pdf, id: note.id } };
+    return { view: pdf, pages: { from: note.from, to: note.from + note.pages - 1 } };
+  }
   const blob = str(block.resource.blob);
-  return blob === null ? null : { kind: 'file', name, bytes: base64Bytes(blob) };
+  return blob === null ? null : { view: { kind: 'file', name, bytes: base64Bytes(blob) } };
 }
 
 /**
@@ -1174,6 +1184,14 @@ export class TranscriptReducer {
   /** Disk notes of the open turn by text: the agent stores each note twice, so every second equal one is dropped. */
   private readonly noteCounts = new Map<string, number>();
   /**
+   * Per user entry: the image blocks it has read, and where each PDF note's pages are among them, with the note's
+   * place in the entry's attachments.
+   */
+  private readonly pdfPages = new WeakMap<
+    TranscriptEntry,
+    { images: number; notes: Array<{ from: number; to: number; at: number }> }
+  >();
+  /**
    * Notices and mode lines made while no turn is open, and on disk while the last entry is the turn's prompt (its
    * chunks still merge): added right after that prompt, so neither starts a turn. The agent sends notices past lines
    * made before them, and stores a prompt's mode line before the prompt.
@@ -1306,6 +1324,37 @@ export class TranscriptReducer {
       entry.attachments = [...attachments];
       this.changed(entry);
     });
+  }
+
+  /**
+   * Adds a block's view to a user entry: an image block inside a PDF note's pages adds its size to that note's view
+   * instead of being a picture of its own.
+   */
+  private attach(
+    entry: Extract<TranscriptEntry, { kind: 'user' }>,
+    read: NonNullable<ReturnType<typeof userAttachment>>,
+  ): void {
+    let slots = this.pdfPages.get(entry);
+    if (slots === undefined) {
+      slots = { images: 0, notes: [] };
+      this.pdfPages.set(entry, slots);
+    }
+    const list = [...(entry.attachments ?? [])];
+    if (read.view.kind === 'image') {
+      slots.images += 1;
+      const seen = slots.images;
+      const note = slots.notes.find((n) => seen >= n.from && seen <= n.to);
+      const pdf = note === undefined ? undefined : list[note.at];
+      if (note !== undefined && pdf?.kind === 'pdf') {
+        const bytes = read.view.bytes;
+        list[note.at] = { ...pdf, bytes: pdf.bytes + bytes, chars: pdf.chars + Math.ceil(bytes / 3) * 4 };
+        entry.attachments = list;
+        return;
+      }
+    }
+    if (read.pages !== undefined) slots.notes.push({ ...read.pages, at: list.length });
+    list.push(read.view);
+    entry.attachments = list;
   }
 
   /** The user's note on a call denied with one, pushed by the host when it sends the deny: a `user` entry with `note`. */
@@ -1952,7 +2001,8 @@ export class TranscriptReducer {
             if (this.turnPrompt === null) this.turnPrompt = entry;
             break;
           }
-          const attachment = userAttachment(content);
+          const read = userAttachment(content);
+          const attachment = read?.view ?? null;
           if (attachment === null && body === '') break;
           const interjection = meta.interjection === true;
           const hostNote = meta[NOTE_META] === true;
@@ -1984,7 +2034,7 @@ export class TranscriptReducer {
             promptIndex !== null &&
             prev.promptIndex === promptIndex
           ) {
-            if (attachment !== null) prev.attachments = [...(prev.attachments ?? []), attachment];
+            if (read !== null) this.attach(prev, read);
             else prev.text = prev.text === '' ? body : `${prev.text}\n${body}`;
             this.changed(prev);
           } else {
@@ -1995,8 +2045,8 @@ export class TranscriptReducer {
               promptIndex,
               ...(interjection ? { interjection: true } : {}),
               ...(!interjection && body === CONTINUE_PROMPT && isLengthEnd(prev) ? { continued: true as const } : {}),
-              ...(attachment === null ? {} : { attachments: [attachment] }),
             };
+            if (read !== null) this.attach(entry, read);
             if (!interjection) this.promptStarts(wasOpen);
             this.add(entry, !interjection);
             if (!interjection) this.noteCounts.clear();

@@ -76,6 +76,7 @@ function build(
     contextTokens: 262144,
     sizeBytes: sizeGb === null ? null : Math.round(sizeGb * GB),
     images: false,
+    family: null,
     ...over,
   };
 }

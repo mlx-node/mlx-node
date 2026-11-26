@@ -48,7 +48,9 @@ import { visibleText } from './agent/visible-text.js';
 import {
   attachmentView,
   type AttachmentInput,
+  CHAT_IMAGES_MAX,
   CHAT_PICTURES_MAX_BASE64,
+  imageCount,
   storedPictureChars,
 } from './attachment-rule.js';
 import { checkCommand } from './commands.js';
@@ -257,17 +259,22 @@ function modeChanged(): ApiError {
   return new ApiError('E_CONFLICT', 'The permission mode could not be changed.', 'mode-changed');
 }
 
-/** A message with pictures is refused once the chat's stored pictures and its own pass `maxBase64`. */
+/**
+ * A message with pictures or PDF pages is refused once the chat's stored ones and its own pass `maxBase64`, or the
+ * images the chat holds and its own pass {@link CHAT_IMAGES_MAX}.
+ */
 function checkPictureRoom(
   conversation: Conversation,
   attachments: readonly AttachmentInput[],
   maxBase64: number = CHAT_PICTURES_MAX_BASE64,
 ): void {
   const added = attachments.map(attachmentView);
-  if (!added.some((item) => item.kind === 'image')) return;
+  const images = imageCount(added);
+  if (images === 0) return;
   if (storedPictureChars([...conversation.userAttachments(), ...added]) > maxBase64) {
     throw chatRouteError('pictures-full');
   }
+  if (conversation.heldImages() + images > CHAT_IMAGES_MAX) throw chatRouteError('pictures-full');
 }
 
 /** The agent took the prompt and ran the turn to an end of its own: no Stop, no exit, no crash. */
@@ -1129,17 +1136,18 @@ export class ChatService {
   }
 
   /**
-   * A picture goes only to a Chat conversation whose model row takes pictures (`images`, as the host state lists it).
-   * The page blocks it first; this settles a model change that landed before this check. A change still in flight is
-   * caught by the engine's 400 and the agent's retry without the pictures.
+   * A picture goes only to a Chat conversation, a PDF to either mode, and both only when the model row takes images
+   * (`images`, as the host state lists it). The page blocks it first; this settles a model change that landed before
+   * this check. A change still in flight is caught by the engine's 400 and the agent's retry without the images.
    */
   private async checkImages(
     mode: ChatMode,
     modelId: string,
     attachments: readonly AttachmentInput[] = [],
   ): Promise<void> {
-    if (!attachments.some((a) => a.kind === 'image')) return;
-    if (mode === 'work') throw chatRouteError('attachment-refused');
+    const pictures = attachments.some((a) => a.kind === 'image');
+    if (!pictures && !attachments.some((a) => a.kind === 'pdf')) return;
+    if (pictures && mode === 'work') throw chatRouteError('attachment-refused');
     const row = (await this.state()).models.find((m) => m.id === modelId);
     if (row?.images !== true) throw chatRouteError('attachment-refused');
   }
@@ -3361,6 +3369,7 @@ export class ChatService {
         contextTokens: this.windows.get(m.name) ?? null,
         sizeBytes: sizes[index]!,
         images: inMemory.get(m.name)?.images ?? m.images ?? false,
+        family: m.modelType ?? null,
         ...(thinking === undefined ? {} : { thinking }),
       };
     });
@@ -3435,6 +3444,7 @@ export class ChatService {
       tempRoot: typedTop(this.tempRoots[0]),
       tempTop: this.tempRoots[0]?.top ?? null,
       scratchRoot: this.scratch,
+      pdfTool: { chat: false, work: false },
       appEnds,
     };
   }

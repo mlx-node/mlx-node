@@ -37,12 +37,12 @@ export interface AttachmentStripProps {
   label?: string;
 }
 
-/** The chips of a sent message: a file by name and size, a picture by type and size (the agent keeps no name). */
+/** The chips of a sent message: a file or a PDF by name and size, a picture by type and size (the agent keeps no name). */
 export function sentChips(attachments: readonly UserAttachment[]): AttachmentChipItem[] {
   return attachments.map((item, index) =>
-    item.kind === 'file'
-      ? { id: `${index}`, kind: 'file', name: item.name, bytes: item.bytes }
-      : { id: `${index}`, kind: 'image', mediaType: item.mediaType, bytes: item.bytes },
+    item.kind === 'image'
+      ? { id: `${index}`, kind: 'image', mediaType: item.mediaType, bytes: item.bytes }
+      : { id: `${index}`, kind: 'file', name: item.name, bytes: item.bytes },
   );
 }
 

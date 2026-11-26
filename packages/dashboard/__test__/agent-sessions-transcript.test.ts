@@ -16,7 +16,7 @@ import {
 } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
-import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
+import { attachmentView, pdfNote, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import { applyOp, Conversation, type HostView } from '../src/chat/conversation.js';
 import { redactEntry } from '../src/chat/redact.js';
 import type { ConversationEvent } from '../src/chat/types.js';
@@ -1295,6 +1295,81 @@ describe('parseUpdates: attachments of a user message', () => {
     ];
     const parsed = parseUpdates(`${lines.join('\n')}\n`).transcript;
     expect(parsed).toEqual([{ kind: 'wake', ts: expect.any(Number), cause: 'unknown', text: 'woke\n[image]' }]);
+  });
+
+  const PAGE_A = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5]).toString('base64');
+  const PAGE_B = Buffer.from([0xff, 0xd8, 0xff, 0xe0, 1, 2, 3, 4, 5, 6, 7, 8]).toString('base64');
+  const WITH_PDF: AttachmentInput[] = [
+    { kind: 'file', name: 'notes.md', text: 'a\n' },
+    { kind: 'pdf', name: 'paper.pdf', images: [PAGE_A, PAGE_B] },
+    { kind: 'image', mediaType: 'image/png', data: PNG },
+  ];
+
+  // Mutation: every image after a note taken as one of its pages → the picture before the pages joins the PDF → red.
+  it("a PDF's note and its page images are one PDF view; a picture of the same message stays a picture", () => {
+    expect(users(stored('what is the claim?', WITH_PDF))).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'what is the claim?',
+        promptIndex: 0,
+        attachments: [
+          { kind: 'file', name: 'notes.md', bytes: 2 },
+          { kind: 'pdf', name: 'paper.pdf', pages: 2, way: 'message', bytes: 9 + 12, chars: 12 + 16 },
+          { kind: 'image', mediaType: 'image/png', bytes: 16 },
+        ],
+      },
+    ]);
+  });
+
+  it('a tool note is a PDF view with its id and no pages; a later picture stays a picture', () => {
+    const toolNote = pdfNote({ name: 'report.pdf', pages: 212, way: 'tool', id: 'k3f9a2c1-212' });
+    const lines = [
+      user('summarize', 3),
+      block({ type: 'resource', resource: { uri: 'file:///attached/report.pdf', text: toolNote } }, 3, 2),
+      block({ type: 'image', mimeType: 'image/png', data: PNG }, 3, 3),
+    ];
+    expect(users(lines)).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'summarize',
+        promptIndex: 3,
+        attachments: [
+          { kind: 'pdf', name: 'report.pdf', pages: 212, way: 'tool', bytes: 0, chars: 0, id: 'k3f9a2c1-212' },
+          { kind: 'image', mediaType: 'image/png', bytes: 16 },
+        ],
+      },
+    ]);
+  });
+
+  // Mutation: a text file named like a PDF read as a note → red.
+  it('a text file named x.pdf without the note line stays a file, and its pictures stay pictures', () => {
+    const lines = [
+      user('two', 5),
+      block({ type: 'resource', resource: { uri: 'file:///attached/x.pdf', text: 'images: 1-1\n' } }, 5, 2),
+      block({ type: 'image', mimeType: 'image/jpeg', data: PAGE_A }, 5, 3),
+    ];
+    expect(users(lines)).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'two',
+        promptIndex: 5,
+        attachments: [
+          { kind: 'file', name: 'x.pdf', bytes: 12 },
+          { kind: 'image', mediaType: 'image/jpeg', bytes: 9 },
+        ],
+      },
+    ]);
+  });
+
+  it('live, a PDF message carries the same views the reader makes from its stored blocks', () => {
+    const reducer = new TranscriptReducer();
+    reducer.userPrompt('what is the claim?', WITH_PDF.map(attachmentView), 5);
+    const [entry] = reducer.snapshot().entries;
+    const [read] = users(stored('what is the claim?', WITH_PDF));
+    expect(entry!.kind === 'user' && entry.attachments).toEqual(read!.kind === 'user' && read.attachments);
   });
 
   it('live, the pushed prompt carries the same views the reader makes from the stored blocks, in the ops the page gets', () => {

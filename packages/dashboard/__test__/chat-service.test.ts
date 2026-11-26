@@ -1087,6 +1087,116 @@ describe('Chat service — attachments', () => {
       { endpointModels: [SEES] },
     );
   }, 20_000);
+
+  const PAGE = '/9j/4AAQ';
+  const pdf = (pages: number, name = 'paper.pdf'): AttachmentInput => ({
+    kind: 'pdf',
+    name,
+    images: Array<string>(pages).fill(PAGE),
+  });
+
+  // Mutation: the Work picture refusal dropped along with the PDF change → red; a PDF refused in Work → red.
+  it('a PDF goes to Work on a model that sees images; a picture in Work is still refused', async () => {
+    await withWork(
+      'work-always',
+      async (fake, project) => {
+        const svc = fake.service;
+        const { conversation } = await svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [pdf(2)] });
+        await until(() => fake.sent().some((m) => m.method === 'session/prompt'), 5_000);
+        const prompt = fake.sent().find((m) => m.method === 'session/prompt')!;
+        expect(prompt.params).toEqual(promptParams(conversation.id, 'read', [pdf(2)], { mode: 'agent' }));
+        expect(refusedAs(await apiError(svc.prompt(conversation.id, 'again', [pdf(1), PICTURE])))).toEqual(REFUSED);
+        const picture = await apiError(
+          svc.create({ mode: 'work', text: 'look', cwd: project, attachments: [PICTURE] }),
+        );
+        expect(refusedAs(picture)).toEqual(REFUSED);
+        expect(fake.sent().filter((m) => m.method === 'session/new')).toHaveLength(1);
+      },
+      { endpointModels: [SEES] },
+    );
+  }, 20_000);
+
+  // Mutation: a PDF let through on a model whose row has images false, in either mode → red.
+  it('a PDF on a model that does not see images is refused in Chat and in Work, before any session', async () => {
+    const chat = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES, BLIND] });
+    try {
+      const svc = chat.service;
+      const blind = await apiError(
+        svc.create({ mode: 'chat', text: 'read', modelId: BLIND.name, attachments: [pdf(1)] }),
+      );
+      expect(refusedAs(blind)).toEqual(REFUSED);
+      expect(chat.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+      const { conversation } = await svc.create({ mode: 'chat', text: 'hello', modelId: BLIND.name });
+      const page = new Page(svc, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(refusedAs(await apiError(svc.prompt(conversation.id, 'read', [pdf(1)])))).toEqual(REFUSED);
+      page.detach();
+    } finally {
+      await chat.close();
+    }
+    await withWork(
+      'work-always',
+      async (fake, project) => {
+        const work = await apiError(
+          fake.service.create({ mode: 'work', text: 'read', cwd: project, modelId: BLIND.name, attachments: [pdf(1)] }),
+        );
+        expect(refusedAs(work)).toEqual(REFUSED);
+        expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+      },
+      { endpointModels: [SEES, BLIND] },
+    );
+  }, 20_000);
+
+  const FULL = [
+    'E_CONFLICT',
+    'pictures-full',
+    'This chat has too many pictures to keep. Start a new chat to send more.',
+  ];
+
+  // Mutation: PDF pages left out of the picture room → the PDF goes out.
+  it('the pages of a PDF count in the stored pictures a chat can keep', async () => {
+    const cap = 1024;
+    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES], maxPicturesBase64: cap });
+    try {
+      const svc = fake.service;
+      const big: AttachmentInput = {
+        kind: 'image',
+        mediaType: 'image/png',
+        data: `iVBO${'A'.repeat(cap - 8)}`,
+      };
+      const { conversation } = await svc.create({ mode: 'chat', text: 'a big one', attachments: [big] });
+      const page = new Page(svc, conversation.id);
+      await until(() => page.ends().length === 1, 10_000);
+      expect(refusedAs(await apiError(svc.prompt(conversation.id, 'one page more', [pdf(1)])))).toEqual(FULL);
+      page.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  // Mutation: PDF pages left out of the images a chat holds → the 65th image goes out.
+  it('a message that would bring the images a chat holds past 64 is refused; 64 go', async () => {
+    const fake = fakeService('chat-basic', { mutate: scripted, endpointModels: [SEES] });
+    try {
+      const svc = fake.service;
+      const { conversation } = await svc.create({ mode: 'chat', text: 'first', attachments: [pdf(20)] });
+      const page = new Page(svc, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      for (const [n, text] of ['second', 'third'].entries()) {
+        await svc.prompt(conversation.id, text, [pdf(19, 'b.pdf'), PICTURE]);
+        await until(() => page.ends().length === n + 2, 5_000);
+      }
+      expect(refusedAs(await apiError(svc.prompt(conversation.id, 'five more', [pdf(5)])))).toEqual(FULL);
+      await svc.prompt(conversation.id, 'four more', [pdf(4)]);
+      await until(() => page.ends().length === 4, 5_000);
+      expect(refusedAs(await apiError(svc.prompt(conversation.id, 'one more', [PICTURE])))).toEqual(FULL);
+      await svc.prompt(conversation.id, 'text still goes', [FILE]);
+      await until(() => page.ends().length === 5, 5_000);
+      page.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
 });
 
 describe('Chat service — the host stream and redaction', () => {
@@ -2297,7 +2407,16 @@ describe('Chat service — thinking level', () => {
   }, 30_000);
 
   it('a fork copies the level into the copy’s composer file, with no queue', async () => {
-    const fake = fakeService('chat-basic', { mutate: levelled });
+    // The answer runs until Stop: a timed one can end before the row is queued, and the row then runs as a turn.
+    const held = (scenario: Json): void => {
+      levelled(scenario);
+      const never = join(String(scenario.recordTo), '..', 'never');
+      (scenario.prompts as Json[]).unshift({
+        match: 'hold',
+        steps: [{ holdOn: never }, { end: { stopReason: 'end_turn' } }],
+      });
+    };
+    const fake = fakeService('chat-basic', { mutate: held });
     try {
       const svc = fake.service;
       const { conversation } = await svc.create({ mode: 'chat', text: 'hi', thinking: 'none' });
@@ -2305,7 +2424,7 @@ describe('Chat service — thinking level', () => {
       const page = new Page(svc, id);
       await until(() => page.ends().length === 1, 5_000);
       // A row held by Stop stays the original's.
-      await svc.prompt(id, 'slow please');
+      await svc.prompt(id, 'hold please');
       await until(() => page.state?.turn?.phase === 'running', 5_000);
       await svc.prompt(id, 'queued for the original', [], undefined, 'queue');
       await svc.cancel(id);

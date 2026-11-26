@@ -9,7 +9,7 @@ import { mergeRunState, type RunState } from '../agent-sessions/run-state.js';
 import { TranscriptReducer, type UpdateLine } from '../agent-sessions/transcript.js';
 import type { TranscriptEntry, TurnMetric } from '../agent-sessions/types.js';
 import { shownCut } from './agent/permissions.js';
-import type { UserAttachment } from './attachment-rule.js';
+import { heldImages, type UserAttachment } from './attachment-rule.js';
 import {
   needleList,
   redactCutText,
@@ -203,6 +203,11 @@ export class Conversation {
       if (entry.kind === 'user' && entry.attachments !== undefined) out.push(...entry.attachments);
     }
     return out;
+  }
+
+  /** The images the current base holds ({@link heldImages}), live ones included. */
+  heldImages(): number {
+    return heldImages(this.base?.view ?? []);
   }
 
   /** The disk entries of the current base, or undefined when there is none. */

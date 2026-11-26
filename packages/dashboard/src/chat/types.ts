@@ -990,9 +990,9 @@ export interface ChatHostState {
    * `variant` names the build, unique inside its base; `sizeBytes` is the size on disk (every part of a split GGUF), null
    * when unknown; `contextTokens` is the window an agent process last listed for the model (kept on disk, so known
    * while no agent runs), null before any agent listed one. `images`: the model takes pictures, by the loaded model's
-   * own answer while it is in memory, else by its files on disk. `thinking`: the levels an agent process listed for the
-   * model in this app run (null: it listed none); absent before a process listed the model, so the Thinking row is not
-   * drawn.
+   * own answer while it is in memory, else by its files on disk. `family`: the engine's model family (`qwen3_5`,
+   * `gemma4`, …), null when the endpoint names none. `thinking`: the levels an agent process listed for the model in
+   * this app run (null: it listed none); absent before a process listed the model, so the Thinking row is not drawn.
    */
   models: Array<{
     id: string;
@@ -1002,6 +1002,7 @@ export interface ChatHostState {
     contextTokens: number | null;
     sizeBytes: number | null;
     images: boolean;
+    family: string | null;
     thinking?: ModelThinking | null;
   }>;
   /** The resident chat model when one is in `models`, else the first of `models`. */
@@ -1051,6 +1052,8 @@ export interface ChatHostState {
   tempTop: string | null;
   /** Where Work without a folder makes each conversation's own folder (`~/Portato`). */
   scratchRoot: string;
+  /** Per mode, whether a PDF that does not fit one message can go to the PDF tool. */
+  pdfTool: { chat: boolean; work: boolean };
   /** How earlier Control Panel lives ended, newest first, from MAIN's ledger: what stopped a turn that was running. */
   appEnds: AppEnd[];
 }

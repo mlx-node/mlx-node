@@ -3850,6 +3850,7 @@ describe('Chat page: conversation actions', () => {
       contextTokens: 262144,
       sizeBytes: gb * 1024 ** 3,
       images: false,
+      family: null,
     });
     const models = [hostModel('qwen3.5-4b', 32768), build(XL, 'UD-Q4_K_XL', 17.6), build(M, 'UD-Q4_K_M', 16.5)];
     await open('/chat?c=p-quant', (text) => text.includes('Hi there'), {

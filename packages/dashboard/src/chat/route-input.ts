@@ -17,16 +17,24 @@ import {
 import { OPTIONS_MAX, QUESTIONS_MAX, type QuestionAnswerInput } from './agent/questions.js';
 import {
   ATTACH_MAX,
+  attachmentView,
   base64Bytes,
   FILE_NUMBERED_MAX_BYTES,
   IMAGE_MAX_BASE64_CHARS,
   IMAGE_MAX_BYTES,
   isBase64,
+  isPdfNoteText,
   magicMatches,
   MESSAGE_FILES_MAX_BYTES,
+  MESSAGE_IMAGES_MAX_BASE64,
   NAME_IN_MAX_CHARS,
   numberedBytes,
+  PAGE_MAX_BASE64_CHARS,
+  PAGE_MAX_BYTES,
+  PDF_MESSAGE_PAGES,
+  pdfNotes,
   safeName,
+  storedPictureChars,
   wellFormed,
   utf8Bytes,
   type AttachmentInput,
@@ -117,14 +125,20 @@ function hasExactKeys(record: Record<string, unknown>, keys: readonly string[]):
   return own.length === keys.length && keys.every((key) => Object.hasOwn(record, key));
 }
 
+function checkName(name: unknown): name is string {
+  return typeof name === 'string' && name.length > 0 && name.length <= NAME_IN_MAX_CHARS;
+}
+
 function checkAttachment(item: unknown): { attachment: AttachmentInput; textBytes: number } {
   const refused = chatRouteError('attachment-refused');
   if (!isPlainObject(item)) throw refused;
   if (item.kind === 'file') {
     if (!hasExactKeys(item, ['kind', 'name', 'text'])) throw refused;
     const { name, text } = item;
-    if (typeof name !== 'string' || name.length === 0 || name.length > NAME_IN_MAX_CHARS) throw refused;
+    if (!checkName(name)) throw refused;
     if (typeof text !== 'string' || !wellFormed(text) || text.includes('\0') || text.trim() === '') throw refused;
+    // The transcript reader takes a resource that starts with the note's line as a PDF.
+    if (isPdfNoteText(text)) throw refused;
     const textBytes = numberedBytes(text);
     if (textBytes > FILE_NUMBERED_MAX_BYTES) throw refused;
     return { attachment: { kind: 'file', name: safeName(name), text }, textBytes };
@@ -137,26 +151,46 @@ function checkAttachment(item: unknown): { attachment: AttachmentInput; textByte
     if (!isBase64(data) || base64Bytes(data) > IMAGE_MAX_BYTES || !magicMatches(mediaType, data)) throw refused;
     return { attachment: { kind: 'image', mediaType, data }, textBytes: 0 };
   }
+  if (item.kind === 'pdf') {
+    if (!hasExactKeys(item, ['kind', 'name', 'images'])) throw refused;
+    const { name, images } = item;
+    if (!checkName(name)) throw refused;
+    if (!Array.isArray(images) || images.length === 0 || images.length > PDF_MESSAGE_PAGES) throw refused;
+    const pages: string[] = [];
+    for (const page of images as unknown[]) {
+      if (typeof page !== 'string' || page.length < 4 || page.length > PAGE_MAX_BASE64_CHARS) throw refused;
+      if (!isBase64(page) || base64Bytes(page) > PAGE_MAX_BYTES || !magicMatches('image/jpeg', page)) throw refused;
+      pages.push(page);
+    }
+    return { attachment: { kind: 'pdf', name: safeName(name), images: pages }, textBytes: 0 };
+  }
   throw refused;
 }
 
 /**
  * The attachments of a message, every limit checked: at most {@link ATTACH_MAX}; a file is well-formed text with no
- * NUL and a cleaned name; a picture is PNG or JPEG base64 whose first bytes match its type; the message text and the
- * numbered file text together stay under the agent's prompt cut. Empty is no attachments. Any failure is
+ * NUL and a cleaned name, and does not start like a PDF note; a picture is PNG or JPEG base64 whose first bytes match
+ * its type; a PDF is 1 to 20 JPEG pages of at most {@link PAGE_MAX_BYTES} each. In all, at most
+ * {@link PDF_MESSAGE_PAGES} pages, {@link MESSAGE_IMAGES_MAX_BASE64} of picture and page base64, and the message text
+ * with the numbered file and note text under the agent's prompt cut. Empty is no attachments. Any failure is
  * `attachment-refused`.
  */
 export function checkAttachments(value: unknown[], text: string): AttachmentInput[] | undefined {
   if (value.length === 0) return undefined;
-  if (value.length > ATTACH_MAX) throw chatRouteError('attachment-refused');
+  const refused = chatRouteError('attachment-refused');
+  if (value.length > ATTACH_MAX) throw refused;
   let bytes = utf8Bytes(text);
+  let pages = 0;
   const out: AttachmentInput[] = [];
   for (const item of value) {
     const { attachment, textBytes } = checkAttachment(item);
     bytes += textBytes;
+    if (attachment.kind === 'pdf') pages += attachment.images.length;
     out.push(attachment);
   }
-  if (bytes > MESSAGE_FILES_MAX_BYTES) throw chatRouteError('attachment-refused');
+  for (const note of pdfNotes(out)) bytes += numberedBytes(note);
+  if (bytes > MESSAGE_FILES_MAX_BYTES || pages > PDF_MESSAGE_PAGES) throw refused;
+  if (storedPictureChars(out.map(attachmentView)) > MESSAGE_IMAGES_MAX_BASE64) throw refused;
   return out;
 }
 
