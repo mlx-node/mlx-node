@@ -136,16 +136,16 @@ its levels only set the effort number in its prompt (Off 0, Low 0.2, Medium 0.7,
 Inkling2 thought can use the answer room. The agent (the app and `mlx agent` need mlx-agent v0.3.6 or later,
 `MLX_AGENT_MIN_RELEASE`) builds its `reasoning_effort` session option from those rows and adds the level as
 `extra_body.reasoning_effort` (`none` for Off, never `minimal`) only for a model whose `/v1/models` row has
-`owned_by: "mlx-node"` and lists `reasoningEfforts`. There it goes beside `output_config.effort` and
+`owned_by: "mlx-node"` and lists `reasoningEfforts` or `reasoning_efforts` (it reads `reasoningEfforts` first). There it goes beside `output_config.effort` and
 `thinking: {type: "adaptive"}`, which the engine never reads, so the extra field carries the level; Off sends that field
 alone, with no thought config. `chat-thinking-levels-real-agent.test.ts` compares its request with one for a row with
 no levels: they differ in those three fields alone. It keeps the level in each session's `summary.json`, so the
 Sessions detail lists `Reasoning high`. `mlx serve` by hand and `mlx launch claude` do not set the option: their
-requests map as before. Every other Messages endpoint gets no `extra_body` (a strict one answers 400 to an unknown
-field). The engine keeps its side of
-that rule: every host `/v1/models` row says `owned_by: "mlx-node"`, and only a server with `thinkingLevels` lists
-`reasoningEfforts` (`__test__/server/models-list.test.ts`), so against `mlx serve` by hand the agent sends no
-`extra_body`.
+rows list only the family's `reasoning_efforts` (`reasoningEffortsFor` of `@mlx-node/lm` family-data), and the effort
+a request names goes to the model as `reasoningEffort`. Every other Messages endpoint gets no `extra_body` (a strict
+one answers 400 to an unknown field). Every host `/v1/models` row says `owned_by: "mlx-node"`, and only a server with
+`thinkingLevels` lists `reasoningEfforts` (`__test__/server/models-list.test.ts`). A family with no levels of its own
+keeps only its `reasoning_efforts` there, so the agent offers Gemma 4 Off and High.
 
 One capability flag goes out at `initialize`, in both modes: `clientCapabilities._meta` =
 `{"x.ai/incrementalBashOutput": true}` (`initializeParams`, `src/chat/agent/profiles.ts`; `fs` and `terminal` stay

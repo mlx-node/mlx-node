@@ -105,13 +105,16 @@ describe('Messages effort: the mapper', () => {
     expect(mapAnthropicRequest(enabled, 'lfm2').config.thinkingTokenBudget).toBe(3000);
   });
 
-  it('a value outside the engine set is refused, levels on or off; minimal included', () => {
+  it('a value outside the engine set is refused, levels on or off; minimal maps as named', () => {
     for (const family of [undefined, 'qwen3_5', 'gemma4']) {
-      for (const bad of ['minimal', 'bogus', 'HIGH', '']) {
+      for (const bad of ['bogus', 'HIGH', '']) {
         expect(() => mapAnthropicRequest(withEffort(bad), family), `${family} ${bad}`).toThrow(
           'Invalid extra_body.reasoning_effort',
         );
       }
+      const minimal = mapAnthropicRequest(withEffort('minimal'), family).config;
+      expect(minimal.reasoningEffort, String(family)).toBe('minimal');
+      expect(minimal.thinkingTokenBudget, String(family)).toBeUndefined();
     }
   });
 
@@ -410,11 +413,9 @@ describe('Messages effort: the server', () => {
   it('an unknown value is a 400 with levels on or off', async () => {
     for (const options of [{}, { ...AGENT_HOST, thinkingLevels: true }]) {
       const { post } = await serve(options);
-      for (const bad of ['minimal', 'bogus']) {
-        const { status, text } = await post({ model: 'q35', extra_body: { reasoning_effort: bad } });
-        expect(status).toBe(400);
-        expect(text).toContain('Invalid extra_body.reasoning_effort');
-      }
+      const { status, text } = await post({ model: 'q35', extra_body: { reasoning_effort: 'bogus' } });
+      expect(status).toBe(400);
+      expect(text).toContain('Invalid extra_body.reasoning_effort');
     }
   });
 
