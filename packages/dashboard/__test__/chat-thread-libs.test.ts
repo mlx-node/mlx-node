@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vite-plus/test';
 
+import { sentChips } from '../ui/src/components/arc-x/attachment-strip/attachment-strip.js';
 import { DashboardApiError } from '../ui/src/lib/api.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import {
@@ -21,6 +22,7 @@ import {
   fullLimit,
   loadFor,
   loadVariant,
+  messagePages,
   modelDetail,
   mountedFor,
   openRetry,
@@ -285,6 +287,83 @@ describe('outcomes', () => {
     expect(pendingRow({ ...base, engine: null })).toEqual(label(CHAT.pendingWorking, 'think'));
     expect(pendingRow({ ...base, engine: null, quiet: true })).toEqual(label(CHAT.pendingWaiting));
     expect(pendingRow({ ...base, work: false })).toEqual(label(CHAT.pendingThinking, 'think'));
+  });
+
+  it('a message with PDF pages: the prompt read names its pages, with counts or the total alone, never "0 of"', () => {
+    const base = {
+      creating: false,
+      phase: 'running' as const,
+      wait: null,
+      model: 'qwen-a',
+      loading: null,
+      inference: 'ready' as const,
+      quiet: false,
+      full: null,
+      pages: 2,
+    };
+    const ours = (done: number | null, total: number | null) => ({
+      kind: 'ours' as const,
+      phase: 'prefill' as const,
+      done,
+      total,
+    });
+    expect(pendingRow({ ...base, engine: ours(620, 1_540) })).toEqual({
+      kind: 'label',
+      text: fill(CHAT.pendingReadingPagesOf, { n: '2', done: '620', total: '1,540' }),
+      orb: 'think',
+      progress: { done: 620, total: 1_540 },
+    });
+    expect(pendingRow({ ...base, engine: ours(0, 1_540) })).toEqual({
+      kind: 'label',
+      text: fill(CHAT.pendingReadingPagesTotal, { n: '2', total: '1,540' }),
+      orb: 'think',
+      progress: { total: 1_540 },
+    });
+    expect(pendingRow({ ...base, engine: ours(null, null) })).toEqual({
+      kind: 'label',
+      text: fill(CHAT.pendingReadingPages, { n: '2' }),
+      orb: 'think',
+    });
+    expect(pendingRow({ ...base, pages: 1, engine: ours(0, 900) })).toMatchObject({
+      text: fill(CHAT.pendingReadingPageTotal, { total: '900' }),
+    });
+    // Once the turn has worked, a later read is the conversation's.
+    expect(pendingRow({ ...base, work: true, engine: ours(0, 1_540) })).toMatchObject({
+      text: fill(CHAT.pendingReadingTotal, { total: '1,540' }),
+    });
+    expect(pendingRow({ ...base, pages: 0, engine: ours(620, 1_540) })).toMatchObject({
+      text: fill(CHAT.pendingReadingOf, { done: '620', total: '1,540' }),
+    });
+  });
+
+  it('a message carries the pages of its PDFs that went in it; a sent PDF chip names its pages', () => {
+    const pdf = { kind: 'pdf' as const, name: 'a.pdf', pages: 3, way: 'message' as const, bytes: 9_000, chars: 12_000 };
+    const tool = {
+      kind: 'pdf' as const,
+      name: 'b.pdf',
+      pages: 40,
+      way: 'tool' as const,
+      bytes: 0,
+      chars: 0,
+      id: 'k3f9a2c1-40',
+    };
+    const picture = { kind: 'image' as const, mediaType: 'image/png', bytes: 10 };
+    const sent: TranscriptEntry = {
+      kind: 'user',
+      ts: 1,
+      text: 'q',
+      promptIndex: null,
+      attachments: [picture, pdf, tool, { ...pdf, pages: 2 }],
+    };
+    const turn = splitTurns([sent, answer('a')], []);
+    expect(messagePages(turn[0])).toBe(5);
+    expect(messagePages(splitTurns([user('q')], [])[0])).toBe(0);
+    expect(messagePages(undefined)).toBe(0);
+    expect(sentChips([picture, pdf, tool])).toEqual([
+      { id: '0', kind: 'image', mediaType: 'image/png', bytes: 10 },
+      { id: '1', kind: 'pdf', name: 'a.pdf', bytes: 9_000, pages: 3, way: 'message' },
+      { id: '2', kind: 'pdf', name: 'b.pdf', bytes: 0, pages: 40, way: 'tool' },
+    ]);
   });
 
   it("the engine's requests: this conversation's newest by its session, else the model's words, else nothing", () => {

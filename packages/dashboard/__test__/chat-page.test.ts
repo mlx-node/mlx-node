@@ -4133,7 +4133,7 @@ describe('Chat page: files and pictures', () => {
       host: host({ inference: 'starting' }),
     });
     pick(new File(['%PDF-1.7'], 'report.pdf', { type: 'application/pdf' }));
-    const sentence = fill(CHAT.attach.errors.pdf, { name: 'report.pdf' });
+    const sentence = fill(CHAT.attach.errors.pdfModel, { name: 'report.pdf' });
     await waitFor(() => allByRole(form(), 'status').some((node) => node.textContent === sentence));
     expect(shown(form())).toContain(CHAT.blockers['inference-starting']);
     type('Now text');

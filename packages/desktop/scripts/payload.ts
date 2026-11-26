@@ -15,6 +15,7 @@ import {
   assertMlxMetallibCarriesNax,
   assertPagedMetallibIntegrity,
 } from '../../core/metallib-select.js';
+import { PDFJS_WORKER, pdfjsBase } from '../../dashboard/ui/pdfjs-assets.js';
 
 /**
  * The three native files, which MUST end up in ONE directory together.
@@ -83,14 +84,7 @@ export function resolvePayload(repoRoot: string): PayloadSource {
   checkMetallibPair(native['mlx.metallib']!, native['paged_attn.metallib']!);
 
   const wwwRoot = join(repoRoot, 'packages', 'dashboard', 'web');
-  // index.html specifically: the directory survives a failed build, and an empty
-  // `www` produces a blank window with no error rather than a packaging failure.
-  if (!existsSync(join(wwwRoot, 'index.html'))) {
-    throw new PayloadError(
-      `Dashboard SPA not built: ${join(wwwRoot, 'index.html')} is missing`,
-      'yarn workspace @mlx-node/dashboard build:ui',
-    );
-  }
+  checkSpa(wwwRoot);
 
   const appDir = join(repoRoot, 'packages', 'desktop');
   if (!existsSync(join(appDir, 'dist', 'main', 'index.js'))) {
@@ -107,6 +101,22 @@ export function resolvePayload(repoRoot: string): PayloadSource {
   }
 
   return { native, wwwRoot, appDir };
+}
+
+/**
+ * The built SPA holds `index.html` and the pdf.js worker. index.html specifically: the directory survives a failed
+ * build, and an empty `www` produces a blank window with no error rather than a packaging failure. The worker is
+ * copied after the bundle, not bundled, and without it every PDF the person adds fails to open.
+ */
+export function checkSpa(wwwRoot: string): void {
+  for (const file of ['index.html', join(pdfjsBase(), PDFJS_WORKER)]) {
+    if (!existsSync(join(wwwRoot, file))) {
+      throw new PayloadError(
+        `Dashboard SPA not built: ${join(wwwRoot, file)} is missing`,
+        'yarn workspace @mlx-node/dashboard build:ui',
+      );
+    }
+  }
 }
 
 /**

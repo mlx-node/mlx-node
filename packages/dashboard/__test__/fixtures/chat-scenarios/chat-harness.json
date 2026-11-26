@@ -2890,6 +2890,29 @@
         ]
       },
       {
+        "match": "pdfwait",
+        "steps": [
+          {
+            "sleepMs": 40000
+          },
+          {
+            "text": "The three pages are notes.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
         "match": "readpdf",
         "steps": [
           {

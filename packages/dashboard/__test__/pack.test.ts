@@ -16,9 +16,10 @@ const assetsDir = join(webDir, 'assets');
 
 /**
  * Ceilings in bytes that only an accident reaches: a whole library or its locales pulled in, source maps, a second
- * copy of a dependency. Features grow the bundle and stay far below them (JS 1.82 MB, CSS 344 KB on 2026-11-24).
+ * copy of a dependency. Features grow the bundle and stay far below them (JS 3.12 MB with pdf.js, CSS 414 KB on
+ * 2026-11-27).
  */
-const JS_CAP_BYTES = 3_000_000;
+const JS_CAP_BYTES = 4_000_000;
 const CSS_CAP_BYTES = 600_000;
 const FONTS_CAP_BYTES = 230_000;
 
@@ -27,8 +28,9 @@ const HARNESS_STRINGS = ['__gallery', 'dev-fixture', '.dev-home', 'mlx:dev-', 'd
 
 /**
  * Every URL the shipped JS may hold, by prefix. None is fetched at run time (CSP `connect-src 'self'`): XML namespace
- * names, the parse base of a router, library help text, and the Hugging Face model page and the web search providers'
- * key and billing pages that links open in the system browser. A new URL fails here so somebody looks at it.
+ * names, the parse bases of a router and of pdf.js, library help text, and the Hugging Face model page and the web
+ * search providers' key and billing pages that links open in the system browser. A new URL fails here so somebody
+ * looks at it.
  */
 const JS_URL_PREFIXES = [
   'http://www.w3.org/',
@@ -36,6 +38,8 @@ const JS_URL_PREFIXES = [
   'http://127.0.0.1',
   'https://react.dev/errors/',
   'https://reactrouter.com/en/main/routers/picking-a-router',
+  'https://foo.bar',
+  'http://example.com',
   'https://github.com/ungap/url-search-params',
   'https://github.com/syntax-tree/hast-util-to-jsx-runtime',
   'https://huggingface.co/',
@@ -169,6 +173,7 @@ const DEV_DEPENDENCIES = [
   'markstream-react',
   'motion',
   'oxc-parser',
+  'pdfjs-dist',
   'playwright-core',
   'react',
   'react-dom',

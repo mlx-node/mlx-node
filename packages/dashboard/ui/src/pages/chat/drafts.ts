@@ -5,7 +5,7 @@
  */
 
 import { isThinkingLevel } from '../../../../src/chat/thinking-levels.js';
-import { attachQueue, type DraftAttachment } from '../../lib/chat-attachments';
+import { attachQueue, type DraftAttachment, type PdfDrawing } from '../../lib/chat-attachments';
 import { CHAT } from '../../lib/chat-strings';
 import type { ChatMode, ThinkingLevel } from '../../lib/chat-types';
 import type { StripNotice } from './blockers';
@@ -15,6 +15,21 @@ export const NEW_PLACE = 'new';
 
 const drafts = new Map<string, string>();
 const attachments = new Map<string, readonly DraftAttachment[]>();
+
+/**
+ * A PDF whose read runs: its chip shows from the start. `total` is null until the file is open; `thumbnail` is page 1
+ * once drawn. `stop` cancels the read when the chip is removed.
+ */
+export interface PendingPdf extends Omit<PdfDrawing, 'total'> {
+  id: string;
+  name: string;
+  total: number | null;
+  thumbnail: string | null;
+  stop: AbortController;
+}
+
+const pending = new Map<string, readonly PendingPdf[]>();
+const NO_PENDING: readonly PendingPdf[] = [];
 /** How often `forgetPlace` removed each place: a read that started before a delete must not bring its files back. */
 const forgets = new Map<string, number>();
 const NO_ATTACHMENTS: readonly DraftAttachment[] = [];
@@ -91,6 +106,40 @@ export function writeAttachments(
   changed();
 }
 
+export function readPending(place: string): readonly PendingPdf[] {
+  return pending.get(place) ?? NO_PENDING;
+}
+
+/** Adds, replaces (same id) or with `null` removes one pending PDF; dropped when the place was forgotten since `epoch`. */
+export function writePending(
+  place: string,
+  id: string,
+  item: PendingPdf | null,
+  epoch: number = placeEpoch(place),
+): void {
+  if (epoch !== placeEpoch(place)) return;
+  const items = readPending(place);
+  const at = items.findIndex((entry) => entry.id === id);
+  if (item === null && at === -1) return;
+  const next = item === null ? items.filter((entry) => entry.id !== id) : [...items];
+  if (item !== null) {
+    if (at === -1) next.push(item);
+    else next[at] = item;
+  }
+  if (next.length === 0) pending.delete(place);
+  else pending.set(place, next);
+  changed();
+}
+
+/** Cancels the read of a pending PDF and drops its chip; false when no read of that id runs. */
+export function stopPending(place: string, id: string): boolean {
+  const item = readPending(place).find((entry) => entry.id === id);
+  if (item === undefined) return false;
+  item.stop.abort();
+  writePending(place, id, null);
+  return true;
+}
+
 export function readFailed(place: string): FailedSend | null {
   return failures.get(place) ?? null;
 }
@@ -138,6 +187,8 @@ export function forgetPlace(id: string): void {
   if (lastPlace.work === id) lastPlace.work = null;
   drafts.delete(id);
   attachments.delete(id);
+  for (const item of readPending(id)) item.stop.abort();
+  pending.delete(id);
   failures.delete(id);
   plans.delete(id);
   planNoticed.delete(id);

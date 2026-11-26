@@ -22,11 +22,13 @@ import {
   MLX_NAX_ONLY_MARKERS,
   NAX_KERNEL_MARKERS,
 } from '../../core/metallib-select.js';
+import { copyPdfjs, PDFJS_WORKER, pdfjsBase } from '../../dashboard/ui/pdfjs-assets.js';
 import {
   APP_PDFJS_RUNTIME_DIRS,
   assertDarwinAppRuntimeAssets,
   checkAddonMinOs,
   checkMetallibPair,
+  checkSpa,
   DARWIN_APP_RUNTIME_FILES,
   findStagedNativeAddons,
   needsDylibIdRewrite,
@@ -366,4 +368,39 @@ describe('assertDarwinAppRuntimeAssets', () => {
       expect(() => assertDarwinAppRuntimeAssets(appDir)).toThrow(relDir);
     },
   );
+});
+
+describe('checkSpa', () => {
+  let www: string;
+  beforeEach(() => {
+    www = mkdtempSync(join(tmpdir(), 'desktop-www-'));
+    writeFileSync(join(www, 'index.html'), '<!doctype html>');
+  });
+  afterEach(() => {
+    rmSync(www, { recursive: true, force: true });
+  });
+
+  it("the build's pdf.js copy step puts the worker where the page starts it", () => {
+    copyPdfjs(www);
+    expect(existsSync(join(www, pdfjsBase(), PDFJS_WORKER))).toBe(true);
+    expect(() => checkSpa(www)).not.toThrow();
+  });
+
+  it('a www with index.html but no pdf.js worker is refused with the build command', () => {
+    let caught: unknown;
+    try {
+      checkSpa(www);
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(PayloadError);
+    expect((caught as PayloadError).message).toContain(join(pdfjsBase(), PDFJS_WORKER));
+    expect((caught as PayloadError).remedy).toBe('yarn workspace @mlx-node/dashboard build:ui');
+  });
+
+  it('a www with no index.html is refused', () => {
+    copyPdfjs(www);
+    rmSync(join(www, 'index.html'));
+    expect(() => checkSpa(www)).toThrow('index.html is missing');
+  });
 });

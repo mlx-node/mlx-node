@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite';
 import react from '@vitejs/plugin-react';
 import { defineConfig } from 'vite-plus';
 
+import { pdfjsAssets } from './pdfjs-assets';
+
 /** markstream's optional peers, loaded by bare dynamic imports; subpaths first, the first match wins. */
 const MARKSTREAM_OFF = resolve(import.meta.dirname, 'src/lib/markstream-off.ts');
 
@@ -11,7 +13,7 @@ const MARKSTREAM_OFF = resolve(import.meta.dirname, 'src/lib/markstream-off.ts')
 // handed to it by the desktop app's preload, not over HTTP. There is no port to
 // proxy to, and `vite dev` alone therefore has no backend.
 export default defineConfig({
-  plugins: [react(), tailwindcss()],
+  plugins: [react(), tailwindcss(), pdfjsAssets()],
   resolve: {
     alias: {
       '@': resolve(import.meta.dirname, 'src'),

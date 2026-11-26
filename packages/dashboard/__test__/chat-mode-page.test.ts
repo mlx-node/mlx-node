@@ -2498,7 +2498,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
 });
 
 describe('files on the shared New screen', () => {
-  it('a picture attached in Chat blocks Send in Work with the Work sentence, and the + row says text files only', async () => {
+  it('a picture attached in Chat blocks Send in Work with the Work sentence, and the + row says text files and PDFs', async () => {
     chooseFolder({ kind: 'folder', path: FOLDER });
     writeAttachments(NEW_PLACE, [
       {
@@ -2533,6 +2533,6 @@ describe('files on the shared New screen', () => {
     click(buttonIn(form(), CHAT.tools));
     await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
     const row = byRole(document.body, 'menuitem', CHAT.attach.row)!;
-    expect(row.textContent).toContain(CHAT.attach.noteWork);
+    expect(row.textContent).toContain(CHAT.attach.noteWorkPdf);
   });
 });

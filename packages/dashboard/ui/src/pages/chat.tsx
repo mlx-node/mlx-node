@@ -38,6 +38,8 @@ import {
   type AttachmentInput,
   attachmentView,
   estimateTokens,
+  heldImages,
+  imageCount,
   WINDOW_SHARE,
 } from '../../../src/chat/attachment-rule.js';
 import { stepLevel } from '../../../src/chat/thinking-levels.js';
@@ -77,6 +79,7 @@ import {
 import { ForkOrigin } from '../components/history-mark';
 import { planModeStatus } from '../components/plan-mode-line';
 import { UnloadButton } from '../components/unload-button';
+import { useNow } from '../components/wait-clock';
 import {
   type Activity,
   activityOf,
@@ -91,7 +94,7 @@ import type { MessageEnd, MessageTarget } from '../lib/agent-message';
 import { agentMarkCounts, neighbourAgent } from '../lib/agent-view';
 import { type AgentAsk, type AgentRow as AgentRowData, agentRowOf, runAgents, subagentRows } from '../lib/agents';
 import { DashboardApiError, getJson, mutate } from '../lib/api';
-import { type DraftAttachment, draftInput } from '../lib/chat-attachments';
+import { type DraftAttachment, drawCaption, draftInput, draftTokens, type PdfWatch } from '../lib/chat-attachments';
 import { isSlashText, slashRest, type AppCommand as AppCommandName } from '../lib/chat-input';
 import { NO_QUEUE, type ConversationState } from '../lib/chat-store';
 import { CHAT, fill } from '../lib/chat-strings';
@@ -163,6 +166,7 @@ import {
   readAttachments,
   readDraft,
   readFailed,
+  readPending,
   pickPath,
   readPlan,
   recentFolders,
@@ -173,12 +177,14 @@ import {
   storeMode,
   storeModel,
   storeThinking,
+  stopPending,
   storeVariant,
   subscribeDrafts,
   takePlanNotice,
   writeAttachments,
   writeDraft,
   writeFailed,
+  writePending,
   writePlan,
 } from './chat/drafts';
 import {
@@ -418,6 +424,7 @@ export default function Chat(): ReactElement {
   const [stripError, setStripError] = useState<StripNotice | null>(null);
   const failed = useSyncExternalStore(subscribeDrafts, () => readFailed(place));
   const held = useSyncExternalStore(subscribeDrafts, () => readAttachments(place));
+  const drawing = useSyncExternalStore(subscribeDrafts, () => readPending(place));
   /** Why the last files picked, pasted or dropped on a place were not added. */
   const [attachNote, setAttachNote] = useState<{ place: string; text: string } | null>(null);
   /** Files still being read, per place. */
@@ -631,7 +638,11 @@ export default function Chat(): ReactElement {
     : conv?.conversation.thinking;
   const levelShown = modelLevels == null ? undefined : stepLevel(levelPicked, modelLevels);
   const seesImages = mode === 'chat' && modelRow?.images === true;
+  // PDF pages are images too, but they go to an image model in Work as well.
+  const seesPages = modelRow?.images === true;
   const windowTokens = modelRow?.contextTokens ?? null;
+  const family = modelRow?.family ?? null;
+  const pdfTool = host?.pdfTool[mode] ?? false;
   const bases = useMemo(
     () => (host === null ? [] : modelBases(host, resident, mode, modelValue, picked, { level: levelPicked, busy })),
     [host, resident, mode, modelValue, picked, levelPicked, busy],
@@ -862,10 +873,20 @@ export default function Chat(): ReactElement {
     () => (threadEntries === undefined ? 0 : heldPictureChars(threadEntries)),
     [threadEntries],
   );
+  const heldPages = useMemo(() => (threadEntries === undefined ? 0 : heldImages(threadEntries)), [threadEntries]);
+  const attachFacts = {
+    mode,
+    seesImages,
+    seesPages,
+    windowTokens,
+    family,
+    contextUsed,
+    heldPictures,
+    heldImages: heldPages,
+    pdfTool,
+  };
   if (blocked === undefined)
-    blocked =
-      attachProblem({ mode, seesImages, text: draft, files: held, windowTokens, reading: readingHere, heldPictures }) ??
-      undefined;
+    blocked = attachProblem({ ...attachFacts, text: draft, files: held, reading: readingHere }) ?? undefined;
   const queueFull = (phase === 'starting' || phase === 'running' || phase === 'op') && queued.count >= QUEUE_MAX;
   // ⌘Enter puts text alone into the running answer: no place in the list, so a full list leaves it on.
   const steerDraft = steerOpen && held.length === 0 && !isSlashText(draft);
@@ -1061,15 +1082,7 @@ export default function Chat(): ReactElement {
     if (isNew && mode === 'work' && workGit.switching !== null) return;
     if (!isNew && cwdProblem !== undefined) return;
     if (modeUnknown) return;
-    const problem = attachProblem({
-      mode,
-      seesImages,
-      text,
-      files,
-      windowTokens,
-      reading: from === 'composer' ? readingHere : 0,
-      heldPictures,
-    });
+    const problem = attachProblem({ ...attachFacts, text, files, reading: from === 'composer' ? readingHere : 0 });
     if (problem !== null) {
       setStripError({ tone: 'warning', text: problem });
       return;
@@ -1231,7 +1244,7 @@ export default function Chat(): ReactElement {
     const whenBusy = now && steerOpen && files.length === 0 && !isSlashText(text) ? 'now' : 'queue';
     if (whenBusy === 'queue' && queued.count >= QUEUE_MAX) return;
     const reading = from === 'composer' ? readingHere : 0;
-    const problem = attachProblem({ mode, seesImages, text, files, windowTokens, reading, heldPictures });
+    const problem = attachProblem({ ...attachFacts, text, files, reading });
     if (problem !== null) {
       setStripError({ tone: 'warning', text: problem });
       return;
@@ -1324,13 +1337,47 @@ export default function Chat(): ReactElement {
     };
     setAttachNote(null);
     count(1);
+    // A PDF's chip shows from the start of its read; it leaves once its draft is in the store, or at once when its
+    // read ends with nothing added.
+    const started: string[] = [];
+    const watch: PdfWatch = {
+      start: (id, name) => {
+        const stop = new AbortController();
+        const now = Date.now();
+        started.push(id);
+        writePending(
+          origin,
+          id,
+          { id, name, done: 0, total: null, startedAt: now, at: now, thumbnail: null, stop },
+          epoch,
+        );
+        return stop.signal;
+      },
+      progress: (id, progress) => {
+        const item = readPending(origin).find((entry) => entry.id === id);
+        if (item === undefined) return;
+        const thumbnail = progress.thumbnail ?? item.thumbnail;
+        writePending(
+          origin,
+          id,
+          { ...item, done: progress.done, total: progress.total, at: Date.now(), thumbnail },
+          epoch,
+        );
+      },
+      end: (id) => writePending(origin, id, null, epoch),
+    };
     attachDrafts(
       files,
-      { mode, seesImages },
+      { mode, seesImages, seesPages, watch },
       { read: () => readAttachments(origin), write: (items) => writeAttachments(origin, items, epoch) },
     )
       .then(
         (result) => {
+          for (const item of result.added) {
+            if (item.kind !== 'pdf') continue;
+            const pages = item.images.length;
+            announce(fill(pages === 1 ? CHAT.attach.pdfReadyOne : CHAT.attach.pdfReady, { name: item.name, n: pages }));
+          }
           const first = result.refused[0];
           if (first === undefined) return;
           const text =
@@ -1342,13 +1389,18 @@ export default function Chat(): ReactElement {
         },
         () => undefined,
       )
-      .finally(() => count(-1));
+      .finally(() => {
+        for (const id of started) writePending(origin, id, null, epoch);
+        count(-1);
+      });
   };
   const removeAttachment = (id: string): void => {
-    writeAttachments(
-      place,
-      readAttachments(place).filter((item) => item.id !== id),
-    );
+    if (!stopPending(place, id)) {
+      writeAttachments(
+        place,
+        readAttachments(place).filter((item) => item.id !== id),
+      );
+    }
     setAttachNote(null);
   };
   const pickerInput = useRef<HTMLInputElement | null>(null);
@@ -1653,13 +1705,12 @@ export default function Chat(): ReactElement {
   const sentPictures = useMemo(
     () =>
       convEntries?.some(
-        (entry) => entry.kind === 'user' && entry.attachments?.some((item) => item.kind === 'image') === true,
+        (entry) => entry.kind === 'user' && entry.attachments !== undefined && imageCount(entry.attachments) > 0,
       ) === true,
     [convEntries],
   );
   const unseenStrip: StripNotice | null =
     conv !== null &&
-    conv.conversation.mode === 'chat' &&
     sentPictures &&
     host !== null &&
     host.models.find((model) => model.id === conv.conversation.modelId)?.images !== true
@@ -3001,43 +3052,80 @@ export default function Chat(): ReactElement {
                 })
             : CHAT.placeholderChat;
 
-  const full = held.length >= ATTACH_MAX;
+  // A PDF whose draft is already in the store keeps one chip while its pending entry leaves.
+  const pendingChips = drawing.filter((entry) => !held.some((item) => item.id === entry.id));
+  const full = held.length + pendingChips.length >= ATTACH_MAX;
   const attachRow = {
     open: openPicker,
     full,
     note: full
       ? CHAT.attach.noteFull
       : mode === 'work'
-        ? CHAT.attach.noteWork
+        ? seesPages
+          ? CHAT.attach.noteWorkPdf
+          : CHAT.attach.noteWork
         : seesImages
           ? undefined
           : CHAT.attach.noteNoImages,
   };
   const pictureProblem = seesImages ? undefined : mode === 'work' ? CHAT.attach.chipWork : CHAT.attach.chipModel;
-  const chips = held.map((item): AttachmentChipItem =>
-    item.kind === 'file'
-      ? { id: item.id, kind: 'file', name: item.name, bytes: item.bytes }
-      : {
-          id: item.id,
-          kind: 'image',
-          name: item.name,
-          mediaType: item.mediaType,
-          bytes: item.bytes,
-          thumbnail: item.dataUrl,
-          problem: pictureProblem,
-        },
-  );
-  const estimate = held.length > 0 ? estimateTokens(draft, held.map(draftInput)) : 0;
+  const chips = held.map((item): AttachmentChipItem => {
+    if (item.kind === 'file') return { id: item.id, kind: 'file', name: item.name, bytes: item.bytes };
+    if (item.kind === 'pdf') {
+      return {
+        id: item.id,
+        kind: 'pdf',
+        name: item.name,
+        bytes: item.bytes,
+        pages: item.images.length,
+        thumbnail: `data:image/jpeg;base64,${item.images[0] ?? ''}`,
+        problem: seesPages ? undefined : CHAT.attach.chipModel,
+      };
+    }
+    return {
+      id: item.id,
+      kind: 'image',
+      name: item.name,
+      mediaType: item.mediaType,
+      bytes: item.bytes,
+      thumbnail: item.dataUrl,
+      problem: pictureProblem,
+    };
+  });
+  for (const entry of pendingChips) {
+    chips.push({
+      id: entry.id,
+      kind: 'pdf',
+      name: entry.name,
+      bytes: 0,
+      drawing: true,
+      ...(entry.thumbnail === null ? {} : { thumbnail: entry.thumbnail }),
+    });
+  }
+  const drawn = pendingChips.find((entry) => entry.total !== null);
+  const drawNow = useNow(drawn !== undefined);
+  const estimate = held.length > 0 ? estimateTokens(draft, held.map(draftTokens), family) : 0;
   const nearFull = windowTokens !== null && (contextUsed ?? 0) + estimate > windowTokens * WINDOW_SHARE;
   const attachStrip = (
     <AttachmentStrip
       items={chips}
       onRemove={removeAttachment}
       note={attachNote !== null && attachNote.place === place ? attachNote.text : undefined}
-      caption={{
-        text: fill(nearFull ? CHAT.attach.tokensNearFull : CHAT.attach.tokens, { n: formatNumber(estimate) }),
-        tone: nearFull ? 'warning' : 'muted',
-      }}
+      caption={
+        drawn !== undefined && drawn.total !== null
+          ? { text: drawCaption({ ...drawn, total: drawn.total }, drawNow), tone: 'muted' }
+          : held.length === 0
+            ? undefined
+            : {
+                text: fill(nearFull ? CHAT.attach.tokensNearFull : CHAT.attach.tokens, { n: formatNumber(estimate) }),
+                tone: nearFull ? 'warning' : 'muted',
+              }
+      }
+      progress={
+        drawn !== undefined && drawn.total !== null
+          ? { label: fill(CHAT.attach.pdfDrawBar, { name: drawn.name }), done: drawn.done, total: drawn.total }
+          : undefined
+      }
     />
   );
 

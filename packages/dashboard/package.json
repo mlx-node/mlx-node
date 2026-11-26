@@ -56,6 +56,7 @@
     "markstream-react": "2.0.32",
     "motion": "14.12.0",
     "oxc-parser": "^0.157.0",
+    "pdfjs-dist": "^6.5.438",
     "playwright-core": "1.65.0",
     "react": "^19.3.1",
     "react-dom": "^19.3.1",

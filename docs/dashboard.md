@@ -955,20 +955,23 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   installed, skills not installed, or no skills (Off).
 - Files and photos: the row Add files or photos, `⌘U`, paste and drop on the composer all take files the same way
   (`ui/src/lib/chat-attachments.ts`). Small UTF-8 text files work in Chat and Work; PNG, JPEG and WebP pictures work
-  in Chat when the model row of `ChatHostState.models` has `images: true`. The page reads the bytes of what was picked,
+  in Chat when the model row of `ChatHostState.models` has `images: true`; PDFs of up to 20 pages work in Chat and
+  Work for the same rows, as page images the page draws itself (below). The page reads the bytes of what was picked,
   pasted or dropped; it never learns a path. The text file goes to the agent as one ACP `resource` block
-  (`file:///attached/<name>`, `text/plain`), a picture as one `image` block (no `uri`), both after the one text block,
-  and on the first `session/prompt` of a turn only (a Work continue sends text only). No block carries `_meta`. The
-  agent shows a file to the model as `<file_contents path="/attached/<name>">` with numbered lines.
+  (`file:///attached/<name>`, `text/plain`), a picture as one `image` block (no `uri`), a PDF as one `resource` note
+  and one `image/jpeg` block per page, all after the one text block, in the order text files, PDF notes, pictures,
+  PDF pages, and on the first `session/prompt` of a turn only (a Work continue sends text only). No block carries
+  `_meta`. The agent shows a file to the model as `<file_contents path="/attached/<name>">` with numbered lines.
   - `⌘U` works from the text field, with the `+` menu open (the menu closes) and while a tooltip shows; not while a
     dialog is open (Rename, Permission, Confirm, Settings, the palette), not while the `+` is disabled, and not with 4
     files held. The picker is one hidden `<input type="file" multiple>` with no `accept`; after it closes or is
     cancelled the focus goes back to the text field. Paste takes files only when the clipboard has no plain text.
-  - Row note: Chat and a model that does not see images: "Text files only. This model cannot see images."; Work: "Text
-    files only in Work"; 4 files held: the row is disabled with "Up to 4 files per message".
+  - Row note: Chat and a model that does not see images: "Text files only. This model cannot see images or PDF
+    pages."; Work: "Text files and PDFs in Work" for a model that sees images, else "Text files only in Work"; 4 files
+    held (a PDF still drawing counts): the row is disabled with "Up to 4 files per message".
   - The content decides, not the type the browser gives: only `image/png`, `image/jpeg` (also `image/jpg`) and
-    `image/webp` take the picture path and `application/pdf` is refused; every other file (`.ts` labelled
-    `video/mp2t`, `.svg`, HEIC, a zip) gets the text path. A text file is first looked at in its first 8,192 bytes, so a
+    `image/webp` take the picture path; `application/pdf`, and any file whose name ends in `.pdf` whatever its type,
+    take the PDF path; every other file (`.ts` labelled `video/mp2t`, `.svg`, HEIC, a zip) gets the text path. A text file is first looked at in its first 8,192 bytes, so a
     40 MB zip says "not a text file", not "too long". A picture is always decoded and drawn again in the page
     (`createImageBitmap` with the photo's EXIF turn applied), scaled to fit 2000 px a side and 2,400,000 px (the 8 px
     and 512 px floor is checked on that drawn size, as the agent checks it: a 4000 x 15 strip is refused), and leaves
@@ -977,6 +980,25 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
     (upright pixels, no EXIF or GPS, the pixel limits) happens in the page, the route's only caller. The agent decodes
     every picture in full: one it cannot decode is dropped with a note to the model and the turn answers from the text;
     one over its pixel limits is made smaller before the engine sees it.
+  - PDF (`ui/src/lib/pdf-pages.ts`, the `PdfCodec` that `readPdf` reads through): `pdfjs-dist` 6.5.438 in the page,
+    loaded only when the first PDF is opened. The page starts the worker itself as a module worker from
+    `/assets/pdfjs-6.5.438/pdf.worker.min.mjs` and hands it to pdf.js as `workerPort` (pdf.js's own start wraps a
+    worker it takes for cross-origin in a `blob:` script, which the CSP blocks); a worker that fails to start leaves
+    `workerSrc`, and pdf.js then imports it on the page's thread. The bytes go in as `data` (no URL fetch), with
+    `useWasm: false` (pdf.js imports its JS JBIG2 and OpenJPEG decoders and never tries a WASM compile), no system
+    fonts (the shipped standard fonts and CMaps, so a file draws the same on every Mac), no XFA, and no annotation or
+    text layer (only the annotation layer reads `enableScripting`); filled form values still draw. Checks, first
+    match: over 50 MiB; locked with a password; not a PDF or damaged; no pages; over 20 pages ("Up to 20 pages fit in
+    one message.", nothing is drawn). Then every page is drawn on white on the page's thread, one page per task, at
+    `scale = min(1280 / long side, sqrt(1,048,576 / (w × h)))` of its size in points, each side floored (A4 861 ×
+    1217, Letter 900 × 1164, a 16:9 slide 1280 × 720), and kept as JPEG at quality 0.85, else 0.7, else 0.5, the first
+    that fits 589,824 bytes: the size the agent's `read_file` passes on untouched. A page that fits no step, is drawn
+    under 8 px a side or 512 px, or fails to draw refuses the whole PDF with its page number. The PDF's own bytes never
+    leave the page; only the drawn pages are sent and stored. While it draws, the chip says "Drawing pages" (its icon
+    becomes the first page once drawn), the caption counts "{done} of {total} pages", adds the time once it passes
+    1 s and the rate ("34 pages/s", "9.4 pages/min") once 8 pages and 1 s have passed, and a bar under the chips
+    (`progressbar` "Drawing pages of {name}", value = pages) fills by pages. Removing the chip stops the read. When it
+    ends the chip reads "{n} pages · {size}" and the screen reader hears "{name}: {n} pages ready." once.
   - Strip (`arc-x/attachment-strip`): between the notice strip and the text field, one chip per file (thumbnail for a
     picture, name, size, remove), one status line with the first refusal of the last add ("{n} more not added" for the
     rest), and the caption "About N tokens". The caption turns to a warning, "The context window is nearly full.", when
@@ -987,10 +1009,13 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
     fits under 4 when it ends and refuses the rest ("Up to 4 files per message"), and the composer on screen follows
     the store, whichever page wrote it. With files and no text
     the field says "Add a message for these files": a message still needs text.
-  - Send is off, first match, after the reasons above: "Reading files…"; a picture in Work; a picture and a model that
-    does not see images (the picture chips say why; nothing is removed); a picture when the conversation's stored
-    pictures and the new ones pass 40 MiB of base64 (below); text plus files over 90,000 bytes; the estimate over 80 %
-    of a known window. A window the host state does not know yet blocks nothing. `send()` runs the
+  - Send is off, first match, after the reasons above: "Reading files…" (also while a PDF draws); a picture in Work; a
+    picture and a model that does not see images (the picture chips say why; nothing is removed); a PDF and such a
+    model, after a model change ("This model cannot read PDF pages. Remove the PDF or pick another model.", its chip
+    "This model cannot see images"); PDF pages that do not fit the message's limits below ("This conversation cannot
+    carry these pages. Start a new chat to send them."); a picture when the conversation's stored pictures and the
+    new ones pass 40 MiB of base64 (below); text plus files and PDF notes over 90,000 bytes; the estimate over 80 % of
+    a known window. A window the host state does not know yet blocks nothing. `send()` runs the
     same checks, so Retry and Send again cannot pass them.
   - Retry and Send again resend the files while this window holds them. A failed send keeps one `failed` record per
     place (conversation or the New screen; text, files and the failure's strip, in `pages/chat/drafts.ts`). The message
@@ -1005,10 +1030,12 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
     "Send again without files" and sends the text only.
   - Thread: the user message shows read-only chips, live and after a reload, in Chat and in the Sessions transcript,
     whose find also matches file names. A file chip has its name and size, a picture chip "Image", its type and size
-    (the agent stores no picture name). No thumbnail in the thread: it is rebuilt from the agent's file and a picture
-    would send up to 1.3 MB on every read. A Chat conversation that holds pictures on a model that does not see
-    images shows one warning line: "This model cannot see images. The images in this conversation are left out of its
-    answers."
+    (the agent stores no picture name), a PDF chip its name and "{n} pages · {size}" (its name read "{name}, {n}
+    pages, {size}"). No thumbnail in the thread: it is rebuilt from the agent's file and a picture would send up to
+    1.3 MB on every read. A conversation that holds pictures or PDF pages on a model that does not see images shows
+    one warning line, in Chat and Work: "This model cannot see images. The images in this conversation are left out of
+    its answers." Until the turn shows work, its wait line names the pages its message carries: "Reading the
+    conversation and 3 pages · 8,087 of 121.3K tokens".
 
   | Limit                                       | Value                                                                                     | Checked by                                                            |
   | ------------------------------------------- | ----------------------------------------------------------------------------------------- | --------------------------------------------------------------------- |
@@ -1020,11 +1047,22 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   | picture file picked                         | 20 MiB, PNG / JPEG / WebP                                                                 | page, before the decode                                               |
   | picture sent                                | PNG or JPEG, ≤ 1,000,000 bytes, ≤ 2000 px a side, ≤ 2,400,000 px, ≥ 8 px a side, ≥ 512 px | page; route checks length, base64, bytes and the first bytes          |
   | pictures                                    | Chat only, model row `images: true`                                                       | page; service (`attachment-refused`); engine (400, below)             |
+  | PDF file picked                             | 50 MiB; one of the 4 files whatever its pages                                             | page, before the open                                                 |
+  | PDF pages in one message                    | 1 to 20; Chat and Work, model row `images: true`                                          | page; route; service (`attachment-refused`)                           |
+  | PDF page sent                               | JPEG, ≤ 589,824 bytes, the drawn size above, ≥ 8 px a side, ≥ 512 px                      | page; route checks length, base64, bytes and the first bytes          |
+  | page and picture base64 of one message      | 6 MiB (the agent trims old pictures from 13 MiB down to 8 MiB, so 2 MiB stay for text)    | page                                                                  |
+  | images one conversation holds               | 64: picture blocks, PDF pages and tool-result pictures of its entries; Flash Next 4       | page; service (`pictures-full`, the 64)                               |
   | `/v1/messages`, `/v1/messages/count_tokens` | 16 MiB body (other engine routes 10 MiB), listed as `max_request_bytes` in `/v1/models`   | engine router; the agent drops old pictures from 13 MiB down to 8 MiB |
   | pictures one chat keeps                     | 40 MiB of stored base64 (about 31 full-size pictures), so text and tools keep 24 MiB      | page; service (`pictures-full`): "Start a new chat to send more."     |
   | the session file the thread is read from    | 64 MiB; past it the thread shows only "Some messages could not be read"                   | reader                                                                |
 
-  Token estimate (page only): bytes of the message and the numbered files ÷ 3, plus 2,800 per picture.
+  Token estimate (page only): bytes of the message, the numbered files and the PDF notes ÷ 3, plus 2,800 per picture,
+  plus each PDF page at the engine's own formula for its drawn size and the model row's `family` (the endpoint's
+  `modelType`): `qwen3_5` and `qwen3_5_moe` `smart_resize(h, w, 32, 147,384, 2,822,400)` then `(H/16)(W/16)/4`
+  (an A4 page 1,026); `qwen4_exp` the same with 65,536 and 262,144 (247); `gemma4` each side
+  `floor(sqrt(645,120 / (h w)) × side / 48) × 48`, then `(H/16)(W/16)/9` (266); `inkling2` `ceil(h/40) × ceil(w/40)`
+  (682); any other family 2,800. The caption keeps "About": the chat template's wrapper tokens per image are not
+  counted.
 
   Model gate: `images` on a host state model row is the loaded model's own `supportsImages()` while it is in memory
   (the engine's live file, per model `images`), else discovery's answer (the endpoint file). Discovery gives a
@@ -1034,6 +1072,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   Discovery reads only the file name of the projector: one of the wrong kind or width (Qwen `projection_dim`, `gemma4v`
   against `gemma4uv`) or a Prism-Hadamard Qwen file still reads as images until the first load. That cold turn
   answers without the picture, then the loaded model's own answer takes over; after each unload the guess comes back.
+  PDFs take the same gate as pictures, in Chat and in Work: a PDF added for a model that does not see images is
+  refused at once ("{name} was not added. This model cannot see images, and PDF pages are sent as images."), and the
+  service refuses a `pdf` item for such a row (`attachment-refused`).
   A request with an image for a model whose `supportsImages()` is not true gets 400 `Could not process image: the
   model "<id>" does not take images.` before any inference; the agent then retries the request without its images, so
   the turn still answers. It leaves the images out of that retry only and keeps them in its history (measured with
@@ -1045,10 +1086,14 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   by Chat and Work, so its files are too. A queued message (its text, file text and picture bytes) is kept in
   `composer/<id>.json` until it is sent or the conversation is deleted. The agent writes each sent block to its session folder: the
   file text and the picture's base64 in `updates.jsonl`, the picture again in `chat_history.jsonl` and as
-  `assets/image-<uuid>.<ext>`. Only the redrawn picture is stored. `updates.jsonl` keeps every sent block, so the chip
+  `assets/image-<uuid>.<ext>`. Only the redrawn picture is stored. A PDF adds nothing new: its note in the same files,
+  and each page as a picture (`assets/image-<uuid>.jpg`); a PDF that is still drawing lives only in this window's
+  memory and is stopped when its place is forgotten. `updates.jsonl` keeps every sent block, so the chip
   stays when the agent's retry left the picture out. The reader turns stored `resource` and `image` user blocks into
-  `attachments` on the user entry (name from the `uri`, sizes from the stored text or base64); no file text and no
-  pixels cross to the page. Titles and the conversation list use the message text only. The Chat address list for
+  `attachments` on the user entry (name from the `uri`, sizes from the stored text or base64); a `resource` whose
+  first line is `Portato PDF note 1` is a PDF note (its `key: value` lines read by a small parser), and the images it
+  names (`images: a-b`, positions among the message's image blocks) become that one `pdf` entry, not picture chips;
+  no file text and no pixels cross to the page. Titles and the conversation list use the message text only. The Chat address list for
   `web_fetch` is built from the typed text only, so an address inside a file is not opened.
 
 - Context hint: an 18 px ring just before Send / Stop, outside the box the chips shrink in, with no text. The arc
@@ -1659,6 +1704,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   is still opening a conversation in it (a fork past its soft deadline holds it until its late copy lands), so a folder
   with any file stays and a fork keeps it. A removed folder's record goes with it. The app never deletes a file there.
   The Sessions page shows such a session by its real folder.
+- **Files.** Text files as in Chat; PDFs of up to 20 pages for a model whose row has `images: true`, drawn into page
+  images in the composer and sent as the prompt's image blocks, exactly as in Chat (Files and photos, above). Pictures
+  stay Chat only: the page refuses one when it is added ("{name} was not added. Images work in Chat only for now.")
+  and the service refuses an `image` item in Work. A model change keeps the PDF chip and holds Send as in Chat.
 - **Branch.** In a git work tree the Work strip also holds a branch chip (`GitBranch` and the branch; a detached HEAD:
   `GitCommitHorizontal` and the short hash; a branch with no commit yet says so in its name), cut at the end with the
   full name as its tip. In a narrow strip nothing wraps: the branch chip shrinks first (to 5rem), then the folder chip
@@ -2778,16 +2827,17 @@ A process is `running` while its heartbeat is at most three intervals plus 1.5 s
 
 One design system: Arc (`uiarc.dev`) in a desktop density.
 
-| Folder / file                       | Holds                                                                                                                                                                                                                                                                                                 |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ui/src/components/arc/`            | Vendored Arc **free** components (MIT), copied by hand. `PROVENANCE.md` lists each file, its source and every local change; `LICENSE` beside it. Excluded from our format and lint                                                                                                                    |
-| `ui/src/components/arc-x/`          | Own components, written from scratch on Arc tokens: surfaces, tables, the chart kit, number and motion parts, transcript parts. A folder holds `<name>.tsx` and, when it has styles, `<name>.module.css`                                                                                              |
-| `ui/src/components/arc-x/wait-orb/` | The one exception in `arc-x/`: `engine.ts` holds orb geometry derived from the MIT package `thinking-orbs` 0.3.2, with its `LICENSE` and a `PROVENANCE.md` that lists every local change. The component and its painter are own code                                                                  |
-| `ui/src/styles/tokens.css`          | Density and own tokens on top of Arc `foundation.css`: controls 28 / 32 / 40 px, radii 10 / 14 / 20 px, type 11–32 px, 8 model colors, data and phase colors, durations, staggers. The font settings' tokens: `--font-reading`, `--text-reading`, `--tracking-reading`, `--text-mono`, `--text-field` |
-| `ui/src/styles/tailwind-theme.css`  | A locked Tailwind theme: layout and text utilities only, no palette. Pages use Tailwind for layout; `arc-x/` and `shell/` use CSS modules only                                                                                                                                                        |
-| `ui/src/styles/fonts.css`           | Inter, Geist and Geist Mono (variable, latin + latin-ext): six bundled `woff2` files, no network. Installed fonts are listed with `queryLocalFonts()`; none is bundled                                                                                                                                |
-| `ui/src/theme/theme.ts`             | `data-theme` on `<html>`: preference `system` / `light` / `dark` in `localStorage`                                                                                                                                                                                                                    |
-| `ui/src/theme/fonts.ts`             | The font settings: reading text, code and the interface, a family and a size each, in `localStorage` (`mlx-node:fonts:v1`); the non-default ones are custom properties on `<html>`                                                                                                                    |
+| Folder / file                       | Holds                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ui/src/components/arc/`            | Vendored Arc **free** components (MIT), copied by hand. `PROVENANCE.md` lists each file, its source and every local change; `LICENSE` beside it. Excluded from our format and lint                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `ui/src/components/arc-x/`          | Own components, written from scratch on Arc tokens: surfaces, tables, the chart kit, number and motion parts, transcript parts. A folder holds `<name>.tsx` and, when it has styles, `<name>.module.css`                                                                                                                                                                                                                                                                                                                                                                                        |
+| `ui/src/components/arc-x/wait-orb/` | The one exception in `arc-x/`: `engine.ts` holds orb geometry derived from the MIT package `thinking-orbs` 0.3.2, with its `LICENSE` and a `PROVENANCE.md` that lists every local change. The component and its painter are own code                                                                                                                                                                                                                                                                                                                                                            |
+| `ui/src/styles/tokens.css`          | Density and own tokens on top of Arc `foundation.css`: controls 28 / 32 / 40 px, radii 10 / 14 / 20 px, type 11–32 px, 8 model colors, data and phase colors, durations, staggers. The font settings' tokens: `--font-reading`, `--text-reading`, `--tracking-reading`, `--text-mono`, `--text-field`                                                                                                                                                                                                                                                                                           |
+| `ui/src/styles/tailwind-theme.css`  | A locked Tailwind theme: layout and text utilities only, no palette. Pages use Tailwind for layout; `arc-x/` and `shell/` use CSS modules only                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ui/src/styles/fonts.css`           | Inter, Geist and Geist Mono (variable, latin + latin-ext): six bundled `woff2` files, no network. Installed fonts are listed with `queryLocalFonts()`; none is bundled                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `ui/src/theme/theme.ts`             | `data-theme` on `<html>`: preference `system` / `light` / `dark` in `localStorage`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `ui/src/theme/fonts.ts`             | The font settings: reading text, code and the interface, a family and a size each, in `localStorage` (`mlx-node:fonts:v1`); the non-default ones are custom properties on `<html>`                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `ui/pdfjs-assets.ts`                | The pdf.js files the page loads by URL at run time: the worker, the JS JBIG2 and OpenJPEG decoders, `cmaps/`, `standard_fonts/` and the licences, copied (not bundled; the library itself joins the one SPA chunk) to `web/assets/pdfjs-<version>/` after a build and served from the package in the dev server. Under `/assets/` a missing file is a 404, not `index.html` with 200, and the version in the folder name keeps the one-year cache of `/assets/` true. No `.wasm`, sandbox, viewer or `iccs/` ships. The desktop payload check fails without the worker, as without `index.html` |
 
 Rules the tests hold (`__test__/style-rules.test.ts`, `no-regex.test.ts`, `tokens.test.ts`):
 
@@ -2932,7 +2982,10 @@ yarn workspace @mlx-node/dashboard dev:shots         # PNGs, light/dark x 1180x8
   step: the call, its title update and the result with the picture's bytes): its read row reads "1 picture · …" and
   opens to the tile, then the agent leaves the picture out. A Work prompt with "readpdf" reads pages 4 to 6 of a
   12-page `docs/spec.pdf`: "3 of 12 pages". The fixture's live session reads `docs/screenshot.png` and three pages of
-  `docs/api-spec.pdf` in its 2nd answer, after that answer's picture rows. A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
+  `docs/api-spec.pdf` in its 2nd answer, after that answer's picture rows. The harness endpoint gives `qwen3.5-4b`
+  and `qwen3.5-9b` `images: true` and the `qwen3_5` family, so they take pictures in Chat and PDFs in both modes and
+  every other model refuses both. With `MLX_DEV_FLIGHT=chat`, a Work message with a PDF and "pdfwait" waits 40 s
+  before any work, so its wait line names the pages ("Reading the conversation and 3 pages · …"). A prompt with "nomodel" (Chat or Work) plays a blocked prompt (`noModel` of the script: the
   `model_auto_switched` line and `end_turn`, nothing stored): "No model answered." with the agent's words under it;
   the scenario's `session.modelGoneOnLoad` plays the load cases. The fixture's live session stores both picture
   one-shots after its 2nd prompt's chunk, which the Sessions transcript draws before that answer's first call.
@@ -3186,6 +3239,12 @@ class of bug is deleted rather than mitigated. What remains:
   the native folder dialog for the Control Panel window only (one at a time) and answers that id with the chosen path
   or null. Nothing else crosses: no path goes in, no file is read. An attached file is read by the page from what the
   user picked, pasted or dropped; its path is never known (see [Chat and Work](#chat-and-work)).
+- **A PDF is drawn in the page and only its drawn pages leave it.** pdf.js runs under the same CSP (no WASM, no eval)
+  with its worker started from `/assets/` by the page itself, the bytes passed as `data` (no URL fetch), no system
+  fonts, no XFA, and no annotation or text layer, so `enableScripting` is never read. The route takes a `pdf` item
+  only as 1 to 20 base64 JPEG pages of at most 589,824 bytes with JPEG first bytes; the PDF's own bytes are never sent
+  or stored. The note the model reads names the file and its pages; text on a page reaches the model as pixels of a
+  picture, as data.
 - **Git runs for the Work strip only, and only as written** (`src/chat/work-git.ts`). `spawn` with no shell, stdin
   closed, its own process group (killed whole at a deadline), stdout at most 4 MiB, stderr 64 KiB. Every call starts
   `git -C <dir> -c core.fsmonitor=false -c color.ui=false -c core.quotePath=false`, so the app starts no fsmonitor
@@ -3305,11 +3364,15 @@ Bodies hold exactly the listed fields: any other field (`_meta`, `mcpServers`, `
 1–100,000 characters (413 above); text whose first non-space character is `/` is a slash command: a name the agent
 would not read, an app command, a blocked or a hidden built-in is 400 with `reason: 'slash-text'` ("No such command
 here.") at the route; the service then refuses what the conversation's mode and the agent's list do not allow
-(Slash commands, above), so such text never reaches the agent. `attachments` is a list of `{kind: 'file', name, text}` and
-`{kind: 'image', mediaType: 'image/png' | 'image/jpeg', data}` (base64, no `data:` prefix); an empty list is no list,
-and an item that breaks a limit of [Chat and Work](#chat-and-work) is 400 with `reason: 'attachment-refused'` ("The
-attached files were refused."). The service refuses a picture in Work, or for a model whose row is not `images: true`,
-the same way. A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
+(Slash commands, above), so such text never reaches the agent. `attachments` is a list of `{kind: 'file', name, text}`,
+`{kind: 'image', mediaType: 'image/png' | 'image/jpeg', data}` (base64, no `data:` prefix) and `{kind: 'pdf', name,
+images}` (1 to 20 base64 JPEG pages, in order); an empty list is no list, and an item that breaks a limit of [Chat and
+Work](#chat-and-work) is 400 with `reason: 'attachment-refused'` ("The attached files were refused."); a text file
+whose first line is a PDF note's first line is refused too. The service refuses a picture in Work, and a picture or a
+PDF for a model whose row is not `images: true`, the same way; images past the 40 MiB store or the 64 a conversation
+holds are 409 `pictures-full`. The host state's model rows carry `family` (the endpoint's `modelType`, or null), which
+the page's page-token estimate reads, and the host state carries `pdfTool: {chat, work}`, whether the PDF tool exists
+in that mode (false in both: a PDF that does not fit the message keeps Send off). A Chat route failure carries a fixed sentence and, where it has one, a `reason` (a
 `ChatFailureCode`); any other error becomes `E_UNAVAILABLE` "The agent could not be reached." and its text is dropped.
 
 Streams are not routes: `runtime.watchChat({scope: 'host'}, fn)` sends `{type: 'state'}` (coalesced to 100 ms) and
