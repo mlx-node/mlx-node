@@ -90,6 +90,20 @@ pub(crate) fn checkpoint_interval_tokens() -> u32 {
     INKLING2_CHECKPOINT_INTERVAL
 }
 
+pub(crate) fn write_behind_min_tokens() -> usize {
+    #[cfg(test)]
+    {
+        if let Some(v) = WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(std::cell::Cell::get) {
+            return v;
+        }
+        crate::disk_tier::state_disk::MINIMUM_TOKENS as usize
+    }
+    #[cfg(not(test))]
+    {
+        INKLING2_WRITE_BEHIND_MIN_TOKENS
+    }
+}
+
 fn spill_backoff_secs() -> f64 {
     #[cfg(test)]
     if let Some(v) = WRITE_BEHIND_DELAY_OVERRIDE.with(std::cell::Cell::get) {
@@ -1008,6 +1022,27 @@ impl StateDiskCodec for Inkling2StateCodec {
     }
 }
 
+/// In-flight off-thread SSD label relabel (`PendingDiskUpgrade::LabelPromote`).
+///
+/// Owns the [`ColdKeyHold`] pinning both `key` and its complete Global KV chain against
+/// competing `MakeRoom::Evict` writes so [`Inkling2StateStore::clear_ram_and_checkpoints`]
+/// cannot release the hold while the relabel is still queued or running on the writer thread.
+struct PendingRelabel {
+    id: EntryId,
+    key: ColdCacheKey,
+    _fallback_hold: ColdKeyHold,
+}
+
+/// Outcome of polling completed off-thread SSD label relabels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct RelabelPollOutcome {
+    landed: bool,
+    landed_ok: u64,
+    failures: u64,
+    resync: bool,
+    failed_id: Option<EntryId>,
+}
+
 /// Model-owned StateDisk tier for Inkling-2-Mini backed by the shared
 /// [`StateDiskEngine`] (single reusable host staging buffer, dual-lane
 /// `ColdCacheManager` writer, 8-layer Global KV chain cursor, shared `WriteBehind`).
@@ -1017,6 +1052,15 @@ pub(crate) struct Inkling2StateDisk {
     /// The landing pages the governor last read from this tier.
     pub(crate) published_landing: u32,
     pub(crate) counters: Inkling2DiskCounters,
+    /// Dedicated channel for off-thread `ColdCacheManager::enqueue_state_relabel` completions
+    /// (kept separate from `engine.landed_tx` so `StateDiskEngine::poll_offload` never
+    /// overwrites `engine.staging` or clears `entry.disk` on relabel completion/refusal).
+    relabel_tx: std::sync::mpsc::Sender<mlx_paged_attn::StateRelabelLanded>,
+    relabel_rx: std::sync::mpsc::Receiver<mlx_paged_attn::StateRelabelLanded>,
+    /// In-flight off-thread `LabelPromote` rewrite (kept separate from `engine.pending` so
+    /// `entry.disk()` remains `Some(DiskCopy { landed: true, .. })` and `engine.staging` stays
+    /// free for concurrent restores throughout the rewrite).
+    pending_relabel: Option<PendingRelabel>,
 }
 
 impl Deref for Inkling2StateDisk {
@@ -1050,12 +1094,109 @@ impl Inkling2StateDisk {
             Inkling2StateCodec { geometry },
         )
         .ok_or_else(|| Error::from_reason("Inkling2 StateDisk staging size overflows usize"))?;
+        let (relabel_tx, relabel_rx) = std::sync::mpsc::channel();
         Ok(Self {
             engine,
             write_behind,
             published_landing: 0,
             counters: Inkling2DiskCounters::default(),
+            relabel_tx,
+            relabel_rx,
+            pending_relabel: None,
         })
+    }
+
+    /// Whether any state write or off-thread label relabel is currently in flight.
+    pub(crate) fn writing(&self) -> bool {
+        self.engine.writing() || self.pending_relabel.is_some()
+    }
+
+    /// Entry ID of the in-flight state write or off-thread label relabel, if any.
+    pub(crate) fn pending_write_id(&self) -> Option<EntryId> {
+        self.engine
+            .pending
+            .as_ref()
+            .map(|p| p.id)
+            .or_else(|| self.pending_relabel.as_ref().map(|p| p.id))
+    }
+
+    /// Wait up to 50 ms (never past `deadline`) for either an off-thread relabel or a normal
+    /// `StateDiskEngine` landing, re-queueing the event so the next poll observes it.
+    pub(crate) fn await_landing(&self, deadline: Instant) -> bool {
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        if self.pending_relabel.is_some() {
+            if let Ok(landing) = self.relabel_rx.try_recv() {
+                let _ = self.relabel_tx.send(landing);
+                return true;
+            }
+            if !self.engine.writing() && self.engine.chain.is_none() {
+                if let Ok(landing) = self
+                    .relabel_rx
+                    .recv_timeout((deadline - now).min(Duration::from_millis(50)))
+                {
+                    let _ = self.relabel_tx.send(landing);
+                }
+                return true;
+            }
+            if let Ok(landing) = self.engine.landed_rx.try_recv() {
+                let _ = self.engine.landed_tx.send(landing);
+                return true;
+            }
+            if let Ok(landing) = self
+                .relabel_rx
+                .recv_timeout((deadline - now).min(Duration::from_millis(5)))
+            {
+                let _ = self.relabel_tx.send(landing);
+            }
+            return true;
+        }
+        self.engine.await_landing(deadline)
+    }
+
+    /// Drain completed off-thread label relabels from `self.relabel_rx`.
+    fn poll_relabel(
+        &mut self,
+        store: &mut HybridStateStore<Inkling2StateAnchor>,
+    ) -> RelabelPollOutcome {
+        let mut out = RelabelPollOutcome::default();
+        while let Ok(landing) = self.relabel_rx.try_recv() {
+            out.landed = true;
+            let Some(write) = self.pending_relabel.take_if(|w| w.key == landing.key) else {
+                // Unlike initial spills, a relabel only atomically updates the header label of an
+                // already-committed durable SSD anchor (`!entry.checkpoint()`), so an unmatched
+                // completion must never delete `landing.key` from disk.
+                continue;
+            };
+            if landing.ok {
+                out.landed_ok += 1;
+                if let Some(chain_missing) = store
+                    .get(write.id)
+                    .filter(|entry| entry.disk().is_some_and(|copy| copy.key == landing.key))
+                    .map(|entry| !self.engine.chain_on_disk(entry))
+                    && let Some(copy) = store
+                        .disk_mut(write.id)
+                        .filter(|copy| copy.key == landing.key)
+                {
+                    copy.landed = true;
+                    copy.bytes = landing.bytes;
+                    if chain_missing && !copy.chain_owed {
+                        copy.chain_owed = true;
+                        out.resync = true;
+                    }
+                }
+                // If the in-memory entry was cleared while the relabel was in flight (e.g., by
+                // `clear_ram_and_checkpoints()` during `ResetCaches`), treat the completion as a
+                // bookkeeping no-op and leave the committed SSD anchor intact on disk.
+            } else {
+                out.failures += 1;
+                out.failed_id = Some(write.id);
+                out.resync = true;
+            }
+        }
+        out
     }
 
     pub(crate) fn entry_disk_restorable(&self, entry: &Entry<Inkling2StateAnchor>) -> bool {
@@ -1089,44 +1230,74 @@ impl Inkling2StateDisk {
     }
 }
 
-/// Queued SSD upgrade or repair for a RAM-resident entry:
-/// - `InPlace`: entry still holds an intact old `DiskCopy` on SSD that must be preserved on
-///   failure (`MakeRoom::Refuse` + rollback).
+/// Queued SSD upgrade, repair, or label promotion:
+/// - `InPlace`: RAM-resident entry still holds an intact old `DiskCopy` on SSD that must be
+///   preserved on failure (`MakeRoom::Refuse` + rollback). `promote_label` records whether the
+///   underlying on-disk copy also still carries `checkpoint: true` so dropping RAM before `InPlace`
+///   lands falls back to `LabelPromote`.
 /// - `Repair`: the old SSD blob or its Global KV chain was already evicted (or an upgrade
 ///   landed with `chain_owed == true`), so a fresh replacement blob AND its full Global KV
 ///   chain must land (`landed && !chain_owed && entry_disk_restorable`) before the repair
 ///   is complete.
+/// - `LabelPromote`: persistent-tier label relabeling for an SSD-backed `Checkpoint` promoted to
+///   `Ordinary` (`!entry.checkpoint()`), rewriting its `ColdStateLabel` with `checkpoint: false`
+///   under `MakeRoom::Refuse` + rollback (works with or without a RAM copy).
 #[derive(Clone, Copy, Debug)]
 enum PendingDiskUpgrade {
-    InPlace { retry_after: Instant },
-    Repair { retry_after: Instant },
+    InPlace {
+        retry_after: Instant,
+        promote_label: bool,
+    },
+    Repair {
+        retry_after: Instant,
+    },
+    LabelPromote {
+        retry_after: Instant,
+    },
 }
 
 impl PendingDiskUpgrade {
     fn retry_after(self) -> Instant {
         match self {
-            Self::InPlace { retry_after } | Self::Repair { retry_after } => retry_after,
+            Self::InPlace { retry_after, .. }
+            | Self::Repair { retry_after }
+            | Self::LabelPromote { retry_after } => retry_after,
         }
     }
 
     fn set_retry_after(&mut self, retry: Instant) {
         match self {
-            Self::InPlace { retry_after } | Self::Repair { retry_after } => *retry_after = retry,
+            Self::InPlace { retry_after, .. }
+            | Self::Repair { retry_after }
+            | Self::LabelPromote { retry_after } => *retry_after = retry,
         }
     }
 
-    fn is_in_place(&self) -> bool {
-        matches!(self, Self::InPlace { .. })
+    fn is_repair(&self) -> bool {
+        matches!(self, Self::Repair { .. })
     }
 }
 
-/// Active in-place SSD upgrade write: retains the previous durable `DiskCopy` alongside a
-/// `ColdKeyHold` pinning both `old_copy.key` and its entire Global KV chain against LRU eviction
-/// by competing writes until the replacement lands or rolls back.
+/// Discriminant for [`InFlightDiskUpgrade`] so rollback restores the exact pending kind without
+/// ever corrupting `entries_missing_draft_window` on a `LabelPromote` failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InFlightDiskUpgradeKind {
+    InPlace { promote_label: bool },
+    LabelPromote,
+}
+
+/// Active in-place SSD upgrade or label-promotion write: retains the previous durable `DiskCopy`
+/// alongside a `ColdKeyHold` pinning both `old_copy.key` and its entire Global KV chain against
+/// LRU eviction by competing writes until the replacement lands or rolls back.
+///
+/// For `LabelPromote`, ownership of the `ColdKeyHold` lives on [`PendingRelabel`] instead so
+/// `clear_ram_and_checkpoints()` does not release the eviction hold while the off-thread relabel
+/// is still queued or running on the writer thread.
 struct InFlightDiskUpgrade {
     id: EntryId,
+    kind: InFlightDiskUpgradeKind,
     old_copy: DiskCopy,
-    _fallback_hold: ColdKeyHold,
+    _fallback_hold: Option<ColdKeyHold>,
 }
 
 /// Target coordinator charging Inkling2's host-heap state store into
@@ -1249,15 +1420,22 @@ pub(crate) struct Inkling2StateStore {
     host_budget: Arc<HostBudgetAccount>,
     /// Most recent rolling prefill checkpoint published per active sequence.
     seq_checkpoints: HashMap<SeqId, EntryId>,
+    /// Entries marked as persistent prompt heads (explicitly via `CaptureOptions::is_head`,
+    /// adopted on startup, or promoted on a confirmed non-preemption Checkpoint hit at
+    /// `depth >= write_behind_min_tokens()`). Survive superseding turns in `WriteBehind` and
+    /// `trim_ram_to_cap_inner` Priority 2b, and are evicted last in Priority 4.
+    prompt_heads: HashSet<EntryId>,
+    /// Active `HybridStateStore::use_state(block)` pin held per sequence for its current turn's
+    /// restored state hit, released via [`Self::end_seq_use`] on turn close, reset, or release.
+    seq_used_blocks: HashMap<SeqId, u64>,
     /// Entries known to lack a `PackedDraftWindow` (`draft_window == None`, either captured
     /// without one or decoded from SSD with `valid_flag == 0`) under a v2 draft-window geometry.
     entries_missing_draft_window: HashSet<EntryId>,
     /// SSD-only entries adopted on startup whose on-disk `valid_flag` has not yet been decoded.
     adopted_unverified_window: HashSet<EntryId>,
-    /// Entries with an upgraded RAM anchor (carrying a complete `PackedDraftWindow`) awaiting
-    /// either in-place SSD overwrite (`InPlace`) or full blob+chain rewrite (`Repair`), paired
-    /// with a `retry_after` backoff instant so failed/refused upgrades are not immediately
-    /// re-staged by `trim_ram_to_cap`.
+    /// Entries awaiting either in-place SSD overwrite (`InPlace`), full blob+chain rewrite
+    /// (`Repair`), or persistent-tier checkpoint->ordinary label rewrite (`LabelPromote`), paired
+    /// with a `retry_after` backoff instant so failed/refused writes do not tight-loop.
     pending_disk_upgrades: HashMap<EntryId, PendingDiskUpgrade>,
     /// In-flight SSD upgrade write: retains the previous durable `DiskCopy` and holds both
     /// `old_copy.key` and its Global KV chain against LRU eviction so a failed replacement write
@@ -1307,6 +1485,8 @@ impl Inkling2StateStore {
             geometry: None,
             host_budget: HostBudgetAccount::new(),
             seq_checkpoints: HashMap::new(),
+            prompt_heads: HashSet::new(),
+            seq_used_blocks: HashMap::new(),
             entries_missing_draft_window: HashSet::new(),
             adopted_unverified_window: HashSet::new(),
             pending_disk_upgrades: HashMap::new(),
@@ -1401,20 +1581,19 @@ impl Inkling2StateStore {
         if self.demote_ram_on_durable.is_empty() {
             return false;
         }
-        let pending_id = self
-            .disk
-            .as_ref()
-            .and_then(|d| d.pending.as_ref().map(|p| p.id));
+        let pending_id = self.disk.as_ref().and_then(|d| d.pending_write_id());
         let ready: Vec<EntryId> = self
             .demote_ram_on_durable
             .iter()
             .copied()
             .filter(|&id| {
-                !self.pending_disk_upgrades.contains_key(&id)
-                    && self
-                        .in_flight_disk_upgrade
-                        .as_ref()
-                        .is_none_or(|u| u.id != id)
+                !matches!(
+                    self.pending_disk_upgrades.get(&id),
+                    Some(PendingDiskUpgrade::InPlace { .. } | PendingDiskUpgrade::Repair { .. })
+                ) && self
+                    .in_flight_disk_upgrade
+                    .as_ref()
+                    .is_none_or(|u| u.id != id)
                     && pending_id != Some(id)
                     && self.store.get(id).is_some_and(|entry| {
                         entry.ram().is_some()
@@ -1461,6 +1640,136 @@ impl Inkling2StateStore {
             && disk.preserve_entry_on_state_failure == Some(id)
         {
             disk.preserve_entry_on_state_failure = None;
+        }
+    }
+
+    /// Queue a persistent-tier `checkpoint: true -> false` on-disk label rewrite for an SSD-backed
+    /// entry just promoted to `StateClass::Ordinary`.
+    ///
+    /// No-op on non-persistent or unwritable tiers, or when `Repair` is already queued (since
+    /// `Repair` writes `label_of(entry)` fresh). When `InPlace` is already queued, marks its
+    /// `promote_label` bit so dropping RAM before `InPlace` lands falls back to `LabelPromote`.
+    fn enqueue_label_promote(&mut self, id: EntryId) {
+        if !self
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.tier.persistent && d.writable())
+        {
+            return;
+        }
+        if !self
+            .store
+            .get(id)
+            .is_some_and(|e| !e.checkpoint() && e.disk().is_some())
+        {
+            return;
+        }
+        match self.pending_disk_upgrades.get_mut(&id) {
+            Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                *promote_label = true;
+                return;
+            }
+            Some(PendingDiskUpgrade::Repair { .. } | PendingDiskUpgrade::LabelPromote { .. }) => {
+                return;
+            }
+            None => {}
+        }
+        self.pending_disk_upgrades.insert(
+            id,
+            PendingDiskUpgrade::LabelPromote {
+                retry_after: Instant::now(),
+            },
+        );
+        self.recent_failed_upgrades.remove(&id);
+    }
+
+    pub(crate) fn is_prompt_head(&self, id: EntryId) -> bool {
+        self.prompt_heads.contains(&id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn entry_missing_draft_window(&self, id: EntryId) -> bool {
+        self.entries_missing_draft_window.contains(&id)
+    }
+
+    pub(crate) fn mark_prompt_head(&mut self, id: EntryId) {
+        if self.prompt_heads.len() >= 64 {
+            let store = &self.store;
+            self.prompt_heads.retain(|eid| store.get(*eid).is_some());
+        }
+        self.prompt_heads.insert(id);
+    }
+
+    pub(crate) fn end_seq_use(&mut self, seq_id: SeqId) {
+        if let Some(block) = self.seq_used_blocks.remove(&seq_id) {
+            self.store.end_use(block);
+        }
+    }
+
+    pub(crate) fn end_all_seq_uses(&mut self) {
+        for (_, block) in std::mem::take(&mut self.seq_used_blocks) {
+            self.store.end_use(block);
+        }
+    }
+
+    /// Record a confirmed state-store restore hit for `seq_id` on `id`.
+    ///
+    /// Releases any previous `use_state` pin held by `seq_id`, touches `id`, and pins `id`'s
+    /// block via `store.use_state(block)` (which upgrades a `Checkpoint` to `Ordinary`). Strictly
+    /// for a hit `Checkpoint` (`was_checkpoint == true`), detaches `seq_checkpoints` and — only
+    /// when `!is_preemption_replay && depth >= write_behind_min_tokens()` — marks `id` in
+    /// `prompt_heads` and enqueues `WriteBehind(..., head = true)`. Restored `Ordinary` entries
+    /// are never added to `prompt_heads`.
+    pub(crate) fn note_state_hit(
+        &mut self,
+        coordinator: &Inkling2KVCacheCoordinator,
+        seq_id: SeqId,
+        id: EntryId,
+        is_preemption_replay: bool,
+        now: f64,
+    ) {
+        self.end_seq_use(seq_id);
+        let Some((was_checkpoint, block, depth, has_ram, has_disk)) =
+            self.store.get(id).and_then(|entry| {
+                let depth = u32::try_from(entry.depth()).ok()?;
+                Some((
+                    entry.checkpoint(),
+                    entry.mark(),
+                    depth,
+                    entry.ram().is_some(),
+                    entry.disk().is_some(),
+                ))
+            })
+        else {
+            return;
+        };
+        self.store.touch(id);
+        self.store.use_state(block);
+        self.seq_used_blocks.insert(seq_id, block);
+        if was_checkpoint {
+            self.seq_checkpoints.retain(|_, v| *v != id);
+            if !is_preemption_replay && depth >= write_behind_min_tokens() as u32 {
+                self.mark_prompt_head(id);
+                if has_disk {
+                    self.enqueue_label_promote(id);
+                } else if has_ram
+                    && !self.pending_disk_upgrades.contains_key(&id)
+                    && let Some(disk) = self.disk.as_mut()
+                {
+                    let writable = disk.writable();
+                    let persistent = disk.tier.persistent;
+                    disk.write_behind.record_published(
+                        &self.store,
+                        writable,
+                        persistent,
+                        id,
+                        depth,
+                        now,
+                        true,
+                    );
+                }
+            }
+            self.sync_marks(coordinator);
         }
     }
 
@@ -1557,6 +1866,7 @@ impl Inkling2StateStore {
                     self.seq_checkpoints.retain(|_, v| *v != id);
                     self.clear_window_tracking(id);
                     self.clear_upgrade_tracking(id);
+                    self.prompt_heads.remove(&id);
                     self.store.remove(id);
                     changed = true;
                 }
@@ -1587,7 +1897,7 @@ impl Inkling2StateStore {
         let mut completed = Vec::new();
         let mut stale_landed = Vec::new();
         for (&id, kind) in &self.pending_disk_upgrades {
-            if kind.is_in_place() {
+            if !kind.is_repair() {
                 continue;
             }
             let Some(entry) = self.store.get(id) else {
@@ -1625,33 +1935,74 @@ impl Inkling2StateStore {
     fn prune_entry_tracking(&mut self) {
         self.seq_checkpoints
             .retain(|_, id| self.store.get(*id).is_some());
+        self.prompt_heads.retain(|id| self.store.get(*id).is_some());
         self.entries_missing_draft_window
             .retain(|id| self.store.get(*id).is_some());
         self.adopted_unverified_window
             .retain(|id| self.store.get(*id).is_some());
-        // Retain pending upgrades/repairs while their RAM anchor is alive. If an `InPlace`
-        // upgrade lost its old SSD blob (e.g. via LRU eviction), transition it to `Repair`
-        // instead of dropping upgrade tracking.
+        // Retain pending upgrades/repairs/label promotions:
+        // - `InPlace`: requires RAM; if disk was evicted, transitions to `Repair`; if RAM vanished
+        //   while `promote_label` was set on a persistent writable tier, falls back to `LabelPromote`.
+        // - `Repair`: requires RAM.
+        // - `LabelPromote`: does NOT require RAM; stays alive on a persistent writable tier while
+        //   `!entry.checkpoint() && entry.disk().is_some()` (and transitions to `Repair` if disk
+        //   was evicted while RAM is still resident).
+        let persistent_writable = self
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.tier.persistent && d.writable());
         self.pending_disk_upgrades.retain(|&id, kind| {
             let Some(entry) = self.store.get(id) else {
                 return false;
             };
-            if entry.ram().is_none() {
-                return false;
+            match kind {
+                PendingDiskUpgrade::LabelPromote { .. } => {
+                    if !persistent_writable || entry.checkpoint() {
+                        return false;
+                    }
+                    if entry.disk().is_some() {
+                        return true;
+                    }
+                    if entry.ram().is_some() {
+                        *kind = PendingDiskUpgrade::Repair {
+                            retry_after: Instant::now(),
+                        };
+                        return true;
+                    }
+                    false
+                }
+                PendingDiskUpgrade::InPlace { promote_label, .. } => {
+                    if entry.ram().is_none() {
+                        if *promote_label
+                            && persistent_writable
+                            && !entry.checkpoint()
+                            && entry.disk().is_some()
+                        {
+                            *kind = PendingDiskUpgrade::LabelPromote {
+                                retry_after: Instant::now(),
+                            };
+                            return true;
+                        }
+                        return false;
+                    }
+                    if entry.disk().is_none() {
+                        *kind = PendingDiskUpgrade::Repair {
+                            retry_after: Instant::now(),
+                        };
+                    }
+                    true
+                }
+                PendingDiskUpgrade::Repair { .. } => entry.ram().is_some(),
             }
-            if kind.is_in_place() && entry.disk().is_none() {
-                *kind = PendingDiskUpgrade::Repair {
-                    retry_after: Instant::now(),
-                };
-            }
-            true
         });
         self.recent_failed_upgrades
             .retain(|id| self.store.get(*id).is_some());
         self.recent_failed_spills
             .retain(|id| self.store.get(*id).is_some());
-        self.spill_backoff
-            .retain(|id, _| self.store.get(*id).is_some_and(|e| e.ram().is_some()));
+        self.spill_backoff.retain(|id, _| {
+            self.store.get(*id).is_some_and(|e| e.ram().is_some())
+                || self.pending_disk_upgrades.contains_key(id)
+        });
         self.demote_ram_on_durable
             .retain(|id| self.store.get(*id).is_some_and(|e| e.ram().is_some()));
     }
@@ -1668,7 +2019,12 @@ impl Inkling2StateStore {
                 !entry.checkpoint()
                     && entry.ram().is_some()
                     && entry.disk().is_some_and(|c| c.chain_owed)
-                    && !self.pending_disk_upgrades.contains_key(&id)
+                    && !matches!(
+                        self.pending_disk_upgrades.get(&id),
+                        Some(
+                            PendingDiskUpgrade::InPlace { .. } | PendingDiskUpgrade::Repair { .. }
+                        )
+                    )
                     && self
                         .in_flight_disk_upgrade
                         .as_ref()
@@ -1709,6 +2065,8 @@ impl Inkling2StateStore {
         let Some(entry) = self.store.get(id) else {
             return false;
         };
+        let is_persistent_head =
+            self.is_prompt_head(id) && self.disk.as_ref().is_some_and(|d| d.tier.persistent);
         !entry.checkpoint()
             && entry.ram().is_some()
             && entry.disk().is_none()
@@ -1717,7 +2075,7 @@ impl Inkling2StateStore {
                 .in_flight_disk_upgrade
                 .as_ref()
                 .is_none_or(|u| u.id != id)
-            && entry.depth() >= crate::disk_tier::state_disk::MINIMUM_TOKENS as usize
+            && (entry.depth() >= write_behind_min_tokens() || is_persistent_head)
             && self
                 .disk
                 .as_ref()
@@ -1758,17 +2116,24 @@ impl Inkling2StateStore {
                 Some(PendingDiskUpgrade::Repair { .. })
             ) {
                 this.mark_repair_failed(id, retry);
-            } else if !this.pending_disk_upgrades.contains_key(&id)
-                && this
-                    .in_flight_disk_upgrade
-                    .as_ref()
-                    .is_none_or(|u| u.id != id)
+            } else if !matches!(
+                this.pending_disk_upgrades.get(&id),
+                Some(PendingDiskUpgrade::InPlace { .. })
+            ) && this
+                .in_flight_disk_upgrade
+                .as_ref()
+                .is_none_or(|u| u.id != id)
                 && this
                     .store
                     .get(id)
                     .is_some_and(|e| !e.checkpoint() && e.ram().is_some() && e.disk().is_none())
             {
+                // If an initial checkpoint write or owed chain failed while `LabelPromote` was
+                // queued, drop the obsolete `LabelPromote` so the RAM-resident promoted entry
+                // falls back cleanly to retryable ordinary write-behind (`checkpoint: false`).
+                this.pending_disk_upgrades.remove(&id);
                 let requeue = this.is_retryable_ordinary_wb(coordinator, id);
+                let is_head = this.is_prompt_head(id);
                 if requeue
                     && let Some(depth) = this
                         .store
@@ -1785,7 +2150,7 @@ impl Inkling2StateStore {
                         id,
                         depth,
                         0.0,
-                        false,
+                        is_head,
                     );
                 }
                 this.recent_failed_spills.insert(id);
@@ -1796,12 +2161,13 @@ impl Inkling2StateStore {
             let still_pending = self
                 .disk
                 .as_ref()
-                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == pid));
+                .is_some_and(|d| d.pending_write_id() == Some(pid));
             if !still_pending {
-                let landed_cleanly = self
-                    .store
-                    .get(pid)
-                    .is_some_and(|e| e.disk().is_some_and(|c| c.landed));
+                let landed_cleanly = state_failed_id != Some(pid)
+                    && self
+                        .store
+                        .get(pid)
+                        .is_some_and(|e| e.disk().is_some_and(|c| c.landed));
                 if landed_cleanly {
                     self.spill_backoff.remove(&pid);
                 } else {
@@ -1845,17 +2211,21 @@ impl Inkling2StateStore {
     ///   re-queue the upgrade with backoff, and return `Some(id)`.
     /// - If the replacement write failed AND the old SSD blob was also evicted, transition to
     ///   `PendingDiskUpgrade::Repair` with backoff and return `Some(id)`.
-    fn reconcile_in_flight_disk_upgrade(&mut self) -> Option<EntryId> {
+    fn reconcile_in_flight_disk_upgrade(
+        &mut self,
+        failed_state_id: Option<EntryId>,
+    ) -> Option<EntryId> {
         let id = self.in_flight_disk_upgrade.as_ref()?.id;
         let still_pending = self
             .disk
             .as_ref()
-            .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == id));
+            .is_some_and(|d| d.pending_write_id() == Some(id));
         if still_pending {
             return None;
         }
         let InFlightDiskUpgrade {
             id,
+            kind,
             mut old_copy,
             _fallback_hold,
         } = self.in_flight_disk_upgrade.take()?;
@@ -1864,7 +2234,9 @@ impl Inkling2StateStore {
         {
             disk.preserve_entry_on_state_failure = None;
         }
-        if let Some(entry) = self.store.get(id)
+        let failed = failed_state_id == Some(id);
+        if !failed
+            && let Some(entry) = self.store.get(id)
             && let Some(copy) = entry.disk()
             && copy.landed
         {
@@ -1894,22 +2266,80 @@ impl Inkling2StateStore {
                 old_copy.chain_owed = !disk.engine.chain_on_disk(entry);
             }
             let has_ram = entry.ram().is_some();
-            self.store.set_disk(id, Some(old_copy));
-            if has_ram {
-                self.pending_disk_upgrades.insert(
-                    id,
-                    PendingDiskUpgrade::InPlace {
-                        retry_after: upgrade_retry_after(),
-                    },
-                );
-                self.recent_failed_upgrades.insert(id);
-            } else if self
-                .resolve_geometry()
-                .is_some_and(|g| g.draft_window_span_bytes > 0)
-            {
-                self.entries_missing_draft_window.insert(id);
+            let is_ordinary = !entry.checkpoint();
+            if entry.disk().copied() != Some(old_copy) {
+                self.store.set_disk(id, Some(old_copy));
+            }
+            let persistent_writable = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.tier.persistent && d.writable());
+            let retry = upgrade_retry_after();
+            match kind {
+                InFlightDiskUpgradeKind::InPlace { promote_label } => {
+                    if has_ram {
+                        self.pending_disk_upgrades.insert(
+                            id,
+                            PendingDiskUpgrade::InPlace {
+                                retry_after: retry,
+                                promote_label,
+                            },
+                        );
+                        self.recent_failed_upgrades.insert(id);
+                    } else {
+                        if self
+                            .resolve_geometry()
+                            .is_some_and(|g| g.draft_window_span_bytes > 0)
+                        {
+                            self.entries_missing_draft_window.insert(id);
+                        }
+                        if promote_label && persistent_writable && is_ordinary {
+                            self.pending_disk_upgrades.insert(
+                                id,
+                                PendingDiskUpgrade::LabelPromote { retry_after: retry },
+                            );
+                            self.recent_failed_upgrades.insert(id);
+                        }
+                    }
+                }
+                InFlightDiskUpgradeKind::LabelPromote => {
+                    // Never mark `entries_missing_draft_window` on a `LabelPromote` rollback:
+                    // the existing SSD blob still carries its original draft-window state.
+                    if persistent_writable && is_ordinary {
+                        match self.pending_disk_upgrades.get_mut(&id) {
+                            Some(PendingDiskUpgrade::InPlace {
+                                retry_after,
+                                promote_label,
+                            }) => {
+                                *retry_after = retry;
+                                *promote_label = true;
+                            }
+                            Some(PendingDiskUpgrade::Repair { .. }) => {}
+                            Some(PendingDiskUpgrade::LabelPromote { retry_after }) => {
+                                *retry_after = retry;
+                            }
+                            None => {
+                                self.pending_disk_upgrades.insert(
+                                    id,
+                                    PendingDiskUpgrade::LabelPromote { retry_after: retry },
+                                );
+                            }
+                        }
+                    }
+                    self.recent_failed_upgrades.insert(id);
+                }
             }
             return Some(id);
+        }
+        // Fallback SSD copy is also gone (e.g. corrupt source pruned during relabel):
+        // clear any stale `DiskCopy` metadata before repairing from RAM or removing the entry.
+        if let Some(disk) = self.disk.as_mut()
+            && disk.chain.as_ref().is_some_and(|c| c.id == id)
+        {
+            disk.chain = None;
+        }
+        if self.store.get(id).is_some_and(|e| e.disk().is_some()) {
+            self.store.set_disk(id, None);
         }
         if self.store.get(id).is_some_and(|e| e.ram().is_some()) {
             self.mark_repair_failed(id, upgrade_retry_after());
@@ -1919,6 +2349,7 @@ impl Inkling2StateStore {
         if self.store.get(id).is_some_and(|e| e.disk().is_none()) {
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
+            self.prompt_heads.remove(&id);
             self.store.remove(id);
             self.sync_host_budget();
             return Some(id);
@@ -1941,8 +2372,11 @@ impl Inkling2StateStore {
         let fallback_hold = disk.tier.manager.hold_keys(keys);
         self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
             id,
+            kind: InFlightDiskUpgradeKind::InPlace {
+                promote_label: false,
+            },
             old_copy,
-            _fallback_hold: fallback_hold,
+            _fallback_hold: Some(fallback_hold),
         });
     }
 
@@ -1988,10 +2422,7 @@ impl Inkling2StateStore {
     ) {
         let mut changed = false;
         while self.ram_len() > self.ram_cap {
-            let pending_id = self
-                .disk
-                .as_ref()
-                .and_then(|d| d.pending.as_ref().map(|p| p.id));
+            let pending_id = self.disk.as_ref().and_then(|d| d.pending_write_id());
 
             // Priority 1: oldest Checkpoint with RAM copy -> retire completely.
             let cp_victim = self
@@ -2023,7 +2454,13 @@ impl Inkling2StateStore {
                     !entry.checkpoint()
                         && entry.ram().is_some()
                         && entry.disk().is_some_and(|c| c.landed && !c.chain_owed)
-                        && !self.pending_disk_upgrades.contains_key(&entry.id())
+                        && !matches!(
+                            self.pending_disk_upgrades.get(&entry.id()),
+                            Some(
+                                PendingDiskUpgrade::InPlace { .. }
+                                    | PendingDiskUpgrade::Repair { .. }
+                            )
+                        )
                         && self
                             .in_flight_disk_upgrade
                             .as_ref()
@@ -2045,15 +2482,79 @@ impl Inkling2StateStore {
                 continue;
             }
 
+            // Priority 2b: oldest RAM-only non-head Ordinary entry that is superseded by at least
+            // one currently restorable ordinary descendant -> erase directly from RAM instead of
+            // spilling a dead intermediate turn blob to SSD.
+            let superseded_victim = self
+                .store
+                .entries()
+                .filter(|entry| {
+                    let id = entry.id();
+                    let depth = entry.chain().len();
+                    !entry.checkpoint()
+                        && entry.ram().is_some()
+                        && entry.disk().is_none()
+                        && depth > 0
+                        && Some(id) != protect
+                        && !self.store.in_use(entry.mark())
+                        && pending_id != Some(id)
+                        && !self.pending_disk_upgrades.contains_key(&id)
+                        && self
+                            .in_flight_disk_upgrade
+                            .as_ref()
+                            .is_none_or(|u| u.id != id)
+                        && !self.is_prompt_head(id)
+                        && self.store.superseded(id)
+                        && self.store.entries().any(|other| {
+                            !other.checkpoint()
+                                && other.chain().len() > depth
+                                && other.chain()[..depth] == entry.chain()[..]
+                                && self.is_restorable(coordinator, other.id())
+                        })
+                })
+                .min_by_key(|entry| (entry.last_used(), entry.id()))
+                .map(Entry::id);
+            if let Some(id) = superseded_victim {
+                if let Some(disk) = self.disk.as_mut()
+                    && disk.chain.as_ref().is_some_and(|c| c.id == id)
+                {
+                    disk.chain = None;
+                }
+                self.seq_checkpoints.retain(|_, v| *v != id);
+                self.clear_window_tracking(id);
+                self.clear_upgrade_tracking(id);
+                self.prompt_heads.remove(&id);
+                self.store.remove(id);
+                changed = true;
+                continue;
+            }
+
             // Priority 3: if disk is writable, not writing, and no restore is waiting on the
             // staging buffer, stage LRU Ordinary with no disk copy (or an eligible pending SSD
             // upgrade past its backoff window) while keeping RAM warm (`keep_ram = true`) until
-            // both state blob and Global KV chain have landed on SSD.
+            // both state blob and Global KV chain have landed on SSD. Do not pile up extra spills
+            // once already-staged non-pinned entries (`!landed || chain_owed`) already cover the
+            // excess over `ram_cap`, otherwise runaway staging marks every linear turn with
+            // `disk = Some(chain_owed = true)` before prior KV chains land and bypasses Priority 2b.
             let (disk_writable, disk_writing, has_read_waiters) =
                 self.disk.as_ref().map_or((false, false, false), |d| {
                     (d.writable(), d.writing(), d.has_read_waiters())
                 });
-            if disk_writable && !disk_writing && !has_read_waiters {
+            let inflight_ram_spills = self
+                .store
+                .entries()
+                .filter(|entry| {
+                    !entry.checkpoint()
+                        && entry.ram().is_some()
+                        && !self.store.in_use(entry.mark())
+                        && entry.disk().is_some_and(|c| !c.landed || c.chain_owed)
+                })
+                .count();
+            if disk_writable
+                && !disk_writing
+                && !has_read_waiters
+                && self.ram_len().saturating_sub(inflight_ram_spills) > self.ram_cap
+            {
                 let now = Instant::now();
                 let spill_victim = self
                     .store
@@ -2071,6 +2572,7 @@ impl Inkling2StateStore {
                                 .is_some_and(|pending| now < pending.retry_after());
                         let needs_stage = match self.pending_disk_upgrades.get(&id) {
                             Some(PendingDiskUpgrade::InPlace { .. }) => true,
+                            Some(PendingDiskUpgrade::LabelPromote { .. }) => false,
                             Some(PendingDiskUpgrade::Repair { .. }) | None => {
                                 entry.disk().is_none()
                             }
@@ -2110,33 +2612,62 @@ impl Inkling2StateStore {
                         && !self.store.in_use(entry.mark())
                         && pending_id != Some(entry.id())
                 })
-                .min_by_key(|entry| (entry.last_used(), entry.id()))
+                .min_by_key(|entry| {
+                    (
+                        self.is_prompt_head(entry.id()),
+                        entry.last_used(),
+                        entry.id(),
+                    )
+                })
                 .map(Entry::id);
             let Some(id) = erase_victim else {
                 break;
             };
-            // If `id` has a pending in-place disk upgrade whose previous SSD copy is still durable
-            // and restorable, fall back cleanly to that old SSD copy by dropping only RAM.
-            let keep_durable_old_ssd = self
-                .pending_disk_upgrades
-                .get(&id)
-                .is_some_and(PendingDiskUpgrade::is_in_place)
-                && self.disk.as_ref().is_some_and(|d| {
-                    self.store.get(id).is_some_and(|e| {
-                        e.disk().is_some_and(|c| c.landed && !c.chain_owed)
-                            && d.entry_disk_restorable(e)
-                    })
-                });
+            // If `id` has a pending in-place disk upgrade or label promotion whose previous SSD
+            // copy is still durable and restorable, fall back cleanly to that old SSD copy by
+            // dropping only RAM.
+            let pending_for_victim = self.pending_disk_upgrades.get(&id).copied();
+            let keep_durable_old_ssd = matches!(
+                pending_for_victim,
+                Some(PendingDiskUpgrade::InPlace { .. } | PendingDiskUpgrade::LabelPromote { .. })
+            ) && self.disk.as_ref().is_some_and(|d| {
+                self.store.get(id).is_some_and(|e| {
+                    e.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                        && d.entry_disk_restorable(e)
+                })
+            });
             if keep_durable_old_ssd {
-                self.pending_disk_upgrades.remove(&id);
-                self.recent_failed_upgrades.remove(&id);
-                self.demote_ram_on_durable.remove(&id);
-                if self
-                    .resolve_geometry()
-                    .is_some_and(|g| g.draft_window_span_bytes > 0)
-                {
-                    self.entries_missing_draft_window.insert(id);
+                match self.pending_disk_upgrades.remove(&id) {
+                    Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                        self.recent_failed_upgrades.remove(&id);
+                        if self
+                            .resolve_geometry()
+                            .is_some_and(|g| g.draft_window_span_bytes > 0)
+                        {
+                            self.entries_missing_draft_window.insert(id);
+                        }
+                        if promote_label
+                            && self
+                                .disk
+                                .as_ref()
+                                .is_some_and(|d| d.tier.persistent && d.writable())
+                            && self.store.get(id).is_some_and(|e| !e.checkpoint())
+                        {
+                            self.pending_disk_upgrades.insert(
+                                id,
+                                PendingDiskUpgrade::LabelPromote {
+                                    retry_after: Instant::now(),
+                                },
+                            );
+                        }
+                    }
+                    Some(PendingDiskUpgrade::LabelPromote { retry_after }) => {
+                        self.pending_disk_upgrades
+                            .insert(id, PendingDiskUpgrade::LabelPromote { retry_after });
+                    }
+                    Some(PendingDiskUpgrade::Repair { .. }) | None => {}
                 }
+                self.demote_ram_on_durable.remove(&id);
                 self.store.drop_ram(id);
                 changed = true;
                 continue;
@@ -2152,6 +2683,7 @@ impl Inkling2StateStore {
             self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
+            self.prompt_heads.remove(&id);
             changed = true;
         }
         if changed {
@@ -2162,6 +2694,7 @@ impl Inkling2StateStore {
 
     pub(crate) fn clear_ram_and_checkpoints(&mut self) {
         self.seq_checkpoints.clear();
+        self.prompt_heads.clear();
         self.entries_missing_draft_window.clear();
         self.adopted_unverified_window.clear();
         self.pending_disk_upgrades.clear();
@@ -2177,6 +2710,7 @@ impl Inkling2StateStore {
         for id in ids {
             self.store.remove(id);
         }
+        self.end_all_seq_uses();
         self.sync_host_budget();
     }
 
@@ -2193,18 +2727,38 @@ impl Inkling2StateStore {
             .collect();
         for (id, has_durable_disk) in ids {
             if has_durable_disk {
-                if matches!(
-                    self.pending_disk_upgrades.remove(&id),
-                    Some(PendingDiskUpgrade::InPlace { .. })
-                ) && has_dw_span
-                {
-                    self.entries_missing_draft_window.insert(id);
+                match self.pending_disk_upgrades.remove(&id) {
+                    Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                        if has_dw_span {
+                            self.entries_missing_draft_window.insert(id);
+                        }
+                        if promote_label
+                            && self
+                                .disk
+                                .as_ref()
+                                .is_some_and(|d| d.tier.persistent && d.writable())
+                            && self.store.get(id).is_some_and(|e| !e.checkpoint())
+                        {
+                            self.pending_disk_upgrades.insert(
+                                id,
+                                PendingDiskUpgrade::LabelPromote {
+                                    retry_after: Instant::now(),
+                                },
+                            );
+                        }
+                    }
+                    Some(PendingDiskUpgrade::LabelPromote { retry_after }) => {
+                        self.pending_disk_upgrades
+                            .insert(id, PendingDiskUpgrade::LabelPromote { retry_after });
+                    }
+                    Some(PendingDiskUpgrade::Repair { .. }) | None => {}
                 }
                 self.store.drop_ram(id);
             } else {
                 self.seq_checkpoints.retain(|_, v| *v != id);
                 self.clear_window_tracking(id);
                 self.clear_upgrade_tracking(id);
+                self.prompt_heads.remove(&id);
                 self.store.remove(id);
             }
         }
@@ -2427,6 +2981,7 @@ impl Inkling2StateStore {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn reuse_existing_entry(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
@@ -2435,13 +2990,25 @@ impl Inkling2StateStore {
         boundary: u32,
         effective_class: StateClass,
         opts: CaptureOptions,
+        chain_re_registered: bool,
     ) -> EntryId {
-        let needs_write_behind = self
-            .store
-            .get(old_id)
-            .is_some_and(|existing| existing.ram().is_some() && existing.disk().is_none());
+        let (was_checkpoint, has_ram, has_disk) =
+            self.store
+                .get(old_id)
+                .map_or((false, false, false), |existing| {
+                    (
+                        existing.checkpoint(),
+                        existing.ram().is_some(),
+                        existing.disk().is_some(),
+                    )
+                });
+        let needs_write_behind = has_ram && !has_disk;
+        let effective_is_head = opts.is_head || self.is_prompt_head(old_id);
         self.store
             .reuse(old_id, effective_class == StateClass::Checkpoint);
+        if chain_re_registered {
+            self.store.mark_changed();
+        }
         self.demote_ram_on_durable.remove(&old_id);
         match effective_class {
             StateClass::Checkpoint => {
@@ -2451,6 +3018,12 @@ impl Inkling2StateStore {
             StateClass::Ordinary => {
                 self.ordinary_published += 1;
                 self.seq_checkpoints.retain(|_, v| *v != old_id);
+                if effective_is_head {
+                    self.mark_prompt_head(old_id);
+                }
+                if was_checkpoint && has_disk {
+                    self.enqueue_label_promote(old_id);
+                }
                 if opts.enqueue_write_behind
                     && needs_write_behind
                     && !self.pending_disk_upgrades.contains_key(&old_id)
@@ -2465,7 +3038,7 @@ impl Inkling2StateStore {
                         old_id,
                         boundary,
                         opts.now,
-                        opts.is_head,
+                        effective_is_head,
                     );
                 }
             }
@@ -2526,7 +3099,7 @@ impl Inkling2StateStore {
             let pending_same = self
                 .disk
                 .as_ref()
-                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+                .is_some_and(|d| d.pending_write_id() == Some(old_id));
             let incoming_can_upgrade = existing_missing_dw && incoming_matches_dw && !pending_same;
             let existing_reusable = existing_has_ram || existing_disk_durable;
             if existing_reusable && !incoming_can_upgrade {
@@ -2535,7 +3108,8 @@ impl Inkling2StateStore {
                 } else {
                     StateClass::Ordinary
                 };
-                if !self.chain_is_hot(coordinator, old_id) {
+                let chain_re_registered = !self.chain_is_hot(coordinator, old_id);
+                if chain_re_registered {
                     coordinator
                         .eval_pending_pool_writes_all()
                         .map_err(Error::from_reason)?;
@@ -2556,6 +3130,7 @@ impl Inkling2StateStore {
                     boundary,
                     effective_class,
                     opts,
+                    chain_re_registered,
                 )));
             }
         }
@@ -2625,6 +3200,8 @@ impl Inkling2StateStore {
         eval_conv_state_arrays(conv_state)?;
 
         // Register Group 0 full blocks so their chained hashes are live in the prefix cache.
+        let existing_chain_was_hot =
+            existing_id.is_some_and(|id| self.chain_is_hot(coordinator, id));
         coordinator
             .register_full_committed_blocks(seq_id, boundary, cache_salt)
             .map_err(Error::from_reason)?;
@@ -2733,6 +3310,7 @@ impl Inkling2StateStore {
                     boundary,
                     effective_class,
                     opts,
+                    !existing_chain_was_hot,
                 )));
             }
         }
@@ -2742,10 +3320,15 @@ impl Inkling2StateStore {
         if let Some(old_id) = existing_id
             && self.store.get(old_id).is_some_and(|e| e.ram().is_none())
         {
+            let was_checkpoint = self.store.get(old_id).is_some_and(Entry::checkpoint);
+            let had_label_promote = matches!(
+                self.pending_disk_upgrades.get(&old_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            );
             let pending_same = self
                 .disk
                 .as_ref()
-                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+                .is_some_and(|d| d.pending_write_id() == Some(old_id));
             let old_disk_copy = self.store.get(old_id).and_then(|e| e.disk().copied());
             let disk_restorable = self.store.get(old_id).is_some_and(|e| {
                 self.disk
@@ -2808,8 +3391,12 @@ impl Inkling2StateStore {
                     self.checkpoints_published += 1;
                     self.seq_checkpoints.insert(seq_id, old_id);
                 } else {
+                    let effective_is_head = opts.is_head || self.is_prompt_head(old_id);
                     self.ordinary_published += 1;
                     self.seq_checkpoints.retain(|_, v| *v != old_id);
+                    if effective_is_head {
+                        self.mark_prompt_head(old_id);
+                    }
                     if self.disk.as_ref().is_some_and(|d| d.writable()) {
                         let upgrade = if disk_unusable && old_disk_copy.is_some() {
                             Some(PendingDiskUpgrade::Repair {
@@ -2818,12 +3405,17 @@ impl Inkling2StateStore {
                         } else if pending_same && has_draft_window && was_missing_dw {
                             Some(PendingDiskUpgrade::InPlace {
                                 retry_after: Instant::now(),
+                                promote_label: was_checkpoint || had_label_promote,
                             })
                         } else {
                             None
                         };
                         if let Some(kind) = upgrade {
                             self.pending_disk_upgrades.insert(old_id, kind);
+                        } else if was_checkpoint
+                            && self.store.get(old_id).is_some_and(|e| e.disk().is_some())
+                        {
+                            self.enqueue_label_promote(old_id);
                         } else if disk_unusable
                             && opts.enqueue_write_behind
                             && let Some(disk) = self.disk.as_mut()
@@ -2837,7 +3429,7 @@ impl Inkling2StateStore {
                                 old_id,
                                 boundary,
                                 opts.now,
-                                opts.is_head,
+                                effective_is_head,
                             );
                         }
                     }
@@ -2854,11 +3446,12 @@ impl Inkling2StateStore {
         // SSD-only/adopted-unverified) and our new capture has one (and is not currently in flight
         // on SSD), upgrade it without downgrading an Ordinary entry and WITHOUT losing its
         // durable `DiskCopy` before the upgraded blob atomically replaces it on SSD.
+        let mut preserved_head = false;
         if has_draft_window && let Some(old_id) = existing_id {
             let pending_same = self
                 .disk
                 .as_ref()
-                .is_some_and(|d| d.pending.as_ref().is_some_and(|p| p.id == old_id));
+                .is_some_and(|d| d.pending_write_id() == Some(old_id));
             let can_upgrade = !pending_same
                 && self.store.get(old_id).is_some_and(|e| {
                     e.ram().is_some_and(|a| a.draft_window.is_none())
@@ -2867,8 +3460,20 @@ impl Inkling2StateStore {
                                 || self.adopted_unverified_window.contains(&old_id)))
                 });
             if can_upgrade {
+                let was_checkpoint = self.store.get(old_id).is_some_and(Entry::checkpoint);
                 let old_disk_copy = self.store.get(old_id).and_then(|e| e.disk().copied());
                 if old_disk_copy.is_some() {
+                    let promote_label = (was_checkpoint && effective_class == StateClass::Ordinary)
+                        || matches!(
+                            self.pending_disk_upgrades.get(&old_id),
+                            Some(
+                                PendingDiskUpgrade::LabelPromote { .. }
+                                    | PendingDiskUpgrade::InPlace {
+                                        promote_label: true,
+                                        ..
+                                    }
+                            )
+                        );
                     // Preserve `old_id` and its existing `DiskCopy` in-place! Atomically
                     // replace its RAM anchor (updating `cached_bytes`), preserve/upgrade
                     // `Ordinary` class and recency, and record the pending disk upgrade.
@@ -2889,6 +3494,7 @@ impl Inkling2StateStore {
                         old_id,
                         PendingDiskUpgrade::InPlace {
                             retry_after: Instant::now(),
+                            promote_label,
                         },
                     );
                     self.recent_failed_upgrades.remove(&old_id);
@@ -2900,6 +3506,9 @@ impl Inkling2StateStore {
                         StateClass::Ordinary => {
                             self.ordinary_published += 1;
                             self.seq_checkpoints.retain(|_, v| *v != old_id);
+                            if opts.is_head {
+                                self.mark_prompt_head(old_id);
+                            }
                         }
                     }
                     self.sync_marks(coordinator);
@@ -2909,6 +3518,7 @@ impl Inkling2StateStore {
                     return Ok(Some(old_id));
                 }
                 // RAM-only entry (`disk().is_none()`): safe to replace directly in RAM.
+                preserved_head = self.prompt_heads.remove(&old_id);
                 self.seq_checkpoints.retain(|_, v| *v != old_id);
                 if let Some(disk) = self.disk.as_mut()
                     && disk.chain.as_ref().is_some_and(|c| c.id == old_id)
@@ -2955,9 +3565,21 @@ impl Inkling2StateStore {
                 self.seq_checkpoints.insert(seq_id, inserted.id);
             }
             StateClass::Ordinary => {
+                let effective_is_head =
+                    opts.is_head || preserved_head || self.is_prompt_head(inserted.id);
                 self.ordinary_published += 1;
                 self.seq_checkpoints.retain(|_, v| *v != inserted.id);
-                if opts.enqueue_write_behind
+                if effective_is_head {
+                    self.mark_prompt_head(inserted.id);
+                }
+                let has_disk = self
+                    .store
+                    .get(inserted.id)
+                    .is_some_and(|e| e.disk().is_some());
+                if inserted.upgraded && has_disk {
+                    self.enqueue_label_promote(inserted.id);
+                } else if (opts.enqueue_write_behind || preserved_head)
+                    && !self.pending_disk_upgrades.contains_key(&inserted.id)
                     && let Some(disk) = self.disk.as_mut()
                 {
                     let writable = disk.writable();
@@ -2969,7 +3591,7 @@ impl Inkling2StateStore {
                         inserted.id,
                         boundary,
                         opts.now,
-                        opts.is_head,
+                        effective_is_head,
                     );
                 }
             }
@@ -2994,7 +3616,7 @@ impl Inkling2StateStore {
             return;
         }
         if let Some(disk) = self.disk.as_mut() {
-            if disk.pending.as_ref().is_some_and(|p| p.id == id) {
+            if disk.pending_write_id() == Some(id) {
                 return;
             }
             if disk.chain.as_ref().is_some_and(|c| c.id == id) {
@@ -3011,11 +3633,63 @@ impl Inkling2StateStore {
         self.seq_checkpoints.retain(|_, v| *v != id);
         self.clear_window_tracking(id);
         self.clear_upgrade_tracking(id);
+        self.prompt_heads.remove(&id);
         self.store.remove(id);
         self.sync_host_budget();
     }
 
-    /// Stage `id`'s RAM anchor into the reusable host buffer and enqueue its SSD write.
+    /// Enqueue an off-thread `LabelPromote` rewrite on `ColdCacheManager`'s writer thread under
+    /// `MakeRoom::Refuse`. Neither reads from SSD on the scheduler thread nor borrows
+    /// `StateDiskEngine`'s reusable staging buffer, and keeps `entry.disk()` at
+    /// `Some(old_copy)` (`landed: true`) throughout the rewrite so concurrent restores continue
+    /// hitting the already-landed SSD copy without interruption.
+    fn stage_state_relabel(
+        &mut self,
+        id: EntryId,
+        old_copy: DiskCopy,
+        fallback_hold: ColdKeyHold,
+    ) -> Staged {
+        let Some(entry) = self.store.get(id) else {
+            return Staged::Refused;
+        };
+        let Some(disk) = self.disk.as_mut() else {
+            return Staged::Refused;
+        };
+        let (Some(layout), Some(key)) = (
+            disk.engine.layout(entry.depth()),
+            disk.engine.state_key(entry),
+        ) else {
+            return Staged::Refused;
+        };
+        if key != old_copy.key {
+            return Staged::Refused;
+        }
+        let relabel = mlx_paged_attn::ColdStateRelabel {
+            key,
+            fingerprint: disk.tier.state_fingerprint,
+            layout,
+            label: crate::disk_tier::state_disk::label_of(entry),
+        };
+        match disk.tier.manager.enqueue_state_relabel(
+            relabel,
+            MakeRoom::Refuse,
+            disk.relabel_tx.clone(),
+        ) {
+            Ok(()) => {
+                disk.pending_relabel = Some(PendingRelabel {
+                    id,
+                    key,
+                    _fallback_hold: fallback_hold,
+                });
+                Staged::Started
+            }
+            Err(mlx_paged_attn::EnqueueRefused::Busy(_)) => Staged::Busy,
+            Err(mlx_paged_attn::EnqueueRefused::Gone(_)) => Staged::Refused,
+        }
+    }
+
+    /// Stage `id`'s RAM anchor into the reusable host buffer (or enqueue an off-thread
+    /// `LabelPromote` rewrite on the writer thread) and submit its SSD write.
     pub(crate) fn stage_entry(
         &mut self,
         coordinator: &Inkling2KVCacheCoordinator,
@@ -3027,8 +3701,23 @@ impl Inkling2StateStore {
             return false;
         };
         let pending_kind = self.pending_disk_upgrades.get(&id).copied();
+        let has_ram = entry.ram().is_some();
+        let is_label_promote =
+            matches!(pending_kind, Some(PendingDiskUpgrade::LabelPromote { .. }));
+        if is_label_promote {
+            let persistent_writable = self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.tier.persistent && d.writable());
+            if !persistent_writable || entry.checkpoint() || entry.disk().is_none() {
+                self.pending_disk_upgrades.remove(&id);
+                return false;
+            }
+        }
         let upgrade_old_copy = match pending_kind {
-            Some(PendingDiskUpgrade::InPlace { .. }) => entry.disk().copied(),
+            Some(PendingDiskUpgrade::InPlace { .. } | PendingDiskUpgrade::LabelPromote { .. }) => {
+                entry.disk().copied()
+            }
             Some(PendingDiskUpgrade::Repair { .. }) | None => None,
         };
         let (writable, writing) = match self.disk.as_ref() {
@@ -3038,11 +3727,19 @@ impl Inkling2StateStore {
         if !writable || writing {
             return false;
         }
+        // For `LabelPromote`, wait cleanly until the initial state blob AND its owed Global KV
+        // chain have landed on SSD before reading/relabeling the blob (never treat an in-flight
+        // or `chain_owed` initial write as stale or place it in backoff).
+        if is_label_promote && upgrade_old_copy.is_some_and(|c| !c.landed || c.chain_owed) {
+            return false;
+        }
         // Acquire a `ColdKeyHold` pinning `old_copy.key` and its entire Global KV chain BEFORE
         // checking presence so a competing writer job cannot evict the SSD fallback after our
         // pre-check passes. The hold is dropped automatically on any early return / refusal and
-        // moved into `in_flight_disk_upgrade` once `stage` starts.
-        let mut upgrade_in_place: Option<(DiskCopy, ColdKeyHold)> = None;
+        // moved onto `PendingRelabel` (for `LabelPromote`) or `in_flight_disk_upgrade` (for
+        // `InPlace`) once staging starts.
+        let mut upgrade_in_place: Option<(DiskCopy, Option<ColdKeyHold>, InFlightDiskUpgradeKind)> =
+            None;
         let mut stale_upgrade_copy: Option<DiskCopy> = None;
         if let Some(old_copy) = upgrade_old_copy
             && old_copy.landed
@@ -3057,7 +3754,13 @@ impl Inkling2StateStore {
                 .contains_in(&old_copy.key, ColdGroup::DFlash2State)
                 && disk.engine.chain_on_disk(entry);
             if intact {
-                upgrade_in_place = Some((old_copy, hold));
+                let in_flight_kind = match pending_kind {
+                    Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                        InFlightDiskUpgradeKind::InPlace { promote_label }
+                    }
+                    _ => InFlightDiskUpgradeKind::LabelPromote,
+                };
+                upgrade_in_place = Some((old_copy, Some(hold), in_flight_kind));
             } else {
                 drop(hold);
                 stale_upgrade_copy = Some(old_copy);
@@ -3076,6 +3779,24 @@ impl Inkling2StateStore {
             transitioned_to_repair = true;
         }
         if let Some(old_copy) = stale_upgrade_copy {
+            if !has_ram {
+                // SSD-only `LabelPromote` whose old blob or Global KV chain was already evicted:
+                // no RAM copy exists to repair it. Clean up the dead entry and drop tracking.
+                if let Some(disk) = self.disk.as_mut() {
+                    if disk.chain.as_ref().is_some_and(|c| c.id == id) {
+                        disk.chain = None;
+                    }
+                    disk.tier.manager.remove(&old_copy.key);
+                }
+                self.seq_checkpoints.retain(|_, v| *v != id);
+                self.clear_window_tracking(id);
+                self.clear_upgrade_tracking(id);
+                self.prompt_heads.remove(&id);
+                self.store.remove(id);
+                self.sync_marks(coordinator);
+                self.sync_host_budget();
+                return false;
+            }
             // The old SSD blob's Global KV chain (or blob itself) was already evicted from SSD,
             // so the old SSD copy is no longer restorable. Remove the dead old SSD blob, transition
             // upgrade tracking to `Repair` (never drop it!), and fall through to the normal
@@ -3101,12 +3822,12 @@ impl Inkling2StateStore {
             return false;
         };
         let can_stage = self.disk.as_ref().is_some_and(|disk| {
-            if let Some((old_copy, _)) = upgrade_in_place.as_ref() {
-                // An in-place upgrade of an already-landed state blob whose KV chain is already
-                // on disk only charges the net delta `(new_state - old_copy.bytes)` against the
-                // logical quota, so it fits whenever the post-overwrite total stays within
-                // `tier.limit` and the volume has `new_state` bytes free above reserve for the
-                // replacement `.tmp` file. Never fall back to `point_fits(entry, room)`: under
+            if let Some((old_copy, _, _)) = upgrade_in_place.as_ref() {
+                // An in-place upgrade or label relabel of an already-landed state blob whose KV
+                // chain is already on disk only charges the net delta `(new_state - old_copy.bytes)`
+                // against the logical quota, so it fits whenever the post-overwrite total stays
+                // within `tier.limit` and the volume has `new_state` bytes free above reserve for
+                // the replacement `.tmp` file. Never fall back to `point_fits(entry, room)`: under
                 // `MakeRoom::Evict`, `point_fits` can return `true` when `free < new_state` and
                 // cause `ColdCacheManager::persist_with` to evict live KV blocks (including this
                 // anchor's own Global KV chain) while chasing volume headroom.
@@ -3129,7 +3850,7 @@ impl Inkling2StateStore {
                         })
                         .unwrap_or(false)
             } else {
-                entry.disk().is_none() && disk.point_fits(entry, room)
+                entry.ram().is_some() && entry.disk().is_none() && disk.point_fits(entry, room)
             }
         });
         if !can_stage {
@@ -3143,23 +3864,35 @@ impl Inkling2StateStore {
             }
             return false;
         }
-        if upgrade_in_place.is_some() {
-            self.store.set_disk(id, None);
-        }
         let is_pending_upgrade = self.pending_disk_upgrades.contains_key(&id);
-        // Always enqueue in-place SSD upgrades with `MakeRoom::Refuse`: even if volume headroom or
-        // quota changes between this model-thread pre-check and async writer execution, the writer
-        // must NEVER evict any object (including the old blob's Global KV chain) — it cleanly
-        // refuses, rolls back `old_copy`, and preserves the old durable SSD hit.
-        let effective_room = if upgrade_in_place.is_some() {
-            MakeRoom::Refuse
+        let label_promote_copy = upgrade_in_place.as_ref().and_then(|(old_copy, _, kind)| {
+            (*kind == InFlightDiskUpgradeKind::LabelPromote).then_some(*old_copy)
+        });
+        let staged = if let Some(old_copy) = label_promote_copy {
+            let Some(fallback_hold) = upgrade_in_place
+                .as_mut()
+                .and_then(|(_, hold, _)| hold.take())
+            else {
+                return false;
+            };
+            self.stage_state_relabel(id, old_copy, fallback_hold)
         } else {
-            room
-        };
-        let effective_keep_ram = keep_ram || is_pending_upgrade;
-        let staged = {
+            if upgrade_in_place.is_some() {
+                self.store.set_disk(id, None);
+            }
+            // Always enqueue in-place SSD upgrades with `MakeRoom::Refuse`: even if volume
+            // headroom or quota changes between this model-thread pre-check and async writer
+            // execution, the writer must NEVER evict any object (including the old blob's Global
+            // KV chain) — it cleanly refuses, rolls back `old_copy`, and preserves the old durable
+            // SSD hit.
+            let effective_room = if upgrade_in_place.is_some() {
+                MakeRoom::Refuse
+            } else {
+                room
+            };
+            let effective_keep_ram = keep_ram || is_pending_upgrade;
             let Some(disk) = self.disk.as_mut() else {
-                if let Some((old_copy, _)) = upgrade_in_place {
+                if let Some((old_copy, _, _)) = upgrade_in_place {
                     self.store.set_disk(id, Some(old_copy));
                 }
                 return false;
@@ -3171,15 +3904,18 @@ impl Inkling2StateStore {
             Staged::Started => {
                 self.spill_backoff.remove(&id);
                 self.recent_failed_spills.remove(&id);
-                if let Some((old_copy, fallback_hold)) = upgrade_in_place {
+                if let Some((old_copy, fallback_hold, in_flight_kind)) = upgrade_in_place {
                     self.pending_disk_upgrades.remove(&id);
                     self.recent_failed_upgrades.remove(&id);
                     self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
                         id,
+                        kind: in_flight_kind,
                         old_copy,
                         _fallback_hold: fallback_hold,
                     });
-                    if let Some(disk) = self.disk.as_mut() {
+                    if in_flight_kind != InFlightDiskUpgradeKind::LabelPromote
+                        && let Some(disk) = self.disk.as_mut()
+                    {
                         disk.preserve_entry_on_state_failure = Some(id);
                     }
                 } else if is_pending_upgrade {
@@ -3192,8 +3928,10 @@ impl Inkling2StateStore {
                 true
             }
             Staged::Busy => {
-                if let Some((old_copy, _)) = upgrade_in_place {
-                    self.store.set_disk(id, Some(old_copy));
+                if let Some((old_copy, _, _)) = upgrade_in_place {
+                    if label_promote_copy.is_none() {
+                        self.store.set_disk(id, Some(old_copy));
+                    }
                 } else if transitioned_to_repair {
                     self.sync_marks(coordinator);
                 }
@@ -3204,8 +3942,37 @@ impl Inkling2StateStore {
             }
             Staged::Refused => {
                 let retry = upgrade_retry_after();
-                if let Some((old_copy, _)) = upgrade_in_place {
-                    self.store.set_disk(id, Some(old_copy));
+                let old_still_indexed =
+                    upgrade_in_place.as_ref().is_some_and(|(old_copy, _, _)| {
+                        self.disk.as_ref().is_some_and(|d| {
+                            d.tier
+                                .manager
+                                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+                        })
+                    });
+                if let Some((old_copy, _, _)) = upgrade_in_place {
+                    if old_still_indexed {
+                        if label_promote_copy.is_none() {
+                            self.store.set_disk(id, Some(old_copy));
+                        }
+                    } else if !has_ram {
+                        self.seq_checkpoints.retain(|_, v| *v != id);
+                        self.clear_window_tracking(id);
+                        self.clear_upgrade_tracking(id);
+                        self.prompt_heads.remove(&id);
+                        self.store.remove(id);
+                        self.sync_marks(coordinator);
+                        self.sync_host_budget();
+                        if let Some(disk) = self.disk.as_mut() {
+                            disk.counters.offload_failures += 1;
+                        }
+                        return false;
+                    } else {
+                        self.store.set_disk(id, None);
+                        self.pending_disk_upgrades
+                            .insert(id, PendingDiskUpgrade::Repair { retry_after: retry });
+                        self.sync_marks(coordinator);
+                    }
                 } else if transitioned_to_repair {
                     self.sync_marks(coordinator);
                 }
@@ -3230,6 +3997,7 @@ impl Inkling2StateStore {
         self.seq_checkpoints.retain(|_, v| *v != id);
         self.clear_window_tracking(id);
         self.clear_upgrade_tracking(id);
+        self.prompt_heads.remove(&id);
         if let Some(disk) = self.disk.as_mut() {
             if disk.chain.as_ref().is_some_and(|c| c.id == id) {
                 disk.chain = None;
@@ -3322,12 +4090,31 @@ impl Inkling2StateStore {
                 return ReclaimOutcome::Erased;
             }
             if disk_copy.is_some_and(|c| c.landed && !c.chain_owed) && disk_restorable {
-                if matches!(
-                    self.pending_disk_upgrades.remove(&id),
-                    Some(PendingDiskUpgrade::InPlace { .. })
-                ) && has_dw_span
-                {
-                    self.entries_missing_draft_window.insert(id);
+                match self.pending_disk_upgrades.remove(&id) {
+                    Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                        if has_dw_span {
+                            self.entries_missing_draft_window.insert(id);
+                        }
+                        if promote_label
+                            && self
+                                .disk
+                                .as_ref()
+                                .is_some_and(|d| d.tier.persistent && d.writable())
+                            && self.store.get(id).is_some_and(|e| !e.checkpoint())
+                        {
+                            self.pending_disk_upgrades.insert(
+                                id,
+                                PendingDiskUpgrade::LabelPromote {
+                                    retry_after: Instant::now(),
+                                },
+                            );
+                        }
+                    }
+                    Some(PendingDiskUpgrade::LabelPromote { retry_after }) => {
+                        self.pending_disk_upgrades
+                            .insert(id, PendingDiskUpgrade::LabelPromote { retry_after });
+                    }
+                    Some(PendingDiskUpgrade::Repair { .. }) | None => {}
                 }
                 self.recent_failed_upgrades.remove(&id);
                 self.recent_failed_spills.remove(&id);
@@ -3421,6 +4208,7 @@ impl Inkling2StateStore {
             self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
+            self.prompt_heads.remove(&id);
             self.store.remove(id);
             self.sync_marks(coordinator);
             self.sync_host_budget();
@@ -3447,20 +4235,25 @@ impl Inkling2StateStore {
                     disk.tier.manager.remove(&copy.key);
                 }
                 self.store.set_disk(id, None);
-                if matches!(
-                    self.pending_disk_upgrades.get(&id),
-                    Some(PendingDiskUpgrade::InPlace { .. })
-                ) {
-                    if disk_writable {
-                        self.pending_disk_upgrades.insert(
-                            id,
-                            PendingDiskUpgrade::Repair {
-                                retry_after: Instant::now(),
-                            },
-                        );
-                    } else {
+                match self.pending_disk_upgrades.get(&id) {
+                    Some(PendingDiskUpgrade::InPlace { .. }) => {
+                        if disk_writable {
+                            self.pending_disk_upgrades.insert(
+                                id,
+                                PendingDiskUpgrade::Repair {
+                                    retry_after: Instant::now(),
+                                },
+                            );
+                        } else {
+                            self.pending_disk_upgrades.remove(&id);
+                        }
+                    }
+                    Some(PendingDiskUpgrade::LabelPromote { .. }) => {
+                        // Old SSD copy was gone; drop `LabelPromote` so patient reclaim spills
+                        // fresh from RAM with `checkpoint: false` below.
                         self.pending_disk_upgrades.remove(&id);
                     }
+                    Some(PendingDiskUpgrade::Repair { .. }) | None => {}
                 }
                 self.recent_failed_upgrades.remove(&id);
             }
@@ -3505,6 +4298,17 @@ impl Inkling2StateStore {
             }
         }
 
+        if disk_writing
+            && has_ram
+            && self.store.get(id).is_some_and(|e| e.disk().is_none())
+            && self
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.engine.reclaim_writes(&self.store, id))
+        {
+            return ReclaimOutcome::Pending;
+        }
+
         let step = {
             let Some(disk) = self.disk.as_mut() else {
                 return ReclaimOutcome::Erased;
@@ -3517,11 +4321,32 @@ impl Inkling2StateStore {
         };
         if step.outcome == Reclaimed::RamDropped {
             self.demote_ram_on_durable.remove(&id);
-            if let Some(removed) = self.pending_disk_upgrades.remove(&id) {
-                self.recent_failed_upgrades.remove(&id);
-                if removed.is_in_place() && has_dw_span {
-                    self.entries_missing_draft_window.insert(id);
+            match self.pending_disk_upgrades.remove(&id) {
+                Some(PendingDiskUpgrade::InPlace { promote_label, .. }) => {
+                    self.recent_failed_upgrades.remove(&id);
+                    if has_dw_span {
+                        self.entries_missing_draft_window.insert(id);
+                    }
+                    if promote_label
+                        && self
+                            .disk
+                            .as_ref()
+                            .is_some_and(|d| d.tier.persistent && d.writable())
+                        && self.store.get(id).is_some_and(|e| !e.checkpoint())
+                    {
+                        self.pending_disk_upgrades.insert(
+                            id,
+                            PendingDiskUpgrade::LabelPromote {
+                                retry_after: Instant::now(),
+                            },
+                        );
+                    }
                 }
+                Some(PendingDiskUpgrade::LabelPromote { retry_after }) => {
+                    self.pending_disk_upgrades
+                        .insert(id, PendingDiskUpgrade::LabelPromote { retry_after });
+                }
+                Some(PendingDiskUpgrade::Repair { .. }) | None => {}
             }
         }
         if step.outcome == Reclaimed::Written {
@@ -3531,6 +4356,7 @@ impl Inkling2StateStore {
             self.seq_checkpoints.retain(|_, v| *v != id);
             self.clear_window_tracking(id);
             self.clear_upgrade_tracking(id);
+            self.prompt_heads.remove(&id);
         }
         if step.resync {
             self.prune_entry_tracking();
@@ -3581,6 +4407,29 @@ impl Inkling2StateStore {
                 .is_some_and(|&retry_after| Instant::now() < retry_after)
         {
             return PersistStatus::Busy;
+        }
+        if self
+            .disk
+            .as_ref()
+            .is_some_and(|d| d.pending_relabel.is_some())
+            && self.store.get(id).is_some_and(|e| e.disk().is_none())
+        {
+            let needed = if head {
+                self.store.get(id).is_some_and(|e| !e.checkpoint())
+            } else {
+                crate::disk_tier::state_disk::newest_point(&self.store, id)
+            };
+            let fits = needed
+                && self.disk.as_ref().is_some_and(|d| {
+                    d.writable()
+                        && self
+                            .store
+                            .get(id)
+                            .is_some_and(|e| d.engine.point_fits(e, d.engine.persist_room()))
+                });
+            if fits {
+                return PersistStatus::Busy;
+            }
         }
         let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
         let step = {
@@ -3633,38 +4482,37 @@ impl Inkling2StateStore {
     /// Poll completed SSD writes & LRU evictions from `ColdCacheManager`.
     pub(crate) fn poll_offload(&mut self, coordinator: &Inkling2KVCacheCoordinator) -> bool {
         let (pending_before, chain_before) = self.disk.as_ref().map_or((None, None), |d| {
-            (
-                d.pending.as_ref().map(|p| p.id),
-                d.chain.as_ref().map(|c| c.id),
-            )
+            (d.pending_write_id(), d.chain.as_ref().map(|c| c.id))
         });
         let repairs_with_disk_before: Vec<EntryId> = self
             .pending_disk_upgrades
             .iter()
             .filter_map(|(&id, kind)| {
-                (!kind.is_in_place() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
+                (kind.is_repair() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
                     .then_some(id)
             })
             .collect();
         let ordinary_owed_before = self.ordinary_chain_owed_ids();
-        let out = {
+        let (out, relabel_out) = {
             let Some(disk) = self.disk.as_mut() else {
                 return false;
             };
             let out = disk.engine.poll_offload(&mut self.store);
-            disk.counters.offloads += out.state_landed_ok;
-            disk.counters.offload_failures += out.offload_failures;
-            out
+            let relabel_out = disk.poll_relabel(&mut self.store);
+            disk.counters.offloads += out.state_landed_ok + relabel_out.landed_ok;
+            disk.counters.offload_failures += out.offload_failures + relabel_out.failures;
+            (out, relabel_out)
         };
+        let state_failed_id = out.state_failed_id.or(relabel_out.failed_id);
         let mut failed_ids = self.reconcile_spill_outcome(
             coordinator,
             pending_before,
             chain_before,
-            out.state_failed_id,
+            state_failed_id,
             &[out.chain_failed_id],
             &ordinary_owed_before,
         );
-        let failed_upgrade = self.reconcile_in_flight_disk_upgrade();
+        let failed_upgrade = self.reconcile_in_flight_disk_upgrade(state_failed_id);
         if let Some(uid) = failed_upgrade
             && !failed_ids.contains(&uid)
         {
@@ -3686,13 +4534,15 @@ impl Inkling2StateStore {
         }
         let retired = self.retire_unwritable_incomplete_disk_copies();
         let demoted = self.demote_requested_ram();
-        let progressed = out.landed || out.resync || failed_upgrade.is_some() || retired || demoted;
+        let any_landed = out.landed || relabel_out.landed;
+        let any_resync = out.resync || relabel_out.resync;
+        let progressed = any_landed || any_resync || failed_upgrade.is_some() || retired || demoted;
         if progressed {
             self.prune_entry_tracking();
             self.sync_marks(coordinator);
             self.sync_host_budget();
         }
-        if out.landed {
+        if any_landed {
             self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
         }
         self.sync_host_budget();
@@ -3787,9 +4637,25 @@ impl Inkling2StateStore {
             .iter()
             .filter_map(|(&id, &kind)| {
                 let entry = self.store.get(id)?;
-                entry.ram()?;
-                if !kind.is_in_place() && entry.disk().is_some() {
-                    return None;
+                match kind {
+                    PendingDiskUpgrade::InPlace { .. } => {
+                        entry.ram()?;
+                    }
+                    PendingDiskUpgrade::Repair { .. } => {
+                        entry.ram()?;
+                        if entry.disk().is_some() {
+                            return None;
+                        }
+                    }
+                    PendingDiskUpgrade::LabelPromote { .. } => {
+                        if !persistent || entry.checkpoint() {
+                            return None;
+                        }
+                        let copy = entry.disk()?;
+                        if !copy.landed || copy.chain_owed {
+                            return None;
+                        }
+                    }
                 }
                 if !force {
                     if now < kind.retry_after() {
@@ -3848,39 +4714,38 @@ impl Inkling2StateStore {
     pub(crate) fn tick(&mut self, coordinator: &Inkling2KVCacheCoordinator, tick: Tick) -> bool {
         let kv = KvPoolHandle::from_adapter(coordinator.full_adapter());
         let (pending_before, chain_before) = self.disk.as_ref().map_or((None, None), |d| {
-            (
-                d.pending.as_ref().map(|p| p.id),
-                d.chain.as_ref().map(|c| c.id),
-            )
+            (d.pending_write_id(), d.chain.as_ref().map(|c| c.id))
         });
         let repairs_with_disk_before: Vec<EntryId> = self
             .pending_disk_upgrades
             .iter()
             .filter_map(|(&id, kind)| {
-                (!kind.is_in_place() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
+                (kind.is_repair() && self.store.get(id).is_some_and(|e| e.disk().is_some()))
                     .then_some(id)
             })
             .collect();
         let ordinary_owed_before = self.ordinary_chain_owed_ids();
-        let out = {
+        let (out, relabel_out) = {
             let Some(disk) = self.disk.as_mut() else {
                 return false;
             };
             let kv_ref = disk.writable().then_some(&kv);
             let out = disk.engine.tick(&mut self.store, kv_ref, tick);
-            disk.counters.offloads += out.state_landed_ok;
-            disk.counters.offload_failures += out.offload_failures;
-            out
+            let relabel_out = disk.poll_relabel(&mut self.store);
+            disk.counters.offloads += out.state_landed_ok + relabel_out.landed_ok;
+            disk.counters.offload_failures += out.offload_failures + relabel_out.failures;
+            (out, relabel_out)
         };
+        let state_failed_id = out.state_failed_id.or(relabel_out.failed_id);
         let mut failed_ids = self.reconcile_spill_outcome(
             coordinator,
             pending_before,
             chain_before,
-            out.state_failed_id,
+            state_failed_id,
             &out.chain_failed_ids,
             &ordinary_owed_before,
         );
-        let failed_upgrade = self.reconcile_in_flight_disk_upgrade();
+        let failed_upgrade = self.reconcile_in_flight_disk_upgrade(state_failed_id);
         if let Some(uid) = failed_upgrade
             && !failed_ids.contains(&uid)
         {
@@ -3902,14 +4767,17 @@ impl Inkling2StateStore {
         }
         let retired = self.retire_unwritable_incomplete_disk_copies();
         let demoted = self.demote_requested_ram();
+        let any_progressed = out.progressed || relabel_out.landed;
+        let any_resync = out.resync || relabel_out.resync;
+        let state_landed_ok = out.state_landed_ok + relabel_out.landed_ok;
         let mut progressed =
-            out.progressed || out.resync || failed_upgrade.is_some() || retired || demoted;
-        if out.resync || failed_upgrade.is_some() || retired || demoted {
+            any_progressed || any_resync || failed_upgrade.is_some() || retired || demoted;
+        if any_resync || failed_upgrade.is_some() || retired || demoted {
             self.prune_entry_tracking();
             self.sync_marks(coordinator);
             self.sync_host_budget();
         }
-        if out.state_landed_ok > 0 || out.progressed || self.ram_len() > self.ram_cap {
+        if state_landed_ok > 0 || any_progressed || self.ram_len() > self.ram_cap {
             self.trim_ram_to_cap_inner(coordinator, None, &failed_ids);
         }
         if matches!(tick, Tick::Full { .. }) {
@@ -3932,10 +4800,22 @@ impl Inkling2StateStore {
         self.reconcile_completed_disk_repairs();
 
         let has_pending_upgrades = |this: &Self, skipped: &HashSet<EntryId>| {
+            let persistent_writable = this
+                .disk
+                .as_ref()
+                .is_some_and(|d| d.tier.persistent && d.writable());
             this.pending_disk_upgrades.iter().any(|(&id, kind)| {
                 !skipped.contains(&id)
-                    && this.store.get(id).is_some_and(|e| {
-                        e.ram().is_some() && (kind.is_in_place() || e.disk().is_none())
+                    && this.store.get(id).is_some_and(|e| match kind {
+                        PendingDiskUpgrade::InPlace { .. } => e.ram().is_some(),
+                        PendingDiskUpgrade::Repair { .. } => {
+                            e.ram().is_some() && e.disk().is_none()
+                        }
+                        PendingDiskUpgrade::LabelPromote { .. } => {
+                            persistent_writable
+                                && !e.checkpoint()
+                                && e.disk().is_some_and(|c| c.landed && !c.chain_owed)
+                        }
                     })
             })
         };
@@ -4047,6 +4927,7 @@ impl Inkling2StateStore {
             {
                 let mut behind = std::mem::take(&mut disk.write_behind);
                 let _ = behind.flush(self, |store, id, head| {
+                    let effective_head = head || store.is_prompt_head(id);
                     if failed_entries.contains(&id) {
                         if store.is_retryable_ordinary_wb(coordinator, id)
                             && let Some(depth) = store
@@ -4054,11 +4935,11 @@ impl Inkling2StateStore {
                                 .get(id)
                                 .and_then(|e| u32::try_from(e.depth()).ok())
                         {
-                            retryable_wb_refusals.push((id, depth, head));
+                            retryable_wb_refusals.push((id, depth, effective_head));
                         }
                         return PersistStatus::Refused;
                     }
-                    let status = store.persist_entry_inner(coordinator, id, head, true);
+                    let status = store.persist_entry_inner(coordinator, id, effective_head, true);
                     if status == PersistStatus::Refused
                         && store.is_retryable_ordinary_wb(coordinator, id)
                         && let Some(depth) = store
@@ -4067,7 +4948,7 @@ impl Inkling2StateStore {
                             .and_then(|e| u32::try_from(e.depth()).ok())
                     {
                         failed_entries.insert(id);
-                        retryable_wb_refusals.push((id, depth, head));
+                        retryable_wb_refusals.push((id, depth, effective_head));
                     }
                     status
                 });
@@ -4112,7 +4993,7 @@ impl Inkling2StateStore {
             if !disk.writable() && !disk.writing() {
                 return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
-            if !disk.engine.await_landing(deadline) {
+            if !disk.await_landing(deadline) {
                 return finalize_and_check(self, &failed_entries, &retryable_wb_refusals);
             }
         }
@@ -4136,6 +5017,7 @@ impl Inkling2StateStore {
         if !persistent && let Some(disk) = self.disk.as_mut() {
             disk.engine.strip_disk_copies(&mut self.store);
             disk.preserve_entry_on_state_failure = None;
+            disk.pending_relabel = None;
             self.pending_disk_upgrades.clear();
             self.in_flight_disk_upgrade = None;
             self.recent_failed_upgrades.clear();
@@ -4222,11 +5104,7 @@ impl Inkling2StateStore {
         let has_dw_span = self
             .resolve_geometry()
             .is_some_and(|g| g.draft_window_span_bytes > 0);
-        let existing: HashSet<EntryId> = if has_dw_span {
-            self.store.entries().map(Entry::id).collect()
-        } else {
-            HashSet::new()
-        };
+        let existing: HashSet<EntryId> = self.store.entries().map(Entry::id).collect();
         let adopted = {
             let Some(disk) = self.disk.as_mut() else {
                 return 0;
@@ -4235,11 +5113,19 @@ impl Inkling2StateStore {
             disk.counters.adopted += count;
             count
         };
-        if has_dw_span && adopted > 0 {
-            for entry in self.store.entries() {
-                let id = entry.id();
-                if !existing.contains(&id) {
+        if adopted > 0 {
+            let newly_adopted: Vec<(EntryId, bool)> = self
+                .store
+                .entries()
+                .filter(|entry| !existing.contains(&entry.id()))
+                .map(|entry| (entry.id(), entry.checkpoint()))
+                .collect();
+            for (id, is_checkpoint) in newly_adopted {
+                if has_dw_span {
                     self.adopted_unverified_window.insert(id);
+                }
+                if !is_checkpoint {
+                    self.mark_prompt_head(id);
                 }
             }
         }
@@ -5651,7 +6537,7 @@ mod tests {
             let dl = test_deadline(10);
             while self.disk().writing() {
                 assert!(Instant::now() < dl, "timed out: {msg}");
-                let _ = self.disk().engine.await_landing(dl);
+                let _ = self.disk().await_landing(dl);
                 self.store.poll_offload(&self.coord);
             }
         }
@@ -5667,7 +6553,7 @@ mod tests {
             {
                 assert!(Instant::now() < dl, "timed out: {msg}");
                 self.store.chain_step(&self.coord, dl);
-                let _ = self.disk().engine.await_landing(dl);
+                let _ = self.disk().await_landing(dl);
                 self.store.poll_offload(&self.coord);
             }
         }
@@ -9505,5 +10391,2008 @@ mod tests {
 
         let _ = store.close_cache(&coord, Instant::now() + Duration::from_secs(5));
         let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// WS1: Restoring a `StateClass::Checkpoint` at `depth >= write_behind_min_tokens()` promotes
+    /// it to `Ordinary`, marks it in `prompt_heads`, enqueues `WriteBehind(..., head = true)`, and
+    /// persists it durably to SSD even after deeper turns supersede it. Conversely, restoring a
+    /// `Checkpoint` below `write_behind_min_tokens()` or restoring an `Ordinary` entry does NOT
+    /// mark `prompt_heads` or enqueue `head = true`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hit_checkpoint_promotes_to_prompt_head_and_persists_despite_superseded() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("ws1-hit-cp-head", b"ws1-hit-cp-head-v1", Some(0.0))
+            .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let mut s = fx.open(128u64 << 20, None);
+        s.store.set_ram_cap(16);
+
+        let salt = 0x5101u64;
+        let tokens: Vec<u32> = (1000u32..1192u32).collect();
+        s.coord.reset_scheduled_request(1).expect("reset seq 1");
+        s.coord.record_tokens_all(1, &tokens).expect("record seq 1");
+
+        // Publish rolling Checkpoints at depth 32 (< min=64) and depth 64 (>= min=64), plus
+        // Ordinary turn anchors at depth 128 and 160 so 64 and 128 are both superseded.
+        let cp32 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens,
+                32,
+                salt,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let cp64 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens,
+                64,
+                salt,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let ord128 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens,
+                128,
+                salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let ord160 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens,
+                160,
+                salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        assert!(s.entry(cp32).checkpoint());
+        assert!(s.entry(cp64).checkpoint());
+        assert!(!s.store.is_prompt_head(cp32));
+        assert!(!s.store.is_prompt_head(cp64));
+        assert!(!s.store.is_prompt_head(ord128));
+        assert!(s.store.store.superseded(cp64));
+        assert!(s.store.store.superseded(ord128));
+        assert!(!s.store.store.superseded(ord160));
+        assert_eq!(s.wb_waiting(), 2, "only ord128 and ord160 queued initially");
+
+        // 1. Hit short Checkpoint cp32 (< write_behind_min_tokens = 64): pins + upgrades via
+        //    use_state, but must NOT mark `prompt_heads` or enqueue `WriteBehind`.
+        let mark32 = s.entry(cp32).mark();
+        s.store.note_state_hit(&s.coord, 2, cp32, false, 0.0);
+        assert!(!s.entry(cp32).checkpoint());
+        assert!(s.store.store.in_use(mark32));
+        assert!(!s.store.is_prompt_head(cp32));
+        assert_eq!(s.wb_waiting(), 2);
+        s.store.end_seq_use(2);
+        assert!(!s.store.store.in_use(mark32));
+
+        // 2. Hit Checkpoint cp64 (>= write_behind_min_tokens = 64): promotes to Ordinary,
+        //    marks `prompt_heads`, pins block, detaches `seq_checkpoints`, and enqueues
+        //    `WriteBehind(..., head = true)`.
+        let mark64 = s.entry(cp64).mark();
+        s.store.note_state_hit(&s.coord, 3, cp64, false, 0.0);
+        assert!(!s.entry(cp64).checkpoint());
+        assert!(s.store.store.in_use(mark64));
+        assert!(s.store.is_prompt_head(cp64));
+        assert!(!s.store.seq_checkpoints.values().any(|&v| v == cp64));
+        assert_eq!(s.wb_waiting(), 3, "cp64 must be enqueued with head = true");
+        s.store.end_seq_use(3);
+        assert!(!s.store.store.in_use(mark64));
+
+        // 3. Hit superseded Ordinary ord128: touches + pins block, but MUST NOT mark
+        //    `prompt_heads` or enqueue `head = true`!
+        let mark128 = s.entry(ord128).mark();
+        let stamp_before = s.entry(ord128).last_used();
+        s.store.note_state_hit(&s.coord, 4, ord128, false, 0.0);
+        assert!(s.entry(ord128).last_used() > stamp_before);
+        assert!(s.store.store.in_use(mark128));
+        assert!(
+            !s.store.is_prompt_head(ord128),
+            "restoring an Ordinary entry must NEVER mark prompt_heads"
+        );
+        s.store.end_seq_use(4);
+        assert!(!s.store.store.in_use(mark128));
+
+        // 4. Flush to SSD: promoted head cp64 AND newest tip ord160 must persist durably,
+        //    while superseded non-head ord128 is skipped as Unneeded (zero disk copy)!
+        assert!(s.flush(10));
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(cp64)),
+            "promoted checkpoint head cp64 must persist to SSD despite being superseded"
+        );
+        assert!(
+            s.entry(ord128).disk().is_none(),
+            "superseded restored Ordinary ord128 must NOT spill as head"
+        );
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(ord160)),
+            "newest conversation tip ord160 must persist to SSD"
+        );
+
+        // Drop RAM & purge hot GPU KV -> diverging query sharing first 80 tokens restores cp64 from SSD!
+        s.drop_ram_and_purge();
+        let mut query = tokens[..80].to_vec();
+        query.extend(9000u32..9020u32);
+        s.assert_ssd_restores(&query, salt, Some(cp64), None);
+        assert!(s.close());
+    }
+
+    /// WS1: Both transient writer refusals (`reconcile_spill_outcome`) and RAM-only draft-window
+    /// replacement (`old_id` -> `inserted.id`) preserve `prompt_heads` membership and `head = true`
+    /// so superseded heads still persist durably to SSD.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_spill_outcome_and_ram_only_dw_upgrade_preserve_prompt_head() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx =
+            StateDiskTestFixture::new("ws1-preserve-head", b"ws1-preserve-head-v1", Some(10.0))
+                .with_paged(1024, 4);
+        let reserve = 4096u64;
+        let mut s = fx.open(128u64 << 20, Some(reserve));
+        s.store.set_ram_cap(16);
+
+        let salt1 = 0x5201u64;
+        let tokens1: Vec<u32> = (2000u32..2128u32).collect();
+        s.coord.reset_scheduled_request(1).expect("reset 1");
+        s.coord.record_tokens_all(1, &tokens1).expect("record 1");
+
+        // Part 1: Superseded promoted Checkpoint hits transient writer space refusal ->
+        // `reconcile_spill_outcome` re-queues with `is_head = true` -> subsequent flush persists it!
+        let cp64 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens1,
+                64,
+                salt1,
+                StateClass::Checkpoint,
+                CaptureOptions {
+                    keep_prev_checkpoint: false,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let ord96 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens1,
+                96,
+                salt1,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(s.store.store.superseded(cp64));
+        assert_eq!(s.wb_waiting(), 0);
+
+        s.store.note_state_hit(&s.coord, 2, cp64, false, 0.0);
+        s.store.end_seq_use(2);
+        assert!(s.store.is_prompt_head(cp64));
+        assert_eq!(s.wb_waiting(), 1);
+
+        // Verify `is_retryable_ordinary_wb` also allows persistent prompt heads below threshold.
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(128)));
+        assert!(
+            s.store.is_retryable_ordinary_wb(&s.coord, cp64),
+            "persistent prompt head below write_behind_min_tokens must stay retryable"
+        );
+        assert!(
+            !s.store.is_retryable_ordinary_wb(&s.coord, ord96),
+            "non-head below write_behind_min_tokens must not be retryable"
+        );
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(32)));
+
+        let refusals = Arc::new(AtomicUsize::new(0));
+        s.set_writer_space(64 << 20, reserve, Some(Arc::clone(&refusals)));
+        s.assert_flush_fails_promptly("transient refusal on promoted head cp64");
+        assert!(refusals.load(Ordering::Relaxed) >= 1);
+        assert!(s.store.is_prompt_head(cp64));
+        assert_eq!(
+            s.wb_waiting(),
+            1,
+            "reconcile_spill_outcome must re-queue promoted head cp64"
+        );
+
+        s.clear_space_override(true);
+        assert!(s.flush(10));
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(cp64)),
+            "re-queued promoted head cp64 must persist despite being superseded by ord96"
+        );
+
+        // Part 2: RAM-only draft-window replacement (`old_id` -> `inserted.id`) transfers
+        // `prompt_heads` membership and re-enqueues `inserted.id` with `head = true`.
+        let salt2 = 0x5202u64;
+        let tokens2: Vec<u32> = (3000u32..3128u32).collect();
+        s.coord.reset_scheduled_request(3).expect("reset 3");
+        s.coord.record_tokens_all(3, &tokens2).expect("record 3");
+
+        let old_head = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                3,
+                &tokens2,
+                64,
+                salt2,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: true,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        let _tip2 = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                3,
+                &tokens2,
+                96,
+                salt2,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(s.store.is_prompt_head(old_head));
+        assert!(s.entry(old_head).disk().is_none());
+        assert!(s.entry(old_head).ram().unwrap().draft_window.is_none());
+        assert!(s.store.store.superseded(old_head));
+
+        // Recapture depth 64 WITH a complete PackedDraftWindow and `is_head: false`:
+        // RAM-only upgrade removes `old_head` and inserts `new_head`, preserving `prompt_heads`!
+        let dw64 = fx.packed_dw(64);
+        let new_head = s
+            .store
+            .capture_boundary_with_window_and_options(
+                &mut s.coord,
+                &fx.conv,
+                3,
+                &tokens2,
+                64,
+                salt2,
+                StateClass::Ordinary,
+                Some(&BoundaryDraftWindow::Packed(dw64.clone())),
+                None,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: false,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_head, old_head, "RAM-only DW upgrade replaces entry id");
+        assert!(!s.store.is_prompt_head(old_head));
+        assert!(
+            s.store.is_prompt_head(new_head),
+            "RAM-only DW upgrade must transfer prompt_heads from old_id to inserted.id"
+        );
+        assert!(s.store.store.superseded(new_head));
+
+        assert!(s.flush(10));
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(new_head)),
+            "upgraded superseded head must persist to SSD with head = true"
+        );
+        s.drop_ram_and_purge();
+        let mut query2 = tokens2[..72].to_vec();
+        query2.extend(9100u32..9110u32);
+        s.assert_ssd_restores(&query2, salt2, Some(new_head), Some(&dw64));
+        assert!(s.close());
+    }
+
+    /// WS1: `trim_ram_to_cap_inner` Priority 2b drops RAM-only superseded non-head intermediates
+    /// directly in RAM instead of spilling ~2 dead blobs/turn to SSD, keeping SSD usage tiny,
+    /// `HostBudgetAccount` exact, and both the persistent head and older unrelated tips restorable.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn trim_ram_to_cap_drops_superseded_non_head_intermediates_without_ssd_bloat() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+
+        let fx = StateDiskTestFixture::new("ws1-no-ssd-bloat", b"ws1-no-ssd-bloat-v1", Some(0.0))
+            .with_paged(4096, 4);
+        let local_limit = Arc::new(CacheLimitCoordinator::new_for_test());
+        let mut s = fx.open(256u64 << 20, None);
+        s.store.attach_host_budget_to(Arc::clone(&local_limit));
+        s.store.set_ram_cap(4);
+
+        // 1. Publish an older unrelated conversation tip (Parent) on salt 10.
+        let parent_salt = 10u64;
+        let parent_tokens: Vec<u32> = (100u32..196u32).collect();
+        s.coord.reset_scheduled_request(1).expect("reset parent");
+        s.coord
+            .record_tokens_all(1, &parent_tokens)
+            .expect("record parent");
+        let parent_tip = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &parent_tokens,
+                64,
+                parent_salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+
+        // 2. Publish 1 persistent prompt head (`is_head = true`) on salt 20, then 40 linear turns
+        //    (80 Ordinary captures: 2 per turn at +32 token steps, depths 96..=2624).
+        let main_salt = 20u64;
+        let max_depth = 64u32 + 80 * 32; // 2624
+        let full_tokens: Vec<u32> = (10_000u32..10_000 + max_depth + 32).collect();
+        s.coord.reset_scheduled_request(2).expect("reset main");
+        s.coord
+            .record_tokens_all(2, &full_tokens[..64])
+            .expect("record head");
+        let head_id = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                2,
+                &full_tokens[..64],
+                64,
+                main_salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: true,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(s.store.is_prompt_head(head_id));
+
+        let mut last_tip = head_id;
+        for step in 1u32..=80 {
+            let prev = 64 + (step - 1) * 32;
+            let cur = 64 + step * 32;
+            s.coord
+                .record_tokens_all(2, &full_tokens[prev as usize..cur as usize])
+                .expect("record turn chunk");
+            s.coord.prune_sliding_all(2).expect("prune swa");
+            last_tip = s
+                .store
+                .capture_boundary_with_options(
+                    &mut s.coord,
+                    &fx.conv,
+                    2,
+                    &full_tokens[..cur as usize],
+                    cur,
+                    main_salt,
+                    StateClass::Ordinary,
+                    CaptureOptions {
+                        keep_prev_checkpoint: true,
+                        enqueue_write_behind: true,
+                        is_head: false,
+                        now: 0.0,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert!(
+                s.store.ram_len() <= 4,
+                "ram_len must stay <= ram_cap=4 at step {step}, got {}",
+                s.store.ram_len()
+            );
+            assert_eq!(
+                local_limit.registered_pool_bytes(),
+                s.store.host_resident_bytes(),
+                "HostBudgetAccount must remain exact at step {step}"
+            );
+        }
+
+        // Flush remaining waiting entries to SSD.
+        assert!(s.flush(10));
+        assert!(s.store.ram_len() <= 4);
+        assert_eq!(
+            local_limit.registered_pool_bytes(),
+            s.store.host_resident_bytes()
+        );
+
+        let offloads = s.store.disk_counters().offloads;
+        assert!(
+            offloads <= 4,
+            "Priority 2b must prevent 80-blob SSD bloat (expected <= 4 blobs for head + 2 tips, got {offloads})"
+        );
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(head_id)),
+            "persistent prompt head must survive 80 turns and be SSD-restorable"
+        );
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(parent_tip)),
+            "older unrelated conversation tip must survive and be SSD-restorable"
+        );
+        assert!(
+            s.disk().entry_disk_restorable(s.entry(last_tip)),
+            "final conversation tip must be SSD-restorable"
+        );
+
+        // Verify all 3 restore cleanly from SSD after purging RAM & hot GPU KV.
+        s.drop_ram_and_purge();
+        assert_eq!(
+            local_limit.registered_pool_bytes(),
+            s.store.host_resident_bytes()
+        );
+        let mut head_query = full_tokens[..80].to_vec();
+        head_query.extend(99_000u32..99_010u32);
+        s.assert_ssd_restores(&head_query, main_salt, Some(head_id), None);
+        s.assert_ssd_restores(&parent_tokens, parent_salt, Some(parent_tip), None);
+        s.assert_ssd_restores(&full_tokens, main_salt, Some(last_tip), None);
+        assert!(s.close());
+    }
+
+    /// WS1: `adopt_all()` restores `prompt_heads` membership for newly adopted Ordinary entries
+    /// BOTH in DFlash2 mode (`has_dw_span == true`) AND in AR-only mode (`has_dw_span == false`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn adopt_all_restores_prompt_head_membership_with_and_without_draft_window() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+
+        // Case A: DFlash2 (`has_dw_span == true`).
+        {
+            let fx = StateDiskTestFixture::new("ws1-adopt-dw", b"ws1-adopt-dw-v1", Some(0.0));
+            let tokens: Vec<u32> = (5000u32..5096u32).collect();
+            fx.seed_durable(&[(1, &tokens, 64, 77)], 128u64 << 20, None);
+
+            let s2 = fx.open_adopted(128u64 << 20, None, 1);
+            let adopted_id = s2.first_id();
+            assert!(
+                s2.store.is_prompt_head(adopted_id),
+                "DFlash2 adopt_all must restore prompt_heads membership"
+            );
+            assert!(
+                s2.store.adopted_unverified_window.contains(&adopted_id),
+                "DFlash2 adopt_all must still mark adopted_unverified_window"
+            );
+        }
+
+        // Case B: AR-only (`has_dw_span == false`, `dflash2 = None`).
+        {
+            let temp_root = std::env::temp_dir()
+                .join(format!("inkling2-ws1-adopt-ar-{}", uuid::Uuid::new_v4()));
+            let cache_dir = temp_root.join("cache");
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            let cfg = tiny_inkling2_config();
+            let paged_cfg = Inkling2PagedConfig::default_for_config(&cfg)
+                .with_kv_format(KvFormat::Int8)
+                .with_max_model_len(512)
+                .with_max_concurrent_sequences(2);
+            let conv = make_short_conv(&cfg);
+            let tokens: Vec<u32> = (6000u32..6096u32).collect();
+
+            let open_ar = || {
+                let recency = Arc::new(CacheRecency::new());
+                let mut coord = Inkling2KVCacheCoordinator::new_for_config_with_recency(
+                    &cfg,
+                    paged_cfg,
+                    Arc::clone(&recency),
+                )
+                .expect("coord");
+                let geom = Inkling2StateGeometry::from_coordinator(&cfg, &coord).expect("geom");
+                assert_eq!(geom.draft_window_span_bytes, 0);
+                let disk_opts = DiskTierOptions {
+                    cache_disk: CacheDisk::Bytes(128u64 << 20),
+                    persistent: true,
+                    cache_dir: Some(cache_dir.clone()),
+                    temp_root: Some(temp_root.clone()),
+                };
+                let pid = compute_path_identity(&temp_root, &cfg, &coord, &geom, Some(1024), None);
+                let (ctx, disk) =
+                    open_inkling2_state_disk(&cfg, &coord, None, &disk_opts, move || pid, 0)
+                        .expect("open AR disk");
+                coord.set_full_cold_tier(ctx);
+                let mut store = Inkling2StateStore::new(coord.block_size(), recency);
+                store.set_geometry(geom);
+                store.disk = Some(disk);
+                (coord, store)
+            };
+
+            {
+                let (mut coord, mut store) = open_ar();
+                coord.reset_scheduled_request(1).unwrap();
+                coord.record_tokens_all(1, &tokens).unwrap();
+                let _id = store
+                    .capture_boundary(
+                        &mut coord,
+                        &conv,
+                        1,
+                        &tokens,
+                        64,
+                        88,
+                        StateClass::Ordinary,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                assert!(store.flush_to_disk(&coord, test_deadline(10)));
+                assert!(store.close_cache(&coord, test_deadline(10)));
+            }
+            {
+                let (coord, mut store) = open_ar();
+                assert_eq!(store.adopt_all(), 1);
+                let adopted_id = store.store.entries().next().expect("adopted AR entry").id();
+                assert!(
+                    store.is_prompt_head(adopted_id),
+                    "AR-only adopt_all (has_dw_span == false) must restore prompt_heads membership"
+                );
+                assert!(store.adopted_unverified_window.is_empty());
+                assert!(store.close_cache(&coord, test_deadline(10)));
+            }
+            let _ = std::fs::remove_dir_all(&temp_root);
+        }
+    }
+
+    /// WS1: `reuse_existing_entry` bumps `store.generation()` via `mark_changed()` whenever a
+    /// previously cold Global KV chain is re-registered hot, and preserves `prompt_heads`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reuse_existing_entry_bumps_generation_when_cold_chain_re_registered() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("ws1-reuse-gen", b"ws1-reuse-gen-v1", Some(0.0));
+        let mut s = fx.open(128u64 << 20, None);
+        let salt = 0x5301u64;
+        let tokens: Vec<u32> = (7000u32..7096u32).collect();
+
+        s.coord.reset_scheduled_request(1).expect("reset 1");
+        s.coord.record_tokens_all(1, &tokens).expect("record 1");
+        let id = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                1,
+                &tokens,
+                64,
+                salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: true,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(s.store.is_prompt_head(id));
+        assert!(s.flush(10));
+
+        // Purge RAM + hot Global KV so `id` is SSD-only with `!chain_is_hot`.
+        s.drop_ram_and_purge();
+        assert!(!s.store.chain_is_hot(&s.coord, id));
+        assert!(s.store.is_prompt_head(id));
+
+        let gen_before = s.store.generation();
+        // Recapture same lineage without draft window: takes the early reuse fast-path
+        // (`existing_disk_durable && !incoming_can_upgrade`), re-registers the cold chain, and
+        // MUST bump `store.generation()` via `mark_changed()` while preserving `prompt_heads`!
+        s.coord.reset_scheduled_request(2).expect("reset 2");
+        s.coord.record_tokens_all(2, &tokens).expect("record 2");
+        let reused_id = s
+            .store
+            .capture_boundary_with_options(
+                &mut s.coord,
+                &fx.conv,
+                2,
+                &tokens,
+                64,
+                salt,
+                StateClass::Ordinary,
+                CaptureOptions {
+                    keep_prev_checkpoint: true,
+                    enqueue_write_behind: true,
+                    is_head: false,
+                    now: 0.0,
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(reused_id, id);
+        assert!(
+            s.store.chain_is_hot(&s.coord, id),
+            "reuse_existing_entry fast-path must re-register the cold Global KV chain"
+        );
+        assert!(
+            s.store.generation() > gen_before,
+            "re-registering a previously cold Global KV chain must bump store.generation()"
+        );
+        assert!(
+            s.store.is_prompt_head(id),
+            "reuse_existing_entry must preserve existing prompt_heads membership when opts.is_head == false"
+        );
+        assert!(s.close());
+    }
+
+    /// Codex C1: Reclaiming a `StateClass::Checkpoint` to persistent SSD writes
+    /// `ColdStateLabel { checkpoint: true, .. }` and drops RAM. When an independent request hits
+    /// that SSD-backed checkpoint (`load_anchor` + `note_state_hit(..., is_preemption_replay: false)`),
+    /// `PendingDiskUpgrade::LabelPromote` rewrites the on-disk header (`checkpoint: false`) directly
+    /// via the staging buffer without repopulating RAM, so reopening and calling `adopt_all()`
+    /// adopts it as `Ordinary` in `prompt_heads` and it survives `ram_cap` Priority 1/2b trimming.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ssd_backed_checkpoint_promotion_persists_across_restart() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new("c1-cp-promote", b"c1-cp-promote-v1", Some(0.0))
+            .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let salt_promoted = 0x6101u64;
+        let salt_control = 0x6102u64;
+        let tokens_promoted: Vec<u32> = (8100u32..8228u32).collect();
+        let tokens_control: Vec<u32> = (8300u32..8396u32).collect();
+        let dw64 = fx.packed_dw(64);
+
+        // Session 1: reclaim two Checkpoints to persistent SSD, promote only the first via
+        // SSD-only `load_anchor` + `note_state_hit`, flush, and verify on-disk headers.
+        {
+            let mut s = fx.open(128u64 << 20, None);
+            s.store.set_ram_cap(16);
+
+            let cp_promoted = s.capture(
+                &fx.conv,
+                1,
+                &tokens_promoted,
+                64,
+                salt_promoted,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            let cp_control = s.capture(
+                &fx.conv,
+                2,
+                &tokens_control,
+                64,
+                salt_control,
+                StateClass::Checkpoint,
+                None,
+            );
+            s.store.clear_seq_checkpoint(1);
+            s.store.clear_seq_checkpoint(2);
+            assert!(s.entry(cp_promoted).checkpoint() && s.entry(cp_promoted).ram().is_some());
+            assert!(s.entry(cp_control).checkpoint() && s.entry(cp_control).ram().is_some());
+
+            // Reclaim both Checkpoints to SSD (drops RAM, writes `checkpoint: true` on disk).
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_promoted),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_control),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+
+            for id in [cp_promoted, cp_control] {
+                assert!(
+                    s.entry(id).ram().is_none(),
+                    "reclaimed checkpoint is SSD-only"
+                );
+                let copy = s.disk_copy(id);
+                assert!(copy.landed && !copy.chain_owed);
+                assert!(s.entry(id).checkpoint());
+                let (_, on_disk_label) = s
+                    .manager()
+                    .state_label(copy.key, s.disk().tier.state_fingerprint)
+                    .expect("on-disk state label before promote");
+                assert!(
+                    on_disk_label.checkpoint,
+                    "reclaimed checkpoint must carry checkpoint=true on SSD before promotion"
+                );
+            }
+
+            // Purge hot GPU KV so the hit is purely SSD-backed.
+            s.coord.release_all_and_purge().expect("purge hot");
+
+            // Hit `cp_promoted` via `load_anchor` + `note_state_hit(..., is_preemption_replay: false)`.
+            let (anchor, from_ssd) = s
+                .store
+                .load_anchor(&s.coord, cp_promoted)
+                .expect("load_anchor from SSD");
+            assert!(from_ssd);
+            assert_eq!(anchor.draft_window.as_ref(), Some(&dw64));
+            assert!(
+                s.entry(cp_promoted).ram().is_none(),
+                "load_anchor must not repopulate RAM"
+            );
+
+            s.store.note_state_hit(&s.coord, 3, cp_promoted, false, 0.0);
+            s.store.end_seq_use(3);
+
+            assert!(!s.entry(cp_promoted).checkpoint());
+            assert!(s.store.is_prompt_head(cp_promoted));
+            assert!(s.entry(cp_promoted).ram().is_none());
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_promoted),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            // Flush must drain `LabelPromote` without repopulating RAM and rewrite header to false.
+            assert!(s.flush(10));
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(s.entry(cp_promoted).ram().is_none());
+
+            let promoted_copy = s.disk_copy(cp_promoted);
+            let (_, promoted_label) = s
+                .manager()
+                .state_label(promoted_copy.key, s.disk().tier.state_fingerprint)
+                .expect("promoted on-disk label");
+            assert!(
+                !promoted_label.checkpoint,
+                "LabelPromote must rewrite on-disk ColdStateLabel to checkpoint=false"
+            );
+
+            let control_copy = s.disk_copy(cp_control);
+            let (_, control_label) = s
+                .manager()
+                .state_label(control_copy.key, s.disk().tier.state_fingerprint)
+                .expect("control on-disk label");
+            assert!(
+                control_label.checkpoint,
+                "unhit control checkpoint must remain checkpoint=true on disk"
+            );
+
+            assert!(s.close());
+        }
+
+        // Session 2: reopen persistent tier, call `adopt_all()`, and verify adopted class,
+        // `prompt_heads`, exact draft-window preservation, and `ram_cap` Priority 1/2b survival.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, None, 2);
+            let promoted_id = s2.id_by_salt(salt_promoted);
+            let control_id = s2.id_by_salt(salt_control);
+
+            assert!(
+                !s2.entry(promoted_id).checkpoint(),
+                "reopened promoted SSD checkpoint must adopt as Ordinary"
+            );
+            assert!(
+                s2.store.is_prompt_head(promoted_id),
+                "reopened promoted SSD checkpoint must be registered in prompt_heads"
+            );
+            assert!(
+                s2.entry(control_id).checkpoint(),
+                "reopened unhit SSD checkpoint must still adopt as Checkpoint"
+            );
+            assert!(!s2.store.is_prompt_head(control_id));
+
+            // Verify payload + draft window survived the zero-decode SSD relabel intact.
+            let mut query_promoted = tokens_promoted[..80].to_vec();
+            query_promoted.extend(9900u32..9910u32);
+            s2.assert_ssd_restores(
+                &query_promoted,
+                salt_promoted,
+                Some(promoted_id),
+                Some(&dw64),
+            );
+
+            // Verify Priority 1/2b `ram_cap` trimming behavior after restart:
+            // Give both entries RAM copies + supersede `promoted_id` with a deeper ordinary turn,
+            // then force `ram_cap = 1`:
+            // - `control_id` (still a Checkpoint) is retired completely by Priority 1!
+            // - `promoted_id` (Ordinary + in `prompt_heads`) survives Priority 1 and Priority 2b
+            //   (dropping only RAM to its durable SSD copy, staying indexed and restorable)!
+            let anchor_promoted = s2
+                .store
+                .load_anchor(&s2.coord, promoted_id)
+                .expect("load promoted")
+                .0;
+            let anchor_control = s2
+                .store
+                .load_anchor(&s2.coord, control_id)
+                .expect("load control")
+                .0;
+            assert!(s2.store.store.promote(promoted_id, anchor_promoted));
+            assert!(s2.store.store.promote(control_id, anchor_control));
+
+            s2.coord.reset_scheduled_request(10).expect("reset deeper");
+            s2.coord
+                .record_tokens_all(10, &tokens_promoted)
+                .expect("record deeper");
+            let deeper_id = s2
+                .store
+                .capture_boundary_with_options(
+                    &mut s2.coord,
+                    &fx.conv,
+                    10,
+                    &tokens_promoted,
+                    96,
+                    salt_promoted,
+                    StateClass::Ordinary,
+                    CaptureOptions {
+                        keep_prev_checkpoint: true,
+                        enqueue_write_behind: false,
+                        is_head: false,
+                        now: 0.0,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert!(s2.store.store.superseded(promoted_id));
+
+            s2.store.set_ram_cap(1);
+            s2.store.trim_ram_to_cap(&s2.coord, Some(deeper_id));
+
+            assert!(
+                s2.store.store.get(control_id).is_none(),
+                "adopted unhit Checkpoint must be retired by Priority 1 under ram_cap"
+            );
+            assert!(
+                s2.store.store.get(promoted_id).is_some(),
+                "adopted promoted Ordinary prompt head must survive Priority 1/2b under ram_cap"
+            );
+            assert!(s2.store.is_prompt_head(promoted_id));
+            assert!(s2.disk().entry_disk_restorable(s2.entry(promoted_id)));
+            assert!(s2.close());
+        }
+
+        // Non-persistent tier must NOT enqueue `LabelPromote` (adopt_all only runs on persistent tiers).
+        {
+            let mut st = fx.open_temp(128u64 << 20, None);
+            let cp_temp = st.capture(
+                &fx.conv,
+                1,
+                &tokens_promoted,
+                64,
+                0x6103u64,
+                StateClass::Checkpoint,
+                None,
+            );
+            st.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                st.store.reclaim_entry(&st.coord, cp_temp),
+                ReclaimOutcome::Spilled
+            );
+            assert!(st.flush(10));
+            st.store.note_state_hit(&st.coord, 2, cp_temp, false, 0.0);
+            st.store.end_seq_use(2);
+            assert!(
+                st.store.pending_disk_upgrades.is_empty(),
+                "non-persistent tier must not enqueue LabelPromote"
+            );
+            assert!(st.close());
+        }
+    }
+
+    /// Codex C1: Both (a) promoting an in-flight (not-yet-landed) reclaimed checkpoint via
+    /// `note_state_hit` and (b) promoting an SSD-backed checkpoint via `reuse_existing_entry`
+    /// queue `PendingDiskUpgrade::LabelPromote`, rewrite `checkpoint: false` once the initial copy
+    /// lands, and adopt as `Ordinary` in `prompt_heads` on restart.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ssd_backed_checkpoint_promotion_in_flight_and_reuse_survive_restart() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "c1-inflight-and-reuse",
+            b"c1-inflight-and-reuse-v1",
+            Some(0.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let salt_inflight = 0x6201u64;
+        let salt_reuse = 0x6202u64;
+        let tokens_inflight: Vec<u32> = (8400u32..8496u32).collect();
+        let tokens_reuse: Vec<u32> = (8500u32..8596u32).collect();
+
+        {
+            let mut s = fx.open(128u64 << 20, None);
+            s.store.set_ram_cap(16);
+
+            // Part A: Promote an in-flight (not-yet-landed) reclaimed checkpoint!
+            let cp_inflight = s.capture(
+                &fx.conv,
+                1,
+                &tokens_inflight,
+                64,
+                salt_inflight,
+                StateClass::Checkpoint,
+                None,
+            );
+            s.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_inflight),
+                ReclaimOutcome::Spilled
+            );
+            // Before any `poll_offload`, the initial checkpoint spill is still in flight on disk.
+            assert!(s.entry(cp_inflight).ram().is_none());
+            assert!(s.entry(cp_inflight).disk().is_some_and(|c| !c.landed));
+            assert!(s.disk().writing());
+
+            s.store.note_state_hit(&s.coord, 2, cp_inflight, false, 0.0);
+            s.store.end_seq_use(2);
+            assert!(!s.entry(cp_inflight).checkpoint());
+            assert!(s.store.is_prompt_head(cp_inflight));
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_inflight),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            // Flush must wait for the initial checkpoint write + KV chain to land, then relabel!
+            assert!(s.flush(10));
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            let inflight_copy = s.disk_copy(cp_inflight);
+            assert!(inflight_copy.landed && !inflight_copy.chain_owed);
+            let (_, inflight_label) = s
+                .manager()
+                .state_label(inflight_copy.key, s.disk().tier.state_fingerprint)
+                .expect("inflight on-disk label");
+            assert!(
+                !inflight_label.checkpoint,
+                "in-flight reclaimed checkpoint promotion must land checkpoint=false on SSD"
+            );
+
+            // Part B: Promote a durable SSD-backed checkpoint via `reuse_existing_entry`!
+            let cp_reuse = s.capture(
+                &fx.conv,
+                3,
+                &tokens_reuse,
+                64,
+                salt_reuse,
+                StateClass::Checkpoint,
+                None,
+            );
+            s.store.clear_seq_checkpoint(3);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_reuse),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert!(s.entry(cp_reuse).ram().is_none());
+            assert!(s.entry(cp_reuse).checkpoint());
+            let reuse_copy_before = s.disk_copy(cp_reuse);
+            assert!(reuse_copy_before.landed && !reuse_copy_before.chain_owed);
+            let (_, reuse_label_before) = s
+                .manager()
+                .state_label(reuse_copy_before.key, s.disk().tier.state_fingerprint)
+                .expect("reuse label before");
+            assert!(reuse_label_before.checkpoint);
+
+            // Recapture same lineage at depth 64 as `Ordinary` with no draft window -> hits the
+            // early reuse fast-path (`reuse_existing_entry`) while keeping `ram().is_none()`.
+            s.coord.reset_scheduled_request(4).expect("reset 4");
+            s.coord
+                .record_tokens_all(4, &tokens_reuse)
+                .expect("record 4");
+            let reused_id = s
+                .store
+                .capture_boundary_with_options(
+                    &mut s.coord,
+                    &fx.conv,
+                    4,
+                    &tokens_reuse,
+                    64,
+                    salt_reuse,
+                    StateClass::Ordinary,
+                    CaptureOptions {
+                        keep_prev_checkpoint: true,
+                        enqueue_write_behind: true,
+                        is_head: false,
+                        now: 0.0,
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(reused_id, cp_reuse);
+            assert!(s.entry(cp_reuse).ram().is_none());
+            assert!(!s.entry(cp_reuse).checkpoint());
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_reuse),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            assert!(s.flush(10));
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            let reuse_copy_after = s.disk_copy(cp_reuse);
+            let (_, reuse_label_after) = s
+                .manager()
+                .state_label(reuse_copy_after.key, s.disk().tier.state_fingerprint)
+                .expect("reuse label after");
+            assert!(
+                !reuse_label_after.checkpoint,
+                "reuse_existing_entry upgrade on SSD checkpoint must land checkpoint=false on SSD"
+            );
+            assert!(s.close());
+        }
+
+        // Reopen persistent tier and verify BOTH adopt as Ordinary prompt heads & restore cleanly.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, None, 2);
+            let id_inflight = s2.id_by_salt(salt_inflight);
+            let id_reuse = s2.id_by_salt(salt_reuse);
+
+            for (label, id, tokens, salt) in [
+                ("inflight", id_inflight, &tokens_inflight, salt_inflight),
+                ("reuse", id_reuse, &tokens_reuse, salt_reuse),
+            ] {
+                assert!(
+                    !s2.entry(id).checkpoint(),
+                    "{label}: must adopt as Ordinary after restart"
+                );
+                assert!(
+                    s2.store.is_prompt_head(id),
+                    "{label}: must be in prompt_heads after restart"
+                );
+                let mut query = tokens[..80].to_vec();
+                query.extend(9800u32..9810u32);
+                s2.assert_ssd_restores(&query, salt, Some(id), None);
+            }
+            assert!(s2.close());
+        }
+    }
+
+    /// Codex C1: When a `LabelPromote` write fails (either asynchronously via `MakeRoom::Refuse`
+    /// on the writer thread or synchronously due to low model-thread headroom), the old SSD copy
+    /// stays pinned and intact (`preserve_entry_on_state_failure`), `entries_missing_draft_window`
+    /// is NEVER corrupted, `LabelPromote` reschedules with backoff without tight-spinning
+    /// `flush_to_disk`, and completes cleanly once room returns.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn label_promote_failure_preserves_old_ssd_copy_and_draft_window_tracking() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fx = StateDiskTestFixture::new(
+            "c1-label-promote-fail",
+            b"c1-label-promote-fail-v1",
+            Some(10.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt = 0x6301u64;
+        let tokens: Vec<u32> = (8600u32..8696u32).collect();
+        let mut query = tokens[..80].to_vec();
+        query.extend(9700u32..9710u32);
+        let dw64 = fx.packed_dw(64);
+
+        {
+            let mut s = fx.open(128u64 << 20, Some(reserve));
+            s.store.set_ram_cap(16);
+
+            let cp_id = s.capture(
+                &fx.conv,
+                1,
+                &tokens,
+                64,
+                salt,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s.store.clear_seq_checkpoint(1);
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+
+            // Reclaim to persistent SSD (`ram().is_none()`, `checkpoint: true` on disk).
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_id),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert!(s.entry(cp_id).ram().is_none());
+            let old_copy = s.disk_copy(cp_id);
+            assert!(old_copy.landed && !old_copy.chain_owed);
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+
+            // Purge hot KV, restore from SSD, and promote via `note_state_hit`.
+            s.coord.release_all_and_purge().expect("purge hot");
+            let (anchor, from_ssd) = s
+                .store
+                .load_anchor(&s.coord, cp_id)
+                .expect("load_anchor before refusal");
+            assert!(from_ssd);
+            assert_eq!(anchor.draft_window.as_ref(), Some(&dw64));
+            s.store.note_state_hit(&s.coord, 2, cp_id, false, 0.0);
+            s.store.end_seq_use(2);
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            // 1. Async writer-side refusal (`MakeRoom::Refuse`): must exit `flush_to_disk`
+            //    promptly, preserve `old_copy` and entry, NEVER set `entries_missing_draft_window`,
+            //    and honor backoff on subsequent `Tick::Full`.
+            let refusals = Arc::new(AtomicUsize::new(0));
+            s.set_writer_space(64 << 20, reserve, Some(Arc::clone(&refusals)));
+            s.assert_flush_fails_promptly("async writer-side refusal on LabelPromote");
+            assert!(refusals.load(Ordering::Relaxed) >= 1);
+
+            assert!(
+                s.store.store.get(cp_id).is_some(),
+                "SSD-only entry must NOT be dropped on LabelPromote failure"
+            );
+            assert!(s.entry(cp_id).ram().is_none());
+            assert_eq!(
+                s.entry(cp_id).disk().copied(),
+                Some(old_copy),
+                "old durable SSD copy must be restored intact on LabelPromote failure"
+            );
+            assert!(s.disk().entry_disk_restorable(s.entry(cp_id)));
+            assert!(
+                !s.store.entry_missing_draft_window(cp_id),
+                "LabelPromote rollback must NEVER corrupt entries_missing_draft_window"
+            );
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+
+            // Background `Tick::Full` must respect backoff without re-staging.
+            let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+            assert!(!s.disk().writing());
+
+            // Old SSD copy must still restore cleanly with its exact PackedDraftWindow.
+            s.assert_ssd_restores(&query, salt, Some(cp_id), Some(&dw64));
+
+            // 2. Synchronous model-thread headroom refusal (`can_stage == false`): exits promptly,
+            //    preserves `old_copy`, and keeps `LabelPromote` queued.
+            s.manager()
+                .set_space_override_for_test(Some(Box::new(move || Ok((1 << 30, reserve)))));
+            s.assert_flush_fails_promptly("sync headroom refusal on LabelPromote");
+            assert_eq!(s.entry(cp_id).disk().copied(), Some(old_copy));
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            // 3. Space recovers: `flush_to_disk` drains `LabelPromote` cleanly.
+            s.clear_space_override(true);
+            assert!(s.flush(10));
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+            let new_copy = s.disk_copy(cp_id);
+            let (_, new_label) = s
+                .manager()
+                .state_label(new_copy.key, s.disk().tier.state_fingerprint)
+                .expect("recovered label");
+            assert!(!new_label.checkpoint);
+            assert!(s.close());
+        }
+
+        // Reopen persistent tier -> adopted as Ordinary head with exact PackedDraftWindow intact.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, None, 1);
+            let adopted_id = s2.id_by_salt(salt);
+            assert!(!s2.entry(adopted_id).checkpoint());
+            assert!(s2.store.is_prompt_head(adopted_id));
+            s2.assert_ssd_restores(&query, salt, Some(adopted_id), Some(&dw64));
+            assert!(s2.close());
+        }
+    }
+
+    /// Codex R2-1: Off-thread `LabelPromote` keeps the already-landed SSD copy visible
+    /// (`landed == true`, `entry_disk_restorable == true`, `staging_free == true`) while the
+    /// `ColdCacheManager` writer is paused, allowing concurrent restores (`lookup_deepest_restorable`
+    /// and `load_anchor`) to succeed immediately without waiting for the writer, preserving
+    /// restorability throughout AND after `MakeRoom::Refuse` refusal, and adopting as `Ordinary`
+    /// in `prompt_heads` after unpausing and landing (for both SSD-only and RAM-backed entries).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn label_promote_keeps_landed_ssd_copy_restorable_while_writer_paused() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx =
+            StateDiskTestFixture::new("r2-1-relabel-paused", b"r2-1-relabel-paused-v1", Some(10.0))
+                .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt_ssd = 0x6401u64;
+        let salt_ram = 0x6402u64;
+        let tokens_ssd: Vec<u32> = (8700u32..8796u32).collect();
+        let tokens_ram: Vec<u32> = (8800u32..8896u32).collect();
+        let mut query_ssd = tokens_ssd[..80].to_vec();
+        query_ssd.extend(9600u32..9610u32);
+        let mut query_ram = tokens_ram[..80].to_vec();
+        query_ram.extend(9620u32..9630u32);
+        let dw64 = fx.packed_dw(64);
+
+        {
+            let mut s = fx.open(128u64 << 20, Some(reserve));
+            s.store.set_ram_cap(16);
+
+            // 1. Reclaim a checkpoint to persistent SSD (SSD-only, `checkpoint: true` on disk).
+            let cp_id = s.capture(
+                &fx.conv,
+                1,
+                &tokens_ssd,
+                64,
+                salt_ssd,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_id),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert!(s.entry(cp_id).ram().is_none());
+            let old_copy = s.disk_copy(cp_id);
+            assert!(old_copy.landed && !old_copy.chain_owed);
+
+            // Purge hot KV and promote via SSD-only hit (`note_state_hit`).
+            s.coord.release_all_and_purge().expect("purge hot");
+            s.assert_ssd_restores(&query_ssd, salt_ssd, Some(cp_id), Some(&dw64));
+            s.store.note_state_hit(&s.coord, 2, cp_id, false, 0.0);
+            s.store.end_seq_use(2);
+            assert!(!s.entry(cp_id).checkpoint());
+            assert!(s.store.is_prompt_head(cp_id));
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            // 2. Refusal case while writer is paused then unpaused:
+            //    Pause writer, start `LabelPromote`, verify restorability + concurrent restore
+            //    while paused, then force `MakeRoom::Refuse` on the writer and unpause.
+            let pause = s.manager().pause_writer_for_test().expect("pause writer");
+            assert!(
+                s.store.drive_pending_disk_upgrades(&s.coord, true),
+                "LabelPromote must enqueue while writer is paused"
+            );
+            assert!(
+                s.disk().writing(),
+                "disk.writing() must be true during relabel"
+            );
+            assert!(
+                s.disk().staging_free(),
+                "off-thread relabel must not steal engine.staging"
+            );
+            assert!(matches!(
+                s.store.in_flight_disk_upgrade.as_ref().map(|u| (u.id, u.kind)),
+                Some((id, InFlightDiskUpgradeKind::LabelPromote)) if id == cp_id
+            ));
+            assert_eq!(
+                s.entry(cp_id).disk().copied(),
+                Some(old_copy),
+                "entry.disk() must stay landed==true while LabelPromote is in flight"
+            );
+            assert!(
+                s.disk().entry_disk_restorable(s.entry(cp_id)),
+                "entry_disk_restorable must stay true while writer is paused"
+            );
+            // Second restore MUST succeed while the writer is still paused!
+            s.assert_ssd_restores(&query_ssd, salt_ssd, Some(cp_id), Some(&dw64));
+
+            // Inject writer-side space refusal before unpausing so `MakeRoom::Refuse` triggers.
+            s.set_writer_space(64 << 20, reserve, None);
+            drop(pause);
+            s.await_writing("refused LabelPromote must finish promptly");
+            assert!(!s.disk().writing());
+            assert!(
+                s.disk().writable(),
+                "MakeRoom::Refuse must keep tier writable"
+            );
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+            assert_eq!(
+                s.entry(cp_id).disk().copied(),
+                Some(old_copy),
+                "old SSD copy must remain landed==true after refusal"
+            );
+            assert!(s.disk().entry_disk_restorable(s.entry(cp_id)));
+            assert!(!s.store.entry_missing_draft_window(cp_id));
+            // Restore MUST still succeed after refusal!
+            s.assert_ssd_restores(&query_ssd, salt_ssd, Some(cp_id), Some(&dw64));
+            let (_, label_after_refusal) = s
+                .manager()
+                .state_label(old_copy.key, s.disk().tier.state_fingerprint)
+                .expect("label after refusal");
+            assert!(
+                label_after_refusal.checkpoint,
+                "refused relabel must leave on-disk header untouched"
+            );
+
+            // 3. Success case while writer is paused then unpaused:
+            s.clear_space_override(true);
+            s.expire_backoff(cp_id);
+            let pause = s.manager().pause_writer_for_test().expect("pause writer 2");
+            assert!(s.store.drive_pending_disk_upgrades(&s.coord, true));
+            assert!(s.disk().writing());
+            assert!(s.disk().staging_free());
+            assert!(s.entry(cp_id).disk().is_some_and(|c| c.landed));
+            assert!(s.disk().entry_disk_restorable(s.entry(cp_id)));
+            // Concurrent restore MUST succeed while writer is paused!
+            s.assert_ssd_restores(&query_ssd, salt_ssd, Some(cp_id), Some(&dw64));
+
+            drop(pause);
+            assert!(s.flush(10));
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(!s.disk().writing());
+            assert!(s.entry(cp_id).ram().is_none());
+            assert!(s.disk().entry_disk_restorable(s.entry(cp_id)));
+            let landed_copy = s.disk_copy(cp_id);
+            assert!(landed_copy.landed && !landed_copy.chain_owed);
+            assert_eq!(landed_copy.bytes, s.state_object_bytes_for(cp_id));
+            let (_, landed_label) = s
+                .manager()
+                .state_label(landed_copy.key, s.disk().tier.state_fingerprint)
+                .expect("landed label");
+            assert!(!landed_label.checkpoint);
+
+            // 4. RAM-backed `LabelPromote` ALSO uses off-thread relabel and keeps `landed == true`
+            //    and `staging_free == true` while writer is paused.
+            let cp_ram = s.capture(
+                &fx.conv,
+                3,
+                &tokens_ram,
+                64,
+                salt_ram,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s.store.clear_seq_checkpoint(3);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_ram),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            let (ram_anchor, from_ssd) = s
+                .store
+                .load_anchor(&s.coord, cp_ram)
+                .expect("load cp_ram from SSD");
+            assert!(from_ssd);
+            assert!(s.store.store.promote(cp_ram, ram_anchor));
+            assert!(s.entry(cp_ram).ram().is_some());
+            s.store.note_state_hit(&s.coord, 4, cp_ram, false, 0.0);
+            s.store.end_seq_use(4);
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_ram),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            let pause = s.manager().pause_writer_for_test().expect("pause writer 3");
+            assert!(s.store.drive_pending_disk_upgrades(&s.coord, true));
+            assert!(s.disk().writing());
+            assert!(s.disk().staging_free());
+            assert!(s.entry(cp_ram).disk().is_some_and(|c| c.landed));
+            assert!(s.disk().entry_disk_restorable(s.entry(cp_ram)));
+            drop(pause);
+            assert!(s.flush(10));
+            let (_, ram_label) = s
+                .manager()
+                .state_label(s.disk_copy(cp_ram).key, s.disk().tier.state_fingerprint)
+                .expect("ram_label");
+            assert!(!ram_label.checkpoint);
+
+            assert!(s.close());
+        }
+
+        // 5. Reopen persistent tier + `adopt_all`: BOTH entries adopt as `Ordinary` in
+        //    `prompt_heads` and restore cleanly from SSD with exact `PackedDraftWindow`.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, None, 2);
+            for (name, salt, query) in [
+                ("ssd-only", salt_ssd, &query_ssd),
+                ("ram-backed", salt_ram, &query_ram),
+            ] {
+                let id = s2.id_by_salt(salt);
+                assert!(
+                    !s2.entry(id).checkpoint(),
+                    "{name}: must adopt as Ordinary (!checkpoint) after relabel"
+                );
+                assert!(
+                    s2.store.is_prompt_head(id),
+                    "{name}: must adopt into prompt_heads after relabel"
+                );
+                s2.assert_ssd_restores(query, salt, Some(id), Some(&dw64));
+            }
+            assert!(s2.close());
+        }
+    }
+
+    /// Codex R4-1: If `clear_ram_and_checkpoints()` (e.g., `ResetCaches`) runs while an off-thread
+    /// `LabelPromote` is in flight, a subsequent `poll_relabel` completion — whether `Ok` or
+    /// `MakeRoom::Refuse` failure — must be a clean bookkeeping no-op that preserves the committed
+    /// durable SSD anchor on disk (never calling `tier.manager.remove(&landing.key)`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn label_promote_landing_after_reset_preserves_durable_ssd_anchor() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "r4-1-relabel-after-reset",
+            b"r4-1-relabel-after-reset-v1",
+            Some(10.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt_ok = 0x6501u64;
+        let salt_fail = 0x6502u64;
+        let tokens_ok: Vec<u32> = (8900u32..8996u32).collect();
+        let tokens_fail: Vec<u32> = (9000u32..9096u32).collect();
+        let mut query_ok = tokens_ok[..80].to_vec();
+        query_ok.extend(9700u32..9710u32);
+        let mut query_fail = tokens_fail[..80].to_vec();
+        query_fail.extend(9720u32..9730u32);
+        let dw64 = fx.packed_dw(64);
+
+        {
+            let mut s = fx.open(128u64 << 20, Some(reserve));
+            s.store.set_ram_cap(16);
+
+            // 1. Success-after-reset: reclaim checkpoint to persistent SSD, hit + promote to
+            //    enqueue `LabelPromote`, start off-thread relabel while writer is paused, run
+            //    `clear_ram_and_checkpoints()`, then unpause and drain.
+            let cp_ok = s.capture(
+                &fx.conv,
+                1,
+                &tokens_ok,
+                64,
+                salt_ok,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_ok),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert!(s.entry(cp_ok).ram().is_none());
+            let key_ok = s.disk_copy(cp_ok).key;
+            assert!(s.disk_copy(cp_ok).landed && !s.disk_copy(cp_ok).chain_owed);
+
+            s.coord.release_all_and_purge().expect("purge hot 1");
+            s.assert_ssd_restores(&query_ok, salt_ok, Some(cp_ok), Some(&dw64));
+            s.store.note_state_hit(&s.coord, 2, cp_ok, false, 0.0);
+            s.store.end_seq_use(2);
+            assert!(!s.entry(cp_ok).checkpoint());
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_ok),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            let offloads_before_ok = s.disk().counters.offloads;
+            let pause = s.manager().pause_writer_for_test().expect("pause writer 1");
+            assert!(
+                s.store.tick(&s.coord, Tick::Full { command_pages: 0 }),
+                "Tick::Full must enqueue LabelPromote while writer is paused"
+            );
+            assert!(s.disk().writing());
+            assert!(s.disk().pending_relabel.is_some());
+            assert!(matches!(
+                s.store.in_flight_disk_upgrade.as_ref().map(|u| (u.id, u.kind)),
+                Some((id, InFlightDiskUpgradeKind::LabelPromote)) if id == cp_ok
+            ));
+
+            // Simulate `ResetCaches` while the relabel is still queued on the paused writer.
+            s.store.clear_ram_and_checkpoints();
+            s.coord
+                .release_all_and_purge()
+                .expect("purge after reset 1");
+            assert!(s.store.store.entries().next().is_none());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.disk().writing());
+
+            drop(pause);
+            let dl = test_deadline(10);
+            while s.disk().writing() {
+                assert!(
+                    Instant::now() < dl,
+                    "post-reset LabelPromote must finish promptly"
+                );
+                let _ = s.disk().await_landing(dl);
+                let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+            }
+            assert!(s.flush(10));
+            assert!(!s.disk().writing());
+            assert!(s.disk().writable());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.recent_failed_upgrades.is_empty());
+            assert!(s.store.recent_failed_spills.is_empty());
+            assert!(s.store.spill_backoff.is_empty());
+            assert_eq!(s.disk().counters.offloads, offloads_before_ok + 1);
+            assert_eq!(s.disk().counters.offload_failures, 0);
+            assert!(
+                s.manager().contains_in(&key_ok, ColdGroup::DFlash2State),
+                "successful LabelPromote landing after reset must preserve durable SSD blob"
+            );
+            let (_, label_ok) = s
+                .manager()
+                .state_label(key_ok, s.disk().tier.state_fingerprint)
+                .expect("label_ok after reset");
+            assert!(
+                !label_ok.checkpoint,
+                "post-reset relabel must commit checkpoint=false on disk"
+            );
+
+            // 2. Failure-after-reset: inject `MakeRoom::Refuse` while writer is paused, run
+            //    `clear_ram_and_checkpoints()`, then unpause and drain — verify clean no-op and
+            //    that the original committed SSD blob stays intact on disk.
+            let cp_fail = s.capture(
+                &fx.conv,
+                3,
+                &tokens_fail,
+                64,
+                salt_fail,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s.store.clear_seq_checkpoint(3);
+            assert_eq!(
+                s.store.reclaim_entry(&s.coord, cp_fail),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s.flush(10));
+            assert!(s.entry(cp_fail).ram().is_none());
+            let key_fail = s.disk_copy(cp_fail).key;
+            assert!(s.disk_copy(cp_fail).landed && !s.disk_copy(cp_fail).chain_owed);
+
+            s.coord.release_all_and_purge().expect("purge hot 2");
+            s.assert_ssd_restores(&query_fail, salt_fail, Some(cp_fail), Some(&dw64));
+            s.store.note_state_hit(&s.coord, 4, cp_fail, false, 0.0);
+            s.store.end_seq_use(4);
+            assert!(!s.entry(cp_fail).checkpoint());
+            assert!(matches!(
+                s.store.pending_disk_upgrades.get(&cp_fail),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+
+            let pause = s.manager().pause_writer_for_test().expect("pause writer 2");
+            assert!(
+                s.store.tick(&s.coord, Tick::Full { command_pages: 0 }),
+                "Tick::Full must enqueue second LabelPromote while writer is paused"
+            );
+            assert!(s.disk().writing());
+            assert!(s.disk().pending_relabel.is_some());
+            assert!(matches!(
+                s.store.in_flight_disk_upgrade.as_ref().map(|u| (u.id, u.kind)),
+                Some((id, InFlightDiskUpgradeKind::LabelPromote)) if id == cp_fail
+            ));
+
+            s.set_writer_space(64 << 20, reserve, None);
+            s.store.clear_ram_and_checkpoints();
+            s.coord
+                .release_all_and_purge()
+                .expect("purge after reset 2");
+            assert!(s.store.store.entries().next().is_none());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.disk().writing());
+
+            drop(pause);
+            let dl = test_deadline(10);
+            while s.disk().writing() {
+                assert!(
+                    Instant::now() < dl,
+                    "refused post-reset LabelPromote must finish promptly"
+                );
+                let _ = s.disk().await_landing(dl);
+                let _ = s.store.tick(&s.coord, Tick::Full { command_pages: 0 });
+            }
+            assert!(s.flush(10));
+            s.clear_space_override(true);
+            assert!(!s.disk().writing());
+            assert!(s.disk().writable());
+            assert!(s.store.in_flight_disk_upgrade.is_none());
+            assert!(s.store.pending_disk_upgrades.is_empty());
+            assert!(s.store.recent_failed_upgrades.is_empty());
+            assert!(s.store.recent_failed_spills.is_empty());
+            assert!(s.store.spill_backoff.is_empty());
+            assert_eq!(s.disk().counters.offload_failures, 1);
+
+            assert!(
+                s.manager().contains_in(&key_ok, ColdGroup::DFlash2State),
+                "first durable SSD blob must remain on disk"
+            );
+            assert!(
+                s.manager().contains_in(&key_fail, ColdGroup::DFlash2State),
+                "refused LabelPromote after reset must preserve old durable SSD blob"
+            );
+            let (_, label_fail) = s
+                .manager()
+                .state_label(key_fail, s.disk().tier.state_fingerprint)
+                .expect("label_fail after reset refusal");
+            assert!(
+                label_fail.checkpoint,
+                "refused relabel after reset must leave original checkpoint=true header intact"
+            );
+
+            assert!(s.close());
+        }
+
+        // 3. Reopen fresh persistent tier + `adopt_all()`:
+        //    - `salt_ok` adopts as `Ordinary` (`!checkpoint`) in `prompt_heads` with exact `dw64`.
+        //    - `salt_fail` adopts as its preserved `Checkpoint` (`checkpoint`) with exact `dw64`.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, None, 2);
+
+            let id_ok = s2.id_by_salt(salt_ok);
+            assert!(
+                !s2.entry(id_ok).checkpoint(),
+                "post-reset relabeled anchor must adopt as Ordinary (!checkpoint)"
+            );
+            assert!(
+                s2.store.is_prompt_head(id_ok),
+                "post-reset relabeled anchor must adopt into prompt_heads"
+            );
+            s2.assert_ssd_restores(&query_ok, salt_ok, Some(id_ok), Some(&dw64));
+
+            let id_fail = s2.id_by_salt(salt_fail);
+            assert!(
+                s2.entry(id_fail).checkpoint(),
+                "post-reset refused relabel anchor must adopt with preserved Checkpoint label"
+            );
+            assert!(
+                !s2.store.is_prompt_head(id_fail),
+                "preserved Checkpoint anchor must not adopt into prompt_heads"
+            );
+            s2.assert_ssd_restores(&query_fail, salt_fail, Some(id_fail), Some(&dw64));
+
+            assert!(s2.close());
+        }
+    }
+
+    /// Codex R5-1: `ColdKeyHold` for an in-flight off-thread `LabelPromote` lives on
+    /// `PendingRelabel` (not `InFlightDiskUpgrade`), so `clear_ram_and_checkpoints()` does not
+    /// drop the eviction hold while the relabel is queued/running on the writer thread. Under
+    /// tight quota, a competing `MakeRoom::Evict` KV write must evict only an unpinned control
+    /// block instead of the held anchor or its Global KV chain, and the hold is released cleanly
+    /// once `poll_relabel()` completes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn label_promote_hold_survives_reset_against_competing_eviction() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use mlx_paged_attn::Landed;
+
+        let fx = StateDiskTestFixture::new(
+            "r5-1-relabel-hold-reset",
+            b"r5-1-relabel-hold-reset-v1",
+            Some(10.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt_a = 0x6601u64;
+        let tokens_a: Vec<u32> = (8100u32..8196u32).collect();
+        let mut query_a = tokens_a[..80].to_vec();
+        query_a.extend(9800u32..9810u32);
+        let tokens_ctrl: Vec<u32> = (4100u32..4132u32).collect();
+        let tokens_competing: Vec<u32> = (4200u32..4232u32).collect();
+        let dw64 = fx.packed_dw(64);
+
+        // 1. Seed the Checkpoint anchor on persistent SSD and measure exact anchor + 1-block footprints.
+        let (footprint_a, control_size) = {
+            let mut s1 = fx.open(64u64 << 20, Some(reserve));
+            let cp_a = s1.capture(
+                &fx.conv,
+                1,
+                &tokens_a,
+                64,
+                salt_a,
+                StateClass::Checkpoint,
+                Some(&dw64),
+            );
+            s1.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s1.store.reclaim_entry(&s1.coord, cp_a),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s1.flush(10));
+            let footprint_a = s1.manager().total_bytes();
+            assert!(footprint_a > 0);
+
+            s1.coord.reset_scheduled_request(2).expect("reset 2");
+            s1.coord
+                .record_tokens_all(2, &tokens_ctrl)
+                .expect("record ctrl");
+            let (tmp_ctrl_key, landed) = s1.enqueue_kv_block(2, &tokens_ctrl, 0, None);
+            assert!(matches!(landed, Landed::Block { ok: true, .. }));
+            let control_size = s1.manager().total_bytes() - footprint_a;
+            assert!(control_size > 1024);
+            assert!(s1.manager().remove(&tmp_ctrl_key));
+            assert!(s1.close());
+            (footprint_a, control_size)
+        };
+
+        // 2. Reopen with tight quota (`anchor + 1 control block + 64 B` relabel header headroom):
+        //    anchor's KV chain is oldest in LRU; control block is newer and unpinned; competing
+        //    `MakeRoom::Evict` KV block exceeds quota by 1 block.
+        let quota = footprint_a + control_size + 64;
+        {
+            let mut s2 = fx.open_adopted(quota, Some(reserve), 1);
+            let cp_id = s2.id_by_salt(salt_a);
+            assert!(s2.entry(cp_id).checkpoint());
+            let key_a = s2.disk_copy(cp_id).key;
+            let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(cp_id));
+            assert_eq!(kv_keys.len(), 2);
+
+            // Hit + promote checkpoint so `LabelPromote` is queued.
+            s2.assert_ssd_restores(&query_a, salt_a, Some(cp_id), Some(&dw64));
+            s2.store.note_state_hit(&s2.coord, 2, cp_id, false, 0.0);
+            s2.store.end_seq_use(2);
+            assert!(!s2.entry(cp_id).checkpoint());
+            assert!(matches!(
+                s2.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::LabelPromote { .. })
+            ));
+            let old_state_bytes = s2.disk_copy(cp_id).bytes;
+            let new_state_bytes = s2.state_object_bytes_for(cp_id);
+            assert!(new_state_bytes.saturating_sub(old_state_bytes) <= 64);
+
+            // Write an unpinned control KV block strictly NEWER in LRU than the anchor's KV chain.
+            s2.coord.reset_scheduled_request(3).expect("reset 3");
+            s2.coord
+                .record_tokens_all(3, &tokens_ctrl)
+                .expect("record ctrl");
+            let (control_key, ctrl_landed) = s2.enqueue_kv_block(3, &tokens_ctrl, 0, None);
+            assert!(matches!(ctrl_landed, Landed::Block { ok: true, .. }));
+            assert!(s2.manager().contains_in(&control_key, ColdGroup::Kv));
+            assert_eq!(s2.manager().total_bytes(), footprint_a + control_size);
+
+            // Pause writer, enqueue `LabelPromote` via `Tick::Full`, and enqueue a competing
+            // `MakeRoom::Evict` KV block write onto the block lane before resetting.
+            let pause = s2.manager().pause_writer_for_test().expect("pause writer");
+            assert!(
+                s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 }),
+                "Tick::Full must enqueue LabelPromote while writer is paused"
+            );
+            assert!(s2.disk().writing());
+            assert!(s2.disk().pending_relabel.is_some());
+            assert!(matches!(
+                s2.store.in_flight_disk_upgrade.as_ref().map(|u| (u.id, u.kind)),
+                Some((id, InFlightDiskUpgradeKind::LabelPromote)) if id == cp_id
+            ));
+
+            s2.coord.reset_scheduled_request(4).expect("reset 4");
+            s2.coord
+                .record_tokens_all(4, &tokens_competing)
+                .expect("record competing");
+            let kv = KvPoolHandle::from_adapter(s2.coord.full_adapter());
+            let blk = Arc::clone(
+                &s2.coord
+                    .full_adapter()
+                    .block_table_for(4)
+                    .expect("block table 4")
+                    .blocks()[0],
+            );
+            let kv_fp = s2.disk().tier.kv_fingerprint;
+            let competing_key =
+                ColdCacheKey::chain(ColdGroup::Kv, kv_fp, None, &tokens_competing, &[], 0, 0);
+            let (comp_tx, comp_rx) = std::sync::mpsc::channel();
+            assert!(
+                s2.manager()
+                    .capture_and_enqueue_tracked(
+                        &kv.pool,
+                        &blk,
+                        competing_key,
+                        kv_fp,
+                        &tokens_competing,
+                        test_deadline(5),
+                        MakeRoom::Evict,
+                        comp_tx,
+                    )
+                    .expect("enqueue competing KV")
+            );
+
+            // Simulate `ResetCaches` while both relabel and competing Evict write are queued.
+            s2.store.clear_ram_and_checkpoints();
+            s2.coord.release_all_and_purge().expect("purge after reset");
+            assert!(s2.store.store.entries().next().is_none());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.disk().writing());
+            assert!(s2.disk().pending_relabel.is_some());
+
+            // Hold MUST still pin the anchor state blob AND its entire Global KV chain after reset!
+            assert!(
+                s2.manager().is_held_for_test(&key_a),
+                "state blob hold must stay live on PendingRelabel after clear_ram_and_checkpoints"
+            );
+            for k in &kv_keys {
+                assert!(
+                    s2.manager().is_held_for_test(k),
+                    "Global KV chain hold must stay live on PendingRelabel after clear_ram_and_checkpoints"
+                );
+            }
+            assert!(!s2.manager().is_held_for_test(&control_key));
+
+            // Unpause writer and wait for the competing Evict write to settle BEFORE polling
+            // `poll_relabel`: it must evict only the unpinned control block, never the held anchor.
+            drop(pause);
+            match comp_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("competing KV settle")
+            {
+                Landed::Block { key, ok } => {
+                    assert_eq!(key, competing_key);
+                    assert!(
+                        ok,
+                        "competing Evict write must succeed by evicting only the unpinned control block"
+                    );
+                }
+                other => panic!("expected Landed::Block, got {other:?}"),
+            }
+            assert!(
+                !s2.manager().contains_in(&control_key, ColdGroup::Kv),
+                "unpinned control block must be evicted instead of the held anchor"
+            );
+            assert!(
+                s2.manager().contains_in(&key_a, ColdGroup::DFlash2State),
+                "held anchor state blob must survive competing Evict write after reset"
+            );
+            for k in &kv_keys {
+                assert!(
+                    s2.manager().contains_in(k, ColdGroup::Kv),
+                    "held anchor Global KV block must survive competing Evict write after reset"
+                );
+            }
+
+            // Drain relabel landing via `Tick::Full` + `flush_to_disk`: hold must be released cleanly.
+            let dl = test_deadline(10);
+            while s2.disk().writing() {
+                assert!(
+                    Instant::now() < dl,
+                    "post-reset relabel under quota pressure must finish promptly"
+                );
+                let _ = s2.disk().await_landing(dl);
+                let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
+            }
+            assert!(s2.flush(10));
+            assert!(!s2.disk().writing());
+            assert!(s2.disk().pending_relabel.is_none());
+            assert!(
+                !s2.manager().is_held_for_test(&key_a),
+                "state blob hold must be released once poll_relabel pops PendingRelabel"
+            );
+            for k in &kv_keys {
+                assert!(
+                    !s2.manager().is_held_for_test(k),
+                    "Global KV chain hold must be released once poll_relabel pops PendingRelabel"
+                );
+            }
+            let (_, label_a) = s2
+                .manager()
+                .state_label(key_a, s2.disk().tier.state_fingerprint)
+                .expect("relabeled state label");
+            assert!(!label_a.checkpoint);
+            assert!(s2.close());
+        }
+
+        // 3. Reopen fresh persistent tier + `adopt_all()`: relabeled anchor AND its complete Global
+        //    KV chain survived competing eviction and restore cleanly as `Ordinary` in `prompt_heads`.
+        {
+            let mut s3 = fx.open_adopted(128u64 << 20, None, 1);
+            let adopted_id = s3.id_by_salt(salt_a);
+            assert!(
+                !s3.entry(adopted_id).checkpoint(),
+                "relabeled anchor must adopt as Ordinary (!checkpoint)"
+            );
+            assert!(
+                s3.store.is_prompt_head(adopted_id),
+                "relabeled anchor must adopt into prompt_heads"
+            );
+            s3.assert_ssd_restores(&query_a, salt_a, Some(adopted_id), Some(&dw64));
+            assert!(s3.close());
+        }
     }
 }

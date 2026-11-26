@@ -1494,4 +1494,45 @@ mod tests {
             4
         );
     }
+
+    #[test]
+    fn dynamic_open_token_budget_zero_single_close_cuts_repeated_opens_and_speculative_waves() {
+        let mut tracker = open_token_tracker(true, Some(0), &[END_MESSAGE_ID], false);
+
+        // Speculative wave opening thinking under budget=0 truncates right after OPEN_THOUGHT_ID.
+        assert_eq!(
+            tracker.speculative_wave_limit(&[OPEN_THOUGHT_ID, 100, 101]),
+            1
+        );
+        // A wave that opens, closes immediately, emits text, then re-opens thinking cuts again.
+        assert_eq!(
+            tracker.speculative_wave_limit(&[
+                OPEN_THOUGHT_ID,
+                END_MESSAGE_ID,
+                CONTENT_TEXT_ID,
+                200,
+                OPEN_THOUGHT_ID,
+                300,
+            ]),
+            5
+        );
+
+        // Repeated dynamic opens in AR decoding cut every time with zero thought tokens counted.
+        for _ in 0..2 {
+            assert!(tracker.observe_token(OPEN_THOUGHT_ID));
+            assert!(tracker.ending());
+            assert_eq!(tracker.take_forced_token(), Some(END_MESSAGE_ID));
+            assert!(tracker.observe_token(END_MESSAGE_ID));
+            assert!(!tracker.ending());
+            assert!(!tracker.observe_token(CONTENT_TEXT_ID));
+            assert!(!tracker.observe_token(200));
+            assert!(!tracker.observe_token(END_MESSAGE_ID));
+        }
+
+        let outcome = tracker.outcome();
+        assert_eq!(outcome.tokens, 0);
+        assert_eq!(outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(outcome.cut_at, Some(0));
+        assert_eq!(outcome.stray_closes, 0);
+    }
 }

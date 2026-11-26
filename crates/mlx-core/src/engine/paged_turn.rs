@@ -159,8 +159,7 @@ pub(crate) fn emit_paged_turn_result<B: PagedBackend>(
             return Err(error);
         }
     };
-    result.thinking_enabled =
-        crate::engine::params::resolve_enable_thinking(args.config).unwrap_or(true);
+    result.thinking_enabled = backend.public_thinking_enabled(args.config);
     result.cached_tokens = args.effective_cached_prefix_len as u32;
 
     if let (Some(sink), Some(emitter)) = (args.sink, args.emitter.as_deref_mut()) {
@@ -2318,5 +2317,247 @@ mod tests {
             "the live paged request is released and nothing is persisted"
         );
         assert!(out.saved.is_none(), "nothing may be persisted");
+    }
+
+    #[test]
+    fn finish_paged_turn_open_token_honoring_reports_public_thinking_enabled_sync_and_stream() {
+        use crate::engine::backend::{DefaultStreamEmitter, StreamEmitter};
+        use crate::engine::params::ThinkingPolicy;
+
+        struct OpenTokenMockPagedBackend {
+            tokenizer: Arc<Qwen3Tokenizer>,
+        }
+
+        struct DummyPagedDecode;
+        impl DecodeStep for DummyPagedDecode {
+            fn forward(&mut self, _input_ids: &MxArray) -> Result<(MxArray, bool)> {
+                unreachable!()
+            }
+        }
+
+        impl ChatBackend for OpenTokenMockPagedBackend {
+            type Decode<'a>
+                = DummyPagedDecode
+            where
+                Self: 'a;
+
+            fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+                Ok(self.tokenizer.clone())
+            }
+            fn family_name(&self) -> &'static str {
+                "inkling2_paged_mock"
+            }
+            fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+                Ok(3)
+            }
+            fn policy(&self) -> ThinkingPolicy {
+                ThinkingPolicy::OpenTokenHonoring
+            }
+            fn cached_token_history(&self) -> &[u32] {
+                &[]
+            }
+            fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+                Ok(())
+            }
+            fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+                0
+            }
+            fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+            fn eval_caches(&self) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+                unreachable!()
+            }
+            fn begin_decode(&mut self, _turn: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+                Ok(DummyPagedDecode)
+            }
+            fn finalize_turn(&self, args: FinalizeArgs<'_>) -> Result<ChatResult> {
+                Ok(ChatResult {
+                    text: "ok".to_string(),
+                    tool_calls: Vec::new(),
+                    thinking: None,
+                    thinking_enabled: args.thinking_enabled,
+                    num_tokens: args.generated_tokens.len() as u32,
+                    prompt_tokens: args.prompt_tokens,
+                    reasoning_tokens: args.reasoning.tokens,
+                    reasoning_close: args.reasoning.close_name(),
+                    reasoning_cut_at: args.reasoning.cut_at,
+                    reasoning_cycle_period: args.reasoning.cycle_period,
+                    reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+                    finish_reason: args.finish_reason,
+                    raw_text: "ok".to_string(),
+                    public_raw_text: None,
+                    cached_tokens: 0,
+                    performance: args.performance,
+                })
+            }
+        }
+
+        impl PagedBackend for OpenTokenMockPagedBackend {
+            type PagedDecode<'a>
+                = DummyPagedDecode
+            where
+                Self: 'a;
+            type PrefixState = MockPrefix;
+
+            fn prime_prefix_state(
+                &mut self,
+                _tokens: &[u32],
+                _reuse_cache: bool,
+                _block_size: usize,
+                _extra_keys: &[u64],
+                _cache_salt: u64,
+            ) -> Result<Self::PrefixState> {
+                unreachable!()
+            }
+            fn paged_prefill(
+                &mut self,
+                _suffix: &[u32],
+                _prefix: &Self::PrefixState,
+                _stream: Stream,
+            ) -> Result<MxArray> {
+                unreachable!()
+            }
+            fn begin_paged_decode(&mut self) -> Result<Self::PagedDecode<'_>> {
+                Ok(DummyPagedDecode)
+            }
+            fn finalize_paged_turn(&mut self, _reuse_cache: bool, _cache_salt: u64) {}
+            fn abort_paged_turn(&mut self) {}
+            fn reconcile_paged_request_tokens(
+                &mut self,
+                _prompt_len: usize,
+                _generated: &[u32],
+                _keep_all: bool,
+            ) -> bool {
+                true
+            }
+            fn save_paged_history(
+                &mut self,
+                _save_tokens: &[u32],
+                _generated: &[u32],
+                _keep_all: bool,
+                _reuse_cache: bool,
+            ) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        struct Sink {
+            chunks: std::sync::Mutex<Vec<ChatStreamChunk>>,
+        }
+        impl ChunkSink for Sink {
+            fn send(&self, item: Result<ChatStreamChunk>) {
+                if let Ok(chunk) = item {
+                    self.chunks.lock().unwrap().push(chunk);
+                }
+            }
+        }
+
+        let tokenizer = tiny_qwen3_tokenizer();
+        let mut backend = OpenTokenMockPagedBackend {
+            tokenizer: tokenizer.clone(),
+        };
+        let prompt = [0u32, 1];
+        let generated = [2u32];
+        let profiler = DecodeProfiler::new("open-token-paged-test", "inkling2_paged_mock");
+
+        for (effort, expected_public) in [
+            (Some("none"), false),
+            (Some("0"), false),
+            (Some("0.0"), false),
+            (Some("-0.0"), false),
+            (Some("low"), true),
+            (None, true),
+        ] {
+            let config = ChatConfig {
+                reasoning_effort: effort.map(str::to_string),
+                ..Default::default()
+            };
+            let params = crate::engine::params::extract_chat_params(&config);
+            let thinking = backend.thinking_setup(&config);
+            assert!(
+                thinking.enabled,
+                "OpenTokenHonoring tracker must remain armed for effort={effort:?}"
+            );
+
+            // Sync epilogue (shared by paged exclusive AR, paged exclusive DSpark/DFlash2,
+            // scheduled AR, and scheduled DFlash2/DSpark).
+            let out = finish_paged_turn(
+                &mut backend,
+                FinishPagedTurnArgs {
+                    tokenizer: &tokenizer,
+                    params: &params,
+                    config: &config,
+                    thinking,
+                    is_delta: false,
+                    reuse_cache: true,
+                    prompt_tokens: &prompt,
+                    effective_cached_prefix_len: 0,
+                    suffix_len: prompt.len(),
+                    generated_tokens: &generated,
+                    finish_reason: "stop".to_string(),
+                    retain_final_length_token: true,
+                    generation_start: None,
+                    first_token_instant: None,
+                    reasoning: crate::engine::penalties::ReasoningOutcome::default(),
+                    profiler: &profiler,
+                    stream_skip_special: false,
+                    streamed_text_len: 0,
+                    last_is_reasoning: false,
+                    sink: None,
+                    emitter: None,
+                },
+            )
+            .expect("sync finish_paged_turn");
+            let TurnOutput::Complete(result) = out else {
+                panic!("sync finish_paged_turn must return Complete");
+            };
+            assert_eq!(
+                result.thinking_enabled, expected_public,
+                "sync paged epilogue thinking_enabled mismatch for effort={effort:?}"
+            );
+
+            // Streaming epilogue
+            let sink = Sink {
+                chunks: std::sync::Mutex::new(Vec::new()),
+            };
+            let emitter: Box<dyn StreamEmitter> = Box::new(DefaultStreamEmitter);
+            let out = finish_paged_turn(
+                &mut backend,
+                FinishPagedTurnArgs {
+                    tokenizer: &tokenizer,
+                    params: &params,
+                    config: &config,
+                    thinking,
+                    is_delta: false,
+                    reuse_cache: true,
+                    prompt_tokens: &prompt,
+                    effective_cached_prefix_len: 0,
+                    suffix_len: prompt.len(),
+                    generated_tokens: &generated,
+                    finish_reason: "stop".to_string(),
+                    retain_final_length_token: true,
+                    generation_start: None,
+                    first_token_instant: None,
+                    reasoning: crate::engine::penalties::ReasoningOutcome::default(),
+                    profiler: &profiler,
+                    stream_skip_special: false,
+                    streamed_text_len: 0,
+                    last_is_reasoning: false,
+                    sink: Some(&sink),
+                    emitter: Some(emitter),
+                },
+            )
+            .expect("stream finish_paged_turn");
+            assert!(matches!(out, TurnOutput::Streamed));
+            let chunks = sink.chunks.lock().unwrap();
+            let done = chunks.iter().find(|c| c.done).expect("terminal chunk");
+            assert_eq!(
+                done.thinking_enabled,
+                Some(expected_public),
+                "streaming paged epilogue terminal thinking_enabled mismatch for effort={effort:?}"
+            );
+        }
     }
 }

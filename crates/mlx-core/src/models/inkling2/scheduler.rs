@@ -986,6 +986,17 @@ impl Inkling2Inner {
         reuse_cache: bool,
         cache_salt: u64,
     ) -> Result<Inkling2PrefixState> {
+        self.prepare_prefix_sync_with_mode(seq_id, tokens, reuse_cache, cache_salt, false)
+    }
+
+    pub(crate) fn prepare_prefix_sync_with_mode(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        is_preemption_replay: bool,
+    ) -> Result<Inkling2PrefixState> {
         let total_budget = u32::try_from(tokens.len())
             .map_err(|_| Error::from_reason("Inkling2 prompt length overflows u32"))?;
         let config = self.config.clone();
@@ -1016,6 +1027,9 @@ impl Inkling2Inner {
                 let boundary = self
                     .continue_turn_all_exclusive(seq_id, tokens, total_budget)
                     .map_err(Error::from_reason)? as usize;
+                if let Some(rt) = self.paged.as_mut() {
+                    rt.state_store.end_seq_use(seq_id);
+                }
                 return Ok(Inkling2PrefixState {
                     effective_cached_prefix_len: boundary,
                     suffix_len: tokens.len().saturating_sub(boundary),
@@ -1032,8 +1046,13 @@ impl Inkling2Inner {
                     .lookup_deepest_restorable(&rt.coordinator, tokens, cache_salt)
             });
             if let Some(hit) = hit
-                && let Some(boundary) =
-                    self.install_state_hit_sync(seq_id, tokens, cache_salt, hit)?
+                && let Some(boundary) = self.install_state_hit_sync(
+                    seq_id,
+                    tokens,
+                    cache_salt,
+                    hit,
+                    is_preemption_replay,
+                )?
             {
                 // StateStore restores text-only target KV/ShortConv + staged
                 // `restored_draft_windows` (no DSpark draft KV or prior multimodal image lineage),
@@ -1062,7 +1081,11 @@ impl Inkling2Inner {
             .paged
             .as_mut()
             .ok_or_else(|| Error::from_reason("Inkling2 paged runtime missing"))?;
+        let saved_extra_boundaries = rt.seq_extra_capture_boundaries.remove(&seq_id);
         rt.reset_sequence(seq_id, &config)?;
+        if let Some(boundaries) = saved_extra_boundaries {
+            rt.seq_extra_capture_boundaries.insert(seq_id, boundaries);
+        }
         rt.seq_reuse_cache.insert(seq_id, reuse_cache);
         rt.seq_cache_salt.insert(seq_id, cache_salt);
         Ok(Inkling2PrefixState {
@@ -1084,6 +1107,7 @@ impl Inkling2Inner {
         tokens: &[u32],
         cache_salt: u64,
         hit: StoreHit,
+        is_preemption_replay: bool,
     ) -> Result<Option<usize>> {
         let depth = u32::try_from(hit.depth)
             .map_err(|_| Error::from_reason("Inkling2 prefix depth overflows u32"))?;
@@ -1293,6 +1317,14 @@ impl Inkling2Inner {
                     first_boundary = first_boundary.min(junction);
                 }
             }
+            if let Some(extra) = rt.seq_extra_capture_boundaries.get(&seq_id) {
+                for &b in extra {
+                    let b_us = b as usize;
+                    if b_us > depth as usize && b_us < tokens.len() {
+                        first_boundary = first_boundary.min(b_us);
+                    }
+                }
+            }
             if first_boundary.saturating_sub(depth as usize) < packed.slots as usize {
                 let restore_res = {
                     #[cfg(test)]
@@ -1336,6 +1368,16 @@ impl Inkling2Inner {
                 window: complete_win,
             },
         );
+        let now = self.governor_now();
+        if let Some(rt) = self.paged.as_mut() {
+            rt.state_store.note_state_hit(
+                &rt.coordinator,
+                seq_id,
+                hit.id,
+                is_preemption_replay,
+                now,
+            );
+        }
         self.clear_seq_image_lineage(seq_id);
         Ok(Some(hit.depth))
     }
@@ -1438,6 +1480,7 @@ impl Inkling2Inner {
         seq_id: SeqId,
         restore: &mut Inkling2Restore,
         tokens: &[u32],
+        is_preemption_replay: bool,
     ) -> Result<Option<ScheduledRestoreResult<Inkling2PrefixState>>> {
         let landed_depth = match &restore.phase {
             Inkling2RestorePhase::Reading(_) => return Ok(None),
@@ -1500,7 +1543,8 @@ impl Inkling2Inner {
                 if let Some(rt) = self.paged.as_mut() {
                     rt.coordinator.full_adapter_mut().arm_landed_chain(prefetch);
                 }
-                let res = self.install_state_hit_sync(seq_id, tokens, salt, hit);
+                let res =
+                    self.install_state_hit_sync(seq_id, tokens, salt, hit, is_preemption_replay);
                 if let Some(rt) = self.paged.as_mut() {
                     rt.coordinator.full_adapter_mut().disarm_landed_chain();
                 }
@@ -1519,17 +1563,35 @@ impl Inkling2Inner {
                         }
                     }
                     None => {
-                        let mut p = self.prepare_prefix_sync(seq_id, tokens, false, salt)?;
+                        let mut p = self.prepare_prefix_sync_with_mode(
+                            seq_id,
+                            tokens,
+                            false,
+                            salt,
+                            is_preemption_replay,
+                        )?;
                         p.reuse_cache = true;
                         p
                     }
                 }
             } else {
                 // State changed while parked; fall back cleanly to synchronous check/cold.
-                self.prepare_prefix_sync(seq_id, tokens, true, salt)?
+                self.prepare_prefix_sync_with_mode(
+                    seq_id,
+                    tokens,
+                    true,
+                    salt,
+                    is_preemption_replay,
+                )?
             }
         } else {
-            let mut p = self.prepare_prefix_sync(seq_id, tokens, false, salt)?;
+            let mut p = self.prepare_prefix_sync_with_mode(
+                seq_id,
+                tokens,
+                false,
+                salt,
+                is_preemption_replay,
+            )?;
             p.reuse_cache = true;
             p
         };
@@ -1538,13 +1600,18 @@ impl Inkling2Inner {
             rt.seq_cache_salt.insert(seq_id, prefix.cache_salt);
         }
 
+        let prompt_u32 = u32::try_from(tokens.len()).unwrap_or(u32::MAX);
+        let cached_u32 = u32::try_from(prefix.effective_cached_prefix_len).unwrap_or(u32::MAX);
+        let extra_prefill_breaks =
+            self.extra_prefill_breaks_for_seq(seq_id, prompt_u32, cached_u32);
+
         Ok(Some(ScheduledRestoreResult {
             prefix,
             bytes_restored,
             wait: restore.parked_at.elapsed(),
             materialized_blocks: 0,
             profiler_prefill_tokens: 0,
-            extra_prefill_breaks: Vec::new(),
+            extra_prefill_breaks,
         }))
     }
 
@@ -2232,6 +2299,28 @@ impl Inkling2Inner {
     }
 }
 
+/// Default minimum uncached shared-prefix length (tokens) for concurrent
+/// cold-prefix coalescing on Inkling2.
+pub(crate) const INKLING2_PREFIX_COALESCE_MIN_TOKENS: u32 = 2048;
+
+/// Maximum per-sequence extra capture boundaries accepted by
+/// `register_shared_prefill_break`.
+pub(crate) const MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ: usize = 8;
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PREFIX_COALESCE_MIN_TOKENS_OVERRIDE: std::cell::Cell<Option<u32>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn prefix_coalesce_min_tokens_value() -> u32 {
+    #[cfg(test)]
+    if let Some(v) = PREFIX_COALESCE_MIN_TOKENS_OVERRIDE.with(std::cell::Cell::get) {
+        return v;
+    }
+    INKLING2_PREFIX_COALESCE_MIN_TOKENS
+}
+
 impl HybridSchedulerBackend for Inkling2Inner {
     type FamilyCommand = Inkling2FamilyCommand;
     type RestoreTicket = Inkling2Restore;
@@ -2537,7 +2626,9 @@ impl HybridSchedulerBackend for Inkling2Inner {
         self.park_scheduled_dspark(seq_id);
         if let Some(rt) = self.paged.as_mut() {
             rt.active_scheduled_seqs.remove(&seq_id);
+            rt.state_store.end_seq_use(seq_id);
             rt.state_store.clear_seq_checkpoint(seq_id);
+            rt.seq_extra_capture_boundaries.remove(&seq_id);
         }
     }
 
@@ -2904,6 +2995,24 @@ impl HybridSchedulerBackend for Inkling2Inner {
         Ok(admission)
     }
 
+    fn prepare_preemption_prefix(
+        &mut self,
+        seq_id: SeqId,
+        tokens: &[u32],
+        _owner_history: &[u32],
+        reuse_cache: bool,
+        cache_salt: u64,
+        _block_size: u32,
+    ) -> Result<ScheduledPrefixAdmission<Self::PrefixState, Self::RestoreTicket>> {
+        let admission = self
+            .prepare_prefix_sync_with_mode(seq_id, tokens, reuse_cache, cache_salt, true)
+            .map(ScheduledPrefixAdmission::Ready)?;
+        if let Some(rt) = self.paged.as_mut() {
+            rt.active_scheduled_seqs.insert(seq_id);
+        }
+        Ok(admission)
+    }
+
     fn prepare_contended_prefix(
         &mut self,
         seq_id: SeqId,
@@ -2948,9 +3057,10 @@ impl HybridSchedulerBackend for Inkling2Inner {
         restore: &mut Self::RestoreTicket,
         prompt_tokens: &[u32],
         _owner_history: &[u32],
-        _is_preemption_replay: bool,
+        is_preemption_replay: bool,
     ) -> Result<Option<ScheduledRestoreResult<Self::PrefixState>>> {
-        let res = self.land_parked_restore_impl(seq_id, restore, prompt_tokens)?;
+        let res =
+            self.land_parked_restore_impl(seq_id, restore, prompt_tokens, is_preemption_replay)?;
         if res.is_some()
             && let Some(rt) = self.paged.as_mut()
         {
@@ -2994,6 +3104,96 @@ impl HybridSchedulerBackend for Inkling2Inner {
             breaks.sort_unstable();
         }
         breaks
+    }
+
+    fn set_seq_prefix_breakpoints(
+        &mut self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        breakpoints: &[u32],
+    ) {
+        self.set_seq_prefix_breakpoints_inner(seq_id, prompt_tokens, breakpoints);
+    }
+
+    fn extra_prefill_breaks_for(
+        &self,
+        seq_id: SeqId,
+        prompt_tokens: u32,
+        cached_prefix: u32,
+    ) -> Vec<u32> {
+        self.extra_prefill_breaks_for_seq(seq_id, prompt_tokens, cached_prefix)
+    }
+
+    fn prefix_coalesce_min_tokens(&self) -> Option<u32> {
+        self.paged
+            .as_ref()
+            .map(|_| prefix_coalesce_min_tokens_value())
+    }
+
+    fn can_lead_prefix_coalesce(&self, seq_id: SeqId) -> bool {
+        let Some(rt) = self.paged.as_ref() else {
+            return false;
+        };
+        rt.seq_reuse_cache(seq_id) && !self.seq_has_image_lineage(seq_id)
+    }
+
+    fn register_shared_prefill_break(&mut self, leader_seq: SeqId, boundary: u32) -> bool {
+        if !self.can_lead_prefix_coalesce(leader_seq) {
+            return false;
+        }
+        let (in_flight_end, matches_unpublished_sub) = match self.prefill_runs.get(&leader_seq) {
+            Some(run) => (
+                run.in_flight_end(),
+                run.is_reuse_cache() && run.unpublished_sub_ends().any(|end| end == boundary),
+            ),
+            None => (0u32, false),
+        };
+        let Some(rt) = self.paged.as_mut() else {
+            return false;
+        };
+        let bs = rt.coordinator.block_size().max(1);
+        if boundary == 0 || !boundary.is_multiple_of(bs) {
+            return false;
+        }
+        let committed = rt
+            .coordinator
+            .request_token_count_all(leader_seq)
+            .unwrap_or(0);
+        let is_future = boundary > committed.max(in_flight_end);
+        if !is_future && !matches_unpublished_sub {
+            return false;
+        }
+        if let Some(existing) = rt.seq_extra_capture_boundaries.get_mut(&leader_seq) {
+            if existing.contains(&boundary) {
+                return true;
+            }
+            if existing.union_len() >= MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ {
+                return false;
+            }
+            existing.shared.insert(boundary);
+            return true;
+        }
+        let mut boundaries = super::paged_forward::SeqCaptureBoundaries::default();
+        boundaries.shared.insert(boundary);
+        rt.seq_extra_capture_boundaries
+            .insert(leader_seq, boundaries);
+        true
+    }
+
+    fn unregister_shared_prefill_break(&mut self, leader_seq: SeqId, boundary: u32) {
+        let Some(rt) = self.paged.as_mut() else {
+            return;
+        };
+        let remove_entry = if let Some(entry) = rt.seq_extra_capture_boundaries.get_mut(&leader_seq)
+        {
+            entry.shared.remove(&boundary);
+            entry.is_empty()
+        } else {
+            false
+        };
+        if remove_entry {
+            rt.seq_extra_capture_boundaries.remove(&leader_seq);
+        }
     }
 
     fn replace_cached_token_history(&mut self, history: Vec<u32>) {
@@ -3575,7 +3775,7 @@ pub(super) mod tests {
         build_synthetic_dflash2_inner_with_window(max_model_len, force_lm_token, 8, 1)
     }
 
-    fn build_synthetic_dflash2_inner_with_window(
+    pub(crate) fn build_synthetic_dflash2_inner_with_window(
         max_model_len: u32,
         force_lm_token: Option<u32>,
         draft_sliding_window: usize,
@@ -14077,6 +14277,2137 @@ pub(super) mod tests {
             ]);
             assert!(next_props[0].is_ok(), "lane 0 next propose must succeed");
             assert!(next_props[1].is_ok(), "lane 2 next propose must succeed");
+        }
+    }
+
+    /// WS1: Preemption replay hitting a `StateClass::Checkpoint` at `depth >= write_behind_min_tokens()`
+    /// (via `try_resume_preempted` -> `prepare_preemption_prefix`) upgrades it via `use_state`
+    /// WITHOUT marking `prompt_heads` or enqueuing `WriteBehind(head = true)`. Also verifies zero
+    /// leaked `store.in_use` pins across `finalize_paged_turn(reuse_cache = true/false)`,
+    /// `ResetScope::PrefixMiss`, `ResetScope::Command`, `run_multimodal_turn`-style `reset_sequence`,
+    /// and exclusive DFlash2 cold fallback.
+    #[test]
+    fn preemption_replay_at_write_behind_depth_does_not_mark_prompt_head_and_releases_pins() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::store::StateClass;
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::backend::{ChatBackend, PagedBackend, ResetScope};
+        use crate::engine::dspark_turn::PagedDsparkBackend;
+        use crate::models::inkling2::state_disk::WRITE_BEHIND_MIN_TOKENS_OVERRIDE;
+
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
+            }
+        }
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(32)));
+        let _ov = OverrideGuard;
+
+        let temp_root = std::env::temp_dir().join(format!(
+            "inkling2-ws1-preempt-pins-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(128u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+
+        // Part 1: Full `HybridSchedulerState` preemption replay via `try_resume_preempted` ->
+        // `prepare_preemption_prefix`.
+        {
+            let tok = build_synthetic_inkling2_tokenizer();
+            let msg_user_id = tok
+                .inner()
+                .token_to_id(crate::tools::inkling::MESSAGE_USER)
+                .expect("MESSAGE_USER id");
+            let mut inner =
+                build_synthetic_dflash2_inner_with_window(512, Some(msg_user_id), 96, 4);
+            let geom =
+                super::super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+                    &inner.config,
+                    &inner.paged.as_ref().unwrap().coordinator,
+                    inner.dflash2.as_ref().map(|d| &d.config),
+                )
+                .unwrap();
+            let pid = super::super::state_disk::compute_path_identity(
+                &temp_root,
+                &inner.config,
+                &inner.paged.as_ref().unwrap().coordinator,
+                &geom,
+                Some(1024),
+                Some(b"ws1-preempt-pins-v1"),
+            );
+            assert!(inner.attach_state_disk(&disk_opts, move || pid).is_some());
+
+            let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+            let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+            let cfg = scheduled_greedy_dflash2_config("owner-ws1-preempt", 32, "salt-ws1-preempt");
+            let (reply, mut done_rx) = tokio::sync::oneshot::channel();
+            tx.send(Inkling2Cmd::Chat(Box::new(ChatCmd::SessionStart {
+                messages: user_msg("a"),
+                config: cfg,
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })))
+            .expect("send SessionStart");
+
+            let mut crossed_seq: Option<u32> = None;
+            for _ in 0..64 {
+                let _ = sched.drive(&mut rx);
+                if let Ok(res) = done_rx.try_recv() {
+                    panic!("turn finished before boundary-32 preemption: {res:?}");
+                }
+                let rt = sched.inner.paged.as_ref().expect("paged");
+                if let Some((&seq_id, _)) = rt.block_boundary_conv.iter().find(|(sid, hist)| {
+                    hist.current.0 == 32
+                        && rt.coordinator.request_token_count_all(**sid).unwrap_or(0) > 32
+                }) {
+                    crossed_seq = Some(seq_id);
+                    break;
+                }
+            }
+            let seq_id = crossed_seq.expect("turn must cross boundary 32 during decode");
+            assert!(
+                sched.preempt_running(seq_id),
+                "preempt_running must preempt running turn at boundary 32"
+            );
+
+            let (cp_id, cp_mark) = {
+                let rt = sched.inner.paged.as_ref().expect("paged");
+                let entry = rt
+                    .state_store
+                    .store
+                    .entries()
+                    .find(|e| e.depth() == 32)
+                    .expect("preemption checkpoint at 32");
+                assert!(
+                    entry.checkpoint(),
+                    "short-reply preemption capture must start as StateClass::Checkpoint"
+                );
+                assert!(!rt.state_store.is_prompt_head(entry.id()));
+                assert_eq!(
+                    rt.state_store
+                        .disk
+                        .as_ref()
+                        .unwrap()
+                        .write_behind
+                        .snapshot()
+                        .waiting,
+                    0
+                );
+                (entry.id(), entry.mark())
+            };
+
+            // Resume via `try_resume_preempted` -> `prepare_preemption_prefix`:
+            // depth == 32 >= write_behind_min_tokens() == 32, yet preemption replay must upgrade
+            // via `use_state` WITHOUT marking `prompt_heads` or enqueuing `WriteBehind(head=true)`!
+            sched.resume_preempted();
+            {
+                let turn = sched.turn_mut(seq_id).expect("replaying turn");
+                assert_eq!(turn.payload.prefix.effective_cached_prefix_len, 32);
+            }
+            {
+                let rt = sched.inner.paged.as_ref().expect("paged");
+                let entry = rt.state_store.store.get(cp_id).expect("cp_id");
+                assert!(
+                    !entry.checkpoint(),
+                    "preemption replay must upgrade Checkpoint via use_state"
+                );
+                assert!(
+                    rt.state_store.store.in_use(cp_mark),
+                    "preemption replay must hold active use_state pin while turn runs"
+                );
+                assert!(
+                    !rt.state_store.is_prompt_head(cp_id),
+                    "preemption replay must NOT mark prompt_heads"
+                );
+                assert_eq!(
+                    rt.state_store
+                        .disk
+                        .as_ref()
+                        .unwrap()
+                        .write_behind
+                        .snapshot()
+                        .waiting,
+                    0,
+                    "preemption replay must NOT enqueue WriteBehind(head = true)"
+                );
+            }
+
+            // Finish resumed turn and confirm zero leaked `in_use` pins!
+            let mut finished = false;
+            for _ in 0..256 {
+                let _ = sched.drive(&mut rx);
+                if let Ok(res) = done_rx.try_recv() {
+                    res.expect("resumed turn succeeds");
+                    finished = true;
+                    break;
+                }
+            }
+            assert!(finished, "resumed turn must finish");
+            {
+                let rt = sched.inner.paged.as_ref().expect("paged");
+                assert!(
+                    !rt.state_store.store.in_use(cp_mark),
+                    "completing resumed turn must release its use_state pin"
+                );
+            }
+            let _ = sched
+                .inner
+                .close_state_disk(Instant::now() + Duration::from_secs(5));
+        }
+
+        // Part 2: Exhaustive pin-release audit across every exit path on `Inkling2Inner`.
+        {
+            let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 96, 4);
+            let make_conv = |cfg: &super::super::config::Inkling2Config| {
+                super::super::short_conv::Inkling2ShortConvState::new(
+                    cfg.num_layer_visits(),
+                    cfg.sconv_kernel_size,
+                    cfg.num_key_value_heads * cfg.head_dim,
+                    cfg.hidden_size,
+                    crate::array::DType::BFloat16,
+                )
+                .unwrap()
+            };
+            let conv = make_conv(&inner.config);
+            let salt_a = 0xAA01u64;
+            let salt_b = 0xAA02u64;
+            let toks_a: Vec<u32> = (0u32..48u32).map(|i| 10 + (i % 50)).collect();
+            let toks_b: Vec<u32> = (0u32..48u32).map(|i| 30 + (i % 50)).collect();
+
+            // Seed two anchors without draft windows (`draft_window == None`, so exclusive
+            // DFlash2 with `sliding_window = 96 > suffix = 16` takes cold fallback!).
+            let (mark_a, mark_b) = {
+                let rt = inner.paged.as_mut().unwrap();
+                rt.coordinator.reset_scheduled_request(100).unwrap();
+                rt.coordinator.record_tokens_all(100, &toks_a).unwrap();
+                let id_a = rt
+                    .state_store
+                    .capture_boundary(
+                        &mut rt.coordinator,
+                        &conv,
+                        100,
+                        &toks_a,
+                        32,
+                        salt_a,
+                        StateClass::Ordinary,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mark_a = rt.state_store.store.get(id_a).unwrap().mark();
+                rt.release_sequence(100);
+
+                rt.coordinator.reset_scheduled_request(101).unwrap();
+                rt.coordinator.record_tokens_all(101, &toks_b).unwrap();
+                let id_b = rt
+                    .state_store
+                    .capture_boundary(
+                        &mut rt.coordinator,
+                        &conv,
+                        101,
+                        &toks_b,
+                        32,
+                        salt_b,
+                        StateClass::Ordinary,
+                        None,
+                    )
+                    .unwrap()
+                    .unwrap();
+                let mark_b = rt.state_store.store.get(id_b).unwrap().mark();
+                rt.release_sequence(101);
+                (mark_a, mark_b)
+            };
+
+            // (a) `finalize_paged_turn(reuse_cache = true)` releases pin.
+            let p1 = inner
+                .prepare_prefix_sync(10, &toks_a, true, salt_a)
+                .expect("hit a for finalize true");
+            assert_eq!(p1.effective_cached_prefix_len, 32);
+            assert!(
+                inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a)
+            );
+            inner.finalize_paged_turn(true, salt_a);
+            assert!(
+                !inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a),
+                "finalize_paged_turn(true) must release use_state pin"
+            );
+
+            // (b) `finalize_paged_turn(reuse_cache = false)` releases pin.
+            let p2 = inner
+                .prepare_prefix_sync(11, &toks_a, true, salt_a)
+                .expect("hit a for finalize false");
+            assert_eq!(p2.effective_cached_prefix_len, 32);
+            assert!(
+                inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a)
+            );
+            inner.finalize_paged_turn(false, salt_a);
+            assert!(
+                !inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a),
+                "finalize_paged_turn(false) must release use_state pin"
+            );
+
+            // (c) `ResetScope::PrefixMiss` releases ONLY `active_seq`, leaving other seqs' pins intact.
+            let p3 = inner
+                .prepare_prefix_sync(12, &toks_a, true, salt_a)
+                .expect("hit a on seq 12");
+            assert_eq!(p3.effective_cached_prefix_len, 32);
+            let p4 = inner
+                .prepare_prefix_sync(13, &toks_b, true, salt_b)
+                .expect("hit b on seq 13");
+            assert_eq!(p4.effective_cached_prefix_len, 32);
+            inner.paged.as_mut().unwrap().active_seq = 12;
+            inner
+                .reset_caches(ResetScope::PrefixMiss)
+                .expect("reset PrefixMiss");
+            {
+                let rt = inner.paged.as_ref().unwrap();
+                assert!(
+                    !rt.state_store.store.in_use(mark_a),
+                    "ResetScope::PrefixMiss must release active_seq pin"
+                );
+                assert!(
+                    rt.state_store.store.in_use(mark_b),
+                    "ResetScope::PrefixMiss must NOT release peer seq 13's pin"
+                );
+            }
+
+            // (d) `run_multimodal_turn`-style `reset_sequence(13)` releases seq 13's pin.
+            {
+                let cfg = inner.config.clone();
+                inner
+                    .paged
+                    .as_mut()
+                    .unwrap()
+                    .reset_sequence(13, &cfg)
+                    .expect("reset_sequence 13");
+                assert!(
+                    !inner
+                        .paged
+                        .as_ref()
+                        .unwrap()
+                        .state_store
+                        .store
+                        .in_use(mark_b),
+                    "reset_sequence must release use_state pin"
+                );
+            }
+
+            // (e) Exclusive DFlash2 cold fallback (`prime_dspark_prefix_state` on anchor
+            //     missing `draft_window` with `suffix_len = 16 < sliding_window = 96`) releases pin.
+            inner.paged.as_mut().unwrap().active_seq = 14;
+            let cold = inner
+                .prime_dspark_prefix_state(&toks_a, true, salt_a)
+                .expect("exclusive DFlash2 cold fallback");
+            assert_eq!(
+                cold.effective_cached_prefix_len, 0,
+                "missing draft window with short suffix must fall back to cold"
+            );
+            assert!(
+                !inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a),
+                "exclusive DFlash2 cold fallback must release use_state pin via reset_sequence"
+            );
+
+            // (f) `ResetScope::Command` (`clear_ram_and_checkpoints`) releases all active pins.
+            let p5 = inner
+                .prepare_prefix_sync(15, &toks_a, true, salt_a)
+                .expect("hit a on seq 15");
+            assert_eq!(p5.effective_cached_prefix_len, 32);
+            assert!(
+                inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a)
+            );
+            inner
+                .reset_caches(ResetScope::Command)
+                .expect("reset Command");
+            assert!(
+                !inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .store
+                    .in_use(mark_a),
+                "ResetScope::Command (clear_ram_and_checkpoints) must release all use_state pins"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// WS2: `set_seq_prefix_breakpoints` floors raw offsets to `block_size=32`, drops `0` and
+    /// `> junction`, survives cold `prepare_prefix_sync_with_mode`, and clears cleanly on
+    /// `finalize_paged_turn(true/false)`, `scheduled_turn_closed`, multimodal `reset_sequence`,
+    /// and `ResetScope::Command`.
+    #[test]
+    fn set_seq_prefix_breakpoints_normalizes_survives_cold_prepare_and_clears_on_exit() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::{ChatBackend, PagedBackend, ResetScope};
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+
+        let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 2);
+        let seq = 7u32;
+        let prompt_128: Vec<u32> = (0u32..128u32).map(|i| 10 + (i % 60)).collect();
+        let salt = 0x5E70u64;
+
+        // Normalization: for prompt_tokens=128, bs=32 -> junction = (127 / 32) * 32 = 96.
+        // 0 and 31 floor to 0 (dropped); 32->32, 65->64, 95->64, 96->96, 127->96;
+        // 128->128 (> junction) and 200->192 (> junction) are dropped.
+        inner.set_seq_prefix_breakpoints(seq, 128, &[0, 31, 32, 65, 95, 96, 127, 128, 200]);
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            let installed: Vec<u32> = rt
+                .seq_extra_capture_boundaries
+                .get(&seq)
+                .expect("normalized set installed")
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(installed, vec![32, 64, 96]);
+        }
+        assert_eq!(
+            inner.extra_prefill_breaks_for(seq, 128, 0),
+            vec![32, 64, 96]
+        );
+        assert_eq!(inner.extra_prefill_breaks_for(seq, 128, 64), vec![96]);
+
+        // Survives cold `prepare_prefix_sync_with_mode` (which calls `rt.reset_sequence`).
+        let prefix = inner
+            .prepare_prefix_sync_with_mode(seq, &prompt_128, true, salt, false)
+            .expect("cold prepare_prefix_sync_with_mode");
+        assert_eq!(prefix.effective_cached_prefix_len, 0);
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            let survived: Vec<u32> = rt
+                .seq_extra_capture_boundaries
+                .get(&seq)
+                .expect("breakpoints must survive cold prepare_prefix_sync_with_mode")
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(survived, vec![32, 64, 96]);
+        }
+
+        // Clears on `finalize_paged_turn(reuse_cache = true)`.
+        inner.paged.as_mut().unwrap().active_seq = seq;
+        inner.finalize_paged_turn(true, salt);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq),
+            "finalize_paged_turn(true) must clear seq_extra_capture_boundaries"
+        );
+
+        // Clears on `finalize_paged_turn(reuse_cache = false)`.
+        inner.set_pending_prefix_breakpoints(128, &[65]);
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq)
+        );
+        inner.finalize_paged_turn(false, salt);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq),
+            "finalize_paged_turn(false) must clear seq_extra_capture_boundaries"
+        );
+
+        // Clears on `scheduled_turn_closed`.
+        inner.set_seq_prefix_breakpoints(seq, 128, &[65]);
+        inner.scheduled_turn_closed(seq);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq),
+            "scheduled_turn_closed must clear seq_extra_capture_boundaries"
+        );
+
+        // Clears on multimodal-style direct `rt.reset_sequence(seq, &cfg)`.
+        inner.set_seq_prefix_breakpoints(seq, 128, &[65]);
+        let cfg = inner.config.clone();
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .reset_sequence(seq, &cfg)
+            .expect("multimodal reset_sequence");
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq),
+            "direct reset_sequence (multimodal path) must clear seq_extra_capture_boundaries"
+        );
+
+        // Clears all sequences on `ResetScope::Command`.
+        inner.set_seq_prefix_breakpoints(seq, 128, &[65]);
+        inner.set_seq_prefix_breakpoints(seq + 1, 128, &[65]);
+        inner
+            .reset_caches(ResetScope::Command)
+            .expect("reset Command");
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .is_empty(),
+            "ResetScope::Command must clear all seq_extra_capture_boundaries"
+        );
+    }
+
+    /// WS2: `install_state_hit_sync` eagerly materializes `DraftContextWindow` when an installed
+    /// extra capture boundary lies `< sliding_window` tokens past `depth`, even when the prompt
+    /// junction and rolling checkpoints are `>= sliding_window` away.
+    #[test]
+    fn install_state_hit_sync_eagerly_materializes_draft_window_for_nearby_extra_breakpoint() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefillPass};
+        use crate::stream::Stream;
+
+        let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 2);
+        let gen_stream = Stream::generation();
+        let salt = 0xD7A0u64;
+        let prompt_160: Vec<u32> = (0u32..160u32).map(|i| 10 + (i % 60)).collect();
+
+        // Seed a `StateClass::Ordinary` anchor at depth 32 carrying a complete `PackedDraftWindow`
+        // (`slots = 64`, `begin = 0`, `end = 32`, `is_complete_for(32) == true`).
+        let seed_33 = &prompt_160[..33];
+        inner
+            .prepare_prefix_sync(1, seed_33, true, salt)
+            .expect("prepare seed");
+        let pass = inner
+            .run_paged_prefill_pass(1, seed_33, 0, 33, salt, true, gen_stream, None)
+            .expect("prefill seed [0..33)");
+        assert!(matches!(pass, ScheduledPrefillPass::Done(Some(_))));
+        inner.scheduled_turn_closed(1);
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .store
+                .entries()
+                .any(|e| {
+                    e.depth() == 32
+                        && e.ram()
+                            .and_then(|r| r.draft_window.as_ref())
+                            .is_some_and(|w| w.is_complete_for(32))
+                }),
+            "seed turn must publish depth-32 anchor with complete PackedDraftWindow"
+        );
+
+        // 1. Without extra breakpoints: junction = 128 (`128 - 32 = 96 >= sliding_window = 64`),
+        //    so `install_state_hit_sync` skips eager DraftContextWindow materialization.
+        let hit_no_extra = inner
+            .prepare_prefix_sync(10, &prompt_160, true, salt)
+            .expect("restore without extra breakpoint");
+        assert_eq!(hit_no_extra.effective_cached_prefix_len, 32);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .draft_windows
+                .contains_key(&10),
+            "without nearby extra breakpoint, DraftContextWindow must not be eagerly materialized"
+        );
+        inner.scheduled_turn_closed(10);
+
+        // 2. With extra breakpoint at `64` (`64 - 32 = 32 < sliding_window = 64`):
+        //    `install_state_hit_sync` MUST eagerly materialize `rt.draft_windows[11]` at end=32!
+        inner.set_seq_prefix_breakpoints(11, 160, &[64]);
+        let hit_with_extra = inner
+            .prepare_prefix_sync(11, &prompt_160, true, salt)
+            .expect("restore with nearby extra breakpoint");
+        assert_eq!(hit_with_extra.effective_cached_prefix_len, 32);
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            let win = rt
+                .draft_windows
+                .get(&11)
+                .expect("nearby extra breakpoint (< sliding_window past depth) must eagerly materialize DraftContextWindow");
+            assert_eq!(win.end(), 32);
+        }
+        inner.scheduled_turn_closed(11);
+    }
+
+    /// WS2: `land_parked_restore_impl` preserves `extra_prefill_breaks_for` across both a landed
+    /// SSD restore and a cold fallback, keeping installed `seq_extra_capture_boundaries` intact.
+    #[test]
+    fn land_parked_restore_impl_preserves_extra_prefill_breaks_for() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::hybrid_scheduler::{
+            HybridSchedulerBackend, ScheduledPrefillPass, ScheduledPrefixAdmission,
+        };
+        use crate::models::inkling2::state_disk::{
+            Inkling2Restore, Inkling2RestorePhase, WRITE_BEHIND_MIN_TOKENS_OVERRIDE,
+            poll_restore_ticket,
+        };
+        use crate::stream::Stream;
+        use crate::transformer::paged_kv_cache_adapter::RestoreUploadBudget;
+
+        struct OverrideGuard;
+        impl Drop for OverrideGuard {
+            fn drop(&mut self) {
+                WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
+            }
+        }
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(32)));
+        let _ov = OverrideGuard;
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-ws2-land-breaks-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(128u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+
+        let mut inner = build_synthetic_dflash2_inner_with_window(256, None, 64, 2);
+        let geom = super::super::state_disk::Inkling2StateGeometry::from_coordinator_with_draft(
+            &inner.config,
+            &inner.paged.as_ref().unwrap().coordinator,
+            inner.dflash2.as_ref().map(|d| &d.config),
+        )
+        .unwrap();
+        let pid = super::super::state_disk::compute_path_identity(
+            &temp_root,
+            &inner.config,
+            &inner.paged.as_ref().unwrap().coordinator,
+            &geom,
+            Some(1024),
+            Some(b"ws2-land-breaks-v1"),
+        );
+        assert!(inner.attach_state_disk(&disk_opts, move || pid).is_some());
+
+        let gen_stream = Stream::generation();
+        let salt = 0x1A4D_u64;
+        let prompt_160: Vec<u32> = (0u32..160u32).map(|i| 15 + (i % 60)).collect();
+        let seed_33 = &prompt_160[..33];
+
+        // 1. Seed a depth-32 anchor with a complete PackedDraftWindow and spill both Global KV
+        //    and StateDisk anchor to SSD, then drop RAM + hot KV so contended prepare parks on SSD.
+        inner
+            .prepare_prefix_sync(1, seed_33, true, salt)
+            .expect("prepare seed");
+        let pass = inner
+            .run_paged_prefill_pass(1, seed_33, 0, 33, salt, true, gen_stream, None)
+            .expect("prefill seed");
+        assert!(matches!(pass, ScheduledPrefillPass::Done(Some(_))));
+        inner.scheduled_turn_closed(1);
+        inner.release_scheduled_cache(1).expect("release seed");
+
+        {
+            let rt = inner.paged.as_mut().expect("paged");
+            let id = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == 32)
+                .expect("depth-32 anchor")
+                .id();
+            let _ = rt.state_store.reclaim_entry(&rt.coordinator, id);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                rt.state_store.tick(
+                    &rt.coordinator,
+                    super::Tick::Wait {
+                        deadline: Instant::now() + Duration::from_millis(25),
+                    },
+                );
+                let landed = rt.state_store.store.get(id).is_some_and(|e| {
+                    e.ram().is_none() && e.disk().is_some_and(|d| d.landed && !d.chain_owed)
+                });
+                if landed {
+                    break;
+                }
+            }
+            assert!(
+                rt.state_store.store.get(id).is_some_and(|e| {
+                    e.ram().is_none() && e.disk().is_some_and(|d| d.landed && !d.chain_owed)
+                }),
+                "depth-32 anchor must land on SSD with chain written"
+            );
+            let _ = rt.coordinator.evict_all_hot_blocks_without_suppress();
+            rt.conv_states.clear();
+        }
+
+        // 2. Contended prepare parks with `Inkling2Restore`, then landing preserves extra breaks
+        //    `[64, 96, 128]` AND eagerly materializes `DraftContextWindow` for `64 - 32 < 64`!
+        let seq_land = 20u32;
+        inner.set_seq_prefix_breakpoints(seq_land, 160, &[64, 96]);
+        let admission = inner
+            .prepare_contended_prefix_impl(seq_land, &prompt_160, true, salt)
+            .expect("prepare contended");
+        let ScheduledPrefixAdmission::Waiting { mut restore, .. } = admission else {
+            panic!("evicted cold SSD anchor must park in WaitingForSsd");
+        };
+        let mut budget = RestoreUploadBudget::chunks(usize::MAX);
+        for _ in 0..2000 {
+            if restore.lands() {
+                break;
+            }
+            let rt = inner.paged.as_ref().expect("paged");
+            poll_restore_ticket(rt.coordinator.full_adapter(), &mut restore, &mut budget);
+            std::thread::yield_now();
+        }
+        assert!(restore.lands(), "SSD restore ticket must land");
+        let landed = inner
+            .land_parked_restore_impl(seq_land, &mut restore, &prompt_160, false)
+            .expect("land_parked_restore_impl")
+            .expect("landed Some");
+        assert_eq!(landed.prefix.effective_cached_prefix_len, 32);
+        assert_eq!(
+            landed.extra_prefill_breaks,
+            vec![64, 96, 128],
+            "landed SSD restore must preserve extra_prefill_breaks_for"
+        );
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .draft_windows
+                .contains_key(&seq_land),
+            "landed SSD restore must also eagerly materialize DraftContextWindow for nearby extra break"
+        );
+        inner.scheduled_turn_closed(seq_land);
+
+        // 3. Explicit `Inkling2RestorePhase::Cold` fallback must ALSO keep installed extra breaks
+        //    and return them in `ScheduledRestoreResult::extra_prefill_breaks`!
+        let seq_cold = 21u32;
+        inner.set_seq_prefix_breakpoints(seq_cold, 160, &[64, 96]);
+        let mut cold_restore = Inkling2Restore {
+            phase: Inkling2RestorePhase::Cold,
+            cache_salt: salt,
+            retried: false,
+            parked_at: Instant::now(),
+            read_wait: None,
+            read_wait_since: None,
+        };
+        let landed_cold = inner
+            .land_parked_restore_impl(seq_cold, &mut cold_restore, &prompt_160, false)
+            .expect("cold land_parked_restore_impl")
+            .expect("cold landed Some");
+        assert_eq!(landed_cold.prefix.effective_cached_prefix_len, 0);
+        assert_eq!(
+            landed_cold.extra_prefill_breaks,
+            vec![64, 96, 128],
+            "cold fallback in land_parked_restore_impl must preserve seq_extra_capture_boundaries"
+        );
+        inner.scheduled_turn_closed(seq_cold);
+
+        let _ = inner.close_state_disk(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
+
+    /// WS3: `Inkling2Inner::register_shared_prefill_break` accepts future aligned breaks AND
+    /// exact unpublished active-run sub-slice ends (`pending_subs` + `run.end`), promoting them
+    /// to durable `StateClass::Ordinary + is_head = true`, while rejecting mid-slice
+    /// (`run.start < b < run.end`), zero/unaligned, already-published, image-lineage, opt-out,
+    /// and `> cap` boundaries.
+    #[test]
+    fn inkling2_register_shared_prefill_break_handles_future_unpublished_subslice_mid_slice_and_guards()
+     {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefillPass};
+        use crate::models::inkling2::kv_cache::{Inkling2PagedConfig, default_inkling2_kv_format};
+        use crate::models::inkling2::state_disk::CHECKPOINT_INTERVAL_OVERRIDE;
+        use crate::stream::Stream;
+
+        struct Guards;
+        impl Drop for Guards {
+            fn drop(&mut self) {
+                CHECKPOINT_INTERVAL_OVERRIDE.with(|c| c.set(None));
+                super::PREFIX_COALESCE_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
+            }
+        }
+        CHECKPOINT_INTERVAL_OVERRIDE.with(|c| c.set(Some(64)));
+        let _guards = Guards;
+
+        // Build a 6-visit synthetic Inkling2Inner (layers [0..6) alternating local/global)
+        // so `budget_ms = Some(0.0)` pauses mid-sub-slice at visit 4 of 6!
+        let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 64, 4);
+        let mut extra = build_synthetic_dflash2_inner_with_window(512, None, 64, 4);
+        let extra_global = extra.layers.pop().expect("layer 3");
+        let extra_local = extra.layers.pop().expect("layer 2");
+        inner.layers.push(extra_local);
+        inner.layers.push(extra_global);
+        inner.config.num_hidden_layers = 6;
+        inner.config.num_physical_layers = Some(6);
+        inner.config.sliding_window_pattern = vec![true, false, true, false, true, false];
+        inner.config.local_layer_ids = vec![0, 2, 4];
+        inner.dflash2 = None;
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 512,
+                max_chunk: 256,
+                max_concurrent_sequences: 4,
+                gpu_memory_mb: None,
+            })
+            .expect("re-enable paged for 6-visit model");
+
+        // 1. `prefix_coalesce_min_tokens` default = Some(2048) and honors test override.
+        assert_eq!(
+            inner.prefix_coalesce_min_tokens(),
+            Some(super::INKLING2_PREFIX_COALESCE_MIN_TOKENS)
+        );
+        super::PREFIX_COALESCE_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(128)));
+        assert_eq!(inner.prefix_coalesce_min_tokens(), Some(128));
+        super::PREFIX_COALESCE_MIN_TOKENS_OVERRIDE.with(|c| c.set(None));
+
+        let seq = 1u32;
+        let salt = 0xC0A1_u64;
+        let gen_stream = Stream::generation();
+        // 192-token prompt with checkpoint interval 64 -> internal sub-slices [0..64), [64..128),
+        // [128..160) (prompt junction = 160), [160..192).
+        let prompt: Vec<u32> = (0u32..192u32).map(|i| 10 + (i % 60)).collect();
+        inner
+            .prepare_prefix_sync(seq, &prompt, true, salt)
+            .expect("prepare seq 1");
+        assert!(inner.can_lead_prefix_coalesce(seq));
+
+        // 2. Drive resumable prefill passes with `budget_ms = Some(0.0)` until sub-slice 0
+        //    `[0..64)` is buffered in `pending_subs` and sub-slice 1 `[64..128)` is paused
+        //    mid-visits!
+        let mut paused_on_sub1 = false;
+        for _ in 0..16 {
+            let pass = inner
+                .run_paged_prefill_pass(
+                    seq,
+                    &prompt,
+                    0,
+                    prompt.len(),
+                    salt,
+                    true,
+                    gen_stream,
+                    Some(0.0),
+                )
+                .expect("paused prefill pass");
+            assert!(matches!(pass, ScheduledPrefillPass::Paused));
+            if let Some(run) = inner.prefill_runs.get(&seq) {
+                let ends: Vec<u32> = run.unpublished_sub_ends().collect();
+                if run.in_flight_end() == 128 && ends.contains(&64) && ends.contains(&128) {
+                    paused_on_sub1 = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            paused_on_sub1,
+            "must pause on sub-slice 1 [64..128) with pending_subs=[64] and run.end=128"
+        );
+
+        // 3. Validate acceptance and rejection while paused on `[64..128)` with `pending_subs=[64]`:
+        // - Zero and unaligned rejected:
+        assert!(!inner.register_shared_prefill_break(seq, 0));
+        assert!(!inner.register_shared_prefill_break(seq, 144));
+        assert!(!inner.register_shared_prefill_break(seq, 161));
+        // - Mid-finished-sub-slice (0 < 32 < 64) and mid-current-sub-slice (64 < 96 < 128) rejected:
+        assert!(
+            !inner.register_shared_prefill_break(seq, 32),
+            "mid-finished-sub-slice boundary 32 must be rejected"
+        );
+        assert!(
+            !inner.register_shared_prefill_break(seq, 96),
+            "mid-current-sub-slice boundary 96 must be rejected"
+        );
+        // - Exact unpublished `pending_subs` end (64), exact unpublished `run.end` (128), and
+        //   future aligned boundary (160 > 128) MUST ALL be accepted!
+        assert!(
+            inner.register_shared_prefill_break(seq, 64),
+            "exact unpublished pending_subs end 64 must be accepted"
+        );
+        assert!(
+            inner.register_shared_prefill_break(seq, 128),
+            "exact unpublished run.end 128 must be accepted"
+        );
+        assert!(
+            inner.register_shared_prefill_break(seq, 160),
+            "future aligned boundary 160 must be accepted"
+        );
+
+        // 4. Finish the paused unit (`budget_ms = None`) and verify ALL THREE boundaries
+        //    (64, 128, 160) published as durable `StateClass::Ordinary` with `is_prompt_head == true`!
+        let done = inner
+            .run_paged_prefill_pass(seq, &prompt, 0, prompt.len(), salt, true, gen_stream, None)
+            .expect("finish paused prefill");
+        assert!(matches!(done, ScheduledPrefillPass::Done(Some(_))));
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            for expected_depth in [64u32, 128, 160] {
+                let entry = rt
+                    .state_store
+                    .store
+                    .entries()
+                    .find(|e| e.depth() == expected_depth as usize)
+                    .unwrap_or_else(|| {
+                        panic!("expected StateStore entry at depth {expected_depth}")
+                    });
+                assert!(
+                    !entry.checkpoint(),
+                    "promoted boundary {expected_depth} must publish as StateClass::Ordinary"
+                );
+                assert!(
+                    rt.state_store.is_prompt_head(entry.id()),
+                    "promoted boundary {expected_depth} must be marked in prompt_heads"
+                );
+            }
+        }
+
+        // 5. After unit commit (`committed == 192`, no active run): past/committed boundaries
+        //    rejected while future aligned boundaries accepted; cap of 8 enforced with
+        //    already-present boundaries still allowed at cap.
+        assert!(!inner.register_shared_prefill_break(seq, 128));
+        assert!(!inner.register_shared_prefill_break(seq, 192));
+        // Currently 3 boundaries installed (`64, 128, 160`); add 5 more future boundaries to reach 8.
+        for b in [224u32, 256, 288, 320, 352] {
+            assert!(
+                inner.register_shared_prefill_break(seq, b),
+                "boundary {b} up to cap 8 must be accepted"
+            );
+        }
+        assert_eq!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .get(&seq)
+                .unwrap()
+                .len(),
+            super::MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ
+        );
+        assert!(
+            inner.register_shared_prefill_break(seq, 352),
+            "already-present future boundary must still be allowed at cap"
+        );
+        assert!(
+            !inner.register_shared_prefill_break(seq, 384),
+            "9th distinct boundary exceeding MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ must be rejected"
+        );
+
+        // 6. Opt-out (`reuse_cache = false`) and image-lineage guards.
+        let seq_optout = 2u32;
+        inner
+            .prepare_prefix_sync(seq_optout, &prompt[..64], false, salt)
+            .expect("prepare optout");
+        assert!(!inner.can_lead_prefix_coalesce(seq_optout));
+        assert!(!inner.register_shared_prefill_break(seq_optout, 96));
+
+        let seq_img = 3u32;
+        inner
+            .prepare_prefix_sync(seq_img, &prompt[..64], true, salt)
+            .expect("prepare img");
+        assert!(inner.can_lead_prefix_coalesce(seq_img));
+        inner
+            .paged
+            .as_mut()
+            .unwrap()
+            .seq_image_lineage
+            .insert(seq_img, (0x1234, vec![(10, 0xABCD)]));
+        assert!(!inner.can_lead_prefix_coalesce(seq_img));
+        assert!(!inner.register_shared_prefill_break(seq_img, 96));
+        assert_eq!(
+            rt_check_len(&inner, seq_img),
+            0,
+            "image-lineage seq must stay clean"
+        );
+    }
+
+    fn rt_check_len(inner: &crate::models::inkling2::model::Inkling2Inner, seq: u32) -> usize {
+        inner
+            .paged
+            .as_ref()
+            .and_then(|rt| rt.seq_extra_capture_boundaries.get(&seq))
+            .map_or(0, |b| b.union_len())
+    }
+
+    /// C4: `Inkling2Inner::unregister_shared_prefill_break` removes only dynamic `shared`
+    /// boundaries, preserves `structural` breakpoints (without double-charging the 8-cap),
+    /// frees cap slots for subsequent live followers, cleans up empty entries, and suppresses
+    /// `Ordinary + is_prompt_head` capture at orphaned offsets during prefill.
+    #[test]
+    fn inkling2_unregister_shared_prefill_break_frees_cap_suppresses_capture_and_preserves_structural()
+     {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::{HybridSchedulerBackend, ScheduledPrefillPass};
+        use crate::models::inkling2::kv_cache::{Inkling2PagedConfig, default_inkling2_kv_format};
+        use crate::stream::Stream;
+
+        let mut inner = build_synthetic_dflash2_inner_with_window(512, None, 64, 2);
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 512,
+                max_chunk: 256,
+                max_concurrent_sequences: 2,
+                gpu_memory_mb: None,
+            })
+            .expect("enable_paged");
+
+        let seq = 1u32;
+        let salt = 0xC401_u64;
+        let prompt: Vec<u32> = (0u32..192u32).map(|i| 10 + (i % 60)).collect();
+
+        // Install structural breakpoint [65] -> floors to 64.
+        inner.set_seq_prefix_breakpoints(seq, 416, &[65]);
+        inner
+            .prepare_prefix_sync(seq, &prompt, true, salt)
+            .expect("prepare seq");
+
+        // Registering `64` (already in `structural`) succeeds without consuming a second cap slot.
+        assert!(inner.register_shared_prefill_break(seq, 64));
+        assert_eq!(rt_check_len(&inner, seq), 1);
+
+        // Fill remaining 7 cap slots with distinct dynamic boundaries -> union_len == 8.
+        for b in [96u32, 128, 160, 192, 224, 256, 288] {
+            assert!(
+                inner.register_shared_prefill_break(seq, b),
+                "dynamic boundary {b} up to union cap 8 must succeed"
+            );
+        }
+        assert_eq!(
+            rt_check_len(&inner, seq),
+            super::MAX_EXTRA_CAPTURE_BOUNDARIES_PER_SEQ
+        );
+        assert!(
+            !inner.register_shared_prefill_break(seq, 320),
+            "9th distinct boundary must be rejected at union cap 8"
+        );
+
+        // Unregistering `64` (structural) leaves `structural` untouched and union_len == 8.
+        inner.unregister_shared_prefill_break(seq, 64);
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .get(&seq)
+                .is_some_and(|b| b.structural.contains(&64) && b.contains(&64)),
+            "unregister_shared_prefill_break must never remove structural breakpoint 64"
+        );
+        assert_eq!(rt_check_len(&inner, seq), 8);
+        assert!(!inner.register_shared_prefill_break(seq, 320));
+
+        // Unregistering dynamic boundary `96` frees a cap slot so `320` now succeeds!
+        inner.unregister_shared_prefill_break(seq, 96);
+        assert_eq!(rt_check_len(&inner, seq), 7);
+        assert!(
+            inner.register_shared_prefill_break(seq, 320),
+            "freed cap slot must accept live dynamic boundary 320"
+        );
+        assert_eq!(rt_check_len(&inner, seq), 8);
+
+        // Unregister all dynamic boundaries on seq (leaving ONLY structural `64`), then prefill
+        // the 192-token prompt: `64` MUST publish as Ordinary+prompt_head, while orphaned `96`
+        // and `128` MUST NOT publish!
+        for b in [128u32, 160, 192, 224, 256, 288, 320] {
+            inner.unregister_shared_prefill_break(seq, b);
+        }
+        assert_eq!(rt_check_len(&inner, seq), 1);
+        let gen_stream = Stream::generation();
+        let done = inner
+            .run_paged_prefill_pass(seq, &prompt, 0, prompt.len(), salt, true, gen_stream, None)
+            .expect("prefill prompt");
+        assert!(matches!(done, ScheduledPrefillPass::Done(Some(_))));
+        {
+            let rt = inner.paged.as_ref().expect("paged");
+            let mut published: Vec<(usize, bool, bool)> = rt
+                .state_store
+                .store
+                .entries()
+                .map(|e| {
+                    (
+                        e.depth(),
+                        e.checkpoint(),
+                        rt.state_store.is_prompt_head(e.id()),
+                    )
+                })
+                .collect();
+            published.sort_unstable();
+            assert_eq!(
+                published,
+                vec![(64, false, true), (160, false, false)],
+                "preserved structural 64 must capture as Ordinary+head, junction 160 as Ordinary, \
+                 and unregistered dynamic boundaries (96, 128) must NOT capture"
+            );
+        }
+
+        // On a seq with ONLY dynamic boundaries, unregistering the last one removes the map entry.
+        let seq2 = 2u32;
+        inner
+            .prepare_prefix_sync(seq2, &prompt, true, salt + 1)
+            .expect("prepare seq2");
+        assert!(inner.register_shared_prefill_break(seq2, 96));
+        assert!(
+            inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq2)
+        );
+        inner.unregister_shared_prefill_break(seq2, 96);
+        assert!(
+            !inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .seq_extra_capture_boundaries
+                .contains_key(&seq2),
+            "unregistering final dynamic boundary must remove empty map entry"
+        );
+    }
+
+    /// WS4 (Test 1): End-to-end multi-phase simulation
+    /// (`Parent tip -> Recon Turn 1 + sibling -> 26 intermediate Recon turns exceeding ram_cap=4 ->
+    /// SSD flush & RAM/GPU purge -> Verify #1, Verify #2, Synthesize, preamble-diverged query,
+    /// and older Parent tip`) on persistent SSD exercising WS1 + WS2 together.
+    ///
+    /// Confirms:
+    /// - WS2 structural static-prefix breakpoints (`preamble` and `CLAUDE.md + skills`) publish as
+    ///   durable `StateClass::Ordinary` (`is_prompt_head == true`) carrying complete 4-bit
+    ///   `PackedDraftWindow`s.
+    /// - WS1 `note_state_hit` does NOT mark restored `Ordinary` Recon turn anchors as prompt heads,
+    ///   and `trim_ram_to_cap_inner` Priority 2b drops RAM-only superseded Recon intermediates in
+    ///   RAM rather than spilling 25+ dead blobs to SSD.
+    /// - After purging RAM and hot GPU KV, Verify #1, Verify #2, Synthesize, a preamble-only
+    ///   diverged prompt, and the older Parent tip ALL restore from persistent SSD with valid
+    ///   `DraftContextWindow` (keeping DFlash2 speculation ON), zero leaked `in_use` pins, empty
+    ///   `seq_extra_capture_boundaries`, and byte-exact `HostBudgetAccount`.
+    #[test]
+    fn ws4_multi_phase_recon_verify_synthesize_and_parent_tip_ssd_durability() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::disk_tier::{CacheDisk, DiskTierOptions};
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::inkling2::kv_cache::{Inkling2PagedConfig, default_inkling2_kv_format};
+        use crate::models::inkling2::paged_forward::render_inkling2_prompt_with_breakpoints;
+        use crate::models::inkling2::state_disk::{Inkling2StateGeometry, compute_path_identity};
+
+        struct TempDirGuard(std::path::PathBuf);
+        impl Drop for TempDirGuard {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let make_msg = |role: &str, content: String| ChatMessage {
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let clone_msgs = |msgs: &[ChatMessage]| -> Vec<ChatMessage> {
+            msgs.iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: m.tool_call_id.clone(),
+                    is_error: m.is_error,
+                    reasoning_content: m.reasoning_content.clone(),
+                    thinking_enabled: m.thinking_enabled,
+                    images: None,
+                    audio: None,
+                })
+                .collect()
+        };
+        let make_text = |prefix: &str, len: usize, seed: u8| -> String {
+            let mut s = String::with_capacity(len);
+            s.push_str(prefix);
+            let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789 -_";
+            let mut idx = usize::from(seed);
+            while s.len() < len {
+                s.push(alphabet[idx % alphabet.len()] as char);
+                idx = idx.wrapping_mul(31).wrapping_add(7);
+            }
+            s.truncate(len);
+            s
+        };
+
+        let temp_root =
+            std::env::temp_dir().join(format!("inkling2-ws4-multiphase-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("create cache_dir");
+        let _temp_guard = TempDirGuard(temp_root.clone());
+
+        // `draft_sliding_window = 128` strictly exceeds Verify/Synthesize/Parent suffix lengths
+        // (~60..100 tokens), forcing DFlash2 to restore `PackedDraftWindow` from SSD on every hit.
+        let mut inner = build_synthetic_dflash2_inner_with_window(8192, None, 128, 4);
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 8192,
+                max_chunk: 2048,
+                max_concurrent_sequences: 4,
+                gpu_memory_mb: Some(64),
+            })
+            .expect("enable paged with max_chunk=2048");
+
+        let disk_opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(256u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+        let geom = Inkling2StateGeometry::from_coordinator_with_draft(
+            &inner.config,
+            &inner.paged.as_ref().expect("paged").coordinator,
+            inner.dflash2.as_ref().map(|d| &d.config),
+        )
+        .expect("geom");
+        let pid = compute_path_identity(
+            &temp_root,
+            &inner.config,
+            &inner.paged.as_ref().expect("paged").coordinator,
+            &geom,
+            Some(1024),
+            Some(b"ws4-multiphase-v1"),
+        );
+        assert!(
+            inner.attach_state_disk(&disk_opts, move || pid).is_some(),
+            "persistent StateDisk must attach"
+        );
+
+        let local_limit = Arc::new(CacheLimitCoordinator::new_for_test());
+        {
+            let rt = inner.paged.as_mut().expect("paged");
+            rt.state_store
+                .attach_host_budget_to(Arc::clone(&local_limit));
+            rt.state_store.set_ram_cap(4);
+        }
+
+        let tok = inner.tokenizer.clone().expect("tokenizer");
+        let salt = "salt-ws4-multiphase";
+        let shared_sys = make_text("SYSTEM_PREAMBLE: ", 2120, 1);
+        let shared_claude_md = make_text("CLAUDE_MD_RULES: ", 1100, 2);
+        let shared_skills = make_text("SKILLS_CATALOG: ", 1120, 3);
+
+        let make_subagent_msgs = |task: &str| {
+            vec![
+                make_msg("system", shared_sys.clone()),
+                make_msg("user", shared_claude_md.clone()),
+                make_msg("user", shared_skills.clone()),
+                make_msg("user", task.to_string()),
+            ]
+        };
+
+        // Pre-verify WS2 emits BOTH structural breakpoints `[preamble_end, skills_end]` >= 2048.
+        let recon_t1_msgs = make_subagent_msgs(
+            "Recon phase 1 task: inspect Inkling2 prefix cache architecture and invariants.",
+        );
+        let (r1_ids, r1_raw_breaks) =
+            render_inkling2_prompt_with_breakpoints(&tok, &recon_t1_msgs, None, None, Some("none"))
+                .expect("render recon t1 with breakpoints");
+        assert_eq!(
+            r1_raw_breaks.len(),
+            2,
+            "expected [preamble_end, skills_end] structural breakpoints, got {r1_raw_breaks:?}"
+        );
+        let bs = 32u32;
+        let preamble_aligned = (r1_raw_breaks[0] / bs) * bs;
+        let skills_aligned = (r1_raw_breaks[1] / bs) * bs;
+        assert!(preamble_aligned >= 2048);
+        assert!(skills_aligned >= preamble_aligned + 2048);
+        assert!((skills_aligned as usize) < r1_ids.len());
+
+        let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+
+        let assert_host_budget_exact = |sched: &Inkling2SchedulerState, ctx: &str| {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert_eq!(
+                local_limit.registered_pool_bytes(),
+                rt.state_store.host_resident_bytes(),
+                "HostBudgetAccount mismatch at {ctx}"
+            );
+        };
+
+        // Phase 0: Older Parent orchestrator conversation tip (distinct prefix, same salt).
+        let parent_sys = make_text("PARENT_ORCHESTRATOR_SYS: ", 64, 11);
+        let parent_u1 = make_text(
+            "Parent task: coordinate recon, verify, synthesize. ",
+            72,
+            12,
+        );
+        let parent_msgs = vec![
+            make_msg("system", parent_sys.clone()),
+            make_msg("user", parent_u1.clone()),
+        ];
+        let (parent_ids, _) =
+            render_inkling2_prompt_with_breakpoints(&tok, &parent_msgs, None, None, Some("none"))
+                .expect("render parent");
+        // Pad parent prompt so `parent_ids.len() % 32` stays safely below 20 (`+ 6` decode tokens
+        // never crosses the next block boundary with un-reproducible synthetic generated tokens).
+        let pad_parent = (12usize + 32 - (parent_ids.len() % 32)) % 32;
+        let parent_u1 = format!("{parent_u1}{}", "p".repeat(pad_parent));
+        let parent_msgs = vec![make_msg("system", parent_sys), make_msg("user", parent_u1)];
+        let (parent_ids, _) =
+            render_inkling2_prompt_with_breakpoints(&tok, &parent_msgs, None, None, Some("none"))
+                .expect("render padded parent");
+        let parent_tip_depth = ((parent_ids.len() - 1) / 32) * 32;
+        assert!(parent_tip_depth >= 96);
+
+        let res_parent = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            clone_msgs(&parent_msgs),
+            scheduled_greedy_dflash2_config("parent-orch", 6, salt),
+        )
+        .expect("Parent Turn 1");
+        assert_eq!(res_parent.cached_tokens, 0);
+        let parent_seq = *sched
+            .owner_sequences
+            .get("parent-orch")
+            .expect("parent seq");
+        let parent_tip_id = {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            let entry = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == parent_tip_depth)
+                .expect("parent tip anchor");
+            assert!(!entry.checkpoint());
+            assert!(!rt.state_store.is_prompt_head(entry.id()));
+            entry.id()
+        };
+        sched
+            .inner
+            .release_scheduled_cache(parent_seq)
+            .expect("release parent live cache");
+        assert_host_budget_exact(&sched, "after parent turn");
+
+        // Phase 1a: Recon Turn 1 starts cold and captures BOTH structural heads (`preamble_aligned`,
+        // `skills_aligned`) as `StateClass::Ordinary` + `is_prompt_head == true` with complete
+        // `PackedDraftWindow`s.
+        let mut recon_msgs = recon_t1_msgs;
+        // Align `recon_t1` length modulo 32 to 12 so `max_new_tokens = 6` stays inside the
+        // trailing partial block and every subsequent turn linearly supersedes the previous tip.
+        let pad_r1 = (12usize + 32 - (r1_ids.len() % 32)) % 32;
+        if let Some(last) = recon_msgs.last_mut() {
+            last.content.push_str(&"r".repeat(pad_r1));
+        }
+        let res_r1 = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            clone_msgs(&recon_msgs),
+            scheduled_greedy_dflash2_config("recon-main", 6, salt),
+        )
+        .expect("Recon Turn 1");
+        assert_eq!(res_r1.cached_tokens, 0);
+        assert_host_budget_exact(&sched, "after recon turn 1");
+
+        let (preamble_head_id, skills_head_id) = {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            let pre = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == preamble_aligned as usize)
+                .expect("preamble structural head");
+            let skl = rt
+                .state_store
+                .store
+                .entries()
+                .find(|e| e.depth() == skills_aligned as usize)
+                .expect("skills structural head");
+            for (name, e, depth) in [
+                ("preamble", pre, preamble_aligned),
+                ("skills", skl, skills_aligned),
+            ] {
+                assert!(
+                    !e.checkpoint(),
+                    "{name} structural head must publish as StateClass::Ordinary"
+                );
+                assert!(
+                    rt.state_store.is_prompt_head(e.id()),
+                    "{name} structural head must be marked in prompt_heads"
+                );
+                if let Some(ram) = e.ram() {
+                    assert!(
+                        ram.draft_window
+                            .as_ref()
+                            .is_some_and(|w| w.is_complete_for(depth)),
+                        "{name} structural head must carry a complete 4-bit PackedDraftWindow"
+                    );
+                } else {
+                    assert!(
+                        !rt.state_store.entry_missing_draft_window(e.id()),
+                        "{name} structural head spilled without missing draft window"
+                    );
+                }
+            }
+            (pre.id(), skl.id())
+        };
+
+        // Run one sibling Recon branch off `skills_aligned` so 5 non-superseded/head entries exist
+        // (`parent_tip`, `preamble_head`, `skills_head`, `recon-sibling`, `recon-main`), ensuring
+        // `ram_cap = 4` actively drives BOTH Priority 2b and Priority 3 during Recon turns.
+        let sib_msgs = make_subagent_msgs("Recon sibling probe: inspect state_disk module.");
+        let res_sib = send_session_start(
+            &mut sched,
+            &tx,
+            &mut rx,
+            sib_msgs,
+            scheduled_greedy_dflash2_config("recon-sibling", 6, salt),
+        )
+        .expect("Recon sibling turn");
+        assert_eq!(
+            res_sib.cached_tokens, skills_aligned,
+            "Recon sibling must hit WS2 structural skills head"
+        );
+        let sib_seq = *sched
+            .owner_sequences
+            .get("recon-sibling")
+            .expect("sibling seq");
+        sched
+            .inner
+            .release_scheduled_cache(sib_seq)
+            .expect("release sibling live cache");
+        assert_host_budget_exact(&sched, "after recon sibling");
+
+        // Phase 1b: 26 intermediate Recon turns exceeding `ram_cap = 4` (26 additional `Ordinary`
+        // captures along the linear Recon chain, each restoring the prior `Ordinary` turn anchor
+        // via `note_state_hit`!).
+        let mut prev_recon_depth = {
+            let (ids, _) = render_inkling2_prompt_with_breakpoints(
+                &tok,
+                &recon_msgs,
+                None,
+                None,
+                Some("none"),
+            )
+            .expect("render r1");
+            ((ids.len() - 1) / 32) * 32
+        };
+        for turn_idx in 1usize..=26 {
+            recon_msgs.push(make_msg(
+                "assistant",
+                format!("Recon finding {turn_idx:02}: inspected subsystem."),
+            ));
+            let base_user = format!(
+                "Recon step {turn_idx:02}: continue examining cache paths and state eviction."
+            );
+            recon_msgs.push(make_msg("user", base_user));
+            let (cur_ids, _) = render_inkling2_prompt_with_breakpoints(
+                &tok,
+                &recon_msgs,
+                None,
+                None,
+                Some("none"),
+            )
+            .expect("render recon step");
+            let pad = (12usize + 32 - (cur_ids.len() % 32)) % 32;
+            if let Some(last) = recon_msgs.last_mut() {
+                last.content.push_str(&"x".repeat(pad));
+            }
+            let (padded_ids, _) = render_inkling2_prompt_with_breakpoints(
+                &tok,
+                &recon_msgs,
+                None,
+                None,
+                Some("none"),
+            )
+            .expect("render padded recon step");
+            let expected_depth = ((padded_ids.len() - 1) / 32) * 32;
+            assert!(expected_depth > prev_recon_depth);
+
+            let res_step = send_session_start(
+                &mut sched,
+                &tx,
+                &mut rx,
+                clone_msgs(&recon_msgs),
+                scheduled_greedy_dflash2_config("recon-main", 6, salt),
+            )
+            .expect("Recon follow-up turn");
+            assert_eq!(
+                res_step.cached_tokens as usize, prev_recon_depth,
+                "Recon step {turn_idx} must hit prior turn anchor {prev_recon_depth}"
+            );
+            prev_recon_depth = expected_depth;
+
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert!(
+                rt.state_store.ram_len() <= 6,
+                "ram_len must remain bounded at ram_cap(4)+2 slack at turn {turn_idx}, got {}",
+                rt.state_store.ram_len()
+            );
+            assert_host_budget_exact(&sched, &format!("recon turn {turn_idx}"));
+        }
+
+        // Release Recon live cache, flush queued write-behind to persistent SSD, and verify:
+        // (1) Priority 2b prevented 26-turn SSD blob bloat;
+        // (2) Both structural heads (`preamble_head_id`, `skills_head_id`) and `parent_tip_id`
+        //     are durably SSD-restorable with valid `PackedDraftWindow`s.
+        let recon_seq = *sched.owner_sequences.get("recon-main").expect("recon seq");
+        sched
+            .inner
+            .release_scheduled_cache(recon_seq)
+            .expect("release recon live cache");
+        {
+            let rt = sched.inner.paged.as_mut().expect("paged");
+            assert!(
+                rt.state_store
+                    .flush_to_disk(&rt.coordinator, Instant::now() + Duration::from_secs(20)),
+                "persistent StateDisk flush_to_disk must complete"
+            );
+            assert!(
+                rt.state_store.ram_len() <= 4,
+                "ram_len after flush must be <= ram_cap=4, got {}",
+                rt.state_store.ram_len()
+            );
+            let offloads = rt.state_store.disk_counters().offloads;
+            assert!(
+                offloads <= 8,
+                "Priority 2b must prevent 26-turn SSD blob bloat (expected <= 8 offloads for \
+                 2 structural heads + parent + sibling + final recon tip, got {offloads})"
+            );
+            let disk = rt.state_store.disk.as_ref().expect("disk");
+            for (name, id) in [
+                ("preamble_head", preamble_head_id),
+                ("skills_head", skills_head_id),
+                ("parent_tip", parent_tip_id),
+            ] {
+                let entry = rt
+                    .state_store
+                    .store
+                    .get(id)
+                    .unwrap_or_else(|| panic!("{name} entry must survive 26 Recon turns"));
+                assert!(
+                    disk.entry_disk_restorable(entry),
+                    "{name} must be durably SSD-restorable"
+                );
+                assert!(
+                    !rt.state_store.entry_missing_draft_window(id),
+                    "{name} SSD blob must include complete 4-bit PackedDraftWindow"
+                );
+            }
+            assert!(rt.state_store.is_prompt_head(preamble_head_id));
+            assert!(rt.state_store.is_prompt_head(skills_head_id));
+            assert!(
+                !rt.state_store.is_prompt_head(parent_tip_id),
+                "non-head parent tip must remain non-head while surviving on SSD"
+            );
+        }
+        assert_host_budget_exact(&sched, "after flush_to_disk");
+
+        // Helper simulating 12+ minutes of RAM/GPU eviction so every Phase 2/3/Parent turn MUST
+        // restore directly from persistent SSD (async `WaitingForSsd` -> `land_parked_restore_impl`).
+        let purge_ram_and_hot_kv = |sched: &mut Inkling2SchedulerState| {
+            let live_seqs: Vec<u32> = sched.owner_sequences.values().copied().collect();
+            for seq in live_seqs {
+                let _ = sched.inner.release_scheduled_cache(seq);
+            }
+            let rt = sched.inner.paged.as_mut().expect("paged");
+            rt.state_store.drop_all_ram_keeping_disk();
+            rt.state_store.sync_marks(&rt.coordinator);
+            rt.coordinator
+                .evict_all_hot_blocks_without_suppress()
+                .expect("evict hot GPU KV");
+            rt.conv_states.clear();
+            rt.block_boundary_conv.clear();
+            rt.draft_windows.clear();
+            rt.block_boundary_draft_window.clear();
+            sched.inner.dspark_turn_contexts.clear();
+        };
+
+        // Phase 2 & 3: Verify #1, Verify #2, Synthesize, preamble-diverged subagent, and older
+        // Parent tip ALL hit persistent SSD with valid `DraftContextWindow` (DFlash2 ON)!
+        let mut parent_followup_msgs = parent_msgs;
+        parent_followup_msgs.push(make_msg(
+            "user",
+            "Parent follow-up: summarize all verification results.".to_string(),
+        ));
+        let preamble_only_msgs = vec![
+            make_msg("system", shared_sys.clone()),
+            make_msg(
+                "user",
+                "Different CLAUDE.md/task diverging immediately after system preamble.".to_string(),
+            ),
+        ];
+
+        let ssd_cases: [(&str, Vec<ChatMessage>, u32); 5] = [
+            (
+                "verify-1",
+                make_subagent_msgs("Verify #1: audit Gap 1 state store durability and pinning."),
+                skills_aligned,
+            ),
+            (
+                "verify-2",
+                make_subagent_msgs("Verify #2: audit Gap 2 structural prefix breakpoints."),
+                skills_aligned,
+            ),
+            (
+                "synthesize",
+                make_subagent_msgs("Synthesize: combine Recon and Verify reports into final plan."),
+                skills_aligned,
+            ),
+            ("preamble-diverged", preamble_only_msgs, preamble_aligned),
+            (
+                "parent-resume",
+                parent_followup_msgs,
+                parent_tip_depth as u32,
+            ),
+        ];
+
+        for (owner, msgs, expected_cached) in ssd_cases {
+            purge_ram_and_hot_kv(&mut sched);
+            assert_host_budget_exact(&sched, &format!("before {owner} SSD restore"));
+            let (ssd_hits_before, waves_before) = (
+                sched
+                    .inner
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .state_store
+                    .disk_counters()
+                    .ssd_hits,
+                sched.inner.scheduled_dspark.total_verify_waves,
+            );
+            let res = send_session_start(
+                &mut sched,
+                &tx,
+                &mut rx,
+                msgs,
+                scheduled_greedy_dflash2_config(owner, 10, salt),
+            )
+            .unwrap_or_else(|e| panic!("{owner} SSD restore turn failed: {e}"));
+            assert_eq!(
+                res.cached_tokens, expected_cached,
+                "{owner} must hit durable SSD anchor at depth {expected_cached}, got {}",
+                res.cached_tokens
+            );
+            assert_eq!(res.num_tokens, 10);
+            let ssd_hits_after = sched
+                .inner
+                .paged
+                .as_ref()
+                .unwrap()
+                .state_store
+                .disk_counters()
+                .ssd_hits;
+            assert!(
+                ssd_hits_after > ssd_hits_before,
+                "{owner} must load StateDisk blob from SSD (ssd_hits stayed {ssd_hits_before})"
+            );
+            assert!(
+                sched.inner.scheduled_dspark.total_verify_waves > waves_before,
+                "{owner} must restore valid DraftContextWindow from SSD and keep DFlash2 ON"
+            );
+            assert_host_budget_exact(&sched, &format!("after {owner} SSD restore"));
+        }
+
+        // Final hygiene audit: zero leaked `in_use` pins, empty `seq_extra_capture_boundaries`,
+        // exact `HostBudgetAccount`.
+        purge_ram_and_hot_kv(&mut sched);
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert!(
+                !rt.state_store
+                    .store
+                    .entries()
+                    .any(|e| rt.state_store.store.in_use(e.mark())),
+                "zero leaked use_state pins after multi-phase workflow"
+            );
+            assert!(
+                rt.seq_extra_capture_boundaries.is_empty(),
+                "zero leaked seq_extra_capture_boundaries after multi-phase workflow"
+            );
+        }
+        assert_host_budget_exact(&sched, "final audit");
+        let _ = sched
+            .inner
+            .close_state_disk(Instant::now() + Duration::from_secs(5));
+    }
+
+    /// WS4 (Test 2): End-to-end 4-way concurrent cold-start `HybridSchedulerState<Inkling2Inner>`
+    /// coalescing integration test exercising WS1 + WS2 + WS3 together (`max_num_seqs = 4`, real
+    /// `>= 2048`-token prompts using the production `2048` coalescing and structural thresholds).
+    ///
+    /// Confirms:
+    /// - 4 simultaneous cold subagents arriving in SJF worst-case descending length order coalesce
+    ///   onto 1 leader (`sched.held.len() == 3`, zero duplicate cold prefill).
+    /// - Leader prefills to BOTH WS2's structural breakpoint (`preamble_aligned`) AND WS3's aligned
+    ///   shared LCP (`shared_lcp_aligned`), publishing both as `StateClass::Ordinary`
+    ///   (`is_prompt_head == true`) with complete 4-bit `PackedDraftWindow`s.
+    /// - All 3 held followers wake on publication, restore `cached_tokens == shared_lcp_aligned`,
+    ///   keep DFlash2 speculation ON (`suffix_len < draft_sliding_window = 128`), match their cold
+    ///   greedy serial baselines byte-for-byte (proving exact KV + ShortConv + `DraftContextWindow`
+    ///   restoration), leak zero `in_use` pins / extra breaks, and maintain byte-exact
+    ///   `HostBudgetAccount`.
+    #[test]
+    fn ws4_four_way_concurrent_cold_start_coalescing_restores_exact_state_and_host_budget() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::cache_limit::CacheLimitCoordinator;
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::models::inkling2::kv_cache::{Inkling2PagedConfig, default_inkling2_kv_format};
+        use crate::models::inkling2::paged_forward::render_inkling2_prompt_with_breakpoints;
+
+        let make_msg = |role: &str, content: String| ChatMessage {
+            role: role.to_string(),
+            content,
+            tool_calls: None,
+            tool_call_id: None,
+            is_error: None,
+            reasoning_content: None,
+            thinking_enabled: None,
+            images: None,
+            audio: None,
+        };
+        let clone_msgs = |msgs: &[ChatMessage]| -> Vec<ChatMessage> {
+            msgs.iter()
+                .map(|m| ChatMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                    tool_calls: None,
+                    tool_call_id: m.tool_call_id.clone(),
+                    is_error: m.is_error,
+                    reasoning_content: m.reasoning_content.clone(),
+                    thinking_enabled: m.thinking_enabled,
+                    images: None,
+                    audio: None,
+                })
+                .collect()
+        };
+        let make_text = |prefix: &str, len: usize, seed: u8| -> String {
+            let mut s = String::with_capacity(len);
+            s.push_str(prefix);
+            let alphabet = b"abcdefghijklmnopqrstuvwxyz0123456789 -_";
+            let mut idx = usize::from(seed);
+            while s.len() < len {
+                s.push(alphabet[idx % alphabet.len()] as char);
+                idx = idx.wrapping_mul(31).wrapping_add(7);
+            }
+            s.truncate(len);
+            s
+        };
+
+        // `draft_sliding_window = 128` > all 4 suffixes (~50..108 tokens past `shared_lcp_aligned`)
+        // so coalesced followers MUST restore `DraftContextWindow` from the leader's captured
+        // 4-bit `PackedDraftWindow`.
+        let mut inner = build_synthetic_dflash2_inner_with_window(4096, None, 128, 4);
+        inner
+            .enable_paged(Inkling2PagedConfig {
+                kv_format: default_inkling2_kv_format(),
+                block_size: 32,
+                max_model_len: 4096,
+                max_chunk: 2048,
+                max_concurrent_sequences: 4,
+                gpu_memory_mb: Some(64),
+            })
+            .expect("enable paged max_chunk=2048, max_num_seqs=4");
+
+        let local_limit = Arc::new(CacheLimitCoordinator::new_for_test());
+        inner
+            .paged
+            .as_mut()
+            .expect("paged")
+            .state_store
+            .attach_host_budget_to(Arc::clone(&local_limit));
+
+        let tok = inner.tokenizer.clone().expect("tokenizer");
+        // Shared prefix >= 2,048 tokens (using real production `INKLING2_PREFIX_COALESCE_MIN_TOKENS`
+        // and `MIN_STRUCTURAL_PREFIX_BREAKPOINT_TOKENS`, NO test threshold overrides!):
+        // - `system` (~2120) + `CLAUDE.md` (320) + `skills` (320) -> WS2 deduplicates `bp2 - bp1 < 2048`
+        //   to `bp1` (`preamble_end`, ~2120, placed before the effort block)
+        // - + 64-token shared header inside the final task user message -> WS3 LCP (~2844 -> aligned 2816)
+        // - + unique descending-length subagent task suffixes (SJF worst case).
+        let shared_sys = make_text("COALESCE_SYSTEM_PROMPT: ", 2120, 21);
+        let shared_claude_md = make_text("COALESCE_CLAUDE_MD: ", 320, 22);
+        let shared_skills = make_text("COALESCE_SKILLS: ", 320, 23);
+        let shared_header = make_text("SHARED_TASK_HEADER: ", 64, 24);
+
+        let subagent_tasks = [
+            format!("{shared_header}Subagent-0: {}", "a".repeat(88)),
+            format!("{shared_header}Subagent-1: {}", "b".repeat(72)),
+            format!("{shared_header}Subagent-2: {}", "c".repeat(56)),
+            format!("{shared_header}Subagent-3: {}", "d".repeat(40)),
+        ];
+        let subagent_msgs: Vec<Vec<ChatMessage>> = subagent_tasks
+            .iter()
+            .map(|task| {
+                vec![
+                    make_msg("system", shared_sys.clone()),
+                    make_msg("user", shared_claude_md.clone()),
+                    make_msg("user", shared_skills.clone()),
+                    make_msg("user", task.clone()),
+                ]
+            })
+            .collect();
+
+        // Compute exact expected WS2 structural breakpoint (`preamble_aligned`) and WS3 block-aligned
+        // LCP (`shared_lcp_aligned`) from rendered token IDs.
+        let rendered: Vec<(Vec<u32>, Vec<u32>)> = subagent_msgs
+            .iter()
+            .map(|m| {
+                render_inkling2_prompt_with_breakpoints(&tok, m, None, None, Some("none"))
+                    .expect("render subagent prompt")
+            })
+            .collect();
+        let bs = 32u32;
+        assert_eq!(
+            rendered[0].1.len(),
+            1,
+            "close preamble & skills offsets must deduplicate to preamble_end (bp1), got {:?}",
+            rendered[0].1
+        );
+        let preamble_aligned = (rendered[0].1[0] / bs) * bs;
+        let mut lcp = rendered[0].0.len();
+        for (ids, _) in &rendered[1..] {
+            lcp = lcp.min(
+                rendered[0]
+                    .0
+                    .iter()
+                    .zip(ids.iter())
+                    .take_while(|(a, b)| a == b)
+                    .count(),
+            );
+        }
+        let min_prompt_len = rendered.iter().map(|(ids, _)| ids.len()).min().unwrap();
+        let shared_lcp_aligned = ((lcp.min(min_prompt_len - 1) as u32) / bs) * bs;
+        assert!(
+            shared_lcp_aligned > preamble_aligned,
+            "shared header must push LCP ({shared_lcp_aligned}) strictly past structural preamble ({preamble_aligned})"
+        );
+        assert!(
+            shared_lcp_aligned >= super::INKLING2_PREFIX_COALESCE_MIN_TOKENS,
+            "shared LCP ({shared_lcp_aligned}) must exceed production 2048 coalescing threshold"
+        );
+        for (idx, (ids, _)) in rendered.iter().enumerate() {
+            let suffix = ids.len() - shared_lcp_aligned as usize;
+            assert!(
+                suffix < 128,
+                "subagent {idx} suffix ({suffix}) must stay < draft_sliding_window (128) to require DraftContextWindow restore"
+            );
+        }
+        // Confirm descending lengths (SJF worst case).
+        for w in rendered.windows(2) {
+            assert!(w[0].0.len() > w[1].0.len());
+        }
+
+        let mut sched = Inkling2SchedulerState::new(inner).expect("scheduler");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Inkling2Cmd>();
+        let salt = "salt-ws4-coalesce";
+        let max_new = 12;
+
+        // 1. Cold greedy serial baselines for exact KV + ShortConv + DraftContextWindow parity.
+        let mut baselines = Vec::with_capacity(4);
+        for (idx, msgs) in subagent_msgs.iter().enumerate() {
+            send_reset_caches(&mut sched, &tx, &mut rx);
+            let res = send_session_start(
+                &mut sched,
+                &tx,
+                &mut rx,
+                clone_msgs(msgs),
+                scheduled_greedy_dflash2_config(&format!("baseline-{idx}"), max_new, salt),
+            )
+            .expect("cold baseline turn");
+            assert_eq!(res.cached_tokens, 0);
+            assert_eq!(res.num_tokens, max_new as u32);
+            baselines.push(res);
+        }
+
+        // Reset caches completely cold before 4-way concurrent cold-start submission.
+        send_reset_caches(&mut sched, &tx, &mut rx);
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert_eq!(rt.state_store.ram_len(), 0);
+            assert_eq!(local_limit.registered_pool_bytes(), 0);
+            assert_eq!(rt.state_store.host_resident_bytes(), 0);
+        }
+        let waves_before = sched.inner.scheduled_dspark.total_verify_waves;
+        let ram_hits_before = sched
+            .inner
+            .paged
+            .as_ref()
+            .unwrap()
+            .state_store
+            .disk_counters()
+            .ram_hits;
+
+        // 2. Submit all 4 cold subagents simultaneously into `HybridSchedulerState<Inkling2Inner>`.
+        let mut reply_rxs = Vec::with_capacity(4);
+        for (idx, msgs) in subagent_msgs.iter().enumerate() {
+            let (reply, done_rx) = tokio::sync::oneshot::channel();
+            tx.send(Inkling2Cmd::Chat(Box::new(ChatCmd::SessionStart {
+                messages: clone_msgs(msgs),
+                config: scheduled_greedy_dflash2_config(&format!("subagent-{idx}"), max_new, salt),
+                reply,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            })))
+            .expect("send concurrent SessionStart");
+            reply_rxs.push(Some(done_rx));
+        }
+
+        // Drive pass 1: Leader (`subagent-0`) admits and runs its first `Measured` unit
+        // (`PREFILL_CHUNK_ROWS = 2048 < shared_lcp_aligned`), while Followers 1, 2, 3 coalesce
+        // into `sched.held` holding zero lanes / KV blocks!
+        let _ = sched.drive(&mut rx);
+        let leader_seq = *sched
+            .owner_sequences
+            .get("subagent-0")
+            .expect("leader subagent-0 seq");
+        assert_eq!(
+            sched.active_turn_count(),
+            1,
+            "only 1 leader lane may be admitted while 3 followers coalesce"
+        );
+        assert_eq!(
+            sched.held_len(),
+            3,
+            "all 3 concurrent cold followers must coalesce in sched.held"
+        );
+        for (_seq, coalesce, overtaken) in sched.held_coalesce_states() {
+            let (c_leader, c_target) =
+                coalesce.expect("held follower must carry PrefixCoalesce state");
+            assert_eq!(c_leader, leader_seq);
+            assert_eq!(c_target, shared_lcp_aligned);
+            assert_eq!(overtaken, 0);
+        }
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            let leader_breaks = rt
+                .seq_extra_capture_boundaries
+                .get(&leader_seq)
+                .expect("leader must have extra capture boundaries installed");
+            assert!(
+                leader_breaks.contains(&preamble_aligned),
+                "leader must retain WS2 structural breakpoint {preamble_aligned}, got {leader_breaks:?}"
+            );
+            assert!(
+                leader_breaks.contains(&shared_lcp_aligned),
+                "leader must register WS3 shared LCP breakpoint {shared_lcp_aligned}, got {leader_breaks:?}"
+            );
+            assert_eq!(
+                local_limit.registered_pool_bytes(),
+                rt.state_store.host_resident_bytes(),
+                "HostBudgetAccount must stay exact after pass 1"
+            );
+        }
+
+        // 3. Drive to completion, checking byte-exact `HostBudgetAccount` on every pass.
+        let mut results: Vec<Option<ChatResult>> = vec![None; 4];
+        let mut max_concurrent_after_wake = 1usize;
+        for step_idx in 0..512 {
+            let _ = sched.drive(&mut rx);
+            let active = sched.active_turn_count();
+            max_concurrent_after_wake = max_concurrent_after_wake.max(active);
+            {
+                let rt = sched.inner.paged.as_ref().expect("paged");
+                assert_eq!(
+                    local_limit.registered_pool_bytes(),
+                    rt.state_store.host_resident_bytes(),
+                    "HostBudgetAccount diverged on pass {step_idx}"
+                );
+            }
+            for (idx, slot) in reply_rxs.iter_mut().enumerate() {
+                if let Some(done_rx) = slot
+                    && let Ok(res) = done_rx.try_recv()
+                {
+                    results[idx] = Some(res.unwrap_or_else(|e| {
+                        panic!("subagent-{idx} failed during concurrent coalesced run: {e}")
+                    }));
+                    *slot = None;
+                }
+            }
+            if results.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        let results: Vec<ChatResult> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| r.unwrap_or_else(|| panic!("subagent-{i} did not finish")))
+            .collect();
+
+        assert!(
+            max_concurrent_after_wake >= 2,
+            "woken followers must execute concurrently after leader publishes shared prefix"
+        );
+
+        // 4. Verify zero duplicate cold prefill + exact greedy output parity across all 4 subagents.
+        assert_eq!(
+            results[0].cached_tokens, 0,
+            "leader subagent-0 must prefill cold from 0"
+        );
+        for (idx, res) in results.iter().enumerate().skip(1) {
+            assert_eq!(
+                res.cached_tokens, shared_lcp_aligned,
+                "coalesced follower subagent-{idx} must restore exact shared LCP {shared_lcp_aligned}, got {}",
+                res.cached_tokens
+            );
+        }
+        for idx in 0..4 {
+            assert_eq!(
+                results[idx].num_tokens, baselines[idx].num_tokens,
+                "subagent-{idx} token count diverged from cold baseline"
+            );
+            assert_eq!(
+                results[idx].raw_text, baselines[idx].raw_text,
+                "subagent-{idx} greedy output diverged from cold baseline (KV/ShortConv/DraftContextWindow mismatch)"
+            );
+        }
+
+        // Verify StateStore hits, prompt_heads + PackedDraftWindow captures, DFlash2 speculation,
+        // zero leaked pins, and exact `HostBudgetAccount` both before and after sequence release.
+        assert!(
+            sched.inner.scheduled_dspark.total_verify_waves > waves_before,
+            "leader and coalesced followers must run scheduled DFlash2 verify waves"
+        );
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert!(
+                rt.state_store.disk_counters().ram_hits >= ram_hits_before + 3,
+                "all 3 coalesced followers must hit StateStore (ram_hits before={ram_hits_before}, after={})",
+                rt.state_store.disk_counters().ram_hits
+            );
+            for (name, depth) in [
+                ("WS2 structural preamble", preamble_aligned),
+                ("WS3 shared LCP", shared_lcp_aligned),
+            ] {
+                let entry = rt
+                    .state_store
+                    .store
+                    .entries()
+                    .find(|e| e.depth() == depth as usize)
+                    .unwrap_or_else(|| panic!("{name} anchor at depth {depth} must exist"));
+                assert!(!entry.checkpoint(), "{name} anchor must be Ordinary");
+                assert!(
+                    rt.state_store.is_prompt_head(entry.id()),
+                    "{name} anchor must be marked in prompt_heads"
+                );
+                assert!(
+                    entry
+                        .ram()
+                        .and_then(|r| r.draft_window.as_ref())
+                        .is_some_and(|w| w.is_complete_for(depth)),
+                    "{name} anchor must carry a complete 4-bit PackedDraftWindow"
+                );
+            }
+            assert!(
+                !rt.state_store
+                    .store
+                    .entries()
+                    .any(|e| rt.state_store.store.in_use(e.mark())),
+                "zero leaked use_state pins after 4-way coalesced run"
+            );
+            assert!(
+                rt.seq_extra_capture_boundaries.is_empty(),
+                "zero leaked seq_extra_capture_boundaries after 4-way coalesced run"
+            );
+            assert_eq!(
+                local_limit.registered_pool_bytes(),
+                rt.state_store.host_resident_bytes()
+            );
+        }
+
+        let live_seqs: Vec<u32> = sched.owner_sequences.values().copied().collect();
+        for seq in live_seqs {
+            sched
+                .inner
+                .release_scheduled_cache(seq)
+                .expect("release subagent seq");
+        }
+        {
+            let rt = sched.inner.paged.as_ref().expect("paged");
+            assert_eq!(
+                local_limit.registered_pool_bytes(),
+                rt.state_store.host_resident_bytes(),
+                "HostBudgetAccount must stay byte-exact after releasing all 4 sequences"
+            );
         }
     }
 }
