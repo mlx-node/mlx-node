@@ -1287,17 +1287,16 @@ enum InFlightDiskUpgradeKind {
 }
 
 /// Active in-place SSD upgrade or label-promotion write: retains the previous durable `DiskCopy`
-/// alongside a `ColdKeyHold` pinning both `old_copy.key` and its entire Global KV chain against
-/// LRU eviction by competing writes until the replacement lands or rolls back.
+/// for rollback if the replacement write fails before landing.
 ///
-/// For `LabelPromote`, ownership of the `ColdKeyHold` lives on [`PendingRelabel`] instead so
-/// `clear_ram_and_checkpoints()` does not release the eviction hold while the off-thread relabel
-/// is still queued or running on the writer thread.
+/// Ownership of the [`ColdKeyHold`] pinning `old_copy.key` and its entire Global KV chain lives on
+/// [`PendingRelabel`] (for `LabelPromote`) or [`StateDiskEngine`] (for `InPlace`) so
+/// [`Inkling2StateStore::clear_ram_and_checkpoints`] does not release the eviction hold while the
+/// replacement write is still queued or running on the writer thread.
 struct InFlightDiskUpgrade {
     id: EntryId,
     kind: InFlightDiskUpgradeKind,
     old_copy: DiskCopy,
-    _fallback_hold: Option<ColdKeyHold>,
 }
 
 /// Target coordinator charging Inkling2's host-heap state store into
@@ -2227,7 +2226,6 @@ impl Inkling2StateStore {
             id,
             kind,
             mut old_copy,
-            _fallback_hold,
         } = self.in_flight_disk_upgrade.take()?;
         if let Some(disk) = self.disk.as_mut()
             && disk.preserve_entry_on_state_failure == Some(id)
@@ -2359,24 +2357,12 @@ impl Inkling2StateStore {
 
     #[cfg(test)]
     fn set_in_flight_upgrade_for_test(&mut self, id: EntryId, old_copy: DiskCopy) {
-        let disk = self
-            .disk
-            .as_ref()
-            .expect("set_in_flight_upgrade_for_test requires attached disk");
-        let entry = self
-            .store
-            .get(id)
-            .expect("set_in_flight_upgrade_for_test requires existing entry");
-        let mut keys = disk.engine.kv_chain_keys(entry);
-        keys.push(old_copy.key);
-        let fallback_hold = disk.tier.manager.hold_keys(keys);
         self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
             id,
             kind: InFlightDiskUpgradeKind::InPlace {
                 promote_label: false,
             },
             old_copy,
-            _fallback_hold: Some(fallback_hold),
         });
     }
 
@@ -3736,10 +3722,11 @@ impl Inkling2StateStore {
         // Acquire a `ColdKeyHold` pinning `old_copy.key` and its entire Global KV chain BEFORE
         // checking presence so a competing writer job cannot evict the SSD fallback after our
         // pre-check passes. The hold is dropped automatically on any early return / refusal and
-        // moved onto `PendingRelabel` (for `LabelPromote`) or `in_flight_disk_upgrade` (for
-        // `InPlace`) once staging starts.
-        let mut upgrade_in_place: Option<(DiskCopy, Option<ColdKeyHold>, InFlightDiskUpgradeKind)> =
-            None;
+        // moved onto `PendingRelabel` (for `LabelPromote`) or `StateDiskEngine`'s pending
+        // replacement slot (for `InPlace`) once staging starts so `clear_ram_and_checkpoints()`
+        // never releases the hold while the replacement write is in flight.
+        let mut upgrade_in_place: Option<(DiskCopy, InFlightDiskUpgradeKind)> = None;
+        let mut upgrade_hold: Option<ColdKeyHold> = None;
         let mut stale_upgrade_copy: Option<DiskCopy> = None;
         if let Some(old_copy) = upgrade_old_copy
             && old_copy.landed
@@ -3760,7 +3747,8 @@ impl Inkling2StateStore {
                     }
                     _ => InFlightDiskUpgradeKind::LabelPromote,
                 };
-                upgrade_in_place = Some((old_copy, Some(hold), in_flight_kind));
+                upgrade_in_place = Some((old_copy, in_flight_kind));
+                upgrade_hold = Some(hold);
             } else {
                 drop(hold);
                 stale_upgrade_copy = Some(old_copy);
@@ -3822,7 +3810,7 @@ impl Inkling2StateStore {
             return false;
         };
         let can_stage = self.disk.as_ref().is_some_and(|disk| {
-            if let Some((old_copy, _, _)) = upgrade_in_place.as_ref() {
+            if let Some((old_copy, _)) = upgrade_in_place.as_ref() {
                 // An in-place upgrade or label relabel of an already-landed state blob whose KV
                 // chain is already on disk only charges the net delta `(new_state - old_copy.bytes)`
                 // against the logical quota, so it fits whenever the post-overwrite total stays
@@ -3865,53 +3853,56 @@ impl Inkling2StateStore {
             return false;
         }
         let is_pending_upgrade = self.pending_disk_upgrades.contains_key(&id);
-        let label_promote_copy = upgrade_in_place.as_ref().and_then(|(old_copy, _, kind)| {
-            (*kind == InFlightDiskUpgradeKind::LabelPromote).then_some(*old_copy)
+        let label_promote_copy = upgrade_in_place.and_then(|(old_copy, kind)| {
+            (kind == InFlightDiskUpgradeKind::LabelPromote).then_some(old_copy)
         });
         let staged = if let Some(old_copy) = label_promote_copy {
-            let Some(fallback_hold) = upgrade_in_place
-                .as_mut()
-                .and_then(|(_, hold, _)| hold.take())
-            else {
+            let Some(fallback_hold) = upgrade_hold.take() else {
                 return false;
             };
             self.stage_state_relabel(id, old_copy, fallback_hold)
-        } else {
-            if upgrade_in_place.is_some() {
-                self.store.set_disk(id, None);
-            }
+        } else if let Some((old_copy, _)) = upgrade_in_place {
+            let Some(fallback_hold) = upgrade_hold.take() else {
+                return false;
+            };
+            self.store.set_disk(id, None);
             // Always enqueue in-place SSD upgrades with `MakeRoom::Refuse`: even if volume
             // headroom or quota changes between this model-thread pre-check and async writer
             // execution, the writer must NEVER evict any object (including the old blob's Global
             // KV chain) — it cleanly refuses, rolls back `old_copy`, and preserves the old durable
             // SSD hit.
-            let effective_room = if upgrade_in_place.is_some() {
-                MakeRoom::Refuse
-            } else {
-                room
-            };
             let effective_keep_ram = keep_ram || is_pending_upgrade;
             let Some(disk) = self.disk.as_mut() else {
-                if let Some((old_copy, _, _)) = upgrade_in_place {
-                    self.store.set_disk(id, Some(old_copy));
-                }
+                self.store.set_disk(id, Some(old_copy));
+                return false;
+            };
+            disk.engine.stage_replacement(
+                &mut self.store,
+                id,
+                MakeRoom::Refuse,
+                effective_keep_ram,
+                (),
+                fallback_hold,
+            )
+        } else {
+            let effective_keep_ram = keep_ram || is_pending_upgrade;
+            let Some(disk) = self.disk.as_mut() else {
                 return false;
             };
             disk.engine
-                .stage(&mut self.store, id, effective_room, effective_keep_ram, ())
+                .stage(&mut self.store, id, room, effective_keep_ram, ())
         };
         match staged {
             Staged::Started => {
                 self.spill_backoff.remove(&id);
                 self.recent_failed_spills.remove(&id);
-                if let Some((old_copy, fallback_hold, in_flight_kind)) = upgrade_in_place {
+                if let Some((old_copy, in_flight_kind)) = upgrade_in_place {
                     self.pending_disk_upgrades.remove(&id);
                     self.recent_failed_upgrades.remove(&id);
                     self.in_flight_disk_upgrade = Some(InFlightDiskUpgrade {
                         id,
                         kind: in_flight_kind,
                         old_copy,
-                        _fallback_hold: fallback_hold,
                     });
                     if in_flight_kind != InFlightDiskUpgradeKind::LabelPromote
                         && let Some(disk) = self.disk.as_mut()
@@ -3928,7 +3919,7 @@ impl Inkling2StateStore {
                 true
             }
             Staged::Busy => {
-                if let Some((old_copy, _, _)) = upgrade_in_place {
+                if let Some((old_copy, _)) = upgrade_in_place {
                     if label_promote_copy.is_none() {
                         self.store.set_disk(id, Some(old_copy));
                     }
@@ -3942,15 +3933,14 @@ impl Inkling2StateStore {
             }
             Staged::Refused => {
                 let retry = upgrade_retry_after();
-                let old_still_indexed =
-                    upgrade_in_place.as_ref().is_some_and(|(old_copy, _, _)| {
-                        self.disk.as_ref().is_some_and(|d| {
-                            d.tier
-                                .manager
-                                .contains_in(&old_copy.key, ColdGroup::DFlash2State)
-                        })
-                    });
-                if let Some((old_copy, _, _)) = upgrade_in_place {
+                let old_still_indexed = upgrade_in_place.is_some_and(|(old_copy, _)| {
+                    self.disk.as_ref().is_some_and(|d| {
+                        d.tier
+                            .manager
+                            .contains_in(&old_copy.key, ColdGroup::DFlash2State)
+                    })
+                });
+                if let Some((old_copy, _)) = upgrade_in_place {
                     if old_still_indexed {
                         if label_promote_copy.is_none() {
                             self.store.set_disk(id, Some(old_copy));
@@ -4192,6 +4182,7 @@ impl Inkling2StateStore {
                 });
             }
             if let Some(disk) = self.disk.as_mut() {
+                disk.engine.cancel_pending_replacement(id);
                 if disk.chain.as_ref().is_some_and(|c| c.id == id) {
                     disk.chain = None;
                 }
@@ -12392,6 +12383,484 @@ mod tests {
                 "relabeled anchor must adopt into prompt_heads"
             );
             s3.assert_ssd_restores(&query_a, salt_a, Some(adopted_id), Some(&dw64));
+            assert!(s3.close());
+        }
+    }
+
+    /// Codex R6-1: An in-flight `PendingDiskUpgrade::InPlace { promote_label: true }` write owns
+    /// its replacement flag and `ColdKeyHold` on `StateDiskEngine` (not `InFlightDiskUpgrade`),
+    /// so `clear_ram_and_checkpoints()` (`ResetCaches`) neither drops the eviction hold nor causes
+    /// `StateDiskEngine::poll_offload()` to delete the freshly committed upgraded SSD anchor upon
+    /// landing. Under tight quota, a competing `MakeRoom::Evict` KV write evicts only an unpinned
+    /// control block, the hold releases cleanly on landing, and reopening + `adopt_all()` adopts
+    /// the anchor as `Ordinary` (`!checkpoint`) in `prompt_heads` with the upgraded
+    /// `PackedDraftWindow` intact.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_place_upgrade_hold_and_commit_survive_reset_against_competing_eviction() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use mlx_paged_attn::Landed;
+
+        let fx = StateDiskTestFixture::new(
+            "r6-1-inplace-hold-reset",
+            b"r6-1-inplace-hold-reset-v1",
+            Some(10.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt_a = 0x6701u64;
+        let tokens_a: Vec<u32> = (8300u32..8396u32).collect();
+        let mut query_a = tokens_a[..80].to_vec();
+        query_a.extend(9820u32..9830u32);
+        let tokens_ctrl: Vec<u32> = (4300u32..4332u32).collect();
+        let tokens_competing: Vec<u32> = (4400u32..4432u32).collect();
+        let dw64 = fx.packed_dw(64);
+
+        // 1. Seed a persistent SSD `Checkpoint` anchor WITHOUT a draft window and measure exact
+        //    anchor + 1-block footprints.
+        let (footprint_a, control_size) = {
+            let mut s1 = fx.open(64u64 << 20, Some(reserve));
+            let cp_a = s1.capture(
+                &fx.conv,
+                1,
+                &tokens_a,
+                64,
+                salt_a,
+                StateClass::Checkpoint,
+                None,
+            );
+            s1.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s1.store.reclaim_entry(&s1.coord, cp_a),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s1.flush(10));
+            let footprint_a = s1.manager().total_bytes();
+            assert!(footprint_a > 0);
+
+            s1.coord.reset_scheduled_request(2).expect("reset 2");
+            s1.coord
+                .record_tokens_all(2, &tokens_ctrl)
+                .expect("record ctrl");
+            let (tmp_ctrl_key, landed) = s1.enqueue_kv_block(2, &tokens_ctrl, 0, None);
+            assert!(matches!(landed, Landed::Block { ok: true, .. }));
+            let control_size = s1.manager().total_bytes() - footprint_a;
+            assert!(control_size > 1024);
+            assert!(s1.manager().remove(&tmp_ctrl_key));
+            assert!(s1.close());
+            (footprint_a, control_size)
+        };
+
+        // 2. Reopen under tight quota (`anchor + 1 control block + 64 B` label headroom),
+        //    recapture the Checkpoint anchor as a structural head WITH `dw64` to queue
+        //    `PendingDiskUpgrade::InPlace { promote_label: true }`, enqueue a competing
+        //    `MakeRoom::Evict` KV write while paused, and reset (`clear_ram_and_checkpoints()`).
+        let quota = footprint_a + control_size + 64;
+        {
+            let mut s2 = fx.open_adopted(quota, Some(reserve), 1);
+            s2.store.set_ram_cap(16);
+            let cp_id = s2.id_by_salt(salt_a);
+            assert!(s2.entry(cp_id).checkpoint());
+            assert!(!s2.store.is_prompt_head(cp_id));
+            let key_a = s2.disk_copy(cp_id).key;
+            let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(cp_id));
+            assert_eq!(kv_keys.len(), 2);
+
+            // Recapture as structural head (`StateClass::Ordinary`, `is_head: true`) WITH `dw64`.
+            s2.coord.reset_scheduled_request(2).expect("reset 2");
+            s2.coord
+                .record_tokens_all(2, &tokens_a)
+                .expect("record tokens_a");
+            let upgraded_id = s2
+                .store
+                .capture_boundary_inner(
+                    &mut s2.coord,
+                    &fx.conv,
+                    2,
+                    &tokens_a,
+                    64,
+                    salt_a,
+                    StateClass::Ordinary,
+                    Some(DraftWindowInput::Packed(&dw64)),
+                    None,
+                    CaptureOptions {
+                        is_head: true,
+                        ..CaptureOptions::default()
+                    },
+                )
+                .expect("capture structural head")
+                .expect("upgraded_id");
+            assert_eq!(upgraded_id, cp_id);
+            assert!(!s2.entry(cp_id).checkpoint());
+            assert!(s2.store.is_prompt_head(cp_id));
+            assert!(matches!(
+                s2.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::InPlace {
+                    promote_label: true,
+                    ..
+                })
+            ));
+            let old_state_bytes = s2.disk_copy(cp_id).bytes;
+            let new_state_bytes = s2.state_object_bytes_for(cp_id);
+            assert!(new_state_bytes.saturating_sub(old_state_bytes) <= 64);
+
+            // Write an unpinned control KV block strictly NEWER in LRU than the anchor's KV chain.
+            s2.coord.reset_scheduled_request(3).expect("reset 3");
+            s2.coord
+                .record_tokens_all(3, &tokens_ctrl)
+                .expect("record ctrl");
+            let (control_key, ctrl_landed) = s2.enqueue_kv_block(3, &tokens_ctrl, 0, None);
+            assert!(matches!(ctrl_landed, Landed::Block { ok: true, .. }));
+            assert!(s2.manager().contains_in(&control_key, ColdGroup::Kv));
+            assert_eq!(s2.manager().total_bytes(), footprint_a + control_size);
+
+            // Pause writer, enqueue `InPlace { promote_label: true }` via `Tick::Full`, and
+            // enqueue a competing `MakeRoom::Evict` KV block write before resetting.
+            let offloads_before = s2.disk().counters.offloads;
+            let pause = s2.manager().pause_writer_for_test().expect("pause writer");
+            assert!(
+                s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 }),
+                "Tick::Full must enqueue InPlace upgrade while writer is paused"
+            );
+            assert!(s2.disk().writing());
+            assert!(s2.disk().engine.writing());
+            assert!(s2.disk().engine.has_pending_replacement());
+            assert!(s2.disk().pending_relabel.is_none());
+            assert!(matches!(
+                s2.store.in_flight_disk_upgrade.as_ref().map(|u| (u.id, u.kind)),
+                Some((
+                    id,
+                    InFlightDiskUpgradeKind::InPlace {
+                        promote_label: true
+                    }
+                )) if id == cp_id
+            ));
+
+            s2.coord.reset_scheduled_request(4).expect("reset 4");
+            s2.coord
+                .record_tokens_all(4, &tokens_competing)
+                .expect("record competing");
+            let kv = KvPoolHandle::from_adapter(s2.coord.full_adapter());
+            let blk = Arc::clone(
+                &s2.coord
+                    .full_adapter()
+                    .block_table_for(4)
+                    .expect("block table 4")
+                    .blocks()[0],
+            );
+            let kv_fp = s2.disk().tier.kv_fingerprint;
+            let competing_key =
+                ColdCacheKey::chain(ColdGroup::Kv, kv_fp, None, &tokens_competing, &[], 0, 0);
+            let (comp_tx, comp_rx) = std::sync::mpsc::channel();
+            assert!(
+                s2.manager()
+                    .capture_and_enqueue_tracked(
+                        &kv.pool,
+                        &blk,
+                        competing_key,
+                        kv_fp,
+                        &tokens_competing,
+                        test_deadline(5),
+                        MakeRoom::Evict,
+                        comp_tx,
+                    )
+                    .expect("enqueue competing KV")
+            );
+
+            // Simulate `ResetCaches` while both InPlace write and competing Evict write are queued.
+            s2.store.clear_ram_and_checkpoints();
+            s2.coord.release_all_and_purge().expect("purge after reset");
+            assert!(s2.store.store.entries().next().is_none());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.disk().writing());
+            assert!(s2.disk().engine.has_pending_replacement());
+
+            // Hold MUST stay live on BOTH the committed state blob AND all Global KV blocks!
+            assert!(
+                s2.manager().is_held_for_test(&key_a),
+                "state blob hold must stay live on StateDiskEngine after clear_ram_and_checkpoints"
+            );
+            for k in &kv_keys {
+                assert!(
+                    s2.manager().is_held_for_test(k),
+                    "Global KV chain hold must stay live on StateDiskEngine after clear_ram_and_checkpoints"
+                );
+            }
+            assert!(!s2.manager().is_held_for_test(&control_key));
+
+            // Unpause writer and settle competing Evict write BEFORE polling `poll_offload`:
+            // it must evict ONLY the unpinned control block, never the held anchor or its KV chain.
+            drop(pause);
+            match comp_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("competing KV settle")
+            {
+                Landed::Block { key, ok } => {
+                    assert_eq!(key, competing_key);
+                    assert!(
+                        ok,
+                        "competing Evict write must succeed by evicting only the unpinned control block"
+                    );
+                }
+                other => panic!("expected Landed::Block, got {other:?}"),
+            }
+            assert!(
+                !s2.manager().contains_in(&control_key, ColdGroup::Kv),
+                "unpinned control block must be evicted instead of the held anchor"
+            );
+            assert!(
+                s2.manager().contains_in(&key_a, ColdGroup::DFlash2State),
+                "held anchor state blob must survive competing Evict write after reset"
+            );
+            for k in &kv_keys {
+                assert!(
+                    s2.manager().contains_in(k, ColdGroup::Kv),
+                    "held anchor Global KV block must survive competing Evict write after reset"
+                );
+            }
+
+            // Settle `InPlace` landing via `Tick::Full` + `flush`: `poll_offload` MUST preserve
+            // the freshly committed SSD anchor (never call `manager.remove`) and release holds.
+            let dl = test_deadline(10);
+            while s2.disk().writing() {
+                assert!(
+                    Instant::now() < dl,
+                    "post-reset InPlace upgrade under quota pressure must finish promptly"
+                );
+                let _ = s2.disk().await_landing(dl);
+                let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
+            }
+            assert!(s2.flush(10));
+            assert!(!s2.disk().writing());
+            assert!(!s2.disk().engine.has_pending_replacement());
+            assert!(s2.disk().writable());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.store.recent_failed_upgrades.is_empty());
+            assert!(s2.store.recent_failed_spills.is_empty());
+            assert!(s2.store.spill_backoff.is_empty());
+            assert_eq!(s2.disk().counters.offloads, offloads_before + 1);
+            assert_eq!(s2.disk().counters.offload_failures, 0);
+            assert!(
+                !s2.manager().is_held_for_test(&key_a),
+                "state blob hold must be released once poll_offload settles replacement"
+            );
+            for k in &kv_keys {
+                assert!(
+                    !s2.manager().is_held_for_test(k),
+                    "Global KV chain hold must be released once poll_offload settles replacement"
+                );
+            }
+            assert!(
+                s2.manager().contains_in(&key_a, ColdGroup::DFlash2State),
+                "poll_offload must preserve freshly committed InPlace replacement anchor after reset"
+            );
+            let (_, label_a) = s2
+                .manager()
+                .state_label(key_a, s2.disk().tier.state_fingerprint)
+                .expect("upgraded state label after reset");
+            assert!(
+                !label_a.checkpoint,
+                "post-reset InPlace upgrade must commit checkpoint=false on disk"
+            );
+            assert!(s2.close());
+        }
+
+        // 3. Reopen fresh persistent tier + `adopt_all()`: anchor adopts as `Ordinary`
+        //    (`!checkpoint`) in `prompt_heads` with the upgraded `PackedDraftWindow` intact.
+        {
+            let mut s3 = fx.open_adopted(128u64 << 20, None, 1);
+            let adopted_id = s3.id_by_salt(salt_a);
+            assert!(
+                !s3.entry(adopted_id).checkpoint(),
+                "post-reset InPlace upgraded anchor must adopt as Ordinary (!checkpoint)"
+            );
+            assert!(
+                s3.store.is_prompt_head(adopted_id),
+                "post-reset InPlace upgraded anchor must adopt into prompt_heads"
+            );
+            s3.assert_ssd_restores(&query_a, salt_a, Some(adopted_id), Some(&dw64));
+            assert!(s3.close());
+        }
+    }
+
+    /// Codex R6-1 companion: If `clear_ram_and_checkpoints()` (`ResetCaches`) runs while an
+    /// `InPlace { promote_label: true }` upgrade is in flight and the writer subsequently refuses
+    /// the write under `MakeRoom::Refuse`, `StateDiskEngine::poll_offload()` cleanly releases the
+    /// hold, leaves the original durable SSD anchor intact on disk, and reopening + `adopt_all()`
+    /// adopts the preserved original `Checkpoint` anchor.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn in_place_upgrade_refusal_after_reset_preserves_old_ssd_anchor() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        let fx = StateDiskTestFixture::new(
+            "r6-1-inplace-refuse-reset",
+            b"r6-1-inplace-refuse-reset-v1",
+            Some(10.0),
+        )
+        .with_paged(1024, 4);
+        WRITE_BEHIND_MIN_TOKENS_OVERRIDE.with(|c| c.set(Some(64)));
+
+        let reserve = 4096u64;
+        let salt_fail = 0x6702u64;
+        let tokens_fail: Vec<u32> = (8500u32..8596u32).collect();
+        let mut query_fail = tokens_fail[..80].to_vec();
+        query_fail.extend(9840u32..9850u32);
+        let dw64 = fx.packed_dw(64);
+
+        // 1. Seed persistent SSD `Checkpoint` anchor WITHOUT draft window.
+        {
+            let mut s1 = fx.open(128u64 << 20, Some(reserve));
+            let cp = s1.capture(
+                &fx.conv,
+                1,
+                &tokens_fail,
+                64,
+                salt_fail,
+                StateClass::Checkpoint,
+                None,
+            );
+            s1.store.clear_seq_checkpoint(1);
+            assert_eq!(
+                s1.store.reclaim_entry(&s1.coord, cp),
+                ReclaimOutcome::Spilled
+            );
+            assert!(s1.flush(10));
+            assert!(s1.close());
+        }
+
+        // 2. Reopen, recapture as structural head WITH `dw64` to queue
+        //    `InPlace { promote_label: true }`, pause writer, stage via `Tick::Full`, inject
+        //    `MakeRoom::Refuse` headroom drop, reset, unpause, and settle.
+        {
+            let mut s2 = fx.open_adopted(128u64 << 20, Some(reserve), 1);
+            s2.store.set_ram_cap(16);
+            let cp_id = s2.id_by_salt(salt_fail);
+            assert!(s2.entry(cp_id).checkpoint());
+            let key_fail = s2.disk_copy(cp_id).key;
+            let kv_keys = s2.disk().engine.kv_chain_keys(s2.entry(cp_id));
+            assert_eq!(kv_keys.len(), 2);
+
+            s2.coord.reset_scheduled_request(2).expect("reset 2");
+            s2.coord
+                .record_tokens_all(2, &tokens_fail)
+                .expect("record tokens_fail");
+            let upgraded_id = s2
+                .store
+                .capture_boundary_inner(
+                    &mut s2.coord,
+                    &fx.conv,
+                    2,
+                    &tokens_fail,
+                    64,
+                    salt_fail,
+                    StateClass::Ordinary,
+                    Some(DraftWindowInput::Packed(&dw64)),
+                    None,
+                    CaptureOptions {
+                        is_head: true,
+                        ..CaptureOptions::default()
+                    },
+                )
+                .expect("capture structural head")
+                .expect("upgraded_id");
+            assert_eq!(upgraded_id, cp_id);
+            assert!(matches!(
+                s2.store.pending_disk_upgrades.get(&cp_id),
+                Some(PendingDiskUpgrade::InPlace {
+                    promote_label: true,
+                    ..
+                })
+            ));
+
+            let pause = s2.manager().pause_writer_for_test().expect("pause writer");
+            assert!(
+                s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 }),
+                "Tick::Full must enqueue InPlace upgrade while writer is paused"
+            );
+            assert!(s2.disk().writing());
+            assert!(s2.disk().engine.has_pending_replacement());
+
+            s2.set_writer_space(64 << 20, reserve, None);
+            s2.store.clear_ram_and_checkpoints();
+            s2.coord.release_all_and_purge().expect("purge after reset");
+            assert!(s2.store.store.entries().next().is_none());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.disk().writing());
+            assert!(s2.disk().engine.has_pending_replacement());
+            assert!(s2.manager().is_held_for_test(&key_fail));
+            for k in &kv_keys {
+                assert!(s2.manager().is_held_for_test(k));
+            }
+
+            drop(pause);
+            let dl = test_deadline(10);
+            while s2.disk().writing() {
+                assert!(
+                    Instant::now() < dl,
+                    "refused post-reset InPlace upgrade must finish promptly"
+                );
+                let _ = s2.disk().await_landing(dl);
+                let _ = s2.store.tick(&s2.coord, Tick::Full { command_pages: 0 });
+            }
+            assert!(s2.flush(10));
+            s2.clear_space_override(true);
+            assert!(!s2.disk().writing());
+            assert!(!s2.disk().engine.has_pending_replacement());
+            assert!(s2.disk().writable());
+            assert!(s2.store.in_flight_disk_upgrade.is_none());
+            assert!(s2.store.pending_disk_upgrades.is_empty());
+            assert!(s2.store.recent_failed_upgrades.is_empty());
+            assert!(s2.store.recent_failed_spills.is_empty());
+            assert!(s2.store.spill_backoff.is_empty());
+            assert_eq!(s2.disk().counters.offload_failures, 1);
+            assert!(!s2.manager().is_held_for_test(&key_fail));
+            for k in &kv_keys {
+                assert!(!s2.manager().is_held_for_test(k));
+            }
+            assert!(
+                s2.manager().contains_in(&key_fail, ColdGroup::DFlash2State),
+                "refused InPlace upgrade after reset must preserve old durable SSD anchor"
+            );
+            for k in &kv_keys {
+                assert!(
+                    s2.manager().contains_in(k, ColdGroup::Kv),
+                    "refused InPlace upgrade after reset must preserve old Global KV blocks"
+                );
+            }
+            let (_, label_fail) = s2
+                .manager()
+                .state_label(key_fail, s2.disk().tier.state_fingerprint)
+                .expect("label_fail after reset refusal");
+            assert!(
+                label_fail.checkpoint,
+                "refused InPlace upgrade after reset must leave original checkpoint=true header intact"
+            );
+            assert!(s2.close());
+        }
+
+        // 3. Reopen fresh persistent tier + `adopt_all()`: original SSD anchor adopts intact as
+        //    `Checkpoint` (without draft window).
+        {
+            let mut s3 = fx.open_adopted(128u64 << 20, None, 1);
+            let id_fail = s3.id_by_salt(salt_fail);
+            assert!(
+                s3.entry(id_fail).checkpoint(),
+                "preserved original anchor must adopt as Checkpoint"
+            );
+            assert!(
+                !s3.store.is_prompt_head(id_fail),
+                "preserved Checkpoint anchor must not adopt into prompt_heads"
+            );
+            s3.assert_ssd_restores(&query_fail, salt_fail, Some(id_fail), None);
             assert!(s3.close());
         }
     }

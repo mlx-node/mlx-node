@@ -1286,20 +1286,22 @@ impl RootDir {
         Ok(File::from(fd))
     }
 
-    fn create_exclusive(&self, name: &str) -> Result<File, String> {
+    fn create_exclusive(&self, name: &str) -> std::io::Result<File> {
         use rustix::fs::{Mode, OFlags, fchmod, openat};
         let flags =
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mode = Mode::RUSR | Mode::WUSR;
-        let fd = openat(&self.fd, name, flags, mode)
-            .map_err(|e| format!("create cold-cache temp file: {e}"))?;
-        fchmod(&fd, mode).map_err(|e| format!("set cold-cache file permissions: {e}"))?;
+        let fd = openat(&self.fd, name, flags, mode).map_err(std::io::Error::from)?;
+        if let Err(err) = fchmod(&fd, mode).map_err(std::io::Error::from) {
+            drop(fd);
+            let _ = self.unlink(name);
+            return Err(err);
+        }
         Ok(File::from(fd))
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
-        rustix::fs::renameat(&self.fd, from, &self.fd, to)
-            .map_err(|e| format!("commit cold-cache file: {e}"))
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
+        rustix::fs::renameat(&self.fd, from, &self.fd, to).map_err(std::io::Error::from)
     }
 
     fn unlink(&self, name: &str) -> std::io::Result<()> {
@@ -1307,8 +1309,8 @@ impl RootDir {
             .map_err(std::io::Error::from)
     }
 
-    fn sync(&self) -> Result<(), String> {
-        rustix::fs::fsync(&self.fd).map_err(|e| format!("sync cold-cache directory: {e}"))
+    fn sync(&self) -> std::io::Result<()> {
+        rustix::fs::fsync(&self.fd).map_err(std::io::Error::from)
     }
 
     fn space(&self) -> Result<(u64, u64), String> {
@@ -1422,15 +1424,14 @@ impl RootDir {
         File::open(self.path.join(name))
     }
 
-    fn create_exclusive(&self, name: &str) -> Result<File, String> {
+    fn create_exclusive(&self, name: &str) -> std::io::Result<File> {
         OpenOptions::new()
             .create_new(true)
             .write(true)
             .open(self.path.join(name))
-            .map_err(|e| format!("create cold-cache temp file: {e}"))
     }
 
-    fn rename(&self, from: &str, to: &str) -> Result<(), String> {
+    fn rename(&self, from: &str, to: &str) -> std::io::Result<()> {
         let src = self.path.join(from);
         let dst = self.path.join(to);
         #[cfg(windows)]
@@ -1439,14 +1440,14 @@ impl RootDir {
                 let _ = fs::remove_file(&dst);
             }
         }
-        fs::rename(src, dst).map_err(|e| format!("commit cold-cache file: {e}"))
+        fs::rename(src, dst)
     }
 
     fn unlink(&self, name: &str) -> std::io::Result<()> {
         fs::remove_file(self.path.join(name))
     }
 
-    fn sync(&self) -> Result<(), String> {
+    fn sync(&self) -> std::io::Result<()> {
         Ok(())
     }
 
@@ -1495,7 +1496,7 @@ pub type SpaceOverrideHook = Box<dyn Fn() -> Result<(u64, u64), String> + Send>;
 type TestSpaceOverride = Mutex<Option<SpaceOverrideHook>>;
 
 #[cfg(test)]
-type TestSyncOverride = Mutex<Option<Box<dyn Fn() -> Result<(), String> + Send>>>;
+type TestSyncOverride = Mutex<Option<Box<dyn Fn() -> std::io::Result<()> + Send>>>;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1509,6 +1510,32 @@ enum RelabelSourceFaultStage {
 #[cfg(test)]
 type RelabelSourceFaultHook =
     Mutex<Option<Box<dyn FnMut(RelabelSourceFaultStage) -> std::io::Result<()> + Send>>>;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LoadFaultStage {
+    Open,
+    Header,
+    Payload,
+    Tail,
+    Metadata,
+}
+
+#[cfg(test)]
+type LoadFaultHook = Mutex<Option<Box<dyn FnMut(LoadFaultStage) -> std::io::Result<()> + Send>>>;
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PersistFaultStage {
+    CreateTemp,
+    SyncPayload,
+    Rename,
+    SyncDir,
+}
+
+#[cfg(test)]
+type PersistFaultHook =
+    Mutex<Option<Box<dyn FnMut(PersistFaultStage) -> std::io::Result<()> + Send>>>;
 
 struct Shared {
     root: RootDir,
@@ -1528,6 +1555,14 @@ struct Shared {
     /// so tests can verify the existing SSD file is preserved and not pruned.
     #[cfg(test)]
     relabel_source_fault_hook: RelabelSourceFaultHook,
+    /// Injects transient open/read/metadata I/O errors during `load_object_with`,
+    /// `load_state`, `state_label`, and `load_object_bounded`.
+    #[cfg(test)]
+    load_fault_hook: LoadFaultHook,
+    /// Injects OS I/O errors (such as `ENOSPC`/`EDQUOT`) into `persist_with`
+    /// stages after the room pre-check passes.
+    #[cfg(test)]
+    persist_fault_hook: PersistFaultHook,
     /// Replaces filesystem space probes so reserve-floor decisions are
     /// deterministic under test.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1583,7 +1618,7 @@ impl Shared {
     }
 
     /// Directory fsync backing the writer commit's durability barrier.
-    fn sync(&self) -> Result<(), String> {
+    fn sync(&self) -> std::io::Result<()> {
         #[cfg(test)]
         if let Ok(hook) = self.dir_sync_override.lock()
             && let Some(hook) = hook.as_ref()
@@ -1596,6 +1631,26 @@ impl Shared {
     #[cfg(test)]
     fn maybe_fail_relabel_source(&self, stage: RelabelSourceFaultStage) -> std::io::Result<()> {
         if let Ok(mut hook) = self.relabel_source_fault_hook.lock()
+            && let Some(hook) = hook.as_mut()
+        {
+            return hook(stage);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_load(&self, stage: LoadFaultStage) -> std::io::Result<()> {
+        if let Ok(mut hook) = self.load_fault_hook.lock()
+            && let Some(hook) = hook.as_mut()
+        {
+            return hook(stage);
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn maybe_fail_persist(&self, stage: PersistFaultStage) -> std::io::Result<()> {
+        if let Ok(mut hook) = self.persist_fault_hook.lock()
             && let Some(hook) = hook.as_mut()
         {
             return hook(stage);
@@ -1615,6 +1670,21 @@ struct FaultingSourceReader<'a> {
 impl Read for FaultingSourceReader<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.shared.maybe_fail_relabel_source(self.stage)?;
+        self.inner.read(buf)
+    }
+}
+
+#[cfg(test)]
+struct FaultingLoadReader<'a> {
+    inner: &'a mut File,
+    shared: &'a Shared,
+    stage: LoadFaultStage,
+}
+
+#[cfg(test)]
+impl Read for FaultingLoadReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.shared.maybe_fail_load(self.stage)?;
         self.inner.read(buf)
     }
 }
@@ -1741,6 +1811,10 @@ impl ColdCacheManager {
             failed_open_identity_hook: Mutex::new(None),
             #[cfg(test)]
             relabel_source_fault_hook: Mutex::new(None),
+            #[cfg(test)]
+            load_fault_hook: Mutex::new(None),
+            #[cfg(test)]
+            persist_fault_hook: Mutex::new(None),
             #[cfg(any(test, feature = "test-hooks"))]
             space_override: Mutex::new(None),
             #[cfg(test)]
@@ -2335,8 +2409,25 @@ impl ColdCacheManager {
         }
         let cap = state_header_bound(expected, extra_keys);
         self.load_object_with(key, ColdGroup::DFlash2State, true, |file| {
-            let Ok(header) = read_state_header(file, key, fingerprint, cap) else {
-                return ObjectRead::Corrupt;
+            let header_res = {
+                #[cfg(test)]
+                {
+                    let mut reader = FaultingLoadReader {
+                        inner: file,
+                        shared: &self.shared,
+                        stage: LoadFaultStage::Header,
+                    };
+                    read_state_header(&mut reader, key, fingerprint, cap)
+                }
+                #[cfg(not(test))]
+                {
+                    read_state_header(file, key, fingerprint, cap)
+                }
+            };
+            let header = match header_res {
+                Ok(header) => header,
+                Err(StateHeaderError::Corrupt) => return ObjectRead::Corrupt,
+                Err(StateHeaderError::Io) => return ObjectRead::Io,
             };
             if header.layout.boundary_tokens != expected.boundary_tokens
                 || header.layout.geometry != expected.geometry
@@ -2354,9 +2445,51 @@ impl ColdCacheManager {
                 return ObjectRead::Corrupt;
             };
             let target = &mut into[..payload];
+            let payload_res = {
+                #[cfg(test)]
+                {
+                    let mut reader = FaultingLoadReader {
+                        inner: file,
+                        shared: &self.shared,
+                        stage: LoadFaultStage::Payload,
+                    };
+                    reader.read_exact(target)
+                }
+                #[cfg(not(test))]
+                {
+                    file.read_exact(target)
+                }
+            };
+            if let Err(err) = payload_res {
+                return if err.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ObjectRead::Corrupt
+                } else {
+                    ObjectRead::Io
+                };
+            }
             let mut tail = [0u8; 1];
-            if file.read_exact(target).is_err() || !matches!(file.read(&mut tail), Ok(0)) {
-                return ObjectRead::Corrupt;
+            loop {
+                let tail_res = {
+                    #[cfg(test)]
+                    {
+                        let mut reader = FaultingLoadReader {
+                            inner: file,
+                            shared: &self.shared,
+                            stage: LoadFaultStage::Tail,
+                        };
+                        reader.read(&mut tail)
+                    }
+                    #[cfg(not(test))]
+                    {
+                        file.read(&mut tail)
+                    }
+                };
+                match tail_res {
+                    Ok(0) => break,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Ok(_) => return ObjectRead::Corrupt,
+                    Err(_) => return ObjectRead::Io,
+                }
             }
             let mut hasher = state_checksum_prefix(&header.layout, &header.label);
             hasher.update(&*target);
@@ -2376,19 +2509,44 @@ impl ColdCacheManager {
         fingerprint: ColdCacheFingerprint,
     ) -> Option<(ColdStateLayout, ColdStateLabel)> {
         self.load_object_with(key, ColdGroup::DFlash2State, false, |file| {
-            let Ok(header) = read_state_header(file, key, fingerprint, STATE_LABEL_HEADER_CAP)
+            let header_res = {
+                #[cfg(test)]
+                {
+                    let mut reader = FaultingLoadReader {
+                        inner: file,
+                        shared: &self.shared,
+                        stage: LoadFaultStage::Header,
+                    };
+                    read_state_header(&mut reader, key, fingerprint, STATE_LABEL_HEADER_CAP)
+                }
+                #[cfg(not(test))]
+                {
+                    read_state_header(file, key, fingerprint, STATE_LABEL_HEADER_CAP)
+                }
+            };
+            let header = match header_res {
+                Ok(header) => header,
+                Err(StateHeaderError::Corrupt) => return ObjectRead::Corrupt,
+                Err(StateHeaderError::Io) => return ObjectRead::Io,
+            };
+            let Some(expected) = header
+                .layout
+                .payload_bytes()
+                .and_then(|payload| payload.checked_add(header.header_len))
             else {
                 return ObjectRead::Corrupt;
             };
-            let expected = header
-                .layout
-                .payload_bytes()
-                .and_then(|payload| payload.checked_add(header.header_len));
-            match file.metadata() {
-                Ok(meta) if Some(meta.len()) == expected => {
-                    ObjectRead::Ok((header.layout, header.label))
-                }
-                _ => ObjectRead::Corrupt,
+            let meta_res = {
+                #[cfg(test)]
+                let injected = self.shared.maybe_fail_load(LoadFaultStage::Metadata);
+                #[cfg(not(test))]
+                let injected: std::io::Result<()> = Ok(());
+                injected.and_then(|()| file.metadata())
+            };
+            match meta_res {
+                Ok(meta) if meta.len() == expected => ObjectRead::Ok((header.layout, header.label)),
+                Ok(_) => ObjectRead::Corrupt,
+                Err(_) => ObjectRead::Io,
             }
         })
     }
@@ -2616,26 +2774,40 @@ impl ColdCacheManager {
             // regular file reports a huge `st_size`, but `take` caps the
             // allocation; anything exceeding the bound is treated as
             // corruption and never read in full.
-            let read = file
-                .take(max_encoded.saturating_add(1))
-                .read_to_end(&mut bytes)
-                .map_err(|e| e.to_string())
-                .and_then(|_| {
-                    if bytes.len() as u64 > max_encoded {
-                        Err("cold-cache entry exceeds geometry bound".to_string())
-                    } else {
-                        decode(&bytes)
-                    }
-                });
-            read.map_or(ObjectRead::Corrupt, ObjectRead::Ok)
+            let read_res = {
+                #[cfg(test)]
+                {
+                    let reader = FaultingLoadReader {
+                        inner: file,
+                        shared: &self.shared,
+                        stage: LoadFaultStage::Payload,
+                    };
+                    reader
+                        .take(max_encoded.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                }
+                #[cfg(not(test))]
+                {
+                    file.take(max_encoded.saturating_add(1))
+                        .read_to_end(&mut bytes)
+                }
+            };
+            if read_res.is_err() {
+                return ObjectRead::Io;
+            }
+            if bytes.len() as u64 > max_encoded {
+                return ObjectRead::Corrupt;
+            }
+            decode(&bytes).map_or(ObjectRead::Corrupt, ObjectRead::Ok)
         })
     }
 
     /// The open / prune / touch / statistics contract of
     /// [`Self::load_bounded`] around a caller-supplied `read` of the opened
-    /// file. `ObjectRead::Mismatch` (a sound object of another shape) is a
-    /// miss that keeps the object; `touch` false leaves recency alone (a
-    /// header scan is not a use).
+    /// file. `ObjectRead::Mismatch` (a sound object of another shape) and
+    /// `ObjectRead::Io` (a transient OS I/O error) are misses that keep the
+    /// object; `touch` false leaves recency alone (a header scan is not a
+    /// use).
     fn load_object_with<T>(
         &self,
         key: ColdCacheKey,
@@ -2644,6 +2816,7 @@ impl ColdCacheManager {
         read: impl FnOnce(&mut File) -> ObjectRead<T>,
     ) -> Option<T> {
         let name = object_file_name(&key, group);
+        let mut observed_entry = None;
         let mut observed_identity = None;
         let mut opened_file = None;
         // The index lock spans [open → failed-open identity snapshot]: the
@@ -2654,7 +2827,13 @@ impl ColdCacheManager {
         // exclusion because its identity comes from the descriptor itself.
         let open_result = {
             let _index_guard = self.shared.index.lock().ok();
-            let result = self.shared.root.open_existing(&name);
+            let result = {
+                #[cfg(test)]
+                let injected = self.shared.maybe_fail_load(LoadFaultStage::Open);
+                #[cfg(not(test))]
+                let injected: std::io::Result<()> = Ok(());
+                injected.and_then(|()| self.shared.root.open_existing(&name))
+            };
             if let Err(e) = &result
                 && e.kind() != std::io::ErrorKind::NotFound
             {
@@ -2664,16 +2843,14 @@ impl ColdCacheManager {
                 {
                     hook();
                 }
-                // Capture the identity of the entry that made the open
-                // fail so pruning can distinguish it from a later writer
-                // replacement. Skipped for NotFound: an entry committed
-                // after a plain miss must never be mistaken for the one
-                // that failed.
-                observed_identity = self
-                    .shared
-                    .root
-                    .stat_identity(&name)
-                    .map(|(identity, _)| identity);
+                // Capture the identity and concrete type of the entry that
+                // made the open fail so pruning can distinguish it from a
+                // later writer replacement and preserve a valid regular file
+                // on transient OS open errors (EIO, EMFILE, etc.). Skipped
+                // for NotFound: an entry committed after a plain miss must
+                // never be mistaken for the one that failed.
+                observed_entry = self.shared.root.stat_identity(&name);
+                observed_identity = observed_entry.map(|(identity, _)| identity);
             }
             result
         };
@@ -2684,10 +2861,36 @@ impl ColdCacheManager {
                 opened_file = Some(file);
                 outcome
             }
-            Err(_) => ObjectRead::Corrupt,
+            // Missing entry: prune stale index record (no corruption bump
+            // because `opened_file` is `None`).
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => ObjectRead::Corrupt,
+            // Confirmed non-regular obstruction (symlink, FIFO, directory):
+            // clear the canonical name and de-index (no corruption bump).
+            Err(_)
+                if matches!(
+                    observed_entry,
+                    Some((_, EntryKind::Directory | EntryKind::Other))
+                ) =>
+            {
+                ObjectRead::Corrupt
+            }
+            // Permanently unreadable regular file (e.g. mode 000): clear the
+            // unopenable entry and de-index so future writes can recover.
+            // On unix, require `observed_entry.is_some()` so an unreadable
+            // root directory (where `stat_identity` also fails with EACCES)
+            // stays non-pruning rather than looking missing.
+            Err(err)
+                if err.kind() == std::io::ErrorKind::PermissionDenied
+                    && (cfg!(not(unix)) || observed_entry.is_some()) =>
+            {
+                ObjectRead::Corrupt
+            }
+            // Transient OS open error (EIO, EMFILE, ENFILE, ENOMEM, EINTR,
+            // etc.): preserve the file and index without pruning.
+            Err(_) => ObjectRead::Io,
         };
         match result {
-            ObjectRead::Mismatch => {
+            ObjectRead::Mismatch | ObjectRead::Io => {
                 self.shared.stats.misses.fetch_add(1, Ordering::Relaxed);
                 None
             }
@@ -3546,6 +3749,22 @@ fn persist_encoded(
     })
 }
 
+fn is_space_io_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::StorageFull {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let raw = error.raw_os_error();
+        if raw == Some(rustix::io::Errno::NOSPC.raw_os_error())
+            || raw == Some(rustix::io::Errno::DQUOT.raw_os_error())
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Why a persist failed: the room the write needs (Splash
 /// `DiskBudget::reportFull`: the volume's, and the file goes on) or anything
 /// else (Splash `SlotFile::stop`).
@@ -3563,13 +3782,10 @@ impl PersistError {
         }
     }
 
-    fn write(error: std::io::Error) -> Self {
-        let space = error.kind() == std::io::ErrorKind::StorageFull;
-        #[cfg(unix)]
-        let space = space || error.raw_os_error() == Some(rustix::io::Errno::DQUOT.raw_os_error());
+    fn io(context: &str, error: std::io::Error) -> Self {
         Self {
-            space,
-            message: format!("write cold-cache file: {error}"),
+            space: is_space_io_error(&error),
+            message: format!("{context}: {error}"),
         }
     }
 }
@@ -3615,17 +3831,33 @@ fn persist_with(
         std::process::id(),
         now_tick()
     );
-    let mut file = shared.root.create_exclusive(&temp)?;
+    let mut file = {
+        #[cfg(test)]
+        let injected = shared.maybe_fail_persist(PersistFaultStage::CreateTemp);
+        #[cfg(not(test))]
+        let injected: std::io::Result<()> = Ok(());
+        injected
+            .and_then(|()| shared.root.create_exclusive(&temp))
+            .map_err(|e| PersistError::io("create cold-cache temp file", e))?
+    };
     if let Err(error) = (|| -> Result<(), PersistError> {
-        write(&mut file).map_err(PersistError::write)?;
+        write(&mut file).map_err(|e| PersistError::io("write cold-cache file", e))?;
         let written = file
             .metadata()
-            .map_err(|e| format!("stat cold-cache file: {e}"))?
+            .map_err(|e| PersistError::io("stat cold-cache file", e))?
             .len();
         if written != size {
             return Err(format!("cold-cache object is {written} bytes, charged {size}").into());
         }
-        sync_payload(&file)?;
+        {
+            #[cfg(test)]
+            let injected = shared.maybe_fail_persist(PersistFaultStage::SyncPayload);
+            #[cfg(not(test))]
+            let injected: std::io::Result<()> = Ok(());
+            injected
+                .and_then(|()| sync_payload(&file))
+                .map_err(|e| PersistError::io("sync cold-cache file", e))?;
+        }
         // The index lock spans [rename + index publish] so a concurrent
         // failed-load cleanup can never observe the renamed file without
         // its index entry (or delete it in between).
@@ -3641,7 +3873,15 @@ fn persist_with(
         // completely different cause (a full queue at admission) and left the
         // other failure modes — a read-only root, a full disk, a failed fsync
         // — with no counter at all.
-        shared.root.rename(&temp, &destination)?;
+        {
+            #[cfg(test)]
+            let injected = shared.maybe_fail_persist(PersistFaultStage::Rename);
+            #[cfg(not(test))]
+            let injected: std::io::Result<()> = Ok(());
+            injected
+                .and_then(|()| shared.root.rename(&temp, &destination))
+                .map_err(|e| PersistError::io("commit cold-cache file", e))?;
+        }
         #[cfg(test)]
         if let Ok(mut log) = shared.commit_log.lock() {
             log.push(key);
@@ -3668,7 +3908,15 @@ fn persist_with(
         // runs after the lock: a model thread reading the index never waits
         // for it.
         drop(index);
-        shared.sync()?;
+        {
+            #[cfg(test)]
+            let injected = shared.maybe_fail_persist(PersistFaultStage::SyncDir);
+            #[cfg(not(test))]
+            let injected: std::io::Result<()> = Ok(());
+            injected
+                .and_then(|()| shared.sync())
+                .map_err(|e| PersistError::io("sync cold-cache directory", e))?;
+        }
         Ok(())
     })() {
         let _ = shared.root.unlink(&temp);
@@ -3914,7 +4162,10 @@ enum ObjectRead<T> {
     Ok(T),
     /// A sound object of another shape: a miss that stays on disk.
     Mismatch,
-    /// Unreadable or damaged: a miss, a corruption, and a prune.
+    /// Transient OS I/O error: a miss that keeps the file and index without
+    /// counting a corruption.
+    Io,
+    /// Unreadable or damaged: a miss, a corruption (when opened), and a prune.
     Corrupt,
 }
 
@@ -4565,17 +4816,16 @@ fn open_identity(_file: &File) -> Option<FileIdentity> {
 /// turns `Err` into a miss plus a prune, so a torn object costs one
 /// recomputed prefix and can never be handed to inference as data.
 #[cfg(unix)]
-fn sync_payload(file: &File) -> Result<(), String> {
-    rustix::fs::fsync(file).map_err(|e| format!("sync cold-cache file: {e}"))
+fn sync_payload(file: &File) -> std::io::Result<()> {
+    rustix::fs::fsync(file).map_err(std::io::Error::from)
 }
 
 /// Non-unix keeps `sync_all`. The measurement above is a macOS/APFS result,
 /// and this platform's [`RootDir::sync`] is already a no-op, so it is not the
 /// platform this trade-off was made for.
 #[cfg(not(unix))]
-fn sync_payload(file: &File) -> Result<(), String> {
+fn sync_payload(file: &File) -> std::io::Result<()> {
     file.sync_all()
-        .map_err(|e| format!("sync cold-cache file: {e}"))
 }
 
 /// Canonical filename for a cold object. KV keeps the historical
@@ -5646,7 +5896,9 @@ mod write_decomposition_bench {
                 SyncMode::SyncAll => file
                     .sync_all()
                     .map_err(|e| format!("sync cold-cache file: {e}")),
-                SyncMode::PlainFsync => sync_payload(file),
+                SyncMode::PlainFsync => {
+                    sync_payload(file).map_err(|e| format!("sync cold-cache file: {e}"))
+                }
                 SyncMode::Barrier => {
                     // SAFETY: `F_BARRIERFSYNC` takes no third argument and the
                     // descriptor is an open, writable regular file owned by
@@ -5885,7 +6137,10 @@ mod write_decomposition_bench {
         );
 
         let t = Instant::now();
-        let mut file = shared.root.create_exclusive(&temp)?;
+        let mut file = shared
+            .root
+            .create_exclusive(&temp)
+            .map_err(|e| format!("create cold-cache temp file: {e}"))?;
         phases.create = ms(t.elapsed());
 
         let outcome = (|| -> Result<(), String> {
@@ -5907,7 +6162,10 @@ mod write_decomposition_bench {
             // body directly instead of going through the writer loop, and the
             // loop is where `write_errors` is counted. Matching production here
             // would count an error production counts elsewhere.
-            shared.root.rename(&temp, &destination)?;
+            shared
+                .root
+                .rename(&temp, &destination)
+                .map_err(|e| format!("commit cold-cache file: {e}"))?;
             if let Some(old) = index.entries.insert(
                 key,
                 IndexEntry {
@@ -5924,7 +6182,9 @@ mod write_decomposition_bench {
             phases.commit = ms(t.elapsed());
 
             let t = Instant::now();
-            shared.sync()?;
+            shared
+                .sync()
+                .map_err(|e| format!("sync cold-cache directory: {e}"))?;
             phases.dir_fsync = ms(t.elapsed());
             Ok(())
         })();
@@ -7447,8 +7707,9 @@ mod tests {
     fn drain_reports_false_when_a_covered_block_fails_to_persist() {
         let root = temp_root("drain-persist-fail");
         let manager = ColdCacheManager::open_at(root.clone(), GIB, 0, 2).unwrap();
-        *manager.shared.dir_sync_override.lock().unwrap() =
-            Some(Box::new(|| Err("injected dir fsync failure".to_string())));
+        *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(|| {
+            Err(std::io::Error::other("injected dir fsync failure"))
+        }));
 
         let key = ColdCacheKey::chain(ColdGroup::Kv, fingerprint(), None, &[1, 2, 3, 4], &[], 0, 0);
         assert!(
@@ -7880,8 +8141,9 @@ mod tests {
         // upper bound used for read-time allocation caps).
         let size = encode_block(&expected).unwrap().len() as u64;
 
-        *manager.shared.dir_sync_override.lock().unwrap() =
-            Some(Box::new(|| Err("injected dir fsync failure".to_string())));
+        *manager.shared.dir_sync_override.lock().unwrap() = Some(Box::new(|| {
+            Err(std::io::Error::other("injected dir fsync failure"))
+        }));
 
         let result = persist_block(&manager.shared, &expected);
         assert!(
@@ -12221,6 +12483,602 @@ mod tests {
             assert!(manager.takes_tracked_writes());
             let _ = fs::remove_file(&victim);
         }
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn load_state_and_object_reads_preserve_file_on_transient_io_errors() {
+        let root = temp_root("load-transient-io");
+        let fp = fingerprint();
+        let key = state_key(80);
+        let mut original = state_object(key, vec![300_000, 12_345]);
+        original.label.checkpoint = true;
+        original.label.last_used = 10;
+        let layout = original.layout.clone();
+        let old_label = original.label.clone();
+        let expected_payload = original.payload.clone();
+        let payload_len = expected_payload.len();
+
+        let promoted_label = ColdStateLabel {
+            checkpoint: false,
+            last_used: 99,
+            ..old_label.clone()
+        };
+        let old_bytes = state_object_bytes(&layout, &old_label);
+        let promoted_bytes = state_object_bytes(&layout, &promoted_label);
+
+        let kv_tokens = vec![11, 22, 33, 44];
+        let kv_key = ColdCacheKey::chain(ColdGroup::Kv, fp, None, &kv_tokens, &[], 0, 0);
+        let mut kv_blk = block(kv_key);
+        kv_blk.tokens = kv_tokens;
+
+        let manager = ColdCacheManager::open_at(root.clone(), 8 << 20, 0, 4).unwrap();
+        let (tx, rx) = mpsc::channel();
+        manager
+            .enqueue_state(original, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+        persist_block(&manager.shared, &kv_blk).unwrap();
+        let initial_total = manager.total_bytes();
+        let state_path = root.join(object_file_name(&key, ColdGroup::DFlash2State));
+        let kv_path = root.join(object_file_name(&kv_key, ColdGroup::Kv));
+
+        let transient_eio = || -> std::io::Error {
+            #[cfg(unix)]
+            {
+                std::io::Error::from_raw_os_error(libc::EIO)
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::Error::other("injected transient EIO")
+            }
+        };
+
+        // Pause the writer and queue a relabel so transient read errors occur while
+        // an off-thread `enqueue_state_relabel` is waiting to commit.
+        let pause = manager.pause_writer_for_test().unwrap();
+        let (rtx, rrx) = mpsc::channel();
+        manager
+            .enqueue_state_relabel(
+                ColdStateRelabel {
+                    key,
+                    fingerprint: fp,
+                    layout: layout.clone(),
+                    label: promoted_label.clone(),
+                },
+                MakeRoom::Refuse,
+                rtx,
+            )
+            .unwrap();
+
+        let mut buf = vec![0u8; payload_len];
+        let load_state_cases = [
+            ("open", LoadFaultStage::Open, 1usize),
+            ("header prefix", LoadFaultStage::Header, 1usize),
+            ("header json", LoadFaultStage::Header, 2usize),
+            ("payload", LoadFaultStage::Payload, 1usize),
+            ("tail eof check", LoadFaultStage::Tail, 1usize),
+        ];
+        for (case_name, target_stage, fail_on_call) in load_state_cases {
+            let mut seen = 0usize;
+            let mut fired = false;
+            *manager.shared.load_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+                if s == target_stage && !fired {
+                    seen += 1;
+                    if seen == fail_on_call {
+                        fired = true;
+                        return Err(transient_eio());
+                    }
+                }
+                Ok(())
+            }));
+            let misses_before = manager.stats().misses;
+            buf.fill(0);
+            assert_eq!(
+                manager.load_state(key, fp, &layout, &[], &mut buf),
+                None,
+                "{case_name}: transient EIO in load_state must return None"
+            );
+            *manager.shared.load_fault_hook.lock().unwrap() = None;
+
+            let stats = manager.stats();
+            assert_eq!(
+                stats.misses,
+                misses_before + 1,
+                "{case_name}: transient EIO must count as one miss"
+            );
+            assert_eq!(
+                stats.corruptions, 0,
+                "{case_name}: transient EIO must not bump corruptions"
+            );
+            assert!(
+                manager.contains_in(&key, ColdGroup::DFlash2State),
+                "{case_name}: transient EIO must keep index entry"
+            );
+            assert!(
+                state_path.exists(),
+                "{case_name}: transient EIO must not unlink valid SSD copy"
+            );
+            assert_eq!(
+                manager.total_bytes(),
+                initial_total,
+                "{case_name}: quota accounting must stay unchanged"
+            );
+
+            buf.fill(0);
+            assert_eq!(
+                manager.load_state(key, fp, &layout, &[], &mut buf),
+                Some(old_label.clone()),
+                "{case_name}: immediate retry of load_state must succeed"
+            );
+            assert_eq!(buf, expected_payload);
+        }
+
+        // One-shot `ErrorKind::Interrupted` on payload AND tail retries transparently.
+        let mut payload_eintr = true;
+        let mut tail_eintr = true;
+        *manager.shared.load_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+            if s == LoadFaultStage::Payload && payload_eintr {
+                payload_eintr = false;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            if s == LoadFaultStage::Tail && tail_eintr {
+                tail_eintr = false;
+                return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+            }
+            Ok(())
+        }));
+        buf.fill(0);
+        assert_eq!(
+            manager.load_state(key, fp, &layout, &[], &mut buf),
+            Some(old_label.clone()),
+            "EINTR on payload and tail must retry and succeed"
+        );
+        *manager.shared.load_fault_hook.lock().unwrap() = None;
+        assert_eq!(buf, expected_payload);
+        assert_eq!(manager.stats().corruptions, 0);
+
+        // Transient EIO in `state_label` (open, header prefix/json, fstat metadata)
+        // must also preserve the SSD file and index without bumping corruptions.
+        let state_label_cases = [
+            ("state_label open", LoadFaultStage::Open, 1usize),
+            ("state_label header prefix", LoadFaultStage::Header, 1usize),
+            ("state_label header json", LoadFaultStage::Header, 2usize),
+            ("state_label metadata", LoadFaultStage::Metadata, 1usize),
+        ];
+        for (case_name, target_stage, fail_on_call) in state_label_cases {
+            let mut seen = 0usize;
+            let mut fired = false;
+            *manager.shared.load_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+                if s == target_stage && !fired {
+                    seen += 1;
+                    if seen == fail_on_call {
+                        fired = true;
+                        return Err(transient_eio());
+                    }
+                }
+                Ok(())
+            }));
+            assert_eq!(
+                manager.state_label(key, fp),
+                None,
+                "{case_name}: transient EIO must return None"
+            );
+            *manager.shared.load_fault_hook.lock().unwrap() = None;
+            assert_eq!(manager.stats().corruptions, 0);
+            assert!(manager.contains_in(&key, ColdGroup::DFlash2State));
+            assert!(state_path.exists());
+            assert_eq!(
+                manager.state_label(key, fp),
+                Some((layout.clone(), old_label.clone())),
+                "{case_name}: immediate retry of state_label must succeed"
+            );
+        }
+
+        // Transient EIO in `load` (KV block via `load_object_bounded`) must preserve
+        // the KV block file and index as well.
+        for (case_name, target_stage) in [
+            ("kv open", LoadFaultStage::Open),
+            ("kv payload", LoadFaultStage::Payload),
+        ] {
+            let mut fired = false;
+            *manager.shared.load_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+                if s == target_stage && !fired {
+                    fired = true;
+                    return Err(transient_eio());
+                }
+                Ok(())
+            }));
+            assert_eq!(manager.load(kv_key, fp), None);
+            *manager.shared.load_fault_hook.lock().unwrap() = None;
+            assert_eq!(manager.stats().corruptions, 0);
+            assert!(manager.contains(&kv_key));
+            assert!(kv_path.exists());
+            assert_eq!(
+                manager.load(kv_key, fp),
+                Some(kv_blk.clone()),
+                "{case_name}: immediate retry of KV load must succeed"
+            );
+        }
+
+        // Unpausing the writer lets the queued relabel commit cleanly over the
+        // preserved SSD state object.
+        drop(pause);
+        let relabeled = rrx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("queued relabel must complete after unpause");
+        assert_eq!(
+            relabeled,
+            StateRelabelLanded {
+                key,
+                ok: true,
+                bytes: promoted_bytes,
+            }
+        );
+        assert_eq!(manager.stats().corruptions, 0);
+        assert_eq!(
+            manager.total_bytes(),
+            initial_total - old_bytes + promoted_bytes
+        );
+        assert_eq!(
+            manager.state_label(key, fp),
+            Some((layout.clone(), promoted_label.clone()))
+        );
+        buf.fill(0);
+        assert_eq!(
+            manager.load_state(key, fp, &layout, &[], &mut buf),
+            Some(promoted_label)
+        );
+        assert_eq!(buf, expected_payload);
+
+        // Confirmed on-disk corruption in `load_state` still bumps corruptions and prunes.
+        type CorruptMutator = fn(&mut Vec<u8>);
+        let corrupt_cases: [(&str, CorruptMutator); 3] = [
+            ("truncated payload", |raw| raw.truncate(raw.len() - 1)),
+            ("trailing byte", |raw| raw.push(0x99)),
+            ("checksum mismatch", |raw| {
+                let last = raw.len() - 1;
+                raw[last] ^= 0xff;
+            }),
+        ];
+        for (idx, (case_name, mutate)) in corrupt_cases.into_iter().enumerate() {
+            let ckey = state_key(85 + idx as u32);
+            let obj = state_object(ckey, vec![1024, 512]);
+            let clayout = obj.layout.clone();
+            let clen = obj.payload.len();
+            manager
+                .enqueue_state(obj, MakeRoom::Evict, tx.clone())
+                .unwrap();
+            assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+            let cpath = root.join(object_file_name(&ckey, ColdGroup::DFlash2State));
+            let mut raw = fs::read(&cpath).unwrap();
+            mutate(&mut raw);
+            fs::write(&cpath, &raw).unwrap();
+
+            let before_corruptions = manager.stats().corruptions;
+            let mut cbuf = vec![0u8; clen];
+            assert_eq!(
+                manager.load_state(ckey, fp, &clayout, &[], &mut cbuf),
+                None,
+                "{case_name}: corrupt state must miss"
+            );
+            assert_eq!(
+                manager.stats().corruptions,
+                before_corruptions + 1,
+                "{case_name}: confirmed corruption must bump corruptions"
+            );
+            assert!(
+                !manager.contains_in(&ckey, ColdGroup::DFlash2State),
+                "{case_name}: confirmed corruption must prune index"
+            );
+            assert!(
+                !cpath.exists(),
+                "{case_name}: confirmed corruption must unlink file"
+            );
+        }
+
+        drop(manager);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn persist_space_errors_in_temp_create_sync_and_rename_do_not_poison_tracked_writes() {
+        let root = temp_root("persist-enospc-no-poison");
+        let fp = fingerprint();
+        let key = state_key(90);
+        let mut initial = state_object(key, vec![4096, 2048]);
+        initial.label.checkpoint = true;
+        initial.label.last_used = 10;
+        initial.payload.fill(0x11);
+        let layout = initial.layout.clone();
+        let old_label = initial.label.clone();
+        let old_payload = initial.payload.clone();
+        let old_bytes = state_object_bytes(&layout, &old_label);
+
+        let promoted_label = ColdStateLabel {
+            checkpoint: false,
+            last_used: 42,
+            ..old_label.clone()
+        };
+        let promoted_bytes = state_object_bytes(&layout, &promoted_label);
+
+        // Generous quota and zero reserve so the room pre-check passes and the
+        // space error hits temp-file creation, sync, or rename directly.
+        let manager = ColdCacheManager::open_at(root.clone(), 8 << 20, 0, 4).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (rtx, rrx) = mpsc::channel();
+
+        manager
+            .enqueue_state(initial, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
+        assert_eq!(manager.total_bytes(), old_bytes);
+
+        let assert_no_tmp_files = |ctx: &str| {
+            let leftover: Vec<_> = fs::read_dir(&root)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".tmp"))
+                .collect();
+            assert!(
+                leftover.is_empty(),
+                "{ctx}: failed persist must not leave temp files behind"
+            );
+        };
+
+        let make_enospc = || -> std::io::Error {
+            #[cfg(unix)]
+            {
+                std::io::Error::from_raw_os_error(libc::ENOSPC)
+            }
+            #[cfg(not(unix))]
+            {
+                std::io::Error::from(std::io::ErrorKind::StorageFull)
+            }
+        };
+
+        type ErrorFactory = fn() -> std::io::Error;
+        let mut space_errors: Vec<(&str, ErrorFactory)> = vec![
+            ("StorageFull", || {
+                std::io::Error::from(std::io::ErrorKind::StorageFull)
+            }),
+            ("ENOSPC", make_enospc),
+        ];
+        #[cfg(unix)]
+        space_errors.push(("EDQUOT", || std::io::Error::from_raw_os_error(libc::EDQUOT)));
+
+        let relabel_req = ColdStateRelabel {
+            key,
+            fingerprint: fp,
+            layout: layout.clone(),
+            label: promoted_label.clone(),
+        };
+        let mut buf = vec![0u8; old_payload.len()];
+
+        // 1. Pre-rename stages (`CreateTemp`, `SyncPayload`, `Rename`) failing with
+        //    space/quota errors during BOTH `enqueue_state_relabel` and `enqueue_state`:
+        //    must return `ok == false`, keep `takes_tracked_writes() == true`, leave no
+        //    temp files, and preserve the old committed anchor intact and readable.
+        for (err_name, make_err) in &space_errors {
+            for (stage_name, stage) in [
+                ("CreateTemp", PersistFaultStage::CreateTemp),
+                ("SyncPayload", PersistFaultStage::SyncPayload),
+                ("Rename", PersistFaultStage::Rename),
+            ] {
+                let make_err = *make_err;
+                let mut fired = false;
+                *manager.shared.persist_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+                    if s == stage && !fired {
+                        fired = true;
+                        return Err(make_err());
+                    }
+                    Ok(())
+                }));
+                manager
+                    .enqueue_state_relabel(relabel_req.clone(), MakeRoom::Refuse, rtx.clone())
+                    .unwrap();
+                let res = rrx
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("relabel space-error landing");
+                *manager.shared.persist_fault_hook.lock().unwrap() = None;
+
+                assert_eq!(
+                    res,
+                    StateRelabelLanded {
+                        key,
+                        ok: false,
+                        bytes: 0,
+                    },
+                    "relabel {stage_name}/{err_name}: must report ok == false"
+                );
+                assert!(
+                    manager.takes_tracked_writes(),
+                    "relabel {stage_name}/{err_name}: space error must NOT poison tracked_failed"
+                );
+                assert_no_tmp_files(&format!("relabel {stage_name}/{err_name}"));
+                assert_eq!(manager.total_bytes(), old_bytes);
+                assert_eq!(
+                    manager.state_label(key, fp),
+                    Some((layout.clone(), old_label.clone())),
+                    "relabel {stage_name}/{err_name}: old SSD anchor label must stay intact"
+                );
+                buf.fill(0);
+                assert_eq!(
+                    manager.load_state(key, fp, &layout, &[], &mut buf),
+                    Some(old_label.clone()),
+                    "relabel {stage_name}/{err_name}: old SSD anchor payload must stay readable"
+                );
+                assert_eq!(buf, old_payload);
+            }
+
+            // Also verify `enqueue_state` on `CreateTemp` and `SyncPayload` space errors.
+            for (stage_name, stage) in [
+                ("CreateTemp", PersistFaultStage::CreateTemp),
+                ("SyncPayload", PersistFaultStage::SyncPayload),
+            ] {
+                let make_err = *make_err;
+                let mut fired = false;
+                *manager.shared.persist_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+                    if s == stage && !fired {
+                        fired = true;
+                        return Err(make_err());
+                    }
+                    Ok(())
+                }));
+                let mut replacement = state_object(key, vec![4096, 2048]);
+                replacement.label = promoted_label.clone();
+                replacement.payload.fill(0x22);
+                manager
+                    .enqueue_state(replacement, MakeRoom::Evict, tx.clone())
+                    .unwrap();
+                match landed(&rx) {
+                    Landed::State {
+                        key: landed_key,
+                        ok,
+                        payload,
+                    } => {
+                        assert_eq!(landed_key, key);
+                        assert!(
+                            !ok,
+                            "state {stage_name}/{err_name}: must report ok == false"
+                        );
+                        assert_eq!(payload.len(), old_payload.len());
+                    }
+                    other => panic!("expected Landed::State, got {other:?}"),
+                }
+                *manager.shared.persist_fault_hook.lock().unwrap() = None;
+
+                assert!(
+                    manager.takes_tracked_writes(),
+                    "state {stage_name}/{err_name}: space error must NOT poison tracked_failed"
+                );
+                assert_no_tmp_files(&format!("state {stage_name}/{err_name}"));
+                assert_eq!(manager.total_bytes(), old_bytes);
+                buf.fill(0);
+                assert_eq!(
+                    manager.load_state(key, fp, &layout, &[], &mut buf),
+                    Some(old_label.clone()),
+                    "state {stage_name}/{err_name}: old SSD anchor must stay intact"
+                );
+                assert_eq!(buf, old_payload);
+            }
+        }
+
+        // 2. Subsequent tracked state write AND relabel both succeed cleanly!
+        let key2 = state_key(91);
+        let mut obj2 = state_object(key2, vec![1024, 512]);
+        obj2.payload.fill(0x33);
+        let layout2 = obj2.layout.clone();
+        let label2 = obj2.label.clone();
+        let payload2 = obj2.payload.clone();
+        manager
+            .enqueue_state(obj2, MakeRoom::Evict, tx.clone())
+            .unwrap();
+        assert!(matches!(
+            landed(&rx),
+            Landed::State { key: k, ok: true, .. } if k == key2
+        ));
+        let mut buf2 = vec![0u8; payload2.len()];
+        assert_eq!(
+            manager.load_state(key2, fp, &layout2, &[], &mut buf2),
+            Some(label2)
+        );
+        assert_eq!(buf2, payload2);
+
+        manager
+            .enqueue_state_relabel(relabel_req.clone(), MakeRoom::Refuse, rtx.clone())
+            .unwrap();
+        assert_eq!(
+            rrx.recv_timeout(Duration::from_secs(10))
+                .expect("follow-up relabel landing"),
+            StateRelabelLanded {
+                key,
+                ok: true,
+                bytes: promoted_bytes,
+            }
+        );
+        assert!(manager.takes_tracked_writes());
+        assert_eq!(
+            manager.state_label(key, fp),
+            Some((layout.clone(), promoted_label.clone()))
+        );
+        buf.fill(0);
+        assert_eq!(
+            manager.load_state(key, fp, &layout, &[], &mut buf),
+            Some(promoted_label.clone())
+        );
+        assert_eq!(buf, old_payload);
+
+        // 3. Post-rename directory `SyncDir` failing with ENOSPC also leaves
+        //    `takes_tracked_writes()` unpoisoned.
+        let mut dir_sync_fired = false;
+        *manager.shared.persist_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+            if s == PersistFaultStage::SyncDir && !dir_sync_fired {
+                dir_sync_fired = true;
+                return Err(make_enospc());
+            }
+            Ok(())
+        }));
+        let bumped_label = ColdStateLabel {
+            last_used: 77,
+            ..promoted_label
+        };
+        manager
+            .enqueue_state_relabel(
+                ColdStateRelabel {
+                    key,
+                    fingerprint: fp,
+                    layout: layout.clone(),
+                    label: bumped_label,
+                },
+                MakeRoom::Refuse,
+                rtx.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            rrx.recv_timeout(Duration::from_secs(10))
+                .expect("dir-sync ENOSPC landing"),
+            StateRelabelLanded {
+                key,
+                ok: false,
+                bytes: 0,
+            }
+        );
+        *manager.shared.persist_fault_hook.lock().unwrap() = None;
+        assert!(
+            manager.takes_tracked_writes(),
+            "dir-sync ENOSPC must NOT poison tracked_failed"
+        );
+
+        // 4. Negative control: a genuine non-space OS error (EIO) in `SyncPayload`
+        //    still trips `tracked_failed` as required by the tracked-write contract.
+        let mut eio_fired = false;
+        *manager.shared.persist_fault_hook.lock().unwrap() = Some(Box::new(move |s| {
+            if s == PersistFaultStage::SyncPayload && !eio_fired {
+                eio_fired = true;
+                return Err(std::io::Error::other("injected non-space sync EIO"));
+            }
+            Ok(())
+        }));
+        manager
+            .enqueue_state_relabel(relabel_req, MakeRoom::Refuse, rtx)
+            .unwrap();
+        assert_eq!(
+            rrx.recv_timeout(Duration::from_secs(10))
+                .expect("non-space sync EIO landing"),
+            StateRelabelLanded {
+                key,
+                ok: false,
+                bytes: 0,
+            }
+        );
+        *manager.shared.persist_fault_hook.lock().unwrap() = None;
+        assert!(
+            !manager.takes_tracked_writes(),
+            "non-space sync error must still poison tracked_failed"
+        );
 
         drop(manager);
         let _ = fs::remove_dir_all(root);
