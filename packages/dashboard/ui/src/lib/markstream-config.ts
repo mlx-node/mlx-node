@@ -44,8 +44,18 @@ export function chatMarkdownIt(md: MarkdownIt): MarkdownIt {
     true,
   );
   // The inline 'reference' rule is markstream's `[n]` mark: its tokens stop the parser from reusing settled blocks,
-  // so `[n]` stays text and the renderer finds the marks (`citePieces`).
+  // so it is off while an answer streams (see `chatCiteMarkdownIt`).
   md.inline.ruler.disable(['reference', 'math', 'ins', 'mark', 'sub', 'sup', 'footnote_ref', 'footnote_inline'], true);
+  return md;
+}
+
+/**
+ * The setup of a finished answer that cites sources: `chatMarkdownIt` with the `[n]` mark on, so a mark comes from the
+ * parser and an escaped `\[1\]` stays text.
+ */
+export function chatCiteMarkdownIt(md: MarkdownIt): MarkdownIt {
+  chatMarkdownIt(md);
+  md.inline.ruler.enable(['reference']);
   return md;
 }
 

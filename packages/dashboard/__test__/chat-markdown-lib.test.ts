@@ -1,9 +1,10 @@
 import { getMarkdown, parseMarkdownToStructure, type MarkdownIt, type ParsedNode } from 'stream-markdown-parser';
 import { describe, expect, it } from 'vite-plus/test';
 
-import { citeNumber, citePieces, linkView, visibleText, type LinkRule } from '../ui/src/lib/link-rule.js';
+import { citeNumber, linkView, visibleText, type LinkRule } from '../ui/src/lib/link-rule.js';
 import {
   CHAT_PARSE_OPTIONS,
+  chatCiteMarkdownIt,
   chatMarkdownIt,
   nodeWords,
   PACE_FRAME_MS,
@@ -201,6 +202,14 @@ describe('the chat parser setup', () => {
     expect(texts([cites])).toContain('see [1] and [12], not ');
   });
 
+  it('with sources, a written [n] is a mark and an escaped one stays text', () => {
+    const cites = only(parse('see \\[1\\] and [2]', chatCiteMarkdownIt(getMarkdown('test'))), 'paragraph');
+    const ids: string[] = [];
+    each([cites], (node) => node.type === 'reference' && ids.push(String((node as { id?: unknown }).id)));
+    expect(ids).toEqual(['2']);
+    expect(texts([cites])).toBe('see [1] and ');
+  });
+
   it('a diff fence keeps its whole text; an open fence says it is loading', () => {
     const diff = only(parse('```diff\n-old\n+new\n```'), 'code_block') as ParsedNode & { diff?: boolean };
     expect(diff.diff).toBe(true);
@@ -291,28 +300,6 @@ describe('[n] marks', () => {
   it('a mark is 1 to 99 without a leading 0', () => {
     expect(['1', '9', '10', '99'].map(citeNumber)).toEqual([1, 9, 10, 99]);
     expect(['0', '01', '100', '', 'a', '1a'].map(citeNumber)).toEqual([null, null, null, null, null, null]);
-  });
-
-  it('only a mark of a known source is cut out, and never one before "("', () => {
-    const known = new Set([1, 2, 99]);
-    expect(citePieces('a [1] b [100] c [0] d [2](x) e [99] f [3]', (n) => known.has(n))).toEqual([
-      { kind: 'text', text: 'a ' },
-      { kind: 'cite', n: 1 },
-      { kind: 'text', text: ' b [100] c [0] d [2](x) e ' },
-      { kind: 'cite', n: 99 },
-      { kind: 'text', text: ' f [3]' },
-    ]);
-    expect(citePieces('[1][2]', (n) => known.has(n))).toEqual([
-      { kind: 'cite', n: 1 },
-      { kind: 'cite', n: 2 },
-    ]);
-    expect(citePieces('', () => true)).toEqual([{ kind: 'text', text: '' }]);
-  });
-
-  it('many open brackets cost time in proportion to their number', () => {
-    const started = performance.now();
-    expect(citePieces('['.repeat(400_000), () => true)).toHaveLength(1);
-    expect(performance.now() - started).toBeLessThan(500);
   });
 });
 

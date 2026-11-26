@@ -99,26 +99,3 @@ export function citeNumber(text: string): number | null {
   if (text[0] === '0') return null;
   return Number(text);
 }
-
-export type CitePiece = { kind: 'text'; text: string } | { kind: 'cite'; n: number };
-
-/**
- * `text` cut at each `[n]` mark whose number `isSource` knows. A mark right before `(` is not one: that is a link
- * the parser refused. Linear: a mark is at most four characters, so no scan runs past it.
- */
-export function citePieces(text: string, isSource: (n: number) => boolean): CitePiece[] {
-  const out: CitePiece[] = [];
-  let start = 0;
-  for (let i = text.indexOf('['); i !== -1; i = text.indexOf('[', i + 1)) {
-    const close = text[i + 2] === ']' ? i + 2 : text[i + 3] === ']' ? i + 3 : -1;
-    if (close === -1) continue;
-    const n = citeNumber(text.slice(i + 1, close));
-    if (n === null || text[close + 1] === '(' || !isSource(n)) continue;
-    if (i > start) out.push({ kind: 'text', text: text.slice(start, i) });
-    out.push({ kind: 'cite', n });
-    start = close + 1;
-    i = close;
-  }
-  if (start < text.length || out.length === 0) out.push({ kind: 'text', text: text.slice(start) });
-  return out;
-}

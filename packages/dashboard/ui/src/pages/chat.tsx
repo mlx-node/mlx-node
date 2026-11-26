@@ -774,6 +774,10 @@ export default function Chat(): ReactElement {
         });
   // Rewind to here: the message menu, `/rewind` and the palette; off while the conversation works, as on the host.
   const rewindEntries = isNew ? null : (conv?.entries ?? null);
+  const rewindEntriesRef = useRef(rewindEntries);
+  useLayoutEffect(() => {
+    rewindEntriesRef.current = rewindEntries;
+  });
   const rewindLast = useMemo(() => (rewindEntries === null ? null : lastRewindPoint(rewindEntries)), [rewindEntries]);
   // The row of the goal that is still open: a rewind to a message before it would leave the goal with no strip.
   const goalAt = useMemo(() => (rewindEntries === null ? null : openGoalAt(rewindEntries)), [rewindEntries]);
@@ -958,7 +962,7 @@ export default function Chat(): ReactElement {
   const forkNow = useCallback(
     (entry: number | null) => {
       if (isNew || conversationId === null) return;
-      const message = entry === null ? undefined : rewindEntries?.[entry];
+      const message = entry === null ? undefined : rewindEntriesRef.current?.[entry];
       if (entry !== null && message === undefined) return;
       const from = conversationId;
       setForking(from);
@@ -974,7 +978,7 @@ export default function Chat(): ReactElement {
         })
         .finally(() => setForking((current) => (current === from ? null : current)));
     },
-    [isNew, conversationId, openFolder, navigate, rewindEntries],
+    [isNew, conversationId, openFolder, navigate],
   );
   const threadRewind = useMemo(
     () => (isNew ? undefined : { off: rewindReason, offAt: rewindAt, onRewind: rewindOnMessage, onFork: forkNow }),

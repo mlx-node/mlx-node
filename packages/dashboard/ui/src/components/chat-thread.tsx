@@ -13,6 +13,7 @@ import {
 import {
   createContext,
   memo,
+  use,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -370,8 +371,8 @@ function ThreadRuleRow({ words, ts }: { words: string; ts?: number }): ReactElem
 /** The host's wake reports by wake `ts` (live only); read by the wake rows alone. */
 const WakeReportsContext = createContext<ReadonlyMap<number, readonly WakeTask[]>>(new Map());
 /**
- * Read by each run block and agent row, so a finished turn does not re-render when a run's host state or an agent's
- * progress changes.
+ * Read by each run block, agent row and tool row whose task may still run, so a finished turn does not re-render when
+ * a run's host state or an agent's progress changes.
  */
 const RunsContext = createContext<ThreadRuns>(NO_RUNS);
 /** Read by every agent row and run block: an agent's live state reaches a finished turn only through it. */
@@ -705,21 +706,31 @@ function taskWord(entry: Entry<'tool'>, agentLive: boolean, live: TaskLive | nul
     : CHAT.task.inBackground;
 }
 
-/** The live facts of the task this call started while it runs in the running agent; null otherwise. */
-function useTaskLive(entry: Entry<'tool'>): TaskLive | null {
-  const { live, agentLive } = useContext(RunsContext);
-  const task = entry.task;
-  if (task === undefined || task.endTs !== undefined || !agentLive) return null;
-  return taskLiveOf(live, task.id);
+interface TaskState {
+  agentLive: boolean;
+  /** The live facts of the task while it runs in the running agent; null otherwise. */
+  live: TaskLive | null;
 }
 
-/** A tool row, with a running monitor's events under it. */
+const NO_TASK: TaskState = { agentLive: true, live: null };
+
+/**
+ * The agent's state and the live facts of the task this call started. Only a call whose task may still run reads the
+ * thread's live state; any other row that read it would re-render on each live update.
+ */
+function useTaskLive(entry: Entry<'tool'>): TaskState {
+  const task = entry.task;
+  if (task === undefined || task.endTs !== undefined || task.killed === true) return NO_TASK;
+  const { live, agentLive } = use(RunsContext);
+  return { agentLive, live: agentLive ? taskLiveOf(live, task.id) : null };
+}
+
+/** A tool row, with a running monitor's events under it. The row keeps its place, so it is not mounted again. */
 function withEvents(row: ReactElement, task: TaskLive | null): ReactElement {
-  if (task === null || task.events === 0 || task.recent.length === 0) return row;
   return (
     <div className="grid min-w-0 gap-1">
       {row}
-      <TaskEvents task={task} />
+      {task !== null && task.events > 0 && task.recent.length > 0 ? <TaskEvents task={task} /> : null}
     </div>
   );
 }
@@ -941,8 +952,7 @@ function WorkRow(props: {
   asking: boolean;
 }): ReactElement {
   const { entry, call } = props;
-  const { agentLive } = useContext(RunsContext);
-  const taskLive = useTaskLive(entry);
+  const { agentLive, live: taskLive } = useTaskLive(entry);
   const mapped = toolStatus(entry.status);
   const unfinished = !props.live && (mapped.status === 'running' || mapped.status === 'pending');
   const status: ToolStatus = unfinished ? 'other' : mapped.status;
@@ -1050,8 +1060,7 @@ function GenericRow({
   denied?: DeniedMark;
   temp: string | null;
 }): ReactElement {
-  const { agentLive } = useContext(RunsContext);
-  const taskLive = useTaskLive(entry);
+  const { agentLive, live: taskLive } = useTaskLive(entry);
   const mapped = toolStatus(entry.status);
   const unfinished = !live && (mapped.status === 'running' || mapped.status === 'pending');
   const status: ToolStatus = unfinished ? 'other' : mapped.status;

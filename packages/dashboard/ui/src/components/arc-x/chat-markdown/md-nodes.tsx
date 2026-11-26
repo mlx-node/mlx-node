@@ -16,7 +16,7 @@ import type {
 } from 'stream-markdown-parser';
 
 import { CHAT, fill } from '../../../lib/chat-strings';
-import { citeNumber, citePieces, linkView, type LinkRule, type LinkView } from '../../../lib/link-rule';
+import { citeNumber, linkView, type LinkRule, type LinkView } from '../../../lib/link-rule';
 import { nodeWords } from '../../../lib/markstream-config';
 import { CodePanel } from '../code-panel/code-panel';
 import { CitationChip } from '../source-list/source-list';
@@ -89,32 +89,16 @@ function Cite({ n }: { n: number }): ReactNode {
   return <CitationChip n={n} title={source.title} host={source.host} onSelect={() => onCite(n)} />;
 }
 
-/** Plain text keeps markstream's word fade; a `[n]` that names a source becomes a chip between its pieces. */
+/** Plain text keeps markstream's word fade. */
 function Text(props: NodeProps): ReactNode {
-  const chat = useContext(ChatMdContext);
-  const inLink = useContext(InLinkContext);
-  const node = props.node as TextNodeData;
-  const citations = chat.citations;
-  const plain = (
-    <TextNode node={node} ctx={props.ctx} indexKey={props.indexKey} typewriter={props.typewriter} fade={props.fade} />
-  );
-  if (inLink || citations === undefined || chat.onCite === undefined) return plain;
-  const pieces = citePieces(String(node.content ?? ''), (n) => citations.has(n));
-  if (pieces.length === 1 && pieces[0]!.kind === 'text') return plain;
-  const key = keyOf(props, 'text');
-  return pieces.map((piece, index) =>
-    piece.kind === 'cite' ? (
-      <Cite key={`c${index}`} n={piece.n} />
-    ) : (
-      <TextNode
-        key={`t${index}`}
-        node={{ type: 'text', content: piece.text }}
-        ctx={props.ctx}
-        indexKey={index === 0 ? props.indexKey : `${key}-t${index}`}
-        typewriter={props.typewriter}
-        fade={props.fade}
-      />
-    ),
+  return (
+    <TextNode
+      node={props.node as TextNodeData}
+      ctx={props.ctx}
+      indexKey={props.indexKey}
+      typewriter={props.typewriter}
+      fade={props.fade}
+    />
   );
 }
 

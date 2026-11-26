@@ -12,7 +12,7 @@ import {
 
 import { cn } from '../../../lib/cn';
 import { visibleText, type LinkRule } from '../../../lib/link-rule';
-import { CHAT_PARSE_OPTIONS, chatMarkdownIt, paceHoldMs } from '../../../lib/markstream-config';
+import { CHAT_PARSE_OPTIONS, chatCiteMarkdownIt, chatMarkdownIt, paceHoldMs } from '../../../lib/markstream-config';
 import { useRichMotion } from '../motion/use-entrance';
 import styles from './chat-markdown.module.css';
 import { ChatMdContext, NODES, type ChatMd } from './md-nodes';
@@ -84,14 +84,17 @@ function MarkdownBody(props: ChatMarkdownProps): ReactElement {
   const latest = useMemo(() => visibleText(props.text), [props.text]);
   const content = usePacedText(latest, streaming);
   const fade = rich && streaming;
-  // The same element while the text is held, so the renderer does not render again.
+  const cites = citations !== undefined;
+  // The same element while the text is held, so the renderer does not render again. The renderer keeps a block whose
+  // source did not change, so the citing setup mounts a new one.
   const body = useMemo(
     () => (
       <NodeRenderer
+        key={cites ? 'cites' : 'plain'}
         content={content}
         final={!streaming}
         customId={CUSTOM_ID}
-        customMarkdownIt={chatMarkdownIt}
+        customMarkdownIt={cites ? chatCiteMarkdownIt : chatMarkdownIt}
         parseOptions={CHAT_PARSE_OPTIONS}
         htmlPolicy="escape"
         renderCodeBlocksAsPre
@@ -106,7 +109,7 @@ function MarkdownBody(props: ChatMarkdownProps): ReactElement {
         showTooltips={false}
       />
     ),
-    [content, streaming, fade],
+    [content, streaming, fade, cites],
   );
   return (
     <div className={cn(styles.root, props.className)}>

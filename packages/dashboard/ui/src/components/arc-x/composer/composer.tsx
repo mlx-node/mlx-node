@@ -236,8 +236,16 @@ export function Composer(props: ComposerProps): ReactElement {
     if (token === null || row === undefined) return;
     const rest = props.value.slice(token.end);
     const tail = rest.startsWith(' ') ? rest : ` ${rest}`;
-    nextCaret.current = token.start + row.name.length + 2;
-    props.onValueChange(`${props.value.slice(0, token.start)}/${row.name}${tail}`);
+    const text = `${props.value.slice(0, token.start)}/${row.name}${tail}`;
+    const want = token.start + row.name.length + 2;
+    // The same text does not change the value, so the caret effect would not run and the request would stay pending.
+    if (text === props.value) {
+      area.current?.setSelectionRange(want, want);
+      setCaret(want);
+      return;
+    }
+    nextCaret.current = want;
+    props.onValueChange(text);
   };
 
   const attach = useCallback(
