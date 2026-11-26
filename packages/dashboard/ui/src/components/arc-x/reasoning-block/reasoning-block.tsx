@@ -4,6 +4,7 @@ import { useId, useLayoutEffect, useRef, useState, type ReactElement } from 'rea
 
 import { cn } from '../../../lib/cn';
 import { formatDuration } from '../../../lib/format';
+import { ChatMarkdown, type LinkRule } from '../chat-markdown/chat-markdown';
 import { LiveLabel } from '../live-label/live-label';
 import { motionX } from '../motion/motion';
 import { useRichMotion } from '../motion/use-entrance';
@@ -24,11 +25,12 @@ export interface ReasoningBlockProps {
   asOfMs?: number;
   /** With live: length of `text` already shown before this render; the rest fades in. Default text.length. */
   freshFrom?: number;
+  /** The link rule of the answers beside this block. Given: the opened body is Markdown; absent: plain text. */
+  links?: LinkRule;
   className?: string;
 }
 
 const INSTANT = { duration: 0 } as const;
-const TAIL_PX = 40;
 /** The live tail shows the last two lines: it draws only the end of the text, cut at a line start. */
 const TAIL_CHARS = 1_200;
 const TAIL_STEP = 4_000;
@@ -94,6 +96,8 @@ export function ReasoningBlock(props: ReasoningBlockProps): ReactElement {
       return;
     }
     const height = node.getBoundingClientRect().height;
+    const box = node.parentElement;
+    if (box !== null) box.toggleAttribute('data-clipped', height > box.clientHeight);
     const previous = tailHeight.current;
     tailHeight.current = height;
     if (previous === null || height <= previous) return;
@@ -134,7 +138,7 @@ export function ReasoningBlock(props: ReasoningBlockProps): ReactElement {
         className={styles.tailClip}
         aria-hidden="true"
         initial={false}
-        animate={{ height: tail ? TAIL_PX : 0 }}
+        animate={{ height: tail ? 'auto' : 0 }}
         transition={staticMotion ? INSTANT : motionX.spring.expand}
       >
         {tail ? (
@@ -160,8 +164,22 @@ export function ReasoningBlock(props: ReasoningBlockProps): ReactElement {
         }}
       >
         {bodyMounted ? (
-          <div className={styles.body} data-enter={staticMotion || !open ? undefined : ''}>
-            <FreshText text={props.text} freshFrom={fresh} />
+          <div
+            className={styles.body}
+            data-enter={staticMotion || !open ? undefined : ''}
+            data-markdown={props.links !== undefined ? '' : undefined}
+          >
+            {props.links !== undefined ? (
+              <ChatMarkdown
+                className={styles.markdown}
+                text={props.text}
+                streaming={live}
+                links={props.links}
+                images="alt"
+              />
+            ) : (
+              <FreshText text={props.text} freshFrom={fresh} />
+            )}
           </div>
         ) : null}
       </motion.div>

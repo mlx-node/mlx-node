@@ -4,10 +4,10 @@
  *
  *   yarn workspace @mlx-node/desktop winget:manifests \
  *     --version 0.0.21 \
- *     --zip out/mlx-node-0.0.21-win32-arm64.zip \
+ *     --zip out/Portato-0.0.21-win32-arm64.zip \
  *     [--tag v0.0.21] \
  *     [--out out/winget] \
- *     [--id mlx-node.mlx-node] \
+ *     [--id LongYinan.Portato] \
  *     [--repo mlx-node/mlx-node] \
  *     [--release-date YYYY-MM-DD]
  *
@@ -21,11 +21,12 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 
+import { APP_NAME } from '../src/app-name.js';
 import { PayloadError } from './payload.js';
 import { assertSemver, ReleaseVersionError, versionFromTag, windowsZipFileName } from './release-version.js';
 
 export const WINGET_MANIFEST_VERSION = '1.12.0';
-export const DEFAULT_WINGET_PACKAGE_ID = 'mlx-node.mlx-node';
+export const DEFAULT_WINGET_PACKAGE_ID = 'LongYinan.Portato';
 export const DEFAULT_WINGET_REPO = 'mlx-node/mlx-node';
 export const WINGET_SHORT_DESCRIPTION = 'Local AI inference and control panel for Apple Silicon and NVIDIA CUDA';
 
@@ -42,7 +43,7 @@ export interface WingetManifestInput {
   tag?: string;
   /** 64-character hex SHA-256 of the Windows ARM64 portable ZIP. */
   sha256: string;
-  /** WinGet package identifier (`Publisher.Package`, default `mlx-node.mlx-node`). */
+  /** WinGet package identifier (`Publisher.Package`, default `LongYinan.Portato`). */
   packageIdentifier?: string;
   /** GitHub `owner/repo` hosting the release assets (default `mlx-node/mlx-node`). */
   repo?: string;
@@ -96,7 +97,7 @@ export function assertWingetPackageId(packageIdentifier: string): string {
   if (!PACKAGE_ID_PATTERN.test(trimmed) || trimmed.length > 128) {
     throw new PayloadError(
       `Invalid WinGet PackageIdentifier: ${JSON.stringify(packageIdentifier)}`,
-      'expected Publisher.Package (two or more dot-separated alphanumeric/hyphen segments, e.g. mlx-node.mlx-node)',
+      'expected Publisher.Package (two or more dot-separated alphanumeric/hyphen segments, e.g. LongYinan.Portato)',
     );
   }
   return trimmed;
@@ -226,7 +227,7 @@ export function generateWingetManifests(input: WingetManifestInput): GeneratedWi
       'InstallerType: zip',
       'NestedInstallerType: portable',
       'NestedInstallerFiles:',
-      '- RelativeFilePath: mlx-node-win32-arm64\\mlx-node.exe',
+      `- RelativeFilePath: ${APP_NAME}-win32-arm64\\mlx-node.exe`,
       '  PortableCommandAlias: mlx-node',
       'ArchiveBinariesDependOnPath: true',
       `ReleaseDate: ${releaseDate}`,
@@ -247,7 +248,7 @@ export function generateWingetManifests(input: WingetManifestInput): GeneratedWi
       'PackageLocale: en-US',
       `Publisher: ${owner}`,
       `PublisherUrl: ${publisherUrl}`,
-      'PackageName: mlx-node',
+      `PackageName: ${APP_NAME}`,
       `PackageUrl: ${packageUrl}`,
       'License: MIT',
       `ShortDescription: ${WINGET_SHORT_DESCRIPTION}`,

@@ -9,7 +9,7 @@ import type { ApiCall } from '../src/runtime.js';
 import type { DraftAttachment } from '../ui/src/lib/chat-attachments.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState, ChatMode, ConversationInfo, ConversationRow } from '../ui/src/lib/chat-types.js';
-import { formatBytes } from '../ui/src/lib/format.js';
+import { formatBytes, formatCount } from '../ui/src/lib/format.js';
 import { PROVIDERS } from '../ui/src/lib/providers-strings.js';
 import type { KeyCheck, ProviderId, ProvidersResponse, SearchProviderId } from '../ui/src/lib/providers-types.js';
 import type { CrawlerValue } from '../ui/src/lib/providers-view.js';
@@ -39,14 +39,17 @@ import {
   writeFailed,
 } from '../ui/src/pages/chat/drafts.js';
 import { chatHostSnapshot } from '../ui/src/pages/chat/use-chat-host.js';
+import { type AppCommand, usePageCommands } from '../ui/src/shell/commands.js';
 import {
   answer,
   end,
   FORGED_CITATION,
+  metric,
   RECORDED_DIRECT,
   RECORDED_USE_TOOL,
   user,
 } from './helpers/chat-thread-fixtures.js';
+import { runView } from './helpers/run-views.js';
 import {
   accessibleName,
   allByRole,
@@ -79,11 +82,18 @@ function LocationSpy(): null {
   return null;
 }
 
+let commands: readonly AppCommand[] = [];
+function CommandSpy(): null {
+  commands = usePageCommands();
+  return null;
+}
+
 function app(initial: string): ReactElement {
   return createElement(
     MemoryRouter,
     { initialEntries: [initial] },
     createElement(LocationSpy),
+    createElement(CommandSpy),
     createElement(
       Routes,
       null,
@@ -126,6 +136,7 @@ function sync(id: string, over: Partial<ChatSync> = {}, conversation: Partial<Co
     transcriptError: null,
     permissionMarks: [],
     runs: [],
+    live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
     ...over,
   };
 }
@@ -298,7 +309,7 @@ function selections(): unknown[] {
 
 /** The "Web search" row of the `+` menu. */
 function webMenuRow(): HTMLElement {
-  return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[1]!;
+  return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[2]!;
 }
 
 /** A row of the web search panel by its label. */
@@ -361,11 +372,10 @@ afterEach(() => {
 describe('Chat page: places and modes', () => {
   it('opens the New screen of the stored mode; ?mode= wins and is stored', async () => {
     localStorage.setItem('mlx-node:chat-mode:v1', 'work');
-    await open('/chat', (text) => text.includes(CHAT.heroWorkTitle));
+    await open('/chat', (text) => text.includes(CHAT.heroWorkNoneTitle));
     expect(heading()).toBe(CHAT.newWork);
     type('Summarize');
-    expect(shown()).toContain(CHAT.folderNeeded);
-    expect(sendFace().disabled).toBe(true);
+    expect(sendFace().disabled).toBe(false);
     page!.unmount();
     api!();
     await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
@@ -377,7 +387,7 @@ describe('Chat page: places and modes', () => {
     await open('/chat?c=p-open', (text) => text.includes('Hi there'), { conversations: { 'p-open': sync('p-open') } });
     expect(heading()).toBe('Title p-open');
     await waitFor(() => document.activeElement === composer());
-    expect(document.title).toBe('Title p-open — mlx-node');
+    expect(document.title).toBe('Title p-open — Portato');
     const said = allByRole(page!.container, 'status').map((node) => node.textContent ?? '');
     expect(said).toContain(fill(CHAT.status.opened, { title: 'Title p-open' }));
   });
@@ -387,7 +397,7 @@ describe('Chat page: places and modes', () => {
     type('Half a thought');
     click(button(CHAT.modeWork));
     await waitFor(() => where.search === '?mode=work');
-    await waitFor(() => shown().includes(CHAT.heroWorkTitle));
+    await waitFor(() => shown().includes(CHAT.heroWorkNoneTitle));
     expect(composer().value).toBe('Half a thought');
     expect(writes()).toEqual([]);
   });
@@ -738,12 +748,12 @@ describe('Chat page: sending', () => {
     expect(composer().value).toBe('second');
   });
 
-  it('slash text keeps Send off, also after spaces or a new line, and Enter sends nothing', async () => {
+  it('an unknown command keeps Send off, also after spaces or a new line, and Enter sends nothing', async () => {
     await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
-    for (const text of ['/help', '   /help', '\n/help']) {
+    for (const text of ['/help', '   /help', '\n/help', '/goal ship it', '/yolo', '/a/b']) {
       type(text);
       expect(sendFace().disabled).toBe(true);
-      expect(shown()).toContain(CHAT.slashText);
+      expect(shown()).toContain(CHAT.slash.unknown);
       key(composer(), { key: 'Enter' });
     }
     type('Hello');
@@ -811,7 +821,6 @@ describe('Chat page: sending', () => {
 
   it.each([
     ['tool-refused', CHAT.outcomes['tool-refused']],
-    ['address-refused', CHAT.outcomes['address-refused']],
     ['arguments-unreadable', CHAT.outcomes['arguments-unreadable']],
     ['tool-loop', CHAT.outcomes['tool-loop']],
   ] as const)('a %s end says why and offers Send again', async (outcome, words) => {
@@ -912,8 +921,9 @@ describe('Chat page: Escape', () => {
 });
 
 describe('Chat page: the context hint', () => {
+  // The ring is the Context panel's button on a conversation.
   const hint = (): HTMLElement | null =>
-    page!.container.querySelector<HTMLElement>('form [role="img"][aria-label^="Context:"]');
+    page!.container.querySelector<HTMLElement>('form button[aria-haspopup="dialog"][aria-label^="Context:"]');
 
   it('the composer shows the conversation’s use of its model’s window, and it moves with the stream', async () => {
     const host: ChatHostState = { ...READY_CHAT_HOST, models: [hostModel('qwen3.5-4b', 262_144)] };
@@ -922,9 +932,9 @@ describe('Chat page: the context hint', () => {
       conversations: { 'p-context': sync('p-context', { contextUsed: 11_971 }) },
     });
     await waitFor(() => hint() !== null);
-    expect(hint()!.getAttribute('aria-label')).toBe('Context: 11,971 of 262,144 tokens (5%)');
+    expect(hint()!.getAttribute('aria-label')).toBe('Context: 11.7K of 256K tokens (5%)');
     act(() => api!.emitChat('p-context', { type: 'ops', seq: 1, ops: [{ op: 'context', used: 220_000 }] }));
-    await waitFor(() => hint()?.getAttribute('aria-label') === 'Context: 220,000 of 262,144 tokens (84%)');
+    await waitFor(() => hint()?.getAttribute('aria-label') === 'Context: 215K of 256K tokens (84%)');
     expect(hint()!.getAttribute('data-tone')).toBe('warning');
   });
 
@@ -1190,6 +1200,1115 @@ describe('Chat page: a message that waits for its model', () => {
   });
 });
 
+describe('Chat page: Compact now', () => {
+  const RUNNING = { turnId: 't', phase: 'running' as const, startedAt: NOW, wait: null };
+  const compactRow = (): HTMLElement | null => byRole(document.body, 'menuitem', CHAT.history.compact);
+  const compactWrites = (id: string) => writes().filter((w) => w.path === `/chat/conversations/${id}/compact`);
+  const openMenu = async (): Promise<HTMLElement> => {
+    click(button(CHAT.history.threadMenu));
+    await waitFor(() => compactRow() !== null);
+    return compactRow()!;
+  };
+  const noteOf = (row: HTMLElement | null): string =>
+    row === null ? '' : (document.getElementById(row.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+  const statusText = (): string =>
+    [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent ?? '').join(' ');
+
+  it('the ⋯ row posts compact once; the wait line and Stop come from the stream; the end leaves the mark and says it', async () => {
+    await open('/chat?c=p-cn', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-cn/compact': {} },
+      conversations: { 'p-cn': sync('p-cn', { turns: [metric()], contextUsed: 16_384 }) },
+    });
+    expect(commands.some((c) => c.id === 'chat:compact' && c.label === CHAT.commands.compact)).toBe(true);
+    const row = await openMenu();
+    expect(row.getAttribute('aria-disabled')).toBeNull();
+    expect(noteOf(row)).toBe(CHAT.history.compactNote);
+    expect(row.textContent).toContain(fill(CHAT.history.compactFull, { n: 50 }));
+    click(row);
+    await waitFor(() => compactWrites('p-cn').length === 1);
+    expect(compactWrites('p-cn')).toEqual([
+      { method: 'POST', path: '/chat/conversations/p-cn/compact', body: undefined },
+    ]);
+    await waitFor(() => compactRow() === null);
+    await waitFor(() => document.activeElement === composer());
+
+    act(() =>
+      api!.emitChat('p-cn', {
+        type: 'compaction',
+        seq: 1,
+        compaction: { phase: 'running', startedAt: NOW, tokensBefore: 16_384 },
+      }),
+    );
+    await waitFor(() => page!.container.querySelector('[data-wait-line="fold"]') !== null);
+    expect(shown()).toContain(CHAT.compacting);
+    type('next question');
+    // Text typed while it compacts: the round button queues it, and Stop is the small square before it.
+    expect(accessibleName(sendFace())).toBe(CHAT.queue.add);
+    expect(button(CHAT.stop)).not.toBeNull();
+    expect(commands.some((c) => c.id === 'chat:compact')).toBe(false);
+    expect(commands.some((c) => c.id === 'chat:stop')).toBe(true);
+    const off = await openMenu();
+    expect(off.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(off)).toBe(CHAT.modelBusy);
+    click(off);
+    await flushTimers();
+    expect(compactWrites('p-cn')).toHaveLength(1);
+    key(off, { key: 'Escape' });
+
+    act(() =>
+      api!.emitChat('p-cn', {
+        type: 'ops',
+        seq: 2,
+        ops: [
+          {
+            op: 'push',
+            entry: { kind: 'compaction', ts: NOW, outcome: 'done', tokensBefore: 16_384, tokensAfter: 2_048 },
+          },
+        ],
+      }),
+    );
+    act(() => api!.emitChat('p-cn', { type: 'compaction', seq: 3, compaction: null, end: 'compacted' }));
+    await waitFor(() => page!.container.querySelector('[data-wait-line="fold"]') === null);
+    expect(page!.container.querySelector('[data-compaction-mark="done"]')).not.toBeNull();
+    await waitFor(() =>
+      statusText().includes(
+        fill(CHAT.history.compactedSaid, { before: formatCount(16_384), after: formatCount(2_048) }),
+      ),
+    );
+    expect(accessibleName(sendFace())).toBe(CHAT.send);
+  });
+
+  it('Stop and Esc end a manual run: one cancel, the face reads Stopping, a stop is a toast and a failure an error', async () => {
+    const info = vi.spyOn(toast, 'info');
+    const error = vi.spyOn(toast, 'error');
+    await open('/chat?c=p-cs', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-cs/cancel': { cancelled: true } },
+      conversations: {
+        'p-cs': sync('p-cs', { turns: [metric()], compaction: { phase: 'running', startedAt: NOW - 2_000 } }),
+      },
+    });
+    await waitFor(() => accessibleName(sendFace()) === CHAT.stop);
+    key(composer(), { key: 'Escape' });
+    await waitFor(() => writes().filter((w) => w.path.endsWith('/p-cs/cancel')).length === 1);
+    act(() =>
+      api!.emitChat('p-cs', { type: 'compaction', seq: 1, compaction: { phase: 'stopping', startedAt: NOW - 2_000 } }),
+    );
+    await waitFor(() => accessibleName(sendFace()) === CHAT.stopping);
+    click(sendFace());
+    key(composer(), { key: 'Escape' });
+    await flushTimers();
+    expect(writes().filter((w) => w.path.endsWith('/p-cs/cancel'))).toHaveLength(1);
+    act(() => api!.emitChat('p-cs', { type: 'compaction', seq: 2, compaction: null, end: 'stopped' }));
+    await waitFor(() => info.mock.calls.some((c) => c[0] === CHAT.compactStopped));
+    expect(statusText()).toContain(CHAT.compactStopped);
+    expect(page!.container.querySelector('[data-compaction-mark]')).toBeNull();
+
+    act(() => api!.emitChat('p-cs', { type: 'compaction', seq: 3, compaction: { phase: 'running', startedAt: NOW } }));
+    act(() => api!.emitChat('p-cs', { type: 'compaction', seq: 4, compaction: null, end: 'failed' }));
+    await waitFor(() => error.mock.calls.some((c) => c[0] === CHAT.compactFailed));
+    expect(info.mock.calls.filter((c) => c[0] === CHAT.compactStopped)).toHaveLength(1);
+    info.mockRestore();
+    error.mockRestore();
+  });
+
+  it('a refused press is one error toast: the engine stopped, busy, else Compaction failed.', async () => {
+    const error = vi.spyOn(toast, 'error');
+    await open('/chat?c=p-cr', (text) => text.includes('Hi there'), {
+      routes: {
+        'POST /chat/conversations/p-cr/compact': sequence(
+          stubError('E_UNAVAILABLE', 'The inference engine is not running.', 'inference-stopped'),
+          stubError('E_CONFLICT', 'busy', 'conversation-busy'),
+          stubError('E_UNAVAILABLE', 'The agent did not answer.'),
+        ),
+      },
+      conversations: { 'p-cr': sync('p-cr', { turns: [metric()] }) },
+    });
+    const said = [CHAT.blockers['inference-stopped'][1], CHAT.sendErrors['conversation-busy'][0], CHAT.compactFailed];
+    for (const [n, words] of said.entries()) {
+      click(await openMenu());
+      await waitFor(() => compactWrites('p-cr').length === n + 1);
+      await waitFor(() => error.mock.calls.length === n + 1);
+      expect(error.mock.calls[n]![0]).toBe(words);
+    }
+    error.mockRestore();
+  });
+
+  it('the row is off, focusable and says why: an answer runs, nothing finished yet, the engine stopped', async () => {
+    await open('/chat?c=p-co', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-co/compact': {} },
+      conversations: {
+        'p-co': sync('p-co', { turns: [metric()], turn: RUNNING }),
+        'p-co-new': sync('p-co-new', { turns: [] }),
+        'p-co-idle': sync('p-co-idle', { turns: [metric()] }),
+      },
+      rows: [row('p-co'), row('p-co-new'), row('p-co-idle')],
+    });
+    let off = await openMenu();
+    expect(off.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(off)).toBe(CHAT.modelBusy);
+    expect(commands.some((c) => c.id === 'chat:compact')).toBe(false);
+    key(off, { key: 'Escape' });
+    await waitFor(() => compactRow() === null);
+
+    click(rowLink('Title p-co-new'));
+    await waitFor(() => where.search.includes('p-co-new'));
+    await waitFor(() => heading() === 'Title p-co-new');
+    await flushTimers();
+    off = await openMenu();
+    await waitFor(() => noteOf(compactRow()!) === CHAT.history.compactEmpty);
+    off = compactRow()!;
+    key(off, { key: 'Escape' });
+    await waitFor(() => compactRow() === null);
+
+    act(() => api!.emitChatHost({ type: 'state', state: host({ inference: 'stopped' }) }));
+    click(rowLink('Title p-co-idle'));
+    await waitFor(() => heading() === 'Title p-co-idle');
+    await flushTimers();
+    off = await openMenu();
+    await waitFor(() => noteOf(compactRow()!) === CHAT.blockers['inference-stopped'][1]);
+    off = compactRow()!;
+    expect(off.getAttribute('aria-disabled')).toBe('true');
+    click(off);
+    await flushTimers();
+    expect(writes().filter((w) => w.path.endsWith('/compact'))).toEqual([]);
+  });
+});
+
+describe('Chat page: Rewind to here', () => {
+  const H = CHAT.history;
+  const PLAN = {
+    token: 'v1:6',
+    removes: { messages: 1, steps: 2 },
+    background: { commands: 0, schedules: 0, runs: 0 },
+    helpers: false,
+    attachments: false,
+    files: [],
+    filesMore: 0,
+  };
+  const THREAD: TranscriptEntry[] = [
+    user('Hello'),
+    answer('Hi there'),
+    end(),
+    user('Second question'),
+    answer('Second answer'),
+    end(),
+  ];
+  const dialog = (): HTMLElement | null => byRole(document.body, 'dialog', H.rewindTitle);
+  const menus = (): HTMLElement[] => [...page!.container.querySelectorAll<HTMLElement>('[data-message-menu]')];
+  const statusText = (): string =>
+    [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent ?? '').join(' ');
+  const rewindWrites = (id: string) => writes().filter((w) => w.path.startsWith(`/chat/conversations/${id}/rewind`));
+
+  async function openOn(id: string, entries: TranscriptEntry[] = THREAD): Promise<void> {
+    await open(`/chat?c=${id}`, (text) => text.includes('Second answer') || text.includes('Hi there'), {
+      routes: {
+        [`POST /chat/conversations/${id}/rewind/plan`]: PLAN,
+        [`POST /chat/conversations/${id}/rewind`]: {},
+      },
+      conversations: { [id]: sync(id, { entries, turns: [metric()] }) },
+    });
+  }
+
+  async function rewindAt(menu: number): Promise<void> {
+    const trigger = menus()[menu]!;
+    click(trigger);
+    await waitFor(() => byRole(document.body, 'menuitem', H.rewind) !== null);
+    click(byRole(document.body, 'menuitem', H.rewind)!);
+    await waitFor(() => dialog() !== null && buttonsIn(dialog()!).includes(H.confirm));
+  }
+
+  const buttonsIn = (scope: Element): string[] => reachable(scope).map(accessibleName);
+
+  function ended(id: string, kept: TranscriptEntry[], entry: number): void {
+    act(() => api!.emitChat(id, sync(id, { seq: 1, entries: kept, turns: [] })));
+    act(() =>
+      api!.emitChat(id, {
+        type: 'rewind',
+        seq: 2,
+        n: 1,
+        end: { outcome: 'done', mode: 'conversation', restored: 0, entry },
+      }),
+    );
+  }
+
+  // Mutation: skip the refill on a done end → the box stays empty.
+  it('plan, confirm, the end on the stream: the thread is shorter, the message is back in the box with focus, and it says so', async () => {
+    const success = vi.spyOn(toast, 'success');
+    await openOn('p-rw');
+    expect(menus()).toHaveLength(2);
+    await rewindAt(1);
+    expect(rewindWrites('p-rw')).toEqual([
+      { method: 'POST', path: '/chat/conversations/p-rw/rewind/plan', body: { entry: 3, ts: THREAD[3]!.ts } },
+    ]);
+    expect(dialog()!.querySelector('blockquote')?.textContent).toBe('Second question');
+    await waitFor(() => document.activeElement === button(CHAT.cancel, dialog()!));
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rw').length === 2);
+    expect(rewindWrites('p-rw')[1]).toEqual({
+      method: 'POST',
+      path: '/chat/conversations/p-rw/rewind',
+      body: { token: 'v1:6', mode: 'conversation' },
+    });
+    await waitFor(() => buttonsIn(dialog()!).includes(H.working));
+    ended('p-rw', THREAD.slice(0, 3), 3);
+    await waitFor(() => dialog() === null);
+    expect(shown()).not.toContain('Second answer');
+    expect(composer().value).toBe('Second question');
+    await waitFor(() => document.activeElement === composer());
+    await waitFor(() => statusText().includes(H.status));
+    expect(success).toHaveBeenCalledWith(H.done);
+  });
+
+  it('a draft in the box stays; the toast with no timeout puts the message back', async () => {
+    const success = vi.spyOn(toast, 'success');
+    await openOn('p-rd');
+    type('my draft');
+    await rewindAt(1);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rd').length === 2);
+    ended('p-rd', THREAD.slice(0, 3), 3);
+    await waitFor(() => dialog() === null);
+    expect(composer().value).toBe('my draft');
+    const [words, options] = success.mock.calls.at(-1)!;
+    expect(words).toBe(H.done);
+    expect(options).toMatchObject({ duration: Number.POSITIVE_INFINITY, action: { label: H.putBack } });
+    act(() => (options as { action: { onClick: (id: string | number) => void } }).action.onClick('t'));
+    expect(composer().value).toBe('Second question');
+  });
+
+  // Mutation: put the message back with the page's own draft setter → it lands in the conversation shown now.
+  it('Put message back after a switch opens the rewound conversation with the message; the other draft stays', async () => {
+    const success = vi.spyOn(toast, 'success');
+    await open('/chat?c=p-ra', (text) => text.includes('Second answer'), {
+      routes: {
+        'POST /chat/conversations/p-ra/rewind/plan': PLAN,
+        'POST /chat/conversations/p-ra/rewind': {},
+      },
+      rows: [row('p-ra'), row('p-rb')],
+      conversations: {
+        'p-ra': sync('p-ra', { entries: THREAD, turns: [metric()] }),
+        'p-rb': sync('p-rb'),
+      },
+    });
+    type('my draft');
+    await rewindAt(1);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-ra').length === 2);
+    ended('p-ra', THREAD.slice(0, 3), 3);
+    await waitFor(() => dialog() === null);
+    const [, options] = success.mock.calls.at(-1)!;
+    click(rowLink('Title p-rb'));
+    await waitFor(() => where.search === '?c=p-rb');
+    type('b draft');
+    act(() => (options as { action: { onClick: (id: string | number) => void } }).action.onClick('t'));
+    await waitFor(() => where.search === '?c=p-ra');
+    await waitFor(() => composer().value === 'Second question');
+    click(rowLink('Title p-rb'));
+    await waitFor(() => where.search === '?c=p-rb');
+    await waitFor(() => composer().value === 'b draft');
+  });
+
+  // Mutation: let the switch close the rewind with no watch → the end never comes and the text is lost.
+  it('a rewind that ends after a switch: its text goes to its own box, and a toast names it and opens it', async () => {
+    const success = vi.spyOn(toast, 'success');
+    await open('/chat?c=p-rx', (text) => text.includes('Second answer'), {
+      routes: {
+        'POST /chat/conversations/p-rx/rewind/plan': PLAN,
+        'POST /chat/conversations/p-rx/rewind': {},
+      },
+      rows: [row('p-rx'), row('p-ry')],
+      conversations: {
+        'p-rx': sync('p-rx', { entries: THREAD, turns: [metric()] }),
+        'p-ry': sync('p-ry'),
+      },
+    });
+    await rewindAt(1);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rx').length === 2);
+    await waitFor(() => buttonsIn(dialog()!).includes(H.working));
+    click(rowLink('Title p-ry'));
+    await waitFor(() => where.search === '?c=p-ry');
+    await waitFor(() => dialog() === null);
+    type('y draft');
+    expect(api!.chatWatchers('p-rx')).toBe(1);
+    ended('p-rx', THREAD.slice(0, 3), 3);
+    await waitFor(() => success.mock.calls.some((c) => c[0] === H.done));
+    const [, options] = success.mock.calls.find((c) => c[0] === H.done)!;
+    expect(options).toMatchObject({ description: 'Title p-rx', action: { label: H.endOpen } });
+    expect(composer().value).toBe('y draft');
+    await waitFor(() => api!.chatWatchers('p-rx') === 0);
+    act(() => (options as { action: { onClick: (id: string) => void } }).action.onClick('t'));
+    await waitFor(() => where.search === '?c=p-rx');
+    await waitFor(() => composer().value === 'Second question');
+    expect(shown()).not.toContain('Second answer');
+  });
+
+  it('a rewind that ends after a switch into a conversation with a draft: the toast puts the message back there', async () => {
+    const success = vi.spyOn(toast, 'success');
+    await open('/chat?c=p-rd2', (text) => text.includes('Second answer'), {
+      routes: {
+        'POST /chat/conversations/p-rd2/rewind/plan': PLAN,
+        'POST /chat/conversations/p-rd2/rewind': {},
+      },
+      rows: [row('p-rd2'), row('p-re2')],
+      conversations: {
+        'p-rd2': sync('p-rd2', { entries: THREAD, turns: [metric()] }),
+        'p-re2': sync('p-re2'),
+      },
+    });
+    type('my draft');
+    await rewindAt(1);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rd2').length === 2);
+    click(rowLink('Title p-re2'));
+    await waitFor(() => where.search === '?c=p-re2');
+    // The stream the rewind keeps open is opened again for it: its first sync comes before the end.
+    await flushTimers();
+    ended('p-rd2', THREAD.slice(0, 3), 3);
+    await waitFor(() => success.mock.calls.some((c) => c[0] === H.done));
+    const [, options] = success.mock.calls.find((c) => c[0] === H.done)!;
+    expect(options).toMatchObject({
+      description: 'Title p-rd2',
+      duration: Number.POSITIVE_INFINITY,
+      action: { label: H.putBack },
+    });
+    act(() => (options as { action: { onClick: (id: string) => void } }).action.onClick('t'));
+    await waitFor(() => where.search === '?c=p-rd2');
+    await waitFor(() => composer().value === 'Second question');
+  });
+
+  it('a rewind that the agent could not open in time says so and offers Try again', async () => {
+    await openOn('p-rl');
+    await rewindAt(1);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rl').length === 2);
+    act(() => api!.emitChat('p-rl', { type: 'rewind', seq: 1, n: 1, end: { outcome: 'load-slow' } }));
+    await waitFor(() => dialog()?.textContent?.includes(H.loadSlow) === true);
+    expect(buttonsIn(dialog()!)).toContain(H.tryAgain);
+  });
+
+  it('a rewind to the first message leaves one line for the start, and the message in the box', async () => {
+    await openOn('p-rs');
+    await rewindAt(0);
+    click(button(H.confirm, dialog()!));
+    await waitFor(() => rewindWrites('p-rs').length === 2);
+    ended('p-rs', [], 0);
+    await waitFor(() => dialog() === null);
+    await waitFor(() => shown().includes(H.empty));
+    expect(composer().value).toBe('Hello');
+  });
+
+  it('a plan the host refuses: the dialog says why; Close returns focus to the ⋯ button', async () => {
+    await open('/chat?c=p-rn', (text) => text.includes('Second answer'), {
+      routes: {
+        'POST /chat/conversations/p-rn/rewind/plan': stubError('E_CONFLICT', 'no', 'rewind-not-point'),
+      },
+      conversations: { 'p-rn': sync('p-rn', { entries: THREAD, turns: [metric()] }) },
+    });
+    const trigger = menus()[1]!;
+    click(trigger);
+    await waitFor(() => byRole(document.body, 'menuitem', H.rewind) !== null);
+    click(byRole(document.body, 'menuitem', H.rewind)!);
+    await waitFor(() => dialog()?.textContent?.includes(H.errUnsent) === true);
+    click(button(H.close, dialog()!));
+    await waitFor(() => dialog() === null);
+    await waitFor(() => document.activeElement === trigger);
+    expect(rewindWrites('p-rn')).toHaveLength(1);
+  });
+
+  it('off while an answer runs: the row reads why and posts nothing; /rewind and the palette open the last message', async () => {
+    await openOn('p-ro');
+    expect(commands.some((c) => c.id === 'chat:rewind-last' && c.label === CHAT.commands.rewindLast)).toBe(true);
+    act(() => void commands.find((c) => c.id === 'chat:rewind-last')!.run());
+    await waitFor(() => dialog()?.querySelector('blockquote')?.textContent === 'Second question');
+    click(button(CHAT.cancel, dialog()!));
+    await waitFor(() => dialog() === null);
+    act(() =>
+      api!.emitChat('p-ro', {
+        type: 'turn',
+        seq: 1,
+        turn: { turnId: 't', phase: 'running', startedAt: NOW, wait: null },
+      }),
+    );
+    await waitFor(() => !commands.some((c) => c.id === 'chat:rewind-last'));
+    click(menus()[1]!);
+    await waitFor(() => byRole(document.body, 'menuitem', H.rewind) !== null);
+    const row = byRole(document.body, 'menuitem', H.rewind)!;
+    expect(row.getAttribute('aria-disabled')).toBe('true');
+    expect(document.getElementById(row.getAttribute('aria-describedby')!)?.textContent).toBe(CHAT.modelBusy);
+    click(row);
+    await flushTimers();
+    expect(rewindWrites('p-ro')).toHaveLength(1);
+  });
+});
+
+describe('Chat page: Fork', () => {
+  const H = CHAT.history;
+  const THREAD: TranscriptEntry[] = [
+    user('Hello'),
+    answer('Hi there'),
+    end(),
+    user('Second question'),
+    answer('Second answer'),
+    end(),
+  ];
+  const forkRow = (): HTMLElement | null => byRole(document.body, 'menuitem', H.fork);
+  const forkWrites = (id: string) => writes().filter((w) => w.path === `/chat/conversations/${id}/fork`);
+  const menus = (): HTMLElement[] => [...page!.container.querySelectorAll<HTMLElement>('[data-message-menu]')];
+  const origin = (): HTMLElement | null =>
+    [...page!.container.querySelectorAll<HTMLElement>('[data-fork-origin]')].find(
+      (n) => n.closest('[inert]') === null,
+    ) ?? null;
+  const listRow = (id: string): HTMLAnchorElement =>
+    page!.container.querySelector<HTMLAnchorElement>(`a[data-conversation-row="${id}"]`)!;
+  const statusText = (): string =>
+    [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent ?? '').join(' ');
+  const noteOf = (row: HTMLElement | null): string =>
+    row === null ? '' : (document.getElementById(row.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+
+  function setup(id: string, copy: string, routes: Record<string, unknown> = {}): Open {
+    return {
+      routes: { [`POST /chat/conversations/${id}/fork`]: { id: copy }, ...routes },
+      conversations: {
+        [id]: sync(id, { entries: THREAD, turns: [metric()] }),
+        [copy]: sync(copy, { entries: THREAD, turns: [metric()] }, { forkOf: { id, title: `Title ${id}` } }),
+      },
+      rows: [row(copy, { forkOf: { id, title: `Title ${id}` } }), row(id)],
+    };
+  }
+
+  // Mutation: navigate to the original in `open` → the copy never opens and the top line never shows.
+  it('the ⋯ row posts {} once, the copy opens with its top line and focus in the box, and Back to the original works', async () => {
+    const loading = vi.spyOn(toast, 'loading');
+    const update = vi.spyOn(toast, 'update');
+    await open('/chat?c=p-fk', (text) => text.includes('Second answer'), setup('p-fk', 'p-fk2'));
+    expect(origin()).toBeNull();
+    expect(commands.some((c) => c.id === 'chat:fork' && c.label === CHAT.commands.fork)).toBe(true);
+    click(button(H.threadMenu));
+    await waitFor(() => forkRow() !== null);
+    expect(noteOf(forkRow())).toBe(H.forkNote);
+    click(forkRow()!);
+    await waitFor(() => forkWrites('p-fk').length === 1);
+    expect(forkWrites('p-fk')).toEqual([{ method: 'POST', path: '/chat/conversations/p-fk/fork', body: {} }]);
+    expect(loading).toHaveBeenCalledWith(H.forking);
+    await waitFor(() => where.search === `?c=p-fk2`);
+    await waitFor(() => origin() !== null);
+    expect(origin()!.textContent).toContain(fill(H.forkOf, { title: 'Title p-fk' }));
+    const link = [...origin()!.querySelectorAll('a')];
+    expect(link.map((a) => [a.textContent, a.getAttribute('href')])).toEqual([[H.forkOpen, '/chat?c=p-fk']]);
+    await waitFor(() => statusText().includes(fill(H.forkedStatus, { title: 'Title p-fk' })));
+    await waitFor(() => document.activeElement === composer());
+    const [toastId, patch] = update.mock.calls.at(-1)!;
+    expect(toastId).toBe(loading.mock.results[0]!.value);
+    expect(patch).toMatchObject({ type: 'success', title: H.forked, action: { label: H.forkBack } });
+    expect(patch).not.toHaveProperty('description');
+    // The list tags the copy.
+    expect(listRow('p-fk2').querySelector('[data-fork]')?.textContent).toBe(H.forkTag);
+    expect(listRow('p-fk').querySelector('[data-fork]')).toBeNull();
+    act(() => (patch as { action: { onClick: (id: string) => void } }).action.onClick('t'));
+    await waitFor(() => where.search === '?c=p-fk');
+    await waitFor(() => origin() === null);
+  });
+
+  // Mutation: post the entry without its time → the body is `{entry}` and the host cannot tell another message there.
+  it('Fork with this answer posts the message’s entry and time; a refused one is an error toast and the page stays', async () => {
+    const update = vi.spyOn(toast, 'update');
+    await open(
+      '/chat?c=p-fh',
+      (text) => text.includes('Second answer'),
+      setup('p-fh', 'p-fh2', {
+        'POST /chat/conversations/p-fh/fork': sequence(
+          { id: 'p-fh2' },
+          stubError('E_CONFLICT', 'no', 'fork-not-point'),
+        ),
+      }),
+    );
+    click(menus()[1]!);
+    await waitFor(() => byRole(document.body, 'menuitem', H.forkHere) !== null);
+    const here = byRole(document.body, 'menuitem', H.forkHere)!;
+    expect(noteOf(here)).toBe(H.forkHereNote);
+    click(here);
+    await waitFor(() => forkWrites('p-fh').length === 1);
+    expect(forkWrites('p-fh')[0]!.body).toEqual({ entry: 3, ts: THREAD[3]!.ts });
+    await waitFor(() => where.search === '?c=p-fh2');
+    click(listRow('p-fh'));
+    await waitFor(() => where.search === '?c=p-fh');
+    await waitFor(() => menus().length === 2);
+    click(menus()[0]!);
+    await waitFor(() => byRole(document.body, 'menuitem', H.forkHere) !== null);
+    click(byRole(document.body, 'menuitem', H.forkHere)!);
+    await waitFor(() => forkWrites('p-fh').length === 2);
+    expect(forkWrites('p-fh')[1]!.body).toEqual({ entry: 0, ts: THREAD[0]!.ts });
+    await waitFor(() => update.mock.calls.some(([, patch]) => patch.type === 'error'));
+    expect(update.mock.calls.at(-1)![1]).toEqual({ type: 'error', title: H.forkUnsent });
+    await flushTimers();
+    expect(where.search).toBe('?c=p-fh');
+  });
+
+  it('a fork of a message the host no longer has at that place says the conversation changed', async () => {
+    const update = vi.spyOn(toast, 'update');
+    await open(
+      '/chat?c=p-fc',
+      (text) => text.includes('Second answer'),
+      setup('p-fc', 'p-fc2', {
+        'POST /chat/conversations/p-fc/fork': stubError('E_CONFLICT', 'moved', 'fork-changed'),
+      }),
+    );
+    click(menus()[1]!);
+    await waitFor(() => byRole(document.body, 'menuitem', H.forkHere) !== null);
+    click(byRole(document.body, 'menuitem', H.forkHere)!);
+    await waitFor(() => update.mock.calls.some(([, patch]) => patch.type === 'error'));
+    expect(update.mock.calls.at(-1)![1]).toEqual({ type: 'error', title: H.forkChanged });
+    expect(where.search).toBe('?c=p-fc');
+  });
+
+  it('/fork and the palette run it; a deleted origin reads so, with no link', async () => {
+    await open('/chat?c=p-fo', (text) => text.includes('Second answer'), {
+      ...setup('p-fo', 'p-fo2'),
+      conversations: {
+        'p-fo': sync('p-fo', { entries: THREAD, turns: [metric()] }),
+        'p-fo2': sync('p-fo2', { entries: THREAD, turns: [metric()] }, { forkOf: { id: 'p-gone', title: null } }),
+      },
+    });
+    act(() => composer().focus());
+    type('/fork');
+    expect(shown()).toContain(CHAT.slash.run);
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => forkWrites('p-fo').length === 1);
+    expect(forkWrites('p-fo')[0]!.body).toEqual({});
+    await waitFor(() => where.search === '?c=p-fo2');
+    await waitFor(() => origin() !== null);
+    expect(origin()!.textContent).toContain(H.forkOfGone);
+    expect(origin()!.querySelector('a')).toBeNull();
+
+    click(listRow('p-fo'));
+    await waitFor(() => where.search === '?c=p-fo');
+    await waitFor(() => commands.some((c) => c.id === 'chat:fork'));
+    act(() => void commands.find((c) => c.id === 'chat:fork')!.run());
+    await waitFor(() => forkWrites('p-fo').length === 2);
+    await waitFor(() => where.search === '?c=p-fo2');
+  });
+
+  it('off while an answer runs: both rows read why and post nothing; /fork shows it and Send stays off', async () => {
+    await open('/chat?c=p-fr', (text) => text.includes('Second answer'), setup('p-fr', 'p-fr2'));
+    act(() =>
+      api!.emitChat('p-fr', {
+        type: 'turn',
+        seq: 1,
+        turn: { turnId: 't', phase: 'running', startedAt: NOW, wait: null },
+      }),
+    );
+    await waitFor(() => !commands.some((c) => c.id === 'chat:fork'));
+    click(button(H.threadMenu));
+    await waitFor(() => forkRow() !== null);
+    expect(forkRow()!.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(forkRow())).toBe(CHAT.modelBusy);
+    click(forkRow()!);
+    key(forkRow()!, { key: 'Escape' });
+    await waitFor(() => forkRow() === null);
+    click(menus()[1]!);
+    await waitFor(() => byRole(document.body, 'menuitem', H.forkHere) !== null);
+    const here = byRole(document.body, 'menuitem', H.forkHere)!;
+    expect(here.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(here)).toBe(CHAT.modelBusy);
+    click(here);
+    key(here, { key: 'Escape' });
+    act(() => composer().focus());
+    type('/fork');
+    expect(shown()).toContain(CHAT.modelBusy);
+    key(composer(), { key: 'Enter' });
+    await flushTimers();
+    expect(forkWrites('p-fr')).toEqual([]);
+    expect(writes().filter((w) => w.path.endsWith('/prompt') || w.path.includes('/queue'))).toEqual([]);
+  });
+
+  it('Work: the toast says both conversations work in the folder', async () => {
+    const update = vi.spyOn(toast, 'update');
+    const work = { mode: 'work' as const, cwd: '/Users/me/code/app' };
+    await open('/chat?c=p-fw', (text) => text.includes('Second answer'), {
+      routes: { 'POST /chat/conversations/p-fw/fork': { id: 'p-fw2' } },
+      conversations: {
+        'p-fw': sync('p-fw', { entries: THREAD, turns: [metric()] }, work),
+        'p-fw2': sync('p-fw2', { entries: THREAD, turns: [metric()] }, { ...work, forkOf: { id: 'p-fw', title: 'x' } }),
+      },
+    });
+    click(button(H.threadMenu));
+    await waitFor(() => forkRow() !== null);
+    click(forkRow()!);
+    await waitFor(() => where.search === '?c=p-fw2');
+    await waitFor(() => update.mock.calls.length > 0);
+    expect(update.mock.calls.at(-1)![1]).toMatchObject({
+      type: 'success',
+      title: H.forked,
+      description: fill(H.forkSameFolder, { folder: 'app/' }),
+    });
+  });
+});
+
+describe('Chat page: Recap', () => {
+  const H = CHAT.history;
+  const recapRow = (): HTMLElement | null => byRole(document.body, 'menuitem', H.recap);
+  const recapWrites = (id: string) => writes().filter((w) => w.path === `/chat/conversations/${id}/recap`);
+  const noteOf = (row: HTMLElement | null): string =>
+    row === null ? '' : (document.getElementById(row.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+  const waitLine = (): Element | null => page!.container.querySelector('[data-recap-line]');
+  const openMenu = async (): Promise<HTMLElement> => {
+    click(button(H.threadMenu));
+    await waitFor(() => recapRow() !== null);
+    return recapRow()!;
+  };
+  const closeMenu = async (row: HTMLElement): Promise<void> => {
+    key(row, { key: 'Escape' });
+    await waitFor(() => recapRow() === null);
+  };
+
+  // Mutation: post the fork route from the recap row → the recap write never comes.
+  it('the ⋯ row posts once; the wait line and the row’s reason follow the stream; the row comes as an entry', async () => {
+    const info = vi.spyOn(toast, 'info');
+    await open('/chat?c=p-rc', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-rc/recap': {} },
+      conversations: { 'p-rc': sync('p-rc', { turns: [metric()] }) },
+    });
+    expect(commands.some((c) => c.id === 'chat:recap' && c.label === CHAT.commands.recap)).toBe(true);
+    const row = await openMenu();
+    expect(noteOf(row)).toBe(H.recapNote);
+    click(row);
+    await waitFor(() => recapWrites('p-rc').length === 1);
+    expect(recapWrites('p-rc')).toEqual([{ method: 'POST', path: '/chat/conversations/p-rc/recap', body: undefined }]);
+    act(() => api!.emitChat('p-rc', { type: 'recap', seq: 1, recap: { startedAt: NOW } }));
+    await waitFor(() => waitLine() !== null);
+    expect(shown(waitLine()!)).toContain(H.recapWriting);
+    const busy = await openMenu();
+    expect(busy.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(busy)).toBe(H.recapWriting);
+    await closeMenu(busy);
+    expect(commands.some((c) => c.id === 'chat:recap')).toBe(false);
+    act(() =>
+      api!.emitChat('p-rc', {
+        type: 'ops',
+        seq: 2,
+        ops: [{ op: 'push', entry: { kind: 'recap', ts: NOW, text: 'The fix is in. Next: the docs.' } }],
+      }),
+    );
+    act(() => api!.emitChat('p-rc', { type: 'recap', seq: 3, recap: null, end: 'shown' }));
+    await waitFor(() => waitLine() === null);
+    expect(shown(page!.container.querySelector('[data-recap-row]')!)).toContain('The fix is in. Next: the docs.');
+    expect(info).not.toHaveBeenCalled();
+    info.mockRestore();
+  });
+
+  // Mutation: toast every end → a cancelled recap (a message was sent) says something.
+  it('an end with no row is a toast: none, off, failed; a cancelled one says nothing', async () => {
+    const info = vi.spyOn(toast, 'info');
+    const error = vi.spyOn(toast, 'error');
+    await open('/chat?c=p-re', (text) => text.includes('Hi there'), {
+      conversations: { 'p-re': sync('p-re', { turns: [metric()], recap: { startedAt: NOW } }) },
+    });
+    await waitFor(() => waitLine() !== null);
+    const end = (seq: number, outcome: 'none' | 'off' | 'failed' | 'cancelled') => {
+      act(() => api!.emitChat('p-re', { type: 'recap', seq, recap: { startedAt: NOW } }));
+      act(() => api!.emitChat('p-re', { type: 'recap', seq: seq + 1, recap: null, end: outcome }));
+    };
+    end(1, 'none');
+    await waitFor(() => info.mock.calls.some((c) => c[0] === H.recapNone));
+    end(3, 'off');
+    await waitFor(() => info.mock.calls.some((c) => c[0] === H.recapOff));
+    end(5, 'failed');
+    await waitFor(() => error.mock.calls.some((c) => c[0] === H.recapError));
+    end(7, 'cancelled');
+    await flushTimers();
+    expect(waitLine()).toBeNull();
+    expect([info.mock.calls.length, error.mock.calls.length]).toEqual([2, 1]);
+    info.mockRestore();
+    error.mockRestore();
+  });
+
+  it('off with no finished answer and while an answer runs: the row reads why, /recap shows it, nothing is posted', async () => {
+    await open('/chat?c=p-ro', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-ro/recap': {} },
+      conversations: { 'p-ro': sync('p-ro', { turns: [] }) },
+    });
+    const empty = await openMenu();
+    expect(empty.getAttribute('aria-disabled')).toBe('true');
+    expect(noteOf(empty)).toBe(H.recapEmpty);
+    click(empty);
+    await closeMenu(empty);
+    act(() => composer().focus());
+    type('/recap');
+    expect(shown()).toContain(H.recapEmpty);
+    expect(sendFace().disabled).toBe(true);
+    key(composer(), { key: 'Enter' });
+    act(() =>
+      api!.emitChat('p-ro', {
+        type: 'turn',
+        seq: 1,
+        turn: { turnId: 't', phase: 'running', startedAt: NOW, wait: null },
+      }),
+    );
+    await flushTimers();
+    const running = await openMenu();
+    await waitFor(() => noteOf(recapRow()) === CHAT.modelBusy);
+    await closeMenu(running);
+    await flushTimers();
+    expect(recapWrites('p-ro')).toEqual([]);
+  });
+
+  // Mutation: turn the row off for a live run, as Compact is → the recap row reads why and posts nothing.
+  it('a live workflow run turns Compact off but not Recap: a recap only reads', async () => {
+    await open('/chat?c=p-rw', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-rw/recap': {} },
+      conversations: { 'p-rw': sync('p-rw', { turns: [metric()], runs: [runView('r1')] }) },
+    });
+    const row = await openMenu();
+    expect(byRole(document.body, 'menuitem', H.compact)?.getAttribute('aria-disabled')).toBe('true');
+    expect(row.getAttribute('aria-disabled')).not.toBe('true');
+    expect(noteOf(row)).toBe(H.recapNote);
+    click(row);
+    await waitFor(() => recapWrites('p-rw').length === 1);
+  });
+
+  it('/recap and the palette run it and send no prompt; a refused press is one error toast', async () => {
+    const error = vi.spyOn(toast, 'error');
+    await open('/chat?c=p-rs', (text) => text.includes('Hi there'), {
+      routes: {
+        'POST /chat/conversations/p-rs/recap': sequence({}, stubError('E_INTERNAL', 'boom')),
+      },
+      conversations: { 'p-rs': sync('p-rs', { turns: [metric()] }) },
+    });
+    act(() => composer().focus());
+    type('/recap');
+    expect(shown()).toContain(CHAT.slash.run);
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => recapWrites('p-rs').length === 1);
+    await waitFor(() => composer().value === '');
+    act(() => void commands.find((c) => c.id === 'chat:recap')!.run());
+    await waitFor(() => recapWrites('p-rs').length === 2);
+    await waitFor(() => error.mock.calls.some((c) => c[0] === H.recapError));
+    expect(writes().filter((w) => w.path.endsWith('/prompt') || w.path.includes('/queue'))).toEqual([]);
+    error.mockRestore();
+  });
+});
+
+describe('Chat page: a fork or a recap that runs, a model that is gone, a prompt a hook blocked', () => {
+  const H = CHAT.history;
+  const THREAD: TranscriptEntry[] = [user('Hello'), answer('Hi there'), end()];
+  const menuRow = (name: string): HTMLElement | null => byRole(document.body, 'menuitem', name);
+  const noteOf = (row: HTMLElement | null): string =>
+    row === null ? '' : (document.getElementById(row.getAttribute('aria-describedby') ?? '')?.textContent ?? '');
+  const prompts = (id: string) => writes().filter((w) => w.path === `/chat/conversations/${id}/prompt`);
+  const statusText = (): string =>
+    [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent ?? '').join(' ');
+  const rowsRead = async (names: readonly string[]): Promise<string[]> => {
+    click(button(H.threadMenu));
+    await waitFor(() => menuRow(names[0]!) !== null);
+    const notes = names.map((name) => noteOf(menuRow(name)));
+    key(menuRow(names[0]!)!, { key: 'Escape' });
+    await waitFor(() => menuRow(names[0]!) === null);
+    return notes;
+  };
+
+  // Mutation: leave this window's fork press out of the page's op → Enter does nothing while the copy is made, and a
+  // second Fork reads nothing of a fork.
+  it('while the copy is made: a second Fork says a fork runs, Enter queues the text, and there is no Stop', async () => {
+    const held = deferred({ id: 'p-fq2' });
+    await open('/chat?c=p-fq', (text) => text.includes('Hi there'), {
+      routes: {
+        'POST /chat/conversations/p-fq/fork': held.body,
+        'POST /chat/conversations/p-fq/prompt': { queued: 'q1' },
+      },
+      conversations: {
+        'p-fq': sync('p-fq', { entries: THREAD, turns: [metric()] }),
+        'p-fq2': sync('p-fq2', { entries: THREAD, turns: [metric()] }, { forkOf: { id: 'p-fq', title: 'x' } }),
+      },
+    });
+    click(button(H.threadMenu));
+    await waitFor(() => menuRow(H.fork) !== null);
+    click(menuRow(H.fork)!);
+    await waitFor(() => writes().some((w) => w.path === '/chat/conversations/p-fq/fork'));
+    await waitFor(() => accessibleName(sendFace()) === CHAT.opBusy);
+    expect(sendFace().disabled).toBe(true);
+    expect(await rowsRead([H.fork, H.compact, H.recap])).toEqual([H.forkRunning, H.forkRunning, CHAT.modelBusy]);
+    act(() => composer().focus());
+    type('one more thing');
+    expect(accessibleName(sendFace())).toBe(CHAT.queue.add);
+    expect(hasButton(CHAT.stop)).toBe(false);
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => prompts('p-fq').length === 1);
+    expect(prompts('p-fq')[0]!.body).toMatchObject({ text: 'one more thing', whenBusy: 'queue' });
+    held.release();
+    await waitFor(() => where.search === '?c=p-fq2');
+  });
+
+  // Mutation: drop the recap from the page's op → Enter during a recap posts nothing and Compact reads its note.
+  it('while a recap is written: Compact and Fork say to wait for it, Recap says it is written, and Enter queues', async () => {
+    await open('/chat?c=p-rq', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-rq/prompt': { queued: 'q1' } },
+      conversations: { 'p-rq': sync('p-rq', { entries: THREAD, turns: [metric()], recap: { startedAt: NOW } }) },
+    });
+    await waitFor(() => accessibleName(sendFace()) === CHAT.opBusy);
+    expect(await rowsRead([H.fork, H.compact, H.recap])).toEqual([H.offRecap, H.offRecap, H.recapWriting]);
+    act(() => composer().focus());
+    type('after the recap');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => prompts('p-rq').length === 1);
+    expect(prompts('p-rq')[0]!.body).toMatchObject({ text: 'after the recap', whenBusy: 'queue' });
+    act(() => api!.emitChat('p-rq', { type: 'recap', seq: 1, recap: null, end: 'none' }));
+    await waitFor(() => accessibleName(sendFace()) === CHAT.send);
+  });
+
+  // Mutation: send the press to the agent update → the picker never opens.
+  it('a turn refused because its model is gone says so; Pick another model opens the model picker', async () => {
+    await open('/chat?c=p-gone', (text) => text.includes(CHAT.outcomes['model-unavailable']), {
+      conversations: {
+        'p-gone': sync('p-gone', {
+          entries: [user('Hello'), end('cancelled')],
+          lastEnd: {
+            turnId: 't1',
+            outcome: 'refused',
+            failure: { code: 'model-unavailable', message: 'That model is not available.' },
+          },
+        }),
+      },
+    });
+    expect(shown()).not.toContain(CHAT.outcomes['refused-chat']);
+    expect(hasButton(CHAT.updateAgent)).toBe(false);
+    click(button(CHAT.pickModel));
+    await waitFor(() => byRole(document.body, 'listbox') !== null);
+    expect(writes()).toEqual([]);
+  });
+
+  // Mutation: drop the page's refill → the box stays empty after a live block.
+  it('a prompt a hook blocked comes back to an empty box; a box with text keeps it and a toast offers it', async () => {
+    const info = vi.spyOn(toast, 'info');
+    await open('/chat?c=p-hb', (text) => text.includes('Hi there'), {
+      conversations: { 'p-hb': sync('p-hb', { entries: THREAD, turns: [metric()] }) },
+    });
+    const blocked = (seq: number, turnId: string, text: string): void =>
+      act(() =>
+        api!.emitChat('p-hb', { type: 'turn', seq, turn: null, turnId, outcome: 'hook-stopped', blocked: text }),
+      );
+    blocked(1, 't1', 'deploy to prod');
+    await waitFor(() => composer().value === 'deploy to prod');
+    await waitFor(() => statusText().includes(CHAT.hook.promptBack));
+    expect(shown()).toContain(CHAT.outcomes['hook-stopped']);
+    type('something else');
+    blocked(2, 't2', 'deploy again');
+    await waitFor(() => info.mock.calls.some((c) => c[0] === CHAT.hook.promptKept));
+    expect(composer().value).toBe('something else');
+    const options = info.mock.calls.find((c) => c[0] === CHAT.hook.promptKept)![1] as {
+      action: { label: string; onClick: (id: string) => void };
+    };
+    expect(options.action.label).toBe(H.putBack);
+    act(() => options.action.onClick('t'));
+    await waitFor(() => composer().value === 'deploy again');
+    info.mockRestore();
+  });
+
+  // Mutation: put the blocked message back with the page's draft setter → it lands in the conversation shown now.
+  it('Put message back of a blocked prompt after a switch opens its own conversation with it; the other draft stays', async () => {
+    const info = vi.spyOn(toast, 'info');
+    await open('/chat?c=p-hx', (text) => text.includes('Hi there'), {
+      rows: [row('p-hx'), row('p-hy')],
+      conversations: {
+        'p-hx': sync('p-hx', { entries: THREAD, turns: [metric()] }),
+        'p-hy': sync('p-hy'),
+      },
+    });
+    type('x draft');
+    act(() =>
+      api!.emitChat('p-hx', {
+        type: 'turn',
+        seq: 1,
+        turn: null,
+        turnId: 't1',
+        outcome: 'hook-stopped',
+        blocked: 'deploy to prod',
+      }),
+    );
+    await waitFor(() => info.mock.calls.some((c) => c[0] === CHAT.hook.promptKept));
+    const options = info.mock.calls.find((c) => c[0] === CHAT.hook.promptKept)![1] as {
+      action: { onClick: (id: string) => void };
+    };
+    click(rowLink('Title p-hy'));
+    await waitFor(() => where.search === '?c=p-hy');
+    type('y draft');
+    act(() => options.action.onClick('t'));
+    await waitFor(() => where.search === '?c=p-hx');
+    await waitFor(() => composer().value === 'deploy to prod');
+    click(rowLink('Title p-hy'));
+    await waitFor(() => where.search === '?c=p-hy');
+    await waitFor(() => composer().value === 'y draft');
+    info.mockRestore();
+  });
+
+  // Mutation: leave the page's own first message out of the refill → a hook that blocked it before the stream opened
+  // leaves the text nowhere (the thread has no bubble and the box stays empty).
+  it('a first message a hook blocked before the stream opened comes back to the box', async () => {
+    const create = deferred({ conversation: info('p-hbn'), turnId: 't1' });
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      routes: { 'POST /chat/conversations': create.body },
+      conversations: {
+        'p-hbn': sync('p-hbn', {
+          entries: [
+            { kind: 'notice', ts: NOW, code: 'hook-note', text: 'Prompt blocked by global/policy: no deploys' },
+            { kind: 'turn-end', ts: NOW, stopReason: 'cancelled', hookStopped: true },
+          ],
+          lastEnd: { turnId: 't1', outcome: 'hook-stopped', blocked: 'deploy to prod' },
+        }),
+      },
+    });
+    type('deploy to prod');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => composer().value === '');
+    await act(async () => create.release());
+    await waitFor(() => where.search === '?c=p-hbn');
+    await waitFor(() => shown().includes(CHAT.outcomes['hook-stopped']), 2_000);
+    await waitFor(() => composer().value === 'deploy to prod');
+  });
+});
+
+describe('Chat page: the / command list', () => {
+  const listNames = (): string[] =>
+    [...document.querySelectorAll('[role="option"]')].map((o) => o.querySelector('span')?.textContent ?? '');
+  const focusComposer = (): void => act(() => composer().focus());
+
+  it('typing / opens the list of app commands; Chat lists no agent command', async () => {
+    await open('/chat?c=p-sl', (text) => text.includes('Hi there'), {
+      conversations: { 'p-sl': sync('p-sl', { turns: [metric()] }) },
+    });
+    focusComposer();
+    type('/');
+    await waitFor(() => listNames().length > 0);
+    expect(listNames()).toEqual(['/compact', '/context', '/fork', '/recap', '/rewind']);
+    expect(composer().getAttribute('aria-expanded')).toBe('true');
+    key(composer(), { key: 'Escape' });
+    expect(listNames()).toEqual([]);
+  });
+
+  it('/context, /usage and /cost open the Context panel and send nothing, also while an answer runs', async () => {
+    const panel = (): HTMLElement | null => byRole(document.body, 'dialog', CHAT.history.context);
+    await open('/chat?c=p-sx', (text) => text.includes('Hi there'), {
+      conversations: {
+        'p-sx': sync('p-sx', {
+          turns: [metric()],
+          turn: { turnId: 't2', phase: 'running', startedAt: NOW, wait: null },
+        }),
+      },
+    });
+    for (const text of ['/context', '/usage', '/COST']) {
+      focusComposer();
+      type(text);
+      expect(shown()).toContain(CHAT.slash.run);
+      expect(shown()).not.toContain(CHAT.slash.unknown);
+      key(composer(), { key: 'Enter' });
+      await waitFor(() => panel() !== null);
+      expect(composer().value).toBe('');
+      key(panel()!, { key: 'Escape' });
+      await waitFor(() => panel() === null);
+    }
+    expect(writes()).toEqual([]);
+  });
+
+  it('a new conversation has no Context panel: /context shows why and Send stays off', async () => {
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle));
+    type('/context');
+    expect(shown()).toContain(CHAT.history.contextCold);
+    expect(sendFace().disabled).toBe(true);
+    key(composer(), { key: 'Enter' });
+    await flushTimers();
+    expect(writes()).toEqual([]);
+  });
+
+  it('a name the list has nothing for is said once; a name still being typed is not', async () => {
+    await open('/chat?c=p-sn', (text) => text.includes('Hi there'), {
+      conversations: { 'p-sn': sync('p-sn', { turns: [metric()] }) },
+    });
+    const statusText = (): string =>
+      [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent ?? '').join(' ');
+    focusComposer();
+    type('/co');
+    expect(shown()).toContain(CHAT.slash.unknown);
+    await flushTimers();
+    expect(statusText()).not.toContain(CHAT.slash.unknown);
+    type('/yolo');
+    await waitFor(() => statusText().includes(CHAT.slash.unknown));
+  });
+
+  it('/compact runs Compact now and sends no prompt; it is never queued', async () => {
+    await open('/chat?c=p-sc', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-sc/compact': {} },
+      conversations: { 'p-sc': sync('p-sc', { turns: [metric()] }) },
+    });
+    focusComposer();
+    type('/compact');
+    expect(shown()).toContain(CHAT.slash.run);
+    expect(sendFace().disabled).toBe(false);
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    expect(writes()).toEqual([{ method: 'POST', path: '/chat/conversations/p-sc/compact', body: undefined }]);
+    await waitFor(() => composer().value === '');
+  });
+
+  it('/compact while its op is off shows the op’s reason and Send stays off', async () => {
+    await open('/chat?c=p-so', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-so/compact': {} },
+      conversations: { 'p-so': sync('p-so', { turns: [] }) },
+    });
+    focusComposer();
+    type('/compact');
+    expect(shown()).toContain(CHAT.history.compactEmpty);
+    expect(sendFace().disabled).toBe(true);
+    key(composer(), { key: 'Enter' });
+    await flushTimers();
+    expect(writes()).toEqual([]);
+  });
+
+  it('the + menu’s Commands row puts / before the draft, focuses the box and opens the list', async () => {
+    await open('/chat?c=p-sp', (text) => text.includes('Hi there'), {
+      conversations: { 'p-sp': sync('p-sp', { turns: [metric()] }) },
+    });
+    type('fix it');
+    click(reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    click(byRole(document.body, 'menuitem', CHAT.slash.menuRow)!);
+    await waitFor(() => listNames().length > 0);
+    expect(composer().value).toBe('/ fix it');
+    expect(document.activeElement).toBe(composer());
+    expect(listNames()).toEqual(['/compact', '/context', '/fork', '/recap', '/rewind']);
+  });
+
+  // Mutation: clear the whole draft when an app command runs → the words after the command are lost.
+  it('an app command picked before the draft runs and leaves the draft’s words in the box', async () => {
+    const panel = (): HTMLElement | null => byRole(document.body, 'dialog', CHAT.history.context);
+    await open('/chat?c=p-sk', (text) => text.includes('Hi there'), {
+      routes: { 'POST /chat/conversations/p-sk/compact': {} },
+      conversations: { 'p-sk': sync('p-sk', { turns: [metric()] }) },
+    });
+    type('fix it\nand the README');
+    click(reachable().find((b) => accessibleName(b).startsWith(CHAT.tools))!);
+    await waitFor(() => byRole(document.body, 'menu', CHAT.tools) !== null);
+    click(byRole(document.body, 'menuitem', CHAT.slash.menuRow)!);
+    await waitFor(() => listNames().length > 0);
+    click(
+      [...document.querySelectorAll<HTMLElement>('[role="option"]')].find((o) =>
+        o.textContent?.startsWith('/context'),
+      )!,
+    );
+    expect(composer().value).toBe('/context fix it\nand the README');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => panel() !== null);
+    expect(composer().value).toBe('fix it\nand the README');
+    key(panel()!, { key: 'Escape' });
+    await waitFor(() => panel() === null);
+    focusComposer();
+    type('/compact   keep this');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    expect(writes()).toEqual([{ method: 'POST', path: '/chat/conversations/p-sk/compact', body: undefined }]);
+    expect(composer().value).toBe('keep this');
+  });
+});
+
 describe('Chat page: Unload', () => {
   const RESIDENT = host({ resident: [{ modelId: 'qwen3.5-4b', sizeBytes: 2 * 1024 ** 3 }] });
   const inMemory = fill(CHAT.engine.resident, { model: 'qwen3.5-4b', size: '2.0 GB' });
@@ -1258,7 +2377,19 @@ describe('Chat page: Unload', () => {
     const error = vi.spyOn(toast, 'error');
     const busy = host({
       ...RESIDENT,
-      active: [{ conversationId: 'p-other', mode: 'chat', busy: true, waiting: false, background: false }],
+      active: [
+        {
+          conversationId: 'p-other',
+          mode: 'chat',
+          busy: true,
+          waiting: false,
+          asks: 0,
+          background: false,
+          helpers: false,
+          tasks: 0,
+          op: null,
+        },
+      ],
     });
     await open('/chat?c=p-unload-busy', (text) => text.includes('Hi there'), {
       routes: {
@@ -1295,7 +2426,7 @@ describe('Chat page: titles', () => {
       rows: [row(id, { title: '' })],
     });
     expect(heading()).toBe(CHAT.newChat);
-    expect(document.title).toBe(`${CHAT.newChat} — mlx-node`);
+    expect(document.title).toBe(`${CHAT.newChat} — Portato`);
     expect(rowLink(CHAT.newChat).textContent).toContain(CHAT.newChat);
     expect(shown()).not.toContain(id);
   });
@@ -1454,6 +2585,14 @@ describe('Chat page: states that stop every message', () => {
     expect(sendFailure('model-unavailable', undefined, 'chat')).toMatchObject({
       strip: { action: { kind: 'pick-model' } },
     });
+    // Mutation: no case for folder-not-made → "Could not send. Try again." with Try again.
+    expect(sendFailure('folder-not-made', 'E_CONFLICT', 'work', undefined, undefined, true, '~/Portato')).toEqual({
+      strip: {
+        tone: 'danger',
+        text: 'The app could not make a folder in ~/Portato. Choose a folder instead.',
+        action: { kind: 'choose-folder', label: e['folder-not-made'][1] },
+      },
+    });
     expect(sendFailure('cwd-invalid', undefined, 'work')).toEqual({
       strip: {
         tone: 'danger',
@@ -1471,7 +2610,7 @@ describe('Chat page: states that stop every message', () => {
     });
     expect(sendFailure('cwd-mismatch', undefined, 'work')).toMatchObject({ strip: { action: { kind: 'retry' } } });
     expect(sendFailure('conversation-busy', 'E_CONFLICT', 'chat')).toEqual({ toast: e['conversation-busy'][0] });
-    expect(sendFailure('slash-text', 'E_BAD_REQUEST', 'chat')).toMatchObject({ strip: { text: CHAT.slashText } });
+    expect(sendFailure('slash-text', 'E_BAD_REQUEST', 'chat')).toMatchObject({ strip: { text: CHAT.slash.unknown } });
     expect(sendFailure('keychain-unavailable', undefined, 'chat')).toMatchObject({
       strip: { tone: 'warning', action: { kind: 'open-providers' } },
     });
@@ -2150,7 +3289,7 @@ describe('Chat page: the crawler', () => {
   }
 
   function crawlerMenuRow(): HTMLElement {
-    return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[2]!;
+    return allByRole(byRole(document.body, 'menu', CHAT.tools)!, 'menuitem')[3]!;
   }
 
   function checkedRow(): string | null {
@@ -2613,6 +3752,93 @@ describe('Chat page: conversation actions', () => {
     });
   });
 
+  it('Thinking: the menu holds the levels only when the agent lists them; a pick PATCHes the level and says it', async () => {
+    const levels = { levels: ['none', 'low', 'medium', 'high'], default: 'high' } as const;
+    const levelled = host({
+      models: [{ ...hostModel('qwen3.5-4b', 32768), thinking: { ...levels, levels: [...levels.levels] } }],
+    });
+    await open('/chat?c=p-think', (text) => text.includes('Hi there'), {
+      host: levelled,
+      routes: { 'PATCH /chat/conversations/p-think': { ...info('p-think'), thinking: 'low' } },
+      conversations: { 'p-think': sync('p-think') },
+    });
+    const trigger = button(
+      fill(CHAT.thinkingLevel.chipName, {
+        model: fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }),
+        level: 'High',
+      }),
+    );
+    key(trigger, { key: 'ArrowDown' });
+    const levelList = fill(CHAT.thinkingLevel.list, { model: 'qwen3.5-4b' });
+    await waitFor(() => byRole(document.body, 'listbox', levelList) !== null);
+    const group = byRole(document.body, 'listbox', levelList)!;
+    expect(document.body.textContent).toContain(CHAT.thinkingLevel.about);
+    act(() =>
+      allByRole(group, 'option')
+        .find((o) => o.textContent === 'Low')!
+        .click(),
+    );
+    await waitFor(() => writes().length === 1);
+    expect(writes()[0]).toEqual({ method: 'PATCH', path: '/chat/conversations/p-think', body: { thinking: 'low' } });
+    const statusText = [...page!.container.querySelectorAll('[role="status"]')].map((n) => n.textContent).join(' ');
+    expect(statusText).toContain(fill(CHAT.thinkingLevel.status, { level: 'Low' }));
+    page!.unmount();
+    api!();
+
+    // No agent listed the model yet: no levels in the host state, no row.
+    await open('/chat?c=p-think', (text) => text.includes('Hi there'), {
+      host: host({ models: [hostModel('qwen3.5-4b', 32768)] }),
+      conversations: { 'p-think': sync('p-think') },
+    });
+    key(button(fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle })), { key: 'ArrowDown' });
+    await waitFor(() => byRole(document.body, 'listbox') !== null);
+    expect(byRole(document.body, 'listbox', levelList)).toBeNull();
+  });
+
+  it('Thinking on the New screen: the pick is kept per mode and goes with the first message; the chip names it', async () => {
+    const levelled = host({
+      models: [{ ...hostModel('qwen3.5-4b', 32768), thinking: { levels: ['none', 'low', 'high'], default: 'high' } }],
+    });
+    const create = deferred({ conversation: info('p-tnew', { thinking: 'none' }), turnId: 't1' });
+    await open('/chat?mode=chat', (text) => text.includes(CHAT.heroChatTitle), {
+      host: levelled,
+      routes: { 'POST /chat/conversations': create.body },
+      conversations: { 'p-tnew': sync('p-tnew', {}, { thinking: 'none' }) },
+    });
+    key(
+      button(
+        fill(CHAT.thinkingLevel.chipName, {
+          model: fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }),
+          level: 'High',
+        }),
+      ),
+      { key: 'ArrowDown' },
+    );
+    const levelList = fill(CHAT.thinkingLevel.list, { model: 'qwen3.5-4b' });
+    await waitFor(() => byRole(document.body, 'listbox', levelList) !== null);
+    const group = byRole(document.body, 'listbox', levelList)!;
+    act(() =>
+      allByRole(group, 'option')
+        .find((o) => o.textContent === 'Off')!
+        .click(),
+    );
+    expect(JSON.parse(localStorage.getItem('mlx-node:chat-thinking:v1') ?? '{}')).toEqual({ chat: 'none' });
+    const named = fill(CHAT.thinkingLevel.chipName, {
+      model: fill(CHAT.pillName, { model: 'qwen3.5-4b MLX', state: CHAT.pillStates.idle }),
+      level: 'Off',
+    });
+    await waitFor(() => button(named) !== null);
+    type('Fast please');
+    key(composer(), { key: 'Enter' });
+    await waitFor(() => writes().length === 1);
+    expect(writes()[0]).toEqual({
+      method: 'POST',
+      path: '/chat/conversations',
+      body: { mode: 'chat', text: 'Fast please', modelId: 'qwen3.5-4b', thinking: 'none' },
+    });
+    await act(async () => create.release());
+  });
+
   it('a quantization is picked in the right list: one PATCH, stored for its base; a new chat starts on the one in memory', async () => {
     const XL = 'Qwen3.8-27B-UD-Q4_K_XL';
     const M = 'Qwen3.8-27B-UD-Q4_K_M';
@@ -2688,7 +3914,7 @@ describe('Chat page: conversation actions', () => {
     act(() => work.focus());
     click(work);
     await waitFor(() => where.search === '?mode=work');
-    await waitFor(() => shown().includes(CHAT.heroWorkTitle));
+    await waitFor(() => shown().includes(CHAT.heroWorkNoneTitle));
     await flushTimers();
     expect(document.activeElement?.closest(`[aria-label="${CHAT.mode}"]`)).not.toBeNull();
   });
@@ -2756,13 +3982,14 @@ describe('Chat page: conversation actions', () => {
 });
 
 describe('Chat page: Work tab', () => {
-  it('shows the folder step: Choose folder is on, every other Work action is off', async () => {
-    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle));
-    expect(button(CHAT.folderChoose, page!.container.querySelector('main')!).disabled).toBe(false);
-    for (const text of CHAT.startersWork) expect(button(text).disabled).toBe(true);
-    expect(composer().placeholder).toBe(CHAT.placeholderWorkNoFolder);
+  it('with no Work conversation yet the place is No folder: the starters and Send are on', async () => {
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle));
+    const none = fill(CHAT.folderLabelNone, { root: READY_CHAT_HOST.scratchRoot });
+    expect(button(none, page!.container.querySelector('main')!).disabled).toBe(false);
+    for (const text of CHAT.startersWorkNone) expect(button(text).disabled).toBe(false);
+    expect(composer().placeholder).toBe(CHAT.placeholderWorkNone);
     type('Run the tests');
-    expect(sendFace().disabled).toBe(true);
+    expect(sendFace().disabled).toBe(false);
   });
 
   it('a Work row the page does not know yet still reads as the conversation', async () => {
@@ -3261,6 +4488,70 @@ describe('Chat page: files and pictures', () => {
     click(button(CHAT.sendAgainNoFiles));
     await waitFor(() => writes().length === 1);
     expect(writes()[0]!.body).toEqual({ text: 'Look at it' });
+  });
+
+  // Mutation: put back only the text → the blocked message comes back without its file.
+  it('a message a hook blocked comes back with its files: to an empty box, or by Put back beside what is there', async () => {
+    const info = vi.spyOn(toast, 'info');
+    await open('/chat?c=p-att-hook', (text) => text.includes('Hi there'), {
+      routes: { '/chat/conversations/p-att-hook/prompt': {} },
+      conversations: { 'p-att-hook': sync('p-att-hook') },
+    });
+    const sendWith = async (name: string, text: string, n: number): Promise<void> => {
+      pick(new File(['notes'], name, { type: 'text/plain' }));
+      await waitFor(() => chipText().includes(name));
+      type(text);
+      click(sendFace());
+      await waitFor(() => writes().length === n);
+      await waitFor(() => !chipText().includes(name));
+    };
+    const blocked = (seq: number, turnId: string, text: string): void =>
+      act(() =>
+        api!.emitChat('p-att-hook', { type: 'turn', seq, turn: null, turnId, outcome: 'hook-stopped', blocked: text }),
+      );
+    await sendWith('plan.txt', 'Deploy with this plan', 1);
+    blocked(1, 't1', 'Deploy with this plan');
+    await waitFor(() => composer().value === 'Deploy with this plan');
+    await waitFor(() => chipText().includes('plan.txt'));
+
+    type('');
+    act(() => writeAttachments('p-att-hook', []));
+    await waitFor(() => chipText() === '');
+    await sendWith('second.txt', 'Deploy again', 2);
+    pick(new File(['mine'], 'mine.txt', { type: 'text/plain' }));
+    await waitFor(() => chipText().includes('mine.txt'));
+    type('typed since');
+    blocked(2, 't2', 'Deploy again');
+    await waitFor(() => info.mock.calls.some((c) => c[0] === CHAT.hook.promptKept));
+    expect(chipText()).not.toContain('second.txt');
+    const options = info.mock.calls.find((c) => c[0] === CHAT.hook.promptKept)![1] as {
+      action: { onClick: (id: string) => void };
+    };
+    act(() => options.action.onClick('t'));
+    await waitFor(() => composer().value === 'Deploy again');
+    expect(chipText()).toContain('mine.txt');
+    expect(chipText()).toContain('second.txt');
+
+    // Mutation: drop `lastSent`'s files → a block that comes after the stream carried the message loses its file.
+    type('');
+    act(() => writeAttachments('p-att-hook', []));
+    await waitFor(() => chipText() === '');
+    await sendWith('third.txt', 'Deploy once more', 3);
+    act(() =>
+      api!.emitChat('p-att-hook', {
+        type: 'ops',
+        seq: 3,
+        ops: [{ op: 'push', entry: { kind: 'user', ts: NOW, text: 'Deploy once more', promptIndex: null } }],
+      }),
+    );
+    await waitFor(() => shown().includes('Deploy once more'));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    blocked(4, 't3', 'Deploy once more');
+    await waitFor(() => composer().value === 'Deploy once more');
+    await waitFor(() => chipText().includes('third.txt'));
+    info.mockRestore();
   });
 
   it('a picture on a model that does not see images: the chip says so and Send waits until the model can', async () => {

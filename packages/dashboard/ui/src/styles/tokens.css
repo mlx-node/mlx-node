@@ -23,6 +23,9 @@
   --chat-bar-height: 2.75rem;
   --chat-list-width: 16rem;
   --chat-drawer-width: 18rem;
+  --chat-rail-width: 18rem;
+  /* An agent's view in the rail's column. */
+  --chat-view-width: 27.5rem;
   --chat-column: 42.5rem;
   --chat-bubble-max: 80%;
   --chat-dock-fade: 1rem;
@@ -103,6 +106,7 @@
   --blur-subtle: 2px;
   --blur-soft: 4px;
   --scrim: oklch(10% 0 0 / 0.46);
+  --scrim-strong: oklch(10% 0 0 / 0.72);
   --scrim-blur: 7px;
   --shine: color-mix(in oklab, var(--background) 62%, transparent);
 

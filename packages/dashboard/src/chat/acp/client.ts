@@ -1,8 +1,8 @@
 /**
  * JSON-RPC 2.0 peer for ACP. Our request ids are integers from 1; the agent's requests use its own id space. A
  * message with `method` and `id` is an agent request, with `id` and no `method` a reply to us, with `method` only a
- * notification. Error replies keep only the numeric code and the agent's fixed `error_kind`: message and data text
- * from the agent never leave this module.
+ * notification. Error replies keep only the numeric code, the agent's fixed `error_kind` and a `kind` from
+ * {@link RPC_KINDS}: message and data text from the agent never leave this module.
  */
 
 import { encodeFrame } from './framing.js';
@@ -25,16 +25,41 @@ export const MAX_GARBAGE_LINES = 100;
 export const METHOD_NOT_FOUND = -32601;
 export const INTERNAL_ERROR = -32603;
 
+/** The values of `error.data.kind` the client keeps: the end of a manual compaction. */
+export const RPC_KINDS = ['compact_failed', 'compact_cancelled'] as const;
+export type RpcKind = (typeof RPC_KINDS)[number];
+
+function rpcKind(value: unknown): RpcKind | null {
+  for (const kind of RPC_KINDS) if (value === kind) return kind;
+  return null;
+}
+
 export class AcpRpcError extends Error {
   readonly code: number;
   /** `error.data.error_kind` when it is a string; the only part of the agent's error text we keep. */
   readonly errorKind: string | null;
+  /** `error.data.kind` when it is one of {@link RPC_KINDS}. */
+  readonly kind: RpcKind | null;
 
-  constructor(code: number, errorKind: string | null) {
+  constructor(code: number, errorKind: string | null, kind: RpcKind | null = null) {
     super(`agent error ${code}`);
     this.code = code;
     this.errorKind = errorKind;
+    this.kind = kind;
     this.name = 'AcpRpcError';
+  }
+}
+
+/** A soft deadline passed. The client stays open; `late` settles with the reply when it comes. */
+export class AcpSoftTimeoutError extends Error {
+  readonly method: string;
+  readonly late: Promise<unknown>;
+
+  constructor(method: string, late: Promise<unknown>) {
+    super(`agent did not answer ${method} in time`);
+    this.method = method;
+    this.late = late;
+    this.name = 'AcpSoftTimeoutError';
   }
 }
 
@@ -156,13 +181,7 @@ export class AcpClient {
     if (this.closed) return { id, reply: Promise.reject(new AcpClosedError()) };
     const reply = new Promise<unknown>((resolve, reject) => {
       const entry: Pending = { method, resolve, reject, timer: null };
-      if (timeoutMs !== null) {
-        entry.timer = setTimeout(() => {
-          this.pending.delete(id);
-          reject(new AcpTimeoutError(method));
-          this.handlers.onProtocolError?.('timeout');
-        }, timeoutMs);
-      }
+      if (timeoutMs !== null) entry.timer = this.deadline(id, entry, timeoutMs);
       this.pending.set(id, entry);
       try {
         this.transport.write(encodeFrame({ jsonrpc: '2.0', id, method, params }));
@@ -173,6 +192,46 @@ export class AcpClient {
       }
     });
     return { id, reply };
+  }
+
+  /**
+   * The soft call: {@link request} with a deadline that never closes the client. A missed {@link ACP_TIMEOUTS}
+   * deadline is a protocol error that stops the agent with every run and command it holds; past `ms` this rejects
+   * with {@link AcpSoftTimeoutError} instead and the request stays open. Every call added that is not a turn uses it.
+   */
+  requestSoft(method: string, params: unknown, ms: number): Promise<unknown> {
+    const { reply } = this.start(method, params, null);
+    return new Promise<unknown>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new AcpSoftTimeoutError(method, reply)), ms);
+      reply.then(
+        (value) => {
+          clearTimeout(timer);
+          resolve(value);
+        },
+        (error: unknown) => {
+          clearTimeout(timer);
+          reject(error);
+        },
+      );
+    });
+  }
+
+  /**
+   * Gives request `id`, started with no deadline, the deadline of {@link request} from now: a miss is the same protocol
+   * error. Nothing for a request that has a deadline or a reply.
+   */
+  harden(id: number, timeoutMs: number): void {
+    const entry = this.pending.get(id);
+    if (entry === undefined || entry.timer !== null) return;
+    entry.timer = this.deadline(id, entry, timeoutMs);
+  }
+
+  private deadline(id: number, entry: Pending, timeoutMs: number): ReturnType<typeof setTimeout> {
+    return setTimeout(() => {
+      this.pending.delete(id);
+      entry.reject(new AcpTimeoutError(entry.method));
+      this.handlers.onProtocolError?.('timeout');
+    }, timeoutMs);
   }
 
   /** Whether request `id` has no reply yet. False from the line that carries its reply on, before any promise job. */
@@ -205,7 +264,9 @@ export class AcpClient {
       const error = isRecord(message.error) ? message.error : {};
       const code = typeof error.code === 'number' ? error.code : INTERNAL_ERROR;
       const data = isRecord(error.data) ? error.data : {};
-      entry.reject(new AcpRpcError(code, typeof data.error_kind === 'string' ? data.error_kind : null));
+      entry.reject(
+        new AcpRpcError(code, typeof data.error_kind === 'string' ? data.error_kind : null, rpcKind(data.kind)),
+      );
       return;
     }
     entry.resolve(message.result);

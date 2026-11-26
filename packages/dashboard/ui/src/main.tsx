@@ -53,6 +53,6 @@ window.addEventListener('message', (event: MessageEvent) => {
 root.render(
   <div className="mlx-boot" role="status" aria-live="polite">
     <span className="mlx-boot__spinner" aria-hidden="true" />
-    <span>Starting mlx-node…</span>
+    <span>Starting Portato…</span>
   </div>,
 );

@@ -10,6 +10,7 @@
 
 import { Menu, nativeImage, Tray, type MenuItemConstructorOptions } from 'electron';
 
+import { APP_NAME } from '../app-name.js';
 import type { SupervisorSnapshot } from './supervisor/types.js';
 import { presentTray, type TrayPresentation } from './tray-view.js';
 import type { UpdatePresentation } from './updates.js';
@@ -182,7 +183,7 @@ export function createTray(options: TrayOptions): TrayController {
       // application menu with the standard roles is also installed — see
       // `index.ts`.
       {
-        label: 'Quit mlx-node',
+        label: `Quit ${APP_NAME}`,
         ...(isDarwin ? { accelerator: 'Command+Q' } : {}),
         click: () => {
           options.actions.quit();

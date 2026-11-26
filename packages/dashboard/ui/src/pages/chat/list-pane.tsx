@@ -1,5 +1,5 @@
 import { Trash2 } from 'lucide-react';
-import { type ReactElement, type RefObject, useMemo } from 'react';
+import { type ReactElement, type RefObject, useEffect, useMemo, useState } from 'react';
 
 import { CompactField } from '../../components/arc-x/compact-field/compact-field';
 import { ConfirmPopover } from '../../components/arc-x/confirm-popover/confirm-popover';
@@ -15,8 +15,22 @@ import { SearchField } from '../../components/arc/search-field/search-field';
 import { CHAT, fill } from '../../lib/chat-strings';
 import { chatTitle } from '../../lib/chat-turns';
 import type { ChatHostState, ChatMode, ConversationRow } from '../../lib/chat-types';
-import { groupByDay, matchesQuery } from '../../lib/conversations';
+import {
+  groupByDay,
+  groupByFolder,
+  groupLive,
+  matchesQuery,
+  NO_FOLDER_KEY,
+  placeKey,
+  placeName,
+  shownRows,
+  spokenFolder,
+} from '../../lib/conversations';
+import { useHomeDir } from '../../lib/home-dir';
+import { scratchShown, tildePath } from '../../lib/paths';
 import { deleteContent } from './conversation-actions';
+import type { FolderPick } from './drafts';
+import { nextFolded, readFolded, revealed, setShownAll, shownAll, toReveal, writeFolded } from './work/folds';
 
 export interface ListSource {
   rows: readonly ConversationRow[] | undefined;
@@ -38,6 +52,10 @@ export interface ListPaneProps {
   onRename: (item: ConversationItem) => void;
   onDeleted: (id: string) => void;
   onRetry: () => void;
+  /** A group's "+": the New Work screen with that folder, or with no folder. */
+  onNewIn: (pick: FolderPick) => void;
+  /** The host's scratch root of Work without a folder; null while the host state is not known. */
+  scratchRoot: string | null;
 }
 
 function itemOf(
@@ -53,7 +71,17 @@ function itemOf(
     mode: row.mode,
     updatedAt: row.updatedAt,
     folder: row.mode === 'work' ? row.cwd : null,
-    state: live === undefined ? 'idle' : live.waiting ? 'waiting' : live.busy || live.background ? 'running' : 'idle',
+    ...(row.mode === 'work' && row.noFolder === true ? { noFolder: true } : {}),
+    state:
+      live === undefined
+        ? 'idle'
+        : live.waiting
+          ? 'waiting'
+          : live.busy || live.background || live.tasks > 0
+            ? 'running'
+            : 'idle',
+    asks: live?.asks ?? 0,
+    fork: row.forkOf !== undefined,
   };
 }
 
@@ -62,13 +90,16 @@ function deleteBlock(id: string, active: ChatHostState['active']): string | null
   const live = active.find((entry) => entry.conversationId === id);
   if (live === undefined) return null;
   if (live.busy || live.waiting) return CHAT.deleteBusy;
-  return live.background ? CHAT.deleteBusyRun : null;
+  if (live.background) return live.helpers ? CHAT.deleteBusyHelper : CHAT.deleteBusyRun;
+  return live.tasks > 0 ? CHAT.deleteBusyTask : null;
 }
 
-/** The conversation list column: search over both workspaces, then the workspace's own list by day. */
+/** The conversation list column: search over both workspaces, else Chat by day and Work by folder. */
 export function ListPane(props: ListPaneProps): ReactElement {
-  const { mode, active, raised } = props;
+  const { mode, active, raised, currentId, onNewIn } = props;
   const now = Date.now();
+  const home = useHomeDir();
+  const root = scratchShown(props.scratchRoot, home);
   const own = mode === 'chat' ? props.chat : props.work;
   const searching = props.query.trim() !== '';
   const items = useMemo(() => {
@@ -77,14 +108,74 @@ export function ListPane(props: ListPaneProps): ReactElement {
     return { chat: pick(props.chat, 'chat'), work: pick(props.work, 'work') };
   }, [props.chat, props.work, active, raised]);
 
+  const [folded, setFolded] = useState(readFolded);
+  const [allKeys, setAllKeys] = useState(shownAll);
+  const keysNow = useMemo(() => new Set(items.work.map(placeKey)), [items.work]);
+  const setFold = (key: string, open: boolean): void => {
+    const next = nextFolded(folded, key, open, keysNow);
+    setFolded(next);
+    writeFolded(next);
+  };
+  const setAll = (key: string, on: boolean): void => {
+    const next = new Set(allKeys);
+    if (on) next.add(key);
+    else next.delete(key);
+    setShownAll(next);
+    setAllKeys(next);
+  };
+  // Going to a conversation in a folded group opens that group; the window's first look does not.
+  useEffect(() => {
+    const id = toReveal(currentId);
+    if (id === null) return;
+    const item = items.work.find((entry) => entry.id === id);
+    if (item === undefined) return;
+    revealed();
+    const key = placeKey(item);
+    if (!folded.has(key)) return;
+    const next = nextFolded(folded, key, true, keysNow);
+    setFolded(next);
+    writeFolded(next);
+  }, [currentId, items.work, folded, keysNow]);
+
   let groups: ConversationGroup[];
   if (searching) {
     const hits = [...items.chat, ...items.work]
-      .filter((item) => matchesQuery({ title: item.title, folder: item.folder }, props.query))
+      .filter((item) => matchesQuery({ title: item.title, folderName: placeName(item) }, props.query))
       .sort((a, b) => b.updatedAt - a.updatedAt);
-    groups = [{ label: null, items: hits }];
+    groups = [{ key: 'search', label: null, items: hits }];
+  } else if (mode === 'chat') {
+    groups = groupByDay(items.chat, now);
   } else {
-    groups = groupByDay(items[mode], now);
+    groups = groupByFolder(items.work).map((group): ConversationGroup => {
+      const { key } = group;
+      const all = allKeys.has(key);
+      const { shown, hidden } = shownRows(group.items, all, currentId);
+      const long = hidden > 0 || (all && shownRows(group.items, false, currentId).hidden > 0);
+      const name = group.name ?? CHAT.folderNone;
+      const none = key === NO_FOLDER_KEY;
+      const open = !folded.has(key);
+      return {
+        key,
+        label: null,
+        items: shown,
+        fold: {
+          open,
+          onToggle: () => setFold(key, !open),
+          count: group.items.length,
+          live: groupLive(group.items),
+          name,
+          hint: group.hint,
+          title: none ? fill(CHAT.list.noneTitle, { root }) : tildePath(key, home),
+          action: none
+            ? { label: CHAT.list.newNone, onPress: () => onNewIn({ kind: 'none' }) }
+            : {
+                label: fill(CHAT.list.newIn, { folder: spokenFolder({ name, hint: group.hint }) }),
+                onPress: () => onNewIn({ kind: 'folder', path: key }),
+              },
+        },
+        more: long ? { hidden, onMore: () => setAll(key, true), onFewer: () => setAll(key, false) } : undefined,
+      };
+    });
   }
   const count = groups.reduce((sum, group) => sum + group.items.length, 0);
   const [emptyTitle, emptyText] = mode === 'work' ? CHAT.listEmptyWork : CHAT.listEmptyChat;
@@ -118,13 +209,20 @@ export function ListPane(props: ListPaneProps): ReactElement {
               disabled={block !== null}
               disabledReason={block ?? undefined}
               {...deleteContent(
-                { id: item.id, title: item.title, mode: item.mode, folder: item.folder ?? null },
+                {
+                  id: item.id,
+                  title: item.title,
+                  mode: item.mode,
+                  folder: item.folder ?? null,
+                  noFolder: item.noFolder === true,
+                },
                 props.onDeleted,
               )}
             />
           );
         }}
         showMode={searching}
+        showFolder={searching}
         now={now}
         loading={loading}
         empty={

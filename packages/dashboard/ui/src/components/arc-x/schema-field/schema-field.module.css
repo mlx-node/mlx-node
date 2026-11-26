@@ -1,0 +1,142 @@
+.form {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+  container-type: inline-size;
+}
+
+.field {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+@container (min-width: 520px) {
+  .field {
+    grid-template-columns: minmax(0, 11rem) minmax(0, 1fr);
+    align-items: start;
+    gap: var(--space-3);
+  }
+  .label {
+    padding-top: var(--space-1-5);
+  }
+}
+
+.label {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  color: var(--foreground);
+  font-size: var(--text-body);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.mark {
+  color: var(--text-secondary);
+}
+
+.body {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.input,
+.box {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  min-height: var(--control-height-md);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-2-5);
+  background: var(--surface);
+  color: var(--foreground);
+  font: inherit;
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+}
+
+.box {
+  padding: var(--space-1) var(--space-2-5);
+  max-height: 12rem;
+  resize: vertical;
+}
+
+.input:focus-visible,
+.box:focus-visible {
+  border-color: var(--foreground);
+  outline: none;
+}
+
+.field[data-invalid] .input,
+.field[data-invalid] .box,
+.field[data-invalid] .list {
+  border-color: var(--danger);
+}
+
+.input:disabled,
+.box:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+  background: var(--surface-muted);
+}
+
+.list {
+  display: grid;
+  min-width: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-inset);
+}
+
+.option {
+  display: grid;
+  min-height: 32px;
+  grid-template-columns: 16px minmax(0, 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2-5);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--foreground);
+  font-size: var(--text-body);
+  cursor: pointer;
+}
+
+.option:first-child {
+  border-top-color: transparent;
+}
+
+.option input {
+  margin: 0;
+  accent-color: var(--accent);
+}
+
+.optionText {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.switchRow {
+  display: flex;
+  min-height: var(--control-height-md);
+  align-items: center;
+}
+
+.description,
+.error {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+  white-space: pre-wrap;
+}
+
+.description {
+  color: var(--text-secondary);
+}
+
+.error {
+  color: var(--danger);
+}

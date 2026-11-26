@@ -96,6 +96,7 @@ export function sidecarHostOptions(env: NodeJS.ProcessEnv = process.env): Sideca
     thinkingTokenBudget: AGENT_HOST_THINKING.tokenBudget,
     thinkingCycleGuard: AGENT_HOST_THINKING.cycleGuard,
     thinkingEndText: AGENT_HOST_THINKING.endText,
+    thinkingLevels: AGENT_HOST_THINKING.levels,
     ...(turnJournal !== null ? { turnJournal } : {}),
   };
 }
@@ -126,6 +127,8 @@ export interface SidecarHostOptions {
   thinkingTokenBudget: number;
   thinkingCycleGuard: boolean;
   thinkingEndText: string;
+  /** The family thinking levels (`AGENT_HOST_THINKING.levels`). */
+  thinkingLevels: boolean;
   turnJournal?: SidecarTurnJournal;
 }
 

@@ -1,11 +1,11 @@
-# mlx-node for macOS
+# Portato
 
 Install the signed DMG from [GitHub Releases](https://github.com/mlx-node/mlx-node/releases)
-by dragging mlx-node to Applications. The app requires Apple Silicon and macOS 26 or newer.
+by dragging Portato to Applications. The app requires Apple Silicon and macOS 26 or newer.
 
 ## Coding Agents
 
-Open **Coding Agents** in the control panel to let other agents delegate GitHub
+Open **Coding Agents** in Portato to let other agents delegate GitHub
 work to `mlx delegate github`. The app includes the CLI and runs it with Electron's
 bundled Node runtime; users do not need npm or a separate Node installation. At
 launch it creates `~/.mlx-node/bin/mlx` (`mlx.cmd` on Windows), verifies delegation
@@ -89,22 +89,22 @@ release that includes it.
 
 The [desktop release workflow](../../.github/workflows/desktop-release.yml) produces:
 
-- `mlx-node-<version>-arm64.dmg` for installation.
+- `Portato-<version>-arm64.dmg` for installation.
 - `mlx-node-<version>-darwin-arm64.zip` for automatic updates.
 - `mlx-node-<version>-darwin-arm64.zip.blockmap` for differential downloads.
 - `latest-mac.yml` with the update version, archive size/hash, minimum macOS, and rollout percentage.
-- `mlx-node-<version>-win32-arm64.zip`, a portable Windows ARM64 app with the
+- `Portato-<version>-win32-arm64.zip`, a portable Windows ARM64 app with the
   native addon, CUDA/cuDNN/OpenBLAS DLLs, and NVRTC headers. Extract it and run
-  `mlx-node.exe`; no automatic update feed is used. When the `ES_USERNAME`,
-  `ES_PASSWORD`, `CREDENTIAL_ID` and `ES_TOTP_SECRET` secrets are set, every
-  `.exe`, `.dll` and `.node` in it without an existing valid, timestamped
-  signature (NVIDIA's DLLs already carry one) is Authenticode-signed and
-  timestamped through SSL.com eSigner (via pinned `CodeSignTool` v1.3.2) before
-  the ZIP is built; without them the ZIP ships unsigned, with a warning.
+  `Portato-win32-arm64\mlx-node.exe`; no automatic update feed is used. When the
+  `ES_USERNAME`, `ES_PASSWORD`, `CREDENTIAL_ID` and `ES_TOTP_SECRET` secrets are
+  set, every `.exe`, `.dll` and `.node` in it without an existing valid,
+  timestamped signature (NVIDIA's DLLs already carry one) is Authenticode-signed
+  and timestamped through SSL.com eSigner (via pinned `CodeSignTool` v1.3.2)
+  before the ZIP is built; without them the ZIP ships unsigned, with a warning.
 
 Stable Windows ARM64 builds also produce two workflow artifacts (kept off GitHub Releases):
 
-- `mlx-node-desktop-windows-arm64-msix`: unsigned `mlx-node-<version>-win32-arm64.msix`
+- `mlx-node-desktop-windows-arm64-msix`: unsigned `Portato-<version>-win32-arm64.msix`
   for Microsoft Store Partner Center ingestion.
 - `mlx-node-desktop-winget-manifests`: WinGet 1.12.0 multi-file manifests pointing at
   the GitHub Release `win32-arm64.zip` archive.
@@ -112,7 +112,7 @@ Stable Windows ARM64 builds also produce two workflow artifacts (kept off GitHub
 ## Microsoft Store (Windows ARM64 MSIX)
 
 Stable `package:windows` runs invoke the Windows SDK's `MakePri.exe` and `MakeAppx.exe`
-to produce `mlx-node-<version>-win32-arm64.msix` using the Partner Center Store identity
+to produce `Portato-<version>-win32-arm64.msix` using the Partner Center Store identity
 `LongYinan.Portato` (reserved Store display name `Portato`, `runFullTrust`, `arm64`,
 `Windows.Desktop` `MinVersion="10.0.26100.0"`, and `Microsoft.VCLibs.140.00.UWPDesktop`).
 Because Microsoft Store Partner Center rejects packages whose `<Identity Version>` starts
@@ -143,7 +143,7 @@ binary downloads/updates so updates flow exclusively through the Microsoft Store
 
 ## WinGet (Windows Package Manager)
 
-WinGet distributes the portable `mlx-node-<version>-win32-arm64.zip` release asset as a
+WinGet distributes the portable `Portato-<version>-win32-arm64.zip` release asset as a
 nested portable package (`ArchiveBinariesDependOnPath: true`, `mlx-node` command alias).
 
 For the one-time initial submission to `microsoft/winget-pkgs`:
@@ -155,7 +155,7 @@ For the one-time initial submission to `microsoft/winget-pkgs`:
    ```bash
    yarn workspace @mlx-node/desktop winget:manifests \
      --version <version> \
-     --zip packages/desktop/out/mlx-node-<version>-win32-arm64.zip
+     --zip packages/desktop/out/Portato-<version>-win32-arm64.zip
    ```
 
 2. Copy the generated `manifests/<letter>/<Publisher>/<App>/<version>/` directory into
@@ -164,7 +164,7 @@ For the one-time initial submission to `microsoft/winget-pkgs`:
 
 For automatic WinGet PRs on every subsequent stable release, configure the repository
 secret `WINGET_TOKEN` (a GitHub PAT with `public_repo` scope) and optionally set the
-`WINGET_PACKAGE_ID` repository variable (defaults to `mlx-node.mlx-node`). Once the
+`WINGET_PACKAGE_ID` repository variable (defaults to `LongYinan.Portato`). Once the
 GitHub release is published (even if the subsequent Homebrew cask bump fails), the
 workflow's `winget` job installs a pinned, SHA-256-verified Komac binary in a
 credential-free step, then runs `komac update <package-id> --version <version> --urls <exact-release-tag-zip-url> --submit`
@@ -177,7 +177,8 @@ skip notarization and release uploads.
 
 The app uses [electron-updater](https://www.electron.build/v26/docs/features/auto-update/)
 with public GitHub Releases. macOS installation still uses Squirrel.Mac. Keep the
-archive naming, bundle ID `ai.mlxnode.desktop`, and Developer ID signing identity
+update ZIP name (`mlx-node-<version>-darwin-arm64.zip`), the userData folder name (`mlx-node`),
+bundle ID `ai.mlxnode.desktop`, and Developer ID signing identity
 consistent across releases. No additional update server, client token, or signing
 secret is needed. Packaging includes `Contents/Resources/app-update.yml` before signing.
 

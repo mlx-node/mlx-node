@@ -37,12 +37,13 @@ export function metricsTraceDir(): string {
 }
 
 /**
- * The agent binary's config home: `GROK_HOME` when set, else `~/.mlx-agent`.
- * `GROK_HOME` gets the same `~`/`file://` expansion as a `--dir` flag.
- * `env`/`home` are test seams.
+ * The agent binary's config home: `MLX_AGENT_HOME` when set, else `~/.mlx-agent`.
+ * `MLX_AGENT_HOME` gets the same `~`/`file://` expansion as a `--dir` flag.
+ * `GROK_HOME` is grok-build's own home and is never read; mlx-node sets it
+ * for the binary from this. `env`/`home` are test seams.
  */
 export function agentConfigDir(env: NodeJS.ProcessEnv = process.env, home: string = homedir()): string {
-  return env.GROK_HOME ? expandAgentDir(env.GROK_HOME, home) : join(home, '.mlx-agent');
+  return env.MLX_AGENT_HOME ? expandAgentDir(env.MLX_AGENT_HOME, home) : join(home, '.mlx-agent');
 }
 
 /**
@@ -83,3 +84,9 @@ function parseDefaultModelLine(text: string): string | undefined {
   }
   return undefined;
 }
+
+/** grok-build's own login and config files: never passed to mlx-agent. */
+export const GROK_BUILD_ENV_REMOVED = ['GROK_AUTH_PATH', 'GROK_CONFIG_PATH'] as const;
+
+/** Connect attempts mlx-node sets for its own endpoints: they listen on port 0 with a fresh token per process. */
+export const LOOPBACK_CONNECT_ATTEMPTS = '3';

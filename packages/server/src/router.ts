@@ -8,7 +8,7 @@ import type { AudioService } from './audio-service.js';
 import { handleMemoryRelease, type MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { handleCountMessageTokens } from './endpoints/messages-count-tokens.js';
 import { handleCreateMessage } from './endpoints/messages.js';
-import { handleListModels, handleUnloadModels } from './endpoints/models.js';
+import { handleListModels, handleUnloadModels, listedFamily } from './endpoints/models.js';
 import { handleCreateResponse } from './endpoints/responses.js';
 import { handleSystemOne } from './endpoints/systemone.js';
 import {
@@ -188,6 +188,11 @@ export interface RouteExtras {
   thinkingCycleGuard?: boolean;
   /** The end text of a Messages request's cut thought. */
   thinkingEndText?: string;
+  /**
+   * `/v1/models` lists each family's thinking levels, and `/v1/messages` and `/v1/messages/count_tokens` map
+   * `extra_body.reasoning_effort` through them.
+   */
+  thinkingLevels?: boolean;
   /** The desktop supervisor's turn journal and quarantine. */
   turnJournal?: TurnJournal;
   /** `POST /v1/memory/release`; omitted ⇒ the route is not served. */
@@ -211,6 +216,7 @@ export async function routeRequest(
   extras?: RouteExtras,
 ): Promise<void> {
   const path = requestPathname(req);
+  const levelsFamily = extras?.thinkingLevels === true ? (name: string) => listedFamily(name, listModels) : undefined;
   const rejectAudio = (body: unknown): boolean => {
     const name = body && typeof body === 'object' && 'model' in body ? body.model : undefined;
     if (
@@ -300,7 +306,7 @@ export async function routeRequest(
       sendMethodNotAllowed(res, 'GET');
       return;
     }
-    handleListModels(res, registry, listModels);
+    handleListModels(res, registry, listModels, extras?.thinkingLevels === true);
     return;
   }
 
@@ -373,6 +379,7 @@ export async function routeRequest(
       resolveModel,
       modelWorkCoordinator,
       extras?.bindLoadedModel,
+      levelsFamily,
     );
     return;
   }
@@ -407,6 +414,7 @@ export async function routeRequest(
         tokenBudget: extras?.thinkingTokenBudget,
         cycleGuard: extras?.thinkingCycleGuard,
         endText: extras?.thinkingEndText,
+        ...(levelsFamily !== undefined ? { levelsFamily } : {}),
       },
       extras?.turnJournal,
       extras?.bindLoadedModel,

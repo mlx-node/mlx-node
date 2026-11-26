@@ -11,16 +11,17 @@ import { StatGroup, StatTile } from '../../components/arc-x/stat-tile/stat-tile'
 import { TrendChart } from '../../components/arc-x/trend-chart/trend-chart';
 import { EmptyState } from '../../components/arc/empty-state/empty-state';
 import { formatCountNoun, formatNumber, formatPercentValue, formatRate, formatTps } from '../../lib/format';
-import { bucketWord, speculationView } from '../../lib/metrics-view';
+import { METRIC } from '../../lib/metric-strings';
+import { bucketWord, ratedSpeed, speculationView } from '../../lib/metrics-view';
 import { modelColor, modelSeries } from '../../lib/model-colors';
 import { bucketPoint, moreInTableLabel } from '../../lib/timeseries';
 import { LOW_SAMPLE_N, type MetricsSpeculative } from '../../lib/types';
 import { PageGrid } from '../../shell/page';
 import {
-  MedianCell,
   quantileMax,
   RefreshAlert,
   regionError,
+  SampledCell,
   tileState,
   useHeldQuery,
   useMetricsScope,
@@ -39,19 +40,12 @@ function fixed(value: number | null, digits: number): string | null {
   return value === null || !Number.isFinite(value) ? null : value.toFixed(digits);
 }
 
+/** Token-weighted decode with speculation ÷ without; null below LOW_SAMPLE_N turns on either side. */
 function gainValue(row: SpecModel): number | null {
-  const withP = row.decodeTpsWithMtp;
-  const without = row.decodeTpsWithoutMtp;
-  if (
-    withP.n < LOW_SAMPLE_N ||
-    without.n < LOW_SAMPLE_N ||
-    withP.p50 === null ||
-    without.p50 === null ||
-    without.p50 <= 0
-  ) {
-    return null;
-  }
-  return withP.p50 / without.p50;
+  if (row.decodeTpsWithMtp.n < LOW_SAMPLE_N || row.decodeTpsWithoutMtp.n < LOW_SAMPLE_N) return null;
+  const withSpeed = ratedSpeed(row.decodeWith);
+  const without = ratedSpeed(row.decodeWithout);
+  return withSpeed === null || without === null ? null : withSpeed / without;
 }
 
 function gain(row: SpecModel): string {
@@ -115,17 +109,16 @@ export function SpeculationTab(): ReactElement {
       : model !== null
         ? view.models.find((row) => row.model === model)
         : undefined;
-  const withQ = single?.decodeTpsWithMtp;
-  const withoutQ = single?.decodeTpsWithoutMtp;
+  const withSpeed = single === undefined ? null : ratedSpeed(single.decodeWith);
+  const withoutSpeed = single === undefined ? null : ratedSpeed(single.decodeWithout);
   const speedTile =
-    withQ !== undefined &&
-    withoutQ !== undefined &&
-    withQ.n > 0 &&
-    withoutQ.n > 0 &&
-    withQ.p50 !== null &&
-    withoutQ.p50 !== null &&
-    withoutQ.p50 > 0
-      ? { with: withQ, without: withoutQ, ratio: withQ.p50 / withoutQ.p50 }
+    single !== undefined && withSpeed !== null && withoutSpeed !== null
+      ? {
+          with: withSpeed,
+          without: withoutSpeed,
+          ratio: withSpeed / withoutSpeed,
+          turns: Math.min(single.decodeTpsWithMtp.n, single.decodeTpsWithoutMtp.n),
+        }
       : null;
 
   const barMax = quantileMax([
@@ -191,13 +184,13 @@ export function SpeculationTab(): ReactElement {
     },
     {
       id: 'with',
-      header: 'With MTP tok/s',
+      header: 'With · tok/s',
       width: 148,
       cell: (row) => (
         <span className="inline-flex items-center gap-2">
-          <MedianCell text={formatTps(row.decodeTpsWithMtp.p50)} n={row.decodeTpsWithMtp.n} />
+          <SampledCell text={formatTps(ratedSpeed(row.decodeWith))} n={row.decodeTpsWithMtp.n} />
           <QuantileBar
-            label={`Decode speed of ${row.model} with MTP`}
+            label={`${METRIC.decodeSpeed.label} of ${row.model} with speculation, per turn`}
             quantiles={row.decodeTpsWithMtp}
             min={0}
             max={barMax}
@@ -208,18 +201,18 @@ export function SpeculationTab(): ReactElement {
           />
         </span>
       ),
-      sortValue: (row) => row.decodeTpsWithMtp.p50,
+      sortValue: (row) => ratedSpeed(row.decodeWith),
     },
     {
       id: 'without',
-      header: 'Without tok/s',
+      header: 'Without · tok/s',
       width: 148,
       minTableWidth: 640,
       cell: (row) => (
         <span className="inline-flex items-center gap-2">
-          <MedianCell text={formatTps(row.decodeTpsWithoutMtp.p50)} n={row.decodeTpsWithoutMtp.n} />
+          <SampledCell text={formatTps(ratedSpeed(row.decodeWithout))} n={row.decodeTpsWithoutMtp.n} />
           <QuantileBar
-            label={`Decode speed of ${row.model} without MTP`}
+            label={`${METRIC.decodeSpeed.label} of ${row.model} without speculation, per turn`}
             quantiles={row.decodeTpsWithoutMtp}
             min={0}
             max={barMax}
@@ -230,7 +223,7 @@ export function SpeculationTab(): ReactElement {
           />
         </span>
       ),
-      sortValue: (row) => row.decodeTpsWithoutMtp.p50,
+      sortValue: (row) => ratedSpeed(row.decodeWithout),
     },
     {
       id: 'gain',
@@ -287,10 +280,10 @@ export function SpeculationTab(): ReactElement {
         />
         {speedTile === null ? null : (
           <StatTile
-            label="Speed with it"
+            label={`${METRIC.decodeSpeed.label} with speculation`}
             value={`${speedTile.ratio.toFixed(2)}×`}
-            hint={`${formatTps(speedTile.with.p50)} vs ${formatTps(speedTile.without.p50)} tok/s`}
-            sampleCount={Math.min(speedTile.with.n, speedTile.without.n)}
+            hint={`${formatTps(speedTile.with)} vs ${formatTps(speedTile.without)} tok/s`}
+            sampleCount={speedTile.turns}
             {...tile}
           />
         )}

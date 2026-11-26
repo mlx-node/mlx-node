@@ -1,4 +1,4 @@
-import { useId, useState, type ReactElement } from 'react';
+import { useId, useRef, useState, type ReactElement } from 'react';
 
 import { errMessage } from '../../../lib/errors';
 import { Alert } from '../../arc/alert/alert';
@@ -12,6 +12,8 @@ export interface ConfirmDialogProps extends ConfirmContent {
   onOpenChange: (open: boolean) => void;
   /** Where focus goes when the dialog closes; by default the element that had it when the dialog opened. */
   returnFocus?: () => HTMLElement | null;
+  /** It opens with focus on the keep button, as ConfirmPopover does. */
+  focusCancel?: boolean;
 }
 
 /**
@@ -22,6 +24,7 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactElement {
   const descriptionId = useId();
   const [working, setWorking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const cancelRef = useRef<HTMLButtonElement | null>(null);
   const tone = props.tone ?? 'danger';
 
   const onOpenChange = (next: boolean): void => {
@@ -51,6 +54,11 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactElement {
       <DialogContent
         title={props.title}
         aria-describedby={descriptionId}
+        onOpenAutoFocus={(event) => {
+          if (props.focusCancel !== true) return;
+          event.preventDefault();
+          cancelRef.current?.focus();
+        }}
         onEscapeKeyDown={(event) => {
           if (working) event.preventDefault();
         }}
@@ -75,7 +83,14 @@ export function ConfirmDialog(props: ConfirmDialogProps): ReactElement {
             </Alert>
           ) : null}
           <div className={styles.footer}>
-            <Button type="button" variant="ghost" size="md" disabled={working} onClick={() => onOpenChange(false)}>
+            <Button
+              ref={cancelRef}
+              type="button"
+              variant="ghost"
+              size="md"
+              disabled={working}
+              onClick={() => onOpenChange(false)}
+            >
               {props.cancelLabel ?? 'Cancel'}
             </Button>
             <Button

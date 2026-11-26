@@ -49,8 +49,25 @@ export interface ConfirmContent {
 }
 
 export type ConfirmTrigger =
-  | { kind: 'button'; label: string; icon?: ReactNode; size?: 'sm' | 'md'; variant?: 'secondary' | 'ghost' | 'danger' }
-  | { kind: 'icon'; label: string; icon: ReactNode; size?: 'sm' | 'md' };
+  | {
+      kind: 'button';
+      label: string;
+      icon?: ReactNode;
+      size?: 'sm' | 'md';
+      variant?: 'secondary' | 'ghost' | 'danger';
+      /** `aria-keyshortcuts`: the key that opens it from its place. */
+      keys?: string;
+    }
+  | {
+      kind: 'icon';
+      label: string;
+      icon: ReactNode;
+      size?: 'sm' | 'md';
+      /** The tooltip, when it says more than the label (its key). */
+      tooltip?: string;
+      /** `aria-keyshortcuts`: the key that opens it from its row. */
+      keys?: string;
+    };
 
 export interface ConfirmPopoverProps extends ConfirmContent {
   trigger: ConfirmTrigger;
@@ -320,7 +337,12 @@ export function ConfirmPopover(props: ConfirmPopoverProps): ReactElement {
         variant="ghost"
         className={styles.trigger}
         data-trigger="ghost"
-        tooltip={props.disabled === true && props.disabledReason !== undefined ? props.disabledReason : true}
+        tooltip={
+          props.disabled === true && props.disabledReason !== undefined
+            ? props.disabledReason
+            : (trigger.tooltip ?? true)
+        }
+        aria-keyshortcuts={trigger.keys}
         aria-disabled={props.disabled === true ? true : undefined}
         onClick={blockWhenDisabled}
       />
@@ -332,6 +354,7 @@ export function ConfirmPopover(props: ConfirmPopoverProps): ReactElement {
         size={trigger.size ?? 'md'}
         className={styles.trigger}
         data-trigger={(trigger.variant ?? 'secondary') === 'ghost' ? 'ghost' : 'solid'}
+        aria-keyshortcuts={trigger.keys}
         aria-disabled={props.disabled === true ? true : undefined}
         onClick={blockWhenDisabled}
       >

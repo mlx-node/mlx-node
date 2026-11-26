@@ -31,6 +31,8 @@ export interface DbWorkerBootstrap {
   chatAgentHome: string;
   /** `conversations.json`, the Work index. Read only here. */
   chatIndexPath: string;
+  /** The scratch root of Work without a folder. */
+  scratchRoot: string;
 }
 
 /**

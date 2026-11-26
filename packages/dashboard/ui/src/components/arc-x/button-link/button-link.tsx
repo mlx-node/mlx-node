@@ -1,4 +1,4 @@
-import type { ReactElement, ReactNode } from 'react';
+import type { MouseEvent, ReactElement, ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 
 import { cn } from '../../../lib/cn';
@@ -11,8 +11,12 @@ interface ButtonLinkBase {
   size?: 'sm' | 'md';
   children: ReactNode;
   className?: string;
-  /** Runs before the link is followed (a popover closes itself). */
-  onClick?: () => void;
+  /** The accessible name, when the shown words alone do not say where the link goes. */
+  label?: string;
+  /** Runs before the link is followed (a popover closes itself); `preventDefault` keeps it from being followed. */
+  onClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
+  /** A middle click, which follows an external link without a click. */
+  onAuxClick?: (event: MouseEvent<HTMLAnchorElement>) => void;
 }
 
 /** `to`: an in-app route. `href`: an external URL, opened outside the app. */
@@ -32,14 +36,23 @@ export function ButtonLink(props: ButtonLinkProps): ReactElement {
         href={props.href}
         target="_blank"
         rel="noreferrer"
+        aria-label={props.label}
         onClick={props.onClick}
+        onAuxClick={props.onAuxClick}
       >
         {props.children}
       </a>
     );
   }
   return (
-    <Link className={className} data-variant={variant} data-size={size} to={props.to} onClick={props.onClick}>
+    <Link
+      className={className}
+      data-variant={variant}
+      data-size={size}
+      to={props.to}
+      aria-label={props.label}
+      onClick={props.onClick}
+    >
       {props.children}
     </Link>
   );

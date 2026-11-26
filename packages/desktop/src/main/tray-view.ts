@@ -16,6 +16,7 @@
  * distinction has to be carried by text.
  */
 
+import { APP_NAME } from '../app-name.js';
 import type { SupervisorSnapshot } from './supervisor/types.js';
 
 /**
@@ -96,7 +97,7 @@ export function presentTray(snapshot: SupervisorSnapshot): TrayPresentation {
     canRestart: isLive(snapshot.state),
     canOpenControlPanel: true,
     canCopyConnect: snapshot.state === 'running' && snapshot.url !== null,
-    tooltip: detail === null ? `mlx-node — ${statusLabel}` : `mlx-node — ${statusLabel}\n${detail}`,
+    tooltip: detail === null ? `${APP_NAME} — ${statusLabel}` : `${APP_NAME} — ${statusLabel}\n${detail}`,
   };
 }
 

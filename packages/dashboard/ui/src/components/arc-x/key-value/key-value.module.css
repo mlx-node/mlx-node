@@ -51,6 +51,13 @@
   white-space: nowrap;
 }
 
+.tip {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--text-muted);
+  text-underline-offset: 3px;
+}
+
 .root[data-layout='grid'] .label {
   font-size: var(--text-xs);
 }

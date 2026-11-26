@@ -215,7 +215,7 @@ yarn build
 ```
 
 Prepare the runtime include tree so NVRTC can find the CUDA, CCCL, and CUTLASS
-headers. Launch Node or the desktop app from the same shell:
+headers. Launch Node or Portato (the desktop app) from the same shell:
 
 ```powershell
 $runtime = New-Item -ItemType Directory -Force .cache/cuda-runtime
@@ -263,7 +263,7 @@ handles steady-state decode.
 - [Training](docs/training.md)
 - [Conversion and quantization](docs/convert-quantize.md)
 - [Performance notes](docs/perf.md)
-- [Desktop dashboard](docs/dashboard.md)
+- [Portato Control Panel](docs/dashboard.md)
 - [Privacy filter](docs/privacy-filter.md)
 
 ## License

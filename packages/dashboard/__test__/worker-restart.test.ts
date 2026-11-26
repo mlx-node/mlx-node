@@ -207,6 +207,7 @@ describe('a worker that keeps dying', () => {
       agentHome: join(dir, 'agent'),
       chatAgentHome: join(dir, 'chat-agent'),
       chatIndexPath: join(dir, 'conversations.json'),
+      scratchRoot: join(dir, 'Portato'),
     });
     try {
       for (let death = 1; death <= 6; death += 1) {
@@ -258,6 +259,7 @@ describe('a worker that keeps dying', () => {
       agentHome: join(dir, 'agent'),
       chatAgentHome: join(dir, 'chat-agent'),
       chatIndexPath: join(dir, 'conversations.json'),
+      scratchRoot: join(dir, 'Portato'),
     });
     try {
       // The first worker served 100 s before it hung: a fresh run of deaths.

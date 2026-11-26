@@ -42,6 +42,7 @@ import {
   type TracedChatConfig,
   type TurnTraceDeps,
 } from '../../packages/server/src/turn-trace.js';
+import { WorkLedger } from '../../packages/server/src/work-ledger.js';
 
 const FIXED_NOW = Date.UTC(2026, 6, 21, 12, 0, 0); // 2026-07-21
 
@@ -1228,6 +1229,115 @@ describe('TurnTraceModel', () => {
     }
     expect(turnCounters().outputTokens - before).toBe(10);
     expect(model.liveTurns()).toEqual([]);
+  });
+
+  // MUTATION: close the lane without the final snapshot -> decode stays at the last read (500 ms) -> red.
+  it("credits a live turn's native clocks and kept tokens to the work ledger, and closes it with the final snapshot", async () => {
+    let clock = FIXED_NOW;
+    const ledger = new WorkLedger();
+    const timers = { waitMs: 20, slotMs: 0, prepareMs: 50 };
+    let snap = progress({
+      ...timers,
+      phase: 'prefill',
+      prefillTotal: 400,
+      prefillDone: 0,
+      generatedTokens: undefined,
+      prefillElapsedMs: 300,
+    });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const model = new TurnTraceModel(
+      makeInner({
+        chatStreamSessionStart: vi.fn(async function* (
+          _messages: unknown,
+          _config: unknown,
+          _signal: unknown,
+          ref?: ChatStreamControl,
+        ) {
+          if (ref) ref.read = () => snap;
+          try {
+            yield { text: 'a', done: false as const };
+            await gate;
+            yield makeFinalEvent({ numTokens: 41 });
+          } finally {
+            if (ref) ref.read = null;
+          }
+        }),
+      }),
+      deps({ now: () => clock, work: ledger }),
+    );
+    const iterator = model.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await iterator.next();
+    clock += 400;
+    model.liveTurns();
+    expect(ledger.totals().ms).toMatchObject({ waiting: 20, prepare: 50, prefill: 300, decode: 0 });
+
+    snap = progress({ ...timers, prefillTotal: 400, prefillDone: 400, prefillElapsedMs: 330, decodeElapsedMs: 500 });
+    snap.generatedTokens = 21;
+    clock += 600;
+    model.liveTurns();
+    // Native ran on to its end before the terminal event; no live read sees it.
+    snap = progress({ ...timers, phase: 'done', prefillTotal: 400, prefillDone: 400, prefillElapsedMs: 330 });
+    snap.decodeElapsedMs = 1500;
+    snap.generatedTokens = 41;
+    clock += 1000;
+    release();
+    while (!(await iterator.next()).done) {
+      // drains
+    }
+    expect(model.liveTurns()).toEqual([]);
+    const totals = ledger.advance(clock, []);
+    expect(totals.ms).toEqual({ loading: 0, waiting: 20, prepare: 50, prefill: 330, decode: 1500, running: 0 });
+    expect([totals.outTokens, totals.outMs]).toEqual([40, 1500]);
+    expect([totals.prefillTokens, totals.prefillMs]).toEqual([400, 330]);
+  });
+
+  // MUTATION: credit a non-streamed turn's final tokens to the output pair -> outTokens 6 -> red.
+  it('a non-streamed turn runs in the ledger from dispatch to settle, with no output pair', async () => {
+    let clock = FIXED_NOW;
+    const ledger = new WorkLedger();
+    let release!: () => void;
+    const model = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(
+          () =>
+            new Promise<ChatResult>((resolve) => {
+              release = () => resolve(makeResult());
+            }),
+        ),
+      }),
+      deps({ now: () => clock, work: ledger }),
+    );
+    const turn = model.chatSessionContinue([]);
+    clock += 700;
+    model.liveTurns();
+    expect(ledger.totals().ms.running).toBe(700);
+    clock += 300;
+    release();
+    await turn;
+    const totals = ledger.advance(clock, []);
+    expect(totals.ms.running).toBe(1000);
+    expect([totals.outTokens, totals.outMs]).toEqual([0, 0]);
+  });
+
+  // MUTATION: skip the ledger close in `settle` -> the reroute's 250 ms never reach the ledger -> red.
+  it('a rerouted turn closes its lane with the time it ran', async () => {
+    let clock = FIXED_NOW;
+    const ledger = new WorkLedger();
+    const model = new TurnTraceModel(
+      makeInner({
+        chatSessionContinue: vi.fn(async () => {
+          clock += 250;
+          throw new Error('IMAGE_CHANGE_REQUIRES_SESSION_RESTART: images changed');
+        }),
+      }),
+      deps({ now: () => clock, work: ledger }),
+    );
+    await expect(model.chatSessionContinue([])).rejects.toThrow('IMAGE_CHANGE_REQUIRES_SESSION_RESTART');
+    clock += 1000;
+    expect(ledger.advance(clock, []).ms.running).toBe(250);
   });
 
   it("consumes a failed turn's counter increments instead of leaking them to the next record", async () => {

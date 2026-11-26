@@ -8,11 +8,21 @@
     "models": [
       {
         "modelId": "qwen3.5-4b",
-        "totalContextTokens": 32768
+        "totalContextTokens": 32768,
+        "reasoningEfforts": [
+          { "value": "none", "label": "Off" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High", "default": true }
+        ]
       },
       {
         "modelId": "qwen3.5-9b",
-        "totalContextTokens": 65536
+        "totalContextTokens": 65536,
+        "reasoningEfforts": [
+          { "value": "low", "label": "Low" },
+          { "value": "high", "label": "High", "default": true }
+        ]
       },
       {
         "modelId": "qwen3.6-35b-a3b-agentworld-instruct-ud-q4-k-xl-mlx-dwq-8bits",
@@ -20,15 +30,33 @@
       },
       {
         "modelId": "Qwen3.8-27B-UD-Q4_K_M",
-        "totalContextTokens": 262144
+        "totalContextTokens": 262144,
+        "reasoningEfforts": [
+          { "value": "none", "label": "Off" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High", "default": true }
+        ]
       },
       {
         "modelId": "Qwen3.8-27B-UD-Q4_K_XL",
-        "totalContextTokens": 262144
+        "totalContextTokens": 262144,
+        "reasoningEfforts": [
+          { "value": "none", "label": "Off" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High", "default": true }
+        ]
       },
       {
         "modelId": "qwen3.8-27b-bf16",
-        "totalContextTokens": 262144
+        "totalContextTokens": 262144,
+        "reasoningEfforts": [
+          { "value": "none", "label": "Off" },
+          { "value": "low", "label": "Low" },
+          { "value": "medium", "label": "Medium" },
+          { "value": "high", "label": "High", "default": true }
+        ]
       },
       {
         "modelId": "Qwen3.6-35B-A3B-UD-IQ1_M",
@@ -404,6 +432,250 @@
       ]
     },
     {
+      "match": "retryfail",
+      "steps": [
+        {
+          "thought": "Start on it.",
+          "chunk": 5,
+          "delayMs": 30
+        },
+        {
+          "retry": {
+            "type": "retrying",
+            "attempt": 1,
+            "max_retries": 3,
+            "reason": "Server error; retrying request",
+            "error_type": "api"
+          }
+        },
+        {
+          "sleepMs": 3000
+        },
+        {
+          "retry": {
+            "type": "retrying",
+            "attempt": 2,
+            "max_retries": 3,
+            "reason": "Server error; retrying request",
+            "error_type": "api"
+          }
+        },
+        {
+          "sleepMs": 3000
+        },
+        {
+          "retry": {
+            "type": "retrying",
+            "attempt": 3,
+            "max_retries": 3,
+            "reason": "Server error; retrying request",
+            "error_type": "api"
+          }
+        },
+        {
+          "sleepMs": 3000
+        },
+        {
+          "retry": {
+            "type": "failed",
+            "error_type": "api",
+            "message": "API error (status 500 Internal Server Error): upstream failed"
+          }
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 900,
+            "outputTokens": 0,
+            "agentResult": "API error (status 500 Internal Server Error): upstream failed",
+            "errorKind": "api"
+          }
+        },
+        {
+          "error": {
+            "code": -32603,
+            "message": "Internal error",
+            "data": {
+              "message": "API error (status 500 Internal Server Error): upstream failed",
+              "error_kind": "api"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "match": "retry",
+      "steps": [
+        {
+          "thought": "Read the question first.",
+          "chunk": 5,
+          "delayMs": 30
+        },
+        {
+          "retry": {
+            "type": "retrying",
+            "attempt": 1,
+            "max_retries": 3,
+            "reason": "Response stalled; retrying request",
+            "error_type": "idle_timeout"
+          }
+        },
+        {
+          "sleepMs": 6000
+        },
+        {
+          "retry": {
+            "type": "retrying",
+            "attempt": 2,
+            "max_retries": 3,
+            "reason": "Response stalled; retrying request",
+            "error_type": "idle_timeout"
+          }
+        },
+        {
+          "sleepMs": 5000
+        },
+        {
+          "text": "The model answered after two tries.",
+          "chunk": 6,
+          "delayMs": 40
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 600,
+            "outputTokens": 40
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
+      "match": "picture",
+      "promptPictures": [
+        {
+          "sessionUpdate": "image_compressed",
+          "images": [
+            {
+              "index": 1,
+              "original_bytes": 2202010,
+              "compressed_bytes": 943718,
+              "original_width": 4032,
+              "original_height": 3024,
+              "compressed_width": 2000,
+              "compressed_height": 1500
+            }
+          ],
+          "message": "Downscaled Image 1: 2.1 MB (4032x3024) → 921.6 KB (2000x1500)"
+        }
+      ],
+      "steps": [
+        {
+          "thought": "Look at the picture.",
+          "chunk": 5,
+          "delayMs": 30
+        },
+        {
+          "picture": {
+            "notes": [
+              "This request failed over its images (or was too large); 1 image(s) were left out of the retry."
+            ]
+          }
+        },
+        {
+          "text": "The engine could not take the picture, so this answer is from your words only.",
+          "chunk": 7,
+          "delayMs": 30
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 500,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
+      "match": "nomodel",
+      "noModel": "None of your models are allowed by allowed_models. Broaden it or remove it from your config, then restart.",
+      "steps": []
+    },
+    {
+      "match": "hookblock",
+      "promptBlocked": {
+        "hook": "global/policy:user_prompt_submit[0].hooks[0]",
+        "reason": "no deploys on Friday",
+        "waitMs": 1500
+      },
+      "steps": []
+    },
+    {
+      "match": "hookstop",
+      "steps": [
+        {
+          "text": "Done. A lint hook runs before the answer ends.",
+          "chunk": 7,
+          "delayMs": 30
+        },
+        {
+          "hookStarted": {
+            "event_name": "stop",
+            "prompt_id": true,
+            "count": 2
+          }
+        },
+        {
+          "sleepMs": 4000
+        },
+        {
+          "hook": {
+            "event_name": "stop",
+            "prompt_id": true,
+            "runs": [
+              {
+                "name": "global/lint:stop[0].hooks[0]",
+                "status": {
+                  "status": "failed",
+                  "error": "exit code 127: sh: eslint: command not found",
+                  "elapsed_ms": 3950
+                }
+              },
+              {
+                "name": "plugin/codex/hooks:stop[0].hooks[0]",
+                "status": {
+                  "status": "success",
+                  "elapsed_ms": 120
+                }
+              }
+            ]
+          }
+        },
+        {
+          "hookNote": {
+            "message": "Remember to run the tests before you push."
+          }
+        },
+        {
+          "turnCompleted": {
+            "inputTokens": 400,
+            "outputTokens": 30
+          }
+        },
+        {
+          "end": {
+            "stopReason": "end_turn"
+          }
+        }
+      ]
+    },
+    {
       "match": "",
       "steps": [
         {
@@ -442,14 +714,98 @@
     }
   ],
   "faults": {},
+  "compactNow": {
+    "ms": 6000,
+    "tokensBefore": 41000,
+    "tokensAfter": 9000
+  },
+  "rewind": {
+    "ms": 3000,
+    "changed": {
+      "src/log.ts": "modified_externally"
+    }
+  },
+  "fork": {
+    "ms": 800
+  },
+  "recap": {
+    "ms": 4000,
+    "summary": "We added retries to the upload client and its tests pass; next, update the docs page that still names the old flag."
+  },
+  "hostTurnText": {
+    "goal": "Goal paused. Use /goal resume to continue.",
+    "workflow": "No workflow runs yet.",
+    "deep-research": "deep-research workflow unavailable: no search provider is set."
+  },
   "work": {
     "session": {
       "agentName": "grok-build-plan",
       "toolDefinitionsCount": 20,
       "skills": 1,
-      "mcpServers": 0
+      "mcpServers": 0,
+      "commands": {
+        "skills": [
+          {
+            "name": "commit",
+            "description": "Write a commit message from the staged diff",
+            "hint": "[scope]"
+          },
+          {
+            "name": "review-pr",
+            "description": "Review a pull request",
+            "hint": "<number>"
+          }
+        ],
+        "workflows": [
+          {
+            "name": "release",
+            "description": "cut a release"
+          }
+        ]
+      }
     },
     "prompts": [
+      {
+        "match": "/goal ",
+        "goal": {
+          "wakeRounds": 2,
+          "wakeRoundMs": 9000,
+          "gapMs": 1500,
+          "end": "complete"
+        },
+        "steps": [
+          {
+            "thought": "The cache tests fail now and then. Run them a few times and look at what differs."
+          },
+          {
+            "goalRound": {
+              "ms": 8000,
+              "ticks": 8,
+              "tokens": 14200,
+              "text": "Round 1: the cache key leaves out the locale, so two runs can share one entry. "
+            }
+          },
+          {
+            "goalRound": {
+              "ms": 8000,
+              "ticks": 8,
+              "tokens": 16800,
+              "text": "Round 2: the key has the locale now; 20 runs in a row pass."
+            }
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 5200,
+              "outputTokens": 640
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
       {
         "match": "lengthtool",
         "steps": [
@@ -653,6 +1009,9 @@
       {
         "match": "plan",
         "steps": [
+          {
+            "planMode": "plan"
+          },
           {
             "plan": [
               {
@@ -1206,6 +1565,9 @@
             "sleepMs": 45000
           },
           {
+            "readSteers": true
+          },
+          {
             "text": "The README is one heading.",
             "chunk": 7
           },
@@ -1255,6 +1617,1607 @@
           },
           {
             "text": "The workflow runs on its own. Its report comes when it ends.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "colors",
+        "steps": [
+          {
+            "thought": "Run the tests and read what they print.",
+            "chunk": 6,
+            "delayMs": 30
+          },
+          {
+            "shell": {
+              "command": "yarn test",
+              "tickMs": 600,
+              "ticks": [
+                "\u001b[1m\u001b[32m PASS \u001b[39m\u001b[22m __test__/line-diff.test.ts \u001b[2m(12 tests)\u001b[22m\n",
+                "\u001b[1m\u001b[32m PASS \u001b[39m\u001b[22m __test__/queue.test.ts \u001b[2m(8 tests)\u001b[22m\n",
+                "\n\u001b[2m Test Files \u001b[22m \u001b[1m\u001b[32m2 passed\u001b[39m\u001b[22m\n\u001b[2m      Tests \u001b[22m \u001b[1m\u001b[32m20 passed\u001b[39m\u001b[22m\n"
+              ]
+            }
+          },
+          {
+            "text": "Both test files pass: 20 tests.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "needs",
+        "steps": [
+          {
+            "giveUp": {
+              "background": true,
+              "id": "toolu_needs_helper",
+              "command": "cargo test -p app",
+              "afterMs": 30000,
+              "requester": {
+                "sessionId": "helper-needs",
+                "label": "fix tests"
+              }
+            }
+          },
+          {
+            "workflow": {
+              "runId": "wf_needs",
+              "name": "release",
+              "label": "packer",
+              "command": "cargo publish",
+              "childAfterMs": 300,
+              "completeAfterMs": 2000,
+              "wake": false
+            }
+          },
+          {
+            "permission": {
+              "toolName": "run_terminal_command",
+              "kind": "execute",
+              "title": "Execute `rm -rf build/`",
+              "rawInput": {
+                "variant": "Bash",
+                "command": "rm -rf build/",
+                "description": "run",
+                "is_background": false
+              },
+              "output": ""
+            }
+          },
+          {
+            "text": "Cleaned the build folder.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "diff",
+        "steps": [
+          {
+            "thought": "Change the port, then tidy the logs and the notes.",
+            "chunk": 8,
+            "delayMs": 30
+          },
+          {
+            "edit": {
+              "toolName": "search_replace",
+              "file_path": "src/app.ts",
+              "before": "import { serve } from './serve';\nimport { log } from './log';\n\nconst host = 'localhost';\nexport const port = 3000;\n\nexport function start(): void {\n  log('starting');\n  serve(host, port);\n  log('started');\n}\n\nexport function stop(): void {\n  log('stopping');\n}\n",
+              "old_string": "export const port = 3000;",
+              "new_string": "export const port = 8080;\nexport const retries = 3;"
+            }
+          },
+          {
+            "edit": {
+              "toolName": "search_replace",
+              "file_path": "src/log.ts",
+              "before": "export function log(text: string): void {\n  console.log(`[app] ${text}`);\n}\n\n// line 5\n// line 6\n// line 7\n// line 8\n// line 9\n// line 10\n// line 11\n// line 12\n// line 13\n// line 14\n// line 15\n// line 16\n// line 17\n// line 18\n// line 19\n// line 20\n// line 21\n// line 22\n// line 23\n// line 24\nexport function warn(text: string): void {\n  console.log(`[app] warning: ${text}`);\n}\n",
+              "replace_all": true,
+              "old_string": "console.log(",
+              "new_string": "console.info("
+            }
+          },
+          {
+            "edit": {
+              "toolName": "write",
+              "file_path": "docs/notes.md",
+              "before": null,
+              "content": "# Notes\n\n- The port is 8080.\n- Logs go to stdout.\n"
+            }
+          },
+          {
+            "edit": {
+              "toolName": "write",
+              "file_path": "README.md",
+              "before": "# App\n\nA small server.\n\n## Run\n\n    yarn start\n\nIt listens on port 3000.\n",
+              "content": "# App\n\nA small server.\n\n## Run\n\n    yarn start\n\nIt listens on port 8080.\n"
+            }
+          },
+          {
+            "edit": {
+              "toolName": "search_replace",
+              "file_path": "src/app.ts",
+              "before": "import { serve } from './serve';\nimport { log } from './log';\n\nconst host = 'localhost';\nexport const port = 3000;\n\nexport function start(): void {\n  log('starting');\n  serve(host, port);\n  log('started');\n}\n\nexport function stop(): void {\n  log('stopping');\n}\n",
+              "old_string": "const timeout = 5;",
+              "new_string": "const timeout = 10;"
+            }
+          },
+          {
+            "text": "Changed the port to 8080 and wrote the notes. The timeout is not in src/app.ts.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "leftpad",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "run_terminal_command",
+              "kind": "execute",
+              "title": "Execute `npm install left-pad`",
+              "rawInput": {
+                "variant": "Bash",
+                "command": "npm install left-pad",
+                "description": "add",
+                "is_background": false
+              },
+              "output": "added 1 package"
+            }
+          },
+          {
+            "tool": {
+              "toolName": "run_terminal_command",
+              "title": "Execute `pnpm add left-pad`",
+              "kind": "execute",
+              "rawInput": {
+                "variant": "Bash",
+                "command": "pnpm add left-pad",
+                "description": "add",
+                "is_background": false
+              },
+              "output": "+ left-pad 1.3.0\n"
+            }
+          },
+          {
+            "text": "Added left-pad with pnpm.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "retryfail",
+        "steps": [
+          {
+            "thought": "Start on it.",
+            "chunk": 5,
+            "delayMs": 30
+          },
+          {
+            "retry": {
+              "type": "retrying",
+              "attempt": 1,
+              "max_retries": 3,
+              "reason": "Server error; retrying request",
+              "error_type": "api"
+            }
+          },
+          {
+            "sleepMs": 3000
+          },
+          {
+            "retry": {
+              "type": "retrying",
+              "attempt": 2,
+              "max_retries": 3,
+              "reason": "Server error; retrying request",
+              "error_type": "api"
+            }
+          },
+          {
+            "sleepMs": 3000
+          },
+          {
+            "retry": {
+              "type": "retrying",
+              "attempt": 3,
+              "max_retries": 3,
+              "reason": "Server error; retrying request",
+              "error_type": "api"
+            }
+          },
+          {
+            "sleepMs": 3000
+          },
+          {
+            "retry": {
+              "type": "failed",
+              "error_type": "api",
+              "message": "API error (status 500 Internal Server Error): upstream failed"
+            }
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 900,
+              "outputTokens": 0,
+              "agentResult": "API error (status 500 Internal Server Error): upstream failed",
+              "errorKind": "api"
+            }
+          },
+          {
+            "error": {
+              "code": -32603,
+              "message": "Internal error",
+              "data": {
+                "message": "API error (status 500 Internal Server Error): upstream failed",
+                "error_kind": "api"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "match": "retry",
+        "steps": [
+          {
+            "thought": "Read the question first.",
+            "chunk": 5,
+            "delayMs": 30
+          },
+          {
+            "retry": {
+              "type": "retrying",
+              "attempt": 1,
+              "max_retries": 3,
+              "reason": "Response stalled; retrying request",
+              "error_type": "idle_timeout"
+            }
+          },
+          {
+            "sleepMs": 6000
+          },
+          {
+            "retry": {
+              "type": "retrying",
+              "attempt": 2,
+              "max_retries": 3,
+              "reason": "Response stalled; retrying request",
+              "error_type": "idle_timeout"
+            }
+          },
+          {
+            "sleepMs": 5000
+          },
+          {
+            "text": "Done after two tries: the folder has a README.",
+            "chunk": 6,
+            "delayMs": 40
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 600,
+              "outputTokens": 40
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "background",
+        "steps": [
+          {
+            "thought": "Start the dev server, watch the build, and look for the flaky test on the side.",
+            "chunk": 6,
+            "delayMs": 30
+          },
+          {
+            "background": {
+              "command": "npm run dev",
+              "description": "Start the dev server",
+              "endAfterMs": 600000,
+              "wake": false
+            }
+          },
+          {
+            "background": {
+              "monitor": true,
+              "command": "tail -f build.log",
+              "description": "Watch the build log",
+              "endAfterMs": 120000,
+              "wakeAfterMs": 500,
+              "wakeEndAfterMs": 2000
+            }
+          },
+          {
+            "monitorEvents": {
+              "afterMs": 4000,
+              "everyMs": 1500,
+              "events": [
+                "[build] Compiling 214 files…",
+                "src/app.ts(12,4): warning TS6133: 'port' is declared but its value is never read.",
+                "src/routes/cart.ts(48,17): error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'.",
+                "[build] 1 error, 1 warning",
+                "[build] Watching for file changes…",
+                "[build] File change detected. Compiling…",
+                "src/routes/cart.ts(48,17): error TS2345: Argument of type 'string' is not assignable to parameter of type 'number'."
+              ],
+              "wake": true,
+              "wakeAfterMs": 300,
+              "wakeEndAfterMs": 2000,
+              "answer": "The build log shows a type error in src/routes/cart.ts at line 48: a string goes where a number is expected."
+            }
+          },
+          {
+            "helper": {
+              "description": "Find the flaky test",
+              "endAfterMs": 45000,
+              "wakeEndAfterMs": 2000
+            }
+          },
+          {
+            "helperProgress": {
+              "everyMs": 2000,
+              "ticks": [
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 1,
+                  "tokens_used": 2100,
+                  "context_usage_pct": 6,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 3,
+                  "tokens_used": 5200,
+                  "context_usage_pct": 15,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 5,
+                  "tokens_used": 8800,
+                  "context_usage_pct": 26,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 7,
+                  "tokens_used": 12400,
+                  "context_usage_pct": 37,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 9,
+                  "tokens_used": 16300,
+                  "context_usage_pct": 49,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 12,
+                  "tokens_used": 18200,
+                  "context_usage_pct": 56,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 14,
+                  "tokens_used": 21900,
+                  "context_usage_pct": 66,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 17,
+                  "tokens_used": 24600,
+                  "context_usage_pct": 75,
+                  "error_count": 1
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 19,
+                  "tokens_used": 27400,
+                  "context_usage_pct": 83,
+                  "error_count": 1
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 21,
+                  "tokens_used": 28200,
+                  "context_usage_pct": 86,
+                  "error_count": 1
+                }
+              ]
+            }
+          },
+          {
+            "schedule": {
+              "prompt": "Check the deploy",
+              "every": "every 5 minutes",
+              "endAfterMs": 600000,
+              "fireAfterMs": 25000,
+              "runMs": 20000
+            }
+          },
+          {
+            "text": "The dev server, a build watch, a subagent and a schedule run in the background.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "ended",
+        "steps": [
+          {
+            "thought": "Run the tests and the build in the background, then read both results together.",
+            "chunk": 6,
+            "delayMs": 30
+          },
+          {
+            "background": {
+              "command": "npm test",
+              "description": "npm test",
+              "endAfterMs": 3000,
+              "wake": false
+            }
+          },
+          {
+            "background": {
+              "command": "cargo build --release",
+              "description": "cargo build",
+              "endAfterMs": 5000,
+              "wake": false
+            }
+          },
+          {
+            "drain": {
+              "afterMs": 7000,
+              "wakeEndAfterMs": 2000,
+              "text": "Background command npm test ended (exit code: 0).\n---\nBackground command cargo build ended (exit code: 0).",
+              "answer": "Both ended: the tests pass and the release build is done."
+            }
+          },
+          {
+            "text": "The tests and the build run in the background. I will read both when they end.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 300,
+              "outputTokens": 25
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "interview",
+        "steps": [
+          {
+            "planMode": "plan"
+          },
+          {
+            "text": "Before I plan, two questions.",
+            "chunk": 7
+          },
+          {
+            "question": {
+              "questions": [
+                {
+                  "question": "Which layout should the shop use?",
+                  "options": [
+                    {
+                      "label": "Sidebar layout (Recommended)",
+                      "description": "Nav on the left. Room for filters.",
+                      "preview": "┌──────┬──────────────┐\n│ nav  │ content      │\n│      │              │\n└──────┴──────────────┘"
+                    },
+                    {
+                      "label": "Top bar layout",
+                      "description": "Nav on top. More room for products.",
+                      "preview": "┌─────────────────────┐\n│ nav                 │\n├─────────────────────┤\n│ content             │\n└─────────────────────┘"
+                    },
+                    {
+                      "label": "No nav",
+                      "description": "One long page."
+                    }
+                  ]
+                },
+                {
+                  "question": "Which pages come first?",
+                  "multi": true,
+                  "options": [
+                    {
+                      "label": "Cart",
+                      "description": ""
+                    },
+                    {
+                      "label": "Checkout",
+                      "description": ""
+                    },
+                    {
+                      "label": "Order history",
+                      "description": ""
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "text": "Noted. I will plan with what I have.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "question",
+        "steps": [
+          {
+            "text": "One thing first.",
+            "chunk": 7
+          },
+          {
+            "question": {
+              "questions": [
+                {
+                  "question": "Which database should the cart use?",
+                  "options": [
+                    {
+                      "label": "Postgres (Recommended)",
+                      "description": "Relational. Already used by the orders service."
+                    },
+                    {
+                      "label": "Redis",
+                      "description": "In memory. Fast, but the cart is lost on restart."
+                    }
+                  ]
+                },
+                {
+                  "question": "Which checks should run before a merge?",
+                  "multi": true,
+                  "options": [
+                    {
+                      "label": "Unit tests",
+                      "description": "Fast. Under a minute."
+                    },
+                    {
+                      "label": "Type check",
+                      "description": "tsc over all packages."
+                    },
+                    {
+                      "label": "Lint",
+                      "description": ""
+                    }
+                  ]
+                },
+                {
+                  "question": "Deploy after merge?",
+                  "options": [
+                    {
+                      "label": "Yes",
+                      "description": ""
+                    },
+                    {
+                      "label": "No",
+                      "description": ""
+                    }
+                  ]
+                }
+              ]
+            }
+          },
+          {
+            "text": "Thanks. Going on with your answers.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "mcp",
+        "steps": [
+          {
+            "text": "The issue tracker needs a few details.",
+            "chunk": 7
+          },
+          {
+            "elicit": {
+              "server": "github",
+              "message": "Where should the issue go, and what is it about?",
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "repo": {
+                    "type": "string",
+                    "title": "Repository",
+                    "description": "Where the issue is filed.",
+                    "oneOf": [
+                      {
+                        "const": "shop-web",
+                        "title": "shop-web"
+                      },
+                      {
+                        "const": "shop-api",
+                        "title": "shop-api"
+                      },
+                      {
+                        "const": "shop-admin",
+                        "title": "shop-admin"
+                      },
+                      {
+                        "const": "payments",
+                        "title": "payments"
+                      },
+                      {
+                        "const": "infra",
+                        "title": "infra"
+                      },
+                      {
+                        "const": "docs",
+                        "title": "docs"
+                      }
+                    ]
+                  },
+                  "title": {
+                    "type": "string",
+                    "title": "Title",
+                    "minLength": 3,
+                    "maxLength": 80
+                  },
+                  "details": {
+                    "type": "string",
+                    "title": "Details",
+                    "maxLength": 2000
+                  },
+                  "labels": {
+                    "type": "array",
+                    "title": "Labels",
+                    "items": {
+                      "type": "string",
+                      "enum": [
+                        "bug",
+                        "feature",
+                        "docs"
+                      ]
+                    }
+                  },
+                  "priority": {
+                    "type": "integer",
+                    "title": "Priority",
+                    "minimum": 1,
+                    "maximum": 5,
+                    "default": 3
+                  },
+                  "due": {
+                    "type": "string",
+                    "title": "Due",
+                    "format": "date"
+                  },
+                  "notify": {
+                    "type": "string",
+                    "title": "Notify",
+                    "description": "An email address.",
+                    "format": "email"
+                  },
+                  "assign": {
+                    "type": "boolean",
+                    "title": "Assign to me",
+                    "default": true
+                  }
+                },
+                "required": [
+                  "repo",
+                  "title"
+                ]
+              }
+            }
+          },
+          {
+            "text": "Filed it.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "signin",
+        "steps": [
+          {
+            "text": "The issue tracker needs you to sign in first.",
+            "chunk": 7
+          },
+          {
+            "elicit": {
+              "server": "github",
+              "mode": "url",
+              "message": "Sign in to GitHub to let this server create issues.",
+              "url": "https://github.com/login/oauth/authorize?client_id=mlx-dev&state=fixture",
+              "elicitationId": "gh-signin-1",
+              "complete": {
+                "afterMs": 3000
+              }
+            }
+          },
+          {
+            "text": "Waiting for the sign-in to finish.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "oddlink",
+        "steps": [
+          {
+            "text": "The tracker sends two pages to open.",
+            "chunk": 7
+          },
+          {
+            "elicit": {
+              "server": "github",
+              "mode": "url",
+              "message": "Sign in to GitHub to let this server create issues.",
+              "url": "https://gіthub.com/login/oauth/authorize?client_id=mlx-dev",
+              "elicitationId": "gh-odd-1"
+            }
+          },
+          {
+            "elicit": {
+              "server": "github",
+              "mode": "url",
+              "message": "Open this page to finish.",
+              "url": "https://github.com/login/device",
+              "elicitationId": ""
+            }
+          },
+          {
+            "text": "Both pages were answered.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "helperform",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow deep-research",
+              "rawInput": {
+                "source": {
+                  "name": "deep-research"
+                },
+                "args": {
+                  "question": "Where should the report go?",
+                  "breadth": 1
+                }
+              },
+              "output": "{\"run_id\":\"wf_mcp\",\"status\":\"active\"}"
+            }
+          },
+          {
+            "workflow": {
+              "runId": "wf_mcp",
+              "name": "deep-research",
+              "label": "researcher-0",
+              "command": "ls",
+              "ask": false,
+              "childAfterMs": 3000,
+              "completeAfterMs": 4000,
+              "wakeEndAfterMs": 2000,
+              "elicit": {
+                "server": "github",
+                "message": "Which repository should the report go to?",
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "repo": {
+                      "type": "string",
+                      "title": "Repository",
+                      "enum": [
+                        "shop-web",
+                        "shop-api"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "repo"
+                  ]
+                }
+              }
+            }
+          },
+          {
+            "text": "The workflow runs on its own; its helper's MCP server will ask you.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "twoagents",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow research-advisory",
+              "rawInput": {
+                "source": {
+                  "name": "research-advisory"
+                },
+                "args": {
+                  "advisory": "GHSA-2mgv-7q4p-7m3x"
+                }
+              },
+              "output": "{\"run_id\":\"wf_pair\",\"status\":\"active\"}"
+            }
+          },
+          {
+            "workflow": {
+              "runId": "wf_pair",
+              "name": "research-advisory",
+              "objective": "Research a GitHub security advisory against the local checkout: verify the fix commit and its claims.",
+              "phases": [
+                "Recon",
+                "Verify",
+                "Synthesize"
+              ],
+              "label": "verify:claims",
+              "command": "grep -rn \"External\" crates/",
+              "ask": false,
+              "childAfterMs": 1500,
+              "completeAfterMs": 120000,
+              "wakeEndAfterMs": 2000,
+              "tickEveryMs": 2000,
+              "more": [
+                {
+                  "label": "verify:fix-vectors",
+                  "command": "rg -n \"Ref::new\" crates/napi/src",
+                  "toolAfterMs": 1000
+                }
+              ]
+            }
+          },
+          {
+            "text": "The workflow runs on its own with two agents. Its report comes when it ends.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "wrapped",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "run_terminal_command",
+              "kind": "execute",
+              "title": "Execute `sudo env CI=1 bash -c 'npm publish --tag next'`",
+              "rawInput": {
+                "variant": "Bash",
+                "command": "sudo env CI=1 bash -c 'npm publish --tag next'",
+                "description": "publish",
+                "is_background": false
+              },
+              "output": "+ shop@1.2.0"
+            }
+          },
+          {
+            "text": "The publish was not allowed, so I left it.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "lateopen",
+        "steps": [
+          {
+            "slowLoad": 40000
+          },
+          {
+            "text": "Restart the agent, then run Rewind, Compact now, Recap or a schedule's Delete here: the agent opens this conversation 40 s late.",
+            "chunk": 8
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 300,
+              "outputTokens": 25
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "noloop",
+        "steps": [
+          {
+            "commands": {
+              "gates": [
+                "AlwaysOn",
+                "Goal",
+                "WorkflowLaunches",
+                "WorkflowManagement",
+                "Hooks",
+                "Plugins",
+                "Feedback"
+              ],
+              "skills": [
+                {
+                  "name": "commit",
+                  "description": "Write a commit message from the staged diff",
+                  "hint": "[scope]"
+                },
+                {
+                  "name": "review-pr",
+                  "description": "Review a pull request",
+                  "hint": "<number>"
+                }
+              ],
+              "workflows": [
+                {
+                  "name": "release",
+                  "description": "cut a release"
+                }
+              ]
+            }
+          },
+          {
+            "text": "The scheduler is off in this session now, so the agent no longer offers /loop.",
+            "chunk": 8
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "picture",
+        "steps": [
+          {
+            "pictureRead": {
+              "path": "docs/shot.png",
+              "width": 64,
+              "height": 48
+            }
+          },
+          {
+            "picture": {
+              "notes": [
+                "Image 1 was dropped before send: unreadable Png header."
+              ]
+            }
+          },
+          {
+            "text": "I could not see docs/shot.png: the agent left it out.",
+            "chunk": 7,
+            "delayMs": 30
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 500,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "nomodel",
+        "noModel": "None of your models are allowed by allowed_models. Broaden it or remove it from your config, then restart.",
+        "steps": []
+      },
+      {
+        "match": "hookblock",
+        "promptBlocked": {
+          "hook": "global/policy:user_prompt_submit[0].hooks[0]",
+          "reason": "no deploys on Friday",
+          "waitMs": 1500
+        },
+        "steps": []
+      },
+      {
+        "match": "hookdeny",
+        "steps": [
+          {
+            "hookDenied": {
+              "toolName": "run_terminal_command",
+              "title": "Execute `rm -rf build`",
+              "rawInput": {
+                "variant": "Bash",
+                "command": "rm -rf build",
+                "description": "clean",
+                "is_background": false
+              },
+              "hook": "global/no-rm:pre_tool_use[0].hooks[0]",
+              "reason": "deleting build output is not allowed here",
+              "waitMs": 1500,
+              "verdictFirst": true
+            }
+          },
+          {
+            "text": "A hook blocked rm -rf build, so build/ stays.",
+            "chunk": 7,
+            "delayMs": 30
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "hookstop",
+        "steps": [
+          {
+            "text": "Done. A lint hook runs before the answer ends.",
+            "chunk": 7,
+            "delayMs": 30
+          },
+          {
+            "hookStarted": {
+              "event_name": "stop",
+              "prompt_id": true,
+              "count": 2
+            }
+          },
+          {
+            "sleepMs": 4000
+          },
+          {
+            "hook": {
+              "event_name": "stop",
+              "prompt_id": true,
+              "runs": [
+                {
+                  "name": "global/lint:stop[0].hooks[0]",
+                  "status": {
+                    "status": "failed",
+                    "error": "exit code 127: sh: eslint: command not found",
+                    "elapsed_ms": 3950
+                  }
+                },
+                {
+                  "name": "plugin/codex/hooks:stop[0].hooks[0]",
+                  "status": {
+                    "status": "success",
+                    "elapsed_ms": 120
+                  }
+                }
+              ]
+            }
+          },
+          {
+            "hookNote": {
+              "message": "Remember to run the tests before you push."
+            }
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "readpdf",
+        "steps": [
+          {
+            "pictureRead": {
+              "path": "docs/spec.pdf",
+              "pages": "4-6",
+              "pdf": {
+                "totalPages": 12,
+                "fileSize": 1468006,
+                "pages": [
+                  4,
+                  5,
+                  6
+                ]
+              }
+            }
+          },
+          {
+            "text": "Pages 4 to 6 hold the API tables.",
+            "chunk": 7,
+            "delayMs": 30
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 900,
+              "outputTokens": 20
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "agentview",
+        "steps": [
+          {
+            "thought": "Hand the flaky test to a subagent and keep going here.",
+            "chunk": 6,
+            "delayMs": 30
+          },
+          {
+            "helper": {
+              "description": "Find the flaky test",
+              "endAfterMs": 150000,
+              "wakeEndAfterMs": 2000,
+              "lines": [
+                {
+                  "prompt": "Find the flaky test in the cache suite and say which line makes it flaky."
+                },
+                {
+                  "thought": "The cache suite has three files. Start with the one that touches timers.",
+                  "chunks": 8,
+                  "everyMs": 150
+                },
+                {
+                  "tool": "av-read-1",
+                  "title": "read __test__/cache.test.ts",
+                  "openMs": 1500
+                },
+                {
+                  "message": "cache.test.ts waits on a real timer at line 88, so a slow machine can miss the window.",
+                  "chunks": 10,
+                  "everyMs": 200
+                },
+                {
+                  "waitMs": 3000
+                },
+                {
+                  "tool": "av-grep-1",
+                  "title": "grep -rn \"setTimeout\" __test__/",
+                  "openMs": 2000
+                },
+                {
+                  "thought": "Two more tests share the timer. Check whether they run in parallel.",
+                  "chunks": 8,
+                  "everyMs": 200
+                },
+                {
+                  "waitMs": 4000
+                },
+                {
+                  "tool": "av-read-2",
+                  "title": "read vitest.config.ts",
+                  "openMs": 1500
+                },
+                {
+                  "message": "The suite runs files in parallel, and two of them reset the same fake clock.",
+                  "chunks": 10,
+                  "everyMs": 200
+                },
+                {
+                  "waitMs": 6000
+                },
+                {
+                  "thought": "Write the answer: the line, the cause and the fix.",
+                  "chunks": 6,
+                  "everyMs": 200
+                },
+                {
+                  "message": "Line 88 of cache.test.ts is the flaky one: it waits on a real 50 ms timer while another file resets the shared fake clock. Use vi.useFakeTimers() in that file.",
+                  "chunks": 14,
+                  "everyMs": 180
+                }
+              ]
+            }
+          },
+          {
+            "helperProgress": {
+              "everyMs": 3000,
+              "ticks": [
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 0,
+                  "tokens_used": 1500,
+                  "context_usage_pct": 4,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 1,
+                  "tokens_used": 2400,
+                  "context_usage_pct": 7,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 2,
+                  "tokens_used": 3300,
+                  "context_usage_pct": 10,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 3,
+                  "tokens_used": 4200,
+                  "context_usage_pct": 13,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 4,
+                  "tokens_used": 5100,
+                  "context_usage_pct": 16,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 5,
+                  "tokens_used": 6000,
+                  "context_usage_pct": 19,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 6,
+                  "tokens_used": 6900,
+                  "context_usage_pct": 22,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 7,
+                  "tokens_used": 7800,
+                  "context_usage_pct": 25,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 8,
+                  "tokens_used": 8700,
+                  "context_usage_pct": 28,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 1,
+                  "tool_call_count": 9,
+                  "tokens_used": 9600,
+                  "context_usage_pct": 31,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 10,
+                  "tokens_used": 10500,
+                  "context_usage_pct": 34,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 11,
+                  "tokens_used": 11400,
+                  "context_usage_pct": 37,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 12,
+                  "tokens_used": 12300,
+                  "context_usage_pct": 40,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 13,
+                  "tokens_used": 13200,
+                  "context_usage_pct": 43,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 14,
+                  "tokens_used": 14100,
+                  "context_usage_pct": 46,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 15,
+                  "tokens_used": 15000,
+                  "context_usage_pct": 49,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 16,
+                  "tokens_used": 15900,
+                  "context_usage_pct": 52,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 17,
+                  "tokens_used": 16800,
+                  "context_usage_pct": 55,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 18,
+                  "tokens_used": 17700,
+                  "context_usage_pct": 58,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 2,
+                  "tool_call_count": 19,
+                  "tokens_used": 18600,
+                  "context_usage_pct": 61,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 20,
+                  "tokens_used": 19500,
+                  "context_usage_pct": 64,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 21,
+                  "tokens_used": 20400,
+                  "context_usage_pct": 67,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 22,
+                  "tokens_used": 21300,
+                  "context_usage_pct": 70,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 23,
+                  "tokens_used": 22200,
+                  "context_usage_pct": 73,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 24,
+                  "tokens_used": 23100,
+                  "context_usage_pct": 76,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 25,
+                  "tokens_used": 24000,
+                  "context_usage_pct": 79,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 26,
+                  "tokens_used": 24900,
+                  "context_usage_pct": 82,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 27,
+                  "tokens_used": 25800,
+                  "context_usage_pct": 85,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 28,
+                  "tokens_used": 26700,
+                  "context_usage_pct": 88,
+                  "error_count": 0
+                },
+                {
+                  "turn_count": 3,
+                  "tool_call_count": 29,
+                  "tokens_used": 27600,
+                  "context_usage_pct": 91,
+                  "error_count": 0
+                }
+              ]
+            }
+          },
+          {
+            "text": "A subagent looks for the flaky test in the background.",
             "chunk": 7
           },
           {

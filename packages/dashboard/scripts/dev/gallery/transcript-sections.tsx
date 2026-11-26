@@ -8,9 +8,9 @@ import { GitBranch } from 'lucide-react';
 import { type ReactElement, useEffect, useMemo, useState } from 'react';
 
 import { AgentMark } from '../../../ui/src/components/arc-x/agent-mark/agent-mark';
+import { ChatMarkdown } from '../../../ui/src/components/arc-x/chat-markdown/chat-markdown';
 import { ChoiceCard } from '../../../ui/src/components/arc-x/choice-card/choice-card';
 import { EventRow, RuleLabel } from '../../../ui/src/components/arc-x/event-row/event-row';
-import { Markdown } from '../../../ui/src/components/arc-x/markdown/markdown';
 import { Message } from '../../../ui/src/components/arc-x/message/message';
 import { ModelBadge } from '../../../ui/src/components/arc-x/model-badge/model-badge';
 import { PlanList } from '../../../ui/src/components/arc-x/plan-list/plan-list';
@@ -43,6 +43,7 @@ function useStep(everyMs: number, max: number): number {
 
 const NOW = Date.now();
 const MODEL = 'qwen3.6-27b';
+const WORK_LINKS = { mode: 'work' } as const;
 
 const READ_OUTPUT = `pub struct Planner {
     queue: VecDeque<Request>,
@@ -151,11 +152,10 @@ export function MessageSection(): ReactElement {
   const step = useStep(1400, ANSWER.length);
   const streaming = step < ANSWER.length - 1 || step === 0;
   const text = ANSWER.slice(0, step + 1).join('');
-  const previous = ANSWER.slice(0, step).join('');
   return (
     <div className="gallery-stage">
       <Message role="user" label="You" ts={NOW - 120_000}>
-        <Markdown text="Split the planner into three modules and move the tests." />
+        <ChatMarkdown text="Split the planner into three modules and move the tests." links={WORK_LINKS} />
       </Message>
       <Message
         role="assistant"
@@ -163,10 +163,10 @@ export function MessageSection(): ReactElement {
         ts={NOW - 100_000}
         streaming={streaming}
       >
-        <Markdown text={text} freshFrom={streaming ? previous.length : undefined} />
+        <ChatMarkdown text={text} streaming={streaming} links={WORK_LINKS} />
       </Message>
       <Message role="user" label="You · interjection" ts={NOW - 20_000}>
-        <Markdown text="Keep the old file as a re-export for now." />
+        <ChatMarkdown text="Keep the old file as a re-export for now." links={WORK_LINKS} />
       </Message>
     </div>
   );

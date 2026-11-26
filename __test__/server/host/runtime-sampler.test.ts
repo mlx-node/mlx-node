@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSy
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
-import type { ChatResult, SchedulerStats } from '@mlx-node/core';
+import type { ChatResult, ChatStreamProgress, SchedulerStats } from '@mlx-node/core';
 import type { SessionCapableModel } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
@@ -34,8 +34,12 @@ import type {
   RuntimeTraceRecord,
 } from '../../../packages/server/src/runtime-trace.js';
 import { TurnTraceModel, type LiveTurn } from '../../../packages/server/src/turn-trace.js';
+import { WorkLedger, type WorkTotals } from '../../../packages/server/src/work-ledger.js';
 
 const T0 = Date.UTC(2026, 6, 21, 12, 0, 0);
+
+/** The ledger the sampler and the traced turns of one test share. */
+let ledger = new WorkLedger();
 
 function schedStats(overrides: Partial<SchedulerStats> = {}): SchedulerStats {
   return {
@@ -153,6 +157,7 @@ function tracedBinding() {
     sidecarStats: () => undefined,
     memory: () => undefined,
     watermarks: { cold: {}, sidecar: {} },
+    work: ledger,
   });
   const entry = {
     names: ['m'],
@@ -170,6 +175,118 @@ function tracedBinding() {
     },
   } as unknown as ResidentModel;
   return { traced, gates, entry, lane };
+}
+
+/** One streamed turn the test drives: its native progress and its end. */
+interface DrivenTurn {
+  read: () => ChatStreamProgress;
+  finish: (numTokens: number) => void;
+}
+
+/**
+ * A binding whose streamed turns read the progress the test sets, and whose non-streamed turns end when the test
+ * says, all through a real `TurnTraceModel` on the test's ledger.
+ */
+function drivenBinding() {
+  const turns: DrivenTurn[] = [];
+  const plain: Array<(numTokens: number) => void> = [];
+  const inner = {
+    chatSessionStart: vi.fn(
+      () =>
+        new Promise<ChatResult>((resolve) => {
+          plain.push((numTokens) =>
+            resolve({
+              text: '',
+              toolCalls: [],
+              numTokens,
+              promptTokens: 5,
+              reasoningTokens: 0,
+              finishReason: 'stop',
+            } as unknown as ChatResult),
+          );
+        }),
+    ),
+    chatStreamSessionStart: vi.fn(async function* (
+      _messages: unknown,
+      _config: unknown,
+      _signal: unknown,
+      ref?: { read: (() => ChatStreamProgress | null) | null },
+    ) {
+      let finish!: (numTokens: number) => void;
+      const gate = new Promise<number>((resolve) => {
+        finish = resolve;
+      });
+      const turn: DrivenTurn = { read: () => ({ phase: 'queued', waitMs: 0 }), finish };
+      turns.push(turn);
+      if (ref) ref.read = () => turn.read();
+      try {
+        yield { text: 'a', done: false as const };
+        const numTokens = await gate;
+        yield { text: '', done: true as const, finishReason: 'stop', toolCalls: [], numTokens, promptTokens: 5 };
+      } finally {
+        if (ref) ref.read = null;
+      }
+    }),
+    resetCaches: vi.fn(),
+  } as unknown as SessionCapableModel;
+  const traced = new TurnTraceModel(inner, {
+    modelName: 'm',
+    trace: { record: () => {} },
+    coldStats: () => undefined,
+    sidecarStats: () => undefined,
+    memory: () => undefined,
+    watermarks: { cold: {}, sidecar: {} },
+    work: ledger,
+  });
+  const entry = {
+    names: ['m'],
+    model: {},
+    sessions: {
+      liveTurns: () => traced.liveTurns(),
+      turnStats: () => traced.turnStats(),
+      activeDispatches: 0,
+      queueDepth: 0,
+      queueDepthLimit: undefined,
+      concurrentAdmissionLimit: 2,
+      identity: undefined,
+    },
+  } as unknown as ResidentModel;
+  /** Start one streamed turn; resolves once it is in flight. */
+  const stream = async () => {
+    const iterator = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
+    await iterator.next();
+    const turn = turns.at(-1)!;
+    return {
+      turn,
+      end: async (numTokens: number) => {
+        turn.finish(numTokens);
+        while (!(await iterator.next()).done) {
+          // drains
+        }
+      },
+    };
+  };
+  return { traced, entry, stream, plain };
+}
+
+/** A one-shot prefill of `total` tokens from `prefillAt`, then decode at `tps` from `decodeAt` (null: still prefilling). */
+function phases(total: number, prefillAt: number, decodeAt: number | null, tps = 40): () => ChatStreamProgress {
+  return () => {
+    const now = Date.now();
+    const base = { waitMs: 0, slotMs: 0, prepareMs: 0, cachedTokens: 0, prefillTotal: total };
+    if (decodeAt === null || now < decodeAt) {
+      return { ...base, phase: 'prefill', prefillDone: 0, prefillElapsedMs: now - prefillAt };
+    }
+    const decodeElapsedMs = now - decodeAt;
+    return {
+      ...base,
+      phase: 'decode',
+      prefillDone: total,
+      prefillElapsedMs: decodeAt - prefillAt,
+      decodeElapsedMs,
+      generatedTokens: 1 + Math.floor((tps * decodeElapsedMs) / 1000),
+    };
+  };
 }
 
 function captureTrace(): { records: RuntimeTraceRecord[]; trace: RuntimeTrace } {
@@ -221,6 +338,7 @@ describe('runtime sampler', () => {
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'mlx-runtime-sampler-'));
+    ledger = new WorkLedger();
     delete process.env.MLX_AGENT_METRICS;
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
     vi.setSystemTime(T0);
@@ -264,12 +382,21 @@ describe('runtime sampler', () => {
       isAlive: () => true,
       loadProgress: () => null,
       pipelineStats: () => null,
+      work: ledger,
       ...overrides,
     });
     return records;
   }
 
   const samples = (records: RuntimeTraceRecord[]) => records.filter((r): r is RuntimeSampleRecord => r.k === 'sample');
+
+  /** Advance `ms` in steps shorter than any tick gap, letting each live write land before the next tick. */
+  async function run(ms: number): Promise<void> {
+    for (let left = ms; left > 0; left -= 100) {
+      await vi.advanceTimersByTimeAsync(Math.min(100, left));
+      await landed();
+    }
+  }
 
   it('never requests scheduler stats while a dispatch is active or queued', async () => {
     for (const activeDispatches of [0, 1, 2])
@@ -467,7 +594,7 @@ describe('runtime sampler', () => {
     const liveFile = join(dir, `live-${process.pid}.json`);
     const live = JSON.parse(readFileSync(liveFile, 'utf8')) as RuntimeLiveFile;
     expect(live).toMatchObject({
-      v: 2,
+      v: 3,
       pid: process.pid,
       host: 'serve',
       port: 8080,
@@ -476,9 +603,11 @@ describe('runtime sampler', () => {
       intervalMs: 1000,
       health: 'ok',
       mem: { active: 100, peak: 200, cache: 50, wiredLimit: 1000 },
-      decodeTps: null,
+      work: { ms: { loading: 0, waiting: 0, prepare: 0, prefill: 0, decode: 0, running: 0 } },
+      rates: { windowMs: 10_000, outputTps: null, prefillTps: null },
       loading: [],
     });
+    expect('decodeTps' in live).toBe(false);
     expect(live.models).toEqual([
       {
         name: 'Qwen3.6-27B',
@@ -510,6 +639,8 @@ describe('runtime sampler', () => {
         waitMs: null,
         slotMs: null,
         prepareMs: null,
+        prefillElapsedMs: null,
+        decodeElapsedMs: null,
         promptTokens: 100,
         cachedTokens: 60,
         prefillTotal: 40,
@@ -667,314 +798,132 @@ describe('runtime sampler', () => {
     expect(stateRootLimit({ mode: 'persistent', limit_bytes: 0 }, ['qwen3_5'])).toBeNull();
   });
 
-  it('live decodeTps counts streamed tokens only, not a non-stream turn that settles', async () => {
-    let generated = 0;
-    let finishStream!: () => void;
-    const streamGate = new Promise<void>((resolve) => {
-      finishStream = resolve;
-    });
-    let finishPlain!: () => void;
-    const inner = {
-      chatSessionStart: vi.fn(
-        () =>
-          new Promise<ChatResult>((resolve) => {
-            finishPlain = () =>
-              resolve({
-                text: '',
-                toolCalls: [],
-                numTokens: 2000,
-                promptTokens: 5,
-                reasoningTokens: 0,
-                finishReason: 'stop',
-              } as unknown as ChatResult);
-          }),
-      ),
-      chatStreamSessionStart: vi.fn(async function* (
-        _messages: unknown,
-        _config: unknown,
-        _signal: unknown,
-        ref?: { read: (() => unknown) | null },
-      ) {
-        if (ref)
-          ref.read = () => ({
-            phase: 'decode',
-            prefillTotal: 1,
-            prefillDone: 1,
-            cachedTokens: 0,
-            generatedTokens: generated,
-          });
-        try {
-          yield { text: 'a', done: false as const };
-          await streamGate;
-          yield {
-            text: '',
-            done: true as const,
-            finishReason: 'stop',
-            toolCalls: [],
-            numTokens: generated,
-            promptTokens: 5,
-          };
-        } finally {
-          if (ref) ref.read = null;
-        }
-      }),
-      resetCaches: vi.fn(),
-    } as unknown as SessionCapableModel;
-    const traced = new TurnTraceModel(inner, {
-      modelName: 'm',
-      trace: { record: () => {} },
-      coldStats: () => undefined,
-      sidecarStats: () => undefined,
-      memory: () => undefined,
-      watermarks: { cold: {}, sidecar: {} },
-    });
-    const entry = {
-      names: ['m'],
-      model: {},
-      sessions: {
-        liveTurns: () => traced.liveTurns(),
-        turnStats: () => traced.turnStats(),
-        activeDispatches: 0,
-        queueDepth: 0,
-        queueDepthLimit: undefined,
-        concurrentAdmissionLimit: 2,
-        identity: undefined,
-      },
-    } as unknown as ResidentModel;
+  // MUTATION: credit the final tokens of a non-streamed turn -> 2,000 tokens with no decode time -> the rate jumps -> red.
+  it("writes v3: the work counters, the window rates, and each turn's two elapsed clocks, with no decodeTps", async () => {
+    const { entry, stream, plain, traced } = drivenBinding();
     start([entry]);
     await landed();
 
-    const stream = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
-    await stream.next();
-    const plain = traced.chatSessionStart([]);
-    await vi.advanceTimersByTimeAsync(1_000);
-    await landed();
-    for (let i = 0; i < 3; i++) {
-      generated += 20;
-      await vi.advanceTimersByTimeAsync(1_000);
-      await landed();
-    }
-    expect(readLive().decodeTps).toBe(20);
+    const { turn, end } = await stream();
+    turn.read = phases(1000, T0, T0 + 1500);
+    await run(500);
+    const other = traced.chatSessionStart([]);
+    await run(2000);
+    plain[0]!(2000);
+    await other;
+    await run(500);
 
-    generated += 20;
-    finishPlain();
-    await plain;
-    await vi.advanceTimersByTimeAsync(1_000);
-    await landed();
     const live = readLive();
+    const now = live.ts;
+    expect(now).toBeGreaterThan(T0 + 1500);
+    expect(live.v).toBe(3);
+    expect('decodeTps' in live).toBe(false);
     expect(live.turns).toHaveLength(1);
-    expect(live.decodeTps).not.toBeNull();
-    expect(live.decodeTps!).toBeLessThanOrEqual(80);
-
-    finishStream();
-    while (!(await stream.next()).done) {
-      // drains
-    }
+    expect(live.turns[0]).toMatchObject({ phase: 'decode', prefillElapsedMs: 1500, decodeElapsedMs: now - T0 - 1500 });
+    expect(live.work.ms).toEqual({
+      loading: 0,
+      waiting: 0,
+      prepare: 0,
+      prefill: 1500,
+      decode: now - T0 - 1500,
+      running: 2000,
+    });
+    // 40 tok/s while decoding; the one-shot prefill of 1,000 tokens took 1.5 s; the plain turn's tokens are in neither.
+    expect(live.rates).toEqual({ windowMs: 10_000, outputTps: 40, prefillTps: 666.67 });
+    await end(1 + 40 * 3);
   });
 
-  it('smooths live decodeTps over a 5 s sliding window and stays null during prefill', async () => {
-    let generated = 0;
-    let phase: 'prefill' | 'decode' = 'prefill';
-    let finishStream!: () => void;
-    const streamGate = new Promise<void>((resolve) => {
-      finishStream = resolve;
-    });
-    const inner = {
-      chatStreamSessionStart: vi.fn(async function* (
-        _messages: unknown,
-        _config: unknown,
-        _signal: unknown,
-        ref?: { read: (() => unknown) | null },
-      ) {
-        if (ref)
-          ref.read = () => ({
-            phase,
-            prefillTotal: 100,
-            prefillDone: phase === 'decode' ? 100 : 50,
-            cachedTokens: 0,
-            generatedTokens: generated,
-          });
-        try {
-          yield { text: 'a', done: false as const };
-          await streamGate;
-          yield {
-            text: '',
-            done: true as const,
-            finishReason: 'stop',
-            toolCalls: [],
-            numTokens: generated,
-            promptTokens: 100,
-          };
-        } finally {
-          if (ref) ref.read = null;
-        }
-      }),
-      resetCaches: vi.fn(),
-    } as unknown as SessionCapableModel;
-    const traced = new TurnTraceModel(inner, {
-      modelName: 'm',
-      trace: { record: () => {} },
-      coldStats: () => undefined,
-      sidecarStats: () => undefined,
-      memory: () => undefined,
-      watermarks: { cold: {}, sidecar: {} },
-    });
-    const entry = {
-      names: ['m'],
-      model: {},
-      sessions: {
-        liveTurns: () => traced.liveTurns(),
-        turnStats: () => traced.turnStats(),
-        activeDispatches: 0,
-        queueDepth: 0,
-        queueDepthLimit: undefined,
-        concurrentAdmissionLimit: 2,
-        identity: undefined,
-      },
-    } as unknown as ResidentModel;
+  // MUTATION: divide by wall time since the anchor -> the rate sags under 40 during the prefill -> red.
+  it('holds the Output rate through the next prefill, and writes null once a whole window has no decode', async () => {
+    const { entry, stream } = drivenBinding();
     start([entry]);
     await landed();
 
-    const stream = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
-    await stream.next();
-    // 3 s of prefill (0 tokens) must stay null and must not dilute decode rate once tokens arrive.
-    for (let i = 0; i < 3; i++) {
-      await vi.advanceTimersByTimeAsync(1_000);
-      await landed();
-      expect(readLive().decodeTps).toBeNull();
+    const first = await stream();
+    first.turn.read = phases(300, T0, T0 + 200);
+    await run(3000);
+    await first.end(1 + Math.floor((40 * (Date.now() - T0 - 200)) / 1000));
+    const second = await stream();
+    const prefillAt = Date.now();
+    second.turn.read = phases(20_000, prefillAt, null);
+    const seen: Array<{ at: number; outputTps: number | null; prefillTps: number | null }> = [];
+    for (let i = 0; i < 14; i++) {
+      await run(1000);
+      const live = readLive();
+      seen.push({ at: live.ts - prefillAt, ...live.rates });
     }
+    const inWindow = seen.filter((s) => s.at < 10_000);
+    const past = seen.filter((s) => s.at > 10_000 + 1000);
+    expect(inWindow.length).toBeGreaterThan(5);
+    expect(inWindow.every((s) => s.outputTps === 40)).toBe(true);
+    expect(past.length).toBeGreaterThan(0);
+    expect(past.every((s) => s.outputTps === null)).toBe(true);
+    // A one-shot prefill credits nothing until its first token; nothing ever reads 0.
+    expect(seen.every((s) => s.prefillTps === null)).toBe(true);
+    expect(seen.some((s) => s.outputTps === 0)).toBe(false);
 
-    // Alternating 40 / 0 token bursts every second smooth to ~20 tok/s over the 5 s window (never dropping to null/0).
-    phase = 'decode';
-    const deltas = [40, 0, 40, 0, 40, 0];
-    const rates: Array<number | null> = [];
-    for (const d of deltas) {
-      generated += d;
-      await vi.advanceTimersByTimeAsync(1_000);
-      await landed();
-      rates.push(readLive().decodeTps);
-    }
-    expect(rates[0]).toBe(40);
-    // Steady 5 s window covers 3*40 + 2*0 = 120 or 2*40 + 3*0 = 80 over 5 s => 16..24, never 0 or null.
-    expect(rates.every((r) => r !== null && r > 0)).toBe(true);
-    expect(rates.at(-1)!).toBeGreaterThanOrEqual(16);
-    expect(rates.at(-1)!).toBeLessThanOrEqual(24);
-
-    finishStream();
-    while (!(await stream.next()).done) {
-      // drains
-    }
+    second.turn.read = phases(20_000, prefillAt, prefillAt + 14_500);
+    await run(1500);
+    expect(readLive().rates.prefillTps).toBe(Math.round((20_000 * 1000 * 100) / 14_500) / 100);
+    await second.end(10);
   });
 
-  it('clears live decodeTps immediately when a new turn enters prefill without an idle tick in between', async () => {
-    const turns: Array<{ phase: 'prefill' | 'decode'; generated: number; finish: () => void }> = [];
-    const inner = {
-      chatStreamSessionStart: vi.fn(async function* (
-        _messages: unknown,
-        _config: unknown,
-        _signal: unknown,
-        ref?: { read: (() => unknown) | null },
-      ) {
-        let finish!: () => void;
-        const gate = new Promise<void>((resolve) => {
-          finish = resolve;
-        });
-        const state = {
-          phase: (turns.length === 0 ? 'decode' : 'prefill') as 'prefill' | 'decode',
-          generated: 0,
-          finish,
-        };
-        turns.push(state);
-        if (ref)
-          ref.read = () => ({
-            phase: state.phase,
-            prefillTotal: 100,
-            prefillDone: state.phase === 'decode' ? 100 : 50,
-            cachedTokens: 0,
-            generatedTokens: state.generated,
-          });
-        try {
-          yield { text: 'a', done: false as const };
-          await gate;
-          yield {
-            text: '',
-            done: true as const,
-            finishReason: 'stop',
-            toolCalls: [],
-            numTokens: state.generated,
-            promptTokens: 100,
-          };
-        } finally {
-          if (ref) ref.read = null;
-        }
-      }),
-      resetCaches: vi.fn(),
-    } as unknown as SessionCapableModel;
-    const traced = new TurnTraceModel(inner, {
-      modelName: 'm',
-      trace: { record: () => {} },
-      coldStats: () => undefined,
-      sidecarStats: () => undefined,
-      memory: () => undefined,
-      watermarks: { cold: {}, sidecar: {} },
-    });
-    const entry = {
-      names: ['m'],
-      model: {},
-      sessions: {
-        liveTurns: () => traced.liveTurns(),
-        turnStats: () => traced.turnStats(),
-        activeDispatches: 0,
-        queueDepth: 0,
-        queueDepthLimit: undefined,
-        concurrentAdmissionLimit: 2,
-        identity: undefined,
-      },
-    } as unknown as ResidentModel;
-    start([entry]);
-    await landed();
+  // MUTATION: keep `prevWork` at the sampler start, so each sample writes totals instead of deltas -> sums overshoot -> red.
+  it('a sample carries the ten work deltas, and they sum to the ledger totals', async () => {
+    const { entry, stream, plain, traced } = drivenBinding();
+    const records = start([entry]);
+    let loaded!: () => void;
+    const load = sampler!.timedLoad(
+      { model: 'm', modelType: 'qwen3_5', capability: 'chat', path: '/m/m' },
+      () => new Promise<string>((resolve) => (loaded = () => resolve('m'))),
+    );
+    await run(1500);
+    loaded();
+    await load;
 
-    // Turn 1 decodes at 20 tok/s over 3 s.
-    const stream1 = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
-    await stream1.next();
-    await vi.advanceTimersByTimeAsync(1_000);
-    await landed();
-    for (let i = 0; i < 3; i++) {
-      turns[0]!.generated += 20;
-      await vi.advanceTimersByTimeAsync(1_000);
-      await landed();
+    const { turn, end } = await stream();
+    const begin = Date.now();
+    turn.read = () => {
+      const now = Date.now();
+      if (now < begin + 300) return { phase: 'queued', waitMs: now - begin };
+      if (now < begin + 500) return { phase: 'slot', waitMs: 300, slotMs: now - begin - 300, prepareMs: 0 };
+      if (now < begin + 600) return { phase: 'prepare', waitMs: 300, slotMs: 200, prepareMs: now - begin - 500 };
+      return { ...phases(400, begin + 600, begin + 2600)(), waitMs: 300, slotMs: 200, prepareMs: 100 };
+    };
+    const other = traced.chatSessionStart([]);
+    await run(6000);
+    plain[0]!(50);
+    await other;
+    await run(1000);
+    await end(1 + Math.floor((40 * (Date.now() - begin - 2600)) / 1000));
+    await run(12_000);
+    await sampler!.stop();
+    sampler = null;
+
+    const totals: WorkTotals = ledger.totals();
+    const sum = (key: keyof RuntimeSampleRecord) =>
+      samples(records).reduce((acc, rec) => acc + ((rec[key] as number | undefined) ?? 0), 0);
+    const expected = {
+      loadingMs: totals.ms.loading,
+      waitingMs: totals.ms.waiting,
+      prepareMs: totals.ms.prepare,
+      prefillMs: totals.ms.prefill,
+      decodeMs: totals.ms.decode,
+      runningMs: totals.ms.running,
+      rateOutTokens: totals.outTokens,
+      rateOutMs: totals.outMs,
+      ratePrefillTokens: totals.prefillTokens,
+      ratePrefillMs: totals.prefillMs,
+    };
+    for (const rec of samples(records)) {
+      for (const key of Object.keys(expected)) expect(rec).toHaveProperty(key);
     }
-    expect(readLive().decodeTps).toBe(20);
-
-    // Between heartbeats (no idle tick with inFlight === 0): Turn 1 finishes and Turn 2 enters prefill.
-    turns[0]!.generated += 5;
-    turns[0]!.finish();
-    while (!(await stream1.next()).done) {
-      // drains Turn 1
+    for (const [key, value] of Object.entries(expected)) {
+      expect(value, key).toBeGreaterThan(0);
+      expect(sum(key as keyof RuntimeSampleRecord), key).toBe(Math.round(value));
     }
-    const stream2 = traced.chatStreamSessionStart([])[Symbol.asyncIterator]();
-    await stream2.next();
-
-    // Subsequent ticks with 0 new tokens during Turn 2's prefill must immediately report null.
-    for (let i = 0; i < 2; i++) {
-      await vi.advanceTimersByTimeAsync(1_000);
-      await landed();
-      expect(readLive().turns).toHaveLength(1);
-      expect(readLive().turns[0]!.phase).toBe('prefill');
-      expect(readLive().decodeTps).toBeNull();
-    }
-
-    // Once Turn 2 begins decoding, decodeTps reflects Turn 2's own rate without carryover or prefill dilution.
-    turns[1]!.phase = 'decode';
-    turns[1]!.generated += 30;
-    await vi.advanceTimersByTimeAsync(1_000);
-    await landed();
-    expect(readLive().decodeTps).toBe(30);
-
-    turns[1]!.finish();
-    while (!(await stream2.next()).done) {
-      // drains Turn 2
-    }
+    expect(samples(records).length).toBeGreaterThan(3);
+    expect(totals.ms).toMatchObject({ loading: 1500, waiting: 500, prepare: 100, prefill: 2000 });
   });
 
   it('timedLoad records duration and ok for success and failure', async () => {
@@ -1206,6 +1155,28 @@ describe('runtime sampler', () => {
     const total = all.reduce((sum, s) => sum + s.busyMs, 0);
     expect(total).toBe(2_000);
     expect(all.at(-1)!.busy).toBe(false);
+  });
+
+  // Finding: a burst that began and settled between two ticks left both busy flags false, so its deltas waited for the
+  // 60 s idle sample (at 60 250 ms for a burst at 30 000 ms). MUTATION "write a sample only when a tick sees busy": the
+  // burst's sample lands at 60 250 -> red.
+  it('writes the sample of a burst no tick saw at the next tick', async () => {
+    const { traced, gates, entry } = tracedBinding();
+    const records = start([entry]);
+    await vi.advanceTimersByTimeAsync(30_000);
+    const turn = traced.chatSessionStart([]);
+    await vi.advanceTimersByTimeAsync(100);
+    gates[0]!();
+    await turn;
+    await vi.advanceTimersByTimeAsync(EDGE_COALESCE_MS);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(
+      samples(records).map((s) => ({ at: s.ts - T0, busy: s.busy, busyMs: s.busyMs, runningMs: s.runningMs })),
+    ).toEqual([
+      { at: 0, busy: false, busyMs: 0, runningMs: 0 },
+      { at: 30_000 + EDGE_COALESCE_MS, busy: false, busyMs: 100, runningMs: 100 },
+      { at: 30_000 + EDGE_COALESCE_MS + SAMPLE_IDLE_MS, busy: false, busyMs: 0, runningMs: 0 },
+    ]);
   });
 
   it('busyMs ends at the settle edge while the admission lane is still held', async () => {

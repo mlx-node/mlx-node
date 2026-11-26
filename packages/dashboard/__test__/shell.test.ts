@@ -167,7 +167,8 @@ function process(overrides: Partial<RuntimeProcessLive> = {}): RuntimeProcessLiv
     coldCapture: { blocks: 63_125, ms: 10_000 },
     health: 'ok',
     mem: { active: 1, peak: 1, cache: 0, wiredLimit: 1, rss: 1 },
-    decodeTps: null,
+    work: { ms: { loading: 0, waiting: 0, prepare: 0, prefill: 0, decode: 0, running: 0 } },
+    rates: { windowMs: 10_000, outputTps: null, prefillTps: null },
     loading: [],
     counters: { ok: 0, error: 0, cancelled: 0, outputTokens: 0, loads: 1, rejected: 0 },
     models: [model('qwen3.5-9b', 1), model('gemma-4-e4b', 0)],
@@ -281,7 +282,7 @@ describe('shell navigation', () => {
 describe('page swap', () => {
   it('replaces the page in one commit, moves focus to main and renames the window', async () => {
     const { container } = await mount('/engine', 'The inference process, live.');
-    expect(document.title).toBe('Engine — mlx-node');
+    expect(document.title).toBe('Engine — Portato');
     const metrics = sections(container).querySelector<HTMLAnchorElement>('a[href="/metrics"]');
     await act(async () => metrics?.click());
     const headings = allByRole(container, 'heading').map((heading) => heading.textContent);
@@ -289,7 +290,7 @@ describe('page swap', () => {
     expect(headings).not.toContain('Engine');
     expect(document.activeElement?.tagName).toBe('MAIN');
     expect(document.activeElement?.hasAttribute('data-scroll-root')).toBe(true);
-    expect(document.title).toBe('Metrics probe — mlx-node');
+    expect(document.title).toBe('Metrics probe — Portato');
     expect(current(container)).toEqual(['Metrics']);
     await waitFor(
       () => container.querySelector('[aria-live="polite"][role="status"]')?.textContent === 'Metrics probe',
@@ -381,16 +382,56 @@ describe('keyboard', () => {
     api!.emitChatHost({
       type: 'state',
       state: state([
-        { conversationId: 'a', mode: 'chat', busy: true, waiting: false, background: false },
-        { conversationId: 'b', mode: 'chat', busy: true, waiting: false, background: false },
+        {
+          conversationId: 'a',
+          mode: 'chat',
+          busy: true,
+          waiting: false,
+          asks: 0,
+          background: false,
+          helpers: false,
+          tasks: 0,
+          op: null,
+        },
+        {
+          conversationId: 'b',
+          mode: 'chat',
+          busy: true,
+          waiting: false,
+          asks: 0,
+          background: false,
+          helpers: false,
+          tasks: 0,
+          op: null,
+        },
       ]),
     });
     await waitFor(() => dot() === '2 running');
     api!.emitChatHost({
       type: 'state',
       state: state([
-        { conversationId: 'a', mode: 'chat', busy: true, waiting: false, background: false },
-        { conversationId: 'w', mode: 'work', busy: true, waiting: true, background: false },
+        {
+          conversationId: 'a',
+          mode: 'chat',
+          busy: true,
+          waiting: false,
+          asks: 0,
+          background: false,
+          helpers: false,
+          tasks: 0,
+          op: null,
+        },
+        {
+          conversationId: 'w',
+          mode: 'work',
+          busy: true,
+          waiting: true,
+          asks: 1,
+          background: false,
+          helpers: false,
+          tasks: 0,
+          op: null,
+        },
       ]),
     });
     await waitFor(() => dot() === '1 waiting for you');

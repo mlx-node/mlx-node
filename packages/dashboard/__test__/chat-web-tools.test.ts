@@ -125,28 +125,6 @@ describe('webCallOf: results', () => {
     status: 'failed',
   });
 
-  it('refusedCall finds the last read, over and without a result, in both call shapes', () => {
-    const direct = refused('mlx_web__web_fetch', { url: 'https://a.example/' });
-    const shapeA = refused('use_tool', {
-      variant: 'UseTool',
-      tool_name: 'mlx_web__web_fetch',
-      tool_input: { url: 'https://b.example/' },
-    });
-    const search = refused('mlx_web__web_search', { query: 'q' });
-    expect(refusedCall([user('q'), direct, search], 'address-refused')).toEqual({ entry: direct, refusal: 'address' });
-    expect(refusedCall([user('q'), direct, shapeA], 'address-refused')?.entry).toBe(shapeA);
-    const page = formatPageText('exa', { url: 'https://c.example/', title: 't', cut: false, text: 'x' });
-    expect(
-      refusedCall(
-        [shapeA, { ...refused('mlx_web__web_fetch', { url: 'https://c.example/' }), output: page }],
-        'address-refused',
-      ),
-    ).toBeNull();
-    expect(refusedCall([{ ...shapeA, status: 'in_progress' }], 'address-refused')).toBeNull();
-    expect(refusedCall([user('q'), direct], 'completed')).toBeNull();
-    expect(refusedCall([user('q'), direct], undefined)).toBeNull();
-  });
-
   it('refusedCall finds the web call of arguments-unreadable and the last call of tool-refused', () => {
     const cut = refused('use_tool', {
       variant: 'UseTool',
@@ -156,6 +134,11 @@ describe('webCallOf: results', () => {
     const other = refused('run_terminal_command', { command: 'ls' });
     expect(refusedCall([user('q'), cut, other], 'arguments-unreadable')).toEqual({ entry: cut, refusal: 'arguments' });
     expect(refusedCall([user('q'), cut, other], 'tool-refused')).toEqual({ entry: other, refusal: 'tool' });
+    const page = formatPageText('exa', { url: 'https://a.example/', title: 't', cut: false, text: 'x' });
+    expect(refusedCall([{ ...cut, output: page }], 'arguments-unreadable')).toBeNull();
+    expect(refusedCall([{ ...cut, status: 'in_progress' }], 'arguments-unreadable')).toBeNull();
+    expect(refusedCall([user('q'), cut], 'completed')).toBeNull();
+    expect(refusedCall([user('q'), cut], undefined)).toBeNull();
   });
 
   it('refusedCall marks the refused call of arguments-unreadable even when its input shows no web call', () => {

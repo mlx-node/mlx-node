@@ -112,7 +112,7 @@ export function tileState(query: Query<unknown>): { loading: boolean; held: bool
   return { loading: query.data === undefined, held: query.held };
 }
 
-/** `Decode speed · qwen3` when a model filter is set. */
+/** `Turns · qwen3` when a model filter is set. */
 export function withModel(text: string, model: string | null): string {
   return model === null ? text : `${text} · ${model}`;
 }
@@ -128,8 +128,8 @@ export function quantileMax(rows: readonly Quantiles[]): number {
   return tail > 0 ? tail : median;
 }
 
-/** A median cell: `n` in the title, a muted `n=3` chip below LOW_SAMPLE_N. */
-export function MedianCell({ text, n }: { text: string; n: number }): ReactElement {
+/** A value of `n` turns: `n` in the title, a muted `n=3` chip below LOW_SAMPLE_N. */
+export function SampledCell({ text, n }: { text: string; n: number }): ReactElement {
   return (
     <span className="whitespace-nowrap tabular-nums" title={`n=${formatNumber(n)}`}>
       {text}

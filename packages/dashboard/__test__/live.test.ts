@@ -26,7 +26,7 @@ const T = Date.UTC(2026, 10, 10, 12);
 /** Typed against the writer's own type, so a field renamed on either side fails the typecheck. */
 function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveFile {
   return {
-    v: 2,
+    v: 3,
     pid,
     startedAt: T - 60_000,
     ts: T,
@@ -39,7 +39,8 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
     stateCache: { dir: null, limitBytes: null },
     health: 'ok',
     mem: { active: 1, peak: 2, cache: 3, wiredLimit: 4, rss: 5 },
-    decodeTps: 42.5,
+    work: { ms: { loading: 4000, waiting: 12, prepare: 410, prefill: 1530, decode: 21_700, running: 90 } },
+    rates: { windowMs: 10_000, outputTps: 42.5, prefillTps: 1135.4 },
     loading: [],
     counters: { ok: 1, error: 0, cancelled: 0, outputTokens: 100, loads: 1, rejected: 0 },
     models: [
@@ -73,6 +74,8 @@ function liveFile(pid: number, extra: Partial<WriterLiveFile> = {}): WriterLiveF
         waitMs: 4,
         slotMs: 0,
         prepareMs: 210,
+        prefillElapsedMs: 180,
+        decodeElapsedMs: 1_600,
         promptTokens: 1200,
         cachedTokens: 1000,
         prefillTotal: 200,
@@ -268,9 +271,10 @@ describe('live: watcher', () => {
     expect(snapshot.processes[0]).toEqual({ ...fields, models: liveModels, status: 'running', ageMs: 500 });
   });
 
-  it('a heartbeat of an older engine (v1) lists no process and breaks nothing', async () => {
+  it('a heartbeat of an older engine (v1, v2) lists no process and breaks nothing', async () => {
     writeLive(31, liveFile(31));
     writeLive(32, { ...liveFile(32), v: 1, loading: null });
+    writeLive(33, { ...liveFile(33), v: 2, decodeTps: 42.5 });
     watcher = createLiveWatcher({
       runtimeDir,
       supervisorPath,
@@ -379,6 +383,69 @@ describe('live: watcher', () => {
     };
     expect(parseLiveFile(v1)).toBeNull();
     expect(parseLiveFile({ ...liveFile(31), v: 1 })).toBeNull();
+  });
+
+  it("reads a v3 heartbeat: lane time by state, the window rates and each turn's two elapsed clocks", () => {
+    const turn = liveFile(31).turns[0]!;
+    const turns = [
+      turn,
+      { ...turn, traceId: 'tr-2', phase: 'prefill' as const, prefillElapsedMs: 3_000, decodeElapsedMs: null },
+      { ...turn, traceId: 'tr-3', phase: 'queued' as const, prefillElapsedMs: null, decodeElapsedMs: null },
+    ];
+    const parsed = parseLiveFile(liveFile(31, { turns }));
+    expect(parsed?.work).toEqual({
+      ms: { loading: 4000, waiting: 12, prepare: 410, prefill: 1530, decode: 21_700, running: 90 },
+    });
+    expect(parsed?.rates).toEqual({ windowMs: 10_000, outputTps: 42.5, prefillTps: 1135.4 });
+    expect(parsed?.turns.map((t) => [t.traceId, t.prefillElapsedMs, t.decodeElapsedMs])).toEqual([
+      ['tr-1', 180, 1_600],
+      ['tr-2', 3_000, null],
+      ['tr-3', null, null],
+    ]);
+    // Mutation: copy the removed process-level `decodeTps` through → red.
+    expect(parsed !== null && 'decodeTps' in parsed).toBe(false);
+    const quiet = liveFile(31, { rates: { windowMs: 10_000, outputTps: null, prefillTps: null } });
+    expect(parseLiveFile(quiet)?.rates).toEqual({ windowMs: 10_000, outputTps: null, prefillTps: null });
+  });
+
+  it('rejects a v2 heartbeat, in its own shape or in the v3 shape', () => {
+    const { work: _work, rates: _rates, ...rest } = liveFile(31);
+    const turns = rest.turns.map(({ prefillElapsedMs: _prefill, decodeElapsedMs: _decode, ...turn }) => turn);
+    expect(parseLiveFile({ ...rest, v: 2, decodeTps: 42.5, turns })).toBeNull();
+    // Mutation: a version guard that still lets v2 through → red.
+    expect(parseLiveFile({ ...liveFile(31), v: 2 })).toBeNull();
+    expect(parseLiveFile({ ...liveFile(31), v: 4 })).toBeNull();
+  });
+
+  it('rejects a file whose work counters or rates are malformed, or a turn without its elapsed clocks', () => {
+    const file = liveFile(31);
+    const ms = file.work.ms;
+    const { running: _running, ...noRunning } = ms;
+    // Mutations: a negative counter, a string, null or a missing member read as a number or as 0 → red.
+    for (const bad of [{ ...ms, decode: -1 }, { ...ms, prefill: '1530' }, { ...ms, waiting: null }, noRunning]) {
+      expect(parseLiveFile({ ...file, work: { ms: bad } })).toBeNull();
+    }
+    expect(parseLiveFile({ ...file, work: null })).toBeNull();
+    expect(parseLiveFile({ ...file, work: ms })).toBeNull();
+    const { work: _work, ...noWork } = file;
+    expect(parseLiveFile(noWork)).toBeNull();
+    const { rates: _rates, ...noRates } = file;
+    expect(parseLiveFile(noRates)).toBeNull();
+    // Mutation: accept a rate of 0 (the writer sends null for no time in the window) → red.
+    for (const bad of [
+      { ...file.rates, outputTps: 0 },
+      { ...file.rates, prefillTps: -3 },
+      { ...file.rates, outputTps: '42.5' },
+      { ...file.rates, windowMs: 0 },
+      { windowMs: 10_000, outputTps: 42.5 },
+    ]) {
+      expect(parseLiveFile({ ...file, rates: bad })).toBeNull();
+    }
+    // Mutation: an absent elapsed clock read as null → red.
+    const { decodeElapsedMs: _decode, ...unclocked } = file.turns[0]!;
+    expect(parseLiveFile({ ...file, turns: [unclocked] })).toBeNull();
+    expect(parseLiveFile({ ...file, turns: [{ ...file.turns[0]!, prefillElapsedMs: 'soon' }] })).toBeNull();
+    expect(parseLiveFile(file)).not.toBeNull();
   });
 
   it('reads every load in flight, oldest first, with its phase and steps', () => {

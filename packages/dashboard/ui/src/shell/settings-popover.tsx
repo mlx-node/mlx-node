@@ -9,8 +9,9 @@ import { Rule } from '../components/arc-x/rule/rule';
 import { Button } from '../components/arc/button/button';
 import { Popover, PopoverContent, PopoverTrigger } from '../components/arc/popover/popover';
 import SegmentedControl, { type Segment } from '../components/arc/segmented-control/segmented-control';
+import { Switch } from '../components/arc/switch/switch';
 import { Tooltip } from '../components/arc/tooltip/tooltip';
-import { getJson } from '../lib/api';
+import { getJson, mutate } from '../lib/api';
 import { resetModelColors } from '../lib/model-colors';
 import { PROVIDERS } from '../lib/providers-strings';
 import { toast } from '../lib/toast';
@@ -67,10 +68,54 @@ export interface SettingsPopoverProps {
   rail: boolean;
 }
 
-/** The gear in the sidebar footer: theme, model colors, and where the data lives. */
+interface WorkSettings {
+  claudeCode: boolean;
+}
+
+const CLAUDE_CODE = {
+  title: 'Claude Code in Work',
+  on: 'Work loads your Claude Code plugins, hooks, skills, agents and MCP servers, as in a terminal.',
+  off: 'Work skips your Claude Code plugins, hooks, skills, agents, rules and MCP servers.',
+  failed: 'Could not save the Claude Code setting',
+};
+
+/**
+ * The app-wide Work settings, fetched each time the popover opens; null until then or after a failed read. A save
+ * shows the new value at once and goes back on a failure.
+ */
+function useWorkSettings(open: boolean): { settings: WorkSettings | null; save: (next: WorkSettings) => void } {
+  const [settings, setSettings] = useState<WorkSettings | null>(null);
+  useEffect(() => {
+    if (!open) return;
+    let current = true;
+    getJson<WorkSettings>('/chat/work/settings').then(
+      (body) => {
+        if (current) setSettings(body);
+      },
+      () => {
+        if (current) setSettings(null);
+      },
+    );
+    return () => {
+      current = false;
+    };
+  }, [open]);
+  const save = (next: WorkSettings): void => {
+    const before = settings;
+    setSettings(next);
+    mutate<WorkSettings>('PUT', '/chat/work/settings', next).then(setSettings, () => {
+      setSettings(before);
+      toast.error(CLAUDE_CODE.failed);
+    });
+  };
+  return { settings, save };
+}
+
+/** The gear in the sidebar footer: theme, model colors, Claude Code in Work, and where the data lives. */
 export function SettingsPopover({ open, onOpenChange, rail }: SettingsPopoverProps): ReactElement {
   const theme = useTheme();
   const paths = useDataPaths(open);
+  const work = useWorkSettings(open);
   return (
     <Popover open={open} onOpenChange={onOpenChange}>
       <Tooltip content="Settings" side={rail ? 'right' : 'top'}>
@@ -101,6 +146,22 @@ export function SettingsPopover({ open, onOpenChange, rail }: SettingsPopoverPro
           </div>
           <p className={styles.settingsCaption}>Colors follow each model across pages. Reset reassigns them.</p>
         </div>
+        {work.settings !== null ? (
+          <>
+            <Rule tone="strong" />
+            <div className={styles.settingsBlock}>
+              <div className={styles.settingsRow}>
+                <span className={styles.settingsTitle}>{CLAUDE_CODE.title}</span>
+                <Switch
+                  aria-label={CLAUDE_CODE.title}
+                  checked={work.settings.claudeCode}
+                  onCheckedChange={(claudeCode) => work.save({ claudeCode })}
+                />
+              </div>
+              <p className={styles.settingsCaption}>{work.settings.claudeCode ? CLAUDE_CODE.on : CLAUDE_CODE.off}</p>
+            </div>
+          </>
+        ) : null}
         <Rule tone="strong" />
         <div className={styles.settingsBlock}>
           <span className={styles.settingsLabel}>{PROVIDERS.settingsLabel}</span>

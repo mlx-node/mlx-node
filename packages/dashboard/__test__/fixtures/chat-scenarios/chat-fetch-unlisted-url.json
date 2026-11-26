@@ -53,11 +53,11 @@
             }
           },
           "onAllow": {
-            "okayOutput": "WEB_PAGE provider=exa url=https://blog.rust-lang.org/2026/11/01/Rust-1.99.0.html\ntitle: canned\n\nFCHK-PAGE-BODY"
+            "okayOutput": "WEB_ERROR blocked exa\nThat address cannot be read. Use another address from the search results."
           }
         },
         {
-          "text": "never sent",
+          "text": "FCHK-AFTER-BLOCKED",
           "chunk": 7
         },
         {

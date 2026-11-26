@@ -18,6 +18,7 @@ import { afterEach, describe, expect, it } from 'vite-plus/test';
 import { AUTO_PER_TURN_MAX } from '../src/chat/agent/auto.js';
 import type { PermissionInteraction, PermissionMark, PermissionMode } from '../src/chat/types.js';
 import { fakeHost, noProviders, until, type FakeHost, type FakeHostOptions, type Json } from './helpers/chat-fake.js';
+import { runView } from './helpers/run-views.js';
 
 const MODEL = 'qwen3.5-4b';
 const EDIT_OPTIONS = [
@@ -306,13 +307,13 @@ describe('Auto', () => {
       expect([card.toolName, card.autoAsk]).toEqual(['workflow', 'helper-start']);
       fake.host.answer(id, card.id, 'allow-once');
       expect((await turn.done).outcome).toBe('completed');
-      expect(fake.host.runs(id)).toEqual([{ runId: 'wf_1', stopping: false }]);
+      expect(fake.host.runs(id)).toEqual([runView('wf_1')]);
     }
 
     /** The run ended and its wake turn ended: every helper line before them was handled. */
     async function runEnded(fake: FakeHost, id: string): Promise<void> {
       await until(() => fake.events.ends.length === 2, 5_000);
-      expect(fake.host.runs(id)).toEqual([]);
+      expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'complete' })]);
     }
 
     it("a helper's shell call in the Work folder is judged like the session's own: allowed with no card", async () => {
@@ -324,12 +325,17 @@ describe('Auto', () => {
           writeFileSync(gate, '');
           await runEnded(fake, id);
           expect(fake.events.interactions).toHaveLength(1);
-          expect(sw.marks.map((m) => [m.toolCallId, m.card?.command, m.card?.from])).toEqual([
-            ['wf_1-call-1', 'ls', { label: 'researcher-0', run: 'deep-research', cwd: null }],
+          expect(sw.marks.map((m) => [m.toolCallId, m.card?.command, m.card?.from, m.child])).toEqual([
+            [
+              'wf_1-call-1',
+              'ls',
+              { label: 'researcher-0', run: 'deep-research', cwd: null, child: 'helper-session-1' },
+              'helper-session-1',
+            ],
           ]);
           expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBe('allow-once');
         },
-        { name: 'work-workflow-run', mutate: run(gate, { command: 'ls' }) },
+        { name: 'work-workflow-run', mutate: run(gate, { command: 'ls', childSessionId: 'helper-session-1' }) },
       );
     });
 
@@ -345,7 +351,7 @@ describe('Auto', () => {
           expect([card.command, card.autoAsk, card.from]).toEqual([
             'ls',
             'helper',
-            { label: 'researcher-0', run: 'deep-research', cwd: other },
+            { label: 'researcher-0', run: 'deep-research', cwd: other, child: expect.stringContaining('-child-') },
           ]);
           fake.host.answer(id, card.id, 'reject-once');
           await runEnded(fake, id);
@@ -371,6 +377,7 @@ describe('Auto', () => {
           expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
           expect(fake.events.interactions).toHaveLength(2);
           expect(sw.marks.map((m) => m.card?.command)).toEqual(['ls']);
+          expect(sw.marks[0]).not.toHaveProperty('child');
         },
         { name: 'work-workflow-run', mutate: run(gate, { command: 'sed -i s/a/b/ a.txt' }) },
       );

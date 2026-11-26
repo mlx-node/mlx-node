@@ -1,15 +1,18 @@
 /**
  * The thinking bounds of the two hosts that run agents: the desktop engine and the server `mlx agent` starts. Both pass
- * these three values as their server options; `mlx serve` by hand sets none of them.
+ * these four values as their server options; `mlx serve` by hand and `mlx launch claude` set none of them.
  *
  * `tokenBudget`: thinking tokens of a Messages request that sets no budget (Splash's example for the Qwen line).
  * `cycleGuard`: an exact repeat inside a thought closes it. `endText`: the sentence written before the template's
- * close when a cut ends thinking, so the model turns to its answer (Splash `--thinking-end-text`).
+ * close when a cut ends thinking, so the model turns to its answer (Splash `--thinking-end-text`). `levels`: the
+ * family thinking levels (`thinking-levels.ts`): `/v1/models` lists them and `extra_body.reasoning_effort` maps
+ * through them.
  */
 export const AGENT_HOST_THINKING = {
   tokenBudget: 12_000,
   cycleGuard: true,
   endText: '\n\nConsidering the limited time, I have to give the solution based on the thinking directly now.',
+  levels: true,
 } as const;
 
 /** The longest thinking end text a server takes, in characters. */

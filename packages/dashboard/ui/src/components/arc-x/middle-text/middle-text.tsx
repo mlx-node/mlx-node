@@ -12,16 +12,25 @@ export const MIDDLE_MIN = 12;
  * `text` in one line: whole when it fits, else cut in the middle by the width it gets; the last characters stay. The
  * head and tail are hidden from screen readers, which read the name whole: two flex items are read with a space between.
  */
-export function MiddleText({ text, className }: { text: string; className?: string }): ReactElement {
+export function MiddleText({
+  text,
+  className,
+  title = text,
+}: {
+  text: string;
+  className?: string;
+  /** Hover text. Default `text`. */
+  title?: string;
+}): ReactElement {
   if (text.length <= MIDDLE_MIN) {
     return (
-      <span className={cn(styles.single, className)} title={text}>
+      <span className={cn(styles.single, className)} title={title}>
         {text}
       </span>
     );
   }
   return (
-    <span className={cn(styles.root, className)} title={text}>
+    <span className={cn(styles.root, className)} title={title}>
       <span className={styles.head} aria-hidden="true">
         {text.slice(0, text.length - MIDDLE_TAIL)}
       </span>

@@ -1,0 +1,175 @@
+.row {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-0-5);
+  padding: var(--space-1) 0;
+  font-size: var(--text-sm);
+  container-type: inline-size;
+}
+
+.line {
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.glyph {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+.glyphFace {
+  display: inline-grid;
+  grid-area: 1 / 1;
+  place-items: center;
+}
+
+.row[data-mark='done'] .glyph {
+  color: var(--success);
+}
+
+.row[data-mark='failed'] .glyph,
+.row[data-mark='failed'] .word {
+  color: var(--danger);
+}
+
+.row[data-mark='asking'] .glyph,
+.row[data-tone='warning'] .word {
+  color: var(--warning);
+}
+
+.label {
+  min-width: 0;
+  max-width: 28ch;
+  flex: none;
+  overflow: hidden;
+  font-weight: 500;
+}
+
+.labelText {
+  max-width: 100%;
+}
+
+/* The label opens the Agent view: a plain text button. */
+.open {
+  display: inline-flex;
+  min-width: 0;
+  padding: 0;
+  border: 0;
+  border-radius: var(--radius-control);
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-weight: 500;
+  text-align: start;
+  cursor: pointer;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .open:hover {
+    color: var(--accent-strong);
+  }
+}
+
+.row[data-open] .open {
+  color: var(--accent-strong);
+}
+
+.chevron {
+  display: inline-grid;
+  flex: none;
+  margin-inline-start: auto;
+  place-items: center;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.controls + .chevron,
+.time + .chevron {
+  margin-inline-start: 0;
+}
+
+.row[data-open] .chevron {
+  color: var(--accent-strong);
+}
+
+.word {
+  flex: none;
+  color: var(--foreground);
+}
+
+.facts {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.time {
+  flex: none;
+  margin-inline-start: auto;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  display: inline-flex;
+  flex: none;
+  margin-inline-start: auto;
+}
+
+.time + .controls {
+  margin-inline-start: 0;
+}
+
+.sub {
+  min-width: 0;
+  overflow: hidden;
+  padding-inline-start: calc(14px + var(--space-2));
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.reason {
+  margin: 0;
+  padding-inline-start: calc(14px + var(--space-2));
+  color: var(--danger);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+/* A narrow row: the glyph, label and word on the first line, its facts under them. */
+@container (max-width: 519px) {
+  .line {
+    flex-wrap: wrap;
+    row-gap: 0;
+  }
+
+  .facts {
+    flex-basis: 100%;
+    padding-inline-start: calc(14px + var(--space-2));
+  }
+
+  .time {
+    display: none;
+  }
+
+  .controls {
+    flex-basis: 100%;
+    justify-content: flex-end;
+  }
+}

@@ -1,8 +1,17 @@
 import { describe, expect, it } from 'vite-plus/test';
 
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
-import { groupTurns, hasTurnWork, openTurnGroup, turnTimeParts, turnTitle } from '../ui/src/lib/sessions.js';
+import { fill } from '../ui/src/lib/chat-strings.js';
+import {
+  CONTRACT_RETRY_TITLE,
+  groupTurns,
+  hasTurnWork,
+  openTurnGroup,
+  turnTitle,
+  WAKE_ENDED,
+} from '../ui/src/lib/sessions.js';
 import type { TranscriptEntry, TurnMetric, WakeCause } from '../ui/src/lib/types.js';
+import { answerLine, eventsText, turnLine, userLine } from './helpers/agent-session-files.js';
 import { wokenParentText } from './helpers/woken-turn.js';
 
 const T0 = 1_700_000_000_000;
@@ -26,27 +35,6 @@ function metric(overrides: Partial<TurnMetric> = {}): TurnMetric {
     ...overrides,
   };
 }
-
-describe('turnTimeParts', () => {
-  it('parts sum to the total', () => {
-    const parts = turnTimeParts({ elapsedMs: 10_000, ttftMs: 1500, decodeTps: 50, outputTokens: 200 });
-    expect(parts).toEqual({ firstTokenMs: 1500, decodeMs: 4000, otherMs: 4500, totalMs: 10_000 });
-  });
-
-  it('all null without a duration', () => {
-    expect(turnTimeParts({ elapsedMs: null, ttftMs: 1500, decodeTps: 50, outputTokens: 200 })).toEqual({
-      firstTokenMs: null,
-      decodeMs: null,
-      otherMs: null,
-      totalMs: null,
-    });
-  });
-
-  it('decode is clamped to what is left', () => {
-    const parts = turnTimeParts({ elapsedMs: 5000, ttftMs: 3000, decodeTps: 10, outputTokens: 100 });
-    expect(parts).toEqual({ firstTokenMs: 3000, decodeMs: 2000, otherMs: 0, totalMs: 5000 });
-  });
-});
 
 describe('groupTurns', () => {
   const user = (ts: number, text: string): TranscriptEntry => ({ kind: 'user', ts, text, promptIndex: null });
@@ -185,7 +173,14 @@ describe('turnTitle', () => {
   });
 
   it('says what woke the agent when no prompt was typed', () => {
-    const run = (status: string) => ({ workflow: { name: 'deep-research', status } });
+    const run = (status: string) => ({
+      workflow: {
+        runId: 'wf_1',
+        revision: 9,
+        name: 'deep-research',
+        snapshot: { status, agentsUsed: 3, agentBudget: 128, agentsFailed: 0, elapsedMs: 1_000 },
+      },
+    });
     expect(title(wake('workflow', run('complete')))).toBe('Woken by workflow deep-research');
     expect(title(wake('workflow', run('failed')))).toBe('Woken by workflow deep-research · failed');
     expect(title(wake('workflow'))).toBe('Woken by a background workflow');
@@ -200,6 +195,38 @@ describe('turnTitle', () => {
     expect(title(wake('notifications'))).toBe('Woken by background notifications');
     expect(title(wake('goal'))).toBe('Started by the goal loop');
     expect(title(wake('unknown'))).toBe('Woken by a background event');
+  });
+
+  it('a Send now that missed its answer ran as its own turn (#3)', () => {
+    expect(title(wake('message'))).toBe('Your message ran as its own turn');
+  });
+
+  // Mutation: name only the first label of several → the joined labels are missing.
+  it('names the commands and monitors whose end woke the agent (H-b)', () => {
+    const cmd = (id: string, label: string) => ({ id, kind: 'command' as const, label });
+    const mon = (id: string, label: string) => ({ id, kind: 'monitor' as const, label });
+    const named = (what: string, labels: string) => fill(WAKE_ENDED.named, { what, labels });
+    expect(title(wake('task', { task: cmd('t1', 'npm test') }))).toBe(named(WAKE_ENDED.command, 'npm test'));
+    expect(title(wake('task', { task: mon('t1', 'Watch the build log') }))).toBe(
+      named(WAKE_ENDED.monitor, 'Watch the build log'),
+    );
+    expect(title(wake('task', { task: cmd('t1', '') }))).toBe(WAKE_ENDED.command);
+    expect(title(wake('task', { task: cmd('t1', 'echo \u202Egood\nrm -rf x') }))).toBe(
+      named(WAKE_ENDED.command, 'echo \\u{202E}good'),
+    );
+    expect(title(wake('notifications', { tasks: [cmd('t1', 'npm test')] }))).toBe(
+      named(WAKE_ENDED.command, 'npm test'),
+    );
+    expect(title(wake('notifications', { tasks: [cmd('t1', 'npm test'), cmd('t2', 'cargo build')] }))).toBe(
+      named(fill(WAKE_ENDED.commands, { n: 2 }), 'npm test, cargo build'),
+    );
+    expect(title(wake('notifications', { tasks: [mon('t1', 'a'), mon('t2', 'b')] }))).toBe(
+      named(fill(WAKE_ENDED.monitors, { n: 2 }), 'a, b'),
+    );
+    expect(title(wake('notifications', { tasks: [cmd('t1', 'a'), mon('t2', '')] }))).toBe(
+      named(fill(WAKE_ENDED.mixed, { n: 2 }), 'a'),
+    );
+    expect(title(wake('notifications', { tasks: [] }))).toBe('Woken by background notifications');
   });
 
   it('a turn woken by a background workflow is titled by the workflow', () => {
@@ -229,11 +256,45 @@ describe('turnTitle', () => {
 
   it('skips an interjection that precedes the wake, and falls back to an interjection only without a prompt', () => {
     const inter: TranscriptEntry = { kind: 'user', ts: T0, text: 'inter', promptIndex: 1, interjection: true };
-    expect(turnTitle([inter, wake('workflow', { workflow: { name: 'deep-research', status: 'complete' } })])).toBe(
-      'Woken by workflow deep-research',
-    );
+    const workflow = { runId: 'wf_1', revision: 9, name: 'deep-research', snapshot: null };
+    expect(turnTitle([inter, wake('workflow', { workflow })])).toBe('Woken by workflow deep-research');
     expect(turnTitle([inter, { kind: 'user', ts: T0 + 1, text: 'typed', promptIndex: 2 }])).toBe('typed');
     expect(turnTitle([inter, { kind: 'assistant', ts: T0 + 1, text: 'a' }])).toBe('inter');
+  });
+
+  /** The workflow host's retry prompt, as a resumed helper attempt stores it. */
+  const REASON =
+    'final message did not contain valid JSON (expected a ```json fenced block): control character (\\u0000-\\u001F) found while parsing a string at line 15 column 0';
+  const RETRY_TEXT = `Your final message did not satisfy the output contract: ${REASON}\nReply with a single \`\`\`json fenced block containing one JSON value conforming to the schema from <output-contract>, and nothing else.`;
+  const retryTitle = fill(CONTRACT_RETRY_TITLE, { reason: REASON });
+
+  // Mutation: no lead check → the raw line. Mutation: slice off a wrong length → the reason loses or keeps letters.
+  // Mutation: fill the reason from the whole prompt → the second line rides along.
+  it("a workflow host's output-contract retry is titled as one, with its reason", () => {
+    expect(turnTitle([{ kind: 'user', ts: T0, text: RETRY_TEXT, promptIndex: 1 }])).toBe(retryTitle);
+    expect(retryTitle).toBe(`Output contract retry: ${REASON}`);
+  });
+
+  // Mutation: `includes` in place of `startsWith` → a prompt that quotes the lead is titled a retry.
+  it('a prompt that only quotes the lead keeps its own first line', () => {
+    const quoted = `Why: ${RETRY_TEXT}`;
+    expect(turnTitle([{ kind: 'user', ts: T0, text: quoted, promptIndex: 0 }])).toBe(quoted.split('\n')[0]);
+  });
+
+  // Mutation: fold a new prompt index into the open turn → one turn titled by the task.
+  it("a resumed attempt's file: the inherited task turn, then the retry turn", () => {
+    const parsed = parseUpdates(
+      eventsText('01a21688-13f5-7b32-873d-247e85ca5c3f', [
+        userLine(T0, 'Track 4 task\nYou work in the local napi-rs checkout.', 0),
+        answerLine(T0 + 180_000, 'Here is the report.'),
+        turnLine(T0 + 187_523, 187_523),
+        userLine(T0 + 187_977, RETRY_TEXT, 1),
+        answerLine(T0 + 300_000, '```json\n{}\n```'),
+        turnLine(T0 + 308_282, 120_305),
+      ]),
+    );
+    const groups = groupTurns(parsed.transcript, parsed.turns);
+    expect(groups.map((group) => turnTitle(group.entries))).toEqual(['Track 4 task', retryTitle]);
   });
 
   it('a group with only a wake entry is a turn and the open one', () => {

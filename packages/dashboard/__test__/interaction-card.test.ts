@@ -148,6 +148,33 @@ describe('InteractionCard', () => {
     expect(read).toEqual(['rm -rf build', 'Deletes files.', 'in /Volumes/disk/projects/work']);
   });
 
+  // Mutation: leave the notes out of `described` → the card's own advice is never read with it.
+  it('its notes join the description, after the rest; a card with none names no notes', () => {
+    const notes = ['This goes to the MCP server "github", not to the model.', 'Never type a password or a key here.'];
+    const container = mount(
+      createElement(InteractionCard, {
+        title: 'github asks for input',
+        actions: createElement('button', { type: 'button' }, 'Send'),
+        warnings: ['1 field needs a change.'],
+        describedBy: ['message-1'],
+        notes,
+      }),
+    );
+    const group = container.querySelector('[role="group"]')!;
+    const ids = (group.getAttribute('aria-describedby') ?? '').split(' ');
+    expect(ids).toHaveLength(3);
+    expect(container.querySelector(`#${CSS.escape(ids[1]!)}`)?.textContent).toBe('1 field needs a change.');
+    const shown = container.querySelector(`#${CSS.escape(ids[2]!)}`)!;
+    expect([...shown.querySelectorAll('p')].map((p) => p.textContent)).toEqual(notes);
+    rerender(
+      createElement(InteractionCard, {
+        title: 'Run this command?',
+        actions: createElement('button', { type: 'button' }, 'Deny'),
+      }),
+    );
+    expect(container.querySelector('[role="group"]')!.hasAttribute('aria-describedby')).toBe(false);
+  });
+
   it('the feedback field is capped, counts, and Escape calls back', () => {
     let escaped = 0;
     const container = mount(

@@ -7,6 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import {
   type ModelBaseOption,
+  type ModelEffort,
   ModelPicker,
   type ModelPickerProps,
 } from '../ui/src/components/arc-x/model-picker/model-picker.js';
@@ -63,6 +64,22 @@ const SMALL: ModelBaseOption = {
   ],
 };
 const BASES = [QWEN27, AGENTS, QWEN36, SMALL];
+
+const LEVELS = (['none', 'low', 'medium', 'high'] as const).map((value) => ({
+  value,
+  label: CHAT.thinkingLevel.levels[value],
+}));
+
+/** BASES with levels on the conversation's model (XL). */
+function levelled(extra: Partial<ModelEffort> = {}): ModelBaseOption[] {
+  const effort: ModelEffort = { levels: LEVELS, value: 'high', ...extra };
+  return [
+    { ...QWEN27, variants: [{ ...QWEN27.variants[0]!, effort }, ...QWEN27.variants.slice(1)] },
+    AGENTS,
+    QWEN36,
+    SMALL,
+  ];
+}
 
 function picker(extra: Partial<ModelPickerProps> = {}) {
   return createElement(ModelPicker, {
@@ -199,19 +216,16 @@ describe('ModelPicker: the pill', () => {
     expect(button.getAttribute('data-state')).toBe('loaded');
     expect(button.getAttribute('title')).toBe(XL);
     expect(button.querySelector('[data-model]')?.getAttribute('data-model')).toBe('Qwen3.8-27B');
-    expect(button.querySelector('[data-chip-label]')?.textContent).toBe('UD-Q4_K_XL');
+    expect(button.querySelector('[data-chip-label]')).toBeNull();
   });
 
-  it('a one-variant base still carries its badge; a long variant is cut in the middle at 14 characters', () => {
+  it('a model with no Thinking row has no badge, whatever its variant label', () => {
     const long: ModelBaseOption = {
       ...AGENTS,
       variants: [{ ...AGENTS.variants[0]!, label: 'BF16 (lfm2.5-1.2b-thinking-mlx)' }],
     };
     const container = mount(picker({ value: 'agents-a1', bases: [long] }));
-    const badge = trigger(container).querySelector('[data-chip-label]')!;
-    expect(badge.textContent!.length).toBe(14);
-    expect(badge.textContent!.startsWith('BF16')).toBe(true);
-    expect(badge.textContent!.endsWith('-mlx)')).toBe(true);
+    expect(trigger(container).querySelector('[data-chip-label]')).toBeNull();
   });
 
   it('crowded (Work): the badge is whole on the pill line or not drawn, never cut; elsewhere it hides only under 520 px', () => {
@@ -223,10 +237,11 @@ describe('ModelPicker: the pill', () => {
       ),
     ).toEqual(['wrap', 'clip', 'stretch']);
     expect(cssValue(rules, '.trigger[data-crowded] .name::before', 'height')).toBe('var(--control-height-sm)');
-    const crowded = trigger(mount(picker({ crowded: true })));
+    const levels = levelled({ levels: [{ value: 'high', label: 'High' }] });
+    const crowded = trigger(mount(picker({ crowded: true, bases: levels })));
     expect(crowded.hasAttribute('data-crowded')).toBe(true);
     expect(crowded.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(true);
-    const chat = trigger(mount(picker()));
+    const chat = trigger(mount(picker({ bases: levels })));
     expect(chat.hasAttribute('data-crowded')).toBe(false);
     expect(chat.querySelector('[data-chip-label]')?.hasAttribute('data-fit-whole')).toBe(false);
   });
@@ -523,5 +538,57 @@ describe('ModelPicker: the popover', () => {
         expect(list.getAttribute('aria-activedescendant')).toBe(rows[3]!.id);
       }
     });
+  });
+});
+
+describe('ModelPicker: thinking levels', () => {
+  it('D2/D3: the chip badge is the level, in its title and its name; a warning dot', () => {
+    const plain = trigger(mount(picker({ bases: levelled() })));
+    expect(plain.querySelector('[data-chip-level]')?.textContent).toBe('High');
+    expect(plain.getAttribute('title')).toBe(fill(CHAT.thinkingLevel.chip, { model: XL, level: 'High' }));
+    unmountAll();
+    expect(
+      trigger(mount(picker({ bases: levelled({ levels: [], value: '' }) }))).querySelector('[data-chip-level]'),
+    ).toBeNull();
+    unmountAll();
+    const low = trigger(mount(picker({ bases: levelled({ value: 'low' }), levelWarning: true })));
+    expect(low.querySelector('[data-chip-level]')?.textContent).toBe('Low');
+    expect(low.getAttribute('title')).toBe(fill(CHAT.thinkingLevel.chip, { model: XL, level: 'Low' }));
+    expect(low.getAttribute('aria-label')).toBe(
+      fill(CHAT.thinkingLevel.chipName, {
+        model: fill(CHAT.pillName, { model: 'Qwen3.8-27B UD-Q4_K_XL', state: CHAT.pillStates.loaded }),
+        level: 'Low',
+      }),
+    );
+    expect(low.querySelector('[data-chip-level] span[aria-hidden="true"]')).not.toBeNull();
+  });
+
+  it('D6: while an answer runs the chip opens, the model rows are off with the reason, the level still changes', async () => {
+    const onValueChange = vi.fn();
+    const container = mount(
+      picker({
+        onValueChange,
+        listDisabled: true,
+        listDisabledReason: CHAT.modelBusy,
+        bases: levelled({ note: CHAT.thinkingLevel.next }),
+      }),
+    );
+    expect(trigger(container).disabled).toBe(false);
+    key(trigger(container), 'ArrowDown');
+    await waitFor(() => allByRole(document.body, 'listbox').length === 3);
+    const [left, right, levels] = allByRole(document.body, 'listbox');
+    expect(document.body.textContent).toContain(CHAT.modelBusy);
+    expect(document.body.textContent).not.toContain('Models load on first use.');
+    expect(document.body.textContent).toContain(CHAT.thinkingLevel.next);
+    click(allByRole(right!, 'option')[1]!);
+    click(allByRole(left!, 'option')[1]!);
+    expect(onValueChange).not.toHaveBeenCalled();
+    expect(
+      allByRole(right!, 'option')
+        .slice(1)
+        .every((option) => option.getAttribute('aria-disabled') === 'true'),
+    ).toBe(true);
+    click(allByRole(levels!, 'option').find((option) => option.textContent === 'Low')!);
+    expect(onValueChange).toHaveBeenCalledWith(XL, 'low');
   });
 });

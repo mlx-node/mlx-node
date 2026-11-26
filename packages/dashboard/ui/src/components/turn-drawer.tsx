@@ -14,6 +14,7 @@ import {
   formatRate,
   formatTps,
 } from '../lib/format';
+import { METRIC } from '../lib/metric-strings';
 import { outcomeText, stopSentence, turnPhases, turnTimeline } from '../lib/metrics-view';
 import { PREFILL_UNDER_TEXT, prefillSizeText, setupHoldsText } from '../lib/prefill';
 import type { MetricsTurns, TurnRow } from '../lib/types';
@@ -87,9 +88,9 @@ function tokenItems(row: TurnRow): KeyValueItem[] {
 /** The native waits before the first token; a record without one, or with none spent, leaves its row out. */
 export function waitItems(row: TurnRow): KeyValueItem[] {
   const rows: Array<[string, string, number | null, string]> = [
-    ['wait', 'Model busy', row.waitMs, 'before the model started this turn'],
-    ['slot', 'Waiting for a slot', row.slotMs, 'no free lane or memory'],
-    ['prepare', 'Preparing', row.prepareMs, 'prompt, prefix match, cache restore'],
+    ['wait', METRIC.modelBusy.label, row.waitMs, 'before the model started this turn'],
+    ['slot', METRIC.laneWait.label, row.slotMs, 'no free lane or memory'],
+    ['prepare', METRIC.preparing.label, row.prepareMs, 'prompt, prefix match, cache restore'],
   ];
   return rows
     .filter(([, , value]) => value !== null && value > 0)
@@ -113,7 +114,12 @@ function speedItems(row: TurnRow | null): KeyValueItem[] {
     else prefillHint = rated ? size : `${size} · ${PREFILL_UNDER_TEXT}`;
   }
   return [
-    { key: 'first', label: 'First token', value: row === null ? null : formatDuration(row.ttftMs), numeric: true },
+    {
+      key: 'first',
+      label: METRIC.firstToken.label,
+      value: row === null ? null : formatDuration(row.ttftMs),
+      numeric: true,
+    },
     ...(row === null ? [] : waitItems(row)),
     {
       key: 'setup',

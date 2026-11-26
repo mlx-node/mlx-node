@@ -8,6 +8,7 @@ import { SERVER_CLOSE_MS } from '@mlx-node/server/supervision';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseServeArgs, run } from '../../packages/cli/src/commands/serve.js';
+import { reasoningEffortsFor } from '../../packages/server/src/host/thinking-levels.js';
 
 /**
  * `mlx serve` is the terminal-visible twin of the desktop app's supervised
@@ -87,6 +88,12 @@ describe('parseServeArgs', () => {
       expect(() => parseServeArgs([`--thinking-end-text=${bad}`])).toThrow('--thinking-end-text');
     }
     expect(parseServeArgs([`--thinking-end-text=${'x'.repeat(512)}`]).thinkingEndText).toHaveLength(512);
+  });
+
+  // By hand, `extra_body.reasoning_effort` keeps its meaning: only the flag turns the family levels on.
+  it('parses --thinking-levels; it is not set by default', () => {
+    expect(parseServeArgs(['--thinking-levels']).thinkingLevels).toBe(true);
+    expect('thinkingLevels' in parseServeArgs([])).toBe(false);
   });
 
   it('validates the global residency policy', () => {
@@ -561,6 +568,80 @@ describe('mlx serve — end to end', () => {
     expect(plain[0]!.thinkingTokenBudget).toBeUndefined();
     expect(plain[0]!.thinkingCycleGuard).toBeUndefined();
     expect(plain[0]!.thinkingEndText).toBeUndefined();
+  });
+
+  // Mutation: drop `thinkingLevels` from the `createInferenceHost` call → red.
+  it('with --thinking-levels a qwen3_5 Low maps to its budget and /v1/models lists the levels; by hand neither', async () => {
+    const servedFor = async (argv: string[]) => {
+      const modelsDir = await makeModelsDir(['alpha']);
+      vi.spyOn(console, 'log').mockImplementation(() => undefined);
+      const configs: Array<Record<string, unknown>> = [];
+      const result = {
+        text: 'ok',
+        toolCalls: [],
+        thinkingEnabled: true,
+        numTokens: 1,
+        promptTokens: 1,
+        reasoningTokens: 0,
+        finishReason: 'stop',
+        rawText: 'ok',
+        cachedTokens: 0,
+      };
+      const model = {
+        chatSessionStart: async (_messages: unknown, config: Record<string, unknown>) => {
+          configs.push({ ...config });
+          return result;
+        },
+        resetCaches: async () => undefined,
+      };
+      const exitCodes: number[] = [];
+      const sigintBefore = new Set(listenersOf('SIGINT'));
+      let efforts: unknown;
+      await run(['--port', '0', '--models-dir', modelsDir, '--model', 'alpha', ...argv], {
+        hostOverrides: {
+          disableStore: true,
+          sweepOrphanTempRoots: false,
+          pagedModelTypes: [],
+          setResidencyKeepAlive: () => undefined,
+          estimateContextWindow: async () => null,
+          loadModel: async () => model as unknown as LoadableModel,
+        },
+        exit: (code) => exitCodes.push(code),
+        onReady: async (host) => {
+          const list = (await (await fetch(`${host.url}/v1/models`)).json()) as {
+            data: Array<Record<string, unknown>>;
+          };
+          efforts = list.data.find((entry) => entry.id === 'alpha')?.reasoningEfforts;
+          const res = await fetch(`${host.url}/v1/messages`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({
+              model: 'alpha',
+              messages: [{ role: 'user', content: 'hi' }],
+              max_tokens: 8,
+              extra_body: { reasoning_effort: 'low' },
+            }),
+          });
+          await res.text();
+          const added = listenersOf('SIGINT').filter((l) => !sigintBefore.has(l));
+          added[0]!('SIGINT');
+          for (let i = 0; i < 200 && exitCodes.length === 0; i++) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+          }
+        },
+      });
+      expect(exitCodes).toEqual([0]);
+      expect(configs).toHaveLength(1);
+      return { config: configs[0]!, efforts };
+    };
+    const levels = await servedFor(['--thinking-levels']);
+    expect(levels.config.thinkingTokenBudget).toBe(1024);
+    expect(levels.config.reasoningEffort).toBe('low');
+    expect(levels.efforts).toEqual(reasoningEffortsFor('qwen3_5'));
+    const byHand = await servedFor([]);
+    expect(byHand.config.reasoningEffort).toBe('low');
+    expect(byHand.config.thinkingTokenBudget).toBeUndefined();
+    expect(byHand.efforts).toBeUndefined();
   });
 
   // Mutation: drop `idleReleaseSeconds` from the `createInferenceHost` call → red.

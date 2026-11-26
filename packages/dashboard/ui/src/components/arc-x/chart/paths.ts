@@ -136,6 +136,71 @@ export function barPath(x: number, top: number, width: number, bottom: number, r
   );
 }
 
+/** One interval of a stacked step chart: flat from `x0` to `x1`, one value per band, bottom band first. */
+export interface StackStep {
+  x0: number;
+  x1: number;
+  values: readonly number[];
+}
+
+/** Steps whose ends are closer than this many px meet: the band runs on without a break. */
+const STEP_JOIN_PX = 0.5;
+
+function stepValue(step: StackStep, band: number): number {
+  const value = step.values[band];
+  return value !== undefined && Number.isFinite(value) && value > 0 ? value : 0;
+}
+
+/**
+ * Stacked step areas, one closed path per band from the bottom band up. Each step is flat over its own interval (no
+ * smoothing), so an area is exactly the value times the interval. A step where the band is 0, or two steps that do
+ * not meet, end a run: the path holds one closed subpath per run and only `M`, `H`, `V` and `Z`.
+ */
+export function stepStackPaths(points: readonly StackStep[], y: (value: number) => number): string[] {
+  let bands = 0;
+  for (const step of points) bands = Math.max(bands, step.values.length);
+  const paths: string[] = [];
+  const base = points.map(() => 0);
+  for (let band = 0; band < bands; band += 1) {
+    let d = '';
+    let run: Array<{ step: StackStep; low: number; high: number }> = [];
+    const flush = (): void => {
+      if (run.length > 0) {
+        const first = run[0];
+        const last = run[run.length - 1];
+        let at = n(y(first.high));
+        const to = (value: number): string => {
+          const next = n(y(value));
+          const move = next === at ? '' : `V${next}`;
+          at = next;
+          return move;
+        };
+        d += `M${n(first.step.x0)} ${at}H${n(first.step.x1)}`;
+        for (let i = 1; i < run.length; i += 1) d += `${to(run[i].high)}H${n(run[i].step.x1)}`;
+        d += `${to(last.low)}H${n(last.step.x0)}`;
+        for (let i = run.length - 2; i >= 0; i -= 1) d += `${to(run[i].low)}H${n(run[i].step.x0)}`;
+        d += 'Z';
+      }
+      run = [];
+    };
+    points.forEach((step, index) => {
+      const value = stepValue(step, band);
+      const low = base[index];
+      base[index] = low + value;
+      const previous = run.length > 0 ? run[run.length - 1].step : null;
+      if (value === 0 || step.x1 <= step.x0) {
+        flush();
+        return;
+      }
+      if (previous !== null && Math.abs(step.x0 - previous.x1) > STEP_JOIN_PX) flush();
+      run.push({ step, low, high: low + value });
+    });
+    flush();
+    paths.push(d);
+  }
+  return paths;
+}
+
 /** Pixel x of each of `count` resampled positions spread from `x0` to `x1`. */
 export function sampleXs(count: number, x0: number, x1: number): number[] {
   const xs: number[] = [];

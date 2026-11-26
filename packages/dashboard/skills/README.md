@@ -8,7 +8,7 @@ every file matches the manifest, and hands that folder to the agent as a plugin 
 | ----------- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
 | `chat-web`  | `own/chat-web`     | Chat: the `web-tools` skill. Its body (after the frontmatter) is also the end of the Chat system prompt                                 |
 | `exa`       | `vendor/exa`       | Work, when Exa is the search provider: `exa-search`, `exa-contents` (`exa-labs/agent-skills`, MIT)                                      |
-| `deepseek`  | `own/deepseek`     | Work, when DeepSeek is the search provider: `deepseek-search` (written by mlx-node; DeepSeek has no skill)                              |
+| `deepseek`  | `own/deepseek`     | Work, when DeepSeek is the search provider: `deepseek-search` (written by Portato; DeepSeek has no skill)                               |
 | `brave`     | `vendor/brave`     | Work, when Brave is the search provider: `web-search`, `llm-context`, `news-search` (`brave/brave-search-skills`, MIT)                  |
 | `firecrawl` | `vendor/firecrawl` | Work, when Firecrawl reads pages and the `firecrawl` CLI is found: the CLI, search, scrape, crawl, map skills (`firecrawl/skills`, ISC) |
 

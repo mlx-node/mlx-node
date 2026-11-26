@@ -4,9 +4,16 @@
  * time the agent compacts the conversation is not counted against it.
  */
 
+import { readdirSync, readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { parseUpdates, TranscriptReducer } from '../src/agent-sessions/transcript.js';
+import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js';
 import { CHAT_TURN_MAX_MS } from '../src/chat/agent/agent-host.js';
+import { applyOp } from '../src/chat/conversation.js';
+import { openRetry, splitTurns } from '../ui/src/lib/chat-turns.js';
 import { fakeHost, noProviders, until, type FakeHost, type FakeHostOptions, type Json } from './helpers/chat-fake.js';
 
 const MODEL = 'qwen3.5-4b';
@@ -190,6 +197,74 @@ describe('a Chat turn', () => {
       vi.advanceTimersByTime(CHAT_TURN_MAX_MS + 1);
       const ended = await Promise.race([turn.done, new Promise((resolve) => setTimeout(() => resolve(null), 3_000))]);
       expect(ended).toMatchObject({ outcome: 'turn-timeout' });
+    });
+  }, 20_000);
+});
+
+describe('a retry inside a Work turn', () => {
+  const retrying = (attempt: number): Json => ({
+    retry: {
+      type: 'retrying',
+      attempt,
+      max_retries: 3,
+      reason: 'Response stalled; retrying request',
+      error_type: 'idle_timeout',
+    },
+  });
+  const stalls = (scenario: Json): void => {
+    scenario.prompts = [
+      {
+        match: '',
+        steps: [
+          { text: 'Working on it', chunk: 5 },
+          { sleepMs: 400 },
+          retrying(1),
+          { sleepMs: 300 },
+          retrying(2),
+          { sleepMs: 300 },
+          { text: ' and done.', chunk: 5 },
+          { turnCompleted: { inputTokens: 10, outputTokens: 5 } },
+          { end: { stopReason: 'end_turn' } },
+        ],
+      },
+    ];
+  };
+
+  it('the wait clock counts from the first try of the episode, not from the turn start; live equals stored', async () => {
+    await withHost('work-permission', { mode: 'work', mutate: stalls }, async (fake) => {
+      const { sessionId } = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+      const startedAt = Date.now();
+      const turn = fake.host.startTurn(sessionId, 'go', { modelId: MODEL, cwd: fake.project });
+      const reducer = new TranscriptReducer();
+      const entries: TranscriptEntry[] = [];
+      const turns: TurnMetric[] = [];
+      for (const op of reducer.userPrompt('go', [], startedAt)) applyOp(entries, turns, op);
+      let fed = 0;
+      const feed = (): void => {
+        const lines = fake.events.updates.filter((u) => u.sessionId === sessionId).map((u) => u.line);
+        for (; fed < lines.length; fed += 1) for (const op of reducer.apply(lines[fed]!)) applyOp(entries, turns, op);
+      };
+      const open = () => openRetry(reducer.retryLive());
+      await until(() => {
+        feed();
+        return open()?.attempts === 2;
+      }, 5_000);
+      const first = fake.events.updates.find((u) => u.line.update.sessionUpdate === 'retry_state')!;
+      // The line's own time is the episode's start: the clock does not count the turn's first 400 ms.
+      expect(open()?.ts).toBe(first.line.meta?.agentTimestampMs);
+      expect(open()!.ts - startedAt).toBeGreaterThanOrEqual(400);
+      expect(splitTurns(entries, turns)).toHaveLength(1);
+
+      expect((await turn.done).outcome).toBe('completed');
+      feed();
+      const live = entries.filter((e) => e.kind === 'notice');
+      expect(live).toEqual([expect.objectContaining({ cause: 'stalled', attempts: 2, max: 3, outcome: 'recovered' })]);
+      const files = readdirSync(fake.agentHome, { recursive: true, encoding: 'utf8' })
+        .filter((f) => f.endsWith('updates.jsonl'))
+        .map((f) => readFileSync(join(fake.agentHome, f), 'utf8'))
+        .filter((text) => text.includes('retry_state'));
+      expect(files).toHaveLength(1);
+      expect(parseUpdates(files[0]!).transcript.filter((e) => e.kind === 'notice')).toEqual(live);
     });
   }, 20_000);
 });

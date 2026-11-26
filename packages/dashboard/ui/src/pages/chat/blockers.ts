@@ -16,6 +16,7 @@ import {
 import { type DraftAttachment, draftInput } from '../../lib/chat-attachments';
 import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatFailure, ChatFailureCode, ChatHostState, ChatMode } from '../../lib/chat-types';
+import { scratchShown } from '../../lib/paths';
 import type { TranscriptEntry } from '../../lib/types';
 
 export type BlockActionKind =
@@ -27,7 +28,8 @@ export type BlockActionKind =
   | 'copy-details'
   | 'retry'
   | 'pick-model'
-  | 'choose-folder';
+  | 'choose-folder'
+  | 'go-to-ask';
 
 export interface BlockAction {
   label: string;
@@ -39,6 +41,8 @@ export type BlockIcon = 'power' | 'unplug' | 'boxes' | 'download' | 'loader' | '
 export interface StripNotice {
   tone: 'neutral' | 'warning' | 'danger';
   text: string;
+  /** The whole sentence when `text` is the short one: the strip's tooltip. */
+  title?: string;
   working?: boolean;
   action?: BlockAction;
   secondary?: BlockAction;
@@ -142,6 +146,31 @@ export function infoNotice(host: ChatHostState | null, mode: ChatMode): StripNot
   return null;
 }
 
+/**
+ * Work: the engine restarted under live commands and monitors. The agent process is shared, so the count is every
+ * Work conversation's; the next message restarts the agent and stops them all.
+ */
+export function engineLostNotice(
+  host: ChatHostState | null,
+  mode: ChatMode,
+  conversationId: string | null,
+): StripNotice | null {
+  if (host === null || mode !== 'work') return null;
+  const { engineLost, tasks } = host.modes.work;
+  if (!engineLost || tasks === 0) return null;
+  const here =
+    conversationId === null
+      ? 0
+      : (host.active.find((entry) => entry.mode === 'work' && entry.conversationId === conversationId)?.tasks ?? 0);
+  const others = tasks - here;
+  return {
+    tone: 'warning',
+    text: tasks === 1 ? CHAT.engineRestartStopsOne : fill(CHAT.engineRestartStops, { n: tasks }),
+    title:
+      others > 0 ? `${CHAT.engineRestartTip} ${fill(CHAT.engineRestartOthers, { n: others })}` : CHAT.engineRestartTip,
+  };
+}
+
 /** "agent {tag} ({agentVersion}) · needs {minTag}": versions only. */
 export function copyDetails(host: ChatHostState, mode: ChatMode): string {
   return fill(CHAT.copyDetailsText, {
@@ -151,7 +180,8 @@ export function copyDetails(host: ChatHostState, mode: ChatMode): string {
   });
 }
 
-const BLOCKER_SENTENCES: Partial<Record<ChatFailureCode, string>> = {
+/** The page's sentence for a refusal that names why the agent or the engine cannot act. */
+export const BLOCKER_SENTENCES: Partial<Record<ChatFailureCode, string>> = {
   'inference-stopped': CHAT.blockers['inference-stopped'][1],
   'inference-failed': CHAT.blockers['inference-failed'][1],
   'no-models': CHAT.blockers['no-models'][1],
@@ -161,6 +191,8 @@ const BLOCKER_SENTENCES: Partial<Record<ChatFailureCode, string>> = {
   'agent-failed': CHAT.blockers['agent-failed'][1],
   'skill-bundle-corrupt': CHAT.blockers['skill-bundle-corrupt'][1],
   'agent-crashed': CHAT.outcomes['agent-crashed'],
+  'engine-lost': CHAT.history.engineLost,
+  'load-slow': CHAT.history.loadSlow,
 };
 
 /** The page's own sentence for a folder the Control Panel refused, found by the server's fixed sentence. */
@@ -182,6 +214,8 @@ export function sendFailure(
   /** The conversation's model, for the sentence of a load that failed. */
   model?: string,
   canInstall = true,
+  /** Where Work without a folder makes its folders, as people read it. */
+  root?: string,
 ): { strip: StripNotice } | { toast: string } {
   const e = CHAT.sendErrors;
   const strip = (
@@ -194,6 +228,8 @@ export function sendFailure(
   switch (reason) {
     case 'agent-slow':
       return strip(e['agent-slow'], 'retry');
+    case 'load-slow':
+      return strip([CHAT.history.loadSlow, CHAT.history.tryAgain], 'retry');
     case 'profile-mismatch':
       return strip(
         mode === 'work' ? e['profile-mismatch-work'] : e['profile-mismatch-chat'],
@@ -210,6 +246,11 @@ export function sendFailure(
       return strip([cwdProblemText(message) ?? e['cwd-invalid'][0], e['cwd-invalid'][1]], 'choose-folder');
     case 'cwd-mismatch':
       return strip(e['cwd-mismatch'], 'retry');
+    case 'folder-not-made':
+      return strip(
+        [fill(e['folder-not-made'][0], { root: root ?? scratchShown(null, null) }), e['folder-not-made'][1]],
+        'choose-folder',
+      );
     case 'conversation-busy':
       return { toast: e['conversation-busy'][0] };
     case 'slash-text':
@@ -220,6 +261,10 @@ export function sendFailure(
       return strip(e['attachment-refused'], null);
     case 'pictures-full':
       return strip(e['pictures-full'], null);
+    case 'queue-full':
+      return strip([CHAT.queue.full, ''], null, 'warning');
+    case 'steer-busy':
+      return strip([CHAT.queue.notThisStep, ''], null, 'warning');
     default:
       break;
   }

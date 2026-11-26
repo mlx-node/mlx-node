@@ -1,23 +1,41 @@
 /** Pure transforms for the Engine page and the Overview engine panel. React-free. */
 
+import type { StackPoint } from '../components/arc-x/activity-strip/phase-stack';
 import type { CellSegment } from '../components/arc-x/cell-grid/cell-grid';
 import type { ChartPoint } from '../components/arc-x/chart/types';
+import type { EngineStateKey, LaneCounts } from '../components/arc-x/live-turn-row/live-turn-row';
 import type { TickerDelta, TickerItem } from '../components/arc-x/metric-ticker/metric-ticker';
+import { fill } from './chat-strings';
 import {
   formatBytes,
   formatBytesParts,
   formatClock,
   formatCount,
-  formatCountNoun,
   formatDayLong,
   formatDuration,
   formatNumber,
   formatPercent,
   formatTps,
 } from './format';
-import type { LiveSample } from './live-history';
+import { LIVE_GAP_MS, type LiveSample } from './live-history';
+import { BANDS, ENGINE_STATE, LANES, METRIC, NOW_FACTS, WINDOW } from './metric-strings';
 import { byteAxis } from './metrics-view';
-import type { RuntimeLive, RuntimeProcessLive, RuntimeSeries, SchedSnapshot, SupervisorLive } from './types';
+import type {
+  HostKind,
+  RuntimeLive,
+  RuntimeProcessLive,
+  RuntimeSeries,
+  SchedSnapshot,
+  SupervisorLive,
+  WorkMs,
+} from './types';
+
+export const HOST_WORD: Record<HostKind, string> = {
+  desktop: 'Portato',
+  serve: 'mlx serve',
+  launch: 'mlx launch',
+  embedded: 'embedded',
+};
 
 /** The process with that pid, else the first running, else the first unresponsive, else null. */
 export function pickProcess(live: RuntimeLive | undefined, pid: number | null): RuntimeProcessLive | null {
@@ -281,30 +299,6 @@ export function sparkPoints(history: readonly LiveSample[], pick: Pick1, now: nu
   return sums.map((sum, index) => (counts[index] > 0 ? sum / counts[index] : null));
 }
 
-/**
- * The last `count` samples of `pid` as exactly `count` slots, oldest first: a null slot where two samples lie more than
- * `gapMs` apart, leading nulls while fewer exist. The fixed length lets a spark reshape per sample instead of remounting.
- */
-export function recentSpark(
-  history: readonly LiveSample[],
-  pick: Pick1,
-  pid: number,
-  count: number,
-  gapMs: number,
-): (number | null)[] {
-  const slots: (number | null)[] = [];
-  let previous: number | null = null;
-  for (const sample of history) {
-    if (sample.pid !== pid) continue;
-    if (previous !== null && sample.t - previous > gapMs) slots.push(null);
-    slots.push(pick(sample));
-    previous = sample.t;
-  }
-  const kept = slots.slice(Math.max(0, slots.length - count));
-  const pad: (number | null)[] = Array.from({ length: count - kept.length }, () => null);
-  return [...pad, ...kept];
-}
-
 const BYTE_DIV: Record<string, number> = { B: 1, KB: 1024, MB: 1024 ** 2, GB: 1024 ** 3, TB: 1024 ** 4, PB: 1024 ** 5 };
 
 /** A signed change as a ticker chip: `+4.2`, `−1` (U+2212), `0`. */
@@ -318,7 +312,8 @@ export function tickerChip(diff: number | null, digits: number, goodWhen: Ticker
     : { text: `−${magnitude}`, direction: 'down', goodWhen };
 }
 
-const outTps: Pick1 = (sample) => sample.outTps;
+const outputTps: Pick1 = (sample) => sample.outputTps;
+const prefillTps: Pick1 = (sample) => sample.prefillTps;
 const inFlight: Pick1 = (sample) => sample.inFlight;
 const queued: Pick1 = (sample) => sample.queued;
 const memActive: Pick1 = (sample) => sample.memActive;
@@ -329,12 +324,90 @@ function sum(values: readonly number[]): number {
   return total;
 }
 
-/** The six items of the Engine "Now" ticker. The MLX memory item gets its meter footer from the page. */
+/** The engine's state word and its lanes per phase, from the newest snapshot. */
+export interface EngineState {
+  key: EngineStateKey;
+  label: string;
+  /** Lanes the engine has taken. `other`: preparing, non-streamed turns and System One decisions. */
+  lanes: LaneCounts;
+}
+
+function stateKey(process: RuntimeProcessLive, lanes: LaneCounts): EngineStateKey {
+  if (process.status !== 'running') return 'unresponsive';
+  if (lanes.decode > 0) return lanes.prefill > 0 ? 'prefillDecode' : 'decode';
+  if (lanes.prefill > 0) return 'prefill';
+  if (lanes.other > 0) return 'working';
+  if (lanes.waiting > 0) return 'waiting';
+  if (process.loading.length > 0) return 'loading';
+  return sum(process.models.map((model) => model.queued)) > 0 ? 'queued' : 'idle';
+}
+
+/**
+ * The engine state from the newest snapshot: a lane in decode or prefill names it; lanes that only prepare or report
+ * no progress are `working`; lanes that all wait are `waiting`. With no lane: a load in flight, then the server
+ * queue, then idle. A model's `inFlight` beyond its listed turns is a lane without progress (a System One decision).
+ */
+export function engineState(process: RuntimeProcessLive): EngineState {
+  const lanes: LaneCounts = { decode: 0, prefill: 0, other: 0, waiting: 0 };
+  for (const turn of process.turns) {
+    if (turn.phase === 'decode') lanes.decode += 1;
+    else if (turn.phase === 'prefill') lanes.prefill += 1;
+    else if (turn.phase === 'queued' || turn.phase === 'slot') lanes.waiting += 1;
+    else lanes.other += 1;
+  }
+  lanes.other += Math.max(0, sum(process.models.map((model) => model.inFlight)) - process.turns.length);
+  const key = stateKey(process, lanes);
+  return { key, label: ENGINE_STATE[key], lanes };
+}
+
+const WORK_KEYS: ReadonlyArray<keyof WorkMs> = ['loading', 'waiting', 'prepare', 'prefill', 'decode', 'running'];
+
+/**
+ * Lanes by phase of `pid`, one interval per pair of its consecutive samples: each band's growth in lane-ms ÷ the time
+ * between the two writes (`at`). A pair is skipped when no time passed (the same file read twice), when the writes lie
+ * more than `LIVE_GAP_MS` apart, or when a counter went down (a new process under the same pid). `other` is
+ * preparing, lanes without progress and model loading.
+ */
+export function stackPoints(history: readonly LiveSample[], pid: number): StackPoint[] {
+  const out: StackPoint[] = [];
+  let previous: { at: number; work: WorkMs } | null = null;
+  for (const sample of history) {
+    if (sample.pid !== pid || sample.at === null || sample.work === null) continue;
+    const current = { at: sample.at, work: sample.work };
+    if (previous !== null) {
+      const span = current.at - previous.at;
+      const before = previous.work;
+      if (span > 0 && span <= LIVE_GAP_MS && WORK_KEYS.every((key) => current.work[key] >= before[key])) {
+        const lanes = (key: keyof WorkMs): number => (current.work[key] - before[key]) / span;
+        out.push({
+          t0: previous.at,
+          t1: current.at,
+          values: {
+            decode: lanes('decode'),
+            prefill: lanes('prefill'),
+            other: lanes('prepare') + lanes('running') + lanes('loading'),
+            waiting: lanes('waiting'),
+          },
+        });
+      }
+    }
+    previous = current;
+  }
+  return out;
+}
+
+/** A rate as the page prints it, or null (drawn "—") when the server sent none: no 0 is invented. */
+export function rateText(tps: number | null): string | null {
+  return tps === null ? null : formatTps(tps);
+}
+
+/** The seven items of the Engine "Now" ticker. The MLX memory item gets its meter footer from the page. */
 export function nowItems(process: RuntimeProcessLive, history: readonly LiveSample[], now: number): TickerItem[] {
   const spark = (pick: Pick1, label: string): TickerItem['spark'] => ({
     data: sparkPoints(history, pick, now, process.pid),
     label: `${label}, last 10 minutes`,
   });
+  const lanes = engineState(process).lanes;
   const flight = sum(process.models.map((model) => model.inFlight));
   const waiting = sum(process.models.map((model) => model.queued));
   const limits = process.models.map((model) => model.queueLimit).filter((limit): limit is number => limit !== null);
@@ -346,27 +419,46 @@ export function nowItems(process: RuntimeProcessLive, history: readonly LiveSamp
   return [
     {
       key: 'out',
-      label: 'Output rate',
-      value: formatTps(process.decodeTps ?? 0),
-      unit: 'tok/s',
-      delta: tickerChip(tickerDelta(history, outTps, now, process.pid), 1, 'up'),
-      spark: spark(outTps, 'Output rate'),
-      facts: [{ label: 'Turns', value: process.turns.length > 0 ? formatNumber(process.turns.length) : 'Idle' }],
+      label: METRIC.outputRate.label,
+      value: rateText(process.rates.outputTps),
+      unit: METRIC.outputRate.unit,
+      delta: tickerChip(tickerDelta(history, outputTps, now, process.pid), 1, 'up'),
+      spark: spark(outputTps, METRIC.outputRate.label),
+      facts: [
+        { label: NOW_FACTS.lanesDecoding, value: formatNumber(lanes.decode) },
+        { label: NOW_FACTS.window, value: WINDOW.last10s },
+      ],
+    },
+    {
+      key: 'prefill',
+      label: METRIC.prefillSpeed.label,
+      value: rateText(process.rates.prefillTps),
+      unit: METRIC.prefillSpeed.unit,
+      spark: spark(prefillTps, METRIC.prefillSpeed.label),
+      facts: [
+        { label: NOW_FACTS.lanesInPrefill, value: formatNumber(lanes.prefill) },
+        { label: NOW_FACTS.cachedTokens, value: NOW_FACTS.notCounted },
+      ],
     },
     {
       key: 'flight',
-      label: 'In flight',
+      label: METRIC.inFlight.label,
       value: formatNumber(flight),
       delta: tickerChip(tickerDelta(history, inFlight, now, process.pid), 0, 'neutral'),
-      spark: spark(inFlight, 'In flight'),
-      facts: [{ label: 'Max at once', value: formatNumber(sum(process.models.map((model) => model.maxConcurrent))) }],
+      spark: spark(inFlight, METRIC.inFlight.label),
+      facts: [
+        { label: 'Max at once', value: formatNumber(sum(process.models.map((model) => model.maxConcurrent))) },
+        { label: BANDS.decode, value: formatNumber(lanes.decode) },
+        { label: BANDS.prefill, value: formatNumber(lanes.prefill) },
+        { label: BANDS.waiting, value: formatNumber(lanes.waiting) },
+      ],
     },
     {
       key: 'queued',
-      label: 'Queued',
+      label: METRIC.queued.label,
       value: formatNumber(waiting),
       delta: tickerChip(tickerDelta(history, queued, now, process.pid), 0, 'down'),
-      spark: spark(queued, 'Queued'),
+      spark: spark(queued, METRIC.queued.label),
       facts: [{ label: 'Queue limit', value: limits.length > 0 ? formatNumber(sum(limits)) : 'none' }],
     },
     {
@@ -418,14 +510,38 @@ const STATUS_WORD: Record<RuntimeLive['status'], string> = {
   stopped: 'stopped',
 };
 
-/** The one polite sentence of the Engine page. */
+/** "2 lanes: 1 decode, 1 prefill." With no lane the state word ("Idle."), none when the status already says it. */
+function laneSentence(state: EngineState): string | null {
+  const parts: Array<[number, string]> = [
+    [state.lanes.decode, LANES.decoding],
+    [state.lanes.prefill, LANES.prefilling],
+    [state.lanes.other, LANES.other],
+    [state.lanes.waiting, LANES.waiting],
+  ];
+  const total = sum(parts.map(([count]) => count));
+  if (total <= 0) return state.key === 'unresponsive' ? null : `${state.label}.`;
+  const head = total === 1 ? LANES.one : fill(LANES.many, { n: formatNumber(total) });
+  const counts = parts.filter(([count]) => count > 0).map(([count, word]) => fill(word, { n: formatNumber(count) }));
+  return `${head}: ${counts.join(', ')}.`;
+}
+
+/** The one polite sentence of the Engine page. A rate the server did not send is left out. */
 export function engineSummary(live: RuntimeLive, process: RuntimeProcessLive | null): string {
   const head = `Inference ${STATUS_WORD[live.status]}.`;
   if (process === null) return head;
-  const flight = sum(process.models.map((model) => model.inFlight));
   const wired = process.mem.wiredLimit;
   const memory = wired > 0 ? formatPercent(process.mem.active / wired) : 'unknown';
-  return `${head} ${formatCountNoun(flight, 'turn', 'turns')} in flight. ${formatTps(process.decodeTps ?? 0)} tokens per second. Memory ${memory} of the limit.`;
+  const output = rateText(process.rates.outputTps);
+  const prefill = rateText(process.rates.prefillTps);
+  return [
+    head,
+    laneSentence(engineState(process)),
+    output === null ? null : `Output ${output} tokens per second.`,
+    prefill === null ? null : `Prefill ${prefill} tokens per second.`,
+    `Memory ${memory} of the limit.`,
+  ]
+    .filter((part): part is string => part !== null)
+    .join(' ');
 }
 
 /** `start`, `continue`, `after tool`. */

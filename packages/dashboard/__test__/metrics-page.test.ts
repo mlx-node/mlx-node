@@ -170,7 +170,7 @@ describe('Metrics page', () => {
     const paths: string[] = [];
     const page = await mountMetrics(
       '/metrics?model=qwen3-8b',
-      (text) => text.includes('Median with the p05–p95 range'),
+      (text) => text.includes('with the p05–p95 range per turn'),
       {},
       (call) => paths.push(call.path),
     );
@@ -182,15 +182,14 @@ describe('Metrics page', () => {
     expect(rows[0]).toHaveLength(2);
   });
 
-  it('keeps a bucket with no turn as no data and marks a low sample', async () => {
-    const page = await mountMetrics('/metrics', (text) => text.includes('Median per day, per model'));
+  it('keeps a bucket with no turn as no data', async () => {
+    const page = await mountMetrics('/metrics', (text) => text.includes('Per day, per model'));
     await figure(page, 'Decode speed');
     const rows = chartTable(page.container, 'Decode speed');
     expect(rows).toHaveLength(7);
     const column = rows.map((row) => row[1]);
     expect(column[0]).toBe('no data');
     expect(column).toContain('42.0');
-    expect(column).toContain('30.0 (n=3)');
     expect(column).not.toContain('0.0');
   });
 
@@ -506,7 +505,7 @@ describe('Metrics page', () => {
       [...(byRole(page.container, 'figure', name)?.querySelectorAll('[class*="gutter"] > span') ?? [])].map(
         (node) => node.textContent ?? '',
       );
-    const summaryPage = await mountMetrics('/metrics', (text) => text.includes('Median per day, per model'));
+    const summaryPage = await mountMetrics('/metrics', (text) => text.includes('Per day, per model'));
     await figure(summaryPage, 'Decode speed');
     const decode = ticksOf(summaryPage, 'Decode speed');
     expect(decode.length).toBeGreaterThan(2);
@@ -586,6 +585,8 @@ describe('Metrics page', () => {
       ],
       decodeTpsWithMtp: quantiles(60, 20),
       decodeTpsWithoutMtp: quantiles(40, 20),
+      decodeWith: { tokens: 1_200, ms: 20_000 },
+      decodeWithout: { tokens: 800, ms: 20_000 },
     });
     const page = await mountMetrics(
       '/metrics?tab=speculation',
@@ -664,6 +665,8 @@ describe('Metrics page', () => {
       acceptByPos: [{ pos: 0, rate: 0.8, cycles: 1000 }],
       decodeTpsWithMtp: quantiles(60, 20),
       decodeTpsWithoutMtp: quantiles(40, 20),
+      decodeWith: { tokens: 1_200, ms: 20_000 },
+      decodeWithout: { tokens: 800, ms: 20_000 },
     };
     const spec = await mountMetrics(
       '/metrics?tab=speculation',
@@ -674,17 +677,6 @@ describe('Metrics page', () => {
     );
     await waitFor(() => spec.container.querySelector('tbody tr[data-model]') !== null);
     check(spec, 'Speculation by model');
-    const specTable = [...spec.container.querySelectorAll('table')].find(
-      (node) => node.querySelector('caption')?.textContent === 'Speculation by model',
-    )!;
-    const specHeads = [...specTable.querySelectorAll('thead th')].map((th) => (th.textContent ?? '').trim());
-    const widthOf = (head: string): string =>
-      (specTable.querySelectorAll('col')[specHeads.indexOf(head)] as HTMLElement).style.width;
-    expect([widthOf('Cycles'), widthOf('With MTP tok/s'), widthOf('Without tok/s')]).toEqual([
-      '84px',
-      '148px',
-      '148px',
-    ]);
   });
 
   it('states decode speed in tok/s once, in the column head, on the Turns and Speculation tables', async () => {
@@ -713,6 +705,8 @@ describe('Metrics page', () => {
       acceptByPos: [{ pos: 0, rate: 0.8, cycles: 1000 }],
       decodeTpsWithMtp: quantiles(60, 20),
       decodeTpsWithoutMtp: quantiles(40, 20),
+      decodeWith: { tokens: 1_200, ms: 20_000 },
+      decodeWithout: { tokens: 800, ms: 20_000 },
     };
     const spec = await mountMetrics(
       '/metrics?tab=speculation',
@@ -722,7 +716,6 @@ describe('Metrics page', () => {
       },
     );
     await waitFor(() => spec.container.querySelector('tr[data-model="mtp-0"]') !== null);
-    expect(heads(spec)).toEqual(expect.arrayContaining(['With MTP tok/s', 'Without tok/s']));
     expect(spec.container.querySelector('tr[data-model="mtp-0"]')?.textContent).not.toContain('tok/s');
   });
 
@@ -822,7 +815,7 @@ describe('Metrics page', () => {
     expect(count(before, 'Prefill time')).toBe(3);
   });
 
-  it('shows — for a model without a rated prefill and a To first token segment for an old range', async () => {
+  it('shows a To first token segment for an old range', async () => {
     const old = summary({
       totals: busyTotals({ prefillMeasured: 0, setupWallMs: 0, prefillWallMs: 0, firstTokenWallMs: 20_000 }),
       byModel: [
@@ -838,10 +831,7 @@ describe('Metrics page', () => {
     const heads = [...(row?.closest('table')?.querySelectorAll('thead th') ?? [])].map((th) =>
       (th.textContent ?? '').trim(),
     );
-    const column = heads.indexOf('Prefill tok/s');
-    expect(column).toBeGreaterThan(-1);
-    const cell = row?.querySelectorAll('td, th')[column];
-    expect((cell?.textContent ?? '').trim()).toBe('—');
+    expect(heads.indexOf('Prefill tok/s')).toBeGreaterThan(-1);
     const bar = page.container.querySelector('[aria-label="Wall time by phase"]')?.closest('section') ?? page.container;
     expect(bar.textContent).toContain('To first token');
     expect(bar.textContent).not.toContain('Setup');

@@ -223,7 +223,7 @@ describe('dev fixture home', () => {
     expect(sched.n).toBeGreaterThan(0);
   });
 
-  it('gives every Engine section data: rejections, a failed load, a turn in prefill and a moving decode rate', () => {
+  it('gives every Engine section data: rejections, a failed load, a turn in prefill and a moving output rate', () => {
     const summary = writeFixtureHome(home, { now });
     const paths = fixturePaths(home);
     const records = readdirSync(paths.runtimeDir)
@@ -243,9 +243,9 @@ describe('dev fixture home', () => {
     expect(live.counters.rejected).toBeGreaterThan(0);
     const prefill = live.turns[1]!;
     expect(prefill.prefillDone!).toBeLessThan(prefill.prefillTotal!);
-    const rates = new Set([0, 2_000, 4_000, 6_000].map((offset) => read(now + offset).decodeTps));
+    const rates = new Set([0, 2_000, 4_000, 6_000].map((offset) => read(now + offset).rates.outputTps));
     expect(rates.size).toBeGreaterThan(1);
-    expect(read(now).decodeTps).toBe(live.decodeTps);
+    expect(read(now).rates.outputTps).toBe(live.rates.outputTps);
   });
 
   it("MLX_DEV_FLIGHT=chat: the model busy with another session's request, then each Work conversation's queued, reading, generating", () => {
@@ -430,9 +430,107 @@ describe('dev fixture content for the manage pages', () => {
 
     const live = reader.detail(LIVE_SESSION_ID)!;
     expect(live.session.live).toBe(true);
+    // Its context grows each turn; the ring and the Context panel read the last count.
+    expect(live.contextUsed).toBe(61_000);
     const last = live.transcript.findLast((entry) => entry.kind === 'tool');
     expect(last?.kind === 'tool' && last.status).toBe('in_progress');
     expect(live.transcript.some((entry) => entry.kind === 'turn-end' && entry.ts > last!.ts)).toBe(false);
+    // A command denied with a note: its failed row, then one "Your note" row from the two stored chunks.
+    const at = live.transcript.findIndex((entry) => entry.kind === 'user' && entry.note === true);
+    expect(live.transcript.filter((entry) => entry.kind === 'user' && entry.note === true)).toEqual([
+      { kind: 'user', ts: expect.any(Number), text: 'use pnpm, not npm', promptIndex: null, note: true },
+    ]);
+    expect(live.transcript[at - 1]).toMatchObject({ kind: 'tool', id: 'toolu_3_denied', status: 'failed' });
+    // A question call answered: the row reads its picks and the note from the stored sentence.
+    const ask = live.transcript.find((entry) => entry.kind === 'tool' && entry.id === 'toolu_4_ask');
+    expect(ask?.kind === 'tool' && ask.ask?.result).toEqual({
+      kind: 'answered',
+      answers: [
+        { picks: ['Postgres (Recommended)'], other: null },
+        { picks: ['Unit tests', 'Lint'], other: 'also run the e2e smoke test' },
+      ],
+    });
+    // A plan-mode question in the 1st turn, answered with "Talk it over": the row reads the agent's plan reply.
+    const discussed = live.transcript.find((entry) => entry.kind === 'tool' && entry.id === 'toolu_0_ask');
+    expect(discussed?.kind === 'tool' && discussed.ask).toEqual({
+      questions: [
+        { text: 'Which layout should the API docs use?', multi: false, options: ['Sidebar layout', 'One page'] },
+      ],
+      result: { kind: 'discuss' },
+    });
+    // A Send now the model read: one steer row inside its answer, as the host draws it live.
+    expect(live.transcript.filter((entry) => entry.kind === 'user' && entry.interjection === true)).toEqual([
+      {
+        kind: 'user',
+        ts: expect.any(Number),
+        text: 'also update the changelog',
+        promptIndex: null,
+        interjection: true,
+      },
+    ]);
+    // Each mode line is stored before its prompt's chunk and drawn right after that prompt.
+    const modes = live.transcript.flatMap((entry, i) => (entry.kind === 'plan-mode' ? [[i, entry.mode]] : []));
+    expect(modes.map(([, mode]) => mode)).toEqual(['plan', 'default']);
+    for (const [i] of modes) expect(live.transcript[(i as number) - 1]?.kind).toBe('user');
+    // The 2nd prompt's picture one-shots, stored before its chunk, are drawn in its answer before its first call.
+    const second = modes[1]![0] as number;
+    const shots = live.transcript.flatMap((entry, i) =>
+      entry.kind === 'notice' && entry.code === 'picture' ? [i] : [],
+    );
+    expect(shots).toHaveLength(2);
+    expect(live.transcript.slice(shots[0], shots[0]! + 2)).toEqual([
+      expect.objectContaining({ kind: 'notice', code: 'picture', what: 'shrunk', count: 1 }),
+      expect.objectContaining({ kind: 'notice', code: 'picture', what: 'dropped', count: 1 }),
+    ]);
+    const secondEnd = live.transcript.findIndex((entry, i) => i > second && entry.kind === 'turn-end');
+    expect(shots[0]).toBeGreaterThan(second);
+    expect(shots[1]).toBeLessThan(secondEnd);
+    expect(live.transcript.slice(second + 1, shots[0]).some((entry) => entry.kind === 'tool')).toBe(false);
+    expect(['tool', 'turn-end']).toContain(live.transcript[shots[1]! + 1]?.kind);
+    // Hooks: the session's start hook failed once, in its first answer; the stop hook fails every turn, one row counts
+    // them; a call a hook denied carries its words; one note.
+    const hooks = live.transcript.filter((entry) => entry.kind === 'notice' && entry.code === 'hook');
+    expect(hooks).toEqual([
+      expect.objectContaining({ event: 'session_start', hook: 'global/env', times: 1 }),
+      expect.objectContaining({ event: 'stop', hook: 'global/lint', times: 5 }),
+    ]);
+    const firstEnd = live.transcript.findIndex((entry) => entry.kind === 'turn-end');
+    expect(live.transcript.indexOf(hooks[0]!)).toBeLessThan(firstEnd);
+    expect(live.transcript.find((entry) => entry.kind === 'tool' && entry.blocked !== undefined)).toMatchObject({
+      id: 'toolu_0_hooked',
+      status: 'failed',
+      blocked: '`run_terminal_command` blocked by global/no-rm: deleting build output is not allowed here',
+    });
+    expect(live.transcript.filter((entry) => entry.kind === 'notice' && entry.code === 'hook-note')).toEqual([
+      expect.objectContaining({ text: 'Stop blocked by hook `global/tests-green`, continuing: 2 tests fail' }),
+    ]);
+    // One stored recap, after the turn it sums up ended.
+    const recaps = live.transcript.flatMap((entry, i) => (entry.kind === 'recap' ? [i] : []));
+    expect(recaps).toHaveLength(1);
+    expect(live.transcript.slice(0, recaps[0]).some((entry) => entry.kind === 'turn-end')).toBe(true);
+    // The 2nd answer reads a screenshot and three pages of a 12-page PDF: sizes on the rows, the bytes from disk.
+    const reads = live.transcript.flatMap((entry) =>
+      entry.kind === 'tool' && entry.pictures !== undefined
+        ? [[entry.id, entry.pdfPages ?? null, entry.pictures.map((p) => [p.n, p.mediaType, p.page ?? null])]]
+        : [],
+    );
+    expect(reads).toEqual([
+      ['toolu_1_pictures0', null, [[0, 'image/png', null]]],
+      [
+        'toolu_1_pictures1',
+        12,
+        [
+          [0, 'image/jpeg', 4],
+          [1, 'image/jpeg', 5],
+          [2, 'image/jpeg', 6],
+        ],
+      ],
+    ]);
+    expect(reader.picture(LIVE_SESSION_ID, 'toolu_1_pictures1', 2)).toMatchObject({
+      ok: true,
+      mediaType: 'image/jpeg',
+    });
+    expect(reader.picture(LIVE_SESSION_ID, 'toolu_1_pictures0', 0)).toMatchObject({ ok: true, mediaType: 'image/png' });
   });
 
   it('gives the agent timeline a turn for each case it draws', () => {
@@ -514,7 +612,13 @@ describe('dev fixture content for the manage pages', () => {
     const detail = reader.detail(LONG_SESSION_ID)!;
     const wakes = detail.transcript.filter((entry) => entry.kind === 'wake');
     expect(wakes).toEqual([
-      expect.objectContaining({ cause: 'workflow', workflow: { name: 'deep-research', status: 'complete' } }),
+      expect.objectContaining({
+        cause: 'workflow',
+        workflow: expect.objectContaining({
+          name: 'deep-research',
+          snapshot: expect.objectContaining({ status: 'complete' }),
+        }),
+      }),
     ]);
     const woken = timeline(LONG_SESSION_ID, 27);
     const range = woken.range!;

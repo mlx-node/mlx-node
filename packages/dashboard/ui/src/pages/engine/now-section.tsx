@@ -1,15 +1,18 @@
 import { useMemo, type ReactElement } from 'react';
 
+import { PHASE_BANDS } from '../../components/arc-x/activity-strip/phase-stack';
 import { KeyValue } from '../../components/arc-x/key-value/key-value';
-import { LiveStream } from '../../components/arc-x/live-stream/live-stream';
+import { LiveStream, type LiveStreamReadout } from '../../components/arc-x/live-stream/live-stream';
+import { EngineStateBadge } from '../../components/arc-x/live-turn-row/live-turn-row';
 import { MetricTicker, type TickerItem } from '../../components/arc-x/metric-ticker/metric-ticker';
 import { Panel } from '../../components/arc-x/panel/panel';
 import { Meter, SplitBar } from '../../components/arc-x/split-bar/split-bar';
 import { fill } from '../../lib/chat-strings';
 import { ENGINE } from '../../lib/engine-strings';
-import { nowItems, procKeyOf } from '../../lib/engine-view';
+import { engineState, nowItems, procKeyOf, rateText, stackPoints } from '../../lib/engine-view';
 import { formatBytes, formatDuration, formatNumber, formatTps } from '../../lib/format';
 import type { LiveSample } from '../../lib/live-history';
+import { LANES, METRIC } from '../../lib/metric-strings';
 import { axisNumber } from '../../lib/metrics-view';
 import { SERIES_A, SERIES_B } from '../../lib/series';
 import type { RuntimeLive, RuntimeProcessLive, RuntimeSeries } from '../../lib/types';
@@ -60,12 +63,33 @@ export function RateAndMemory({
 }): ReactElement {
   const points = useMemo(
     () =>
-      history.filter((sample) => sample.pid === process.pid).map((sample) => ({ t: sample.t, value: sample.outTps })),
+      history
+        .filter((sample) => sample.pid === process.pid)
+        .map((sample) => ({ t: sample.t, value: sample.outputTps })),
     [history, process.pid],
   );
+  const stack = useMemo(() => stackPoints(history, process.pid), [history, process.pid]);
   const running = process.status === 'running';
-  const tps = process.decodeTps ?? 0;
-  const status = !running ? 'Not responding' : tps > 0 || process.turns.length > 0 ? 'All turns in flight' : 'Idle';
+  const state = engineState(process);
+  // A readout whose phase no lane is in now shows the last window, not this instant: drawn quiet.
+  const readouts: LiveStreamReadout[] = [
+    {
+      key: 'out',
+      label: METRIC.outputRate.label,
+      value: rateText(process.rates.outputTps),
+      unit: METRIC.outputRate.unit,
+      tip: METRIC.outputRate.tip,
+      quiet: state.lanes.decode === 0,
+    },
+    {
+      key: 'prefill',
+      label: METRIC.prefillSpeed.label,
+      value: rateText(process.rates.prefillTps),
+      unit: METRIC.prefillSpeed.unit,
+      tip: METRIC.prefillSpeed.tip,
+      quiet: state.lanes.prefill === 0,
+    },
+  ];
   const mem = process.mem;
   const key = procKeyOf(process);
   const proc = series?.procs.find((row) => row.procKey === key);
@@ -73,15 +97,17 @@ export function RateAndMemory({
   const poolBytes = pools.reduce((sum, row) => sum + row.latest.memoryCapacityBytes, 0);
   return (
     <PageGrid>
-      <Panel className="col-span-12 @md:col-span-7" ariaLabel="Output rate">
+      <Panel className="col-span-12 @md:col-span-7" ariaLabel={METRIC.outputRate.label}>
         <LiveStream
           key={key}
-          label="Output rate"
-          unit="tok/s"
+          label={METRIC.outputRate.label}
+          unit={METRIC.outputRate.unit}
           points={points}
           nowMs={live.now}
           live={running}
-          status={status}
+          state={<EngineStateBadge state={state.key} lanes={state.lanes} live={running} />}
+          readouts={readouts}
+          stack={{ label: LANES.byPhase, unit: LANES.unit, bands: PHASE_BANDS, points: stack }}
           formatValue={formatTps}
           formatTick={axisNumber}
           height={160}
@@ -114,9 +140,10 @@ export function RateAndMemory({
               },
               {
                 key: 'rss',
-                label: 'Node RSS',
+                label: 'Process RSS',
+                labelTip:
+                  'Memory the engine process holds outside Metal: its own heap and mapped files. Most MLX memory is in Metal and is not counted here.',
                 value: formatBytes(mem.rss),
-                hint: 'counted apart from MLX',
                 numeric: true,
               },
               {

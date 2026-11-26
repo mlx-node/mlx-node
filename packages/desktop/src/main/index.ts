@@ -16,6 +16,7 @@
  * debounced.
  */
 
+import { mkdirSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
@@ -35,6 +36,7 @@ import {
 } from 'electron';
 import electronUpdater from 'electron-updater';
 
+import { DATA_DIR_NAME } from '../app-name.js';
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
 import { createPanelLedger, ledgerFileName, sweepLedger, type PanelLedger } from '../panel-ledger.js';
@@ -116,6 +118,11 @@ let quitting = false;
  * for the app, and the quit then waits on it forever.
  */
 let preflightScanPending = false;
+
+// Before the single-instance lock, whose file lives in userData. setPath throws on a missing directory.
+const userDataDir = join(app.getPath('appData'), DATA_DIR_NAME);
+mkdirSync(userDataDir, { recursive: true });
+app.setPath('userData', userDataDir);
 
 /**
  * MUST run before `app.whenReady()`. Chromium reads the privileged-scheme table

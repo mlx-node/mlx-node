@@ -654,7 +654,7 @@ mlx options (handled before the agent binary sees the args):
                             ~/.mlx-node/cache/prefix-cache).
 
 First run: when no local model exists, an interactive wizard offers a curated
-download. Agent config home: ~/.mlx-agent (override: GROK_HOME).
+download. Agent config home: ~/.mlx-agent (override: MLX_AGENT_HOME).
 
 Environment:
   MLX_AGENT_BIN             Path to a locally built agent binary (dev override;

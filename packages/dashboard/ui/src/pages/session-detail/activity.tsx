@@ -25,10 +25,12 @@ import {
   formatRate,
   formatTps,
 } from '../../lib/format';
+import { METRIC } from '../../lib/metric-strings';
 import { axisNumber } from '../../lib/metrics-view';
 import { modelSeries } from '../../lib/model-colors';
 import { PREFILL_MIN_TOKENS, PREFILL_SMALL_HINT } from '../../lib/prefill';
 import {
+  decodeAverage,
   openTurnGroup,
   prefillAverage,
   sessionTitle,
@@ -111,7 +113,7 @@ function SessionTotals({ turns }: { turns: readonly TurnMetric[] }): ReactElemen
     }
   }
   const ttfts = turns.map((turn) => turn.ttftMs).filter(finite);
-  const decodes = turns.map((turn) => turn.decodeTps).filter(finite);
+  const decode = decodeAverage(turns);
   const prefills = turns.map(turnPrefill);
   const measuredCount = prefills.filter((prefill) => prefill !== null).length;
   const ratedCount = prefills.filter((prefill) => prefill !== null && prefill.tps !== null).length;
@@ -157,25 +159,25 @@ function SessionTotals({ turns }: { turns: readonly TurnMetric[] }): ReactElemen
         hint={reasoning > 0 ? `${formatCount(reasoning)} reasoning` : undefined}
       />
       <StatTile
-        label="First token"
+        label={METRIC.firstToken.label}
         value={ttft === null ? '—' : ttftParts.value}
         unit={ttft === null ? undefined : ttftParts.unit}
         hint={ttfts.length > 0 ? `mean of ${formatCountNoun(ttfts.length, 'turn', 'turns')}` : undefined}
         sampleCount={ttfts.length}
       />
       <StatTile
-        label="Prefill speed"
+        label={METRIC.prefillSpeed.label}
         value={prefill === null ? '—' : formatTps(prefill)}
         unit={prefill === null ? undefined : 'tok/s'}
         hint={prefillHint}
         sampleCount={prefill === null ? undefined : ratedCount}
       />
       <StatTile
-        label="Decode speed"
-        value={decodes.length === 0 ? '—' : formatTps(mean(decodes))}
-        unit={decodes.length === 0 ? undefined : 'tok/s'}
-        hint={decodes.length > 0 ? `mean of ${formatCountNoun(decodes.length, 'turn', 'turns')}` : undefined}
-        sampleCount={decodes.length}
+        label={METRIC.decodeSpeed.label}
+        value={decode.tps === null ? '—' : formatTps(decode.tps)}
+        unit={decode.tps === null ? undefined : 'tok/s'}
+        hint={decode.turns > 0 ? formatCountNoun(decode.turns, 'turn', 'turns') : undefined}
+        sampleCount={decode.turns}
       />
     </StatGroup>
   );
@@ -378,7 +380,7 @@ export function Activity(props: ActivityProps): ReactElement {
             height={CHART_HEIGHT}
             state={timeEmpty ? 'empty' : 'ready'}
             empty={{ title: 'No turn durations recorded' }}
-            footnote="Decode time is output tokens ÷ decode speed. Prompt processing of later model calls is in Tools and other."
+            footnote="Decode time is (output tokens − model calls) ÷ decode speed. Prompt processing of later model calls is in Tools and other."
           >
             <StackedBarChart
               label="Time per turn"
@@ -397,14 +399,14 @@ export function Activity(props: ActivityProps): ReactElement {
           </ChartCard>
           <ChartCard
             className="col-span-12 @md:col-span-6"
-            title="Decode speed per turn"
+            title={`${METRIC.decodeSpeed.label} per turn`}
             subtitle="Tokens per second"
             height={CHART_HEIGHT}
             state={decodeEmpty ? 'empty' : 'ready'}
             empty={{ title: 'No decode speed reported' }}
           >
             <TrendChart
-              label="Decode speed per turn"
+              label={`${METRIC.decodeSpeed.label} per turn`}
               unit="tok/s"
               height={CHART_HEIGHT}
               data={decodeData}
@@ -416,7 +418,7 @@ export function Activity(props: ActivityProps): ReactElement {
           </ChartCard>
           <ChartCard
             className="col-span-12 @md:col-span-6"
-            title="Prefill speed per turn"
+            title={`${METRIC.prefillSpeed.label} per turn`}
             subtitle={`Tokens per second · measured prefill of ${String(PREFILL_MIN_TOKENS)}+ tokens`}
             height={CHART_HEIGHT}
             state={prefillEmpty ? 'empty' : 'ready'}
@@ -427,12 +429,12 @@ export function Activity(props: ActivityProps): ReactElement {
                     title: prefillMeasuredAnywhere
                       ? 'Prefill was not measured for these turns'
                       : 'Prefill was not measured in this session',
-                    hint: "The session file holds the first model call's time to first token only. Prefill speed needs the prefill time of each call.",
+                    hint: `The session file holds the first model call's time to first token only. ${METRIC.prefillSpeed.label} needs the prefill time of each call.`,
                   }
             }
           >
             <TrendChart
-              label="Prefill speed per turn"
+              label={`${METRIC.prefillSpeed.label} per turn`}
               unit="tok/s"
               height={CHART_HEIGHT}
               data={prefillData}

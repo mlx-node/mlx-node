@@ -15,7 +15,7 @@ export const PROVIDERS = {
   },
   lines: {
     exa: 'Web search and page text.',
-    deepseek: 'Web search and page text. The skill for Work is written by mlx-node.',
+    deepseek: 'Web search and page text. The skill for Work is written by Portato.',
     brave: 'Web search. It has no page reader: Chat reads excerpts, or uses Firecrawl.',
     firecrawl: 'Reads pages for Chat. Crawl, map and search skills for Work.',
   },
@@ -117,7 +117,7 @@ export const PROVIDERS = {
   factsBalance: 'Balance {amount} {currency}',
   factsBrave: 'Checked with one billed search request.',
   skills: 'Skills',
-  skillsOwn: 'written by mlx-node',
+  skillsOwn: 'written by Portato',
   skillsSource: '{repo} @ {commit} · {license}',
   removeTitle: 'Remove the {provider} key?',
   removeText: 'The key is deleted from the Keychain.',

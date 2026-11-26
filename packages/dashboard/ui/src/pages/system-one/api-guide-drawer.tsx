@@ -149,8 +149,8 @@ export function ApiGuideDrawer({
                   <CopyButton value={serveCommand} label="Copy command" />
                 </div>
                 <p className={styles.apiCmdHint}>
-                  The Desktop App&apos;s own inference process is private. Run <code>mlx serve</code> to open an HTTP
-                  API for external scripts and apps — models load lazily on first request. Add{' '}
+                  Portato&apos;s own inference process is private. Run <code>mlx serve</code> to open an HTTP API for
+                  external scripts and apps. Models load lazily on first request. Add{' '}
                   <code>--auth-token &lt;secret&gt;</code> if exposing beyond localhost.
                 </p>
               </div>

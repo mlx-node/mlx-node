@@ -12,3 +12,11 @@ export function tildePath(path: string, home: string | null): string {
   if (path.startsWith(`${root}/`)) return `~${path.slice(root.length)}`;
   return path;
 }
+
+/** The scratch root's `~` form while the host state is not known; the host makes it `join(home, 'Portato')`. */
+const SCRATCH_SHOWN = '~/Portato';
+
+/** Where Work without a folder makes its folders, as people read it (`{root}` of the strings). */
+export function scratchShown(root: string | null | undefined, home: string | null): string {
+  return root === null || root === undefined ? SCRATCH_SHOWN : tildePath(root, home);
+}

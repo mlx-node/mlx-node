@@ -10,6 +10,7 @@ import { createRoot } from 'react-dom/client';
 import { MemoryRouter } from 'react-router-dom';
 
 import '../../../ui/src/index.css';
+import { ChatMarkdown } from '../../../ui/src/components/arc-x/chat-markdown/chat-markdown';
 import { CodePanel } from '../../../ui/src/components/arc-x/code-panel/code-panel';
 import { ConfirmPopover } from '../../../ui/src/components/arc-x/confirm-popover/confirm-popover';
 import { DataTable, type DataColumn } from '../../../ui/src/components/arc-x/data-table/data-table';
@@ -17,7 +18,6 @@ import { Disclosure } from '../../../ui/src/components/arc-x/disclosure/disclosu
 import { KeyValue } from '../../../ui/src/components/arc-x/key-value/key-value';
 import { LiveDot } from '../../../ui/src/components/arc-x/live-dot/live-dot';
 import { LiveLabel } from '../../../ui/src/components/arc-x/live-label/live-label';
-import { Markdown } from '../../../ui/src/components/arc-x/markdown/markdown';
 import { ModelBadge } from '../../../ui/src/components/arc-x/model-badge/model-badge';
 import { MorphLoader } from '../../../ui/src/components/arc-x/morph-loader/morph-loader';
 import type { LoaderStatus } from '../../../ui/src/components/arc-x/morph-loader/shapes';
@@ -320,6 +320,8 @@ function Table(): ReactElement {
   );
 }
 
+const WORK_LINKS = { mode: 'work' } as const;
+
 const MARKDOWN = `## Plan
 
 1. Read **the trace** for the slow turn.
@@ -388,7 +390,7 @@ function Texts(): ReactElement {
           <CodePanel label="JSON" code={JSON.stringify({ model: 'qwen3.6', max_tokens: 512, stream: true }, null, 2)} />
         </Disclosure>
         <Disclosure title="Response" meta="collapsed">
-          <Markdown text={MARKDOWN} />
+          <ChatMarkdown text={MARKDOWN} links={WORK_LINKS} />
         </Disclosure>
       </div>
     </div>
@@ -442,7 +444,7 @@ function Gallery(): ReactElement {
       </Section>
       <Section
         title="Text and detail"
-        note="KeyValue, LiveDot, LiveLabel, SwapText, ModelBadge, Disclosure, CodePanel, Markdown."
+        note="KeyValue, LiveDot, LiveLabel, SwapText, ModelBadge, Disclosure, CodePanel, ChatMarkdown."
       >
         <Texts />
       </Section>

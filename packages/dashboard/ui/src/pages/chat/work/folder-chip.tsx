@@ -20,6 +20,11 @@ const PATH_CHARS = 34;
 
 const icon = <FolderOpen size={14} strokeWidth={1.75} />;
 
+/** The value of the "No folder" row: no folder path is empty. */
+const NONE_VALUE = '';
+/** The list's value while nothing is picked yet: no path holds a NUL, so no row reads checked. */
+const NO_PICK = '\u0000';
+
 export interface NewFolderChipProps {
   /** The folder the next Work conversation opens in, or null. */
   folder: string | null;
@@ -28,16 +33,33 @@ export interface NewFolderChipProps {
   onChoose: (path: string) => void;
   /** Open the native folder dialog. */
   onPick: () => void;
-  /** The composer's tool row (popover above) or the bar (popover below, at the end). */
-  place: 'composer' | 'header';
+  /** The chip's words while no folder is chosen. Default "Choose folder…". */
+  label?: string;
+  /** The server refused the folder: its sentence, as the chip's danger dot and title. */
+  problem?: string | null;
+  /**
+   * Work: the "No folder" row, last; the caption reads "Folder" and the popover always opens. `selected`: the next
+   * conversation starts without a folder. `root`: where its folder is made, as people read it.
+   */
+  none?: { selected: boolean; onChoose: () => void; root: string };
+  /** Work: no place yet. `loading`: the Work list is on its way; `unset`: it failed, and the person picks one. */
+  unplaced?: 'loading' | 'unset';
 }
 
 /**
- * A new Work conversation's folder chip: recent folders, then the native dialog. With no recent folder the dialog
- * opens at once. It sits in the composer while no folder is chosen and in the bar once one is.
+ * A new conversation's folder chip in the tray under the composer: recent folders, in Work "No folder", then the
+ * native dialog. Outside Work, with no recent folder the dialog opens at once.
  */
-export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFolderChipProps): ReactElement {
-  const header = place === 'header';
+export function NewFolderChip({
+  folder,
+  recent,
+  onChoose,
+  onPick,
+  label,
+  problem,
+  none,
+  unplaced,
+}: NewFolderChipProps): ReactElement {
   const [open, setOpen] = useState(false);
   // A pick leaves focus to the page (the composer); Radix's return to the chip after the exit animation would undo it.
   const pickedRef = useRef(false);
@@ -47,12 +69,30 @@ export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFo
     title: folderName(path),
     note: truncateMiddle(tildePath(path, home), PATH_CHARS),
   }));
-  const label = folder === null ? CHAT.folderChoose : truncateMiddle(folderName(folder), NAME_CHARS);
+  if (none !== undefined)
+    options.push({ value: NONE_VALUE, title: CHAT.folderNone, note: fill(CHAT.folderNoneNote, { root: none.root }) });
+  const nothing =
+    unplaced === 'loading'
+      ? CHAT.folderLoadingChip
+      : unplaced === 'unset'
+        ? CHAT.folderUnset
+        : (label ?? CHAT.folderChoose);
+  const blank = unplaced === undefined && none?.selected === true;
+  const shown = blank ? CHAT.folderNone : folder === null ? nothing : truncateMiddle(folderName(folder), NAME_CHARS);
+  const named = blank
+    ? fill(CHAT.folderLabelNone, { root: none.root })
+    : folder === null
+      ? unplaced === 'loading'
+        ? CHAT.folderLoading
+        : nothing
+      : fill(CHAT.folderLabel, { folder: tildePath(folder, home) });
+  const refused = problem !== undefined && problem !== null;
+  const caption = none !== undefined ? CHAT.folderPath : CHAT.folderRecent;
   return (
     <Popover
       open={open}
       onOpenChange={(next) => {
-        if (next && recent.length === 0) {
+        if (next && recent.length === 0 && none === undefined) {
           onPick();
           return;
         }
@@ -63,29 +103,31 @@ export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFo
       <PopoverTrigger asChild>
         <ToolChip
           icon={icon}
-          label={label}
-          give={1}
-          state={folder === null ? 'off' : 'on'}
-          title={folder === null ? undefined : tildePath(folder, home)}
-          aria-label={folder === null ? CHAT.folderChoose : fill(CHAT.folderLabel, { folder: tildePath(folder, home) })}
+          label={shown}
+          state={blank || folder === null ? 'off' : 'on'}
+          dot={refused ? 'danger' : undefined}
+          title={refused ? problem : blank || folder === null ? undefined : tildePath(folder, home)}
+          aria-label={refused ? `${named}. ${problem}` : named}
+          data-tray-part="folder"
         />
       </PopoverTrigger>
       <PopoverContent
-        side={header ? 'bottom' : 'top'}
-        align={header ? 'end' : 'start'}
-        aria-label={CHAT.folderRecent}
+        side="top"
+        align="start"
+        aria-label={caption}
         onCloseAutoFocus={(event) => {
           if (pickedRef.current) event.preventDefault();
         }}
       >
         <div className="grid w-[18.75rem] max-w-full gap-2">
-          <p className="m-0 text-caption font-medium text-secondary">{CHAT.folderRecent}</p>
+          <p className="m-0 text-caption font-medium text-secondary">{caption}</p>
           <OptionList
-            label={CHAT.folderRecent}
-            value={folder ?? ''}
+            label={caption}
+            value={blank ? NONE_VALUE : (folder ?? (unplaced === undefined ? NONE_VALUE : NO_PICK))}
             onValueChange={(path) => {
               pickedRef.current = true;
-              onChoose(path);
+              if (none !== undefined && path === NONE_VALUE) none.onChoose();
+              else onChoose(path);
               setOpen(false);
             }}
             options={options}
@@ -101,7 +143,7 @@ export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFo
                 onPick();
               }}
             >
-              {CHAT.folderChooseOther}
+              {recent.length === 0 ? CHAT.folderChoose : CHAT.folderChooseOther}
             </Button>
           </span>
         </div>
@@ -110,8 +152,11 @@ export function NewFolderChip({ folder, recent, onChoose, onPick, place }: NewFo
   );
 }
 
-/** An open Work conversation's folder in the bar: fixed for its life. The popover shows the whole path and copies it. */
-export function OpenFolderChip({ folder }: { folder: string }): ReactElement {
+/**
+ * An open Work conversation's folder in the bar: fixed for its life. The popover shows the whole path and copies it.
+ * `noFolder`: the folder the app made for it, named "No folder".
+ */
+export function OpenFolderChip({ folder, noFolder = false }: { folder: string; noFolder?: boolean }): ReactElement {
   const home = useHomeDir();
   const shown = tildePath(folder, home);
   return (
@@ -119,10 +164,10 @@ export function OpenFolderChip({ folder }: { folder: string }): ReactElement {
       <PopoverTrigger asChild>
         <ToolChip
           icon={icon}
-          label={truncateMiddle(folderName(folder), NAME_CHARS)}
+          label={noFolder ? CHAT.folderNone : truncateMiddle(folderName(folder), NAME_CHARS)}
           give={1}
           title={shown}
-          aria-label={fill(CHAT.folderLabel, { folder: shown })}
+          aria-label={noFolder ? `${CHAT.folderNone}, ${shown}` : fill(CHAT.folderLabel, { folder: shown })}
         />
       </PopoverTrigger>
       <PopoverContent side="bottom" align="end" aria-label={CHAT.folderPath}>
@@ -131,6 +176,7 @@ export function OpenFolderChip({ folder }: { folder: string }): ReactElement {
           <p className="m-0 min-w-0 text-body text-foreground">
             <PathText path={folder} wrap />
           </p>
+          {noFolder ? <p className="m-0 text-caption text-secondary">{CHAT.folderNoneOwn}</p> : null}
           <span>
             <CopyButton value={folder} label={CHAT.folderCopy} />
           </span>

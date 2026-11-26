@@ -18,7 +18,7 @@ export interface DashboardDb {
  * rather than migrated in place. The index is disposable and repopulated from
  * JSONL on boot, so a rebuild never loses source-of-truth data.
  */
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 const DDL = `
 CREATE TABLE IF NOT EXISTS traces (
@@ -147,6 +147,16 @@ CREATE TABLE IF NOT EXISTS runtime_samples (
   d_cancelled INTEGER,
   d_out_tokens INTEGER,
   d_rejected INTEGER,
+  loading_ms INTEGER,
+  waiting_ms INTEGER,
+  prepare_ms INTEGER,
+  prefill_ms INTEGER,
+  decode_ms INTEGER,
+  running_ms INTEGER,
+  rate_out_tokens INTEGER,
+  rate_out_ms INTEGER,
+  rate_prefill_tokens INTEGER,
+  rate_prefill_ms INTEGER,
   source_file TEXT NOT NULL
 );
 

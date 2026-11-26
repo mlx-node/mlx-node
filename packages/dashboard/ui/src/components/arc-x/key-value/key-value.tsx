@@ -3,6 +3,7 @@ import type { ReactElement, ReactNode } from 'react';
 import { cn } from '../../../lib/cn';
 import { NO_VALUE } from '../../../lib/format';
 import { CopyButton } from '../../arc/copy-button/copy-button';
+import { Tooltip } from '../../arc/tooltip/tooltip';
 import { Placeholder } from '../placeholder/placeholder';
 import { SwapText } from '../swap-text/swap-text';
 import styles from './key-value.module.css';
@@ -10,8 +11,8 @@ import styles from './key-value.module.css';
 export interface KeyValueItem {
   key: string;
   label: string;
-  /** Hover text of the label. */
-  labelTitle?: string;
+  /** More about the label, in a tooltip on hover and focus; the label gets a dotted underline. */
+  labelTip?: string;
   /** null -> "—" */
   value: ReactNode | null;
   /** Muted text after the value. */
@@ -53,8 +54,16 @@ export function KeyValue({
     <dl className={cn(styles.root, className)} data-layout={layout} aria-label={ariaLabel}>
       {items.map((item, index) => (
         <div key={item.key} className={styles.row}>
-          <dt className={styles.label} title={item.labelTitle}>
-            {item.label}
+          <dt className={styles.label}>
+            {item.labelTip !== undefined ? (
+              <Tooltip content={item.labelTip}>
+                <span className={styles.tip} tabIndex={0}>
+                  {item.label}
+                </span>
+              </Tooltip>
+            ) : (
+              item.label
+            )}
           </dt>
           <dd
             className={styles.value}

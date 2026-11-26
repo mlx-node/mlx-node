@@ -11,6 +11,7 @@ import {
   CHAT_ANSWER_TOKENS,
   CHAT_MAX_COMPLETION_TOKENS,
   chatAgentEnv,
+  CLAUDE_CODE_OFF_ENV,
   WORK_ANSWER_TOKENS,
   WORK_MAX_COMPLETION_TOKENS,
   workAgentEnv,
@@ -41,6 +42,7 @@ import { chatPaths, writeWorkGuard } from '../src/chat/paths.js';
 
 const paths = chatPaths('/r');
 const endpoint = { url: 'http://127.0.0.1:4321', token: 'tok-INFERENCE' };
+const AGENT_HOME = '/Users/dev/.mlx-agent';
 
 describe('chatAgentEnv', () => {
   it('is exactly the Chat table and inherits nothing', () => {
@@ -61,6 +63,7 @@ describe('chatAgentEnv', () => {
         GROK_CLI_CHAT_PROXY_BASE_URL: 'http://127.0.0.1:4321/v1',
         GROK_XAI_API_BASE_URL: 'http://127.0.0.1:4321/v1',
         XAI_API_KEY: 'tok-INFERENCE',
+        GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS: '3',
         GROK_DISABLE_AUTOUPDATER: '1',
         GROK_IMAGE_GEN: '0',
         GROK_IMAGE_EDIT: '0',
@@ -75,6 +78,7 @@ describe('chatAgentEnv', () => {
         GROK_CODEX_HOOKS_ENABLED: 'false',
         GROK_CODEX_MCPS_ENABLED: 'false',
         GROK_CLAUDE_SKILLS_ENABLED: 'false',
+        GROK_CLAUDE_PLUGINS_ENABLED: 'false',
         GROK_CURSOR_SKILLS_ENABLED: 'false',
         GROK_TURN_SUMMARY: '0',
         GROK_SESSION_SEARCH: '0',
@@ -108,7 +112,7 @@ describe('workAgentEnv', () => {
   };
 
   it('keeps the parent env, removes the app internals and every unselected key, sets the rest', () => {
-    const env = workAgentEnv({ base, endpoint, agentHome: null, providerKeys: { EXA_API_KEY: 'new-exa' } });
+    const env = workAgentEnv({ base, endpoint, agentHome: AGENT_HOME, providerKeys: { EXA_API_KEY: 'new-exa' } });
     expect(env.PATH).toBe('/usr/bin:/opt/homebrew/bin');
     expect(env.HOME).toBe('/Users/dev');
     for (const name of ['ELECTRON_RUN_AS_NODE', 'MLX_DESKTOP_CLI', 'NAPI_RS_NATIVE_LIBRARY_PATH', 'NODE_OPTIONS']) {
@@ -125,20 +129,32 @@ describe('workAgentEnv', () => {
     expect(env.GROK_IMAGE_EDIT).toBe('0');
     expect(env.GROK_RESUME_COMMAND).toBe('mlx agent');
     expect(env.GROK_TURN_SUMMARY).toBe('0');
+    expect(env.GROK_ACTIVE_AGENT_MESSAGES).toBe('1');
     expect(env.GROK_TWO_PASS_COMPACTION).toBe('0');
     expect(env.GROK_COMPACTION_WALL_CLOCK_SECS).toBe('0');
     expect(env.GROK_CONFIG).toBe(
       '{"mine":true,"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}',
     );
-    expect(env).not.toHaveProperty('GROK_HOME');
+    expect(env.GROK_HOME).toBe(AGENT_HOME);
     expect(env.FIRECRAWL_NO_SEARCH_FEEDBACK).toBe('1');
     expect(env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK).toBe('1');
     expect(env.FIRECRAWL_NO_ENDPOINT_FEEDBACK).toBe('1');
   });
 
+  // Mutation: `??=` → a parent env with the flag off keeps the rail's Message dead (the agent answers method not found).
+  it('turns subagent messages on, also over an inherited value (the Chat env above has none)', () => {
+    const env = workAgentEnv({
+      base: { ...base, GROK_ACTIVE_AGENT_MESSAGES: '0' },
+      endpoint,
+      agentHome: AGENT_HOME,
+      providerKeys: {},
+    });
+    expect(env.GROK_ACTIVE_AGENT_MESSAGES).toBe('1');
+  });
+
   it('sets CDPATH empty, also over a CDPATH of the app, so the agent does not fill it from the login shell', () => {
     for (const own of [{}, { CDPATH: '/Users/dev:.' }]) {
-      const env = workAgentEnv({ base: { ...base, ...own }, endpoint, agentHome: null, providerKeys: {} });
+      const env = workAgentEnv({ base: { ...base, ...own }, endpoint, agentHome: AGENT_HOME, providerKeys: {} });
       expect(Object.hasOwn(env, 'CDPATH')).toBe(true);
       expect(env.CDPATH).toBe('');
     }
@@ -148,7 +164,7 @@ describe('workAgentEnv', () => {
     const env = workAgentEnv({
       base: { ...base, GROK_TWO_PASS_COMPACTION: '1', GROK_COMPACTION_WALL_CLOCK_SECS: '300' },
       endpoint,
-      agentHome: null,
+      agentHome: AGENT_HOME,
       providerKeys: {},
     });
     expect([env.GROK_TWO_PASS_COMPACTION, env.GROK_COMPACTION_WALL_CLOCK_SECS]).toEqual(['0', '0']);
@@ -164,10 +180,44 @@ describe('workAgentEnv', () => {
     expect(CHAT_MAX_COMPLETION_TOKENS - CHAT_ANSWER_TOKENS).toBe(AGENT_HOST_THINKING.tokenBudget);
   });
 
-  it('caps output at 28,384 tokens when the user set no config, and sets GROK_HOME only for a custom home', () => {
+  it('caps output at 28,384 tokens when the user set no config', () => {
     const env = workAgentEnv({ base: { PATH: '/bin' }, endpoint, agentHome: '/custom/agent', providerKeys: {} });
     expect(env.GROK_CONFIG).toBe('{"models":{"max_completion_tokens":28384,"inference_idle_timeout_secs":3600}}');
     expect(env.GROK_HOME).toBe('/custom/agent');
+  });
+
+  // Mutations: `GROK_HOME ??=` (grok-build's inherited home wins), or GROK_AUTH_PATH / GROK_CONFIG_PATH left out of the
+  // removed list (mlx-agent logs in with and reads grok-build's files) → red.
+  it("sets GROK_HOME over grok-build's own and drops grok-build's login and config paths", () => {
+    const env = workAgentEnv({
+      base: {
+        ...base,
+        GROK_HOME: '/Users/dev/.grok',
+        GROK_AUTH_PATH: '/Users/dev/.grok/auth.json',
+        GROK_CONFIG_PATH: '/Users/dev/.grok/config.toml',
+      },
+      endpoint,
+      agentHome: AGENT_HOME,
+      providerKeys: {},
+    });
+    expect(env.GROK_HOME).toBe(AGENT_HOME);
+    expect(env).not.toHaveProperty('GROK_AUTH_PATH');
+    expect(env).not.toHaveProperty('GROK_CONFIG_PATH');
+  });
+
+  // Mutations: `=` for `??=` (the user's own number is overwritten), or the line dropped → red.
+  it('caps the loopback connect attempts at 3 unless the user exported a number', () => {
+    expect(workAgentEnv({ base, endpoint, agentHome: AGENT_HOME, providerKeys: {} })).toHaveProperty(
+      'GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS',
+      '3',
+    );
+    const own = workAgentEnv({
+      base: { ...base, GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS: '9' },
+      endpoint,
+      agentHome: AGENT_HOME,
+      providerKeys: {},
+    });
+    expect(own.GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS).toBe('9');
   });
 
   it("keeps the user's own overlay and puts the cap and the stall limit inside it; a value that is not an object is replaced", () => {
@@ -223,15 +273,48 @@ describe('workAgentEnv', () => {
       const env = workAgentEnv({
         base: base === undefined ? {} : { GROK_CONFIG: base },
         endpoint,
-        agentHome: null,
+        agentHome: AGENT_HOME,
         providerKeys: {},
       });
       expect([base, env.GROK_CONFIG]).toEqual([base, want]);
     }
   });
 
+  // Mutation: a switch missing from the off list (PLUGINS: Claude plugins and `.claude/agents` keep loading).
+  it('Claude Code off is exactly the six Claude switches, plugins included', () => {
+    expect(CLAUDE_CODE_OFF_ENV).toEqual({
+      GROK_CLAUDE_HOOKS_ENABLED: 'false',
+      GROK_CLAUDE_SKILLS_ENABLED: 'false',
+      GROK_CLAUDE_AGENTS_ENABLED: 'false',
+      GROK_CLAUDE_RULES_ENABLED: 'false',
+      GROK_CLAUDE_MCPS_ENABLED: 'false',
+      GROK_CLAUDE_PLUGINS_ENABLED: 'false',
+    });
+    const env = workAgentEnv({ base: {}, endpoint, agentHome: AGENT_HOME, providerKeys: {}, claudeCode: false });
+    expect(env.GROK_CLAUDE_PLUGINS_ENABLED).toBe('false');
+  });
+
+  // Mutations: the switches set with `??=` (an inherited `true` keeps Claude Code on), or set while the setting is on.
+  it('Claude Code off sets every switch over inherited values; on or absent leaves the inherited env alone', () => {
+    const inherited = Object.fromEntries(Object.keys(CLAUDE_CODE_OFF_ENV).map((name) => [name, 'true']));
+    const input = { endpoint, agentHome: AGENT_HOME, providerKeys: {} };
+    const off = workAgentEnv({ ...input, base: { ...base, ...inherited }, claudeCode: false });
+    for (const [name, value] of Object.entries(CLAUDE_CODE_OFF_ENV)) expect([name, off[name]]).toEqual([name, value]);
+    for (const claudeCode of [true, undefined]) {
+      const on = workAgentEnv({ ...input, base: { ...base, ...inherited }, claudeCode });
+      for (const name of Object.keys(CLAUDE_CODE_OFF_ENV)) expect([name, on[name]]).toEqual([name, 'true']);
+      const bare = workAgentEnv({ ...input, base, claudeCode });
+      for (const name of Object.keys(CLAUDE_CODE_OFF_ENV)) expect(bare).not.toHaveProperty(name);
+    }
+  });
+
   it('never sets a provider key variable name it does not know', () => {
-    const env = workAgentEnv({ base: {}, endpoint, agentHome: null, providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' } });
+    const env = workAgentEnv({
+      base: {},
+      endpoint,
+      agentHome: AGENT_HOME,
+      providerKeys: { PATH: 'evil', EXA_API_KEY: 'k' },
+    });
     expect(env.PATH).toBeUndefined();
     expect(env.EXA_API_KEY).toBe('k');
   });
@@ -242,12 +325,12 @@ describe('workAgentEnv', () => {
       const env = workAgentEnv({
         base: from,
         endpoint,
-        agentHome: null,
+        agentHome: AGENT_HOME,
         providerKeys: { FIRECRAWL_API_KEY: 'fc-key' },
       });
       expect([env.FIRECRAWL_API_KEY, env.FIRECRAWL_API_URL]).toEqual(['fc-key', 'https://api.firecrawl.dev']);
     }
-    const none = workAgentEnv({ base: inherited, endpoint, agentHome: null, providerKeys: {} });
+    const none = workAgentEnv({ base: inherited, endpoint, agentHome: AGENT_HOME, providerKeys: {} });
     expect(none.FIRECRAWL_API_URL).toBe('https://elsewhere.example');
     expect(none).not.toHaveProperty('FIRECRAWL_API_KEY');
   });
@@ -257,7 +340,11 @@ describe('session contract', () => {
   it('initialize pins clientType "generic" and advertises no fs or terminal', () => {
     expect(initializeParams('9.9.9')).toEqual({
       protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+      clientCapabilities: {
+        fs: { readTextFile: false, writeTextFile: false },
+        terminal: false,
+        _meta: { 'x.ai/incrementalBashOutput': true },
+      },
       _meta: {
         clientType: 'generic',
         clientIdentifier: 'mlx-node-desktop',
@@ -266,6 +353,20 @@ describe('session contract', () => {
       },
     });
     expect(AGENT_ARGS).toEqual(['--disable-web-search', 'agent', '--no-leader', 'stdio']);
+  });
+
+  it('turns on incremental shell output as the one capability flag; color, status line, echo and folder trust stay off', () => {
+    const caps = initializeParams('9.9.9').clientCapabilities as {
+      fs: unknown;
+      terminal: unknown;
+      _meta: Record<string, unknown>;
+    };
+    expect(caps._meta).toEqual({ 'x.ai/incrementalBashOutput': true });
+    for (const off of ['x.ai/bashOutputNoColor', 'x.ai/statusLine', 'x.ai/userMessageEcho', 'x.ai/folderTrust']) {
+      expect(caps._meta).not.toHaveProperty([off]);
+    }
+    expect(caps.fs).toEqual({ readTextFile: false, writeTextFile: false });
+    expect(caps.terminal).toBe(false);
   });
 
   it('the Chat session has a profile object, two tools, one plugin dir, and keys only as env values', () => {
@@ -277,6 +378,7 @@ describe('session contract', () => {
       prompt: 'P',
       pluginDir: '/r/plugins/chat-web',
       extraCaCerts: '/ca.pem',
+      ledgerFile: '/r/web-ledger/a.json',
     });
     expect(params).toEqual({
       cwd: '/r/chat-workspace',
@@ -290,6 +392,7 @@ describe('session contract', () => {
             { name: 'MLX_WEB_SEARCH_KEY', value: 'KEY-1' },
             { name: 'MLX_WEB_FETCH_PROVIDER', value: 'exa' },
             { name: 'MLX_WEB_FETCH_KEY', value: 'KEY-1' },
+            { name: 'MLX_WEB_LEDGER', value: '/r/web-ledger/a.json' },
             { name: 'NODE_NO_WARNINGS', value: '1' },
             { name: 'ELECTRON_RUN_AS_NODE', value: '1' },
             { name: 'NODE_EXTRA_CA_CERTS', value: '/ca.pem' },
@@ -303,7 +406,7 @@ describe('session contract', () => {
         askUserQuestion: false,
         agentProfile: {
           name: 'mlx-chat',
-          description: 'mlx-node Chat mode',
+          description: 'Portato Chat mode',
           promptMode: 'full',
           promptBody: 'P',
           tools: ['search_tool', 'use_tool'],
@@ -324,13 +427,14 @@ describe('session contract', () => {
       web: NO_WEB,
       prompt: 'P',
       pluginDir: '/p',
+      ledgerFile: '/l.json',
     });
     const servers = params.mcpServers as Array<{ env: Array<{ name: string; value: string }> }>;
     expect(servers).toHaveLength(1);
     expect(servers[0]!.env.slice(0, 4).map((e) => e.value)).toEqual(['none', '', 'none', '']);
   });
 
-  it('the Work session sends the rules, the guard and only the given plugin dirs, and no MCP server', () => {
+  it('the Work session sends the rules, the guard and only the given plugin dirs, and no MCP server; questions on', () => {
     expect(
       workSessionParams({ cwd: '/proj', modelId: 'm', guardDir: '/r/work-guard', pluginDirs: ['/r/plugins/exa'] }),
     ).toEqual({
@@ -341,7 +445,7 @@ describe('session contract', () => {
         rules: WORK_RULES,
         yoloMode: false,
         autoMode: false,
-        askUserQuestion: false,
+        askUserQuestion: true,
         pluginDirs: ['/r/work-guard', '/r/plugins/exa'],
       },
     });
@@ -435,9 +539,7 @@ describe('session contract', () => {
     expect(skillBody(skill)).toBe('# Web tools\n\nbody\n');
     expect(chatPrompt(skill)).toBe(`${CHAT_PROMPT_HEAD}\n\n# Web tools\n\nbody\n`);
     expect(
-      CHAT_PROMPT_HEAD.startsWith(
-        "You are the Chat assistant of mlx-node. You run on a local model on the user's Mac.",
-      ),
+      CHAT_PROMPT_HEAD.startsWith("You are the Chat assistant of Portato. You run on a local model on the user's Mac."),
     ).toBe(true);
   });
 
@@ -484,6 +586,8 @@ describe('session contract', () => {
       Electron_Run_As_Node: '1',
       exa_api_key: 'secret-exa',
       Firecrawl_Api_Key: 'secret-fc',
+      Grok_Auth_Path: 'C:\\Users\\dev\\.grok\\auth.json',
+      grok_config_path: 'C:\\Users\\dev\\.grok\\config.toml',
       KEEP_ME: 'yes',
     };
     const winEnv = workInherited(base, 'win32');

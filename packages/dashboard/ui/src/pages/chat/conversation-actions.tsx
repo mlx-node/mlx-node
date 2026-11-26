@@ -138,13 +138,14 @@ export function RenameDialog({ target, onOpenChange, onRenamed, returnFocus }: R
 
 /** The one delete confirmation of a conversation: at its button (ConfirmPopover) or from the palette (ConfirmDialog). */
 export function deleteContent(
-  item: { id: string; title: string; mode: ChatMode; folder: string | null },
+  item: { id: string; title: string; mode: ChatMode; folder: string | null; noFolder?: boolean },
   onDeleted: (id: string) => void,
 ): ConfirmContent {
   return {
     title: CHAT.deleteTitle,
     description: fill(CHAT.deleteText, { title: item.title }),
-    notice: item.mode === 'work' && item.folder !== null ? workDeleteNotice(item.folder) : undefined,
+    notice:
+      item.mode === 'work' && item.folder !== null ? workDeleteNotice(item.folder, item.noFolder === true) : undefined,
     confirmLabel: CHAT.deleteConfirm,
     workingLabel: CHAT.deleting,
     successLabel: CHAT.deleted,

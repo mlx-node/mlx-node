@@ -8,18 +8,29 @@
   overflow-wrap: anywhere;
 }
 
-.p,
+/* markstream's wrappers take no box: the blocks are the grid's items, as our own markup was. */
+.root :global(.markdown-renderer),
+.root :global(.node-slot),
+.root :global(.node-content) {
+  display: contents;
+}
+
+.root :global(.paragraph-node),
 .list,
 .quote,
 .rule {
   margin: 0;
 }
 
-.p {
+/* Its text spans ask for pre-wrap; a soft line break inside a paragraph reads as a space. */
+.root :global(.paragraph-node),
+.root :global(.text-node) {
   white-space: normal;
 }
 
-.plain {
+.plain,
+.source {
+  margin: 0;
   white-space: pre-wrap;
 }
 
@@ -62,8 +73,8 @@
   color: var(--text-secondary);
 }
 
-.item > :is(.p, .list, .quote, .block, .tableWrap) + :is(.p, .list, .quote, .block, .tableWrap) {
-  margin-top: var(--space-1-5);
+.item > * + * {
+  margin-top: var(--space-1);
 }
 
 .quote {
@@ -87,14 +98,23 @@
 
 .table {
   border-collapse: collapse;
-  font-variant-numeric: tabular-nums;
 }
 
+/*
+ * Not `anywhere`, not even on code or links: under it a column's narrowest width is one letter, and the table breaks
+ * words that fit. A token wider than the text scrolls the table inside .tableWrap.
+ */
 .table :is(th, td) {
-  padding: var(--space-1) var(--space-2-5);
+  padding: var(--space-2) var(--space-2-5);
   box-shadow: inset 0 -1px 0 var(--border-subtle);
+  overflow-wrap: break-word;
   text-align: start;
   vertical-align: top;
+}
+
+/* Inter's tnum also widens the hyphen, space, comma, period and brackets, so prose cells never take it. */
+.table .figures {
+  font-variant-numeric: tabular-nums;
 }
 
 .table th {
@@ -126,7 +146,8 @@
   min-width: 0;
 }
 
-.fresh {
+/* Words that just arrived. A span settles into the text only on animationend, so it always runs an animation. */
+.root :global(.text-node-stream-delta) {
   animation: chat-markdown-chunk var(--duration-fast) var(--ease-standard) both;
 }
 
@@ -139,8 +160,18 @@
   }
 }
 
+/* No fade, but still an animation: the span settles on its animationend. */
+@keyframes chat-markdown-settle {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 @media (prefers-reduced-motion: reduce) {
-  .fresh {
-    animation: none;
+  .root :global(.text-node-stream-delta) {
+    animation-name: chat-markdown-settle;
   }
 }

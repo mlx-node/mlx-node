@@ -3,6 +3,7 @@ import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, win32 } from 'node:path';
 
+import { APP_NAME } from '../src/app-name.js';
 import { createCliLauncher } from '../src/cli-launcher.js';
 
 function hasDigits(value: string): boolean {
@@ -250,7 +251,7 @@ export async function verifyBundledCli(appPath: string): Promise<void> {
   const home = await mkdtemp(join(tmpdir(), 'mlx-cli-package-check-'));
   const resources = join(appPath, 'Contents', 'Resources');
   try {
-    const executable = join(appPath, 'Contents', 'MacOS', 'mlx-node');
+    const executable = join(appPath, 'Contents', 'MacOS', APP_NAME);
     const launcher = createCliLauncher(
       {
         executable,
@@ -264,7 +265,7 @@ export async function verifyBundledCli(appPath: string): Promise<void> {
     // --version enters the full agent runtime before exiting, so missing lazy
     // dependencies and native runtime incompatibilities cannot hide behind help.
     const version = execFileSync(path, ['agent', '--version'], {
-      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, GROK_HOME: join(home, 'agent') },
+      env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', HOME: home, MLX_AGENT_HOME: join(home, 'agent') },
       encoding: 'utf8',
       timeout: 30_000,
       maxBuffer: 256 * 1024,

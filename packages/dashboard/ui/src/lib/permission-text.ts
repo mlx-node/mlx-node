@@ -93,7 +93,24 @@ export function autoAskText(
 }
 
 export type AllowedMark = Extract<PermissionMark, { kind: 'allowed' }>;
-export type LineMark = Exclude<PermissionMark, { kind: 'allowed' }>;
+export type DeniedMark = Extract<PermissionMark, { kind: 'denied' }>;
+export type LineMark = Exclude<PermissionMark, { kind: 'allowed' | 'denied' | 'rewind' | 'mcp' }>;
+
+export type RewindMark = Extract<PermissionMark, { kind: 'rewind' }>;
+export type McpMark = Extract<PermissionMark, { kind: 'mcp' }>;
+
+/**
+ * An MCP line: "github asked for input" and how it ended ("sent", "declined", "closed with no answer"; a link's accept
+ * "opened"), or "github" and "finished in the browser" once the server says a page opened from a link is done.
+ */
+export function mcpLine(mark: McpMark): { label: string; outcome: string } {
+  const words = CHAT.mcp.line;
+  if (mark.outcome === 'completed') return { label: mark.server, outcome: words.completed };
+  return {
+    label: fill(mark.mode === 'url' ? words.link : words.form, { server: mark.server }),
+    outcome: mark.mode === 'url' && mark.outcome === 'accept' ? words.opened : words[mark.outcome],
+  };
+}
 
 const ORDER: Record<PermissionMode, number> = { ask: 0, auto: 1, bypass: 2 };
 
@@ -248,8 +265,8 @@ export function cardDescription(
   return shown;
 }
 
-/** What an allowed call did, in one line: the first line of its command or path, else what kind of call it was. */
-export function allowedSummary(mark: AllowedMark): string {
+/** What an allowed or denied call was, in one line: the first line of its command or path, else what kind of call. */
+export function allowedSummary(mark: AllowedMark | DeniedMark): string {
   const p = CHAT.permission;
   const fallback = mark.access === 'bash' ? p.allowedCommand : mark.access === 'edit' ? p.allowedEdit : p.allowedTool;
   const text = mark.card === null ? null : (mark.card.command ?? mark.card.path);
@@ -259,6 +276,44 @@ export function allowedSummary(mark: AllowedMark): string {
   return first === '' ? fallback : first;
 }
 
+/** The fact of a subagent row with allowed calls: "14 commands allowed", "1 file edit allowed", "3 calls allowed". */
+export function subagentAllowedText(marks: readonly AllowedMark[]): string {
+  const p = CHAT.permission;
+  let kind: 'bash' | 'edit' | 'tool' | 'mixed' | null = null;
+  for (const mark of marks) {
+    const own = mark.access === 'bash' || mark.access === 'edit' ? mark.access : 'tool';
+    kind = kind === null || kind === own ? own : 'mixed';
+  }
+  if (kind === null) kind = 'mixed';
+  if (marks.length === 1 && kind !== 'mixed') return p.subagentAllowedOne[kind];
+  return fill(p.subagentAllowed[kind], { n: marks.length });
+}
+
+/** The word on a denied call's row: "Denied · note sent", or the never-allow rule that denied it. */
+export function deniedWord(mark: DeniedMark): string {
+  if (mark.by === 'note') return CHAT.permission.deniedNote;
+  const words = mark.words ?? null;
+  return words === null ? CHAT.never.rowGone : fill(CHAT.never.row, { words: oneLine(words) });
+}
+
+/** The host's note to the agent for a call a never-allow rule denied (`never-rules.ts` `neverNote`), around its words. */
+export const NEVER_NOTE_HEAD = 'I never allow commands that start with `';
+export const NEVER_NOTE_TAIL =
+  '` in this folder. Do not run it, and do not get the same result another way. Go on with the rest of the task, or stop and say what is blocked.';
+
+/** The rule's words when a note row is the app's never-allow note, else null. */
+export function neverNoteWords(text: string): string | null {
+  if (text.length <= NEVER_NOTE_HEAD.length + NEVER_NOTE_TAIL.length) return null;
+  if (!text.startsWith(NEVER_NOTE_HEAD) || !text.endsWith(NEVER_NOTE_TAIL)) return null;
+  return text.slice(NEVER_NOTE_HEAD.length, text.length - NEVER_NOTE_TAIL.length);
+}
+
+/** The fact of a subagent row with calls denied with a note: "1 call denied", "3 calls denied". */
+export function subagentDeniedText(count: number): string {
+  const p = CHAT.permission;
+  return count === 1 ? p.subagentDeniedOne : fill(p.subagentDenied, { n: count });
+}
+
 export interface PlacedMarks {
   /** Lines drawn before the entry at that index. */
   before: Map<number, PermissionMark[]>;
@@ -266,29 +321,79 @@ export interface PlacedMarks {
   end: PermissionMark[];
   /** The allowed mark of a tool row, by its tool call id. */
   allowed: Map<string, AllowedMark>;
+  /** The allowed calls of a helper whose `subagent` entry is in the thread, by its `childId`, oldest first. */
+  bySubagent: Map<string, AllowedMark[]>;
+  /** The mark of a tool row denied with a note, by its tool call id. */
+  denied: Map<string, DeniedMark>;
+  /** The calls of a helper denied with a note, by the `childId` of its entry in the thread, oldest first. */
+  deniedBySubagent: Map<string, DeniedMark[]>;
+}
+
+/** "1 file", "3 files": a count of files in a rewind's words. */
+export function filesWord(n: number): string {
+  return n === 1 ? CHAT.history.oneFile : fill(CHAT.history.nFiles, { n });
+}
+
+/** The words of a rewind's rule: what it put back, by its mode and its count of files. */
+export function rewindRule(mark: RewindMark): string {
+  const h = CHAT.history;
+  if (mark.mode === 'files') return fill(h.ruleFilesOnly, { files: filesWord(mark.files) });
+  return mark.files > 0 ? fill(h.ruleFiles, { files: filesWord(mark.files) }) : h.rule;
 }
 
 /**
- * Where each mark goes. An allowed call whose tool row is in the thread marks that row; every other mark is a line
- * before the first entry that is later than it, else after the last entry.
+ * Where each mark goes. A helper's allowed or denied call goes to its `subagent` entry; another allowed or denied
+ * call whose tool row is in the thread marks that row; an allowed or denied mark with no row, or an MCP line, inside a
+ * span a rewind removed (`[from, at)`) is not drawn: its call was rewound away. Every other mark (a helper's call with no entry here
+ * too, a rewind's rule) is a line before the first entry that is later than it, else after the last entry.
  */
 export function placeMarks(entries: readonly TranscriptEntry[], marks: readonly PermissionMark[]): PlacedMarks {
+  const spans: Array<[number, number]> = [];
+  for (const mark of marks) if (mark.kind === 'rewind' && mark.from !== undefined) spans.push([mark.from, mark.at]);
+  const rewound = (at: number): boolean => spans.some(([from, to]) => at >= from && at < to);
   const rows = new Set<string>();
+  const children = new Set<string>();
   // Running maximum of the entry times: the first entry later than a time is where this maximum first passes it.
   const top: number[] = [];
   let max = Number.NEGATIVE_INFINITY;
   for (const entry of entries) {
     if (entry.kind === 'tool') rows.add(entry.id);
+    else if (entry.kind === 'subagent') children.add(entry.childId);
     const ts = entry.ts ?? 0;
     if (ts > max) max = ts;
     top.push(max);
   }
-  const placed: PlacedMarks = { before: new Map(), end: [], allowed: new Map() };
+  const placed: PlacedMarks = {
+    before: new Map(),
+    end: [],
+    allowed: new Map(),
+    bySubagent: new Map(),
+    denied: new Map(),
+    deniedBySubagent: new Map(),
+  };
   for (const mark of marks) {
-    if (mark.kind === 'allowed' && rows.has(mark.toolCallId)) {
+    if (mark.kind === 'allowed' && mark.child !== undefined && children.has(mark.child)) {
+      const list = placed.bySubagent.get(mark.child);
+      if (list === undefined) placed.bySubagent.set(mark.child, [mark]);
+      else list.push(mark);
+      continue;
+    }
+    if (mark.kind === 'denied' && mark.child !== undefined && children.has(mark.child)) {
+      const list = placed.deniedBySubagent.get(mark.child);
+      if (list === undefined) placed.deniedBySubagent.set(mark.child, [mark]);
+      else list.push(mark);
+      continue;
+    }
+    // A helper's tool call id can equal one of the session's own: only the session's own calls mark its rows.
+    if (mark.kind === 'allowed' && mark.child === undefined && rows.has(mark.toolCallId)) {
       placed.allowed.set(mark.toolCallId, mark);
       continue;
     }
+    if (mark.kind === 'denied' && mark.child === undefined && rows.has(mark.toolCallId)) {
+      placed.denied.set(mark.toolCallId, mark);
+      continue;
+    }
+    if ((mark.kind === 'allowed' || mark.kind === 'denied' || mark.kind === 'mcp') && rewound(mark.at)) continue;
     let lo = 0;
     let hi = top.length;
     while (lo < hi) {

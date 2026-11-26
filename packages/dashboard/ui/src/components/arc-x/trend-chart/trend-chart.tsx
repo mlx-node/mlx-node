@@ -20,7 +20,7 @@ import { useRichMotion } from '../motion/use-entrance';
 import styles from './trend-chart.module.css';
 
 export interface TrendChartProps {
-  /** Accessible name, e.g. "Decode speed over time". */
+  /** Accessible name: the measure from `METRIC` and "over time". */
   label: string;
   /** "tok/s" */
   unit: string;

@@ -1,0 +1,57 @@
+.root {
+  display: grid;
+  min-width: 0;
+}
+
+/* The composer stays above the strip, whose top runs under the composer's rounded bottom corners. */
+.card {
+  position: relative;
+  z-index: 1;
+  min-width: 0;
+}
+
+/* Clips the strip's bottom while its height changes, and leaves room above for the part under the corners. */
+.clip {
+  min-width: 0;
+  clip-path: inset(calc(-1 * var(--radius-surface)) -1px 0 -1px);
+}
+
+.tray {
+  position: relative;
+  box-sizing: border-box;
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+  border: 1px solid var(--border-subtle);
+  border-top: 0;
+  border-radius: 0 0 var(--radius-surface) var(--radius-surface);
+  padding: var(--space-1-5) var(--space-2) var(--space-2);
+  background: var(--surface-muted);
+}
+
+.tray::before {
+  position: absolute;
+  bottom: 100%;
+  inset-inline: -1px;
+  height: var(--radius-surface);
+  border: 1px solid var(--border-subtle);
+  border-block: 0;
+  background: var(--surface-muted);
+  content: '';
+}
+
+/* A narrow row never wraps: the branch chip gives way first, down to its floor, then the folder chip. */
+.tray > [data-tray-part] {
+  min-width: 0;
+}
+
+.tray > [data-tray-part='folder'] {
+  flex: 0 1 auto;
+  min-width: 6rem;
+}
+
+.tray > [data-tray-part='branch'] {
+  flex: 0 1000 auto;
+  min-width: 5rem;
+}

@@ -11,6 +11,7 @@ import {
   type ConversationItem,
   type ConversationListProps,
 } from '../ui/src/components/arc-x/conversation-list/conversation-list.js';
+import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { groupByDay } from '../ui/src/lib/conversations.js';
 import { mount, rerender, unmountAll } from './helpers/mount.js';
 import { allByRole, byRole } from './render.js';
@@ -67,7 +68,7 @@ describe('relativeTime', () => {
 });
 
 describe('ConversationList', () => {
-  it('groups with labelled lists, live dots, the current row and a two-line Work row', () => {
+  it('groups with labelled lists, live dots, the current row; a Work row names its folder only with showFolder', () => {
     const container = mount(list());
     expect(byRole(container, 'navigation', 'Chats')).not.toBeNull();
     expect(byRole(container, 'list', 'Today')).not.toBeNull();
@@ -75,8 +76,10 @@ describe('ConversationList', () => {
     expect(container.querySelector('[aria-label="Running"]')).not.toBeNull();
     expect(container.querySelector('[aria-label="Waiting for you"]')).not.toBeNull();
     expect(container.querySelector('[aria-current="page"]')?.textContent).toContain('Fix the build');
-    expect(container.querySelector('[data-two-line]')?.textContent).toContain('app');
+    expect(container.querySelector('[data-two-line]')).toBeNull();
     expect(container.textContent).not.toContain('Work');
+    rerender(list({ showFolder: true }));
+    expect(container.querySelector('[data-two-line]')?.textContent).toContain('app');
   });
 
   it('one tab stop on the current row; arrows, Home and End move it', () => {
@@ -140,5 +143,53 @@ describe('ConversationList', () => {
     rerender(list({ groups: [], empty: createElement('p', null, 'No chats yet') }));
     expect(container.textContent).toContain('No chats yet');
     expect(allByRole(container, 'link')).toHaveLength(0);
+  });
+});
+
+describe('ConversationList: open requests', () => {
+  const at = (container: HTMLElement, id: string): HTMLElement =>
+    container.querySelector<HTMLElement>(`a[data-conversation-row="${id}"]`)!.closest('li')!;
+
+  it('a count badge takes the time slot and its words are in the row link; none at 0', () => {
+    const items: ConversationItem[] = [
+      { ...ITEMS[1]!, asks: 2 },
+      { ...ITEMS[0]!, id: 'one', state: 'waiting', asks: 1 },
+      { ...ITEMS[2]!, asks: 0 },
+    ];
+    const container = mount(list({ groups: groupByDay(items, NOW) }));
+    const two = at(container, 'b');
+    const badge = two.querySelector('[data-asks]')!;
+    expect(badge.textContent).toBe('2');
+    expect(badge.getAttribute('aria-hidden')).toBe('true');
+    expect(two.querySelector('[class*="time"]')?.textContent).toBe('2');
+    expect(two.querySelector('a')!.textContent).toContain(fill(CHAT.needs.listBadge, { n: 2 }));
+    expect(two.querySelector('[aria-label="Waiting for you"]')).not.toBeNull();
+    expect(at(container, 'one').querySelector('a')!.textContent).toContain(CHAT.needs.listBadgeOne);
+    const idle = at(container, 'c');
+    expect(idle.querySelector('[data-asks]')).toBeNull();
+    expect(idle.querySelector('[class*="time"]')?.textContent).toBe(new Date(2026, 5, 3).toLocaleDateString());
+  });
+});
+
+describe('ConversationList: forks', () => {
+  const at = (container: HTMLElement, id: string): HTMLElement =>
+    container.querySelector<HTMLElement>(`a[data-conversation-row="${id}"]`)!.closest('li')!;
+
+  // Mutation: draw the tag only when `showMode` is on → a fork row reads like its original.
+  it('a fork has an outline Fork tag after its title, read in the row link; the dot column holds only the state dot', () => {
+    const items: ConversationItem[] = [
+      { ...ITEMS[1]!, fork: true },
+      { ...ITEMS[1]!, id: 'orig' },
+    ];
+    const container = mount(list({ groups: groupByDay(items, NOW) }));
+    const copy = at(container, 'b');
+    const tag = copy.querySelector('[data-fork]')!;
+    expect(tag.textContent).toBe(CHAT.history.forkTag);
+    expect(copy.querySelector('a')!.textContent).toBe(`${ITEMS[1]!.title}${CHAT.history.forkTag}`);
+    expect(copy.querySelector('[class*="dot"]')!.children).toHaveLength(1);
+    expect(copy.querySelector('a svg')).toBeNull();
+    const original = at(container, 'orig');
+    expect(original.querySelector('[data-fork]')).toBeNull();
+    expect(original.querySelector('[class*="dot"]')!.innerHTML).toBe(copy.querySelector('[class*="dot"]')!.innerHTML);
   });
 });

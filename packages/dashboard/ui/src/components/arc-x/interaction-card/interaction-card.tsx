@@ -34,12 +34,16 @@ export interface InteractionCardProps {
   warnings?: readonly string[];
   /** Buttons in tab order. */
   actions: ReactNode;
-  /** Small lines under the actions. */
+  /** Small lines under the actions, read with the card's description. */
   notes?: readonly string[];
   busy?: boolean;
   warningIcon?: ReactNode;
   /** A neutral first line of the warning list: why this request asks although a rule could have allowed it. */
   reason?: { icon: ReactNode; text: string };
+  /** The request's id, for the page to find this card (a card that leaves stays in the page while it closes). */
+  askId?: string;
+  /** Keys pressed anywhere in the card (a question card's number keys). */
+  onKeyDown?: (event: KeyboardEvent<HTMLElement>) => void;
 }
 
 const INSTANT = { duration: 0 } as const;
@@ -51,12 +55,16 @@ export const InteractionCard = forwardRef<HTMLElement, InteractionCardProps>(
     const titleId = useId();
     const metaId = useId();
     const warningsId = useId();
+    const notesId = useId();
     const hasMeta = props.metaText !== undefined && props.metaText !== '';
     const hasWarnings = (props.warnings !== undefined && props.warnings.length > 0) || props.reason !== undefined;
+    const notes = props.notes ?? [];
+    const hasNotes = notes.length > 0;
     const described = [
       ...(props.describedBy ?? []),
       ...(hasWarnings ? [warningsId] : []),
       ...(hasMeta ? [metaId] : []),
+      ...(hasNotes ? [notesId] : []),
     ].join(' ');
     return (
       <motion.div
@@ -73,7 +81,9 @@ export const InteractionCard = forwardRef<HTMLElement, InteractionCardProps>(
           aria-labelledby={titleId}
           aria-describedby={described === '' ? undefined : described}
           data-interaction-card=""
+          data-ask-id={props.askId}
           aria-busy={props.busy === true ? true : undefined}
+          onKeyDown={props.onKeyDown}
         >
           <div className={styles.top}>
             <div className={styles.head}>
@@ -127,9 +137,9 @@ export const InteractionCard = forwardRef<HTMLElement, InteractionCardProps>(
           ) : null}
           <div className={styles.foot}>
             <div className={styles.actions}>{props.actions}</div>
-            {props.notes !== undefined && props.notes.length > 0 ? (
-              <div className={styles.notes}>
-                {props.notes.map((note) => (
+            {hasNotes ? (
+              <div id={notesId} className={styles.notes}>
+                {notes.map((note) => (
                   <p key={note} className={styles.note}>
                     {note}
                   </p>
@@ -308,10 +318,24 @@ export function CardTextField(props: {
   maxLength?: number;
   /** "{n} of {max} characters", shown under the field when `maxLength` is set. */
   countText?: string;
+  /** Ids of more lines that describe the field (a hint, a reason). */
+  describedBy?: string;
+  /** While what was typed is being sent. */
+  readOnly?: boolean;
   onEscape?: () => void;
+  /** Cmd+Enter (Ctrl+Enter): send. Enter alone is a new line. */
+  onSubmit?: () => void;
 }): ReactElement {
   const countId = useId();
+  const described = [props.countText !== undefined ? countId : '', props.describedBy ?? '']
+    .filter((id) => id !== '')
+    .join(' ');
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
+    if (event.key === 'Enter' && (event.metaKey || event.ctrlKey) && props.onSubmit !== undefined) {
+      event.preventDefault();
+      props.onSubmit();
+      return;
+    }
     if (event.key !== 'Escape' || props.onEscape === undefined) return;
     event.preventDefault();
     event.stopPropagation();
@@ -325,7 +349,8 @@ export function CardTextField(props: {
         rows={3}
         value={props.value}
         maxLength={props.maxLength}
-        aria-describedby={props.countText !== undefined ? countId : undefined}
+        readOnly={props.readOnly}
+        aria-describedby={described === '' ? undefined : described}
         onChange={(event) => props.onChange(event.target.value)}
         onKeyDown={onKeyDown}
         className={styles.field}

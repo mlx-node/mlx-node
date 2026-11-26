@@ -69,13 +69,13 @@ export function versionFromTag(tag: string): string {
  * name disagrees with its contents.
  */
 export function dmgFileName(version: string): string {
-  return `mlx-node-${assertSemver('version', version)}-arm64.dmg`;
+  return `Portato-${assertSemver('version', version)}-arm64.dmg`;
 }
 
 /** The inverse of {@link dmgFileName}. `null` when the name is not one of ours. */
 export function versionFromDmgPath(path: string): string | null {
   const base = artifactBaseName(path);
-  const match = /^mlx-node-(.+)-arm64\.dmg$/.exec(base);
+  const match = /^Portato-(.+)-arm64\.dmg$/.exec(base);
   if (match === null) return null;
   return SEMVER.test(match[1]) ? match[1] : null;
 }
@@ -92,21 +92,21 @@ export function versionFromUpdateZipPath(path: string): string | null {
 
 /** Unsigned portable Windows installation archive. */
 export function windowsZipFileName(version: string): string {
-  return `mlx-node-${assertSemver('version', version)}-win32-arm64.zip`;
+  return `Portato-${assertSemver('version', version)}-win32-arm64.zip`;
 }
 
 export function versionFromWindowsZipPath(path: string): string | null {
-  const match = /^mlx-node-(.+)-win32-arm64\.zip$/.exec(artifactBaseName(path));
+  const match = /^Portato-(.+)-win32-arm64\.zip$/.exec(artifactBaseName(path));
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
 }
 
 /** Unsigned Windows ARM64 MSIX package for Microsoft Store submission. */
 export function windowsMsixFileName(version: string): string {
-  return `mlx-node-${assertSemver('version', version)}-win32-arm64.msix`;
+  return `Portato-${assertSemver('version', version)}-win32-arm64.msix`;
 }
 
 export function versionFromWindowsMsixPath(path: string): string | null {
-  const match = /^mlx-node-(.+)-win32-arm64\.msix$/.exec(artifactBaseName(path));
+  const match = /^Portato-(.+)-win32-arm64\.msix$/.exec(artifactBaseName(path));
   return match !== null && SEMVER.test(match[1]) ? match[1] : null;
 }
 

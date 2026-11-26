@@ -5,7 +5,7 @@
  *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21
  *   yarn workspace @mlx-node/desktop package:windows --app-version 0.0.21 --skip-msix
  *
- * The ZIP contains mlx-node-win32-arm64/mlx-node.exe, the staged JS closure,
+ * The ZIP contains Portato-win32-arm64/mlx-node.exe, the staged JS closure,
  * the addon, every CUDA/cuDNN/OpenBLAS runtime DLL, and the NVRTC headers.
  *
  * Authenticode signing happens between two phases, so the binaries are signed
@@ -50,7 +50,7 @@ const REPO_ROOT = resolve(APP_DIR, '..', '..');
 const OUT = join(APP_DIR, 'out');
 const STAGE = join(OUT, '.windows-stage');
 const STAGE_APP = join(STAGE, 'app');
-const PRODUCT_NAME = 'mlx-node';
+const WINDOWS_EXECUTABLE = 'mlx-node';
 const TAR = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'tar.exe');
 const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', '@mlx-node/cli', 'electron-updater'];
 
@@ -181,7 +181,7 @@ async function packageApp(appVersion: string): Promise<string> {
     platform: 'win32',
     arch: 'arm64',
     appVersion,
-    executableName: PRODUCT_NAME,
+    executableName: WINDOWS_EXECUTABLE,
     icon: iconPath,
     overwrite: true,
     asar: false,
@@ -246,7 +246,7 @@ async function main(): Promise<void> {
   const tempHome = mkdtempSync(join(tmpdir(), 'mlx-windows-runtime-check-'));
   try {
     verifyPackagedNativeRuntime({
-      executable: join(appPath, 'mlx-node.exe'),
+      executable: join(appPath, `${WINDOWS_EXECUTABLE}.exe`),
       appDir: join(appPath, 'resources', 'app'),
       home: tempHome,
       platform: 'win32',

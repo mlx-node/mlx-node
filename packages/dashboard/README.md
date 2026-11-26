@@ -1,7 +1,7 @@
 # @mlx-node/dashboard
 
-The mlx-node Control Panel UI: Chat and Work with a local model, local models, agent sessions,
-inference metrics, web search providers, and the paged-attention cold cache. Rendered inside the mlx-node desktop app — there is
+The Portato Control Panel UI: Chat and Work with a local model, local models, agent sessions,
+inference metrics, web search providers, and the paged-attention cold cache. Rendered inside Portato, the desktop app — there is
 no server and no port.
 
 ## Requirements
@@ -12,7 +12,7 @@ no server and no port.
 
 ## Usage
 
-Not started on its own. The desktop app creates the runtime, serves the built SPA
+Not started on its own. Portato creates the runtime, serves the built SPA
 over its `app://` scheme, and hands the page one end of a `MessageChannel`; the SPA
 calls `connectDashboardApi(port)` and every API call rides it.
 

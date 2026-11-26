@@ -1,10 +1,10 @@
 import type { ReactElement, ReactNode } from 'react';
 
 import { Badge, type BadgeTone } from '../../components/arc/badge/badge';
-import { pickProcess } from '../../lib/engine-view';
+import { HOST_WORD, pickProcess } from '../../lib/engine-view';
 import { formatDuration, formatNumber } from '../../lib/format';
 import { useRuntimeLive } from '../../lib/live';
-import type { CacheScope, HostKind, RuntimeLive, RuntimeProcessLive } from '../../lib/types';
+import type { CacheScope, RuntimeLive, RuntimeProcessLive } from '../../lib/types';
 
 /** `WHOLE_PROMPT_CAPTURE_BLOCKS` of the server: a cap this high never ends a capture walk before the prompt does. */
 export const WHOLE_PROMPT_CAPTURE_BLOCKS = 63_125;
@@ -35,13 +35,6 @@ const SWITCH: Record<DiskCacheSwitch, { word: string; tone: BadgeTone; note: str
   off: { word: 'Off', tone: 'warning', note: null },
   unknown: { word: 'Unknown', tone: 'neutral', note: 'engine started before this field' },
   'no-engine': { word: 'No engine', tone: 'neutral', note: 'inference is not running' },
-};
-
-export const HOST_WORD: Record<HostKind, string> = {
-  desktop: 'desktop',
-  serve: 'mlx serve',
-  launch: 'mlx launch',
-  embedded: 'embedded',
 };
 
 /** Which engine the line reads, when more than one runs: their switches can differ. */

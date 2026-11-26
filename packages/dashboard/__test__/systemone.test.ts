@@ -133,7 +133,8 @@ function liveWithModels(pid: number, residentNames: string[]): { readNow(): Prom
           coldCapture: null,
           health: 'ok',
           mem: { active: 0, peak: 0, cache: 0, wiredLimit: 0, rss: 0 },
-          decodeTps: null,
+          work: { ms: { loading: 0, waiting: 0, prepare: 0, prefill: 0, decode: 0, running: 0 } },
+          rates: { windowMs: 10_000, outputTps: null, prefillTps: null },
           loading: [],
           counters: { ok: 0, error: 0, cancelled: 0, outputTokens: 0, loads: 0, rejected: 0 },
           models: residentNames.map((name) => ({

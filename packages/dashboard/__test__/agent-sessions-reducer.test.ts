@@ -16,11 +16,13 @@ import {
   splitCompleteLines,
   TranscriptReducer,
   WAKE_PROMPT_ID,
+  wakeCause,
   type UpdateLine,
 } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js';
 import { liveFilter } from '../src/chat/agent/live-filter.js';
 import type { TranscriptOp } from '../src/chat/types.js';
+import { splitTurns } from '../ui/src/lib/chat-turns.js';
 
 const FIXTURES = fileURLToPath(new URL('./fixtures/', import.meta.url));
 const RECORDED = join(FIXTURES, 'chat-scenarios/recorded');
@@ -502,15 +504,19 @@ describe('wake rows: the host line and the agent prompt', () => {
     revision: 5,
   };
   const wakes = (r: TranscriptReducer) => r.snapshot().entries.filter((e) => e.kind === 'wake');
+  const WOKEN = {
+    runId: 'wf_1',
+    revision: 5,
+    name: 'deep-research',
+    snapshot: { status: 'complete', agentsUsed: 0, agentBudget: null, agentsFailed: 0, elapsedMs: 0 },
+  };
 
   // Mutation: read no `mlxWakePromptId` in the hidden-chunk case → cause 'unknown' until turn_completed.
   it("the host line's prompt id names the run at once", () => {
     const r = new TranscriptReducer({ now: () => 5 });
     r.apply(xai(RUN));
     r.apply(hidden('', { [WAKE_PROMPT_ID]: 'workflow-completed-wf_1-5' }));
-    expect(wakes(r)).toEqual([
-      { kind: 'wake', ts: 5, cause: 'workflow', workflow: { name: 'deep-research', status: 'complete' }, text: '' },
-    ]);
+    expect(wakes(r)).toEqual([{ kind: 'wake', ts: 5, cause: 'workflow', workflow: WOKEN, text: '' }]);
   });
 
   // Mutation: drop the merge into the host's empty row → two wake rows.
@@ -525,7 +531,7 @@ describe('wake rows: the host line and the agent prompt', () => {
         kind: 'wake',
         ts: 5,
         cause: 'workflow',
-        workflow: { name: 'deep-research', status: 'complete' },
+        workflow: WOKEN,
         text: 'A workflow finished.\nRead its report.',
       },
     ]);
@@ -533,5 +539,1016 @@ describe('wake rows: the host line and the agent prompt', () => {
     r.apply(hidden('', {}));
     r.apply(hidden('A task finished.', { promptIndex: 2 }));
     expect(wakes(r).map((e) => e.text)).toEqual(['A workflow finished.\nRead its report.', 'A task finished.']);
+  });
+});
+
+describe('wake cause (H-b): what ended names the wake row', () => {
+  const plain = (update: Json, meta?: Json): UpdateLine => ({ xai: false, update, meta });
+  const xai = (update: Json): UpdateLine => ({ xai: true, update, meta: undefined });
+  /** A command (or a monitor) the model started in the background, as the agent sends it (fake-agent `backgroundStep`). */
+  const started = (n: number, label: string, monitor = false): UpdateLine[] => [
+    plain({
+      sessionUpdate: 'tool_call',
+      toolCallId: `call-${n}`,
+      title: monitor ? 'monitor' : 'run_terminal_command',
+      rawInput: { command: `cmd-${n}`, description: label, ...(monitor ? {} : { is_background: true }) },
+    }),
+    xai({
+      sessionUpdate: 'task_backgrounded',
+      tool_call_id: `call-${n}`,
+      task_id: `task-${n}`,
+      command: `cmd-${n}`,
+      ...(monitor ? { monitor_description: label } : { description: label }),
+    }),
+    plain({ sessionUpdate: 'tool_call_update', toolCallId: `call-${n}`, status: 'completed' }),
+  ];
+  /** grok `TaskCompleted { task_snapshot, will_wake }`. */
+  const ended = (n: number, willWake: boolean, snapshot: Json = {}): UpdateLine =>
+    xai({
+      sessionUpdate: 'task_completed',
+      task_snapshot: {
+        task_id: `task-${n}`,
+        command: `cmd-${n}`,
+        kind: 'bash',
+        completed: true,
+        block_waited: false,
+        explicitly_killed: false,
+        kill_result_delivered: false,
+        ...snapshot,
+      },
+      will_wake: willWake,
+    });
+  const typed = (index: number, text: string): UpdateLine =>
+    plain({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text }, _meta: { promptIndex: index } });
+  const end = (promptId: string): UpdateLine =>
+    xai({ sessionUpdate: 'turn_completed', prompt_id: promptId, stop_reason: 'end_turn' });
+  /** The host's empty wake line (live only), with the id it expects for the wake. */
+  const hostLine = (promptId: string | null): UpdateLine =>
+    plain({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: '' },
+      _meta: { hideFromScrollback: true, ...(promptId === null ? {} : { [WAKE_PROMPT_ID]: promptId }) },
+    });
+  /** The agent's own wake prompt: stored, never sent live. */
+  const agentPrompt = (index: number): UpdateLine =>
+    plain({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: 'A background task finished.' },
+      _meta: { hideFromScrollback: true, promptIndex: index },
+    });
+  const answer = plain({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Done.' } });
+  const wakes = (entries: readonly TranscriptEntry[]) =>
+    entries.flatMap((e) => (e.kind === 'wake' ? [{ ...e, text: '' }] : []));
+  const stored = (lines: readonly UpdateLine[]): TranscriptEntry[] =>
+    parseUpdates(
+      lines
+        .map((l) =>
+          JSON.stringify({
+            method: l.xai ? '_x.ai/session/update' : 'session/update',
+            params: { sessionId: 's', update: l.update, ...(l.meta === undefined ? {} : { _meta: l.meta }) },
+          }),
+        )
+        .join('\n') + '\n',
+    ).transcript;
+
+  it('every prefix of the table; monitor-completed- is a task, not a monitor report', () => {
+    expect(wakeCause('task-completed-t1')).toBe('task');
+    expect(wakeCause('bash-completed-t1')).toBe('task');
+    expect(wakeCause('monitor-completed-t1')).toBe('task');
+    expect(wakeCause('monitor-t1-0193f1e2')).toBe('notifications');
+    expect(wakeCause('monitor-user-start-drain-0193f1e2')).toBe('notifications');
+    expect(wakeCause('notifications-0193f1e2')).toBe('notifications');
+    expect(wakeCause('plan-resume-1764000000000')).toBe('unknown');
+  });
+
+  // Mutation: drop the 'task' branch of applyWake → no `task` on the row.
+  it('a task-completed- wake names the command, or the monitor, from its first line; live and disk agree', () => {
+    for (const monitor of [false, true]) {
+      const before = [typed(0, 'start it'), ...started(1, 'Start the dev server', monitor), end('p0')];
+      const kind = monitor ? 'monitor' : 'command';
+      const r = new TranscriptReducer({ now: () => 7 });
+      const ops: TranscriptOp[] = [];
+      for (const line of [
+        ...before,
+        ended(1, true, { kind: monitor ? 'monitor' : 'bash' }),
+        hostLine('task-completed-task-1'),
+      ])
+        ops.push(...r.apply(line));
+      const task = { id: 'task-1', kind, label: 'Start the dev server' };
+      expect(wakes(r.snapshot().entries)).toEqual([{ kind: 'wake', ts: 7, cause: 'task', task, text: '' }]);
+      for (const line of [answer, end('task-completed-task-1')]) ops.push(...r.apply(line));
+      expect(replay(ops).entries).toEqual(r.snapshot().entries);
+      const disk = stored([
+        ...before,
+        ended(1, true, { kind: monitor ? 'monitor' : 'bash' }),
+        agentPrompt(1),
+        answer,
+        end('task-completed-task-1'),
+      ]);
+      expect(wakes(disk).map(({ ts: _ts, ...e }) => e)).toEqual(
+        wakes(r.snapshot().entries).map(({ ts: _ts, ...e }) => e),
+      );
+    }
+  });
+
+  it('the queued names bash-completed- and monitor-completed- link the task too; an unlinked task is named by its end line', () => {
+    const r = new TranscriptReducer({ now: () => 7 });
+    for (const line of [...started(1, 'Run the tests'), ended(1, false), hostLine('bash-completed-task-1')])
+      r.apply(line);
+    expect(wakes(r.snapshot().entries)).toMatchObject([
+      { cause: 'task', task: { id: 'task-1', label: 'Run the tests' } },
+    ]);
+    const lone = new TranscriptReducer({ now: () => 7 });
+    lone.apply(ended(9, false, { kind: 'monitor', description: 'Watch the build log' }));
+    lone.apply(hostLine('monitor-completed-task-9'));
+    expect(wakes(lone.snapshot().entries)).toMatchObject([
+      { cause: 'task', task: { id: 'task-9', kind: 'monitor', label: 'Watch the build log' } },
+    ]);
+    const none = new TranscriptReducer({ now: () => 7 });
+    none.apply(hostLine('task-completed-task-404'));
+    expect(wakes(none.snapshot().entries)).toEqual([{ kind: 'wake', ts: 7, cause: 'task', text: '' }]);
+  });
+
+  // Mutation: keep the quiet ends across a turn end → the first end shows in the drain too.
+  // Mutation: count a will_wake end as quiet → task-3 is listed.
+  it('a notifications- wake lists what ended since the last turn end with no wake of its own; live and disk agree', () => {
+    const lines = [
+      ...started(1, 'Old build'),
+      ...started(2, 'npm test'),
+      ...started(3, 'Admitted one'),
+      ...started(4, 'Waited one'),
+      ...started(5, 'Stopped one'),
+      ...started(6, 'Watch the log', true),
+      ended(1, false),
+      end('p0'),
+      ended(2, false),
+      ended(3, true),
+      ended(4, false, { block_waited: true }),
+      ended(5, false, { explicitly_killed: true, kill_result_delivered: true }),
+      ended(6, false, { kind: 'monitor' }),
+    ];
+    const id = 'notifications-0193f1e2-7c3a';
+    const r = new TranscriptReducer({ now: () => 7 });
+    const ops: TranscriptOp[] = [];
+    for (const line of [typed(0, 'go'), ...lines, hostLine(null)]) ops.push(...r.apply(line));
+    expect(wakes(r.snapshot().entries)).toEqual([{ kind: 'wake', ts: 7, cause: 'unknown', text: '' }]);
+    for (const line of [answer, end(id)]) ops.push(...r.apply(line));
+    const tasks = [
+      { id: 'task-2', kind: 'command', label: 'npm test' },
+      { id: 'task-6', kind: 'monitor', label: 'Watch the log' },
+    ];
+    expect(wakes(r.snapshot().entries)).toEqual([{ kind: 'wake', ts: 7, cause: 'notifications', tasks, text: '' }]);
+    expect(replay(ops).entries).toEqual(r.snapshot().entries);
+    const disk = stored([typed(0, 'go'), ...lines, agentPrompt(1), answer, end(id)]);
+    expect(wakes(disk).map(({ ts: _ts, ...e }) => e)).toEqual([
+      { kind: 'wake', cause: 'notifications', tasks, text: '' },
+    ]);
+  });
+
+  it('a notifications- wake names at most 8 ends; with none it names nothing', () => {
+    const r = new TranscriptReducer({ now: () => 7 });
+    for (let n = 1; n <= 10; n += 1) r.apply(ended(n, false, { description: `job ${n}` }));
+    r.apply(agentPrompt(0));
+    r.apply(end('notifications-a'));
+    const [wake] = wakes(r.snapshot().entries);
+    expect(wake?.tasks?.map((t) => t.label)).toEqual([
+      'job 1',
+      'job 2',
+      'job 3',
+      'job 4',
+      'job 5',
+      'job 6',
+      'job 7',
+      'job 8',
+    ]);
+    r.apply(agentPrompt(1));
+    r.apply(end('notifications-b'));
+    expect(wakes(r.snapshot().entries)[1]).toEqual({ kind: 'wake', ts: 7, cause: 'notifications', text: '' });
+  });
+
+  // Mutation: re-apply only a known cause at turn_completed → the live row keeps the host's guess.
+  it("the wake's own turn_completed id wins over the host's guess, as on disk", () => {
+    const r = new TranscriptReducer({ now: () => 7 });
+    for (const line of [...started(1, 'npm test'), ended(1, true), hostLine('task-completed-task-1')]) r.apply(line);
+    expect(wakes(r.snapshot().entries)).toMatchObject([{ cause: 'task' }]);
+    r.apply(end('plan-resume-1764000000000'));
+    expect(wakes(r.snapshot().entries)).toEqual([{ kind: 'wake', ts: 7, cause: 'unknown', text: '' }]);
+  });
+});
+
+describe('shell output ticks with x.ai/incrementalBashOutput', () => {
+  const ID = 'toolu_ticks';
+  const bytes = (text: string): number[] => [...Buffer.from(text)];
+  const bash = (fields: Json): Json => ({
+    type: 'Bash',
+    output_for_prompt: '',
+    exit_code: 0,
+    command: 'yarn test',
+    truncated: false,
+    signal: null,
+    timed_out: false,
+    description: null,
+    current_dir: '/Users/dev/proj',
+    output_file: '',
+    total_bytes: 0,
+    ...fields,
+  });
+  const line = (fields: Json): UpdateLine => ({
+    xai: false,
+    update: { sessionUpdate: 'tool_call_update', toolCallId: ID, ...fields },
+    meta: undefined,
+  });
+  /** A tick as the agent sends it with the flag: the whole output as text, no byte copy, the new bytes apart. */
+  const tick = (whole: string, delta: string): UpdateLine =>
+    line({
+      status: 'in_progress',
+      content: [{ type: 'content', content: { type: 'text', text: whole } }],
+      rawOutput: bash({ output: [], output_delta: bytes(delta), total_bytes: Buffer.byteLength(whole) }),
+    });
+  const toolOf = (entries: readonly TranscriptEntry[]): Extract<TranscriptEntry, { kind: 'tool' }> => {
+    const tool = entries.find((e) => e.kind === 'tool');
+    if (tool?.kind !== 'tool') throw new Error('no tool entry');
+    return tool;
+  };
+  const start = (): { reducer: TranscriptReducer; ops: TranscriptOp[] } => {
+    const reducer = new TranscriptReducer({ now: () => 5 });
+    const ops = reducer.apply({
+      xai: false,
+      update: { sessionUpdate: 'tool_call', toolCallId: ID, title: 'run_terminal_command', rawInput: { command: 'x' } },
+      meta: undefined,
+    });
+    return { reducer, ops };
+  };
+
+  // Mutation: read `output_delta` (or the empty `output` array) instead of the text block → 'c\n' or ''.
+  it("three ticks: the entry's output is the last tick's whole text, live and in the snapshot", () => {
+    const { reducer, ops } = start();
+    ops.push(...reducer.apply(tick('a\n', 'a\n')));
+    ops.push(...reducer.apply(tick('a\nb\n', 'b\n')));
+    ops.push(...reducer.apply(tick('a\nb\nc\n', 'c\n')));
+    expect(toolOf(replay(ops).entries).output).toBe('a\nb\nc\n');
+    expect(toolOf(reducer.snapshot().entries)).toMatchObject({ status: 'in_progress', output: 'a\nb\nc\n' });
+    expect(toolOf(reducer.snapshot().entries)).not.toHaveProperty('exitCode');
+  });
+
+  // Mutation: treat an empty `output_delta` as the agent's "clear" → the output is gone.
+  it('a tick with an empty output_delta changes nothing', () => {
+    const { reducer } = start();
+    reducer.apply(tick('a\nb\n', 'a\nb\n'));
+    const before = toolOf(reducer.snapshot().entries);
+    reducer.apply(tick('a\nb\n', ''));
+    expect(toolOf(reducer.snapshot().entries)).toEqual(before);
+  });
+
+  it('colored ticks read as text, and the final result line still sets the exit code and the output', () => {
+    const { reducer, ops } = start();
+    const red = '\u001b[31mFAIL\u001b[39m a.test.ts\n';
+    ops.push(...reducer.apply(tick(red, red)));
+    expect(toolOf(replay(ops).entries).output).toBe('FAIL a.test.ts\n');
+    const whole = `${red}1 failed\n`;
+    ops.push(
+      ...reducer.apply(
+        line({
+          status: 'completed',
+          content: [{ type: 'content', content: { type: 'text', text: whole } }],
+          rawOutput: bash({
+            output: bytes(whole),
+            output_for_prompt: 'exit: 1\nFAIL a.test.ts\n1 failed\n',
+            exit_code: 1,
+            description: 'run',
+            output_file: '/Users/dev/.mlx-agent/sessions/proj/s/terminal/toolu_ticks.log',
+            total_bytes: Buffer.byteLength(whole),
+          }),
+        }),
+      ),
+    );
+    const shown = toolOf(replay(ops).entries);
+    expect(shown).toMatchObject({ status: 'completed', exitCode: 1, output: 'FAIL a.test.ts\n1 failed\n' });
+    expect(toolOf(reducer.snapshot().entries)).toEqual(shown);
+  });
+});
+
+describe('notes: the user note on a call denied with one', () => {
+  const NOTE = 'use pnpm, not npm';
+  const disk = (update: Json, xai = false): string =>
+    JSON.stringify({
+      timestamp: 1,
+      method: xai ? '_x.ai/session/update' : 'session/update',
+      params: { sessionId: 's', update, _meta: { agentTimestampMs: 1_000 } },
+    });
+  const chunk = (text: string, meta: Json): string =>
+    disk({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text }, _meta: { modelId: 'm', ...meta } });
+  const typed = (text: string, promptIndex: number): string => chunk(text, { promptIndex });
+  /** As the agent stores a note: no `promptIndex`, only the model id. */
+  const bare = (text: string): string => chunk(text, {});
+  const said = (text: string): string =>
+    disk({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text } });
+  const done = disk({ sessionUpdate: 'turn_completed', prompt_id: 'p', stop_reason: 'end_turn' }, true);
+  const users = (text: string, helper = false) =>
+    parseUpdates(text, { helper })
+      .transcript.filter((e) => e.kind === 'user')
+      .map((e) => (e.kind === 'user' ? [e.text, e.note === true] : null));
+
+  // Mutation: read no `mlxNote` → the host's line is a typed message.
+  it("the host's own line is a note: a user entry that is not the turn's prompt; ops equal the snapshot", () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    const ops = [...r.userPrompt('clean the build', [], 4)];
+    ops.push(...r.note(NOTE));
+    const note = { kind: 'user', ts: 5, text: NOTE, promptIndex: null, note: true };
+    expect(r.snapshot().entries).toEqual([{ kind: 'user', ts: 4, text: 'clean the build', promptIndex: null }, note]);
+    expect(replay(ops).entries).toEqual(r.snapshot().entries);
+  });
+
+  // Mutation: drop the pair rule → two note rows.
+  it('disk: two equal bare chunks of one open turn are one note, four are two; the entry equals the live one', () => {
+    const two = [typed('clean', 0), said('Running.'), bare(NOTE), said('Using pnpm.'), bare(NOTE), done];
+    expect(users(two.join('\n') + '\n')).toEqual([
+      ['clean', false],
+      [NOTE, true],
+    ]);
+    const four = [typed('clean', 0), bare(NOTE), bare(NOTE), said('Again.'), bare(NOTE), bare(NOTE), done];
+    expect(users(four.join('\n') + '\n')).toEqual([
+      ['clean', false],
+      [NOTE, true],
+      [NOTE, true],
+    ]);
+    const diskNote = parseUpdates(two.join('\n') + '\n').transcript.find((e) => e.kind === 'user' && e.note === true)!;
+    const live = new TranscriptReducer({ now: () => 1_000 });
+    live.userPrompt('clean');
+    live.note(NOTE);
+    expect(diskNote).toEqual(live.snapshot().entries[1]);
+  });
+
+  it('a new turn starts the pair count again', () => {
+    const text = [typed('one', 0), bare(NOTE), done, typed('two', 1), bare(NOTE), bare(NOTE), done].join('\n') + '\n';
+    expect(users(text)).toEqual([
+      ['one', false],
+      [NOTE, true],
+      ['two', false],
+      [NOTE, true],
+    ]);
+  });
+
+  it("never a note: the host's typed prompt, a hostTurn chunk, a chunk with no turn open", () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.apply({
+      xai: false,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'one' },
+        _meta: { promptIndex: 0 },
+      },
+      meta: undefined,
+    });
+    r.userPrompt('two');
+    expect(r.snapshot().entries.map((e) => e.kind === 'user' && e.note === true)).toEqual([false, false]);
+    const hostTurn =
+      [typed('one', 0), said('Working.'), chunk('/goal pause', { hostTurn: true }), done].join('\n') + '\n';
+    expect(users(hostTurn)).toEqual([
+      ['one', false],
+      ['/goal pause', false],
+    ]);
+    expect(users([typed('one', 0), said('ok'), done, bare('a message after the end')].join('\n') + '\n')).toEqual([
+      ['one', false],
+      ['a message after the end', false],
+    ]);
+  });
+
+  it('an old build with no promptIndex and no turn_completed: every chunk stays a message and turns split as today', () => {
+    const text = [bare('first'), said('one'), bare('second'), said('two')].join('\n') + '\n';
+    const parsed = parseUpdates(text);
+    expect(users(text)).toEqual([
+      ['first', false],
+      ['second', false],
+    ]);
+    expect(splitTurns(parsed.transcript, parsed.turns).map((t) => t.entries.length)).toEqual([2, 2]);
+  });
+
+  // Mutation: ignore `helper` → the parent's message reads as a note.
+  it("a helper's own session: its parent's bare message stays a message", () => {
+    const text = [typed('task', 0), said('Working.'), bare('also check the docs'), said('ok'), done].join('\n') + '\n';
+    expect(users(text, true)).toEqual([
+      ['task', false],
+      ['also check the docs', false],
+    ]);
+    expect(users(text)).toEqual([
+      ['task', false],
+      ['also check the docs', true],
+    ]);
+  });
+
+  it('filterRewindLines cuts at the same prompt with note lines in the turn', () => {
+    const rewind = disk({ sessionUpdate: 'rewind_marker', target_prompt_index: 1 }, true);
+    const plain = [typed('one', 0), said('A1'), done, typed('two', 1), said('A2'), done, rewind];
+    const noted = [typed('one', 0), said('A1'), bare(NOTE), said('A1b'), bare(NOTE), done, ...plain.slice(3)];
+    const kept = filterRewindLines(noted);
+    expect(kept.filter((l) => !l.includes(NOTE) && !l.includes('A1b'))).toEqual(filterRewindLines(plain));
+    expect(kept).toEqual(noted.slice(0, 6));
+  });
+});
+
+describe('ask_user_question: the entry carries the questions and what the stored sentence says', () => {
+  const META = {
+    'x.ai/tool': { version: 1, name: 'ask_user_question', kind: 'ask_user', namespace: 'grok_build', read_only: true },
+  };
+  const Q = 'Which checks should run before a merge?';
+  const options = [
+    { label: 'Unit tests', description: 'Fast.' },
+    { label: 'Lint', description: '' },
+  ];
+  const SENTENCE = `User has answered your questions: "${Q}"="Unit tests, Lint" user notes: also e2e. You can now continue with the user's answers in mind.`;
+  /** As the agent sends and stores them: the model's call, its own copy of the input, then the result. */
+  const updates: Json[] = [
+    {
+      sessionUpdate: 'tool_call',
+      toolCallId: 'call_q',
+      title: 'ask_user_question',
+      rawInput: { questions: [{ question: Q, options, multi_select: true }] },
+      _meta: META,
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_q',
+      kind: 'other',
+      title: `Ask: ${Q}`,
+      locations: [],
+      rawInput: { variant: 'AskUserQuestion', questions: [{ question: Q, options, multiSelect: true }] },
+      _meta: META,
+    },
+    {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: 'call_q',
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: SENTENCE } }],
+      rawOutput: { type: 'AskUserQuestion', UserAnswered: { message: SENTENCE } },
+    },
+  ];
+
+  // Mutation: read `ask` only on disk (snapshot) → the live entry has none.
+  it('live ops and disk text give the same entry; multi_select of the model input is read before the copy lands', () => {
+    const live = new TranscriptReducer({ now: () => 1_000 });
+    const ops: TranscriptOp[] = [];
+    ops.push(...live.apply({ xai: false, update: updates[0]!, meta: { agentTimestampMs: 1_000 } }));
+    const first = live.snapshot().entries[0];
+    expect(first?.kind === 'tool' ? first.ask : null).toEqual({
+      questions: [{ text: Q, multi: true, options: ['Unit tests', 'Lint'] }],
+      result: null,
+    });
+    for (const update of updates.slice(1))
+      ops.push(...live.apply({ xai: false, update, meta: { agentTimestampMs: 1_000 } }));
+    const entries = live.snapshot().entries;
+    expect(entries).toHaveLength(1);
+    const tool = entries[0]!;
+    expect(tool.kind === 'tool' ? tool.ask : null).toEqual({
+      questions: [{ text: Q, multi: true, options: ['Unit tests', 'Lint'] }],
+      result: { kind: 'answered', answers: [{ picks: ['Unit tests', 'Lint'], other: 'also e2e' }] },
+    });
+    expect(replay(ops).entries).toEqual(entries);
+    const disk = updates
+      .map((update) =>
+        JSON.stringify({
+          timestamp: 1,
+          method: 'session/update',
+          params: { sessionId: 's', update, _meta: { agentTimestampMs: 1_000 } },
+        }),
+      )
+      .join('\n');
+    expect(parseUpdates(`${disk}\n`).transcript).toEqual(entries);
+  });
+
+  it('another tool never gets ask', () => {
+    const r = new TranscriptReducer({ now: () => 1 });
+    r.apply({
+      xai: false,
+      update: { ...updates[0]!, _meta: { 'x.ai/tool': { name: 'read_file' } } },
+      meta: undefined,
+    });
+    const [entry] = r.snapshot().entries;
+    expect(entry?.kind === 'tool' && entry.ask === undefined).toBe(true);
+  });
+});
+
+describe('helper progress (#10): live ticks make nothing, the end stores turns and tool calls', () => {
+  const xai = (update: Json): UpdateLine => ({ xai: true, update, meta: undefined });
+  const spawned = xai({
+    sessionUpdate: 'subagent_spawned',
+    subagent_id: 'child-1',
+    parent_session_id: 's',
+    child_session_id: 'child-1',
+    subagent_type: 'explore',
+    description: 'Find the flaky test',
+  });
+  /** grok `SubagentProgress`: never stored. */
+  const tick = xai({
+    sessionUpdate: 'subagent_progress',
+    subagent_id: 'child-1',
+    parent_session_id: 's',
+    child_session_id: 'child-1',
+    duration_ms: 2_000,
+    turn_count: 1,
+    tool_call_count: 4,
+    tokens_used: 9_000,
+    context_window_tokens: 32_768,
+    context_usage_pct: 27,
+    tools_used: ['grep'],
+    error_count: 0,
+  });
+  /** grok `SubagentFinished`: stored. */
+  const finished = xai({
+    sessionUpdate: 'subagent_finished',
+    subagent_id: 'child-1',
+    child_session_id: 'child-1',
+    status: 'completed',
+    tool_calls: 14,
+    turns: 3,
+    duration_ms: 134_000,
+    tokens_used: 21_480,
+    output: 'Found it.',
+    will_wake: false,
+  });
+
+  it('a tick makes no entry and no op', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    r.apply(spawned);
+    const before = r.snapshot().entries;
+    expect(r.apply(tick)).toEqual([]);
+    expect(r.snapshot().entries).toEqual(before);
+  });
+
+  // Mutation: drop `entry.turns = turns` → the row has no turns.
+  it('subagent_finished stores turns and tool calls; ops, snapshot and the disk read agree', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    const ops: TranscriptOp[] = [];
+    for (const line of [spawned, tick, finished]) ops.push(...r.apply(line));
+    const row = r.snapshot().entries.find((e) => e.kind === 'subagent');
+    expect(row).toMatchObject({ status: 'completed', turns: 3, toolCalls: 14, tokens: 21_480, durationMs: 134_000 });
+    expect(replay(ops).entries).toEqual(r.snapshot().entries);
+    const disk = parseUpdates(
+      [spawned, finished]
+        .map((l) => JSON.stringify({ method: '_x.ai/session/update', params: { sessionId: 's', update: l.update } }))
+        .join('\n') + '\n',
+    ).transcript;
+    const shape = (entries: readonly TranscriptEntry[]) =>
+      entries.flatMap((e) => (e.kind === 'subagent' ? [{ ...e, ts: 0, endTs: 0 }] : []));
+    expect(shape(disk)).toEqual(shape(r.snapshot().entries));
+  });
+});
+
+describe('a stopped task (T1): `killed` from the end line', () => {
+  const plain = (update: Json): UpdateLine => ({ xai: false, update, meta: undefined });
+  const xai = (update: Json): UpdateLine => ({ xai: true, update, meta: undefined });
+  const started = (n: number, monitor = false): UpdateLine[] => [
+    plain({
+      sessionUpdate: 'tool_call',
+      toolCallId: `call-${n}`,
+      title: monitor ? 'monitor' : 'run_terminal_command',
+      rawInput: { command: `cmd-${n}`, description: `Task ${n}`, ...(monitor ? {} : { is_background: true }) },
+    }),
+    xai({
+      sessionUpdate: 'task_backgrounded',
+      tool_call_id: `call-${n}`,
+      task_id: `task-${n}`,
+      command: `cmd-${n}`,
+      ...(monitor ? { monitor_description: `Task ${n}` } : { description: `Task ${n}` }),
+    }),
+    plain({ sessionUpdate: 'tool_call_update', toolCallId: `call-${n}`, status: 'completed' }),
+  ];
+  /** grok `TaskCompleted`: a kill leaves exit code none and signal `killed` (`terminal.rs` finalize_process). */
+  const ended = (n: number, killed: boolean): UpdateLine =>
+    xai({
+      sessionUpdate: 'task_completed',
+      task_snapshot: {
+        task_id: `task-${n}`,
+        command: `cmd-${n}`,
+        kind: 'bash',
+        completed: true,
+        exit_code: killed ? null : 0,
+        signal: killed ? 'killed' : null,
+        end_time: { secs_since_epoch: 1_800_000_000, nanos_since_epoch: 0 },
+        block_waited: false,
+        explicitly_killed: killed,
+        kill_result_delivered: false,
+      },
+      will_wake: true,
+    });
+  const emptyList = xai({ sessionUpdate: 'background_tasks', tasks: [] });
+  const stored = (lines: readonly UpdateLine[]): TranscriptEntry[] =>
+    parseUpdates(
+      lines
+        .map((l) =>
+          JSON.stringify({
+            method: l.xai ? '_x.ai/session/update' : 'session/update',
+            params: { sessionId: 's', update: l.update },
+          }),
+        )
+        .join('\n') + '\n',
+    ).transcript;
+  const tasks = (entries: readonly TranscriptEntry[]) =>
+    entries.flatMap((e) => (e.kind === 'tool' && e.task !== undefined ? [e.task] : []));
+  function live(lines: readonly UpdateLine[]): { entries: TranscriptEntry[]; ops: TranscriptOp[] } {
+    const r = new TranscriptReducer({ now: () => 7 });
+    const ops: TranscriptOp[] = [];
+    for (const line of lines) ops.push(...r.apply(line));
+    return { entries: r.snapshot().entries, ops };
+  }
+
+  // Mutation: drop `explicitly_killed` from the task_completed case → no "Stopped in the background".
+  it('a killed end marks the task; one that ended by itself does not; ops, snapshot and disk agree', () => {
+    const lines = [...started(1), ...started(2, true), ended(1, true), ended(2, false)];
+    const { entries, ops } = live(lines);
+    expect(tasks(entries)).toEqual([
+      { id: 'task-1', kind: 'command', label: 'Task 1', endTs: 1_800_000_000_000, killed: true },
+      { id: 'task-2', kind: 'monitor', label: 'Task 2', endTs: 1_800_000_000_000 },
+    ]);
+    expect(replay(ops).entries).toEqual(entries);
+    expect(tasks(stored(lines))).toEqual(tasks(entries));
+  });
+
+  // Mutation: return early on an ended task in endTask → the list's end hides the kill.
+  it('the list ended the task first: the kill still lands on it', () => {
+    const lines = [...started(1), emptyList, ended(1, true)];
+    const { entries, ops } = live(lines);
+    expect(tasks(entries)).toEqual([
+      { id: 'task-1', kind: 'command', label: 'Task 1', endTs: expect.any(Number), killed: true },
+    ]);
+    expect(replay(ops).entries).toEqual(entries);
+    expect(tasks(stored(lines)).map((t) => t.killed)).toEqual([true]);
+  });
+
+  it('the end came before the line that names the task: the task starts ended and killed', () => {
+    const [call, backgrounded, result] = started(1);
+    const lines = [call!, ended(1, true), backgrounded!, result!];
+    const { entries, ops } = live(lines);
+    expect(tasks(entries)).toEqual([
+      { id: 'task-1', kind: 'command', label: 'Task 1', endTs: 1_800_000_000_000, killed: true },
+    ]);
+    expect(replay(ops).entries).toEqual(entries);
+    expect(tasks(stored(lines))).toEqual(tasks(entries));
+  });
+});
+
+describe('model_auto_switched (#16): live only, never an entry', () => {
+  /** grok `SessionUpdate::ModelAutoSwitched` as `send_model_auto_switched` sends it: no `_meta`, never stored. */
+  const switched: UpdateLine = {
+    xai: true,
+    update: {
+      sessionUpdate: 'model_auto_switched',
+      previous_model_id: '',
+      new_model_id: '',
+      reason: 'Your previous model is no longer available. Please start a new session.',
+    },
+    meta: undefined,
+  };
+
+  it('a line fed to the reducer makes no entry and no op, in a turn and outside one', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    expect(r.apply(switched)).toEqual([]);
+    r.userPrompt('Fix the failing test', [], 6);
+    const before = r.snapshot().entries;
+    expect(r.apply(switched)).toEqual([]);
+    expect(r.snapshot().entries).toEqual(before);
+    const disk = `${JSON.stringify({ method: '_x.ai/session/update', params: { sessionId: 's', update: switched.update } })}\n`;
+    expect(parseUpdates(disk).transcript).toEqual([]);
+  });
+});
+
+describe('monitor_event (T2): live only, never an entry', () => {
+  /** grok `SessionUpdate::MonitorEvent` as the bridge sends it (`_x.ai/monitor_event`): no `_meta`, never stored. */
+  const event: UpdateLine = {
+    xai: true,
+    update: {
+      sessionUpdate: 'monitor_event',
+      task_id: '01a20df5-8562-75b2-aaf5-d3c1e2ec9a01',
+      description: 'Watch the build log',
+      event_text: "error TS2345: Argument of type 'string' is not assignable",
+    },
+    meta: undefined,
+  };
+
+  it('a line fed to the reducer makes no entry and no op, in a turn and outside one', () => {
+    const r = new TranscriptReducer({ now: () => 5 });
+    expect(r.apply(event)).toEqual([]);
+    r.userPrompt('Watch the build', [], 6);
+    const before = r.snapshot().entries;
+    expect(r.apply(event)).toEqual([]);
+    expect(r.snapshot().entries).toEqual(before);
+    const disk = `${JSON.stringify({ method: '_x.ai/session/update', params: { sessionId: 's', update: event.update } })}\n`;
+    expect(parseUpdates(disk).transcript).toEqual([]);
+  });
+});
+
+describe('workflow runs: what the reducer keeps of a run, its calls, its agents and its wake', () => {
+  /** A real run's parent lines and its retried agent's own lines, prose replaced (`fixtures/workflow-run`). */
+  const RUN_DIR = join(FIXTURES, 'workflow-run');
+  const RUN = 'wf_01a2168534c27fd1a477edb6fad7b0a4';
+  const RETRY_CHILD = '01a21688-13f5-7b32-873d-247e85ca5c3f';
+  const parentLines = (): string[] => splitCompleteLines(readFileSync(join(RUN_DIR, 'parent.jsonl'), 'utf8'));
+  const text = (lines: readonly string[]): string => `${lines.join('\n')}\n`;
+  const updateOf = (line: string): Json => ((JSON.parse(line) as Json).params as Json).update as Json;
+  const withUpdate = (line: string, update: Json): string => {
+    const obj = JSON.parse(line) as Json;
+    return JSON.stringify({ ...obj, params: { ...(obj.params as Json), update } });
+  };
+  const xaiAt = (n: number, update: Json): string =>
+    JSON.stringify({
+      timestamp: Math.floor(n / 1000),
+      method: '_x.ai/session/update',
+      params: { sessionId: 's', update, _meta: { agentTimestampMs: n } },
+    });
+  const acpAt = (n: number, update: Json): string =>
+    JSON.stringify({
+      timestamp: Math.floor(n / 1000),
+      method: 'session/update',
+      params: { sessionId: 's', update, _meta: { agentTimestampMs: n } },
+    });
+  type Tool = Extract<TranscriptEntry, { kind: 'tool' }>;
+  type Wake = Extract<TranscriptEntry, { kind: 'wake' }>;
+  type Run = Extract<TranscriptEntry, { kind: 'workflow' }>;
+  const tools = (entries: readonly TranscriptEntry[]): Tool[] =>
+    entries.filter((e): e is Tool => e.kind === 'tool' && e.name === 'workflow');
+
+  // Mutation: put back `&& this.runEntries.has(run)` → a spawn read before (or without) its run's entry loses it.
+  it('a spawn names its run and model with no run entry in the transcript', () => {
+    const spawn = parentLines().find((l) => updateOf(l).sessionUpdate === 'subagent_spawned')!;
+    const [entry] = parseUpdates(text([spawn])).transcript;
+    expect(entry).toMatchObject({
+      kind: 'subagent',
+      childId: '01a21685-34f1-7d63-8879-909f581e5a5b',
+      description: 'track:process',
+      run: RUN,
+      model: 'Inkling-2-Mini-UD-Q4_K_M',
+    });
+  });
+
+  // Mutation: class a call by `rawOutput.run_id` → the pause, stop and resume results read as launches.
+  it('a workflow call names its kind by source.type and its run by the id that came back, else by its name', () => {
+    const lines = parentLines();
+    const real = tools(parseUpdates(text(lines)).transcript);
+    expect(real.map((e) => [e.status, e.run])).toEqual([
+      ['failed', undefined],
+      ['failed', { id: null, kind: 'check' }],
+      ['completed', { id: null, kind: 'check' }],
+      ['completed', { id: RUN, kind: 'launch' }],
+    ]);
+    const launch = lines.filter((l) => updateOf(l).toolCallId === 'toolu_71e89f72f5d44bbd88745919cabf3fec');
+    const call = (id: string, n: number, source: Json, rawOutput: Json | null, status = 'completed'): string[] => [
+      acpAt(n, {
+        sessionUpdate: 'tool_call',
+        toolCallId: id,
+        title: 'workflow',
+        rawInput: { source },
+        _meta: { 'x.ai/tool': { name: 'workflow', kind: 'workflow' } },
+      }),
+      acpAt(n + 1, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: id,
+        status,
+        ...(rawOutput === null ? {} : { rawOutput }),
+      }),
+    ];
+    const controlled = (verb: string) => ({
+      type: 'Workflow',
+      run_id: RUN,
+      task_id: RUN,
+      name: 'research-advisory',
+      message: `${verb} workflow 'research-advisory'; its child agents were cancelled.`,
+    });
+    const refused = { error: 'workflow_resolve_failed', message: 'no such workflow' };
+    const t = 1795676600000;
+    const later = [
+      ...call('pause-1', t, { type: 'pause', run_id: 'research-advisory' }, controlled('Paused')),
+      ...call(
+        'resume-1',
+        t + 10,
+        { type: 'resume', resume_from_run_id: RUN },
+        { ...controlled('Resumed'), message: '' },
+      ),
+      ...call('stop-1', t + 20, { type: 'stop', run_id: 'research-advisory' }, null, 'failed'),
+      ...call('stop-2', t + 30, { type: 'stop', run_id: 'other-run' }, null, 'failed'),
+      ...call('launch-2', t + 40, { type: 'name', name: 'deep-research' }, refused, 'failed'),
+    ];
+    const all = tools(parseUpdates(text([...lines.slice(0, lines.indexOf(launch.at(-1)!) + 1), ...later])).transcript);
+    expect(all.slice(4).map((e) => [e.id, e.run])).toEqual([
+      ['pause-1', { id: RUN, kind: 'pause' }],
+      ['resume-1', { id: RUN, kind: 'resume' }],
+      ['stop-1', { id: RUN, kind: 'stop' }],
+      ['stop-2', { id: null, kind: 'stop' }],
+      ['launch-2', { id: null, kind: 'launch' }],
+    ]);
+  });
+
+  // Mutation: read the run's newest state for the snapshot → a resume in the wake turn empties the first row.
+  it('a wake keeps the stored update of the revision its prompt id names, also after a resume', () => {
+    const real = parseUpdates(text(parentLines())).transcript.filter((e): e is Wake => e.kind === 'wake');
+    expect(real).toHaveLength(1);
+    expect(real[0]!.workflow).toEqual({
+      runId: RUN,
+      revision: 26,
+      name: 'research-advisory',
+      snapshot: {
+        status: 'complete',
+        report: '# Advisory research\n\nThe fix holds for the reported path; one more path needs a guard.\n',
+        agentsUsed: 7,
+        agentBudget: 128,
+        agentsFailed: 0,
+        elapsedMs: 2_323_877,
+      },
+    });
+    const run = (n: number, revision: number, status: string, extra: Json = {}) =>
+      xaiAt(n, {
+        sessionUpdate: 'workflow_updated',
+        run_id: 'wf_2',
+        name: 'deep-research',
+        status,
+        revision,
+        agent_budget: 4,
+        agents_used: 4,
+        elapsed_ms: n,
+        agents: [
+          { agent_id: 'a', label: 'a', state: 'done', tokens_used: 1, duration_ms: 1 },
+          { agent_id: 'b', label: 'b', state: 'failed', tokens_used: 1, duration_ms: 1 },
+        ],
+        ...extra,
+      });
+    const wake = (n: number, revision: number): string[] => [
+      xaiAt(n, {
+        sessionUpdate: 'hook_execution',
+        event_name: 'user_prompt_submit',
+        prompt_id: `workflow-completed-wf_2-${revision}`,
+        runs: [],
+      }),
+      acpAt(n + 1, {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'A background workflow stopped.' },
+        _meta: { promptIndex: revision, hideFromScrollback: true },
+      }),
+    ];
+    const end = (n: number, revision: number) =>
+      xaiAt(n, {
+        sessionUpdate: 'turn_completed',
+        prompt_id: `workflow-completed-wf_2-${revision}`,
+        stop_reason: 'end_turn',
+      });
+    const lines = [
+      run(1_000, 10, 'budget_limited', { pause_message: 'Out of agents.' }),
+      ...wake(2_000, 10),
+      run(3_000, 11, 'active'),
+      end(4_000, 10),
+      run(5_000, 20, 'complete', { result_summary: 'All four agree.' }),
+      ...wake(6_000, 20),
+      run(7_000, 21, 'complete', { result_summary: 'All four agree.' }),
+      end(8_000, 20),
+    ];
+    const wakes = parseUpdates(text(lines)).transcript.filter((e): e is Wake => e.kind === 'wake');
+    expect(wakes.map((e) => e.workflow)).toEqual([
+      {
+        runId: 'wf_2',
+        revision: 10,
+        name: 'deep-research',
+        snapshot: {
+          status: 'budget_limited',
+          pauseMessage: 'Out of agents.',
+          agentsUsed: 4,
+          agentBudget: 4,
+          agentsFailed: 1,
+          elapsedMs: 1_000,
+        },
+      },
+      {
+        runId: 'wf_2',
+        revision: 20,
+        name: 'deep-research',
+        snapshot: {
+          status: 'complete',
+          report: 'All four agree.',
+          agentsUsed: 4,
+          agentBudget: 4,
+          agentsFailed: 1,
+          elapsedMs: 5_000,
+        },
+      },
+    ]);
+  });
+
+  // Mutation: mark a copy by its outer `timestamp` (the copy time) → the copied answer and turn end read as own.
+  it("a retried agent's copied lines are marked by their eventId prefix, and keep the first attempt's times", () => {
+    const childText = readFileSync(join(RUN_DIR, 'retry-child.jsonl'), 'utf8');
+    const lines = splitCompleteLines(childText);
+    const own = (line: string) =>
+      ((((JSON.parse(line) as Json).params as Json)._meta as Json).eventId as string).startsWith(`${RETRY_CHILD}-`);
+    expect(lines.findIndex(own)).toBe(56);
+    expect(lines.slice(56).every(own)).toBe(true);
+    const parsed = parseUpdates(childText, { helper: true, sessionId: RETRY_CHILD });
+    const turns = parsed.transcript.findIndex((e) => e.kind === 'turn-end');
+    expect(turns).toBeGreaterThan(0);
+    const firstAttempt = parsed.transcript.slice(0, turns + 1);
+    const secondAttempt = parsed.transcript.slice(turns + 1);
+    expect(firstAttempt.every((e) => e.copied === true)).toBe(true);
+    expect(secondAttempt.length).toBeGreaterThan(0);
+    expect(secondAttempt.every((e) => e.copied === undefined)).toBe(true);
+    expect(firstAttempt.filter((e) => e.kind === 'assistant')).toHaveLength(1);
+    expect(firstAttempt[0]).toMatchObject({ kind: 'user', ts: 1795674158731 });
+    expect(parsed.turns.map((t) => [t.copied, t.ts])).toEqual([
+      [true, 1795674346254],
+      [undefined, 1795674467013],
+    ]);
+    expect(parseUpdates(childText, { helper: true }).transcript.some((e) => e.copied !== undefined)).toBe(false);
+  });
+
+  // Mutations: link only tool calls → a typed control turn names no run; take the first of two prefix matches.
+  it('a typed /workflow pause|resume|stop host turn names the run its name picks, none for two matches', () => {
+    const launch = parentLines().filter((l) => {
+      const u = updateOf(l);
+      return u.sessionUpdate === 'workflow_updated' && u.revision === 1;
+    });
+    const second = withUpdate(launch[0]!, {
+      ...updateOf(launch[0]!),
+      run_id: 'wf_01a2168534c27fd1a477edb6fad7b0a5',
+      name: 'research-advisory-2',
+    });
+    const hostTurn = (n: number, typed: string, said: string): string[] => [
+      acpAt(n, {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: typed },
+        _meta: { hostTurn: true },
+      }),
+      acpAt(n + 1, {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: said },
+        _meta: { hostTurn: true },
+      }),
+      xaiAt(n + 2, { sessionUpdate: 'turn_completed', prompt_id: `p${n}`, stop_reason: 'end_turn', elapsed_ms: 5 }),
+    ];
+    const t = 1795676700000;
+    const lines = [
+      launch[0]!,
+      second,
+      ...hostTurn(t, '/workflow resume research-advisory', 'Resumed research-advisory from its journal.'),
+      ...hostTurn(t + 10, '/workflow stop research', "Several runs could be 'stop'."),
+      ...hostTurn(t + 20, '/workflow research-advisory-2 PAUSE', 'Paused research-advisory-2.'),
+      ...hostTurn(t + 30, '/workflow stop wf_01a2168534c27fd1a477edb6fad7b0a4', 'Stopped research-advisory.'),
+      ...hostTurn(t + 40, '/workflow save research-advisory', 'Saved.'),
+      ...hostTurn(t + 50, '/workflowstop research-advisory', 'Unknown command.'),
+    ];
+    const users = parseUpdates(text(lines)).transcript.filter((e) => e.kind === 'user');
+    expect(users.map((e) => (e.kind === 'user' ? e.runControl : null))).toEqual([
+      { verb: 'resume', runId: RUN },
+      undefined,
+      { verb: 'pause', runId: 'wf_01a2168534c27fd1a477edb6fad7b0a5' },
+      { verb: 'stop', runId: RUN },
+      undefined,
+      undefined,
+    ]);
+    const typedOnly = parseUpdates(
+      text([launch[0]!, ...hostTurn(t, '/workflow resume research-advisory', 'Ran.').filter((_, i) => i !== 1)]),
+    ).transcript;
+    expect(typedOnly.find((e) => e.kind === 'user')).not.toHaveProperty('runControl');
+    // Live: the host pushes the typed prompt, and the agent's hostTurn answer names the run.
+    const r = new TranscriptReducer({ now: () => t });
+    r.apply({ xai: true, update: updateOf(launch[0]!), meta: undefined });
+    r.userPrompt('/workflow pause research-advisory', [], t);
+    const ops = r.apply({
+      xai: false,
+      update: {
+        sessionUpdate: 'agent_message_chunk',
+        content: { type: 'text', text: 'Paused.' },
+        _meta: { hostTurn: true },
+      },
+      meta: undefined,
+    });
+    expect(ops[0]).toMatchObject({
+      op: 'set',
+      index: 1,
+      entry: { kind: 'user', runControl: { verb: 'pause', runId: RUN } },
+    });
+  });
+
+  // Mutation: keep only the newest step start (`phasesEntered = [that one]`) → the first step's start is lost.
+  it('a run entry keeps the objective, run time, model of a roster row and each stored step start', () => {
+    const lines = parentLines();
+    const usage = lines.findIndex((l) => updateOf(l).revision === 14);
+    const flagged = withUpdate(lines[usage]!, {
+      ...updateOf(lines[usage]!),
+      agent_usage_incomplete: true,
+      agents: [{ ...((updateOf(lines[usage]!).agents as Json[])[0] as Json), model: 'small-model' }],
+    });
+    const [run] = parseUpdates(text([...lines.slice(0, usage), flagged])).transcript.filter(
+      (e): e is Run => e.kind === 'workflow',
+    );
+    expect(run).toMatchObject({
+      revision: 14,
+      objective:
+        "Research a GitHub security advisory against the local checkout: verify the fix commit, the advisory's claims, and remaining holes",
+      elapsedMs: 845_501,
+      usageIncomplete: true,
+      phasesEntered: [
+        { title: 'Recon', ts: 1795674158302 },
+        { title: 'Verify', ts: 1795675003800 },
+      ],
+    });
+    expect(run!.agents[0]).toMatchObject({ label: 'track:fix-reality', model: 'small-model' });
+    const done = parseUpdates(text(lines)).transcript.find((e): e is Run => e.kind === 'workflow')!;
+    expect(done.phasesEntered.map((p) => p.title)).toEqual(['Recon', 'Verify', 'Synthesize']);
+    expect(done.usageIncomplete).toBeUndefined();
   });
 });

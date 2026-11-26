@@ -6,19 +6,39 @@
 
 import { useCallback, useRef, useSyncExternalStore } from 'react';
 
-import { createConversationStore, type ChatStore, type ConversationSnapshot } from '../../lib/chat-store';
+import { createConversationStore, type ConversationSnapshot, type ConversationStore } from '../../lib/chat-store';
+import type { ConversationEvent } from '../../lib/chat-types';
 
-const stores = new Map<string, ChatStore<ConversationSnapshot>>();
+const stores = new Map<string, ConversationStore>();
 const arrivals = new Map<string, number>();
 const EMPTY: ConversationSnapshot = { state: null, gone: null };
 
-function storeFor(id: string): ChatStore<ConversationSnapshot> {
+function storeFor(id: string): ConversationStore {
   let store = stores.get(id);
   if (store === undefined) {
     store = createConversationStore(id);
     stores.set(id, store);
   }
   return store;
+}
+
+/**
+ * Keeps a conversation's stream open while the page shows another: `listener` gets its state at each change, and
+ * once now. Call to stop.
+ */
+export function watchConversation(id: string, listener: (snapshot: ConversationSnapshot) => void): () => void {
+  const store = storeFor(id);
+  const stop = store.subscribe(() => listener(store.getSnapshot()));
+  listener(store.getSnapshot());
+  return stop;
+}
+
+/**
+ * Each event of a conversation's stream as its store applies it (a `sync` too), while someone else keeps the stream
+ * open. Call to stop.
+ */
+export function listenConversation(id: string, listener: (event: ConversationEvent) => void): () => void {
+  return storeFor(id).listen(listener);
 }
 
 /** Forget a conversation's store (it was deleted): a later open starts from a fresh `sync`. */

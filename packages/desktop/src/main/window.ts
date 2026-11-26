@@ -10,6 +10,7 @@
 
 import { app, BrowserWindow, dialog, ipcMain, nativeTheme, shell, type IpcMainEvent, type WebContents } from 'electron';
 
+import { APP_NAME } from '../app-name.js';
 import { clampBoundsToDisplays, type Rect, type WindowBounds } from './settings.js';
 import {
   CONTROL_PANEL_PICK_FOLDER_CHANNEL,
@@ -142,7 +143,7 @@ export function createControlPanelWindowManager(options: ControlPanelWindowOptio
       ...(bounds.x !== null && bounds.y !== null ? { x: bounds.x, y: bounds.y } : {}),
       minWidth: MIN_WIDTH,
       minHeight: MIN_HEIGHT,
-      title: 'mlx-node',
+      title: APP_NAME,
       ...(options.windowIcon ? { icon: options.windowIcon } : {}),
       // Painted before the SPA's first frame; without it the window opens as a
       // white flash even in dark mode.

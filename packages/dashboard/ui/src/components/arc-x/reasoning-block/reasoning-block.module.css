@@ -62,14 +62,19 @@
   overflow: clip;
 }
 
+/* As tall as its text, at most two lines; the fade shows only when earlier lines are cut. */
 .tail {
   display: flex;
-  height: 40px;
+  max-height: calc(2lh + var(--space-1-5));
   flex-direction: column;
   justify-content: flex-end;
   overflow: hidden;
-  padding: 0 var(--space-3) 0 calc(var(--space-2-5) + 14px + var(--space-2));
+  padding: 0 var(--space-3) var(--space-1-5) calc(var(--space-2-5) + 14px + var(--space-2));
   color: var(--text-muted);
+  line-height: var(--leading-prose);
+}
+
+.tail[data-clipped] {
   mask-image: linear-gradient(to bottom, transparent, var(--foreground) 16px);
 }
 
@@ -87,6 +92,33 @@
   text-wrap: pretty;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.body[data-markdown] {
+  white-space: normal;
+}
+
+/* Quiet Markdown: the thinking color and size, bold words for headings, a flat code block with a rule at its edge. */
+.body .markdown {
+  gap: var(--space-2);
+  color: inherit;
+}
+
+.body .markdown :is(h3, h4, h5, h6) {
+  margin: 0;
+  font-size: inherit;
+  font-weight: 500;
+}
+
+.body .markdown figure {
+  padding: 0 0 0 var(--space-2);
+  border-inline-start: 2px solid var(--border);
+  border-radius: 0;
+  background: transparent;
+}
+
+.body .markdown :is(ul, ol, blockquote) {
+  gap: var(--space-1);
 }
 
 .body[data-enter] {

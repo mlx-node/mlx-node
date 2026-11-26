@@ -15,9 +15,12 @@ export interface PlanListProps {
   items: readonly PlanItem[];
   ts?: number;
   className?: string;
+  /** Only the list: no card, no header. */
+  bare?: boolean;
 }
 
-function Glyph({ status }: { status: string }): ReactElement {
+/** The state mark of one plan item: a check, a ring with a dot while in progress, or an empty ring. */
+function PlanGlyph({ status }: { status: string }): ReactElement {
   if (status === 'completed') {
     return (
       <span className={styles.glyph} data-status={status} role="img" aria-label={status}>
@@ -36,8 +39,9 @@ function Glyph({ status }: { status: string }): ReactElement {
 }
 
 /** An agent's plan: one line per item with its state. */
-export function PlanList({ items, ts, className }: PlanListProps): ReactElement {
+export function PlanList({ items, ts, className, bare }: PlanListProps): ReactElement {
   const timed = ts !== undefined && ts > 0;
+  if (bare === true) return <PlanItems items={items} className={className} />;
   return (
     <section className={cn(styles.root, className)} aria-label="Plan">
       <div className={styles.header}>
@@ -48,14 +52,20 @@ export function PlanList({ items, ts, className }: PlanListProps): ReactElement 
           </time>
         ) : null}
       </div>
-      <ul className={styles.list}>
-        {items.map((item, index) => (
-          <li key={index} className={styles.item} data-status={item.status}>
-            <Glyph status={item.status} />
-            <span className={styles.text}>{item.content}</span>
-          </li>
-        ))}
-      </ul>
+      <PlanItems items={items} />
     </section>
+  );
+}
+
+function PlanItems({ items, className }: { items: readonly PlanItem[]; className?: string }): ReactElement {
+  return (
+    <ul className={cn(styles.list, className)}>
+      {items.map((item, index) => (
+        <li key={index} className={styles.item} data-status={item.status}>
+          <PlanGlyph status={item.status} />
+          <span className={styles.text}>{item.content}</span>
+        </li>
+      ))}
+    </ul>
   );
 }

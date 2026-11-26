@@ -3,6 +3,18 @@ import { useEffect, useState, type ReactElement } from 'react';
 import { formatElapsed } from '../lib/chat-turns';
 import { SwapText } from './arc-x/swap-text/swap-text';
 
+/** The clock (epoch ms), read again every second while `on`; no timer while off. Reads no data. */
+export function useNow(on: boolean): number {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    if (!on) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [on]);
+  return now;
+}
+
 /**
  * The time since `since` (epoch ms), `m:ss`, on a 1 s clock that reads no data. Hidden from assistive tech like the
  * load card's clock: the wait line's text says what waits.

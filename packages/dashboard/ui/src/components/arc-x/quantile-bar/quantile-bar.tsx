@@ -7,7 +7,7 @@ import { useEntrance } from '../motion/use-entrance';
 import styles from './quantile-bar.module.css';
 
 export interface QuantileBarProps {
-  /** "Decode speed, qwen3.6-27b" */
+  /** The measure and the model: "<METRIC label>, qwen3.6-27b". */
   label: string;
   /** { n, p05, p50, p95 } from the API. */
   quantiles: Quantiles;

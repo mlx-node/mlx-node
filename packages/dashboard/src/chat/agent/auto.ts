@@ -57,7 +57,7 @@ export interface AutoInput {
   watched: boolean;
   request: PermissionRequest;
   /** The card as it would open. */
-  interaction: PermissionInteraction;
+  interaction: Omit<PermissionInteraction, 'openedAt'>;
   /** This start's guard hook name; null in Chat. */
   guardHook: string | null;
   /** The request is a helper's whose folder is not the Work folder. */

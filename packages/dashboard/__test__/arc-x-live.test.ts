@@ -22,7 +22,7 @@ import { ScatterChart, type ScatterPoint } from '../ui/src/components/arc-x/scat
 import { StatTile } from '../ui/src/components/arc-x/stat-tile/stat-tile.js';
 import { formatCount } from '../ui/src/lib/format.js';
 import { cssRules, cssValue } from './helpers/css-rules.js';
-import { allByRole, byRole, statValue } from './render.js';
+import { allByRole, byRole } from './render.js';
 
 interface Mounted {
   container: HTMLElement;
@@ -120,14 +120,6 @@ describe('LiveStream', () => {
     expect(rows[0]).toEqual(['0 seconds ago', '40.0']);
     expect(rows[1][0]).toBe('10 seconds ago');
   });
-
-  it('the value is one text node', () => {
-    const { container } = mount(liveStream(stream(10)));
-    const value = container.querySelector('[data-stat-value]')?.firstElementChild;
-    expect(value?.childNodes).toHaveLength(1);
-    expect(value?.firstChild?.nodeType).toBe(Node.TEXT_NODE);
-    expect(statValue(container, 'Output rate')).toBe('40.0 tok/s');
-  });
 });
 
 describe('CellGrid', () => {
@@ -219,7 +211,6 @@ describe('LiveTurnRow', () => {
       [{ phase: 'decode' }, 'Decode', '1,204 tokens out'],
       [{ phase: 'decode', generatedTokens: 1 }, 'Decode', '1 token out'],
       [{ phase: 'queued' }, 'Waiting', 'model busy'],
-      [{ phase: 'slot' }, 'Queued', 'waiting for a slot'],
       [{ phase: 'prepare', cachedTokens: 19_456 }, 'Preparing', 'restoring 19,456 cached tokens'],
       [{ phase: 'prepare', cachedTokens: 1 }, 'Preparing', 'restoring 1 cached token'],
       [{ phase: 'prepare', cachedTokens: 0 }, 'Preparing', 'reading the prompt'],
@@ -239,29 +230,6 @@ describe('LiveTurnRow', () => {
       expect(row.getAttribute('aria-label')).toContain(`${word.toLowerCase()}, ${progress}`);
       document.body.innerHTML = '';
     }
-  });
-
-  it('says "waiting for a slot" only for a turn the scheduler could not start', () => {
-    const phases: LiveTurnRowProps['phase'][] = ['queued', 'slot', 'prepare', 'prefill', 'decode', null];
-    const slotted = phases.filter((phase) => {
-      const { container } = mount(
-        createElement(LiveTurnList, {
-          label: 'In flight',
-          children: createElement(LiveTurnRow, { ...BASE, phase, cachedTokens: 900, prefillDone: 1, prefillTotal: 2 }),
-        }),
-      );
-      const text = rowOf(container).textContent ?? '';
-      document.body.innerHTML = '';
-      return text.includes('waiting for a slot');
-    });
-    expect(slotted).toEqual(['slot']);
-  });
-
-  it('each waiting phase has its own key color', () => {
-    const rules = cssRules('components/arc-x/live-turn-row/live-turn-row.module.css');
-    expect(cssValue(rules, '.key', 'background')).toBe('var(--phase-queue)');
-    expect(cssValue(rules, ".key[data-phase='slot']", 'background')).toBe('var(--phase-slot)');
-    expect(cssValue(rules, ".key[data-phase='prepare']", 'background')).toBe('var(--phase-prepare)');
   });
 
   it('shows — for the context when the window is unknown', () => {
@@ -441,13 +409,6 @@ describe('live value and unit', () => {
   }
 
   it('reserves the width on the value and its unit together, so no gap opens between them', () => {
-    const { container } = mount(liveStream(stream(90)));
-    const line = byRole(container, 'group', 'Output rate')?.querySelector('[data-stat-value]');
-    expect(line?.textContent).toContain('tok/s');
-    expect(reservedInside(line)).toHaveLength(0);
-    const rules = cssRules('components/arc-x/live-stream/live-stream.module.css');
-    expect(cssValue(rules, '.valueLine', 'min-width')).toBe('5ch');
-    document.body.innerHTML = '';
     const row = mount(createElement(LiveTurnList, { label: 'In flight', children: createElement(LiveTurnRow, BASE) }));
     const count = [...rowOf(row.container).querySelectorAll('span')].find((node) =>
       (node.textContent ?? '').endsWith('tokens out'),

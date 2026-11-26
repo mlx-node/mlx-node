@@ -70,6 +70,8 @@ export interface WorkerApiContext extends ApiPaths {
   chatSessions: AgentSessionsReader;
   /** A read-only view of `conversations.json`: the Work sessions the app created. The main thread writes it. */
   chatIndex: () => WorkIndex;
+  /** Where Work without a folder makes each conversation's own folder (`~/Portato`): its rows are marked. */
+  scratchRoot: string;
 }
 
 /** The transport thread's context: it alone holds the download manager and the live watcher. */

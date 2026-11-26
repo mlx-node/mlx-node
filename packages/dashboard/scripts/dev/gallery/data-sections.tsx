@@ -5,6 +5,8 @@
 
 import { type ReactElement, useEffect, useState } from 'react';
 
+import { ActivityStrip } from '../../../ui/src/components/arc-x/activity-strip/activity-strip';
+import { PHASE_BANDS, type StackPoint } from '../../../ui/src/components/arc-x/activity-strip/phase-stack';
 import {
   AgentTimeline,
   AgentTimelineLoading,
@@ -23,7 +25,11 @@ import { DraftSweep } from '../../../ui/src/components/arc-x/draft-sweep/draft-s
 import { Histogram, type HistogramBin } from '../../../ui/src/components/arc-x/histogram/histogram';
 import { KpiDrilldown, type KpiDetail } from '../../../ui/src/components/arc-x/kpi-drilldown/kpi-drilldown';
 import { LiveStream, type LiveStreamPoint } from '../../../ui/src/components/arc-x/live-stream/live-stream';
-import { LiveTurnList, LiveTurnRow } from '../../../ui/src/components/arc-x/live-turn-row/live-turn-row';
+import {
+  EngineStateBadge,
+  LiveTurnList,
+  LiveTurnRow,
+} from '../../../ui/src/components/arc-x/live-turn-row/live-turn-row';
 import { MetricTicker, type TickerItem } from '../../../ui/src/components/arc-x/metric-ticker/metric-ticker';
 import { MiniSpark } from '../../../ui/src/components/arc-x/mini-spark/mini-spark';
 import { ModelBadge } from '../../../ui/src/components/arc-x/model-badge/model-badge';
@@ -35,7 +41,8 @@ import { StackedBarChart } from '../../../ui/src/components/arc-x/stacked-bar-ch
 import { StatGroup, StatTile } from '../../../ui/src/components/arc-x/stat-tile/stat-tile';
 import { TrendChart } from '../../../ui/src/components/arc-x/trend-chart/trend-chart';
 import { timelineAxis } from '../../../ui/src/lib/agent-timeline';
-import { formatClock, formatCount, formatDuration, formatNumber } from '../../../ui/src/lib/format';
+import { formatClock, formatCount, formatDuration, formatNumber, formatTps } from '../../../ui/src/lib/format';
+import { METRIC } from '../../../ui/src/lib/metric-strings';
 import { TOKEN_SERIES } from '../../../ui/src/lib/series';
 import { TimelineLoadError, TimelineNoTimes } from '../../../ui/src/pages/session-detail/turn-timeline';
 
@@ -911,27 +918,68 @@ function livePoints(seconds: number): LiveStreamPoint[] {
   return out;
 }
 
+/** Lanes by phase per second: a prefill, then decode, a short prepare; two lanes and a wait every other minute. */
+function liveStack(seconds: number): StackPoint[] {
+  const out: StackPoint[] = [];
+  for (let s = 1; s <= seconds; s += 1) {
+    if (s > 100 && s <= 130) continue;
+    const cycle = s % 20;
+    const pair = s % 60 >= 30;
+    const values = {
+      decode: cycle >= 3 && cycle < 17 ? (pair ? 2 : 1) : pair && cycle < 3 ? 1 : 0,
+      prefill: cycle < 3 ? 1 : 0,
+      other: cycle === 17 ? 0.4 : 0,
+      waiting: pair && cycle >= 17 ? 1 : 0,
+    };
+    out.push({ t0: LIVE_START + (s - 1) * 1000, t1: LIVE_START + s * 1000, values });
+  }
+  return out;
+}
+
 export function LiveStreamSection(): ReactElement {
   const tick = useTick(1000);
   const seconds = 400 + tick;
+  const points = livePoints(seconds);
+  const stack = liveStack(seconds);
+  const now = LIVE_START + seconds * 1000;
+  const prefilling = seconds % 20 < 3;
+  const newest = points[points.length - 1]?.value ?? null;
   return (
     <div className="gallery-grid">
       <LiveStream
-        label="Output rate"
+        label={METRIC.outputRate.label}
         unit="tok/s"
-        points={livePoints(seconds)}
-        nowMs={LIVE_START + seconds * 1000}
+        points={points}
+        nowMs={now}
         live
-        status="Idle"
+        state={
+          <EngineStateBadge
+            state={prefilling ? 'prefill' : 'decode'}
+            lanes={{ decode: prefilling ? 0 : 1, prefill: prefilling ? 1 : 0, other: 0, waiting: 0 }}
+          />
+        }
+        readouts={[
+          {
+            key: 'output',
+            label: METRIC.outputRate.label,
+            value: newest === null ? null : formatTps(newest),
+            unit: METRIC.outputRate.unit,
+            tip: METRIC.outputRate.tip,
+            quiet: prefilling,
+          },
+          {
+            key: 'prefill',
+            label: METRIC.prefillSpeed.label,
+            value: seconds % 40 < 20 ? formatTps(1135) : null,
+            unit: METRIC.prefillSpeed.unit,
+            tip: METRIC.prefillSpeed.tip,
+            quiet: !prefilling,
+          },
+        ]}
+        stack={{ label: METRIC.timeByPhase.label, unit: 'lanes', bands: PHASE_BANDS, points: stack }}
       />
-      <LiveStream
-        label="Stopped stream"
-        unit="tok/s"
-        points={[]}
-        nowMs={LIVE_START}
-        live={false}
-        status="Not running"
-      />
+      <LiveStream label="Stopped stream" unit="tok/s" points={[]} nowMs={LIVE_START} live={false} />
+      <ActivityStrip points={stack} bands={PHASE_BANDS} nowMs={now} label="Engine activity, last 2 minutes" />
     </div>
   );
 }
@@ -974,6 +1022,22 @@ export function LiveTurnSection(): ReactElement {
         promptTokens={31_000}
         cachedTokens={0}
         ctxWindow={131_072}
+        prefillElapsedMs={(1 + Math.min(tick, 12)) * 1000}
+        decodeElapsedMs={decoding ? (tick - 12) * 1000 : null}
+      />
+      <LiveTurnRow
+        key="one-shot"
+        model="qwen3.6-27b"
+        dispatchLabel="continue_tool"
+        phase="prefill"
+        elapsedMs={1_000 + (tick % 10) * 1000}
+        prefillDone={0}
+        prefillTotal={6_127}
+        generatedTokens={null}
+        promptTokens={6_127}
+        cachedTokens={82_464}
+        ctxWindow={131_072}
+        prefillElapsedMs={(tick % 10) * 1000}
       />
       <LiveTurnRow
         key="b"
@@ -987,6 +1051,7 @@ export function LiveTurnSection(): ReactElement {
         promptTokens={3_900}
         cachedTokens={0}
         ctxWindow={32_768}
+        decodeElapsedMs={(20 + tick) * 1000}
       />
       {tick % 8 < 5 ? (
         <LiveTurnRow
@@ -1001,6 +1066,8 @@ export function LiveTurnSection(): ReactElement {
           promptTokens={null}
           cachedTokens={tick % 8 < 4 ? null : 19_456}
           ctxWindow={null}
+          waitMs={(tick % 8) * 1000}
+          slotMs={((tick % 8) - 2) * 1000}
         />
       ) : null}
       <LiveTurnRow

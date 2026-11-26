@@ -68,6 +68,7 @@ import {
 import { readPipelineStats, readResidency, type PipelineStats, type TurnProgressSnapshot } from './native-progress.js';
 import { reasoningOutcomeOf, type NativeReasoningOutcome } from './native-thinking.js';
 import type { MeasuredPrefill } from './timing.js';
+import { WORK, type LaneMark, type WorkLedger } from './work-ledger.js';
 
 /** Read the process-wide cold-tier snapshot; the native addon may be absent (unit tests). */
 function safeColdStats(): ColdCacheStats | undefined {
@@ -142,14 +143,9 @@ export interface TurnCounters {
   error: number;
   cancelled: number;
   outputTokens: number;
-  /**
-   * Tokens of streaming turns only. A non-stream turn credits all its tokens at
-   * settle, so a live rate must read this counter, never `outputTokens`.
-   */
-  streamedTokens: number;
 }
 
-const COUNTERS: TurnCounters = { ok: 0, error: 0, cancelled: 0, outputTokens: 0, streamedTokens: 0 };
+const COUNTERS: TurnCounters = { ok: 0, error: 0, cancelled: 0, outputTokens: 0 };
 
 export function turnCounters(): Readonly<TurnCounters> {
   return { ...COUNTERS };
@@ -349,6 +345,8 @@ export interface TurnTraceDeps {
   memory?: () => { activeBytes: number; peakBytes: number } | undefined;
   /** Process-wide pipeline counter; defaults to the native addon. Null while the counter is off. */
   pipelineStats?: () => PipelineStats | null;
+  /** Lane time ledger the turns credit; defaults to the process-wide {@link WORK}. */
+  work?: WorkLedger;
 }
 
 /**
@@ -408,6 +406,8 @@ interface TurnContext {
   progress: TraceControl | null;
   /** Generated tokens already added to the process counter. */
   creditedTokens: number;
+  /** This turn's lane in the work ledger. */
+  work: LaneMark;
   /** The pipeline counter at dispatch; null while it is off. */
   pipelines: PipelineStats | null;
   /** The thinking budget, the guard and `maxNewTokens` of the config sent to native. */
@@ -566,9 +566,10 @@ export class TurnTraceModel implements SessionCapableModel {
           : undefined;
   }
 
-  /** Live turns of this model. Also credits streamed tokens to the process counter. */
+  /** Live turns of this model. Also credits streamed tokens to the process counter and lane time to the work ledger. */
   liveTurns(): LiveTurn[] {
     const out: LiveTurn[] = [];
+    const now = this.now();
     for (const ctx of this.liveCtx) {
       let progress: TurnProgressSnapshot | null = null;
       try {
@@ -579,9 +580,10 @@ export class TurnTraceModel implements SessionCapableModel {
       const generated = progress?.generatedTokens;
       if (typeof generated === 'number' && generated > ctx.creditedTokens) {
         COUNTERS.outputTokens += generated - ctx.creditedTokens;
-        COUNTERS.streamedTokens += generated - ctx.creditedTokens;
         ctx.creditedTokens = generated;
       }
+      // After the stream bridge cleared its reader the captured last snapshot still holds the lane's clocks.
+      this.ledger.observe(ctx.work, progress ?? ctx.progress?.last ?? null, now);
       out.push({
         traceId: ctx.traceId,
         model: this.modelNameOf(ctx),
@@ -610,6 +612,10 @@ export class TurnTraceModel implements SessionCapableModel {
 
   private get now(): () => number {
     return this.deps.now ?? Date.now;
+  }
+
+  private get ledger(): WorkLedger {
+    return this.deps.work ?? WORK;
   }
 
   /**
@@ -652,6 +658,7 @@ export class TurnTraceModel implements SessionCapableModel {
       }
     }
     const traced = config as TracedChatConfig | null | undefined;
+    const startMs = this.now();
     const ctx: TurnContext = {
       traceId: randomUUID(),
       sessionId: typeof config?.cacheOwnerId === 'string' ? config.cacheOwnerId : undefined,
@@ -659,7 +666,7 @@ export class TurnTraceModel implements SessionCapableModel {
       // (and one wrapper) serves every alias of a model.
       modelAlias: traced?.modelAlias,
       clientSession: traced?.clientSession,
-      startMs: this.now(),
+      startMs,
       cold,
       sidecar,
       done: false,
@@ -673,6 +680,7 @@ export class TurnTraceModel implements SessionCapableModel {
       signal,
       progress: stream ? new TraceControl(outerControl) : null,
       creditedTokens: 0,
+      work: this.ledger.open(startMs),
       pipelines: this.pipelineStats(),
       thinkingBudget: config?.thinkingTokenBudget ?? undefined,
       thinkingGuard: config?.thinkingCycleGuard === true,
@@ -787,15 +795,16 @@ export class TurnTraceModel implements SessionCapableModel {
     return rec;
   }
 
-  /** Remove a turn from the live set and credit its last tokens. */
-  private settle(ctx: TurnContext, totalTokens: number | undefined): void {
+  /** Remove a turn from the live set, credit its last tokens, and close its lane with the final snapshot. */
+  private settle(ctx: TurnContext, totalTokens: number | undefined, snap: TurnProgressSnapshot | null): void {
     this.liveCtx.delete(ctx);
     if (typeof totalTokens === 'number' && totalTokens > ctx.creditedTokens) {
       COUNTERS.outputTokens += totalTokens - ctx.creditedTokens;
-      if (ctx.stream) COUNTERS.streamedTokens += totalTokens - ctx.creditedTokens;
       ctx.creditedTokens = totalTokens;
     }
-    this.lastSettleAt = this.now();
+    const now = this.now();
+    this.ledger.close(ctx.work, snap, now, totalTokens, ctx.stream);
+    this.lastSettleAt = now;
   }
 
   /**
@@ -812,12 +821,12 @@ export class TurnTraceModel implements SessionCapableModel {
     if (ctx.done) return;
     ctx.done = true;
     (this.deps.watermarks ?? SHARED_WATERMARKS).live?.delete(ctx);
-    this.settle(ctx, final.numTokens);
+    const snap = this.readProgress(ctx);
+    this.settle(ctx, final.numTokens, snap);
     COUNTERS.ok += 1;
     try {
       const coldStats = this.deps.coldStats ?? safeColdStats;
       const sidecarStats = this.deps.sidecarStats ?? safeSidecarStats;
-      const snap = this.readProgress(ctx);
       const rec = this.baseRecord(ctx, snap);
       rec.outcome = 'ok';
       rec.finishReason = final.finishReason;
@@ -952,7 +961,7 @@ export class TurnTraceModel implements SessionCapableModel {
     const snap = this.readProgress(ctx);
     this.discardTurn(ctx);
     const total = final !== undefined ? final.numTokens : snap?.generatedTokens;
-    this.settle(ctx, total);
+    this.settle(ctx, total, snap);
     COUNTERS[outcome] += 1;
     try {
       const rec = this.baseRecord(ctx, snap);
@@ -994,8 +1003,9 @@ export class TurnTraceModel implements SessionCapableModel {
   /** Close a turn that is retried elsewhere and must not be recorded. */
   private rerouteTurn(ctx: TurnContext): void {
     if (ctx.done) return;
+    const snap = this.readProgress(ctx);
     this.discardTurn(ctx);
-    this.settle(ctx, undefined);
+    this.settle(ctx, undefined, snap);
     notifyEdge();
   }
 

@@ -20,6 +20,8 @@ export interface ToolChipProps extends Omit<ButtonHTMLAttributes<HTMLButtonEleme
   keepLabel?: boolean;
   /** Where it shortens in a full row: 1 first, then 2. A label of 8 characters or fewer never shortens. */
   give?: 1 | 2;
+  /** A toggle: its state as `aria-pressed`. Absent: the chip opens a menu or acts once. */
+  pressed?: boolean;
 }
 
 /** A 28 px pill that names a tool of the composer and opens its menu. */
@@ -33,6 +35,7 @@ export const ToolChip = forwardRef<HTMLButtonElement, ToolChipProps>(function To
     tone,
     keepLabel = false,
     give,
+    pressed,
     className,
     type = 'button',
     ...rest
@@ -50,6 +53,7 @@ export const ToolChip = forwardRef<HTMLButtonElement, ToolChipProps>(function To
       data-keep-label={keepLabel ? '' : undefined}
       data-give={give !== undefined && label.length > 8 ? give : undefined}
       aria-label={rest['aria-label'] ?? label}
+      aria-pressed={pressed}
       {...rest}
     >
       <span className={styles.icon} aria-hidden="true">

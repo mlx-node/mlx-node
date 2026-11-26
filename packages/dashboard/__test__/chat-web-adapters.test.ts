@@ -5,6 +5,10 @@
  * result text was written by these adapters, in both call shapes.
  */
 
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import type { ConversationEvent } from '../src/chat/types.js';
@@ -435,8 +439,10 @@ describe('a Chat turn with adapter-written web results', () => {
             }
           : { json: { results: [{ title: 'Rust 1.99', text: 'Release notes body.' }] } },
       );
+      const ledgerFile = join(mkdtempSync(join(tmpdir(), 'mlx-web-ledger-')), 'ledger.json');
+      writeFileSync(ledgerFile, JSON.stringify(['https://blog.rust-lang.org/2026/11/01/Rust-1.99.0.html']));
       const tools = new WebTools(
-        { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY },
+        { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY, ledgerFile },
         {
           fetch: (input, init) => fetch(input, init),
           baseUrls: {

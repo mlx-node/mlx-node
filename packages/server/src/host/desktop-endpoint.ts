@@ -68,7 +68,7 @@ function validate(value: DesktopEndpoint): void {
     url.search ||
     url.hash
   )
-    throw new Error('Invalid desktop inference endpoint. Restart the mlx-node app.');
+    throw new Error('Invalid desktop inference endpoint. Restart Portato.');
 }
 
 /** Atomic publication; an older generation must never remove a newer one's credentials. */

@@ -10,6 +10,7 @@ import { hasCredential, isAuthorized, sendUnauthorized } from './auth.js';
 import type { MemoryReleaseAnswer } from './endpoints/memory-release.js';
 import { sendInternalError } from './errors.js';
 import { createHealthReporter, type ServerHealth } from './health.js';
+import type { ReasoningEffortRow } from './host/thinking-levels.js';
 import type { IdleSweeper } from './idle-sweeper.js';
 import { ModelWorkCoordinator } from './model-work-coordinator.js';
 import type { ModelRegistry } from './registry.js';
@@ -74,6 +75,8 @@ export interface PublicModelEntry {
   modality?: 'audio' | 'text';
   task?: 'asr' | 'tts' | 'rerank';
   capabilities?: Record<string, unknown>;
+  /** With `thinkingLevels`: the family's thinking levels, which the agent offers as its reasoning effort option. */
+  reasoningEfforts?: ReasoningEffortRow[];
 }
 
 export interface HandlerOptions {
@@ -154,6 +157,8 @@ export interface HandlerOptions {
   thinkingCycleGuard?: boolean;
   /** See `ServerConfig.thinkingEndText`. */
   thinkingEndText?: string;
+  /** See `ServerConfig.thinkingLevels`. */
+  thinkingLevels?: boolean;
   /** See `ServerConfig.turnJournal`. */
   turnJournal?: TurnJournal;
   /** Serves `POST /v1/memory/release`; supplied by `createServer` when it can release the weights. */
@@ -258,6 +263,7 @@ export function createHandler(
           thinkingTokenBudget: options?.thinkingTokenBudget,
           thinkingCycleGuard: options?.thinkingCycleGuard,
           thinkingEndText: options?.thinkingEndText,
+          ...(options?.thinkingLevels === true ? { thinkingLevels: true } : {}),
           ...(options?.turnJournal !== undefined ? { turnJournal: options.turnJournal } : {}),
           ...(options?.releaseMemory !== undefined ? { releaseMemory: options.releaseMemory } : {}),
         },

@@ -53,6 +53,10 @@ export function totals(overrides: Partial<MetricsTotals> = {}): MetricsTotals {
     decodeWallMs: 0,
     otherWallMs: 0,
     totalWallMs: 0,
+    decodeRatedTokens: 0,
+    decodeRatedMs: 0,
+    prefillRatedTokens: 0,
+    prefillRatedMs: 0,
     ...overrides,
   };
 }
@@ -77,6 +81,11 @@ export function busyTotals(overrides: Partial<MetricsTotals> = {}): MetricsTotal
     decodeWallMs: 60_000,
     otherWallMs: 1_000,
     totalWallMs: 92_000,
+    // 42 tok/s decode and 1,800 tok/s prefill, the medians of `latency()`.
+    decodeRatedTokens: 2_520,
+    decodeRatedMs: 60_000,
+    prefillRatedTokens: 28_800,
+    prefillRatedMs: 16_000,
     ...overrides,
   });
 }
@@ -312,6 +321,8 @@ export function liveTurn(traceId: string, overrides: Partial<LiveTurn> = {}): Li
     waitMs: 3,
     slotMs: 0,
     prepareMs: 120,
+    prefillElapsedMs: 850,
+    decodeElapsedMs: 11_000,
     promptTokens: 31_000,
     cachedTokens: 30_000,
     prefillTotal: 1_000,
@@ -336,7 +347,10 @@ export function process(overrides: Partial<RuntimeProcessLive> = {}): RuntimePro
     coldCapture: { blocks: 63_125, ms: 10_000 },
     health: 'ok',
     mem: { active: 18 * GIB, peak: 21 * GIB, cache: 2 * GIB, wiredLimit: 30 * GIB, rss: 1.2 * GIB },
-    decodeTps: 42.7,
+    work: {
+      ms: { loading: 8_200, waiting: 1_400, prepare: 52_000, prefill: 610_000, decode: 4_100_000, running: 9_000 },
+    },
+    rates: { windowMs: 10_000, outputTps: 42.7, prefillTps: 1_180 },
     loading: [],
     counters: { ok: 1200, error: 3, cancelled: 1, outputTokens: 400_000, loads: 2, rejected: 0 },
     models: [liveModel('qwen3-8b', { inFlight: 1 })],
@@ -365,6 +379,7 @@ export function sched(overrides: Partial<SchedSnapshot> = {}): SchedSnapshot {
   };
 }
 
+/** Its one point carries no phase time, like a range of samples written before the work deltas. */
 export function runtimeSeries(overrides: Partial<RuntimeSeries> = {}): RuntimeSeries {
   const bucketMs = 60_000;
   const to = Math.floor(Date.now() / bucketMs) * bucketMs + bucketMs;
@@ -391,6 +406,11 @@ export function runtimeSeries(overrides: Partial<RuntimeSeries> = {}): RuntimeSe
         cancelledTurns: 0,
         outTokens: 2_000,
         rejected: 2,
+        phaseMs: { loading: 0, waiting: 0, prepare: 0, prefill: 0, decode: 0, running: 0 },
+        rateOutTokens: 0,
+        rateOutMs: 0,
+        ratePrefillTokens: 0,
+        ratePrefillMs: 0,
       },
     ],
     procs: [

@@ -7,15 +7,21 @@
 import { useSyncExternalStore } from 'react';
 
 import { getConnectionGeneration, subscribeConnection } from './connection';
-import type { RuntimeLive } from './types';
+import type { RuntimeLive, WorkMs } from './types';
 
 export interface LiveSample {
   /** snapshot.now */
   t: number;
+  /** The process's own write time (`process.ts`): the clock of `work`; null = no process was running. */
+  at: number | null;
   /** The process these values belong to; null = no process was running. */
   pid: number | null;
-  /** 0 = running and idle; null = no running process, or turns in flight without decode yet (e.g. prefilling). */
-  outTps: number | null;
+  /** `rates.outputTps` as the server sent it: null when no lane decoded in its window or no process runs. */
+  outputTps: number | null;
+  /** `rates.prefillTps` as the server sent it: null when no rated prefill ran in its window or no process runs. */
+  prefillTps: number | null;
+  /** Cumulative lane-ms per state (`work.ms`); null = no process was running. */
+  work: WorkMs | null;
   memActive: number | null;
   memCache: number | null;
   inFlight: number | null;
@@ -61,8 +67,11 @@ function samplesOf(snapshot: RuntimeLive): LiveSample[] {
     }
     out.push({
       t: snapshot.now,
+      at: process.ts,
       pid: process.pid,
-      outTps: process.decodeTps ?? (inFlight > 0 ? null : 0),
+      outputTps: process.rates.outputTps,
+      prefillTps: process.rates.prefillTps,
+      work: process.work.ms,
       memActive: process.mem.active,
       memCache: process.mem.cache,
       inFlight,
@@ -70,7 +79,20 @@ function samplesOf(snapshot: RuntimeLive): LiveSample[] {
     });
   }
   if (out.length > 0) return out;
-  return [{ t: snapshot.now, pid: null, outTps: null, memActive: null, memCache: null, inFlight: null, queued: null }];
+  return [
+    {
+      t: snapshot.now,
+      at: null,
+      pid: null,
+      outputTps: null,
+      prefillTps: null,
+      work: null,
+      memActive: null,
+      memCache: null,
+      inFlight: null,
+      queued: null,
+    },
+  ];
 }
 
 /** Keeps the newest LIVE_HISTORY_MAX snapshot times; the samples of one snapshot share its `t`. */

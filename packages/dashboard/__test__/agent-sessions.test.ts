@@ -28,9 +28,13 @@ import {
   MAX_UPDATES_BYTES,
   resumeCommand,
 } from '../src/agent-sessions/reader.js';
+import { splitCompleteLines } from '../src/agent-sessions/transcript.js';
+import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { deleteSession, renameSession, sweepTombstones, TOMBSTONE_PREFIX } from '../src/agent-sessions/writes.js';
+import { runAgents } from '../ui/src/lib/agents.js';
 import {
   answerLine,
+  type EventLine,
   eventsText,
   finishedLine,
   spawnedLine,
@@ -156,6 +160,33 @@ describe('AgentSessionsReader.list', () => {
     const f = rows.find((s) => s.id === F)!;
     // A fork with no messages and no title is not a husk; it points at its source.
     expect(f).toMatchObject({ kind: 'fork', parentId: P, title: '', lastActiveAt: '2026-10-19T00:00:00Z' });
+  });
+
+  it('a fork the agent copied (`session/fork`): listed with kind fork, its source as parentId and the kept title', () => {
+    const copy = id(0x30);
+    const dir = sessionDir(PROJ, copy);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(
+      join(dir, 'summary.json'),
+      JSON.stringify({
+        info: { id: copy, cwd: '/Users/dev/proj' },
+        session_summary: 'Research the project layout',
+        generated_title: 'Research the project layout',
+        created_at: '2026-10-21T10:00:00Z',
+        updated_at: '2026-10-21T10:00:00Z',
+        num_messages: 4,
+        current_model_id: 'Qwen3.8-27B-UD-Q4_K_M',
+        session_kind: 'fork',
+        parent_session_id: P,
+        forked_at: '2026-10-21T10:00:00Z',
+      }),
+    );
+    writeFileSync(join(dir, 'updates.jsonl'), readFileSync(join(sessionDir(PROJ, P), 'updates.jsonl')));
+    setMtimes(dir, NOW - DAY);
+    const r = reader();
+    const row = r.list({ limit: 500 }).sessions.find((s) => s.id === copy)!;
+    expect(row).toMatchObject({ kind: 'fork', parentId: P, title: 'Research the project layout' });
+    expect(r.detail(copy)!.session.parent).toEqual({ id: P, title: 'Research the project layout' });
   });
 
   it('filters by q over title and cwd, by exact cwd, and paginates', () => {
@@ -348,10 +379,47 @@ describe('AgentSessionsReader.detail', () => {
     expect(detail.transcriptError).toBeUndefined();
   });
 
+  // Mutation: read every session without `helper` → the parent's message in the helper's own log is a note.
+  it("a bare user chunk in an open turn is a note in a session, and stays a message in a helper's own session", () => {
+    const T0 = 1_800_000_000_000;
+    const parentId = '01b40000-0000-7000-8000-000000000000';
+    const childId = '01b40000-0000-7000-8000-000000000001';
+    const bare: EventLine = {
+      at: T0 + 20,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'use pnpm' },
+        _meta: { modelId: 'm' },
+      },
+    };
+    const lines = [userLine(T0, 'Add left-pad'), answerLine(T0 + 10, 'Working'), bare, bare, turnLine(T0 + 40, 40)];
+    writeSession(home, { id: parentId, lines });
+    writeSession(home, { id: childId, lines, parent: { id: parentId, status: 'completed', description: 'Add it' } });
+    setMtimes(home, NOW - DAY);
+    const r = reader();
+    const users = (sid: string) =>
+      r.detail(sid)!.transcript.flatMap((e) => (e.kind === 'user' ? [[e.text, e.note === true] as const] : []));
+    expect(users(childId)).toEqual([
+      ['Add left-pad', false],
+      ['use pnpm', false],
+      ['use pnpm', false],
+    ]);
+    expect(users(parentId)).toEqual([
+      ['Add left-pad', false],
+      ['use pnpm', true],
+    ]);
+    expect(users(childId)).toEqual([
+      ['Add left-pad', false],
+      ['use pnpm', false],
+      ['use pnpm', false],
+    ]);
+  });
+
+  // Mutation: the command keeps `GROK_HOME=` (grok-build's home; `mlx agent` reads `MLX_AGENT_HOME`) → red.
   it('builds the resume command', () => {
     expect(reader().detail(P)!.resumeCommand).toBe(`cd '/Users/dev/proj' && mlx agent --resume ${P}`);
     expect(reader({ defaultAgentHome: '/nonexistent/.mlx-agent' }).detail(P)!.resumeCommand).toBe(
-      `cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`,
+      `cd '/Users/dev/proj' && MLX_AGENT_HOME='${home}' mlx agent --resume ${P}`,
     );
   });
 });
@@ -777,7 +845,102 @@ describe('resumeCommand', () => {
     );
     expect(resumeCommand('/tmp', 'a b', '/h', '/h')).toBe(`cd '/tmp' && mlx agent --resume 'a b'`);
     expect(resumeCommand('/tmp', 'abc', "/x/'h", '/h')).toBe(
-      `cd '/tmp' && GROK_HOME='/x/'\\''h' mlx agent --resume abc`,
+      `cd '/tmp' && MLX_AGENT_HOME='/x/'\\''h' mlx agent --resume abc`,
     );
+  });
+});
+
+describe('AgentSessionsReader.detail: a workflow run with its state.json', () => {
+  const RUN_FIXTURES = fileURLToPath(new URL('./fixtures/workflow-run/', import.meta.url));
+  const PARENT = '01a2167d-b0e0-79b0-b308-cddf84241628';
+  const RUN = 'wf_01a2168534c27fd1a477edb6fad7b0a4';
+  type Run = Extract<TranscriptEntry, { kind: 'workflow' }>;
+  type Json = Record<string, unknown>;
+  /** The real run's parent lines up to the spawns of its second step: the stored roster is the first step's four. */
+  const midRun = (): string => {
+    const lines = splitCompleteLines(readFileSync(join(RUN_FIXTURES, 'parent.jsonl'), 'utf8'));
+    return `${lines.slice(0, lines.findIndex((l) => l.includes('"description":"verify:claims"')) + 1).join('\n')}\n`;
+  };
+  const endState = (): Json => JSON.parse(readFileSync(join(RUN_FIXTURES, 'state.json'), 'utf8')) as Json;
+  /** The end state moved back to `revision`, in `phase`, with the first `agents` roster rows still running. */
+  const stateAt = (revision: number, phase: string, agents: number, detail?: string): string => {
+    const doc = endState();
+    const state = doc.state as Json;
+    const phases = (state.phases as Json[]).map((p, i) => (i === 1 && detail !== undefined ? { ...p, detail } : p));
+    const roster = (state.agents as Json[]).slice(0, agents);
+    return JSON.stringify({
+      ...doc,
+      state: {
+        ...state,
+        revision,
+        status: 'active',
+        current_phase: phase,
+        phases,
+        agents: roster,
+        result_summary: undefined,
+      },
+    });
+  };
+  const write = (state: string): string => {
+    const dir = writeSession(home, { id: PARENT, cwd: '/Users/dev/napi-rs', lines: null });
+    writeFileSync(join(dir, 'updates.jsonl'), midRun());
+    mkdirSync(join(dir, 'workflows', RUN), { recursive: true });
+    writeFileSync(join(dir, 'workflows', RUN, 'state.json'), state);
+    return dir;
+  };
+  const run = (r: AgentSessionsReader): Run =>
+    r.detail(PARENT)!.transcript.find((e): e is Run => e.kind === 'workflow')!;
+
+  // Mutations: always prefer the file → its older roster wins; build the list from the roster alone → the second
+  // step's agents, in no roster yet, are not listed.
+  it('a stale state.json loses to the stored update, a newer one wins; an agent in no roster is still listed', () => {
+    const dir = write(stateAt(9, 'Recon', 2));
+    const r = reader();
+    const stale = run(r);
+    expect(stale).toMatchObject({ revision: 14, currentPhase: 'Verify', agentsUsed: 4 });
+    expect(stale.agents.map((a) => a.label)).toEqual([
+      'track:fix-reality',
+      'track:claims-check',
+      'track:holes',
+      'track:process',
+    ]);
+    expect(stale.phases.map((p) => p.detail)).toEqual([
+      'four independent read-only tracks',
+      'adversarial checks of the key claims',
+      'final maintainer-ready report',
+    ]);
+    expect(stale.history?.filter((h) => h.event === 'log')).toHaveLength(3);
+    const listed = (rows: ReturnType<typeof runAgents>) => rows.get(RUN)!.map((row) => row.label);
+    expect(listed(runAgents(r.detail(PARENT)!.transcript))).toEqual([
+      'track:process',
+      'track:holes',
+      'track:claims-check',
+      'track:fix-reality',
+      'verify:fix-vectors',
+      'verify:claims',
+    ]);
+
+    writeFileSync(join(dir, 'workflows', RUN, 'state.json'), stateAt(19, 'Verify', 6));
+    utimesSync(join(dir, 'workflows', RUN, 'state.json'), new Date(NOW), new Date(NOW));
+    const newer = run(r);
+    expect(newer).toMatchObject({ revision: 19, currentPhase: 'Verify', updatedTs: NOW });
+    expect(newer.agents.map((a) => a.label).slice(4)).toEqual(['verify:fix-vectors', 'verify:claims']);
+  });
+
+  // Mutation: merge the file into the parse that is cached by the stamp of `updates.jsonl` → the second read
+  // answers from the first file.
+  it('a changed state.json with an unchanged updates.jsonl gives a fresh answer', () => {
+    const dir = write(stateAt(15, 'Verify', 4, 'first words'));
+    const r = reader();
+    expect(run(r)).toMatchObject({ revision: 15 });
+    expect(run(r).phases[1]!.detail).toBe('first words');
+    const updates = lstatSync(join(dir, 'updates.jsonl'));
+    writeFileSync(join(dir, 'workflows', RUN, 'state.json'), stateAt(16, 'Verify', 6, 'second words, longer'));
+    expect(lstatSync(join(dir, 'updates.jsonl')).mtimeMs).toBe(updates.mtimeMs);
+    expect(run(r)).toMatchObject({ revision: 16 });
+    expect(run(r).phases[1]!.detail).toBe('second words, longer');
+    rmSync(join(dir, 'workflows'), { recursive: true });
+    expect(run(r)).toMatchObject({ revision: 14 });
+    expect(run(r).history).toBeUndefined();
   });
 });

@@ -1,0 +1,110 @@
+{
+  "description": "mlx-agent v0.3.6 stopping one agent of a running workflow (parallel alpha, beta): the client cancel, its reply, the parent lines that follow. Recorded with a throwaway home against a fake model.",
+  "lines": [
+    {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "method": "_x.ai/subagent/cancel",
+      "params": {
+        "subagentId": "01a21856-39f1-7711-abda-6a9d19545507"
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "id": 4,
+      "result": {
+        "result": {
+          "subagentId": "01a21856-39f1-7711-abda-6a9d19545507",
+          "cancelled": true,
+          "outcome": {
+            "kind": "cancelled"
+          }
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_x.ai/session_notification",
+      "params": {
+        "sessionId": "01a21856-3918-73e2-8d92-c67b5a319337",
+        "update": {
+          "sessionUpdate": "subagent_finished",
+          "subagent_id": "01a21856-39f1-7711-abda-6a9d19545507",
+          "attempt_id": "at1.62f8a3c08f034c2eb84372b2c4e31acc",
+          "child_session_id": "01a21856-39f1-7711-abda-6a9d19545507",
+          "status": "cancelled",
+          "error": "Subagent was cancelled",
+          "tool_calls": 0,
+          "turns": 1,
+          "duration_ms": 2516,
+          "tokens_used": 0,
+          "will_wake": false
+        },
+        "_meta": {
+          "eventId": "01a21856-3918-73e2-8d92-c67b5a319337-32",
+          "agentTimestampMs": 1795704636407
+        }
+      }
+    },
+    {
+      "jsonrpc": "2.0",
+      "method": "_x.ai/session_notification",
+      "params": {
+        "sessionId": "01a21856-3918-73e2-8d92-c67b5a319337",
+        "update": {
+          "sessionUpdate": "workflow_updated",
+          "run_id": "wf_01a2185639d376b2a1c4a4f482ca7fe1",
+          "revision": 6,
+          "name": "stopprobe",
+          "objective": "Stop one agent probe",
+          "status": "active",
+          "foreground": false,
+          "phases": [
+            {
+              "title": "Work",
+              "state": "active"
+            },
+            {
+              "title": "After",
+              "state": "pending"
+            }
+          ],
+          "current_phase": "Work",
+          "agent_budget": 128,
+          "agents_used": 2,
+          "agents_reserved": 0,
+          "agents_remaining": 126,
+          "agent_usage_incomplete": false,
+          "elapsed_ms": 2573,
+          "active_agents": 1,
+          "current_agent_label": "beta",
+          "agents": [
+            {
+              "agent_id": "01a21856-39f1-7711-abda-6a9d19545507",
+              "label": "alpha",
+              "phase": "Work",
+              "state": "failed",
+              "tokens_used": 0,
+              "duration_ms": 2516
+            },
+            {
+              "agent_id": "01a21856-39f1-7711-abda-6aa435da5f97",
+              "label": "beta",
+              "phase": "Work",
+              "state": "running",
+              "tokens_used": 0,
+              "duration_ms": 0
+            }
+          ],
+          "last_event": "phase_entered",
+          "last_event_detail": "Work",
+          "last_event_timestamp": "2026-11-26T14:50:33.837445+00:00"
+        },
+        "_meta": {
+          "eventId": "01a21856-3918-73e2-8d92-c67b5a319337-33",
+          "agentTimestampMs": 1795704636407
+        }
+      }
+    }
+  ]
+}

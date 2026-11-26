@@ -1,6 +1,8 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactElement, type RefObject } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 
+import { ActivityStrip } from '../components/arc-x/activity-strip/activity-strip';
+import { PHASE_BANDS, stackLaneMs, type StackPoint } from '../components/arc-x/activity-strip/phase-stack';
 import { BarList, type BarListRow } from '../components/arc-x/bar-list/bar-list';
 import { ButtonLink } from '../components/arc-x/button-link/button-link';
 import { ChartCard } from '../components/arc-x/chart-card/chart-card';
@@ -8,8 +10,7 @@ import { DataTable, type DataColumn } from '../components/arc-x/data-table/data-
 import { KeyValue } from '../components/arc-x/key-value/key-value';
 import { KpiDrilldown } from '../components/arc-x/kpi-drilldown/kpi-drilldown';
 import { LiveDot, type LiveDotProps } from '../components/arc-x/live-dot/live-dot';
-import { LiveTurnList } from '../components/arc-x/live-turn-row/live-turn-row';
-import { MiniSpark } from '../components/arc-x/mini-spark/mini-spark';
+import { EngineStateBadge, LiveTurnList } from '../components/arc-x/live-turn-row/live-turn-row';
 import { ModelBadge } from '../components/arc-x/model-badge/model-badge';
 import { NumberValue } from '../components/arc-x/number-value/number-value';
 import { Panel } from '../components/arc-x/panel/panel';
@@ -20,9 +21,12 @@ import { StatGroup, StatTile } from '../components/arc-x/stat-tile/stat-tile';
 import { SwapText } from '../components/arc-x/swap-text/swap-text';
 import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
+import { Tooltip } from '../components/arc/tooltip/tooltip';
 import { useTurnDrawer } from '../components/turn-drawer';
+import { fill } from '../lib/chat-strings';
+import { cn } from '../lib/cn';
 import { coldWindowTotals } from '../lib/cold-tier';
-import { engineSummary, pickProcess, recentSpark } from '../lib/engine-view';
+import { engineState, engineSummary, HOST_WORD, pickProcess, rateText, stackPoints } from '../lib/engine-view';
 import {
   formatBytes,
   formatBytesParts,
@@ -40,7 +44,9 @@ import {
 import { healthChecks, type CheckTone } from '../lib/health-checks';
 import { useHeld } from '../lib/held';
 import { useDataVersion, useRuntimeLive } from '../lib/live';
-import { LIVE_GAP_MS, useLiveHistory } from '../lib/live-history';
+import { useLiveHistory } from '../lib/live-history';
+import { useLiveLanes, visibleLanes } from '../lib/live-lanes';
+import { ENGINE_PANEL, METRIC } from '../lib/metric-strings';
 import {
   isKpiKey,
   KPI_LABEL,
@@ -99,7 +105,31 @@ const CHECK_DOT: Record<CheckTone, LiveDotProps['tone']> = {
 
 const OUTCOME_TONE = { ok: 'neutral', error: 'danger', cancelled: 'warning' } as const;
 
-const SPARK_SAMPLES = 60;
+/** The span of the activity strip; its name says "last 2 minutes". */
+const ACTIVITY_WINDOW_MS = 120_000;
+
+const ACTIVITY_KEYS: readonly string[] = PHASE_BANDS.map((band) => band.key);
+
+/**
+ * The strip's accessible name: each band's lane time over the observed part of the window, then the idle rest
+ * ("decode 68%, prefill 15%, idle 17%"). Lanes add up, so the idle rest is left out once they fill the time.
+ */
+function activityLabel(points: readonly StackPoint[], now: number): string {
+  const { laneMs, coveredMs } = stackLaneMs(points, ACTIVITY_KEYS, now - ACTIVITY_WINDOW_MS, now);
+  if (coveredMs <= 0) return ENGINE_PANEL.activityNone;
+  const shares: string[] = [];
+  let busy = 0;
+  for (const band of PHASE_BANDS) {
+    const share = laneMs[band.key] / coveredMs;
+    busy += share;
+    if (share > 0) {
+      shares.push(fill(ENGINE_PANEL.activityShare, { band: band.label.toLowerCase(), pct: formatPercent(share) }));
+    }
+  }
+  const idle = 1 - busy;
+  if (idle > 1e-6) shares.push(fill(ENGINE_PANEL.activityShare, { band: ENGINE_PANEL.idle, pct: formatPercent(idle) }));
+  return fill(ENGINE_PANEL.activity, { shares: shares.join(', ') });
+}
 
 const TILE_ORDER: readonly KpiKey[] = ['turns', 'tokens', 'decode', 'ttft', 'failed'];
 
@@ -189,7 +219,7 @@ function EnginePanel({
       <LiveDot tone={dot.tone} pulse={dot.pulse} label={dot.label} showLabel shimmer={shimmer} />
       {process === null ? null : (
         <span className="text-body text-secondary tabular-nums">
-          {`${process.host} · :${String(process.port)} · up `}
+          {`${HOST_WORD[process.host]} · :${String(process.port)} · up `}
           <SwapText text={formatDuration(Math.max(0, live.now - process.startedAt))} granularity="char" />
         </span>
       )}
@@ -250,42 +280,75 @@ function ProcessBody({
   locals: ModelsResponse | undefined;
   history: ReturnType<typeof useLiveHistory>;
 }): ReactElement {
-  const tps = process.decodeTps ?? 0;
-  const spark = recentSpark(history, (sample) => sample.outTps, process.pid, SPARK_SAMPLES, LIVE_GAP_MS);
+  const state = engineState(process);
+  const output = rateText(process.rates.outputTps);
+  const prefill = rateText(process.rates.prefillTps);
+  const stack = useMemo(() => stackPoints(history, process.pid), [history, process.pid]);
   const inFlight = sum(process.models.map((model) => model.inFlight));
   const queued = sum(process.models.map((model) => model.queued));
-  const turns = [...process.turns].sort((a, b) => a.startedAt - b.startedAt);
+  const lanes = useLiveLanes(process.turns, live.now, process.pid);
   const body = useRef<HTMLDivElement>(null);
-  const shown = turns.slice(0, usePageAtLeastMd(body) ? 3 : 2);
+  const shown = visibleLanes(lanes, usePageAtLeastMd(body) ? 3 : 2);
   const running = process.status === 'running';
   return (
     <>
       <div ref={body} className="flex flex-wrap items-center gap-x-4 gap-y-2">
-        <span className="inline-flex min-w-[7ch] items-baseline gap-1.5 font-heading text-hero">
+        <EngineStateBadge state={state.key} live={running} />
+        {/* The rate covers the last 10 s: quiet while no lane decodes now. */}
+        <span
+          role="group"
+          aria-label={METRIC.outputRate.label}
+          className={cn(
+            'inline-flex min-w-[7ch] items-baseline gap-1.5 font-heading text-hero',
+            state.lanes.decode === 0 && 'text-secondary',
+          )}
+        >
           <span className="tabular-nums" data-stat-value="">
-            <NumberValue text={formatTps(tps)} />
+            <NumberValue text={output} />
           </span>
-          <span className="font-sans text-body text-secondary">tok/s</span>
+          <Tooltip content={METRIC.outputRate.tip}>
+            <span className="font-sans text-body text-secondary" tabIndex={0}>
+              {`${METRIC.outputRate.unit} ${ENGINE_PANEL.out}`}
+            </span>
+          </Tooltip>
         </span>
-        <MiniSpark data={spark} label="Output rate, last minutes" width={96} height={24} />
+        {prefill === null ? null : (
+          <Tooltip content={METRIC.prefillSpeed.tip}>
+            <span
+              role="group"
+              aria-label={METRIC.prefillSpeed.label}
+              className="text-body text-secondary tabular-nums"
+              tabIndex={0}
+            >
+              <SwapText text={`${prefill} ${METRIC.prefillSpeed.unit} ${ENGINE_PANEL.prefill}`} />
+            </span>
+          </Tooltip>
+        )}
+        <ActivityStrip
+          points={stack}
+          bands={PHASE_BANDS}
+          nowMs={live.now}
+          windowMs={ACTIVITY_WINDOW_MS}
+          label={activityLabel(stack, live.now)}
+        />
         <span className="text-body text-secondary tabular-nums">
           <SwapText text={`${formatNumber(inFlight)} in flight · ${formatNumber(queued)} queued`} />
         </span>
       </div>
-      {turns.length === 0 ? (
+      {lanes.length === 0 ? (
         <p className="text-body text-secondary">
           {latest === undefined ? 'Idle.' : `Idle. Last turn finished ${formatRelativeTime(latest.ts)}.`}
         </p>
       ) : (
         <div className="grid gap-1">
           <LiveTurnList label="Turns in flight">
-            {shown.map((turn) => (
-              <TurnRowFor key={turn.traceId} turn={turn} now={live.now} live={running} density="compact" />
+            {shown.map((lane) => (
+              <TurnRowFor key={lane.key} lane={lane} now={live.now} live={running} density="compact" />
             ))}
           </LiveTurnList>
-          {turns.length > shown.length ? (
+          {lanes.length > shown.length ? (
             <Link to="/engine" className="link text-body">
-              {`+${formatNumber(turns.length - shown.length)} more`}
+              {`+${formatNumber(lanes.length - shown.length)} more`}
             </Link>
           ) : null}
         </div>
@@ -356,7 +419,7 @@ export default function Overview(): ReactElement {
     () =>
       data === undefined
         ? null
-        : kpiTiles(data, versusText('24h'), 'median').map((tile) =>
+        : kpiTiles(data, versusText('24h')).map((tile) =>
             tile.key === 'decode' || tile.key === 'ttft' ? tile : { ...tile, sampleCount: undefined },
           ),
     [data],
@@ -456,7 +519,13 @@ export default function Overview(): ReactElement {
         <span className="tabular-nums">{`${formatCount(row.promptTokens)} → ${formatCount(row.outputTokens)}`}</span>
       ),
     },
-    { id: 'ttft', header: 'First token', align: 'end', minTableWidth: 700, cell: (row) => formatDuration(row.ttftMs) },
+    {
+      id: 'ttft',
+      header: METRIC.firstToken.label,
+      align: 'end',
+      minTableWidth: 700,
+      cell: (row) => formatDuration(row.ttftMs),
+    },
     {
       id: 'decode',
       header: 'Decode',

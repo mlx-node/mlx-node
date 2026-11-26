@@ -357,10 +357,18 @@ pub struct ChatStreamProgress {
     pub cached_tokens: Option<u32>,
     /// Tokens kept so far; known from the `decode` phase on.
     pub generated_tokens: Option<u32>,
-    /// Milliseconds from prefill start to the first token (or to now).
+    /// Milliseconds from prefill start to the first token (or to now, or
+    /// to the end of the turn).
     pub prefill_elapsed_ms: Option<f64>,
-    /// Milliseconds since the first token.
+    /// Milliseconds from the first token to now, or to the end of the turn.
     pub decode_elapsed_ms: Option<f64>,
+    /// Milliseconds from the start of a whole turn to its prefill start,
+    /// when the prefill start moved there: `prefill_elapsed_ms` counted
+    /// them before and no longer does.
+    pub setup_ms: Option<f64>,
+    /// Milliseconds since the terminal chunk or error was sent. The elapsed
+    /// clocks stop there.
+    pub since_done_ms: Option<f64>,
 }
 
 /// In-flight non-streaming chat turn returned by the internal

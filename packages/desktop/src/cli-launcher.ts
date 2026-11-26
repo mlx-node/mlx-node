@@ -6,6 +6,7 @@ import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { promisify } from 'node:util';
 
+import { APP_NAME } from './app-name.js';
 import { CliVerificationCache } from './cli-verification-cache.js';
 
 const execute = promisify(execFile);
@@ -146,7 +147,7 @@ export function createCliLauncher(
           })()
         : await execute(path, ['delegate', '--help'], { env: baseEnv, timeout, maxBuffer });
       if (!stdout.includes('Usage: mlx delegate') || !stdout.includes('mlx delegate github')) {
-        throw new Error('The bundled command does not support delegation. Reinstall or update mlx-node.');
+        throw new Error(`The bundled command does not support delegation. Reinstall or update ${APP_NAME}.`);
       }
     });
     return path;

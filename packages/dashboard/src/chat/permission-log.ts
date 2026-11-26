@@ -1,8 +1,9 @@
 /**
  * `ROOT/permission/<id>.jsonl`: the permission record of one Work conversation. Metadata only: times, tool call ids,
- * access kinds, mode lines and a hash per agent settings file, keyed by the fixed names of {@link SETTINGS_KEYS};
- * never a command, a title or any other path. It is history, never state: the mode lives in memory and is never read
- * back from here.
+ * helper session ids, access kinds, mode lines and a hash per agent settings file, keyed by the fixed names of
+ * {@link SETTINGS_KEYS}; never a command, a title, a note or any other path. A rewind line holds its mode and a count of
+ * files, never their paths. An MCP line holds the server's name and how its request ended, never what was typed. It
+ * is history, never state: the mode lives in memory and is never read back from here.
  */
 
 import { createHash } from 'node:crypto';
@@ -11,9 +12,11 @@ import { chmod, lstat, mkdir, open, readFile, stat, unlink } from 'node:fs/promi
 import { join, sep } from 'node:path';
 
 import { gitRoot } from './agent/auto.js';
-import type { PermissionMark, PermissionMode } from './types.js';
+import { visibleText } from './agent/visible-text.js';
+import type { PermissionMark, PermissionMode, RewindMode } from './types.js';
 
 type Access = Extract<PermissionMark, { kind: 'allowed' }>['access'];
+type McpMark = Extract<PermissionMark, { kind: 'mcp' }>;
 
 /**
  * The agent settings files the app watches: `<root>:<path under the root>`, where the root is the agent home of Work
@@ -57,16 +60,45 @@ export type PermissionLine =
       /** To Auto: the confirm named the temp folder. */
       temp?: true;
     }
-  /** `temp` (Auto only): a real place of the call is in the temp root. */
-  | { kind: 'allowed'; at: number; mode: 'auto' | 'bypass'; toolCallId: string; access: Access; temp?: true }
+  /**
+   * `temp` (Auto only): a real place of the call is in the temp root. `child`: the helper session that asked, a
+   * {@link safeId}; a line written before it existed has none.
+   */
+  | {
+      kind: 'allowed';
+      at: number;
+      mode: 'auto' | 'bypass';
+      toolCallId: string;
+      access: Access;
+      temp?: true;
+      child?: string;
+    }
+  /**
+   * A call the user denied with a note (never the note itself), or one a never-allow rule denied (`ruleId`, never its
+   * words). `child`: the helper session that asked.
+   */
+  | {
+      kind: 'denied';
+      at: number;
+      toolCallId: string;
+      access: Access;
+      by: 'note' | 'rule';
+      ruleId?: string;
+      child?: string;
+    }
   /** The allowed line with this `toolCallId` and `at === of` got no allow: the reader drops both. */
   | { kind: 'withdrawn'; at: number; of: number; toolCallId: string }
-  | { kind: 'settings'; at: number; prints: SettingsPrints; changed: SettingsKey[] };
+  | { kind: 'settings'; at: number; prints: SettingsPrints; changed: SettingsKey[] }
+  /** The user rewound: its mode, how many files were put back, and the time of the first entry it removed. */
+  | { kind: 'rewind'; at: number; mode: RewindMode; files: number; from?: number }
+  /** An MCP server asked for input: its name ({@link storedServer}), the request's mode and how it ended. */
+  | { kind: 'mcp'; at: number; server: string; mode: McpMark['mode']; outcome: McpMark['outcome'] };
 
 /** A line the thread shows: every kind but `withdrawn`. */
 export type ShownLine = Exclude<PermissionLine, { kind: 'withdrawn' }>;
 
 const TOOL_CALL_ID_MAX = 128;
+const SERVER_MAX = 64;
 const LOG_READ_MAX = 16 * 1024 * 1024;
 const SETTINGS_FILE_MAX = 16 * 1024 * 1024;
 
@@ -90,6 +122,27 @@ function storedCallId(id: string): string {
     if (c < 0x21 || c > 0x7e) return '';
   }
   return id;
+}
+
+function printable(c: number): boolean {
+  return c >= 0x20 && !(c >= 0x7f && c <= 0x9f);
+}
+
+/** An MCP server's name as the file keeps it: hidden characters shown as their code, at most 64 characters. */
+export function storedServer(name: string): string {
+  let out = '';
+  for (const ch of visibleText(name)) {
+    const kept = printable(ch.codePointAt(0)!) ? ch : ' ';
+    if (out.length + kept.length > SERVER_MAX) break;
+    out += kept;
+  }
+  return out;
+}
+
+function isServer(value: unknown): value is string {
+  if (typeof value !== 'string' || value.length > SERVER_MAX) return false;
+  for (let i = 0; i < value.length; i++) if (!printable(value.charCodeAt(i))) return false;
+  return true;
 }
 
 function isPrint(value: unknown): value is string {
@@ -183,11 +236,12 @@ export function readPermissionLine(text: string): PermissionLine | null {
     return line;
   }
   if (r.kind === 'allowed') {
-    if (!onlyKeys(r, ['kind', 'at', 'mode', 'toolCallId', 'access', 'temp'])) return null;
+    if (!onlyKeys(r, ['kind', 'at', 'mode', 'toolCallId', 'access', 'temp', 'child'])) return null;
     if (r.mode !== 'auto' && r.mode !== 'bypass') return null;
     if (typeof r.toolCallId !== 'string' || !isAccess(r.access)) return null;
     if (r.mode === 'auto' && r.access !== 'bash' && r.access !== 'edit') return null;
     if (r.temp !== undefined && (r.temp !== true || r.mode !== 'auto')) return null;
+    if (r.child !== undefined && (typeof r.child !== 'string' || !safeId(r.child))) return null;
     const line: PermissionLine = {
       kind: 'allowed',
       at: r.at,
@@ -196,12 +250,48 @@ export function readPermissionLine(text: string): PermissionLine | null {
       access: r.access,
     };
     if (r.temp === true) line.temp = true;
+    if (typeof r.child === 'string') line.child = r.child;
+    return line;
+  }
+  if (r.kind === 'denied') {
+    if (!onlyKeys(r, ['kind', 'at', 'toolCallId', 'access', 'by', 'ruleId', 'child'])) return null;
+    if (typeof r.toolCallId !== 'string' || !isAccess(r.access)) return null;
+    if (r.by !== 'note' && r.by !== 'rule') return null;
+    const by: 'note' | 'rule' = r.by;
+    if (by === 'note' ? r.ruleId !== undefined : typeof r.ruleId !== 'string' || !safeId(r.ruleId)) return null;
+    if (r.child !== undefined && (typeof r.child !== 'string' || !safeId(r.child))) return null;
+    const line: Extract<PermissionLine, { kind: 'denied' }> = {
+      kind: 'denied',
+      at: r.at,
+      toolCallId: storedCallId(r.toolCallId),
+      access: r.access,
+      by,
+    };
+    if (typeof r.ruleId === 'string') line.ruleId = r.ruleId;
+    if (typeof r.child === 'string') line.child = r.child;
     return line;
   }
   if (r.kind === 'withdrawn') {
     if (!onlyKeys(r, ['kind', 'at', 'of', 'toolCallId'])) return null;
     if (!isTime(r.of) || typeof r.toolCallId !== 'string') return null;
     return { kind: 'withdrawn', at: r.at, of: r.of, toolCallId: storedCallId(r.toolCallId) };
+  }
+  if (r.kind === 'rewind') {
+    if (!onlyKeys(r, ['kind', 'at', 'mode', 'files', 'from'])) return null;
+    if (r.mode !== 'all' && r.mode !== 'conversation' && r.mode !== 'files') return null;
+    if (typeof r.files !== 'number' || !Number.isSafeInteger(r.files) || r.files < 0) return null;
+    if (r.from !== undefined && !isTime(r.from)) return null;
+    const line: PermissionLine = { kind: 'rewind', at: r.at, mode: r.mode, files: r.files };
+    if (r.from !== undefined) line.from = r.from;
+    return line;
+  }
+  if (r.kind === 'mcp') {
+    if (!onlyKeys(r, ['kind', 'at', 'server', 'mode', 'outcome'])) return null;
+    if (!isServer(r.server) || (r.mode !== 'form' && r.mode !== 'url')) return null;
+    const outcome = r.outcome;
+    const ended = outcome === 'accept' || outcome === 'decline' || outcome === 'cancel' || outcome === 'expired';
+    if (!ended && !(outcome === 'completed' && r.mode === 'url')) return null;
+    return { kind: 'mcp', at: r.at, server: r.server, mode: r.mode, outcome };
   }
   if (r.kind === 'settings') {
     if (!onlyKeys(r, ['kind', 'at', 'prints', 'changed'])) return null;
@@ -241,8 +331,15 @@ export function readPermissionLines(text: string): ShownLine[] {
   return out;
 }
 
-/** A line as the thread shows it. Lines read from disk carry no card text. */
-export function markOf(line: ShownLine, place: SettingsPlace): PermissionMark {
+/**
+ * A line as the thread shows it. Lines read from disk carry no card text. `ruleWords`: the words of a never-allow rule
+ * as the rule file holds them now, null when it is gone.
+ */
+export function markOf(
+  line: ShownLine,
+  place: SettingsPlace,
+  ruleWords: (id: string) => string | null = () => null,
+): PermissionMark {
   if (line.kind === 'allowed') {
     return {
       kind: 'allowed',
@@ -252,9 +349,34 @@ export function markOf(line: ShownLine, place: SettingsPlace): PermissionMark {
       access: line.access,
       card: null,
       ...(line.temp === true ? { temp: true as const } : {}),
+      ...(line.child !== undefined ? { child: line.child } : {}),
+    };
+  }
+  if (line.kind === 'denied') {
+    return {
+      kind: 'denied',
+      at: line.at,
+      toolCallId: line.toolCallId,
+      access: line.access,
+      by: line.by,
+      ...(line.ruleId !== undefined ? { ruleId: line.ruleId, words: ruleWords(line.ruleId) } : {}),
+      card: null,
+      ...(line.child !== undefined ? { child: line.child } : {}),
     };
   }
   if (line.kind === 'settings') return { kind: 'settings', at: line.at, changed: shownPaths(place, line.changed) };
+  if (line.kind === 'mcp') {
+    return { kind: 'mcp', at: line.at, server: line.server, mode: line.mode, outcome: line.outcome };
+  }
+  if (line.kind === 'rewind') {
+    return {
+      kind: 'rewind',
+      at: line.at,
+      mode: line.mode,
+      files: line.files,
+      ...(line.from === undefined ? {} : { from: line.from }),
+    };
+  }
   const mark: PermissionMark = { kind: 'mode', at: line.at, mode: line.mode, from: line.from, by: line.by };
   if (line.editsUnasked === true) mark.editsUnasked = true;
   if (line.userHooks === true) mark.userHooks = true;
@@ -272,6 +394,18 @@ function lineText(line: PermissionLine): string {
       toolCallId: storedCallId(line.toolCallId),
       access: line.access,
       ...(line.temp === true ? { temp: true } : {}),
+      ...(line.child !== undefined && safeId(line.child) ? { child: line.child } : {}),
+    });
+  }
+  if (line.kind === 'denied') {
+    return JSON.stringify({
+      kind: 'denied',
+      at: line.at,
+      toolCallId: storedCallId(line.toolCallId),
+      access: line.access,
+      by: line.by,
+      ...(line.by === 'rule' && line.ruleId !== undefined && safeId(line.ruleId) ? { ruleId: line.ruleId } : {}),
+      ...(line.child !== undefined && safeId(line.child) ? { child: line.child } : {}),
     });
   }
   if (line.kind === 'withdrawn') {
@@ -279,6 +413,24 @@ function lineText(line: PermissionLine): string {
   }
   if (line.kind === 'settings') {
     return JSON.stringify({ kind: 'settings', at: line.at, prints: printsText(line.prints), changed: line.changed });
+  }
+  if (line.kind === 'mcp') {
+    return JSON.stringify({
+      kind: 'mcp',
+      at: line.at,
+      server: storedServer(line.server),
+      mode: line.mode,
+      outcome: line.outcome,
+    });
+  }
+  if (line.kind === 'rewind') {
+    return JSON.stringify({
+      kind: 'rewind',
+      at: line.at,
+      mode: line.mode,
+      files: line.files,
+      ...(line.from === undefined ? {} : { from: line.from }),
+    });
   }
   const out: Record<string, unknown> = { kind: 'mode', at: line.at, mode: line.mode, from: line.from, by: line.by };
   if (line.prints !== undefined) out.prints = printsText(line.prints);

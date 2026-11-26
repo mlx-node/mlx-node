@@ -14,8 +14,14 @@ export interface EventRowProps {
   to?: string;
   /** Nullish and empty entries are skipped, joined with " · ". */
   facts?: ReadonlyArray<string | null | undefined>;
-  tone?: 'neutral' | 'danger';
+  tone?: 'neutral' | 'warning' | 'danger';
   error?: string;
+  /** Muted text under the line: the agent's own words on the event. */
+  detail?: string;
+  /** A second muted line of facts, for what does not fit the head's three. */
+  sub?: ReactNode;
+  /** One control at the end of the line, before the time (a small button). */
+  action?: ReactNode;
   ts?: number;
   className?: string;
   /** Added to the label's own class (an ink of its own). */
@@ -55,6 +61,9 @@ export function EventRow(props: EventRowProps): ReactElement {
           </span>
         )}
         {facts.length > 0 ? <span className={styles.facts}>{facts.join(' · ')}</span> : null}
+        {props.action !== undefined && props.action !== null ? (
+          <span className={styles.action}>{props.action}</span>
+        ) : null}
         {timed && props.ts !== undefined ? (
           <time
             className={styles.time}
@@ -65,7 +74,9 @@ export function EventRow(props: EventRowProps): ReactElement {
           </time>
         ) : null}
       </div>
+      {props.sub !== undefined && props.sub !== null ? <div className={styles.sub}>{props.sub}</div> : null}
       {props.error !== undefined && props.error !== '' ? <p className={styles.error}>{props.error}</p> : null}
+      {props.detail !== undefined && props.detail !== '' ? <p className={styles.rowDetail}>{props.detail}</p> : null}
     </div>
   );
 }

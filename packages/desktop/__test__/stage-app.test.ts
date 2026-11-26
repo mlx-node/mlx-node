@@ -48,6 +48,7 @@ import {
   WINDOWS_RUNTIME_BUILD_FILES,
   workspaceShipEntries,
 } from '../scripts/stage-app.js';
+import { APP_NAME } from '../src/app-name.js';
 
 interface SeedDeps {
   dependencies?: Record<string, string>;
@@ -238,6 +239,23 @@ describe('packaged update eligibility', () => {
       stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['fixture'], autoUpdates });
       const manifest = JSON.parse(readFileSync(join(stage, 'package.json'), 'utf-8')) as { autoUpdates: boolean };
       expect(manifest.autoUpdates).toBe(autoUpdates === true);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('staged display name', () => {
+  it('names the packaged app APP_NAME whatever the source manifest says', () => {
+    const root = mkdtempSync(join(tmpdir(), 'mlx-name-stage-'));
+    const stage = join(root, 'stage');
+    try {
+      const desktop = seedDesktop(root);
+      writeFileSync(join(desktop, 'package.json'), JSON.stringify({ version: '0.0.1', productName: 'mlx-node' }));
+      seedPkg(root, 'fixture');
+      stageApp({ repoRoot: root, desktopDir: desktop, stageDir: stage, roots: ['fixture'] });
+      const manifest = JSON.parse(readFileSync(join(stage, 'package.json'), 'utf-8')) as { productName: string };
+      expect(manifest.productName).toBe(APP_NAME);
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

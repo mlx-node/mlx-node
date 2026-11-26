@@ -5,7 +5,7 @@ import { CompactField } from '../components/arc-x/compact-field/compact-field';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
 import SegmentedControl from '../components/arc/segmented-control/segmented-control';
 import { Select } from '../components/arc/select/select';
-import { engineSummary, pickProcess, procKeyOf, seriesStarts } from '../lib/engine-view';
+import { engineSummary, HOST_WORD, pickProcess, procKeyOf, seriesStarts } from '../lib/engine-view';
 import { useHeld } from '../lib/held';
 import { useDataVersion, useRuntimeLive } from '../lib/live';
 import { useLiveHistory } from '../lib/live-history';
@@ -13,6 +13,8 @@ import { ENGINE_RANGE_OPTIONS, engineRange, isEngineRangeKey, type EngineRangeKe
 import type { ModelsResponse, RuntimeSeries } from '../lib/types';
 import { LIVE_REFETCH_FAST_MS, useJson } from '../lib/use-api';
 import { Page, PageHeader } from '../shell/page';
+import { useChatHost } from './chat/use-chat-host';
+import { useUnload } from './chat/use-unload';
 import { FlightSection } from './engine/flight-section';
 import { HistorySection } from './engine/history-section';
 import { ModelsSection } from './engine/models-section';
@@ -25,6 +27,7 @@ const SUMMARY_EVERY_MS = 10_000;
 export default function Engine(): ReactElement {
   const [params, setSearch] = useSearchParams();
   const live = useRuntimeLive();
+  const unload = useUnload(useChatHost().state);
   const history = useLiveHistory();
   const dataVersion = useDataVersion();
   const rawPid = params.get('pid');
@@ -116,7 +119,7 @@ export default function Engine(): ReactElement {
                 label="Process"
                 options={choices.map((item) => ({
                   value: String(item.pid),
-                  label: `${item.host} · :${String(item.port)} · pid ${String(item.pid)}`,
+                  label: `${HOST_WORD[item.host]} · :${String(item.port)} · pid ${String(item.pid)}`,
                 }))}
                 value={process === null ? undefined : String(process.pid)}
                 onValueChange={(value) => setParams({ pid: value })}
@@ -141,7 +144,13 @@ export default function Engine(): ReactElement {
             <>
               <RateAndMemory live={live} process={process} history={history} series={series.data} />
               <FlightSection process={process} now={live.now} />
-              <ModelsSection process={process} now={live.now} locals={locals.data?.models} modelUrl={modelUrl} />
+              <ModelsSection
+                process={process}
+                now={live.now}
+                locals={locals.data?.models}
+                modelUrl={modelUrl}
+                unload={unload.control}
+              />
             </>
           )}
         </>

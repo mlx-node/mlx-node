@@ -1,0 +1,297 @@
+/* The view fills its slot: the head and the field stay, the stream between them scrolls. */
+.root {
+  box-sizing: border-box;
+  display: flex;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  container-type: inline-size;
+}
+
+.root[data-place='column'] {
+  background: var(--background);
+}
+
+.head {
+  display: grid;
+  flex: none;
+  min-width: 0;
+  gap: var(--space-1-5);
+  padding-bottom: var(--space-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.root[data-place='column'] .head {
+  padding: var(--space-2) var(--space-3) var(--space-3);
+}
+
+.bar {
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.back {
+  flex: none;
+  gap: var(--space-0-5);
+  padding-inline-start: var(--space-1);
+}
+
+.needs {
+  color: var(--warning);
+}
+
+.barEnd {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sessions {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-0-5);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+.title {
+  min-width: 0;
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.state {
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.glyph {
+  display: inline-grid;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+.state[data-mark='done'] .glyph {
+  color: var(--success);
+}
+
+.state[data-mark='failed'] .glyph,
+.state[data-mark='failed'] .word {
+  color: var(--danger);
+}
+
+.state[data-mark='asking'] .glyph,
+.state[data-tone='warning'] .word {
+  color: var(--warning);
+}
+
+.word {
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.stateFacts {
+  flex: none;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.controls {
+  margin-inline-start: auto;
+}
+
+.line {
+  min-width: 0;
+  margin: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  line-height: var(--leading-body);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.subRow {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.marks {
+  padding: 0;
+  border: 0;
+  background: none;
+  font: inherit;
+  cursor: pointer;
+}
+
+.attempts {
+  flex: none;
+}
+
+.body {
+  position: relative;
+  display: flex;
+  min-height: 0;
+  flex: 1;
+  flex-direction: column;
+}
+
+.scroll {
+  min-height: 0;
+  flex: 1;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.stream {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+  padding: var(--space-3) 0;
+}
+
+.root[data-place='column'] .stream {
+  padding-inline: var(--space-1);
+}
+
+.copied {
+  opacity: 0.72;
+}
+
+.prompt {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+  margin-inline: var(--space-3);
+  border-radius: var(--radius-surface);
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-muted);
+}
+
+.promptLabel {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  overflow-wrap: anywhere;
+}
+
+.promptText {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.empty {
+  margin: 0;
+  padding: 0 var(--space-3);
+  color: var(--text-secondary);
+}
+
+.failed {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  color: var(--danger);
+}
+
+.jump {
+  position: absolute;
+  z-index: 1;
+  bottom: var(--space-3);
+  left: 50%;
+  translate: -50% 0;
+}
+
+.foot {
+  flex: none;
+  min-width: 0;
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border);
+}
+
+.root[data-place='column'] .foot {
+  padding: var(--space-3);
+}
+
+.field {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1-5);
+}
+
+.notice {
+  margin: 0;
+  color: var(--warning);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.count,
+.hint {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.count[data-tone='danger'],
+.reason {
+  color: var(--danger);
+}
+
+.reason {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.fieldFoot {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.note {
+  margin: 0;
+  color: var(--text-secondary);
+  line-height: var(--leading-body);
+}
+
+/* A narrow view: the bar's links wrap under the back button. */
+@container (max-width: 360px) {
+  .bar {
+    flex-wrap: wrap;
+  }
+}

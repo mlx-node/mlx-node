@@ -1,0 +1,171 @@
+.body {
+  display: grid;
+  gap: var(--space-3);
+}
+
+.loading {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.quote {
+  margin: 0;
+  padding-inline-start: var(--space-3);
+  border-inline-start: 2px solid var(--border-strong);
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: pre;
+}
+
+.facts {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.lead,
+.line,
+.muted {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  text-wrap: pretty;
+  overflow-wrap: anywhere;
+}
+
+.lead {
+  color: var(--foreground);
+}
+
+.line {
+  color: var(--text-secondary);
+}
+
+.muted {
+  color: var(--text-muted);
+}
+
+.warnings {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.warning {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.warningIcon {
+  flex: none;
+  color: var(--warning);
+  transform: translateY(1px);
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.choices,
+.files {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.label {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.conflictDot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--warning);
+}
+
+.fileList {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.file {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.fileLead {
+  width: 12px;
+}
+
+.path {
+  min-width: 0;
+  color: var(--foreground);
+  font-family: var(--font-code);
+  font-size: var(--text-xs);
+}
+
+.fileNote {
+  color: var(--warning);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+}
+
+.note {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.noteIcon {
+  flex: none;
+  transform: translateY(1px);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@media (max-width: 519px) {
+  .file {
+    grid-template-columns: 12px minmax(0, 1fr);
+  }
+
+  .fileNote {
+    grid-column: 2;
+    white-space: normal;
+  }
+}

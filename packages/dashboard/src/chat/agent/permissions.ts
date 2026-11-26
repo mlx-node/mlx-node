@@ -9,7 +9,6 @@ import { posix, win32 } from 'node:path';
 import type { PermissionRequest, PromptResultFacts } from '../acp/messages.js';
 import { redactText } from '../redact.js';
 import type { ChatMode, CommandFlag, PermissionInteraction, PlanInteraction, TurnOutcome } from '../types.js';
-import { forwardsAsWritten, type AddressLedger } from './address-ledger.js';
 import { agentPath, commandFlags, landsOutside, pathFlags, type WorkPlace } from './command-flags.js';
 import {
   ALLOW_EDITS_SESSION_OPTION_ID,
@@ -33,21 +32,24 @@ export type PermissionAnswer = { outcome: 'selected'; optionId: string } | { out
 export type TurnEndCause =
   | 'cancelled'
   | 'tool-refused'
-  | 'address-refused'
   | 'arguments-unreadable'
   | 'tool-loop'
   | 'turn-timeout'
   | 'inference-lost'
   | 'denied'
   /** The Control Panel closed during the turn. */
-  | 'app-closed';
+  | 'app-closed'
+  /** The agent said it has no model it can use (`model_auto_switched` with no new id). */
+  | 'no-model'
+  /** Work: a call matched a never-allow rule once more than an answer may (`NEVER_PER_TURN_MAX`); it got a plain deny. */
+  | 'never-loop';
 
 /** The outcome a recorded cause ends the turn with. */
 export function causeOutcome(cause: TurnEndCause): TurnOutcome {
   return cause === 'app-closed' ? 'interrupted' : cause;
 }
 
-type RefusalCause = 'tool-refused' | 'address-refused' | 'arguments-unreadable';
+type RefusalCause = 'tool-refused' | 'arguments-unreadable';
 
 export type ChatPermissionDecision =
   | { kind: 'approve'; answer: PermissionAnswer; row: 6 | 7 }
@@ -57,7 +59,7 @@ export type ChatPermissionDecision =
       answer: PermissionAnswer;
       cause: RefusalCause;
       cancelTurn: boolean;
-      row: 2 | 3 | 5 | 8;
+      row: 2 | 3 | 8;
     }
   /** Answered `cancelled`, then `session/cancel`. */
   | { kind: 'cancel'; answer: PermissionAnswer; cause: 'tool-refused' | 'tool-loop'; cancelTurn: true; row: 1 | 2 | 4 };
@@ -67,7 +69,6 @@ export interface ChatPermissionContext {
   sessionGuarded: boolean;
   /** Approvals already given in this turn. */
   approvals: number;
-  ledger: AddressLedger;
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -86,8 +87,8 @@ const CALL_KEYS = ['variant', 'tool_name', 'tool_input'] as const;
 /**
  * What the tool receives after an allow: `object` is that object; `none` is no arguments (or `{}`), which the tool
  * answers with `bad-request`; `unreadable` is a text that could still become an object the app cannot read the same way.
- * Only `web_fetch` has a rule on its input (the ledger), so only its `unreadable` text is refused; any other tool gets
- * the same answer as for an object.
+ * Only `web_fetch` has a rule on its input (the `mlx_web` server checks its address against the ledger), so only its
+ * `unreadable` text is refused; any other tool gets the same answer as for an object.
  */
 export type WebToolInput =
   | { kind: 'object'; value: Record<string, unknown> }
@@ -146,7 +147,7 @@ export function decideChatPermission(req: PermissionRequest, ctx: ChatPermission
     return { kind: 'cancel', answer: CANCELLED, cause: 'tool-refused', cancelTurn: true, row: 1 };
   const ids = req.options.map((o) => o.optionId);
   const canReject = ids.includes(REJECT_ONCE_OPTION_ID);
-  const refuse = (cause: RefusalCause, row: 2 | 3 | 5 | 8): ChatPermissionDecision =>
+  const refuse = (cause: RefusalCause, row: 2 | 3 | 8): ChatPermissionDecision =>
     canReject
       ? { kind: 'reject', answer: selected(REJECT_ONCE_OPTION_ID), cause, cancelTurn: false, row }
       : { kind: 'reject', answer: CANCELLED, cause, cancelTurn: true, row };
@@ -162,10 +163,6 @@ export function decideChatPermission(req: PermissionRequest, ctx: ChatPermission
   }
   if (call.toolName === 'mlx_web__web_fetch' && call.input.kind === 'unreadable') {
     return refuse('arguments-unreadable', 8);
-  }
-  const url = call.input.kind === 'object' ? call.input.value.url : undefined;
-  if (call.toolName === 'mlx_web__web_fetch' && typeof url === 'string') {
-    if (!forwardsAsWritten(url) || !ctx.ledger.has(url)) return refuse('address-refused', 5);
   }
   if ((WEB_TOOL_KEYS as readonly string[]).includes(call.toolName)) {
     return { kind: 'approve', answer: selected(ALLOW_ONCE_OPTION_ID), row: 6 };
@@ -228,6 +225,19 @@ export function requestTarget(req: PermissionRequest): { command: string | null;
   };
 }
 
+/** The tools that run their input's `command` in a shell: the ones the Work guard asks for (`WORK_GUARD_MATCHER`). */
+const SHELL_TOOLS: readonly string[] = ['run_terminal_command', 'monitor'];
+
+/**
+ * The shell command a request runs, as it will reach the shell: `text` is null when its `command` is not text. Null
+ * for a tool that runs no shell command.
+ */
+export function shellCommand(req: PermissionRequest): { text: string | null } | null {
+  const name = req.tool?.name ?? null;
+  if (name === null || !SHELL_TOOLS.includes(name)) return null;
+  return { text: stringField(req.rawInput, 'command') };
+}
+
 function inputText(req: PermissionRequest): string {
   try {
     return req.rawInput === undefined ? '' : (JSON.stringify(req.rawInput, null, 2) ?? '');
@@ -267,8 +277,8 @@ export function shownCut(text: string, max: number, needles: readonly string[]):
  * A Work permission request as the page sees it. Only the options of `WORK_OPTIONS` pass, so `enable-always-approve`, every
  * `reject_always` and any other "always" grant are never offered. `place` adds the "outside the work folder" check;
  * `landing` is where an edit really lands once the disk follows its links, which decides that check. A landing that
- * cannot be known (null) is warned about as outside the folder. `from`: the helper that asks, the name of its run, and
- * its folder when that is not the Work folder.
+ * cannot be known (null) is warned about as outside the folder. `from`: the helper that asks, the name of its run, its
+ * folder when that is not the Work folder, and its session. The host stamps `openedAt` when it opens the card.
  */
 export function workInteraction(
   id: string,
@@ -277,7 +287,7 @@ export function workInteraction(
   place?: WorkPlace,
   landing?: string | null,
   from?: NonNullable<PermissionInteraction['from']>,
-): PermissionInteraction {
+): Omit<PermissionInteraction, 'openedAt'> {
   const access = accessOf(req);
   const options: PermissionInteraction['options'] = [];
   for (const o of req.options) {
@@ -328,6 +338,7 @@ export function workInteraction(
             label: shownCut(from.label, TITLE_MAX, needles),
             run: from.run === null ? null : shownCut(from.run, TITLE_MAX, needles),
             cwd: shown(from.cwd),
+            child: from.child,
           },
         }),
   };
@@ -348,7 +359,11 @@ export function readPlanRequest(params: unknown): PlanRequest | null {
   return { sessionId, toolCallId, plan: typeof planContent === 'string' ? planContent : '' };
 }
 
-export function planInteraction(id: string, req: PlanRequest, needles: readonly string[]): PlanInteraction {
+export function planInteraction(
+  id: string,
+  req: PlanRequest,
+  needles: readonly string[],
+): Omit<PlanInteraction, 'openedAt'> {
   return {
     id,
     kind: 'plan',
@@ -363,6 +378,36 @@ export function planAnswer(decision: 'approved' | 'rejected', feedback?: string)
   return feedback === undefined || feedback.trim() === ''
     ? { outcome: 'cancelled' }
     : { outcome: 'cancelled', feedback };
+}
+
+/** Unicode `White_Space` (what Rust's `trim` skips) plus U+FEFF: every text the agent reads as blank is blank here. */
+function isSpace(code: number): boolean {
+  return (
+    (code >= 0x09 && code <= 0x0d) ||
+    code === 0x20 ||
+    code === 0x85 ||
+    code === 0xa0 ||
+    code === 0x1680 ||
+    (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    code === 0x202f ||
+    code === 0x205f ||
+    code === 0x3000 ||
+    code === 0xfeff
+  );
+}
+
+/**
+ * The reply to a permission request denied with the user's note: deny once, the note as `_meta.followup_message`.
+ * The agent then skips the call, adds the note as a user message and goes on. Null for a blank note: the agent
+ * would read that as a plain deny and end the turn.
+ */
+export function noteAnswer(optionId: string, note: string): Record<string, unknown> | null {
+  let blank = true;
+  for (let i = 0; i < note.length && blank; i++) blank = isSpace(note.charCodeAt(i));
+  if (blank) return null;
+  return { outcome: { outcome: 'selected', optionId }, _meta: { followup_message: note } };
 }
 
 export interface TurnEnd {
@@ -385,8 +430,11 @@ export function turnOutcome(end: TurnEnd): TurnOutcome {
       ? 'output-limit'
       : 'model-error';
   }
+  // The agent answers a blocked prompt `end_turn` at once.
+  if (end.recorded === 'no-model') return 'no-model';
   const stop = end.result?.stopReason ?? null;
   if (stop === 'cancelled') {
+    if (end.result?.cancellationCategory === 'HookDenied' && end.recorded === null) return 'hook-stopped';
     if (end.result?.cancellationCategory === 'PermissionRejected') {
       if (end.recorded !== null && end.recorded !== 'cancelled' && end.recorded !== 'app-closed') return end.recorded;
       return end.mode === 'chat' ? 'tool-refused' : 'denied';

@@ -241,11 +241,35 @@ describe('dashboard runtime — route ownership', () => {
       'POST /api/chat/conversations',
       'POST /api/chat/conversations/:id/prompt',
       'POST /api/chat/conversations/:id/cancel',
+      'PATCH /api/chat/conversations/:id/queue/:qid',
+      'DELETE /api/chat/conversations/:id/queue/:qid',
+      'DELETE /api/chat/conversations/:id/queue',
+      'POST /api/chat/conversations/:id/queue/release',
+      'POST /api/chat/conversations/:id/queue/:qid/send',
+      'POST /api/chat/conversations/:id/compact',
+      'GET /api/chat/conversations/:id/context',
+      'POST /api/chat/conversations/:id/rewind/plan',
+      'POST /api/chat/conversations/:id/rewind',
+      'POST /api/chat/conversations/:id/fork',
+      'POST /api/chat/conversations/:id/recap',
+      'POST /api/chat/conversations/:id/goal',
       'POST /api/chat/conversations/:id/runs/:runId/stop',
+      'POST /api/chat/conversations/:id/tasks/:taskId/stop',
+      'POST /api/chat/conversations/:id/subagents/:childId/stop',
+      'POST /api/chat/conversations/:id/subagents/:childId/message',
+      'POST /api/chat/conversations/:id/subagents/:childId/watch',
+      'DELETE /api/chat/conversations/:id/subagents/:childId/watch',
+      'POST /api/chat/conversations/:id/schedules/:scheduleId/delete',
       'POST /api/chat/conversations/:id/interactions/:iid',
+      'GET /api/chat/conversations/:id/never',
+      'DELETE /api/chat/conversations/:id/never/:ruleId',
       'POST /api/chat/conversations/:id/permission-mode',
       'POST /api/chat/drafts/:draft/permission-mode',
       'GET /api/chat/work/hooks',
+      'GET /api/chat/work/git',
+      'POST /api/chat/work/git/switch',
+      'GET /api/chat/work/settings',
+      'PUT /api/chat/work/settings',
       'PATCH /api/chat/conversations/:id',
       'DELETE /api/chat/conversations/:id',
       'POST /api/chat/agent',
@@ -503,6 +527,7 @@ describe('dashboard runtime — worker death', () => {
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
+      scratchRoot: join(base, 'home', 'Portato'),
     });
 
     try {
@@ -562,6 +587,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
+      scratchRoot: join(base, 'home', 'Portato'),
     });
   }
 
@@ -654,6 +680,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
+      scratchRoot: join(base, 'home', 'Portato'),
     });
 
     try {
@@ -738,6 +765,7 @@ describe('dashboard database worker — withdrawing an abandoned request', () =>
       agentHome: join(base, 'agent'),
       chatAgentHome: join(base, 'chat', 'chat-agent'),
       chatIndexPath: join(base, 'chat', 'conversations.json'),
+      scratchRoot: join(base, 'home', 'Portato'),
     });
     try {
       const controller = new AbortController();

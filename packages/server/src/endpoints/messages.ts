@@ -219,11 +219,15 @@ function applyClaudeCodeTitleFastPath(config: ChatConfig, body: AnthropicMessage
   };
 }
 
-/** The server's thinking options: `ServerConfig.thinkingTokenBudget`, `thinkingCycleGuard`, `thinkingEndText`. */
+/**
+ * The server's thinking options: `ServerConfig.thinkingTokenBudget`, `thinkingCycleGuard`, `thinkingEndText`, and
+ * with `thinkingLevels` the family whose levels a model name's `extra_body.reasoning_effort` maps through.
+ */
 export interface ServerThinking {
   tokenBudget?: number;
   cycleGuard?: boolean;
   endText?: string;
+  levelsFamily?: (model: string) => string | undefined;
 }
 
 /**
@@ -1356,7 +1360,7 @@ export async function handleCreateMessage(
       messages: mappedMessages,
       config: mappedConfig,
       stopSequences: mappedStopSequences,
-    } = mapAnthropicRequest(body));
+    } = mapAnthropicRequest(body, serverThinking?.levelsFamily?.(body.model)));
   } catch (err) {
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;

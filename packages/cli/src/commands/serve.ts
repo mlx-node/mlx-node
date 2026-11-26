@@ -112,6 +112,11 @@ Options:
   --thinking-end-text <text>  Text written before the close when the budget or
                       the guard ends a thought, 1 to 512 characters (default:
                       the close alone). \`mlx agent\` passes all three.
+  --thinking-levels   List each model family's thinking levels on
+                      /v1/models and map a Messages request's
+                      extra_body.reasoning_effort through them (default:
+                      off, the field is used as it is). \`mlx agent\`
+                      passes it.
   --rerank-config <file>    JSON { policy?, families?, service? } for rerank limits
   --auth-token <tok>  Require this secret on every route except /health,
                       as \`x-api-key\` or \`authorization: Bearer\`. Also
@@ -182,6 +187,7 @@ export async function run(argv: string[], deps: ServeRunOptions = {}): Promise<v
       ...(args.persistWholePrompt === true ? { persistWholePrompt: true } : {}),
       ...(args.thinkingCycleGuard === true ? { thinkingCycleGuard: true } : {}),
       ...(args.thinkingEndText !== undefined ? { thinkingEndText: args.thinkingEndText } : {}),
+      ...(args.thinkingLevels === true ? { thinkingLevels: true } : {}),
       ...(await readRerankConfig(args.rerankConfig)),
       authToken: args.authToken,
       logDir: args.logDir,

@@ -12,6 +12,7 @@ import { Alert } from '../../components/arc/alert/alert';
 import { Badge } from '../../components/arc/badge/badge';
 import { Button } from '../../components/arc/button/button';
 import { CopyButton } from '../../components/arc/copy-button/copy-button';
+import { HOST_WORD } from '../../lib/engine-view';
 import {
   formatBytes,
   formatBytesParts,
@@ -30,7 +31,6 @@ import type {
   PrefixCacheRoot,
 } from '../../lib/types';
 import { useJson, type AsyncState } from '../../lib/use-api';
-import { HOST_WORD } from './disk-cache-line';
 
 const TITLE = 'Model caches';
 const DESCRIPTION =

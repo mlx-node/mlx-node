@@ -20,6 +20,8 @@
 import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
+import { APP_NAME } from '../src/app-name.js';
+
 export const RUNTIME_BUILD_FILES = ['iconTemplate.png', 'iconTemplate@2x.png'] as const;
 export const WINDOWS_RUNTIME_BUILD_FILES = ['icon.ico', 'iconTemplate.png', 'iconTemplate@2x.png'] as const;
 
@@ -394,7 +396,7 @@ export function stageApp(opts: StageAppOptions): StageResult {
     `${JSON.stringify(
       {
         name: source?.name ?? '@mlx-node/desktop',
-        productName: 'mlx-node',
+        productName: APP_NAME,
         version: source?.version ?? '0.0.0',
         private: true,
         type: 'module',

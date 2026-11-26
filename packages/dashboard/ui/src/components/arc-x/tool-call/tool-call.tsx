@@ -42,6 +42,8 @@ export interface ToolCallProps {
   truncated?: boolean;
   /** Default: status === 'failed'. */
   defaultOpen?: boolean;
+  /** Opens the row each time it turns true (the person may close it again); never closes it. Moves no focus. */
+  openNow?: boolean;
   /** Only read when status === 'running': the session is live and the body is fresh. The ring turns and the title shimmers. Default false. */
   live?: boolean;
   /** 14 px, before the name. */
@@ -132,6 +134,11 @@ export function ToolCall(props: ToolCallProps): ReactElement {
   const bodyId = useId();
   const hasBody = props.body !== undefined || props.input !== undefined || props.output !== undefined;
   const [open, setOpen] = useState(props.defaultOpen ?? props.status === 'failed');
+  const [openedNow, setOpenedNow] = useState(false);
+  if (props.openNow === true && !openedNow) {
+    setOpenedNow(true);
+    setOpen(true);
+  } else if (props.openNow !== true && openedNow) setOpenedNow(false);
   const liveRunning = props.live === true && props.status === 'running';
   const title = props.title !== undefined && props.title.length > 0 && props.title !== props.name ? props.title : null;
   const duration =

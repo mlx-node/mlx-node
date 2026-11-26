@@ -17,15 +17,33 @@ import {
   InteractionCard,
   Well,
 } from '../../../components/arc-x/interaction-card/interaction-card';
+import { MenuItem } from '../../../components/arc-x/menu/menu';
+import { OptionList } from '../../../components/arc-x/option-list/option-list';
 import { PathText } from '../../../components/arc-x/path-text/path-text';
+import { SplitButton } from '../../../components/arc-x/split-button/split-button';
 import { Button } from '../../../components/arc/button/button';
 import { CHAT, fill } from '../../../lib/chat-strings';
-import type { PermissionInteraction, PermissionMode, PlanInteraction } from '../../../lib/chat-types';
+import type { Interaction, PermissionInteraction, PermissionMode, PlanInteraction } from '../../../lib/chat-types';
 import { autoAskText, cardDescription, cardWarnings } from '../../../lib/permission-text';
 import { oneLine } from '../../../lib/web-tools';
 
-/** What the page sends for an answer. */
-export type InteractionAnswer = { optionId: string } | { decision: 'approved' | 'rejected'; feedback?: string };
+/**
+ * What the page sends for an answer. `note`: a deny with the user's note; the agent reads it and goes on. `never`: "Never
+ * allow" with the scope of words the card offered; the call is denied with the rule's note. `answers`: a
+ * question card's answer by option index, null for a question left open; `reply: 'skip'`: no answer; `reply:
+ * 'discuss' | 'plan-now'` (plan mode): the answers so far, and the agent stops asking or plans now. `mcp`: an MCP
+ * form's values, one per shown field (text, a switch, an option index, option indexes, null for none), a link's accept
+ * with none (the page was opened), or Decline.
+ */
+export type InteractionAnswer =
+  | { optionId: string; note?: string }
+  | { never: 'short' | 'exact' }
+  | { decision: 'approved' | 'rejected'; feedback?: string }
+  | { answers: Array<{ picks: number[]; other?: string } | null> }
+  | { reply: 'skip' }
+  | { reply: 'discuss' | 'plan-now'; answers: Array<{ picks: number[]; other?: string } | null> }
+  | { mcp: 'accept'; values?: Array<string | boolean | number | number[] | null> }
+  | { mcp: 'decline' };
 
 type Access = PermissionInteraction['access'];
 type Option = PermissionInteraction['options'][number];
@@ -34,16 +52,16 @@ type Option = PermissionInteraction['options'][number];
 const META_PATH_CHARS = 36;
 /** Time after a card is first shown before a press of a button that allows can count: a click meant for the card before. */
 export const CARD_ARM_MS = 600;
-/** The plan feedback field's cap, as the answer route's. */
+/** The plan feedback and deny note fields' cap, as the answer route's. */
 export const FEEDBACK_MAX_CHARS = 4_000;
 
 const GAP_WORDS = { spaces: CHAT.exactSpaces, emptyLines: CHAT.exactEmptyLines };
 
 /**
  * A click on a button that allows counts only once the card has been on screen for {@link CARD_ARM_MS}: a quick second
- * click meant for the card before must not answer the next one, which takes its place.
+ * click meant for the card before must not answer the next one, which takes its place. A key press too.
  */
-function useArmed(): (event: MouseEvent) => boolean {
+export function useArmed(): (event: { timeStamp: number }) => boolean {
   const shownAt = useRef<number | null>(null);
   useEffect(() => {
     shownAt.current = performance.now();
@@ -55,7 +73,7 @@ function exactNote(lines: number): string {
   return lines === 1 ? CHAT.exactLong : fill(CHAT.exactLines, { n: lines });
 }
 
-function Exact(props: { text: string; label: string; id?: string }): ReactElement {
+export function Exact(props: { text: string; label: string; id?: string }): ReactElement {
   return <ExactText {...props} overflowNote={exactNote} gapWords={GAP_WORDS} />;
 }
 
@@ -73,8 +91,14 @@ export function permissionTitle(access: Access): string {
 }
 
 /** The sentence for the page's status region when a card arrives. */
-export function asksSentence(interaction: PermissionInteraction | PlanInteraction): string {
+export function asksSentence(interaction: Interaction): string {
   if (interaction.kind === 'plan') return CHAT.status.asksPlan;
+  if (interaction.kind === 'question') return CHAT.status.asksQuestion;
+  if (interaction.kind === 'mcp-input') {
+    return fill(interaction.mode === 'url' ? CHAT.status.asksMcpLink : CHAT.status.asksMcp, {
+      server: interaction.server,
+    });
+  }
   switch (interaction.access) {
     case 'bash':
       return CHAT.status.asksRun;
@@ -156,19 +180,29 @@ function useArrivalFocus(
   }, [id]);
 }
 
-interface CardBase {
+export interface CardBase {
   /** The conversation's folder. */
   folder: string | null;
   /** "1 of 3" when more wait. */
   position: { index: number; count: number };
   composerRef: RefObject<HTMLTextAreaElement | null>;
-  /** Resolves when the request was sent; rejects when it was refused. */
-  onAnswer: (answer: InteractionAnswer) => Promise<void>;
+  /** Resolves when the request was sent (an MCP form the host refused resolves with its field errors); rejects when it was refused. */
+  onAnswer: (answer: InteractionAnswer) => Promise<unknown>;
 }
 
 type From = PermissionInteraction['from'];
 
-/** Who asks, when it is a helper and not the conversation's own turn. */
+/** The menu row that opens the never-allow step: it names the short words. */
+export function neverMenuText(never: NonNullable<PermissionInteraction['never']>): string {
+  return fill(CHAT.never.menu, { words: oneLine(never.short) });
+}
+
+/** The menu row that opens the note step: it names the agent that asked. */
+export function denyWhyText(from: PermissionInteraction['from']): string {
+  return from === undefined ? CHAT.denyWhy : fill(CHAT.denyWhyHelper, { label: oneLine(from.label) });
+}
+
+/** Who asks, when it is an agent and not the conversation's own turn. */
 export function fromText(from: From): string | null {
   if (from === undefined) return null;
   return from.run === null
@@ -176,7 +210,7 @@ export function fromText(from: From): string | null {
     : fill(CHAT.permFrom, { label: from.label, run: from.run });
 }
 
-function metaText(folder: string | null, from?: From): string | undefined {
+export function metaText(folder: string | null, from?: From): string | undefined {
   const who = fromText(from);
   const elsewhere = from?.cwd ?? null;
   const where =
@@ -189,7 +223,7 @@ function metaText(folder: string | null, from?: From): string | undefined {
   return parts.length === 0 ? undefined : parts.join(', ');
 }
 
-function Meta({ folder, position, from }: Pick<CardBase, 'folder' | 'position'> & { from?: From }): ReactNode {
+export function Meta({ folder, position, from }: Pick<CardBase, 'folder' | 'position'> & { from?: From }): ReactNode {
   const who = fromText(from);
   const elsewhere = from?.cwd ?? null;
   if (folder === null && elsewhere === null && who === null && position.count <= 1) return undefined;
@@ -217,13 +251,16 @@ function Meta({ folder, position, from }: Pick<CardBase, 'folder' | 'position'> 
  * Ask draws an answer the mode hides); else Auto's own reason.
  */
 export function cardReason(
-  interaction: Pick<PermissionInteraction, 'access' | 'options' | 'autoAsk' | 'autoAskDetail'>,
+  interaction: Pick<PermissionInteraction, 'access' | 'options' | 'autoAsk' | 'autoAskDetail' | 'neverUnread'>,
   permissionMode: PermissionMode,
   folder: string | null,
   temp: string | null = null,
 ): string | null {
   if (permissionMode === 'ask') return null;
   const p = CHAT.permission;
+  if (permissionMode === 'bypass' && interaction.neverUnread === true) {
+    return fill(CHAT.never.stillAsks, { mode: p.modes.bypass, why: CHAT.never.unread });
+  }
   const once = interaction.options.some((option) => option.optionId === 'allow-once' && option.kind === 'allow_once');
   if (!once) {
     const line = fill(p.noAllowOnce, { mode: p.modes[permissionMode] });
@@ -249,11 +286,39 @@ export function PermissionCard(
   const buttons = cardButtons(interaction, props.permissionMode);
   const reason = cardReason(interaction, props.permissionMode, props.folder, props.temp);
   const [pressed, setPressed] = useState<string | null>(null);
+  const [writing, setWriting] = useState(false);
+  const [note, setNote] = useState('');
+  const [picking, setPicking] = useState(false);
+  const [scope, setScope] = useState<'short' | 'exact'>('short');
   const first = useRef<HTMLButtonElement | null>(null);
+  const field = useRef<HTMLTextAreaElement | null>(null);
+  const pick = useRef<HTMLDivElement | null>(null);
+  const neverButton = useRef<HTMLButtonElement | null>(null);
   useArrivalFocus(first, props.composerRef, interaction.id);
   const armed = useArmed();
   const exactId = useId();
   const landsId = useId();
+  const wrote = useRef(false);
+  useEffect(() => {
+    if (writing) {
+      wrote.current = true;
+      field.current?.focus({ preventScroll: true });
+    } else if (wrote.current) {
+      wrote.current = false;
+      first.current?.focus({ preventScroll: true });
+    }
+  }, [writing]);
+  const picked = useRef(false);
+  useEffect(() => {
+    if (picking) {
+      picked.current = true;
+      const radio = pick.current?.querySelector<HTMLElement>('[role="radio"][aria-checked="true"]');
+      (radio ?? neverButton.current)?.focus({ preventScroll: true });
+    } else if (picked.current) {
+      picked.current = false;
+      first.current?.focus({ preventScroll: true });
+    }
+  }, [picking]);
 
   const answer = (event: MouseEvent, button: CardButton): void => {
     if (pressed !== null) return;
@@ -261,6 +326,21 @@ export function PermissionCard(
     const optionId = button.option.optionId;
     setPressed(optionId);
     props.onAnswer({ optionId }).catch(() => setPressed(null));
+  };
+
+  const deny = buttons.find((button) => button.option.kind === 'reject_once');
+  const sendNote = (): void => {
+    const text = note.trim();
+    if (pressed !== null || deny === undefined || text === '') return;
+    setPressed('note');
+    props.onAnswer({ optionId: deny.option.optionId, note: text }).catch(() => setPressed(null));
+  };
+
+  const never = interaction.access === 'bash' ? (interaction.never ?? null) : null;
+  const sendNever = (): void => {
+    if (pressed !== null || never === null) return;
+    setPressed('never');
+    props.onAnswer({ never: never.short === never.exact ? 'short' : scope }).catch(() => setPressed(null));
   };
 
   let body: ReactNode;
@@ -284,6 +364,7 @@ export function PermissionCard(
 
   return (
     <InteractionCard
+      askId={interaction.id}
       icon={<Shield size={16} strokeWidth={1.75} />}
       title={permissionTitle(interaction.access)}
       meta={<Meta folder={props.folder} position={props.position} from={interaction.from} />}
@@ -307,24 +388,150 @@ export function PermissionCard(
             }
       }
       busy={pressed !== null}
-      notes={cardNotes(interaction.access, buttons, interaction.from !== undefined && interaction.from.run !== null)}
-      actions={buttons.map((button, index) => (
-        <Button
-          key={button.option.optionId}
-          ref={index === 0 ? first : undefined}
-          type="button"
-          variant={button.variant}
-          size="sm"
-          loading={pressed === button.option.optionId}
-          disabled={pressed !== null && pressed !== button.option.optionId}
-          data-option={button.option.optionId}
-          onClick={(event) => answer(event, button)}
-        >
-          {button.label}
-        </Button>
-      ))}
+      onKeyDown={
+        picking
+          ? (event) => {
+              if (event.key !== 'Escape' || pressed !== null) return;
+              event.preventDefault();
+              event.stopPropagation();
+              setPicking(false);
+            }
+          : undefined
+      }
+      notes={
+        writing
+          ? [interaction.access === 'bash' ? CHAT.denyWritingNote : CHAT.denyWritingNoteOther]
+          : picking
+            ? [CHAT.never.note]
+            : cardNotes(interaction.access, buttons, interaction.from !== undefined && interaction.from.run !== null)
+      }
+      actions={
+        picking ? (
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={pressed !== null}
+              onClick={() => setPicking(false)}
+            >
+              {CHAT.planBack}
+            </Button>
+            <Button
+              ref={neverButton}
+              type="button"
+              variant="primary"
+              size="sm"
+              loading={pressed === 'never'}
+              disabled={pressed !== null && pressed !== 'never'}
+              data-never-confirm=""
+              onClick={sendNever}
+            >
+              {CHAT.never.confirm}
+            </Button>
+          </>
+        ) : writing ? (
+          <>
+            <Button
+              type="button"
+              variant="secondary"
+              size="sm"
+              disabled={pressed !== null}
+              onClick={() => setWriting(false)}
+            >
+              {CHAT.planBack}
+            </Button>
+            <Button
+              type="button"
+              variant="primary"
+              size="sm"
+              loading={pressed === 'note'}
+              disabled={note.trim() === '' || (pressed !== null && pressed !== 'note')}
+              onClick={sendNote}
+            >
+              {CHAT.denySend}
+            </Button>
+          </>
+        ) : (
+          buttons.map((button, index) =>
+            button === deny ? (
+              <SplitButton
+                key={button.option.optionId}
+                ref={index === 0 ? first : undefined}
+                label={button.label}
+                variant={button.variant}
+                loading={pressed === button.option.optionId}
+                disabled={pressed !== null && pressed !== button.option.optionId}
+                data-option={button.option.optionId}
+                moreLabel={CHAT.denyMore}
+                menuLabel={CHAT.denyMore}
+                onClick={(event) => answer(event, button)}
+              >
+                <MenuItem label={denyWhyText(interaction.from)} onSelect={() => setWriting(true)} />
+                {never === null ? null : <MenuItem label={neverMenuText(never)} onSelect={() => setPicking(true)} />}
+              </SplitButton>
+            ) : (
+              <Button
+                key={button.option.optionId}
+                ref={index === 0 ? first : undefined}
+                type="button"
+                variant={button.variant}
+                size="sm"
+                loading={pressed === button.option.optionId}
+                disabled={pressed !== null && pressed !== button.option.optionId}
+                data-option={button.option.optionId}
+                onClick={(event) => answer(event, button)}
+              >
+                {button.label}
+              </Button>
+            ),
+          )
+        )
+      }
     >
       {body}
+      {picking && never !== null ? (
+        <div ref={pick} className="grid gap-1" data-never-pick="">
+          {never.short === never.exact ? (
+            <>
+              <p className="m-0 text-body text-secondary">{CHAT.never.pick}</p>
+              <p className="m-0 font-mono text-body" data-never-words="">
+                {oneLine(never.short)}
+              </p>
+            </>
+          ) : (
+            <>
+              <p className="m-0 text-body text-secondary" aria-hidden="true">
+                {CHAT.never.pick}
+              </p>
+              <OptionList
+                label={CHAT.never.pick}
+                value={scope}
+                onValueChange={(value) => setScope(value === 'exact' ? 'exact' : 'short')}
+                options={[
+                  { value: 'short', title: oneLine(never.short) },
+                  { value: 'exact', title: oneLine(never.exact) },
+                ]}
+                wrap
+              />
+            </>
+          )}
+        </div>
+      ) : null}
+      {writing ? (
+        <CardTextField
+          label={CHAT.denyNoteLabel}
+          value={note}
+          onChange={setNote}
+          fieldRef={field}
+          maxLength={FEEDBACK_MAX_CHARS}
+          countText={fill(CHAT.feedbackCount, { n: note.length, max: FEEDBACK_MAX_CHARS })}
+          onEscape={() => {
+            if (pressed === null) setWriting(false);
+          }}
+          onSubmit={sendNote}
+        />
+      ) : null}
     </InteractionCard>
   );
 }
@@ -401,6 +608,7 @@ export function PlanCard(props: CardBase & { interaction: PlanInteraction }): Re
 
   return (
     <InteractionCard
+      askId={interaction.id}
       icon={<ClipboardCheck size={16} strokeWidth={1.75} />}
       title={CHAT.planTitle}
       meta={<Meta folder={props.folder} position={props.position} />}

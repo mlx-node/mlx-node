@@ -13,15 +13,17 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { describe, expect, it } from 'vite-plus/test';
+import { describe, expect, it, onTestFinished } from 'vite-plus/test';
 
 import { ApiError } from '../src/api/errors.js';
+import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
 import { attachmentView, type AttachmentInput } from '../src/chat/attachment-rule.js';
 import type { ChatPaths } from '../src/chat/paths.js';
@@ -29,7 +31,7 @@ import { MemorySecretStore, type SecretStore } from '../src/chat/providers/secre
 import { ProvidersService, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
 import { routeError } from '../src/chat/route-errors.js';
 import type { ChatService } from '../src/chat/service.js';
-import type { ChatHostEvent, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
+import type { ChatHostEvent, ChatHostState, ConversationEvent, CwdProblem, Interaction } from '../src/chat/types.js';
 import { CWD_PROBLEM_MESSAGES } from '../src/chat/work-folder.js';
 import type { RuntimeLive } from '../src/live.js';
 import { applyConversationEvent, type ConversationState } from '../ui/src/lib/chat-store.js';
@@ -46,6 +48,7 @@ import {
 } from './helpers/chat-fake.js';
 import { UNLOAD_PATH } from './helpers/fake-engine.js';
 import { live, liveModel, liveTurn, process as liveProcess } from './helpers/observability-fixtures.js';
+import { runView } from './helpers/run-views.js';
 
 const BASIC = [
   { thought: 'The user greets me.', chunk: 5 },
@@ -403,6 +406,23 @@ describe('Chat service — a conversation end to end on the fake agent', () => {
       await svc.delete(conversation.id);
       expect(fake.reader.detail(conversation.id)).toBeNull();
       expect(fake.sent().filter((m) => m.method === '_x.ai/session/delete')).toHaveLength(0);
+    });
+  }, 20_000);
+
+  it('a delete through the session writer removes the ledger file of a chat this run loaded', async () => {
+    await withService(async (fake) => {
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'crash now' });
+      const page = new Page(fake.service, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      page.detach();
+      expect(readdirSync(fake.paths.webLedger)).toHaveLength(1);
+
+      fake.endpoint.current = null;
+      ageTree(fake.paths.chatSessions, Date.now() - 20 * 60_000);
+      await fake.service.delete(conversation.id);
+      expect(fake.reader.detail(conversation.id)).toBeNull();
+      expect(fake.sent().filter((m) => m.method === '_x.ai/session/delete')).toHaveLength(0);
+      expect(readdirSync(fake.paths.webLedger)).toEqual([]);
     });
   }, 20_000);
 });
@@ -1058,7 +1078,7 @@ describe('Chat service — attachments', () => {
         const { conversation } = await svc.create({ mode: 'work', text: 'list', cwd: project, attachments: [FILE] });
         await until(() => fake.sent().some((m) => m.method === 'session/prompt'), 5_000);
         const prompt = fake.sent().find((m) => m.method === 'session/prompt')!;
-        expect(prompt.params).toEqual(promptParams(conversation.id, 'list', [FILE]));
+        expect(prompt.params).toEqual(promptParams(conversation.id, 'list', [FILE], { mode: 'agent' }));
         expect(refusedAs(await apiError(svc.prompt(conversation.id, 'again', [PICTURE])))).toEqual(REFUSED);
       },
       { endpointModels: [SEES] },
@@ -1463,6 +1483,46 @@ describe('Chat service — Work', () => {
     );
   }, 20_000);
 
+  it('the host state counts the open cards of a conversation; a card the agent gives up on is withdrawn', async () => {
+    const gate = join(mkdtempSync(join(tmpdir(), 'mlx-svc-ask-')), 'give-up');
+    onTestFinished(() => rmSync(dirname(gate), { recursive: true, force: true }));
+    await withWork(
+      'work-permission',
+      async (fake, project) => {
+        const svc = fake.service;
+        const states: ChatHostEvent[] = [];
+        const hostOff = svc.watchHost((e) => states.push(e));
+        const asksOf = (id: string): number | undefined => {
+          for (let i = states.length - 1; i >= 0; i--) {
+            const e = states[i]!;
+            if (e.type === 'state') return e.state.active.find((a) => a.conversationId === id)?.asks;
+          }
+          return undefined;
+        };
+        const { conversation } = await svc.create({ mode: 'work', text: 'ls', cwd: project });
+        const page = new Page(svc, conversation.id);
+        await until(() => interactionsOf(page).length === 2, 5_000);
+        await until(() => asksOf(conversation.id) === 2, 5_000);
+        writeFileSync(gate, '');
+        await until(() => page.state?.withdrawn === 1, 5_000);
+        expect(page.state?.interactions).toHaveLength(1);
+        await until(() => asksOf(conversation.id) === 1, 5_000);
+        await svc.answer(conversation.id, page.state!.interactions[0]!.id, { optionId: 'allow-once' });
+        await until(() => page.lastOutcome() !== undefined, 5_000);
+        await until(() => asksOf(conversation.id) === 0, 5_000);
+        expect(page.state?.withdrawn).toBe(1);
+        hostOff();
+        page.detach();
+      },
+      {
+        mutate: (scenario) => {
+          const prompt = (scenario.prompts as Json[])[0]!;
+          prompt.steps = [{ giveUp: { background: true, on: gate, id: 'toolu_gone' } }, ...(prompt.steps as Json[])];
+        },
+      },
+    );
+  }, 20_000);
+
   it('while a window holds the host stream, the card waits for the user', async () => {
     await withWork(
       'work-permission',
@@ -1503,7 +1563,9 @@ describe('Chat service — Work', () => {
         await svc.answer(conversation.id, interactionsOf(page)[0]!.id, { optionId: 'allow-once' });
         await until(() => page.lastOutcome() !== undefined, 5_000);
         const notices = page.events.filter((e) => e.type === 'notice');
-        expect(notices.map((e) => e.type === 'notice' && e.notice)).toEqual([{ code: 'key-printed', provider: 'exa' }]);
+        expect(notices.map((e) => e.type === 'notice' && e.notice)).toEqual([
+          { code: 'key-printed', tone: 'danger', provider: 'exa' },
+        ]);
         expect(JSON.stringify(page.events)).not.toContain(key);
         expect(JSON.stringify(page.events)).toContain('EXA_API_KEY=[redacted]');
         const start = fake.records().find((r) => r.kind === 'start') as Json;
@@ -1553,7 +1615,7 @@ describe('Chat service — Work', () => {
           await until(() => interactionsOf(page).length === 1, 5_000);
           const card = interactionsOf(page)[0]!;
           if (card.kind === 'permission') expect(card.title.startsWith(`${prefix}xxx`)).toBe(true);
-          else expect(card.plan.startsWith('ppp')).toBe(true);
+          else expect(card.kind === 'plan' && card.plan.startsWith('ppp')).toBe(true);
           expect(JSON.stringify(page.events)).not.toContain(T.slice(0, 8));
           await fake.service.cancel(conversation.id);
           await until(() => page.lastOutcome() !== undefined, 5_000);
@@ -1756,18 +1818,28 @@ describe('Chat service — a Work workflow run', () => {
           await until(() => page.lastOutcome() !== undefined, 5_000);
           expect(page.lastOutcome()).toBe('completed');
           const runs = (): unknown[] => page.events.flatMap((e) => (e.type === 'runs' ? [e.runs] : []));
-          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }]]);
+          expect(runs()).toEqual([[runView('wf_1')]]);
           expect(svc.busyConversations()).toEqual([id]);
           expect(svc.closingConversations()).toEqual([id]);
           const state = await svc.state();
           expect(state.active).toEqual([
-            { conversationId: id, mode: 'work', busy: false, waiting: false, background: true },
+            {
+              conversationId: id,
+              mode: 'work',
+              busy: false,
+              waiting: false,
+              asks: 0,
+              background: true,
+              helpers: false,
+              tasks: 0,
+              op: null,
+            },
           ]);
           expect(state.modes.work.background).toBe(1);
           const late = new Page(svc, id);
           await until(() => late.events.length > 0, 5_000);
           const sync = late.events[0]!;
-          expect(sync.type === 'sync' ? sync.runs : null).toEqual([{ runId: 'wf_1', stopping: false }]);
+          expect(sync.type === 'sync' ? sync.runs : null).toEqual([runView('wf_1')]);
           late.detach();
           expect((await apiError(svc.delete(id))).reason).toBe('conversation-busy');
           expect((await apiError(svc.patch(id, { modelId: 'qwen3.5-9b' }))).reason).toBe('conversation-busy');
@@ -1776,8 +1848,14 @@ describe('Chat service — a Work workflow run', () => {
           const missing = await apiError(svc.stopRun(id, 'wf_none'));
           expect([missing.code, missing.message]).toEqual(['E_NOT_FOUND', 'No such run.']);
           expect(await svc.stopRun(id, 'wf_1')).toEqual({});
-          await until(() => runs().length === 3, 5_000);
-          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }], [{ runId: 'wf_1', stopping: true }], []]);
+          await until(() => runs().length === 4, 5_000);
+          const stopped = { live: false, status: 'cancelled', by: 'you' } as const;
+          expect(runs()).toEqual([
+            [runView('wf_1')],
+            [runView('wf_1', { stopping: true })],
+            [runView('wf_1', { ...stopped, stopping: true })],
+            [runView('wf_1', stopped)],
+          ]);
           await until(() => svc.busyConversations().length === 0, 5_000);
           expect(busy.at(-1)).toEqual([]);
           expect(page.state?.entries.filter((e) => e.kind === 'workflow').map((e) => e.status)).toEqual(['cancelled']);
@@ -1809,14 +1887,10 @@ describe('Chat service — a Work workflow run', () => {
           await svc.answer(id, interactionsOf(page)[0]!.id, { optionId: 'allow-once' });
           await until(() => page.lastOutcome() !== undefined, 5_000);
           const runs = (): unknown[] => page.events.flatMap((e) => (e.type === 'runs' ? [e.runs] : []));
-          expect(runs()).toEqual([[{ runId: 'wf_1', stopping: false }]]);
+          expect(runs()).toEqual([[runView('wf_1')]]);
           const error = await apiError(svc.stopRun(id, 'wf_1'));
           expect([error.code, error.message]).toEqual(['E_CONFLICT', 'The run could not be stopped.']);
-          expect(runs()).toEqual([
-            [{ runId: 'wf_1', stopping: false }],
-            [{ runId: 'wf_1', stopping: true }],
-            [{ runId: 'wf_1', stopping: false }],
-          ]);
+          expect(runs()).toEqual([[runView('wf_1')], [runView('wf_1', { stopping: true })], [runView('wf_1')]]);
           page.detach();
         },
         { mutate: workflow({ childOn: join(flags, 'child'), stopRejects: true }) },
@@ -1832,6 +1906,102 @@ describe('Chat service — a Work workflow run', () => {
       const error = await apiError(fake.service.stopRun(conversation.id, 'wf_1'));
       expect([error.code, error.message]).toEqual(['E_NOT_FOUND', 'No such run.']);
     });
+  }, 20_000);
+});
+
+describe('Chat service — background work (H-a)', () => {
+  /** One prompt per word: its background step, then a short answer. */
+  const prompts =
+    (words: Record<string, Json>) =>
+    (scenario: Json): void => {
+      scenario.prompts = Object.entries(words).map(([match, step]) => ({
+        match,
+        steps: [step, { text: 'Started.' }, { end: { stopReason: 'end_turn' } }],
+      }));
+    };
+
+  /** The host state once `check` holds, polled every 10 ms for at most 5 s. */
+  async function stateWhen(svc: ChatService, check: (state: ChatHostState) => boolean): Promise<ChatHostState> {
+    const end = Date.now() + 5_000;
+    for (;;) {
+      const state = await svc.state();
+      if (check(state)) return state;
+      if (Date.now() > end) throw new Error('condition not reached');
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+  }
+
+  it('a command holds delete, the quit guard and a settings change, not unload or a model change; a helper holds unload', async () => {
+    const flags = mkdtempSync(join(tmpdir(), 'mlx-bg-'));
+    const helperEnd = join(flags, 'helper-end');
+    const snapshot = live({
+      processes: [liveProcess({ pid: process.pid, models: [liveModel('qwen3.5-4b')] })],
+    }) as unknown as RuntimeLive;
+    let providers: ProvidersService | null = null;
+    try {
+      await withWork(
+        'work-workflow-run',
+        async (fake, project) => {
+          const svc = fake.service;
+          const { conversation } = await svc.create({ mode: 'work', text: 'cmd', cwd: project });
+          const id = conversation.id;
+          const page = new Page(svc, id);
+          // The first answer may end before the page attaches: its sync carries the end.
+          await until(() => page.state?.lastEnd?.outcome !== undefined, 5_000);
+          expect(page.state?.lastEnd?.outcome).toBe('completed');
+          await until(() => svc.busyConversations().includes(id), 5_000);
+          const state = await svc.state();
+          expect(state.active).toEqual([
+            {
+              conversationId: id,
+              mode: 'work',
+              busy: false,
+              waiting: false,
+              asks: 0,
+              background: false,
+              helpers: false,
+              tasks: 1,
+              op: null,
+            },
+          ]);
+          expect(state.modes.work).toMatchObject({ background: 0, tasks: 1, engineLost: false });
+          expect(state.providers.applyPending).toBe(false);
+          expect((await apiError(svc.delete(id))).reason).toBe('conversation-busy');
+          expect((await svc.patch(id, { modelId: 'qwen3.5-9b' })).modelId).toBe('qwen3.5-9b');
+          expect(await svc.unloadModels()).toEqual({ unloaded: ['qwen3.5-4b'] });
+          await providers!.putKey('exa', 'exa-KEY-0123456789abcdef');
+          const stale = await stateWhen(svc, (s) => s.modes.work.stale);
+          expect(stale.modes.work).toMatchObject({ state: 'ready', tasks: 1 });
+          expect(stale.providers.applyPending).toBe(true);
+          // The first answer's end is in the sync or is the first event: count from here.
+          const endsBefore = page.ends().length;
+          await svc.prompt(id, 'helper');
+          await until(() => page.ends().length === endsBefore + 1, 5_000);
+          expect(page.lastOutcome()).toBe('completed');
+          await until(() => svc.busyConversations().includes(id), 5_000);
+          const helper = (await svc.state()).active.find((a) => a.conversationId === id);
+          expect(helper).toMatchObject({ background: true, helpers: true, tasks: 1 });
+          expect((await apiError(svc.unloadModels())).reason).toBe('engine-busy');
+          expect((await apiError(svc.patch(id, { modelId: 'qwen3.5-4b' }))).reason).toBe('conversation-busy');
+          writeFileSync(helperEnd, '');
+          await stateWhen(svc, (s) => s.active.some((a) => a.conversationId === id && !a.helpers));
+          expect(await svc.unloadModels()).toEqual({ unloaded: ['qwen3.5-4b'] });
+          expect(svc.busyConversations()).toEqual([id]);
+          page.detach();
+        },
+        {
+          mutate: prompts({
+            cmd: { background: { wake: false } },
+            helper: { helper: { endOn: helperEnd, wake: false } },
+          }),
+          live: { subscribe: () => () => {}, readNow: async () => snapshot },
+          providers: (paths) => (providers = memoryProviders(paths)),
+          engine: (r) => (r.path === UNLOAD_PATH ? { json: { unloaded: ['qwen3.5-4b'] } } : { json: {} }),
+        },
+      );
+    } finally {
+      rmSync(flags, { recursive: true, force: true });
+    }
   }, 20_000);
 });
 
@@ -1937,4 +2107,433 @@ describe('Chat service — what MAIN learns of turns and of earlier panel lives'
       await fake.close();
     }
   }, 20_000);
+});
+
+describe('Chat service — thinking level', () => {
+  const FOUR = 'qwen3.5-4b';
+  const NINE = 'qwen3.5-9b';
+  /** The fake agent lists Off · Low · Medium · High for one model and Low · High for the other (an LFM2 row). */
+  const levelled = (scenario: Json): void => {
+    scenario.initialize = {
+      models: [
+        {
+          modelId: FOUR,
+          totalContextTokens: 32768,
+          reasoningEfforts: [
+            { value: 'none', label: 'Off' },
+            { value: 'low', label: 'Low' },
+            { value: 'medium', label: 'Medium' },
+            { value: 'high', label: 'High', default: true },
+          ],
+        },
+        {
+          modelId: NINE,
+          totalContextTokens: 32768,
+          reasoningEfforts: [
+            { value: 'low', label: 'Low' },
+            { value: 'high', label: 'High', default: true },
+          ],
+        },
+      ],
+    };
+    scenario.prompts = [
+      {
+        match: 'slow',
+        steps: [{ text: 'Thinking', chunk: 3 }, { sleepMs: 1500 }, { end: { stopReason: 'end_turn' } }],
+      },
+      { match: '', steps: [{ text: 'Done.' }, { end: { stopReason: 'end_turn' } }] },
+    ];
+  };
+  const levelsOf = async (svc: ChatService, id: string) => (await svc.state()).models.find((m) => m.id === id);
+  const stored = (fake: FakeService, id: string): Json | null => {
+    try {
+      return JSON.parse(readFileSync(join(fake.paths.composer, `${id}.json`), 'utf8')) as Json;
+    } catch {
+      return null;
+    }
+  };
+  const setValues = (fake: FakeService): unknown[] =>
+    fake
+      .sent()
+      .filter((m) => m.method === 'session/set_config_option')
+      .map((m) => (m.params as Json).value);
+
+  it('the host state lists levels once an agent listed the model', async () => {
+    const fake = fakeService('chat-basic', { mutate: levelled });
+    try {
+      expect(await levelsOf(fake.service, FOUR)).not.toHaveProperty('thinking');
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hi' });
+      const page = new Page(fake.service, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      page.detach();
+      expect((await levelsOf(fake.service, FOUR))?.thinking).toEqual({
+        levels: ['none', 'low', 'medium', 'high'],
+        default: 'high',
+      });
+      expect((await levelsOf(fake.service, NINE))?.thinking).toEqual({ levels: ['low', 'high'], default: 'high' });
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('before any agent a served model has its family’s levels; an agent’s list replaces them', async () => {
+    const INKLING = 'Inkling-2-Mini';
+    const GEMMA = 'gemma-4-e4b';
+    const NO_FAMILY = 'no-family';
+    const CLAIRIC = 'clairic-1';
+    const listing = (scenario: Json): void => {
+      levelled(scenario);
+      scenario.initialize = {
+        models: [
+          {
+            modelId: FOUR,
+            totalContextTokens: 32768,
+            reasoningEfforts: [
+              { value: 'low', label: 'Low' },
+              { value: 'high', label: 'High', default: true },
+            ],
+          },
+          // An agent build that lists no efforts: its word wins over the family's.
+          { modelId: INKLING, totalContextTokens: 32768 },
+        ],
+      };
+    };
+    const fake = fakeService('chat-basic', {
+      mutate: listing,
+      endpointModels: [
+        { ...endpointModel(FOUR, '/models/qwen3.5-4b'), modelType: 'qwen3_5' },
+        { ...endpointModel(INKLING, '/models/inkling'), modelType: 'inkling2' },
+        { ...endpointModel(GEMMA, '/models/gemma'), modelType: 'gemma4' },
+        endpointModel(NO_FAMILY, '/models/plain'),
+        { ...endpointModel(CLAIRIC, '/models/clairic'), modelType: 'clairic', kind: 'decision' },
+      ],
+    });
+    try {
+      const family = { levels: ['none', 'low', 'medium', 'high'], default: 'high' };
+      expect((await levelsOf(fake.service, INKLING))?.thinking).toEqual(family);
+      expect((await levelsOf(fake.service, FOUR))?.thinking).toEqual(family);
+      expect((await levelsOf(fake.service, GEMMA))?.thinking).toBeNull();
+      expect(await levelsOf(fake.service, NO_FAMILY)).not.toHaveProperty('thinking');
+      expect((await fake.service.state()).models.map((m) => m.id)).not.toContain(CLAIRIC);
+
+      const { conversation } = await fake.service.create({ mode: 'chat', text: 'hi', modelId: FOUR });
+      const page = new Page(fake.service, conversation.id);
+      await until(() => page.ends().length === 1, 5_000);
+      page.detach();
+      expect((await levelsOf(fake.service, FOUR))?.thinking).toEqual({ levels: ['low', 'high'], default: 'high' });
+      expect((await levelsOf(fake.service, INKLING))?.thinking).toBeNull();
+      expect((await levelsOf(fake.service, GEMMA))?.thinking).toBeNull();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('create and patch store the level, also while an answer runs; the next answer sets it; a restart reads it', async () => {
+    const fake = fakeService('chat-basic', { mutate: levelled });
+    try {
+      const svc = fake.service;
+      const created = await svc.create({ mode: 'chat', text: 'hi', thinking: 'low' });
+      const id = created.conversation.id;
+      expect(created.conversation.thinking).toBe('low');
+      const page = new Page(svc, id);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(setValues(fake)).toEqual(['low']);
+      await until(() => stored(fake, id)?.thinking === 'low');
+
+      await svc.prompt(id, 'slow please');
+      await until(() => page.state?.turn?.phase === 'running', 5_000);
+      const patched = await svc.patch(id, { thinking: 'none' });
+      expect(patched.thinking).toBe('none');
+      expect(page.state!.conversation.thinking).toBe('none');
+      expect(stored(fake, id)).toEqual({ queue: [], thinking: 'none' });
+      await until(() => page.ends().length === 2, 5_000);
+      expect(setValues(fake)).toEqual(['low']);
+      await svc.prompt(id, 'again');
+      await until(() => page.ends().length === 3, 5_000);
+      expect(setValues(fake)).toEqual(['low', 'none']);
+      page.detach();
+
+      await svc.close();
+      const svc2 = fake.restart();
+      const cold = new Page(svc2, id);
+      await until(() => cold.state !== null, 5_000);
+      expect(cold.state!.conversation.thinking).toBe('none');
+      await svc2.prompt(id, 'once more');
+      await until(() => cold.ends().length === 1, 5_000);
+      expect(setValues(fake)).toEqual(['low', 'none', 'none']);
+      cold.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('a model change steps the level down to one the model has (else its default) and clears the notice', async () => {
+    const refusing = (scenario: Json): void => {
+      levelled(scenario);
+      scenario.session = { ...(scenario.session as Json), refuseEffort: true };
+    };
+    const fake = fakeService('chat-basic', { mutate: refusing });
+    try {
+      const svc = fake.service;
+      const { conversation } = await svc.create({ mode: 'chat', text: 'hi', thinking: 'medium' });
+      const id = conversation.id;
+      const page = new Page(svc, id);
+      await until(() => page.ends().length === 1, 5_000);
+      expect(page.lastOutcome()).toBe('completed');
+      await until(() => page.state!.notices.some((n) => n.code === 'thinking-not-set'));
+      expect((await svc.patch(id, { modelId: NINE })).thinking).toBe('low');
+      expect(stored(fake, id)?.thinking).toBe('low');
+      expect(page.state!.notices).toEqual([]);
+      expect((await svc.patch(id, { modelId: FOUR })).thinking).toBe('low');
+      await svc.patch(id, { thinking: 'none' });
+      expect((await svc.patch(id, { modelId: NINE })).thinking).toBe('high');
+      page.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+
+  it('a fork copies the level into the copy’s composer file, with no queue', async () => {
+    const fake = fakeService('chat-basic', { mutate: levelled });
+    try {
+      const svc = fake.service;
+      const { conversation } = await svc.create({ mode: 'chat', text: 'hi', thinking: 'none' });
+      const id = conversation.id;
+      const page = new Page(svc, id);
+      await until(() => page.ends().length === 1, 5_000);
+      // A row held by Stop stays the original's.
+      await svc.prompt(id, 'slow please');
+      await until(() => page.state?.turn?.phase === 'running', 5_000);
+      await svc.prompt(id, 'queued for the original', [], undefined, 'queue');
+      await svc.cancel(id);
+      await until(() => page.ends().length === 2, 5_000);
+      expect(stored(fake, id)).toMatchObject({ queue: [{ text: 'queued for the original' }], thinking: 'none' });
+      const copy = await svc.fork(id);
+      expect(stored(fake, copy.id)).toEqual({ queue: [], thinking: 'none' });
+      expect(stored(fake, id)).toMatchObject({ queue: [{ text: 'queued for the original' }], thinking: 'none' });
+      const opened = new Page(svc, copy.id);
+      await until(() => opened.state !== null, 5_000);
+      expect(opened.state!.conversation.thinking).toBe('none');
+      opened.detach();
+      page.detach();
+    } finally {
+      await fake.close();
+    }
+  }, 30_000);
+});
+
+describe('Chat service — Claude Code in Work', () => {
+  // Mutations: the Work host not marked stale (the idle agent keeps Claude Code until it idles out), both hosts marked
+  // stale (the idle Chat agent stops too), or the setting read only at construction (the restart reads the default).
+  it('off: the idle Work agent stops at once, the next one starts with the switches, Chat stays; a restart keeps it', async () => {
+    await withWork(
+      'chat-basic',
+      async (fake, project) => {
+        const svc = fake.service;
+        const starts = (): Json[] => fake.records().filter((r) => r.kind === 'start');
+        const idle = (id: string): Promise<void> => until(() => !svc.busyConversations().includes(id), 5_000);
+        const chat = (await svc.create({ mode: 'chat', text: 'hi' })).conversation;
+        await idle(chat.id);
+        const work = (await svc.create({ mode: 'work', text: 'hi', cwd: project })).conversation;
+        await idle(work.id);
+        expect(starts()).toHaveLength(2);
+        expect(starts()[1]!.claudeSwitches).toEqual({});
+
+        expect(await svc.setWorkSettings({ claudeCode: false })).toEqual({ claudeCode: false });
+        for (const end = Date.now() + 5_000; (await svc.state()).modes.work.state !== 'stopped';) {
+          if (Date.now() > end) throw new Error('the Work agent did not stop');
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        expect((await svc.state()).modes.chat.state).toBe('ready');
+        await svc.prompt(work.id, 'again');
+        await idle(work.id);
+        expect(starts()).toHaveLength(3);
+        expect(starts()[2]!.claudeSwitches).toEqual(CLAUDE_CODE_OFF_ENV);
+
+        await fake.service.close();
+        expect(fake.restart().getWorkSettings()).toEqual({ claudeCode: false });
+      },
+      {
+        mutate: (scenario) => {
+          scripted(scenario);
+          scenario.work = { session: { agentName: 'grok-build-plan' } };
+        },
+      },
+    );
+  }, 30_000);
+});
+
+describe('Chat service — Work without a folder', () => {
+  const quiet = (scenario: Json): void => {
+    scenario.prompts = [];
+  };
+
+  async function withNone(
+    run: (fake: FakeService, scratch: string) => Promise<void>,
+    options: Parameters<typeof fakeService>[1] = {},
+  ): Promise<void> {
+    const fake = fakeService('work-workflow-run', { mutate: quiet, ...options });
+    try {
+      await run(fake, join(fake.root, 'home', 'Portato'));
+    } finally {
+      await fake.close();
+    }
+  }
+
+  /** Waits until the conversation's first answer ended, however soon after the create it did. */
+  async function answered(fake: FakeService, id: string): Promise<void> {
+    const page = new Page(fake.service, id);
+    await until(() => page.state !== null && page.state.turn === null && page.texts('user').length === 1, 8_000);
+    page.detach();
+  }
+
+  /** A No folder conversation whose first answer ended. */
+  async function made(fake: FakeService): Promise<{ id: string; cwd: string }> {
+    const { conversation } = await fake.service.create({ mode: 'work', text: 'hi', noFolder: true });
+    await answered(fake, conversation.id);
+    return { id: conversation.id, cwd: conversation.cwd! };
+  }
+
+  const sessionNews = (fake: FakeService): Json[] => fake.sent().filter((m) => m.method === 'session/new');
+
+  // Mutations: no folder made (the agent gets no cwd); the folder made under the app data; the mark left out.
+  it('makes a new 0700 folder in ~/Portato, starts the agent there and marks the conversation', async () => {
+    await withNone(async (fake, scratch) => {
+      const { id, cwd } = await made(fake);
+      expect(dirname(cwd)).toBe(realpathSync(scratch));
+      expect(statSync(cwd).isDirectory()).toBe(true);
+      expect(statSync(cwd).mode & 0o777).toBe(0o700);
+      expect((sessionNews(fake)[0]!.params as Json).cwd).toBe(cwd);
+      const page = new Page(fake.service, id);
+      await until(() => page.state !== null, 5_000);
+      expect(page.state!.conversation).toMatchObject({ mode: 'work', cwd, noFolder: true });
+      page.detach();
+      // ~/Portato picked by hand is a folder of its own: its parent is home.
+      const picked = await fake.service.create({ mode: 'work', text: 'hi', cwd: scratch });
+      expect([picked.conversation.cwd, picked.conversation.noFolder]).toEqual([realpathSync(scratch), undefined]);
+    });
+  }, 30_000);
+
+  // Mutation: the root read before it existed is kept after the make → the first No folder conversation is not marked.
+  it('a conversation read before ~/Portato exists leaves the first No folder conversation marked', async () => {
+    await withNone(async (fake, scratch) => {
+      const project = join(fake.root, 'home', 'code');
+      mkdirSync(project, { recursive: true });
+      const before = await fake.service.create({ mode: 'work', text: 'hi', cwd: project });
+      expect(before.conversation.noFolder).toBeUndefined();
+      expect(existsSync(scratch)).toBe(false);
+      const { conversation } = await fake.service.create({ mode: 'work', text: 'hi', noFolder: true });
+      expect(dirname(conversation.cwd!)).toBe(realpathSync(scratch));
+      expect(conversation.noFolder).toBe(true);
+    });
+  }, 30_000);
+
+  // Mutation: the new folder skips `checkWorkFolder` → the agent starts in the agent home.
+  it('the folder rule runs on the new folder: a ~/Portato inside the agent home fails and leaves nothing', async () => {
+    await withNone(async (fake, scratch) => {
+      const inside = join(fake.root, 'agent-home', 'Portato');
+      mkdirSync(inside, { recursive: true });
+      symlinkSync(inside, scratch);
+      const error = await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+      expect([error.reason, error.message]).toEqual(['cwd-invalid', CWD_PROBLEM_MESSAGES['app-data']]);
+      expect(readdirSync(inside)).toEqual([]);
+      expect(sessionNews(fake)).toEqual([]);
+    });
+  });
+
+  // Mutation: a raw fs error passed on → "The agent could not be reached." in place of the typed failure.
+  it('a file named Portato: the create answers folder-not-made and never reaches the agent', async () => {
+    await withNone(async (fake, scratch) => {
+      writeFileSync(scratch, 'x');
+      const error = await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+      expect([error.code, error.reason, error.message]).toEqual([
+        'E_CONFLICT',
+        'folder-not-made',
+        'The app could not make a folder for this conversation.',
+      ]);
+      expect(sessionNews(fake)).toEqual([]);
+    });
+  });
+
+  // Mutation: no cleanup on a failed create → an empty dated folder per failure.
+  it('session/new that never answers: the new folder is gone', async () => {
+    await withNone(
+      async (fake, scratch) => {
+        expect((await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }))).reason).toBe(
+          'agent-slow',
+        );
+        expect(readdirSync(scratch)).toEqual([]);
+      },
+      {
+        mutate: (scenario) => void Object.assign(scenario, { prompts: [], faults: { hangOn: 'session/new' } }),
+        createBudgetMs: 400,
+      },
+    );
+  }, 30_000);
+
+  // Mutation: no cleanup on a failed create → an empty dated folder per failure.
+  it('an index write that fails: the new folder is gone', async () => {
+    await withNone(async (fake, scratch) => {
+      // A folder where the index file goes: its write cannot land.
+      mkdirSync(join(fake.paths.conversations, 'held'), { recursive: true });
+      await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+      expect(sessionNews(fake)).toHaveLength(1);
+      expect(readdirSync(scratch)).toEqual([]);
+    });
+  }, 30_000);
+
+  // Mutation: the cleanup also after the conversation is stored → a live conversation loses its folder.
+  it('a first turn that cannot start after the conversation is stored keeps the folder', async () => {
+    await withNone(async (fake, scratch) => {
+      const target = fake.service as unknown as { startTurn: () => never };
+      const original = target.startTurn;
+      target.startTurn = () => {
+        throw routeError('chat', new Error('no turn'));
+      };
+      try {
+        await apiError(fake.service.create({ mode: 'work', text: 'hi', noFolder: true }));
+      } finally {
+        target.startTurn = original;
+      }
+      expect(readdirSync(scratch)).toHaveLength(1);
+    });
+  });
+
+  // Mutations: a recursive remove (the file goes); no remove at all (the empty folder stays).
+  it('delete removes the empty folder and keeps one that holds a file', async () => {
+    await withNone(async (fake, scratch) => {
+      const empty = await made(fake);
+      const full = await made(fake);
+      writeFileSync(join(full.cwd, 'notes.md'), 'mine');
+      await fake.service.delete(empty.id);
+      await fake.service.delete(full.id);
+      expect(existsSync(empty.cwd)).toBe(false);
+      expect(readFileSync(join(full.cwd, 'notes.md'), 'utf8')).toBe('mine');
+      expect(existsSync(scratch)).toBe(true);
+    });
+  }, 30_000);
+
+  // Mutation: the remove does not look for another conversation in the folder → the fork loses its folder.
+  it('a fork keeps the folder until it is deleted too', async () => {
+    await withNone(async (fake) => {
+      const origin = await made(fake);
+      const copy = await fake.service.fork(origin.id);
+      await fake.service.delete(origin.id);
+      expect(existsSync(origin.cwd)).toBe(true);
+      await fake.service.delete(copy.id);
+      expect(existsSync(origin.cwd)).toBe(false);
+    });
+  }, 30_000);
+
+  // Mutation: the remove for every Work folder → a user's own empty folder goes.
+  it('delete of a conversation in a picked folder never removes it, empty or not', async () => {
+    await withNone(async (fake) => {
+      const picked = join(fake.root, 'home', 'code', 'empty');
+      mkdirSync(picked, { recursive: true });
+      const { conversation } = await fake.service.create({ mode: 'work', text: 'hi', cwd: picked });
+      await answered(fake, conversation.id);
+      await fake.service.delete(conversation.id);
+      expect(readdirSync(picked)).toEqual([]);
+    });
+  }, 30_000);
 });

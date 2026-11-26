@@ -1,0 +1,142 @@
+.frame {
+  container: run-strip / inline-size;
+  min-width: 0;
+}
+
+.box {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  margin: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-1) 0 var(--space-2-5);
+  background: var(--surface-raised);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  list-style: none;
+}
+
+.line {
+  display: flex;
+  min-height: var(--control-height-md);
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.line + .line {
+  border-top: 1px solid var(--border);
+}
+
+.main {
+  --focus-outline-offset: -2px;
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-control);
+  padding: var(--space-1) 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: start;
+  cursor: pointer;
+}
+
+.icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.ask {
+  flex: none;
+  color: var(--warning);
+}
+
+.name {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail {
+  display: flex;
+  min-width: 0;
+  flex: 1 1 auto;
+  gap: var(--space-2);
+  overflow: hidden;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.step,
+.counts {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.step::before,
+.counts::before {
+  content: '· ';
+}
+
+.state {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.clock {
+  font-variant-numeric: tabular-nums;
+}
+
+.askText,
+.summary {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.askText .name {
+  color: var(--foreground);
+}
+
+.review.review {
+  flex: none;
+}
+
+.open {
+  flex: none;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .main:hover .name {
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+}
+
+@container run-strip (max-width: 559px) {
+  .counts {
+    display: none;
+  }
+}
+
+@container run-strip (max-width: 419px) {
+  .step {
+    display: none;
+  }
+}

@@ -276,6 +276,7 @@ describe('nothing else moves the mode up', () => {
       ['POST', '/api/chat/conversations', (f) => ({ mode: 'work', text: 'ls', cwd: folder, ...f })],
       ['POST', `${conv}/prompt`, (f) => ({ text: 'ls', ...f })],
       ['POST', `${conv}/cancel`, (f) => f],
+      ['POST', `${conv}/compact`, (f) => f],
       ['POST', `${conv}/interactions/x1`, (f) => ({ optionId: 'allow-once', ...f })],
       ['PATCH', conv, (f) => ({ title: 'x', ...f })],
       ['PATCH', conv, (f) => f],
@@ -531,12 +532,13 @@ describe('the source', () => {
       return out;
     };
     expect(uses('.setDraftPermissionMode(')).toEqual(['api/handlers/chat.ts handleChatDraftPermissionMode']);
-    expect(uses('.claim(')).toEqual(['chat/service.ts create']);
+    // `createIn` is the body of `create` (which counts the creates in flight around it).
+    expect(uses('.claim(')).toEqual(['chat/service.ts createIn']);
     expect(uses('this.raise(').filter((use) => use.startsWith('chat/service.ts'))).toEqual([
       'chat/service.ts applyDraft',
       'chat/service.ts setPermissionMode',
     ]);
-    expect(uses('this.applyDraft(')).toEqual(['chat/service.ts create']);
+    expect(uses('this.applyDraft(')).toEqual(['chat/service.ts createIn']);
   });
 });
 

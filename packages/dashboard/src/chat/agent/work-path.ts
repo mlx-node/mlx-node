@@ -13,6 +13,7 @@ import { basename } from 'node:path';
 
 import { findOnPath, readPathEnv } from '../skills/cli-check.js';
 import { workInherited } from './env.js';
+import { mergePath } from './login-path.js';
 
 type ShellKind = 'zsh' | 'bash';
 
@@ -43,18 +44,6 @@ async function shellBinary(kind: ShellKind, env: Record<string, string>): Promis
     if (named !== undefined && basename(named) === kind && (await executable(named))) return named;
   }
   return (await findOnPath(kind, [env.PATH ?? '', ...SHELL_DIRS].join(':'))) ?? `/bin/${kind}`;
-}
-
-/** `first` then `then`, empty entries dropped, the first occurrence kept. */
-function mergePath(first: string, then: string | undefined): string {
-  const seen = new Set<string>();
-  const out: string[] = [];
-  for (const entry of [...first.split(':'), ...(then ?? '').split(':')]) {
-    if (entry === '' || seen.has(entry)) continue;
-    seen.add(entry);
-    out.push(entry);
-  }
-  return out.join(':');
 }
 
 /**
@@ -131,7 +120,7 @@ function askShell(
 }
 
 /**
- * The `PATH` a Work command gets, for the Work environment `base` (the agent's cwd is `home`). A login shell that
+ * The `PATH` a Work command gets, for the Work environment `base` (both shells run in `home`). A login shell that
  * fails or runs past the limit gives `base.PATH`, as in the agent; then the command shell is still asked. Never
  * rejects; writes nothing.
  */

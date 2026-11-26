@@ -1,17 +1,25 @@
 import type { ReactElement } from 'react';
 
 import { DataTable, type DataColumn } from '../../components/arc-x/data-table/data-table';
-import { ContextFill, LiveTurnRow, PhaseBadge, TurnProgress } from '../../components/arc-x/live-turn-row/live-turn-row';
+import {
+  ContextFill,
+  LaneSpeed,
+  LiveTurnRow,
+  PhaseBadge,
+  TurnProgress,
+  type LaneSpeedFields,
+  type LiveTurnRowProps,
+} from '../../components/arc-x/live-turn-row/live-turn-row';
 import { ModelBadge } from '../../components/arc-x/model-badge/model-badge';
 import { Panel } from '../../components/arc-x/panel/panel';
 import { SwapText } from '../../components/arc-x/swap-text/swap-text';
 import { dispatchWord } from '../../lib/engine-view';
 import { formatClock, formatCountNoun } from '../../lib/format';
+import { useLiveLanes, visibleLanes, type LiveLane, type LiveTurn } from '../../lib/live-lanes';
+import { METRIC } from '../../lib/metric-strings';
 import type { RuntimeProcessLive } from '../../lib/types';
 
 const TURN_CAP = 32;
-
-type LiveTurn = RuntimeProcessLive['turns'][number];
 
 /** The model that serves the turn: the checkpoint, else the name the client used when the engine did not resolve it. */
 export function servedModel(turn: Pick<LiveTurn, 'model' | 'modelId'>): string {
@@ -38,27 +46,40 @@ export function startedAgo(ms: number): string {
   return `${String(Math.floor(minutes / 60))}h ${String(minutes % 60).padStart(2, '0')}m ago`;
 }
 
+/** The lane's own clocks and counts: its wait reason, one-shot prefill time and prefill or decode speed. */
+function laneFields(lane: LiveLane): LaneSpeedFields & Pick<LiveTurnRowProps, 'waitMs' | 'slotMs'> {
+  const turn = lane.turn;
+  return {
+    phase: lane.endedAt === null ? turn.phase : 'idle',
+    prefillDone: turn.prefillDone,
+    prefillTotal: turn.prefillTotal,
+    generatedTokens: turn.generatedTokens,
+    waitMs: turn.waitMs,
+    slotMs: turn.slotMs,
+    prefillElapsedMs: turn.prefillElapsedMs,
+    decodeElapsedMs: turn.decodeElapsedMs,
+  };
+}
+
 /** One live turn row of the Overview list; display and color use `modelId ?? model`. */
 export function TurnRowFor({
-  turn,
+  lane,
   now,
   live,
   density,
 }: {
-  turn: LiveTurn;
+  lane: LiveLane;
   now: number;
   live: boolean;
   density?: 'default' | 'compact';
 }): ReactElement {
+  const turn = lane.turn;
   return (
     <LiveTurnRow
+      {...laneFields(lane)}
       model={servedModel(turn)}
       alias={askedAlias(turn)}
-      phase={turn.phase}
-      elapsedMs={Math.max(0, now - turn.startedAt)}
-      prefillDone={turn.prefillDone}
-      prefillTotal={turn.prefillTotal}
-      generatedTokens={turn.generatedTokens}
+      elapsedMs={Math.max(0, now - (lane.endedAt ?? turn.startedAt))}
       promptTokens={turn.promptTokens}
       cachedTokens={turn.cachedTokens}
       ctxWindow={turn.ctxWindow}
@@ -70,27 +91,24 @@ export function TurnRowFor({
 }
 
 export function FlightSection({ process, now }: { process: RuntimeProcessLive; now: number }): ReactElement {
-  const turns = [...process.turns].sort((a, b) => a.startedAt - b.startedAt).slice(0, TURN_CAP);
+  const lanes = visibleLanes(useLiveLanes(process.turns, now, process.pid), TURN_CAP);
   const live = process.status === 'running';
-  const progressOf = (turn: LiveTurn) => ({
-    model: servedModel(turn),
-    phase: turn.phase,
-    prefillDone: turn.prefillDone,
-    prefillTotal: turn.prefillTotal,
-    generatedTokens: turn.generatedTokens,
-    promptTokens: turn.promptTokens,
-    cachedTokens: turn.cachedTokens,
-    ctxWindow: turn.ctxWindow,
+  const progressOf = (lane: LiveLane) => ({
+    ...laneFields(lane),
+    model: servedModel(lane.turn),
+    promptTokens: lane.turn.promptTokens,
+    cachedTokens: lane.turn.cachedTokens,
+    ctxWindow: lane.turn.ctxWindow,
     live,
   });
 
-  const columns: DataColumn<LiveTurn>[] = [
+  const columns: DataColumn<LiveLane>[] = [
     {
       id: 'model',
       header: 'Model',
       width: '32%',
       truncate: true,
-      cell: (turn) => {
+      cell: ({ turn }) => {
         const alias = askedAlias(turn);
         return (
           <ModelBadge
@@ -108,24 +126,41 @@ export function FlightSection({ process, now }: { process: RuntimeProcessLive; n
         );
       },
     },
-    { id: 'phase', header: 'Phase', width: 116, cell: (turn) => <PhaseBadge phase={turn.phase} live={live} /> },
+    {
+      id: 'phase',
+      header: 'Phase',
+      width: 116,
+      cell: (lane) => <PhaseBadge phase={laneFields(lane).phase} live={live} />,
+    },
     {
       id: 'progress',
       header: 'Progress',
       flex: true,
       minWidth: 200,
       truncate: true,
-      cell: (turn) => <TurnProgress {...progressOf(turn)} />,
+      cell: (lane) => <TurnProgress {...progressOf(lane)} />,
+    },
+    {
+      id: 'speed',
+      header: METRIC.laneSpeed.label,
+      headerTitle: METRIC.laneSpeed.tip,
+      align: 'end',
+      width: 96,
+      minTableWidth: 700,
+      cell: (lane) => <LaneSpeed {...laneFields(lane)} />,
     },
     {
       id: 'started',
       header: 'Started',
-      headerTitle: 'How long ago the turn started',
+      headerTitle: 'How long ago the turn started; for an idle session, how long ago its last call ended',
       align: 'end',
       width: 104,
-      cell: (turn) => (
-        <span className="tabular-nums" title={`Started at ${formatClock(turn.startedAt)}`}>
-          <SwapText text={startedAgo(now - turn.startedAt)} granularity="char" />
+      cell: ({ turn, endedAt }) => (
+        <span
+          className="tabular-nums"
+          title={endedAt === null ? `Started at ${formatClock(turn.startedAt)}` : `Ended at ${formatClock(endedAt)}`}
+        >
+          <SwapText text={startedAgo(now - (endedAt ?? turn.startedAt))} granularity="char" />
         </span>
       ),
     },
@@ -135,11 +170,11 @@ export function FlightSection({ process, now }: { process: RuntimeProcessLive; n
       headerTitle: 'Prompt and output against the model window',
       width: 128,
       minTableWidth: 700,
-      cell: (turn) => <ContextFill {...progressOf(turn)} />,
+      cell: (lane) => <ContextFill {...progressOf(lane)} />,
     },
   ];
 
-  if (turns.length === 0) {
+  if (lanes.length === 0) {
     return (
       <Panel title="In flight" description="Turns running in this process.">
         <p className="text-body text-secondary">No turns in flight.</p>
@@ -151,9 +186,9 @@ export function FlightSection({ process, now }: { process: RuntimeProcessLive; n
       <DataTable
         caption="Turns in flight"
         columns={columns}
-        rows={turns}
-        rowKey={(turn) => turn.traceId}
-        rowAttrs={(turn) => ({ 'data-trace-id': turn.traceId })}
+        rows={lanes}
+        rowKey={(lane) => lane.key}
+        rowAttrs={(lane) => ({ 'data-trace-id': lane.turn.traceId })}
         footer={process.turns.length >= TURN_CAP ? `Showing the first ${String(TURN_CAP)}.` : undefined}
       />
     </Panel>

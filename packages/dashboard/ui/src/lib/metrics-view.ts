@@ -14,6 +14,7 @@ import {
   formatRate,
   formatTps,
 } from './format';
+import { METRIC } from './metric-strings';
 import { PREFILL_UNDER_TEXT } from './prefill';
 import type { AlignedRange, RangeKey } from './range';
 import { pivotMeasures } from './timeseries';
@@ -25,6 +26,7 @@ import {
   type MetricsSummary,
   type MetricsTimeseries,
   type MetricsTotals,
+  type RatedSum,
   type TurnRow,
 } from './types';
 
@@ -110,6 +112,21 @@ export function toBins(edges: readonly number[], histogram: Histogram | undefine
   }));
 }
 
+/** Tokens per second of `ms` that produced `tokens`; null when nothing was measured. */
+export function ratedSpeed(sum: RatedSum): number | null {
+  return sum.ms > 0 && sum.tokens > 0 ? (sum.tokens * 1000) / sum.ms : null;
+}
+
+/** Token-weighted decode speed of many turns: output tokens after each first ÷ their decode time. */
+export function decodeSpeed(totals: MetricsTotals): number | null {
+  return ratedSpeed({ tokens: totals.decodeRatedTokens, ms: totals.decodeRatedMs });
+}
+
+/** Token-weighted prefill speed of many turns: tokens of prefills over the size floor ÷ their prefill time. */
+export function prefillSpeed(totals: MetricsTotals): number | null {
+  return ratedSpeed({ tokens: totals.prefillRatedTokens, ms: totals.prefillRatedMs });
+}
+
 /** Phase durations of one turn, each clamped so they sum to preDispatch + duration. */
 export interface TurnPhases {
   handlingMs: number;
@@ -181,9 +198,9 @@ export const PHASES: ReadonlyArray<{ key: string; label: string; color: string; 
   { key: 'queue', label: 'Queue', color: 'var(--phase-queue)', pattern: 'hatch' },
   { key: 'loadWait', label: 'Waiting for a model load', color: 'var(--phase-wait)', pattern: 'hatch' },
   { key: 'resolve', label: 'Loading the model', color: 'var(--phase-wait)', pattern: 'solid' },
-  { key: 'wait', label: 'Model busy', color: 'var(--phase-queue)', pattern: 'solid' },
-  { key: 'slot', label: 'Waiting for a slot', color: 'var(--phase-slot)', pattern: 'hatch' },
-  { key: 'prepare', label: 'Preparing', color: 'var(--phase-prepare)', pattern: 'solid' },
+  { key: 'wait', label: METRIC.modelBusy.label, color: 'var(--phase-queue)', pattern: 'solid' },
+  { key: 'slot', label: METRIC.laneWait.label, color: 'var(--phase-slot)', pattern: 'hatch' },
+  { key: 'prepare', label: METRIC.preparing.label, color: 'var(--phase-prepare)', pattern: 'solid' },
   { key: 'first', label: 'To first token', color: 'var(--phase-prefill)', pattern: 'hatch' },
   { key: 'setup', label: 'Setup', color: 'var(--phase-setup)', pattern: 'solid' },
   { key: 'prefill', label: 'Prefill', color: 'var(--phase-prefill)', pattern: 'solid' },
@@ -328,9 +345,9 @@ const SPAN_LABEL = {
   resolve: 'Loading the model',
   loadWait: 'Waiting for a model load',
   queue: 'Queue',
-  wait: 'Model busy',
-  slot: 'Waiting for a slot',
-  prepare: 'Preparing',
+  wait: METRIC.modelBusy.label,
+  slot: METRIC.laneWait.label,
+  prepare: METRIC.preparing.label,
   first: 'To first token',
   setup: 'Setup',
   prefill: 'Prefill',
@@ -399,7 +416,7 @@ export function turnTimeline(row: TurnRow): {
       push('prefill', 'prefill', phases.prefillMs, false, [
         { label: 'Prefill tokens', value: formatNumber(row.prefillTokens) },
         {
-          label: 'Prefill speed',
+          label: METRIC.prefillSpeed.label,
           value: row.prefillTps === null ? PREFILL_UNDER_TEXT : `${formatCount(row.prefillTps)} tok/s`,
         },
       ]);
@@ -414,7 +431,7 @@ export function turnTimeline(row: TurnRow): {
     if (stop !== 'prefill') {
       push('decode', 'decode', phases.decodeMs, true, [
         { label: 'Output tokens', value: formatNumber(row.outputTokens) },
-        { label: 'Decode speed', value: row.decodeTps === null ? '—' : `${formatTps(row.decodeTps)} tok/s` },
+        { label: METRIC.decodeSpeed.label, value: row.decodeTps === null ? '—' : `${formatTps(row.decodeTps)} tok/s` },
       ]);
       push('tail', 'other', phases.tailMs, false);
     }
@@ -437,7 +454,7 @@ export function turnTimeline(row: TurnRow): {
               phases.setupMs +
               phases.prefillMs +
               phases.firstTokenMs,
-            label: 'First token',
+            label: METRIC.firstToken.label,
           },
         ]
       : [];
@@ -480,8 +497,8 @@ export function previousLabel(key: RangeKey): string {
 }
 
 export const KPI_LABEL: Record<KpiKey, string> = {
-  decode: 'Decode speed',
-  ttft: 'First token',
+  decode: METRIC.decodeSpeed.label,
+  ttft: METRIC.firstToken.label,
   turns: 'Turns',
   tokens: 'Output tokens',
   failed: 'Failed turns',
@@ -496,7 +513,7 @@ export function kpiDescription(key: KpiKey, range: RangeKey): string {
     case 'tokens':
       return `Tokens generated in ${window}.`;
     case 'decode':
-      return `Median decode speed of completed turns in ${window}.`;
+      return `Completed turns in ${window}. ${METRIC.decodeSpeed.tip}`;
     case 'ttft':
       return `Median time to the first token of completed turns in ${window}.`;
     case 'failed':
@@ -504,11 +521,11 @@ export function kpiDescription(key: KpiKey, range: RangeKey): string {
   }
 }
 
-/** The measure of one timeseries row for a KPI: the median for speeds, the bucket total for counts. */
+/** The measure of one timeseries row for a KPI: the token-weighted speed, the median time, the bucket total for counts. */
 export function kpiPointValue(key: KpiKey, point: TsPoint): number | null {
   switch (key) {
     case 'decode':
-      return point.decodeTps.p50;
+      return decodeSpeed(point.totals);
     case 'ttft':
       return point.ttftMs.p50;
     case 'turns':
@@ -520,7 +537,7 @@ export function kpiPointValue(key: KpiKey, point: TsPoint): number | null {
   }
 }
 
-/** A bucket with no row: 0 for counts, null (a gap) for medians. */
+/** A bucket with no row: 0 for counts, null (a gap) for speeds and times. */
 export function kpiEmpty(key: KpiKey): 0 | null {
   return key === 'decode' || key === 'ttft' ? null : 0;
 }
@@ -561,8 +578,12 @@ export function kpiByModel(
   const rows: Array<{ model: string; value: number; samples?: number }> = [];
   for (const row of byModel) {
     if (row.totals.turns <= 0) continue;
-    if (key === 'decode' || key === 'ttft') {
-      const quantiles = key === 'decode' ? row.latency.decodeTps : row.latency.ttftMs;
+    if (key === 'decode') {
+      const speed = decodeSpeed(row.totals);
+      if (speed === null) continue;
+      rows.push({ model: row.model, value: speed, samples: row.latency.decodeTps.n });
+    } else if (key === 'ttft') {
+      const quantiles = row.latency.ttftMs;
       if (quantiles.p50 === null) continue;
       rows.push({ model: row.model, value: quantiles.p50, samples: quantiles.n });
     } else {
@@ -592,18 +613,19 @@ function errorShare(totals: MetricsTotals | undefined): number | null {
 }
 
 /**
- * The five KPI tiles of a summary. `decodeHint`: 'tails' prints p05 and p95 once there are 20 turns (Metrics),
- * 'median' always prints the sample (Overview).
+ * The five KPI tiles of a summary. The decode tile is token-weighted; its hint gives the per-turn p05 and p95 once
+ * there are 20 turns, else the turn count.
  */
-export function kpiTiles(summary: MetricsSummary, versus: string, decodeHint: 'tails' | 'median'): KpiTileView[] {
+export function kpiTiles(summary: MetricsSummary, versus: string): KpiTileView[] {
   const { totals, latency, previous } = summary;
   const decode = latency.decodeTps;
+  const speed = decodeSpeed(totals);
   const ttft = latency.ttftMs;
   const ttftParts = formatDurationParts(ttft.p50);
   const decodeText =
-    decodeHint === 'tails' && decode.n >= LOW_SAMPLE_TAIL_N
-      ? `p05 ${formatTps(decode.p05)} · p95 ${formatTps(decode.p95)}`
-      : `median of ${formatCountNoun(decode.n, 'turn', 'turns')}`;
+    decode.n >= LOW_SAMPLE_TAIL_N
+      ? `p05 ${formatTps(decode.p05)} · p95 ${formatTps(decode.p95)} per turn`
+      : formatCountNoun(decode.n, 'turn', 'turns');
   const ttftText =
     ttft.n >= LOW_SAMPLE_TAIL_N
       ? `p95 ${formatDuration(ttft.p95)}`
@@ -612,9 +634,14 @@ export function kpiTiles(summary: MetricsSummary, versus: string, decodeHint: 't
     {
       key: 'decode',
       label: KPI_LABEL.decode,
-      value: measured(formatTps(decode.p50)),
+      value: measured(formatTps(speed)),
       unit: 'tok/s',
-      delta: { current: decode.p50, previous: previous?.latency.decodeTps.p50 ?? null, goodWhen: 'up', versus },
+      delta: {
+        current: speed,
+        previous: previous === null ? null : decodeSpeed(previous.totals),
+        goodWhen: 'up',
+        versus,
+      },
       hint: decodeText,
       sampleCount: decode.n,
     },

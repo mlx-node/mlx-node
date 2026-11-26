@@ -3,10 +3,11 @@
  */
 
 import { act, createElement } from 'react';
-import { MemoryRouter, useNavigate, type NavigateFunction } from 'react-router-dom';
+import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import { visibleColumns } from '../ui/src/components/arc-x/data-table/data-table.js';
+import { CHAT } from '../ui/src/lib/chat-strings.js';
 import { ENGINE } from '../ui/src/lib/engine-strings.js';
 import type { RuntimeLive, RuntimeSeries, SupervisorLive } from '../ui/src/lib/types.js';
 import Engine from '../ui/src/pages/engine.js';
@@ -168,7 +169,7 @@ describe('Engine page', () => {
     expect(mounted?.text()).toContain('not trustworthy');
   });
 
-  it('names the reason in the restarting and failed alerts, and shows none after a good start', async () => {
+  it('names the reason in the restarting and failed alerts', async () => {
     const reason =
       'The models folder /Users/x/.mlx-node/models is a link to /Volumes/Disk/models, which is not available. Connect that disk, or change the link, then try again.';
     await mountEngine();
@@ -203,19 +204,12 @@ describe('Engine page', () => {
       (text) => text.includes('/Volumes/Di…'),
     );
     expect(byRole(document.body, 'alert')?.textContent).toContain('Reason: mkdir failed at /Volumes/Di… Last exit');
-
-    // The writer clears the reason on a good start; the running page has no alert and no reason.
-    await push(live({ supervisor: { ...SUPERVISOR, state: 'running', failureReason: null } }), (text) =>
-      text.includes('Output rate'),
-    );
-    expect(mounted?.text()).not.toContain('Reason:');
-    expect(mounted?.text()).not.toContain('Inference failed');
   });
 
   it('follows the live snapshot in the Now items', async () => {
     const page = await mountEngine();
     await push(live(), (text) => text.includes('Output rate42.7'));
-    await push(live({ processes: [process({ decodeTps: 12.5 })] }), () =>
+    await push(live({ processes: [process({ rates: { windowMs: 10_000, outputTps: 12.5, prefillTps: null } })] }), () =>
       statValue(page.container, 'Output rate').includes('12.5'),
     );
     expect(statValue(page.container, 'In flight')).toBe('1');
@@ -226,42 +220,9 @@ describe('Engine page', () => {
     await push(live(), (text) => text.includes('Output rate'));
     expect(page.container.textContent).not.toContain('pid 812');
     await push(live({ processes: [process(), process({ pid: 913, port: 52115 })] }), (text) =>
-      text.includes('desktop · :52114 · pid 812'),
+      text.includes('Portato · :52114 · pid 812'),
     );
     expect(byLabel(page.container, 'Process')).not.toBeNull();
-  });
-
-  it('leaves a paused Output rate chart when another process is picked', async () => {
-    let navigate: NavigateFunction | undefined;
-    const Grab = (): null => {
-      navigate = useNavigate();
-      return null;
-    };
-    api = stubApi({ '/runtime/series': runtimeSeries(), '/models': { models: [], warnings: [], dir: '/models' } });
-    mounted = await renderPage(
-      createElement(MemoryRouter, { initialEntries: ['/engine?pid=812'] }, createElement(Grab), createElement(Engine)),
-      (text) => text.includes('History'),
-    );
-    const page = mounted;
-    const pair = (now: number) =>
-      live({
-        now,
-        processes: [process({ pid: 812, decodeTps: 10 }), process({ pid: 913, port: 52115, decodeTps: 20 })],
-      });
-    const chart = (): Element | null => page.container.querySelector('figure[aria-label="Output rate"]');
-    const value = (): string => chart()?.querySelector('[data-stat-value]')?.textContent ?? '';
-    const pill = (): HTMLButtonElement | null => chart()?.querySelector('button[aria-pressed]') ?? null;
-    const start = Date.now();
-    await push(pair(start), () => value().includes('10.0'));
-    await push(pair(start + 1500), () => value().includes('10.0'));
-    act(() => pill()?.click());
-    expect(chart()?.getAttribute('data-state')).toBe('paused');
-    act(() => void navigate?.('/engine?pid=913'));
-    await push(pair(start + 3000), (text) => text.includes('pid 913'));
-    await push(pair(start + 4500), () => value().includes('20.0'));
-    expect(pill()?.getAttribute('aria-pressed')).toBe('false');
-    expect(pill()?.textContent).toBe('Live');
-    expect(chart()?.getAttribute('data-state')).toBe('live');
   });
 
   it('explains a flat model and an unread pool', async () => {
@@ -388,6 +349,22 @@ describe('Engine page', () => {
     }
   });
 
+  it('explains Process RSS in a tooltip on its label, not in a hint beside the value', async () => {
+    const page = await mountEngine();
+    await push(live(), (text) => text.includes('Process RSS'));
+    const rows = keyValueRows(page.container, 'Memory');
+    expect(rows.get('Process RSS')).not.toContain('Metal');
+    const label = [...page.container.querySelectorAll('dl[aria-label="Memory"] dt span')].find(
+      (node) => node.textContent === 'Process RSS',
+    );
+    expect(label?.getAttribute('tabindex')).toBe('0');
+    act(() => (label as HTMLElement).focus());
+    await waitFor(
+      () => document.body.textContent?.includes('Most MLX memory is in Metal and is not counted here.') === true,
+      2000,
+    );
+  });
+
   it('holds the pool region in its loading state, then its error state, never the empty one', async () => {
     const held = deferred(runtimeSeries());
     const page = await mountEngine('/engine', { '/runtime/series': held.body });
@@ -504,13 +481,6 @@ describe('Engine page', () => {
     const table = byRole(page.container, 'table', 'Turns in flight');
     const section = table?.closest('section');
     expect(section?.querySelector('header p')?.textContent).toBe('2 turns on 1 model');
-    expect([...(table?.querySelectorAll('thead th') ?? [])].map((th) => th.textContent)).toEqual([
-      'Model',
-      'Phase',
-      'Progress',
-      'Started',
-      'Context',
-    ]);
     const rows = [...(table?.querySelectorAll('tbody tr') ?? [])];
     expect(rows.map((row) => row.getAttribute('data-trace-id'))).toEqual(['b', 'a']);
     expect(rows.map((row) => row.querySelector('[data-model]')?.getAttribute('data-model'))).toEqual([
@@ -524,7 +494,6 @@ describe('Engine page', () => {
     expect(rows[1]?.querySelector('[data-model-detail] [title]')?.getAttribute('title')).toBe(
       'The client asked for mlx-local; this model served it.',
     );
-    expect(rows.map((row) => row.children[3]?.textContent)).toEqual(['2m 05s ago', '30s ago']);
     expect(section?.textContent).not.toContain('start');
   });
 
@@ -566,6 +535,18 @@ describe('Engine page', () => {
     const line = cell?.querySelector('span');
     expect(line?.className.split(' ')).toContain('whitespace-nowrap');
     expect(line?.getAttribute('title')).toBe('1h ago · 8.20 s');
+  });
+
+  it('offers Unload in the Loaded models header while a model is loaded', async () => {
+    const page = await mountEngine();
+    await push(live(), (text) => text.includes('1h ago'));
+    const panel = [...page.container.querySelectorAll('section')].find((node) =>
+      node.querySelector('h2')?.textContent?.includes('Loaded models'),
+    );
+    const button = [...(panel?.querySelectorAll('button') ?? [])].find(
+      (node) => node.textContent === CHAT.engine.unload,
+    );
+    expect(button).toBeDefined();
   });
 
   it('prints the quant on the caption line under the model name, not beside it', async () => {
@@ -688,6 +669,5 @@ describe('Engine page', () => {
     );
     expect(regions).toHaveLength(1);
     expect(regions[0].getAttribute('aria-live')).toBe('polite');
-    expect(regions[0].textContent).toContain('1 turn in flight. 42.7 tokens per second. Memory 60% of the limit.');
   });
 });

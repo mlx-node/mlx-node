@@ -1,20 +1,34 @@
 import { useMemo, type ReactElement, type ReactNode } from 'react';
 
+import { PHASE_BANDS } from '../../components/arc-x/activity-strip/phase-stack';
 import { ChartCard, type ChartState } from '../../components/arc-x/chart-card/chart-card';
 import { DataTable, type DataColumn } from '../../components/arc-x/data-table/data-table';
 import { ModelBadge } from '../../components/arc-x/model-badge/model-badge';
 import { Panel } from '../../components/arc-x/panel/panel';
+import { StackedBarChart } from '../../components/arc-x/stacked-bar-chart/stacked-bar-chart';
 import { StatGroup, StatTile } from '../../components/arc-x/stat-tile/stat-tile';
 import { TrendChart } from '../../components/arc-x/trend-chart/trend-chart';
 import { Badge } from '../../components/arc/badge/badge';
+import { columnWord, hasPhaseTime, outputRatePoints, phasePoints, phaseShare } from '../../lib/engine-history-view';
 import { flightPoints, historyTotals, memoryPoints, procKeyOf, runtimeBucketWord } from '../../lib/engine-view';
-import { formatBytes, formatClock, formatDay, formatDuration, formatNumber, formatPercent } from '../../lib/format';
+import {
+  formatBytes,
+  formatClock,
+  formatDay,
+  formatDuration,
+  formatNumber,
+  formatPercent,
+  formatTps,
+} from '../../lib/format';
+import { BANDS, METRIC } from '../../lib/metric-strings';
 import { axisNumber } from '../../lib/metrics-view';
 import { SERIES_A, SERIES_B, SERIES_REF } from '../../lib/series';
 import type { RuntimeLive, RuntimeSeries } from '../../lib/types';
 import { PageGrid, PageSection } from '../../shell/page';
 
 const REJECTED_HINT = 'HTTP 429: a chat, model-load, audio or decision queue was full';
+const WORK_EMPTY_HINT =
+  'Samples are written while inference runs; samples from before this update have none. Kept 14 days.';
 
 type Load = RuntimeSeries['loads'][number];
 type Proc = RuntimeSeries['procs'][number];
@@ -173,7 +187,13 @@ export function HistorySection({
     [series, starts, newestProc],
   );
   const flight = useMemo(() => (series === undefined ? [] : flightPoints(series, starts)), [series, starts]);
+  const phases = useMemo(() => (series === undefined ? null : phasePoints(series, starts)), [series, starts]);
+  const rates = useMemo(() => (series === undefined ? [] : outputRatePoints(series, starts)), [series, starts]);
   const noSamples = series !== undefined && series.points.every((point) => point.samples === 0);
+  const noPhaseTime = series !== undefined && !hasPhaseTime(series);
+  const noRate = rates.every((point) => point.values.rate === null);
+  const sampledState = (empty: boolean): ChartState =>
+    state === 'ready' || state === 'held' ? (empty ? 'empty' : state) : state;
 
   const loads = useMemo(() => [...(series?.loads ?? [])].sort((a, b) => b.ts - a.ts), [series]);
   const procs = useMemo(() => [...(series?.procs ?? [])].sort((a, b) => b.startedAt - a.startedAt), [series]);
@@ -184,6 +204,17 @@ export function HistorySection({
 
   const busyText =
     totals === null || totals.coveredMs <= 0 ? null : formatPercent(Math.min(1, totals.busyMs / totals.coveredMs));
+  const share = series === undefined || totals === null ? null : phaseShare(series, totals.coveredMs);
+  const busyHint =
+    totals === null || totals.coveredMs <= 0
+      ? undefined
+      : share === null
+        ? `${formatDuration(totals.busyMs)} of ${formatDuration(totals.coveredMs)} observed`
+        : [
+            `${BANDS.decode.toLowerCase()} ${formatPercent(share.decode)}`,
+            `${BANDS.prefill.toLowerCase()} ${formatPercent(share.prefill)}`,
+            `${formatDuration(totals.busyMs)} of ${formatDuration(totals.coveredMs)}`,
+          ].join(' · ');
 
   return (
     <PageSection title="History" description="All inference processes on this machine." actions={rangeControl}>
@@ -192,11 +223,7 @@ export function HistorySection({
           <StatTile
             label="Busy time"
             value={busyText}
-            hint={
-              totals === null || totals.coveredMs <= 0
-                ? undefined
-                : `${formatDuration(totals.busyMs)} of ${formatDuration(totals.coveredMs)} observed`
-            }
+            hint={busyHint}
             loading={loading}
             held={held}
             error={tileError}
@@ -257,10 +284,48 @@ export function HistorySection({
         <PageGrid>
           <ChartCard
             className="col-span-12 @md:col-span-7"
+            title={METRIC.timeByPhase.label}
+            subtitle={`Mean lanes per ${phases === null ? word : columnWord(phases.columnMs)}`}
+            height={200}
+            state={sampledState(noSamples || noPhaseTime)}
+            empty={{ title: 'No engine work in this range', hint: WORK_EMPTY_HINT }}
+            error={error}
+          >
+            <StackedBarChart
+              label={METRIC.timeByPhase.label}
+              unit="lanes"
+              height={200}
+              data={phases?.data ?? []}
+              series={PHASE_BANDS}
+              formatValue={axisNumber}
+            />
+          </ChartCard>
+          <ChartCard
+            className="col-span-12 @md:col-span-5"
+            title={METRIC.outputRate.label}
+            subtitle={`Per ${word} · tok/s while decoding`}
+            height={200}
+            state={sampledState(noSamples || noRate)}
+            empty={{ title: 'No decode in this range', hint: WORK_EMPTY_HINT }}
+            error={error}
+          >
+            <TrendChart
+              label={`${METRIC.outputRate.label} over time`}
+              unit="tok/s"
+              height={200}
+              curve="linear"
+              data={rates}
+              series={[{ key: 'rate', label: METRIC.outputRate.label, color: SERIES_A }]}
+              formatValue={formatTps}
+              formatTick={axisNumber}
+            />
+          </ChartCard>
+          <ChartCard
+            className="col-span-12 @md:col-span-7"
             title="Memory over time"
             subtitle={`Mean per ${word} · ${memory?.unit ?? 'GB'}`}
             height={200}
-            state={state === 'ready' || state === 'held' ? (noSamples ? 'empty' : state) : state}
+            state={sampledState(noSamples)}
             empty={{
               title: 'No runtime samples in this range',
               hint: 'Samples are written while inference runs. They are kept 14 days.',
@@ -269,7 +334,7 @@ export function HistorySection({
             footnote={
               series === undefined
                 ? undefined
-                : `Peak ${formatBytes(maxOf(series.points.map((p) => p.memPeakMax)))} · Node RSS up to ${formatBytes(maxOf(series.points.map((p) => p.rssMax)))}`
+                : `Peak ${formatBytes(maxOf(series.points.map((p) => p.memPeakMax)))} · process RSS up to ${formatBytes(maxOf(series.points.map((p) => p.rssMax)))}`
             }
           >
             <TrendChart
@@ -290,7 +355,7 @@ export function HistorySection({
             title="Turns in flight and queued"
             subtitle={`Highest per ${word} · turns`}
             height={200}
-            state={state === 'ready' || state === 'held' ? (noSamples ? 'empty' : state) : state}
+            state={sampledState(noSamples)}
             empty={{
               title: 'No runtime samples in this range',
               hint: 'Samples are written while inference runs. They are kept 14 days.',

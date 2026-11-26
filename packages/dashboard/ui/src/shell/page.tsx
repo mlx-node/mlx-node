@@ -54,7 +54,7 @@ export function PageHeader({
 }: PageHeaderProps): ReactElement {
   useCrumbs([...crumbs, { label: title }]);
   useEffect(() => {
-    document.title = `${title} — mlx-node`;
+    document.title = `${title} — Portato`;
   }, [title]);
 
   const root = useScrollRoot();

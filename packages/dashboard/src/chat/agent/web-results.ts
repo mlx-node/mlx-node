@@ -1,4 +1,4 @@
-/** What the Chat host takes from a web tool result: search addresses for the ledger, and key failures. */
+/** What the Chat host takes from a web tool result: search and page addresses for the ledger, and key failures. */
 
 import { mcpOutputText } from '../../agent-sessions/mcp-output.js';
 import { parseWebResultText, type WebResult } from '../web/result-text.js';
@@ -25,6 +25,10 @@ export interface WebResultEffects {
 export function applyWebResult(result: WebResult, effects: WebResultEffects): void {
   if (result.kind === 'search') {
     effects.ledger.addSearchResults(result.results.map((r) => r.url));
+    return;
+  }
+  if (result.kind === 'page') {
+    effects.ledger.addPageText(result.text);
     return;
   }
   if (result.kind === 'error' && result.provider !== 'none') {

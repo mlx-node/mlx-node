@@ -111,8 +111,26 @@ export const READY_CHAT_HOST: ChatHostState = {
     install: 'idle',
   },
   modes: {
-    chat: { state: 'ready', stale: false, failure: null, agentVersion: '1.0.45', turnsInFlight: 0, background: 0 },
-    work: { state: 'stopped', stale: false, failure: null, agentVersion: null, turnsInFlight: 0, background: 0 },
+    chat: {
+      state: 'ready',
+      stale: false,
+      failure: null,
+      agentVersion: '1.0.45',
+      turnsInFlight: 0,
+      background: 0,
+      tasks: 0,
+      engineLost: false,
+    },
+    work: {
+      state: 'stopped',
+      stale: false,
+      failure: null,
+      agentVersion: null,
+      turnsInFlight: 0,
+      background: 0,
+      tasks: 0,
+      engineLost: false,
+    },
   },
   providers: { search: null, searchCheck: null, firecrawl: false, fetch: null, applyPending: false },
   active: [],
@@ -120,6 +138,7 @@ export const READY_CHAT_HOST: ChatHostState = {
   permissionDraft: null,
   tempRoot: null,
   tempTop: null,
+  scratchRoot: '/Users/me/Portato',
   appEnds: [],
 };
 

@@ -373,7 +373,7 @@ export async function discoverLocalChatModels(
       return;
     }
     const baseTraits = decision
-      ? { reasoning: false, fallbackContextWindow: decisionContextCap }
+      ? { reasoning: false, thinkingLevels: {}, fallbackContextWindow: decisionContextCap }
       : familyTraitsFor(modelType);
     if (!baseTraits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);

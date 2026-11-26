@@ -1,0 +1,243 @@
+.root {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-surface);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface);
+  color: var(--foreground);
+  container-type: inline-size;
+}
+
+.head {
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-sm);
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.name {
+  min-width: 0;
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 500;
+}
+
+.nameButton {
+  display: inline-flex;
+  max-width: 100%;
+  align-items: center;
+  gap: var(--space-2);
+  border: 0;
+  border-radius: var(--radius-control);
+  padding: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.icon {
+  flex: none;
+  color: var(--text-muted);
+}
+
+.nameText {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.state {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.clock {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+}
+
+.status {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-0-5);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.status[data-tone='warning'] > .statusLine:first-child {
+  color: var(--warning);
+}
+
+.status[data-tone='danger'] > .statusLine:first-child {
+  color: var(--danger);
+}
+
+.statusLine {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.statusLine:has(.review) {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-2);
+}
+
+.review.review {
+  min-height: 24px;
+  height: 24px;
+  padding-inline: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.stop {
+  display: inline-flex;
+}
+
+.bodyClip {
+  min-width: 0;
+  overflow: clip;
+}
+
+.body {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2-5);
+}
+
+.goal {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.glance {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-3);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.glanceWords {
+  min-width: 0;
+}
+
+.failedLink {
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--danger);
+  font: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.budget {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.meter {
+  width: 96px;
+  min-width: 0;
+}
+
+.now {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: var(--space-2);
+  border: 0;
+  border-inline-start: 2px solid var(--border-strong);
+  padding: 0 0 0 var(--space-2);
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  margin: 0;
+  font-size: var(--text-sm);
+  text-align: start;
+}
+
+button.now {
+  cursor: pointer;
+}
+
+.nowText {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+}
+
+.folds {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.logHead {
+  margin: 0;
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.logLine {
+  display: flex;
+  min-width: 0;
+  margin: 0;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.jump {
+  justify-self: end;
+  border: 0;
+  padding: 0;
+  background: none;
+  color: var(--accent);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+/* A narrow block: the name on its own line, the state, clock and buttons under it. */
+@container (max-width: 519px) {
+  .head {
+    flex-wrap: wrap;
+    row-gap: var(--space-1);
+  }
+
+  .name {
+    flex-basis: 100%;
+  }
+}

@@ -151,6 +151,49 @@ describe('Menu', () => {
     await waitFor(() => menu() === null);
   });
 
+  it('a row that moves focus elsewhere keeps it there after the close; a row that does not gives it back to the trigger', async () => {
+    function Elsewhere(): ReactElement {
+      const [open, setOpen] = useState(false);
+      return createElement(
+        Fragment,
+        null,
+        createElement('input', { 'aria-label': 'Message' }),
+        createElement(Menu, {
+          label: 'Things',
+          open,
+          onOpenChange: setOpen,
+          trigger: createElement('button', { type: 'button' }, 'Open'),
+          children: createElement(
+            Fragment,
+            null,
+            createElement(MenuItem, {
+              label: 'Alpha',
+              // Moved after the panel is gone, as a page's frame-late focus is.
+              onSelect: () =>
+                queueMicrotask(() => document.querySelector<HTMLInputElement>('input[aria-label="Message"]')!.focus()),
+            }),
+            createElement(MenuItem, { label: 'Beta', onSelect: onBeta }),
+          ),
+        }),
+      );
+    }
+    const input = (): HTMLInputElement => document.querySelector<HTMLInputElement>('input[aria-label="Message"]')!;
+    mount(createElement(Elsewhere));
+    act(() => trigger().click());
+    await waitFor(() => menu() !== null);
+    act(() => row('Alpha').click());
+    await waitFor(() => menu() === null);
+    await rest(50);
+    expect(document.activeElement).toBe(input());
+
+    act(() => trigger().click());
+    await waitFor(() => menu() !== null);
+    act(() => row('Beta').click());
+    expect(onBeta).toHaveBeenCalledTimes(1);
+    await waitFor(() => menu() === null);
+    await waitFor(() => document.activeElement === trigger());
+  });
+
   it('keys: the row names its shortcut as aria-keyshortcuts and draws `end`; a row without keys names none', async () => {
     await openMenu();
     const alpha = row('Alpha');

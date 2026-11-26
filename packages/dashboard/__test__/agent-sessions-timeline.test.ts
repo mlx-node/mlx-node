@@ -1364,6 +1364,38 @@ describe('buildTimeline: a woken turn', () => {
     expect(lane(r)[0]).toBe('wait text 0-100');
   });
 
+  // Mutation: digest a note as a typed message → the turn gets a second prompt.
+  it('a stored note on a denied call is digested as a chunk inside the turn, never a prompt', () => {
+    const note: EventLine = {
+      at: T + 60,
+      update: {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'use pnpm' },
+        _meta: { modelId: 'm' },
+      },
+    };
+    const lines: EventLine[] = [
+      {
+        at: T,
+        update: {
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: 'Add left-pad' },
+          _meta: { promptIndex: 0 },
+        },
+      },
+      answerLine(T + 50, 'Running it'),
+      note,
+      note,
+      answerLine(T + 100, 'Using pnpm'),
+      { at: T + 300, xai: true, update: { sessionUpdate: 'turn_completed', stop_reason: 'end_turn', elapsed_ms: 300 } },
+    ];
+    const entries = digestUpdates(parseUpdates(eventsText('parent', lines))).entries;
+    expect(entries.flatMap((e) => (e.kind === 'user' ? [e.interjection] : []))).toEqual([false, true]);
+    const r = build(entries);
+    expect(r.range).toMatchObject({ startMs: T, turnStartMs: T });
+    expect(lane(r)).toEqual(['wait text 0-50', 'answer 50-50', 'wait text 60-100', 'answer 100-100']);
+  });
+
   it('runs that meet the turn take the lanes before runs of the stretch alone; lanes keep spawn order', () => {
     const gap = Array.from({ length: 8 }, (_, i) => spawn(200 + i, `bg${String(i)}`, 1_000 + i));
     const entries = [

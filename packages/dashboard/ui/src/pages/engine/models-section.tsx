@@ -7,7 +7,8 @@ import { Panel } from '../../components/arc-x/panel/panel';
 import { Meter } from '../../components/arc-x/split-bar/split-bar';
 import { SwapText } from '../../components/arc-x/swap-text/swap-text';
 import { Badge } from '../../components/arc/badge/badge';
-import { fill } from '../../lib/chat-strings';
+import { UnloadButton, type UnloadControl } from '../../components/unload-button';
+import { CHAT, fill } from '../../lib/chat-strings';
 import { ENGINE } from '../../lib/engine-strings';
 import {
   formatBytes,
@@ -44,12 +45,15 @@ export function ModelsSection({
   now,
   locals,
   modelUrl,
+  unload,
 }: {
   process: RuntimeProcessLive;
   now: number;
   locals: readonly LocalModel[] | undefined;
   /** The current URL with `model` set (selects the model in the pool section). */
   modelUrl: (name: string) => string;
+  /** The engine's Unload action for these models; the engine unloads all of them at once. */
+  unload?: (modelId: string) => UnloadControl;
 }): ReactElement {
   const rows: Row[] = process.models.map((model) => ({ kind: 'model', model }));
   for (const load of [...process.loading].reverse())
@@ -196,7 +200,18 @@ export function ModelsSection({
   ];
 
   return (
-    <Panel title="Loaded models" padding="none">
+    <Panel
+      title="Loaded models"
+      padding="none"
+      actions={
+        unload !== undefined && live && process.models.length > 0 ? (
+          <UnloadButton
+            control={unload(process.models.map((model) => model.name).join(', '))}
+            label={process.models.length > 1 ? CHAT.engine.unloadAll : CHAT.engine.unload}
+          />
+        ) : null
+      }
+    >
       <DataTable
         caption="Loaded models"
         columns={columns}

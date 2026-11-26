@@ -125,7 +125,7 @@ function verify(): string {
 
   const dmg = values.dmg.trim();
   if (dmg !== '' && versionFromDmgPath(dmg) === null) {
-    console.error(`::error::DMG ${dmg} is not named mlx-node-<version>-arm64.dmg`);
+    console.error(`::error::DMG ${dmg} is not named Portato-<version>-arm64.dmg`);
     process.exit(1);
   }
 
@@ -136,7 +136,7 @@ function verify(): string {
   }
   const windowsZip = values['windows-zip'].trim();
   if (windowsZip !== '' && (versionFromWindowsZipPath(windowsZip) === null || !existsSync(windowsZip))) {
-    console.error(`::error::Windows ZIP ${windowsZip} must exist and be named mlx-node-<version>-win32-arm64.zip`);
+    console.error(`::error::Windows ZIP ${windowsZip} must exist and be named Portato-<version>-win32-arm64.zip`);
     process.exit(1);
   }
 
@@ -158,12 +158,12 @@ function verifyWindows(): string {
   }
   const zip = values.zip.trim();
   if (zip === '' || versionFromWindowsZipPath(zip) === null || !existsSync(zip)) {
-    console.error(`::error::Windows ZIP ${zip} must exist and be named mlx-node-<version>-win32-arm64.zip`);
+    console.error(`::error::Windows ZIP ${zip} must exist and be named Portato-<version>-win32-arm64.zip`);
     process.exit(1);
   }
   const msix = values.msix.trim();
   if (msix !== '' && (versionFromWindowsMsixPath(msix) === null || !existsSync(msix))) {
-    console.error(`::error::Windows MSIX ${msix} must exist and be named mlx-node-<version>-win32-arm64.msix`);
+    console.error(`::error::Windows MSIX ${msix} must exist and be named Portato-<version>-win32-arm64.msix`);
     process.exit(1);
   }
   const app = readPackagedWindowsApp(values.app);

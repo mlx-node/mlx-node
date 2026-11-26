@@ -9,11 +9,11 @@ import { prepareDraftRelease, publishDesktopRelease } from '../scripts/release-p
 const tag = 'v0.0.14';
 const commit = 'a'.repeat(40);
 const names = [
-  'mlx-node-0.0.14-arm64.dmg',
+  'Portato-0.0.14-arm64.dmg',
   'mlx-node-0.0.14-darwin-arm64.zip',
   'mlx-node-0.0.14-darwin-arm64.zip.blockmap',
   'latest-mac.yml',
-  'mlx-node-0.0.14-win32-arm64.zip',
+  'Portato-0.0.14-win32-arm64.zip',
 ];
 let root: string;
 let files: string[];

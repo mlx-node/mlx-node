@@ -95,13 +95,43 @@ export const FAKE_AGENT_FILE = resolve(import.meta.dirname, '../../__test__/help
 /**
  * The fake agent's script in the harness, picked by a word of the prompt. Chat: "search", "read <address>", "shell",
  * "error", "long", "slow", "agent-stop" (the agent ends the turn as cancelled on its own), "untitled" (the agent writes no
- * title); any other prompt gets a Markdown answer. Work: "run" (a command with an always option),
+ * title); any other prompt gets a Markdown answer. Chat and Work: "retry" (the model stalls twice, then answers),
+ * "retryfail" (three server errors, then the agent gives up), "picture" (Chat: the message's picture made smaller, then
+ * left out of the retry the engine refused; Work: a read whose picture the agent left out), "nomodel" (the agent has no
+ * model it can use: nothing runs, the answer ends "No model answered" with its words), "hookstop" (after the answer two
+ * stop hooks run 4 s: the wait line from 1 s, then "Hook failed" for the lint hook, counted on the same row when sent
+ * again, and the other hook's note), "hookblock" (a prompt hook blocks the message after 1.5 s: its note, then "Stopped
+ * by a hook."). Work: "hookdeny" (a hook blocks `rm -rf build`: the row reads "Blocked · by a hook" with the hook's
+ * words), "run" (a command with an always option),
  * "write" (a file edit), "edit" (a read, then an edit with the edits-for-this-conversation option), "look" (a listing,
- * a search and a read), "risky" (a flagged command), "plan" (a plan to approve), "key" (a command that prints the
+ * a search and a read), "risky" (a flagged command), "plan" (the model enters plan mode itself, then a plan to approve;
+ * approving it leaves plan mode), "key" (a command that prints the
  * selected provider key), "auto" (three known commands, an edit, then a command that is not on Auto's list),
  * "everything" (a printf, an edit outside the folder, an MCP tool and a helper's request with no tool call),
  * "longcmd" (a long command that reads `/tmp/napi-rs-a6ih`: Auto allows it), "tmpshared" (a read under `/tmp`, then the
- * same long command on a folder its group can write: Auto asks and names it); any other Work prompt lists the folder.
+ * same long command on a folder its group can write: Auto asks and names it), "colors" (a `yarn test` whose colored
+ * output comes in three ticks 600 ms apart), "needs" (a subagent's request, the turn's own `rm -rf build/` and a workflow
+ * helper's `cargo publish`; the subagent gives up after 30 s and its card closes as withdrawn), "diff" (five edits with
+ * their diffs, each asking: a change, a replace-all with two matches, a new file, a whole-file write, an edit that
+ * fails), "leftpad" (an `npm install left-pad` to deny with a note: with one the agent goes on with `pnpm add
+ * left-pad`, with a plain Deny the answer ends), "background" (a dev server for 10 min, a build watch that ends after
+ * 2 min and wakes the agent, a subagent that ends after 45 s and a schedule for 10 min that fires once at 25 s (its
+ * run is a subagent for 20 s; Delete on the rail removes it, also once paused): the process stays for them, and a
+ * settings change or an engine restart waits; each wake row names what ended from its first line; Stop on the rail
+ * kills the dev server or the build watch, and the agent wakes to hear of it; the subagent ticks
+ * every 2 s for 20 s, its context climbing to 86% with 1 error, then is quiet until its end; the build watch prints
+ * seven lines from 4 s, then the agent wakes once to read them), "ended" (`npm test`
+ * and `cargo build` end after 3 s and 5 s with no wake of their own; 7 s in, the agent reports both in one turn whose
+ * row reads "2 commands ended: npm test, cargo build" once it ends), "question" (three questions on one card: a single
+ * pick with a Recommended option, checks to pick any of, a yes or no; the answer becomes the row "Asked 3 questions"),
+ * "interview" (the model enters plan mode itself, then asks two questions: layouts whose previews show under the list,
+ * and pages to pick any of; the card adds Talk it over and Plan now, and the row says which one you chose),
+ * "mcp" (the MCP server "github" asks for input: a form of eight fields, its answer the line "github asked for input"),
+ * "signin" (the MCP server "github" asks you to open its sign-in page: Open page leaves "opened", and 3 s later the
+ * server's done leaves "github · finished in the browser"),
+ * "noloop" (the agent's list drops /loop: its scheduler is off for that conversation), "lateopen" (the next agent
+ * process opens that conversation 40 s late, once); any other Work prompt lists the folder. The "Plan first" chip works
+ * with any Work word: the fake agent enters and leaves plan mode on the prompt's `_meta.mode`, as the agent does.
  */
 export const HARNESS_CHAT_SCENARIO = resolve(
   import.meta.dirname,
@@ -231,6 +261,9 @@ export const HARNESS_MODELS: readonly HarnessModel[] = [
   model('example-small-Q4_0', 'example-small-Q4_0.gguf', 'example-small', 'Q4_0', 'gguf', 0.4),
 ];
 
+/** The release the harness's fake agent reports: one that sends thinking levels, so the Thinking row shows. */
+export const HARNESS_AGENT_TAG = 'mlx-agent-v0.3.6';
+
 /**
  * Chat for the harness: the fake agent, keys in memory, the fake providers (`providerBaseUrls`, all loopback), an app
  * folder inside the fixture home, an endpoint that names {@link HARNESS_MODELS} with a throwaway token, and their fixture
@@ -247,7 +280,11 @@ export function harnessChatOptions(
     root: join(home, 'chat'),
     homeDir: home,
     baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home, LANG: 'en_US.UTF-8' },
-    agentCommand: { command: process.execPath, args: [FAKE_AGENT_FILE, HARNESS_CHAT_SCENARIO] },
+    agentCommand: {
+      command: process.execPath,
+      args: [FAKE_AGENT_FILE, HARNESS_CHAT_SCENARIO],
+      tag: process.env.MLX_DEV_AGENT_TAG ?? HARNESS_AGENT_TAG,
+    },
     secrets: new MemorySecretStore(),
     providerBaseUrls,
     readEndpoint: () =>

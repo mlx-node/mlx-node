@@ -69,6 +69,22 @@ function sample(ts: number, extra: Partial<RuntimeSampleRecord> = {}): RuntimeSa
   };
 }
 
+/** Ten distinct values, so a field bound to the wrong column shows. */
+const WORK = {
+  loadingMs: 11,
+  waitingMs: 22,
+  prepareMs: 33,
+  prefillMs: 44,
+  decodeMs: 55,
+  runningMs: 66,
+  rateOutTokens: 77,
+  rateOutMs: 88,
+  ratePrefillTokens: 99,
+  ratePrefillMs: 110,
+} satisfies Partial<RuntimeSampleRecord>;
+
+const WORK_FIELDS = Object.keys(WORK) as Array<keyof typeof WORK>;
+
 function sched(ts: number): RuntimeSchedRecord {
   return {
     v: 1,
@@ -220,6 +236,28 @@ describe('ingestRuntime', () => {
     const again = await ingestRuntime(dash, dir);
     expect(again.files).toBe(0);
     expect(dash.db.select().from(runtimeSamples).all()).toHaveLength(2);
+  });
+
+  it('stores each work delta of a sample in its own column', async () => {
+    const sink = sinkAt(dir);
+    sink.append(sample(T0, WORK));
+    await sink.close();
+    await ingestRuntime(dash, dir);
+    const rows = dash.db.select().from(runtimeSamples).all();
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject(WORK);
+  });
+
+  it('stores NULL work columns for a sample written before the work deltas', async () => {
+    await writeSeries(dir);
+    await ingestRuntime(dash, dir);
+    const rows = dash.db.select().from(runtimeSamples).all();
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(Object.fromEntries(WORK_FIELDS.map((field) => [field, row[field]]))).toEqual(
+        Object.fromEntries(WORK_FIELDS.map((field) => [field, null])),
+      );
+    }
   });
 
   it('stores no turn count for a scheduler snapshot of an engine that did not write one', async () => {

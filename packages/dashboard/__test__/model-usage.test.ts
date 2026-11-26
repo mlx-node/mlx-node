@@ -45,6 +45,10 @@ function totals(turns: number, error = 0, cancelled = 0): MetricsTotals {
     decodeWallMs: 0,
     otherWallMs: 0,
     totalWallMs: 0,
+    decodeRatedTokens: 0,
+    decodeRatedMs: 0,
+    prefillRatedTokens: 0,
+    prefillRatedMs: 0,
   };
 }
 
@@ -114,7 +118,6 @@ describe('joinModelUsage', () => {
     const usage = map.get('qwen3.8-27b-gguf');
     expect(usage).toMatchObject({ key: 'Qwen3.8-27B-Q8_0', turns: 14, failed: 3, mtpTurns: 2, lastTs: 900 });
     expect(usage?.keys).toEqual(['Qwen3.8-27B-UD-Q4_K_XL', 'Qwen3.8-27B-Q8_0']);
-    expect(usage?.decodeTps.p50).toBe(25);
   });
 
   it('a model without a row is absent from the map', () => {

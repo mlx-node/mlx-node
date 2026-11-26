@@ -32,7 +32,7 @@ export interface TickerDelta {
 
 export interface TickerItem {
   key: string;
-  /** "Output rate" */
+  /** A label from `METRIC`, e.g. `METRIC.outputRate.label`. */
   label: string;
   /** Formatted; null -> "—". */
   value: string | null;

@@ -930,8 +930,8 @@ jobs:
       #
       # `package.ts` writes out/package-result.json with the bundle path it
       # actually produced. Nothing here reconstructs that path: packager returns
-      # the PLATFORM directory (out/mlx-node-darwin-arm64) and puts the bundle
-      # inside it, so every hand-written `out/mlx-node.app` was one level too high
+      # the PLATFORM directory (out/Portato-darwin-arm64) and puts the bundle
+      # inside it, so every hand-written `out/Portato.app` was one level too high
       # and this workflow could not get past its first gate.
       - name: Package and sign
         id: package
@@ -1023,11 +1023,12 @@ jobs:
           TAG: ${{ env.RELEASE_TAG }}
           ZIP: ${{ steps.zip.outputs.path }}
           DRY_RUN: ${{ inputs.dry_run }}
+          PACKAGED_APP: ${{ steps.package.outputs.app }}
         run: |
           set -euo pipefail
           EXTRACTED="$RUNNER_TEMP/update-verification"
           ditto -x -k "$ZIP" "$EXTRACTED"
-          APP="$EXTRACTED/mlx-node.app"
+          APP="$EXTRACTED/$(basename "$PACKAGED_APP")"
           codesign --verify --deep --strict "$APP"
           yarn oxnode packages/desktop/scripts/check-release.ts verify \
             --tag "$TAG" --manifest packages/desktop/package.json --app "$APP" --zip "$ZIP"
@@ -1059,9 +1060,9 @@ jobs:
           STAGE="$RUNNER_TEMP/dmg"
           mkdir -p "$STAGE"
           # Copy the STAPLED .app; a ticket stapled after imaging would not be inside.
-          ditto "$APP" "$STAGE/mlx-node.app"
+          ditto "$APP" "$STAGE/$(basename "$APP")"
           ln -s /Applications "$STAGE/Applications"
-          hdiutil create -volname "mlx-node" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          hdiutil create -volname "$(basename "$APP" .app)" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
           echo "path=$DMG" >> "$GITHUB_OUTPUT"
 
       # Re-derives nothing. It reads CFBundleShortVersionString and CFBundleVersion
@@ -1507,7 +1508,7 @@ jobs:
         id: submit
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
-          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
+          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'LongYinan.Portato' }}
           VERSION: ${{ needs.publish.outputs.version }}
           RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
           WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
@@ -1545,7 +1546,7 @@ jobs:
         if: steps.submit.outputs.submitted == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
-          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'mlx-node.mlx-node' }}
+          PACKAGE_ID: ${{ vars.WINGET_PACKAGE_ID || 'LongYinan.Portato' }}
           VERSION: ${{ needs.publish.outputs.version }}
           RELEASE_TAG: ${{ needs.publish.outputs.release_tag }}
           WINDOWS_ZIP_NAME: ${{ needs.publish.outputs.windows_zip_name }}
