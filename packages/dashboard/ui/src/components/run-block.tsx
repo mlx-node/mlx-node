@@ -306,6 +306,8 @@ export function RunBlock(props: RunBlockProps): ReactElement {
   const ended = endedOf(state);
 
   const [bodyOpen, setBodyOpen] = useState(true);
+  const [collapsed, setCollapsed] = useState(false);
+  if (bodyOpen && collapsed) setCollapsed(false);
   const [selected, setSelected] = useState<string | null>(null);
   const [logOpen, setLogOpen] = useState(false);
   const [doneOpen, setDoneOpen] = useState(false);
@@ -526,10 +528,14 @@ export function RunBlock(props: RunBlockProps): ReactElement {
       <motion.div
         id={bodyId}
         className={styles.bodyClip}
-        hidden={!bodyOpen && staticMotion}
+        hidden={!bodyOpen && (staticMotion || collapsed)}
+        inert={!bodyOpen}
         initial={false}
         animate={{ height: bodyOpen ? 'auto' : 0, opacity: bodyOpen ? 1 : 0 }}
         transition={staticMotion ? INSTANT : motionTokens.spring.smooth}
+        onAnimationComplete={() => {
+          if (!bodyOpen) setCollapsed(true);
+        }}
       >
         <div className={styles.body}>
           {entry?.objective !== undefined && entry.objective !== '' ? (

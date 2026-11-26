@@ -276,13 +276,15 @@ export class ActivityTracker {
 
   /**
    * The agent says the helper (any attempt's id) already ended, or knows none by that id: no end line is coming. Only
-   * while `subagentId` is still its newest attempt's: a retry that took the row since runs on. True when it was live.
+   * while `subagentId` is still its newest attempt's: a retry that took the row since runs on. A workflow agent's
+   * attempts stay for its retry, as at an end line: the reply can come before that line. True when it was live.
    */
   dropHelper(child: string, subagentId: string): boolean {
     const at = this.resolve(child);
     const helper = at === null ? undefined : this.helpers.get(at);
     if (at === null || helper === undefined || helper.subagentId !== subagentId) return false;
     this.removeHelper(at, helper);
+    this.keepEnded(at, helper);
     return true;
   }
 

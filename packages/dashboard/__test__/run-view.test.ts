@@ -384,8 +384,8 @@ describe('the report', () => {
     expect(reportPlace(entry, before, false)).toEqual({ home: 'block', writingUp: false });
     expect(reportPlace({ ...entry, revision: 27 }, entries, false).home).toBe('block');
     expect(reportPlace({ ...entry, report: '' }, entries, true)).toEqual({ home: null, writingUp: false });
-    expect(wakeAt(entries, RUN)).toBe(wakeIndex);
-    expect(wakeAt(before, RUN)).toBeNull();
+    expect(wakeAt(entries, entry)).toBe(wakeIndex);
+    expect(wakeAt(before, entry)).toBeNull();
   });
 
   it('the end row reads the update its wake names: finished, its time, its agents', () => {
@@ -545,6 +545,21 @@ describe('where each run is drawn', () => {
     expect(facts.launch).toBe(entries[launchAt]);
     expect(facts.wakes).toEqual([entries[wake]]);
     expect(at.names.get(RUN)).toBe('research-advisory');
+  });
+
+  // Mutation: match the wake by run id alone → a run stopped after a resume links to its out-of-agents result.
+  it("the result link is the newest wake's only while the run still has the status that wake reported", () => {
+    const woke = entries[wake] as Extract<TranscriptEntry, { kind: 'wake' }>;
+    const shot = { ...woke.workflow!.snapshot!, status: 'budget_limited' };
+    const thread = entries.map((e, i) =>
+      i === wake ? { ...woke, workflow: { ...woke.workflow!, snapshot: shot } } : e,
+    );
+    const at = (status: string) => {
+      const list = thread.map((e, i) => (i === entryAt ? { ...(e as RunEntry), status } : e));
+      return [wakeAt(list, list[entryAt] as RunEntry), runsAt(list).runs.get(RUN)!.resultAt];
+    };
+    expect(at('cancelled')).toEqual([null, null]);
+    expect(at('budget_limited')).toEqual([wake, wake]);
   });
 
   // Mutation: mark the entry data only for every place → a cut thread with no launch call draws no block.

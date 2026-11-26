@@ -2433,17 +2433,19 @@ export function parseUpdates(text: string, options: { helper?: boolean; sessionI
 }
 
 /**
- * The `_meta.eventId` of each line of a whole `updates.jsonl` text, rewinds applied first, and those of its
- * `turn_completed` lines in file order.
+ * The `_meta.eventId` of each line of a whole `updates.jsonl` text, rewinds applied first, those of its
+ * `turn_completed` lines in file order, and that of its last ACP line.
  */
-export function storedEventIds(text: string): { ids: Set<string>; turnEnds: string[] } {
+export function storedEventIds(text: string): { ids: Set<string>; turnEnds: string[]; lastAcp: string | null } {
   const ids = new Set<string>();
   const turnEnds: string[] = [];
+  let lastAcp: string | null = null;
   for (const line of filterRewindLines(splitCompleteLines(text))) {
     const n = parseLine(line);
     if (n === null || typeof n.eventId !== 'string') continue;
     ids.add(n.eventId);
-    if (n.xai && n.update.sessionUpdate === 'turn_completed') turnEnds.push(n.eventId);
+    if (!n.xai) lastAcp = n.eventId;
+    else if (n.update.sessionUpdate === 'turn_completed') turnEnds.push(n.eventId);
   }
-  return { ids, turnEnds };
+  return { ids, turnEnds, lastAcp };
 }

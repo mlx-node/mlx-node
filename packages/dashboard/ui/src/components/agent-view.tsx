@@ -48,10 +48,31 @@ import SegmentedControl from './arc/segmented-control/segmented-control';
 import { TranscriptStream } from './transcript';
 import { useNow } from './wait-clock';
 
-/** What a message field sends with: the page's handler and the drafts it keeps per agent (by its newest attempt). */
+/** A message on its way to an agent. */
+export interface PendingMessage {
+  end: Promise<MessageEnd>;
+  /** Fields that wait for it now; with none, a reason it ends with is a toast. */
+  fields: number;
+}
+
+/**
+ * What a message field sends with: the page's handler, and the drafts and the messages on their way it keeps per
+ * agent (by its newest attempt). A field opened again while its message is on its way waits for it.
+ */
 export interface AgentMessaging {
   drafts: Map<string, string>;
+  pending: Map<string, PendingMessage>;
   onSend: (target: MessageTarget, text: string) => Promise<MessageEnd>;
+}
+
+function sendMessage(messaging: AgentMessaging, target: MessageTarget, text: string): PendingMessage {
+  const message: PendingMessage = { end: messaging.onSend(target, text), fields: 0 };
+  messaging.pending.set(target.id, message);
+  void message.end.then((end) => {
+    if (messaging.pending.get(target.id) === message) messaging.pending.delete(target.id);
+    if (message.fields === 0 && end.kind === 'stay') toast.error(end.reason);
+  });
+  return message;
 }
 
 /** One agent now, as its view's head and field read it. */
@@ -180,16 +201,29 @@ function MessageBox(props: {
   const reasonId = useId();
   const noticeId = useId();
   const [text, setText] = useState(() => drafts.get(target.id) ?? '');
-  const [sending, setSending] = useState(false);
+  const [message, setMessage] = useState<PendingMessage | null>(() => messaging.pending.get(target.id) ?? null);
+  const sending = message !== null;
   const [reason, setReason] = useState<string | null>(null);
   const field = useRef<HTMLTextAreaElement | null>(null);
-  const alive = useRef(true);
   useEffect(() => {
-    alive.current = true;
+    if (message === null) return;
+    message.fields += 1;
+    let here = true;
+    void message.end.then((end) => {
+      if (!here) return;
+      setMessage(null);
+      if (end.kind === 'close') {
+        if (end.clear) setText('');
+        return;
+      }
+      setReason(end.reason);
+      field.current?.focus();
+    });
     return () => {
-      alive.current = false;
+      here = false;
+      message.fields -= 1;
     };
-  }, []);
+  }, [message]);
   const tick = props.focusTick;
   useEffect(() => {
     if (tick > 0) field.current?.focus({ preventScroll: true });
@@ -203,21 +237,8 @@ function MessageBox(props: {
   };
   const send = (): void => {
     if (!canSend) return;
-    setSending(true);
     setReason(null);
-    void messaging.onSend(target, text).then((end) => {
-      if (!alive.current) {
-        if (end.kind === 'stay') toast.error(end.reason);
-        return;
-      }
-      setSending(false);
-      if (end.kind === 'close') {
-        if (end.clear) setText('');
-        return;
-      }
-      setReason(end.reason);
-      field.current?.focus();
-    });
+    setMessage(sendMessage(messaging, target, text));
   };
   const described = [props.notice !== null ? noticeId : '', count !== null ? countId : '', hintId]
     .concat(reason !== null ? [reasonId] : [])

@@ -30,6 +30,12 @@ function inTurn<T>(key: string, call: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/**
+ * Mounted views of each agent. The host holds one watch per window and agent, and a view that mounts takes it over, as
+ * the column does while the drawer slides out: only the last view to close ends it.
+ */
+const holders = new Map<string, number>();
+
 export interface AgentFeedHandle {
   feed: AgentFeed | null;
   /** Watch again (after a failed watch). */
@@ -57,6 +63,7 @@ export function useAgentFeed(conversationId: string, childId: string): AgentFeed
       );
     };
     start.current = watch;
+    holders.set(key, (holders.get(key) ?? 0) + 1);
     // The answer of the watch and the stream's events come over one port in the order the host sent them.
     const stop = listenConversation(conversationId, (event) => {
       if (event.type === 'sync') watch();
@@ -67,6 +74,12 @@ export function useAgentFeed(conversationId: string, childId: string): AgentFeed
       closed = true;
       stop();
       start.current = () => undefined;
+      const left = (holders.get(key) ?? 1) - 1;
+      if (left > 0) {
+        holders.set(key, left);
+        return;
+      }
+      holders.delete(key);
       const query = `?window=${encodeURIComponent(WINDOW_ID)}`;
       inTurn(key, () => mutate('DELETE', `${path}${query}`)).catch(() => undefined);
     };

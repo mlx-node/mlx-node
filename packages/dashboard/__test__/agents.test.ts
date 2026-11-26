@@ -35,6 +35,7 @@ import {
 } from '../ui/src/lib/agents.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import type { LiveActivity, PermissionInteraction } from '../ui/src/lib/chat-types.js';
+import { stopText } from '../ui/src/lib/run-view.js';
 import { runView } from './helpers/run-views.js';
 
 const SID = '01a2167d-b0e0-79b0-b308-cddf84241628';
@@ -330,6 +331,27 @@ describe('the attempt fold', () => {
     expect(runAgents(read(task)).get(RUN)![0]!.attempts).toEqual([child(0)]);
   });
 
+  // Mutation: no roster check in the fold → the follow-up takes the first agent's row, and that id controls it.
+  it('a script call that resumes an ended agent with its label is its own row once the roster names both', () => {
+    const entries = read([
+      ...START,
+      finished(T0 + 187_923, child(0), 25_262, 187_923),
+      spawn(T0 + 188_000, FOLLOW, 'track:process', { resumed_from: child(0) }),
+      revision(T0 + 200_000, 5, {
+        agents: roster([
+          [child(0), 'track:process', 'done', 188_922, 187_923],
+          [FOLLOW, 'track:process', 'running', 0, 0],
+        ]),
+      }),
+    ]);
+    const rows = runAgents(entries).get(RUN)!;
+    expect([rows[0], rows[4]].map((row) => [row!.childId, row!.attempts, row!.continues?.childId ?? null])).toEqual([
+      [child(0), [child(0)], null],
+      [FOLLOW, [FOLLOW], child(0)],
+    ]);
+    expect(controlTarget(rows, child(0))).toBe(child(0));
+  });
+
   // Mutation: drop "A has no folded successor yet" → the second call folds into the retried row, and its rows clash.
   it('each attempt has one row: after the retry took the first attempt, a later call that resumes it is its own row', () => {
     const entries = read([
@@ -549,6 +571,16 @@ describe("the rail: a run's agents under its row, and the runs that wait (T21)",
       turnRunning: false,
     });
     expect(out.needsRuns.map((row) => [row.id, row.stoppable])).toEqual([[RUN, false]]);
+  });
+
+  // Mutation: count every row with no end → a paused run's Stop confirm says 4 agents stop that the host no longer holds.
+  it('a run the host does not hold live counts the agents it lists: those the host still holds', () => {
+    const entries = read([...START, revision(T0 + 300, 3, { status: 'user_paused' })]);
+    const paused = runView(RUN, { live: false, status: 'user_paused', waiting: true });
+    const [one] = activityOf({ entries, runs: [paused], live: held(child(1)), turnRunning: false }).needsRuns;
+    expect([one!.listed.map((agent) => agent.id), one!.agentsRunning]).toEqual([[child(1)], 1]);
+    const [none] = activityOf({ entries, runs: [paused], live: held(), turnRunning: false }).needsRuns;
+    expect([none!.listed, none!.agentsRunning, stopText(none!.agentsRunning)]).toEqual([[], 0, CHAT.run.stopText.none]);
   });
 
   // Mutation: no cap → a run of 26 agents lists all 26 rows on the rail.

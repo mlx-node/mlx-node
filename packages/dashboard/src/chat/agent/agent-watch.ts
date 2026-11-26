@@ -1,9 +1,9 @@
 /**
  * Work: the Agent view's live data. The host keeps each running agent's own live lines (the newest
  * {@link AGENT_LINES_BYTES}, until {@link AGENT_LINES_KEEP_MS} past its end). A watch of a window reads the agent's
- * `updates.jsonl` once, applies the kept lines past the seam, and runs each later line through the same reducer; at
- * the agent's end it sends the stored list once the file holds the agent's turn end. Every entry and op is redacted,
- * and an open text holds back an end that could start a key.
+ * `updates.jsonl` once, applies the kept lines past the seam, and runs each later line past it through the same
+ * reducer; at the agent's end it sends the stored list once the file holds the agent's turn end. Every entry and op
+ * is redacted, and an open text holds back an end that could start a key.
  */
 
 import { lstat, readFile } from 'node:fs/promises';
@@ -73,29 +73,38 @@ function eventIdOf(line: UpdateLine): string | null {
   return typeof id === 'string' && id !== '' ? id : null;
 }
 
+/** What the file a watch read holds: its lines' `eventId`s, and the counter of its last ACP line (-1 with none). */
+interface Stored {
+  ids: ReadonlySet<string>;
+  seam: number;
+}
+
+/** The counter that ends an `eventId` (`<session id>-<n>`); null when it ends in none. */
+function counterOf(id: string): number | null {
+  const tail = id.slice(id.lastIndexOf('-') + 1);
+  if (tail === '') return null;
+  for (const c of tail) if (c < '0' || c > '9') return null;
+  return Number(tail);
+}
+
+function storedOf(text: string): Stored {
+  const { ids, lastAcp } = storedEventIds(text);
+  return { ids, seam: (lastAcp === null ? null : counterOf(lastAcp)) ?? -1 };
+}
+
 /**
- * The kept lines a watch applies over the file. A line whose `eventId` the file holds is in it, and so is a text chunk
- * before the last ACP line the file holds: the agent stores a run of text chunks as one line that takes the newest
- * chunk's `_meta`, and holds each ACP line until the next one comes, while an xAI line is written at once.
+ * A live line the file already holds, kept or later: its `eventId` is stored, or it is a text chunk older than the
+ * file's last ACP line. The agent stores a run of text chunks as one line that takes the newest chunk's `_meta`, and
+ * holds each ACP line until the next one comes, while an xAI line is written at once. Its event ids count up over the
+ * whole process, and the file can be ahead of the lines the host has read.
  */
-export function pastSeam(lines: readonly UpdateLine[], stored: ReadonlySet<string>): UpdateLine[] {
-  let seam = -1;
-  for (let i = lines.length - 1; i >= 0; i--) {
-    const line = lines[i]!;
-    const id = eventIdOf(line);
-    if (!line.xai && id !== null && stored.has(id)) {
-      seam = i;
-      break;
-    }
-  }
-  const out: UpdateLine[] = [];
-  for (const [i, line] of lines.entries()) {
-    const id = eventIdOf(line);
-    if (id !== null && stored.has(id)) continue;
-    if (i < seam && TEXT_CHUNKS.has(String(line.update.sessionUpdate))) continue;
-    out.push(line);
-  }
-  return out;
+function inFile(line: UpdateLine, stored: Stored): boolean {
+  const id = eventIdOf(line);
+  if (id === null) return false;
+  if (stored.ids.has(id)) return true;
+  if (!TEXT_CHUNKS.has(String(line.update.sessionUpdate))) return false;
+  const n = counterOf(id);
+  return n !== null && n < stored.seam;
 }
 
 function isText(entry: TranscriptEntry): entry is Extract<TranscriptEntry, { kind: 'assistant' | 'thinking' }> {
@@ -206,6 +215,7 @@ interface Watch {
   window: string;
   reducer: TranscriptReducer;
   list: ShownList;
+  stored: Stored;
   queue: TranscriptOp[];
   flush: ReturnType<typeof setTimeout> | null;
   /** When the agent's end came; null while it runs. */
@@ -261,7 +271,9 @@ export class AgentWatches {
       }
       if (line.xai && line.update.sessionUpdate === 'turn_completed') kept.turnEnd = id;
     }
-    for (const w of this.watchesOf(childId)) this.queue(w, w.list.take(w.reducer.apply(line), this.needles()));
+    for (const w of this.watchesOf(childId)) {
+      if (!inFile(line, w.stored)) this.queue(w, w.list.take(w.reducer.apply(line), this.needles()));
+    }
   }
 
   /** Every agent of the session that is kept or watched and that `running` says runs no more has ended. */
@@ -306,7 +318,7 @@ export class AgentWatches {
     const key = keyOf(window, childId);
     if (running() && this.full(window, key)) return 'too-many';
     const text = await this.deps.read(childId);
-    const { reducer, list } = this.listOf(childId, text);
+    const { reducer, list, stored } = this.listOf(childId, text);
     if (!running()) {
       list.close();
       return { entries: [...list.entries], live: false };
@@ -320,6 +332,7 @@ export class AgentWatches {
       window,
       reducer,
       list,
+      stored,
       queue: [],
       flush: null,
       endedAt: null,
@@ -373,17 +386,17 @@ export class AgentWatches {
     return n >= AGENT_WATCHES_PER_WINDOW;
   }
 
-  /** The file's list, then the kept lines past the seam, through one reducer that later lines go on with. */
-  private listOf(childId: string, text: string): { reducer: TranscriptReducer; list: ShownList } {
+  /** The file's list, then the kept lines it does not hold, through one reducer that later lines go on with. */
+  private listOf(childId: string, text: string): { reducer: TranscriptReducer; list: ShownList; stored: Stored } {
     const needles = this.needles();
     const reducer = new TranscriptReducer({ helper: true, sessionId: childId });
     reducer.applyText(text);
     const list = new ShownList(reducer.snapshot().entries, needles);
-    const kept = this.kept.get(childId);
-    if (kept !== undefined) {
-      for (const line of pastSeam(kept.lines, storedEventIds(text).ids)) list.take(reducer.apply(line), needles);
+    const stored = storedOf(text);
+    for (const line of this.kept.get(childId)?.lines ?? []) {
+      if (!inFile(line, stored)) list.take(reducer.apply(line), needles);
     }
-    return { reducer, list };
+    return { reducer, list, stored };
   }
 
   /**

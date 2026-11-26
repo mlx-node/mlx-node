@@ -53,7 +53,10 @@ export interface RunRailRow {
   step: { i: number; n: number } | null;
   phasesDone: number;
   phasesTotal: number;
-  /** Its agents that run (the rail lists them under this row, not as rows of their own). */
+  /**
+   * Its agents that run (the rail lists them under this row, not as rows of their own); of a run the host does not
+   * hold live, only those the host still holds, as {@link listed}.
+   */
   agentsRunning: number;
   /** Its agents that ask or run, at most {@link RUN_AGENTS_SHOWN}: the asking ones first, then by start. */
   agents: readonly AgentRailRow[];
@@ -516,7 +519,7 @@ function workflowsOf(
       step: step?.kind === 'numbered' ? { i: step.i, n: step.n } : null,
       phasesDone: entry.phases.filter((phase) => phase.state === 'done').length,
       phasesTotal: entry.phases.length,
-      agentsRunning: counts.running,
+      agentsRunning: run.live ? counts.running : listed.length,
       agents: listed.slice(0, RUN_AGENTS_SHOWN),
       listed,
       moreAgents: Math.max(0, listed.length - RUN_AGENTS_SHOWN),

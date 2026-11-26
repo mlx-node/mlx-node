@@ -460,11 +460,15 @@ export function reportPlace(entry: RunEntry, entries: readonly TranscriptEntry[]
   return { home: !report ? null : wakeDue || woke ? 'end-row' : 'block', writingUp: wakeDue && !woke };
 }
 
-/** The newest wake row of the run: the block's `The result ↓` link; null when none is in the loaded transcript. */
-export function wakeAt(entries: readonly TranscriptEntry[], runId: string): number | null {
+/**
+ * The newest wake row of the run, when its stored update has the run's status: the block's `The result ↓` link. Null
+ * when none is in the loaded transcript, or when the run moved on since (a resume, then a Stop that wakes no one).
+ */
+export function wakeAt(entries: readonly TranscriptEntry[], run: Pick<RunEntry, 'runId' | 'status'>): number | null {
   for (let i = entries.length - 1; i >= 0; i -= 1) {
     const entry = entries[i]!;
-    if (entry.kind === 'wake' && entry.workflow?.runId === runId) return i;
+    if (entry.kind === 'wake' && entry.workflow?.runId === run.runId)
+      return entry.workflow.snapshot?.status === run.status ? i : null;
   }
   return null;
 }
@@ -764,16 +768,17 @@ export function runsAt(entries: readonly TranscriptEntry[], previous?: RunsAt): 
   });
   for (const [runId, place] of places) {
     const at = entryAt.get(runId) ?? null;
+    const entry = at === null ? null : (entries[at] as RunEntry);
     const launch = place.kind === 'launch' ? (entries[place.at] as ToolEntry) : null;
     const facts: RunFacts = {
       runId,
-      entry: at === null ? null : (entries[at] as RunEntry),
+      entry,
       place,
       entryAt: at,
       launch,
       by: runBy(entries, runId),
       wakes: wakes.get(runId) ?? [],
-      resultAt: wakeAt(entries, runId),
+      resultAt: entry === null ? null : wakeAt(entries, entry),
     };
     const kept = previous?.runs.get(runId);
     runs.set(runId, kept !== undefined && sameFacts(kept, facts) ? kept : facts);

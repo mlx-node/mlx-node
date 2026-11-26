@@ -41,6 +41,7 @@ import {
   WINDOW_SHARE,
 } from '../../../src/chat/attachment-rule.js';
 import { stepLevel } from '../../../src/chat/thinking-levels.js';
+import type { PendingMessage } from '../components/agent-view';
 import { ActivityRail } from '../components/arc-x/activity-rail/activity-rail';
 import type { AgentHandlers, AgentTarget } from '../components/arc-x/agent-controls/agent-controls';
 import { type AttachmentChipItem, AttachmentStrip } from '../components/arc-x/attachment-strip/attachment-strip';
@@ -1476,6 +1477,7 @@ export default function Chat(): ReactElement {
 
   // Work: what was typed in each subagent's message field, by child session id. A ref: a keystroke draws the field alone.
   const messageDrafts = useRef(new Map<string, string>()).current;
+  const pendingMessages = useRef(new Map<string, PendingMessage>()).current;
 
   // A workflow agent's Stop takes the same route: the host sends it to the newest attempt of the row.
   const stopOneAgent = useCallback(
@@ -2229,8 +2231,8 @@ export default function Chat(): ReactElement {
     [stopOneAgent, openAgent],
   );
   const agentMessaging = useMemo(
-    () => ({ drafts: messageDrafts, onSend: messageSubagent }),
-    [messageDrafts, messageSubagent],
+    () => ({ drafts: messageDrafts, pending: pendingMessages, onSend: messageSubagent }),
+    [messageDrafts, pendingMessages, messageSubagent],
   );
   /** Removes a never-allow rule of the open conversation's folder; false when it was not removed (said in a toast). */
   const removeRule = useCallback(

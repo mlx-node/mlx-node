@@ -68,7 +68,7 @@ export async function messageAgent(
   }
   switch (result) {
     case 'sent':
-      deps.drafts.delete(target.id);
+      if (deps.drafts.get(target.id) === text) deps.drafts.delete(target.id);
       toast.success(fill(CHAT.activity.messageSent, { title: target.title }), { action: open });
       deps.announce(CHAT.status.messageSent);
       return { kind: 'close', clear: true };

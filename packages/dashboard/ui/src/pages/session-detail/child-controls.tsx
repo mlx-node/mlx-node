@@ -7,7 +7,13 @@
 import { type ReactElement, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
-import { AgentMessageField, type AgentMessaging, AgentStateLine, agentFacts } from '../../components/agent-view';
+import {
+  AgentMessageField,
+  type AgentMessaging,
+  AgentStateLine,
+  agentFacts,
+  type PendingMessage,
+} from '../../components/agent-view';
 import { ButtonLink } from '../../components/arc-x/button-link/button-link';
 import { useNow } from '../../components/wait-clock';
 import type { MessageTarget } from '../../lib/agent-message';
@@ -53,15 +59,17 @@ export function ChildControls({ childId, parentId }: { childId: string; parentId
     return list;
   }, [interactions]);
   const drafts = useRef(new Map<string, string>()).current;
+  const pending = useRef(new Map<string, PendingMessage>()).current;
   const [said, setSaid] = useState({ n: 0, text: '' });
   const announce = useCallback((text: string) => setSaid((now) => ({ n: now.n + 1, text })), []);
   const messaging = useMemo<AgentMessaging>(
     () => ({
       drafts,
+      pending,
       onSend: (target: MessageTarget, text: string) =>
         messageAgent(parentId, target, text, { drafts, announce, open: (path) => void navigate(path) }),
     }),
-    [drafts, parentId, announce, navigate],
+    [drafts, pending, parentId, announce, navigate],
   );
   const hot = state?.conversation.hot === true;
   const now = useNow(hot && row !== null);

@@ -382,6 +382,20 @@ describe("a workflow agent's contract retry", () => {
     expect(t.live().agents.map((a) => a.attempts)).toEqual([['c'], ['d']]);
   });
 
+  // Mutation: a drop keeps no ended agent → the retry is a row of its own, and the first attempt's id finds nothing.
+  it('a Stop answered as already finished before the finish line still lets the retry take the row', () => {
+    const t = new ActivityTracker();
+    t.apply(spawn('a1'));
+    expect(t.dropHelper('a1', 'a1')).toBe(true);
+    expect(t.apply(finished('a1'))).toBe(false);
+    t.apply(spawn('a2', { resumed_from: 'a1' }));
+    expect(t.agent('a1')?.childId).toBe('a2');
+    expect([t.attempts('a1'), t.attempts('a2')]).toEqual([
+      ['a1', 'a2'],
+      ['a1', 'a2'],
+    ]);
+  });
+
   // Mutation: fold every `resumed_from` of the run → the script's follow-up call under its own label takes the row.
   it("a script's resume of an ended agent under its own label is its own row; the retry after it still folds", () => {
     const t = new ActivityTracker();

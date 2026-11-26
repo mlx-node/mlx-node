@@ -90,17 +90,26 @@ interface Draft {
 }
 
 /**
- * B is A's next attempt: the same run (set) and label, A ended before B started, and no spawn took A's place yet. A
- * script's `agent({resume_from})` with A's label after A's retry is its own row; so is a resumed Task subagent.
+ * B is A's next attempt: the same run (set) and label, A ended before B started, no spawn took A's place yet, and the
+ * run's roster (`listed`) does not name both: a retry takes its first attempt's roster row. A script's
+ * `agent({resume_from})` with A's label is its own row once the roster names it, or after A's retry; so is a resumed
+ * Task subagent.
  */
-function retries(a: SubagentEntry, b: SubagentEntry, taken: ReadonlySet<string>): boolean {
+function retries(
+  a: SubagentEntry,
+  b: SubagentEntry,
+  taken: ReadonlySet<string>,
+  listed: ReadonlyMap<string, ReadonlySet<string>>,
+): boolean {
+  const roster = b.run === undefined ? undefined : listed.get(b.run);
   return (
     b.run !== undefined &&
     b.run === a.run &&
     b.description === a.description &&
     a.endTs !== undefined &&
     a.endTs <= b.ts &&
-    !taken.has(a.childId)
+    !taken.has(a.childId) &&
+    !(roster?.has(a.childId) === true && roster.has(b.childId))
   );
 }
 
@@ -108,6 +117,10 @@ function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Ma
   const drafts: Draft[] = [];
   const owner = new Map<string, Draft>();
   const taken = new Set<string>();
+  const listed = new Map<string, ReadonlySet<string>>();
+  for (const entry of entries) {
+    if (entry.kind === 'workflow') listed.set(entry.runId, new Set(entry.agents.map((agent) => agent.agentId)));
+  }
   entries.forEach((entry, i) => {
     if (entry.kind !== 'subagent') return;
     const known = owner.get(entry.childId);
@@ -119,7 +132,7 @@ function fold(entries: readonly TranscriptEntry[]): { drafts: Draft[]; owner: Ma
     const from = entry.resumedFrom ?? null;
     const prior = from === null ? undefined : owner.get(from);
     const priorEntry = from === null ? undefined : prior?.entries.get(from);
-    if (prior !== undefined && priorEntry !== undefined && from !== null && retries(priorEntry, entry, taken)) {
+    if (prior !== undefined && priorEntry !== undefined && from !== null && retries(priorEntry, entry, taken, listed)) {
       taken.add(from);
       prior.attempts.push(entry.childId);
       prior.at.push(i);

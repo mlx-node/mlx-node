@@ -189,6 +189,24 @@ describe('the seam between the file and the kept lines (T36)', () => {
     expect(texts(start.entries, 'thinking')).toEqual(['Thinking hard']);
   });
 
+  // Mutation: no check of the later lines → the thought reads 'Hellolo' and `t1` comes twice.
+  // Mutation: the seam at the last kept line the file holds → the kept 'Hel' is applied again.
+  it('a file ahead of the lines read: a kept or a later line it holds is skipped by the same rule', async () => {
+    const r = rig();
+    r.running.add('c1');
+    r.feed('c1', [prompt(0), thought(1, 'Hel')]);
+    const done = callUpdate(4, 't1', { status: 'completed' });
+    r.files.set('c1', fileOf('c1', [prompt(0), thought(2, 'Hello'), call(3, 't1'), done]));
+    const start = started(await r.start('c1'));
+    r.feed('c1', [thought(2, 'lo'), call(3, 't1'), done, thought(5, 'X')]);
+    await until(() => r.events.length > 0);
+    const list = pageList(start, r.events, 'c1');
+    expect(texts(list, 'thinking')).toEqual(['Hello', 'X']);
+    expect(list.filter((e) => e.kind === 'tool').map((e) => e.kind === 'tool' && [e.id, e.status])).toEqual([
+      ['t1', 'completed'],
+    ]);
+  });
+
   it('later lines go to the window as ops on the list it started with', async () => {
     const r = rig();
     r.running.add('c1');
