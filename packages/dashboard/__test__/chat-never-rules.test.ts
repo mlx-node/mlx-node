@@ -346,10 +346,12 @@ describe('the rule file', () => {
           { id: id(7), words: ['rm'], at: 'x' },
         ],
         relative: [{ id: id(8), words: ['rm'], at: 1 }],
+        'C:\\Users\\me\\project': [{ id: id(9), words: ['git', 'push'], at: 1 }],
+        '\\\\server\\share\\repo': [{ id: id(10), words: ['rm'], at: 1 }],
       },
     });
     const folders = parseNeverFile(text);
-    expect([...folders.keys()]).toEqual(['/p']);
+    expect([...folders.keys()]).toEqual(['/p', 'c:\\users\\me\\project', '\\\\server\\share\\repo']);
     expect(folders.get('/p')!.rules).toEqual([{ id: id(1), words: ['git', 'push'], at: 1 }]);
     expect(parseNeverFile('[]').size).toBe(0);
     expect(parseNeverFile(JSON.stringify({ version: 2, folders: {} })).size).toBe(0);

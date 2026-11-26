@@ -7,6 +7,7 @@
 
 import { randomUUID } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
+import { posix, win32 } from 'node:path';
 
 import { writeFileAtomic } from '../paths.js';
 import { redactText } from '../redact.js';
@@ -467,7 +468,7 @@ export function parseNeverFile(text: string): Map<string, Folder> {
   if (record.version !== 1 || typeof record.folders !== 'object' || record.folders === null) return out;
   if (Array.isArray(record.folders)) return out;
   for (const [path, list] of Object.entries(record.folders as Record<string, unknown>)) {
-    if (!path.startsWith('/') || !Array.isArray(list)) continue;
+    if (!(posix.isAbsolute(path) || win32.isAbsolute(path)) || !Array.isArray(list)) continue;
     const key = folderKey(path);
     const folder = out.get(key) ?? { path, rules: [] };
     for (const item of list as unknown[]) {
