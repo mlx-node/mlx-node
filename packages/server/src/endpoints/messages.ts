@@ -60,11 +60,14 @@ import type { ChatConfig, ChatMessage, ChatResult, ChatStreamProgress, Performan
 import {
   isCapacityExhaustedError,
   isContextCapacityError,
+  isImageProcessingError,
   retryableErrorCode,
   selectCommittedStreamText,
+  validateRequestImagesAsync,
 } from '@mlx-node/lm';
 import type { ChatSession, ChatStreamControl, ChatStreamEvent, SessionCapableModel } from '@mlx-node/lm';
 import { ToolCallTagBuffer } from '@mlx-node/lm';
+import { defaultThinkingBudgetForEffort, type ChatFamilyId } from '@mlx-node/lm/family-data';
 
 import { resetPreservingNativeCacheForWarmReuse } from '../chat-session-warm-reuse.js';
 import {
@@ -230,20 +233,46 @@ export interface ServerThinking {
 export function applyServerThinking(
   config: ChatConfig,
   server: ServerThinking | undefined,
+  modelFamily?: ChatFamilyId,
+  modelDefaultBudget?: number,
 ): { config: ChatConfig; from: TurnBudgetFrom | undefined } {
   const own = config.thinkingTokenBudget !== undefined;
   if (server === undefined || config.reasoningEffort === 'none') {
     return { config, from: own ? 'request' : undefined };
   }
-  const budget = !own && server.tokenBudget !== undefined;
-  const guard = server.cycleGuard === true;
-  const endText = server.endText !== undefined && server.endText !== '' ? server.endText : undefined;
+  const effortBudget = own ? undefined : defaultThinkingBudgetForEffort(modelFamily, config.reasoningEffort);
+  const serverBudget = server.tokenBudget;
+  // Apply the host cap as an upper bound over any operator-configured per-model
+  // budget first, then over any family effort default (`AlwaysOnBudgetFromEffort`).
+  // When `server.tokenBudget` is unset, leave `thinkingTokenBudget` absent from
+  // the request overlay so `samplingDefaults` or native policy resolves it directly.
+  const baseBudget = modelDefaultBudget ?? effortBudget;
+  const resolvedBudget = own
+    ? config.thinkingTokenBudget
+    : serverBudget === undefined
+      ? undefined
+      : baseBudget !== undefined
+        ? Math.min(baseBudget, serverBudget)
+        : serverBudget;
+  const budget = !own && resolvedBudget !== undefined;
+  const zeroBudget = resolvedBudget === 0;
+  const guard = !zeroBudget && server.cycleGuard === true;
+  const endText = !zeroBudget && server.endText !== undefined && server.endText !== '' ? server.endText : undefined;
   if (!budget && !guard && endText === undefined) return { config, from: own ? 'request' : undefined };
   const out: ChatConfig = { ...config };
-  if (budget) out.thinkingTokenBudget = server.tokenBudget;
+  if (budget) out.thinkingTokenBudget = resolvedBudget;
   if (guard) out.thinkingCycleGuard = true;
   if (endText !== undefined) out.thinkingEndText = endText;
-  return { config: out, from: own ? 'request' : budget ? 'server' : undefined };
+  const from: TurnBudgetFrom | undefined = own
+    ? 'request'
+    : !budget
+      ? undefined
+      : baseBudget !== undefined && serverBudget !== undefined && baseBudget <= serverBudget
+        ? modelDefaultBudget !== undefined
+          ? undefined
+          : 'request'
+        : 'server';
+  return { config: out, from };
 }
 
 // Non-streaming path
@@ -418,19 +447,63 @@ async function handleStreamingNativeWithAbort(
     if (pendingDrain === drain) pendingDrain = null;
   };
 
-  let contentBlockIndex = 0;
-  let hasEmittedThinking = false;
-  let hasEmittedText = false;
+  // Single-open-block state machine (Splash `BlockSequencer` parity):
+  // `nextBlockIndex` is strictly monotonic and at most one content block is
+  // open at a time, supporting arbitrarily interleaved thinking/text blocks
+  // (`reasoning_returns` on Inkling2 / Gemma4).
+  type OpenBlock = { kind: 'thinking' | 'text'; index: number };
+  let nextBlockIndex = 0;
+  // Held in a box so TypeScript's control-flow analysis does not narrow
+  // `open` to `null` across closure mutations in `ensureOpenBlock`/`closeOpenBlock`.
+  const blockState: { open: OpenBlock | null } = { open: null };
+  let everEmittedThinking = false;
+  let everEmittedText = false;
+  const closeOpenBlock = (): void => {
+    if (blockState.open === null) return;
+    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(blockState.open.index));
+    blockState.open = null;
+  };
+  const ensureOpenBlock = (kind: 'thinking' | 'text'): number => {
+    if (blockState.open?.kind === kind) return blockState.open.index;
+    closeOpenBlock();
+    const index = nextBlockIndex++;
+    if (kind === 'thinking') {
+      everEmittedThinking = true;
+      writeSSEEvent(
+        res,
+        'content_block_start',
+        buildContentBlockStart(index, {
+          type: 'thinking',
+          thinking: '',
+          // Local models have no encrypted-reasoning service, so the
+          // signature is a placeholder — clients that require the field
+          // (e.g. strict Anthropic-schema consumers) still deserialize.
+          signature: '',
+        }),
+      );
+    } else {
+      everEmittedText = true;
+      writeSSEEvent(
+        res,
+        'content_block_start',
+        buildContentBlockStart(index, {
+          type: 'text',
+          text: '',
+        }),
+      );
+    }
+    blockState.open = { kind, index };
+    return index;
+  };
   let emittedTextLength = 0;
-  // Whitespace-only text seen before any non-whitespace content is buffered
+  // Whitespace-only text seen before a text block is open is buffered
   // here so we don't open a text content block that the client would have
-  // to render as a stray `"\n\n"` immediately before a tool_use block.
-  // Flushed lazily when the first non-whitespace text delta arrives;
-  // dropped silently when a non-text block (tool_use) is about to open or
-  // when the stream ends without further text. Once `hasEmittedText` flips
-  // true (a real text block exists) this buffer is no longer consulted —
-  // subsequent whitespace-only deltas pass through to keep streamed text
-  // byte-accurate.
+  // to render as a stray `"\n\n"` immediately before a tool_use block or a
+  // returning thinking block. Flushed lazily when the first non-whitespace
+  // text delta arrives; dropped silently when a non-text block (tool_use) is
+  // about to open or when the stream ends without further text. While a text
+  // block is open (`openBlock?.kind === 'text'`), subsequent whitespace-only
+  // deltas pass through to keep streamed text byte-accurate.
   let pendingLeadingWhitespace = '';
   // Mirror of the actual streamed text body, used by the malformed-tool-call
   // recovery branches below. `emittedTextLength` counts bytes of streamed text
@@ -564,7 +637,7 @@ async function handleStreamingNativeWithAbort(
         const streamedReceived = emittedText + pendingLeadingWhitespace + heldPartial + tagResidual;
         let recoveredTail = '';
         if (finalText) {
-          if (!hasEmittedText && heldPartial.length === 0 && tagResidual.length === 0) {
+          if (!everEmittedText && heldPartial.length === 0 && tagResidual.length === 0) {
             // Nothing was streamed or held: the whole `finalText` is terminal.
             recoveredTail = finalText;
           } else if (!streamedReceived.includes(finalText)) {
@@ -602,13 +675,8 @@ async function handleStreamingNativeWithAbort(
         // whitespace, so prepending it would double those bytes.
         const prependParked = heldPartial.length > 0 || tagResidual.length > 0;
 
-        // Close a dangling reasoning block before any terminal text block opens.
-        if (hasEmittedThinking && !hasEmittedText) {
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-        }
-
-        if (hasEmittedText) {
-          // A text block is already open from the streamed deltas: append the
+        if (blockState.open?.kind === 'text') {
+          // A text block is currently open from the streamed deltas: append the
           // newly released terminal text (if any), then close the block.
           if (terminalVisible) {
             emittedText += terminalVisible;
@@ -616,20 +684,20 @@ async function handleStreamingNativeWithAbort(
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, {
+              buildContentBlockDelta(blockState.open.index, {
                 type: 'text_delta',
                 text: terminalVisible,
               }),
             );
           }
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-          contentBlockIndex++;
+          closeOpenBlock();
           pendingLeadingWhitespace = '';
         } else {
-          // No text block open yet. Build the block body from the terminal text
-          // (fronted by parked whitespace only when it precedes released held
-          // content), or from the parked whitespace alone when a stop truncated
-          // the turn right after it.
+          // No text block currently open (either nothing open or a thinking
+          // block is open). Build the terminal text body (fronted by parked
+          // whitespace only when it precedes released held content), or from
+          // the parked whitespace alone when a stop truncated the turn right
+          // after it.
           const body = terminalVisible
             ? prependParked
               ? pendingLeadingWhitespace + terminalVisible
@@ -646,32 +714,27 @@ async function handleStreamingNativeWithAbort(
           // non-streaming content does. Whitespace-only released held content
           // opens no block.
           const openTextBlock =
-            (matchedStopSequence !== null && (body.length > 0 || !hasEmittedThinking)) ||
+            (matchedStopSequence !== null && (body.length > 0 || !everEmittedThinking)) ||
             (body.length > 0 && (body.trim().length > 0 || !prependParked));
           if (openTextBlock) {
-            hasEmittedText = true;
-            writeSSEEvent(
-              res,
-              'content_block_start',
-              buildContentBlockStart(contentBlockIndex, {
-                type: 'text',
-                text: '',
-              }),
-            );
+            // `ensureOpenBlock('text')` closes any open thinking block first.
+            const textIndex = ensureOpenBlock('text');
             if (body.length > 0) {
               emittedText += body;
               emittedTextLength += body.length;
               writeSSEEvent(
                 res,
                 'content_block_delta',
-                buildContentBlockDelta(contentBlockIndex, {
+                buildContentBlockDelta(textIndex, {
                   type: 'text_delta',
                   text: body,
                 }),
               );
             }
-            writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-            contentBlockIndex++;
+            closeOpenBlock();
+          } else {
+            // Close any dangling thinking block before tool_use / terminal.
+            closeOpenBlock();
           }
         }
 
@@ -724,10 +787,11 @@ async function handleStreamingNativeWithAbort(
             return '{}';
           })();
 
+          const toolBlockIndex = nextBlockIndex++;
           writeSSEEvent(
             res,
             'content_block_start',
-            buildContentBlockStart(contentBlockIndex, {
+            buildContentBlockStart(toolBlockIndex, {
               type: 'tool_use',
               id: toolId,
               name: tc.name,
@@ -737,13 +801,12 @@ async function handleStreamingNativeWithAbort(
           writeSSEEvent(
             res,
             'content_block_delta',
-            buildContentBlockDelta(contentBlockIndex, {
+            buildContentBlockDelta(toolBlockIndex, {
               type: 'input_json_delta',
               partial_json: partialJson,
             }),
           );
-          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-          contentBlockIndex++;
+          writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(toolBlockIndex));
         }
 
         // Capture terminal state and break — actual `message_delta` / `message_stop` /
@@ -774,26 +837,35 @@ async function handleStreamingNativeWithAbort(
         const deltaText = withoutReasoningClose(event.text);
         if (!deltaText) continue;
 
-        if (!hasEmittedThinking) {
-          hasEmittedThinking = true;
-          writeSSEEvent(
-            res,
-            'content_block_start',
-            buildContentBlockStart(contentBlockIndex, {
-              type: 'thinking',
-              thinking: '',
-              // Local models have no encrypted-reasoning service, so the
-              // signature is a placeholder — clients that require the field
-              // (e.g. strict Anthropic-schema consumers) still deserialize.
-              signature: '',
-            }),
-          );
-          contentBlockIndex++;
+        if (blockState.open?.kind === 'text') {
+          // Flush any held partial from `tagBuffer` into the open text block
+          // before closing it and starting a fresh thinking block (structural
+          // tags cannot span across a reasoning boundary).
+          const tagResidual = tagBuffer.flush();
+          if (tagResidual) {
+            const stopPushed = stopBuffer.push(tagResidual);
+            if (stopPushed.matched !== null) {
+              matchedStopSequence = stopPushed.matched;
+            }
+            if (stopPushed.safeText) {
+              emittedText += stopPushed.safeText;
+              emittedTextLength += stopPushed.safeText.length;
+              writeSSEEvent(
+                res,
+                'content_block_delta',
+                buildContentBlockDelta(blockState.open.index, {
+                  type: 'text_delta',
+                  text: stopPushed.safeText,
+                }),
+              );
+            }
+          }
         }
+        const thinkingIndex = ensureOpenBlock('thinking');
         writeSSEEvent(
           res,
           'content_block_delta',
-          buildContentBlockDelta(contentBlockIndex - 1, {
+          buildContentBlockDelta(thinkingIndex, {
             type: 'thinking_delta',
             thinking: deltaText,
           }),
@@ -839,33 +911,20 @@ async function handleStreamingNativeWithAbort(
           // whatever the held partial releases — clearing it here would drop
           // it before that text block opens.
           if (visibleText.trim().length > 0) {
-            if (!hasEmittedText) {
-              if (hasEmittedThinking) {
-                writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-              }
-              hasEmittedText = true;
-              writeSSEEvent(
-                res,
-                'content_block_start',
-                buildContentBlockStart(contentBlockIndex, {
-                  type: 'text',
-                  text: '',
-                }),
-              );
-            }
+            const textIndex = ensureOpenBlock('text');
             pendingLeadingWhitespace = '';
             emittedText += visibleText;
             emittedTextLength += visibleText.length;
             writeSSEEvent(
               res,
               'content_block_delta',
-              buildContentBlockDelta(contentBlockIndex, {
+              buildContentBlockDelta(textIndex, {
                 type: 'text_delta',
                 text: visibleText,
               }),
             );
           } else {
-            pendingLeadingWhitespace = hasEmittedText ? '' : visibleText;
+            pendingLeadingWhitespace = blockState.open?.kind === 'text' ? '' : visibleText;
           }
         } else if (safeText) {
           // Run the tag-buffer's visible text through the stop-sequence
@@ -881,39 +940,24 @@ async function handleStreamingNativeWithAbort(
           }
           const visibleText = stopResult.safeText;
           if (visibleText) {
-            if (!hasEmittedText) {
+            if (blockState.open?.kind !== 'text') {
               // Hold back leading whitespace-only text so a `\n\n` emitted
-              // right before a `<tool_call>` tag never gets ratified into a
-              // standalone text content block. We can't open the block now
-              // because we don't yet know whether the next event is a real
-              // text delta (in which case the buffered prefix is flushed
-              // together with it) or a structural tag (in which case the
-              // buffer is dropped silently at tag-found / done time). When
-              // any non-whitespace arrives we ratify the block exactly
-              // once with `pendingLeadingWhitespace + visibleText`.
+              // right before a `<tool_call>` tag or a returning thinking block
+              // never gets ratified into a standalone text content block. When
+              // any non-whitespace arrives we ratify the block once with
+              // `pendingLeadingWhitespace + visibleText`.
               const combined = pendingLeadingWhitespace + visibleText;
               if (combined.trim().length === 0) {
                 pendingLeadingWhitespace = combined;
               } else {
-                if (hasEmittedThinking) {
-                  writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-                }
-                hasEmittedText = true;
-                writeSSEEvent(
-                  res,
-                  'content_block_start',
-                  buildContentBlockStart(contentBlockIndex, {
-                    type: 'text',
-                    text: '',
-                  }),
-                );
+                const textIndex = ensureOpenBlock('text');
                 pendingLeadingWhitespace = '';
                 emittedText += combined;
                 emittedTextLength += combined.length;
                 writeSSEEvent(
                   res,
                   'content_block_delta',
-                  buildContentBlockDelta(contentBlockIndex, {
+                  buildContentBlockDelta(textIndex, {
                     type: 'text_delta',
                     text: combined,
                   }),
@@ -925,7 +969,7 @@ async function handleStreamingNativeWithAbort(
               writeSSEEvent(
                 res,
                 'content_block_delta',
-                buildContentBlockDelta(contentBlockIndex, {
+                buildContentBlockDelta(blockState.open.index, {
                   type: 'text_delta',
                   text: visibleText,
                 }),
@@ -1004,11 +1048,7 @@ async function handleStreamingNativeWithAbort(
   // Close any dangling content block so the error frame lands at a clean state,
   // then emit the streaming error. Never emit `message_stop` here — pairing it
   // with an error would tell the client the turn completed cleanly.
-  if (hasEmittedThinking && !hasEmittedText) {
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex - 1));
-  } else if (hasEmittedText) {
-    writeSSEEvent(res, 'content_block_stop', buildContentBlockStop(contentBlockIndex));
-  }
+  closeOpenBlock();
   await drainPending();
   let message: string;
   if (thrownError != null) {
@@ -1318,11 +1358,24 @@ export async function handleCreateMessage(
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;
   }
-  mappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
-  const thinking = applyServerThinking(mappedConfig, serverThinking);
-  mappedConfig = thinking.config;
+  const baseMappedConfig = applyClaudeCodeTitleFastPath(mappedConfig, body);
+  // Pre-load quarantine fingerprint stays independent of whether the target
+  // model is already loaded (retries after a crash must match before load),
+  // while distinguishing client-supplied budgets from host-injected defaults
+  // so `low` (no explicit budget → 256 on LFM2) and explicit `budget_tokens: 12000`
+  // do not collide in quarantine.
+  const preflightThinking = applyServerThinking(baseMappedConfig, serverThinking);
+  mappedConfig = preflightThinking.config;
   const turnFingerprint =
-    turnJournal === undefined ? null : requestFingerprint(body.model, mappedMessages, mappedConfig);
+    turnJournal === undefined
+      ? null
+      : requestFingerprint(
+          body.model,
+          mappedMessages,
+          preflightThinking.from !== undefined
+            ? ({ ...mappedConfig, thinkingBudgetFrom: preflightThinking.from } as ChatConfig)
+            : mappedConfig,
+        );
   // Splash `_admit`: refused before admission and before any model load or swap.
   if (turnFingerprint !== null && turnJournal?.refuses(turnFingerprint) === true) {
     sendAnthropicError(res, 400, 'invalid_request_error', QUARANTINE_MESSAGE);
@@ -1444,13 +1497,6 @@ export async function handleCreateMessage(
     sendAnthropicNotFound(res, `Model "${body.model}" not found`);
     return;
   }
-  // "Could not process image" with a 400 is what makes the agent strip the request's images and retry.
-  if (mappedMessages.some((message) => (message.images?.length ?? 0) > 0) && model.supportsImages?.() !== true) {
-    preDispatchAdmission?.release();
-    modelLoadAdmission?.release();
-    sendAnthropicBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`);
-    return;
-  }
 
   // The lease keeps the binding's FIFO `execLock` chain alive across every
   // await — a concurrent `unregister()` + `register(sameModel)` would otherwise
@@ -1519,8 +1565,62 @@ export async function handleCreateMessage(
     finalizeIdleRequest();
   };
   try {
+    const armAbortListeners = (): void => {
+      if (abortListenersAttached) return;
+      res.once('close', onAbortClose);
+      res.once('error', onAbortError);
+      if (abortSocket != null) {
+        abortSocket.once('close', onAbortClose);
+      }
+      if (httpReq) {
+        httpReq.once('close', onAbortClose);
+        httpReq.once('error', onAbortError);
+      }
+      // Catch-up abort: a response torn down BEFORE the attach above has
+      // already emitted its terminal event, so the `once('close')`
+      // listeners will never fire. Consult the response-side socket state
+      // directly (the REQUEST side is deliberately excluded — a fully
+      // consumed IncomingMessage auto-destroys after 'end' on every
+      // normal request, so `httpReq.destroyed` is not a disconnect
+      // signal). Makes `streamSignal.aborted` authoritative for the H2
+      // pre-dispatch disconnect check inside the mutex callback.
+      if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
+        abortController.abort();
+      }
+      abortListenersAttached = true;
+    };
+
+    // "Could not process image" with a 400 is what makes the agent strip the request's images and retry.
+    const hasImages = mappedMessages.some((message) => (message.images?.length ?? 0) > 0);
+    if (hasImages && leaseModel.supportsImages?.() !== true) {
+      sendAnthropicBadRequest(res, `Could not process image: the model "${body.model}" does not take images.`);
+      return;
+    }
+    if (hasImages) {
+      armAbortListeners();
+      try {
+        await validateRequestImagesAsync(mappedMessages, { signal: abortController.signal });
+      } catch {
+        if (abortController.signal.aborted) {
+          return;
+        }
+        sendAnthropicBadRequest(res, 'Could not process image');
+        return;
+      }
+    }
+
     const sessionReg: SessionRegistry = lease.registry;
-    mappedConfig = applyOutputTokenLimit(mappedConfig, sessionReg.outputTokenLimit);
+    // Resolve server/effort thinking budgets against the leased model's
+    // canonical family so `AlwaysOnBudgetFromEffort` families (LFM2,
+    // Muse-Glimmer, K2-Horizon) keep their 256-token `low` cap instead of
+    // having the host's 12,000-token safety cap override it.
+    const thinking = applyServerThinking(
+      baseMappedConfig,
+      serverThinking,
+      lease.modelFamily,
+      sessionReg.defaultSamplingConfig?.thinkingTokenBudget,
+    );
+    mappedConfig = applyOutputTokenLimit(thinking.config, sessionReg.outputTokenLimit);
     // Snapshot the monotonic instance id so the in-mutex re-read can detect a
     // hot-swap that lands between lease acquisition and mutex entry. Unlike
     // `/v1/responses`, the Anthropic handler has no stored-identity check
@@ -1564,33 +1664,11 @@ export async function handleCreateMessage(
     // `cached_token_history` / `caches`), so two concurrent `primeHistory` +
     // `startFromHistory` would clobber each other's KV state.
     //
-    // Arm the AbortController now — past all validation gates, so the
-    // matching detach in the outer `finally` is guarded by
-    // `abortListenersAttached`. Streaming wrappers in `@mlx-node/lm` plumb
-    // this signal through `_runChatStream` to cancel the native
-    // `ChatStreamHandle` and unblock the pending `waitForItem()` on
-    // disconnect.
-    res.once('close', onAbortClose);
-    res.once('error', onAbortError);
-    if (abortSocket != null) {
-      abortSocket.once('close', onAbortClose);
-    }
-    if (httpReq) {
-      httpReq.once('close', onAbortClose);
-      httpReq.once('error', onAbortError);
-    }
-    // Catch-up abort: a response torn down BEFORE the attach above has
-    // already emitted its terminal event, so the `once('close')`
-    // listeners will never fire. Consult the response-side socket state
-    // directly (the REQUEST side is deliberately excluded — a fully
-    // consumed IncomingMessage auto-destroys after 'end' on every
-    // normal request, so `httpReq.destroyed` is not a disconnect
-    // signal). Makes `streamSignal.aborted` authoritative for the H2
-    // pre-dispatch disconnect check inside the mutex callback.
-    if (res.destroyed || res.writableEnded || abortSocket?.destroyed === true) {
-      abortController.abort();
-    }
-    abortListenersAttached = true;
+    // Arm the AbortController now (no-op if already armed for image preflight).
+    // Streaming wrappers in `@mlx-node/lm` plumb this signal through
+    // `_runChatStream` to cancel the native `ChatStreamHandle` and unblock the
+    // pending `waitForItem()` on disconnect.
+    armAbortListeners();
     const streamSignal: AbortSignal = abortController.signal;
 
     // Bracket the native-model dispatch with the idle sweeper.
@@ -1808,7 +1886,7 @@ export async function handleCreateMessage(
                 outcome.wasCommitted,
                 httpReq,
                 visibility,
-                config.includeReasoning !== false,
+                config.includeReasoning ?? config.reasoningEffort !== 'none',
                 stopSequences,
                 outcome.outputClampedToContext,
                 serverTiming,
@@ -1961,6 +2039,8 @@ export async function handleCreateMessage(
             if (visibility.responseMode === null) {
               if (retryableErrorCode(err) !== null) {
                 sendAnthropicOverloaded(res, message);
+              } else if (isImageProcessingError(err)) {
+                sendAnthropicBadRequest(res, 'Could not process image');
               } else if (isContextCapacityError(err) || isCapacityExhaustedError(err)) {
                 sendAnthropicBadRequest(res, message);
               } else {

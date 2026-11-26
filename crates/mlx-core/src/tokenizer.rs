@@ -2972,8 +2972,8 @@ impl Qwen3Tokenizer {
     }
 
     /// Step the decode stream with error recovery. On InvalidPrefix,
-    /// recreates the stream, replays all generated tokens, and returns
-    /// the delta since `streamed_text_len`.
+    /// recreates the stream (preserving `skip_special_tokens`), replays all
+    /// generated tokens, and returns the delta since `streamed_text_len`.
     pub(crate) fn step_decode_stream<'a>(
         decode_stream: &mut tokenizers::DecodeStream<
             'a,
@@ -2991,23 +2991,117 @@ impl Qwen3Tokenizer {
         match decode_stream.step(token_id) {
             Ok(Some(text)) => text,
             Ok(None) => String::new(),
-            Err(_) => {
-                // Recreate stream and replay all tokens to recover state
-                let mut new_ds = tokenizer.decode_stream(true);
-                let mut replayed = String::new();
-                for &tid in generated_tokens {
-                    if let Ok(Some(t)) = new_ds.step(tid) {
-                        replayed.push_str(&t);
+            Err(err) => {
+                let skip_special = Self::infer_decode_stream_skip_special(
+                    tokenizer,
+                    token_id,
+                    generated_tokens,
+                    streamed_text_len,
+                    err.as_ref(),
+                );
+                // Recreate a clean stream with the inferred skip_special_tokens
+                // mode, seed it with `token_id` so the next step keeps spacing /
+                // UTF-8 context without re-triggering InvalidPrefix on the old
+                // prefix, and return any newly decoded suffix past
+                // `streamed_text_len`.
+                let mut new_ds = tokenizer.decode_stream(skip_special);
+                let buffered_incomplete = match new_ds.step(token_id) {
+                    Ok(Some(_)) => false,
+                    Ok(None) => true,
+                    Err(_) => {
+                        new_ds = tokenizer.decode_stream(skip_special);
+                        false
                     }
-                }
+                };
                 *decode_stream = new_ds;
-                if replayed.len() > streamed_text_len {
-                    replayed[streamed_text_len..].to_string()
+
+                let mut full = tokenizer
+                    .decode(generated_tokens, skip_special)
+                    .unwrap_or_default();
+                if buffered_incomplete && full.ends_with('\u{FFFD}') {
+                    full.pop();
+                }
+                if full.len() > streamed_text_len && full.is_char_boundary(streamed_text_len) {
+                    full[streamed_text_len..].to_string()
                 } else {
                     String::new()
                 }
             }
         }
+    }
+
+    /// Infer whether a `DecodeStream` that just raised an error was created
+    /// with `skip_special_tokens = true` or `false` (`tokenizers::DecodeStream`
+    /// keeps the flag private).
+    fn infer_decode_stream_skip_special(
+        tokenizer: &tokenizers::Tokenizer,
+        token_id: u32,
+        generated_tokens: &[u32],
+        streamed_text_len: usize,
+        err: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        let prior = generated_tokens
+            .strip_suffix(&[token_id])
+            .unwrap_or(generated_tokens);
+        let replay_len = |skip: bool| -> usize {
+            let mut ds = tokenizer.decode_stream(skip);
+            let mut len = 0usize;
+            for &tid in prior {
+                if let Ok(Some(t)) = ds.step(tid) {
+                    len += t.len();
+                }
+            }
+            len
+        };
+        let len_true = replay_len(true);
+        let len_false = replay_len(false);
+        if len_true != len_false {
+            if len_false == streamed_text_len {
+                return false;
+            }
+            if len_true == streamed_text_len {
+                return true;
+            }
+            return len_true.abs_diff(streamed_text_len) <= len_false.abs_diff(streamed_text_len);
+        }
+
+        if let Some(tokenizers::tokenizer::DecodeStreamError::InvalidPrefix {
+            token_id: failed_id,
+            expected_prefix,
+            actual_string,
+        }) = err.downcast_ref::<tokenizers::tokenizer::DecodeStreamError>()
+        {
+            if let (Ok(s_true), Ok(s_false)) = (
+                tokenizer.decode(&[*failed_id], true),
+                tokenizer.decode(&[*failed_id], false),
+            ) && s_true != s_false
+                && !s_false.is_empty()
+                && actual_string.ends_with(&s_false)
+                && !actual_string.ends_with(&s_true)
+            {
+                return false;
+            }
+            if let (Ok(full_true), Ok(full_false)) = (
+                tokenizer.decode(generated_tokens, true),
+                tokenizer.decode(generated_tokens, false),
+            ) && full_true != full_false
+            {
+                if !actual_string.is_empty()
+                    && full_false.ends_with(actual_string.as_str())
+                    && !full_true.ends_with(actual_string.as_str())
+                {
+                    return false;
+                }
+                if !expected_prefix.is_empty()
+                    && full_false.contains(expected_prefix.as_str())
+                    && !full_true.contains(expected_prefix.as_str())
+                {
+                    return false;
+                }
+            }
+        }
+
+        true
     }
 
     /// Render the same request controls used by native inference and replay.
@@ -3384,6 +3478,7 @@ impl Qwen3Tokenizer {
             think_end_str: self.think_end_str.clone(),
             thinking_end,
             think_end_extra_ids: Vec::new(),
+            think_open_id: None,
         }
     }
 
@@ -4204,7 +4299,7 @@ fn serialize_message_for_jinja_with_policy(
             .filter(|placeholder| !placeholder.is_empty())
             .is_some_and(|placeholder| msg.content.contains(placeholder));
 
-    if (has_images || has_audio) && msg.role == "user" {
+    if (has_images || has_audio) && matches!(msg.role.as_str(), "user" | "tool") {
         let mut parts: Vec<serde_json::Value> = Vec::new();
         let push_text = |parts: &mut Vec<serde_json::Value>| {
             if !msg.content.is_empty() {
@@ -4812,14 +4907,156 @@ mod tests {
 
     #[test]
     fn non_user_role_with_images_keeps_content_as_string() {
-        // Only the user turn should ever ship images in practice; system /
-        // assistant / tool keep their flat `content: string` shape so
+        // System and assistant keep their flat `content: string` shape so
         // templates that don't expect arrays on those roles keep working.
         let mut msg = user_msg("A reply", 2);
         msg.role = "assistant".to_string();
         let v = serialize_message_for_jinja(&msg);
         assert!(v["content"].is_string());
         assert_eq!(v["content"], "A reply");
+
+        let mut sys = user_msg("System prompt", 1);
+        sys.role = "system".to_string();
+        let sv = serialize_message_for_jinja(&sys);
+        assert!(sv["content"].is_string());
+        assert_eq!(sv["content"], "System prompt");
+    }
+
+    #[test]
+    fn tool_role_with_images_emits_image_parts_and_renders_placeholders() {
+        // Text-only tool message keeps flat string content.
+        let mut text_only_tool = user_msg("ok", 0);
+        text_only_tool.role = "tool".to_string();
+        text_only_tool.tool_call_id = Some("call_1".to_string());
+        let tv = serialize_message_for_jinja(&text_only_tool);
+        assert!(tv["content"].is_string());
+        assert_eq!(tv["content"], "ok");
+
+        // Tool message with text + 2 images emits content-parts array.
+        let mut tool_with_imgs = user_msg("screenshot attached", 2);
+        tool_with_imgs.role = "tool".to_string();
+        tool_with_imgs.tool_call_id = Some("call_1".to_string());
+        let v = serialize_message_for_jinja(&tool_with_imgs);
+        let parts = v["content"].as_array().expect("tool content parts array");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0]["type"], "text");
+        assert_eq!(parts[0]["text"], "screenshot attached");
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[2]["type"], "image");
+
+        // Image-only tool message omits empty text part.
+        let mut img_only_tool = user_msg("", 1);
+        img_only_tool.role = "tool".to_string();
+        let iv = serialize_message_for_jinja(&img_only_tool);
+        let iparts = iv["content"].as_array().expect("image-only tool parts");
+        assert_eq!(iparts.len(), 1);
+        assert_eq!(iparts[0]["type"], "image");
+
+        // Qwen3.6 template renders `<|vision_start|><|image_pad|><|vision_end|>`
+        // inside `<tool_response>` matching the 2 attached images.
+        let qwen36_tmpl = include_str!("tokenizer/fixtures/qwen3.6-27b/chat_template.jinja");
+        let messages = [
+            user_msg("Take two screenshots", 0),
+            assistant_calling(vec![tool_call(Some("call_1"), "screenshot")]),
+            tool_with_imgs,
+        ];
+        let rendered_qwen = Qwen3Tokenizer::render_chat_template_jinja2(
+            qwen36_tmpl,
+            &messages,
+            None,
+            true,
+            Some(true),
+            "<|endoftext|>",
+            "<|im_end|>",
+        )
+        .expect("Qwen3.6 render tool_result with images");
+        assert_eq!(
+            rendered_qwen
+                .matches("<|vision_start|><|image_pad|><|vision_end|>")
+                .count(),
+            2
+        );
+        assert!(rendered_qwen.contains("<tool_response>\nscreenshot attached"));
+
+        // Gemma4 canonical tool_body sequence template emits `<|image|>` for each image.
+        let gemma4_tool_tmpl = r#"{%- set follow = messages[2] -%}
+{%- set tool_body = follow.get('content') -%}
+{%- if tool_body is sequence and tool_body is not string -%}
+{%- set ns_txt = namespace(s='') -%}
+{%- for part in tool_body -%}
+{%- if part.get('type') == 'text' -%}{%- set ns_txt.s = ns_txt.s + (part.get('text') | default('')) -%}{%- endif -%}
+{%- endfor -%}
+<|tool_response>response:{{ follow.get('name') }}:{{ ns_txt.s }}<tool_response|>
+{%- for part in tool_body -%}
+{%- if part.get('type') in ['image', 'image_url'] -%}<|image|>{%- endif -%}
+{%- endfor -%}
+{%- endif -%}"#;
+        let rendered_gemma = Qwen3Tokenizer::render_chat_template_jinja2(
+            gemma4_tool_tmpl,
+            &messages,
+            None,
+            false,
+            None,
+            "<bos>",
+            "<eos>",
+        )
+        .expect("Gemma4 render tool_result with images");
+        assert_eq!(
+            rendered_gemma,
+            "<|tool_response>response:screenshot:screenshot attached<tool_response|><|image|><|image|>"
+        );
+    }
+
+    #[test]
+    fn step_decode_stream_invalid_prefix_recovery_preserves_skip_special_false() {
+        // Build a tokenizer whose Fuse + Replace("AB" -> "X") decoder reliably
+        // triggers `DecodeStreamError::InvalidPrefix` on `[<|spec|>, A, B, C]`.
+        let tok_json = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": {
+                "type": "Sequence",
+                "decoders": [
+                    { "type": "Fuse" },
+                    { "type": "Replace", "pattern": { "String": "AB" }, "content": "X" }
+                ]
+            },
+            "model": {
+                "type": "WordLevel",
+                "vocab": { "A": 0, "B": 1, "C": 2 },
+                "unk_token": "A"
+            }
+        });
+        let mut tok = tokenizers::Tokenizer::from_bytes(tok_json.to_string().as_bytes()).unwrap();
+        tok.add_special_tokens(vec![tokenizers::AddedToken::from("<|spec|>", true)])
+            .unwrap();
+        let spec_id = tok.token_to_id("<|spec|>").unwrap();
+
+        let mut ds = tok.decode_stream(false);
+        let mut generated = Vec::new();
+        let mut streamed = String::new();
+        for tid in [spec_id, 0u32, 1u32, 2u32, spec_id] {
+            generated.push(tid);
+            let piece =
+                Qwen3Tokenizer::step_decode_stream(&mut ds, &tok, tid, &generated, streamed.len());
+            streamed.push_str(&piece);
+        }
+
+        // Recovery must preserve `skip_special_tokens = false`, so both the
+        // initial and post-recovery `<|spec|>` tokens are kept intact.
+        assert!(
+            streamed.starts_with("<|spec|>"),
+            "missing leading special token: {streamed:?}"
+        );
+        assert!(
+            streamed.ends_with("<|spec|>"),
+            "post-InvalidPrefix stream lost skip_special_tokens=false: {streamed:?}"
+        );
     }
 
     #[test]

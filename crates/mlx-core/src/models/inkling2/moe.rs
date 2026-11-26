@@ -73,13 +73,6 @@ impl ExpertSwitchProj {
         }
         Ok(())
     }
-
-    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
-        if let Self::Quantized(q) = self {
-            q.promote_outer_scale_to_f32()?;
-        }
-        Ok(())
-    }
 }
 
 impl From<ExpertSwitchProj> for SwitchProj {
@@ -88,6 +81,94 @@ impl From<ExpertSwitchProj> for SwitchProj {
             ExpertSwitchProj::Quantized(q) => SwitchProj::Quantized(q),
             ExpertSwitchProj::Dense(w) => SwitchProj::Standard(SwitchLinear::from_weight(w)),
         }
+    }
+}
+
+/// Expert gate+up projection representation:
+/// - `Fused`: single `[E, 2*I, D]` projection (interleaved or `[gate, up]` split),
+///   eligible for Stage 3 Metal grouped/fused MoE kernels.
+/// - `Split`: independent `gate` `[E, I, D]` and `up` `[E, I, D]` projections
+///   (used when GGUF split `ffn_gate_exps` + `ffn_up_exps` or `mlx-lm`
+///   `switch_mlp.{gate,up}_proj` cannot fuse due to distinct NVFP4 `.scale`s,
+///   mixed quantization modes, or dense+quant mixes). Always non-interleaved.
+pub enum ExpertGateUp {
+    Fused(SwitchProj),
+    Split { gate: SwitchProj, up: SwitchProj },
+}
+
+impl ExpertGateUp {
+    pub fn try_compact_symmetric_q8_or_promote_bf16(&mut self) -> Result<()> {
+        match self {
+            Self::Fused(p) => p.try_compact_symmetric_q8_or_promote_bf16(),
+            Self::Split { gate, up } => {
+                gate.try_compact_symmetric_q8_or_promote_bf16()?;
+                up.try_compact_symmetric_q8_or_promote_bf16()
+            }
+        }
+    }
+
+    pub fn promote_affine_sidecars_to_bf16(&mut self) -> Result<()> {
+        match self {
+            Self::Fused(p) => p.promote_affine_sidecars_to_bf16(),
+            Self::Split { gate, up } => {
+                gate.promote_affine_sidecars_to_bf16()?;
+                up.promote_affine_sidecars_to_bf16()
+            }
+        }
+    }
+
+    pub fn promote_affine_sidecars_to_f32(&mut self, compute_dtype: DType) -> Result<()> {
+        match self {
+            Self::Fused(p) => p.promote_affine_sidecars_to_f32(compute_dtype),
+            Self::Split { gate, up } => {
+                gate.promote_affine_sidecars_to_f32(compute_dtype)?;
+                up.promote_affine_sidecars_to_f32(compute_dtype)
+            }
+        }
+    }
+
+    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
+        match self {
+            Self::Fused(p) => p.promote_outer_scale_to_f32(),
+            Self::Split { gate, up } => {
+                gate.promote_outer_scale_to_f32()?;
+                up.promote_outer_scale_to_f32()
+            }
+        }
+    }
+
+    pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
+        match self {
+            Self::Fused(p) => p.ensure_cuda_device(),
+            Self::Split { gate, up } => Ok(gate.ensure_cuda_device()? + up.ensure_cuda_device()?),
+        }
+    }
+
+    pub fn weight_refs(&self) -> Vec<&MxArray> {
+        match self {
+            Self::Fused(p) => p.weight_refs(),
+            Self::Split { gate, up } => {
+                let mut refs = gate.weight_refs();
+                refs.extend(up.weight_refs());
+                refs
+            }
+        }
+    }
+
+    pub fn is_fused(&self) -> bool {
+        matches!(self, Self::Fused(_))
+    }
+}
+
+impl From<SwitchProj> for ExpertGateUp {
+    fn from(proj: SwitchProj) -> Self {
+        Self::Fused(proj)
+    }
+}
+
+impl From<ExpertSwitchProj> for ExpertGateUp {
+    fn from(proj: ExpertSwitchProj) -> Self {
+        Self::Fused(proj.into())
     }
 }
 
@@ -150,8 +231,9 @@ pub struct Inkling2MoE {
     /// Router selection bias `e_score_correction_bias` `[num_experts]` (F32).
     pub router_bias_f32: Option<MxArray>,
 
-    /// Stacked expert projections (`gate_up_proj`: `[E, 2*I, D]`, `down_proj`: `[E, D, I]`).
-    pub gate_up_proj: SwitchProj,
+    /// Stacked expert projections (`gate_up_proj`: fused `[E, 2*I, D]` or split
+    /// `gate` `[E, I, D]` + `up` `[E, I, D]`; `down_proj`: `[E, D, I]`).
+    pub gate_up_proj: ExpertGateUp,
     pub down_proj: SwitchProj,
 
     /// Post-MoE static ShortConv weight `[D, 4]` (F32, oldest-to-newest).
@@ -170,7 +252,7 @@ impl Inkling2MoE {
         gate_up_interleaved: bool,
         router_weight: MxArray,
         router_bias: Option<MxArray>,
-        gate_up_proj: impl Into<SwitchProj>,
+        gate_up_proj: impl Into<ExpertGateUp>,
         down_proj: impl Into<SwitchProj>,
         post_conv: MxArray,
     ) -> Result<Self> {
@@ -180,6 +262,11 @@ impl Inkling2MoE {
             Some(b) => Some(b.astype(DType::Float32)?),
             None => None,
         };
+        let gate_up_proj = gate_up_proj.into();
+        let effective_interleaved = match gate_up_proj {
+            ExpertGateUp::Fused(_) => gate_up_interleaved,
+            ExpertGateUp::Split { .. } => false,
+        };
         Ok(Self {
             num_experts,
             top_k,
@@ -187,11 +274,11 @@ impl Inkling2MoE {
             route_scale,
             mlp_gate_softcap,
             mlp_up_softcap,
-            gate_up_interleaved,
+            gate_up_interleaved: effective_interleaved,
             router_weight_f32,
             router_weight_t_f32,
             router_bias_f32,
-            gate_up_proj: gate_up_proj.into(),
+            gate_up_proj,
             down_proj: down_proj.into(),
             post_conv,
         })
@@ -241,42 +328,72 @@ impl Inkling2MoE {
             (x.reshape(&[t, 1, 1, d])?, top_k_indices.clone(), None)
         };
 
-        // 3. `gate_up_proj` + per-expert outer scale in FP32 BEFORE SiTU
-        let mut gu_f32 = self
-            .gate_up_proj
-            .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
-            .astype(DType::Float32)?
-            .reshape(&[total_slots, 1, 2 * inter])?;
-        if let Some(outer) = self.gate_up_proj.outer_scale() {
-            let outer_f32 = if outer.dtype()? == DType::Float32 {
-                outer.clone()
-            } else {
-                outer.astype(DType::Float32)?
-            };
-            let idx_flat = if do_sort {
-                idx_for_gather.clone()
-            } else {
-                idx_for_gather.reshape(&[-1])?
-            };
-            let gathered_scale = outer_f32
-                .take(&idx_flat, 0)?
-                .reshape(&[total_slots, 1, 1])?;
-            gu_f32 = gu_f32.mul(&gathered_scale)?;
-        }
+        // 3. `gate_up_proj` (fused or split) + per-expert outer scale in FP32 BEFORE SiTU
+        let apply_expert_outer_scale = |mut y_f32: MxArray,
+                                        outer_opt: Option<&MxArray>|
+         -> Result<MxArray> {
+            if let Some(outer) = outer_opt {
+                let outer_f32 = if outer.dtype()? == DType::Float32 {
+                    outer.clone()
+                } else {
+                    outer.astype(DType::Float32)?
+                };
+                let idx_flat = if do_sort {
+                    idx_for_gather.clone()
+                } else {
+                    idx_for_gather.reshape(&[-1])?
+                };
+                let gathered_scale = outer_f32
+                    .take(&idx_flat, 0)?
+                    .reshape(&[total_slots, 1, 1])?;
+                y_f32 = y_f32.mul(&gathered_scale)?;
+            }
+            Ok(y_f32)
+        };
 
-        let (gate, up) = if self.gate_up_interleaved {
-            let paired = gu_f32.reshape(&[total_slots, 1, inter, 2])?;
-            let g = paired
-                .slice(&[0, 0, 0, 0], &[total_slots, 1, inter, 1])?
-                .squeeze(Some(&[-1]))?;
-            let u = paired
-                .slice(&[0, 0, 0, 1], &[total_slots, 1, inter, 2])?
-                .squeeze(Some(&[-1]))?;
-            (g, u)
-        } else {
-            let g = gu_f32.slice(&[0, 0, 0], &[total_slots, 1, inter])?;
-            let u = gu_f32.slice(&[0, 0, inter], &[total_slots, 1, 2 * inter])?;
-            (g, u)
+        let (gate, up) = match &self.gate_up_proj {
+            ExpertGateUp::Fused(proj) => {
+                let gu_f32 = apply_expert_outer_scale(
+                    proj.forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
+                        .astype(DType::Float32)?
+                        .reshape(&[total_slots, 1, 2 * inter])?,
+                    proj.outer_scale(),
+                )?;
+                if self.gate_up_interleaved {
+                    let paired = gu_f32.reshape(&[total_slots, 1, inter, 2])?;
+                    let g = paired
+                        .slice(&[0, 0, 0, 0], &[total_slots, 1, inter, 1])?
+                        .squeeze(Some(&[-1]))?;
+                    let u = paired
+                        .slice(&[0, 0, 0, 1], &[total_slots, 1, inter, 2])?
+                        .squeeze(Some(&[-1]))?;
+                    (g, u)
+                } else {
+                    let g = gu_f32.slice(&[0, 0, 0], &[total_slots, 1, inter])?;
+                    let u = gu_f32.slice(&[0, 0, inter], &[total_slots, 1, 2 * inter])?;
+                    (g, u)
+                }
+            }
+            ExpertGateUp::Split {
+                gate: gate_proj,
+                up: up_proj,
+            } => {
+                let g = apply_expert_outer_scale(
+                    gate_proj
+                        .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
+                        .astype(DType::Float32)?
+                        .reshape(&[total_slots, 1, inter])?,
+                    gate_proj.outer_scale(),
+                )?;
+                let u = apply_expert_outer_scale(
+                    up_proj
+                        .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
+                        .astype(DType::Float32)?
+                        .reshape(&[total_slots, 1, inter])?,
+                    up_proj.outer_scale(),
+                )?;
+                (g, u)
+            }
         };
 
         // 4. SiTU activation -> cast back to activation dtype (BF16) for `down_proj`
@@ -530,43 +647,101 @@ impl Inkling2MoE {
                 (x.reshape(&[t, 1, 1, d])?, top_k_indices.clone(), None)
             };
 
-            let gate_up = self.gate_up_proj.forward_without_outer_scale(
-                &x_for_gather,
-                &idx_for_gather,
-                do_sort,
-            )?;
-            let act_in = if use_metal {
-                let gu_in = if gate_up.dtype()? == act_dtype {
-                    gate_up
-                } else {
-                    gate_up.astype(act_dtype)?
-                };
-                let idx_i32_owned;
-                let idx_i32_ref = if idx_for_gather.dtype()? == DType::Int32 {
-                    &idx_for_gather
-                } else {
-                    idx_i32_owned = idx_for_gather.astype(DType::Int32)?;
-                    &idx_i32_owned
-                };
-                let outer_arg = self.gate_up_proj.outer_scale().map(|s| (s, idx_i32_ref));
-                super::kernels::inkling2_situ(
-                    &gu_in,
-                    outer_arg,
-                    self.mlp_gate_softcap as f32,
-                    self.mlp_up_softcap as f32,
-                    self.gate_up_interleaved,
-                )?
-            } else {
-                self.situ_fallback(
-                    &gate_up,
-                    &idx_for_gather,
-                    total_slots,
-                    inter,
-                    act_dtype,
-                    do_sort,
-                    t,
-                    k,
-                )?
+            let act_in = match &self.gate_up_proj {
+                ExpertGateUp::Fused(proj) => {
+                    let gate_up =
+                        proj.forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?;
+                    if use_metal {
+                        let gu_in = if gate_up.dtype()? == act_dtype {
+                            gate_up
+                        } else {
+                            gate_up.astype(act_dtype)?
+                        };
+                        let idx_i32_owned;
+                        let idx_i32_ref = if idx_for_gather.dtype()? == DType::Int32 {
+                            &idx_for_gather
+                        } else {
+                            idx_i32_owned = idx_for_gather.astype(DType::Int32)?;
+                            &idx_i32_owned
+                        };
+                        let outer_arg = proj.outer_scale().map(|s| (s, idx_i32_ref));
+                        super::kernels::inkling2_situ(
+                            &gu_in,
+                            outer_arg,
+                            self.mlp_gate_softcap as f32,
+                            self.mlp_up_softcap as f32,
+                            self.gate_up_interleaved,
+                        )?
+                    } else {
+                        self.situ_fallback(
+                            &gate_up,
+                            proj.outer_scale(),
+                            &idx_for_gather,
+                            total_slots,
+                            inter,
+                            act_dtype,
+                            do_sort,
+                            t,
+                            k,
+                        )?
+                    }
+                }
+                ExpertGateUp::Split {
+                    gate: gate_proj,
+                    up: up_proj,
+                } => {
+                    let apply_outer =
+                        |mut y_f32: MxArray, outer_opt: Option<&MxArray>| -> Result<MxArray> {
+                            if let Some(outer) = outer_opt {
+                                let outer_f32 = if outer.dtype()? == DType::Float32 {
+                                    outer.clone()
+                                } else {
+                                    outer.astype(DType::Float32)?
+                                };
+                                let idx_flat = if do_sort {
+                                    idx_for_gather.clone()
+                                } else {
+                                    idx_for_gather.reshape(&[-1])?
+                                };
+                                let gathered_scale =
+                                    outer_f32
+                                        .take(&idx_flat, 0)?
+                                        .reshape(&[total_slots, 1, 1])?;
+                                y_f32 = y_f32.mul(&gathered_scale)?;
+                            }
+                            Ok(y_f32)
+                        };
+                    let g_f32 = apply_outer(
+                        gate_proj
+                            .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
+                            .astype(DType::Float32)?
+                            .reshape(&[total_slots, 1, inter])?,
+                        gate_proj.outer_scale(),
+                    )?;
+                    let u_f32 = apply_outer(
+                        up_proj
+                            .forward_without_outer_scale(&x_for_gather, &idx_for_gather, do_sort)?
+                            .astype(DType::Float32)?
+                            .reshape(&[total_slots, 1, inter])?,
+                        up_proj.outer_scale(),
+                    )?;
+                    let activated = situ_activation(
+                        &g_f32,
+                        &u_f32,
+                        self.mlp_gate_softcap,
+                        self.mlp_up_softcap,
+                    )?;
+                    let cast = if act_dtype != DType::Float32 {
+                        activated.astype(act_dtype)?
+                    } else {
+                        activated
+                    };
+                    if do_sort {
+                        cast
+                    } else {
+                        cast.reshape(&[t, k, 1, inter])?
+                    }
+                }
             };
 
             let down_out =
@@ -776,7 +951,7 @@ impl Inkling2MoE {
         {
             return false;
         }
-        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
+        let (ExpertGateUp::Fused(SwitchProj::Quantized(gu)), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return false;
@@ -815,7 +990,7 @@ impl Inkling2MoE {
         {
             return Ok(None);
         }
-        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
+        let (ExpertGateUp::Fused(SwitchProj::Quantized(gu)), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return Ok(None);
@@ -894,7 +1069,7 @@ impl Inkling2MoE {
         {
             return Ok(None);
         }
-        let (SwitchProj::Quantized(gu), SwitchProj::Quantized(dn)) =
+        let (ExpertGateUp::Fused(SwitchProj::Quantized(gu)), SwitchProj::Quantized(dn)) =
             (&self.gate_up_proj, &self.down_proj)
         else {
             return Ok(None);
@@ -987,6 +1162,7 @@ impl Inkling2MoE {
     fn situ_fallback(
         &self,
         gate_up: &MxArray,
+        outer_scale: Option<&MxArray>,
         idx_for_gather: &MxArray,
         total_slots: i64,
         inter: i64,
@@ -998,7 +1174,7 @@ impl Inkling2MoE {
         let mut gu_f32 = gate_up
             .astype(DType::Float32)?
             .reshape(&[total_slots, 1, 2 * inter])?;
-        if let Some(outer) = self.gate_up_proj.outer_scale() {
+        if let Some(outer) = outer_scale {
             let outer_f32 = if outer.dtype()? == DType::Float32 {
                 outer.clone()
             } else {
@@ -1081,5 +1257,386 @@ mod tests {
             (got - expected).abs() < 1e-4,
             "got {got}, expected {expected}"
         );
+    }
+
+    #[test]
+    fn split_nvfp4_distinct_scales_forward_matches_fused_and_reference() {
+        let e = 4usize;
+        let top_k = 2usize;
+        let d = 64usize;
+        let inter = 64usize;
+
+        // Distinct NVFP4 per-expert outer scales for gate vs up!
+        let gate_w = MxArray::from_uint32(
+            &vec![0x2222_2222u32; e * inter * (d / 8)],
+            &[e as i64, inter as i64, (d / 8) as i64],
+        )
+        .unwrap();
+        let gate_s = MxArray::from_uint8(
+            &vec![0x38u8; e * inter * (d / 16)],
+            &[e as i64, inter as i64, (d / 16) as i64],
+        )
+        .unwrap();
+        let gate_outer = MxArray::from_float32(&[0.05, 0.10, 0.15, 0.20], &[e as i64]).unwrap();
+
+        let up_w = MxArray::from_uint32(
+            &vec![0x2222_2222u32; e * inter * (d / 8)],
+            &[e as i64, inter as i64, (d / 8) as i64],
+        )
+        .unwrap();
+        let up_s = MxArray::from_uint8(
+            &vec![0x38u8; e * inter * (d / 16)],
+            &[e as i64, inter as i64, (d / 16) as i64],
+        )
+        .unwrap();
+        let up_outer = MxArray::from_float32(&[0.30, 0.25, 0.08, 0.12], &[e as i64]).unwrap();
+
+        let down_w = MxArray::from_uint32(
+            &vec![0x2222_2222u32; e * d * (inter / 8)],
+            &[e as i64, d as i64, (inter / 8) as i64],
+        )
+        .unwrap();
+        let down_s = MxArray::from_uint8(
+            &vec![0x38u8; e * d * (inter / 16)],
+            &[e as i64, d as i64, (inter / 16) as i64],
+        )
+        .unwrap();
+        let down_outer = MxArray::from_float32(&[0.10, 0.20, 0.30, 0.40], &[e as i64]).unwrap();
+
+        let gate_q =
+            QuantizedSwitchLinear::new(gate_w, gate_s, None, 16, 4, NVFP4_MODE.to_string())
+                .with_outer_scale(gate_outer);
+        let up_q = QuantizedSwitchLinear::new(up_w, up_s, None, 16, 4, NVFP4_MODE.to_string())
+            .with_outer_scale(up_outer);
+        let down_q =
+            QuantizedSwitchLinear::new(down_w, down_s, None, 16, 4, NVFP4_MODE.to_string())
+                .with_outer_scale(down_outer);
+
+        let router_w = MxArray::from_float32(
+            &(0..e * d)
+                .map(|i| ((i as f32) * 0.17).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[e as i64, d as i64],
+        )
+        .unwrap();
+        let post_conv = MxArray::from_float32(
+            &(0..d * 4)
+                .map(|i| if i % 4 == 3 { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>(),
+            &[d as i64, 4],
+        )
+        .unwrap();
+
+        // Even if caller passes gate_up_interleaved = true, Split forces it to false!
+        let moe = Inkling2MoE::new(
+            e,
+            top_k,
+            inter,
+            1.0,
+            4.0,
+            25.0,
+            true,
+            router_w,
+            None,
+            ExpertGateUp::Split {
+                gate: SwitchProj::Quantized(gate_q),
+                up: SwitchProj::Quantized(up_q),
+            },
+            SwitchProj::Quantized(down_q),
+            post_conv,
+        )
+        .unwrap();
+        assert!(!moe.gate_up_interleaved);
+        assert!(!moe.supports_grouped_moe(1, d, DType::BFloat16));
+
+        for t in [1usize, 16usize] {
+            let x = MxArray::from_float32(
+                &(0..t * d)
+                    .map(|i| ((i as f32) * 0.13).cos() * 0.25)
+                    .collect::<Vec<_>>(),
+                &[t as i64, d as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let mut flat_state = VisitShortConvState::zeros(3, 1, d, DType::BFloat16).unwrap();
+            let flat = moe
+                .forward(&x, &mut flat_state)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            let mut hist = MxArray::zeros(&[3, d as i64], Some(DType::BFloat16)).unwrap();
+            let fused = moe
+                .forward_fused(&x, &mut [&mut hist], &[0, t])
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            let max_diff = flat
+                .iter()
+                .zip(fused.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 5e-2,
+                "split NVFP4 T={t}: flat vs forward_fused max_diff={max_diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn mxfp8_moe_stage3_vs_stage2_and_flat_parity() {
+        let e = 4usize;
+        let top_k = 2usize;
+        let d = 64usize;
+        let inter = 64usize;
+
+        // Build valid MXFP8 weights (33B blocks repacked via gguf::mxfp8_repack_block)
+        let make_mxfp8 = |rows: usize, cols: usize, seed: usize| -> QuantizedSwitchLinear {
+            let blocks_per_row = cols / 32;
+            let total_blocks = e * rows * blocks_per_row;
+            let mut words = vec![0u32; total_blocks * 8];
+            let mut scales = vec![0u8; total_blocks];
+            for b in 0..total_blocks {
+                let mut blk = [0u8; 33];
+                blk[0] = 123 + ((b + seed) % 4) as u8; // E8M0 scale ~ 2^-4..2^-1
+                for j in 0..32 {
+                    let sign = if (b + j + seed).is_multiple_of(3) {
+                        0x80u8
+                    } else {
+                        0x00u8
+                    };
+                    let mag = 0x28 + (((b * 7 + j * 5 + seed) % 16) as u8);
+                    blk[1 + j] = sign | mag;
+                }
+                let mut w8 = [0u32; 8];
+                scales[b] = crate::utils::gguf::mxfp8_repack_block(&blk, &mut w8);
+                words[b * 8..(b + 1) * 8].copy_from_slice(&w8);
+            }
+            let w_arr = MxArray::from_uint32(
+                &words,
+                &[e as i64, rows as i64, (blocks_per_row * 8) as i64],
+            )
+            .unwrap();
+            let s_arr =
+                MxArray::from_uint8(&scales, &[e as i64, rows as i64, blocks_per_row as i64])
+                    .unwrap();
+            QuantizedSwitchLinear::new(w_arr, s_arr, None, 32, 8, MXFP8_MODE.to_string())
+        };
+
+        let gu = make_mxfp8(2 * inter, d, 1);
+        let dn = make_mxfp8(d, inter, 2);
+        let router_w = MxArray::from_float32(
+            &(0..e * d)
+                .map(|i| ((i as f32) * 0.21).sin() * 0.1)
+                .collect::<Vec<_>>(),
+            &[e as i64, d as i64],
+        )
+        .unwrap();
+        let post_conv = MxArray::from_float32(
+            &(0..d * 4)
+                .map(|i| if i % 4 == 3 { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>(),
+            &[d as i64, 4],
+        )
+        .unwrap();
+
+        let moe = Inkling2MoE::new(
+            e,
+            top_k,
+            inter,
+            1.0,
+            4.0,
+            25.0,
+            false,
+            router_w,
+            None,
+            SwitchProj::Quantized(gu),
+            SwitchProj::Quantized(dn),
+            post_conv,
+        )
+        .unwrap();
+
+        // T=1, 8 hit Stage 3 MXFP8 grouped/fused Metal path (when Metal available); T=64 hits Stage 2.
+        for t in [1usize, 8usize, 64usize] {
+            let x = MxArray::from_float32(
+                &(0..t * d)
+                    .map(|i| ((i as f32) * 0.11).sin() * 0.25)
+                    .collect::<Vec<_>>(),
+                &[t as i64, d as i64],
+            )
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+            let mut flat_state = VisitShortConvState::zeros(3, 1, d, DType::BFloat16).unwrap();
+            let flat = moe
+                .forward(&x, &mut flat_state)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            let mut hist = MxArray::zeros(&[3, d as i64], Some(DType::BFloat16)).unwrap();
+            let fused = moe
+                .forward_fused(&x, &mut [&mut hist], &[0, t])
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            let max_diff = flat
+                .iter()
+                .zip(fused.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 5e-2,
+                "MXFP8 MoE T={t}: flat vs forward_fused max_diff={max_diff}"
+            );
+        }
+    }
+
+    #[test]
+    fn f16_dense_experts_normalized_to_bf16_match_fp32_reference_across_t() {
+        let e = 4usize;
+        let top_k = 2usize;
+        let d = 64usize;
+        let inter = 64usize;
+
+        let make_arr = |len: usize, shape: &[i64], seed: usize| -> MxArray {
+            let vals: Vec<f32> = (0..len)
+                .map(|i| (((i + seed * 17) as f32) * 0.13).sin() * 0.15)
+                .collect();
+            MxArray::from_float32(&vals, shape).unwrap()
+        };
+
+        let gate_f32 = make_arr(e * inter * d, &[e as i64, inter as i64, d as i64], 1);
+        let up_f32 = make_arr(e * inter * d, &[e as i64, inter as i64, d as i64], 2);
+        let gu_f32 = MxArray::concatenate(&gate_f32, &up_f32, 1).unwrap();
+        let dn_f32 = make_arr(e * d * inter, &[e as i64, d as i64, inter as i64], 3);
+
+        // Simulate SafeTensors/GGUF Float16 experts normalized once to BFloat16 at load time.
+        let gate_bf16 = gate_f32
+            .astype(DType::Float16)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let up_bf16 = up_f32
+            .astype(DType::Float16)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let gu_bf16 = gu_f32
+            .astype(DType::Float16)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let dn_bf16 = dn_f32
+            .astype(DType::Float16)
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+
+        let router_w = make_arr(e * d, &[e as i64, d as i64], 4);
+        let post_conv = MxArray::from_float32(
+            &(0..d * 4)
+                .map(|i| if i % 4 == 3 { 1.0 } else { 0.0 })
+                .collect::<Vec<_>>(),
+            &[d as i64, 4],
+        )
+        .unwrap();
+
+        let moe_ref = Inkling2MoE::new(
+            e,
+            top_k,
+            inter,
+            1.0,
+            4.0,
+            25.0,
+            false,
+            router_w.clone(),
+            None,
+            SwitchProj::Standard(SwitchLinear::from_weight(gu_f32)),
+            SwitchProj::Standard(SwitchLinear::from_weight(dn_f32)),
+            post_conv.clone(),
+        )
+        .unwrap();
+        let moe_fused_bf16 = Inkling2MoE::new(
+            e,
+            top_k,
+            inter,
+            1.0,
+            4.0,
+            25.0,
+            false,
+            router_w.clone(),
+            None,
+            SwitchProj::Standard(SwitchLinear::from_weight(gu_bf16)),
+            SwitchProj::Standard(SwitchLinear::from_weight(dn_bf16.clone())),
+            post_conv.clone(),
+        )
+        .unwrap();
+        let moe_split_bf16 = Inkling2MoE::new(
+            e,
+            top_k,
+            inter,
+            1.0,
+            4.0,
+            25.0,
+            false,
+            router_w,
+            None,
+            ExpertGateUp::Split {
+                gate: SwitchProj::Standard(SwitchLinear::from_weight(gate_bf16)),
+                up: SwitchProj::Standard(SwitchLinear::from_weight(up_bf16)),
+            },
+            SwitchProj::Standard(SwitchLinear::from_weight(dn_bf16)),
+            post_conv,
+        )
+        .unwrap();
+
+        for t in [1usize, 8usize, 16usize] {
+            let x_f32 = make_arr(t * d, &[t as i64, d as i64], 10 + t);
+            let x_bf16 = x_f32.astype(DType::BFloat16).unwrap();
+
+            let mut ref_state = VisitShortConvState::zeros(3, 1, d, DType::Float32).unwrap();
+            let ref_out = moe_ref
+                .forward(&x_f32, &mut ref_state)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            for (label, moe) in [
+                ("fused_bf16", &moe_fused_bf16),
+                ("split_bf16", &moe_split_bf16),
+            ] {
+                let mut st = VisitShortConvState::zeros(3, 1, d, DType::BFloat16).unwrap();
+                let out_flat = moe
+                    .forward(&x_bf16, &mut st)
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                let mut hist = MxArray::zeros(&[3, d as i64], Some(DType::BFloat16)).unwrap();
+                let out_fused = moe
+                    .forward_fused(&x_bf16, &mut [&mut hist], &[0, t])
+                    .unwrap()
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .to_float32()
+                    .unwrap();
+                for (path, out) in [("flat", &out_flat), ("fused", &out_fused)] {
+                    let max_diff = ref_out
+                        .iter()
+                        .zip(out.iter())
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    assert!(
+                        max_diff < 5e-2,
+                        "F16->BF16 {label} ({path}) T={t} vs FP32 ref max_diff={max_diff}"
+                    );
+                }
+            }
+        }
     }
 }

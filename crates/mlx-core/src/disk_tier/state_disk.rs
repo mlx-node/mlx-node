@@ -1193,12 +1193,14 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
     }
 
     /// Splash `Cache::persist` with `StateCache::persist`: a copy ahead of
-    /// `id`'s RAM copy and its chain.
+    /// `id`'s RAM copy and its chain. When `head` is true, a persistent prompt
+    /// head stays needed even after deeper ordinary turns supersede it.
     pub(crate) fn persist(
         &mut self,
         store: &mut HybridStateStore<C::State>,
         kv: Option<&KvPoolHandle>,
         id: EntryId,
+        head: bool,
         ctx: C::EncodeCtx<'_>,
     ) -> PersistStep {
         let mut result = PersistStep {
@@ -1215,7 +1217,12 @@ impl<C: StateDiskCodec> StateDiskEngine<C> {
             res.status = status;
             res
         };
-        if !newest_point(store, id) {
+        let needed = if head {
+            store.get(id).is_some_and(|entry| !entry.checkpoint())
+        } else {
+            newest_point(store, id)
+        };
+        if !needed {
             return settle(self, result, PersistStatus::Unneeded);
         }
         if !self.writable() {
@@ -1449,6 +1456,7 @@ pub(crate) enum Stop {
 struct Point {
     id: EntryId,
     due: f64,
+    head: bool,
 }
 
 #[derive(Default)]
@@ -1511,7 +1519,9 @@ impl WriteBehind {
     }
 
     /// Splash `WriteBehind::published`: queues an ordinary point published or
-    /// reused `tokens` deep at `now`.
+    /// reused `tokens` deep at `now`. Persistent prompt heads (`head && persistent`)
+    /// are queued even below `MINIMUM_TOKENS` and survive superseding turns.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn record_published<S: StateBytes>(
         &mut self,
         store: &HybridStateStore<S>,
@@ -1520,21 +1530,26 @@ impl WriteBehind {
         id: EntryId,
         tokens: u32,
         now: f64,
+        head: bool,
     ) {
+        let head = head && persistent;
         if !writable
-            || tokens < MINIMUM_TOKENS
+            || (tokens < MINIMUM_TOKENS && !head)
             || store.get(id).is_none_or(|entry| entry.checkpoint())
         {
             return;
         }
-        if self.waiting.iter().any(|point| point.id == id) {
+        if let Some(existing) = self.waiting.iter_mut().find(|point| point.id == id) {
+            if head {
+                existing.head = true;
+            }
             return;
         }
         self.copying = persistent || self.demand_bytes != 0;
         if !self.copying {
             let mut unneeded = 0;
             self.waiting.retain(|point| {
-                let keep = newest_point(store, point.id);
+                let keep = point.head || newest_point(store, point.id);
                 unneeded += u64::from(!keep);
                 keep
             });
@@ -1543,6 +1558,7 @@ impl WriteBehind {
         self.waiting.push_back(Point {
             id,
             due: now + DELAY_SECONDS,
+            head,
         });
     }
 
@@ -1559,7 +1575,7 @@ impl WriteBehind {
         persistent: bool,
         is_in_use: impl Fn(&Ctx, EntryId) -> bool,
         is_demanded: impl Fn(&Ctx, u64) -> bool,
-        mut persist: impl FnMut(&mut Ctx, EntryId) -> PersistStatus,
+        mut persist: impl FnMut(&mut Ctx, EntryId, bool) -> PersistStatus,
     ) -> bool {
         self.demand_bytes = demand_bytes;
         self.copying = persistent || demand_bytes != 0;
@@ -1585,7 +1601,7 @@ impl WriteBehind {
                 self.stopped = Stop::Covered;
                 break;
             }
-            if !self.settle(persist(ctx, point.id)) {
+            if !self.settle(persist(ctx, point.id, point.head)) {
                 self.stopped = Stop::Stalled;
                 break;
             }
@@ -1600,13 +1616,13 @@ impl WriteBehind {
     pub(crate) fn flush<Ctx>(
         &mut self,
         ctx: &mut Ctx,
-        mut persist: impl FnMut(&mut Ctx, EntryId) -> PersistStatus,
+        mut persist: impl FnMut(&mut Ctx, EntryId, bool) -> PersistStatus,
     ) -> bool {
         loop {
             let Some(point) = self.waiting.back().copied() else {
                 return true;
             };
-            if !self.settle(persist(ctx, point.id)) {
+            if !self.settle(persist(ctx, point.id, point.head)) {
                 return false;
             }
             self.waiting.pop_back();
@@ -1624,4 +1640,174 @@ pub(crate) fn point_in_use<S: StateBytes>(
         && store
             .get(id)
             .is_some_and(|entry| store.in_use(entry.mark()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::disk_tier::{CacheDisk, DiskTierOptions, PersistentIdentity, open_disk_tier};
+    use mlx_paged_attn::ColdCacheFingerprint;
+
+    #[derive(Clone)]
+    struct DummyState(u64);
+
+    impl StateBytes for DummyState {
+        fn state_bytes(&self) -> u64 {
+            self.0
+        }
+    }
+
+    struct DummyCodec;
+
+    impl StateDiskCodec for DummyCodec {
+        type State = DummyState;
+        type EncodeCtx<'a> = ();
+
+        fn encode_into(
+            &self,
+            _ctx: (),
+            _spans: &[u64],
+            _entry: &Entry<DummyState>,
+            _state: &DummyState,
+            into: &mut [u8],
+        ) -> Option<u32> {
+            into.fill(0x5A);
+            Some(0)
+        }
+
+        fn adopt_copy(&self, spans: &[u64], _label: &ColdStateLabel) -> Option<(u64, u32)> {
+            Some((spans.iter().sum(), 0))
+        }
+    }
+
+    #[test]
+    fn persist_head_survives_superseding_ordinary_turn() {
+        let temp_root =
+            std::env::temp_dir().join(format!("state-disk-head-persist-{}", uuid::Uuid::new_v4()));
+        let cache_dir = temp_root.join("cache");
+        std::fs::create_dir_all(&cache_dir).expect("create cache dir");
+
+        let opts = DiskTierOptions {
+            cache_disk: CacheDisk::Bytes(64u64 << 20),
+            persistent: true,
+            cache_dir: Some(cache_dir),
+            temp_root: Some(temp_root.clone()),
+        };
+        let fp = ColdCacheFingerprint::from_components([b"dummy-head-persist".as_slice()]);
+        let id_fn = move || {
+            Some(PersistentIdentity {
+                namespace: fp.to_hex()[..32].to_string(),
+                state: fp,
+                kv: fp,
+            })
+        };
+        let tier = open_disk_tier(&opts, id_fn, 64).expect("open persistent tier");
+        let mut engine = StateDiskEngine::new(
+            Arc::clone(&tier),
+            vec![64],
+            "dummy:v1".to_string(),
+            64,
+            DummyCodec,
+        )
+        .expect("engine");
+        let mut store = HybridStateStore::<DummyState>::new(16);
+
+        // Insert a short persistent head (16 tokens < MINIMUM_TOKENS = 32), a regular superseded
+        // turn (32 tokens), and a deeper turn (48 tokens) extending the same conversation.
+        let tokens: Vec<u32> = (100u32..148u32).collect();
+        let head_id = store
+            .insert(
+                Lineage::text(&tokens[..16], 0),
+                DummyState(64),
+                StateClass::Ordinary,
+            )
+            .expect("insert head")
+            .id;
+        let mid_id = store
+            .insert(
+                Lineage::text(&tokens[..32], 0),
+                DummyState(64),
+                StateClass::Ordinary,
+            )
+            .expect("insert mid")
+            .id;
+        let tip_id = store
+            .insert(
+                Lineage::text(&tokens[..48], 0),
+                DummyState(64),
+                StateClass::Ordinary,
+            )
+            .expect("insert tip")
+            .id;
+        assert!(
+            store.superseded(head_id),
+            "head_id is superseded by deeper turns"
+        );
+        assert!(store.superseded(mid_id), "mid_id is superseded by tip_id");
+        assert!(!store.superseded(tip_id), "tip_id is newest");
+
+        // 1. WriteBehind queues a persistent head even below MINIMUM_TOKENS, and upgrades an
+        //    existing queued point's head flag when re-published with `head = true`.
+        let mut wb = WriteBehind::new(true);
+        wb.record_published(&store, true, true, head_id, 16, 0.0, false);
+        assert_eq!(
+            wb.snapshot().waiting,
+            0,
+            "non-head below MINIMUM_TOKENS is skipped"
+        );
+        wb.record_published(&store, true, true, head_id, 16, 0.0, true);
+        assert_eq!(
+            wb.snapshot().waiting,
+            1,
+            "persistent head below MINIMUM_TOKENS is queued"
+        );
+        wb.record_published(&store, true, true, mid_id, 32, 0.0, false);
+        wb.record_published(&store, true, true, tip_id, 48, 0.0, false);
+        assert_eq!(wb.snapshot().waiting, 3);
+
+        // 2. Directly verify `StateDiskEngine::persist(..., head)`:
+        //    - non-head superseded `mid_id` returns `Unneeded` without writing.
+        //    - persistent head `head_id` returns `Started` (persists despite `superseded`).
+        let mid_res = engine.persist(&mut store, None, mid_id, false, ());
+        assert_eq!(mid_res.status, PersistStatus::Unneeded);
+        assert!(store.get(mid_id).unwrap().disk().is_none());
+
+        let head_res = engine.persist(&mut store, None, head_id, true, ());
+        assert_eq!(
+            head_res.status,
+            PersistStatus::Started,
+            "persistent head must persist even when superseded"
+        );
+        assert!(store.get(head_id).unwrap().disk().is_some());
+
+        // 3. Verify `WriteBehind::step` forwards `(id, head)` accurately.
+        let mut seen = Vec::new();
+        wb.step(
+            &mut seen,
+            DELAY_SECONDS + 1.0,
+            0,
+            false,
+            true,
+            |_, _| false,
+            |_, _| true,
+            |log, id, head| {
+                log.push((id, head));
+                if head || id == tip_id {
+                    PersistStatus::Durable
+                } else {
+                    PersistStatus::Unneeded
+                }
+            },
+        );
+        assert_eq!(
+            seen,
+            vec![(head_id, true), (mid_id, false), (tip_id, false)]
+        );
+        assert_eq!(wb.snapshot().durable, 2);
+        assert_eq!(wb.snapshot().unneeded, 1);
+        assert_eq!(wb.snapshot().waiting, 0);
+
+        let _ = tier.close(Instant::now() + Duration::from_secs(5));
+        let _ = std::fs::remove_dir_all(&temp_root);
+    }
 }

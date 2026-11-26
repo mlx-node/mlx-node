@@ -3,7 +3,7 @@
 //! `CompositeStateLayout::cachedBytes`). The target KV is the prefix cache's
 //! chain, never a copy here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use mlx_paged_attn::CacheRecency;
@@ -129,6 +129,15 @@ pub(crate) struct DFlash2States {
     /// Each running turn's points by its sequence (Splash `Request`): the
     /// serial lane's is sequence 0, a scheduled lane's its own.
     pub(crate) turns: HashMap<u32, TurnStates>,
+    /// Block-aligned prompt head boundary per active sequence (`0` / absent when
+    /// the turn has no prompt head boundary). Retained across turn planning and
+    /// cleared on turn end or state clear.
+    pub(crate) turn_head_boundaries: HashMap<u32, u32>,
+    /// Explicit prompt-head provenance for stored states: entries published with
+    /// `is_head == true` (or adopted from a persistent SSD tier at load). Excludes
+    /// non-head ordinary states such as preemption-promoted reply checkpoints or
+    /// lazy junctions so they never suppress a lineage's first durable prompt head.
+    pub(crate) prompt_heads: HashSet<EntryId>,
     /// The block whose state each sequence's turn resumes from or published
     /// at its own replay point (Splash `ActiveRequest::replayPoint`); a
     /// vacated lane keeps it.
@@ -349,6 +358,8 @@ impl DFlash2States {
         Self {
             store,
             turns: HashMap::new(),
+            turn_head_boundaries: HashMap::new(),
+            prompt_heads: HashSet::new(),
             replay_points: HashMap::new(),
             generation_suffix: None,
             lane_window: None,
@@ -373,6 +384,8 @@ impl DFlash2States {
     pub(crate) fn clear(&mut self) {
         self.store.clear();
         self.turns.clear();
+        self.turn_head_boundaries.clear();
+        self.prompt_heads.clear();
         self.replay_points.clear();
         self.lane_window = None;
         self.seq_windows.clear();
@@ -384,6 +397,30 @@ impl DFlash2States {
         self.state_read = None;
         self.restore_uses.clear();
         self.idle_lane = IdleLane::default();
+    }
+
+    pub(crate) fn turn_head_boundary(&self, seq: u32) -> u32 {
+        self.turn_head_boundaries.get(&seq).copied().unwrap_or(0)
+    }
+
+    pub(crate) fn set_turn_head_boundary(&mut self, seq: u32, head_boundary: u32) {
+        if head_boundary == 0 {
+            self.turn_head_boundaries.remove(&seq);
+        } else {
+            self.turn_head_boundaries.insert(seq, head_boundary);
+        }
+    }
+
+    pub(crate) fn is_prompt_head(&self, id: EntryId) -> bool {
+        self.prompt_heads.contains(&id)
+    }
+
+    pub(crate) fn mark_prompt_head(&mut self, id: EntryId) {
+        if self.prompt_heads.len() >= 64 {
+            let store = &self.store;
+            self.prompt_heads.retain(|eid| store.get(*eid).is_some());
+        }
+        self.prompt_heads.insert(id);
     }
 
     /// Marks `id`'s block as `seq`'s turn's replay point (Splash

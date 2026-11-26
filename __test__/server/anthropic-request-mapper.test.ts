@@ -339,97 +339,96 @@ describe('mapAnthropicRequest', () => {
     expect(messages[2].images).toHaveLength(1);
   });
 
-  it('rejects a tool_result whose content array carries a nested image block', () => {
-    // Anthropic allows `tool_result.content` to mix text and image blocks, but the
-    // internal `ChatMessage` shape is a NAPI-generated Rust struct with no `images`
-    // field on `role: 'tool'`. Refuse this shape outright — hoisting the image onto
-    // a trailing user turn would reorder images relative to the caller's declaration
-    // and lose the per-tool association after canonicalization reorders tool rows.
+  it('accepts a tool_result whose content array carries a nested image block', () => {
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-    expect(() =>
-      mapAnthropicRequest({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'tool_result',
-                tool_use_id: 'call_screenshot',
-                content: [
-                  { type: 'text', text: 'Here is the screenshot you asked for:' },
-                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
-                ],
-              },
-            ],
-          },
-        ],
-      }),
-    ).toThrow(/nested image content in tool_result blocks is not representable/i);
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_screenshot',
+              content: [
+                { type: 'text', text: 'Here is the screenshot you asked for:' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(messages).toHaveLength(1);
+    expect(messages[0].role).toBe('tool');
+    expect(messages[0].toolCallId).toBe('call_screenshot');
+    expect(messages[0].content).toBe('Here is the screenshot you asked for:');
+    expect(messages[0].images).toHaveLength(1);
+    expect(messages[0].images![0]).toEqual(new Uint8Array(Buffer.from(imageData, 'base64')));
   });
 
-  it('rejects a tool_result nested image even when another tool_result in the same turn is plain text', () => {
-    // When the caller mixes a plain-text tool_result with one that carries a nested
-    // image, reject the whole turn rather than silently hoisting the image onto a
-    // trailing user message that loses its owner after canonicalization.
+  it('attaches nested tool_result images to their owning tool message alongside plain-text siblings', () => {
     const imageData =
       'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
-    expect(() =>
-      mapAnthropicRequest({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'tool_result', tool_use_id: 'call_ok', content: 'ok' },
-              {
-                type: 'tool_result',
-                tool_use_id: 'call_shot',
-                content: [
-                  { type: 'text', text: 'screenshot:' },
-                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
-                ],
-              },
-            ],
-          },
-        ],
-      }),
-    ).toThrow(/nested image content in tool_result blocks is not representable/i);
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_ok', content: 'ok' },
+            {
+              type: 'tool_result',
+              tool_use_id: 'call_shot',
+              content: [
+                { type: 'text', text: 'screenshot:' },
+                { type: 'image', source: { type: 'base64', media_type: 'image/png', data: imageData } },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'ok', toolCallId: 'call_ok' });
+    expect(messages[1].role).toBe('tool');
+    expect(messages[1].toolCallId).toBe('call_shot');
+    expect(messages[1].content).toBe('screenshot:');
+    expect(messages[1].images).toHaveLength(1);
+    expect(messages[1].images![0]).toEqual(new Uint8Array(Buffer.from(imageData, 'base64')));
   });
 
-  // The flat NAPI `ChatMessage` shape cannot represent interleaved text/image blocks
-  // after a tool_result prefix, so the mapper rejects ambiguous shapes. These tests
-  // pin the narrow accepted set (pure trailing text, single trailing image) and pin
-  // rejection for every interleaved / multi-image shape.
   const iter28Png = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
 
-  it('rejects trailing text followed by an image after a tool_result prefix', () => {
-    expect(() =>
-      mapAnthropicRequest({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
-              { type: 'text', text: 'see the attached screenshot' },
-              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
-            ],
-          },
-        ],
-      }),
-    ).toThrow(/mixing trailing text and image blocks after a tool_result prefix/i);
+  it('accepts trailing text followed by an image after a tool_result prefix', () => {
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+            { type: 'text', text: 'see the attached screenshot' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+          ],
+        },
+      ],
+    });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
+    expect(messages[1].role).toBe('user');
+    expect(messages[1].content).toBe('see the attached screenshot');
+    expect(messages[1].images).toHaveLength(1);
+    expect(messages[1].images![0]).toEqual(new Uint8Array(Buffer.from(iter28Png, 'base64')));
   });
 
   it('rejects trailing image followed by text after a tool_result prefix', () => {
-    // The text-after-image guard fires during the main loop (before the
-    // trailing-mixed check) because the serializer cannot preserve text
-    // that follows an image in any turn, not just after a tool_result
-    // prefix. Either rejection is equivalent for the caller.
+    // The text-after-image guard fires during the main loop because the flat
+    // serializer cannot preserve text that follows an image in any turn.
     expect(() =>
       mapAnthropicRequest({
         model: 'claude-3-5-sonnet-20241022',
@@ -448,23 +447,26 @@ describe('mapAnthropicRequest', () => {
     ).toThrow(/text block after an image block in the same user turn/i);
   });
 
-  it('rejects multiple trailing image blocks after a tool_result prefix', () => {
-    expect(() =>
-      mapAnthropicRequest({
-        model: 'claude-3-5-sonnet-20241022',
-        max_tokens: 1024,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
-              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
-              { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
-            ],
-          },
-        ],
-      }),
-    ).toThrow(/multiple trailing image blocks after a tool_result prefix/i);
+  it('accepts multiple trailing image blocks after a tool_result prefix', () => {
+    const { messages } = mapAnthropicRequest({
+      model: 'claude-3-5-sonnet-20241022',
+      max_tokens: 1024,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            { type: 'tool_result', tool_use_id: 'call_a', content: 'alpha' },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+            { type: 'image', source: { type: 'base64', media_type: 'image/png', data: iter28Png } },
+          ],
+        },
+      ],
+    });
+    expect(messages).toHaveLength(2);
+    expect(messages[0]).toEqual({ role: 'tool', content: 'alpha', toolCallId: 'call_a' });
+    expect(messages[1].role).toBe('user');
+    expect(messages[1].content).toBe('');
+    expect(messages[1].images).toHaveLength(2);
   });
 
   it('accepts a single trailing text block after a tool_result prefix', () => {
@@ -507,7 +509,7 @@ describe('mapAnthropicRequest', () => {
     expect(messages[1].role).toBe('user');
     expect(messages[1].content).toBe('');
     expect(messages[1].images).toHaveLength(1);
-    expect(messages[1].images![0]).toEqual(Buffer.from(iter28Png, 'base64'));
+    expect(messages[1].images![0]).toEqual(new Uint8Array(Buffer.from(iter28Png, 'base64')));
   });
 
   it('accepts multiple trailing text blocks after a tool_result prefix (concatenated)', () => {
@@ -1298,7 +1300,7 @@ describe('mapAnthropicRequest', () => {
     expect(msg.role).toBe('user');
     expect(msg.content).toBe('');
     expect(msg.images).toHaveLength(1);
-    expect(msg.images![0]).toEqual(Buffer.from(imageData, 'base64'));
+    expect(msg.images![0]).toEqual(new Uint8Array(Buffer.from(imageData, 'base64')));
   });
 
   it('maps user message with text + image to content and images populated', () => {
@@ -1323,11 +1325,12 @@ describe('mapAnthropicRequest', () => {
     expect(msg.role).toBe('user');
     expect(msg.content).toBe('What is in this image?');
     expect(msg.images).toHaveLength(1);
-    expect(msg.images![0]).toEqual(Buffer.from(imageData, 'base64'));
+    expect(msg.images![0]).toEqual(new Uint8Array(Buffer.from(imageData, 'base64')));
   });
 
   it('maps user message with only image (no text) to empty content with images', () => {
-    const imageData = '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoH';
+    const imageData =
+      '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==';
     const { messages } = mapAnthropicRequest({
       model: 'claude-3-5-sonnet-20241022',
       max_tokens: 1024,
@@ -1346,7 +1349,7 @@ describe('mapAnthropicRequest', () => {
     expect(msg.images).toBeDefined();
     expect(msg.images).toHaveLength(1);
     expect(msg.images![0]).toBeInstanceOf(Uint8Array);
-    expect(msg.images![0]).toEqual(Buffer.from(imageData, 'base64'));
+    expect(msg.images![0]).toEqual(new Uint8Array(Buffer.from(imageData, 'base64')));
   });
 
   it('maps tool_result with text block array content', () => {
@@ -1739,6 +1742,215 @@ describe('mapAnthropicRequest', () => {
         { role: 'assistant', content: '4' },
         { role: 'user', content: 'Are you sure?' },
       ]);
+    });
+  });
+
+  describe('image cap, base64 normalization, MIME allowlist, and null-safe source', () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const imageBlock = (data = validPng, mediaType = 'image/png') => ({
+      type: 'image' as const,
+      source: { type: 'base64' as const, media_type: mediaType, data },
+    });
+
+    it('accepts 64 images across user and tool_result blocks', () => {
+      const blocks = Array.from({ length: 64 }, () => imageBlock());
+      const { messages } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: blocks }],
+      });
+      expect(messages[0].images).toHaveLength(64);
+    });
+
+    it('rejects 65 images naming the oldest user image block path', () => {
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'hello' },
+            {
+              role: 'user',
+              content: [{ type: 'text', text: 'look' }, ...Array.from({ length: 65 }, () => imageBlock())],
+            },
+          ],
+        }),
+      ).toThrow('messages.2.content.1.image: requests support at most 64 images');
+    });
+
+    it('rejects 65 images naming the oldest tool_result image block path', () => {
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [
+            { role: 'user', content: 'hi' },
+            { role: 'assistant', content: 'calling tool' },
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'tool_result',
+                  tool_use_id: 'call_1',
+                  content: [{ type: 'text', text: 'shot' }, imageBlock()],
+                },
+                ...Array.from({ length: 64 }, () => imageBlock()),
+              ],
+            },
+          ],
+        }),
+      ).toThrow('messages.2.content.0.tool_result.content.1.image: requests support at most 64 images');
+    });
+
+    it('decodes whitespace-wrapped, unpadded, and URL-safe base64 identically to standard base64', () => {
+      const expected = new Uint8Array(Buffer.from(validPng, 'base64'));
+      const unpadded = validPng.replace(/=+$/, '');
+      const urlSafe = unpadded.replace(/\+/g, '-').replace(/\//g, '_');
+      const wrapped = `  ${urlSafe.slice(0, 20)}\r\n\t${urlSafe.slice(20, 44)} \n ${urlSafe.slice(44)}  `;
+
+      const { messages } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: [imageBlock(unpadded), imageBlock(urlSafe), imageBlock(wrapped)] }],
+      });
+      expect(messages[0].images).toHaveLength(3);
+      for (const img of messages[0].images!) {
+        expect(img).toEqual(expected);
+      }
+    });
+
+    it.each(['@@@', 'A', 'A=BC', 'A===', '', '   \r\n  '])(
+      'rejects invalid base64 %j with "Could not process image"',
+      (bad) => {
+        expect(() =>
+          mapAnthropicRequest({
+            model: 'local',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: [imageBlock(bad)] }],
+          }),
+        ).toThrow('Could not process image');
+      },
+    );
+
+    it.each(['image/heic', 'image/bmp', 'image/tiff', 'application/pdf'])(
+      'rejects unsupported image media_type %j with "Could not process image"',
+      (mediaType) => {
+        expect(() =>
+          mapAnthropicRequest({
+            model: 'local',
+            max_tokens: 64,
+            messages: [{ role: 'user', content: [imageBlock(validPng, mediaType)] }],
+          }),
+        ).toThrow('Could not process image');
+      },
+    );
+
+    it('rejects null block.source and non-base64 source types without TypeError', () => {
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: [{ type: 'image', source: null } as unknown as AnthropicContentBlock] }],
+        }),
+      ).toThrow(/source/i);
+
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'image',
+                  source: { type: 'url', url: 'https://example.com/a.png' },
+                } as unknown as AnthropicContentBlock,
+              ],
+            },
+          ],
+        }),
+      ).toThrow(/Unsupported image source type/i);
+    });
+  });
+
+  describe('reasoning_effort minimal, thinking.type=disabled, and thinking.display', () => {
+    it('accepts extra_body.reasoning_effort minimal', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        extra_body: { reasoning_effort: 'minimal' },
+      });
+      expect(config.reasoningEffort).toBe('minimal');
+    });
+
+    it('maps thinking.type=disabled to reasoningEffort=none, includeReasoning=false, and undefined budget', () => {
+      const { config } = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'disabled' },
+      });
+      expect(config.reasoningEffort).toBe('none');
+      expect(config.includeReasoning).toBe(false);
+      expect(config.thinkingTokenBudget).toBeUndefined();
+    });
+
+    it('validates thinking.display and rejects display with disabled thinking', () => {
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: 'hi' }],
+          thinking: { type: 'disabled', display: 'omitted' },
+        }),
+      ).toThrow('thinking.display requires enabled or adaptive thinking');
+
+      expect(() =>
+        mapAnthropicRequest({
+          model: 'local',
+          max_tokens: 64,
+          messages: [{ role: 'user', content: 'hi' }],
+          thinking: { type: 'adaptive', display: 'bogus' },
+        }),
+      ).toThrow('thinking.display must be summarized, omitted, updates, or null');
+    });
+
+    it('maps thinking.display omitted/updates to includeReasoning=false and preserves summarized', () => {
+      const enabledOmitted = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'enabled', budget_tokens: 1024, display: 'omitted' },
+      }).config;
+      expect(enabledOmitted.thinkingTokenBudget).toBe(1024);
+      expect(enabledOmitted.includeReasoning).toBe(false);
+
+      const adaptiveOmitted = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'adaptive', display: 'omitted' },
+      }).config;
+      expect(adaptiveOmitted.includeReasoning).toBe(false);
+
+      const adaptiveUpdates = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'adaptive', display: 'updates' },
+      }).config;
+      expect(adaptiveUpdates.includeReasoning).toBe(false);
+
+      const adaptiveSummarized = mapAnthropicRequest({
+        model: 'local',
+        max_tokens: 64,
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: { type: 'adaptive', display: 'summarized' },
+      }).config;
+      expect(adaptiveSummarized.includeReasoning).not.toBe(false);
     });
   });
 });

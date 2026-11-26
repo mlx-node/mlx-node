@@ -174,7 +174,7 @@ describe('parseServeArgs', () => {
     expect('maxContextTokens' in parseServeArgs(['--max-context', 'auto'])).toBe(false);
     expect('maxContextTokens' in parseServeArgs([])).toBe(false);
     expect(() => parseServeArgs(['--max-context', '2M'])).toThrow(
-      "--max-context must be 'auto' or a token count up to 1010000, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
+      "--max-context must be 'auto' or a token count up to 1048576, such as 100K or 1M (K = 1024 tokens, M = 1000000 tokens)",
     );
   });
 

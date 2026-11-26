@@ -70,6 +70,9 @@ impl SwitchGLU {
         if modes.iter().any(|mode| grouped_format(mode).is_none()) {
             return Ok(false);
         }
+        if [g, u, d].iter().any(|q| q.outer_scale().is_some()) {
+            return Ok(false);
+        }
         if [sg, su, sd]
             .iter()
             .any(|q| !q.grouped_moe_plain_projection())

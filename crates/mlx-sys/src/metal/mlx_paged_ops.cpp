@@ -20,6 +20,7 @@
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -29,6 +30,70 @@
 #include "mlx/backend/metal/device.h"
 #include "mlx/compile.h"
 #include "mlx/transforms_impl.h"
+
+namespace mlx::core::fast::paged {
+
+struct Qwen35QkvPrepParams {
+  uint32_t num_tokens;
+  uint32_t chunk_stride;
+  uint32_t num_q_heads;
+  uint32_t num_kv_heads;
+  uint32_t block_size;
+  uint32_t rope_dims;
+  int32_t rope_offset;
+  float eps;
+  float log2_base;
+  float rope_scale;
+  uint32_t q_row_stride;
+  uint32_t q_head_stride;
+  uint32_t k_row_stride;
+  uint32_t k_head_stride;
+  uint32_t v_row_stride;
+  uint32_t v_head_stride;
+};
+static_assert(sizeof(Qwen35QkvPrepParams) == 64, "matches the Metal struct");
+
+bool metallib_has_prefill_v2_abi(mlx::core::metal::Device& device);
+
+void dispatch_paged_prefill_attention_gated(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    mlx::core::array& workspace,
+    const mlx::core::array& q_staged,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array& block_table,
+    const PagedPrefillParams& params,
+    int num_q_heads,
+    int head_size,
+    KvDtype cache_dtype,
+    bool int8_queries,
+    int64_t live_blocks,
+    int64_t q_row_offset,
+    const mlx::core::array* gate,
+    uint32_t gate_row_stride);
+
+void dispatch_qwen35_qkv_prep(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    const mlx::core::array& q_raw,
+    const mlx::core::array& k_raw,
+    const mlx::core::array& v_raw,
+    const mlx::core::array& wq,
+    const mlx::core::array& wk,
+    const mlx::core::array& slot_mapping,
+    mlx::core::array& q_staged,
+    mlx::core::array& k_pool,
+    mlx::core::array& v_pool,
+    mlx::core::array& k_scale,
+    mlx::core::array& v_scale,
+    const Qwen35QkvPrepParams& params,
+    bool is_int8_ktm);
+
+} // namespace mlx::core::fast::paged
 
 namespace mlx::core::fast {
 
@@ -2473,6 +2538,738 @@ std::array<array, 2> paged_prefill_attention(
 }
 
 // =============================================================================
+// PagedPrefillAttentionGated & Qwen35QkvPrep (local Metal-only primitives)
+// =============================================================================
+
+namespace {
+
+uint32_t validate_paged_prefill_gated_inputs(
+    const array& q_staged,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    const array* gate,
+    int committed_tokens,
+    int rows,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    bool int8_queries,
+    int q_row_offset,
+    bool in_eval_gpu,
+    const char* op_name) {
+  namespace paged = mlx::core::fast::paged;
+  require_row_contiguous_head_offset(q_staged, op_name, "q_staged");
+  require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
+  require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
+  require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
+  require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
+  require_row_contiguous_zero_offset(block_table, op_name, "block_table");
+  require_row_contiguous_zero_offset(workspace, op_name, "workspace");
+  if (kv_dtype != KvDtype::Bf16 && kv_dtype != KvDtype::Int8) {
+    prefill_reject(op_name, "kv_dtype must be bf16 or int8");
+  }
+  if (int8_queries && kv_dtype != KvDtype::Int8) {
+    prefill_reject(op_name, "INT8 queries take INT8 pages");
+  }
+  if (num_kv_heads <= 0 || num_q_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(op_name, "query heads must be a positive multiple of KV heads");
+  }
+  const int group = num_q_heads / num_kv_heads;
+  if (!paged::paged_prefill_attention_geometry(group, head_size)) {
+    prefill_reject(op_name, "unsupported paged prefill geometry");
+  }
+  if (block_size != 16 && block_size != 32) {
+    prefill_reject(op_name, "block_size must be 16 or 32");
+  }
+  if (max_splits != paged::kPagedPrefillMaxSplits &&
+      max_splits != paged::kPagedVerifyMaxSplits) {
+    prefill_reject(op_name, "max_splits must be 32 (prefill) or 128 (verify)");
+  }
+  const int max_rows = max_splits == paged::kPagedVerifyMaxSplits
+      ? paged::kPagedVerifyRows
+      : paged::kPagedPrefillMaxRows;
+  if (rows <= 0 || rows > max_rows) {
+    prefill_reject(op_name, "rows out of range");
+  }
+  if (splits <= 0 || splits > max_splits) {
+    prefill_reject(op_name, "splits out of range");
+  }
+  if (committed_tokens < 0) {
+    prefill_reject(op_name, "committed_tokens must be >= 0");
+  }
+  if (q_staged.dtype() != mlx::core::bfloat16 || q_staged.ndim() != 4 ||
+      q_staged.shape(0) != num_kv_heads || q_staged.shape(2) != group ||
+      q_staged.shape(3) != head_size) {
+    prefill_reject(op_name, "q_staged must be bf16 [kv_heads, chunk_stride, group, head_size]");
+  }
+  const int chunk_stride = q_staged.shape(1);
+  const int padded_rows = ((rows + 7) / 8) * 8;
+  if (chunk_stride < rows || chunk_stride > paged::kPagedPrefillMaxRows ||
+      chunk_stride % 32 != 0 || q_row_offset < 0 ||
+      q_row_offset + padded_rows > chunk_stride) {
+    prefill_reject(op_name, "q_staged chunk_stride / q_row_offset out of range");
+  }
+  const int x = x_pack_for(kv_dtype);
+  const auto cache_dtype = cache_dtype_for_kv_dtype(kv_dtype);
+  if (k_pool.dtype() != cache_dtype || v_pool.dtype() != cache_dtype) {
+    prefill_reject(op_name, "k_pool / v_pool dtype must match kv_dtype");
+  }
+  const bool keys_token_major = k_pool.ndim() == 4;
+  if ((!keys_token_major && k_pool.ndim() != 5) || v_pool.ndim() != 4) {
+    prefill_reject(op_name, "k_pool must be rank 5 (or rank 4 KTM) and v_pool rank 4");
+  }
+  const int num_blocks = k_pool.shape(0);
+  if (keys_token_major) {
+    if (kv_dtype != KvDtype::Int8 || block_size != 32 ||
+        !paged::paged_prefill_keys_token_major_geometry(group, head_size)) {
+      prefill_reject(op_name, "unsupported keys-token-major geometry");
+    }
+    if (k_pool.shape() != Shape{num_blocks, num_kv_heads, block_size, head_size} ||
+        v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
+      prefill_reject(op_name, "keys-token-major pool shape mismatch");
+    }
+  } else if (
+      k_pool.shape() != Shape{num_blocks, num_kv_heads, head_size / x, block_size, x} ||
+      v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
+    prefill_reject(op_name, "vLLM pool shape mismatch");
+  }
+  validate_kv_scales(
+      k_pool, k_scale, v_scale, num_kv_heads, block_size, head_size, kv_dtype, true, op_name);
+  if (block_table.dtype() != mlx::core::int32) {
+    prefill_reject(op_name, "block_table must be int32");
+  }
+  const int64_t needed =
+      (static_cast<int64_t>(committed_tokens) + rows + block_size - 1) / block_size;
+  if (static_cast<int64_t>(block_table.size()) < needed) {
+    prefill_reject(op_name, "block_table too small");
+  }
+  if (workspace.dtype() != mlx::core::float32 ||
+      static_cast<int64_t>(workspace.size()) <
+          paged::paged_prefill_workspace_floats(rows, splits, num_q_heads, head_size)) {
+    prefill_reject(op_name, "workspace too small or wrong dtype");
+  }
+  if (gate == nullptr) {
+    return 0u;
+  }
+  if (gate->dtype() != mlx::core::bfloat16) {
+    prefill_reject(op_name, "gate must be bfloat16");
+  }
+  const int gate_cols = num_q_heads * head_size;
+  if (gate->ndim() == 3 &&
+      gate->shape() == Shape{rows, num_q_heads, head_size} &&
+      gate->flags().row_contiguous) {
+    return static_cast<uint32_t>(gate_cols);
+  }
+  if (gate->ndim() == 2 && gate->shape() == Shape{rows, gate_cols}) {
+    if (gate->flags().row_contiguous) {
+      return static_cast<uint32_t>(gate_cols);
+    }
+    if (in_eval_gpu || gate->strides().size() == 2) {
+      if (gate->strides(1) == 1 && gate->strides(0) >= 0 &&
+          gate->strides(0) <=
+              static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        return static_cast<uint32_t>(gate->strides(0));
+      }
+      prefill_reject(op_name, "gate 2D strides must have strides(1) == 1 and strides(0) >= 0");
+    }
+    return static_cast<uint32_t>(gate_cols);
+  }
+  prefill_reject(op_name, "gate must be bf16 [rows, H*D] or row-contiguous [rows, H, D]");
+  return 0u;
+}
+
+class PagedPrefillAttentionGated : public Custom {
+ public:
+  PagedPrefillAttentionGated(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int committed_tokens,
+      int rows,
+      int splits,
+      int max_splits,
+      int block_size,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      KvDtype kv_dtype,
+      bool int8_queries,
+      int q_row_offset,
+      bool has_gate)
+      : Custom(stream, std::move(fallback)),
+        committed_tokens_(committed_tokens),
+        rows_(rows),
+        splits_(splits),
+        max_splits_(max_splits),
+        block_size_(block_size),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        kv_dtype_(kv_dtype),
+        int8_queries_(int8_queries),
+        q_row_offset_(q_row_offset),
+        has_gate_(has_gate) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("PagedPrefillAttentionGated CPU NYI");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    const size_t expected_inputs = has_gate_ ? 8u : 7u;
+    if (inputs.size() != expected_inputs || outputs.size() != 2u) {
+      throw std::runtime_error("PagedPrefillAttentionGated: input/output count mismatch");
+    }
+    const array& q_staged = inputs[0];
+    const array& k_pool = inputs[1];
+    const array& v_pool = inputs[2];
+    const array& k_scale = inputs[3];
+    const array& v_scale = inputs[4];
+    const array& block_table = inputs[5];
+    const array& workspace = inputs[6];
+    const array* gate = has_gate_ ? &inputs[7] : nullptr;
+
+    const uint32_t gate_row_stride = validate_paged_prefill_gated_inputs(
+        q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+        gate, committed_tokens_, rows_, splits_, max_splits_, block_size_,
+        num_q_heads_, num_kv_heads_, head_size_, kv_dtype_, int8_queries_,
+        q_row_offset_, /*in_eval_gpu=*/true,
+        "PagedPrefillAttentionGated::eval_gpu");
+
+    const int32_t* table = block_table.data<int32_t>();
+    const int32_t num_blocks = static_cast<int32_t>(k_pool.shape(0));
+    const int64_t used =
+        (static_cast<int64_t>(committed_tokens_) + rows_ + block_size_ - 1) /
+        block_size_;
+    for (int64_t j = 0; j < used; ++j) {
+      if (table[j] < 0 || table[j] >= num_blocks) {
+        std::ostringstream msg;
+        msg << "[runtime] PagedPrefillAttentionGated::eval_gpu: block_table["
+            << j << "] (" << table[j] << ") out of range [0, " << num_blocks
+            << ")";
+        throw std::invalid_argument(msg.str());
+      }
+    }
+    const int32_t visible = committed_tokens_ + rows_;
+    const int64_t live_blocks = distinct_live_blocks(
+        table, &visible, 1, static_cast<uint32_t>(used), block_size_, num_blocks);
+
+    array& out = outputs[0];
+    out.set_data(allocator::malloc(out.nbytes()));
+    outputs[1].copy_shared_buffer(workspace);
+
+    auto& s = stream();
+    auto& d = mlx::core::metal::device(s.device);
+    auto& encoder = mlx::core::metal::get_command_encoder(s);
+    mlx::core::fast::paged::PagedPrefillParams params{
+        static_cast<uint32_t>(committed_tokens_),
+        static_cast<uint32_t>(rows_),
+        static_cast<uint32_t>(q_staged.shape(1)),
+        static_cast<uint32_t>(block_table.size()),
+        static_cast<uint32_t>(splits_),
+        static_cast<uint32_t>(max_splits_),
+        static_cast<uint32_t>(block_size_),
+        static_cast<uint32_t>(num_kv_heads_)};
+    mlx::core::fast::paged::dispatch_paged_prefill_attention_gated(
+        encoder,
+        d,
+        out,
+        outputs[1],
+        q_staged,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        block_table,
+        params,
+        num_q_heads_,
+        head_size_,
+        to_paged_dtype(kv_dtype_),
+        int8_queries_,
+        live_blocks,
+        static_cast<int64_t>(q_row_offset_),
+        gate,
+        gate_row_stride);
+  }
+
+  std::vector<array> vjp(
+      const std::vector<array>&,
+      const std::vector<array>&,
+      const std::vector<int>&,
+      const std::vector<array>&) override {
+    throw std::runtime_error("PagedPrefillAttentionGated is inference-only");
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    const size_t expected_inputs = has_gate_ ? 8u : 7u;
+    if (inputs.size() != expected_inputs) {
+      throw std::runtime_error("PagedPrefillAttentionGated::output_shapes: input mismatch");
+    }
+    return {Shape{rows_, num_q_heads_, head_size_}, inputs[6].shape()};
+  }
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& o = static_cast<const PagedPrefillAttentionGated&>(other);
+    return committed_tokens_ == o.committed_tokens_ && rows_ == o.rows_ &&
+        splits_ == o.splits_ && max_splits_ == o.max_splits_ &&
+        block_size_ == o.block_size_ && num_q_heads_ == o.num_q_heads_ &&
+        num_kv_heads_ == o.num_kv_heads_ && head_size_ == o.head_size_ &&
+        kv_dtype_ == o.kv_dtype_ && int8_queries_ == o.int8_queries_ &&
+        q_row_offset_ == o.q_row_offset_ && has_gate_ == o.has_gate_;
+  }
+
+  DEFINE_NAME(PagedPrefillAttentionGated);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        committed_tokens_,
+        rows_,
+        splits_,
+        max_splits_,
+        block_size_,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        static_cast<uint8_t>(kv_dtype_),
+        int8_queries_,
+        q_row_offset_,
+        has_gate_);
+  }
+
+ private:
+  int committed_tokens_;
+  int rows_;
+  int splits_;
+  int max_splits_;
+  int block_size_;
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  KvDtype kv_dtype_;
+  bool int8_queries_;
+  int q_row_offset_;
+  bool has_gate_;
+};
+
+std::array<array, 2> paged_prefill_attention_gated(
+    const array& q_staged,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    const array& block_table,
+    const array& workspace,
+    int committed_tokens,
+    int rows,
+    int splits,
+    int max_splits,
+    int block_size,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    KvDtype kv_dtype,
+    bool int8_queries,
+    int q_row_offset,
+    const std::optional<array>& gate,
+    Stream s) {
+  const char* op_name = "paged_prefill_attention_gated";
+  std::optional<array> gate_in;
+  if (gate.has_value()) {
+    const int gate_cols = num_q_heads * head_size;
+    if ((gate->ndim() == 3 &&
+         gate->shape() == Shape{rows, num_q_heads, head_size} &&
+         gate->flags().row_contiguous) ||
+        (gate->ndim() == 2 && gate->shape() == Shape{rows, gate_cols} &&
+         (gate->flags().row_contiguous ||
+          (gate->strides().size() == 2 && gate->strides(1) == 1 &&
+           gate->strides(0) >= 0)))) {
+      gate_in = *gate;
+    } else {
+      gate_in = contiguous(*gate, false, s);
+    }
+  }
+  validate_paged_prefill_gated_inputs(
+      q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace,
+      gate_in ? &*gate_in : nullptr, committed_tokens, rows, splits, max_splits,
+      block_size, num_q_heads, num_kv_heads, head_size, kv_dtype, int8_queries,
+      q_row_offset, /*in_eval_gpu=*/false, op_name);
+
+  auto fallback = [](std::vector<array>) -> std::vector<array> {
+    throw std::runtime_error(
+        "paged_prefill_attention_gated has no fallback implementation (inference-only)");
+  };
+  auto primitive = std::make_shared<PagedPrefillAttentionGated>(
+      s, std::move(fallback), committed_tokens, rows, splits, max_splits,
+      block_size, num_q_heads, num_kv_heads, head_size, kv_dtype, int8_queries,
+      q_row_offset, gate_in.has_value());
+  std::vector<array> prim_inputs{
+      q_staged, k_pool, v_pool, k_scale, v_scale, block_table, workspace};
+  if (gate_in.has_value()) {
+    prim_inputs.push_back(*gate_in);
+  }
+  auto results = array::make_arrays(
+      {Shape{rows, num_q_heads, head_size}, workspace.shape()},
+      {mlx::core::bfloat16, mlx::core::float32},
+      std::move(primitive),
+      std::move(prim_inputs));
+  return {std::move(results[0]), std::move(results[1])};
+}
+
+void validate_qwen35_qkv_prep_inputs(
+    const array& q_raw,
+    const array& k_raw,
+    const array& v_raw,
+    const array& wq,
+    const array& wk,
+    const array& slot_mapping,
+    const array& k_pool,
+    const array& v_pool,
+    const array& k_scale,
+    const array& v_scale,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int rope_dims,
+    float rope_base,
+    uint32_t kv_mode,
+    bool in_eval_gpu,
+    const char* op_name) {
+  namespace paged = mlx::core::fast::paged;
+  if (head_size != 256) {
+    prefill_reject(op_name, "head_size must be 256");
+  }
+  if (num_kv_heads <= 0 || num_q_heads <= 0 || num_q_heads % num_kv_heads != 0) {
+    prefill_reject(op_name, "num_q_heads must be a positive multiple of num_kv_heads");
+  }
+  if (kv_mode != 0u && kv_mode != 1u) {
+    prefill_reject(op_name, "kv_mode must be 0 (INT8-KTM) or 1 (BF16-vLLM)");
+  }
+  if (rope_dims < 0 || rope_dims > head_size || rope_dims % 2 != 0) {
+    prefill_reject(op_name, "rope_dims must be even in [0, head_size]");
+  }
+  if (rope_dims > 0 && !(rope_base > 0.0f)) {
+    prefill_reject(op_name, "rope_base must be positive");
+  }
+  if (q_raw.ndim() != 4 || k_raw.ndim() != 4 || v_raw.ndim() != 4) {
+    prefill_reject(op_name, "q_raw, k_raw, v_raw must be rank 4 [1, T, H, 256]");
+  }
+  if (q_raw.dtype() != mlx::core::bfloat16 ||
+      k_raw.dtype() != mlx::core::bfloat16 ||
+      v_raw.dtype() != mlx::core::bfloat16) {
+    prefill_reject(op_name, "q_raw, k_raw, v_raw must be bfloat16");
+  }
+  const int num_tokens = q_raw.shape(1);
+  if (num_tokens <= 0 || paged_prefill_stride(num_tokens) > paged::kPagedPrefillMaxRows) {
+    prefill_reject(op_name, "num_tokens must be in 1..2048");
+  }
+  if (q_raw.shape() != Shape{1, num_tokens, num_q_heads, head_size} ||
+      k_raw.shape() != Shape{1, num_tokens, num_kv_heads, head_size} ||
+      v_raw.shape() != Shape{1, num_tokens, num_kv_heads, head_size}) {
+    prefill_reject(op_name, "q_raw / k_raw / v_raw shape mismatch");
+  }
+  auto check_innermost_stride = [&](const array& a, const char* name) {
+    if (a.flags().row_contiguous) {
+      return;
+    }
+    if (in_eval_gpu || a.strides().size() == 4) {
+      const int64_t max_u32 =
+          static_cast<int64_t>(std::numeric_limits<uint32_t>::max());
+      if (a.strides(3) != 1 || a.strides(1) < 0 || a.strides(2) < 0 ||
+          a.strides(1) > max_u32 || a.strides(2) > max_u32) {
+        prefill_reject(
+            op_name,
+            std::string(name) + " must have strides(3) == 1 and non-negative 32-bit row/head strides");
+      }
+    }
+  };
+  check_innermost_stride(q_raw, "q_raw");
+  check_innermost_stride(k_raw, "k_raw");
+  check_innermost_stride(v_raw, "v_raw");
+
+  require_row_contiguous(wq, op_name, "wq");
+  require_row_contiguous(wk, op_name, "wk");
+  if (wq.dtype() != mlx::core::bfloat16 || wk.dtype() != mlx::core::bfloat16 ||
+      wq.ndim() != 1 || wk.ndim() != 1 ||
+      wq.shape(0) != head_size || wk.shape(0) != head_size) {
+    prefill_reject(op_name, "wq / wk must be row-contiguous bfloat16 [256]");
+  }
+
+  require_row_contiguous_zero_offset(slot_mapping, op_name, "slot_mapping");
+  if (slot_mapping.dtype() != mlx::core::int64 || slot_mapping.ndim() != 1 ||
+      slot_mapping.shape(0) != num_tokens) {
+    prefill_reject(op_name, "slot_mapping must be int64 [num_tokens]");
+  }
+
+  require_row_contiguous_zero_offset(k_pool, op_name, "k_pool");
+  require_row_contiguous_zero_offset(v_pool, op_name, "v_pool");
+  require_row_contiguous_zero_offset(k_scale, op_name, "k_scale");
+  require_row_contiguous_zero_offset(v_scale, op_name, "v_scale");
+
+  if (kv_mode == 0u) {
+    if (block_size != 32) {
+      prefill_reject(op_name, "INT8-KTM requires block_size == 32");
+    }
+    if (k_pool.dtype() != mlx::core::int8 || v_pool.dtype() != mlx::core::int8 ||
+        k_pool.ndim() != 4 || v_pool.ndim() != 4) {
+      prefill_reject(op_name, "INT8-KTM requires rank-4 int8 k_pool / v_pool");
+    }
+    const int num_blocks = k_pool.shape(0);
+    if (num_blocks <= 0 ||
+        k_pool.shape() != Shape{num_blocks, num_kv_heads, 32, head_size} ||
+        v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, 32}) {
+      prefill_reject(op_name, "INT8-KTM pool shape mismatch");
+    }
+    if (k_scale.dtype() != mlx::core::float32 ||
+        v_scale.dtype() != mlx::core::float32 ||
+        k_scale.shape() != Shape{num_blocks, num_kv_heads, 32} ||
+        v_scale.shape() != Shape{num_blocks, num_kv_heads, 32}) {
+      prefill_reject(op_name, "INT8-KTM scale shape/dtype mismatch");
+    }
+  } else {
+    if (block_size < 1) {
+      prefill_reject(op_name, "BF16-vLLM requires block_size >= 1");
+    }
+    if (k_pool.dtype() != mlx::core::bfloat16 ||
+        v_pool.dtype() != mlx::core::bfloat16 ||
+        k_pool.ndim() != 5 || v_pool.ndim() != 4) {
+      prefill_reject(op_name, "BF16-vLLM requires rank-5 bf16 k_pool and rank-4 bf16 v_pool");
+    }
+    const int num_blocks = k_pool.shape(0);
+    if (num_blocks <= 0 ||
+        k_pool.shape() != Shape{num_blocks, num_kv_heads, head_size / 8, block_size, 8} ||
+        v_pool.shape() != Shape{num_blocks, num_kv_heads, head_size, block_size}) {
+      prefill_reject(op_name, "BF16-vLLM pool shape mismatch");
+    }
+    if (k_scale.dtype() != mlx::core::float32 ||
+        v_scale.dtype() != mlx::core::float32 ||
+        k_scale.size() != 1 || v_scale.size() != 1) {
+      prefill_reject(op_name, "BF16-vLLM scales must be 1-element float32");
+    }
+  }
+}
+
+class Qwen35QkvPrep : public Custom {
+ public:
+  Qwen35QkvPrep(
+      Stream stream,
+      std::function<std::vector<array>(std::vector<array>)> fallback,
+      int num_q_heads,
+      int num_kv_heads,
+      int head_size,
+      int block_size,
+      int rope_dims,
+      int rope_offset,
+      float eps,
+      float rope_base,
+      float rope_scale,
+      uint32_t kv_mode)
+      : Custom(stream, std::move(fallback)),
+        num_q_heads_(num_q_heads),
+        num_kv_heads_(num_kv_heads),
+        head_size_(head_size),
+        block_size_(block_size),
+        rope_dims_(rope_dims),
+        rope_offset_(rope_offset),
+        eps_(eps),
+        rope_base_(rope_base),
+        rope_scale_(rope_scale),
+        kv_mode_(kv_mode) {}
+
+  void eval_cpu(const std::vector<array>&, std::vector<array>&) override {
+    throw std::runtime_error("Qwen35QkvPrep CPU NYI");
+  }
+
+  void eval_gpu(
+      const std::vector<array>& inputs,
+      std::vector<array>& outputs) override {
+    if (inputs.size() != 10u || outputs.size() != 5u) {
+      throw std::runtime_error("Qwen35QkvPrep: expected 10 inputs and 5 outputs");
+    }
+    const array& q_raw = inputs[0];
+    const array& k_raw = inputs[1];
+    const array& v_raw = inputs[2];
+    const array& wq = inputs[3];
+    const array& wk = inputs[4];
+    const array& slot_mapping = inputs[5];
+    const array& k_pool = inputs[6];
+    const array& v_pool = inputs[7];
+    const array& k_scale = inputs[8];
+    const array& v_scale = inputs[9];
+
+    validate_qwen35_qkv_prep_inputs(
+        q_raw, k_raw, v_raw, wq, wk, slot_mapping, k_pool, v_pool, k_scale,
+        v_scale, num_q_heads_, num_kv_heads_, head_size_, block_size_,
+        rope_dims_, rope_base_, kv_mode_, /*in_eval_gpu=*/true,
+        "Qwen35QkvPrep::eval_gpu");
+
+    const int num_tokens = q_raw.shape(1);
+    const int64_t pool_capacity =
+        static_cast<int64_t>(k_pool.shape(0)) * static_cast<int64_t>(block_size_);
+    const int64_t* slot_data = slot_mapping.data<int64_t>();
+    int64_t max_slot = -1;
+    for (int i = 0; i < num_tokens; ++i) {
+      if (slot_data[i] >= 0 && slot_data[i] > max_slot) {
+        max_slot = slot_data[i];
+      }
+    }
+    if (max_slot >= pool_capacity) {
+      std::ostringstream msg;
+      msg << "[runtime] Qwen35QkvPrep::eval_gpu: slot_mapping max (" << max_slot
+          << ") exceeds pool capacity (" << pool_capacity << ")";
+      throw std::invalid_argument(msg.str());
+    }
+
+    outputs[0].set_data(allocator::malloc(outputs[0].nbytes()));
+    outputs[1].copy_shared_buffer(k_pool);
+    outputs[2].copy_shared_buffer(v_pool);
+    outputs[3].copy_shared_buffer(k_scale);
+    outputs[4].copy_shared_buffer(v_scale);
+
+    auto row_head_strides = [](const array& a) -> std::pair<uint32_t, uint32_t> {
+      if (a.flags().row_contiguous) {
+        return {
+            static_cast<uint32_t>(a.shape(2) * a.shape(3)),
+            static_cast<uint32_t>(a.shape(3))};
+      }
+      return {
+          static_cast<uint32_t>(a.strides(1)),
+          static_cast<uint32_t>(a.strides(2))};
+    };
+    const auto [q_row_stride, q_head_stride] = row_head_strides(q_raw);
+    const auto [k_row_stride, k_head_stride] = row_head_strides(k_raw);
+    const auto [v_row_stride, v_head_stride] = row_head_strides(v_raw);
+
+    const int chunk_stride = paged_prefill_stride(num_tokens);
+    const float log2_base = rope_dims_ > 0 ? std::log2(rope_base_) : 0.0f;
+    mlx::core::fast::paged::Qwen35QkvPrepParams params{
+        static_cast<uint32_t>(num_tokens),
+        static_cast<uint32_t>(chunk_stride),
+        static_cast<uint32_t>(num_q_heads_),
+        static_cast<uint32_t>(num_kv_heads_),
+        static_cast<uint32_t>(block_size_),
+        static_cast<uint32_t>(rope_dims_),
+        static_cast<int32_t>(rope_offset_),
+        eps_,
+        log2_base,
+        rope_scale_,
+        q_row_stride,
+        q_head_stride,
+        k_row_stride,
+        k_head_stride,
+        v_row_stride,
+        v_head_stride};
+
+    auto& s = stream();
+    auto& d = mlx::core::metal::device(s.device);
+    auto& encoder = mlx::core::metal::get_command_encoder(s);
+    mlx::core::fast::paged::dispatch_qwen35_qkv_prep(
+        encoder,
+        d,
+        q_raw,
+        k_raw,
+        v_raw,
+        wq,
+        wk,
+        slot_mapping,
+        outputs[0],
+        outputs[1],
+        outputs[2],
+        outputs[3],
+        outputs[4],
+        params,
+        kv_mode_ == 0u);
+  }
+
+  std::vector<array> vjp(
+      const std::vector<array>&,
+      const std::vector<array>&,
+      const std::vector<int>&,
+      const std::vector<array>&) override {
+    throw std::runtime_error("Qwen35QkvPrep is inference-only");
+  }
+
+  std::vector<Shape> output_shapes(const std::vector<array>& inputs) override {
+    if (inputs.size() != 10u) {
+      throw std::runtime_error("Qwen35QkvPrep::output_shapes: expected 10 inputs");
+    }
+    const int num_tokens = inputs[0].shape(1);
+    const int chunk_stride = paged_prefill_stride(num_tokens);
+    const int group = num_q_heads_ / num_kv_heads_;
+    return {
+        Shape{num_kv_heads_, chunk_stride, group, head_size_},
+        inputs[6].shape(),
+        inputs[7].shape(),
+        inputs[8].shape(),
+        inputs[9].shape()};
+  }
+
+  bool is_equivalent(const Primitive& other) const override {
+    const auto& o = static_cast<const Qwen35QkvPrep&>(other);
+    return num_q_heads_ == o.num_q_heads_ && num_kv_heads_ == o.num_kv_heads_ &&
+        head_size_ == o.head_size_ && block_size_ == o.block_size_ &&
+        rope_dims_ == o.rope_dims_ && rope_offset_ == o.rope_offset_ &&
+        eps_ == o.eps_ && rope_base_ == o.rope_base_ &&
+        rope_scale_ == o.rope_scale_ && kv_mode_ == o.kv_mode_;
+  }
+
+  DEFINE_NAME(Qwen35QkvPrep);
+
+  auto state() const {
+    return std::make_tuple(
+        nullptr,
+        num_q_heads_,
+        num_kv_heads_,
+        head_size_,
+        block_size_,
+        rope_dims_,
+        rope_offset_,
+        eps_,
+        rope_base_,
+        rope_scale_,
+        kv_mode_);
+  }
+
+ private:
+  int num_q_heads_;
+  int num_kv_heads_;
+  int head_size_;
+  int block_size_;
+  int rope_dims_;
+  int rope_offset_;
+  float eps_;
+  float rope_base_;
+  float rope_scale_;
+  uint32_t kv_mode_;
+};
+
+struct PendingPrefillScope {
+  bool active = false;
+  int base_committed = 0;
+  int total_rows = 0;
+  int consumed_rows = 0;
+  int gate_fused_rows = 0;
+  int expected_num_q_heads = 0;
+  int expected_num_kv_heads = 0;
+  int expected_head_size = 0;
+  std::optional<array> gate_2d;
+  std::optional<array> q_staged;
+};
+
+thread_local PendingPrefillScope g_pending_prefill_scope;
+
+} // namespace
+
+// =============================================================================
 // Inkling-2-Mini Paged Attention & In-Place MPP Paged Prefill Primitives
 // =============================================================================
 
@@ -3595,8 +4392,205 @@ bool mlx_paged_query_codes_forward(
   }
 }
 
-/// Production FFI: emit a `PagedPrefillAttention` (queries staged inside).
-/// Returns false on a validation error; the outputs stay lazy.
+/// Arm a thread-local scope for the next `mlx_paged_prefill_attention_forward`
+/// call(s) covering `total_rows` rows (one or more pieces): optional BF16 gate
+/// to fuse into the attention output store, and optional pre-staged
+/// `[H_kv, chunk_stride, group, head_size]` BF16 queries from `qwen35_qkv_prep`.
+bool mlx_paged_prefill_scope_arm(
+    mlx_array* gate_ptr,
+    mlx_array* q_staged_ptr,
+    int base_committed,
+    int total_rows,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size) {
+  using namespace mlx::core;
+  using namespace mlx::core::fast;
+  g_pending_prefill_scope = PendingPrefillScope{};
+  if (base_committed < 0 || total_rows <= 0 || num_q_heads <= 0 ||
+      num_kv_heads <= 0 || num_q_heads % num_kv_heads != 0 || head_size <= 0) {
+    return false;
+  }
+  if (gate_ptr == nullptr && q_staged_ptr == nullptr) {
+    return false;
+  }
+  try {
+    if (!metal::is_available() ||
+        !paged::metallib_has_prefill_v2_abi(metal::device(Device::gpu))) {
+      return false;
+    }
+    PendingPrefillScope scope;
+    scope.base_committed = base_committed;
+    scope.total_rows = total_rows;
+    scope.expected_num_q_heads = num_q_heads;
+    scope.expected_num_kv_heads = num_kv_heads;
+    scope.expected_head_size = head_size;
+    const int gate_cols = num_q_heads * head_size;
+
+    if (gate_ptr != nullptr) {
+      const auto& g = *reinterpret_cast<array*>(gate_ptr);
+      if (g.dtype() != bfloat16) {
+        return false;
+      }
+      if (g.ndim() == 3 && g.shape(0) == 1 && g.shape(1) == total_rows &&
+          g.shape(2) == gate_cols) {
+        scope.gate_2d = squeeze(g, 0);
+      } else if (g.ndim() == 2 && g.shape(0) == total_rows &&
+                 g.shape(1) == gate_cols) {
+        scope.gate_2d = g;
+      } else if (g.ndim() == 3 && g.shape(0) == total_rows &&
+                 g.shape(1) == num_q_heads && g.shape(2) == head_size &&
+                 g.flags().row_contiguous) {
+        scope.gate_2d = reshape(g, {total_rows, gate_cols});
+      } else {
+        return false;
+      }
+    }
+
+    if (q_staged_ptr != nullptr) {
+      const auto& qs = *reinterpret_cast<array*>(q_staged_ptr);
+      const int group = num_q_heads / num_kv_heads;
+      if (qs.dtype() != bfloat16 || qs.ndim() != 4 ||
+          qs.shape(0) != num_kv_heads || qs.shape(2) != group ||
+          qs.shape(3) != head_size || qs.shape(1) < total_rows ||
+          qs.shape(1) > paged::kPagedPrefillMaxRows ||
+          qs.shape(1) % 32 != 0) {
+        return false;
+      }
+      scope.q_staged = qs;
+    }
+
+    scope.active = true;
+    g_pending_prefill_scope = std::move(scope);
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("paged_prefill_scope_arm", e.what());
+    g_pending_prefill_scope = PendingPrefillScope{};
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("paged_prefill_scope_arm", "unknown exception");
+    g_pending_prefill_scope = PendingPrefillScope{};
+    return false;
+  }
+}
+
+/// Disarm the thread-local prefill scope and return the number of rows whose
+/// output had `sigmoid(gate)` fused inside paged prefill attention.
+int32_t mlx_paged_prefill_scope_disarm() {
+  using namespace mlx::core::fast;
+  const int32_t fused = static_cast<int32_t>(g_pending_prefill_scope.gate_fused_rows);
+  g_pending_prefill_scope = PendingPrefillScope{};
+  return fused;
+}
+
+/// Production FFI: fused QK-norm + partial RoPE + Q staging + paged KV write
+/// (`qwen35_qkv_prep_int8_ktm_d256` / `qwen35_qkv_prep_bf16_vllm_d256`).
+bool mlx_qwen35_paged_qkv_prep_forward(
+    mlx_array* q_raw_ptr,
+    mlx_array* k_raw_ptr,
+    mlx_array* v_raw_ptr,
+    mlx_array* wq_ptr,
+    mlx_array* wk_ptr,
+    mlx_array* slot_mapping_ptr,
+    mlx_array* k_pool_ptr,
+    mlx_array* v_pool_ptr,
+    mlx_array* k_scale_ptr,
+    mlx_array* v_scale_ptr,
+    int num_q_heads,
+    int num_kv_heads,
+    int head_size,
+    int block_size,
+    int rope_dims,
+    int rope_offset,
+    float eps,
+    float rope_base,
+    float rope_scale,
+    uint32_t kv_mode,
+    mlx_array** out_q_staged,
+    mlx_array** out_k_pool,
+    mlx_array** out_v_pool,
+    mlx_array** out_k_scale,
+    mlx_array** out_v_scale) {
+  for (mlx_array** out :
+       {out_q_staged, out_k_pool, out_v_pool, out_k_scale, out_v_scale}) {
+    if (out) *out = nullptr;
+  }
+  if (!q_raw_ptr || !k_raw_ptr || !v_raw_ptr || !wq_ptr || !wk_ptr ||
+      !slot_mapping_ptr || !k_pool_ptr || !v_pool_ptr || !k_scale_ptr ||
+      !v_scale_ptr || !out_q_staged || !out_k_pool || !out_v_pool ||
+      !out_k_scale || !out_v_scale) {
+    return false;
+  }
+  try {
+    using namespace mlx::core;
+    using namespace mlx::core::fast;
+    if (!metal::is_available() ||
+        !paged::metallib_has_prefill_v2_abi(metal::device(Device::gpu))) {
+      return false;
+    }
+    auto s = to_stream(StreamOrDevice{});
+    const auto& q_raw = *reinterpret_cast<array*>(q_raw_ptr);
+    const auto& k_raw = *reinterpret_cast<array*>(k_raw_ptr);
+    const auto& v_raw = *reinterpret_cast<array*>(v_raw_ptr);
+    const auto& wq_in = *reinterpret_cast<array*>(wq_ptr);
+    const auto& wk_in = *reinterpret_cast<array*>(wk_ptr);
+    const auto& slot_mapping = *reinterpret_cast<array*>(slot_mapping_ptr);
+    const auto& k_pool = *reinterpret_cast<array*>(k_pool_ptr);
+    const auto& v_pool = *reinterpret_cast<array*>(v_pool_ptr);
+    const auto& k_scale = *reinterpret_cast<array*>(k_scale_ptr);
+    const auto& v_scale = *reinterpret_cast<array*>(v_scale_ptr);
+
+    array wq = wq_in.flags().row_contiguous ? wq_in : contiguous(wq_in, false, s);
+    array wk = wk_in.flags().row_contiguous ? wk_in : contiguous(wk_in, false, s);
+
+    validate_qwen35_qkv_prep_inputs(
+        q_raw, k_raw, v_raw, wq, wk, slot_mapping, k_pool, v_pool, k_scale,
+        v_scale, num_q_heads, num_kv_heads, head_size, block_size, rope_dims,
+        rope_base, kv_mode, /*in_eval_gpu=*/false,
+        "mlx_qwen35_paged_qkv_prep_forward");
+
+    const int num_tokens = q_raw.shape(1);
+    const int chunk_stride = paged_prefill_stride(num_tokens);
+    const int group = num_q_heads / num_kv_heads;
+    auto fallback = [](std::vector<array>) -> std::vector<array> {
+      throw std::runtime_error("Qwen35QkvPrep has no fallback implementation");
+    };
+    auto prim = std::make_shared<Qwen35QkvPrep>(
+        s, std::move(fallback), num_q_heads, num_kv_heads, head_size,
+        block_size, rope_dims, rope_offset, eps, rope_base, rope_scale, kv_mode);
+    auto results = array::make_arrays(
+        {Shape{num_kv_heads, chunk_stride, group, head_size},
+         k_pool.shape(),
+         v_pool.shape(),
+         k_scale.shape(),
+         v_scale.shape()},
+        {bfloat16, k_pool.dtype(), v_pool.dtype(), k_scale.dtype(), v_scale.dtype()},
+        std::move(prim),
+        {q_raw, k_raw, v_raw, wq, wk, slot_mapping, k_pool, v_pool, k_scale, v_scale});
+    auto q_staged_out = std::make_unique<array>(std::move(results[0]));
+    auto k_pool_out = std::make_unique<array>(std::move(results[1]));
+    auto v_pool_out = std::make_unique<array>(std::move(results[2]));
+    auto k_scale_out = std::make_unique<array>(std::move(results[3]));
+    auto v_scale_out = std::make_unique<array>(std::move(results[4]));
+    *out_q_staged = reinterpret_cast<mlx_array*>(q_staged_out.release());
+    *out_k_pool = reinterpret_cast<mlx_array*>(k_pool_out.release());
+    *out_v_pool = reinterpret_cast<mlx_array*>(v_pool_out.release());
+    *out_k_scale = reinterpret_cast<mlx_array*>(k_scale_out.release());
+    *out_v_scale = reinterpret_cast<mlx_array*>(v_scale_out.release());
+    return true;
+  } catch (const std::exception& e) {
+    mlx_trace_native_error("qwen35_paged_qkv_prep_forward", e.what());
+    return false;
+  } catch (...) {
+    mlx_trace_native_error("qwen35_paged_qkv_prep_forward", "unknown exception");
+    return false;
+  }
+}
+
+/// Production FFI: emit a `PagedPrefillAttention` (queries staged inside), or
+/// `PagedPrefillAttentionGated` when an armed `PendingPrefillScope` supplies
+/// pre-staged queries and/or a BF16 gate tensor. Returns false on a validation
+/// error; the outputs stay lazy.
 bool mlx_paged_prefill_attention_forward(
     mlx_array* q_ptr,
     mlx_array* k_pool_ptr,
@@ -3627,14 +4621,133 @@ bool mlx_paged_prefill_attention_forward(
     using namespace mlx::core;
     using namespace mlx::core::fast;
     require_known_kv_dtype(kv_dtype_raw);
+    const auto& q = *reinterpret_cast<array*>(q_ptr);
+    const auto& k_pool = *reinterpret_cast<array*>(k_pool_ptr);
+    const auto& v_pool = *reinterpret_cast<array*>(v_pool_ptr);
+    const auto& k_scale = *reinterpret_cast<array*>(k_scale_ptr);
+    const auto& v_scale = *reinterpret_cast<array*>(v_scale_ptr);
+    const auto& block_table = *reinterpret_cast<array*>(block_table_ptr);
+    const auto& workspace = *reinterpret_cast<array*>(workspace_ptr);
+    const auto kv_dtype = static_cast<KvDtype>(kv_dtype_raw);
+
+    auto& scope = g_pending_prefill_scope;
+    bool scope_matched = false;
+    int matched_piece_rows = 0;
+    if (scope.active &&
+        num_q_heads == scope.expected_num_q_heads &&
+        num_kv_heads == scope.expected_num_kv_heads &&
+        head_size == scope.expected_head_size &&
+        q.ndim() == 3 && q.shape(1) == num_q_heads && q.shape(2) == head_size &&
+        committed_tokens == scope.base_committed + scope.consumed_rows) {
+      const int piece_rows = q.shape(0);
+      if (piece_rows > 0 && scope.consumed_rows + piece_rows <= scope.total_rows) {
+        scope_matched = true;
+        matched_piece_rows = piece_rows;
+        if (std::abs(scale * std::sqrt(static_cast<float>(head_size)) - 1.0f) > 1e-6f) {
+          prefill_reject("paged_prefill_attention_gated", "scale must be 1/sqrt(head_size)");
+        }
+        auto s = to_stream(StreamOrDevice{});
+        const int row_offset = committed_tokens - scope.base_committed;
+        const int group = num_q_heads / num_kv_heads;
+        bool use_pre_staged = false;
+        if (scope.q_staged.has_value()) {
+          const auto& qs = *scope.q_staged;
+          const int padded_piece_rows = ((piece_rows + 7) / 8) * 8;
+          if (qs.ndim() == 4 && qs.shape(0) == num_kv_heads &&
+              qs.shape(2) == group && qs.shape(3) == head_size) {
+            const int chunk_stride = qs.shape(1);
+            if (chunk_stride >= piece_rows &&
+                chunk_stride <= paged::kPagedPrefillMaxRows &&
+                chunk_stride % 32 == 0 &&
+                row_offset + padded_piece_rows <= chunk_stride &&
+                (piece_rows % 8 == 0 || row_offset + piece_rows == scope.total_rows)) {
+              use_pre_staged = true;
+            }
+          }
+        }
+        std::optional<array> piece_gate;
+        if (scope.gate_2d.has_value()) {
+          const int gate_cols = num_q_heads * head_size;
+          if (row_offset == 0 && piece_rows == scope.total_rows) {
+            piece_gate = *scope.gate_2d;
+          } else {
+            piece_gate = slice(
+                *scope.gate_2d,
+                {row_offset, 0},
+                {row_offset + piece_rows, gate_cols},
+                s);
+          }
+        }
+        if (use_pre_staged || piece_gate.has_value()) {
+          array staged_q = [&]() {
+            if (use_pre_staged) {
+              return *scope.q_staged;
+            }
+            const int stride = paged_prefill_stride(piece_rows);
+            array staged = transpose(
+                reshape(
+                    astype(q, bfloat16, s),
+                    {piece_rows, num_kv_heads, group, head_size},
+                    s),
+                {1, 0, 2, 3},
+                s);
+            return stride == piece_rows
+                ? contiguous(staged, false, s)
+                : pad(
+                      staged,
+                      {1},
+                      {0},
+                      {stride - piece_rows},
+                      array(0.0f, bfloat16),
+                      "constant",
+                      s);
+          }();
+          const int q_row_offset = use_pre_staged ? row_offset : 0;
+          auto results = paged_prefill_attention_gated(
+              staged_q,
+              k_pool,
+              v_pool,
+              k_scale,
+              v_scale,
+              block_table,
+              workspace,
+              committed_tokens,
+              piece_rows,
+              splits,
+              max_splits,
+              block_size,
+              num_q_heads,
+              num_kv_heads,
+              head_size,
+              kv_dtype,
+              int8_queries,
+              q_row_offset,
+              piece_gate,
+              s);
+          auto out_attn = std::make_unique<array>(std::move(results[0]));
+          auto out_ws = std::make_unique<array>(std::move(results[1]));
+          scope.consumed_rows += piece_rows;
+          if (piece_gate.has_value()) {
+            scope.gate_fused_rows += piece_rows;
+          }
+          if (scope.consumed_rows == scope.total_rows) {
+            scope.active = false;
+          }
+          *out_attention = reinterpret_cast<mlx_array*>(out_attn.release());
+          *out_workspace = reinterpret_cast<mlx_array*>(out_ws.release());
+          return true;
+        }
+      }
+    }
+
     auto results = paged_prefill_attention(
-        *reinterpret_cast<array*>(q_ptr),
-        *reinterpret_cast<array*>(k_pool_ptr),
-        *reinterpret_cast<array*>(v_pool_ptr),
-        *reinterpret_cast<array*>(k_scale_ptr),
-        *reinterpret_cast<array*>(v_scale_ptr),
-        *reinterpret_cast<array*>(block_table_ptr),
-        *reinterpret_cast<array*>(workspace_ptr),
+        q,
+        k_pool,
+        v_pool,
+        k_scale,
+        v_scale,
+        block_table,
+        workspace,
         committed_tokens,
         splits,
         max_splits,
@@ -3642,11 +4755,19 @@ bool mlx_paged_prefill_attention_forward(
         num_q_heads,
         num_kv_heads,
         head_size,
-        static_cast<KvDtype>(kv_dtype_raw),
+        kv_dtype,
         int8_queries,
         scale);
-    *out_attention = reinterpret_cast<mlx_array*>(new array(std::move(results[0])));
-    *out_workspace = reinterpret_cast<mlx_array*>(new array(std::move(results[1])));
+    auto out_attn = std::make_unique<array>(std::move(results[0]));
+    auto out_ws = std::make_unique<array>(std::move(results[1]));
+    if (scope_matched) {
+      scope.consumed_rows += matched_piece_rows;
+      if (scope.consumed_rows == scope.total_rows) {
+        scope.active = false;
+      }
+    }
+    *out_attention = reinterpret_cast<mlx_array*>(out_attn.release());
+    *out_workspace = reinterpret_cast<mlx_array*>(out_ws.release());
     return true;
   } catch (const std::exception& e) {
     mlx_trace_native_error("paged_prefill_attention_forward", e.what());

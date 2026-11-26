@@ -145,10 +145,10 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use napi_derive::napi;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::array::memory::{
-    get_active_memory, get_cache_memory, get_peak_memory, set_cache_limit,
+    SetCacheLimitError, get_active_memory, get_cache_memory, get_peak_memory, set_cache_limit,
     synchronize_and_clear_cache,
 };
 use crate::stream::WiredLimitContext;
@@ -176,6 +176,18 @@ const GIB: u64 = 1u64 << 30;
 /// 1 GiB so it has something to reuse — MLX will churn but at least the
 /// model runs instead of thrashing the allocator on every step.
 const MIN_FREELIST_BYTES: u64 = GIB;
+
+#[derive(Clone, Copy)]
+enum ApplyLogLevel {
+    Info,
+    Debug,
+}
+
+#[derive(Clone, Copy)]
+struct PolicyOverride {
+    wired: u64,
+    headroom: u64,
+}
 
 struct CoordState {
     next_id: u64,
@@ -219,6 +231,9 @@ impl CoordState {
 struct AppliedCacheLimit {
     last_applied: Option<usize>,
     before_scoped_limits: Option<usize>,
+    /// True after a failed `set_cache_limit` so the next successful apply
+    /// promotes to `INFO` even when triggered by a `Debug`-level path.
+    last_apply_failed: bool,
 }
 
 impl AppliedCacheLimit {
@@ -237,8 +252,12 @@ impl AppliedCacheLimit {
         let previous = if self.last_applied == Some(target) {
             target
         } else {
-            let Some(previous) = set(target) else { return };
+            let Some(previous) = set(target) else {
+                self.last_apply_failed = true;
+                return;
+            };
             self.last_applied = Some(target);
+            self.last_apply_failed = false;
             previous
         };
         if ceiling.is_some() {
@@ -261,6 +280,15 @@ pub struct CacheLimitCoordinator {
     /// notifies the process-wide memory governor. Local test coordinators
     /// run identical pool accounting without mutating global allocator state.
     global: bool,
+    /// Test-only fake `set_cache_limit` sink so unit tests can exercise the
+    /// full coordinator -> `recompute` -> `apply_limit_with` path without
+    /// touching the process-wide coordinator or Metal FFI.
+    #[cfg(test)]
+    test_cap: Option<Mutex<f64>>,
+    /// Test-only fixed policy budget so log-level tests never read or mutate
+    /// process-wide env vars or clamp on memory-limited container runners.
+    #[cfg(test)]
+    test_policy: Option<PolicyOverride>,
 }
 
 impl CacheLimitCoordinator {
@@ -283,6 +311,10 @@ impl CacheLimitCoordinator {
                 limit: AppliedCacheLimit::default(),
             }),
             global,
+            #[cfg(test)]
+            test_cap: None,
+            #[cfg(test)]
+            test_policy: None,
         }
     }
 
@@ -291,9 +323,41 @@ impl CacheLimitCoordinator {
         Self::new()
     }
 
-    fn finish_pool_mutation(&self, mut state: std::sync::MutexGuard<'_, CoordState>) {
+    #[cfg(test)]
+    fn new_for_log_test() -> Self {
+        let mut coord = Self::new();
+        coord.test_cap = Some(Mutex::new(0.0));
+        coord.test_policy = Some(PolicyOverride {
+            wired: 64 * GIB,
+            headroom: 0,
+        });
+        coord
+    }
+
+    fn recompute(&self, state: &mut CoordState, log_level: ApplyLogLevel) {
         if self.global {
-            recompute_locked(&mut state);
+            recompute_locked(state, log_level);
+        }
+        #[cfg(test)]
+        if !self.global
+            && let Some(cap) = &self.test_cap
+        {
+            recompute_locked_with(state, log_level, self.test_policy, |b| {
+                let mut g = cap.lock().unwrap_or_else(|e| e.into_inner());
+                let prev = *g;
+                *g = b;
+                Ok(prev)
+            });
+        }
+    }
+
+    fn finish_pool_mutation(
+        &self,
+        mut state: std::sync::MutexGuard<'_, CoordState>,
+        log_level: ApplyLogLevel,
+    ) {
+        self.recompute(&mut state, log_level);
+        if self.global {
             drop(state);
             pools_changed();
         }
@@ -310,7 +374,7 @@ impl CacheLimitCoordinator {
         state.next_id = state.next_id.saturating_add(1);
         if cap_bytes > 0 {
             state.decode_limits.insert(id, cap_bytes);
-            recompute_locked(&mut state);
+            self.recompute(&mut state, ApplyLogLevel::Debug);
         }
         DecodeCacheLimitGuard { id }
     }
@@ -318,7 +382,7 @@ impl CacheLimitCoordinator {
     fn pop_decode_limit(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.decode_limits.remove(&id).is_some() {
-            recompute_locked(&mut state);
+            self.recompute(&mut state, ApplyLogLevel::Debug);
         }
     }
 
@@ -373,7 +437,7 @@ impl CacheLimitCoordinator {
                 weight_bytes as f64 / ONE_GIB,
                 state.profiles.len(),
             );
-            recompute_locked(&mut state);
+            self.recompute(&mut state, ApplyLogLevel::Info);
             id
         };
         CacheLimitGuard { id }
@@ -422,9 +486,7 @@ impl CacheLimitCoordinator {
             pool_bytes as f64 / ONE_GIB,
             state.pools.len(),
         );
-        recompute_locked(&mut state);
-        drop(state);
-        pools_changed();
+        self.finish_pool_mutation(state, ApplyLogLevel::Info);
         Some(PoolCacheLimitGuard { id })
     }
 
@@ -432,24 +494,20 @@ impl CacheLimitCoordinator {
     /// debited by memory that MLX's own allocator counters cannot see. Reserve
     /// restore staging up front, avoiding callbacks under the pool upload locks.
     pub fn register_pool(&self, pool_bytes: u64) -> PoolCacheLimitGuard {
-        let id = {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let id = state.next_id;
-            state.next_id = state.next_id.saturating_add(1);
-            state.pools.insert(
-                id,
-                pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
-            );
-            info!(
-                "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
-                id,
-                pool_bytes as f64 / ONE_GIB,
-                state.pools.len(),
-            );
-            recompute_locked(&mut state);
-            id
-        };
-        pools_changed();
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let id = state.next_id;
+        state.next_id = state.next_id.saturating_add(1);
+        state.pools.insert(
+            id,
+            pool_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES),
+        );
+        info!(
+            "[cache_limit] register paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            pool_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        self.finish_pool_mutation(state, ApplyLogLevel::Info);
         PoolCacheLimitGuard { id }
     }
 
@@ -460,27 +518,24 @@ impl CacheLimitCoordinator {
     /// already dropped) or the byte total is unchanged.
     pub fn update_pool(&self, id: u64, new_bytes: u64) {
         let new_bytes = new_bytes.saturating_add(mlx_paged_attn::RESTORE_STAGING_BYTES);
-        {
-            let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let Some(bytes) = state.pools.get_mut(&id) else {
-                return;
-            };
-            if *bytes == new_bytes {
-                return;
-            }
-            *bytes = new_bytes;
-            info!(
-                "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
-                id,
-                new_bytes as f64 / ONE_GIB,
-                state.pools.len(),
-            );
-            recompute_locked(&mut state);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(bytes) = state.pools.get_mut(&id) else {
+            return;
+        };
+        if *bytes == new_bytes {
+            return;
         }
-        pools_changed();
+        *bytes = new_bytes;
+        info!(
+            "[cache_limit] update paged pool guard={} bytes={:.2} GB (live_pools={})",
+            id,
+            new_bytes as f64 / ONE_GIB,
+            state.pools.len(),
+        );
+        self.finish_pool_mutation(state, ApplyLogLevel::Info);
     }
 
-    /// Register a host-resident memory pool (e.g. Inkling2's flat host-RAM state
+    /// Register a host-resident memory pool (e.g. Inkling2's host-RAM state
     /// store) without adding paged-KV `RESTORE_STAGING_BYTES`. Its exact byte
     /// total is included in [`Self::registered_pool_bytes`] so both the MLX
     /// cache ceiling and the memory governor charge it alongside private Metal
@@ -520,7 +575,7 @@ impl CacheLimitCoordinator {
             bytes as f64 / (1u64 << 20) as f64,
             state.pools.len(),
         );
-        self.finish_pool_mutation(state);
+        self.finish_pool_mutation(state, ApplyLogLevel::Info);
         id
     }
 
@@ -536,7 +591,7 @@ impl CacheLimitCoordinator {
             return;
         }
         *bytes = new_bytes;
-        self.finish_pool_mutation(state);
+        self.finish_pool_mutation(state, ApplyLogLevel::Debug);
     }
 
     fn unregister(&self, id: u64) {
@@ -544,14 +599,14 @@ impl CacheLimitCoordinator {
         if state.profiles.remove(&id).is_some() {
             // Recompute the surviving policy, restoring the pre-ceiling cap
             // when the last temporary model constraint disappears.
-            recompute_locked(&mut state);
+            self.recompute(&mut state, ApplyLogLevel::Info);
         }
     }
 
     fn unregister_pool(&self, id: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.pools.remove(&id).is_some() {
-            self.finish_pool_mutation(state);
+            self.finish_pool_mutation(state, ApplyLogLevel::Info);
         }
     }
 }
@@ -743,8 +798,17 @@ struct CachePolicy {
     allow_decode_limit: bool,
 }
 
-fn recompute_locked(state: &mut CoordState) {
-    let policy = cache_policy(state);
+fn recompute_locked(state: &mut CoordState, log_level: ApplyLogLevel) {
+    recompute_locked_with(state, log_level, None, set_cache_limit);
+}
+
+fn recompute_locked_with(
+    state: &mut CoordState,
+    log_level: ApplyLogLevel,
+    policy_override: Option<PolicyOverride>,
+    set: impl FnOnce(f64) -> Result<f64, SetCacheLimitError>,
+) {
+    let policy = cache_policy_with(state, policy_override);
     let ceiling = state.scoped_cache_ceiling(policy.allow_decode_limit);
     let source = match ceiling {
         Some(bytes) => format!(
@@ -754,15 +818,27 @@ fn recompute_locked(state: &mut CoordState) {
         ),
         None => policy.source,
     };
-    state
-        .limit
-        .update(policy.limit, ceiling, |bytes| apply_limit(bytes, &source));
+    let effective_level = if state.limit.last_apply_failed {
+        ApplyLogLevel::Info
+    } else {
+        log_level
+    };
+    state.limit.update(policy.limit, ceiling, |bytes| {
+        apply_limit_with(bytes, &source, effective_level, set)
+    });
+}
+
+#[cfg(test)]
+fn cache_policy(state: &CoordState) -> CachePolicy {
+    cache_policy_with(state, None)
 }
 
 /// Select the process policy independently of model and decode ceilings.
 /// None means leave the allocator unmanaged, not a zero-byte pool.
-fn cache_policy(state: &CoordState) -> CachePolicy {
-    if let Ok(raw) = std::env::var(CACHE_LIMIT_ENV) {
+fn cache_policy_with(state: &CoordState, policy_override: Option<PolicyOverride>) -> CachePolicy {
+    if policy_override.is_none()
+        && let Ok(raw) = std::env::var(CACHE_LIMIT_ENV)
+    {
         let trimmed = raw.trim();
         match trimmed.parse::<f64>() {
             Ok(gib) if gib <= 0.0 => {
@@ -804,16 +880,27 @@ fn cache_policy(state: &CoordState) -> CachePolicy {
             allow_decode_limit: true,
         };
     }
-    let wired = {
+    let budget = policy_override.unwrap_or_else(|| {
         let metal_wired = WiredLimitContext::get_max_working_set_size() as u64;
-        if metal_wired > 0 {
+        let wired = if metal_wired > 0 {
             metal_wired
         } else {
             crate::accelerator::caps().total_device_bytes
-        }
-    };
-    let limit = compute_cache_limit(summed_weights, summed_pools, wired);
-    let source = if wired == 0 {
+        };
+        let headroom = if wired == 0 {
+            0
+        } else {
+            estimate_user_headroom(wired)
+        };
+        PolicyOverride { wired, headroom }
+    });
+    let limit = compute_cache_limit_with_headroom(
+        summed_weights,
+        summed_pools,
+        budget.wired,
+        budget.headroom,
+    );
+    let source = if budget.wired == 0 {
         format!(
             "auto (weights={:.1}GB, pools={:.1}GB, wired=0 → fallback cap={:.1}GB, live_guards={})",
             summed_weights as f64 / ONE_GIB,
@@ -826,9 +913,9 @@ fn cache_policy(state: &CoordState) -> CachePolicy {
             "auto (weights={:.1}GB, pools={:.1}GB, overhead={:.1}GB, headroom={:.1}GB, wired={:.1}GB → cap={:.1}GB, live_guards={})",
             summed_weights as f64 / ONE_GIB,
             summed_pools as f64 / ONE_GIB,
-            estimate_metal_overhead(wired) as f64 / ONE_GIB,
-            estimate_user_headroom(wired) as f64 / ONE_GIB,
-            wired as f64 / ONE_GIB,
+            estimate_metal_overhead(budget.wired) as f64 / ONE_GIB,
+            budget.headroom as f64 / ONE_GIB,
+            budget.wired as f64 / ONE_GIB,
             limit as f64 / ONE_GIB,
             state.profiles.len(),
         )
@@ -867,9 +954,19 @@ fn estimate_user_headroom(wired: u64) -> u64 {
     core::cmp::max(4 * GIB, wired / 10)
 }
 
-/// Compute the freelist cap from total weight bytes and the Metal
-/// wired limit, using the budget formula described at the top of this
-/// module.
+#[cfg(test)]
+fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
+    let headroom = if wired == 0 {
+        0
+    } else {
+        estimate_user_headroom(wired)
+    };
+    compute_cache_limit_with_headroom(weights, pool_bytes, wired, headroom)
+}
+
+/// Compute the freelist cap from total weight bytes, private pool bytes,
+/// wired limit, and user headroom, using the budget formula described at the
+/// top of this module.
 ///
 /// Contract:
 ///   - `wired == 0` → assume non-Metal or failed query, fall back to
@@ -878,7 +975,12 @@ fn estimate_user_headroom(wired: u64) -> u64 {
 ///     [`MIN_FREELIST_BYTES`] (tight-fit floor).
 ///   - otherwise → `wired - weights - pool_bytes - overhead - headroom`, clamped to
 ///     at least [`MIN_FREELIST_BYTES`].
-fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
+fn compute_cache_limit_with_headroom(
+    weights: u64,
+    pool_bytes: u64,
+    wired: u64,
+    headroom: u64,
+) -> u64 {
     if wired == 0 {
         return weights
             .saturating_mul(3)
@@ -887,7 +989,6 @@ fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
             .max(MIN_FREELIST_BYTES);
     }
     let overhead = estimate_metal_overhead(wired);
-    let headroom = estimate_user_headroom(wired);
     let reserved = weights
         .saturating_add(pool_bytes)
         .saturating_add(overhead)
@@ -898,27 +999,45 @@ fn compute_cache_limit(weights: u64, pool_bytes: u64, wired: u64) -> u64 {
     (wired - reserved).max(MIN_FREELIST_BYTES)
 }
 
-/// Push a freshly computed cap through `set_cache_limit`. Returns the prior cap
-/// when the FFI succeeded so the caller can update `last_applied`; `None`
-/// indicates the FFI caught a C++ exception (degraded Metal) and the cap
-/// was NOT applied — the caller MUST leave `last_applied` untouched so
-/// the next register/unregister cycle retries.
+/// Push a freshly computed cap through `set` (production: [`set_cache_limit`]).
+/// Returns the prior cap when the FFI succeeded so the caller can update
+/// `last_applied`; `None` indicates the FFI caught a C++ exception (degraded
+/// Metal) and the cap was NOT applied — the caller MUST leave `last_applied`
+/// untouched so the next register/unregister cycle retries.
 ///
 /// Logging:
-///   - success → `info!` with the new cap, source, and previous cap.
-///   - failure → `warn!` so an operator can grep logs for the explicit
-///     failure reason instead of having to reason about a silent retry
-///     loop.
+///   - success (`ApplyLogLevel::Info`) → `info!` for structural lifecycle
+///     events (model/pool register, grow, unregister) with the new cap,
+///     source, and previous cap.
+///   - success (`ApplyLogLevel::Debug`) → `debug!` for high-frequency
+///     per-turn / per-state updates (`push_decode_limit`, `pop_decode_limit`,
+///     `update_host_pool`) with the exact same message format.
+///   - failure → always `warn!` regardless of `log_level` so an operator
+///     can grep logs for the explicit failure reason instead of having to
+///     reason about a silent retry loop.
 #[must_use]
-fn apply_limit(bytes: usize, source: &str) -> Option<usize> {
-    match set_cache_limit(bytes as f64) {
+fn apply_limit_with(
+    bytes: usize,
+    source: &str,
+    log_level: ApplyLogLevel,
+    set: impl FnOnce(f64) -> Result<f64, SetCacheLimitError>,
+) -> Option<usize> {
+    match set(bytes as f64) {
         Ok(prev) => {
-            info!(
-                "[cache_limit] cache pool cap set to {:.2} GB ({}); previous = {:.2} GB",
-                bytes as f64 / ONE_GIB,
-                source,
-                prev / ONE_GIB,
-            );
+            match log_level {
+                ApplyLogLevel::Info => info!(
+                    "[cache_limit] cache pool cap set to {:.2} GB ({}); previous = {:.2} GB",
+                    bytes as f64 / ONE_GIB,
+                    source,
+                    prev / ONE_GIB,
+                ),
+                ApplyLogLevel::Debug => debug!(
+                    "[cache_limit] cache pool cap set to {:.2} GB ({}); previous = {:.2} GB",
+                    bytes as f64 / ONE_GIB,
+                    source,
+                    prev / ONE_GIB,
+                ),
+            }
             Some(prev as usize)
         }
         Err(err) => {
@@ -1402,35 +1521,42 @@ mod tests {
 
     #[test]
     fn host_pool_guard_tracks_exact_bytes_without_restore_staging() {
-        let _lock = POOL_LOCK.lock().unwrap();
-        let before = coordinator().registered_pool_bytes();
-        let guard = coordinator().register_host_pool(64 << 20);
+        let local = std::sync::Arc::new(CacheLimitCoordinator::new_for_test());
+        assert_eq!(local.registered_pool_bytes(), 0);
+        let guard = local.register_host_pool_local(64 << 20);
         assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
+            local.registered_pool_bytes(),
             64 << 20,
-            "register_host_pool must charge exact bytes without RESTORE_STAGING_BYTES"
+            "register_host_pool_local must charge exact bytes without RESTORE_STAGING_BYTES"
         );
         guard.update(96 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            96 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 96 << 20);
         guard.update(96 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            96 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 96 << 20);
         guard.update(16 << 20);
-        assert_eq!(
-            coordinator().registered_pool_bytes().saturating_sub(before),
-            16 << 20
-        );
+        assert_eq!(local.registered_pool_bytes(), 16 << 20);
         drop(guard);
         assert_eq!(
-            coordinator().registered_pool_bytes(),
-            before,
-            "dropping HostPoolCacheLimitGuard must unregister exact bytes"
+            local.registered_pool_bytes(),
+            0,
+            "dropping HostPoolCacheLimitGuard must unregister its host pool bytes"
         );
+
+        let _lock = POOL_LOCK.lock().unwrap();
+        let before = coordinator().registered_pool_bytes();
+        let global_guard = coordinator().register_host_pool(32 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            32 << 20,
+            "global register_host_pool must also charge exact bytes without RESTORE_STAGING_BYTES"
+        );
+        global_guard.update(48 << 20);
+        assert_eq!(
+            coordinator().registered_pool_bytes().saturating_sub(before),
+            48 << 20
+        );
+        drop(global_guard);
+        assert_eq!(coordinator().registered_pool_bytes(), before);
     }
 
     // ── env override: MLX_GPU_HEADROOM_GB ─────────────────────────
@@ -1559,5 +1685,217 @@ mod tests {
         clear_headroom_env();
         // 192 / 10 = 19.2 GB > 4 GB floor.
         assert_eq!(estimate_user_headroom(192 * GB), 192 * GB / 10);
+    }
+
+    // ── log level separation ──────────────────────────────────────
+
+    #[derive(Clone, Default)]
+    struct LogRecorder(std::sync::Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            if field.name() == "message" {
+                self.0 = value.to_string();
+            }
+        }
+
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = format!("{value:?}");
+            }
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::layer::Layer<S> for LogRecorder {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().target() != "mlx_core::cache_limit" {
+                return;
+            }
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0
+                .lock()
+                .unwrap()
+                .push((*event.metadata().level(), visitor.0));
+        }
+    }
+
+    fn capture_cache_limit_logs<R>(f: impl FnOnce() -> R) -> (R, Vec<(tracing::Level, String)>) {
+        use tracing_subscriber::prelude::*;
+
+        let recorder = LogRecorder::default();
+        let out = tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(recorder.clone()),
+            f,
+        );
+        let events = std::mem::take(&mut *recorder.0.lock().unwrap());
+        (out, events)
+    }
+
+    fn cap_set_levels(events: &[(tracing::Level, String)]) -> Vec<tracing::Level> {
+        events
+            .iter()
+            .filter(|(_, msg)| msg.contains("cache pool cap set to"))
+            .map(|(level, _)| *level)
+            .collect()
+    }
+
+    #[test]
+    fn apply_limit_log_levels_separate_lifecycle_from_high_frequency_updates() {
+        let coord = std::sync::Arc::new(CacheLimitCoordinator::new_for_log_test());
+
+        let (model1, events) = capture_cache_limit_logs(|| coord.register(16 << 20));
+        let model1_id = model1.id;
+        std::mem::forget(model1);
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let (model2, events) = capture_cache_limit_logs(|| coord.register(16 << 20));
+        let model2_id = model2.id;
+        std::mem::forget(model2);
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let (paged_pool, events) = capture_cache_limit_logs(|| coord.register_pool(16 << 20));
+        let paged_pool_id = paged_pool.id();
+        std::mem::forget(paged_pool);
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let ((), events) = capture_cache_limit_logs(|| coord.update_pool(paged_pool_id, 32 << 20));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let current_total = coord.registered_pool_bytes();
+        let (cas_pool, events) = capture_cache_limit_logs(|| {
+            coord.try_register_pool_if_total_eq(current_total, 16 << 20)
+        });
+        let cas_pool = cas_pool.expect("matching snapshot must reserve");
+        let cas_pool_id = cas_pool.id();
+        std::mem::forget(cas_pool);
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let (host_pool, events) =
+            capture_cache_limit_logs(|| coord.register_host_pool_local(16 << 20));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        // High-frequency per-state / per-turn mutations must emit at DEBUG,
+        // never at INFO.
+        let ((), events) = capture_cache_limit_logs(|| host_pool.update(32 << 20));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::DEBUG]);
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::INFO),
+            "update_host_pool must not emit INFO logs: {events:?}"
+        );
+
+        let (decode_guard, events) =
+            capture_cache_limit_logs(|| coord.push_decode_limit(DECODE_CACHE_LIMIT_FLOOR));
+        let decode_id = decode_guard.id;
+        std::mem::forget(decode_guard);
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::DEBUG]);
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::INFO),
+            "push_decode_limit must not emit INFO logs: {events:?}"
+        );
+
+        let ((), events) = capture_cache_limit_logs(|| coord.pop_decode_limit(decode_id));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::DEBUG]);
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::INFO),
+            "pop_decode_limit must not emit INFO logs: {events:?}"
+        );
+
+        // Structural teardown transitions still emit at INFO.
+        let ((), events) = capture_cache_limit_logs(|| drop(host_pool));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let ((), events) = capture_cache_limit_logs(|| coord.unregister_pool(cas_pool_id));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let ((), events) = capture_cache_limit_logs(|| coord.unregister_pool(paged_pool_id));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        let ((), events) = capture_cache_limit_logs(|| coord.unregister(model2_id));
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+
+        coord.unregister(model1_id);
+
+        // Failures always emit WARN regardless of ApplyLogLevel.
+        for log_level in [ApplyLogLevel::Debug, ApplyLogLevel::Info] {
+            let (applied, events) = capture_cache_limit_logs(|| {
+                apply_limit_with(128 << 20, "test error", log_level, |_| {
+                    Err(SetCacheLimitError)
+                })
+            });
+            assert_eq!(applied, None);
+            assert_eq!(
+                events.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+                vec![tracing::Level::WARN],
+            );
+            assert!(
+                events[0].1.contains("FAILED"),
+                "expected failure message in warn log: {events:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_apply_promotes_next_debug_recovery_to_info() {
+        const TEST_POLICY: Option<PolicyOverride> = Some(PolicyOverride {
+            wired: 64 * GIB,
+            headroom: 0,
+        });
+
+        let coord = CacheLimitCoordinator::new_for_log_test();
+        let mut state = coord.state.lock().unwrap();
+        state.profiles.insert(
+            1,
+            ModelCacheProfile {
+                weight_bytes: 16 << 20,
+                cache_limit: None,
+            },
+        );
+
+        // 1. Failed apply on a Debug path emits WARN and records recovery pending.
+        let ((), events) = capture_cache_limit_logs(|| {
+            recompute_locked_with(&mut state, ApplyLogLevel::Debug, TEST_POLICY, |_| {
+                Err(SetCacheLimitError)
+            });
+        });
+        assert_eq!(
+            events.iter().map(|(level, _)| *level).collect::<Vec<_>>(),
+            vec![tracing::Level::WARN],
+        );
+        assert!(state.limit.last_apply_failed);
+
+        // 2. Next successful Debug apply promotes to INFO so recovery is visible.
+        let ((), events) = capture_cache_limit_logs(|| {
+            recompute_locked_with(&mut state, ApplyLogLevel::Debug, TEST_POLICY, |_| Ok(0.0));
+        });
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::INFO]);
+        assert!(!state.limit.last_apply_failed);
+
+        // 3. Subsequent routine Debug apply returns to DEBUG.
+        state.decode_limits.insert(2, DECODE_CACHE_LIMIT_FLOOR);
+        let ((), events) = capture_cache_limit_logs(|| {
+            recompute_locked_with(&mut state, ApplyLogLevel::Debug, TEST_POLICY, |_| {
+                Ok((59 * GIB) as f64)
+            });
+        });
+        assert_eq!(cap_set_levels(&events), vec![tracing::Level::DEBUG]);
+        assert!(
+            events
+                .iter()
+                .all(|(level, _)| *level != tracing::Level::INFO),
+            "routine post-recovery Debug apply must not emit INFO: {events:?}"
+        );
     }
 }

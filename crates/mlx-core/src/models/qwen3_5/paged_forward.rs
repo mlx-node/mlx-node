@@ -410,6 +410,9 @@ thread_local! {
     /// Layers this thread queued while building a paged forward.
     pub(crate) static PAGED_LAYER_SUBMITS: std::cell::Cell<u64> =
         const { std::cell::Cell::new(0) };
+    /// Layer-interval barriers this thread submitted during paged prefill.
+    pub(crate) static PAGED_PREFILL_LAYER_SUBMITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
     /// Replaces the [`VerifySubmit`] of the DFlash2 verify entries and the
     /// verify wave on this thread.
     pub(crate) static DFLASH2_VERIFY_SUBMIT_OVERRIDE: std::cell::Cell<Option<VerifySubmit>> =
@@ -445,6 +448,57 @@ fn submit_paged_layer(layer_idx: usize, num_layers: usize, early_layers: usize, 
         #[cfg(test)]
         PAGED_LAYER_SUBMITS.with(|submits| submits.set(submits.get() + 1));
         MxArray::async_eval_arrays(&[hidden]);
+    }
+}
+
+/// Whether `layer_idx` sits on an interior paged-prefill submission boundary.
+/// Skips `layer_idx + 1 >= layers_end` because `end_launch` / `end_unit` /
+/// pass-pause / chunk-end evaluation immediately follows.
+fn should_submit_paged_prefill_layer(layer_idx: usize, layers_end: usize, interval: i32) -> bool {
+    if interval <= 0 {
+        return false;
+    }
+    let next = layer_idx + 1;
+    next < layers_end && next.is_multiple_of(interval as usize)
+}
+
+/// Periodically submit completed paged-prefill layers so MLX detaches the lazy
+/// graph and bounds in-flight activation memory without draining the Metal GPU
+/// queue on every barrier.
+///
+/// On Metal (`supports_async_overlap()`), submits `hidden` asynchronously with
+/// no synchronous host wait and no `clear_cache()` wipe — MLX's `eval_impl`,
+/// memory limit, Metal auto-commit, and inter-chunk
+/// `synchronize_and_clear_cache()` bound live allocations while keeping the GPU
+/// pipeline fed. Off Metal (CUDA / CPU), where `async_eval_arrays_with_context`
+/// does not guard CUDA, falls back to synchronous `eval_arrays_with_context` +
+/// `clear_cache()`.
+fn maybe_submit_paged_prefill_layer(
+    layer_idx: usize,
+    layers_end: usize,
+    hidden: &MxArray,
+) -> Result<()> {
+    let interval = crate::array::paged_prefill_eval_interval();
+    maybe_submit_paged_prefill_layer_with_interval(layer_idx, layers_end, interval, hidden)
+}
+
+fn maybe_submit_paged_prefill_layer_with_interval(
+    layer_idx: usize,
+    layers_end: usize,
+    interval: i32,
+    hidden: &MxArray,
+) -> Result<()> {
+    if !should_submit_paged_prefill_layer(layer_idx, layers_end, interval) {
+        return Ok(());
+    }
+    #[cfg(test)]
+    PAGED_PREFILL_LAYER_SUBMITS.with(|submits| submits.set(submits.get() + 1));
+    if crate::accelerator::supports_async_overlap() {
+        MxArray::async_eval_arrays_with_context(&[hidden], "paged_prefill_layer_barrier")
+    } else {
+        MxArray::eval_arrays_with_context(&[hidden], "paged_prefill_layer_barrier")?;
+        crate::array::clear_cache();
+        Ok(())
     }
 }
 
@@ -1642,6 +1696,7 @@ fn run_paged_prefill_layers(
     debug_assert_eq!(layers.len(), layer_kinds.len());
     let rope_position_offset = paged_rope_offset(launch.start, cached_rope_deltas);
     let mut mrope_cache: Option<(MxArray, MxArray)> = None;
+    let layers_end = layers_to_run.end;
     for layer_idx in layers_to_run {
         #[cfg(test)]
         let build_scope = crate::array::host_waits::scope("prefill_chunk_graph");
@@ -1705,7 +1760,7 @@ fn run_paged_prefill_layers(
             drop(build_scope);
             note_timeline("layer", launch.start + layer_idx as u32);
         }
-        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &launch.hidden)?;
+        maybe_submit_paged_prefill_layer(layer_idx, layers_end, &launch.hidden)?;
         launch.next_layer = layer_idx + 1;
     }
     Ok(())
@@ -2104,7 +2159,7 @@ pub(crate) fn run_paged_prefill_chunk_with_hidden_with_size(
         if let Some(sink) = taps.as_deref_mut() {
             sink.chunk(chunk_start_position as usize, chunk, &prefilled.taps)?;
         }
-        if prefilled.stored_only() {
+        if !overlaps_kept_tail && !is_last_chunk {
             prefilled.eval_roots("paged_prefill_chunk")?;
             #[cfg(test)]
             note_tail_writes(parts.adapter, layer_kinds);
@@ -2483,7 +2538,7 @@ fn run_paged_prefill_one_chunk_tapped_inner(
             drop(build_scope);
             note_timeline("layer", chunk_first_position + layer_idx as u32);
         }
-        crate::array::maybe_eval_clear_for_paged_prefill_layer(layer_idx, &hidden_states)?;
+        maybe_submit_paged_prefill_layer(layer_idx, num_layers, &hidden_states)?;
     }
     let taps = collect_taps(taps, tap_layers)?;
     Ok(PrefillChunk {
@@ -2519,6 +2574,7 @@ impl PrefillChunk {
             .ok_or_else(|| Error::from_reason("a store-only prefill chunk has no output rows"))
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn stored_only(&self) -> bool {
         self.hidden.is_none()
     }
@@ -3865,6 +3921,97 @@ mod pass_sizing_tests {
         assert_eq!(measured.linear_ms, Some(45.0));
         measured.observe(1, 1, 145.0);
         assert_eq!(measured.attention_ms, Some(100.0));
+    }
+}
+
+#[cfg(test)]
+mod paged_prefill_layer_submit_tests {
+    use super::{
+        PAGED_PREFILL_LAYER_SUBMITS, maybe_submit_paged_prefill_layer,
+        maybe_submit_paged_prefill_layer_with_interval, should_submit_paged_prefill_layer,
+    };
+    use crate::array::MxArray;
+    use napi::Result;
+
+    fn prefill_submits() -> u64 {
+        PAGED_PREFILL_LAYER_SUBMITS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn layer_submit_boundary_rules() {
+        // Non-positive interval disables periodic submission.
+        for interval in [0, -1, -8] {
+            for layer_idx in 0..16 {
+                assert!(
+                    !should_submit_paged_prefill_layer(layer_idx, 16, interval),
+                    "interval={interval} must never submit at layer {layer_idx}"
+                );
+            }
+        }
+
+        // Standard 64-layer chunk with interval=8 submits at 7,15,...,55 and
+        // skips the final layer 63 (`next == layers_end`).
+        let fired: Vec<usize> = (0..64)
+            .filter(|&layer_idx| should_submit_paged_prefill_layer(layer_idx, 64, 8))
+            .collect();
+        assert_eq!(fired, vec![7, 15, 23, 31, 39, 47, 55]);
+
+        // Exact-multiple single pass/chunk (`layers_end == interval`) skips its
+        // final layer because pass-pause / end_launch immediately follows.
+        assert!(!should_submit_paged_prefill_layer(7, 8, 8));
+        assert!(!should_submit_paged_prefill_layer(8, 8, 8));
+
+        // Partial pass `4..16` with interval=8 submits only at layer 7, skipping 15.
+        let pass_fired: Vec<usize> = (4..16)
+            .filter(|&layer_idx| should_submit_paged_prefill_layer(layer_idx, 16, 8))
+            .collect();
+        assert_eq!(pass_fired, vec![7]);
+
+        // Interval=1 submits every interior layer and skips the last.
+        let every_fired: Vec<usize> = (0..4)
+            .filter(|&layer_idx| should_submit_paged_prefill_layer(layer_idx, 4, 1))
+            .collect();
+        assert_eq!(every_fired, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn maybe_submit_paged_prefill_layer_respects_boundaries() -> Result<()> {
+        let a = MxArray::from_float32(&[1.0], &[1])?;
+        let b = MxArray::from_float32(&[2.0], &[1])?;
+
+        // interval = 0: never submits.
+        let before = prefill_submits();
+        for layer_idx in 0..16 {
+            let lazy = a.add(&b)?;
+            maybe_submit_paged_prefill_layer_with_interval(layer_idx, 16, 0, &lazy)?;
+        }
+        assert_eq!(prefill_submits() - before, 0);
+
+        // next == layers_end (8 == 8): skipped.
+        let before = prefill_submits();
+        for layer_idx in 0..8 {
+            let lazy = a.add(&b)?;
+            maybe_submit_paged_prefill_layer_with_interval(layer_idx, 8, 8, &lazy)?;
+        }
+        assert_eq!(prefill_submits() - before, 0);
+
+        // 24 layers with interval = 8: fires at layer 7 and 15, skips layer 23.
+        let before = prefill_submits();
+        let mut acc = a.clone();
+        for layer_idx in 0..24 {
+            acc = acc.add(&b)?;
+            maybe_submit_paged_prefill_layer_with_interval(layer_idx, 24, 8, &acc)?;
+        }
+        assert_eq!(prefill_submits() - before, 2);
+        acc.eval();
+        assert_eq!(acc.to_float32()?.as_ref(), &[49.0]);
+
+        // Wrapper skips the sole/final layer regardless of env interval.
+        let before = prefill_submits();
+        let lazy = a.add(&b)?;
+        maybe_submit_paged_prefill_layer(0, 1, &lazy)?;
+        assert_eq!(prefill_submits() - before, 0);
+        Ok(())
     }
 }
 

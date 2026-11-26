@@ -2,9 +2,7 @@
 //! disk copies): Qwen3.5 adapter over the shared governor-driven
 //! [`crate::disk_tier::state_disk::StateDiskEngine`].
 
-use std::collections::HashMap;
-#[cfg(test)]
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::path::Path;
 use std::sync::Arc;
@@ -370,7 +368,17 @@ pub(crate) fn copying_ahead_bytes(states: &DFlash2States) -> u64 {
 
 /// Splash `Cache::persist` with `StateCache::persist`: a copy ahead of
 /// `id`'s RAM copy and its chain.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn persist<T: DFlash2Target>(target: &mut T, id: EntryId) -> PersistStatus {
+    persist_point(target, id, false)
+}
+
+/// [`persist`] with persistent prompt-head flag `head`.
+pub(crate) fn persist_point<T: DFlash2Target>(
+    target: &mut T,
+    id: EntryId,
+    head: bool,
+) -> PersistStatus {
     let config = target.dense_config().into_owned();
     let kv = target.paged_adapter_ref().map(KvPoolHandle::from_adapter);
     let step = {
@@ -378,7 +386,7 @@ pub(crate) fn persist<T: DFlash2Target>(target: &mut T, id: EntryId) -> PersistS
         let Some(disk) = disk.as_mut() else {
             return PersistStatus::Refused;
         };
-        let step = disk.engine.persist(store, kv.as_ref(), id, &config);
+        let step = disk.engine.persist(store, kv.as_ref(), id, head, &config);
         if step.staged {
             disk.counters.offloads += 1;
         }
@@ -746,11 +754,23 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
     let part_pages = target
         .paged_adapter_ref()
         .is_some_and(|adapter| adapter.layer_kv_pool().layout().keys_token_major);
-    let DFlash2States { store, disk, .. } = target.dflash2_states_mut();
+    let DFlash2States {
+        store,
+        disk,
+        prompt_heads,
+        ..
+    } = target.dflash2_states_mut();
     let Some(disk) = disk.as_mut() else {
         return 0;
     };
     let adopted = disk.engine.adopt_all(store, part_pages);
+    if adopted > 0 {
+        for entry in store.entries() {
+            if !entry.checkpoint() {
+                prompt_heads.insert(entry.id());
+            }
+        }
+    }
     disk.counters.adopted += adopted;
     adopted
 }
@@ -759,6 +779,7 @@ pub(crate) fn adopt_all<T: DFlash2Target>(target: &mut T) -> u64 {
 /// warm-up runs.
 struct HeldDFlash2Tier {
     store: HybridStateStore<PagedAnchor>,
+    prompt_heads: HashSet<EntryId>,
     disk: StateDisk,
     cold: Option<ColdTierContext>,
 }
@@ -771,20 +792,33 @@ pub(crate) fn hold_tier<T: DFlash2Target>(target: &mut T) -> Option<HeldTier> {
     let disk = states.disk.take()?;
     let empty = HybridStateStore::new(states.store.block_size());
     let store = std::mem::replace(&mut states.store, empty);
+    let prompt_heads = std::mem::take(&mut states.prompt_heads);
     let cold = target
         .paged_adapter_mut_ref()
         .and_then(PagedKVCacheAdapter::take_cold_tier);
     target.sync_gdn_state_marks();
-    Some(HeldTier::new(HeldDFlash2Tier { store, disk, cold }))
+    Some(HeldTier::new(HeldDFlash2Tier {
+        store,
+        prompt_heads,
+        disk,
+        cold,
+    }))
 }
 
 /// Puts a [`hold_tier`] back; the store that stood in for it goes.
 pub(crate) fn release_tier<T: DFlash2Target>(target: &mut T, held: HeldTier) {
-    let Some(HeldDFlash2Tier { store, disk, cold }) = held.downcast::<HeldDFlash2Tier>() else {
+    let Some(HeldDFlash2Tier {
+        store,
+        prompt_heads,
+        disk,
+        cold,
+    }) = held.downcast::<HeldDFlash2Tier>()
+    else {
         return;
     };
     let states = target.dflash2_states_mut();
     states.store = store;
+    states.prompt_heads = prompt_heads;
     states.disk = Some(disk);
     if let (Some(cold), Some(adapter)) = (cold, target.paged_adapter_mut_ref()) {
         adapter.set_cold_tier(cold);

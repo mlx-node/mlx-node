@@ -136,14 +136,22 @@ impl MLPType {
         }
     }
 
-    pub(crate) fn forward_store_residual(
+    pub(crate) fn forward_store_residual_with_int8(
         &self,
         x: &MxArray,
         residual: &MxArray,
+        int8_act: bool,
     ) -> Result<MxArray> {
         match self {
-            Self::Dense(mlp) => mlp.forward_store_residual(x, residual),
+            Self::Dense(mlp) => mlp.forward_store_residual_with_int8(x, residual, int8_act),
             Self::MoE(moe) => residual.add(&moe.forward(x)?),
+        }
+    }
+
+    pub(crate) fn forward_with_int8(&self, x: &MxArray, int8_act: bool) -> Result<MxArray> {
+        match self {
+            Self::Dense(mlp) => mlp.forward_with_int8(x, int8_act),
+            Self::MoE(moe) => moe.forward(x),
         }
     }
 
@@ -997,12 +1005,13 @@ impl DecoderLayer {
         rope_position_offset: i32,
         mrope_cache: &mut Option<(MxArray, MxArray)>,
     ) -> Result<MxArray> {
+        let int8_act = pass == PagedPass::Prefill
+            && adapter.activations() == crate::transformer::Activations::Auto;
         match kind {
             Qwen3_5LayerKind::Linear => {
-                // Linear (GDN) layer takes the flat path unchanged.
-                let _ = adapter;
+                // Linear (GDN) layer takes the flat path (opting into INT8
+                // prefill projections when `Activations::Auto` on prefill).
                 let _ = first_logical_position;
-                let _ = pass;
                 let _ = rope_position_offset;
                 if !matches!(self.attn, AttentionType::Linear(_)) {
                     return Err(Error::from_reason(
@@ -1010,7 +1019,19 @@ impl DecoderLayer {
                          FullAttention operator",
                     ));
                 }
-                self.forward(x, mask, flat_cache, position_ids, use_kernel)
+                if !int8_act {
+                    return self.forward(x, mask, flat_cache, position_ids, use_kernel);
+                }
+                let AttentionType::Linear(gdn) = &self.attn else {
+                    unreachable!("checked Linear above");
+                };
+                let normed = self.input_layernorm.forward(x)?;
+                let ac = flat_cache.and_then(|c| c.as_arrays_cache_mut());
+                let attn_out =
+                    gdn.forward_with_tape_int8(&normed, mask, ac, use_kernel, None, true)?;
+                let (h, normed) =
+                    Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
+                h.add(&self.mlp.forward_with_int8(&normed, true)?)
             }
             Qwen3_5LayerKind::FullAttentionPaged { paged_idx } => {
                 let _ = flat_cache; // adapter owns K/V for paged layers
@@ -1042,7 +1063,7 @@ impl DecoderLayer {
                 // Residual + post-attention norm (fused when eligible).
                 let (h, normed) =
                     Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?;
-                h.add(&self.mlp.forward(&normed)?)
+                h.add(&self.mlp.forward_with_int8(&normed, int8_act)?)
             }
         }
     }
@@ -1070,15 +1091,18 @@ impl DecoderLayer {
             Hidden(MxArray),
             Delta(MxArray),
         }
+        let int8_act = adapter.activations() == crate::transformer::Activations::Auto;
         let rows = x.size()? as i64 / x.shape_at(x.ndim()?.saturating_sub(1))?.max(1);
         let normed = self.input_layernorm.forward(x)?;
         let mixed = match (kind, &mut self.attn) {
             (Qwen3_5LayerKind::Linear, AttentionType::Linear(gdn)) => {
                 let ac = flat_cache.and_then(|c| c.as_arrays_cache_mut());
                 if gdn.out_proj_store_route(rows)? {
-                    Mixed::Hidden(gdn.forward_store_residual(&normed, ac, true, x)?)
+                    Mixed::Hidden(gdn.forward_store_residual_int8(&normed, ac, true, x, int8_act)?)
                 } else {
-                    Mixed::Delta(gdn.forward_with_tape(&normed, None, ac, true, None)?)
+                    Mixed::Delta(
+                        gdn.forward_with_tape_int8(&normed, None, ac, true, None, int8_act)?,
+                    )
                 }
             }
             (Qwen3_5LayerKind::FullAttentionPaged { paged_idx }, AttentionType::Full(attn)) => {
@@ -1129,7 +1153,8 @@ impl DecoderLayer {
                 Self::add_residual_norm(&self.post_attention_layernorm, x, &attn_out)?
             }
         };
-        self.mlp.forward_store_residual(&normed, &h)
+        self.mlp
+            .forward_store_residual_with_int8(&normed, &h, int8_act)
     }
 
     /// A text prefill chunk through a full-attention layer whose output no

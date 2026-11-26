@@ -1926,9 +1926,10 @@ fn bit_classes(widths: &[i64], rows: &[Vec<u16>], suffix: bool) -> Vec<Vec<i64>>
 /// Slot and padding never matter on any GPU: every kernel reduces a row
 /// alone. Width does: the kernel tier follows M (`qmv_t64` at 1,
 /// `qmv_wide_t64`, the tensor-op tier, then `qmm_t_splitk`, whose split
-/// count is `512 / (32 * ceil(M / 32))` clamped to whole K groups), so
-/// the fc runs unsplit from M = 33 and each layer's `k|v` (N = 1024)
-/// from M = 257. A cold-prefill tail append narrower than that is not
+/// count is `512 / (32 * ceil(M / 32))` clamped to whole K groups, and
+/// `t64_p128` from M = 65), so the fc runs unsplit from M = 33 (switching
+/// to `t64_p128` at M = 65) and each layer's `k|v` (N = 1024) from M = 257.
+/// A cold-prefill tail append narrower than that is not
 /// bit-reproducible at another width, and a rebuilt window must project
 /// each segment at its recorded (route, width), padding allowed. Which
 /// widths differ depends on the GPU's kernel tiers and core count, so
@@ -2214,8 +2215,9 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
             vec![1],
             vec![2, 3, 7],
             vec![8, 9, 15, 16, 17, 32],
+            vec![33, 64],
             vec![
-                33, 64, 65, 128, 129, 224, 225, 255, 256, 257, 288, 548, 1024, 1500, 2047, 2048
+                65, 128, 129, 224, 225, 255, 256, 257, 288, 548, 1024, 1500, 2047, 2048
             ],
         ]
     );
@@ -2227,10 +2229,9 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
             vec![8],
             vec![15, 16, 17, 32],
             vec![33, 64],
-            vec![65],
-            vec![128],
-            vec![129, 224, 225, 255, 256],
-            vec![257, 288, 548, 1024, 1500, 2047, 2048],
+            vec![
+                65, 128, 129, 224, 225, 255, 256, 257, 288, 548, 1024, 1500, 2047, 2048
+            ],
         ]
     );
     assert_eq!(
@@ -2242,15 +2243,17 @@ fn draft_context_kv_bits_follow_append_width_not_slot_or_padding() {
             vec![9],
             vec![15, 16, 17, 32],
             vec![33, 64],
-            vec![65],
-            vec![128],
-            vec![129, 224, 225, 255, 256],
-            vec![257, 288, 548, 1024, 1500, 2047, 2048],
+            vec![
+                65, 128, 129, 224, 225, 255, 256, 257, 288, 548, 1024, 1500, 2047, 2048
+            ],
         ]
     );
     // keep: merged == full-width prefix, merged == per-layer,
     // per-layer == per-layer at 9 rows, per-layer == per-layer at 2048.
-    let mut want_routes = vec![(1, false, false, false, false)];
+    // Note: at keep = 1, merged (`rows=16`) and per-layer (`rows=8`) run
+    // different `qmv_t64` K-chunk counts that only differ at FP32 ULP level,
+    // which rounds identically to bf16 on row 0 of the `t64_p128`-fused input.
+    let mut want_routes = vec![(1, false, true, false, false)];
     want_routes.extend((2..=7).map(|keep| (keep, false, true, true, false)));
     want_routes.push((8, true, false, true, false));
     assert_eq!(route_table, want_routes);

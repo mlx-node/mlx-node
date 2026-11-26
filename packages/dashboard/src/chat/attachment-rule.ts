@@ -150,6 +150,10 @@ export function nameOfUri(uri: string): string {
   return name === '' ? 'file' : name;
 }
 
+function isAsciiWhitespace(code: number): boolean {
+  return code === 0x20 || code === 0x09 || code === 0x0a || code === 0x0d;
+}
+
 function isBase64Char(code: number): boolean {
   return (
     (code >= 0x41 && code <= 0x5a) || // A-Z
@@ -160,22 +164,61 @@ function isBase64Char(code: number): boolean {
   );
 }
 
-function paddingOf(data: string): number {
-  if (data.endsWith('==')) return 2;
-  return data.endsWith('=') ? 1 : 0;
+function normalizeBase64Prefix(prefix: string): string | null {
+  if (prefix.length === 0) return null;
+  let padCount = 0;
+  while (padCount < prefix.length && prefix.charCodeAt(prefix.length - 1 - padCount) === 0x3d) {
+    padCount += 1;
+  }
+  if (padCount > 2) return null;
+  const dataLen = prefix.length - padCount;
+  if (dataLen === 0) return null;
+  if (padCount > 0) {
+    if (prefix.length % 4 !== 0) return null;
+  } else if (dataLen % 4 === 1) {
+    return null;
+  }
+  for (let i = 0; i < dataLen; i += 1) {
+    if (!isBase64Char(prefix.charCodeAt(i))) return null;
+  }
+  if (padCount === 0) {
+    const rem = dataLen % 4;
+    if (rem === 2) return `${prefix}==`;
+    if (rem === 3) return `${prefix}=`;
+  }
+  return prefix;
 }
 
-/** Standard padded base64: length a multiple of 4, at most two `=` at the end and none elsewhere. */
+/** Standard or URL-safe base64, padded or unpadded, ignoring ASCII whitespace. */
 export function isBase64(data: string): boolean {
-  if (data.length === 0 || data.length % 4 !== 0) return false;
-  const end = data.length - paddingOf(data);
-  for (let i = 0; i < end; i += 1) if (!isBase64Char(data.charCodeAt(i))) return false;
-  return true;
+  let dataLen = 0;
+  let padCount = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    const code = data.charCodeAt(i);
+    if (isAsciiWhitespace(code)) continue;
+    if (code === 0x3d) {
+      padCount += 1;
+      if (padCount > 2) return false;
+    } else {
+      if (padCount > 0) return false;
+      if (!isBase64Char(code) && code !== 0x2d && code !== 0x5f) return false;
+      dataLen += 1;
+    }
+  }
+  if (dataLen === 0) return false;
+  if (padCount > 0) return (dataLen + padCount) % 4 === 0;
+  return dataLen % 4 !== 1;
 }
 
-/** Decoded length of base64 text, padded or not. */
+/** Decoded length of base64 text, ignoring ASCII whitespace and padding. */
 export function base64Bytes(data: string): number {
-  return Math.floor((data.length * 3) / 4) - paddingOf(data);
+  let unpaddedLen = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    const code = data.charCodeAt(i);
+    if (isAsciiWhitespace(code) || code === 0x3d) continue;
+    unpaddedLen += 1;
+  }
+  return Math.floor((unpaddedLen * 3) / 4);
 }
 
 const MAGIC: Readonly<Record<ImageMediaType, readonly number[]>> = {
@@ -187,9 +230,21 @@ const MAGIC: Readonly<Record<ImageMediaType, readonly number[]>> = {
 export function magicMatches(mediaType: string, data: string): boolean {
   if (mediaType !== 'image/png' && mediaType !== 'image/jpeg') return false;
   const magic = MAGIC[mediaType];
+  // Normalize whitespace and URL-safe chars BEFORE slicing the first 16 chars
+  // (12 decoded bytes, enough for PNG's 8-byte header).
+  let prefix = '';
+  for (let i = 0; i < data.length && prefix.length < 16; i += 1) {
+    const code = data.charCodeAt(i);
+    if (isAsciiWhitespace(code)) continue;
+    if (code === 0x2d) prefix += '+';
+    else if (code === 0x5f) prefix += '/';
+    else prefix += data[i];
+  }
+  const normalized = normalizeBase64Prefix(prefix);
+  if (normalized === null) return false;
   let head: string;
   try {
-    head = atob(data.slice(0, 16));
+    head = atob(normalized);
   } catch {
     return false;
   }

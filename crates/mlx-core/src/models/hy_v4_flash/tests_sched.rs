@@ -10,11 +10,13 @@ use std::path::PathBuf;
 use napi::Result;
 
 use super::chat::{MTP_DEPTH_MAX, generation_defaults, resolve};
+use super::ladder::RAM_STATES;
 use super::prefill::{BLOCK_ROWS, Grid, NEAR_EVERY};
 use super::sched::{
-    Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, pass_keys, preempt,
-    prefill_ends, readmit, slice_breaks,
+    Busy, Edge, Requests, SafePoint, lanes, napi_concurrency, paged_mode, paged_ram_states,
+    pass_keys, preempt, prefill_ends, readmit, slice_breaks,
 };
+use super::store::{LADDER_BYTES, ladder_bytes_for};
 use crate::engine::hybrid_scheduler::scheduler_max_num_seqs_for;
 use crate::engine::types::ChatConfig;
 use crate::transformer::paged_kv_cache_adapter::SeqId;
@@ -46,6 +48,26 @@ fn lanes_are_the_admitted_ones_within_the_row_cap() {
     assert_eq!(lanes(4, 3), 3);
     assert_eq!(lanes(1, 12), 1);
     assert_eq!(lanes(0, 12), 1);
+}
+
+#[test]
+fn paged_ram_states_and_ladder_budget_scale_with_lanes() {
+    assert_eq!(paged_ram_states(0), RAM_STATES);
+    assert_eq!(paged_ram_states(1), RAM_STATES);
+    assert_eq!(paged_ram_states(2), 2 * RAM_STATES);
+    assert_eq!(paged_ram_states(4), 4 * RAM_STATES);
+    assert_eq!(ladder_bytes_for(0), LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(1), LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(2), 2 * LADDER_BYTES);
+    assert_eq!(ladder_bytes_for(4), 4 * LADDER_BYTES);
+    // Real Hy4-flash per-state own bytes (30 sliding * 515 * 576 * 2 +
+    // 12 indexed * 6 * 128 * 4 + draft open/tail/seed 52,864) = 17,888,128 B.
+    let hy4_state_own_bytes: u64 = 30 * 515 * 576 * 2 + 12 * 6 * 128 * 4 + 52_864;
+    assert_eq!(hy4_state_own_bytes, 17_888_128);
+    assert!(
+        (paged_ram_states(4) as u64) * hy4_state_own_bytes < ladder_bytes_for(4),
+        "4-lane RAM state cap must stay within 4-lane ladder budget"
+    );
 }
 
 /// Force serial reads 1; otherwise the engine's cap over the lanes.
@@ -253,6 +275,121 @@ fn request_depth_is_clamped_and_never_adaptive() {
     assert!(!p.mtp_adaptive_depth);
     let p = resolve(&ChatConfig::default(), &generation_defaults());
     assert_eq!(p.mtp_depth, 1);
+}
+
+/// SSD restore reservation accounts for BOTH the promoted cached state AND the
+/// live owner cell that `OwnerCell::from_state` will materialize afterward, so
+/// multi-lane MTP restores skip candidates that would exceed `state_budget`.
+#[test]
+fn ssd_restore_budget_reserves_restored_owner_bytes_alongside_state() {
+    use super::ladder::Kind;
+    use super::prefill::BLOCK_ROWS;
+    use super::prefix_state::{Key, States, Stored};
+    use super::sched::restore_ram_cap;
+    use crate::disk_tier::store::{DiskCopy, Lineage, StateClass};
+    use mlx_paged_attn::{ColdCacheFingerprint, ColdCacheKey, ColdGroup};
+
+    struct SizedState(u64);
+    impl Stored for SizedState {
+        fn bytes(&self) -> u64 {
+            self.0
+        }
+        fn shared(&self) -> Vec<(usize, u64)> {
+            Vec::new()
+        }
+    }
+
+    const MIB: u64 = 1 << 20;
+    let total_budget = 400 * MIB;
+    let other_owners = 260 * MIB;
+    let current_owner = 10 * MIB;
+    let state_ram_budget = total_budget - (other_owners + current_owner); // 130 MiB left
+    let owner_base = 50 * MIB;
+    let mtp_row = 1280; // ~80 MiB at 65,536 rows, ~10 MiB at 8,192 rows
+
+    // Candidate 1 (65,536 rows): state = 80 MiB (fits 130 MiB alone!),
+    // but owner_extra = 50 MiB + 80 MiB - 10 MiB = 120 MiB -> cap = 10 MiB < 80 MiB.
+    let deep_row = 65_536;
+    let deep_state = 80 * MIB;
+    let deep_cap = restore_ram_cap(
+        state_ram_budget,
+        current_owner,
+        deep_row,
+        owner_base,
+        mtp_row,
+    );
+    assert_eq!(deep_cap, 10 * MIB);
+
+    // Candidate 2 (8,192 rows): state = 10 MiB,
+    // owner_extra = 50 MiB + 10 MiB - 10 MiB = 50 MiB -> cap = 80 MiB >= 10 MiB.
+    let mid_row = 8_192;
+    let mid_state = 10 * MIB;
+    let mid_cap = restore_ram_cap(
+        state_ram_budget,
+        current_owner,
+        mid_row,
+        owner_base,
+        mtp_row,
+    );
+    assert_eq!(mid_cap, 80 * MIB);
+
+    let disk_copy = |seed: u64| DiskCopy {
+        key: ColdCacheKey::chain(
+            ColdGroup::DFlash2State,
+            ColdCacheFingerprint::from_components([&seed.to_le_bytes()[..]]),
+            None,
+            &[seed as u32],
+            &[],
+            0,
+            0,
+        ),
+        bytes: 64,
+        landed: true,
+        window_begin: 0,
+        chain_owed: false,
+    };
+
+    let mut st = States::<SizedState>::with_cap(32);
+    let ram_tok: Vec<u32> = (0..BLOCK_ROWS as u32).map(|i| 10 + i).collect();
+    let ram_id = st
+        .publish(Key::text(&ram_tok, 1), SizedState(75 * MIB), Kind::Prompt)
+        .unwrap()
+        .unwrap();
+    let deep_tok: Vec<u32> = (0..2 * BLOCK_ROWS as u32).map(|i| 100 + i).collect();
+    let mid_tok: Vec<u32> = (0..BLOCK_ROWS as u32).map(|i| 200 + i).collect();
+    let deep_id = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&deep_tok, 1),
+            deep_state,
+            StateClass::Ordinary,
+            disk_copy(1),
+        )
+        .unwrap();
+    let mid_id = st
+        .store_mut()
+        .insert_disk(
+            Lineage::text(&mid_tok, 1),
+            mid_state,
+            StateClass::Ordinary,
+            disk_copy(2),
+        )
+        .unwrap();
+
+    // Deep candidate is skipped pre-decode WITHOUT evicting `ram_id`.
+    assert!(!st.reserve_for_promote(deep_id, deep_state, deep_cap, None));
+    assert!(st.get(ram_id).is_some());
+
+    // Shallower candidate fits after evicting `ram_id` (75 + 10 > 80 MiB), and
+    // combined owners + restored state stays strictly within `total_budget`.
+    assert!(st.reserve_for_promote(mid_id, mid_state, mid_cap, None));
+    assert!(st.promote_within(mid_id, SizedState(mid_state), Some(mid_cap), None));
+    let owners_after = other_owners + owner_base + mtp_row * mid_row as u64;
+    assert!(
+        owners_after + st.held_bytes() <= total_budget,
+        "owners ({owners_after}) + states ({}) must stay <= budget ({total_budget})",
+        st.held_bytes()
+    );
 }
 
 fn hy4_dir() -> PathBuf {

@@ -666,6 +666,7 @@ class Sampler implements RuntimeSampler {
   private tick(): void {
     if (this.stopped) return;
     let busy = this.busy;
+    let settleDelay: number | null = null;
     try {
       const now = this.now();
       const views = this.collect();
@@ -686,10 +687,15 @@ class Sampler implements RuntimeSampler {
         this.lastResidentKey = residentKey;
       }
       this.snapshotSchedulers(now, views);
+      settleDelay = this.nextSchedulerSettleDelayMs(now, views);
     } catch {
       // A sampler failure must never reach inference; the next tick retries.
     }
-    if (!this.stopped) this.schedule(busy ? HEARTBEAT_BUSY_MS : HEARTBEAT_IDLE_MS);
+    if (!this.stopped) {
+      let delayMs = busy ? HEARTBEAT_BUSY_MS : HEARTBEAT_IDLE_MS;
+      if (settleDelay !== null && settleDelay < delayMs) delayMs = settleDelay;
+      this.schedule(delayMs);
+    }
   }
 
   private writeSample(
@@ -782,6 +788,29 @@ class Sampler implements RuntimeSampler {
         },
       );
     }
+  }
+
+  /**
+   * Shortest remaining settle wait for any idle model that still owes a `schedulerStats()`
+   * snapshot. Without this, an edge-coalesced idle tick at +250 ms (`< SCHED_IDLE_SETTLE_MS`)
+   * sleeps a full `HEARTBEAT_IDLE_MS` (5 s), so models with brief idle gaps never take a reading.
+   */
+  private nextSchedulerSettleDelayMs(now: number, views: BindingView[]): number | null {
+    let soonest: number | null = null;
+    for (const view of views) {
+      const model = view.entry.model as unknown as { schedulerStats?: () => Promise<SchedulerStats> };
+      if (typeof model.schedulerStats !== 'function') continue;
+      if (view.active !== 0 || view.queued !== 0 || view.stats.live !== 0) continue;
+      const state = this.sched.get(model);
+      if (state?.pending) continue;
+      if (state !== undefined && state.snapshotBegun !== undefined && state.snapshotBegun === view.stats.begun) {
+        continue;
+      }
+      const remaining = view.stats.lastSettleAt + SCHED_IDLE_SETTLE_MS - now;
+      if (remaining <= 0) continue;
+      if (soonest === null || remaining < soonest) soonest = remaining;
+    }
+    return soonest;
   }
 
   private onSchedulerStats(name: string, state: SchedState, stats: SchedulerStats, turns: number): void {

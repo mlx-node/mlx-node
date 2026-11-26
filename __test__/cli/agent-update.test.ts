@@ -2262,6 +2262,196 @@ describe('launchGrokAgent server gating', () => {
     expect(agentKill).not.toHaveBeenCalled();
   });
 
+  it('drains serve stdout after readiness so post-startup output does not stall the pipe', async () => {
+    const serveStdout = new PassThrough();
+    spawnServe.mockImplementationOnce((_argv: string[], _so: SpawnOptions) => {
+      const kill = vi.fn();
+      serveKills.push(kill);
+      const child = Object.assign(new EventEmitter(), { stdout: serveStdout, kill });
+      serveStdout.write(`listening on ${serveBase}\n`);
+      return child as unknown as ChildProcess;
+    });
+    let agentStarted = false;
+    const agent = Object.assign(new EventEmitter(), { kill: vi.fn() }) as unknown as ChildProcess;
+    const launch = launchGrokAgent({
+      argv: ['-p', 'hi'],
+      spawnServe,
+      persistPagedCache,
+      spawnAgent: () => {
+        agentStarted = true;
+        return agent;
+      },
+    });
+    await vi.waitFor(() => expect(agentStarted).toBe(true));
+    // With `rl.close()` leaving `stdout` paused, writing beyond `highWaterMark`
+    // buffers without draining (`readableLength > 0`). Resuming puts it in
+    // flowing mode and drains it.
+    expect(serveStdout.readableFlowing).toBe(true);
+    serveStdout.write('x'.repeat(64 * 1024));
+    await vi.waitFor(() => expect(serveStdout.readableLength).toBe(0));
+    agent.emit('exit', 0, null);
+    await expect(launch).resolves.toBe(0);
+  });
+
+  it('logs and stops the agent when serve exits unexpectedly mid-session', async () => {
+    const serveChild = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(),
+    });
+    serveChild.stdout.end(`listening on ${serveBase}\n`);
+    spawnServe.mockImplementationOnce(() => serveChild as unknown as ChildProcess);
+
+    const agentKill = vi.fn((signal: NodeJS.Signals) => {
+      if (signal === 'SIGTERM') {
+        queueMicrotask(() => agent.emit('exit', 0, null));
+      }
+      return true;
+    });
+    const agent = Object.assign(new EventEmitter(), {
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: agentKill,
+    }) as unknown as ChildProcess;
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let agentStarted = false;
+      const launch = launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        persistPagedCache,
+        spawnAgent: () => {
+          agentStarted = true;
+          return agent;
+        },
+      });
+      await vi.waitFor(() => expect(agentStarted).toBe(true));
+      serveChild.signalCode = 'SIGKILL';
+      serveChild.emit('exit', null, 'SIGKILL');
+      await expect(launch).resolves.toBe(1);
+      expect(agentKill).toHaveBeenCalledWith('SIGTERM');
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('signal SIGKILL'));
+      expect(serveChild.kill).not.toHaveBeenCalled();
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('escalates to SIGKILL when the agent ignores SIGTERM after serve crashes', async () => {
+    const serveChild = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(),
+    });
+    serveChild.stdout.end(`listening on ${serveBase}\n`);
+    spawnServe.mockImplementationOnce(() => serveChild as unknown as ChildProcess);
+
+    const agentKill = vi.fn((signal: NodeJS.Signals) => {
+      if (signal === 'SIGKILL') {
+        queueMicrotask(() => agent.emit('exit', null, 'SIGKILL'));
+      }
+      return true;
+    });
+    const agent = Object.assign(new EventEmitter(), {
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: agentKill,
+    }) as unknown as ChildProcess;
+
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let agentStarted = false;
+      const launch = launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        persistPagedCache,
+        serveStopGraceMs: 40,
+        spawnAgent: () => {
+          agentStarted = true;
+          return agent;
+        },
+      });
+      await vi.waitFor(() => expect(agentStarted).toBe(true));
+      serveChild.exitCode = 137;
+      serveChild.emit('exit', 137, null);
+      await expect(launch).resolves.toBe(1);
+      expect(agentKill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+      expect(errSpy).toHaveBeenCalledWith(expect.stringContaining('code 137'));
+    } finally {
+      errSpy.mockRestore();
+    }
+  });
+
+  it('waits for agent kill escalation before re-raising SIGTERM when serve already crashed', async () => {
+    const serveChild = Object.assign(new EventEmitter(), {
+      stdout: new PassThrough(),
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: vi.fn(),
+    });
+    serveChild.stdout.end(`listening on ${serveBase}\n`);
+    spawnServe.mockImplementationOnce(() => serveChild as unknown as ChildProcess);
+
+    let agentExited = false;
+    const agentKill = vi.fn((signal: NodeJS.Signals) => {
+      if (signal === 'SIGKILL') {
+        agentExited = true;
+        agentMock.signalCode = 'SIGKILL';
+        queueMicrotask(() => agentMock.emit('exit', null, 'SIGKILL'));
+      }
+      return true;
+    });
+    const agentMock = Object.assign(new EventEmitter(), {
+      exitCode: null as number | null,
+      signalCode: null as NodeJS.Signals | null,
+      kill: agentKill,
+    });
+    const agent = agentMock as unknown as ChildProcess;
+
+    const baseline = new Set(process.listeners('SIGTERM'));
+    const reRaiseSpy = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      let agentStarted = false;
+      const launch = launchGrokAgent({
+        argv: ['-p', 'hi'],
+        spawnServe,
+        persistPagedCache,
+        serveStopGraceMs: 60,
+        spawnAgent: () => {
+          agentStarted = true;
+          return agent;
+        },
+      });
+      await vi.waitFor(() => expect(agentStarted).toBe(true));
+      serveChild.signalCode = 'SIGKILL';
+      serveChild.emit('exit', null, 'SIGKILL');
+      expect(agentKill).toHaveBeenCalledWith('SIGTERM');
+
+      const teardown = process.listeners('SIGTERM').find((listener) => !baseline.has(listener)) as
+        | ((signal: 'SIGTERM') => void)
+        | undefined;
+      expect(teardown).toBeDefined();
+      teardown!('SIGTERM');
+      // Must NOT re-raise SIGTERM while the agent is still ignoring the crash watchdog's SIGTERM.
+      await new Promise((resolvePromise) => setTimeout(resolvePromise, 15));
+      expect(agentExited).toBe(false);
+      expect(reRaiseSpy).not.toHaveBeenCalled();
+
+      // After the grace expires, SIGKILL runs and only then does the launcher re-raise SIGTERM.
+      await vi.waitFor(() => expect(reRaiseSpy).toHaveBeenCalledWith(process.pid, 'SIGTERM'));
+      expect(agentExited).toBe(true);
+      expect(agentKill.mock.calls).toEqual([['SIGTERM'], ['SIGKILL']]);
+      await expect(launch).resolves.toBe(1);
+    } finally {
+      reRaiseSpy.mockRestore();
+      errSpy.mockRestore();
+    }
+  });
+
   it('forwards SIGTERM to both children and re-raises it', async () => {
     const agentKill = vi.fn();
     const agent = Object.assign(new EventEmitter(), { kill: agentKill }) as unknown as ChildProcess;

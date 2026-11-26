@@ -595,6 +595,31 @@ fn lookup_vision_feature_cache(
     (ordered_features, misses, cache_hits)
 }
 
+/// Apple Silicon Metal `vm_page_size` (16 KiB). MLX's `MetalAllocator::malloc`
+/// (`mlx/backend/metal/allocator.cpp`) rounds allocations above one page up to
+/// whole 16 KiB pages and standalone `MTLBuffer` allocations occupy whole pages
+/// in `device.current_allocated_size()`.
+const METAL_ALLOC_PAGE_BYTES: usize = 16 * 1024;
+
+fn round_up_metal_page_usize(bytes: usize) -> Result<usize> {
+    if bytes == 0 {
+        return Ok(0);
+    }
+    bytes
+        .checked_next_multiple_of(METAL_ALLOC_PAGE_BYTES)
+        .ok_or_else(|| Error::from_reason("vision feature byte count overflow"))
+}
+
+fn round_up_metal_page_u64(bytes: u64) -> u64 {
+    if bytes == 0 {
+        0
+    } else {
+        bytes
+            .checked_next_multiple_of(METAL_ALLOC_PAGE_BYTES as u64)
+            .unwrap_or(u64::MAX)
+    }
+}
+
 fn vision_array_bytes(array: &MxArray) -> Result<usize> {
     let elements = array.shape()?.iter().try_fold(1usize, |product, &dim| {
         let dim = usize::try_from(dim).map_err(|_| {
@@ -604,9 +629,10 @@ fn vision_array_bytes(array: &MxArray) -> Result<usize> {
             .checked_mul(dim)
             .ok_or_else(|| Error::from_reason("vision feature element count overflow"))
     })?;
-    elements
+    let raw_bytes = elements
         .checked_mul(array.dtype()?.byte_size())
-        .ok_or_else(|| Error::from_reason("vision feature byte count overflow"))
+        .ok_or_else(|| Error::from_reason("vision feature byte count overflow"))?;
+    round_up_metal_page_usize(raw_bytes)
 }
 
 fn projected_vision_feature_bytes(
@@ -614,21 +640,22 @@ fn projected_vision_feature_bytes(
     output_size: u64,
     dtype_bytes: u64,
 ) -> (u64, u64) {
-    let bytes_for = |request: &VisionImageRequest| {
+    let raw_bytes_for = |request: &VisionImageRequest| {
         u64::try_from(request.feature_count)
             .unwrap_or(u64::MAX)
             .saturating_mul(output_size)
             .saturating_mul(dtype_bytes)
     };
-    let request_bytes = requests.iter().fold(0u64, |bytes, request| {
-        bytes.saturating_add(bytes_for(request))
+    let raw_request_bytes = requests.iter().fold(0u64, |bytes, request| {
+        bytes.saturating_add(raw_bytes_for(request))
     });
+    let request_bytes = round_up_metal_page_u64(raw_request_bytes);
     let mut accounted_keys = HashSet::with_capacity(requests.len());
     let protected_bytes = requests
         .iter()
         .filter(|request| accounted_keys.insert(request.key))
         .fold(0u64, |bytes, request| {
-            bytes.saturating_add(bytes_for(request))
+            bytes.saturating_add(round_up_metal_page_u64(raw_bytes_for(request)))
         });
     (request_bytes, protected_bytes)
 }
@@ -832,11 +859,10 @@ pub(crate) fn encode_images_cached(
         );
         let projected_miss_output_bytes = misses.iter().fold(0u64, |bytes, miss| {
             let feature_count = u64::try_from(miss.request.feature_count).unwrap_or(u64::MAX);
-            bytes.saturating_add(
-                feature_count
-                    .saturating_mul(vision_output_size)
-                    .saturating_mul(cache_feature_dtype_bytes),
-            )
+            let raw = feature_count
+                .saturating_mul(vision_output_size)
+                .saturating_mul(cache_feature_dtype_bytes);
+            bytes.saturating_add(round_up_metal_page_u64(raw))
         });
         let projected_concat_output_bytes = if requests.len() > 1 {
             request_feature_bytes

@@ -13,7 +13,8 @@ use super::gated_delta::{
     gated_delta_update_tree_with_tape, gated_delta_update_with_tape, prefill_fused_enabled,
 };
 use crate::models::quantized_linear::{
-    DEFAULT_QUANT_MODE, LinearProj, MixerResidual, PreparedSg8, QuantizedLinear,
+    DEFAULT_QUANT_MODE, LinearProj, MixerResidual, PreparedInt8Prefill, PreparedSg8,
+    QuantizedLinear,
 };
 
 /// Chunk-relative rows at which a prefill forward captures every GDN layer's
@@ -451,12 +452,116 @@ enum PrefillPrep {
         gated: MxArray,
         state: MxArray,
         captured: Vec<MxArray>,
+        captured_conv: Option<Vec<MxArray>>,
     },
     Raw {
         q: MxArray,
         k: MxArray,
         v: MxArray,
     },
+}
+
+unsafe extern "C-unwind" {
+    fn mlx_gdn_fused_prefill_with_conv(
+        qkv: *mut sys::mlx_array,
+        conv_w: *mut sys::mlx_array,
+        conv_state: *mut sys::mlx_array,
+        a: *mut sys::mlx_array,
+        b: *mut sys::mlx_array,
+        a_log: *mut sys::mlx_array,
+        dt_bias: *mut sys::mlx_array,
+        state: *mut sys::mlx_array,
+        wq: *mut sys::mlx_array,
+        wk: *mut sys::mlx_array,
+        z: *mut sys::mlx_array,
+        w: *mut sys::mlx_array,
+        hk: i32,
+        hv: i32,
+        eps: f32,
+        qk_eps: f32,
+        tiled: i32,
+        out: *mut *mut sys::mlx_array,
+        out_state: *mut *mut sys::mlx_array,
+        out_conv_state: *mut *mut sys::mlx_array,
+    ) -> bool;
+}
+
+/// One primitive for a whole prompt window including the 4-tap depthwise
+/// conv1d + SiLU + `conv_state` update, q/k RMSNorm, decay/beta gating,
+/// 8-lanes/row recurrence scan, and gated RMSNorm + z gate. Returns
+/// `(gated_out, new_state, next_conv_state)` or `Ok(None)` when
+/// off-contract / declined.
+#[allow(clippy::too_many_arguments)]
+fn gated_delta_fused_prefill_with_conv(
+    qkv: &MxArray,
+    conv_w: &MxArray,
+    conv_state: Option<&MxArray>,
+    state: Option<&MxArray>,
+    hk: i32,
+    hv: i32,
+    pf: &GdnPrefill<'_>,
+) -> Result<Option<(MxArray, MxArray, MxArray)>> {
+    if !crate::engine::persistence::compiled_forward_backend_available()
+        || pf.tail.state_dst.is_some()
+        || hk <= 0
+        || hv <= 0
+        || hv % hk != 0
+        || [
+            qkv,
+            pf.a,
+            pf.b,
+            pf.tail.z,
+            pf.tail.norm_weight,
+            pf.wq,
+            pf.wk,
+        ]
+        .iter()
+        .any(|x| x.dtype().ok() != Some(DType::BFloat16))
+        || conv_w.dtype().ok() != Some(DType::Float32)
+        || conv_state.is_some_and(|h| h.dtype().ok() != Some(DType::BFloat16))
+        || !super::gated_delta::prefill_scalar_dtypes(pf.a_log, pf.dt_bias)
+        || state.is_some_and(|s| s.dtype().ok() != Some(DType::Float32))
+    {
+        return Ok(None);
+    }
+    let mut out_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_state_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let mut out_conv_ptr: *mut sys::mlx_array = std::ptr::null_mut();
+    let ok = unsafe {
+        mlx_gdn_fused_prefill_with_conv(
+            qkv.as_raw_ptr(),
+            conv_w.as_raw_ptr(),
+            conv_state
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            pf.a.as_raw_ptr(),
+            pf.b.as_raw_ptr(),
+            pf.a_log.as_raw_ptr(),
+            pf.dt_bias.as_raw_ptr(),
+            state
+                .map(MxArray::as_raw_ptr)
+                .unwrap_or(std::ptr::null_mut()),
+            pf.wq.as_raw_ptr(),
+            pf.wk.as_raw_ptr(),
+            pf.tail.z.as_raw_ptr(),
+            pf.tail.norm_weight.as_raw_ptr(),
+            hk,
+            hv,
+            pf.tail.eps,
+            pf.qk_eps,
+            i32::from(pf.tiled),
+            &mut out_ptr,
+            &mut out_state_ptr,
+            &mut out_conv_ptr,
+        )
+    };
+    if !ok {
+        return Ok(None);
+    }
+    let out = MxArray::from_handle(out_ptr, "gdn_fused_prefill_with_conv:out");
+    let out_state = MxArray::from_handle(out_state_ptr, "gdn_fused_prefill_with_conv:state");
+    let out_conv = MxArray::from_handle(out_conv_ptr, "gdn_fused_prefill_with_conv:conv_state");
+    Ok(Some((out?, out_state?, out_conv?)))
 }
 
 /// The complete fused core's output for the layer: the gated rows, the new
@@ -790,6 +895,20 @@ impl GatedDeltaNet {
         )
     }
 
+    pub(crate) fn forward_with_tape_int8(
+        &self,
+        x: &MxArray,
+        mask: Option<&MxArray>,
+        cache: Option<&mut ArraysCache>,
+        use_kernel: bool,
+        tape_sink: Option<&mut Option<GdnLayerTape>>,
+        int8_act: bool,
+    ) -> Result<MxArray> {
+        self.forward_with_tape_core(
+            x, None, mask, None, cache, use_kernel, tape_sink, None, None, None, None, int8_act,
+        )
+    }
+
     /// CUDA deferred-fold variant of [`Self::forward_with_tape`].
     #[allow(dead_code, clippy::too_many_arguments)]
     pub(crate) fn forward_with_tape_deferred(
@@ -865,6 +984,7 @@ impl GatedDeltaNet {
             None,
             cuda_deferred,
             tree,
+            false,
         )
     }
 
@@ -895,6 +1015,7 @@ impl GatedDeltaNet {
             None,
             cuda_deferred,
             tree,
+            false,
         )
     }
 
@@ -930,6 +1051,7 @@ impl GatedDeltaNet {
             None,
             None,
             None,
+            false,
         )
     }
 
@@ -954,22 +1076,26 @@ impl GatedDeltaNet {
             None,
             None,
             None,
+            false,
         )
     }
 
     /// The unmasked, untaped prefill forward whose output projection adds
     /// `residual` in its GEMM store where the shape takes the epilogue GEMM
     /// ([`Self::out_proj_store_route`]); residual-inclusive output, the bits
-    /// of `residual + forward(x)`.
-    pub(crate) fn forward_store_residual(
+    /// of `residual + forward(x)` (or INT8-activation NAX prefill when
+    /// `int8_act` is enabled).
+    pub(crate) fn forward_store_residual_int8(
         &self,
         x: &MxArray,
         cache: Option<&mut ArraysCache>,
         use_kernel: bool,
         residual: &MxArray,
+        int8_act: bool,
     ) -> Result<MxArray> {
-        self.forward_with_tape_impl(
+        self.forward_with_tape_core(
             x,
+            None,
             None,
             None,
             cache,
@@ -979,6 +1105,7 @@ impl GatedDeltaNet {
             None,
             None,
             None,
+            int8_act,
         )
     }
 
@@ -1126,6 +1253,7 @@ impl GatedDeltaNet {
             capture,
             cuda_deferred,
             tree,
+            false,
         )
     }
 
@@ -1143,6 +1271,7 @@ impl GatedDeltaNet {
         capture: Option<(&GdnCapturePlan<'_>, &mut Vec<GdnLayerCapture>)>,
         cuda_deferred: Option<Option<&super::layer_cache::CudaPendingGdn>>,
         tree: Option<&super::verify_tree::TreeDeviceViews>,
+        int8_act: bool,
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
@@ -1197,7 +1326,7 @@ impl GatedDeltaNet {
             ));
         }
 
-        let (qkv, z, b, a) = self.in_projections(x, prequant_sym8)?;
+        let (qkv, z, b, a) = self.in_projections_with_int8(x, prequant_sym8, int8_act)?;
 
         // Apply mask before conv to prevent masked values leaking through convolution
         let qkv = if let Some(m) = mask {
@@ -1251,6 +1380,7 @@ impl GatedDeltaNet {
             gated,
             state,
             captured,
+            captured_conv,
         }) = prefill_prep
         {
             if let Some(cache) = cache {
@@ -1258,8 +1388,29 @@ impl GatedDeltaNet {
             }
             #[cfg(test)]
             note_route(GdnRoute::FusedPrefill);
-            self.record_captures(capture, &qkv, incoming_conv.as_ref(), captured)?;
-            return self.out_proj.forward_mixer_output(&gated, None, residual);
+            if let Some(convs) = captured_conv {
+                if let Some((plan, out)) = capture {
+                    if captured.len() != plan.rows.len() || convs.len() != plan.rows.len() {
+                        return Err(Error::from_reason(format!(
+                            "GDN capture: {} states / {} convs for {} rows",
+                            captured.len(),
+                            convs.len(),
+                            plan.rows.len()
+                        )));
+                    }
+                    for (conv, rec) in convs.into_iter().zip(captured) {
+                        out.push(GdnLayerCapture {
+                            conv: conv.deep_copy()?,
+                            rec: rec.deep_copy()?,
+                        });
+                    }
+                }
+            } else {
+                self.record_captures(capture, &qkv, incoming_conv.as_ref(), captured)?;
+            }
+            return self
+                .out_proj
+                .forward_mixer_output_int8_prefill(&gated, residual, int8_act);
         }
 
         // Whole GDN core in ONE dispatch (prep + recurrence + gated norm +
@@ -1578,7 +1729,9 @@ impl GatedDeltaNet {
                     conv_kernel_dim: self.conv_kernel_dim,
                 });
             }
-            return self.out_proj.forward_mixer_output(&gated, None, residual);
+            return self
+                .out_proj
+                .forward_mixer_output_int8_prefill(&gated, residual, int8_act);
         }
 
         // Non-deferred tree fallback (e.g. Metal/CPU or unit-test geometries).
@@ -1619,7 +1772,9 @@ impl GatedDeltaNet {
             ])?;
             let y_normed = self.norm.forward(&y, Some(&z))?;
             let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
-            return self.out_proj.forward_mixer_output(&y_flat, None, residual);
+            return self
+                .out_proj
+                .forward_mixer_output_int8_prefill(&y_flat, residual, int8_act);
         }
 
         // Fused tail: recurrence + gated norm + z gate in one dispatch (the
@@ -1739,7 +1894,9 @@ impl GatedDeltaNet {
                         conv_kernel_dim: self.conv_kernel_dim,
                     });
                 }
-                return self.out_proj.forward_mixer_output(&gated, None, residual);
+                return self
+                    .out_proj
+                    .forward_mixer_output_int8_prefill(&gated, residual, int8_act);
             }
         }
 
@@ -1869,7 +2026,9 @@ impl GatedDeltaNet {
                     }
                     #[cfg(test)]
                     note_route(GdnRoute::Chain);
-                    return self.out_proj.forward_mixer_output(&y_flat, None, residual);
+                    return self
+                        .out_proj
+                        .forward_mixer_output_int8_prefill(&y_flat, residual, int8_act);
                 }
                 cuda_chain = crate::kernels::gdn::prefill_chain(
                     &q,
@@ -1939,7 +2098,8 @@ impl GatedDeltaNet {
         let y_flat = y_normed.reshape(&[batch, seq_len, self.value_dim as i64])?;
 
         // Output projection
-        self.out_proj.forward_mixer_output(&y_flat, None, residual)
+        self.out_proj
+            .forward_mixer_output_int8_prefill(&y_flat, residual, int8_act)
     }
 
     /// `x` `[B, T, H]` -> `(qkv, z, b, a)`, the layer's input projections.
@@ -1947,6 +2107,15 @@ impl GatedDeltaNet {
         &self,
         x: &MxArray,
         prequant_sym8: Option<(&MxArray, &MxArray)>,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        self.in_projections_with_int8(x, prequant_sym8, false)
+    }
+
+    fn in_projections_with_int8(
+        &self,
+        x: &MxArray,
+        prequant_sym8: Option<(&MxArray, &MxArray)>,
+        int8_act: bool,
     ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
         if let Some((x_i8, s_x)) = prequant_sym8
             && self.in_proj_qkvz_ba_t.is_none()
@@ -1972,8 +2141,57 @@ impl GatedDeltaNet {
             return Ok((qkvz_split[0].clone(), qkvz_split[1].clone(), b, a));
         }
 
-        // When the stacked weight is available, do one matmul + one split.
+        // Prefill INT8 activation sharing: quantize `x` ONCE and reuse across
+        // `in_proj_qkv` + `in_proj_z` (when split) or `in_proj_qkvz` /
+        // `in_proj_qkvz_ba_q` (when merged) plus `in_proj_ba` if eligible.
         let qkvz_dim = (self.key_dim * 2 + self.value_dim * 2) as i64;
+        if int8_act && self.in_proj_qkvz_ba_t.is_none() {
+            let any_i8 = self
+                .in_proj_qkvz_ba_q
+                .as_ref()
+                .is_some_and(LinearProj::supports_int8_prefill)
+                || self.split_in_proj_qkv_z.as_ref().is_some_and(|(qkv, z)| {
+                    qkv.supports_int8_prefill() || z.supports_int8_prefill()
+                })
+                || (self.split_in_proj_qkv_z.is_none()
+                    && self.in_proj_qkvz.supports_int8_prefill())
+                || self
+                    .split_in_proj_b_a
+                    .as_ref()
+                    .is_some_and(|(b, a)| b.supports_int8_prefill() || a.supports_int8_prefill())
+                || (self.split_in_proj_b_a.is_none() && self.in_proj_ba.supports_int8_prefill());
+            if any_i8 && let Some(pre) = PreparedInt8Prefill::try_new(x)? {
+                if let Some(merged) = &self.in_proj_qkvz_ba_q {
+                    let combined = merged.forward_int8_prefill_or(x, Some(&pre))?;
+                    let parts = combined.split_sections(&[qkvz_dim], 2)?;
+                    let qkvz_split = parts[0].split_sections(&[self.conv_dim as i64], 2)?;
+                    let (b, a) = self.split_ba_padded(&parts[1])?;
+                    return Ok((qkvz_split[0].clone(), qkvz_split[1].clone(), b, a));
+                }
+                let (qkv, z) = if let Some((qkv_proj, z_proj)) = &self.split_in_proj_qkv_z {
+                    (
+                        qkv_proj.forward_int8_prefill_or(x, Some(&pre))?,
+                        z_proj.forward_int8_prefill_or(x, Some(&pre))?,
+                    )
+                } else {
+                    let qkvz = self.in_proj_qkvz.forward_int8_prefill_or(x, Some(&pre))?;
+                    let qkvz_split = qkvz.split_sections(&[self.conv_dim as i64], 2)?;
+                    (qkvz_split[0].clone(), qkvz_split[1].clone())
+                };
+                let (b, a) = if let Some((b_proj, a_proj)) = &self.split_in_proj_b_a {
+                    (
+                        b_proj.forward_int8_prefill_or(x, Some(&pre))?,
+                        a_proj.forward_int8_prefill_or(x, Some(&pre))?,
+                    )
+                } else {
+                    let ba = self.in_proj_ba.forward_int8_prefill_or(x, Some(&pre))?;
+                    self.split_ba_padded(&ba)?
+                };
+                return Ok((qkv, z, b, a));
+            }
+        }
+
+        // When the stacked weight is available, do one matmul + one split.
         let stacked = if let Some(wqb_t) = &self.in_proj_qkvz_ba_t {
             let combined = x.matmul(wqb_t)?; // [B, T, qkvz_dim + ba_dim]
             let parts = combined.split_sections(&[qkvz_dim], 2)?;
@@ -2863,7 +3081,7 @@ impl GatedDeltaNet {
         a: &MxArray,
         b: &MxArray,
         conv_state: Option<&MxArray>,
-        cache: Option<&mut ArraysCache>,
+        mut cache: Option<&mut ArraysCache>,
         mask: Option<&MxArray>,
         use_kernel: bool,
         batch: i64,
@@ -2895,9 +3113,152 @@ impl GatedDeltaNet {
         {
             return Ok(None);
         }
-        if self.num_k_heads <= 0 || self.num_v_heads % self.num_k_heads != 0 {
+        if self.num_k_heads <= 0
+            || self.num_v_heads <= 0
+            || self.num_v_heads % self.num_k_heads != 0
+        {
             return Ok(None);
         }
+
+        // Fast path: fuse 4-tap depthwise conv1d + SiLU + conv_state carry
+        // directly into the prefill prologue (zero intermediate [1, T, W] conv
+        // output buffer and one fewer dispatch). Under `HEAD_SCAN_PREFILL`
+        // (test-only head-kernel reference) fall through to `prep_conv_qkv` +
+        // `gated_delta_fused_prefill` so the head reference still runs.
+        #[cfg(test)]
+        let allow_with_conv = !super::gated_delta::HEAD_SCAN_PREFILL.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let allow_with_conv = true;
+        if allow_with_conv
+            && self.conv_kernel_dim == 4
+            && self.key_head_dim == 128
+            && self.value_head_dim == 128
+            && self.conv_dim == 2 * self.key_dim + self.value_dim
+            && let Some(conv_w) = self.conv1d_w4_f32.as_ref()
+            && conv_state.is_none_or(|h| h.dtype().ok() == Some(crate::array::DType::BFloat16))
+        {
+            let window_conv =
+                |s: usize, e: usize, state: Option<&MxArray>, history: Option<&MxArray>| {
+                    let whole = (s, e) == (0, seq_len as usize);
+                    let r = |x: &MxArray| {
+                        if whole {
+                            Ok(x.clone())
+                        } else {
+                            window_rows(x, s, e)
+                        }
+                    };
+                    let (qkv_s, a_s, b_s, z_s) = (r(qkv)?, r(a)?, r(b)?, r(z)?);
+                    gated_delta_fused_prefill_with_conv(
+                        &qkv_s,
+                        conv_w,
+                        history,
+                        state,
+                        self.num_k_heads,
+                        self.num_v_heads,
+                        &GdnPrefill {
+                            a: &a_s,
+                            b: &b_s,
+                            a_log: &self.a_log,
+                            dt_bias: &self.dt_bias,
+                            wq: &self.qk_norm_w_q,
+                            wk: &self.qk_norm_w_k,
+                            qk_eps: 1e-6,
+                            tiled: self.tiled_gguf_layout,
+                            tail: GdnTail {
+                                z: &z_s,
+                                norm_weight: self.norm.weight(),
+                                eps: self.norm.eps(),
+                                state_dst: None,
+                            },
+                        },
+                    )
+                };
+            match rows {
+                None => {
+                    if let Some((gated, state, next_conv)) =
+                        window_conv(0, seq_len as usize, recurrent.as_ref(), conv_state)?
+                    {
+                        if let Some(cache) = cache.as_deref_mut() {
+                            cache.set(0, next_conv)?;
+                        }
+                        return Ok(Some(PrefillPrep::Fused {
+                            gated,
+                            state,
+                            captured: Vec::new(),
+                            captured_conv: None,
+                        }));
+                    }
+                }
+                Some(cuts) => {
+                    let mut declined = false;
+                    let split = gated_delta_split_at(
+                        seq_len as usize,
+                        cuts,
+                        GdnCarry {
+                            state: recurrent.clone(),
+                            history: conv_state.cloned(),
+                        },
+                        |s, e, carry| match window_conv(
+                            s,
+                            e,
+                            carry.state.as_ref(),
+                            carry.history.as_ref(),
+                        )? {
+                            Some((gated, state, next_conv)) => Ok((
+                                gated,
+                                GdnCarry {
+                                    state: Some(state),
+                                    history: Some(next_conv),
+                                },
+                            )),
+                            None => {
+                                declined = s == 0;
+                                Err(Error::from_reason(
+                                    "fused GDN prefill-with-conv declined a capture segment",
+                                ))
+                            }
+                        },
+                    );
+                    match split {
+                        Ok(split) => {
+                            let state = split.carry.state.ok_or_else(|| {
+                                Error::from_reason("GDN capture: the split carried no state")
+                            })?;
+                            let final_conv = split.carry.history.ok_or_else(|| {
+                                Error::from_reason("GDN capture: the split carried no conv history")
+                            })?;
+                            let mut states = Vec::with_capacity(split.captured.len());
+                            let mut convs = Vec::with_capacity(split.captured.len());
+                            for carry in split.captured {
+                                states.push(carry.state.ok_or_else(|| {
+                                    Error::from_reason("GDN capture: a split row carried no state")
+                                })?);
+                                convs.push(carry.history.ok_or_else(|| {
+                                    Error::from_reason(
+                                        "GDN capture: a split row carried no conv history",
+                                    )
+                                })?);
+                            }
+                            if let Some(cache) = cache.as_deref_mut() {
+                                cache.set(0, final_conv)?;
+                            }
+                            return Ok(Some(PrefillPrep::Fused {
+                                gated: split.y,
+                                state,
+                                captured: states,
+                                captured_conv: Some(convs),
+                            }));
+                        }
+                        Err(_) if declined => {
+                            // Fall through cleanly to `prep_conv_qkv` +
+                            // `gated_delta_fused_prefill` with `cache[0]` untouched.
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+        }
+
         // Conv first: on a late kernel decline the prepared views feed the
         // shared chain instead of being recomputed.
         let (q_raw, k_raw, v) = self.prep_conv_qkv(
@@ -2999,6 +3360,7 @@ impl GatedDeltaNet {
                 gated,
                 state,
                 captured,
+                captured_conv: None,
             },
             None => PrefillPrep::Raw {
                 q: q_raw,
@@ -4644,6 +5006,313 @@ mod tests {
             max_diff(settled_arrays.get(1).unwrap(), ref_cache.get(1).unwrap())? <= 1e-4,
             "settled recurrent_state mismatch"
         );
+        Ok(())
+    }
+
+    /// RAII guard restoring `HEAD_SCAN_PREFILL` on scope exit or panic.
+    struct HeadScanGuard(bool);
+    impl HeadScanGuard {
+        fn set(head: bool) -> Self {
+            let prev = crate::models::qwen3_5::gated_delta::HEAD_SCAN_PREFILL.with(|c| {
+                let old = c.get();
+                c.set(head);
+                old
+            });
+            Self(prev)
+        }
+    }
+    impl Drop for HeadScanGuard {
+        fn drop(&mut self) {
+            crate::models::qwen3_5::gated_delta::HEAD_SCAN_PREFILL.with(|c| c.set(self.0));
+        }
+    }
+
+    /// `gated_delta_fused_prefill_with_conv` must match `prep_conv_qkv` +
+    /// `gated_delta_fused_prefill` bit for bit across cold/warm histories,
+    /// strided views (including a 4-byte-offset misaligned state), f32 and bf16
+    /// scalars, `T = 1, 2, 3, 16, 17, 64, 65`, and `tiled = true/false`.
+    #[test]
+    fn fused_prefill_with_conv_matches_prep_and_prefill_bit_for_bit() -> Result<()> {
+        if !crate::models::qwen3_5::gated_delta::tests::fused_prefill_launches() {
+            eprintln!("SKIP fused_prefill_with_conv_matches_prep_and_prefill_bit_for_bit");
+            return Ok(());
+        }
+        let d = 128i64;
+        for (hv, tiled) in [(48i64, true), (32, false)] {
+            let hk = 16i64;
+            let w_dim = (2 * hk + hv) * d;
+            for scalars in [DType::Float32, DType::BFloat16] {
+                let mut net = capture_net_heads(hv, tiled);
+                let a_log = MxArray::random_normal(&[hv], 0.0, 0.3, Some(DType::Float32))?
+                    .astype(scalars)?;
+                let dt_bias = MxArray::random_normal(&[hv], 0.0, 0.3, Some(DType::Float32))?
+                    .astype(scalars)?;
+                net.a_log = a_log.clone();
+                net.dt_bias = dt_bias.clone();
+                let conv_w = net.conv1d_w4_f32.as_ref().expect("conv1d_w4_f32").clone();
+                let norm_w = net.norm.weight().clone();
+
+                // Off-contract decline checks (checked once per config).
+                {
+                    let qkv1 = rand_bf16(&[1, 1, w_dim]);
+                    let a1 = rand_bf16(&[1, 1, hv]);
+                    let z1 = rand_bf16(&[1, 1, hv * d]);
+                    let pf1 = GdnPrefill {
+                        a: &a1,
+                        b: &a1,
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        wq: &net.qk_norm_w_q,
+                        wk: &net.qk_norm_w_k,
+                        qk_eps: 1e-6,
+                        tiled,
+                        tail: GdnTail {
+                            z: &z1,
+                            norm_weight: &norm_w,
+                            eps: net.norm.eps(),
+                            state_dst: None,
+                        },
+                    };
+                    assert!(
+                        gated_delta_fused_prefill_with_conv(
+                            &qkv1, &conv_w, None, None, 0, hv as i32, &pf1,
+                        )?
+                        .is_none(),
+                        "hk == 0 must decline"
+                    );
+                    let wrong_conv_w = conv_w.astype(DType::BFloat16)?;
+                    assert!(
+                        gated_delta_fused_prefill_with_conv(
+                            &qkv1,
+                            &wrong_conv_w,
+                            None,
+                            None,
+                            hk as i32,
+                            hv as i32,
+                            &pf1,
+                        )?
+                        .is_none(),
+                        "bf16 conv_w must decline"
+                    );
+                }
+
+                let warm_hist_full = rand_bf16(&[1, 3, w_dim + 64]);
+                let warm_hist = warm_hist_full.slice_axis(2, 0, w_dim)?;
+                let state_elems = hv * d * d;
+                // Offset by 1 float (4 bytes, not 16B aligned) to exercise the
+                // float4 alignment guard in `GdnFusedPrefillWithConv::eval_gpu`.
+                let state_padded =
+                    MxArray::random_normal(&[state_elems + 1], 0.0, 0.3, Some(DType::Float32))?;
+                state_padded.eval();
+                let warm_state = state_padded
+                    .slice_axis(0, 1, 1 + state_elems)?
+                    .reshape(&[1, hv, d, d])?;
+                warm_state.eval();
+
+                for &t in &[1i64, 2, 3, 16, 17, 64, 65] {
+                    // Strided production views: qkv and z from a padded qkvz,
+                    // b and a from a padded ba.
+                    let qkvz = rand_bf16(&[1, t, w_dim + hv * d + 64]);
+                    let qkv = qkvz.slice_axis(2, 0, w_dim)?;
+                    let z = qkvz.slice_axis(2, w_dim, w_dim + hv * d)?;
+                    let ba = rand_bf16(&[1, t, 2 * hv + 32]);
+                    let b = ba.slice_axis(2, 0, hv)?;
+                    let a = ba.slice_axis(2, hv, 2 * hv)?;
+                    let pf = GdnPrefill {
+                        a: &a,
+                        b: &b,
+                        a_log: &a_log,
+                        dt_bias: &dt_bias,
+                        wq: &net.qk_norm_w_q,
+                        wk: &net.qk_norm_w_k,
+                        qk_eps: 1e-6,
+                        tiled,
+                        tail: GdnTail {
+                            z: &z,
+                            norm_weight: &norm_w,
+                            eps: net.norm.eps(),
+                            state_dst: None,
+                        },
+                    };
+                    for warm in [false, true] {
+                        let tag = format!("hv={hv} tiled={tiled} {scalars:?} T={t} warm={warm}");
+                        let hist_opt = warm.then_some(&warm_hist);
+                        let st_opt = warm.then_some(&warm_state);
+
+                        let mut ref_cache = ArraysCache::new(2);
+                        let (q_raw, k_raw, v_raw) = net.prep_conv_qkv(
+                            &qkv,
+                            1,
+                            t,
+                            None,
+                            Some(&mut ref_cache),
+                            hist_opt.cloned(),
+                            true,
+                        )?;
+                        let (ref_out, ref_state) =
+                            gated_delta_fused_prefill(&q_raw, &k_raw, &v_raw, st_opt, &pf)?
+                                .expect("reference fused prefill must run");
+                        let ref_conv = ref_cache.get(0).expect("ref conv_state").clone();
+                        MxArray::eval_arrays(&[&ref_out, &ref_state, &ref_conv])?;
+
+                        unsafe { sys::mlx_test_kquant_counting(true) };
+                        let fused = gated_delta_fused_prefill_with_conv(
+                            &qkv, &conv_w, hist_opt, st_opt, hk as i32, hv as i32, &pf,
+                        )?;
+                        let (got_out, got_state, got_conv) =
+                            fused.expect("fused prefill with conv must run");
+                        MxArray::eval_arrays(&[&got_out, &got_state, &got_conv])?;
+                        let scans = unsafe {
+                            sys::mlx_test_kquant_family_count(c"gdn_prefill_row_scan".as_ptr())
+                        };
+                        unsafe { sys::mlx_test_kquant_counting(false) };
+
+                        assert_eq!(scans, 1, "{tag}: expected 1 row_scan dispatch");
+                        assert_eq!(
+                            got_conv.shape()?.as_ref(),
+                            &[1, 3, w_dim],
+                            "{tag}: conv_state shape"
+                        );
+                        assert_eq!(raw_bits(&got_out), raw_bits(&ref_out), "{tag}: out");
+                        assert_eq!(raw_bits(&got_state), raw_bits(&ref_state), "{tag}: state");
+                        assert_eq!(
+                            raw_bits(&got_conv),
+                            raw_bits(&ref_conv),
+                            "{tag}: conv_state"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Full `GatedDeltaNet` layer forward on the fused-with-conv prefill path:
+    /// `cache = None`, cold/warm capture splits (`rows = &[1, 2, 3, 16, 17, 64, 65]`),
+    /// both `tiled = true/false`, both f32 and bf16 scalars, non-aliasing
+    /// captures, and `HEAD_SCAN_PREFILL` still routing to the head reference.
+    #[test]
+    fn fused_prefill_with_conv_layer_capture_and_no_cache() -> Result<()> {
+        if !crate::models::qwen3_5::gated_delta::tests::fused_prefill_launches() {
+            eprintln!("SKIP fused_prefill_with_conv_layer_capture_and_no_cache");
+            return Ok(());
+        }
+        // `gdn_prefill_head_scan` requires a larger threadgroup than `gdn_prefill_row_scan`
+        // and can decline on smaller GPUs (e.g. virtualized CI runners) where row_scan runs.
+        let head_scan_launches = {
+            let _g = HeadScanGuard::set(true);
+            crate::models::qwen3_5::gated_delta::tests::fused_prefill_launches()
+        };
+        let cuts: &[usize] = &[1, 2, 3, 16, 17, 64, 65];
+        for (hv, tiled, scalars) in [
+            (48i64, true, DType::Float32),
+            (32, false, DType::Float32),
+            (48, true, DType::BFloat16),
+            (32, false, DType::BFloat16),
+        ] {
+            let mut net = capture_net_heads(hv, tiled);
+            if scalars == DType::BFloat16 {
+                net.a_log = net.a_log.astype(DType::BFloat16)?;
+                net.dt_bias = net.dt_bias.astype(DType::BFloat16)?;
+            }
+            let x = exact_bf16(&[1, 65, 64], 77 + hv as u32);
+            x.eval();
+
+            // 1. `cache = None` takes fused-with-conv and matches reference.
+            unsafe { sys::mlx_test_kquant_counting(true) };
+            let out_nocache = net.forward(&x, None, None, true)?;
+            out_nocache.eval();
+            let scans =
+                unsafe { sys::mlx_test_kquant_family_count(c"gdn_prefill_row_scan".as_ptr()) };
+            unsafe { sys::mlx_test_kquant_counting(false) };
+            assert_eq!(scans, 1, "hv={hv} tiled={tiled} {scalars:?} cache=None");
+
+            let ref_nocache = if scalars == DType::Float32 && head_scan_launches {
+                let _g = HeadScanGuard::set(true);
+                unsafe { sys::mlx_test_kquant_counting(true) };
+                let y = net.forward(&x, None, None, true)?;
+                y.eval();
+                let head_scans =
+                    unsafe { sys::mlx_test_kquant_family_count(c"gdn_prefill_head_scan".as_ptr()) };
+                unsafe { sys::mlx_test_kquant_counting(false) };
+                assert_eq!(head_scans, 1, "HEAD_SCAN_PREFILL must route to head scan");
+                y
+            } else {
+                let mut sink = None;
+                net.forward_with_tape(&x, None, None, true, Some(&mut sink))?
+            };
+            assert_eq!(
+                raw_bits(&out_nocache),
+                raw_bits(&ref_nocache),
+                "hv={hv} tiled={tiled} {scalars:?} cache=None output"
+            );
+
+            // 2. Capture splits (cold and warm cache).
+            for warm in [false, true] {
+                let tag = format!("hv={hv} tiled={tiled} {scalars:?} warm={warm}");
+                let mut base = ArraysCache::new(2);
+                if warm {
+                    net.forward(&exact_bf16(&[1, 5, 64], 91), None, Some(&mut base), true)?;
+                    MxArray::eval_arrays(&[base.get(0).unwrap(), base.get(1).unwrap()])?;
+                }
+                let mut plain = copy_cache(&base);
+                let out_plain = net.forward(&x, None, Some(&mut plain), true)?;
+
+                let mut live = copy_cache(&base);
+                let (out_cap, captured) = net.forward_captured(
+                    &x,
+                    Some(&mut live),
+                    true,
+                    None,
+                    &GdnCapturePlan { rows: cuts },
+                )?;
+                assert_eq!(raw_bits(&out_cap), raw_bits(&out_plain), "{tag}: out");
+                for slot in 0..2 {
+                    assert_eq!(
+                        raw_bits(live.get(slot).unwrap()),
+                        raw_bits(plain.get(slot).unwrap()),
+                        "{tag}: live cache slot {slot}"
+                    );
+                }
+                assert_eq!(captured.len(), cuts.len(), "{tag}: capture count");
+                for (i, cap) in captured.iter().enumerate() {
+                    assert!(
+                        !aliases(&cap.conv, live.get(0).unwrap())
+                            && !aliases(&cap.rec, live.get(1).unwrap()),
+                        "{tag} cut {}: capture aliases live cache",
+                        cuts[i]
+                    );
+                }
+                if scalars == DType::Float32 {
+                    let _g = HeadScanGuard::set(true);
+                    let mut head_cache = copy_cache(&base);
+                    let (out_head, head_caps) = net.forward_captured(
+                        &x,
+                        Some(&mut head_cache),
+                        true,
+                        None,
+                        &GdnCapturePlan { rows: cuts },
+                    )?;
+                    assert_eq!(
+                        raw_bits(&out_cap),
+                        raw_bits(&out_head),
+                        "{tag}: vs head out"
+                    );
+                    for (&c, (got, want)) in cuts.iter().zip(captured.iter().zip(&head_caps)) {
+                        assert_eq!(
+                            raw_bits(&got.conv),
+                            raw_bits(&want.conv),
+                            "{tag} cut {c}: conv vs head"
+                        );
+                        assert_eq!(
+                            raw_bits(&got.rec),
+                            raw_bits(&want.rec),
+                            "{tag} cut {c}: rec vs head"
+                        );
+                    }
+                }
+            }
+        }
         Ok(())
     }
 }

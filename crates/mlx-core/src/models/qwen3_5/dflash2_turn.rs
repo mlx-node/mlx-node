@@ -32,8 +32,9 @@ use super::dflash2_state::paged::{
     DFlash2States, PagedAnchor, PrefillYield, TurnStates, anchor_bytes,
 };
 use super::dflash2_state::plan::{
-    CaptureSpan, PlanInputs, StatePlan, checkpoint_interval, command_breaks,
-    configure_draft_state_plan, plan_draft_context, replay_state_boundary,
+    CaptureSpan, PlanInputs, StatePlan, checkpoint_interval, command_breaks_with_head,
+    configure_draft_state_plan_with_head, head_boundary_for, plan_draft_context,
+    replay_state_boundary,
 };
 use super::dflash2_state::store::{EntryId, Inserted, Lineage, StateClass, lineage_bytes};
 use super::draft_context::DraftContextWindow;
@@ -559,6 +560,70 @@ fn state_window<T: DFlash2Target>(target: &T) -> Result<u32> {
     }
 }
 
+fn turn_head_boundary<T: DFlash2Target>(target: &T, seq: u32) -> u32 {
+    target.dflash2_states().turn_head_boundary(seq)
+}
+
+fn set_turn_head_boundary<T: DFlash2Target>(target: &mut T, seq: u32, head_boundary: u32) {
+    target
+        .dflash2_states_mut()
+        .set_turn_head_boundary(seq, head_boundary);
+}
+
+/// Prompt-head token count for a live turn of `tokens` (first `prompt` rows are
+/// the prompt) resuming at `resume` on `(cache_salt, extra_keys)`.
+///
+/// A turn whose prompt establishes the first durable prompt head on its lineage
+/// (no existing explicit prompt-head ancestor strictly below `prompt_replay`)
+/// marks `prompt_replay` as its persistent prompt head; later continuations
+/// extending an earlier prompt head return `0` so superseded intermediate turns
+/// still settle as `Unneeded` while the conversation's head persists. Checking
+/// explicit prompt-head provenance (instead of any `!entry.checkpoint()` state)
+/// ensures non-head ordinary states — such as preemption-promoted reply
+/// checkpoints or lazy junctions — never suppress the first durable prompt head.
+fn live_prompt_head_tokens<T: DFlash2Target>(
+    target: &T,
+    tokens: &[u32],
+    prompt: u32,
+    resume: u32,
+    cache_salt: u64,
+    extra_keys: &[Vec<u64>],
+) -> u32 {
+    let Some(adapter) = target.paged_adapter_ref() else {
+        return 0;
+    };
+    let block = adapter.block_size();
+    let prompt_end = (prompt as usize).min(tokens.len());
+    let prompt_replay = crate::engine::gen_prompt::prompt_replay_boundary(
+        &tokens[..prompt_end],
+        target.dflash2_states().generation_suffix.as_deref(),
+        block as usize,
+    );
+    let Ok(prompt_replay_u32) = u32::try_from(prompt_replay) else {
+        return 0;
+    };
+    if prompt_replay_u32 == 0 || prompt_replay_u32 <= resume {
+        return 0;
+    }
+    let states = target.dflash2_states();
+    let store = &states.store;
+    let lineage = Lineage {
+        tokens: &tokens[..prompt_end],
+        extra_keys,
+        salt: cache_salt,
+    };
+    let has_prompt_head_ancestor = store
+        .deepest_accepted_within(lineage, prompt_replay.saturating_sub(1), |id| {
+            states.is_prompt_head(id) && store.get(id).is_some_and(|entry| !entry.checkpoint())
+        })
+        .is_some();
+    if has_prompt_head_ancestor {
+        0
+    } else {
+        prompt_replay_u32
+    }
+}
+
 /// Splash `Engine::configureDraftStatePlan` for a turn of `tokens` that
 /// resumes at `resume` with a junction at `junction` (0 for none), with the
 /// state window; `None` without a pool. Shared-prefill points are not
@@ -569,7 +634,8 @@ fn state_plan<T: DFlash2Target>(
     prompt: u32,
     resume: u32,
     junction: u32,
-) -> Result<Option<(StatePlan, u32)>> {
+    head_tokens: u32,
+) -> Result<Option<(StatePlan, u32, u32)>> {
     let Some(adapter) = target.paged_adapter_ref() else {
         return Ok(None);
     };
@@ -583,20 +649,24 @@ fn state_plan<T: DFlash2Target>(
         block as usize,
     ))
     .map_err(|_| Error::from_reason("DFlash2 replay point exceeds u32 tokens"))?;
+    let head_boundary = head_boundary_for(head_tokens, block);
     // Splash `plannedCheckpoints` margins with the constant
     // `prefillTokenBudget`, never the configured chunk.
     let chunk =
         super::paged_forward::prefill_chunk_rows(crate::models::forward::PREFILL_STEP_SIZE as i32);
-    let plan = configure_draft_state_plan(&PlanInputs {
-        resume,
-        junction,
-        prompt_replay,
-        replay_state: replay_state_boundary(len, prompt.min(len), prompt_replay, block),
-        window,
-        interval: checkpoint_interval(window, block),
-        chunk: u32::try_from(chunk).unwrap_or(0),
-    });
-    Ok(Some((plan, window)))
+    let plan = configure_draft_state_plan_with_head(
+        &PlanInputs {
+            resume,
+            junction,
+            prompt_replay,
+            replay_state: replay_state_boundary(len, prompt.min(len), prompt_replay, block),
+            window,
+            interval: checkpoint_interval(window, block),
+            chunk: u32::try_from(chunk).unwrap_or(0),
+        },
+        head_boundary,
+    );
+    Ok(Some((plan, window, head_boundary)))
 }
 
 /// Splash `Cache::lookup`'s junction: the KV hit of `tokens` (its leading
@@ -641,15 +711,26 @@ fn open_turn<T: DFlash2Target>(
     reuse: bool,
     extra_keys: Option<Vec<Vec<u64>>>,
 ) -> Result<StatePlan> {
-    let plan = if reuse {
-        state_plan(&*target, tokens, prompt, resume, junction)?
-            .map(|(plan, _)| plan)
+    let seq = target.lane_seq();
+    let (plan, head_boundary) = if reuse {
+        let extra_keys_ref: &[Vec<u64>] = match &extra_keys {
+            Some(keys) => keys.as_slice(),
+            None => target
+                .dflash2_states()
+                .turns
+                .get(&seq)
+                .map_or(&[][..], |turn| turn.extra_keys.as_slice()),
+        };
+        let head_tokens =
+            live_prompt_head_tokens(&*target, tokens, prompt, resume, cache_salt, extra_keys_ref);
+        state_plan(&*target, tokens, prompt, resume, junction, head_tokens)?
+            .map(|(plan, _, head_boundary)| (plan, head_boundary))
             .unwrap_or_default()
     } else {
-        StatePlan::default()
+        (StatePlan::default(), 0)
     };
+    set_turn_head_boundary(target, seq, head_boundary);
     let anchor_bytes = turn_anchor_bytes(&*target, &plan);
-    let seq = target.lane_seq();
     let extra_keys = extra_keys.unwrap_or_else(|| {
         target
             .dflash2_states_mut()
@@ -1056,7 +1137,13 @@ pub(crate) fn turn_plan<T: DFlash2Target>(
     if !target.replay_state_exact() {
         plan.boundaries.clear();
     }
-    let breaks = command_breaks(resume, len, u32::try_from(chunk_rows).unwrap_or(0), &plan);
+    let breaks = command_breaks_with_head(
+        resume,
+        len,
+        u32::try_from(chunk_rows).unwrap_or(0),
+        &plan,
+        turn_head_boundary(&*target, seq),
+    );
     if let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq) {
         turn.plan = plan.clone();
         turn.passed = breaks.passed;
@@ -1565,6 +1652,9 @@ fn publish_point<T: DFlash2Target>(
     turn.cursor += 1;
     let checkpoint = point.disposable;
     let replay = !checkpoint && row == turn.plan.prompt_replay;
+    let head_boundary = turn_head_boundary(&*target, target.lane_seq());
+    let is_head = !checkpoint && head_boundary > 0 && row == head_boundary;
+    let keeps = !checkpoint && (replay || is_head);
     let class = if checkpoint {
         CaptureClass::Checkpoint
     } else if replay {
@@ -1629,7 +1719,7 @@ fn publish_point<T: DFlash2Target>(
                     .get(id)
                     .is_some_and(|entry| entry.ram().is_some())
             });
-            if !replay && resident {
+            if !keeps && resident {
                 retire_checkpoint(states, turn);
             }
             let (state, lane) = match outcome {
@@ -1637,7 +1727,7 @@ fn publish_point<T: DFlash2Target>(
                     (Some((anchor, reservation, recycled)), None)
                 }
                 Reached::FromLane(sink) => (
-                    from_lane(target, turn, &mut *sink, class, row, replay, resident)?,
+                    from_lane(target, turn, &mut *sink, class, row, keeps, resident)?,
                     Some(sink),
                 ),
                 Reached::Refused(sink) => (None, Some(sink)),
@@ -1671,7 +1761,7 @@ fn publish_point<T: DFlash2Target>(
                 } else {
                     &mut counters.junction_materializations
                 }) += 1;
-                finish_publication(target, turn, id, checkpoint, replay, depth);
+                finish_publication(target, turn, id, checkpoint, keeps, is_head, depth);
                 return Ok(());
             };
             let states = target.dflash2_states_mut();
@@ -1703,24 +1793,25 @@ fn publish_point<T: DFlash2Target>(
             }
         }
     };
-    finish_publication(target, turn, id, checkpoint, replay, depth);
+    finish_publication(target, turn, id, checkpoint, keeps, is_head, depth);
     Ok(())
 }
 
 /// After a point's publication (Splash `publishReachedStateBoundaries`):
-/// the lane's previous checkpoint retires, except at the replay point; an
-/// ordinary point joins the copies ahead.
+/// the lane's previous checkpoint retires, except at a replay or head point;
+/// an ordinary point joins the copies ahead.
 fn finish_publication<T: DFlash2Target>(
     target: &mut T,
     turn: &mut TurnStates,
     id: EntryId,
     checkpoint: bool,
-    replay: bool,
+    keeps: bool,
+    is_head: bool,
     depth: u32,
 ) {
     let now = super::dflash2_state::disk::clock(&*target);
     let states = target.dflash2_states_mut();
-    if !replay {
+    if !keeps {
         retire_checkpoint(states, turn);
     }
     turn.latest_checkpoint = if checkpoint {
@@ -1729,22 +1820,26 @@ fn finish_publication<T: DFlash2Target>(
         None
     };
     if !checkpoint {
-        super::dflash2_state::write_behind::published(states, id, depth, now);
+        if is_head {
+            states.mark_prompt_head(id);
+        }
+        super::dflash2_state::write_behind::published_with_head(states, id, depth, now, is_head);
     }
 }
 
 /// Splash `publishReachedStateBoundaries`' `fromLane` arm: the state a
 /// claim refused before the chunk, taken from the lane under its claim
-/// now; for the replay point, a refusal first retires the lane's resident
-/// checkpoint and tries once more. `recycled` when the ledger freed units
-/// for it; None when refused.
+/// now; for a point that keeps the checkpoint (replay or head), a refusal
+/// first retires the lane's resident checkpoint and tries once more.
+/// `recycled` when the ledger freed units for it; None when refused.
+#[allow(clippy::too_many_arguments)]
 fn from_lane<T: DFlash2Target>(
     target: &mut T,
     turn: &mut TurnStates,
     sink: &mut (dyn super::paged_forward::PrefillTapSink + '_),
     class: CaptureClass,
     row: u32,
-    replay: bool,
+    keeps: bool,
     resident: bool,
 ) -> Result<Option<(PagedAnchor, Option<Reservation<'static>>, bool)>> {
     let prompt = target
@@ -1764,7 +1859,7 @@ fn from_lane<T: DFlash2Target>(
         Refusal::Settled,
         |target, retry| {
             if retry {
-                return replay && resident && retire_checkpoint(target.dflash2_states_mut(), turn);
+                return keeps && resident && retire_checkpoint(target.dflash2_states_mut(), turn);
             }
             made = Some(lane_state(target, &mut *sink, row));
             matches!(made, Some(Ok(_)))
@@ -1842,6 +1937,7 @@ fn run_control_pass<T: DFlash2Target>(
 /// go; what it published stays.
 pub(crate) fn end_turn_states<T: DFlash2Target>(target: &mut T) {
     let seq = target.lane_seq();
+    set_turn_head_boundary(target, seq, 0);
     if target.dflash2_states().turns.contains_key(&seq) {
         log_turn_end("end_use");
     }
@@ -2962,6 +3058,7 @@ pub(crate) fn lane_command_breaks<T: DFlash2Target>(
     let (Ok(start), Ok(end)) = (u32::try_from(start), u32::try_from(end)) else {
         return Vec::new();
     };
+    let head_boundary = turn_head_boundary(&*target, seq);
     let Some(turn) = target.dflash2_states_mut().turns.get_mut(&seq) else {
         return Vec::new();
     };
@@ -2970,7 +3067,13 @@ pub(crate) fn lane_command_breaks<T: DFlash2Target>(
     } else {
         end
     };
-    let breaks = command_breaks(start, stop, u32::try_from(chunk).unwrap_or(0), &turn.plan);
+    let breaks = command_breaks_with_head(
+        start,
+        stop,
+        u32::try_from(chunk).unwrap_or(0),
+        &turn.plan,
+        head_boundary,
+    );
     turn.passed
         .extend(breaks.passed.into_iter().filter(|&row| row <= end));
     breaks
@@ -4743,5 +4846,540 @@ mod tests {
         drop(restore);
         drop(manager);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn finish_publication_at_head_boundary_keeps_checkpoint_and_marks_write_behind_head() {
+        use super::super::dflash2_state::disk::tests::{
+            fixture_on, park_blocks, persistent_test_tier,
+        };
+        use super::super::dflash2_state::plan::StatePlan;
+        use super::super::dflash2_state::write_behind::DELAY_SECONDS;
+
+        let Some((mut inner, _tier)) = fixture_on(
+            0x16A0_0001,
+            32,
+            32,
+            persistent_test_tier("qwen35-head-keeps-cp", 1 << 30),
+        ) else {
+            return;
+        };
+
+        // 1. Park a rolling Checkpoint at 2 blocks (32 tokens) and a head Ordinary at 3 blocks
+        //    (48 tokens), plus a deeper Ordinary at 4 blocks (64 tokens) superseding the head.
+        let cp_id = park_blocks(&mut inner, 41, 2, StateClass::Checkpoint);
+        let head_id = park_blocks(&mut inner, 41, 3, StateClass::Ordinary);
+        let tip_id = park_blocks(&mut inner, 41, 4, StateClass::Ordinary);
+        let cp_state = inner.dflash2_states.store.checkpoint_state(cp_id);
+        assert!(cp_state.is_some());
+
+        let mut turn = TurnStates {
+            plan: StatePlan::default(),
+            cursor: 0,
+            passed: Vec::new(),
+            anchor_bytes: 0,
+            latest_checkpoint: cp_state,
+            cache_salt: 0,
+            extra_keys: Vec::new(),
+            junction: 0,
+            prompt_tokens: 64,
+            reuse: true,
+        };
+
+        // Publishing at `head_boundary` (`keeps = true, is_head = true`) must NOT retire `cp_id`
+        // AND must enqueue `head_id` into write_behind with `head = true` so it survives being
+        // superseded by `tip_id`!
+        let head_depth = inner
+            .dflash2_states
+            .store
+            .get(head_id)
+            .expect("head")
+            .depth() as u32;
+        finish_publication(
+            &mut inner, &mut turn, head_id, false, true, true, head_depth,
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(cp_id)
+                .is_some_and(|e| e.checkpoint()),
+            "finish_publication at head_boundary must NOT retire the prior rolling checkpoint"
+        );
+        assert!(turn.latest_checkpoint.is_none());
+        assert!(
+            inner.dflash2_states.store.superseded(head_id),
+            "head_id is superseded by tip_id"
+        );
+
+        // Running write_behind past the delay must still persist `head_id` (not drop as Unneeded!).
+        let run_now = crate::engine::governor::governor().now() + DELAY_SECONDS + 10.0;
+        let _ = super::super::dflash2_state::write_behind::run(&mut inner, run_now, 0, false);
+        let head_entry = inner.dflash2_states.store.get(head_id).expect("head entry");
+        assert!(
+            head_entry.disk().is_some(),
+            "persistent head must be persisted by write_behind even after being superseded"
+        );
+        let _ = tip_id;
+    }
+
+    /// Finding 3 regression: ordinary turn planning (`open_lane_turn` and
+    /// `turn_plan` -> `open_turn` -> `state_plan`) must compute and retain the
+    /// live prompt-head boundary without manual `set_turn_head_boundary` calls
+    /// so `publish_reached_state` marks `is_head = true` for:
+    /// 1. Short live prompt heads below `MINIMUM_TOKENS` on a persistent tier;
+    /// 2. Turn-1 prompt heads later superseded by Turn 2 and Turn 3 (while
+    ///    superseded intermediate Turn 2 is NOT marked head and settles as `Unneeded`).
+    #[test]
+    fn live_turn_planning_persists_short_and_superseded_prompt_heads() {
+        use super::super::dflash2_state::disk::poll_offload;
+        use super::super::dflash2_state::disk::tests::{
+            drained, fixture_on, persistent_test_tier, window, writable_anchor,
+        };
+        use super::super::dflash2_state::write_behind::{DELAY_SECONDS, MINIMUM_TOKENS};
+
+        // Part 1: short live prompt head (< MINIMUM_TOKENS) planned via `open_lane_turn`.
+        let Some((mut short_inner, short_tier)) = fixture_on(
+            0x16A0_0002,
+            32,
+            32,
+            persistent_test_tier("qwen35-live-short-head", 1 << 30),
+        ) else {
+            return;
+        };
+        let bs = short_inner
+            .paged_adapter
+            .as_ref()
+            .expect("pool")
+            .block_size();
+        assert!(
+            bs < MINIMUM_TOKENS,
+            "test relies on 1-block prompt head ({bs}) < MINIMUM_TOKENS ({MINIMUM_TOKENS})"
+        );
+        let short_prompt: Vec<u32> = (100..100 + bs + 4).collect();
+        {
+            let adapter = short_inner.paged_adapter.as_mut().expect("pool");
+            adapter.reset_for_new_request(0).expect("reset");
+            adapter
+                .allocate_suffix_blocks(short_prompt.len() as u32)
+                .expect("alloc");
+            adapter.record_tokens(&short_prompt).expect("record");
+            assert_eq!(
+                adapter.register_full_blocks_for_reuse(&[], 0).expect("reg"),
+                1
+            );
+        }
+        open_lane_turn(&mut short_inner, &short_prompt, &[], 0, 0, true, None)
+            .expect("open_lane_turn");
+        assert_eq!(
+            turn_head_boundary(&short_inner, 0),
+            bs,
+            "open_lane_turn must plan and retain the aligned live prompt head boundary"
+        );
+        let anchor = writable_anchor(&short_inner.config, window(&short_inner));
+        publish_reached_state(&mut short_inner, bs, Reached::Captured(anchor, None, false))
+            .expect("publish short prompt head");
+        end_turn_states(&mut short_inner);
+        assert_eq!(
+            turn_head_boundary(&short_inner, 0),
+            0,
+            "end_turn_states must clear the turn head boundary"
+        );
+        assert_eq!(
+            short_inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("disk")
+                .write_behind
+                .snapshot()
+                .waiting,
+            1,
+            "short live prompt head (< MINIMUM_TOKENS) must be queued in write_behind"
+        );
+        let run_now = crate::engine::governor::governor().now() + DELAY_SECONDS + 10.0;
+        let _ = super::super::dflash2_state::write_behind::run(&mut short_inner, run_now, 0, false);
+        drained(&short_tier);
+        let _ = poll_offload(&mut short_inner);
+        let _ = super::super::dflash2_state::write_behind::run(&mut short_inner, run_now, 0, false);
+        let (_, short_id) = short_inner
+            .dflash2_states
+            .store
+            .locate(Lineage::text(&short_prompt[..bs as usize], 0));
+        let short_id = short_id.expect("short head stored");
+        assert!(
+            short_inner
+                .dflash2_states
+                .store
+                .get(short_id)
+                .expect("entry")
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "short live prompt head must become durable on SSD through ordinary turn planning"
+        );
+        drop(short_inner);
+        drop(short_tier);
+
+        // Part 2: multi-turn conversation planned via `turn_plan` (Turn 1 head at 3 blocks,
+        // Turn 2 continuation at 6 blocks, Turn 3 newest at 9 blocks). Turn 1 must persist
+        // despite superseding Turn 2 & Turn 3; Turn 2 must settle as Unneeded; Turn 3 persists.
+        let Some((mut inner, tier)) = fixture_on(
+            0x16A0_0003,
+            32,
+            32,
+            persistent_test_tier("qwen35-live-superseded-head", 1 << 30),
+        ) else {
+            return;
+        };
+        let bs = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let conv: Vec<u32> = (500..500 + bs * 10).collect();
+
+        let mut publish_turn = |prompt_blocks: u32, cached_blocks: u32| -> EntryId {
+            let prompt_len = (prompt_blocks * bs + 4) as usize;
+            let row = prompt_blocks * bs;
+            let prompt = &conv[..prompt_len];
+            {
+                let adapter = inner.paged_adapter.as_mut().expect("pool");
+                adapter.reset_for_new_request(0).expect("reset");
+                adapter
+                    .allocate_suffix_blocks(prompt.len() as u32)
+                    .expect("alloc");
+                adapter.record_tokens(prompt).expect("record");
+                adapter.register_full_blocks_for_reuse(&[], 0).expect("reg");
+            }
+            turn_plan(&mut inner, prompt, (cached_blocks * bs) as usize, 0, 256)
+                .expect("turn_plan");
+            let expected_head = if cached_blocks == 0 { row } else { 0 };
+            assert_eq!(
+                turn_head_boundary(&inner, 0),
+                expected_head,
+                "only the initial live turn (cached_blocks={cached_blocks}) establishes a prompt head"
+            );
+            let anchor = writable_anchor(&inner.config, window(&inner));
+            publish_reached_state(&mut inner, row, Reached::Captured(anchor, None, false))
+                .expect("publish turn boundary");
+            end_turn_states(&mut inner);
+            inner
+                .dflash2_states
+                .store
+                .locate(Lineage::text(&conv[..row as usize], 0))
+                .1
+                .expect("published entry")
+        };
+
+        let head_id = publish_turn(3, 0);
+        let mid_id = publish_turn(6, 3);
+        let tip_id = publish_turn(9, 6);
+        assert!(inner.dflash2_states.store.superseded(head_id));
+        assert!(inner.dflash2_states.store.superseded(mid_id));
+        assert!(!inner.dflash2_states.store.superseded(tip_id));
+
+        let run_now = crate::engine::governor::governor().now() + DELAY_SECONDS + 10.0;
+        for _ in 0..16 {
+            let _ = super::super::dflash2_state::write_behind::run(&mut inner, run_now, 0, false);
+            drained(&tier);
+            let _ = poll_offload(&mut inner);
+            if inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("disk")
+                .write_behind
+                .snapshot()
+                .waiting
+                == 0
+            {
+                break;
+            }
+        }
+        let snap = inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("disk")
+            .write_behind
+            .snapshot();
+        assert_eq!(snap.waiting, 0, "all write-behind entries must settle");
+        assert_eq!(
+            snap.durable, 2,
+            "Turn 1 head and newest Turn 3 must persist"
+        );
+        assert_eq!(
+            snap.unneeded, 1,
+            "superseded continuation Turn 2 must settle as Unneeded"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(head_id)
+                .expect("head")
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "Turn 1 live prompt head must persist to SSD despite being superseded"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(mid_id)
+                .expect("mid")
+                .disk()
+                .is_none(),
+            "superseded Turn 2 continuation must NOT persist to SSD"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(tip_id)
+                .expect("tip")
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "newest Turn 3 must persist to SSD"
+        );
+    }
+
+    /// Codex Round 2 regression: a preemption-promoted `StateClass::Ordinary` reply checkpoint
+    /// (created without write-behind in `preempt_scheduled_cache_with_prompt` after a short,
+    /// unaligned Turn 1 prompt) MUST NOT suppress `is_head` on Turn 2. Turn 2 must still be
+    /// marked as the lineage's first durable prompt head and survive Turn 3 & Turn 4 superseding
+    /// it before write-behind runs (while Turn 3 settles as `Unneeded` and Turn 4 persists).
+    #[test]
+    fn preempt_promoted_reply_checkpoint_does_not_suppress_first_durable_prompt_head() {
+        use crate::engine::hybrid_scheduler::HybridSchedulerBackend;
+        use crate::engine::scheduler::PreemptionMode;
+
+        use super::super::dflash2_state::disk::poll_offload;
+        use super::super::dflash2_state::disk::tests::{
+            drained, fixture_on, persistent_test_tier, window, writable_anchor,
+        };
+        use super::super::dflash2_state::write_behind::DELAY_SECONDS;
+
+        let Some((mut inner, tier)) = fixture_on(
+            0x16A0_0004,
+            512,
+            512,
+            persistent_test_tier("qwen35-preempt-promoted-head", 1 << 30),
+        ) else {
+            return;
+        };
+        let bs = inner.paged_adapter.as_ref().expect("pool").block_size();
+        let cp_blocks = 2048u32.div_ceil(bs);
+        let cp_depth = cp_blocks * bs;
+        let conv: Vec<u32> = (1000..1000 + (cp_blocks + 8) * bs).collect();
+
+        // 1. Turn 1: short, unaligned prompt (< 1 block, so `prompt_replay == 0` -> no head).
+        let prompt1_len = (bs.saturating_sub(4)).max(1) as usize;
+        assert!(prompt1_len < bs as usize);
+        open_lane_turn(&mut inner, &conv[..prompt1_len], &[], 0, 0, true, None)
+            .expect("open Turn 1");
+        assert_eq!(
+            turn_head_boundary(&inner, 0),
+            0,
+            "unaligned Turn 1 prompt has no prompt head boundary"
+        );
+
+        // Turn 1 decodes a long reply (>= 2048 tokens), parks a rolling `Checkpoint` at
+        // `cp_depth`, and gets preempted via `preempt_scheduled_cache_with_prompt`, promoting
+        // `cp_id` to `StateClass::Ordinary` WITHOUT queueing it for write-behind.
+        {
+            let adapter = inner.paged_adapter.as_mut().expect("pool");
+            adapter.reset_for_new_request(0).expect("reset");
+            adapter.allocate_suffix_blocks(cp_depth).expect("alloc");
+            adapter
+                .record_tokens(&conv[..cp_depth as usize])
+                .expect("record");
+            adapter.register_full_blocks_for_reuse(&[], 0).expect("reg");
+        }
+        let cp_anchor = writable_anchor(&inner.config, window(&inner));
+        let cp_id = inner
+            .dflash2_states
+            .store
+            .insert(
+                Lineage::text(&conv[..cp_depth as usize], 0),
+                cp_anchor,
+                StateClass::Checkpoint,
+            )
+            .expect("insert rolling reply checkpoint")
+            .id;
+        inner.sync_gdn_state_marks();
+        let cp_state = inner.dflash2_states.store.checkpoint_state(cp_id);
+        inner
+            .dflash2_states
+            .turns
+            .get_mut(&0)
+            .expect("Turn 1 state")
+            .latest_checkpoint = cp_state;
+        inner
+            .preempt_scheduled_cache_with_prompt(
+                0,
+                prompt1_len as u32,
+                0,
+                PreemptionMode::Recompute,
+            )
+            .expect("preempt Turn 1");
+        end_turn_states(&mut inner);
+
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(cp_id)
+                .is_some_and(|e| !e.checkpoint()),
+            "preemption must promote long reply checkpoint to Ordinary"
+        );
+        assert!(
+            !inner.dflash2_states.is_prompt_head(cp_id),
+            "preemption-promoted reply checkpoint must NOT be marked as a prompt head"
+        );
+        assert_eq!(
+            inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("disk")
+                .write_behind
+                .snapshot()
+                .waiting,
+            0,
+            "preemption promotion must not eagerly queue write-behind"
+        );
+
+        let publish_turn = |inner: &mut crate::models::qwen3_5::model::Qwen35Inner,
+                            prompt_blocks: u32,
+                            cached_blocks: u32,
+                            expected_head: u32|
+         -> EntryId {
+            let prompt_len = (prompt_blocks * bs + 4) as usize;
+            let row = prompt_blocks * bs;
+            let prompt = &conv[..prompt_len];
+            {
+                let adapter = inner.paged_adapter.as_mut().expect("pool");
+                adapter.reset_for_new_request(0).expect("reset");
+                adapter
+                    .allocate_suffix_blocks(prompt.len() as u32)
+                    .expect("alloc");
+                adapter.record_tokens(prompt).expect("record");
+                adapter.register_full_blocks_for_reuse(&[], 0).expect("reg");
+            }
+            turn_plan(inner, prompt, (cached_blocks * bs) as usize, 0, 256).expect("turn_plan");
+            assert_eq!(
+                turn_head_boundary(inner, 0),
+                expected_head,
+                "unexpected turn_head_boundary at prompt_blocks={prompt_blocks}"
+            );
+            let anchor = writable_anchor(&inner.config, window(inner));
+            publish_reached_state(inner, row, Reached::Captured(anchor, None, false))
+                .expect("publish turn boundary");
+            end_turn_states(inner);
+            inner
+                .dflash2_states
+                .store
+                .locate(Lineage::text(&conv[..row as usize], 0))
+                .1
+                .expect("published entry")
+        };
+
+        // 2. Turn 2 extends past the promoted reply checkpoint: must STILL establish the
+        //    lineage's first durable prompt head!
+        let turn2_blocks = cp_blocks + 2;
+        let turn2_id = publish_turn(&mut inner, turn2_blocks, cp_blocks, turn2_blocks * bs);
+        assert!(
+            inner.dflash2_states.is_prompt_head(turn2_id),
+            "Turn 2 must be recorded as the lineage's prompt head"
+        );
+
+        // 3. Turn 3 & Turn 4 supersede Turn 2 before write-behind runs: once Turn 2 established
+        //    the prompt head, Turn 3 & Turn 4 must NOT claim head status.
+        let turn3_blocks = cp_blocks + 4;
+        let turn3_id = publish_turn(&mut inner, turn3_blocks, turn2_blocks, 0);
+        assert!(!inner.dflash2_states.is_prompt_head(turn3_id));
+
+        let turn4_blocks = cp_blocks + 6;
+        let turn4_id = publish_turn(&mut inner, turn4_blocks, turn3_blocks, 0);
+        assert!(!inner.dflash2_states.is_prompt_head(turn4_id));
+
+        assert!(inner.dflash2_states.store.superseded(turn2_id));
+        assert!(inner.dflash2_states.store.superseded(turn3_id));
+        assert!(!inner.dflash2_states.store.superseded(turn4_id));
+
+        // 4. Drain write-behind past DELAY_SECONDS: Turn 2 (head) + Turn 4 (newest tip) must
+        //    persist to SSD, Turn 3 (superseded non-head) settles as Unneeded, and `cp_id` stays
+        //    RAM-only.
+        let run_now = crate::engine::governor::governor().now() + DELAY_SECONDS + 10.0;
+        for _ in 0..256 {
+            let _ = super::super::dflash2_state::write_behind::run(&mut inner, run_now, 0, false);
+            drained(&tier);
+            let _ = poll_offload(&mut inner);
+            if inner
+                .dflash2_states
+                .disk
+                .as_ref()
+                .expect("disk")
+                .write_behind
+                .snapshot()
+                .waiting
+                == 0
+            {
+                break;
+            }
+        }
+        let snap = inner
+            .dflash2_states
+            .disk
+            .as_ref()
+            .expect("disk")
+            .write_behind
+            .snapshot();
+        assert_eq!(snap.waiting, 0, "all write-behind entries must settle");
+        assert_eq!(
+            snap.durable, 2,
+            "Turn 2 durable prompt head and newest Turn 4 must persist"
+        );
+        assert_eq!(
+            snap.unneeded, 1,
+            "superseded continuation Turn 3 must settle as Unneeded"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(cp_id)
+                .expect("promoted cp")
+                .disk()
+                .is_none(),
+            "preemption-promoted reply checkpoint was not queued for write-behind"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(turn2_id)
+                .expect("turn2")
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "Turn 2 prompt head must persist to SSD despite Turn 3 & Turn 4 superseding it"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(turn3_id)
+                .expect("turn3")
+                .disk()
+                .is_none(),
+            "superseded Turn 3 continuation must NOT persist to SSD"
+        );
+        assert!(
+            inner
+                .dflash2_states
+                .store
+                .get(turn4_id)
+                .expect("turn4")
+                .disk()
+                .is_some_and(|c| c.landed && !c.chain_owed),
+            "newest Turn 4 must persist to SSD"
+        );
     }
 }

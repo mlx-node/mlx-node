@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -21,12 +22,18 @@ use crate::engine::persistence::{
 };
 use crate::models::quant_dispatch::{
     PerLayerMode, PerLayerQuant, QslBuildSpec, QslFp8Policy, QslSym8Policy, build_qsl,
-    effective_plq_for, load_embedding_affine_or_bf16, load_linear_proj_quantized_or_bf16,
-    load_quant_settings_from_disk,
+    effective_plq_for, ensure_dense_weight_floating, ensure_row_major_kquant_layout,
+    is_kquant_mode, kquant_mode_params_for_scales, load_embedding_affine_or_bf16,
+    load_linear_proj_quantized_or_bf16, load_quant_settings_from_disk,
 };
 use crate::models::quantized_linear::{
-    DEFAULT_QUANT_MODE, LinearProj, MXFP8_MODE, NVFP4_MODE, QuantizedLinear, QuantizedSwitchLinear,
+    DEFAULT_QUANT_MODE, LinearProj, MXFP4_BITS, MXFP4_GROUP_SIZE, MXFP4_MODE, MXFP8_BITS,
+    MXFP8_GROUP_SIZE, MXFP8_MODE, NVFP4_BITS, NVFP4_GROUP_SIZE, NVFP4_MODE, QuantizedLinear,
+    QuantizedSwitchLinear, normalize_scalar_outer_scale, resolve_nvfp4_outer_scale_2d,
+    resolve_nvfp4_outer_scale_3d, resolve_optional_outer_scale_3d, row_major_kquant_arrays,
+    try_build_fp8_e4m3_quantized_linear,
 };
+use crate::moe::{SwitchLinear, SwitchProj};
 use crate::nn::{Embedding, LayerNorm, Linear};
 use crate::stream::WiredResidency;
 use crate::tokenizer::Qwen3Tokenizer;
@@ -49,12 +56,12 @@ use super::model::{
     AttnInputNorm, Inkling2Inner, Inkling2LoadOptions, Inkling2Model, Inkling2PhysicalLayer,
     default_decode_share, next_inkling2_model_id,
 };
-use super::moe::{ExpertSwitchProj, Inkling2MoE};
+use super::moe::{ExpertGateUp, Inkling2MoE};
 use super::paged_forward::Inkling2PagedRuntime;
 use super::scheduled_dspark::Inkling2ScheduledDsparkStates;
 use super::scheduler::Inkling2SchedulerState;
 use super::state_disk::compute_persistent_identity;
-use super::vision::{Inkling2VisionBlock, Inkling2VisionEncoder};
+use super::vision::{Inkling2VisionBlock, Inkling2VisionEncoder, VisionLinear};
 use crate::models::qwen3_5::dflash2::{DFlash2TargetShape, load_dflash2, read_dflash2_config};
 
 const FAMILY_NAME: &str = "inkling2";
@@ -402,7 +409,7 @@ pub(crate) async fn load_model_with_options(
             let meta = InitMeta {
                 model_id: inner.model_id,
                 config: inner.config.clone(),
-                vision_config: inner.config.vision_config.clone(),
+                vision_config: inner.vision_encoder.as_ref().map(|v| v.config.clone()),
                 tokenizer: inner.tokenizer.clone(),
                 paged_active: inner.paged.is_some(),
                 scheduled_lanes,
@@ -1123,26 +1130,49 @@ fn load_weights_sync(
     let raw_params = load_checkpoint(asset_dir, load_vision, gguf.preload.as_mut())?;
     drop(gguf.preload.take());
 
-    // Strip leading `model.` prefix so keys match `load_quant_settings_from_disk`'s normalized
-    // `per_layer_quant` namespace (keeping `lm_head.*`, `vision_tower.*`, `vision_projector.*`).
-    let mut params: HashMap<String, MxArray> = HashMap::with_capacity(raw_params.len());
-    for (k, v) in raw_params {
-        let norm_key = k
-            .strip_prefix("language_model.model.")
-            .or_else(|| k.strip_prefix("model."))
-            .map(ToOwned::to_owned)
-            .unwrap_or(k);
-        params.insert(norm_key, v);
-    }
+    // Detect SafeTensors converter layout on RAW keys BEFORE prefix stripping.
+    let layout = if is_gguf {
+        Inkling2CheckpointLayout::Canonical
+    } else {
+        detect_inkling2_safetensors_layout(&raw_params)
+    };
 
-    // Normalize native Thinking Machines HuggingFace SafeTensors checkpoints (`llm.*` / `visual.*`)
-    // with ZERO unpacking of NVFP4 (L0-19) and MXFP8 (L20-23) expert weights.
-    if !is_gguf && normalize_inkling2_safetensors_params(&mut params, &config)? {
-        config.gate_up_interleaved = true;
-    }
+    // Strip leading wrapper prefixes (`model.language_model.model.`, `model.language_model.`,
+    // `language_model.model.`, `language_model.`, `model.`) while keeping vision keys cleanly
+    // addressable for `normalize_inkling2_vision_params`.
+    let mut params = strip_inkling2_wrapper_prefixes(raw_params);
 
-    let (default_bits, default_group_size, default_mode, per_layer_quant) =
+    // Normalize SafeTensors text layouts (`Release`, `oMLX`, `mlx-vlm`, `mlx-lm`) into the
+    // canonical Inkling2 namespace and set authoritative `gate_up_interleaved` from layout.
+    let st_norm = if !is_gguf {
+        let norm = normalize_inkling2_safetensors_params(&mut params, layout, &config)?;
+        if let Some(interleaved) = norm.gate_up_interleaved {
+            config.gate_up_interleaved = interleaved;
+        }
+        // Normalize vision tower keys independently of text layout; on quantized or
+        // unsupported vision weights, log a warning and fall back to text-only mode.
+        if let Err(err) = normalize_inkling2_vision_params(&mut params, &config) {
+            tracing::warn!(
+                "Inkling2: vision tower unavailable ({err}); continuing in text-only mode"
+            );
+            params.retain(|k, _| {
+                !k.starts_with("visual.")
+                    && !k.starts_with("vision_tower.")
+                    && !k.starts_with("vision_projector.")
+            });
+            config.vision_config = None;
+        }
+        norm
+    } else {
+        Inkling2StNormResult::default()
+    };
+
+    let (default_bits, default_group_size, default_mode, mut per_layer_quant) =
         load_quant_settings_from_disk(asset_dir, 8, 32)?;
+    if !is_gguf {
+        remap_inkling2_per_layer_quant(&mut per_layer_quant, layout, &st_norm, &config)?;
+        infer_unregistered_2d_fp_quant_overrides(&params, &mut per_layer_quant)?;
+    }
     let default_plq = PerLayerQuant {
         bits: default_bits,
         group_size: default_group_size,
@@ -1155,39 +1185,31 @@ fn load_weights_sync(
     let padded_vocab = config.effective_padded_vocab_size();
     let inv_sqrt_d = 1.0_f64 / (hidden_size as f64).sqrt();
 
-    // 1. Embeddings & embed_norm (keep packed affine embedding sidecars in native F16 so
-    // `dequantize` output precision stays bit-identical to GGUF Q8_0; gather-then-dequant
-    // only touches T rows and costs ~0.03 ms).
+    // 1. Embeddings & embed_norm (keep packed embedding sidecars intact; supports Affine,
+    // MXFP4/MXFP8/NVFP4, K-quants such as Q6_K, and dense floating weights).
     let mut embed_tokens = Embedding::new(padded_vocab as u32, hidden_size as u32)?;
-    load_embedding_affine_or_bf16(
-        &mut embed_tokens,
-        &params,
-        "embed_tokens",
-        &per_layer_quant,
-        default_plq,
-        FAMILY_NAME,
-    )?;
-    let embed_norm = require_tensor(&params, "embed_norm.weight")?.astype(DType::Float32)?;
+    load_inkling2_embedding(&mut embed_tokens, &params, &per_layer_quant, default_plq)?;
+    let embed_norm =
+        load_dense_or_dequant_f32(&params, "embed_norm", &per_layer_quant, default_plq)?;
 
     // 2. Output head & output AttnRes query (`[1, D]` row-major & `[D, 1]` transposed FP32)
-    let output_res_query = require_tensor(&params, "output_res_query.weight")?
-        .astype(DType::Float32)?
-        .reshape(&[1, hidden_size as i64])?
-        .mul_scalar(inv_sqrt_d)?;
+    let output_res_query =
+        load_dense_or_dequant_f32(&params, "output_res_query", &per_layer_quant, default_plq)?
+            .reshape(&[1, hidden_size as i64])?
+            .mul_scalar(inv_sqrt_d)?;
     let output_res_query_t = output_res_query.transpose(None)?;
-    let output_norm = require_tensor(&params, "norm.weight")?.astype(DType::Float32)?;
+    let output_norm = load_dense_or_dequant_f32(&params, "norm", &per_layer_quant, default_plq)?;
     let mut lm_head = LinearProj::Standard(Linear::new(
         hidden_size as u32,
         padded_vocab as u32,
         Some(false),
     )?);
-    load_linear_proj_quantized_or_bf16(
+    load_inkling2_linear_proj(
         &mut lm_head,
         &params,
         "lm_head",
         &per_layer_quant,
         default_plq,
-        FAMILY_NAME,
     )?;
     // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) to native Float16 scales
     // with zero biases (4x less sidecar DRAM), falling back to F32 hoisting for asymmetric affine.
@@ -1208,9 +1230,12 @@ fn load_weights_sync(
         None
     };
 
-    // Global cross-pass message queries (Unsloth GGUF format)
-    let global_loop_res = params.get("loop_res_query.weight");
-    let global_loop_kv_res = params.get("loop_kv_res_query.weight");
+    // Global cross-pass message queries (Unsloth GGUF & Release SafeTensors format) —
+    // dequantize ONCE before the physical layer loop.
+    let global_loop_res =
+        try_load_dense_or_dequant_f32(&params, "loop_res_query", &per_layer_quant, default_plq)?;
+    let global_loop_kv_res =
+        try_load_dense_or_dequant_f32(&params, "loop_kv_res_query", &per_layer_quant, default_plq)?;
 
     // 3. Build physical layers `0..num_physical_layers`
     let n_phys = config.num_physical_layers();
@@ -1223,13 +1248,13 @@ fn load_weights_sync(
             &per_layer_quant,
             default_plq,
             inv_sqrt_d,
-            global_loop_res,
-            global_loop_kv_res,
+            global_loop_res.as_ref(),
+            global_loop_kv_res.as_ref(),
         )?;
         layers.push(layer);
     }
 
-    // 4. Optional Vision Encoder (`mmproj-BF16.gguf`)
+    // 4. Optional Vision Encoder (`mmproj-BF16/F32/Q8_0.gguf` or SafeTensors)
     let vision_encoder = if params.contains_key("vision_tower.patch_embed.weight") {
         let vcfg = config
             .vision_config
@@ -1238,8 +1263,18 @@ fn load_weights_sync(
                 projection_dim: hidden_size,
                 ..Inkling2VisionConfig::default()
             });
-        Some(build_vision_encoder(&vcfg, &params)?)
+        match build_vision_encoder(&vcfg, &params, hidden_size) {
+            Ok(encoder) => Some(encoder),
+            Err(err) => {
+                tracing::warn!(
+                    "Inkling2: vision tower unavailable ({err}); continuing in text-only mode"
+                );
+                config.vision_config = None;
+                None
+            }
+        }
     } else {
+        config.vision_config = None;
         None
     };
 
@@ -1326,12 +1361,15 @@ fn build_physical_layer(
     let r_dim = n_heads * d_rel;
 
     // AttnRes queries (pre-scaled by `1 / sqrt(D)`, both row-major `[Q, D]` & transposed `[D, Q]` FP32)
-    let attn_res_query = if let Some(q_raw) = params.get(&format!("{prefix}.attn_res_query.weight"))
-    {
+    let attn_res_query = if let Some(q_raw) = try_load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.attn_res_query"),
+        per_layer_quant,
+        default_plq,
+    )? {
         let expected_q = if is_local { 1 } else { 3 };
         Some(
             q_raw
-                .astype(DType::Float32)?
                 .reshape(&[expected_q, d as i64])?
                 .mul_scalar(inv_sqrt_d)?,
         )
@@ -1347,25 +1385,43 @@ fn build_physical_layer(
         None => None,
     };
 
-    let ffn_res_query = require_tensor(params, &format!("{prefix}.ffn_res_query.weight"))?
-        .astype(DType::Float32)?
-        .reshape(&[1, d as i64])?
-        .mul_scalar(inv_sqrt_d)?;
+    let ffn_res_query = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.ffn_res_query"),
+        per_layer_quant,
+        default_plq,
+    )?
+    .reshape(&[1, d as i64])?
+    .mul_scalar(inv_sqrt_d)?;
     let ffn_res_query_t = ffn_res_query.transpose(None)?;
 
     // Sublayer norms (kept in FP32 so hot-path RMSNorm never re-casts)
     let attn_inp_norm = if is_local {
-        AttnInputNorm::Local(
-            require_tensor(params, &format!("{prefix}.input_layernorm.weight"))?
-                .astype(DType::Float32)?,
-        )
+        AttnInputNorm::Local(load_dense_or_dequant_f32(
+            params,
+            &format!("{prefix}.input_layernorm"),
+            per_layer_quant,
+            default_plq,
+        )?)
     } else {
-        let q_norm = require_tensor(params, &format!("{prefix}.self_attn.q_inp_norm.weight"))?
-            .astype(DType::Float32)?;
-        let k_norm = require_tensor(params, &format!("{prefix}.self_attn.k_inp_norm.weight"))?
-            .astype(DType::Float32)?;
-        let v_norm = require_tensor(params, &format!("{prefix}.self_attn.v_inp_norm.weight"))?
-            .astype(DType::Float32)?;
+        let q_norm = load_dense_or_dequant_f32(
+            params,
+            &format!("{prefix}.self_attn.q_inp_norm"),
+            per_layer_quant,
+            default_plq,
+        )?;
+        let k_norm = load_dense_or_dequant_f32(
+            params,
+            &format!("{prefix}.self_attn.k_inp_norm"),
+            per_layer_quant,
+            default_plq,
+        )?;
+        let v_norm = load_dense_or_dequant_f32(
+            params,
+            &format!("{prefix}.self_attn.v_inp_norm"),
+            per_layer_quant,
+            default_plq,
+        )?;
         let qkv_norm = MxArray::stack(vec![&q_norm, &k_norm, &v_norm], Some(0))?;
         AttnInputNorm::Global {
             q_norm,
@@ -1374,21 +1430,18 @@ fn build_physical_layer(
             qkv_norm,
         }
     };
-    let ffn_norm = require_tensor(params, &format!("{prefix}.post_attention_layernorm.weight"))?
-        .astype(DType::Float32)?;
+    let ffn_norm = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.post_attention_layernorm"),
+        per_layer_quant,
+        default_plq,
+    )?;
 
     // Attention projections (compact exact symmetric Q8_0 to native F16 scales BEFORE row-concat fusion!)
     let load_proj = |sub: &str, in_f: usize, out_f: usize| -> Result<LinearProj> {
         let base = format!("{prefix}.self_attn.{sub}");
         let mut proj = LinearProj::Standard(Linear::new(in_f as u32, out_f as u32, Some(false))?);
-        load_linear_proj_quantized_or_bf16(
-            &mut proj,
-            params,
-            &base,
-            per_layer_quant,
-            default_plq,
-            FAMILY_NAME,
-        )?;
+        load_inkling2_linear_proj(&mut proj, params, &base, per_layer_quant, default_plq)?;
         proj.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)?;
         maybe_quantize_bf16_proj_to_symq8_cuda(&mut proj)?;
         Ok(proj)
@@ -1402,12 +1455,26 @@ fn build_physical_layer(
     let sink_proj = load_proj("sink_proj", d, n_heads)?;
     let o_proj = load_proj("o_proj", q_dim, d)?;
 
-    let k_conv = require_tensor(params, &format!("{prefix}.self_attn.k_conv.weight"))?
-        .astype(DType::Float32)?;
-    let v_conv = require_tensor(params, &format!("{prefix}.self_attn.v_conv.weight"))?
-        .astype(DType::Float32)?;
-    let post_conv = require_tensor(params, &format!("{prefix}.self_attn.post_conv.weight"))?
-        .astype(DType::Float32)?;
+    // ShortConv weights: dequantize if quantized and normalize F16 -> F32 so Metal
+    // `mlx_inkling2_sconv_k4*` (`is_bf16_or_f32`) never crashes on F16 checkpoints.
+    let k_conv = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.k_conv"),
+        per_layer_quant,
+        default_plq,
+    )?;
+    let v_conv = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.v_conv"),
+        per_layer_quant,
+        default_plq,
+    )?;
+    let post_conv = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.post_conv"),
+        per_layer_quant,
+        default_plq,
+    )?;
 
     let (k_conv_proj, v_conv_proj) = if !is_local {
         let dyn_out = n_kv * config.sconv_kernel_size;
@@ -1420,14 +1487,26 @@ fn build_physical_layer(
     };
 
     // Clip weights and relative bias table
-    let q_clip = require_tensor(params, &format!("{prefix}.self_attn.q_clip.weight"))?
-        .astype(DType::Float32)?
-        .reshape(&[1, n_heads as i64, head_dim as i64])?;
-    let rel_clip = require_tensor(params, &format!("{prefix}.self_attn.rel_clip.weight"))?
-        .astype(DType::Float32)?
-        .reshape(&[1, n_heads as i64, d_rel as i64])?;
-    let rel_bias_raw = require_tensor(params, &format!("{prefix}.self_attn.rel_bias.weight"))?
-        .astype(DType::Float32)?;
+    let q_clip = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.q_clip"),
+        per_layer_quant,
+        default_plq,
+    )?
+    .reshape(&[1, n_heads as i64, head_dim as i64])?;
+    let rel_clip = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.rel_clip"),
+        per_layer_quant,
+        default_plq,
+    )?
+    .reshape(&[1, n_heads as i64, d_rel as i64])?;
+    let rel_bias_raw = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.self_attn.rel_bias"),
+        per_layer_quant,
+        default_plq,
+    )?;
     let rb_shape = rel_bias_raw.shape()?;
     // GGUF loads `[rel_extent, d_rel]` (`[1024, 16]`); HF loads `[d_rel, rel_extent]` (`[16, 1024]`).
     let (rel_bias_t, rel_bias_w) = if rb_shape.as_ref() == [rel_extent as i64, d_rel as i64] {
@@ -1487,16 +1566,31 @@ fn build_physical_layer(
     };
     self_attn.try_fuse_projections()?;
 
-    // MoE block (hoist Q8_0 Float16 sidecars on blk.20..23 MoE experts!)
-    let router_weight = require_tensor(params, &format!("{prefix}.mlp.gate.weight"))?;
-    let router_bias = params
-        .get(&format!("{prefix}.mlp.gate.e_score_correction_bias"))
-        .cloned();
-    let mut gate_up_proj = load_expert_switch_proj(
+    // MoE block (supports fused `gate_up_proj` and split `gate_proj` + `up_proj`,
+    // fusing compatible split pairs BEFORE symmetric-Q8 compaction / BF16 promotion!)
+    let router_weight = load_dense_or_dequant_f32(
         params,
-        &format!("{prefix}.mlp.experts.gate_up_proj"),
+        &format!("{prefix}.mlp.gate"),
         per_layer_quant,
         default_plq,
+    )?;
+    let router_bias = match params.get(&format!("{prefix}.mlp.gate.e_score_correction_bias")) {
+        Some(b) => {
+            ensure_dense_weight_floating(&format!("{prefix}.mlp.gate.e_score_correction_bias"), b)?;
+            Some(if b.dtype()? == DType::Float32 {
+                b.clone()
+            } else {
+                b.astype(DType::Float32)?
+            })
+        }
+        None => None,
+    };
+    let (mut gate_up_proj, effective_gate_up_interleaved) = load_expert_gate_up(
+        params,
+        &prefix,
+        per_layer_quant,
+        default_plq,
+        config.gate_up_interleaved,
     )?;
     let mut down_proj = load_expert_switch_proj(
         params,
@@ -1504,15 +1598,15 @@ fn build_physical_layer(
         per_layer_quant,
         default_plq,
     )?;
-    // Compact exact symmetric GGUF Q8_0 (`biases == -128 * scales`) on `blk.20..23` MoE experts
-    // to native Float16 scales with zero biases (-255 MiB RAM, 2x less sidecar DRAM, no x_sum ALU),
-    // falling back to BF16 sidecar hoisting for non-symmetric affine Q8_0.
-    gate_up_proj.try_compact_symmetric_q8_or_promote_bf16()?;
     down_proj.try_compact_symmetric_q8_or_promote_bf16()?;
     gate_up_proj.promote_outer_scale_to_f32()?;
     down_proj.promote_outer_scale_to_f32()?;
-    let mlp_post_conv = require_tensor(params, &format!("{prefix}.mlp.post_conv.weight"))?
-        .astype(DType::Float32)?;
+    let mlp_post_conv = load_dense_or_dequant_f32(
+        params,
+        &format!("{prefix}.mlp.post_conv"),
+        per_layer_quant,
+        default_plq,
+    )?;
     let moe = Inkling2MoE::new(
         config.num_experts,
         config.num_experts_per_tok,
@@ -1520,7 +1614,7 @@ fn build_physical_layer(
         config.route_scale,
         config.mlp_gate_softcap,
         config.mlp_up_softcap,
-        config.gate_up_interleaved,
+        effective_gate_up_interleaved,
         router_weight,
         router_bias,
         gate_up_proj,
@@ -1530,35 +1624,55 @@ fn build_physical_layer(
 
     // Optional Loop Controllers for core layers (`6..17`)
     let loop_ctrl = if let Some(core_idx) = config.core_offset(phys) {
-        let msg_queries_raw =
-            if let Some(per_layer) = params.get(&format!("{prefix}.loop_msg_query.weight")) {
-                // Mainline `inkling2_loop`: already `[4, D]` in `[q, k, v, mlp]` order.
-                per_layer.astype(DType::Float32)?.reshape(&[4, d as i64])?
-            } else if let (Some(lq), Some(lkv)) = (global_loop_res, global_loop_kv_res) {
-                // Unsloth `inkling2`: `loop_res_query` `[2*C, D]` (`[2i]=attn, [2i+1]=mlp`)
-                // and `loop_kv_res_query` `[2*C, D]` (`[2i]=k, [2i+1]=v`).
-                let lq_f32 = lq.astype(DType::Float32)?;
-                let lkv_f32 = lkv.astype(DType::Float32)?;
-                let row0 = (2 * core_idx) as i64;
-                let row1 = row0 + 1;
-                let q_attn = lq_f32.slice(&[row0, 0], &[row0 + 1, d as i64])?;
-                let q_k = lkv_f32.slice(&[row0, 0], &[row0 + 1, d as i64])?;
-                let q_v = lkv_f32.slice(&[row1, 0], &[row1 + 1, d as i64])?;
-                let q_mlp = lq_f32.slice(&[row1, 0], &[row1 + 1, d as i64])?;
-                MxArray::concatenate_many(vec![&q_attn, &q_k, &q_v, &q_mlp], Some(0))?
-            } else {
-                return Err(Error::from_reason(format!(
-                    "Inkling2: missing loop message queries for core physical layer {phys}"
-                )));
-            };
+        let msg_queries_raw = if let Some(per_layer) = try_load_dense_or_dequant_f32(
+            params,
+            &format!("{prefix}.loop_msg_query"),
+            per_layer_quant,
+            default_plq,
+        )? {
+            // Mainline `inkling2_loop`, oMLX, mlx-vlm, mlx-lm: already `[4, D]` in `[q, k, v, mlp]` order.
+            per_layer.reshape(&[4, d as i64])?
+        } else if let (Some(lq), Some(lkv)) = (global_loop_res, global_loop_kv_res) {
+            // Unsloth `inkling2` / Release: `loop_res_query` `[2*C, D]` (`[2i]=attn, [2i+1]=mlp`)
+            // and `loop_kv_res_query` `[2*C, D]` (`[2i]=k, [2i+1]=v`).
+            let row0 = (2 * core_idx) as i64;
+            let row1 = row0 + 1;
+            let q_attn = lq.slice(&[row0, 0], &[row0 + 1, d as i64])?;
+            let q_k = lkv.slice(&[row0, 0], &[row0 + 1, d as i64])?;
+            let q_v = lkv.slice(&[row1, 0], &[row1 + 1, d as i64])?;
+            let q_mlp = lq.slice(&[row1, 0], &[row1 + 1, d as i64])?;
+            MxArray::concatenate_many(vec![&q_attn, &q_k, &q_v, &q_mlp], Some(0))?
+        } else {
+            return Err(Error::from_reason(format!(
+                "Inkling2: missing loop message queries for core physical layer {phys}"
+            )));
+        };
         let msg_queries = msg_queries_raw.mul_scalar(inv_sqrt_d)?;
 
         let load_ctrl = |stream: &str| -> Result<LoopController> {
             let base = format!("{prefix}.loop_ctrl.{stream}");
             LoopController::new(
-                require_tensor(params, &format!("{base}.down_proj.weight"))?,
-                require_tensor(params, &format!("{base}.gain_proj.weight"))?,
-                require_tensor(params, &format!("{base}.forget_proj.weight"))?,
+                load_dense_or_dequant_tensor(
+                    params,
+                    &format!("{base}.down_proj"),
+                    per_layer_quant,
+                    default_plq,
+                    true,
+                )?,
+                load_dense_or_dequant_tensor(
+                    params,
+                    &format!("{base}.gain_proj"),
+                    per_layer_quant,
+                    default_plq,
+                    true,
+                )?,
+                load_dense_or_dequant_tensor(
+                    params,
+                    &format!("{base}.forget_proj"),
+                    per_layer_quant,
+                    default_plq,
+                    true,
+                )?,
             )
         };
         Some(LoopLayerControllers::new(
@@ -1588,17 +1702,555 @@ fn build_physical_layer(
     })
 }
 
+/// Load `embed_tokens` supporting Affine, MXFP4, MXFP8, NVFP4, all 14 GGUF K-quant/IQ
+/// modes (e.g. Q6_K), optional outer scales (dequantized with outer scale applied because
+/// `Embedding` packed storage has no `outer_scale` field), and dense floating weights.
+fn load_inkling2_embedding(
+    embed_tokens: &mut Embedding,
+    params: &HashMap<String, MxArray>,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    let has_outer_scale = params.contains_key("embed_tokens.scale")
+        || params.contains_key("embed_tokens.global_scale")
+        || params.contains_key("embed_tokens.weight_scale_2")
+        || params.contains_key("embed_tokens.weight_global_scale");
+    if has_outer_scale {
+        let w_f32 = load_dense_or_dequant_tensor(
+            params,
+            "embed_tokens",
+            per_layer_quant,
+            default_plq,
+            false,
+        )?;
+        let w_bf16 = if w_f32.dtype()? == DType::BFloat16 {
+            w_f32
+        } else {
+            w_f32.astype(DType::BFloat16)?
+        };
+        return embed_tokens.load_weight(&w_bf16);
+    }
+    if params.contains_key("embed_tokens.scales") {
+        let embed_plq = effective_plq_for("embed_tokens", per_layer_quant, default_plq, None);
+        if is_kquant_mode(embed_plq.mode) {
+            ensure_row_major_kquant_layout(embed_plq, "embed_tokens", FAMILY_NAME)?;
+            let w = require_tensor(params, "embed_tokens.weight")?;
+            let s = require_tensor(params, "embed_tokens.scales")?;
+            let b = params.get("embed_tokens.biases").cloned();
+            if w.dtype()? != DType::Uint32 {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: K-quant embed_tokens.weight must be Uint32, got {:?}",
+                    w.dtype()?
+                )));
+            }
+            let s_dtype = s.dtype()?;
+            let kq = kquant_mode_params_for_scales(embed_plq.mode, s_dtype).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Inkling2: embed_tokens K-quant mode {:?} has unsupported scales dtype {s_dtype:?}",
+                    embed_plq.mode
+                ))
+            })?;
+            if s_dtype != kq.scales_dtype {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: embed_tokens K-quant mode {:?} expects {:?} scales, got {s_dtype:?}",
+                    embed_plq.mode, kq.scales_dtype
+                )));
+            }
+            let Some(ref b_arr) = b else {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: K-quant embed_tokens ({:?}) missing mandatory .biases",
+                    embed_plq.mode
+                )));
+            };
+            if b_arr.dtype()? != DType::Float16 {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: K-quant embed_tokens ({:?}) biases must be Float16, got {:?}",
+                    embed_plq.mode,
+                    b_arr.dtype()?
+                )));
+            }
+            return embed_tokens.load_quantized_packed(
+                &w,
+                &s,
+                b.as_ref(),
+                kq.group_size,
+                kq.bits,
+                kq.mode_str,
+            );
+        }
+    }
+    load_embedding_affine_or_bf16(
+        embed_tokens,
+        params,
+        "embed_tokens",
+        per_layer_quant,
+        default_plq,
+        FAMILY_NAME,
+    )
+}
+
+/// Dequantize a quantized tensor (1-D or 2-D, Affine, K-quant RowMajor or Tiled64,
+/// MXFP4/MXFP8/NVFP4, FP8 E4M3, Sym8) into `Float32`, or load a dense floating tensor
+/// (optionally preserving native `BFloat16` when `preserve_bf16 == true`, otherwise casting
+/// to `Float32`).
+///
+/// Enforces all MLX dequantize invariants:
+/// 1. 1-D quantized tensors `expand_dims(0)` before `mlx_dequantize` and `squeeze(0)` after.
+/// 2. Affine `scales` and `biases` cast to `Float32` BEFORE `mlx_dequantize` (avoiding F16
+///    intermediate arithmetic inside `mlx::core::affine_dequantize`).
+/// 3. K-quant `Tiled64` untiles first via `row_major_kquant_arrays`.
+/// 4. Dense path rejects orphaned packed `Uint32`/`Int8`/`Uint8` via `ensure_dense_weight_floating`.
+fn load_dense_or_dequant_tensor(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    preserve_bf16: bool,
+) -> Result<MxArray> {
+    if params.contains_key(&format!("{base}.scales")) {
+        let plq = effective_plq_for(base, per_layer_quant, default_plq, None);
+        if plq.mode == PerLayerMode::Sym8 {
+            let w = require_tensor(params, &format!("{base}.weight"))?.astype(DType::Float32)?;
+            let mut s =
+                require_tensor(params, &format!("{base}.scales"))?.astype(DType::Float32)?;
+            if w.ndim()? == 2 && s.ndim()? == 1 {
+                s = s.expand_dims(-1)?;
+            }
+            return w.mul(&s);
+        }
+        if plq.mode == PerLayerMode::Fp8E4m3 {
+            let w_raw = require_tensor(params, &format!("{base}.weight"))?;
+            let s_raw = require_tensor(params, &format!("{base}.scales"))?;
+            let was_1d = w_raw.ndim()? == 1;
+            let mut tmp = HashMap::new();
+            tmp.insert(
+                format!("{base}.weight"),
+                if was_1d { w_raw.expand_dims(0)? } else { w_raw },
+            );
+            tmp.insert(
+                format!("{base}.scales"),
+                if was_1d && s_raw.ndim()? == 1 {
+                    s_raw.expand_dims(0)?
+                } else {
+                    s_raw
+                },
+            );
+            let ql = try_build_fp8_e4m3_quantized_linear(&tmp, base)?.ok_or_else(|| {
+                Error::from_reason(format!("Inkling2: failed to build fp8_e4m3 for '{base}'"))
+            })?;
+            let mut out = ql.dequantized_weight()?.astype(DType::Float32)?;
+            if was_1d {
+                out = out.squeeze(Some(&[0]))?;
+            }
+            return Ok(out);
+        }
+
+        let (mut w, mut s, mut b, mode_str, group_size, bits) = if is_kquant_mode(plq.mode) {
+            let Some((w, s, b)) = row_major_kquant_arrays(params, base, plq.mode, plq.layout)?
+            else {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: missing K-quant weight/scales for '{base}' (mode={:?})",
+                    plq.mode
+                )));
+            };
+            let s_dtype = s.dtype()?;
+            let kq = kquant_mode_params_for_scales(plq.mode, s_dtype).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "Inkling2: unsupported K-quant scales dtype {s_dtype:?} on '{base}' ({:?})",
+                    plq.mode
+                ))
+            })?;
+            (w, s, b, kq.mode_str, kq.group_size, kq.bits)
+        } else {
+            let w = require_tensor(params, &format!("{base}.weight"))?;
+            let s = require_tensor(params, &format!("{base}.scales"))?;
+            match plq.mode {
+                PerLayerMode::Affine => {
+                    // CRITICAL: cast affine scales & biases to Float32 BEFORE mlx_dequantize
+                    // because `mlx::core::affine_dequantize` computes `w * s + b` in scales.dtype().
+                    let s_f32 = if s.dtype()? == DType::Float32 {
+                        s
+                    } else {
+                        s.astype(DType::Float32)?
+                    };
+                    let b_f32 = match params.get(&format!("{base}.biases")) {
+                        Some(b) => Some(if b.dtype()? == DType::Float32 {
+                            b.clone()
+                        } else {
+                            b.astype(DType::Float32)?
+                        }),
+                        None => None,
+                    };
+                    (w, s_f32, b_f32, "affine", plq.group_size, plq.bits)
+                }
+                PerLayerMode::Mxfp4 => (w, s, None, MXFP4_MODE, MXFP4_GROUP_SIZE, MXFP4_BITS),
+                PerLayerMode::Mxfp8 => (w, s, None, MXFP8_MODE, MXFP8_GROUP_SIZE, MXFP8_BITS),
+                PerLayerMode::Nvfp4 => (w, s, None, NVFP4_MODE, NVFP4_GROUP_SIZE, NVFP4_BITS),
+                other => {
+                    return Err(Error::from_reason(format!(
+                        "Inkling2: unsupported quantized small-tensor mode {other:?} on '{base}'"
+                    )));
+                }
+            }
+        };
+
+        let was_1d = w.ndim()? == 1;
+        if was_1d {
+            w = w.expand_dims(0)?;
+            if s.ndim()? == 1 {
+                s = s.expand_dims(0)?;
+            }
+            if let Some(ref b_arr) = b
+                && b_arr.ndim()? == 1
+            {
+                b = Some(b_arr.expand_dims(0)?);
+            }
+        }
+
+        let mode_c = CString::new(mode_str)
+            .map_err(|e| Error::from_reason(format!("Invalid quant mode '{mode_str}': {e}")))?;
+        let biases_ptr = b
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |arr| arr.as_raw_ptr());
+        let handle = unsafe {
+            mlx_sys::mlx_dequantize(
+                w.as_raw_ptr(),
+                s.as_raw_ptr(),
+                biases_ptr,
+                group_size,
+                bits,
+                DType::Float32 as i32,
+                mode_c.as_ptr(),
+            )
+        };
+        if handle.is_null() {
+            return Err(Error::from_reason(format!(
+                "Inkling2: mlx_dequantize failed for '{base}' (mode={mode_str}, gs={group_size}, bits={bits})"
+            )));
+        }
+        let mut out = MxArray::from_handle(handle, "inkling2_small_tensor_dequant")?;
+        if was_1d {
+            out = out.squeeze(Some(&[0]))?;
+        }
+        if out.dtype()? != DType::Float32 {
+            out = out.astype(DType::Float32)?;
+        }
+        if plq.mode == PerLayerMode::Nvfp4 {
+            if let Some(outer) = resolve_nvfp4_outer_scale_2d(params, base)? {
+                out = out.mul(&outer)?;
+            }
+        } else if let Some(raw_scale) = params.get(&format!("{base}.scale")) {
+            let outer = normalize_scalar_outer_scale(raw_scale, &format!("{base}.scale"))?;
+            out = out.mul(&outer)?;
+        }
+        return Ok(out);
+    }
+
+    let key = format!("{base}.weight");
+    let w = require_tensor(params, &key)?;
+    ensure_dense_weight_floating(&key, &w)?;
+    let dt = w.dtype()?;
+    if (preserve_bf16 && dt == DType::BFloat16) || dt == DType::Float32 {
+        Ok(w)
+    } else {
+        w.astype(DType::Float32)
+    }
+}
+
+/// Load an Inkling2 2-D linear projection (`self_attn.*` or `lm_head`) and preserve any scalar
+/// `{base}.scale` outer scale on non-NVFP4 projections (such as oMLX MXFP4/MXFP8 fused
+/// attention splits). NVFP4 projections already resolve `.scale`/`.global_scale`/`.weight_scale_2`/
+/// `.weight_global_scale` inside [`load_linear_proj_quantized_or_bf16`]; NVFP4-only outer-scale
+/// sidecars on non-NVFP4 projections fail loudly instead of being silently ignored.
+fn load_inkling2_linear_proj(
+    proj: &mut LinearProj,
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<()> {
+    load_linear_proj_quantized_or_bf16(
+        proj,
+        params,
+        base,
+        per_layer_quant,
+        default_plq,
+        FAMILY_NAME,
+    )?;
+
+    let is_nvfp4_quant = matches!(proj, LinearProj::Quantized(ql) if ql.mode() == NVFP4_MODE);
+    if is_nvfp4_quant {
+        return Ok(());
+    }
+
+    for bad_sfx in [".global_scale", ".weight_scale_2", ".weight_global_scale"] {
+        let bad_key = format!("{base}{bad_sfx}");
+        if params.contains_key(&bad_key) {
+            return Err(Error::from_reason(format!(
+                "Inkling2: unsupported NVFP4 outer scale tensor '{bad_key}' on non-NVFP4 projection '{base}'"
+            )));
+        }
+    }
+
+    let scale_key = format!("{base}.scale");
+    let Some(raw_scale) = params.get(&scale_key) else {
+        return Ok(());
+    };
+    let outer = normalize_scalar_outer_scale(raw_scale, &scale_key)?;
+    match proj {
+        LinearProj::Quantized(ql) => {
+            if ql.outer_scale().is_none() {
+                let placeholder = Linear::new(1, 1, Some(false))?;
+                let owned = std::mem::replace(proj, LinearProj::Standard(placeholder));
+                if let LinearProj::Quantized(ql_owned) = owned {
+                    *proj = LinearProj::Quantized(ql_owned.with_outer_scale(outer));
+                }
+            }
+        }
+        LinearProj::Standard(lin) => {
+            let w = lin.get_weight();
+            let dt = w.dtype()?;
+            let w_f32 = if dt == DType::Float32 {
+                w
+            } else {
+                w.astype(DType::Float32)?
+            };
+            let scaled = w_f32.mul(&outer)?;
+            let scaled = if dt == DType::Float32 {
+                scaled
+            } else {
+                scaled.astype(dt)?
+            };
+            let bias = lin.get_bias();
+            *proj = LinearProj::Standard(Linear::from_weights(&scaled, bias.as_ref())?);
+        }
+    }
+    Ok(())
+}
+
+fn load_dense_or_dequant_f32(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<MxArray> {
+    load_dense_or_dequant_tensor(params, base, per_layer_quant, default_plq, false)
+}
+
+fn try_load_dense_or_dequant_f32(
+    params: &HashMap<String, MxArray>,
+    base: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+) -> Result<Option<MxArray>> {
+    if params.contains_key(&format!("{base}.weight"))
+        || params.contains_key(&format!("{base}.scales"))
+    {
+        Ok(Some(load_dense_or_dequant_f32(
+            params,
+            base,
+            per_layer_quant,
+            default_plq,
+        )?))
+    } else {
+        Ok(None)
+    }
+}
+
+fn outer_scales_bitwise_compatible(
+    a: Option<&MxArray>,
+    b: Option<&MxArray>,
+) -> Result<Option<Option<MxArray>>> {
+    match (a, b) {
+        (None, None) => Ok(Some(None)),
+        (Some(sa), Some(sb)) => {
+            if sa.shape()?.as_ref() != sb.shape()?.as_ref() {
+                return Ok(None);
+            }
+            let va = if sa.dtype()? == DType::Float32 {
+                sa.to_float32()?
+            } else {
+                sa.astype(DType::Float32)?.to_float32()?
+            };
+            let vb = if sb.dtype()? == DType::Float32 {
+                sb.to_float32()?
+            } else {
+                sb.astype(DType::Float32)?.to_float32()?
+            };
+            if va.len() == vb.len()
+                && va
+                    .iter()
+                    .zip(vb.iter())
+                    .all(|(x, y)| x.to_bits() == y.to_bits())
+            {
+                Ok(Some(Some(sa.clone())))
+            } else {
+                Ok(None)
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
+fn try_fuse_split_expert_gate_up(gate: &SwitchProj, up: &SwitchProj) -> Result<Option<SwitchProj>> {
+    match (gate, up) {
+        (SwitchProj::Standard(g), SwitchProj::Standard(u)) => {
+            let Some(shared_scale) =
+                outer_scales_bitwise_compatible(g.outer_scale(), u.outer_scale())?
+            else {
+                return Ok(None);
+            };
+            let gw = g.weight_ref();
+            let uw = u.weight_ref();
+            let gs = gw.shape()?;
+            let us = uw.shape()?;
+            if gw.dtype()? != uw.dtype()?
+                || gs.len() != 3
+                || us.len() != 3
+                || gs[0] != us[0]
+                || gs[1] != us[1]
+                || gs[2] != us[2]
+            {
+                return Ok(None);
+            }
+            let w = MxArray::concatenate(gw, uw, 1)?;
+            let mut sl = SwitchLinear::from_weight(w);
+            if let Some(scale) = shared_scale {
+                sl = sl.with_outer_scale(scale);
+            }
+            Ok(Some(SwitchProj::Standard(sl)))
+        }
+        (SwitchProj::Quantized(g), SwitchProj::Quantized(u)) => {
+            if g.mode() != u.mode()
+                || g.bits() != u.bits()
+                || g.group_size() != u.group_size()
+                || !g.transpose()
+                || !u.transpose()
+                || crate::models::quant_dispatch::split_kquant_layout(g.mode()).1
+                || g.is_symmetric_q8()
+                || u.is_symmetric_q8()
+                || g.reconstructed_fp8_weight().is_some()
+                || u.reconstructed_fp8_weight().is_some()
+            {
+                return Ok(None);
+            }
+            let Some(shared_scale) =
+                outer_scales_bitwise_compatible(g.outer_scale(), u.outer_scale())?
+            else {
+                return Ok(None);
+            };
+            let (gw, uw) = (g.get_weight(), u.get_weight());
+            let (gs, us) = (g.get_scales(), u.get_scales());
+            if gw.dtype()? != uw.dtype()? || gs.dtype()? != us.dtype()? {
+                return Ok(None);
+            }
+            let (gws, uws) = (gw.shape()?, uw.shape()?);
+            let (gss, uss) = (gs.shape()?, us.shape()?);
+            if gws.len() != 3
+                || uws.len() != 3
+                || gss.len() != 3
+                || uss.len() != 3
+                || gws[0] != uws[0]
+                || gws[1] != uws[1]
+                || gws[2] != uws[2]
+                || gss[0] != uss[0]
+                || gss[1] != uss[1]
+                || gss[2] != uss[2]
+            {
+                return Ok(None);
+            }
+            let biases = match (g.get_biases(), u.get_biases()) {
+                (Some(gb), Some(ub)) => {
+                    let (gbs, ubs) = (gb.shape()?, ub.shape()?);
+                    if gb.dtype()? != ub.dtype()?
+                        || gbs.len() != 3
+                        || ubs.len() != 3
+                        || gbs[0] != ubs[0]
+                        || gbs[1] != ubs[1]
+                        || gbs[2] != ubs[2]
+                    {
+                        return Ok(None);
+                    }
+                    Some(MxArray::concatenate(gb, ub, 1)?)
+                }
+                (None, None) => None,
+                _ => return Ok(None),
+            };
+            let weight = MxArray::concatenate(gw, uw, 1)?;
+            let scales = MxArray::concatenate(gs, us, 1)?;
+            let mut qsl = QuantizedSwitchLinear::new(
+                weight,
+                scales,
+                biases,
+                g.group_size(),
+                g.bits(),
+                g.mode().to_string(),
+            );
+            if let Some(scale) = shared_scale {
+                qsl = qsl.with_outer_scale(scale);
+            }
+            Ok(Some(SwitchProj::Quantized(qsl)))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Load MoE expert `gate_up_proj`, handling both fused `gate_up_proj` and split
+/// `gate_proj` + `up_proj` (GGUF `ffn_gate_exps`+`ffn_up_exps` or `mlx-lm`
+/// `switch_mlp.{gate,up}_proj`).
+///
+/// Compatible split pairs are fused along axis 1 BEFORE `try_compact_symmetric_q8_or_promote_bf16()`,
+/// and split layers always return `effective_gate_up_interleaved = false`.
+fn load_expert_gate_up(
+    params: &HashMap<String, MxArray>,
+    prefix: &str,
+    per_layer_quant: &HashMap<String, PerLayerQuant>,
+    default_plq: PerLayerQuant,
+    config_gate_up_interleaved: bool,
+) -> Result<(ExpertGateUp, bool)> {
+    let gu_base = format!("{prefix}.mlp.experts.gate_up_proj");
+    if params.contains_key(&format!("{gu_base}.weight"))
+        || params.contains_key(&format!("{gu_base}.scales"))
+    {
+        let mut gu = load_expert_switch_proj(params, &gu_base, per_layer_quant, default_plq)?;
+        gu.try_compact_symmetric_q8_or_promote_bf16()?;
+        return Ok((ExpertGateUp::Fused(gu), config_gate_up_interleaved));
+    }
+
+    let gate_base = format!("{prefix}.mlp.experts.gate_proj");
+    let up_base = format!("{prefix}.mlp.experts.up_proj");
+    let has_gate = params.contains_key(&format!("{gate_base}.weight"))
+        || params.contains_key(&format!("{gate_base}.scales"));
+    let has_up = params.contains_key(&format!("{up_base}.weight"))
+        || params.contains_key(&format!("{up_base}.scales"));
+    if has_gate && has_up {
+        let mut gate = load_expert_switch_proj(params, &gate_base, per_layer_quant, default_plq)?;
+        let mut up = load_expert_switch_proj(params, &up_base, per_layer_quant, default_plq)?;
+        if let Some(mut fused) = try_fuse_split_expert_gate_up(&gate, &up)? {
+            fused.try_compact_symmetric_q8_or_promote_bf16()?;
+            return Ok((ExpertGateUp::Fused(fused), false));
+        }
+        gate.try_compact_symmetric_q8_or_promote_bf16()?;
+        up.try_compact_symmetric_q8_or_promote_bf16()?;
+        return Ok((ExpertGateUp::Split { gate, up }, false));
+    }
+
+    Err(Error::from_reason(format!(
+        "Inkling2: missing required MoE expert projection '{gu_base}.weight' (or split '{gate_base}.weight' + '{up_base}.weight')"
+    )))
+}
+
 fn load_expert_switch_proj(
     params: &HashMap<String, MxArray>,
     base: &str,
     per_layer_quant: &HashMap<String, PerLayerQuant>,
     default_plq: PerLayerQuant,
-) -> Result<ExpertSwitchProj> {
+) -> Result<SwitchProj> {
     if let Some(scales) = params.get(&format!("{base}.scales")) {
-        // Native SafeTensors NVFP4 / MXFP8 checkpoints (`quant_method: "modelopt"`) have no
-        // per-layer entries in `per_layer_quant`, store Uint8 FP8 scales (E4M3 for NVFP4,
-        // UE8M0 for MXFP8), and carry no `.biases`. Detect directly from tensor metadata & shapes
-        // so packed weights stay zero-copy!
+        // Native SafeTensors NVFP4 / MXFP8 / MXFP4 checkpoints (`quant_method: "modelopt"` or
+        // flat MLX) have no per-layer override, store Uint8 FP8/E8M0 scales, and carry no `.biases`.
+        // Match shape ratio FIRST (`* 2` => NVFP4, `* 8` => MXFP8, `* 4` => MXFP4) so neither
+        // unscaled NVFP4 nor MXFP8-with-`.scale` falls through to Affine.
         let has_override = per_layer_quant.contains_key(base);
         if !has_override
             && scales.dtype()? == DType::Uint8
@@ -1607,36 +2259,57 @@ fn load_expert_switch_proj(
             let w = require_tensor(params, &format!("{base}.weight"))?;
             let w_shape = w.shape()?;
             let s_shape = scales.shape()?;
-            if w_shape.len() == 3
+            if w.dtype()? == DType::Uint32
+                && w_shape.len() == 3
                 && s_shape.len() == 3
                 && w_shape[0] == s_shape[0]
                 && w_shape[1] == s_shape[1]
             {
-                if let Some(outer) = params.get(&format!("{base}.scale")) {
-                    // NVFP4: uint32 packed 4-bit weights (8 elems/u32) + uint8 E4M3 scales (16 elems/scale) -> w_last == s_last * 2
-                    if w_shape[2] == s_shape[2] * 2 {
-                        let q = QuantizedSwitchLinear::new(
-                            w,
-                            scales.clone(),
-                            None,
-                            16,
-                            4,
-                            NVFP4_MODE.to_string(),
-                        )
-                        .with_outer_scale(outer.clone());
-                        return Ok(ExpertSwitchProj::Quantized(q));
-                    }
-                } else if w_shape[2] == s_shape[2] * 8 {
-                    // MXFP8: uint32 packed FP8 E4M3 weights (4 elems/u32) + uint8 UE8M0 scales (32 elems/scale) -> w_last == s_last * 8
-                    let q = QuantizedSwitchLinear::new(
+                let num_experts = w_shape[0];
+                if w_shape[2] == s_shape[2] * 2 {
+                    // NVFP4: uint32 packed 4-bit (8 elems/u32) + uint8 E4M3 scales (16 elems/scale)
+                    let mut q = QuantizedSwitchLinear::new(
                         w,
                         scales.clone(),
                         None,
-                        32,
-                        8,
+                        NVFP4_GROUP_SIZE,
+                        NVFP4_BITS,
+                        NVFP4_MODE.to_string(),
+                    );
+                    if let Some(outer) = resolve_nvfp4_outer_scale_3d(params, base, num_experts)? {
+                        q = q.with_outer_scale(outer);
+                    }
+                    return Ok(SwitchProj::Quantized(q));
+                } else if w_shape[2] == s_shape[2] * 8 {
+                    // MXFP8: uint32 packed FP8 E4M3 (4 elems/u32) + uint8 UE8M0 scales (32 elems/scale)
+                    let mut q = QuantizedSwitchLinear::new(
+                        w,
+                        scales.clone(),
+                        None,
+                        MXFP8_GROUP_SIZE,
+                        MXFP8_BITS,
                         MXFP8_MODE.to_string(),
                     );
-                    return Ok(ExpertSwitchProj::Quantized(q));
+                    if let Some(outer) = resolve_optional_outer_scale_3d(params, base, num_experts)?
+                    {
+                        q = q.with_outer_scale(outer);
+                    }
+                    return Ok(SwitchProj::Quantized(q));
+                } else if w_shape[2] == s_shape[2] * 4 {
+                    // MXFP4: uint32 packed 4-bit (8 elems/u32) + uint8 UE8M0 scales (32 elems/scale)
+                    let mut q = QuantizedSwitchLinear::new(
+                        w,
+                        scales.clone(),
+                        None,
+                        MXFP4_GROUP_SIZE,
+                        MXFP4_BITS,
+                        MXFP4_MODE.to_string(),
+                    );
+                    if let Some(outer) = resolve_optional_outer_scale_3d(params, base, num_experts)?
+                    {
+                        q = q.with_outer_scale(outer);
+                    }
+                    return Ok(SwitchProj::Quantized(q));
                 }
             }
         }
@@ -1662,28 +2335,86 @@ fn load_expert_switch_proj(
                 plq.mode
             ))
         })?;
-        return Ok(ExpertSwitchProj::Quantized(qsl));
+        return Ok(SwitchProj::Quantized(qsl));
     }
 
-    let w = require_tensor(params, &format!("{base}.weight"))?;
-    Ok(ExpertSwitchProj::Dense(w))
+    let weight_key = format!("{base}.weight");
+    let mut w = require_tensor(params, &weight_key)?;
+    ensure_dense_weight_floating(&weight_key, &w)?;
+    // Normalize non-BF16 dense expert weights (e.g. SafeTensors/unconverted Float16) to BFloat16
+    // once at load time: prevents MLX `gather_mm(BF16, F16)` from promoting BOTH operands to
+    // Float32 (~4.08 GB/visit) and keeps Stage 2 `inkling2_situ`/`inkling2_moe_combine` compatible.
+    if w.dtype()? != DType::BFloat16 {
+        w = w.astype(DType::BFloat16)?;
+    }
+    let num_experts = w.shape_at(0)?;
+    let mut sl = SwitchLinear::from_weight(w);
+    if let Some(outer) = resolve_optional_outer_scale_3d(params, base, num_experts)? {
+        sl = sl.with_outer_scale(outer);
+    }
+    Ok(SwitchProj::Standard(sl))
 }
 
 fn build_vision_encoder(
     config: &Inkling2VisionConfig,
     params: &HashMap<String, MxArray>,
+    expected_projection_dim: usize,
 ) -> Result<Inkling2VisionEncoder> {
+    if config.projection_dim != expected_projection_dim {
+        return Err(Error::from_reason(format!(
+            "Inkling2 vision: projection_dim ({}) does not match text hidden_size ({expected_projection_dim})",
+            config.projection_dim
+        )));
+    }
+    if config.patch_size == 0
+        || config.hidden_size == 0
+        || config.num_attention_heads == 0
+        || !config
+            .hidden_size
+            .is_multiple_of(config.num_attention_heads)
+        || config.spatial_merge_size == 0
+        || config.posemb_grid_size() == 0
+    {
+        return Err(Error::from_reason(format!(
+            "Inkling2 vision: invalid vision config {config:?}"
+        )));
+    }
+
     let p = config.patch_size as i64;
     let d = config.hidden_size as i64;
+    let m = config.spatial_merge_size as i64;
+    let grid = config.posemb_grid_size() as i64;
+    let grid_sq = grid * grid;
     let eps = Some(config.layer_norm_eps);
 
-    let class_embedding = require_tensor(params, "vision_tower.class_embedding")?;
-    let class_position_embedding =
-        require_tensor(params, "vision_tower.class_position_embedding.weight")?;
+    let require_float = |key: &str| -> Result<MxArray> {
+        let t = require_tensor(params, key)?;
+        ensure_dense_weight_floating(key, &t)?;
+        Ok(t)
+    };
+    let normalize_vec_d = |t: MxArray, key: &str| -> Result<MxArray> {
+        let shape = t.shape()?;
+        match shape.as_ref() {
+            [dim] if *dim == d => Ok(t),
+            [1, dim] if *dim == d => t.squeeze(Some(&[0])),
+            other => Err(Error::from_reason(format!(
+                "Inkling2 vision: unexpected {key} shape {other:?} (expected [{d}] or [1, {d}])"
+            ))),
+        }
+    };
+
+    let class_embedding = normalize_vec_d(
+        require_float("vision_tower.class_embedding")?,
+        "vision_tower.class_embedding",
+    )?;
+    let class_position_embedding = normalize_vec_d(
+        require_float("vision_tower.class_position_embedding.weight")?,
+        "vision_tower.class_position_embedding.weight",
+    )?;
 
     // GGUF loads `v.patch_embd.weight` as OIHW `[1024, 3, 20, 20]`.
     // Handle OHWI `[1024, 20, 20, 3]` or pre-flattened `[1024, 1200]` cleanly too.
-    let patch_raw = require_tensor(params, "vision_tower.patch_embed.weight")?;
+    let patch_raw = require_float("vision_tower.patch_embed.weight")?;
     let p_shape = patch_raw.shape()?;
     let patch_weight_flat = match p_shape.as_ref() {
         [o, 3, ph, pw] if *o == d && *ph == p && *pw == p => patch_raw.reshape(&[d, 3 * p * p])?,
@@ -1698,54 +2429,97 @@ fn build_vision_encoder(
         }
     };
 
-    let position_embedding = require_tensor(params, "vision_tower.position_embedding.weight")?;
+    let pos_raw = require_float("vision_tower.position_embedding.weight")?;
+    let pos_shape = pos_raw.shape()?;
+    let position_embedding = match pos_shape.as_ref() {
+        [n, dim] if *n == grid_sq && *dim == d => pos_raw,
+        [1, n, dim] if *n == grid_sq && *dim == d => pos_raw.squeeze(Some(&[0]))?,
+        [gh, gw, dim] if *gh == grid && *gw == grid && *dim == d => {
+            pos_raw.reshape(&[grid_sq, d])?
+        }
+        other => {
+            return Err(Error::from_reason(format!(
+                "Inkling2 vision: unexpected position_embedding shape {other:?} (expected [{grid_sq}, {d}], [1, {grid_sq}, {d}], or [{grid}, {grid}, {d}])"
+            )));
+        }
+    };
+
     let pre_ln = LayerNorm::from_weights(
-        &require_tensor(params, "vision_tower.pre_ln.weight")?,
-        Some(&require_tensor(params, "vision_tower.pre_ln.bias")?),
+        &require_float("vision_tower.pre_ln.weight")?,
+        Some(&require_float("vision_tower.pre_ln.bias")?),
         eps,
     )?;
+
+    let load_f32_vec = |key: &str| -> Result<MxArray> {
+        let t = normalize_vec_d(require_float(key)?, key)?;
+        if t.dtype()? == DType::Float32 {
+            Ok(t)
+        } else {
+            t.astype(DType::Float32)
+        }
+    };
+    let load_vision_linear = |base: &str| -> Result<VisionLinear> {
+        let w_key = format!("{base}.weight");
+        let w = require_float(&w_key)?;
+        let b_key = format!("{base}.bias");
+        let b = match params.get(&b_key) {
+            Some(bias) => {
+                ensure_dense_weight_floating(&b_key, bias)?;
+                Some(bias)
+            }
+            None => None,
+        };
+        VisionLinear::from_weights(&w, b)
+    };
 
     let mut blocks = Vec::with_capacity(config.num_hidden_layers);
     for i in 0..config.num_hidden_layers {
         let bp = format!("vision_tower.blocks.{i}");
         let norm1 = LayerNorm::from_weights(
-            &require_tensor(params, &format!("{bp}.norm1.weight"))?,
-            Some(&require_tensor(params, &format!("{bp}.norm1.bias"))?),
+            &require_float(&format!("{bp}.norm1.weight"))?,
+            Some(&require_float(&format!("{bp}.norm1.bias"))?),
             eps,
         )?;
         let norm2 = LayerNorm::from_weights(
-            &require_tensor(params, &format!("{bp}.norm2.weight"))?,
-            Some(&require_tensor(params, &format!("{bp}.norm2.bias"))?),
+            &require_float(&format!("{bp}.norm2.weight"))?,
+            Some(&require_float(&format!("{bp}.norm2.bias"))?),
             eps,
         )?;
-        let load_lin = |name: &str| -> Result<Linear> {
-            Linear::from_weights(
-                &require_tensor(params, &format!("{bp}.{name}.weight"))?,
-                params.get(&format!("{bp}.{name}.bias")),
-            )
-        };
         blocks.push(Inkling2VisionBlock {
             norm1,
-            q_proj: load_lin("attn.q_proj")?,
-            k_proj: load_lin("attn.k_proj")?,
-            v_proj: load_lin("attn.v_proj")?,
-            o_proj: load_lin("attn.o_proj")?,
-            ls1: require_tensor(params, &format!("{bp}.ls1.weight"))?,
+            q_proj: load_vision_linear(&format!("{bp}.attn.q_proj"))?,
+            k_proj: load_vision_linear(&format!("{bp}.attn.k_proj"))?,
+            v_proj: load_vision_linear(&format!("{bp}.attn.v_proj"))?,
+            o_proj: load_vision_linear(&format!("{bp}.attn.o_proj"))?,
+            ls1: load_f32_vec(&format!("{bp}.ls1.weight"))?,
             norm2,
-            fc1: load_lin("mlp.fc1")?,
-            fc2: load_lin("mlp.fc2")?,
-            ls2: require_tensor(params, &format!("{bp}.ls2.weight"))?,
+            fc1: load_vision_linear(&format!("{bp}.mlp.fc1"))?,
+            fc2: load_vision_linear(&format!("{bp}.mlp.fc2"))?,
+            ls2: load_f32_vec(&format!("{bp}.ls2.weight"))?,
         });
     }
 
-    let proj_fc1 = Linear::from_weights(
-        &require_tensor(params, "vision_projector.fc1.weight")?,
-        params.get("vision_projector.fc1.bias"),
-    )?;
-    let proj_fc2 = Linear::from_weights(
-        &require_tensor(params, "vision_projector.fc2.weight")?,
-        params.get("vision_projector.fc2.bias"),
-    )?;
+    let proj_fc1 = load_vision_linear("vision_projector.fc1")?;
+    let proj_fc2 = load_vision_linear("vision_projector.fc2")?;
+    let merged_dim = m * m * d;
+    let fc1_shape = proj_fc1.linear.get_weight().shape()?;
+    if fc1_shape.len() != 2 || fc1_shape[1] != merged_dim {
+        return Err(Error::from_reason(format!(
+            "Inkling2 vision: vision_projector.fc1.weight shape {:?} incompatible with merged dim {merged_dim}",
+            fc1_shape.as_ref()
+        )));
+    }
+    let fc2_shape = proj_fc2.linear.get_weight().shape()?;
+    if fc2_shape.len() != 2
+        || fc2_shape[0] != expected_projection_dim as i64
+        || fc2_shape[1] != fc1_shape[0]
+    {
+        return Err(Error::from_reason(format!(
+            "Inkling2 vision: vision_projector.fc2.weight shape {:?} incompatible with fc1 out {} and projection_dim {expected_projection_dim}",
+            fc2_shape.as_ref(),
+            fc1_shape[0]
+        )));
+    }
 
     Ok(Inkling2VisionEncoder {
         config: config.clone(),
@@ -1767,372 +2541,1129 @@ fn require_tensor(params: &HashMap<String, MxArray>, key: &str) -> Result<MxArra
         .ok_or_else(|| Error::from_reason(format!("Inkling2: missing required tensor '{key}'")))
 }
 
-/// Normalize native Thinking Machines HuggingFace SafeTensors keys (`llm.*` / `visual.*`,
-/// after leading `model.` strip) into the canonical internal Inkling2 namespace used by
-/// `load_weights_sync` with ZERO unpacking of quantized NVFP4 (L0–19) and MXFP8 (L20–23)
-/// MoE expert weights.
-///
-/// Returns `Ok(true)` if the checkpoint used the Thinking Machines SafeTensors layout, or
-/// `Ok(false)` (leaving `params` untouched) for GGUF / pre-normalized checkpoints.
+/// Detected SafeTensors checkpoint naming layout (probed on raw keys BEFORE prefix stripping).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Inkling2CheckpointLayout {
+    /// Native Thinking Machines HF SafeTensors (`model.llm.embed.weight`, interleaved `w13`).
+    Release,
+    /// oMLX converted SafeTensors (`model.embed.weight`, fused `attn.in_proj`, interleaved `w13`).
+    OMlx,
+    /// mlx-vlm converted SafeTensors (`model.language_model.embed_tokens.weight`, interleaved `gate_up_proj`).
+    MlxVlm,
+    /// mlx-lm converted SafeTensors (`language_model.model.embed_tokens.weight`, split `switch_mlp.{gate,up}_proj`).
+    MlxLm,
+    /// GGUF or already-canonical Inkling2 layout.
+    Canonical,
+}
+
+const ST_QUANT_SUFFIXES: [&str; 8] = [
+    ".weight",
+    ".scales",
+    ".weight_scale",
+    ".biases",
+    ".scale",
+    ".global_scale",
+    ".weight_scale_2",
+    ".weight_global_scale",
+];
+
+fn split_st_quant_suffix(key: &str) -> Option<(&str, &'static str)> {
+    for suffix in ST_QUANT_SUFFIXES {
+        if let Some(base) = key.strip_suffix(suffix) {
+            return Some((base, suffix));
+        }
+    }
+    None
+}
+
+fn canonical_st_quant_suffix(suffix: &'static str) -> &'static str {
+    if suffix == ".weight_scale" {
+        ".scales"
+    } else {
+        suffix
+    }
+}
+
+fn is_scalar_outer_scale_suffix(suffix: &str) -> bool {
+    matches!(
+        suffix,
+        ".scale" | ".global_scale" | ".weight_scale_2" | ".weight_global_scale"
+    )
+}
+
+fn maybe_view_u8_to_u32(tensor: MxArray) -> Result<MxArray> {
+    if tensor.dtype()? == DType::Uint8 {
+        tensor.view(DType::Uint32)
+    } else {
+        Ok(tensor)
+    }
+}
+
+fn expand_global_loop_msg_queries(
+    out: &mut HashMap<String, MxArray>,
+    tensor: MxArray,
+    config: &Inkling2Config,
+    key: &str,
+) -> Result<()> {
+    let lc = config.loop_config.as_ref().ok_or_else(|| {
+        Error::from_reason(format!(
+            "Inkling2 ST: unexpected top-level loop query '{key}' on model without loop_config"
+        ))
+    })?;
+    let expected_core = lc.core_end.saturating_sub(lc.core_start) as i64;
+    let d = config.hidden_size as i64;
+    let shape = tensor.shape()?;
+    if shape.as_ref() != [expected_core, 4, d] {
+        return Err(Error::from_reason(format!(
+            "Inkling2 ST: top-level loop query '{key}' has shape {:?}, expected [{expected_core}, 4, {d}]",
+            shape.as_ref()
+        )));
+    }
+    for ci in 0..expected_core {
+        let q = tensor
+            .slice(&[ci, 0, 0], &[ci + 1, 4, d])?
+            .squeeze(Some(&[0]))?;
+        // Deterministic precedence: per-layer `layers.{L}.loop_msg_query.weight` wins if already present.
+        out.entry(format!(
+            "layers.{}.loop_msg_query.weight",
+            lc.core_start + ci as usize
+        ))
+        .or_insert(q);
+    }
+    Ok(())
+}
+
+fn normalize_sconv_weight(tensor: MxArray, key: &str) -> Result<MxArray> {
+    match tensor.ndim()? {
+        2 => Ok(tensor),
+        3 => {
+            let shape = tensor.shape()?;
+            if shape[1] == 1 {
+                tensor.squeeze(Some(&[1]))
+            } else if shape[2] == 1 {
+                tensor.squeeze(Some(&[2]))
+            } else {
+                Err(Error::from_reason(format!(
+                    "Inkling2 ST: unexpected 3-D sconv weight shape {:?} for '{key}' (expected [C, 1, K] or [C, K, 1])",
+                    shape.as_ref()
+                )))
+            }
+        }
+        other => Err(Error::from_reason(format!(
+            "Inkling2 ST: unexpected {other}-D sconv weight for '{key}'"
+        ))),
+    }
+}
+
+fn normalize_dynamic_static_conv(tensor: MxArray, rev_k: &MxArray) -> Result<MxArray> {
+    tensor.transpose(None)?.take(rev_k, 1)
+}
+
+fn detect_inkling2_safetensors_layout(raw: &HashMap<String, MxArray>) -> Inkling2CheckpointLayout {
+    if raw.contains_key("model.llm.embed.weight")
+        || raw.contains_key("model.llm.embed.scales")
+        || raw.contains_key("llm.embed.weight")
+        || raw.contains_key("llm.embed.scales")
+        || raw.contains_key("model.llm.layers.0.attn.wq_du.weight")
+        || raw.contains_key("llm.layers.0.attn.wq_du.weight")
+    {
+        return Inkling2CheckpointLayout::Release;
+    }
+    if raw.contains_key("model.embed.weight")
+        || raw.contains_key("model.embed.scales")
+        || raw.contains_key("embed.weight")
+        || raw.contains_key("embed.scales")
+        || raw.keys().any(|k| {
+            k.contains(".attn.in_proj.")
+                || k.ends_with(".mlp.router_weight")
+                || k.contains(".mlp.experts.w13.")
+                || k.ends_with(".loop_down")
+        })
+    {
+        return Inkling2CheckpointLayout::OMlx;
+    }
+    // Check `MlxVlm`-exclusive structural markers BEFORE `MlxLm`-exclusive markers so a
+    // partially converted `mlx-vlm` checkpoint with both fused and split layers is still
+    // detected as `MlxVlm` (preserving interleaved order for its fused layers while split
+    // layers force non-interleaved per-layer inside `load_expert_gate_up`).
+    if raw.keys().any(|k| {
+        k.contains(".post_attention_convolution.")
+            || k.contains(".post_mlp_convolution.")
+            || k.ends_with(".self_attn.q_l2_clip.scale")
+            || k.contains(".self_attn.rel_logits_proj.proj")
+    }) {
+        return Inkling2CheckpointLayout::MlxVlm;
+    }
+    if raw.keys().any(|k| {
+        k.contains(".mlp.switch_mlp.")
+            || k.ends_with(".mlp.gate_weight")
+            || k.ends_with(".self_attn.q_scale")
+            || k.contains(".attn_sconv.conv.")
+    }) {
+        return Inkling2CheckpointLayout::MlxLm;
+    }
+    // Shared `mlx-vlm` / `mlx-lm` markers: disambiguate by wrapper prefix when present.
+    if raw.keys().any(|k| {
+        k.contains(".q_message_gate.")
+            || k.ends_with(".attention_input.query")
+            || k.contains(".self_attn.r_proj.")
+    }) {
+        if raw.keys().any(|k| {
+            k.starts_with("language_model.model.") || k.starts_with("language_model.lm_head.")
+        }) {
+            return Inkling2CheckpointLayout::MlxLm;
+        }
+        return Inkling2CheckpointLayout::MlxVlm;
+    }
+    // Recognize canonical tensor names BEFORE wrapper-only fallbacks so an already-canonical
+    // checkpoint nested under `language_model.model.*` keeps `Canonical` and preserves explicit
+    // `config.gate_up_interleaved`.
+    if raw.keys().any(|k| {
+        k.contains(".self_attn.k_conv.")
+            || k.contains(".self_attn.v_conv.")
+            || k.contains(".self_attn.post_conv.")
+            || k.contains(".mlp.post_conv.")
+            || k.contains(".loop_ctrl.")
+            || k.contains(".attn_res_query.")
+            || k.contains(".ffn_res_query.")
+            || k.contains(".loop_msg_query.")
+            || k.contains(".self_attn.q_clip.")
+            || k.contains(".self_attn.rel_bias.")
+    }) {
+        return Inkling2CheckpointLayout::Canonical;
+    }
+    if raw
+        .keys()
+        .any(|k| k.starts_with("language_model.model.") || k.starts_with("language_model.lm_head."))
+    {
+        return Inkling2CheckpointLayout::MlxLm;
+    }
+    if raw.keys().any(|k| k.starts_with("model.language_model.")) {
+        return Inkling2CheckpointLayout::MlxVlm;
+    }
+    Inkling2CheckpointLayout::Canonical
+}
+
+fn strip_inkling2_wrapper_prefixes(
+    raw_params: HashMap<String, MxArray>,
+) -> HashMap<String, MxArray> {
+    let mut params = HashMap::with_capacity(raw_params.len());
+    for (k, v) in raw_params {
+        let norm_key = if let Some(rest) = k.strip_prefix("model.language_model.model.") {
+            rest.to_owned()
+        } else if let Some(rest) = k.strip_prefix("model.language_model.") {
+            rest.to_owned()
+        } else if let Some(rest) = k.strip_prefix("language_model.model.") {
+            rest.to_owned()
+        } else if let Some(rest) = k.strip_prefix("language_model.") {
+            rest.to_owned()
+        } else if let Some(rest) = k.strip_prefix("model.") {
+            rest.to_owned()
+        } else {
+            k
+        };
+        params.insert(norm_key, v);
+    }
+    params
+}
+
+fn slice_fused_projection_group(
+    out: &mut HashMap<String, MxArray>,
+    lp: &str,
+    suffix: &str,
+    tensor: MxArray,
+    segments: &[(&str, i64)],
+    source_key: &str,
+) -> Result<()> {
+    if is_scalar_outer_scale_suffix(suffix) && tensor.size()? == 1 {
+        for &(target_proj, _) in segments {
+            out.insert(
+                format!("{lp}.self_attn.{target_proj}{suffix}"),
+                tensor.clone(),
+            );
+        }
+        return Ok(());
+    }
+    let total_expected: i64 = segments.iter().map(|(_, rows)| *rows).sum();
+    let total_rows = tensor.shape_at(0)?;
+    if total_rows != total_expected {
+        return Err(Error::from_reason(format!(
+            "Inkling2 oMLX: fused projection '{source_key}' has {total_rows} rows, expected {total_expected}"
+        )));
+    }
+    let mut offset = 0i64;
+    for &(target_proj, rows) in segments {
+        let sliced = tensor.slice_axis(0, offset, offset + rows)?;
+        out.insert(format!("{lp}.self_attn.{target_proj}{suffix}"), sliced);
+        offset += rows;
+    }
+    Ok(())
+}
+
+/// Shape-derived normalization metadata returned by [`normalize_inkling2_safetensors_params`]
+/// so [`remap_inkling2_per_layer_quant`] follows the exact same oMLX split plan as the tensors.
+#[derive(Default, Debug, Clone)]
+struct Inkling2StNormResult {
+    gate_up_interleaved: Option<bool>,
+    omlx_fused_in_proj: HashSet<usize>,
+    omlx_fused_q: HashSet<usize>,
+    omlx_fused_k: HashSet<usize>,
+    omlx_fused_v: HashSet<usize>,
+}
+
+/// Normalize SafeTensors text layouts (`Release`, `oMLX`, `mlx-vlm`, `mlx-lm`) into the
+/// canonical internal Inkling2 namespace used by `load_weights_sync`.
 fn normalize_inkling2_safetensors_params(
     params: &mut HashMap<String, MxArray>,
+    layout: Inkling2CheckpointLayout,
     config: &Inkling2Config,
-) -> Result<bool> {
-    if !params.contains_key("llm.embed.weight")
-        && !params.contains_key("llm.layers.0.attn.wq_du.weight")
-    {
-        return Ok(false);
+) -> Result<Inkling2StNormResult> {
+    if layout == Inkling2CheckpointLayout::Canonical {
+        // Even when per-layer tensors are already canonical, expand a top-level
+        // `[C, 4, D]` loop message query tensor if present (per-layer queries take precedence).
+        for top_key in [
+            "message_input.query",
+            "message_queries",
+            "loop_message.query",
+        ] {
+            if let Some(tensor) = params.remove(top_key) {
+                expand_global_loop_msg_queries(params, tensor, config, top_key)?;
+            }
+        }
+        return Ok(Inkling2StNormResult::default());
     }
 
     let raw = std::mem::take(params);
     let mut out: HashMap<String, MxArray> = HashMap::with_capacity(raw.len());
 
-    // Pair `weight_amax` and `weight_outer_scale_denominator` per `(layer, proj)` for NVFP4 outer scales.
+    let d = config.hidden_size as i64;
+    let n_heads = config.num_attention_heads as i64;
+    let n_kv = config.num_key_value_heads as i64;
+    let head_dim = config.head_dim as i64;
+    let d_rel = config.d_rel as i64;
+    let q_dim = n_heads * head_dim;
+    let kv_dim = n_kv * head_dim;
+    let rel_dim = n_heads * d_rel;
+    let taps = n_kv * config.sconv_kernel_size as i64;
+    let gate_rank = config
+        .loop_config
+        .as_ref()
+        .map_or(64i64, |lc| lc.gate_rank as i64);
+
+    let k_len = config.sconv_kernel_size as i32;
+    let rev_vals: Vec<i32> = (0..k_len).rev().collect();
+    let rev_k = MxArray::from_int32(&rev_vals, &[k_len as i64])?;
+
+    // Release layout pairs `weight_amax` and `weight_outer_scale_denominator` per `(layer, proj)`.
     let mut expert_amax: HashMap<(usize, &'static str), MxArray> = HashMap::new();
     let mut expert_denom: HashMap<(usize, &'static str), MxArray> = HashMap::new();
 
-    // Reverse index `[3, 2, 1, 0]` to flip Global dynamic `static_w` from newest-to-oldest
-    // (`[4, C]` in SafeTensors) into oldest-to-newest (`[C, 4]` expected by `dynamic_short_conv`
-    // and `inkling2_sconv_k4_kv_prep`).
-    let rev_k4 = MxArray::from_int32(&[3, 2, 1, 0], &[4])?;
-    let vision_patch = config
-        .vision_config
-        .as_ref()
-        .map_or(20i64, |v| v.patch_size as i64);
-
-    for (key, tensor) in raw {
-        // 1. Top-level LLM weights
-        match key.as_str() {
-            "llm.embed.weight" => {
-                out.insert("embed_tokens.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.embed_norm.weight" => {
-                out.insert("embed_norm.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.norm.weight" => {
-                out.insert("norm.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.unembed.weight" => {
-                out.insert("lm_head.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.attn_res.output_query" => {
-                out.insert("output_res_query.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.middle_cycle_cross_pass_queries" => {
-                out.insert("loop_res_query.weight".to_string(), tensor);
-                continue;
-            }
-            "llm.middle_cycle_cross_pass_kv_queries" => {
-                out.insert("loop_kv_res_query.weight".to_string(), tensor);
-                continue;
-            }
-            _ => {}
-        }
-
-        // 2. AttnRes queries (`attn_queries.{idx}` -> physical layer `idx + 1`, since phys 0 has none)
-        if let Some(rest) = key.strip_prefix("llm.attn_res.attn_queries.") {
-            let idx: usize = rest.parse().map_err(|e| {
-                Error::from_reason(format!(
-                    "Inkling2 ST: invalid attn_queries index '{rest}': {e}"
-                ))
-            })?;
-            out.insert(format!("layers.{}.attn_res_query.weight", idx + 1), tensor);
-            continue;
-        }
-        if let Some(rest) = key.strip_prefix("llm.attn_res.mlp_queries.") {
-            let idx: usize = rest.parse().map_err(|e| {
-                Error::from_reason(format!(
-                    "Inkling2 ST: invalid mlp_queries index '{rest}': {e}"
-                ))
-            })?;
-            out.insert(format!("layers.{idx}.ffn_res_query.weight"), tensor);
-            continue;
-        }
-
-        // 3. Per-layer LLM weights (`llm.layers.{L}.*`)
-        if let Some(rest) = key.strip_prefix("llm.layers.")
-            && let Some((layer_str, suffix)) = rest.split_once('.')
+    // Pre-scan which raw prefixes carry a quantization scale companion (`.scales` / `.weight_scale` /
+    // Release `*_weight_scale`) so packed Uint8 ModelOpt weights are reinterpreted as Uint32 ONLY
+    // when paired with scales (leaving orphaned Uint8 dense weights caught by `ensure_dense_weight_floating`).
+    let mut bases_with_scales: HashSet<String> = HashSet::new();
+    for k in raw.keys() {
+        if let Some(base) = k
+            .strip_suffix(".scales")
+            .or_else(|| k.strip_suffix(".weight_scale"))
         {
-            let layer_idx: usize = layer_str.parse().map_err(|e| {
-                Error::from_reason(format!(
-                    "Inkling2 ST: invalid layer index '{layer_str}': {e}"
-                ))
-            })?;
-            let lp = format!("layers.{layer_idx}");
-            match suffix {
-                "attn_norm.weight" => {
-                    out.insert(format!("{lp}.input_layernorm.weight"), tensor);
-                }
-                "q_input_norm.weight" => {
-                    out.insert(format!("{lp}.self_attn.q_inp_norm.weight"), tensor);
-                }
-                "k_input_norm.weight" => {
-                    out.insert(format!("{lp}.self_attn.k_inp_norm.weight"), tensor);
-                }
-                "v_input_norm.weight" => {
-                    out.insert(format!("{lp}.self_attn.v_inp_norm.weight"), tensor);
-                }
-                "mlp_norm.weight" => {
-                    out.insert(format!("{lp}.post_attention_layernorm.weight"), tensor);
-                }
-                "attn.wq_du.weight" => {
-                    out.insert(format!("{lp}.self_attn.q_proj.weight"), tensor);
-                }
-                "attn.wk_dv.weight" => {
-                    out.insert(format!("{lp}.self_attn.k_proj.weight"), tensor);
-                }
-                "attn.wv_dv.weight" => {
-                    out.insert(format!("{lp}.self_attn.v_proj.weight"), tensor);
-                }
-                "attn.wr_du.weight" => {
-                    out.insert(format!("{lp}.self_attn.rel_proj.weight"), tensor);
-                }
-                "attn.gate_attn.weight" => {
-                    out.insert(format!("{lp}.self_attn.gate_proj.weight"), tensor);
-                }
-                "attn.attn_sink_proj.weight" => {
-                    out.insert(format!("{lp}.self_attn.sink_proj.weight"), tensor);
-                }
-                "attn.wo_ud.weight" => {
-                    out.insert(format!("{lp}.self_attn.o_proj.weight"), tensor);
-                }
-                "attn.q_l2_clip.scale" => {
-                    out.insert(format!("{lp}.self_attn.q_clip.weight"), tensor);
-                }
-                "attn.rel_l2_clip.scale" => {
-                    out.insert(format!("{lp}.self_attn.rel_clip.weight"), tensor);
-                }
-                "attn.rel_logits_proj.proj" => {
-                    out.insert(format!("{lp}.self_attn.rel_bias.weight"), tensor);
-                }
-                // Static ShortConv (`[C, 1, 4]` oldest-to-newest -> `[C, 4]`)
-                "attn.k_sconv.weight" => {
-                    let w = if tensor.ndim()? == 3 {
-                        tensor.squeeze(Some(&[1]))?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
-                }
-                "attn.v_sconv.weight" => {
-                    let w = if tensor.ndim()? == 3 {
-                        tensor.squeeze(Some(&[1]))?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
-                }
-                "attn_sconv.weight" => {
-                    let w = if tensor.ndim()? == 3 {
-                        tensor.squeeze(Some(&[1]))?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.self_attn.post_conv.weight"), w);
-                }
-                "mlp_sconv.weight" => {
-                    let w = if tensor.ndim()? == 3 {
-                        tensor.squeeze(Some(&[1]))?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.mlp.post_conv.weight"), w);
-                }
-                // Dynamic Global ShortConv (`static_w` `[4, C]` newest-to-oldest -> `[C, 4]` oldest-to-newest)
-                "attn.k_sconv.static_w" => {
-                    let w = tensor.transpose(None)?.take(&rev_k4, 1)?;
-                    out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
-                }
-                "attn.v_sconv.static_w" => {
-                    let w = tensor.transpose(None)?.take(&rev_k4, 1)?;
-                    out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
-                }
-                "attn.k_sconv.weight_proj" => {
-                    out.insert(format!("{lp}.self_attn.k_conv_proj.weight"), tensor);
-                }
-                "attn.v_sconv.weight_proj" => {
-                    out.insert(format!("{lp}.self_attn.v_conv_proj.weight"), tensor);
-                }
-                // MoE router
-                "mlp.gate.weight" => {
-                    out.insert(format!("{lp}.mlp.gate.weight"), tensor);
-                }
-                "mlp.gate.bias" => {
-                    out.insert(format!("{lp}.mlp.gate.e_score_correction_bias"), tensor);
-                }
-                // MoE experts: ZERO-COPY `view(DType::Uint32)` for NVFP4 (L0–19) & MXFP8 (L20–23)!
-                "mlp.experts.w13_weight" => {
-                    let w = if tensor.dtype()? == DType::Uint8 {
-                        tensor.view(DType::Uint32)?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.mlp.experts.gate_up_proj.weight"), w);
-                }
-                "mlp.experts.w13_weight_scale" => {
-                    out.insert(format!("{lp}.mlp.experts.gate_up_proj.scales"), tensor);
-                }
-                "mlp.experts.w13_weight_amax" => {
-                    expert_amax.insert((layer_idx, "gate_up_proj"), tensor);
-                }
-                "mlp.experts.w13_weight_outer_scale_denominator" => {
-                    expert_denom.insert((layer_idx, "gate_up_proj"), tensor);
-                }
-                "mlp.experts.w2_weight" => {
-                    let w = if tensor.dtype()? == DType::Uint8 {
-                        tensor.view(DType::Uint32)?
-                    } else {
-                        tensor
-                    };
-                    out.insert(format!("{lp}.mlp.experts.down_proj.weight"), w);
-                }
-                "mlp.experts.w2_weight_scale" => {
-                    out.insert(format!("{lp}.mlp.experts.down_proj.scales"), tensor);
-                }
-                "mlp.experts.w2_weight_amax" => {
-                    expert_amax.insert((layer_idx, "down_proj"), tensor);
-                }
-                "mlp.experts.w2_weight_outer_scale_denominator" => {
-                    expert_denom.insert((layer_idx, "down_proj"), tensor);
-                }
-                // Loop controllers (`controllers.{attn->q, k->k, v->v, mlp->mlp}.{down,gain,forget}_weight`)
-                _ if suffix.starts_with("controllers.") => {
-                    if let Some(ctrl_rest) = suffix.strip_prefix("controllers.")
-                        && let Some((stream_raw, proj_raw)) = ctrl_rest.split_once('.')
-                    {
-                        let stream = match stream_raw {
-                            "attn" => "q",
-                            "k" => "k",
-                            "v" => "v",
-                            "mlp" => "mlp",
-                            other => {
-                                return Err(Error::from_reason(format!(
-                                    "Inkling2 ST: unknown controller stream '{other}' in '{key}'"
-                                )));
-                            }
-                        };
-                        let proj = match proj_raw {
-                            "down_weight" => "down_proj.weight",
-                            "gain_weight" => "gain_proj.weight",
-                            "forget_weight" => "forget_proj.weight",
-                            other => {
-                                return Err(Error::from_reason(format!(
-                                    "Inkling2 ST: unknown controller weight '{other}' in '{key}'"
-                                )));
-                            }
-                        };
-                        out.insert(format!("{lp}.loop_ctrl.{stream}.{proj}"), tensor);
-                    } else {
-                        out.insert(key, tensor);
-                    }
-                }
-                _ => {
-                    out.insert(key, tensor);
-                }
-            }
-            continue;
+            bases_with_scales.insert(base.to_string());
+        } else if let Some(base) = k.strip_suffix("_weight_scale") {
+            bases_with_scales.insert(format!("{base}_weight"));
         }
-
-        // 4. Vision tower + projector (`visual.*`)
-        if let Some(vrest) = key.strip_prefix("visual.") {
-            match vrest {
-                "backbone.embeddings.class_embedding" => {
-                    out.insert("vision_tower.class_embedding".to_string(), tensor);
-                }
-                "backbone.embeddings.cls_position_embedding" => {
-                    out.insert(
-                        "vision_tower.class_position_embedding.weight".to_string(),
-                        tensor,
-                    );
-                }
-                "backbone.embeddings.position_embedding" => {
-                    out.insert("vision_tower.position_embedding.weight".to_string(), tensor);
-                }
-                "backbone.embeddings.patch_embedding.weight" => {
-                    // SafeTensors stores `[D, P*P*3]` in HWC `(P, P, 3)` flattened order;
-                    // `Inkling2VisionEncoder` expects CHW `(3, P, P)` flattened `[D, 3*P*P]`.
-                    let shape = tensor.shape()?;
-                    let converted =
-                        if shape.len() == 2 && shape[1] == 3 * vision_patch * vision_patch {
-                            let d_vis = shape[0];
-                            tensor
-                                .reshape(&[d_vis, vision_patch, vision_patch, 3])?
-                                .transpose(Some(&[0, 3, 1, 2]))?
-                                .reshape(&[d_vis, 3 * vision_patch * vision_patch])?
-                        } else {
-                            tensor
-                        };
-                    out.insert("vision_tower.patch_embed.weight".to_string(), converted);
-                }
-                "backbone.ln_pre.weight" => {
-                    out.insert("vision_tower.pre_ln.weight".to_string(), tensor);
-                }
-                "backbone.ln_pre.bias" => {
-                    out.insert("vision_tower.pre_ln.bias".to_string(), tensor);
-                }
-                "proj_in.weight" => {
-                    out.insert("vision_projector.fc1.weight".to_string(), tensor);
-                }
-                "proj_in.bias" => {
-                    out.insert("vision_projector.fc1.bias".to_string(), tensor);
-                }
-                "proj_out.weight" => {
-                    out.insert("vision_projector.fc2.weight".to_string(), tensor);
-                }
-                "proj_out.bias" => {
-                    out.insert("vision_projector.fc2.bias".to_string(), tensor);
-                }
-                _ if vrest.starts_with("backbone.layers.") => {
-                    if let Some(lrest) = vrest.strip_prefix("backbone.layers.")
-                        && let Some((blk_str, sub)) = lrest.split_once('.')
-                    {
-                        let bp = format!("vision_tower.blocks.{blk_str}");
-                        let mapped = match sub {
-                            "ln_1.weight" => Some("norm1.weight"),
-                            "ln_1.bias" => Some("norm1.bias"),
-                            "ln_2.weight" => Some("norm2.weight"),
-                            "ln_2.bias" => Some("norm2.bias"),
-                            "ls_1.gamma" => Some("ls1.weight"),
-                            "ls_2.gamma" => Some("ls2.weight"),
-                            "self_attn.q_proj.weight" => Some("attn.q_proj.weight"),
-                            "self_attn.q_proj.bias" => Some("attn.q_proj.bias"),
-                            "self_attn.k_proj.weight" => Some("attn.k_proj.weight"),
-                            "self_attn.k_proj.bias" => Some("attn.k_proj.bias"),
-                            "self_attn.v_proj.weight" => Some("attn.v_proj.weight"),
-                            "self_attn.v_proj.bias" => Some("attn.v_proj.bias"),
-                            "self_attn.out_proj.weight" => Some("attn.o_proj.weight"),
-                            "self_attn.out_proj.bias" => Some("attn.o_proj.bias"),
-                            "mlp.c_fc.weight" => Some("mlp.fc1.weight"),
-                            "mlp.c_fc.bias" => Some("mlp.fc1.bias"),
-                            "mlp.c_proj.weight" => Some("mlp.fc2.weight"),
-                            "mlp.c_proj.bias" => Some("mlp.fc2.bias"),
-                            _ => None,
-                        };
-                        if let Some(m) = mapped {
-                            out.insert(format!("{bp}.{m}"), tensor);
-                        } else {
-                            out.insert(key, tensor);
-                        }
-                    } else {
-                        out.insert(key, tensor);
-                    }
-                }
-                _ => {
-                    out.insert(key, tensor);
-                }
-            }
-            continue;
-        }
-
-        out.insert(key, tensor);
     }
 
-    // Materialize per-expert NVFP4 `outer_scale = amax / outer_scale_denominator` (`[E]` F32).
+    // Pre-scan oMLX fused projection shapes so `.scales`/`.biases`/`.global_scale` and
+    // `per_layer_quant` overrides fan out consistently from the exact same split plan.
+    let mut omlx_fused_in_proj: HashSet<usize> = HashSet::new();
+    let mut omlx_fused_q: HashSet<usize> = HashSet::new();
+    let mut omlx_fused_k: HashSet<usize> = HashSet::new();
+    let mut omlx_fused_v: HashSet<usize> = HashSet::new();
+    if layout == Inkling2CheckpointLayout::OMlx {
+        let full_q_rows = 2 * q_dim + rel_dim + n_heads;
+        let full_kv_rows = kv_dim + taps;
+        for (key, tensor) in &raw {
+            if let Some(rest) = key.strip_prefix("layers.")
+                && let Some((layer_str, suffix)) = rest.split_once('.')
+                && let Ok(layer_idx) = layer_str.parse::<usize>()
+            {
+                if suffix == "attn.in_proj.weight" {
+                    omlx_fused_in_proj.insert(layer_idx);
+                } else if suffix == "attn.q_proj.weight"
+                    && tensor.shape_at(0).ok() == Some(full_q_rows)
+                {
+                    omlx_fused_q.insert(layer_idx);
+                } else if suffix == "attn.k_proj.weight"
+                    && tensor.shape_at(0).ok() == Some(full_kv_rows)
+                {
+                    omlx_fused_k.insert(layer_idx);
+                } else if suffix == "attn.v_proj.weight"
+                    && tensor.shape_at(0).ok() == Some(full_kv_rows)
+                {
+                    omlx_fused_v.insert(layer_idx);
+                }
+            }
+        }
+    }
+
+    for (key, tensor) in raw {
+        // Leave vision keys untouched for `normalize_inkling2_vision_params`.
+        if key.starts_with("visual.")
+            || key.starts_with("vision_tower.")
+            || key.starts_with("vision_projector.")
+        {
+            out.insert(key, tensor);
+            continue;
+        }
+
+        match layout {
+            Inkling2CheckpointLayout::Release => {
+                // 1. Top-level Release LLM weights
+                if let Some((base, q_sfx)) = split_st_quant_suffix(&key) {
+                    let dst_base = match base {
+                        "llm.embed" => Some("embed_tokens"),
+                        "llm.embed_norm" => Some("embed_norm"),
+                        "llm.norm" => Some("norm"),
+                        "llm.unembed" => Some("lm_head"),
+                        _ => None,
+                    };
+                    if let Some(dst) = dst_base {
+                        let out_sfx = canonical_st_quant_suffix(q_sfx);
+                        let t = if q_sfx == ".weight" && bases_with_scales.contains(base) {
+                            maybe_view_u8_to_u32(tensor)?
+                        } else {
+                            tensor
+                        };
+                        out.insert(format!("{dst}{out_sfx}"), t);
+                        continue;
+                    }
+                }
+                match key.as_str() {
+                    "llm.attn_res.output_query" => {
+                        out.insert("output_res_query.weight".to_string(), tensor);
+                        continue;
+                    }
+                    "llm.middle_cycle_cross_pass_queries" => {
+                        out.insert("loop_res_query.weight".to_string(), tensor);
+                        continue;
+                    }
+                    "llm.middle_cycle_cross_pass_kv_queries" => {
+                        out.insert("loop_kv_res_query.weight".to_string(), tensor);
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // 2. AttnRes queries (`attn_queries.{idx}` -> physical layer `idx + 1`)
+                if let Some(rest) = key.strip_prefix("llm.attn_res.attn_queries.") {
+                    let idx: usize = rest.parse().map_err(|e| {
+                        Error::from_reason(format!(
+                            "Inkling2 ST: invalid attn_queries index '{rest}': {e}"
+                        ))
+                    })?;
+                    out.insert(format!("layers.{}.attn_res_query.weight", idx + 1), tensor);
+                    continue;
+                }
+                if let Some(rest) = key.strip_prefix("llm.attn_res.mlp_queries.") {
+                    let idx: usize = rest.parse().map_err(|e| {
+                        Error::from_reason(format!(
+                            "Inkling2 ST: invalid mlp_queries index '{rest}': {e}"
+                        ))
+                    })?;
+                    out.insert(format!("layers.{idx}.ffn_res_query.weight"), tensor);
+                    continue;
+                }
+
+                // 3. Per-layer Release weights (`llm.layers.{L}.*`)
+                if let Some(rest) = key.strip_prefix("llm.layers.")
+                    && let Some((layer_str, suffix)) = rest.split_once('.')
+                {
+                    let layer_idx: usize = layer_str.parse().map_err(|e| {
+                        Error::from_reason(format!(
+                            "Inkling2 ST: invalid layer index '{layer_str}': {e}"
+                        ))
+                    })?;
+                    let lp = format!("layers.{layer_idx}");
+                    match suffix {
+                        "attn.q_l2_clip.scale" => {
+                            out.insert(format!("{lp}.self_attn.q_clip.weight"), tensor);
+                        }
+                        "attn.rel_l2_clip.scale" => {
+                            out.insert(format!("{lp}.self_attn.rel_clip.weight"), tensor);
+                        }
+                        "attn.rel_logits_proj.proj" => {
+                            out.insert(format!("{lp}.self_attn.rel_bias.weight"), tensor);
+                        }
+                        "attn.k_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                        }
+                        "attn.v_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                        }
+                        "attn_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.post_conv.weight"), w);
+                        }
+                        "mlp_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.mlp.post_conv.weight"), w);
+                        }
+                        "attn.k_sconv.static_w" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                        }
+                        "attn.v_sconv.static_w" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                        }
+                        "attn.k_sconv.weight_proj" => {
+                            out.insert(format!("{lp}.self_attn.k_conv_proj.weight"), tensor);
+                        }
+                        "attn.v_sconv.weight_proj" => {
+                            out.insert(format!("{lp}.self_attn.v_conv_proj.weight"), tensor);
+                        }
+                        "mlp.gate.bias" => {
+                            out.insert(format!("{lp}.mlp.gate.e_score_correction_bias"), tensor);
+                        }
+                        "mlp.experts.w13_weight" => {
+                            let w = if bases_with_scales.contains(&key) {
+                                maybe_view_u8_to_u32(tensor)?
+                            } else {
+                                tensor
+                            };
+                            out.insert(format!("{lp}.mlp.experts.gate_up_proj.weight"), w);
+                        }
+                        "mlp.experts.w13_weight_scale" => {
+                            out.insert(format!("{lp}.mlp.experts.gate_up_proj.scales"), tensor);
+                        }
+                        "mlp.experts.w13_weight_amax" => {
+                            expert_amax.insert((layer_idx, "gate_up_proj"), tensor);
+                        }
+                        "mlp.experts.w13_weight_outer_scale_denominator" => {
+                            expert_denom.insert((layer_idx, "gate_up_proj"), tensor);
+                        }
+                        "mlp.experts.w2_weight" => {
+                            let w = if bases_with_scales.contains(&key) {
+                                maybe_view_u8_to_u32(tensor)?
+                            } else {
+                                tensor
+                            };
+                            out.insert(format!("{lp}.mlp.experts.down_proj.weight"), w);
+                        }
+                        "mlp.experts.w2_weight_scale" => {
+                            out.insert(format!("{lp}.mlp.experts.down_proj.scales"), tensor);
+                        }
+                        "mlp.experts.w2_weight_amax" => {
+                            expert_amax.insert((layer_idx, "down_proj"), tensor);
+                        }
+                        "mlp.experts.w2_weight_outer_scale_denominator" => {
+                            expert_denom.insert((layer_idx, "down_proj"), tensor);
+                        }
+                        _ if suffix.starts_with("controllers.") => {
+                            if let Some(ctrl_rest) = suffix.strip_prefix("controllers.")
+                                && let Some((stream_raw, proj_raw)) = ctrl_rest.split_once('.')
+                            {
+                                let stream = match stream_raw {
+                                    "attn" => "q",
+                                    "k" => "k",
+                                    "v" => "v",
+                                    "mlp" => "mlp",
+                                    other => {
+                                        return Err(Error::from_reason(format!(
+                                            "Inkling2 ST: unknown controller stream '{other}' in '{key}'"
+                                        )));
+                                    }
+                                };
+                                let proj = match proj_raw {
+                                    "down_weight" => "down_proj.weight",
+                                    "gain_weight" => "gain_proj.weight",
+                                    "forget_weight" => "forget_proj.weight",
+                                    other => {
+                                        return Err(Error::from_reason(format!(
+                                            "Inkling2 ST: unknown controller weight '{other}' in '{key}'"
+                                        )));
+                                    }
+                                };
+                                out.insert(format!("{lp}.loop_ctrl.{stream}.{proj}"), tensor);
+                            } else {
+                                out.insert(key, tensor);
+                            }
+                        }
+                        _ => {
+                            if let Some((base, q_sfx)) = split_st_quant_suffix(suffix) {
+                                let mapped = match base {
+                                    "attn_norm" => Some("input_layernorm"),
+                                    "q_input_norm" => Some("self_attn.q_inp_norm"),
+                                    "k_input_norm" => Some("self_attn.k_inp_norm"),
+                                    "v_input_norm" => Some("self_attn.v_inp_norm"),
+                                    "mlp_norm" => Some("post_attention_layernorm"),
+                                    "attn.wq_du" => Some("self_attn.q_proj"),
+                                    "attn.wk_dv" => Some("self_attn.k_proj"),
+                                    "attn.wv_dv" => Some("self_attn.v_proj"),
+                                    "attn.wr_du" => Some("self_attn.rel_proj"),
+                                    "attn.gate_attn" => Some("self_attn.gate_proj"),
+                                    "attn.attn_sink_proj" => Some("self_attn.sink_proj"),
+                                    "attn.wo_ud" => Some("self_attn.o_proj"),
+                                    "attn.k_sconv.weight_proj" => Some("self_attn.k_conv_proj"),
+                                    "attn.v_sconv.weight_proj" => Some("self_attn.v_conv_proj"),
+                                    "mlp.gate" => Some("mlp.gate"),
+                                    _ => None,
+                                };
+                                if let Some(dst) = mapped {
+                                    let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                                    let out_sfx = canonical_st_quant_suffix(q_sfx);
+                                    let t = if q_sfx == ".weight"
+                                        && bases_with_scales.contains(raw_base)
+                                    {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                    out.insert(format!("{lp}.{dst}{out_sfx}"), t);
+                                    continue;
+                                }
+                            }
+                            out.insert(key, tensor);
+                        }
+                    }
+                    continue;
+                }
+                out.insert(key, tensor);
+            }
+
+            Inkling2CheckpointLayout::OMlx => {
+                // 1. Top-level oMLX weights
+                if let Some((base, q_sfx)) = split_st_quant_suffix(&key) {
+                    match base {
+                        "embed" | "embed_tokens" => {
+                            out.insert(format!("embed_tokens{q_sfx}"), tensor);
+                            continue;
+                        }
+                        "unembed" | "lm_head" => {
+                            out.insert(format!("lm_head{q_sfx}"), tensor);
+                            continue;
+                        }
+                        "embed_norm" => {
+                            out.insert(format!("embed_norm{q_sfx}"), tensor);
+                            continue;
+                        }
+                        "norm" => {
+                            out.insert(format!("norm{q_sfx}"), tensor);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
+                match key.as_str() {
+                    "final_input.query" | "attn_res.output_query" => {
+                        out.insert("output_res_query.weight".to_string(), tensor);
+                        continue;
+                    }
+                    "message_queries" | "message_input.query" | "loop_message.query" => {
+                        expand_global_loop_msg_queries(&mut out, tensor, config, &key)?;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // 2. Per-layer oMLX weights (`layers.{L}.*`)
+                if let Some(rest) = key.strip_prefix("layers.")
+                    && let Some((layer_str, suffix)) = rest.split_once('.')
+                {
+                    let layer_idx: usize = layer_str.parse().map_err(|e| {
+                        Error::from_reason(format!(
+                            "Inkling2 oMLX: invalid layer index '{layer_str}': {e}"
+                        ))
+                    })?;
+                    let lp = format!("layers.{layer_idx}");
+
+                    // Bare (non-quant-suffixed) exact names first so `attn.rel_proj` never collides.
+                    match suffix {
+                        "attn.q_scale" => {
+                            out.insert(format!("{lp}.self_attn.q_clip.weight"), tensor);
+                            continue;
+                        }
+                        "attn.r_scale" | "attn.rel_scale" => {
+                            out.insert(format!("{lp}.self_attn.rel_clip.weight"), tensor);
+                            continue;
+                        }
+                        "attn.rel_proj" => {
+                            out.insert(format!("{lp}.self_attn.rel_bias.weight"), tensor);
+                            continue;
+                        }
+                        "attn.k_conv" | "attn.k_conv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                            continue;
+                        }
+                        "attn.v_conv" | "attn.v_conv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                            continue;
+                        }
+                        "attn.k_static" | "attn.k_static.weight" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                            continue;
+                        }
+                        "attn.v_static" | "attn.v_static.weight" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                            continue;
+                        }
+                        "attn_conv" | "attn_conv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.post_conv.weight"), w);
+                            continue;
+                        }
+                        "mlp_conv" | "mlp_conv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.mlp.post_conv.weight"), w);
+                            continue;
+                        }
+                        "attn_input.query" | "attention_input.query" => {
+                            out.insert(format!("{lp}.attn_res_query.weight"), tensor);
+                            continue;
+                        }
+                        "mlp_input.query" => {
+                            out.insert(format!("{lp}.ffn_res_query.weight"), tensor);
+                            continue;
+                        }
+                        "mlp.router_weight" => {
+                            out.insert(format!("{lp}.mlp.gate.weight"), tensor);
+                            continue;
+                        }
+                        "mlp.router_bias" | "mlp.gate.bias" => {
+                            out.insert(format!("{lp}.mlp.gate.e_score_correction_bias"), tensor);
+                            continue;
+                        }
+                        "loop_message.query" | "message_input.query" => {
+                            out.insert(format!("{lp}.loop_msg_query.weight"), tensor);
+                            continue;
+                        }
+                        "loop_down" | "loop_down.weight" => {
+                            // Packed `[4, 2*D, rank]` -> per-stream `[rank, 2*D]`.
+                            let reshaped = tensor.reshape(&[4, 2 * d, gate_rank])?;
+                            for (g, stream) in [(0i64, "q"), (1, "k"), (2, "v"), (3, "mlp")] {
+                                let w = reshaped
+                                    .slice(&[g, 0, 0], &[g + 1, 2 * d, gate_rank])?
+                                    .squeeze(Some(&[0]))?
+                                    .transpose(None)?;
+                                out.insert(format!("{lp}.loop_ctrl.{stream}.down_proj.weight"), w);
+                            }
+                            continue;
+                        }
+                        "loop_gain_forget" | "loop_gain_forget.weight" => {
+                            // Packed `[4, rank, 2*D]` -> cols `[0..D]` gain^T, cols `[D..2*D]` forget^T.
+                            let reshaped = tensor.reshape(&[4, gate_rank, 2 * d])?;
+                            for (g, stream) in [(0i64, "q"), (1, "k"), (2, "v"), (3, "mlp")] {
+                                let gf = reshaped
+                                    .slice(&[g, 0, 0], &[g + 1, gate_rank, 2 * d])?
+                                    .squeeze(Some(&[0]))?;
+                                let gain = gf.slice(&[0, 0], &[gate_rank, d])?.transpose(None)?;
+                                let forget =
+                                    gf.slice(&[0, d], &[gate_rank, 2 * d])?.transpose(None)?;
+                                out.insert(
+                                    format!("{lp}.loop_ctrl.{stream}.gain_proj.weight"),
+                                    gain,
+                                );
+                                out.insert(
+                                    format!("{lp}.loop_ctrl.{stream}.forget_proj.weight"),
+                                    forget,
+                                );
+                            }
+                            continue;
+                        }
+                        _ => {}
+                    }
+
+                    if let Some((base, q_sfx)) = split_st_quant_suffix(suffix) {
+                        let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                        let out_sfx = canonical_st_quant_suffix(q_sfx);
+                        match base {
+                            "attn.in_proj" => {
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                slice_fused_projection_group(
+                                    &mut out,
+                                    &lp,
+                                    out_sfx,
+                                    t,
+                                    &[
+                                        ("q_proj", q_dim),
+                                        ("k_proj", kv_dim),
+                                        ("v_proj", kv_dim),
+                                        ("rel_proj", rel_dim),
+                                        ("gate_proj", q_dim),
+                                        ("sink_proj", n_heads),
+                                    ],
+                                    &key,
+                                )?;
+                                continue;
+                            }
+                            "attn.q_proj" if omlx_fused_q.contains(&layer_idx) => {
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                slice_fused_projection_group(
+                                    &mut out,
+                                    &lp,
+                                    out_sfx,
+                                    t,
+                                    &[
+                                        ("q_proj", q_dim),
+                                        ("rel_proj", rel_dim),
+                                        ("gate_proj", q_dim),
+                                        ("sink_proj", n_heads),
+                                    ],
+                                    &key,
+                                )?;
+                                continue;
+                            }
+                            "attn.k_proj" if omlx_fused_k.contains(&layer_idx) => {
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                slice_fused_projection_group(
+                                    &mut out,
+                                    &lp,
+                                    out_sfx,
+                                    t,
+                                    &[("k_proj", kv_dim), ("k_conv_proj", taps)],
+                                    &key,
+                                )?;
+                                continue;
+                            }
+                            "attn.v_proj" if omlx_fused_v.contains(&layer_idx) => {
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                slice_fused_projection_group(
+                                    &mut out,
+                                    &lp,
+                                    out_sfx,
+                                    t,
+                                    &[("v_proj", kv_dim), ("v_conv_proj", taps)],
+                                    &key,
+                                )?;
+                                continue;
+                            }
+                            "mlp.experts.w13" => {
+                                let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                                let out_sfx = canonical_st_quant_suffix(q_sfx);
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                out.insert(format!("{lp}.mlp.experts.gate_up_proj{out_sfx}"), t);
+                                continue;
+                            }
+                            "mlp.experts.w2" => {
+                                let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                                let out_sfx = canonical_st_quant_suffix(q_sfx);
+                                let t =
+                                    if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                out.insert(format!("{lp}.mlp.experts.down_proj{out_sfx}"), t);
+                                continue;
+                            }
+                            _ => {
+                                let mapped = match base {
+                                    "attn_norm" | "input_layernorm" => Some("input_layernorm"),
+                                    "q_input_norm"
+                                    | "q_input_layernorm"
+                                    | "attn.q_input_norm"
+                                    | "self_attn.q_inp_norm" => Some("self_attn.q_inp_norm"),
+                                    "k_input_norm"
+                                    | "k_input_layernorm"
+                                    | "attn.k_input_norm"
+                                    | "self_attn.k_inp_norm" => Some("self_attn.k_inp_norm"),
+                                    "v_input_norm"
+                                    | "v_input_layernorm"
+                                    | "attn.v_input_norm"
+                                    | "self_attn.v_inp_norm" => Some("self_attn.v_inp_norm"),
+                                    "mlp_norm" | "post_attention_layernorm" => {
+                                        Some("post_attention_layernorm")
+                                    }
+                                    "attn.q_proj" => Some("self_attn.q_proj"),
+                                    "attn.k_proj" => Some("self_attn.k_proj"),
+                                    "attn.v_proj" => Some("self_attn.v_proj"),
+                                    "attn.r_proj" => Some("self_attn.rel_proj"),
+                                    "attn.gate_proj" => Some("self_attn.gate_proj"),
+                                    "attn.sink_proj" => Some("self_attn.sink_proj"),
+                                    "attn.o_proj" => Some("self_attn.o_proj"),
+                                    "mlp.router" | "mlp.gate" => Some("mlp.gate"),
+                                    _ => None,
+                                };
+                                if let Some(dst) = mapped {
+                                    let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                                    let out_sfx = canonical_st_quant_suffix(q_sfx);
+                                    let t = if q_sfx == ".weight"
+                                        && bases_with_scales.contains(raw_base)
+                                    {
+                                        maybe_view_u8_to_u32(tensor)?
+                                    } else {
+                                        tensor
+                                    };
+                                    out.insert(format!("{lp}.{dst}{out_sfx}"), t);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    out.insert(key, tensor);
+                    continue;
+                }
+                out.insert(key, tensor);
+            }
+
+            Inkling2CheckpointLayout::MlxVlm | Inkling2CheckpointLayout::MlxLm => {
+                // 1. Top-level mlx-vlm / mlx-lm weights
+                match key.as_str() {
+                    "final_input.query" | "attn_res.output_query" => {
+                        out.insert("output_res_query.weight".to_string(), tensor);
+                        continue;
+                    }
+                    "message_queries" | "message_input.query" | "loop_message.query" => {
+                        expand_global_loop_msg_queries(&mut out, tensor, config, &key)?;
+                        continue;
+                    }
+                    _ => {}
+                }
+
+                // 2. Per-layer mlx-vlm / mlx-lm weights (`layers.{L}.*`)
+                if let Some(rest) = key.strip_prefix("layers.")
+                    && let Some((layer_str, suffix)) = rest.split_once('.')
+                {
+                    let layer_idx: usize = layer_str.parse().map_err(|e| {
+                        Error::from_reason(format!(
+                            "Inkling2 MLX: invalid layer index '{layer_str}': {e}"
+                        ))
+                    })?;
+                    let lp = format!("layers.{layer_idx}");
+
+                    // Bare / exact keys first (guards `self_attn.rel_proj` vs `self_attn.rel_proj.*` collision!)
+                    match suffix {
+                        "self_attn.rel_proj" | "self_attn.rel_logits_proj.proj" => {
+                            out.insert(format!("{lp}.self_attn.rel_bias.weight"), tensor);
+                            continue;
+                        }
+                        "self_attn.q_scale" | "self_attn.q_l2_clip.scale" => {
+                            out.insert(format!("{lp}.self_attn.q_clip.weight"), tensor);
+                            continue;
+                        }
+                        "self_attn.rel_scale"
+                        | "self_attn.r_scale"
+                        | "self_attn.rel_l2_clip.scale" => {
+                            out.insert(format!("{lp}.self_attn.rel_clip.weight"), tensor);
+                            continue;
+                        }
+                        "self_attn.k_sconv.conv1d.weight"
+                        | "self_attn.k_sconv.conv.weight"
+                        | "self_attn.k_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                            continue;
+                        }
+                        "self_attn.v_sconv.conv1d.weight"
+                        | "self_attn.v_sconv.conv.weight"
+                        | "self_attn.v_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                            continue;
+                        }
+                        "self_attn.k_sconv.static_weight" | "self_attn.k_sconv.static_w" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.k_conv.weight"), w);
+                            continue;
+                        }
+                        "self_attn.v_sconv.static_weight" | "self_attn.v_sconv.static_w" => {
+                            let w = normalize_dynamic_static_conv(tensor, &rev_k)?;
+                            out.insert(format!("{lp}.self_attn.v_conv.weight"), w);
+                            continue;
+                        }
+                        "self_attn.k_sconv.weight_proj" => {
+                            out.insert(format!("{lp}.self_attn.k_conv_proj.weight"), tensor);
+                            continue;
+                        }
+                        "self_attn.v_sconv.weight_proj" => {
+                            out.insert(format!("{lp}.self_attn.v_conv_proj.weight"), tensor);
+                            continue;
+                        }
+                        "post_attention_convolution.conv1d.weight"
+                        | "attn_sconv.conv.weight"
+                        | "attn_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.self_attn.post_conv.weight"), w);
+                            continue;
+                        }
+                        "post_mlp_convolution.conv1d.weight"
+                        | "mlp_sconv.conv.weight"
+                        | "mlp_sconv.weight" => {
+                            let w = normalize_sconv_weight(tensor, &key)?;
+                            out.insert(format!("{lp}.mlp.post_conv.weight"), w);
+                            continue;
+                        }
+                        "attention_input.query" | "attn_input.query" => {
+                            out.insert(format!("{lp}.attn_res_query.weight"), tensor);
+                            continue;
+                        }
+                        "mlp_input.query" => {
+                            out.insert(format!("{lp}.ffn_res_query.weight"), tensor);
+                            continue;
+                        }
+                        "message_input.query" => {
+                            out.insert(format!("{lp}.loop_msg_query.weight"), tensor);
+                            continue;
+                        }
+                        "mlp.gate_weight" => {
+                            out.insert(format!("{lp}.mlp.gate.weight"), tensor);
+                            continue;
+                        }
+                        "mlp.e_score_correction_bias"
+                        | "mlp.gate.e_score_correction_bias"
+                        | "mlp.gate.bias" => {
+                            out.insert(format!("{lp}.mlp.gate.e_score_correction_bias"), tensor);
+                            continue;
+                        }
+                        _ if suffix.starts_with("controllers.") => {
+                            if let Some(ctrl_rest) = suffix.strip_prefix("controllers.")
+                                && let Some((stream_raw, proj_raw)) = ctrl_rest.split_once('.')
+                            {
+                                let stream = match stream_raw {
+                                    "attn" => "q",
+                                    "k" => "k",
+                                    "v" => "v",
+                                    "mlp" => "mlp",
+                                    other => {
+                                        return Err(Error::from_reason(format!(
+                                            "Inkling2 MLX: unknown controller stream '{other}' in '{key}'"
+                                        )));
+                                    }
+                                };
+                                let proj = match proj_raw {
+                                    "down_weight" => "down_proj.weight",
+                                    "gain_weight" => "gain_proj.weight",
+                                    "forget_weight" => "forget_proj.weight",
+                                    other => {
+                                        return Err(Error::from_reason(format!(
+                                            "Inkling2 MLX: unknown controller weight '{other}' in '{key}'"
+                                        )));
+                                    }
+                                };
+                                out.insert(format!("{lp}.loop_ctrl.{stream}.{proj}"), tensor);
+                                continue;
+                            }
+                        }
+                        _ => {}
+                    }
+
+                    if let Some((base, q_sfx)) = split_st_quant_suffix(suffix) {
+                        // Message gate projections (`{q,k,v,mlp}_message_gate.*`)
+                        if let Some((gate_prefix, gate_proj)) = base.split_once("_message_gate.")
+                            && matches!(gate_prefix, "q" | "k" | "v" | "mlp")
+                        {
+                            let mapped_proj = match gate_proj {
+                                "down_proj" => Some("down_proj"),
+                                "message_gate_proj" => Some("gain_proj"),
+                                "forget_gate_proj" => Some("forget_proj"),
+                                _ => None,
+                            };
+                            if let Some(p) = mapped_proj {
+                                out.insert(
+                                    format!("{lp}.loop_ctrl.{gate_prefix}.{p}{q_sfx}"),
+                                    tensor,
+                                );
+                                continue;
+                            }
+                        }
+
+                        // Experts (`mlp.experts.{gate_up_proj,down_proj}` or `mlp.switch_mlp.{gate,up,down}_proj`)
+                        let expert_dst = match base {
+                            "mlp.experts.gate_up_proj" => Some("mlp.experts.gate_up_proj"),
+                            "mlp.experts.down_proj" | "mlp.switch_mlp.down_proj" => {
+                                Some("mlp.experts.down_proj")
+                            }
+                            "mlp.switch_mlp.gate_proj" => Some("mlp.experts.gate_proj"),
+                            "mlp.switch_mlp.up_proj" => Some("mlp.experts.up_proj"),
+                            _ => None,
+                        };
+                        if let Some(dst) = expert_dst {
+                            let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                            let out_sfx = canonical_st_quant_suffix(q_sfx);
+                            let t = if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                maybe_view_u8_to_u32(tensor)?
+                            } else {
+                                tensor
+                            };
+                            out.insert(format!("{lp}.{dst}{out_sfx}"), t);
+                            continue;
+                        }
+
+                        // Norms & attention projections
+                        let mapped = match base {
+                            "q_input_layernorm"
+                            | "q_input_norm"
+                            | "self_attn.q_input_layernorm"
+                            | "self_attn.q_inp_norm" => Some("self_attn.q_inp_norm"),
+                            "k_input_layernorm"
+                            | "k_input_norm"
+                            | "self_attn.k_input_layernorm"
+                            | "self_attn.k_inp_norm" => Some("self_attn.k_inp_norm"),
+                            "v_input_layernorm"
+                            | "v_input_norm"
+                            | "self_attn.v_input_layernorm"
+                            | "self_attn.v_inp_norm" => Some("self_attn.v_inp_norm"),
+                            "self_attn.r_proj" => Some("self_attn.rel_proj"),
+                            "self_attn.k_sconv.weight_proj" => Some("self_attn.k_conv_proj"),
+                            "self_attn.v_sconv.weight_proj" => Some("self_attn.v_conv_proj"),
+                            _ => None,
+                        };
+                        if let Some(dst) = mapped {
+                            let raw_base = key.strip_suffix(q_sfx).unwrap_or(&key);
+                            let out_sfx = canonical_st_quant_suffix(q_sfx);
+                            let t = if q_sfx == ".weight" && bases_with_scales.contains(raw_base) {
+                                maybe_view_u8_to_u32(tensor)?
+                            } else {
+                                tensor
+                            };
+                            out.insert(format!("{lp}.{dst}{out_sfx}"), t);
+                            continue;
+                        }
+                    }
+
+                    out.insert(key, tensor);
+                    continue;
+                }
+
+                out.insert(key, tensor);
+            }
+
+            Inkling2CheckpointLayout::Canonical => unreachable!(),
+        }
+    }
+
+    // Materialize per-expert Release NVFP4 `outer_scale = amax / outer_scale_denominator` (`[E]` F32).
     for ((layer_idx, proj_name), amax) in expert_amax {
         let denom = expert_denom.remove(&(layer_idx, proj_name)).ok_or_else(|| {
             Error::from_reason(format!(
@@ -2147,9 +3678,491 @@ fn normalize_inkling2_safetensors_params(
             outer,
         );
     }
+    if let Some(((layer_idx, proj_name), _)) = expert_denom.into_iter().next() {
+        return Err(Error::from_reason(format!(
+            "Inkling2 ST: orphaned outer_scale_denominator without matching weight_amax for layers.{layer_idx}.mlp.experts.{proj_name}"
+        )));
+    }
 
+    let has_split_experts = out.keys().any(|k| {
+        k.ends_with(".mlp.experts.gate_proj.weight") || k.ends_with(".mlp.experts.gate_proj.scales")
+    });
+    let has_fused_experts = out.keys().any(|k| {
+        k.ends_with(".mlp.experts.gate_up_proj.weight")
+            || k.ends_with(".mlp.experts.gate_up_proj.scales")
+    });
     *params = out;
-    Ok(true)
+    let gate_up_interleaved = match layout {
+        Inkling2CheckpointLayout::Release | Inkling2CheckpointLayout::OMlx => Some(true),
+        Inkling2CheckpointLayout::MlxVlm => {
+            // Preserve interleaved order for any stored fused layers; split layers always
+            // force `effective_gate_up_interleaved = false` per-layer inside `load_expert_gate_up`.
+            if has_fused_experts {
+                Some(true)
+            } else if has_split_experts {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Inkling2CheckpointLayout::MlxLm => {
+            // Only force non-interleaved when all layers are split; if fused layers coexist,
+            // leave `config.gate_up_interleaved` untouched while split layers force `false` per-layer.
+            if has_split_experts && !has_fused_experts {
+                Some(false)
+            } else {
+                None
+            }
+        }
+        Inkling2CheckpointLayout::Canonical => None,
+    };
+    Ok(Inkling2StNormResult {
+        gate_up_interleaved,
+        omlx_fused_in_proj,
+        omlx_fused_q,
+        omlx_fused_k,
+        omlx_fused_v,
+    })
+}
+
+/// Infer 2-D NVFP4 / MXFP8 / MXFP4 per-layer overrides from validated storage geometry
+/// (`Uint32` `.weight` + `Uint8` `.scales` + no `.biases`) for checkpoints whose config carries
+/// no MLX `quantization` entries (e.g. Release ModelOpt NVFP4 SafeTensors).
+fn infer_unregistered_2d_fp_quant_overrides(
+    params: &HashMap<String, MxArray>,
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+) -> Result<()> {
+    for (key, scales) in params {
+        let Some(base) = key.strip_suffix(".scales") else {
+            continue;
+        };
+        let norm_key = crate::models::quant_dispatch::normalize_per_layer_key(base);
+        if per_layer_quant.contains_key(base) || per_layer_quant.contains_key(&norm_key) {
+            continue;
+        }
+        if scales.dtype()? != DType::Uint8 || params.contains_key(&format!("{base}.biases")) {
+            continue;
+        }
+        let Some(w) = params.get(&format!("{base}.weight")) else {
+            continue;
+        };
+        if w.dtype()? != DType::Uint32 {
+            continue;
+        }
+        let w_shape = w.shape()?;
+        let s_shape = scales.shape()?;
+        if w_shape.len() != 2 || s_shape.len() != 2 || w_shape[0] != s_shape[0] {
+            continue;
+        }
+        let inferred = if w_shape[1] == s_shape[1] * 2 {
+            Some(PerLayerQuant {
+                bits: NVFP4_BITS,
+                group_size: NVFP4_GROUP_SIZE,
+                mode: PerLayerMode::Nvfp4,
+                layout: Default::default(),
+                input_amax: None,
+            })
+        } else if w_shape[1] == s_shape[1] * 8 {
+            Some(PerLayerQuant {
+                bits: MXFP8_BITS,
+                group_size: MXFP8_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp8,
+                layout: Default::default(),
+                input_amax: None,
+            })
+        } else if w_shape[1] == s_shape[1] * 4 {
+            Some(PerLayerQuant {
+                bits: MXFP4_BITS,
+                group_size: MXFP4_GROUP_SIZE,
+                mode: PerLayerMode::Mxfp4,
+                layout: Default::default(),
+                input_amax: None,
+            })
+        } else {
+            None
+        };
+        if let Some(plq) = inferred {
+            per_layer_quant.insert(norm_key, plq);
+        }
+    }
+    Ok(())
+}
+
+/// Normalize SafeTensors vision tower keys independently of text layout across all 4
+/// verified Inkling2 SafeTensors layouts (matching Splash `InklingVision.cpp:139-186`):
+/// 1. Transformers / MLX (`model.vision_tower.*` -> `vision_tower.*` + `merger.linear_{1,2}`)
+/// 2. Release HF (`model.visual.backbone.*` -> `visual.backbone.*` + `visual.proj_{in,out}`)
+/// 3. oMLX (`vision_tower.backbone.*` + `vision_tower.proj_{in,out}`)
+/// 4. thoddnn NVFP4 (`vision_tower.*` + `vision_tower.proj_{in,out}`)
+///
+/// Transposes 2-D flattened HWC `embeddings.patch_embedding.weight` (`[D, P*P*3]`) to CHW once
+/// (leaving 4-D OIHW/OHWI or already-canonical `vision_tower.patch_embed.weight` untouched),
+/// and rejects quantized vision weights (`.scales` / `.weight_scale`) so `load_weights_sync`
+/// cleanly falls back to text-only mode.
+fn normalize_inkling2_vision_params(
+    params: &mut HashMap<String, MxArray>,
+    config: &Inkling2Config,
+) -> Result<()> {
+    // Reject quantized vision weights before any remap so fallback engages cleanly.
+    if let Some(qkey) = params.keys().find(|k| {
+        (k.starts_with("visual.")
+            || k.starts_with("vision_tower.")
+            || k.starts_with("vision_projector."))
+            && (k.ends_with(".scales") || k.ends_with(".weight_scale"))
+    }) {
+        return Err(Error::from_reason(format!(
+            "vision tower is quantized (found '{qkey}'); quantized vision weights are not supported"
+        )));
+    }
+
+    // Probe the 4 SafeTensors vision layouts after `strip_inkling2_wrapper_prefixes`:
+    // `(owner_prefix, backbone_prefix)`.
+    let detected = if params.contains_key("visual.backbone.embeddings.patch_embedding.weight") {
+        // Layout 2: Release HF (`model.visual.backbone.*` + `model.visual.proj_{in,out}.*`)
+        Some(("visual.", "visual.backbone."))
+    } else if params.contains_key("vision_tower.backbone.embeddings.patch_embedding.weight") {
+        // Layout 3: oMLX (`vision_tower.backbone.*` + `vision_tower.proj_{in,out}.*`)
+        Some(("vision_tower.", "vision_tower.backbone."))
+    } else if params.contains_key("vision_tower.embeddings.patch_embedding.weight") {
+        // Layout 1 (Transformers / MLX: `vision_tower.*` + `vision_tower.merger.linear_{1,2}.*`)
+        // & Layout 4 (thoddnn NVFP4: `vision_tower.*` + `vision_tower.proj_{in,out}.*`)
+        Some(("vision_tower.", "vision_tower."))
+    } else {
+        None
+    };
+
+    let Some((owner_prefix, backbone_prefix)) = detected else {
+        return Ok(());
+    };
+
+    let vision_patch = config
+        .vision_config
+        .as_ref()
+        .map_or(20i64, |v| v.patch_size as i64);
+
+    let keys_to_move: Vec<String> = params
+        .keys()
+        .filter(|k| k.starts_with(owner_prefix))
+        .cloned()
+        .collect();
+    let mut moved: Vec<(String, MxArray)> = Vec::with_capacity(keys_to_move.len());
+    for key in keys_to_move {
+        if let Some(tensor) = params.remove(&key) {
+            moved.push((key, tensor));
+        }
+    }
+
+    for (key, tensor) in moved {
+        // 1. Backbone tensors (`{backbone_prefix}*`)
+        if let Some(brest) = key.strip_prefix(backbone_prefix) {
+            match brest {
+                "embeddings.class_embedding" => {
+                    params.insert("vision_tower.class_embedding".to_string(), tensor);
+                    continue;
+                }
+                "embeddings.cls_position_embedding" => {
+                    params.insert(
+                        "vision_tower.class_position_embedding.weight".to_string(),
+                        tensor,
+                    );
+                    continue;
+                }
+                "embeddings.position_embedding" | "embeddings.position_embedding.weight" => {
+                    params.insert("vision_tower.position_embedding.weight".to_string(), tensor);
+                    continue;
+                }
+                "embeddings.patch_embedding.weight" => {
+                    // All 4 SafeTensors layouts store 2-D `[D, P*P*3]` in HWC `(P, P, 3)` order;
+                    // `Inkling2VisionEncoder` expects CHW `(3, P, P)` flattened `[D, 3*P*P]`.
+                    // 4-D OIHW/OHWI weights are left untouched for `build_vision_encoder`.
+                    let shape = tensor.shape()?;
+                    let converted =
+                        if shape.len() == 2 && shape[1] == 3 * vision_patch * vision_patch {
+                            let d_vis = shape[0];
+                            tensor
+                                .reshape(&[d_vis, vision_patch, vision_patch, 3])?
+                                .transpose(Some(&[0, 3, 1, 2]))?
+                                .reshape(&[d_vis, 3 * vision_patch * vision_patch])?
+                        } else {
+                            tensor
+                        };
+                    params.insert("vision_tower.patch_embed.weight".to_string(), converted);
+                    continue;
+                }
+                "ln_pre.weight" | "pre_layernorm.weight" => {
+                    params.insert("vision_tower.pre_ln.weight".to_string(), tensor);
+                    continue;
+                }
+                "ln_pre.bias" | "pre_layernorm.bias" => {
+                    params.insert("vision_tower.pre_ln.bias".to_string(), tensor);
+                    continue;
+                }
+                _ if brest.starts_with("layers.") => {
+                    if let Some(lrest) = brest.strip_prefix("layers.")
+                        && let Some((blk_str, sub)) = lrest.split_once('.')
+                    {
+                        let bp = format!("vision_tower.blocks.{blk_str}");
+                        let mapped = match sub {
+                            "ln_1.weight" | "layernorm_before.weight" => Some("norm1.weight"),
+                            "ln_1.bias" | "layernorm_before.bias" => Some("norm1.bias"),
+                            "ln_2.weight" | "layernorm_after.weight" => Some("norm2.weight"),
+                            "ln_2.bias" | "layernorm_after.bias" => Some("norm2.bias"),
+                            "ls_1.gamma" | "lambda_1" | "lambda_1.weight" => Some("ls1.weight"),
+                            "ls_2.gamma" | "lambda_2" | "lambda_2.weight" => Some("ls2.weight"),
+                            "self_attn.q_proj.weight" => Some("attn.q_proj.weight"),
+                            "self_attn.q_proj.bias" => Some("attn.q_proj.bias"),
+                            "self_attn.k_proj.weight" => Some("attn.k_proj.weight"),
+                            "self_attn.k_proj.bias" => Some("attn.k_proj.bias"),
+                            "self_attn.v_proj.weight" => Some("attn.v_proj.weight"),
+                            "self_attn.v_proj.bias" => Some("attn.v_proj.bias"),
+                            "self_attn.out_proj.weight" => Some("attn.o_proj.weight"),
+                            "self_attn.out_proj.bias" => Some("attn.o_proj.bias"),
+                            "mlp.c_fc.weight" | "mlp.fc1.weight" => Some("mlp.fc1.weight"),
+                            "mlp.c_fc.bias" | "mlp.fc1.bias" => Some("mlp.fc1.bias"),
+                            "mlp.c_proj.weight" | "mlp.fc2.weight" => Some("mlp.fc2.weight"),
+                            "mlp.c_proj.bias" | "mlp.fc2.bias" => Some("mlp.fc2.bias"),
+                            _ => None,
+                        };
+                        if let Some(m) = mapped {
+                            params.insert(format!("{bp}.{m}"), tensor);
+                            continue;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 2. Projector tensors (`{owner_prefix}proj_{in,out}.*` or `{owner_prefix}merger.linear_{1,2}.*`)
+        if let Some(orest) = key.strip_prefix(owner_prefix) {
+            let proj_dst = match orest {
+                "proj_in.weight" | "merger.linear_1.weight" => Some("vision_projector.fc1.weight"),
+                "proj_in.bias" | "merger.linear_1.bias" => Some("vision_projector.fc1.bias"),
+                "proj_out.weight" | "merger.linear_2.weight" => Some("vision_projector.fc2.weight"),
+                "proj_out.bias" | "merger.linear_2.bias" => Some("vision_projector.fc2.bias"),
+                _ => None,
+            };
+            if let Some(dst) = proj_dst {
+                params.insert(dst.to_string(), tensor);
+                continue;
+            }
+        }
+
+        params.insert(key, tensor);
+    }
+    Ok(())
+}
+
+/// Remap converter-specific `per_layer_quant` keys into the canonical Inkling2 namespace,
+/// fanning out oMLX fused `attn.in_proj` / `attn.{q,k,v}_proj` overrides using the exact
+/// shape-derived split plan from `norm`.
+fn remap_inkling2_per_layer_quant(
+    per_layer_quant: &mut HashMap<String, PerLayerQuant>,
+    layout: Inkling2CheckpointLayout,
+    norm: &Inkling2StNormResult,
+    config: &Inkling2Config,
+) -> Result<()> {
+    if per_layer_quant.is_empty() || layout == Inkling2CheckpointLayout::Canonical {
+        return Ok(());
+    }
+    let n_phys = config.num_physical_layers();
+    let old = std::mem::take(per_layer_quant);
+    let mut remapped: HashMap<String, PerLayerQuant> = HashMap::with_capacity(old.len() * 2);
+
+    for (raw_key, plq) in old {
+        // Preserve already-normalized key as fallback, then add canonical target(s).
+        let stripped = raw_key
+            .strip_prefix("language_model.")
+            .or_else(|| raw_key.strip_prefix("llm."))
+            .unwrap_or(&raw_key);
+
+        match stripped {
+            "embed" => {
+                remapped.insert("embed_tokens".to_string(), plq);
+                continue;
+            }
+            "unembed" => {
+                remapped.insert("lm_head".to_string(), plq);
+                continue;
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = stripped.strip_prefix("layers.")
+            && let Some((layer_str, sub)) = rest.split_once('.')
+            && let Ok(layer_idx) = layer_str.parse::<usize>()
+        {
+            if layer_idx >= n_phys {
+                return Err(Error::from_reason(format!(
+                    "Inkling2: quantization override '{raw_key}' references out-of-range physical layer {layer_idx} (num_physical_layers={n_phys})"
+                )));
+            }
+            let lp = format!("layers.{layer_idx}");
+            match sub {
+                // oMLX fused attention projections -> fan out using exact shape-derived split plan
+                "attn.in_proj"
+                    if layout == Inkling2CheckpointLayout::OMlx
+                        && norm.omlx_fused_in_proj.contains(&layer_idx) =>
+                {
+                    for dst in [
+                        "self_attn.q_proj",
+                        "self_attn.k_proj",
+                        "self_attn.v_proj",
+                        "self_attn.rel_proj",
+                        "self_attn.gate_proj",
+                        "self_attn.sink_proj",
+                    ] {
+                        remapped.entry(format!("{lp}.{dst}")).or_insert(plq);
+                    }
+                    continue;
+                }
+                // Ignore stale `attn.in_proj` metadata when no fused `attn.in_proj` tensor exists
+                // so independent projections retain their own overrides / file-wide defaults.
+                "attn.in_proj" => {
+                    continue;
+                }
+                "attn.q_proj"
+                    if layout == Inkling2CheckpointLayout::OMlx
+                        && norm.omlx_fused_q.contains(&layer_idx) =>
+                {
+                    for dst in [
+                        "self_attn.q_proj",
+                        "self_attn.rel_proj",
+                        "self_attn.gate_proj",
+                        "self_attn.sink_proj",
+                    ] {
+                        remapped.entry(format!("{lp}.{dst}")).or_insert(plq);
+                    }
+                    continue;
+                }
+                "attn.k_proj"
+                    if layout == Inkling2CheckpointLayout::OMlx
+                        && norm.omlx_fused_k.contains(&layer_idx) =>
+                {
+                    for dst in ["self_attn.k_proj", "self_attn.k_conv_proj"] {
+                        remapped.entry(format!("{lp}.{dst}")).or_insert(plq);
+                    }
+                    continue;
+                }
+                "attn.v_proj"
+                    if layout == Inkling2CheckpointLayout::OMlx
+                        && norm.omlx_fused_v.contains(&layer_idx) =>
+                {
+                    for dst in ["self_attn.v_proj", "self_attn.v_conv_proj"] {
+                        remapped.entry(format!("{lp}.{dst}")).or_insert(plq);
+                    }
+                    continue;
+                }
+                // Release / oMLX / mlx-vlm / mlx-lm single-target aliases (including renamed norms!)
+                "attn_norm" => {
+                    remapped.insert(format!("{lp}.input_layernorm"), plq);
+                    continue;
+                }
+                "mlp_norm" => {
+                    remapped.insert(format!("{lp}.post_attention_layernorm"), plq);
+                    continue;
+                }
+                "q_input_norm"
+                | "q_input_layernorm"
+                | "attn.q_input_norm"
+                | "self_attn.q_input_layernorm" => {
+                    remapped.insert(format!("{lp}.self_attn.q_inp_norm"), plq);
+                    continue;
+                }
+                "k_input_norm"
+                | "k_input_layernorm"
+                | "attn.k_input_norm"
+                | "self_attn.k_input_layernorm" => {
+                    remapped.insert(format!("{lp}.self_attn.k_inp_norm"), plq);
+                    continue;
+                }
+                "v_input_norm"
+                | "v_input_layernorm"
+                | "attn.v_input_norm"
+                | "self_attn.v_input_layernorm" => {
+                    remapped.insert(format!("{lp}.self_attn.v_inp_norm"), plq);
+                    continue;
+                }
+                "attn.wq_du" | "attn.q_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.q_proj"), plq);
+                    continue;
+                }
+                "attn.wk_dv" | "attn.k_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.k_proj"), plq);
+                    continue;
+                }
+                "attn.wv_dv" | "attn.v_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.v_proj"), plq);
+                    continue;
+                }
+                "attn.wr_du" | "attn.r_proj" | "self_attn.r_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.rel_proj"), plq);
+                    continue;
+                }
+                "attn.gate_attn" | "attn.gate_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.gate_proj"), plq);
+                    continue;
+                }
+                "attn.attn_sink_proj" | "attn.sink_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.sink_proj"), plq);
+                    continue;
+                }
+                "attn.wo_ud" | "attn.o_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.o_proj"), plq);
+                    continue;
+                }
+                "attn.k_sconv.weight_proj" | "self_attn.k_sconv.weight_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.k_conv_proj"), plq);
+                    continue;
+                }
+                "attn.v_sconv.weight_proj" | "self_attn.v_sconv.weight_proj" => {
+                    remapped.insert(format!("{lp}.self_attn.v_conv_proj"), plq);
+                    continue;
+                }
+                "mlp.router" => {
+                    remapped.insert(format!("{lp}.mlp.gate"), plq);
+                    continue;
+                }
+                "mlp.experts.w13" => {
+                    remapped.insert(format!("{lp}.mlp.experts.gate_up_proj"), plq);
+                    continue;
+                }
+                "mlp.experts.w2" | "mlp.switch_mlp.down_proj" => {
+                    remapped.insert(format!("{lp}.mlp.experts.down_proj"), plq);
+                    continue;
+                }
+                "mlp.switch_mlp.gate_proj" => {
+                    remapped.insert(format!("{lp}.mlp.experts.gate_proj"), plq);
+                    continue;
+                }
+                "mlp.switch_mlp.up_proj" => {
+                    remapped.insert(format!("{lp}.mlp.experts.up_proj"), plq);
+                    continue;
+                }
+                _ => {
+                    if let Some((gate_prefix, gate_proj)) = sub.split_once("_message_gate.")
+                        && matches!(gate_prefix, "q" | "k" | "v" | "mlp")
+                    {
+                        let mapped_proj = match gate_proj {
+                            "down_proj" => Some("down_proj"),
+                            "message_gate_proj" => Some("gain_proj"),
+                            "forget_gate_proj" => Some("forget_proj"),
+                            _ => None,
+                        };
+                        if let Some(p) = mapped_proj {
+                            remapped.insert(format!("{lp}.loop_ctrl.{gate_prefix}.{p}"), plq);
+                            continue;
+                        }
+                    }
+                }
+            }
+        }
+
+        remapped.insert(stripped.to_string(), plq);
+    }
+
+    *per_layer_quant = remapped;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4085,5 +6098,2783 @@ mod tests {
         }
 
         crate::array::clear_cache();
+    }
+
+    fn quantize_affine_for_test(
+        w_f32: &MxArray,
+        group_size: i32,
+        bits: i32,
+        f16_sidecars: bool,
+    ) -> (MxArray, MxArray, MxArray) {
+        let mut q = std::ptr::null_mut();
+        let mut s = std::ptr::null_mut();
+        let mut b = std::ptr::null_mut();
+        let mode_c = CString::new("affine").unwrap();
+        unsafe {
+            mlx_sys::mlx_quantize(
+                w_f32.as_raw_ptr(),
+                group_size,
+                bits,
+                mode_c.as_ptr(),
+                &mut q,
+                &mut s,
+                &mut b,
+            );
+        }
+        let wq = MxArray::from_handle(q, "test_q").unwrap();
+        let mut sq = MxArray::from_handle(s, "test_s").unwrap();
+        let mut bq = MxArray::from_handle(b, "test_b").unwrap();
+        if f16_sidecars {
+            sq = sq.astype(DType::Float16).unwrap();
+            bq = bq.astype(DType::Float16).unwrap();
+        }
+        (wq, sq, bq)
+    }
+
+    #[test]
+    fn small_tensors_and_message_gates_dequantize_1d_2d_affine_mxfp_nvfp4_kquant_and_reject_raw_u32()
+     {
+        use crate::models::quant_dispatch::{KQuantLayout, kquant_tile_rows};
+        use crate::utils::gguf_kquant::{KQuantFormat, KQuantRepacker, KQuantScales};
+
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+
+        // 1. 1-D quantized norm & clip (Affine with F16 scales/biases -> must expand_dims(0), cast s/b to F32, squeeze(0))
+        let norm_ref: Vec<f32> = (0..64).map(|i| 0.5 + (i as f32) * 0.015).collect();
+        let norm_2d = MxArray::from_float32(&norm_ref, &[1, 64]).unwrap();
+        let (nw, ns, nb) = quantize_affine_for_test(&norm_2d, 32, 8, true);
+        let mut params = HashMap::new();
+        params.insert(
+            "embed_norm.weight".to_string(),
+            nw.squeeze(Some(&[0])).unwrap(),
+        );
+        params.insert(
+            "embed_norm.scales".to_string(),
+            ns.squeeze(Some(&[0])).unwrap(),
+        );
+        params.insert(
+            "embed_norm.biases".to_string(),
+            nb.squeeze(Some(&[0])).unwrap(),
+        );
+
+        let got_norm =
+            load_dense_or_dequant_f32(&params, "embed_norm", &HashMap::new(), default_plq).unwrap();
+        assert_eq!(got_norm.dtype().unwrap(), DType::Float32);
+        assert_eq!(got_norm.shape().unwrap().as_ref(), &[64]);
+        let got_norm_v = got_norm.to_float32().unwrap();
+        let max_err = got_norm_v
+            .iter()
+            .zip(norm_ref.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_err < 1e-2, "1-D affine dequant max_err={max_err}");
+
+        // 2. Quantized 2-D message gates across Affine (4/5/8-bit), MXFP4, MXFP8, NVFP4 (+ .scale / .global_scale),
+        //    and K-quants (RowMajor + Tiled64 Q4K, Q5K, Q6K, Q3K, Q2K, IQ4NL).
+        let (rows, cols) = (64usize, 256usize);
+        let gate_ref: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.07).sin() * 0.5)
+            .collect();
+        let gate_arr = MxArray::from_float32(&gate_ref, &[rows as i64, cols as i64]).unwrap();
+
+        for (bits, gs) in [(4, 32), (5, 32), (8, 32)] {
+            let (wq, sq, bq) = quantize_affine_for_test(&gate_arr, gs, bits, true);
+            let mut p = HashMap::new();
+            p.insert("g.weight".to_string(), wq);
+            p.insert("g.scales".to_string(), sq);
+            p.insert("g.biases".to_string(), bq);
+            let mut plqs = HashMap::new();
+            plqs.insert(
+                "g".to_string(),
+                PerLayerQuant {
+                    bits,
+                    group_size: gs,
+                    mode: PerLayerMode::Affine,
+                    layout: KQuantLayout::RowMajor,
+                    input_amax: None,
+                },
+            );
+            let out = load_dense_or_dequant_tensor(&p, "g", &plqs, default_plq, true).unwrap();
+            assert_eq!(out.dtype().unwrap(), DType::Float32);
+            assert_eq!(out.shape().unwrap().as_ref(), &[rows as i64, cols as i64]);
+        }
+
+        // MXFP4, MXFP8, NVFP4 (with .global_scale = 5376.0 -> outer_scale = 2.0)
+        for (mode, gs, bits, w_last, s_last, w_word, s_byte) in [
+            (
+                PerLayerMode::Mxfp4,
+                32,
+                4,
+                cols / 8,
+                cols / 32,
+                0x2222_2222u32,
+                127u8,
+            ),
+            (
+                PerLayerMode::Mxfp8,
+                32,
+                8,
+                cols / 4,
+                cols / 32,
+                0x3838_3838u32,
+                127u8,
+            ),
+            (
+                PerLayerMode::Nvfp4,
+                16,
+                4,
+                cols / 8,
+                cols / 16,
+                0x2222_2222u32,
+                0x38u8,
+            ),
+        ] {
+            let mut p = HashMap::new();
+            p.insert(
+                "g.weight".to_string(),
+                MxArray::from_uint32(&vec![w_word; rows * w_last], &[rows as i64, w_last as i64])
+                    .unwrap(),
+            );
+            p.insert(
+                "g.scales".to_string(),
+                MxArray::from_uint8(&vec![s_byte; rows * s_last], &[rows as i64, s_last as i64])
+                    .unwrap(),
+            );
+            if mode == PerLayerMode::Nvfp4 {
+                p.insert(
+                    "g.global_scale".to_string(),
+                    MxArray::from_float32(&[5376.0], &[1]).unwrap(), // / 2688 = 2.0
+                );
+            }
+            let mut plqs = HashMap::new();
+            plqs.insert(
+                "g".to_string(),
+                PerLayerQuant {
+                    bits,
+                    group_size: gs,
+                    mode,
+                    layout: KQuantLayout::RowMajor,
+                    input_amax: None,
+                },
+            );
+            let out = load_dense_or_dequant_tensor(&p, "g", &plqs, default_plq, true).unwrap();
+            assert_eq!(out.dtype().unwrap(), DType::Float32);
+            let vals = out.to_float32().unwrap();
+            let want = if mode == PerLayerMode::Nvfp4 {
+                2.0
+            } else {
+                1.0
+            };
+            assert!(
+                vals.iter().all(|&v| (v - want).abs() < 1e-3),
+                "{mode:?}: expected {want}, got {}",
+                vals[0]
+            );
+        }
+
+        // K-quants: RowMajor AND pre-saved Tiled64 (catches K-quant Tiled64 trap on loop_ctrl.down_proj!)
+        for (fmt, plq_mode) in [
+            (KQuantFormat::Q4K, PerLayerMode::Q4K),
+            (KQuantFormat::Q5K, PerLayerMode::Q5K),
+            (KQuantFormat::Q6K, PerLayerMode::Q6K),
+            (KQuantFormat::Q3K, PerLayerMode::Q3K),
+            (KQuantFormat::Q2K, PerLayerMode::Q2K),
+            (KQuantFormat::IQ4NL, PerLayerMode::IQ4NL),
+        ] {
+            let blocks_per_row = cols / fmt.block_size();
+            let mut raw = vec![0u8; rows * blocks_per_row * fmt.block_bytes()];
+            for (idx, byte) in raw.iter_mut().enumerate() {
+                // Keep all bytes < 0x58 so FP16 superblock scale headers (d/dmin) stay strictly finite.
+                *byte = ((idx * 37 + 13) % 0x58) as u8;
+            }
+            let mut repacker = KQuantRepacker::new(fmt, cols, rows).unwrap();
+            repacker.push_rows(&raw, rows).unwrap();
+            let arrays = repacker.finish();
+            let w_rm =
+                MxArray::from_uint32(&arrays.weight, &[rows as i64, fmt.weight_cols(cols) as i64])
+                    .unwrap();
+            let s_rm = match &arrays.scales {
+                KQuantScales::Unsigned(v) => {
+                    MxArray::from_uint8(v, &[rows as i64, fmt.scales_cols(cols) as i64]).unwrap()
+                }
+                KQuantScales::Signed(v) => {
+                    MxArray::from_int8(v, &[rows as i64, fmt.scales_cols(cols) as i64]).unwrap()
+                }
+            };
+            let b_rm =
+                MxArray::from_float16(&arrays.biases, &[rows as i64, fmt.biases_cols(cols) as i64])
+                    .unwrap();
+
+            let mut p_rm = HashMap::new();
+            p_rm.insert("g.weight".to_string(), w_rm.clone());
+            p_rm.insert("g.scales".to_string(), s_rm.clone());
+            p_rm.insert("g.biases".to_string(), b_rm.clone());
+            let mut plqs_rm = HashMap::new();
+            plqs_rm.insert(
+                "g".to_string(),
+                PerLayerQuant {
+                    bits: fmt.bits() as i32,
+                    group_size: fmt.group_size() as i32,
+                    mode: plq_mode,
+                    layout: KQuantLayout::RowMajor,
+                    input_amax: None,
+                },
+            );
+            let out_rm = load_dense_or_dequant_tensor(&p_rm, "g", &plqs_rm, default_plq, true)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+
+            // Now tile to Tiled64 and verify load_dense_or_dequant_tensor untiles bit-for-bit!
+            let kq = kquant_mode_params_for_scales(plq_mode, s_rm.dtype().unwrap()).unwrap();
+            let w_t64 = kquant_tile_rows(&w_rm, i64::from(kq.bits)).unwrap();
+            let s_t64 =
+                kquant_tile_rows(&s_rm, i64::from(kq.scale_entries_per_super_block())).unwrap();
+            let b_t64 =
+                kquant_tile_rows(&b_rm, i64::from(kq.bias_entries_per_super_block)).unwrap();
+            let mut p_t64 = HashMap::new();
+            p_t64.insert("g.weight".to_string(), w_t64);
+            p_t64.insert("g.scales".to_string(), s_t64);
+            p_t64.insert("g.biases".to_string(), b_t64);
+            let mut plqs_t64 = HashMap::new();
+            plqs_t64.insert(
+                "g".to_string(),
+                PerLayerQuant {
+                    bits: fmt.bits() as i32,
+                    group_size: fmt.group_size() as i32,
+                    mode: plq_mode,
+                    layout: KQuantLayout::Tiled64,
+                    input_amax: None,
+                },
+            );
+            let out_t64 = load_dense_or_dequant_tensor(&p_t64, "g", &plqs_t64, default_plq, true)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            assert_eq!(
+                out_rm.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                out_t64.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "{fmt:?}: Tiled64 untile must match RowMajor bit-for-bit"
+            );
+        }
+
+        // 3. Mixed Q8_0 down_proj + BF16 gain/forget widens cleanly to Float32 via Bug 1
+        let d_small = 32i64;
+        let r_small = 8i64;
+        let down_f32 = MxArray::ones(&[r_small, 2 * d_small], Some(DType::Float32)).unwrap();
+        let (dw, ds, db) = quantize_affine_for_test(&down_f32, 32, 8, true);
+        let mut p_mix = HashMap::new();
+        p_mix.insert("c.down_proj.weight".to_string(), dw);
+        p_mix.insert("c.down_proj.scales".to_string(), ds);
+        p_mix.insert("c.down_proj.biases".to_string(), db);
+        p_mix.insert(
+            "c.gain_proj.weight".to_string(),
+            MxArray::ones(&[d_small, r_small], Some(DType::BFloat16)).unwrap(),
+        );
+        p_mix.insert(
+            "c.forget_proj.weight".to_string(),
+            MxArray::ones(&[d_small, r_small], Some(DType::BFloat16)).unwrap(),
+        );
+        let ctrl = LoopController::new(
+            load_dense_or_dequant_tensor(&p_mix, "c.down_proj", &HashMap::new(), default_plq, true)
+                .unwrap(),
+            load_dense_or_dequant_tensor(&p_mix, "c.gain_proj", &HashMap::new(), default_plq, true)
+                .unwrap(),
+            load_dense_or_dequant_tensor(
+                &p_mix,
+                "c.forget_proj",
+                &HashMap::new(),
+                default_plq,
+                true,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(ctrl.down_proj_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(ctrl.gain_forget_w.dtype().unwrap(), DType::Float32);
+
+        // 4. Dense F16 conv normalizes to Float32 (avoiding Metal sconv_k4 crash)
+        let mut p_f16 = HashMap::new();
+        p_f16.insert(
+            "conv.weight".to_string(),
+            MxArray::ones(&[16, 4], Some(DType::Float16)).unwrap(),
+        );
+        let conv_f32 =
+            load_dense_or_dequant_f32(&p_f16, "conv", &HashMap::new(), default_plq).unwrap();
+        assert_eq!(conv_f32.dtype().unwrap(), DType::Float32);
+
+        // 5. Orphaned raw Uint32 without `.scales` fails loud via ensure_dense_weight_floating
+        let mut p_bad = HashMap::new();
+        p_bad.insert(
+            "orphan.weight".to_string(),
+            MxArray::zeros(&[8, 8], Some(DType::Uint32)).unwrap(),
+        );
+        assert!(
+            load_dense_or_dequant_f32(&p_bad, "orphan", &HashMap::new(), default_plq).is_err(),
+            "raw Uint32 without .scales must fail loud"
+        );
+    }
+
+    #[test]
+    fn load_expert_switch_proj_and_split_gate_up_fusion_matrix() {
+        use crate::models::quant_dispatch::KQuantLayout;
+        use crate::utils::gguf_kquant::{KQuantFormat, KQuantRepacker, KQuantScales};
+
+        let e = 2i64;
+        let inter = 16i64;
+        let d = 64i64;
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+        let empty_plq = HashMap::new();
+
+        // 1. load_expert_switch_proj: Dense F16 + .scale normalizes to BF16 + keeps outer_scale
+        {
+            let mut p = HashMap::new();
+            p.insert(
+                "l.mlp.experts.down_proj.weight".to_string(),
+                MxArray::ones(&[e, d, inter], Some(DType::Float16)).unwrap(),
+            );
+            p.insert(
+                "l.mlp.experts.down_proj.scale".to_string(),
+                MxArray::from_float32(&[0.5, 2.0], &[e, 1]).unwrap(),
+            );
+            let proj =
+                load_expert_switch_proj(&p, "l.mlp.experts.down_proj", &empty_plq, default_plq)
+                    .unwrap();
+            assert!(!proj.is_quantized());
+            assert_eq!(proj.weight_ref().dtype().unwrap(), DType::BFloat16);
+            assert_eq!(
+                proj.outer_scale().unwrap().to_float32().unwrap().as_ref(),
+                &[0.5f32, 2.0]
+            );
+        }
+
+        // 2. load_expert_switch_proj: MXFP8 + .scale, MXFP4 + .scale, unscaled NVFP4, NVFP4 + .global_scale, NVFP4 + .weight_scale_2
+        {
+            // MXFP8 + .scale (previously fell through to Affine!)
+            let mut p = HashMap::new();
+            p.insert(
+                "x.weight".to_string(),
+                MxArray::from_uint32(
+                    &vec![0x3838_3838u32; (e * inter * (d / 4)) as usize],
+                    &[e, inter, d / 4],
+                )
+                .unwrap(),
+            );
+            p.insert(
+                "x.scales".to_string(),
+                MxArray::from_uint8(
+                    &vec![127u8; (e * inter * (d / 32)) as usize],
+                    &[e, inter, d / 32],
+                )
+                .unwrap(),
+            );
+            p.insert(
+                "x.scale".to_string(),
+                MxArray::from_float32(&[1.25, 0.75], &[e]).unwrap(),
+            );
+            let proj = load_expert_switch_proj(&p, "x", &empty_plq, default_plq).unwrap();
+            let SwitchProj::Quantized(q) = proj else {
+                panic!("expected quantized")
+            };
+            assert_eq!(q.mode(), MXFP8_MODE);
+            assert_eq!(
+                q.outer_scale().unwrap().to_float32().unwrap().as_ref(),
+                &[1.25f32, 0.75]
+            );
+
+            // Unscaled NVFP4 (previously fell through to Affine!)
+            let mut p_nv = HashMap::new();
+            p_nv.insert(
+                "x.weight".to_string(),
+                MxArray::from_uint32(
+                    &vec![0x2222_2222u32; (e * inter * (d / 8)) as usize],
+                    &[e, inter, d / 8],
+                )
+                .unwrap(),
+            );
+            p_nv.insert(
+                "x.scales".to_string(),
+                MxArray::from_uint8(
+                    &vec![0x38u8; (e * inter * (d / 16)) as usize],
+                    &[e, inter, d / 16],
+                )
+                .unwrap(),
+            );
+            let proj_unscaled =
+                load_expert_switch_proj(&p_nv, "x", &empty_plq, default_plq).unwrap();
+            let SwitchProj::Quantized(q_un) = proj_unscaled else {
+                panic!("expected quantized")
+            };
+            assert_eq!(q_un.mode(), NVFP4_MODE);
+            assert!(q_un.outer_scale().is_none());
+
+            // NVFP4 + .global_scale (/ 2688.0)
+            let mut p_gs = p_nv.clone();
+            p_gs.insert(
+                "x.global_scale".to_string(),
+                MxArray::from_float32(&[2688.0, 5376.0], &[e]).unwrap(),
+            );
+            let SwitchProj::Quantized(q_gs) =
+                load_expert_switch_proj(&p_gs, "x", &empty_plq, default_plq).unwrap()
+            else {
+                panic!("expected quantized")
+            };
+            assert_eq!(q_gs.mode(), NVFP4_MODE);
+            assert_eq!(
+                q_gs.outer_scale().unwrap().to_float32().unwrap().as_ref(),
+                &[1.0f32, 2.0]
+            );
+
+            // NVFP4 + .weight_scale_2 (direct, NO / 2688.0)
+            let mut p_ws2 = p_nv.clone();
+            p_ws2.insert(
+                "x.weight_scale_2".to_string(),
+                MxArray::from_float32(&[0.25, 0.5], &[e]).unwrap(),
+            );
+            let SwitchProj::Quantized(q_ws2) =
+                load_expert_switch_proj(&p_ws2, "x", &empty_plq, default_plq).unwrap()
+            else {
+                panic!("expected quantized")
+            };
+            assert_eq!(
+                q_ws2.outer_scale().unwrap().to_float32().unwrap().as_ref(),
+                &[0.25f32, 0.5]
+            );
+        }
+
+        // 3. Split gate_proj + up_proj FUSIBLE cases -> ExpertGateUp::Fused + interleaved == false (overriding config true!)
+        // (a) Dense F16 split -> fused BF16
+        {
+            let mut p = HashMap::new();
+            p.insert(
+                "layers.0.mlp.experts.gate_proj.weight".to_string(),
+                MxArray::ones(&[e, inter, d], Some(DType::Float16)).unwrap(),
+            );
+            p.insert(
+                "layers.0.mlp.experts.up_proj.weight".to_string(),
+                MxArray::ones(&[e, inter, d], Some(DType::Float16)).unwrap(),
+            );
+            let (gu, interleaved) =
+                load_expert_gate_up(&p, "layers.0", &empty_plq, default_plq, true).unwrap();
+            assert!(
+                !interleaved,
+                "split gate+up must override interleaved to false"
+            );
+            let ExpertGateUp::Fused(SwitchProj::Standard(sl)) = gu else {
+                panic!("expected fused dense")
+            };
+            assert_eq!(sl.weight_ref().dtype().unwrap(), DType::BFloat16);
+            assert_eq!(
+                sl.weight_ref().shape().unwrap().as_ref(),
+                &[e, 2 * inter, d]
+            );
+        }
+
+        // (b) Symmetric Q8_0 split -> fuses BEFORE compaction, then compacts to symmetric_q8!
+        {
+            let make_sym_q8 = |p: &mut HashMap<String, MxArray>, name: &str| {
+                let s = MxArray::full(
+                    &[e, inter, d / 32],
+                    napi::Either::A(0.25f64),
+                    Some(DType::Float16),
+                )
+                .unwrap();
+                let b = s
+                    .astype(DType::Float32)
+                    .unwrap()
+                    .mul_scalar(-128.0)
+                    .unwrap()
+                    .astype(DType::Float16)
+                    .unwrap();
+                p.insert(
+                    format!("{name}.weight"),
+                    MxArray::from_uint32(
+                        &vec![0x8080_8080u32; (e * inter * (d / 4)) as usize],
+                        &[e, inter, d / 4],
+                    )
+                    .unwrap(),
+                );
+                p.insert(format!("{name}.scales"), s);
+                p.insert(format!("{name}.biases"), b);
+            };
+            let mut p = HashMap::new();
+            make_sym_q8(&mut p, "layers.0.mlp.experts.gate_proj");
+            make_sym_q8(&mut p, "layers.0.mlp.experts.up_proj");
+            let (gu, interleaved) =
+                load_expert_gate_up(&p, "layers.0", &empty_plq, default_plq, true).unwrap();
+            assert!(!interleaved);
+            let ExpertGateUp::Fused(SwitchProj::Quantized(q)) = gu else {
+                panic!("expected fused sym Q8")
+            };
+            assert!(
+                q.is_symmetric_q8(),
+                "must compact to symmetric_q8 after fusion"
+            );
+            assert_eq!(
+                q.get_weight().shape().unwrap().as_ref(),
+                &[e, 2 * inter, d / 4]
+            );
+        }
+
+        // (c) NVFP4 equal `.scale` -> Fused; distinct `.scale` -> Split!
+        {
+            let mut p = HashMap::new();
+            for proj_name in ["gate_proj", "up_proj"] {
+                p.insert(
+                    format!("layers.0.mlp.experts.{proj_name}.weight"),
+                    MxArray::from_uint32(
+                        &vec![0x2222_2222u32; (e * inter * (d / 8)) as usize],
+                        &[e, inter, d / 8],
+                    )
+                    .unwrap(),
+                );
+                p.insert(
+                    format!("layers.0.mlp.experts.{proj_name}.scales"),
+                    MxArray::from_uint8(
+                        &vec![0x38u8; (e * inter * (d / 16)) as usize],
+                        &[e, inter, d / 16],
+                    )
+                    .unwrap(),
+                );
+                p.insert(
+                    format!("layers.0.mlp.experts.{proj_name}.scale"),
+                    MxArray::from_float32(&[0.5, 1.5], &[e]).unwrap(),
+                );
+            }
+            let (gu_eq, il_eq) =
+                load_expert_gate_up(&p, "layers.0", &empty_plq, default_plq, true).unwrap();
+            assert!(!il_eq);
+            assert!(gu_eq.is_fused(), "equal NVFP4 .scale must fuse");
+
+            // Change up_proj.scale so gate != up -> MUST stay Split!
+            p.insert(
+                "layers.0.mlp.experts.up_proj.scale".to_string(),
+                MxArray::from_float32(&[0.5, 2.5], &[e]).unwrap(),
+            );
+            let (gu_diff, il_diff) =
+                load_expert_gate_up(&p, "layers.0", &empty_plq, default_plq, true).unwrap();
+            assert!(!il_diff);
+            assert!(!gu_diff.is_fused(), "distinct NVFP4 .scale must stay Split");
+        }
+
+        // (d) Mixed K-quant Q5_K gate + Q4_K up -> MUST stay Split!
+        {
+            let k_kq = 256usize;
+            let make_kq = |fmt: KQuantFormat| {
+                let rows = (e * inter) as usize;
+                let raw = vec![0u8; rows * (k_kq / fmt.block_size()) * fmt.block_bytes()];
+                let mut rep = KQuantRepacker::new(fmt, k_kq, rows).unwrap();
+                rep.push_rows(&raw, rows).unwrap();
+                let a = rep.finish();
+                let w = MxArray::from_uint32(&a.weight, &[e, inter, fmt.weight_cols(k_kq) as i64])
+                    .unwrap();
+                let s = match a.scales {
+                    KQuantScales::Unsigned(v) => {
+                        MxArray::from_uint8(&v, &[e, inter, fmt.scales_cols(k_kq) as i64]).unwrap()
+                    }
+                    KQuantScales::Signed(v) => {
+                        MxArray::from_int8(&v, &[e, inter, fmt.scales_cols(k_kq) as i64]).unwrap()
+                    }
+                };
+                let b = MxArray::from_float16(&a.biases, &[e, inter, fmt.biases_cols(k_kq) as i64])
+                    .unwrap();
+                (w, s, b)
+            };
+            let (gw, gs, gb) = make_kq(KQuantFormat::Q5K);
+            let (uw, us, ub) = make_kq(KQuantFormat::Q4K);
+            let mut p = HashMap::new();
+            p.insert("layers.0.mlp.experts.gate_proj.weight".to_string(), gw);
+            p.insert("layers.0.mlp.experts.gate_proj.scales".to_string(), gs);
+            p.insert("layers.0.mlp.experts.gate_proj.biases".to_string(), gb);
+            p.insert("layers.0.mlp.experts.up_proj.weight".to_string(), uw);
+            p.insert("layers.0.mlp.experts.up_proj.scales".to_string(), us);
+            p.insert("layers.0.mlp.experts.up_proj.biases".to_string(), ub);
+            let mut plqs = HashMap::new();
+            plqs.insert(
+                "layers.0.mlp.experts.gate_proj".to_string(),
+                PerLayerQuant {
+                    bits: 5,
+                    group_size: 32,
+                    mode: PerLayerMode::Q5K,
+                    layout: KQuantLayout::RowMajor,
+                    input_amax: None,
+                },
+            );
+            plqs.insert(
+                "layers.0.mlp.experts.up_proj".to_string(),
+                PerLayerQuant {
+                    bits: 4,
+                    group_size: 32,
+                    mode: PerLayerMode::Q4K,
+                    layout: KQuantLayout::RowMajor,
+                    input_amax: None,
+                },
+            );
+            let (gu, il) = load_expert_gate_up(&p, "layers.0", &plqs, default_plq, true).unwrap();
+            assert!(!il);
+            assert!(!gu.is_fused(), "mixed Q5K+Q4K must stay Split");
+        }
+    }
+
+    #[test]
+    fn cross_layout_safetensors_equivalence_release_omlx_mlxvlm_mlxlm() {
+        use crate::models::inkling2::config::Inkling2LoopConfig;
+        use crate::models::quant_dispatch::KQuantLayout;
+
+        // Tiny synthetic Inkling2: 2 physical layers (layer 0 = local SWA, layer 1 = global + core loop),
+        // D=16, n_heads=2, n_kv=1, head_dim=8, d_rel=4, rel_extent=8, K_conv=4, E=2, top_k=1, inter=8, rank=4.
+        let d = 16usize;
+        let n_heads = 2usize;
+        let n_kv = 1usize;
+        let head_dim = 8usize;
+        let d_rel = 4usize;
+        let rel_extent = 8usize;
+        let k_conv = 4usize;
+        let e = 2usize;
+        let inter = 8usize;
+        let rank = 4usize;
+        let vocab = 32usize;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv * head_dim;
+        let r_dim = n_heads * d_rel;
+        let taps = n_kv * k_conv;
+
+        let config = Inkling2Config {
+            model_type: "inkling2_loop".to_string(),
+            hidden_size: d,
+            num_hidden_layers: 3,
+            num_physical_layers: Some(2),
+            num_attention_heads: n_heads,
+            num_key_value_heads: n_kv,
+            head_dim,
+            value_head_dim: None,
+            vocab_size: vocab,
+            padded_vocab_size: Some(vocab),
+            unpadded_vocab_size: Some(vocab),
+            rms_norm_eps: 1e-6,
+            max_position_embeddings: 64,
+            sliding_window: 16,
+            sliding_window_pattern: vec![true, false],
+            local_layer_ids: vec![0],
+            sconv_kernel_size: k_conv,
+            n_layers_per_attn_res_block: 1,
+            d_rel,
+            rel_extent,
+            qk_l2_clip_threshold: 22.6,
+            rel_l2_clip_threshold: 8.0,
+            log_scaling_n_floor: 8192,
+            log_scaling_alpha: 0.1,
+            num_experts: e,
+            num_experts_per_tok: 1,
+            moe_intermediate_size: Some(inter),
+            intermediate_size: Some(inter),
+            route_scale: 1.0,
+            mlp_gate_softcap: 4.0,
+            mlp_up_softcap: 25.0,
+            final_logit_softcapping: 30.0,
+            loop_config: Some(Inkling2LoopConfig {
+                core_start: 1,
+                core_end: 2,
+                num_passes: 2,
+                gate_rank: rank,
+                is_varloop: false,
+            }),
+            vision_config: None,
+            dspark_config: None,
+            eos_token_id: 2,
+            pad_token_id: 0,
+            gate_up_interleaved: false,
+        };
+
+        let mk = |seed: usize, shape: &[i64], dt: DType| -> MxArray {
+            let n: usize = shape.iter().map(|&v| v as usize).product();
+            let vals: Vec<f32> = (0..n)
+                .map(|i| (((i + seed * 17) as f32) * 0.13).sin() * 0.25)
+                .collect();
+            let arr = MxArray::from_float32(&vals, shape).unwrap();
+            if dt == DType::Float32 {
+                arr
+            } else {
+                arr.astype(dt).unwrap()
+            }
+        };
+
+        // Shared ground-truth canonical tensors (BF16 projections, F32 norms/queries/convs/clips)
+        let embed_w = mk(1, &[vocab as i64, d as i64], DType::BFloat16);
+        let lm_head_w = mk(2, &[vocab as i64, d as i64], DType::BFloat16);
+        let embed_norm_w = mk(3, &[d as i64], DType::Float32);
+        let final_norm_w = mk(4, &[d as i64], DType::Float32);
+        let out_res_q = mk(5, &[d as i64], DType::Float32);
+
+        // Layer 0 (local) & Layer 1 (global + loop core 0)
+        let l0_inp_norm = mk(10, &[d as i64], DType::Float32);
+        let l0_ffn_norm = mk(11, &[d as i64], DType::Float32);
+        let l0_ffn_q = mk(12, &[d as i64], DType::Float32);
+        let l0_q = mk(13, &[q_dim as i64, d as i64], DType::BFloat16);
+        let l0_k = mk(14, &[kv_dim as i64, d as i64], DType::BFloat16);
+        let l0_v = mk(15, &[kv_dim as i64, d as i64], DType::BFloat16);
+        let l0_r = mk(16, &[r_dim as i64, d as i64], DType::BFloat16);
+        let l0_g = mk(17, &[q_dim as i64, d as i64], DType::BFloat16);
+        let l0_s = mk(18, &[n_heads as i64, d as i64], DType::BFloat16);
+        let l0_o = mk(19, &[d as i64, q_dim as i64], DType::BFloat16);
+        let l0_qc = mk(20, &[n_heads as i64, head_dim as i64], DType::Float32);
+        let l0_rc = mk(21, &[n_heads as i64, d_rel as i64], DType::Float32);
+        let l0_rb = mk(22, &[d_rel as i64, rel_extent as i64], DType::Float32);
+        let l0_kc = mk(23, &[kv_dim as i64, k_conv as i64], DType::Float32);
+        let l0_vc = mk(24, &[kv_dim as i64, k_conv as i64], DType::Float32);
+        let l0_pc = mk(25, &[d as i64, k_conv as i64], DType::Float32);
+        let l0_mpc = mk(26, &[d as i64, k_conv as i64], DType::Float32);
+        let l0_router = mk(27, &[e as i64, d as i64], DType::Float32);
+        let l0_rbias = mk(28, &[e as i64], DType::Float32);
+        let l0_e_gate = mk(29, &[e as i64, inter as i64, d as i64], DType::BFloat16);
+        let l0_e_up = mk(30, &[e as i64, inter as i64, d as i64], DType::BFloat16);
+        let l0_e_down = mk(31, &[e as i64, d as i64, inter as i64], DType::BFloat16);
+        // Interleaved `[E, 2*I, D]` matching `(g0, u0, g1, u1, ...)`
+        let interleave = |g: &MxArray, u: &MxArray| -> MxArray {
+            MxArray::stack(vec![g, u], Some(2))
+                .unwrap()
+                .reshape(&[e as i64, (2 * inter) as i64, d as i64])
+                .unwrap()
+        };
+        let l0_e_gu_il = interleave(&l0_e_gate, &l0_e_up);
+
+        // Layer 1 (global + core 0)
+        let l1_attn_q = mk(40, &[3, d as i64], DType::Float32);
+        let l1_ffn_q = mk(41, &[d as i64], DType::Float32);
+        let l1_qn = mk(42, &[d as i64], DType::Float32);
+        let l1_kn = mk(43, &[d as i64], DType::Float32);
+        let l1_vn = mk(44, &[d as i64], DType::Float32);
+        let l1_ffn_norm = mk(45, &[d as i64], DType::Float32);
+        let l1_q = mk(46, &[q_dim as i64, d as i64], DType::BFloat16);
+        let l1_k = mk(47, &[kv_dim as i64, d as i64], DType::BFloat16);
+        let l1_v = mk(48, &[kv_dim as i64, d as i64], DType::BFloat16);
+        let l1_r = mk(49, &[r_dim as i64, d as i64], DType::BFloat16);
+        let l1_g = mk(50, &[q_dim as i64, d as i64], DType::BFloat16);
+        let l1_s = mk(51, &[n_heads as i64, d as i64], DType::BFloat16);
+        let l1_o = mk(52, &[d as i64, q_dim as i64], DType::BFloat16);
+        let l1_kcp = mk(53, &[taps as i64, d as i64], DType::BFloat16);
+        let l1_vcp = mk(54, &[taps as i64, d as i64], DType::BFloat16);
+        let l1_qc = mk(55, &[n_heads as i64, head_dim as i64], DType::Float32);
+        let l1_rc = mk(56, &[n_heads as i64, d_rel as i64], DType::Float32);
+        let l1_rb = mk(57, &[d_rel as i64, rel_extent as i64], DType::Float32);
+        // Stored as `[K, C]` newest-to-oldest in SafeTensors!
+        let l1_k_static_kc = mk(58, &[k_conv as i64, kv_dim as i64], DType::Float32);
+        let l1_v_static_kc = mk(59, &[k_conv as i64, kv_dim as i64], DType::Float32);
+        let l1_pc = mk(60, &[d as i64, k_conv as i64], DType::Float32);
+        let l1_mpc = mk(61, &[d as i64, k_conv as i64], DType::Float32);
+        let l1_router = mk(62, &[e as i64, d as i64], DType::Float32);
+        let l1_rbias = mk(63, &[e as i64], DType::Float32);
+        let l1_e_gate = mk(64, &[e as i64, inter as i64, d as i64], DType::BFloat16);
+        let l1_e_up = mk(65, &[e as i64, inter as i64, d as i64], DType::BFloat16);
+        let l1_e_down = mk(66, &[e as i64, d as i64, inter as i64], DType::BFloat16);
+        let l1_e_gu_il = interleave(&l1_e_gate, &l1_e_up);
+
+        // Loop message queries `[4, D]` ([q, k, v, mlp]) and 4 controllers (mixed BF16 down + F32 gain/forget!)
+        let msg_q4 = mk(70, &[4, d as i64], DType::Float32);
+        let ctrl_down: Vec<MxArray> = (0..4)
+            .map(|g| mk(80 + g, &[rank as i64, (2 * d) as i64], DType::BFloat16))
+            .collect();
+        let ctrl_gain: Vec<MxArray> = (0..4)
+            .map(|g| mk(90 + g, &[d as i64, rank as i64], DType::Float32))
+            .collect();
+        let ctrl_forget: Vec<MxArray> = (0..4)
+            .map(|g| mk(100 + g, &[d as i64, rank as i64], DType::Float32))
+            .collect();
+
+        // Build all 4 raw SafeTensors maps
+        // (A) Release (`model.llm.*`)
+        let mut raw_release = HashMap::new();
+        raw_release.insert("model.llm.embed.weight".into(), embed_w.clone());
+        raw_release.insert("model.llm.unembed.weight".into(), lm_head_w.clone());
+        raw_release.insert("model.llm.embed_norm.weight".into(), embed_norm_w.clone());
+        raw_release.insert("model.llm.norm.weight".into(), final_norm_w.clone());
+        raw_release.insert("model.llm.attn_res.output_query".into(), out_res_q.clone());
+        raw_release.insert("model.llm.attn_res.mlp_queries.0".into(), l0_ffn_q.clone());
+        raw_release.insert(
+            "model.llm.attn_res.attn_queries.0".into(),
+            l1_attn_q.clone(),
+        );
+        raw_release.insert("model.llm.attn_res.mlp_queries.1".into(), l1_ffn_q.clone());
+        // Release global cross-pass queries: `[2*C, D]` ([q, mlp]) and `[2*C, D]` ([k, v])
+        let rel_lq = MxArray::concatenate(
+            &msg_q4.slice(&[0, 0], &[1, d as i64]).unwrap(),
+            &msg_q4.slice(&[3, 0], &[4, d as i64]).unwrap(),
+            0,
+        )
+        .unwrap();
+        let rel_lkv = MxArray::concatenate(
+            &msg_q4.slice(&[1, 0], &[2, d as i64]).unwrap(),
+            &msg_q4.slice(&[2, 0], &[3, d as i64]).unwrap(),
+            0,
+        )
+        .unwrap();
+        raw_release.insert("model.llm.middle_cycle_cross_pass_queries".into(), rel_lq);
+        raw_release.insert(
+            "model.llm.middle_cycle_cross_pass_kv_queries".into(),
+            rel_lkv,
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn_norm.weight".into(),
+            l0_inp_norm.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.mlp_norm.weight".into(),
+            l0_ffn_norm.clone(),
+        );
+        raw_release.insert("model.llm.layers.0.attn.wq_du.weight".into(), l0_q.clone());
+        raw_release.insert("model.llm.layers.0.attn.wk_dv.weight".into(), l0_k.clone());
+        raw_release.insert("model.llm.layers.0.attn.wv_dv.weight".into(), l0_v.clone());
+        raw_release.insert("model.llm.layers.0.attn.wr_du.weight".into(), l0_r.clone());
+        raw_release.insert(
+            "model.llm.layers.0.attn.gate_attn.weight".into(),
+            l0_g.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.attn_sink_proj.weight".into(),
+            l0_s.clone(),
+        );
+        raw_release.insert("model.llm.layers.0.attn.wo_ud.weight".into(), l0_o.clone());
+        raw_release.insert(
+            "model.llm.layers.0.attn.q_l2_clip.scale".into(),
+            l0_qc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.rel_l2_clip.scale".into(),
+            l0_rc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.rel_logits_proj.proj".into(),
+            l0_rb.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.k_sconv.weight".into(),
+            l0_kc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.v_sconv.weight".into(),
+            l0_vc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn_sconv.weight".into(),
+            l0_pc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.mlp_sconv.weight".into(),
+            l0_mpc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.mlp.gate.weight".into(),
+            l0_router.clone(),
+        );
+        raw_release.insert("model.llm.layers.0.mlp.gate.bias".into(), l0_rbias.clone());
+        raw_release.insert(
+            "model.llm.layers.0.mlp.experts.w13_weight".into(),
+            l0_e_gu_il.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.mlp.experts.w2_weight".into(),
+            l0_e_down.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.q_input_norm.weight".into(),
+            l1_qn.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.k_input_norm.weight".into(),
+            l1_kn.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.v_input_norm.weight".into(),
+            l1_vn.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.mlp_norm.weight".into(),
+            l1_ffn_norm.clone(),
+        );
+        raw_release.insert("model.llm.layers.1.attn.wq_du.weight".into(), l1_q.clone());
+        raw_release.insert("model.llm.layers.1.attn.wk_dv.weight".into(), l1_k.clone());
+        raw_release.insert("model.llm.layers.1.attn.wv_dv.weight".into(), l1_v.clone());
+        raw_release.insert("model.llm.layers.1.attn.wr_du.weight".into(), l1_r.clone());
+        raw_release.insert(
+            "model.llm.layers.1.attn.gate_attn.weight".into(),
+            l1_g.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.attn_sink_proj.weight".into(),
+            l1_s.clone(),
+        );
+        raw_release.insert("model.llm.layers.1.attn.wo_ud.weight".into(), l1_o.clone());
+        raw_release.insert(
+            "model.llm.layers.1.attn.k_sconv.weight_proj".into(),
+            l1_kcp.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.v_sconv.weight_proj".into(),
+            l1_vcp.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.q_l2_clip.scale".into(),
+            l1_qc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.rel_l2_clip.scale".into(),
+            l1_rc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.rel_logits_proj.proj".into(),
+            l1_rb.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.k_sconv.static_w".into(),
+            l1_k_static_kc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn.v_sconv.static_w".into(),
+            l1_v_static_kc.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.attn_sconv.weight".into(),
+            l1_pc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.mlp_sconv.weight".into(),
+            l1_mpc.expand_dims(1).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.mlp.gate.weight".into(),
+            l1_router.clone(),
+        );
+        raw_release.insert("model.llm.layers.1.mlp.gate.bias".into(), l1_rbias.clone());
+        raw_release.insert(
+            "model.llm.layers.1.mlp.experts.w13_weight".into(),
+            l1_e_gu_il.clone(),
+        );
+        raw_release.insert(
+            "model.llm.layers.1.mlp.experts.w2_weight".into(),
+            l1_e_down.clone(),
+        );
+        for (i, s) in ["attn", "k", "v", "mlp"].iter().enumerate() {
+            raw_release.insert(
+                format!("model.llm.layers.1.controllers.{s}.down_weight"),
+                ctrl_down[i].clone(),
+            );
+            raw_release.insert(
+                format!("model.llm.layers.1.controllers.{s}.gain_weight"),
+                ctrl_gain[i].clone(),
+            );
+            raw_release.insert(
+                format!("model.llm.layers.1.controllers.{s}.forget_weight"),
+                ctrl_forget[i].clone(),
+            );
+        }
+
+        // (B) oMLX (`model.embed.weight`, fused `attn.in_proj`, fused `attn.{q,k,v}_proj`, packed `loop_down`/`loop_gain_forget`)
+        let mut raw_omlx = HashMap::new();
+        raw_omlx.insert("model.embed.weight".into(), embed_w.clone());
+        raw_omlx.insert("model.lm_head.weight".into(), lm_head_w.clone());
+        raw_omlx.insert("model.embed_norm.weight".into(), embed_norm_w.clone());
+        raw_omlx.insert("model.norm.weight".into(), final_norm_w.clone());
+        raw_omlx.insert("model.final_input.query".into(), out_res_q.clone());
+        raw_omlx.insert(
+            "model.layers.0.attn_norm.weight".into(),
+            l0_inp_norm.clone(),
+        );
+        raw_omlx.insert("model.layers.0.mlp_norm.weight".into(), l0_ffn_norm.clone());
+        raw_omlx.insert("model.layers.0.mlp_input.query".into(), l0_ffn_q.clone());
+        let l0_in_proj =
+            MxArray::concatenate_many(vec![&l0_q, &l0_k, &l0_v, &l0_r, &l0_g, &l0_s], Some(0))
+                .unwrap();
+        raw_omlx.insert("model.layers.0.attn.in_proj.weight".into(), l0_in_proj);
+        raw_omlx.insert("model.layers.0.attn.o_proj.weight".into(), l0_o.clone());
+        raw_omlx.insert("model.layers.0.attn.q_scale".into(), l0_qc.clone());
+        raw_omlx.insert("model.layers.0.attn.r_scale".into(), l0_rc.clone());
+        raw_omlx.insert("model.layers.0.attn.rel_proj".into(), l0_rb.clone());
+        raw_omlx.insert("model.layers.0.attn.k_conv".into(), l0_kc.clone());
+        raw_omlx.insert("model.layers.0.attn.v_conv".into(), l0_vc.clone());
+        raw_omlx.insert("model.layers.0.attn_conv".into(), l0_pc.clone());
+        raw_omlx.insert("model.layers.0.mlp_conv".into(), l0_mpc.clone());
+        raw_omlx.insert("model.layers.0.mlp.router_weight".into(), l0_router.clone());
+        raw_omlx.insert("model.layers.0.mlp.router_bias".into(), l0_rbias.clone());
+        raw_omlx.insert(
+            "model.layers.0.mlp.experts.w13.weight".into(),
+            l0_e_gu_il.clone(),
+        );
+        raw_omlx.insert(
+            "model.layers.0.mlp.experts.w2.weight".into(),
+            l0_e_down.clone(),
+        );
+        raw_omlx.insert("model.layers.1.attn_input.query".into(), l1_attn_q.clone());
+        raw_omlx.insert("model.layers.1.mlp_input.query".into(), l1_ffn_q.clone());
+        raw_omlx.insert("model.layers.1.q_input_norm.weight".into(), l1_qn.clone());
+        raw_omlx.insert("model.layers.1.k_input_norm.weight".into(), l1_kn.clone());
+        raw_omlx.insert("model.layers.1.v_input_norm.weight".into(), l1_vn.clone());
+        raw_omlx.insert("model.layers.1.mlp_norm.weight".into(), l1_ffn_norm.clone());
+        let l1_q_fused =
+            MxArray::concatenate_many(vec![&l1_q, &l1_r, &l1_g, &l1_s], Some(0)).unwrap();
+        let l1_k_fused = MxArray::concatenate(&l1_k, &l1_kcp, 0).unwrap();
+        let l1_v_fused = MxArray::concatenate(&l1_v, &l1_vcp, 0).unwrap();
+        raw_omlx.insert("model.layers.1.attn.q_proj.weight".into(), l1_q_fused);
+        raw_omlx.insert("model.layers.1.attn.k_proj.weight".into(), l1_k_fused);
+        raw_omlx.insert("model.layers.1.attn.v_proj.weight".into(), l1_v_fused);
+        raw_omlx.insert("model.layers.1.attn.o_proj.weight".into(), l1_o.clone());
+        raw_omlx.insert("model.layers.1.attn.q_scale".into(), l1_qc.clone());
+        raw_omlx.insert("model.layers.1.attn.r_scale".into(), l1_rc.clone());
+        raw_omlx.insert("model.layers.1.attn.rel_proj".into(), l1_rb.clone());
+        raw_omlx.insert(
+            "model.layers.1.attn.k_static".into(),
+            l1_k_static_kc.clone(),
+        );
+        raw_omlx.insert(
+            "model.layers.1.attn.v_static".into(),
+            l1_v_static_kc.clone(),
+        );
+        raw_omlx.insert("model.layers.1.attn_conv".into(), l1_pc.clone());
+        raw_omlx.insert("model.layers.1.mlp_conv".into(), l1_mpc.clone());
+        raw_omlx.insert("model.layers.1.mlp.router_weight".into(), l1_router.clone());
+        raw_omlx.insert("model.layers.1.mlp.router_bias".into(), l1_rbias.clone());
+        raw_omlx.insert(
+            "model.layers.1.mlp.experts.w13.weight".into(),
+            l1_e_gu_il.clone(),
+        );
+        raw_omlx.insert(
+            "model.layers.1.mlp.experts.w2.weight".into(),
+            l1_e_down.clone(),
+        );
+        raw_omlx.insert("model.layers.1.loop_message.query".into(), msg_q4.clone());
+        let omlx_down_t: Vec<MxArray> = ctrl_down
+            .iter()
+            .map(|a| a.transpose(None).unwrap())
+            .collect();
+        raw_omlx.insert(
+            "model.layers.1.loop_down".into(),
+            MxArray::stack(omlx_down_t.iter().collect(), Some(0)).unwrap(),
+        );
+        let omlx_gf: Vec<MxArray> = (0..4)
+            .map(|i| {
+                MxArray::concatenate(
+                    &ctrl_gain[i].transpose(None).unwrap(),
+                    &ctrl_forget[i].transpose(None).unwrap(),
+                    1,
+                )
+                .unwrap()
+            })
+            .collect();
+        raw_omlx.insert(
+            "model.layers.1.loop_gain_forget".into(),
+            MxArray::stack(omlx_gf.iter().collect(), Some(0)).unwrap(),
+        );
+
+        // (C) mlx-vlm (`model.language_model.*`, `[C, K, 1]` convs, `{q,k,v,mlp}_message_gate.*`)
+        let mut raw_mlxvlm = HashMap::new();
+        raw_mlxvlm.insert(
+            "model.language_model.embed_tokens.weight".into(),
+            embed_w.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.lm_head.weight".into(),
+            lm_head_w.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.embed_norm.weight".into(),
+            embed_norm_w.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.norm.weight".into(),
+            final_norm_w.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.final_input.query".into(),
+            out_res_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.input_layernorm.weight".into(),
+            l0_inp_norm.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.post_attention_layernorm.weight".into(),
+            l0_ffn_norm.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.mlp_input.query".into(),
+            l0_ffn_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.q_proj.weight".into(),
+            l0_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.k_proj.weight".into(),
+            l0_k.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.v_proj.weight".into(),
+            l0_v.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.r_proj.weight".into(),
+            l0_r.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.gate_proj.weight".into(),
+            l0_g.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.sink_proj.weight".into(),
+            l0_s.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.o_proj.weight".into(),
+            l0_o.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.q_l2_clip.scale".into(),
+            l0_qc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.rel_l2_clip.scale".into(),
+            l0_rc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.rel_logits_proj.proj".into(),
+            l0_rb.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.k_sconv.conv1d.weight".into(),
+            l0_kc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.self_attn.v_sconv.conv1d.weight".into(),
+            l0_vc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.post_attention_convolution.conv1d.weight".into(),
+            l0_pc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.post_mlp_convolution.conv1d.weight".into(),
+            l0_mpc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.mlp.gate.weight".into(),
+            l0_router.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.mlp.gate.e_score_correction_bias".into(),
+            l0_rbias.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj.weight".into(),
+            l0_e_gu_il.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.0.mlp.experts.down_proj.weight".into(),
+            l0_e_down.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.attention_input.query".into(),
+            l1_attn_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.mlp_input.query".into(),
+            l1_ffn_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.q_input_layernorm.weight".into(),
+            l1_qn.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.k_input_layernorm.weight".into(),
+            l1_kn.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.v_input_layernorm.weight".into(),
+            l1_vn.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.post_attention_layernorm.weight".into(),
+            l1_ffn_norm.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.q_proj.weight".into(),
+            l1_q.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.k_proj.weight".into(),
+            l1_k.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.v_proj.weight".into(),
+            l1_v.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.r_proj.weight".into(),
+            l1_r.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.gate_proj.weight".into(),
+            l1_g.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.sink_proj.weight".into(),
+            l1_s.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.o_proj.weight".into(),
+            l1_o.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.k_sconv.weight_proj.weight".into(),
+            l1_kcp.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.v_sconv.weight_proj.weight".into(),
+            l1_vcp.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.q_l2_clip.scale".into(),
+            l1_qc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.rel_l2_clip.scale".into(),
+            l1_rc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.rel_logits_proj.proj".into(),
+            l1_rb.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.k_sconv.static_weight".into(),
+            l1_k_static_kc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.self_attn.v_sconv.static_weight".into(),
+            l1_v_static_kc.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.post_attention_convolution.conv1d.weight".into(),
+            l1_pc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.post_mlp_convolution.conv1d.weight".into(),
+            l1_mpc.expand_dims(2).unwrap(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.mlp.gate.weight".into(),
+            l1_router.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.mlp.gate.e_score_correction_bias".into(),
+            l1_rbias.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.mlp.experts.gate_up_proj.weight".into(),
+            l1_e_gu_il.clone(),
+        );
+        raw_mlxvlm.insert(
+            "model.language_model.layers.1.mlp.experts.down_proj.weight".into(),
+            l1_e_down.clone(),
+        );
+        // Top-level `[C, 4, D]` `message_input.query` (Splash mlx-vlm layout)
+        raw_mlxvlm.insert(
+            "model.language_model.message_input.query".into(),
+            msg_q4.expand_dims(0).unwrap(),
+        );
+        for (i, s) in ["q", "k", "v", "mlp"].iter().enumerate() {
+            raw_mlxvlm.insert(
+                format!("model.language_model.layers.1.{s}_message_gate.down_proj.weight"),
+                ctrl_down[i].clone(),
+            );
+            raw_mlxvlm.insert(
+                format!("model.language_model.layers.1.{s}_message_gate.message_gate_proj.weight"),
+                ctrl_gain[i].clone(),
+            );
+            raw_mlxvlm.insert(
+                format!("model.language_model.layers.1.{s}_message_gate.forget_gate_proj.weight"),
+                ctrl_forget[i].clone(),
+            );
+        }
+
+        // (D) mlx-lm (`language_model.model.*`, `language_model.lm_head.*`, bare `self_attn.rel_proj` collision,
+        //     split `switch_mlp.{gate,up,down}_proj`, top-level `message_input.query` [C, 4, D])
+        let mut raw_mlxlm = HashMap::new();
+        raw_mlxlm.insert(
+            "language_model.model.embed_tokens.weight".into(),
+            embed_w.clone(),
+        );
+        raw_mlxlm.insert("language_model.lm_head.weight".into(), lm_head_w.clone());
+        raw_mlxlm.insert(
+            "language_model.model.embed_norm.weight".into(),
+            embed_norm_w.clone(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.norm.weight".into(),
+            final_norm_w.clone(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.final_input.query".into(),
+            out_res_q.clone(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.message_input.query".into(),
+            msg_q4.expand_dims(0).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.input_layernorm.weight".into(),
+            l0_inp_norm,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.post_attention_layernorm.weight".into(),
+            l0_ffn_norm,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp_input.query".into(),
+            l0_ffn_q,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.q_proj.weight".into(),
+            l0_q,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.k_proj.weight".into(),
+            l0_k,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.v_proj.weight".into(),
+            l0_v,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.r_proj.weight".into(),
+            l0_r,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.gate_proj.weight".into(),
+            l0_g,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.sink_proj.weight".into(),
+            l0_s,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.o_proj.weight".into(),
+            l0_o,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.q_scale".into(),
+            l0_qc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.rel_scale".into(),
+            l0_rc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.rel_proj".into(),
+            l0_rb,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.k_sconv.conv.weight".into(),
+            l0_kc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.self_attn.v_sconv.conv.weight".into(),
+            l0_vc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.attn_sconv.conv.weight".into(),
+            l0_pc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp_sconv.conv.weight".into(),
+            l0_mpc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp.gate_weight".into(),
+            l0_router,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp.e_score_correction_bias".into(),
+            l0_rbias,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp.switch_mlp.gate_proj.weight".into(),
+            l0_e_gate,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp.switch_mlp.up_proj.weight".into(),
+            l0_e_up,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.0.mlp.switch_mlp.down_proj.weight".into(),
+            l0_e_down,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.attention_input.query".into(),
+            l1_attn_q,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp_input.query".into(),
+            l1_ffn_q,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.q_input_layernorm.weight".into(),
+            l1_qn,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.k_input_layernorm.weight".into(),
+            l1_kn,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.v_input_layernorm.weight".into(),
+            l1_vn,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.post_attention_layernorm.weight".into(),
+            l1_ffn_norm,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.q_proj.weight".into(),
+            l1_q,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.k_proj.weight".into(),
+            l1_k,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.v_proj.weight".into(),
+            l1_v,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.r_proj.weight".into(),
+            l1_r,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.gate_proj.weight".into(),
+            l1_g,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.sink_proj.weight".into(),
+            l1_s,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.o_proj.weight".into(),
+            l1_o,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.k_sconv.weight_proj.weight".into(),
+            l1_kcp,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.v_sconv.weight_proj.weight".into(),
+            l1_vcp,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.q_scale".into(),
+            l1_qc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.rel_scale".into(),
+            l1_rc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.rel_proj".into(),
+            l1_rb,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.k_sconv.static_weight".into(),
+            l1_k_static_kc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.self_attn.v_sconv.static_weight".into(),
+            l1_v_static_kc,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.attn_sconv.conv.weight".into(),
+            l1_pc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp_sconv.conv.weight".into(),
+            l1_mpc.expand_dims(2).unwrap(),
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp.gate_weight".into(),
+            l1_router,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp.e_score_correction_bias".into(),
+            l1_rbias,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp.switch_mlp.gate_proj.weight".into(),
+            l1_e_gate,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp.switch_mlp.up_proj.weight".into(),
+            l1_e_up,
+        );
+        raw_mlxlm.insert(
+            "language_model.model.layers.1.mlp.switch_mlp.down_proj.weight".into(),
+            l1_e_down,
+        );
+        for (i, s) in ["q", "k", "v", "mlp"].iter().enumerate() {
+            raw_mlxlm.insert(
+                format!("language_model.model.layers.1.{s}_message_gate.down_proj.weight"),
+                ctrl_down[i].clone(),
+            );
+            raw_mlxlm.insert(
+                format!("language_model.model.layers.1.{s}_message_gate.message_gate_proj.weight"),
+                ctrl_gain[i].clone(),
+            );
+            raw_mlxlm.insert(
+                format!("language_model.model.layers.1.{s}_message_gate.forget_gate_proj.weight"),
+                ctrl_forget[i].clone(),
+            );
+        }
+
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+        let empty_plq = HashMap::new();
+        let inv_sqrt_d = 1.0 / (d as f64).sqrt();
+
+        // Normalize & build physical layers for all 4 layouts and compare forward outputs!
+        let mut layer_outputs: Vec<(&str, Vec<f32>)> = Vec::new();
+        let x_in = mk(200, &[2, d as i64], DType::Float32);
+
+        let mut omlx_norm_captured = Inkling2StNormResult::default();
+        for (tag, raw_map, want_layout, want_il) in [
+            (
+                "Release",
+                raw_release,
+                Inkling2CheckpointLayout::Release,
+                Some(true),
+            ),
+            ("oMLX", raw_omlx, Inkling2CheckpointLayout::OMlx, Some(true)),
+            (
+                "mlx-vlm",
+                raw_mlxvlm,
+                Inkling2CheckpointLayout::MlxVlm,
+                Some(true),
+            ),
+            (
+                "mlx-lm",
+                raw_mlxlm,
+                Inkling2CheckpointLayout::MlxLm,
+                Some(false),
+            ),
+        ] {
+            let detected = detect_inkling2_safetensors_layout(&raw_map);
+            assert_eq!(detected, want_layout, "{tag}: layout detection mismatch");
+            let mut params = strip_inkling2_wrapper_prefixes(raw_map);
+            let norm =
+                normalize_inkling2_safetensors_params(&mut params, detected, &config).unwrap();
+            assert_eq!(
+                norm.gate_up_interleaved, want_il,
+                "{tag}: gate_up_interleaved mismatch"
+            );
+            if detected == Inkling2CheckpointLayout::OMlx {
+                omlx_norm_captured = norm.clone();
+            }
+            assert!(params.contains_key("embed_tokens.weight"), "{tag}");
+            assert!(params.contains_key("lm_head.weight"), "{tag}");
+
+            let mut cfg = config.clone();
+            cfg.gate_up_interleaved = norm.gate_up_interleaved.unwrap();
+
+            let glr =
+                try_load_dense_or_dequant_f32(&params, "loop_res_query", &empty_plq, default_plq)
+                    .unwrap();
+            let glkv = try_load_dense_or_dequant_f32(
+                &params,
+                "loop_kv_res_query",
+                &empty_plq,
+                default_plq,
+            )
+            .unwrap();
+            let l0 = build_physical_layer(
+                0,
+                &cfg,
+                &params,
+                &empty_plq,
+                default_plq,
+                inv_sqrt_d,
+                glr.as_ref(),
+                glkv.as_ref(),
+            )
+            .unwrap();
+            let l1 = build_physical_layer(
+                1,
+                &cfg,
+                &params,
+                &empty_plq,
+                default_plq,
+                inv_sqrt_d,
+                glr.as_ref(),
+                glkv.as_ref(),
+            )
+            .unwrap();
+
+            // Verify mixed BF16/F32 loop controllers widened cleanly to F32 across all 4 layouts
+            let ctrl = l1.loop_ctrl.as_ref().unwrap();
+            assert_eq!(ctrl.qkv_down_w.dtype().unwrap(), DType::Float32, "{tag}");
+            assert_eq!(
+                ctrl.mlp_ctrl.down_proj_w.dtype().unwrap(),
+                DType::Float32,
+                "{tag}"
+            );
+
+            // Run attention o_proj + both MoE blocks + loop controller to prove numerical equivalence across all 4 layouts!
+            let o_out = l0
+                .self_attn
+                .o_proj
+                .forward(&x_in.astype(DType::BFloat16).unwrap())
+                .unwrap();
+            let mut s0 = crate::models::inkling2::short_conv::VisitShortConvState::zeros(
+                3,
+                1,
+                d,
+                DType::BFloat16,
+            )
+            .unwrap();
+            let y0 = l0.moe.forward(&o_out, &mut s0).unwrap();
+            let mut s1 = crate::models::inkling2::short_conv::VisitShortConvState::zeros(
+                3,
+                1,
+                d,
+                DType::BFloat16,
+            )
+            .unwrap();
+            let y1 = l1.moe.forward(&y0, &mut s1).unwrap();
+            let msg_out = ctrl
+                .mlp_ctrl
+                .forward(&x_in, &y1.astype(DType::Float32).unwrap())
+                .unwrap();
+            layer_outputs.push((tag, msg_out.to_float32().unwrap().to_vec()));
+        }
+
+        let (ref_tag, ref_vals) = &layer_outputs[0];
+        for (tag, vals) in &layer_outputs[1..] {
+            let max_diff = vals
+                .iter()
+                .zip(ref_vals.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_diff < 1e-4,
+                "layout {tag} diverged from {ref_tag}: max_diff={max_diff}"
+            );
+        }
+
+        // Verify per_layer_quant remapping including shape-driven oMLX fused fan-out!
+        let mut plq_omlx = HashMap::new();
+        let q4 = PerLayerQuant {
+            bits: 4,
+            group_size: 64,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+        let q8 = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+        plq_omlx.insert("embed".to_string(), q8);
+        plq_omlx.insert("layers.0.attn.in_proj".to_string(), q4);
+        plq_omlx.insert("layers.1.attn.q_proj".to_string(), q4);
+        plq_omlx.insert("layers.1.attn.k_proj".to_string(), q4);
+        plq_omlx.insert("layers.1.mlp.experts.w13".to_string(), q8);
+        remap_inkling2_per_layer_quant(
+            &mut plq_omlx,
+            Inkling2CheckpointLayout::OMlx,
+            &omlx_norm_captured,
+            &config,
+        )
+        .unwrap();
+        assert_eq!(plq_omlx.get("embed_tokens"), Some(&q8));
+        for p in [
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "rel_proj",
+            "gate_proj",
+            "sink_proj",
+        ] {
+            assert_eq!(plq_omlx.get(&format!("layers.0.self_attn.{p}")), Some(&q4));
+        }
+        for p in ["q_proj", "rel_proj", "gate_proj", "sink_proj"] {
+            assert_eq!(plq_omlx.get(&format!("layers.1.self_attn.{p}")), Some(&q4));
+        }
+        assert_eq!(plq_omlx.get("layers.1.self_attn.k_proj"), Some(&q4));
+        assert_eq!(plq_omlx.get("layers.1.self_attn.k_conv_proj"), Some(&q4));
+        assert_eq!(plq_omlx.get("layers.1.mlp.experts.gate_up_proj"), Some(&q8));
+
+        // Verify unfused oMLX global layer does NOT fan out `attn.q_proj` or stale `attn.in_proj`,
+        // AND renamed attention norms (`q_input_norm`) remap to `self_attn.q_inp_norm`!
+        let mut plq_omlx_unfused = HashMap::new();
+        plq_omlx_unfused.insert("layers.0.attn.in_proj".to_string(), q4);
+        plq_omlx_unfused.insert("layers.1.attn.q_proj".to_string(), q4);
+        plq_omlx_unfused.insert("layers.1.q_input_norm".to_string(), q8);
+        remap_inkling2_per_layer_quant(
+            &mut plq_omlx_unfused,
+            Inkling2CheckpointLayout::OMlx,
+            &Inkling2StNormResult::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(plq_omlx_unfused.get("layers.0.self_attn.q_proj"), None);
+        assert_eq!(plq_omlx_unfused.get("layers.1.self_attn.q_proj"), Some(&q4));
+        assert_eq!(plq_omlx_unfused.get("layers.1.self_attn.rel_proj"), None);
+        assert_eq!(
+            plq_omlx_unfused.get("layers.1.self_attn.q_inp_norm"),
+            Some(&q8)
+        );
+
+        // Stale out-of-range `layers.99` override returns descriptive Err instead of panicking!
+        let mut plq_stale = HashMap::new();
+        plq_stale.insert("layers.99.attn.q_proj".to_string(), q4);
+        let stale_err = remap_inkling2_per_layer_quant(
+            &mut plq_stale,
+            Inkling2CheckpointLayout::OMlx,
+            &Inkling2StNormResult::default(),
+            &config,
+        )
+        .unwrap_err();
+        assert!(
+            stale_err.reason.contains("layers.99.attn.q_proj"),
+            "{stale_err}"
+        );
+
+        let mut plq_mlxlm = HashMap::new();
+        plq_mlxlm.insert("layers.0.self_attn.r_proj".to_string(), q4);
+        plq_mlxlm.insert("layers.0.mlp.switch_mlp.gate_proj".to_string(), q8);
+        plq_mlxlm.insert("layers.1.q_message_gate.message_gate_proj".to_string(), q8);
+        remap_inkling2_per_layer_quant(
+            &mut plq_mlxlm,
+            Inkling2CheckpointLayout::MlxLm,
+            &Inkling2StNormResult::default(),
+            &config,
+        )
+        .unwrap();
+        assert_eq!(plq_mlxlm.get("layers.0.self_attn.rel_proj"), Some(&q4));
+        assert_eq!(plq_mlxlm.get("layers.0.mlp.experts.gate_proj"), Some(&q8));
+        assert_eq!(plq_mlxlm.get("layers.1.loop_ctrl.q.gain_proj"), Some(&q8));
+    }
+
+    #[test]
+    fn release_modelopt_2d_nvfp4_and_wrapped_canonical_interleaved_and_loop_query_validation() {
+        let cfg = Inkling2Config::from_json_str(
+            &serde_json::json!({
+                "hidden_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 16,
+                "d_rel": 8,
+                "rel_extent": 16,
+                "sconv_kernel_size": 4,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "n_layers_per_attn_res_block": 1,
+                "layer_types": ["sliding_attention", "full_attention"],
+                "loop_config": { "core_start": 1, "core_end": 2, "num_passes": 2, "gate_rank": 4 },
+                "gate_up_interleaved": true
+            })
+            .to_string(),
+            false,
+        )
+        .unwrap();
+
+        // 1. Release ModelOpt 2-D NVFP4 (`Uint8` .weight + `Uint8` .weight_scale + .weight_scale_2)
+        // must normalize `.weight` -> Uint32, `.weight_scale` -> `.scales`, infer PerLayerMode::Nvfp4
+        // without explicit MLX quantization config, and apply `.weight_scale_2` directly (NO / 2688).
+        let mut raw_release = HashMap::new();
+        raw_release.insert(
+            "model.llm.embed.weight".to_string(),
+            MxArray::zeros(&[16, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        // 32x32 FP4 = 32x16 U8 bytes (0x22 = two 1.0 FP4 values), 32x2 U8 scales (0x38 = 1.0 E4M3)
+        raw_release.insert(
+            "model.llm.layers.0.attn.wo_ud.weight".to_string(),
+            MxArray::from_uint8(&vec![0x22u8; 32 * 16], &[32, 16]).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.wo_ud.weight_scale".to_string(),
+            MxArray::from_uint8(&[0x38u8; 32 * 2], &[32, 2]).unwrap(),
+        );
+        raw_release.insert(
+            "model.llm.layers.0.attn.wo_ud.weight_scale_2".to_string(),
+            MxArray::from_float32(&[0.25], &[1]).unwrap(),
+        );
+        assert_eq!(
+            detect_inkling2_safetensors_layout(&raw_release),
+            Inkling2CheckpointLayout::Release
+        );
+        let mut params = strip_inkling2_wrapper_prefixes(raw_release);
+        normalize_inkling2_safetensors_params(&mut params, Inkling2CheckpointLayout::Release, &cfg)
+            .unwrap();
+        assert_eq!(
+            params["layers.0.self_attn.o_proj.weight"].dtype().unwrap(),
+            DType::Uint32
+        );
+        assert!(params.contains_key("layers.0.self_attn.o_proj.scales"));
+        assert!(params.contains_key("layers.0.self_attn.o_proj.weight_scale_2"));
+
+        let mut plq = HashMap::new();
+        infer_unregistered_2d_fp_quant_overrides(&params, &mut plq).unwrap();
+        assert_eq!(
+            plq.get("layers.0.self_attn.o_proj").map(|p| p.mode),
+            Some(PerLayerMode::Nvfp4)
+        );
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: Default::default(),
+            input_amax: None,
+        };
+        let mut o_proj = LinearProj::Standard(Linear::new(32, 32, Some(false)).unwrap());
+        load_linear_proj_quantized_or_bf16(
+            &mut o_proj,
+            &params,
+            "layers.0.self_attn.o_proj",
+            &plq,
+            default_plq,
+            FAMILY_NAME,
+        )
+        .unwrap();
+        let x = MxArray::ones(&[1, 32], Some(DType::Float32)).unwrap();
+        let y = o_proj.forward(&x).unwrap().to_float32().unwrap();
+        // 32 * 1.0 * 1.0 * 0.25 = 8.0 (proves weight_scale_2 applied directly without / 2688.0!)
+        assert!(
+            y.iter().all(|&v| (v - 8.0).abs() < 1e-3),
+            "Release ModelOpt NVFP4 2D o_proj got {}",
+            y[0]
+        );
+
+        // 2. Canonical checkpoint wrapped under `language_model.model.*` with fused interleaved
+        // `gate_up_proj` must NOT be misclassified as MlxLm or overwrite explicit `gate_up_interleaved = true`.
+        let mut raw_wrapped_canon = HashMap::new();
+        raw_wrapped_canon.insert(
+            "language_model.model.layers.0.self_attn.k_conv.weight".to_string(),
+            MxArray::zeros(&[32, 4], Some(DType::Float32)).unwrap(),
+        );
+        raw_wrapped_canon.insert(
+            "language_model.model.layers.0.mlp.experts.gate_up_proj.weight".to_string(),
+            MxArray::zeros(&[2, 32, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        assert_eq!(
+            detect_inkling2_safetensors_layout(&raw_wrapped_canon),
+            Inkling2CheckpointLayout::Canonical
+        );
+        let mut p_canon = strip_inkling2_wrapper_prefixes(raw_wrapped_canon);
+        let norm_canon = normalize_inkling2_safetensors_params(
+            &mut p_canon,
+            Inkling2CheckpointLayout::Canonical,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(norm_canon.gate_up_interleaved, None);
+
+        // Even wrapper-only `language_model.model.*` without split experts returns None (preserves config).
+        let mut raw_wrapper_only = HashMap::new();
+        raw_wrapper_only.insert(
+            "language_model.model.layers.0.mlp.experts.gate_up_proj.weight".to_string(),
+            MxArray::zeros(&[2, 32, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        let det_wo = detect_inkling2_safetensors_layout(&raw_wrapper_only);
+        let mut p_wo = strip_inkling2_wrapper_prefixes(raw_wrapper_only);
+        let norm_wo = normalize_inkling2_safetensors_params(&mut p_wo, det_wo, &cfg).unwrap();
+        assert_eq!(norm_wo.gate_up_interleaved, None);
+
+        // Mixed `MlxVlm` checkpoint (layer 0 fused interleaved + layer 1 split `switch_mlp`):
+        // checkpoint-level `gate_up_interleaved` stays `Some(true)` for fused layer 0, while
+        // `load_expert_gate_up` resolves split layer 1 to `effective_gate_up_interleaved == false`!
+        let mut raw_mixed_vlm = HashMap::new();
+        raw_mixed_vlm.insert(
+            "model.language_model.layers.0.post_attention_convolution.conv1d.weight".to_string(),
+            MxArray::zeros(&[32, 4, 1], Some(DType::Float32)).unwrap(),
+        );
+        raw_mixed_vlm.insert(
+            "model.language_model.layers.0.mlp.experts.gate_up_proj.weight".to_string(),
+            MxArray::zeros(&[2, 32, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        raw_mixed_vlm.insert(
+            "model.language_model.layers.1.mlp.switch_mlp.gate_proj.weight".to_string(),
+            MxArray::zeros(&[2, 16, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        raw_mixed_vlm.insert(
+            "model.language_model.layers.1.mlp.switch_mlp.up_proj.weight".to_string(),
+            MxArray::zeros(&[2, 16, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        let det_mixed = detect_inkling2_safetensors_layout(&raw_mixed_vlm);
+        assert_eq!(
+            det_mixed,
+            Inkling2CheckpointLayout::MlxVlm,
+            "mixed MlxVlm checkpoint must be detected as MlxVlm, not MlxLm"
+        );
+        let mut p_mixed = strip_inkling2_wrapper_prefixes(raw_mixed_vlm);
+        let norm_mixed =
+            normalize_inkling2_safetensors_params(&mut p_mixed, det_mixed, &cfg).unwrap();
+        assert_eq!(norm_mixed.gate_up_interleaved, Some(true));
+        let empty_plq = HashMap::new();
+        let (_, il_l0) =
+            load_expert_gate_up(&p_mixed, "layers.0", &empty_plq, default_plq, true).unwrap();
+        let (_, il_l1) =
+            load_expert_gate_up(&p_mixed, "layers.1", &empty_plq, default_plq, true).unwrap();
+        assert!(il_l0, "fused layer 0 must preserve interleaved=true");
+        assert!(!il_l1, "split layer 1 must force interleaved=false");
+
+        // Fused oMLX ModelOpt `.weight_scale` + packed `Uint8` normalizes to `.scales` + `Uint32`.
+        let mut raw_omlx_fused_q = HashMap::new();
+        raw_omlx_fused_q.insert(
+            "model.embed.weight".to_string(),
+            MxArray::zeros(&[16, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        // k_dim (32) + taps (8) = 40 rows; K=32 -> U8 [40, 16], weight_scale [40, 2]
+        raw_omlx_fused_q.insert(
+            "model.layers.1.attn.k_proj.weight".to_string(),
+            MxArray::from_uint8(&vec![0x22u8; 40 * 16], &[40, 16]).unwrap(),
+        );
+        raw_omlx_fused_q.insert(
+            "model.layers.1.attn.k_proj.weight_scale".to_string(),
+            MxArray::from_uint8(&[0x38u8; 40 * 2], &[40, 2]).unwrap(),
+        );
+        let mut p_omlx_fq = strip_inkling2_wrapper_prefixes(raw_omlx_fused_q);
+        normalize_inkling2_safetensors_params(&mut p_omlx_fq, Inkling2CheckpointLayout::OMlx, &cfg)
+            .unwrap();
+        assert_eq!(
+            p_omlx_fq["layers.1.self_attn.k_proj.weight"]
+                .dtype()
+                .unwrap(),
+            DType::Uint32
+        );
+        assert!(p_omlx_fq.contains_key("layers.1.self_attn.k_proj.scales"));
+        assert!(p_omlx_fq.contains_key("layers.1.self_attn.k_conv_proj.scales"));
+
+        // 3. Top-level `message_input.query` with wrong core count fails loudly.
+        let mut bad_q = HashMap::new();
+        bad_q.insert(
+            "language_model.model.message_input.query".to_string(),
+            MxArray::zeros(&[3, 4, 32], Some(DType::Float32)).unwrap(),
+        );
+        let mut bad_p = strip_inkling2_wrapper_prefixes(bad_q);
+        let err = normalize_inkling2_safetensors_params(
+            &mut bad_p,
+            Inkling2CheckpointLayout::MlxLm,
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(err.reason.contains("expected [1, 4, 32]"), "{err}");
+
+        // 4. Canonical layout with top-level `message_input.query` still expands into core layers,
+        // and explicit per-layer `loop_msg_query.weight` wins deterministically when both coexist.
+        let mut canon_top_q = HashMap::new();
+        canon_top_q.insert(
+            "layers.0.self_attn.k_conv.weight".to_string(),
+            MxArray::zeros(&[32, 4], Some(DType::Float32)).unwrap(),
+        );
+        canon_top_q.insert(
+            "message_input.query".to_string(),
+            MxArray::from_float32(&vec![2.0f32; 4 * 32], &[1, 4, 32]).unwrap(),
+        );
+        assert_eq!(
+            detect_inkling2_safetensors_layout(&canon_top_q),
+            Inkling2CheckpointLayout::Canonical
+        );
+        normalize_inkling2_safetensors_params(
+            &mut canon_top_q,
+            Inkling2CheckpointLayout::Canonical,
+            &cfg,
+        )
+        .unwrap();
+        assert!(canon_top_q.contains_key("layers.1.loop_msg_query.weight"));
+        assert_eq!(
+            canon_top_q["layers.1.loop_msg_query.weight"]
+                .to_float32()
+                .unwrap()[0],
+            2.0
+        );
+
+        // Coexistence: explicit per-layer `layers.1.loop_msg_query.weight` (5.0) wins over global (2.0)!
+        let mut canon_coexist = HashMap::new();
+        canon_coexist.insert(
+            "layers.0.self_attn.k_conv.weight".to_string(),
+            MxArray::zeros(&[32, 4], Some(DType::Float32)).unwrap(),
+        );
+        canon_coexist.insert(
+            "layers.1.loop_msg_query.weight".to_string(),
+            MxArray::from_float32(&vec![5.0f32; 4 * 32], &[4, 32]).unwrap(),
+        );
+        canon_coexist.insert(
+            "message_input.query".to_string(),
+            MxArray::from_float32(&vec![2.0f32; 4 * 32], &[1, 4, 32]).unwrap(),
+        );
+        normalize_inkling2_safetensors_params(
+            &mut canon_coexist,
+            Inkling2CheckpointLayout::Canonical,
+            &cfg,
+        )
+        .unwrap();
+        assert_eq!(
+            canon_coexist["layers.1.loop_msg_query.weight"]
+                .to_float32()
+                .unwrap()[0],
+            5.0
+        );
+
+        // 5. Release expert group with orphaned `weight_outer_scale_denominator` (missing `weight_amax`) fails loudly.
+        let mut orphan_rel = HashMap::new();
+        orphan_rel.insert(
+            "model.llm.embed.weight".to_string(),
+            MxArray::zeros(&[16, 32], Some(DType::BFloat16)).unwrap(),
+        );
+        orphan_rel.insert(
+            "model.llm.layers.0.mlp.experts.w13_weight_outer_scale_denominator".to_string(),
+            MxArray::from_float32(&[2688.0, 2688.0], &[2]).unwrap(),
+        );
+        let mut orphan_p = strip_inkling2_wrapper_prefixes(orphan_rel);
+        let orphan_err = normalize_inkling2_safetensors_params(
+            &mut orphan_p,
+            Inkling2CheckpointLayout::Release,
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(
+            orphan_err
+                .reason
+                .contains("orphaned outer_scale_denominator"),
+            "{orphan_err}"
+        );
+    }
+
+    #[test]
+    fn safetensors_all_4_vision_layouts_match_gguf_and_guard_quantized_or_corrupt() {
+        use crate::models::inkling2::vision::preprocess_dynamic_image;
+
+        // Tiny synthetic 1-block vision tower: hidden=8, heads=2 (head_dim=4), patch=2, merge=2,
+        // image_size=4 (posemb_grid=2 -> 4 pos rows), projection_dim=12.
+        let vcfg = Inkling2VisionConfig {
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            image_size: 4,
+            patch_size: 2,
+            spatial_merge_size: 2,
+            projection_dim: 12,
+            layer_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+        };
+        let cfg = Inkling2Config {
+            hidden_size: 12,
+            num_hidden_layers: 1,
+            num_physical_layers: Some(1),
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 4,
+            vocab_size: 16,
+            vision_config: Some(vcfg.clone()),
+            ..Inkling2Config::from_json_str(
+                r#"{"hidden_size":12,"num_hidden_layers":1,"num_attention_heads":2,"num_key_value_heads":2,"head_dim":4,"vocab_size":16}"#,
+                false,
+            )
+            .unwrap()
+        };
+
+        let fill = |shape: &[i64], seed: f32, dt: DType| -> MxArray {
+            let n: usize = shape.iter().map(|&x| x as usize).product();
+            let vals: Vec<f32> = (0..n)
+                .map(|i| ((i as f32 + seed) * 0.13).sin() * 0.25)
+                .collect();
+            let arr = MxArray::from_float32(&vals, shape).unwrap();
+            if dt == DType::Float32 {
+                arr
+            } else {
+                arr.astype(dt).unwrap()
+            }
+        };
+
+        // Patch weight in OIHW `[8, 3, 2, 2]` (GGUF) and HWC 2D `[8, 12]` (SafeTensors).
+        let patch_oihw = fill(&[8, 3, 2, 2], 1.0, DType::Float32);
+        let patch_hwc_2d = patch_oihw
+            .transpose(Some(&[0, 2, 3, 1]))
+            .unwrap()
+            .reshape(&[8, 12])
+            .unwrap();
+        let class_emb = fill(&[8], 2.0, DType::Float32);
+        let class_pos = fill(&[8], 3.0, DType::Float32);
+        let pos_emb = fill(&[4, 8], 4.0, DType::Float32);
+        let pre_ln_w = fill(&[8], 5.0, DType::Float32);
+        let pre_ln_b = fill(&[8], 6.0, DType::Float32);
+        let n1_w = fill(&[8], 7.0, DType::Float32);
+        let n1_b = fill(&[8], 8.0, DType::Float32);
+        let n2_w = fill(&[8], 9.0, DType::Float32);
+        let n2_b = fill(&[8], 10.0, DType::Float32);
+        let ls1 = fill(&[8], 11.0, DType::Float32);
+        let ls2 = fill(&[8], 12.0, DType::Float32);
+        let q_w = fill(&[8, 8], 13.0, DType::BFloat16);
+        let q_b = fill(&[8], 14.0, DType::Float32);
+        let k_w = fill(&[8, 8], 15.0, DType::BFloat16);
+        let k_b = fill(&[8], 16.0, DType::Float32);
+        let v_w = fill(&[8, 8], 17.0, DType::BFloat16);
+        let v_b = fill(&[8], 18.0, DType::Float32);
+        let o_w = fill(&[8, 8], 19.0, DType::BFloat16);
+        let o_b = fill(&[8], 20.0, DType::Float32);
+        let fc1_w = fill(&[16, 8], 21.0, DType::BFloat16);
+        let fc1_b = fill(&[16], 22.0, DType::Float32);
+        let fc2_w = fill(&[8, 16], 23.0, DType::BFloat16);
+        let fc2_b = fill(&[8], 24.0, DType::Float32);
+        let p1_w = fill(&[32, 32], 25.0, DType::BFloat16);
+        let p2_w = fill(&[12, 32], 26.0, DType::BFloat16);
+
+        // Reference canonical GGUF params
+        let mut gguf_params = HashMap::new();
+        gguf_params.insert("vision_tower.class_embedding".into(), class_emb.clone());
+        gguf_params.insert(
+            "vision_tower.class_position_embedding.weight".into(),
+            class_pos.clone(),
+        );
+        gguf_params.insert("vision_tower.patch_embed.weight".into(), patch_oihw.clone());
+        gguf_params.insert(
+            "vision_tower.position_embedding.weight".into(),
+            pos_emb.clone(),
+        );
+        gguf_params.insert("vision_tower.pre_ln.weight".into(), pre_ln_w.clone());
+        gguf_params.insert("vision_tower.pre_ln.bias".into(), pre_ln_b.clone());
+        gguf_params.insert("vision_tower.blocks.0.norm1.weight".into(), n1_w.clone());
+        gguf_params.insert("vision_tower.blocks.0.norm1.bias".into(), n1_b.clone());
+        gguf_params.insert("vision_tower.blocks.0.norm2.weight".into(), n2_w.clone());
+        gguf_params.insert("vision_tower.blocks.0.norm2.bias".into(), n2_b.clone());
+        gguf_params.insert("vision_tower.blocks.0.ls1.weight".into(), ls1.clone());
+        gguf_params.insert("vision_tower.blocks.0.ls2.weight".into(), ls2.clone());
+        gguf_params.insert(
+            "vision_tower.blocks.0.attn.q_proj.weight".into(),
+            q_w.clone(),
+        );
+        gguf_params.insert("vision_tower.blocks.0.attn.q_proj.bias".into(), q_b.clone());
+        gguf_params.insert(
+            "vision_tower.blocks.0.attn.k_proj.weight".into(),
+            k_w.clone(),
+        );
+        gguf_params.insert("vision_tower.blocks.0.attn.k_proj.bias".into(), k_b.clone());
+        gguf_params.insert(
+            "vision_tower.blocks.0.attn.v_proj.weight".into(),
+            v_w.clone(),
+        );
+        gguf_params.insert("vision_tower.blocks.0.attn.v_proj.bias".into(), v_b.clone());
+        gguf_params.insert(
+            "vision_tower.blocks.0.attn.o_proj.weight".into(),
+            o_w.clone(),
+        );
+        gguf_params.insert("vision_tower.blocks.0.attn.o_proj.bias".into(), o_b.clone());
+        gguf_params.insert("vision_tower.blocks.0.mlp.fc1.weight".into(), fc1_w.clone());
+        gguf_params.insert("vision_tower.blocks.0.mlp.fc1.bias".into(), fc1_b.clone());
+        gguf_params.insert("vision_tower.blocks.0.mlp.fc2.weight".into(), fc2_w.clone());
+        gguf_params.insert("vision_tower.blocks.0.mlp.fc2.bias".into(), fc2_b.clone());
+        gguf_params.insert("vision_projector.fc1.weight".into(), p1_w.clone());
+        gguf_params.insert("vision_projector.fc2.weight".into(), p2_w.clone());
+
+        let ref_enc = build_vision_encoder(&vcfg, &gguf_params, 12).expect("build ref GGUF vision");
+        let mut test_img = image::RgbImage::new(4, 4);
+        for y in 0..4 {
+            for x in 0..4 {
+                test_img.put_pixel(
+                    x,
+                    y,
+                    image::Rgb([(x * 60) as u8, (y * 60) as u8, ((x + y) * 30) as u8]),
+                );
+            }
+        }
+        let prep = preprocess_dynamic_image(&image::DynamicImage::ImageRgb8(test_img), &vcfg)
+            .expect("preprocess");
+        let ref_out = ref_enc
+            .encode(&prep)
+            .unwrap()
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        // Build all 4 SafeTensors vision layouts and verify exact parity with GGUF reference!
+        let build_layout = |kind: &str| -> HashMap<String, MxArray> {
+            let mut m = HashMap::new();
+            let (owner, backbone, transformers_blocks, pos_has_weight, merger_proj) = match kind {
+                "transformers" => (
+                    "model.vision_tower.",
+                    "model.vision_tower.",
+                    true,
+                    true,
+                    true,
+                ),
+                "release" => (
+                    "model.visual.",
+                    "model.visual.backbone.",
+                    false,
+                    false,
+                    false,
+                ),
+                "omlx" => (
+                    "vision_tower.",
+                    "vision_tower.backbone.",
+                    false,
+                    false,
+                    false,
+                ),
+                "nvfp4" => ("vision_tower.", "vision_tower.", true, false, false),
+                _ => unreachable!(),
+            };
+            m.insert(
+                format!("{backbone}embeddings.class_embedding"),
+                class_emb.clone(),
+            );
+            m.insert(
+                format!("{backbone}embeddings.cls_position_embedding"),
+                class_pos.clone(),
+            );
+            m.insert(
+                if pos_has_weight {
+                    format!("{backbone}embeddings.position_embedding.weight")
+                } else {
+                    format!("{backbone}embeddings.position_embedding")
+                },
+                pos_emb.clone(),
+            );
+            m.insert(
+                format!("{backbone}embeddings.patch_embedding.weight"),
+                patch_hwc_2d.clone(),
+            );
+            let pre_ln = if transformers_blocks {
+                "pre_layernorm"
+            } else {
+                "ln_pre"
+            };
+            m.insert(format!("{backbone}{pre_ln}.weight"), pre_ln_w.clone());
+            m.insert(format!("{backbone}{pre_ln}.bias"), pre_ln_b.clone());
+            let (ln1, ln2, l1, l2, f1, f2) = if transformers_blocks {
+                (
+                    "layernorm_before",
+                    "layernorm_after",
+                    "lambda_1",
+                    "lambda_2",
+                    "fc1",
+                    "fc2",
+                )
+            } else {
+                ("ln_1", "ln_2", "ls_1.gamma", "ls_2.gamma", "c_fc", "c_proj")
+            };
+            m.insert(format!("{backbone}layers.0.{ln1}.weight"), n1_w.clone());
+            m.insert(format!("{backbone}layers.0.{ln1}.bias"), n1_b.clone());
+            m.insert(format!("{backbone}layers.0.{ln2}.weight"), n2_w.clone());
+            m.insert(format!("{backbone}layers.0.{ln2}.bias"), n2_b.clone());
+            m.insert(format!("{backbone}layers.0.{l1}"), ls1.clone());
+            m.insert(format!("{backbone}layers.0.{l2}"), ls2.clone());
+            m.insert(
+                format!("{backbone}layers.0.self_attn.q_proj.weight"),
+                q_w.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.q_proj.bias"),
+                q_b.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.k_proj.weight"),
+                k_w.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.k_proj.bias"),
+                k_b.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.v_proj.weight"),
+                v_w.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.v_proj.bias"),
+                v_b.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.out_proj.weight"),
+                o_w.clone(),
+            );
+            m.insert(
+                format!("{backbone}layers.0.self_attn.out_proj.bias"),
+                o_b.clone(),
+            );
+            m.insert(format!("{backbone}layers.0.mlp.{f1}.weight"), fc1_w.clone());
+            m.insert(format!("{backbone}layers.0.mlp.{f1}.bias"), fc1_b.clone());
+            m.insert(format!("{backbone}layers.0.mlp.{f2}.weight"), fc2_w.clone());
+            m.insert(format!("{backbone}layers.0.mlp.{f2}.bias"), fc2_b.clone());
+            if merger_proj {
+                m.insert(format!("{owner}merger.linear_1.weight"), p1_w.clone());
+                m.insert(format!("{owner}merger.linear_2.weight"), p2_w.clone());
+            } else {
+                m.insert(format!("{owner}proj_in.weight"), p1_w.clone());
+                m.insert(format!("{owner}proj_out.weight"), p2_w.clone());
+            }
+            m
+        };
+
+        for layout_name in ["transformers", "release", "omlx", "nvfp4"] {
+            let raw = build_layout(layout_name);
+            let mut stripped = strip_inkling2_wrapper_prefixes(raw);
+            normalize_inkling2_vision_params(&mut stripped, &cfg)
+                .unwrap_or_else(|e| panic!("normalize {layout_name}: {e}"));
+            let enc = build_vision_encoder(&vcfg, &stripped, 12)
+                .unwrap_or_else(|e| panic!("build {layout_name}: {e}"));
+            let got = enc
+                .encode(&prep)
+                .unwrap()
+                .astype(DType::Float32)
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            assert_eq!(got.len(), ref_out.len(), "{layout_name}: output len");
+            for (i, (&g, &r)) in got.iter().zip(ref_out.iter()).enumerate() {
+                assert!(
+                    (g - r).abs() < 1e-4,
+                    "{layout_name}: mismatch at {i}: got {g}, ref {r}"
+                );
+            }
+        }
+
+        // Quantized vision guard rejects `.scales` and `.weight_scale` across vision prefixes.
+        for qkey in [
+            "model.vision_tower.layers.0.self_attn.q_proj.scales",
+            "vision_tower.backbone.layers.0.mlp.c_fc.weight_scale",
+            "model.visual.proj_in.scales",
+        ] {
+            let mut raw = build_layout("transformers");
+            raw.insert(
+                qkey.to_string(),
+                MxArray::zeros(&[8, 1], Some(DType::Float16)).unwrap(),
+            );
+            let mut stripped = strip_inkling2_wrapper_prefixes(raw);
+            let err = normalize_inkling2_vision_params(&mut stripped, &cfg)
+                .expect_err("quantized vision must be rejected");
+            assert!(
+                err.reason.contains("quantized"),
+                "expected quantized error for {qkey}, got {err}"
+            );
+        }
+
+        // End-to-end `load_weights_sync` graceful text-only fallback on quantized & corrupt vision.
+        let write_tiny_st_dir = |tag: &str, mut extra: HashMap<String, MxArray>| -> TempDirGuard {
+            let dir = TempDirGuard::new(tag);
+            fs::create_dir_all(&dir.0).unwrap();
+            let config_json = serde_json::json!({
+                "model_type": "inkling2",
+                "hidden_size": 12,
+                "num_hidden_layers": 1,
+                "num_physical_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 4,
+                "vocab_size": 16,
+                "unpadded_vocab_size": 16,
+                "d_rel": 4,
+                "rel_extent": 8,
+                "sconv_kernel_size": 4,
+                "n_layers_per_attn_res_block": 2,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 8,
+                "vision_config": {
+                    "hidden_size": 8,
+                    "intermediate_size": 16,
+                    "num_hidden_layers": 1,
+                    "num_attention_heads": 2,
+                    "image_size": 4,
+                    "patch_size": 2,
+                    "spatial_merge_size": 2,
+                    "projection_dim": 12
+                }
+            });
+            fs::write(
+                dir.0.join("config.json"),
+                serde_json::to_string_pretty(&config_json).unwrap(),
+            )
+            .unwrap();
+
+            let mut w: HashMap<String, MxArray> = HashMap::new();
+            w.insert(
+                "embed_tokens.weight".into(),
+                MxArray::zeros(&[16, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "embed_norm.weight".into(),
+                MxArray::ones(&[12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "output_res_query.weight".into(),
+                MxArray::zeros(&[1, 12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "norm.weight".into(),
+                MxArray::ones(&[12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "lm_head.weight".into(),
+                MxArray::zeros(&[16, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            // Layer 0 (local: n_layers_per_attn_res_block=2 -> phys 0 is local)
+            w.insert(
+                "layers.0.ffn_res_query.weight".into(),
+                MxArray::zeros(&[1, 12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.input_layernorm.weight".into(),
+                MxArray::ones(&[12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.post_attention_layernorm.weight".into(),
+                MxArray::ones(&[12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.q_proj.weight".into(),
+                MxArray::zeros(&[8, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.k_proj.weight".into(),
+                MxArray::zeros(&[8, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.v_proj.weight".into(),
+                MxArray::zeros(&[8, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.rel_proj.weight".into(),
+                MxArray::zeros(&[8, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.gate_proj.weight".into(),
+                MxArray::zeros(&[8, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.sink_proj.weight".into(),
+                MxArray::zeros(&[2, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.o_proj.weight".into(),
+                MxArray::zeros(&[12, 8], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.k_conv.weight".into(),
+                MxArray::zeros(&[8, 4], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.v_conv.weight".into(),
+                MxArray::zeros(&[8, 4], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.post_conv.weight".into(),
+                MxArray::zeros(&[12, 4], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.q_clip.weight".into(),
+                MxArray::ones(&[8], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.rel_clip.weight".into(),
+                MxArray::ones(&[8], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.self_attn.rel_bias.weight".into(),
+                MxArray::zeros(&[8, 4], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.mlp.gate.weight".into(),
+                MxArray::zeros(&[2, 12], Some(DType::Float32)).unwrap(),
+            );
+            w.insert(
+                "layers.0.mlp.experts.gate_up_proj.weight".into(),
+                MxArray::zeros(&[2, 16, 12], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.mlp.experts.down_proj.weight".into(),
+                MxArray::zeros(&[2, 12, 8], Some(DType::BFloat16)).unwrap(),
+            );
+            w.insert(
+                "layers.0.mlp.post_conv.weight".into(),
+                MxArray::zeros(&[12, 4], Some(DType::Float32)).unwrap(),
+            );
+            for (k, v) in extra.drain() {
+                w.insert(k, v);
+            }
+            crate::utils::safetensors::save_safetensors(
+                dir.0.join("model.safetensors"),
+                &mut w,
+                None,
+            )
+            .unwrap();
+            dir
+        };
+
+        // Case A: quantized vision tower -> falls back cleanly to text-only (`vision_encoder == None`, `vision_config == None`).
+        let mut q_vis = build_layout("transformers");
+        q_vis.insert(
+            "model.vision_tower.layers.0.self_attn.q_proj.scales".into(),
+            MxArray::ones(&[8, 1], Some(DType::Float16)).unwrap(),
+        );
+        let dir_q = write_tiny_st_dir("vis-quant-fallback", q_vis);
+        let loaded_q = load_weights_sync(&dir_q.0, None, None, false)
+            .expect("quantized vision must fall back to text-only");
+        assert!(loaded_q.vision_encoder.is_none());
+        assert!(loaded_q.config.vision_config.is_none());
+
+        // Case B: missing vision tensor -> falls back cleanly to text-only.
+        let mut broken_vis = build_layout("omlx");
+        broken_vis.remove("vision_tower.proj_out.weight");
+        let dir_broken = write_tiny_st_dir("vis-broken-fallback", broken_vis);
+        let loaded_broken = load_weights_sync(&dir_broken.0, None, None, false)
+            .expect("incomplete vision tower must fall back to text-only");
+        assert!(loaded_broken.vision_encoder.is_none());
+        assert!(loaded_broken.config.vision_config.is_none());
+
+        // Case C: valid Transformers vision tower loads end-to-end with `vision_encoder.is_some()`.
+        let dir_ok = write_tiny_st_dir("vis-ok", build_layout("transformers"));
+        let loaded_ok = load_weights_sync(&dir_ok.0, None, None, false)
+            .expect("valid Transformers vision tower must load");
+        assert!(loaded_ok.vision_encoder.is_some());
+        assert!(loaded_ok.config.vision_config.is_some());
+    }
+
+    #[test]
+    fn omlx_split_mxfp_attention_projections_preserve_outer_scale_and_reject_nvfp4_sidecars() {
+        use crate::models::quant_dispatch::KQuantLayout;
+
+        // Tiny 1-layer local Inkling2 config with hidden_size=32 (aligned to MXFP group_size=32):
+        // q_dim = 2*8 = 16, kv_dim = 1*8 = 8, rel_dim = 2*4 = 8, sink = 2 -> fused attn.in_proj rows = 16+8+8+8+16+2 = 58.
+        let cfg = Inkling2Config::from_json_str(
+            &serde_json::json!({
+                "hidden_size": 32,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 8,
+                "d_rel": 4,
+                "rel_extent": 16,
+                "sconv_kernel_size": 4,
+                "num_experts": 2,
+                "num_experts_per_tok": 1,
+                "moe_intermediate_size": 16,
+                "n_layers_per_attn_res_block": 1,
+                "layer_types": ["sliding_attention"]
+            })
+            .to_string(),
+            false,
+        )
+        .unwrap();
+
+        let d = 32usize;
+        let in_proj_rows = 16 + 8 + 8 + 8 + 16 + 2; // 58
+        let outer_val = 2.5f32;
+        let x = MxArray::ones(&[1, d as i64], Some(DType::BFloat16)).unwrap();
+        let default_plq = PerLayerQuant {
+            bits: 8,
+            group_size: 32,
+            mode: PerLayerMode::Affine,
+            layout: KQuantLayout::RowMajor,
+            input_amax: None,
+        };
+
+        for (mode, gs, bits, w_last, w_word) in [
+            (PerLayerMode::Mxfp4, 32, 4, d / 8, 0x2222_2222u32), // all nibbles = 0x2 (+1.0)
+            (PerLayerMode::Mxfp8, 32, 8, d / 4, 0x3838_3838u32), // all bytes = 0x38 (+1.0)
+        ] {
+            let mut raw = HashMap::new();
+            raw.insert(
+                "model.embed.weight".to_string(),
+                MxArray::zeros(&[16, d as i64], Some(DType::BFloat16)).unwrap(),
+            );
+            raw.insert(
+                "model.layers.0.attn.in_proj.weight".to_string(),
+                MxArray::from_uint32(
+                    &vec![w_word; in_proj_rows * w_last],
+                    &[in_proj_rows as i64, w_last as i64],
+                )
+                .unwrap(),
+            );
+            raw.insert(
+                "model.layers.0.attn.in_proj.scales".to_string(),
+                MxArray::from_uint8(
+                    &vec![127u8; in_proj_rows * (d / 32)],
+                    &[in_proj_rows as i64, (d / 32) as i64],
+                )
+                .unwrap(),
+            );
+            raw.insert(
+                "model.layers.0.attn.in_proj.scale".to_string(),
+                MxArray::from_float32(&[outer_val], &[1]).unwrap(),
+            );
+
+            assert_eq!(
+                detect_inkling2_safetensors_layout(&raw),
+                Inkling2CheckpointLayout::OMlx
+            );
+            let mut params = strip_inkling2_wrapper_prefixes(raw);
+            let norm = normalize_inkling2_safetensors_params(
+                &mut params,
+                Inkling2CheckpointLayout::OMlx,
+                &cfg,
+            )
+            .unwrap();
+            assert!(norm.omlx_fused_in_proj.contains(&0));
+
+            let plq = PerLayerQuant {
+                bits,
+                group_size: gs,
+                mode,
+                layout: KQuantLayout::RowMajor,
+                input_amax: None,
+            };
+            let mut per_layer_quant = HashMap::new();
+            per_layer_quant.insert("layers.0.attn.in_proj".to_string(), plq);
+            remap_inkling2_per_layer_quant(
+                &mut per_layer_quant,
+                Inkling2CheckpointLayout::OMlx,
+                &norm,
+                &cfg,
+            )
+            .unwrap();
+
+            for (sub, out_f) in [
+                ("q_proj", 16usize),
+                ("k_proj", 8),
+                ("v_proj", 8),
+                ("rel_proj", 8),
+                ("gate_proj", 16),
+                ("sink_proj", 2),
+            ] {
+                let base = format!("layers.0.self_attn.{sub}");
+                let mut proj =
+                    LinearProj::Standard(Linear::new(d as u32, out_f as u32, Some(false)).unwrap());
+                load_inkling2_linear_proj(&mut proj, &params, &base, &per_layer_quant, default_plq)
+                    .unwrap();
+                proj.try_compact_symmetric_q8_or_promote_f32(DType::BFloat16)
+                    .unwrap();
+
+                match &proj {
+                    LinearProj::Quantized(ql) => {
+                        let s = ql
+                            .outer_scale()
+                            .unwrap_or_else(|| panic!("{mode:?} {sub} lost outer_scale"))
+                            .to_float32()
+                            .unwrap();
+                        assert!(
+                            (s[0] - outer_val).abs() < 1e-5,
+                            "{mode:?} {sub}: expected outer_scale {outer_val}, got {}",
+                            s[0]
+                        );
+                    }
+                    LinearProj::Standard(_) => panic!("{mode:?} {sub} must stay Quantized"),
+                }
+
+                // Weight is all +1.0, x is all +1.0 (len=32), outer_scale=2.5 -> output = 32 * 2.5 = 80.0.
+                let y = proj.forward(&x).unwrap();
+                let vals = y.to_float32().unwrap();
+                assert_eq!(vals.len(), out_f);
+                for (idx, &v) in vals.iter().enumerate() {
+                    assert!(
+                        (v - 80.0).abs() < 1e-2,
+                        "{mode:?} {sub}[{idx}]: expected 80.0 (32 * 2.5), got {v}"
+                    );
+                }
+            }
+
+            // Confirm QuantizedLinear::concat_rows refuses to fuse projections with outer_scale
+            // (so Inkling2Attention::try_fuse_projections can never silently drop outer_scale).
+            let mut q_p = LinearProj::Standard(Linear::new(d as u32, 16, Some(false)).unwrap());
+            let mut k_p = LinearProj::Standard(Linear::new(d as u32, 8, Some(false)).unwrap());
+            load_inkling2_linear_proj(
+                &mut q_p,
+                &params,
+                "layers.0.self_attn.q_proj",
+                &per_layer_quant,
+                default_plq,
+            )
+            .unwrap();
+            load_inkling2_linear_proj(
+                &mut k_p,
+                &params,
+                "layers.0.self_attn.k_proj",
+                &per_layer_quant,
+                default_plq,
+            )
+            .unwrap();
+            if let (LinearProj::Quantized(q_ql), LinearProj::Quantized(k_ql)) = (&q_p, &k_p) {
+                assert!(
+                    q_ql.concat_rows(k_ql).unwrap().is_none(),
+                    "{mode:?}: concat_rows must decline fusion when outer_scale is present"
+                );
+            }
+
+            // Unsupported NVFP4-only `.global_scale` on MXFP4/MXFP8 must fail loudly.
+            let mut bad_params = params.clone();
+            bad_params.insert(
+                "layers.0.self_attn.q_proj.global_scale".to_string(),
+                MxArray::from_float32(&[5376.0], &[1]).unwrap(),
+            );
+            let mut bad_proj =
+                LinearProj::Standard(Linear::new(d as u32, 16, Some(false)).unwrap());
+            let err = load_inkling2_linear_proj(
+                &mut bad_proj,
+                &bad_params,
+                "layers.0.self_attn.q_proj",
+                &per_layer_quant,
+                default_plq,
+            )
+            .expect_err("NVFP4-only global_scale on MXFP projection must fail loudly");
+            assert!(
+                err.reason.contains("unsupported NVFP4 outer scale tensor"),
+                "unexpected error: {}",
+                err.reason
+            );
+        }
+
+        // Dense projection with scalar `.scale` also folds the scale instead of dropping it.
+        let mut dense_params = HashMap::new();
+        dense_params.insert(
+            "layers.0.self_attn.o_proj.weight".to_string(),
+            MxArray::ones(&[8, d as i64], Some(DType::BFloat16)).unwrap(),
+        );
+        dense_params.insert(
+            "layers.0.self_attn.o_proj.scale".to_string(),
+            MxArray::from_float32(&[outer_val], &[1]).unwrap(),
+        );
+        let mut dense_proj = LinearProj::Standard(Linear::new(d as u32, 8, Some(false)).unwrap());
+        load_inkling2_linear_proj(
+            &mut dense_proj,
+            &dense_params,
+            "layers.0.self_attn.o_proj",
+            &HashMap::new(),
+            default_plq,
+        )
+        .unwrap();
+        let dense_y = dense_proj.forward(&x).unwrap().to_float32().unwrap();
+        assert!(
+            dense_y.iter().all(|&v| (v - 80.0).abs() < 1e-1),
+            "dense o_proj with .scale=2.5 must produce 80.0, got {:?}",
+            dense_y.as_ref()
+        );
     }
 }

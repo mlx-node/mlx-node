@@ -13,11 +13,12 @@ afterAll(() => rmSync(tmp, { recursive: true, force: true }));
 // chmod 000 yields EACCES only on POSIX for a non-root user.
 const canChmod = process.platform !== 'win32' && process.getuid?.() !== 0;
 
-function minimalGguf(architecture: string): Buffer {
+function minimalGguf(architecture: string, extraStrings: Record<string, string> = {}): Buffer {
+  const entries = [['general.architecture', architecture] as const, ...Object.entries(extraStrings)];
   const header = Buffer.alloc(24);
   header.write('GGUF');
   header.writeUInt32LE(3, 4);
-  header.writeBigUInt64LE(1n, 16);
+  header.writeBigUInt64LE(BigInt(entries.length), 16);
   const string = (value: string): Buffer => {
     const bytes = Buffer.from(value);
     const length = Buffer.alloc(8);
@@ -26,7 +27,7 @@ function minimalGguf(architecture: string): Buffer {
   };
   const stringType = Buffer.alloc(4);
   stringType.writeUInt32LE(8);
-  return Buffer.concat([header, string('general.architecture'), stringType, string(architecture)]);
+  return Buffer.concat([header, ...entries.flatMap(([key, value]) => [string(key), stringType, string(value)])]);
 }
 
 /** Write `files` (path → contents) under a fresh `<tmp>/<name>` models dir; returns the dir. */
@@ -1041,5 +1042,114 @@ describe('bareGgufFamily — a GGUF with no config.json beside it', () => {
     expect(bareGgufFamily('gemma-4-UD-Q4_K_XL.gguf', 'gemma4')).toBeUndefined();
     expect(bareGgufFamily('Model-Q4_K_M.gguf', 'llama')).toBeUndefined();
     expect(bareGgufFamily('Hy4-flash-Q4_K_M-00002-of-00002.gguf', 'hy_v4_flash')).toBeUndefined();
+  });
+});
+
+describe('discoverLocalChatModels — per-checkpoint Qwen3.5/3.6 vs Qwen3.8 reasoningEfforts', () => {
+  const QWEN36_TEMPLATE = '{%- if enable_thinking is false -%}<think>\n\n</think>{%- endif -%}';
+  const QWEN38_TEMPLATE = "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}";
+  const BINARY = [
+    { value: 'none', label: 'Off' },
+    { value: 'high', label: 'High', default: true },
+  ];
+  const FIVE_LEVEL = [
+    { value: 'none', label: 'Off' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High', default: true },
+    { value: 'xhigh', label: 'X-High' },
+  ];
+
+  function gpt2Gguf(architecture: string, opts: { chatTemplate: string; tokenTypes?: number[] }): Buffer {
+    const str = (value: string): Buffer => {
+      const bytes = Buffer.from(value, 'utf8');
+      const length = Buffer.alloc(8);
+      length.writeBigUInt64LE(BigInt(bytes.length));
+      return Buffer.concat([length, bytes]);
+    };
+    const u32 = (value: number): Buffer => {
+      const buf = Buffer.alloc(4);
+      buf.writeUInt32LE(value);
+      return buf;
+    };
+    const u64 = (value: number): Buffer => {
+      const buf = Buffer.alloc(8);
+      buf.writeBigUInt64LE(BigInt(value));
+      return buf;
+    };
+    const strArray = (items: string[]): Buffer => Buffer.concat([u32(9), u32(8), u64(items.length), ...items.map(str)]);
+    const i32Array = (items: number[]): Buffer => {
+      const payload = Buffer.alloc(items.length * 4);
+      items.forEach((value, idx) => payload.writeInt32LE(value, idx * 4));
+      return Buffer.concat([u32(9), u32(5), u64(items.length), payload]);
+    };
+    const tokenTypes = opts.tokenTypes ?? [1, 1];
+    const entries: Buffer[] = [
+      Buffer.concat([str('general.architecture'), u32(8), str(architecture)]),
+      Buffer.concat([str('tokenizer.ggml.model'), u32(8), str('gpt2')]),
+      Buffer.concat([str('tokenizer.ggml.tokens'), strArray(['a', 'b'])]),
+      Buffer.concat([str('tokenizer.ggml.token_type'), i32Array(tokenTypes)]),
+      Buffer.concat([str('tokenizer.ggml.merges'), strArray(['a b'])]),
+      Buffer.concat([str('tokenizer.chat_template'), u32(8), str(opts.chatTemplate)]),
+    ];
+    const header = Buffer.alloc(24);
+    header.write('GGUF');
+    header.writeUInt32LE(3, 4);
+    header.writeBigUInt64LE(BigInt(entries.length), 16);
+    return Buffer.concat([header, ...entries]);
+  }
+
+  it('resolves binary vs multi-level reasoningEfforts from chat_template.jinja, tokenizer_config.json, and GGUF metadata', async () => {
+    const dir = modelsDir('qwen35-vs-qwen38-efforts', {
+      'qwen36-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
+      'qwen36-mlx/chat_template.jinja': QWEN36_TEMPLATE,
+      'qwen38-mlx/config.json': JSON.stringify({ model_type: 'qwen3_5' }),
+      'qwen38-mlx/tokenizer_config.json': JSON.stringify({ chat_template: QWEN38_TEMPLATE }),
+      'qwen36-gguf/Qwen3.6-27B-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN36_TEMPLATE,
+      }),
+      'qwen38-gguf/Qwen3.8-27B-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN38_TEMPLATE,
+      }),
+      'qwen35-bare-gguf/Qwen3.5-9B-UD-Q4_K_XL.gguf': minimalGguf('qwen35'),
+    });
+
+    const found = await discoverLocalChatModels(dir);
+    const byName = new Map(found.map((model) => [model.name, model]));
+
+    expect(byName.get('qwen36-mlx')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('qwen38-mlx')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.6-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-27B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.5-9B-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+  });
+
+  it('mirrors native GGUF embedded GPT-2 tokenizer template overwrite precedence based on tokenizer.json presence', async () => {
+    const dir = modelsDir('qwen38-gguf-embedded-precedence', {
+      // No tokenizer.json: native write_embedded_gpt2_tokenizer overwrites sidecar template with GGUF template.
+      'no-tok-json/Qwen3.8-NoTok-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'no-tok-json/chat_template.jinja': QWEN36_TEMPLATE,
+      // With tokenizer.json: native skips write_embedded_gpt2_tokenizer, so sidecar template wins.
+      'with-tok-json/Qwen3.8-WithTok-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'with-tok-json/chat_template.jinja': QWEN36_TEMPLATE,
+      'with-tok-json/tokenizer.json': '{}',
+      // With tokenizer.json and NO template sidecars: native never extracts the GGUF template.
+      'with-tok-no-tpl/Qwen3.8-TokNoTpl-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', { chatTemplate: QWEN38_TEMPLATE }),
+      'with-tok-no-tpl/tokenizer.json': '{}',
+      // Mismatched tokens/token_type counts: embedded GPT-2 check fails, so sidecar template wins.
+      'bad-tok-len/Qwen3.8-BadLen-UD-Q4_K_XL.gguf': gpt2Gguf('qwen35', {
+        chatTemplate: QWEN38_TEMPLATE,
+        tokenTypes: [1],
+      }),
+      'bad-tok-len/chat_template.jinja': QWEN36_TEMPLATE,
+    });
+
+    const found = await discoverLocalChatModels(dir);
+    const byName = new Map(found.map((model) => [model.name, model]));
+
+    expect(byName.get('Qwen3.8-NoTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(FIVE_LEVEL);
+    expect(byName.get('Qwen3.8-WithTok-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-TokNoTpl-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
+    expect(byName.get('Qwen3.8-BadLen-UD-Q4_K_XL')?.traits.reasoningEfforts).toEqual(BINARY);
   });
 });

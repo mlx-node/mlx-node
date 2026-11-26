@@ -1183,6 +1183,7 @@ impl ChatBackend for K2Inner {
             think_end_str: Some(tag.to_string()),
             thinking_end: think_end_id.map_or_else(|| Arc::from([]), |id| Arc::from([id])),
             think_end_extra_ids,
+            think_open_id: None,
         }
     }
 

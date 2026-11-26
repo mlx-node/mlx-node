@@ -14,6 +14,7 @@
 #include "mlx/transforms_impl.h"
 
 #include <cstdio>
+#include <memory>
 #include <numeric>
 #include <sstream>
 
@@ -550,6 +551,31 @@ bool KQuantMatmulEpilogue::is_equivalent(const Primitive &other) const {
 std::vector<Shape>
 KQuantMatmulEpilogue::output_shapes(const std::vector<array> &inputs) {
   return {inputs[4].shape()};
+}
+
+bool KQuantQuantizePrefillInt8::is_equivalent(const Primitive &) const {
+  return true;
+}
+
+std::vector<Shape>
+KQuantQuantizePrefillInt8::output_shapes(const std::vector<array> &inputs) {
+  const auto &x = inputs[0];
+  const int K = x.shape(-1);
+  const int M = static_cast<int>(x.size() / K);
+  const int M_pad = ((M + 31) / 32) * 32;
+  const int U_pad = (((K / 32) + 15) / 16) * 16;
+  return {Shape{M_pad, K}, Shape{K / 64, M_pad}, Shape{M_pad, U_pad}};
+}
+
+bool KQuantMatmulInt8::is_equivalent(const Primitive &other) const {
+  const auto &o = static_cast<const KQuantMatmulInt8 &>(other);
+  return group_size_ == o.group_size_ && bits_ == o.bits_ && mode_ == o.mode_ &&
+         epilogue_ == o.epilogue_ && out_shape_ == o.out_shape_;
+}
+
+std::vector<Shape>
+KQuantMatmulInt8::output_shapes(const std::vector<array> &) {
+  return {out_shape_};
 }
 
 bool KQuantGatherQMM::is_equivalent(const Primitive &other) const {
@@ -1344,6 +1370,18 @@ void KQuantMatmulEpilogue::eval_cpu(const std::vector<array> &,
       "[quantized_matmul] The K-quant store epilogue runs on the GPU only.");
 }
 
+void KQuantQuantizePrefillInt8::eval_cpu(const std::vector<array> &,
+                                         std::vector<array> &) {
+  throw std::runtime_error(
+      "[kquant_quantize_prefill_int8] INT8 prefill quantization runs on the "
+      "Metal GPU only.");
+}
+
+void KQuantMatmulInt8::eval_cpu(const std::vector<array> &, array &) {
+  throw std::runtime_error(
+      "[kquant_matmul_int8] INT8 prefill matmul runs on the Metal GPU only.");
+}
+
 void KQuantGatherQMM::eval_cpu(const std::vector<array> &inputs, array &out) {
   validate_cpu_config("gather_qmm", mode_, inputs[0].dtype(), bits_,
                       group_size_);
@@ -1494,6 +1532,94 @@ bool mlx_kquant_store_epilogue_route(const char *mode, int m, int n, int k) {
            kquant::store_epilogue_route(parsed->mode, m, n, k);
   } catch (const std::exception &) {
     return false;
+  }
+}
+
+int mlx_kquant_quantize_prefill_int8(mlx_array *x, mlx_array **out_xq,
+                                     mlx_array **out_x_sa,
+                                     mlx_array **out_x_ysum) {
+  using namespace mlx::core;
+  if (out_xq) {
+    *out_xq = nullptr;
+  }
+  if (out_x_sa) {
+    *out_x_sa = nullptr;
+  }
+  if (out_x_ysum) {
+    *out_x_ysum = nullptr;
+  }
+  try {
+    if (!x || !out_xq || !out_x_sa || !out_x_ysum) {
+      return -1;
+    }
+    auto result = kquant::quantize_prefill_int8(*reinterpret_cast<array *>(x));
+    if (!result) {
+      return 0;
+    }
+    auto xq_ptr = std::make_unique<array>(std::move(std::get<0>(*result)));
+    auto x_sa_ptr = std::make_unique<array>(std::move(std::get<1>(*result)));
+    auto x_ysum_ptr = std::make_unique<array>(std::move(std::get<2>(*result)));
+    *out_xq = reinterpret_cast<mlx_array *>(xq_ptr.release());
+    *out_x_sa = reinterpret_cast<mlx_array *>(x_sa_ptr.release());
+    *out_x_ysum = reinterpret_cast<mlx_array *>(x_ysum_ptr.release());
+    return 1;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_kquant_quantize_prefill_int8: %s\n", e.what());
+    return -1;
+  }
+}
+
+int mlx_kquant_matmul_int8(mlx_array *xq, mlx_array *x_sa, mlx_array *x_ysum,
+                           mlx_array *w, mlx_array *scales, mlx_array *biases,
+                           mlx_array *aux, const int64_t *orig_shape,
+                           size_t orig_ndim, const char *mode, int epilogue,
+                           mlx_array **output) {
+  using namespace mlx::core;
+  if (output) {
+    *output = nullptr;
+  }
+  try {
+    if (!xq || !x_sa || !x_ysum || !w || !scales || !biases || !orig_shape ||
+        orig_ndim == 0 || !mode || !output) {
+      return -1;
+    }
+    if (epilogue < 0 || epilogue > 2) {
+      return -1;
+    }
+    if ((epilogue != 0) != (aux != nullptr)) {
+      return -1;
+    }
+    auto parsed = kquant::parse_mode_layout(mode);
+    if (!parsed || parsed->layout != kquant::Layout::Tiled64 ||
+        !kquant::is_int8_prefill_mode(parsed->mode)) {
+      return 0;
+    }
+    Shape shape;
+    shape.reserve(orig_ndim);
+    for (size_t i = 0; i < orig_ndim; ++i) {
+      if (orig_shape[i] <= 0 ||
+          orig_shape[i] > std::numeric_limits<int>::max()) {
+        return -1;
+      }
+      shape.push_back(static_cast<int>(orig_shape[i]));
+    }
+    std::optional<array> aux_opt = std::nullopt;
+    if (aux != nullptr) {
+      aux_opt = *reinterpret_cast<array *>(aux);
+    }
+    auto result = kquant::quantized_matmul_int8(
+        *reinterpret_cast<array *>(xq), *reinterpret_cast<array *>(x_sa),
+        *reinterpret_cast<array *>(x_ysum), *reinterpret_cast<array *>(w),
+        *reinterpret_cast<array *>(scales), *reinterpret_cast<array *>(biases),
+        aux_opt, shape, parsed->mode, epilogue);
+    if (!result) {
+      return 0;
+    }
+    *output = reinterpret_cast<mlx_array *>(new array(std::move(*result)));
+    return 1;
+  } catch (const std::exception &e) {
+    std::fprintf(stderr, "mlx_kquant_matmul_int8: %s\n", e.what());
+    return -1;
   }
 }
 

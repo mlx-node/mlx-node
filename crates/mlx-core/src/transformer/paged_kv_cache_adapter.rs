@@ -610,6 +610,30 @@ pub(crate) fn pool_extents_for_bytes(want_bytes: u64, extent_bytes: u64) -> u32 
         .max(1)
 }
 
+/// Step down a geometric extent-growth target by halves (aligned to whole
+/// `extent` multiples above `current`) down to `linear_target`. Returns `None`
+/// once `cur_target <= linear_target`.
+fn step_down_extent_target(
+    current: u32,
+    cur_target: u32,
+    extent: u32,
+    linear_target: u32,
+) -> Option<u32> {
+    if cur_target <= linear_target {
+        return None;
+    }
+    let extent = extent.max(1);
+    let cur_add = cur_target.saturating_sub(current);
+    let half_extents = (cur_add / 2) / extent;
+    let next_add = half_extents.saturating_mul(extent);
+    let next_target = current.saturating_add(next_add).max(linear_target);
+    if next_target >= cur_target {
+        Some(linear_target)
+    } else {
+        Some(next_target)
+    }
+}
+
 /// Pages per split of this device's prefill launches (Splash
 /// `KernelCalibration::of` over the planned GPU cores).
 #[cfg(target_os = "macos")]
@@ -1205,6 +1229,16 @@ pub struct PagedKVCacheAdapter {
     /// doubles and counts cached blocks as available.
     extent_growth_blocks: Option<u32>,
 
+    /// When true on an extent-growth pool, [`Self::try_grow_pool`] jumps by
+    /// extent-aligned geometric multiples (doubling `current` up to
+    /// `extent_growth_max_step_blocks`) and steps down toward the linear
+    /// extent when memory headroom or the governor declines the larger jump.
+    extent_growth_geometric: bool,
+
+    /// Maximum additional blocks added in a single geometric extent grow step
+    /// (aligned to whole `extent_growth_blocks` multiples).
+    extent_growth_max_step_blocks: Option<u32>,
+
     /// Block count of an extent-growth pool when its growth was set: the
     /// floor [`Self::try_release_pool_extents`] cuts down to.
     extent_runway_blocks: u32,
@@ -1237,6 +1271,13 @@ pub struct PagedKVCacheAdapter {
     /// grow-target block count and returns the probe's `selected_blocks`.
     #[cfg(test)]
     grow_headroom_probe_override: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
+
+    /// Test-only override for `LayerKVPool::grow_to`: simulates Metal
+    /// allocation rejections (untouched or partial) for specific targets.
+    #[cfg(test)]
+    grow_to_override: Option<
+        Arc<dyn Fn(&mlx_paged_attn::LayerKVPool, u32) -> Result<bool, String> + Send + Sync>,
+    >,
 
     /// Test-only: prefill and verify take the varlen route on a GPU that
     /// builds the tensor-op pipelines.
@@ -1469,6 +1510,8 @@ impl PagedKVCacheAdapter {
             int8_query_threshold: None,
             pool_growth_notifier: None,
             extent_growth_blocks: None,
+            extent_growth_geometric: false,
+            extent_growth_max_step_blocks: None,
             extent_runway_blocks: 0,
             recency,
             turn_end_stamps: HashMap::new(),
@@ -1478,6 +1521,8 @@ impl PagedKVCacheAdapter {
             admission: None,
             #[cfg(test)]
             grow_headroom_probe_override: None,
+            #[cfg(test)]
+            grow_to_override: None,
             #[cfg(all(test, target_os = "macos"))]
             portable_prefill_forced: false,
             #[cfg(all(test, target_os = "macos"))]
@@ -1490,11 +1535,24 @@ impl PagedKVCacheAdapter {
     /// extent; reclaim only after the extent is refused).
     pub(crate) fn set_extent_growth(&mut self, blocks: u32) {
         self.extent_growth_blocks = Some(blocks.max(1));
+        self.extent_growth_geometric = false;
+        self.extent_growth_max_step_blocks = None;
         self.extent_runway_blocks = self
             .allocator
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .num_blocks();
+    }
+
+    /// Like [`Self::set_extent_growth`], but grows by extent-aligned geometric
+    /// multiples of `min_extent` (doubling `current` capped at
+    /// `max_step_blocks` per grow), stepping down by halves toward the linear
+    /// extent if memory headroom or the governor declines the larger jump.
+    pub(crate) fn set_extent_growth_geometric(&mut self, min_extent: u32, max_step_blocks: u32) {
+        let extent = min_extent.max(1);
+        self.set_extent_growth(extent);
+        self.extent_growth_geometric = true;
+        self.extent_growth_max_step_blocks = Some(max_step_blocks.max(extent));
     }
 
     /// Probe every later growth against the memory plan's ceiling.
@@ -1505,6 +1563,11 @@ impl PagedKVCacheAdapter {
     /// The load's int8 activations (Splash `--activations`).
     pub(crate) fn set_activations(&mut self, activations: crate::transformer::Activations) {
         self.activations = activations;
+    }
+
+    /// The load's configured activation mode (Splash `--activations`).
+    pub(crate) fn activations(&self) -> crate::transformer::Activations {
+        self.activations
     }
 
     /// The position from which this adapter's query rows score INT8 codes,
@@ -1710,6 +1773,18 @@ impl PagedKVCacheAdapter {
         probe: Option<Arc<dyn Fn(u32) -> Result<u32, String> + Send + Sync>>,
     ) {
         self.grow_headroom_probe_override = probe;
+    }
+
+    /// Test-only override for `LayerKVPool::grow_to`; `None` restores the live
+    /// Metal pool grow path.
+    #[cfg(test)]
+    pub(crate) fn set_grow_to_override(
+        &mut self,
+        grow: Option<
+            Arc<dyn Fn(&mlx_paged_attn::LayerKVPool, u32) -> Result<bool, String> + Send + Sync>,
+        >,
+    ) {
+        self.grow_to_override = grow;
     }
 
     /// The cold-tier context this adapter persists through, if any. Exposed so
@@ -3717,77 +3792,175 @@ impl PagedKVCacheAdapter {
             }
         };
         let current = guard.num_blocks();
-        let target = match self.extent_growth_blocks {
-            Some(extent) => current.saturating_add(
-                needed_additional_blocks
+        let max_num_blocks = self.layer_kv_pool.max_num_blocks();
+        let (target, linear_floor) = match self.extent_growth_blocks {
+            Some(extent) => {
+                let linear_add = needed_additional_blocks
                     .max(1)
                     .div_ceil(extent)
-                    .saturating_mul(extent),
+                    .saturating_mul(extent);
+                let linear_target = max_num_blocks.min(current.saturating_add(linear_add));
+                if self.extent_growth_geometric {
+                    let max_step = self
+                        .extent_growth_max_step_blocks
+                        .unwrap_or(extent)
+                        .max(extent);
+                    let geom_add = current
+                        .min(max_step)
+                        .max(1)
+                        .div_ceil(extent)
+                        .saturating_mul(extent)
+                        .max(linear_add);
+                    let geom_target = max_num_blocks.min(current.saturating_add(geom_add));
+                    (geom_target, Some((extent, linear_target)))
+                } else {
+                    (linear_target, None)
+                }
+            }
+            None => (
+                max_num_blocks.min(
+                    current
+                        .saturating_mul(2)
+                        .max(current.saturating_add(needed_additional_blocks)),
+                ),
+                None,
             ),
-            None => current
-                .saturating_mul(2)
-                .max(current.saturating_add(needed_additional_blocks)),
         };
         #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-        let mut new_num_blocks = self.layer_kv_pool.max_num_blocks().min(target);
+        let mut new_num_blocks = target;
         if let Some(admission) = self.admission.clone() {
             if new_num_blocks <= current {
                 return false;
             }
-            let bytes = match self.grow_admission_bytes(new_num_blocks) {
-                Ok(bytes) => bytes,
+            loop {
+                let bytes = match self.grow_admission_bytes(new_num_blocks) {
+                    Ok(bytes) => bytes,
+                    Err(e) => {
+                        tracing::warn!(
+                            target: "mlx_core::paged_kv",
+                            "paged KV pool grow declined: its bytes are unknown: {e}"
+                        );
+                        return false;
+                    }
+                };
+                let before_layers = self.layer_kv_pool.layer_bytes();
+                let mut grow_result: Option<Result<bool, String>> = None;
+                let admitted = admission.admit_grow(bytes, &mut || {
+                    let res = self.grow_pool_to(&mut guard, current, new_num_blocks, started);
+                    grow_result = Some(res.clone());
+                    res
+                });
+                if admitted && matches!(grow_result, Some(Ok(true))) {
+                    return true;
+                }
+                match grow_result {
+                    None => {
+                        // Governor declined before attempting Metal grow: step down.
+                    }
+                    Some(Ok(_)) => {
+                        // Nothing allocatable (`Ok(false)`) or wrapper declined after `Ok(true)`.
+                        return false;
+                    }
+                    Some(Err(_)) => {
+                        let untouched = self.layer_kv_pool.layer_bytes() == before_layers
+                            && self.layer_kv_pool.num_blocks() == current;
+                        if !untouched {
+                            // Partial grow swapped some layers before failing: reconcile
+                            // oversized layers back to `current` before deciding whether
+                            // a smaller target can safely retry.
+                            self.finish_pending_shrink();
+                            if self.layer_kv_pool.shrink_pending()
+                                || self.layer_kv_pool.num_blocks() != current
+                            {
+                                return false;
+                            }
+                        }
+                    }
+                }
+                let Some((extent, linear_target)) = linear_floor else {
+                    return false;
+                };
+                let Some(next) =
+                    step_down_extent_target(current, new_num_blocks, extent, linear_target)
+                else {
+                    return false;
+                };
+                new_num_blocks = next;
+            }
+        }
+        #[cfg(target_os = "macos")]
+        loop {
+            match self.grow_headroom_probe(new_num_blocks) {
+                Ok(selected) if selected < new_num_blocks => {
+                    if let Some((extent, linear_target)) = linear_floor
+                        && let Some(next) =
+                            step_down_extent_target(current, new_num_blocks, extent, linear_target)
+                    {
+                        new_num_blocks = next;
+                        continue;
+                    }
+                    // Partial headroom: grow to the selected count when it covers
+                    // the shortfall. The transient depends on the exact target
+                    // (after a part-way cut a smaller target swaps more layers),
+                    // so the reduced count must pass its own probe.
+                    let shortfall_target = current.saturating_add(needed_additional_blocks);
+                    let reduced_fits = selected >= shortfall_target
+                        && selected > current
+                        && matches!(self.grow_headroom_probe(selected), Ok(fits) if fits >= selected);
+                    if reduced_fits {
+                        tracing::info!(
+                            target: "mlx_core::paged_kv",
+                            "paged KV pool grow targeting partial headroom: {selected} blocks \
+                             (< {new_num_blocks} doubling target, covers shortfall {shortfall_target})"
+                        );
+                        new_num_blocks = selected;
+                    } else {
+                        tracing::warn!(
+                            target: "mlx_core::paged_kv",
+                            "paged KV pool grow declined: headroom probe caps the pool at {selected} \
+                             blocks ({new_num_blocks} requested, shortfall {shortfall_target}), or \
+                             {selected} blocks do not fit their own grow peak"
+                        );
+                        return false;
+                    }
+                }
+                Ok(_) => {}
                 Err(e) => {
                     tracing::warn!(
                         target: "mlx_core::paged_kv",
-                        "paged KV pool grow declined: its bytes are unknown: {e}"
-                    );
-                    return false;
-                }
-            };
-            let mut grew = false;
-            let admitted = admission.admit_grow(bytes, &mut || {
-                grew = self.grow_pool_to(&mut guard, current, new_num_blocks, started)?;
-                Ok(grew)
-            });
-            return admitted && grew;
-        }
-        #[cfg(target_os = "macos")]
-        match self.grow_headroom_probe(new_num_blocks) {
-            Ok(selected) if selected < new_num_blocks => {
-                // Partial headroom: grow to the selected count when it covers
-                // the shortfall. The transient depends on the exact target
-                // (after a part-way cut a smaller target swaps more layers),
-                // so the reduced count must pass its own probe.
-                let shortfall_target = current.saturating_add(needed_additional_blocks);
-                let reduced_fits = selected >= shortfall_target
-                    && selected > current
-                    && matches!(self.grow_headroom_probe(selected), Ok(fits) if fits >= selected);
-                if reduced_fits {
-                    tracing::info!(
-                        target: "mlx_core::paged_kv",
-                        "paged KV pool grow targeting partial headroom: {selected} blocks \
-                         (< {new_num_blocks} doubling target, covers shortfall {shortfall_target})"
-                    );
-                    new_num_blocks = selected;
-                } else {
-                    tracing::warn!(
-                        target: "mlx_core::paged_kv",
-                        "paged KV pool grow declined: headroom probe caps the pool at {selected} \
-                         blocks ({new_num_blocks} requested, shortfall {shortfall_target}), or \
-                         {selected} blocks do not fit their own grow peak"
+                        "paged KV pool grow declined: headroom probe failed: {e}"
                     );
                     return false;
                 }
             }
-            Ok(_) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "mlx_core::paged_kv",
-                    "paged KV pool grow declined: headroom probe failed: {e}"
-                );
-                return false;
+            let before_layers = self.layer_kv_pool.layer_bytes();
+            match self.grow_pool_to(&mut guard, current, new_num_blocks, started) {
+                Ok(grew) => return grew,
+                Err(e) => {
+                    tracing::warn!(target: "mlx_core::paged_kv", "{e}");
+                    let untouched = self.layer_kv_pool.layer_bytes() == before_layers
+                        && self.layer_kv_pool.num_blocks() == current;
+                    if !untouched {
+                        self.finish_pending_shrink();
+                        if self.layer_kv_pool.shrink_pending()
+                            || self.layer_kv_pool.num_blocks() != current
+                        {
+                            return false;
+                        }
+                    }
+                    let Some((extent, linear_target)) = linear_floor else {
+                        return false;
+                    };
+                    let Some(next) =
+                        step_down_extent_target(current, new_num_blocks, extent, linear_target)
+                    else {
+                        return false;
+                    };
+                    new_num_blocks = next;
+                }
             }
         }
+        #[cfg(not(target_os = "macos"))]
         match self.grow_pool_to(&mut guard, current, new_num_blocks, started) {
             Ok(grew) => grew,
             Err(e) => {
@@ -3828,7 +4001,15 @@ impl PagedKVCacheAdapter {
         // adapters sharing the pool rebuild lazily via the generation guard.
         #[cfg(target_os = "macos")]
         self.clear_native_graph_state();
-        match self.layer_kv_pool.grow_to(new_num_blocks) {
+        #[cfg(test)]
+        let grow_outcome = if let Some(override_fn) = self.grow_to_override.as_ref() {
+            override_fn(&self.layer_kv_pool, new_num_blocks)
+        } else {
+            self.layer_kv_pool.grow_to(new_num_blocks)
+        };
+        #[cfg(not(test))]
+        let grow_outcome = self.layer_kv_pool.grow_to(new_num_blocks);
+        match grow_outcome {
             Ok(true) => {}
             Ok(false) => return Ok(false),
             Err(e) => {
@@ -19890,6 +20071,361 @@ mod tests {
         assert_eq!(adapter.reserve_rows(24).unwrap(), 3);
         assert_eq!(pool.num_blocks(), 10, "decode grows one more extent");
         assert_eq!(evictable(), 1, "the cached block survives the decode grow");
+    }
+
+    /// Geometric extent growth doubles in extent-aligned jumps (`4 -> 8 -> 16 -> 24`
+    /// with `min_extent = 4, max_step_blocks = 8`), preserves `extent`-aligned shrink
+    /// granularity, and steps down by halves to the linear extent when either the
+    /// headroom probe or a `PoolAdmission` governor declines the larger geometric jump.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn geometric_extent_growth_doubles_aligned_and_steps_down_on_decline() {
+        let make_adapter = |initial: u32,
+                            max_blocks: u32|
+         -> Option<(
+            Arc<Mutex<BlockAllocator>>,
+            Arc<mlx_paged_attn::LayerKVPool>,
+            PagedKVCacheAdapter,
+        )> {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: 2,
+                gpu_memory_mb: 256,
+                max_seq_len: Some(max_blocks * 8),
+                max_batch_size: Some(2),
+            };
+            let pool = match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                initial,
+                max_blocks,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    eprintln!(
+                        "skipping geometric_extent_growth_doubles_aligned_and_steps_down_on_decline: {e}"
+                    );
+                    return None;
+                }
+            };
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(initial, max_blocks, 8)));
+            let adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+                .expect("adapter");
+            Some((allocator, pool, adapter))
+        };
+
+        // 1. Unconstrained geometric progression with `min_extent = 4, max_step = 8`:
+        //    4 -> +4 = 8 -> +8 = 16 -> +8 (capped by max_step) = 24.
+        let Some((_alloc, pool, mut adapter)) = make_adapter(4, 32) else {
+            return;
+        };
+        adapter.set_extent_growth_geometric(4, 8);
+        adapter.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        assert!(adapter.try_grow_pool(1));
+        assert_eq!(pool.num_blocks(), 8, "4 + 4 = 8");
+        assert!(adapter.try_grow_pool(1));
+        assert_eq!(pool.num_blocks(), 16, "8 + 8 = 16");
+        assert!(adapter.try_grow_pool(1));
+        assert_eq!(pool.num_blocks(), 24, "16 + min(16, max_step=8) = 24");
+
+        // 2. macOS headroom probe declines the geometric jump (16 -> 32) and the half-step
+        //    (16 -> 24), admitting only the linear extent (16 -> 20).
+        let Some((_alloc2, pool2, mut adapter2)) = make_adapter(16, 48) else {
+            return;
+        };
+        adapter2.set_extent_growth_geometric(4, 16);
+        let probed = Arc::new(Mutex::new(Vec::<u32>::new()));
+        {
+            let probed = Arc::clone(&probed);
+            adapter2.set_grow_headroom_probe_override(Some(Arc::new(move |target| {
+                probed.lock().unwrap().push(target);
+                Ok(target.min(20))
+            })));
+        }
+        assert!(adapter2.try_grow_pool(1));
+        assert_eq!(
+            pool2.num_blocks(),
+            20,
+            "stepped down to linear extent 16 + 4"
+        );
+        assert_eq!(*probed.lock().unwrap(), vec![32, 24, 20]);
+
+        // 3. Governor `PoolAdmission` declines the geometric jump (16 -> 32) and admits the
+        //    half-step (16 -> 24), then on the next grow admits only the linear extent (24 -> 28).
+        struct CapAdmission {
+            max_bytes: Arc<Mutex<u64>>,
+            asked: Arc<Mutex<Vec<u64>>>,
+        }
+        impl PoolAdmission for CapAdmission {
+            fn admit_grow(
+                &self,
+                bytes: u64,
+                grow: &mut dyn FnMut() -> Result<bool, String>,
+            ) -> bool {
+                self.asked.lock().unwrap().push(bytes);
+                if bytes > *self.max_bytes.lock().unwrap() {
+                    return false;
+                }
+                grow().unwrap_or(false)
+            }
+            fn held_blocks(&self) -> u32 {
+                0
+            }
+        }
+        let Some((_alloc3, pool3, mut adapter3)) = make_adapter(16, 64) else {
+            return;
+        };
+        adapter3.set_extent_growth_geometric(4, 16);
+        let asked = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let allow_24 = adapter3.grow_admission_bytes(24).expect("bytes for 24");
+        let max_bytes = Arc::new(Mutex::new(allow_24));
+        adapter3.set_admission(Arc::new(CapAdmission {
+            max_bytes: Arc::clone(&max_bytes),
+            asked: Arc::clone(&asked),
+        }));
+        assert!(adapter3.try_grow_pool(1));
+        assert_eq!(pool3.num_blocks(), 24, "governor stepped down 32 -> 24");
+        assert_eq!(asked.lock().unwrap().len(), 2, "probed 32 then admitted 24");
+
+        // Next grow from 24: geometric wants 24+16=40, half=32, linear=28; allow only 28!
+        asked.lock().unwrap().clear();
+        *max_bytes.lock().unwrap() = adapter3.grow_admission_bytes(28).expect("bytes for 28");
+        assert!(adapter3.try_grow_pool(1));
+        assert_eq!(
+            pool3.num_blocks(),
+            28,
+            "governor stepped down 40 -> 32 -> 28"
+        );
+        assert_eq!(
+            asked.lock().unwrap().len(),
+            3,
+            "probed 40, 32, then admitted 28"
+        );
+    }
+
+    /// Finding 2 regression: when Metal rejects the larger geometric extent
+    /// AFTER governor admission (or headroom probe approval), `try_grow_pool`
+    /// must distinguish an untouched failure from a partial grow, step down
+    /// through halves to the smaller linear extent on untouched failure, and
+    /// reconcile partial-grow layers cleanly via `finish_pending_shrink`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn geometric_extent_growth_falls_back_to_linear_after_driver_rejection() {
+        let make_adapter = |initial: u32,
+                            max_blocks: u32,
+                            num_layers: usize|
+         -> Option<(
+            Arc<Mutex<BlockAllocator>>,
+            Arc<mlx_paged_attn::LayerKVPool>,
+            PagedKVCacheAdapter,
+        )> {
+            let cfg = mlx_paged_attn::PagedAttentionConfig {
+                block_size: 8,
+                num_kv_heads: 1,
+                head_size: 64,
+                num_layers: num_layers as u32,
+                gpu_memory_mb: 256,
+                max_seq_len: Some(max_blocks * 8),
+                max_batch_size: Some(2),
+            };
+            let pool = match mlx_paged_attn::LayerKVPool::new(
+                cfg,
+                initial,
+                max_blocks,
+                mlx_paged_attn::metal::MetalDtype::BFloat16,
+            ) {
+                Ok(p) => Arc::new(p),
+                Err(e) => {
+                    eprintln!(
+                        "skipping geometric_extent_growth_falls_back_to_linear_after_driver_rejection: {e}"
+                    );
+                    return None;
+                }
+            };
+            let allocator = Arc::new(Mutex::new(BlockAllocator::new(initial, max_blocks, 8)));
+            let adapter = PagedKVCacheAdapter::new(Arc::clone(&allocator), Arc::clone(&pool), 8)
+                .expect("adapter");
+            Some((allocator, pool, adapter))
+        };
+
+        struct AdmitAll {
+            asked: Arc<Mutex<Vec<u64>>>,
+            driver_rejects: Arc<Mutex<Vec<u64>>>,
+        }
+        impl PoolAdmission for AdmitAll {
+            fn admit_grow(
+                &self,
+                bytes: u64,
+                grow: &mut dyn FnMut() -> Result<bool, String>,
+            ) -> bool {
+                self.asked.lock().unwrap().push(bytes);
+                match grow() {
+                    Ok(grew) => grew,
+                    Err(_) => {
+                        self.driver_rejects.lock().unwrap().push(bytes);
+                        false
+                    }
+                }
+            }
+            fn held_blocks(&self) -> u32 {
+                0
+            }
+        }
+
+        // 1. Governor admits geometric 16 -> 32; Metal rejects > 20 untouched ->
+        //    steps down 32 -> 24 -> 20 (linear fallback) and succeeds.
+        let Some((alloc1, pool1, mut adapter1)) = make_adapter(16, 64, 2) else {
+            return;
+        };
+        adapter1.set_extent_growth_geometric(4, 16);
+        let asked1 = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let rejects1 = Arc::new(Mutex::new(Vec::<u64>::new()));
+        adapter1.set_admission(Arc::new(AdmitAll {
+            asked: Arc::clone(&asked1),
+            driver_rejects: Arc::clone(&rejects1),
+        }));
+        let attempted1 = Arc::new(Mutex::new(Vec::<u32>::new()));
+        {
+            let attempted1 = Arc::clone(&attempted1);
+            adapter1.set_grow_to_override(Some(Arc::new(move |pool, target| {
+                attempted1.lock().unwrap().push(target);
+                if target > 20 {
+                    return Err(format!("Metal driver rejected {target}-block buffer"));
+                }
+                pool.grow_to(target)
+            })));
+        }
+        let notified1 = Arc::new(Mutex::new(Vec::<u64>::new()));
+        {
+            let notified1 = Arc::clone(&notified1);
+            adapter1.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notified1.lock().unwrap().push(bytes);
+            })));
+        }
+        let block_bytes1 = adapter1.bytes_per_block().expect("bytes per block");
+        assert!(
+            adapter1.try_grow_pool(1),
+            "untouched driver rejection on geometric target must fall back to linear extent"
+        );
+        assert_eq!(*attempted1.lock().unwrap(), vec![32, 24, 20]);
+        assert_eq!(asked1.lock().unwrap().len(), 3);
+        assert_eq!(rejects1.lock().unwrap().len(), 2);
+        assert_eq!(pool1.num_blocks(), 20);
+        assert_eq!(alloc1.lock().unwrap().num_blocks(), 20);
+        assert_eq!(*notified1.lock().unwrap(), vec![20 * block_bytes1]);
+
+        // 2. Non-admission macOS headroom probe approves 32; Metal rejects > 20 untouched ->
+        //    steps down 32 -> 24 -> 20 and succeeds.
+        let Some((alloc2, pool2, mut adapter2)) = make_adapter(16, 64, 2) else {
+            return;
+        };
+        adapter2.set_extent_growth_geometric(4, 16);
+        adapter2.set_grow_headroom_probe_override(Some(Arc::new(Ok)));
+        let attempted2 = Arc::new(Mutex::new(Vec::<u32>::new()));
+        {
+            let attempted2 = Arc::clone(&attempted2);
+            adapter2.set_grow_to_override(Some(Arc::new(move |pool, target| {
+                attempted2.lock().unwrap().push(target);
+                if target > 20 {
+                    return Err(format!("Metal driver rejected {target}-block buffer"));
+                }
+                pool.grow_to(target)
+            })));
+        }
+        assert!(
+            adapter2.try_grow_pool(1),
+            "headroom-probe path must also fall back to linear extent after untouched failure"
+        );
+        assert_eq!(*attempted2.lock().unwrap(), vec![32, 24, 20]);
+        assert_eq!(pool2.num_blocks(), 20);
+        assert_eq!(alloc2.lock().unwrap().num_blocks(), 20);
+
+        // 3. Partial grow failure: layers 2..4 already grew to 32 before failing ->
+        //    reconciles oversized layers back to 16 via `finish_pending_shrink`, then
+        //    succeeds on linear fallback 20 with uniform layer sizes (`!shrink_pending`).
+        let Some((alloc3, pool3, mut adapter3)) = make_adapter(16, 64, 4) else {
+            return;
+        };
+        adapter3.set_extent_growth_geometric(4, 16);
+        adapter3.set_admission(Arc::new(AdmitAll {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            driver_rejects: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let attempted3 = Arc::new(Mutex::new(Vec::<u32>::new()));
+        {
+            let attempted3 = Arc::clone(&attempted3);
+            adapter3.set_grow_to_override(Some(Arc::new(move |pool, target| {
+                attempted3.lock().unwrap().push(target);
+                if target > 20 {
+                    // Simulate a partial grow leaving layers 2..4 at `target` while
+                    // `num_blocks()` remains 16 (`shrink_pending() == true`).
+                    pool.grow_to(target)?;
+                    mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+                    let _ = pool.shrink_to(16);
+                    mlx_paged_attn::set_shrink_fail_at_layer(None);
+                    return Err(format!("Metal partial grow failure at {target} blocks"));
+                }
+                pool.grow_to(target)
+            })));
+        }
+        let block_bytes3 = adapter3.bytes_per_block().expect("bytes per block");
+        assert!(
+            adapter3.try_grow_pool(1),
+            "reconciled partial grow should safely step down and succeed on linear extent"
+        );
+        assert_eq!(*attempted3.lock().unwrap(), vec![32, 24, 20]);
+        assert_eq!(pool3.num_blocks(), 20);
+        assert_eq!(alloc3.lock().unwrap().num_blocks(), 20);
+        assert!(!pool3.shrink_pending());
+        assert_eq!(pool3.total_bytes(), 20 * block_bytes3);
+
+        // 4. Unreconcilable partial grow: when `finish_pending_shrink` cannot restore
+        //    uniform layer sizes, `try_grow_pool` must abort immediately without retrying
+        //    smaller targets and must notify the exact actual layer bytes.
+        let Some((alloc4, pool4, mut adapter4)) = make_adapter(16, 64, 4) else {
+            return;
+        };
+        adapter4.set_extent_growth_geometric(4, 16);
+        adapter4.set_admission(Arc::new(AdmitAll {
+            asked: Arc::new(Mutex::new(Vec::new())),
+            driver_rejects: Arc::new(Mutex::new(Vec::new())),
+        }));
+        let notified4 = Arc::new(Mutex::new(Vec::<u64>::new()));
+        {
+            let notified4 = Arc::clone(&notified4);
+            adapter4.set_pool_growth_notifier(Some(Arc::new(move |bytes| {
+                notified4.lock().unwrap().push(bytes);
+            })));
+        }
+        let attempted4 = Arc::new(Mutex::new(Vec::<u32>::new()));
+        {
+            let attempted4 = Arc::clone(&attempted4);
+            adapter4.set_grow_to_override(Some(Arc::new(move |pool, target| {
+                attempted4.lock().unwrap().push(target);
+                pool.grow_to(target)?;
+                mlx_paged_attn::set_shrink_fail_at_layer(Some(2));
+                let _ = pool.shrink_to(16);
+                // Keep SHRINK_FAIL_AT_LAYER armed so `finish_pending_shrink` also stops at layer 2.
+                Err(format!("Metal partial grow failure at {target} blocks"))
+            })));
+        }
+        let grew4 = adapter4.try_grow_pool(1);
+        mlx_paged_attn::set_shrink_fail_at_layer(None);
+        assert!(
+            !grew4,
+            "unreconcilable partial grow must abort instead of retrying smaller targets"
+        );
+        assert_eq!(*attempted4.lock().unwrap(), vec![32]);
+        assert_eq!(pool4.num_blocks(), 16);
+        assert_eq!(alloc4.lock().unwrap().num_blocks(), 16);
+        assert!(pool4.shrink_pending());
+        assert_eq!(
+            notified4.lock().unwrap().last().copied(),
+            Some(pool4.total_bytes()),
+            "notifier must hold exact actual pool bytes after partial grow"
+        );
     }
 
     /// A runway pool of 4 blocks grown by two 3-block extents to 10, then

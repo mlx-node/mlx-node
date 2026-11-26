@@ -275,36 +275,61 @@ fn is_exact_bf16_roundtrip(w: &MxArray) -> Result<bool> {
     Ok(all_eq.item_at_int32(0)? != 0)
 }
 
+/// Pure helper resolving LoopController weight dtype from an override tag and all
+/// participating source tensor dtypes.
+///
+/// Under `"auto"`, preserves `BFloat16` iff ALL participating source tensors are
+/// `BFloat16` (and non-empty); any mixed checkpoint (e.g. BF16 `down_proj` with F32
+/// `gain_proj`/`forget_proj`, or mixed BF16 + quantized-to-F32 gates) widens BF16 to
+/// `Float32` losslessly (0-ULP exact) instead of truncating F32 mantissa bits.
+pub(crate) fn resolve_loop_controller_weight_dtype(
+    override_tag: &str,
+    source_dtypes: &[DType],
+) -> DType {
+    match override_tag {
+        "bf16" => DType::BFloat16,
+        "f32" => DType::Float32,
+        _ => {
+            if !source_dtypes.is_empty() && source_dtypes.iter().all(|&d| d == DType::BFloat16) {
+                DType::BFloat16
+            } else {
+                DType::Float32
+            }
+        }
+    }
+}
+
 /// LoopController weight dtype:
 /// - Always honors explicit `MLX_INKLING2_LOOP_BF16` override (`1`/`true`/`bf16` or `0`/`false`/`f32`).
-/// - Preserves native BF16 checkpoints (`down_proj.dtype() == BFloat16`) on all backends.
-/// - On the CUDA fast path (`cuda_fast_enabled()`), compacts F32 controller tensors back to
+/// - Under `"auto"`, preserves native BF16 checkpoints (when ALL participating weights are natively
+///   `BFloat16`) on all backends (2x less DRAM with zero precision loss).
+/// - On the CUDA fast path (`cuda_fast_enabled()`), compacts F32/mixed controller tensors back to
 ///   `DType::BFloat16` ONLY when all three tensors (`down_proj`, `gain_proj`, `forget_proj`)
 ///   round-trip through BF16 bit-for-bit losslessly (e.g. GGUF exports widened from BF16).
-/// - Preserves native FP32 precision whenever any tensor has non-BF16-exact FP32 values, when
+/// - Preserves native FP32 precision whenever any tensor has non-BF16-exact FP32 values (widening
+///   any BF16 peers losslessly to FP32 instead of truncating F32 mantissa bits), when
 ///   `MLX_INKLING2_CUDA_FAST=0`, or on macOS Metal / CPU.
 pub(crate) fn loop_controller_weight_dtype(
     down_proj: &MxArray,
     gain_proj: &MxArray,
     forget_proj: &MxArray,
 ) -> Result<DType> {
-    match loop_bf16_override_tag() {
-        "bf16" => Ok(DType::BFloat16),
-        "f32" => Ok(DType::Float32),
-        _ => {
-            if down_proj.dtype()? == DType::BFloat16 {
-                return Ok(DType::BFloat16);
-            }
-            if super::cuda_forward::cuda_fast_enabled()
-                && is_exact_bf16_roundtrip(down_proj)?
-                && is_exact_bf16_roundtrip(gain_proj)?
-                && is_exact_bf16_roundtrip(forget_proj)?
-            {
-                Ok(DType::BFloat16)
-            } else {
-                Ok(DType::Float32)
-            }
-        }
+    let tag = loop_bf16_override_tag();
+    let base = resolve_loop_controller_weight_dtype(
+        tag,
+        &[down_proj.dtype()?, gain_proj.dtype()?, forget_proj.dtype()?],
+    );
+    if tag != "auto" || base == DType::BFloat16 {
+        return Ok(base);
+    }
+    if super::cuda_forward::cuda_fast_enabled()
+        && is_exact_bf16_roundtrip(down_proj)?
+        && is_exact_bf16_roundtrip(gain_proj)?
+        && is_exact_bf16_roundtrip(forget_proj)?
+    {
+        Ok(DType::BFloat16)
+    } else {
+        Ok(DType::Float32)
     }
 }
 
@@ -471,6 +496,7 @@ impl LoopController {
                 let w_dtype = self.down_proj_w.dtype()?;
                 let (min_t, max_t) = fused_loop_ctrl_range();
                 if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
+                    && self.gain_forget_w.dtype()? == w_dtype
                     && t >= min_t
                     && t <= max_t
                     && d % 4 == 0
@@ -607,24 +633,53 @@ impl LoopLayerControllers {
         mlp_ctrl: LoopController,
     ) -> Result<Self> {
         let msg_queries_t = msg_queries.transpose(None)?;
-        let qkv_down_w = MxArray::stack(
-            vec![
-                &q_ctrl.down_proj_w,
-                &k_ctrl.down_proj_w,
-                &v_ctrl.down_proj_w,
+        // Cross-stream Q/K/V dtype unification (keeping `mlp_ctrl` independent, matching
+        // Splash `kInkling2LoopGateCalls = {{0,3},{3,4}}`): if any Q/K/V controller is F32,
+        // widen BF16 peers losslessly to F32 before stacking (or compact losslessly to BF16
+        // on the CUDA fast path iff all 6 participating tensors round-trip through BF16).
+        let tag = loop_bf16_override_tag();
+        let qkv_base = resolve_loop_controller_weight_dtype(
+            tag,
+            &[
+                q_ctrl.down_proj_w.dtype()?,
+                q_ctrl.gain_forget_w.dtype()?,
+                k_ctrl.down_proj_w.dtype()?,
+                k_ctrl.gain_forget_w.dtype()?,
+                v_ctrl.down_proj_w.dtype()?,
+                v_ctrl.gain_forget_w.dtype()?,
             ],
-            Some(0),
-        )?;
+        );
+        let qkv_dtype = if tag != "auto" || qkv_base == DType::BFloat16 {
+            qkv_base
+        } else if super::cuda_forward::cuda_fast_enabled()
+            && is_exact_bf16_roundtrip(&q_ctrl.down_proj_w)?
+            && is_exact_bf16_roundtrip(&q_ctrl.gain_forget_w)?
+            && is_exact_bf16_roundtrip(&k_ctrl.down_proj_w)?
+            && is_exact_bf16_roundtrip(&k_ctrl.gain_forget_w)?
+            && is_exact_bf16_roundtrip(&v_ctrl.down_proj_w)?
+            && is_exact_bf16_roundtrip(&v_ctrl.gain_forget_w)?
+        {
+            DType::BFloat16
+        } else {
+            DType::Float32
+        };
+        let cast_to = |arr: &MxArray| -> Result<MxArray> {
+            if arr.dtype()? == qkv_dtype {
+                Ok(arr.clone())
+            } else {
+                arr.astype(qkv_dtype)
+            }
+        };
+        let q_down = cast_to(&q_ctrl.down_proj_w)?;
+        let k_down = cast_to(&k_ctrl.down_proj_w)?;
+        let v_down = cast_to(&v_ctrl.down_proj_w)?;
+        let qkv_down_w = MxArray::stack(vec![&q_down, &k_down, &v_down], Some(0))?;
         let qkv_down_proj_t = qkv_down_w.transpose(Some(&[0, 2, 1]))?;
 
-        let qkv_gain_forget_w = MxArray::stack(
-            vec![
-                &q_ctrl.gain_forget_w,
-                &k_ctrl.gain_forget_w,
-                &v_ctrl.gain_forget_w,
-            ],
-            Some(0),
-        )?;
+        let q_gf = cast_to(&q_ctrl.gain_forget_w)?;
+        let k_gf = cast_to(&k_ctrl.gain_forget_w)?;
+        let v_gf = cast_to(&v_ctrl.gain_forget_w)?;
+        let qkv_gain_forget_w = MxArray::stack(vec![&q_gf, &k_gf, &v_gf], Some(0))?;
         let qkv_gain_forget_proj_t = qkv_gain_forget_w.transpose(Some(&[0, 2, 1]))?;
 
         let dim = q_ctrl.dim;
@@ -689,6 +744,7 @@ impl LoopLayerControllers {
                 let w_dtype = self.qkv_down_w.dtype()?;
                 let (min_t, max_t) = fused_loop_ctrl_range();
                 if (w_dtype == DType::Float32 || w_dtype == DType::BFloat16)
+                    && self.qkv_gain_forget_w.dtype()? == w_dtype
                     && t >= min_t
                     && t <= max_t
                     && d % 4 == 0
@@ -936,5 +992,301 @@ mod tests {
             assert_eq!(ctrl_exact.down_proj_w.dtype().unwrap(), expected);
             assert_eq!(ctrl_exact.gain_forget_w.dtype().unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn resolve_loop_controller_weight_dtype_matrix() {
+        use DType::{BFloat16 as BF16, Float16 as F16, Float32 as F32};
+        // Explicit overrides win regardless of source dtypes
+        for dtypes in [
+            &[BF16, BF16, BF16][..],
+            &[BF16, F32, F32][..],
+            &[F32, F32, F32][..],
+            &[F16, F16, F16][..],
+            &[][..],
+        ] {
+            assert_eq!(resolve_loop_controller_weight_dtype("bf16", dtypes), BF16);
+            assert_eq!(resolve_loop_controller_weight_dtype("f32", dtypes), F32);
+        }
+        // Under "auto", ONLY non-empty all-BF16 stays BF16; every mixed or non-BF16 combo widens to F32
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[BF16, BF16, BF16]),
+            BF16
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[BF16, F32, F32]),
+            F32
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[BF16, BF16, F32]),
+            F32
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[F32, BF16, BF16]),
+            F32
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[BF16, F16, F16]),
+            F32
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[F16, F16, F16]),
+            F32
+        );
+        assert_eq!(
+            resolve_loop_controller_weight_dtype("auto", &[F32, F32, F32]),
+            F32
+        );
+        assert_eq!(resolve_loop_controller_weight_dtype("auto", &[]), F32);
+    }
+
+    #[test]
+    fn loop_controller_mixed_bf16_f32_widens_without_truncating_f32_weights() {
+        let d = 8i64;
+        let r = 4i64;
+        // down_proj is BF16; gain_proj & forget_proj carry non-BF16-representable F32 mantissa bits.
+        let down_f32: Vec<f32> = (0..(r * 2 * d) as usize)
+            .map(|i| ((i as f32) * 0.125 - 2.0) * 0.25)
+            .collect();
+        let down_bf16 = MxArray::from_float32(&down_f32, &[r, 2 * d])
+            .unwrap()
+            .astype(DType::BFloat16)
+            .unwrap();
+        let down_bf16_as_f32 = down_bf16
+            .astype(DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+
+        let gain_vals: Vec<f32> = (0..(d * r) as usize)
+            .map(|i| 0.1234568 + (i as f32) * 0.0001379)
+            .collect();
+        let forget_vals: Vec<f32> = (0..(d * r) as usize)
+            .map(|i| -0.0987654 + (i as f32) * 0.0002713)
+            .collect();
+        let gain_f32 = MxArray::from_float32(&gain_vals, &[d, r]).unwrap();
+        let forget_f32 = MxArray::from_float32(&forget_vals, &[d, r]).unwrap();
+
+        let mixed =
+            LoopController::new(down_bf16.clone(), gain_f32.clone(), forget_f32.clone()).unwrap();
+        assert_eq!(mixed.down_proj_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(mixed.gain_forget_w.dtype().unwrap(), DType::Float32);
+
+        // Verify BF16->F32 widen is 0-ULP bit-exact and F32 gain/forget are NOT truncated.
+        let got_down = mixed.down_proj_w.to_float32().unwrap();
+        assert_eq!(
+            got_down.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            down_bf16_as_f32
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>()
+        );
+        let got_gf = mixed.gain_forget_w.to_float32().unwrap();
+        let mut expected_gf = gain_vals.clone();
+        expected_gf.extend_from_slice(&forget_vals);
+        assert_eq!(
+            got_gf.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected_gf.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "F32 gain/forget weights must stay bit-exact without BF16 truncation"
+        );
+
+        // All-BF16 checkpoint still preserves BF16 for 2x DRAM savings (under default auto).
+        if loop_bf16_override_tag() == "auto" {
+            let all_bf16 = LoopController::new(
+                down_bf16,
+                gain_f32.astype(DType::BFloat16).unwrap(),
+                forget_f32.astype(DType::BFloat16).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(all_bf16.down_proj_w.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(all_bf16.gain_forget_w.dtype().unwrap(), DType::BFloat16);
+        }
+    }
+
+    #[test]
+    fn loop_layer_controllers_cross_stream_qkv_promotion_isolates_mlp() {
+        let d = 8i64;
+        let r = 4i64;
+        let make_ctrl = |dt: DType, seed: f32| {
+            let down = MxArray::from_float32(
+                &(0..(r * 2 * d) as usize)
+                    .map(|i| seed + i as f32 * 0.0012345)
+                    .collect::<Vec<_>>(),
+                &[r, 2 * d],
+            )
+            .unwrap()
+            .astype(dt)
+            .unwrap();
+            let gain = MxArray::from_float32(
+                &(0..(d * r) as usize)
+                    .map(|i| seed - i as f32 * 0.0023456)
+                    .collect::<Vec<_>>(),
+                &[d, r],
+            )
+            .unwrap()
+            .astype(dt)
+            .unwrap();
+            let forget = MxArray::from_float32(
+                &(0..(d * r) as usize)
+                    .map(|i| seed + i as f32 * 0.0034567)
+                    .collect::<Vec<_>>(),
+                &[d, r],
+            )
+            .unwrap()
+            .astype(dt)
+            .unwrap();
+            LoopController::new(down, gain, forget).unwrap()
+        };
+
+        let q_ctrl = make_ctrl(DType::Float32, 0.11);
+        let k_ctrl = make_ctrl(DType::BFloat16, 0.22);
+        let v_ctrl = make_ctrl(DType::BFloat16, 0.33);
+        let mlp_ctrl = make_ctrl(DType::BFloat16, 0.44);
+        let msg_q = MxArray::zeros(&[4, d], Some(DType::Float32)).unwrap();
+
+        let ctrls = LoopLayerControllers::new(msg_q, q_ctrl, k_ctrl, v_ctrl, mlp_ctrl).unwrap();
+        assert_eq!(ctrls.qkv_down_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(ctrls.qkv_gain_forget_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(ctrls.q_ctrl.down_proj_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(ctrls.k_ctrl.down_proj_w.dtype().unwrap(), DType::Float32);
+        assert_eq!(ctrls.v_ctrl.down_proj_w.dtype().unwrap(), DType::Float32);
+        if loop_bf16_override_tag() == "auto" {
+            assert_eq!(ctrls.mlp_ctrl.down_proj_w.dtype().unwrap(), DType::BFloat16);
+            assert_eq!(
+                ctrls.mlp_ctrl.gain_forget_w.dtype().unwrap(),
+                DType::BFloat16
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn inkling2_loop_ctrl_mixed_bf16_f32_fused_matches_f32_reference() {
+        if !unsafe { mlx_sys::mlx_metal_is_available() } {
+            return;
+        }
+        let d = 16i64;
+        let r = 8i64;
+        let t = 4i64;
+        let make_mixed_and_ref = |offset: f32| {
+            let down_raw: Vec<f32> = (0..(r * 2 * d) as usize)
+                .map(|i| ((i as f32 * 0.37 + offset).sin()) * 0.2)
+                .collect();
+            let gain_raw: Vec<f32> = (0..(d * r) as usize)
+                .map(|i| ((i as f32 * 0.53 + offset).cos()) * 0.15 + 0.00123456)
+                .collect();
+            let forget_raw: Vec<f32> = (0..(d * r) as usize)
+                .map(|i| ((i as f32 * 0.71 - offset).sin()) * 0.15 - 0.00234567)
+                .collect();
+            let down_bf16 = MxArray::from_float32(&down_raw, &[r, 2 * d])
+                .unwrap()
+                .astype(DType::BFloat16)
+                .unwrap();
+            let down_f32 = down_bf16.astype(DType::Float32).unwrap();
+            let gain_f32 = MxArray::from_float32(&gain_raw, &[d, r]).unwrap();
+            let forget_f32 = MxArray::from_float32(&forget_raw, &[d, r]).unwrap();
+            let mixed =
+                LoopController::new(down_bf16, gain_f32.clone(), forget_f32.clone()).unwrap();
+            let ref_f32 = LoopController::new(down_f32, gain_f32, forget_f32).unwrap();
+            (mixed, ref_f32)
+        };
+
+        let (q_m, q_r) = make_mixed_and_ref(0.1);
+        let (k_m, k_r) = make_mixed_and_ref(0.2);
+        let (v_m, v_r) = make_mixed_and_ref(0.3);
+        let (mlp_m, mlp_r) = make_mixed_and_ref(0.4);
+        let msg_q = MxArray::zeros(&[4, d], Some(DType::Float32)).unwrap();
+        let ctrls_m = LoopLayerControllers::new(msg_q.clone(), q_m, k_m, v_m, mlp_m).unwrap();
+        let ctrls_r = LoopLayerControllers::new(msg_q, q_r, k_r, v_r, mlp_r).unwrap();
+
+        let dest = MxArray::from_float32(
+            &(0..(t * d) as usize)
+                .map(|i| ((i as f32) * 0.19).sin())
+                .collect::<Vec<_>>(),
+            &[t, d],
+        )
+        .unwrap();
+        let msgs_qkv = MxArray::from_float32(
+            &(0..(3 * t * d) as usize)
+                .map(|i| ((i as f32) * 0.23).cos())
+                .collect::<Vec<_>>(),
+            &[3, t, d],
+        )
+        .unwrap();
+        let msg_mlp = MxArray::from_float32(
+            &(0..(t * d) as usize)
+                .map(|i| ((i as f32) * 0.29).sin())
+                .collect::<Vec<_>>(),
+            &[t, d],
+        )
+        .unwrap();
+        let norm_w = MxArray::ones(&[d], Some(DType::Float32)).unwrap();
+
+        // S=3 QKV fused Metal path parity
+        let (mq, mk, mv) = ctrls_m
+            .forward_qkv_fused_rms_norm(&dest, &msgs_qkv, &norm_w, 1e-6, DType::Float32)
+            .unwrap();
+        let (rq, rk, rv) = ctrls_r
+            .forward_qkv_fused_rms_norm(&dest, &msgs_qkv, &norm_w, 1e-6, DType::Float32)
+            .unwrap();
+        for (a, b) in [(&mq, &rq), (&mk, &rk), (&mv, &rv)] {
+            let av = a.to_float32().unwrap();
+            let bv = b.to_float32().unwrap();
+            let max_diff = av
+                .iter()
+                .zip(bv.iter())
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            assert!(max_diff < 1e-5, "QKV fused max_diff={max_diff}");
+        }
+
+        // S=1 MLP fused Metal path parity: mixed BF16/F32 vs pure F32 fused (exact FP32 kernel)
+        let mlp_fused_m = ctrls_m
+            .mlp_ctrl
+            .forward_fused_rms_norm(&dest, &msg_mlp, &norm_w, 1e-6, DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let mlp_fused_r = ctrls_r
+            .mlp_ctrl
+            .forward_fused_rms_norm(&dest, &msg_mlp, &norm_w, 1e-6, DType::Float32)
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let fused_diff = mlp_fused_m
+            .iter()
+            .zip(mlp_fused_r.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            fused_diff < 1e-5,
+            "MLP fused mixed vs F32 max_diff={fused_diff}"
+        );
+
+        // Also cross-check against `forward_fused_rms_norm_with_hats` fallback (MLX FP32 matmul
+        // may use TF32 ~1e-3 on Apple Silicon, matching kernels.rs tolerance).
+        let mlp_ref = ctrls_r
+            .mlp_ctrl
+            .forward_fused_rms_norm_with_hats(
+                &dest,
+                &msg_mlp,
+                None,
+                None,
+                &norm_w,
+                1e-6,
+                DType::Float32,
+            )
+            .unwrap()
+            .to_float32()
+            .unwrap();
+        let fallback_diff = mlp_fused_m
+            .iter()
+            .zip(mlp_ref.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            fallback_diff < 5e-3,
+            "MLP fused vs fallback max_diff={fallback_diff}"
+        );
     }
 }

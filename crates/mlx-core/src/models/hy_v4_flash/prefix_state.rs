@@ -131,11 +131,14 @@ impl Stored for PrefixState {
 }
 
 /// A state as the store keeps it.
-pub struct Held<S>(pub S);
+pub struct Held<S> {
+    pub state: S,
+    pub kind: Kind,
+}
 
 impl<S: Stored> StateBytes for Held<S> {
     fn state_bytes(&self) -> u64 {
-        self.0.bytes()
+        self.state.bytes()
     }
 }
 
@@ -144,6 +147,17 @@ fn class_of(kind: Kind) -> StateClass {
     match kind {
         Kind::Checkpoint => StateClass::Checkpoint,
         Kind::Prompt | Kind::Turn | Kind::Cancel => StateClass::Ordinary,
+    }
+}
+
+/// Merges an incoming publication kind onto an existing state at the same
+/// block: `Kind::Prompt` always wins (never downgraded to `Checkpoint` or
+/// `Turn`), and any ordinary kind upgrades a `Checkpoint`.
+fn upgrade_kind(existing: Kind, incoming: Kind) -> Kind {
+    match (existing, incoming) {
+        (Kind::Prompt, _) | (_, Kind::Prompt) => Kind::Prompt,
+        (Kind::Checkpoint, other) => other,
+        (other, _) => other,
     }
 }
 
@@ -180,11 +194,15 @@ impl Turn {
         self.rows.last().map_or(self.resume, |s| s.row)
     }
 
+    /// Whether [`Self::hold`] would keep a state at `row`.
+    pub fn wants(&self, row: usize) -> bool {
+        row > self.floor() && self.held.as_ref().is_none_or(|h| row > h.row)
+    }
+
     /// Keeps `s` as the T candidate when it lies past the prompt's state
     /// rows and past the one held.
     pub fn hold(&mut self, s: PrefixState) {
-        let newer = self.held.as_ref().is_none_or(|h| s.row > h.row);
-        if s.row > self.floor() && newer {
+        if self.wants(s.row) {
             self.held = Some(s);
         }
     }
@@ -293,6 +311,11 @@ impl<S: Stored> States<S> {
         self.dropped
     }
 
+    /// Maximum RAM copies held at once.
+    pub fn ram_cap(&self) -> usize {
+        self.ram_cap
+    }
+
     /// States with a RAM copy.
     pub fn ram_len(&self) -> usize {
         self.store.entries().filter(|e| e.ram().is_some()).count()
@@ -310,38 +333,87 @@ impl<S: Stored> States<S> {
         rows
     }
 
+    /// Bytes `state` adds on top of shared parts already in `seen`.
+    fn delta_bytes(seen: &mut HashSet<usize>, state: &S) -> u64 {
+        let shared = state.shared();
+        let own = state
+            .bytes()
+            .saturating_sub(shared.iter().map(|p| p.1).sum::<u64>());
+        let mut extra = own;
+        for (id, bytes) in shared {
+            if seen.insert(id) {
+                extra = extra.saturating_add(bytes);
+            }
+        }
+        extra
+    }
+
     /// Bytes the RAM copies hold, shared parts once.
     pub fn held_bytes(&self) -> u64 {
         let mut seen = HashSet::new();
         let mut total = 0u64;
-        for Held(s) in self.store.entries().filter_map(|e| e.ram()) {
-            let shared = s.shared();
-            total += s.bytes().saturating_sub(shared.iter().map(|p| p.1).sum());
-            for (id, bytes) in shared {
-                if seen.insert(id) {
-                    total += bytes;
-                }
-            }
+        for Held { state: s, .. } in self.store.entries().filter_map(|e| e.ram()) {
+            total = total.saturating_add(Self::delta_bytes(&mut seen, s));
         }
         total
     }
 
-    /// The RAM copy that goes first: a checkpoint (oldest publication), else
-    /// the least recently used; never one with a disk write in flight or in
-    /// use.
-    fn victim(&self) -> Option<u64> {
+    /// Incremental RAM bytes adding `state` would add to [`Self::held_bytes`],
+    /// counting shared parts only when not already held by another RAM entry.
+    pub fn added_bytes(&self, state: &S) -> u64 {
+        let mut seen = HashSet::new();
+        for Held { state: s, .. } in self.store.entries().filter_map(|e| e.ram()) {
+            for (id, _) in s.shared() {
+                seen.insert(id);
+            }
+        }
+        Self::delta_bytes(&mut seen, state)
+    }
+
+    /// Whether `e` holds a RAM copy eligible for eviction (not protected, not
+    /// in use, and not waiting for a disk write to land).
+    fn is_free_excluding(&self, e: &Entry<Held<S>>, protect: Option<u64>) -> bool {
+        Some(e.id()) != protect
+            && e.ram().is_some()
+            && e.disk().is_none_or(|d| d.landed)
+            && !self.store.in_use(e.mark())
+    }
+
+    /// Count, resident bytes (shared parts once), and shared part ids of RAM
+    /// entries that cannot currently be evicted.
+    fn pinned_ram_excluding(&self, protect: Option<u64>) -> (usize, u64, HashSet<usize>) {
+        let mut count = 0usize;
+        let mut bytes = 0u64;
+        let mut seen = HashSet::new();
+        for e in self.store.entries() {
+            if let Some(Held { state: s, .. }) = e.ram()
+                && !self.is_free_excluding(e, protect)
+            {
+                count += 1;
+                bytes = bytes.saturating_add(Self::delta_bytes(&mut seen, s));
+            }
+        }
+        (count, bytes, seen)
+    }
+
+    /// The RAM copy that goes first, skipping `protect`: a checkpoint (oldest
+    /// publication), else the least recently used; never one with a disk write
+    /// in flight or in use.
+    fn victim_excluding(&self, protect: Option<u64>) -> Option<u64> {
         let free = || {
-            self.store.entries().filter(|e| {
-                e.ram().is_some()
-                    && e.disk().is_none_or(|d| d.landed)
-                    && !self.store.in_use(e.mark())
-            })
+            self.store
+                .entries()
+                .filter(|e| self.is_free_excluding(e, protect))
         };
         free()
             .filter(|e| e.checkpoint())
             .min_by_key(|e| e.publication())
             .or_else(|| free().min_by_key(|e| e.last_used()))
             .map(|e| e.id())
+    }
+
+    fn victim(&self) -> Option<u64> {
+        self.victim_excluding(None)
     }
 
     /// Gives up the RAM copy of `id`: a state whose disk copy and chain
@@ -367,11 +439,102 @@ impl<S: Stored> States<S> {
         before.saturating_sub(self.held_bytes())
     }
 
-    /// Publishes `state` at the end of `lineage` (whole blocks). The oldest
-    /// RAM copy goes when `RAM_STATES` are held; `None` when every held one
-    /// is in use. A state already on that block is reused; one there on
+    /// Evicts eligible victims until `held_bytes() + incoming <= byte_cap`.
+    /// Returns `false` without evicting when pinned RAM entries leave no way
+    /// to fit `incoming`.
+    pub fn reserve_bytes(&mut self, incoming: u64, byte_cap: u64) -> bool {
+        let (_, pinned_bytes, _) = self.pinned_ram_excluding(None);
+        if pinned_bytes.saturating_add(incoming) > byte_cap {
+            return false;
+        }
+        while self.held_bytes().saturating_add(incoming) > byte_cap {
+            let Some(id) = self.victim() else {
+                break;
+            };
+            self.evict(id);
+        }
+        self.held_bytes().saturating_add(incoming) <= byte_cap
+    }
+
+    /// Evicts eligible victims (never `protect`) before decoding disk-only `id`
+    /// until there is both a RAM slot and `incoming` bytes of headroom under
+    /// `byte_cap`. Returns `false` without evicting when `id` is not disk-only
+    /// or pinned/protected RAM entries leave no way to fit it.
+    pub fn reserve_for_promote(
+        &mut self,
+        id: u64,
+        incoming: u64,
+        byte_cap: u64,
+        protect: Option<u64>,
+    ) -> bool {
+        if !self.store.get(id).is_some_and(|e| e.ram().is_none()) {
+            return false;
+        }
+        let (pinned_count, pinned_bytes, _) = self.pinned_ram_excluding(protect);
+        if pinned_count >= self.ram_cap || pinned_bytes.saturating_add(incoming) > byte_cap {
+            return false;
+        }
+        while self.ram_len() >= self.ram_cap
+            || self.held_bytes().saturating_add(incoming) > byte_cap
+        {
+            match self.victim_excluding(protect) {
+                Some(v) if v != id => self.evict(v),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Evicts eligible victims (never `protect`) until there is a RAM slot and
+    /// `state` fits within `byte_cap` (when given); returns `false` without
+    /// evicting if pinned/protected RAM entries make fitting impossible.
+    fn make_room_for_state(
+        &mut self,
+        exclude: Option<u64>,
+        state: &S,
+        byte_cap: Option<u64>,
+        protect: Option<u64>,
+    ) -> bool {
+        let (pinned_count, pinned_bytes, mut pinned_seen) = self.pinned_ram_excluding(protect);
+        if pinned_count >= self.ram_cap {
+            return false;
+        }
+        if let Some(cap) = byte_cap {
+            let min_bytes = pinned_bytes.saturating_add(Self::delta_bytes(&mut pinned_seen, state));
+            if min_bytes > cap {
+                return false;
+            }
+        }
+        while self.ram_len() >= self.ram_cap
+            || byte_cap
+                .is_some_and(|cap| self.held_bytes().saturating_add(self.added_bytes(state)) > cap)
+        {
+            match self.victim_excluding(protect) {
+                Some(v) if Some(v) != exclude => self.evict(v),
+                _ => return false,
+            }
+        }
+        true
+    }
+
+    /// Publishes `state` at the end of `lineage` (whole blocks). A victim RAM
+    /// copy goes when `ram_cap` are held; `None` when every held one is in
+    /// use. A state already on that block is reused (upgrading its kind when
+    /// needed, never downgrading `Prompt` or ordinary states); one there on
     /// disk only takes this copy as its RAM copy.
     pub fn publish(&mut self, key: Key<'_>, state: S, kind: Kind) -> Result<Option<u64>> {
+        self.publish_within(key, state, kind, None)
+    }
+
+    /// Like [`Self::publish`], also enforcing `byte_cap` on total resident
+    /// state RAM bytes (shared parts counted once).
+    pub fn publish_within(
+        &mut self,
+        key: Key<'_>,
+        state: S,
+        kind: Kind,
+        byte_cap: Option<u64>,
+    ) -> Result<Option<u64>> {
         let lineage = key.lineage();
         if lineage.tokens.is_empty() || !lineage.tokens.len().is_multiple_of(BLOCK_ROWS) {
             return Err(bad(format!(
@@ -381,22 +544,34 @@ impl<S: Stored> States<S> {
         }
         let (_, there) = self.store.locate(lineage);
         let disk_only = there.filter(|&id| self.store.get(id).is_some_and(|e| e.ram().is_none()));
-        if there.is_none() || disk_only.is_some() {
-            while self.ram_len() >= self.ram_cap {
-                match self.victim() {
-                    Some(id) => self.evict(id),
-                    None => return Ok(None),
-                }
+        if let Some(id) = there
+            && disk_only.is_none()
+            && let Some(prev) = self.store.get(id).and_then(|e| e.ram()).map(|h| h.kind)
+        {
+            let next_kind = upgrade_kind(prev, kind);
+            if next_kind != prev
+                && let Some(held) = self.store.ram_mut(id)
+            {
+                held.kind = next_kind;
             }
+            self.store.reuse(id, next_kind == Kind::Checkpoint);
+            return Ok(Some(id));
+        }
+        if (there.is_none() || disk_only.is_some())
+            && !self.make_room_for_state(disk_only, &state, byte_cap, None)
+        {
+            return Ok(None);
         }
         if let Some(id) = disk_only
             && self.store.get(id).is_some()
         {
-            self.store.promote(id, Held(state));
+            self.store.promote(id, Held { state, kind });
             self.store.reuse(id, kind == Kind::Checkpoint);
             return Ok(Some(id));
         }
-        let ins = self.store.insert(lineage, Held(state), class_of(kind))?;
+        let ins = self
+            .store
+            .insert(lineage, Held { state, kind }, class_of(kind))?;
         Ok(Some(ins.id))
     }
 
@@ -426,20 +601,39 @@ impl<S: Stored> States<S> {
         out.into_iter().map(|(id, row, _)| (id, row)).collect()
     }
 
-    /// Gives disk-only `id` its RAM copy `state` back, the oldest RAM copy
-    /// going first when `RAM_STATES` are held; false when it is gone, holds
+    /// Gives disk-only `id` its RAM copy `state` back, a victim RAM copy
+    /// going first when `ram_cap` are held; false when it is gone, holds
     /// one, or every held one is in use.
     pub fn promote(&mut self, id: u64, state: S) -> bool {
-        if self.store.get(id).is_none_or(|e| e.ram().is_some()) {
+        self.promote_within(id, state, None, None)
+    }
+
+    /// Like [`Self::promote`], also enforcing `byte_cap` on total resident
+    /// state RAM bytes (shared parts counted once) and never evicting
+    /// `protect`.
+    pub fn promote_within(
+        &mut self,
+        id: u64,
+        state: S,
+        byte_cap: Option<u64>,
+        protect: Option<u64>,
+    ) -> bool {
+        let kind = match self.store.get(id) {
+            Some(e) if e.ram().is_none() => {
+                if e.checkpoint() {
+                    Kind::Checkpoint
+                } else if !any_written(e.extra_keys()) {
+                    Kind::Prompt
+                } else {
+                    Kind::Turn
+                }
+            }
+            _ => return false,
+        };
+        if !self.make_room_for_state(Some(id), &state, byte_cap, protect) {
             return false;
         }
-        while self.ram_len() >= self.ram_cap {
-            match self.victim() {
-                Some(v) if v != id => self.evict(v),
-                _ => return false,
-            }
-        }
-        self.store.promote(id, Held(state))
+        self.store.promote(id, Held { state, kind })
     }
 
     /// Drops the RAM copy of every state whose disk copy and chain landed.
@@ -468,7 +662,7 @@ impl<S: Stored> States<S> {
 
     /// The RAM copy of `id`.
     pub fn get(&self, id: u64) -> Option<&S> {
-        self.store.get(id).and_then(|e| e.ram()).map(|h| &h.0)
+        self.store.get(id).and_then(|e| e.ram()).map(|h| &h.state)
     }
 
     /// Stamps `id` newest (after a restore from it).
@@ -551,7 +745,14 @@ pub(crate) fn resumes<S>(e: &Entry<S>, prompt: Key<'_>) -> bool {
 }
 
 fn agrees(a: &[Vec<u64>], b: &[Vec<u64>], blocks: usize) -> bool {
-    (0..blocks).all(|i| block_key(a, i) == block_key(b, i))
+    (0..blocks).all(|i| block_key_agrees(block_key(a, i), block_key(b, i)))
+}
+
+/// Whether a stored block's extra key matches a prompt's cold pass key:
+/// exact equality, or a pre-upgrade 1-element `[k]` key matching the
+/// deterministic `[WRITE_TAG, k]` key now emitted for transient chunks.
+fn block_key_agrees(stored: &[u64], prompt: &[u64]) -> bool {
+    stored == prompt || matches!((stored, prompt), ([k], [WRITE_TAG, p]) if k == p)
 }
 
 fn block_key(keys: &[Vec<u64>], i: usize) -> &[u64] {

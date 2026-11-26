@@ -52,10 +52,7 @@ impl Gemma4ImageProcessor {
     /// Process raw image bytes (PNG/JPEG) into pixel values + soft token count.
     pub fn process_bytes(&self, data: &[u8]) -> Result<ProcessedGemma4Image> {
         let img = image::load_from_memory(data).map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to decode image: {e}"),
-            )
+            crate::vision::validate::image_processing_error(format!("Failed to decode image: {e}"))
         })?;
 
         let (orig_width, orig_height) = img.dimensions();

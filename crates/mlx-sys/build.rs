@@ -366,6 +366,46 @@ fn compile_paged_attn_metallib(
             min_os.clone(),
         ],
     });
+    // Standalone Metal 4 Tiled64 prefill GEMM kernels (zero MLX headers):
+    // plain BF16 stores (-O3), BF16 residual/SwiGLU epilogues (-O3 -fno-fast-math),
+    // and INT8-activation quantizer + GEMM (-O3).
+    jobs.push(AirJob {
+        src: bridge_dir.join("kquant").join("kquant_prefill_nax.metal"),
+        air: out_dir.join("kquant_prefill_nax.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-std=metal4.0".to_string(),
+            "-O3".to_string(),
+            min_os.clone(),
+        ],
+    });
+    jobs.push(AirJob {
+        src: bridge_dir.join("kquant").join("kquant_prefill_nax.metal"),
+        air: out_dir.join("kquant_prefill_nax_ep.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-std=metal4.0".to_string(),
+            "-O3".to_string(),
+            "-fno-fast-math".to_string(),
+            "-DKQUANT_PREFILL_EPILOGUES=1".to_string(),
+            min_os.clone(),
+        ],
+    });
+    jobs.push(AirJob {
+        src: bridge_dir
+            .join("kquant")
+            .join("kquant_prefill_int8_nax.metal"),
+        air: out_dir.join("kquant_prefill_int8_nax.air"),
+        args: vec![
+            "-x".to_string(),
+            "metal".to_string(),
+            "-std=metal4.0".to_string(),
+            "-O3".to_string(),
+            min_os.clone(),
+        ],
+    });
     // Self-contained sources (no MLX headers), with the same flags. The
     // tensor-op verify kernel includes MetalPerformancePrimitives from the
     // SDK; `assert_nax_buildable` has already checked the deployment target.

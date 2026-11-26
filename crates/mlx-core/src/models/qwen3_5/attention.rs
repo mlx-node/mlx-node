@@ -16,7 +16,116 @@ use crate::vision::rope_vision::{
 use napi::bindgen_prelude::*;
 
 use super::config::Qwen3_5Config;
-use crate::models::quantized_linear::{LinearProj, MixerResidual, QuantizedLinear};
+use crate::models::quantized_linear::{
+    LinearProj, MixerResidual, PreparedInt8Prefill, QuantizedLinear,
+};
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn mlx_paged_prefill_scope_arm(
+        gate: *mut mlx_sys::mlx_array,
+        q_staged: *mut mlx_sys::mlx_array,
+        base_committed: i32,
+        total_rows: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+    ) -> bool;
+
+    fn mlx_paged_prefill_scope_disarm() -> i32;
+
+    fn mlx_qwen35_paged_qkv_prep_forward(
+        q_raw: *mut mlx_sys::mlx_array,
+        k_raw: *mut mlx_sys::mlx_array,
+        v_raw: *mut mlx_sys::mlx_array,
+        wq: *mut mlx_sys::mlx_array,
+        wk: *mut mlx_sys::mlx_array,
+        slot_mapping: *mut mlx_sys::mlx_array,
+        k_pool: *mut mlx_sys::mlx_array,
+        v_pool: *mut mlx_sys::mlx_array,
+        k_scale: *mut mlx_sys::mlx_array,
+        v_scale: *mut mlx_sys::mlx_array,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+        block_size: i32,
+        rope_dims: i32,
+        rope_offset: i32,
+        eps: f32,
+        rope_base: f32,
+        rope_scale: f32,
+        kv_mode: u32,
+        out_q_staged: *mut *mut mlx_sys::mlx_array,
+        out_k_pool: *mut *mut mlx_sys::mlx_array,
+        out_v_pool: *mut *mut mlx_sys::mlx_array,
+        out_k_scale: *mut *mut mlx_sys::mlx_array,
+        out_v_scale: *mut *mut mlx_sys::mlx_array,
+    ) -> bool;
+}
+
+/// RAII guard for the thread-local paged prefill scope (`gate` fusion and/or
+/// pre-staged queries from `qwen35_qkv_prep`). Always disarms on drop so an
+/// error or panic never leaks thread-local state into later calls.
+#[cfg(target_os = "macos")]
+struct PrefillScopeGuard {
+    armed: bool,
+}
+
+#[cfg(target_os = "macos")]
+impl PrefillScopeGuard {
+    fn arm(
+        gate: Option<&MxArray>,
+        q_staged: Option<&MxArray>,
+        base_committed: i32,
+        total_rows: i32,
+        num_q_heads: i32,
+        num_kv_heads: i32,
+        head_size: i32,
+    ) -> Self {
+        let gate_ptr = gate.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        let q_staged_ptr = q_staged.map_or(std::ptr::null_mut(), MxArray::as_raw_ptr);
+        let armed = if gate_ptr.is_null() && q_staged_ptr.is_null() {
+            false
+        } else {
+            // SAFETY: input array handles remain live for the duration of the FFI
+            // call; the C++ side retains ref-counted copies in thread-local storage.
+            unsafe {
+                mlx_paged_prefill_scope_arm(
+                    gate_ptr,
+                    q_staged_ptr,
+                    base_committed,
+                    total_rows,
+                    num_q_heads,
+                    num_kv_heads,
+                    head_size,
+                )
+            }
+        };
+        Self { armed }
+    }
+
+    fn disarm(mut self) -> i32 {
+        if !self.armed {
+            return 0;
+        }
+        self.armed = false;
+        // SAFETY: clears thread-local prefill scope and returns fused gate row count.
+        unsafe { mlx_paged_prefill_scope_disarm() }
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for PrefillScopeGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.armed = false;
+            // SAFETY: clears thread-local prefill scope on early return or unwind.
+            unsafe {
+                let _ = mlx_paged_prefill_scope_disarm();
+            }
+        }
+    }
+}
 
 /// Rotary position embedding mode for full-attention layers when 3D M-RoPE
 /// `position_ids` (`[3, B, T]`) are provided.
@@ -145,6 +254,7 @@ pub struct PagedWaveLane {
 /// `keys` / `values` `[B, T, Hkv, D]`; returns `[B, T, Hq * D]` in
 /// `out_dtype`.
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn paged_store_attend(
     adapter: &mut PagedKVCacheAdapter,
     attn_layer_idx: u32,
@@ -571,6 +681,92 @@ impl Qwen3_5Attention {
         let (queries, gate) = self.project_q_gate(x, batch, seq_len)?;
         let (keys, values) = self.project_kv(x)?;
         Ok((queries, gate, keys, values))
+    }
+
+    /// Prefill mixer projection sharing ONE `PreparedInt8Prefill` across
+    /// `q_proj` and `kv_proj` (or unmerged `k_proj` + `v_proj`). Falls back to
+    /// [`Self::project_mixer`] when off-contract or unsupported.
+    fn project_mixer_int8_prefill(
+        &self,
+        x: &MxArray,
+        batch: i64,
+        seq_len: i64,
+    ) -> Result<(MxArray, MxArray, MxArray, MxArray)> {
+        let any_i8 = (self.q_gate_block_t.is_none() && self.q_proj.supports_int8_prefill())
+            || match &self.kv_proj {
+                Some((merged, _)) => merged.supports_int8_prefill(),
+                None => self.k_proj.supports_int8_prefill() || self.v_proj.supports_int8_prefill(),
+            };
+        if !any_i8 {
+            return self.project_mixer(x, batch, seq_len);
+        }
+        let Some(pre) = PreparedInt8Prefill::try_new(x)? else {
+            return self.project_mixer(x, batch, seq_len);
+        };
+        let hd = i64::from(self.num_heads * self.head_dim);
+        let (queries, gate) = if self.q_gate_block_t.is_some() {
+            self.project_q_gate(x, batch, seq_len)?
+        } else if self.q_proj.has_q_gate_block_layout() {
+            let flat = self.q_proj.forward_int8_prefill_or(x, Some(&pre))?;
+            let qg = flat.split_sections(&[hd], 2)?;
+            let queries = qg[0].reshape(&[
+                batch,
+                seq_len,
+                i64::from(self.num_heads),
+                i64::from(self.head_dim),
+            ])?;
+            (queries, qg[1].clone())
+        } else {
+            let q_proj_output = self.q_proj.forward_int8_prefill_or(x, Some(&pre))?;
+            let q_per_head = q_proj_output.reshape(&[
+                batch,
+                seq_len,
+                i64::from(self.num_heads),
+                i64::from(self.head_dim * 2),
+            ])?;
+            let queries = q_per_head.slice_axis(3, 0, i64::from(self.head_dim))?;
+            let gate = q_per_head
+                .slice_axis(3, i64::from(self.head_dim), i64::from(self.head_dim * 2))?
+                .reshape(&[batch, seq_len, hd])?;
+            (queries, gate)
+        };
+        let (keys, values) = if let Some((merged, k_rows)) = &self.kv_proj {
+            let kv = merged.forward_int8_prefill_or(x, Some(&pre))?;
+            let last = kv.ndim()? as usize - 1;
+            let kv_split = kv.split_sections(&[*k_rows], last as i32)?;
+            (kv_split[0].clone(), kv_split[1].clone())
+        } else {
+            (
+                self.k_proj.forward_int8_prefill_or(x, Some(&pre))?,
+                self.v_proj.forward_int8_prefill_or(x, Some(&pre))?,
+            )
+        };
+        Ok((queries, gate, keys, values))
+    }
+
+    /// Prefill K/V projection sharing ONE `PreparedInt8Prefill` across
+    /// `kv_proj` or unmerged `k_proj` + `v_proj`.
+    fn project_kv_int8_prefill(&self, x: &MxArray) -> Result<(MxArray, MxArray)> {
+        let any_i8 = match &self.kv_proj {
+            Some((merged, _)) => merged.supports_int8_prefill(),
+            None => self.k_proj.supports_int8_prefill() || self.v_proj.supports_int8_prefill(),
+        };
+        if !any_i8 {
+            return self.project_kv(x);
+        }
+        let Some(pre) = PreparedInt8Prefill::try_new(x)? else {
+            return self.project_kv(x);
+        };
+        if let Some((merged, k_rows)) = &self.kv_proj {
+            let kv = merged.forward_int8_prefill_or(x, Some(&pre))?;
+            let last = kv.ndim()? as usize - 1;
+            let kv_split = kv.split_sections(&[*k_rows], last as i32)?;
+            return Ok((kv_split[0].clone(), kv_split[1].clone()));
+        }
+        Ok((
+            self.k_proj.forward_int8_prefill_or(x, Some(&pre))?,
+            self.v_proj.forward_int8_prefill_or(x, Some(&pre))?,
+        ))
     }
 
     /// Resolve the CUDA Sym8 mixer projections (`q_proj` + `kv_proj` or
@@ -1751,12 +1947,19 @@ impl Qwen3_5Attention {
     ) -> Result<MxArray> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        let int8_act = pass == PagedPass::Prefill
+            && adapter.activations() == crate::transformer::Activations::Auto;
 
-        let (queries, gate, keys, values) = self.project_mixer(x, batch, seq_len)?;
-        let output = self.attend_projected(
+        let (queries, gate, keys, values) = if int8_act {
+            self.project_mixer_int8_prefill(x, batch, seq_len)?
+        } else {
+            self.project_mixer(x, batch, seq_len)?
+        };
+        let (output, gate_fused) = self.attend_projected(
             &queries,
             &keys,
             &values,
+            Some(&gate),
             adapter,
             attn_layer_idx,
             first_logical_position,
@@ -1767,28 +1970,42 @@ impl Qwen3_5Attention {
             x.dtype()?,
         )?;
 
-        // Apply gate: output * sigmoid(gate) — one compiled fusion.
-        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+        // Apply gate: output * sigmoid(gate) — skipped when fused inside paged
+        // prefill/verify attention.
+        let gated_output = if gate_fused {
+            output
+        } else {
+            Activations::sigmoid_mul_compiled(&gate, &output)?
+        };
 
         // Output projection.
-        match residual {
-            Some(residual) => self
-                .o_proj
-                .forward_mixer_output(&gated_output, None, Some(residual)),
-            None => self.o_proj.forward(&gated_output),
+        if int8_act {
+            self.o_proj
+                .forward_mixer_output_int8_prefill(&gated_output, residual, true)
+        } else {
+            match residual {
+                Some(residual) => {
+                    self.o_proj
+                        .forward_mixer_output(&gated_output, None, Some(residual))
+                }
+                None => self.o_proj.forward(&gated_output),
+            }
         }
     }
 
     /// The part of [`Self::forward_paged`] after the projections, for the
     /// active sequence: QK norm, RoPE, the pool's operands, then
     /// [`paged_store_attend`]. `queries` `[B, T, Hq, D]`, `keys` / `values`
-    /// `[B, T, Hkv * D]`; returns `[B, T, Hq * D]` in `out_dtype`.
+    /// `[B, T, Hkv * D]`; returns `([B, T, Hq * D]` in `out_dtype`,
+    /// `gate_fused)` where `gate_fused` is `true` iff `gate` was already fused
+    /// into every output row inside paged prefill/verify attention.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn attend_projected(
         &self,
         queries: &MxArray,
         keys: &MxArray,
         values: &MxArray,
+        gate: Option<&MxArray>,
         adapter: &mut PagedKVCacheAdapter,
         attn_layer_idx: u32,
         first_logical_position: u32,
@@ -1797,7 +2014,7 @@ impl Qwen3_5Attention {
         rope_position_offset: i32,
         mrope_cache: &mut Option<(MxArray, MxArray)>,
         out_dtype: DType,
-    ) -> Result<MxArray> {
+    ) -> Result<(MxArray, bool)> {
         let batch = queries.shape_at(0)?;
         let seq_len = queries.shape_at(1)?;
         let keys = keys.reshape(&[
@@ -1812,6 +2029,167 @@ impl Qwen3_5Attention {
             self.num_kv_heads as i64,
             self.head_dim as i64,
         ])?;
+
+        #[cfg(target_os = "macos")]
+        let gate_for_scope = if pass != PagedPass::Decode
+            && batch == 1
+            && out_dtype == DType::BFloat16
+            && gate.is_some_and(|g| g.dtype().ok() == Some(DType::BFloat16))
+        {
+            gate
+        } else {
+            None
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let can_fuse_qkv = pass != PagedPass::Decode
+                && batch == 1
+                && self.head_dim == 256
+                && position_ids.is_none()
+                && !self.rope.is_scaled()
+                && !self.rope.traditional
+                && rope_position_offset >= 0
+                && !self.q_norm.is_precise_f32()
+                && !self.k_norm.is_precise_f32()
+                && self.q_norm.eps_f32().to_bits() == self.k_norm.eps_f32().to_bits()
+                && self.q_norm.weight().dtype()? == DType::BFloat16
+                && self.k_norm.weight().dtype()? == DType::BFloat16
+                && queries.dtype()? == DType::BFloat16
+                && keys.dtype()? == DType::BFloat16
+                && values.dtype()? == DType::BFloat16
+                && adapter
+                    .paged_operand_dtype()
+                    .is_none_or(|d| d == DType::BFloat16)
+                && seq_len > 0
+                && seq_len <= i64::from(mlx_paged_attn::prefill_plan::PREFILL_MAX_ROWS)
+                && self.num_kv_heads > 0
+                && self.num_heads > 0
+                && self.num_heads % self.num_kv_heads == 0
+                && (attn_layer_idx as usize) < adapter.physical_layer_count()
+                && adapter.layer_kv_pool().config().num_kv_heads as i32 == self.num_kv_heads
+                && adapter.layer_kv_pool().config().head_size as i32 == self.head_dim
+                && first_logical_position.checked_add(seq_len as u32)
+                    == Some(adapter.current_token_count())
+                && unsafe { mlx_sys::mlx_metal_is_available() };
+
+            if can_fuse_qkv
+                && let Some(seq_id) = adapter.active_seq_id()
+                && let Ok((k_pool_in, v_pool_in, k_scale_in, v_scale_in, kv_mode)) =
+                    adapter.native_fused_write_pool_arrays(attn_layer_idx)
+            {
+                let block_size = adapter.block_size();
+                let mode_ok =
+                    (kv_mode == 0 && block_size == 32) || (kv_mode == 1 && block_size >= 1);
+                if mode_ok
+                    && let Ok((slot_mapping, _)) = adapter.build_single_write_slot_mapping(
+                        seq_id,
+                        first_logical_position,
+                        seq_len as u32,
+                        first_logical_position,
+                    )
+                {
+                    let mut out_q_staged: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut out_k_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut out_v_pool: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut out_k_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    let mut out_v_scale: *mut mlx_sys::mlx_array = std::ptr::null_mut();
+                    // SAFETY: all input handles remain live for the duration of the FFI call.
+                    let ok = unsafe {
+                        mlx_qwen35_paged_qkv_prep_forward(
+                            queries.as_raw_ptr(),
+                            keys.as_raw_ptr(),
+                            values.as_raw_ptr(),
+                            self.q_norm.weight().as_raw_ptr(),
+                            self.k_norm.weight().as_raw_ptr(),
+                            slot_mapping.as_raw_ptr(),
+                            k_pool_in.as_raw_ptr(),
+                            v_pool_in.as_raw_ptr(),
+                            k_scale_in.as_raw_ptr(),
+                            v_scale_in.as_raw_ptr(),
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                            block_size as i32,
+                            self.rope.dims,
+                            rope_position_offset,
+                            self.q_norm.eps_f32(),
+                            self.rope.base,
+                            self.rope.scale,
+                            kv_mode,
+                            &mut out_q_staged,
+                            &mut out_k_pool,
+                            &mut out_v_pool,
+                            &mut out_k_scale,
+                            &mut out_v_scale,
+                        )
+                    };
+                    if ok
+                        && !out_q_staged.is_null()
+                        && !out_k_pool.is_null()
+                        && !out_v_pool.is_null()
+                        && !out_k_scale.is_null()
+                        && !out_v_scale.is_null()
+                    {
+                        let q_staged =
+                            MxArray::from_handle(out_q_staged, "qwen35_qkv_prep.q_staged")?;
+                        let kp_out = MxArray::from_handle(out_k_pool, "qwen35_qkv_prep.k_pool")?;
+                        let vp_out = MxArray::from_handle(out_v_pool, "qwen35_qkv_prep.v_pool")?;
+                        let ks_out = MxArray::from_handle(out_k_scale, "qwen35_qkv_prep.k_scale")?;
+                        let vs_out = MxArray::from_handle(out_v_scale, "qwen35_qkv_prep.v_scale")?;
+                        adapter
+                            .commit_native_fused_write(
+                                attn_layer_idx,
+                                kp_out,
+                                vp_out,
+                                ks_out,
+                                vs_out,
+                            )
+                            .map_err(Error::from_reason)?;
+                        // Lazy `[1, T, Hq, D]` view over `q_staged`: never evaluated on the
+                        // MPP fast path (which consumes `q_staged` directly via the armed
+                        // scope), while giving exact post-norm post-RoPE queries if
+                        // `force_portable_prefill()` or a non-aligned straddle falls back.
+                        let group = (self.num_heads / self.num_kv_heads) as i64;
+                        let q_4d = q_staged
+                            .slice(
+                                &[0, 0, 0, 0],
+                                &[
+                                    self.num_kv_heads as i64,
+                                    seq_len,
+                                    group,
+                                    self.head_dim as i64,
+                                ],
+                            )?
+                            .transpose(Some(&[1, 0, 2, 3]))?
+                            .reshape(&[1, seq_len, self.num_heads as i64, self.head_dim as i64])?;
+                        let guard = PrefillScopeGuard::arm(
+                            gate_for_scope,
+                            Some(&q_staged),
+                            first_logical_position as i32,
+                            seq_len as i32,
+                            self.num_heads,
+                            self.num_kv_heads,
+                            self.head_dim,
+                        );
+                        let output = paged_attend(
+                            adapter,
+                            attn_layer_idx,
+                            first_logical_position,
+                            pass,
+                            &q_4d,
+                            self.scale,
+                            out_dtype,
+                        )?;
+                        let fused_rows = guard.disarm();
+                        return Ok((
+                            output,
+                            gate_for_scope.is_some() && fused_rows == seq_len as i32,
+                        ));
+                    }
+                }
+            }
+        }
 
         // QK normalization on the last dim.
         let queries = self.q_norm.forward(queries)?;
@@ -1888,18 +2266,54 @@ impl Qwen3_5Attention {
 
         let (queries, keys, values) =
             self.paged_attention_operands(&queries, &keys, &values, adapter.paged_operand_dtype())?;
-        let output = paged_store_attend(
+        paged_store(
             adapter,
             attn_layer_idx,
             first_logical_position,
             pass,
-            &queries,
             &keys,
             &values,
-            self.scale,
-            out_dtype,
         )?;
-        Ok(output)
+        #[cfg(target_os = "macos")]
+        {
+            let guard = PrefillScopeGuard::arm(
+                gate_for_scope,
+                None,
+                first_logical_position as i32,
+                seq_len as i32,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            );
+            let output = paged_attend(
+                adapter,
+                attn_layer_idx,
+                first_logical_position,
+                pass,
+                &queries,
+                self.scale,
+                out_dtype,
+            )?;
+            let fused_rows = guard.disarm();
+            Ok((
+                output,
+                gate_for_scope.is_some() && fused_rows == seq_len as i32,
+            ))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = gate;
+            let output = paged_attend(
+                adapter,
+                attn_layer_idx,
+                first_logical_position,
+                pass,
+                &queries,
+                self.scale,
+                out_dtype,
+            )?;
+            Ok((output, false))
+        }
     }
 
     /// Q/gate, K and V of a wave `[N, T, H]`, each lane's rows with the bits
@@ -2009,15 +2423,19 @@ impl Qwen3_5Attention {
         let (queries, gate, keys, values) = self.project_mixer_lanes(x, batch, seq_len)?;
         let out_dtype = x.dtype()?;
         let mut outputs = Vec::with_capacity(lanes.len());
+        let mut all_gated = true;
+        let mut any_gated = false;
         for (i, lane) in lanes.iter().enumerate() {
             let i = i as i64;
             adapter
                 .activate_request(lane.seq)
                 .map_err(Error::from_reason)?;
-            outputs.push(self.attend_projected(
+            let lane_gate = gate.slice_axis(0, i, i + 1)?;
+            let (lane_out, lane_gated) = self.attend_projected(
                 &queries.slice_axis(0, i, i + 1)?,
                 &keys.slice_axis(0, i, i + 1)?,
                 &values.slice_axis(0, i, i + 1)?,
+                Some(&lane_gate),
                 adapter,
                 attn_layer_idx,
                 lane.first_logical_position,
@@ -2026,10 +2444,29 @@ impl Qwen3_5Attention {
                 lane.rope_position_offset,
                 &mut None,
                 out_dtype,
-            )?);
+            )?;
+            all_gated &= lane_gated;
+            any_gated |= lane_gated;
+            outputs.push((lane_out, lane_gate, lane_gated));
         }
-        let output = MxArray::concatenate_many(outputs.iter().collect(), Some(0))?;
-        let gated_output = Activations::sigmoid_mul_compiled(&gate, &output)?;
+        let gated_output = if all_gated {
+            let outs: Vec<&MxArray> = outputs.iter().map(|(o, _, _)| o).collect();
+            MxArray::concatenate_many(outs, Some(0))?
+        } else if !any_gated {
+            let outs: Vec<&MxArray> = outputs.iter().map(|(o, _, _)| o).collect();
+            let output = MxArray::concatenate_many(outs, Some(0))?;
+            Activations::sigmoid_mul_compiled(&gate, &output)?
+        } else {
+            let mut gated_lanes = Vec::with_capacity(outputs.len());
+            for (lane_out, lane_gate, lane_gated) in outputs {
+                if lane_gated {
+                    gated_lanes.push(lane_out);
+                } else {
+                    gated_lanes.push(Activations::sigmoid_mul_compiled(&lane_gate, &lane_out)?);
+                }
+            }
+            MxArray::concatenate_many(gated_lanes.iter().collect(), Some(0))?
+        };
         match residual {
             Some(residual) => self
                 .o_proj
@@ -2059,8 +2496,10 @@ impl Qwen3_5Attention {
     ) -> Result<()> {
         let batch = x.shape_at(0)?;
         let seq_len = x.shape_at(1)?;
+        let int8_act = adapter.activations() == crate::transformer::Activations::Auto;
         let (keys, values) = match self.project_mixer_fused(x, batch, seq_len)? {
             Some((_, _, keys, values)) => (keys, values),
+            None if int8_act => self.project_kv_int8_prefill(x)?,
             None => self.project_kv(x)?,
         };
         let keys = keys.reshape(&[
@@ -5267,6 +5706,666 @@ mod tests {
             max_causal_diff > 1e-3,
             "float additive [B,1,1,K] mask had no effect vs causal attention: max_causal_diff={max_causal_diff}"
         );
+        Ok(())
+    }
+
+    #[cfg(target_os = "macos")]
+    fn build_d256_test_attention(
+        hidden: i32,
+        num_heads: i32,
+        num_kv_heads: i32,
+        finalize_block: bool,
+    ) -> Result<Qwen3_5Attention> {
+        let cfg = Qwen3_5Config {
+            hidden_size: hidden,
+            num_heads,
+            num_kv_heads,
+            head_dim: 256,
+            partial_rotary_factor: 0.25,
+            rope_theta: 10_000_000.0,
+            ..tiny_cfg()
+        };
+        let mut attn = Qwen3_5Attention::new(&cfg)?;
+        let det_bf16 = |shape: &[i64], salt: f32, scale: f32| -> Result<MxArray> {
+            let n: usize = shape.iter().map(|&d| d as usize).product();
+            let vals: Vec<f32> = (0..n)
+                .map(|i| ((i as f32) * 0.1937 + salt).sin() * scale)
+                .collect();
+            MxArray::from_float32(&vals, shape)?.astype(DType::BFloat16)
+        };
+        let h = i64::from(hidden);
+        let nq = i64::from(num_heads);
+        let nkv = i64::from(num_kv_heads);
+        let d = 256i64;
+        attn.set_q_proj_weight(&det_bf16(&[2 * nq * d, h], 1.1, 0.06)?)?;
+        attn.set_k_proj_weight(&det_bf16(&[nkv * d, h], 2.2, 0.06)?)?;
+        attn.set_v_proj_weight(&det_bf16(&[nkv * d, h], 3.3, 0.06)?)?;
+        attn.set_o_proj_weight(&det_bf16(&[h, nq * d], 4.4, 0.06)?)?;
+        let qw = det_bf16(&[d], 5.5, 0.25)?
+            .add_scalar(1.0)?
+            .astype(DType::BFloat16)?;
+        let kw = det_bf16(&[d], 6.6, 0.25)?
+            .add_scalar(1.0)?
+            .astype(DType::BFloat16)?;
+        attn.set_q_norm_weight(&qw, DType::BFloat16)?;
+        attn.set_k_norm_weight(&kw, DType::BFloat16)?;
+        if finalize_block {
+            attn.finalize_q_gate_block()?;
+        }
+        Ok(attn)
+    }
+
+    /// Reference unfused paged forward: manual QK-norm + RoPE + `paged_store_attend`
+    /// (without arming `PrefillScopeGuard`) + `Activations::sigmoid_mul_compiled` + `o_proj`.
+    #[cfg(target_os = "macos")]
+    #[allow(clippy::too_many_arguments)]
+    fn unfused_forward_paged_ref(
+        attn: &Qwen3_5Attention,
+        x: &MxArray,
+        adapter: &mut PagedKVCacheAdapter,
+        attn_layer_idx: u32,
+        first_logical_position: u32,
+        pass: PagedPass,
+        rope_position_offset: i32,
+    ) -> Result<MxArray> {
+        let batch = x.shape_at(0)?;
+        let seq_len = x.shape_at(1)?;
+        let (queries, gate, keys, values) = attn.project_mixer(x, batch, seq_len)?;
+        let keys = keys.reshape(&[
+            batch,
+            seq_len,
+            attn.num_kv_heads as i64,
+            attn.head_dim as i64,
+        ])?;
+        let values = values.reshape(&[
+            batch,
+            seq_len,
+            attn.num_kv_heads as i64,
+            attn.head_dim as i64,
+        ])?;
+        let queries = attn.q_norm.forward(&queries)?;
+        let keys = attn.k_norm.forward(&keys)?;
+        let q_t = queries.transpose(Some(&[0, 2, 1, 3]))?;
+        let k_t = keys.transpose(Some(&[0, 2, 1, 3]))?;
+        let queries = attn
+            .rope
+            .forward(&q_t, Some(rope_position_offset))?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let keys = attn
+            .rope
+            .forward(&k_t, Some(rope_position_offset))?
+            .transpose(Some(&[0, 2, 1, 3]))?;
+        let (queries, keys, values) =
+            attn.paged_attention_operands(&queries, &keys, &values, adapter.paged_operand_dtype())?;
+        let output = paged_store_attend(
+            adapter,
+            attn_layer_idx,
+            first_logical_position,
+            pass,
+            &queries,
+            &keys,
+            &values,
+            attn.scale,
+            x.dtype()?,
+        )?;
+        let gated = Activations::sigmoid_mul_compiled(&gate, &output)?;
+        attn.o_proj.forward(&gated)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn make_d256_adapter(
+        num_kv_heads: u32,
+        block_size: u32,
+        dtype: mlx_paged_attn::metal::MetalDtype,
+        ktm: bool,
+        max_tokens: u32,
+    ) -> Option<PagedKVCacheAdapter> {
+        use crate::transformer::paged_int8_tests::adapter_with_layout;
+        let config = mlx_paged_attn::PagedAttentionConfig {
+            block_size,
+            gpu_memory_mb: 256,
+            head_size: 256,
+            num_kv_heads,
+            num_layers: 1,
+            max_seq_len: Some(max_tokens + 64),
+            max_batch_size: Some(4),
+        };
+        let blocks = max_tokens.div_ceil(block_size) + 8;
+        let layout = mlx_paged_attn::PageLayout {
+            keys_token_major: ktm,
+            ..mlx_paged_attn::PageLayout::default()
+        };
+        let (mut adapter, _pool) = adapter_with_layout(config, blocks, blocks, dtype, layout)?;
+        adapter.set_activations(crate::transformer::Activations::Auto);
+        Some(adapter)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn assert_outputs_close(got: &MxArray, want: &MxArray, tol: f32, label: &str) -> Result<()> {
+        let g = got.astype(DType::Float32)?;
+        let w = want.astype(DType::Float32)?;
+        MxArray::eval_arrays(&[&g, &w])?;
+        let gv = g.to_float32()?;
+        let wv = w.to_float32()?;
+        assert_eq!(gv.len(), wv.len(), "{label}: length mismatch");
+        let mut max_diff = 0.0f32;
+        let mut max_abs = 0.0f32;
+        for (&a, &b) in gv.iter().zip(wv.iter()) {
+            assert!(a.is_finite() && b.is_finite(), "{label}: non-finite output");
+            max_diff = max_diff.max((a - b).abs());
+            max_abs = max_abs.max(b.abs());
+        }
+        assert!(
+            max_abs > 1e-4,
+            "{label}: reference output is near zero ({max_abs})"
+        );
+        assert!(
+            max_diff <= tol,
+            "{label}: max_diff {max_diff} > tol {tol} (max_abs={max_abs})"
+        );
+        Ok(())
+    }
+
+    /// `splits == 1` direct BF16 store + fused `sigmoid(gate)` parity on BOTH
+    /// BF16-vLLM and INT8-KTM pools, including `rows = 256` (`splits == 1`) and
+    /// `rows = 320` straddling `int8_query_from = 256` (piece 0: `splits == 1`
+    /// direct store, piece 1: `splits == 4` reduce + INT8 queries on Apple10+).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_prefill_splits_one_direct_store_and_fused_gate_parity() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_prefill_splits_one_direct_store_and_fused_gate_parity",
+        ) {
+            return Ok(());
+        }
+        use mlx_paged_attn::metal::MetalDtype;
+        let attn = build_d256_test_attention(256, 24, 4, true)?;
+        for (label, dtype, bs, ktm) in [
+            ("bf16_vllm", MetalDtype::BFloat16, 16u32, false),
+            ("int8_ktm", MetalDtype::Int8, 32u32, true),
+        ] {
+            for &rows in &[256i64, 320i64] {
+                let Some(mut adapter_fused) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                    return Ok(());
+                };
+                let Some(mut adapter_ref) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                    return Ok(());
+                };
+                for ad in [&mut adapter_fused, &mut adapter_ref] {
+                    ad.reset_for_new_request(1).map_err(Error::from_reason)?;
+                    ad.allocate_suffix_blocks(rows as u32)
+                        .map_err(Error::from_reason)?;
+                    ad.record_tokens(&(0..rows as u32).collect::<Vec<_>>())
+                        .map_err(Error::from_reason)?;
+                }
+                let x_vals: Vec<f32> = (0..(rows as usize * 256))
+                    .map(|i| ((i as f32) * 0.137 + 0.5).sin() * 0.4)
+                    .collect();
+                let x = MxArray::from_float32(&x_vals, &[1, rows, 256])?.astype(DType::BFloat16)?;
+                let mut mrope_cache = None;
+                let got = attn.forward_paged(
+                    &x,
+                    &mut adapter_fused,
+                    0,
+                    0,
+                    PagedPass::Prefill,
+                    None,
+                    0,
+                    &mut mrope_cache,
+                )?;
+                let want = unfused_forward_paged_ref(
+                    &attn,
+                    &x,
+                    &mut adapter_ref,
+                    0,
+                    0,
+                    PagedPass::Prefill,
+                    0,
+                )?;
+                assert_outputs_close(&got, &want, 2e-2, &format!("{label}_rows{rows}"))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `splits > 1` reduce fused `sigmoid(gate)` parity for both `Pass::Prefill`
+    /// (`rows = 64`, `splits = 4`) and `Pass::Verify` (`rows = 8`, `splits >= 32`),
+    /// plus multi-lane `forward_paged_wave` parity on BF16-vLLM and INT8-KTM.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn paged_prefill_splits_gt_one_reduce_fused_gate_parity() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "paged_prefill_splits_gt_one_reduce_fused_gate_parity",
+        ) {
+            return Ok(());
+        }
+        use mlx_paged_attn::metal::MetalDtype;
+        let attn = build_d256_test_attention(256, 24, 4, true)?;
+        for (label, dtype, bs, ktm) in [
+            ("bf16_vllm", MetalDtype::BFloat16, 16u32, false),
+            ("int8_ktm", MetalDtype::Int8, 32u32, true),
+        ] {
+            let Some(mut adapter_fused) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                return Ok(());
+            };
+            let Some(mut adapter_ref) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                return Ok(());
+            };
+            for ad in [&mut adapter_fused, &mut adapter_ref] {
+                ad.reset_for_new_request(1).map_err(Error::from_reason)?;
+                ad.allocate_suffix_blocks(128).map_err(Error::from_reason)?;
+            }
+            // Chunk 1: Prefill rows = 64 (splits = 4 > 1)
+            for ad in [&mut adapter_fused, &mut adapter_ref] {
+                ad.record_tokens(&(0..64u32).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            let x1_vals: Vec<f32> = (0..(64 * 256))
+                .map(|i| ((i as f32) * 0.211 + 1.0).cos() * 0.4)
+                .collect();
+            let x1 = MxArray::from_float32(&x1_vals, &[1, 64, 256])?.astype(DType::BFloat16)?;
+            let mut mrope_cache = None;
+            let got_prefill = attn.forward_paged(
+                &x1,
+                &mut adapter_fused,
+                0,
+                0,
+                PagedPass::Prefill,
+                None,
+                0,
+                &mut mrope_cache,
+            )?;
+            let want_prefill = unfused_forward_paged_ref(
+                &attn,
+                &x1,
+                &mut adapter_ref,
+                0,
+                0,
+                PagedPass::Prefill,
+                0,
+            )?;
+            assert_outputs_close(
+                &got_prefill,
+                &want_prefill,
+                2e-2,
+                &format!("{label}_prefill64"),
+            )?;
+
+            // Chunk 2: Verify rows = 8 at committed = 64 (splits = 32 > 1)
+            for ad in [&mut adapter_fused, &mut adapter_ref] {
+                ad.record_tokens(&(64..72u32).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            let x2_vals: Vec<f32> = (0..(8 * 256))
+                .map(|i| ((i as f32) * 0.317 + 2.0).sin() * 0.4)
+                .collect();
+            let x2 = MxArray::from_float32(&x2_vals, &[1, 8, 256])?.astype(DType::BFloat16)?;
+            let got_verify = attn.forward_paged(
+                &x2,
+                &mut adapter_fused,
+                0,
+                64,
+                PagedPass::Verify,
+                None,
+                64,
+                &mut mrope_cache,
+            )?;
+            let want_verify = unfused_forward_paged_ref(
+                &attn,
+                &x2,
+                &mut adapter_ref,
+                0,
+                64,
+                PagedPass::Verify,
+                64,
+            )?;
+            assert_outputs_close(&got_verify, &want_verify, 2e-2, &format!("{label}_verify8"))?;
+
+            // Multi-lane verify wave parity against single-lane forward_paged
+            let Some(mut wave_ad) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                return Ok(());
+            };
+            let Some(mut single_ad) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                return Ok(());
+            };
+            for seq_id in [10u32, 11u32] {
+                for ad in [&mut wave_ad, &mut single_ad] {
+                    ad.begin_request(seq_id).map_err(Error::from_reason)?;
+                    ad.allocate_suffix_blocks(72).map_err(Error::from_reason)?;
+                    ad.record_tokens(&(0..64u32).collect::<Vec<_>>())
+                        .map_err(Error::from_reason)?;
+                    let _ =
+                        attn.forward_paged(&x1, ad, 0, 0, PagedPass::Prefill, None, 0, &mut None)?;
+                    ad.record_tokens(&(64..72u32).collect::<Vec<_>>())
+                        .map_err(Error::from_reason)?;
+                }
+            }
+            let x2_lane1 = x2.mul_scalar(0.75)?.astype(DType::BFloat16)?;
+            let x_wave = MxArray::concatenate(&x2, &x2_lane1, 0)?;
+            let lanes = [
+                PagedWaveLane {
+                    seq: 10,
+                    first_logical_position: 64,
+                    rope_position_offset: 64,
+                },
+                PagedWaveLane {
+                    seq: 11,
+                    first_logical_position: 64,
+                    rope_position_offset: 64,
+                },
+            ];
+            let got_wave = attn.forward_paged_wave(&x_wave, &mut wave_ad, 0, &lanes)?;
+            single_ad.activate_request(10).map_err(Error::from_reason)?;
+            let ref0 = attn.forward_paged(
+                &x2,
+                &mut single_ad,
+                0,
+                64,
+                PagedPass::Verify,
+                None,
+                64,
+                &mut None,
+            )?;
+            single_ad.activate_request(11).map_err(Error::from_reason)?;
+            let ref1 = attn.forward_paged(
+                &x2_lane1,
+                &mut single_ad,
+                0,
+                64,
+                PagedPass::Verify,
+                None,
+                64,
+                &mut None,
+            )?;
+            let want_wave = MxArray::concatenate(&ref0, &ref1, 0)?;
+            assert_outputs_close(&got_wave, &want_wave, 1e-4, &format!("{label}_wave"))?;
+        }
+        Ok(())
+    }
+
+    /// Fused `qwen35_qkv_prep` parity vs unfused path:
+    /// 1. Decoupled compressed M-RoPE offset (negative cross-turn delta, `rope_position_offset < first_logical_position`),
+    /// 2. Literally negative `rope_position_offset` (`-5`),
+    /// 3. `force_portable_prefill()` fallback (lazy `q_4d` view over `q_staged`, non-fused gate),
+    /// 4. Non-aligned straddles across `int8_query_from = 256` (`252 + 8` and `228 + 32`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn qwen35_qkv_prep_fused_parity_offsets_and_portable_fallback() -> Result<()> {
+        if crate::test_support::paged_prefill_unsupported(
+            "qwen35_qkv_prep_fused_parity_offsets_and_portable_fallback",
+        ) {
+            return Ok(());
+        }
+        use mlx_paged_attn::metal::MetalDtype;
+        let attn = build_d256_test_attention(256, 24, 4, false)?;
+        let make_x = |rows: i64, salt: f32| -> Result<MxArray> {
+            let vals: Vec<f32> = (0..(rows as usize * 256))
+                .map(|i| ((i as f32) * 0.173 + salt).sin() * 0.35)
+                .collect();
+            MxArray::from_float32(&vals, &[1, rows, 256])?.astype(DType::BFloat16)
+        };
+
+        // 1 & 2 & 3: decoupled positive offset, negative offset, and force_portable_prefill()
+        for (label, dtype, bs, ktm) in [
+            ("int8_ktm", MetalDtype::Int8, 32u32, true),
+            ("bf16_vllm", MetalDtype::BFloat16, 16u32, false),
+        ] {
+            for (case_name, prefix_len, chunk_len, rope_offset, portable) in [
+                ("compressed_delta", 64u32, 24u32, 20i32, false),
+                ("negative_rope_offset", 16u32, 12u32, -5i32, false),
+                ("portable_fallback", 32u32, 20u32, 32i32, true),
+            ] {
+                if portable && ktm {
+                    // KTM (rank-4 K pool) is tile-only; `varlen` portable prefill requires rank-5 vLLM K pool.
+                    continue;
+                }
+                let Some(mut ad_fused) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                    return Ok(());
+                };
+                let Some(mut ad_ref) = make_d256_adapter(4, bs, dtype, ktm, 512) else {
+                    return Ok(());
+                };
+                if portable {
+                    ad_fused.force_portable_prefill();
+                    ad_ref.force_portable_prefill();
+                }
+                for ad in [&mut ad_fused, &mut ad_ref] {
+                    ad.reset_for_new_request(1).map_err(Error::from_reason)?;
+                    ad.allocate_suffix_blocks(prefix_len + chunk_len)
+                        .map_err(Error::from_reason)?;
+                    ad.record_tokens(&(0..prefix_len).collect::<Vec<_>>())
+                        .map_err(Error::from_reason)?;
+                }
+                let x_pre = make_x(i64::from(prefix_len), 0.3)?;
+                let _ = attn.forward_paged(
+                    &x_pre,
+                    &mut ad_fused,
+                    0,
+                    0,
+                    PagedPass::Prefill,
+                    None,
+                    0,
+                    &mut None,
+                )?;
+                let _ = unfused_forward_paged_ref(
+                    &attn,
+                    &x_pre,
+                    &mut ad_ref,
+                    0,
+                    0,
+                    PagedPass::Prefill,
+                    0,
+                )?;
+                for ad in [&mut ad_fused, &mut ad_ref] {
+                    ad.record_tokens(&(prefix_len..prefix_len + chunk_len).collect::<Vec<_>>())
+                        .map_err(Error::from_reason)?;
+                }
+                let x_cur = make_x(i64::from(chunk_len), 1.9)?;
+                let got = attn.forward_paged(
+                    &x_cur,
+                    &mut ad_fused,
+                    0,
+                    prefix_len,
+                    PagedPass::Prefill,
+                    None,
+                    rope_offset,
+                    &mut None,
+                )?;
+                let want = unfused_forward_paged_ref(
+                    &attn,
+                    &x_cur,
+                    &mut ad_ref,
+                    0,
+                    prefix_len,
+                    PagedPass::Prefill,
+                    rope_offset,
+                )?;
+                assert_outputs_close(&got, &want, 2e-2, &format!("{label}_{case_name}"))?;
+            }
+        }
+
+        // 4: Non-aligned straddles across int8_query_from = 256 on INT8-KTM
+        for (committed, rows) in [(252u32, 8u32), (228u32, 32u32)] {
+            let Some(mut ad_fused) = make_d256_adapter(4, 32, MetalDtype::Int8, true, 512) else {
+                return Ok(());
+            };
+            let Some(mut ad_ref) = make_d256_adapter(4, 32, MetalDtype::Int8, true, 512) else {
+                return Ok(());
+            };
+            for ad in [&mut ad_fused, &mut ad_ref] {
+                ad.reset_for_new_request(1).map_err(Error::from_reason)?;
+                ad.allocate_suffix_blocks(committed + rows)
+                    .map_err(Error::from_reason)?;
+                ad.record_tokens(&(0..committed).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            let x_pre = make_x(i64::from(committed), 2.7)?;
+            let _ = attn.forward_paged(
+                &x_pre,
+                &mut ad_fused,
+                0,
+                0,
+                PagedPass::Prefill,
+                None,
+                0,
+                &mut None,
+            )?;
+            let _ =
+                unfused_forward_paged_ref(&attn, &x_pre, &mut ad_ref, 0, 0, PagedPass::Prefill, 0)?;
+            for ad in [&mut ad_fused, &mut ad_ref] {
+                ad.record_tokens(&(committed..committed + rows).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            let x_straddle = make_x(i64::from(rows), 4.1)?;
+            let got = attn.forward_paged(
+                &x_straddle,
+                &mut ad_fused,
+                0,
+                committed,
+                PagedPass::Prefill,
+                None,
+                committed as i32,
+                &mut None,
+            )?;
+            let want = unfused_forward_paged_ref(
+                &attn,
+                &x_straddle,
+                &mut ad_ref,
+                0,
+                committed,
+                PagedPass::Prefill,
+                committed as i32,
+            )?;
+            assert_outputs_close(
+                &got,
+                &want,
+                2e-2,
+                &format!("int8_ktm_straddle_{committed}_{rows}"),
+            )?;
+        }
+
+        // 5: Gate-free staged-query-only unaligned straddle (`252 + 12` = piece 0
+        // of 4 rows falling back to ordinary staging + piece 1 of 8 rows reusing
+        // `q_staged` at `row_offset = 4`, NOT `0`).
+        {
+            let committed = 252u32;
+            let rows = 12u32;
+            let Some(mut ad_staged) = make_d256_adapter(4, 32, MetalDtype::Int8, true, 512) else {
+                return Ok(());
+            };
+            let Some(mut ad_ref) = make_d256_adapter(4, 32, MetalDtype::Int8, true, 512) else {
+                return Ok(());
+            };
+            for ad in [&mut ad_staged, &mut ad_ref] {
+                ad.reset_for_new_request(1).map_err(Error::from_reason)?;
+                ad.allocate_suffix_blocks(committed + rows)
+                    .map_err(Error::from_reason)?;
+                ad.record_tokens(&(0..committed).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            let x_pre = make_x(i64::from(committed), 5.3)?;
+            let _ = attn.forward_paged(
+                &x_pre,
+                &mut ad_staged,
+                0,
+                0,
+                PagedPass::Prefill,
+                None,
+                0,
+                &mut None,
+            )?;
+            let _ = attn.forward_paged(
+                &x_pre,
+                &mut ad_ref,
+                0,
+                0,
+                PagedPass::Prefill,
+                None,
+                0,
+                &mut None,
+            )?;
+            for ad in [&mut ad_staged, &mut ad_ref] {
+                ad.record_tokens(&(committed..committed + rows).collect::<Vec<_>>())
+                    .map_err(Error::from_reason)?;
+            }
+            // Build distinct queries/keys/values per row so reading rows 0..7
+            // instead of 4..11 fails unmistakably.
+            let x_cur = make_x(i64::from(rows), 7.1)?;
+            let (q_raw, _gate, k_raw, v_raw) = attn.project_mixer(&x_cur, 1, i64::from(rows))?;
+            let k_4d = k_raw.reshape(&[1, i64::from(rows), 4, 256])?;
+            let v_4d = v_raw.reshape(&[1, i64::from(rows), 4, 256])?;
+            let q_norm = attn.q_norm.forward(&q_raw)?;
+            let k_norm = attn.k_norm.forward(&k_4d)?;
+            let q_rot = attn
+                .rope
+                .forward(
+                    &q_norm.transpose(Some(&[0, 2, 1, 3]))?,
+                    Some(committed as i32),
+                )?
+                .transpose(Some(&[0, 2, 1, 3]))?;
+            let k_rot = attn
+                .rope
+                .forward(
+                    &k_norm.transpose(Some(&[0, 2, 1, 3]))?,
+                    Some(committed as i32),
+                )?
+                .transpose(Some(&[0, 2, 1, 3]))?;
+            paged_store(
+                &mut ad_staged,
+                0,
+                committed,
+                PagedPass::Prefill,
+                &k_rot,
+                &v_4d,
+            )?;
+            paged_store(&mut ad_ref, 0, committed, PagedPass::Prefill, &k_rot, &v_4d)?;
+
+            // Stage `q_rot` into `[Hkv=4, stride=32, G=6, D=256]` BF16 with zero padding.
+            let q_grouped = q_rot
+                .reshape(&[i64::from(rows), 4, 6, 256])?
+                .transpose(Some(&[1, 0, 2, 3]))?;
+            let pad_zeros =
+                MxArray::zeros(&[4, 32 - i64::from(rows), 6, 256], Some(DType::BFloat16))?;
+            let q_staged = MxArray::concatenate(&q_grouped, &pad_zeros, 1)?;
+            let guard = PrefillScopeGuard::arm(
+                None,
+                Some(&q_staged),
+                committed as i32,
+                rows as i32,
+                24,
+                4,
+                256,
+            );
+            let got = paged_attend(
+                &mut ad_staged,
+                0,
+                committed,
+                PagedPass::Prefill,
+                &q_rot,
+                attn.scale,
+                DType::BFloat16,
+            )?;
+            assert_eq!(
+                guard.disarm(),
+                0,
+                "gate-free scope must fuse zero gate rows"
+            );
+            let want = paged_attend(
+                &mut ad_ref,
+                0,
+                committed,
+                PagedPass::Prefill,
+                &q_rot,
+                attn.scale,
+                DType::BFloat16,
+            )?;
+            assert_outputs_close(
+                &got,
+                &want,
+                1e-4,
+                "gate_free_staged_unaligned_straddle_252_12",
+            )?;
+        }
         Ok(())
     }
 }

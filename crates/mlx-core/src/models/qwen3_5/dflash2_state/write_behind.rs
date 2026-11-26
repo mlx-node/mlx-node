@@ -6,7 +6,7 @@ use crate::disk_tier::state_disk::point_in_use;
 use crate::engine::governor::ledger::{Need, Stage, TakeRights, VictimQuery};
 use crate::models::qwen3_5::dflash2_turn::{DFlash2Target, Keep, model_units};
 
-use super::disk::{copying_ahead_bytes, persist};
+use super::disk::{copying_ahead_bytes, persist_point};
 use super::paged::DFlash2States;
 use super::store::EntryId;
 
@@ -18,7 +18,19 @@ pub(crate) use crate::disk_tier::state_disk::{
 
 /// Splash `WriteBehind::published`: an ordinary point published or reused
 /// `tokens` deep at `now`. Nothing while the tier takes no writes.
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn published(states: &mut DFlash2States, id: EntryId, tokens: u32, now: f64) {
+    published_with_head(states, id, tokens, now, false);
+}
+
+/// [`published`] with persistent prompt-head flag `head`.
+pub(crate) fn published_with_head(
+    states: &mut DFlash2States,
+    id: EntryId,
+    tokens: u32,
+    now: f64,
+    head: bool,
+) {
     let DFlash2States { store, disk, .. } = states;
     let Some(disk) = disk.as_mut() else {
         return;
@@ -26,7 +38,7 @@ pub(crate) fn published(states: &mut DFlash2States, id: EntryId, tokens: u32, no
     let writable = disk.writable();
     let persistent = disk.tier.persistent;
     disk.write_behind
-        .record_published(store, writable, persistent, id, tokens, now);
+        .record_published(store, writable, persistent, id, tokens, now, head);
 }
 
 /// Splash `WriteBehind::run`: steps the points due at `now` and not in use,
@@ -50,7 +62,7 @@ pub(crate) fn run<T: DFlash2Target>(
         persistent,
         |target, id| point_in_use(&target.dflash2_states().store, persistent, id),
         |target, bytes| demanded(target, bytes),
-        |target, id| persist(target, id),
+        |target, id, head| persist_point(target, id, head),
     );
     if let Some(disk) = target.dflash2_states_mut().disk.as_mut() {
         disk.write_behind = behind;
@@ -69,7 +81,7 @@ pub(crate) fn flush<T: DFlash2Target>(target: &mut T) -> bool {
         return true;
     }
     let mut behind = std::mem::take(&mut disk.write_behind);
-    let flushed = behind.flush(target, |target, id| persist(target, id));
+    let flushed = behind.flush(target, |target, id, head| persist_point(target, id, head));
     if let Some(disk) = target.dflash2_states_mut().disk.as_mut() {
         disk.write_behind = behind;
     }

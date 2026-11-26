@@ -457,10 +457,10 @@ impl<'a> Paged<'a> {
     }
 
     /// One wave of `ids` with `logits`: `(logits, hidden)` of its rows.
-    fn wave(&mut self, ids: &[u32], logits: Logits) -> Result<(MxArray, MxArray)> {
+    fn wave(&mut self, ids: &[u32], logits: Logits, hold_turn: bool) -> Result<(MxArray, MxArray)> {
         let out = self
             .inner
-            .mtp_wave(&[(self.seq, ids)], logits)?
+            .mtp_wave(&[(self.seq, ids)], logits, hold_turn)?
             .into_iter()
             .next()
             .ok_or_else(|| bad("the wave returned no owner"))?;
@@ -489,7 +489,7 @@ impl MtpStepper for Paged<'_> {
         _embedding: &Embedding,
     ) -> Result<(MxArray, MxArray, bool)> {
         let token = ids.item_at_int32(0)? as u32;
-        let (logits, hidden) = self.wave(&[token], Logits::Last)?;
+        let (logits, hidden) = self.wave(&[token], Logits::Last, true)?;
         Ok((logits, hidden, false))
     }
 
@@ -520,7 +520,7 @@ impl MtpStepper for Paged<'_> {
             return Err(bad(format!("{} verify ids at depth {depth}", ids.len())));
         }
         let start = self.inner.owner_len(self.seq);
-        let wave = self.wave(ids, Logits::All);
+        let wave = self.wave(ids, Logits::All, false);
         self.draft_scope = None;
         let (logits, hidden) = wave?;
         let shaped = verify_output(&logits, &hidden, ids.len() as i64);

@@ -4258,6 +4258,36 @@ unsafe extern "C" {
         n: i32,
         k: i32,
     ) -> bool;
+    /// Per-64 symmetric INT8 activation quantizer for Tiled64 NAX prefill:
+    /// `x` (`bfloat16 [..., M, K]`, `K % 256 == 0`) -> `(out_xq: int8 [M_pad, K],
+    /// out_x_sa: float32 [K/64, M_pad], out_x_ysum: float32 [M_pad, U_pad])`
+    /// where `M_pad = ((M + 31)/32)*32` and `U_pad = (((K/32) + 15)/16)*16`.
+    /// Returns 1 on success, 0 when unsupported, -1 on error.
+    pub fn mlx_kquant_quantize_prefill_int8(
+        x: *mut mlx_array,
+        out_xq: *mut *mut mlx_array,
+        out_x_sa: *mut *mut mlx_array,
+        out_x_ysum: *mut *mut mlx_array,
+    ) -> i32;
+    /// Tiled64 INT8-activation NAX prefill GEMM (`int8 x int8 -> int32`) over
+    /// pre-quantized `(xq, x_sa, x_ysum)` for `{q4k, q5k, iq4xs, iq4nl}`:
+    /// `epilogue` 0 = plain, 1 = residual (`aux + y`), 2 = SwiGLU (`silu(aux) * y`).
+    /// `aux` may be null when `epilogue == 0`. Returns 1 on success, 0 when
+    /// unsupported, -1 on error.
+    pub fn mlx_kquant_matmul_int8(
+        xq: *mut mlx_array,
+        x_sa: *mut mlx_array,
+        x_ysum: *mut mlx_array,
+        weight: *mut mlx_array,
+        scales: *mut mlx_array,
+        biases: *mut mlx_array,
+        aux: *mut mlx_array,
+        orig_shape: *const i64,
+        orig_ndim: usize,
+        mode: *const std::ffi::c_char,
+        epilogue: i32,
+        output: *mut *mut mlx_array,
+    ) -> i32;
     pub fn mlx_kquant_head_f32(
         x: *mut mlx_array,
         weight: *mut mlx_array,

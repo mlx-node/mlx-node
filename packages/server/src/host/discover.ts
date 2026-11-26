@@ -1,6 +1,6 @@
 /** Discover locally-downloaded generative models under a given directory. */
 
-import type { LaunchPreset, ModelType } from '@mlx-node/lm/family-data';
+import type { LaunchPreset, ModelType, ReasoningEffortOption } from '@mlx-node/lm/family-data';
 import { discoverLocalChatModels, type DiscoveryScanOptions, type ModelFormat } from '@mlx-node/lm/model-discovery';
 
 /** A locally-downloaded model paired with its sampling preset. */
@@ -11,6 +11,8 @@ export interface DiscoveredModel {
   preset: LaunchPreset;
   contextWindow: number;
   supportsImages: boolean;
+  /** Ordered reasoning-effort levels resolved for this checkpoint, when supported. */
+  reasoningEfforts?: readonly ReasoningEffortOption[];
   /** The model without its packaging; equal strings mean one model. */
   base: string;
   /** The build of that model, unique inside one base. */
@@ -24,13 +26,14 @@ export interface DiscoveredModel {
  */
 export async function discoverModels(dir: string, opts?: DiscoveryScanOptions): Promise<DiscoveredModel[]> {
   return (await discoverLocalChatModels(dir, { ...opts, includeDecisions: true })).map(
-    ({ name, path, modelType, preset, contextWindow, supportsImages, base, variant, format }) => ({
+    ({ name, path, modelType, preset, traits, contextWindow, supportsImages, base, variant, format }) => ({
       name,
       path,
       modelType,
       preset,
       contextWindow,
       supportsImages,
+      ...(traits.reasoningEfforts !== undefined ? { reasoningEfforts: traits.reasoningEfforts } : {}),
       base,
       variant,
       format,

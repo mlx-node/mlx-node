@@ -19,9 +19,8 @@ import {
   type RenderedPdfPage,
 } from './clairic-types.js';
 
-const PDF_DATA_URI_RE = /^data:application\/pdf;base64,([A-Za-z0-9+/]*={0,2})$/i;
-const IMAGE_DATA_URI_RE = /^data:[^;,]+;base64,(.*)$/s;
-const BASE64_CHARS_RE = /^[A-Za-z0-9+/]*={0,2}$/;
+const PDF_DATA_URI_RE = /^data:application\/pdf;base64,(.+)$/is;
+const IMAGE_DATA_URI_RE = /^data:[^;,]+;base64,(.*)$/is;
 const PDF_MAGIC = Buffer.from('%PDF-', 'ascii');
 
 interface PdfjsAssetUrls {
@@ -176,31 +175,66 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
 
-function isValidStrictBase64(encoded: string): boolean {
-  return encoded.length % 4 === 0 && BASE64_CHARS_RE.test(encoded);
+function normalizeBase64(encoded: string): string | null {
+  const stripped = encoded
+    .replace(/[\t\n\r ]+/g, '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  if (stripped.length === 0) return null;
+
+  let padCount = 0;
+  while (padCount < stripped.length && stripped.charCodeAt(stripped.length - 1 - padCount) === 0x3d) {
+    padCount++;
+  }
+  if (padCount > 2) return null;
+
+  const dataLen = stripped.length - padCount;
+  if (dataLen === 0) return null;
+
+  if (padCount > 0) {
+    if (stripped.length % 4 !== 0) return null;
+  } else if (dataLen % 4 === 1) {
+    return null;
+  }
+
+  for (let i = 0; i < dataLen; i++) {
+    const c = stripped.charCodeAt(i);
+    const valid =
+      (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || (c >= 0x30 && c <= 0x39) || c === 0x2b || c === 0x2f;
+    if (!valid) return null;
+  }
+
+  if (padCount === 0) {
+    const rem = dataLen % 4;
+    if (rem === 2) return `${stripped}==`;
+    if (rem === 3) return `${stripped}=`;
+  }
+  return stripped;
 }
 
 function strictDecodeBase64(encoded: string, errorMessage: string): Buffer {
-  if (!isValidStrictBase64(encoded)) {
+  const normalized = normalizeBase64(encoded);
+  if (normalized === null) {
     throw new Error(errorMessage);
   }
-  return Buffer.from(encoded, 'base64');
+  return Buffer.from(normalized, 'base64');
 }
 
 function decodedBase64ByteLength(encoded: string): number {
-  if (!isValidStrictBase64(encoded)) {
-    throw new Error('image base64 is malformed');
-  }
   if (encoded.length === 0) {
     return 0;
   }
+  const normalized = normalizeBase64(encoded);
+  if (normalized === null) {
+    throw new Error('image base64 is malformed');
+  }
   let padding = 0;
-  if (encoded.endsWith('==')) {
+  if (normalized.endsWith('==')) {
     padding = 2;
-  } else if (encoded.endsWith('=')) {
+  } else if (normalized.endsWith('=')) {
     padding = 1;
   }
-  return (encoded.length / 4) * 3 - padding;
+  return (normalized.length / 4) * 3 - padding;
 }
 
 function parseDocumentBytes(entry: unknown): Buffer {

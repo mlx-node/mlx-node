@@ -8,20 +8,21 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use napi::bindgen_prelude::*;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::gguf::{
-    GGUF_RUNTIME_ASSET_FILES, GgufFile, GgufMetaValue, KQUANT_TILED_DISK_PROJECTIONS,
-    QWEN35_INLINE_MTP_INDEX_METADATA, SourceQuantProfile, apply_gemma4_attention_geometry,
-    apply_qwen35_inline_mtp_config, config_ties_word_embeddings, describe_gemma4_kv_head_counts,
-    extract_config, gemma4_config_states, gemma4_kv_counts_cover_both_layer_types,
-    gemma4_layer_types_from_missing_v, gguf_name_to_hf_for_metadata, is_clef_main_gguf,
-    is_gemma4_main_gguf, is_muse_glimmer_dflash_gguf, is_muse_glimmer_main_gguf,
-    is_muse_glimmer_mmproj_gguf, k_quant_output_keys, plain_qwen3_quantized_source,
-    prepare_muse_secondary_config, preserved_source_quantization, prism_hadamard_config,
-    qwen35_inline_mtp_index, qwen35_kquant_dense_fixup_target, source_quantization_profiles,
-    symmetric_zero_point, validate_prism_supplied_config, validate_qwen35_standalone_geometry,
-    write_embedded_gpt2_tokenizer,
+    GGUF_RUNTIME_ASSET_FILES, GgufFile, GgufMetaValue, GgufTensorType,
+    KQUANT_TILED_DISK_PROJECTIONS, QWEN35_INLINE_MTP_INDEX_METADATA, SourceQuantProfile,
+    apply_gemma4_attention_geometry, apply_qwen35_inline_mtp_config, config_ties_word_embeddings,
+    describe_gemma4_kv_head_counts, extract_config, gemma4_config_states,
+    gemma4_kv_counts_cover_both_layer_types, gemma4_layer_types_from_missing_v,
+    gguf_name_to_hf_for_metadata, is_clef_main_gguf, is_gemma4_main_gguf, is_inkling2_mmproj_gguf,
+    is_muse_glimmer_dflash_gguf, is_muse_glimmer_main_gguf, is_muse_glimmer_mmproj_gguf,
+    k_quant_output_keys, plain_qwen3_quantized_source, prepare_muse_secondary_config,
+    preserved_source_quantization, prism_hadamard_config, qwen35_inline_mtp_index,
+    qwen35_kquant_dense_fixup_target, qwen35_mxfp8_dense_fixup_target,
+    source_quantization_profiles, symmetric_zero_point, validate_prism_supplied_config,
+    validate_qwen35_standalone_geometry, write_embedded_gpt2_tokenizer,
 };
 use super::gguf_source::reject_split;
 use crate::array::DType;
@@ -177,6 +178,15 @@ pub(crate) fn plan_gguf_import(
         )));
     }
 
+    if !native_qwen35_layout && let Some((tensor, mapped)) = qwen35_mxfp8_dense_fixup_target(gguf) {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' ({}) maps to Qwen3.5 linear-attention tensor '{}', which requires a head-axis reinterleave during conversion. Packed MXFP8 import cannot safely apply that dense transform to packed codes without also reordering the group's .scales, so this source cannot currently be imported losslessly. Use a floating-point source or a native-layout checkpoint. Rejected from the GGUF header before tensor data was loaded.",
+            tensor.name,
+            tensor.tensor_type.name(),
+            mapped,
+        )));
+    }
+
     if import_k_quants
         && opts.requantize
         && gguf
@@ -212,12 +222,53 @@ pub(crate) fn plan_gguf_import(
         )));
     }
 
+    if opts.quantize
+        && let Some(tensor) = gguf.tensors.iter().find(|t| {
+            t.tensor_type.is_mlx_mxfp8_quantized() && !super::gguf::is_gather_only_mxfp8(t)
+        })
+    {
+        return Err(Error::from_reason(format!(
+            "GGUF tensor '{}' is already quantized ({}); convert without --quantize. \
+             MXFP8 tensors are repacked losslessly as packed MLX MXFP8 groups, and --quantize \
+             skips already-packed tensors while overwriting config.json's quantization block \
+             with only newly quantized tensors — dropping the explicit mxfp8 profile.",
+            tensor.name,
+            tensor.tensor_type.name(),
+        )));
+    }
+
     let is_primary = role.is_primary();
     let is_muse_companion =
         is_muse_glimmer_mmproj_gguf(&gguf.metadata) || is_muse_glimmer_dflash_gguf(&gguf.metadata);
-    if !is_primary
+    let is_inkling2_mmproj = is_inkling2_mmproj_gguf(&gguf.metadata);
+    if !is_primary && is_inkling2_mmproj {
+        // Inkling2 vision projector companions (`clip.vision.projector_type = "inkling2v"`)
+        // accept dense F32/F16/BF16 tensors plus 2D+ Q8_0 matrices whose inner dimension is a
+        // multiple of 32 (dequantized directly to dense BF16 during import, matching Splash
+        // `InklingVision.cpp:226-231` / `VisionPreparation.cpp:33-43`). Reject all other
+        // quantized formats or unaligned/1D Q8_0 tensors so callers can fall back to text-only.
+        if let Some(tensor) = gguf.tensors.iter().find(|t| match t.tensor_type {
+            GgufTensorType::F32 | GgufTensorType::F16 | GgufTensorType::BF16 => false,
+            GgufTensorType::Q8_0 => {
+                let cols = t.dims.first().copied().unwrap_or(0);
+                t.dims.len() < 2 || cols == 0 || !cols.is_multiple_of(32)
+            }
+            _ => true,
+        }) {
+            return Err(Error::from_reason(format!(
+                "Inkling2 vision projector tensor '{}' uses unsupported type {} with dims {:?}; \
+                 only F32, F16, BF16, and 2D+ Q8_0 (inner dim multiple of 32) are supported",
+                tensor.name,
+                tensor.tensor_type.name(),
+                tensor.dims,
+            )));
+        }
+    } else if !is_primary
         && !is_muse_companion
         && let Some((tensor, profile)) = gguf.tensors.iter().find_map(|t| {
+            if super::gguf::is_gather_only_mxfp8(t) {
+                return None;
+            }
             if !import_k_quants && t.tensor_type.k_quant_format().is_some() {
                 return None;
             }
@@ -283,7 +334,7 @@ pub(crate) fn plan_gguf_import(
         )));
     }
 
-    let preserve_dtype_keys: HashSet<String> = gguf
+    let mut preserve_dtype_keys: HashSet<String> = gguf
         .tensors
         .iter()
         .filter(|t| t.tensor_type.k_quant_format().is_some())
@@ -296,6 +347,18 @@ pub(crate) fn plan_gguf_import(
             }
         })
         .collect();
+    if is_inkling2_mmproj {
+        // Preserve dense F32 tensors in Inkling2 mmproj companions (1D norms, biases,
+        // LayerScales, class/position/patch embeddings, and full mmproj-F32.gguf weights)
+        // so the companion `--dtype bf16` pass never truncates them before ViT execution.
+        for t in &gguf.tensors {
+            if t.tensor_type == GgufTensorType::F32
+                && let Some(key) = gguf_name_to_hf_for_metadata(&t.name, &gguf.metadata)
+            {
+                preserve_dtype_keys.insert(key);
+            }
+        }
+    }
 
     let clef_head_config = plan_clef_head_config(gguf)?;
 
@@ -402,15 +465,37 @@ pub(crate) fn plan_gguf_import(
         }
         config = Some(config_json);
 
+        let has_embedded_gpt2_tokenizer = matches!(
+            gguf.metadata.get("tokenizer.ggml.model"),
+            Some(GgufMetaValue::String(model)) if model == "gpt2"
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.tokens"),
+            Some(GgufMetaValue::ArrayString(_))
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.token_type"),
+            Some(GgufMetaValue::ArrayI32(_))
+        ) && matches!(
+            gguf.metadata.get("tokenizer.ggml.merges"),
+            Some(GgufMetaValue::ArrayString(_))
+        );
+        let will_reconstruct_tokenizer =
+            has_embedded_gpt2_tokenizer && !asset_dir.join("tokenizer.json").exists();
         for &filename in GGUF_RUNTIME_ASSET_FILES {
             let src = asset_dir.join(filename);
             if src.exists() {
                 asset_copies.push((src, filename));
             } else if matches!(filename, "tokenizer.json" | "tokenizer_config.json") {
-                warn!(
-                    "{filename} not found in asset source directory {}. You may need to download it separately.",
-                    asset_dir.display()
-                );
+                if will_reconstruct_tokenizer {
+                    debug!(
+                        "{filename} not found in asset source directory {}; will reconstruct from embedded GGUF tokenizer metadata.",
+                        asset_dir.display()
+                    );
+                } else {
+                    warn!(
+                        "{filename} not found in asset source directory {}. You may need to download it separately.",
+                        asset_dir.display()
+                    );
+                }
             }
         }
     }
@@ -737,6 +822,9 @@ pub(crate) fn plan_tiled_kquant(
         let Some(prefix) = mapped.strip_suffix(".weight") else {
             continue;
         };
+        if prefix.contains(".loop_ctrl.") {
+            continue;
+        }
         let last = prefix.rsplit('.').next().unwrap_or(prefix);
         let candidate = if last == "lm_head" {
             !tie_word_embeddings
@@ -1948,6 +2036,339 @@ mod tests {
             vc.get("out_hidden_size").and_then(|v| v.as_u64()),
             Some(u64::from(backbone_hidden))
         );
+
+        fs::remove_dir_all(&work).ok();
+    }
+
+    #[test]
+    fn qwen35_non_native_mxfp8_linear_attn_rejected_at_header_preflight() {
+        use super::super::gguf::{GgufTensorInfo, GgufTensorType};
+        use std::collections::HashMap;
+
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            "general.architecture".to_string(),
+            GgufMetaValue::String("qwen35".to_string()),
+        );
+        let gguf = GgufFile {
+            version: 3,
+            tensor_count: 1,
+            metadata,
+            tensors: vec![GgufTensorInfo {
+                name: "blk.0.attn_gate.weight".to_string(),
+                n_dims: 2,
+                dims: vec![64, 64],
+                tensor_type: GgufTensorType::MXFP8,
+                offset: 0,
+            }],
+            data_offset: 0,
+            alignment: 32,
+        };
+        // Non-native Qwen3.5 GGUF with MXFP8 linear_attn.in_proj_z.weight MUST fail preflight
+        // so dense head reinterleave can never reorder packed codes without reordering scales.
+        let err = plan_gguf_import(
+            &gguf,
+            Path::new("qwen35.gguf"),
+            &ImportOptions::default(),
+            OutputRole::Primary,
+        )
+        .unwrap_err();
+        assert!(
+            err.reason.contains("MXFP8") && err.reason.contains("linear_attn.in_proj_z.weight"),
+            "unexpected preflight error: {err}"
+        );
+        // Native layout bypasses the non-native head-reinterleave fixup.
+        assert!(qwen35_mxfp8_dense_fixup_target(&gguf).is_some());
+
+        // Preserved non-engram MXFP8 combined with `--quantize` MUST fail preflight so
+        // config.json never drops the explicit `mxfp8` profile for skipped packed tensors.
+        let mut attn_q_gguf = gguf;
+        attn_q_gguf.tensors[0].name = "blk.0.attn_q.weight".to_string();
+        let q_opts = ImportOptions {
+            quantize: true,
+            native_qwen35_layout: true,
+            ..ImportOptions::default()
+        };
+        let q_err = plan_gguf_import(
+            &attn_q_gguf,
+            Path::new("qwen35.gguf"),
+            &q_opts,
+            OutputRole::Primary,
+        )
+        .unwrap_err();
+        assert!(
+            q_err.reason.contains("MXFP8") && q_err.reason.contains("--quantize"),
+            "unexpected --quantize preflight error: {q_err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn inkling2_mmproj_q8_0_plan_f32_preservation_and_text_only_fallback() {
+        use super::super::gguf::{
+            GgufTensorInfo, GgufTensorType, native_gguf_preflight, prepare_gguf_assets_in,
+        };
+        use std::collections::HashMap;
+
+        let make_mmproj = |tensors: Vec<GgufTensorInfo>| -> GgufFile {
+            let mut metadata = HashMap::new();
+            metadata.insert(
+                "general.architecture".to_string(),
+                GgufMetaValue::String("clip".to_string()),
+            );
+            metadata.insert(
+                "clip.vision.projector_type".to_string(),
+                GgufMetaValue::String("inkling2v".to_string()),
+            );
+            GgufFile {
+                version: 3,
+                tensor_count: tensors.len() as u64,
+                metadata,
+                tensors,
+                data_offset: 0,
+                alignment: 32,
+            }
+        };
+
+        // 1. Valid mmproj-Q8_0: F32 1D norms/biases/patch_embd + 2D Q8_0 matrices with cols % 32 == 0.
+        let valid_q8 = make_mmproj(vec![
+            GgufTensorInfo {
+                name: "v.patch_embd.weight".to_string(),
+                n_dims: 4,
+                dims: vec![20, 20, 3, 64],
+                tensor_type: GgufTensorType::F32,
+                offset: 0,
+            },
+            GgufTensorInfo {
+                name: "v.pre_ln.weight".to_string(),
+                n_dims: 1,
+                dims: vec![64],
+                tensor_type: GgufTensorType::F32,
+                offset: 0,
+            },
+            GgufTensorInfo {
+                name: "v.blk.0.attn_q.weight".to_string(),
+                n_dims: 2,
+                dims: vec![64, 64],
+                tensor_type: GgufTensorType::Q8_0,
+                offset: 0,
+            },
+            GgufTensorInfo {
+                name: "mm.1.weight".to_string(),
+                n_dims: 2,
+                dims: vec![128, 64],
+                tensor_type: GgufTensorType::Q8_0,
+                offset: 0,
+            },
+        ]);
+        let opts = ImportOptions {
+            dtype: Some(DType::BFloat16),
+            import_k_quants: true,
+            ..Default::default()
+        };
+        let plan = plan_gguf_import(
+            &valid_q8,
+            Path::new("mmproj-Q8_0.gguf"),
+            &opts,
+            OutputRole::Companion {
+                filename: "vision.safetensors".to_string(),
+            },
+        )
+        .expect("Inkling2 mmproj-Q8_0 with aligned 2D Q8_0 matrices must be accepted");
+        assert!(
+            plan.preserve_dtype_keys
+                .contains("vision_tower.patch_embed.weight"),
+            "F32 patch_embed must be preserved in preserve_dtype_keys"
+        );
+        assert!(
+            plan.preserve_dtype_keys
+                .contains("vision_tower.pre_ln.weight"),
+            "F32 pre_ln.weight must be preserved in preserve_dtype_keys"
+        );
+        assert!(
+            !plan
+                .preserve_dtype_keys
+                .contains("vision_tower.blocks.0.attn.q_proj.weight"),
+            "Q8_0 weight is not F32"
+        );
+
+        // 2. Unsupported Q4_0, Q4_K, unaligned Q8_0 (cols % 32 != 0), and 1D Q8_0 are all rejected.
+        let bad_cases: [(&str, Vec<u64>, GgufTensorType); 4] = [
+            ("v.blk.0.attn_q.weight", vec![64, 64], GgufTensorType::Q4_0),
+            ("v.blk.0.attn_q.weight", vec![256, 64], GgufTensorType::Q4K),
+            ("v.patch_embd.weight", vec![1200, 64], GgufTensorType::Q8_0),
+            ("v.pre_ln.weight", vec![64], GgufTensorType::Q8_0),
+        ];
+        for (name, dims, ty) in bad_cases {
+            let bad = make_mmproj(vec![GgufTensorInfo {
+                name: name.to_string(),
+                n_dims: dims.len() as u32,
+                dims,
+                tensor_type: ty,
+                offset: 0,
+            }]);
+            let err = plan_gguf_import(
+                &bad,
+                Path::new("mmproj-bad.gguf"),
+                &opts,
+                OutputRole::Companion {
+                    filename: "vision.safetensors".to_string(),
+                },
+            )
+            .expect_err("unsupported mmproj tensor must fail planning");
+            assert!(
+                err.reason.contains("Inkling2 vision projector"),
+                "unexpected error for {name} ({ty:?}): {err}"
+            );
+        }
+
+        // 3. End-to-end CheckpointSource / prepare_gguf_assets_in soft fallback on unsupported Q4_0 mmproj
+        //    and corrupt/ambiguous sibling mmproj files.
+        let work = work_dir("inkling2-mmproj-fallback");
+        let src = work.join("src");
+        let cache = work.join("cache");
+        fs::create_dir_all(&src).unwrap();
+        let main_path = src.join("inkling2.gguf");
+        let main_bytes = {
+            let mut b = Vec::new();
+            let main_meta: Vec<(&str, GgufMetaValue)> = vec![
+                (
+                    "general.architecture",
+                    GgufMetaValue::String("inkling2".to_string()),
+                ),
+                ("inkling2.embedding_length", GgufMetaValue::Uint32(64)),
+                ("inkling2.block_count", GgufMetaValue::Uint32(1)),
+                ("inkling2.attention.head_count", GgufMetaValue::Uint32(2)),
+                ("inkling2.attention.head_count_kv", GgufMetaValue::Uint32(2)),
+                ("inkling2.attention.key_length", GgufMetaValue::Uint32(32)),
+                ("inkling2.feed_forward_length", GgufMetaValue::Uint32(64)),
+            ];
+            let mut tmp = Vec::new();
+            tmp.extend_from_slice(&super::super::gguf::GGUF_MAGIC.to_le_bytes());
+            tmp.extend_from_slice(&super::super::gguf::GGUF_VERSION_3.to_le_bytes());
+            tmp.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+            tmp.extend_from_slice(&(main_meta.len() as u64).to_le_bytes());
+            for (k, v) in &main_meta {
+                tmp.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                tmp.extend_from_slice(k.as_bytes());
+                match v {
+                    GgufMetaValue::String(s) => {
+                        tmp.extend_from_slice(&8u32.to_le_bytes());
+                        tmp.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                        tmp.extend_from_slice(s.as_bytes());
+                    }
+                    GgufMetaValue::Uint32(n) => {
+                        tmp.extend_from_slice(&4u32.to_le_bytes());
+                        tmp.extend_from_slice(&n.to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            // token_embd.weight [64, 4] F32
+            let tname = "token_embd.weight";
+            tmp.extend_from_slice(&(tname.len() as u64).to_le_bytes());
+            tmp.extend_from_slice(tname.as_bytes());
+            tmp.extend_from_slice(&2u32.to_le_bytes());
+            tmp.extend_from_slice(&64u64.to_le_bytes());
+            tmp.extend_from_slice(&4u64.to_le_bytes());
+            tmp.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+            tmp.extend_from_slice(&0u64.to_le_bytes());
+            tmp.resize(tmp.len().next_multiple_of(32), 0);
+            tmp.extend(std::iter::repeat_n(0u8, 64 * 4 * 4));
+            b.extend_from_slice(&tmp);
+            b
+        };
+        fs::write(&main_path, &main_bytes).unwrap();
+
+        // Write an unsupported Q4_0 mmproj companion beside inkling2.gguf.
+        let bad_mmproj_path = src.join("mmproj-Q4_0.gguf");
+        {
+            let mut b = Vec::new();
+            let meta = [
+                ("general.architecture", "clip"),
+                ("clip.vision.projector_type", "inkling2v"),
+            ];
+            b.extend_from_slice(&super::super::gguf::GGUF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&super::super::gguf::GGUF_VERSION_3.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+            for (k, s) in meta {
+                b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                b.extend_from_slice(k.as_bytes());
+                b.extend_from_slice(&8u32.to_le_bytes());
+                b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                b.extend_from_slice(s.as_bytes());
+            }
+            let tname = "v.blk.0.attn_q.weight";
+            b.extend_from_slice(&(tname.len() as u64).to_le_bytes());
+            b.extend_from_slice(tname.as_bytes());
+            b.extend_from_slice(&2u32.to_le_bytes());
+            b.extend_from_slice(&64u64.to_le_bytes());
+            b.extend_from_slice(&4u64.to_le_bytes());
+            b.extend_from_slice(&(GgufTensorType::Q4_0 as u32).to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.resize(b.len().next_multiple_of(32), 0);
+            b.extend(std::iter::repeat_n(0u8, (64 * 4 / 32) * 18));
+            fs::write(&bad_mmproj_path, &b).unwrap();
+        }
+        // Also place a corrupt sibling mmproj file in the same directory; preflight must skip it.
+        let corrupt_mmproj_path = src.join("mmproj-corrupt.gguf");
+        fs::write(&corrupt_mmproj_path, b"NOT_A_GGUF_FILE").unwrap();
+
+        let ckpt = prepare_gguf_assets_in(&main_path, NativeGgufFamily::Inkling2, &cache)
+            .await
+            .expect("unsupported Q4_0 mmproj + corrupt sibling must fall back to text-only");
+        assert!(
+            ckpt.companion.is_none(),
+            "unsupported companion must be dropped"
+        );
+        assert!(
+            ckpt.plans.1.is_none(),
+            "unsupported companion plan must be None"
+        );
+        let source_json = read_json(&ckpt.asset_dir.join("gguf-source.json"));
+        assert!(
+            source_json["companion"].is_null(),
+            "gguf-source.json must record null companion after text-only fallback"
+        );
+        super::super::gguf::native_gguf_unlease_in_use(&ckpt.asset_dir);
+
+        // Ambiguous same-tier mmproj files also degrade cleanly to `None` in preflight.
+        fs::remove_file(&bad_mmproj_path).unwrap();
+        fs::remove_file(&corrupt_mmproj_path).unwrap();
+        let make_valid_mmproj_bytes = || {
+            let mut b = Vec::new();
+            let meta = [
+                ("general.architecture", "clip"),
+                ("clip.vision.projector_type", "inkling2v"),
+            ];
+            b.extend_from_slice(&super::super::gguf::GGUF_MAGIC.to_le_bytes());
+            b.extend_from_slice(&super::super::gguf::GGUF_VERSION_3.to_le_bytes());
+            b.extend_from_slice(&1u64.to_le_bytes());
+            b.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+            for (k, s) in meta {
+                b.extend_from_slice(&(k.len() as u64).to_le_bytes());
+                b.extend_from_slice(k.as_bytes());
+                b.extend_from_slice(&8u32.to_le_bytes());
+                b.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                b.extend_from_slice(s.as_bytes());
+            }
+            let tname = "v.pre_ln.weight";
+            b.extend_from_slice(&(tname.len() as u64).to_le_bytes());
+            b.extend_from_slice(tname.as_bytes());
+            b.extend_from_slice(&1u32.to_le_bytes());
+            b.extend_from_slice(&16u64.to_le_bytes());
+            b.extend_from_slice(&(GgufTensorType::F32 as u32).to_le_bytes());
+            b.extend_from_slice(&0u64.to_le_bytes());
+            b.resize(b.len().next_multiple_of(32), 0);
+            b.extend(std::iter::repeat_n(0u8, 16 * 4));
+            b
+        };
+        let mm_bytes = make_valid_mmproj_bytes();
+        fs::write(src.join("mmproj-a-BF16.gguf"), &mm_bytes).unwrap();
+        fs::write(src.join("mmproj-b-BF16.gguf"), &mm_bytes).unwrap();
+        let (_parts, amb_companion) = native_gguf_preflight(&main_path, NativeGgufFamily::Inkling2)
+            .expect("ambiguous Inkling2 mmproj must degrade cleanly instead of erroring");
+        assert!(amb_companion.is_none(), "ambiguous mmproj must return None");
 
         fs::remove_dir_all(&work).ok();
     }

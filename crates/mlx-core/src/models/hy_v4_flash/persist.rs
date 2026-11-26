@@ -19,7 +19,7 @@ use sha2::{Digest, Sha256};
 
 use super::cache::{LayerCache, WINDOW_SLACK};
 use super::config::HyV4FlashConfig;
-use super::ladder::{Ladder, Snapshot};
+use super::ladder::{Kind, Ladder, Snapshot};
 use super::mtp::{LagMark, Lagged};
 use super::owner::draft_state_at;
 use super::paged::{PAGE_DTYPE, PageGeometry};
@@ -336,13 +336,13 @@ impl PrefixCodec for Hy4Codec {
         super::persist_codec::FORMAT
     }
 
-    fn state_matches_lane(&self, Held(state): &Held<PrefixState>, row: usize) -> bool {
+    fn state_matches_lane(&self, Held { state, .. }: &Held<PrefixState>, row: usize) -> bool {
         state.row == row
             && state.layers.len() == self.shape.layers.len()
             && state.draft.is_some() == self.shape.draft.is_some()
     }
 
-    fn state_segment_count(&self, Held(state): &Held<PrefixState>) -> usize {
+    fn state_segment_count(&self, Held { state, .. }: &Held<PrefixState>) -> usize {
         state.draft.as_ref().map_or(0, |d| d.segments.len())
     }
 
@@ -350,7 +350,11 @@ impl PrefixCodec for Hy4Codec {
         segments_at(row)
     }
 
-    fn encode_state_into(&self, Held(state): &Held<PrefixState>, into: &mut [u8]) -> Result<bool> {
+    fn encode_state_into(
+        &self,
+        Held { state, .. }: &Held<PrefixState>,
+        into: &mut [u8],
+    ) -> Result<bool> {
         encode_state_into(state, into)
     }
 
@@ -371,14 +375,16 @@ impl PrefixCodec for Hy4Codec {
         Some(Arc::new(decode_segment(bytes, self.shape.draft.as_ref()?)?))
     }
 
-    /// Cold prompt-end replay states (`!any_written`) are never superseded by
-    /// deeper turn states: a turn state cannot resume the original prompt after
-    /// a restart when decode finishes faster than `DELAY`.
+    /// Prompt-end replay states (cold `!any_written` states and warm
+    /// `Kind::Prompt` states resumed from a prior turn's write-path blocks) are
+    /// never superseded by deeper turn states: a turn state cannot resume the
+    /// original prompt after a restart or assistant-end BPE drift when decode
+    /// finishes faster than `DELAY`.
     fn is_superseded(&self, store: &Store, id: EntryId) -> bool {
         let Some(entry) = store.get(id) else {
             return false;
         };
-        if !any_written(entry.extra_keys()) {
+        if !any_written(entry.extra_keys()) || entry.ram().is_some_and(|h| h.kind == Kind::Prompt) {
             return false;
         }
         store.superseded(id)
@@ -561,8 +567,14 @@ impl Disk {
     }
 
     pub(crate) fn adopt(&mut self, store: &mut Store) -> u64 {
-        let span = self.0.codec.shape.span_bytes();
-        self.0.adopt(store, |_| span)
+        let shape = self.0.codec.shape.clone();
+        self.0.adopt(store, |row| shape.resident_bytes_at(row))
+    }
+
+    /// Resident RAM bytes a decoded state at `row` holds (state span plus all
+    /// whole MTP draft segments when MTP is enabled).
+    pub(crate) fn state_bytes_at(&self, row: usize) -> u64 {
+        self.0.codec.shape.resident_bytes_at(row)
     }
 
     pub(crate) fn read_state(

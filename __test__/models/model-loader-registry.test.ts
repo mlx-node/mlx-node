@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
+  CHAT_FAMILY_IDS,
   detectModelType,
   Gemma4Model,
   Inkling2Model,
   loadModel,
   loadSession,
   MuseGlimmerModel,
+  NON_GENERATIVE_FAMILY_IDS,
   Qwen35Model,
+  reasoningEffortsFor,
   type ModelType,
 } from '@mlx-node/lm';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
@@ -263,5 +266,88 @@ describe('declarative model loader registry', () => {
       kvFormat: 'int8',
       cacheDisk: 'auto',
     });
+  });
+
+  it.each([
+    [
+      'missing model_type + Inkling2LoopForConditionalGeneration',
+      { architectures: ['Inkling2LoopForConditionalGeneration'] },
+    ],
+    ['missing model_type + Inkling2ForConditionalGeneration', { architectures: ['Inkling2ForConditionalGeneration'] }],
+    ['missing model_type + Inkling2LoopForCausalLM', { architectures: ['Inkling2LoopForCausalLM'] }],
+    ['missing model_type + Inkling2ForCausalLM', { architectures: ['Inkling2ForCausalLM'] }],
+    [
+      'null model_type + text_config.model_type inkling2_loop_text',
+      { model_type: null, text_config: { model_type: 'inkling2_loop_text' } },
+    ],
+    ['missing model_type + text_config.model_type inkling2_text', { text_config: { model_type: 'inkling2_text' } }],
+    [
+      'wrapper inkling2_vl + architectures',
+      { model_type: 'inkling2_vl', architectures: ['Inkling2LoopForConditionalGeneration'] },
+    ],
+    [
+      'wrapper inkling2_vl + text_config.model_type',
+      { model_type: 'inkling2_vl', text_config: { model_type: 'inkling2_loop_text' } },
+    ],
+  ] as const)('detects Inkling2 via architecture probe and text_config (%s)', async (_label, config) => {
+    await writeConfig({ ...config });
+    await expect(detectModelType(tempDir)).resolves.toBe('inkling2');
+  });
+
+  it('keeps fail-closed rejection for explicit non-inkling model_type even with inkling text_config', async () => {
+    await writeConfig({ model_type: 'llama', text_config: { model_type: 'inkling2_loop_text' } });
+    await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "llama" in ${tempDir}/config.json`);
+
+    await writeConfig({ model_type: 42, text_config: { model_type: 'inkling2_loop_text' } });
+    await expect(detectModelType(tempDir)).rejects.toThrow(`Unsupported model_type "42" in ${tempDir}/config.json`);
+  });
+
+  it('defines valid reasoningEfforts for every chat family and omits them for non-generative or unknown families', () => {
+    const allowedValues = new Set(['none', 'low', 'medium', 'high', 'xhigh', 'max']);
+
+    for (const familyId of CHAT_FAMILY_IDS) {
+      const efforts = reasoningEffortsFor(familyId);
+      expect(efforts, familyId).toBeDefined();
+      expect(efforts!.length, familyId).toBeGreaterThanOrEqual(2);
+      const values = efforts!.map((option) => option.value);
+      expect(new Set(values).size, familyId).toBe(values.length);
+      for (const option of efforts!) {
+        expect(allowedValues.has(option.value), `${familyId}:${option.value}`).toBe(true);
+        expect(option.label.length, `${familyId}:${option.value}`).toBeGreaterThan(0);
+      }
+      const defaults = efforts!.filter((option) => option.default === true);
+      expect(defaults, `${familyId} must mark exactly one default effort`).toHaveLength(1);
+    }
+
+    for (const familyId of NON_GENERATIVE_FAMILY_IDS) {
+      expect(reasoningEffortsFor(familyId), familyId).toBeUndefined();
+    }
+    expect(reasoningEffortsFor('unknown_family')).toBeUndefined();
+    expect(reasoningEffortsFor('')).toBeUndefined();
+
+    // Qwen3.5/3.6 defaults to binary [Off, High]; only Qwen3.8 templates unlock 5-level efforts.
+    expect(reasoningEffortsFor('qwen3_5')).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    expect(
+      reasoningEffortsFor('qwen3_5', {
+        chatTemplate: '{%- if enable_thinking is false -%}<think>\n\n</think>{%- endif -%}',
+      }),
+    ).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'high', label: 'High', default: true },
+    ]);
+    expect(
+      reasoningEffortsFor('qwen3_5', {
+        chatTemplate: "{%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') -%}",
+      }),
+    ).toEqual([
+      { value: 'none', label: 'Off' },
+      { value: 'low', label: 'Low' },
+      { value: 'medium', label: 'Medium' },
+      { value: 'high', label: 'High', default: true },
+      { value: 'xhigh', label: 'X-High' },
+    ]);
   });
 });

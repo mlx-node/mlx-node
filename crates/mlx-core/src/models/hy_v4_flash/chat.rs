@@ -489,6 +489,42 @@ impl Inner {
     }
 
     #[cfg(test)]
+    pub(crate) fn for_paged_test(
+        store: Store,
+        mtp: Option<MtpLayer>,
+        grid: Grid,
+        paged: Paged,
+    ) -> Result<Self> {
+        let seq = new_seq(&store, mtp.as_ref())?;
+        let tok_json = r#"{
+            "version": "1.0",
+            "model": { "type": "WordLevel", "vocab": { "t0": 0 }, "unk_token": "t0" }
+        }"#;
+        let raw = tokenizers::Tokenizer::from_bytes(tok_json.as_bytes())
+            .map_err(|e| bad(format!("test tokenizer: {e}")))?;
+        let tokenizer = Qwen3Tokenizer::from_tokenizer(raw, None)?;
+        Ok(Self {
+            store,
+            mtp,
+            conv: Conv::new(seq),
+            grid,
+            tokenizer: Arc::new(tokenizer),
+            tags: Hy4Tags::for_test(),
+            defaults: generation_defaults(),
+            cancel: None,
+            in_turn: true,
+            residency: Arc::new(Mutex::new(Residency::default())),
+            turn_stats: None,
+            paged: Some(paged),
+            flat: None,
+            telemetry: Arc::new(Telemetry::default()),
+            waves: WaveLog::default(),
+            served_from: Counters::default(),
+            turn_salt: Cell::new(0),
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn conv(&self) -> &Conv<Lagged> {
         &self.conv
     }

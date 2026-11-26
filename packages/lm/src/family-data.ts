@@ -16,6 +16,7 @@ export type ModelFamilyKind = 'trainable' | 'loadable' | 'embedding' | 'vlm' | '
 export interface NormalizedModelConfig {
   readonly usesDefaultModelType: boolean;
   readonly rawModelType: string | undefined;
+  readonly textModelType: string | undefined;
   readonly rawModelTypeLabel: string;
   readonly architectures: ReadonlySet<string>;
 }
@@ -46,6 +47,29 @@ export interface FamilyThinkingLevelMap {
   readonly max?: string | null;
 }
 
+/**
+ * Canonical reasoning-effort wire levels accepted by both `mlx-node` and
+ * `mlx-agent` (`grok-build`) over `/v1/messages` `extra_body.reasoning_effort`.
+ *
+ * `'minimal'` is intentionally excluded: `mlx-agent`'s `to_messages_extra_body`
+ * drops `minimal` instead of forwarding it in `extra_body.reasoning_effort`.
+ */
+export type ReasoningEffortLevel = 'none' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+/**
+ * One selectable reasoning-effort option advertised on `GET /v1/models`
+ * (`reasoning_efforts`) and parsed by `mlx-agent` (`parse_reasoning_effort_options`).
+ *
+ * Exactly one option per family carries `default: true` so `mlx-agent`'s
+ * `derive_reasoning_effort_fields` selects the model's native default instead
+ * of falling back to the first row (`none`).
+ */
+export interface ReasoningEffortOption {
+  readonly value: ReasoningEffortLevel;
+  readonly label: string;
+  readonly default?: true;
+}
+
 export interface FamilyTraits {
   /**
    * Whether the family emits `<think>` reasoning (drives the agent's thinking
@@ -61,6 +85,12 @@ export interface FamilyTraits {
    */
   readonly thinkingLevelMap?: FamilyThinkingLevelMap;
   /**
+   * Ordered reasoning-effort levels advertised on `GET /v1/models`
+   * (`reasoning_efforts`) for models of this family. Omitted when the family
+   * does not expose user-selectable reasoning effort controls.
+   */
+  readonly reasoningEfforts?: readonly ReasoningEffortOption[];
+  /**
    * Context-window fallback when `config.json` carries no
    * `max_position_embeddings` at either nesting level.
    *
@@ -69,6 +99,87 @@ export interface FamilyTraits {
    * (nemotron_h is 131072 vocab / 1048576 context).
    */
   readonly fallbackContextWindow: number;
+}
+
+const EFFORT_OFF: ReasoningEffortOption = Object.freeze({ value: 'none', label: 'Off' });
+const EFFORT_LOW: ReasoningEffortOption = Object.freeze({ value: 'low', label: 'Low' });
+const EFFORT_MEDIUM: ReasoningEffortOption = Object.freeze({ value: 'medium', label: 'Medium' });
+const EFFORT_HIGH: ReasoningEffortOption = Object.freeze({ value: 'high', label: 'High' });
+const EFFORT_HIGH_DEFAULT: ReasoningEffortOption = Object.freeze({ value: 'high', label: 'High', default: true });
+const EFFORT_XHIGH: ReasoningEffortOption = Object.freeze({ value: 'xhigh', label: 'X-High' });
+const EFFORT_XHIGH_DEFAULT: ReasoningEffortOption = Object.freeze({ value: 'xhigh', label: 'X-High', default: true });
+const EFFORT_MAX: ReasoningEffortOption = Object.freeze({ value: 'max', label: 'Max' });
+
+/** Binary `enable_thinking` families: thinking off (`none`) or on (`high`, default). */
+const BINARY_THINKING_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([EFFORT_OFF, EFFORT_HIGH_DEFAULT]);
+
+/** Always-on thinking families with budget-from-effort (`none`→0, `low`→256, `high`→unlimited). */
+const BUDGET_THINKING_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
+  EFFORT_OFF,
+  EFFORT_LOW,
+  EFFORT_HIGH_DEFAULT,
+]);
+
+/** K2-Horizon always thinks (no `none`) and supports exact `low` / `medium` / `high` (default). */
+const K2_THINKING_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
+  EFFORT_LOW,
+  EFFORT_MEDIUM,
+  EFFORT_HIGH_DEFAULT,
+]);
+
+/** Four-level families with native `none` / `low` / `high` (default) / `max` (Hy4-Flash, DeepSeek-V4.1). */
+const FOUR_LEVEL_MAX_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
+  EFFORT_OFF,
+  EFFORT_LOW,
+  EFFORT_HIGH_DEFAULT,
+  EFFORT_MAX,
+]);
+
+/**
+ * Five-level families defaulting to `high`:
+ * - Inkling2 (`0.0`/`0.2`/`0.7`/`0.9` default/`0.99`),
+ * - Qwen3.8 checkpoints under `qwen3_5` / `qwen3_5_moe` (whose template checks
+ *   `resolved_reasoning_effort` with `xhigh` default and `high`→`xhigh` alias).
+ */
+const FIVE_LEVEL_HIGH_DEFAULT_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
+  EFFORT_OFF,
+  EFFORT_LOW,
+  EFFORT_MEDIUM,
+  EFFORT_HIGH_DEFAULT,
+  EFFORT_XHIGH,
+]);
+
+/** Five-level Qwen3.8-Flash-Next family (`qwen4_exp`), whose template defaults to `xhigh` and aliases `high`→`xhigh`. */
+const FIVE_LEVEL_XHIGH_DEFAULT_EFFORTS: readonly ReasoningEffortOption[] = Object.freeze([
+  EFFORT_OFF,
+  EFFORT_LOW,
+  EFFORT_MEDIUM,
+  EFFORT_HIGH,
+  EFFORT_XHIGH_DEFAULT,
+]);
+
+/**
+ * Whether a Jinja chat template implements the Qwen3.8 multi-level
+ * `reasoning_effort` protocol (`low` / `medium` / `xhigh`). Matches the native
+ * renderer gate in `crates/mlx-core/src/tokenizer.rs`.
+ */
+export function hasQwen38ReasoningEffortTemplate(chatTemplate: string | undefined): boolean {
+  return (
+    typeof chatTemplate === 'string' &&
+    chatTemplate.includes('resolved_reasoning_effort') &&
+    chatTemplate.includes('xhigh')
+  );
+}
+
+/** Optional checkpoint context for resolving per-checkpoint reasoning efforts. */
+export interface ReasoningEffortsOptions {
+  /**
+   * Raw Jinja chat template from the checkpoint (`tokenizer_config.json`,
+   * `chat_template.jinja`, or GGUF `tokenizer.chat_template`). Used for
+   * families that host both binary-thinking and multi-level checkpoints
+   * (`qwen3_5` and `qwen3_5_moe`: Qwen3.5/3.6 vs Qwen3.8).
+   */
+  readonly chatTemplate?: string;
 }
 
 /**
@@ -447,6 +558,7 @@ export const MODEL_FAMILY_DATA = [
         medium: null,
         high: 'high',
       },
+      reasoningEfforts: BINARY_THINKING_EFFORTS,
       fallbackContextWindow: 131072,
     },
     launchPreset: {
@@ -467,6 +579,7 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
+      reasoningEfforts: BUDGET_THINKING_EFFORTS,
       fallbackContextWindow: 131072,
     },
     launchPreset: {
@@ -503,7 +616,7 @@ export const MODEL_FAMILY_DATA = [
      * `applyChatTemplate`; it retains the native tokenizer-backed method.
      */
     streamOpts: { recordModelPath: true, applyTemplate: false },
-    traits: { reasoning: true, fallbackContextWindow: 40960 },
+    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 40960 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 38912,
@@ -525,7 +638,7 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl', split: true },
-    traits: { reasoning: true, fallbackContextWindow: 262144 },
+    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 81920,
@@ -547,7 +660,7 @@ export const MODEL_FAMILY_DATA = [
     acceptsCacheDisk: true,
     publishesGovernorStateDisk: true,
     streamOpts: { recordModelPath: true },
-    traits: { reasoning: true, fallbackContextWindow: 262144 },
+    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 262144 },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 81920,
@@ -568,7 +681,7 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },
-    traits: { reasoning: true, fallbackContextWindow: 262144 },
+    traits: { reasoning: true, reasoningEfforts: FIVE_LEVEL_XHIGH_DEFAULT_EFFORTS, fallbackContextWindow: 262144 },
     launchPreset: { sampling: QWEN4_EXP_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
@@ -584,7 +697,7 @@ export const MODEL_FAMILY_DATA = [
     ggufArchitectures: ['deepseek41'],
     ggufDiscovery: { variants: 'all', split: true },
     /** v1 context limit (min(GGUF context, 16384)). */
-    traits: { reasoning: true, fallbackContextWindow: 16384 },
+    traits: { reasoning: true, reasoningEfforts: FOUR_LEVEL_MAX_EFFORTS, fallbackContextWindow: 16384 },
     launchPreset: { sampling: DEEPSEEK_V41_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
@@ -613,6 +726,7 @@ export const MODEL_FAMILY_DATA = [
         xhigh: null,
         max: 'max',
       },
+      reasoningEfforts: FOUR_LEVEL_MAX_EFFORTS,
       fallbackContextWindow: 262144,
     },
     launchPreset: { sampling: HY_V4_FLASH_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
@@ -623,7 +737,34 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     ggufArchitectures: ['inkling2', 'inkling2_loop'],
     ggufDiscovery: { variants: 'all', split: true },
-    match: { rawModelTypes: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'] },
+    match: {
+      rawModelTypes: ['inkling2', 'inkling2_loop', 'inkling2_text', 'inkling2_loop_text'],
+      architectureProbe: ({ architectures, modelType, rawModelType, textModelType, usesDefaultModelType }) => {
+        if (
+          architectures.has('Inkling2LoopForConditionalGeneration') ||
+          architectures.has('Inkling2ForConditionalGeneration') ||
+          architectures.has('Inkling2LoopForCausalLM') ||
+          architectures.has('Inkling2ForCausalLM')
+        ) {
+          return true;
+        }
+        const isInkling2TextType =
+          textModelType === 'inkling2' ||
+          textModelType === 'inkling2_loop' ||
+          textModelType === 'inkling2_text' ||
+          textModelType === 'inkling2_loop_text';
+        if (
+          isInkling2TextType &&
+          (usesDefaultModelType ||
+            (modelType === undefined &&
+              rawModelType !== undefined &&
+              rawModelType.toLowerCase().startsWith('inkling2')))
+        ) {
+          return true;
+        }
+        return false;
+      },
+    },
     acceptsDraftModel: true,
     acceptsKvFormat: true,
     acceptsMaxMemory: true,
@@ -637,7 +778,7 @@ export const MODEL_FAMILY_DATA = [
      * instead of installing the factory's path-backed Jinja tokenizer.
      */
     streamOpts: { recordModelPath: false, applyTemplate: false },
-    traits: { reasoning: true, fallbackContextWindow: 1048576 },
+    traits: { reasoning: true, reasoningEfforts: FIVE_LEVEL_HIGH_DEFAULT_EFFORTS, fallbackContextWindow: 1048576 },
     launchPreset: {
       sampling: INKLING2_SAMPLING_DEFAULTS,
       maxOutputTokens: 32768,
@@ -653,7 +794,7 @@ export const MODEL_FAMILY_DATA = [
      * through the shared `Lfm2Model` wrapper, so the flag lives once, here.
      */
     streamOpts: { recordModelPath: true, replayAssistantRawText: true },
-    traits: { reasoning: true, fallbackContextWindow: 128000 },
+    traits: { reasoning: true, reasoningEfforts: BUDGET_THINKING_EFFORTS, fallbackContextWindow: 128000 },
     launchPreset: {
       sampling: LFM2_SAMPLING_DEFAULTS,
       maxOutputTokens: 8192,
@@ -664,7 +805,7 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2_moe'] },
     coldRestoreEligible: true,
-    traits: { reasoning: true, fallbackContextWindow: 128000 },
+    traits: { reasoning: true, reasoningEfforts: BUDGET_THINKING_EFFORTS, fallbackContextWindow: 128000 },
     /**
      * LFM2.5-8B-A1B: LiquidAI's MoE card recommends temperature 0.2 / top_k 80
      * — deliberately NOT the dense `lfm2` values (0.05 / 50).
@@ -691,6 +832,7 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     traits: {
       reasoning: true,
+      reasoningEfforts: BINARY_THINKING_EFFORTS,
       fallbackContextWindow: 1048576,
     },
     launchPreset: {
@@ -724,6 +866,7 @@ export const MODEL_FAMILY_DATA = [
         xhigh: null,
         max: null,
       },
+      reasoningEfforts: K2_THINKING_EFFORTS,
       fallbackContextWindow: 524288,
     },
     launchPreset: {
@@ -847,9 +990,67 @@ export function rawModelTypeToCanonical(rawModelType: string): ModelType | undef
   return FAMILY_DATA_INDEX.byRawModelType.get(rawModelType)?.id as ModelType | undefined;
 }
 
+/** Canonical `ChatFamilyId` for `modelType`, or `undefined` for non-chat or unknown model types. */
+export function chatFamilyIdFor(modelType: string): ChatFamilyId | undefined {
+  return chatFamilyDataFor(modelType)?.id as ChatFamilyId | undefined;
+}
+
+/**
+ * Default thinking-token budget implied by `reasoningEffort` for families
+ * whose native `ThinkingPolicy` is `AlwaysOnBudgetFromEffort`
+ * (`crates/mlx-core/src/engine/params.rs` and `models/k2_horizon/model.rs`).
+ *
+ * Returns `undefined` when the family honors effort via its chat template or
+ * leaves thinking uncapped at this effort level.
+ */
+export function defaultThinkingBudgetForEffort(
+  family: ChatFamilyId | undefined,
+  reasoningEffort: string | undefined,
+): number | undefined {
+  if (family === undefined || reasoningEffort === undefined) return undefined;
+  if (family === 'lfm2' || family === 'lfm2_moe' || family === 'muse_glimmer') {
+    if (reasoningEffort === 'none') return 0;
+    if (reasoningEffort === 'minimal' || reasoningEffort === 'low') return 256;
+    return undefined;
+  }
+  if (family === 'k2_horizon') {
+    if (reasoningEffort === 'none' || reasoningEffort === 'minimal' || reasoningEffort === 'low') {
+      return 256;
+    }
+    return undefined;
+  }
+  return undefined;
+}
+
 /** Agent discovery traits for a chat-capable family. */
 export function familyTraitsFor(modelType: string): FamilyTraits | undefined {
   return chatFamilyDataFor(modelType)?.traits;
+}
+
+/**
+ * Ordered reasoning-effort options advertised by `GET /v1/models` for
+ * `modelType`, or `undefined` when the family does not support reasoning
+ * effort (decision, embedding, VLM, rerank, or unknown foreign families).
+ *
+ * Families shared by binary-thinking (Qwen3.5/3.6) and multi-level (Qwen3.8)
+ * checkpoints default to binary `[Off, High]` and upgrade to 5-level efforts
+ * only when `opts.chatTemplate` matches the Qwen3.8 template protocol.
+ */
+export function reasoningEffortsFor(
+  modelType: string,
+  opts?: ReasoningEffortsOptions,
+): readonly ReasoningEffortOption[] | undefined {
+  const traits = familyTraitsFor(modelType);
+  if (!traits?.reasoning || !traits.reasoningEfforts || traits.reasoningEfforts.length === 0) {
+    return undefined;
+  }
+  if (
+    (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe') &&
+    hasQwen38ReasoningEffortTemplate(opts?.chatTemplate)
+  ) {
+    return FIVE_LEVEL_HIGH_DEFAULT_EFFORTS;
+  }
+  return traits.reasoningEfforts;
 }
 
 /**
@@ -905,8 +1106,22 @@ function normalizeConfig(modelPath: string, config: unknown): NormalizedModelCon
     : typeof rawArchitectures === 'string'
       ? [rawArchitectures]
       : [];
+  const rawTextConfig = object.text_config;
+  const textModelType =
+    typeof rawTextConfig === 'object' &&
+    rawTextConfig !== null &&
+    !Array.isArray(rawTextConfig) &&
+    typeof (rawTextConfig as Record<string, unknown>).model_type === 'string'
+      ? ((rawTextConfig as Record<string, unknown>).model_type as string)
+      : undefined;
 
-  return { usesDefaultModelType, rawModelType, rawModelTypeLabel, architectures: new Set(architectures) };
+  return {
+    usesDefaultModelType,
+    rawModelType,
+    textModelType,
+    rawModelTypeLabel,
+    architectures: new Set(architectures),
+  };
 }
 
 /**
@@ -988,8 +1203,9 @@ export interface LoadModelOptions {
    */
   maxMemoryBytes?: number;
   /**
-   * Context token limit for `qwen3_5`, `qwen3_5_moe` and `qwen4_exp` targets
-   * (`--max-context`), 1 to 1,010,000: every turn holds at most this many
+   * Context token limit for `qwen3_5`, `qwen3_5_moe`, `qwen4_exp`, and
+   * `inkling2` targets (`--max-context`), 1 to 1,048,576 (YaRN targets capped
+   * at 1,010,000): every turn holds at most this many
    * tokens, and the load fails when its memory plan holds fewer. Past the
    * native window the target's RoPE takes YaRN, which is static and changes
    * answers at every length. `hy_v4_flash` takes it too, capped at 262,144

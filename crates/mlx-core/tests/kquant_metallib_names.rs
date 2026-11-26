@@ -47,9 +47,20 @@ const BASE_NAMES: i64 = MODES * 3 * (39 + 15) + 4 + 2 + AFFINE_MODES * 3 * (1 + 
 /// qmm_m8_nax (q3k, q2k, iq4nl and the seven grid formats); each affine mode
 /// adds qmm_t_nax_t64 per dtype and its three Tiled64 row tiers.
 // The Q6_K tiled M8 head adds one FP32-output NAX kernel; seven bfloat16
-// Tiled64 modes add the residual and swiglu store-epilogue GEMMs.
-const NAX_NAMES: i64 =
-    MODES * 3 * (4 + 1 + 2) + MODES * 3 + 10 + AFFINE_MODES * 3 + AFFINE_MODES * 3 + 1 + 7 * 2;
+// Tiled64 modes add the residual and swiglu store-epilogue GEMMs; standalone
+// Metal 4 BM=128 BF16 prefill adds 17 plain + 14 epilogue kernels; standalone
+// Metal 4 INT8-activation NAX prefill adds 1 quantizer + 12 GEMM kernels.
+const NAX_NAMES: i64 = MODES * 3 * (4 + 1 + 2)
+    + MODES * 3
+    + 10
+    + AFFINE_MODES * 3
+    + AFFINE_MODES * 3
+    + 1
+    + 7 * 2
+    + (MODES + AFFINE_MODES)
+    + 7 * 2
+    + 1
+    + 4 * 3;
 /// The GGUF planes kernels (`mlx_gguf_planes.cpp`, Splash's sources in
 /// `src/metal/splash_gguf`): 8 formats x 3 row tiers (8, 16, 32) x {a, r, g,
 /// gate_up}, the fused kernel at 3 row tiers and `gguf_repack`.

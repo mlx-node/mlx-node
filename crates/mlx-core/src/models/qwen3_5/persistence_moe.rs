@@ -81,11 +81,32 @@ pub(crate) fn sanitize_weights_moe(
     Ok(result)
 }
 
-/// MoE-specific transform chain over the spec-renamed map: `mtp.*` non-expert
-/// bypass (conv1d + MTP-norm shift only), per-expert weight collection and
-/// stacking, fused `gate_up_proj` splitting, `experts.down_proj` →
-/// `switch_mlp.down_proj` renames, conv1d axis fix, and the LM-body +1.0 norm
-/// shift.
+/// Split a MoE expert tensor key into its known suffix and whether that
+/// suffix is an outer-scale sidecar (`.scale` / `.global_scale` /
+/// `.weight_scale_2` / `.weight_global_scale`).
+fn split_moe_expert_suffix(name: &str) -> (&'static str, bool) {
+    if name.ends_with(".scales") {
+        (".scales", false)
+    } else if name.ends_with(".biases") {
+        (".biases", false)
+    } else if name.ends_with(".scale") {
+        (".scale", true)
+    } else if name.ends_with(".global_scale") {
+        (".global_scale", true)
+    } else if name.ends_with(".weight_scale_2") {
+        (".weight_scale_2", true)
+    } else if name.ends_with(".weight_global_scale") {
+        (".weight_global_scale", true)
+    } else {
+        (".weight", false)
+    }
+}
+
+/// Pure weight-map transform shared by the checkpoint loader and its unit
+/// tests: handles MTP bypass (conv1d + MTP-norm shift only), per-expert weight
+/// collection and stacking, fused `gate_up_proj` splitting,
+/// `experts.down_proj` → `switch_mlp.down_proj` renames, conv1d axis fix, and
+/// the LM-body +1.0 norm shift.
 fn normalize_moe_weight_map(
     params: HashMap<String, MxArray>,
     has_individual_experts: bool,
@@ -122,13 +143,8 @@ fn normalize_moe_weight_map(
                     ))
                 })?;
                 let proj_name = rest_parts[1];
-                let suffix = if name.ends_with(".scales") {
-                    "scales"
-                } else if name.ends_with(".biases") {
-                    "biases"
-                } else {
-                    "weight"
-                };
+                let (suffix_dot, _) = split_moe_expert_suffix(&name);
+                let suffix = &suffix_dot[1..];
                 let key = format!("{}.mlp.switch_mlp.{}.{}", prefix, proj_name, suffix);
                 expert_weights
                     .entry(key)
@@ -141,15 +157,29 @@ fn normalize_moe_weight_map(
         if name.contains(".mlp.experts.gate_up_proj")
             || name.contains(".mlp.switch_mlp.gate_up_proj")
         {
-            let suffix = if name.ends_with(".weight") {
-                ".weight"
-            } else if name.ends_with(".scales") {
-                ".scales"
-            } else if name.ends_with(".biases") {
-                ".biases"
+            let (suffix, is_outer_scale) = split_moe_expert_suffix(&name);
+            let name_stripped = name.strip_suffix(suffix).unwrap_or(&name);
+            let base = if name_stripped.contains("switch_mlp") {
+                format!(
+                    "{}{}",
+                    name_stripped.replace("gate_up_proj", "gate_proj"),
+                    suffix
+                )
             } else {
-                ".weight"
+                format!(
+                    "{}{}",
+                    name_stripped.replace("experts.gate_up_proj", "switch_mlp.gate_proj"),
+                    suffix
+                )
             };
+            let up_name = base.replace("gate_proj", "up_proj");
+
+            if is_outer_scale {
+                // Per-expert / scalar outer scale applies identically to both halves.
+                result.insert(base, array.clone());
+                result.insert(up_name, array);
+                continue;
+            }
 
             let shape = array.shape()?;
             if shape.len() >= 2 {
@@ -157,22 +187,6 @@ fn normalize_moe_weight_map(
                 let mid = shape[split_axis] / 2;
                 let gate = array.slice_axis(split_axis, 0, mid)?;
                 let up = array.slice_axis(split_axis, mid, shape[split_axis])?;
-
-                let name_stripped = name.strip_suffix(suffix).unwrap_or(&name);
-                let base = if name_stripped.contains("switch_mlp") {
-                    format!(
-                        "{}{}",
-                        name_stripped.replace("gate_up_proj", "gate_proj"),
-                        suffix
-                    )
-                } else {
-                    format!(
-                        "{}{}",
-                        name_stripped.replace("experts.gate_up_proj", "switch_mlp.gate_proj"),
-                        suffix
-                    )
-                };
-                let up_name = base.replace("gate_proj", "up_proj");
 
                 result.insert(base, gate);
                 result.insert(up_name, up);
@@ -187,13 +201,7 @@ fn normalize_moe_weight_map(
         }
 
         let name = if name.contains(".mlp.experts.down_proj") {
-            let suffix = if name.ends_with(".scales") {
-                ".scales"
-            } else if name.ends_with(".biases") {
-                ".biases"
-            } else {
-                ".weight"
-            };
+            let (suffix, _) = split_moe_expert_suffix(&name);
             let stripped = name.strip_suffix(suffix).unwrap_or(&name);
             format!(
                 "{}{}",
@@ -248,13 +256,8 @@ pub(crate) fn mtp_expert_keys(name: &str, has_individual_experts: bool) -> Vec<S
         return vec![name.to_string()];
     };
     let tensor = |base: &str| {
-        let suffix = if name.ends_with(".scales") {
-            "scales"
-        } else if name.ends_with(".biases") {
-            "biases"
-        } else {
-            "weight"
-        };
+        let (suffix_dot, _) = split_moe_expert_suffix(name);
+        let suffix = &suffix_dot[1..];
         format!("{prefix}.mlp.switch_mlp.{base}.{suffix}")
     };
     let mut parts = rest.split('.');
@@ -1101,3 +1104,119 @@ pub fn create_random_qwen35_moe_checkpoint_sync(
 #[cfg(test)]
 #[path = "persistence_moe_tests.rs"]
 mod persistence_moe_tests;
+
+#[cfg(test)]
+mod outer_scale_tests {
+    use super::*;
+
+    #[test]
+    fn normalize_moe_weight_map_preserves_outer_scales_on_fused_and_down_proj() {
+        let mut params = HashMap::new();
+        // Fused gate_up_proj with [E] .scale, .global_scale, .weight_scale_2 + weight [E, 4, 8]
+        params.insert(
+            "layers.0.mlp.experts.gate_up_proj.weight".to_string(),
+            MxArray::zeros(&[2, 4, 8], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.mlp.experts.gate_up_proj.scale".to_string(),
+            MxArray::from_float32(&[0.5, 1.5], &[2]).unwrap(),
+        );
+        params.insert(
+            "layers.0.mlp.experts.gate_up_proj.global_scale".to_string(),
+            MxArray::from_float32(&[10.0, 20.0], &[2]).unwrap(),
+        );
+        params.insert(
+            "layers.0.mlp.experts.down_proj.weight".to_string(),
+            MxArray::zeros(&[2, 8, 2], Some(DType::BFloat16)).unwrap(),
+        );
+        params.insert(
+            "layers.0.mlp.experts.down_proj.scale".to_string(),
+            MxArray::from_float32(&[0.25, 0.75], &[2]).unwrap(),
+        );
+        params.insert(
+            "layers.0.mlp.experts.down_proj.weight_scale_2".to_string(),
+            MxArray::from_float32(&[0.125, 0.375], &[2]).unwrap(),
+        );
+
+        let out = normalize_moe_weight_map(params, false, false, false, 2).unwrap();
+        assert!(out.contains_key("layers.0.mlp.switch_mlp.gate_proj.weight"));
+        assert!(out.contains_key("layers.0.mlp.switch_mlp.up_proj.weight"));
+        assert_eq!(
+            out["layers.0.mlp.switch_mlp.gate_proj.scale"]
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[0.5f32, 1.5]
+        );
+        assert_eq!(
+            out["layers.0.mlp.switch_mlp.up_proj.scale"]
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[0.5f32, 1.5]
+        );
+        assert_eq!(
+            out["layers.0.mlp.switch_mlp.gate_proj.global_scale"]
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[10.0f32, 20.0]
+        );
+        assert_eq!(
+            out["layers.0.mlp.switch_mlp.up_proj.global_scale"]
+                .to_float32()
+                .unwrap()
+                .as_ref(),
+            &[10.0f32, 20.0]
+        );
+        assert!(out.contains_key("layers.0.mlp.switch_mlp.down_proj.scale"));
+        assert!(out.contains_key("layers.0.mlp.switch_mlp.down_proj.weight_scale_2"));
+        assert!(!out.contains_key("layers.0.mlp.switch_mlp.down_proj.scale.weight"));
+    }
+
+    #[test]
+    fn merge_split_projections_keeps_scaled_nvfp4_gdn_projections_split() {
+        let mut params = HashMap::new();
+        for (name, rows) in [
+            ("layers.0.linear_attn.in_proj_qkv", 16i64),
+            ("layers.0.linear_attn.in_proj_z", 8i64),
+            ("layers.0.linear_attn.in_proj_b", 4i64),
+            ("layers.0.linear_attn.in_proj_a", 4i64),
+        ] {
+            params.insert(
+                format!("{name}.weight"),
+                MxArray::zeros(&[rows, 8], Some(DType::Uint32)).unwrap(),
+            );
+            params.insert(
+                format!("{name}.scales"),
+                MxArray::zeros(&[rows, 4], Some(DType::Uint8)).unwrap(),
+            );
+        }
+        params.insert(
+            "layers.0.linear_attn.in_proj_qkv.global_scale".to_string(),
+            MxArray::from_float32(&[2688.0], &[1]).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.in_proj_z.global_scale".to_string(),
+            MxArray::from_float32(&[5376.0], &[1]).unwrap(),
+        );
+        params.insert(
+            "layers.0.linear_attn.in_proj_b.weight_scale_2".to_string(),
+            MxArray::from_float32(&[0.5], &[1]).unwrap(),
+        );
+
+        let plq = HashMap::new();
+        super::merge_split_projections(&mut params, &plq).unwrap();
+
+        // Both pairs MUST stay split so neither outer scale is orphaned/dropped!
+        assert!(!params.contains_key("layers.0.linear_attn.in_proj_qkvz.weight"));
+        assert!(!params.contains_key("layers.0.linear_attn.in_proj_ba.weight"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_qkv.weight"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_qkv.global_scale"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_z.weight"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_z.global_scale"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_b.weight"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_b.weight_scale_2"));
+        assert!(params.contains_key("layers.0.linear_attn.in_proj_a.weight"));
+    }
+}

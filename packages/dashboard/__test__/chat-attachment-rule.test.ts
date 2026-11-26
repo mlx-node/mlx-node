@@ -116,24 +116,38 @@ describe('attachment uri', () => {
 });
 
 describe('base64', () => {
-  it('takes 0, 1 or 2 padding characters and counts the bytes', () => {
+  it('takes 0, 1 or 2 padding characters, unpadded, whitespace-wrapped, and URL-safe base64', () => {
     for (const length of [3, 4, 5, 6]) {
       const data = Buffer.alloc(length, 7).toString('base64');
       expect(isBase64(data)).toBe(true);
       expect(base64Bytes(data)).toBe(length);
+      const unpadded = data.replaceAll('=', '');
+      expect(isBase64(unpadded)).toBe(true);
+      expect(base64Bytes(unpadded)).toBe(length);
+      const wrapped = ` ${unpadded.slice(0, 2)}\r\n\t${unpadded.slice(2)} `;
+      expect(isBase64(wrapped)).toBe(true);
+      expect(base64Bytes(wrapped)).toBe(length);
     }
+    expect(isBase64('AQI-')).toBe(true);
+    expect(isBase64('AQI_')).toBe(true);
+    expect(isBase64('AQ I')).toBe(true);
+    expect(isBase64('AQI')).toBe(true);
+    expect(base64Bytes('AQI')).toBe(2);
+    expect(base64Bytes('AQ I\r\nD')).toBe(3);
     expect(Buffer.alloc(3).toString('base64').endsWith('=')).toBe(false);
     expect(Buffer.alloc(5).toString('base64').endsWith('==')).toBe(false);
     expect(Buffer.alloc(4).toString('base64').endsWith('==')).toBe(true);
   });
 
-  it('refuses a bad character, a bad length, inner padding and empty text', () => {
-    expect(isBase64('AQI-')).toBe(false);
-    expect(isBase64('AQ I')).toBe(false);
-    expect(isBase64('AQI')).toBe(false);
+  it('refuses a bad character, len % 4 === 1, bad padded length, inner padding and empty text', () => {
+    expect(isBase64('iVBORw0KGgo!AAAA')).toBe(false);
+    expect(isBase64('A')).toBe(false);
+    expect(isBase64('ABCDE')).toBe(false);
+    expect(isBase64('AQ=')).toBe(false);
     expect(isBase64('A=BC')).toBe(false);
     expect(isBase64('A===')).toBe(false);
     expect(isBase64('')).toBe(false);
+    expect(isBase64(' \r\n\t ')).toBe(false);
   });
 
   it('sizes the base64 cap from the byte cap', () => {
@@ -142,9 +156,14 @@ describe('base64', () => {
 });
 
 describe('magicMatches', () => {
-  it('takes PNG and JPEG bytes under their own type', () => {
+  it('takes PNG and JPEG bytes under their own type, including whitespace-wrapped, unpadded, and URL-safe', () => {
     expect(magicMatches('image/png', PNG)).toBe(true);
     expect(magicMatches('image/jpeg', JPEG)).toBe(true);
+    expect(magicMatches('image/png', `  \r\n${PNG.slice(0, 6)}\n${PNG.slice(6)}`)).toBe(true);
+    expect(magicMatches('image/png', 'iVBORw0KGgo')).toBe(true);
+    const urlSafeJpeg = JPEG.replaceAll('+', '-').replaceAll('/', '_').replaceAll('=', '');
+    expect(magicMatches('image/jpeg', urlSafeJpeg)).toBe(true);
+    expect(magicMatches('image/jpeg', `\r\n _9j_4AAQ`)).toBe(true);
   });
 
   it('refuses a wrong pair, WebP bytes and text that is not base64', () => {

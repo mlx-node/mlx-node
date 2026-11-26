@@ -1056,6 +1056,13 @@ impl Inkling2Model {
         self.state_tier.namespace()
     }
 
+    /// The stored states' SSD cache mode: `'persistent'` or `'temp'` while open,
+    /// `'off'` without one, after `closeCache`, or after a non-space write error.
+    #[napi(ts_return_type = "'persistent' | 'temp' | 'off'")]
+    pub fn state_tier_mode(&self) -> String {
+        self.state_tier.mode().to_string()
+    }
+
     /// Whether weights are initialized (always `true` for instances returned by `Inkling2Model.load`).
     #[napi(getter)]
     pub fn is_initialized(&self) -> bool {
@@ -1146,6 +1153,11 @@ impl Inkling2Model {
         if images.is_empty() {
             return u32::try_from(base_len)
                 .map_err(|_| Error::from_reason("expanded_prompt_token_count overflows u32"));
+        }
+        if !self.vision_active {
+            return Err(Error::from_reason(
+                "Inkling2Model: image inputs require a loaded vision encoder",
+            ));
         }
         let vcfg = self.vision_config.clone().ok_or_else(|| {
             Error::from_reason("Inkling2Model: image inputs require a loaded vision encoder")

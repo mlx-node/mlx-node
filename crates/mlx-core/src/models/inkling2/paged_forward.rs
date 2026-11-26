@@ -44,10 +44,10 @@ use crate::models::qwen3_5::draft_context::DraftContextWindow;
 use crate::stream::{Stream, StreamContext};
 use crate::tokenizer::{ChatMessage, Qwen3Tokenizer, ToolDefinition};
 use crate::tools::inkling::{
-    CONTENT_MODEL_END_SAMPLING_ID, IMAGE_PAD_ID, Inkling2RenderOptions, InklingParserState,
-    InklingStreamParser, InklingToolSpec, count_inkling2_reasoning_tokens,
-    output_marker_for_token_id, parse_inkling2_output, parse_reasoning_effort,
-    render_inkling2_chat_messages_to_ids,
+    CONTENT_MODEL_END_SAMPLING_ID, CONTENT_THINKING_ID, END_MESSAGE_ID, IMAGE_PAD_ID,
+    Inkling2RenderOptions, InklingOutputMarkerIds, InklingParserState, InklingStreamParser,
+    InklingToolSpec, count_inkling2_reasoning_tokens_with_ids, output_marker_for_token_id,
+    parse_inkling2_tokens, parse_reasoning_effort, render_inkling2_chat_messages_to_ids,
 };
 use crate::transformer::paged_kv_cache_adapter::{PagedKVCacheAdapter, PagedRaggedRow, SeqId};
 
@@ -76,7 +76,8 @@ use super::short_conv::{
     fused_short_conv_ragged_residual_taped_tree,
 };
 use super::state_disk::{
-    BoundaryDraftWindow, Inkling2StateStore, PackedDraftWindow, planned_rolling_checkpoints,
+    BoundaryDraftWindow, CaptureOptions, Inkling2StateStore, PackedDraftWindow,
+    planned_rolling_checkpoints,
 };
 use super::vision::expand_image_tokens;
 
@@ -98,6 +99,12 @@ thread_local! {
     /// so unit tests can verify best-effort AR draft-window isolation without touching target logits.
     pub(crate) static FAIL_DRAFT_WINDOW_CAPTURE_SEQ: std::cell::Cell<Option<SeqId>> =
         const { std::cell::Cell::new(None) };
+
+    /// Test-only hook: force `stage_prefill_unit_subs` to return an error on scheduled draft
+    /// append at `(seq_id, first_pos)` so unit tests can verify failed multi-sub-slice prefill
+    /// commits leave `StateStore` checkpoints and block marks untouched.
+    pub(crate) static FAIL_PREFILL_DRAFT_APPEND_AT: std::cell::Cell<Option<(SeqId, u32)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Restored 4-bit DFlash2 context window handed from `install_state_hit_sync` to either
@@ -109,6 +116,33 @@ pub(crate) struct RestoredDraftContext {
     pub window: Option<PackedDraftWindow>,
 }
 
+/// One prefill sub-slice staged after all fallible draft appends succeed, awaiting publication
+/// into `block_boundary_conv`, `block_boundary_draft_window`, and `StateStore`.
+struct StagedPrefillBoundary {
+    end: usize,
+    conv_after: Inkling2ShortConvState,
+    draft_window: Option<(u32, BoundaryDraftWindow)>,
+    draft_window_invalidated: bool,
+}
+
+/// Complete staged boundary bundle for an atomic prefill unit `[unit_start..unit_end)`.
+struct StagedPrefillUnit {
+    prior_boundary_draft_window: Option<(u32, BoundaryDraftWindow)>,
+    boundaries: Vec<StagedPrefillBoundary>,
+}
+
+/// Two-slot history of block-aligned ShortConv snapshots for a single sequence.
+///
+/// Keeps the deepest recorded boundary in `current` and the immediately preceding
+/// deeper-replaced boundary in `previous`, so rolling back a trailing stop token
+/// across a `block_size` (32-token) boundary rewinds cleanly instead of leaving a
+/// stale `boundary > recorded` snapshot that skips capture or corrupts the next turn.
+#[derive(Clone)]
+pub(crate) struct BoundaryConvHistory {
+    pub(crate) current: (u32, Inkling2ShortConvState),
+    pub(crate) previous: Option<(u32, Inkling2ShortConvState)>,
+}
+
 /// Runtime state owned by [`Inkling2Inner`] for block-paged hybrid inference.
 pub struct Inkling2PagedRuntime {
     pub coordinator: Inkling2KVCacheCoordinator,
@@ -117,9 +151,10 @@ pub struct Inkling2PagedRuntime {
     /// Pre-step ShortConv snapshot for decode steps so `reconcile_paged_request_tokens`
     /// can roll back one trailing stop token without desynchronizing ShortConv state.
     pub(crate) prev_conv_snapshots: HashMap<SeqId, (u32, Inkling2ShortConvState)>,
-    /// Exact ShortConv snapshot at the deepest complete `block_size` boundary reached by `seq_id`,
-    /// so `StateClass::Ordinary` / preemption capture pairs exact SWA blocks with exact ShortConv.
-    pub(crate) block_boundary_conv: HashMap<SeqId, (u32, Inkling2ShortConvState)>,
+    /// Two-slot history of exact ShortConv snapshots at complete `block_size` boundaries
+    /// reached by `seq_id`, so `StateClass::Ordinary` / preemption capture pairs exact SWA
+    /// blocks with exact ShortConv even after a rollback across a block boundary.
+    pub(crate) block_boundary_conv: HashMap<SeqId, BoundaryConvHistory>,
     /// Live per-sequence 4-bit quantized DFlash2 fused context ring buffer.
     pub(crate) draft_windows: HashMap<SeqId, DraftContextWindow>,
     /// Exact 4-bit DFlash2 context window snapshotted at the deepest complete `block_size`
@@ -134,6 +169,9 @@ pub struct Inkling2PagedRuntime {
     /// Per-sequence cache publication policy (`reuse_cache`) recorded when preparing a turn so
     /// preemption never publishes checkpoints or prefix blocks for opted-out (`false`) turns.
     pub(crate) seq_reuse_cache: HashMap<SeqId, bool>,
+    /// Per-sequence `cache_salt` recorded when preparing a turn so periodic decode rolling
+    /// checkpoints publish under the exact same cache namespace as prefill and turn-end capture.
+    pub(crate) seq_cache_salt: HashMap<SeqId, u64>,
     /// Qwen 3.8-style hybrid prefix state store (RAM + optional StateDisk SSD cache).
     pub(crate) state_store: Inkling2StateStore,
     pub active_seq: SeqId,
@@ -142,6 +180,17 @@ pub struct Inkling2PagedRuntime {
     /// True only while executing an exclusive barrier turn (`execute_chat_barrier`), enabling
     /// on-demand idle-owner and `StateStore` KV reclaim on allocation pressure.
     pub(crate) exclusive_turn_active: bool,
+    /// Active scheduled sequence IDs (`Waiting`, `Running`, `WaitingForSsd`) synced from
+    /// `HybridSchedulerState` so scheduled Group 1 SWA reclaim never evicts a live lane.
+    pub(crate) active_scheduled_seqs: HashSet<SeqId>,
+    /// Expanded `(token_position, digest_word)` image identity positions for the currently
+    /// installed owner's paged session (used by `build_paged_extra_keys` on both multimodal
+    /// turns and live text continuations so Group 0 `PrefixRegistry` is never poisoned).
+    pub(crate) cached_paged_image_token_positions: Vec<(u32, u64)>,
+    /// Per-sequence image lineage `(image_key, token_positions)` so concurrent scheduled lanes
+    /// (e.g. `preempt_scheduled_cache` / `maybe_capture_rolling_checkpoint`) always know whether
+    /// `seq_id` carries image KV even when another owner is currently installed on `self`.
+    pub(crate) seq_image_lineage: HashMap<SeqId, (u64, Vec<(u32, u64)>)>,
 }
 
 impl Inkling2PagedRuntime {
@@ -177,11 +226,15 @@ impl Inkling2PagedRuntime {
             block_boundary_draft_window: HashMap::new(),
             restored_draft_windows: HashMap::new(),
             seq_reuse_cache: HashMap::new(),
+            seq_cache_salt: HashMap::new(),
             state_store,
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
             exclusive_turn_active: false,
+            active_scheduled_seqs: HashSet::new(),
+            cached_paged_image_token_positions: Vec::new(),
+            seq_image_lineage: HashMap::new(),
         })
     }
 
@@ -202,11 +255,88 @@ impl Inkling2PagedRuntime {
             block_boundary_draft_window: HashMap::new(),
             restored_draft_windows: HashMap::new(),
             seq_reuse_cache: HashMap::new(),
+            seq_cache_salt: HashMap::new(),
             state_store: Inkling2StateStore::new(block_size, recency),
             active_seq: 0,
             prefill_chunk_size,
             paged_finalize_error: None,
             exclusive_turn_active: false,
+            active_scheduled_seqs: HashSet::new(),
+            cached_paged_image_token_positions: Vec::new(),
+            seq_image_lineage: HashMap::new(),
+        }
+    }
+
+    fn push_block_boundary_conv(
+        &mut self,
+        seq_id: SeqId,
+        boundary: u32,
+        conv: Inkling2ShortConvState,
+    ) {
+        match self.block_boundary_conv.get_mut(&seq_id) {
+            Some(hist) if boundary > hist.current.0 => {
+                let prev = std::mem::replace(&mut hist.current, (boundary, conv));
+                hist.previous = Some(prev);
+            }
+            Some(hist) if boundary == hist.current.0 => {
+                hist.current = (boundary, conv);
+            }
+            Some(hist) => {
+                hist.current = (boundary, conv);
+                hist.previous = None;
+            }
+            None => {
+                self.block_boundary_conv.insert(
+                    seq_id,
+                    BoundaryConvHistory {
+                        current: (boundary, conv),
+                        previous: None,
+                    },
+                );
+            }
+        }
+    }
+
+    pub(crate) fn current_block_boundary_conv(
+        &self,
+        seq_id: SeqId,
+    ) -> Option<(u32, Inkling2ShortConvState)> {
+        self.block_boundary_conv
+            .get(&seq_id)
+            .map(|hist| hist.current.clone())
+    }
+
+    /// Rewind `block_boundary_conv[seq_id]` (and any future draft-window state) so no snapshot
+    /// deeper than `target_len` survives a rollback across a `block_size` boundary. Promotes
+    /// `previous` if `previous.0 <= target_len`, otherwise removes the entry cleanly.
+    pub(crate) fn rewind_block_boundary_conv(&mut self, seq_id: SeqId, target_len: u32) {
+        let remove = match self.block_boundary_conv.get_mut(&seq_id) {
+            None => false,
+            Some(hist) if hist.current.0 <= target_len => false,
+            Some(hist) => match hist.previous.take() {
+                Some(prev) if prev.0 <= target_len => {
+                    hist.current = prev;
+                    false
+                }
+                _ => true,
+            },
+        };
+        if remove {
+            self.block_boundary_conv.remove(&seq_id);
+        }
+        if self
+            .block_boundary_draft_window
+            .get(&seq_id)
+            .is_some_and(|(depth, _)| *depth > target_len)
+        {
+            self.block_boundary_draft_window.remove(&seq_id);
+        }
+        if self
+            .draft_windows
+            .get(&seq_id)
+            .is_some_and(|w| w.end() > target_len)
+        {
+            self.draft_windows.remove(&seq_id);
         }
     }
 
@@ -362,7 +492,7 @@ impl Inkling2PagedRuntime {
             && pos_after.is_multiple_of(bs)
             && let Some(conv) = self.conv_states.get(&seq_id).cloned()
         {
-            self.block_boundary_conv.insert(seq_id, (pos_after, conv));
+            self.push_block_boundary_conv(seq_id, pos_after, conv);
         }
     }
 
@@ -392,7 +522,7 @@ impl Inkling2PagedRuntime {
         let offset = (boundary - prev) as usize;
         if let Some(mut snap) = self.conv_states.get(&seq_id).cloned() {
             tape.commit_prefix(offset, &mut snap)?;
-            self.block_boundary_conv.insert(seq_id, (boundary, snap));
+            self.push_block_boundary_conv(seq_id, boundary, snap);
         }
         Ok(())
     }
@@ -424,7 +554,7 @@ impl Inkling2PagedRuntime {
         let offset = (boundary - prev) as usize;
         if let Some(mut snap) = self.conv_states.get(&seq_id).cloned() {
             tape.commit_path(&accepted_rows[..offset], &mut snap)?;
-            self.block_boundary_conv.insert(seq_id, (boundary, snap));
+            self.push_block_boundary_conv(seq_id, boundary, snap);
         }
         Ok(())
     }
@@ -467,6 +597,8 @@ impl Inkling2PagedRuntime {
         self.block_boundary_draft_window.remove(&seq_id);
         self.restored_draft_windows.remove(&seq_id);
         self.seq_reuse_cache.remove(&seq_id);
+        self.seq_cache_salt.remove(&seq_id);
+        self.seq_image_lineage.remove(&seq_id);
         Ok(())
     }
 
@@ -479,6 +611,8 @@ impl Inkling2PagedRuntime {
         self.block_boundary_draft_window.remove(&seq_id);
         self.restored_draft_windows.remove(&seq_id);
         self.seq_reuse_cache.remove(&seq_id);
+        self.seq_cache_salt.remove(&seq_id);
+        self.seq_image_lineage.remove(&seq_id);
     }
 
     pub fn snapshot_conv_state(&self, seq_id: SeqId) -> Option<Inkling2ShortConvState> {
@@ -596,7 +730,7 @@ pub(crate) fn device_int8_query_from() -> Option<u32> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SwaMppVerifyMode {
     Off,
     Auto,
@@ -604,9 +738,11 @@ enum SwaMppVerifyMode {
 }
 
 /// Gate for routing SWA `M >= 4` verify lanes onto GQA-3 MPP verify.
-/// Defaults to `Auto` (`first_logical_position >= 512`: keeps short `< 512` prompts on scalar V1
-/// while giving `>= 512` / `1511` / `2048` contexts the measured `-1.44 to -2.68 ms` MPP speedup).
-/// `MLX_INKLING2_SWA_MPP_VERIFY=0` forces off; `=1` forces on for `first_logical_position >= 64`.
+/// Defaults to `Auto` (`first_logical_position >= 512` for solo `N == 1` waves: keeps short
+/// `< 512` prompts and multi-lane `N >= 2` waves on batched varlen `inkling2_paged_attention`
+/// while giving solo `>= 512` / `1511` / `2048` contexts the measured `-1.44 to -2.68 ms` MPP
+/// speedup). `MLX_INKLING2_SWA_MPP_VERIFY=0` forces off; `=1` forces per-lane on for
+/// `first_logical_position >= 64`.
 #[inline]
 fn swa_mpp_verify_mode() -> SwaMppVerifyMode {
     static MODE: std::sync::OnceLock<SwaMppVerifyMode> = std::sync::OnceLock::new();
@@ -632,17 +768,49 @@ pub(crate) fn lane_uses_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) ->
         && row.first_logical_position >= 2048
 }
 
-/// Per-lane eligibility for MPP `Pass::Verify` on SWA attention layers.
 #[inline]
-pub(crate) fn lane_uses_swa_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) -> bool {
+fn lane_uses_swa_mpp_verify_with_mode(
+    row: &PagedRaggedRow,
+    mpp_supported: bool,
+    mode: SwaMppVerifyMode,
+) -> bool {
     if !mpp_supported || row.query_len < 4 || row.query_len > prefill_plan::INKLING2_VERIFY_ROWS {
         return false;
     }
-    match swa_mpp_verify_mode() {
+    match mode {
         SwaMppVerifyMode::Off => false,
         SwaMppVerifyMode::Auto => row.first_logical_position >= 512,
         SwaMppVerifyMode::ForceLowCtx => row.first_logical_position >= 64,
     }
+}
+
+/// Per-lane eligibility for MPP `Pass::Verify` on SWA attention layers.
+#[inline]
+pub(crate) fn lane_uses_swa_mpp_verify(row: &PagedRaggedRow, mpp_supported: bool) -> bool {
+    lane_uses_swa_mpp_verify_with_mode(row, mpp_supported, swa_mpp_verify_mode())
+}
+
+/// Wave-level eligibility for per-lane SWA MPP verify.
+///
+/// Under `Auto`, gated on solo `ragged_rows.len() == 1` so `N = 2..4` waves route all 40 SWA
+/// visits through ONE batched varlen `inkling2_paged_attention_ex_tree` launch (0 slices,
+/// 0 concats, 0 SWA workspaces) while keeping solo `N = 1` SWA MPP speedup and `ForceLowCtx`
+/// explicit overrides intact.
+#[inline]
+fn wave_uses_swa_mpp_verify(
+    ragged_rows: &[PagedRaggedRow],
+    mpp_supported: bool,
+    mode: SwaMppVerifyMode,
+) -> bool {
+    let allowed = match mode {
+        SwaMppVerifyMode::Off => false,
+        SwaMppVerifyMode::Auto => ragged_rows.len() == 1,
+        SwaMppVerifyMode::ForceLowCtx => true,
+    };
+    allowed
+        && ragged_rows
+            .iter()
+            .any(|r| lane_uses_swa_mpp_verify_with_mode(r, mpp_supported, mode))
 }
 
 /// Splash-tuned split count for Inkling2 MPP verify (`1..=16` rows) across Global & SWA layers.
@@ -853,12 +1021,24 @@ enum LogitsOutput {
     GreedyArgmax,
 }
 
+/// Completed internal sub-slice buffered until its enclosing scheduler prefill unit
+/// `[unit_start..unit_end)` finishes cleanly, guaranteeing atomic rollback across sub-slices
+/// without mutating draft contexts, boundary snapshots, or StateStore on mid-unit failure.
+struct PendingPrefillSubSlice {
+    first_pos: u32,
+    end: usize,
+    rows: usize,
+    conv_after: Inkling2ShortConvState,
+    captured_taps: Vec<MxArray>,
+}
+
 /// Resumable 48-visit prefill unit for 100ms layer-chunked prefill interleaving.
 ///
 /// While a long prefill is paused between visits (`ScheduledPrefillPass::Paused`), active decode
 /// lanes run batched `[N, 1]` decode steps on independent sequences without stalling past the
-/// 500ms decode-gap cap. If preempted mid-unit, `abort_prefill_run` restores `conv_at_start` and
-/// rolls back the uncommitted KV rows `[start..end)` cleanly.
+/// 500ms decode-gap cap. If preempted or blocked mid-unit (even on sub-slice `k >= 1`),
+/// `abort_prefill_run` / `rollback_prefill_unit` restores `unit_initial_conv` and rolls back ALL
+/// uncommitted KV rows in `[unit_start..committed)` cleanly.
 pub(crate) struct Inkling2PrefillRun {
     unit_start: usize,
     unit_end: usize,
@@ -885,9 +1065,10 @@ pub(crate) struct Inkling2PrefillRun {
     mpp_pass: Pass,
     pages_per_split: u32,
     int8_q_from: Option<u32>,
-    conv_at_unit_start: Inkling2ShortConvState,
+    unit_initial_conv: Option<Inkling2ShortConvState>,
     tap_visits: Vec<usize>,
     captured_taps: Vec<MxArray>,
+    pending_subs: Vec<PendingPrefillSubSlice>,
 }
 
 impl Inkling2PrefillRun {
@@ -1229,18 +1410,229 @@ impl Inkling2Inner {
             .map_err(Error::from_reason)
     }
 
-    /// Abort an in-flight layer-chunked prefill run for `seq_id`, rolling back its uncommitted
-    /// KV rows for the active sub-slice and restoring the ShortConv snapshot captured at that
-    /// sub-slice's start.
+    /// Atomically roll back an aborted or failed prefill unit `[unit_start..)` for `seq_id`
+    /// across BOTH Group 0 (Global) and Group 1 (SWA) KV caches, ShortConv state, block-boundary
+    /// snapshots, draft windows, and any draft lane that drifted past `unit_start`.
+    fn rollback_prefill_unit(
+        &mut self,
+        seq_id: SeqId,
+        unit_start: usize,
+        unit_initial_conv: Option<Inkling2ShortConvState>,
+    ) {
+        let target_u32 = u32::try_from(unit_start).unwrap_or(u32::MAX);
+        if let Some(rt) = self.paged.as_mut() {
+            let _ = rt.coordinator.eval_pending_pool_writes_all();
+            if let Ok(committed) = rt.coordinator.request_token_count_all(seq_id) {
+                let delta = committed.saturating_sub(target_u32);
+                if delta > 0 {
+                    let _ = rt.coordinator.rollback_last_tokens_all(seq_id, delta);
+                }
+            }
+            match unit_initial_conv {
+                Some(conv) if unit_start > 0 => {
+                    rt.conv_states.insert(seq_id, conv);
+                }
+                _ => {
+                    rt.conv_states.remove(&seq_id);
+                }
+            }
+            rt.rewind_block_boundary_conv(seq_id, target_u32);
+        }
+        // Defense-in-depth fail-closed guard: draft taps are deferred until full-unit commit,
+        // so `committed_len()` should already equal `unit_start`; drop if ever ahead.
+        if self
+            .scheduled_dspark
+            .seq_lanes
+            .get(&seq_id)
+            .is_some_and(|lane| lane.ctx.committed_len() as usize > unit_start)
+        {
+            self.scheduled_dspark.seq_lanes.remove(&seq_id);
+            self.scheduled_dspark.sync_decode_limit();
+        }
+        if self
+            .dspark_turn_contexts
+            .get(&seq_id)
+            .is_some_and(|ctx| ctx.committed_len() as usize > unit_start)
+        {
+            self.dspark_turn_contexts.remove(&seq_id);
+        }
+    }
+
+    /// Phase 1 of atomic prefill unit commit: feed buffered sub-slices into DSpark/DFlash2 draft
+    /// contexts and capture any per-sub-slice boundary draft windows WITHOUT mutating
+    /// `block_boundary_conv` or `StateStore`.
+    ///
+    /// If any fallible draft append fails, restores any pre-unit `block_boundary_draft_window`
+    /// and returns `Err` so `rollback_prefill_unit` rewinds live state cleanly while leaving
+    /// `StateStore` checkpoints and Group 0 block marks completely untouched.
+    fn stage_prefill_unit_subs(
+        &mut self,
+        seq_id: SeqId,
+        reuse_cache: bool,
+        tap_visits: &[usize],
+        subs: Vec<PendingPrefillSubSlice>,
+        context: &'static str,
+    ) -> Result<StagedPrefillUnit> {
+        let prior_boundary_draft_window = self
+            .paged
+            .as_mut()
+            .and_then(|rt| rt.block_boundary_draft_window.remove(&seq_id));
+        let mut boundaries = Vec::with_capacity(subs.len());
+
+        let stage_res: Result<()> = (|| {
+            for sub in subs {
+                let mut draft_window_invalidated = false;
+                if !tap_visits.is_empty() {
+                    if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+                        #[cfg(test)]
+                        if FAIL_PREFILL_DRAFT_APPEND_AT.with(std::cell::Cell::get)
+                            == Some((seq_id, sub.first_pos))
+                        {
+                            return Err(Error::from_reason(format!(
+                                "injected prefill draft append failure for seq {seq_id} at pos {}",
+                                sub.first_pos
+                            )));
+                        }
+                        self.append_scheduled_dspark_prefill(
+                            seq_id,
+                            sub.first_pos,
+                            &sub.captured_taps,
+                            sub.rows,
+                        )?;
+                        if reuse_cache
+                            && self.dflash2.is_some()
+                            && !sub.captured_taps.is_empty()
+                            && sub.rows > 0
+                            && self.paged.as_ref().is_some_and(|rt| {
+                                rt.seq_reuse_cache(seq_id)
+                                    && !rt.draft_windows.contains_key(&seq_id)
+                            })
+                        {
+                            draft_window_invalidated = true;
+                        }
+                    } else if reuse_cache && self.dflash2.is_some() && !sub.captured_taps.is_empty()
+                    {
+                        self.record_taps_to_draft_window_best_effort(
+                            seq_id,
+                            sub.first_pos,
+                            &sub.captured_taps,
+                            sub.rows,
+                            context,
+                        );
+                        if sub.rows > 0
+                            && self
+                                .paged
+                                .as_ref()
+                                .is_some_and(|rt| !rt.draft_windows.contains_key(&seq_id))
+                        {
+                            draft_window_invalidated = true;
+                        }
+                    }
+                }
+                let draft_window = self
+                    .paged
+                    .as_mut()
+                    .and_then(|rt| rt.block_boundary_draft_window.remove(&seq_id));
+                boundaries.push(StagedPrefillBoundary {
+                    end: sub.end,
+                    conv_after: sub.conv_after,
+                    draft_window,
+                    draft_window_invalidated,
+                });
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = stage_res {
+            if let Some(prior) = prior_boundary_draft_window
+                && let Some(rt) = self.paged.as_mut()
+            {
+                rt.block_boundary_draft_window.insert(seq_id, prior);
+            }
+            return Err(err);
+        }
+
+        Ok(StagedPrefillUnit {
+            prior_boundary_draft_window,
+            boundaries,
+        })
+    }
+
+    /// Phase 2 of atomic prefill unit commit: runs ONLY after every fallible draft append and
+    /// committed KV pool write has succeeded. Records block-aligned ShortConv + draft-window
+    /// boundaries and publishes rolling checkpoints / prompt junctions to `StateStore` BEFORE
+    /// final SWA pruning retires blocks past `unit_start`.
+    fn publish_staged_prefill_boundaries(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        cache_salt: u64,
+        reuse_cache: bool,
+        staged: StagedPrefillUnit,
+        context: &'static str,
+    ) {
+        let bs = self
+            .paged
+            .as_ref()
+            .map_or(1, |rt| rt.coordinator.block_size().max(1));
+        if let Some(prior) = staged.prior_boundary_draft_window
+            && let Some(rt) = self.paged.as_mut()
+        {
+            rt.block_boundary_draft_window.insert(seq_id, prior);
+        }
+        for sub in staged.boundaries {
+            if let Some(rt) = self.paged.as_mut() {
+                if sub.draft_window_invalidated {
+                    rt.block_boundary_draft_window.remove(&seq_id);
+                } else if let Some((wb, win)) = sub.draft_window {
+                    rt.block_boundary_draft_window.insert(seq_id, (wb, win));
+                }
+                if let Ok(sub_end_u32) = u32::try_from(sub.end)
+                    && sub_end_u32 > 0
+                    && sub_end_u32.is_multiple_of(bs)
+                {
+                    rt.push_block_boundary_conv(seq_id, sub_end_u32, sub.conv_after.clone());
+                }
+            }
+            if reuse_cache {
+                self.maybe_capture_rolling_checkpoint_with_conv_best_effort(
+                    seq_id,
+                    source,
+                    sub.end,
+                    &sub.conv_after,
+                    cache_salt,
+                    context,
+                );
+            }
+        }
+    }
+
+    /// Post-publication async eval and SWA pruning for an already-committed prefill unit.
+    ///
+    /// Called ONLY after `settle_paged_step_committed` has already validated and evaluated all
+    /// pending KV pool writes and `publish_staged_prefill_boundaries` has published any staged
+    /// checkpoints, so a warning-only prune error can never report a rolled-back unit after
+    /// `StateStore` publication.
+    fn finish_committed_prefill_settle(&mut self, seq_id: SeqId, context: &'static str) {
+        if let Err(err) = self.settle_paged_step(seq_id) {
+            tracing::warn!(
+                target: "mlx_core::inkling2::paged",
+                seq_id,
+                context,
+                error = %err,
+                "Inkling2 {context}: post-commit SWA prune failed after StateStore publication; keeping committed state"
+            );
+        }
+    }
+
+    /// Abort an in-flight layer-chunked prefill run for `seq_id`, rolling back ALL uncommitted
+    /// KV rows across every sub-slice of `[unit_start..committed)` and restoring the ShortConv
+    /// snapshot captured before sub-slice 0.
     pub(crate) fn abort_prefill_run(&mut self, seq_id: SeqId) {
         let Some(run) = self.prefill_runs.remove(&seq_id) else {
             return;
         };
-        if let Some(rt) = self.paged.as_mut() {
-            let _ = rt.coordinator.eval_pending_pool_writes_all();
-            let _ = rt.coordinator.rollback_last_tokens_all(seq_id, run.rows);
-            rt.conv_states.insert(seq_id, run.conv_at_unit_start);
-        }
+        self.rollback_prefill_unit(seq_id, run.unit_start, run.unit_initial_conv);
     }
 
     /// Execute one pass (up to `budget_ms`, or to completion when `None`) of the scheduled
@@ -1272,15 +1664,18 @@ impl Inkling2Inner {
                 source.len()
             )));
         }
-        let bs = self
-            .paged
-            .as_ref()
-            .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?
-            .coordinator
-            .block_size();
+        let bs = {
+            let rt = self
+                .paged
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
+            rt.seq_cache_salt.insert(seq_id, cache_salt);
+            rt.coordinator.block_size()
+        };
 
         // Fast path: unbounded slice with no active run executes sub-slices (splitting at any
-        // internal rolling checkpoint or prompt junction when `reuse_cache` permits publication).
+        // internal rolling checkpoint or prompt junction when `reuse_cache` permits publication),
+        // committing atomically at `end` or rolling back the entire unit to `start` on error.
         if budget_ms.is_none() && !self.prefill_runs.contains_key(&seq_id) {
             let subs = if reuse_cache {
                 prefill_sub_boundaries(start, end, source.len(), bs)
@@ -1299,75 +1694,133 @@ impl Inkling2Inner {
             } else {
                 Vec::new()
             };
-            let mut sub_start = start;
-            let mut final_logits_opt = None;
-            for sub_end in subs {
-                let chunk = &source[sub_start..sub_end];
-                let first_pos = {
-                    let rt = self.paged.as_mut().ok_or_else(|| {
-                        Error::from_reason("Inkling2Inner: paged runtime missing")
-                    })?;
-                    rt.ensure_conv_state(seq_id, &self.config)?;
-                    let pos = rt
-                        .coordinator
-                        .request_token_count_all(seq_id)
-                        .map_err(Error::from_reason)?;
-                    rt.coordinator
-                        .record_tokens_all(seq_id, chunk)
-                        .map_err(Error::from_reason)?;
-                    pos
-                };
-                let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
-                    seq_id,
-                    chunk,
-                    None,
-                    first_pos,
-                    sub_end == source.len(),
-                    &tap_visits,
-                )?;
-                let _ = self.settle_paged_step(seq_id)?;
-                if !tap_visits.is_empty() {
-                    if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
-                        self.append_scheduled_dspark_prefill(
-                            seq_id,
-                            first_pos,
-                            &taps,
-                            chunk.len(),
-                        )?;
-                    } else if reuse_cache && self.dflash2.is_some() && !taps.is_empty() {
-                        self.record_taps_to_draft_window_best_effort(
-                            seq_id,
-                            first_pos,
-                            &taps,
-                            chunk.len(),
-                            "scheduled AR prefill",
-                        );
+            // Proactively reclaim idle Group 1 SWA owners for the whole unit before sub-slice 0.
+            let unit_end_u32 = u32::try_from(end).unwrap_or(u32::MAX);
+            self.ensure_swa_headroom_for_total(seq_id, unit_end_u32);
+
+            let unit_initial_conv = {
+                let rt = self
+                    .paged
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
+                let pos = rt
+                    .coordinator
+                    .request_token_count_all(seq_id)
+                    .map_err(Error::from_reason)?;
+                if pos as usize != start {
+                    return Err(Error::from_reason(format!(
+                        "Inkling2 prefill frontier mismatch: KV at {pos}, expected {start}"
+                    )));
+                }
+                if start == 0 {
+                    let _ = rt.ensure_conv_state(seq_id, &self.config)?;
+                    None
+                } else {
+                    Some(rt.ensure_conv_state(seq_id, &self.config)?.clone())
+                }
+            };
+
+            let fast_res: Result<(Option<MxArray>, StagedPrefillUnit)> = (|| {
+                let mut sub_start = start;
+                let mut final_logits_opt = None;
+                let mut pending_subs: Vec<PendingPrefillSubSlice> = Vec::with_capacity(subs.len());
+                let unit_start_u32 = u32::try_from(start).unwrap_or(u32::MAX);
+                for sub_end in subs {
+                    let chunk = &source[sub_start..sub_end];
+                    self.ensure_swa_headroom_for_total(seq_id, unit_end_u32);
+                    let first_pos = {
+                        let rt = self.paged.as_mut().ok_or_else(|| {
+                            Error::from_reason("Inkling2Inner: paged runtime missing")
+                        })?;
+                        rt.ensure_conv_state(seq_id, &self.config)?;
+                        let pos = rt
+                            .coordinator
+                            .request_token_count_all(seq_id)
+                            .map_err(Error::from_reason)?;
+                        if pos as usize != sub_start {
+                            return Err(Error::from_reason(format!(
+                                "Inkling2 prefill frontier mismatch: KV at {pos}, expected {sub_start}"
+                            )));
+                        }
+                        rt.coordinator
+                            .record_tokens_all(seq_id, chunk)
+                            .map_err(Error::from_reason)?;
+                        pos
+                    };
+                    let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
+                        seq_id,
+                        chunk,
+                        None,
+                        first_pos,
+                        sub_end == source.len(),
+                        &tap_visits,
+                    )?;
+                    if sub_end < end {
+                        // Anchor SWA pruning at `unit_start` so both lossless rollback and
+                        // boundary checkpoint capture keep every in-window block alive.
+                        let _ = self.settle_paged_step_committed(seq_id, unit_start_u32)?;
+                        if !taps.is_empty() {
+                            let tap_refs: Vec<&MxArray> = taps.iter().collect();
+                            MxArray::eval_arrays(&tap_refs)?;
+                        }
+                    } else if let Some(rt) = self.paged.as_mut() {
+                        rt.coordinator
+                            .eval_pending_pool_writes_all()
+                            .map_err(Error::from_reason)?;
                     }
+                    let conv_after = self
+                        .paged
+                        .as_ref()
+                        .and_then(|rt| rt.conv_states.get(&seq_id).cloned())
+                        .ok_or_else(|| {
+                            Error::from_reason(format!(
+                                "Inkling2 prefill fast path: missing conv state for seq {seq_id}"
+                            ))
+                        })?;
+                    pending_subs.push(PendingPrefillSubSlice {
+                        first_pos,
+                        end: sub_end,
+                        rows: chunk.len(),
+                        conv_after,
+                        captured_taps: taps,
+                    });
+                    if sub_end == end {
+                        final_logits_opt = logits_opt;
+                    }
+                    sub_start = sub_end;
                 }
-                if let Some(rt) = self.paged.as_mut()
-                    && let Ok(sub_end_u32) = u32::try_from(sub_end)
-                {
-                    rt.record_block_boundary_conv(seq_id, sub_end_u32);
-                }
-                if reuse_cache {
-                    self.maybe_capture_rolling_checkpoint_best_effort(
+                let final_logits = match final_logits_opt {
+                    Some(l) => Some(l.squeeze(Some(&[0]))?),
+                    None => None,
+                };
+                let _ = self.settle_paged_step_committed(seq_id, unit_start_u32)?;
+                let staged = self.stage_prefill_unit_subs(
+                    seq_id,
+                    reuse_cache,
+                    &tap_visits,
+                    pending_subs,
+                    "scheduled prefill",
+                )?;
+                Ok((final_logits, staged))
+            })();
+            return match fast_res {
+                Ok((logits, staged)) => {
+                    self.publish_staged_prefill_boundaries(
                         seq_id,
                         source,
-                        sub_end,
                         cache_salt,
+                        reuse_cache,
+                        staged,
                         "scheduled prefill",
                     );
+                    self.finish_committed_prefill_settle(seq_id, "scheduled prefill");
+                    Ok(ScheduledPrefillPass::Done(logits))
                 }
-                if sub_end == end {
-                    final_logits_opt = logits_opt;
+                Err(err) => {
+                    self.rollback_prefill_unit(seq_id, start, unit_initial_conv);
+                    Err(err)
                 }
-                sub_start = sub_end;
-            }
-            let logits = match final_logits_opt {
-                Some(l) => Some(l.squeeze(Some(&[0]))?),
-                None => None,
             };
-            return Ok(ScheduledPrefillPass::Done(logits));
         }
 
         // Resumable pass path: either resume an existing run for `[start..end)` or initialize one
@@ -1400,6 +1853,7 @@ impl Inkling2Inner {
                     reuse_cache,
                     first_sub_end == source.len(),
                     None,
+                    Vec::new(),
                 )?
             }
             None => {
@@ -1419,6 +1873,7 @@ impl Inkling2Inner {
                     reuse_cache,
                     first_sub_end == source.len(),
                     None,
+                    Vec::new(),
                 )?
             }
         };
@@ -1446,16 +1901,23 @@ impl Inkling2Inner {
             };
 
             // Extract `conv` ONCE before the visit loop (zero per-visit HashMap remove/insert!).
-            let mut conv_state = {
-                let rt = self
-                    .paged
-                    .as_mut()
-                    .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
-                rt.conv_states.remove(&seq_id).ok_or_else(|| {
-                    Error::from_reason(format!(
-                        "Inkling2 prefill pass: missing conv state for seq {seq_id}"
-                    ))
-                })?
+            let mut conv_state = match self
+                .paged
+                .as_mut()
+                .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))
+                .and_then(|rt| {
+                    rt.conv_states.remove(&seq_id).ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Inkling2 prefill pass: missing conv state for seq {seq_id}"
+                        ))
+                    })
+                }) {
+                Ok(c) => c,
+                Err(err) => {
+                    self.prefill_runs.insert(seq_id, run);
+                    self.abort_prefill_run(seq_id);
+                    return Err(err);
+                }
             };
 
             let mut loop_outcome: Result<bool> = Ok(false); // Ok(true) => paused
@@ -1551,7 +2013,7 @@ impl Inkling2Inner {
                                             &mut visit_convs,
                                             None,
                                             run.current_bank.as_deref(),
-                                            run.mpp_workspace.as_mut(),
+                                            std::slice::from_mut(&mut run.mpp_workspace),
                                             act_dtype,
                                         )
                                     }
@@ -1623,11 +2085,13 @@ impl Inkling2Inner {
                 Ok(false) => {}
             }
 
-            // All 48 visits finished for `[run.start..run.end)`: settle writes, capture final
-            // tap (`visit == 48`) + feed scheduled DSpark context, record exact ShortConv boundary,
-            // and capture checkpoint / prompt junction!
+            // All 48 visits finished for `[run.start..run.end)`: evaluate outputs/taps and either
+            // buffer this intermediate sub-slice (preserving SWA blocks at `unit_start`) or commit
+            // the entire unit `[run.unit_start..run.unit_end)` atomically!
             let capture_final_norm = run.tap_visits.contains(&num_visits);
-            let post_res: Result<Option<MxArray>> = (|| {
+            let is_unit_end = run.end >= run.unit_end;
+            let unit_start_u32 = u32::try_from(run.unit_start).unwrap_or(u32::MAX);
+            let post_res: Result<(Option<MxArray>, Inkling2ShortConvState)> = (|| {
                 let (logits_opt, final_norm_opt) = self.compute_final_norm_and_logits(
                     &run.blocks,
                     &run.partial,
@@ -1648,75 +2112,119 @@ impl Inkling2Inner {
                         None
                     }
                 };
-                let _ = self.settle_paged_step(seq_id)?;
-                Ok(logits)
+                if is_unit_end {
+                    if let Some(rt) = self.paged.as_mut() {
+                        rt.coordinator
+                            .eval_pending_pool_writes_all()
+                            .map_err(Error::from_reason)?;
+                    }
+                } else {
+                    // Anchor SWA pruning at `unit_start` so rolling back if a later sub-slice
+                    // hits `allocation_blocked` or cancellation never touches pruned null blocks.
+                    let _ = self.settle_paged_step_committed(seq_id, unit_start_u32)?;
+                    if !run.captured_taps.is_empty() {
+                        let tap_refs: Vec<&MxArray> = run.captured_taps.iter().collect();
+                        MxArray::eval_arrays(&tap_refs)?;
+                    }
+                }
+                let conv_after = self
+                    .paged
+                    .as_ref()
+                    .and_then(|rt| rt.conv_states.get(&seq_id).cloned())
+                    .ok_or_else(|| {
+                        Error::from_reason(format!(
+                            "Inkling2 prefill pass: missing conv state after sub-slice for seq {seq_id}"
+                        ))
+                    })?;
+                Ok((logits, conv_after))
             })();
-            let logits = match post_res {
-                Ok(l) => l,
+            let (logits, conv_after) = match post_res {
+                Ok(out) => out,
                 Err(err) => {
                     self.prefill_runs.insert(seq_id, run);
                     self.abort_prefill_run(seq_id);
                     return Err(err);
                 }
             };
-            if !run.tap_visits.is_empty() {
-                if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
-                    self.append_scheduled_dspark_prefill(
+
+            let sub_entry = PendingPrefillSubSlice {
+                first_pos: run.first_pos,
+                end: run.end,
+                rows: run.rows as usize,
+                conv_after,
+                captured_taps: std::mem::take(&mut run.captured_taps),
+            };
+            run.pending_subs.push(sub_entry);
+
+            if is_unit_end {
+                let unit_start = run.unit_start;
+                let unit_initial_conv = run.unit_initial_conv.take();
+                let run_cache_salt = run.cache_salt;
+                let run_reuse_cache = run.reuse_cache;
+                let commit_res: Result<StagedPrefillUnit> = (|| {
+                    let _ = self.settle_paged_step_committed(seq_id, unit_start_u32)?;
+                    self.stage_prefill_unit_subs(
                         seq_id,
-                        run.first_pos,
-                        &run.captured_taps,
-                        run.rows as usize,
-                    )?;
-                } else if run.reuse_cache && self.dflash2.is_some() && !run.captured_taps.is_empty()
-                {
-                    self.record_taps_to_draft_window_best_effort(
-                        seq_id,
-                        run.first_pos,
-                        &run.captured_taps,
-                        run.rows as usize,
-                        "scheduled AR prefill pass",
-                    );
-                }
-            }
-            if let Some(rt) = self.paged.as_mut()
-                && let Ok(sub_end_u32) = u32::try_from(run.end)
-            {
-                rt.record_block_boundary_conv(seq_id, sub_end_u32);
-            }
-            if run.reuse_cache {
-                self.maybe_capture_rolling_checkpoint_best_effort(
+                        run_reuse_cache,
+                        &run.tap_visits,
+                        std::mem::take(&mut run.pending_subs),
+                        "scheduled prefill pass",
+                    )
+                })();
+                let staged = match commit_res {
+                    Ok(staged) => staged,
+                    Err(err) => {
+                        self.rollback_prefill_unit(seq_id, unit_start, unit_initial_conv);
+                        return Err(err);
+                    }
+                };
+                self.publish_staged_prefill_boundaries(
                     seq_id,
                     source,
-                    run.end,
-                    run.cache_salt,
+                    run_cache_salt,
+                    run_reuse_cache,
+                    staged,
                     "scheduled prefill pass",
                 );
-            }
-
-            if run.end >= run.unit_end {
+                self.finish_committed_prefill_settle(seq_id, "scheduled prefill pass");
                 return Ok(ScheduledPrefillPass::Done(logits));
             }
-            // Advance to next internal sub-slice (e.g. tiny `[junction..end)` tail).
-            // Sub-slice 1 is already settled (KV pruned, DSpark fed, boundary conv recorded),
-            // so pass `None` to capture the exact post-sub-slice ShortConv snapshot for rollback!
+
+            // Advance to next internal sub-slice while preserving `unit_start`,
+            // `unit_initial_conv`, and buffered `pending_subs` across sub-slices so any failure
+            // (including Group 1 SWA `allocation_blocked`!) rolls the ENTIRE unit back to
+            // `unit_start` cleanly with zero leaked tokens!
+            let unit_start = run.unit_start;
+            let unit_end = run.unit_end;
+            let unit_initial_conv = run.unit_initial_conv.take();
+            let pending_subs = std::mem::take(&mut run.pending_subs);
+            let run_cache_salt = run.cache_salt;
+            let run_reuse_cache = run.reuse_cache;
             let next_start = run.end;
-            let next_end = if run.reuse_cache {
-                prefill_sub_boundaries(next_start, run.unit_end, source.len(), bs)[0]
+            let next_end = if run_reuse_cache {
+                prefill_sub_boundaries(next_start, unit_end, source.len(), bs)[0]
             } else {
-                run.unit_end
+                unit_end
             };
-            run = self.init_prefill_run(
+            match self.init_prefill_run(
                 seq_id,
                 source,
-                run.unit_start,
-                run.unit_end,
+                unit_start,
+                unit_end,
                 next_start,
                 next_end,
-                run.cache_salt,
-                run.reuse_cache,
+                run_cache_salt,
+                run_reuse_cache,
                 next_end == source.len(),
-                None,
-            )?;
+                unit_initial_conv.clone(),
+                pending_subs,
+            ) {
+                Ok(next_run) => run = next_run,
+                Err(err) => {
+                    self.rollback_prefill_unit(seq_id, unit_start, unit_initial_conv);
+                    return Err(err);
+                }
+            }
         }
     }
 
@@ -1733,159 +2241,210 @@ impl Inkling2Inner {
         reuse_cache: bool,
         compute_last_logits: bool,
         preserved_unit_conv: Option<Inkling2ShortConvState>,
+        pending_subs: Vec<PendingPrefillSubSlice>,
     ) -> Result<Inkling2PrefillRun> {
         let chunk = &source[start..end];
         let rows = u32::try_from(chunk.len())
             .map_err(|_| Error::from_reason("Inkling2 prefill slice length overflows u32"))?;
         let act_dtype = DType::BFloat16;
 
-        let (first_pos, conv_at_unit_start) = {
+        // Proactively reclaim idle Group 1 (SWA) owners before recording tokens.
+        self.ensure_swa_headroom_for_total(seq_id, u32::try_from(unit_end).unwrap_or(u32::MAX));
+
+        let (first_pos, unit_initial_conv) = {
             let rt = self
                 .paged
                 .as_mut()
                 .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
-            let conv_snap = match preserved_unit_conv {
-                Some(prev) => {
-                    let _ = rt.ensure_conv_state(seq_id, &self.config)?;
-                    prev
-                }
-                None => rt.ensure_conv_state(seq_id, &self.config)?.clone(),
-            };
             let pos = rt
                 .coordinator
                 .request_token_count_all(seq_id)
                 .map_err(Error::from_reason)?;
+            if pos as usize != start {
+                return Err(Error::from_reason(format!(
+                    "Inkling2 prefill frontier mismatch: KV at {pos}, expected {start}"
+                )));
+            }
+            let conv_snap = if start == unit_start {
+                if unit_start == 0 {
+                    let _ = rt.ensure_conv_state(seq_id, &self.config)?;
+                    None
+                } else {
+                    Some(rt.ensure_conv_state(seq_id, &self.config)?.clone())
+                }
+            } else {
+                let _ = rt.ensure_conv_state(seq_id, &self.config)?;
+                preserved_unit_conv
+            };
             rt.coordinator
                 .record_tokens_all(seq_id, chunk)
                 .map_err(Error::from_reason)?;
             (pos, conv_snap)
         };
 
-        let ids_i32: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
-        let ids_arr = MxArray::from_int32(&ids_i32, &[rows as i64])?;
-        let raw_emb = self.embed_tokens.forward(&ids_arr)?;
-        let partial = apply_sublayer_rms_norm(
-            &raw_emb,
-            &self.embed_norm,
-            self.config.rms_norm_eps as f32,
-            act_dtype,
-        )?;
+        let build_res: Result<Inkling2PrefillRun> = (|| {
+            let ids_i32: Vec<i32> = chunk.iter().map(|&id| id as i32).collect();
+            let ids_arr = MxArray::from_int32(&ids_i32, &[rows as i64])?;
+            let raw_emb = self.embed_tokens.forward(&ids_arr)?;
+            let partial = apply_sublayer_rms_norm(
+                &raw_emb,
+                &self.embed_norm,
+                self.config.rms_norm_eps as f32,
+                act_dtype,
+            )?;
 
-        let use_mpp_prefill = rows > 1 && inkling2_paged_prefill_mpp_supported();
-        let mpp_pass = if rows <= prefill_plan::INKLING2_VERIFY_ROWS {
-            Pass::Verify
-        } else {
-            Pass::Prefill
-        };
-        let pages_per_split = device_pages_per_split();
-        let int8_q_from = if self.activations == crate::transformer::Activations::Bf16 {
-            None
-        } else {
-            device_int8_query_from()
-        };
-
-        let seq_q_lens = [(seq_id, rows)];
-        let (group_metas, kv_dtype, block_size, mpp_workspace) = {
-            let rt = self
-                .paged
-                .as_mut()
-                .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
-            let num_groups = rt.coordinator.groups().len();
-            let mut metas = Vec::with_capacity(num_groups);
-            for gid in 0..num_groups {
-                let adapter = rt
-                    .coordinator
-                    .adapter_mut(gid)
-                    .map_err(Error::from_reason)?;
-                #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
-                let mut meta = build_group_attention_meta(adapter, &seq_q_lens)?;
-                #[cfg(target_os = "macos")]
-                {
-                    meta.write_slot_mapping = Some(
-                        adapter
-                            .build_single_write_slot_mapping(seq_id, first_pos, rows, first_pos)
-                            .map_err(Error::from_reason)?,
-                    );
-                }
-                metas.push(meta);
-            }
-            let ws = if use_mpp_prefill {
-                let splits_needed = match mpp_pass {
-                    Pass::Verify => {
-                        prefill_plan::inkling2_verify_most_splits(rows, device_gpu_cores())
-                    }
-                    Pass::Prefill => {
-                        prefill_plan::splits(mpp_pass, rows, first_pos, pages_per_split)
-                    }
-                };
-                let floats = prefill_plan::workspace_floats(
-                    rows,
-                    splits_needed,
-                    self.config.num_attention_heads as u32,
-                    self.config.head_dim as u32,
-                );
-                Some(MxArray::zeros(&[floats as i64], Some(DType::Float32))?)
+            let use_mpp_prefill = rows > 1 && inkling2_paged_prefill_mpp_supported();
+            let mpp_pass = if rows <= prefill_plan::INKLING2_VERIFY_ROWS {
+                Pass::Verify
             } else {
-                None
+                Pass::Prefill
             };
-            (
-                metas,
-                rt.coordinator.kv_dtype(),
-                rt.coordinator.block_size(),
-                ws,
-            )
-        };
+            let pages_per_split = device_pages_per_split();
+            let int8_q_from = if self.activations == crate::transformer::Activations::Bf16 {
+                None
+            } else {
+                device_int8_query_from()
+            };
 
-        let positions: Vec<u32> = (0..rows).map(|i| first_pos + i).collect();
-        let global_tau = global_log_scale_tau_for_positions(
-            &positions,
-            self.config.log_scaling_n_floor,
-            self.config.log_scaling_alpha,
-        )?;
+            let seq_q_lens = [(seq_id, rows)];
+            let (group_metas, kv_dtype, block_size, mpp_workspace) = {
+                let rt = self
+                    .paged
+                    .as_mut()
+                    .ok_or_else(|| Error::from_reason("Inkling2Inner: paged runtime missing"))?;
+                let num_groups = rt.coordinator.groups().len();
+                let mut metas = Vec::with_capacity(num_groups);
+                for gid in 0..num_groups {
+                    let adapter = rt
+                        .coordinator
+                        .adapter_mut(gid)
+                        .map_err(Error::from_reason)?;
+                    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+                    let mut meta = build_group_attention_meta(adapter, &seq_q_lens)?;
+                    #[cfg(target_os = "macos")]
+                    {
+                        meta.write_slot_mapping = Some(
+                            adapter
+                                .build_single_write_slot_mapping(seq_id, first_pos, rows, first_pos)
+                                .map_err(Error::from_reason)?,
+                        );
+                    }
+                    metas.push(meta);
+                }
+                let ws = if use_mpp_prefill {
+                    let splits_needed = match mpp_pass {
+                        Pass::Verify => {
+                            prefill_plan::inkling2_verify_most_splits(rows, device_gpu_cores())
+                        }
+                        Pass::Prefill => {
+                            prefill_plan::splits(mpp_pass, rows, first_pos, pages_per_split)
+                        }
+                    };
+                    let floats = prefill_plan::workspace_floats(
+                        rows,
+                        splits_needed,
+                        self.config.num_attention_heads as u32,
+                        self.config.head_dim as u32,
+                    );
+                    Some(MxArray::zeros(&[floats as i64], Some(DType::Float32))?)
+                } else {
+                    None
+                };
+                (
+                    metas,
+                    rt.coordinator.kv_dtype(),
+                    rt.coordinator.block_size(),
+                    ws,
+                )
+            };
 
-        let tap_visits = if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
-            self.active_draft_tap_visits()
-                .map(|taps| taps.to_vec())
-                .unwrap_or_default()
-        } else if reuse_cache
-            && self.cached_image_key.is_none()
-            && let Some(ref draft) = self.dflash2
-        {
-            draft.config.target_layers.clone()
-        } else {
-            Vec::new()
-        };
+            let positions: Vec<u32> = (0..rows).map(|i| first_pos + i).collect();
+            let global_tau = global_log_scale_tau_for_positions(
+                &positions,
+                self.config.log_scaling_n_floor,
+                self.config.log_scaling_alpha,
+            )?;
 
-        Ok(Inkling2PrefillRun {
-            unit_start,
-            unit_end,
-            start,
-            end,
-            first_pos,
-            rows,
-            compute_last_logits,
-            cache_salt,
-            reuse_cache,
-            next_visit: 0,
-            blocks: Vec::new(),
-            partial,
-            prelude_blocks: Vec::new(),
-            prelude_partial: None,
-            prelude_block_count: 0,
-            current_bank: None,
-            group_metas,
-            kv_dtype,
-            block_size,
-            mpp_workspace,
-            global_tau,
-            use_mpp_prefill,
-            mpp_pass,
-            pages_per_split,
-            int8_q_from,
-            conv_at_unit_start,
-            captured_taps: Vec::with_capacity(tap_visits.len()),
-            tap_visits,
+            let tap_visits = if self.scheduled_dspark.seq_lanes.contains_key(&seq_id) {
+                self.active_draft_tap_visits()
+                    .map(|taps| taps.to_vec())
+                    .unwrap_or_default()
+            } else if reuse_cache
+                && self.cached_image_key.is_none()
+                && let Some(ref draft) = self.dflash2
+            {
+                draft.config.target_layers.clone()
+            } else {
+                Vec::new()
+            };
+
+            Ok(Inkling2PrefillRun {
+                unit_start,
+                unit_end,
+                start,
+                end,
+                first_pos,
+                rows,
+                compute_last_logits,
+                cache_salt,
+                reuse_cache,
+                next_visit: 0,
+                blocks: Vec::new(),
+                partial,
+                prelude_blocks: Vec::new(),
+                prelude_partial: None,
+                prelude_block_count: 0,
+                current_bank: None,
+                group_metas,
+                kv_dtype,
+                block_size,
+                mpp_workspace,
+                global_tau,
+                use_mpp_prefill,
+                mpp_pass,
+                pages_per_split,
+                int8_q_from,
+                unit_initial_conv,
+                captured_taps: Vec::with_capacity(tap_visits.len()),
+                tap_visits,
+                pending_subs,
+            })
+        })();
+        match build_res {
+            Ok(run) => Ok(run),
+            Err(err) => {
+                if let Some(rt) = self.paged.as_mut() {
+                    let _ = rt.coordinator.rollback_last_tokens_all(seq_id, rows);
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// True when `seq_id` carries multimodal image KV lineage (either recorded per-sequence or
+    /// currently installed on `self` as the active sequence).
+    pub(crate) fn seq_has_image_lineage(&self, seq_id: SeqId) -> bool {
+        self.paged.as_ref().is_some_and(|rt| {
+            rt.seq_image_lineage.contains_key(&seq_id)
+                || (rt.active_seq == seq_id
+                    && (self.cached_image_key.is_some()
+                        || !rt.cached_paged_image_token_positions.is_empty()))
         })
+    }
+
+    /// Clear multimodal image lineage for `seq_id` (and the active owner fields when `seq_id`
+    /// is the active sequence).
+    pub(crate) fn clear_seq_image_lineage(&mut self, seq_id: SeqId) {
+        let is_active = self.paged.as_ref().is_none_or(|rt| rt.active_seq == seq_id);
+        if is_active {
+            self.cached_image_key = None;
+        }
+        if let Some(rt) = self.paged.as_mut() {
+            rt.seq_image_lineage.remove(&seq_id);
+            if rt.active_seq == seq_id {
+                rt.cached_paged_image_token_positions.clear();
+            }
+        }
     }
 
     pub(crate) fn maybe_capture_rolling_checkpoint(
@@ -1895,6 +2454,28 @@ impl Inkling2Inner {
         end: usize,
         cache_salt: u64,
     ) -> Result<()> {
+        let Some(conv) = self
+            .paged
+            .as_ref()
+            .and_then(|rt| rt.conv_states.get(&seq_id).cloned())
+        else {
+            return Ok(());
+        };
+        self.maybe_capture_rolling_checkpoint_with_conv(seq_id, source, end, &conv, cache_salt)
+    }
+
+    fn maybe_capture_rolling_checkpoint_with_conv(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        end: usize,
+        conv: &Inkling2ShortConvState,
+        cache_salt: u64,
+    ) -> Result<()> {
+        if self.seq_has_image_lineage(seq_id) {
+            return Ok(());
+        }
+        let now = self.governor_now();
         let governor = self
             .memory_registration
             .as_ref()
@@ -1920,17 +2501,15 @@ impl Inkling2Inner {
         } else {
             return Ok(());
         };
-        let Some(conv) = rt.conv_states.get(&seq_id).cloned() else {
-            return Ok(());
-        };
         let draft_win = rt
             .block_boundary_draft_window
             .get(&seq_id)
             .filter(|(wb, _)| *wb == end_u32)
             .map(|(_, w)| w);
-        let _ = rt.state_store.capture_boundary_with_window(
+        let is_ordinary = class == StateClass::Ordinary;
+        let _ = rt.state_store.capture_boundary_with_window_and_options(
             &mut rt.coordinator,
-            &conv,
+            conv,
             seq_id,
             source,
             end_u32,
@@ -1938,6 +2517,12 @@ impl Inkling2Inner {
             class,
             draft_win,
             governor,
+            CaptureOptions {
+                keep_prev_checkpoint: is_ordinary,
+                enqueue_write_behind: is_ordinary,
+                is_head: false,
+                now,
+            },
         )?;
         Ok(())
     }
@@ -1958,6 +2543,106 @@ impl Inkling2Inner {
                 context,
                 error = %err,
                 "Inkling2 {context}: rolling checkpoint capture failed; continuing without caching boundary"
+            );
+        }
+    }
+
+    fn maybe_capture_rolling_checkpoint_with_conv_best_effort(
+        &mut self,
+        seq_id: SeqId,
+        source: &[u32],
+        end: usize,
+        conv: &Inkling2ShortConvState,
+        cache_salt: u64,
+        context: &'static str,
+    ) {
+        if let Err(err) =
+            self.maybe_capture_rolling_checkpoint_with_conv(seq_id, source, end, conv, cache_salt)
+        {
+            tracing::warn!(
+                target: "mlx_core::inkling2::state_disk",
+                seq_id,
+                end,
+                context,
+                error = %err,
+                "Inkling2 {context}: rolling checkpoint capture failed; continuing without caching boundary"
+            );
+        }
+    }
+
+    /// Best-effort rolling `StateClass::Checkpoint` capture during decode whenever `seq_id`
+    /// crosses a multiple of `checkpoint_interval_tokens()` (4,096 rounded up to `block_size`).
+    ///
+    /// CRITICAL INVARIANT: must be called AFTER `record_block_boundary_conv*` (and any draft-window
+    /// snapshot) and BEFORE `prune_sliding_all` / `settle_paged_step` so the exact SWA window
+    /// ending at `boundary` is still live in Group 1.
+    pub(crate) fn maybe_capture_decode_rolling_checkpoint_best_effort(
+        &mut self,
+        seq_id: SeqId,
+        prev_pos: u32,
+    ) {
+        if self.seq_has_image_lineage(seq_id) || self.cached_image_key.is_some() {
+            return;
+        }
+        let Some((boundary, conv, cache_salt, tokens)) = self.paged.as_ref().and_then(|rt| {
+            if !rt.seq_reuse_cache(seq_id) {
+                return None;
+            }
+            let bs = rt.coordinator.block_size().max(1);
+            let step = super::state_disk::checkpoint_interval_tokens().next_multiple_of(bs);
+            if step == 0 {
+                return None;
+            }
+            let (boundary, conv) = rt.current_block_boundary_conv(seq_id)?;
+            if boundary == 0 || !boundary.is_multiple_of(step) || prev_pos >= boundary {
+                return None;
+            }
+            let tokens = rt
+                .coordinator
+                .full_adapter()
+                .request_tokens_for(seq_id)
+                .filter(|t| t.len() >= boundary as usize)?
+                .to_vec();
+            let cache_salt = rt.seq_cache_salt.get(&seq_id).copied().unwrap_or(0);
+            Some((boundary, conv, cache_salt, tokens))
+        }) else {
+            return;
+        };
+        let now = self.governor_now();
+        let governor = self
+            .memory_registration
+            .as_ref()
+            .map(|g| (g.governor(), g.model_id()));
+        let Some(rt) = self.paged.as_mut() else {
+            return;
+        };
+        let draft_win = rt
+            .block_boundary_draft_window
+            .get(&seq_id)
+            .filter(|(wb, _)| *wb == boundary)
+            .map(|(_, w)| w);
+        if let Err(err) = rt.state_store.capture_boundary_with_window_and_options(
+            &mut rt.coordinator,
+            &conv,
+            seq_id,
+            &tokens,
+            boundary,
+            cache_salt,
+            StateClass::Checkpoint,
+            draft_win,
+            governor,
+            CaptureOptions {
+                keep_prev_checkpoint: true,
+                now,
+                ..CaptureOptions::default()
+            },
+        ) {
+            tracing::warn!(
+                target: "mlx_core::inkling2::state_disk",
+                seq_id,
+                boundary,
+                error = %err,
+                "Inkling2 decode: rolling checkpoint capture failed; continuing without caching boundary"
             );
         }
     }
@@ -2262,27 +2947,41 @@ impl Inkling2Inner {
             };
 
             // Current sequence cursor BEFORE recording this chunk.
-            let first_pos = {
+            let (first_pos, pre_chunk_conv) = {
                 let rt = self
                     .paged
                     .as_mut()
                     .ok_or_else(|| Error::from_reason("Inkling2Model: paged runtime missing"))?;
-                rt.ensure_conv_state(seq_id, &self.config)?;
-                rt.coordinator
+                let pos = rt
+                    .coordinator
                     .request_token_count_all(seq_id)
-                    .map_err(Error::from_reason)?
+                    .map_err(Error::from_reason)?;
+                let conv = if pos == 0 {
+                    let _ = rt.ensure_conv_state(seq_id, &self.config)?;
+                    None
+                } else {
+                    Some(rt.ensure_conv_state(seq_id, &self.config)?.clone())
+                };
+                (pos, conv)
             };
             self.record_tokens_all_exclusive(seq_id, chunk)
                 .map_err(Error::from_reason)?;
 
-            let (logits_opt, taps) = self.forward_paged_single_chunk_with_taps(
+            let chunk_res = self.forward_paged_single_chunk_with_taps(
                 seq_id,
                 chunk,
                 chunk_img.as_ref(),
                 first_pos,
                 /* compute_last_logits */ is_final_chunk,
                 effective_tap_visits,
-            )?;
+            );
+            let (logits_opt, taps) = match chunk_res {
+                Ok(out) => out,
+                Err(err) => {
+                    self.rollback_prefill_unit(seq_id, first_pos as usize, pre_chunk_conv);
+                    return Err(err);
+                }
+            };
 
             // Materialize pending pool writes + ShortConv state and prune expired SWA blocks
             // before launching the next chunk (keeps SWA pool usage bounded to O(window + chunk)).
@@ -2458,6 +3157,7 @@ impl Inkling2Inner {
                 "AR single decode",
             );
         }
+        self.maybe_capture_decode_rolling_checkpoint_best_effort(seq_id, first_pos);
         Ok(logits)
     }
 
@@ -2593,6 +3293,9 @@ impl Inkling2Inner {
             }
         }
         self.record_batched_taps_to_draft_windows_best_effort(&planned_rows, &taps);
+        for &(seq_id, prev_pos) in &planned_rows {
+            self.maybe_capture_decode_rolling_checkpoint_best_effort(seq_id, prev_pos);
+        }
         Ok(logits)
     }
 
@@ -2831,19 +3534,20 @@ impl Inkling2Inner {
         }
 
         // Enable per-lane MPP verify on long-context Global layers (`first_pos >= 2048`) where
-        // split-K + Apple10 `q8q` win; all 40 SWA layers (window 1024 <= 32 pages) default to
-        // `inkling2_paged_attention` unless `MLX_INKLING2_SWA_MPP_VERIFY=1` is set.
+        // split-K + Apple10 `q8q` win; on all 40 SWA layers (window 1024 <= 32 pages), `Auto`
+        // uses MPP verify only for solo `N == 1` waves so `N = 2..4` waves route into ONE batched
+        // varlen `inkling2_paged_attention_ex_tree` launch (0 slices, 0 concats, 0 SWA workspaces),
+        // while `MLX_INKLING2_SWA_MPP_VERIFY=1` (`ForceLowCtx`) still honors explicit per-lane override.
         //
-        // Eligibility is decided PER LANE (`any` here triggers per-lane dispatch) so pairing a
-        // long-context lane with a short-context peer never alters either lane's attention kernel
-        // or INT8-query arithmetic!
+        // Eligibility on Global layers is decided PER LANE (`any` here triggers per-lane dispatch)
+        // so pairing a long-context lane with a short-context peer never alters either lane's
+        // attention kernel or INT8-query arithmetic!
         let mpp_supported = inkling2_paged_prefill_mpp_supported();
         let use_mpp_verify = ragged_rows
             .iter()
             .any(|r| lane_uses_mpp_verify(r, mpp_supported));
-        let use_swa_mpp_verify = ragged_rows
-            .iter()
-            .any(|r| lane_uses_swa_mpp_verify(r, mpp_supported));
+        let use_swa_mpp_verify =
+            wave_uses_swa_mpp_verify(ragged_rows, mpp_supported, swa_mpp_verify_mode());
         let pages_per_split = device_pages_per_split();
         let int8_q_from = if self.activations == crate::transformer::Activations::Bf16 {
             None
@@ -3090,8 +3794,8 @@ impl Inkling2Inner {
             }
         }
 
-        // 3. Build per-group attention metadata & optional shared MPP workspace ONCE per wave.
-        let (group_metas, kv_dtype, block_size, mut mpp_workspace) = {
+        // 3. Build per-group attention metadata & persistent per-lane MPP workspaces ONCE per wave.
+        let (group_metas, kv_dtype, block_size, mut mpp_workspaces) = {
             let rt = self.paged.as_mut().ok_or_else(|| {
                 Error::from_reason("Inkling2Model: paged runtime not initialized")
             })?;
@@ -3126,7 +3830,7 @@ impl Inkling2Inner {
                 }
                 metas.push(meta);
             }
-            let ws = match mode {
+            let wss: Vec<Option<MxArray>> = match mode {
                 PagedWaveMode::Single {
                     rows,
                     first_pos,
@@ -3149,7 +3853,10 @@ impl Inkling2Inner {
                         self.config.num_attention_heads as u32,
                         self.config.head_dim as u32,
                     );
-                    Some(MxArray::zeros(&[floats as i64], Some(DType::Float32))?)
+                    vec![Some(MxArray::zeros(
+                        &[floats as i64],
+                        Some(DType::Float32),
+                    )?)]
                 }
                 PagedWaveMode::RaggedVerify {
                     ragged_rows,
@@ -3158,36 +3865,36 @@ impl Inkling2Inner {
                     ..
                 } if use_mpp_verify || use_swa_mpp_verify => {
                     let cores = device_gpu_cores();
-                    let mut max_floats = 0u64;
+                    let mut per_lane = Vec::with_capacity(ragged_rows.len());
                     for r in ragged_rows {
-                        if !lane_uses_mpp_verify(r, use_mpp_verify)
-                            && !lane_uses_swa_mpp_verify(r, use_swa_mpp_verify)
+                        if lane_uses_mpp_verify(r, use_mpp_verify)
+                            || lane_uses_swa_mpp_verify(r, use_swa_mpp_verify)
                         {
-                            continue;
+                            let splits_needed =
+                                prefill_plan::inkling2_verify_most_splits(r.query_len, cores);
+                            let lane_floats = prefill_plan::workspace_floats(
+                                r.query_len,
+                                splits_needed,
+                                self.config.num_attention_heads as u32,
+                                self.config.head_dim as u32,
+                            );
+                            per_lane.push(Some(MxArray::zeros(
+                                &[lane_floats as i64],
+                                Some(DType::Float32),
+                            )?));
+                        } else {
+                            per_lane.push(None);
                         }
-                        let splits_needed =
-                            prefill_plan::inkling2_verify_most_splits(r.query_len, cores);
-                        let floats = prefill_plan::workspace_floats(
-                            r.query_len,
-                            splits_needed,
-                            self.config.num_attention_heads as u32,
-                            self.config.head_dim as u32,
-                        );
-                        max_floats = max_floats.max(floats);
                     }
-                    if max_floats > 0 {
-                        Some(MxArray::zeros(&[max_floats as i64], Some(DType::Float32))?)
-                    } else {
-                        None
-                    }
+                    per_lane
                 }
-                _ => None,
+                _ => Vec::new(),
             };
             (
                 metas,
                 rt.coordinator.kv_dtype(),
                 rt.coordinator.block_size(),
-                ws,
+                wss,
             )
         };
 
@@ -3292,7 +3999,7 @@ impl Inkling2Inner {
                                 &mut single_conv,
                                 Some(&mut single_tape),
                                 bank_opt,
-                                mpp_workspace.as_mut(),
+                                &mut mpp_workspaces,
                                 act_dtype,
                             )?;
                         }
@@ -3313,7 +4020,7 @@ impl Inkling2Inner {
                                 &mut single_conv,
                                 None,
                                 bank_opt,
-                                mpp_workspace.as_mut(),
+                                &mut mpp_workspaces,
                                 act_dtype,
                             )?;
                         }
@@ -3343,7 +4050,7 @@ impl Inkling2Inner {
                         &mut visit_convs,
                         visit_tapes_vec.as_deref_mut(),
                         bank_opt,
-                        mpp_workspace.as_mut(),
+                        &mut mpp_workspaces,
                         act_dtype,
                     )?;
                 }
@@ -3468,7 +4175,7 @@ fn forward_physical_layer_paged(
     visit_convs: &mut [&mut VisitShortConvState],
     mut visit_tapes: Option<&mut [&mut VisitShortConvTape]>,
     cross_pass_bank: Option<&[MxArray]>,
-    mpp_workspace: Option<&mut MxArray>,
+    mpp_workspaces: &mut [Option<MxArray>],
     act_dtype: DType,
 ) -> Result<()> {
     let t = partial.shape_at(0)?;
@@ -3607,7 +4314,7 @@ fn forward_physical_layer_paged(
         global_tau,
         visit_convs,
         visit_tapes.as_deref_mut(),
-        mpp_workspace,
+        mpp_workspaces,
     )?;
     if is_block_boundary {
         blocks.push(partial.clone());
@@ -3724,7 +4431,7 @@ fn dispatch_paged_attention_kernel_ex(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    mpp_workspace: Option<&mut MxArray>,
+    mpp_workspaces: &mut [Option<MxArray>],
 ) -> Result<(MxArray, Option<MxArray>)> {
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let swa_i32 = if is_local { sliding_window as i32 } else { 0 };
@@ -3736,19 +4443,22 @@ fn dispatch_paged_attention_kernel_ex(
     let hd_i32 = head_dim as i32;
     let cores = device_gpu_cores();
 
-    match (mode, mpp_workspace) {
-        (
-            PagedWaveMode::Single {
-                first_pos,
-                rows,
-                use_mpp_prefill: true,
-                mpp_pass,
-                pages_per_split,
-                int8_q_from,
-                ..
-            },
-            Some(ws),
-        ) => {
+    match mode {
+        PagedWaveMode::Single {
+            first_pos,
+            rows,
+            use_mpp_prefill: true,
+            mpp_pass,
+            pages_per_split,
+            int8_q_from,
+            ..
+        } if mpp_workspaces.first().is_some_and(Option::is_some) => {
+            let ws = mpp_workspaces
+                .first_mut()
+                .and_then(Option::as_mut)
+                .ok_or_else(|| {
+                    Error::from_reason("Inkling2 paged prefill: missing MPP workspace")
+                })?;
             let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
                 Error::from_reason("Inkling2 paged prefill: missing 1D block_table")
             })?;
@@ -3798,18 +4508,25 @@ fn dispatch_paged_attention_kernel_ex(
             *ws = ws_next;
             Ok((out, lse))
         }
-        (
-            PagedWaveMode::RaggedVerify {
-                ragged_rows,
-                use_mpp_verify,
-                use_swa_mpp_verify,
-                int8_q_from,
-                tree_rows,
-                ..
-            },
-            Some(ws),
-        ) if (!is_local && *use_mpp_verify) || (is_local && *use_swa_mpp_verify) => {
+        PagedWaveMode::RaggedVerify {
+            ragged_rows,
+            use_mpp_verify,
+            use_swa_mpp_verify,
+            int8_q_from,
+            tree_rows,
+            ..
+        } if ((!is_local && *use_mpp_verify) || (is_local && *use_swa_mpp_verify))
+            && !mpp_workspaces.is_empty() =>
+        {
             if ragged_rows.len() == 1 {
+                let ws = mpp_workspaces
+                    .first_mut()
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| {
+                        Error::from_reason(
+                            "Inkling2 paged verify: missing MPP workspace for lane 0",
+                        )
+                    })?;
                 let bt_1d = group_meta.block_table_1d.as_ref().ok_or_else(|| {
                     Error::from_reason("Inkling2 paged verify: missing 1D block_table")
                 })?;
@@ -3854,17 +4571,16 @@ fn dispatch_paged_attention_kernel_ex(
                 *ws = ws_next;
                 Ok((out, lse))
             } else {
-                // Dispatch each lane independently so MPP-eligible lanes run the exact same
-                // `inkling2_paged_prefill_attention` (`Pass::Verify`, including `use_int8_q`) as
-                // when solo, while non-MPP peer lanes run `inkling2_paged_attention` identically
-                // to solo execution without forcing long-context peers onto fallback!
-                let ws_len = ws.shape_at(0)?;
+                // Dispatch each lane independently using its persistent per-lane MPP workspace
+                // (ZERO `MxArray::zeros` inside the 48-visit loop!) so MPP-eligible lanes run the
+                // exact same `inkling2_paged_prefill_attention` (`Pass::Verify`, including
+                // `use_int8_q`) as when solo, while non-MPP peer lanes run `inkling2_paged_attention`
+                // identically to solo execution without forcing long-context peers onto fallback!
                 let mut lane_outs = Vec::with_capacity(ragged_rows.len());
                 let mut lane_lses =
                     Vec::with_capacity(if want_lse { ragged_rows.len() } else { 0 });
                 let rb_ext = rel_bias.shape_at(2)?;
                 let q_dim = (num_heads * head_dim) as i64;
-                let mut shared_ws_used = false;
                 for (lane_idx, r) in ragged_rows.iter().enumerate() {
                     let row_start = cu_seqlens_q[lane_idx] as i64;
                     let row_end = cu_seqlens_q[lane_idx + 1] as i64;
@@ -3912,13 +4628,14 @@ fn dispatch_paged_attention_kernel_ex(
                         let use_int8_q = !is_local
                             && kv_dtype == Inkling2KvDtype::Int8
                             && int8_q_from.is_some_and(|from| r.first_logical_position >= from);
-                        let lane_ws_owned;
-                        let lane_ws_ref = if !shared_ws_used {
-                            &*ws
-                        } else {
-                            lane_ws_owned = MxArray::zeros(&[ws_len], Some(DType::Float32))?;
-                            &lane_ws_owned
-                        };
+                        let ws = mpp_workspaces
+                            .get_mut(lane_idx)
+                            .and_then(Option::as_mut)
+                            .ok_or_else(|| {
+                                Error::from_reason(format!(
+                                    "Inkling2 paged verify: missing persistent MPP workspace for lane {lane_idx}"
+                                ))
+                            })?;
                         let (out_l, lse_l, ws_next) = inkling2_paged_prefill_attention_ex_tree(
                             &q_lane,
                             k_pool,
@@ -3926,7 +4643,7 @@ fn dispatch_paged_attention_kernel_ex(
                             k_scale,
                             v_scale,
                             bt_1d,
-                            lane_ws_ref,
+                            ws,
                             Some(&rb_lane),
                             rel_bias_w,
                             gs_lane,
@@ -3946,10 +4663,7 @@ fn dispatch_paged_attention_kernel_ex(
                             tree_lane,
                             lane_live_blocks,
                         )?;
-                        if !shared_ws_used {
-                            *ws = ws_next;
-                            shared_ws_used = true;
-                        }
+                        *ws = ws_next;
                         (out_l, lse_l)
                     } else {
                         let bt_1d = &group_meta.per_seq_block_tables_1d[lane_idx];
@@ -4051,7 +4765,7 @@ fn dispatch_paged_attention_kernel(
     num_heads: usize,
     num_kv_heads: usize,
     head_dim: usize,
-    mpp_workspace: Option<&mut MxArray>,
+    mpp_workspaces: &mut [Option<MxArray>],
 ) -> Result<(MxArray, MxArray)> {
     let (out, lse) = dispatch_paged_attention_kernel_ex(
         q_cur,
@@ -4074,7 +4788,7 @@ fn dispatch_paged_attention_kernel(
         num_heads,
         num_kv_heads,
         head_dim,
-        mpp_workspace,
+        mpp_workspaces,
     )?;
     let lse =
         lse.ok_or_else(|| Error::from_reason("dispatch_paged_attention_kernel missing lse"))?;
@@ -4102,7 +4816,7 @@ fn forward_attention_paged(
     global_tau: Option<&MxArray>,
     visit_convs: &mut [&mut VisitShortConvState],
     mut visit_tapes: Option<&mut [&mut VisitShortConvTape]>,
-    mpp_workspace: Option<&mut MxArray>,
+    mpp_workspaces: &mut [Option<MxArray>],
 ) -> Result<MxArray> {
     let t_i64 = x_q.shape_at(0)?;
     let act_dtype = x_q.dtype()?;
@@ -4488,7 +5202,7 @@ fn forward_attention_paged(
         attn.num_heads,
         attn.num_kv_heads,
         attn.head_dim,
-        mpp_workspace,
+        mpp_workspaces,
     )?;
     // 9. Fused `o_proj` (Sym-Q8_0 or BF16) + static `attn_post_conv` (+ optional FP32 residual
     //    epilogue + optional rollback tape) in 1 MLX primitive directly on 3D `y_3d` (skips
@@ -5053,6 +5767,108 @@ impl PagedPrefix for Inkling2PrefixState {
 
 /// Inkling2's [`StreamEmitter`]: routes committed token text through
 /// [`InklingStreamParser`] so reasoning deltas (`is_reasoning = true`, gated by
+/// Per-run stateful detokenizer for token-ID Inkling2 streaming.
+///
+/// Decodes each contiguous non-marker token run with a fresh
+/// `skip_special_tokens = true` decode stream and flushes/resets at every real
+/// Inkling2 output marker token ID (resolved via `token_to_id`), so:
+/// - ordinary tokens spelling `<|end_message|>` / `<|content_thinking|>` / etc.
+///   remain literal payload text with zero `<|` hold-back latency, and
+/// - incomplete multi-byte UTF-8 sequences flush within their own block and
+///   cannot bleed across marker boundaries into the next block.
+struct TokenRunDecoder {
+    tokenizer: Arc<tokenizers::Tokenizer>,
+    marker_ids: InklingOutputMarkerIds,
+    run_tokens: Vec<u32>,
+    run_emitted: String,
+    decode_ids: Vec<u32>,
+    decode_prefix: String,
+    decode_prefix_index: usize,
+    stream_broken: bool,
+}
+
+impl TokenRunDecoder {
+    fn new(tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        let marker_ids = InklingOutputMarkerIds::from_hf_tokenizer(&tokenizer);
+        Self {
+            tokenizer,
+            marker_ids,
+            run_tokens: Vec::new(),
+            run_emitted: String::new(),
+            decode_ids: Vec::new(),
+            decode_prefix: String::new(),
+            decode_prefix_index: 0,
+            stream_broken: false,
+        }
+    }
+
+    fn push_non_marker(&mut self, token_id: u32) -> String {
+        self.run_tokens.push(token_id);
+        if self.stream_broken {
+            return String::new();
+        }
+        match tokenizers::step_decode_stream(
+            &self.tokenizer,
+            vec![token_id],
+            true,
+            &mut self.decode_ids,
+            &mut self.decode_prefix,
+            &mut self.decode_prefix_index,
+        ) {
+            Ok(Some(piece)) => {
+                if !piece.is_empty() {
+                    self.run_emitted.push_str(&piece);
+                }
+                piece
+            }
+            Ok(None) => String::new(),
+            Err(_) => {
+                // Defer remaining run bytes to run-end full decode.
+                self.stream_broken = true;
+                String::new()
+            }
+        }
+    }
+
+    fn flush_and_reset(&mut self) -> String {
+        let tail = if self.run_tokens.is_empty() {
+            String::new()
+        } else {
+            match self.tokenizer.decode(&self.run_tokens, true) {
+                Ok(full) => {
+                    if let Some(rest) = full.strip_prefix(&self.run_emitted) {
+                        rest.to_string()
+                    } else {
+                        let mut common = 0usize;
+                        for (a, b) in self.run_emitted.chars().zip(full.chars()) {
+                            if a != b {
+                                break;
+                            }
+                            common += a.len_utf8();
+                        }
+                        let mut start = common.max(self.run_emitted.len().min(full.len()));
+                        while start < full.len() && !full.is_char_boundary(start) {
+                            start += 1;
+                        }
+                        full[start..].to_string()
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!("Inkling2StreamEmitter run decode failed: {e}");
+                    String::new()
+                }
+            }
+        };
+        self.run_tokens.clear();
+        self.run_emitted.clear();
+        self.decode_ids.clear();
+        self.decode_prefix.clear();
+        self.decode_prefix_index = 0;
+        self.stream_broken = false;
+        tail
+    }
+}
+
 /// `include_reasoning`) and visible content deltas (`is_reasoning = false`) are
 /// separated cleanly, while Inkling2 framing markers (`<|message_model|>`,
 /// `<|content_thinking|>`, `<|content_text|>`, `<|content_invoke_tool_json|>`,
@@ -5063,6 +5879,9 @@ pub(crate) struct Inkling2StreamEmitter {
     /// Latched from the turn's `include_reasoning` flag so [`Self::finish`]
     /// applies the same suppression gate to any reasoning tail flushed at EOS.
     include_reasoning: bool,
+    /// When `Some`, `on_token_id` matches real output markers by token ID and
+    /// decodes non-marker runs with per-run `skip_special_tokens = true`.
+    token_decoder: Option<TokenRunDecoder>,
 }
 
 impl Inkling2StreamEmitter {
@@ -5074,6 +5893,22 @@ impl Inkling2StreamEmitter {
         Self {
             parser: InklingStreamParser::with_initial_state(initial_state),
             include_reasoning: true,
+            token_decoder: None,
+        }
+    }
+
+    pub(crate) fn with_tokenizer(tokenizer: Arc<tokenizers::Tokenizer>) -> Self {
+        Self::with_tokenizer_and_state(tokenizer, InklingParserState::MessageHeader)
+    }
+
+    pub(crate) fn with_tokenizer_and_state(
+        tokenizer: Arc<tokenizers::Tokenizer>,
+        initial_state: InklingParserState,
+    ) -> Self {
+        Self {
+            parser: InklingStreamParser::with_initial_state(initial_state),
+            include_reasoning: true,
+            token_decoder: Some(TokenRunDecoder::new(tokenizer)),
         }
     }
 
@@ -5082,6 +5917,7 @@ impl Inkling2StreamEmitter {
         Self {
             parser: InklingStreamParser::from_prompt_tokens(prompt_tokens),
             include_reasoning: true,
+            token_decoder: None,
         }
     }
 
@@ -5138,6 +5974,24 @@ impl StreamEmitter for Inkling2StreamEmitter {
         sink: &dyn ChunkSink,
     ) {
         self.include_reasoning = include_reasoning;
+        if let Some(ref mut decoder) = self.token_decoder {
+            if let Some(marker) = decoder.marker_ids.marker_for(token_id) {
+                let tail = decoder.flush_and_reset();
+                if !tail.is_empty() {
+                    let (content, reasoning, _) = self.parser.push_literal_text(&tail);
+                    self.emit_deltas(content, reasoning, include_reasoning, sink);
+                }
+                let (content, reasoning, _) = self.parser.push_marker(marker);
+                self.emit_deltas(content, reasoning, include_reasoning, sink);
+            } else {
+                let piece = decoder.push_non_marker(token_id);
+                if !piece.is_empty() {
+                    let (content, reasoning, _) = self.parser.push_literal_text(&piece);
+                    self.emit_deltas(content, reasoning, include_reasoning, sink);
+                }
+            }
+            return;
+        }
         if let Some(marker) = output_marker_for_token_id(token_id)
             && !token_text.contains(marker)
         {
@@ -5178,7 +6032,7 @@ impl StreamEmitter for Inkling2StreamEmitter {
         sink: &dyn ChunkSink,
     ) {
         self.include_reasoning = include_reasoning;
-        if residual.is_empty() {
+        if self.token_decoder.is_some() || residual.is_empty() {
             return;
         }
         let (content, reasoning, _) = self.parser.push_text(residual);
@@ -5186,6 +6040,13 @@ impl StreamEmitter for Inkling2StreamEmitter {
     }
 
     fn finish(&mut self, result: &ChatResult, sink: &dyn ChunkSink) {
+        if let Some(ref mut decoder) = self.token_decoder {
+            let tail = decoder.flush_and_reset();
+            if !tail.is_empty() {
+                let (content, reasoning, _) = self.parser.push_literal_text(&tail);
+                self.emit_deltas(content, reasoning, self.include_reasoning, sink);
+            }
+        }
         let (content_tail, reasoning_tail, _) = self.parser.flush();
         self.emit_deltas(content_tail, reasoning_tail, self.include_reasoning, sink);
 
@@ -5215,8 +6076,20 @@ impl StreamEmitter for Inkling2StreamEmitter {
 
 fn finalize_inkling2_turn(args: FinalizeArgs<'_>) -> Result<ChatResult> {
     let raw_text = args.tokenizer.decode_sync(args.generated_tokens, false)?;
-    let parsed = parse_inkling2_output(&raw_text);
-    let reasoning_tokens = count_inkling2_reasoning_tokens(args.generated_tokens) as u32;
+    let parsed = parse_inkling2_tokens(
+        args.generated_tokens,
+        args.tokenizer,
+        InklingParserState::MessageHeader,
+    )?;
+    let marker_ids = InklingOutputMarkerIds::from_tokenizer(args.tokenizer);
+    let reasoning_tokens =
+        count_inkling2_reasoning_tokens_with_ids(args.generated_tokens, &marker_ids) as u32;
+    let finish_reason =
+        if args.finish_reason == "stop" && parsed.tool_calls.iter().any(|tc| tc.status == "ok") {
+            "tool_calls".to_string()
+        } else {
+            args.finish_reason.to_string()
+        };
     Ok(ChatResult {
         text: parsed.text,
         tool_calls: parsed.tool_calls,
@@ -5229,16 +6102,39 @@ fn finalize_inkling2_turn(args: FinalizeArgs<'_>) -> Result<ChatResult> {
         num_tokens: args.generated_tokens.len() as u32,
         prompt_tokens: args.prompt_tokens,
         reasoning_tokens,
-        reasoning_close: None,
-        reasoning_cut_at: None,
-        reasoning_cycle_period: None,
-        reasoning_stray_closes: None,
-        finish_reason: args.finish_reason.to_string(),
+        reasoning_close: args.reasoning.close_name(),
+        reasoning_cut_at: args.reasoning.cut_at,
+        reasoning_cycle_period: args.reasoning.cycle_period,
+        reasoning_stray_closes: args.reasoning.reported_stray_closes(),
+        finish_reason,
         raw_text,
         public_raw_text: None,
         cached_tokens: 0,
         performance: args.performance,
     })
+}
+
+/// Resolve the effective Inkling2 numeric reasoning effort in `[0.0, 0.99]`.
+pub(crate) fn resolve_inkling2_effort(
+    enable_thinking: Option<bool>,
+    reasoning_effort: Option<&str>,
+) -> Result<f64> {
+    if let Some(raw_effort) = reasoning_effort {
+        parse_reasoning_effort(raw_effort)
+            .map_err(|e| Error::from_reason(format!("Inkling2 invalid reasoning_effort: {e}")))
+    } else if enable_thinking == Some(false) {
+        Ok(0.0)
+    } else {
+        Ok(crate::tools::inkling::DEFAULT_REASONING_EFFORT)
+    }
+}
+
+/// Whether thinking is enabled for an Inkling2 turn (resolved effort `> 0.0`).
+pub(crate) fn resolve_inkling2_thinking_enabled(config: &ChatConfig) -> Result<bool> {
+    Ok(resolve_inkling2_effort(
+        crate::engine::resolve_enable_thinking(config),
+        config.reasoning_effort.as_deref(),
+    )? > 0.0)
 }
 
 /// Render `messages` to Inkling2 native wire token IDs matching [`Inkling2Inner::render_prompt`].
@@ -5252,14 +6148,7 @@ pub(crate) fn render_inkling2_prompt(
     enable_thinking: Option<bool>,
     reasoning_effort: Option<&str>,
 ) -> Result<Vec<u32>> {
-    let effort = if let Some(raw_effort) = reasoning_effort {
-        parse_reasoning_effort(raw_effort)
-            .map_err(|e| Error::from_reason(format!("Inkling2 invalid reasoning_effort: {e}")))?
-    } else if enable_thinking == Some(false) {
-        0.0
-    } else {
-        crate::tools::inkling::DEFAULT_REASONING_EFFORT
-    };
+    let effort = resolve_inkling2_effort(enable_thinking, reasoning_effort)?;
     let specs = match tools {
         Some(defs) => defs
             .iter()
@@ -5319,7 +6208,27 @@ impl ChatBackend for Inkling2Inner {
     }
 
     fn policy(&self) -> crate::engine::ThinkingPolicy {
-        crate::engine::ThinkingPolicy::None
+        crate::engine::ThinkingPolicy::OpenTokenHonoring
+    }
+
+    fn think_end_for_turn(
+        &self,
+        config: &ChatConfig,
+        tok: &Qwen3Tokenizer,
+    ) -> crate::engine::backend::ThinkEndResolution {
+        let markers = InklingOutputMarkerIds::from_tokenizer(tok);
+        let open_id = markers.content_thinking.unwrap_or(CONTENT_THINKING_ID);
+        let close_id = markers.end_message.unwrap_or(END_MESSAGE_ID);
+        let mut end = match config.thinking_end_text.as_deref() {
+            Some(text) if !text.is_empty() => {
+                tok.encode_sync(text, Some(false)).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        };
+        if end.last().copied() != Some(close_id) {
+            end.push(close_id);
+        }
+        crate::engine::backend::ThinkEndResolution::with_open_token(open_id, Arc::from(end))
     }
 
     fn render_prompt(
@@ -5358,6 +6267,7 @@ impl ChatBackend for Inkling2Inner {
         self.cached_image_key = None;
         let _ = self.retract_open_dspark_wave();
         if let Some(ref mut rt) = self.paged {
+            rt.cached_paged_image_token_positions.clear();
             if scope == ResetScope::Command {
                 self.dspark_turn_contexts.clear();
                 self.scheduled_dspark.clear();
@@ -5372,6 +6282,8 @@ impl ChatBackend for Inkling2Inner {
                 rt.block_boundary_draft_window.clear();
                 rt.restored_draft_windows.clear();
                 rt.seq_reuse_cache.clear();
+                rt.seq_cache_salt.clear();
+                rt.seq_image_lineage.clear();
             } else {
                 let seq = rt.active_seq;
                 self.dspark_turn_contexts.remove(&seq);
@@ -5526,7 +6438,10 @@ impl ChatBackend for Inkling2Inner {
     }
 
     fn stream_emitter(&self) -> Box<dyn StreamEmitter> {
-        Box::new(Inkling2StreamEmitter::new())
+        match self.tokenizer.as_ref() {
+            Some(tok) => Box::new(Inkling2StreamEmitter::with_tokenizer(tok.inner_arc())),
+            None => Box::new(Inkling2StreamEmitter::new()),
+        }
     }
 
     fn run_paged_turn(&mut self, args: &mut WholeTurnArgs<'_>) -> Result<TurnOutput> {
@@ -5576,6 +6491,15 @@ impl ChatBackend for Inkling2Inner {
         };
         let image_token_counts: Vec<usize> = grids.iter().map(|(r, c)| r * c).collect();
         let expanded_tokens = expand_image_tokens(args.tokens, &image_token_counts)?;
+        let (image_key, per_image_digests) =
+            crate::engine::compute_image_cache_keys(args.media.images);
+        let image_token_positions = crate::engine::map_expanded_image_token_positions(
+            &expanded_tokens,
+            IMAGE_PAD_ID,
+            &image_token_counts,
+            &per_image_digests,
+        )
+        .map_err(Error::from_reason)?;
         let prompt_len = expanded_tokens.len();
 
         let mut profiler = crate::decode_profiler::DecodeProfiler::new(
@@ -5733,14 +6657,6 @@ impl ChatBackend for Inkling2Inner {
                 stepper.end_decode()?;
             }
 
-            // Hash image payloads so session media tracking stays distinct from text-only turns.
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            use std::hash::{Hash, Hasher};
-            for img in args.media.images {
-                img.hash(&mut hasher);
-            }
-            self.cached_image_key = Some(hasher.finish());
-
             if self.paged.is_some() {
                 if let Some(ref rt) = self.paged {
                     let seq_id = rt.active_seq;
@@ -5750,12 +6666,23 @@ impl ChatBackend for Inkling2Inner {
                 if args.params.reuse_cache {
                     let finalize_res = if let Some(ref mut rt) = self.paged {
                         let seq_id = rt.active_seq;
+                        let total_tokens = rt
+                            .coordinator
+                            .full_adapter()
+                            .request_tokens_for(seq_id)
+                            .map_or(expanded_tokens.len(), |t| t.len());
+                        let bs = rt.coordinator.block_size();
+                        let extra_keys = crate::engine::build_paged_extra_keys(
+                            total_tokens,
+                            bs,
+                            &image_token_positions,
+                        );
                         rt.coordinator
                             .eval_pending_pool_writes_all()
                             .and_then(|()| {
                                 rt.coordinator.finalize_keep_live_all(
                                     seq_id,
-                                    &[],
+                                    &extra_keys,
                                     args.params.cache_salt,
                                 )
                             })
@@ -5773,11 +6700,19 @@ impl ChatBackend for Inkling2Inner {
                             .history_tokens(&generated_tokens, finish_reason == "length");
                         self.cached_token_history = expanded_tokens;
                         self.cached_token_history.extend_from_slice(hist_tokens);
+                        self.cached_image_key = Some(image_key);
+                        if let Some(ref mut rt) = self.paged {
+                            let seq_id = rt.active_seq;
+                            rt.cached_paged_image_token_positions = image_token_positions.clone();
+                            rt.seq_image_lineage
+                                .insert(seq_id, (image_key, image_token_positions));
+                        }
                     }
                 } else {
                     self.abort_paged_turn();
                 }
             } else {
+                self.cached_image_key = Some(image_key);
                 self.cached_token_history = expanded_tokens;
                 self.cached_token_history
                     .extend_from_slice(&generated_tokens);
@@ -5799,6 +6734,7 @@ impl ChatBackend for Inkling2Inner {
                 prompt_len,
                 generated_tokens.len(),
             );
+            let thinking_enabled = resolve_inkling2_thinking_enabled(args.config)?;
             let result = self.finalize_turn(FinalizeArgs {
                 tokenizer: args.tokenizer,
                 generated_tokens: &generated_tokens,
@@ -5808,7 +6744,7 @@ impl ChatBackend for Inkling2Inner {
                 think_end_extra_ids: &close.think_end_extra_ids,
                 prompt_tokens: prompt_len as u32,
                 include_reasoning: args.params.include_reasoning,
-                thinking_enabled: args.thinking.enabled,
+                thinking_enabled,
                 performance,
                 reasoning: reasoning_tracker.outcome(),
             })?;
@@ -5860,6 +6796,7 @@ impl PagedBackend for Inkling2Inner {
         let prefix = self.prepare_prefix_sync(seq_id, plan, reuse_cache, cache_salt)?;
         if let Some(rt) = self.paged.as_mut() {
             rt.seq_reuse_cache.insert(seq_id, prefix.reuse_cache);
+            rt.seq_cache_salt.insert(seq_id, prefix.cache_salt);
         }
         Ok(prefix)
     }
@@ -5894,92 +6831,125 @@ impl PagedBackend for Inkling2Inner {
     }
 
     fn finalize_paged_turn(&mut self, reuse_cache: bool, cache_salt: u64) {
+        let Some(seq_id) = self.paged.as_ref().map(|rt| rt.active_seq) else {
+            return;
+        };
+        let has_image_lineage = self.seq_has_image_lineage(seq_id);
+        let now = self.governor_now();
         let governor = self
             .memory_registration
             .as_ref()
             .map(|g| (g.governor(), g.model_id()));
-        let Some(ref mut rt) = self.paged else {
-            return;
-        };
-        rt.paged_finalize_error = None;
-        let seq_id = rt.active_seq;
-        rt.restored_draft_windows.remove(&seq_id);
-        let res = (|| -> std::result::Result<(), String> {
-            rt.coordinator.activate_request_all(seq_id)?;
-            rt.coordinator.eval_pending_pool_writes_all()?;
-            if reuse_cache {
-                rt.coordinator
-                    .finalize_keep_live_all(seq_id, &[], cache_salt)?;
-
-                // Capture turn-end ordinary state (`StateClass::Ordinary`) into the hybrid
-                // StateStore (40 SWA trailing blocks + 48 ShortConv states + optional DFlash2
-                // 4-bit DraftContextWindow) anchored on the exact deepest complete `block_size`
-                // boundary where ShortConv was snapshotted!
-                if self.cached_image_key.is_none() {
-                    let recorded = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
-                    let bs = rt.coordinator.block_size().max(1);
-                    if let Some((boundary, conv)) = rt.block_boundary_conv.get(&seq_id).cloned()
-                        && boundary > 0
-                        && boundary <= recorded
-                        && boundary.is_multiple_of(bs)
-                        && let Some(tokens) = rt
+        let res = if let Some(ref mut rt) = self.paged {
+            rt.paged_finalize_error = None;
+            rt.restored_draft_windows.remove(&seq_id);
+            (|| -> std::result::Result<(), String> {
+                rt.coordinator.activate_request_all(seq_id)?;
+                rt.coordinator.eval_pending_pool_writes_all()?;
+                if reuse_cache {
+                    let extra_keys = if rt.cached_paged_image_token_positions.is_empty() {
+                        Vec::new()
+                    } else {
+                        let total_tokens = rt
                             .coordinator
                             .full_adapter()
                             .request_tokens_for(seq_id)
-                            .map(|t| t.to_vec())
-                        && tokens.len() >= boundary as usize
-                    {
-                        let draft_win = rt
-                            .block_boundary_draft_window
-                            .get(&seq_id)
-                            .filter(|(wb, _)| *wb == boundary)
-                            .map(|(_, w)| w);
-                        if let Err(err) = rt.state_store.capture_boundary_with_window(
-                            &mut rt.coordinator,
-                            &conv,
-                            seq_id,
-                            &tokens,
-                            boundary,
-                            cache_salt,
-                            StateClass::Ordinary,
-                            draft_win,
-                            governor,
-                        ) {
-                            tracing::warn!(
-                                target: "mlx_core::inkling2::paged",
-                                "Inkling2 finalize StateStore capture at boundary={boundary} failed: {err}"
-                            );
+                            .map_or(0, |t| t.len());
+                        let bs = rt.coordinator.block_size();
+                        crate::engine::build_paged_extra_keys(
+                            total_tokens,
+                            bs,
+                            &rt.cached_paged_image_token_positions,
+                        )
+                    };
+                    rt.coordinator
+                        .finalize_keep_live_all(seq_id, &extra_keys, cache_salt)?;
+
+                    // Capture turn-end ordinary state (`StateClass::Ordinary`) into the hybrid
+                    // StateStore (40 SWA trailing blocks + 48 ShortConv states + optional DFlash2
+                    // 4-bit DraftContextWindow) anchored on the exact deepest complete `block_size`
+                    // boundary where ShortConv was snapshotted!
+                    if !has_image_lineage {
+                        let recorded = rt.coordinator.request_token_count_all(seq_id).unwrap_or(0);
+                        let bs = rt.coordinator.block_size().max(1);
+                        if let Some((boundary, conv)) = rt.current_block_boundary_conv(seq_id)
+                            && boundary > 0
+                            && boundary <= recorded
+                            && boundary.is_multiple_of(bs)
+                            && let Some(tokens) = rt
+                                .coordinator
+                                .full_adapter()
+                                .request_tokens_for(seq_id)
+                                .map(|t| t.to_vec())
+                            && tokens.len() >= boundary as usize
+                        {
+                            let draft_win = rt
+                                .block_boundary_draft_window
+                                .get(&seq_id)
+                                .filter(|(wb, _)| *wb == boundary)
+                                .map(|(_, w)| w);
+                            if let Err(err) =
+                                rt.state_store.capture_boundary_with_window_and_options(
+                                    &mut rt.coordinator,
+                                    &conv,
+                                    seq_id,
+                                    &tokens,
+                                    boundary,
+                                    cache_salt,
+                                    StateClass::Ordinary,
+                                    draft_win,
+                                    governor,
+                                    CaptureOptions {
+                                        keep_prev_checkpoint: true,
+                                        enqueue_write_behind: true,
+                                        is_head: false,
+                                        now,
+                                    },
+                                )
+                            {
+                                tracing::warn!(
+                                    target: "mlx_core::inkling2::paged",
+                                    "Inkling2 finalize StateStore capture at boundary={boundary} failed: {err}"
+                                );
+                            }
                         }
                     }
+                } else {
+                    rt.state_store.clear_seq_checkpoint(seq_id);
+                    rt.coordinator.release_request_all(seq_id)?;
+                    rt.conv_states.remove(&seq_id);
+                    rt.prev_conv_snapshots.remove(&seq_id);
+                    rt.block_boundary_conv.remove(&seq_id);
+                    rt.draft_windows.remove(&seq_id);
+                    rt.block_boundary_draft_window.remove(&seq_id);
+                    rt.restored_draft_windows.remove(&seq_id);
+                    rt.seq_reuse_cache.remove(&seq_id);
+                    rt.seq_cache_salt.remove(&seq_id);
                 }
-            } else {
-                rt.state_store.clear_seq_checkpoint(seq_id);
-                rt.coordinator.release_request_all(seq_id)?;
-                rt.conv_states.remove(&seq_id);
-                rt.prev_conv_snapshots.remove(&seq_id);
-                rt.block_boundary_conv.remove(&seq_id);
-                rt.draft_windows.remove(&seq_id);
-                rt.block_boundary_draft_window.remove(&seq_id);
-                rt.restored_draft_windows.remove(&seq_id);
-                rt.seq_reuse_cache.remove(&seq_id);
-            }
-            Ok(())
-        })();
+                Ok(())
+            })()
+        } else {
+            return;
+        };
         if !reuse_cache {
             self.dspark_turn_contexts.remove(&seq_id);
             self.scheduled_dspark.seq_lanes.remove(&seq_id);
             self.scheduled_dspark.sync_decode_limit();
+            self.clear_seq_image_lineage(seq_id);
         }
         if let Err(error) = res {
             tracing::warn!(
                 target: "mlx_core::inkling2::paged",
                 "Inkling2 paged finalize failed: {error}"
             );
-            rt.paged_finalize_error = Some(error);
-            rt.release_sequence(seq_id);
+            if let Some(ref mut rt) = self.paged {
+                rt.paged_finalize_error = Some(error);
+                rt.release_sequence(seq_id);
+            }
             self.dspark_turn_contexts.remove(&seq_id);
             self.scheduled_dspark.seq_lanes.remove(&seq_id);
             self.scheduled_dspark.sync_decode_limit();
+            self.clear_seq_image_lineage(seq_id);
         }
     }
 
@@ -6051,6 +7021,7 @@ impl PagedBackend for Inkling2Inner {
         );
         if rollback_res.is_ok() {
             rt.conv_states.insert(seq_id, snap);
+            rt.rewind_block_boundary_conv(seq_id, u32::try_from(target_len).unwrap_or(u32::MAX));
             true
         } else {
             false
@@ -6061,6 +7032,7 @@ impl PagedBackend for Inkling2Inner {
         if let Some(ref mut rt) = self.paged {
             let seq = rt.active_seq;
             rt.state_store.clear_seq_checkpoint(seq);
+            rt.cached_paged_image_token_positions.clear();
             rt.release_sequence(seq);
             self.dspark_turn_contexts.remove(&seq);
             self.scheduled_dspark.seq_lanes.remove(&seq);
@@ -6651,7 +7623,8 @@ mod stream_emitter_tests {
         let sink_with = VecSink::default();
         let mut emitter_with = Inkling2StreamEmitter::new();
         for piece in pieces {
-            // Note: engine passes is_reasoning=false because ThinkingPolicy::None
+            // Note: Inkling2StreamEmitter parses Inkling wire markers directly, ignoring the
+            // engine's token-level `is_reasoning` hint.
             emitter_with.on_token_text(piece, false, true, &sink_with);
         }
         let result_with = make_final_result(raw, true);
@@ -6949,7 +7922,7 @@ mod stream_emitter_tests {
 
         for include_reasoning in [true, false] {
             let sink = VecSink::default();
-            let mut emitter = Inkling2StreamEmitter::new();
+            let mut emitter = Inkling2StreamEmitter::with_tokenizer(tokenizer.inner_arc());
             let mut decode_stream = tokenizer.inner().decode_stream(false);
             let mut streamed_text_len = 0usize;
             let mut prefix_tokens = Vec::with_capacity(generated_tokens.len());
@@ -7018,7 +7991,564 @@ mod stream_emitter_tests {
             assert_no_protocol_leaks(&streamed_content);
             assert!(!streamed_content.contains("get_weather"));
             assert!(!streamed_content.contains("Tokyo"));
+            assert!(
+                finalized.reasoning_tokens > 0,
+                "synthetic tokenizer reasoning_tokens must be counted"
+            );
         }
+    }
+
+    fn build_byte_level_test_tokenizer() -> Qwen3Tokenizer {
+        let mut bs: Vec<u32> = (33..=126).chain(161..=172).chain(174..=255).collect();
+        let mut cs = bs.clone();
+        let mut n = 0u32;
+        for b in 0..=255u32 {
+            if !bs.contains(&b) {
+                bs.push(b);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        let mut vocab = serde_json::Map::new();
+        for (idx, &c) in cs.iter().enumerate() {
+            let ch = char::from_u32(c).unwrap();
+            vocab.insert(ch.to_string(), json!(idx));
+        }
+        let tokenizer_json = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "post_processor": null,
+            "decoder": {
+                "type": "ByteLevel",
+                "add_prefix_space": false,
+                "trim_offsets": false,
+                "use_regex": false
+            },
+            "model": {
+                "type": "BPE",
+                "vocab": vocab,
+                "merges": []
+            }
+        });
+        let mut tok = Tokenizer::from_bytes(tokenizer_json.to_string().as_bytes())
+            .expect("build ByteLevel tokenizer");
+        let added: Vec<AddedToken> = INKLING2_CONTROL_TOKENS
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+        tok.add_special_tokens(added)
+            .expect("register Inkling2 special tokens");
+        Qwen3Tokenizer::from_tokenizer(tok, None).expect("wrap Qwen3Tokenizer")
+    }
+
+    #[test]
+    fn token_id_stream_and_finalize_keep_quoted_control_tokens_and_tool_args_literal() {
+        use crate::tools::inkling::{InklingOutputMarkerIds, InklingTokenizer};
+
+        let tokenizer = build_byte_level_test_tokenizer();
+        let ids = InklingOutputMarkerIds::from_tokenizer(&tokenizer);
+
+        let quoted_thought = concat!(
+            "Consider <|end_message|><|content_text|>leak and ",
+            r#"<|message_model|>rm<|content_invoke_tool_json|>{"name":"rm","args":{}}<|end_message|>"#,
+        );
+        let tool_payload = r#"{"name":"echo","args":{"msg":"<|end_message|> and <|content_model_end_sampling|>"}}"#;
+        let quoted_answer = concat!(
+            "Shown: <|end_message|>, <|content_thinking|>prose, ",
+            r#"<|message_model|>rm<|content_invoke_tool_json|>{"name":"rm","args":{}}<|end_message|>"#,
+        );
+
+        let mut generated_tokens = Vec::new();
+        generated_tokens.push(ids.message_model.unwrap());
+        generated_tokens.push(ids.content_thinking.unwrap());
+        generated_tokens.extend(tokenizer.encode_text(quoted_thought).unwrap());
+        generated_tokens.push(ids.end_message.unwrap());
+        generated_tokens.push(ids.message_model.unwrap());
+        generated_tokens.extend(tokenizer.encode_text("echo").unwrap());
+        generated_tokens.push(ids.content_invoke_tool_json.unwrap());
+        generated_tokens.extend(tokenizer.encode_text(tool_payload).unwrap());
+        generated_tokens.push(ids.end_message.unwrap());
+        generated_tokens.push(ids.message_model.unwrap());
+        generated_tokens.push(ids.content_text.unwrap());
+        generated_tokens.extend(tokenizer.encode_text(quoted_answer).unwrap());
+        generated_tokens.push(ids.end_message.unwrap());
+        generated_tokens.push(ids.content_model_end_sampling.unwrap());
+
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::with_tokenizer(tokenizer.inner_arc());
+        for &tid in &generated_tokens {
+            // Deliberately pass misleading text to prove token-ID mode ignores `token_text`.
+            emitter.on_token_id(tid, "<|end_message|>", false, true, &sink);
+        }
+        // Residual must be a no-op in token-ID mode (no duplication).
+        emitter.on_residual("DUPLICATE", false, true, &sink);
+
+        let finalized = finalize_inkling2_turn(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &generated_tokens,
+            finish_reason: "stop".to_string(),
+            think_end_id: None,
+            think_end_str: None,
+            think_end_extra_ids: &[],
+            performance: None,
+            include_reasoning: true,
+            thinking_enabled: true,
+            prompt_tokens: 10,
+            reasoning: ReasoningOutcome::default(),
+        })
+        .expect("finalize_inkling2_turn");
+
+        emitter.finish(&finalized, &sink);
+
+        let chunks = sink.chunks();
+        let (streamed_reasoning, streamed_content, done) = collect_streamed(&chunks);
+        assert_eq!(streamed_reasoning, quoted_thought);
+        assert_eq!(streamed_content, quoted_answer);
+        assert_eq!(finalized.thinking.as_deref(), Some(quoted_thought));
+        assert_eq!(finalized.text, quoted_answer);
+        assert_eq!(finalized.finish_reason, "tool_calls");
+        assert_eq!(done.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(finalized.tool_calls.len(), 1);
+        assert_eq!(finalized.tool_calls[0].status, "ok");
+        assert_eq!(finalized.tool_calls[0].name, "echo");
+        assert_eq!(
+            finalized.tool_calls[0].arguments,
+            json!({"msg": "<|end_message|> and <|content_model_end_sampling|>"})
+        );
+        assert_eq!(
+            finalized.reasoning_tokens as usize,
+            tokenizer.encode_text(quoted_thought).unwrap().len()
+        );
+    }
+
+    #[test]
+    fn production_stream_emitter_and_finalize_keep_quoted_markers_literal_with_reasoning_off_and_tool_json()
+     {
+        use std::sync::Arc;
+
+        use crate::engine::backend::ChatBackend;
+        use crate::tools::inkling::{InklingOutputMarkerIds, InklingTokenizer};
+
+        let tokenizer = Arc::new(build_byte_level_test_tokenizer());
+        let mut backend = super::dflash2_plan_tests::build_dflash2_only_inner();
+        backend.tokenizer = Some(Arc::clone(&tokenizer));
+        let ids = InklingOutputMarkerIds::from_tokenizer(&tokenizer);
+        let skip_special = backend.stream_skip_special_tokens();
+
+        // Helper mimicking production `TurnStreaming` + `ChatBackend::finalize_turn`:
+        // runs real `step_decode_stream` into `backend.stream_emitter().on_token_id(...)`,
+        // flushes any residual, and finalizes via `backend.finalize_turn(...)`.
+        let run_serving_turn =
+            |generated_tokens: &[u32], include_reasoning: bool, thinking_enabled: bool| {
+                let sink = VecSink::default();
+                let mut emitter = backend.stream_emitter();
+                let mut decode_ids = Vec::new();
+                let mut decode_prefix = String::new();
+                let mut decode_prefix_index = 0usize;
+                for &tid in generated_tokens {
+                    let piece = tokenizers::step_decode_stream(
+                        tokenizer.inner(),
+                        vec![tid],
+                        skip_special,
+                        &mut decode_ids,
+                        &mut decode_prefix,
+                        &mut decode_prefix_index,
+                    )
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default();
+                    emitter.on_token_id(tid, &piece, false, include_reasoning, &sink);
+                }
+                emitter.on_residual("MUST_NOT_APPEAR", false, include_reasoning, &sink);
+                let finalized = backend
+                    .finalize_turn(FinalizeArgs {
+                        tokenizer: &tokenizer,
+                        generated_tokens,
+                        finish_reason: "stop".to_string(),
+                        think_end_id: None,
+                        think_end_str: None,
+                        think_end_extra_ids: &[],
+                        performance: None,
+                        include_reasoning,
+                        thinking_enabled,
+                        prompt_tokens: 12,
+                        reasoning: ReasoningOutcome::default(),
+                    })
+                    .expect("ChatBackend::finalize_turn");
+                emitter.finish(&finalized, &sink);
+                let chunks = sink.chunks();
+                let (streamed_reasoning, streamed_content, done) = collect_streamed(&chunks);
+                (
+                    streamed_reasoning,
+                    streamed_content,
+                    done.clone(),
+                    finalized,
+                )
+            };
+
+        // 1. Literal quoted `<|content_text|>` / `<|end_message|>` / `<|message_model|>` inside
+        //    reasoning with reasoning disabled (`include_reasoning = false`,
+        //    `thinking_enabled = false`) MUST NOT leak any reasoning into visible content.
+        let hidden_thought = concat!(
+            "Secret plan <|content_text|>MUST_NOT_LEAK ",
+            "<|end_message|><|message_model|><|content_text|>ALSO_HIDDEN",
+        );
+        let visible_answer = "Safe visible answer.";
+        let mut reasoning_off_tokens = Vec::new();
+        reasoning_off_tokens.push(ids.message_model.unwrap());
+        reasoning_off_tokens.push(ids.content_thinking.unwrap());
+        reasoning_off_tokens.extend(tokenizer.encode_text(hidden_thought).unwrap());
+        reasoning_off_tokens.push(ids.end_message.unwrap());
+        reasoning_off_tokens.push(ids.message_model.unwrap());
+        reasoning_off_tokens.push(ids.content_text.unwrap());
+        reasoning_off_tokens.extend(tokenizer.encode_text(visible_answer).unwrap());
+        reasoning_off_tokens.push(ids.end_message.unwrap());
+        reasoning_off_tokens.push(ids.content_model_end_sampling.unwrap());
+
+        let (r1, c1, done1, fin1) = run_serving_turn(&reasoning_off_tokens, false, false);
+        assert_eq!(r1, "", "reasoning deltas must be suppressed when disabled");
+        assert_eq!(
+            c1, visible_answer,
+            "quoted <|content_text|>/<|end_message|> in reasoning must not leak into streamed content"
+        );
+        assert_eq!(fin1.text, visible_answer);
+        assert_eq!(fin1.thinking, None);
+        assert!(fin1.tool_calls.is_empty());
+        assert_eq!(fin1.finish_reason, "stop");
+        assert_eq!(done1.text, visible_answer);
+        assert_eq!(done1.thinking, None);
+        assert_eq!(
+            fin1.reasoning_tokens as usize,
+            tokenizer.encode_text(hidden_thought).unwrap().len()
+        );
+
+        // 2. Literal quoted closing markers (`<|end_message|>`, `<|content_model_end_sampling|>`)
+        //    inside JSON tool-call arguments MUST NOT terminate the JSON early (verified for both
+        //    `include_reasoning = false` and `include_reasoning = true`).
+        let tool_json = r#"{"name":"run_cmd","args":{"cmd":"echo <|end_message|> && echo <|content_model_end_sampling|>"}}"#;
+        let mut tool_tokens = Vec::new();
+        tool_tokens.push(ids.message_model.unwrap());
+        tool_tokens.extend(tokenizer.encode_text("run_cmd").unwrap());
+        tool_tokens.push(ids.content_invoke_tool_json.unwrap());
+        tool_tokens.extend(tokenizer.encode_text(tool_json).unwrap());
+        tool_tokens.push(ids.end_message.unwrap());
+        tool_tokens.push(ids.content_model_end_sampling.unwrap());
+
+        for include_reasoning in [false, true] {
+            let (rt, ct, donet, fint) =
+                run_serving_turn(&tool_tokens, include_reasoning, include_reasoning);
+            assert_eq!(rt, "");
+            assert_eq!(
+                ct, "",
+                "quoted closing markers inside tool JSON must not spill JSON into visible stream"
+            );
+            assert_eq!(fint.text, "");
+            assert_eq!(fint.finish_reason, "tool_calls");
+            assert_eq!(donet.finish_reason.as_deref(), Some("tool_calls"));
+            assert_eq!(fint.tool_calls.len(), 1);
+            assert_eq!(fint.tool_calls[0].status, "ok");
+            assert_eq!(fint.tool_calls[0].name, "run_cmd");
+            assert_eq!(
+                fint.tool_calls[0].arguments,
+                json!({"cmd": "echo <|end_message|> && echo <|content_model_end_sampling|>"})
+            );
+        }
+    }
+
+    #[test]
+    fn token_id_stream_and_finalize_isolate_incomplete_utf8_at_block_boundary() {
+        use crate::tools::inkling::{InklingOutputMarkerIds, InklingTokenizer};
+
+        let tokenizer = build_byte_level_test_tokenizer();
+        let ids = InklingOutputMarkerIds::from_tokenizer(&tokenizer);
+        let emoji_tokens = tokenizer.encode_text("😀").unwrap();
+        assert_eq!(emoji_tokens.len(), 4);
+
+        let mut generated_tokens = Vec::new();
+        generated_tokens.push(ids.message_model.unwrap());
+        generated_tokens.push(ids.content_thinking.unwrap());
+        generated_tokens.extend(tokenizer.encode_text("abc").unwrap());
+        generated_tokens.extend_from_slice(&emoji_tokens[..2]);
+        generated_tokens.push(ids.end_message.unwrap());
+        generated_tokens.push(ids.message_model.unwrap());
+        generated_tokens.push(ids.content_text.unwrap());
+        generated_tokens.extend(tokenizer.encode_text("xyz").unwrap());
+        generated_tokens.push(ids.end_message.unwrap());
+        generated_tokens.push(ids.content_model_end_sampling.unwrap());
+
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::with_tokenizer(tokenizer.inner_arc());
+        for &tid in &generated_tokens {
+            emitter.on_token_id(tid, "", false, true, &sink);
+        }
+
+        let finalized = finalize_inkling2_turn(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &generated_tokens,
+            finish_reason: "stop".to_string(),
+            think_end_id: None,
+            think_end_str: None,
+            think_end_extra_ids: &[],
+            performance: None,
+            include_reasoning: true,
+            thinking_enabled: true,
+            prompt_tokens: 4,
+            reasoning: ReasoningOutcome::default(),
+        })
+        .expect("finalize_inkling2_turn");
+        emitter.finish(&finalized, &sink);
+
+        let chunks = sink.chunks();
+        let (streamed_reasoning, streamed_content, _) = collect_streamed(&chunks);
+        assert_eq!(streamed_reasoning, "abc\u{FFFD}");
+        assert_eq!(streamed_content, "xyz");
+        assert_eq!(finalized.thinking.as_deref(), Some("abc\u{FFFD}"));
+        assert_eq!(finalized.text, "xyz");
+    }
+
+    #[test]
+    fn synthetic_tokenizer_token_id_streaming_matches_finalize_and_finish_reasons() {
+        // Synthetic WordLevel tokenizer with Fuse decoder placing Inkling2 control
+        // tokens at non-canonical IDs 96..111 (same IDs as `build_test_tokenizer`,
+        // without WordLevel's null-decoder inter-character spaces).
+        let mut vocab = serde_json::Map::new();
+        for (i, ch) in (32u8..=126u8).enumerate() {
+            vocab.insert((ch as char).to_string(), json!(i));
+        }
+        vocab.insert("\n".to_string(), json!(95));
+        let tokenizer_json = json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [],
+            "normalizer": null,
+            "pre_tokenizer": {
+                "type": "Split",
+                "pattern": { "Regex": "." },
+                "behavior": "Isolated",
+                "invert": false
+            },
+            "post_processor": null,
+            "decoder": { "type": "Fuse" },
+            "model": {
+                "type": "WordLevel",
+                "vocab": vocab,
+                "unk_token": "?"
+            }
+        });
+        let mut tok = Tokenizer::from_bytes(tokenizer_json.to_string().as_bytes())
+            .expect("build synthetic Fuse WordLevel tokenizer");
+        let added: Vec<AddedToken> = INKLING2_CONTROL_TOKENS
+            .iter()
+            .map(|&s| AddedToken::from(s, true))
+            .collect();
+        tok.add_special_tokens(added)
+            .expect("register Inkling2 special tokens");
+        let tokenizer = Qwen3Tokenizer::from_tokenizer(tok, None).expect("wrap Qwen3Tokenizer");
+        assert!(
+            (96..=111).contains(&tokenizer.inner().token_to_id(END_MESSAGE).unwrap()),
+            "expected synthetic control token IDs in 96..=111"
+        );
+        let raw_output = concat!(
+            "<|message_model|><|content_thinking|>Think.<|end_message|>",
+            "<|message_model|>get_weather<|content_invoke_tool_json|>",
+            r#"{"name":"get_weather","args":{"city":"SF"}}"#,
+            "<|end_message|>",
+            "<|content_model_end_sampling|>",
+        );
+        let generated_tokens = tokenizer
+            .inner()
+            .encode(raw_output, false)
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+
+        // Streaming via token-ID emitter on synthetic IDs (96..111)
+        let sink = VecSink::default();
+        let mut emitter = Inkling2StreamEmitter::with_tokenizer(tokenizer.inner_arc());
+        for &tid in &generated_tokens {
+            emitter.on_token_id(tid, "", false, true, &sink);
+        }
+
+        // "stop" with valid tool call promotes to "tool_calls"
+        let finalized_stop = finalize_inkling2_turn(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &generated_tokens,
+            finish_reason: "stop".to_string(),
+            think_end_id: None,
+            think_end_str: None,
+            think_end_extra_ids: &[],
+            performance: None,
+            include_reasoning: true,
+            thinking_enabled: true,
+            prompt_tokens: 5,
+            reasoning: ReasoningOutcome::default(),
+        })
+        .expect("finalize stop");
+        emitter.finish(&finalized_stop, &sink);
+
+        let chunks = sink.chunks();
+        let (streamed_reasoning, streamed_content, done) = collect_streamed(&chunks);
+        assert_eq!(streamed_reasoning, "Think.");
+        assert_eq!(streamed_content, "");
+        assert_eq!(finalized_stop.thinking.as_deref(), Some("Think."));
+        assert_eq!(finalized_stop.text, "");
+        assert_eq!(finalized_stop.reasoning_tokens, 6); // "Think." = 6 chars in WordLevel
+        assert_eq!(finalized_stop.finish_reason, "tool_calls");
+        assert_eq!(done.finish_reason.as_deref(), Some("tool_calls"));
+
+        // "length" and "cancelled" must NOT be promoted to "tool_calls"
+        for preserved in ["length", "cancelled"] {
+            let finalized = finalize_inkling2_turn(FinalizeArgs {
+                tokenizer: &tokenizer,
+                generated_tokens: &generated_tokens,
+                finish_reason: preserved.to_string(),
+                think_end_id: None,
+                think_end_str: None,
+                think_end_extra_ids: &[],
+                performance: None,
+                include_reasoning: true,
+                thinking_enabled: true,
+                prompt_tokens: 5,
+                reasoning: ReasoningOutcome::default(),
+            })
+            .expect("finalize preserved");
+            assert_eq!(finalized.finish_reason, preserved);
+        }
+
+        // Malformed tool call (status != "ok") on "stop" stays "stop"
+        let bad_tool_tokens = tokenizer
+            .inner()
+            .encode(
+                "<|message_model|><|content_invoke_tool_json|>{bad<|end_message|><|content_model_end_sampling|>",
+                false,
+            )
+            .expect("encode")
+            .get_ids()
+            .to_vec();
+        let finalized_bad = finalize_inkling2_turn(FinalizeArgs {
+            tokenizer: &tokenizer,
+            generated_tokens: &bad_tool_tokens,
+            finish_reason: "stop".to_string(),
+            think_end_id: None,
+            think_end_str: None,
+            think_end_extra_ids: &[],
+            performance: None,
+            include_reasoning: true,
+            thinking_enabled: true,
+            prompt_tokens: 5,
+            reasoning: ReasoningOutcome::default(),
+        })
+        .expect("finalize bad");
+        assert_eq!(finalized_bad.tool_calls.len(), 1);
+        assert_ne!(finalized_bad.tool_calls[0].status, "ok");
+        assert_eq!(finalized_bad.finish_reason, "stop");
+    }
+
+    #[test]
+    fn inkling2_multimodal_thinking_enabled_tracks_resolved_effort() {
+        use super::{resolve_inkling2_effort, resolve_inkling2_thinking_enabled};
+        use crate::engine::types::ChatConfig;
+
+        let config_with_effort = |effort: Option<&str>| ChatConfig {
+            cache_salt: None,
+            cache_owner_id: None,
+            cache_root_owner_id: None,
+            max_new_tokens: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            repetition_context_size: None,
+            presence_penalty: None,
+            presence_context_size: None,
+            frequency_penalty: None,
+            frequency_context_size: None,
+            max_consecutive_tokens: None,
+            max_ngram_repeats: None,
+            ngram_size: None,
+            tools: None,
+            reasoning_effort: effort.map(str::to_string),
+            thinking_token_budget: None,
+            thinking_cycle_guard: None,
+            thinking_end_text: None,
+            include_reasoning: None,
+            report_performance: None,
+            reuse_cache: None,
+            enable_mtp: None,
+            mtp_depth: None,
+            mtp_adaptive_depth: None,
+        };
+
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(None)).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("minimal"))).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("low"))).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("medium"))).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("high"))).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("max"))).unwrap());
+        assert!(resolve_inkling2_thinking_enabled(&config_with_effort(Some("0.25"))).unwrap());
+
+        assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("none"))).unwrap());
+        assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("0"))).unwrap());
+        assert!(!resolve_inkling2_thinking_enabled(&config_with_effort(Some("0.0"))).unwrap());
+        assert_eq!(resolve_inkling2_effort(Some(false), None).unwrap(), 0.0);
+    }
+
+    #[test]
+    fn inkling2_policy_and_think_end_for_turn_honor_open_token() {
+        use crate::engine::backend::ChatBackend;
+        use crate::engine::types::ChatConfig;
+        use crate::tools::inkling::{
+            CONTENT_TEXT, CONTENT_THINKING, END_MESSAGE, InklingOutputMarkerIds,
+        };
+
+        let tok = build_test_tokenizer();
+        let markers = InklingOutputMarkerIds::from_tokenizer(&tok);
+        let open_id = markers.content_thinking.expect("content_thinking id");
+        let close_id = markers.end_message.expect("end_message id");
+        let content_text_id = markers.content_text.expect("content_text id");
+        assert_eq!(tok.inner().token_to_id(CONTENT_THINKING), Some(open_id));
+        assert_eq!(tok.inner().token_to_id(END_MESSAGE), Some(close_id));
+        assert_eq!(tok.inner().token_to_id(CONTENT_TEXT), Some(content_text_id));
+
+        let inner = super::dflash2_plan_tests::build_dflash2_only_inner();
+        assert!(matches!(
+            inner.policy(),
+            crate::engine::ThinkingPolicy::OpenTokenHonoring
+        ));
+
+        // Default config: open=<|content_thinking|>, thinking_end=[<|end_message|>] (no forced <|content_text|>).
+        let default_res = inner.think_end_for_turn(&ChatConfig::default(), &tok);
+        assert_eq!(default_res.think_open_id, Some(open_id));
+        assert_eq!(default_res.think_end_id, Some(close_id));
+        assert_eq!(default_res.thinking_end.as_ref(), &[close_id]);
+        assert!(
+            !default_res.thinking_end.contains(&content_text_id),
+            "think_end_for_turn must NOT force <|content_text|> after <|end_message|>"
+        );
+
+        // Custom `thinking_end_text`: encoded with add_special_tokens=false followed by <|end_message|>.
+        let custom_cfg = ChatConfig {
+            thinking_end_text: Some("stop".to_string()),
+            ..ChatConfig::default()
+        };
+        let custom_res = inner.think_end_for_turn(&custom_cfg, &tok);
+        let mut expected = tok.encode_sync("stop", Some(false)).unwrap();
+        expected.push(close_id);
+        assert_eq!(custom_res.think_open_id, Some(open_id));
+        assert_eq!(custom_res.think_end_id, Some(close_id));
+        assert_eq!(custom_res.thinking_end.as_ref(), expected.as_slice());
+        assert!(!custom_res.thinking_end.contains(&content_text_id));
     }
 }
 
@@ -7053,6 +8583,71 @@ mod mpp_verify_tests {
         assert!(!lane_uses_mpp_verify(&long, false));
         assert!(!lane_uses_mpp_verify(&decode_one, true));
         assert!(!lane_uses_mpp_verify(&too_wide, true));
+    }
+
+    #[test]
+    fn wave_uses_swa_mpp_verify_routes_multi_lane_auto_to_batched_varlen() {
+        let long_a = PagedRaggedRow {
+            seq_id: 1,
+            first_logical_position: 1024,
+            query_len: 8,
+        };
+        let long_b = PagedRaggedRow {
+            seq_id: 2,
+            first_logical_position: 1536,
+            query_len: 8,
+        };
+        let short = PagedRaggedRow {
+            seq_id: 3,
+            first_logical_position: 128,
+            query_len: 8,
+        };
+
+        // Auto: solo N == 1 keeps SWA MPP verify speedup; N >= 2 routes to batched varlen!
+        assert!(wave_uses_swa_mpp_verify(
+            &[long_a],
+            true,
+            SwaMppVerifyMode::Auto
+        ));
+        assert!(!wave_uses_swa_mpp_verify(
+            &[short],
+            true,
+            SwaMppVerifyMode::Auto
+        ));
+        assert!(!wave_uses_swa_mpp_verify(
+            &[long_a, long_b],
+            true,
+            SwaMppVerifyMode::Auto
+        ));
+        assert!(!wave_uses_swa_mpp_verify(
+            &[long_a, short],
+            true,
+            SwaMppVerifyMode::Auto
+        ));
+
+        // ForceLowCtx: explicit override honors per-lane even for N >= 2.
+        assert!(wave_uses_swa_mpp_verify(
+            &[short],
+            true,
+            SwaMppVerifyMode::ForceLowCtx
+        ));
+        assert!(wave_uses_swa_mpp_verify(
+            &[long_a, long_b],
+            true,
+            SwaMppVerifyMode::ForceLowCtx
+        ));
+
+        // Off or unsupported MPP: always false.
+        assert!(!wave_uses_swa_mpp_verify(
+            &[long_a],
+            true,
+            SwaMppVerifyMode::Off
+        ));
+        assert!(!wave_uses_swa_mpp_verify(
+            &[long_a],
+            false,
+            SwaMppVerifyMode::Auto
+        ));
     }
 
     #[cfg(target_os = "macos")]
@@ -7198,28 +8793,23 @@ mod mpp_verify_tests {
         let pages_per_split = device_pages_per_split();
         let int8_q_from = device_int8_query_from();
 
-        let make_ws = |rows: &[PagedRaggedRow]| -> Option<MxArray> {
-            let mut max_floats = 0u64;
-            for r in rows {
-                if !lane_uses_mpp_verify(r, true) {
-                    continue;
-                }
-                let splits = prefill_plan::splits(
-                    Pass::Verify,
-                    r.query_len,
-                    r.first_logical_position,
-                    pages_per_split,
-                );
-                let floats = prefill_plan::workspace_floats(
-                    r.query_len,
-                    splits,
-                    num_q_heads as u32,
-                    head_dim as u32,
-                );
-                max_floats = max_floats.max(floats);
-            }
-            (max_floats > 0)
-                .then(|| MxArray::zeros(&[max_floats as i64], Some(DType::Float32)).unwrap())
+        let make_ws = |rows: &[PagedRaggedRow]| -> Vec<Option<MxArray>> {
+            let cores = device_gpu_cores();
+            rows.iter()
+                .map(|r| {
+                    if !lane_uses_mpp_verify(r, true) {
+                        return None;
+                    }
+                    let splits = prefill_plan::inkling2_verify_most_splits(r.query_len, cores);
+                    let floats = prefill_plan::workspace_floats(
+                        r.query_len,
+                        splits,
+                        num_q_heads as u32,
+                        head_dim as u32,
+                    );
+                    Some(MxArray::zeros(&[floats as i64], Some(DType::Float32)).unwrap())
+                })
+                .collect()
         };
 
         let run_case =
@@ -7232,7 +8822,7 @@ mod mpp_verify_tests {
                 }
                 let meta = build_group_attention_meta(&adapter, &seq_q_lens).expect("meta");
                 let use_mpp = rows.iter().any(|r| lane_uses_mpp_verify(r, true));
-                let mut ws = if use_mpp { make_ws(rows) } else { None };
+                let mut wss = if use_mpp { make_ws(rows) } else { Vec::new() };
                 let mode = PagedWaveMode::RaggedVerify {
                     ragged_rows: rows,
                     use_mpp_verify: use_mpp,
@@ -7259,7 +8849,7 @@ mod mpp_verify_tests {
                     num_q_heads,
                     num_kv_heads,
                     head_dim,
-                    ws.as_mut(),
+                    &mut wss,
                 )
                 .expect("dispatch_paged_attention_kernel");
                 (
@@ -7395,7 +8985,7 @@ mod mpp_verify_tests {
             }
             let meta = build_group_attention_meta(&adapter, &seq_q_lens).expect("meta");
             let use_mpp = rows.iter().any(|r| lane_uses_mpp_verify(r, true));
-            let mut ws = if use_mpp { make_ws(rows) } else { None };
+            let mut wss = if use_mpp { make_ws(rows) } else { Vec::new() };
             let mode = PagedWaveMode::RaggedVerify {
                 ragged_rows: rows,
                 use_mpp_verify: use_mpp,
@@ -7425,7 +9015,7 @@ mod mpp_verify_tests {
                 num_q_heads,
                 num_kv_heads,
                 head_dim,
-                ws.as_mut(),
+                &mut wss,
             )
             .expect("dispatch_paged_attention_kernel_ex");
             assert!(lse_opt.is_none());
@@ -7477,7 +9067,7 @@ mod dflash2_plan_tests {
     use crate::nn::{Embedding, Linear};
     use crate::transformer::Activations;
 
-    fn build_dflash2_only_inner() -> Inkling2Inner {
+    pub(super) fn build_dflash2_only_inner() -> Inkling2Inner {
         let d = 256usize;
         let vocab = 64usize;
         let unpadded_vocab = 60usize;
@@ -8007,6 +9597,386 @@ mod dflash2_plan_tests {
                         .release_request_all(seq_id)
                         .expect("release seq");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn rollback_across_block_boundary_rewinds_conv_and_captures_prior_boundary() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::backend::PagedBackend;
+
+        let mut inner = build_dflash2_only_inner();
+        let seq_id = 0u32;
+        let salt = 0x16B0u64;
+
+        let make_sentinel_conv = |cfg: &Inkling2Config, val: f32| -> Inkling2ShortConvState {
+            let mut conv = Inkling2ShortConvState::new(
+                cfg.num_layer_visits(),
+                cfg.sconv_kernel_size,
+                cfg.num_key_value_heads * cfg.head_dim,
+                cfg.hidden_size,
+                DType::BFloat16,
+            )
+            .expect("conv");
+            let hist = (cfg.sconv_kernel_size - 1) as i64;
+            let kv_dim = (cfg.num_key_value_heads * cfg.head_dim) as i64;
+            let filled = MxArray::full(
+                &[hist, kv_dim],
+                napi::Either::A(val as f64),
+                Some(DType::BFloat16),
+            )
+            .expect("sentinel k");
+            conv.visits[0].k = filled;
+            conv
+        };
+
+        // Case A: pos=63 (boundary 32 recorded) -> EOS steps to 64 (records 64, demotes 32 to
+        // previous) -> reconcile rolls back 64 -> 63 -> rewind restores (32, conv_32) ->
+        // finalize captures Ordinary at 32 with conv_32 (not skipped!).
+        let conv_32 = make_sentinel_conv(&inner.config, 1.5);
+        let conv_63 = make_sentinel_conv(&inner.config, 2.5);
+        let conv_64 = make_sentinel_conv(&inner.config, 3.5);
+        let tokens_64: Vec<u32> = (100u32..164u32).collect();
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.active_seq = seq_id;
+            rt.reset_sequence(seq_id, &inner.config).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_id, &tokens_64[..32])
+                .unwrap();
+            rt.conv_states.insert(seq_id, conv_32.clone());
+            rt.record_block_boundary_conv(seq_id, 32);
+
+            rt.coordinator
+                .record_tokens_all(seq_id, &tokens_64[32..63])
+                .unwrap();
+            rt.conv_states.insert(seq_id, conv_63.clone());
+            rt.prev_conv_snapshots.insert(seq_id, (63, conv_63.clone()));
+
+            // Decode step on trailing EOS token crossing 63 -> 64.
+            rt.coordinator
+                .record_tokens_all(seq_id, &tokens_64[63..64])
+                .unwrap();
+            rt.conv_states.insert(seq_id, conv_64);
+            rt.record_block_boundary_conv(seq_id, 64);
+
+            let hist = rt.block_boundary_conv.get(&seq_id).expect("history");
+            assert_eq!(hist.current.0, 64);
+            assert_eq!(hist.previous.as_ref().map(|p| p.0), Some(32));
+        }
+
+        // prompt_len=60, generated=[60, 61, 62, EOS(63)] with keep_all=false -> target_len=63.
+        assert!(inner.reconcile_paged_request_tokens(60, &tokens_64[60..64], false));
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            assert_eq!(rt.coordinator.request_token_count_all(seq_id).unwrap(), 63);
+            let hist = rt
+                .block_boundary_conv
+                .get(&seq_id)
+                .expect("rewound history must retain prior boundary 32");
+            assert_eq!(hist.current.0, 32);
+            assert!(hist.previous.is_none());
+        }
+        inner.finalize_paged_turn(true, salt);
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            let entry =
+                rt.state_store.store.entries().next().expect(
+                    "finalize_paged_turn must capture Ordinary at 32 after 64->63 rollback",
+                );
+            assert_eq!(entry.depth(), 32);
+            assert!(!entry.checkpoint());
+            let conv_bytes = &entry.ram().expect("ram anchor").conv_data;
+            let captured_k0 = half::bf16::from_le_bytes([conv_bytes[0], conv_bytes[1]]).to_f32();
+            assert!(
+                (captured_k0 - 1.5).abs() < 1e-2,
+                "captured conv must be conv_32 (1.5), got {captured_k0}"
+            );
+        }
+
+        // Case B: recorded=32 -> rolled back to 31 (previous = None) -> block_boundary_conv
+        // entry is removed cleanly so Turn 2 cannot capture stale conv_at_32!
+        let tokens_32: Vec<u32> = (200u32..232u32).collect();
+        let conv_31 = make_sentinel_conv(&inner.config, 4.5);
+        let conv_32_stale = make_sentinel_conv(&inner.config, 5.5);
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.active_seq = seq_id;
+            rt.reset_sequence(seq_id, &inner.config).unwrap();
+            rt.coordinator
+                .record_tokens_all(seq_id, &tokens_32[..31])
+                .unwrap();
+            rt.conv_states.insert(seq_id, conv_31.clone());
+            rt.prev_conv_snapshots.insert(seq_id, (31, conv_31));
+
+            rt.coordinator
+                .record_tokens_all(seq_id, &tokens_32[31..32])
+                .unwrap();
+            rt.conv_states.insert(seq_id, conv_32_stale);
+            rt.record_block_boundary_conv(seq_id, 32);
+            assert_eq!(rt.block_boundary_conv.get(&seq_id).unwrap().current.0, 32);
+        }
+        assert!(inner.reconcile_paged_request_tokens(30, &tokens_32[30..32], false));
+        {
+            let rt = inner.paged.as_ref().unwrap();
+            assert_eq!(rt.coordinator.request_token_count_all(seq_id).unwrap(), 31);
+            assert!(
+                !rt.block_boundary_conv.contains_key(&seq_id),
+                "rolling back 32->31 with previous=None must clear block_boundary_conv"
+            );
+        }
+
+        // Case C: `rewind_block_boundary_conv` with `target_len` matching `abort_prefill_run`
+        // rewinds deeper boundary cleanly without dropping valid shallower boundary.
+        {
+            let rt = inner.paged.as_mut().unwrap();
+            rt.conv_states.insert(seq_id, conv_32.clone());
+            rt.record_block_boundary_conv(seq_id, 32);
+            rt.conv_states.insert(seq_id, conv_63);
+            rt.record_block_boundary_conv(seq_id, 64);
+            rt.rewind_block_boundary_conv(seq_id, 40);
+            assert_eq!(rt.current_block_boundary_conv(seq_id).unwrap().0, 32);
+            rt.rewind_block_boundary_conv(seq_id, 16);
+            assert!(rt.current_block_boundary_conv(seq_id).is_none());
+        }
+    }
+
+    /// Regression test for atomic multi-sub-slice prefill checkpoint staging:
+    /// When a multi-sub-slice prefill unit `[64..192)` spans an internal rolling checkpoint
+    /// (`128`) and prompt junction (`160`), injecting a draft-append failure on `sub1` (`[128..160)`)
+    /// AFTER `sub0` (`[64..128)`) has completed MUST roll back cleanly WITHOUT publishing any
+    /// post-frontier checkpoint (`128` or `160`), WITHOUT retiring the prior checkpoint at `64`,
+    /// and WITHOUT modifying Group 0 marked blocks — across BOTH fast (`budget_ms = None`) and
+    /// resumable (`budget_ms = Some(0.0)`) paths.
+    #[test]
+    fn failed_prefill_draft_append_leaves_statestore_checkpoints_and_marks_untouched() {
+        if !crate::engine::persistence::compiled_forward_backend_available() {
+            return;
+        }
+        use crate::engine::hybrid_scheduler::ScheduledPrefillPass;
+
+        struct CheckpointIntervalGuard(Option<u32>);
+        impl CheckpointIntervalGuard {
+            fn set(interval: u32) -> Self {
+                let prev = super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE
+                    .with(|cell| cell.replace(Some(interval)));
+                Self(prev)
+            }
+        }
+        impl Drop for CheckpointIntervalGuard {
+            fn drop(&mut self) {
+                super::super::state_disk::CHECKPOINT_INTERVAL_OVERRIDE
+                    .with(|cell| cell.set(self.0));
+            }
+        }
+
+        struct FailDraftAppendGuard;
+        impl Drop for FailDraftAppendGuard {
+            fn drop(&mut self) {
+                super::FAIL_PREFILL_DRAFT_APPEND_AT.with(|c| c.set(None));
+            }
+        }
+
+        let _cp_guard = CheckpointIntervalGuard::set(64);
+        let _fail_guard = FailDraftAppendGuard;
+        let gen_stream = Stream::generation();
+        let prompt: Vec<u32> = (0u32..192u32).map(|i| 10 + (i % 80)).collect();
+
+        let drive_unit = |inner: &mut Inkling2Inner,
+                          seq_id: SeqId,
+                          start: usize,
+                          end: usize,
+                          salt: u64,
+                          budget_ms: Option<f64>|
+         -> Result<Option<MxArray>> {
+            for _ in 0..256 {
+                match inner.run_paged_prefill_pass(
+                    seq_id, &prompt, start, end, salt, true, gen_stream, budget_ms,
+                )? {
+                    ScheduledPrefillPass::Paused => {}
+                    ScheduledPrefillPass::Done(logits) => return Ok(logits),
+                }
+            }
+            panic!("prefill pass did not terminate");
+        };
+
+        let build_ready_inner = || {
+            let mut inner =
+                super::super::scheduler::tests::build_synthetic_dflash2_inner(512, None);
+            inner
+                .enable_paged(Inkling2PagedConfig {
+                    kv_format: default_inkling2_kv_format(),
+                    block_size: 32,
+                    max_model_len: 512,
+                    max_chunk: 128,
+                    max_concurrent_sequences: 2,
+                    gpu_memory_mb: None,
+                })
+                .expect("enable_paged with headroom for 128-token unit");
+            inner
+        };
+
+        for (case_idx, budget_ms) in [None, Some(0.0)].into_iter().enumerate() {
+            let mut inner = build_ready_inner();
+            let seq_id = 1u32;
+            let salt = 0xD200u64 + case_idx as u64;
+
+            inner
+                .prepare_prefix_sync(seq_id, &prompt, true, salt)
+                .expect("prepare prefix");
+            assert!(
+                inner
+                    .begin_scheduled_dspark(seq_id, 0)
+                    .expect("begin dspark")
+            );
+            assert!(
+                drive_unit(&mut inner, seq_id, 0, 64, salt, None)
+                    .expect("seed prefix [0..64)")
+                    .is_none()
+            );
+
+            // Snapshot pre-unit StateStore entry (rolling checkpoint at 64) and Group 0 marks.
+            let (prior_id, prior_marks, prior_adapter_marks) = {
+                let rt = inner.paged.as_ref().expect("paged");
+                let entries: Vec<_> = rt.state_store.store.entries().collect();
+                assert_eq!(
+                    entries.len(),
+                    1,
+                    "case {case_idx}: expected exactly 1 seeded checkpoint at depth 64"
+                );
+                assert_eq!(entries[0].depth(), 64);
+                assert!(entries[0].checkpoint());
+                let mut marks: Vec<u64> = rt.state_store.store.marks().collect();
+                marks.sort_unstable();
+                assert!(
+                    !marks.is_empty(),
+                    "case {case_idx}: seeded checkpoint must mark Group 0 blocks in StateStore"
+                );
+                let adapter_marks = rt.coordinator.full_adapter().marked_blocks();
+                assert_eq!(
+                    rt.current_block_boundary_conv(seq_id).map(|(b, _)| b),
+                    Some(64)
+                );
+                assert_eq!(
+                    rt.block_boundary_draft_window.get(&seq_id).map(|(b, _)| *b),
+                    Some(64)
+                );
+                (entries[0].id(), marks, adapter_marks)
+            };
+
+            // Inject draft-append failure on `sub1 = [128..160)` AFTER `sub0 = [64..128)` passed
+            // rolling checkpoint boundary `128`.
+            super::FAIL_PREFILL_DRAFT_APPEND_AT.with(|c| c.set(Some((seq_id, 128))));
+            let Err(err) = drive_unit(&mut inner, seq_id, 64, 192, salt, budget_ms) else {
+                panic!("case {case_idx}: injected draft append failure at 128 must return Err");
+            };
+            super::FAIL_PREFILL_DRAFT_APPEND_AT.with(|c| c.set(None));
+            assert!(
+                err.reason.contains("injected prefill draft append failure"),
+                "case {case_idx}: unexpected error: {}",
+                err.reason
+            );
+
+            // Verify rollback restored frontier & conv AND left StateStore + marks untouched!
+            {
+                let rt = inner.paged.as_ref().expect("paged");
+                assert_eq!(
+                    rt.coordinator.request_token_count_all(seq_id).unwrap(),
+                    64,
+                    "case {case_idx}: KV frontier must roll back to unit_start=64"
+                );
+                assert_eq!(
+                    rt.current_block_boundary_conv(seq_id).map(|(b, _)| b),
+                    Some(64),
+                    "case {case_idx}: block_boundary_conv must stay at 64"
+                );
+                assert_eq!(
+                    rt.block_boundary_draft_window.get(&seq_id).map(|(b, _)| *b),
+                    Some(64),
+                    "case {case_idx}: pre-unit block_boundary_draft_window at 64 must survive"
+                );
+                let survived = rt
+                    .state_store
+                    .store
+                    .get(prior_id)
+                    .expect("prior checkpoint at 64 must NOT be retired on failed unit commit");
+                assert_eq!(survived.depth(), 64);
+                assert!(survived.checkpoint());
+                assert_eq!(
+                    rt.state_store.store.entries().count(),
+                    1,
+                    "case {case_idx}: no post-frontier checkpoint (128 or 160) may be published"
+                );
+                let mut after_marks: Vec<u64> = rt.state_store.store.marks().collect();
+                after_marks.sort_unstable();
+                assert_eq!(
+                    after_marks, prior_marks,
+                    "case {case_idx}: StateStore Group 0 marks must remain identical after rollback"
+                );
+                assert_eq!(
+                    rt.coordinator.full_adapter().marked_blocks(),
+                    prior_adapter_marks,
+                    "case {case_idx}: Group 0 adapter marked blocks must remain identical after rollback"
+                );
+            }
+            assert!(
+                !inner.scheduled_dspark.seq_lanes.contains_key(&seq_id),
+                "case {case_idx}: drifted scheduled draft lane must be dropped on rollback"
+            );
+
+            // Happy path with same `budget_ms`: commits cleanly and publishes BOTH rolling
+            // checkpoint `128` (retiring `64`) and Ordinary prompt junction `160` with draft windows!
+            let mut happy = build_ready_inner();
+            happy
+                .prepare_prefix_sync(seq_id, &prompt, true, salt)
+                .expect("prepare happy");
+            assert!(
+                happy
+                    .begin_scheduled_dspark(seq_id, 0)
+                    .expect("begin happy dspark")
+            );
+            assert!(
+                drive_unit(&mut happy, seq_id, 0, 64, salt, None)
+                    .expect("happy [0..64)")
+                    .is_none()
+            );
+            assert!(
+                drive_unit(&mut happy, seq_id, 64, 192, salt, budget_ms)
+                    .expect("happy [64..192)")
+                    .is_some()
+            );
+            {
+                let rt = happy.paged.as_ref().expect("paged");
+                assert_eq!(rt.coordinator.request_token_count_all(seq_id).unwrap(), 192);
+                assert_eq!(
+                    rt.current_block_boundary_conv(seq_id).map(|(b, _)| b),
+                    Some(192)
+                );
+                assert_eq!(
+                    rt.block_boundary_draft_window.get(&seq_id).map(|(b, _)| *b),
+                    Some(192)
+                );
+                let mut published: Vec<(usize, bool, bool)> = rt
+                    .state_store
+                    .store
+                    .entries()
+                    .map(|e| {
+                        (
+                            e.depth(),
+                            e.checkpoint(),
+                            e.ram().is_some_and(|r| r.draft_window.is_some()),
+                        )
+                    })
+                    .collect();
+                published.sort_unstable();
+                assert_eq!(
+                    published,
+                    vec![(128, true, true), (160, false, true)],
+                    "case {case_idx}: happy path must publish checkpoint 128 and junction 160 with draft windows"
+                );
             }
         }
     }

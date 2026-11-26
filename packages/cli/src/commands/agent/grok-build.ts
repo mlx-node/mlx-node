@@ -1691,8 +1691,8 @@ function waitForPreload(
       if (err) reject(err);
       else resolvePromise();
     };
-    const onExit = (code: number | null): void =>
-      finish(new Error(`mlx serve exited (${code}) while loading ${model}`));
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+      finish(new Error(`mlx serve exited (${code ?? signal}) while loading ${model}`));
     child.once('exit', onExit);
     const poll = (): void => {
       fetch(`${base}/health`, { headers: { authorization: `Bearer ${token}` } })
@@ -1730,15 +1730,25 @@ function waitForPreload(
 function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
   return new Promise((resolvePromise, reject) => {
     const rl = child.stdout ? createInterface({ input: child.stdout }) : undefined;
-    const timer = setTimeout(() => fail(new Error('timed out waiting for `mlx serve` to report its port')), timeoutMs);
-
-    const fail = (err: Error): void => {
+    let settled = false;
+    const cleanup = (): void => {
       clearTimeout(timer);
+      child.removeListener('exit', onExit);
+      child.removeListener('error', fail);
       rl?.close();
+    };
+    const fail = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(err);
     };
+    const onExit = (code: number | null, signal: NodeJS.Signals | null): void =>
+      fail(new Error(`mlx serve exited (${code ?? signal}) before reporting a port`));
 
-    child.once('exit', (code) => fail(new Error(`mlx serve exited (${code}) before reporting a port`)));
+    const timer = setTimeout(() => fail(new Error('timed out waiting for `mlx serve` to report its port')), timeoutMs);
+
+    child.once('exit', onExit);
     // A spawn failure emits 'error' without 'exit' — surface it instead of
     // hanging on the timeout.
     child.once('error', fail);
@@ -1751,8 +1761,13 @@ function waitForServe(child: ChildProcess, timeoutMs: number): Promise<string> {
       fetch(`${base}/health`)
         .then((res) => (res.ok ? url : Promise.reject(new Error(`health ${res.status}`))))
         .then((ready) => {
-          clearTimeout(timer);
-          rl?.close();
+          if (settled) return;
+          settled = true;
+          cleanup();
+          // `rl.close()` pauses `child.stdout`; drain it for the rest of serve's
+          // lifetime so post-startup stdout output can never fill the OS pipe
+          // buffer and stall the inference server.
+          child.stdout?.resume();
           resolvePromise(ready);
         })
         .catch(fail);
@@ -1774,7 +1789,7 @@ export const LOCAL_BACKEND_DISABLED_TOOL_ENV = ['GROK_IMAGE_GEN', 'GROK_IMAGE_ED
  * both fit in it.
  */
 export async function stopServe(child: ChildProcess, signal: NodeJS.Signals, graceMs = STOP_MS): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (child.exitCode != null || child.signalCode != null) return;
   const exited = new Promise<void>((resolvePromise) => child.once('exit', () => resolvePromise()));
   child.kill(signal);
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -1811,6 +1826,7 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
   // signal then must not leave serve holding the model.
   let serveChild: ChildProcess | undefined;
   let agent: ChildProcess | undefined;
+  let agentStopping: Promise<void> | undefined;
   let tearingDown: Promise<void> | undefined;
   const removeHandlers = (): void => {
     process.removeListener('SIGINT', forward);
@@ -1824,7 +1840,8 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       return;
     }
     tearingDown = (async () => {
-      agent?.kill(signal);
+      if (agentStopping) await agentStopping;
+      else agent?.kill(signal);
       if (serveChild) await stopServe(serveChild, signal, opts.serveStopGraceMs);
       removeHandlers();
       process.kill(process.pid, signal);
@@ -1867,20 +1884,45 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
       await tearingDown;
       throw new Error('mlx agent: signaled during startup');
     }
+    if (serveChild && (serveChild.exitCode != null || serveChild.signalCode != null)) {
+      const reason = serveChild.signalCode ? `signal ${serveChild.signalCode}` : `code ${serveChild.exitCode}`;
+      throw new Error(`mlx serve exited unexpectedly (${reason}) before starting agent`);
+    }
     const spawnAgent = opts.spawnAgent ?? ((b, a, so) => spawn(b, a, so));
     const spawnedAgent = spawnAgent(bin, opts.argv, { stdio: 'inherit', env: withLoopbackNoProxy(env) });
     agent = spawnedAgent;
-    code = await new Promise<number>((resolvePromise, reject) => {
-      spawnedAgent.once('exit', (c, signal) => resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1)));
-      // A spawn failure emits 'error' with no 'exit' — rejecting routes it
-      // through the same teardown so the serve child is never orphaned.
-      spawnedAgent.once('error', reject);
-    });
+    let agentSettled = false;
+    let serveCrashed = false;
+    const onServeExit = (exitCode: number | null, signal: NodeJS.Signals | null): void => {
+      if (tearingDown || agentSettled) return;
+      serveCrashed = true;
+      const reason = signal ? `signal ${signal}` : `code ${exitCode ?? 'unknown'}`;
+      console.error(`[mlx] inference server (mlx serve) exited unexpectedly (${reason}); stopping agent.`);
+      agentStopping = stopServe(spawnedAgent, 'SIGTERM', opts.serveStopGraceMs);
+    };
+    serveChild?.once('exit', onServeExit);
+    try {
+      code = await new Promise<number>((resolvePromise, reject) => {
+        spawnedAgent.once('exit', (c, signal) => {
+          agentSettled = true;
+          resolvePromise(c ?? (signal === 'SIGINT' ? 130 : 1));
+        });
+        // A spawn failure emits 'error' with no 'exit' — rejecting routes it
+        // through the same teardown so the serve child is never orphaned.
+        spawnedAgent.once('error', (err) => {
+          agentSettled = true;
+          reject(err);
+        });
+      });
+      if (serveCrashed && code === 0) code = 1;
+    } finally {
+      serveChild?.removeListener('exit', onServeExit);
+    }
   } finally {
     // A signal ends the launcher once serve is gone; returning or throwing
     // first would let the caller exit with serve still alive.
     if (tearingDown) await tearingDown;
-    else serveChild?.kill('SIGTERM');
+    else if (serveChild && serveChild.exitCode == null && serveChild.signalCode == null) serveChild.kill('SIGTERM');
     removeHandlers();
   }
   return code;

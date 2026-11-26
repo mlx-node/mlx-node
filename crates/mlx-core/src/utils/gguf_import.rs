@@ -22,7 +22,8 @@ use crate::utils::gguf::{
     GgufFile, GgufLoadOptions, GgufTensorInfo, GgufTensorType, convert_tensor_dtype,
     extract_clef_head_assets, fixup_gemma4_mmproj_layout, fixup_gemma4v_mmproj_layout,
     fixup_qwen35_linear_attn, fixup_qwen35_moe_shared_expert_gate, fixup_shapes,
-    gguf_name_to_hf_for_metadata, load_gguf_tensor, remap_keys,
+    gguf_name_to_hf_for_metadata, is_gather_only_mxfp8, is_inkling2_mmproj_gguf, load_gguf_tensor,
+    remap_keys,
 };
 use crate::utils::gguf_cpu_repack::{
     copy_dense_band_into, cpu_kquant_band_into, decode_affine_band_into,
@@ -194,9 +195,9 @@ fn dense_dtype(t: GgufTensorType) -> Option<DType> {
 
 fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> {
     let ty = t.tensor_type;
-    if ty == GgufTensorType::MXFP8 {
-        // Refused at planning: Route::Whole would allocate the whole payload
-        // (202 GB for the one real MXFP8 table) before load_gguf_tensor sees it.
+    if is_gather_only_mxfp8(t) {
+        // Refused at planning: DeepSeek-V4.1's 202 GB engram table is gather-only
+        // and must never be allocated or imported whole.
         return Err(Error::from_reason(format!(
             "MXFP8 tensor '{}' is gather-only and cannot be imported",
             t.name
@@ -244,6 +245,7 @@ fn route_for(t: &GgufTensorInfo, plan: &ImportPlan, gpu: bool) -> Result<Route> 
         | GgufTensorType::Q5_1
         | GgufTensorType::Q8_0
         | GgufTensorType::MXFP4
+        | GgufTensorType::MXFP8
         | GgufTensorType::NVFP4 => Route::CpuAffine,
         _ => match dense_dtype(ty) {
             Some(d) => Route::Dense(d),
@@ -630,7 +632,58 @@ fn alloc_dst(
                 ptrs,
             }
         }
-        Route::CpuAffine => alloc_dst(t, Route::CpuKQuant(OutLayout::RowMajor), probe, budget)?,
+        Route::CpuAffine => {
+            if t.tensor_type == GgufTensorType::MXFP8 {
+                let block = t.tensor_type.block_size();
+                let shape = t.mlx_shape();
+                let k = shape.last().copied().unwrap_or(0);
+                if k <= 0 || !(k as usize).is_multiple_of(block) {
+                    return Err(Error::from_reason(format!(
+                        "GGUF tensor '{}' has last dimension {k}; expected a positive multiple of {block}",
+                        t.name
+                    )));
+                }
+                let k = k as usize;
+                let rows = usize::try_from(t.num_elements()?).map_err(|_| {
+                    Error::from_reason(format!(
+                        "GGUF tensor '{}' element count exceeds usize",
+                        t.name
+                    ))
+                })? / k;
+                let blocks = k / block;
+                let mut w_shape = shape.clone();
+                if let Some(last) = w_shape.last_mut() {
+                    *last = (blocks * 8) as i64;
+                }
+                let mut s_shape = shape;
+                if let Some(last) = s_shape.last_mut() {
+                    *last = blocks as i64;
+                }
+                let (weight, weight_ptr, w_bytes) = MxArray::alloc_uninit(&w_shape, DType::Uint32)?;
+                let (scales, scales_ptr, s_bytes) = MxArray::alloc_uninit(&s_shape, DType::Uint8)?;
+                probe.alloc(w_bytes);
+                probe.alloc(s_bytes);
+                let dst = RepackDst {
+                    weight,
+                    scales: Some(scales),
+                    biases: None,
+                };
+                let ptrs = DstPtrs {
+                    weight: weight_ptr,
+                    scales: Some(scales_ptr),
+                    biases: None,
+                    rows,
+                    k,
+                    layout: OutLayout::RowMajor,
+                };
+                Dst::Repack {
+                    dst: Some(dst),
+                    ptrs,
+                }
+            } else {
+                alloc_dst(t, Route::CpuKQuant(OutLayout::RowMajor), probe, budget)?
+            }
+        }
         Route::Dense(dtype) => {
             let (array, ptr, bytes) = MxArray::alloc_uninit(&t.mlx_shape(), dtype)?;
             probe.alloc(bytes);
@@ -1451,10 +1504,20 @@ pub(crate) fn imported_dtypes(
 ) -> Vec<(String, DType)> {
     let mut out = Vec::new();
     for t in &header.tensors {
+        if is_gather_only_mxfp8(t) {
+            continue;
+        }
         let Some(key) = gguf_name_to_hf_for_metadata(&t.name, &header.metadata) else {
             continue;
         };
         let ty = t.tensor_type;
+        if !plan.role.is_primary()
+            && is_inkling2_mmproj_gguf(&header.metadata)
+            && ty == GgufTensorType::Q8_0
+        {
+            out.push((key, DType::BFloat16));
+            continue;
+        }
         let scales = if let Some(format) = ty.k_quant_format() {
             if !plan.import_k_quants {
                 continue;
@@ -1466,7 +1529,10 @@ pub(crate) fn imported_dtypes(
             }
         } else if ty.is_mlx_affine_quantized() {
             DType::Float16
-        } else if ty.is_mlx_mxfp4_quantized() || ty.is_mlx_nvfp4_quantized() {
+        } else if ty.is_mlx_mxfp4_quantized()
+            || ty.is_mlx_nvfp4_quantized()
+            || ty.is_mlx_mxfp8_quantized()
+        {
             DType::Uint8
         } else {
             if let Some(source) = dense_dtype(ty) {
@@ -1578,6 +1644,46 @@ fn transform_imported_part(
         .filter(|(_, a)| !is_available(a))
         .map(|(k, _)| k.clone())
         .collect();
+
+    // Inkling2 `mmproj-Q8_0.gguf`: dequantize packed Q8_0 `(Uint32 weight, Float16 scales)`
+    // pairs directly into dense BF16 on CPU using FP32 scales and exact `-128.0 * scales`
+    // symmetric biases (matching Splash `VisionPreparation.cpp:33-43`).
+    if !plan.role.is_primary() && is_inkling2_mmproj_gguf(&gguf.metadata) {
+        let q8_bases: Vec<String> = weights
+            .keys()
+            .filter_map(|k| k.strip_suffix(".scales").map(str::to_owned))
+            .filter(|base| {
+                !weights.contains_key(&format!("{base}.biases"))
+                    && weights
+                        .get(&format!("{base}.weight"))
+                        .and_then(|w| w.dtype().ok())
+                        == Some(DType::Uint32)
+                    && weights
+                        .get(&format!("{base}.scales"))
+                        .and_then(|s| s.dtype().ok())
+                        == Some(DType::Float16)
+            })
+            .collect();
+        for base in q8_bases {
+            let weight_key = format!("{base}.weight");
+            let scales_key = format!("{base}.scales");
+            let Some(w) = weights.remove(&weight_key) else {
+                continue;
+            };
+            let Some(scales) = weights.remove(&scales_key) else {
+                weights.insert(weight_key, w);
+                continue;
+            };
+            let scales_f32 = convert_tensor_dtype(scales, DType::Float32)?;
+            let biases_f32 = scales_f32.mul_scalar_cpu(-128.0)?;
+            let dequant =
+                MxArray::dequantize_cpu(&w, &scales_f32, Some(&biases_f32), 32, 8, "affine")?;
+            let bf16 = convert_tensor_dtype(dequant, DType::BFloat16)?;
+            views.remove(&weight_key);
+            views.remove(&scales_key);
+            weights.insert(weight_key, bf16);
+        }
+    }
 
     if let Some(target_dtype) = opts.dtype.filter(|_| !plan.prism) {
         tracing::info!("Converting to {target_dtype:?}...");
@@ -1828,15 +1934,28 @@ impl GgufPreload {
         let mode = PageCacheMode::from_env()?;
         let (main_header, main_plan) = (&input.main.header, &input.main.plan);
         let companion = input.companion.as_ref().filter(|_| input.load_companion);
-        let set = GgufSourceSet::open(
-            &input
-                .main
-                .parts
-                .iter()
-                .map(|(path, header, identity)| (path.as_path(), header.clone(), identity))
-                .collect::<Vec<_>>(),
+        let companion_is_inkling2_mmproj = companion
+            .as_ref()
+            .is_some_and(|(_, header, _, _)| is_inkling2_mmproj_gguf(&header.metadata));
+        let main_parts_ref: Vec<_> = input
+            .main
+            .parts
+            .iter()
+            .map(|(path, header, identity)| (path.as_path(), header.clone(), identity))
+            .collect();
+        let mut set = match GgufSourceSet::open(
+            &main_parts_ref,
             companion.map(|(path, header, identity, _)| (path.as_path(), header.clone(), identity)),
-        )?;
+        ) {
+            Ok(set) => set,
+            Err(err) if companion_is_inkling2_mmproj => {
+                tracing::warn!(
+                    "Inkling2: failed to open vision projector companion ({err}); continuing in text-only mode"
+                );
+                GgufSourceSet::open(&main_parts_ref, None)?
+            }
+            Err(err) => return Err(err),
+        };
         let mode = split_page_cache_mode(mode, &set.main, physical_memory());
 
         let main_probe = ImportProbe {
@@ -1977,22 +2096,58 @@ impl GgufPreload {
         };
 
         let mut companion_map = HashMap::new();
+        let mut drop_inkling2_companion = false;
         if let (Some(handle), Some((_, header, _, plan))) = (&set.companion, companion) {
-            let raw = read_gguf_tensors_consuming(
-                &handle.file,
-                handle,
-                plan,
-                backend,
-                mode,
-                &ReadConfig::default(),
-                &ImportProbe::default(),
-                None,
-                &budget,
-            )?;
-            add_stats(&mut stats, &raw.stats);
-            let imported = transform_imported(raw.map, header, plan, &input.opts)?;
-            companion_map = imported.weights;
-            materialize(&mut companion_map, &imported.views, &budget)?;
+            if is_inkling2_mmproj_gguf(&header.metadata) {
+                let companion_res = (|| -> Result<(HashMap<String, MxArray>, LoadStats)> {
+                    let raw = read_gguf_tensors_consuming(
+                        &handle.file,
+                        handle,
+                        plan,
+                        backend,
+                        mode,
+                        &ReadConfig::default(),
+                        &ImportProbe::default(),
+                        None,
+                        &budget,
+                    )?;
+                    let imported = transform_imported(raw.map, header, plan, &input.opts)?;
+                    let mut map = imported.weights;
+                    materialize(&mut map, &imported.views, &budget)?;
+                    Ok((map, raw.stats))
+                })();
+                match companion_res {
+                    Ok((map, comp_stats)) => {
+                        add_stats(&mut stats, &comp_stats);
+                        companion_map = map;
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            "Inkling2: failed to preload vision projector companion ({err}); continuing in text-only mode"
+                        );
+                        drop_inkling2_companion = true;
+                    }
+                }
+            } else {
+                let raw = read_gguf_tensors_consuming(
+                    &handle.file,
+                    handle,
+                    plan,
+                    backend,
+                    mode,
+                    &ReadConfig::default(),
+                    &ImportProbe::default(),
+                    None,
+                    &budget,
+                )?;
+                add_stats(&mut stats, &raw.stats);
+                let imported = transform_imported(raw.map, header, plan, &input.opts)?;
+                companion_map = imported.weights;
+                materialize(&mut companion_map, &imported.views, &budget)?;
+            }
+        }
+        if drop_inkling2_companion {
+            set.companion = None;
         }
 
         set.recheck()?;
@@ -2266,6 +2421,186 @@ mod tests {
     }
 
     #[test]
+    fn inkling2_mmproj_q8_0_dequantizes_to_bf16_and_preserves_f32_tensors() {
+        use crate::utils::gguf_plan::plan_gguf_import;
+
+        // Build a deterministic Q8_0 block payload (2 rows x 64 cols = 4 blocks of 32).
+        // Each Q8_0 block = 2-byte f16 scale + 32 signed i8 quants.
+        let mut q8_bytes = Vec::new();
+        let mut expected_f32 = Vec::new();
+        let block_scales_f16: [u16; 4] = [
+            0x3C00, // 1.0
+            0x3800, // 0.5
+            0x3400, // 0.25
+            0x3E00, // 1.5
+        ];
+        let block_scales_f32: [f32; 4] = [1.0, 0.5, 0.25, 1.5];
+        for b in 0..4usize {
+            q8_bytes.extend_from_slice(&block_scales_f16[b].to_le_bytes());
+            for j in 0..32i32 {
+                let q = ((j * 7 + (b as i32) * 13) % 255 - 127) as i8;
+                q8_bytes.push(q as u8);
+                expected_f32.push(block_scales_f32[b] * f32::from(q));
+            }
+        }
+
+        // Write a synthetic Inkling2 mmproj-Q8_0.gguf with:
+        // - F32 `v.patch_embd.weight` [2, 2, 3, 4]
+        // - F32 1D `v.pre_ln.weight` [4]
+        // - F32 `v.position_embd.weight` [4, 4]
+        // - Q8_0 2D `v.blk.0.attn_q.weight` [cols=64, rows=2]
+        let meta = [
+            ("general.architecture", "clip"),
+            ("clip.vision.projector_type", "inkling2v"),
+        ];
+        let f32_patch: Vec<u8> = (0..(2 * 2 * 3 * 4))
+            .flat_map(|i| ((i as f32) * 0.125 - 1.0).to_le_bytes())
+            .collect();
+        let f32_ln: Vec<u8> = [1.000123_f32, 0.999877, 1.123456, 0.876544]
+            .into_iter()
+            .flat_map(f32::to_le_bytes)
+            .collect();
+        let f32_pos: Vec<u8> = (0..16)
+            .flat_map(|i| ((i as f32) * 0.03125 + 0.0001).to_le_bytes())
+            .collect();
+
+        let tensors: Vec<(&str, Vec<u64>, GgufTensorType, &[u8])> = vec![
+            ("v.patch_embd.weight", vec![2, 2, 3, 4], F32, &f32_patch),
+            ("v.pre_ln.weight", vec![4], F32, &f32_ln),
+            ("v.position_embd.weight", vec![4, 4], F32, &f32_pos),
+            ("v.blk.0.attn_q.weight", vec![64, 2], Q8_0, &q8_bytes),
+        ];
+
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&GGUF_MAGIC.to_le_bytes());
+        buf.extend_from_slice(&GGUF_VERSION_3.to_le_bytes());
+        buf.extend_from_slice(&(tensors.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(meta.len() as u64).to_le_bytes());
+        for (k, s) in meta {
+            buf.extend_from_slice(&(k.len() as u64).to_le_bytes());
+            buf.extend_from_slice(k.as_bytes());
+            buf.extend_from_slice(&(GgufValueType::String as u32).to_le_bytes());
+            buf.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            buf.extend_from_slice(s.as_bytes());
+        }
+        let mut offsets = Vec::new();
+        let mut at = 0u64;
+        for (_, _, _, data) in &tensors {
+            at = at.next_multiple_of(32);
+            offsets.push(at);
+            at += data.len() as u64;
+        }
+        for ((name, dims, ty, _), off) in tensors.iter().zip(&offsets) {
+            buf.extend_from_slice(&(name.len() as u64).to_le_bytes());
+            buf.extend_from_slice(name.as_bytes());
+            buf.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                buf.extend_from_slice(&d.to_le_bytes());
+            }
+            buf.extend_from_slice(&(*ty as u32).to_le_bytes());
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        buf.resize((buf.len() as u64).next_multiple_of(32) as usize, 0);
+        let start = buf.len();
+        for ((_, _, _, data), off) in tensors.iter().zip(&offsets) {
+            buf.resize(start + *off as usize, 0);
+            buf.extend_from_slice(data);
+        }
+
+        let fix = open_fixture("inkling2-mmproj-q8", &buf);
+        let opts = ImportOptions {
+            dtype: Some(DType::BFloat16),
+            import_k_quants: true,
+            ..Default::default()
+        };
+        let comp_plan = plan_gguf_import(
+            &fix.handle.header,
+            &fix.path,
+            &opts,
+            OutputRole::Companion {
+                filename: "vision.safetensors".to_string(),
+            },
+        )
+        .expect("plan mmproj-Q8_0 companion");
+
+        // Verify imported_dtypes reports BF16 for Q8_0 and Float32 for F32 tensors.
+        let dtypes_map: HashMap<String, DType> =
+            imported_dtypes(&fix.handle.header, &comp_plan, &opts)
+                .into_iter()
+                .collect();
+        assert_eq!(
+            dtypes_map.get("vision_tower.blocks.0.attn.q_proj.weight"),
+            Some(&DType::BFloat16)
+        );
+        assert!(
+            !dtypes_map.contains_key("vision_tower.blocks.0.attn.q_proj.scales"),
+            "Q8_0 mmproj tensor must not emit .scales"
+        );
+        assert_eq!(
+            dtypes_map.get("vision_tower.pre_ln.weight"),
+            Some(&DType::Float32)
+        );
+
+        let budget = CudaDeviceBudget::for_current_device();
+        let raw = read_gguf_tensors_consuming(
+            &fix.handle.file,
+            &fix.handle,
+            &comp_plan,
+            RepackBackend::CpuOnly,
+            PageCacheMode::Off,
+            &ReadConfig::default(),
+            &ImportProbe::default(),
+            None,
+            &budget,
+        )
+        .expect("read mmproj-Q8_0");
+        let mut imported =
+            transform_imported(raw.map, &fix.handle.header, &comp_plan, &opts).expect("transform");
+        materialize(&mut imported.weights, &imported.views, &budget).expect("materialize");
+
+        // F32 tensors keep full Float32 precision (not truncated to BF16).
+        for key in [
+            "vision_tower.patch_embed.weight",
+            "vision_tower.pre_ln.weight",
+            "vision_tower.position_embedding.weight",
+        ] {
+            assert_eq!(
+                imported.weights[key].dtype().unwrap(),
+                DType::Float32,
+                "{key} must stay Float32"
+            );
+        }
+        let ln_vals = imported.weights["vision_tower.pre_ln.weight"]
+            .to_float32()
+            .unwrap();
+        assert!((ln_vals[0] - 1.000123_f32).abs() < 1e-6);
+
+        // Q8_0 tensor is dequantized to dense BF16 with no `.scales` or `.biases` left behind.
+        assert!(
+            !imported
+                .weights
+                .contains_key("vision_tower.blocks.0.attn.q_proj.scales")
+        );
+        assert!(
+            !imported
+                .weights
+                .contains_key("vision_tower.blocks.0.attn.q_proj.biases")
+        );
+        let q_arr = &imported.weights["vision_tower.blocks.0.attn.q_proj.weight"];
+        assert_eq!(q_arr.dtype().unwrap(), DType::BFloat16);
+        assert_eq!(q_arr.shape().unwrap().as_ref(), &[2, 64]);
+        let got_f32 = q_arr.astype(DType::Float32).unwrap().to_float32().unwrap();
+        for (idx, (&got, &want)) in got_f32.iter().zip(&expected_f32).enumerate() {
+            // BF16 has 7 mantissa bits (~0.4% relative precision).
+            let tol = want.abs() * 0.01 + 1e-4;
+            assert!(
+                (got - want).abs() <= tol,
+                "Q8_0 dequant mismatch at {idx}: got {got}, want {want} (tol {tol})"
+            );
+        }
+    }
+
+    #[test]
     fn mxfp8_refused_at_route_planning() {
         let t = GgufTensorInfo {
             name: "per_layer_token_embd.weight".into(),
@@ -2278,6 +2613,78 @@ mod tests {
             let err = route_for(&t, &plan(&[]), gpu).err().unwrap();
             assert!(err.reason.contains("gather-only"), "{err}");
         }
+    }
+
+    #[test]
+    fn mxfp8_non_engram_routes_to_cpu_affine_and_imports_bit_exact() {
+        let name = "blk.20.ffn_down_exps.weight";
+        let dims = vec![64u64, 32, 2]; // 3D [E=2, N=32, K=64]
+        let info = GgufTensorInfo {
+            name: name.into(),
+            n_dims: 3,
+            dims: dims.clone(),
+            tensor_type: MXFP8,
+            offset: 0,
+        };
+        assert!(matches!(
+            route_for(&info, &plan(&[]), false).unwrap(),
+            Route::CpuAffine
+        ));
+        assert!(matches!(
+            route_for(&info, &plan(&[]), true).unwrap(),
+            Route::CpuAffine
+        ));
+
+        let gguf_bytes = build_gguf(&[], &[(name, dims.clone(), MXFP8)], 32, 42);
+        let fix = open_fixture("mxfp8-import", &gguf_bytes);
+        let p = plan(&[]);
+        let dtypes = imported_dtypes(&fix.handle.header, &p, &ImportOptions::default());
+        assert!(
+            dtypes
+                .iter()
+                .any(|(k, d)| k.ends_with(".scales") && *d == DType::Uint8)
+        );
+        assert!(
+            dtypes
+                .iter()
+                .any(|(k, d)| k.ends_with(".weight") && *d == DType::Uint32)
+        );
+
+        let t_hdr = &fix.handle.header.tensors[0];
+        let start = (fix.handle.header.data_offset + t_hdr.offset) as usize;
+        let len = t_hdr.data_size().unwrap() as usize;
+        let tensor_raw = &gguf_bytes[start..start + len];
+        let probe = ImportProbe::default();
+        let budget = CudaDeviceBudget::for_current_device();
+        let mut dst = alloc_dst(t_hdr, Route::CpuAffine, &probe, &budget).unwrap();
+        if let Dst::Repack { ptrs, .. } = &mut dst {
+            decode_affine_band_into(MXFP8, tensor_raw, 0, 64, 64, ptrs).unwrap();
+        } else {
+            panic!("expected Dst::Repack for MXFP8");
+        }
+        let mut map = HashMap::new();
+        let mut ple = None;
+        collect_tensor(t_hdr, dst, &mut map, &mut ple).unwrap();
+
+        let ref_loaded: HashMap<String, MxArray> = load_gguf_tensor(
+            &mut std::io::Cursor::new(&gguf_bytes),
+            &fix.handle.header,
+            t_hdr,
+            GgufLoadOptions::default(),
+        )
+        .unwrap()
+        .into_iter()
+        .collect();
+        assert_eq!(
+            map[name].to_uint32().unwrap().to_vec(),
+            ref_loaded[name].to_uint32().unwrap().to_vec()
+        );
+        assert_eq!(
+            map["blk.20.ffn_down_exps.scales"].to_uint8().unwrap(),
+            ref_loaded["blk.20.ffn_down_exps.scales"]
+                .to_uint8()
+                .unwrap()
+        );
     }
 
     fn small_slots(slots: usize) -> ReadConfig {

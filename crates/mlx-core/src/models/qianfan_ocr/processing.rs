@@ -185,10 +185,7 @@ impl QianfanImageProcessor {
     /// for MLX's vision encoder).
     fn process(&self, image_bytes: &[u8]) -> Result<ProcessedImage> {
         let img = image::load_from_memory(image_bytes).map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to decode image: {e}"),
-            )
+            crate::vision::validate::image_processing_error(format!("Failed to decode image: {e}"))
         })?;
 
         let tiles = if self.dynamic_image_size {

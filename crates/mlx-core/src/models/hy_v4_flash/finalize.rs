@@ -66,6 +66,21 @@ impl Hy4Tags {
         Self::from_vocab(|id| tok.id_to_token(id))
     }
 
+    #[cfg(test)]
+    pub(crate) fn for_test() -> Self {
+        let pair = |name: &str| Pair {
+            open: format!("<{name}:test>"),
+            close: format!("</{name}:test>"),
+        };
+        Self {
+            think: pair("think"),
+            tool_calls: pair("tool_calls"),
+            tool_call: pair("tool_call"),
+            arg_key: pair("arg_key"),
+            arg_value: pair("arg_value"),
+        }
+    }
+
     /// Every tag must be `<name:X>` / `</name:X>` at its id, with the suffix
     /// `:X` of `<think:X>` (no `<` or `>` in it).
     fn from_vocab(token: impl Fn(u32) -> Option<String>) -> Result<Self> {

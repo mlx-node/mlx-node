@@ -9,6 +9,7 @@ import {
   familyTraitsFor,
   NON_GENERATIVE_FAMILY_IDS,
   familyDataFor,
+  reasoningEffortsFor,
   type FamilyTraits,
   type LaunchPreset,
   type ModelType,
@@ -17,8 +18,10 @@ import { isBonsaiPq2GgufName, isGgufCompanionName, isQwen35XlGgufName, parseGguf
 import {
   detectModelType,
   ggufArchitectureModelType,
-  readGgufArchitecture,
+  readDirectoryChatTemplate,
+  readGgufDiscoveryMetadata,
   readModelConfig,
+  type GgufDiscoveryMetadata,
 } from './model-detection.js';
 import {
   folderVariant,
@@ -104,6 +107,14 @@ export function bareGgufFamily(name: string, architecture: string): ModelType | 
   const modelType = ggufArchitectureModelType(architecture);
   if (modelType === undefined || familyDataFor(modelType)?.ggufDiscovery?.requiresAssets) return undefined;
   return supportedGgufName(name, modelType) ? modelType : undefined;
+}
+
+async function hasRegularFile(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isFile();
+  } catch {
+    return false;
+  }
 }
 
 async function hasGgufAssets(modelDir: string, onIoFailure?: (error: unknown) => void): Promise<boolean> {
@@ -347,6 +358,7 @@ export async function discoverLocalChatModels(
     format: ModelFormat,
     splitFileId: string | undefined,
     naming: (config: unknown, id: string) => ModelVariantName,
+    ggufMetadata?: Pick<GgufDiscoveryMetadata, 'chatTemplate' | 'hasEmbeddedGpt2Tokenizer'>,
   ): Promise<void> => {
     const decision = familyDataFor(modelType)?.kind === 'decision' && opts?.includeDecisions === true;
     if (NON_GENERATIVE_FAMILY_IDS.has(modelType) && !decision) return;
@@ -360,12 +372,35 @@ export async function discoverLocalChatModels(
       if (debug) console.warn(`[mlx] skip ${path}: no launch preset for ${modelType}`);
       return;
     }
-    const traits = decision
+    const baseTraits = decision
       ? { reasoning: false, fallbackContextWindow: decisionContextCap }
       : familyTraitsFor(modelType);
-    if (!traits) {
+    if (!baseTraits) {
       if (debug) console.warn(`[mlx] skip ${path}: no FAMILY_TRAITS entry for ${modelType}`);
       return;
+    }
+
+    // Qwen3.5/3.6 and Qwen3.8 share `qwen3_5` (and potentially `qwen3_5_moe`).
+    // Mirror native GGUF preparation (`gguf_plan.rs` + `write_embedded_gpt2_tokenizer`):
+    // native only materializes the GGUF's embedded `tokenizer.chat_template` when
+    // `tokenizer.json` is absent and embedded GPT-2 tokenizer metadata is present
+    // (overwriting any sidecar template). When `tokenizer.json` exists or embedded
+    // reconstruction cannot run, native never extracts the GGUF template and only
+    // reads directory sidecars.
+    let traits = baseTraits;
+    if (!decision && (modelType === 'qwen3_5' || modelType === 'qwen3_5_moe')) {
+      const ggufMaterializesTemplate =
+        format === 'gguf' &&
+        ggufMetadata?.hasEmbeddedGpt2Tokenizer === true &&
+        ggufMetadata.chatTemplate !== undefined &&
+        !(await hasRegularFile(join(metadataRoot, 'tokenizer.json')));
+      const chatTemplate = ggufMaterializesTemplate
+        ? ggufMetadata.chatTemplate
+        : await readDirectoryChatTemplate(metadataRoot);
+      const resolvedEfforts = reasoningEffortsFor(modelType, { chatTemplate });
+      if (resolvedEfforts !== baseTraits.reasoningEfforts) {
+        traits = { ...baseTraits, reasoningEfforts: resolvedEfforts };
+      }
     }
 
     const metadata = await readDiscoveryMetadata(metadataRoot, modelType, traits.fallbackContextWindow);
@@ -437,7 +472,8 @@ export async function discoverLocalChatModels(
       const family = familyDataFor(ggufPolicyModelType);
       if (!supportedGgufName(name, ggufPolicyModelType)) return;
       // A sibling config must agree with the target header, never a projector.
-      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(canonical))) return;
+      const ggufMetadata = await readGgufDiscoveryMetadata(canonical);
+      if (!family?.ggufArchitectures?.includes(ggufMetadata.architecture)) return;
       if (
         family.ggufDiscovery?.requiresAssets &&
         !(await hasGgufAssets(assetsRoot, (error) => reportFailure(error, path)))
@@ -448,8 +484,16 @@ export async function discoverLocalChatModels(
       }
       const names = ggufNames(name, repoFolder, variantFolder);
       const splitFileId = names.split ? name.slice(0, -'.gguf'.length) : undefined;
-      await append(names.id, path, assetsRoot, modelType, scopeName, 'gguf', splitFileId, (_config, id) =>
-        ggufVariant(names.stem, repoFolder, variantFolder, id),
+      await append(
+        names.id,
+        path,
+        assetsRoot,
+        modelType,
+        scopeName,
+        'gguf',
+        splitFileId,
+        (_config, id) => ggufVariant(names.stem, repoFolder, variantFolder, id),
+        ggufMetadata,
       );
     } catch (err) {
       reportFailure(err, path);

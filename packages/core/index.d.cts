@@ -827,6 +827,11 @@ export declare class Inkling2Model {
   modelAssetsPath(): string;
   /** Active persistent StateDisk namespace directory name, or `null` for temp/off/closed caches. */
   stateTierNamespace(): string | null;
+  /**
+   * The stored states' SSD cache mode: `'persistent'` or `'temp'` while open,
+   * `'off'` without one, after `closeCache`, or after a non-space write error.
+   */
+  stateTierMode(): 'persistent' | 'temp' | 'off';
   /** Whether weights are initialized (always `true` for instances returned by `Inkling2Model.load`). */
   get isInitialized(): boolean;
   /** Whether the block-paged hybrid KV cache coordinator is active on this instance. */
@@ -4019,6 +4024,17 @@ export declare function createRandomQwen35MoeCheckpoint(config: Qwen35MoeConfig,
  * NAPI model instance alive.
  */
 export declare function createRandomQwen3Checkpoint(config: Qwen3Config, savePath: string): Promise<undefined>;
+
+/**
+ * Strictly decode base64 using SIMD acceleration into a plain, tightly sized
+ * `Uint8Array` (exported to JS as `decodeBase64Strict`).
+ *
+ * Accepts ASCII whitespace (space, tab, LF, CR), unpadded or properly padded
+ * standard base64, and URL-safe base64. Rejects empty input, form feed (0x0c),
+ * vertical tab (0x0b), mixed alphabets, malformed padding, invalid characters,
+ * and non-canonical trailing bits per RFC 4648 §3.5.
+ */
+export declare function decodeBase64Strict(encoded: string, errorMessage?: string | undefined | null): Uint8Array;
 
 export interface DecodeBatchOccupancyBucket {
   occupancy: number;
@@ -7387,6 +7403,18 @@ export interface UnwarpResult {
   /** Unwarped image as PNG bytes */
   image: Buffer;
 }
+
+/**
+ * Validate raw encoded image bytes before starting inference or committing SSE
+ * headers (exported to JS as `validateImageBytes`).
+ */
+export declare function validateImageBytes(data: Uint8Array): void;
+
+/**
+ * Validate raw encoded image bytes on libuv's worker thread pool without
+ * blocking the JS event loop (exported to JS as `validateImageBytesAsync`).
+ */
+export declare function validateImageBytesAsync(data: Uint8Array): Promise<void>;
 
 /** Vision encoder configuration */
 export interface VisionConfig {

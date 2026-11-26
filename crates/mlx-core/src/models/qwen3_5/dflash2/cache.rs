@@ -313,6 +313,13 @@ impl DraftKvWindow {
         let (Some(buffer_keys), Some(buffer_values)) = (&self.keys, &self.values) else {
             return Err(Error::from_reason("DFlash2 draft window has no buffers"));
         };
+        let k_cap = buffer_keys.shape_at(2)?;
+        let v_cap = buffer_values.shape_at(2)?;
+        if offset < 0 || rows < 0 || offset + rows > k_cap || offset + rows > v_cap {
+            return Err(Error::from_reason(format!(
+                "DFlash2 draft window store_rows out of bounds: offset={offset}, rows={rows}, k_cap={k_cap}, v_cap={v_cap}"
+            )));
+        }
         if let Some((new_k, new_v)) = crate::kernels::kv::store_kv_pair(
             buffer_keys,
             buffer_values,
@@ -324,11 +331,21 @@ impl DraftKvWindow {
             self.values = Some(new_v);
             return Ok(());
         }
-        let (Some(buffer_keys), Some(buffer_values)) = (&mut self.keys, &mut self.values) else {
-            return Err(Error::from_reason("DFlash2 draft window has no buffers"));
-        };
-        buffer_keys.slice_assign_axis_inplace(2, offset, offset + rows, keys)?;
-        buffer_values.slice_assign_axis_inplace(2, offset, offset + rows, values)?;
+        // Clone the C++ `mlx::core::array` handle before `slice_assign_axis_inplace`
+        // overwrites its descriptor so any saved `pre_propose_handles` clone of the
+        // old `Arc<MxHandle>` stays untouched on non-Metal (CUDA/CPU) backends too.
+        let mut next_k = MxArray::from_handle(
+            unsafe { mlx_sys::mlx_array_clone_handle(buffer_keys.as_raw_ptr()) },
+            "dflash2_store_rows_clone_k",
+        )?;
+        let mut next_v = MxArray::from_handle(
+            unsafe { mlx_sys::mlx_array_clone_handle(buffer_values.as_raw_ptr()) },
+            "dflash2_store_rows_clone_v",
+        )?;
+        next_k.slice_assign_axis_inplace(2, offset, offset + rows, keys)?;
+        next_v.slice_assign_axis_inplace(2, offset, offset + rows, values)?;
+        self.keys = Some(next_k);
+        self.values = Some(next_v);
         Ok(())
     }
 
@@ -369,6 +386,11 @@ pub(crate) struct DFlash2ContextCache {
     /// model's spanned draft vocabulary (e.g. Qwen3.8 `[0, 98_304) U [248_032, 248_320)`
     /// or Inkling-2-Mini `[0, low_end) U [199_936, 200_058)`).
     wide_vocab: bool,
+    /// Saved per-layer `(keys, values)` ring handles captured before a batched
+    /// `propose_with_batched` call mutates `DraftKvWindow` in place via
+    /// `with_block`. Restoring them drops any lazy `KvStoreRows` handles whose
+    /// inputs depend on a failed shared batched forward graph before solo retry.
+    pub(super) pre_propose_handles: Option<Vec<(Option<MxArray>, Option<MxArray>)>>,
 }
 
 impl DFlash2ContextCache {
@@ -385,7 +407,30 @@ impl DFlash2ContextCache {
             token_history: Vec::new(),
             vocab_size: config.vocab_size,
             wide_vocab: false,
+            pre_propose_handles: None,
         }
+    }
+
+    pub(crate) fn save_pre_propose_handles(&mut self) {
+        self.pre_propose_handles = Some(
+            self.layers
+                .iter()
+                .map(|window| (window.keys.clone(), window.values.clone()))
+                .collect(),
+        );
+    }
+
+    pub(crate) fn restore_pre_propose_handles(&mut self) {
+        if let Some(saved) = self.pre_propose_handles.take() {
+            for (window, (keys, values)) in self.layers.iter_mut().zip(saved) {
+                window.keys = keys;
+                window.values = values;
+            }
+        }
+    }
+
+    pub(crate) fn clear_pre_propose_handles(&mut self) {
+        self.pre_propose_handles = None;
     }
 
     pub(crate) fn observe_token(&mut self, token: u32) {
@@ -487,6 +532,79 @@ impl DFlash2ContextCache {
         self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
         self.observe_tokens(token_ids);
+        self.pre_propose_handles = None;
+        Ok(())
+    }
+
+    /// Batched counterpart to [`Self::append`]: validates every lane's cursor,
+    /// provenance, and layer count BEFORE mutating any ring, projects all lanes'
+    /// concatenated `fused_all` (`[1, sum(token_ids_i.len()), H]`) in one batched
+    /// K/V pass, and appends each lane's slice into its own sliding window.
+    pub(crate) fn append_batched(
+        model: &DFlash2Model,
+        fused_all: &MxArray,
+        lanes: &mut [(&mut DFlash2ContextCache, &[u32])],
+    ) -> Result<()> {
+        if lanes.is_empty() {
+            return Ok(());
+        }
+        let mut segments = Vec::with_capacity(lanes.len());
+        let mut total_rows = 0usize;
+        for (cache, token_ids) in lanes.iter() {
+            let keep = token_ids.len();
+            if keep == 0 {
+                return Err(Error::from_reason(
+                    "DFlash2ContextCache::append_batched requires non-empty token_ids per lane",
+                ));
+            }
+            if usize::try_from(cache.logical_len).ok() != Some(cache.token_history.len()) {
+                return Err(Error::from_reason(format!(
+                    "DFlash2 context provenance length {} does not match logical length {}",
+                    cache.token_history.len(),
+                    cache.logical_len
+                )));
+            }
+            if cache.layers.len() != model.layers.len() {
+                return Err(Error::from_reason(format!(
+                    "DFlash2 context layer count {} != model layers {}",
+                    cache.layers.len(),
+                    model.layers.len()
+                )));
+            }
+            let keep_i32 = i32::try_from(keep).map_err(|_| {
+                Error::from_reason(format!(
+                    "DFlash2 context append row count {keep} exceeds i32"
+                ))
+            })?;
+            cache
+                .logical_len
+                .checked_add(keep_i32)
+                .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
+            segments.push((cache.logical_len, keep));
+            total_rows = total_rows
+                .checked_add(keep)
+                .ok_or_else(|| Error::from_reason("DFlash2 batched append total rows overflow"))?;
+        }
+        if fused_all.shape_at(0)? != 1 || fused_all.shape_at(1)? as usize != total_rows {
+            return Err(Error::from_reason(format!(
+                "DFlash2ContextCache::append_batched fused_all shape {:?} does not match [1, {total_rows}, _]",
+                fused_all.shape()?.as_ref()
+            )));
+        }
+
+        let per_lane_kv = model.project_context_batched(fused_all, &segments)?;
+        for (((cache, token_ids), &(base, keep)), kv) in
+            lanes.iter_mut().zip(segments.iter()).zip(per_lane_kv)
+        {
+            cache.append_projected(
+                ProjectedContext {
+                    base,
+                    rows: keep as i64,
+                    kv,
+                },
+                token_ids,
+            )?;
+        }
         Ok(())
     }
 
@@ -542,6 +660,7 @@ impl DFlash2ContextCache {
         self.kv_end = next;
         self.token_history.extend_from_slice(token_ids);
         self.observe_tokens(token_ids);
+        self.pre_propose_handles = None;
         Ok(())
     }
 
@@ -561,6 +680,7 @@ impl DFlash2ContextCache {
             .ok_or_else(|| Error::from_reason("DFlash2 context length overflow"))?;
         self.token_history.extend_from_slice(token_ids);
         self.observe_tokens(token_ids);
+        self.pre_propose_handles = None;
         Ok(())
     }
 
@@ -590,6 +710,7 @@ impl DFlash2ContextCache {
         self.kv_end = 0;
         self.token_history.clear();
         self.wide_vocab = false;
+        self.pre_propose_handles = None;
     }
 
     #[cfg(test)]
@@ -648,6 +769,7 @@ impl DFlash2ContextCache {
             ring.append_projected(projected, &lineage[first as usize..])?;
             ring.eval()?;
         }
+        ring.clear_pre_propose_handles();
         Ok(ring)
     }
 }

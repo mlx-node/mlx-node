@@ -1,11 +1,16 @@
 //! One packed verifier wave, followed by independent owner commits and emission.
 use super::*;
-use engine::backend::DsparkProposal;
+#[cfg(test)]
+use engine::backend::ThinkingSetup;
+use engine::backend::{DsparkProposal, ThinkEndResolution};
 use engine::dspark_timeline::{self as timeline, Mark};
 use engine::dspark_turn::{
     CycleStop, SampledRows, accept_dspark_proposal, clamp_dspark_cycle, submit_sampled_rows,
+    thinking_budget_wave_limit,
 };
 use engine::penalties::ThinkingCut;
+#[cfg(test)]
+use engine::penalties::{ReasoningClose, ReasoningTracker};
 use engine::scheduler::SpeculativeRowResult;
 
 struct VerifyWork {
@@ -15,6 +20,45 @@ struct VerifyWork {
     cap: usize,
     proposal: DsparkProposal,
     cut: Option<ThinkingCut>,
+    think_close: ThinkEndResolution,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_THINK_END_OVERRIDE: std::cell::RefCell<Option<ThinkEndResolution>> =
+        const { std::cell::RefCell::new(None) };
+    static TEST_DRAFT_OVERRIDE: std::cell::RefCell<
+        Option<Box<dyn FnMut(u32, u32, usize) -> Option<Vec<i32>>>>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_POST_BATCH_PROPOSAL_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(&[u32], &mut [Result<DsparkProposal>])>>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_SOLO_PROPOSAL_HOOK: std::cell::RefCell<
+        Option<Box<dyn FnMut(u32, Result<DsparkProposal>) -> Result<DsparkProposal>>>,
+    > = const { std::cell::RefCell::new(None) };
+    static TEST_DRAFT_EVAL_OVERRIDE: std::cell::RefCell<
+        Option<Box<dyn FnMut(&[&MxArray], &'static str) -> Option<Result<()>>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+fn collect_proposal_device_arrays<'a>(prop: &'a DsparkProposal, out: &mut Vec<&'a MxArray>) {
+    if let Some(ref ids) = prop.device_draft_ids {
+        out.push(ids);
+    }
+    if let Some(ref sparse) = prop.device_draft_sparse {
+        out.push(&sparse.ids);
+        out.push(&sparse.probs);
+    }
+}
+
+fn eval_scheduled_draft_arrays(arrays: &[&MxArray], context: &'static str) -> Result<()> {
+    #[cfg(test)]
+    if let Some(override_res) = TEST_DRAFT_EVAL_OVERRIDE
+        .with(|slot| slot.borrow_mut().as_mut().and_then(|f| f(arrays, context)))
+    {
+        return override_res;
+    }
+    MxArray::eval_arrays_with_context(arrays, context)
 }
 
 fn empty_proposal() -> DsparkProposal {
@@ -77,7 +121,6 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
     ) -> Result<(Vec<(usize, RowStepResult)>, usize, usize)> {
         let mut results = Vec::new();
         let mut work = Vec::new();
-        let mut verify_rows = Vec::new();
         for (plan_index, row) in plan
             .rows
             .iter()
@@ -194,6 +237,22 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
             cap = cap.min(remaining.saturating_sub(1));
             // A thinking cut is a row of this verify: the row keeps its cap.
             let cut = turn.payload.reasoning_tracker.thinking_cut();
+            let think_close = {
+                #[cfg(test)]
+                {
+                    TEST_THINK_END_OVERRIDE
+                        .with(|c| c.borrow().clone())
+                        .unwrap_or_else(|| {
+                            self.inner
+                                .think_end_for_turn(&turn.payload.config, &turn.payload.tokenizer)
+                        })
+                }
+                #[cfg(not(test))]
+                {
+                    self.inner
+                        .think_end_for_turn(&turn.payload.config, &turn.payload.tokenizer)
+                }
+            };
             // Reserve before proposal construction. On pressure retry only the
             // known anchor; the scheduler can preempt if even that cannot fit.
             let reserve = self
@@ -227,6 +286,7 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 cap,
                 proposal: empty_proposal(),
                 cut,
+                think_close,
             });
         }
         if work.is_empty() {
@@ -335,37 +395,94 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 self.inner.propose_scheduled_batch(&mut batch_reqs)
             };
             let mut batch_iter = batch_out.into_iter();
-            for wi in eligible_work_indices {
+            for &wi in &eligible_work_indices {
                 timeline::lane_mark(plan.rows[work[wi].plan_index].seq_id, Mark::DraftSubmit);
                 proposals[wi] = batch_iter.next().unwrap_or_else(|| {
                     Err(Error::from_reason("scheduled proposal width mismatch"))
                 });
             }
         }
-        let mut proposed = Vec::with_capacity(work.len());
-        // Materialize ALL device-resident draft proposals in ONE single GPU sync instead of N!
+        #[cfg(test)]
         {
+            let wave_seqs: Vec<u32> = work
+                .iter()
+                .map(|item| plan.rows[item.plan_index].seq_id)
+                .collect();
+            TEST_POST_BATCH_PROPOSAL_HOOK.with(|slot| {
+                if let Some(f) = slot.borrow_mut().as_mut() {
+                    f(&wave_seqs, &mut proposals);
+                }
+            });
+        }
+        let mut proposed = Vec::with_capacity(work.len());
+        // Materialize ALL device-resident draft proposals in ONE single GPU sync instead of N.
+        // If that batched eval fails, NEVER re-evaluate outputs from the failed Metal command
+        // buffer (MLX may already have marked those arrays evaluated): preserve the original
+        // error, discard all affected batch handles, restore each eligible lane's committed
+        // draft-ring handles, and rebuild fresh solo proposals so healthy peers survive cleanly.
+        let batch_eval_err = {
             let mut eval_refs: Vec<&MxArray> = Vec::new();
             for prop in proposals.iter().flatten() {
-                if let Some(ref ids) = prop.device_draft_ids {
-                    eval_refs.push(ids);
+                collect_proposal_device_arrays(prop, &mut eval_refs);
+            }
+            if eval_refs.is_empty() {
+                None
+            } else {
+                eval_scheduled_draft_arrays(&eval_refs, "scheduled_draft_proposals").err()
+            }
+        };
+        if let Some(batch_err) = batch_eval_err {
+            let mut solo_retry_indices = Vec::new();
+            for (wi, res) in proposals.iter_mut().enumerate() {
+                let has_device_arrays = res.as_ref().is_ok_and(|prop| {
+                    let mut lane_refs: Vec<&MxArray> = Vec::new();
+                    collect_proposal_device_arrays(prop, &mut lane_refs);
+                    !lane_refs.is_empty()
+                });
+                if !has_device_arrays {
+                    continue;
                 }
-                if let Some(ref sparse) = prop.device_draft_sparse {
-                    eval_refs.push(&sparse.ids);
-                    eval_refs.push(&sparse.probs);
+                *res = Err(Error::from_reason(batch_err.reason.clone()));
+                if eligible_work_indices.len() > 1 && eligible_work_indices.contains(&wi) {
+                    solo_retry_indices.push(wi);
                 }
             }
-            if !eval_refs.is_empty()
-                && let Err(error) =
-                    MxArray::eval_arrays_with_context(&eval_refs, "scheduled_draft_proposals")
-            {
-                for res in &mut proposals {
-                    if res.as_ref().is_ok_and(|p| {
-                        p.device_draft_ids.is_some() || p.device_draft_sparse.is_some()
-                    }) {
-                        *res = Err(Error::from_reason(error.reason.clone()));
+            for wi in solo_retry_indices {
+                let item = &work[wi];
+                let row = &plan.rows[item.plan_index];
+                let payload = &mut running[item.turn_index].payload;
+                let Some(rng) = payload.scheduled_speculation.as_mut() else {
+                    continue;
+                };
+                self.inner.restore_scheduled_draft_handles(row.seq_id);
+                let solo = self.inner.propose_scheduled(
+                    row.seq_id,
+                    item.anchor,
+                    item.cap,
+                    &payload.params,
+                    rng,
+                    profiling,
+                );
+                #[cfg(test)]
+                let solo = TEST_SOLO_PROPOSAL_HOOK.with(|slot| {
+                    if let Some(f) = slot.borrow_mut().as_mut() {
+                        f(row.seq_id, solo)
+                    } else {
+                        solo
                     }
-                }
+                });
+                let solo = solo.and_then(|prop| {
+                    let mut lane_refs: Vec<&MxArray> = Vec::new();
+                    collect_proposal_device_arrays(&prop, &mut lane_refs);
+                    if !lane_refs.is_empty() {
+                        eval_scheduled_draft_arrays(
+                            &lane_refs,
+                            "scheduled_draft_proposal_solo_retry",
+                        )?;
+                    }
+                    Ok(prop)
+                });
+                proposals[wi] = solo;
             }
         }
         for (mut item, proposal) in work.into_iter().zip(proposals) {
@@ -386,6 +503,18 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                         && proposal.draft_ids.iter().all(|&token| token >= 0) =>
                 {
                     item.proposal = proposal;
+                    #[cfg(test)]
+                    if let Some(override_ids) = TEST_DRAFT_OVERRIDE.with(|slot| {
+                        slot.borrow_mut()
+                            .as_mut()
+                            .and_then(|f| f(row.seq_id, item.anchor, item.cap))
+                    }) {
+                        let len = override_ids.len().min(item.cap);
+                        item.proposal.draft_ids = override_ids[..len].to_vec();
+                        item.proposal.draft_dists.clear();
+                        item.proposal.draft_sparse_dists.clear();
+                        item.proposal.keep_probabilities = None;
+                    }
                     // At row 0 the end tokens are the first proposals; their
                     // keep probability is 1 before the wave's budget reads it.
                     let replaced = match &item.cut {
@@ -397,14 +526,20 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     };
                     match replaced {
                         Ok(()) => proposed.push(item),
-                        Err(error) => results
-                            .push((item.plan_index, Self::speculative_failure(turn, row, error))),
+                        Err(error) => {
+                            self.inner.release_scheduled_speculation(turn.seq_id);
+                            results.push((
+                                item.plan_index,
+                                Self::speculative_failure(turn, row, error),
+                            ));
+                        }
                     }
                 }
                 outcome => {
                     let error = outcome
                         .err()
                         .unwrap_or_else(|| Error::from_reason("invalid scheduled draft proposal"));
+                    self.inner.release_scheduled_speculation(turn.seq_id);
                     results.push((item.plan_index, Self::speculative_failure(turn, row, error)));
                 }
             }
@@ -455,19 +590,52 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 }
             }
         }
-        for item in &work {
-            let turn = &running[item.turn_index];
+        let mut seen_verify_seqs = std::collections::HashSet::with_capacity(work.len());
+        let mut valid_work = Vec::with_capacity(work.len());
+        let mut valid_verify_rows = Vec::with_capacity(work.len());
+        for item in work {
             let row = &plan.rows[item.plan_index];
             timeline::lane_mark(row.seq_id, Mark::DraftPost);
             let mut tokens = Vec::with_capacity(item.proposal.draft_ids.len() + 1);
             tokens.push(item.anchor);
             tokens.extend(item.proposal.draft_ids.iter().map(|&token| token as u32));
-            verify_rows.push(ScheduledVerifyRow {
+            let verify_row = ScheduledVerifyRow {
                 seq_id: row.seq_id,
                 first_position: row.token_start,
                 tokens,
-                speculative: turn.payload.scheduled_speculation.is_some(),
-            });
+                speculative: running[item.turn_index]
+                    .payload
+                    .scheduled_speculation
+                    .is_some(),
+            };
+            let valid = if !seen_verify_seqs.insert(verify_row.seq_id) {
+                Err(Error::from_reason(
+                    "duplicate or empty scheduled verifier row",
+                ))
+            } else {
+                self.inner.validate_scheduled_verify_row(&verify_row)
+            };
+            match valid {
+                Ok(()) => {
+                    valid_work.push(item);
+                    valid_verify_rows.push(verify_row);
+                }
+                Err(error) => {
+                    let turn = &mut running[item.turn_index];
+                    results.push((item.plan_index, Self::speculative_failure(turn, row, error)));
+                }
+            }
+        }
+        let mut work = valid_work;
+        let verify_rows = valid_verify_rows;
+        if profiling && work.len() != profile_rows.len() {
+            profiling = false;
+            if let Some(budget) = self.inner.scheduled_verification_budget() {
+                budget.clear();
+            }
+        }
+        if work.is_empty() {
+            return Ok((results, 0, 0));
         }
         crate::array::maybe_clear_cache_for_paged_step(plan.global_step as i32);
         let logits = {
@@ -629,12 +797,24 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                     .map(|&token| token as u32)
                     .collect::<Vec<_>>();
                 tokens.push(boundary);
+                let budget_limit = thinking_budget_wave_limit(
+                    &turn.payload.reasoning_tracker,
+                    turn.payload.thinking,
+                    &item.think_close,
+                    &tokens,
+                );
+                let effective_count = if budget_limit < tokens.len() {
+                    tokens.truncate(budget_limit);
+                    budget_limit.saturating_sub(1)
+                } else {
+                    count
+                };
                 let cancelled = turn.cancelled.as_ref();
                 let observer = &mut turn.payload.turn_token_observer;
                 let clamp = clamp_dspark_cycle(
                     &turn.payload.generated_tokens,
                     &tokens,
-                    count,
+                    effective_count,
                     &turn.payload.params,
                     turn.payload.params.max_new_tokens.max(0) as usize,
                     turn.payload.eos_id,
@@ -649,11 +829,11 @@ impl<B: HybridSchedulerBackend> HybridStepExecutor<'_, B> {
                 timeline::lane_counts(
                     verify.seq_id,
                     item.proposal.draft_ids.len(),
-                    count,
+                    effective_count,
                     clamp.emit_count,
                 );
                 timeline::lane_mark(verify.seq_id, Mark::StopClamp);
-                (tokens, clamp, count)
+                (tokens, clamp, effective_count)
             });
             commits.push(ScheduledVerifyCommit {
                 seq_id: verify.seq_id,
@@ -1945,5 +2125,613 @@ pub(super) mod tests {
             .expect("the row's claim");
         let refusal = governor.ledger(|ledger| ledger.claim(claim).map(|state| state.refusal));
         assert_eq!(refusal.map(|need| need.bytes), Some(growth));
+    }
+
+    /// Pre-verify per-row validation isolates a single lane whose target
+    /// frontier is mismatched so ONLY that lane fails while its healthy peer in
+    /// the same 2-lane speculative wave completes normally with exact output.
+    #[test]
+    fn mismatched_frontier_row_fails_in_isolation_without_killing_healthy_peer() {
+        let (baseline, _) = run(true, false);
+        let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+        let first = request(
+            &mut inner,
+            41,
+            vec![0, 1, 2, 3, 4, 5, 6],
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        let second = request(
+            &mut inner,
+            42,
+            vec![4, 5, 6, 7, 8, 9, 10, 11, 12],
+            true,
+            Arc::new(AtomicBool::new(false)),
+        );
+        scheduler.enqueue_turn(first).unwrap();
+        scheduler.enqueue_turn(second).unwrap();
+
+        let _guard = crate::engine::hybrid_scheduler::set_test_validate_scheduled_verify_row(
+            Arc::new(|adapter, row| {
+                let frontier = adapter
+                    .and_then(|a| a.current_token_count_for(row.seq_id))
+                    .ok_or_else(|| {
+                        Error::from_reason("scheduled verifier has no target frontier")
+                    })?;
+                if u64::from(frontier) != u64::from(row.first_position) {
+                    return Err(Error::from_reason(
+                        "scheduled verifier target frontier mismatch",
+                    ));
+                }
+                Ok(())
+            }),
+        );
+
+        let mut injected = false;
+        let mut lane_41_failure = None;
+        let mut lane_42_tokens = None;
+        for _ in 0..100 {
+            // Once both lanes have finished prefill and are ready to enter a
+            // 2-lane decode verify wave, desync ONLY lane 41's target frontier.
+            if !injected
+                && scheduler.running().len() == 2
+                && scheduler
+                    .running()
+                    .iter()
+                    .all(|t| t.num_computed_tokens >= t.payload.prompt_tokens.len() as u32)
+            {
+                inner
+                    .paged_adapter_mut()
+                    .unwrap()
+                    .rollback_last_tokens_for(41, 1)
+                    .unwrap();
+                injected = true;
+            }
+            let action = scheduler
+                .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                .unwrap();
+            if let SchedulerAction::Stepped { completed, .. } = action {
+                for turn in completed {
+                    inner.release_scheduled_speculation(turn.seq_id);
+                    if turn.seq_id == 41 {
+                        lane_41_failure = turn.payload.failure;
+                    } else if turn.seq_id == 42 {
+                        assert!(
+                            turn.payload.failure.is_none(),
+                            "healthy peer lane 42 must not fail: {:?}",
+                            turn.payload.failure
+                        );
+                        lane_42_tokens = Some(turn.payload.generated_tokens);
+                    }
+                }
+            }
+            if lane_41_failure.is_some() && lane_42_tokens.is_some() {
+                break;
+            }
+        }
+        assert!(injected, "both lanes must reach decode wave");
+        let err = lane_41_failure.expect("mismatched lane 41 must fail");
+        assert!(
+            err.reason
+                .contains("scheduled verifier target frontier mismatch"),
+            "unexpected lane 41 error: {}",
+            err.reason
+        );
+        assert_eq!(
+            lane_42_tokens.expect("healthy peer lane 42 must finish"),
+            baseline[1].1,
+            "healthy peer lane 42 output must match baseline exactly"
+        );
+    }
+
+    struct DynamicThinkTestGuards;
+    impl Drop for DynamicThinkTestGuards {
+        fn drop(&mut self) {
+            TEST_THINK_END_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+            TEST_DRAFT_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Drive a single request (greedy) with optional dynamic open-token thinking
+    /// setup and optional wave-1 draft override, returning `(generated, per_wave_lens, outcome)`.
+    fn run_single_dynamic_thinking(
+        prompt: Vec<u32>,
+        speculate: bool,
+        budget: Option<i32>,
+        close: Option<ThinkEndResolution>,
+        draft_allowance: usize,
+        max_new_tokens: i32,
+        wave1_drafts: Option<Vec<i32>>,
+    ) -> (Vec<u32>, Vec<usize>, engine::penalties::ReasoningOutcome) {
+        let _guards = DynamicThinkTestGuards;
+        TEST_THINK_END_OVERRIDE.with(|slot| *slot.borrow_mut() = close.clone());
+        if let Some(drafts) = wave1_drafts {
+            let mut fired = false;
+            TEST_DRAFT_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = Some(Box::new(move |_seq, _anchor, cap| {
+                    if fired {
+                        return None;
+                    }
+                    fired = true;
+                    Some(drafts[..drafts.len().min(cap)].to_vec())
+                }));
+            });
+        }
+
+        let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
+        let mut scheduler = Scheduler::<_, (), ()>::new(2, 16).unwrap();
+        let mut turn = request(
+            &mut inner,
+            41,
+            prompt,
+            speculate,
+            Arc::new(AtomicBool::new(false)),
+        );
+        turn.payload.params.max_new_tokens = max_new_tokens;
+        turn.decode_draft_allowance = if speculate { draft_allowance as u32 } else { 0 };
+        if let Some(ref close) = close {
+            turn.payload.thinking = ThinkingSetup {
+                enabled: true,
+                budget,
+                cycle_guard: false,
+            };
+            turn.payload.reasoning_tracker =
+                ReasoningTracker::from_setup(&turn.payload.thinking, close);
+            turn.payload.last_is_reasoning = false;
+        }
+        scheduler.enqueue_turn(turn).unwrap();
+
+        let mut wave_lens = Vec::new();
+        let mut prev_len = 0usize;
+        let mut finished: Option<(Vec<u32>, engine::penalties::ReasoningOutcome)> = None;
+        for _ in 0..100 {
+            let action = scheduler
+                .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                .unwrap();
+            if let SchedulerAction::Stepped { completed, .. } = action {
+                for turn in completed {
+                    assert!(
+                        turn.payload.failure.is_none(),
+                        "owner {} failed: {:?}",
+                        turn.seq_id,
+                        turn.payload.failure
+                    );
+                    let generated = turn.payload.generated_tokens;
+                    if generated.len() > prev_len {
+                        wave_lens.push(generated.len() - prev_len);
+                        prev_len = generated.len();
+                    }
+                    let mut expected = turn.payload.prompt_tokens;
+                    expected.extend_from_slice(&generated[..generated.len().saturating_sub(1)]);
+                    assert_eq!(
+                        inner
+                            .paged_adapter()
+                            .unwrap()
+                            .request_tokens_for(turn.seq_id)
+                            .unwrap(),
+                        expected,
+                        "KV/request history must match committed tokens after wave rollback"
+                    );
+                    let outcome = turn.payload.reasoning_tracker.outcome();
+                    inner.release_scheduled_speculation(turn.seq_id);
+                    finished = Some((generated, outcome));
+                }
+            }
+            if let Some(running_turn) = scheduler.running().iter().find(|t| t.seq_id == 41) {
+                let len = running_turn.payload.generated_tokens.len();
+                if len > prev_len {
+                    wave_lens.push(len - prev_len);
+                    prev_len = len;
+                }
+            }
+            if finished.is_some() {
+                break;
+            }
+        }
+        let (generated, outcome) = finished.expect("single turn must finish");
+        (generated, wave_lens, outcome)
+    }
+
+    /// Find a deterministic prompt whose greedy baseline produces a fresh token
+    /// at index `open_idx` (`1 <= open_idx <= 2`) that did NOT appear in
+    /// `baseline[..open_idx]`, so the seed emitted from prefill (`baseline[0]`)
+    /// leaves the turn outside thinking and Wave 1 dynamically opens thinking.
+    fn pick_dynamic_open_baseline(max_new: i32) -> (Vec<u32>, Vec<u32>, usize) {
+        let candidates = [
+            vec![0, 1, 2, 3, 4, 5, 6],
+            vec![4, 5, 6, 7, 8, 9, 10, 11, 12],
+            vec![1, 3, 5, 7, 2, 4, 6],
+            vec![6, 5, 4, 3, 2, 1, 0],
+            vec![2, 0, 4, 1, 6, 3, 5],
+        ];
+        for prompt in candidates {
+            let (baseline, _, _) =
+                run_single_dynamic_thinking(prompt.clone(), false, None, None, 0, max_new, None);
+            if let Some(open_idx) = (1..=2)
+                .find(|&idx| idx < baseline.len() && !baseline[..idx].contains(&baseline[idx]))
+            {
+                return (prompt, baseline, open_idx);
+            }
+        }
+        panic!("no candidate prompt produced a fresh dynamic open token in Wave 1");
+    }
+
+    /// Finding 1 regression (zero budget): a dynamic open-token speculative wave
+    /// starting outside thinking (`anchor = baseline[0]`, `thinking_cut() == None`)
+    /// that proposes `[..., open_marker, thought_1, thought_2, ...]` (all matching
+    /// target argmax) under `budget == 0` must truncate Wave 1 right after
+    /// `open_marker`, roll back KV/draft cleanly, force the close sequence
+    /// immediately in Wave 2, emit ZERO thought tokens past budget, and match AR.
+    #[test]
+    fn dynamic_open_zero_budget_speculative_wave_never_commits_thought_tokens() {
+        let (prompt, baseline, open_idx) = pick_dynamic_open_baseline(10);
+        assert!(baseline.len() >= open_idx + 5);
+        let open_id = baseline[open_idx];
+        let close_ids: Vec<u32> = (0..16u32)
+            .filter(|t| !baseline[..open_idx + 5].contains(t))
+            .take(2)
+            .collect();
+        assert_eq!(
+            close_ids.len(),
+            2,
+            "tiny vocab must have 2 unused close ids"
+        );
+        let close = ThinkEndResolution::with_open_token(open_id, Arc::from(close_ids.as_slice()));
+
+        let (ar_tokens, _, ar_outcome) = run_single_dynamic_thinking(
+            prompt.clone(),
+            false,
+            Some(0),
+            Some(close.clone()),
+            0,
+            10,
+            None,
+        );
+        // Prefill produces seed `baseline[0]` (observed outside thinking); Wave 1
+        // verifies `[baseline[0], baseline[1], ..., open_id, t1, t2, t3]` so greedy
+        // verification accepts open_id + 3 thought tokens before budget truncation.
+        let draft_len = open_idx + 3;
+        let wave1_drafts: Vec<i32> = baseline[1..1 + draft_len]
+            .iter()
+            .map(|&t| t as i32)
+            .collect();
+        let (spec_tokens, wave_lens, spec_outcome) = run_single_dynamic_thinking(
+            prompt,
+            true,
+            Some(0),
+            Some(close),
+            draft_len,
+            10,
+            Some(wave1_drafts),
+        );
+
+        assert_eq!(
+            wave_lens[0],
+            open_idx + 1,
+            "Step 1 (seed + Wave 1) under budget=0 must stop right after open_id (lens={wave_lens:?})"
+        );
+        assert_eq!(
+            spec_tokens, ar_tokens,
+            "speculative output must match greedy AR with zero thought tokens past budget"
+        );
+        assert_eq!(spec_tokens[open_idx], open_id);
+        assert_eq!(
+            &spec_tokens[open_idx + 1..open_idx + 3],
+            close_ids.as_slice(),
+            "close sequence must follow open_id immediately with 0 thought tokens"
+        );
+        assert_eq!(spec_outcome, ar_outcome);
+        assert_eq!(spec_outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(spec_outcome.cut_at, Some(0));
+    }
+
+    /// Finding 1 regression (tight non-zero budget): a dynamic open-token
+    /// speculative wave starting outside thinking (`thinking_cut() == None`)
+    /// that proposes `[..., open_marker, t1, t2, t3, t4]` (all matching target
+    /// argmax) under `budget == 2` must truncate right after `t2`, drop `t3`/`t4`,
+    /// roll back KV/draft cleanly, force the close sequence on the next wave,
+    /// and match greedy AR bit-for-bit.
+    #[test]
+    fn dynamic_open_tight_budget_crossed_mid_wave_truncates_and_matches_ar() {
+        let (prompt, baseline, open_idx) = pick_dynamic_open_baseline(12);
+        assert!(baseline.len() >= open_idx + 6);
+        let open_id = baseline[open_idx];
+        let close_ids: Vec<u32> = (0..16u32)
+            .filter(|t| !baseline[..open_idx + 6].contains(t))
+            .take(2)
+            .collect();
+        assert_eq!(
+            close_ids.len(),
+            2,
+            "tiny vocab must have 2 unused close ids"
+        );
+        let close = ThinkEndResolution::with_open_token(open_id, Arc::from(close_ids.as_slice()));
+
+        let (ar_tokens, _, ar_outcome) = run_single_dynamic_thinking(
+            prompt.clone(),
+            false,
+            Some(2),
+            Some(close.clone()),
+            0,
+            12,
+            None,
+        );
+        // Prefill produces seed `baseline[0]` (outside thinking); Wave 1 verifies
+        // `[baseline[0], ..., open_id, t1, t2, t3, t4]` so greedy verification
+        // accepts 2 extra thought tokens past budget=2 before budget truncation.
+        let draft_len = open_idx + 4;
+        let wave1_drafts: Vec<i32> = baseline[1..1 + draft_len]
+            .iter()
+            .map(|&t| t as i32)
+            .collect();
+        let (spec_tokens, wave_lens, spec_outcome) = run_single_dynamic_thinking(
+            prompt,
+            true,
+            Some(2),
+            Some(close),
+            draft_len,
+            12,
+            Some(wave1_drafts),
+        );
+
+        assert_eq!(
+            wave_lens[0],
+            open_idx + 3,
+            "Step 1 (seed + Wave 1) under budget=2 must stop right after [open_id, t1, t2] (lens={wave_lens:?})"
+        );
+        assert_eq!(
+            spec_tokens, ar_tokens,
+            "speculative output must match greedy AR when budget=2 is crossed mid-wave"
+        );
+        assert_eq!(spec_tokens[open_idx], open_id);
+        assert_eq!(
+            &spec_tokens[open_idx + 1..open_idx + 3],
+            &baseline[open_idx + 1..open_idx + 3]
+        );
+        assert_eq!(
+            &spec_tokens[open_idx + 3..open_idx + 5],
+            close_ids.as_slice(),
+            "close sequence must immediately follow the 2 allowed thought tokens"
+        );
+        assert_eq!(spec_outcome, ar_outcome);
+        assert_eq!(spec_outcome.close, Some(ReasoningClose::Budget));
+        assert_eq!(spec_outcome.cut_at, Some(2));
+    }
+
+    /// Unit tests for `thinking_budget_wave_limit` edge cases: reopening a
+    /// second thought block within the same wave after crossing budget,
+    /// immediate model self-close under budget=0, and partial multi-token end.
+    #[test]
+    fn thinking_budget_wave_limit_handles_reopen_self_close_and_multitoken_end() {
+        const OPEN: u32 = 50;
+        const END0: u32 = 51;
+        const CLOSE: u32 = 52;
+        let close = ThinkEndResolution::with_open_token(OPEN, Arc::from([END0, CLOSE]));
+
+        // 1. Re-opening thinking in the same wave hits budget=2 on the second block.
+        let setup_2 = ThinkingSetup {
+            enabled: true,
+            budget: Some(2),
+            cycle_guard: false,
+        };
+        let tracker_2 = ReasoningTracker::from_setup(&setup_2, &close);
+        assert_eq!(
+            thinking_budget_wave_limit(&tracker_2, setup_2, &close, &[OPEN, 1, CLOSE, OPEN, 2, 3]),
+            5,
+            "must drop token `3` after 2 cumulative thought tokens across two blocks"
+        );
+
+        // 2. Model immediately emits the full end sequence under budget=0 -> no truncation.
+        let setup_0 = ThinkingSetup {
+            enabled: true,
+            budget: Some(0),
+            cycle_guard: false,
+        };
+        let tracker_0 = ReasoningTracker::from_setup(&setup_0, &close);
+        assert_eq!(
+            thinking_budget_wave_limit(&tracker_0, setup_0, &close, &[OPEN, END0, CLOSE, 99]),
+            4,
+            "matching forced end tokens must not be truncated"
+        );
+
+        // 3. Partial match of multi-token end followed by a stray thought token truncates before stray.
+        assert_eq!(
+            thinking_budget_wave_limit(&tracker_0, setup_0, &close, &[OPEN, END0, 77]),
+            2,
+            "stray thought token after partial multi-token end must be truncated"
+        );
+    }
+
+    struct DeviceEvalTestGuards;
+    impl Drop for DeviceEvalTestGuards {
+        fn drop(&mut self) {
+            TEST_POST_BATCH_PROPOSAL_HOOK.with(|slot| *slot.borrow_mut() = None);
+            TEST_SOLO_PROPOSAL_HOOK.with(|slot| *slot.borrow_mut() = None);
+            TEST_DRAFT_EVAL_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    /// Finding 2 regression: when batched evaluation of deferred device-backed
+    /// draft proposals fails in a multi-lane wave, the executor must NOT fail
+    /// every device-backed lane.
+    ///
+    /// Covers both:
+    /// 1. Independent per-lane failure: lane 41's device array fails eval while
+    ///    lane 42's device array evaluates cleanly in per-lane isolation (no
+    ///    unnecessary solo retry on lane 42); lane 41 fails in isolation and
+    ///    lane 42 finishes matching baseline bit-for-bit.
+    /// 2. Shared batched graph failure: both batched device arrays fail isolated
+    ///    eval (simulating a shared batched forward graph poisoned by lane 41);
+    ///    solo retry recovers lane 42 with a fresh device proposal while lane 41
+    ///    fails in isolation and lane 42 finishes matching baseline bit-for-bit.
+    #[test]
+    fn deferred_device_draft_eval_failure_isolates_failing_lane_and_preserves_healthy_peer() {
+        let (baseline, _) = run(true, false);
+
+        for shared_graph_poison in [false, true] {
+            let _guards = DeviceEvalTestGuards;
+            let bad_ptrs = Arc::new(std::sync::Mutex::new(
+                std::collections::HashSet::<usize>::new(),
+            ));
+            let solo_retried = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+            let batch_evals_failed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+            let injected = Arc::new(AtomicBool::new(false));
+            {
+                let bad_ptrs = Arc::clone(&bad_ptrs);
+                let injected = Arc::clone(&injected);
+                TEST_POST_BATCH_PROPOSAL_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |wave_seqs, proposals| {
+                        if injected.load(Ordering::Relaxed)
+                            || wave_seqs.len() != 2
+                            || !wave_seqs.contains(&41)
+                            || !wave_seqs.contains(&42)
+                        {
+                            return;
+                        }
+                        injected.store(true, Ordering::Relaxed);
+                        for (&seq, res) in wave_seqs.iter().zip(proposals.iter_mut()) {
+                            let Ok(prop) = res.as_mut() else {
+                                continue;
+                            };
+                            let host_ids = if prop.draft_ids.is_empty() {
+                                vec![0i32]
+                            } else {
+                                std::mem::take(&mut prop.draft_ids)
+                            };
+                            let dev = MxArray::from_int32(&host_ids, &[host_ids.len() as i64])
+                                .expect("device draft ids");
+                            if seq == 41 || shared_graph_poison {
+                                bad_ptrs.lock().unwrap().insert(dev.as_raw_ptr() as usize);
+                            }
+                            prop.device_draft_ids = Some(dev);
+                        }
+                    }));
+                });
+            }
+            {
+                let bad_ptrs = Arc::clone(&bad_ptrs);
+                let solo_retried = Arc::clone(&solo_retried);
+                TEST_SOLO_PROPOSAL_HOOK.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |seq, solo| {
+                        solo_retried.lock().unwrap().push(seq);
+                        let mut prop = solo?;
+                        let host_ids = if prop.draft_ids.is_empty() {
+                            vec![0i32]
+                        } else {
+                            std::mem::take(&mut prop.draft_ids)
+                        };
+                        let dev = MxArray::from_int32(&host_ids, &[host_ids.len() as i64])
+                            .expect("solo device draft ids");
+                        let ptr = dev.as_raw_ptr() as usize;
+                        if seq == 41 {
+                            bad_ptrs.lock().unwrap().insert(ptr);
+                        } else {
+                            // Guard against allocator pointer reuse after the dropped batched array.
+                            bad_ptrs.lock().unwrap().remove(&ptr);
+                        }
+                        prop.device_draft_ids = Some(dev);
+                        Ok(prop)
+                    }));
+                });
+            }
+            {
+                let bad_ptrs = Arc::clone(&bad_ptrs);
+                let batch_evals_failed = Arc::clone(&batch_evals_failed);
+                TEST_DRAFT_EVAL_OVERRIDE.with(|slot| {
+                    *slot.borrow_mut() = Some(Box::new(move |arrays, context| {
+                        let guard = bad_ptrs.lock().unwrap();
+                        if arrays
+                            .iter()
+                            .any(|arr| guard.contains(&(arr.as_raw_ptr() as usize)))
+                        {
+                            if context == "scheduled_draft_proposals" {
+                                batch_evals_failed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            return Some(Err(Error::from_reason(
+                                "injected deferred device draft eval failure",
+                            )));
+                        }
+                        None
+                    }));
+                });
+            }
+
+            let mut inner = seeded_tiny_paged_inner_with_draft(1729).unwrap();
+            let mut scheduler = Scheduler::<_, (), ()>::new(2, 12).unwrap();
+            let first = request(
+                &mut inner,
+                41,
+                vec![0, 1, 2, 3, 4, 5, 6],
+                true,
+                Arc::new(AtomicBool::new(false)),
+            );
+            let second = request(
+                &mut inner,
+                42,
+                vec![4, 5, 6, 7, 8, 9, 10, 11, 12],
+                true,
+                Arc::new(AtomicBool::new(false)),
+            );
+            scheduler.enqueue_turn(first).unwrap();
+            scheduler.enqueue_turn(second).unwrap();
+
+            let mut lane_41_failure = None;
+            let mut lane_42_tokens = None;
+            for _ in 0..100 {
+                let action = scheduler
+                    .drive_once(&mut HybridStepExecutor::new(&mut inner))
+                    .unwrap();
+                if let SchedulerAction::Stepped { completed, .. } = action {
+                    for turn in completed {
+                        inner.release_scheduled_speculation(turn.seq_id);
+                        if turn.seq_id == 41 {
+                            lane_41_failure = turn.payload.failure;
+                        } else if turn.seq_id == 42 {
+                            assert!(
+                                turn.payload.failure.is_none(),
+                                "shared_graph_poison={shared_graph_poison}: healthy peer lane 42 must not fail: {:?}",
+                                turn.payload.failure
+                            );
+                            lane_42_tokens = Some(turn.payload.generated_tokens);
+                        }
+                    }
+                }
+                if lane_41_failure.is_some() && lane_42_tokens.is_some() {
+                    break;
+                }
+            }
+
+            assert!(
+                injected.load(Ordering::Relaxed),
+                "shared_graph_poison={shared_graph_poison}: 2-lane wave must trigger device proposal injection"
+            );
+            assert!(
+                batch_evals_failed.load(Ordering::Relaxed) >= 1,
+                "shared_graph_poison={shared_graph_poison}: batched device eval must fail and enter isolation"
+            );
+            let err = lane_41_failure.expect("failing lane 41 must report error");
+            assert!(
+                err.reason
+                    .contains("injected deferred device draft eval failure"),
+                "unexpected lane 41 error: {}",
+                err.reason
+            );
+            assert_eq!(
+                lane_42_tokens.expect("healthy peer lane 42 must complete"),
+                baseline[1].1,
+                "shared_graph_poison={shared_graph_poison}: healthy peer lane 42 must match baseline exactly"
+            );
+            let retried = solo_retried.lock().unwrap();
+            assert!(
+                retried.contains(&41),
+                "failing lane 41 must attempt solo retry before failing"
+            );
+            assert!(
+                retried.contains(&42),
+                "shared_graph_poison={shared_graph_poison}: healthy lane 42 must rebuild solo rather than re-evaluating handles from a failed batch command"
+            );
+        }
     }
 }

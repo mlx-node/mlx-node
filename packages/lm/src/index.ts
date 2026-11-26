@@ -106,7 +106,7 @@ export type { ChatStreamDelta, ChatStreamFinal, ChatStreamEvent, ChatStreamContr
 // `makeStreamingModel` is the factory that builds each family's wrapper
 // subclass from its native class; the VLM package reuses it to build
 // `QianfanOCRModel`.
-export { _runChatStream, makeStreamingModel } from './stream.js';
+export { _runChatStream, getLoadedModelPath, makeStreamingModel } from './stream.js';
 export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance, StreamingModel } from './stream.js';
 // Cross-model chat session wrapper (see chat-session.ts for design notes).
 // `SessionCapableModel` is the structural interface matched by every
@@ -116,10 +116,12 @@ export type { NativeStreamingInstance, NativeStreamingMethod, StreamingInstance,
 export {
   ChatSession,
   ContextCapacityError,
+  ImageProcessingError,
   contextLane,
   countPromptTokens,
   isCapacityExhaustedError,
   isContextCapacityError,
+  isImageProcessingError,
   isMediaHeldRestartError,
   isMetalOutOfMemoryError,
   isResourceTimeoutError,
@@ -127,6 +129,8 @@ export {
   mtpOnByDefault,
   retryableErrorCode,
   selectCommittedStreamText,
+  validateRequestImages,
+  validateRequestImagesAsync,
 } from './chat-session.js';
 export { ToolCallTagBuffer, longestSuffixPrefixOverlap } from './tool-call-buffer.js';
 export type {
@@ -135,6 +139,7 @@ export type {
   SendOptions,
   SessionCapableModel,
   SessionContextLimits,
+  ValidateRequestImagesOptions,
 } from './chat-session.js';
 
 // Model utilities (TypeScript-only)
@@ -163,6 +168,8 @@ export {
 // addon; see family-data.ts).
 export {
   CHAT_FAMILY_IDS,
+  chatFamilyIdFor,
+  defaultThinkingBudgetForEffort,
   FAMILY_LOAD_OPTION_SPECS,
   familyDataFor,
   familyTraitsFor,
@@ -181,7 +188,9 @@ export {
   NON_GENERATIVE_FAMILY_IDS,
   QWEN4_EXP_SAMPLING_DEFAULTS,
   QWEN_SAMPLING_DEFAULTS,
+  hasQwen38ReasoningEffortTemplate,
   rawModelTypeToCanonical,
+  reasoningEffortsFor,
   validateFamilyLoadOptions,
   type ChatFamilyId,
   type FamilyLoadOptionFlag,
@@ -194,6 +203,9 @@ export {
   type ModelFamilyData,
   type ModelFamilyKind,
   type ModelType,
+  type ReasoningEffortLevel,
+  type ReasoningEffortOption,
+  type ReasoningEffortsOptions,
   type TrainableFamilyId,
 } from './family-data.js';
 

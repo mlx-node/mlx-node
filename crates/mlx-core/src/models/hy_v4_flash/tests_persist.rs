@@ -17,8 +17,8 @@ use super::ladder::Kind;
 use super::owner::{CellLayer, OwnerCell};
 use super::paged::PageGeometry;
 use super::persist::{
-    Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, chain, disk_plan, fingerprint,
-    identity_text, segment_key, segments_at,
+    Blocks, Disk, FLAT_RUN, Identity, MINIMUM_ROWS, QUEUE_BYTES, Read, SEGMENT_BOUND, chain,
+    disk_plan, fingerprint, identity_text, segment_key, segments_at,
 };
 use super::persist_codec::{
     StateShape, block_layout, decode_state, encode_state_into, join_block, split_block,
@@ -26,8 +26,8 @@ use super::persist_codec::{
 use super::persist_writer::Telemetry;
 use super::prefill::BLOCK_ROWS;
 use super::prefix_state::{
-    Key, PrefixState, StateLayer, States, WRITE_TAG, any_written, is_written, prompt_keys, resumes,
-    turn_keys, written_key,
+    DraftState, Key, OpenRows, PrefixState, Segment, StateLayer, States, Stored, WRITE_TAG,
+    any_written, is_written, prompt_keys, resumes, turn_keys, written_key,
 };
 use super::sched::lookup_bounds;
 use super::test_support::{Temp, arr, tiny_cfg};
@@ -817,5 +817,636 @@ fn fast_decode_turn_does_not_supersede_prompt_end_state() {
             1,
             "linear Turn 1 should supersede"
         );
+    }
+}
+
+/// Cold `Kind::Prompt` states resume cleanly across Turn 1 -> Turn 2 -> Turn 3
+/// for BOTH non-grid `replay_row` (canonical `!is_written` keys on permanent
+/// grid/checkpoint chunks + deterministic `[WRITE_TAG, key]` on the trailing
+/// non-grid chunk, still protected from fast `Kind::Turn` superseding) AND
+/// grid-aligned `replay_row` (`!any_written`, matching Turn 2 via `agrees()`).
+#[test]
+fn cold_prompt_state_resumes_across_multi_turn_prompts() {
+    use super::prefill::Grid;
+    use super::sched::pass_keys;
+
+    const OPEN: [u32; 3] = [120_000, 611, 10_372];
+    const GEN: [u32; 5] = [120_000, 611, 10_372, 120_001, 120_029];
+    const CHUNK: usize = 4096;
+    const SALT: u64 = 19;
+
+    let g = Grid::new(CHUNK, OPEN.to_vec()).unwrap();
+    let mut st = States::<PrefixState>::with_cap(8);
+
+    // 1. Non-grid replay_row (8704): 0..8192 is permanent (grid + checkpoint),
+    //    8192..8704 is a non-grid trailing chunk carrying deterministic
+    //    `[WRITE_TAG, key]`.
+    let mut p1: Vec<u32> = (0..8709).map(|i| 17 + (i % 97) as u32).collect();
+    p1[8709 - GEN.len()..].copy_from_slice(&GEN);
+    let r1 = g.replay_row(&p1);
+    assert_eq!(r1, 8704);
+    let ends1 = g.ends(0, &p1);
+    assert_eq!(ends1, vec![4096, 8192, 8704, 8709]);
+    let pass1 = pass_keys(&p1, &ends1, CHUNK);
+    assert_eq!(pass1.len(), r1 / BLOCK_ROWS);
+    assert!(
+        !any_written(&pass1[..8192 / BLOCK_ROWS]),
+        "permanent grid/checkpoint chunks 0..8192 must stay canonical (!is_written)"
+    );
+    assert!(
+        pass1[8192 / BLOCK_ROWS..].iter().all(|k| is_written(k)),
+        "non-grid trailing chunk 8192..8704 must carry deterministic WRITE_TAG keys"
+    );
+    assert_eq!(
+        pass_keys(&p1, &ends1, CHUNK),
+        pass1,
+        "concurrent cold prefills of the same prompt deduplicate identically"
+    );
+
+    let ck_id = st
+        .publish(
+            Key {
+                tokens: &p1[..8192],
+                keys: &pass1[..8192 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(8192),
+            Kind::Checkpoint,
+        )
+        .unwrap()
+        .unwrap();
+    let id1 = st
+        .publish(
+            Key {
+                tokens: &p1[..r1],
+                keys: &pass1[..r1 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(r1),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Turn 2: extends Turn 1 (mutating post-OPEN token to mimic <think>
+    // stripping) + reply + user msg + GEN -> len 10_000, r2 = 9984.
+    let mut p2 = p1.clone();
+    p2[8707] = 999;
+    p2.extend((0..1291).map(|i| 31 + (i % 89) as u32));
+    let len2 = p2.len();
+    p2[len2 - GEN.len()..].copy_from_slice(&GEN);
+    let r2 = g.replay_row(&p2);
+    assert_eq!(r2, 9984);
+    let ends2 = g.ends(0, &p2);
+    assert_eq!(ends2, vec![4096, 8192, 9984, 10_000]);
+    let pass2 = pass_keys(&p2, &ends2, CHUNK);
+    assert_eq!(&pass2[..8192 / BLOCK_ROWS], &pass1[..8192 / BLOCK_ROWS]);
+
+    let pk2 = Key {
+        tokens: &p2,
+        keys: &pass2,
+        salt: SALT,
+    };
+    assert!(
+        resumes(st.store().get(ck_id).unwrap(), pk2),
+        "cold Checkpoint at 8192 (!any_written) resumes Turn 2 via agrees()"
+    );
+    assert!(
+        resumes(st.store().get(id1).unwrap(), pk2),
+        "Turn 1 Kind::Prompt at non-grid row 8704 resumes Turn 2"
+    );
+    assert_eq!(st.lookup(pk2, &|_| true), Some((id1, r1)));
+
+    // Turn 2 resumes from id1 at 8704, keeps line1[..272], and publishes Prompt at r2.
+    let line1 = st.keys_of(id1).unwrap();
+    let keys2 = prompt_keys(&p2, r1, &line1, &pass2, ends2.contains(&r1), 42);
+    assert_eq!(&keys2[..r1 / BLOCK_ROWS], &line1[..]);
+    let id2 = st
+        .publish(
+            Key {
+                tokens: &p2[..r2],
+                keys: &keys2[..r2 / BLOCK_ROWS],
+                salt: SALT,
+            },
+            bare(r2),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    // Turn 3 extends Turn 2 -> len 12_500; resumes at deepest Turn 2 Prompt (r2).
+    let mut p3 = p2.clone();
+    p3.extend((0..2500).map(|i| 53 + (i % 79) as u32));
+    let len3 = p3.len();
+    p3[len3 - GEN.len()..].copy_from_slice(&GEN);
+    let ends3 = g.ends(0, &p3);
+    let pass3 = pass_keys(&p3, &ends3, CHUNK);
+    let pk3 = Key {
+        tokens: &p3,
+        keys: &pass3,
+        salt: SALT,
+    };
+    assert!(resumes(st.store().get(ck_id).unwrap(), pk3));
+    assert!(resumes(st.store().get(id1).unwrap(), pk3));
+    assert!(resumes(st.store().get(id2).unwrap(), pk3));
+    assert_eq!(st.lookup(pk3, &|_| true), Some((id2, r2)));
+
+    // Non-grid cold Turn 1 Prompt (`[WRITE_TAG, key]`, `Kind::Prompt`) is NOT
+    // superseded by a fast `< DELAY` `Kind::Turn` on the disk tier.
+    {
+        let root = Temp::new("persist-nongrid-prompt");
+        let cfg = tiny_cfg();
+        let shape = StateShape::of(&cfg, false).unwrap();
+        let pid = Some((
+            "11223344556677889900aabbccddeeff",
+            b"hy4-nongrid-prompt-supersede".as_slice(),
+        ));
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut disk_st = States::<PrefixState>::with_cap(8);
+        let p_row = MINIMUM_ROWS + 64; // non-grid for chunk 4096
+        let t_row = p_row + 128;
+        let mut full: Vec<u32> = (0..t_row + 16).map(|i| 23 + (i % 97) as u32).collect();
+        let p_len = p_row + GEN.len();
+        full[p_row..p_len].copy_from_slice(&GEN);
+        let e = g.ends(0, &full[..p_len]);
+        let pk = pass_keys(&full[..p_len], &e, CHUNK);
+        assert!(any_written(&pk));
+        let tk = turn_keys(&full, &pk, t_row, 777);
+        let mk = |row: usize| make_cell_state(&cfg, &full[..row], &[row], false).1;
+        let p_id = rig.publish(
+            &mut disk_st,
+            1,
+            &full[..p_row],
+            &pk,
+            0,
+            mk(p_row),
+            Kind::Prompt,
+        );
+        let t_id = rig.publish(
+            &mut disk_st,
+            1,
+            &full[..t_row],
+            &tk,
+            0,
+            mk(t_row),
+            Kind::Turn,
+        );
+        assert!(rig.flush(&mut disk_st, 30));
+        assert_eq!(
+            rig.telem.unneeded.load(Ordering::Relaxed),
+            0,
+            "non-grid Kind::Prompt with deterministic WRITE_TAG must not be superseded"
+        );
+        assert!(disk_st.store().get(p_id).unwrap().disk().unwrap().landed);
+        assert!(disk_st.store().get(t_id).unwrap().disk().unwrap().landed);
+    }
+
+    // 2. Grid-aligned replay_row (8192): stays completely `!any_written` AND
+    //    resumes cleanly on Turn 2 via `agrees()` and `ends2.contains(&8192)`.
+    let mut st_grid = States::<PrefixState>::with_cap(8);
+    let mut g1: Vec<u32> = (0..8197).map(|i| 41 + (i % 83) as u32).collect();
+    g1[8192..8197].copy_from_slice(&GEN);
+    assert_eq!(g.replay_row(&g1), 8192);
+    let g_ends1 = g.ends(0, &g1);
+    assert_eq!(g_ends1, vec![4096, 8192, 8197]);
+    let g_pass1 = pass_keys(&g1, &g_ends1, CHUNK);
+    assert!(!any_written(&g_pass1));
+    let gid1 = st_grid
+        .publish(
+            Key {
+                tokens: &g1[..8192],
+                keys: &g_pass1,
+                salt: SALT,
+            },
+            bare(8192),
+            Kind::Prompt,
+        )
+        .unwrap()
+        .unwrap();
+
+    let mut g2 = g1.clone();
+    g2.extend((0..1500).map(|i| 61 + (i % 73) as u32));
+    let g2_len = g2.len();
+    g2[g2_len - GEN.len()..].copy_from_slice(&GEN);
+    let g_ends2 = g.ends(0, &g2);
+    assert!(g_ends2.contains(&8192));
+    let g_pass2 = pass_keys(&g2, &g_ends2, CHUNK);
+    assert_eq!(&g_pass2[..8192 / BLOCK_ROWS], &g_pass1[..]);
+    let g_pk2 = Key {
+        tokens: &g2,
+        keys: &g_pass2,
+        salt: SALT,
+    };
+    assert!(resumes(st_grid.store().get(gid1).unwrap(), g_pk2));
+    assert_eq!(st_grid.lookup(g_pk2, &|_| true), Some((gid1, 8192)));
+}
+
+/// Warm `Kind::Prompt` states (`any_written == true`, e.g. Turn 2+ resumed from
+/// a prior `Kind::Turn`) and `Checkpoint -> Prompt` upgrades must NOT be
+/// superseded by a fast `< DELAY` `Kind::Turn`, while linear `Turn -> Turn`
+/// still supersedes.
+#[test]
+fn warm_prompt_and_upgraded_checkpoint_are_not_superseded_by_fast_turn() {
+    let root = Temp::new("persist-warm-prompt");
+    let cfg = tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let pid = Some((
+        "00112233445566778899aabbccddeeff",
+        b"hy4-warm-prompt-supersede".as_slice(),
+    ));
+
+    let prompt_row = MINIMUM_ROWS + 256;
+    let turn_row = prompt_row + 256;
+    let turn2_row = turn_row + 256;
+    let full = tokens(turn2_row + 32);
+
+    // Warm keys: Turn 2 resumed from a Turn 1 write-path state, so block 0..
+    // already carries WRITE_TAG -> `any_written(&warm_prompt_keys)` is TRUE.
+    let pass: Vec<Vec<u64>> = (0..MINIMUM_ROWS / BLOCK_ROWS)
+        .map(|b| vec![0x6000_0000 + b as u64])
+        .collect();
+    let prev_turn_keys = turn_keys(&full, &pass[..1], MINIMUM_ROWS, 333);
+    let warm_prompt_keys = prompt_keys(
+        &full[..prompt_row],
+        MINIMUM_ROWS,
+        &prev_turn_keys,
+        &[],
+        false,
+        444,
+    );
+    assert!(
+        any_written(&warm_prompt_keys),
+        "warm Turn 2 prompt keys must carry write-path keys"
+    );
+    let fast_turn_keys = turn_keys(&full, &warm_prompt_keys, turn_row, 555);
+    let turn2_keys = turn_keys(&full, &fast_turn_keys, turn2_row, 666);
+    let mk = |row: usize| make_cell_state(&cfg, &full[..row], &[row], false).1;
+
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(8);
+
+    // 1. Warm `Kind::Prompt` (`any_written == true`) followed immediately (< DELAY)
+    //    by `Kind::Turn` on the same lineage: Prompt must NOT be superseded.
+    let p_id = rig.publish(
+        &mut st,
+        1,
+        &full[..prompt_row],
+        &warm_prompt_keys,
+        0,
+        mk(prompt_row),
+        Kind::Prompt,
+    );
+    let t_id = rig.publish(
+        &mut st,
+        1,
+        &full[..turn_row],
+        &fast_turn_keys,
+        0,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    assert!(
+        st.store().superseded(p_id),
+        "raw store sees Turn descendant"
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed),
+        0,
+        "warm Kind::Prompt must not be superseded by fast Kind::Turn"
+    );
+    for (id, label) in [(p_id, "warm prompt"), (t_id, "fast turn")] {
+        assert!(
+            st.store()
+                .get(id)
+                .and_then(|e| e.disk())
+                .is_some_and(|d| d.landed),
+            "{label} must land on disk"
+        );
+    }
+
+    // 2. Checkpoint at `prompt_row` upgraded to `Kind::Prompt` at the exact same
+    //    block (and never downgraded by a subsequent Checkpoint/Turn at the same
+    //    block) must ALSO be protected from superseding by a deeper `Kind::Turn`.
+    let ck_id = st
+        .publish(
+            Key {
+                tokens: &full[..prompt_row],
+                keys: &warm_prompt_keys,
+                salt: 9,
+            },
+            mk(prompt_row),
+            Kind::Checkpoint,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        st.store().get(ck_id).unwrap().ram().unwrap().kind,
+        Kind::Checkpoint
+    );
+    let upgraded_id = rig.publish(
+        &mut st,
+        2,
+        &full[..prompt_row],
+        &warm_prompt_keys,
+        9,
+        mk(prompt_row),
+        Kind::Prompt,
+    );
+    assert_eq!(upgraded_id, ck_id, "reuses existing entry on same block");
+    assert_eq!(
+        st.store().get(ck_id).unwrap().ram().unwrap().kind,
+        Kind::Prompt,
+        "Checkpoint must upgrade to Kind::Prompt"
+    );
+    assert!(!st.store().get(ck_id).unwrap().checkpoint());
+    // Publishing Checkpoint or Turn on the same block must NEVER downgrade Prompt.
+    for downgrade in [Kind::Checkpoint, Kind::Turn] {
+        let same = st
+            .publish(
+                Key {
+                    tokens: &full[..prompt_row],
+                    keys: &warm_prompt_keys,
+                    salt: 9,
+                },
+                mk(prompt_row),
+                downgrade,
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(same, ck_id);
+        assert_eq!(
+            st.store().get(ck_id).unwrap().ram().unwrap().kind,
+            Kind::Prompt
+        );
+    }
+    let t9_id = rig.publish(
+        &mut st,
+        2,
+        &full[..turn_row],
+        &fast_turn_keys,
+        9,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed),
+        0,
+        "Checkpoint upgraded to Prompt must not be superseded"
+    );
+    assert!(
+        st.store()
+            .get(ck_id)
+            .and_then(|e| e.disk())
+            .is_some_and(|d| d.landed)
+    );
+    assert!(
+        st.store()
+            .get(t9_id)
+            .and_then(|e| e.disk())
+            .is_some_and(|d| d.landed)
+    );
+
+    // 3. Linear Turn 1 -> Turn 2 on a fresh salt still supersedes Turn 1.
+    let before_unneeded = rig.telem.unneeded.load(Ordering::Relaxed);
+    rig.publish(
+        &mut st,
+        3,
+        &full[..turn_row],
+        &fast_turn_keys,
+        11,
+        mk(turn_row),
+        Kind::Turn,
+    );
+    rig.publish(
+        &mut st,
+        3,
+        &full[..turn2_row],
+        &turn2_keys,
+        11,
+        mk(turn2_row),
+        Kind::Turn,
+    );
+    assert!(rig.flush(&mut st, 30));
+    assert_eq!(
+        rig.telem.unneeded.load(Ordering::Relaxed) - before_unneeded,
+        1,
+        "linear Turn -> Turn must still supersede"
+    );
+}
+
+/// Adopting an MTP state from SSD must account for all decoded draft segments
+/// (`StateShape::resident_bytes_at(row)`), not only the trunk `span_bytes()`.
+#[test]
+fn adopt_resident_bytes_include_mtp_draft_segments() {
+    let root = Temp::new("persist-mtp-resident-bytes");
+    let mut cfg = tiny_cfg();
+    let mut mtp_layer = cfg.layers[1].clone();
+    mtp_layer.mtp = true;
+    mtp_layer.engram = None;
+    cfg.layers.push(mtp_layer);
+    let shape = StateShape::of(&cfg, true).unwrap();
+    let draft_shape = shape.draft.as_ref().unwrap();
+    let pid = Some((
+        "1234567890abcdef1234567890abcdef",
+        b"hy4-mtp-resident-bytes".as_slice(),
+    ));
+
+    let row = MINIMUM_ROWS;
+    let tok = tokens(row + 16);
+    let (_, mut state) = make_cell_state(&cfg, &tok[..row], &[row], false);
+    let whole = segments_at(row);
+    let m = row - 1;
+    let open_rows = m - whole * BLOCK_ROWS;
+    let per = BLOCK_ROWS / draft_shape.index.kpool.max(1);
+    let seg = Arc::new(Segment {
+        kv: MxArray::zeros(
+            &[BLOCK_ROWS as i64, draft_shape.width],
+            Some(DType::Float16),
+        )
+        .unwrap(),
+        pooled: MxArray::zeros(
+            &[per as i64, draft_shape.index.head_dim as i64],
+            Some(DType::Float16),
+        )
+        .unwrap(),
+    });
+    let expected_resident = shape.span_bytes() + whole as u64 * seg.nbytes() as u64;
+    assert_eq!(shape.resident_bytes_at(row), expected_resident);
+    assert!(expected_resident > shape.span_bytes());
+
+    let open_pooled_groups = open_rows / draft_shape.index.kpool.max(1);
+    let open = OpenRows {
+        kv: MxArray::zeros(&[open_rows as i64, draft_shape.width], Some(DType::Float16)).unwrap(),
+        pooled: (open_pooled_groups > 0).then(|| {
+            MxArray::zeros(
+                &[open_pooled_groups as i64, draft_shape.index.head_dim as i64],
+                Some(DType::Float16),
+            )
+            .unwrap()
+        }),
+    };
+    let tail_rows = (draft_shape.index.kpool.saturating_sub(1) + WINDOW_SLACK).min(m);
+    let tail_arr = MxArray::zeros(
+        &[tail_rows as i64, draft_shape.index.head_dim as i64],
+        Some(DType::Float32),
+    )
+    .unwrap();
+    let tail = TokTail::of_rows(&draft_shape.index, Some(tail_arr), m).unwrap();
+    let seed = MxArray::zeros(&[1, draft_shape.dim], Some(DType::Float32)).unwrap();
+    state.draft = Some(DraftState {
+        segments: vec![Arc::clone(&seg); whole],
+        open: Some(open),
+        tail,
+        seed,
+    });
+    assert!(state.bytes() <= shape.resident_bytes_at(row));
+
+    let keys: Vec<Vec<u64>> = (0..row / BLOCK_ROWS)
+        .map(|b| vec![0x7000_0000 + b as u64])
+        .collect();
+    {
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(4);
+        let hot = vec![0u64; row / BLOCK_ROWS];
+        rig.disk.start(1, &tok[..row], &keys, &hot, 0);
+        let k = Key {
+            tokens: &tok[..row],
+            keys: &keys,
+            salt: 0,
+        };
+        let id = st.publish(k, state, Kind::Prompt).unwrap().unwrap();
+        let draft = st.get(id).and_then(|s| s.draft.as_ref());
+        rig.disk.published(st.store(), 1, row, draft, Some(id));
+        assert!(rig.flush(&mut st, 30));
+    }
+
+    // Session 2: adopt and verify cached resident bytes include all draft segments.
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(4);
+    assert_eq!(rig.disk.adopt(st.store_mut()), 1);
+    assert_eq!(rig.disk.state_bytes_at(row), expected_resident);
+    let entry = st.store().entries().next().unwrap();
+    let cached_bytes = entry.resident_bytes().saturating_sub(entry.state_bytes());
+    assert_eq!(
+        cached_bytes, expected_resident,
+        "adopted entry cached_bytes must include MTP draft segments"
+    );
+}
+
+/// Pre-upgrade SSD cold replay entries stored 1-element `[k]` extra keys on
+/// non-grid replay chunks where the upgraded `pass_keys` now emits
+/// `[WRITE_TAG, k]`. Adopted legacy entries must still match identical prompts
+/// and restore their original SSD KV block chain, while rejecting mismatched
+/// hashes.
+#[test]
+fn legacy_ssd_cold_replay_entry_resumes_under_new_pass_keys() {
+    use super::prefill::Grid;
+    use super::sched::pass_keys;
+
+    const OPEN: [u32; 3] = [120_000, 611, 10_372];
+    const GEN: [u32; 5] = [120_000, 611, 10_372, 120_001, 120_029];
+    const CHUNK: usize = 4096;
+
+    let root = Temp::new("persist-legacy-pass-keys");
+    let cfg = tiny_cfg();
+    let shape = StateShape::of(&cfg, false).unwrap();
+    let pid = Some((
+        "abcdef0123456789abcdef0123456789",
+        b"hy4-legacy-pass-keys".as_slice(),
+    ));
+
+    let g = Grid::new(CHUNK, OPEN.to_vec()).unwrap();
+    let p_row = MINIMUM_ROWS + 256; // 2304: non-grid replay_row
+    let mut prompt: Vec<u32> = (0..p_row + GEN.len())
+        .map(|i| 19 + (i % 101) as u32)
+        .collect();
+    prompt[p_row..].copy_from_slice(&GEN);
+    assert_eq!(g.replay_row(&prompt), p_row);
+
+    let ends = g.ends(0, &prompt);
+    let new_pass = pass_keys(&prompt, &ends, CHUNK);
+    assert_eq!(new_pass.len(), p_row / BLOCK_ROWS);
+    assert!(new_pass.iter().all(|k| is_written(k)));
+
+    // Legacy pre-upgrade pass_keys emitted the bare 1-element `[k]` hash.
+    let legacy_pass: Vec<Vec<u64>> = new_pass.iter().map(|k| vec![k[1]]).collect();
+    assert!(!any_written(&legacy_pass));
+
+    // Session 1 (pre-upgrade): persist cold replay state under legacy `[k]` keys.
+    {
+        let mut rig = TierRig::open(&root, pid, &shape);
+        let mut st = States::<PrefixState>::with_cap(4);
+        let (_, state) = make_cell_state(&cfg, &prompt[..p_row], &[p_row], false);
+        let id = rig.publish(
+            &mut st,
+            1,
+            &prompt[..p_row],
+            &legacy_pass,
+            0,
+            state,
+            Kind::Prompt,
+        );
+        assert!(rig.flush(&mut st, 30));
+        assert!(st.store().get(id).unwrap().disk().unwrap().landed);
+    }
+
+    // Session 2 (post-upgrade): adopt legacy entry, look up with new `[WRITE_TAG, k]`
+    // pass_keys, verify hit + SSD chain/state restore + mismatch rejection.
+    let mut rig = TierRig::open(&root, pid, &shape);
+    let mut st = States::<PrefixState>::with_cap(4);
+    assert_eq!(rig.disk.adopt(st.store_mut()), 1);
+
+    let pk_new = Key {
+        tokens: &prompt,
+        keys: &new_pass,
+        salt: 0,
+    };
+    let found = st.disk_only_above(pk_new, 0);
+    assert_eq!(found.len(), 1);
+    let (id, row) = found[0];
+    assert_eq!(row, p_row);
+    assert!(!any_written(st.store().get(id).unwrap().extra_keys()));
+    assert_eq!(st.keys_of(id).unwrap(), legacy_pass);
+
+    // Mismatched hash `[WRITE_TAG, k ^ 1]` must still be rejected.
+    let mut bad_pass = new_pass.clone();
+    bad_pass[0][1] ^= 1;
+    assert!(
+        st.disk_only_above(
+            Key {
+                tokens: &prompt,
+                keys: &bad_pass,
+                salt: 0,
+            },
+            0
+        )
+        .is_empty()
+    );
+
+    // Original legacy SSD KV chain and state decode cleanly under stored legacy keys.
+    let (disk_key, extra) = {
+        let e = st.store().get(id).unwrap();
+        (e.disk().unwrap().key, e.extra_keys().to_vec())
+    };
+    let segments = rig
+        .disk
+        .chain_whole(&prompt, &extra, 0, row, &|_| false)
+        .expect("legacy SSD KV chain must remain whole");
+    match rig.disk.read_state(
+        st.store_mut(),
+        disk_key,
+        row,
+        &extra,
+        &segments,
+        SEGMENT_BOUND,
+    ) {
+        Read::State(restored) => {
+            assert_eq!(restored.row, p_row);
+            assert!(st.promote(id, restored));
+            assert_eq!(st.lookup(pk_new, &|_| true), Some((id, p_row)));
+        }
+        Read::Busy | Read::Failed => panic!("legacy SSD replay state failed to read back"),
     }
 }

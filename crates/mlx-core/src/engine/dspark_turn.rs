@@ -21,7 +21,7 @@ use crate::array::{DType, MxArray};
 use crate::decode_profiler::DecodeProfiler;
 use crate::engine::backend::{
     DecodeStep, DsparkBackend, DsparkProposal, DsparkStepper, FinalizeArgs, PagedBackend,
-    PagedPrefix, TurnOutput, TurnTokenObserver, WholeTurnArgs,
+    PagedPrefix, ThinkEndResolution, ThinkingSetup, TurnOutput, TurnTokenObserver, WholeTurnArgs,
 };
 use crate::engine::decode::{StreamingCtx, TurnStreaming};
 use crate::engine::dspark_timeline::{self as timeline, Mark};
@@ -633,6 +633,20 @@ impl SampledRows {
     }
 }
 
+/// Provisional thinking-budget cap for one already-accepted speculative wave.
+///
+/// Delegates to [`ReasoningTracker::speculative_wave_limit`] so the check reads
+/// the tracker's live `budget` (including cycle-guard reductions) and enforces
+/// forced multi-token ending text before `is_close`.
+pub(crate) fn thinking_budget_wave_limit(
+    tracker: &ReasoningTracker,
+    _setup: ThinkingSetup,
+    _close: &ThinkEndResolution,
+    tokens: &[u32],
+) -> usize {
+    tracker.speculative_wave_limit(tokens)
+}
+
 /// The rows `cut` decides for `drafts`.
 fn cut_targets(cut: Option<&ThinkingCut>, drafts: &[i32]) -> Option<CutTargets> {
     cut.map(|c| c.targets(drafts))
@@ -653,6 +667,9 @@ pub(crate) struct DsparkTurnArgs<'a> {
     pub block_size: usize,
     pub params: &'a ChatParams,
     pub reasoning_tracker: &'a mut ReasoningTracker,
+    /// Resolved dynamic thinking setup + close tag so mid-wave open markers
+    /// enforce the thinking budget before committing or streaming tokens.
+    pub thinking: Option<(ThinkingSetup, &'a ThinkEndResolution)>,
     pub profiler: &'a mut DecodeProfiler,
     pub max_new_tokens: i32,
     pub eos_id: u32,
@@ -983,6 +1000,7 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
         block_size,
         params: p,
         reasoning_tracker: tracker,
+        thinking,
         profiler,
         max_new_tokens: max,
         eos_id,
@@ -1283,13 +1301,29 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                         tree_out.accepted_nodes,
                     )));
                 }
-                let accepted_drafts_k = tree_out.accepted_nodes.len() - 1;
-                let Some(&boundary_id) = tree_out.emitted_tokens.last() else {
-                    return Err(Error::from_reason(
-                        "DSpark tree verify emitted_tokens unexpectedly empty",
-                    ));
+                let mut accepted = tree_out.emitted_tokens;
+                let (accepted_drafts_k, boundary_id) = if let Some((setup, close)) = thinking {
+                    let budget_limit = thinking_budget_wave_limit(tracker, setup, close, &accepted);
+                    if budget_limit < accepted.len() {
+                        accepted.truncate(budget_limit);
+                        let new_k = budget_limit.saturating_sub(1);
+                        (new_k, accepted[new_k])
+                    } else {
+                        let Some(&boundary_id) = accepted.last() else {
+                            return Err(Error::from_reason(
+                                "DSpark tree verify emitted_tokens unexpectedly empty",
+                            ));
+                        };
+                        (tree_out.accepted_nodes.len() - 1, boundary_id)
+                    }
+                } else {
+                    let Some(&boundary_id) = accepted.last() else {
+                        return Err(Error::from_reason(
+                            "DSpark tree verify emitted_tokens unexpectedly empty",
+                        ));
+                    };
+                    (tree_out.accepted_nodes.len() - 1, boundary_id)
                 };
-                let accepted = tree_out.emitted_tokens;
                 let DsparkCycleDecision {
                     emit_count,
                     keep,
@@ -1327,7 +1361,10 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                 profiler.end();
                 commit_res?;
                 if tree_out.draft_count >= 1 {
-                    profiler.record_mtp_cycle(tree_out.draft_count, tree_out.accepted_draft_count);
+                    profiler.record_mtp_cycle(
+                        tree_out.draft_count,
+                        tree_out.accepted_draft_count.min(accepted_drafts_k),
+                    );
                 }
                 (accepted, emit_count, kept_drafts, stop, boundary_id, None)
             } else {
@@ -1539,6 +1576,21 @@ pub(crate) fn run_dspark_turn<B: DsparkBackend, R: rand::Rng>(
                         .map(|&id| id as u32),
                 );
                 accepted.push(boundary_id);
+
+                let (accepted_drafts_k, boundary_id) = if !tf.is_forcing()
+                    && let Some((setup, close)) = thinking
+                {
+                    let budget_limit = thinking_budget_wave_limit(tracker, setup, close, &accepted);
+                    if budget_limit < accepted.len() {
+                        accepted.truncate(budget_limit);
+                        let new_k = budget_limit.saturating_sub(1);
+                        (new_k, accepted[new_k])
+                    } else {
+                        (accepted_drafts_k, boundary_id)
+                    }
+                } else {
+                    (accepted_drafts_k, boundary_id)
+                };
 
                 // STOP-CLAMP BEFORE COMMIT: walk the accepted list simulating the
                 // history, replaying `run_mtp_turn`'s emit-loop per-token check
@@ -1998,6 +2050,7 @@ pub(crate) fn run_paged_dspark_turn<B: PagedDsparkBackend>(
                 block_size,
                 params: &p,
                 reasoning_tracker: &mut reasoning_tracker,
+                thinking: Some((thinking, &close)),
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
@@ -2299,6 +2352,7 @@ pub(crate) fn run_flat_dspark_turn<B: FlatDsparkBackend>(
                 block_size: prefix.block_size,
                 params: &params,
                 reasoning_tracker: &mut reasoning_tracker,
+                thinking: Some((thinking, &close)),
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
@@ -3373,6 +3427,7 @@ mod tests {
                 block_size,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
@@ -5127,6 +5182,7 @@ mod tests {
                 block_size,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens,
                 eos_id,
@@ -5655,7 +5711,7 @@ mod tree_verify_tests {
         ChatBackend, DsparkTreeGreedyResult, DsparkVerifyOutput, FinalizeArgs, ResetScope,
         SaveStateArgs, TurnSetup,
     };
-    use crate::engine::penalties::ReasoningTracker;
+    use crate::engine::penalties::{ReasoningClose, ReasoningTracker};
     use crate::engine::types::ChatResult;
     use crate::sampling::SamplingConfig;
     use crate::tokenizer::Qwen3Tokenizer;
@@ -5920,6 +5976,7 @@ mod tree_verify_tests {
                 block_size: 7,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens: 5,
                 eos_id: 31,
@@ -5999,6 +6056,7 @@ mod tree_verify_tests {
                 block_size: 7,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens: 10,
                 eos_id: 31,
@@ -6050,6 +6108,7 @@ mod tree_verify_tests {
                 block_size: 7,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens: 10,
                 eos_id: 31,
@@ -6101,6 +6160,7 @@ mod tree_verify_tests {
                 block_size: 7,
                 params: &params,
                 reasoning_tracker: &mut tracker,
+                thinking: None,
                 profiler: &mut profiler,
                 max_new_tokens: 5,
                 eos_id: 31,
@@ -6133,5 +6193,487 @@ mod tree_verify_tests {
                 .any(|c| matches!(c, TreeCall::LinearPropose { .. })),
             "penalized turns must route through linear propose"
         );
+    }
+
+    /// Finding 1 regression (exclusive verify-tree route): a dynamic open-token
+    /// verify-tree wave starting outside thinking (`cut == None`) that accepts
+    /// `[..., open_id, thought_1, ...]` must truncate BEFORE `commit_tree`,
+    /// rolling back unkept tree nodes and never emitting or observing thought
+    /// tokens past the configured budget (both `budget == 0` and tight `budget == 2`).
+    #[test]
+    fn exclusive_tree_verify_dynamic_open_enforces_zero_and_tight_budget() {
+        const OPEN: u32 = 10;
+        const CLOSE_0: u32 = 13;
+        const CLOSE_1: u32 = 14;
+        const ANSWER: u32 = 25;
+        let close =
+            ThinkEndResolution::with_open_token(OPEN, std::sync::Arc::from([CLOSE_0, CLOSE_1]));
+
+        // Case 1: thinkingBudget == 0 -> tree emits [OPEN, 20, 21, 22] on nodes [0, 2, 4, 6].
+        // Must truncate to [OPEN], commit ONLY node [0] (contiguous=true), observe ONLY [OPEN],
+        // and force [CLOSE_0, CLOSE_1] on the next cycles with ZERO thought tokens!
+        {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut backend = TreeMockBackend {
+                tree_steps: VecDeque::from([TreeScriptStep {
+                    emitted_tokens: vec![OPEN, 20, 21, 22],
+                    accepted_nodes: vec![0, 2, 4, 6],
+                    draft_count: 7,
+                    tree_nodes: 16,
+                }]),
+                linear_next_token: ANSWER,
+                calls: Rc::clone(&calls),
+            };
+            let setup = ThinkingSetup {
+                enabled: true,
+                budget: Some(0),
+                cycle_guard: false,
+            };
+            let params = greedy_tree_params(5);
+            let mut tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut profiler = DecodeProfiler::new("test", "tree_mock");
+            let mut generated = Vec::new();
+            let mut history = vec![1, 2];
+            let mut finish_reason = String::new();
+            let mut first_tok = None;
+            let mut rng = rand::rng();
+
+            let outcome = run_dspark_turn(
+                &mut backend,
+                &mut rng,
+                DsparkTurnArgs {
+                    y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                    block_size: 7,
+                    params: &params,
+                    reasoning_tracker: &mut tracker,
+                    thinking: Some((setup, &close)),
+                    profiler: &mut profiler,
+                    max_new_tokens: 5,
+                    eos_id: 31,
+                    generated_tokens: &mut generated,
+                    token_history: &mut history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_tok,
+                    report_perf: false,
+                    generation_stream: Stream::generation(),
+                    cancel_flag: None,
+                    turn_token_observer: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                generated,
+                vec![4, OPEN, CLOSE_0, CLOSE_1, ANSWER],
+                "budget=0 tree wave must emit zero thought tokens past open_id"
+            );
+            assert!(!outcome.last_in_cache);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+            assert_eq!(tracker.outcome().cut_at, Some(0));
+            assert!(
+                calls.borrow().contains(&TreeCall::CommitTree {
+                    nodes: vec![0],
+                    contiguous: true,
+                }),
+                "budget=0 truncation must commit ONLY anchor node [0]: {:?}",
+                calls.borrow()
+            );
+            assert!(
+                calls.borrow().contains(&TreeCall::Observe(vec![OPEN])),
+                "SAM observer must receive only truncated [OPEN]: {:?}",
+                calls.borrow()
+            );
+            assert!(
+                !calls
+                    .borrow()
+                    .iter()
+                    .any(|c| matches!(c, TreeCall::Observe(toks) if toks.contains(&20))),
+                "dropped post-budget thought tokens must never reach observe_emitted_tokens"
+            );
+        }
+
+        // Case 2: tight budget == 2 -> tree emits [5, OPEN, 20, 21, 22, 23] on nodes [0, 1, 3, 5, 7, 9].
+        // Must truncate to [5, OPEN, 20, 21], commit ONLY nodes [0, 1, 3, 5] (contiguous=false),
+        // observe ONLY [5, OPEN, 20, 21], and force [CLOSE_0, CLOSE_1] immediately after!
+        {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut backend = TreeMockBackend {
+                tree_steps: VecDeque::from([TreeScriptStep {
+                    emitted_tokens: vec![5, OPEN, 20, 21, 22, 23],
+                    accepted_nodes: vec![0, 1, 3, 5, 7, 9],
+                    draft_count: 7,
+                    tree_nodes: 16,
+                }]),
+                linear_next_token: ANSWER,
+                calls: Rc::clone(&calls),
+            };
+            let setup = ThinkingSetup {
+                enabled: true,
+                budget: Some(2),
+                cycle_guard: false,
+            };
+            let params = greedy_tree_params(7);
+            let mut tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut profiler = DecodeProfiler::new("test", "tree_mock");
+            let mut generated = Vec::new();
+            let mut history = vec![1, 2];
+            let mut finish_reason = String::new();
+            let mut first_tok = None;
+            let mut rng = rand::rng();
+
+            let outcome = run_dspark_turn(
+                &mut backend,
+                &mut rng,
+                DsparkTurnArgs {
+                    y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                    block_size: 7,
+                    params: &params,
+                    reasoning_tracker: &mut tracker,
+                    thinking: Some((setup, &close)),
+                    profiler: &mut profiler,
+                    max_new_tokens: 7,
+                    eos_id: 31,
+                    generated_tokens: &mut generated,
+                    token_history: &mut history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_tok,
+                    report_perf: false,
+                    generation_stream: Stream::generation(),
+                    cancel_flag: None,
+                    turn_token_observer: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                generated,
+                vec![4, 5, OPEN, 20, 21, CLOSE_0, CLOSE_1],
+                "budget=2 tree wave must stop at 2 thought tokens and force close immediately"
+            );
+            assert!(!outcome.last_in_cache);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+            assert_eq!(tracker.outcome().cut_at, Some(2));
+            assert!(
+                calls.borrow().contains(&TreeCall::CommitTree {
+                    nodes: vec![0, 1, 3, 5],
+                    contiguous: false,
+                }),
+                "budget=2 truncation must commit ONLY kept tree prefix [0, 1, 3, 5]: {:?}",
+                calls.borrow()
+            );
+            assert!(
+                calls
+                    .borrow()
+                    .contains(&TreeCall::Observe(vec![5, OPEN, 20, 21])),
+                "SAM observer must receive only [5, OPEN, 20, 21]: {:?}",
+                calls.borrow()
+            );
+        }
+    }
+
+    /// Finding 1 regression (exclusive linear DSpark/DFlash2 route): a dynamic
+    /// open-token linear speculative wave starting outside thinking (`cut == None`)
+    /// that accepts `[..., open_id, thought_1, ...]` must truncate BEFORE `commit`,
+    /// rolling back unkept KV/draft slots (`keep = 1 + kept_drafts`), passing the
+    /// truncated boundary token as the next cycle's anchor, and forcing `thinking_end`
+    /// at row 0 under both `budget == 0` and tight `budget == 2`.
+    #[test]
+    fn exclusive_linear_dspark_dynamic_open_enforces_zero_and_tight_budget() {
+        const OPEN: u32 = 10;
+        const CLOSE_0: u32 = 13;
+        const CLOSE_1: u32 = 14;
+        const ANSWER: u32 = 25;
+        let close =
+            ThinkEndResolution::with_open_token(OPEN, std::sync::Arc::from([CLOSE_0, CLOSE_1]));
+
+        #[derive(Debug, PartialEq, Eq)]
+        enum LinearCall {
+            Verify(Vec<u32>),
+            Commit { keep: usize, total: usize },
+            EvalBoundary(i32),
+        }
+
+        struct LinearDynamicBackend {
+            wave1_drafts: Option<Vec<i32>>,
+            wave1_targets: Option<Vec<u32>>,
+            fallback_token: u32,
+            calls: Rc<RefCell<Vec<LinearCall>>>,
+        }
+
+        struct LinearDynamicStepper<'a> {
+            backend: &'a mut LinearDynamicBackend,
+        }
+
+        impl DsparkStepper for LinearDynamicStepper<'_> {
+            fn propose(
+                &mut self,
+                _anchor_id: u32,
+                max_len: usize,
+                _params: &ChatParams,
+                _rng: &mut dyn rand::Rng,
+            ) -> Result<DsparkProposal> {
+                let draft_ids = self
+                    .backend
+                    .wave1_drafts
+                    .take()
+                    .map(|d| d[..d.len().min(max_len)].to_vec())
+                    .unwrap_or_default();
+                Ok(DsparkProposal {
+                    draft_ids,
+                    device_draft_ids: None,
+                    device_draft_sparse: None,
+                    draft_dists: Vec::new(),
+                    draft_sparse_dists: Vec::new(),
+                    keep_probabilities: None,
+                })
+            }
+
+            fn verify(&mut self, verify_ids: &[u32]) -> Result<DsparkVerifyOutput> {
+                self.backend
+                    .calls
+                    .borrow_mut()
+                    .push(LinearCall::Verify(verify_ids.to_vec()));
+                let rows = verify_ids.len();
+                let targets = self
+                    .backend
+                    .wave1_targets
+                    .take()
+                    .unwrap_or_else(|| vec![self.backend.fallback_token; rows]);
+                let mut data = vec![-10.0f32; rows * 32];
+                for (r, &tok) in targets.iter().take(rows).enumerate() {
+                    data[r * 32 + tok as usize] = 10.0;
+                }
+                let logits = MxArray::from_float32(&data, &[1, rows as i64, 32])?;
+                Ok(DsparkVerifyOutput { logits })
+            }
+
+            fn commit(&mut self, keep: usize, total_written: usize) -> Result<()> {
+                self.backend.calls.borrow_mut().push(LinearCall::Commit {
+                    keep,
+                    total: total_written,
+                });
+                Ok(())
+            }
+
+            fn eval_boundary(&self, token: &MxArray) {
+                if let Ok(tok) = token.item_at_int32(0) {
+                    self.backend
+                        .calls
+                        .borrow_mut()
+                        .push(LinearCall::EvalBoundary(tok));
+                }
+            }
+        }
+
+        impl ChatBackend for LinearDynamicBackend {
+            type Decode<'a>
+                = DummyDecode
+            where
+                Self: 'a;
+
+            fn tokenizer(&self) -> Result<Arc<Qwen3Tokenizer>> {
+                unreachable!()
+            }
+            fn family_name(&self) -> &'static str {
+                "linear_dynamic_mock"
+            }
+            fn session_eos_id(&self, _tok: &Qwen3Tokenizer) -> Result<u32> {
+                Ok(31)
+            }
+            fn cached_token_history(&self) -> &[u32] {
+                &[]
+            }
+            fn reset_caches(&mut self, _scope: ResetScope) -> Result<()> {
+                Ok(())
+            }
+            fn verify_cache_prefix(&self, _tokens: &[u32], _reuse_cache: bool) -> usize {
+                0
+            }
+            fn save_cache_state(&mut self, _args: SaveStateArgs<'_>) {}
+            fn eval_caches(&self) -> Result<()> {
+                Ok(())
+            }
+            fn prefill(&mut self, _tokens: &[u32], _stream: Stream) -> Result<MxArray> {
+                unreachable!()
+            }
+            fn begin_decode(&mut self, _setup: &TurnSetup<'_>) -> Result<Self::Decode<'_>> {
+                Ok(DummyDecode)
+            }
+            fn finalize_turn(&self, _args: FinalizeArgs<'_>) -> Result<ChatResult> {
+                unreachable!()
+            }
+        }
+
+        impl DsparkBackend for LinearDynamicBackend {
+            type DsparkDecode<'a>
+                = LinearDynamicStepper<'a>
+            where
+                Self: 'a;
+
+            fn begin_dspark_decode(
+                &mut self,
+                _block_size: usize,
+            ) -> Result<Self::DsparkDecode<'_>> {
+                Ok(LinearDynamicStepper { backend: self })
+            }
+        }
+
+        // Case 1: budget == 0 -> Wave 1 proposes [OPEN, 20, 21] and target accepts all + bonus 22.
+        // Must truncate to [OPEN], commit keep=1 of total=4, set next anchor = OPEN, and force [CLOSE_0, CLOSE_1].
+        {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut backend = LinearDynamicBackend {
+                wave1_drafts: Some(vec![OPEN as i32, 20, 21]),
+                wave1_targets: Some(vec![OPEN, 20, 21, 22]),
+                fallback_token: ANSWER,
+                calls: Rc::clone(&calls),
+            };
+            let setup = ThinkingSetup {
+                enabled: true,
+                budget: Some(0),
+                cycle_guard: false,
+            };
+            let params = greedy_tree_params(5);
+            let mut tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut profiler = DecodeProfiler::new("test", "linear_dynamic_mock");
+            let mut generated = Vec::new();
+            let mut history = vec![1, 2];
+            let mut finish_reason = String::new();
+            let mut first_tok = None;
+            let mut rng = rand::rng();
+
+            let outcome = run_dspark_turn(
+                &mut backend,
+                &mut rng,
+                DsparkTurnArgs {
+                    y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                    block_size: 7,
+                    params: &params,
+                    reasoning_tracker: &mut tracker,
+                    thinking: Some((setup, &close)),
+                    profiler: &mut profiler,
+                    max_new_tokens: 5,
+                    eos_id: 31,
+                    generated_tokens: &mut generated,
+                    token_history: &mut history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_tok,
+                    report_perf: false,
+                    generation_stream: Stream::generation(),
+                    cancel_flag: None,
+                    turn_token_observer: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                generated,
+                vec![4, OPEN, CLOSE_0, CLOSE_1, ANSWER],
+                "budget=0 linear wave must commit zero thought tokens past open_id"
+            );
+            assert!(!outcome.last_in_cache);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+            assert_eq!(tracker.outcome().cut_at, Some(0));
+            let ledger = calls.borrow();
+            assert_eq!(
+                ledger[0],
+                LinearCall::Verify(vec![4, OPEN, 20, 21]),
+                "Wave 1 verified anchor + 3 drafts"
+            );
+            assert_eq!(
+                ledger[1],
+                LinearCall::Commit { keep: 1, total: 4 },
+                "Wave 1 must roll back all 3 draft slots and keep only anchor (keep=1)"
+            );
+            assert_eq!(
+                ledger[2],
+                LinearCall::EvalBoundary(OPEN as i32),
+                "next cycle anchor must be the truncated boundary OPEN, not dropped bonus 22"
+            );
+            assert_eq!(
+                ledger[3],
+                LinearCall::Verify(vec![OPEN]),
+                "Cycle 2 must start from anchor OPEN and force CLOSE_0"
+            );
+        }
+
+        // Case 2: tight budget == 2 -> Wave 1 proposes [5, OPEN, 20, 21, 22] and target accepts all + bonus 23.
+        // Must truncate to [5, OPEN, 20, 21], commit keep=4 of total=6, set next anchor = 21, and force [CLOSE_0, CLOSE_1].
+        {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let mut backend = LinearDynamicBackend {
+                wave1_drafts: Some(vec![5, OPEN as i32, 20, 21, 22]),
+                wave1_targets: Some(vec![5, OPEN, 20, 21, 22, 23]),
+                fallback_token: ANSWER,
+                calls: Rc::clone(&calls),
+            };
+            let setup = ThinkingSetup {
+                enabled: true,
+                budget: Some(2),
+                cycle_guard: false,
+            };
+            let params = greedy_tree_params(7);
+            let mut tracker = ReasoningTracker::from_setup(&setup, &close);
+            let mut profiler = DecodeProfiler::new("test", "linear_dynamic_mock");
+            let mut generated = Vec::new();
+            let mut history = vec![1, 2];
+            let mut finish_reason = String::new();
+            let mut first_tok = None;
+            let mut rng = rand::rng();
+
+            let outcome = run_dspark_turn(
+                &mut backend,
+                &mut rng,
+                DsparkTurnArgs {
+                    y: MxArray::from_int32(&[4], &[1]).unwrap(),
+                    block_size: 7,
+                    params: &params,
+                    reasoning_tracker: &mut tracker,
+                    thinking: Some((setup, &close)),
+                    profiler: &mut profiler,
+                    max_new_tokens: 7,
+                    eos_id: 31,
+                    generated_tokens: &mut generated,
+                    token_history: &mut history,
+                    finish_reason: &mut finish_reason,
+                    first_token_instant: &mut first_tok,
+                    report_perf: false,
+                    generation_stream: Stream::generation(),
+                    cancel_flag: None,
+                    turn_token_observer: None,
+                },
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                generated,
+                vec![4, 5, OPEN, 20, 21, CLOSE_0, CLOSE_1],
+                "budget=2 linear wave must stop at 2 thought tokens and force close immediately"
+            );
+            assert!(!outcome.last_in_cache);
+            assert_eq!(tracker.outcome().close, Some(ReasoningClose::Budget));
+            assert_eq!(tracker.outcome().cut_at, Some(2));
+            let ledger = calls.borrow();
+            assert_eq!(ledger[0], LinearCall::Verify(vec![4, 5, OPEN, 20, 21, 22]));
+            assert_eq!(
+                ledger[1],
+                LinearCall::Commit { keep: 4, total: 6 },
+                "Wave 1 must keep anchor + [5, OPEN, 20] (keep=4) and roll back [21, 22]"
+            );
+            assert_eq!(
+                ledger[2],
+                LinearCall::EvalBoundary(21),
+                "next cycle anchor must be truncated boundary 21, not dropped bonus 23"
+            );
+            assert_eq!(
+                ledger[3],
+                LinearCall::Verify(vec![21]),
+                "Cycle 2 must start from anchor 21 and force CLOSE_0"
+            );
+        }
     }
 }

@@ -183,14 +183,22 @@ describe('mapRequest', () => {
     expect(config.topP).toBe(0.9);
   });
 
-  it('maps reasoning.effort to reasoningEffort in config', () => {
-    const { config } = mapRequest({
-      model: 'test-model',
-      input: 'Hello',
-      reasoning: { effort: 'high' },
-    });
-
-    expect(config.reasoningEffort).toBe('high');
+  it('maps reasoning.effort to reasoningEffort in config (including minimal) and rejects invalid values', () => {
+    for (const effort of ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max']) {
+      const { config } = mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        reasoning: { effort },
+      });
+      expect(config.reasoningEffort).toBe(effort);
+    }
+    expect(() =>
+      mapRequest({
+        model: 'test-model',
+        input: 'Hello',
+        reasoning: { effort: 'bogus' },
+      }),
+    ).toThrow('Invalid reasoning.effort');
   });
 
   it('maps tools from flat format to nested format with stringified properties', () => {
@@ -877,6 +885,100 @@ describe('mapRequest', () => {
           ],
         }),
       ).toThrow(/only allowed on user messages/);
+    });
+
+    it('accepts wrapped, unpadded, and URL-safe base64 in input_image and rejects invalid base64 or unsupported MIME', () => {
+      const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const expected = new Uint8Array(Buffer.from(b64, 'base64'));
+      const unpaddedUrlSafe = b64.replace(/=+$/, '').replace(/\+/g, '-').replace(/\//g, '_');
+      const wrapped = ` ${unpaddedUrlSafe.slice(0, 18)}\r\n${unpaddedUrlSafe.slice(18)} `;
+
+      const { messages } = mapRequest({
+        model: 'test-model',
+        input: [
+          {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_image', image_url: `data:image/png;base64,${wrapped}` }],
+          },
+        ],
+      });
+      expect(messages[0].images).toHaveLength(1);
+      expect(messages[0].images![0]).toEqual(expected);
+
+      expect(() =>
+        mapRequest({
+          model: 'test-model',
+          input: [
+            {
+              type: 'message',
+              role: 'user',
+              content: [{ type: 'input_image', image_url: 'data:image/png;base64,@@@' }],
+            },
+          ],
+        }),
+      ).toThrow('Could not process image');
+
+      for (const mime of ['image/heic', 'image/bmp', 'image/tiff']) {
+        expect(() =>
+          mapRequest({
+            model: 'test-model',
+            input: [
+              {
+                type: 'message',
+                role: 'user',
+                content: [{ type: 'input_image', image_url: `data:${mime};base64,${b64}` }],
+              },
+            ],
+          }),
+        ).toThrow('Could not process image');
+      }
+    });
+
+    it('enforces the 64-image cap across priorMessages and req.input', () => {
+      const b64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const pngBytes = new Uint8Array(Buffer.from(b64, 'base64'));
+      const prior = [{ role: 'user' as const, content: 'prior', images: Array.from({ length: 60 }, () => pngBytes) }];
+
+      // 60 prior + 4 new = 64 -> succeeds
+      expect(() =>
+        mapRequest(
+          {
+            model: 'test-model',
+            input: [
+              {
+                type: 'message',
+                role: 'user',
+                content: Array.from({ length: 4 }, () => ({
+                  type: 'input_image' as const,
+                  image_url: `data:image/png;base64,${b64}`,
+                })),
+              },
+            ],
+          },
+          prior,
+        ),
+      ).not.toThrow();
+
+      // 60 prior + 5 new = 65 -> rejects
+      expect(() =>
+        mapRequest(
+          {
+            model: 'test-model',
+            input: [
+              {
+                type: 'message',
+                role: 'user',
+                content: Array.from({ length: 5 }, () => ({
+                  type: 'input_image' as const,
+                  image_url: `data:image/png;base64,${b64}`,
+                })),
+              },
+            ],
+          },
+          prior,
+        ),
+      ).toThrow('requests support at most 64 images');
     });
   });
 

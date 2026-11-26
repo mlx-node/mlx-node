@@ -17,6 +17,8 @@ pub use accelerator::{RuntimeCapabilities, get_runtime_capabilities};
 pub mod array;
 pub mod audio;
 pub mod autograd;
+pub mod base64;
+pub use base64::decode_base64_strict;
 #[cfg(test)]
 mod benchmarks;
 pub mod cache_limit;
@@ -57,6 +59,7 @@ pub mod training_state;
 pub mod transformer;
 pub mod utils;
 pub mod vision;
+pub use vision::{validate_image_bytes, validate_image_bytes_async};
 
 #[cfg(not(target_family = "wasm"))]
 #[global_allocator]

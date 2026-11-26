@@ -540,6 +540,25 @@ pub(crate) struct ThinkEndResolution {
     /// the whole family while the forced token stays the rendered one.
     /// Empty for every other family.
     pub think_end_extra_ids: Vec<u32>,
+    /// Optional dynamic thinking-open token id for families whose prompt does
+    /// not pre-open a thinking block (e.g. Inkling2 `<|content_thought|>`).
+    /// When `Some`, [`crate::engine::penalties::ReasoningTracker`] starts
+    /// outside thinking and enters thinking when this token is observed.
+    pub(crate) think_open_id: Option<u32>,
+}
+
+impl ThinkEndResolution {
+    /// Construct a dynamic open-token resolution (starts outside thinking,
+    /// enters on `open_id`, closes on `thinking_end`).
+    pub(crate) fn with_open_token(open_id: u32, thinking_end: Arc<[u32]>) -> Self {
+        Self {
+            think_end_id: thinking_end.last().copied(),
+            think_end_str: None,
+            thinking_end,
+            think_end_extra_ids: Vec::new(),
+            think_open_id: Some(open_id),
+        }
+    }
 }
 
 /// Arguments for [`ChatBackend::save_cache_state`].

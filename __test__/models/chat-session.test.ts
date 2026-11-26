@@ -20,10 +20,20 @@
  * export is added in T5.
  */
 import type { ChatConfig, ChatMessage, ChatResult } from '@mlx-node/core';
-import { ChatSession, ContextCapacityError, contextLane, type SessionCapableModel } from '@mlx-node/lm';
+import {
+  ChatSession,
+  ContextCapacityError,
+  ImageProcessingError,
+  contextLane,
+  isImageProcessingError,
+  validateRequestImages,
+  validateRequestImagesAsync,
+  type SessionCapableModel,
+} from '@mlx-node/lm';
 import type { ChatStreamControl, ChatStreamEvent, ChatStreamFinal } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { __setImageValidatorForTests } from '../../packages/lm/src/chat-session.js';
 import { resetPreservingNativeCacheForWarmReuse } from '../../packages/server/src/chat-session-warm-reuse.js';
 
 /** Build a minimal `ChatResult` sufficient for the session layer. */
@@ -4252,5 +4262,428 @@ describe('ChatSession H2 abortable non-streaming turns', () => {
     expect(mock.chatSessionStart).toHaveBeenCalledTimes(2);
     expect(mock.chatSessionContinue).not.toHaveBeenCalled();
     expect(mock.chatSessionStart.mock.calls[1][0]).toEqual([{ role: 'user', content: 'again' }]);
+  });
+
+  it('does not throw RangeError when clamping fractional maxNewTokens with positive thinkingTokenBudget', async () => {
+    const model = {
+      applyChatTemplate: vi.fn(() => new Uint32Array(50)),
+      contextLimits: () => ({
+        trainedWindowTokens: 100,
+        effectiveWindowTokens: 100,
+        pagedBlockCapacity: 8,
+        pagedBlockSize: 16,
+        restOfWindowOutputBudget: true,
+      }),
+      chatSessionStart: vi.fn().mockResolvedValue(makeChatResult('ok')),
+      chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult('ok')),
+      chatSessionContinueTool: vi.fn().mockResolvedValue(makeChatResult('ok')),
+      chatStreamSessionStart: vi.fn(),
+      chatStreamSessionContinue: vi.fn(),
+      chatStreamSessionContinueTool: vi.fn(),
+      resetCaches: vi.fn(),
+    } as unknown as SessionCapableModel;
+
+    const session = new ChatSession(model);
+    const constrained = await session.preflightContextCapacity([{ role: 'user', content: 'hi' }], {
+      maxNewTokens: 60.5,
+      thinkingTokenBudget: 20,
+    });
+    expect(constrained.maxNewTokens).toBe(50);
+    expect(constrained.thinkingTokenBudget).toBe(20);
+  });
+
+  it('tracks trailing images from role=tool messages in computeTrailingImagesKey', async () => {
+    const toolImg = new Uint8Array([0x89, 0x50, 0x4e, 0x47]);
+    const model = {
+      chatSessionStart: vi.fn().mockResolvedValue(makeChatResult('saw screenshot')),
+      chatSessionContinue: vi.fn().mockResolvedValue(makeChatResult('follow-up')),
+      chatSessionContinueTool: vi.fn().mockResolvedValue(makeChatResult('tool')),
+      chatStreamSessionStart: vi.fn(),
+      chatStreamSessionContinue: vi.fn(),
+      chatStreamSessionContinueTool: vi.fn(),
+      resetCaches: vi.fn(),
+    } as unknown as SessionCapableModel;
+
+    const session = new ChatSession(model);
+    session.primeHistory([
+      { role: 'user', content: 'take screenshot' },
+      { role: 'assistant', content: '', toolCalls: [{ id: 'call_1', name: 'shot', arguments: '{}' }] },
+      { role: 'tool', content: 'done', toolCallId: 'call_1', images: [toolImg] },
+    ]);
+    await session.startFromHistory();
+    expect(session.hasImages).toBe(true);
+  });
+
+  it('validateRequestImages accepts valid PNG/JPEG/GIF/WebP and rejects corrupt/BMP/TIFF/HEIC with ImageProcessingError', () => {
+    const validPng = new Uint8Array(
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        'base64',
+      ),
+    );
+    const validJpg = new Uint8Array(
+      Buffer.from(
+        '/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAMCAgMCAgMDAwMEAwMEBQgFBQQEBQoHBwYIDAoMDAsKCwsNDhIQDQ4RDgsLEBYQERMUFRUVDA8XGBYUGBIUFRT/wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AKp//2Q==',
+        'base64',
+      ),
+    );
+    const validGif = new Uint8Array(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
+    const validWebp = new Uint8Array(Buffer.from('UklGRh4AAABXRUJQVlA4TBEAAAAvAAAAAAfQ//73v/+BiOh/AAA=', 'base64'));
+
+    expect(() =>
+      validateRequestImages([{ role: 'user', content: '', images: [validPng, validJpg, validGif, validWebp] }]),
+    ).not.toThrow();
+
+    const badImages = [
+      new Uint8Array(0),
+      validPng.subarray(0, Math.floor(validPng.length / 2)),
+      new Uint8Array([0x42, 0x4d, 0x1e, 0x00, 0x00, 0x00]), // BMP
+      new Uint8Array([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]), // TIFF
+      new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]), // HEIC
+      new Uint8Array(Buffer.from('not an image')),
+    ];
+    for (const img of badImages) {
+      let caught: unknown;
+      try {
+        validateRequestImages([{ role: 'user', content: '', images: [img] }]);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(ImageProcessingError);
+      expect(isImageProcessingError(caught)).toBe(true);
+    }
+
+    // Native validator hook path wraps errors into ImageProcessingError
+    const failingNative = vi.fn(() => {
+      throw new Error('image_processing_error: native decode failed');
+    });
+    expect(() => validateRequestImages([{ role: 'user', content: '', images: [validPng] }], failingNative)).toThrow(
+      'image_processing_error:',
+    );
+    expect(failingNative).toHaveBeenCalledOnce();
+    expect(isImageProcessingError(new Error('image_processing_error: native'))).toBe(true);
+    expect(isImageProcessingError(new Error('unrelated error'))).toBe(false);
+  });
+
+  it('sendToolResult and sendToolResultStream forward tool images through the start path and preserve them in history', async () => {
+    const img1 = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1]);
+    const img2 = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 2]);
+
+    // Non-streaming: Turn 1 (user with img1 -> tool call) -> Turn 2 (tool result with same img1 + img2) -> Turn 3 (text follow-up)
+    const syncStart = vi
+      .fn()
+      .mockResolvedValueOnce(makeChatResultWithSingleToolCall('', 'call_1'))
+      .mockResolvedValueOnce(makeChatResult('saw both images'));
+    const syncContinue = vi.fn().mockResolvedValueOnce(makeChatResult('still remember'));
+    const syncContinueTool = vi.fn().mockRejectedValue(new Error('continueTool must not drop tool images'));
+    const syncModel = {
+      chatSessionStart: syncStart,
+      chatSessionContinue: syncContinue,
+      chatSessionContinueTool: syncContinueTool,
+      chatStreamSessionStart: vi.fn(),
+      chatStreamSessionContinue: vi.fn(),
+      chatStreamSessionContinueTool: vi.fn(),
+      resetCaches: vi.fn().mockResolvedValue(undefined),
+    } as unknown as SessionCapableModel;
+
+    const session = new ChatSession(syncModel);
+    await session.send('snap', { images: [img1] });
+    // Even if the tool result carries the exact same bytes as Turn 1's user image,
+    // it MUST replay through chatSessionStart with the tool image attached.
+    const r2 = await session.sendToolResult('call_1', 'captured', {
+      images: [img1, img2],
+      isError: true,
+    });
+    expect(r2.text).toBe('saw both images');
+    expect(session.turns).toBe(2);
+    expect(session.hasImages).toBe(true);
+    expect(syncContinueTool).not.toHaveBeenCalled();
+    expect(syncStart).toHaveBeenCalledTimes(2);
+    const secondStartMessages = syncStart.mock.calls[1]![0] as ChatMessage[];
+    expect(secondStartMessages.at(-1)).toEqual({
+      role: 'tool',
+      content: 'captured',
+      toolCallId: 'call_1',
+      isError: true,
+      images: [img1, img2],
+    });
+
+    // Turn 3 text-only continuation carries Turn 2's tool images in its completed history
+    const r3 = await session.send('what color?');
+    expect(r3.text).toBe('still remember');
+    expect(syncContinue).toHaveBeenCalledTimes(1);
+    const continueMessages = syncContinue.mock.calls[0]![0] as ChatMessage[];
+    expect(continueMessages.find((m) => m.role === 'tool')?.images).toEqual([img1, img2]);
+
+    // Streaming: Turn 1 (tool call) -> Turn 2 (tool result with image) + rollback on mid-stream throw
+    let streamStartCall = 0;
+    const streamStart = vi.fn((_msgs: ChatMessage[]) => {
+      const idx = streamStartCall++;
+      async function* gen(): AsyncGenerator<ChatStreamEvent> {
+        if (idx === 0) {
+          yield finalChunkWithSingleToolCall('', 'call_s1');
+          return;
+        }
+        if (idx === 1) {
+          yield { done: false, text: 'partial' };
+          throw new Error('stream-boom');
+        }
+        yield { done: false, text: 'streamed-tool-image' };
+        yield finalChunk('streamed-tool-image');
+      }
+      return gen();
+    });
+    const streamContinueTool = vi.fn(() => {
+      throw new Error('chatStreamSessionContinueTool must not drop tool images');
+    });
+    const streamModel = {
+      chatSessionStart: vi.fn(),
+      chatSessionContinue: vi.fn(),
+      chatSessionContinueTool: vi.fn(),
+      chatStreamSessionStart: streamStart,
+      chatStreamSessionContinue: vi.fn(),
+      chatStreamSessionContinueTool: streamContinueTool,
+      resetCaches: vi.fn().mockResolvedValue(undefined),
+    } as unknown as SessionCapableModel;
+
+    const streamSession = new ChatSession(streamModel);
+    for await (const _e of streamSession.sendStream('snap')) void _e;
+    expect(streamSession.turns).toBe(1);
+
+    // Failed streaming tool-image turn rolls back cleanly
+    await expect(async () => {
+      for await (const _e of streamSession.sendToolResultStream('call_s1', 'err-snap', { images: [img1] })) void _e;
+    }).rejects.toThrow('stream-boom');
+    expect(streamSession.turns).toBe(0);
+    expect(streamSession.hasImages).toBe(false);
+
+    // Retry succeeds and sends tool image through chatStreamSessionStart
+    let finalText = '';
+    for await (const ev of streamSession.sendToolResultStream('call_s1', 'ok-snap', { images: [img2] })) {
+      if (ev.done) finalText = ev.text;
+    }
+    expect(finalText).toBe('streamed-tool-image');
+    expect(streamSession.turns).toBe(1);
+    expect(streamSession.hasImages).toBe(true);
+    expect(streamContinueTool).not.toHaveBeenCalled();
+    const retryMsgs = streamStart.mock.calls[2]![0] as ChatMessage[];
+    expect(retryMsgs.at(-1)).toEqual({
+      role: 'tool',
+      content: 'ok-snap',
+      toolCallId: 'call_s1',
+      isError: undefined,
+      images: [img2],
+    });
+  });
+
+  it('validateRequestImagesAsync bounds concurrency, stays non-blocking, fails fast, and caches repeated digests', async () => {
+    const validPng = new Uint8Array(
+      Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==',
+        'base64',
+      ),
+    );
+    const validGif = new Uint8Array(Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64'));
+
+    // 1. Bounded concurrency + unrelated event-loop timers run during async validation
+    let inFlight = 0;
+    let maxInFlight = 0;
+    let calls = 0;
+    let timerTicksDuringValidation = 0;
+    const timer = setInterval(() => {
+      timerTicksDuringValidation++;
+    }, 2);
+    try {
+      const twelveImages = Array.from({ length: 12 }, () => validPng);
+      await validateRequestImagesAsync([{ role: 'user', content: '', images: twelveImages }], {
+        concurrency: 4,
+        validator: async () => {
+          calls++;
+          inFlight++;
+          maxInFlight = Math.max(maxInFlight, inFlight);
+          await new Promise((resolve) => setTimeout(resolve, 6));
+          inFlight--;
+        },
+      });
+    } finally {
+      clearInterval(timer);
+    }
+    expect(calls).toBe(12);
+    expect(maxInFlight).toBe(4);
+    expect(timerTicksDuringValidation).toBeGreaterThan(0);
+
+    // 2. Fail-fast stops scheduling remaining images on failure and wraps errors
+    let started = 0;
+    await expect(
+      validateRequestImagesAsync([{ role: 'user', content: '', images: Array.from({ length: 20 }, () => validPng) }], {
+        concurrency: 2,
+        validator: async () => {
+          const id = ++started;
+          await new Promise((resolve) => setTimeout(resolve, 2));
+          if (id === 2) throw new Error('corrupt frame');
+        },
+      }),
+    ).rejects.toThrow(ImageProcessingError);
+    expect(started).toBeLessThan(20);
+
+    // 3. Rejects empty / truncated / BMP / TIFF / HEIC payloads with ImageProcessingError
+    const badImages = [
+      new Uint8Array(0),
+      validPng.subarray(0, Math.floor(validPng.length / 2)),
+      new Uint8Array([0x42, 0x4d, 0x1e, 0x00, 0x00, 0x00]),
+      new Uint8Array([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]),
+      new Uint8Array([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]),
+    ];
+    for (const bad of badImages) {
+      await expect(validateRequestImagesAsync([{ role: 'user', content: '', images: [bad] }])).rejects.toThrow(
+        ImageProcessingError,
+      );
+    }
+
+    // 4. Per-validator LRU digest cache avoids re-validating identical bytes across calls and within one request
+    const overrideSpy = vi.fn(async (data: Uint8Array) => {
+      await new Promise((resolve) => setImmediate(resolve));
+      if (data[0] === 0x00) throw new Error('bad');
+    });
+    __setImageValidatorForTests(overrideSpy);
+    try {
+      // Duplicate within a single request validates once
+      await validateRequestImagesAsync([{ role: 'user', content: '', images: [validPng, validPng] }]);
+      expect(overrideSpy).toHaveBeenCalledTimes(1);
+
+      // Repeat call with the same bytes hits the digest cache (0 new calls)
+      await validateRequestImagesAsync([{ role: 'user', content: '', images: [validPng] }]);
+      expect(overrideSpy).toHaveBeenCalledTimes(1);
+
+      // Different valid image validates once
+      await validateRequestImagesAsync([{ role: 'user', content: '', images: [validPng, validGif] }]);
+      expect(overrideSpy).toHaveBeenCalledTimes(2);
+
+      // Failed images are never cached
+      const badPayload = new Uint8Array([0x00, 0x01, 0x02, 0x03]);
+      await expect(validateRequestImagesAsync([{ role: 'user', content: '', images: [badPayload] }])).rejects.toThrow(
+        ImageProcessingError,
+      );
+      await expect(validateRequestImagesAsync([{ role: 'user', content: '', images: [badPayload] }])).rejects.toThrow(
+        ImageProcessingError,
+      );
+      expect(overrideSpy).toHaveBeenCalledTimes(4);
+    } finally {
+      __setImageValidatorForTests(null);
+    }
+  });
+
+  it('validateRequestImagesAsync enforces a process-wide concurrency ceiling across concurrent callers and cancels queued/in-flight batches on AbortSignal', async () => {
+    const img = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 1, 2, 3, 4]);
+
+    // 1. Process-wide concurrency ceiling: 4 concurrent requests × 4 images (even with concurrency: 8)
+    //    must NEVER exceed the shared global ceiling of 4 in-flight validations.
+    let globalInFlight = 0;
+    let globalMaxInFlight = 0;
+    let totalCompleted = 0;
+    const sharedValidator = async () => {
+      globalInFlight++;
+      globalMaxInFlight = Math.max(globalMaxInFlight, globalInFlight);
+      await new Promise((resolve) => setTimeout(resolve, 6));
+      globalInFlight--;
+      totalCompleted++;
+    };
+    await Promise.all(
+      Array.from({ length: 4 }, () =>
+        validateRequestImagesAsync([{ role: 'user', content: '', images: [img, img, img, img] }], {
+          concurrency: 8,
+          validator: sharedValidator,
+        }),
+      ),
+    );
+    expect(totalCompleted).toBe(16);
+    expect(globalMaxInFlight).toBe(4);
+
+    // 2. Aborting a queued request evicts it immediately without invoking its validator or stalling peers.
+    let releaseBlocker!: () => void;
+    const blockerGate = new Promise<void>((resolve) => {
+      releaseBlocker = resolve;
+    });
+    let blockerEntered = 0;
+    let allFourEntered!: () => void;
+    const fourEnteredPromise = new Promise<void>((resolve) => {
+      allFourEntered = resolve;
+    });
+
+    const reqA = validateRequestImagesAsync([{ role: 'user', content: '', images: [img, img, img, img] }], {
+      concurrency: 4,
+      validator: async () => {
+        blockerEntered++;
+        if (blockerEntered === 4) allFourEntered();
+        await blockerGate;
+      },
+    });
+    await fourEnteredPromise;
+
+    const controllerB = new AbortController();
+    const validatorB = vi.fn(async () => {});
+    const reqB = validateRequestImagesAsync(
+      [{ role: 'user', content: '', images: Array.from({ length: 8 }, () => img) }],
+      { concurrency: 4, signal: controllerB.signal, validator: validatorB },
+    );
+
+    const validatorC = vi.fn(async () => {});
+    const reqC = validateRequestImagesAsync([{ role: 'user', content: '', images: [img, img] }], {
+      concurrency: 2,
+      validator: validatorC,
+    });
+
+    // Abort B while A still occupies all 4 global slots -> B rejects immediately before A finishes!
+    controllerB.abort();
+    await expect(reqB).rejects.toThrow();
+    expect(validatorB).not.toHaveBeenCalled();
+
+    // Release A -> both A and C finish cleanly without slot leaks or queue stalls.
+    releaseBlocker();
+    await Promise.all([reqA, reqC]);
+    expect(validatorB).not.toHaveBeenCalled();
+    expect(validatorC).toHaveBeenCalledTimes(2);
+
+    // 3. Aborting mid-batch stops remaining images from ever calling the validator and frees slots once in-flight settles.
+    const controllerD = new AbortController();
+    let releaseD!: () => void;
+    const gateD = new Promise<void>((resolve) => {
+      releaseD = resolve;
+    });
+    let enteredD = 0;
+    let twoEnteredD!: () => void;
+    const twoEnteredDPromise = new Promise<void>((resolve) => {
+      twoEnteredD = resolve;
+    });
+    const validatorD = vi.fn(async () => {
+      enteredD++;
+      if (enteredD === 2) twoEnteredD();
+      await gateD;
+    });
+    const reqD = validateRequestImagesAsync(
+      [{ role: 'user', content: '', images: Array.from({ length: 10 }, () => img) }],
+      { concurrency: 2, signal: controllerD.signal, validator: validatorD },
+    );
+    await twoEnteredDPromise;
+    controllerD.abort();
+    await expect(reqD).rejects.toThrow();
+    releaseD();
+    // Wait a tick for in-flight workers to release their slots; no further images may start.
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(validatorD).toHaveBeenCalledTimes(2);
+
+    // Subsequent 4-wide batch still acquires all 4 global slots cleanly.
+    let eInFlight = 0;
+    let eMax = 0;
+    await validateRequestImagesAsync([{ role: 'user', content: '', images: [img, img, img, img] }], {
+      concurrency: 4,
+      validator: async () => {
+        eInFlight++;
+        eMax = Math.max(eMax, eInFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        eInFlight--;
+      },
+    });
+    expect(eMax).toBe(4);
   });
 });

@@ -240,7 +240,7 @@ fn affine_geometry(t: GgufTensorType) -> Option<(u32, usize, bool)> {
         GgufTensorType::Q4_1 => Some((4, 4, true)),
         GgufTensorType::Q5_0 => Some((5, 5, false)),
         GgufTensorType::Q5_1 => Some((5, 5, true)),
-        GgufTensorType::Q8_0 => Some((8, 8, false)),
+        GgufTensorType::Q8_0 | GgufTensorType::MXFP8 => Some((8, 8, false)),
         GgufTensorType::NVFP4 => Some((4, 8, false)),
         _ => None,
     }
@@ -376,6 +376,24 @@ pub(crate) fn decode_affine_band_into(
             );
             weight[i * 8..(i + 1) * 8].copy_from_slice(&w);
             scales[i * 4..(i + 1) * 4].copy_from_slice(&s);
+        }
+        return Ok(());
+    }
+    if t == GgufTensorType::MXFP8 {
+        // SAFETY: each destination holds `dst.rows * per_row` MXFP8 blocks
+        // (8 u32 weight words + 1 uint8 E8M0 scale per 32-value block); `[first, first + n)`
+        // lies inside and belongs exclusively to this band.
+        let weight = unsafe {
+            std::slice::from_raw_parts_mut(dst.weight.0.cast::<u32>().add(first * 8), n * 8)
+        };
+        let scales = unsafe { std::slice::from_raw_parts_mut(scales_dst.0.add(first), n) };
+        let mut w = [0u32; 8];
+        for i in 0..n {
+            scales[i] = crate::utils::gguf::mxfp8_repack_block(
+                &blocks[i * block_bytes..(i + 1) * block_bytes],
+                &mut w,
+            );
+            weight[i * 8..(i + 1) * 8].copy_from_slice(&w);
         }
         return Ok(());
     }
@@ -774,5 +792,148 @@ mod tests {
             rows * row_bytes
         );
         assert!(weight.iter().any(|&w| w != 0) && scales.iter().all(|&s| s == 0x2000));
+    }
+
+    #[test]
+    fn mxfp8_cpu_repack_matches_load_quantized_tensor_and_c_dequant() {
+        use std::ffi::CString;
+        use std::io::Cursor;
+
+        // Test 2D [128, 64], 3D [4, 64, 64], and small [32, 32] with E4M3 edge codes & E8M0 e=0..254.
+        for (name, dims) in [
+            ("blk.20.attn_q.weight", vec![64u64, 128]),
+            ("blk.20.ffn_down_exps.weight", vec![64u64, 64, 4]),
+            ("blk.20.small.weight", vec![32u64, 32]),
+        ] {
+            let k = dims[0] as usize;
+            let rows: usize = dims[1..].iter().map(|&d| d as usize).product();
+            let blocks_per_row = k / 32;
+            let total_blocks = rows * blocks_per_row;
+            let mut raw = vec![0u8; total_blocks * 33];
+            for b in 0..total_blocks {
+                let off = b * 33;
+                // Cover E8M0 e = 0..=254 (avoid 255 NaN)
+                raw[off] = ((b * 7) % 255) as u8;
+                for j in 0..32 {
+                    // Cover E4M3 edge codes (0x00, 0x80, 0x01, 0x38=1.0, 0x7E=448, 0xFE=-448, avoiding 0x7F/0xFF NaN)
+                    let code = ((b * 13 + j * 11) % 254) as u8;
+                    let code = if code == 0x7F { 0x7E } else { code };
+                    raw[off + 1 + j] = code;
+                }
+            }
+
+            let info = GgufTensorInfo {
+                name: name.into(),
+                n_dims: dims.len() as u32,
+                dims: dims.clone(),
+                tensor_type: GgufTensorType::MXFP8,
+                offset: 0,
+            };
+            let gguf = GgufFile {
+                version: 3,
+                tensor_count: 1,
+                metadata: HashMap::new(),
+                tensors: vec![info.clone()],
+                data_offset: 0,
+                alignment: 32,
+            };
+
+            let loaded: HashMap<String, MxArray> =
+                load_quantized_tensor(&mut Cursor::new(&raw), &gguf, &info)
+                    .unwrap()
+                    .into_iter()
+                    .collect();
+            let w_ref = &loaded[name];
+            let s_ref = &loaded[&format!("{}.scales", name.strip_suffix(".weight").unwrap())];
+            assert_eq!(w_ref.dtype().unwrap(), DType::Uint32);
+            assert_eq!(s_ref.dtype().unwrap(), DType::Uint8);
+
+            // Repack via decode_affine_band_into across split row bands
+            let mut w_dst = vec![0u32; rows * blocks_per_row * 8];
+            let mut s_dst = vec![0u8; rows * blocks_per_row];
+            let ptrs = DstPtrs {
+                weight: SendPtr(w_dst.as_mut_ptr().cast()),
+                scales: Some(SendPtr(s_dst.as_mut_ptr())),
+                biases: None,
+                rows,
+                k,
+                layout: OutLayout::RowMajor,
+            };
+            let row_bytes = blocks_per_row * 33;
+            let split = rows / 2;
+            decode_affine_band_into(
+                GgufTensorType::MXFP8,
+                &raw[..split * row_bytes],
+                0,
+                split,
+                k,
+                &ptrs,
+            )
+            .unwrap();
+            decode_affine_band_into(
+                GgufTensorType::MXFP8,
+                &raw[split * row_bytes..],
+                split,
+                rows - split,
+                k,
+                &ptrs,
+            )
+            .unwrap();
+            assert_eq!(w_dst, w_ref.to_uint32().unwrap().to_vec());
+            assert_eq!(s_dst, s_ref.to_uint8().unwrap());
+
+            // Verify MLX `mlx_dequantize("mxfp8")` matches `decode_mxfp8_rows` bit-for-bit!
+            let mode_c = CString::new("mxfp8").unwrap();
+            let w_2d = w_ref
+                .reshape(&[rows as i64, (blocks_per_row * 8) as i64])
+                .unwrap();
+            let s_2d = s_ref
+                .reshape(&[rows as i64, blocks_per_row as i64])
+                .unwrap();
+            let handle = unsafe {
+                mlx_sys::mlx_dequantize(
+                    w_2d.as_raw_ptr(),
+                    s_2d.as_raw_ptr(),
+                    std::ptr::null_mut(),
+                    32,
+                    8,
+                    DType::Float32 as i32,
+                    mode_c.as_ptr(),
+                )
+            };
+            let mlx_f32 = MxArray::from_handle(handle, "mxfp8_dequant_test")
+                .unwrap()
+                .to_float32()
+                .unwrap();
+            let mut ref_f32 = vec![0.0f32; rows * k];
+            crate::utils::gguf::decode_mxfp8_rows(&raw, &mut ref_f32).unwrap();
+            let mut normal_checked = 0usize;
+            let mut zero_scale_checked = 0usize;
+            for (idx, (&a, &b)) in mlx_f32.iter().zip(ref_f32.iter()).enumerate() {
+                let block_e = raw[(idx / 32) * 33];
+                if block_e == 0 {
+                    // Upstream MLX `e8m0_to_float` uses `as_type<float>(uint32_t(e) << 23)`,
+                    // which produces 0.0f for e == 0, whereas ggml special-cases e == 0 to 2^-127.
+                    assert_eq!(a, 0.0, "{name} idx={idx} (e=0): expected MLX 0.0, got {a}");
+                    zero_scale_checked += 1;
+                    continue;
+                }
+                if (a == 0.0 && b == 0.0) || (a == 0.0 && b.abs() < f32::MIN_POSITIVE) {
+                    continue;
+                }
+                normal_checked += 1;
+                assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "{name} idx={idx} (e={block_e}): mlx={a} ({:#010x}) vs ref={b} ({:#010x})",
+                    a.to_bits(),
+                    b.to_bits()
+                );
+            }
+            assert!(
+                normal_checked > 0 && zero_scale_checked > 0,
+                "{name}: expected both normal ({normal_checked}) and e=0 ({zero_scale_checked}) values checked"
+            );
+        }
     }
 }

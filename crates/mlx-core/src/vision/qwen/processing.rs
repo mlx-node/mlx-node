@@ -95,10 +95,7 @@ impl QwenImageProcessor {
     /// Process a single image from encoded bytes
     pub fn process_bytes(&self, data: &[u8]) -> Result<ProcessedImage> {
         let img = image::load_from_memory(data).map_err(|e| {
-            Error::new(
-                Status::GenericFailure,
-                format!("Failed to decode image: {e}"),
-            )
+            crate::vision::validate::image_processing_error(format!("Failed to decode image: {e}"))
         })?;
         self.process_image(img)
     }
@@ -131,16 +128,14 @@ impl QwenImageProcessor {
                 let reader = ImageReader::new(Cursor::new(*data))
                     .with_guessed_format()
                     .map_err(|e| {
-                        Error::new(
-                            Status::GenericFailure,
-                            format!("Failed to inspect image format: {e}"),
-                        )
+                        crate::vision::validate::image_processing_error(format!(
+                            "Failed to inspect image format: {e}"
+                        ))
                     })?;
                 let (width, height) = reader.into_dimensions().map_err(|e| {
-                    Error::new(
-                        Status::GenericFailure,
-                        format!("Failed to inspect image dimensions: {e}"),
-                    )
+                    crate::vision::validate::image_processing_error(format!(
+                        "Failed to inspect image dimensions: {e}"
+                    ))
                 })?;
                 let geometry = self.plan_geometry(width, height)?;
                 merged_image_token_count(

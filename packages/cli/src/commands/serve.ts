@@ -69,7 +69,7 @@ Options:
                       MoE loads size their KV pool and windows from it.
   --max-context <tokens>  Context token limit, e.g. 100K or 1M (K = 1024
                       tokens, M = 1000000 tokens), up to the model's limit,
-                      at most 1010000; past its native window a model with
+                      at most 1048576; past its native window a model with
                       YaRN turns it on, which is static and changes answers
                       at every length, so pass more than the native window
                       only when a request needs it (default: auto, the

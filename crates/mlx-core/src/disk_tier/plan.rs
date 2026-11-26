@@ -35,12 +35,22 @@ pub(crate) struct StatePlan {
 }
 
 impl StatePlan {
-    /// Splash `reserveCaptures` `stateClass` = `StateClass::InUse`.
-    fn replays(&self, index: usize) -> bool {
-        self.boundaries
-            .get(index)
-            .is_some_and(|point| !point.disposable && point.tokens == self.prompt_replay)
+    /// Splash `Engine::keepsCheckpoint`: true when publishing `boundaries[index]`
+    /// keeps the lane's prior rolling checkpoint instead of retiring it
+    /// (prompt replay point or non-zero prompt head boundary).
+    pub(crate) fn keeps_checkpoint(&self, index: usize, head_boundary: u32) -> bool {
+        self.boundaries.get(index).is_some_and(|point| {
+            !point.disposable
+                && (point.tokens == self.prompt_replay
+                    || (head_boundary > 0 && point.tokens == head_boundary))
+        })
     }
+}
+
+/// Block-aligned prompt head boundary (`head_tokens / block * block`).
+pub(crate) fn head_boundary_for(head_tokens: u32, block: u32) -> u32 {
+    let block = block.max(1);
+    head_tokens / block * block
 }
 
 /// Rows `[begin, end)` the draft window captures; `reset` starts the window
@@ -153,6 +163,15 @@ fn add_state_boundary(
 
 /// Splash `Engine::configureDraftStatePlan`, shared-prefill points aside.
 pub(crate) fn configure_draft_state_plan(inputs: &PlanInputs) -> StatePlan {
+    configure_draft_state_plan_with_head(inputs, 0)
+}
+
+/// Splash `Engine::configureDraftStatePlan` with an optional block-aligned
+/// prompt `head_boundary` (`0` for none).
+pub(crate) fn configure_draft_state_plan_with_head(
+    inputs: &PlanInputs,
+    head_boundary: u32,
+) -> StatePlan {
     let PlanInputs {
         resume,
         junction,
@@ -176,6 +195,9 @@ pub(crate) fn configure_draft_state_plan(inputs: &PlanInputs) -> StatePlan {
     };
     for checkpoint in planned_checkpoints(resume, replay_state, interval, chunk) {
         add(checkpoint, true);
+    }
+    if head_boundary > 0 && u64::from(head_boundary) >= u64::from(resume) + u64::from(window) {
+        add(head_boundary, false);
     }
     if u64::from(junction) >= u64::from(resume) + u64::from(window) {
         add(junction, false);
@@ -259,10 +281,24 @@ pub(crate) fn plan_draft_context(
 
 /// The prefill's chunk ends from `resume` to `end` with chunks of at most
 /// `chunk` rows, cut at every planned point: a checkpoint is passed when
-/// the point after it lies in the same chunk and is not the prompt's
-/// replay point (Splash `reserveCaptures` `passed`), since publishing that
-/// point would retire it at once.
+/// the point after it lies in the same chunk and does not keep the checkpoint
+/// (Splash `reserveCaptures` `passed`), since publishing that point would
+/// retire it at once.
+#[cfg(test)]
 pub(crate) fn command_breaks(resume: u32, end: u32, chunk: u32, plan: &StatePlan) -> CommandBreaks {
+    command_breaks_with_head(resume, end, chunk, plan, 0)
+}
+
+/// [`command_breaks`] with an optional block-aligned prompt `head_boundary`
+/// (`0` for none): a checkpoint before `head_boundary` in the same chunk is
+/// kept because publishing the head keeps the checkpoint below it.
+pub(crate) fn command_breaks_with_head(
+    resume: u32,
+    end: u32,
+    chunk: u32,
+    plan: &StatePlan,
+    head_boundary: u32,
+) -> CommandBreaks {
     let points = &plan.boundaries;
     let chunk = chunk.max(1);
     let mut out = CommandBreaks::default();
@@ -278,9 +314,9 @@ pub(crate) fn command_breaks(resume: u32, end: u32, chunk: u32, plan: &StatePlan
             continue;
         };
         let passed = point.disposable
-            && points
-                .get(index + 1)
-                .is_some_and(|next| next.tokens <= limit && !plan.replays(index + 1));
+            && points.get(index + 1).is_some_and(|next| {
+                next.tokens <= limit && !plan.keeps_checkpoint(index + 1, head_boundary)
+            });
         index += 1;
         if passed {
             out.passed.push(point.tokens);
@@ -487,5 +523,44 @@ mod tests {
         assert!(plan_draft_context(0, 9000, &[9001], WINDOW).is_err());
         assert!(plan_draft_context(0, 9000, &[4096, 4096], WINDOW).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn head_boundary_keeps_checkpoint_in_command_breaks_and_state_plan() {
+        let block = 32;
+        let head_boundary = head_boundary_for(4530, block);
+        assert_eq!(head_boundary, 4512);
+
+        let plan =
+            configure_draft_state_plan_with_head(&inputs(0, 0, 10_000, 10_000), head_boundary);
+        let head_idx = plan
+            .boundaries
+            .iter()
+            .position(|point| point.tokens == head_boundary)
+            .expect("head_boundary must be planned");
+        assert!(!plan.boundaries[head_idx].disposable);
+        assert!(plan.keeps_checkpoint(head_idx, head_boundary));
+        assert!(!plan.keeps_checkpoint(head_idx, 0));
+
+        // Checkpoint 4096 and head 4512 fall inside the same 2048-token chunk from resume=3000.
+        // With `head_boundary = 4512`, 4096 MUST NOT be passed because publishing the head keeps
+        // the prior checkpoint below it.
+        let with_head = command_breaks_with_head(3000, 10_000, CHUNK, &plan, head_boundary);
+        assert!(
+            with_head.breaks.contains(&4096),
+            "4096 checkpoint before head_boundary must be kept in breaks: {with_head:?}"
+        );
+        assert!(
+            !with_head.passed.contains(&4096),
+            "4096 checkpoint before head_boundary must not be passed: {with_head:?}"
+        );
+        assert!(with_head.breaks.contains(&head_boundary));
+
+        // Without head_boundary (plain junction at 4512), 4096 IS passed in the same chunk.
+        let without_head = command_breaks_with_head(3000, 10_000, CHUNK, &plan, 0);
+        assert!(
+            without_head.passed.contains(&4096),
+            "plain junction without head_boundary should still pass 4096: {without_head:?}"
+        );
     }
 }

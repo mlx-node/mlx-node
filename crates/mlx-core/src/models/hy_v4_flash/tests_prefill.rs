@@ -269,6 +269,30 @@ fn grid_rules() {
     assert_eq!(g.replay_row(&first_only), 32);
 }
 
+/// Historical assistant openings inside a cold multi-turn prompt must NOT
+/// multiply prefill waves: a 4,096-token prompt containing 100 short historical
+/// turns on distinct block rows still cuts into only 2 waves (`replay_row` and
+/// prompt end), matching a single-turn prompt.
+#[test]
+fn many_historical_openings_keep_cold_prefill_waves_bounded() {
+    let g = grid(4096);
+    let mut p = prompt_of(4096);
+    for turn in 0..100usize {
+        let at = (turn + 1) * BLOCK_ROWS + 5;
+        p[at..at + OPEN.len()].copy_from_slice(&OPEN);
+    }
+    let replay = g.replay_row(&p);
+    assert_eq!(replay, 4064);
+    assert_eq!(g.ends(0, &p), vec![4064, 4096]);
+    assert_eq!(
+        g.states(0, &p),
+        vec![StateRow {
+            row: 4064,
+            kind: Kind::Prompt
+        }]
+    );
+}
+
 /// The truncate rules of `WindowRing` and `IndexerState`.
 #[test]
 fn truncate_rules() {

@@ -5,6 +5,7 @@ import type { ChatMessage, ChatResult, ChatStreamProgress, ToolCallResult } from
 import { ChatSession, isContextCapacityError, type ChatStreamControl, type SessionCapableModel } from '@mlx-node/lm';
 import { describe, expect, it, vi } from 'vite-plus/test';
 
+import { __setImageValidatorForTests } from '../../packages/lm/src/chat-session.js';
 import { handleCreateMessage, type ServerThinking } from '../../packages/server/src/endpoints/messages.js';
 import { AGENT_HOST_THINKING } from '../../packages/server/src/host/agent-thinking.js';
 import { ModelWorkCoordinator } from '../../packages/server/src/model-work-coordinator.js';
@@ -1054,11 +1055,13 @@ describe('handleCreateMessage', () => {
     });
 
     describe('an image for a model that does not see images', () => {
+      const validPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
       const imageMessage = {
         role: 'user' as const,
         content: [
           { type: 'text' as const, text: 'describe' },
-          { type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: 'AQID' } },
+          { type: 'image' as const, source: { type: 'base64' as const, media_type: 'image/png', data: validPng } },
         ],
       };
 
@@ -1129,8 +1132,11 @@ describe('handleCreateMessage', () => {
     });
 
     it('returns JSON 400 before SSE when image expansion exceeds capacity', async () => {
+      const validPng =
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+      const expectedPngBytes = Array.from(Buffer.from(validPng, 'base64'));
       const expandedPromptTokenCount = vi.fn((_tokens: Uint32Array, messages: ChatMessage[]) => {
-        expect(Array.from(messages[0]?.images?.[0] ?? [])).toEqual([1, 2, 3]);
+        expect(Array.from(messages[0]?.images?.[0] ?? [])).toEqual(expectedPngBytes);
         return 65;
       });
       const model = Object.assign(createMockStreamModel([]), {
@@ -1159,7 +1165,7 @@ describe('handleCreateMessage', () => {
                 { type: 'text', text: 'describe' },
                 {
                   type: 'image',
-                  source: { type: 'base64', media_type: 'image/png', data: 'AQID' },
+                  source: { type: 'base64', media_type: 'image/png', data: validPng },
                 },
               ],
             },
@@ -1231,6 +1237,8 @@ describe('handleCreateMessage', () => {
       });
 
       it('returns a JSON 400 before SSE for an image prompt above the window with generation_mode=mtp', async () => {
+        const validPng =
+          'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
         const model = createLaneWindowModel(4, {
           expandedPromptTokenCount: vi.fn(() => 80),
           supportsImages: () => true,
@@ -1248,7 +1256,7 @@ describe('handleCreateMessage', () => {
                 role: 'user',
                 content: [
                   { type: 'text', text: 'describe' },
-                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AQID' } },
+                  { type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } },
                 ],
               },
             ],
@@ -7835,12 +7843,228 @@ describe('handleCreateMessage output limits, thinking budget and call text', () 
       endText: undefined,
       from: undefined,
     });
+    expect(await thinkingOf({ thinking: { type: 'disabled' } }, host)).toEqual({
+      budget: undefined,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+    expect(await thinkingOf({ extra_body: { thinking_budget: 0 } }, host)).toEqual({
+      budget: 0,
+      guard: undefined,
+      endText: undefined,
+      from: 'request',
+    });
     expect(await thinkingOf({}, undefined)).toEqual({
       budget: undefined,
       guard: undefined,
       endText: undefined,
       from: undefined,
     });
+  });
+
+  it('preserves AlwaysOnBudgetFromEffort 256-token low budget under agent host thinking cap and respects tighter host or explicit request caps', async () => {
+    const runFor = async (
+      modelCtorName: 'Lfm2Model' | 'MuseGlimmerModel' | 'K2HorizonModel' | 'Qwen35Model',
+      extra: Record<string, unknown>,
+      server: ServerThinking | undefined,
+      samplingDefaults?: { thinkingTokenBudget?: number },
+    ): Promise<Record<string, unknown>> => {
+      const registry = new ModelRegistry();
+      const base = createMockModel();
+      const proto = { constructor: { name: modelCtorName } };
+      const model = Object.assign(Object.create(proto), base) as typeof base;
+      registry.register('model', model, samplingDefaults ? { samplingDefaults } : undefined);
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'model', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        registry,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        server,
+      );
+      const config = ((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls[0]?.[1] ?? {}) as Record<
+        string,
+        unknown
+      >;
+      return {
+        budget: config.thinkingTokenBudget,
+        guard: config.thinkingCycleGuard,
+        endText: config.thinkingEndText,
+        from: (config.turnMeta as { thinkingBudgetFrom?: string } | undefined)?.thinkingBudgetFrom,
+      };
+    };
+
+    const host: ServerThinking = {
+      tokenBudget: AGENT_HOST_THINKING.tokenBudget,
+      cycleGuard: AGENT_HOST_THINKING.cycleGuard,
+      endText: AGENT_HOST_THINKING.endText,
+    };
+
+    // Lfm2Model and MuseGlimmerModel: `low` keeps its 256-token cap instead of 12,000; `high` gets 12,000.
+    for (const ctor of ['Lfm2Model', 'MuseGlimmerModel'] as const) {
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'low' } }, host), `${ctor} low`).toEqual({
+        budget: 256,
+        guard: true,
+        endText: AGENT_HOST_THINKING.endText,
+        from: 'request',
+      });
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'high' } }, host), `${ctor} high`).toEqual({
+        budget: 12_000,
+        guard: true,
+        endText: AGENT_HOST_THINKING.endText,
+        from: 'server',
+      });
+      expect(await runFor(ctor, { extra_body: { reasoning_effort: 'none' } }, host), `${ctor} none`).toEqual({
+        budget: undefined,
+        guard: undefined,
+        endText: undefined,
+        from: undefined,
+      });
+    }
+
+    // K2HorizonModel: `low` gets 256 (bounded by tighter host cap); `thinking.type: disabled`
+    // (`reasoning_effort: none`) preserves a registered per-model zero budget instead of injecting 256.
+    expect(await runFor('K2HorizonModel', { extra_body: { reasoning_effort: 'low' } }, host)).toEqual({
+      budget: 256,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+    expect(
+      await runFor(
+        'K2HorizonModel',
+        { extra_body: { reasoning_effort: 'low' } },
+        { tokenBudget: 100, cycleGuard: true },
+      ),
+    ).toEqual({
+      budget: 100,
+      guard: true,
+      endText: undefined,
+      from: 'server',
+    });
+    expect(
+      await runFor('K2HorizonModel', { thinking: { type: 'disabled' } }, host, { thinkingTokenBudget: 0 }),
+    ).toEqual({
+      budget: 0,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+    // Per-model default budget (e.g. 64) also stays below the 256 effort default under a 12,000 host cap.
+    expect(
+      await runFor('Lfm2Model', { extra_body: { reasoning_effort: 'low' } }, host, { thinkingTokenBudget: 64 }),
+    ).toEqual({
+      budget: 64,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: undefined,
+    });
+
+    // Tighter host cap (100 < 256) acts as an upper bound; 0 disables cycleGuard & endText.
+    expect(
+      await runFor('Lfm2Model', { extra_body: { reasoning_effort: 'low' } }, { tokenBudget: 100, cycleGuard: true }),
+    ).toEqual({
+      budget: 100,
+      guard: true,
+      endText: undefined,
+      from: 'server',
+    });
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' } },
+        { tokenBudget: 0, cycleGuard: true, endText: AGENT_HOST_THINKING.endText },
+      ),
+    ).toEqual({
+      budget: 0,
+      guard: undefined,
+      endText: undefined,
+      from: 'server',
+    });
+
+    // Explicit request `thinking.budget_tokens` still overrides both effort default and host cap.
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' }, thinking: { type: 'enabled', budget_tokens: 4096 } },
+        host,
+      ),
+    ).toEqual({
+      budget: 4096,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'request',
+    });
+
+    // Template-honoring families (Qwen35Model) keep the host's 12,000 safety cap on `low`.
+    expect(await runFor('Qwen35Model', { extra_body: { reasoning_effort: 'low' } }, host)).toEqual({
+      budget: 12_000,
+      guard: true,
+      endText: AGENT_HOST_THINKING.endText,
+      from: 'server',
+    });
+
+    // Without a host tokenBudget cap, leave the request overlay untouched so a
+    // per-model `samplingDefaults.thinkingTokenBudget` (e.g. 64) still wins on `low`.
+    expect(
+      await runFor(
+        'Lfm2Model',
+        { extra_body: { reasoning_effort: 'low' } },
+        { cycleGuard: false },
+        { thinkingTokenBudget: 64 },
+      ),
+    ).toEqual({
+      budget: 64,
+      guard: undefined,
+      endText: undefined,
+      from: undefined,
+    });
+
+    // Crash quarantine fingerprints distinguish client-supplied budget_tokens: 12000
+    // from host-injected 12000 (which dispatches as 256 on LFM2 `low`), and stay
+    // identical across cold (pre-load) and resident dispatch.
+    const seenKeys: string[] = [];
+    const journal = {
+      refuses: vi.fn((fp: string) => {
+        seenKeys.push(fp);
+        return false;
+      }),
+      begin: vi.fn(() => () => {}),
+    } as never;
+    const coldRegistry = new ModelRegistry();
+    const baseModel = createMockModel();
+    const lfm2 = Object.assign(Object.create({ constructor: { name: 'Lfm2Model' } }), baseModel) as typeof baseModel;
+    const sendWithJournal = async (extra: Record<string, unknown>, lazyLoad: boolean): Promise<void> => {
+      const { res } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'lfm2', messages: [{ role: 'user', content: 'go' }], max_tokens: 16, ...extra },
+        coldRegistry,
+        undefined,
+        undefined,
+        lazyLoad
+          ? async () => {
+              coldRegistry.register('lfm2', lfm2);
+            }
+          : undefined,
+        undefined,
+        host,
+        journal,
+      );
+    };
+    await sendWithJournal({ extra_body: { reasoning_effort: 'low' } }, true);
+    await sendWithJournal({ extra_body: { reasoning_effort: 'low' } }, false);
+    await sendWithJournal(
+      { extra_body: { reasoning_effort: 'low' }, thinking: { type: 'enabled', budget_tokens: 12_000 } },
+      false,
+    );
+    expect(seenKeys).toHaveLength(3);
+    expect(seenKeys[0]).toBe(seenKeys[1]);
+    expect(seenKeys[0]).not.toBe(seenKeys[2]);
   });
 
   // Splash `StreamingToolCallProjector._begin_call`: an opening that names no function
@@ -8113,5 +8337,508 @@ describe('handleCreateMessage trace metadata', () => {
       ...(mockModel.chatSessionContinue as unknown as ReturnType<typeof vi.fn>).mock.calls,
     ] as Array<[unknown, { clientSession?: string }]>;
     expect(calls.map(([, config]) => config.clientSession)).toEqual(['acp-1', undefined]);
+  });
+
+  describe('reasoning_returns SSE state machine', () => {
+    function assertValidAnthropicBlockLifecycle(events: Array<{ event: string; data: Record<string, unknown> }>) {
+      const starts = events.filter((e) => e.event === 'content_block_start');
+      const stops = events.filter((e) => e.event === 'content_block_stop');
+      expect(stops.length).toBe(starts.length);
+      let openIdx: number | null = null;
+      let expectedNextIdx = 0;
+      const blocks: Array<{ index: number; type: string; text: string }> = [];
+      for (const e of events) {
+        if (e.event === 'content_block_start') {
+          expect(openIdx).toBeNull();
+          const idx = e.data.index as number;
+          expect(idx).toBe(expectedNextIdx++);
+          openIdx = idx;
+          const cb = e.data.content_block as { type: string };
+          blocks.push({ index: idx, type: cb.type, text: '' });
+        } else if (e.event === 'content_block_delta') {
+          expect(openIdx).not.toBeNull();
+          expect(e.data.index).toBe(openIdx);
+          const delta = e.data.delta as { type: string; thinking?: string; text?: string; partial_json?: string };
+          const cur = blocks[blocks.length - 1]!;
+          cur.text += delta.thinking ?? delta.text ?? delta.partial_json ?? '';
+        } else if (e.event === 'content_block_stop') {
+          expect(openIdx).not.toBeNull();
+          expect(e.data.index).toBe(openIdx);
+          openIdx = null;
+        }
+      }
+      expect(openIdx).toBeNull();
+      return blocks;
+    }
+
+    it('handles Think1 -> Text1 -> Think2 -> Text2 -> ToolCall with strictly monotonic non-overlapping indices', async () => {
+      const toolCall: ToolCallResult = {
+        id: 'call_1',
+        name: 'get_weather',
+        arguments: '{"city":"SF"}',
+        status: 'ok',
+        rawContent: '',
+      };
+      const streamEvents = [
+        { done: false, text: 'Think1', isReasoning: true },
+        { done: false, text: 'Text1', isReasoning: false },
+        { done: false, text: 'Think2', isReasoning: true },
+        { done: false, text: 'Text2', isReasoning: false },
+        {
+          done: true,
+          text: 'Text1Text2',
+          thinking: 'Think1Think2',
+          thinkingEnabled: true,
+          finishReason: 'tool_calls',
+          toolCalls: [toolCall],
+          rawText: '',
+          numTokens: 10,
+          promptTokens: 5,
+          reasoningTokens: 4,
+          cachedTokens: 0,
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('m', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(
+        res,
+        {
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 64,
+          stream: true,
+          tools: [{ name: 'get_weather', input_schema: { type: 'object', properties: {} } }],
+        },
+        registry,
+      );
+      const events = parseSSE(getBody());
+      const blocks = assertValidAnthropicBlockLifecycle(events);
+      expect(blocks).toEqual([
+        { index: 0, type: 'thinking', text: 'Think1' },
+        { index: 1, type: 'text', text: 'Text1' },
+        { index: 2, type: 'thinking', text: 'Think2' },
+        { index: 3, type: 'text', text: 'Text2' },
+        { index: 4, type: 'tool_use', text: '{"city":"SF"}' },
+      ]);
+      expect(events[events.length - 1]!.event).toBe('message_stop');
+    });
+
+    it('handles Text1 -> Think1 -> Text2 with monotonic indices 0, 1, 2', async () => {
+      const streamEvents = [
+        { done: false, text: 'Text1', isReasoning: false },
+        { done: false, text: 'Think1', isReasoning: true },
+        { done: false, text: 'Text2', isReasoning: false },
+        {
+          done: true,
+          text: 'Text1Text2',
+          thinking: 'Think1',
+          thinkingEnabled: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          rawText: '',
+          numTokens: 6,
+          promptTokens: 3,
+          reasoningTokens: 2,
+          cachedTokens: 0,
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('m', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'm', messages: [{ role: 'user', content: 'hi' }], max_tokens: 64, stream: true },
+        registry,
+      );
+      const blocks = assertValidAnthropicBlockLifecycle(parseSSE(getBody()));
+      expect(blocks).toEqual([
+        { index: 0, type: 'text', text: 'Text1' },
+        { index: 1, type: 'thinking', text: 'Think1' },
+        { index: 2, type: 'text', text: 'Text2' },
+      ]);
+    });
+
+    it('handles Think1 -> "\\n" -> Think2 without splitting and Think1 -> ToolCall without empty text block', async () => {
+      const wsEvents = [
+        { done: false, text: 'Think1', isReasoning: true },
+        { done: false, text: '\n', isReasoning: false },
+        { done: false, text: 'Think2', isReasoning: true },
+        {
+          done: true,
+          text: '',
+          thinking: 'Think1Think2',
+          thinkingEnabled: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          rawText: '',
+          numTokens: 5,
+          promptTokens: 2,
+          reasoningTokens: 4,
+          cachedTokens: 0,
+        },
+      ];
+      const reg1 = new ModelRegistry();
+      reg1.register('m', createMockStreamModel(wsEvents));
+      const res1 = createMockRes();
+      await handleCreateMessage(
+        res1.res,
+        { model: 'm', messages: [{ role: 'user', content: 'hi' }], max_tokens: 64, stream: true },
+        reg1,
+      );
+      expect(assertValidAnthropicBlockLifecycle(parseSSE(res1.getBody()))).toEqual([
+        { index: 0, type: 'thinking', text: 'Think1Think2' },
+      ]);
+
+      const toolEvents = [
+        { done: false, text: 'Think1', isReasoning: true },
+        {
+          done: true,
+          text: '',
+          thinking: 'Think1',
+          thinkingEnabled: true,
+          finishReason: 'tool_calls',
+          toolCalls: [{ id: 'call_a', name: 'fn', arguments: '{}', status: 'ok', rawContent: '' }],
+          rawText: '',
+          numTokens: 4,
+          promptTokens: 2,
+          reasoningTokens: 2,
+          cachedTokens: 0,
+        },
+      ];
+      const reg2 = new ModelRegistry();
+      reg2.register('m', createMockStreamModel(toolEvents));
+      const res2 = createMockRes();
+      await handleCreateMessage(
+        res2.res,
+        {
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 64,
+          stream: true,
+          tools: [{ name: 'fn', input_schema: { type: 'object', properties: {} } }],
+        },
+        reg2,
+      );
+      expect(assertValidAnthropicBlockLifecycle(parseSSE(res2.getBody()))).toEqual([
+        { index: 0, type: 'thinking', text: 'Think1' },
+        { index: 1, type: 'tool_use', text: '{}' },
+      ]);
+    });
+
+    it('closes only the single open block once on mid-stream throw during Think2', async () => {
+      const model = createMockModel();
+      model.chatStreamSessionStart = vi.fn(async function* () {
+        yield { done: false as const, text: 'Text1', isReasoning: false };
+        yield { done: false as const, text: 'Think2', isReasoning: true };
+        throw new Error('decode boom');
+      }) as unknown as SessionCapableModel['chatStreamSessionStart'];
+      const registry = new ModelRegistry();
+      registry.register('m', model);
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(
+        res,
+        { model: 'm', messages: [{ role: 'user', content: 'hi' }], max_tokens: 64, stream: true },
+        registry,
+      );
+      const events = parseSSE(getBody());
+      const blocks = assertValidAnthropicBlockLifecycle(events);
+      expect(blocks).toEqual([
+        { index: 0, type: 'text', text: 'Text1' },
+        { index: 1, type: 'thinking', text: 'Think2' },
+      ]);
+      expect(events[events.length - 1]!.event).toBe('error');
+    });
+
+    it('omits thinking blocks/deltas when thinking.display is omitted', async () => {
+      const streamEvents = [
+        { done: false, text: 'secret thought', isReasoning: true },
+        { done: false, text: 'visible answer', isReasoning: false },
+        {
+          done: true,
+          text: 'visible answer',
+          thinking: 'secret thought',
+          thinkingEnabled: true,
+          finishReason: 'stop',
+          toolCalls: [],
+          rawText: 'visible answer',
+          numTokens: 5,
+          promptTokens: 2,
+          reasoningTokens: 2,
+          cachedTokens: 0,
+        },
+      ];
+      const registry = new ModelRegistry();
+      registry.register('m', createMockStreamModel(streamEvents));
+      const { res, getBody } = createMockRes();
+      await handleCreateMessage(
+        res,
+        {
+          model: 'm',
+          messages: [{ role: 'user', content: 'hi' }],
+          max_tokens: 64,
+          stream: true,
+          thinking: { type: 'adaptive', display: 'omitted' },
+        },
+        registry,
+      );
+      const blocks = assertValidAnthropicBlockLifecycle(parseSSE(getBody()));
+      expect(blocks).toEqual([{ index: 0, type: 'text', text: 'visible answer' }]);
+    });
+  });
+
+  describe('corrupt / unsupported images return HTTP 400 before SSE', () => {
+    const validPng = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+    const pngBytes = Buffer.from(validPng, 'base64');
+    const badPayloads = [
+      ['truncated PNG', pngBytes.subarray(0, Math.floor(pngBytes.length / 2)).toString('base64')],
+      ['random garbage', Buffer.from('garbage-not-an-image').toString('base64')],
+      [
+        'BMP',
+        Buffer.from([0x42, 0x4d, 0x1e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1a, 0x00, 0x00, 0x00]).toString(
+          'base64',
+        ),
+      ],
+      ['TIFF', Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]).toString('base64')],
+      [
+        'HEIC',
+        Buffer.from([0x00, 0x00, 0x00, 0x18, 0x66, 0x74, 0x79, 0x70, 0x68, 0x65, 0x69, 0x63]).toString('base64'),
+      ],
+    ] as const;
+
+    it.each(badPayloads)(
+      'returns HTTP 400 JSON before SSE for %s (stream: false and stream: true)',
+      async (_name, data) => {
+        for (const stream of [false, true]) {
+          const model = Object.assign(createMockModel(), { supportsImages: () => true });
+          const registry = new ModelRegistry();
+          registry.register('vision', model);
+          const { res, getStatus, getBody, getHeaders } = createMockRes();
+          await handleCreateMessage(
+            res,
+            {
+              model: 'vision',
+              max_tokens: 32,
+              stream,
+              messages: [
+                {
+                  role: 'user',
+                  content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data } }],
+                },
+              ],
+            },
+            registry,
+          );
+          expect(getStatus()).toBe(400);
+          expect(getHeaders()['content-type']).toContain('application/json');
+          expect(getBody()).not.toContain('event:');
+          expect(JSON.parse(getBody())).toEqual({
+            type: 'error',
+            error: { type: 'invalid_request_error', message: 'Could not process image' },
+          });
+          expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+          expect((model.chatStreamSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+        }
+      },
+    );
+
+    it('runs image validation asynchronously without blocking event-loop work, rejects before SSE, and caches repeated multi-turn images', async () => {
+      const validGif = 'R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7';
+      const model = Object.assign(createMockModel(), { supportsImages: () => true });
+      const registry = new ModelRegistry({ maxQueueDepth: 2 });
+      registry.register('vision', model);
+
+      let entered!: () => void;
+      let release!: () => void;
+      const enteredPromise = new Promise<void>((resolve) => {
+        entered = resolve;
+      });
+      const gatePromise = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const validator = vi.fn(async (data: Uint8Array) => {
+        if (validator.mock.calls.length === 1) {
+          entered();
+          await gatePromise;
+        }
+        if (data[0] === 0x00) {
+          throw new Error('image_processing_error: invalid');
+        }
+      });
+
+      __setImageValidatorForTests(validator);
+      try {
+        // Turn 1: image validation awaits without blocking unrelated timers
+        const r1 = createMockRes();
+        const turn1 = handleCreateMessage(
+          r1.res,
+          {
+            model: 'vision',
+            max_tokens: 32,
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+              },
+            ],
+          },
+          registry,
+        );
+        await enteredPromise;
+        let tickRan = false;
+        await new Promise<void>((resolve) => {
+          setTimeout(() => {
+            tickRan = true;
+            resolve();
+          }, 0);
+        });
+        expect(tickRan).toBe(true);
+        release();
+        await turn1;
+        expect(r1.getStatus()).toBe(200);
+        expect(validator).toHaveBeenCalledTimes(1);
+
+        // Turn 2: stateless multi-turn resend of the same image hits the digest cache (0 new decodes)
+        const r2 = createMockRes();
+        await handleCreateMessage(
+          r2.res,
+          {
+            model: 'vision',
+            max_tokens: 32,
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+              },
+              { role: 'assistant', content: 'it is a pixel' },
+              { role: 'user', content: 'thanks' },
+            ],
+          },
+          registry,
+        );
+        expect(r2.getStatus()).toBe(200);
+        expect(validator).toHaveBeenCalledTimes(1);
+
+        // Turn 3: adding a new image validates ONLY the new image
+        const r3 = createMockRes();
+        await handleCreateMessage(
+          r3.res,
+          {
+            model: 'vision',
+            max_tokens: 32,
+            messages: [
+              {
+                role: 'user',
+                content: [{ type: 'image', source: { type: 'base64', media_type: 'image/png', data: validPng } }],
+              },
+              { role: 'assistant', content: 'ok' },
+              {
+                role: 'user',
+                content: [{ type: 'image', source: { type: 'base64', media_type: 'image/gif', data: validGif } }],
+              },
+            ],
+          },
+          registry,
+        );
+        expect(r3.getStatus()).toBe(200);
+        expect(validator).toHaveBeenCalledTimes(2);
+
+        // Async failure on streaming request rejects with JSON 400 before SSE headers and releases permit
+        const r4 = createMockRes();
+        await handleCreateMessage(
+          r4.res,
+          {
+            model: 'vision',
+            max_tokens: 32,
+            stream: true,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  {
+                    type: 'image',
+                    source: {
+                      type: 'base64',
+                      media_type: 'image/png',
+                      data: Buffer.from([0x00, 0x01, 0x02, 0x03]).toString('base64'),
+                    },
+                  },
+                ],
+              },
+            ],
+          },
+          registry,
+        );
+        expect(r4.getStatus()).toBe(400);
+        expect(r4.getHeaders()['content-type']).toContain('application/json');
+        expect(r4.getBody()).not.toContain('event:');
+        expect(registry.getSessionRegistry('vision')!.preDispatchAdmitCount).toBe(0);
+      } finally {
+        __setImageValidatorForTests(null);
+      }
+    });
+
+    it('cancels remaining image preflight validations on client disconnect and releases permits and leases', async () => {
+      const model = Object.assign(createMockModel(), { supportsImages: () => true });
+      const registry = new ModelRegistry({ maxQueueDepth: 0 });
+      registry.register('vision', model);
+
+      let enteredCount = 0;
+      let fourEntered!: () => void;
+      const fourEnteredPromise = new Promise<void>((resolve) => {
+        fourEntered = resolve;
+      });
+      let releaseGate!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        releaseGate = resolve;
+      });
+      const validator = vi.fn(async () => {
+        enteredCount++;
+        if (enteredCount === 4) fourEntered();
+        await gate;
+      });
+
+      __setImageValidatorForTests(validator);
+      try {
+        const r1 = createMockRes();
+        const images = Array.from({ length: 10 }, (_, i) => ({
+          type: 'image' as const,
+          source: {
+            type: 'base64' as const,
+            media_type: 'image/png' as const,
+            data: Buffer.from(`msg-img-${i}`).toString('base64'),
+          },
+        }));
+        const req1 = handleCreateMessage(
+          r1.res,
+          { model: 'vision', max_tokens: 32, messages: [{ role: 'user', content: images }] },
+          registry,
+        );
+
+        await fourEnteredPromise;
+        r1.res.emit('close');
+        await req1;
+
+        expect(r1.getBody()).toBe('');
+        expect(registry.getSessionRegistry('vision')!.preDispatchAdmitCount).toBe(0);
+        expect((model.chatSessionStart as ReturnType<typeof vi.fn>).mock.calls).toHaveLength(0);
+
+        releaseGate();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        expect(validator).toHaveBeenCalledTimes(4);
+
+        // Next request succeeds on maxQueueDepth: 0 -> confirms permit & lease were released cleanly.
+        const r2 = createMockRes();
+        await handleCreateMessage(
+          r2.res,
+          { model: 'vision', max_tokens: 32, messages: [{ role: 'user', content: 'hi' }] },
+          registry,
+        );
+        expect(r2.getStatus()).toBe(200);
+      } finally {
+        releaseGate();
+        __setImageValidatorForTests(null);
+      }
+    });
   });
 });

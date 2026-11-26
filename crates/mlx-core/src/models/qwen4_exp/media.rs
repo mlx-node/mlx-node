@@ -174,6 +174,9 @@ impl Inner {
         }
         self.decoder.check_cancelled()?;
         IMAGE_LIMITS.validate(args.media.images)?;
+        for bytes in args.media.images {
+            crate::vision::validate::validate_image_bytes_slice(bytes)?;
+        }
         let processor = image_processor();
         let refs: Vec<_> = args.media.images.iter().map(Vec::as_slice).collect();
         let counts = processor.plan_merged_token_counts(&refs, 2)?;

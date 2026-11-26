@@ -30,6 +30,7 @@ use napi::bindgen_prelude::*;
 pub struct SwitchLinear {
     weight: MxArray,
     transpose: bool,
+    outer_scale: Option<MxArray>,
 }
 
 impl SwitchLinear {
@@ -44,6 +45,7 @@ impl SwitchLinear {
         Ok(Self {
             weight,
             transpose: true,
+            outer_scale: None,
         })
     }
 
@@ -52,6 +54,7 @@ impl SwitchLinear {
         Self {
             weight,
             transpose: true,
+            outer_scale: None,
         }
     }
 
@@ -62,8 +65,25 @@ impl SwitchLinear {
         self
     }
 
-    /// Forward pass using `gather_mm`.
-    pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
+    /// Attach a per-expert F32 outer scale `[num_experts]` multiplied into the
+    /// output of [`Self::forward`].
+    pub fn with_outer_scale(mut self, outer_scale: MxArray) -> Self {
+        self.outer_scale = Some(outer_scale);
+        self
+    }
+
+    /// Optional per-expert F32 outer scale `[num_experts]`.
+    pub fn outer_scale(&self) -> Option<&MxArray> {
+        self.outer_scale.as_ref()
+    }
+
+    /// Forward pass using `gather_mm` WITHOUT applying `outer_scale`.
+    pub fn forward_without_outer_scale(
+        &self,
+        x: &MxArray,
+        indices: &MxArray,
+        sorted: bool,
+    ) -> Result<MxArray> {
         let weight_t;
         let rhs = if self.transpose {
             weight_t = self.weight.transpose(Some(&[0, 2, 1]))?;
@@ -84,6 +104,69 @@ impl SwitchLinear {
         MxArray::from_handle(handle, "switch_linear")
     }
 
+    /// Forward pass using `gather_mm`, applying the optional per-expert
+    /// `outer_scale` in FP32 if attached.
+    pub fn forward(&self, x: &MxArray, indices: &MxArray, sorted: bool) -> Result<MxArray> {
+        let input_dtype = x.dtype()?;
+        let promote_f16 = self.outer_scale.is_some()
+            && input_dtype == DType::Float16
+            && self.weight.dtype()? == DType::Float16;
+        let x_f32_owned;
+        let x_in = if promote_f16 {
+            x_f32_owned = x.astype(DType::Float32)?;
+            &x_f32_owned
+        } else {
+            x
+        };
+
+        let mut result = self.forward_without_outer_scale(x_in, indices, sorted)?;
+        if let Some(outer) = self.outer_scale.as_ref() {
+            let out_dtype = if promote_f16 {
+                input_dtype
+            } else {
+                result.dtype()?
+            };
+            let outer_f32 = if outer.dtype()? == DType::Float32 {
+                outer.clone()
+            } else {
+                outer.astype(DType::Float32)?
+            };
+            let res_f32 = if result.dtype()? == DType::Float32 {
+                result
+            } else {
+                result.astype(DType::Float32)?
+            };
+            let scaled = if outer_f32.size()? == 1 {
+                let s = outer_f32.reshape(&[1])?;
+                res_f32.mul(&s)?
+            } else {
+                let outer_1d = if outer_f32.ndim()? == 1 {
+                    outer_f32
+                } else {
+                    outer_f32.reshape(&[-1])?
+                };
+                let gathered = outer_1d.take(indices, 0)?;
+                let mut broadcast_shape = indices.shape()?.to_vec();
+                let result_ndim = res_f32.ndim()? as usize;
+                if result_ndim < broadcast_shape.len() {
+                    return Err(Error::from_reason(format!(
+                        "SwitchLinear outer_scale broadcast mismatch: result ndim {result_ndim} < indices ndim {}",
+                        broadcast_shape.len()
+                    )));
+                }
+                broadcast_shape.resize(result_ndim, 1);
+                let scale = gathered.reshape(&broadcast_shape)?;
+                res_f32.mul(&scale)?
+            };
+            result = if scaled.dtype()? != out_dtype {
+                scaled.astype(out_dtype)?
+            } else {
+                scaled
+            };
+        }
+        Ok(result)
+    }
+
     pub fn get_weight(&self) -> MxArray {
         self.weight.clone()
     }
@@ -96,8 +179,25 @@ impl SwitchLinear {
         self.weight = weight.clone();
     }
 
+    /// Ensure optional per-expert `outer_scale` is stored as `Float32` once at load.
+    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
+        if let Some(ref mut os) = self.outer_scale
+            && os.dtype()? != DType::Float32
+        {
+            *os = os.astype(DType::Float32)?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn ensure_cuda_device(&mut self) -> Result<usize> {
-        self.weight.promote_cuda_device()
+        if !crate::accelerator::cuda_ops_available() {
+            return Ok(0);
+        }
+        let mut promoted = self.weight.promote_cuda_device()?;
+        if let Some(ref mut os) = self.outer_scale {
+            promoted += os.promote_cuda_device()?;
+        }
+        Ok(promoted)
     }
 }
 
@@ -106,6 +206,7 @@ impl Clone for SwitchLinear {
         Self {
             weight: self.weight.clone(),
             transpose: self.transpose,
+            outer_scale: self.outer_scale.clone(),
         }
     }
 }
@@ -132,14 +233,14 @@ impl SwitchProj {
         sorted: bool,
     ) -> Result<MxArray> {
         match self {
-            SwitchProj::Standard(l) => l.forward(x, indices, sorted),
+            SwitchProj::Standard(l) => l.forward_without_outer_scale(x, indices, sorted),
             SwitchProj::Quantized(l) => l.forward_without_outer_scale(x, indices, sorted),
         }
     }
 
     pub fn outer_scale(&self) -> Option<&MxArray> {
         match self {
-            SwitchProj::Standard(_) => None,
+            SwitchProj::Standard(l) => l.outer_scale(),
             SwitchProj::Quantized(l) => l.outer_scale(),
         }
     }
@@ -197,7 +298,20 @@ impl SwitchProj {
                 }
                 refs
             }
-            Self::Standard(l) => vec![l.weight_ref()],
+            Self::Standard(l) => {
+                let mut refs = vec![l.weight_ref()];
+                if let Some(s) = l.outer_scale() {
+                    refs.push(s);
+                }
+                refs
+            }
+        }
+    }
+
+    pub(crate) fn promote_outer_scale_to_f32(&mut self) -> Result<()> {
+        match self {
+            Self::Standard(l) => l.promote_outer_scale_to_f32(),
+            Self::Quantized(q) => q.promote_outer_scale_to_f32(),
         }
     }
 
@@ -302,5 +416,43 @@ impl SwitchGLU {
 
     pub fn is_quantized(&self) -> bool {
         self.gate_proj.is_quantized()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dense_switch_linear_outer_scale_and_f16_overflow_guard() -> Result<()> {
+        // E=2, N=4, K=16 dense Float16 weights with large values + small outer_scale so raw
+        // F16 matmul (500 * 16 * 16 = 128000) would overflow Float16 (> 65504) without F32 promotion.
+        let w_e0 = vec![500.0f32; 4 * 16];
+        let w_e1 = vec![-250.0f32; 4 * 16];
+        let mut w_all = Vec::new();
+        w_all.extend_from_slice(&w_e0);
+        w_all.extend_from_slice(&w_e1);
+        let weight = MxArray::from_float32(&w_all, &[2, 4, 16])?.astype(DType::Float16)?;
+        let scale = MxArray::from_float32(&[1.0 / 2560.0, 1.0 / 1280.0], &[2])?;
+
+        let sl = SwitchLinear::from_weight(weight).with_outer_scale(scale);
+        let proj = SwitchProj::Standard(sl);
+        assert!(proj.outer_scale().is_some());
+        assert_eq!(proj.weight_refs().len(), 2);
+
+        let x = MxArray::from_float32(&[16.0f32; 16], &[1, 1, 1, 16])?.astype(DType::Float16)?;
+        let idx = MxArray::from_int32(&[0, 1], &[1, 2])?;
+        let y = proj.forward(&x, &idx, false)?;
+        assert_eq!(y.dtype()?, DType::Float16);
+        let vals = y.astype(DType::Float32)?.to_float32()?;
+        // Expert 0: 16 * 16 * 500 / 2560 = 50.0 (would be Inf in F16 without guard!)
+        // Expert 1: 16 * 16 * (-250) / 1280 = -50.0
+        for &v in &vals[0..4] {
+            assert!(v.is_finite() && (v - 50.0).abs() < 0.25, "e0 got {v}");
+        }
+        for &v in &vals[4..8] {
+            assert!(v.is_finite() && (v + 50.0).abs() < 0.25, "e1 got {v}");
+        }
+        Ok(())
     }
 }

@@ -138,6 +138,38 @@ MTL::Library* get_paged_attn_library(mlx::core::metal::Device& device) {
   return device.get_library(kPagedAttnLibraryName, cached_path.string());
 }
 
+// Validates that the loaded `paged_attn.metallib` carries the P0/P3 v2 ABI
+// (direct-store/gated prefill attention + M>=65 Tiled64 prefill GEMM) by
+// probing for a newly introduced symbol (`qwen35_qkv_prep_int8_ktm_d256`).
+// Cached per `MTL::Library*` so steady-state dispatch pays one pointer check.
+bool metallib_has_prefill_v2_abi(mlx::core::metal::Device& device) {
+  auto* lib = get_paged_attn_library(device);
+  static std::mutex mu;
+  static MTL::Library* cached_lib = nullptr;
+  static bool cached_result = false;
+  std::lock_guard<std::mutex> lock(mu);
+  if (lib == cached_lib) {
+    return cached_result;
+  }
+  bool found = false;
+  if (lib != nullptr) {
+    auto* names = lib->functionNames();
+    if (names != nullptr) {
+      for (NS::UInteger i = 0; i < names->count(); ++i) {
+        auto* name = names->object<NS::String>(i);
+        if (name != nullptr &&
+            std::string(name->utf8String()) == "qwen35_qkv_prep_int8_ktm_d256") {
+          found = true;
+          break;
+        }
+      }
+    }
+  }
+  cached_lib = lib;
+  cached_result = found;
+  return found;
+}
+
 MTL::ComputePipelineState* get_prebuilt_kernel(
     mlx::core::metal::Device& device,
     const char* tag,
@@ -2679,7 +2711,33 @@ int64_t paged_prefill_workspace_floats(
       (static_cast<int64_t>(head_size) + 2);
 }
 
-void dispatch_paged_prefill_attention(
+struct PagedPrefillGateParams {
+  uint32_t has_gate;
+  uint32_t gate_row_stride;
+};
+static_assert(sizeof(PagedPrefillGateParams) == 8, "matches the Metal struct");
+
+struct Qwen35QkvPrepParams {
+  uint32_t num_tokens;
+  uint32_t chunk_stride;
+  uint32_t num_q_heads;
+  uint32_t num_kv_heads;
+  uint32_t block_size;
+  uint32_t rope_dims;
+  int32_t rope_offset;
+  float eps;
+  float log2_base;
+  float rope_scale;
+  uint32_t q_row_stride;
+  uint32_t q_head_stride;
+  uint32_t k_row_stride;
+  uint32_t k_head_stride;
+  uint32_t v_row_stride;
+  uint32_t v_head_stride;
+};
+static_assert(sizeof(Qwen35QkvPrepParams) == 64, "matches the Metal struct");
+
+void dispatch_paged_prefill_attention_gated(
     mlx::core::metal::CommandEncoder& encoder,
     mlx::core::metal::Device& device,
     mlx::core::array& out,
@@ -2695,7 +2753,10 @@ void dispatch_paged_prefill_attention(
     int head_size,
     KvDtype cache_dtype,
     bool int8_queries,
-    int64_t live_blocks) {
+    int64_t live_blocks,
+    int64_t q_row_offset,
+    const mlx::core::array* gate,
+    uint32_t gate_row_stride) {
   const int kv_heads = static_cast<int>(params.kv_heads);
   const int group = num_q_heads / kv_heads;
   const int parts = paged_prefill_tile_parts(group);
@@ -2721,6 +2782,21 @@ void dispatch_paged_prefill_attention(
     }
   }
 
+  const float dummy_zero = 0.0f;
+  const bool has_v2_abi = metallib_has_prefill_v2_abi(device);
+  if (!has_v2_abi && (gate != nullptr || q_row_offset != 0)) {
+    throw PrebuiltKernelMissing(
+        "[paged_prefill] Loaded paged_attn.metallib lacks the direct-store/gated "
+        "prefill ABI (missing qwen35_qkv_prep_int8_ktm_d256); rebuild it with "
+        "`yarn build:native`.");
+  }
+  const bool direct_store = has_v2_abi && params.split_count == 1u;
+  const int64_t q_byte_offset = q_row_offset * static_cast<int64_t>(group) *
+      static_cast<int64_t>(head_size) * static_cast<int64_t>(q_staged.itemsize());
+  const PagedPrefillGateParams split_gate_params{
+      (direct_store && gate != nullptr) ? 1u : 0u,
+      (direct_store && gate != nullptr) ? gate_row_stride : 0u};
+
   {
     auto* pipeline = paged_prefill_pipeline(
         device,
@@ -2728,12 +2804,23 @@ void dispatch_paged_prefill_attention(
             ? paged_prefill_keys_token_major_split_name(int8_queries)
             : paged_prefill_split_name(cache_dtype, int8_queries, group, head_size));
     encoder.set_compute_pipeline_state(pipeline);
-    encoder.set_input_array(q_staged, 0);
+    encoder.set_input_array(q_staged, 0, q_byte_offset);
     encoder.set_output_array(workspace, 1);
     encoder.set_output_array(workspace, 2, partial_floats * 4);
     encoder.set_input_array(block_table, 3);
     bind_pool_planes(encoder, k_pool, v_pool, k_scale, v_scale, live_blocks);
     encoder.set_bytes(params, 8);
+    if (direct_store) {
+      encoder.set_output_array(out, 9);
+    } else {
+      encoder.set_bytes(dummy_zero, 9);
+    }
+    if (direct_store && gate != nullptr) {
+      encoder.set_input_array(*gate, 10);
+    } else {
+      encoder.set_bytes(dummy_zero, 10);
+    }
+    encoder.set_bytes(split_gate_params, 11);
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
             static_cast<size_t>(kv_heads * parts),
@@ -2741,15 +2828,27 @@ void dispatch_paged_prefill_attention(
             static_cast<size_t>(params.split_count)),
         MTL::Size::Make(kNumThreads, 1, 1));
   }
+  if (direct_store) {
+    return;
+  }
   // The reduce reads every split's partials.
   encoder.barrier();
   {
+    const PagedPrefillGateParams reduce_gate_params{
+        gate != nullptr ? 1u : 0u,
+        gate != nullptr ? gate_row_stride : 0u};
     auto* pipeline = paged_prefill_pipeline(device, paged_prefill_reduce_name(group, head_size));
     encoder.set_compute_pipeline_state(pipeline);
     encoder.set_input_array(workspace, 0);
     encoder.set_input_array(workspace, 1, partial_floats * 4);
     encoder.set_output_array(out, 2);
     encoder.set_bytes(params, 3);
+    if (gate != nullptr) {
+      encoder.set_input_array(*gate, 4);
+    } else {
+      encoder.set_bytes(dummy_zero, 4);
+    }
+    encoder.set_bytes(reduce_gate_params, 5);
     encoder.dispatch_threadgroups(
         MTL::Size::Make(
             static_cast<size_t>(kv_heads),
@@ -2757,6 +2856,107 @@ void dispatch_paged_prefill_attention(
             static_cast<size_t>(tiles)),
         MTL::Size::Make(static_cast<size_t>(head_size), 1, 1));
   }
+}
+
+void dispatch_paged_prefill_attention(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    mlx::core::array& out,
+    mlx::core::array& workspace,
+    const mlx::core::array& q_staged,
+    const mlx::core::array& k_pool,
+    const mlx::core::array& v_pool,
+    const mlx::core::array& k_scale,
+    const mlx::core::array& v_scale,
+    const mlx::core::array& block_table,
+    const PagedPrefillParams& params,
+    int num_q_heads,
+    int head_size,
+    KvDtype cache_dtype,
+    bool int8_queries,
+    int64_t live_blocks) {
+  dispatch_paged_prefill_attention_gated(
+      encoder,
+      device,
+      out,
+      workspace,
+      q_staged,
+      k_pool,
+      v_pool,
+      k_scale,
+      v_scale,
+      block_table,
+      params,
+      num_q_heads,
+      head_size,
+      cache_dtype,
+      int8_queries,
+      live_blocks,
+      /*q_row_offset=*/0,
+      /*gate=*/nullptr,
+      /*gate_row_stride=*/0u);
+}
+
+void dispatch_qwen35_qkv_prep(
+    mlx::core::metal::CommandEncoder& encoder,
+    mlx::core::metal::Device& device,
+    const mlx::core::array& q_raw,
+    const mlx::core::array& k_raw,
+    const mlx::core::array& v_raw,
+    const mlx::core::array& wq,
+    const mlx::core::array& wk,
+    const mlx::core::array& slot_mapping,
+    mlx::core::array& q_staged,
+    mlx::core::array& k_pool,
+    mlx::core::array& v_pool,
+    mlx::core::array& k_scale,
+    mlx::core::array& v_scale,
+    const Qwen35QkvPrepParams& params,
+    bool is_int8_ktm) {
+  const std::string name = is_int8_ktm ? "qwen35_qkv_prep_int8_ktm_d256"
+                                       : "qwen35_qkv_prep_bf16_vllm_d256";
+  thread_local const void* cached_dev = nullptr;
+  thread_local std::unordered_map<std::string, MTL::ComputePipelineState*> cache;
+  const void* cur_dev = static_cast<const void*>(device.mtl_device());
+  if (cached_dev != cur_dev) {
+    cache.clear();
+    cached_dev = cur_dev;
+  }
+  MTL::ComputePipelineState* pipeline = nullptr;
+  auto it = cache.find(name);
+  if (it != cache.end()) {
+    pipeline = it->second;
+  } else {
+    pipeline = get_prebuilt_kernel(device, "qwen35_qkv_prep", "qwen35 qkv prep", name);
+    if (pipeline != nullptr) {
+      cache.emplace(name, pipeline);
+    }
+  }
+  encoder.set_compute_pipeline_state(pipeline);
+  encoder.set_input_array(q_raw, 0);
+  encoder.set_input_array(k_raw, 1);
+  encoder.set_input_array(v_raw, 2);
+  encoder.set_input_array(wq, 3);
+  encoder.set_input_array(wk, 4);
+  encoder.set_input_array(slot_mapping, 5);
+  encoder.set_output_array(q_staged, 6);
+  encoder.set_output_array(k_pool, 7);
+  encoder.set_output_array(v_pool, 8);
+  if (is_int8_ktm) {
+    encoder.set_output_array(k_scale, 9);
+    encoder.set_output_array(v_scale, 10);
+  } else {
+    const float dummy_zero = 0.0f;
+    encoder.set_bytes(dummy_zero, 9);
+    encoder.set_bytes(dummy_zero, 10);
+  }
+  encoder.set_bytes(params, 11);
+  const size_t total_groups =
+      static_cast<size_t>(params.chunk_stride) * params.num_q_heads +
+      2u * static_cast<size_t>(params.num_tokens) * params.num_kv_heads;
+  encoder.dispatch_threadgroups(
+      MTL::Size::Make(total_groups, 1, 1),
+      MTL::Size::Make(kNumThreads, 1, 1));
 }
 
 void dispatch_paged_query_codes(

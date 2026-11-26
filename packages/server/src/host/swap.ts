@@ -12,7 +12,7 @@
  */
 
 import type { LoadableModel, SessionCapableModel } from '@mlx-node/lm';
-import { familyDataFor } from '@mlx-node/lm/family-data';
+import { familyDataFor, reasoningEffortsFor } from '@mlx-node/lm/family-data';
 
 import type { SystemOneModel } from '../decision-registry.js';
 import type { PublicModelEntry } from '../handler.js';
@@ -340,6 +340,8 @@ export function makeSwapController(
     return ordered.map((entry) => {
       const window =
         registry.servedContext(entry.name)?.windowTokens ?? estimatedWindow?.(entry.name) ?? entry.contextWindow;
+      const reasoningEfforts =
+        registry.reasoningEfforts?.(entry.name) ?? entry.reasoningEfforts ?? reasoningEffortsFor(entry.modelType);
       return {
         id: entry.name,
         object: 'model',
@@ -356,6 +358,7 @@ export function makeSwapController(
         model_family: String(entry.modelType),
         supports_images: entry.supportsImages,
         max_request_bytes: ANTHROPIC_MAX_BODY_BYTES,
+        ...(reasoningEfforts !== undefined ? { reasoning_efforts: reasoningEfforts } : {}),
       };
     });
   }
