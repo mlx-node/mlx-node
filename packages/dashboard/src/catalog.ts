@@ -263,22 +263,30 @@ function holdsBuild(
 }
 
 /**
- * Whether any other catalog build (on this platform or another platform) shares
- * `build`'s repository, requiring variant-filename identity checks so one
- * platform's build can never spoof or overwrite another build's checkpoint.
+ * IDs of catalog builds on OTHER platforms that share `build`'s repository (for example,
+ * `SPARK-4Bit` and `SPARK-4Bit-Fast` on win32/linux when evaluating `Q4_K_M` on darwin).
+ * Used when `catalogSharesRepo(build, platform)` is false so a cross-platform sibling
+ * checkpoint neither spoofs this build nor gets silently overwritten, without changing
+ * sole-build semantics for non-catalog files or non-GGUF checkpoints.
  */
-function repoHasOtherBuilds(build: CatalogBuild, platform: NodeJS.Platform): boolean {
-  if (catalogSharesRepo(build, platform)) return true;
+function crossPlatformSiblingIds(build: CatalogBuild, platform: NodeJS.Platform): ReadonlySet<string> {
   const hfRepo = catalogBuildRepo(build, platform);
-  return MODEL_CATALOG.some((candidate) =>
-    candidate.builds.some((other) => other !== build && other.hfRepo === hfRepo),
-  );
+  const ids = new Set<string>();
+  for (const candidate of MODEL_CATALOG) {
+    for (const other of candidate.builds) {
+      if (other !== build && !catalogSupportedOnPlatform(other, platform) && other.hfRepo === hfRepo) {
+        ids.add(other.id);
+      }
+    }
+  }
+  return ids;
 }
 
 /**
  * What the loadable model at the folder of `build` is when it is not `build`, for a build whose repository another
- * build shares: its build names, or `another model` when its weights state none. `null` when the folder holds no
- * loadable model, holds `build`, or the repository is the build's alone.
+ * build shares: its build names, or `another model` when its weights state none. For a build that is the sole build
+ * on `platform` but shares its repository with builds on other platforms, only those cross-platform sibling builds
+ * hold the folder. `null` when the folder holds no loadable model, holds `build`, or is not held by a sibling build.
  */
 function heldByOther(
   modelsDir: string,
@@ -287,11 +295,17 @@ function heldByOther(
   configless: boolean,
   platform: NodeJS.Platform = process.platform,
 ): string | null {
-  if (!repoHasOtherBuilds(build, platform)) return null;
+  const sharesOnPlatform = catalogSharesRepo(build, platform);
+  const crossIds = sharesOnPlatform ? undefined : crossPlatformSiblingIds(build, platform);
+  if (!sharesOnPlatform && (crossIds === undefined || crossIds.size === 0)) return null;
   const slug = catalogBuildSlug(build, platform);
   const model = catalogFolderModel(join(modelsDir, slug), slug, family, configless);
   if (model === undefined || model.builds.includes(build.id)) return null;
-  return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
+  if (sharesOnPlatform) {
+    return model.builds.length > 0 ? model.builds.join(', ') : 'another model';
+  }
+  const matched = model.builds.filter((id) => crossIds!.has(id));
+  return matched.length > 0 ? matched.join(', ') : null;
 }
 
 /** The entry names of `dir`; none when it cannot be read. */
@@ -320,16 +334,13 @@ function buildWithState(
   let present: boolean;
   let installed: boolean;
   let heldBy: string | null = null;
-  if (repoHasOtherBuilds(build, platform)) {
+  if (catalogSharesRepo(build, platform)) {
     // The folder is the build it HOLDS, never the build its name suggests: a
-    // marker names only the repository, and multiple builds share it (on this
-    // platform or across platforms, e.g. Hy4-flash Q4_K_M vs SPARK-4Bit*).
+    // marker names only the repository, and multiple builds on this platform share it.
     const holds = (name: string): boolean => holdsBuild(modelsDir, name, build, family, configless !== undefined, true);
     const siblings = MODEL_CATALOG.flatMap((candidate) => candidate.builds).filter(
       (other) =>
-        other !== build &&
-        ((catalogSupportedOnPlatform(other, platform) && catalogBuildRepo(other, platform) === hfRepo) ||
-          other.hfRepo === hfRepo),
+        other !== build && catalogSupportedOnPlatform(other, platform) && catalogBuildRepo(other, platform) === hfRepo,
     );
     present =
       holds(slug) || siblings.some((other) => holds(catalogBuildSlug(other, platform))) || markedFolders.some(holds);
@@ -340,10 +351,21 @@ function buildWithState(
     // completion marker names THIS PLATFORM's repo. Matching the other
     // platform's build too would render the card "Installed" with `installed`
     // false — no Install button and no update affordance.
-    const holds = (name: string): boolean =>
-      holdsBuild(modelsDir, name, build, family, configless !== undefined, false);
+    // When other platforms ship different builds from the same repo (e.g.
+    // win32/linux SPARK-4Bit* vs darwin Q4_K_M), reject folders whose GGUF
+    // filenames identify one of those sibling builds without changing sole-build
+    // semantics for non-catalog GGUFs or non-GGUF fixtures.
+    const crossIds = crossPlatformSiblingIds(build, platform);
+    const holds = (name: string): boolean => {
+      const model = catalogFolderModel(join(modelsDir, name), name, family, configless !== undefined);
+      if (model === undefined) return false;
+      if (model.builds.includes(build.id)) return true;
+      if (crossIds.size > 0 && model.builds.some((id) => crossIds.has(id))) return false;
+      return !model.configless;
+    };
     present = holds(slug) || markedFolders.some(holds);
-    installed = isModelInstalled(dir, configless);
+    installed = isModelInstalled(dir, configless) && (crossIds.size === 0 || holds(slug));
+    heldBy = heldByOther(modelsDir, build, family, configless !== undefined, platform);
   }
   // Exactly the state the download runner's ownership preflight refuses, computed
   // with the SAME predicates it uses (isPathOccupied stays no-follow; a live
