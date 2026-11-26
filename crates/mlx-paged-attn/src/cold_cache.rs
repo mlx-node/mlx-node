@@ -12447,7 +12447,17 @@ mod tests {
             manager.enqueue_state(sym_obj, MakeRoom::Evict, tx).unwrap();
             assert!(matches!(landed(&rx), Landed::State { ok: true, .. }));
             let sym_path = root.join(object_file_name(&sym_key, ColdGroup::DFlash2State));
-            let victim = root.parent().unwrap().join("relabel-symlink-victim.txt");
+            let victim = root.parent().unwrap().join(format!(
+                "{}-victim.txt",
+                root.file_name().unwrap().to_string_lossy()
+            ));
+            struct RemoveOnDrop(PathBuf);
+            impl Drop for RemoveOnDrop {
+                fn drop(&mut self) {
+                    let _ = fs::remove_file(&self.0);
+                }
+            }
+            let _victim_guard = RemoveOnDrop(victim.clone());
             fs::write(&victim, b"keep-me").unwrap();
             fs::remove_file(&sym_path).unwrap();
             std::os::unix::fs::symlink(&victim, &sym_path).unwrap();

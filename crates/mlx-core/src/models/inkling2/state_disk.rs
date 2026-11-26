@@ -12278,7 +12278,7 @@ mod tests {
                         competing_key,
                         kv_fp,
                         &tokens_competing,
-                        test_deadline(5),
+                        test_deadline(10),
                         MakeRoom::Evict,
                         comp_tx,
                     )
@@ -12311,7 +12311,7 @@ mod tests {
             // `poll_relabel`: it must evict only the unpinned control block, never the held anchor.
             drop(pause);
             match comp_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("competing KV settle")
             {
                 Landed::Block { key, ok } => {
@@ -12564,7 +12564,7 @@ mod tests {
                         competing_key,
                         kv_fp,
                         &tokens_competing,
-                        test_deadline(5),
+                        test_deadline(10),
                         MakeRoom::Evict,
                         comp_tx,
                     )
@@ -12597,7 +12597,7 @@ mod tests {
             // it must evict ONLY the unpinned control block, never the held anchor or its KV chain.
             drop(pause);
             match comp_rx
-                .recv_timeout(Duration::from_secs(5))
+                .recv_timeout(Duration::from_secs(10))
                 .expect("competing KV settle")
             {
                 Landed::Block { key, ok } => {

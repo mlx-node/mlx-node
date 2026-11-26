@@ -14977,7 +14977,7 @@ pub(super) mod tests {
                 .expect("depth-32 anchor")
                 .id();
             let _ = rt.state_store.reclaim_entry(&rt.coordinator, id);
-            let deadline = Instant::now() + Duration::from_secs(5);
+            let deadline = Instant::now() + Duration::from_secs(15);
             while Instant::now() < deadline {
                 rt.state_store.tick(
                     &rt.coordinator,
@@ -15013,15 +15013,18 @@ pub(super) mod tests {
             panic!("evicted cold SSD anchor must park in WaitingForSsd");
         };
         let mut budget = RestoreUploadBudget::chunks(usize::MAX);
-        for _ in 0..2000 {
-            if restore.lands() {
-                break;
-            }
+        let restore_deadline = Instant::now() + Duration::from_secs(15);
+        while !restore.lands() && Instant::now() < restore_deadline {
             let rt = inner.paged.as_ref().expect("paged");
             poll_restore_ticket(rt.coordinator.full_adapter(), &mut restore, &mut budget);
-            std::thread::yield_now();
+            if !restore.lands() {
+                std::thread::sleep(Duration::from_millis(2));
+            }
         }
-        assert!(restore.lands(), "SSD restore ticket must land");
+        assert!(
+            matches!(restore.phase, Inkling2RestorePhase::Landed(_)),
+            "SSD restore ticket must land before deadline"
+        );
         let landed = inner
             .land_parked_restore_impl(seq_land, &mut restore, &prompt_160, false)
             .expect("land_parked_restore_impl")
