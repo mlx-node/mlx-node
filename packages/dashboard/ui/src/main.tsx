@@ -6,9 +6,11 @@ import { bindEventTargetPort } from '../../src/rpc/port.js';
 import { DASHBOARD_PORT_MESSAGE } from '../../src/rpc/protocol.js';
 import App from './App.tsx';
 import './index.css';
+import { initFonts } from './theme/fonts';
 import { initTheme } from './theme/theme';
 
 initTheme();
+initFonts();
 
 const rootEl = document.getElementById('root');
 if (rootEl === null) throw new Error('#root element not found');

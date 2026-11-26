@@ -26,7 +26,7 @@
   min-width: 0;
   overflow-wrap: anywhere;
   color: var(--foreground);
-  font-size: var(--text-body);
+  font-size: var(--text-sm);
   font-weight: 500;
   line-height: var(--leading-body);
 }
@@ -53,7 +53,7 @@
   background: var(--surface);
   color: var(--foreground);
   font: inherit;
-  font-size: var(--text-body);
+  font-size: var(--text-sm);
   line-height: var(--leading-body);
 }
 
@@ -99,7 +99,7 @@
   padding: var(--space-1) var(--space-2-5);
   border-top: 1px solid var(--border-subtle);
   color: var(--foreground);
-  font-size: var(--text-body);
+  font-size: var(--text-sm);
   cursor: pointer;
 }
 

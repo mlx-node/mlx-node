@@ -213,6 +213,11 @@
   justify-content: center;
   gap: 12px;
   color: var(--text-secondary);
+  font:
+    13px/1.4 system-ui,
+    BlinkMacSystemFont,
+    sans-serif;
+  letter-spacing: normal;
 }
 
 .bootSpinner {

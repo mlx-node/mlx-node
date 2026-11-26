@@ -13,7 +13,12 @@
   --text-xl: 1.25rem;
   --text-2xl: 1.5rem;
   --text-3xl: 2rem;
+  --text-mono: 0.75rem;
+  --text-field: 0.8125rem;
   --font-code: 'Geist Mono Variable', ui-monospace, 'SF Mono', Menlo, monospace;
+  --font-reading: 'Inter Variable', sans-serif;
+  --text-reading: 0.8125rem;
+  --tracking-reading: -0.01em;
 
   --shell-chrome: oklch(99% 0 0);
   --shell-titlebar-height: 2.5rem;

@@ -96,7 +96,7 @@
 .gap {
   padding: 0 var(--space-2-5);
   color: var(--text-secondary);
-  font-family: var(--font-sans);
+  font-family: var(--font-body);
   font-size: var(--text-xs);
 }
 

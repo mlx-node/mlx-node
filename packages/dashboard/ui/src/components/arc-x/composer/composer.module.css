@@ -74,7 +74,9 @@
   background: transparent;
   color: var(--foreground);
   font: inherit;
-  font-size: var(--text-sm);
+  font-family: var(--font-reading);
+  font-size: var(--text-reading);
+  letter-spacing: var(--tracking-reading);
   line-height: var(--leading-prose);
   outline: none;
 }

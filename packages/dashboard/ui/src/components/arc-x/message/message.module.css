@@ -33,7 +33,9 @@
 .body {
   min-width: 0;
   max-width: 72ch;
-  font-size: var(--text-sm);
+  font-family: var(--font-reading);
+  font-size: var(--text-reading);
+  letter-spacing: var(--tracking-reading);
   line-height: var(--leading-prose);
   overflow-wrap: anywhere;
 }

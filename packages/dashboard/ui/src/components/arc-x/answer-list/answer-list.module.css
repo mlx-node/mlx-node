@@ -24,7 +24,7 @@
   padding: var(--space-1-5) var(--space-2-5);
   border-top: 1px solid var(--border-subtle);
   color: var(--foreground);
-  font-size: var(--text-body);
+  font-size: var(--text-sm);
   cursor: pointer;
   transition: background-color var(--duration-fast) var(--ease-standard);
 }
@@ -137,7 +137,7 @@
   background: var(--surface);
   color: var(--foreground);
   font: inherit;
-  font-size: var(--text-body);
+  font-size: var(--text-sm);
 }
 
 .field:focus {

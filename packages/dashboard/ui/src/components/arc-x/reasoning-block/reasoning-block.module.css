@@ -71,6 +71,9 @@
   overflow: hidden;
   padding: 0 var(--space-3) var(--space-1-5) calc(var(--space-2-5) + 14px + var(--space-2));
   color: var(--text-muted);
+  font-family: var(--font-reading);
+  font-size: var(--text-reading);
+  letter-spacing: var(--tracking-reading);
   line-height: var(--leading-prose);
 }
 
@@ -88,6 +91,9 @@
 .body {
   padding: var(--space-1) var(--space-3) var(--space-3);
   color: var(--text-secondary);
+  font-family: var(--font-reading);
+  font-size: var(--text-reading);
+  letter-spacing: var(--tracking-reading);
   line-height: var(--leading-prose);
   text-wrap: pretty;
   white-space: pre-wrap;

@@ -314,7 +314,7 @@
 .line1 {
   overflow: hidden;
   color: var(--foreground);
-  font-size: 0.75rem;
+  font-size: calc(var(--text-xs) * 12 / 11);
   font-weight: 500;
   line-height: 1.3;
   text-overflow: ellipsis;
