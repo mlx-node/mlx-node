@@ -21,6 +21,7 @@
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
 
 use std::collections::VecDeque;
+use std::mem::{MaybeUninit, align_of, size_of};
 
 use napi::{Error, Result};
 
@@ -48,6 +49,7 @@ use crate::cache_limit::{CacheLimitGuard, coordinator};
 use crate::models::moe_common::{Weight, inv_freqs};
 use crate::moe_stream::io::ShardSet;
 use crate::nn::Embedding;
+use crate::utils::gguf::GgufTensorType;
 
 /// The K/V buffer's rows are a multiple of this.
 const BLOCK_ROWS: usize = 32;
@@ -109,6 +111,196 @@ pub(crate) fn with_mtp_head<T>(mode: MtpHeadMode, f: impl FnOnce() -> T) -> T {
     f()
 }
 
+#[inline]
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    if (bits & 0x7F80_0000) == 0x7F80_0000 {
+        let top = (bits >> 16) as u16;
+        return if (bits & 0x007F_FFFF) != 0 {
+            top | 0x0040
+        } else {
+            top
+        };
+    }
+    let round_bias = 0x0000_7FFF + ((bits >> 16) & 1);
+    ((bits.wrapping_add(round_bias)) >> 16) as u16
+}
+
+fn affine4_quantize_f32_range(
+    src: &[f32],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+    b_out: &mut [MaybeUninit<u16>],
+) {
+    for (((vals, w_grp), s_dst), b_dst) in src
+        .as_chunks::<64>()
+        .0
+        .iter()
+        .zip(w_out.as_chunks_mut::<8>().0)
+        .zip(s_out.iter_mut())
+        .zip(b_out.iter_mut())
+    {
+        let mut min_v = vals[0];
+        let mut max_v = vals[0];
+        for &v in &vals[1..] {
+            if v < min_v {
+                min_v = v;
+            }
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        let bias_bits = f32_to_bf16_bits(min_v);
+        let bias = f32::from_bits(u32::from(bias_bits) << 16);
+        let scale_bits = f32_to_bf16_bits((max_v - bias) / 15.0);
+        let scale = f32::from_bits(u32::from(scale_bits) << 16);
+        s_dst.write(scale_bits);
+        b_dst.write(bias_bits);
+        if scale == 0.0 || !scale.is_finite() {
+            w_grp.fill(MaybeUninit::new(0));
+            continue;
+        }
+        let inv = 1.0 / scale;
+        for (j, dst) in w_grp.iter_mut().enumerate() {
+            let base = j * 8;
+            let mut word = 0u32;
+            for lane in 0..8 {
+                let q = ((vals[base + lane] - bias) * inv).round().clamp(0.0, 15.0) as u32;
+                word |= q << (lane * 4);
+            }
+            dst.write(word);
+        }
+    }
+}
+
+fn affine4_quantize_f32_chunk(
+    src: &[f32],
+    w_out: &mut [MaybeUninit<u32>],
+    s_out: &mut [MaybeUninit<u16>],
+    b_out: &mut [MaybeUninit<u16>],
+) {
+    let groups = s_out.len();
+    debug_assert_eq!(src.len(), groups * 64);
+    debug_assert_eq!(w_out.len(), groups * 8);
+    debug_assert_eq!(b_out.len(), groups);
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(16);
+    if threads <= 1 || groups < 2048 {
+        affine4_quantize_f32_range(src, w_out, s_out, b_out);
+        return;
+    }
+    let chunk_g = groups.div_ceil(threads);
+    std::thread::scope(|scope| {
+        let mut s_rem = s_out;
+        let mut b_rem = b_out;
+        let mut w_rem = w_out;
+        let mut x_rem = src;
+        while !s_rem.is_empty() {
+            let take = chunk_g.min(s_rem.len());
+            let (sc, sr) = s_rem.split_at_mut(take);
+            let (bc, br) = b_rem.split_at_mut(take);
+            let (wc, wr) = w_rem.split_at_mut(take * 8);
+            let (xc, xr) = x_rem.split_at(take * 64);
+            s_rem = sr;
+            b_rem = br;
+            w_rem = wr;
+            x_rem = xr;
+            scope.spawn(move || affine4_quantize_f32_range(xc, wc, sc, bc));
+        }
+    });
+}
+
+/// Quantizes a 2-D `Dense::SymQ8` / `Dense::Q8` LM head `[rows, k]` (`k % 64 == 0`)
+/// into `Dense::Qmm4` (affine-4 g64, bf16 scales & biases) in 4096-row chunks to
+/// keep transient peak memory ~50 MiB instead of materializing the full F32 matrix.
+fn quantize_affine4_from_dense_chunked(output: &Dense, rows: usize, k: usize) -> Result<Dense> {
+    if rows == 0 || k == 0 || !k.is_multiple_of(64) {
+        return Err(bad(format!(
+            "Affine4 draft head shape [{rows}, {k}] requires k > 0 divisible by 64"
+        )));
+    }
+    let n = rows
+        .checked_mul(k)
+        .ok_or_else(|| bad("Affine4 draft head size overflows"))?;
+    let groups = n / 64;
+    let groups_per_row = k / 64;
+    let (ri, ki) = (
+        i64::try_from(rows).map_err(|_| bad("row count exceeds i64"))?,
+        i64::try_from(k).map_err(|_| bad("col count exceeds i64"))?,
+    );
+    let (w_arr, w_ptr, w_bytes) = MxArray::alloc_uninit(&[ri, ki / 8], DType::Uint32)?;
+    let (s_arr, s_ptr, s_bytes) = MxArray::alloc_uninit(&[ri, ki / 64], DType::BFloat16)?;
+    let (b_arr, b_ptr, b_bytes) = MxArray::alloc_uninit(&[ri, ki / 64], DType::BFloat16)?;
+    let w_len = groups * 8;
+    if w_len.checked_mul(size_of::<u32>()) != Some(w_bytes)
+        || w_ptr.0.align_offset(align_of::<u32>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(s_bytes)
+        || s_ptr.0.align_offset(align_of::<u16>()) != 0
+        || groups.checked_mul(size_of::<u16>()) != Some(b_bytes)
+        || b_ptr.0.align_offset(align_of::<u16>()) != 0
+    {
+        return Err(bad(
+            "Affine4 draft head alloc_uninit size or alignment mismatch",
+        ));
+    }
+    // SAFETY: `alloc_uninit` returned freshly allocated writable buffers alive
+    // for the lifetime of `w_arr`/`s_arr`/`b_arr` with verified size/alignment;
+    // `MaybeUninit<T>` has no initialization invariant.
+    let w_slice =
+        unsafe { std::slice::from_raw_parts_mut(w_ptr.0.cast::<MaybeUninit<u32>>(), w_len) };
+    let s_slice =
+        unsafe { std::slice::from_raw_parts_mut(s_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
+    let b_slice =
+        unsafe { std::slice::from_raw_parts_mut(b_ptr.0.cast::<MaybeUninit<u16>>(), groups) };
+    const CHUNK_ROWS: usize = 4096;
+    let mut row = 0usize;
+    while row < rows {
+        let hi = (row + CHUNK_ROWS).min(rows);
+        let chunk_f32 = output
+            .row_range(row as i64, hi as i64)?
+            .f32()?
+            .to_float32()?;
+        let g_lo = row * groups_per_row;
+        let g_hi = hi * groups_per_row;
+        affine4_quantize_f32_chunk(
+            chunk_f32.as_ref(),
+            &mut w_slice[g_lo * 8..g_hi * 8],
+            &mut s_slice[g_lo..g_hi],
+            &mut b_slice[g_lo..g_hi],
+        );
+        row = hi;
+    }
+    if rows > CHUNK_ROWS {
+        crate::array::clear_cache();
+    }
+    Ok(Dense::Qmm4 {
+        w: w_arr,
+        scales: s_arr,
+        biases: b_arr,
+    })
+}
+
+fn promote_dense_cuda(d: &mut Dense) -> Result<()> {
+    match d {
+        Dense::Qmm4 { w, scales, biases } | Dense::Qmm { w, scales, biases } => {
+            w.promote_cuda_device()?;
+            scales.promote_cuda_device()?;
+            biases.promote_cuda_device()?;
+        }
+        Dense::SymQ8 { w, scales } | Dense::Q8 { w, scales } | Dense::Nvfp4 { w, scales } => {
+            w.promote_cuda_device()?;
+            scales.promote_cuda_device()?;
+        }
+        Dense::Array(a) => {
+            a.promote_cuda_device()?;
+        }
+        Dense::MmapBf16 { .. } | Dense::MmapQ8_0 { .. } => {}
+    }
+    Ok(())
+}
+
 /// Extra resident bytes of the draft-only quantized LM head (`output.weight`)
 /// when enabled via `MLX_HY4_MTP_HEAD`, or 0 when `bf16` or not applicable.
 pub fn draft_head_bytes(scan: &Scan) -> Result<u64> {
@@ -119,6 +311,15 @@ pub fn draft_head_bytes(scan: &Scan) -> Result<u64> {
     let Some(entry) = scan.tensors.get(OUTPUT) else {
         return Ok(0);
     };
+    let tt = entry.loc.info.tensor_type;
+    // NVFP4 output heads are already 4-bit (~209 MiB) and kept untouched.
+    if tt == GgufTensorType::NVFP4 {
+        return Ok(0);
+    }
+    // SymQ8 mode is a no-op when `output.weight` is already Q8_0 (`Dense::SymQ8`).
+    if mode == MtpHeadMode::SymQ8 && tt == GgufTensorType::Q8_0 {
+        return Ok(0);
+    }
     let shape = super::weights::held_shape(&entry.loc.info)?;
     let &[_, k] = shape.as_slice() else {
         return Ok(0);
@@ -150,7 +351,7 @@ fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
         return Ok(None);
     }
     let t0 = std::time::Instant::now();
-    let (label, q) = match mode {
+    let (label, mut q) = match mode {
         MtpHeadMode::Q4 => {
             let q = match output {
                 Dense::Array(a) => {
@@ -168,6 +369,18 @@ fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
                     };
                     quantize_affine4_from_bf16_raw(raw, rows, k)?
                 }
+                Dense::SymQ8 { w, scales } | Dense::Q8 { w, scales } => {
+                    if w.ndim()? != 2 || scales.ndim()? != 2 {
+                        return Ok(None);
+                    }
+                    let rows = w.shape_at(0)? as usize;
+                    let k = scales.shape_at(1)? as usize * 32;
+                    if rows == 0 || k == 0 || !k.is_multiple_of(64) {
+                        return Ok(None);
+                    }
+                    quantize_affine4_from_dense_chunked(output, rows, k)?
+                }
+                // `Dense::Nvfp4` is already 4-bit (~209 MiB) — leave untouched.
                 _ => return Ok(None),
             };
             ("Q4 g64", q)
@@ -195,6 +408,9 @@ fn build_draft_head(output: &Dense) -> Result<Option<Dense>> {
         }
         MtpHeadMode::Bf16 => return Ok(None),
     };
+    if crate::accelerator::cuda_ops_available() {
+        promote_dense_cuda(&mut q)?;
+    }
     tracing::info!(
         "hy_v4_flash MTP draft head: {label} {} bytes ({:.0} ms)",
         q.nbytes(),
@@ -255,6 +471,9 @@ pub struct KvRows {
     buf: Option<MxArray>,
     held: usize,
     len: usize,
+    /// Set when allocated via `cuda_ensure_buf`; keeps GPU buffer pointer fixed
+    /// across speculative rollbacks for CUDA Graphs.
+    cuda_pinned: bool,
 }
 
 impl KvRows {
@@ -265,6 +484,7 @@ impl KvRows {
             buf: None,
             held: 0,
             len: 0,
+            cuda_pinned: false,
         }
     }
 
@@ -346,17 +566,108 @@ impl KvRows {
         if len == 0 {
             self.buf = None;
             self.held = 0;
+            self.cuda_pinned = false;
             return Ok(());
         }
-        let keep = round_up(len);
-        if 4 * keep <= self.held {
-            self.resize((2 * keep).min(self.cap))?;
+        if !self.cuda_pinned {
+            let keep = round_up(len);
+            if 4 * keep <= self.held {
+                self.resize((2 * keep).min(self.cap))?;
+            }
         }
         Ok(())
     }
 
     pub fn nbytes(&self) -> usize {
         self.buf.as_ref().map_or(0, MxArray::nbytes)
+    }
+
+    /// Ensures a growable GPU-resident `device == 0` f16 slab holding at least
+    /// `need_len` rows (`initial = min(cap, max(4096, round_up(need)))`, doubling
+    /// up to `cap`), keeping the buffer pointer stable across speculative rollbacks
+    /// for CUDA Graph capture.
+    pub(crate) fn cuda_ensure_buf(&mut self, need_len: usize) -> Result<&MxArray> {
+        if need_len > self.cap {
+            return Err(bad(format!(
+                "K/V write to {need_len} past the {} rows a draft holds",
+                self.cap
+            )));
+        }
+        if self.cap == 0 {
+            return Err(bad("K/V buffer capacity is 0"));
+        }
+        let want_rows = need_len.max(1);
+        if self.buf.is_none() || want_rows > self.held {
+            let new_rows = if self.held == 0 {
+                round_up(want_rows)
+                    .checked_next_power_of_two()
+                    .unwrap_or(self.cap)
+                    .max(4096)
+                    .min(self.cap)
+            } else {
+                round_up(want_rows)
+                    .max(self.held.saturating_mul(2))
+                    .max(4096)
+                    .min(self.cap)
+            };
+            let r = i64::try_from(new_rows).map_err(|_| bad("K/V rows exceed i64"))?;
+            let mut new_buf = match MxArray::alloc_gpu_uninit(&[r, self.width], ROW_DTYPE)? {
+                Some(b) => b,
+                None => {
+                    let b = MxArray::zeros(&[r, self.width], Some(ROW_DTYPE))?;
+                    MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash MTP K/V cuda alloc")?;
+                    b
+                }
+            };
+            if self.len > 0
+                && let Some(old) = &self.buf
+            {
+                let live = old.slice(&[0, 0], &[self.len as i64, self.width])?;
+                new_buf = match crate::kernels::hy4::ring_write_in_place(&new_buf, &live, 0, 0)? {
+                    Some(updated) => updated,
+                    None => {
+                        new_buf.slice_assign_axis_inplace(0, 0, self.len as i64, &live)?;
+                        new_buf
+                    }
+                };
+                MxArray::eval_arrays_with_context(&[&new_buf], "hy_v4_flash MTP K/V cuda grow")?;
+            }
+            self.buf = Some(new_buf);
+            self.held = new_rows;
+        } else if let Some(b) = self.buf.as_mut()
+            && b.is_available()
+        {
+            b.promote_cuda_device()?;
+        }
+        self.cuda_pinned = true;
+        self.buf.as_ref().ok_or_else(|| bad("K/V buffer missing"))
+    }
+
+    /// Clones the current K/V slab handle (if allocated) for transactional
+    /// rollback across deferred CUDA writes.
+    pub(crate) fn cuda_buf_clone(&self) -> Option<MxArray> {
+        self.buf.clone()
+    }
+
+    /// Restores the saved optional K/V slab handle on step rollback.
+    pub(crate) fn cuda_restore_buf_opt(&mut self, buf: Option<MxArray>) {
+        self.held = buf
+            .as_ref()
+            .and_then(|b| b.shape_at(0).ok())
+            .map_or(0, |r| r.max(0) as usize);
+        self.buf = buf;
+    }
+
+    pub(crate) fn is_buf_available(&self) -> bool {
+        self.buf.as_ref().is_none_or(MxArray::is_available)
+    }
+
+    /// Commits `buf` after an in-place CUDA write up to `new_len` rows.
+    pub(crate) fn cuda_commit(&mut self, buf: MxArray, new_len: usize) -> Result<()> {
+        super::stats::defer(&buf, "hy_v4_flash MTP K/V write")?;
+        self.buf = Some(buf);
+        self.len = new_len;
+        Ok(())
     }
 }
 
@@ -370,6 +681,12 @@ impl Seeds {
     /// Copies of the last rows of `h [n, d]` (positions `start..start + n`).
     pub fn copies(h: &MxArray, start: usize) -> Result<Vec<(usize, MxArray)>> {
         let (n, d) = (h.shape_at(0)? as usize, h.shape_at(1)?);
+        if n == 1 && h.dtype()? == DType::Float32 {
+            // Single-row f32 hidden is already a standalone immutable `[1, d]`
+            // buffer — cloning avoids a redundant `slice + deep_copy + eval`
+            // sync on every AR decode / Step A forward.
+            return Ok(vec![(start, h.clone())]);
+        }
         let k = n.min(SEEDS);
         let mut out = Vec::with_capacity(k);
         for r in n - k..n {
@@ -518,6 +835,10 @@ impl Draft {
         &self.kv
     }
 
+    pub(crate) fn kv_and_index_mut(&mut self) -> (&mut KvRows, &mut IndexerState) {
+        (&mut self.kv, &mut self.index)
+    }
+
     pub fn seed(&self, pos: usize) -> Option<&MxArray> {
         self.seeds.get(pos)
     }
@@ -537,7 +858,22 @@ impl Draft {
             return Err(bad(format!("cut to {len}, {} rows held", self.len())));
         }
         self.index.truncate(len)?;
-        self.kv.truncate(len)
+        self.kv.truncate(len)?;
+        // Defense-in-depth on full reset: if an earlier deferred GPU write failed
+        // or was abandoned before materializing, drop any unevaluated buffer
+        // handles so a later turn cannot re-enter the failed lazy graph.
+        if len == 0 {
+            if !self.kv.is_buf_available() {
+                self.kv.cuda_restore_buf_opt(None);
+            }
+            if !self.index.is_pooled_buf_available() {
+                self.index.cuda_restore_pooled_buf(None);
+            }
+            if !self.index.is_tail_buf_available() {
+                self.index.reset_empty()?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn mark(&self, trunk: usize) -> Option<DraftMark> {
@@ -546,9 +882,21 @@ impl Draft {
             Some(at) => Some((at, self.seeds.get(at)?.clone())),
             None => None,
         };
-        (self.len() == len.unwrap_or(0)).then(|| DraftMark {
+        if self.len() != len.unwrap_or(0) {
+            return None;
+        }
+        let index = self.index.mark();
+        // Detach and materialize the draft indexer tail snapshot immediately
+        // (matching `Session::mark`) so subsequent in-place CUDA ring writes
+        // cannot overwrite slots referenced by a retained `DraftMark`.
+        if let Some(rows) = index.tail().rows()
+            && MxArray::eval_arrays_with_context(&[rows], "hy_v4_flash draft mark").is_err()
+        {
+            return None;
+        }
+        Some(DraftMark {
             len: self.len(),
-            index: self.index.mark(),
+            index,
             seed,
         })
     }
@@ -574,6 +922,77 @@ impl Draft {
     }
 }
 
+/// Pre-mutation GPU handles and indexer metadata held across deferred CUDA
+/// MTP commit / draft writes so a failing flush, decode, or verify step
+/// restores materialized buffers and tail layout (`ring_cap`, `held`, `len`)
+/// cleanly instead of leaving poisoned lazy handles or mismatched ring metadata.
+pub(crate) struct DraftRollback {
+    keep: usize,
+    is_commit: bool,
+    prev_kv: Option<MxArray>,
+    prev_pooled: Option<MxArray>,
+    prev_tail: Option<MxArray>,
+    prev_held: usize,
+    had_tail_buf: bool,
+    mark: Option<IndexerMark>,
+}
+
+impl DraftRollback {
+    pub(crate) fn capture(d: &Draft, rows: usize, is_commit: bool) -> Result<Self> {
+        let keep = d.len();
+        let index = d.index();
+        let prev_kv = d.kv().cuda_buf_clone();
+        let prev_pooled = index.cuda_pooled_buf_clone();
+        let prev_tail = index.cuda_tail_rows_clone();
+        let prev_held = index.held();
+        let had_tail_buf = index.tail().rows().is_some();
+        let fast_rb = (index.is_empty() && rows <= index.tail().target_ring_cap())
+            || (index.tail().ring_cap() > 0 && rows <= index.tail().rollback_slack());
+        let mark = if fast_rb {
+            None
+        } else {
+            let m_snap = index.mark();
+            if let Some(tail_rows) = m_snap.tail().rows() {
+                MxArray::eval_arrays_with_context(&[tail_rows], "hy_v4_flash MTP rollback mark")?;
+            }
+            Some(m_snap)
+        };
+        Ok(Self {
+            keep,
+            is_commit,
+            prev_kv,
+            prev_pooled,
+            prev_tail,
+            prev_held,
+            had_tail_buf,
+            mark,
+        })
+    }
+
+    pub(crate) fn keep(&self) -> usize {
+        self.keep
+    }
+
+    pub(crate) fn is_commit(&self) -> bool {
+        self.is_commit
+    }
+
+    pub(crate) fn restore(self, d: &mut Draft) {
+        let (kv, index) = d.kv_and_index_mut();
+        kv.cuda_restore_buf_opt(self.prev_kv);
+        let _ = kv.truncate(self.keep);
+        index.cuda_restore_pooled_buf(self.prev_pooled);
+        index.cuda_restore_tail_rows(self.prev_tail);
+        if let Some(m_snap) = self.mark {
+            let _ = index.restore(m_snap);
+        } else if !self.had_tail_buf {
+            let _ = index.reset_empty();
+        } else {
+            let _ = index.rollback_push(self.keep, self.prev_held);
+        }
+    }
+}
+
 /// The MTP layer; built once at load.
 pub struct MtpLayer {
     layer: usize,
@@ -590,6 +1009,7 @@ pub struct MtpLayer {
     /// Optional draft-only SymQ8 copy of `output.weight`; trunk verification
     /// always uses the lossless BF16 trunk head.
     draft_head: Option<Dense>,
+    cuda_cache: Option<super::cuda_forward::MtpCudaCache>,
     bytes: u64,
     _guard: CacheLimitGuard,
     _draft_head_guard: Option<CacheLimitGuard>,
@@ -631,7 +1051,7 @@ fn draft_embedding(token_embd: &Dense, vocab: usize, dim: usize) -> Result<Embed
             e.load_gguf_q8_0_mmap(buf, *byte_offset)?;
             Ok(e)
         }
-        Dense::MmapBf16 { .. } => Embedding::from_weight(&token_embd.f32()?),
+        Dense::MmapBf16 { .. } | Dense::Nvfp4 { .. } => Embedding::from_weight(&token_embd.f32()?),
     }
 }
 
@@ -685,6 +1105,7 @@ impl MtpLayer {
         let inv_freqs = rope_inv_freqs(&inv_freqs(g.rope_dim, g.rope_theta, None))?;
         let indexer = Indexer::new(IndexerGeometry::of(cfg, layer)?, iw)?;
         let mla = Mla::new(g, &w.attn)?;
+        let cuda_cache = super::cuda_forward::MtpCudaCache::build(cfg, layer, &w, &experts)?;
         let ffn = LayerFfn::new(
             &FfnConfig::of(cfg, layer)?,
             layer,
@@ -713,6 +1134,7 @@ impl MtpLayer {
             inv_freqs,
             embedding,
             draft_head,
+            cuda_cache,
             bytes: total_bytes,
             _guard: guard,
             _draft_head_guard: draft_head_guard,
@@ -721,6 +1143,46 @@ impl MtpLayer {
 
     pub fn draft_head(&self) -> Option<&Dense> {
         self.draft_head.as_ref()
+    }
+
+    pub(crate) fn cuda_cache(&self) -> Option<&super::cuda_forward::MtpCudaCache> {
+        self.cuda_cache.as_ref()
+    }
+
+    pub(crate) fn cuda_fast_active(&self) -> bool {
+        self.cuda_cache.is_some() && super::cuda_forward::cuda_fast_enabled()
+    }
+
+    pub(crate) fn weights(&self) -> &LayerWeights {
+        &self.w
+    }
+
+    pub(crate) fn nextn_weights(&self) -> Result<&NextnWeights> {
+        self.nextn()
+    }
+
+    pub(crate) fn indexer_weights_ref(&self) -> Result<&super::weights::IndexerWeights> {
+        self.indexer_weights()
+    }
+
+    pub(crate) fn eps(&self) -> f32 {
+        self.eps
+    }
+
+    pub(crate) fn dim(&self) -> i64 {
+        self.dim
+    }
+
+    pub(crate) fn mla(&self) -> &Mla {
+        &self.mla
+    }
+
+    pub(crate) fn indexer(&self) -> &Indexer {
+        &self.indexer
+    }
+
+    pub(crate) fn ffn(&self) -> &LayerFfn {
+        &self.ffn
     }
 
     pub fn layer(&self) -> usize {
@@ -793,6 +1255,29 @@ impl MtpLayer {
     /// next tokens `ids` (m) at the end of `d`; their K/V and indexer keys
     /// only. On error `d` is as it was.
     pub fn commit(&self, model: &Model, d: &mut Draft, h: &MxArray, ids: &[u32]) -> Result<()> {
+        if self.cuda_fast_active() {
+            return super::cuda_forward::mtp_commit_cuda(self, model, d, h, ids);
+        }
+        self.commit_eager(model, d, h, ids)
+    }
+
+    /// Like [`Self::commit`], leaving CUDA deferred KV/indexer updates in the
+    /// caller's active `DeferScope` with zero blocking host sync so they fuse
+    /// into the immediately following draft or trunk forward.
+    pub(crate) fn commit_lazy(
+        &self,
+        model: &Model,
+        d: &mut Draft,
+        h: &MxArray,
+        ids: &[u32],
+    ) -> Result<()> {
+        if self.cuda_fast_active() {
+            return super::cuda_forward::mtp_commit_cuda_with_flush(self, model, d, h, ids, false);
+        }
+        self.commit_eager(model, d, h, ids)
+    }
+
+    fn commit_eager(&self, model: &Model, d: &mut Draft, h: &MxArray, ids: &[u32]) -> Result<()> {
         let at = d.len();
         let m = ids.len();
         if m == 0 || h.shape_at(0)? as usize != m {
@@ -869,6 +1354,17 @@ impl MtpLayer {
         flush: bool,
         persist_state: bool,
     ) -> Result<(MxArray, MxArray)> {
+        if self.cuda_cache.is_some() && super::cuda_forward::cuda_fast_enabled() {
+            return super::cuda_forward::mtp_draft_cuda(
+                self,
+                model,
+                d,
+                h,
+                emb,
+                flush,
+                persist_state,
+            );
+        }
         let _scope = flush.then(super::stats::DeferScope::enter);
         let at = d.len();
         if at >= d.cap {
@@ -1385,19 +1881,32 @@ impl Lagged {
         };
         let p = self.trunk.len();
         let at = d.len();
+        let fuse_cuda_commit = m.cuda_fast_active() && !super::stats::profiling();
+        let _fused_scope = fuse_cuda_commit.then(super::stats::DeferScope::enter);
+        let mut fused_rollback = None;
         if at + 1 == p {
             let seed = d
                 .seed(at)
                 .cloned()
                 .ok_or_else(|| bad(format!("no seed for trunk row {at}")))?;
-            let committed = {
-                let _scope = super::stats::DeferScope::enter();
-                m.commit(model, d, &seed, &[token])
-                    .and_then(|()| super::stats::flush("hy_v4_flash MTP lag"))
-            };
-            if let Err(e) = committed {
-                let _ = d.cut(at);
-                return Err(e);
+            if fuse_cuda_commit {
+                let rb = DraftRollback::capture(d, 1, true)?;
+                if let Err(e) = m.commit_lazy(model, d, &seed, &[token]) {
+                    crate::array::synchronize();
+                    rb.restore(d);
+                    return Err(e);
+                }
+                fused_rollback = Some(rb);
+            } else {
+                let committed = {
+                    let _scope = super::stats::DeferScope::enter();
+                    m.commit(model, d, &seed, &[token])
+                        .and_then(|()| super::stats::flush("hy_v4_flash MTP lag"))
+                };
+                if let Err(e) = committed {
+                    let _ = d.cut(at);
+                    return Err(e);
+                }
             }
         } else if at != p {
             return Err(bad(format!("a decode row at {p} with {at} draft rows")));
@@ -1420,10 +1929,16 @@ impl Lagged {
         let (logits, h) = match out {
             Ok(v) => v,
             Err(e) => {
-                d.cut(at)?;
+                if let Some(rb) = fused_rollback {
+                    crate::array::synchronize();
+                    rb.restore(d);
+                } else {
+                    d.cut(at)?;
+                }
                 return Err(e);
             }
         };
+        drop(_fused_scope);
         match Seeds::copies(&h, p) {
             Ok(rows) => d.seeds.extend(rows),
             Err(e) => {

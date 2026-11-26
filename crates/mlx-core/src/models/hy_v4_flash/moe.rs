@@ -970,7 +970,7 @@ impl Moe {
 
         if use_gpu_route {
             match &self.experts {
-                ExpertSource::Bank(bank) if bank.is_direct() => {
+                ExpertSource::Bank(bank) if bank.is_direct() && !bank.is_cuda_direct() => {
                     let tp = prof_start();
                     let r_logits = Self::router_logits_for(x, &w.router, kind)?;
                     if let Some((gpu_ids, gpu_weights)) =
@@ -1142,6 +1142,7 @@ impl Moe {
             && (rows >= 2 || split_m1_enabled())
             && let ExpertSource::Bank(bank) = &self.experts
             && !bank.is_mmap()
+            && !bank.is_cuda_direct()
             && bank.split()
         {
             let f = self.forward_split(
@@ -1388,6 +1389,15 @@ impl Moe {
                 } else {
                     self.combine(z, &ids, &w, false, |p, x, i| a.gather(p, x, i))?
                 };
+                prof_end(Phase::Routed, tp, &[&y])?;
+                Ok(y)
+            }
+            ExpertSource::Bank(bank) if bank.is_cuda_direct() => {
+                let tp = prof_start();
+                let ce = bank
+                    .cuda_layer_experts(layer)?
+                    .ok_or_else(|| bad(format!("layer {layer}: CUDA direct bank missing")))?;
+                let y = ce.routed_f32_bounded(z, &ids, &w, self.moe.n_used, self.limit)?;
                 prof_end(Phase::Routed, tp, &[&y])?;
                 Ok(y)
             }

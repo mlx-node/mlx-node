@@ -395,7 +395,7 @@ fn cache_for(class: ExpertClass, n: usize) -> [usize; 2] {
     match class {
         ExpertClass::Q6kDown => [n, 0],
         ExpertClass::Q4kDown => [0, n],
-        ExpertClass::Bf16 => unreachable!(),
+        ExpertClass::Bf16 | ExpertClass::Nvfp4 | ExpertClass::Q8_0 => unreachable!(),
     }
 }
 

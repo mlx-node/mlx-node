@@ -13,6 +13,7 @@ import { join } from 'node:path';
 import {
   type CatalogBuild,
   type CatalogEntry,
+  type CatalogGpuInfo,
   catalogBuildRepo,
   catalogBuildSlug,
   catalogDraftSlug,
@@ -31,10 +32,12 @@ export interface WizardDeps {
   download: (argv: string[]) => Promise<unknown>;
   /** Resolved models dir: the download lands in `<modelsDir>/<build folder>`, the dir `mlx agent` re-scans. */
   modelsDir: string;
-  /** Physical RAM in bytes: the models offered are `visibleCatalog(totalMemBytes, platform)`. */
+  /** Physical RAM in bytes: the models offered are `visibleCatalog(totalMemBytes, platform, gpu)`. */
   totalMemBytes: number;
   /** Target platform override (default `process.platform`). */
   platform?: NodeJS.Platform;
+  /** Detected host GPU capabilities (used to gate CUDA-VRAM-floored builds on non-darwin hosts). */
+  gpu?: CatalogGpuInfo;
 }
 
 /**
@@ -122,7 +125,7 @@ async function chooseBuild(io: WizardIO, entry: CatalogEntry): Promise<CatalogBu
  * build of each model instead — the caller must not touch stdin on that path (the binary's print mode owns it).
  */
 export async function runFirstRunWizard(deps: WizardDeps): Promise<string> {
-  const catalog = visibleCatalog(deps.totalMemBytes, deps.platform);
+  const catalog = visibleCatalog(deps.totalMemBytes, deps.platform, deps.gpu);
 
   if (!deps.io.isTTY) {
     const commands = catalog

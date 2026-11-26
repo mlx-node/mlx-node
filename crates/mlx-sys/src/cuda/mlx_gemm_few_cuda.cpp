@@ -40,6 +40,8 @@ int sidecar_dtype_code(Dtype dt) noexcept {
   return -1;
 }
 
+void bf16_ensure_carveout(CUfunction fn, int carveout_pct);
+
 class AffineQ8Few : public UnaryPrimitive {
 public:
   AffineQ8Few(Stream stream, bool symmetric)
@@ -112,34 +114,55 @@ public:
     }();
     const bool has_mma = encoder.device().compute_capability_major() >= 8;
 
-    // Dispatch Tensor Core MMA across M in 4..=16 when K >= 256 and N >= 256 (plus
-    // M >= 9 for all N on sm_80+), keeping all verify tree sizes [4, 6, 8, 12, 16]
-    // 0-ULP batch-invariant while restoring u4_1warp/u4_1row for M in 1..=3 decode.
+    // Dispatch Tensor Core MMA (cp.async.cg + group stagger) across M in 3..=16 when
+    // K >= 256 and N >= 256 (plus M >= 9 for all N on sm_80+); M in 1..=2 uses zero-SMEM
+    // 1-warp-per-row streaming uint4 (4 warps/CTA for fine wave scheduling on N=1600..8192).
     const bool use_mma =
-        !exact_m16 && has_mma && ((M >= 4 && K >= 256 && N >= 256) || M >= 9);
+        !exact_m16 && has_mma && ((M >= 3 && K >= 256 && N >= 256) || M >= 9);
 
     if (!use_mma) {
-      // M in 1..=2 at medium N (e.g. LP_K/V [1024, 2304]): 1-warp-per-row streaming
-      // kernel eliminates SMEM/barrier overhead and jumps to ~250 GB/s.
-      if (!exact_m16 && M <= 2 && N > 128 && N <= 1024 && K >= 2048) {
-        static constexpr const char* kU4WarpEntries[2][3][2] = {
+      // M in 1..=2 (and M=3..4 pre-Ampere / narrow-N fallback) at N >= 128, K >= 512:
+      // 4-warp/CTA for M<=2 eliminates wave-tail quantization (e.g. q_kv N=1600 -> 400 CTAs);
+      // 8-warp/CTA kept for M=3..4 fallback.
+      if (!exact_m16 && M <= 4 && N >= 128 && K >= 512) {
+        static constexpr const char* kU4WarpEntries[2][3][4] = {
             {
-                {"mlx_node_affine_q8_u4_1warp<0,1,8,false>", "mlx_node_affine_q8_u4_1warp<0,2,8,false>"},
-                {"mlx_node_affine_q8_u4_1warp<1,1,8,false>", "mlx_node_affine_q8_u4_1warp<1,2,8,false>"},
-                {"mlx_node_affine_q8_u4_1warp<2,1,8,false>", "mlx_node_affine_q8_u4_1warp<2,2,8,false>"},
+                {"mlx_node_affine_q8_u4_1warp<0,1,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<0,2,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<0,3,8,false>",
+                 "mlx_node_affine_q8_u4_1warp<0,4,8,false>"},
+                {"mlx_node_affine_q8_u4_1warp<1,1,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<1,2,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<1,3,8,false>",
+                 "mlx_node_affine_q8_u4_1warp<1,4,8,false>"},
+                {"mlx_node_affine_q8_u4_1warp<2,1,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<2,2,4,false>",
+                 "mlx_node_affine_q8_u4_1warp<2,3,8,false>",
+                 "mlx_node_affine_q8_u4_1warp<2,4,8,false>"},
             },
             {
-                {"mlx_node_affine_q8_u4_1warp<0,1,8,true>", "mlx_node_affine_q8_u4_1warp<0,2,8,true>"},
-                {"mlx_node_affine_q8_u4_1warp<1,1,8,true>", "mlx_node_affine_q8_u4_1warp<1,2,8,true>"},
-                {"mlx_node_affine_q8_u4_1warp<2,1,8,true>", "mlx_node_affine_q8_u4_1warp<2,2,8,true>"},
+                {"mlx_node_affine_q8_u4_1warp<0,1,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<0,2,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<0,3,8,true>",
+                 "mlx_node_affine_q8_u4_1warp<0,4,8,true>"},
+                {"mlx_node_affine_q8_u4_1warp<1,1,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<1,2,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<1,3,8,true>",
+                 "mlx_node_affine_q8_u4_1warp<1,4,8,true>"},
+                {"mlx_node_affine_q8_u4_1warp<2,1,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<2,2,4,true>",
+                 "mlx_node_affine_q8_u4_1warp<2,3,8,true>",
+                 "mlx_node_affine_q8_u4_1warp<2,4,8,true>"},
             },
         };
+        const int num_warps = (M <= 2) ? 4 : 8;
         auto kernel = cu::jit_kernel(
             encoder.device(), affine_q8_few_source,
             kU4WarpEntries[sym_idx][sb_dtype][M - 1]);
+        bf16_ensure_carveout(kernel, 0);
         auto args = bind_and_build_args(out);
         encoder.add_kernel_node_raw(
-            kernel, dim3((N + 7) / 8), dim3(32, 8), {}, 0, args.args());
+            kernel, dim3((N + num_warps - 1) / num_warps), dim3(32, num_warps), {}, 0, args.args());
         return;
       }
 

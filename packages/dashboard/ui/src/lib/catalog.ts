@@ -5,11 +5,36 @@ import type { CatalogBuildItem, CatalogItem, HostResponse } from './types';
 const GIB = 2 ** 30;
 
 /**
- * Whether the page offers `item` on this machine: not hidden, platform supported, and memory floor met. An entry
- * with a platform restriction or memory floor waits for the host reading.
+ * Whether `build` is eligible on this machine: its platform list matches `host.platform` (when set), and any
+ * non-darwin `minGpuMemoryGb` requirement is met by a detected CUDA device (`host.gpu`). Fails closed when host or
+ * GPU capability info is absent for a gated build.
+ */
+export function buildOfferedOnHost(
+  build: Pick<CatalogBuildItem, 'minGpuMemoryGb'> & { platforms?: readonly string[] },
+  host: HostResponse | undefined,
+): boolean {
+  if (build.platforms !== undefined) {
+    if (host === undefined) return false;
+    if (host.platform !== undefined && !build.platforms.includes(host.platform)) return false;
+  }
+  if (build.minGpuMemoryGb !== undefined) {
+    if (host === undefined) return false;
+    if (host.platform !== 'darwin') {
+      return host.gpu?.backend === 'cuda' && host.gpu.totalMemoryBytes >= build.minGpuMemoryGb * GIB;
+    }
+  }
+  return true;
+}
+
+/**
+ * Whether the page offers `item` on this machine: not hidden, platform supported, memory floor met, and (when builds
+ * are present) at least one build satisfies {@link buildOfferedOnHost}. An entry with a platform, memory, or GPU
+ * requirement waits for the host reading.
  */
 export function offeredOnHost(
-  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb' | 'platforms'>,
+  item: Pick<CatalogItem, 'hidden' | 'minMemoryGb' | 'platforms'> & {
+    builds?: readonly (Pick<CatalogBuildItem, 'minGpuMemoryGb'> & { platforms?: readonly string[] })[];
+  },
   host: HostResponse | undefined,
 ): boolean {
   if (item.hidden === true) return false;
@@ -17,8 +42,24 @@ export function offeredOnHost(
     if (host === undefined) return false;
     if (host.platform !== undefined && !item.platforms.includes(host.platform)) return false;
   }
-  if (item.minMemoryGb === undefined) return true;
-  return host !== undefined && host.totalMemBytes >= item.minMemoryGb * GIB;
+  if (item.minMemoryGb !== undefined) {
+    if (host === undefined || host.totalMemBytes < item.minMemoryGb * GIB) return false;
+  }
+  if (item.builds !== undefined) {
+    return item.builds.some((build) => buildOfferedOnHost(build, host));
+  }
+  return true;
+}
+
+/**
+ * `item` restricted to builds eligible on `host`, or `undefined` when the entry is not offered on `host`.
+ * Preserves object identity when every build qualifies.
+ */
+export function catalogItemForHost(item: CatalogItem, host: HostResponse | undefined): CatalogItem | undefined {
+  if (!offeredOnHost(item, host)) return undefined;
+  const builds = item.builds.filter((build) => buildOfferedOnHost(build, host));
+  if (builds.length === 0) return undefined;
+  return builds.length === item.builds.length ? item : { ...item, builds };
 }
 
 /** The build that installs to the folder `slug`, from any entry. */

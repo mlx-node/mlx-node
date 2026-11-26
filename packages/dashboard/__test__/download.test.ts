@@ -483,8 +483,8 @@ function finalDir(): string {
   return join(modelsDir, SLUG);
 }
 /** The catalog state of the build that installs to `slug`, from a fresh scan. */
-function buildState(slug: string): CatalogBuildItem | undefined {
-  return catalogWithState(modelsDir)
+function buildState(slug: string, platform: NodeJS.Platform = process.platform): CatalogBuildItem | undefined {
+  return catalogWithState(modelsDir, platform)
     .flatMap((item) => item.builds)
     .find((build) => build.slug === slug);
 }
@@ -6943,25 +6943,34 @@ describe('a full record with no config.json of a build that needs one, as before
     return dir;
   }
 
-  it.each<[string, CatalogBuild, string[], string]>([
+  it.each<[string, CatalogBuild, string[], string, NodeJS.Platform]>([
     [
       'the Qwen3.8-27B XL folder with two quants',
       BUILD,
       ['Qwen3.8-27B-UD-Q4_K_XL.gguf', 'Qwen3.8-27B-UD-Q6_K_XL.gguf'],
       'qwen35',
+      process.platform,
     ],
     [
       'the Hy4-flash folder with its split set',
       catalogBuild('Hy4-flash', 'Q4_K_M'),
       ['Hy4-flash-Q4_K_M-00001-of-00002.gguf', 'Hy4-flash-Q4_K_M-00002-of-00002.gguf'],
       'hy_v4_flash',
+      'darwin',
     ],
-  ])('%s: present, not installed, no Update', (_name, build, files, architecture) => {
+    [
+      'the Hy4-flash SPARK-4Bit folder',
+      catalogBuild('Hy4-flash', 'SPARK-4Bit'),
+      ['Hy4-flash-SPARK-4Bit.gguf'],
+      'hy_v4_flash',
+      'win32',
+    ],
+  ])('%s: present, not installed, no Update', (_name, build, files, architecture, platform) => {
     const dir = plantCliFolder(build, files, architecture);
     expect(isModelInstalled(dir)).toBe(false);
-    const item = buildState(catalogBuildSlug(build))!;
+    const item = buildState(catalogBuildSlug(build, platform), platform)!;
     expect(item).toMatchObject({ present: true, installed: false, localRevision: null });
-    const updates = new Map<string, string | null>([[catalogBuildRepo(build), SHA_NEW]]);
+    const updates = new Map<string, string | null>([[catalogBuildRepo(build, platform), SHA_NEW]]);
     expect(hasUpdate(item, updates)).toBe(false);
     expect(catalogActionState(item, { job: undefined, updateAvailable: hasUpdate(item, updates) })).toBe('installed');
   });
@@ -6970,7 +6979,7 @@ describe('a full record with no config.json of a build that needs one, as before
     const items = catalogWithState(modelsDir);
     const hy4 = items.find((entry) => entry.label === 'Hy4-flash');
     const qwen = items.find((entry) => entry.label === 'Qwen3.8-27B');
-    expect(hy4?.platforms).toEqual(['darwin']);
+    expect(hy4?.platforms).toEqual(['darwin', 'win32', 'linux']);
     expect(qwen?.platforms).toBeUndefined();
   });
 });

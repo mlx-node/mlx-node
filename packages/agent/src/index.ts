@@ -3,9 +3,11 @@ export type { DiscoveredModelLike } from './types.js';
 export {
   type CatalogBuild,
   type CatalogEntry,
+  type CatalogGpuInfo,
   type CatalogTarget,
   catalogBuildRepo,
   catalogBuildSlug,
+  catalogBuildSupportedOnHost,
   catalogDraftSlug,
   catalogSharesRepo,
   catalogSupportedOnPlatform,

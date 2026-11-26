@@ -42,7 +42,13 @@ const FLOAT_TAGS: ReadonlyMap<string, string> = new Map([
   ['NVFP4', 'NVFP4'],
   ['SYM8', 'SYM8'],
   ['MXFP4_MOE', 'MXFP4_MOE'],
+  ['SPARK-4BIT', 'SPARK-4Bit'],
+  ['SPARK-4BIT-FAST', 'SPARK-4Bit-Fast'],
 ]);
+const COMPOUND_TAGS: ReadonlyArray<readonly [readonly string[], string]> = [
+  [['SPARK', '4BIT', 'FAST'], 'SPARK-4Bit-Fast'],
+  [['SPARK', '4BIT'], 'SPARK-4Bit'],
+];
 const DTYPE_TAGS: ReadonlySet<string> = new Set(['BF16', 'F16', 'F32']);
 const TAG_FAMILIES: ReadonlyArray<readonly [string, readonly string[]]> = [
   ['Q', ['', '_0', '_1', '_K', '_K_S', '_K_M', '_K_L', '_K_XL', 'K']],
@@ -72,6 +78,17 @@ export function quantTag(token: string): string | undefined {
   return undefined;
 }
 
+function matchCompoundTag(tokens: readonly string[]): { count: number; tag: string } | undefined {
+  for (const [parts, normalized] of COMPOUND_TAGS) {
+    if (tokens.length < parts.length) continue;
+    const start = tokens.length - parts.length;
+    if (parts.every((part, i) => tokens[start + i]!.toUpperCase() === part)) {
+      return { count: parts.length, tag: normalized };
+    }
+  }
+  return undefined;
+}
+
 /** Read `name` from the right while its `-` tokens are packaging words. */
 export function splitNameTail(name: string): NameTail {
   const tokens = name.split('-');
@@ -80,6 +97,13 @@ export function splitNameTail(name: string): NameTail {
   let saysGguf = false;
   let lastWasTag = false;
   while (tokens.length > 0) {
+    const compound = tag === undefined ? matchCompoundTag(tokens) : undefined;
+    if (compound !== undefined) {
+      tag = compound.tag;
+      lastWasTag = false;
+      tokens.length -= compound.count;
+      continue;
+    }
     const upper = tokens[tokens.length - 1]!.toUpperCase();
     const found = tag === undefined ? quantTag(upper) : undefined;
     const qualifier = QUALIFIERS.get(upper);

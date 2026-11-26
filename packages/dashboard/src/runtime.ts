@@ -22,6 +22,7 @@ import { dirname, isAbsolute, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { probeAgentInstall } from '@mlx-node/agent/binary';
+import type { CatalogGpuInfo } from '@mlx-node/agent/catalog';
 import { agentConfigDir } from '@mlx-node/agent/paths';
 import { readDesktopEndpoint } from '@mlx-node/server/host/desktop-endpoint';
 
@@ -29,6 +30,7 @@ import type { SessionDetailResponse } from './agent-sessions/types.js';
 import type { IngestSummary, MainApiContext } from './api/context.js';
 import { dispatchMain, isApiPath, routePatternFor, splitSegments } from './api/dispatch.js';
 import { failure, toFailure, type ApiResponse } from './api/errors.js';
+import { probeHostGpu } from './api/handlers/host.js';
 import { launchFromProbe, type HostTimings } from './chat/agent/agent-host.js';
 import type { EndpointReader } from './chat/agent/endpoint.js';
 import { needsLoginPath, resolveLoginPath, withLoginPath } from './chat/agent/login-path.js';
@@ -159,6 +161,8 @@ export interface DashboardRuntimeOptions {
   systemOneHistoryPath?: string;
   /** How a cleanup moves an old entry to the Trash. Default `/usr/bin/trash`; tests and the dev harness pass a fake. */
   moveToTrash?: (path: string) => Promise<void>;
+  /** Host GPU capability probe for `GET /api/host` (tests / dev harness). Default: out-of-process probe on non-darwin hosts. */
+  probeHostGpu?: () => Promise<CatalogGpuInfo | undefined>;
 }
 
 /** One API call, addressed the way `fetch` would address it. */
@@ -418,6 +422,14 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     live,
     historyPath: opts.systemOneHistoryPath ?? systemOneHistoryPath(),
   });
+  const hostGpuAbort = new AbortController();
+  let hostGpuPromise: Promise<CatalogGpuInfo | undefined> | undefined;
+  const hostGpu = (): Promise<CatalogGpuInfo | undefined> => {
+    hostGpuPromise ??= (opts.probeHostGpu ?? (() => probeHostGpu({ signal: hostGpuAbort.signal })))().catch(
+      () => undefined,
+    );
+    return hostGpuPromise;
+  };
   const context: MainApiContext = {
     modelsDir,
     tracesDir,
@@ -430,6 +442,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     chat,
     providers,
     systemone,
+    hostGpu,
   };
 
   // The boot ingest runs inside the worker; only the periodic rescan is driven
@@ -444,6 +457,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const drain = (): Promise<void> => {
     draining ??= (async () => {
       clearInterval(ingestTimer);
+      hostGpuAbort.abort();
       live.close();
       // Abort and drain in-flight downloads BEFORE anything else so a shutdown
       // (SIGINT/SIGTERM → `process.exit`) can't kill the process mid-write and

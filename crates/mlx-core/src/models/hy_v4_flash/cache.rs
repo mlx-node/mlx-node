@@ -18,6 +18,12 @@ use crate::array::{DType, MxArray};
 /// Rows a `WindowRing` keeps past the window, so a speculative append of up
 /// to this many rows can be dropped exactly.
 pub const WINDOW_SLACK: usize = 3;
+/// Live circular-ring slack for flat `Session` sliding layers: one row wider
+/// than [`WINDOW_SLACK`] (`LOOKAHEAD_MAX = 4`) so an `M = 4` MTP-3 verify step
+/// always fits `StepMark::Short` at any context (`>= window`) without copying
+/// all 31 sliding window rings on every verify cycle. Persisted snapshots still
+/// emit at most `window + WINDOW_SLACK` rows.
+pub(crate) const WINDOW_RING_SLACK: usize = WINDOW_SLACK + 1;
 /// Cache dtype of every latent row.
 pub const ROW_DTYPE: DType = DType::Float16;
 
@@ -59,6 +65,16 @@ fn rows_of(x: &MxArray, width: i64, what: &str) -> Result<usize> {
         &[n, w] if w == width && n > 0 => Ok(n as usize),
         s => Err(bad(format!("{what}: rows {s:?}, need [n > 0, {width}]"))),
     }
+}
+
+fn alloc_gpu_f16_buf(rows: usize, width: i64, ctx: &str) -> Result<MxArray> {
+    let rows_i64 = i64::try_from(rows).map_err(|_| bad("buffer rows exceed i64"))?;
+    if let Some(buf) = MxArray::alloc_gpu_uninit(&[rows_i64, width], ROW_DTYPE)? {
+        return Ok(buf);
+    }
+    let buf = MxArray::zeros(&[rows_i64, width], Some(ROW_DTYPE))?;
+    MxArray::eval_arrays_with_context(&[&buf], ctx)?;
+    Ok(buf)
 }
 
 /// Reads `count` logical rows starting at `first_pos` out of a circular
@@ -265,13 +281,14 @@ impl WindowRing {
             .buf
             .as_ref()
             .ok_or_else(|| bad("window buffer missing"))?;
-        let first_pos = self.len - self.held;
-        let rows = linear_range(buf, self.cap, self.width, first_pos, self.held, true)?;
+        let snap_held = self.held.min(self.window + WINDOW_SLACK);
+        let first_pos = self.len - snap_held;
+        let rows = linear_range(buf, self.cap, self.width, first_pos, snap_held, true)?;
         Ok(WindowRingSnapshot {
             window: self.window,
             width: self.width,
             rows: Some(rows),
-            held: self.held,
+            held: snap_held,
             len: self.len,
         })
     }
@@ -450,6 +467,88 @@ impl WindowRing {
     pub fn nbytes(&self) -> usize {
         self.buf.as_ref().map_or(0, MxArray::nbytes)
     }
+
+    /// Ensures the `[cap, width]` f16 circular buffer exists on CUDA GPU `device == 0`.
+    #[allow(dead_code)]
+    pub(crate) fn cuda_ensure_buf(&mut self) -> Result<&MxArray> {
+        if self.cap == 0 {
+            return Err(bad("window ring capacity must be > 0"));
+        }
+        if self.buf.is_none() {
+            self.buf = Some(alloc_gpu_f16_buf(
+                self.cap,
+                self.width,
+                "hy_v4_flash window cuda alloc",
+            )?);
+        } else if let Some(b) = self.buf.as_mut()
+            && b.is_available()
+        {
+            b.promote_cuda_device()?;
+        }
+        self.buf
+            .as_ref()
+            .ok_or_else(|| bad("window buffer missing"))
+    }
+
+    /// Takes the GPU-resident `[cap, width]` f16 ring buffer (keeping refcount 1 for
+    /// in-place donation) or allocates a fresh one on CUDA `device == 0`.
+    pub(crate) fn cuda_take_buf_or_alloc(&mut self) -> Result<MxArray> {
+        if self.cap == 0 {
+            return Err(bad("window ring capacity must be > 0"));
+        }
+        match self.buf.take() {
+            Some(mut b) => {
+                if b.is_available() {
+                    b.promote_cuda_device()?;
+                }
+                Ok(b)
+            }
+            None => alloc_gpu_f16_buf(self.cap, self.width, "hy_v4_flash window cuda alloc"),
+        }
+    }
+
+    /// Clones the current ring buffer handle (if allocated) for transactional
+    /// rollback across deferred CUDA writes.
+    pub(crate) fn cuda_buf_clone(&self) -> Option<MxArray> {
+        self.buf.clone()
+    }
+
+    /// Restores a taken ring buffer handle on kernel error before metadata updates.
+    pub(crate) fn cuda_restore_buf(&mut self, buf: MxArray) {
+        self.buf = Some(buf);
+    }
+
+    /// Restores the saved optional ring buffer handle on step rollback.
+    pub(crate) fn cuda_restore_buf_opt(&mut self, buf: Option<MxArray>) {
+        self.buf = buf;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_buf_available(&self) -> bool {
+        self.buf.as_ref().is_none_or(MxArray::is_available)
+    }
+
+    /// Commits `buf` after an in-place CUDA write of `n` rows at `self.len`.
+    pub(crate) fn cuda_commit(&mut self, buf: MxArray, n: usize) -> Result<()> {
+        super::stats::defer(&buf, "hy_v4_flash window ring")?;
+        self.buf = Some(buf);
+        self.held = (self.held + n).min(self.cap);
+        self.len += n;
+        Ok(())
+    }
+
+    /// Reads `prefix_len` oldest-first rows starting at `first_needed` from the ring.
+    pub(crate) fn cuda_linear_prefix(
+        &self,
+        first_needed: usize,
+        prefix_len: usize,
+    ) -> Result<MxArray> {
+        let buf = self
+            .buf
+            .as_ref()
+            .ok_or_else(|| bad("window buffer missing"))?;
+        linear_range(buf, self.cap, self.width, first_needed, prefix_len, false)
+    }
 }
 
 /// The latent rows of one indexed layer: one f16 `[cap, width]` array made
@@ -518,9 +617,19 @@ impl LatentBuf {
         } else {
             kv.astype(row_dtype())?
         };
-        if self.buf.is_none() {
+        let cur_rows = match &self.buf {
+            Some(b) => b.shape_at(0)? as usize,
+            None => 0,
+        };
+        if self.buf.is_none() || end > cur_rows {
             let cap = i64::try_from(self.cap).map_err(|_| bad("context exceeds i64"))?;
-            let b = MxArray::zeros(&[cap, self.width], Some(row_dtype()))?;
+            let mut b = MxArray::zeros(&[cap, self.width], Some(row_dtype()))?;
+            if self.len > 0
+                && let Some(old) = &self.buf
+            {
+                let live = old.slice(&[0, 0], &[self.len as i64, self.width])?;
+                b.slice_assign_axis_inplace(0, 0, self.len as i64, &live)?;
+            }
             MxArray::eval_arrays_with_context(&[&b], "hy_v4_flash latent alloc")?;
             self.buf = Some(b);
         }
@@ -549,6 +658,92 @@ impl LatentBuf {
     pub fn nbytes(&self) -> usize {
         self.buf.as_ref().map_or(0, MxArray::nbytes)
     }
+
+    /// Ensures a growable GPU-resident `device == 0` f16 slab holding at least
+    /// `need_len` rows (`initial = min(cap, max(4096, need.next_power_of_two()))`,
+    /// doubling up to `cap`), keeping the device pointer fixed across decode steps
+    /// for CUDA Graph capture.
+    pub(crate) fn cuda_ensure_buf(&mut self, need_len: usize) -> Result<&MxArray> {
+        if need_len > self.cap {
+            return Err(bad(format!(
+                "latent write to {need_len} past the context of {}",
+                self.cap
+            )));
+        }
+        if self.cap == 0 {
+            return Err(bad("latent buffer capacity is 0"));
+        }
+        let want_rows = need_len.max(1);
+        let cur_rows = match &self.buf {
+            Some(b) => b.shape_at(0)? as usize,
+            None => 0,
+        };
+        if self.buf.is_none() || cur_rows < want_rows {
+            let new_rows = if cur_rows == 0 {
+                want_rows
+                    .checked_next_power_of_two()
+                    .unwrap_or(self.cap)
+                    .max(4096)
+                    .min(self.cap)
+            } else {
+                let mut r = cur_rows.max(4096);
+                while r < want_rows {
+                    r = r.saturating_mul(2);
+                }
+                r.min(self.cap)
+            };
+            let mut new_buf =
+                alloc_gpu_f16_buf(new_rows, self.width, "hy_v4_flash latent cuda alloc")?;
+            if self.len > 0
+                && let Some(old) = &self.buf
+            {
+                let live = old.slice(&[0, 0], &[self.len as i64, self.width])?;
+                new_buf = match crate::kernels::hy4::ring_write_in_place(&new_buf, &live, 0, 0)? {
+                    Some(updated) => updated,
+                    None => {
+                        new_buf.slice_assign_axis_inplace(0, 0, self.len as i64, &live)?;
+                        new_buf
+                    }
+                };
+                MxArray::eval_arrays_with_context(&[&new_buf], "hy_v4_flash latent cuda grow")?;
+            }
+            self.buf = Some(new_buf);
+        } else if let Some(b) = self.buf.as_mut()
+            && b.is_available()
+        {
+            // Only promote already-materialized buffers (e.g. host-imported
+            // snapshots). Unevaluated buffers are lazy GPU outputs from this
+            // forward (e.g. `kpool_compress` -> `indexer_select`) and must not
+            // force an eager blocking `eval()` mid-forward.
+            b.promote_cuda_device()?;
+        }
+        self.buf
+            .as_ref()
+            .ok_or_else(|| bad("latent buffer missing"))
+    }
+
+    /// Clones the current latent slab handle (if allocated) for transactional
+    /// rollback across deferred CUDA writes.
+    pub(crate) fn cuda_buf_clone(&self) -> Option<MxArray> {
+        self.buf.clone()
+    }
+
+    /// Restores the saved optional latent slab handle on step rollback.
+    pub(crate) fn cuda_restore_buf_opt(&mut self, buf: Option<MxArray>) {
+        self.buf = buf;
+    }
+
+    pub(crate) fn is_buf_available(&self) -> bool {
+        self.buf.as_ref().is_none_or(MxArray::is_available)
+    }
+
+    /// Commits `buf` after an in-place CUDA write up to `new_len` rows.
+    pub(crate) fn cuda_commit(&mut self, buf: MxArray, new_len: usize) -> Result<()> {
+        super::stats::defer(&buf, "hy_v4_flash latent write")?;
+        self.buf = Some(buf);
+        self.len = new_len;
+        Ok(())
+    }
 }
 
 /// The attention state of one layer.
@@ -561,7 +756,7 @@ impl LayerCache {
     /// Empty state for a layer of kind `attn`; `cap` = the admitted context.
     pub fn new(attn: Attn, window: usize, cap: usize, width: i64) -> Self {
         match attn {
-            Attn::Sliding => Self::Window(WindowRing::new(window, WINDOW_SLACK, width)),
+            Attn::Sliding => Self::Window(WindowRing::new(window, WINDOW_RING_SLACK, width)),
             Attn::Indexed => Self::Latent(LatentBuf::new(cap, width)),
         }
     }

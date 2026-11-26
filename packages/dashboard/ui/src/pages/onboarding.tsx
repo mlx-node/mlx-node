@@ -11,7 +11,7 @@ import { Alert } from '../components/arc/alert/alert';
 import { Badge } from '../components/arc/badge/badge';
 import { Button } from '../components/arc/button/button';
 import { EmptyState } from '../components/arc/empty-state/empty-state';
-import { modelBlurb, modelPresent, offeredOnHost, onboardingBuild } from '../lib/catalog';
+import { catalogItemForHost, modelBlurb, modelPresent, onboardingBuild } from '../lib/catalog';
 import { dismissOnboarding } from '../lib/onboarding';
 import type { CatalogBuildItem, CatalogItem, CatalogResponse, HostResponse, ModelsResponse } from '../lib/types';
 import type { AsyncState } from '../lib/use-api';
@@ -74,9 +74,11 @@ export default function Onboarding({
   const navigate = useNavigate();
   const [selectedLabel, setSelectedLabel] = useState<string | null>(null);
   const host = hostState.data;
-  const items = (catalog.data?.items ?? []).filter(
-    (item) => offeredOnHost(item, host) && item.category !== 'systemone',
-  );
+  const items = (catalog.data?.items ?? []).flatMap((item) => {
+    if (item.category === 'systemone') return [];
+    const offered = catalogItemForHost(item, host);
+    return offered === undefined ? [] : [offered];
+  });
   const activeLabel = items.find(
     (item) =>
       item.builds.some((build) => activeSlugs.includes(build.slug)) ||

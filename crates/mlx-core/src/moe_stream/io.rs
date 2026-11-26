@@ -41,6 +41,20 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// `O_RDONLY` + `FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS` on Windows
+/// so random Engram row reads bypass the Windows System Cache lock under heavy
+/// CUDA memory pinning.
+#[cfg(windows)]
+pub fn open_unbuffered(path: &Path) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_RANDOM_ACCESS: u32 = 0x1000_0000;
+    const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_NO_BUFFERING | FILE_FLAG_RANDOM_ACCESS)
+        .open(path)
+}
+
 /// `O_RDONLY` + `F_NOCACHE` 1 + `F_RDAHEAD` 0.
 pub fn open_nocache(path: &Path) -> Result<File> {
     let file = File::open(path).map_err(|e| bad(format!("open '{}': {e}", path.display())))?;
@@ -228,6 +242,69 @@ impl ShardSet {
                 e.len, e.offset, e.shard
             ))
         })
+    }
+
+    /// Reads `e` through a caller-owned `FILE_FLAG_NO_BUFFERING` handle on
+    /// Windows using 4 KiB sector-aligned offset, buffer, and length (note
+    /// `AlignedBuf` is 16 KiB-aligned). Falls back to [`Self::read_aligned`]
+    /// if the unbuffered read cannot satisfy the request (e.g. non-4K sector
+    /// device or active test fault/delay hooks).
+    #[cfg(windows)]
+    pub fn read_aligned_unbuffered<'b>(
+        &self,
+        file: &File,
+        e: Extent,
+        buf: &'b mut AlignedBuf,
+    ) -> Result<&'b [u8]> {
+        use std::os::windows::fs::FileExt;
+        const SECTOR: u64 = 4096;
+
+        self.check(&e)?;
+        #[cfg(test)]
+        if self.delay_ms.load(std::sync::atomic::Ordering::Relaxed) > 0
+            || lock(&self.fault).is_some()
+        {
+            return self.read_aligned(e, buf);
+        }
+
+        let len = usize::try_from(e.len).map_err(|_| bad("extent length exceeds usize"))?;
+        let start = e.offset & !(SECTOR - 1);
+        let head = (e.offset - start) as usize;
+        let need = head
+            .checked_add(len)
+            .ok_or_else(|| bad("unbuffered read window overflows usize"))?;
+        let aligned_len = need
+            .checked_next_multiple_of(SECTOR as usize)
+            .ok_or_else(|| bad("unbuffered read length overflows usize"))?;
+
+        let ok = {
+            let bytes = buf.get(aligned_len)?;
+            let mut done = 0usize;
+            let mut failed = false;
+            while done < need {
+                // `FILE_FLAG_NO_BUFFERING` requires offset, pointer, and length
+                // to be sector-aligned; abort to fallback on any misaligned partial read.
+                if !done.is_multiple_of(SECTOR as usize) {
+                    failed = true;
+                    break;
+                }
+                match file.seek_read(&mut bytes[done..aligned_len], start + done as u64) {
+                    Ok(0) => break,
+                    Ok(n) => done += n,
+                    Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => {
+                        failed = true;
+                        break;
+                    }
+                }
+            }
+            !failed && done >= need
+        };
+        if ok {
+            let bytes = buf.get(aligned_len)?;
+            return Ok(&bytes[head..head + len]);
+        }
+        self.read_aligned(e, buf)
     }
 
     fn window<'b>(

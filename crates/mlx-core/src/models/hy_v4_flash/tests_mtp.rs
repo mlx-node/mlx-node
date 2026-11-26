@@ -68,6 +68,7 @@ fn held_bytes_match_the_fixture() {
                 Held::SymQ8 => "symq8_g32_f16_scale",
                 Held::F32 => "f32",
                 Held::Affine4 => "affine4_g64_bf16_scale_bias",
+                Held::Affine8 => "affine8_g32_f16_scale_bias",
             };
             assert_eq!(t["plan_form"]["form"], form, "{}", i.name);
             total += want;
@@ -114,7 +115,7 @@ fn held_bytes_match_the_fixture() {
 #[test]
 fn held_refuses_types_the_layer_does_not_use() {
     let mut i = info(&fixture("mtp-tensors.json")["tensors"][0]);
-    i.tensor_type = GgufTensorType::Q8_0;
+    i.tensor_type = GgufTensorType::Q4K;
     assert!(held(&i, false).is_err());
     i.tensor_type = GgufTensorType::F32;
     assert!(held(&i, true).is_err());

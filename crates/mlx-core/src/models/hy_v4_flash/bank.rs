@@ -22,6 +22,7 @@
 //! them `NonVolatile` again and, when Metal emptied a class's banks, forgets
 //! that class's tags and cache entries before a gather can read the slots.
 
+use std::collections::BTreeMap;
 #[cfg(unix)]
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -39,14 +40,24 @@ use super::kq_slot;
 use super::scan::{ExpertClass, ExpertLayer, Located};
 #[cfg(any(unix, test))]
 use super::weights::Dense;
-use super::weights::{MmapDense, MmapDenseSpec};
+use super::weights::{
+    CUDA_CLEAR_CACHE_BYTES, CUDA_REPACK_BAND_BYTES, CudaStaging, MmapDense, MmapDenseSpec,
+    cuda_repack_from_shards,
+};
 use crate::array::alloc::{DstPtrs, MetalResidencySet, OutLayout};
 use crate::array::purgeable::{BankWatch, PurgeableBank, PurgeableState};
 use crate::array::{DType, MxArray};
 use crate::moe_stream::cache::Cache;
 pub use crate::moe_stream::directory::{Directory, Plan};
-use crate::moe_stream::io::{BatchWatch, Extent, IoPool, IoStats, Priority, Read, Ticket};
+use crate::moe_stream::io::{
+    AlignedBuf, BatchWatch, Extent, IoPool, IoStats, Priority, Read, ShardSet, Ticket,
+};
+use crate::nn::Activations;
 use crate::utils::gguf::{GgufTensorInfo, GgufTensorType};
+use crate::utils::gguf_cpu_repack::decode_affine_band_into;
+use crate::utils::gguf_gpu::{
+    CudaDeviceBudget, GpuRepackKind, RepackDst, gpu_repack_available, gpu_repack_supports_kind,
+};
 use crate::utils::gguf_kquant::KQuantFormat;
 
 fn bad(msg: impl std::fmt::Display) -> Error {
@@ -269,7 +280,7 @@ pub fn class_types(class: ExpertClass) -> Option<[GgufTensorType; 3]> {
     match class {
         ExpertClass::Q6kDown => Some([Q4K, Q4K, Q6K]),
         ExpertClass::Q4kDown => Some([Q4K, Q4K, Q4K]),
-        ExpertClass::Bf16 => None,
+        ExpertClass::Bf16 | ExpertClass::Nvfp4 | ExpertClass::Q8_0 => None,
     }
 }
 
@@ -342,14 +353,77 @@ pub fn geometry(moe: &MoeConfig, class: ExpertClass) -> Result<[ProjGeo; 3]> {
     Ok(out)
 }
 
+fn cuda_expert_slot_bytes(moe: &MoeConfig, class: ExpertClass) -> Result<u64> {
+    let rk = [
+        (moe.ff, moe.latent),
+        (moe.ff, moe.latent),
+        (moe.latent, moe.ff),
+    ];
+    let (block, w_num, w_den, s_num, s_den) = match class {
+        ExpertClass::Nvfp4 => (64usize, 1u64, 2u64, 1u64, 16u64),
+        ExpertClass::Q8_0 => (32usize, 1u64, 1u64, 1u64, 16u64),
+        _ => return Err(bad(format!("{class:?} is not a CUDA direct expert class"))),
+    };
+    let mut total = 0u64;
+    for (p, (rows, k)) in rk.into_iter().enumerate() {
+        if rows == 0 || k == 0 || !k.is_multiple_of(block) {
+            return Err(bad(format!(
+                "projection {p}: {rows} x {k} does not fit {class:?} blocks ({block})"
+            )));
+        }
+        let n = (rows as u64)
+            .checked_mul(k as u64)
+            .ok_or_else(|| bad("expert projection elements overflow u64"))?;
+        total = total
+            .checked_add(n * w_num / w_den + n * s_num / s_den)
+            .ok_or_else(|| bad("expert slot bytes overflow u64"))?;
+    }
+    Ok(total)
+}
+
+fn cuda_expert_file_bytes(moe: &MoeConfig, class: ExpertClass) -> Result<u64> {
+    let rk = [
+        (moe.ff, moe.latent),
+        (moe.ff, moe.latent),
+        (moe.latent, moe.ff),
+    ];
+    let ty = match class {
+        ExpertClass::Nvfp4 => GgufTensorType::NVFP4,
+        ExpertClass::Q8_0 => GgufTensorType::Q8_0,
+        _ => return Err(bad(format!("{class:?} is not a CUDA direct expert class"))),
+    };
+    let block = ty.block_size();
+    let tsize = ty.type_size() as u64;
+    let mut total = 0u64;
+    for (p, (rows, k)) in rk.into_iter().enumerate() {
+        if rows == 0 || k == 0 || !k.is_multiple_of(block) {
+            return Err(bad(format!(
+                "projection {p}: {rows} x {k} does not fit {} blocks ({block})",
+                ty.name()
+            )));
+        }
+        let per_row = (k / block) as u64 * tsize;
+        total = total
+            .checked_add((rows as u64) * per_row)
+            .ok_or_else(|| bad("expert file bytes overflow u64"))?;
+    }
+    Ok(total)
+}
+
 /// Bank bytes of one expert of `class` (gate + up + down).
 pub fn slot_bytes(moe: &MoeConfig, class: ExpertClass) -> Result<u64> {
-    Ok(geometry(moe, class)?.iter().map(ProjGeo::slot_bytes).sum())
+    match class {
+        ExpertClass::Nvfp4 | ExpertClass::Q8_0 => cuda_expert_slot_bytes(moe, class),
+        _ => Ok(geometry(moe, class)?.iter().map(ProjGeo::slot_bytes).sum()),
+    }
 }
 
 /// GGUF bytes one miss of `class` reads.
 pub fn file_bytes(moe: &MoeConfig, class: ExpertClass) -> Result<u64> {
-    Ok(geometry(moe, class)?.iter().map(ProjGeo::file_bytes).sum())
+    match class {
+        ExpertClass::Nvfp4 | ExpertClass::Q8_0 => cuda_expert_file_bytes(moe, class),
+        _ => Ok(geometry(moe, class)?.iter().map(ProjGeo::file_bytes).sum()),
+    }
 }
 
 /// Refuses any tensor of layer `il` whose type or ggml dims are not exactly
@@ -2153,9 +2227,569 @@ impl MmapExpertBank {
     }
 }
 
+/// One GPU-resident routed-expert projection (`[E, rows, k_packed]` + `[E, rows, k_scales]`)
+/// allocated directly in CUDA VRAM (`device == 0`).
+#[derive(Clone)]
+pub struct CudaExpertProj {
+    pub w: MxArray,
+    pub scales: MxArray,
+}
+
+impl CudaExpertProj {
+    pub fn nbytes(&self) -> u64 {
+        (self.w.nbytes() + self.scales.nbytes()) as u64
+    }
+}
+
+/// One MoE layer's GPU-resident routed experts (`gate`, `up`, `down`) on CUDA `device == 0`.
+#[derive(Clone)]
+pub struct CudaExpertLayer {
+    pub class: ExpertClass,
+    pub gate: CudaExpertProj,
+    pub up: CudaExpertProj,
+    pub down: CudaExpertProj,
+}
+
+/// Maximum unique experts dequantized simultaneously in the FP32 fallback path
+/// (`MLX_HY4_CUDA_FAST=0`). At Hy4 dimensions (1536×1536), 8 experts' FP32
+/// `gate + up + down` matrices total ~226 MiB instead of duplicating per
+/// `(row, top_k)` pair.
+const CUDA_FALLBACK_EXPERTS_PER_WAVE: usize = 8;
+
+impl CudaExpertLayer {
+    pub fn nbytes(&self) -> u64 {
+        self.gate.nbytes() + self.up.nbytes() + self.down.nbytes()
+    }
+
+    fn proj(&self, p: usize) -> Result<&CudaExpertProj> {
+        match p {
+            0 => Ok(&self.gate),
+            1 => Ok(&self.up),
+            2 => Ok(&self.down),
+            _ => Err(bad(format!("invalid CUDA expert projection index {p}"))),
+        }
+    }
+
+    /// Dequantizes `unique_ids` (distinct expert indices) for projection `p`
+    /// into `[U, out_d, in_d]` FP32 using MLX's AOT `mlx_dequantize`.
+    fn dequant_unique_proj(&self, p: usize, unique_ids: &[u32]) -> Result<MxArray> {
+        let pr = self.proj(p)?;
+        let u = unique_ids.len() as i64;
+        let u_arr = MxArray::from_uint32(unique_ids, &[u])?;
+        let w_sel = pr.w.take(&u_arr, 0)?;
+        let s_sel = pr.scales.take(&u_arr, 0)?;
+        match self.class {
+            ExpertClass::Nvfp4 => {
+                // SAFETY: live arrays owned for this call; biases is null for nvfp4.
+                let h = unsafe {
+                    mlx_sys::mlx_dequantize(
+                        w_sel.as_raw_ptr(),
+                        s_sel.as_raw_ptr(),
+                        std::ptr::null_mut(),
+                        16,
+                        4,
+                        DType::Float32 as i32,
+                        c"nvfp4".as_ptr(),
+                    )
+                };
+                MxArray::from_handle(h, "hy_v4_flash cuda_direct dequant nvfp4")
+            }
+            ExpertClass::Q8_0 => {
+                let s_f32 = if s_sel.dtype()? == DType::Float32 {
+                    s_sel
+                } else {
+                    s_sel.astype(DType::Float32)?
+                };
+                let b_f32 = s_f32.mul_scalar(-128.0)?;
+                // SAFETY: live arrays owned for this call.
+                let h = unsafe {
+                    mlx_sys::mlx_dequantize(
+                        w_sel.as_raw_ptr(),
+                        s_f32.as_raw_ptr(),
+                        b_f32.as_raw_ptr(),
+                        32,
+                        8,
+                        DType::Float32 as i32,
+                        c"affine".as_ptr(),
+                    )
+                };
+                MxArray::from_handle(h, "hy_v4_flash cuda_direct dequant q8_0")
+            }
+            other => Err(bad(format!(
+                "unsupported CUDA direct expert class {other:?} in dequant_unique_proj"
+            ))),
+        }
+    }
+
+    /// Bounded-memory FP32 routed-expert evaluation for `MLX_HY4_CUDA_FAST=0`:
+    /// groups `(row, k)` pairs by unique expert ID and processes at most
+    /// [`CUDA_FALLBACK_EXPERTS_PER_WAVE`] unique experts per evaluated wave so
+    /// long prefills never duplicate or dequantize `rows * k` expert matrices.
+    pub fn routed_f32_bounded(
+        &self,
+        z: &MxArray,
+        ids: &[u32],
+        weights: &[f32],
+        k: usize,
+        limit: f32,
+    ) -> Result<MxArray> {
+        let rows = z.shape_at(0)?;
+        let lat = z.shape_at(1)?;
+        let pairs = (rows as usize) * k;
+        if ids.len() != pairs || weights.len() != pairs {
+            return Err(bad(format!(
+                "routed_f32_bounded: routes len {}/{} != {}x{}",
+                ids.len(),
+                weights.len(),
+                rows,
+                k
+            )));
+        }
+        if pairs == 0 {
+            return MxArray::zeros(&[rows, lat], Some(DType::Float32));
+        }
+        let z_f32 = if z.dtype()? == DType::Float32 {
+            z.clone()
+        } else {
+            z.astype(DType::Float32)?
+        };
+        let ff = self.gate.w.shape_at(1)?;
+
+        let mut by_expert: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+        for (pi, &eid) in ids.iter().enumerate() {
+            by_expert.entry(eid).or_default().push(pi);
+        }
+        let expert_groups: Vec<(u32, Vec<usize>)> = by_expert.into_iter().collect();
+
+        let mut inv_order = vec![0u32; pairs];
+        let mut cursor = 0u32;
+        let mut wave_outs: Vec<MxArray> =
+            Vec::with_capacity(expert_groups.len().div_ceil(CUDA_FALLBACK_EXPERTS_PER_WAVE));
+
+        for wave in expert_groups.chunks(CUDA_FALLBACK_EXPERTS_PER_WAVE) {
+            let wave_ids: Vec<u32> = wave.iter().map(|&(eid, _)| eid).collect();
+            let wg = self.dequant_unique_proj(0, &wave_ids)?;
+            let wu = self.dequant_unique_proj(1, &wave_ids)?;
+            let wd = self.dequant_unique_proj(2, &wave_ids)?;
+
+            let mut parts: Vec<MxArray> = Vec::with_capacity(wave.len());
+            for (li, (_, pair_indices)) in wave.iter().enumerate() {
+                let m_e = pair_indices.len() as i64;
+                let mut tok_rows = Vec::with_capacity(pair_indices.len());
+                let mut pair_w = Vec::with_capacity(pair_indices.len());
+                for &pi in pair_indices {
+                    inv_order[pi] = cursor;
+                    cursor += 1;
+                    tok_rows.push((pi / k) as u32);
+                    pair_w.push(weights[pi]);
+                }
+                let x_e = z_f32.take(&MxArray::from_uint32(&tok_rows, &[m_e])?, 0)?;
+                let g_mat = wg
+                    .slice(&[li as i64, 0, 0], &[(li + 1) as i64, ff, lat])?
+                    .reshape(&[ff, lat])?;
+                let u_mat = wu
+                    .slice(&[li as i64, 0, 0], &[(li + 1) as i64, ff, lat])?
+                    .reshape(&[ff, lat])?;
+                let d_mat = wd
+                    .slice(&[li as i64, 0, 0], &[(li + 1) as i64, lat, ff])?
+                    .reshape(&[lat, ff])?;
+
+                let g_e = x_e.matmul(&g_mat.transpose(Some(&[1, 0]))?)?;
+                let u_e = x_e.matmul(&u_mat.transpose(Some(&[1, 0]))?)?;
+                let h_e = Activations::swiglu_clamped_compiled(&g_e, &u_e, limit)?;
+                let y_e = h_e.matmul(&d_mat.transpose(Some(&[1, 0]))?)?;
+                let w_e = MxArray::from_float32(&pair_w, &[m_e, 1])?;
+                parts.push(y_e.mul(&w_e)?);
+            }
+            let wave_out = if parts.len() == 1 {
+                parts.swap_remove(0)
+            } else {
+                MxArray::concatenate_many(parts.iter().collect(), Some(0))?
+            };
+            // Evaluate wave output so the dequantized FP32 weight slabs (`wg`/`wu`/`wd`)
+            // are released before the next wave begins.
+            MxArray::eval_arrays_with_context(
+                &[&wave_out],
+                "hy_v4_flash cuda_direct routed_f32_bounded wave",
+            )?;
+            wave_outs.push(wave_out);
+        }
+
+        let all = if wave_outs.len() == 1 {
+            wave_outs.swap_remove(0)
+        } else {
+            MxArray::concatenate_many(wave_outs.iter().collect(), Some(0))?
+        };
+        all.take(&MxArray::from_uint32(&inv_order, &[pairs as i64])?, 0)?
+            .reshape(&[rows, k as i64, lat])?
+            .sum(Some(&[1]), Some(false))
+    }
+
+    /// Reference FP32 `gather_qmm` over `gate` (`p == 0`), `up` (`p == 1`), or
+    /// `down` (`p == 2`) for eager/A-B parity fallback (`MLX_HY4_CUDA_FAST=0`).
+    pub fn gather_f32(&self, p: usize, x: &MxArray, ids: &MxArray) -> Result<MxArray> {
+        let pr = self.proj(p)?;
+        match self.class {
+            ExpertClass::Nvfp4 => {
+                let x_f32 = if x.dtype()? == DType::Float32 {
+                    x.clone()
+                } else {
+                    x.astype(DType::Float32)?
+                };
+                if crate::accelerator::cuda_ops_available() {
+                    // Avoid MLX's CUDA NVRTC `gather_qmm(..., "nvfp4")` which requires CUTLASS
+                    // `cute/` headers not bundled at runtime on Windows; deduplicate unique
+                    // experts in bounded waves using AOT `mlx_dequantize`.
+                    let ids_nd = ids.ndim()?;
+                    let out_d = pr.w.shape_at(1)?;
+                    let in_d = pr.w.shape_at(2)? * 8;
+                    let (rows, k, x_flat, broadcast_k, out_shape): (
+                        usize,
+                        usize,
+                        MxArray,
+                        bool,
+                        Vec<i64>,
+                    ) = if ids_nd == 2 {
+                        let r = ids.shape_at(0)? as usize;
+                        let kv = ids.shape_at(1)? as usize;
+                        let x_mid = x_f32.shape_at(1)? as usize;
+                        if x_mid == 1 {
+                            (
+                                r,
+                                kv,
+                                x_f32.reshape(&[r as i64, in_d])?,
+                                true,
+                                vec![r as i64, kv as i64, 1, out_d],
+                            )
+                        } else {
+                            (
+                                r,
+                                kv,
+                                x_f32.reshape(&[(r * kv) as i64, in_d])?,
+                                false,
+                                vec![r as i64, kv as i64, 1, out_d],
+                            )
+                        }
+                    } else {
+                        let n = ids.shape_at(0)? as usize;
+                        (
+                            n,
+                            1,
+                            x_f32.reshape(&[n as i64, in_d])?,
+                            false,
+                            vec![n as i64, 1, out_d],
+                        )
+                    };
+                    let pairs = rows * k;
+                    if pairs == 0 {
+                        return MxArray::zeros(&out_shape, Some(DType::Float32));
+                    }
+                    let ids_u32 = ids.reshape(&[pairs as i64])?.to_uint32()?;
+                    let mut by_expert: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+                    for (pi, &eid) in ids_u32.iter().enumerate() {
+                        by_expert.entry(eid).or_default().push(pi);
+                    }
+                    let expert_groups: Vec<(u32, Vec<usize>)> = by_expert.into_iter().collect();
+                    let mut inv_order = vec![0u32; pairs];
+                    let mut cursor = 0u32;
+                    let mut wave_outs: Vec<MxArray> = Vec::with_capacity(
+                        expert_groups.len().div_ceil(CUDA_FALLBACK_EXPERTS_PER_WAVE),
+                    );
+                    for wave in expert_groups.chunks(CUDA_FALLBACK_EXPERTS_PER_WAVE) {
+                        let wave_ids: Vec<u32> = wave.iter().map(|&(eid, _)| eid).collect();
+                        let w_wave = self.dequant_unique_proj(p, &wave_ids)?;
+                        let mut parts: Vec<MxArray> = Vec::with_capacity(wave.len());
+                        for (li, (_, pair_indices)) in wave.iter().enumerate() {
+                            let m_e = pair_indices.len() as i64;
+                            let mut x_rows = Vec::with_capacity(pair_indices.len());
+                            for &pi in pair_indices {
+                                inv_order[pi] = cursor;
+                                cursor += 1;
+                                x_rows.push(if broadcast_k {
+                                    (pi / k) as u32
+                                } else {
+                                    pi as u32
+                                });
+                            }
+                            let x_e = x_flat.take(&MxArray::from_uint32(&x_rows, &[m_e])?, 0)?;
+                            let w_mat = w_wave
+                                .slice(&[li as i64, 0, 0], &[(li + 1) as i64, out_d, in_d])?
+                                .reshape(&[out_d, in_d])?;
+                            parts.push(x_e.matmul(&w_mat.transpose(Some(&[1, 0]))?)?);
+                        }
+                        let wave_out = if parts.len() == 1 {
+                            parts.swap_remove(0)
+                        } else {
+                            MxArray::concatenate_many(parts.iter().collect(), Some(0))?
+                        };
+                        MxArray::eval_arrays_with_context(
+                            &[&wave_out],
+                            "hy_v4_flash cuda_direct gather_f32 wave",
+                        )?;
+                        wave_outs.push(wave_out);
+                    }
+                    let all = if wave_outs.len() == 1 {
+                        wave_outs.swap_remove(0)
+                    } else {
+                        MxArray::concatenate_many(wave_outs.iter().collect(), Some(0))?
+                    };
+                    return all
+                        .take(&MxArray::from_uint32(&inv_order, &[pairs as i64])?, 0)?
+                        .reshape(&out_shape);
+                }
+                // SAFETY: live arrays owned for this call; biases and lhs_indices are null for nvfp4.
+                let h = unsafe {
+                    mlx_sys::mlx_gather_qmm(
+                        x_f32.as_raw_ptr(),
+                        pr.w.as_raw_ptr(),
+                        pr.scales.as_raw_ptr(),
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        ids.as_raw_ptr(),
+                        true,
+                        16,
+                        4,
+                        c"nvfp4".as_ptr(),
+                        false,
+                    )
+                };
+                let out = MxArray::from_handle(h, "hy_v4_flash cuda_direct gather_qmm nvfp4")?;
+                if out.dtype()? == DType::Float32 {
+                    Ok(out)
+                } else {
+                    out.astype(DType::Float32)
+                }
+            }
+            ExpertClass::Q8_0 => {
+                let dt = pr.scales.dtype()?;
+                let xq = if x.dtype()? == dt {
+                    x.clone()
+                } else {
+                    x.astype(dt)?
+                };
+                let biases = pr
+                    .scales
+                    .astype(DType::Float32)?
+                    .mul_scalar(-128.0)?
+                    .astype(dt)?;
+                // SAFETY: live arrays owned for this call; lhs_indices is null.
+                let h = unsafe {
+                    mlx_sys::mlx_gather_qmm(
+                        xq.as_raw_ptr(),
+                        pr.w.as_raw_ptr(),
+                        pr.scales.as_raw_ptr(),
+                        biases.as_raw_ptr(),
+                        std::ptr::null_mut(),
+                        ids.as_raw_ptr(),
+                        true,
+                        32,
+                        8,
+                        c"affine".as_ptr(),
+                        false,
+                    )
+                };
+                MxArray::from_handle(h, "hy_v4_flash cuda_direct gather_qmm q8_0")?
+                    .astype(DType::Float32)
+            }
+            other => Err(bad(format!(
+                "unsupported CUDA direct expert class {other:?} in gather_f32"
+            ))),
+        }
+    }
+}
+
+struct CudaExpertBank {
+    /// Indexed by trunk layer id (`None` on dense-FFN layers like `blk.0`).
+    layers: Vec<Option<CudaExpertLayer>>,
+    total_experts: usize,
+    slot_bytes: u64,
+    total_bytes: u64,
+    uses: AtomicUsize,
+    in_turn: AtomicBool,
+}
+
+impl CudaExpertBank {
+    fn repack_proj(
+        shards: &ShardSet,
+        loc: &Located,
+        kind: GpuRepackKind,
+        budget: &CudaDeviceBudget,
+        read_buf: &mut AlignedBuf,
+        staging: &mut CudaStaging,
+    ) -> Result<(CudaExpertProj, u64)> {
+        let info = &loc.info;
+        let (mut w, mut scales, read_len) = if crate::accelerator::cuda_ops_available()
+            && gpu_repack_available()
+            && gpu_repack_supports_kind(kind)
+        {
+            let (dst, _, read_len) =
+                cuda_repack_from_shards(shards, loc, kind, budget, read_buf, staging)?;
+            let scales = dst.scales.ok_or_else(|| {
+                bad(format!(
+                    "'{}': {kind:?} CUDA repack gave no scales",
+                    info.name
+                ))
+            })?;
+            (dst.weight, scales, read_len)
+        } else {
+            let (dst, ptrs) = RepackDst::alloc(info, OutLayout::RowMajor)?;
+            let ty = info.tensor_type;
+            let row_bytes = (ptrs.k / ty.block_size()) * ty.type_size();
+            let band_rows = (CUDA_REPACK_BAND_BYTES / row_bytes).clamp(1, ptrs.rows);
+            let base_offset = loc.abs_offset()?;
+            let mut row0 = 0usize;
+            let mut read_len = 0u64;
+            while row0 < ptrs.rows {
+                let count = band_rows.min(ptrs.rows - row0);
+                let band_len = (count as u64) * (row_bytes as u64);
+                let raw = shards.read_aligned(
+                    Extent {
+                        shard: loc.shard,
+                        offset: base_offset + (row0 as u64) * (row_bytes as u64),
+                        len: band_len,
+                    },
+                    read_buf,
+                )?;
+                decode_affine_band_into(ty, raw, row0, count, ptrs.k, &ptrs)?;
+                read_len += band_len;
+                row0 += count;
+            }
+            let scales = dst
+                .scales
+                .ok_or_else(|| bad(format!("'{}': {kind:?} repack gave no scales", info.name)))?;
+            MxArray::eval_arrays_with_context(&[&dst.weight, &scales], "hy_v4_flash cuda expert")?;
+            (dst.weight, scales, read_len)
+        };
+        if crate::accelerator::cuda_ops_available() {
+            w.promote_cuda_device()?;
+            scales.promote_cuda_device()?;
+            let w_host = w.cuda_host_bytes();
+            let s_host = scales.cuda_host_bytes();
+            if w_host > 0 || s_host > 0 {
+                return Err(bad(format!(
+                    "'{}': CUDA direct expert projection remained host-backed after device promotion \
+                     (w_host={w_host} B, scales_host={s_host} B)",
+                    info.name
+                )));
+            }
+        }
+        Ok((CudaExpertProj { w, scales }, read_len))
+    }
+
+    fn load(shards: &ShardSet, moe: &MoeConfig, experts: &[Option<ExpertLayer>]) -> Result<Self> {
+        let t0 = Instant::now();
+        let budget = CudaDeviceBudget::for_current_device();
+        let mut read_buf = AlignedBuf::new();
+        let mut staging = CudaStaging::new();
+        let mut layers = Vec::with_capacity(experts.len());
+        let mut total_experts = 0usize;
+        let mut slot_bytes_val = 0u64;
+        let mut total_bytes = 0u64;
+        let mut total_read = 0u64;
+        let mut bytes_since_clear = 0u64;
+        let n = moe.n_experts;
+
+        for (il, opt) in experts.iter().enumerate() {
+            let Some(layer) = opt else {
+                layers.push(None);
+                continue;
+            };
+            let (kind, want_ty) = match layer.class {
+                ExpertClass::Nvfp4 => (GpuRepackKind::Nvfp4, GgufTensorType::NVFP4),
+                ExpertClass::Q8_0 => (GpuRepackKind::Q8_0, GgufTensorType::Q8_0),
+                other => {
+                    return Err(bad(format!(
+                        "layer {il}: CUDA direct bank expects Nvfp4 or Q8_0 experts, got {other:?}"
+                    )));
+                }
+            };
+            let dims_expected = [
+                [moe.latent as u64, moe.ff as u64, n as u64],
+                [moe.latent as u64, moe.ff as u64, n as u64],
+                [moe.ff as u64, moe.latent as u64, n as u64],
+            ];
+            let locs = [&layer.gate, &layer.up, &layer.down];
+            for (loc, want_dims) in locs.iter().zip(dims_expected) {
+                if loc.info.tensor_type != want_ty || loc.info.dims != want_dims {
+                    return Err(bad(format!(
+                        "'{}' is {} {:?}, expected {} {want_dims:?}",
+                        loc.info.name,
+                        loc.info.tensor_type.name(),
+                        loc.info.dims,
+                        want_ty.name()
+                    )));
+                }
+            }
+            if slot_bytes_val == 0 {
+                slot_bytes_val = cuda_expert_slot_bytes(moe, layer.class)?;
+            }
+            let (gate, r0) = Self::repack_proj(
+                shards,
+                &layer.gate,
+                kind,
+                &budget,
+                &mut read_buf,
+                &mut staging,
+            )?;
+            let (up, r1) = Self::repack_proj(
+                shards,
+                &layer.up,
+                kind,
+                &budget,
+                &mut read_buf,
+                &mut staging,
+            )?;
+            let (down, r2) = Self::repack_proj(
+                shards,
+                &layer.down,
+                kind,
+                &budget,
+                &mut read_buf,
+                &mut staging,
+            )?;
+            let cuda_layer = CudaExpertLayer {
+                class: layer.class,
+                gate,
+                up,
+                down,
+            };
+            let layer_bytes = cuda_layer.nbytes();
+            total_bytes += layer_bytes;
+            total_read += r0 + r1 + r2;
+            total_experts += n;
+            bytes_since_clear += layer_bytes;
+            if bytes_since_clear >= CUDA_CLEAR_CACHE_BYTES {
+                bytes_since_clear = 0;
+                if crate::array::get_cache_memory() >= CUDA_CLEAR_CACHE_BYTES as f64 {
+                    crate::array::clear_cache();
+                }
+            }
+            layers.push(Some(cuda_layer));
+        }
+        crate::array::clear_cache();
+        tracing::info!(
+            "hy_v4_flash CUDA direct expert bank: {} layers ({total_experts} experts), \
+             {:.2} GiB read, {:.2} GiB VRAM in {:.1} s",
+            layers.iter().flatten().count(),
+            total_read as f64 / (1u64 << 30) as f64,
+            total_bytes as f64 / (1u64 << 30) as f64,
+            t0.elapsed().as_secs_f64(),
+        );
+        Ok(Self {
+            layers,
+            total_experts,
+            slot_bytes: slot_bytes_val,
+            total_bytes,
+            uses: AtomicUsize::new(0),
+            in_turn: AtomicBool::new(false),
+        })
+    }
+}
+
 enum ResidentBank {
     Direct(DirectBank),
     Mmap(MmapExpertBank),
+    CudaDirect(CudaExpertBank),
 }
 
 pub struct KqBank {
@@ -2465,12 +3099,87 @@ impl KqBank {
         }
     }
 
+    /// Allocates and repacks every trunk MoE layer (`ExpertClass::Nvfp4` or
+    /// `ExpertClass::Q8_0`) directly into CUDA VRAM (`device == 0`) via
+    /// `mlx_gguf_repack_band`.
+    pub fn new_cuda_direct(
+        shards: Arc<ShardSet>,
+        moe: &MoeConfig,
+        experts: &[Option<ExpertLayer>],
+    ) -> Result<Self> {
+        let cuda = CudaExpertBank::load(&shards, moe, experts)?;
+        let pool = Arc::new(IoPool::new(shards, 1)?);
+        let layout = ClassLayout {
+            of_layer: vec![None; experts.len()],
+            layers: [Vec::new(), Vec::new()],
+        };
+        Ok(Self {
+            direct: OnceLock::from(ResidentBank::CudaDirect(cuda)),
+            inner: Mutex::new(Inner {
+                ahead: [Vec::new(), Vec::new()],
+                inflight: Vec::new(),
+                ahead_left: [Vec::new(), Vec::new()],
+                classes: Vec::new(),
+                in_turn: false,
+                retired: Vec::new(),
+            }),
+            pool,
+            n_experts: moe.n_experts,
+            n_used: moe.n_used,
+            layout,
+            split: AtomicBool::new(false),
+            prefetch: AtomicBool::new(false),
+            decode_prefetch: AtomicBool::new(false),
+            stats: Mutex::new([KqStats::default(); 2]),
+        })
+    }
+
     pub fn is_direct(&self) -> bool {
         self.direct.get().is_some()
     }
 
+    pub fn is_cuda_direct(&self) -> bool {
+        matches!(self.direct.get(), Some(ResidentBank::CudaDirect(_)))
+    }
+
     pub fn is_mmap(&self) -> bool {
         matches!(self.direct.get(), Some(ResidentBank::Mmap(_)))
+    }
+
+    /// In CUDA direct mode, returns `layer`'s GPU-resident routed experts
+    /// (`gate`, `up`, `down` on `device == 0`) and records active expert uses.
+    /// Returns `Ok(None)` when not in CUDA direct mode.
+    pub fn cuda_layer_experts(&self, layer: usize) -> Result<Option<&CudaExpertLayer>> {
+        let Some(ResidentBank::CudaDirect(cuda)) = self.direct.get() else {
+            return Ok(None);
+        };
+        let l = cuda
+            .layers
+            .get(layer)
+            .and_then(Option::as_ref)
+            .ok_or_else(|| bad(format!("layer {layer} has no CUDA direct experts")))?;
+        cuda.uses.fetch_add(self.n_used, Ordering::Relaxed);
+        Ok(Some(l))
+    }
+
+    /// Convenience accessor for `cuda_forward.rs`: returns
+    /// `[(&gate.w, &gate.scales), (&up.w, &up.scales), (&down.w, &down.scales)]`
+    /// when `layer` holds CUDA-resident NVFP4 experts.
+    pub fn cuda_layer_nvfp4(&self, layer: usize) -> Result<Option<[(&MxArray, &MxArray); 3]>> {
+        let Some(l) = self.cuda_layer_experts(layer)? else {
+            return Ok(None);
+        };
+        if l.class != ExpertClass::Nvfp4 {
+            return Err(bad(format!(
+                "layer {layer}: expected Nvfp4 CUDA experts, got {:?}",
+                l.class
+            )));
+        }
+        Ok(Some([
+            (&l.gate.w, &l.gate.scales),
+            (&l.up.w, &l.up.scales),
+            (&l.down.w, &l.down.scales),
+        ]))
     }
 
     pub fn mapped_bytes(&self) -> u64 {
@@ -2564,7 +3273,7 @@ impl KqBank {
         }
     }
 
-    /// Records `count` routed-expert uses for `layer` in direct or mmap mode.
+    /// Records `count` routed-expert uses for `layer` in direct, mmap, or CUDA direct mode.
     pub fn record_direct_use(&self, layer: usize, count: usize) {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => {
@@ -2577,16 +3286,19 @@ impl KqBank {
                     m.uses[m.layers[idx].ci].fetch_add(count, Ordering::Relaxed);
                 }
             }
+            Some(ResidentBank::CudaDirect(c)) => {
+                c.uses.fetch_add(count, Ordering::Relaxed);
+            }
             None => {}
         }
     }
 
     /// In direct or mmap mode, returns `layer`'s resident expert views
     /// (`slot_id == expert_id`) without taking the bank lock.
-    /// Returns `Ok(None)` in streamed mode.
+    /// Returns `Ok(None)` in streamed or CUDA direct mode.
     pub fn direct_layer_arrays(&self, layer: usize) -> Result<Option<DirectLayerArrays>> {
         match self.direct.get() {
-            None => Ok(None),
+            None | Some(ResidentBank::CudaDirect(_)) => Ok(None),
             Some(ResidentBank::Direct(direct)) => {
                 let dl = direct.wait_layer(layer)?;
                 direct.uses[dl.ci].fetch_add(self.n_used, Ordering::Relaxed);
@@ -2637,6 +3349,9 @@ impl KqBank {
             Some(ResidentBank::Mmap(_)) => Err(bad(format!(
                 "layer {layer}: mmap bank uses raw GGUF buffers, not repacked ProjArrays"
             ))),
+            Some(ResidentBank::CudaDirect(_)) => Err(bad(format!(
+                "layer {layer}: CUDA direct bank uses GPU-resident NVFP4/Q8_0 tensors, not repacked ProjArrays"
+            ))),
         }
     }
 
@@ -2644,17 +3359,17 @@ impl KqBank {
     pub fn direct_fill_complete(&self) -> bool {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => d.fill_complete(),
-            Some(ResidentBank::Mmap(_)) => true,
+            Some(ResidentBank::Mmap(_) | ResidentBank::CudaDirect(_)) => true,
             None => false,
         }
     }
 
     /// Blocks until the background direct fill finishes all layers (no-op in
-    /// mmap or streamed mode).
+    /// mmap, CUDA direct, or streamed mode).
     pub fn wait_direct_fill(&self) -> Result<()> {
         match self.direct.get() {
             Some(ResidentBank::Direct(direct)) => direct.wait_all(),
-            Some(ResidentBank::Mmap(_)) | None => Ok(()),
+            Some(ResidentBank::Mmap(_) | ResidentBank::CudaDirect(_)) | None => Ok(()),
         }
     }
 
@@ -2702,6 +3417,12 @@ impl KqBank {
     }
 
     pub fn class_of(&self, layer: usize) -> Option<ExpertClass> {
+        if let Some(ResidentBank::CudaDirect(c)) = self.direct.get() {
+            return c
+                .layers
+                .get(layer)
+                .and_then(|l| l.as_ref().map(|l| l.class));
+        }
         self.layout
             .of_layer
             .get(layer)
@@ -2714,6 +3435,7 @@ impl KqBank {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => return d.cache_slots,
             Some(ResidentBank::Mmap(m)) => return m.cache_slots,
+            Some(ResidentBank::CudaDirect(c)) => return [c.total_experts, 0],
             None => {}
         }
         let g = lock(&self.inner);
@@ -2735,6 +3457,7 @@ impl KqBank {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => return d.slot_bytes,
             Some(ResidentBank::Mmap(m)) => return m.slot_bytes,
+            Some(ResidentBank::CudaDirect(c)) => return [c.slot_bytes, 0],
             None => {}
         }
         let g = lock(&self.inner);
@@ -2742,7 +3465,7 @@ impl KqBank {
         [one(&g.classes[0]), one(&g.classes[1])]
     }
 
-    /// Anonymous bank bytes held in RAM (0 for mmap clean file-backed pages).
+    /// Anonymous bank bytes held in RAM / VRAM (0 for mmap clean file-backed pages).
     pub fn nbytes(&self) -> u64 {
         match self.direct.get() {
             Some(ResidentBank::Direct(direct)) => {
@@ -2755,6 +3478,7 @@ impl KqBank {
                     .sum();
             }
             Some(ResidentBank::Mmap(_)) => return 0,
+            Some(ResidentBank::CudaDirect(c)) => return c.total_bytes,
             None => {}
         }
         lock(&self.inner)
@@ -2766,7 +3490,7 @@ impl KqBank {
             .sum()
     }
 
-    /// Anonymous bytes of every bank resident in RAM now (0 for mmap).
+    /// Anonymous bytes of every bank resident in RAM / VRAM now (0 for mmap).
     pub fn resident_bytes(&self) -> Result<u64> {
         match self.direct.get() {
             Some(ResidentBank::Direct(direct)) => {
@@ -2781,6 +3505,7 @@ impl KqBank {
                     .sum());
             }
             Some(ResidentBank::Mmap(_)) => return Ok(0),
+            Some(ResidentBank::CudaDirect(c)) => return Ok(c.total_bytes),
             None => {}
         }
         let g = lock(&self.inner);
@@ -2820,6 +3545,12 @@ impl KqBank {
                 return Ok(r);
             }
             Some(ResidentBank::Mmap(_)) => return Ok(Residency::default()),
+            Some(ResidentBank::CudaDirect(c)) => {
+                return Ok(Residency {
+                    resident: c.total_bytes,
+                    volatile: 0,
+                });
+            }
             None => {}
         }
         let g = lock(&self.inner);
@@ -2848,6 +3579,12 @@ impl KqBank {
         match self.direct.get() {
             Some(ResidentBank::Direct(_)) => return self.residency(),
             Some(ResidentBank::Mmap(_)) => return Ok(Residency::default()),
+            Some(ResidentBank::CudaDirect(c)) => {
+                return Ok(Residency {
+                    resident: c.total_bytes,
+                    volatile: 0,
+                });
+            }
             None => {}
         }
         let g = lock(&self.inner);
@@ -2880,7 +3617,7 @@ impl KqBank {
                 let _ = direct.wait_all();
                 return;
             }
-            Some(ResidentBank::Mmap(_)) => return,
+            Some(ResidentBank::Mmap(_) | ResidentBank::CudaDirect(_)) => return,
             None => {}
         }
         let g = lock(&self.inner);
@@ -2898,17 +3635,27 @@ impl KqBank {
     /// Per class index.
     pub fn stats(&self) -> [KqStats; 2] {
         let mut out = *lock(&self.stats);
-        let uses = match self.direct.get() {
-            Some(ResidentBank::Direct(d)) => Some(&d.uses),
-            Some(ResidentBank::Mmap(m)) => Some(&m.uses),
-            None => None,
-        };
-        if let Some(uses) = uses {
-            for (ci, s) in out.iter_mut().enumerate() {
-                let u = uses[ci].load(Ordering::Relaxed);
-                s.uses += u;
-                s.hits += u;
+        match self.direct.get() {
+            Some(ResidentBank::Direct(d)) => {
+                for (ci, s) in out.iter_mut().enumerate() {
+                    let u = d.uses[ci].load(Ordering::Relaxed);
+                    s.uses += u;
+                    s.hits += u;
+                }
             }
+            Some(ResidentBank::Mmap(m)) => {
+                for (ci, s) in out.iter_mut().enumerate() {
+                    let u = m.uses[ci].load(Ordering::Relaxed);
+                    s.uses += u;
+                    s.hits += u;
+                }
+            }
+            Some(ResidentBank::CudaDirect(c)) => {
+                let u = c.uses.load(Ordering::Relaxed);
+                out[0].uses += u;
+                out[0].hits += u;
+            }
+            None => {}
         }
         out
     }
@@ -2937,6 +3684,7 @@ impl KqBank {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => d.in_turn.load(Ordering::Acquire),
             Some(ResidentBank::Mmap(m)) => m.in_turn.load(Ordering::Acquire),
+            Some(ResidentBank::CudaDirect(c)) => c.in_turn.load(Ordering::Acquire),
             None => lock(&self.inner).in_turn,
         }
     }
@@ -2946,6 +3694,7 @@ impl KqBank {
         match self.direct.get() {
             Some(ResidentBank::Direct(d)) => d.in_turn.store(active, Ordering::Release),
             Some(ResidentBank::Mmap(m)) => m.set_in_turn(active),
+            Some(ResidentBank::CudaDirect(c)) => c.in_turn.store(active, Ordering::Release),
             None => lock(&self.inner).in_turn = active,
         }
     }
@@ -2960,6 +3709,10 @@ impl KqBank {
             }
             Some(ResidentBank::Mmap(mmap)) => {
                 mmap.set_in_turn(true);
+                return Ok(false);
+            }
+            Some(ResidentBank::CudaDirect(cuda)) => {
+                cuda.in_turn.store(true, Ordering::Release);
                 return Ok(false);
             }
             None => {}
@@ -3047,6 +3800,12 @@ impl KqBank {
                     crate::array::synchronize();
                     mmap.last_turn_end_ms
                         .store(mmap.elapsed_ms(), Ordering::Release);
+                }
+                return Ok(());
+            }
+            Some(ResidentBank::CudaDirect(cuda)) => {
+                if cuda.in_turn.swap(false, Ordering::AcqRel) {
+                    crate::array::synchronize();
                 }
                 return Ok(());
             }
@@ -3221,6 +3980,11 @@ impl KqBank {
             Some(ResidentBank::Mmap(_)) => {
                 return Err(bad("mmap expert bank does not support repacked prepare"));
             }
+            Some(ResidentBank::CudaDirect(_)) => {
+                return Err(bad(
+                    "CUDA direct expert bank does not support repacked prepare",
+                ));
+            }
             None => {}
         }
         let (ci, local) = self
@@ -3383,6 +4147,11 @@ impl KqBank {
             Some(ResidentBank::Mmap(_)) => {
                 return Err(bad(
                     "mmap expert bank does not support repacked prefill subgroups",
+                ));
+            }
+            Some(ResidentBank::CudaDirect(_)) => {
+                return Err(bad(
+                    "CUDA direct expert bank does not support repacked prefill subgroups",
                 ));
             }
             None => {}
@@ -3684,6 +4453,13 @@ impl KqBank {
                         p.layer
                     );
                 }
+                ResidentBank::CudaDirect(cuda) => {
+                    assert!(
+                        cuda.layers.get(p.layer).and_then(Option::as_ref).is_some(),
+                        "Hy4 expert bank: CUDA direct gather of unmapped layer {}",
+                        p.layer
+                    );
+                }
             }
             let stale = experts.iter().find_map(|&e| {
                 let s = p.slot(e)?;
@@ -3732,6 +4508,13 @@ impl KqBank {
                     assert!(
                         mmap.layer_to_idx.get(p.layer).copied().flatten().is_some(),
                         "Hy4 expert bank: mmap gather of unmapped layer {}",
+                        p.layer
+                    );
+                }
+                ResidentBank::CudaDirect(cuda) => {
+                    assert!(
+                        cuda.layers.get(p.layer).and_then(Option::as_ref).is_some(),
+                        "Hy4 expert bank: CUDA direct gather of unmapped layer {}",
                         p.layer
                     );
                 }

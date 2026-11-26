@@ -190,9 +190,17 @@ impl Own {
     }
 }
 
-/// Metal `max_recommended_working_set_size` (0 without Metal).
+/// Metal `max_recommended_working_set_size` (or CUDA total device bytes when
+/// running without Metal on a CUDA host; 0 otherwise).
 pub fn working_set() -> u64 {
-    crate::stream::WiredLimitContext::get_max_working_set_size() as u64
+    let metal = crate::stream::WiredLimitContext::get_max_working_set_size() as u64;
+    if metal > 0 {
+        return metal;
+    }
+    if crate::accelerator::host_has_cuda() {
+        return crate::accelerator::caps().total_device_bytes;
+    }
+    0
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

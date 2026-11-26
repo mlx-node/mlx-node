@@ -1067,6 +1067,56 @@ describe('Models page — the Install affordance', () => {
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).toBeNull();
   });
 
+  it('hides Hy4-flash SPARK on Windows with 128 GiB RAM + 24 GiB CUDA GPU and offers it on 102 GiB CUDA Spark', async () => {
+    const sparkRoutes = (gpu?: HostResponse['gpu']): Record<string, unknown> => {
+      const routes = catalogRoutes({});
+      const catalog = routes['/catalog'] as CatalogResponse;
+      const first = catalog.items[0]!;
+      const hy4Spark: CatalogItem = {
+        ...first,
+        label: 'Hy4-flash',
+        description: '512-expert MoE streamed from SSD',
+        minMemoryGb: 96,
+        platforms: ['darwin', 'win32', 'linux'],
+        builds: [
+          {
+            ...first.builds[0],
+            id: 'SPARK-4Bit',
+            hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+            slug: 'hy4-flash-gguf-spark-4bit',
+            sizeGb: 162.5,
+            minGpuMemoryGb: 96,
+          },
+        ],
+      };
+      routes['/catalog'] = { items: [...catalog.items, hy4Spark] };
+      routes['/host'] = {
+        totalMemBytes: 128 * 1024 ** 3,
+        diskFreeBytes: null,
+        platform: 'win32',
+        ...(gpu === undefined ? {} : { gpu }),
+      } satisfies HostResponse;
+      return routes;
+    };
+
+    await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      sparkRoutes({ backend: 'cuda', totalMemoryBytes: 24 * 1024 ** 3 }),
+      LABEL,
+    );
+    await settle();
+    expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf-spark-4bit"]')).toBeNull();
+    mounted!.unmount();
+    restoreApi?.();
+
+    await mount(
+      createElement(MemoryRouter, null, createElement(Models)),
+      sparkRoutes({ backend: 'cuda', totalMemoryBytes: 102 * 1024 ** 3 }),
+      'Hy4-flash',
+    );
+    expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf-spark-4bit"]')).not.toBeNull();
+  });
+
   it('offers a streamed model at its memory floor, with no weights-larger-than-memory note', async () => {
     const text = await mount(createElement(MemoryRouter, null, createElement(Models)), floorRoutes(96), 'Hy4-flash');
     expect(mounted!.container.querySelector('[data-model="hy4-flash-gguf"]')).not.toBeNull();
@@ -2328,11 +2378,11 @@ describe('Models page — the Install affordance', () => {
       mkdirSync(modelsDir);
       layout.plant(join(root, layout.slug));
       symlinkSync(join(root, layout.slug), join(modelsDir, layout.slug));
-      const catalog: CatalogResponse = { items: catalogWithState(modelsDir) };
+      const catalog: CatalogResponse = { items: catalogWithState(modelsDir, 'darwin') };
       const build = catalog.items.flatMap((item) => item.builds).find((candidate) => candidate.slug === layout.slug)!;
       restoreApi = stubApi({
         '/models': { ...discoverLocalModels(modelsDir), dir: modelsDir } satisfies ModelsResponse,
-        '/host': { totalMemBytes: 256 * 1024 ** 3, diskFreeBytes: null } satisfies HostResponse,
+        '/host': { totalMemBytes: 256 * 1024 ** 3, diskFreeBytes: null, platform: 'darwin' } satisfies HostResponse,
         '/catalog': catalog,
         '/catalog/updates': { items: [{ hfRepo: build.hfRepo, remoteRevision: 'b'.repeat(40) }] },
         '/downloads': { jobs: [] } satisfies DownloadsResponse,

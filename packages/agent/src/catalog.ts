@@ -12,6 +12,17 @@ import { INKLING2_DFLASH2, QWEN38_DFLASH2 } from '@mlx-node/lm/draft-companion';
 
 const GIB = 2 ** 30;
 
+/**
+ * Host GPU/accelerator capability slice used by catalog eligibility checks.
+ * Structurally compatible with `RuntimeCapabilities` from `@mlx-node/core` / `@mlx-node/lm`.
+ */
+export interface CatalogGpuInfo {
+  /** Active host backend: `'metal'`, `'cuda'`, or `'cpu'`. */
+  readonly backend: string;
+  /** Total usable device memory in bytes (or host RAM on CPU-only hosts). */
+  readonly totalMemoryBytes: number;
+}
+
 /** One downloadable build of a catalog model: a repository, the files it takes, and the folder it installs to. */
 export interface CatalogBuild {
   /**
@@ -73,6 +84,18 @@ export interface CatalogBuild {
    * entry never moves a folder.
    */
   folderSuffix?: string;
+  /**
+   * Platforms where this specific build is supported (absent means every platform supported by the entry).
+   * Non-matching platforms omit this build from {@link visibleCatalog}, {@link visibleSystemOneCatalog},
+   * {@link catalogTargets}, and {@link catalogSharesRepo}.
+   */
+  platforms?: readonly NodeJS.Platform[];
+  /**
+   * Minimum CUDA device memory in GiB required on non-macOS hosts.
+   * When set, non-darwin hosts offer this build only when the detected runtime backend is `'cuda'`
+   * with at least `minGpuMemoryGb * GIB` bytes of usable device memory (failing closed otherwise).
+   */
+  minGpuMemoryGb?: number;
 }
 
 export interface CatalogEntry {
@@ -264,19 +287,20 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
   {
     label: 'Hy4-flash',
     description: '512-expert MoE streamed from SSD, 256K context',
-    // The load admission accepts 39 GiB: its fixed bytes at its smallest
-    // settings (16K context, 2048-row chunk, MTP on, one staging layer) are
-    // 26.52 GiB, plus the 12 GiB reserve. The catalog offers it from 96 GiB.
+    // The load admission accepts 39 GiB on Metal (its fixed bytes at smallest
+    // settings are 26.52 GiB + 12 GiB reserve) and ~90 GiB on unified CUDA
+    // (SPARK-4Bit / SPARK-4Bit-Fast direct VRAM + SSD-streamed Q8_0 Engram).
+    // The catalog offers it from 96 GiB.
     minMemoryGb: 96,
-    platforms: ['darwin'],
+    platforms: ['darwin', 'win32', 'linux'],
     ggufFamily: 'hy_v4_flash',
     builds: [
       {
-        // Shard 2 is the Engram table, read by row from SSD; the routed experts
-        // stream from SSD too, so the weights may exceed RAM. The loader reads the
-        // embedded GGUF tokenizer, never the sidecar files. `*Q4_K_M*` would also
-        // take the two `Q4_K_M_MTP_Q8_0*` split sets, 306 GB of other builds. The
-        // load is text-only, so the repo's mmproj is not taken.
+        // macOS Metal: Shard 2 is the F8_E4M3 Engram table, read by row from SSD;
+        // the K-quant routed experts stream from SSD too, so the weights may exceed
+        // RAM. The loader reads the embedded GGUF tokenizer, never the sidecar files.
+        // `*Q4_K_M*` would also take the two `Q4_K_M_MTP_Q8_0*` split sets, 306 GB of
+        // other builds. The load is text-only, so the repo's mmproj is not taken.
         id: 'Q4_K_M',
         hfRepo: 'AngelSlim/Hy4-flash-GGUF',
         globs: ['Hy4-flash-Q4_K_M-*'],
@@ -284,6 +308,37 @@ export const MODEL_CATALOG: readonly CatalogEntry[] = [
         sizeGb: 168.3,
         source: 'AngelSlim GGUF',
         included: 'Streams from SSD',
+        platforms: ['darwin'],
+      },
+      {
+        // Windows/Linux CUDA (RTX Spark / DGX Spark): single-file GGUF with NVFP4
+        // routed experts, Q8_0 dense projections, and SSD-streamed Q8_0 Engram table.
+        id: 'SPARK-4Bit',
+        hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+        globs: ['Hy4-flash-SPARK-4Bit.gguf'],
+        assetsRepo: 'tencent/Hy4-flash',
+        sizeGb: 162.5,
+        source: 'AngelSlim GGUF',
+        note: 'NVFP4 experts · Q8_0 dense',
+        included: 'CUDA · Engram streams from SSD',
+        folderSuffix: 'spark-4bit',
+        platforms: ['win32', 'linux'],
+        minGpuMemoryGb: 96,
+      },
+      {
+        // Windows/Linux CUDA fast build: NVFP4 dense projections + NVFP4 routed
+        // experts, Q8_0 attention/indexer, and SSD-streamed Q8_0 Engram table.
+        id: 'SPARK-4Bit-Fast',
+        hfRepo: 'AngelSlim/Hy4-flash-GGUF',
+        globs: ['Hy4-flash-SPARK-4Bit-Fast.gguf'],
+        assetsRepo: 'tencent/Hy4-flash',
+        sizeGb: 159.6,
+        source: 'AngelSlim GGUF',
+        note: '2.9 GB smaller · NVFP4 dense + experts',
+        included: 'CUDA · Engram streams from SSD',
+        folderSuffix: 'spark-4bit-fast',
+        platforms: ['win32', 'linux'],
+        minGpuMemoryGb: 96,
       },
     ],
   },
@@ -492,12 +547,51 @@ export type CatalogTarget =
     }
   | { kind: 'draft'; slug: string; entry: CatalogEntry; repo: string };
 
-/** Whether `entry` is supported on `platform` ({@link CatalogEntry.platforms}; absent means every platform). */
+/** Whether `entry` or `build` is supported on `platform` (`platforms`; absent means every platform). */
 export function catalogSupportedOnPlatform(
   entry: Pick<CatalogEntry, 'platforms'>,
   platform: NodeJS.Platform = process.platform,
 ): boolean {
   return entry.platforms === undefined || entry.platforms.includes(platform);
+}
+
+/**
+ * Whether `build` is supported on a host with `platform` and optional `gpu` capabilities.
+ *
+ * On non-darwin platforms, a build declaring {@link CatalogBuild.minGpuMemoryGb} fails closed:
+ * it is supported only when `gpu` reports `backend === 'cuda'` with at least
+ * `minGpuMemoryGb * GIB` bytes of usable device memory.
+ */
+export function catalogBuildSupportedOnHost(
+  build: Pick<CatalogBuild, 'platforms' | 'minGpuMemoryGb'>,
+  platform: NodeJS.Platform = process.platform,
+  gpu?: CatalogGpuInfo,
+): boolean {
+  if (!catalogSupportedOnPlatform(build, platform)) return false;
+  if (build.minGpuMemoryGb !== undefined && platform !== 'darwin') {
+    return gpu?.backend === 'cuda' && gpu.totalMemoryBytes >= build.minGpuMemoryGb * GIB;
+  }
+  return true;
+}
+
+function filterEntryForPlatform(entry: CatalogEntry, platform: NodeJS.Platform): CatalogEntry | undefined {
+  if (!catalogSupportedOnPlatform(entry, platform)) return undefined;
+  const [first, ...rest] = entry.builds.filter((build) => catalogSupportedOnPlatform(build, platform));
+  if (first === undefined) return undefined;
+  const builds: readonly [CatalogBuild, ...CatalogBuild[]] = [first, ...rest];
+  return builds.length === entry.builds.length ? entry : { ...entry, builds };
+}
+
+function filterEntryForHost(
+  entry: CatalogEntry,
+  platform: NodeJS.Platform,
+  gpu?: CatalogGpuInfo,
+): CatalogEntry | undefined {
+  if (!catalogSupportedOnPlatform(entry, platform)) return undefined;
+  const [first, ...rest] = entry.builds.filter((build) => catalogBuildSupportedOnHost(build, platform, gpu));
+  if (first === undefined) return undefined;
+  const builds: readonly [CatalogBuild, ...CatalogBuild[]] = [first, ...rest];
+  return builds.length === entry.builds.length ? entry : { ...entry, builds };
 }
 
 /**
@@ -508,22 +602,29 @@ export function catalogSupportedOnPlatform(
 export function catalogTargets(platform: NodeJS.Platform = process.platform): CatalogTarget[] {
   const targets: CatalogTarget[] = [];
   for (const entry of MODEL_CATALOG) {
-    if (entry.hidden || !catalogSupportedOnPlatform(entry, platform)) continue;
-    for (const build of entry.builds) {
+    if (entry.hidden) continue;
+    const filtered = filterEntryForPlatform(entry, platform);
+    if (filtered === undefined) continue;
+    for (const build of filtered.builds) {
       const repo = catalogBuildRepo(build, platform);
       const own = repo === build.hfRepo;
       targets.push({
         kind: 'build',
         slug: catalogBuildSlug(build, platform),
-        entry,
+        entry: filtered,
         build,
         repo,
         ...(own && build.globs !== undefined ? { globs: build.globs } : {}),
         ...(own && build.assetsRepo !== undefined ? { assetsRepo: build.assetsRepo } : {}),
       });
     }
-    if (entry.draft !== undefined) {
-      targets.push({ kind: 'draft', slug: catalogDraftSlug(entry.draft), entry, repo: entry.draft.hfRepo });
+    if (filtered.draft !== undefined) {
+      targets.push({
+        kind: 'draft',
+        slug: catalogDraftSlug(filtered.draft),
+        entry: filtered,
+        repo: filtered.draft.hfRepo,
+      });
     }
   }
   return targets;
@@ -538,13 +639,18 @@ export function catalogTargetForSlug(
 }
 
 /**
- * Whether another build of the catalog, hidden entries included, installs the same repository as `build` on this
- * platform. Such a build's folder must name the build in its weight file to count as that build.
+ * Whether another build of the catalog supported on `platform`, hidden entries included, installs the same repository
+ * as `build` on this platform. Such a build's folder must name the build in its weight file to count as that build.
  */
 export function catalogSharesRepo(build: CatalogBuild, platform: NodeJS.Platform = process.platform): boolean {
   const repo = catalogBuildRepo(build, platform);
   return MODEL_CATALOG.some((entry) =>
-    entry.builds.some((other) => other !== build && catalogBuildRepo(other, platform) === repo),
+    entry.builds.some(
+      (other) =>
+        other !== build &&
+        catalogSupportedOnPlatform(other, platform) &&
+        catalogBuildRepo(other, platform) === repo,
+    ),
   );
 }
 
@@ -574,32 +680,34 @@ export function catalogFitsMemory(entry: Pick<CatalogEntry, 'minMemoryGb'>, tota
   return entry.minMemoryGb === undefined || totalMemBytes >= entry.minMemoryGb * GIB;
 }
 
-/** Catalog entries the wizard offers: visible chat entries supported on `platform` whose memory floor `totalMemBytes` meets. */
+/** Catalog entries the wizard offers: visible chat entries supported on this host whose memory and GPU floors are met. */
 export function visibleCatalog(
   totalMemBytes: number = totalmem(),
   platform: NodeJS.Platform = process.platform,
+  gpu?: CatalogGpuInfo,
 ): CatalogEntry[] {
-  return MODEL_CATALOG.filter(
-    (entry) =>
-      !entry.hidden &&
-      (entry.category ?? 'chat') === 'chat' &&
-      catalogSupportedOnPlatform(entry, platform) &&
-      catalogFitsMemory(entry, totalMemBytes),
-  );
+  const visible: CatalogEntry[] = [];
+  for (const entry of MODEL_CATALOG) {
+    if (entry.hidden || (entry.category ?? 'chat') !== 'chat' || !catalogFitsMemory(entry, totalMemBytes)) continue;
+    const filtered = filterEntryForHost(entry, platform, gpu);
+    if (filtered !== undefined) visible.push(filtered);
+  }
+  return visible;
 }
 
-/** Visible System One (Clairic / CLEF) catalog entries supported on `platform` whose memory floor `totalMemBytes` meets. */
+/** Visible System One (Clairic / CLEF) catalog entries supported on this host whose memory and GPU floors are met. */
 export function visibleSystemOneCatalog(
   totalMemBytes: number = totalmem(),
   platform: NodeJS.Platform = process.platform,
+  gpu?: CatalogGpuInfo,
 ): CatalogEntry[] {
-  return MODEL_CATALOG.filter(
-    (entry) =>
-      !entry.hidden &&
-      entry.category === 'systemone' &&
-      catalogSupportedOnPlatform(entry, platform) &&
-      catalogFitsMemory(entry, totalMemBytes),
-  );
+  const visible: CatalogEntry[] = [];
+  for (const entry of MODEL_CATALOG) {
+    if (entry.hidden || entry.category !== 'systemone' || !catalogFitsMemory(entry, totalMemBytes)) continue;
+    const filtered = filterEntryForHost(entry, platform, gpu);
+    if (filtered !== undefined) visible.push(filtered);
+  }
+  return visible;
 }
 
 /**

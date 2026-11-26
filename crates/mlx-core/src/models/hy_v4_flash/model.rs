@@ -236,10 +236,19 @@ enum LayerMark {
     },
 }
 
+enum ShortIndexMark {
+    Fast {
+        prev_len: usize,
+        prev_held: usize,
+        had_buf: bool,
+    },
+    Full(IndexerMark),
+}
+
 enum StepMark {
     Short {
         len: usize,
-        index: Vec<Option<IndexerMark>>,
+        index: Vec<Option<ShortIndexMark>>,
     },
     Full(Mark),
 }
@@ -318,6 +327,10 @@ impl Session {
         &self.layers
     }
 
+    pub(crate) fn layers_mut(&mut self) -> &mut [LayerState] {
+        &mut self.layers
+    }
+
     pub fn nbytes(&self) -> usize {
         self.layers.iter().map(LayerState::nbytes).sum::<usize>()
             + self.tokens.len() * std::mem::size_of::<u32>()
@@ -340,6 +353,9 @@ impl Session {
             .iter()
             .filter_map(|lm| match lm {
                 LayerMark::Window(Some(s)) => s.rows(),
+                LayerMark::Latent {
+                    index: Some(im), ..
+                } => im.tail().rows(),
                 _ => None,
             })
             .collect();
@@ -359,14 +375,46 @@ impl Session {
         }
     }
 
-    fn step_mark(&self, rows: usize) -> StepMark {
+    pub(crate) fn can_short_mark(&self, rows: usize) -> bool {
         if rows <= WINDOW_SLACK {
+            return true;
+        }
+        if rows > super::indexer::TAIL_ROLLBACK_SLACK {
+            return false;
+        }
+        self.layers.iter().all(|st| match &st.cache {
+            LayerCache::Window(r) => {
+                let kept_after = (r.kept() + rows).min(r.cap());
+                let left = kept_after.saturating_sub(rows);
+                left >= r.len().min(r.window())
+            }
+            LayerCache::Latent(_) => true,
+        })
+    }
+
+    fn step_mark(&self, rows: usize) -> StepMark {
+        if self.can_short_mark(rows) {
             StepMark::Short {
                 len: self.tokens.len(),
                 index: self
                     .layers
                     .iter()
-                    .map(|st| st.index.as_ref().map(IndexerState::mark))
+                    .map(|st| {
+                        st.index.as_ref().map(|ix| {
+                            let tail = ix.tail();
+                            let fast = (tail.is_empty() && rows <= tail.target_ring_cap())
+                                || (tail.ring_cap() > 0 && rows <= tail.rollback_slack());
+                            if fast {
+                                ShortIndexMark::Fast {
+                                    prev_len: tail.len(),
+                                    prev_held: tail.held(),
+                                    had_buf: tail.rows().is_some(),
+                                }
+                            } else {
+                                ShortIndexMark::Full(ix.mark())
+                            }
+                        })
+                    })
                     .collect(),
             }
         } else {
@@ -380,7 +428,20 @@ impl Session {
             StepMark::Short { len, index } => {
                 for (st, im) in self.layers.iter_mut().zip(index) {
                     if let (Some(ix), Some(saved)) = (st.index.as_mut(), im) {
-                        ix.restore(saved.clone())?;
+                        match saved {
+                            ShortIndexMark::Fast {
+                                prev_len,
+                                prev_held,
+                                had_buf,
+                            } => {
+                                if !*had_buf {
+                                    ix.reset_empty()?;
+                                } else {
+                                    ix.rollback_push(*prev_len, *prev_held)?;
+                                }
+                            }
+                            ShortIndexMark::Full(mark) => ix.restore(mark.clone())?,
+                        }
                     }
                 }
                 for st in &mut self.layers {
@@ -407,8 +468,8 @@ impl Session {
             .iter()
             .zip(&m.layers)
             .map(|(st, lm)| match (&st.cache, lm) {
-                (LayerCache::Window(_), LayerMark::Window(Some(saved))) => {
-                    WindowRing::from_snapshot(saved, WINDOW_SLACK).map(Some)
+                (LayerCache::Window(r), LayerMark::Window(Some(saved))) => {
+                    WindowRing::from_snapshot(saved, r.slack()).map(Some)
                 }
                 (LayerCache::Latent(_), LayerMark::Latent { .. }) => Ok(None),
                 _ => Err(bad("layer kinds changed during restore")),
@@ -494,7 +555,7 @@ impl Session {
         for (l, (st, part)) in self.layers.iter_mut().zip(layers).enumerate() {
             match (&mut st.cache, st.index.as_ref(), part) {
                 (LayerCache::Window(r), None, StateLayer::Window(s)) if s.len() == b => {
-                    *r = WindowRing::from_snapshot(s, WINDOW_SLACK)?;
+                    *r = WindowRing::from_snapshot(s, r.slack())?;
                 }
                 (LayerCache::Latent(_), Some(_), StateLayer::Tail(t)) if t.len() == b => {
                     indexed.push((l, t));
@@ -631,6 +692,7 @@ pub struct Model {
     /// The distinct banks the blocks gather from.
     banks: Vec<Arc<KqBank>>,
     engram_lookahead: Mutex<Option<EngramLookahead>>,
+    cuda_cache: Option<super::cuda_forward::CudaForwardCache>,
 }
 
 /// Refuses an empty call or one past the session's context.
@@ -680,22 +742,28 @@ impl Model {
         want_dims(weights.token_embd(), cfg.vocab_size, cfg.dim, "token_embd")?;
         want_dims(weights.output(), cfg.vocab_size, cfg.dim, "output")?;
         let mut banks: Vec<Arc<KqBank>> = Vec::new();
+        let mut expert_sources: Vec<Option<ExpertSource>> = Vec::with_capacity(layers.len());
+        for (l, lc) in cfg.layers.iter().enumerate().take(layers.len()) {
+            let src = if lc.dense_ffn {
+                None
+            } else {
+                Some(experts(l)?)
+            };
+            if let Some(ExpertSource::Bank(b)) = &src
+                && !banks.iter().any(|k| Arc::ptr_eq(k, b))
+            {
+                banks.push(Arc::clone(b));
+            }
+            expert_sources.push(src);
+        }
+        let source_refs: Vec<Option<&ExpertSource>> =
+            expert_sources.iter().map(Option::as_ref).collect();
+        let cuda_cache = super::cuda_forward::CudaForwardCache::build(&cfg, layers, &source_refs)?;
         let blocks = layers
             .iter()
+            .zip(expert_sources)
             .enumerate()
-            .map(|(l, w)| {
-                let src = if cfg.layers[l].dense_ffn {
-                    None
-                } else {
-                    Some(experts(l)?)
-                };
-                if let Some(ExpertSource::Bank(b)) = &src
-                    && !banks.iter().any(|k| Arc::ptr_eq(k, b))
-                {
-                    banks.push(Arc::clone(b));
-                }
-                Block::new(&cfg, l, w, src)
-            })
+            .map(|(l, (w, src))| Block::new(&cfg, l, w, src))
             .collect::<Result<Vec<_>>>()?;
         let hasher = Hasher::new(&cfg.engram)?;
         Ok(Self {
@@ -706,6 +774,7 @@ impl Model {
             table,
             banks,
             engram_lookahead: Mutex::new(None),
+            cuda_cache,
         })
     }
 
@@ -868,6 +937,35 @@ impl Model {
         &self.blocks
     }
 
+    pub(crate) fn cuda_cache(&self) -> Option<&super::cuda_forward::CudaForwardCache> {
+        self.cuda_cache.as_ref()
+    }
+
+    pub(crate) fn table(&self) -> &dyn EngramRows {
+        self.table.as_ref()
+    }
+
+    pub(crate) fn hasher(&self) -> &Hasher {
+        &self.hasher
+    }
+
+    pub(crate) fn banks(&self) -> &[Arc<KqBank>] {
+        &self.banks
+    }
+
+    pub(crate) fn take_engram_chunk_cuda(
+        &self,
+        start: usize,
+        ids: &[u32],
+        history: &[u32],
+    ) -> Option<(Vec<Vec<u32>>, Vec<Option<PrefetchHandle>>)> {
+        self.take_engram_chunk(start, ids, history)
+    }
+
+    pub(crate) fn prefetch_next_engram_layer_cuda(&self, e: usize) {
+        self.prefetch_next_engram_layer(e);
+    }
+
     pub fn bank_is_direct(&self) -> bool {
         !self.banks.is_empty() && self.banks.iter().all(|b| b.is_direct())
     }
@@ -957,14 +1055,30 @@ impl Model {
             .iter()
             .map(|o| o.sess.step_mark(o.ids.len()))
             .collect();
-        let out = self.wave(
-            &mut FlatOwners {
-                owners: &mut *owners,
-            },
-            &wave,
-            cancel,
-            trace,
-        );
+        let use_cuda_fast = owners.len() == 1
+            && trace.is_none()
+            && self.cuda_cache.is_some()
+            && super::cuda_forward::cuda_fast_enabled()
+            && owners[0].ids.len() <= 65_535
+            && owners[0]
+                .ids
+                .len()
+                .saturating_mul(self.cfg.moe.n_used.max(1))
+                <= 262_144;
+        let out = if use_cuda_fast {
+            let o = &mut owners[0];
+            super::cuda_forward::forward_trunk_cuda(self, o.sess, o.ids, kind, o.want, cancel)
+                .map(|single| vec![single])
+        } else {
+            self.wave(
+                &mut FlatOwners {
+                    owners: &mut *owners,
+                },
+                &wave,
+                cancel,
+                trace,
+            )
+        };
         match &out {
             Ok(_) => {
                 for o in owners.iter_mut() {
