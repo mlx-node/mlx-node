@@ -17,6 +17,7 @@ import Cache from '../pages/cache';
 import Chat from '../pages/chat';
 import CodingAgents from '../pages/coding-agents';
 import Engine from '../pages/engine';
+import Fonts from '../pages/fonts';
 import Metrics from '../pages/metrics';
 import Models from '../pages/models';
 import Overview from '../pages/overview';
@@ -39,7 +40,8 @@ export interface AppRoute {
     | 'cache'
     | 'models'
     | 'coding-agents'
-    | 'providers';
+    | 'providers'
+    | 'fonts';
   path: string;
   label: string;
   /** Present on nav items only. */
@@ -71,6 +73,7 @@ export const APP_ROUTES: readonly AppRoute[] = [
     element: CodingAgents,
   },
   { id: 'providers', path: '/providers', label: 'Web Search', icon: Globe, section: 'manage', element: Providers },
+  { id: 'fonts', path: '/fonts', label: 'Fonts', element: Fonts },
 ];
 
 export const NAV_SECTIONS: ReadonlyArray<{ id: NavSection; label: string | null }> = [

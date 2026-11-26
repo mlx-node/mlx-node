@@ -279,7 +279,7 @@ const runtime = createDashboardRuntime({ modelsDir, dbPath });
 
 ## Pages
 
-Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; all ten sit in the `⌘K` command palette); one route table
+Thirteen routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; all ten sit in the `⌘K` command palette); one route table
 (`ui/src/shell/routes.tsx`) feeds the router, the sidebar, the breadcrumb, the hotkeys and the palette.
 
 | Key       | Goes to                                                                       |
@@ -304,6 +304,7 @@ Twelve routes. Ten sit in the sidebar (`⌘1`…`⌘9` jump to the first nine; a
 | `/models`        | Models         | Local models table (also the legend of the disk-use bar), usage per model over 30 days, recommended catalog with installs; `?focus=` opens a model's drawer                                                                                                                                                                            | `/models`, `/catalog`, `/catalog/updates`, `/downloads`, `/metrics/summary`, `/metrics/timeseries`           |
 | `/coding-agents` | Coding Agents  | The model and command the coding agents will use, per-agent setup with the instruction block it adds                                                                                                                                                                                                                                   | `/coding-agents`                                                                                             |
 | `/providers`     | Web Search     | "Now" summary of what Chat and Work get; the search provider choice (one of the configured Exa, DeepSeek, Brave, or Off) and the crawler choice (Firecrawl or Off), with the skills each installs; one key card per provider (save, check, replace, remove; the key is never shown after entry)                                        | `/providers`                                                                                                 |
+| `/fonts`         | Fonts          | Font and text size for reading text, code and the interface; opened from the gear or ⌘K                                                                                                                                                                                                                                                | `localStorage`, `queryLocalFonts()`                                                                          |
 | `/welcome`       | Onboarding     | First run: pick and download a model, then set up coding agents. Outside the shell; `/` sends here while the model library is empty                                                                                                                                                                                                    | `/models`, `/catalog`, `/downloads`, `/coding-agents`                                                        |
 
 A models folder that is a link to a missing target (a folder on a disk that is not connected) is not an empty
@@ -854,6 +855,31 @@ file by removing its name first, so it never writes through to the user's file (
 Not supported: copying or moving weights into the models folder, an older version of a file or a renamed file (only
 the current catalog file passes, unless the folder has this app's install record), picking a single file, a search
 deeper than the direct child folders, models that are not in the catalog, and updating a located model in place.
+
+### Fonts
+
+`/fonts` sets a font and a size for three roles. It has no sidebar item: the gear popover's **Fonts** block and `⌘K`
+**Fonts** open it. **Reset fonts** in its header, or in `⌘K` on any page (with the toast "Fonts reset"), puts back
+the defaults. Every change applies at once to every window, with no Save.
+
+| Role         | Default                 | Size        | Covers                                                                                                                                         |
+| ------------ | ----------------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Reading text | Inter                   | 11 to 24 px | Answers in Chat, Work and Sessions, your messages, reasoning, the message box; headings and inline code follow in `em`                         |
+| Code         | Geist Mono              | 10 to 20 px | Code blocks, diffs, tool input and output, the exact command in a permission card, the System One editors; other mono text takes the font only |
+| Interface    | Inter, Geist for titles | 12 to 15 px | Everything else: the nine text tokens scale by n/13; boxes, icons and spacing do not                                                           |
+
+- Interface size is text only. `⌘+` `⌘−` `⌘0` still zoom the whole window, these sizes included.
+- The font lists hold the built-in fonts, **System font** (`system-ui`; not for code) and the installed families from
+  `queryLocalFonts()`, read while the page is visible. A canvas pass keeps families that draw Latin text for reading
+  and interface, and fixed-width ones for code. A stored font that is not installed stays stored and shows as
+  "(not installed)"; text falls back to the role's built-in font.
+- The values live in `localStorage` (`mlx-node:fonts:v1`) and are written on `<html>` before the first frame; with
+  nothing stored nothing is written. The page draws its own labels and controls in the stock interface font and size,
+  so a symbol font can always be undone there.
+- The two boot screens ("Starting Portato…", "Opening your workspace…") use one fixed `system-ui` font that no
+  setting reaches.
+- MAIN sets no permission handler, so Electron grants `local-fonts`. A handler added later must allow `local-fonts`,
+  or the list comes back empty with no error (`packages/desktop/__test__/permission-guard.test.ts`).
 
 ## Chat and Work
 
@@ -2752,15 +2778,16 @@ A process is `running` while its heartbeat is at most three intervals plus 1.5 s
 
 One design system: Arc (`uiarc.dev`) in a desktop density.
 
-| Folder / file                       | Holds                                                                                                                                                                                                                                |
-| ----------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ui/src/components/arc/`            | Vendored Arc **free** components (MIT), copied by hand. `PROVENANCE.md` lists each file, its source and every local change; `LICENSE` beside it. Excluded from our format and lint                                                   |
-| `ui/src/components/arc-x/`          | Own components, written from scratch on Arc tokens: surfaces, tables, the chart kit, number and motion parts, transcript parts. A folder holds `<name>.tsx` and, when it has styles, `<name>.module.css`                             |
-| `ui/src/components/arc-x/wait-orb/` | The one exception in `arc-x/`: `engine.ts` holds orb geometry derived from the MIT package `thinking-orbs` 0.3.2, with its `LICENSE` and a `PROVENANCE.md` that lists every local change. The component and its painter are own code |
-| `ui/src/styles/tokens.css`          | Density and own tokens on top of Arc `foundation.css`: controls 28 / 32 / 40 px, radii 10 / 14 / 20 px, type 11–32 px, 8 model colors, data and phase colors, durations, staggers                                                    |
-| `ui/src/styles/tailwind-theme.css`  | A locked Tailwind theme: layout and text utilities only, no palette. Pages use Tailwind for layout; `arc-x/` and `shell/` use CSS modules only                                                                                       |
-| `ui/src/styles/fonts.css`           | Inter, Geist and Geist Mono (variable, latin + latin-ext): six bundled `woff2` files, no network                                                                                                                                     |
-| `ui/src/theme/theme.ts`             | `data-theme` on `<html>`: preference `system` / `light` / `dark` in `localStorage`                                                                                                                                                   |
+| Folder / file                       | Holds                                                                                                                                                                                                                                                                                                 |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ui/src/components/arc/`            | Vendored Arc **free** components (MIT), copied by hand. `PROVENANCE.md` lists each file, its source and every local change; `LICENSE` beside it. Excluded from our format and lint                                                                                                                    |
+| `ui/src/components/arc-x/`          | Own components, written from scratch on Arc tokens: surfaces, tables, the chart kit, number and motion parts, transcript parts. A folder holds `<name>.tsx` and, when it has styles, `<name>.module.css`                                                                                              |
+| `ui/src/components/arc-x/wait-orb/` | The one exception in `arc-x/`: `engine.ts` holds orb geometry derived from the MIT package `thinking-orbs` 0.3.2, with its `LICENSE` and a `PROVENANCE.md` that lists every local change. The component and its painter are own code                                                                  |
+| `ui/src/styles/tokens.css`          | Density and own tokens on top of Arc `foundation.css`: controls 28 / 32 / 40 px, radii 10 / 14 / 20 px, type 11–32 px, 8 model colors, data and phase colors, durations, staggers. The font settings' tokens: `--font-reading`, `--text-reading`, `--tracking-reading`, `--text-mono`, `--text-field` |
+| `ui/src/styles/tailwind-theme.css`  | A locked Tailwind theme: layout and text utilities only, no palette. Pages use Tailwind for layout; `arc-x/` and `shell/` use CSS modules only                                                                                                                                                        |
+| `ui/src/styles/fonts.css`           | Inter, Geist and Geist Mono (variable, latin + latin-ext): six bundled `woff2` files, no network. Installed fonts are listed with `queryLocalFonts()`; none is bundled                                                                                                                                |
+| `ui/src/theme/theme.ts`             | `data-theme` on `<html>`: preference `system` / `light` / `dark` in `localStorage`                                                                                                                                                                                                                    |
+| `ui/src/theme/fonts.ts`             | The font settings: reading text, code and the interface, a family and a size each, in `localStorage` (`mlx-node:fonts:v1`); the non-default ones are custom properties on `<html>`                                                                                                                    |
 
 Rules the tests hold (`__test__/style-rules.test.ts`, `no-regex.test.ts`, `tokens.test.ts`):
 

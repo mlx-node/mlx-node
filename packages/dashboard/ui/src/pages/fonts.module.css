@@ -1,0 +1,139 @@
+/* The page's own type: the stock interface tokens are set inline on this root, and these lines resolve them here. */
+.zone {
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-body);
+}
+
+/* aria-disabled keeps focus on the button after a reset; Arc dims only :disabled, so it looks off by hand, over Arc's
+   hover at any stylesheet order. */
+.reset.reset[aria-disabled='true'],
+.reset.reset[aria-disabled='true']:hover,
+.reset.reset[aria-disabled='true']:active {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  box-shadow: none;
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.group {
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-surface);
+  background: var(--surface);
+  color: var(--foreground);
+}
+
+.groupHead {
+  display: grid;
+  gap: var(--space-0-5);
+  padding: var(--space-4) var(--space-5);
+}
+
+.groupTitle {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.groupDescription {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.row {
+  --row-control: var(--control-height-md);
+  display: grid;
+  align-items: start;
+  gap: var(--space-2) var(--space-4);
+  border-top: 1px solid var(--border-subtle);
+  padding: var(--space-3) var(--space-5);
+  grid-template-columns: 10rem minmax(0, 1fr);
+}
+
+.row[data-row='size'] {
+  --row-control: var(--control-height-sm);
+}
+
+.row[data-row='sample'] {
+  padding-block: var(--space-4);
+}
+
+.rowLabel {
+  display: flex;
+  min-height: var(--row-control);
+  align-items: center;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.row[data-row='sample'] .rowLabel {
+  min-height: 0;
+}
+
+.rowControl {
+  min-width: 0;
+}
+
+.font {
+  max-width: 20rem;
+}
+
+/* The size field's label row holds only the visually hidden label, so its gap would leave an empty line. */
+.size > div > div:first-child {
+  margin-bottom: 0;
+}
+
+/* The notes under the fields: the parts draw them in --text-muted, under 4.5:1 on the light surface at this size. */
+.font > div > span,
+.size > div > span > span {
+  color: var(--text-secondary);
+}
+
+.uiSample {
+  display: grid;
+  gap: var(--space-1);
+  font-family: var(--font-body);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-body);
+}
+
+.uiSampleTitle {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 500;
+  letter-spacing: var(--tracking-display);
+  line-height: 1.3;
+}
+
+.uiSampleLine {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+}
+
+.uiSampleTime {
+  color: var(--text-muted);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+@container page (max-width: 559px) {
+  .row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .rowLabel,
+  .row[data-row='size'] .rowLabel {
+    min-height: 0;
+  }
+
+  .font {
+    max-width: none;
+  }
+}

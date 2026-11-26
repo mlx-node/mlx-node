@@ -17,11 +17,13 @@ import { motionX } from '../components/arc-x/motion/motion';
 import { useStaticMotion } from '../components/arc-x/motion/use-static-motion';
 import { mutate } from '../lib/api';
 import { errMessage } from '../lib/errors';
+import { FONTS } from '../lib/fonts-strings';
 import { ensureModelColors } from '../lib/model-colors';
 import { toast } from '../lib/toast';
 import type { MetricsModels, ModelsResponse } from '../lib/types';
 import { reloadMountedQueries, useJson } from '../lib/use-api';
 import { storedMode } from '../pages/chat/drafts';
+import { resetFonts } from '../theme/fonts';
 import { useTheme } from '../theme/theme';
 import styles from './app-shell.module.css';
 import { CommandMenu } from './command-menu';
@@ -43,6 +45,11 @@ const EXPANDED_WIDTH_PX = 208;
 const RAIL_WIDTH_PX = 52;
 
 type SidebarPreference = 'expanded' | 'rail';
+
+function resetFontsWithToast(): void {
+  resetFonts();
+  toast.success(FONTS.resetDone);
+}
 
 function readSidebarPreference(): SidebarPreference {
   try {
@@ -180,6 +187,7 @@ export function AppShell(): ReactElement {
         theme: theme.preference,
         setTheme: theme.setPreference,
         resetColors: resetColorsWithToast,
+        resetFonts: resetFontsWithToast,
       }),
     [navigate, refresh, narrow, toggleSidebar, theme.preference, theme.setPreference],
   );

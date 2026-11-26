@@ -10,8 +10,10 @@ import {
   PaletteIcon,
   PanelLeft,
   RefreshCw,
+  RotateCcw,
   SquareTerminal,
   Sun,
+  Type,
 } from 'lucide-react';
 import { createElement, type ReactNode, useEffect, useSyncExternalStore } from 'react';
 
@@ -19,6 +21,7 @@ import type { CommandItem } from '../components/arc/command-palette/command-pale
 import { CHAT } from '../lib/chat-strings';
 import { chatTitle } from '../lib/chat-turns';
 import type { ChatHostState, ConversationRow } from '../lib/chat-types';
+import { FONTS } from '../lib/fonts-strings';
 import { formatBytes, formatRelativeTime } from '../lib/format';
 import { tildePath } from '../lib/paths';
 import { isoMs, sessionTitle } from '../lib/sessions';
@@ -80,6 +83,7 @@ export interface GlobalCommandDeps {
   theme: ThemePreference;
   setTheme: (preference: ThemePreference) => void;
   resetColors: () => void;
+  resetFonts: () => void;
 }
 
 const THEMES: ReadonlyArray<{ value: ThemePreference; label: string }> = [
@@ -110,6 +114,15 @@ export function globalCommands(deps: GlobalCommandDeps): AppCommand[] {
     keywords: ['onboarding', 'welcome', 'download'],
     icon: glyph(Download),
     run: () => deps.navigate('/welcome'),
+  });
+  goTo.push({
+    id: 'go:fonts',
+    label: FONTS.goTo.label,
+    description: FONTS.goTo.description,
+    group: 'Go to',
+    keywords: [...FONTS.goTo.keywords],
+    icon: glyph(Type),
+    run: () => deps.navigate('/fonts'),
   });
   const actions: AppCommand[] = [
     {
@@ -170,6 +183,15 @@ export function globalCommands(deps: GlobalCommandDeps): AppCommand[] {
     keywords: ['palette'],
     icon: glyph(PaletteIcon),
     run: () => deps.resetColors(),
+  });
+  actions.push({
+    id: 'act:reset-fonts',
+    label: FONTS.resetAction.label,
+    description: FONTS.resetAction.description,
+    group: 'Actions',
+    keywords: [...FONTS.resetAction.keywords],
+    icon: glyph(RotateCcw),
+    run: () => deps.resetFonts(),
   });
   return [...goTo, ...actions];
 }

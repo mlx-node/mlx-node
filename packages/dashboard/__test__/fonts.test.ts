@@ -293,4 +293,10 @@ describe('font settings, stylesheets', () => {
       cssValue(cssRules('components/arc-x/secret-field/secret-field.module.css'), '.input[data-shown]', 'font-size'),
     ).toBe('var(--text-mono)');
   });
+
+  it('the title-bar search box grows with the interface text, 220 px at 13', () => {
+    expect(cssValue(cssRules('shell/app-shell.module.css'), '.search', 'width')).toBe(
+      'calc(var(--text-sm) * 220 / 13)',
+    );
+  });
 });
