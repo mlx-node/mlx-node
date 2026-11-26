@@ -12,7 +12,13 @@ Every file in this folder is copied from Arc, the free (MIT) component library.
 Files are copied by hand (no CLI) to the paths the registry names under `components/arc/`. Imports between items stay
 relative, as shipped. Formatting and linting skip this folder so every file stays diffable against upstream.
 
-## Vendored items (25)
+`combobox` and `number-field` were added on 2026-11-27 with the shadcn CLI 4.23.1 in a scratch project
+(`shadcn add https://uiarc.dev/r/combobox.json https://uiarc.dev/r/number-field.json`, the command the Arc MCP tool
+`get_install_command` gives) and copied from there. That CLI writes `number-field.module.css` without the two comment
+lines the registry file starts with. It also wrote newer `motion-tokens.ts` and `lib/motion-tokens.ts` (shorter durations
+and springs); those were not taken, the copies here stay as fetched on 2026-11-10.
+
+## Vendored items (27)
 
 | Item | Files |
 |---|---|
@@ -41,13 +47,16 @@ relative, as shipped. Formatting and linting skip this folder so every file stay
 | text-shimmer | `text-shimmer/text-shimmer.tsx`, `text-shimmer/text-shimmer.module.css` |
 | expandable-text | `expandable-text/expandable-text.tsx`, `expandable-text/expandable-text.module.css` |
 | switch | `switch/switch.tsx`, `switch/switch.module.css` (dependency `@radix-ui/react-switch` 1.4.1) |
+| combobox | `combobox/combobox.tsx`, `combobox/combobox.module.css` |
+| number-field | `number-field/number-field.tsx`, `number-field/number-field.module.css` |
 
 ## Local changes
 
 Every `.ts` / `.tsx` file that shipped with a first line `"use client";` has that line removed (the bundler warns on
 module-level directives): `lib/arc-provider.tsx`, `lib/use-copy-feedback.ts`, and the `.tsx` file of every item above
 except `arc-foundation` and `arc-motion-tokens`. No other file changed except the regex replacements below
-(this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`) and the one
+(this app commits no regex; the replacements are hand-written scanners in `ui/src/lib/text-scan.ts`, or a plain
+list where the pattern matched four fixed key names) and the one
 `drawer/drawer.tsx` fix in the last rows of the table.
 
 | File | Line (here) | Upstream | Here |
@@ -62,6 +71,15 @@ except `arc-foundation` and `arc-motion-tokens`. No other file changed except th
 | `command-palette/command-palette.tsx` | 32 | `/[\p{L}\p{N}]/u.test(text.charAt(start - 1))` | `isWordChar(text.charAt(start - 1))` |
 | `command-palette/command-palette.tsx` | 59 | `query.trim().toLowerCase().split(/\s+/).filter(Boolean)` | `splitWhitespace(query.trim().toLowerCase())` |
 | `command-palette/command-palette.tsx` | 91 | `shortcut.split(/\s+\|\+(?=.)/).filter(Boolean)` | `splitShortcut(shortcut)` |
+| `number-field/number-field.tsx` | 7 | — | `import { hasAsciiDigit, keepDigitsAnd } from "../../../lib/text-scan";` |
+| `number-field/number-field.tsx` | — | line 63: `const escape = (text: string) => text.replace(/[.*+?^${}()\|[\]\\-]/g, "\\$&");` | removed: `keepDigitsAnd` takes its characters as they are, so nothing needs escaping |
+| `number-field/number-field.tsx` | 138 | `const digits = word?.replace(/[^\d.-]/g, "");` | `const digits = word === undefined ? undefined : keepDigitsAnd(word, ".-");` |
+| `number-field/number-field.tsx` | 138 | `return digits && /\d/.test(digits) && …` | `return digits && hasAsciiDigit(digits) && …` |
+| `number-field/number-field.tsx` | 287 | `….replace(symbols.decimal, ".").replace(/[^\d.-]/g, "");` | `keepDigitsAnd(….replace(symbols.decimal, "."), ".-");` |
+| `number-field/number-field.tsx` | 288 | `if (!/\d/.test(normalized)) return null;` | `if (!hasAsciiDigit(normalized)) return null;` |
+| `number-field/number-field.tsx` | 400 | ``const allowed = new RegExp(`[^0-9${escape(symbols.group)}${decimals \|\| maxFraction ? escape(symbols.decimal) : ""}${min < 0 ? "\\-" : ""}]`, "g");`` | ``const allowed = `${symbols.group}${decimals \|\| maxFraction ? symbols.decimal : ""}${min < 0 ? "-" : ""}`;`` |
+| `number-field/number-field.tsx` | 401 | `const next = text.replace(allowed, "");` | `const next = keepDigitsAnd(text, allowed);` |
+| `number-field/number-field.tsx` | 468 | `if (/^(Arrow(Up\|Down)\|Page(Up\|Down))$/.test(event.key)) stopHold();` | `if (["ArrowUp", "ArrowDown", "PageUp", "PageDown"].includes(event.key)) stopHold();` |
 | `drawer/drawer.tsx` | 97 | — | the comment line above the `offset` value |
 | `drawer/drawer.tsx` | 98 | `const offset = useMotionValue<number \| string>(0);` (four lines higher, above `pan`) | ``const offset = useMotionValue<number \| string>(reduced ? 0 : `${sign * 100}%`);`` |
 
