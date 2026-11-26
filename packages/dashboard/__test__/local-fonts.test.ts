@@ -58,7 +58,7 @@ function labels(list: LocalFontList, role: 'reading' | 'code' | 'ui', stored: Pa
 }
 
 describe('local fonts', () => {
-  it('L1: merges the faces of one family and sorts names A to Z without case', () => {
+  it('merges the faces of one family and sorts names A to Z without case', () => {
     expect(
       familiesOf([{ family: 'Helvetica Neue' }, { family: 'Helvetica Neue' }, { family: 'Helvetica Neue' }]),
     ).toEqual(['Helvetica Neue']);
@@ -67,7 +67,7 @@ describe('local fonts', () => {
     ).toEqual(['apple braille', 'Avenir Next', 'Menlo', 'Zapfino']);
   });
 
-  it('L2: offers no family whose two fallback widths differ', () => {
+  it('offers no family whose two fallback widths differ', () => {
     expect(classifyFamily('Noto Sans Arabic', measure)).toEqual({ latin: false, fixed: false });
     const list = readyList();
     for (const role of ['reading', 'code', 'ui'] as const) {
@@ -75,7 +75,7 @@ describe('local fonts', () => {
     }
   });
 
-  it('L3: puts a proportional family in Reading and not in Code', () => {
+  it('puts a proportional family in Reading and not in Code', () => {
     expect(classifyFamily('Helvetica Neue', measure)).toEqual({ latin: true, fixed: false });
     const list = readyList();
     expect(labels(list, 'reading', 'default')).toContain('Helvetica Neue');
@@ -83,12 +83,12 @@ describe('local fonts', () => {
     expect(labels(list, 'code', 'default')).toContain('Menlo');
   });
 
-  it('L4: needs both pairs to match before a family is fixed width', () => {
+  it('needs both pairs to match before a family is fixed width', () => {
     expect(classifyFamily('Half Mono', measure)).toEqual({ latin: true, fixed: false });
     expect(labels(readyList(), 'code', 'default')).not.toContain('Half Mono');
   });
 
-  it('L5: offers neither System font nor Geist for code', () => {
+  it('offers neither System font nor Geist for code', () => {
     const code = fontOptions('code', readyList(), 'default');
     expect(code.map((option) => option.value)).not.toContain('system');
     expect(code.map((option) => option.value)).not.toContain('name:Geist Variable');
@@ -98,7 +98,7 @@ describe('local fonts', () => {
     expect(labels(readyList(), 'reading', 'default').slice(0, 3)).toEqual(['Inter (default)', 'Geist', 'System font']);
   });
 
-  it('L6: keeps a missing stored font in the field, and calls nothing missing while the list loads', () => {
+  it('keeps a missing stored font in the field, and calls nothing missing while the list loads', () => {
     const ready = readyList();
     expect(fontOptions('code', ready, 'name:Fira Code')).toContainEqual({
       value: 'name:Fira Code',
@@ -112,7 +112,7 @@ describe('local fonts', () => {
     expect(missingFamily('name:Fira Code', LOADING)).toBeNull();
   });
 
-  it('L7: never calls a built-in or an installed font missing', () => {
+  it('never calls a built-in or an installed font missing', () => {
     const ready = readyList();
     expect(missingFamily('name:Geist Variable', ready)).toBeNull();
     for (const role of ['reading', 'code', 'ui'] as const) {
@@ -129,7 +129,7 @@ describe('local fonts', () => {
     });
   });
 
-  it('L8: reads an empty or failed list as not available', () => {
+  it('reads an empty or failed list as not available', () => {
     expect(localFontList([], new Map())).toEqual({ status: 'unavailable' });
     expect(localFontList(null, new Map())).toEqual({ status: 'unavailable' });
     expect(readyList().status).toBe('ready');
