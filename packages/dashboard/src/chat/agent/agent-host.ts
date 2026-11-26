@@ -2215,10 +2215,11 @@ export class AgentHost {
    * rewind that puts files back first asks for the dry run again: the agent's commit overwrites every file it finds
    * changed, so one that changed since the plan without the plan showing it so ends it `changed`. A rewind that removes
    * conversation then stops the removed part's commands and monitors (`teardown`: no wake) and deletes its schedules;
-   * one that fails refuses the rewind. A file of the dry run the commit did not put back ends it `partial`. The dry run
-   * and the commit have no deadline and are never killed by the host: a kill mid-restore leaves the files half put
-   * back. The op holds the session until the reply or the agent's exit. Throws `conversation-busy` while a turn, engine
-   * work or another op is live, and `engine-lost` while the engine restarted under commands or monitors.
+   * one that fails refuses the rewind. One that does both and stopped anything asks for the dry run once more after the
+   * stops, as the stopped work ran until then. A file of the dry run the commit did not put back ends it `partial`.
+   * The dry run and the commit have no deadline and are never killed by the host: a kill mid-restore leaves the files
+   * half put back. The op holds the session until the reply or the agent's exit. Throws `conversation-busy` while a
+   * turn, engine work or another op is live, and `engine-lost` while the engine restarted under commands or monitors.
    */
   rewind(sessionId: string, load: LoadInput, input: RewindInput): { done: Promise<RewindHostEnd> } {
     if (this.closed) throw new AgentHostError('agent-crashed');
@@ -3430,19 +3431,23 @@ export class AgentHost {
             null,
           ),
         );
-      let restores: string[] = [];
-      if (input.mode !== 'conversation') {
+      const shown = new Map(input.files.map((file) => [file.path, file.state]));
+      const checkFiles = async (): Promise<RewindHostEnd | string[]> => {
         const check = await execute(false);
         if (check === null || (check.error && check.files.every((file) => file.state === 'clean'))) {
           return { outcome: 'refused' };
         }
-        const shown = new Map(input.files.map((file) => [file.path, file.state]));
         const changed = check.files.some((file) => {
           const was = shown.get(file.path);
           return was === undefined || (was === 'clean' && file.state !== 'clean');
         });
-        if (changed) return { outcome: 'changed' };
-        restores = check.files.map((file) => file.path);
+        return changed ? { outcome: 'changed' } : check.files.map((file) => file.path);
+      };
+      let restores: string[] = [];
+      if (input.mode !== 'conversation') {
+        const check = await checkFiles();
+        if (!Array.isArray(check)) return check;
+        restores = check;
       }
       if (input.mode !== 'files') {
         const ends = await Promise.all([
@@ -3451,6 +3456,12 @@ export class AgentHost {
           ...input.runs.map((runId) => this.stopRunAs(session.id, runId, 'you')),
         ]);
         if (ends.includes('failed')) return { outcome: 'tasks' };
+        // The work being stopped runs until its stop and can write a file the last check found clean.
+        if (input.mode === 'all' && ends.length > 0) {
+          const check = await checkFiles();
+          if (!Array.isArray(check)) return check;
+          restores = check;
+        }
       }
       op.sent = true;
       const reply = await execute(true);

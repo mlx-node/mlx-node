@@ -1182,8 +1182,10 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   ("A background command could not be stopped. Stop it in Activity, then rewind."). A rewind that puts files back
   (`all`, `files`) first sends the dry run again (`force: false`, its own `mode`): the agent's commit overwrites every
   file it finds changed outside it, so a file the plan showed clean (or did not show) that changed since ends the
-  rewind `changed` with nothing rewound, nothing stopped and nothing sent with `force: true`; the page asks the plan
-  again and the dialog says "A file changed after the last check. Look at the files again." over the new list (it
+  rewind `changed` with nothing rewound, nothing stopped and nothing sent with `force: true`. An `all` rewind that
+  stops anything sends the dry run once more after the stops, as the stopped work ran until its stop: a file that
+  changed during them ends it `changed` there, with that work stopped and nothing rewound. Either way the page asks
+  the plan again and the dialog says "A file changed after the last check. Look at the files again." over the new list (it
   opens on Conversation only, as for any conflict). Then it sends
   `_x.ai/rewind/execute {sessionId, targetPromptIndex, force: true, mode}` (`all`, `conversation_only`, `files_only`; both always sent, as an absent `mode` is the agent's `all`) with no deadline and
   never kills the agent for it (mlx-agent v0.3.4 `extensions/rewind.rs`: a bare `RewindResponse`; the agent writes a

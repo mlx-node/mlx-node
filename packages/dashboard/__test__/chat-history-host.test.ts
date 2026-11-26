@@ -831,6 +831,63 @@ describe('Rewind on the host: the removed part’s background work (C13)', () =>
     );
   }, 30_000);
 
+  // Mutation: drop the dry run after the stops → force true goes and the rewind ends `done`.
+  it('a file that changes while the removed part’s work stops ends it `changed` after the stops', async () => {
+    const hold = gate();
+    const changedFile = gate();
+    const edit = {
+      toolName: 'search_replace',
+      file_path: 'src/a.ts',
+      before: 'a1\n',
+      old_string: 'a1',
+      new_string: 'a2',
+    };
+    const paused = { runId: 'wf_1', ask: false, completeAfterMs: 0, status: 'user_paused', wake: false, stopOn: hold };
+    await withHost(
+      'work-workflow-run',
+      async (fake) => {
+        const load = { modelId: WORK_MODEL, cwd: fake.project };
+        const { sessionId: id } = await fake.host.createSession(load);
+        for (const text of ['first', 'edit', 'cmd']) {
+          expect((await fake.host.startTurn(id, text, load).done).outcome).toBe('completed');
+        }
+        await until(() => fake.host.runs(id)[0]?.status === 'user_paused');
+        const run = fake.host.rewind(id, load, {
+          target: 1,
+          mode: 'all',
+          tasks: [],
+          schedules: [],
+          runs: ['wf_1'],
+          files: [{ path: 'src/a.ts', state: 'clean' }],
+        });
+        await until(() => fake.records().some((r) => r.kind === 'stop'));
+        writeFileSync(changedFile, JSON.stringify({ 'src/a.ts': 'modified_externally' }));
+        writeFileSync(hold, '');
+        expect(await run.done).toEqual({ outcome: 'changed' });
+        const rewinds = fake.records().filter((r) => r.kind === 'rewind');
+        expect(rewinds.map((r) => r.force)).toEqual([false, false]);
+        expect(asked(fake, '_x.ai/workflows/stop')).toHaveLength(1);
+      },
+      {
+        mode: 'work',
+        providers: noProviders(),
+        mutate: (scenario) => {
+          scenario.prompts = [
+            {
+              match: 'edit',
+              steps: [{ edit: { ...edit, ask: false } }, { text: 'Edited.' }, { end: { stopReason: 'end_turn' } }],
+            },
+            {
+              match: 'cmd',
+              steps: [{ workflow: paused }, { text: 'Started.' }, { end: { stopReason: 'end_turn' } }],
+            },
+          ];
+          scenario.rewind = { changedFile };
+        },
+      },
+    );
+  }, 20_000);
+
   it('a stop that fails refuses the rewind: nothing is rewound; files only stops nothing', async () => {
     await withHost(
       'work-workflow-run',
