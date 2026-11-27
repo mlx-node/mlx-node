@@ -996,6 +996,7 @@ fn real_slot_load_admits_draft_banks_beside_the_cached_count() {
 }
 #[test]
 fn slot_replacement_completes_all_lazy_readers_and_retains_warm_codes() {
+    let _host = super::super::super::memory::scoped_fixture_host();
     let dir = std::env::temp_dir().join(format!("qwen4-slots-{}", uuid::Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     struct Cleanup(std::path::PathBuf);

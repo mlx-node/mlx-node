@@ -880,13 +880,15 @@ mod direct_tests {
     use super::super::*;
     use crate::models::qwen4_exp::memory;
 
-    struct Temp(PathBuf);
+    /// A fixture directory whose test plans against [`memory::fixture_host`],
+    /// never the runner's free memory.
+    struct Temp(PathBuf, #[expect(dead_code)] memory::TestHostGuard);
     impl Temp {
         fn new() -> Self {
             let path =
                 std::env::temp_dir().join(format!("qwen4-direct-store-{}", uuid::Uuid::new_v4()));
             fs::create_dir_all(&path).unwrap();
-            Self(path)
+            Self(path, memory::scoped_fixture_host())
         }
     }
     impl Drop for Temp {
@@ -1381,7 +1383,6 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
-        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let paths = write_split_fixture_layout_with_empty_first(
             &temp.0,
@@ -1751,7 +1752,6 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
-        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let path = temp.0.join("quantized-fixture.gguf");
         let base_config = super::super::super::tests::write_direct_gguf_fixture(&path);
@@ -1887,7 +1887,6 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
-        let _host = memory::scoped_fixture_host();
         const LAYERS: usize = 3;
         let temp = Temp::new();
         let gguf = temp.0.join("full-capacity.gguf");
@@ -2046,7 +2045,6 @@ mod direct_tests {
         if !crate::utils::gguf_gpu::gpu_repack_available() {
             return;
         }
-        let _host = memory::scoped_fixture_host();
         let temp = Temp::new();
         let gguf = temp.0.join("idle-gap.gguf");
         write_fixture(&gguf);
