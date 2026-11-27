@@ -897,6 +897,9 @@ describe('Fork through the service', () => {
       await until(() => c.current() !== null);
       expect(c.state().conversation.forkOf).toEqual({ id, title: conversation.title });
       expect(c.state().conversation.permissionMode).toBe('ask');
+      await fake.service.prompt(whole.id, 'three');
+      await idle(c, 3);
+      expect(fake.reader.detail(whole.id)!.session).toMatchObject({ kind: 'fork', parentId: id });
       c.off();
 
       const first = userAt(w.state().entries, 'one');

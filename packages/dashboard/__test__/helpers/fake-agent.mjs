@@ -97,10 +97,23 @@ function persistLine(session, method, params) {
   );
 }
 
+/** A fork's provenance in its stored summary: the agent never restamps a persisted kind, so later writes keep it. */
+function storedFork(dir) {
+  let stored;
+  try {
+    stored = JSON.parse(readFileSync(join(dir, 'summary.json'), 'utf8'));
+  } catch {
+    return {};
+  }
+  if (stored?.session_kind !== 'fork') return {};
+  return { parent_session_id: stored.parent_session_id, forked_at: stored.forked_at, session_kind: 'fork' };
+}
+
 function persistSummary(session) {
   if (!scenario.persist || grokHome === '') return;
   const dir = persistDir(session);
   mkdirSync(dir, { recursive: true });
+  const fork = session.parentId === undefined ? storedFork(dir) : {};
   const now = new Date().toISOString();
   writeFileSync(
     join(dir, 'summary.json'),
@@ -115,6 +128,7 @@ function persistSummary(session) {
       current_model_id: session.model,
       generated_title: session.title,
       title_is_manual: session.titleIsManual === true,
+      ...fork,
       ...(session.parentId !== undefined ? { parent_session_id: session.parentId, session_kind: 'subagent' } : {}),
     }),
   );
@@ -2885,6 +2899,9 @@ async function runPrompt(id, params) {
     const managed = builtin === 'workflow' ? (readPdfStart(session, text) ?? manageRun(session, text)) : null;
     const said = managed ?? (scripted ? scenario.hostTurnText?.[builtin] : undefined) ?? goalSaid ?? `Ran /${builtin}.`;
     update(session, 'agent_message_chunk', { content: { type: 'text', text: said }, _meta: { hostTurn: true } });
+    // v0.3.6 ends a `/workflow` turn with a live and stored `turn_completed`.
+    if (builtin === 'workflow')
+      update(session, 'turn_completed', { prompt_id: randomUUID(), stop_reason: 'end_turn', elapsed_ms: 28 }, true);
     persistSummary(session);
     return reply(id, { stopReason: 'end_turn', _meta: { sessionId: session.id } });
   }

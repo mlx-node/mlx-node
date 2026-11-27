@@ -23,6 +23,7 @@ import { basename, dirname, join } from 'node:path';
 
 import { describe, expect, it, onTestFinished } from 'vite-plus/test';
 
+import { AgentSessionsReader } from '../src/agent-sessions/reader.js';
 import { ApiError } from '../src/api/errors.js';
 import { CLAUDE_CODE_OFF_ENV } from '../src/chat/agent/env.js';
 import { readPdfCommand, readPdfScript } from '../src/chat/agent/pdf-tool.js';
@@ -1213,6 +1214,12 @@ describe('Chat service — attachments', () => {
           await until(() => done() === 3, 5_000);
           const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
           expect(sent).toEqual({ type: 'text', text: readPdfCommand(id, 'read', 'report.pdf', 'you') });
+          const work = new AgentSessionsReader({ agentHome: join(fake.root, 'agent-home') });
+          const stored = work.detail(conversation.id)!.transcript;
+          const command = stored.findIndex((e) => e.kind === 'user' && e.text.startsWith('/workflow read-pdf '));
+          expect(stored.slice(command + 1).find((e) => e.kind === 'user' || e.kind === 'turn-end')?.kind).toBe(
+            'turn-end',
+          );
           const gone = await apiError(svc.readPdf(conversation.id, pdfToolId('b'.repeat(26), 3)));
           expect([gone.code, gone.message]).toEqual(['E_NOT_FOUND', 'No such PDF.']);
           page.detach();
