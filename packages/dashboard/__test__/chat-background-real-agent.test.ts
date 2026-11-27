@@ -135,6 +135,14 @@ function xaiLines(fake: FakeHost, sessionId: string, kind: string): Json[] {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+// The agent confirms a new schedule before it writes it (its state is saved on a 500 ms tick), and a stop before that
+// tick loses the schedule.
+function scheduleOnDisk(root: string, scheduleId: string): boolean {
+  return readdirSync(root, { recursive: true, encoding: 'utf8' })
+    .filter((f) => f.endsWith('resources_state.json'))
+    .some((f) => readFileSync(join(root, f), 'utf8').includes(scheduleId));
+}
+
 describe.skipIf(BIN === undefined)('Background work on the real agent (H-a)', () => {
   it('a background command: tracked from the real lines, it holds a settings change until it ends', async () => {
     const PROMPT = 'BGPROBE: start the waiter.';
@@ -591,6 +599,7 @@ describe.skipIf(BIN === undefined)('Delete a schedule on the real agent (T3)', (
       await until(() => fake.host.liveActivity(id).schedules.length === 1, AGENT_WAIT_MS);
       // The agent's own answer for an id it does not hold: `{result: {taskId, deleted: false}}`.
       expect(await fake.host.deleteSchedule(id, 'no-such-schedule', load)).toBe('gone');
+      await until(() => scheduleOnDisk(fake.root, scheduleId), AGENT_WAIT_MS);
 
       await fake.host.restart();
       expect(fake.host.isHot(id)).toBe(false);
@@ -676,6 +685,7 @@ describe.skipIf(BIN === undefined)('A cold load past its soft deadline on the re
       const { sessionId: paused } = await fake.host.createSession(load);
       expect(await runAllowing(fake, paused, SCHED)).toBe('completed');
       const scheduleId = xaiLines(fake, paused, 'scheduled_task_created')[0]!.task_id as string;
+      await until(() => scheduleOnDisk(fake.root, scheduleId), AGENT_WAIT_MS);
       await fake.host.restart();
       const { sessionId: live } = await fake.host.createSession(load);
       expect(await runAllowing(fake, live, BG)).toBe('completed');
