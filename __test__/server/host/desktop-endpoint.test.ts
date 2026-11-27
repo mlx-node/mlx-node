@@ -1,16 +1,19 @@
-import { spawnSync } from 'node:child_process';
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmod, mkdir, mkdtemp, readdir, readFile, rename, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 
-import { afterEach, expect, it } from 'vite-plus/test';
+import { afterEach, describe, expect, it } from 'vite-plus/test';
 
 import {
+  isPrivateWindowsSddl,
   publishDesktopEndpoint,
   readDesktopEndpoint,
+  WINDOWS_ACL_INSPECT_SCRIPTS,
   type DesktopEndpoint,
 } from '../../../packages/server/src/host/desktop-endpoint.js';
 
+const windows = process.platform === 'win32';
 const dirs: string[] = [];
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
@@ -28,11 +31,18 @@ const endpoint: DesktopEndpoint = {
   token: 'private',
 };
 
+function icacls(args: string[]): void {
+  const exe = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'icacls.exe');
+  execFileSync(exe, args, { windowsHide: true, stdio: 'ignore' });
+}
+
 it('publishes privately and removes only its own generation', async () => {
   const path = await location();
   const releaseOld = await publishDesktopEndpoint(endpoint, path);
-  expect((await stat(path)).mode & 0o777).toBe(0o600);
-  expect((await stat(join(path, '..'))).mode & 0o777).toBe(0o700);
+  if (!windows) {
+    expect((await stat(path)).mode & 0o777).toBe(0o600);
+    expect((await stat(join(path, '..'))).mode & 0o777).toBe(0o700);
+  }
   expect(JSON.parse(await readFile(path, 'utf8'))).toEqual(endpoint);
   const releaseNew = await publishDesktopEndpoint({ ...endpoint, token: 'new' }, path);
   await releaseOld();
@@ -44,7 +54,7 @@ it('publishes privately and removes only its own generation', async () => {
 async function writeRaw(path: string, text: string, mode = 0o600): Promise<void> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
   await writeFile(path, text, { mode });
-  await chmod(path, mode);
+  if (!windows) await chmod(path, mode);
 }
 
 it('reads back a published endpoint', async () => {
@@ -94,7 +104,7 @@ it('reads a model whose images flag is true, false or missing, and refuses one t
   expect(await readDesktopEndpoint(path)).toBeNull();
 });
 
-it('reads null when group or other may read the file', async () => {
+it.skipIf(windows)('reads null when group or other may read the file', async () => {
   const path = await location();
   await writeRaw(path, JSON.stringify(endpoint), 0o640);
   expect(await readDesktopEndpoint(path)).toBeNull();
@@ -104,11 +114,22 @@ it('reads null when group or other may read the file', async () => {
   expect(await readDesktopEndpoint(path)).toEqual(endpoint);
 });
 
+it('reads null for a directory at the endpoint path', async () => {
+  const path = await location();
+  await mkdir(path, { recursive: true });
+  expect(await readDesktopEndpoint(path)).toBeNull();
+});
+
 it('reads null through a symlink', async () => {
   const path = await location();
   const real = join(dirname(path), 'real.json');
   await writeRaw(real, JSON.stringify(endpoint));
-  await symlink(real, path);
+  try {
+    await symlink(real, path);
+  } catch (error) {
+    if (windows && (error as NodeJS.ErrnoException).code === 'EPERM') return;
+    throw error;
+  }
   expect(await readDesktopEndpoint(path)).toBeNull();
 });
 
@@ -133,4 +154,200 @@ it('reads null when the publishing process is gone', async () => {
   expect(child.pid).toBeGreaterThan(0);
   await writeRaw(path, JSON.stringify({ ...endpoint, pid: child.pid }));
   expect(await readDesktopEndpoint(path)).toBeNull();
+});
+
+describe('isPrivateWindowsSddl', () => {
+  const user = 'S-1-5-21-3365401605-447589653-2711680764-1001';
+  const other = 'S-1-5-21-3365401605-447589653-2711680764-1005';
+
+  it('accepts owner-only protected and inherited DACLs restricted to user, SYSTEM, and Administrators', () => {
+    expect(isPrivateWindowsSddl(`O:${user}G:${user}D:PAI(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;${user})`, user)).toEqual({
+      ok: true,
+      protectedDacl: true,
+    });
+    expect(
+      isPrivateWindowsSddl(`O:${user}D:AI(A;ID;FA;;;S-1-5-18)(A;ID;FA;;;S-1-5-32-544)(A;ID;FA;;;${user})`, user),
+    ).toEqual({
+      ok: true,
+      protectedDacl: false,
+    });
+    // Elevated admin process creates objects owned by BA (or SY); unelevated processes of the same user still accept them.
+    expect(isPrivateWindowsSddl(`O:BAG:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;${user})`, user)).toEqual({
+      ok: true,
+      protectedDacl: true,
+    });
+    expect(isPrivateWindowsSddl(`O:SYG:SYD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;${user})`, user)).toEqual({
+      ok: true,
+      protectedDacl: true,
+    });
+    // Explicit deny ACEs do not grant access, and trailing SACLs are ignored.
+    expect(isPrivateWindowsSddl(`O:${user}D:P(D;;FA;;;WD)(A;;FA;;;${user})S:(AU;SAFA;FA;;;WD)`, user)).toEqual({
+      ok: true,
+      protectedDacl: true,
+    });
+  });
+
+  it('rejects foreign owners, other local accounts/groups, missing/empty DACLs, and unknown ACE types', () => {
+    for (const bad of [
+      `O:${other}D:P(A;;FA;;;${user})`,
+      `O:${user}D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;${user})(A;;FR;;;${other})`,
+      `O:${user}D:AI(A;ID;FR;;;BU)(A;ID;FA;;;${user})`,
+      `O:${user}D:P(A;;FR;;;WD)(A;;FA;;;${user})`,
+      `O:${user}D:P(A;;FR;;;AU)(A;;FA;;;${user})`,
+      `O:${user}G:${user}`,
+      `O:${user}D:NO_ACCESS_CONTROL`,
+      `O:${user}D:P`,
+      `O:${user}D:P(XA;;FA;;;${user};(WIN://SYSAPPID))`,
+      `O:${user}D:P(OA;;FA;;;${user})`,
+      `not-sddl`,
+    ]) {
+      expect(isPrivateWindowsSddl(bad, user).ok, bad).toBe(false);
+    }
+  });
+});
+
+describe.runIf(windows)('Windows NTFS ACL hardening and verification', () => {
+  function runConstrainedPowerShell(script: string, extraEnv: Record<string, string>) {
+    const sysRoot = process.env.SystemRoot ?? 'C:\\Windows';
+    const ps = join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    const guarded = `$ExecutionContext.SessionState.LanguageMode = 'ConstrainedLanguage'\n${script}`;
+    const encoded = Buffer.from(guarded, 'utf16le').toString('base64');
+    const env: NodeJS.ProcessEnv = { ...process.env, ...extraEnv };
+    for (const key of Object.keys(env)) {
+      if (key.toUpperCase() === 'PSMODULEPATH') delete env[key];
+    }
+    env.PSModulePath = join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'Modules');
+    return spawnSync(ps, ['-NoProfile', '-NonInteractive', '-EncodedCommand', encoded], {
+      env,
+      windowsHide: true,
+      encoding: 'utf8',
+    });
+  }
+
+  it('hardens an open directory on publish, round-trips Windows model paths, and rejects file/dir ACL relaxation', async () => {
+    const path = await location();
+    const dir = dirname(path);
+    await mkdir(dir, { recursive: true });
+    // Grant Everyone and BUILTIN\Users read access before publish — publishDesktopEndpoint must wipe both.
+    icacls([dir, '/grant', '*S-1-1-0:(OI)(CI)(R)', '/grant', '*S-1-5-32-545:(OI)(CI)(R)', '/q']);
+
+    const winEndpoint: DesktopEndpoint = {
+      ...endpoint,
+      models: [
+        {
+          name: 'Hy4-flash-SPARK-4Bit-Fast',
+          path: 'C:\\Users\\lynwe\\.mlx-node\\models\\hy4-flash-gguf-spark-4bit-fast\\Hy4-flash-SPARK-4Bit-Fast.gguf',
+          base: 'Hy4-flash',
+          variant: 'SPARK-4Bit-Fast',
+          format: 'gguf',
+          modelType: 'hy_v4_flash',
+          kind: 'chat',
+          images: false,
+        },
+      ],
+    };
+    await publishDesktopEndpoint(winEndpoint, path);
+    // Repeated reads verify file and directory ACLs live without trusting stale stat caches.
+    expect(await readDesktopEndpoint(path)).toEqual(winEndpoint);
+    expect(await readDesktopEndpoint(path)).toEqual(winEndpoint);
+
+    // Granting another local group read access on the file fails closed immediately.
+    icacls([path, '/grant', '*S-1-5-32-545:(R)', '/q']);
+    expect(await readDesktopEndpoint(path)).toBeNull();
+
+    // Re-publishing re-hardens both directory and file so reads succeed again.
+    await publishDesktopEndpoint(winEndpoint, path);
+    expect(await readDesktopEndpoint(path)).toEqual(winEndpoint);
+
+    // Granting another local group write/read access on the containing directory must also fail closed.
+    icacls([dir, '/grant', '*S-1-5-32-545:(W)', '/q']);
+    expect(await readDesktopEndpoint(path)).toBeNull();
+  });
+
+  it('runs Windows ACL inspection under PowerShell Constrained Language mode and rejects junctions', async () => {
+    const path = await location();
+    const dir = dirname(path);
+    await publishDesktopEndpoint(endpoint, path);
+
+    const pathRun = runConstrainedPowerShell(WINDOWS_ACL_INSPECT_SCRIPTS.path, {
+      MLX_ENDPOINT_ACL_PATH: dir,
+    });
+    expect(pathRun.status, pathRun.stderr).toBe(0);
+    expect(pathRun.stdout.trim()).toMatch(/^O:.+D:P/);
+
+    const pairRun = runConstrainedPowerShell(WINDOWS_ACL_INSPECT_SCRIPTS.pair, {
+      MLX_ENDPOINT_ACL_FILE: path,
+      MLX_ENDPOINT_ACL_DIR: dir,
+    });
+    expect(pairRun.status, pairRun.stderr).toBe(0);
+    expect(pairRun.stdout.trim().split(/\r?\n/).filter(Boolean)).toHaveLength(2);
+
+    const junction = join(dirname(dir), 'junction-desktop');
+    const cmd = join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'cmd.exe');
+    const mk = spawnSync(cmd, ['/c', 'mklink', '/J', junction, dir], { windowsHide: true });
+    expect(mk.status).toBe(0);
+    try {
+      const juncRun = runConstrainedPowerShell(WINDOWS_ACL_INSPECT_SCRIPTS.path, {
+        MLX_ENDPOINT_ACL_PATH: junction,
+      });
+      expect(juncRun.status).not.toBe(0);
+      expect(await readDesktopEndpoint(join(junction, 'inference.json'))).toBeNull();
+      const junctionEndpoint: DesktopEndpoint = { ...endpoint, token: 'never-written-through-junction' };
+      await expect(publishDesktopEndpoint(junctionEndpoint, join(junction, 'inference.json'))).rejects.toThrow();
+      expect(await readdir(dir)).toEqual(['inference.json']);
+      expect(await readFile(path, 'utf8')).not.toContain('never-written-through-junction');
+    } finally {
+      spawnSync(cmd, ['/c', 'rmdir', junction], { windowsHide: true });
+    }
+  });
+
+  it('ignores inherited PowerShell 7 PSModulePath and tolerates concurrent sibling writes in the endpoint directory', async () => {
+    const path = await location();
+    const dir = dirname(path);
+    await mkdir(dir, { recursive: true });
+
+    // Discover PowerShell 7's PSModulePath if installed (otherwise inject a realistic PowerShell 7 path).
+    const pwshProbe = spawnSync('pwsh.exe', ['-NoProfile', '-Command', '$env:PSModulePath'], {
+      windowsHide: true,
+      encoding: 'utf8',
+    });
+    const pollutedModulePath =
+      pwshProbe.status === 0 && pwshProbe.stdout.trim()
+        ? pwshProbe.stdout.trim()
+        : `C:\\Program Files\\PowerShell\\7\\Modules;${join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'Modules')}`;
+
+    const prevKeys: Array<[string, string | undefined]> = [];
+    for (const key of Object.keys(process.env)) {
+      if (key.toUpperCase() === 'PSMODULEPATH') {
+        prevKeys.push([key, process.env[key]]);
+        delete process.env[key];
+      }
+    }
+    process.env.PSModulePath = pollutedModulePath;
+
+    // Continuously write a sibling file (mirroring `supervisor.json` heartbeats) to advance `dir.ctimeNs`
+    // while `publishDesktopEndpoint` and `readDesktopEndpoint` run.
+    let stopSibling = false;
+    let siblingCounter = 0;
+    const siblingWriter = (async () => {
+      while (!stopSibling) {
+        const tmp = join(dir, `supervisor.${siblingCounter++}.tmp`);
+        await writeFile(tmp, '{"state":"starting"}', 'utf8');
+        await rename(tmp, join(dir, 'supervisor.json'));
+        await new Promise((r) => setTimeout(r, 10));
+      }
+    })();
+
+    try {
+      await publishDesktopEndpoint(endpoint, path);
+      expect(await readDesktopEndpoint(path)).toEqual(endpoint);
+    } finally {
+      stopSibling = true;
+      await siblingWriter;
+      delete process.env.PSModulePath;
+      for (const [key, value] of prevKeys) {
+        if (value !== undefined) process.env[key] = value;
+      }
+    }
+  });
 });
