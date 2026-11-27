@@ -826,6 +826,16 @@ describe('a run of the PDF tool', () => {
     expect(progress(agents).notStarted).toBe(28);
   });
 
+  // Mutation: a first reader that ended with a second try of its group counted → its pages read and its rate shown.
+  it('a group with a second try counts only when that try ended well, and its first reader stays out of the rate', () => {
+    const first = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 120_000)];
+    const trying = progress([...first, reader('pages 1-4 again', 'running', 120_000)]);
+    expect(trying).toMatchObject({ read: 4, rate: null });
+    const tried = progress([...first, reader('pages 1-4 again', 'done', 120_000, 180_000)]);
+    expect(tried.read).toBe(8);
+    expect(tried.rate).toBeCloseTo(8 / 120);
+  });
+
   // Mutation: time left in step 2 → the combine step shows a time left for pages already read.
   it('time left: the pages left at the rate, less the time since a reader last ended, only in step 1 while it runs', () => {
     const agents = [reader('pages 1-4', 'done', 0, 60_000), reader('pages 5-8', 'done', 60_000, 120_000)];

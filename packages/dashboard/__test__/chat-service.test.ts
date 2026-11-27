@@ -1163,8 +1163,8 @@ describe('Chat service — attachments', () => {
         .filter((m) => m.method === 'session/prompt')
         .map((m) => m.params as Json);
 
-    // Mutations: the stage not placed on Send; Read it now not the agent's own command; the page folders kept on
-    // delete → red.
+    // Mutations: the stage not placed on Send; Read it now not the agent's own command; Read it now with a reader of the
+    // Work folder's that takes the tool's name; the page folders kept on delete → red.
     it('Work: Send moves the stage to the page folder of its id, the note names the id; Read it now starts read-pdf', async () => {
       await withWork(
         'work-always',
@@ -1197,6 +1197,11 @@ describe('Chat service — attachments', () => {
           await svc.prompt(conversation.id, 'and again', [item]);
           await until(() => done() === 2, 5_000);
           expect(prompts(fake)[1]).toEqual(promptParams(conversation.id, 'and again', [item], { mode: 'agent' }));
+          const own = join(project, '.mlx-agent', 'agents', 'pdf-reader.md');
+          mkdirSync(join(own, '..'), { recursive: true });
+          writeFileSync(own, '---\nname: pdf-reader\n---\nmine\n');
+          expect(refusedAs(await apiError(svc.readPdf(conversation.id, id)))).toEqual(REFUSED);
+          rmSync(join(project, '.mlx-agent'), { recursive: true });
           await svc.readPdf(conversation.id, id);
           await until(() => done() === 3, 5_000);
           const sent = (prompts(fake)[2]!.prompt as Array<{ type: string; text?: string }>)[0]!;
@@ -1244,7 +1249,9 @@ describe('Chat service — attachments', () => {
     }, 20_000);
 
     // Mutation: the tool reported on while a file of the person's holds its name → red.
-    // Mutations: the host start left out; the family check dropped; a second start after the model's own run → red.
+    // Mutations: the host start left out; the family check dropped; a start after the model's call of the PDF, after
+    // any call of the tool, or after a deny; Read it now while a run of the tool goes on; Read it now during the host's
+    // start not answered with its turn → red.
     it('Work: on a family that skips the tool, the host starts read-pdf when the turn that sent the PDF ends', async () => {
       const GEMMA = { ...endpointModel('qwen3.5-4b', '/models/qwen3.5-4b'), modelType: 'gemma4', images: true };
       const INKLING = { ...endpointModel('qwen3.5-9b', '/models/qwen3.5-9b'), modelType: 'inkling2', images: true };
@@ -1259,7 +1266,7 @@ describe('Chat service — attachments', () => {
           /** Sends `text` with a 3-page tool PDF on `model`; its page, and its first turn's end as the page saw it. */
           const send = async (text: string, model: string) => {
             const stage = await staged(svc, 3);
-            const { conversation } = await svc.create({
+            const { conversation, turnId } = await svc.create({
               mode: 'work',
               text,
               cwd: project,
@@ -1271,47 +1278,96 @@ describe('Chat service — attachments', () => {
               const first = page.events[0];
               return page.ends().length + (first?.type === 'sync' && first.turn === null ? 1 : 0) > 0;
             };
-            return { id: conversation.id, pdf: pdfToolId(stage, 3), page, ended };
+            return { id: conversation.id, pdf: pdfToolId(stage, 3), turnId, page, ended };
+          };
+          const settle = () => new Promise((resolve) => setTimeout(resolve, 500));
+          const answered = async (p: Awaited<ReturnType<typeof send>>, optionId: string) => {
+            await until(() => interactionsOf(p.page).length === 1, 10_000);
+            await svc.answer(p.id, interactionsOf(p.page)[0]!.id, { optionId });
+            await until(p.ended, 10_000);
+            await settle();
           };
 
           const skipped = await send('pdfnot', GEMMA.name);
+          let pressed: Promise<{ turnId: string }> | null = null;
+          let hostTurn: string | null = null;
+          const stopWatch = svc.watchConversation(skipped.id, (event) => {
+            if (pressed !== null || event.type !== 'turn' || event.turn === null) return;
+            if (event.turn.turnId === skipped.turnId) return;
+            hostTurn = event.turn.turnId;
+            pressed = svc.readPdf(skipped.id, skipped.pdf);
+          });
           await until(() => texts(skipped.id).length === 2, 10_000);
           expect(texts(skipped.id)).toEqual(['pdfnot', readPdfCommand(skipped.pdf, 'pdfnot', 'report.pdf')]);
+          await until(() => pressed !== null, 5_000);
+          expect(await pressed!).toEqual({ turnId: hostTurn });
+          stopWatch();
 
           const other = await send('pdfnot', INKLING.name);
           await until(other.ended, 10_000);
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await settle();
           expect(texts(other.id)).toEqual(['pdfnot']);
 
           const own = await send('pdftool', GEMMA.name);
-          await until(() => interactionsOf(own.page).length === 1, 10_000);
-          await svc.answer(own.id, interactionsOf(own.page)[0]!.id, { optionId: 'allow-once' });
-          await until(own.ended, 10_000);
-          await new Promise((resolve) => setTimeout(resolve, 500));
+          await answered(own, 'allow-once');
           expect(texts(own.id)).toEqual(['pdftool']);
-          for (const p of [skipped, other, own]) p.page.detach();
+          const busy = await apiError(svc.readPdf(own.id, own.pdf));
+          expect(busy.code).toBe('E_CONFLICT');
+          expect(texts(own.id)).toEqual(['pdftool']);
+
+          const refused = await send('pdftool', GEMMA.name);
+          await answered(refused, 'reject-once');
+          expect(refused.page.ends()[0]).toMatchObject({ outcome: 'denied' });
+          expect(texts(refused.id)).toEqual(['pdftool']);
+
+          const called = await send('pdfcall', GEMMA.name);
+          await answered(called, 'allow-once');
+          expect(texts(called.id)).toEqual(['pdfcall']);
+
+          const wrong = await send('pdfwrong', GEMMA.name);
+          await answered(wrong, 'allow-once');
+          expect(texts(wrong.id)).toEqual(['pdfwrong', readPdfCommand(wrong.pdf, 'pdfwrong', 'report.pdf')]);
+
+          const wrongDenied = await send('pdfwrong', GEMMA.name);
+          await answered(wrongDenied, 'reject-once');
+          expect(wrongDenied.page.ends()[0]).toMatchObject({ outcome: 'denied' });
+          expect(texts(wrongDenied.id)).toEqual(['pdfwrong']);
+          for (const p of [skipped, other, own, refused, called, wrong, wrongDenied]) p.page.detach();
         },
         { endpointModels: [GEMMA, INKLING] },
       );
-    }, 40_000);
+    }, 90_000);
 
+    // Mutation: Read it now with the tool off once the person's file took its name → red.
     it("Work: a file of the person's named like the tool's turns it off, before any agent start", async () => {
       await withWork(
         'work-always',
         async (fake, project) => {
-          const svc = fake.service;
+          const first = fake.service;
+          const stage = await staged(first, 2);
+          const sent = await first.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(stage, 2)] });
+          const page = new Page(first, sent.conversation.id);
+          await until(() => {
+            const head = page.events[0];
+            return page.ends().length > 0 || (head?.type === 'sync' && head.turn === null);
+          }, 5_000);
+          page.detach();
+          await first.close();
           const agents = join(fake.root, 'agent-home', 'agents');
           mkdirSync(agents, { recursive: true });
           writeFileSync(join(agents, 'pdf-reader.md'), '---\nname: pdf-reader\n---\nmine\n');
+          const svc = fake.restart();
           expect((await svc.state()).pdfTool).toEqual({ chat: false, work: false });
-          const stage = await staged(svc, 2);
+          const off = await apiError(svc.readPdf(sent.conversation.id, pdfToolId(stage, 2)));
+          expect(refusedAs(off)).toEqual(REFUSED);
+          const again = await staged(svc, 2);
           const refused = await apiError(
-            svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(stage, 2)] }),
+            svc.create({ mode: 'work', text: 'read', cwd: project, attachments: [tool(again, 2)] }),
           );
           expect(refusedAs(refused)).toEqual(REFUSED);
-          expect(fake.sent().filter((m) => m.method === 'session/new')).toEqual([]);
+          expect(fake.sent().filter((m) => m.method === 'session/new')).toHaveLength(1);
         },
-        { endpointModels: [SEES] },
+        { endpointModels: [SEES], mutate: scripted },
       );
     });
   });

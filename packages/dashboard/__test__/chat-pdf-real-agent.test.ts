@@ -197,7 +197,7 @@ async function rig(mode: PermissionMode, launchArgs: () => Json): Promise<Rig> {
       const meta = paths.workPdf === null ? null : await readPdfMeta(paths.workPdf, pdf);
       return meta === null
         ? null
-        : { id: pdf, session: meta.session, name: meta.name, pages: meta.pages, images: true };
+        : { id: pdf, session: meta.session, name: meta.name, pages: meta.pages, images: true, tool: true };
     },
   });
   paths.workPdf = fake.paths.workPdf;

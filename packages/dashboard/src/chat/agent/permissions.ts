@@ -213,6 +213,11 @@ export interface PdfFacts {
   pages: number;
   /** The model row of the session that asks says `images: true`. */
   images: boolean;
+  /**
+   * The agent finds the app's `read-pdf` and `pdf-reader` by those names for that session: the tool is on and no file
+   * of its Work folder takes either name first.
+   */
+  tool: boolean;
 }
 
 /** What the Ask card says of a launch: the PDF's name, the pages it reads and its reader agents. */
@@ -224,12 +229,13 @@ export interface PdfLaunchWords {
 
 /**
  * A `read-pdf` launch the app may let run: {@link readPdfLaunch}, a `pdf` whose page folder names the session that
- * asks, a model that sees images, and at least one page picked. Null for any other request.
+ * asks, a model that sees images, the app's own tool by that name, and at least one page picked. Null for any other
+ * request.
  */
 export function pdfLaunchRow(req: PermissionRequest, facts: PdfFacts | null): PdfLaunchWords | null {
   const launch = readPdfLaunch(req);
   if (launch === null || facts === null || facts.id !== launch.pdf) return null;
-  if (facts.session !== req.sessionId || !facts.images) return null;
+  if (facts.session !== req.sessionId || !facts.images || !facts.tool) return null;
   const pages = parsePages(launch.pages ?? `1-${facts.pages}`, facts.pages).length;
   if (pages === 0) return null;
   return { name: facts.name, pages, readers: Math.ceil(pages / PDF_READER_PAGES) };

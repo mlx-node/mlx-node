@@ -5,6 +5,7 @@
  */
 
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -26,6 +27,7 @@ import {
   PDF_READER_MARKER,
   PDF_READER_TEXT,
   pdfToolBlocked,
+  pdfToolShadowed,
   READ_PDF_MARKER,
   READ_PDF_QUESTION_MAX,
   readPdfCommand,
@@ -163,6 +165,60 @@ describe('the files in the agent home', () => {
     rmSync(script());
     mkdirSync(script());
     expect(await pdfToolBlocked(home)).toBe(true);
+  });
+});
+
+// Mutations: the project workflows not read; the walk stopped at the Work folder; the walk past the git root; the app's
+// own agent home taken for a project folder; a folder that cannot be read taken as none; a home that is a repo taken
+// as the project → red.
+describe('a file of the Work folder that takes a PDF tool name first', () => {
+  it('is any project workflow script or a pdf-reader agent from the Work folder up to the git root', async () => {
+    const user = join(home, 'u');
+    const agentHome = join(user, '.mlx-agent');
+    const repo = join(user, 'repo');
+    const cwd = join(repo, 'sub', 'work');
+    mkdirSync(cwd, { recursive: true });
+    mkdirSync(join(repo, '.git'));
+    const put = (path: string): string => {
+      mkdirSync(join(path, '..'), { recursive: true });
+      writeFileSync(path, 'x');
+      return path;
+    };
+    const shadowed = (at = cwd) => pdfToolShadowed(at, agentHome, user);
+    put(join(agentHome, 'workflows', 'read-pdf.rhai'));
+    put(join(agentHome, 'agents', 'pdf-reader.md'));
+    expect(await shadowed()).toBe(false);
+
+    const found = [
+      join(repo, '.mlx-agent', 'workflows', 'any-name.rhai'),
+      join(repo, 'sub', '.claude', 'agents', 'pdf-reader.md'),
+      join(cwd, '.mlx-agent', 'agents', 'pdf-reader.md'),
+      join(repo, '.claude', 'agents', 'pdf-reader.md'),
+    ];
+    for (const path of found) {
+      put(path);
+      expect([path, await shadowed()]).toEqual([path, true]);
+      rmSync(path);
+    }
+    put(join(repo, '.mlx-agent', 'workflows', 'notes.txt'));
+    put(join(user, '.claude', 'agents', 'pdf-reader.md'));
+    expect(await shadowed()).toBe(false);
+    rmSync(join(user, '.claude'), { recursive: true });
+    expect(await shadowed(user)).toBe(false);
+
+    const locked = join(repo, '.mlx-agent', 'workflows');
+    chmodSync(locked, 0o000);
+    try {
+      expect(await shadowed()).toBe(true);
+    } finally {
+      chmodSync(locked, 0o700);
+    }
+
+    rmSync(join(repo, '.git'), { recursive: true });
+    rmSync(join(repo, '.mlx-agent'), { recursive: true });
+    mkdirSync(join(user, '.git'));
+    put(join(repo, 'sub', '.claude', 'agents', 'pdf-reader.md'));
+    expect(await shadowed()).toBe(false);
   });
 });
 

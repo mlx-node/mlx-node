@@ -257,11 +257,12 @@ export interface PdfProgress {
 }
 
 /**
- * The run's PDF numbers. Pages read count a group's pages once, when one of its readers ended well; after the end the
- * report's first line is the word. The rate: live, the pages of the {@link RATE_READERS} newest readers that ended well
- * over the time from the first of them starting to the last ending; ended, the pages read over the time of the read
- * (the first reader's start to the last reader's end). Time left: the pages left at that rate, less the time since a
- * reader last ended, never under 0, only in step 1 while the run runs.
+ * The run's PDF numbers. Pages read count a group's pages once, when one of its readers ended well (a first reader
+ * whose group has a second try did not); after the end the report's first line is the word. The rate: live, the pages
+ * of the {@link RATE_READERS} newest readers that ended well over the time from the first of them starting to the last
+ * ending; ended, the pages read over the time of the read (the first reader's start to the last reader's end). Time
+ * left: the pages left at that rate, less the time since a reader last ended, never under 0, only in step 1 while the
+ * run runs.
  */
 export function pdfProgress(input: PdfProgressInput): PdfProgress {
   const { run, agents, entry } = input;
@@ -274,6 +275,11 @@ export function pdfProgress(input: PdfProgressInput): PdfProgress {
   let first: number | null = null;
   let last: number | null = null;
   let read = 0;
+  const retried = new Set<string>();
+  for (const agent of agents) {
+    const reader = runReader(run, agent.row.label);
+    if (reader?.again === true) retried.add(rangeText(reader.pages));
+  }
   for (const agent of agents) {
     const reader = runReader(run, agent.row.label);
     if (reader === null) continue;
@@ -284,7 +290,8 @@ export function pdfProgress(input: PdfProgressInput): PdfProgress {
       first = first === null ? span.start : Math.min(first, span.start);
       if (span.end !== null && agent.state !== 'running') last = last === null ? span.end : Math.max(last, span.end);
     }
-    if (agent.state !== 'done') continue;
+    // The script tries a group again only when its first reader gave no notes, whatever that reader's end.
+    if (agent.state !== 'done' || (!reader.again && retried.has(key))) continue;
     if (!readGroups.has(key)) {
       readGroups.add(key);
       read += reader.pages.length;

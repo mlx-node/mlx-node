@@ -148,6 +148,8 @@ import {
   fileWays,
   heldPictureChars,
   messageInputs,
+  resendFiles,
+  sentStages,
   type BlockAction,
   copyDetails,
   engineLostNotice,
@@ -300,13 +302,15 @@ const PDF_STAGE: PdfStageSink = {
   },
 };
 
+/** The stages {@link dropSentStages} dropped in this window. */
+const DROPPED_STAGES = new Set<string>();
+
 /** A sent PDF whose pages went in the message no longer needs the stage that also holds them. */
 function dropSentStages(files: readonly DraftAttachment[], inputs: readonly AttachmentInput[]): void {
-  files.forEach((file, i) => {
-    const input = inputs[i];
-    if (file.kind === 'pdf' && file.stage !== null && input?.kind === 'pdf' && !('stage' in input))
-      PDF_STAGE.drop(file.stage);
-  });
+  for (const stage of sentStages(files, inputs)) {
+    DROPPED_STAGES.add(stage);
+    PDF_STAGE.drop(stage);
+  }
 }
 
 const NO_RAISED: ChatHostState['permissionRaised'] = [];
@@ -979,12 +983,14 @@ export default function Chat(): ReactElement {
     const text = shownEnd.blocked;
     if (text === undefined) return;
     // The send still in flight, else the last one this window sent there, holds the message's files.
-    const files =
+    const files = resendFiles(
       sending !== null && sending.conversationId === id && sending.text === text
         ? sending.files
         : lastSent !== null && lastSent.place === id && lastSent.text === text
           ? lastSent.files
-          : [];
+          : [],
+      DROPPED_STAGES,
+    );
     const putBack = (): void => {
       putBackTo(id, text);
       if (files.length === 0) return;
@@ -2926,7 +2932,7 @@ export default function Chat(): ReactElement {
   const resend = (action: Extract<TurnAction, { text: string }>): void => {
     const files =
       action.kind === 'send-again' && keptFor !== null && keptFor === action.text && lastSent !== null
-        ? lastSent.files
+        ? resendFiles(lastSent.files, DROPPED_STAGES)
         : [];
     void send(action.text, files);
   };

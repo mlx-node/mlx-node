@@ -3029,6 +3029,84 @@
         ]
       },
       {
+        "match": "pdfcall",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow read-pdf",
+              "rawInput": {
+                "variant": "Workflow",
+                "source": {
+                  "type": "name",
+                  "name": "read-pdf"
+                },
+                "args": {
+                  "pdf": "$PDF",
+                  "question": "What are the findings?"
+                }
+              },
+              "output": "read-pdf: the pdf id is not valid"
+            }
+          },
+          {
+            "text": "The PDF tool did not start.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
+        "match": "pdfwrong",
+        "steps": [
+          {
+            "permission": {
+              "toolName": "workflow",
+              "kind": "other",
+              "title": "Run workflow read-pdf",
+              "rawInput": {
+                "variant": "Workflow",
+                "source": {
+                  "type": "name",
+                  "name": "read-pdf"
+                },
+                "args": {
+                  "pdf": "pdf-of-another-message-3",
+                  "question": "What are the findings?"
+                }
+              },
+              "output": "read-pdf: the pdf id is not valid"
+            }
+          },
+          {
+            "text": "The PDF tool did not start.",
+            "chunk": 7
+          },
+          {
+            "turnCompleted": {
+              "inputTokens": 400,
+              "outputTokens": 30
+            }
+          },
+          {
+            "end": {
+              "stopReason": "end_turn"
+            }
+          }
+        ]
+      },
+      {
         "match": "agentview",
         "steps": [
           {

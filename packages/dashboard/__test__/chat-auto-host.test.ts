@@ -290,7 +290,9 @@ describe('Auto', () => {
     const facts =
       (over: Json = {}): FakeHostOptions['pdfFacts'] =>
       async (sessionId, pdf) =>
-        pdf === PDF ? { id: PDF, session: sessionId, name: 'report.pdf', pages: 40, images: true, ...over } : null;
+        pdf === PDF
+          ? { id: PDF, session: sessionId, name: 'report.pdf', pages: 40, images: true, tool: true, ...over }
+          : null;
 
     // Mutation: the launch row left out of the host (every workflow a card) → red.
     it('on a PDF of this conversation runs with no card: allow-once after its line, the card naming the PDF', async () => {

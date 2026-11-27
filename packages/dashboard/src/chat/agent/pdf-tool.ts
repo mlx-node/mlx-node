@@ -6,8 +6,8 @@
  * person's (the Work home is shared with the terminal agent) and is never replaced; the tool is then off.
  */
 
-import { lstat, mkdir, readFile, realpath } from 'node:fs/promises';
-import { dirname, join } from 'node:path';
+import { lstat, mkdir, readdir, readFile, realpath } from 'node:fs/promises';
+import { dirname, join, resolve } from 'node:path';
 
 import { PDF_READER_PAGES, PDF_TOOL_MAX_PAGES } from '../attachment-rule.js';
 import { writeFileAtomic } from '../paths.js';
@@ -442,6 +442,69 @@ export async function appReadPdfPaths(home: string): Promise<string[]> {
   return real === file.path ? [file.path] : [file.path, real];
 }
 
+/** The agent's project folder in a Work folder or a folder above it. */
+const PROJECT_AGENT_DIR = '.mlx-agent';
+
+/** A missing path: any other failure to read one counts as a file there. */
+function missing(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === 'ENOENT' || code === 'ENOTDIR';
+}
+
+async function present(path: string): Promise<boolean> {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    return !missing(error);
+  }
+}
+
+async function samePath(a: string, b: string): Promise<boolean> {
+  const real = (path: string) => realpath(path).catch(() => resolve(path));
+  return (await real(a)) === (await real(b));
+}
+
+/** The nearest folder from `cwd` up that holds a `.git` entry; null when none does. */
+async function gitRoot(cwd: string): Promise<string | null> {
+  let dir = resolve(cwd);
+  for (;;) {
+    if (await present(join(dir, '.git'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+}
+
+/**
+ * Whether a file of the Work folder `cwd` would take a PDF tool name before the agent home `agentHome` does, as the
+ * agent looks names up: any `.rhai` in `.mlx-agent/workflows` of the project root (the git root, else `cwd`; the
+ * agent reads a workflow's name from inside the script), or a `pdf-reader.md` in `.mlx-agent/agents` or
+ * `.claude/agents` of a folder from `cwd` up to the git root. A path that cannot be read counts as a file.
+ */
+export async function pdfToolShadowed(cwd: string, agentHome: string, home: string): Promise<boolean> {
+  const found = await gitRoot(cwd);
+  const root = found !== null && !(await samePath(found, home)) ? found : null;
+  const top = root ?? resolve(cwd);
+  const dirs = [resolve(cwd)];
+  for (let dir = dirs[0]!; dir !== top; dirs.push(dir)) dir = dirname(dir);
+  const ownHome = async (dir: string) => samePath(join(dir, PROJECT_AGENT_DIR), agentHome);
+  if (!(await samePath(top, home)) && !(await ownHome(top))) {
+    try {
+      const names = await readdir(join(top, PROJECT_AGENT_DIR, 'workflows'));
+      if (names.some((name) => name.endsWith('.rhai'))) return true;
+    } catch (error) {
+      if (!missing(error)) return true;
+    }
+  }
+  for (const dir of dirs) {
+    const agentFile = `${PDF_READER_AGENT}.md`;
+    if (!(await ownHome(dir)) && (await present(join(dir, PROJECT_AGENT_DIR, 'agents', agentFile)))) return true;
+    if (await present(join(dir, '.claude', 'agents', agentFile))) return true;
+  }
+  return false;
+}
+
 /** `text` cut to `max` UTF-16 units, never inside a surrogate pair. */
 function cutUnits(text: string, max: number): string {
   if (text.length <= max) return text;
@@ -456,4 +519,22 @@ function cutUnits(text: string, max: number): string {
 export function readPdfCommand(id: string, question: string, name: string): string {
   const args = { pdf: id, question: cutUnits(question, READ_PDF_QUESTION_MAX), objective: `Read ${name}` };
   return `/workflow ${READ_PDF_WORKFLOW} ${JSON.stringify(args)}`;
+}
+
+/** The `pdf` a `workflow` call's input starts `read-pdf` by name with; null for any other call or input. */
+export function readPdfCallId(name: string, input: string | undefined): string | null {
+  if (name !== 'workflow' || input === undefined) return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(input) as unknown;
+  } catch {
+    return null;
+  }
+  if (typeof value !== 'object' || value === null) return null;
+  const { source, args } = value as { source?: unknown; args?: unknown };
+  if (typeof source !== 'object' || source === null || typeof args !== 'object' || args === null) return null;
+  const named = source as { type?: unknown; name?: unknown };
+  if (named.type !== 'name' || named.name !== READ_PDF_WORKFLOW) return null;
+  const pdf = (args as { pdf?: unknown }).pdf;
+  return typeof pdf === 'string' ? pdf : null;
 }

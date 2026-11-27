@@ -37,7 +37,14 @@ import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { normalizeMime } from '../ui/src/lib/file-read.js';
 import { type PdfCodec, type PdfOpenFailure, PdfOpenError } from '../ui/src/lib/pdf-pages.js';
 import { rateWords } from '../ui/src/lib/pdf-run.js';
-import { type AttachFacts, attachPlan, attachProblem, messageInputs } from '../ui/src/pages/chat/blockers.js';
+import {
+  type AttachFacts,
+  attachPlan,
+  attachProblem,
+  messageInputs,
+  resendFiles,
+  sentStages,
+} from '../ui/src/pages/chat/blockers.js';
 import {
   drawingCount,
   forgetPlace,
@@ -907,6 +914,21 @@ describe('the way each PDF goes, and what Send sends', () => {
     expect(messageInputs(staged, attachPlan({ ...TOOL, files: staged, heldImages: 60 }))).toEqual([
       { kind: 'pdf', name: 'a.pdf', stage: STAGE, pages: 5 },
     ]);
+  });
+
+  // Mutation: the copy kept for a resend keeps its dropped stage → Send again plans the tool way for a stage that is gone.
+  it('a PDF sent in the message drops its stage, and a resend of that message holds the PDF with none', () => {
+    const short = pdfDraft('a.pdf', 5, 1_000, undefined, STAGE);
+    const long = pdfDraft('b.pdf', 21, 1_000, undefined, 'bcdefghijklmnopqrstuvwxyza');
+    const files = [short, long];
+    expect(sentStages(files, messageInputs(files, attachPlan({ ...TOOL, files })))).toEqual([STAGE]);
+    const kept = resendFiles(files, new Set([STAGE]));
+    expect(kept.map((file) => (file.kind === 'pdf' ? file.stage : undefined))).toEqual([
+      null,
+      'bcdefghijklmnopqrstuvwxyza',
+    ]);
+    expect(attachProblem({ ...TOOL, files: [kept[0]!], heldImages: 60 })).toBe(CHAT.attach.blockedPdfRoom);
+    expect(resendFiles(files, new Set())).toEqual(files);
   });
 
   it('a model change moves a short PDF between the two ways with no second draw', () => {

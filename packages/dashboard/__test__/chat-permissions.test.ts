@@ -649,7 +649,7 @@ describe('Work: a launch of the PDF tool', () => {
       ...(Object.keys(meta).length === 0 ? {} : { _meta: meta }),
     })!;
   }
-  const FACTS = { id: 'k3f7a2c4-40', session: 's', name: 'report.pdf', pages: 40, images: true };
+  const FACTS = { id: 'k3f7a2c4-40', session: 's', name: 'report.pdf', pages: 40, images: true, tool: true };
 
   // Mutation: the row by the tool's name alone → red.
   it('is read only from a call by name with the args the script takes, and nothing else', () => {
@@ -687,7 +687,7 @@ describe('Work: a launch of the PDF tool', () => {
     expect(readPdfLaunch(bash('/workflow read-pdf {}'))).toBeNull();
   });
 
-  it('may run only on a PDF of this session, on a model that sees images, with a page picked', () => {
+  it("may run only on a PDF of this session, on a model that sees images, with the app's tool, a page picked", () => {
     expect(pdfLaunchRow(launch(), FACTS)).toEqual({ name: 'report.pdf', pages: 40, readers: 10 });
     expect(pdfLaunchRow(launch({ args: { ...ARGS, pages: '1-12, 15' } }), FACTS)).toEqual({
       name: 'report.pdf',
@@ -698,6 +698,7 @@ describe('Work: a launch of the PDF tool', () => {
     expect(pdfLaunchRow(launch(), { ...FACTS, session: 'other' })).toBeNull();
     expect(pdfLaunchRow(launch(), { ...FACTS, id: 'k3f7a2c4-41' })).toBeNull();
     expect(pdfLaunchRow(launch(), { ...FACTS, images: false })).toBeNull();
+    expect(pdfLaunchRow(launch(), { ...FACTS, tool: false })).toBeNull();
     expect(pdfLaunchRow(launch({ args: { ...ARGS, pages: '41-50' } }), FACTS)).toBeNull();
     expect(pdfLaunchRow(launch({ agent_budget: 9 }), FACTS)).toBeNull();
   });

@@ -1736,26 +1736,34 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   tool`) names the id the model passes as `{"pdf": id, "question": …, "pages": "40-60"}` (the Work rules tell it how).
   Auto allows a launch with no card when it is the main agent's `workflow` call of `read-pdf` by name, with no budget,
   no dry run and no arg but `pdf`, `question` and `pages`, on a page folder whose `meta.json` names this conversation,
-  for a model that sees images and with at least one page picked; it counts in the answer's cap and touches no folder.
-  Any other workflow still asks (`helper-start`). The card of a launch carries `pdfRead: {name, pages, readers}`. Read
+  for a model that sees images and with at least one page picked, while the tool is on and no file of the Work folder
+  takes either name before the agent home (any `.rhai` in `.mlx-agent/workflows` of the project root, the git root
+  else the Work folder, since the agent reads a workflow's name from inside it; a `pdf-reader.md` in `.mlx-agent/agents`
+  or `.claude/agents` of a folder from the Work folder up to the git root; a path that cannot be read counts); it counts
+  in the answer's cap and touches no folder. Any other workflow still asks (`helper-start`). The card of a launch carries `pdfRead: {name, pages, readers}`. Read
   it now (`POST …/pdf-read`) sends the agent's own `/workflow read-pdf {json}` with the message's text as the
-  question: no model call and no permission request. For a model of `HOST_START_FAMILIES` (`gemma4`, `qwen3_5`: they
-  started the tool from the note in 2 of 10 tries each, against 10 of 10 for Inkling-2-Mini) the service sends that
-  command itself when the turn that sent the PDF ends (completed, denied, output limit or tool loop) with no new
-  `read-pdf` run; not after a Stop or a failed turn, and not while another turn runs, which leaves Read it now.
+  question: no model call and no permission request. It is refused (`attachment-refused`) when the tool is off or a
+  file of the Work folder takes one of its names, and (`conversation-busy`) while a run of `read-pdf` of
+  the conversation is active or paused, so two runs never share the image lane. For a model of `HOST_START_FAMILIES`
+  (`gemma4`, `qwen3_5`: they started the tool from the note in 2 of 10 tries each, against 10 of 10 for
+  Inkling-2-Mini) the service sends that command itself when the turn that sent the PDF ends (completed, output limit
+  or tool loop) and no `read-pdf` call of the model named its id, whatever the answer to it; not after a Stop, a deny
+  or a failed turn, and not while another turn or a run of the tool goes on, which leaves Read it now. A Read it now
+  sent while that start is in flight gets its turn.
   - Composer. While `pdfTool.work` is true every PDF of Work is posted page by page to the stage as it is drawn (up to
     320 pages: "{name} has {n} pages. Up to 320 pages can be read."); only a PDF of 20 pages or fewer keeps its pages
     in the window too, so a model change moves it between the two ways with no second draw. The page plans the ways
     with the host's own `planPdfs`: a PDF the message has no room for goes to the tool, its chip reads "{n} pages · read
     by the PDF tool" and the caption "About {n} tokens now · about {m} to read the pages". A page the host could not
     save refuses the PDF ("{name} could not be saved for reading. Add it again.") and drops its stage; removing the chip
-    drops it too, and so does a Send that carried the PDF in the message. The tool way is offered only when every PDF
-    held has a stage. Without the tool a PDF over 20 pages is refused as before.
+    drops it too, and so does a Send that carried the PDF in the message (Send again and a hook's put-back then hold
+    that PDF with no stage). The tool way is offered only when every PDF held has a stage. Without the tool a PDF over 20 pages is refused as before.
   - Run block (`ui/src/lib/pdf-run.ts`, `run-block.tsx`). A run is the PDF tool's when its `workflow` call names
     `read-pdf` and a valid id, or when the prompt that opens its turn is a Read it now command. Its block is named
     "Reading {name}" ("Reading a PDF" when no note of the conversation names the id; also its end row). Under the step
     line: "Pages {range} · {done} of {total} pages read · {rate} · {time left}" and a `Meter` filled by pages read. A
-    group counts once, when one of its readers ended well; the rate is the pages of the newest 5 such readers over the
+    group counts once, when one of its readers ended well (a first reader whose group has a second try did not: the
+    script tries a group again only when it gave no notes); the rate is the pages of the newest 5 such readers over the
     span from the earliest start to the last end, shown from 2 readers; time left shows only in the first step while
     the run runs, less the time since a reader last ended. After the end the counts are the report's first line, the
     rate is pages read over the read step, and the pages not read are in warning ink ("pages 9-12 not read"). Under
@@ -1862,7 +1870,9 @@ The page is `ui/src/pages/chat.tsx` plus `ui/src/pages/chat/`.
   Sessions transcript draws the same tiles. With `MLX_AGENT_E2E_BIN`, `__test__/chat-tool-pictures-real-agent.test.ts`
   reads a PNG and pages 4 to 6 of a 12-page PDF on the real agent (past 10 pages the agent needs the model's `pages`,
   which both `rawInput`s carry): the fake agent's lines have its shape, live and stored give the same `pictures`, and
-  the reader serves the wire's bytes from disk.
+  the reader serves the wire's bytes from disk. A `pdf-reader` agent of the PDF tool reads its `page-NNN.jpg` files
+  the same way: the image blocks are in the reader's own session (its Sessions transcript shows the read rows and
+  their tiles), and the conversation that sent the PDF holds no page images.
 - **Permission card** (`ui/src/pages/chat/work/permission.tsx`, `arc-x/interaction-card`). One card at a time, under
   the turn, in arrival order ("1 of 3"). It shows what the agent asks for exactly: the whole command, path or tool
   input in a scrolling well, never cut, as plain text with hidden, blank-looking and bidi characters made visible (the

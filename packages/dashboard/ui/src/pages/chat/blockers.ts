@@ -348,6 +348,24 @@ export function messageInputs(files: readonly DraftAttachment[], plan: PdfPlan |
   return files.map((file, i) => draftInput(file, ways[i]));
 }
 
+/** The stages a sent message no longer needs: each PDF whose pages went in the message. */
+export function sentStages(files: readonly DraftAttachment[], inputs: readonly AttachmentInput[]): string[] {
+  const out: string[] = [];
+  files.forEach((file, i) => {
+    const input = inputs[i];
+    if (file.kind === 'pdf' && file.stage !== null && input?.kind === 'pdf' && !('stage' in input))
+      out.push(file.stage);
+  });
+  return out;
+}
+
+/** The files of a message as a resend holds them: a PDF whose stage was dropped has none. */
+export function resendFiles(files: readonly DraftAttachment[], dropped: ReadonlySet<string>): DraftAttachment[] {
+  return files.map((file) =>
+    file.kind === 'pdf' && file.stage !== null && dropped.has(file.stage) ? { ...file, stage: null } : file,
+  );
+}
+
 /**
  * Why a message with these files cannot go, first match wins; null when it can. The composer shows it beside Send,
  * and `send()` checks it again, so Retry and Send again cannot pass it.
