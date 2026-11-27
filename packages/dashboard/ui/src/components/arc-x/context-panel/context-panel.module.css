@@ -1,0 +1,108 @@
+/* 320 px of content beside the panel's own padding. */
+.popover {
+  width: min(22rem, calc(100vw - 20px));
+}
+
+.root {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.section {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.section + .section {
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--border-subtle);
+}
+
+.title {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.head {
+  margin: 0;
+  font-size: var(--text-base);
+  font-variant-numeric: tabular-nums;
+}
+
+.parts {
+  display: grid;
+  margin: 0;
+  gap: var(--space-1);
+}
+
+.part {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.partName {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  color: var(--text-secondary);
+}
+
+.partValue {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.key {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  border-radius: var(--radius-mark);
+  background: var(--c);
+}
+
+.key[data-free] {
+  border: 1px solid var(--border-strong);
+  background: none;
+}
+
+.loading {
+  display: grid;
+  gap: var(--space-1);
+}
+
+.note {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: var(--text-sm);
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+}
+
+.actions .note {
+  min-width: 0;
+  flex: 1;
+}
+
+.compact[aria-disabled='true'] {
+  border-color: var(--border);
+  background: var(--surface-muted);
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.inspect {
+  justify-self: start;
+}

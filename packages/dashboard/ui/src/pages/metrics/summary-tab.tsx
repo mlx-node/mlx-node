@@ -23,13 +23,18 @@ import {
   formatRelativeTime,
   formatTps,
 } from '../../lib/format';
+import { METRIC } from '../../lib/metric-strings';
 import {
   axisNumber,
   bucketWord,
+  decodeSpeed,
   isKpiKey,
+  KPI_KEYS,
+  KPI_LABEL,
   kpiSeries,
   kpiTiles,
   phaseSegments,
+  prefillSpeed,
   RECORD_HINT,
   timeAxis,
   versusText,
@@ -49,11 +54,11 @@ import {
 import { useJson } from '../../lib/use-api';
 import { kpiDetail, kpiDetailLoading, ShowLink } from './kpi-detail';
 import {
-  MedianCell,
   quantileMax,
   RefreshAlert,
   regionError,
   regionState,
+  SampledCell,
   tileState,
   useHeldQuery,
   useMetricsScope,
@@ -64,18 +69,19 @@ import {
 type TsPoint = MetricsTimeseries['points'][number];
 type ByModelRow = MetricsSummary['byModel'][number];
 
-/** Medians with the p05–p95 band of one model; band keys are null below LOW_SAMPLE_TAIL_N. */
+/** `value` of one model with the per-turn p05–p95 band; band keys are null below LOW_SAMPLE_TAIL_N. */
 function bandPoints(
   points: readonly TsPoint[],
   range: Parameters<typeof pivotMeasures>[1],
   key: string,
   pick: (p: TsPoint) => Quantiles,
+  value: (p: TsPoint) => number | null,
 ): ChartPoint[] {
   const data = pivotMeasures(
     points,
     range,
     {
-      [key]: (p) => pick(p).p50,
+      [key]: value,
       p05: (p) => (pick(p).n >= LOW_SAMPLE_TAIL_N ? pick(p).p05 : null),
       p95: (p) => (pick(p).n >= LOW_SAMPLE_TAIL_N ? pick(p).p95 : null),
     },
@@ -123,10 +129,7 @@ export function SummaryTab(): ReactElement {
   const locals = useJson<ModelsResponse>('/models');
   useReportBusy(locals);
   const data = summary.data;
-  const tiles = useMemo(
-    () => (data === undefined ? null : kpiTiles(data, versusText(rangeKey), 'tails')),
-    [data, rangeKey],
-  );
+  const tiles = useMemo(() => (data === undefined ? null : kpiTiles(data, versusText(rangeKey))), [data, rangeKey]);
   const nonePoints = noneTs.data?.points;
   const top = useMemo(
     () => (data === undefined ? [] : model === null ? topModels(data.byModel) : [model]),
@@ -139,14 +142,15 @@ export function SummaryTab(): ReactElement {
     const word = bucketWord((kpi === 'failed' ? noneRange : byModelRange).bucket);
     if (kpi === 'decode' || kpi === 'ttft') {
       const pick = (p: TsPoint): Quantiles => (kpi === 'decode' ? p.decodeTps : p.ttftMs);
+      const value = (p: TsPoint): number | null => (kpi === 'decode' ? decodeSpeed(p.totals) : p.ttftMs.p50);
       let raw: ChartPoint[];
       let series: ChartSeries[];
       let dropped: string[] = [];
       if (model !== null) {
-        raw = bandPoints(points, byModelRange, model, pick);
+        raw = bandPoints(points, byModelRange, model, pick, value);
         series = [{ key: model, label: model, color: modelColor(model).color }];
       } else {
-        const pivot = pivotByModel(points, byModelRange, (p) => pick(p).p50, {
+        const pivot = pivotByModel(points, byModelRange, value, {
           empty: null,
           samples: (p) => pick(p).n,
           models: top,
@@ -157,11 +161,12 @@ export function SummaryTab(): ReactElement {
         series = modelSeries(top);
       }
       const axis = kpi === 'ttft' ? timeAxis(maxValue(raw)) : { unit: 'tok/s', div: 1 };
-      const title = kpi === 'decode' ? 'Decode speed' : 'Time to first token';
+      const title = kpi === 'decode' ? METRIC.decodeSpeed.label : 'Time to first token';
+      const measure = kpi === 'decode' ? 'Per' : 'Median per';
       const subtitle =
         model === null
-          ? `Median per ${word}, per model · ${axis.unit}`
-          : withModel(`Median with the p05–p95 range per ${word} · ${axis.unit}`, model);
+          ? `${measure} ${word}, per model · ${axis.unit}`
+          : withModel(`${measure} ${word}, with the p05–p95 range per turn · ${axis.unit}`, model);
       return {
         kind: 'line' as const,
         title,
@@ -217,7 +222,7 @@ export function SummaryTab(): ReactElement {
   const noTurns = totals !== undefined && totals.turns === 0;
   const noValue =
     data !== undefined &&
-    (kpi === 'decode' ? data.latency.decodeTps.n === 0 : kpi === 'ttft' ? data.latency.ttftMs.n === 0 : false);
+    (kpi === 'decode' ? decodeSpeed(data.totals) === null : kpi === 'ttft' ? data.latency.ttftMs.n === 0 : false);
   const chartSource = chart.kind === 'line' || kpi !== 'failed' ? byModelTs : noneTs;
   const mainState =
     summary.data === undefined ? regionState(summary, false) : regionState(chartSource, noTurns || noValue);
@@ -343,16 +348,9 @@ export function SummaryTab(): ReactElement {
 }
 
 function kpiPlaceholders(): ReturnType<typeof kpiTiles> {
-  const labels: Array<[KpiKey, string]> = [
-    ['decode', 'Decode speed'],
-    ['ttft', 'First token'],
-    ['turns', 'Turns'],
-    ['tokens', 'Output tokens'],
-    ['failed', 'Failed turns'],
-  ];
-  return labels.map(([key, label]) => ({
+  return KPI_KEYS.map((key) => ({
     key,
-    label,
+    label: KPI_LABEL[key],
     value: null,
     hint: '',
     delta: { current: null, previous: null, goodWhen: 'neutral', versus: '' },
@@ -434,10 +432,10 @@ function ModelsTable({
       width: bars ? LATENCY_COLUMN : undefined,
       cell: (row) => (
         <span className="inline-flex items-center gap-2">
-          <MedianCell text={formatTps(row.latency.decodeTps.p50)} n={row.latency.decodeTps.n} />
+          <SampledCell text={formatTps(decodeSpeed(row.totals))} n={row.latency.decodeTps.n} />
           {bars ? (
             <QuantileBar
-              label={`Decode speed of ${row.model}`}
+              label={`${METRIC.decodeSpeed.label} of ${row.model}, per turn`}
               quantiles={row.latency.decodeTps}
               min={0}
               max={decodeMax}
@@ -449,15 +447,15 @@ function ModelsTable({
           ) : null}
         </span>
       ),
-      sortValue: (row) => row.latency.decodeTps.p50,
+      sortValue: (row) => decodeSpeed(row.totals),
     },
     {
       id: 'ttft',
-      header: 'First token',
+      header: METRIC.firstToken.label,
       width: bars ? LATENCY_COLUMN : undefined,
       cell: (row) => (
         <span className="inline-flex items-center gap-2">
-          <MedianCell text={formatDuration(row.latency.ttftMs.p50)} n={row.latency.ttftMs.n} />
+          <SampledCell text={formatDuration(row.latency.ttftMs.p50)} n={row.latency.ttftMs.n} />
           {bars ? (
             <QuantileBar
               label={`Time to first token of ${row.model}`}
@@ -480,8 +478,8 @@ function ModelsTable({
       align: 'end',
       width: 90,
       minTableWidth: 760,
-      cell: (row) => <MedianCell text={formatCount(row.latency.prefillTps.p50)} n={row.latency.prefillTps.n} />,
-      sortValue: (row) => row.latency.prefillTps.p50,
+      cell: (row) => <SampledCell text={formatCount(prefillSpeed(row.totals))} n={row.latency.prefillTps.n} />,
+      sortValue: (row) => prefillSpeed(row.totals),
     },
     {
       id: 'failed',

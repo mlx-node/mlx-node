@@ -9,16 +9,20 @@ export interface StepsProps {
   steps: readonly string[];
   /** 0-based. */
   current: number;
+  /** Which steps show a check; default: every step before `current`. */
+  done?: readonly boolean[];
+  /** The labels are read by assistive tech only; the dots stand alone. */
+  bare?: boolean;
   className?: string;
 }
 
 /** Numbered steps joined by hairlines; done steps show a check. Narrow: only the current label is shown. */
-export function Steps({ label, steps, current, className }: StepsProps): ReactElement {
+export function Steps({ label, steps, current, done, bare, className }: StepsProps): ReactElement {
   return (
-    <div className={cn(styles.root, className)}>
+    <div className={cn(styles.root, className)} data-bare={bare === true ? '' : undefined}>
       <ol className={styles.list} aria-label={label}>
         {steps.map((step, index) => {
-          const complete = index < current;
+          const complete = done === undefined ? index < current : done[index] === true && index !== current;
           const isCurrent = index === current;
           return (
             <li

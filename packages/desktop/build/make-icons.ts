@@ -1,22 +1,25 @@
 /**
  * Generate the macOS, Windows, and Microsoft Store MSIX app icons.
  *
- * macOS assets use `images/logo.png` (canonical MLX wordmark plus green node)
- * on a white rounded tile, with the compact X + node optical variant at
- * 16px..32px, and `tray-icon-source.png` thresholded into a pure black-and-alpha
- * menu-bar template (`iconTemplate.png` / `iconTemplate@2x.png`).
- *
- * Windows and Microsoft Store MSIX assets use `portato-logo-source.png`
- * (canonical 1024x1024 Portato mascot + wordmark):
- * - Square icons (`icon.ico` and square MSIX tiles) place the extracted Portato
- *   mascot emblem on a warm `#F1F2EC` rounded-square tile with transparent outer
- *   corners and a subtle dark keyline (`rgba(22, 25, 24, 0.22)`) so the icon
- *   reads cleanly on both dark (`#202020`) and light (`#F3F3F3`) Windows taskbars.
+ * App icons use `portato-logo-source.png` (canonical 1024x1024 Portato mascot +
+ * wordmark), with the mascot emblem extracted onto a warm `#F1F2EC` tile:
+ * - The macOS app icon (`icon.icns`) puts the tile on the macOS app icon grid
+ *   (824px rounded tile in a 1024px canvas, transparent outside) with a soft
+ *   built-in shadow and a faint dark keyline that keeps the tile edge visible in
+ *   a white Dock.
+ * - Square Windows icons (`icon.ico` and square MSIX tiles) fill the canvas with
+ *   the rounded-square tile, with transparent outer corners and a subtle dark
+ *   keyline (`rgba(22, 25, 24, 0.22)`) so the icon reads cleanly on both dark
+ *   (`#202020`) and light (`#F3F3F3`) Windows taskbars.
  * - Wide tiles and splash screens (`Wide310x150Logo*`, `SplashScreen*`) render a
  *   rounded `#F1F2EC` card with a centered horizontal lockup of the mascot emblem
  *   and the `portato` wordmark.
  * - MSIX PNGs are kept strictly below Microsoft Store WACK's 204,800-byte limit
  *   (quantizing oversized truecolor assets to 8-bit indexed PNG with `PLTE` + `tRNS`).
+ *
+ * The macOS menu-bar template (`iconTemplate.png` / `iconTemplate@2x.png`) is
+ * `tray-icon-source.png` (hexagon M) thresholded into pure black and alpha: a
+ * Portato head silhouette fuses its ears into the head at 16px.
  *
  *     icon.iconset/ -> icon.icns      macOS app icon, 10 images, 16..1024 with @2x (darwin only)
  *     icon.ico                        Windows multi-resolution PNG-in-ICO, 16..256
@@ -47,7 +50,6 @@ import { MAX_MSIX_ASSET_BYTES } from '../scripts/windows-msix.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = resolve(HERE, '..', '..', '..');
-const LOGO_PATH = join(REPO_ROOT, 'images', 'logo.png');
 const TRAY_SOURCE_PATH = join(HERE, 'tray-icon-source.png');
 const PORTATO_SOURCE_PATH = join(HERE, 'portato-logo-source.png');
 
@@ -67,9 +69,7 @@ interface RgbaImage {
   pixels: Uint8Array;
 }
 
-// Bounds measured from the canonical 1024px logos.
-const WORDMARK_BOUNDS: Bounds = [98, 404, 926, 630];
-const COMPACT_BOUNDS: Bounds = [552, 404, 926, 630];
+// Bounds measured from the canonical 1024px Portato source.
 const PORTATO_EMBLEM_REGION: Bounds = [205, 160, 843, 775];
 const PORTATO_WORDMARK_REGION: Bounds = [0, 795, CANVAS, CANVAS];
 const PORTATO_BG_TOLERANCE = 26;
@@ -106,14 +106,6 @@ function decodeOpaqueImage(path: string): RgbaImage {
   return { width: metadata.width, height: metadata.height, pixels };
 }
 
-function decodeLogo(): RgbaImage {
-  const logo = decodeOpaqueImage(LOGO_PATH);
-  if (logo.width !== CANVAS || logo.height !== CANVAS) {
-    throw new Error(`${LOGO_PATH} must be ${CANVAS}x${CANVAS}, got ${logo.width}x${logo.height}`);
-  }
-  return logo;
-}
-
 function decodePortatoSource(): RgbaImage {
   const logo = decodeOpaqueImage(PORTATO_SOURCE_PATH);
   if (logo.width !== CANVAS || logo.height !== CANVAS) {
@@ -122,7 +114,6 @@ function decodePortatoSource(): RgbaImage {
   return logo;
 }
 
-const SOURCE_LOGO = decodeLogo();
 const TRAY_SOURCE = decodeOpaqueImage(TRAY_SOURCE_PATH);
 const PORTATO_SOURCE = decodePortatoSource();
 
@@ -210,7 +201,7 @@ function roundedRectContains(
   return dx * dx + dy * dy <= radius * radius;
 }
 
-function drawTile(size: number): RgbaImage {
+function drawTile(size: number, fill: Rgb): RgbaImage {
   const renderSize = size * APP_SS;
   const tile = blankImage(renderSize, renderSize);
   const left = scaled(SQUIRCLE_MARGIN, size, APP_SS);
@@ -228,7 +219,7 @@ function drawTile(size: number): RgbaImage {
     }
   }
 
-  // A small built-in shadow makes the white tile retain its shape in asset
+  // A small built-in shadow makes the light tile retain its shape in asset
   // previews; macOS adds the larger system shadow in the Dock.
   const shadow = blankImage(renderSize, renderSize);
   for (let pixel = 0; pixel < mask.length; pixel += 1) {
@@ -246,9 +237,9 @@ function drawTile(size: number): RgbaImage {
   for (let pixel = 0; pixel < mask.length; pixel += 1) {
     if (mask[pixel] === 0) continue;
     const offset = pixel * 4;
-    tile.pixels[offset] = 255;
-    tile.pixels[offset + 1] = 255;
-    tile.pixels[offset + 2] = 255;
+    tile.pixels[offset] = fill[0];
+    tile.pixels[offset + 1] = fill[1];
+    tile.pixels[offset + 2] = fill[2];
     tile.pixels[offset + 3] = 255;
   }
 
@@ -276,13 +267,9 @@ function drawTile(size: number): RgbaImage {
 }
 
 function appIcon(size: number): RgbaImage {
-  const image = drawTile(size);
-  const compact = size <= 32;
-  const mark = cropImage(SOURCE_LOGO, compact ? COMPACT_BOUNDS : WORDMARK_BOUNDS);
-  const targetWidth = scaled(compact ? 690 : 716, size);
-  const targetHeight = Math.max(1, Math.round((mark.height * targetWidth) / mark.width));
-  const resizedMark = resizeImage(mark, targetWidth, targetHeight);
-  compositeAt(image, resizedMark, Math.trunc((size - targetWidth) / 2), Math.trunc((size - targetHeight) / 2));
+  const image = drawTile(size, PORTATO_BG);
+  const fillRatio = size <= 64 ? 0.9 : 0.86;
+  compositeEmblem(image, Math.max(1, Math.round(((size * SQUIRCLE) / CANVAS) * fillRatio)));
   return image;
 }
 
@@ -689,6 +676,18 @@ const PORTATO_BG = sampleCornerBackground(PORTATO_SOURCE);
 const PORTATO_EMBLEM = extractPortatoEmblem(PORTATO_SOURCE, PORTATO_BG);
 const PORTATO_WORDMARK = extractPortatoWordmark(PORTATO_SOURCE, PORTATO_BG);
 
+function compositeEmblem(image: RgbaImage, box: number): void {
+  const scale = Math.min(box / PORTATO_EMBLEM.width, box / PORTATO_EMBLEM.height);
+  const width = Math.max(1, Math.round(PORTATO_EMBLEM.width * scale));
+  const height = Math.max(1, Math.round(PORTATO_EMBLEM.height * scale));
+  compositeAt(
+    image,
+    resizeImage(PORTATO_EMBLEM, width, height),
+    Math.round((image.width - width) / 2),
+    Math.round((image.height - height) / 2),
+  );
+}
+
 const WINDOWS_TILE_KEYLINE_RGB: Rgb = [22, 25, 24];
 const WINDOWS_TILE_KEYLINE_ALPHA = 0.22;
 const WINDOWS_TILE_RADIUS_RATIO = 0.225;
@@ -775,12 +774,7 @@ function drawWindowsTile(size: number, fill: Rgb): RgbaImage {
 function windowsAppIcon(size: number): RgbaImage {
   const image = drawWindowsTile(size, PORTATO_BG);
   const fillRatio = size <= 24 ? 0.9 : 0.86;
-  const targetBox = Math.max(1, Math.round(size * fillRatio));
-  const scale = Math.min(targetBox / PORTATO_EMBLEM.width, targetBox / PORTATO_EMBLEM.height);
-  const targetWidth = Math.max(1, Math.round(PORTATO_EMBLEM.width * scale));
-  const targetHeight = Math.max(1, Math.round(PORTATO_EMBLEM.height * scale));
-  const resizedMark = resizeImage(PORTATO_EMBLEM, targetWidth, targetHeight);
-  compositeAt(image, resizedMark, Math.round((size - targetWidth) / 2), Math.round((size - targetHeight) / 2));
+  compositeEmblem(image, Math.max(1, Math.round(size * fillRatio)));
 
   const cornerOffsets = [3, (size - 1) * 4 + 3, (size - 1) * size * 4 + 3, (size * size - 1) * 4 + 3];
   for (const alphaOffset of cornerOffsets) {
@@ -799,12 +793,7 @@ function windowsAppIcon(size: number): RgbaImage {
 function windowsLightUnplatedIcon(size: number): RgbaImage {
   const image = blankImage(size, size);
   const fillRatio = size <= 24 ? 0.94 : 0.9;
-  const targetBox = Math.max(1, Math.round(size * fillRatio));
-  const scale = Math.min(targetBox / PORTATO_EMBLEM.width, targetBox / PORTATO_EMBLEM.height);
-  const targetWidth = Math.max(1, Math.round(PORTATO_EMBLEM.width * scale));
-  const targetHeight = Math.max(1, Math.round(PORTATO_EMBLEM.height * scale));
-  const resizedMark = resizeImage(PORTATO_EMBLEM, targetWidth, targetHeight);
-  compositeAt(image, resizedMark, Math.round((size - targetWidth) / 2), Math.round((size - targetHeight) / 2));
+  compositeEmblem(image, Math.max(1, Math.round(size * fillRatio)));
 
   const cornerOffsets = [3, (size - 1) * 4 + 3, (size - 1) * size * 4 + 3, (size * size - 1) * 4 + 3];
   for (const alphaOffset of cornerOffsets) {

@@ -41,6 +41,7 @@ export function createDbWorkerEngine(boot: DbWorkerBootstrap): DbWorkerEngine {
     agentHome,
     chatAgentHome,
     chatIndexPath,
+    scratchFolders,
   } = boot;
 
   const dash = openDashboardDb(dbPath);
@@ -99,6 +100,7 @@ export function createDbWorkerEngine(boot: DbWorkerBootstrap): DbWorkerEngine {
     agentSessions: new AgentSessionsReader({ agentHome }),
     chatSessions: new AgentSessionsReader({ agentHome: chatAgentHome, origin: 'chat' }),
     chatIndex: () => readWorkIndexSync(chatIndexPath),
+    scratchFolders,
   };
 
   let closed = false;

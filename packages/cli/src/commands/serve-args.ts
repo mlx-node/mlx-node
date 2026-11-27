@@ -46,6 +46,8 @@ export interface ServeArgs {
   /** `--thinking-cycle-guard`; unset when not given. */
   thinkingCycleGuard?: true;
   thinkingEndText?: string;
+  /** `--thinking-levels`; unset when not given. */
+  thinkingLevels?: true;
   rerankConfig?: string;
   logDir?: string;
 }
@@ -88,6 +90,7 @@ export function parseServeArgs(
       'thinking-token-budget': { type: 'string' },
       'thinking-cycle-guard': { type: 'boolean' },
       'thinking-end-text': { type: 'string' },
+      'thinking-levels': { type: 'boolean' },
       'rerank-config': { type: 'string' },
       'auth-token': { type: 'string' },
       verbose: { type: 'boolean', short: 'v', default: false },
@@ -166,6 +169,7 @@ export function parseServeArgs(
     ...(thinkingTokenBudget !== undefined ? { thinkingTokenBudget } : {}),
     ...(values['thinking-cycle-guard'] === true ? { thinkingCycleGuard: true as const } : {}),
     ...(thinkingEndText !== undefined ? { thinkingEndText } : {}),
+    ...(values['thinking-levels'] === true ? { thinkingLevels: true as const } : {}),
     ...(values['rerank-config'] !== undefined ? { rerankConfig: values['rerank-config'] } : {}),
     authToken: values['auth-token'],
     logDir: verbose ? resolveLogDir(values['log-dir'], resolveMlxNodeHome()) : undefined,

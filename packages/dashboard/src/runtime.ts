@@ -31,6 +31,7 @@ import { dispatchMain, isApiPath, routePatternFor, splitSegments } from './api/d
 import { failure, toFailure, type ApiResponse } from './api/errors.js';
 import { launchFromProbe, type HostTimings } from './chat/agent/agent-host.js';
 import type { EndpointReader } from './chat/agent/endpoint.js';
+import { needsLoginPath, resolveLoginPath, withLoginPath } from './chat/agent/login-path.js';
 import type { AllowedRoot } from './chat/agent/roots.js';
 import { chatPaths, defaultChatRoot } from './chat/paths.js';
 import { KeyringSecretStore, type SecretStore } from './chat/providers/secrets.js';
@@ -40,6 +41,7 @@ import { redactDeep, redactEntry } from './chat/redact.js';
 import { ChatService, webServerScript, type AgentResolution } from './chat/service.js';
 import { readPathEnv } from './chat/skills/cli-check.js';
 import type { AppEnd, ChatHostEvent, ConversationEvent } from './chat/types.js';
+import type { GitDeps } from './chat/work-git.js';
 import { CodingAgentsService } from './coding-agents.js';
 import type { CodingAgentsOptions } from './coding-agents.js';
 import { DownloadManager, type DownloadEvent } from './download.js';
@@ -72,8 +74,11 @@ export interface ChatRuntimeOptions {
   readEndpoint?: EndpointReader;
   /** The size on disk of a model path. Default: the files on disk. The dev harness passes fixture sizes. */
   modelSize?: (path: string) => Promise<number | null>;
-  /** Replaces the agent binary and its version check (the scripted fake agent). */
-  agentCommand?: { command: string; args: string[]; env?: Record<string, string> };
+  /**
+   * Replaces the agent binary and its version check (the scripted fake agent). `tag`: the release its launch reports
+   * (default none, as an unreleased build).
+   */
+  agentCommand?: { command: string; args: string[]; env?: Record<string, string>; tag?: string };
   /** What the agent runs the web tool server with. Default: this process's executable. */
   node?: { command: string };
   /** Where provider keys are kept. Default: the macOS Keychain. Tests and the dev harness pass a memory store. */
@@ -82,15 +87,18 @@ export interface ChatRuntimeOptions {
   providerBaseUrls?: Partial<Record<ProviderId, string>>;
   /** Runs `mlx agent update` for the install action. */
   installAgent?: () => Promise<void>;
-  /** Work: the process cwd (the user's home). */
+  /** Work: the user's home. */
   homeDir?: string;
   /** Work: the environment the agent inherits. Default: this process's. Tests and the dev harness pass a throwaway home. */
   baseEnv?: NodeJS.ProcessEnv;
   /**
-   * Work: the `PATH` a command of the agent gets, for `baseEnv` and `homeDir`. Default: the `PATH` of `baseEnv`. The
+   * Work: the `PATH` a command of the agent gets, for `baseEnv` (with the login `PATH` first in the app, as the agent
+   * gets it) and `homeDir`. Default: the `PATH` of that env. The
    * Control Panel passes `workCommandPath`, which asks the user's login shell.
    */
   workPath?: (base: NodeJS.ProcessEnv, home: string) => string | undefined | Promise<string | undefined>;
+  /** Work: the shell asked for the login `PATH` in the app. Default: the user record's. Tests pass a fake. */
+  loginShell?: string;
   /** Work: the temp roots Auto covers. Default: `/tmp` when the resolver accepts it. Tests pass `[]` or a throwaway root. */
   tempRoots?: readonly AllowedRoot[];
   /** With no window attached for this long, open Work requests are denied. */
@@ -103,6 +111,8 @@ export interface ChatRuntimeOptions {
   appEnds?: Promise<readonly AppEnd[]>;
   /** Called when a turn starts or ends, so the process can tell MAIN at once. */
   onBusyChange?: () => void;
+  /** Tests: how the Work branch tray finds and runs git. */
+  gitDeps?: Partial<GitDeps>;
 }
 
 export interface DashboardRuntimeOptions {
@@ -117,7 +127,7 @@ export interface DashboardRuntimeOptions {
   cacheRoot?: string;
   /** The model caches root. Default `~/.mlx-node/cache/prefix-cache`. */
   prefixCacheRoot?: string;
-  /** grok-build (`mlx agent`) config home for the Sessions API. Default `agentConfigDir()`. */
+  /** mlx-agent (`mlx agent`) config home: the Sessions API and `GROK_HOME` of the Work agent. Default `agentConfigDir()`. */
   agentHome?: string;
   /**
    * Override the database worker's entry module. Packaging needs this: under
@@ -251,10 +261,11 @@ function webServerCommand(): string {
 
 function resolveAgent(command: ChatRuntimeOptions['agentCommand']): AgentResolution {
   if (command !== undefined) {
+    const { tag = null, ...launch } = command;
     return {
-      launch: { ...command, source: 'test', tag: null, versionVerified: false },
+      launch: { ...launch, source: 'test', tag, versionVerified: tag !== null },
       source: 'test',
-      tag: null,
+      tag,
     };
   }
   try {
@@ -300,7 +311,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   const cacheRoot = opts.cacheRoot;
   const prefixCacheRoot = opts.prefixCacheRoot;
   // Absolute: the resume command `cd`s into the session cwd before setting
-  // GROK_HOME, and grok uses it verbatim, so a relative home would point elsewhere.
+  // MLX_AGENT_HOME, and the Work agent runs in its own folder, so a relative home would point elsewhere.
   const agentHome = resolve(opts.agentHome ?? agentConfigDir());
   const chatOpts = opts.chat ?? {};
   const paths = chatPaths(resolve(chatOpts.root ?? defaultChatRoot()));
@@ -326,6 +337,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     agentHome,
     chatAgentHome: paths.chatAgent,
     chatIndexPath: paths.conversations,
+    scratchFolders: paths.scratchFolders,
   };
   const worker = opts.inProcessWorker
     ? startInProcessDbWorker(workerBoot)
@@ -356,11 +368,17 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
   });
   const workBase = chatOpts.baseEnv ?? process.env;
   const workHome = chatOpts.homeDir ?? homedir();
+  const workLoginPath = needsLoginPath(workBase)
+    ? resolveLoginPath({ base: workBase, home: workHome, shell: chatOpts.loginShell })
+    : undefined;
   const providers = new ProvidersService({
     paths,
     secrets: chatOpts.secrets ?? new KeyringSecretStore(),
     baseUrls: chatOpts.providerBaseUrls,
-    workPath: () => (chatOpts.workPath === undefined ? readPathEnv(workBase) : chatOpts.workPath(workBase, workHome)),
+    workPath: async () => {
+      const base = withLoginPath(workBase, await workLoginPath);
+      return chatOpts.workPath === undefined ? readPathEnv(base) : chatOpts.workPath(base, workHome);
+    },
   });
   const readEndpoint = chatOpts.readEndpoint ?? (() => readDesktopEndpoint());
   const chat = new ChatService({
@@ -380,9 +398,9 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     webServer: { command: chatOpts.node?.command ?? webServerCommand(), script: webServerScript() },
     installAgent: chatOpts.installAgent,
     extraCaCerts: process.env.NODE_EXTRA_CA_CERTS,
-    agentHome: agentHome === resolve(agentConfigDir()) ? null : agentHome,
     workAgentHome: agentHome,
     baseEnv: chatOpts.baseEnv,
+    workLoginPath,
     tempRoots: chatOpts.tempRoots,
     pageGoneMs: chatOpts.pageGoneMs,
     homeDir: chatOpts.homeDir,
@@ -392,6 +410,7 @@ export function createDashboardRuntime(opts: DashboardRuntimeOptions = {}): Dash
     stateCoalesceMs: chatOpts.stateCoalesceMs,
     appEnds: chatOpts.appEnds,
     onBusyChange: chatOpts.onBusyChange,
+    gitDeps: chatOpts.gitDeps,
   });
   const systemone = new SystemOneService({
     modelsDir,

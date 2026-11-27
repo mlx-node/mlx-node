@@ -80,6 +80,15 @@
   color: var(--foreground);
 }
 
+.root[data-bare] .label {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
 @container (max-width: 519px) {
   .step:not([data-current]) > .label {
     position: absolute;

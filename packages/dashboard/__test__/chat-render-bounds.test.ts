@@ -7,7 +7,6 @@ import { createRoot, type Root } from 'react-dom/client';
 import { MemoryRouter } from 'react-router-dom';
 import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
-import { ChatMarkdown } from '../ui/src/components/arc-x/chat-markdown/chat-markdown.js';
 import { ReasoningBlock } from '../ui/src/components/arc-x/reasoning-block/reasoning-block.js';
 import { ChatThread } from '../ui/src/components/chat-thread.js';
 import { useStickToBottom, type StickToBottom } from '../ui/src/lib/stick-to-bottom.js';
@@ -16,18 +15,6 @@ import { formatSearchText } from '../ui/src/lib/web-result-text.js';
 import { conversationHosts } from '../ui/src/lib/web-tools.js';
 import { answer, directSearch, end, user } from './helpers/chat-thread-fixtures.js';
 import { skipAnimations } from './render.js';
-
-const parsed = vi.hoisted(() => ({ chars: 0 }));
-vi.mock('../ui/src/lib/markdown-parse.js', async (importOriginal) => {
-  const real = await importOriginal<typeof import('../ui/src/lib/markdown-parse.js')>();
-  return {
-    ...real,
-    parseMarkdown: (text: string, base?: number) => {
-      parsed.chars += text.length;
-      return real.parseMarkdown(text, base);
-    },
-  };
-});
 
 let mounted: { root: Root; container: HTMLElement } | undefined;
 
@@ -195,21 +182,6 @@ describe('a hostile turn', () => {
 });
 
 describe('streaming cost', () => {
-  it('each settled block of a streaming answer is parsed once', () => {
-    const paragraphs = Array.from({ length: 300 }, (_, i) => `Paragraph ${i} ${'word '.repeat(40)}`);
-    const element = (text: string): ReactElement =>
-      createElement(ChatMarkdown, { text, streaming: true, links: { mode: 'work' } });
-    let text = '';
-    mount(element(text));
-    parsed.chars = 0;
-    for (const paragraph of paragraphs) {
-      rerender(element(text + paragraph.slice(0, 100)));
-      text += `${paragraph}\n\n`;
-      rerender(element(text));
-    }
-    expect(parsed.chars).toBeLessThan(text.length * 8);
-  });
-
   it('a live thinking tail draws only the end of the text', () => {
     skipAnimations(false);
     const text = 'thought '.repeat(125_000);

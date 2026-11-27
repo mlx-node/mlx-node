@@ -1,5 +1,6 @@
 .root {
   container: composer / inline-size;
+  position: relative;
   box-sizing: border-box;
   display: grid;
   min-width: 0;
@@ -155,6 +156,7 @@
 }
 
 .fit[data-side='reason'],
+.fit[data-side='hint'],
 .fit[data-side='count'] {
   height: auto;
   min-height: var(--control-height-sm);
@@ -232,6 +234,19 @@
   color: var(--info);
 }
 
+.contextButton {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  background: none;
+  cursor: pointer;
+}
+
+.contextButton:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
 .context[data-tone='warning'] {
   color: var(--warning);
 }
@@ -261,6 +276,10 @@
   background: var(--accent);
   color: var(--accent-foreground);
   cursor: pointer;
+}
+
+.stopSmall {
+  flex: none;
 }
 
 .send:disabled {

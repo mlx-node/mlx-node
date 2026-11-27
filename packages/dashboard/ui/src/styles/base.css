@@ -30,3 +30,24 @@ pre,
 samp {
   font-family: var(--font-code);
 }
+
+/* The thread card the activity rail jumped to. */
+[data-entry-flash] {
+  border-radius: var(--radius-panel);
+  animation: entry-flash 1.2s var(--ease-standard) both;
+}
+
+@keyframes entry-flash {
+  from {
+    box-shadow: 0 0 0 2px var(--accent-strong);
+  }
+  to {
+    box-shadow: 0 0 0 2px transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-entry-flash] {
+    animation-duration: 0.01ms;
+  }
+}

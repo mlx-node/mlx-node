@@ -1,18 +1,21 @@
 /**
  * The `mlx_web` server as the agent runs it (a child process on stdio): the MCP methods it answers, the exact tool
  * schemas, `not-configured` with no provider, sloppy and wrong arguments, malformed and oversized frames, and a
- * stderr that only ever holds the fixed lines. Then the tool layer with a fake adapter, and the source rules: no
- * `console`, only `node:` and own imports.
+ * stderr that only ever holds the fixed lines, and `web_fetch` refused for any address its ledger file does not list.
+ * Then the tool layer with a fake adapter, and the source rules: no `console`, only `node:` and own imports.
  */
 
 import { spawn } from 'node:child_process';
-import { readdirSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { describe, expect, it } from 'vite-plus/test';
 
+import { AddressLedger, writeLedgerFile } from '../src/chat/agent/address-ledger.js';
 import { STDERR_LINES } from '../src/chat/web/errors.js';
+import { forwardsAsWritten } from '../src/chat/web/ledger-file.js';
 import { MAX_FRAME_BYTES } from '../src/chat/web/mcp.js';
 import { formatErrorText, parseWebResultText } from '../src/chat/web/result-text.js';
 import {
@@ -28,6 +31,20 @@ import {
 const WEB_DIR = fileURLToPath(new URL('../src/chat/web/', import.meta.url));
 const BOOTSTRAP = join(WEB_DIR, 'server-ts-bootstrap.ts');
 const KEY = 'sk-WEB-KEY-0123456789';
+const LEDGER_DIR = mkdtempSync(join(tmpdir(), 'mlx-web-ledger-'));
+
+/** A ledger file of these addresses, as the host writes it. */
+function ledgerFile(name: string, ledger: AddressLedger): string {
+  const path = join(LEDGER_DIR, name);
+  writeLedgerFile(path, ledger.members());
+  return path;
+}
+
+function ledgerOf(...urls: string[]): AddressLedger {
+  const ledger = new AddressLedger();
+  ledger.addSearchResults(urls);
+  return ledger;
+}
 
 interface Run {
   replies: Array<Record<string, unknown>>;
@@ -114,6 +131,28 @@ describe('mlx_web over stdio', () => {
     expect(JSON.stringify(out.replies)).not.toContain(KEY);
   });
 
+  it('refuses a read whose address its ledger file does not list, and any read with no readable ledger file', async () => {
+    const listed = ledgerFile('stdio.json', ledgerOf('https://listed.example/a'));
+    const garbage = join(LEDGER_DIR, 'garbage.json');
+    writeFileSync(garbage, '{"addresses": ["https://listed.example/a"]}');
+    const envs: Array<[Record<string, string>, string]> = [
+      [{ MLX_WEB_LEDGER: listed }, 'https://other.example/a'],
+      [{ MLX_WEB_LEDGER: listed }, 'https://listed.example/a?d=more'],
+      [{}, 'https://listed.example/a'],
+      [{ MLX_WEB_LEDGER: join(LEDGER_DIR, 'missing.json') }, 'https://listed.example/a'],
+      [{ MLX_WEB_LEDGER: garbage }, 'https://listed.example/a'],
+    ];
+    for (const [env, url] of envs) {
+      const out = await run([callTool(1, 'web_fetch', { url })], {
+        MLX_WEB_FETCH_PROVIDER: 'firecrawl',
+        MLX_WEB_FETCH_KEY: KEY,
+        ...env,
+      });
+      expect(out.stderr).toBe('');
+      expect([url, env, textOf(out.replies[0])]).toEqual([url, env, formatErrorText('blocked', 'firecrawl')]);
+    }
+  });
+
   it('says not-configured with no provider, and with a provider but no key', async () => {
     const envs: Array<Record<string, string>> = [
       {},
@@ -175,7 +214,13 @@ describe('mlx_web over stdio', () => {
   });
 });
 
-const CONFIG: WebConfig = { searchProvider: 'exa', searchKey: KEY, fetchProvider: 'exa', fetchKey: KEY };
+const CONFIG: WebConfig = {
+  searchProvider: 'exa',
+  searchKey: KEY,
+  fetchProvider: 'exa',
+  fetchKey: KEY,
+  ledgerFile: ledgerFile('config.json', ledgerOf('https://example.com/', 'https://example.com/docs')),
+};
 
 /** A fetch that answers from `answer` and records each URL it was asked for. */
 function fakeFetch(answer: (url: string) => Promise<Response>): { fetch: typeof fetch; urls: string[] } {
@@ -240,6 +285,128 @@ describe('web tools', () => {
     expect(page).toMatchObject({ kind: 'page', url: 'https://example.com/docs' });
     expect(await tools.call('web_fetch', { url: 'http://127.1/' })).toBe(formatErrorText('blocked', 'exa'));
     expect(fake.urls).toEqual(['http://127.0.0.1:9/contents']);
+  });
+
+  it('reads only addresses its ledger file lists, and reads the file again at every call', async () => {
+    const fake = fakeFetch(() => Promise.resolve(Response.json({ results: [{ title: 'T', text: 'Body' }] })));
+    const ledger = ledgerOf('https://listed.example/a');
+    const path = ledgerFile('every-call.json', ledger);
+    const tools = new WebTools({ ...CONFIG, ledgerFile: path }, deps(fake.fetch));
+    expect(parseWebResultText(await tools.call('web_fetch', { url: 'https://LISTED.example/a/' }))).toMatchObject({
+      kind: 'page',
+    });
+    expect(await tools.call('web_fetch', { url: 'https://linked.example/b' })).toBe(formatErrorText('blocked', 'exa'));
+    expect(fake.urls).toHaveLength(1);
+    ledger.addPageText('See [the report](https://linked.example/b).');
+    writeLedgerFile(path, ledger.members());
+    expect(parseWebResultText(await tools.call('web_fetch', { url: 'https://linked.example/b' }))).toMatchObject({
+      kind: 'page',
+    });
+    expect(fake.urls).toHaveLength(2);
+  });
+
+  it('allows nothing with no ledger file, an unreadable one, or one of another shape', async () => {
+    const fake = fakeFetch(() => Promise.resolve(Response.json({ results: [{ title: 'T', text: 'Body' }] })));
+    const url = 'https://listed.example/a';
+    const files: Array<[string, string | null]> = [
+      ['none', null],
+      ['broken', '["https://listed.example/a"'],
+      ['object', '{"addresses": ["https://listed.example/a"]}'],
+      ['mixed', '["https://listed.example/a", 1]'],
+      ['text', 'https://listed.example/a\n'],
+    ];
+    for (const [name, text] of files) {
+      const path = join(LEDGER_DIR, `shape-${name}.json`);
+      if (text !== null) writeFileSync(path, text);
+      const tools = new WebTools({ ...CONFIG, ledgerFile: path }, deps(fake.fetch));
+      expect([name, await tools.call('web_fetch', { url })]).toEqual([name, formatErrorText('blocked', 'exa')]);
+    }
+    const noEnv = new WebTools({ ...CONFIG, ledgerFile: '' }, deps(fake.fetch));
+    expect(await noEnv.call('web_fetch', { url })).toBe(formatErrorText('blocked', 'exa'));
+    expect(fake.urls).toEqual([]);
+  });
+
+  it('refuses a listed address whose forwarded text carries more than its normal form; a fragment is never forwarded', async () => {
+    const fake = fakeFetch(() => Promise.resolve(Response.json({ results: [{ title: 'T', text: 'Body' }] })));
+    const path = ledgerFile(
+      'forwarded.json',
+      ledgerOf('https://attacker.example/article', 'https://de.wikipedia.org/wiki/M%C3%BCller'),
+    );
+    const tools = new WebTools({ ...CONFIG, ledgerFile: path }, deps(fake.fetch));
+    for (const url of [
+      'https://attacker.example/pw-hunter2/../article',
+      'https://attacker.example/./article',
+      'https://attacker.example/%2e%2e/article',
+      'https://attacker.example/art\ticle',
+      'https://attacker.example/art\nicle',
+      'https://attacker.example\\article',
+      'https://attacker.example:443/article',
+      'https://%61ttacker.example/article',
+    ]) {
+      expect([url, await tools.call('web_fetch', { url })]).toEqual([url, formatErrorText('blocked', 'exa')]);
+    }
+    expect(fake.urls).toEqual([]);
+    for (const url of [
+      'https://attacker.example/article',
+      ' https://attacker.example/article/ ',
+      'HTTPS://Attacker.Example/article',
+      'https://de.wikipedia.org/wiki/Müller',
+      'https://de.wikipedia.org/wiki/M%C3%BCller',
+      'https://attacker.example/article#user-said-my-password-is-hunter2',
+      'https://attacker.example/article#',
+    ]) {
+      expect([url, parseWebResultText(await tools.call('web_fetch', { url }))?.kind]).toEqual([url, 'page']);
+    }
+  });
+
+  it('the address the provider fetches is in the ledger, for every address the server lets through', async () => {
+    const ledger = new AddressLedger();
+    ledger.addUserText('Read https://user.example/guide.');
+    ledger.addSearchResults(['https://attacker.example/article', 'https://de.wikipedia.org/wiki/M%C3%BCller']);
+    const asked: string[] = [];
+    const tools = new WebTools(
+      { ...CONFIG, ledgerFile: ledgerFile('provider.json', ledger) },
+      deps((_input, init) => {
+        asked.push((JSON.parse(init?.body as string) as { urls: string[] }).urls[0]!);
+        return Promise.resolve(Response.json({ results: [{ title: 't', text: 'body' }] }));
+      }),
+    );
+    const written = [
+      'https://user.example/guide',
+      'https://user.example/guide.',
+      'https://user.example/guide#part-2',
+      ' https://attacker.example/article/ ',
+      'HTTPS://Attacker.Example/article#user-said-my-password-is-hunter2',
+      'https://attacker.example/article#',
+      'https://de.wikipedia.org/wiki/Müller#Leben',
+      'https://attacker.example/article?d=secret',
+      'https://attacker.example/pw/../article',
+      'https://attacker.example\\article',
+      'https://elsewhere.example/',
+    ];
+    let read = 0;
+    for (const url of written) {
+      asked.length = 0;
+      const result = parseWebResultText(await tools.call('web_fetch', { url }));
+      if (result?.kind !== 'page') {
+        expect([url, result, asked.length]).toEqual([
+          url,
+          { kind: 'error', code: 'blocked', provider: 'exa', sentence: expect.any(String) },
+          0,
+        ]);
+        continue;
+      }
+      read += 1;
+      expect([url, asked.length]).toEqual([url, 1]);
+      const fetched = asked[0]!;
+      expect([url, fetched.includes('#'), ledger.has(fetched), forwardsAsWritten(fetched)]).toEqual([
+        url,
+        false,
+        true,
+        true,
+      ]);
+    }
+    expect(read).toBe(7);
   });
 
   it('reads sloppy search arguments', () => {

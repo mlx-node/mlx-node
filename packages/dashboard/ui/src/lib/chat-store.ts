@@ -11,11 +11,21 @@ import type {
   ChatFailure,
   ChatHostEvent,
   ChatHostState,
+  CommandView,
   CompactionState,
+  CompactOutcome,
   ConversationEvent,
   ConversationInfo,
   ConversationNotice,
+  HookRunState,
   Interaction,
+  LiveActivity,
+  ModelSwitch,
+  QueueState,
+  RecapEnd,
+  RecapState,
+  RetryLive,
+  RewindEndMark,
   RunView,
   TranscriptOp,
   TurnEnd,
@@ -32,10 +42,26 @@ export interface ConversationState {
   turns: TurnMetric[];
   turn: TurnState | null;
   interactions: Interaction[];
+  /**
+   * Requests the agent stopped waiting on (`interaction-closed` as `expired`), questions and MCP cards aside, counted while the page
+   * holds the stream.
+   */
+  withdrawn: number;
+  /** Question cards that closed with no answer (Stop, the agent's time limit, no window), counted the same way. */
+  unanswered: number;
+  /** MCP cards that closed with no answer (Stop, the server stopped waiting, no window), counted the same way. */
+  mcpUnanswered: number;
   notices: ConversationNotice[];
   transcriptError: string | null;
   /** How the last turn ended, live or from the `sync`; null while none ended. */
-  lastEnd: { turnId?: string; outcome?: TurnOutcome; failure?: ChatFailure; unsent?: true } | null;
+  lastEnd: {
+    turnId?: string;
+    outcome?: TurnOutcome;
+    failure?: ChatFailure;
+    unsent?: true;
+    model?: ModelSwitch;
+    blocked?: string;
+  } | null;
   gone: 'deleted' | 'unknown' | null;
   /** Every permission mark of the conversation, oldest first: `sync` replaces them, `permission-mark` appends one. */
   permissionMarks: PermissionMark[];
@@ -43,9 +69,33 @@ export interface ConversationState {
   contextUsed: number | null;
   /** The agent compacts the conversation now; null when it does not. */
   compaction: CompactionState | null;
-  /** Work: the live workflow runs the host holds; `sync` and `runs` replace the list. */
+  /** How the last manual compaction this stream saw ended; a new object per end. Null after a `sync`. */
+  compactionEnd: { outcome: CompactOutcome } | null;
+  /** The agent waits on a batch of hooks now; null when it does not. */
+  hookRun: HookRunState | null;
+  /** A recap the user asked for is being written; null while none is. */
+  recap: RecapState | null;
+  /** How the last recap this stream saw ended; a new object per end. Null after a `sync`. */
+  recapEnd: { outcome: RecapEnd } | null;
+  /**
+   * How the last rewind of this app run ended, numbered: the event and `sync` carry it, and the same end again keeps
+   * its object. Null before the first.
+   */
+  rewindEnd: RewindEndMark | null;
+  /** The running answer's last retry episode (its row may not be placed yet); null while it has none. */
+  retry: RetryLive | null;
+  /** Work: the host's workflow runs, live and newest ended; `sync` and `runs` replace the list. */
   runs: RunView[];
+  /** Work: the live facts of the background work (helper progress); `sync` and `activity` replace them. */
+  live: LiveActivity;
+  /** The queued messages the host holds; `sync` and `queue` replace them. */
+  queue: QueueState;
+  /** Work: the agent's commands the loaded session may send; null while it holds no list (`sync`, `commands`). */
+  commands: CommandView[] | null;
 }
+
+/** A conversation with nothing queued and nothing held. */
+export const NO_QUEUE: QueueState = { items: [], held: null, count: 0 };
 
 function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: TranscriptOp): void {
   switch (op.op) {
@@ -74,12 +124,33 @@ function applyOp(entries: TranscriptEntry[], turns: TurnMetric[], op: Transcript
   }
 }
 
+/** `entries` after `ops`, a new list; turn metrics and context ops are left out. */
+export function applyEntryOps(entries: readonly TranscriptEntry[], ops: readonly TranscriptOp[]): TranscriptEntry[] {
+  const out = [...entries];
+  for (const op of ops) applyOp(out, [], op);
+  return out;
+}
+
+/** Applies a batch of ops to `next`, whose entry and turn lists are still the previous state's. */
+function applyOps(next: ConversationState, ops: readonly TranscriptOp[]): void {
+  const entries = [...next.entries];
+  const turns = [...next.turns];
+  for (const op of ops) {
+    if (op.op === 'context') next.contextUsed = op.used;
+    else applyOp(entries, turns, op);
+  }
+  next.entries = entries;
+  next.turns = turns;
+}
+
 function endOf(end: Partial<TurnEnd>): NonNullable<ConversationState['lastEnd']> {
   const out: NonNullable<ConversationState['lastEnd']> = {};
   if (end.turnId !== undefined) out.turnId = end.turnId;
   if (end.outcome !== undefined) out.outcome = end.outcome;
   if (end.failure !== undefined) out.failure = end.failure;
   if (end.unsent === true) out.unsent = true;
+  if (end.model !== undefined) out.model = end.model;
+  if (end.blocked !== undefined) out.blocked = end.blocked;
   return out;
 }
 
@@ -96,6 +167,9 @@ export function applyConversationEvent(
       turns: [...event.turns],
       turn: event.turn,
       interactions: [...event.interactions],
+      withdrawn: state?.withdrawn ?? 0,
+      unanswered: state?.unanswered ?? 0,
+      mcpUnanswered: state?.mcpUnanswered ?? 0,
       notices: [...event.notices],
       transcriptError: event.transcriptError,
       // The same end again keeps its object: the page tells a new end from a repeated one by identity.
@@ -109,25 +183,34 @@ export function applyConversationEvent(
       permissionMarks: [...event.permissionMarks],
       contextUsed: event.contextUsed ?? null,
       compaction: event.compaction ?? null,
+      compactionEnd: null,
+      hookRun: event.hookRun ?? null,
+      recap: event.recap ?? null,
+      recapEnd: null,
+      rewindEnd:
+        event.rewindEnd === undefined
+          ? null
+          : state?.rewindEnd?.n === event.rewindEnd.n
+            ? state.rewindEnd
+            : { n: event.rewindEnd.n, end: event.rewindEnd.end },
+      retry: event.retry ?? null,
       runs: [...event.runs],
+      live: event.live,
+      queue: event.queue ?? NO_QUEUE,
+      commands: event.commands ?? null,
     };
   }
   if (state === null || event.seq !== state.seq + 1) return 'resync';
   const next: ConversationState = { ...state, seq: event.seq };
   switch (event.type) {
-    case 'ops': {
-      const entries = [...state.entries];
-      const turns = [...state.turns];
-      for (const op of event.ops) {
-        if (op.op === 'context') next.contextUsed = op.used;
-        else applyOp(entries, turns, op);
-      }
-      next.entries = entries;
-      next.turns = turns;
+    case 'ops':
+      applyOps(next, event.ops);
       return next;
-    }
     case 'notice':
       next.notices = [...state.notices, event.notice];
+      return next;
+    case 'notice-cleared':
+      next.notices = state.notices.filter((notice) => notice.code !== event.code);
       return next;
     case 'turn':
       next.turn = event.turn;
@@ -136,9 +219,18 @@ export function applyConversationEvent(
     case 'interaction':
       next.interactions = [...state.interactions.filter((i) => i.id !== event.interaction.id), event.interaction];
       return next;
-    case 'interaction-closed':
+    case 'interaction-closed': {
       next.interactions = state.interactions.filter((i) => i.id !== event.id);
+      const closed = state.interactions.find((i) => i.id === event.id);
+      if (closed?.kind === 'question') {
+        if (event.reason !== 'answered') next.unanswered = state.unanswered + 1;
+      } else if (closed?.kind === 'mcp-input') {
+        if (event.reason !== 'answered') next.mcpUnanswered = state.mcpUnanswered + 1;
+      } else if (event.reason === 'expired' && closed !== undefined) {
+        next.withdrawn = state.withdrawn + 1;
+      }
       return next;
+    }
     case 'conversation':
       next.conversation = event.conversation;
       return next;
@@ -148,11 +240,42 @@ export function applyConversationEvent(
     case 'permission-mark':
       next.permissionMarks = [...state.permissionMarks, event.mark];
       return next;
+    case 'rule-gone':
+      next.permissionMarks = state.permissionMarks.map((mark) =>
+        mark.kind === 'denied' && mark.ruleId === event.ruleId ? { ...mark, words: null } : mark,
+      );
+      return next;
     case 'compaction':
       next.compaction = event.compaction;
+      if (event.end !== undefined) next.compactionEnd = { outcome: event.end };
+      return next;
+    case 'hook-run':
+      next.hookRun = event.hookRun;
+      return next;
+    case 'recap':
+      next.recap = event.recap;
+      if (event.end !== undefined) next.recapEnd = { outcome: event.end };
+      return next;
+    case 'rewind':
+      next.rewindEnd = { n: event.n, end: event.end };
+      return next;
+    case 'retry':
+      next.retry = event.retry;
       return next;
     case 'runs':
+      if (event.ops !== undefined) applyOps(next, event.ops);
       next.runs = [...event.runs];
+      return next;
+    case 'activity':
+      next.live = event.live;
+      return next;
+    case 'agent-entries':
+      return next;
+    case 'queue':
+      next.queue = event.queue;
+      return next;
+    case 'commands':
+      next.commands = event.commands === null ? null : [...event.commands];
       return next;
   }
 }
@@ -172,13 +295,19 @@ export interface ChatStore<T> {
   getSnapshot(): T;
 }
 
+/** A conversation's store; `listen` hears each event it applied, in order, and keeps no stream open by itself. */
+export interface ConversationStore extends ChatStore<ConversationSnapshot> {
+  listen(listener: (event: ConversationEvent) => void): () => void;
+}
+
 /**
  * One conversation's stream behind `useSyncExternalStore`. Open while it has readers, the window is visible and the
  * transport is up; re-opened after a reconnect and after a `seq` gap.
  */
-export function createConversationStore(conversationId: string): ChatStore<ConversationSnapshot> {
+export function createConversationStore(conversationId: string): ConversationStore {
   let snapshot: ConversationSnapshot = { state: null, gone: null };
   const listeners = new Set<() => void>();
+  const hearers = new Set<(event: ConversationEvent) => void>();
   let subscription: Subscription | null = null;
   let boundGeneration = getConnectionGeneration();
   let detach: (() => void) | null = null;
@@ -208,6 +337,7 @@ export function createConversationStore(conversationId: string): ChatStore<Conve
     snapshot = { state: next, gone: next.gone };
     if (next.gone !== null) close();
     notify();
+    for (const hear of Array.from(hearers)) hear(event);
   };
 
   const sync = (): void => {
@@ -245,6 +375,12 @@ export function createConversationStore(conversationId: string): ChatStore<Conve
       };
     },
     getSnapshot: () => snapshot,
+    listen(listener: (event: ConversationEvent) => void): () => void {
+      hearers.add(listener);
+      return () => {
+        hearers.delete(listener);
+      };
+    },
   };
 }
 

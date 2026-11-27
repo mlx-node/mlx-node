@@ -1,11 +1,13 @@
 /**
- * Window memory of the Chat page: the draft, the attached files and the failed send per place and the last open
- * conversation per workspace. Prompt text and files are never written to storage; only the last used mode, the chosen model per mode
- * and the last model picked per base are.
+ * Window memory of the Chat page: the draft, the attached files, the "Plan first" value and the failed send per place and the last open
+ * conversation per workspace. Prompt text and files are never written to storage; only the last used mode, the chosen model and
+ * thinking level per mode and the last model picked per base are.
  */
 
+import { isThinkingLevel } from '../../../../src/chat/thinking-levels.js';
 import { attachQueue, type DraftAttachment } from '../../lib/chat-attachments';
-import type { ChatMode } from '../../lib/chat-types';
+import { CHAT } from '../../lib/chat-strings';
+import type { ChatMode, ThinkingLevel } from '../../lib/chat-types';
 import type { StripNotice } from './blockers';
 
 /** The New screen of both modes shares one draft: it is one composer. */
@@ -30,6 +32,19 @@ export interface FailedSend {
 
 const failures = new Map<string, FailedSend>();
 const listeners = new Set<() => void>();
+
+/**
+ * Work: the "Plan first" value the user set for a place, kept beside its draft. `seen`: the key of the conversation's
+ * last mode line when it was set (null: none yet); a newer mode line takes over from it.
+ */
+export interface PlanArm {
+  next: boolean;
+  seen: string | null;
+}
+
+const plans = new Map<string, PlanArm>();
+/** Places whose "no plan mode" notice already turned the chip off; the notice goes at the next send. */
+const planNoticed = new Set<string>();
 
 /** Called after every change of the attached files or the failed sends, whichever page made it. */
 export function subscribeDrafts(listener: () => void): () => void {
@@ -88,6 +103,27 @@ export function writeFailed(place: string, record: FailedSend | null, epoch: num
   changed();
 }
 
+export function readPlan(place: string): PlanArm | null {
+  return plans.get(place) ?? null;
+}
+
+export function writePlan(place: string, value: PlanArm | null): void {
+  if (value === null) plans.delete(place);
+  else plans.set(place, value);
+  changed();
+}
+
+/** Whether the place's "no plan mode" notice still has to turn the chip off: true once per notice. */
+export function takePlanNotice(place: string, shown: boolean): boolean {
+  if (!shown) {
+    planNoticed.delete(place);
+    return false;
+  }
+  if (planNoticed.has(place)) return false;
+  planNoticed.add(place);
+  return true;
+}
+
 export function lastPlaceOf(mode: ChatMode): string | null {
   return lastPlace[mode];
 }
@@ -103,19 +139,100 @@ export function forgetPlace(id: string): void {
   drafts.delete(id);
   attachments.delete(id);
   failures.delete(id);
+  plans.delete(id);
+  planNoticed.delete(id);
   forgets.set(id, placeEpoch(id) + 1);
   changed();
 }
 
-/** The folder the user chose for the next Work conversation, in this window. */
-let workFolder: string | null = null;
+/** Where a new Work conversation starts: a folder, or none (the app makes it a new empty folder). */
+export type FolderPick = { kind: 'folder'; path: string } | { kind: 'none' };
 
-export function chosenFolder(): string | null {
-  return workFolder;
+/** The place the user chose for the next Work conversation, in this window. */
+let workPlace: FolderPick | null = null;
+
+/** Null: no pick in this window. */
+export function chosenFolder(): FolderPick | null {
+  return workPlace;
 }
 
-export function chooseFolder(path: string | null): void {
-  workFolder = path;
+export function chooseFolder(pick: FolderPick | null): void {
+  workPlace = pick;
+}
+
+/** With no pick in this window: the place of the newest Work conversation, else none. */
+export function defaultPick(
+  rows: ReadonlyArray<{ cwd: string | null; updatedAt: number; noFolder?: boolean }>,
+): FolderPick {
+  let newest: (typeof rows)[number] | null = null;
+  for (const row of rows) if (newest === null || row.updatedAt > newest.updatedAt) newest = row;
+  if (newest === null || newest.noFolder === true || newest.cwd === null || newest.cwd === '') return { kind: 'none' };
+  return { kind: 'folder', path: newest.cwd };
+}
+
+/** The place of the next Work conversation: a pick, or none yet (`loading`: the Work list is on its way; `unset`: it failed). */
+export type NewPlace = FolderPick | { kind: 'loading' } | { kind: 'unset' };
+
+type ListedRows = ReadonlyArray<{ cwd: string | null; updatedAt: number; noFolder?: boolean }>;
+
+/**
+ * The window's pick, else the place of the newest Work conversation once the Work list is in. Before that there is no
+ * place: a send would start without a folder the person did not pick. A list that failed gives no default.
+ */
+export function newPlace(choice: FolderPick | null, list: { rows: ListedRows | undefined; failed: boolean }): NewPlace {
+  if (choice !== null) return choice;
+  if (list.rows !== undefined) return defaultPick(list.rows);
+  return list.failed ? { kind: 'unset' } : { kind: 'loading' };
+}
+
+/** Why Send and a move up wait for the place; undefined once there is one. */
+export function placeBlock(place: NewPlace): string | undefined {
+  if (place.kind === 'loading') return CHAT.folderLoading;
+  if (place.kind === 'unset') return CHAT.folderUnsetBlock;
+  return undefined;
+}
+
+/** The folder of a place; null for none, and while there is no place yet. */
+export function pickPath(pick: NewPlace): string | null {
+  return pick.kind === 'folder' ? pick.path : null;
+}
+
+/** The folder a mode draft is for: a path, null for none, undefined while there is no place yet. */
+function draftFolder(place: NewPlace): string | null | undefined {
+  if (place.kind === 'folder') return place.path;
+  return place.kind === 'none' ? null : undefined;
+}
+
+/** The New Work screen's mode draft: the host keeps a mode picked there for this id and folder only. */
+export interface ModeDraft {
+  id: string;
+  /** Undefined: made before the place was known. */
+  folder: string | null | undefined;
+  visit: string;
+  mode: ChatMode;
+}
+
+/**
+ * The mode draft for the screen now (the same object when it holds). A new id when the visit, the mode or a known
+ * folder changes, so a mode picked for one folder never reaches another; a draft made before the place was known
+ * takes the first place with its id, so the Work list coming in loses nothing.
+ */
+export function nextModeDraft(
+  draft: ModeDraft,
+  now: { place: NewPlace; visit: string; mode: ChatMode },
+  newId: () => string,
+): ModeDraft {
+  const folder = draftFolder(now.place);
+  const moved = draft.folder !== undefined && folder !== undefined && draft.folder !== folder;
+  if (draft.visit !== now.visit || draft.mode !== now.mode || moved)
+    return { id: newId(), folder, visit: now.visit, mode: now.mode };
+  if (draft.folder === undefined && folder !== undefined) return { ...draft, folder };
+  return draft;
+}
+
+/** A fresh mode draft for the screen now. */
+export function firstModeDraft(now: { place: NewPlace; visit: string; mode: ChatMode }, id: string): ModeDraft {
+  return { id, folder: draftFolder(now.place), visit: now.visit, mode: now.mode };
 }
 
 /** The longest file name the agent can make: it keeps a folder's conversations under its encoded path. */
@@ -126,11 +243,14 @@ export function folderTooLong(path: string): boolean {
   return encodeURIComponent(path).length > AGENT_NAME_BYTES;
 }
 
-/** The newest distinct folders of the Work list, at most `n`. */
-export function recentFolders(rows: ReadonlyArray<{ cwd: string | null; updatedAt: number }>, n = 6): string[] {
+/** The newest distinct folders of the Work list, at most `n`; the folders the app made for No folder are not offered. */
+export function recentFolders(
+  rows: ReadonlyArray<{ cwd: string | null; updatedAt: number; noFolder?: boolean }>,
+  n = 6,
+): string[] {
   const out: string[] = [];
   for (const row of [...rows].sort((a, b) => b.updatedAt - a.updatedAt)) {
-    if (row.cwd === null || row.cwd === '' || out.includes(row.cwd)) continue;
+    if (row.noFolder === true || row.cwd === null || row.cwd === '' || out.includes(row.cwd)) continue;
     out.push(row.cwd);
     if (out.length === n) break;
   }
@@ -139,6 +259,8 @@ export function recentFolders(rows: ReadonlyArray<{ cwd: string | null; updatedA
 
 const MODE_KEY = 'mlx-node:chat-mode:v1';
 const MODEL_KEY = 'mlx-node:chat-model:v1';
+/** The thinking level a new conversation starts with, per mode, next to its model. */
+const THINKING_KEY = 'mlx-node:chat-thinking:v1';
 /** The last model picked per base, in both modes: `{ [base in lower case]: id }`. */
 const VARIANT_KEY = 'mlx-node:chat-variant:v1';
 
@@ -185,6 +307,33 @@ export function storeModel(mode: ChatMode, id: string): void {
       if (typeof parsed === 'object' && parsed !== null) current = parsed as Record<string, unknown>;
     }
     globalThis.localStorage?.setItem(MODEL_KEY, JSON.stringify({ ...current, [mode]: id }));
+  } catch {
+    // The choice still applies to this window.
+  }
+}
+
+export function storedThinking(mode: ChatMode): ThinkingLevel | undefined {
+  try {
+    const raw = globalThis.localStorage?.getItem(THINKING_KEY);
+    if (raw === null || raw === undefined) return undefined;
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== 'object' || parsed === null) return undefined;
+    const value = (parsed as Record<string, unknown>)[mode];
+    return isThinkingLevel(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export function storeThinking(mode: ChatMode, level: ThinkingLevel): void {
+  try {
+    const raw = globalThis.localStorage?.getItem(THINKING_KEY);
+    let current: Record<string, unknown> = {};
+    if (raw !== null && raw !== undefined) {
+      const parsed: unknown = JSON.parse(raw);
+      if (typeof parsed === 'object' && parsed !== null) current = parsed as Record<string, unknown>;
+    }
+    globalThis.localStorage?.setItem(THINKING_KEY, JSON.stringify({ ...current, [mode]: level }));
   } catch {
     // The choice still applies to this window.
   }

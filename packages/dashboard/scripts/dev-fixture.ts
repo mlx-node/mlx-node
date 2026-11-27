@@ -22,6 +22,7 @@ import {
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { crc32, deflateSync } from 'node:zlib';
 
 import type { SupervisorStateFile } from '../../desktop/src/main/supervisor-state-file.js';
 import type { MetricsTraceRecord } from '../../server/src/metrics-trace.js';
@@ -29,6 +30,7 @@ import type {
   RuntimeLiveFile,
   RuntimeLiveLoad,
   RuntimeLiveTurn,
+  RuntimeSampleRecord,
   RuntimeTraceRecord,
 } from '../../server/src/runtime-trace.js';
 import { readWorkIndexSync, workIds } from '../src/chat/index-file.js';
@@ -41,7 +43,7 @@ const MIB = 1024 * 1024;
 const GIB = 1024 * MIB;
 
 /** The app command the harness hands the Coding Agents page; `.claude/CLAUDE.md` is installed for it. */
-export const FIXTURE_COMMAND = '/Applications/mlx-node.app/Contents/Resources/bin/mlx';
+export const FIXTURE_COMMAND = '/Applications/Portato.app/Contents/Resources/bin/mlx';
 const OLD_COMMAND = '/usr/local/bin/mlx-old';
 
 /** The file that marks a directory as written by this generator; only such a directory is ever deleted. */
@@ -525,6 +527,7 @@ export function chatWaitTurns(
     at: number,
     state: RuntimeLiveTurn['phase'],
     done: number | null,
+    clocks: { prefill: number | null; decode: number | null },
     generated = 12,
   ): RuntimeLiveTurn => ({
     traceId,
@@ -538,6 +541,8 @@ export function chatWaitTurns(
     waitMs: null,
     slotMs: null,
     prepareMs: null,
+    prefillElapsedMs: clocks.prefill,
+    decodeElapsedMs: clocks.decode,
     promptTokens: state === 'queued' ? null : CHAT_PROMPT_TOKENS,
     cachedTokens: state === 'queued' ? null : 0,
     prefillTotal: state === 'queued' ? null : CHAT_PROMPT_TOKENS,
@@ -548,18 +553,30 @@ export function chatWaitTurns(
   if (second < 10) {
     const reading = second < 6;
     const read = reading ? Math.round((CHAT_PROMPT_TOKENS * (second + 1)) / 7) : CHAT_PROMPT_TOKENS;
+    const clocks = reading
+      ? { prefill: (second + 1) * 1000, decode: null }
+      : { prefill: 6_000, decode: (second - 5) * 1000 };
     return {
-      turns: [turn('fx-chat-other', OTHER_SESSION, now - second * 1000, reading ? 'prefill' : 'decode', read)],
+      turns: [turn('fx-chat-other', OTHER_SESSION, now - second * 1000, reading ? 'prefill' : 'decode', read, clocks)],
       queued: ids.length,
     };
   }
   const ours = second - 10;
   const phase = ours < 10 ? 'queued' : ours < 25 ? 'prefill' : 'decode';
   const done = phase === 'queued' ? null : Math.round((CHAT_PROMPT_TOKENS * Math.min(ours - 9, 15)) / 15);
+  const clocks =
+    phase === 'queued'
+      ? { prefill: null, decode: null }
+      : { prefill: Math.min(ours - 9, 15) * 1000, decode: phase === 'decode' ? (ours - 24) * 1000 : null };
   return {
     turns: [
-      turn('fx-chat-other', OTHER_SESSION, now - 90_000, 'decode', CHAT_PROMPT_TOKENS),
-      ...ids.map((id, n) => turn(`fx-chat-${String(n)}`, id, now - ours * 1000, phase, done, (ours - 24) * 640)),
+      turn('fx-chat-other', OTHER_SESSION, now - 90_000, 'decode', CHAT_PROMPT_TOKENS, {
+        prefill: 6_000,
+        decode: 84_000,
+      }),
+      ...ids.map((id, n) =>
+        turn(`fx-chat-${String(n)}`, id, now - ours * 1000, phase, done, clocks, (ours - 24) * 640),
+      ),
     ],
     queued: 0,
   };
@@ -579,6 +596,8 @@ function phaseTurns(model: string, now: number): RuntimeLiveTurn[] {
     waitMs: null,
     slotMs: null,
     prepareMs: null,
+    prefillElapsedMs: null,
+    decodeElapsedMs: null,
     promptTokens: null,
     cachedTokens: null,
     prefillTotal: null,
@@ -613,8 +632,8 @@ export interface LiveProcess {
    * whose turns all ran before the last hour.
    */
   engineStates?: boolean;
-  /** Fixed Now values instead of the moving decode rate. */
-  ticker?: { decodeTps: number; memActive: number };
+  /** Fixed Now values instead of the moving output rate; an output rate of 0 or less writes none (null). */
+  ticker?: { outputTps: number; memActive: number };
   /**
    * The turns in flight. 'two-models' (default): one turn on each fixture model, the big one asked through an alias.
    * 'one-model': two turns on the big model, one of them asked through the alias `mlx-local`.
@@ -859,6 +878,7 @@ function seriesFor(
     const dtMs = ts - previous;
     const busyMs = busy ? Math.round(dtMs * between(random, 0.3, 1)) : Math.round(dtMs * between(random, 0, 0.1));
     const ok = busy ? int(random, 1, 6) : 0;
+    const inFlight = busy ? int(random, 1, 3) : 0;
     records.push({
       ...base(ts),
       k: 'sample',
@@ -870,7 +890,7 @@ function seriesFor(
       memPeak: Math.round(between(random, 31, 34) * GIB),
       memCache: Math.round(between(random, 1, 4) * GIB),
       rss: Math.round(between(random, 1.2, 1.8) * GIB),
-      inFlight: busy ? int(random, 1, 3) : 0,
+      inFlight,
       queued: busy && random() < 0.1 ? 1 : 0,
       resident: LIVE_MODELS.length,
       dOk: ok,
@@ -878,6 +898,7 @@ function seriesFor(
       dCancelled: 0,
       dOutTokens: ok * int(random, 120, 900),
       dRejected: busy && step % 13 === 5 ? 2 : 0,
+      ...workDeltas(random, busy, busyMs, dtMs, inFlight),
     });
     if (!busy && step % 10 === 0) {
       for (const model of LIVE_MODELS) records.push(schedRecord(base(ts + 1), model, step / 10 + 1, random));
@@ -892,6 +913,70 @@ function seriesFor(
   }
   if (exit) records.push({ ...base(to + 1000), k: 'exit', uptimeMs: to + 1000 - process.startedAt });
   return records;
+}
+
+/** The work deltas of one sample: lane-ms per phase stay within lanes x interval, a rate pair appears only where tokens moved. */
+function workDeltas(
+  random: Random,
+  busy: boolean,
+  busyMs: number,
+  dtMs: number,
+  lanes: number,
+): Pick<
+  RuntimeSampleRecord,
+  | 'loadingMs'
+  | 'waitingMs'
+  | 'prepareMs'
+  | 'prefillMs'
+  | 'decodeMs'
+  | 'runningMs'
+  | 'rateOutTokens'
+  | 'rateOutMs'
+  | 'ratePrefillTokens'
+  | 'ratePrefillMs'
+> {
+  const none = {
+    loadingMs: 0,
+    waitingMs: 0,
+    prepareMs: 0,
+    prefillMs: 0,
+    decodeMs: 0,
+    runningMs: 0,
+    rateOutTokens: 0,
+    rateOutMs: 0,
+    ratePrefillTokens: 0,
+    ratePrefillMs: 0,
+  };
+  if (!busy) return none;
+  const laneMs = Math.min(lanes * busyMs, lanes * dtMs);
+  const prefillMs = Math.round(laneMs * between(random, 0.05, 0.25));
+  const decodeMs = Math.round(laneMs * between(random, 0.4, 0.65));
+  const prepareMs = Math.round(laneMs * between(random, 0.02, 0.06));
+  const runningMs = Math.round(laneMs * between(random, 0.02, 0.06));
+  const waitingMs = Math.max(
+    0,
+    Math.min(
+      Math.round(laneMs * between(random, 0, 0.15)),
+      lanes * dtMs - prefillMs - decodeMs - prepareMs - runningMs,
+    ),
+  );
+  const rateOutMs = Math.min(Math.round(decodeMs / lanes), busyMs);
+  const rateOutTokens = Math.round((rateOutMs / 1000) * between(random, 40, 80));
+  const prefilled = prefillMs > 0 && random() < 0.6;
+  const ratePrefillMs = prefilled ? prefillMs : 0;
+  const ratePrefillTokens = prefilled ? Math.round((prefillMs / 1000) * between(random, 800, 1500)) : 0;
+  return {
+    ...none,
+    waitingMs,
+    prepareMs,
+    prefillMs,
+    decodeMs,
+    runningMs,
+    rateOutTokens,
+    rateOutMs: rateOutTokens > 0 ? rateOutMs : 0,
+    ratePrefillTokens,
+    ratePrefillMs: ratePrefillTokens > 0 ? ratePrefillMs : 0,
+  };
 }
 
 function writeSeries(dir: string, process: LiveProcess, records: readonly RuntimeTraceRecord[]): void {
@@ -921,8 +1006,28 @@ function writeRuntime(home: string, random: Random, now: number, live: LiveProce
 }
 
 /**
+ * The heartbeat's lane-ms per state since `startedAt`. Decode and prefill lanes swing against each other in step with
+ * the output rate's wave, as integrals of `share × (1 ± sin(t / DECODE_WAVE_MS))`, so each rewrite moves the stack and
+ * no counter ever goes down.
+ */
+function fixtureWork(startedAt: number, now: number): RuntimeLiveFile['work'] {
+  const up = Math.max(0, now - startedAt);
+  const swing = DECODE_WAVE_MS * (Math.cos(startedAt / DECODE_WAVE_MS) - Math.cos(now / DECODE_WAVE_MS));
+  return {
+    ms: {
+      loading: 8_300,
+      waiting: Math.round(0.04 * up),
+      prepare: Math.round(0.03 * up),
+      prefill: Math.round(0.4 * (up - swing)),
+      decode: Math.round(0.6 * (up + swing)),
+      running: Math.round(0.01 * up),
+    },
+  };
+}
+
+/**
  * The heartbeat of one running process with 2 models and 2 turns in flight, one decoding and one in prefill. The
- * decode rate and the prefill progress follow `now`, so each rewrite moves them. Rewrite it to keep it fresh.
+ * rates, the lane time and the prefill progress follow `now`, so each rewrite moves them. Rewrite it to keep it fresh.
  */
 export function writeLiveFile(home: string, live: LiveProcess, now: number = Date.now()): void {
   const { runtimeDir } = fixturePaths(home);
@@ -939,8 +1044,9 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         ? { blocks: 128, ms: 250 }
         : null;
   const chat = live.flight === 'chat' ? chatWaitTurns(home, live, now) : { turns: [], queued: 0 };
+  const fixedRate = live.ticker?.outputTps;
   const file: RuntimeLiveFile = {
-    v: 2,
+    v: 3,
     pid: live.pid,
     startedAt: live.startedAt,
     ts: now,
@@ -959,7 +1065,17 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
       wiredLimit: 96 * GIB,
       rss: Math.round(1.4 * GIB),
     },
-    decodeTps: live.ticker?.decodeTps ?? round(37.5 + 6 * Math.sin(now / DECODE_WAVE_MS), 1),
+    work: fixtureWork(live.startedAt, now),
+    rates: {
+      windowMs: 10_000,
+      outputTps:
+        fixedRate === undefined
+          ? round(37.5 + 6 * Math.sin(now / DECODE_WAVE_MS), 1)
+          : fixedRate > 0
+            ? fixedRate
+            : null,
+      prefillTps: round(1_140 + 90 * Math.cos(now / DECODE_WAVE_MS), 1),
+    },
     loading: live.loading ?? [],
     counters: { ok: 412, error: 6, cancelled: 3, outputTokens: 389_120, loads: 3, rejected: 5 },
     models: [
@@ -1032,6 +1148,8 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         waitMs: 4,
         slotMs: 0,
         prepareMs: 310,
+        prefillElapsedMs: 1_290,
+        decodeElapsedMs: 4_796,
         promptTokens: 18_432,
         cachedTokens: 16_896,
         prefillTotal: 1536,
@@ -1051,6 +1169,8 @@ export function writeLiveFile(home: string, live: LiveProcess, now: number = Dat
         waitMs: 2,
         slotMs: 0,
         prepareMs: 40,
+        prefillElapsedMs: 1_758,
+        decodeElapsedMs: null,
         promptTokens: 9_216,
         cachedTokens: 2_048,
         prefillTotal: PREFILL_TOTAL,
@@ -1410,7 +1530,33 @@ const ANSWERS = [
   'Two tests failed because the loader cached a body across a reconnect. I now drop the cache on reconnect; all **42** tests pass.',
   'The stall comes from both sessions waiting on the same prefix block. The fix releases the block when the first prefill finishes.',
 ];
-const TOOLS: ReadonlyArray<{ name: string; kind: string; input: (n: number) => unknown; output: string }> = [
+/** A plan file's edit, as the agent's search_replace result carries it: a diff block with the match's place. */
+function planEdit(n: number): unknown[] {
+  const oldString = 'order(parsed)';
+  const newString = 'order(parsed)\n        .validated()';
+  const details = [
+    {
+      old_string: oldString,
+      old_line: 3,
+      new_string: newString,
+      new_line: 3,
+      context_before: 'pub fn plan(request: &Request) -> Plan {\n    let parsed = parse(request);\n',
+      context_after: '}\n',
+      line_prefix: '    ',
+    },
+  ];
+  const path = `/Users/dev/proj/src/planner/plan${n % 3}.rs`;
+  return [{ type: 'diff', path, oldText: oldString, newText: newString, _meta: { details } }];
+}
+
+const TOOLS: ReadonlyArray<{
+  name: string;
+  kind: string;
+  input: (n: number) => unknown;
+  output: string;
+  /** The result's content in place of `output` as one text block. */
+  result?: (n: number) => unknown[];
+}> = [
   {
     name: 'read_file',
     kind: 'read',
@@ -1427,15 +1573,79 @@ const TOOLS: ReadonlyArray<{ name: string; kind: string; input: (n: number) => u
     name: 'run_terminal_command',
     kind: 'execute',
     input: () => ({ command: 'cargo test -p mlx-core planner' }),
-    output: 'running 42 tests\n........................................ 42 passed\n',
+    // Colored as a terminal prints it: the thread shows plain text, never `[binary · …]`.
+    output: 'running 42 tests\n........................................ \u001b[32m42 passed\u001b[0m\n',
   },
   {
-    name: 'edit_file',
+    name: 'search_replace',
     kind: 'edit',
-    input: (n) => ({ target_file: `/Users/dev/proj/src/planner/plan${n % 3}.rs` }),
-    output: 'Applied 1 edit.',
+    input: (n) => ({
+      file_path: `src/planner/plan${n % 3}.rs`,
+      old_string: 'order(parsed)',
+      new_string: 'order(parsed)\n        .validated()',
+    }),
+    output: 'The file was edited.',
+    result: planEdit,
   },
 ];
+
+/** A plain RGB PNG as base64, drawn by `pixel` (x, y) → [r, g, b]. */
+function pngBase64(width: number, height: number, pixel: (x: number, y: number) => [number, number, number]): string {
+  const chunk = (type: string, data: Buffer): Buffer => {
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type, 'ascii'), data]);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(crc32(body));
+    return Buffer.concat([length, body, crc]);
+  };
+  const header = Buffer.alloc(13);
+  header.writeUInt32BE(width, 0);
+  header.writeUInt32BE(height, 4);
+  header[8] = 8;
+  header[9] = 2;
+  const rows: Buffer[] = [];
+  for (let y = 0; y < height; y += 1) {
+    const row = Buffer.alloc(1 + width * 3);
+    for (let x = 0; x < width; x += 1) row.set(pixel(x, y), 1 + x * 3);
+    rows.push(row);
+  }
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk('IHDR', header),
+    chunk('IDAT', deflateSync(Buffer.concat(rows))),
+    chunk('IEND', Buffer.alloc(0)),
+  ]).toString('base64');
+}
+
+/** A screenshot-like picture: a title bar, a side list and a panel. */
+function screenshotPng(): string {
+  return pngBase64(240, 150, (x, y) => {
+    if (y < 14) return [44, 46, 54];
+    if (x < 56) return y % 18 < 10 && x > 8 && x < 48 ? [120, 124, 136] : [232, 233, 236];
+    if (y > 30 && y < 120 && x > 72 && x < 224) return y % 12 < 3 ? [70, 120, 200] : [250, 250, 252];
+    return [244, 244, 246];
+  });
+}
+
+/** A rendered PDF page: white with a heading and text lines; `n` moves the heading so pages differ. */
+function pagePng(n: number): string {
+  return pngBase64(120, 156, (x, y) => {
+    if (y > 12 && y < 22 && x > 12 && x < 60 + n * 6) return [36, 36, 44];
+    if (y > 34 && y < 144 && (y - 34) % 8 < 2 && x > 12 && x < 108 - ((y * 5 + n) % 23)) return [150, 150, 158];
+    return [252, 252, 250];
+  });
+}
+
+/** The agent's `read_file` tool, as its lines name it. */
+const READ_TOOL = {
+  version: 1,
+  name: 'read_file',
+  kind: 'read',
+  namespace: 'grok_build',
+  label: 'Read',
+  read_only: true,
+} as const;
 
 interface SessionWriter {
   lines: string[];
@@ -1514,6 +1724,43 @@ interface TurnPlan {
   background?: (at: number) => number;
   /** A background event woke the agent: the prompt id it recorded; the prompt is hidden and nothing is typed. */
   wake?: string;
+  /** After the tools, a command the user denied with this note: the agent skips it, stores the note twice, goes on. */
+  deniedNote?: { command: string; note: string };
+  /**
+   * After the tools, a command a `pre_tool_use` hook denied, stored as the agent stores it: the hook's line before the
+   * call, the agent's words on the verdict before the call's failed update.
+   */
+  hookDenied?: { command: string; hook: string; reason: string };
+  /** A stop hook that fails before the turn ends (the same hook and error each turn: one row, counted). */
+  stopHookFails?: true;
+  /** The session's `session_start` hook failed: its batch is stored before the first prompt's chunk. */
+  sessionStartFails?: true;
+  /** After the answer, a hook's note (`hook_annotation`). */
+  hookNote?: string;
+  /** After the tools, a message the user sent with Send now, stored when the model read it (`interjection.rs`). */
+  steer?: string;
+  /** After the tools, a question call and the sentence the agent stored for its answer. */
+  asked?: {
+    questions: Array<{
+      question: string;
+      options: Array<{ label: string; description: string; preview?: string }>;
+      multi?: boolean;
+    }>;
+    result: string;
+  };
+  /** The prompt's `_meta.mode` moved the agent's mode: the agent stores the mode line before the prompt's chunk. */
+  mode?: 'plan' | 'default';
+  /** The context after the turn, as `_meta.totalTokens` on its chunks: the ring and the Context panel read it. */
+  context?: number;
+  /**
+   * The prompt's first picture was made smaller and its second left out: the agent's two one-shots, stored after the
+   * prompt's chunk (`turn.rs` writes the chunks, then runs `normalize_images_with_notices`).
+   */
+  pictures?: true;
+  /** 20 s after the turn's end, a recap the user asked for (`session_recap`), stored as the agent stores it. */
+  recap?: string;
+  /** After the tools, a read of a screenshot and of three pages of a 12-page PDF, stored as the agent stores them. */
+  pictureReads?: true;
 }
 
 interface ChildRecord {
@@ -1584,6 +1831,21 @@ function writeTurn(
       runs: [],
     });
   }
+  if (turn.sessionStartFails === true) {
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'hook_execution',
+      event_name: 'session_start',
+      runs: [
+        {
+          name: 'global/env:session_start[0].hooks[0]',
+          status: { status: 'failed', error: 'exit code 1: no .env here', elapsed_ms: 12 },
+        },
+      ],
+    });
+  }
+  if (turn.mode !== undefined) {
+    sessionEvent(writer, id, at, update, { sessionUpdate: 'current_mode_update', currentModeId: turn.mode });
+  }
   sessionEvent(writer, id, at, update, {
     sessionUpdate: 'user_message_chunk',
     content: { type: 'text', text: turn.wake === undefined ? turn.prompt : WORKFLOW_WAKE_TEXT },
@@ -1593,9 +1855,36 @@ function writeTurn(
       ...(turn.wake === undefined ? {} : { hideFromScrollback: true }),
     },
   });
+  if (turn.pictures === true) {
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'image_compressed',
+      images: [
+        {
+          index: 1,
+          original_bytes: 2_202_010,
+          compressed_bytes: 943_718,
+          original_width: 4032,
+          original_height: 3024,
+          compressed_width: 2000,
+          compressed_height: 1500,
+        },
+      ],
+      message: 'Downscaled Image 1: 2.1 MB (4032x3024) → 921.6 KB (2000x1500)',
+    });
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'image_dropped',
+      notes: ['Image 2 was dropped before send: below dimension floor (4x4).'],
+    });
+  }
   const ttft = int(random, 300, 2_400);
   at += ttft;
-  const chunk = { promptId, turnStartMs: turn.start, streamStartMs: at, updateType: 'AgentMessageChunk' };
+  const chunk = {
+    promptId,
+    turnStartMs: turn.start,
+    streamStartMs: at,
+    updateType: 'AgentMessageChunk',
+    ...(turn.context === undefined ? {} : { totalTokens: turn.context }),
+  };
   if (turn.retryAt !== undefined) {
     const retryAt = at + turn.retryAt;
     writer.pending.push({
@@ -1709,19 +1998,215 @@ function writeTurn(
       sessionUpdate: 'tool_call_update',
       toolCallId: callId,
       status: failed ? 'failed' : 'completed',
+      content:
+        !failed && tool.result !== undefined
+          ? tool.result(turn.promptIndex + n)
+          : [
+              {
+                type: 'content',
+                content: {
+                  type: 'text',
+                  text: failed
+                    ? 'error[E0425]: cannot find value `prefix` in this scope\n --> src/sched.rs:214:9'
+                    : tool.output,
+                },
+              },
+            ],
+    });
+    at += int(random, 300, 1_800);
+  }
+  if (turn.hookDenied !== undefined) {
+    const callId = `toolu_${turn.promptIndex}_hooked`;
+    const { command, hook, reason } = turn.hookDenied;
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'hook_execution',
+      event_name: 'pre_tool_use',
+      tool_name: 'run_terminal_command',
+      runs: [
+        { name: hook, status: { status: 'failed', error: `denied: ${reason}`, elapsed_ms: 1_400, blocked: true } },
+      ],
+    });
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call',
+      toolCallId: callId,
+      title: 'run_terminal_command',
+      rawInput: { command },
+      _meta: {
+        'x.ai/tool': {
+          version: 1,
+          name: 'run_terminal_command',
+          kind: 'execute',
+          namespace: 'grok_build',
+          label: 'run_terminal_command',
+          read_only: false,
+        },
+      },
+    });
+    at += 1_400;
+    const shown = hook.slice(0, hook.lastIndexOf(':'));
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'hook_annotation',
+      message: `\`run_terminal_command\` blocked by ${shown}: ${reason}`,
+      kind: 'tool_outcome',
+    });
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: callId,
+      status: 'failed',
+      content: [{ type: 'content', content: { type: 'text', text: `Hook denied: ${reason}` } }],
+    });
+    at += 600;
+  }
+  if (turn.pictureReads === true) {
+    const shot = screenshotPng();
+    const pages = [4, 5, 6].map((page) => ({ page, data: pagePng(page) }));
+    const reads = [
+      {
+        path: 'docs/screenshot.png',
+        asked: {},
+        content: [{ data: shot, mimeType: 'image/png' }],
+        rawOutput: { type: 'ReadFile', ImageContent: { data: shot, mime_type: 'image/png' } },
+      },
+      {
+        path: 'docs/api-spec.pdf',
+        asked: { pages: '4-6' },
+        content: pages.map(({ data }) => ({ data, mimeType: 'image/jpeg' })),
+        rawOutput: {
+          type: 'ReadFile',
+          PdfPageImages: {
+            pages: pages.map(({ page, data }) => ({ data, mime_type: 'image/jpeg', page_number: page })),
+            total_pages: 12,
+            file_size: 1_468_006,
+          },
+        },
+      },
+    ];
+    for (const [n, read] of reads.entries()) {
+      const callId = `toolu_${turn.promptIndex}_pictures${n}`;
+      sessionEvent(writer, id, at, update, {
+        sessionUpdate: 'tool_call',
+        toolCallId: callId,
+        title: 'read_file',
+        rawInput: { target_file: read.path, ...read.asked },
+        _meta: { 'x.ai/tool': READ_TOOL },
+      });
+      sessionEvent(writer, id, at, update, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: callId,
+        kind: 'read',
+        title: `Read \`${read.path}\``,
+        locations: [{ path: read.path }],
+        rawInput: { variant: 'ReadFile', target_file: read.path, ...read.asked },
+        _meta: { 'x.ai/tool': { ...READ_TOOL, input: { path: read.path } } },
+      });
+      at += int(random, 300, 2_100);
+      sessionEvent(writer, id, at, update, {
+        sessionUpdate: 'tool_call_update',
+        toolCallId: callId,
+        status: 'completed',
+        content: read.content.map((image) => ({ type: 'content', content: { type: 'image', ...image } })),
+        rawOutput: read.rawOutput,
+      });
+      at += int(random, 300, 1_200);
+    }
+  }
+  if (turn.deniedNote !== undefined) {
+    const callId = `toolu_${turn.promptIndex}_denied`;
+    const tool = { name: 'run_terminal_command', kind: 'execute', namespace: 'grok_build', read_only: false };
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call',
+      toolCallId: callId,
+      title: tool.name,
+      rawInput: { command: turn.deniedNote.command },
+      _meta: { 'x.ai/tool': { version: 1, label: tool.name, ...tool } },
+    });
+    at += 4_000;
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: callId,
+      status: 'failed',
       content: [
         {
           type: 'content',
           content: {
             type: 'text',
-            text: failed
-              ? 'error[E0425]: cannot find value `prefix` in this scope\n --> src/sched.rs:214:9'
-              : tool.output,
+            text: `The user elected to avoid running the ${tool.name} tool. The tool was not executed. Please refer to the user's message for next steps.`,
           },
         },
       ],
     });
-    at += int(random, 300, 1_800);
+    for (let copy = 0; copy < 2; copy += 1) {
+      sessionEvent(writer, id, at, update, {
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: turn.deniedNote.note },
+        _meta: { modelId: turn.model },
+      });
+    }
+    at += 600;
+  }
+  if (turn.steer !== undefined) {
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'user_message_chunk',
+      content: {
+        type: 'text',
+        text: `The user sent a message while you were working:\n<user_query>\n${turn.steer}\n</user_query>\nIf the user is asking for a response, address the user first. After replying, complete any unfinished tasks from previous turns.`,
+        _meta: { displayText: turn.steer },
+      },
+      _meta: { modelId: turn.model, interjection: true },
+    });
+    at += 600;
+  }
+  if (turn.asked !== undefined) {
+    const callId = `toolu_${turn.promptIndex}_ask`;
+    const meta = {
+      'x.ai/tool': {
+        version: 1,
+        name: 'ask_user_question',
+        kind: 'ask_user',
+        namespace: 'grok_build',
+        label: 'Ask User',
+        read_only: true,
+      },
+    };
+    const questions = turn.asked.questions;
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call',
+      toolCallId: callId,
+      title: 'ask_user_question',
+      rawInput: {
+        questions: questions.map((q) => ({
+          question: q.question,
+          options: q.options,
+          ...(q.multi === true ? { multi_select: true } : {}),
+        })),
+      },
+      _meta: meta,
+    });
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: callId,
+      kind: 'other',
+      title: questions.length === 1 ? `Ask: ${questions[0]!.question}` : `Ask ${questions.length} questions`,
+      locations: [],
+      rawInput: {
+        variant: 'AskUserQuestion',
+        questions: questions.map((q) => ({
+          question: q.question,
+          options: q.options,
+          multiSelect: q.multi === true ? true : null,
+        })),
+      },
+      _meta: meta,
+    });
+    at += 45_000;
+    sessionEvent(writer, id, at, update, {
+      sessionUpdate: 'tool_call_update',
+      toolCallId: callId,
+      status: 'completed',
+      content: [{ type: 'content', content: { type: 'text', text: turn.asked.result } }],
+      rawOutput: { type: 'AskUserQuestion', UserAnswered: { message: turn.asked.result } },
+    });
+    at += 600;
   }
   if (turn.background !== undefined) at = turn.background(at);
   if (turn.children.length > 0) {
@@ -1817,6 +2302,22 @@ function writeTurn(
     );
     at += int(random, 600, 3_000);
   }
+  if (turn.hookNote !== undefined) {
+    sessionEvent(writer, id, at, custom, { sessionUpdate: 'hook_annotation', message: turn.hookNote });
+  }
+  if (turn.stopHookFails === true) {
+    sessionEvent(writer, id, at, custom, {
+      sessionUpdate: 'hook_execution',
+      event_name: 'stop',
+      prompt_id: promptId,
+      runs: [
+        {
+          name: 'global/lint:stop[0].hooks[0]',
+          status: { status: 'failed', error: 'exit code 127: sh: eslint: command not found', elapsed_ms: 38 },
+        },
+      ],
+    });
+  }
   const input = int(random, 12_000, 90_000);
   const cached = Math.round(input * between(random, 0.55, 0.95));
   const output = int(random, 300, 4_000);
@@ -1860,6 +2361,14 @@ function writeTurn(
       ...measured,
     },
   });
+  if (turn.recap !== undefined) {
+    const recapAt = at + 20_000;
+    const summary = turn.recap;
+    writer.pending.push({
+      at: recapAt,
+      write: () => sessionEvent(writer, id, recapAt, custom, { sessionUpdate: 'session_recap', summary, auto: false }),
+    });
+  }
   return at;
 }
 
@@ -2128,6 +2637,89 @@ function writeAgentWork(home: string, random: Random, now: number, pid: number):
       open: false,
       cancelled: false,
       perf: 'first-call',
+      ...(n === 3 ? { deniedNote: { command: 'npm install left-pad', note: 'use pnpm, not npm' } } : {}),
+      ...(n === 0
+        ? {
+            hookDenied: {
+              command: 'rm -rf build',
+              hook: 'global/no-rm:pre_tool_use[0].hooks[0]',
+              reason: 'deleting build output is not allowed here',
+            },
+          }
+        : {}),
+      ...(n === 2 ? { hookNote: '\u21a9 Stop blocked by hook `global/tests-green`, continuing: 2 tests fail' } : {}),
+      stopHookFails: true,
+      ...(n === 0 ? { sessionStartFails: true as const } : {}),
+      ...(n === 0
+        ? {
+            asked: {
+              questions: [
+                {
+                  question: 'Which layout should the API docs use?',
+                  options: [
+                    {
+                      label: 'Sidebar layout',
+                      description: 'Endpoints on the left.',
+                      preview:
+                        '┌──────────┬──────────────┐\n│ /users   │ GET /users   │\n│ /orders  │              │\n└──────────┴──────────────┘',
+                    },
+                    {
+                      label: 'One page',
+                      description: 'Every endpoint on one long page.',
+                      preview:
+                        '┌─────────────────────────┐\n│ GET /users              │\n│ GET /orders             │\n└─────────────────────────┘',
+                    },
+                  ],
+                },
+              ],
+              result:
+                'The user wants to clarify these questions.\n' +
+                '    This means they may have additional information, context or questions for you.\n' +
+                '    Take their response into account and then reformulate the questions if appropriate.\n' +
+                '    Start by asking them what they would like to clarify.\n\n' +
+                '    Questions asked:\n' +
+                '- "Which layout should the API docs use?"\n  Answer: Sidebar layout',
+            },
+          }
+        : {}),
+      ...(n === 2 ? { steer: 'also update the changelog' } : {}),
+      ...(n === 1 ? { pictures: true as const, pictureReads: true as const } : {}),
+      ...(n === 3
+        ? {
+            recap:
+              'We split the upload client into three files and its tests pass; next, add retries and update the docs.',
+          }
+        : {}),
+      ...(n === 4
+        ? {
+            asked: {
+              questions: [
+                {
+                  question: 'Which database should the cart use?',
+                  options: [
+                    { label: 'Postgres (Recommended)', description: 'Relational. Already used by the orders service.' },
+                    { label: 'Redis', description: 'In memory. Fast, but the cart is lost on restart.' },
+                  ],
+                },
+                {
+                  question: 'Which checks should run before a merge?',
+                  options: [
+                    { label: 'Unit tests', description: 'Fast. Under a minute.' },
+                    { label: 'Type check', description: 'tsc over all packages.' },
+                    { label: 'Lint', description: '' },
+                  ],
+                  multi: true,
+                },
+              ],
+              result:
+                'User has answered your questions: "Which database should the cart use?"="Postgres (Recommended)", ' +
+                '"Which checks should run before a merge?"="Unit tests, Lint" user notes: also run the e2e smoke test. ' +
+                "You can now continue with the user's answers in mind.",
+            },
+          }
+        : {}),
+      ...(n === 0 ? { mode: 'plan' as const } : n === 1 ? { mode: 'default' as const } : {}),
+      context: 18_000 + n * 9_000,
     });
   }
   writeTurn(
@@ -2146,6 +2738,7 @@ function writeAgentWork(home: string, random: Random, now: number, pid: number):
       open: true,
       cancelled: false,
       perf: 'first-call',
+      context: 61_000,
     },
     liveKids,
   );

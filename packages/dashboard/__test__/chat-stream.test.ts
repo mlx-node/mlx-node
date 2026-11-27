@@ -4,8 +4,12 @@
  * hot → cold switch. The page's reducer refuses a gap.
  */
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { parseRunState } from '../src/agent-sessions/run-state.js';
 import type { UpdateLine } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { CHAT_FLUSH_MS, Conversation, mergeTextOps, type HostView } from '../src/chat/conversation.js';
@@ -23,7 +27,16 @@ const INFO: ConversationInfo = {
   hot: true,
   permissionMode: 'ask',
 };
-const HOST: HostView = { turn: null, interactions: [], compaction: null, runs: [] };
+const HOST: HostView = {
+  turn: null,
+  interactions: [],
+  compaction: null,
+  hookRun: null,
+  recap: null,
+  runs: [],
+  live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
+  commands: null,
+};
 
 function chunk(text: string, kind = 'agent_message_chunk'): UpdateLine {
   return { xai: false, update: { sessionUpdate: kind, content: { type: 'text', text } }, meta: undefined };
@@ -67,6 +80,24 @@ describe('a field the transcript cut', () => {
     const output = (sync.entries[0] as { output: string }).output;
     expect(output).toBe(`${'x'.repeat(100)} `);
     expect(output).not.toContain('fc-');
+  });
+});
+
+describe('the model a turn could not use (#16)', () => {
+  // Mutation: drop the model copy in turnEnded → the page never sees the reason.
+  it('rides the turn event and the sync to the page store, redacted, a cut end that could start a key too', () => {
+    const key = 'fc-0123456789abcdef0123456789abcdef';
+    const conv = new Conversation(INFO, { needles: () => [key] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    const reason = `${'r'.repeat(280)} ${key.slice(0, 14)}…`;
+    conv.turnEnded({ turnId: 't', outcome: 'no-model', model: { previous: key, next: null, reason } });
+    const model = { previous: '[redacted]', next: null, reason: `${'r'.repeat(280)}…` };
+    expect(fold(a).lastEnd).toEqual({ turnId: 't', outcome: 'no-model', model });
+    const b: ConversationEvent[] = [];
+    conv.attach((e) => b.push(e), HOST);
+    expect(fold(b).lastEnd).toEqual({ turnId: 't', outcome: 'no-model', model });
   });
 });
 
@@ -324,7 +355,11 @@ describe('conversation stream', () => {
       turn: { turnId: 't11', phase: 'running', startedAt: 3, wait: null },
       interactions: [],
       compaction: null,
+      hookRun: null,
+      recap: null,
       runs: [],
+      live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
+      commands: null,
     });
     expect(running[0]).not.toHaveProperty('lastEnd');
     expect(fold(running).lastEnd).toBeNull();
@@ -402,18 +437,65 @@ describe('conversation stream', () => {
     const a: ConversationEvent[] = [];
     conv.attach((e) => a.push(e), HOST);
     conv.userPrompt('compact two');
-    conv.applyLine(chunk('Let me look.'));
+    conv.applyLine(chunk('Let me look. sk-cur'));
     vi.advanceTimersByTime(CHAT_FLUSH_MS);
-    expect(texts(fold(a))).toEqual(['']);
+    expect(texts(fold(a))).toEqual(['Let me look. ']);
     conv.compactionChanged({ phase: 'running', startedAt: 7 });
-    expect(texts(fold(a))).toEqual(['Let me look.']);
+    expect(texts(fold(a))).toEqual(['Let me look. sk-cur']);
     expect(a.at(-1)!.type).toBe('compaction');
 
     conv.compactionChanged(null);
     conv.applyLine(chunk(` Now ${key} end`));
     conv.turnEnded({ turnId: 't', outcome: 'completed' });
     expect(JSON.stringify(a)).not.toContain(key);
-    expect(texts(fold(a))).toEqual(['Let me look. Now [redacted] end']);
+    expect(texts(fold(a))).toEqual(['Let me look. sk-cur Now [redacted] end']);
+  });
+
+  it('a hook batch: its state on the stream and in a late sync, redacted, held-back text shown at its start, gone at its end', () => {
+    const key = 'sk-current-KEY-0001';
+    const conv = new Conversation(INFO, { needles: () => [key] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    expect(a[0]).not.toHaveProperty('hookRun');
+    expect(fold(a).hookRun).toBeNull();
+    conv.userPrompt('run it');
+    conv.applyLine(chunk('Let me look. sk-cur'));
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    expect(texts(fold(a))).toEqual(['Let me look. ']);
+    const run = { event: 'pre_tool_use', tool: `run ${key}`, count: 2, startedAt: 7 };
+    conv.hookRunChanged(run);
+    expect(texts(fold(a))).toEqual(['Let me look. sk-cur']);
+    expect(a.at(-1)).toMatchObject({ type: 'hook-run' });
+    expect(JSON.stringify(a)).not.toContain(key);
+    expect(fold(a).hookRun).toEqual({ ...run, tool: 'run [redacted]' });
+
+    const late: ConversationEvent[] = [];
+    conv.attach((e) => late.push(e), { ...HOST, hookRun: run });
+    expect(late[0]).toMatchObject({ type: 'sync', hookRun: { tool: 'run [redacted]' } });
+    expect(JSON.stringify(late)).not.toContain(key);
+    expect(fold(late).hookRun).toEqual({ ...run, tool: 'run [redacted]' });
+
+    conv.hookRunChanged(null);
+    expect(fold(a).hookRun).toBeNull();
+    expect(fold(late).hookRun).toBeNull();
+  });
+
+  it('a notice clears on every page: the event drops it, a later sync no longer has it, a second clear sends nothing', () => {
+    const conv = new Conversation(INFO, { needles: () => [] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    conv.notice({ code: 'key-printed', tone: 'danger', provider: 'exa' });
+    conv.notice({ code: 'key-printed', tone: 'danger', provider: 'brave' });
+    expect(fold(a).notices.map((n) => n.provider)).toEqual(['exa', 'brave']);
+    conv.clearNotice('key-printed');
+    conv.clearNotice('key-printed');
+    expect(a.map((e) => e.type)).toEqual(['sync', 'notice', 'notice', 'notice-cleared']);
+    expect(fold(a).notices).toEqual([]);
+    const b: ConversationEvent[] = [];
+    conv.attach((e) => b.push(e), HOST);
+    expect(fold(b).notices).toEqual([]);
   });
 
   it('ends the stream with gone', () => {
@@ -427,6 +509,88 @@ describe('conversation stream', () => {
     vi.advanceTimersByTime(CHAT_FLUSH_MS * 2);
     expect(a.map((e) => e.type)).toEqual(['sync', 'gone']);
     expect(fold(a).gone).toBe('deleted');
+  });
+});
+
+describe("a workflow run's live updates on the page", () => {
+  const run = (revision: number, status: string, extra: Record<string, unknown> = {}): UpdateLine => ({
+    xai: true,
+    update: {
+      sessionUpdate: 'workflow_updated',
+      run_id: 'wf_1',
+      revision,
+      name: 'deep-research',
+      status,
+      phases: [
+        { title: 'Plan', state: 'done' },
+        { title: 'Research', state: 'active' },
+      ],
+      current_phase: 'Research',
+      ...extra,
+    },
+    meta: { agentTimestampMs: 1_000 + revision },
+  });
+  const runOf = (state: ConversationState) => state.entries.find((e) => e.kind === 'workflow');
+
+  // Mutation: flush the queued ops as their own event before the runs event → for one page step the run reads done
+  // with its report while the host's word that a wake is due has not come, so the report draws in the block.
+  it('a runs event carries the ops queued before it: the run and its due wake reach the page in one event', () => {
+    vi.useFakeTimers();
+    try {
+      const conv = new Conversation({ ...INFO, mode: 'work' }, { needles: () => [] });
+      conv.seed([], [], null);
+      const a: ConversationEvent[] = [];
+      conv.attach((e) => a.push(e), HOST);
+      conv.applyLine(run(1, 'active'));
+      vi.advanceTimersByTime(CHAT_FLUSH_MS);
+      conv.applyLine(run(2, 'complete', { result_summary: '# Findings' }));
+      const view = { runId: 'wf_1', name: 'deep-research', status: 'complete', live: false } as const;
+      conv.runsChanged([{ ...view, stopping: false, by: null, waiting: false, wakeDue: true }]);
+      expect(a.map((e) => e.type)).toEqual(['sync', 'ops', 'runs']);
+      const sent = a[2]!;
+      expect(sent.type === 'runs' && sent.ops?.map((op) => op.op)).toEqual(['set']);
+      const page = fold(a);
+      expect(runOf(page)).toMatchObject({ status: 'complete', report: '# Findings' });
+      expect(page.runs[0]?.wakeDue).toBe(true);
+      vi.advanceTimersByTime(CHAT_FLUSH_MS);
+      expect(a).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // Mutation: drop the live `state.json` merge → a run of a live thread has no log, no now line and no step details.
+  it("a run's state.json read live gives the page its history and step details; the same read again sends nothing", () => {
+    const file = readFileSync(fileURLToPath(new URL('./fixtures/workflow-run/state.json', import.meta.url)), 'utf8');
+    const doc = JSON.parse(file) as { state: Record<string, unknown> };
+    doc.state.run_id = 'wf_1';
+    doc.state.revision = 1;
+    const state = parseRunState(JSON.stringify(doc))!;
+    const conv = new Conversation({ ...INFO, mode: 'work' }, { needles: () => [] });
+    conv.seed([], [], null);
+    const a: ConversationEvent[] = [];
+    conv.attach((e) => a.push(e), HOST);
+    conv.applyLine(run(3, 'active'));
+    conv.runState(state, 2_000);
+    conv.flush();
+    const page = fold(a);
+    const entry = runOf(page);
+    expect(entry?.kind === 'workflow' && entry.history?.length).toBe(state.history.length);
+    expect(entry?.kind === 'workflow' && entry.revision).toBe(3);
+    expect(entry?.kind === 'workflow' && entry.phases.map((phase) => phase.detail)).toEqual([
+      state.details.get('Plan'),
+      state.details.get('Research'),
+    ]);
+    const count = a.length;
+    conv.runState(state, 2_000);
+    conv.flush();
+    expect(a).toHaveLength(count);
+    // A later update keeps what the file gave.
+    conv.applyLine(run(4, 'active'));
+    conv.flush();
+    const later = runOf(fold(a));
+    expect(later?.kind === 'workflow' && later.history?.length).toBe(state.history.length);
+    expect(later?.kind === 'workflow' && later.phases[1]?.detail).toBe(state.details.get('Research'));
   });
 });
 
@@ -462,6 +626,32 @@ describe('a live thought keeps its time on the page', () => {
     const entry = fold(events).entries.find((e) => e.kind === 'thinking');
     expect(entry).toMatchObject({ kind: 'thinking', ts: T, endTs: T + 5_000, timed: true });
     expect(entry!.kind === 'thinking' && entry!.text).not.toContain(key);
+  });
+
+  // Mutation: hold back a fixed `longest needle − 1` characters → red (the thought reads '' until the next entry).
+  it('a short thought shows its text while the model streams a tool call, with a 43-character token', () => {
+    const token = 'Zq3'.repeat(14) + 'x';
+    const conv = new Conversation(INFO, { needles: () => [token] });
+    conv.seed([], [], null);
+    const events: ConversationEvent[] = [];
+    conv.attach((e) => events.push(e), HOST);
+    conv.userPrompt('go');
+    for (const [n, part] of ['Now', ' write', ' the', ' workflow', ' file', '.'].entries()) {
+      conv.applyLine(thought(part, T + n * 20));
+    }
+    for (let n = 0; n < 10; n += 1) {
+      conv.applyLine({
+        xai: true,
+        update: { sessionUpdate: 'tool_call_delta_chunk', tool_call_id: 't1', tool_index: 0, arguments_delta: 'x' },
+        meta: undefined,
+      });
+    }
+    vi.advanceTimersByTime(CHAT_FLUSH_MS);
+    expect(fold(events).entries.find((e) => e.kind === 'thinking')).toMatchObject({
+      text: 'Now write the workflow file.',
+      ts: T,
+      endTs: T + 100,
+    });
   });
 
   it('merged text ops keep the later stamp', () => {

@@ -5,23 +5,38 @@ import type { ReactElement } from 'react';
 import { CHAT } from '../../../lib/chat-strings';
 import { motionTokens } from '../../arc/motion-tokens';
 import { Tooltip } from '../../arc/tooltip/tooltip';
+import { IconButton } from '../icon-button/icon-button';
 import { motionX } from '../motion/motion';
 import { useStaticMotion } from '../motion/use-static-motion';
 import styles from './composer.module.css';
 
-export type ComposerPhase = 'idle' | 'creating' | 'starting' | 'running' | 'cancelling';
+/** `op`: a fork, a rewind or a recap of the conversation runs; it has no Stop, and Enter queues. */
+export type ComposerPhase = 'idle' | 'creating' | 'starting' | 'running' | 'cancelling' | 'op';
+
+/** While an answer starts or runs and the box has text: the round button queues the text. */
+export interface Queueing {
+  enabled: boolean;
+  onQueue: () => void;
+}
 
 export interface SendButtonProps {
   phase: ComposerPhase;
   canSend: boolean;
-  /** Why Send is off, for the tooltip. */
+  /** Why Send (or Queue) is off, for the tooltip. */
   reason?: string;
+  /**
+   * Set while an answer starts or runs (or an op runs) and the box has text: Queue, with a small Stop before it (none
+   * for an op).
+   */
+  queueing?: Queueing;
   onSend: () => void;
   onStop: () => void;
 }
 
 interface Face {
   glyph: 'send' | 'stop' | 'ring';
+  /** What a press does. */
+  action: 'send' | 'queue' | 'stop' | 'none';
   enabled: boolean;
   name: string;
   tip: string;
@@ -31,12 +46,39 @@ interface Face {
   dim: boolean;
 }
 
-/** What the one round button shows in each phase. */
-export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string): Face {
+/**
+ * What the one round button shows in each phase. It always does what Enter does: with text while an answer starts or
+ * runs (`queueing` set) it is Queue, and Stop moves to the small square before it.
+ */
+export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string, queueing?: Queueing): Face {
+  if (queueing !== undefined && (phase === 'starting' || phase === 'running' || phase === 'op')) {
+    return {
+      glyph: 'send',
+      action: 'queue',
+      enabled: queueing.enabled,
+      name: CHAT.queue.add,
+      tip: reason ?? (phase === 'op' ? CHAT.queue.addTipOp : CHAT.queue.addTip),
+      ring: false,
+      spin: false,
+      dim: !queueing.enabled,
+    };
+  }
   switch (phase) {
+    case 'op':
+      return {
+        glyph: 'ring',
+        action: 'none',
+        enabled: false,
+        name: CHAT.opBusy,
+        tip: CHAT.opBusyTip,
+        ring: true,
+        spin: true,
+        dim: false,
+      };
     case 'idle':
       return {
         glyph: 'send',
+        action: 'send',
         enabled: canSend,
         name: CHAT.send,
         tip: reason ?? CHAT.sendTip,
@@ -47,6 +89,7 @@ export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string
     case 'creating':
       return {
         glyph: 'ring',
+        action: 'none',
         enabled: false,
         name: CHAT.starting,
         tip: CHAT.startingTip,
@@ -55,12 +98,31 @@ export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string
         dim: false,
       };
     case 'starting':
-      return { glyph: 'stop', enabled: true, name: CHAT.stop, tip: CHAT.stopTip, ring: true, spin: true, dim: false };
+      return {
+        glyph: 'stop',
+        action: 'stop',
+        enabled: true,
+        name: CHAT.stop,
+        tip: CHAT.stopTip,
+        ring: true,
+        spin: true,
+        dim: false,
+      };
     case 'running':
-      return { glyph: 'stop', enabled: true, name: CHAT.stop, tip: CHAT.stopTip, ring: false, spin: false, dim: false };
+      return {
+        glyph: 'stop',
+        action: 'stop',
+        enabled: true,
+        name: CHAT.stop,
+        tip: CHAT.stopTip,
+        ring: false,
+        spin: false,
+        dim: false,
+      };
     case 'cancelling':
       return {
         glyph: 'stop',
+        action: 'none',
         enabled: false,
         name: CHAT.stopping,
         tip: CHAT.stoppingTip,
@@ -74,10 +136,13 @@ export function sendFace(phase: ComposerPhase, canSend: boolean, reason?: string
 const SWAP_IN = { duration: motionX.swap.in.duration, ease: motionX.swap.in.ease };
 const SWAP_OUT = { duration: motionX.swap.out.duration, ease: motionX.swap.out.ease };
 
-/** The composer's one round button: Send or Stop. The glyph swaps in place; the button never changes size. */
-export function SendButton({ phase, canSend, reason, onSend, onStop }: SendButtonProps): ReactElement {
+/**
+ * The composer's one round button: Send, Queue or Stop. The glyph swaps in place; the button never changes size.
+ * While it is Queue for an answer, Stop is a small ghost square just before it (Esc still stops); an op has no Stop.
+ */
+export function SendButton({ phase, canSend, reason, queueing, onSend, onStop }: SendButtonProps): ReactElement {
   const staticMotion = useStaticMotion();
-  const face = sendFace(phase, canSend, reason);
+  const face = sendFace(phase, canSend, reason, queueing);
   const glyph =
     face.glyph === 'send' ? (
       <ArrowUp size={16} strokeWidth={2} />
@@ -91,11 +156,13 @@ export function SendButton({ phase, canSend, reason, onSend, onStop }: SendButto
       data-phase={phase}
       data-dim={face.dim ? '' : undefined}
       aria-label={face.name}
+      aria-keyshortcuts={face.action === 'queue' ? 'Enter' : undefined}
       disabled={!face.enabled}
       onClick={() => {
         if (!face.enabled) return;
-        if (face.glyph === 'send') onSend();
-        else onStop();
+        if (face.action === 'send') onSend();
+        else if (face.action === 'queue') queueing?.onQueue();
+        else if (face.action === 'stop') onStop();
       }}
     >
       {face.ring ? <span className={styles.ring} data-spin={face.spin ? '' : undefined} aria-hidden="true" /> : null}
@@ -120,9 +187,22 @@ export function SendButton({ phase, canSend, reason, onSend, onStop }: SendButto
       </span>
     </button>
   );
-  return (
+  const round = (
     <Tooltip content={face.tip}>
       <span className={styles.tipTarget}>{button}</span>
     </Tooltip>
+  );
+  if (face.action !== 'queue' || phase === 'op') return round;
+  return (
+    <>
+      <IconButton
+        className={styles.stopSmall}
+        label={CHAT.stop}
+        tooltip={CHAT.stopTip}
+        icon={<Square size={10} strokeWidth={0} fill="currentColor" />}
+        onClick={onStop}
+      />
+      {round}
+    </>
   );
 }

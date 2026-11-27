@@ -13,7 +13,8 @@ export interface UnloadControl {
   onUnload: () => void;
 }
 
-export function UnloadButton({ control }: { control: UnloadControl }): ReactElement {
+/** `label`: the idle name; default Unload. */
+export function UnloadButton({ control, label }: { control: UnloadControl; label?: string }): ReactElement {
   const working = control.state === 'working';
   const button = (
     <Button
@@ -33,7 +34,7 @@ export function UnloadButton({ control }: { control: UnloadControl }): ReactElem
           {CHAT.engine.unloading}
         </span>
       ) : (
-        CHAT.engine.unload
+        (label ?? CHAT.engine.unload)
       )}
     </Button>
   );

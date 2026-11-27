@@ -1,0 +1,30 @@
+.origin {
+  display: grid;
+  grid-template-columns: minmax(var(--space-4), 1fr) minmax(0, auto) minmax(var(--space-4), 1fr);
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.origin::before,
+.origin::after {
+  height: 1px;
+  background: var(--border);
+  content: '';
+}
+
+.text {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}

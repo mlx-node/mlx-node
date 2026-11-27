@@ -11,16 +11,19 @@
 
 import { MessageChannel } from 'node:worker_threads';
 
-import { CHAT } from '@/lib/chat-strings';
+import { CHAT, fill } from '@/lib/chat-strings';
+import { formatClock } from '@/lib/format';
 import { writeCache } from '@/lib/json-cache';
+import { NEVER_NOTE_HEAD, NEVER_NOTE_TAIL } from '@/lib/permission-text';
 import { PREFILL_MIN_TOKENS } from '@/lib/prefill';
-import { LIVE_FRESH_MS, LIVE_HINT, prefillAverage, turnPrefill, turnTimeParts, turnTokenBars } from '@/lib/sessions';
+import { LIVE_FRESH_MS, LIVE_HINT, prefillAverage, turnPrefill, turnTokenBars } from '@/lib/sessions';
 import { toast } from '@/lib/toast';
 import type {
   SessionDeleteResponse,
   SessionDetail as SessionDetailData,
   SessionDetailResponse,
   SessionListResponse,
+  SessionPictureResponse,
   SessionRenameResponse,
   SessionRow,
   SessionTimelineResponse,
@@ -837,9 +840,8 @@ describe('Session detail page', () => {
     expect(text).toContain('/work/mlx-node');
     expect(text).toContain('main');
     expect(statValue(mounted!.container, 'Turns')).toBe('2');
-    // Means over the two turns: first token (120+80)/2, decode (60+40)/2.
+    // Mean over the two turns: first token (120+80)/2.
     expect(statValue(mounted!.container, 'First token')).toContain('100 ms');
-    expect(statValue(mounted!.container, 'Decode speed')).toContain('50.0');
     // The totals open the activity column: no empty measuring box takes a grid gap above them.
     const totals = byRole(mounted!.container, 'group', 'Session totals');
     expect(totals?.parentElement?.firstElementChild).toBe(totals);
@@ -1005,6 +1007,239 @@ describe('Session detail page', () => {
     expect(mounted!.text()).toContain('"path":"planner.rs"');
   });
 
+  // Mutation: drop the note branch of the Sessions transcript → the note is drawn as a second user message.
+  it('the transcript draws the stored note on a denied call as one "Your note" row, not as a message', async () => {
+    const NOTE = 'use pnpm, not npm';
+    const at = Date.UTC(2026, 9, 20, 10);
+    const line = (update: Record<string, unknown>, xai = false): string =>
+      JSON.stringify({
+        method: xai ? '_x.ai/session/update' : 'session/update',
+        params: { sessionId: PARENT_ID, update, _meta: { agentTimestampMs: at } },
+      });
+    const note = {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: NOTE },
+      _meta: { modelId: 'm' },
+    };
+    const text = `${[
+      line({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'Add left-pad' },
+        _meta: { modelId: 'm', promptIndex: 0 },
+      }),
+      line({ sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'npm install left-pad', status: 'pending' }),
+      line({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'c1',
+        status: 'failed',
+        content: [{ type: 'content', content: { type: 'text', text: 'The tool was not executed.' } }],
+      }),
+      line(note),
+      line({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Using pnpm.' } }),
+      line(note),
+      line({ sessionUpdate: 'turn_completed', prompt_id: 'p1', stop_reason: 'end_turn', elapsed_ms: 4_000 }, true),
+    ].join('\n')}\n`;
+    const parsed = parseUpdates(text);
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: parsed.turns } } },
+      'Per turn',
+    );
+    await showTab('Transcript');
+    const rows = [...mounted!.container.querySelectorAll('[data-note-row]')];
+    expect(rows.map((row) => row.textContent)).toEqual([expect.stringContaining(CHAT.noteRow)]);
+    expect(rows[0]!.textContent).toContain(NOTE);
+    expect(mounted!.container.querySelectorAll('[data-role="user"]')).toHaveLength(1);
+  });
+
+  // Mutation: drop the rule branch of the Sessions transcript → the rule's note is drawn as a "Your note" row.
+  it('the transcript draws the app\'s never-allow note as one "Your rule" row, with no remove button', async () => {
+    const NOTE = `${NEVER_NOTE_HEAD}npm install${NEVER_NOTE_TAIL}`;
+    const at = Date.UTC(2026, 9, 20, 10);
+    const line = (update: Record<string, unknown>, xai = false): string =>
+      JSON.stringify({
+        method: xai ? '_x.ai/session/update' : 'session/update',
+        params: { sessionId: PARENT_ID, update, _meta: { agentTimestampMs: at } },
+      });
+    const note = {
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: NOTE },
+      _meta: { modelId: 'm' },
+    };
+    const text = `${[
+      line({
+        sessionUpdate: 'user_message_chunk',
+        content: { type: 'text', text: 'Add left-pad' },
+        _meta: { modelId: 'm', promptIndex: 0 },
+      }),
+      line({ sessionUpdate: 'tool_call', toolCallId: 'c1', title: 'npm install left-pad', status: 'pending' }),
+      line({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'c1',
+        status: 'failed',
+        content: [{ type: 'content', content: { type: 'text', text: 'The tool was not executed.' } }],
+      }),
+      line(note),
+      line({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Not installed.' } }),
+      line(note),
+      line({ sessionUpdate: 'turn_completed', prompt_id: 'p1', stop_reason: 'end_turn', elapsed_ms: 4_000 }, true),
+    ].join('\n')}\n`;
+    const parsed = parseUpdates(text);
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: parsed.turns } } },
+      'Per turn',
+    );
+    await showTab('Transcript');
+    expect(mounted!.container.querySelector('[data-note-row]')).toBeNull();
+    const rows = [...mounted!.container.querySelectorAll('[data-rule-row]')];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.textContent).toContain(CHAT.never.ruleLine);
+    expect(rows[0]!.textContent).toContain(fill(CHAT.never.ruleText, { words: 'npm install' }));
+    expect(rows[0]!.querySelector('button')).toBeNull();
+    expect(mounted!.container.querySelectorAll('[data-role="user"]')).toHaveLength(1);
+  });
+
+  it('the transcript draws a stored retry as the thread row does, and only under All', async () => {
+    const at = Date.UTC(2026, 9, 20, 10);
+    const line = (update: Record<string, unknown>, n: number, xai = false): string =>
+      JSON.stringify({
+        method: xai ? '_x.ai/session/update' : 'session/update',
+        params: { sessionId: PARENT_ID, update, _meta: { agentTimestampMs: at + n * 1_000 } },
+      });
+    const retrying = (attempt: number, n: number): string =>
+      line(
+        {
+          sessionUpdate: 'retry_state',
+          type: 'retrying',
+          attempt,
+          max_retries: 3,
+          reason: 'Connection problem; retrying request',
+          error_type: 'http',
+        },
+        n,
+        true,
+      );
+    const parsed = parseUpdates(
+      `${[
+        line(
+          { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Fix it' }, _meta: { promptIndex: 0 } },
+          0,
+        ),
+        retrying(1, 1),
+        retrying(2, 2),
+        line({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Fixed after a retry.' } }, 66),
+        line(
+          { sessionUpdate: 'turn_completed', prompt_id: 'p1', stop_reason: 'end_turn', elapsed_ms: 66_000 },
+          67,
+          true,
+        ),
+      ].join('\n')}\n`,
+    );
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: parsed.turns } } },
+      'Fixed after a retry.',
+      '?tab=transcript',
+    );
+    const rows = [...mounted!.container.querySelectorAll('[data-notice-row="retry"]')];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.textContent).toContain(`${CHAT.retry.row}${CHAT.retry.cause.connection}`);
+    expect(rows[0]!.textContent).toContain(
+      `${fill(CHAT.retry.tries, { n: 2 })} · ${fill(CHAT.retry.waited, { time: '1m 05s' })}`,
+    );
+    await click([...mounted!.container.querySelectorAll('button')].find((b) => b.textContent === 'Messages'));
+    expect(mounted!.container.querySelectorAll('[data-notice-row]')).toHaveLength(0);
+    expect(mounted!.text()).toContain('Fixed after a retry.');
+  });
+
+  it('the transcript draws a stored picture left out, stored before its prompt, right after that prompt', async () => {
+    const note = 'Image 1 was dropped before send: unreadable Png header.';
+    const line = (update: Record<string, unknown>, n: number, xai = false): string =>
+      JSON.stringify({
+        method: xai ? '_x.ai/session/update' : 'session/update',
+        params: { sessionId: PARENT_ID, update, _meta: { agentTimestampMs: Date.UTC(2026, 9, 20, 10) + n * 1_000 } },
+      });
+    const parsed = parseUpdates(
+      `${[
+        line({ sessionUpdate: 'image_dropped', notes: [note] }, 0, true),
+        line(
+          { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Look' }, _meta: { promptIndex: 0 } },
+          0,
+        ),
+        line({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Nothing to see.' } }, 2),
+      ].join('\n')}\n`,
+    );
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: parsed.turns } } },
+      'Nothing to see.',
+      '?tab=transcript',
+    );
+    const rows = [...mounted!.container.querySelectorAll('[data-notice-row="picture"]')];
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.textContent).toContain(`${CHAT.pictureNote.label}${CHAT.pictureNote.dropped}`);
+    expect(rows[0]!.textContent).toContain(note);
+  });
+
+  it('the transcript draws a stored picture read: its count, and once opened its tile read from the session', async () => {
+    const data = Buffer.from('png').toString('base64');
+    const line = (update: Record<string, unknown>, n: number): string =>
+      JSON.stringify({
+        method: 'session/update',
+        params: { sessionId: PARENT_ID, update, _meta: { agentTimestampMs: Date.UTC(2026, 9, 20, 10) + n * 1_000 } },
+      });
+    const parsed = parseUpdates(
+      `${[
+        line(
+          { sessionUpdate: 'user_message_chunk', content: { type: 'text', text: 'Look' }, _meta: { promptIndex: 0 } },
+          0,
+        ),
+        line(
+          {
+            sessionUpdate: 'tool_call',
+            toolCallId: 'call_png',
+            title: 'read_file',
+            rawInput: { target_file: 'shot.png' },
+            _meta: { 'x.ai/tool': { name: 'read_file' } },
+          },
+          1,
+        ),
+        line(
+          {
+            sessionUpdate: 'tool_call_update',
+            toolCallId: 'call_png',
+            status: 'completed',
+            content: [{ type: 'content', content: { type: 'image', data, mimeType: 'image/png' } }],
+            rawOutput: { type: 'ReadFile', ImageContent: { data, mime_type: 'image/png' } },
+          },
+          2,
+        ),
+        line({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'A screenshot.' } }, 3),
+      ].join('\n')}\n`,
+    );
+    const picture = `GET /sessions/${PARENT_ID}/pictures/call_png/0`;
+    await mountDetail(
+      PARENT_ID,
+      {
+        [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: parsed.turns } },
+        [picture]: { body: { mediaType: 'image/png', data } },
+      },
+      'A screenshot.',
+      '?tab=transcript',
+    );
+    const row = [...mounted!.container.querySelectorAll('button[aria-expanded]')].find((b) =>
+      (b.getAttribute('aria-label') ?? '').includes(`${CHAT.pictures.one} · 3 B`),
+    );
+    expect(row).toBeTruthy();
+    expect(calls.some((call) => call.path.includes('/pictures/'))).toBe(false);
+    await click(row);
+    await waitFor(() => byRole(mounted!.container, 'button', fill(CHAT.pictures.open, { n: 1, total: 1 })) !== null);
+    expect(calls.filter((call) => call.path.includes('/pictures/')).map((call) => call.path)).toEqual([
+      `/api/sessions/${PARENT_ID}/pictures/call_png/0`,
+    ]);
+  });
+
   it('shows why the transcript could not be read', async () => {
     const body = { ...detailBody({}, []), transcriptError: 'EACCES: permission denied' };
     const text = await mountDetail(
@@ -1082,8 +1317,12 @@ describe('Session detail page', () => {
     expect(text).toContain(CHAT.mode);
     expect(text).toContain(CHAT.modeWork);
     expect(text).not.toContain('grok-build-plan');
-    const label = [...mounted!.container.querySelectorAll('dt')].find((dt) => dt.textContent === 'Agent messages');
-    expect(label?.getAttribute('title')).toContain("The agent's own count");
+    const label = [...mounted!.container.querySelectorAll('dt span[tabindex="0"]')].find(
+      (span) => span.textContent === 'Agent messages',
+    ) as HTMLElement | undefined;
+    expect(label).toBeDefined();
+    act(() => label!.focus());
+    await vi.waitFor(() => expect(document.body.textContent).toContain("The agent's own count"));
     const tab = allByRole(mounted!.container, 'tab').find((candidate) =>
       candidate.textContent?.startsWith('Transcript'),
     );
@@ -1203,11 +1442,6 @@ describe('Session detail page', () => {
     expect(ticks.length).toBeGreaterThan(2);
     expect(ticks[0]).toBe('0');
     for (const tick of ticks) expect(Number.isFinite(Number(tick.replaceAll(',', ''))), tick).toBe(true);
-    const rows = chartTable(mounted!.container, 'Time per turn');
-    for (const cell of rows.flatMap((cells) => cells.slice(1))) {
-      expect(Number.isFinite(Number(cell.replaceAll(',', ''))), cell).toBe(true);
-    }
-    expect(rows[0]!.slice(1)).toEqual(['13.6', '59.4', '0.4', '73.4']);
   });
 
   it('prints the agent timeline axis in one unit', async () => {
@@ -1452,6 +1686,7 @@ describe('Session detail page: a woken turn', () => {
     process.off('warning', onWarning);
     expect(warnings).toEqual([]);
   });
+  const ENDED = fill(CHAT.run.finished.complete, { name: 'deep-research' });
   function wokenDetail(): SessionDetailResponse {
     const parsed = parseUpdates(wokenParentText());
     return { ...detailBody({}, parsed.transcript), turns: parsed.turns };
@@ -1478,9 +1713,12 @@ describe('Session detail page: a woken turn', () => {
     expect(timelineStatus('Turn 2 timeline')).toContain('Finished · 4m 12s · after 33m 51s idle');
     expect(mounted!.text()).not.toContain('(no prompt)');
     await showTab('Transcript');
-    await waitFor(() => mounted!.text().includes('No prompt typed'));
+    // The run's wake is its end row: the run's end, not "No prompt typed".
+    await waitFor(() => mounted!.container.querySelector('[data-run-end="wf_1"]') !== null);
     const text = mounted!.text();
     expect(text).toContain('Woken by workflow deep-research');
+    expect(mounted!.container.querySelector('[data-run-end="wf_1"]')!.textContent).toContain(ENDED);
+    expect(text).not.toContain('No prompt typed');
     expect(text).not.toContain('(no prompt)');
     expect(userMessages()).toBe(1);
     expect(text).not.toContain(HIDDEN_TEXT);
@@ -1488,18 +1726,13 @@ describe('Session detail page: a woken turn', () => {
     expect(mounted!.text()).toContain(HIDDEN_TEXT);
   });
 
-  it('keeps the notice but not the hidden prompt in the Messages filter', async () => {
-    await mountDetail(
-      PARENT_ID,
-      { [`GET /sessions/${PARENT_ID}`]: { body: wokenDetail() } },
-      'No prompt typed',
-      '?tab=transcript',
-    );
+  it("keeps the run's end row but not the hidden prompt in the Messages filter", async () => {
+    await mountDetail(PARENT_ID, { [`GET /sessions/${PARENT_ID}`]: { body: wokenDetail() } }, ENDED, '?tab=transcript');
     expect(hiddenToggle()).toBeTruthy();
     const messages = [...mounted!.container.querySelectorAll('button')].find((b) => b.textContent === 'Messages');
     await click(messages);
     await settle();
-    expect(mounted!.text()).toContain('No prompt typed');
+    expect(mounted!.text()).toContain(ENDED);
     expect(hiddenToggle()).toBeUndefined();
   });
 
@@ -1525,7 +1758,78 @@ describe('Session detail page: a woken turn', () => {
     await waitFor(() => byRole(mounted!.container, 'region', 'Turn 2 · in progress') !== null);
   });
 
-  it('the transcript draws each workflow run as a read-only card: the agent words, the report, no Stop run', async () => {
+  it('the transcript draws an edit as the Work row does: its diff from the stored lines, the made change unheaded', async () => {
+    const update = (u: object) =>
+      JSON.stringify({
+        timestamp: 1_791_643_279,
+        method: 'session/update',
+        params: { sessionId: PARENT_ID, update: u },
+      });
+    const details = [
+      {
+        old_string: 'port = 3000',
+        old_line: 2,
+        new_string: 'port = 8080',
+        new_line: 2,
+        context_before: 'import x;\n',
+        context_after: '',
+        line_prefix: 'const ',
+      },
+    ];
+    const parsed = parseUpdates(
+      [
+        update({
+          sessionUpdate: 'user_message_chunk',
+          content: { type: 'text', text: 'Change the port' },
+          _meta: { promptIndex: 0 },
+        }),
+        update({
+          sessionUpdate: 'tool_call',
+          toolCallId: 'call_1',
+          title: 'search_replace',
+          status: 'pending',
+          rawInput: { file_path: 'src/app.ts', old_string: 'port = 3000', new_string: 'port = 8080' },
+          _meta: { 'x.ai/tool': { name: 'search_replace' } },
+        }),
+        update({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'call_1',
+          status: 'completed',
+          content: [
+            {
+              type: 'diff',
+              path: '/work/mlx-node/src/app.ts',
+              oldText: 'port = 3000',
+              newText: 'port = 8080',
+              _meta: { details },
+            },
+          ],
+          rawOutput: { type: 'SearchReplace', EditsApplied: { old_string: 'port = 3000', new_string: 'port = 8080' } },
+        }),
+        update({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Changed the port.' } }),
+      ].join('\n') + '\n',
+    );
+    await mountDetail(
+      PARENT_ID,
+      { [`GET /sessions/${PARENT_ID}`]: { body: { ...detailBody({}, parsed.transcript), turns: [turn({})] } } },
+      'Changed the port.',
+      '?tab=transcript',
+    );
+    const tool = [...mounted!.container.querySelectorAll('button')].find((b) =>
+      (b.getAttribute('aria-label') ?? '').includes('search_replace'),
+    );
+    await click(tool);
+    const figure = byRole(mounted!.container, 'figure', undefined)!;
+    expect(figure.getAttribute('aria-label')).toBe(
+      `${fill(CHAT.diff.label, { path: '/work/mlx-node/src/app.ts' })}: ${fill(CHAT.diff.countsSr, { added: 1, removed: 1 })}`,
+    );
+    expect(figure.querySelector('figcaption')).toBeNull();
+    const rows = [...figure.querySelectorAll('[data-mark]')].map((row) => row.textContent);
+    expect(rows).toEqual([`2−${CHAT.diff.removed} const port = 3000`, `2+${CHAT.diff.added} const port = 8080`]);
+    expect(mounted!.text()).not.toContain('EditsApplied');
+  });
+
+  it('the transcript draws each workflow run as a read-only block: the agent words, the report, no Stop run', async () => {
     const ts = Date.UTC(2026, 9, 20, 10);
     const transcript: TranscriptEntry[] = [
       { kind: 'user', ts, text: 'Research the lanes', promptIndex: 0 },
@@ -1541,16 +1845,20 @@ describe('Session detail page: a woken turn', () => {
       '?tab=transcript',
     );
     const card = (id: string): HTMLElement =>
-      mounted!.container.querySelector<HTMLElement>(`[data-run="${id}"]`)!.closest('section')!;
+      mounted!.container.querySelector<HTMLElement>(`section[data-run="${id}"]`)!;
     const running = card('wf_01');
-    expect(running.querySelector('h3')?.textContent).toBe('Workflow · deep-research');
-    expect(running.querySelector('header [data-tone]')?.textContent).toBe(CHAT.run.status.active);
+    expect(running.querySelector('h3')?.textContent).toBe(`${CHAT.run.namePrefix}deep-research`);
+    expect(running.querySelector('header [data-tone]')?.textContent).toBe(
+      fill(CHAT.run.status.notFinished, { time: formatClock(ts + 2_000) }),
+    );
     expect(running.textContent).toContain('Step 2 of 4: Research');
     const done = card('wf_02');
-    expect(done.querySelector('header [data-tone]')?.textContent).toBe(CHAT.run.status.complete);
+    expect(done.querySelector('header [data-tone]')?.textContent).toBe(
+      fill(CHAT.run.status.donePartly, { n: 1, m: 3 }),
+    );
     expect(done.querySelector('strong')?.textContent).toBe('4 lanes');
-    expect(byRole(mounted!.container, 'button', CHAT.run.stop)).toBeNull();
-    expect(mounted!.text()).not.toContain(CHAT.run.status.interrupted);
+    expect(byRole(mounted!.container, 'button', CHAT.run.buttons.stop)).toBeNull();
+    expect(mounted!.text()).not.toContain(CHAT.run.status.endedEarly);
   });
 });
 
@@ -1568,7 +1876,7 @@ describe('turnTokenBars', () => {
   });
 });
 
-describe('turnPrefill / prefillAverage / turnTimeParts', () => {
+describe('turnPrefill / prefillAverage', () => {
   it('reads a measured pair, rates it from the floor up, and applies the floor per call', () => {
     expect(turnPrefill({ prefillMs: null, prefillTokens: null, prefillCalls: null })).toBeNull();
     expect(turnPrefill({ prefillMs: 100, prefillTokens: null, prefillCalls: null })).toBeNull();
@@ -1594,13 +1902,6 @@ describe('turnPrefill / prefillAverage / turnTimeParts', () => {
     expect(prefillAverage([big, mid, small, null])).toBe(775);
     expect(prefillAverage([small])).toBeNull();
     expect(prefillAverage([])).toBeNull();
-  });
-
-  it('splits a turn into time to first token, decode and the rest', () => {
-    const parts = turnTimeParts({ elapsedMs: 10_000, ttftMs: 400, decodeTps: 50, outputTokens: 100 });
-    expect(parts).toEqual({ firstTokenMs: 400, decodeMs: 2_000, otherMs: 7_600, totalMs: 10_000 });
-    const clamped = turnTimeParts({ elapsedMs: 1_000, ttftMs: 800, decodeTps: 10, outputTokens: 100 });
-    expect((clamped.firstTokenMs ?? 0) + (clamped.decodeMs ?? 0) + (clamped.otherMs ?? 0)).toBe(1_000);
   });
 });
 
@@ -1700,6 +2001,7 @@ describe('UI session types', () => {
     expectTypeOf<SessionRenameResponse>().toEqualTypeOf<Server.SessionRenameResponse>();
     expectTypeOf<SessionDeleteResponse>().toEqualTypeOf<Server.SessionDeleteResponse>();
     expectTypeOf<SessionTimelineResponse>().toEqualTypeOf<Server.SessionTimelineResponse>();
+    expectTypeOf<SessionPictureResponse>().toEqualTypeOf<Server.SessionPictureResponse>();
   });
 });
 

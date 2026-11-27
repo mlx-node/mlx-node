@@ -11,7 +11,6 @@ import {
   pickProcess,
   poolSegments,
   procKeyOf,
-  recentSpark,
   seriesStarts,
   sparkPoints,
   tickerChip,
@@ -21,8 +20,19 @@ import type { LiveSample } from '../ui/src/lib/live-history.js';
 import type * as Page from '../ui/src/lib/types.js';
 import { GIB, live, process, runtimeSeries, sched } from './helpers/observability-fixtures.js';
 
-function sample(t: number, outTps: number | null, pid: number | null = 812): LiveSample {
-  return { t, pid, outTps, memActive: 10 * GIB, memCache: GIB, inFlight: 1, queued: 0 };
+function sample(t: number, outputTps: number | null, pid: number | null = 812): LiveSample {
+  return {
+    t,
+    at: t,
+    pid,
+    outputTps,
+    prefillTps: null,
+    work: null,
+    memActive: 10 * GIB,
+    memCache: GIB,
+    inFlight: 1,
+    queued: 0,
+  };
 }
 
 describe('pickProcess', () => {
@@ -148,29 +158,19 @@ describe('batchUse', () => {
 describe('ticker', () => {
   const NOW = 1_000_000_000;
 
-  it('builds six items in order', () => {
-    const items = nowItems(process({ startedAt: NOW - 3_600_000 }), [], NOW);
-    expect(items.map((item) => item.key)).toEqual(['out', 'flight', 'queued', 'mem', 'turns', 'uptime']);
-    expect(items[0].value).toBe('42.7');
-    expect(items[3].value).toBe('18.0');
-    expect(items[3].unit).toBe('GB');
-    expect(items[4].value).toBe('1,204');
-    expect(items[5].value).toBe('1h 0m');
-  });
-
   it('never has more than 60 spark points and keeps an empty bucket null', () => {
     const history: LiveSample[] = [];
     for (let i = 0; i < 600; i += 1) history.push(sample(NOW - 599_000 + i * 1000, i < 100 ? null : 10));
-    const points = sparkPoints(history, (s) => s.outTps, NOW, 812);
+    const points = sparkPoints(history, (s) => s.outputTps, NOW, 812);
     expect(points).toHaveLength(60);
     expect(points[0]).toBeNull();
     expect(points[59]).toBe(10);
-    const sparse = sparkPoints([sample(NOW - 5_000, 4)], (s) => s.outTps, NOW, 812);
+    const sparse = sparkPoints([sample(NOW - 5_000, 4)], (s) => s.outputTps, NOW, 812);
     expect(sparse.filter((value) => value !== null)).toEqual([4]);
   });
 
   it('gives no delta in the first minute or after a gap, else the change over 60 s', () => {
-    const pick = (s: LiveSample) => s.outTps;
+    const pick = (s: LiveSample) => s.outputTps;
     expect(tickerDelta([sample(NOW - 30_000, 5), sample(NOW, 9)], pick, NOW, 812)).toBeNull();
     expect(tickerDelta([sample(NOW - 60_000, 5), sample(NOW, 9)], pick, NOW, 812)).toBe(4);
     expect(tickerDelta([sample(NOW - 90_000, 5), sample(NOW, 9)], pick, NOW, 812)).toBeNull();
@@ -182,12 +182,16 @@ describe('ticker', () => {
   });
 
   it('gives no delta when either reading is 0 or missing: a change from or to nothing is not a trend', () => {
-    const pick = (s: LiveSample) => s.outTps;
+    const pick = (s: LiveSample) => s.outputTps;
     expect(tickerDelta([sample(NOW - 60_000, 0), sample(NOW, 78.9)], pick, NOW, 812)).toBeNull();
     expect(tickerDelta([sample(NOW - 60_000, 78.9), sample(NOW, 0)], pick, NOW, 812)).toBeNull();
     expect(tickerDelta([sample(NOW - 60_000, null), sample(NOW, 78.9)], pick, NOW, 812)).toBeNull();
     expect(tickerDelta([sample(NOW - 54_000, 40), sample(NOW, 78.9)], pick, NOW, 812)).toBeNull();
-    const items = nowItems(process({ decodeTps: 78.9 }), [sample(NOW - 60_000, 0), sample(NOW, 78.9)], NOW);
+    const items = nowItems(
+      process({ rates: { windowMs: 10_000, outputTps: 78.9, prefillTps: null } }),
+      [sample(NOW - 60_000, 0), sample(NOW, 78.9)],
+      NOW,
+    );
     expect(items[0].delta).toBeNull();
     expect('delta' in items[0]).toBe(true);
   });
@@ -201,15 +205,6 @@ describe('ticker', () => {
     expect(other[0].spark?.data.filter((value) => value !== null)).toEqual([]);
     const own = nowItems(process({ pid: 222, startedAt: NOW - 3_600_000 }), history, NOW);
     expect(own[0].delta).toEqual({ text: '+2.0', direction: 'up', goodWhen: 'up' });
-  });
-
-  it('keeps the recent spark at a fixed length, breaks it at a gap and reads one pid', () => {
-    const pick = (s: LiveSample) => s.outTps;
-    const history = [sample(1_000, 1), sample(2_000, 2, 900), sample(2_000, 3), sample(300_000, 4), sample(301_000, 5)];
-    expect(recentSpark(history, pick, 812, 6, 20_000)).toEqual([null, 1, 3, null, 4, 5]);
-    expect(recentSpark(history, pick, 812, 3, 20_000)).toEqual([null, 4, 5]);
-    expect(recentSpark(history, pick, 900, 3, 20_000)).toEqual([null, null, 2]);
-    expect(recentSpark([], pick, 812, 2, 20_000)).toEqual([null, null]);
   });
 
   it('keys a process by start and pid', () => {

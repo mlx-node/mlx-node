@@ -73,6 +73,7 @@ describe('Chat page: jump to latest', () => {
               transcriptError: null,
               permissionMarks: [],
               runs: [],
+              live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
             },
           },
         },

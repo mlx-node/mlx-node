@@ -23,6 +23,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { ApiError, type ApiResponse } from '../src/api/errors.js';
+import { LAUNCHD_PATH } from '../src/chat/agent/login-path.js';
 import { chatPaths, type ChatPaths } from '../src/chat/paths.js';
 import { checkKeyFormat, MemorySecretStore, type SecretStore } from '../src/chat/providers/secrets.js';
 import { ProvidersService, type ProvidersServiceOptions, WORK_PATH_ASK_GAP_MS } from '../src/chat/providers/service.js';
@@ -1028,6 +1029,7 @@ describe('the runtime and the Work PATH', () => {
     workPath?: (base: NodeJS.ProcessEnv, home: string) => string;
     baseEnv: NodeJS.ProcessEnv;
     homeDir: string;
+    loginShell?: string;
   }): Promise<ProvidersResponse> {
     const secrets = new MemorySecretStore();
     await secrets.set('firecrawl', 'fc-key-000001');
@@ -1078,6 +1080,35 @@ describe('the runtime and the Work PATH', () => {
     runtime = null;
     const plain = await firecrawlWork({ baseEnv: { ...baseEnv, PATH: bin }, homeDir });
     expect(plain.providers[3]!.work.missing).toBe(null);
+  }, 30_000);
+
+  // Mutation: the check given the app's own env → under launchd's PATH the CLI only the login shell finds is missing.
+  it("in the app the check reads the login shell's PATH, the one the Work agent gets", async () => {
+    const bin = join(root, 'login-bin');
+    mkdirSync(bin);
+    writeFileSync(join(bin, 'firecrawl'), '#!/bin/sh\n');
+    chmodSync(join(bin, 'firecrawl'), 0o755);
+    const shell = join(root, 'zsh');
+    writeFileSync(shell, `#!/bin/sh\nPATH="${bin}:$PATH" /bin/sh -c "$2"\n`);
+    chmodSync(shell, 0o755);
+    const homeDir = join(root, 'home');
+    mkdirSync(homeDir, { recursive: true });
+    const baseEnv = { PATH: LAUNCHD_PATH, HOME: homeDir };
+    const asked = await firecrawlWork({ baseEnv, homeDir, loginShell: shell });
+    expect(asked.providers[3]!.work.missing).toBe(null);
+    let seen: NodeJS.ProcessEnv | null = null;
+    await runtime!.close();
+    runtime = null;
+    await firecrawlWork({
+      baseEnv,
+      homeDir,
+      loginShell: shell,
+      workPath: (base) => {
+        seen = base;
+        return bin;
+      },
+    });
+    expect(seen).toEqual({ ...baseEnv, PATH: `${bin}:${LAUNCHD_PATH}` });
   }, 30_000);
 });
 

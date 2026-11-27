@@ -181,20 +181,18 @@ export function webCallOf(entry: ToolEntry): { call: WebCall; result: WebResult 
   return { call, result: fits ? plainTitles(result) : null };
 }
 
-/** Why the app refused a call: the tool or its form, the address of a read, or an input text it could not read. */
-export type Refusal = 'tool' | 'address' | 'arguments';
+/** Why the app refused a call: the tool or its form, or an input text it could not read. */
+export type Refusal = 'tool' | 'arguments';
 
 const REFUSALS: Partial<Record<TurnOutcome, Refusal>> = {
   'tool-refused': 'tool',
-  'address-refused': 'address',
   'arguments-unreadable': 'arguments',
 };
 
 /**
  * In a turn that ended on a refusal, the call the app refused: the agent ends the turn on that rejection, so it is the
- * turn's last tool call (a read for `address-refused`; a `use_tool` read whose input is a text for
- * `arguments-unreadable`, whatever that text holds), ended without a result. Null when that call has a result or is not
- * over.
+ * turn's last tool call (for `arguments-unreadable`, a `use_tool` read whose input is a text, whatever that text
+ * holds), ended without a result. Null when that call has a result or is not over.
  */
 function fetchText(entry: ToolEntry): boolean {
   const raw = parseJson(entry.input);
@@ -213,7 +211,6 @@ export function refusedCall(
     const entry = entries[i]!;
     if (entry.kind !== 'tool') continue;
     const web = webCallOf(entry);
-    if (refusal === 'address' && web?.call.kind !== 'fetch') continue;
     if (refusal === 'arguments' && !fetchText(entry)) continue;
     const over = entry.status !== 'completed' && entry.status !== 'in_progress' && entry.status !== 'pending';
     return over && (web?.result ?? null) === null ? { entry, refusal } : null;

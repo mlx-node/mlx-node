@@ -1,0 +1,45 @@
+.controls {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  gap: 2px;
+}
+
+.slot {
+  display: inline-flex;
+}
+
+/* Beside a pointer a target is 24 px; in the drawer or on touch 32 px. */
+.controls.controls button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+}
+
+.controls.controls .review {
+  width: auto;
+  padding-inline: var(--space-2);
+  font-size: var(--text-xs);
+}
+
+.controls.controls[data-large] button {
+  width: 32px;
+  height: 32px;
+  min-height: 32px;
+}
+
+.controls.controls[data-large] .review {
+  width: auto;
+}
+
+@media (pointer: coarse) {
+  .controls.controls button {
+    width: 32px;
+    height: 32px;
+    min-height: 32px;
+  }
+
+  .controls.controls .review {
+    width: auto;
+  }
+}

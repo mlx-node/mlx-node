@@ -7,10 +7,13 @@
  * only, token sums and turn counts read every outcome; empty buckets are never
  * filled; percentiles are nearest rank over one scan per window. Prefill
  * speed reads measured rows only; a row without a prefill window has none.
+ * A speed over many turns is token-weighted (Σ tokens ÷ Σ phase ms, the
+ * `*Rated*` sums); the per-turn quantiles are its distribution, never its value.
  */
 
 import type { StatementSync } from 'node:sqlite';
 
+import { PREFILL_MIN_TOKENS } from '../../prefill-rule.js';
 import type { ApiRequest, WorkerApiContext } from '../context.js';
 import { toInt, toNum } from '../context.js';
 import { ApiError } from '../errors.js';
@@ -79,6 +82,18 @@ export interface MetricsTotals {
   /** total − every phase above, clamped at 0. */
   otherWallMs: number;
   totalWallMs: number;
+  /** Ok turns with a decode rate: output tokens after the first, and their decode ms. */
+  decodeRatedTokens: number;
+  decodeRatedMs: number;
+  /** Ok turns with a measured prefill of at least `PREFILL_MIN_TOKENS`: prefill tokens and prefill ms. */
+  prefillRatedTokens: number;
+  prefillRatedMs: number;
+}
+
+/** Σ tokens and Σ ms of one rated phase: their quotient is the token-weighted speed. */
+export interface RatedSum {
+  tokens: number;
+  ms: number;
 }
 
 export interface MetricsLatency {
@@ -166,6 +181,9 @@ export interface MetricsSpeculative {
     acceptByPos: Array<{ pos: number; rate: number; cycles: number }>;
     decodeTpsWithMtp: Quantiles;
     decodeTpsWithoutMtp: Quantiles;
+    /** Decode sums of ok turns that ran speculation, and of those that did not. */
+    decodeWith: RatedSum;
+    decodeWithout: RatedSum;
   }>;
   trend: Array<{ t: number; model: string; meanAccepted: number | null; mtpTurns: number }>;
 }
@@ -206,6 +224,7 @@ export interface TurnRow {
   durationMs: number | null;
   /** Rated turns only (measured, at least `PREFILL_MIN_TOKENS`). */
   prefillTps: number | null;
+  /** Null when native measured no rate (0) or the turn wrote one token or none. */
   decodeTps: number | null;
   mtpCycles: number | null;
   mtpMeanAccepted: number | null;
@@ -258,8 +277,23 @@ function strOrNull(value: unknown): string | null {
   return typeof value === 'string' ? value : null;
 }
 
+/** Output tokens after the first of a row with a decode rate: the tokens behind {@link DECODE_WALL_SQL}. */
+const DECODE_TOKENS_SQL = 'CASE WHEN decode_tps > 0 AND output_tokens > 1 THEN output_tokens - 1 END';
+/** The rows {@link PREFILL_TPS_SQL} rates. */
+const PREFILL_RATED_SQL = `prefill_ms > 0 AND prefill_tokens >= ${String(PREFILL_MIN_TOKENS)}`;
+
+/** Σ decode tokens and Σ decode ms of ok rows, for a `filter` on top. */
+function decodeSumSql(filter: string, prefix: string): string {
+  const ok = `outcome = 'ok'${filter === '' ? '' : ` AND ${filter}`}`;
+  return `SUM(CASE WHEN ${ok} THEN COALESCE(${DECODE_TOKENS_SQL}, 0) ELSE 0 END) AS ${prefix}Tokens,
+  SUM(CASE WHEN ${ok} THEN COALESCE(${DECODE_WALL_SQL}, 0) ELSE 0 END) AS ${prefix}Ms`;
+}
+
 /** Aggregate columns of {@link MetricsTotals}; every outcome counts. */
 const TOTALS_SELECT = `
+  ${decodeSumSql('', 'decodeRated')},
+  SUM(CASE WHEN outcome = 'ok' AND ${PREFILL_RATED_SQL} THEN prefill_tokens ELSE 0 END) AS prefillRatedTokens,
+  SUM(CASE WHEN outcome = 'ok' AND ${PREFILL_RATED_SQL} THEN prefill_ms ELSE 0 END) AS prefillRatedMs,
   COUNT(*) AS turns,
   SUM(outcome = 'ok') AS ok, SUM(outcome = 'error') AS error, SUM(outcome = 'cancelled') AS cancelled,
   SUM(CASE WHEN outcome = 'ok' AND ${PREFILL_MEASURED_SQL} THEN 1 ELSE 0 END) AS prefillMeasured,
@@ -295,6 +329,10 @@ function emptyTotals(): MetricsTotals {
     decodeWallMs: 0,
     otherWallMs: 0,
     totalWallMs: 0,
+    decodeRatedTokens: 0,
+    decodeRatedMs: 0,
+    prefillRatedTokens: 0,
+    prefillRatedMs: 0,
   };
 }
 
@@ -337,6 +375,10 @@ function totalsOf(row: Row): MetricsTotals {
     decodeWallMs: ms(row.decodeWallMs),
     otherWallMs: 0,
     totalWallMs: ms(row.totalWallMs),
+    decodeRatedTokens: toInt(row.decodeRatedTokens),
+    decodeRatedMs: ms(row.decodeRatedMs),
+    prefillRatedTokens: toInt(row.prefillRatedTokens),
+    prefillRatedMs: ms(row.prefillRatedMs),
   });
 }
 
@@ -614,7 +656,9 @@ export function handleMetricsSpeculative(ctx: WorkerApiContext, req: ApiRequest)
               SUM(CASE WHEN outcome = 'ok' AND mtp_mean_drafts IS NOT NULL THEN mtp_mean_drafts * mtp_cycles END) AS drafts,
               SUM(CASE WHEN outcome = 'ok' AND mtp_mean_drafts IS NOT NULL THEN mtp_cycles END) AS draftsW,
               SUM(CASE WHEN outcome = 'ok' AND mtp_mean_depth IS NOT NULL THEN mtp_mean_depth * mtp_cycles END) AS depth,
-              SUM(CASE WHEN outcome = 'ok' AND mtp_mean_depth IS NOT NULL THEN mtp_cycles END) AS depthW
+              SUM(CASE WHEN outcome = 'ok' AND mtp_mean_depth IS NOT NULL THEN mtp_cycles END) AS depthW,
+              ${decodeSumSql('mtp_cycles IS NOT NULL', 'decodeWith')},
+              ${decodeSumSql('mtp_cycles IS NULL', 'decodeWithout')}
        FROM traces ${all.where} GROUP BY model_key ORDER BY model_key`,
     ),
     all.args,
@@ -687,6 +731,8 @@ export function handleMetricsSpeculative(ctx: WorkerApiContext, req: ApiRequest)
         acceptByPos,
         decodeTpsWithMtp: quantilesOf(tps.values(key, 'with')),
         decodeTpsWithoutMtp: quantilesOf(tps.values(key, 'without')),
+        decodeWith: { tokens: toInt(row.decodeWithTokens), ms: toNum(row.decodeWithMs) ?? 0 },
+        decodeWithout: { tokens: toInt(row.decodeWithoutTokens), ms: toNum(row.decodeWithoutMs) ?? 0 },
       };
     }),
     trend: trend.map((row) => ({
@@ -706,7 +752,7 @@ const TURN_COLUMNS = `trace_id AS traceId, ts, model_key AS modelKey, model, mod
   wait_ms AS waitMs, slot_ms AS slotMs, prepare_ms AS prepareMs, ttft_ms AS ttftMs, CASE WHEN ${PREFILL_MEASURED_SQL} THEN prefill_ms END AS prefillMs,
   CASE WHEN ${PREFILL_MEASURED_SQL} THEN prefill_tokens END AS prefillTokens, ${SETUP_MS_SQL} AS setupMs,
   ${DECODE_WALL_SQL} AS decodeMs, duration_ms AS durationMs, ${PREFILL_TPS_SQL} AS prefillTps,
-  decode_tps AS decodeTps, mtp_cycles AS mtpCycles, mtp_mean_accepted AS mtpMeanAccepted, cold_hits AS coldHits,
+  ${DECODE_TPS_SQL} AS decodeTps, mtp_cycles AS mtpCycles, mtp_mean_accepted AS mtpMeanAccepted, cold_hits AS coldHits,
   cold_misses AS coldMisses, tool_count AS toolCount, tool_call_count AS toolCallCount, image_count AS imageCount,
   concurrency, concurrency_peak AS concurrencyPeak, mem_active_bytes AS memActiveBytes,
   pipelines_created AS pipelinesCreated, pipeline_create_ms AS pipelineCreateMs, pid`;

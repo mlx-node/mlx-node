@@ -1,4 +1,4 @@
-import { Check, ChevronDown, ChevronRight, TriangleAlert } from 'lucide-react';
+import { Check, ChevronDown, ChevronLeft, ChevronRight, Info, TriangleAlert } from 'lucide-react';
 import {
   type CSSProperties,
   type KeyboardEvent,
@@ -6,6 +6,7 @@ import {
   type ReactElement,
   type ReactNode,
   useCallback,
+  useEffect,
   useId,
   useLayoutEffect,
   useRef,
@@ -14,7 +15,6 @@ import {
 
 import { CHAT, fill } from '../../../lib/chat-strings';
 import { cn } from '../../../lib/cn';
-import { truncateMiddle } from '../../../lib/labels';
 import { Badge } from '../../arc/badge/badge';
 import { Popover, PopoverContent, PopoverTrigger } from '../../arc/popover/popover';
 import { Tooltip } from '../../arc/tooltip/tooltip';
@@ -23,6 +23,16 @@ import { MiddleText } from '../middle-text/middle-text';
 import { ModelBadge } from '../model-badge/model-badge';
 import { MorphLoader } from '../morph-loader/morph-loader';
 import styles from './model-picker.module.css';
+
+/** A model's thinking levels and the one a pick of its row keeps. */
+export interface ModelEffort {
+  /** Least thinking first. */
+  levels: ReadonlyArray<{ value: string; label: string }>;
+  /** One of `levels`: the conversation's level when the row is of its base, else the model's default. */
+  value: string;
+  /** Behind the ⓘ of the Thinking effort column. */
+  note?: string;
+}
 
 export interface ModelVariantOption {
   /** The served model id. The key of the row. */
@@ -34,6 +44,8 @@ export interface ModelVariantOption {
   facts: readonly string[];
   /** e.g. "small for Work"; drawn with a warning icon. */
   warning?: string;
+  /** Absent or no levels: no Thinking effort column, and a pick sends no level. */
+  effort?: ModelEffort;
 }
 
 export interface ModelBaseOption {
@@ -58,30 +70,48 @@ export interface ModelPickerProps {
   bases: readonly ModelBaseOption[];
   /** The model whose base opens when `value` is not served: the model a new conversation starts on. */
   fallback?: string | null;
-  onValueChange: (id: string) => void;
+  /**
+   * A pick: the model, and its level when the model has levels (the one picked in the Thinking effort column, else
+   * the row's `effort.value`). Not called when neither differs from the conversation's.
+   */
+  onValueChange: (id: string, level?: string) => void;
   disabled?: boolean;
   disabledReason?: string;
+  /**
+   * Only the model rows are off (an answer runs): the chip still opens, for the Thinking effort column of the
+   * conversation's model; the reason is the footer.
+   */
+  listDisabled?: boolean;
+  listDisabledReason?: string;
+  /** The agent did not take the level before the last answer: a warning dot in the chip's level badge. */
+  levelWarning?: boolean;
   /** A change is being saved. */
   working?: boolean;
-  /** Under both lists. */
+  /** Under the lists. */
   footer?: string;
   /** Shown instead of the footer while one or more variants are not loaded. */
   swapWarning?: string;
   /** The last row: what the engine holds now, and an action (Unload). Outside the listboxes: a normal tab stop. */
   memory?: { text: string; action: ReactNode };
-  /** The tools row holds more chips (Work): the quantization badge hides under a wider composer. */
+  /** The tools row holds more chips (Work): the level badge hides under a wider composer. */
   crowded?: boolean;
 }
 
 /** The left list asks for this many rows at least, and shows 8.5 at most. */
 const MIN_ROWS = 4;
 const MAX_ROWS = 8.5;
+/** The width of `.panel.panel[data-third]` in the CSS, and the gap the panel keeps from the window edge. */
+const THIRD_WIDTH = 713;
+const GUTTER = 16;
 
 interface Keys {
   open: string;
   base: string;
   variant: string;
+  level: string;
 }
+
+const NO_KEYS: Keys = { open: '', base: '', variant: '', level: '' };
 
 function holding(bases: readonly ModelBaseOption[], id: string | null | undefined): ModelBaseOption | undefined {
   if (id === null || id === undefined) return undefined;
@@ -107,6 +137,28 @@ function resolve(
       variants.findIndex((option) => option.id === open?.preselect),
     );
   return { home, open, base, variant };
+}
+
+function levelsOf(variant: ModelVariantOption | undefined): ModelEffort | undefined {
+  const effort = variant?.effort;
+  return effort !== undefined && effort.levels.length > 0 ? effort : undefined;
+}
+
+/** The label of the level a pick of `variant` keeps; null for a model with no levels. */
+function keptLabel(variant: ModelVariantOption | undefined): string | null {
+  const effort = levelsOf(variant);
+  return effort?.levels.find((option) => option.value === effort.value)?.label ?? null;
+}
+
+/** The active level row: `key` when the list has it, else the level the row keeps, else the first. */
+function levelIndex(effort: ModelEffort | undefined, key: string): number {
+  if (effort === undefined) return 0;
+  const at = effort.levels.findIndex((option) => option.value === key);
+  if (at !== -1) return at;
+  return Math.max(
+    0,
+    effort.levels.findIndex((option) => option.value === effort.value),
+  );
 }
 
 /** Scrolls `list` by the least amount that shows all of its `index`th row; rows are positioned against the list. */
@@ -170,22 +222,36 @@ function Facts(props: {
   );
 }
 
+/** The chip's name with the level of the model. */
+function withLevel(name: string, level: string | null): string {
+  return level === null ? name : fill(CHAT.thinkingLevel.chipName, { model: name, level });
+}
+
 /**
- * The model of the next message: a pill with the base and the quantization, and a popover with two lists, the bases
- * on the left and the quantizations of the open base on the right.
+ * The model of the next message: a pill with the base and the level, and a popover of cascading lists: the bases, the
+ * quantizations of the open base (a base with several), and the Thinking effort of the quantization in view (a model
+ * with levels). A window too narrow for three columns shows the levels in place of the quantizations, with a back row.
  */
 export function ModelPicker(props: ModelPickerProps): ReactElement {
   const [open, setOpen] = useState(false);
-  const [keys, setKeysState] = useState<Keys>({ open: '', base: '', variant: '' });
+  const [keys, setKeysState] = useState<Keys>(NO_KEYS);
   const keysRef = useRef(keys);
   const [rightLive, setRightLive] = useState({ focus: false, pointer: false });
+  const [levelsLive, setLevelsLive] = useState({ focus: false, pointer: false });
+  /** Narrow window: the levels of the active quantization replace the quantization list. */
+  const [deep, setDeep] = useState(false);
+  /** Three columns fit between the chip's left edge and the window's right edge. */
+  const [room, setRoom] = useState(true);
   const pointer = useRef<{ x: number; y: number } | null>(null);
-  const focusRight = useRef(false);
+  const focusTo = useRef<'quants' | 'levels' | null>(null);
+  const triggerRef = useRef<HTMLButtonElement | null>(null);
   const id = useId();
   const [left, setLeft] = useState<HTMLDivElement | null>(null);
   const [right, setRight] = useState<HTMLDivElement | null>(null);
+  const [levelsNode, setLevelsNode] = useState<HTMLDivElement | null>(null);
   const leftRef = useRef<HTMLDivElement | null>(null);
   const rightRef = useRef<HTMLDivElement | null>(null);
+  const levelsRef = useRef<HTMLDivElement | null>(null);
   const attachLeft = useCallback((node: HTMLDivElement | null) => {
     leftRef.current = node;
     setLeft(node);
@@ -193,6 +259,10 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
   const attachRight = useCallback((node: HTMLDivElement | null) => {
     rightRef.current = node;
     setRight(node);
+  }, []);
+  const attachLevels = useCallback((node: HTMLDivElement | null) => {
+    levelsRef.current = node;
+    setLevelsNode(node);
   }, []);
 
   const bases = props.bases;
@@ -203,6 +273,7 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
   const at = resolve(bases, props.value, props.fallback, keys);
   const openOption = at.open;
   const variants = openOption?.variants ?? [];
+  const one = variants.length === 1;
   // The footer must not follow the active row. The panel hangs from its bottom edge: a change of the footer height
   // moves the rows under a resting pointer, the active row changes, and the footer flips back.
   const swap =
@@ -210,8 +281,21 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
     bases.some((option) => option.variants.some((variant) => variant.state !== 'loaded'))
       ? props.swapWarning
       : null;
-  const footer = swap ?? props.footer ?? null;
+  const listOff = props.listDisabled === true;
+  const footer = (listOff ? props.listDisabledReason : undefined) ?? swap ?? props.footer ?? null;
+  const levelShown = keptLabel(selected);
   const rows = Math.min(Math.max(bases.length, MIN_ROWS), MAX_ROWS);
+
+  /** The levels a row opens: while the model rows are off, only the conversation's model has them. */
+  const nextOf = (variant: ModelVariantOption | undefined): ModelEffort | undefined =>
+    listOff && variant?.id !== props.value ? undefined : levelsOf(variant);
+  const activeVariant = variants[at.variant];
+  const levelsVariant = nextOf(activeVariant) !== undefined && (one || room || deep) ? activeVariant : undefined;
+  const effort = nextOf(levelsVariant);
+  const inPlace = levelsVariant !== undefined && (one || !room);
+  const third = levelsVariant !== undefined && !inPlace;
+  const back = inPlace && !one;
+  const levelAt = levelIndex(effort, keys.level);
 
   const setKeys = (next: Partial<Keys>): void => {
     const merged = { ...keysRef.current, ...next };
@@ -219,29 +303,45 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
     setKeysState(merged);
   };
 
+  const measure = useCallback((): void => {
+    const node = triggerRef.current;
+    if (node === null) return;
+    setRoom(node.getBoundingClientRect().left + THIRD_WIDTH + GUTTER <= window.innerWidth);
+  }, []);
+  useEffect(() => {
+    if (!open) return;
+    window.addEventListener('resize', measure);
+    return () => window.removeEventListener('resize', measure);
+  }, [open, measure]);
+
   const openList = (): void => {
-    const home = resolve(bases, props.value, props.fallback, { open: '', base: '', variant: '' }).home;
-    setKeys({ open: home?.base ?? '', base: home?.base ?? '', variant: home?.preselect ?? '' });
+    const home = resolve(bases, props.value, props.fallback, NO_KEYS).home;
+    setKeys({ open: home?.base ?? '', base: home?.base ?? '', variant: home?.preselect ?? '', level: '' });
     setRightLive({ focus: false, pointer: false });
+    setLevelsLive({ focus: false, pointer: false });
+    setDeep(false);
+    measure();
     setOpen(true);
   };
 
   // Read by the effects below through a ref: they run when a list mounts or the order changes, not on each state.
-  const latest = useRef({ bases, value: props.value, fallback: props.fallback });
+  const latest = useRef({ bases, value: props.value, fallback: props.fallback, level: levelAt });
   useLayoutEffect(() => {
-    latest.current = { bases, value: props.value, fallback: props.fallback };
+    latest.current = { bases, value: props.value, fallback: props.fallback, level: levelAt };
   });
   const showActive = useCallback((): void => {
     const now = latest.current;
     const where = resolve(now.bases, now.value, now.fallback, keysRef.current);
     reveal(leftRef.current, where.base);
     reveal(rightRef.current, where.variant);
+    reveal(levelsRef.current, now.level);
   }, []);
 
   useLayoutEffect(() => {
-    const node = rightRef.current;
-    if (!focusRight.current || node === null) return;
-    focusRight.current = false;
+    const target = focusTo.current;
+    const node = target === 'quants' ? rightRef.current : target === 'levels' ? levelsRef.current : null;
+    if (node === null) return;
+    focusTo.current = null;
     node.focus();
     showActive();
   });
@@ -255,23 +355,56 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
     const observer = new ResizeObserver(showActive);
     if (left !== null) observer.observe(left);
     if (right !== null) observer.observe(right);
+    if (levelsNode !== null) observer.observe(levelsNode);
     return () => observer.disconnect();
-  }, [left, right, order, showActive]);
+  }, [left, right, levelsNode, order, showActive]);
 
-  const pick = (pickedId: string): void => {
+  /** Model and level together; nothing is sent when both are the conversation's. */
+  const commit = (variant: ModelVariantOption, level: string | undefined): void => {
+    if (listOff && nextOf(variant) === undefined) return;
     setOpen(false);
-    if (pickedId !== props.value) props.onValueChange(pickedId);
+    const current = levelsOf(selected)?.value;
+    if (level === undefined) {
+      if (variant.id !== props.value) props.onValueChange(variant.id);
+    } else if (variant.id !== props.value || level !== current) props.onValueChange(variant.id, level);
   };
 
-  /** Opens `option` in the right list with its preselected row active, and moves focus there. */
+  /** A leaf row: a model with no levels (or, while the model rows are off, one that is not the conversation's). */
+  const pick = (variant: ModelVariantOption): void => commit(variant, undefined);
+
+  /** Opens `option` with its preselected row active, and moves focus to its next column. */
   const openBase = (option: ModelBaseOption): void => {
-    setKeys({ open: option.base, base: option.base, variant: option.preselect });
-    focusRight.current = true;
+    setKeys({ open: option.base, base: option.base, variant: option.preselect, level: '' });
+    setDeep(false);
+    const only = option.variants.length === 1 ? option.variants[0] : undefined;
+    focusTo.current = nextOf(only) !== undefined ? 'levels' : 'quants';
   };
 
   const enterBase = (option: ModelBaseOption): void => {
-    if (option.variants.length === 1) pick(option.variants[0]!.id);
+    const only = option.variants.length === 1 ? option.variants[0]! : undefined;
+    if (only !== undefined && nextOf(only) === undefined) pick(only);
     else openBase(option);
+  };
+
+  /** The levels of `variant` with the level it keeps active, focus in them. */
+  const openLevels = (variant: ModelVariantOption): void => {
+    setKeys({ variant: variant.id, level: '' });
+    if (!room) setDeep(true);
+    focusTo.current = 'levels';
+  };
+
+  const levelsBack = (): void => {
+    if (one) {
+      setKeys({ base: openOption?.base ?? '' });
+      left?.focus();
+      return;
+    }
+    if (third) {
+      right?.focus();
+      return;
+    }
+    setDeep(false);
+    focusTo.current = 'quants';
   };
 
   const pointerMoved = (event: PointerEvent): boolean => {
@@ -315,9 +448,10 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
     }
     const variant = variants[at.variant];
     if (variant === undefined) return;
-    if (event.key === 'Enter' || event.key === ' ') {
+    if (event.key === 'Enter' || event.key === ' ' || event.key === 'ArrowRight') {
       event.preventDefault();
-      pick(variant.id);
+      if (nextOf(variant) !== undefined) openLevels(variant);
+      else if (event.key !== 'ArrowRight') pick(variant);
       return;
     }
     const next = moveOf(
@@ -327,30 +461,67 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
     );
     if (next === null) return;
     event.preventDefault();
-    setKeys({ variant: variants[next]!.id });
+    setKeys({ variant: variants[next]!.id, level: '' });
     reveal(right, next);
   };
 
-  const pillState = selected?.state ?? null;
+  const onLevelsKey = (event: KeyboardEvent<HTMLDivElement>): void => {
+    if (event.key === 'ArrowLeft') {
+      event.preventDefault();
+      levelsBack();
+      return;
+    }
+    if (event.key === 'Tab' && event.shiftKey) {
+      if (inPlace) setKeys({ base: openOption?.base ?? '' });
+      return;
+    }
+    const level = effort?.levels[levelAt];
+    if (levelsVariant === undefined || effort === undefined || level === undefined) return;
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      commit(levelsVariant, level.value);
+      return;
+    }
+    const next = moveOf(
+      event,
+      effort.levels.map((row) => row.label),
+      levelAt,
+    );
+    if (next === null) return;
+    event.preventDefault();
+    setKeys({ level: effort.levels[next]!.value });
+    reveal(levelsRef.current, next);
+  };
+
   const trigger = (
     <button
+      ref={triggerRef}
       type="button"
       className={styles.trigger}
       disabled={disabled}
       aria-haspopup="listbox"
       aria-expanded={open}
-      data-state={pillState ?? undefined}
+      data-state={selected?.state ?? undefined}
       data-crowded={props.crowded === true ? '' : undefined}
-      title={empty ? undefined : (props.value ?? undefined)}
+      title={
+        empty
+          ? undefined
+          : levelShown === null
+            ? (props.value ?? undefined)
+            : fill(CHAT.thinkingLevel.chip, { model: props.value ?? '', level: levelShown })
+      }
       aria-label={
         empty
           ? CHAT.noModel
-          : selected === undefined || valueBase === undefined
-            ? `${CHAT.model}: ${props.value}`
-            : fill(CHAT.pillName, {
-                model: `${valueBase.base} ${selected.label}`,
-                state: CHAT.pillStates[selected.state],
-              })
+          : withLevel(
+              selected === undefined || valueBase === undefined
+                ? `${CHAT.model}: ${props.value}`
+                : fill(CHAT.pillName, {
+                    model: `${valueBase.base} ${selected.label}`,
+                    state: CHAT.pillStates[selected.state],
+                  }),
+              levelShown,
+            )
       }
       onKeyDown={(event) => {
         if (event.key === 'ArrowDown' && !open) {
@@ -370,14 +541,16 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
             showLogo
             maxChars={22}
           />
-          {selected !== undefined ? (
+          {levelShown !== null ? (
             <span
               data-chip-label=""
+              data-chip-level=""
               data-fit-whole={props.crowded === true ? '' : undefined}
               className={styles.variant}
             >
               <Badge tone="neutral" size="sm" outline>
-                {truncateMiddle(selected.label, 14)}
+                {levelShown}
+                {props.levelWarning === true ? <span className={styles.levelWarn} aria-hidden="true" /> : null}
               </Badge>
             </span>
           ) : null}
@@ -394,6 +567,70 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
   );
 
   const showRightActive = rightLive.focus || rightLive.pointer;
+  const showLevelsActive = levelsLive.focus || levelsLive.pointer;
+  const levelsLiveOn = {
+    onPointerEnter: () => setLevelsLive((live) => ({ ...live, pointer: true })),
+    onPointerLeave: () => setLevelsLive((live) => ({ ...live, pointer: false })),
+  };
+
+  const levelsHeading =
+    effort === undefined ? null : (
+      <p className={styles.heading}>
+        {CHAT.thinkingLevel.column}
+        {effort.note !== undefined ? (
+          <>
+            <Tooltip content={effort.note}>
+              <span className={styles.info}>
+                <Info size={12} strokeWidth={1.75} aria-hidden="true" />
+              </span>
+            </Tooltip>
+            <span id={`${id}-note`} hidden>
+              {effort.note}
+            </span>
+          </>
+        ) : null}
+      </p>
+    );
+
+  const levelsList =
+    levelsVariant === undefined || effort === undefined || openOption === undefined ? null : (
+      <div
+        key={inPlace ? `in:${openOption.base}` : 'third'}
+        ref={attachLevels}
+        id={`${id}-levels`}
+        className={cn(styles.list, styles.inner, styles.swap)}
+        role="listbox"
+        tabIndex={0}
+        aria-label={fill(CHAT.thinkingLevel.list, {
+          model: one ? openOption.base : `${openOption.base} ${levelsVariant.label}`,
+        })}
+        aria-describedby={effort.note !== undefined ? `${id}-note` : undefined}
+        aria-activedescendant={effort.levels[levelAt] !== undefined ? `${id}-l${String(levelAt)}` : undefined}
+        onKeyDown={onLevelsKey}
+        onFocus={() => setLevelsLive((live) => ({ ...live, focus: true }))}
+        onBlur={() => setLevelsLive((live) => ({ ...live, focus: false }))}
+      >
+        {effort.levels.map((level, index) => (
+          <div
+            key={level.value}
+            id={`${id}-l${String(index)}`}
+            className={cn(styles.row, styles.levelRow)}
+            role="option"
+            aria-selected={level.value === effort.value}
+            data-active={showLevelsActive && index === levelAt ? '' : undefined}
+            onPointerMove={(event) => {
+              if (pointerMoved(event)) setKeys({ level: level.value });
+            }}
+            onClick={() => commit(levelsVariant, level.value)}
+          >
+            <span className={styles.levelName}>{level.label}</span>
+            {level.value === effort.value ? (
+              <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
+            ) : null}
+          </div>
+        ))}
+      </div>
+    );
 
   return (
     <Popover
@@ -413,14 +650,20 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
       <PopoverContent
         side="top"
         align="start"
+        collisionPadding={GUTTER}
         className={styles.panel}
+        data-third={third ? '' : undefined}
         aria-label={CHAT.model}
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           leftRef.current?.focus();
         }}
       >
-        <div className={styles.columns} style={{ '--picker-rows': rows } as CSSProperties}>
+        <div
+          className={styles.columns}
+          data-third={third ? '' : undefined}
+          style={{ '--picker-rows': rows } as CSSProperties}
+        >
           <div className={styles.column}>
             <p className={styles.heading} id={`${id}-bases`}>
               {CHAT.model}
@@ -431,98 +674,147 @@ export function ModelPicker(props: ModelPickerProps): ReactElement {
               role="listbox"
               tabIndex={0}
               aria-labelledby={`${id}-bases`}
-              aria-controls={`${id}-quants`}
+              aria-controls={inPlace ? `${id}-levels` : `${id}-quants`}
               aria-activedescendant={bases[at.base] !== undefined ? `${id}-b${String(at.base)}` : undefined}
               onKeyDown={onLeftKey}
             >
-              {bases.map((option, index) => (
-                <div
-                  key={option.base}
-                  id={`${id}-b${String(index)}`}
-                  className={cn(styles.row, styles.baseRow)}
-                  role="option"
-                  aria-selected={option === valueBase}
-                  data-active={index === at.base ? '' : undefined}
-                  data-open={option === openOption ? '' : undefined}
-                  onPointerMove={(event) => {
-                    if (pointerMoved(event)) setKeys({ base: option.base });
-                  }}
-                  onClick={() => enterBase(option)}
-                >
-                  <span className={styles.rowText}>
-                    <span className={styles.rowName}>
-                      <MiddleText text={option.base} />
+              {bases.map((option, index) => {
+                const only = option.variants.length === 1 ? option.variants[0] : undefined;
+                const level = keptLabel(option.variants.find((variant) => variant.id === option.preselect));
+                return (
+                  <div
+                    key={option.base}
+                    id={`${id}-b${String(index)}`}
+                    className={cn(styles.row, styles.baseRow)}
+                    role="option"
+                    aria-selected={option === valueBase}
+                    aria-disabled={listOff && only !== undefined && nextOf(only) === undefined ? true : undefined}
+                    data-active={index === at.base ? '' : undefined}
+                    data-open={option === openOption ? '' : undefined}
+                    onPointerMove={(event) => {
+                      if (pointerMoved(event)) setKeys({ base: option.base });
+                    }}
+                    onClick={() => enterBase(option)}
+                  >
+                    <span className={styles.rowText}>
+                      <span className={styles.rowName}>
+                        <MiddleText text={option.base} />
+                        {level !== null ? <span className={styles.rowLevel}>{level}</span> : null}
+                      </span>
+                      <Facts
+                        state={option.state}
+                        stateVariant={option.stateVariant}
+                        facts={option.facts}
+                        warning={option.warning}
+                      />
                     </span>
-                    <Facts
-                      state={option.state}
-                      stateVariant={option.stateVariant}
-                      facts={option.facts}
-                      warning={option.warning}
-                    />
-                  </span>
-                  {option.variants.length > 1 ? (
-                    <ChevronRight className={styles.chev} size={12} strokeWidth={1.75} aria-hidden="true" />
-                  ) : (
-                    <span className={styles.end}>{option.variants[0]?.label}</span>
-                  )}
-                  {option === valueBase ? (
-                    <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
-                  ) : null}
-                </div>
-              ))}
+                    {only === undefined ? (
+                      <ChevronRight className={styles.chev} size={12} strokeWidth={1.75} aria-hidden="true" />
+                    ) : nextOf(only) !== undefined ? (
+                      <span className={styles.endNext}>
+                        <span className={styles.end}>{only.label}</span>
+                        <ChevronRight size={12} strokeWidth={1.75} aria-hidden="true" />
+                      </span>
+                    ) : (
+                      <span className={styles.end}>{only.label}</span>
+                    )}
+                    {option === valueBase ? (
+                      <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
+                    ) : null}
+                  </div>
+                );
+              })}
             </div>
           </div>
           <div
             className={cn(styles.column, styles.quants)}
-            onPointerEnter={() => setRightLive((live) => ({ ...live, pointer: true }))}
-            onPointerLeave={() => setRightLive((live) => ({ ...live, pointer: false }))}
+            data-back={back ? '' : undefined}
+            onPointerEnter={
+              inPlace ? levelsLiveOn.onPointerEnter : () => setRightLive((live) => ({ ...live, pointer: true }))
+            }
+            onPointerLeave={
+              inPlace ? levelsLiveOn.onPointerLeave : () => setRightLive((live) => ({ ...live, pointer: false }))
+            }
           >
-            <p className={styles.heading}>{CHAT.modelQuant}</p>
-            <div className={styles.body}>
-              <div
-                key={openOption?.base ?? ''}
-                ref={attachRight}
-                id={`${id}-quants`}
-                className={cn(styles.list, styles.inner, styles.swap)}
-                role="listbox"
-                tabIndex={0}
-                aria-label={fill(CHAT.modelQuantList, { base: openOption?.base ?? '' })}
-                aria-activedescendant={variants[at.variant] !== undefined ? `${id}-v${String(at.variant)}` : undefined}
-                onKeyDown={onRightKey}
-                onFocus={() => setRightLive((live) => ({ ...live, focus: true }))}
-                onBlur={() => setRightLive((live) => ({ ...live, focus: false }))}
+            {back && levelsVariant !== undefined ? (
+              <button
+                type="button"
+                tabIndex={-1}
+                className={styles.back}
+                aria-label={fill(CHAT.thinkingLevel.back, { quant: levelsVariant.label })}
+                onClick={levelsBack}
               >
-                {variants.map((variant, index) => (
-                  <div
-                    key={variant.id}
-                    id={`${id}-v${String(index)}`}
-                    className={styles.row}
-                    role="option"
-                    aria-selected={variant.id === props.value}
-                    data-active={showRightActive && index === at.variant ? '' : undefined}
-                    onPointerMove={(event) => {
-                      if (pointerMoved(event)) setKeys({ variant: variant.id });
-                    }}
-                    onClick={() => pick(variant.id)}
-                  >
-                    <span className={styles.rowText}>
-                      <span className={styles.rowName}>
-                        <MiddleText text={variant.label} />
-                      </span>
-                      <Facts state={variant.state} facts={variant.facts} warning={variant.warning} />
-                    </span>
-                    {variant.id === props.value ? (
-                      <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
-                    ) : null}
-                  </div>
-                ))}
-              </div>
+                <ChevronLeft size={12} strokeWidth={1.75} aria-hidden="true" />
+                <MiddleText text={levelsVariant.label} />
+              </button>
+            ) : null}
+            {inPlace ? levelsHeading : <p className={styles.heading}>{CHAT.modelQuant}</p>}
+            <div className={styles.body}>
+              {inPlace ? (
+                levelsList
+              ) : (
+                <div
+                  key={openOption?.base ?? ''}
+                  ref={attachRight}
+                  id={`${id}-quants`}
+                  className={cn(styles.list, styles.inner, styles.swap)}
+                  role="listbox"
+                  tabIndex={0}
+                  aria-label={fill(CHAT.modelQuantList, { base: openOption?.base ?? '' })}
+                  aria-controls={third ? `${id}-levels` : undefined}
+                  aria-activedescendant={
+                    variants[at.variant] !== undefined ? `${id}-v${String(at.variant)}` : undefined
+                  }
+                  onKeyDown={onRightKey}
+                  onFocus={() => setRightLive((live) => ({ ...live, focus: true }))}
+                  onBlur={() => setRightLive((live) => ({ ...live, focus: false }))}
+                >
+                  {variants.map((variant, index) => {
+                    const next = nextOf(variant) !== undefined;
+                    return (
+                      <div
+                        key={variant.id}
+                        id={`${id}-v${String(index)}`}
+                        className={cn(styles.row, next && styles.variantNext)}
+                        role="option"
+                        aria-selected={variant.id === props.value}
+                        aria-disabled={listOff && !next ? true : undefined}
+                        data-active={showRightActive && index === at.variant ? '' : undefined}
+                        data-open={third && variant === levelsVariant ? '' : undefined}
+                        onPointerMove={(event) => {
+                          if (pointerMoved(event)) setKeys({ variant: variant.id, level: '' });
+                        }}
+                        onClick={() => (next ? openLevels(variant) : pick(variant))}
+                      >
+                        <span className={styles.rowText}>
+                          <span className={styles.rowName}>
+                            <MiddleText text={variant.label} />
+                          </span>
+                          <Facts state={variant.state} facts={variant.facts} warning={variant.warning} />
+                        </span>
+                        {next ? (
+                          <ChevronRight className={styles.chev} size={12} strokeWidth={1.75} aria-hidden="true" />
+                        ) : null}
+                        {variant.id === props.value ? (
+                          <Check className={styles.check} size={14} strokeWidth={1.75} aria-hidden="true" />
+                        ) : null}
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           </div>
+          {third ? (
+            <div className={cn(styles.column, styles.quants)} {...levelsLiveOn}>
+              {levelsHeading}
+              <div className={styles.body}>{levelsList}</div>
+            </div>
+          ) : null}
         </div>
         {footer !== null ? (
-          <p className={styles.footer} data-warning={swap !== null ? '' : undefined}>
-            {swap !== null ? <TriangleAlert size={12} strokeWidth={1.75} aria-hidden="true" /> : null}
+          <p className={styles.footer} data-warning={swap !== null && !listOff ? '' : undefined}>
+            {swap !== null && !listOff ? <TriangleAlert size={12} strokeWidth={1.75} aria-hidden="true" /> : null}
             <span>{footer}</span>
           </p>
         ) : null}

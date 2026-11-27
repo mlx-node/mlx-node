@@ -34,7 +34,7 @@ export interface AppLayout {
   resourcesPath: string;
   /** `app.isPackaged`. */
   packaged: boolean;
-  /** `app.getPath('userData')` — `~/Library/Application Support/<productName>`. */
+  /** `app.getPath('userData')` — `appData/<DATA_DIR_NAME>`, pinned in index.ts. */
   userData: string;
   platform?: NodeJS.Platform;
   arch?: NodeJS.Architecture;

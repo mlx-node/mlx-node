@@ -15,6 +15,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readdirSync,
+  readFileSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -28,10 +29,11 @@ import { fileURLToPath } from 'node:url';
 import { MessageChannel } from 'node:worker_threads';
 
 import { canonicalCacheRoot, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from 'vite-plus/test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it } from 'vite-plus/test';
 
 import type { ApiContext } from '../src/api/context.js';
 import { dispatch, isApiPath } from '../src/api/dispatch.js';
+import type { RuntimeSeries as WorkerSeries } from '../src/api/handlers/runtime.js';
 import { quantilesOf } from '../src/api/quantiles.js';
 import { ROUTES } from '../src/api/routes.js';
 import { CodingAgentsService } from '../src/coding-agents.js';
@@ -43,10 +45,12 @@ import { serveRuntimeOverPort } from '../src/rpc/host.js';
 import { bindEventTargetPort } from '../src/rpc/port.js';
 import { createDashboardRuntime, type DashboardRuntime } from '../src/runtime.js';
 import { turnPhases } from '../ui/src/lib/metrics-view.js';
-import type { MetricsTotals, TurnRow } from '../ui/src/lib/types.js';
+import type { MetricsTotals, RuntimeSeries, TurnRow } from '../ui/src/lib/types.js';
 import { createTestClient, type TestClient } from './helpers/api-client.js';
 
 const FIXTURE_TRACES = fileURLToPath(new URL('./fixtures/traces', import.meta.url));
+/** Traces 2420–2466 of a real Work loop: id, start, duration, ttft, prefill ms and tokens, cached, output, decode tok/s. */
+const WORK_LOOP = fileURLToPath(new URL('./fixtures/work-loop.json', import.meta.url));
 
 const MODEL_CONFIG = JSON.stringify({ model_type: 'qwen3', max_position_embeddings: 40960 });
 
@@ -499,6 +503,44 @@ describe('dashboard api — metrics', () => {
     );
     expect(dist.series[0].decodeTps.n).toBe(1);
     expect(dist.series[0].decodeTps.counts[0]).toBe(0);
+    // The turn drawer reads this row: no rate, not "0.0 tok/s".
+    const turns = await get<{ rows: Array<{ traceId: string; decodeTps: number | null }> }>('/api/metrics/turns');
+    expect(turns.rows.find((row) => row.traceId === 'title')?.decodeTps).toBeNull();
+  });
+
+  it('summary: decode and prefill speed over many turns are tokens ÷ phase time, not the median turn', async () => {
+    const loop = JSON.parse(readFileSync(WORK_LOOP, 'utf8')) as { rows: Array<Array<number | null>> };
+    const at = Date.UTC(2026, 6, 10, 12);
+    writeTurns(
+      '2026-07-10-11.jsonl',
+      loop.rows.map(([id, start, duration, ttft, prefillMs, prefillTokens, cached, output, decodeTps]) => ({
+        traceId: String(id),
+        ts: at + (start ?? 0) + (duration ?? 0),
+        outcome: decodeTps === null ? 'cancelled' : 'ok',
+        durationMs: duration,
+        ttftMs: ttft,
+        prefillMs,
+        prefillTokens,
+        promptTokens: (prefillTokens ?? 0) + (cached ?? 0),
+        cachedTokens: cached,
+        outputTokens: output,
+        decodeTps,
+      })),
+    );
+    await ingest();
+    const summary = await get<{
+      totals: { decodeRatedTokens: number; decodeRatedMs: number; prefillRatedTokens: number; prefillRatedMs: number };
+      latency: { decodeTps: Q; prefillTps: Q };
+    }>('/api/metrics/summary');
+    const { totals, latency } = summary;
+    // Kills "count the first token" (21,901 tokens) and "median headline" (nearest-rank median 79.0).
+    expect(totals.decodeRatedTokens).toBe(21_855);
+    expect(((totals.decodeRatedTokens * 1000) / totals.decodeRatedMs).toFixed(1)).toBe('64.0');
+    expect(latency.decodeTps.p50).toBe(79);
+    // Kills "no prefill floor" (1,107 over 46 prefills) and a median prefill headline (1,011).
+    expect(latency.prefillTps.n).toBe(33);
+    expect(totals.prefillRatedTokens).toBe(85_193);
+    expect(Math.round((totals.prefillRatedTokens * 1000) / totals.prefillRatedMs)).toBe(1_138);
   });
 
   it('prefill speed reads rated rows only and the first-token time splits into setup and prefill', async () => {
@@ -960,6 +1002,8 @@ describe('dashboard api — runtime series', () => {
     writeFileSync(join(runtimeDir, name), records.map((r) => `${JSON.stringify(r)}\n`).join(''));
   }
 
+  type WorkKey = 'phaseMs' | 'rateOutTokens' | 'rateOutMs' | 'ratePrefillTokens' | 'ratePrefillMs';
+
   interface Series {
     points: Array<{
       t: number;
@@ -1001,6 +1045,62 @@ describe('dashboard api — runtime series', () => {
     const body = await get<Series>(`/api/runtime/series?from=${T}&to=${T + 4999}&bucketMs=5000`);
     expect(body.points[0]).toMatchObject({ samples: 3, memActiveAvg: 1200, memActiveMax: 1300 });
     expect(body.procs).toHaveLength(2);
+  });
+
+  /** Ten distinct work deltas from `base`, so a field read from the wrong column shows. */
+  function work(base: number): Record<string, number> {
+    return {
+      loadingMs: base + 1,
+      waitingMs: base + 2,
+      prepareMs: base + 3,
+      prefillMs: base + 4,
+      decodeMs: base + 5,
+      runningMs: base + 6,
+      rateOutTokens: base + 7,
+      rateOutMs: base + 8,
+      ratePrefillTokens: base + 9,
+      ratePrefillMs: base + 10,
+    };
+  }
+
+  /** The work fields of a point whose samples' deltas sum to `work(base)`'s fields plus `k` times each offset. */
+  function workPoint(base: number, k = 1): Pick<WorkerSeries['points'][number], WorkKey> {
+    const at = (offset: number): number => base + k * offset;
+    return {
+      phaseMs: { loading: at(1), waiting: at(2), prepare: at(3), prefill: at(4), decode: at(5), running: at(6) },
+      rateOutTokens: at(7),
+      rateOutMs: at(8),
+      ratePrefillTokens: at(9),
+      ratePrefillMs: at(10),
+    };
+  }
+
+  it("runtime series: a bucket's phase ms and rate pairs are the sums of its samples, over all processes", async () => {
+    writeSeries('2026-11-10-7.jsonl', [
+      sample(7, T + 1000, work(100)),
+      sample(7, T + 2000, work(200)),
+      sample(7, T + 6000, work(5000)),
+    ]);
+    writeSeries('2026-11-10-8.jsonl', [sample(8, T + 1500, work(1000))]);
+    await ingest();
+    const body = await get<WorkerSeries>(`/api/runtime/series?from=${T}&to=${T + 9999}&bucketMs=5000`);
+    expect(body.points).toHaveLength(2);
+    expect(body.points[0]).toMatchObject({ t: T, samples: 3, ...workPoint(1300, 3) });
+    expect(body.points[1]).toMatchObject({ t: T + 5000, samples: 1, ...workPoint(5000) });
+  });
+
+  it('runtime series: a sample written before the work deltas adds 0, and a bucket of only such samples reads 0', async () => {
+    writeSeries('2026-11-10-7.jsonl', [sample(7, T + 1000), sample(7, T + 2000, work(0)), sample(7, T + 6000)]);
+    await ingest();
+    const body = await get<WorkerSeries>(`/api/runtime/series?from=${T}&to=${T + 9999}&bucketMs=5000`);
+    expect(body.points).toHaveLength(2);
+    expect(body.points[0]).toMatchObject({ samples: 2, ...workPoint(0) });
+    expect(body.points[1]).toMatchObject({ samples: 1, ...workPoint(0, 0) });
+  });
+
+  it('runtime series: the page copy of a point mirrors the worker type exactly', () => {
+    // Checked by `tsc`: a field added to or changed on either side fails the typecheck.
+    expectTypeOf<RuntimeSeries['points']>().branded.toEqualTypeOf<WorkerSeries['points']>();
   });
 
   it("runtime series: busyMs is the sum of the samples' busyMs", async () => {

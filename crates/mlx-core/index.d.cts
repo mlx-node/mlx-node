@@ -3642,10 +3642,24 @@ export interface ChatStreamProgress {
   cachedTokens?: number;
   /** Tokens kept so far; known from the `decode` phase on. */
   generatedTokens?: number;
-  /** Milliseconds from prefill start to the first token (or to now). */
+  /**
+   * Milliseconds from prefill start to the first token (or to now, or
+   * to the end of the turn).
+   */
   prefillElapsedMs?: number;
-  /** Milliseconds since the first token. */
+  /** Milliseconds from the first token to now, or to the end of the turn. */
   decodeElapsedMs?: number;
+  /**
+   * Milliseconds from the start of a whole turn to its prefill start,
+   * when the prefill start moved there: `prefill_elapsed_ms` counted
+   * them before and no longer does.
+   */
+  setupMs?: number;
+  /**
+   * Milliseconds since the terminal chunk or error was sent. The elapsed
+   * clocks stop there.
+   */
+  sinceDoneMs?: number;
 }
 
 /**

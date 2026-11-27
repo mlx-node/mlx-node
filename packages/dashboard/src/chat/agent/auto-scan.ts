@@ -2050,6 +2050,15 @@ export function scanWords(
   }
 }
 
+/** The words of each simple command, in order, as the scan reads them; null when the text is unread. */
+export function commandParts(command: string): Word[][] | null {
+  try {
+    return lex(command, { steps: 0, budget: SCAN_STEP_BUDGET }).map((p) => p.words);
+  } catch {
+    return null;
+  }
+}
+
 /** For each simple command, the folders the scan holds the shell may be in when it runs; null when unread. For the shell test. */
 export function scanDirs(
   command: string,

@@ -1,23 +1,34 @@
-import { BellRing, Cpu, GitBranch, RotateCw } from 'lucide-react';
+import { BellRing, Cpu, RotateCw } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState, type MouseEvent, type ReactElement, type ReactNode } from 'react';
 
-import { CHAT } from '../lib/chat-strings';
+import { type AgentRow as AgentRowData, agentState, runAgents, subagentRows } from '../lib/agents';
+import { CHAT, fill } from '../lib/chat-strings';
 import { thoughtDuration } from '../lib/chat-turns';
-import { formatClock, formatCount, formatCountNoun, formatDuration } from '../lib/format';
+import { formatClock, formatDuration } from '../lib/format';
+import { rowWords } from '../lib/helper-words';
+import type { LinkRule } from '../lib/link-rule';
+import { neverNoteWords } from '../lib/permission-text';
+import { type RunsAt, runsAt } from '../lib/run-view';
 import { groupTurns, turnTitle, wakeTitle, type TurnGroup } from '../lib/sessions';
 import type { TranscriptEntry, TurnMetric } from '../lib/types';
+import { visibleText, workCallOf } from '../lib/work-tools';
+import { AgentRow } from './arc-x/agent-row/agent-row';
 import { AttachmentStrip, sentChips } from './arc-x/attachment-strip/attachment-strip';
+import { ChatMarkdown } from './arc-x/chat-markdown/chat-markdown';
+import { CodePanel } from './arc-x/code-panel/code-panel';
 import { CompactField } from './arc-x/compact-field/compact-field';
+import { diffStateOf, EditDiffs } from './arc-x/diff-view/diff-view';
 import { Disclosure } from './arc-x/disclosure/disclosure';
 import { EventRow, RuleLabel } from './arc-x/event-row/event-row';
+import { GoalRow } from './arc-x/goal-strip/goal-strip';
 import { LiveLabel } from './arc-x/live-label/live-label';
-import { Markdown } from './arc-x/markdown/markdown';
 import { Message } from './arc-x/message/message';
 import { ModelBadge } from './arc-x/model-badge/model-badge';
 import { Panel } from './arc-x/panel/panel';
+import { PictureScope, PictureStrip, picturesDetail } from './arc-x/picture-strip/picture-strip';
 import { PlanList } from './arc-x/plan-list/plan-list';
 import { ReasoningBlock } from './arc-x/reasoning-block/reasoning-block';
-import { ToolCall, ToolCallGroup, type ToolStatus } from './arc-x/tool-call/tool-call';
+import { ToolCall, ToolCallField, ToolCallGroup, type ToolStatus } from './arc-x/tool-call/tool-call';
 import { Alert } from './arc/alert/alert';
 import { Button } from './arc/button/button';
 import { EmptyState } from './arc/empty-state/empty-state';
@@ -25,9 +36,17 @@ import { SearchField } from './arc/search-field/search-field';
 import SegmentedControl, { type Segment } from './arc/segmented-control/segmented-control';
 import { Tooltip } from './arc/tooltip/tooltip';
 import { CompactionMark } from './compaction-mark';
-import { RunCard } from './run-card';
+import { RecapRow } from './history-mark';
+import { NoteRow } from './note-row';
+import { NoticeRow } from './notice-row';
+import { PlanModeLine } from './plan-mode-line';
+import { RuleRow } from './rule-row';
+import { RunBlock } from './run-block';
+import { RunEndRow } from './run-end-row';
 
 export interface TranscriptProps {
+  /** The session shown: its tool rows read their pictures from it. */
+  sessionId?: string | null;
   entries: TranscriptEntry[];
   turns: TurnMetric[];
   /** 1-based turn to open and scroll to. */
@@ -52,6 +71,7 @@ const SHOW_OPTIONS: Segment[] = [
   { value: 'all', label: 'All' },
   { value: 'messages', label: 'Messages' },
 ];
+const WORK_LINKS: LinkRule = { mode: 'work' };
 const FIND_DEBOUNCE_MS = 200;
 const FIND_OPEN = 5;
 const EXPAND_ALL_MAX = 60;
@@ -69,6 +89,34 @@ export function toolStatus(raw: string): { status: ToolStatus; statusText?: stri
   return { status: 'other', statusText: raw };
 }
 
+/** An edit call's body, as the Work row draws it: the diff of each file, then the agent's words (an error) if any. */
+function EditBody({ tool }: { tool: Entry<'tool'> }): ReactElement {
+  return (
+    <div className="grid min-w-0 gap-2">
+      <EditDiffs edits={tool.edits ?? []} state={diffStateOf(tool.status)} folder={null} />
+      {tool.output !== undefined && tool.output !== '' ? (
+        <ToolCallField label={CHAT.output}>
+          <CodePanel code={tool.output} label={CHAT.output} maxLines={12} wrap />
+        </ToolCallField>
+      ) : null}
+    </div>
+  );
+}
+
+/** A picture read's body, as the Work row draws it: the tiles, then the agent's words if any. */
+function PicturesBody({ tool }: { tool: Entry<'tool'> }): ReactElement {
+  return (
+    <div className="grid min-w-0 gap-2">
+      <PictureStrip call={tool.id} pictures={tool.pictures ?? []} path={workCallOf(tool, null)?.title ?? tool.title} />
+      {tool.output !== undefined && tool.output !== '' ? (
+        <ToolCallField label={CHAT.output}>
+          <CodePanel code={tool.output} label={CHAT.output} maxLines={12} wrap />
+        </ToolCallField>
+      ) : null}
+    </div>
+  );
+}
+
 function entryMatches(entry: TranscriptEntry, needle: string): boolean {
   const has = (value: string | undefined): boolean => value !== undefined && value.toLowerCase().includes(needle);
   switch (entry.kind) {
@@ -80,14 +128,23 @@ function entryMatches(entry: TranscriptEntry, needle: string): boolean {
     case 'wake':
       return has(entry.text) || has(entry.workflow?.name);
     case 'tool':
-      return has(entry.name) || has(entry.title) || has(entry.input) || has(entry.output);
+      return has(entry.name) || has(entry.title) || has(entry.input) || has(entry.output) || has(entry.blocked);
     case 'subagent':
       return has(entry.description);
     case 'plan':
       return entry.entries.some((item) => has(item.content));
     case 'workflow':
       return has(entry.name) || has(entry.report) || entry.agents.some((agent) => has(agent.label));
+    case 'notice':
+      if (entry.code === 'picture') return entry.notes.some(has);
+      if (entry.code === 'hook') return has(entry.hook) || has(entry.detail);
+      return entry.code === 'hook-note' ? has(entry.text) : has(entry.detail);
+    case 'recap':
+      return has(entry.text);
+    case 'goal':
+      return has(entry.objective);
     case 'model':
+    case 'plan-mode':
     case 'compaction':
     case 'turn-end':
       return false;
@@ -95,7 +152,13 @@ function entryMatches(entry: TranscriptEntry, needle: string): boolean {
 }
 
 function isMessage(entry: TranscriptEntry): boolean {
-  return entry.kind !== 'thinking' && entry.kind !== 'tool' && entry.kind !== 'plan' && entry.kind !== 'subagent';
+  return (
+    entry.kind !== 'thinking' &&
+    entry.kind !== 'tool' &&
+    entry.kind !== 'plan' &&
+    entry.kind !== 'subagent' &&
+    entry.kind !== 'notice'
+  );
 }
 
 /** Where a live entry's text grew since the last render: the offset the added part starts at. */
@@ -164,12 +227,62 @@ interface BodyProps {
   indexOf: ReadonlyMap<TranscriptEntry, number>;
   shownText: Map<number, string>;
   onInspectTurn: (turn: number) => void;
+  helpers: ReadonlyMap<string, readonly AgentRowData[]>;
+  subagents: ReadonlyMap<string, AgentRowData>;
+  places: RunsAt;
+  /** The session runs in an agent process now (its body says so), fresh or not. */
+  sessionLive: boolean;
+  sessionId: string | null;
+  onJump: (at: number) => void;
+}
+
+/** An entry a jump lands on: it draws no box of its own. */
+function Anchor({ at, children }: { at: number; children: ReactNode }): ReactElement {
+  return (
+    <div data-entry-at={at} className="contents">
+      {children}
+    </div>
+  );
+}
+
+/**
+ * A run's agents are drawn in its block, and a `workflow` entry whose block stands at its launch call is data only. A
+ * run that only spawn lines name draws its block at the first of them.
+ */
+function drawnHere(entry: TranscriptEntry, at: number, places: RunsAt): boolean {
+  if (entry.kind === 'subagent') return entry.run === undefined || places.blocks.get(at) === entry.run;
+  if (entry.kind === 'workflow') return !places.dataOnly.has(at);
+  return true;
 }
 
 function GroupBody(props: BodyProps): ReactElement {
   const { group, trailing, live, asOfMs, show } = props;
   const open = trailing && group.end === null;
-  const visible = show === 'messages' ? group.entries.filter(isMessage) : group.entries;
+  const places = props.places;
+  const visible = group.entries.filter(
+    (entry) => (show !== 'messages' || isMessage(entry)) && drawnHere(entry, props.indexOf.get(entry) ?? -1, places),
+  );
+  const block = (at: number, runId: string): ReactElement | null => {
+    const facts = places.runs.get(runId);
+    if (facts === undefined) return null;
+    return (
+      <Anchor key={at} at={at}>
+        <RunBlock
+          runId={runId}
+          entry={facts.entry}
+          agents={props.helpers.get(runId) ?? []}
+          live={false}
+          sessionLive={props.sessionLive}
+          by={facts.by}
+          wakes={facts.wakes}
+          resultAt={facts.resultAt}
+          onJump={props.onJump}
+          launch={facts.launch}
+          workHref={props.sessionId === null ? undefined : `/chat?c=${encodeURIComponent(props.sessionId)}`}
+        />
+      </Anchor>
+    );
+  };
   // The reader stamps endTs on every text chunk, so only the open group's final entry is still being written.
   const tail = group.entries[group.entries.length - 1];
   const rendered: Array<[number, string]> = [];
@@ -183,9 +296,19 @@ function GroupBody(props: BodyProps): ReactElement {
   while (i < visible.length) {
     const entry = visible[i]!;
     const at = props.indexOf.get(entry) ?? -1;
+    const launchRun = entry.kind === 'tool' ? places.blocks.get(at) : undefined;
+    if (launchRun !== undefined) {
+      i += 1;
+      items.push(block(at, launchRun));
+      continue;
+    }
     if (entry.kind === 'tool') {
       const run: Array<Entry<'tool'>> = [];
-      while (i < visible.length && visible[i]!.kind === 'tool') {
+      while (
+        i < visible.length &&
+        visible[i]!.kind === 'tool' &&
+        places.blocks.get(props.indexOf.get(visible[i]!) ?? -1) === undefined
+      ) {
         run.push(visible[i] as Entry<'tool'>);
         i += 1;
       }
@@ -203,8 +326,22 @@ function GroupBody(props: BodyProps): ReactElement {
             statusText={statusText}
             durationMs={tool.endTs !== undefined && tool.ts > 0 ? tool.endTs - tool.ts : null}
             ts={tool.ts}
+            detail={
+              tool.blocked !== undefined
+                ? CHAT.hook.blockedRow
+                : tool.pictures !== undefined && tool.pictures.length > 0
+                  ? picturesDetail(tool.pictures, tool.pdfPages)
+                  : undefined
+            }
             input={tool.input}
-            output={tool.output}
+            output={tool.blocked === undefined ? tool.output : visibleText(tool.blocked)}
+            body={
+              tool.edits !== undefined && tool.edits.length > 0 ? (
+                <EditBody tool={tool} />
+              ) : tool.pictures !== undefined && tool.pictures.length > 0 ? (
+                <PicturesBody tool={tool} />
+              ) : undefined
+            }
             truncated={tool.truncated}
             live={open && status === 'running' ? live : false}
           />
@@ -226,6 +363,17 @@ function GroupBody(props: BodyProps): ReactElement {
     i += 1;
     switch (entry.kind) {
       case 'user':
+        if (entry.note === true) {
+          const rule = neverNoteWords(entry.text);
+          items.push(
+            rule === null ? (
+              <NoteRow key={at} text={entry.text} ts={entry.ts} />
+            ) : (
+              <RuleRow key={at} words={rule} ts={entry.ts} />
+            ),
+          );
+          break;
+        }
         if (entry.continued === true) {
           items.push(
             <RuleLabel key={at}>
@@ -244,24 +392,31 @@ function GroupBody(props: BodyProps): ReactElement {
           >
             {entry.attachments !== undefined && entry.attachments.length > 0 ? (
               <div className="grid gap-2">
-                {entry.text !== '' ? <Markdown text={entry.text} /> : null}
+                {entry.text !== '' ? <ChatMarkdown text={entry.text} links={WORK_LINKS} /> : null}
                 <AttachmentStrip readOnly items={sentChips(entry.attachments)} />
               </div>
             ) : (
-              <Markdown text={entry.text} />
+              <ChatMarkdown text={entry.text} links={WORK_LINKS} />
             )}
           </Message>,
         );
         break;
-      case 'wake':
+      case 'wake': {
+        const runId = entry.cause === 'workflow' ? entry.workflow?.runId : undefined;
         items.push(
-          <EventRow
-            key={at}
-            icon={<BellRing size={14} strokeWidth={1.75} />}
-            label="No prompt typed"
-            text={wakeTitle(entry)}
-            ts={entry.ts}
-          />,
+          runId !== undefined ? (
+            <Anchor key={at} at={at}>
+              <RunEndRow entry={entry} runAt={places.runs.get(runId)?.place.at ?? null} onJump={props.onJump} />
+            </Anchor>
+          ) : (
+            <EventRow
+              key={at}
+              icon={<BellRing size={14} strokeWidth={1.75} />}
+              label="No prompt typed"
+              text={wakeTitle(entry)}
+              ts={entry.ts}
+            />
+          ),
         );
         if (show === 'all' && entry.text.trim() !== '') {
           items.push(
@@ -273,10 +428,10 @@ function GroupBody(props: BodyProps): ReactElement {
           );
         }
         break;
+      }
       case 'assistant': {
         const current = props.modelAt.get(entry) ?? group.metric?.model ?? props.model;
         const streaming = open && entry === tail;
-        const fresh = streaming && live ? freshOffset(props.shownText.get(at), entry.text) : undefined;
         if (streaming) rendered.push([at, entry.text]);
         items.push(
           <Message
@@ -286,7 +441,7 @@ function GroupBody(props: BodyProps): ReactElement {
             ts={entry.ts}
             streaming={streaming && live}
           >
-            <Markdown text={entry.text} freshFrom={fresh} />
+            <ChatMarkdown text={entry.text} streaming={streaming && live} links={WORK_LINKS} />
           </Message>,
         );
         break;
@@ -303,6 +458,7 @@ function GroupBody(props: BodyProps): ReactElement {
             startTs={running ? entry.ts : undefined}
             asOfMs={running ? asOfMs : undefined}
             freshFrom={running && live ? freshOffset(props.shownText.get(at), entry.text) : undefined}
+            links={WORK_LINKS}
           />,
         );
         break;
@@ -310,25 +466,30 @@ function GroupBody(props: BodyProps): ReactElement {
       case 'plan':
         items.push(<PlanList key={at} items={entry.entries} ts={entry.ts} />);
         break;
-      case 'subagent':
+      case 'subagent': {
+        if (entry.run !== undefined) {
+          items.push(block(at, entry.run));
+          break;
+        }
+        const row = props.subagents.get(entry.childId);
+        if (row === undefined) break;
         items.push(
-          <EventRow
+          <AgentRow
             key={at}
-            icon={<GitBranch size={14} strokeWidth={1.75} />}
-            label={`Subagent${entry.type !== '' ? ` · ${entry.type}` : ''}`}
-            text={entry.description !== '' ? entry.description : entry.childId}
+            id={row.childId}
+            label={row.label}
+            words={rowWords(agentState(row, { live: false, now: asOfMs ?? 0, open: props.sessionLive }), {
+              progress: null,
+              now: asOfMs ?? 0,
+            })}
+            kind={entry.type !== '' ? `${CHAT.subagent.label} · ${entry.type}` : CHAT.subagent.label}
             to={entry.exists === true ? `/sessions/${encodeURIComponent(entry.childId)}` : undefined}
-            facts={[
-              entry.status,
-              entry.durationMs !== undefined ? formatDuration(entry.durationMs) : null,
-              entry.tokens !== undefined ? formatCountNoun(entry.tokens, 'token', 'tokens', formatCount) : null,
-            ]}
-            tone={entry.error !== undefined ? 'danger' : 'neutral'}
-            error={entry.error}
+            openLabel={fill(CHAT.agent.open, { label: row.label })}
             ts={entry.ts}
           />,
         );
         break;
+      }
       case 'model':
         items.push(
           <RuleLabel key={at}>
@@ -337,11 +498,23 @@ function GroupBody(props: BodyProps): ReactElement {
           </RuleLabel>,
         );
         break;
+      case 'plan-mode':
+        items.push(<PlanModeLine key={at} mode={entry.mode} />);
+        break;
       case 'compaction':
         items.push(<CompactionMark key={at} entry={entry} />);
         break;
       case 'workflow':
-        items.push(<RunCard key={at} entry={entry} live={false} />);
+        items.push(block(at, entry.runId));
+        break;
+      case 'notice':
+        items.push(<NoticeRow key={at} entry={entry} running={open} />);
+        break;
+      case 'recap':
+        items.push(<RecapRow key={at} entry={entry} />);
+        break;
+      case 'goal':
+        items.push(<GoalRow key={at} entry={entry} />);
         break;
       case 'turn-end':
         break;
@@ -369,6 +542,67 @@ function GroupBody(props: BodyProps): ReactElement {
   return <div className="grid min-w-0 gap-3 px-3 pt-1 pb-4">{items}</div>;
 }
 
+/** The assistant entries' model: the session model until a model row switches it. */
+function modelsAt(entries: readonly TranscriptEntry[]): ReadonlyMap<TranscriptEntry, string | null> {
+  const map = new Map<TranscriptEntry, string | null>();
+  let current: string | null = null;
+  for (const entry of entries) {
+    if (entry.kind === 'model') current = entry.modelId;
+    else if (entry.kind === 'assistant') map.set(entry, current);
+  }
+  return map;
+}
+
+export interface TranscriptStreamProps {
+  /** The session the lines are from: its tool rows read their pictures from it. */
+  sessionId: string | null;
+  entries: readonly TranscriptEntry[];
+  /** Its lines still come: the last text streams and a running call reads as running. */
+  live: boolean;
+  model: string | null;
+  asOfMs?: number;
+}
+
+/**
+ * One session's lines as one stream with the Transcript's rows, in no turn groups: the Agent view's body. After the
+ * stream ends, a call with no end reads not finished.
+ */
+export function TranscriptStream(props: TranscriptStreamProps): ReactElement {
+  const entries = props.entries;
+  const group = useMemo<TurnGroup>(
+    () => ({ number: 0, entries: [...entries], end: null, metric: null, startTs: null, endTs: null }),
+    [entries],
+  );
+  const indexOf = useMemo(() => new Map(entries.map((entry, index) => [entry, index] as const)), [entries]);
+  const helpers = useMemo(() => runAgents(entries), [entries]);
+  const subagents = useMemo(() => subagentRows(entries), [entries]);
+  const places = useMemo(() => runsAt(entries), [entries]);
+  const modelAt = useMemo(() => modelsAt(entries), [entries]);
+  const shownText = useRef(new Map<number, string>()).current;
+  return (
+    <PictureScope session={props.sessionId}>
+      <GroupBody
+        group={group}
+        trailing={props.live}
+        live={props.live}
+        asOfMs={props.asOfMs}
+        show="all"
+        model={props.model}
+        modelAt={modelAt}
+        indexOf={indexOf}
+        shownText={shownText}
+        onInspectTurn={() => undefined}
+        helpers={helpers}
+        subagents={subagents}
+        places={places}
+        sessionLive={props.live}
+        sessionId={props.sessionId}
+        onJump={() => undefined}
+      />
+    </PictureScope>
+  );
+}
+
 /**
  * A session transcript grouped by turn, oldest first. Closed groups mount nothing until opened. In a live session whose
  * last body is fresh, the open trailing group shows the running tool, the open thinking block and the arriving answer.
@@ -377,15 +611,10 @@ export function Transcript(props: TranscriptProps): ReactElement {
   const live = props.live === true;
   const groups = useMemo(() => groupTurns(props.entries, props.turns), [props.entries, props.turns]);
   const indexOf = useMemo(() => new Map(props.entries.map((entry, index) => [entry, index] as const)), [props.entries]);
-  const modelAt = useMemo(() => {
-    const map = new Map<TranscriptEntry, string | null>();
-    let current: string | null = null;
-    for (const entry of props.entries) {
-      if (entry.kind === 'model') current = entry.modelId;
-      else if (entry.kind === 'assistant') map.set(entry, current);
-    }
-    return map;
-  }, [props.entries]);
+  const helpers = useMemo(() => runAgents(props.entries), [props.entries]);
+  const subagents = useMemo(() => subagentRows(props.entries), [props.entries]);
+  const places = useMemo(() => runsAt(props.entries), [props.entries]);
+  const modelAt = useMemo(() => modelsAt(props.entries), [props.entries]);
   const shownText = useRef(new Map<number, string>()).current;
 
   const [query, setQuery] = useState('');
@@ -410,6 +639,20 @@ export function Transcript(props: TranscriptProps): ReactElement {
     return focused === -1 ? null : focused;
   });
   const nodes = useRef(new Map<number, HTMLDivElement>()).current;
+  // A link to a run's block or end row opens its turn first, then scrolls to it once it is drawn and moves focus there.
+  const [jumpAt, setJumpAt] = useState<number | null>(null);
+  const jump = (at: number): void => {
+    const index = groups.findIndex((group) => group.entries.some((entry) => indexOf.get(entry) === at));
+    if (index !== -1) setOpenSet((previous) => new Set([...previous, index]));
+    setJumpAt(at);
+  };
+  useEffect(() => {
+    if (jumpAt === null) return;
+    const target = document.querySelector(`[data-entry-at="${String(jumpAt)}"]`)?.firstElementChild;
+    target?.scrollIntoView?.({ block: 'center' });
+    target?.querySelector<HTMLElement>('h3 button, button, a[href]')?.focus({ preventScroll: true });
+    setJumpAt(null);
+  }, [jumpAt]);
 
   useEffect(() => {
     const handle = setTimeout(() => setNeedle(query.trim().toLowerCase()), FIND_DEBOUNCE_MS);
@@ -466,7 +709,7 @@ export function Transcript(props: TranscriptProps): ReactElement {
     </Button>
   );
 
-  return (
+  const page = (
     <div className="grid min-w-0 gap-3">
       {props.transcriptError !== undefined ? (
         <Alert tone="warning" title="Transcript could not be read">
@@ -550,6 +793,12 @@ export function Transcript(props: TranscriptProps): ReactElement {
                   indexOf={indexOf}
                   shownText={shownText}
                   onInspectTurn={props.onInspectTurn}
+                  helpers={helpers}
+                  subagents={subagents}
+                  places={places}
+                  sessionLive={props.sessionLive}
+                  sessionId={props.sessionId ?? null}
+                  onJump={jump}
                 />
               </Disclosure>
             </div>
@@ -558,4 +807,5 @@ export function Transcript(props: TranscriptProps): ReactElement {
       </Panel>
     </div>
   );
+  return <PictureScope session={props.sessionId ?? null}>{page}</PictureScope>;
 }

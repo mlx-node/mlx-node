@@ -1,7 +1,8 @@
-import { FileText, Globe, Paperclip, Plus } from 'lucide-react';
+import { FileText, Globe, NotebookPen, Paperclip, Plus, SquareSlash } from 'lucide-react';
 import { type ReactElement, useCallback, useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 
+import { stepLevel } from '../../../../src/chat/thinking-levels.js';
 import {
   Menu,
   MenuGroup,
@@ -11,18 +12,26 @@ import {
   MenuSeparator,
   MenuSub,
 } from '../../components/arc-x/menu/menu';
-import type { ModelBaseOption, ModelVariantOption } from '../../components/arc-x/model-picker/model-picker';
+import type {
+  ModelBaseOption,
+  ModelEffort,
+  ModelVariantOption,
+} from '../../components/arc-x/model-picker/model-picker';
 import { ToolChip } from '../../components/arc-x/tool-chip/tool-chip';
+import { Tooltip } from '../../components/arc/tooltip/tooltip';
+import type { PlanMode } from '../../components/plan-mode-line';
 import { DashboardApiError, getJson, mutate } from '../../lib/api';
 import { CHAT, fill } from '../../lib/chat-strings';
-import type { ChatHostState, ChatMode } from '../../lib/chat-types';
+import type { ChatHostState, ChatMode, ThinkingLevel } from '../../lib/chat-types';
 import { formatBytes } from '../../lib/format';
 import { PROVIDERS } from '../../lib/providers-strings';
 import type { ProviderId, ProvidersResponse, ProviderState, SearchProviderId } from '../../lib/providers-types';
 import { CRAWLER_BODIES, type CrawlerValue, crawlerValue, SEARCH_IDS } from '../../lib/providers-view';
 import { toast } from '../../lib/toast';
+import type { TranscriptEntry } from '../../lib/types';
 import { providerName } from '../../lib/web-tools';
 import { useHotkeys } from '../../shell/hotkeys';
+import type { PlanArm } from './drafts';
 
 /** Context below this is "small for Work". */
 const WORK_CONTEXT = 32_768;
@@ -47,9 +56,32 @@ function bySize(a: HostModel, b: HostModel): number {
 }
 
 /**
+ * The levels of a model the agent listed levels for: on the base of the conversation's model the conversation's level
+ * (`level`, stepped to one the model has), on another base the model's default. `busy`: an answer runs.
+ */
+function effortOf(
+  model: HostModel,
+  home: boolean,
+  level: ThinkingLevel | undefined,
+  busy: boolean,
+): ModelEffort | null {
+  const thinking = model.thinking;
+  if (thinking === undefined || thinking === null || thinking.levels.length === 0) return null;
+  return {
+    levels: thinking.levels.map((value) => ({ value, label: CHAT.thinkingLevel.levels[value] })),
+    value: home ? stepLevel(level, thinking) : thinking.default,
+    note: busy
+      ? CHAT.thinkingLevel.next
+      : thinking.levels.includes('none')
+        ? CHAT.thinkingLevel.about
+        : CHAT.thinkingLevel.aboutNoOff,
+  };
+}
+
+/**
  * The picker rows: one per base, each with its quantizations. Both lists put the model in memory first, then the model
  * in load, then the rest (bases by name without case, quantizations by size). `value` is the conversation's model;
- * `picked` is the last model picked per base (keys in lower case).
+ * `picked` is the last model picked per base (keys in lower case); `thinking` gives each model its levels.
  */
 export function modelBases(
   host: ChatHostState,
@@ -57,6 +89,7 @@ export function modelBases(
   mode: ChatMode,
   value: string | null,
   picked: Readonly<Record<string, string>>,
+  thinking?: { level: ThinkingLevel | undefined; busy: boolean },
 ): ModelBaseOption[] {
   const stateOf = (id: string): State =>
     host.loading.some((load) => load.modelId === id) ? 'loading' : resident.has(id) ? 'loaded' : 'idle';
@@ -74,12 +107,16 @@ export function modelBases(
     const ordered = [...sized].sort((a, b) => STATE_RANK[stateOf(a.id)] - STATE_RANK[stateOf(b.id)]);
     const contexts = members.flatMap((model) => (model.contextTokens === null ? [] : [model.contextTokens]));
     const differ = contexts.some((tokens) => tokens !== contexts[0]);
+    const home = members.some((model) => model.id === value);
     const variants = ordered.map((model): ModelVariantOption => {
       const facts = [model.format === 'gguf' ? 'GGUF' : 'MLX'];
       if (model.sizeBytes !== null) facts.push(formatBytes(model.sizeBytes));
       if (differ && model.contextTokens !== null) facts.push(contextText(model.contextTokens));
       const option: ModelVariantOption = { id: model.id, label: model.variant, state: stateOf(model.id), facts };
-      return small(model) ? { ...option, warning: CHAT.modelSmall } : option;
+      if (small(model)) option.warning = CHAT.modelSmall;
+      const effort = thinking === undefined ? null : effortOf(model, home, thinking.level, thinking.busy);
+      if (effort !== null) option.effort = effort;
+      return option;
     });
     const loading = variants.find((variant) => variant.state === 'loading');
     const loaded = variants.find((variant) => variant.state === 'loaded');
@@ -732,6 +769,76 @@ function CrawlerPanelView({ choices, work, pick }: CrawlerPanel & { choices: Cra
   );
 }
 
+/** The conversation's last mode line: its key (index and time) and the mode; null when it has none. */
+export function lastModeLine(entries: readonly TranscriptEntry[]): { key: string; mode: PlanMode } | null {
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    const entry = entries[i]!;
+    if (entry.kind === 'plan-mode') return { key: `${i}:${entry.ts}`, mode: entry.mode };
+  }
+  return null;
+}
+
+export interface PlanChipView {
+  /** The agent's mode as its last mode line says; null when it sent none. */
+  mode: PlanMode | null;
+  /** The agent is in plan mode: its last mode line says `plan`. */
+  agentPlan: boolean;
+  /** Pressed, and what the next send carries as `plan`. */
+  next: boolean;
+  /** The last mode line's key, stored with a press. */
+  seen: string | null;
+}
+
+/**
+ * The one value of the "Plan first" chip: the user's press holds until a newer mode line arrives; with no press since
+ * that line, the chip follows the agent's mode. So the chip is on whenever the agent plans, and what shows pressed is
+ * what the next message carries.
+ */
+export function planChip(entries: readonly TranscriptEntry[], stored: PlanArm | null): PlanChipView {
+  const last = lastModeLine(entries);
+  const agentPlan = last?.mode === 'plan';
+  const seen = last?.key ?? null;
+  return {
+    mode: last?.mode ?? null,
+    agentPlan,
+    next: stored !== null && stored.seen === seen ? stored.next : agentPlan,
+    seen,
+  };
+}
+
+/**
+ * Work: the "Plan first" toggle in the tools row. Live while an answer runs: a press only sets what the next message
+ * carries. "Planning" while the agent plans and the chip is on.
+ */
+export function PlanChip({
+  view,
+  busy,
+  onToggle,
+}: {
+  view: PlanChipView;
+  /** An answer runs: the press applies to the next message. */
+  busy: boolean;
+  onToggle: () => void;
+}): ReactElement | null {
+  // Off and not planning: the toggle lives in the `/plan` command until it is on.
+  if (!view.next && !view.agentPlan) return null;
+  return (
+    <Tooltip content={busy ? CHAT.planMode.next : CHAT.planMode.tip}>
+      <ToolChip
+        icon={<NotebookPen size={14} strokeWidth={1.75} />}
+        label={view.agentPlan && view.next ? CHAT.planMode.chipOn : CHAT.planMode.chip}
+        aria-label={CHAT.planMode.chip}
+        state={view.next ? 'on' : 'off'}
+        tone={view.next ? 'active' : undefined}
+        pressed={view.next}
+        give={2}
+        data-plan-chip=""
+        onClick={onToggle}
+      />
+    </Tooltip>
+  );
+}
+
 /** The "Add files or photos" row: `open` clicks the page's file input; `full` holds the most a message can carry. */
 export interface AttachRow {
   open: () => void;
@@ -751,17 +858,20 @@ function modalOpen(): boolean {
 }
 
 /**
- * The `+` at the start of the composer's tools row and its menu: Add files or photos, then web search and the crawler,
- * each with its panel.
+ * The `+` at the start of the composer's tools row and its menu: Add files or photos, Commands (it opens the `/` list;
+ * no key, since `/` outside a text field is the page search), then web search and the crawler, each with its panel.
  */
 export function ComposerMenu({
   providers,
   mode,
   attach,
+  onCommands,
 }: {
   providers: ChatHostState['providers'] | null;
   mode: ChatMode;
   attach: AttachRow;
+  /** Puts `/` in the message box and focuses it. */
+  onCommands: () => void;
 }): ReactElement {
   const [open, setOpen] = useState(false);
   const view = providers === null ? null : webRow(providers);
@@ -809,6 +919,15 @@ export function ComposerMenu({
             note={attach.note}
             disabled={attach.full}
             onSelect={attach.open}
+          />
+          <MenuItem
+            icon={<SquareSlash size={14} strokeWidth={1.75} />}
+            label={CHAT.slash.menuRow}
+            note={CHAT.slash.menuNote}
+            onSelect={() => {
+              setOpen(false);
+              onCommands();
+            }}
           />
           <MenuSub
             icon={<Globe size={14} strokeWidth={1.75} />}

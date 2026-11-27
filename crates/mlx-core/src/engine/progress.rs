@@ -3,8 +3,8 @@
 //!
 //! One [`TurnProgress`] lives behind an `Arc` shared by the handle and the
 //! request's [`crate::model_thread::StreamTx`]. The model thread is the only
-//! writer; every access is `Relaxed`, so a reader may see fields from
-//! slightly different moments.
+//! writer; every access but the prefill start's is `Relaxed`, so a reader
+//! may see fields from slightly different moments.
 //!
 //! Code that holds the sink reaches the progress through
 //! [`crate::engine::backend::ChunkSink::progress`]. Whole-turn prefill loops
@@ -106,10 +106,16 @@ pub(crate) struct TurnProgress {
     picked_up_us: AtomicU64,
     slot: WaitTime,
     prepare: WaitTime,
+    /// Microseconds since `created`, at least 1 once set. A whole turn's
+    /// start: the prefill clock runs from here until `prefill_start_us`.
+    turn_start_us: AtomicU64,
     /// Microseconds since `created`, at least 1 once set.
     prefill_start_us: AtomicU64,
     /// Microseconds since `created`, at least 1 once set.
     first_token_us: AtomicU64,
+    /// Microseconds since `created`, at least 1 once set. The elapsed
+    /// clocks stop here.
+    end_us: AtomicU64,
 }
 
 impl Default for TurnProgress {
@@ -130,8 +136,10 @@ impl TurnProgress {
             picked_up_us: AtomicU64::new(UNSET),
             slot: WaitTime::default(),
             prepare: WaitTime::default(),
+            turn_start_us: AtomicU64::new(UNSET),
             prefill_start_us: AtomicU64::new(UNSET),
             first_token_us: AtomicU64::new(UNSET),
+            end_us: AtomicU64::new(UNSET),
         }
     }
 
@@ -196,14 +204,14 @@ impl TurnProgress {
         }
         let now = self.now_us();
         self.close_span(now);
-        self.prefill_start_us.store(now, Ordering::Relaxed);
+        self.turn_start_us.store(now, Ordering::Relaxed);
         self.phase.store(PHASE_PREFILL, Ordering::Relaxed);
     }
 
     /// Prefill of `total` tokens starts on top of `cached` reused prefix
     /// tokens. Ignored once decode has started. The prefill clock starts at
     /// the first call that brings the totals; a later call (a preemption
-    /// replay) keeps it.
+    /// replay) keeps it. A whole turn's time before it reads as `setup_ms`.
     pub(crate) fn begin_prefill(&self, total: u32, cached: u32) {
         if self.phase() >= PHASE_DECODE {
             return;
@@ -218,7 +226,8 @@ impl TurnProgress {
         self.prefill_done.store(0, Ordering::Relaxed);
         self.cached_tokens.store(cached, Ordering::Relaxed);
         if first {
-            self.prefill_start_us.store(now, Ordering::Relaxed);
+            // Release: a reader that sees this start also sees the turn start.
+            self.prefill_start_us.store(now, Ordering::Release);
         }
         self.phase.store(PHASE_PREFILL, Ordering::Relaxed);
     }
@@ -273,11 +282,16 @@ impl TurnProgress {
         self.generated.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// The terminal chunk or error was sent.
+    /// The terminal chunk or error was sent. The elapsed clocks stop here,
+    /// so a terminal chunk that waits for its reader adds no time.
     pub(crate) fn finish(&self) {
         self.picked_up();
+        let now = self.now_us();
         if self.phase() < PHASE_PREFILL {
-            self.close_span(self.now_us());
+            self.close_span(now);
+        }
+        if self.end_us.load(Ordering::Relaxed) == UNSET {
+            self.end_us.store(now, Ordering::Relaxed);
         }
         self.phase.store(PHASE_DONE, Ordering::Relaxed);
     }
@@ -286,8 +300,12 @@ impl TurnProgress {
         let phase = self.phase();
         let now_us = self.now_us();
         let known = |v: u32| (v != UNKNOWN).then_some(v);
-        let prefill_start = self.prefill_start_us.load(Ordering::Relaxed);
+        // Acquire before the turn start: a set prefill start comes with it.
+        let prefill_start = self.prefill_start_us.load(Ordering::Acquire);
+        let turn_start = self.turn_start_us.load(Ordering::Relaxed);
         let first_token = self.first_token_us.load(Ordering::Relaxed);
+        let end = self.end_us.load(Ordering::Relaxed);
+        let clock_us = if end != UNSET { end } else { now_us };
         let ms = |us: u64| us as f64 / 1000.0;
         let picked_up = self.picked_up_us.load(Ordering::Relaxed);
         let wait_ms = ms(if picked_up != UNSET {
@@ -296,16 +314,24 @@ impl TurnProgress {
             now_us
         });
         let waited = |time: &WaitTime| (picked_up != UNSET).then(|| ms(time.read(now_us)));
-        let prefill_elapsed_ms = (prefill_start != UNSET).then(|| {
+        let window_start = if prefill_start != UNSET {
+            prefill_start
+        } else {
+            turn_start
+        };
+        let prefill_elapsed_ms = (window_start != UNSET).then(|| {
             let end = if first_token != UNSET {
                 first_token
             } else {
-                now_us
+                clock_us
             };
-            ms(end.saturating_sub(prefill_start))
+            ms(end.saturating_sub(window_start))
         });
+        let setup_ms = (turn_start != UNSET && prefill_start != UNSET)
+            .then(|| ms(prefill_start.saturating_sub(turn_start)));
         let decode_elapsed_ms =
-            (first_token != UNSET).then(|| ms(now_us.saturating_sub(first_token)));
+            (first_token != UNSET).then(|| ms(clock_us.saturating_sub(first_token)));
+        let since_done_ms = (end != UNSET).then(|| ms(now_us.saturating_sub(end)));
         let prefill_total = known(self.prefill_total.load(Ordering::Relaxed));
         // Relaxed loads can pair a new (smaller) total with an older done.
         let prefill_done = known(self.prefill_done.load(Ordering::Relaxed))
@@ -330,6 +356,8 @@ impl TurnProgress {
                 .then(|| self.generated.load(Ordering::Relaxed)),
             prefill_elapsed_ms,
             decode_elapsed_ms,
+            setup_ms,
+            since_done_ms,
         }
     }
 }
@@ -598,6 +626,73 @@ mod tests {
         assert_eq!(s.phase, "prefill");
         assert_eq!(s.prefill_total, None);
         assert!(s.prefill_elapsed_ms.is_some());
+    }
+
+    /// The time `begin_prefill` takes out of a whole turn's prefill clock
+    /// reads as `setup_ms`, so setup + prefill is one clock that never moves
+    /// back. A scheduled lane has no setup. Mutation ps (`begin_turn` sets
+    /// the prefill start, which `begin_prefill` then moves) -> red.
+    #[test]
+    fn setup_and_prefill_are_one_clock_across_begin_prefill() {
+        let p = TurnProgress::new();
+        p.begin_turn();
+        sleep_ms(20);
+        let before = p.snapshot();
+        assert_eq!(before.setup_ms, None);
+        let provisional = before.prefill_elapsed_ms.expect("whole turn");
+        assert!(provisional >= 20.0, "{before:?}");
+        p.begin_prefill(512, 0);
+        let after = p.snapshot();
+        let setup = after.setup_ms.expect("the prefill start moved");
+        let window = after.prefill_elapsed_ms.expect("prefill");
+        assert!(setup >= 20.0, "{after:?}");
+        assert!(
+            window < setup,
+            "the window restarts at begin_prefill: {after:?}"
+        );
+        assert!(setup + window >= provisional, "{before:?} then {after:?}");
+        sleep_ms(10);
+        p.first_token();
+        let decoding = p.snapshot();
+        assert_eq!(decoding.setup_ms, Some(setup), "frozen at begin_prefill");
+
+        let scheduled = TurnProgress::new();
+        scheduled.enter(Waiting::Prepare);
+        scheduled.begin_prefill(512, 0);
+        assert_eq!(scheduled.snapshot().setup_ms, None);
+    }
+
+    /// `finish` stops both elapsed clocks; `since_done_ms` keeps running.
+    /// Mutation pd (the snapshot reads the elapsed clocks at now) -> red.
+    #[test]
+    fn finish_stops_the_elapsed_clocks() {
+        let decoded = TurnProgress::new();
+        decoded.begin_prefill(100, 0);
+        sleep_ms(5);
+        decoded.first_token();
+        sleep_ms(10);
+        decoded.finish();
+        let done = decoded.snapshot();
+        sleep_ms(30);
+        let later = decoded.snapshot();
+        assert_eq!(later.phase, "done");
+        assert_eq!(later.decode_elapsed_ms, done.decode_elapsed_ms);
+        assert_eq!(later.prefill_elapsed_ms, done.prefill_elapsed_ms);
+        assert!(
+            later.since_done_ms.expect("done") >= done.since_done_ms.expect("done") + 30.0,
+            "{done:?} then {later:?}"
+        );
+
+        let cancelled = TurnProgress::new();
+        cancelled.begin_prefill(100, 0);
+        sleep_ms(5);
+        assert_eq!(cancelled.snapshot().since_done_ms, None);
+        cancelled.finish();
+        let done = cancelled.snapshot();
+        sleep_ms(30);
+        let later = cancelled.snapshot();
+        assert_eq!(later.decode_elapsed_ms, None);
+        assert_eq!(later.prefill_elapsed_ms, done.prefill_elapsed_ms);
     }
 
     #[test]

@@ -210,6 +210,12 @@ export interface ServerConfig {
    */
   thinkingEndText?: string;
   /**
+   * Each chat family's thinking levels (`host/thinking-levels.ts`): `/v1/models` rows list them as
+   * `reasoningEfforts` and a Messages request's `extra_body.reasoning_effort` maps through them. Default: off, the
+   * field maps as it is.
+   */
+  thinkingLevels?: boolean;
+  /**
    * The desktop supervisor's turn journal and quarantine (Splash
    * `Quarantine`). Omitted: no journal and no refusal.
    */
@@ -604,6 +610,7 @@ export async function createServer(config?: ServerConfig): Promise<ServerInstanc
     ...(config?.thinkingTokenBudget !== undefined ? { thinkingTokenBudget: config.thinkingTokenBudget } : {}),
     ...(config?.thinkingCycleGuard === true ? { thinkingCycleGuard: true } : {}),
     ...(config?.thinkingEndText !== undefined ? { thinkingEndText: parseThinkingEndText(config.thinkingEndText) } : {}),
+    ...(config?.thinkingLevels === true ? { thinkingLevels: true } : {}),
     ...(config?.turnJournal !== undefined ? { turnJournal: new TurnJournal(config.turnJournal) } : {}),
   });
   /**

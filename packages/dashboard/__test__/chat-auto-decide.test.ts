@@ -87,6 +87,7 @@ function card(
     resolvedPath: null,
     options: [],
     flags: [],
+    openedAt: 0,
     ...over,
   };
 }

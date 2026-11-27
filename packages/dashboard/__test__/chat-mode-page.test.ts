@@ -20,9 +20,11 @@ import type {
   ChatHostState,
   ConversationInfo,
   ConversationRow,
+  McpInteraction,
   PermissionInteraction,
   PermissionMark,
   PermissionMode,
+  PlanInteraction,
 } from '../ui/src/lib/chat-types.js';
 import { bumpConnectionGeneration } from '../ui/src/lib/connection.js';
 import {
@@ -33,6 +35,7 @@ import {
   markLine,
   placeMarks,
   settingsToast,
+  subagentAllowedText,
   tempFor,
 } from '../ui/src/lib/permission-text.js';
 import type { ProvidersResponse } from '../ui/src/lib/providers-types.js';
@@ -137,6 +140,7 @@ function sync(id: string, over: Partial<ChatSync> = {}, conversation: Partial<Co
     transcriptError: null,
     permissionMarks: [],
     runs: [],
+    live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
     ...over,
   };
 }
@@ -159,6 +163,7 @@ function permission(over: Partial<PermissionInteraction> = {}): PermissionIntera
       { optionId: 'reject-once', kind: 'reject_once', name: 'No' },
     ],
     flags: [],
+    openedAt: NOW,
     ...over,
   };
 }
@@ -244,13 +249,12 @@ function chip(place: 'composer' | 'header' = 'composer'): HTMLButtonElement {
   return found;
 }
 
-/** The page bar: the header that holds the page's h1. */
-function bar(): HTMLElement {
-  const found = [...page!.container.querySelectorAll<HTMLElement>('header')].find(
-    (h) => h.querySelector('h1') !== null,
+/** The strip under the composer on New; an empty node while it is not shown. */
+function tray(): HTMLElement {
+  return (
+    page!.container.querySelector<HTMLElement>(`[role="group"][aria-label="${CHAT.tray.label}"]`) ??
+    document.createElement('div')
   );
-  if (found === undefined) throw new Error('no bar');
-  return found;
 }
 
 function menu(): HTMLElement | null {
@@ -384,7 +388,7 @@ describe('rules of the page', () => {
       auto: null,
       bypass: null,
     });
-    expect(folderReason(true, null, undefined)).toBe(CHAT.folderNeeded);
+    expect(folderReason(true, null, undefined)).toBeUndefined();
     expect(folderReason(true, `/Users/dev/${'a'.repeat(250)}`, undefined)).toBe(CHAT.folderTooLong);
     expect(folderReason(true, FOLDER, 'missing')).toBeUndefined();
     expect(folderReason(false, FOLDER, 'missing')).toBe(missing);
@@ -576,6 +580,57 @@ describe('rules of the page', () => {
     expect(placed.before.get(2)).toEqual([helper]);
     expect(placed.allowed.get('c1')).toBe(row);
     expect(placed.end).toEqual([down]);
+    expect(placed.bySubagent.size).toBe(0);
+  });
+
+  it("groups a helper's allowed calls under its subagent entry; a helper with no entry keeps its line", () => {
+    const spawn: TranscriptEntry = {
+      kind: 'subagent',
+      ts: 20,
+      childId: 's1',
+      type: 'general-purpose',
+      description: 'd',
+    };
+    const entries = [user('a', 10), spawn, runEntry('c1', 'ls', 30), answer('b', 50)];
+    const allowed = (at: number, toolCallId: string, child?: string): PermissionMark => ({
+      kind: 'allowed',
+      mode: 'bypass',
+      at,
+      toolCallId,
+      access: 'bash',
+      card: null,
+      ...(child === undefined ? {} : { child }),
+    });
+    const first = allowed(25, 'h1', 's1');
+    // A helper's call id that equals a row of the session: it stays the helper's.
+    const same = allowed(35, 'c1', 's1');
+    const loose = allowed(40, 'h2', 'gone');
+    const own = allowed(30, 'c1');
+    const up: PermissionMark = { kind: 'mode', at: 22, mode: 'bypass', from: 'ask', by: 'user' };
+    const placed = placeMarks(entries, [up, first, own, same, loose]);
+    expect(placed.bySubagent).toEqual(new Map([['s1', [first, same]]]));
+    expect(placed.allowed).toEqual(new Map([['c1', own]]));
+    expect(placed.before.get(2)).toEqual([up]);
+    expect(placed.before.get(3)).toEqual([loose]);
+    expect(placed.end).toEqual([]);
+  });
+
+  it('the fact of a subagent row counts its allowed calls by kind', () => {
+    const allowed = (access: 'bash' | 'edit' | 'mcp' | 'other'): Extract<PermissionMark, { kind: 'allowed' }> => ({
+      kind: 'allowed',
+      mode: 'bypass',
+      at: 1,
+      toolCallId: 'x',
+      access,
+      card: null,
+      child: 's1',
+    });
+    expect(subagentAllowedText(Array.from({ length: 14 }, () => allowed('bash')))).toBe('14 commands allowed');
+    expect(subagentAllowedText([allowed('bash')])).toBe('1 command allowed');
+    expect(subagentAllowedText([allowed('edit'), allowed('edit')])).toBe('2 file edits allowed');
+    expect(subagentAllowedText([allowed('mcp'), allowed('other')])).toBe('2 tool calls allowed');
+    expect(subagentAllowedText([allowed('other')])).toBe('1 tool call allowed');
+    expect(subagentAllowedText([allowed('bash'), allowed('edit'), allowed('bash')])).toBe('3 calls allowed');
   });
 });
 
@@ -1092,6 +1147,71 @@ describe('block reasons', () => {
     await openConfirm('bypass');
   });
 
+  // Mutation: add 'mcp-input' to MODE_BLOCKING_CARDS → the Auto row turns off.
+  it('an open MCP card shows in the card slot and leaves the Auto row on (the host does not count it)', async () => {
+    const mcp: McpInteraction = {
+      id: 'm1',
+      kind: 'mcp-input',
+      toolCallId: 'mcp-elicit-1',
+      openedAt: NOW,
+      mode: 'form',
+      server: 'github',
+      message: 'Which repository?',
+      form: { fields: [], leftOut: 0 },
+    };
+    await openIn('pm-mcp', 'ask', {
+      conversations: { 'pm-mcp': sync('pm-mcp', { interactions: [mcp] }) },
+    });
+    const slot = page!.container.querySelector('[data-interaction-card]')!;
+    expect(slot.textContent).toContain(fill(CHAT.mcp.formTitle, { server: 'github' }));
+    await openMenu();
+    expect(radio('auto').getAttribute('aria-disabled')).toBeNull();
+    expect(radio('bypass').getAttribute('aria-disabled')).toBeNull();
+  });
+
+  it('an MCP card that closes with no answer drops what was typed: the same card shown again starts empty', async () => {
+    const id = 'pm-mcp-draft';
+    const mcp: McpInteraction = {
+      id: 'm2',
+      kind: 'mcp-input',
+      toolCallId: 'mcp-elicit-2',
+      openedAt: NOW,
+      mode: 'form',
+      server: 'github',
+      message: 'Which repository?',
+      form: {
+        fields: [
+          {
+            name: 'title',
+            title: 'Title',
+            description: null,
+            required: true,
+            type: 'text',
+            format: null,
+            minLength: null,
+            maxLength: null,
+            initial: '',
+          },
+        ],
+        leftOut: 0,
+      },
+    };
+    await openIn(id, 'ask', { conversations: { [id]: sync(id, { interactions: [mcp] }) } });
+    const box = (): HTMLInputElement | null =>
+      page!.container.querySelector<HTMLInputElement>('[data-interaction-card] [data-field="0"] input');
+    await waitFor(() => box() !== null);
+    act(() => {
+      Reflect.set(HTMLInputElement.prototype, 'value', 'Cart', box()!);
+      box()!.dispatchEvent(new Event('input', { bubbles: true }));
+    });
+    expect(box()!.value).toBe('Cart');
+    act(() => api!.emitChat(id, { type: 'interaction-closed', seq: 1, id: mcp.id, reason: 'cancelled' }));
+    await waitFor(() => box() === null);
+    act(() => api!.emitChat(id, { type: 'interaction', seq: 2, interaction: mcp }));
+    await waitFor(() => box() !== null);
+    expect(box()!.value).toBe('');
+  });
+
   it('the agent blocker and the folder disable the higher rows, never the lower ones', async () => {
     await openIn('pm-agent', 'auto', { host: raisedHost('pm-agent', 'auto', FAILED_AGENT) });
     await openMenu();
@@ -1143,7 +1263,7 @@ describe('header and list', () => {
     expect(switches()).toEqual([{ mode: 'ask', up: false }]);
   });
 
-  it('list marks: Auto icon with hidden text, Bypass icon and word, none in Ask; also in search results', async () => {
+  it('list marks: Auto icon with hidden text, Bypass icon and word (with the folder in search results), none in Ask', async () => {
     const rows: ConversationRow[] = [
       { ...info('pm-l-auto'), turns: 1 },
       { ...info('pm-l-b'), turns: 1 },
@@ -1163,7 +1283,7 @@ describe('header and list', () => {
     const row = (id: string): HTMLElement | null =>
       page!.container.querySelector<HTMLElement>(`a[data-conversation-row="${id}"]`);
     await waitFor(() => row('pm-l-b') !== null);
-    const check = (): void => {
+    const check = (searching: boolean): void => {
       const auto = row('pm-l-auto')!.querySelector('[data-permission-mode]')!;
       expect(auto.getAttribute('data-permission-mode')).toBe('auto');
       expect(iconOf(auto)).toBe('lucide-shield-check');
@@ -1171,17 +1291,18 @@ describe('header and list', () => {
       expect(row('pm-l-auto')!.textContent).not.toContain('Bypass');
       const loud = row('pm-l-b')!.querySelector('[data-permission-mode]')!;
       expect(iconOf(loud)).toBe('lucide-shield-off');
-      expect(row('pm-l-b')!.textContent).toContain('Bypass · ');
+      if (searching) expect(row('pm-l-b')!.textContent).toContain('Bypass · ');
+      else expect(row('pm-l-b')!.textContent?.endsWith(CHAT.permission.modes.bypass)).toBe(true);
       expect(row('pm-l-ask')!.querySelector('[data-permission-mode]')).toBeNull();
     };
-    check();
+    check(false);
     const search = byRole(document.body, 'searchbox', CHAT.listSearch) as HTMLInputElement;
     act(() => {
       Reflect.set(HTMLInputElement.prototype, 'value', 'Title', search);
       search.dispatchEvent(new Event('input', { bubbles: true }));
     });
     await waitFor(() => shown(page!.container).includes(fill(CHAT.listCount, { n: 3 })));
-    check();
+    check(true);
   });
 });
 
@@ -1424,6 +1545,36 @@ describe('status, placeholder and cards', () => {
     expect(labels()).toEqual([CHAT.deny, CHAT.allowOnce, CHAT.allowAlwaysCommand]);
     expect(shown(card())).not.toContain(P.asksStart);
   });
+
+  const needRows = (): HTMLButtonElement[] => [
+    ...page!.container.querySelectorAll<HTMLButtonElement>('section[data-needs] button'),
+  ];
+
+  it('in Auto the cards Auto did not cover are listed under Needs you, marked "Auto asks"', async () => {
+    const id = 'pm-auto-needs';
+    await openIn(id, 'auto', {
+      conversations: {
+        [id]: sync(
+          id,
+          { interactions: [permission({ autoAsk: 'not-known' }), permission({ id: 'i2', openedAt: NOW + 1 })] },
+          { permissionMode: 'auto' },
+        ),
+      },
+    });
+    await waitFor(() => needRows().length === 2);
+    expect(needRows().map((row) => row.textContent?.includes(CHAT.needs.autoAsks))).toEqual([true, false]);
+  });
+
+  it('in Bypass a plan card is still a request: listed, and the composer says to answer it', async () => {
+    const id = 'pm-plan-in-bypass';
+    const plan: PlanInteraction = { id: 'p1', kind: 'plan', toolCallId: 'c-p1', openedAt: NOW, plan: 'Do it' };
+    await openIn(id, 'bypass', {
+      conversations: { [id]: sync(id, { interactions: [plan] }, { permissionMode: 'bypass' }) },
+    });
+    await waitFor(() => needRows().length === 1);
+    expect(needRows()[0]!.getAttribute('data-ask')).toBe('plan');
+    expect(page!.container.querySelector('textarea')!.placeholder).toBe(CHAT.needs.composerPlaceholder);
+  });
 });
 
 describe('the thread', () => {
@@ -1538,6 +1689,58 @@ describe('the thread', () => {
     click(tool);
     await waitFor(() => page!.container.querySelector(`pre[aria-label="${CHAT.permInput}"]`) !== null);
     expect(page!.container.querySelector(`pre[aria-label="${CHAT.permInput}"]`)?.textContent).toBe(mcpInput);
+  });
+
+  it("a subagent's allowed calls: a count on its row and a closed list under it; one with no row keeps its line", async () => {
+    const helperCard = (command: string): PermissionInteraction =>
+      permission({ command, input: JSON.stringify({ command }), options: [] });
+    const allowed = (at: number, id: string, command: string, child: string): PermissionMark => ({
+      kind: 'allowed',
+      mode: 'bypass',
+      at,
+      toolCallId: id,
+      access: 'bash',
+      card: helperCard(command),
+      child,
+    });
+    const marks: PermissionMark[] = [
+      { kind: 'mode', at: T0 + 50, mode: 'bypass', from: 'ask', by: 'user' },
+      allowed(T0 + 300, 'h1', 'touch a', 'child-1'),
+      allowed(T0 + 400, 'h2', 'touch b', 'child-1'),
+      allowed(T0 + 450, 'h3', 'rm stray', 'grandchild-1'),
+      allowed(T0 + 500, 'h4', 'touch c', 'child-1'),
+    ];
+    const entries: TranscriptEntry[] = [
+      user('Research it', T0),
+      { kind: 'subagent', ts: T0 + 100, childId: 'child-1', type: 'general-purpose', description: 'Research A' },
+      answer('Done', T0 + 900),
+      end('end_turn', T0 + 1_500),
+    ];
+    await open('/chat?c=pm-helper', (text) => text.includes('Done'), {
+      conversations: { 'pm-helper': sync('pm-helper', { entries, permissionMarks: marks }) },
+    });
+    const root = page!.container;
+    const text = shown(root);
+    expect(text).toContain('Research A');
+    expect(text).toContain('3 commands allowed');
+    expect(text).not.toContain(`${P.allowed.bypass}touch a`);
+    expect(text.indexOf(`${P.allowed.bypass}rm stray`)).toBeGreaterThan(text.indexOf('Research A'));
+    expect(text.indexOf(`${P.allowed.bypass}rm stray`)).toBeLessThan(text.indexOf('Done'));
+    const toggle = [...root.querySelectorAll<HTMLButtonElement>('button[aria-expanded]')].find(
+      (b) => b.textContent === P.subagentAllowedList,
+    )!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    const region = document.getElementById(toggle.getAttribute('aria-controls')!)!;
+    expect(region.getAttribute('aria-labelledby')).toBe(toggle.id);
+    expect(region.textContent).toBe('');
+    click(toggle);
+    await waitFor(() => toggle.getAttribute('aria-expanded') === 'true');
+    await waitFor(() => (region.textContent ?? '').includes('touch c'));
+    expect(region.textContent).toContain(`${P.allowed.bypass}touch a`);
+    expect(region.textContent).toContain(`${P.allowed.bypass}touch b`);
+    expect(region.textContent).not.toContain('rm stray');
+    const lines = shown(root).split(`${P.allowed.bypass}`).length - 1;
+    expect(lines).toBe(4);
   });
 
   it('a settings mark that arrives live is also a toast', async () => {
@@ -1835,7 +2038,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
   const hooksRead = (): number => calls.filter((call) => pathOf(call) === '/chat/work/hooks').length;
   async function openNew(setup: Open = {}): Promise<void> {
     draftIds();
-    if (setup.rows === undefined) chooseFolder(FOLDER);
+    if (setup.rows === undefined) chooseFolder({ kind: 'folder', path: FOLDER });
     await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
       ...setup,
       routes: { ...DRAFT_ROUTES, ...setup.routes },
@@ -1893,20 +2096,21 @@ describe('the New Work screen: a mode picked before the first message', () => {
     ];
     await openNew({ rows, conversations: { 'pm-new-a': sync('pm-new-a') } });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => bar().querySelector(label) !== null);
+    await waitFor(() => tray().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'auto') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'auto');
-    click(bar().querySelector<HTMLElement>(label)!);
+    click(tray().querySelector<HTMLElement>(label)!);
     const options = (): HTMLElement[] => [
-      ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
+      ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderPath}"] [role="radio"]`),
     ];
-    await waitFor(() => options().length === 2);
-    const popover = document.querySelector(`[role="dialog"][aria-label="${CHAT.folderRecent}"]`)!;
-    expect([popover.getAttribute('data-side'), popover.getAttribute('data-align')]).toEqual(['bottom', 'end']);
+    await waitFor(() => options().length === 3);
+    const popover = document.querySelector(`[role="dialog"][aria-label="${CHAT.folderPath}"]`)!;
+    expect([popover.getAttribute('data-side'), popover.getAttribute('data-align')]).toEqual(['top', 'start']);
     expect(options().map((o) => o.textContent ?? '')).toEqual([
       expect.stringContaining('proj'),
       expect.stringContaining('other'),
+      expect.stringContaining(CHAT.folderNone),
     ]);
     click(options().find((o) => (o.textContent ?? '').includes('other'))!);
     await waitFor(() => posts().length === 1);
@@ -1915,7 +2119,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     expect(page!.container.querySelector('textarea')!.placeholder).toBe(
       fill(CHAT.placeholderWork, { folder: 'other' }),
     );
-    expect(bar().querySelector(`[aria-label="${fill(CHAT.folderLabel, { folder: OTHER })}"]`)).not.toBeNull();
+    expect(tray().querySelector(`[aria-label="${fill(CHAT.folderLabel, { folder: OTHER })}"]`)).not.toBeNull();
     await waitFor(() => document.activeElement === page!.container.querySelector('textarea'));
 
     const second = made.at(-1)!;
@@ -1956,6 +2160,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       modelId: 'qwen3.5-4b',
       cwd: FOLDER,
       draft: 'd1',
+      plan: false,
     });
     for (const key of ['permissionMode', 'bypass', 'up']) expect(Object.hasOwn(creates()[0]!, key)).toBe(false);
     // The claim empties the host's draft; the chip keeps what it showed at Send.
@@ -1973,7 +2178,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     await waitFor(() => error.mock.calls.some((c) => c[0] === P.failed));
   });
 
-  it('a folder change while the first message is on its way: a move down still posts to the draft it sent', async () => {
+  it('while the first message is on its way the folder cannot change, and a move down still posts to the draft it sent', async () => {
     const rows = [
       { ...info('pm-new-a', { cwd: FOLDER, updatedAt: NOW - 1_000 }), turns: 1 },
       { ...info('pm-new-b', { cwd: OTHER, updatedAt: NOW - 2_000 }), turns: 1 },
@@ -1985,7 +2190,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       conversations: { 'pm-new-a': sync('pm-new-a'), 'pm-made': sync('pm-made') },
     });
     const label = `[aria-label="${fill(CHAT.folderLabel, { folder: FOLDER })}"]`;
-    await waitFor(() => bar().querySelector(label) !== null);
+    await waitFor(() => tray().querySelector(label) !== null);
     const first = made.at(-1)!;
     act(() => api!.emitChatHost({ type: 'state', state: draftHost(first, 'bypass') }));
     await waitFor(() => chip().getAttribute('data-permission-mode') === 'bypass');
@@ -1993,13 +2198,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     sendNow();
     await waitFor(() => creates().length === 1);
     act(() => api!.emitChatHost({ type: 'state', state: READY_CHAT_HOST }));
-    click(bar().querySelector<HTMLElement>(label)!);
-    const options = (): HTMLElement[] => [
-      ...document.querySelectorAll<HTMLElement>(`[aria-label="${CHAT.folderRecent}"] [role="radio"]`),
-    ];
-    await waitFor(() => options().length === 2);
-    click(options().find((o) => (o.textContent ?? '').includes('other'))!);
-    await waitFor(() => made.at(-1) !== first);
+    await waitFor(() => tray().querySelector(label) === null);
     await openMenu();
     click(radio('ask'));
     await waitFor(() => posts().length === 1);
@@ -2079,13 +2278,20 @@ describe('the New Work screen: a mode picked before the first message', () => {
     await waitFor(() => posts().length === 1);
   });
 
-  it('no folder: the higher rows say to choose one; the lower row needs none', async () => {
+  it('no folder: every row is on; the confirm reads the hooks of no folder and the move up names no folder', async () => {
+    useClock();
     draftIds();
-    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), { routes: DRAFT_ROUTES });
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle), { routes: DRAFT_ROUTES });
     await openMenu();
-    expect(radio('auto').getAttribute('aria-disabled')).toBe('true');
-    expect(radio('bypass').getAttribute('aria-disabled')).toBe('true');
-    expect(radio('ask').getAttribute('aria-disabled')).toBeNull();
+    for (const mode of ['ask', 'auto', 'bypass'] as const) expect(radio(mode).getAttribute('aria-disabled')).toBeNull();
+    const view = await openConfirm('bypass');
+    await waitFor(() => shown(view).includes(P.draftFoot) && hooksRead() === 1);
+    expect(calls.find((call) => pathOf(call) === '/chat/work/hooks')?.path.split('?')[1]).toBe('noFolder=1');
+    await settle();
+    advance(CARD_ARM_MS);
+    press(action('bypass'), true);
+    await waitFor(() => posts().length === 1);
+    expect(posts()).toEqual([`${draftPath('d1')} ${JSON.stringify({ mode: 'bypass', up: true, noFolder: true })}`]);
   });
 
   it('Chat: no chip on the New screen', async () => {
@@ -2094,19 +2300,19 @@ describe('the New Work screen: a mode picked before the first message', () => {
     expect(page!.container.querySelector('[data-permission-chip]')).toBeNull();
   });
 
-  it('the tools row: the + first without a tier, the picker wrapper 3, the folder chip 1, the mode chip none', async () => {
-    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+  it('the tools row: the + first without a tier, the picker wrapper 3, the mode chip none (the folder is in the tray), no Plan first until it is on', async () => {
+    await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle), {
       host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
     });
     const start = chip().parentElement!;
     const tiers = [...start.children].map((child) => child.getAttribute('data-give'));
-    expect(tiers).toEqual([null, '3', '1', null]);
+    expect(tiers).toEqual([null, '3', null]);
     expect(chip().getAttribute('data-give')).toBeNull();
   });
 
   it('the Work hero says the agent can read the key only when a key is in the Work environment', async () => {
     const hero = async (firecrawl: boolean): Promise<string> => {
-      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle), {
         host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, firecrawl } },
       });
       const text = page!.text();
@@ -2121,7 +2327,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
   });
 
   it('the tools row once a folder is chosen: the +, the picker, the mode chip', async () => {
-    chooseFolder('/tmp/work/a-twenty-char-folder');
+    chooseFolder({ kind: 'folder', path: '/tmp/work/a-twenty-char-folder' });
     await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
       host: { ...READY_CHAT_HOST, providers: { ...READY_CHAT_HOST.providers, search: 'deepseek' } },
     });
@@ -2153,7 +2359,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
       row: string,
       body: unknown = exa(['exa-search', 'exa-fetch']),
     ): Promise<HTMLElement> => {
-      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle), {
         host: {
           ...READY_CHAT_HOST,
           providers: { ...READY_CHAT_HOST.providers, search: 'exa', searchCheck, fetch: 'exa' },
@@ -2248,7 +2454,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
     ): Promise<HTMLElement> => {
       page?.unmount();
       api?.();
-      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkTitle), {
+      await open('/chat?mode=work', (text) => text.includes(CHAT.heroWorkNoneTitle), {
         host: {
           ...READY_CHAT_HOST,
           providers: {
@@ -2293,7 +2499,7 @@ describe('the New Work screen: a mode picked before the first message', () => {
 
 describe('files on the shared New screen', () => {
   it('a picture attached in Chat blocks Send in Work with the Work sentence, and the + row says text files only', async () => {
-    chooseFolder(FOLDER);
+    chooseFolder({ kind: 'folder', path: FOLDER });
     writeAttachments(NEW_PLACE, [
       {
         id: 'mode-pic',

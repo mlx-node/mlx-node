@@ -219,10 +219,10 @@ export default function Onboarding({
               type="button"
               disabled={!canFinish}
               onClick={() => finish('/')}
-              aria-label="mlx-node home"
+              aria-label="Portato home"
               className="cursor-pointer font-heading text-strong font-medium text-foreground disabled:cursor-default disabled:text-muted"
             >
-              mlx-node
+              Portato
             </button>
             <Button variant="ghost" disabled={!canFinish} onClick={() => finish('/')}>
               {downloading ? 'Explore while downloading' : 'Set up later'}

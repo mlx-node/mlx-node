@@ -63,14 +63,15 @@ describe('versionFromTag', () => {
 
 describe('dmg naming', () => {
   it('round-trips', () => {
-    expect(dmgFileName('0.0.9')).toBe('mlx-node-0.0.9-arm64.dmg');
+    expect(dmgFileName('0.0.9')).toBe('Portato-0.0.9-arm64.dmg');
     expect(versionFromDmgPath(dmgFileName('0.0.9'))).toBe('0.0.9');
     expect(versionFromDmgPath(`packages/desktop/out/${dmgFileName('1.2.3-rc.1')}`)).toBe('1.2.3-rc.1');
   });
 
   it('does not claim a foreign name is ours', () => {
-    expect(versionFromDmgPath('mlx-node.dmg')).toBeNull();
-    expect(versionFromDmgPath('mlx-node-nightly-arm64.dmg')).toBeNull();
+    expect(versionFromDmgPath('Portato.dmg')).toBeNull();
+    expect(versionFromDmgPath('Portato-nightly-arm64.dmg')).toBeNull();
+    expect(versionFromDmgPath('mlx-node-0.0.9-arm64.dmg')).toBeNull();
     expect(versionFromDmgPath('/tmp/somethingelse-0.0.9-arm64.dmg')).toBeNull();
   });
 
@@ -165,16 +166,16 @@ describe('assertVersionsAgree, untagged path', () => {
 describe('Windows ZIP release versions', () => {
   it('round-trips a Windows path and checks the version against the other artifacts', () => {
     const path = `packages\\desktop\\out\\${windowsZipFileName('0.0.14')}`;
-    expect(windowsZipFileName('0.0.14')).toBe('mlx-node-0.0.14-win32-arm64.zip');
+    expect(windowsZipFileName('0.0.14')).toBe('Portato-0.0.14-win32-arm64.zip');
     expect(versionFromWindowsZipPath(path)).toBe('0.0.14');
     expect(assertVersionsAgree({ ...AGREED, windowsZip: '0.0.9' })).toBe('0.0.9');
     expect(() => assertVersionsAgree({ ...AGREED, windowsZip: '0.0.8' })).toThrow(/Windows ZIP filename/);
   });
 
   it('rejects other platforms, architectures, and invalid versions', () => {
-    expect(versionFromWindowsZipPath('mlx-node-0.0.14-darwin-arm64.zip')).toBeNull();
-    expect(versionFromWindowsZipPath('mlx-node-0.0.14-win32-x64.zip')).toBeNull();
-    expect(versionFromWindowsZipPath('mlx-node-nightly-win32-arm64.zip')).toBeNull();
+    expect(versionFromWindowsZipPath('Portato-0.0.14-darwin-arm64.zip')).toBeNull();
+    expect(versionFromWindowsZipPath('Portato-0.0.14-win32-x64.zip')).toBeNull();
+    expect(versionFromWindowsZipPath('Portato-nightly-win32-arm64.zip')).toBeNull();
     expect(() => windowsZipFileName('nightly')).toThrow();
   });
 });
@@ -182,7 +183,7 @@ describe('Windows ZIP release versions', () => {
 describe('Windows MSIX release versions', () => {
   it('round-trips a Windows MSIX path and checks agreement with other artifacts', () => {
     const path = `packages\\desktop\\out\\${windowsMsixFileName('0.0.21')}`;
-    expect(windowsMsixFileName('0.0.21')).toBe('mlx-node-0.0.21-win32-arm64.msix');
+    expect(windowsMsixFileName('0.0.21')).toBe('Portato-0.0.21-win32-arm64.msix');
     expect(versionFromWindowsMsixPath(path)).toBe('0.0.21');
     expect(versionFromWindowsMsixPath(`/out/${windowsMsixFileName('1.2.3')}`)).toBe('1.2.3');
     expect(assertVersionsAgree({ ...AGREED, windowsMsix: '0.0.9' })).toBe('0.0.9');
@@ -190,10 +191,10 @@ describe('Windows MSIX release versions', () => {
   });
 
   it('rejects other platforms, extensions, architectures, and invalid versions', () => {
-    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-win32-arm64.zip')).toBeNull();
-    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-win32-x64.msix')).toBeNull();
-    expect(versionFromWindowsMsixPath('mlx-node-0.0.21-darwin-arm64.msix')).toBeNull();
-    expect(versionFromWindowsMsixPath('mlx-node-nightly-win32-arm64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('Portato-0.0.21-win32-arm64.zip')).toBeNull();
+    expect(versionFromWindowsMsixPath('Portato-0.0.21-win32-x64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('Portato-0.0.21-darwin-arm64.msix')).toBeNull();
+    expect(versionFromWindowsMsixPath('Portato-nightly-win32-arm64.msix')).toBeNull();
     expect(versionFromWindowsMsixPath('other-0.0.21-win32-arm64.msix')).toBeNull();
     expect(() => windowsMsixFileName('nightly')).toThrow(ReleaseVersionError);
   });

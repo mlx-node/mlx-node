@@ -1,5 +1,6 @@
 /** The join between a checkpoint directory and the names it is served and traced under. Never by folder name alone. */
 
+import { decodeSpeed } from './metrics-view';
 import type { LocalModel, MetricsSummary, MetricsTimeseries, Quantiles } from './types';
 
 /** True when `key` (a model_key, a live models[].name, a turn's modelId) belongs to this checkpoint directory. */
@@ -20,14 +21,17 @@ export function usageKeys(model: Pick<LocalModel, 'name' | 'servedIds'>): string
 }
 
 export interface ModelUsage {
-  /** The usage key with the most turns (ties: first in `usageKeys`). Quantiles, `ctxWindow` and the color come from it. */
+  /** The usage key with the most turns (ties: first in `usageKeys`). Speeds, quantiles, `ctxWindow` and the color come from it. */
   key: string;
   /** Usage keys with at least one turn. More than one = a folder with several GGUF variants in use. */
   keys: string[];
   turns: number;
   failed: number;
   cancelled: number;
-  decodeTps: Quantiles;
+  /** Token-weighted decode speed; null when no turn had a decode rate. */
+  decodeSpeed: number | null;
+  /** Turns with a decode rate. */
+  decodeTurns: number;
   ttftMs: Quantiles;
   ctxFillPct: Quantiles;
   ctxWindow: number | null;
@@ -73,7 +77,8 @@ export function joinModelUsage(
       turns,
       failed,
       cancelled,
-      decodeTps: main.latency.decodeTps,
+      decodeSpeed: decodeSpeed(main.totals),
+      decodeTurns: main.latency.decodeTps.n,
       ttftMs: main.latency.ttftMs,
       ctxFillPct: main.latency.ctxFillPct,
       ctxWindow: main.ctxWindow,

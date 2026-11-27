@@ -188,7 +188,7 @@ describe('first model onboarding', () => {
     expect(window.location.pathname).toBe('/welcome');
   });
 
-  it.each(['Set up later', 'Explore while downloading', 'mlx-node home'])(
+  it.each(['Set up later', 'Explore while downloading', 'Portato home'])(
     'waits for the library before allowing %s from a direct welcome visit',
     async (action) => {
       const dir = `/test/delayed-library/${action}`;
@@ -209,8 +209,8 @@ describe('first model onboarding', () => {
       });
       page = await renderPage(createElement(App), (text) => text.includes('Choose your first model'));
       const control = () =>
-        action === 'mlx-node home'
-          ? page!.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!
+        action === 'Portato home'
+          ? page!.container.querySelector<HTMLButtonElement>('[aria-label="Portato home"]')!
           : button(action);
       await waitFor(() => expect(control().disabled).toBe(true));
       await act(async () => control().click());
@@ -234,7 +234,7 @@ describe('first model onboarding', () => {
     window.history.replaceState({}, '', '/welcome');
     dispose = stubApi({ ...routes(dir), '/models': sequence(STUB_FAILURE, library.body) });
     page = await renderPage(createElement(App), (text) => text.includes('Try again'));
-    const home = page.container.querySelector<HTMLButtonElement>('[aria-label="mlx-node home"]')!;
+    const home = page.container.querySelector<HTMLButtonElement>('[aria-label="Portato home"]')!;
     expect(splitWhitespace(home.className)).toEqual(expect.arrayContaining(['font-heading', 'text-strong']));
     expect(button('Set up later').disabled).toBe(true);
     expect(home.disabled).toBe(true);

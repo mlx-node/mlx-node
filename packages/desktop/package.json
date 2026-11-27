@@ -2,7 +2,7 @@
   "name": "@mlx-node/desktop",
   "version": "0.0.21",
   "private": true,
-  "description": "mlx-node desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
+  "description": "Portato desktop app (Electron shell: tray, control panel window, supervised inference sidecar)",
   "homepage": "https://github.com/mlx-node/mlx-node",
   "bugs": {
     "url": "https://github.com/mlx-node/mlx-node/issues"
@@ -44,5 +44,5 @@
   "engines": {
     "node": ">= 22.19.0"
   },
-  "productName": "mlx-node"
+  "productName": "Portato"
 }

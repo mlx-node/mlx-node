@@ -4,6 +4,7 @@ import type { ModelAdmissionLane } from './model-work-coordinator.js';
 import { noteQueueRejection } from './queue-rejections.js';
 import type { PreDispatchAdmission } from './session-registry.js';
 import { notifyTurnEdge, type LiveTurn, type ModelIdentity } from './turn-trace.js';
+import { WORK, type LaneMark, type WorkLedger } from './work-ledger.js';
 
 export type SystemOneModel = DecisionModel | ExtractionModel;
 
@@ -22,6 +23,14 @@ export interface DecisionEntry {
   id: string;
   created: number;
   binding: Binding;
+}
+
+/** Injectable seams for {@link DecisionRegistry} (unit tests). */
+export interface DecisionRegistryDeps {
+  /** Lane time ledger each running decision credits; defaults to the process-wide {@link WORK}. */
+  work?: WorkLedger;
+  /** Clock of the ledger lanes. Default: `Date.now`. */
+  now?: () => number;
 }
 
 export interface ResidentDecisionBinding {
@@ -49,7 +58,15 @@ export class DecisionRegistry {
     PreDispatchAdmission,
     { binding: Binding; released: boolean; consumed: boolean }
   >();
-  constructor(private readonly maxQueueDepth?: number) {}
+  private readonly work: WorkLedger;
+  private readonly now: () => number;
+  constructor(
+    private readonly maxQueueDepth?: number,
+    deps: DecisionRegistryDeps = {},
+  ) {
+    this.work = deps.work ?? WORK;
+    this.now = deps.now ?? Date.now;
+  }
   private reserve(binding: Binding): PreDispatchAdmission {
     if (this.maxQueueDepth !== undefined && binding.pending >= this.maxQueueDepth + 1) {
       noteQueueRejection('decision');
@@ -165,6 +182,8 @@ export class DecisionRegistry {
     state.consumed = true;
     let released = false;
     let used = false;
+    const work = this.work;
+    const now = this.now;
     return {
       model: binding.model,
       canonicalName: binding.canonicalName,
@@ -186,6 +205,7 @@ export class DecisionRegistry {
         });
         let onAbort: (() => void) | undefined;
         let activeIncremented = false;
+        let lane: LaneMark | null = null;
         try {
           if (signal) {
             signal.throwIfAborted();
@@ -199,12 +219,14 @@ export class DecisionRegistry {
           binding.active += 1;
           binding.begun += 1;
           activeIncremented = true;
+          lane = work.open(now(), true);
           notifyTurnEdge();
           return await fn();
         } finally {
           if (activeIncremented) {
             binding.active = Math.max(0, binding.active - 1);
             binding.lastSettleAt = Date.now();
+            if (lane !== null) work.close(lane, null, now(), undefined, false);
             notifyTurnEdge();
           }
           if (onAbort) signal?.removeEventListener('abort', onAbort);

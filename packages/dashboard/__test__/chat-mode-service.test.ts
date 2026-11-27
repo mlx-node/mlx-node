@@ -17,7 +17,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
@@ -471,8 +471,48 @@ describe('the move to Bypass with open cards (D6)', () => {
         ['allowed', 'bypass'],
       ]);
       expect(page.marks().at(-1)).toMatchObject({ kind: 'allowed', mode: 'bypass', toolCallId: card.toolCallId });
+      expect(page.marks().at(-1)).not.toHaveProperty('child');
+      expect(logLines(fake, id).at(-1)).not.toHaveProperty('child');
       page.detach();
     });
+  }, 30_000);
+
+  it("Ask → Bypass with a helper's open card: its line and its mark name the helper's session", async () => {
+    const helperRun = (scenario: Json): void => {
+      const steps = (scenario.prompts as Json[])[0]!.steps as Json[];
+      steps[1] = { workflow: { ...(steps[1]!.workflow as Json), childSessionId: 'helper-session-1' } };
+    };
+    await withWork(
+      async (fake, project) => {
+        const svc = fake.service;
+        const { conversation } = await svc.create({ mode: 'work', text: 'go', cwd: project });
+        const id = conversation.id;
+        const page = new Page(svc, id);
+        await until(() => page.cards().length === 1, 5_000);
+        await svc.answer(id, page.cards()[0]!.id, { optionId: 'allow-once' });
+        await until(() => page.open().some((c) => c.kind === 'permission' && c.from !== undefined), 5_000);
+        const helper = page.open().find((c) => c.kind === 'permission' && c.from !== undefined)!;
+        expect(await svc.setPermissionMode(id, 'bypass', true)).toEqual({ mode: 'bypass' });
+        await until(() => page.closed(helper.id) !== undefined, 5_000);
+        expect(page.closed(helper.id)).toBe('answered');
+        expect(logLines(fake, id).filter((l) => l.kind === 'allowed')).toEqual([
+          {
+            kind: 'allowed',
+            at: expect.any(Number),
+            mode: 'bypass',
+            toolCallId: 'wf_1-call-1',
+            access: 'bash',
+            child: 'helper-session-1',
+          },
+        ]);
+        expect(page.marks().filter((m) => m.kind === 'allowed')).toMatchObject([
+          { mode: 'bypass', toolCallId: 'wf_1-call-1', child: 'helper-session-1' },
+        ]);
+        page.detach();
+      },
+      { mutate: helperRun },
+      'work-workflow-run',
+    );
   }, 30_000);
 
   it('Auto → Bypass with two open cards: both are allowed, one line each', async () => {
@@ -1056,6 +1096,7 @@ describe('the marks of a conversation', () => {
       resolvedPath: null,
       options: [],
       flags: [],
+      openedAt: n,
     });
     for (let n = 0; n < 2_500; n++) {
       conversation.permissionMark({
@@ -1068,7 +1109,16 @@ describe('the marks of a conversation', () => {
       });
     }
     const events: ConversationEvent[] = [];
-    conversation.attach((e) => events.push(e), { turn: null, interactions: [], compaction: null, runs: [] });
+    conversation.attach((e) => events.push(e), {
+      turn: null,
+      interactions: [],
+      compaction: null,
+      hookRun: null,
+      recap: null,
+      runs: [],
+      live: { helpers: [], agents: [], tasks: [], schedules: [], reports: [], stoppedByYou: [] },
+      commands: null,
+    });
     const sync = events[0];
     if (sync?.type !== 'sync') throw new Error('no sync');
     expect(sync.permissionMarks).toHaveLength(2_500);
@@ -1682,5 +1732,83 @@ describe('the mode picked on the New Work screen', () => {
       await svc.answer(made.conversation.id, page.cards()[0]!.id, { optionId: 'reject-once' });
       page.detach();
     });
+  }, 30_000);
+});
+
+describe('Work without a folder: the mode', () => {
+  const EDIT_OPTIONS = [
+    { optionId: 'allow-once', name: 'Yes', kind: 'allow_once' },
+    { optionId: 'reject-once', name: 'No', kind: 'reject_once' },
+  ];
+  const editStep = (path: string): Json => ({
+    permission: {
+      toolName: 'write',
+      kind: 'edit',
+      title: `Write ${path}`,
+      rawInput: { variant: 'Write', file_path: path, content: 'x\n' },
+      options: EDIT_OPTIONS,
+      output: 'wrote',
+    },
+  });
+
+  // Mutations: the slot's place left out of the claim (a pick raises any next conversation); a none pick read as a
+  // folder pick.
+  it('a none pick is claimed by a create with no folder only; a folder pick never by one', async () => {
+    await withWork(async (fake, project) => {
+      const svc = fake.service;
+      await svc.setDraftPermissionMode('d1', 'auto', true, null, null);
+      const a = await svc.create({ mode: 'work', text: 'printf', noFolder: true, draft: 'd1' });
+      await svc.setDraftPermissionMode('d2', 'auto', true, null, null);
+      const b = await svc.create({ mode: 'work', text: 'printf', cwd: project, draft: 'd2' });
+      await svc.setDraftPermissionMode('d3', 'auto', true, project, null);
+      const c = await svc.create({ mode: 'work', text: 'printf', noFolder: true, draft: 'd3' });
+      expect([a, b, c].map((made) => made.conversation.permissionMode)).toEqual(['auto', 'ask', 'ask']);
+      for (const made of [a, b, c]) await svc.cancel(made.conversation.id);
+    });
+  }, 30_000);
+
+  // Mutation: the hooks read checks a folder that does not exist yet → the confirm can never be pressed.
+  it('the hooks of no folder are read with no folder on disk', async () => {
+    await withWork(async (fake) => {
+      expect(await fake.service.workHooks(null)).toEqual({ userHooks: false });
+      expect(existsSync(join(fake.root, 'home', 'Portato'))).toBe(false);
+    });
+  });
+
+  // Mutation: Auto's folder set to the scratch root → an edit in another No folder conversation's folder runs.
+  it('Auto in a No folder conversation: an edit in its folder runs; one in a sibling folder asks', async () => {
+    await withWork(
+      async (fake) => {
+        const svc = fake.service;
+        mkdirSync(join(fake.root, 'home', 'Portato', 'other'), { recursive: true });
+        const { conversation } = await svc.create({ mode: 'work', text: 'ls', noFolder: true });
+        const id = conversation.id;
+        const page = new Page(svc, id);
+        await until(() => page.cards().length === 1, 5_000);
+        await svc.answer(id, page.cards()[0]!.id, { optionId: 'allow-once' });
+        await until(() => page.ends() === 1, 5_000);
+        expect(await svc.setPermissionMode(id, 'auto', true)).toEqual({ mode: 'auto' });
+        await svc.prompt(id, 'edit-inside');
+        await until(() => page.ends() === 2, 5_000);
+        expect([page.lastOutcome(), page.cards().length]).toEqual(['completed', 1]);
+        await svc.prompt(id, 'edit-sibling');
+        await until(() => page.cards().length === 2, 5_000);
+        expect((page.cards()[1] as PermissionInteraction).autoAsk).toBeDefined();
+        await svc.answer(id, page.cards()[1]!.id, { optionId: 'reject-once' });
+        await until(() => page.ends() === 3, 5_000);
+        page.detach();
+      },
+      {
+        mutate: (scenario) => {
+          SCRIPTS(scenario);
+          // The fake service's root holds the record file; the sibling is another folder of its ~/Portato.
+          const sibling = join(dirname(scenario.recordTo as string), 'home', 'Portato', 'other', 'x.md');
+          (scenario.prompts as Json[]).unshift(
+            { match: 'edit-inside', steps: [editStep('notes.md'), ...END] },
+            { match: 'edit-sibling', steps: [editStep(sibling), ...END] },
+          );
+        },
+      },
+    );
   }, 30_000);
 });

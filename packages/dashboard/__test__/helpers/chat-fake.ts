@@ -18,6 +18,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { AgentSessionsReader } from '../../src/agent-sessions/reader.js';
+import type { RunState } from '../../src/agent-sessions/run-state.js';
 import type { UpdateLine } from '../../src/agent-sessions/transcript.js';
 import {
   AgentHost,
@@ -25,6 +26,7 @@ import {
   type AgentHostListener,
   type AgentHostOptions,
   type HostTimings,
+  type McpClosed,
   type TurnResult,
 } from '../../src/chat/agent/agent-host.js';
 import type { InferenceEndpoint } from '../../src/chat/agent/endpoint.js';
@@ -37,9 +39,15 @@ import { ChatService, type ChatServiceOptions } from '../../src/chat/service.js'
 import type {
   AgentModeState,
   ChatMode,
+  CommandView,
   CompactionState,
+  CompactOutcome,
   ConversationNotice,
+  HookRunState,
   Interaction,
+  LiveActivity,
+  RecapEnd,
+  RecapState,
   RunView,
   TurnState,
 } from '../../src/chat/types.js';
@@ -64,16 +72,38 @@ export interface HostEvents {
   web: Array<{ sessionId: string; result: WebResult }>;
   models: Array<{ sessionId: string; modelId: string }>;
   notices: Array<{ sessionId: string; notice: ConversationNotice }>;
+  /** Each notice code the host cleared. */
+  cleared: Array<{ sessionId: string; code: ConversationNotice['code'] }>;
   /** Work: sessions that passed their guard after `session/new` or `session/load`. */
   ready: string[];
   /** Work: automatic continues written to the agent. */
   continues: Array<{ sessionId: string; n: number }>;
   /** Every update line kind, automatic continue, compaction start and end, turn end and cold, in arrival order. */
   timeline: string[];
-  /** Each compaction state change: the state, or null at its end. */
-  compactions: Array<{ sessionId: string; compaction: CompactionState | null }>;
+  /** Each compaction state change: the state, or null at its end (`end`: how a manual run ended). */
+  compactions: Array<{ sessionId: string; compaction: CompactionState | null; end?: CompactOutcome }>;
+  /** Each hook batch the agent waits on: its state at the start, then null at its end. */
+  hookRuns: Array<{ sessionId: string; hookRun: HookRunState | null }>;
+  /** Each recap wait: its start (the state), then null with how it ended. */
+  recaps: Array<{ sessionId: string; recap: RecapState | null; end?: RecapEnd }>;
   /** Work: each change of a session's live workflow runs (the whole list). */
   runs: Array<{ sessionId: string; runs: RunView[] }>;
+  /** Work: each run `state.json` the host read and sent on. */
+  runStates: Array<{ sessionId: string; state: RunState; fileTs: number }>;
+  /** Update lines and runs events, in the order the host sent them. */
+  order: Array<
+    { kind: 'update'; sessionId: string; line: UpdateLine } | { kind: 'runs'; sessionId: string; runs: RunView[] }
+  >;
+  /** Work: each live-facts event (helper progress), as the host sent it. */
+  activity: Array<{ sessionId: string; live: LiveActivity }>;
+  /** Each change of the commands a session may send, as the host sent it. */
+  commands: Array<{ sessionId: string; commands: CommandView[] | null }>;
+  /** Work: each MCP card that closed, with what its history line holds. */
+  mcp: Array<{ sessionId: string; closed: McpClosed }>;
+  /** Work: each "finished in the browser" of a page opened from a link card: the server's own name. */
+  mcpDone: Array<{ sessionId: string; server: string }>;
+  /** Each fork whose reply came after its soft deadline: the original and the copy. */
+  forks: Array<{ sessionId: string; copyId: string }>;
 }
 
 /** An endpoint file model that is its own base, as an MLX folder with no build words in its name. */
@@ -83,6 +113,8 @@ export function endpointModel(name: string, path: string): InferenceEndpoint['mo
 
 export interface FakeHostOptions {
   mode?: ChatMode;
+  /** Work: the folder of a session, as the sessions reader finds it. */
+  sessionDir?: (sessionId: string) => string | null;
   timings?: Partial<HostTimings>;
   /** The `models` of the endpoint file (default: one model). */
   endpointModels?: InferenceEndpoint['models'];
@@ -95,8 +127,12 @@ export interface FakeHostOptions {
   onModeAllowed?: AgentHostListener['onModeAllowed'];
   onModeMarked?: AgentHostListener['onModeMarked'];
   onModeWithdrawn?: AgentHostListener['onModeWithdrawn'];
+  /** Work: the never-allow rules, and what a rule deny tells the service. */
+  never?: AgentHostOptions['never'];
+  onRuleDenied?: AgentHostListener['onRuleDenied'];
   /** Added to the Work environment (`CDPATH`, …). */
   env?: Record<string, string>;
+  loginPath?: AgentHostOptions['loginPath'];
   spawn?: AgentHostOptions['spawn'];
   /** Work: the temp roots Auto covers beside the Work folder, and whose files are yours there. */
   tempRoots?: AgentHostOptions['tempRoots'];
@@ -202,11 +238,21 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     web: [],
     models: [],
     notices: [],
+    cleared: [],
     ready: [],
     continues: [],
     timeline: [],
     compactions: [],
+    hookRuns: [],
+    recaps: [],
     runs: [],
+    runStates: [],
+    order: [],
+    activity: [],
+    commands: [],
+    mcp: [],
+    mcpDone: [],
+    forks: [],
   };
   const mode = options.mode ?? 'chat';
   const host = new AgentHost({
@@ -232,20 +278,25 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
     username: 'tester',
     timings: { stopEofMs: 300, stopTermMs: 300, ...options.timings },
     ...(options.permission === undefined ? {} : { permission: options.permission }),
+    ...(options.never === undefined ? {} : { never: options.never }),
     ...(options.spawn === undefined ? {} : { spawn: options.spawn }),
+    ...(options.loginPath === undefined ? {} : { loginPath: options.loginPath }),
     tempRoots: options.tempRoots ?? [],
     ...(options.uid === undefined ? {} : { uid: options.uid }),
     ...(options.login === undefined ? {} : { login: options.login }),
     ...(options.now === undefined ? {} : { now: options.now }),
+    ...(options.sessionDir === undefined ? {} : { sessionDir: options.sessionDir }),
     listener: {
       onSessionReady: (sessionId) => events.ready.push(sessionId),
       ...(options.onModeAllowed === undefined ? {} : { onModeAllowed: options.onModeAllowed }),
       ...(options.onModeMarked === undefined ? {} : { onModeMarked: options.onModeMarked }),
       ...(options.onModeWithdrawn === undefined ? {} : { onModeWithdrawn: options.onModeWithdrawn }),
+      ...(options.onRuleDenied === undefined ? {} : { onRuleDenied: options.onRuleDenied }),
       onState: (s) => events.states.push(s),
       onUpdate: (sessionId, line) => {
         events.updates.push({ sessionId, line });
         events.timeline.push(String(line.update.sessionUpdate));
+        events.order.push({ kind: 'update', sessionId, line });
       },
       onAutoContinue: (sessionId, n) => {
         events.continues.push({ sessionId, n });
@@ -259,6 +310,8 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
       },
       onInteraction: (sessionId, interaction) => events.interactions.push({ sessionId, interaction }),
       onInteractionClosed: (sessionId, id, reason) => events.closed.push({ sessionId, id, reason }),
+      onMcpClosed: (sessionId, closed) => events.mcp.push({ sessionId, closed }),
+      onMcpDone: (sessionId, server) => events.mcpDone.push({ sessionId, server }),
       onCold: (ids) => {
         events.cold.push(ids);
         events.timeline.push('cold');
@@ -266,11 +319,27 @@ export async function fakeHost(name: string, options: FakeHostOptions = {}): Pro
       onWebResult: (sessionId, result) => events.web.push({ sessionId, result }),
       onModel: (sessionId, modelId) => events.models.push({ sessionId, modelId }),
       onNotice: (sessionId, notice) => events.notices.push({ sessionId, notice }),
-      onCompaction: (sessionId, compaction) => {
-        events.compactions.push({ sessionId, compaction });
+      onNoticeCleared: (sessionId, code) => events.cleared.push({ sessionId, code }),
+      onCompaction: (sessionId, compaction, end) => {
+        events.compactions.push({ sessionId, compaction, ...(end === undefined ? {} : { end }) });
         events.timeline.push(compaction === null ? 'compaction end' : 'compaction start');
       },
-      onRuns: (sessionId, runs) => events.runs.push({ sessionId, runs }),
+      onHookRun: (sessionId, hookRun) => {
+        events.hookRuns.push({ sessionId, hookRun });
+        events.timeline.push(hookRun === null ? 'hook end' : 'hook start');
+      },
+      onRecap: (sessionId, recap, end) => {
+        events.recaps.push({ sessionId, recap, ...(end === undefined ? {} : { end }) });
+        events.timeline.push(recap === null ? `recap ${end ?? ''}` : 'recap start');
+      },
+      onRuns: (sessionId, runs) => {
+        events.runs.push({ sessionId, runs });
+        events.order.push({ kind: 'runs', sessionId, runs });
+      },
+      onRunState: (sessionId, state, fileTs) => events.runStates.push({ sessionId, state, fileTs }),
+      onActivity: (sessionId, live) => events.activity.push({ sessionId, live }),
+      onCommands: (sessionId, commands) => events.commands.push({ sessionId, commands }),
+      onForkLanded: (sessionId, copyId) => events.forks.push({ sessionId, copyId }),
     },
   });
   const records = (): Json[] => {
@@ -340,6 +409,8 @@ export interface FakeServiceOptions {
   appEnds?: () => ChatServiceOptions['appEnds'];
   onBusyChange?: ChatServiceOptions['onBusyChange'];
   maxPicturesBase64?: ChatServiceOptions['maxPicturesBase64'];
+  /** The service's clock (default: `Date.now`). */
+  now?: () => number;
 }
 
 export interface FakeService {
@@ -425,7 +496,6 @@ export function fakeService(name: string, options: FakeServiceOptions = {}): Fak
       webServer: { command: process.execPath, script: join(root, 'no-server.js') },
       skillsDir: options.skillsDir,
       baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: userHome },
-      agentHome: join(root, 'agent-home'),
       workAgentHome: join(root, 'agent-home'),
       homeDir: userHome,
       ...(options.tempRoots === 'default' ? {} : { tempRoots: options.tempRoots ?? [] }),
@@ -439,6 +509,7 @@ export function fakeService(name: string, options: FakeServiceOptions = {}): Fak
       appEnds: options.appEnds?.(),
       onBusyChange: options.onBusyChange,
       maxPicturesBase64: options.maxPicturesBase64,
+      ...(options.now === undefined ? {} : { now: options.now }),
     });
   const records = (): Json[] => {
     try {

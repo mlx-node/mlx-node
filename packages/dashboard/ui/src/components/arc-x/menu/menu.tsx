@@ -186,6 +186,13 @@ export function Menu({
             const first = panel.current === null ? undefined : rowsOf(panel.current)[0];
             first?.focus();
           }}
+          onCloseAutoFocus={(event) => {
+            // Runs after the exit animation: focus a row's action moved elsewhere stays, not pulled back to the trigger.
+            const active = document.activeElement;
+            if (active !== null && active !== document.body && panel.current?.contains(active) !== true) {
+              event.preventDefault();
+            }
+          }}
           onKeyDown={onKeyDown}
         >
           {children}

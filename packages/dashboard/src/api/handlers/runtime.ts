@@ -49,6 +49,16 @@ export type SchedDelta = Record<SchedCounter, number> & {
   occupancy: Array<{ occupancy: number; steps: number }>;
 };
 
+/** `loading` is wall ms with a load in flight; `waiting` is model busy plus lane wait. */
+export interface RuntimePhaseMs {
+  loading: number;
+  waiting: number;
+  prepare: number;
+  prefill: number;
+  decode: number;
+  running: number;
+}
+
 export interface RuntimeSeries {
   range: { from: number; to: number };
   bucketMs: number;
@@ -69,6 +79,14 @@ export interface RuntimeSeries {
     cancelledTurns: number;
     outTokens: number;
     rejected: number;
+    /** Lane-ms per engine state, summed over the bucket's samples; a sample that predates them adds 0. */
+    phaseMs: RuntimePhaseMs;
+    /** Output tokens after each lane's first, and the ms with at least one lane decoding: the output rate pair. */
+    rateOutTokens: number;
+    rateOutMs: number;
+    /** Tokens of prefills of 256+ tokens and their lane prefill ms: the prefill speed pair. */
+    ratePrefillTokens: number;
+    ratePrefillMs: number;
   }>;
   procs: Array<{
     procKey: string;
@@ -198,13 +216,21 @@ export function handleRuntimeSeries(ctx: WorkerApiContext, req: ApiRequest): Run
         `SELECT t, SUM(n) AS samples, SUM(a) AS memActiveAvg, SUM(m) AS memActiveMax, SUM(pk) AS memPeakMax,
                 SUM(c) AS memCacheAvg, SUM(r) AS rssMax, SUM(ifa) AS inFlightAvg, SUM(ifm) AS inFlightMax,
                 SUM(q) AS queuedMax, SUM(b) AS busyMs, SUM(ok) AS okTurns, SUM(er) AS errorTurns,
-                SUM(ca) AS cancelledTurns, SUM(tok) AS outTokens, SUM(rej) AS rejected
+                SUM(ca) AS cancelledTurns, SUM(tok) AS outTokens, SUM(rej) AS rejected,
+                SUM(lo) AS loadingMs, SUM(wa) AS waitingMs, SUM(pr) AS prepareMs, SUM(pf) AS prefillMs,
+                SUM(de) AS decodeMs, SUM(ru) AS runningMs, SUM(rot) AS rateOutTokens, SUM(rom) AS rateOutMs,
+                SUM(rpt) AS ratePrefillTokens, SUM(rpm) AS ratePrefillMs
          FROM (SELECT ${t} AS t, proc_key, COUNT(*) AS n,
                       AVG(mem_active) AS a, MAX(mem_active) AS m, MAX(mem_peak) AS pk, AVG(mem_cache) AS c,
                       MAX(rss) AS r, AVG(in_flight) AS ifa, MAX(in_flight) AS ifm, MAX(queued) AS q,
                       SUM(COALESCE(busy_ms, 0)) AS b, SUM(COALESCE(d_ok, 0)) AS ok, SUM(COALESCE(d_error, 0)) AS er,
                       SUM(COALESCE(d_cancelled, 0)) AS ca, SUM(COALESCE(d_out_tokens, 0)) AS tok,
-                      SUM(COALESCE(d_rejected, 0)) AS rej
+                      SUM(COALESCE(d_rejected, 0)) AS rej,
+                      SUM(COALESCE(loading_ms, 0)) AS lo, SUM(COALESCE(waiting_ms, 0)) AS wa,
+                      SUM(COALESCE(prepare_ms, 0)) AS pr, SUM(COALESCE(prefill_ms, 0)) AS pf,
+                      SUM(COALESCE(decode_ms, 0)) AS de, SUM(COALESCE(running_ms, 0)) AS ru,
+                      SUM(COALESCE(rate_out_tokens, 0)) AS rot, SUM(COALESCE(rate_out_ms, 0)) AS rom,
+                      SUM(COALESCE(rate_prefill_tokens, 0)) AS rpt, SUM(COALESCE(rate_prefill_ms, 0)) AS rpm
                FROM runtime_samples WHERE ts >= ? AND ts <= ? GROUP BY t, proc_key)
          GROUP BY t ORDER BY t`,
       )
@@ -226,6 +252,18 @@ export function handleRuntimeSeries(ctx: WorkerApiContext, req: ApiRequest): Run
     cancelledTurns: toInt(row.cancelledTurns),
     outTokens: toInt(row.outTokens),
     rejected: toInt(row.rejected),
+    phaseMs: {
+      loading: toInt(row.loadingMs),
+      waiting: toInt(row.waitingMs),
+      prepare: toInt(row.prepareMs),
+      prefill: toInt(row.prefillMs),
+      decode: toInt(row.decodeMs),
+      running: toInt(row.runningMs),
+    },
+    rateOutTokens: toInt(row.rateOutTokens),
+    rateOutMs: toInt(row.rateOutMs),
+    ratePrefillTokens: toInt(row.ratePrefillTokens),
+    ratePrefillMs: toInt(row.ratePrefillMs),
   }));
 
   const procs = (

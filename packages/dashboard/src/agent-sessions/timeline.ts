@@ -24,6 +24,7 @@ export const SPAWN_TOOL_NAMES: ReadonlySet<string> = new Set(['task', 'Task', 's
 
 /** A transcript entry without its text: kinds, times, tool names, statuses and usage only. */
 export type DigestEntry =
+  /** `interjection`: a user chunk inside a running turn (a steer or a note on a denied call): it starts no turn. */
   | { kind: 'user'; ts: number; interjection: boolean }
   /** A hidden prompt: a background event woke the agent. */
   | { kind: 'wake'; ts: number }
@@ -100,7 +101,7 @@ export function digestUpdates(parsed: ParsedUpdates): LaneSource {
   for (const e of parsed.transcript) {
     switch (e.kind) {
       case 'user':
-        entries.push({ kind: 'user', ts: e.ts, interjection: e.interjection === true });
+        entries.push({ kind: 'user', ts: e.ts, interjection: e.interjection === true || e.note === true });
         break;
       case 'wake':
         entries.push({ kind: 'wake', ts: e.ts });

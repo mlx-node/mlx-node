@@ -7,7 +7,7 @@
 import { SessionWriteError } from '../agent-sessions/writes.js';
 import { ApiError, type ApiErrorCode } from '../api/errors.js';
 import { AgentHostError, FAILURE_MESSAGES, InteractionError } from './agent/agent-host.js';
-import type { ChatFailureCode } from './types.js';
+import type { ChatFailureCode, WorkGitErrorCode } from './types.js';
 
 export type GuardedRoute = 'chat' | 'provider-key' | 'provider-validate' | 'provider-selection';
 
@@ -29,6 +29,7 @@ const CODE_OF_FAILURE: Readonly<Record<ChatFailureCode, ApiErrorCode>> = {
   'agent-crashed': 'E_UNAVAILABLE',
   'agent-failed': 'E_UNAVAILABLE',
   'agent-slow': 'E_UNAVAILABLE',
+  'load-slow': 'E_UNAVAILABLE',
   'keychain-unavailable': 'E_UNAVAILABLE',
   'skill-bundle-corrupt': 'E_UNAVAILABLE',
   'model-load-failed': 'E_UNAVAILABLE',
@@ -37,6 +38,7 @@ const CODE_OF_FAILURE: Readonly<Record<ChatFailureCode, ApiErrorCode>> = {
   'cwd-mismatch': 'E_CONFLICT',
   'conversation-busy': 'E_CONFLICT',
   'engine-busy': 'E_CONFLICT',
+  'engine-lost': 'E_CONFLICT',
   'cwd-invalid': 'E_BAD_REQUEST',
   'slash-text': 'E_BAD_REQUEST',
   'attachment-refused': 'E_BAD_REQUEST',
@@ -46,6 +48,31 @@ const CODE_OF_FAILURE: Readonly<Record<ChatFailureCode, ApiErrorCode>> = {
 /** The typed route failure of a code: its API code, its fixed sentence, and the code as `reason`. */
 export function chatRouteError(code: ChatFailureCode): ApiError {
   return new ApiError(CODE_OF_FAILURE[code], FAILURE_MESSAGES[code], code);
+}
+
+const WORK_GIT_ERRORS: Readonly<Record<WorkGitErrorCode, { code: ApiErrorCode; message: string }>> = {
+  'branch-unknown': { code: 'E_NOT_FOUND', message: 'That branch is not a local branch of this folder.' },
+  'folder-busy': { code: 'E_CONFLICT', message: 'A Work conversation is running in this folder.' },
+  'git-unavailable': { code: 'E_CONFLICT', message: 'Git cannot read this folder now.' },
+  dirty: {
+    code: 'E_CONFLICT',
+    message: 'The folder has uncommitted changes. Commit or stash them to change the branch.',
+  },
+  'status-unknown': {
+    code: 'E_CONFLICT',
+    message: 'Git could not check the folder for uncommitted changes, so the branch cannot change now.',
+  },
+};
+
+/** A refused branch switch: its API code, its fixed sentence, and the code as `reason`. */
+export function workGitError(code: WorkGitErrorCode): ApiError {
+  const { code: api, message } = WORK_GIT_ERRORS[code];
+  return new ApiError(api, message, code);
+}
+
+/** Work without a folder: the app could not make the conversation's own folder under the scratch root. */
+export function folderNotMadeError(): ApiError {
+  return new ApiError('E_CONFLICT', 'The app could not make a folder for this conversation.', 'folder-not-made');
 }
 
 const SESSION_WRITE_MESSAGES: Readonly<Record<SessionWriteError['kind'], string>> = {

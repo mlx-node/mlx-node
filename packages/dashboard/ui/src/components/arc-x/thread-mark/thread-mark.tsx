@@ -10,8 +10,8 @@ export interface ThreadMarkProps {
   icon: ReactNode;
   /** "Mode: Auto". */
   label: string;
-  /** One short sentence; it never wraps. */
-  fact: string;
+  /** One short sentence; it never wraps. None: the label says it all. */
+  fact?: string;
   /** The second line, centered under the rule. */
   detail?: ReactNode;
   tone?: 'neutral' | 'warning' | 'danger';
@@ -40,10 +40,14 @@ export function ThreadMark(props: ThreadMarkProps): ReactElement {
           {props.icon}
         </span>
         <span className={styles.label}>{props.label}</span>
-        <span className={styles.srOnly}>. </span>
-        <span className={styles.fact} title={props.fact}>
-          {props.fact}
-        </span>
+        {props.fact !== undefined && props.fact !== '' ? (
+          <>
+            <span className={styles.srOnly}>. </span>
+            <span className={styles.fact} title={props.fact}>
+              {props.fact}
+            </span>
+          </>
+        ) : null}
         {timed ? (
           <>
             <span className={styles.srOnly}> </span>

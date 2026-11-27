@@ -195,6 +195,19 @@ export const runtimeSamples = sqliteTable('runtime_samples', {
   dCancelled: integer('d_cancelled'),
   dOutTokens: integer('d_out_tokens'),
   dRejected: integer('d_rejected'),
+  /** Lane-ms per engine state since the previous sample; NULL in a record that predates them. `loading_ms` is wall ms. */
+  loadingMs: integer('loading_ms'),
+  waitingMs: integer('waiting_ms'),
+  prepareMs: integer('prepare_ms'),
+  prefillMs: integer('prefill_ms'),
+  decodeMs: integer('decode_ms'),
+  runningMs: integer('running_ms'),
+  /** Output tokens after each lane's first, and the ms with at least one lane decoding, since the previous sample. */
+  rateOutTokens: integer('rate_out_tokens'),
+  rateOutMs: integer('rate_out_ms'),
+  /** Tokens of prefills of 256+ tokens and their lane prefill ms, since the previous sample. */
+  ratePrefillTokens: integer('rate_prefill_tokens'),
+  ratePrefillMs: integer('rate_prefill_ms'),
   sourceFile: text('source_file').notNull(),
 });
 

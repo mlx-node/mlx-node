@@ -9,9 +9,9 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { parseUpdates } from '../src/agent-sessions/transcript.js';
 import { Transcript, type TranscriptProps } from '../ui/src/components/transcript.js';
-import { CHAT } from '../ui/src/lib/chat-strings.js';
+import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { formatBytes, formatClock } from '../ui/src/lib/format.js';
-import { LIVE_FRESH_MS, useFreshness } from '../ui/src/lib/sessions.js';
+import { LIVE_FRESH_MS, useFreshness, WAKE_ENDED } from '../ui/src/lib/sessions.js';
 import type { TranscriptEntry, TurnMetric } from '../ui/src/lib/types.js';
 import { allByRole, byRole, waitFor } from './render.js';
 
@@ -142,23 +142,23 @@ describe('Transcript', () => {
     expect(text).toContain('Turn ended · end_turn · 4.00 s');
   });
 
-  it('counts the tokens of a subagent run in agreement with the number', () => {
+  // Mutation: read a subagent's finish line as its total use → "tokens used" for a context size.
+  it('a stored subagent reads its context at its end, not a total; one with no end reads not finished', () => {
     const { entries, turns } = closedTurns(1);
-    const sub = (childId: string, tokens: number): TranscriptEntry => ({
+    const sub = (childId: string, tokens: number, ended: boolean): TranscriptEntry => ({
       kind: 'subagent',
       ts: T0 + 60_500,
       childId,
       type: 'explore',
       description: `Run ${childId}`,
-      status: 'completed',
-      tokens,
+      ...(ended ? { status: 'completed', tokens, durationMs: 4_000, endTs: T0 + 64_500 } : {}),
     });
-    entries.splice(2, 0, sub('one', 1), sub('two', 2));
+    entries.splice(2, 0, sub('one', 1_200, true), sub('two', 2, false));
     const container = mount(transcript({ entries, turns }));
     const text = container.textContent ?? '';
-    expect(text).toContain('1 token');
-    expect(text).not.toContain('1 tokens');
-    expect(text).toContain('2 tokens');
+    expect(text).toContain(`${CHAT.agent.state.done}4.00 s · ${fill(CHAT.agent.facts.contextAtEnd, { n: '1,200' })}`);
+    expect(text).not.toContain('tokens used');
+    expect(text).toContain(`Run two${CHAT.agent.state.unfinished}`);
   });
 
   it('opens every group when there are three or fewer', () => {
@@ -358,6 +358,51 @@ function Probe({ data }: { data: object | undefined }): ReactElement {
   return createElement('output', null, `${String(fresh)} ${String(arrivedAt)}`);
 }
 
+describe('Transcript: wake rows (H-b)', () => {
+  // Mutation: return the old 'Woken by a background task' for a task wake → the command's name is missing.
+  it('each wake turn is titled by what ended, from its stored entry', () => {
+    const cmd = (id: string, label: string) => ({ id, kind: 'command' as const, label });
+    const wakes: TranscriptEntry[] = [
+      { kind: 'wake', ts: T0, cause: 'task', task: cmd('t1', 'npm test'), text: '' },
+      {
+        kind: 'wake',
+        ts: T0 + 60_000,
+        cause: 'task',
+        task: { id: 't2', kind: 'monitor', label: 'Watch the build log' },
+        text: '',
+      },
+      {
+        kind: 'wake',
+        ts: T0 + 120_000,
+        cause: 'notifications',
+        tasks: [cmd('t3', 'npm test'), cmd('t4', 'cargo build')],
+        text: '',
+      },
+      {
+        kind: 'wake',
+        ts: T0 + 180_000,
+        cause: 'subagent',
+        subagent: { childId: 'c1', description: 'Find the flaky test' },
+        text: '',
+      },
+      { kind: 'wake', ts: T0 + 240_000, cause: 'task', text: '' },
+    ];
+    const entries = wakes.flatMap((wake) => [
+      wake,
+      { kind: 'assistant' as const, ts: wake.ts + 1000, text: 'Looked.', endTs: wake.ts + 2000 },
+      { kind: 'turn-end' as const, ts: wake.ts + 3000, stopReason: 'end_turn' },
+    ]);
+    const container = mount(transcript({ entries, turns: wakes.map((w) => metric(w.ts)) }));
+    const text = container.textContent ?? '';
+    const named = (what: string, labels: string) => fill(WAKE_ENDED.named, { what, labels });
+    expect(text).toContain(named(WAKE_ENDED.command, 'npm test'));
+    expect(text).toContain(named(WAKE_ENDED.monitor, 'Watch the build log'));
+    expect(text).toContain(named(fill(WAKE_ENDED.commands, { n: 2 }), 'npm test, cargo build'));
+    expect(text).toContain('Woken by subagent: Find the flaky test');
+    expect(text).toContain('Woken by a background task');
+  });
+});
+
 describe('Transcript: files on a message', () => {
   it('a message sent with files shows read-only chips; one with only a picture is not an empty row', () => {
     const { entries, turns } = closedTurns(2);
@@ -404,6 +449,67 @@ describe('Transcript: files on a message', () => {
     typeInto(input, 'BUDGET-NOTES');
     await waitFor(() => (container.textContent ?? '').includes('1 of 6 turns match'));
     expect(container.textContent).toContain('Answer body 2');
+  });
+});
+
+describe('Transcript: hook results (#11)', () => {
+  const RM = '`run_terminal_command` blocked by global/no-rm: deleting build output is not allowed here';
+  const withHooks = (): { entries: TranscriptEntry[]; turns: TurnMetric[] } => {
+    const { entries, turns } = closedTurns(3);
+    const ts = T0 + 60_000;
+    entries.splice(
+      1,
+      1,
+      {
+        kind: 'tool',
+        ts: ts + 500,
+        id: 'c1',
+        name: 'run_terminal_command',
+        title: 'rm -rf build',
+        status: 'failed',
+        output: 'Hook denied: no',
+        blocked: RM,
+      },
+      {
+        kind: 'notice',
+        ts: ts + 600,
+        code: 'hook',
+        event: 'stop',
+        hook: 'global/lint',
+        detail: 'eslint: command not found',
+        times: 12,
+        lastTs: ts + 900,
+      },
+    );
+    entries.splice(7, 0, { kind: 'notice', ts: T0 + 120_600, code: 'hook-note', text: 'Remember the tests.' });
+    return { entries, turns };
+  };
+
+  it('the same rows as the thread: a failed hook with its count, a note, and a blocked call with the words', () => {
+    const container = mount(transcript(withHooks()));
+    const hook = container.querySelector('[data-notice-row="hook"]');
+    expect(hook?.textContent).toContain(`global/lint · ${CHAT.hook.when.stop}`);
+    expect(hook?.textContent).toContain('12 times');
+    const labels = [...container.querySelectorAll('button[aria-expanded]')].map((b) => b.getAttribute('aria-label'));
+    expect(labels.find((l) => l?.startsWith('run_terminal_command'))).toContain(CHAT.hook.blockedRow);
+    expect(container.textContent).toContain(RM);
+    expect(container.textContent).not.toContain('Hook denied');
+  });
+
+  it('find matches a hook by its name or error, a note by its words, a call by the blocked words', async () => {
+    const container = mount(transcript(withHooks()));
+    const input = container.querySelector<HTMLInputElement>('input[type="search"]')!;
+    for (const [needle, turn] of [
+      ['NO-RM', 1],
+      ['eslint', 1],
+      ['remember the', 2],
+    ] as const) {
+      typeInto(input, '');
+      await waitFor(() => !(container.textContent ?? '').includes('turns match'));
+      typeInto(input, needle);
+      await waitFor(() => (container.textContent ?? '').includes('1 of 3 turns match'));
+      for (const n of [1, 2, 3]) expect((container.textContent ?? '').includes(`Prompt number ${n}`)).toBe(n === turn);
+    }
   });
 });
 

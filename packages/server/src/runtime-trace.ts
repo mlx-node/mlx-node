@@ -13,6 +13,9 @@ import { join } from 'node:path';
 
 import { resolveMlxNodeHome } from './host/paths.js';
 import { metricsEnvDisabled, type ExpertResidency } from './metrics-trace.js';
+import type { WorkMs } from './work-ledger.js';
+
+export type { WorkMs };
 
 export type HostKind = 'serve' | 'launch' | 'desktop' | 'embedded';
 export const HOST_KINDS: readonly HostKind[] = ['serve', 'launch', 'desktop', 'embedded'];
@@ -87,6 +90,19 @@ export interface RuntimeSampleRecord extends RuntimeBase {
   dropped?: number;
   /** GPU pipelines created while serving since the process started (cumulative); absent while the counter is off. */
   pipelinesCreatedWhileServing?: number;
+  /** Lane-ms per state since the previous sample (`work.ms` of the live file); `loadingMs` is wall ms. */
+  loadingMs?: number;
+  waitingMs?: number;
+  prepareMs?: number;
+  prefillMs?: number;
+  decodeMs?: number;
+  runningMs?: number;
+  /** Output tokens after each lane's first, and the ms with at least one lane decoding, since the previous sample. */
+  rateOutTokens?: number;
+  rateOutMs?: number;
+  /** Rated prefill tokens (256+ token prefills) and their lane prefill ms, since the previous sample. */
+  ratePrefillTokens?: number;
+  ratePrefillMs?: number;
 }
 
 /** One idle snapshot of a model's scheduler. Counters are cumulative for the model's lifetime. */
@@ -217,6 +233,10 @@ export interface RuntimeLiveTurn {
   slotMs: number | null;
   /** Time spent preparing the prompt before its prefill, rounded to ms; null before pickup or when not reported. */
   prepareMs: number | null;
+  /** Prefill start to the first token (or to now), rounded to ms; null before the prefill. */
+  prefillElapsedMs: number | null;
+  /** Time since the first token, rounded to ms; null before it. */
+  decodeElapsedMs: number | null;
   promptTokens: number | null;
   cachedTokens: number | null;
   prefillTotal: number | null;
@@ -237,7 +257,7 @@ export interface RuntimeLiveLoad {
 
 /** `live-<pid>.json`: replaced atomically (tmp + rename). */
 export interface RuntimeLiveFile {
-  v: 2;
+  v: 3;
   pid: number;
   startedAt: number;
   ts: number;
@@ -254,8 +274,14 @@ export interface RuntimeLiveFile {
   stateCache: { dir: string | null; limitBytes: number | null };
   health: RuntimeHealth;
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
-  /** Output tokens per second across all in-flight turns since the previous write; null when idle. */
-  decodeTps: number | null;
+  /** Lane-ms per state since the process started, rounded; `loading` is wall ms with a load in flight. */
+  work: { ms: WorkMs };
+  /**
+   * Over the last `windowMs`: output tokens per second while at least one lane decodes (all lanes, each lane's first
+   * token left out), and prefill tokens per second of lane prefill time (prefills of 256+ tokens, cached prefix not
+   * counted). Null when the window holds no such time.
+   */
+  rates: { windowMs: number; outputTps: number | null; prefillTps: number | null };
   /** Loads in flight, oldest first; empty when idle. */
   loading: RuntimeLiveLoad[];
   counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };

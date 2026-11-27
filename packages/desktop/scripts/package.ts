@@ -1,5 +1,5 @@
 /**
- * Build `packages/desktop/out/mlx-node-darwin-arm64/mlx-node.app`.
+ * Build `packages/desktop/out/Portato-darwin-arm64/Portato.app`.
  *
  *   yarn workspace @mlx-node/desktop package                       unsigned, for local runs
  *   yarn workspace @mlx-node/desktop package --sign                Developer ID + hardened runtime
@@ -21,6 +21,7 @@ import { fileURLToPath } from 'node:url';
 
 import { packager } from '@electron/packager';
 
+import { APP_NAME } from '../src/app-name.js';
 import { maxOsVersion, parseMinOs } from './min-os.js';
 import {
   assertDarwinAppRuntimeAssets,
@@ -52,7 +53,6 @@ const STAGE_APP = join(STAGE, 'app');
  */
 const RUNTIME_ROOTS = ['@mlx-node/server', '@mlx-node/dashboard', '@mlx-node/cli', 'electron-updater'];
 const BUNDLE_ID = 'ai.mlxnode.desktop';
-const PRODUCT_NAME = 'mlx-node';
 const RESULT_FILE = join(OUT, 'package-result.json');
 
 const sign = process.argv.includes('--sign');
@@ -171,6 +171,9 @@ for (const addon of stagedAddons) {
   }
   if (!needsDylibIdRewrite(parseDylibIds(output))) continue;
   run('install_name_tool', ['-id', `@rpath/${basename(addon)}`, addon]);
+  // keyring ships a Developer ID signature that the rewrite breaks, and the kernel
+  // SIGKILLs any process that loads it. An unsigned build has no later signing pass.
+  if (!sign) run('codesign', ['--force', '--sign', '-', addon]);
   rewrittenAddons += 1;
 }
 console.log(`rewrote LC_ID_DYLIB on ${rewrittenAddons} of ${stagedAddons.length} staged native addon(s)`);
@@ -222,11 +225,11 @@ const [outDir] = await packager({
   darwinDarkModeSupport: true,
 });
 
-// packager returns the PLATFORM directory (`out/mlx-node-darwin-arm64`), not the
+// packager returns the PLATFORM directory (`out/Portato-darwin-arm64`), not the
 // bundle inside it. Treating the return value as the .app puts every later path
 // one level too high, and the first symptom is an ENOENT on a file that is
 // actually present.
-const appPath = join(outDir, `${PRODUCT_NAME}.app`);
+const appPath = join(outDir, `${APP_NAME}.app`);
 
 // Asserted HERE, at the one place that knows how the path was derived. Without it
 // a packager layout change surfaces three steps later as an ENOENT on some file
@@ -256,7 +259,7 @@ console.log(`addon will load from: ${bundledAddonPath(resources)}`);
 // signature invalidates it.
 const minOsProbes = [
   bundledAddonPath(resources),
-  join(appPath, 'Contents', 'MacOS', PRODUCT_NAME),
+  join(appPath, 'Contents', 'MacOS', APP_NAME),
   join(appPath, 'Contents', 'Frameworks', 'Electron Framework.framework', 'Versions', 'A', 'Electron Framework'),
 ].filter((f) => existsSync(f));
 const floors = minOsProbes
@@ -288,14 +291,14 @@ run('plutil', [
   '-replace',
   'NSMicrophoneUsageDescription',
   '-string',
-  'mlx-node uses your microphone to transcribe speech locally on this Mac.',
+  `${APP_NAME} uses your microphone to transcribe speech locally on this Mac.`,
   join(appPath, 'Contents', 'Info.plist'),
 ]);
 run('plutil', [
   '-replace',
   'NSAudioCaptureUsageDescription',
   '-string',
-  'mlx-node captures app and system audio to transcribe meetings locally on this Mac.',
+  `${APP_NAME} captures app and system audio to transcribe meetings locally on this Mac.`,
   join(appPath, 'Contents', 'Info.plist'),
 ]);
 
@@ -359,7 +362,7 @@ rmSync(STAGE, { recursive: true, force: true });
 await verifyBundledCli(appPath);
 
 // One canonical path for everything downstream. The release workflow used to
-// spell `out/mlx-node.app` in four places; packager puts the bundle inside a
+// spell `out/Portato.app` in four places; packager puts the bundle inside a
 // PLATFORM directory, so all four were wrong and every step after packaging
 // failed. Consumers read this file rather than guessing the layout again.
 writeFileSync(
@@ -370,7 +373,7 @@ writeFileSync(
       version: appVersion,
       minimumSystemVersion,
       bundleId: BUNDLE_ID,
-      productName: PRODUCT_NAME,
+      productName: APP_NAME,
       signed: sign,
     },
     null,

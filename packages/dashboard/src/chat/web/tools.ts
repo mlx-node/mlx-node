@@ -10,6 +10,7 @@ import { deepseekFetch, deepseekSearch } from './adapters/deepseek.js';
 import { exaFetch, exaSearch } from './adapters/exa.js';
 import { firecrawlFetch } from './adapters/firecrawl.js';
 import { type AdapterContext, PROVIDER_ORIGINS, type SearchArgs } from './http.js';
+import { ledgerAllows, readLedgerFile } from './ledger-file.js';
 import { redactKeys } from './normalize.js';
 import { formatErrorText, type WebFetchProvider, type WebSearchProvider } from './result-text.js';
 import { fetchAllowed, forwardedAddress } from './url-policy.js';
@@ -59,12 +60,14 @@ export interface WebConfig {
   searchKey: string;
   fetchProvider: WebFetchProvider | 'none';
   fetchKey: string;
+  /** The session's address ledger file, read at every `web_fetch`; '' allows no address. */
+  ledgerFile: string;
 }
 
 const SEARCH_IDS: readonly string[] = ['exa', 'deepseek', 'brave'];
 const FETCH_IDS: readonly string[] = ['exa', 'deepseek', 'brave', 'firecrawl'];
 
-/** The four `MLX_WEB_*` variables; an unknown provider reads as `none`. */
+/** The five `MLX_WEB_*` variables; an unknown provider reads as `none`. */
 export function readWebConfig(env: NodeJS.ProcessEnv): WebConfig {
   const search = env.MLX_WEB_SEARCH_PROVIDER ?? '';
   const fetch = env.MLX_WEB_FETCH_PROVIDER ?? '';
@@ -73,6 +76,7 @@ export function readWebConfig(env: NodeJS.ProcessEnv): WebConfig {
     searchKey: env.MLX_WEB_SEARCH_KEY ?? '',
     fetchProvider: FETCH_IDS.includes(fetch) ? (fetch as WebFetchProvider) : 'none',
     fetchKey: env.MLX_WEB_FETCH_KEY ?? '',
+    ledgerFile: env.MLX_WEB_LEDGER ?? '',
   };
 }
 
@@ -195,6 +199,7 @@ export class WebTools {
     if (parsed === null) return formatErrorText('bad-request', provider);
     if (provider === 'none' || this.config.fetchKey === '') return notConfigured();
     if (!fetchAllowed(parsed.url)) return formatErrorText('blocked', provider);
+    if (!ledgerAllows(readLedgerFile(this.config.ledgerFile), parsed.url)) return formatErrorText('blocked', provider);
     const ctx = this.context(provider, this.config.fetchKey);
     return this.run(provider, () => FETCH[provider](parsed.url, ctx));
   }

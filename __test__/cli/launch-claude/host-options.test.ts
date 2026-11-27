@@ -58,6 +58,14 @@ describe('launchClaudeHostOptions', () => {
     expect(launchClaudeHostOptions({}).hostKind).toBe('launch');
   });
 
+  // Claude Code is not an agent host: its requests map as they always did.
+  it('sets none of the agent hosts thinking options, the family levels included', () => {
+    const opts = launchClaudeHostOptions({ port: 8080, model: 'q' });
+    for (const key of ['thinkingTokenBudget', 'thinkingCycleGuard', 'thinkingEndText', 'thinkingLevels']) {
+      expect(key in opts, key).toBe(false);
+    }
+  });
+
   it('forwards the per-launch token onto the host', () => {
     // Dropping it here is invisible: `claude` still gets its token and still
     // works, because a host with no `authToken` accepts everyone. The server is

@@ -5,8 +5,8 @@ type Raised = 'auto' | 'bypass';
 interface Slot {
   draft: string;
   mode: Raised;
-  /** The folder `checkWorkFolder` returned when the mode was picked. */
-  cwd: string;
+  /** The folder `checkWorkFolder` returned when the mode was picked; null: no folder, which only a `noFolder` create claims. */
+  cwd: string | null;
 }
 
 /** The mode picked on the New Work screen before a conversation exists. One at a time; never on disk. */
@@ -29,7 +29,7 @@ export class PermissionDraft {
   }
 
   /** Replaces whatever the slot held. */
-  set(draft: string, mode: Raised, cwd: string): void {
+  set(draft: string, mode: Raised, cwd: string | null): void {
     this.slot = { draft, mode, cwd };
   }
 
@@ -41,8 +41,11 @@ export class PermissionDraft {
     else slot.mode = target;
   }
 
-  /** The pick of this draft for the conversation just made in `cwd`; the slot empties. Null when there is none. */
-  claim(draft: string | undefined, cwd: string, conversation: string): Raised | null {
+  /**
+   * The pick of this draft for the conversation just made in `cwd` (null: made without a folder); the slot empties.
+   * Null when there is none.
+   */
+  claim(draft: string | undefined, cwd: string | null, conversation: string): Raised | null {
     if (draft === undefined) return null;
     this.epoch += 1;
     const slot = this.slot;

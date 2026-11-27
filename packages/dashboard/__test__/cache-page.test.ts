@@ -119,7 +119,7 @@ describe('Cache page disk cache line', () => {
     });
     const line = await pushLive(page, two, 'on');
     expect(line?.textContent).toBe(
-      `Disk cache:On(desktop engine, pid 4242)·Per turn: up to the whole prompt, 10.0 s cap·${turns}`,
+      `Disk cache:On(Portato engine, pid 4242)·Per turn: up to the whole prompt, 10.0 s cap·${turns}`,
     );
   });
 

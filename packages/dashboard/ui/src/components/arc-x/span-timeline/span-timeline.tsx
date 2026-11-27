@@ -47,7 +47,7 @@ export interface TimelineSpan {
   detail?: ReadonlyArray<{ label: string; value: string }>;
 }
 
-/** e.g. "First token". */
+/** A point in time on the timeline, e.g. the first token. */
 export interface TimelineMarker {
   id: string;
   rowId?: string;

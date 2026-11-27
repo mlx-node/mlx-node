@@ -4,6 +4,7 @@ import type {
   SessionDetailResponse,
   SessionListQuery,
   SessionListResponse,
+  SessionPictureResponse,
   SessionRow,
 } from '../../agent-sessions/types.js';
 import {
@@ -89,6 +90,38 @@ export function handleSessionDetail(ctx: WorkerApiContext, req: ApiRequest): Ses
   const chat = ctx.chatSessions.detail(req.params.id);
   if (chat === null) throw ApiError.notFound(`Session ${req.params.id} not found`);
   return chat;
+}
+
+/** A route index: decimal digits only, at most 6, else null. */
+function indexParam(text: string): number | null {
+  if (text === '' || text.length > 6) return null;
+  let n = 0;
+  for (let i = 0; i < text.length; i++) {
+    const digit = text.charCodeAt(i) - 48;
+    if (digit < 0 || digit > 9) return null;
+    n = n * 10 + digit;
+  }
+  return n;
+}
+
+/** `:call/:n`: the n-th picture (from 0) a tool call read, from either agent home: `{mediaType, data}` (base64). */
+export function handleSessionPicture(ctx: WorkerApiContext, req: ApiRequest): SessionPictureResponse {
+  const n = indexParam(req.params.n);
+  if (n === null) throw ApiError.badRequest('n must be a picture index');
+  const { id, call } = req.params;
+  let read = ctx.agentSessions.picture(id, call, n);
+  if (!read.ok && read.error === 'no-session') read = ctx.chatSessions.picture(id, call, n);
+  if (read.ok) return { mediaType: read.mediaType, data: read.data };
+  switch (read.error) {
+    case 'no-session':
+      throw ApiError.notFound(`Session ${id} not found`);
+    case 'not-found':
+      throw ApiError.notFound('Picture not found');
+    case 'unsupported':
+      throw new ApiError('E_UNSUPPORTED_MEDIA_TYPE', 'This kind of picture is not served');
+    case 'too-large':
+      throw ApiError.payloadTooLarge('This picture is too large to show');
+  }
 }
 
 /** `?turn=<n>`: one turn as an agent timeline. Metadata only. */

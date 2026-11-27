@@ -12,7 +12,7 @@ export type SelfCheck =
   | {
       ok: true;
       agentVersion: string;
-      models: Array<{ modelId: string; contextTokens: number | null }>;
+      models: NonNullable<InitializeFacts['models']>;
       embeddedContext: boolean;
     }
   /** Every row but 5 blocks the mode as `agent-incompatible`; row 5 (no models) is resolved by the host. */

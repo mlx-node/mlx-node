@@ -38,7 +38,8 @@ import {
 } from '../../lib/format';
 import { useHeld } from '../../lib/held';
 import { truncateMiddle } from '../../lib/labels';
-import { axisNumber, failPhaseText, outcomeText } from '../../lib/metrics-view';
+import { METRIC } from '../../lib/metric-strings';
+import { axisNumber, decodeSpeed, failPhaseText, outcomeText, speculationView } from '../../lib/metrics-view';
 import { modelColor } from '../../lib/model-colors';
 import { usageKeys, type ModelUsage } from '../../lib/model-usage';
 import type { AlignedRange } from '../../lib/range';
@@ -47,6 +48,7 @@ import {
   LOW_SAMPLE_TAIL_N,
   type CatalogItem,
   type LocalModel,
+  type MetricsSpeculative,
   type MetricsSummary,
   type MetricsTimeseries,
   type MetricsTurns,
@@ -147,25 +149,23 @@ interface DayRow {
   ok: number;
   failed: number;
   turns: number;
+  /** Token-weighted decode speed of the day. */
+  speed: number | null;
+  /** The day's per-turn decode distribution, for the band. */
   decode: MetricsTimeseries['points'][number]['decodeTps'] | null;
-  mtpTurns: number;
-  mtpSum: number;
 }
 
 function byDay(points: MetricsTimeseries['points'] | undefined, key: string): Map<number, DayRow> {
   const days = new Map<number, DayRow>();
   for (const point of points ?? []) {
     if (point.model !== key) continue;
-    const row = days.get(point.t) ?? { ok: 0, failed: 0, turns: 0, decode: null, mtpTurns: 0, mtpSum: 0 };
-    row.ok += point.totals.ok;
-    row.failed += point.totals.error + point.totals.cancelled;
-    row.turns += point.totals.turns;
-    row.decode = point.decodeTps;
-    if (point.mtpMeanAccepted !== null && point.mtpTurns > 0) {
-      row.mtpTurns += point.mtpTurns;
-      row.mtpSum += point.mtpMeanAccepted * point.mtpTurns;
-    }
-    days.set(point.t, row);
+    days.set(point.t, {
+      ok: point.totals.ok,
+      failed: point.totals.error + point.totals.cancelled,
+      turns: point.totals.turns,
+      speed: decodeSpeed(point.totals),
+      decode: point.decodeTps,
+    });
   }
   return days;
 }
@@ -238,6 +238,7 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
   const summary = useJson<MetricsSummary>(`/metrics/summary?${scope}`, { live: true });
   const held = useHeld(summary);
   const series = useJson<MetricsTimeseries>(`/metrics/timeseries?${scope}&bucket=day&groupBy=model`, { live: true });
+  const spec = useJson<MetricsSpeculative>(`/metrics/speculative?${scope}&bucket=day`, { live: true });
   const turns = useJson<MetricsTurns>(`/metrics/turns?model=${encodeURIComponent(usageId)}&limit=5`, {
     live: { minIntervalMs: LIVE_REFETCH_FAST_MS },
   });
@@ -299,6 +300,7 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
   const data = held.data;
   const totals = data?.totals;
   const latency = data?.latency;
+  const speed = totals === undefined ? null : decodeSpeed(totals);
   const loading = data === undefined && summary.error === undefined;
   const empty = totals !== undefined && totals.turns === 0;
   const ttft = formatDurationParts(latency?.ttftMs.p50 ?? null);
@@ -317,26 +319,22 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
     { key: 'failed', label: 'Failed or cancelled', color: 'var(--model-other)', pattern: 'alt' },
   ];
   const decodeData: ChartPoint[] = range.starts.map((t) => {
-    const decode = days.get(t)?.decode ?? null;
+    const day = days.get(t);
+    const decode = day?.decode ?? null;
     const tails = decode !== null && decode.n >= LOW_SAMPLE_TAIL_N;
     return {
       key: String(t),
       label: formatDayLong(t),
       axisLabel: formatDay(t),
       values: {
-        p50: decode?.p50 ?? null,
+        speed: day?.speed ?? null,
         p05: tails ? decode.p05 : null,
         p95: tails ? decode.p95 : null,
       },
-      samples: { p50: decode?.n ?? 0 },
+      samples: { speed: decode?.n ?? 0 },
     };
   });
-  let mtpTurns = 0;
-  let mtpSum = 0;
-  for (const row of days.values()) {
-    mtpTurns += row.mtpTurns;
-    mtpSum += row.mtpSum;
-  }
+  const speculation = speculationView(spec.data?.models ?? []);
   const ctx = latency?.ctxFillPct;
   const ctxWindow = usage?.ctxWindow ?? model.contextWindow;
 
@@ -476,14 +474,14 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
               />
               <StatTile
                 label="Decode"
-                value={latency?.decodeTps.p50 == null ? null : formatTps(latency.decodeTps.p50)}
+                value={speed === null ? null : formatTps(speed)}
                 unit="tok/s"
                 sampleCount={latency?.decodeTps.n}
                 loading={loading}
                 held={held.held}
               />
               <StatTile
-                label="First token"
+                label={METRIC.firstToken.label}
                 value={latency?.ttftMs.p50 == null ? null : ttft.value}
                 unit={ttft.unit}
                 loading={loading}
@@ -512,17 +510,17 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
               />
             </ChartBlock>
             <ChartBlock
-              title="Decode speed · median per day, p05–p95 band"
+              title={`${METRIC.decodeSpeed.label} · per day, p05–p95 per turn`}
               unit="tok/s"
               height={120}
               loading={series.data === undefined}
             >
               <TrendChart
-                label="Decode speed per day"
+                label={`${METRIC.decodeSpeed.label} per day`}
                 unit="tok/s"
                 height={120}
                 data={decodeData}
-                series={[{ key: 'p50', label: 'Median', color }]}
+                series={[{ key: 'speed', label: METRIC.decodeSpeed.label, color }]}
                 band={{ lowKey: 'p05', highKey: 'p95' }}
                 formatValue={formatTps}
                 formatTick={axisNumber}
@@ -553,7 +551,7 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
                 ) : null}
               </div>
             ) : null}
-            {mtpTurns > 0 ? (
+            {speculation.mtpTurns > 0 && speculation.tokensPerCycle !== null ? (
               <KeyValue
                 ariaLabel="Speculative decoding"
                 items={[
@@ -563,8 +561,8 @@ function ModelDrawerBody(props: ModelDrawerProps & { model: LocalModel }): React
                     value: (
                       <span className="flex flex-wrap items-center gap-2">
                         <span className="tabular-nums">
-                          {(mtpSum / mtpTurns).toFixed(2)} tokens per cycle ·{' '}
-                          {formatCountNoun(mtpTurns, 'turn', 'turns', formatCount)}
+                          {speculation.tokensPerCycle.toFixed(2)} tokens per cycle ·{' '}
+                          {formatCountNoun(speculation.mtpTurns, 'turn', 'turns', formatCount)}
                         </span>
                         <Link className="link" to={`/metrics?model=${encodeURIComponent(usageId)}`}>
                           Open in Metrics

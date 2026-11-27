@@ -98,6 +98,20 @@ const SCHED_NUMERIC = [
   'turns',
 ] as const;
 
+/** The work deltas of a `sample` record, in column order; absent in a record that predates them (NULL). */
+const SAMPLE_WORK = [
+  'loadingMs',
+  'waitingMs',
+  'prepareMs',
+  'prefillMs',
+  'decodeMs',
+  'runningMs',
+  'rateOutTokens',
+  'rateOutMs',
+  'ratePrefillTokens',
+  'ratePrefillMs',
+] as const;
+
 interface Statements {
   upsertProc: StatementSync;
   procInfo: StatementSync;
@@ -125,8 +139,10 @@ function prepare(dash: DashboardDb): Statements {
     procExit: sqlite.prepare('UPDATE runtime_procs SET exit_ts = MAX(COALESCE(exit_ts, 0), ?) WHERE proc_key = ?'),
     sample: sqlite.prepare(
       `INSERT INTO runtime_samples (proc_key, ts, dt_ms, busy, busy_ms, health, mem_active, mem_peak, mem_cache, rss,
-         in_flight, queued, resident, d_ok, d_error, d_cancelled, d_out_tokens, d_rejected, source_file)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         in_flight, queued, resident, d_ok, d_error, d_cancelled, d_out_tokens, d_rejected, loading_ms, waiting_ms,
+         prepare_ms, prefill_ms, decode_ms, running_ms, rate_out_tokens, rate_out_ms, rate_prefill_tokens,
+         rate_prefill_ms, source_file)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     ),
     sched: sqlite.prepare(
       `INSERT INTO runtime_sched (proc_key, ts, model, block_capacity, allocated_blocks, free_blocks,
@@ -203,6 +219,7 @@ function ingestRecord(st: Statements, rec: Rec, sourceFile: string): string | nu
         num(rec.dCancelled),
         num(rec.dOutTokens),
         num(rec.dRejected),
+        ...SAMPLE_WORK.map((field) => num(rec[field])),
         sourceFile,
       );
       return procKey;

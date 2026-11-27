@@ -168,7 +168,7 @@ export class CodingAgentsService {
     let commandError: string | null = null;
     if (model) {
       try {
-        if (!this.options.prepareCommand) throw new Error('Open the updated mlx-node app to set up its command.');
+        if (!this.options.prepareCommand) throw new Error('Open the updated Portato app to set up its command.');
         command = await this.options.prepareCommand();
         if (!isAbsoluteCommandPath(command, this.platform)) {
           throw new Error('The app command must use an absolute path.');
@@ -177,7 +177,7 @@ export class CodingAgentsService {
       } catch (error) {
         command = null;
         commandError =
-          error instanceof Error ? error.message : 'The app command is unavailable. Restart mlx-node and retry.';
+          error instanceof Error ? error.message : 'The app command is unavailable. Restart Portato and retry.';
       }
     }
     this.model = model;

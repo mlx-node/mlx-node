@@ -6,7 +6,6 @@ import { MorphLoader } from '../../components/arc-x/morph-loader/morph-loader';
 import { SwapCell } from '../../components/arc-x/swap-cell/swap-cell';
 import { Button } from '../../components/arc/button/button';
 import { EmptyState } from '../../components/arc/empty-state/empty-state';
-import { Tooltip } from '../../components/arc/tooltip/tooltip';
 import { CHAT, fill } from '../../lib/chat-strings';
 import type { ChatHostState, ChatMode } from '../../lib/chat-types';
 import { providerName } from '../../lib/web-tools';
@@ -29,10 +28,8 @@ export interface NewScreenProps {
   blocker: Blocker | null;
   onStarter: (text: string) => void;
   onAction: (action: BlockAction) => void;
-  /** Work: the folder the next conversation opens in. */
-  folder?: string | null;
-  /** Work: open the native folder dialog. */
-  onChooseFolder?: () => void;
+  /** Work: the next conversation starts without a folder, in a new one under `root` (as people read it). */
+  noFolder?: { root: string } | null;
 }
 
 function BlockedPanel({
@@ -70,38 +67,14 @@ function BlockedPanel({
   );
 }
 
-function Starters({
-  items,
-  disabled,
-  onStarter,
-}: {
-  items: readonly string[];
-  disabled: boolean;
-  onStarter: (text: string) => void;
-}) {
+function Starters({ items, onStarter }: { items: readonly string[]; onStarter: (text: string) => void }) {
   return (
     <div className="flex w-full max-w-[42.5rem] flex-wrap justify-center gap-2 [@media(max-height:559px)]:hidden">
-      {items.map((text) => {
-        const button = (
-          <Button
-            key={text}
-            type="button"
-            variant="secondary"
-            size="sm"
-            disabled={disabled}
-            onClick={() => onStarter(text)}
-          >
-            {text}
-          </Button>
-        );
-        return disabled ? (
-          <Tooltip key={text} content={CHAT.folderFirst}>
-            <span>{button}</span>
-          </Tooltip>
-        ) : (
-          button
-        );
-      })}
+      {items.map((text) => (
+        <Button key={text} type="button" variant="secondary" size="sm" onClick={() => onStarter(text)}>
+          {text}
+        </Button>
+      ))}
     </div>
   );
 }
@@ -131,31 +104,25 @@ function ChatHero({ model, providers, onStarter }: Pick<NewScreenProps, 'model' 
           )}
         </p>
       </div>
-      <Starters items={starters} disabled={false} onStarter={onStarter} />
+      <Starters items={starters} onStarter={onStarter} />
     </div>
   );
 }
 
-function WorkHero({
-  providers,
-  onStarter,
-  folder,
-  onChooseFolder,
-}: Pick<NewScreenProps, 'providers' | 'onStarter' | 'folder' | 'onChooseFolder'>) {
+function WorkHero({ providers, onStarter, noFolder }: Pick<NewScreenProps, 'providers' | 'onStarter' | 'noFolder'>) {
   const keyShared = providers !== null && (providers.search !== null || providers.firecrawl);
-  const chosen = folder !== null && folder !== undefined;
+  const none = noFolder ?? null;
   return (
     <div className="grid justify-items-center gap-4 text-center">
       <div className="grid max-w-[34rem] gap-1">
-        <p className="m-0 font-heading text-title font-medium text-foreground">{CHAT.heroWorkTitle}</p>
-        <p className="m-0 text-body text-secondary">{CHAT.heroWorkText}</p>
+        <p className="m-0 font-heading text-title font-medium text-foreground">
+          {none === null ? CHAT.heroWorkTitle : CHAT.heroWorkNoneTitle}
+        </p>
+        <p className="m-0 text-body text-secondary">
+          {none === null ? CHAT.heroWorkText : fill(CHAT.heroWorkNoneText, { root: none.root })}
+        </p>
       </div>
-      {chosen ? null : (
-        <Button type="button" variant="primary" size="sm" onClick={onChooseFolder}>
-          {CHAT.folderChoose}
-        </Button>
-      )}
-      <Starters items={CHAT.startersWork} disabled={!chosen} onStarter={onStarter} />
+      <Starters items={none === null ? CHAT.startersWork : CHAT.startersWorkNone} onStarter={onStarter} />
       {keyShared ? <p className="m-0 max-w-[34rem] text-caption text-secondary">{CHAT.workKeyNotice}</p> : null}
     </div>
   );
@@ -171,12 +138,7 @@ export function NewScreen(props: NewScreenProps): ReactElement {
     ) : props.mode === 'chat' ? (
       <ChatHero model={props.model} providers={props.providers} onStarter={props.onStarter} />
     ) : (
-      <WorkHero
-        providers={props.providers}
-        onStarter={props.onStarter}
-        folder={props.folder}
-        onChooseFolder={props.onChooseFolder}
-      />
+      <WorkHero providers={props.providers} onStarter={props.onStarter} noFolder={props.noFolder} />
     );
   return (
     <div className="grid h-full min-h-0 content-center py-6">

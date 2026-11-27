@@ -17,6 +17,8 @@ export interface MessageProps {
   variant?: 'transcript' | 'chat';
   /** The live word while streaming. Default "Writing". */
   status?: string;
+  /** One muted line under the body, always shown (a warning must not wait for a hover). */
+  caption?: ReactNode;
   /** Under the body: actions that show on hover or focus. */
   footer?: ReactNode;
   /** It arrived live (not from history): it rises in once. */
@@ -72,6 +74,7 @@ export function Message(props: MessageProps): ReactElement {
     >
       {header}
       <div className={styles.body}>{props.children}</div>
+      {props.caption !== undefined ? <div className={styles.caption}>{props.caption}</div> : null}
       {props.footer !== undefined ? <div className={styles.footer}>{props.footer}</div> : null}
     </article>
   );

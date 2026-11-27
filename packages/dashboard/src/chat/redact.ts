@@ -42,21 +42,27 @@ export function redactText(text: string, needles: readonly string[]): string {
   return scan(text, needles, text.length).out;
 }
 
+/** The length of the longest end of `text` that is the start of a needle but not the whole needle. */
+function needleStartAtEnd(text: string, needles: readonly string[]): number {
+  let longest = 0;
+  for (const n of needles) {
+    for (let len = Math.min(n.length - 1, text.length); len > longest; len--) {
+      if (text.endsWith(n.slice(0, len))) {
+        longest = len;
+        break;
+      }
+    }
+  }
+  return longest;
+}
+
 /**
  * Redacts text that was cut to length before it could be redacted: a key cut in two by the cut no longer matches, so
  * an end that could be the start of a key is dropped too.
  */
 export function redactCutText(text: string, needles: readonly string[]): string {
   const out = redactText(text, needles);
-  let drop = 0;
-  for (const n of needles) {
-    for (let len = Math.min(n.length - 1, out.length); len > drop; len--) {
-      if (out.endsWith(n.slice(0, len))) {
-        drop = len;
-        break;
-      }
-    }
-  }
+  const drop = needleStartAtEnd(out, needles);
   return drop === 0 ? out : out.slice(0, out.length - drop);
 }
 
@@ -91,25 +97,68 @@ export function redactDeep<T>(value: T, needles: readonly string[]): T {
   return walk(value) as T;
 }
 
+/** A hunk body whose rows the reader may have cut (a cut row ends in `…`): a cut row's end that could start a key is dropped. */
+function redactCutRows(body: string, needles: readonly string[]): string {
+  return body
+    .split('\n')
+    .map((row) => (row.endsWith('…') ? `${redactCutText(row.slice(0, -1), needles)}…` : row))
+    .join('\n');
+}
+
 /** A transcript entry for the page. A field the reader cut to length may end in part of a key, so that end is dropped. */
 export function redactEntry(entry: TranscriptEntry, needles: readonly string[]): TranscriptEntry {
   const out = redactDeep({ ...entry }, needles);
   if (needles.length === 0) return out;
+  if (out.kind === 'tool' && out.edits !== undefined) {
+    out.edits = out.edits.map((edit) => ({
+      ...edit,
+      hunks: edit.hunks.map((hunk) => ({ ...hunk, body: redactCutRows(hunk.body, needles) })),
+    }));
+  }
   if (out.kind === 'tool' && out.truncated === true) {
     if (out.input !== undefined) out.input = redactCutText(out.input, needles);
     if (out.output !== undefined) out.output = redactCutText(out.output, needles);
   } else if (out.kind === 'wake' && out.truncated === true) {
     out.text = redactCutText(out.text, needles);
-  } else if (out.kind === 'workflow' && out.truncated === true && out.report !== undefined) {
-    out.report = redactCutText(out.report, needles);
+  } else if (out.kind === 'workflow' && out.report !== undefined) {
+    out.report = redactReport(out.report, out.truncated === true, needles);
+  } else if (out.kind === 'notice' && out.code === 'retry' && out.detail?.endsWith('…') === true) {
+    out.detail = `${redactCutText(out.detail.slice(0, -1), needles)}…`;
+  } else if (out.kind === 'notice' && out.code === 'picture') {
+    out.notes = out.notes.map((note) => (note.endsWith('…') ? `${redactCutText(note.slice(0, -1), needles)}…` : note));
+  } else if (out.kind === 'notice' && out.code === 'hook' && out.detail.endsWith('…')) {
+    out.detail = `${redactCutText(out.detail.slice(0, -1), needles)}…`;
+  } else if (out.kind === 'notice' && out.code === 'hook-note' && out.text.endsWith('…')) {
+    out.text = `${redactCutText(out.text.slice(0, -1), needles)}…`;
+  } else if (out.kind === 'recap' && out.text.endsWith('…')) {
+    out.text = `${redactCutText(out.text.slice(0, -1), needles)}…`;
+  } else if (out.kind === 'goal' && out.pauseMessage?.endsWith('…') === true) {
+    out.pauseMessage = `${redactCutText(out.pauseMessage.slice(0, -1), needles)}…`;
+  }
+  if (out.kind === 'tool' && out.blocked?.endsWith('…') === true) {
+    out.blocked = `${redactCutText(out.blocked.slice(0, -1), needles)}…`;
+  }
+  const snapshot = out.kind === 'wake' ? out.workflow?.snapshot : null;
+  if (snapshot != null && snapshot.report !== undefined) {
+    snapshot.report = redactReport(snapshot.report, snapshot.truncated === true, needles);
   }
   return out;
 }
 
 /**
- * Streaming redaction for one open text entry: the last `L − 1` characters (L = the longest needle) are held back
- * until more text arrives or the entry ends, so a secret split over two chunks is still caught. The whole text is
- * kept, because a key that becomes known mid-entry may have started in text already sent.
+ * A run's report, already redacted whole: the app's own cut (`truncated`) or the agent's, which ends in `…`, can split
+ * a key, so an end that could start one is dropped.
+ */
+function redactReport(report: string, truncated: boolean, needles: readonly string[]): string {
+  if (truncated) return redactCutText(report, needles);
+  if (report.endsWith('…')) return `${redactCutText(report.slice(0, -1), needles)}…`;
+  return report;
+}
+
+/**
+ * Streaming redaction for one open text entry: an end that could be the start of a needle is held back until more
+ * text arrives or the entry ends, so a secret split over two chunks is still caught; the rest goes out at once. The
+ * whole text is kept, because a key that becomes known mid-entry may have started in text already sent.
  */
 export class StreamRedactor {
   private pending = '';
@@ -127,8 +176,7 @@ export class StreamRedactor {
     this.raw += chunk;
     if (this.needles.length === 0) return chunk;
     this.pending += chunk;
-    const hold = this.needles[0]!.length - 1;
-    let stop = this.pending.length - hold;
+    let stop = this.pending.length - needleStartAtEnd(this.pending, this.needles);
     if (stop <= 0) return '';
     const code = this.pending.charCodeAt(stop - 1);
     if (code >= 0xd800 && code <= 0xdbff) stop -= 1;

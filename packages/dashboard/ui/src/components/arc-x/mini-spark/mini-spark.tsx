@@ -12,7 +12,7 @@ import styles from './mini-spark.module.css';
 export interface MiniSparkProps {
   /** ≤ 60 points; more are bucket means, nulls kept. */
   data: readonly (number | null)[];
-  /** sr-only: "Decode speed, last 24 hours". */
+  /** sr-only: the measure and its range, "<METRIC label>, last 24 hours". */
   label: string;
   /** Default var(--text-muted); the last point in var(--series-1). */
   color?: string;

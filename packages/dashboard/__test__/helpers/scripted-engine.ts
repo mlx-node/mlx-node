@@ -55,6 +55,8 @@ export interface ModelReply {
   outputTokens?: number;
   /** After `message_start`, progress pings every 250 ms for this long, with `prefill_done` going up, then the blocks. */
   holdMs?: number;
+  /** Answer with this HTTP status and an error body instead of a stream; `blocks` is not read. */
+  status?: number;
 }
 
 export type ModelScript = (request: ModelRequest) => ModelReply;
@@ -62,6 +64,8 @@ export type ModelScript = (request: ModelRequest) => ModelReply;
 export interface ScriptedModel {
   id: string;
   contextWindow: number;
+  /** The row's `reasoningEfforts`, as an engine with `thinkingLevels` lists them; absent by default. */
+  reasoningEfforts?: unknown[];
 }
 
 export interface ScriptedEngine extends FakeEngine {
@@ -254,6 +258,7 @@ export async function startScriptedEngine(models: ScriptedModel[], reply: ModelS
           api_backend: 'messages',
           model_family: 'qwen3_5',
           supports_images: false,
+          ...(m.reasoningEfforts !== undefined ? { reasoningEfforts: m.reasoningEfforts } : {}),
         }));
         send(200, {
           object: 'list',
@@ -300,6 +305,11 @@ export async function startScriptedEngine(models: ScriptedModel[], reply: ModelS
         if (model.doneAt === null) model.closedEarly = true;
       });
       const answer = reply(model);
+      if (answer.status !== undefined) {
+        model.doneAt = Date.now() - t0;
+        send(answer.status, { type: 'error', error: { type: 'overloaded_error', message: 'upstream overloaded' } });
+        return;
+      }
       request.answered = true;
       void stream(
         response,

@@ -1,7 +1,8 @@
 /**
  * `mlx_web`: the stdio MCP server the Chat agent starts once per session. It imports only Node built-ins and its own
- * folder; it never spawns a process, reads or writes a file, opens a listening socket or follows a redirect; and it
- * writes only the fixed lines of `errors.ts` to stderr, because the agent saves stderr to disk.
+ * folder; it reads exactly one file, the session's address ledger (`MLX_WEB_LEDGER`, at every `web_fetch`); it never
+ * spawns a process, writes a file, opens a listening socket or follows a redirect; and it writes only the fixed lines
+ * of `errors.ts` to stderr, because the agent saves stderr to disk.
  */
 
 import { writeStderrLine } from './errors.js';

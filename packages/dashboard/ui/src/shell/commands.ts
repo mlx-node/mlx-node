@@ -221,7 +221,8 @@ export function conversationCommands(
     .slice(0, 20)
     .map((row) => {
       const parts: string[] = [row.mode === 'work' ? CHAT.modeWork : CHAT.modeChat];
-      if (row.mode === 'work' && row.cwd !== null) {
+      if (row.mode === 'work' && row.noFolder === true) parts.push(CHAT.folderNone);
+      else if (row.mode === 'work' && row.cwd !== null) {
         const shown = tildePath(row.cwd, home);
         const segments = shown.split('/').filter((part) => part.length > 0);
         parts.push(segments[segments.length - 1] ?? shown);
@@ -229,7 +230,9 @@ export function conversationCommands(
       parts.push(formatRelativeTime(row.updatedAt));
       const live = active.find((entry) => entry.conversationId === row.id);
       if (live?.waiting === true) parts.push(CHAT.waiting.toLowerCase());
-      else if (live?.busy === true || live?.background === true) parts.push(CHAT.running.toLowerCase());
+      else if (live !== undefined && (live.busy || live.background || live.tasks > 0)) {
+        parts.push(CHAT.running.toLowerCase());
+      }
       return {
         id: `conversation:${row.id}`,
         label: chatTitle(row.title, row.mode),

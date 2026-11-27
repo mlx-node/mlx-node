@@ -4,23 +4,39 @@
  * rules, interactions refused for Chat, the error text law, and the `chat` stream of the runtime.
  */
 
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vite-plus/test';
 
 import { MAX_FIELD_CHARS } from '../src/agent-sessions/transcript.js';
-import type { SessionDetailResponse } from '../src/agent-sessions/types.js';
+import type { SessionDetailResponse, TranscriptEntry } from '../src/agent-sessions/types.js';
 import { routeThreadFor } from '../src/api/dispatch.js';
 import type { ApiResponse } from '../src/api/errors.js';
 import { ROUTES } from '../src/api/routes.js';
+import { isRuleId } from '../src/chat/agent/never-rules.js';
 import { promptParams } from '../src/chat/agent/profiles.js';
 import type { AttachmentInput } from '../src/chat/attachment-rule.js';
+import { applyOp } from '../src/chat/conversation.js';
 import { MemorySecretStore } from '../src/chat/providers/secrets.js';
+import { REDACTED } from '../src/chat/redact.js';
 import { guarded } from '../src/chat/route-errors.js';
-import { createConversationInput, isSlashText, permissionModeInput, promptInput } from '../src/chat/route-input.js';
-import type { ConversationEvent, ConversationInfo, Interaction } from '../src/chat/types.js';
+import {
+  createConversationInput,
+  forkInput,
+  goalInput,
+  interactionInput,
+  isSlashText,
+  MAX_FEEDBACK_CHARS,
+  permissionModeInput,
+  promptInput,
+  queuePatchInput,
+  queueSendInput,
+  rewindInput,
+  rewindPlanInput,
+} from '../src/chat/route-input.js';
+import type { AgentWatchAnswer, ConversationEvent, ConversationInfo, Interaction } from '../src/chat/types.js';
 import { createDashboardRuntime, type ChatRuntimeOptions, type DashboardRuntime } from '../src/runtime.js';
 import { endpointModel, FAKE_AGENT, INFERENCE_TOKEN, readScenario, until, type Json } from './helpers/chat-fake.js';
 import { startFakeEngine, UNLOAD_PATH, type FakeEngine } from './helpers/fake-engine.js';
@@ -157,11 +173,35 @@ describe('Chat routes — threads', () => {
       'main POST /api/chat/conversations',
       'main POST /api/chat/conversations/:id/prompt',
       'main POST /api/chat/conversations/:id/cancel',
+      'main PATCH /api/chat/conversations/:id/queue/:qid',
+      'main DELETE /api/chat/conversations/:id/queue/:qid',
+      'main DELETE /api/chat/conversations/:id/queue',
+      'main POST /api/chat/conversations/:id/queue/release',
+      'main POST /api/chat/conversations/:id/queue/:qid/send',
+      'main POST /api/chat/conversations/:id/compact',
+      'main GET /api/chat/conversations/:id/context',
+      'main POST /api/chat/conversations/:id/rewind/plan',
+      'main POST /api/chat/conversations/:id/rewind',
+      'main POST /api/chat/conversations/:id/fork',
+      'main POST /api/chat/conversations/:id/recap',
+      'main POST /api/chat/conversations/:id/goal',
       'main POST /api/chat/conversations/:id/runs/:runId/stop',
+      'main POST /api/chat/conversations/:id/tasks/:taskId/stop',
+      'main POST /api/chat/conversations/:id/subagents/:childId/stop',
+      'main POST /api/chat/conversations/:id/subagents/:childId/message',
+      'main POST /api/chat/conversations/:id/subagents/:childId/watch',
+      'main DELETE /api/chat/conversations/:id/subagents/:childId/watch',
+      'main POST /api/chat/conversations/:id/schedules/:scheduleId/delete',
       'main POST /api/chat/conversations/:id/interactions/:iid',
+      'main GET /api/chat/conversations/:id/never',
+      'main DELETE /api/chat/conversations/:id/never/:ruleId',
       'main POST /api/chat/conversations/:id/permission-mode',
       'main POST /api/chat/drafts/:draft/permission-mode',
       'main GET /api/chat/work/hooks',
+      'main GET /api/chat/work/git',
+      'main POST /api/chat/work/git/switch',
+      'main GET /api/chat/work/settings',
+      'main PUT /api/chat/work/settings',
       'main PATCH /api/chat/conversations/:id',
       'main DELETE /api/chat/conversations/:id',
       'main POST /api/chat/agent',
@@ -172,7 +212,7 @@ describe('Chat routes — threads', () => {
 });
 
 describe('Chat routes — the New Work screen', () => {
-  it('the draft mode route takes exactly {mode, up, cwd?, temp?}; a move up names its folder, a move down none', async () => {
+  it('the draft mode route takes exactly {mode, up, cwd?, noFolder?, temp?}; a move up names its place, a move down none', async () => {
     start('chat-basic');
     const folder = join(base, 'home', 'code', 'app');
     mkdirSync(folder, { recursive: true });
@@ -188,6 +228,9 @@ describe('Chat routes — the New Work screen', () => {
       { mode: 'Bypass', up: true, cwd: folder },
       { mode: 'bypass', up: 'true', cwd: folder },
       { mode: 'bypass', cwd: folder },
+      { mode: 'bypass', up: true, cwd: folder, noFolder: true },
+      { mode: 'bypass', up: true, noFolder: false },
+      { mode: 'ask', up: false, noFolder: true },
       null,
     ]) {
       expect([body, failureOf(await call('POST', path, body)).code]).toEqual([body, 'E_BAD_REQUEST']);
@@ -201,6 +244,10 @@ describe('Chat routes — the New Work screen', () => {
     expect(up.ok && up.body).toEqual({ mode: 'bypass' });
     const down = await call('POST', path, { mode: 'ask', up: false });
     expect(down.ok && down.body).toEqual({ mode: 'ask' });
+    // No folder: nothing on disk yet, so no folder is checked.
+    const none = await call('POST', path, { mode: 'bypass', up: true, noFolder: true });
+    expect(none.ok && none.body).toEqual({ mode: 'bypass' });
+    expect(existsSync(join(base, 'home', 'Portato'))).toBe(false);
   });
 
   it('the hooks route reads the folder rule first, then the hooks', async () => {
@@ -214,6 +261,44 @@ describe('Chat routes — the New Work screen', () => {
       expect([cwd, failureOf(refused).reason]).toEqual([cwd, 'cwd-invalid']);
     }
     expect(failureOf(await call('GET', '/api/chat/work/hooks')).reason).toBe('cwd-invalid');
+    // Mutation: the none read sent through the folder rule → the draft confirm of No folder never arms.
+    const none = await call('GET', '/api/chat/work/hooks?noFolder=1');
+    expect(none.ok && none.body).toEqual({ userHooks: false });
+    expect(existsSync(join(base, 'home', 'Portato'))).toBe(false);
+    expect(failureOf(await call('GET', '/api/chat/work/hooks?noFolder=1&cwd=%2Ftmp')).code).toBe('E_BAD_REQUEST');
+  });
+});
+
+describe('Chat routes — the Work settings', () => {
+  // Mutations: the parser takes an extra field or a value that is not a boolean; the value kept in memory only.
+  it('takes exactly {claudeCode: boolean}, saves it and reads it back after a restart', async () => {
+    start('chat-basic');
+    const path = '/api/chat/work/settings';
+    const read = async (): Promise<unknown> => {
+      const reply = await call('GET', path);
+      return reply.ok && reply.body;
+    };
+    expect(await read()).toEqual({ claudeCode: true });
+    for (const body of [
+      {},
+      { claudeCode: 'false' },
+      { claudeCode: null },
+      { claudeCode: false, mode: 'work' },
+      [],
+      null,
+    ]) {
+      expect([body, failureOf(await call('PUT', path, body)).code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+    expect(await read()).toEqual({ claudeCode: true });
+    const put = await call('PUT', path, { claudeCode: false });
+    expect(put.ok && put.body).toEqual({ claudeCode: false });
+    expect(JSON.parse(readFileSync(join(base, 'chat', 'work-settings.json'), 'utf8'))).toEqual({
+      version: 1,
+      claudeCode: false,
+    });
+    await runtime.close();
+    start('chat-basic');
+    expect(await read()).toEqual({ claudeCode: false });
   });
 });
 
@@ -244,6 +329,108 @@ describe('Chat routes — a conversation', () => {
     expect(deleted.ok && deleted.body).toEqual({});
     const after = await call('POST', `/api/chat/conversations/${conversation.id}/cancel`);
     expect(failureOf(after).code).toBe('E_NOT_FOUND');
+  }, 20_000);
+
+  it('Compact now: 202 with no body once it started, its end on the stream; a body or a running turn is refused', async () => {
+    start('chat-basic', (scenario) => {
+      scenario.compactNow = { ms: 200 };
+    });
+    const conversation = await created();
+    await settled(conversation.id);
+    const path = `/api/chat/conversations/${conversation.id}/compact`;
+    expect(failureOf(await call('POST', path, { force: true })).code).toBe('E_BAD_REQUEST');
+    const w = watch(conversation.id);
+    const response = await call('POST', path);
+    expect(response.ok && response.status).toBe(202);
+    expect(response.ok && response.body).toEqual({});
+    expect(failureOf(await call('POST', path))).toMatchObject({ code: 'E_CONFLICT', reason: 'conversation-busy' });
+    await until(() => w.events.some((e) => e.type === 'compaction' && e.end === 'compacted'), 5_000);
+    expect(sent().filter((m) => m.method === '_x.ai/compact_conversation')).toHaveLength(1);
+    w.off();
+  }, 20_000);
+
+  it('Recap: 202 with no body once it started, `auto: false` to the agent, its end and its row on the stream', async () => {
+    start('chat-basic', (scenario) => {
+      scenario.recap = { ms: 200, summary: 'Where things stand.' };
+    });
+    const conversation = await created();
+    await settled(conversation.id);
+    const path = `/api/chat/conversations/${conversation.id}/recap`;
+    expect(failureOf(await call('POST', path, { auto: true })).code).toBe('E_BAD_REQUEST');
+    const w = watch(conversation.id);
+    const response = await call('POST', path);
+    expect(response.ok && response.status).toBe(202);
+    expect(response.ok && response.body).toEqual({});
+    expect(failureOf(await call('POST', path))).toMatchObject({ code: 'E_CONFLICT', reason: 'conversation-busy' });
+    await until(() => w.events.some((e) => e.type === 'recap' && e.end === 'shown'), 5_000);
+    expect(
+      sent()
+        .filter((m) => m.method === '_x.ai/recap')
+        .map((m) => m.params),
+    ).toEqual([{ sessionId: conversation.id, auto: false }]);
+    w.off();
+  }, 20_000);
+
+  it('Rewind: the plan answers 200 with its token; the commit 202 with no body, its end on the stream; bad bodies refused', async () => {
+    start('chat-basic');
+    const conversation = await created('one');
+    await settled(conversation.id);
+    const base = `/api/chat/conversations/${conversation.id}/rewind`;
+    const shown = watch(conversation.id);
+    await until(() => shown.events.some((e) => e.type === 'sync'), 5_000);
+    const sync = shown.events.find((e) => e.type === 'sync');
+    const ts = (at: number): number => (sync?.type === 'sync' ? sync.entries[at]!.ts : -1);
+    shown.off();
+    expect(failureOf(await call('POST', `${base}/plan`, { entry: 'x', ts: 0 })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', `${base}/plan`, { entry: 0 })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', `${base}/plan`, { entry: 1, ts: ts(1) }))).toMatchObject({
+      code: 'E_CONFLICT',
+      reason: 'rewind-not-point',
+    });
+    expect(failureOf(await call('POST', `${base}/plan`, { entry: 0, ts: ts(0) + 1 }))).toMatchObject({
+      code: 'E_CONFLICT',
+      reason: 'rewind-changed',
+    });
+    const plan = await call('POST', `${base}/plan`, { entry: 0, ts: ts(0) });
+    expect(plan.ok && plan.status).toBe(200);
+    const token = (plan as { body: { token: string } }).body.token;
+    expect(plan.ok && plan.body).toMatchObject({
+      removes: { messages: 1 },
+      background: { commands: 0, schedules: 0, runs: 0 },
+      files: [],
+      filesMore: 0,
+    });
+    // Chat has no files: a file mode is a bad request, and no dry run went to the agent.
+    for (const mode of ['all', 'files']) {
+      expect(failureOf(await call('POST', base, { token, mode })).code).toBe('E_BAD_REQUEST');
+    }
+    expect(sent().filter((m) => m.method === '_x.ai/rewind/execute')).toEqual([]);
+    const w = watch(conversation.id);
+    const response = await call('POST', base, { token, mode: 'conversation' });
+    expect(response.ok && response.status).toBe(202);
+    expect(response.ok && response.body).toEqual({});
+    await until(() => w.events.some((e) => e.type === 'rewind'), 5_000);
+    expect(w.events.find((e) => e.type === 'rewind')).toMatchObject({
+      end: { outcome: 'done', mode: 'conversation', restored: 0, entry: 0 },
+    });
+    expect(
+      sent()
+        .filter((m) => m.method === '_x.ai/rewind/execute')
+        .map((m) => m.params),
+    ).toEqual([{ sessionId: expect.any(String), targetPromptIndex: 0, force: true, mode: 'conversation_only' }]);
+    w.off();
+  }, 20_000);
+
+  it('the Context panel: GET context answers the agent’s parts while the conversation is loaded', async () => {
+    start('chat-basic');
+    const conversation = await created();
+    await settled(conversation.id);
+    const response = await call('GET', `/api/chat/conversations/${conversation.id}/context`);
+    expect(response.ok && response.status).toBe(200);
+    expect(response.ok && response.body).toMatchObject({
+      parts: { systemTokens: 432, toolCount: 2, toolTokens: 261, autoCompactPercent: 85, compactions: 0 },
+    });
+    expect(failureOf(await call('GET', '/api/chat/conversations/nope/context')).code).toBe('E_NOT_FOUND');
   }, 20_000);
 
   it('serves the host state and the agent actions', async () => {
@@ -341,6 +528,12 @@ describe('Chat routes — the input law', () => {
       ['POST', '/api/chat/conversations', ['hi']],
       ['POST', `/api/chat/conversations/${id}/prompt`, { text: 'hi', env: {} }],
       ['POST', `/api/chat/conversations/${id}/prompt`, { text: 'hi', prompt: [{ type: 'text', text: 'x' }] }],
+      ['POST', '/api/chat/conversations', { mode: 'chat', text: 'hi', plan: true }],
+      ['POST', '/api/chat/conversations', { mode: 'chat', text: 'hi', plan: false }],
+      ['POST', `/api/chat/conversations/${id}/prompt`, { text: 'hi', plan: true }],
+      ['POST', `/api/chat/conversations/${id}/prompt`, { text: 'hi', plan: false }],
+      ['POST', `/api/chat/conversations/${id}/prompt`, { text: 'hi', plan: 'yes' }],
+      ['POST', '/api/chat/conversations', { mode: 'work', text: 'hi', cwd: base, plan: 1 }],
       ['POST', `/api/chat/conversations/${id}/cancel`, { now: true }],
       ['PATCH', `/api/chat/conversations/${id}`, { title: 'a', modelId: 'qwen3.5-4b' }],
       ['PATCH', `/api/chat/conversations/${id}`, { name: 'a' }],
@@ -366,7 +559,7 @@ describe('Chat routes — the input law', () => {
       expect(failure).toEqual({
         code: 'E_BAD_REQUEST',
         reason: 'slash-text',
-        message: 'Start the message with a word, not /.',
+        message: 'No such command here.',
       });
     }
     const conversation = await created('a word first, then /yolo');
@@ -506,6 +699,163 @@ describe('Chat routes — Work', () => {
     });
   }, 30_000);
 
+  // Mutation: the worker without the record file → the list row of a No folder conversation is not marked.
+  it('a create with no folder runs in a new folder of ~/Portato, and the worker lists it as No folder', async () => {
+    startWork('work-plan');
+    const response = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'plan', noFolder: true });
+    if (!response.ok) throw new Error(response.message);
+    const conversation = (response.body as { conversation: ConversationInfo }).conversation;
+    expect(conversation).toMatchObject({ mode: 'work', noFolder: true });
+    expect(dirname(conversation.cwd!)).toBe(realpathSync(join(base, 'home', 'Portato')));
+    const w = watch(conversation.id);
+    await until(() => cards(w).length === 1, 5_000);
+    const answer = `/api/chat/conversations/${conversation.id}/interactions/${cards(w)[0]!.id}`;
+    expect((await call('POST', answer, { decision: 'approved' })).ok).toBe(true);
+    expect(await w.ended()).toMatchObject({ outcome: 'completed' });
+    w.off();
+    let rows: Array<{ id: string; noFolder?: true }> = [];
+    await until(() => {
+      void call('GET', '/api/chat/conversations?mode=work').then((list) => {
+        if (list.ok) rows = (list.body as { conversations: typeof rows }).conversations;
+      });
+      return rows.some((r) => r.id === conversation.id);
+    }, 10_000);
+    expect(rows.find((r) => r.id === conversation.id)?.noFolder).toBe(true);
+  }, 30_000);
+
+  /** Every transcript entry the stream showed: the `sync` list, then each pushed one. */
+  function entries(w: { events: ConversationEvent[] }): Array<{ kind: string; mode?: string }> {
+    const out: Array<{ kind: string; mode?: string }> = [];
+    for (const e of w.events) {
+      if (e.type === 'sync') out.splice(0, out.length, ...e.entries);
+      if (e.type === 'ops') for (const op of e.ops) if (op.op === 'push') out.push(op.entry);
+    }
+    return out;
+  }
+  const planLines = (w: { events: ConversationEvent[] }) =>
+    entries(w).flatMap((entry) => (entry.kind === 'plan-mode' ? [entry.mode] : []));
+  const promptModes = () =>
+    sent()
+      .filter((m) => m.method === 'session/prompt')
+      .map((m) => ((m.params as Json)._meta as Json | undefined)?.mode);
+  const textOnly = (scenario: Json): void => {
+    scenario.prompts = [{ match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] }];
+  };
+
+  it("plan: the first message and each prompt name their mode; the agent's mode lines reach the stream", async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start('work-plan', textOnly, { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } });
+    const made = await call('POST', '/api/chat/conversations', {
+      mode: 'work',
+      text: 'Plan it',
+      cwd: project,
+      plan: true,
+    });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    await settled(id);
+    const w = watch(id);
+    await w.idle();
+    expect(planLines(w)).toEqual(['plan']);
+    // Already planning: the agent sends no mode line, and that is no sign of an agent without plan mode.
+    const again = await call('POST', `/api/chat/conversations/${id}/prompt`, { text: 'Go on', plan: true });
+    expect(again.ok).toBe(true);
+    await settled(id);
+    expect(planLines(w)).toEqual(['plan']);
+    expect(w.events.some((e) => e.type === 'notice')).toBe(false);
+    const next = await call('POST', `/api/chat/conversations/${id}/prompt`, { text: 'Build it', plan: false });
+    expect(next.ok).toBe(true);
+    await until(() => planLines(w).length === 2, 5_000);
+    expect(planLines(w)).toEqual(['plan', 'default']);
+    expect(promptModes()).toEqual(['plan', 'plan', 'agent']);
+    expect(w.events.some((e) => e.type === 'notice')).toBe(false);
+    w.off();
+  }, 20_000);
+
+  it('an agent that reads no `_meta.mode`: a stopped planned message says nothing; one that ends makes the notice; the next message clears it', async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-plan',
+      (scenario) => {
+        textOnly(scenario);
+        (scenario.prompts as Json[]).unshift({ match: 'Hold', steps: [{ sleepMs: 10_000 }, { text: 'ok' }] });
+        scenario.noPlanMode = true;
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    const conversation = await createdWork(project, 'Build it');
+    await settled(conversation.id);
+    const w = watch(conversation.id);
+    await w.idle();
+    expect(w.events.some((e) => e.type === 'notice')).toBe(false);
+    const ends = (): number => w.events.filter((e) => e.type === 'turn' && e.turn === null).length;
+    // A stopped answer is no sign of an agent without plan mode.
+    const held = await call('POST', `/api/chat/conversations/${conversation.id}/prompt`, {
+      text: 'Hold it',
+      plan: true,
+    });
+    expect(held.ok).toBe(true);
+    await until(() => w.events.some((e) => e.type === 'turn' && e.turn?.phase === 'running'), 5_000);
+    expect((await call('POST', `/api/chat/conversations/${conversation.id}/cancel`)).ok).toBe(true);
+    await until(() => ends() === 1, 5_000);
+    expect(w.events.find((e) => e.type === 'turn' && e.turn === null)).toMatchObject({ outcome: 'cancelled' });
+    expect(w.events.some((e) => e.type === 'notice')).toBe(false);
+    const asked = await call('POST', `/api/chat/conversations/${conversation.id}/prompt`, {
+      text: 'Plan it',
+      plan: true,
+    });
+    expect(asked.ok).toBe(true);
+    await until(() => ends() === 2, 5_000);
+    expect(w.events.find((e) => e.type === 'notice')).toMatchObject({
+      notice: { code: 'no-plan-mode', tone: 'warning' },
+    });
+    expect(planLines(w)).toEqual([]);
+    const again = await call('POST', `/api/chat/conversations/${conversation.id}/prompt`, { text: 'Go on' });
+    expect(again.ok).toBe(true);
+    await until(() => w.events.some((e) => e.type === 'notice-cleared'), 5_000);
+    expect(w.events.find((e) => e.type === 'notice-cleared')).toMatchObject({ code: 'no-plan-mode' });
+    await until(() => promptModes().length === 4, 5_000);
+    expect(promptModes()).toEqual(['agent', 'plan', 'plan', 'agent']);
+    w.off();
+  }, 20_000);
+
+  // Mutation: drop `no-model` from reachedAgent → the blocked message makes the notice.
+  it('a planned message that no model answered says nothing about plan mode', async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'blocked');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-plan',
+      (scenario) => {
+        textOnly(scenario);
+        (scenario.prompts as Json[]).unshift({ match: 'Blocked', noModel: 'No model is allowed.', steps: [] });
+        scenario.noPlanMode = true;
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    const conversation = await createdWork(project, 'Build it');
+    await settled(conversation.id);
+    const w = watch(conversation.id);
+    await w.idle();
+    const blocked = await call('POST', `/api/chat/conversations/${conversation.id}/prompt`, {
+      text: 'Blocked plan',
+      plan: true,
+    });
+    expect(blocked.ok).toBe(true);
+    await until(() => w.events.some((e) => e.type === 'turn' && e.turn === null), 5_000);
+    expect(w.events.find((e) => e.type === 'turn' && e.turn === null)).toMatchObject({
+      outcome: 'no-model',
+      model: { previous: null, next: null, reason: 'No model is allowed.' },
+    });
+    await settled(conversation.id);
+    expect(w.events.some((e) => e.type === 'notice')).toBe(false);
+    w.off();
+  }, 20_000);
+
   it('refuses an option the card did not list; Deny ends the turn as denied', async () => {
     const project = startWork('work-deny');
     const conversation = await createdWork(project, 'clean');
@@ -521,6 +871,69 @@ describe('Chat routes — Work', () => {
     expect(deny.ok).toBe(true);
     expect(await w.ended()).toMatchObject({ outcome: 'denied' });
     w.off();
+  }, 20_000);
+
+  it('a deny with a note: a note with another option is refused; with reject-once the answer goes on', async () => {
+    const project = startWork('work-deny');
+    const conversation = await createdWork(project, 'clean');
+    const w = watch(conversation.id);
+    await until(() => cards(w).length === 1, 5_000);
+    const path = `/api/chat/conversations/${conversation.id}/interactions/${cards(w)[0]!.id}`;
+    expect(failureOf(await call('POST', path, { optionId: 'allow-once', note: 'use pnpm' })).code).toBe(
+      'E_BAD_REQUEST',
+    );
+    expect(failureOf(await call('POST', path, { optionId: 'reject-once', note: 'x'.repeat(4_001) })).code).toBe(
+      'E_BAD_REQUEST',
+    );
+    expect((await call('POST', path, { optionId: 'reject-once', note: 'use pnpm' })).ok).toBe(true);
+    expect(await w.ended()).toMatchObject({ outcome: 'completed' });
+    w.off();
+  }, 20_000);
+
+  it('never allow: the card answer, the rules of the folder, and their removal; Chat has none', async () => {
+    const project = startWork('work-deny');
+    const conversation = await createdWork(project, 'clean');
+    const w = watch(conversation.id);
+    await until(() => cards(w).length === 1, 5_000);
+    const card = cards(w)[0]!;
+    expect(card).toMatchObject({ never: { short: 'rm', exact: 'rm -rf build' } });
+    const path = `/api/chat/conversations/${conversation.id}/interactions/${card.id}`;
+    expect(failureOf(await call('POST', path, { never: 'all' })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path, { never: 'short', optionId: 'reject-once' })).code).toBe('E_BAD_REQUEST');
+    const made = await call('POST', path, { never: 'exact' });
+    if (!made.ok) throw new Error('the never answer failed');
+    const never = (made.body as { never: { saved: true; ruleId: string; words: string } }).never;
+    expect(never).toEqual({ saved: true, ruleId: expect.any(String), words: 'rm -rf build' });
+    expect(isRuleId(never.ruleId)).toBe(true);
+    expect(await w.ended()).toMatchObject({ outcome: 'completed' });
+    const rules = `/api/chat/conversations/${conversation.id}/never`;
+    const listed = await call('GET', rules);
+    expect(listed.ok && listed.body).toEqual({
+      folder: conversation.cwd,
+      rules: [{ id: never.ruleId, words: 'rm -rf build', at: expect.any(Number) }],
+    });
+    expect(failureOf(await call('DELETE', `${rules}/n_${'0'.repeat(32)}`))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such rule.',
+    });
+    expect(failureOf(await call('DELETE', `${rules}/not.a.rule`)).code).toBe('E_NOT_FOUND');
+    expect(failureOf(await call('POST', `${rules}`, {})).code).toBe('E_METHOD_NOT_ALLOWED');
+    const gone = await call('DELETE', `${rules}/${never.ruleId}`);
+    expect(gone.ok && gone.body).toEqual({});
+    const after = await call('GET', rules);
+    expect(after.ok && (after.body as { rules: unknown[] }).rules).toEqual([]);
+    w.off();
+  }, 20_000);
+
+  it('never allow: a Chat conversation has no rules', async () => {
+    start('chat-basic');
+    const chat = await created();
+    await settled(chat.id);
+    expect(failureOf(await call('GET', `/api/chat/conversations/${chat.id}/never`)).code).toBe('E_NOT_FOUND');
+    const rule = `n_${'0'.repeat(32)}`;
+    expect(failureOf(await call('DELETE', `/api/chat/conversations/${chat.id}/never/${rule}`)).code).toBe(
+      'E_NOT_FOUND',
+    );
   }, 20_000);
 
   describe('the Sessions routes redact a key a Work command printed', () => {
@@ -800,4 +1213,896 @@ describe('the permission mode input', () => {
       expect([body, code]).toEqual([body, 'E_BAD_REQUEST']);
     }
   });
+});
+
+describe('the rewind inputs', () => {
+  // Mutation: let `rewindInput` take any mode → the agent's own `conversation_only` passes.
+  // Mutation: let the plan go without `ts` → a plan names an index the page may no longer show there.
+  it('the plan takes {entry, ts} (a whole number from 0 and the entry time); the commit takes {token, mode} of the three modes', () => {
+    expect(rewindPlanInput({ entry: 0, ts: 1_700_000_000_000 })).toEqual({ entry: 0, ts: 1_700_000_000_000 });
+    expect(rewindPlanInput({ entry: 12, ts: 0 })).toEqual({ entry: 12, ts: 0 });
+    for (const mode of ['all', 'conversation', 'files'] as const) {
+      expect(rewindInput({ token: '3:12', mode })).toEqual({ token: '3:12', mode });
+    }
+    const refused = (read: (body: unknown) => unknown, body: unknown): string => {
+      try {
+        read(body);
+        return 'ok';
+      } catch (error) {
+        return (error as { code?: string }).code ?? 'thrown';
+      }
+    };
+    for (const body of [
+      { entry: -1, ts: 1 },
+      { entry: 1.5, ts: 1 },
+      { entry: '1', ts: 1 },
+      { entry: 2 ** 60, ts: 1 },
+      { entry: 1 },
+      { entry: 1, ts: '1' },
+      { entry: 1, ts: Number.NaN },
+      {},
+      { entry: 1, ts: 1, x: 1 },
+      null,
+    ]) {
+      expect([body, refused(rewindPlanInput, body)]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+    for (const body of [
+      { token: 't', mode: 'conversation_only' },
+      { token: 't', mode: 'files_only' },
+      { token: 't', mode: 'ALL' },
+      { token: '', mode: 'conversation' },
+      { token: 'x'.repeat(65), mode: 'conversation' },
+      { token: 't' },
+      { mode: 'conversation' },
+      { token: 't', mode: 'conversation', dryRun: true },
+      { token: 1, mode: 'conversation' },
+    ]) {
+      expect([body, refused(rewindInput, body)]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+  });
+});
+
+describe('the fork input', () => {
+  // Mutation: make `entry` required → the whole-conversation fork body `{}` is refused.
+  // Mutation: let `{entry}` through without its time → the message is named by its place only.
+  it('takes {} (the whole conversation) or {entry, ts} (a whole number from 0 and the entry’s time), nothing else', () => {
+    expect(forkInput({})).toEqual({});
+    expect(forkInput({ entry: 0, ts: 1_700_000_000_000 })).toEqual({ at: { entry: 0, ts: 1_700_000_000_000 } });
+    expect(forkInput({ entry: 7, ts: 5 })).toEqual({ at: { entry: 7, ts: 5 } });
+    for (const body of [
+      { entry: 1 },
+      { ts: 5 },
+      { entry: -1, ts: 5 },
+      { entry: 1.5, ts: 5 },
+      { entry: '1', ts: 5 },
+      { entry: 1, ts: Number.NaN },
+      { entry: 1, ts: '5' },
+      { entry: 1, ts: 5, target: 1 },
+      { title: 'x' },
+      null,
+    ]) {
+      let code = 'ok';
+      try {
+        forkInput(body);
+      } catch (error) {
+        code = (error as { code?: string }).code ?? 'thrown';
+      }
+      expect([body, code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+  });
+});
+
+describe('the goal input', () => {
+  // Mutation: let any string through as the action → `{action: 'status'}` is accepted.
+  it('takes exactly {action: pause | resume | clear}', () => {
+    for (const action of ['pause', 'resume', 'clear'] as const) expect(goalInput({ action })).toEqual({ action });
+    for (const body of [
+      {},
+      { action: 'status' },
+      { action: '/goal pause' },
+      { action: 'Pause' },
+      { action: 1 },
+      { action: 'pause', text: '/goal pause' },
+      null,
+    ]) {
+      let code = 'ok';
+      try {
+        goalInput(body);
+      } catch (error) {
+        code = (error as { code?: string }).code ?? 'thrown';
+      }
+      expect([body, code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+  });
+});
+
+describe('the interaction answer input', () => {
+  it('takes {optionId}, {optionId: reject-once, note} with at most 4,000 characters, or {decision, feedback?}', () => {
+    expect(interactionInput({ optionId: 'allow-once' })).toEqual({ optionId: 'allow-once' });
+    expect(interactionInput({ optionId: 'reject-once', note: 'use pnpm, not npm' })).toEqual({
+      optionId: 'reject-once',
+      note: 'use pnpm, not npm',
+    });
+    expect(interactionInput({ optionId: 'reject-once', note: '  ' })).toEqual({ optionId: 'reject-once', note: '  ' });
+    const longest = 'x'.repeat(MAX_FEEDBACK_CHARS);
+    expect(interactionInput({ optionId: 'reject-once', note: longest })).toEqual({
+      optionId: 'reject-once',
+      note: longest,
+    });
+    expect(interactionInput({ decision: 'rejected', feedback: 'more tests' })).toEqual({
+      decision: 'rejected',
+      feedback: 'more tests',
+    });
+    expect(interactionInput({ never: 'short' })).toEqual({ never: 'short' });
+    expect(interactionInput({ never: 'exact' })).toEqual({ never: 'exact' });
+    for (const body of [
+      { never: 'all' },
+      { never: 1 },
+      { never: 'short', optionId: 'reject-once' },
+      { never: 'short', note: 'x' },
+      { optionId: 'reject-once', note: 'x'.repeat(MAX_FEEDBACK_CHARS + 1) },
+      { optionId: 'allow-once', note: 'use pnpm' },
+      { optionId: 'always-allow', note: 'use pnpm' },
+      { optionId: 'reject-once', note: 7 },
+      { optionId: 'reject-once', note: null },
+      { optionId: 'reject-once', note: '\ud800' },
+      { optionId: 'reject-once', note: 'x', feedback: 'y' },
+      { decision: 'rejected', note: 'x' },
+      { note: 'x' },
+    ]) {
+      let code = 'ok';
+      try {
+        interactionInput(body);
+      } catch (error) {
+        code = (error as { code?: string }).code ?? 'thrown';
+      }
+      expect([body, code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+  });
+});
+
+describe('the queue routes', () => {
+  it('prompt takes whenBusy "queue" or "now"; a row patch is exactly {text} or {editing}; Send now exactly {how: "now"}', () => {
+    expect(promptInput({ text: 'hi', whenBusy: 'queue' })).toEqual({ text: 'hi', whenBusy: 'queue' });
+    expect(promptInput({ text: 'hi', whenBusy: 'now' })).toEqual({ text: 'hi', whenBusy: 'now' });
+    expect(promptInput({ text: 'hi' })).toEqual({ text: 'hi' });
+    for (const whenBusy of ['later', 'Now', '']) {
+      expect(() => promptInput({ text: 'hi', whenBusy })).toThrow('Field "whenBusy" must be "queue" or "now".');
+    }
+    expect(queueSendInput({ how: 'now' })).toEqual({ how: 'now' });
+    for (const body of [{}, { how: 'later' }, { how: 'now', text: 'x' }, { how: true }, ['now'], null]) {
+      expect(() => queueSendInput(body)).toThrow();
+    }
+    expect(() => promptInput({ text: 'hi', whenBusy: true })).toThrow('wrong type');
+    expect(queuePatchInput({ text: 'new words' })).toEqual({ text: 'new words' });
+    expect(queuePatchInput({ editing: true })).toEqual({ editing: true });
+    expect(queuePatchInput({ editing: false })).toEqual({ editing: false });
+    const refused: unknown[] = [
+      {},
+      { text: 'a', editing: true },
+      { editing: 'yes' },
+      { text: 3 },
+      { text: '   ' },
+      { text: 'a', plan: true },
+      { how: 'now' },
+      ['a'],
+    ];
+    for (const body of refused) {
+      let code: string | undefined;
+      try {
+        queuePatchInput(body);
+      } catch (error) {
+        code = (error as { code?: string }).code;
+      }
+      expect([body, code]).toEqual([body, 'E_BAD_REQUEST']);
+    }
+    expect(() => queuePatchInput({ text: '/yolo' })).toThrow('No such command here.');
+  });
+
+  it('queues with 202 {queued} while an answer runs; edits, removes, clears and releases through their routes', async () => {
+    const gate = join(base, 'gate');
+    start('chat-basic', (scenario) => {
+      scenario.prompts = [
+        { match: 'hold', steps: [{ holdOn: gate }, { text: 'ok', chunk: 2 }, { end: { stopReason: 'end_turn' } }] },
+        { match: '', steps: [{ text: 'ok', chunk: 2 }, { end: { stopReason: 'end_turn' } }] },
+      ];
+    });
+    const conversation = await created('hold on');
+    const id = conversation.id;
+    const w = watch(id);
+    await until(
+      () => w.events.some((e) => (e.type === 'turn' || e.type === 'sync') && e.turn?.phase === 'running'),
+      5_000,
+    );
+    const path = `/api/chat/conversations/${id}`;
+    const queuedOf = async (text: string): Promise<string> => {
+      const response = await call('POST', `${path}/prompt`, { text, whenBusy: 'queue' });
+      expect(response.ok && response.status).toBe(202);
+      return (response as { body: { queued: string } }).body.queued;
+    };
+    const a = await queuedOf('row a');
+    const b = await queuedOf('row b');
+    expect(failureOf(await call('POST', `${path}/prompt`, { text: 'no queue' }))).toMatchObject({
+      code: 'E_CONFLICT',
+      reason: 'conversation-busy',
+    });
+    const lastQueue = () => {
+      const events = w.events.filter((e) => e.type === 'queue');
+      const last = events.at(-1);
+      return last?.type === 'queue' ? last.queue : null;
+    };
+    expect(lastQueue()?.items.map((item) => item.text)).toEqual(['row a', 'row b']);
+
+    for (const [method, route, body] of [
+      ['PATCH', `${path}/queue/${a}`, { text: 'a', extra: 1 }],
+      ['PATCH', `${path}/queue/${a}`, { how: 'now' }],
+      ['DELETE', `${path}/queue/${a}`, { force: true }],
+      ['DELETE', `${path}/queue`, { all: true }],
+      ['POST', `${path}/queue/release`, { now: true }],
+    ] as const) {
+      expect([method, route, failureOf(await call(method, route, body)).code]).toEqual([
+        method,
+        route,
+        'E_BAD_REQUEST',
+      ]);
+    }
+    expect(failureOf(await call('PATCH', `${path}/queue/no-such-row`, { text: 'x' })).code).toBe('E_NOT_FOUND');
+    expect(failureOf(await call('DELETE', `${path}/queue/bad id`)).code).toBe('E_NOT_FOUND');
+
+    const edited = await call('PATCH', `${path}/queue/${a}`, { text: 'row a, edited' });
+    expect(edited.ok && edited.body).toEqual({});
+    const removed = await call('DELETE', `${path}/queue/${b}`);
+    expect(removed.ok && removed.body).toEqual({});
+    expect(lastQueue()?.items.map((item) => item.text)).toEqual(['row a, edited']);
+
+    const cancelled = await call('POST', `${path}/cancel`);
+    expect(cancelled.ok && cancelled.body).toEqual({ cancelled: true });
+    await w.ended();
+    await until(() => lastQueue()?.held !== null, 5_000);
+    expect(lastQueue()?.held).toEqual({ why: 'stopped' });
+    const released = await call('POST', `${path}/queue/release`);
+    expect(released.ok && released.body).toEqual({});
+    await until(() => sent().filter((m) => m.method === 'session/prompt').length === 2, 5_000);
+    const texts = sent()
+      .filter((m) => m.method === 'session/prompt')
+      .map((m) => ((m.params as Json).prompt as Json[])[0]!.text);
+    expect(texts).toEqual(['hold on', 'row a, edited']);
+    await until(() => lastQueue()?.items.length === 0, 5_000);
+    await settled(id);
+
+    const cleared = await call('DELETE', `${path}/queue`);
+    expect(cleared.ok && cleared.body).toEqual({});
+    w.off();
+  }, 20_000);
+
+  it('Send now: exactly {how: "now"}; Chat answers 409 and sends nothing; a gone row is 404', async () => {
+    const gate = join(base, 'gate');
+    start('chat-basic', (scenario) => {
+      scenario.prompts = [
+        { match: 'hold', steps: [{ holdOn: gate }, { text: 'ok', chunk: 2 }, { end: { stopReason: 'end_turn' } }] },
+        { match: '', steps: [{ text: 'ok', chunk: 2 }, { end: { stopReason: 'end_turn' } }] },
+      ];
+    });
+    const conversation = await created('hold on');
+    const id = conversation.id;
+    const w = watch(id);
+    await until(
+      () => w.events.some((e) => (e.type === 'turn' || e.type === 'sync') && e.turn?.phase === 'running'),
+      5_000,
+    );
+    const path = `/api/chat/conversations/${id}`;
+    const queued = await call('POST', `${path}/prompt`, { text: 'row a', whenBusy: 'queue' });
+    const a = (queued as { body: { queued: string } }).body.queued;
+    for (const body of [undefined, {}, { how: 'later' }, { how: 'now', extra: 1 }]) {
+      expect([body, failureOf(await call('POST', `${path}/queue/${a}/send`, body)).code]).toEqual([
+        body,
+        'E_BAD_REQUEST',
+      ]);
+    }
+    expect(failureOf(await call('POST', `${path}/queue/${a}/send`, { how: 'now' }))).toMatchObject({
+      code: 'E_CONFLICT',
+      reason: 'steer-work-only',
+    });
+    expect(failureOf(await call('POST', `${path}/prompt`, { text: 'now', whenBusy: 'now' }))).toMatchObject({
+      code: 'E_CONFLICT',
+      reason: 'steer-work-only',
+    });
+    expect(failureOf(await call('POST', `${path}/queue/bad id/send`, { how: 'now' })).code).toBe('E_NOT_FOUND');
+    expect(sent().some((m) => m.method === '_x.ai/interject')).toBe(false);
+    await call('POST', `${path}/cancel`);
+    await w.ended();
+    w.off();
+  }, 20_000);
+});
+
+describe('the task stop route (T1)', () => {
+  function startTasks(faults: Json = {}): string {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-plan',
+      (scenario) => {
+        scenario.prompts = [
+          {
+            match: 'Start',
+            steps: [{ background: { wake: false } }, { text: 'Started.' }, { end: { stopReason: 'end_turn' } }],
+          },
+          { match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] },
+        ];
+        scenario.faults = { ...(scenario.faults as Json | undefined), ...faults };
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    return project;
+  }
+
+  /** The task id on the stream's entries, once the background step named it. */
+  function taskOf(events: readonly ConversationEvent[]): string | null {
+    for (const e of events) {
+      const list =
+        e.type === 'sync'
+          ? e.entries
+          : e.type === 'ops'
+            ? e.ops.flatMap((op) => ('entry' in op ? [op.entry] : []))
+            : [];
+      for (const entry of list) if (entry.kind === 'tool' && entry.task !== undefined) return entry.task.id;
+    }
+    return null;
+  }
+
+  // Mutation: answer `not-live` as 503 → the page says "Could not stop" for a command that already ended.
+  it('200 sends the kill and the end arrives; 404 for a task that is not live or a bad id; a body is refused', async () => {
+    const project = startTasks();
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Start it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => taskOf(w.events) !== null, 5_000);
+    await settled(id);
+    const task = taskOf(w.events)!;
+    const path = `/api/chat/conversations/${id}/tasks`;
+
+    expect(failureOf(await call('POST', `${path}/${task}/stop`, { now: true })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', `${path}/no-such-task/stop`))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such task.',
+    });
+    expect(failureOf(await call('POST', `${path}/bad.id/stop`)).code).toBe('E_NOT_FOUND');
+    expect(sent().some((m) => m.method === '_x.ai/task/kill')).toBe(false);
+
+    const stopped = await call('POST', `${path}/${task}/stop`);
+    expect(stopped.ok && stopped.body).toEqual({});
+    expect(sent().find((m) => m.method === '_x.ai/task/kill')?.params).toEqual({
+      sessionId: id,
+      taskId: task,
+      source: 'clientUi',
+    });
+    await until(
+      () =>
+        w.events.some(
+          (e) =>
+            e.type === 'ops' &&
+            e.ops.some((op) => 'entry' in op && op.entry.kind === 'tool' && op.entry.task?.killed === true),
+        ),
+      5_000,
+    );
+    expect(w.events.some((e) => e.type === 'activity' && e.live.tasks.some((t) => t.stopping))).toBe(true);
+    expect(failureOf(await call('POST', `${path}/${task}/stop`)).code).toBe('E_NOT_FOUND');
+    w.off();
+  }, 30_000);
+
+  // Mutation: leave the tasks out of `sync.live` → a reopen shows Stop again on a task whose stop is out.
+  it('a reopen while the stop waits for the end line reads stopping from sync', async () => {
+    const project = startTasks({ killReply: 'already_exited' });
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Start it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => taskOf(w.events) !== null, 5_000);
+    await settled(id);
+    const task = taskOf(w.events)!;
+    w.off();
+    const stopped = await call('POST', `/api/chat/conversations/${id}/tasks/${task}/stop`);
+    expect(stopped.ok && stopped.body).toEqual({});
+    const again = watch(id);
+    await until(() => again.events.some((e) => e.type === 'sync'), 5_000);
+    const sync = again.events.find((e) => e.type === 'sync');
+    expect(sync?.type === 'sync' ? sync.live.tasks : null).toEqual([
+      { id: task, kind: 'command', stopping: true, events: 0, recent: [] },
+    ]);
+    again.off();
+  }, 30_000);
+
+  it('a Chat conversation has no tasks: 404', async () => {
+    start('chat-basic');
+    const conversation = await created();
+    await settled(conversation.id);
+    expect(failureOf(await call('POST', `/api/chat/conversations/${conversation.id}/tasks/task-1/stop`))).toMatchObject(
+      { code: 'E_NOT_FOUND', message: 'No such task.' },
+    );
+    expect(sent().some((m) => m.method === '_x.ai/task/kill')).toBe(false);
+  }, 30_000);
+
+  it('503 when the agent answers with an error, and the task can be stopped again', async () => {
+    const project = startTasks({ killReply: 'error' });
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Start it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => taskOf(w.events) !== null, 5_000);
+    await settled(id);
+    const failed = await call('POST', `/api/chat/conversations/${id}/tasks/${taskOf(w.events)!}/stop`);
+    expect(failureOf(failed)).toMatchObject({ code: 'E_UNAVAILABLE', message: 'The agent could not be reached.' });
+    const lastLive = [...w.events].reverse().find((e) => e.type === 'activity');
+    expect(lastLive?.type === 'activity' && lastLive.live.tasks.map((t) => t.stopping)).toEqual([false]);
+    w.off();
+  }, 30_000);
+});
+
+describe('the subagent routes: Stop and Message', () => {
+  const CHILD = 'helper-1';
+
+  function startHelper(faults: Json = {}): string {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-plan',
+      (scenario) => {
+        scenario.prompts = [
+          {
+            match: 'Start',
+            steps: [
+              { helper: { child: CHILD, wake: false } },
+              { text: 'Started.' },
+              { end: { stopReason: 'end_turn' } },
+            ],
+          },
+          { match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] },
+        ];
+        scenario.faults = { ...(scenario.faults as Json | undefined), ...faults };
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    return project;
+  }
+
+  /** A Work conversation whose first turn started the helper, with its stream. */
+  async function running(project: string): Promise<{ id: string; w: Watch }> {
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Start it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => w.events.some((e) => e.type === 'activity' && e.live.agents.length > 0), 5_000);
+    await settled(id);
+    return { id, w };
+  }
+
+  const subagentsOf = (events: readonly ConversationEvent[]): unknown => {
+    const last = [...events].reverse().find((e) => e.type === 'activity' || e.type === 'sync');
+    return last?.type === 'activity' || last?.type === 'sync' ? last.live.agents : null;
+  };
+
+  // Mutation: answer `not-live` as 503 → the page says "Could not stop" for a subagent that already ended.
+  // Mutation: drop `subagents` from the conversation's copy of the live facts → the page never shows Stop.
+  it('stop: 200 sends the cancel and the end arrives; 404 for a subagent not running here or a bad id; a body is refused', async () => {
+    const { id, w } = await running(startHelper());
+    expect(subagentsOf(w.events)).toEqual([
+      { childId: CHILD, run: null, attempts: [CHILD], stopping: false, messages: 'on' },
+    ]);
+    const path = `/api/chat/conversations/${id}/subagents`;
+    expect(failureOf(await call('POST', `${path}/${CHILD}/stop`, { now: true })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', `${path}/stranger/stop`))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such subagent.',
+    });
+    expect(failureOf(await call('POST', `${path}/bad.id/stop`)).code).toBe('E_NOT_FOUND');
+    expect(sent().some((m) => m.method === '_x.ai/subagent/cancel')).toBe(false);
+
+    const stopped = await call('POST', `${path}/${CHILD}/stop`);
+    expect(stopped.ok && stopped.body).toEqual({});
+    expect(sent().find((m) => m.method === '_x.ai/subagent/cancel')?.params).toEqual({ subagentId: CHILD });
+    expect(w.events.some((e) => e.type === 'activity' && e.live.agents.some((s) => s.stopping))).toBe(true);
+    await until(
+      () =>
+        w.events.some(
+          (e) =>
+            e.type === 'ops' &&
+            e.ops.some((op) => 'entry' in op && op.entry.kind === 'subagent' && op.entry.status === 'cancelled'),
+        ),
+      5_000,
+    );
+    await until(() => JSON.stringify(subagentsOf(w.events)) === '[]', 5_000);
+    expect(failureOf(await call('POST', `${path}/${CHILD}/stop`)).code).toBe('E_NOT_FOUND');
+    w.off();
+  }, 30_000);
+
+  // Mutation: let a blank text through → an empty message goes to the agent, which answers `limit`.
+  // Mutation: answer `gone` as a result → the page keeps the popover open for a subagent that ended.
+  it('message: 200 names the result; 400 for a blank or wrong body; 404 when it is not running here', async () => {
+    const { id, w } = await running(startHelper({ messageReplies: ['not_active'] }));
+    const path = `/api/chat/conversations/${id}/subagents/${CHILD}/message`;
+    expect(failureOf(await call('POST', path, { text: '  \n ' })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path, { text: 'hi', queue: true })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path)).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path, { text: 'x'.repeat(100_001) })).code).toBe('E_PAYLOAD_TOO_LARGE');
+    expect(sent().some((m) => m.method === '_x.ai/subagent/message')).toBe(false);
+
+    const notReady = await call('POST', path, { text: '/compact is plain text here' });
+    expect(notReady.ok && notReady.body).toEqual({ result: 'not-ready' });
+    const ok = await call('POST', path, { text: '/compact is plain text here' });
+    expect(ok.ok && ok.body).toEqual({ result: 'sent' });
+    expect(
+      sent()
+        .filter((m) => m.method === '_x.ai/subagent/message')
+        .map((m) => m.params),
+    ).toEqual([
+      {
+        sessionId: id,
+        agentAddress: `addr-${CHILD}`,
+        content: [{ type: 'text', text: '/compact is plain text here' }],
+      },
+      {
+        sessionId: id,
+        agentAddress: `addr-${CHILD}`,
+        content: [{ type: 'text', text: '/compact is plain text here' }],
+      },
+    ]);
+    expect(
+      failureOf(await call('POST', `/api/chat/conversations/${id}/subagents/stranger/message`, { text: 'hi' })),
+    ).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such subagent.',
+    });
+    w.off();
+  }, 30_000);
+
+  it('a Chat conversation has no subagents: 404 for both, and nothing is sent', async () => {
+    start('chat-basic');
+    const conversation = await created();
+    await settled(conversation.id);
+    const path = `/api/chat/conversations/${conversation.id}/subagents/${CHILD}`;
+    expect(failureOf(await call('POST', `${path}/stop`))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such subagent.',
+    });
+    expect(failureOf(await call('POST', `${path}/message`, { text: 'hi' }))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such subagent.',
+    });
+    expect(sent().some((m) => m.method === '_x.ai/subagent/cancel' || m.method === '_x.ai/subagent/message')).toBe(
+      false,
+    );
+  }, 30_000);
+
+  it('503 when the cancel gets an error reply; the subagent can be stopped again', async () => {
+    const { id, w } = await running(startHelper({ cancelReply: 'error' }));
+    const failed = await call('POST', `/api/chat/conversations/${id}/subagents/${CHILD}/stop`);
+    expect(failureOf(failed)).toMatchObject({ code: 'E_UNAVAILABLE', message: 'The agent could not be reached.' });
+    expect(subagentsOf(w.events)).toEqual([
+      { childId: CHILD, run: null, attempts: [CHILD], stopping: false, messages: 'on' },
+    ]);
+    w.off();
+  }, 30_000);
+});
+
+describe('the subagent watch routes: the Agent view', () => {
+  const CHILD = 'helper-watched';
+
+  type AgentEvent = Extract<ConversationEvent, { type: 'agent-entries' }>;
+  const agentEvents = (events: readonly ConversationEvent[]): AgentEvent[] =>
+    events.filter((e): e is AgentEvent => e.type === 'agent-entries');
+
+  /** The list the window holds: the watch's answer, then each of its events in order. */
+  function windowList(answer: AgentWatchAnswer, events: readonly ConversationEvent[]): TranscriptEntry[] {
+    let entries = [...answer.entries];
+    for (const event of agentEvents(events)) {
+      if (event.window !== 'win-1' || event.childId !== CHILD) continue;
+      if (event.stored !== undefined) entries = [...event.stored];
+      for (const op of event.ops) applyOp(entries, [], op);
+    }
+    return entries;
+  }
+
+  // Mutation: drop the child's lines in the host (no `watches.line`) → the message streamed after the watch never shows.
+  // Mutation: no end swap at the agent's end (no `agentsSettled` after the tracker) → the stored list never comes.
+  it('answers the file and later lines live, redacted, then the stored list once the agent ended', async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    const more = join(base, 'more.gate');
+    const end = join(base, 'end.gate');
+    start(
+      'work-plan',
+      (scenario) => {
+        scenario.persist = true;
+        scenario.prompts = [
+          {
+            match: 'Start',
+            steps: [
+              {
+                helper: {
+                  child: CHILD,
+                  wake: false,
+                  lines: [
+                    { prompt: 'Find the flaky test' },
+                    { thought: 'Looking at the tests', chunks: 3 },
+                    { tool: 'call-1', title: 'Read src/a.test.ts' },
+                  ],
+                  more: [{ message: `The token is ${INFERENCE_TOKEN}. Found it.`, chunks: 5 }],
+                  moreOn: more,
+                  endOn: end,
+                  endLagMs: 400,
+                },
+              },
+              { text: 'Started.' },
+              { end: { stopReason: 'end_turn' } },
+            ],
+          },
+          { match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] },
+        ];
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Start it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => w.events.some((e) => e.type === 'activity' && e.live.agents.length > 0), 5_000);
+    await settled(id);
+    const path = `/api/chat/conversations/${id}/subagents/${CHILD}/watch`;
+
+    expect(failureOf(await call('POST', path)).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path, { window: 'not an id' })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', path, { window: 'win-1', extra: 1 })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('DELETE', path)).code).toBe('E_BAD_REQUEST');
+    expect(
+      failureOf(await call('POST', `/api/chat/conversations/${id}/subagents/stranger/watch`, { window: 'win-1' })),
+    ).toMatchObject({ code: 'E_NOT_FOUND', message: 'No such subagent.' });
+
+    const first = await call('POST', path, { window: 'win-1' });
+    if (!first.ok) throw new Error(first.message);
+    const answer = first.body as AgentWatchAnswer;
+    expect({ childId: answer.childId, attempts: answer.attempts, live: answer.live }).toEqual({
+      childId: CHILD,
+      attempts: [CHILD],
+      live: true,
+    });
+    expect(answer.entries.map((e) => e.kind)).toEqual(['user', 'thinking', 'tool']);
+    expect(answer.entries[1]?.kind === 'thinking' && answer.entries[1].text).toBe('Looking at the tests');
+
+    // Another conversation cannot close this window's view of an agent it did not start.
+    const other = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Hello', cwd: project });
+    if (!other.ok) throw new Error(other.message);
+    const otherId = (other.body as { conversation: ConversationInfo }).conversation.id;
+    await settled(otherId);
+    expect(
+      failureOf(await call('DELETE', `/api/chat/conversations/${otherId}/subagents/${CHILD}/watch?window=win-1`)),
+    ).toMatchObject({ code: 'E_NOT_FOUND', message: 'No such subagent.' });
+
+    writeFileSync(more, '');
+    await until(() => windowList(answer, w.events).some((e) => e.kind === 'assistant'), 5_000);
+    await until(() => {
+      const said = windowList(answer, w.events).find((e) => e.kind === 'assistant');
+      return said?.kind === 'assistant' && said.text.endsWith('Found it.');
+    }, 5_000);
+    const said = windowList(answer, w.events).find((e) => e.kind === 'assistant');
+    expect(said?.kind === 'assistant' && said.text).toBe(`The token is ${REDACTED}. Found it.`);
+
+    writeFileSync(end, '');
+    await until(() => agentEvents(w.events).some((e) => e.stored !== undefined), 10_000);
+    const stored = agentEvents(w.events).find((e) => e.stored !== undefined)!;
+    expect(stored.window).toBe('win-1');
+    expect(stored.stored!.map((e) => e.kind)).toEqual(['user', 'thinking', 'tool', 'assistant', 'turn-end']);
+    expect(JSON.stringify(w.events)).not.toContain(INFERENCE_TOKEN);
+
+    const again = await call('POST', path, { window: 'win-1' });
+    if (!again.ok) throw new Error(again.message);
+    const reopened = again.body as AgentWatchAnswer;
+    expect(reopened.live).toBe(false);
+    expect(reopened.entries).toEqual(stored.stored);
+    const closed = await call('DELETE', `${path}?window=win-1`);
+    expect(closed.ok && closed.body).toEqual({});
+    w.off();
+  }, 30_000);
+
+  it('a Chat conversation has no agents to watch: 404', async () => {
+    start('chat-basic');
+    const conversation = await created();
+    await settled(conversation.id);
+    const path = `/api/chat/conversations/${conversation.id}/subagents/${CHILD}/watch`;
+    expect(failureOf(await call('POST', path, { window: 'win-1' }))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such subagent.',
+    });
+  }, 30_000);
+});
+
+describe('the schedule delete route (T3)', () => {
+  function startSchedule(faults: Json = {}): string {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-plan',
+      (scenario) => {
+        scenario.persist = true;
+        scenario.prompts = [
+          {
+            match: 'Schedule',
+            steps: [{ schedule: { taskId: 's1' } }, { text: 'Scheduled.' }, { end: { stopReason: 'end_turn' } }],
+          },
+          { match: '', steps: [{ text: 'ok' }, { end: { stopReason: 'end_turn' } }] },
+        ];
+        scenario.faults = { ...(scenario.faults as Json | undefined), ...faults };
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    return project;
+  }
+
+  async function scheduledConversation(project: string): Promise<{ id: string; w: Watch }> {
+    const made = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'Schedule it', cwd: project });
+    if (!made.ok) throw new Error(made.message);
+    const id = (made.body as { conversation: ConversationInfo }).conversation.id;
+    const w = watch(id);
+    await until(() => scheduleEnded(w.events) === false, 5_000);
+    await settled(id);
+    return { id, w };
+  }
+
+  /** The schedule row's state on the stream: null before it shows, then whether it ended. */
+  function scheduleEnded(events: readonly ConversationEvent[]): boolean | null {
+    let ended: boolean | null = null;
+    for (const e of events) {
+      const list =
+        e.type === 'sync'
+          ? e.entries
+          : e.type === 'ops'
+            ? e.ops.flatMap((op) => ('entry' in op ? [op.entry] : []))
+            : [];
+      for (const entry of list) {
+        if (entry.kind === 'tool' && entry.schedule?.id === 's1') ended = entry.schedule.endTs !== undefined;
+      }
+    }
+    return ended;
+  }
+
+  const deletes = (): Json[] => sent().filter((m) => m.method === '_x.ai/scheduler/delete');
+
+  // Mutation: answer `gone` as 503 → the page says "Could not delete" for a schedule the agent already removed.
+  it('200 deletes it and its row ends; 404 for a schedule the thread does not list, a bad id, or once gone', async () => {
+    const project = startSchedule();
+    const { id, w } = await scheduledConversation(project);
+    const path = `/api/chat/conversations/${id}/schedules`;
+    expect(failureOf(await call('POST', `${path}/s1/delete`, { now: true })).code).toBe('E_BAD_REQUEST');
+    expect(failureOf(await call('POST', `${path}/no-such-schedule/delete`))).toMatchObject({
+      code: 'E_NOT_FOUND',
+      message: 'No such schedule.',
+    });
+    expect(failureOf(await call('POST', `${path}/bad.id/delete`)).code).toBe('E_NOT_FOUND');
+    expect(deletes()).toEqual([]);
+
+    const deleted = await call('POST', `${path}/s1/delete`);
+    expect(deleted.ok && deleted.body).toEqual({});
+    expect(deletes().map((m) => m.params)).toEqual([{ sessionId: id, taskId: 's1' }]);
+    await until(() => scheduleEnded(w.events) === true, 5_000);
+    expect(w.events.some((e) => e.type === 'activity' && e.live.schedules.some((s) => s.deleting === 'removing'))).toBe(
+      true,
+    );
+    expect(failureOf(await call('POST', `${path}/s1/delete`)).code).toBe('E_NOT_FOUND');
+    w.off();
+  }, 30_000);
+
+  // Mutation: skip the load for a conversation the agent does not hold → the agent answers "session not found" (503).
+  it('a paused schedule: the conversation loads first, then the schedule is deleted', async () => {
+    const project = startSchedule();
+    const { id, w } = await scheduledConversation(project);
+    w.off();
+    expect((await call('POST', '/api/chat/agent', { action: 'restart', mode: 'work' })).ok).toBe(true);
+    const again = watch(id);
+    await until(() => again.events.some((e) => e.type === 'sync' && !e.conversation.hot), 5_000);
+    const deleted = await call('POST', `/api/chat/conversations/${id}/schedules/s1/delete`);
+    expect(deleted.ok && deleted.body).toEqual({});
+    const order = sent()
+      .map((m) => m.method)
+      .filter((m) => m === 'session/load' || m === '_x.ai/scheduler/delete');
+    expect(order).toEqual(['session/load', '_x.ai/scheduler/delete']);
+    expect(
+      again.events.some((e) => e.type === 'activity' && e.live.schedules.some((s) => s.deleting === 'opening')),
+    ).toBe(true);
+    await until(() => scheduleEnded(again.events) === true, 5_000);
+    await until(() => again.events.some((e) => e.type === 'conversation' && e.conversation.hot), 5_000);
+    again.off();
+  }, 30_000);
+
+  it('a Chat conversation has no schedules: 404', async () => {
+    start('chat-basic');
+    const conversation = await created();
+    await settled(conversation.id);
+    expect(
+      failureOf(await call('POST', `/api/chat/conversations/${conversation.id}/schedules/s1/delete`)),
+    ).toMatchObject({ code: 'E_NOT_FOUND', message: 'No such schedule.' });
+    expect(deletes()).toEqual([]);
+  }, 30_000);
+
+  it('503 when the agent answers with an error, and the row is back', async () => {
+    const project = startSchedule({ scheduleDeleteReply: 'error' });
+    const { id, w } = await scheduledConversation(project);
+    const failed = await call('POST', `/api/chat/conversations/${id}/schedules/s1/delete`);
+    expect(failureOf(failed)).toMatchObject({ code: 'E_UNAVAILABLE', message: 'The agent could not be reached.' });
+    const lastLive = [...w.events].reverse().find((e) => e.type === 'activity');
+    expect(lastLive?.type === 'activity' && lastLive.live.schedules).toEqual([
+      { id: 's1', deleting: null, firing: null },
+    ]);
+    expect(scheduleEnded(w.events)).toBe(false);
+    w.off();
+  }, 30_000);
+});
+
+describe('Chat routes — slash commands', () => {
+  const refusal = async (path: string, text: string): Promise<[string, string | undefined]> => {
+    const response = await call('POST', path, { text });
+    return [text, response.ok ? `ok ${response.status}` : failureOf(response).reason];
+  };
+
+  it('Work sends its built-ins and the listed skills as typed; app, blocked, hidden, unknown and unlisted are refused', async () => {
+    const home = join(base, 'home');
+    const project = join(home, 'code', 'app');
+    mkdirSync(project, { recursive: true });
+    start(
+      'work-length',
+      (scenario) => {
+        scenario.prompts = [{ match: '', steps: [{ text: 'Done.' }, { end: { stopReason: 'end_turn' } }] }];
+        scenario.session = {
+          ...(scenario.session as Json),
+          commands: { skills: [{ name: 'commit', description: 'Write a commit message' }] },
+        };
+      },
+      { baseEnv: { PATH: process.env.PATH ?? '/usr/bin:/bin', HOME: home } },
+    );
+    const createdReply = await call('POST', '/api/chat/conversations', { mode: 'work', text: 'hello', cwd: project });
+    if (!createdReply.ok) throw new Error(createdReply.message);
+    const id = (createdReply.body as { conversation: ConversationInfo }).conversation.id;
+    await settled(id);
+    const path = `/api/chat/conversations/${id}/prompt`;
+    for (const text of [
+      '/compact',
+      '/context now',
+      '/rewind',
+      '/fork',
+      '/recap',
+      '/yolo',
+      '/status',
+      '/hooks-add x',
+      '/nothere',
+      '/a/b',
+    ]) {
+      expect(await refusal(path, text)).toEqual([text, 'slash-text']);
+    }
+    expect(await refusal(path, '/goal ship it')).toEqual(['/goal ship it', 'ok 202']);
+    await settled(id);
+    expect(await refusal(path, '/commit fix')).toEqual(['/commit fix', 'ok 202']);
+    await settled(id);
+    const prompts = sent()
+      .filter((m) => m.method === 'session/prompt')
+      .map((m) => ((m.params as Json).prompt as Json[])[0]!.text);
+    expect(prompts).toEqual(['hello', '/goal ship it', '/commit fix']);
+  }, 30_000);
+
+  it('Chat sends no agent command, and a refused first message makes no conversation', async () => {
+    start('chat-basic');
+    const conversation = await created('hello');
+    await settled(conversation.id);
+    const path = `/api/chat/conversations/${conversation.id}/prompt`;
+    for (const text of ['/goal ship it', '/loop 5m check', '/compact', '/workflow runs']) {
+      expect(await refusal(path, text)).toEqual([text, 'slash-text']);
+    }
+    const first = await call('POST', '/api/chat/conversations', { mode: 'chat', text: '/goal x' });
+    expect(failureOf(first).reason).toBe('slash-text');
+    const list = await call('GET', '/api/chat/conversations?mode=chat');
+    expect(list.ok && (list.body as { conversations: unknown[] }).conversations).toHaveLength(1);
+    expect(sent().filter((m) => m.method === 'session/new')).toHaveLength(1);
+  }, 30_000);
 });

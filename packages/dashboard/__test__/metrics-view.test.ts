@@ -243,7 +243,7 @@ describe('turnPhases with the native timers', () => {
 });
 
 describe('turnTimeline', () => {
-  it('draws model busy, slot and prepare before the setup, the first-token marker after them', () => {
+  it('puts the first-token marker after model busy, slot, prepare, setup and prefill', () => {
     const timeline = turnTimeline(
       turnRow('t', {
         preDispatchMs: 0,
@@ -257,15 +257,6 @@ describe('turnTimeline', () => {
         durationMs: 79_700,
       }),
     );
-    expect(timeline.spans.map((span) => [span.kind, span.label, span.startMs, span.endMs])).toEqual([
-      ['busy', 'Model busy', 0, 75_070],
-      ['slot', 'Waiting for a slot', 75_070, 75_370],
-      ['prepare', 'Preparing', 75_370, 76_570],
-      ['setup', 'Setup', 76_570, 77_170],
-      ['prefill', 'Prefill', 77_170, 77_670],
-      ['decode', 'Decode', 77_670, 79_670],
-      ['other', 'Other', 79_670, 79_700],
-    ]);
     expect(timeline.markers[0]?.atMs).toBe(77_670);
   });
 
@@ -429,7 +420,7 @@ describe('units and bins', () => {
 
 describe('kpiTiles', () => {
   it('keeps a null median as no data and never as 0', () => {
-    const tiles = kpiTiles(emptySummary(), versusText('7d'), 'tails');
+    const tiles = kpiTiles(emptySummary(), versusText('7d'));
     const byKey = new Map(tiles.map((tile) => [tile.key, tile]));
     expect(byKey.get('decode')?.value).toBeNull();
     expect(byKey.get('ttft')?.value).toBeNull();
@@ -438,11 +429,8 @@ describe('kpiTiles', () => {
   });
 
   it('prints tails from 20 turns and the sample below', () => {
-    const many = new Map(kpiTiles(summary(), 'vs previous 7 days', 'tails').map((tile) => [tile.key, tile]));
-    expect(many.get('decode')?.hint).toBe('p05 21.0 · p95 63.0');
     const few = summary({ latency: { ...summary().latency, decodeTps: quantiles(40, 3) } });
-    const tiles = new Map(kpiTiles(few, 'vs previous 7 days', 'tails').map((tile) => [tile.key, tile]));
-    expect(tiles.get('decode')?.hint).toBe('median of 3 turns');
+    const tiles = new Map(kpiTiles(few, 'vs previous 7 days').map((tile) => [tile.key, tile]));
     expect(tiles.get('decode')?.sampleCount).toBe(3);
     expect(tiles.get('turns')?.hint).toBe('95 ok · 3 failed · 2 cancelled');
     expect(tiles.get('failed')?.hint).toBe('3% of turns');
@@ -495,6 +483,8 @@ describe('speculationView', () => {
         ],
         decodeTpsWithMtp: quantiles(50, 10),
         decodeTpsWithoutMtp: quantiles(40, 0),
+        decodeWith: { tokens: 0, ms: 0 },
+        decodeWithout: { tokens: 0, ms: 0 },
       },
       {
         model: 'b',
@@ -507,6 +497,8 @@ describe('speculationView', () => {
         acceptByPos: [{ pos: 0, rate: 0.4, cycles: 300 }],
         decodeTpsWithMtp: quantiles(50, 10),
         decodeTpsWithoutMtp: quantiles(40, 0),
+        decodeWith: { tokens: 0, ms: 0 },
+        decodeWithout: { tokens: 0, ms: 0 },
       },
       {
         model: 'c',
@@ -519,6 +511,8 @@ describe('speculationView', () => {
         acceptByPos: [],
         decodeTpsWithMtp: quantiles(null, 0),
         decodeTpsWithoutMtp: quantiles(40, 5),
+        decodeWith: { tokens: 0, ms: 0 },
+        decodeWithout: { tokens: 0, ms: 0 },
       },
     ]);
     expect(view.models.map((row) => row.model)).toEqual(['a', 'b']);

@@ -52,6 +52,7 @@ import {
   readAgentTag,
   releasePin,
 } from '@mlx-node/agent/binary';
+import { agentConfigDir, GROK_BUILD_ENV_REMOVED, LOOPBACK_CONNECT_ATTEMPTS } from '@mlx-node/agent/paths';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 import { idleReleaseText } from '@mlx-node/server/host/idle-release';
 import {
@@ -1614,6 +1615,7 @@ export function agentThinkingFlags(): string[] {
     String(AGENT_HOST_THINKING.tokenBudget),
     ...(AGENT_HOST_THINKING.cycleGuard ? ['--thinking-cycle-guard'] : []),
     `--thinking-end-text=${AGENT_HOST_THINKING.endText}`,
+    ...(AGENT_HOST_THINKING.levels ? ['--thinking-levels'] : []),
   ];
 }
 
@@ -1876,12 +1878,16 @@ export async function launchGrokAgent(opts: GrokAgentLaunchOptions): Promise<num
     const env = { ...process.env };
     // grok's exit hint prints this as the resume command; the bare `grok` is not on PATH.
     env.GROK_RESUME_COMMAND ??= 'mlx agent';
+    // An inherited GROK_HOME, GROK_AUTH_PATH or GROK_CONFIG_PATH is grok-build's own.
+    env.GROK_HOME = agentConfigDir();
+    for (const name of GROK_BUILD_ENV_REMOVED) delete env[name];
+    env.GROK_DISABLE_AUTOUPDATER = '1';
     if (serve) {
       env.GROK_MODELS_BASE_URL = serve.url;
       env.GROK_CLI_CHAT_PROXY_BASE_URL = serve.url;
       env.GROK_XAI_API_BASE_URL = serve.url;
       env.XAI_API_KEY = serve.token || 'mlx-local';
-      env.GROK_DISABLE_AUTOUPDATER = '1';
+      env.GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS ??= LOOPBACK_CONNECT_ATTEMPTS;
       for (const name of LOCAL_BACKEND_DISABLED_TOOL_ENV) env[name] ??= '0';
     }
 

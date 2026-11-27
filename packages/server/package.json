@@ -34,6 +34,11 @@
       "types": "./dist/host/agent-thinking.d.ts",
       "import": "./dist/host/agent-thinking.js"
     },
+    "./host/thinking-levels": {
+      "@mlx-node/source": "./src/host/thinking-levels.ts",
+      "types": "./dist/host/thinking-levels.d.ts",
+      "import": "./dist/host/thinking-levels.js"
+    },
     "./host/env-policy": {
       "@mlx-node/source": "./src/host/env-policy.ts",
       "types": "./dist/host/env-policy.d.ts",

@@ -1,80 +1,18 @@
 /**
- * The addresses Chat's `web_fetch` may read: those a user message or a parsed search result put into this
- * conversation. The provider fetches a page from its own servers, so an address chosen by injected text would carry
- * conversation text to a stranger's server. Addresses in page text, snippets, titles or the model's own text never
- * count. In memory only.
+ * The addresses Chat's `web_fetch` may read: those a user message, a parsed search result or the text of a page read
+ * put into this conversation. The provider fetches a page from its own servers, so an address chosen by injected text
+ * would carry conversation text to a stranger's server; an address taken whole from a page the provider returned
+ * carries only what that page already held. Addresses in snippets, titles or the model's own text never count. The
+ * host writes the members to the session's ledger file at every change, and the `mlx_web` server checks each read
+ * against that file.
  */
 
-import { forwardedAddress } from '../web/url-policy.js';
+import { randomUUID } from 'node:crypto';
+import { renameSync, unlinkSync, writeFileSync } from 'node:fs';
+
+import { ledgerFileText, normalizeAddress } from '../web/ledger-file.js';
 
 const TRAILING_PUNCTUATION = '.,;:!?)]';
-
-/**
- * `new URL`; scheme and host lower-cased; default port, fragment, one trailing host dot and one trailing `/` of the
- * path dropped; path and query otherwise byte-equal. null for anything that is not http(s).
- */
-export function normalizeAddress(text: string): string | null {
-  let url: URL;
-  try {
-    url = new URL(text);
-  } catch {
-    return null;
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
-  let host = url.hostname.toLowerCase();
-  if (host.endsWith('.')) host = host.slice(0, -1);
-  if (host === '') return null;
-  const port = url.port === '' ? '' : `:${url.port}`;
-  const auth = url.username !== '' || url.password !== '' ? `${url.username}:${url.password}@` : '';
-  let path = url.pathname;
-  if (path.endsWith('/')) path = path.slice(0, -1);
-  return `${url.protocol}//${auth}${host}${port}${path}${url.search}`;
-}
-
-/**
- * True when the address the web server forwards for this text (`forwardedAddress`: trimmed, fragment cut off) is what
- * a parser would send, up to scheme and host case, a missing final `/` and UTF-8 escapes of non-ASCII. The ledger
- * compares normal forms, but the forwarded text goes to the provider, so any part the normal form drops or the parser
- * rewrites (dot segments, stripped tabs and newlines, back-slashes, default port, escaped host bytes) could carry
- * conversation text past the ledger. The fragment is the one part never forwarded.
- */
-export function forwardsAsWritten(text: string): boolean {
-  if (text.trim() === '') return false;
-  const trimmed = forwardedAddress(text);
-  for (let i = 0; i < trimmed.length; i++) {
-    const c = trimmed.charCodeAt(i);
-    if (c <= 32 || c === 127 || c === 92) return false;
-  }
-  let href: string;
-  try {
-    href = new URL(trimmed).href;
-  } catch {
-    return false;
-  }
-  const expected = escapeNonAscii(lowerAuthority(trimmed));
-  return href === expected || href === `${expected}/`;
-}
-
-/** Lower-cases everything before the first `/`, `?` after `scheme://` (scheme, user info, host, port). */
-function lowerAuthority(text: string): string {
-  const sep = text.indexOf('://');
-  if (sep === -1) return text;
-  let end = sep + 3;
-  while (end < text.length && text[end] !== '/' && text[end] !== '?') end++;
-  return text.slice(0, end).toLowerCase() + text.slice(end);
-}
-
-function escapeNonAscii(text: string): string {
-  let out = '';
-  for (const ch of text) {
-    if (ch.charCodeAt(0) < 128) {
-      out += ch;
-      continue;
-    }
-    for (const byte of Buffer.from(ch, 'utf8')) out += `%${byte.toString(16).toUpperCase().padStart(2, '0')}`;
-  }
-  return out;
-}
 
 function isAddressEnd(ch: string): boolean {
   const c = ch.charCodeAt(0);
@@ -84,9 +22,29 @@ function isAddressEnd(ch: string): boolean {
   );
 }
 
+function count(text: string, ch: string): number {
+  let n = 0;
+  for (const c of text) if (c === ch) n++;
+  return n;
+}
+
+/** Without trailing `.,;:!?)]`, except a `)` or `]` that closes a `(` or `[` inside the address. */
+function trimUnbalanced(raw: string): string {
+  let out = raw;
+  while (out.length > 0) {
+    const last = out[out.length - 1]!;
+    if (!TRAILING_PUNCTUATION.includes(last)) break;
+    if (last === ')' && count(out, ')') <= count(out, '(')) break;
+    if (last === ']' && count(out, ']') <= count(out, '[')) break;
+    out = out.slice(0, -1);
+  }
+  return out;
+}
+
 /**
  * Every `http://` or `https://` address in a text, read to the next white space, `<`, `>`, `"` or back-tick; each one
- * also without trailing `.,;:!?)]`.
+ * also without trailing `.,;:!?)]`, and without those but a `)` or `]` that closes a bracket inside it (a Markdown link
+ * to `.../Mercury_(planet)`).
  */
 export function scanAddresses(text: string): string[] {
   const found: string[] = [];
@@ -104,13 +62,15 @@ export function scanAddresses(text: string): string[] {
     while (trimmed.length > 0 && TRAILING_PUNCTUATION.includes(trimmed[trimmed.length - 1]!))
       trimmed = trimmed.slice(0, -1);
     if (trimmed !== raw && trimmed !== '') found.push(trimmed);
+    const balanced = trimUnbalanced(raw);
+    if (balanced !== raw && balanced !== trimmed) found.push(balanced);
     i = end > start ? end : start + 1;
   }
   return found;
 }
 
 export class AddressLedger {
-  private readonly members = new Set<string>();
+  private readonly set = new Set<string>();
 
   /** The addresses of one user message. */
   addUserText(text: string): void {
@@ -122,15 +82,25 @@ export class AddressLedger {
     for (const url of urls) this.add(url);
   }
 
+  /** The addresses in the text of one parsed page result. */
+  addPageText(text: string): void {
+    for (const address of scanAddresses(text)) this.add(address);
+  }
+
+  /** The normal forms, in the order they were added. */
+  members(): string[] {
+    return [...this.set];
+  }
+
   has(address: string): boolean {
     const normal = normalizeAddress(address);
-    return normal !== null && this.members.has(normal);
+    return normal !== null && this.set.has(normal);
   }
 
   /** Hosts of every member, for link rendering. */
   hosts(): Set<string> {
     const out = new Set<string>();
-    for (const m of this.members) {
+    for (const m of this.set) {
       try {
         out.add(new URL(m).hostname);
       } catch {
@@ -141,11 +111,26 @@ export class AddressLedger {
   }
 
   get size(): number {
-    return this.members.size;
+    return this.set.size;
   }
 
   private add(address: string): void {
     const normal = normalizeAddress(address);
-    if (normal !== null) this.members.add(normal);
+    if (normal !== null) this.set.add(normal);
+  }
+}
+
+/** Temp file and rename in the same folder, mode 0600, synchronous: the next `web_fetch` may read it right after. */
+export function writeLedgerFile(path: string, members: Iterable<string>): void {
+  const temp = `${path}.${randomUUID()}.tmp`;
+  try {
+    writeFileSync(temp, ledgerFileText(members), { mode: 0o600, flag: 'wx' });
+    renameSync(temp, path);
+  } finally {
+    try {
+      unlinkSync(temp);
+    } catch {
+      // Renamed: nothing left.
+    }
   }
 }

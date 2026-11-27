@@ -29,7 +29,7 @@ function heartbeat(
   pid: number = process.pid,
 ): void {
   const file: WriterLiveFile = {
-    v: 2,
+    v: 3,
     pid,
     startedAt: ts - 60_000,
     ts,
@@ -42,7 +42,8 @@ function heartbeat(
     stateCache,
     health: 'ok',
     mem: { active: 1, peak: 2, cache: 3, wiredLimit: 4, rss: 5 },
-    decodeTps: null,
+    work: { ms: { loading: 0, waiting: 0, prepare: 0, prefill: 0, decode: 0, running: 0 } },
+    rates: { windowMs: 10_000, outputTps: null, prefillTps: null },
     loading: [],
     counters: { ok: 0, error: 0, cancelled: 0, outputTokens: 0, loads: 0, rejected: 0 },
     models,

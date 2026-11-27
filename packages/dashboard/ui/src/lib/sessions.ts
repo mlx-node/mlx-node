@@ -5,6 +5,7 @@ import { fill } from './chat-strings';
 import { prefillRate } from './prefill';
 import { toast } from './toast';
 import type { TranscriptEntry, TurnMetric } from './types';
+import { visibleText } from './work-tools';
 
 /** The words for a session with no title: `id` is the first 8 characters of its id. */
 export const UNTITLED_SESSION = 'Session {id}';
@@ -92,6 +93,30 @@ export function prefillAverage(prefills: Array<TurnPrefill | null>): number | nu
   return ms > 0 ? (tokens * 1000) / ms : null;
 }
 
+/**
+ * Token-weighted decode speed over turns: Σ rated tokens ÷ Σ decode time. A turn's rate leaves out each model call's
+ * first token, so its rated tokens are output tokens − model calls and its decode time is rated tokens ÷ turn rate.
+ * Turns without a rate, a model-call count or a rated token are left out; `turns` counts the rest.
+ */
+export function decodeAverage(metrics: ReadonlyArray<Pick<TurnMetric, 'decodeTps' | 'outputTokens' | 'modelCalls'>>): {
+  tps: number | null;
+  turns: number;
+} {
+  let tokens = 0;
+  let ms = 0;
+  let turns = 0;
+  for (const metric of metrics) {
+    const tps = positive(metric.decodeTps);
+    if (tps === null || metric.modelCalls === null) continue;
+    const rated = metric.outputTokens - metric.modelCalls;
+    if (!Number.isFinite(rated) || rated <= 0) continue;
+    tokens += rated;
+    ms += (rated * 1000) / tps;
+    turns += 1;
+  }
+  return { tps: ms > 0 ? (tokens * 1000) / ms : null, turns };
+}
+
 export interface TurnTimeParts {
   /** Time to first token of the turn's first model call. */
   firstTokenMs: number | null;
@@ -101,19 +126,21 @@ export interface TurnTimeParts {
 }
 
 /**
- * Where a turn's wall time went: time to first token, then decode (output tokens ÷ decode speed), then the rest.
+ * Where a turn's wall time went: time to first token, then decode ((output tokens − model calls) ÷ decode speed, as each
+ * call's first token comes from its prefill), then the rest.
  * Each part is clamped to what is left, so the parts always sum to the total.
  */
 export function turnTimeParts(
-  t: Pick<TurnMetric, 'elapsedMs' | 'ttftMs' | 'decodeTps' | 'outputTokens'>,
+  t: Pick<TurnMetric, 'elapsedMs' | 'ttftMs' | 'decodeTps' | 'outputTokens' | 'modelCalls'>,
 ): TurnTimeParts {
   const total = positive(t.elapsedMs);
   if (total === null) return { firstTokenMs: null, decodeMs: null, otherMs: null, totalMs: null };
   const rawFirst = positive(t.ttftMs);
   const first = rawFirst === null ? null : Math.min(rawFirst, total);
-  const tps = t.decodeTps;
+  const tps = positive(t.decodeTps);
+  const rated = t.modelCalls === null ? null : t.outputTokens - t.modelCalls;
   const rawDecode =
-    tps !== null && Number.isFinite(tps) && tps > 0 && t.outputTokens > 0 ? (t.outputTokens * 1000) / tps : null;
+    tps === null || rated === null || !Number.isFinite(rated) || rated <= 0 ? null : (rated * 1000) / tps;
   const decode = rawDecode === null ? null : Math.min(rawDecode, total - (first ?? 0));
   const other = total - (first ?? 0) - (decode ?? 0);
   return { firstTokenMs: first, decodeMs: decode, otherMs: other, totalMs: total };
@@ -133,9 +160,9 @@ export interface TurnGroup {
   endTs: number | null;
 }
 
-/** A turn's prompt: a typed message that is not an interjection, or a wake. The server's rule for a window. */
+/** A turn's prompt: a typed message that is not an interjection or a note, or a wake. The server's rule for a window. */
 function isPrompt(entry: TranscriptEntry): boolean {
-  return (entry.kind === 'user' && entry.interjection !== true) || entry.kind === 'wake';
+  return (entry.kind === 'user' && entry.interjection !== true && entry.note !== true) || entry.kind === 'wake';
 }
 
 function earliestTs(entries: readonly TranscriptEntry[], keep: (entry: TranscriptEntry) => boolean): number | null {
@@ -233,13 +260,61 @@ function firstLine(text: string): string {
   return newline === -1 ? trimmed : trimmed.slice(0, newline);
 }
 
-/** What woke the agent, in words: the title of a turn that a background event started. */
-export function wakeTitle(entry: Extract<TranscriptEntry, { kind: 'wake' }>): string {
+type WakeEntry = Extract<TranscriptEntry, { kind: 'wake' }>;
+type WakeTask = NonNullable<WakeEntry['task']>;
+
+/** The words of a wake row that names the commands and monitors whose end woke the agent. */
+export const WAKE_ENDED = {
+  command: 'A command ended',
+  monitor: 'A monitor ended',
+  commands: '{n} commands ended',
+  monitors: '{n} monitors ended',
+  mixed: '{n} background tasks ended',
+  /** `{what}`: one of the above; `{labels}`: their descriptions or first command lines. */
+  named: '{what}: {labels}',
+} as const;
+
+/** The words of a wake row the host names from monitor events (live only: the agent stores no event). */
+export const WAKE_REPORTED = {
+  one: 'A monitor reported',
+  many: '{n} monitors reported',
+} as const;
+
+function labelsOf(tasks: readonly WakeTask[]): string[] {
+  return tasks.map((t) => visibleText(firstLine(t.label))).filter((label) => label !== '');
+}
+
+/** "A command ended: npm test", "2 commands ended: npm test, cargo build"; labels are shown with hidden characters. */
+function endedTitle(tasks: readonly WakeTask[]): string {
+  const kinds = new Set(tasks.map((t) => t.kind));
+  const what =
+    tasks.length === 1
+      ? WAKE_ENDED[tasks[0]!.kind]
+      : fill(kinds.size > 1 ? WAKE_ENDED.mixed : kinds.has('monitor') ? WAKE_ENDED.monitors : WAKE_ENDED.commands, {
+          n: tasks.length,
+        });
+  const labels = labelsOf(tasks);
+  return labels.length === 0 ? what : fill(WAKE_ENDED.named, { what, labels: labels.join(', ') });
+}
+
+/** "A monitor reported: Watch the build log", "2 monitors reported: …". */
+function reportedTitle(monitors: readonly WakeTask[]): string {
+  const what = monitors.length === 1 ? WAKE_REPORTED.one : fill(WAKE_REPORTED.many, { n: monitors.length });
+  const labels = labelsOf(monitors);
+  return labels.length === 0 ? what : fill(WAKE_ENDED.named, { what, labels: labels.join(', ') });
+}
+
+/**
+ * What woke the agent, in words: the title of a turn that a background event started. `reported`: the monitors whose
+ * events the host saw before this wake (the live page only; the Sessions page passes none).
+ */
+export function wakeTitle(entry: WakeEntry, reported?: readonly WakeTask[] | null): string {
   switch (entry.cause) {
     case 'workflow': {
       const run = entry.workflow;
       if (run === undefined || run.name === '') return 'Woken by a background workflow';
-      const status = run.status !== '' && run.status !== 'complete' ? ` · ${run.status}` : '';
+      const said = run.snapshot?.status ?? '';
+      const status = said !== '' && said !== 'complete' ? ` · ${said}` : '';
       return `Woken by workflow ${run.name}${status}`;
     }
     case 'subagent': {
@@ -247,25 +322,44 @@ export function wakeTitle(entry: Extract<TranscriptEntry, { kind: 'wake' }>): st
       return description === '' ? 'Woken by a background subagent' : `Woken by subagent: ${description}`;
     }
     case 'task':
-      return 'Woken by a background task';
+      return entry.task === undefined ? 'Woken by a background task' : endedTitle([entry.task]);
     case 'notifications':
-      return 'Woken by background notifications';
+      if (entry.tasks !== undefined && entry.tasks.length > 0) return endedTitle(entry.tasks);
+      return reported === undefined || reported === null || reported.length === 0
+        ? 'Woken by background notifications'
+        : reportedTitle(reported);
     case 'goal':
       return 'Started by the goal loop';
+    case 'message':
+      return 'Your message ran as its own turn';
     case 'unknown':
       return 'Woken by a background event';
   }
 }
 
+/** The workflow host's output-contract retry prompt starts with these words (mlx-agent `host_service.rs`). */
+const CONTRACT_RETRY_LEAD = 'Your final message did not satisfy the output contract: ';
+export const CONTRACT_RETRY_TITLE = 'Output contract retry: {reason}';
+
+/** `Output contract retry: {reason}` for a prompt whose first line is the workflow host's retry; else null. */
+export function retryTitleOf(text: string): string | null {
+  const line = firstLine(text);
+  return line.startsWith(CONTRACT_RETRY_LEAD)
+    ? fill(CONTRACT_RETRY_TITLE, { reason: line.slice(CONTRACT_RETRY_LEAD.length) })
+    : null;
+}
+
 /**
- * A turn's title: the first line of its typed prompt, what woke the agent, or `(no prompt)`. An interjection is the
- * title only when the turn has no other prompt.
+ * A turn's title: the first line of its typed prompt (a workflow host's output-contract retry reads as one), what woke
+ * the agent, or `(no prompt)`. An interjection is the title only when the turn has no other prompt.
  */
 export function turnTitle(entries: readonly TranscriptEntry[]): string {
   const prompt = entries.find(isPrompt) ?? entries.find((entry) => entry.kind === 'user');
   if (prompt === undefined) return NO_PROMPT;
   if (prompt.kind === 'wake') return wakeTitle(prompt);
   if (prompt.kind !== 'user') return NO_PROMPT;
+  const retry = retryTitleOf(prompt.text);
+  if (retry !== null) return retry;
   const text = firstLine(prompt.text);
   return text === '' ? NO_PROMPT : text;
 }

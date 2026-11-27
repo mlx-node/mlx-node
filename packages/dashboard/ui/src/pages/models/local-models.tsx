@@ -419,18 +419,18 @@ export function LocalModels(props: LocalModelsProps): ReactElement {
       align: 'end',
       width: 96,
       minTableWidth: 700,
-      sortValue: (model) => view.usage.get(model.name)?.decodeTps.p50 ?? null,
+      sortValue: (model) => view.usage.get(model.name)?.decodeSpeed ?? null,
       cell: (model) => {
         const usage = view.usage.get(model.name);
-        const tps = usage?.decodeTps;
+        const speed = usage?.decodeSpeed ?? null;
         return (
           <UsageCell view={view}>
-            {tps === undefined || tps.p50 === null ? (
+            {usage === undefined || speed === null ? (
               noUsage
             ) : (
               <span className="whitespace-nowrap">
-                {formatTps(tps.p50)} <span className="text-secondary">tok/s</span>
-                {tps.n < LOW_SAMPLE_N ? <span className="text-muted"> n={tps.n}</span> : null}
+                {formatTps(speed)} <span className="text-secondary">tok/s</span>
+                {usage.decodeTurns < LOW_SAMPLE_N ? <span className="text-muted"> n={usage.decodeTurns}</span> : null}
               </span>
             )}
           </UsageCell>

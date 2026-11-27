@@ -9,7 +9,8 @@ You can search the web and read web pages. Call use_tool with one of exactly the
 - Search the web:  {"tool_name": "mlx_web__web_search", "tool_input": {"query": "<2 to 6 search words>"}}
 - Read one page:   {"tool_name": "mlx_web__web_fetch", "tool_input": {"url": "<https address>"}}
 
-Read only an address that the user wrote or that a search result listed. Any other address is refused and ends your answer.
+Read only an address that the user wrote, that a search result listed, or that a page you read links to.
+Any other address gets WEB_ERROR blocked.
 Do not call search_tool. It looks in a tool catalog, not on the web, and the two names above are all it would find.
 Never invent another tool name.
 

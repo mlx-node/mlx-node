@@ -1,0 +1,24 @@
+{
+  "source": "grok-build-workflows mlx-agent-v0.3.4, crates/codegen/xai-grok-shell/src/session/slash_commands.rs: BUILTIN_COMMANDS and PROMPT_COMMANDS",
+  "commands": [
+    { "name": "compact", "description": "Compress conversation history to save context window", "hint": null, "aliases": [], "gate": "AlwaysOn" },
+    { "name": "always-approve", "description": "Toggle always-approve mode (skip all permission prompts)", "hint": "on|off", "aliases": ["yolo"], "gate": "AlwaysOn" },
+    { "name": "flush", "description": "Flush conversation memory to disk now", "hint": null, "aliases": [], "gate": "Memory" },
+    { "name": "dream", "description": "Run memory consolidation (merge session logs into organized topics)", "hint": null, "aliases": [], "gate": "Memory" },
+    { "name": "memory", "description": "Browse, view, and manage your memories", "hint": null, "aliases": ["mem"], "gate": "MemoryConfigured" },
+    { "name": "context", "description": "Show context window usage and session stats", "hint": null, "aliases": [], "gate": "AlwaysOn" },
+    { "name": "hooks-trust", "description": "Trust this project for hook execution", "hint": null, "aliases": [], "gate": "Hooks" },
+    { "name": "hooks-list", "description": "Show hooks loaded in this session", "hint": null, "aliases": [], "gate": "Hooks" },
+    { "name": "hooks-add", "description": "Add a custom hook file or directory", "hint": "path to hook file or directory", "aliases": [], "gate": "Hooks" },
+    { "name": "hooks-remove", "description": "Remove a custom hook file or directory path", "hint": "path to hook file or directory", "aliases": [], "gate": "Hooks" },
+    { "name": "hooks-untrust", "description": "Remove trust for the current project", "hint": null, "aliases": [], "gate": "Hooks" },
+    { "name": "plugins", "description": "Manage plugins (list, reload, trust, add, remove)", "hint": "list | reload | trust <path> | add <path> | remove <path>", "aliases": ["plugin"], "gate": "Plugins" },
+    { "name": "reload-plugins", "description": "Reload plugins from disk (alias for /plugins reload)", "hint": null, "aliases": [], "gate": "Plugins" },
+    { "name": "session-info", "description": "Show session details (model, turns, context usage)", "hint": null, "aliases": ["status", "info"], "gate": "AlwaysOn" },
+    { "name": "feedback", "description": "Send feedback about the current session", "hint": "feedback text", "aliases": [], "gate": "Feedback" },
+    { "name": "deep-research", "description": "Research with bounded parallel agents, cross-check evidence, and write a cited report", "hint": "<query>", "aliases": [], "gate": "WorkflowLaunches" },
+    { "name": "workflow", "description": "Launch a saved workflow, list runs, or manage a run (pause, resume, stop, save)", "hint": "<name> [--agent-budget N] [--effort LEVEL] [args] | runs | pause|resume|stop|save [name]", "aliases": [], "gate": "WorkflowManagement" },
+    { "name": "goal", "description": "Set, manage, or check an autonomous goal", "hint": "<objective> [--budget <tokens>] | status | pause | resume | clear", "aliases": [], "gate": "Goal" },
+    { "name": "loop", "description": "Run a prompt on a recurring interval", "hint": "[interval] <prompt>", "aliases": [], "gate": "Scheduler" }
+  ]
+}

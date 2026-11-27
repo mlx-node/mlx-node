@@ -5,10 +5,27 @@
 
 import { appEndFor, appEndText, type AppEndContext } from './app-ends';
 import { CHAT, fill } from './chat-strings';
-import type { ChatFailure, ChatHostState, ChatMode, TurnOutcome } from './chat-types';
-import { formatCount, formatCountNoun, formatDuration, formatNumber, formatTps } from './format';
-import type { TranscriptEntry, TurnMetric } from './types';
+import type {
+  ChatFailure,
+  ChatFailureCode,
+  ChatHostState,
+  ChatMode,
+  HookRunState,
+  ModelSwitch,
+  TurnOutcome,
+} from './chat-types';
+import {
+  formatBytes,
+  formatClock,
+  formatCount,
+  formatCountNoun,
+  formatDuration,
+  formatNumber,
+  formatTps,
+} from './format';
+import type { PictureSize, TranscriptEntry, TurnMetric } from './types';
 import { oneLine, parseWebCall } from './web-tools';
+import { visibleText } from './work-tools';
 
 type TurnEnd = Extract<TranscriptEntry, { kind: 'turn-end' }>;
 
@@ -21,8 +38,52 @@ export interface ThreadTurn {
   metric: TurnMetric | null;
 }
 
+/** A user entry inside a running answer: a steer or the note on a denied call. It never starts a turn. */
+export function isAside(entry: TranscriptEntry): boolean {
+  return entry.kind === 'user' && (entry.interjection === true || entry.note === true);
+}
+
+/**
+ * No step of the answer: a notice, a mode line, a goal, a recap, or a steer or note inside it. It never starts a turn
+ * and never counts as work.
+ */
+export function isSideEntry(entry: TranscriptEntry): boolean {
+  return (
+    entry.kind === 'notice' ||
+    entry.kind === 'plan-mode' ||
+    entry.kind === 'goal' ||
+    entry.kind === 'recap' ||
+    isAside(entry)
+  );
+}
+
 function startsTurn(entry: TranscriptEntry): boolean {
-  return (entry.kind === 'user' && entry.interjection !== true) || entry.kind === 'wake';
+  return !isSideEntry(entry) && (entry.kind === 'user' || entry.kind === 'wake');
+}
+
+/** The turn that holds entry `at` (its index in the conversation's entries); -1 before the first turn. */
+export function turnIndexOf(list: readonly ThreadTurn[], at: number): number {
+  let lo = 0;
+  let hi = list.length - 1;
+  let found = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (list[mid]!.start <= at) {
+      found = mid;
+      lo = mid + 1;
+    } else hi = mid - 1;
+  }
+  return found;
+}
+
+/**
+ * How many of the newest turns the thread mounts so a jump to entry `at` lands: the older turns wait behind a button,
+ * and a jump to one of them mounts it and every turn after it first. `mounted` when it already shows.
+ */
+export function mountedFor(list: readonly ThreadTurn[], at: number, mounted: number): number {
+  const turn = turnIndexOf(list, at);
+  if (turn === -1) return mounted;
+  return Math.max(mounted, list.length - turn);
 }
 
 /**
@@ -54,7 +115,7 @@ export function splitTurns(entries: readonly TranscriptEntry[], turns: readonly 
 }
 
 export type OutcomeTone = 'neutral' | 'warning' | 'danger';
-export type TurnActionKind = 'send-again' | 'continue' | 'update-agent';
+export type TurnActionKind = 'send-again' | 'continue' | 'update-agent' | 'pick-model';
 
 export interface OutcomeLine {
   tone: OutcomeTone;
@@ -73,8 +134,16 @@ export interface EngineNote {
   action: 'open-engine' | 'unload' | null;
 }
 
-/** The live outcome of a turn, or null for `completed`. `unsent`: the turn ended before its prompt went to the agent. */
-export function liveOutcome(outcome: TurnOutcome, mode: ChatMode, unsent = false): OutcomeLine | null {
+/**
+ * The live outcome of a turn, or null for `completed`. `unsent`: the turn ended before its prompt went to the agent.
+ * `failure`: why the guard refused it (a model it cannot use asks for another model, not an agent update).
+ */
+export function liveOutcome(
+  outcome: TurnOutcome,
+  mode: ChatMode,
+  unsent = false,
+  failure?: ChatFailureCode,
+): OutcomeLine | null {
   const o = CHAT.outcomes;
   switch (outcome) {
     case 'completed':
@@ -92,8 +161,6 @@ export function liveOutcome(outcome: TurnOutcome, mode: ChatMode, unsent = false
       return { tone: 'warning', glyph: 'alert', text: o['tool-loop'], action: 'send-again' };
     case 'tool-refused':
       return { tone: 'warning', glyph: 'alert', text: o['tool-refused'], action: 'send-again' };
-    case 'address-refused':
-      return { tone: 'warning', glyph: 'alert', text: o['address-refused'], action: 'send-again' };
     case 'arguments-unreadable':
       return { tone: 'warning', glyph: 'alert', text: o['arguments-unreadable'], action: 'send-again' };
     case 'denied':
@@ -108,7 +175,16 @@ export function liveOutcome(outcome: TurnOutcome, mode: ChatMode, unsent = false
       return { tone: 'danger', glyph: 'alert', text: o['agent-crashed'], action: 'send-again' };
     case 'model-error':
       return { tone: 'danger', glyph: 'alert', text: o['model-error'], action: 'send-again' };
+    case 'no-model':
+      return { tone: 'warning', glyph: 'alert', text: o['no-model'], action: 'send-again' };
+    case 'hook-stopped':
+      return HOOK_STOPPED;
+    case 'never-loop':
+      return { tone: 'neutral', glyph: 'ban', text: o['never-loop'], action: null };
     case 'refused':
+      if (failure === 'model-unavailable') {
+        return { tone: 'danger', glyph: 'alert', text: o['model-unavailable'], action: 'pick-model' };
+      }
       return {
         tone: 'danger',
         glyph: 'alert',
@@ -116,6 +192,24 @@ export function liveOutcome(outcome: TurnOutcome, mode: ChatMode, unsent = false
         action: 'update-agent',
       };
   }
+}
+
+/** Our sentence on a model the agent could not use, without the agent's words. */
+export function modelHeadline(model: ModelSwitch): string {
+  const m = CHAT.modelAuto;
+  if (model.previous === null) return m.none;
+  const previous = visibleText(model.previous);
+  return model.next === null
+    ? fill(m.refused, { previous })
+    : fill(m.wanted, { previous, next: visibleText(model.next) });
+}
+
+/** The muted line under an answer's end: our sentence, then the agent's words as it wrote them. */
+export function modelDetail(model: ModelSwitch): string {
+  const head = modelHeadline(model);
+  const reason = visibleText(model.reason);
+  if (reason === '') return head;
+  return head.endsWith('.') ? `${head} ${reason}` : `${head}: ${reason}`;
 }
 
 /** A stored end on the model's length limit: `max_tokens`, or the agent's length error. */
@@ -140,6 +234,7 @@ export function storedOutcome(end: TurnEnd): OutcomeLine | null {
   const detail = end.error !== undefined && end.error !== '' ? end.error : undefined;
   let line: OutcomeLine | null;
   if (end.stopReason === 'end_turn') line = null;
+  else if (end.stopReason === 'cancelled' && end.hookStopped === true) line = HOOK_STOPPED;
   else if (end.stopReason === 'cancelled')
     line = { tone: 'neutral', glyph: 'stop', text: o['stopped-stored'], action: 'send-again' };
   else if (end.stopReason === 'max_tokens')
@@ -155,7 +250,7 @@ export interface TurnEndState {
   /** The turn this outcome belongs to is the last one and no turn runs. */
   last: boolean;
   running: boolean;
-  live: { outcome?: TurnOutcome; failure?: ChatFailure; unsent?: true } | null;
+  live: { outcome?: TurnOutcome; failure?: ChatFailure; unsent?: true; model?: ModelSwitch } | null;
   mode: ChatMode;
   /** How earlier Control Panel lives ended, for this conversation: see `app-ends.ts`. */
   app?: AppEndContext;
@@ -174,8 +269,10 @@ export function turnStartedAt(turn: ThreadTurn): number | null {
 export function turnOutcome(turn: ThreadTurn, state: TurnEndState): OutcomeLine | null {
   if (state.last && state.running) return null;
   if (state.last && state.live !== null && state.live.outcome !== undefined) {
-    const line = liveOutcome(state.live.outcome, state.mode, state.live.unsent === true);
-    return state.live.outcome === 'output-limit' && continuedWithoutTool(turn) ? twice(line) : line;
+    const live = liveOutcome(state.live.outcome, state.mode, state.live.unsent === true, state.live.failure?.code);
+    const line = state.live.outcome === 'output-limit' && continuedWithoutTool(turn) ? twice(live) : live;
+    const model = state.live.model;
+    return line === null || model === undefined ? line : { ...line, detail: modelDetail(model) };
   }
   const appEnd =
     state.app === undefined ? null : appEndFor({ end: turn.end, startedAt: turnStartedAt(turn) }, state.app);
@@ -205,16 +302,27 @@ export function turnStats(metric: TurnMetric | null, end: TurnEnd | null): strin
   return parts;
 }
 
-/** The stats tooltip; parts with no value are left out. */
+/**
+ * The stats tooltip; parts with no value are left out. The decode speed is the agent's rate over all model calls of
+ * the turn; the first token is the first call's.
+ */
 export function turnStatsTitle(metric: TurnMetric | null, model: string | null): string | undefined {
   if (metric === null) return undefined;
+  const words = CHAT.statsTitle;
   const parts: string[] = [];
-  if (metric.ttftMs !== null && metric.ttftMs > 0) parts.push(`First token ${formatDuration(metric.ttftMs)}`);
+  if (metric.decodeTps !== null && metric.decodeTps > 0)
+    parts.push(fill(words.decode, { tps: formatTps(metric.decodeTps) }));
+  if (metric.ttftMs !== null && metric.ttftMs > 0)
+    parts.push(fill(words.firstToken, { ttft: formatDuration(metric.ttftMs) }));
   if (metric.inputTokens > 0) {
-    const cached = metric.cachedTokens > 0 ? `, ${formatNumber(metric.cachedTokens)} from cache` : '';
-    parts.push(`${formatNumber(metric.inputTokens)} tokens in${cached}`);
+    const input = formatNumber(metric.inputTokens);
+    parts.push(
+      metric.cachedTokens > 0
+        ? fill(words.inputCached, { input, cached: formatNumber(metric.cachedTokens) })
+        : fill(words.input, { input }),
+    );
   }
-  if (metric.outputTokens > 0) parts.push(`${formatNumber(metric.outputTokens)} tokens out`);
+  if (metric.outputTokens > 0) parts.push(fill(words.output, { output: formatNumber(metric.outputTokens) }));
   const name = metric.model ?? model;
   if (name !== null && name !== '') parts.push(name);
   return parts.length === 0 ? undefined : parts.join(' · ');
@@ -231,7 +339,9 @@ export function answerMarkdown(entries: readonly TranscriptEntry[]): string {
 
 /** The typed prompt of a turn (what "Send again" sends), or null. */
 export function turnPrompt(turn: ThreadTurn): string | null {
-  const user = turn.entries.find((entry): entry is Extract<TranscriptEntry, { kind: 'user' }> => entry.kind === 'user');
+  const user = turn.entries.find(
+    (entry): entry is Extract<TranscriptEntry, { kind: 'user' }> => entry.kind === 'user' && !isAside(entry),
+  );
   return user === undefined || user.text.trim() === '' ? null : user.text;
 }
 
@@ -317,8 +427,17 @@ export interface PendingInput {
   engine?: EngineWait | null;
 }
 
+/**
+ * A prompt read: `done` of `total` tokens. No `done` while the engine has counted none: a one-shot prefill reports its
+ * count only at its end, so its meter is busy with no fill and its words never say "0 of".
+ */
+export interface ReadCounts {
+  done?: number;
+  total: number;
+}
+
 export type PendingRow =
-  | { kind: 'label'; text: string; orb: 'hold' | 'think'; progress?: { done: number; total: number } }
+  | { kind: 'label'; text: string; orb: 'hold' | 'think'; progress?: ReadCounts }
   | { kind: 'load'; modelId: string };
 
 /**
@@ -329,16 +448,20 @@ export type PendingRow =
  */
 export type EngineWait =
   | { kind: 'ours'; phase: EngineRequest['phase']; done: number | null; total: number | null }
-  | { kind: 'model'; reading: { done: number; total: number } | null };
+  | { kind: 'model'; reading: ReadCounts | null };
 
-/** The counts of a prefill that reports them; null for any other phase. */
-function readCounts(
-  phase: EngineRequest['phase'],
-  done: number | null,
-  total: number | null,
-): { done: number; total: number } | null {
+/** The counts of a prefill that reports them, without `done` while it is 0; null for any other phase. */
+function readCounts(phase: EngineRequest['phase'], done: number | null, total: number | null): ReadCounts | null {
   if (phase !== 'prefill' || done === null || total === null || total <= 0) return null;
-  return { done: Math.min(Math.max(done, 0), total), total };
+  const counted = Math.min(Math.max(done, 0), total);
+  return counted === 0 ? { total } : { done: counted, total };
+}
+
+/** `of` with both counts, or `all` with the total alone while nothing is counted. */
+function readText(counts: ReadCounts, of: string, all: string): string {
+  return counts.done === undefined
+    ? fill(all, { total: formatCount(counts.total) })
+    : fill(of, { done: formatCount(counts.done), total: formatCount(counts.total) });
 }
 
 /**
@@ -370,7 +493,7 @@ export function engineWait(input: {
   const unknown = since !== null && onModel.some(mayBeOurs);
   const queuedBehind = input.hidden > 0 && onModel.length > 0 && !onModel.some(mayBeOurs);
   if (!unknown && !queuedBehind) return null;
-  let reading: { done: number; total: number } | null = null;
+  let reading: ReadCounts | null = null;
   for (const request of onModel) reading ??= readCounts(request.phase, request.prefillDone, request.prefillTotal);
   return { kind: 'model', reading };
 }
@@ -386,9 +509,9 @@ export function pendingRow(input: PendingInput): PendingRow {
             : fill(CHAT.pendingQueuedMany, { model: input.model, n: String(input.full) }),
         )
       : null;
-  const reading = (text: string, counts: { done: number; total: number }, orb: 'hold' | 'think'): PendingRow => ({
+  const reading = (text: string, counts: ReadCounts, orb: 'hold' | 'think'): PendingRow => ({
     kind: 'label',
-    text: fill(text, { done: formatCount(counts.done), total: formatCount(counts.total) }),
+    text,
     orb,
     progress: counts,
   });
@@ -399,7 +522,9 @@ export function pendingRow(input: PendingInput): PendingRow {
     if (engine.phase === 'queued' || engine.phase === 'slot') return queued() ?? label(CHAT.pendingQueued);
     if (engine.phase === 'prepare' || engine.phase === 'prefill') {
       const counts = readCounts(engine.phase, engine.done, engine.total);
-      return counts === null ? label(CHAT.pendingReading, 'think') : reading(CHAT.pendingReadingOf, counts, 'think');
+      return counts === null
+        ? label(CHAT.pendingReading, 'think')
+        : reading(readText(counts, CHAT.pendingReadingOf, CHAT.pendingReadingTotal), counts, 'think');
     }
     return label(CHAT.pendingThinking, 'think');
   }
@@ -412,7 +537,13 @@ export function pendingRow(input: PendingInput): PendingRow {
     if (full !== null) return full;
   }
   if (engine?.kind === 'model')
-    return engine.reading === null ? label(CHAT.pendingBusy) : reading(CHAT.pendingBusyReading, engine.reading, 'hold');
+    return engine.reading === null
+      ? label(CHAT.pendingBusy)
+      : reading(
+          readText(engine.reading, CHAT.pendingBusyReading, CHAT.pendingBusyReadingTotal),
+          engine.reading,
+          'hold',
+        );
   if (input.phase === 'running' && input.continuing === true) return label(CHAT.pendingContinuing, 'think');
   if (input.quiet) return label(CHAT.pendingWaiting);
   return input.work === true ? label(CHAT.pendingWorking, 'think') : label(CHAT.pendingThinking, 'think');
@@ -421,7 +552,7 @@ export function pendingRow(input: PendingInput): PendingRow {
 /** The quieter words of the compaction line: the summary request reads the conversation, then writes. */
 export interface CompactionDetail {
   text: string;
-  progress?: { done: number; total: number };
+  progress?: ReadCounts;
 }
 
 /**
@@ -445,10 +576,7 @@ export function compactionDetail(input: {
   if (ours === null) return null;
   const counts = readCounts(ours.phase, ours.prefillDone, ours.prefillTotal);
   if (counts !== null)
-    return {
-      text: fill(CHAT.compactingReading, { done: formatCount(counts.done), total: formatCount(counts.total) }),
-      progress: counts,
-    };
+    return { text: readText(counts, CHAT.compactingReading, CHAT.compactingReadingTotal), progress: counts };
   if (ours.phase !== 'decode') return null;
   return ours.generated === null || ours.generated <= 0
     ? { text: CHAT.compactingWriting }
@@ -465,6 +593,203 @@ export function compactionText(entry: Extract<TranscriptEntry, { kind: 'compacti
   const { tokensBefore: before, tokensAfter: after } = entry;
   if (before === undefined || after === undefined || after * 100 > before * 99) return CHAT.compacted;
   return fill(CHAT.compactedTokens, { before: formatCount(before), after: formatCount(after) });
+}
+
+export type RetryNotice = Extract<TranscriptEntry, { kind: 'notice'; code: 'retry' }>;
+
+/**
+ * The running answer's retry episode while it has no end (the agent still tries), from the stream's live copy: its row
+ * is placed later (before the next call or at the answer's end), so the thread's entries cannot say it.
+ */
+export function openRetry(live: RetryNotice | null | undefined): RetryNotice | null {
+  return live == null || live.endTs !== undefined ? null : live;
+}
+
+function retryTry(entry: RetryNotice): string {
+  return entry.max >= 1
+    ? fill(CHAT.retry.try, { n: entry.attempts, max: entry.max })
+    : fill(CHAT.retry.tryNoMax, { n: entry.attempts });
+}
+
+/**
+ * The prompt read of this conversation's newest engine request since `since` (the request the agent sent again), with
+ * its counts; null when no such request is listed or it does not read.
+ */
+export function retryReading(input: {
+  requests: readonly EngineRequest[];
+  session: string | null;
+  since: number;
+}): ReadCounts | null {
+  let ours: EngineRequest | null = null;
+  for (const request of input.requests)
+    if (
+      input.session !== null &&
+      request.session === input.session &&
+      request.startedAt >= input.since &&
+      (ours === null || request.startedAt >= ours.startedAt)
+    )
+      ours = request;
+  return ours === null ? null : readCounts(ours.phase, ours.prefillDone, ours.prefillTotal);
+}
+
+/** The wait line of an open retry episode: what happened, then the try. */
+export function retryLine(entry: RetryNotice): string {
+  return `${CHAT.retry.live[entry.cause]} · ${retryTry(entry)}`;
+}
+
+/** One event row's parts; `detail` is the agent's own words. */
+export interface NoticeRowView {
+  label: string;
+  text: string;
+  facts: string[];
+  tone: 'neutral' | 'warning' | 'danger';
+  detail?: string;
+}
+
+/**
+ * A retry episode as a row. `running`: its turn runs now, so an episode with no end still tries; with no turn running
+ * it never finished (the agent stopped mid-retry).
+ */
+export function retryRow(entry: RetryNotice, running: boolean): NoticeRowView {
+  const text = CHAT.retry.cause[entry.cause];
+  const tries = entry.attempts === 1 ? CHAT.retry.triesOne : fill(CHAT.retry.tries, { n: entry.attempts });
+  const detail = entry.detail === undefined ? {} : { detail: entry.detail };
+  if (entry.endTs === undefined) {
+    return running
+      ? { label: CHAT.retry.rowLive, text, facts: [retryTry(entry)], tone: 'neutral', ...detail }
+      : { label: CHAT.retry.rowOpen, text, facts: [tries], tone: 'warning', ...detail };
+  }
+  if (entry.outcome === 'gave-up')
+    return { label: CHAT.retry.rowGaveUp, text, facts: [tries], tone: 'danger', ...detail };
+  const facts = [tries];
+  if (entry.outcome === 'recovered' && entry.ts > 0 && entry.endTs > entry.ts)
+    facts.push(fill(CHAT.retry.waited, { time: formatDuration(entry.endTs - entry.ts) }));
+  return { label: CHAT.retry.row, text, facts, tone: 'neutral', ...detail };
+}
+
+export type PictureNotice = Extract<TranscriptEntry, { kind: 'notice'; code: 'picture' }>;
+
+/** Lines of the agent's notes or of sizes a picture row shows. */
+const PICTURE_LINES_MAX = 6;
+
+function pictureSize(size: PictureSize): string {
+  return fill(CHAT.pictureNote.size, { from: formatBytes(size.fromBytes), to: formatBytes(size.toBytes) });
+}
+
+function picturePixels(size: PictureSize): string {
+  return fill(CHAT.pictureNote.pixels, { w: size.from[0], h: size.from[1], w2: size.to[0], h2: size.to[1] });
+}
+
+/** The row's headline: pictures left out (no count: the agent's note under it says how many), or how many shrunk. */
+export function pictureHeadline(entry: PictureNotice): string {
+  const p = CHAT.pictureNote;
+  if (entry.what === 'dropped') return p.dropped;
+  return entry.count === 1 ? p.shrunk : fill(p.shrunkMany, { n: entry.count });
+}
+
+/**
+ * Pictures left out (warning, the agent's notes under it) or made smaller (neutral; one picture's sizes as facts,
+ * several as lines, else the agent's words).
+ */
+export function pictureRow(entry: PictureNotice): NoticeRowView {
+  const text = pictureHeadline(entry);
+  const notes = entry.notes.slice(0, PICTURE_LINES_MAX).join('\n');
+  const detail = notes === '' ? {} : { detail: notes };
+  if (entry.what === 'dropped') return { label: CHAT.pictureNote.label, text, facts: [], tone: 'warning', ...detail };
+  const sizes = entry.sizes ?? [];
+  if (sizes.length === 1)
+    return {
+      label: CHAT.pictureNote.label,
+      text,
+      facts: [pictureSize(sizes[0]!), picturePixels(sizes[0]!)],
+      tone: 'neutral',
+    };
+  if (sizes.length > 1) {
+    const lines = sizes.slice(0, PICTURE_LINES_MAX).map((size) => `${pictureSize(size)} · ${picturePixels(size)}`);
+    return { label: CHAT.pictureNote.label, text, facts: [], tone: 'neutral', detail: lines.join('\n') };
+  }
+  return { label: CHAT.pictureNote.label, text, facts: [], tone: 'neutral', ...detail };
+}
+
+/** A turn whose prompt a hook blocked: sending it again meets the same hook. */
+const HOOK_STOPPED: OutcomeLine = { tone: 'neutral', glyph: 'stop', text: CHAT.outcomes['hook-stopped'], action: null };
+
+export type HookNotice = Extract<TranscriptEntry, { kind: 'notice'; code: 'hook' }>;
+export type HookNoteNotice = Extract<TranscriptEntry, { kind: 'notice'; code: 'hook-note' }>;
+
+/** The app's own Work guard (`profiles.ts` `workGuardHookName`) as the reducer keeps its name: no spec path tail. */
+const GUARD_HEAD = 'plugin/mlx-work-guard-';
+const GUARD_TAIL = '/plugin';
+const GUARD_SUFFIX_CHARS = 16;
+
+/** The hook's name as the row shows it: the app's own guard in words, any other as sent. */
+export function hookName(hook: string): string {
+  if (hook.startsWith(GUARD_HEAD) && hook.endsWith(GUARD_TAIL)) {
+    const suffix = hook.slice(GUARD_HEAD.length, hook.length - GUARD_TAIL.length);
+    let hex = suffix.length === GUARD_SUFFIX_CHARS;
+    for (let i = 0; hex && i < suffix.length; i += 1) hex = '0123456789abcdef'.includes(suffix.charAt(i));
+    if (hex) return CHAT.hook.ownGuard;
+  }
+  return visibleText(hook);
+}
+
+/** A tool as the hook words name it: the command, the edit, the read, else its name. */
+function hookTool(tool: string | undefined): string {
+  const t = CHAT.hook.tools;
+  if (tool === undefined || tool === '') return t.any;
+  if (tool === 'run_terminal_command') return t.command;
+  if (tool === 'search_replace' || tool === 'write') return t.edit;
+  if (tool === 'read_file') return t.read;
+  return visibleText(tool);
+}
+
+/** When the hook ran: "before the command", "on your message", "before the answer ends", else the agent's event name. */
+export function hookWhen(event: string, tool: string | undefined): string {
+  const w = CHAT.hook.when;
+  switch (event) {
+    case 'pre_tool_use':
+      return fill(w.pre_tool_use, { tool: hookTool(tool) });
+    case 'post_tool_use':
+      return fill(w.post_tool_use, { tool: hookTool(tool) });
+    case 'user_prompt_submit':
+    case 'stop':
+    case 'session_start':
+    case 'session_end':
+      return w[event];
+    default:
+      return fill(w.other, { event: visibleText(event) });
+  }
+}
+
+/** A failed hook: its name and when it ran, the error under it; after the first failure the count and the newest. */
+export function hookRow(entry: HookNotice): NoticeRowView {
+  const text = `${hookName(entry.hook)} · ${hookWhen(entry.event, entry.tool)}`;
+  const facts =
+    entry.times > 1
+      ? [
+          fill(CHAT.hook.times, { n: formatCount(entry.times) }),
+          fill(CHAT.hook.last, { time: formatClock(entry.lastTs) }),
+        ]
+      : [];
+  const detail = entry.detail === '' ? {} : { detail: entry.detail };
+  return { label: CHAT.hook.failed, text, facts, tone: 'warning', ...detail };
+}
+
+/** A hook's note: the agent's words as the row's text. */
+export function hookNoteRow(entry: HookNoteNotice): NoticeRowView {
+  return { label: CHAT.hook.note, text: visibleText(entry.text), facts: [], tone: 'neutral' };
+}
+
+/** The first line of a hook row, said once when it arrives. */
+export function hookHeadline(entry: HookNotice | HookNoteNotice): string {
+  const view = entry.code === 'hook' ? hookRow(entry) : hookNoteRow(entry);
+  return `${view.label}: ${view.text}`;
+}
+
+/** The wait line of a slow hook batch: how many run, and when. */
+export function hookWaitLine(run: HookRunState): string {
+  const head = run.count > 1 ? fill(CHAT.hook.waitMany, { n: run.count }) : CHAT.hook.wait;
+  return `${head} · ${hookWhen(run.event, run.tool)}`;
 }
 
 /** The time of a thought, from its first to its last live chunk; null for a thought read from disk. */

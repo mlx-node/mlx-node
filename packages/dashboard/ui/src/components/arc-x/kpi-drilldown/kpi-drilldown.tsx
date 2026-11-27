@@ -24,7 +24,7 @@ import { DrilldownContext, type DrilldownContextValue } from './drilldown-contex
 import styles from './kpi-drilldown.module.css';
 
 export interface KpiDetail {
-  /** "Decode speed" */
+  /** The tile's label, from `METRIC`. */
   label: string;
   /** Formatted, the same string as the tile. */
   value: string | null;

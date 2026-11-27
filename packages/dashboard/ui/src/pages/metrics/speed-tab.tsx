@@ -15,7 +15,17 @@ import {
   formatNumber,
   formatTps,
 } from '../../lib/format';
-import { axisNumber, bucketWord, phaseMeans, PHASE_SERIES, timeAxis, toBins } from '../../lib/metrics-view';
+import { METRIC } from '../../lib/metric-strings';
+import {
+  axisNumber,
+  bucketWord,
+  decodeSpeed,
+  phaseMeans,
+  PHASE_SERIES,
+  prefillSpeed,
+  timeAxis,
+  toBins,
+} from '../../lib/metrics-view';
 import { modelColor, modelSeries } from '../../lib/model-colors';
 import {
   PREFILL_MIN_TOKENS,
@@ -42,6 +52,11 @@ const SCATTER_LIMIT = 1000;
 function tailHint(q: Quantiles | undefined, tail: (q: Quantiles) => string): string {
   if (q === undefined) return '';
   return q.n >= LOW_SAMPLE_TAIL_N ? tail(q) : `median of ${formatCountNoun(q.n, 'turn', 'turns')}`;
+}
+
+/** The per-turn median beside a token-weighted speed: the speed is the value, the median only its context. */
+function medianHint(q: Quantiles | undefined, format: (value: number | null) => string): string {
+  return q === undefined || q.p50 === null ? '' : `median per turn ${format(q.p50)}`;
 }
 
 function markers(q: Quantiles | undefined): Array<{ value: number; label: string }> {
@@ -135,7 +150,7 @@ export function SpeedTab(): ReactElement {
         detail: [
           { label: 'Setup', value: formatDuration(row.setupMs) },
           {
-            label: 'Prefill speed',
+            label: METRIC.prefillSpeed.label,
             value: row.prefillTps === null ? PREFILL_UNDER_TEXT : `${formatCount(row.prefillTps)} tok/s`,
           },
         ],
@@ -157,7 +172,7 @@ export function SpeedTab(): ReactElement {
         points,
         byModelRange,
         {
-          [model]: (p) => p.prefillTps.p50,
+          [model]: (p) => prefillSpeed(p.totals),
           p05: (p) => (p.prefillTps.n >= LOW_SAMPLE_TAIL_N ? p.prefillTps.p05 : null),
           p95: (p) => (p.prefillTps.n >= LOW_SAMPLE_TAIL_N ? p.prefillTps.p95 : null),
         },
@@ -171,7 +186,7 @@ export function SpeedTab(): ReactElement {
       };
     }
     const top = topModels(summary.data?.byModel ?? []);
-    const pivot = pivotByModel(points, byModelRange, (p) => p.prefillTps.p50, {
+    const pivot = pivotByModel(points, byModelRange, (p) => prefillSpeed(p.totals), {
       empty: null,
       samples: (p) => p.prefillTps.n,
       models: top,
@@ -190,8 +205,9 @@ export function SpeedTab(): ReactElement {
   const setup = durationTile(latency?.setupMs);
   const total = durationTile(latency?.totalMs);
   const queue = durationTile(latency?.queueMs);
-  const decodeText = formatTps(latency?.decodeTps.p50 ?? null);
-  const prefillText = formatCount(latency?.prefillTps.p50 ?? null);
+  const totals = summary.data?.totals;
+  const decodeText = formatTps(totals === undefined ? null : decodeSpeed(totals));
+  const prefillText = formatCount(totals === undefined ? null : prefillSpeed(totals));
 
   const histogram = (
     title: string,
@@ -236,7 +252,7 @@ export function SpeedTab(): ReactElement {
     latency !== undefined && latency.setupMs.n === 0
       ? 'no measured prefill'
       : tailHint(latency?.setupMs, (v) => `p95 ${formatDuration(v.p95)}`);
-  let prefillHint = tailHint(latency?.prefillTps, (v) => `p05 ${formatCount(v.p05)}`);
+  let prefillHint = medianHint(latency?.prefillTps, formatCount);
   if (latency !== undefined && rated === 0) {
     prefillHint = measured === 0 ? 'no measured prefill' : `no prefill of ${String(PREFILL_MIN_TOKENS)}+ tokens`;
   }
@@ -257,7 +273,7 @@ export function SpeedTab(): ReactElement {
       <RefreshAlert queries={[summary, dist, byModelTs, noneTs, scatter]} />
       <StatGroup label="Percentiles" maxColumns={3}>
         <StatTile
-          label="First token"
+          label={METRIC.firstToken.label}
           {...ttft}
           hint={tailHint(latency?.ttftMs, (v) => `p95 ${formatDuration(v.p95)}`)}
           sampleCount={latency?.ttftMs.n}
@@ -265,7 +281,7 @@ export function SpeedTab(): ReactElement {
         />
         <StatTile label="Setup" {...setup} hint={setupHint} sampleCount={latency?.setupMs.n} {...tile} />
         <StatTile
-          label="Prefill speed"
+          label={METRIC.prefillSpeed.label}
           value={prefillText === '—' ? null : prefillText}
           unit="tok/s"
           hint={prefillHint}
@@ -273,10 +289,10 @@ export function SpeedTab(): ReactElement {
           {...tile}
         />
         <StatTile
-          label="Decode speed"
+          label={METRIC.decodeSpeed.label}
           value={decodeText === '—' ? null : decodeText}
           unit="tok/s"
-          hint={tailHint(latency?.decodeTps, (v) => `slowest 5%: ${formatTps(v.p05)} tok/s`)}
+          hint={medianHint(latency?.decodeTps, formatTps)}
           sampleCount={latency?.decodeTps.n}
           {...tile}
         />
@@ -297,7 +313,7 @@ export function SpeedTab(): ReactElement {
       </StatGroup>
       <PageGrid>
         {histogram(
-          'Decode speed',
+          METRIC.decodeSpeed.label,
           'Completed turns per speed range · tok/s',
           'decodeTps',
           'tok/s',
@@ -382,9 +398,11 @@ export function SpeedTab(): ReactElement {
         </ChartCard>
         <ChartCard
           className="col-span-12 @md:col-span-5"
-          title="Prefill speed"
+          title={METRIC.prefillSpeed.label}
           subtitle={withModel(
-            `Median per ${bucketWord(byModelRange.bucket)}, per model · tok/s · prefills of ${String(PREFILL_MIN_TOKENS)}+ tokens`,
+            model === null
+              ? `Per ${bucketWord(byModelRange.bucket)}, per model · tok/s · prefills of ${String(PREFILL_MIN_TOKENS)}+ tokens`
+              : `Per ${bucketWord(byModelRange.bucket)}, with the p05–p95 range per turn · tok/s · prefills of ${String(PREFILL_MIN_TOKENS)}+ tokens`,
             model,
           )}
           height={240}
@@ -394,7 +412,7 @@ export function SpeedTab(): ReactElement {
           footnote={prefillFootnote === '' ? undefined : prefillFootnote}
         >
           <TrendChart
-            label="Prefill speed"
+            label={METRIC.prefillSpeed.label}
             unit="tok/s"
             height={240}
             curve="linear"

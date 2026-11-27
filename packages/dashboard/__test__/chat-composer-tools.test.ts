@@ -9,9 +9,19 @@ import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 import { Tooltip } from '../ui/src/components/arc/tooltip/tooltip.js';
 import { CHAT } from '../ui/src/lib/chat-strings.js';
 import type { ChatHostState } from '../ui/src/lib/chat-types.js';
-import { type AttachRow, ComposerMenu, modelBases, startModel } from '../ui/src/pages/chat/composer-tools.js';
+import type { TranscriptEntry } from '../ui/src/lib/types.js';
+import {
+  type AttachRow,
+  ComposerMenu,
+  lastModeLine,
+  modelBases,
+  PlanChip,
+  planChip,
+  type PlanChipView,
+  startModel,
+} from '../ui/src/pages/chat/composer-tools.js';
 import { RenameDialog } from '../ui/src/pages/chat/conversation-actions.js';
-import { pickedVariants, storeVariant } from '../ui/src/pages/chat/drafts.js';
+import { type PlanArm, pickedVariants, storeVariant } from '../ui/src/pages/chat/drafts.js';
 import { mount, unmountAll } from './helpers/mount.js';
 import { accessibleName, allByRole, byRole, hostModel, READY_CHAT_HOST, waitFor } from './render.js';
 
@@ -225,7 +235,12 @@ describe('ComposerMenu', () => {
 
   it('before the first host state the + is drawn and disabled, and a click opens no menu', () => {
     const container = mount(
-      createElement(ComposerMenu, { providers: null, mode: 'chat', attach: { open: () => undefined, full: false } }),
+      createElement(ComposerMenu, {
+        providers: null,
+        mode: 'chat',
+        attach: { open: () => undefined, full: false },
+        onCommands: () => undefined,
+      }),
     );
     const plus = [...container.querySelectorAll('button')].find((b) => accessibleName(b) === CHAT.tools)!;
     expect(plus.disabled).toBe(true);
@@ -235,7 +250,11 @@ describe('ComposerMenu', () => {
 
   describe('Add files or photos', () => {
     const open = vi.fn();
-    afterEach(() => open.mockClear());
+    const onCommands = vi.fn<() => void>();
+    afterEach(() => {
+      open.mockClear();
+      onCommands.mockClear();
+    });
 
     interface Setup {
       attach?: Partial<AttachRow>;
@@ -256,6 +275,7 @@ describe('ComposerMenu', () => {
             providers: over.providers === undefined ? READY_CHAT_HOST.providers : over.providers,
             mode: over.mode ?? 'chat',
             attach,
+            onCommands,
           }),
           createElement(Tooltip, { content: 'Tip', children: createElement('button', { type: 'button' }, 'Tipped') }),
           createElement(RenameDialog, {
@@ -288,6 +308,7 @@ describe('ComposerMenu', () => {
       const rows = allByRole(await openMenu(), 'menuitem');
       expect(rows.map((row) => row.querySelector('[class*="label"]')?.textContent)).toEqual([
         CHAT.attach.row,
+        CHAT.slash.menuRow,
         CHAT.webSearch,
         CHAT.crawler,
       ]);
@@ -310,6 +331,17 @@ describe('ComposerMenu', () => {
       expect(row.getAttribute('aria-disabled')).toBeNull();
       act(() => row.click());
       expect(open).toHaveBeenCalledTimes(1);
+    });
+
+    it('Commands has no key; picking it opens the / list and closes the menu (#6)', async () => {
+      setup();
+      const row = byRole(await openMenu(), 'menuitem', CHAT.slash.menuRow)!;
+      expect(row.getAttribute('aria-keyshortcuts')).toBeNull();
+      expect(document.getElementById(row.getAttribute('aria-describedby')!)?.textContent).toBe(CHAT.slash.menuNote);
+      act(() => row.click());
+      expect(onCommands).toHaveBeenCalledTimes(1);
+      expect(open).not.toHaveBeenCalled();
+      await waitFor(() => menu() === null);
     });
 
     it('with 4 attached the row says so and does nothing, and ⌘U does nothing', async () => {
@@ -340,7 +372,7 @@ describe('ComposerMenu', () => {
 
     it('⌘U opens the picker with the Web search panel open: a dialog inside a popover is not a modal', async () => {
       setup();
-      const web = allByRole(await openMenu(), 'menuitem')[1]!;
+      const web = allByRole(await openMenu(), 'menuitem')[2]!;
       act(() => web.click());
       await waitFor(() => byRole(document.body, 'dialog', CHAT.webSearch) !== null);
       metaU(byRole(document.body, 'dialog', CHAT.webSearch)!);
@@ -349,7 +381,7 @@ describe('ComposerMenu', () => {
 
     it('⌘U opens the picker with the Crawler panel open', async () => {
       setup();
-      const crawler = allByRole(await openMenu(), 'menuitem')[2]!;
+      const crawler = allByRole(await openMenu(), 'menuitem')[3]!;
       act(() => crawler.click());
       await waitFor(() => byRole(document.body, 'dialog', CHAT.crawler) !== null);
       metaU(byRole(document.body, 'dialog', CHAT.crawler)!);
@@ -377,5 +409,102 @@ describe('ComposerMenu', () => {
       metaU(document.activeElement ?? document.body);
       expect(open).not.toHaveBeenCalled();
     });
+  });
+});
+
+describe('the "Plan first" chip', () => {
+  afterEach(unmountAll);
+
+  const mode = (value: 'plan' | 'default' | 'ask', ts: number): TranscriptEntry => ({
+    kind: 'plan-mode',
+    ts,
+    mode: value,
+  });
+  const prompt = (text: string, ts: number): TranscriptEntry => ({ kind: 'user', ts, text, promptIndex: null });
+  const planned = [prompt('Plan the cache', 1), mode('plan', 2)];
+
+  function chip(view: PlanChipView, busy = false, onToggle = vi.fn()): HTMLButtonElement {
+    const container = mount(createElement(PlanChip, { view, busy, onToggle }));
+    return byRole(container, 'button', CHAT.planMode.chip) as HTMLButtonElement;
+  }
+
+  it('off and not planning, the chip is not drawn at all', () => {
+    // Mutation: drop the early return of PlanChip → a dashed "Plan first" chip stays in the toolbar.
+    const container = mount(createElement(PlanChip, { view: planChip([], null), busy: false, onToggle: vi.fn() }));
+    expect(byRole(container, 'button', CHAT.planMode.chip)).toBeNull();
+  });
+
+  it('one value, row by row: what shows pressed is what the next message carries', () => {
+    const lastKey = lastModeLine(planned)!.key;
+    const rows: Array<{
+      name: string;
+      entries: TranscriptEntry[];
+      stored: PlanArm | null;
+      label: string;
+      plan: boolean;
+    }> = [
+      {
+        name: 'the user arms it',
+        entries: [],
+        stored: { next: true, seen: null },
+        label: CHAT.planMode.chip,
+        plan: true,
+      },
+      { name: 'the agent plans', entries: planned, stored: null, label: CHAT.planMode.chipOn, plan: true },
+      {
+        name: 'the user turns it off',
+        entries: planned,
+        stored: { next: false, seen: lastKey },
+        label: CHAT.planMode.chip,
+        plan: false,
+      },
+    ];
+    for (const row of rows) {
+      const view = planChip(row.entries, row.stored);
+      const button = chip(view);
+      expect([row.name, view.next, button.getAttribute('aria-pressed')]).toEqual([
+        row.name,
+        row.plan,
+        String(row.plan),
+      ]);
+      expect([row.name, button.querySelector('[data-chip-label]')?.textContent]).toEqual([row.name, row.label]);
+      expect([row.name, button.getAttribute('data-chip')]).toEqual([row.name, row.plan ? 'on' : 'off']);
+      expect([row.name, button.getAttribute('data-chip-tone')]).toEqual([row.name, row.plan ? 'active' : null]);
+      unmountAll();
+    }
+  });
+
+  it('the model entering plan mode by itself turns the chip on; a newer mode line takes over from a press', () => {
+    const before = [prompt('Fix the cache', 1)];
+    const off = planChip(before, null);
+    expect([off.next, off.agentPlan, off.mode]).toEqual([false, false, null]);
+    // The user pressed it off before the agent planned: the agent's new line wins.
+    const stored: PlanArm = { next: false, seen: off.seen };
+    const on = planChip([...before, mode('plan', 2)], stored);
+    expect([on.next, on.agentPlan, on.mode]).toEqual([true, true, 'plan']);
+    // A press after that line holds, until the approved plan leaves plan mode.
+    const pressed: PlanArm = { next: false, seen: on.seen };
+    expect(planChip([...before, mode('plan', 2)], pressed).next).toBe(false);
+    const left = planChip([...before, mode('plan', 2), mode('default', 3)], { next: true, seen: on.seen });
+    expect([left.next, left.agentPlan]).toEqual([false, false]);
+    expect(lastModeLine([...before, mode('plan', 2), mode('default', 3)])).toEqual({ key: '2:3', mode: 'default' });
+  });
+
+  it('stays live while an answer runs: a press toggles, and its tooltip says it is for the next message', async () => {
+    const onToggle = vi.fn();
+    const button = chip(planChip([], { next: true, seen: null }), true, onToggle);
+    expect(button.disabled).toBe(false);
+    act(() => button.click());
+    expect(onToggle).toHaveBeenCalledTimes(1);
+    act(() => button.focus());
+    await waitFor(() => document.querySelector('[role="tooltip"]')?.textContent?.includes(CHAT.planMode.next) === true);
+  });
+
+  it('idle, its tooltip says what plan mode does; the name stays "Plan first" while the label says "Planning"', async () => {
+    const button = chip(planChip(planned, null));
+    expect(accessibleName(button)).toBe(CHAT.planMode.chip);
+    expect(button.querySelector('[data-chip-label]')?.textContent).toBe(CHAT.planMode.chipOn);
+    act(() => button.focus());
+    await waitFor(() => document.querySelector('[role="tooltip"]')?.textContent?.includes(CHAT.planMode.tip) === true);
   });
 });

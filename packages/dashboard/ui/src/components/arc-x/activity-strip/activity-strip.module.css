@@ -1,0 +1,15 @@
+.root {
+  display: inline-block;
+  flex: none;
+  overflow: hidden;
+  vertical-align: middle;
+}
+
+.base {
+  stroke: color-mix(in oklab, var(--text-secondary) 24%, transparent);
+  stroke-width: 1;
+}
+
+.band {
+  fill: var(--c);
+}

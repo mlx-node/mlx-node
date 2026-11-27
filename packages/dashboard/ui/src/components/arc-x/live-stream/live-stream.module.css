@@ -12,36 +12,66 @@
   gap: var(--space-3);
 }
 
-.reading {
-  display: grid;
+.lead {
+  display: flex;
   min-width: 0;
-  gap: var(--space-0-5);
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-6);
 }
 
-.valueLine {
-  display: inline-flex;
-  min-width: 5ch;
-  align-items: baseline;
-  gap: var(--space-1-5);
-  font-family: var(--font-display);
-  font-size: var(--text-3xl);
+.state {
+  display: flex;
+  min-width: 0;
+  align-self: center;
+  align-items: center;
+}
+
+.readout {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-1);
+}
+
+.readoutLabel {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.value {
+.tip {
+  cursor: help;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--text-muted);
+  text-underline-offset: 3px;
+}
+
+/* The slot is reserved on the value and its unit together, so a "—" keeps the width of "1,135 tok/s". */
+.readoutLine {
+  display: inline-flex;
+  min-width: 8ch;
+  align-items: baseline;
+  gap: var(--space-1-5);
   font-family: var(--font-display);
-  font-size: var(--text-3xl);
+  font-size: var(--text-2xl);
+  white-space: nowrap;
+}
+
+.readoutValue {
+  font-family: var(--font-display);
+  font-size: var(--text-2xl);
   font-weight: 400;
   letter-spacing: var(--tracking-display);
   line-height: 1;
 }
 
-.unit {
+.quiet {
   color: var(--text-secondary);
-  font-size: var(--text-sm);
 }
 
-.status {
+.unit {
   color: var(--text-secondary);
   font-size: var(--text-sm);
 }
@@ -153,6 +183,24 @@
   stroke: var(--surface);
   stroke-width: 2;
   transform-box: view-box;
+}
+
+.band {
+  fill: var(--band);
+}
+
+.legendRow {
+  display: flex;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+}
+
+.legendTitle {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
 }
 
 [data-entrance='pending'] .trace {

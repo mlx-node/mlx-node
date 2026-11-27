@@ -1,0 +1,184 @@
+.root {
+  position: relative;
+  min-width: 0;
+  margin: 0;
+  border-radius: var(--radius-inset);
+  padding: var(--space-2) 0;
+  background: var(--surface-muted);
+  color: var(--text-secondary);
+  container-type: inline-size;
+}
+
+.caption {
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: var(--space-2);
+  margin: 0 var(--space-2-5) var(--space-1);
+  padding-inline-end: var(--control-height-sm);
+  font-size: var(--text-xs);
+}
+
+.path {
+  min-width: 0;
+  color: var(--foreground);
+}
+
+.state {
+  flex: none;
+  font-weight: 500;
+}
+
+.scroller {
+  min-width: 0;
+  padding-inline-end: var(--control-height-sm);
+  font-family: var(--font-code);
+  font-size: var(--text-code);
+  letter-spacing: 0;
+  line-height: var(--leading-code);
+}
+
+.scroller[data-expanded] {
+  max-height: 480px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.scroller[data-expanded]:focus-visible {
+  outline: var(--focus-outline-width, 2px) solid var(--focus-ring);
+  outline-offset: -2px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns:
+    calc(var(--digits) * 1ch + var(--space-2)) calc(var(--digits) * 1ch + var(--space-2))
+    2ch minmax(0, 1fr);
+  padding-inline-start: var(--space-1);
+}
+
+.row[data-mark='removed'] {
+  background: color-mix(in oklab, var(--danger) 12%, transparent);
+}
+
+.row[data-mark='added'] {
+  background: color-mix(in oklab, var(--success) 12%, transparent);
+}
+
+.old,
+.new {
+  padding-inline-end: var(--space-2);
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+  text-align: end;
+  user-select: none;
+}
+
+.mark {
+  user-select: none;
+}
+
+.row[data-mark='removed'] .mark {
+  color: var(--danger);
+}
+
+.row[data-mark='added'] .mark {
+  color: var(--success);
+}
+
+.text {
+  min-width: 0;
+  color: var(--foreground);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.gap {
+  padding: 0 var(--space-2-5);
+  color: var(--text-secondary);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+}
+
+.gapMark {
+  margin-inline-end: var(--space-1);
+}
+
+/* A new file has no old lines: one number column. */
+.root[data-create] .row {
+  grid-template-columns: calc(var(--digits) * 1ch + var(--space-2)) 2ch minmax(0, 1fr);
+}
+
+.root[data-create] .old {
+  display: none;
+}
+
+.more {
+  margin: var(--space-1) var(--space-2-5) 0;
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition: color var(--duration-fast) var(--ease-standard);
+}
+
+.note {
+  margin: var(--space-1) var(--space-2-5) 0;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.copy {
+  position: absolute;
+  top: var(--space-1);
+  right: var(--space-1);
+}
+
+.files {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-2);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* Under 520 px the old column gives way: the new numbers stay. */
+@container (max-width: 519px) {
+  .row {
+    grid-template-columns: calc(var(--digits) * 1ch + var(--space-2)) 2ch minmax(0, 1fr);
+  }
+
+  .old {
+    display: none;
+  }
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .more:hover {
+    color: var(--foreground);
+  }
+}
+
+@media (forced-colors: active) {
+  .row[data-mark='removed'] .mark,
+  .row[data-mark='added'] .mark {
+    color: CanvasText;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .more {
+    transition-duration: var(--duration-instant);
+  }
+}

@@ -4,7 +4,8 @@
  * Control Panel cannot handle. All on the scripted fake agent.
  */
 
-import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
@@ -347,6 +348,159 @@ describe('an agent line the Control Panel cannot handle', () => {
       expect(state.modes.chat.failure?.code).toBe('agent-protocol-error');
     } finally {
       await fake.close();
+    }
+  }, 20_000);
+});
+
+describe('the idle stop and background work (H-a)', () => {
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Work on the fake agent with a 300 ms idle stop; `word` starts `step` (or steps) in the background, gated on `end`. */
+  async function idleWith(
+    step: (end: string) => Json | Json[],
+    run: (fake: FakeHost, id: string, end: string) => Promise<void>,
+  ) {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-idle-gate-'));
+    const end = join(dir, 'end');
+    try {
+      await withFake(
+        'work-workflow-run',
+        async (fake) => {
+          const { sessionId } = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+          const turn = fake.host.startTurn(sessionId, 'bg', { modelId: MODEL, cwd: fake.project });
+          expect((await turn.done).outcome).toBe('completed');
+          await run(fake, sessionId, end);
+        },
+        {
+          mode: 'work',
+          timings: { idleStopMs: 300 },
+          mutate: (scenario) => {
+            scenario.prompts = [
+              { match: 'bg', steps: [step(end), { text: 'Started.' }, { end: { stopReason: 'end_turn' } }].flat() },
+            ];
+          },
+        },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  const kinds: Array<[string, (end: string) => Json]> = [
+    ['a command', (endOn) => ({ background: { endOn, wake: false } })],
+    ['a monitor', (endOn) => ({ background: { monitor: true, endOn, wake: false } })],
+    ['a helper', (endOn) => ({ helper: { endOn, wake: false } })],
+    ['a schedule', (endOn) => ({ schedule: { endOn } })],
+  ];
+
+  for (const [name, step] of kinds) {
+    it(`does not stop a process that holds ${name}; it does once that ends`, async () => {
+      await idleWith(step, async (fake, _id, end) => {
+        await sleep(900);
+        expect(fake.host.modeState().state).toBe('ready');
+        writeFileSync(end, '');
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+      });
+    }, 15_000);
+  }
+
+  it('a helper the agent no longer lists (its end line lost) is dropped at the guard, and the process stops', async () => {
+    await idleWith(
+      (endOn) => ({ helper: { endOn, lostEnd: true } }),
+      async (fake, id, end) => {
+        const asked = (): Json[] => fake.records().filter((r) => r.kind === 'list-running');
+        await until(() => asked().length >= 2, 5_000);
+        expect(fake.host.modeState().state).toBe('ready');
+        expect(asked()[0]).toMatchObject({ sessionId: id, listed: [`${id}-helper-toolu_1`] });
+        expect(fake.host.engineBusy(id)).toBe(true);
+        writeFileSync(end, '');
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(asked().at(-1)).toMatchObject({ sessionId: id, listed: [] });
+        expect(
+          fake
+            .sent()
+            .filter((m) => m.method === '_x.ai/subagent/list_running')
+            .at(-1)?.params,
+        ).toEqual({
+          sessionId: id,
+        });
+      },
+    );
+  }, 15_000);
+
+  it('a stale process with a schedule still asks about its helpers: one whose end line was lost does not hold the restart', async () => {
+    await idleWith(
+      (endOn) => [{ helper: { endOn, lostEnd: true } }, { schedule: {} }],
+      async (fake, id, end) => {
+        fake.host.markStale();
+        await sleep(900);
+        expect(fake.host.modeState()).toMatchObject({ state: 'ready', stale: true });
+        writeFileSync(end, '');
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(
+          fake
+            .records()
+            .filter((r) => r.kind === 'list-running')
+            .at(-1),
+        ).toMatchObject({ sessionId: id, listed: [] });
+      },
+    );
+  }, 15_000);
+
+  // Mutation: let the reply judge every helper tracked when it lands → the helper started meanwhile goes with the lost
+  // one and the process stops under it.
+  it('a late reply judges only the helpers tracked when the guard asked: one started meanwhile keeps the process', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-idle-late-'));
+    const lost = join(dir, 'lost');
+    const end = join(dir, 'end');
+    try {
+      await withFake(
+        'work-workflow-run',
+        async (fake) => {
+          const load = { modelId: MODEL, cwd: fake.project };
+          const { sessionId } = await fake.host.createSession(load);
+          expect((await fake.host.startTurn(sessionId, 'bg', load).done).outcome).toBe('completed');
+          writeFileSync(lost, '');
+          const asked = (): Json[] => fake.records().filter((r) => r.kind === 'list-running');
+          await until(() => asked().length >= 1, 5_000);
+          expect(asked()[0]).toMatchObject({ sessionId, listed: [] });
+          expect((await fake.host.startTurn(sessionId, 'more', load).done).outcome).toBe('completed');
+          expect(fake.records().some((r) => r.kind === 'list-running-replied')).toBe(false);
+          await until(() => fake.records().some((r) => r.kind === 'list-running-replied'), 5_000);
+          await sleep(300);
+          expect(fake.host.modeState().state).toBe('ready');
+          expect(fake.host.engineBusy(sessionId)).toBe(true);
+          writeFileSync(end, '');
+          await until(() => fake.host.modeState().state === 'stopped', 8_000);
+        },
+        {
+          mode: 'work',
+          timings: { idleStopMs: 300 },
+          mutate: (scenario) => {
+            scenario.faults = { listRunningLagMs: 1_500 };
+            scenario.prompts = [
+              {
+                match: 'bg',
+                steps: [
+                  { helper: { id: 'toolu_lost', endOn: lost, lostEnd: true } },
+                  { text: 'Started.' },
+                  { end: { stopReason: 'end_turn' } },
+                ],
+              },
+              {
+                match: 'more',
+                steps: [
+                  { helper: { id: 'toolu_new', endOn: end, wake: false } },
+                  { text: 'Started another.' },
+                  { end: { stopReason: 'end_turn' } },
+                ],
+              },
+            ];
+          },
+        },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
 });

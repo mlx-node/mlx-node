@@ -10,9 +10,11 @@ import { Placeholder } from '../../components/arc-x/placeholder/placeholder';
 import { TrendChart } from '../../components/arc-x/trend-chart/trend-chart';
 import { Button } from '../../components/arc/button/button';
 import { formatCount, formatDuration, formatNumber, formatTps } from '../../lib/format';
+import { METRIC } from '../../lib/metric-strings';
 import {
   axisNumber,
   bucketWord,
+  decodeSpeed,
   kpiByModel,
   kpiDescription,
   KPI_LABEL,
@@ -175,6 +177,10 @@ function DetailBody(props: BodyProps & { points: readonly TsPoint[]; pointsLoadi
   );
 }
 
+function speedText(value: number | null): string | null {
+  return value === null ? null : `${formatTps(value)} tok/s`;
+}
+
 function quantileItems(label: string, q: Quantiles, format: (value: number) => string) {
   const text = (value: number | null): string | null => (value === null ? null : format(value));
   return [
@@ -193,9 +199,17 @@ function ByModel(props: BodyProps): ReactElement {
       row === undefined
         ? [{ key: 'none', label: 'Turns', value: null }]
         : key === 'decode'
-          ? quantileItems('Decode', row.latency.decodeTps, (v) => `${formatTps(v)} tok/s`)
+          ? [
+              {
+                key: 'speed',
+                label: METRIC.decodeSpeed.label,
+                value: speedText(decodeSpeed(row.totals)),
+                numeric: true,
+              },
+              ...quantileItems('Per turn', row.latency.decodeTps, (v) => speedText(v) ?? '—'),
+            ]
           : key === 'ttft'
-            ? quantileItems('First token', row.latency.ttftMs, formatDuration)
+            ? quantileItems(METRIC.firstToken.label, row.latency.ttftMs, formatDuration)
             : [
                 { key: 'turns', label: 'Turns', value: formatNumber(row.totals.turns), numeric: true },
                 { key: 'ok', label: 'Completed', value: formatNumber(row.totals.ok), numeric: true },

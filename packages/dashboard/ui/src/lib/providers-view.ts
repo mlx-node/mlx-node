@@ -178,7 +178,7 @@ export function checkedLine(p: ProviderState): string | null {
   return p.checkedAt === null ? null : fill(PROVIDERS.checked, { when: formatRelativeTime(p.checkedAt) });
 }
 
-/** `{repo} @ {7 chars} · {license}`, or "written by mlx-node" for an own bundle. */
+/** `{repo} @ {7 chars} · {license}`, or "written by Portato" for an own bundle. */
 export function skillSource(p: ProviderState): string {
   const up = p.skill.upstream;
   if (up === null) return PROVIDERS.skillsOwn;

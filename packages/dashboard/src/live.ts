@@ -75,6 +75,10 @@ export interface RuntimeLiveTurn {
   slotMs: number | null;
   /** Time spent preparing the prompt before its prefill. */
   prepareMs: number | null;
+  /** Prefill start to the first token (or to now); null before the prefill. */
+  prefillElapsedMs: number | null;
+  /** Time since the first token; null before it. */
+  decodeElapsedMs: number | null;
   promptTokens: number | null;
   cachedTokens: number | null;
   prefillTotal: number | null;
@@ -93,6 +97,18 @@ export interface RuntimeLiveLoad {
   steps: number | null;
 }
 
+/** Lane-ms per state; `loading` is wall ms with at least one model load in flight. */
+export interface WorkMs {
+  loading: number;
+  /** Dispatched, not started: the model thread is busy or no lane is free. */
+  waiting: number;
+  prepare: number;
+  prefill: number;
+  decode: number;
+  /** Lanes without native progress (non-streamed turns, System One decisions). */
+  running: number;
+}
+
 /** The validated content of one `live-<pid>.json`. */
 export interface RuntimeLiveFile {
   pid: number;
@@ -108,7 +124,13 @@ export interface RuntimeLiveFile {
   coldCapture: { blocks: number; ms: number } | null;
   health: RuntimeHealth;
   mem: { active: number; peak: number; cache: number; wiredLimit: number; rss: number };
-  decodeTps: number | null;
+  /** Lane-ms per state since the process started; cumulative, never decreasing. */
+  work: { ms: WorkMs };
+  /**
+   * Over the last `windowMs`: output tokens per second while at least one lane decodes, and prefill tokens per second
+   * of lane prefill time. Each is null when the window holds no such time, never 0.
+   */
+  rates: { windowMs: number; outputTps: number | null; prefillTps: number | null };
   /** Loads in flight, oldest first; empty when idle. */
   loading: RuntimeLiveLoad[];
   counters: { ok: number; error: number; cancelled: number; outputTokens: number; loads: number; rejected: number };
@@ -171,6 +193,8 @@ const LIVE_TURNS_MAX = 32;
 const LIVE_MODELS_MAX = 64;
 const LIVE_LOADS_MAX = 16;
 const CLIENT_SESSION_MAX = 128;
+/** The only heartbeat version this host reads; any other is skipped like a malformed file. */
+const LIVE_FILE_VERSION = 3;
 
 // ---------------------------------------------------------------- parsing
 
@@ -206,6 +230,7 @@ const STATES: readonly SupervisorState[] = ['stopped', 'starting', 'running', 'r
 const PHASES: readonly LiveTurnPhase[] = ['queued', 'slot', 'prepare', 'prefill', 'decode'];
 const LOAD_PHASES: readonly LiveLoadPhase[] = ['weights', 'kernels'];
 const DISPATCHES: readonly LiveDispatch[] = ['start', 'continue', 'continue_tool'];
+const WORK_KEYS: ReadonlyArray<keyof WorkMs> = ['loading', 'waiting', 'prepare', 'prefill', 'decode', 'running'];
 
 /** pid of a `live-<pid>.json` file name, or null. */
 export function liveFilePid(name: string): number | null {
@@ -321,10 +346,22 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
     value.waitMs,
     value.slotMs,
     value.prepareMs,
+    value.prefillElapsedMs,
+    value.decodeElapsedMs,
   ].map(finOrNull);
   if (counts.some((c) => c === undefined)) return null;
-  const [promptTokens, cachedTokens, prefillTotal, prefillDone, generatedTokens, waitMs, slotMs, prepareMs] =
-    counts as Array<number | null>;
+  const [
+    promptTokens,
+    cachedTokens,
+    prefillTotal,
+    prefillDone,
+    generatedTokens,
+    waitMs,
+    slotMs,
+    prepareMs,
+    prefillElapsedMs,
+    decodeElapsedMs,
+  ] = counts as Array<number | null>;
   return {
     traceId: value.traceId,
     model: value.model,
@@ -337,6 +374,8 @@ function parseTurn(value: unknown): RuntimeLiveTurn | null {
     waitMs,
     slotMs,
     prepareMs,
+    prefillElapsedMs,
+    decodeElapsedMs,
     promptTokens,
     cachedTokens,
     prefillTotal,
@@ -361,9 +400,36 @@ function parseLoad(value: unknown): RuntimeLiveLoad | null {
   return { model: value.model, startedAt, phase, stepsDone, steps };
 }
 
+function parseWork(value: unknown): RuntimeLiveFile['work'] | null {
+  if (!isObj(value) || !isObj(value.ms)) return null;
+  const ms = {} as WorkMs;
+  for (const key of WORK_KEYS) {
+    const n = fin(value.ms[key]);
+    if (n === null || n < 0) return null;
+    ms[key] = n;
+  }
+  return { ms };
+}
+
+/** A positive rate, null, or undefined for anything else: the writer sends null, never 0, for no time in the window. */
+function rateOrNull(value: unknown): number | null | undefined {
+  if (value === null) return null;
+  const n = fin(value);
+  return n !== null && n > 0 ? n : undefined;
+}
+
+function parseRates(value: unknown): RuntimeLiveFile['rates'] | null {
+  if (!isObj(value)) return null;
+  const windowMs = fin(value.windowMs);
+  const outputTps = rateOrNull(value.outputTps);
+  const prefillTps = rateOrNull(value.prefillTps);
+  if (windowMs === null || windowMs <= 0 || outputTps === undefined || prefillTps === undefined) return null;
+  return { windowMs, outputTps, prefillTps };
+}
+
 /** Field-by-field validation of a heartbeat; null for anything malformed. */
 export function parseLiveFile(value: unknown): RuntimeLiveFile | null {
-  if (!isObj(value) || value.v !== 2) return null;
+  if (!isObj(value) || value.v !== LIVE_FILE_VERSION) return null;
   const pid = fin(value.pid);
   const startedAt = fin(value.startedAt);
   const ts = fin(value.ts);
@@ -371,9 +437,10 @@ export function parseLiveFile(value: unknown): RuntimeLiveFile | null {
   const port = fin(value.port);
   const host = oneOf(value.host, HOSTS);
   const health = oneOf(value.health, HEALTH);
-  const decodeTps = finOrNull(value.decodeTps);
+  const work = parseWork(value.work);
+  const rates = parseRates(value.rates);
   if (pid === null || startedAt === null || ts === null || intervalMs === null || intervalMs <= 0) return null;
-  if (port === null || host === null || health === null || decodeTps === undefined) return null;
+  if (port === null || host === null || health === null || work === null || rates === null) return null;
   if (typeof value.version !== 'string') return null;
   if (!isObj(value.mem) || !isObj(value.counters)) return null;
   const memKeys = ['active', 'peak', 'cache', 'wiredLimit', 'rss'] as const;
@@ -422,7 +489,8 @@ export function parseLiveFile(value: unknown): RuntimeLiveFile | null {
     coldCapture: parseColdCapture(value.coldCapture),
     health,
     mem,
-    decodeTps,
+    work,
+    rates,
     loading,
     counters,
     models,

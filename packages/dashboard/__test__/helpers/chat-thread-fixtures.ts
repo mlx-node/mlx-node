@@ -424,6 +424,7 @@ export function workflowRun(over: Partial<RunEntry> = {}): RunEntry {
     revision: 7,
     name: 'deep-research',
     status: 'active',
+    elapsedMs: 59_600,
     phases: [
       { title: 'Plan', state: 'done' },
       { title: 'Research', state: 'active' },
@@ -433,6 +434,7 @@ export function workflowRun(over: Partial<RunEntry> = {}): RunEntry {
     currentPhase: 'Research',
     agentBudget: 128,
     agentsUsed: 5,
+    phasesEntered: [],
     agents: [
       { agentId: 'a0', label: 'research-planner', phase: 'Plan', state: 'done', tokens: 10_999, durationMs: 167_000 },
       { agentId: 'a1', label: 'researcher-0', phase: 'Research', state: 'running', tokens: 2_400, durationMs: 31_000 },
@@ -499,7 +501,6 @@ export const THREAD_SAMPLES: Readonly<Record<string, ThreadSample>> = {
   'length-limit': outcomeSample('max_tokens'),
   'ended-error': outcomeSample('refusal', 'model call failed: 500'),
   'tool-refused': liveOutcomeSample('tool-refused'),
-  'address-refused': liveOutcomeSample('address-refused'),
   'model-error': liveOutcomeSample('model-error'),
   'agent-crashed': liveOutcomeSample('agent-crashed'),
   'output-limit': liveOutcomeSample('output-limit'),

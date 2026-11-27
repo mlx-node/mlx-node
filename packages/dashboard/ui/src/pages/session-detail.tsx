@@ -42,6 +42,7 @@ import { useJson } from '../lib/use-api';
 import { type AppCommand, useCommands } from '../shell/commands';
 import { Page, PageHeader } from '../shell/page';
 import { Activity } from './session-detail/activity';
+import { ChildControls } from './session-detail/child-controls';
 import { INSPECTOR_ID } from './session-detail/turn-inspector';
 
 type Tab = 'activity' | 'transcript';
@@ -145,7 +146,7 @@ function facts(data: SessionDetailResponse): KeyValueItem[] {
     {
       key: 'messages',
       label: AGENT_MESSAGES,
-      labelTitle: AGENT_MESSAGES_TIP,
+      labelTip: AGENT_MESSAGES_TIP,
       value: formatNumber(session.messageCount),
       numeric: true,
     },
@@ -417,6 +418,9 @@ export default function SessionDetail(): ReactElement {
               </ExpandableText>
             </div>
           ) : null}
+          {isSubagentKind(session.kind) && parent !== null && parent.title !== null ? (
+            <ChildControls childId={session.id} parentId={parent.id} />
+          ) : null}
         </div>
       </Panel>
 
@@ -444,6 +448,7 @@ export default function SessionDetail(): ReactElement {
         <TabsContent value="transcript">
           {tab === 'transcript' ? (
             <Transcript
+              sessionId={session.id}
               entries={data.transcript}
               turns={data.turns}
               focusTurn={focusTurn}

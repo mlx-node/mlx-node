@@ -24,6 +24,8 @@
   --color-success: var(--success);
   --color-warning: var(--warning);
   --color-danger: var(--danger);
+  /* The agent's question rows: a tone no state uses, so they are easy to find in a long thread. */
+  --color-question: var(--tone-violet);
 
   --text-caption: var(--text-xs);
   --text-body: var(--text-sm);

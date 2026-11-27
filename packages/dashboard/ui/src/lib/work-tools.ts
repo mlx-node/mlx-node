@@ -1,9 +1,10 @@
 /**
  * Work tool rows: the agent's input of a shell command, an edit, a read, a listing or a file search, read with a
  * shape check. An input that does not fit gives null, and the row falls back to the agent's title and the raw input.
+ * The `workflow` calls have forms of their own ({@link workflowFormOf}).
  */
 
-import { CHAT } from './chat-strings';
+import { CHAT, fill } from './chat-strings';
 import { truncateMiddle } from './labels';
 import type { TranscriptEntry } from './types';
 import { oneLine } from './web-tools';
@@ -100,10 +101,16 @@ function prefixed(value: string, mark: string): string {
   return lines.map((line) => `${mark} ${line}`).join('\n');
 }
 
+/** An edit whose input was cut too long to read (a big write): its diff blocks still name the file. */
+function cutEdit(entry: ToolEntry, folder: string | null): WorkCall | null {
+  const path = entry.name === 'search_replace' || entry.name === 'write' ? text(entry.edits?.[0]?.path) : null;
+  return path === null ? null : { kind: 'edit', words: CHAT.workEdit, title: oneLine(relativeTo(path, folder)), path };
+}
+
 /** The Work form of a tool row, or null for a tool this table does not know or an input that does not fit. */
 export function workCallOf(entry: ToolEntry, folder: string | null): WorkCall | null {
   const input = record(entry.input);
-  if (input === null) return null;
+  if (input === null) return cutEdit(entry, folder);
   switch (entry.name) {
     case 'run_terminal_command': {
       const command = text(input.command);
@@ -149,4 +156,138 @@ export function workCallOf(entry: ToolEntry, folder: string | null): WorkCall | 
     default:
       return null;
   }
+}
+
+/**
+ * A `workflow` call as the thread draws it, by its `rawInput.source.type` (the reducer's `run`): a launch that came
+ * back with a run id is its run's block; a refused or failed launch is a row, never a block; a check passed or failed;
+ * the main agent's pause, stop or resume names the run and links to it. Null while the call runs, for a source the
+ * agent could not read, and for a control call that failed: the plain tool row shows those.
+ */
+export type WorkflowForm =
+  | { form: 'block'; runId: string }
+  | { form: 'row'; kind: 'not-started' | 'check-failed'; title: string; error: string | null }
+  | { form: 'row'; kind: 'checked'; title: string }
+  | { form: 'row'; kind: 'control'; verb: 'pause' | 'stop' | 'resume'; title: string; runId: string | null };
+
+const WORKFLOW_TOOL = 'workflow';
+
+function errorLine(entry: ToolEntry): string | null {
+  const output = entry.output ?? '';
+  let start = 0;
+  while (start < output.length) {
+    const end = output.indexOf('\n', start);
+    const line = oneLine(output.slice(start, end === -1 ? output.length : end)).trim();
+    if (line !== '') return line;
+    if (end === -1) break;
+    start = end + 1;
+  }
+  return null;
+}
+
+/** The run a control call names, as the agent's input gave it: a run id or a name. */
+function namedRun(input: Record<string, unknown> | null, verb: 'pause' | 'stop' | 'resume'): string | null {
+  const source = input !== null && typeof input.source === 'object' && input.source !== null ? input.source : null;
+  if (source === null) return null;
+  return text((source as Record<string, unknown>)[verb === 'resume' ? 'resume_from_run_id' : 'run_id']);
+}
+
+/** `names`: run id to its name, from the `workflow` entries. */
+export function workflowFormOf(entry: ToolEntry, names: ReadonlyMap<string, string>): WorkflowForm | null {
+  const run = entry.run;
+  if (entry.name !== WORKFLOW_TOOL || run === undefined) return null;
+  const done = entry.status === 'completed';
+  if (!done && entry.status !== 'failed') return null;
+  const words = CHAT.run.toolRows;
+  switch (run.kind) {
+    case 'launch':
+      return done && run.id !== null
+        ? { form: 'block', runId: run.id }
+        : { form: 'row', kind: 'not-started', title: words.notStarted, error: errorLine(entry) };
+    case 'check': {
+      if (!done) return { form: 'row', kind: 'check-failed', title: words.checkFailed, error: errorLine(entry) };
+      const output = record(entry.output);
+      const source = record(entry.input)?.source;
+      const name =
+        (output === null ? null : text(output.name)) ??
+        (typeof source === 'object' && source !== null ? text((source as Record<string, unknown>).name) : null);
+      return name === null
+        ? null
+        : { form: 'row', kind: 'checked', title: fill(words.checked, { name: oneLine(name) }) };
+    }
+    default: {
+      if (!done) return null;
+      const name = (run.id === null ? null : names.get(run.id)) ?? namedRun(record(entry.input), run.kind);
+      if (name === null || name === '') return null;
+      const title = run.kind === 'pause' ? words.paused : run.kind === 'stop' ? words.stopped : words.resumed;
+      return {
+        form: 'row',
+        kind: 'control',
+        verb: run.kind,
+        title: fill(title, { name: oneLine(name) }),
+        runId: run.id,
+      };
+    }
+  }
+}
+
+export interface LaunchDetails {
+  source: 'name' | 'script' | 'script_path';
+  /** `name`: the saved workflow's name; `script_path`: the path as the main agent wrote it. */
+  value: string | null;
+  /** The script's args as JSON text; null with none. */
+  args: string | null;
+  /** The agent limit the call asked for; null for the default. */
+  budget: number | null;
+}
+
+const LAUNCH_SOURCES: ReadonlySet<string> = new Set(['name', 'script', 'script_path']);
+
+/** What a launch call asked for, from its input: the source, its args and limit. Null for an input that does not fit. */
+export function launchDetails(entry: ToolEntry): LaunchDetails | null {
+  const input = record(entry.input);
+  const source = input === null ? null : input.source;
+  if (typeof source !== 'object' || source === null || Array.isArray(source)) return null;
+  const fields = source as Record<string, unknown>;
+  const type = fields.type;
+  if (typeof type !== 'string' || !LAUNCH_SOURCES.has(type)) return null;
+  const kind = type as LaunchDetails['source'];
+  const value = kind === 'script' ? null : text(fields[kind]);
+  const args = input!.args;
+  const budget = input!.agent_budget;
+  return {
+    source: kind,
+    value,
+    args: args === undefined || args === null ? null : JSON.stringify(args, null, 2),
+    budget: typeof budget === 'number' && Number.isInteger(budget) ? budget : null,
+  };
+}
+
+/** The entry a run's block is drawn at, and what that entry is. */
+export interface RunPlace {
+  at: number;
+  kind: 'launch' | 'entry' | 'bare';
+}
+
+const NO_NAMES: ReadonlyMap<string, string> = new Map();
+
+/**
+ * Where each run's block is drawn, by run id: its launch call when the transcript holds it; else its `workflow` entry
+ * (a cut, a fork, a client resume); else the first spawn line that names it (`bare`: no run entry at all).
+ */
+export function runPlaces(entries: readonly TranscriptEntry[]): ReadonlyMap<string, RunPlace> {
+  const places = new Map<string, RunPlace>();
+  entries.forEach((entry, at) => {
+    if (entry.kind !== 'tool') return;
+    const form = workflowFormOf(entry, NO_NAMES);
+    if (form?.form === 'block' && !places.has(form.runId)) places.set(form.runId, { at, kind: 'launch' });
+  });
+  entries.forEach((entry, at) => {
+    if (entry.kind === 'workflow' && !places.has(entry.runId)) places.set(entry.runId, { at, kind: 'entry' });
+  });
+  entries.forEach((entry, at) => {
+    if (entry.kind === 'subagent' && entry.run !== undefined && !places.has(entry.run))
+      places.set(entry.run, { at, kind: 'bare' });
+  });
+  return places;
 }

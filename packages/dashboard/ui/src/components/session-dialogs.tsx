@@ -45,9 +45,9 @@ export function sessionUrl(id: string): string {
 /** Characters of a folder path inside a sentence: the path never breaks its line, the hover title has it all. */
 const NOTICE_PATH_CHARS = 28;
 
-/** The Work delete notice, with the folder as one unbroken path. */
-export function workDeleteNotice(folder: string): ReactNode {
-  const [before, after] = splitAt(CHAT.deleteWorkNotice, '{folder}');
+/** The Work delete notice, with the folder as one unbroken path. `noFolder`: the app made the folder and removes it when empty. */
+export function workDeleteNotice(folder: string, noFolder = false): ReactNode {
+  const [before, after] = splitAt(noFolder ? CHAT.deleteWorkNoticeNone : CHAT.deleteWorkNotice, '{folder}');
   return (
     <>
       {before}

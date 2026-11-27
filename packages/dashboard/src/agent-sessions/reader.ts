@@ -8,8 +8,9 @@
 
 import { type Dirent, lstatSync, readdirSync, readFileSync, type Stats } from 'node:fs';
 import { homedir } from 'node:os';
-import { join, resolve, sep } from 'node:path';
+import { dirname, join, resolve, sep } from 'node:path';
 
+import { base64Bytes } from '../chat/attachment-rule.js';
 import { resolveTitle } from '../chat/titles.js';
 import { type ParsedEvents, parseEvents } from './events.js';
 import {
@@ -20,6 +21,7 @@ import {
   ownLiveness,
   readActiveRegistry,
 } from './liveness.js';
+import { MAX_RUN_STATE_BYTES, mergeRunState, parseRunState, type RunState, runStatePath } from './run-state.js';
 import {
   displayTitle,
   type GrokSummary,
@@ -41,7 +43,7 @@ import {
   timelineChildReads,
   type TimelineInput,
 } from './timeline.js';
-import { type ParsedUpdates, parseUpdates } from './transcript.js';
+import { type ParsedUpdates, parseUpdates, toolPictureBlocks } from './transcript.js';
 import type {
   SessionDetail,
   SessionDetailResponse,
@@ -52,10 +54,20 @@ import type {
   SessionTimelineResponse,
   SessionTokens,
   SubagentRef,
+  TranscriptEntry,
 } from './types.js';
 
 /** Larger `updates.jsonl` files are not parsed (typical is ≤ 3 MB). */
 export const MAX_UPDATES_BYTES = 64 * 1024 * 1024;
+/** Larger pictures are not served; the agent sends at most about 768 KiB of base64 a picture. */
+export const MAX_PICTURE_BYTES = 4 * 1024 * 1024;
+/** The only picture types served: an SVG could carry script. */
+const PICTURE_TYPES: ReadonlySet<string> = new Set(['image/png', 'image/jpeg', 'image/webp', 'image/gif']);
+
+/** One picture of a tool call, read from disk: its bytes as the agent stored them (base64), or why there are none. */
+export type PictureRead =
+  | { ok: true; mediaType: string; data: string }
+  | { ok: false; error: 'no-session' | 'not-found' | 'unsupported' | 'too-large' };
 export const DEFAULT_LIST_LIMIT = 100;
 export const MAX_LIST_LIMIT = 500;
 const TRANSCRIPT_CACHE_ENTRIES = 4;
@@ -164,7 +176,7 @@ export function shQuote(s: string): string {
 
 /**
  * The command that reopens a session: `cd '<cwd>' && mlx agent --resume <id>`,
- * with `GROK_HOME='<home>'` when the home is not the default `~/.mlx-agent`.
+ * with `MLX_AGENT_HOME='<home>'` when the home is not the default `~/.mlx-agent`.
  */
 export function resumeCommand(
   cwd: string,
@@ -172,7 +184,7 @@ export function resumeCommand(
   agentHome: string,
   defaultAgentHome: string = join(homedir(), '.mlx-agent'),
 ): string {
-  const env = resolve(agentHome) === resolve(defaultAgentHome) ? '' : `GROK_HOME=${shQuote(agentHome)} `;
+  const env = resolve(agentHome) === resolve(defaultAgentHome) ? '' : `MLX_AGENT_HOME=${shQuote(agentHome)} `;
   const arg = /^[A-Za-z0-9._-]+$/.test(id) ? id : shQuote(id);
   return `cd ${shQuote(cwd)} && ${env}mlx agent --resume ${arg}`;
 }
@@ -200,11 +212,13 @@ export class AgentSessionsReader {
   private readonly summaries = new Map<string, Cached<GrokSummary | null>>();
   private readonly metas = new Map<string, Cached<SubagentMeta | null>>();
   private readonly stats = new Map<string, Cached<UpdateStats>>();
-  private readonly transcripts = new Map<string, Cached<ParsedUpdates>>();
+  private readonly transcripts = new Map<string, Cached<ParsedUpdates> & { helper: boolean }>();
   /** Child event digests for timelines; text-free, so child files never enter `transcripts`. */
   private readonly digests = new Map<string, Cached<LaneSource>>();
   /** Parsed `events.jsonl` timing digests for main and child timeline lanes. */
   private readonly eventDigests = new Map<string, Cached<ParsedEvents>>();
+  /** Each run's `state.json` by path: a detail merges it into the parse of `updates.jsonl`, which never holds it. */
+  private readonly runStates = new Map<string, Cached<RunState | null>>();
   private readonly ownWrites = new Map<string, number>();
   private readonly maxTimelineChildBytes: number;
   private readonly origin: SessionOrigin;
@@ -298,6 +312,10 @@ export class AgentSessionsReader {
     for (const key of this.transcripts.keys()) if (!liveUpdates.has(key)) this.transcripts.delete(key);
     for (const key of this.digests.keys()) if (!liveUpdates.has(key)) this.digests.delete(key);
     for (const key of this.eventDigests.keys()) if (!liveEvents.has(key)) this.eventDigests.delete(key);
+    const liveDirs = new Set([...sessions.values()].map((r) => r.dir));
+    for (const key of this.runStates.keys()) {
+      if (!liveDirs.has(dirname(dirname(dirname(key))))) this.runStates.delete(key);
+    }
 
     return { sessions, ambiguous, parentOf, childrenOf, spawnedBy, unreadable };
   }
@@ -376,11 +394,15 @@ export class AgentSessionsReader {
           : { id: row.parentId, title: parentRef === undefined ? null : this.title(parentRef) },
       subagents,
     };
-    const updates = this.updates(ref, true);
+    const updates = this.updates(ref, true, index.parentOf.has(id));
     // Forks copy `updates.jsonl`, so a spawn line can name a child that was never ours or is gone.
     const transcript = updates.ok
       ? updates.parsed.transcript.map((e) =>
-          e.kind === 'subagent' ? { ...e, exists: index.sessions.has(e.childId) } : e,
+          e.kind === 'subagent'
+            ? { ...e, exists: index.sessions.has(e.childId) }
+            : e.kind === 'workflow'
+              ? this.withRunState(ref.dir, e)
+              : e,
         )
       : [];
     return {
@@ -394,6 +416,32 @@ export class AgentSessionsReader {
   }
 
   /**
+   * The `n`-th picture (from 0) of a tool call, read from `updates.jsonl` with rewinds applied: `no-session` = unknown
+   * or ambiguous session; `not-found` = no such call, picture or readable file (also past {@link MAX_UPDATES_BYTES});
+   * `unsupported` = not png, jpeg, webp or gif; `too-large` = over {@link MAX_PICTURE_BYTES}. Reads the whole file and
+   * keeps nothing.
+   */
+  picture(id: string, callId: string, n: number): PictureRead {
+    const ref = this.scan().sessions.get(id);
+    if (ref === undefined) return { ok: false, error: 'no-session' };
+    const path = join(ref.dir, 'updates.jsonl');
+    const st = statUpdates(path);
+    if (st === null || st instanceof Error) return { ok: false, error: 'not-found' };
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch {
+      return { ok: false, error: 'not-found' };
+    }
+    const block = toolPictureBlocks(text, callId)?.[n];
+    if (block === undefined) return { ok: false, error: 'not-found' };
+    const mediaType = block.mediaType.toLowerCase();
+    if (!PICTURE_TYPES.has(mediaType)) return { ok: false, error: 'unsupported' };
+    if (base64Bytes(block.data) > MAX_PICTURE_BYTES) return { ok: false, error: 'too-large' };
+    return { ok: true, mediaType, data: block.data };
+  }
+
+  /**
    * One turn of a session as lanes: `null` = unknown or ambiguous session; `'no-turn'` = the
    * transcript was read and has no such turn. Reads at most `MAX_TIMELINE_LANES` child event files.
    */
@@ -403,7 +451,7 @@ export class AgentSessionsReader {
     if (ref === undefined) return null;
     const now = this.now();
     const live = this.livenessIn(index, id, readActiveRegistry(this.agentHome, this.alive), now, false).live;
-    const updates = this.updates(ref, true);
+    const updates = this.updates(ref, true, index.parentOf.has(id));
     if (!updates.ok) {
       return {
         turn,
@@ -464,6 +512,15 @@ export class AgentSessionsReader {
     return buildTimeline(input, events);
   }
 
+  /** A run's entry merged with its `state.json`, read again whenever the file's stamp moved; the entry is not changed. */
+  private withRunState(dir: string, entry: Extract<TranscriptEntry, { kind: 'workflow' }>): TranscriptEntry {
+    const path = runStatePath(dir, entry.runId);
+    const st = path === null ? null : regularFile(path);
+    if (path === null || st === null || st.size > MAX_RUN_STATE_BYTES) return entry;
+    const state = this.cachedRead(this.runStates, path, st, parseRunState);
+    return state === null || state.runId !== entry.runId ? entry : mergeRunState(entry, state, Math.floor(st.mtimeMs));
+  }
+
   /** A child's event digest for a timeline lane, cached by stamp; a file over the size cap is not read. */
   private childEvents(ref: SessionRef): ChildEvents {
     const path = join(ref.dir, 'updates.jsonl');
@@ -489,7 +546,7 @@ export class AgentSessionsReader {
     } catch {
       return { ok: false, noSteps: 'unreadable', fileBytes: null };
     }
-    const source = digestUpdates(parseUpdates(text));
+    const source = digestUpdates(parseUpdates(text, { helper: true }));
     this.digests.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: source });
     while (this.digests.size > DIGEST_CACHE_ENTRIES) this.digests.delete(this.digests.keys().next().value!);
     return { ok: true, source: withEvents(source, this.readEvents(ref.dir, this.maxTimelineChildBytes)) };
@@ -587,6 +644,7 @@ export class AgentSessionsReader {
       this.transcripts,
       this.digests,
       this.eventDigests,
+      this.runStates,
       this.ownWrites,
     ] as Map<string, unknown>[]) {
       for (const key of cache.keys()) if (key.startsWith(prefix)) cache.delete(key);
@@ -648,14 +706,17 @@ export class AgentSessionsReader {
     return result.ok ? statsOf(result.parsed) : { tokens: null, openTurn: null, firstPrompt: null };
   }
 
-  /** Parse `updates.jsonl`, refreshing the stats cache; `keep` also retains the transcript. */
-  private updates(ref: SessionRef, keep: boolean): UpdatesResult {
+  /**
+   * Parse `updates.jsonl`, refreshing the stats cache; `keep` also retains the transcript. `helper`: the session has a
+   * parent link, so its bare user chunks (its parent's messages) stay messages.
+   */
+  private updates(ref: SessionRef, keep: boolean, helper = false): UpdatesResult {
     const path = join(ref.dir, 'updates.jsonl');
     const st = statUpdates(path);
     if (st === null) return { ok: true, parsed: EMPTY_PARSED };
     if (st instanceof Error) return { ok: false, error: st.message };
     const hit = this.transcripts.get(path);
-    if (fresh(hit, st)) {
+    if (fresh(hit, st) && hit!.helper === helper) {
       this.transcripts.delete(path);
       this.transcripts.set(path, hit!);
       if (!fresh(this.stats.get(path), st)) {
@@ -669,10 +730,10 @@ export class AgentSessionsReader {
     } catch (err) {
       return { ok: false, error: `cannot read updates.jsonl: ${(err as Error).message}` };
     }
-    const parsed = parseUpdates(text);
+    const parsed = parseUpdates(text, helper ? { helper, sessionId: ref.id } : {});
     this.stats.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: statsOf(parsed) });
     if (keep) {
-      this.transcripts.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: parsed });
+      this.transcripts.set(path, { mtimeMs: st.mtimeMs, size: st.size, value: parsed, helper });
       while (this.transcripts.size > TRANSCRIPT_CACHE_ENTRIES) {
         this.transcripts.delete(this.transcripts.keys().next().value!);
       }
@@ -728,7 +789,7 @@ function statUpdates(path: string): Stats | Error | null {
 }
 
 function statsOf(parsed: ParsedUpdates): UpdateStats {
-  const prompt = parsed.transcript.find((e) => e.kind === 'user' && e.interjection !== true);
+  const prompt = parsed.transcript.find((e) => e.kind === 'user' && e.interjection !== true && e.note !== true);
   const firstPrompt = prompt?.kind === 'user' ? prompt.text.slice(0, FIRST_PROMPT_CHARS) : null;
   if (parsed.turnsWithUsage === 0) return { tokens: null, openTurn: parsed.openTurn, firstPrompt };
   const tokens: SessionTokens = { input: 0, output: 0, cached: 0 };

@@ -66,34 +66,68 @@
   min-width: 0;
 }
 
+/* The key takes the color of the lane's band: both waits are one band, a non-streamed turn is in "Other". */
 .key {
   display: inline-block;
   flex: none;
   width: 6px;
   height: 6px;
+  box-sizing: border-box;
   margin-inline-end: var(--space-1);
   border-radius: var(--radius-pill);
   background: var(--phase-queue);
 }
 
-.key[data-phase='slot'] {
-  background: var(--phase-slot);
-}
-
-.key[data-phase='prepare'] {
+.key[data-phase='prepare'],
+.key[data-phase='running'],
+.key[data-state='working'],
+.key[data-state='loading'] {
   background: var(--phase-prepare);
 }
 
-.key[data-phase='prefill'] {
+.key[data-phase='prefill'],
+.key[data-state='prefill'] {
   background: var(--phase-prefill);
 }
 
-.key[data-phase='decode'] {
+.key[data-phase='decode'],
+.key[data-state='decode'] {
   background: var(--phase-decode);
 }
 
-.key[data-phase='running'] {
-  background: var(--phase-wait);
+.key[data-state='prefillDecode'] {
+  background: linear-gradient(90deg, var(--phase-prefill) 50%, var(--phase-decode) 50%);
+}
+
+.key[data-state='queued'] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--phase-queue);
+}
+
+.key[data-state='idle'],
+.key[data-phase='idle'] {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-secondary);
+}
+
+.key[data-state='unresponsive'] {
+  background: var(--text-secondary);
+}
+
+.engineState {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.laneCount {
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .progress {
@@ -129,6 +163,58 @@
   .progressText[data-short] {
     display: inline;
   }
+}
+
+/* A prefill that has counted nothing yet: the track with a sweep, never a bar at 0. */
+.busyBar {
+  position: relative;
+  overflow: hidden;
+  height: 4px;
+  flex: 1 1 64px;
+  min-width: 48px;
+  border-radius: var(--radius-pill);
+  background: color-mix(in oklab, var(--phase-prefill) 16%, transparent);
+}
+
+.busyBar[data-busy]::after {
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+      90deg,
+      transparent,
+      color-mix(in oklab, var(--phase-prefill) 72%, transparent),
+      transparent
+    )
+    no-repeat;
+  background-size: 40% 100%;
+  content: '';
+  animation: busy-sweep var(--duration-sweep) var(--ease-in-out) infinite;
+}
+
+@keyframes busy-sweep {
+  from {
+    background-position: -70% 0;
+  }
+  to {
+    background-position: 170% 0;
+  }
+}
+
+.speed {
+  flex: none;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+@container progress (max-width: 319px) {
+  .speed {
+    display: none;
+  }
+}
+
+.speedCell {
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .progressMuted {
@@ -182,5 +268,13 @@
 
   .root[data-density='compact'] .context {
     display: none;
+  }
+}
+
+/* A still sweep would read as a partial fill, so reduced motion keeps the bare track. */
+@media (prefers-reduced-motion: reduce) {
+  .busyBar[data-busy]::after {
+    display: none;
+    animation: none;
   }
 }

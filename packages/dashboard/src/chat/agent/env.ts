@@ -1,13 +1,16 @@
 /**
  * Spawn environments of the two agent processes. Chat is built from nothing: no variable is inherited, so no key,
  * token or user config of the Control Panel reaches it. Work is the Control Panel's own environment, like `mlx agent`
- * in a terminal, minus the app's internal variables and every provider key that is not selected.
+ * in a terminal, minus the app's internal variables and every provider key that is not selected; in the app its `PATH`
+ * gets the login shell's entries first, as a terminal has them.
  */
 
+import { GROK_BUILD_ENV_REMOVED, LOOPBACK_CONNECT_ATTEMPTS } from '@mlx-node/agent/paths';
 import { AGENT_HOST_THINKING } from '@mlx-node/server/host/agent-thinking';
 
 import type { ChatPaths } from '../paths.js';
 import { PROVIDER_ORIGINS } from '../web/http.js';
+import { withLoginPath } from './login-path.js';
 
 export interface InferenceAccess {
   /** Loopback origin of the inference sidecar, without a path. */
@@ -32,6 +35,21 @@ export const WORK_ENV_REMOVED = [
   'NAPI_RS_NATIVE_LIBRARY_PATH',
   'NODE_OPTIONS',
 ];
+
+/**
+ * Work with the user's Claude Code setup turned off, set over any inherited value: `~/.claude/settings.json` hooks,
+ * `~/.claude/skills` and `commands`, `~/.claude/CLAUDE.md` (the AGENTS switch, not subagents), `~/.claude/rules`,
+ * `~/.claude.json` MCP servers, and every Claude plugin source plus `.claude/agents` subagents (PLUGINS, v0.3.6). The
+ * app's own `_meta.pluginDirs` guard still loads.
+ */
+export const CLAUDE_CODE_OFF_ENV: Readonly<Record<string, string>> = {
+  GROK_CLAUDE_HOOKS_ENABLED: 'false',
+  GROK_CLAUDE_SKILLS_ENABLED: 'false',
+  GROK_CLAUDE_AGENTS_ENABLED: 'false',
+  GROK_CLAUDE_RULES_ENABLED: 'false',
+  GROK_CLAUDE_MCPS_ENABLED: 'false',
+  GROK_CLAUDE_PLUGINS_ENABLED: 'false',
+};
 
 /** Room for the answer after the thought. */
 export const CHAT_ANSWER_TOKENS = 8192;
@@ -113,6 +131,7 @@ export function chatAgentEnv(input: ChatEnvInput): Record<string, string> {
     GROK_HOME: input.paths.chatAgent,
     ...baseUrls(input.endpoint),
     XAI_API_KEY: input.endpoint.token,
+    GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS: LOOPBACK_CONNECT_ATTEMPTS,
     GROK_DISABLE_AUTOUPDATER: '1',
     GROK_IMAGE_GEN: '0',
     GROK_IMAGE_EDIT: '0',
@@ -126,6 +145,7 @@ export function chatAgentEnv(input: ChatEnvInput): Record<string, string> {
     env[`GROK_${vendor}_MCPS_ENABLED`] = 'false';
   }
   env.GROK_CLAUDE_SKILLS_ENABLED = 'false';
+  env.GROK_CLAUDE_PLUGINS_ENABLED = 'false';
   env.GROK_CURSOR_SKILLS_ENABLED = 'false';
   env.GROK_TURN_SUMMARY = '0';
   env.GROK_SESSION_SEARCH = '0';
@@ -139,10 +159,14 @@ export interface WorkEnvInput {
   /** The Control Panel's own environment. */
   base: NodeJS.ProcessEnv;
   endpoint: InferenceAccess;
-  /** Set only when the runtime's agent home is not the default, so reader and agent agree. */
-  agentHome: string | null;
+  /** `GROK_HOME` of the agent, over any inherited value: the runtime's agent home, so reader and agent agree. */
+  agentHome: string;
   /** The selected providers' key variables (name → key). Every other provider key variable is removed. */
   providerKeys: Readonly<Record<string, string>>;
+  /** The user's login-shell `PATH` (`login-path.ts`): its entries go first, then the inherited ones it lacks. */
+  loginPath?: string | null;
+  /** The user's Claude Code setup loads (on when absent); off sets {@link CLAUDE_CODE_OFF_ENV}. */
+  claudeCode?: boolean;
   platform?: NodeJS.Platform;
 }
 
@@ -183,38 +207,44 @@ export function workOverlay(base: string | undefined): string {
   });
 }
 
-/** What Work inherits from the Control Panel: every variable minus the app's internals and every provider key. */
+/**
+ * What Work inherits from the Control Panel: every variable minus the app's internals, grok-build's own files and every
+ * provider key.
+ */
 export function workInherited(
   base: NodeJS.ProcessEnv,
   platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
   const env: Record<string, string> = {};
   for (const [name, value] of Object.entries(base)) if (value !== undefined) env[name] = value;
+  const removed = [...WORK_ENV_REMOVED, ...GROK_BUILD_ENV_REMOVED, ...ALL_PROVIDER_KEY_ENV];
   if (platform === 'win32') {
-    const blocked = new Set([...WORK_ENV_REMOVED, ...ALL_PROVIDER_KEY_ENV].map((name) => name.toLowerCase()));
+    const blocked = new Set(removed.map((name) => name.toLowerCase()));
     for (const key of Object.keys(env)) {
       if (blocked.has(key.toLowerCase())) delete env[key];
     }
   } else {
-    for (const name of WORK_ENV_REMOVED) delete env[name];
-    for (const name of ALL_PROVIDER_KEY_ENV) delete env[name];
+    for (const name of removed) delete env[name];
   }
   return env;
 }
 
 export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
-  const env = workInherited(input.base, input.platform);
+  const env = workInherited(withLoginPath(input.base, input.loginPath), input.platform);
   Object.assign(env, baseUrls(input.endpoint));
   env.XAI_API_KEY = input.endpoint.token;
+  env.GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS ??= LOOPBACK_CONNECT_ATTEMPTS;
   env.GROK_DISABLE_AUTOUPDATER = '1';
   for (const name of ['GROK_IMAGE_GEN', 'GROK_IMAGE_EDIT', 'GROK_VIDEO_GEN']) env[name] ??= '0';
   env.GROK_RESUME_COMMAND ??= 'mlx agent';
   env.GROK_TURN_SUMMARY = '0';
+  // The Activity rail's Message reaches a running subagent only with it; it also gives the model `send_subagent_message`.
+  env.GROK_ACTIVE_AGENT_MESSAGES = '1';
   compactionEnv(env);
   // Set, so the agent does not fill it from the login shell: the Auto check places a relative `cd` in the folder.
   env.CDPATH = '';
   env.GROK_CONFIG = workOverlay(env.GROK_CONFIG);
-  if (input.agentHome !== null) env.GROK_HOME = input.agentHome;
+  env.GROK_HOME = input.agentHome;
   for (const [name, value] of Object.entries(input.providerKeys)) {
     if (ALL_PROVIDER_KEY_ENV.includes(name)) env[name] = value;
   }
@@ -223,5 +253,6 @@ export function workAgentEnv(input: WorkEnvInput): Record<string, string> {
   env.FIRECRAWL_NO_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_DISABLE_SEARCH_FEEDBACK = '1';
   env.FIRECRAWL_NO_ENDPOINT_FEEDBACK = '1';
+  if (input.claudeCode === false) Object.assign(env, CLAUDE_CODE_OFF_ENV);
   return env;
 }

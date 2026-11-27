@@ -166,7 +166,9 @@ describe('GET /api/sessions', () => {
     expect(chatTimeline.status).toBe(200);
     const workDetail = await json<{ session: { origin: string }; resumeCommand: string | null }>(`/api/sessions/${P}`);
     expect(workDetail.body.session.origin).toBe('work');
-    expect(workDetail.body.resumeCommand).toBe(`cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`);
+    expect(workDetail.body.resumeCommand).toBe(
+      `cd '/Users/dev/proj' && MLX_AGENT_HOME='${home}' mlx agent --resume ${P}`,
+    );
     const rows = await runtime.call({ method: 'GET', path: '/api/chat/conversations?mode=chat' });
     expect(rows.ok && (rows.body as { conversations: { id: string }[] }).conversations.map((c) => c.id)).toEqual([
       chatId,
@@ -216,10 +218,10 @@ describe('GET /api/sessions/:id', () => {
     expect(body.transcript.length).toBeGreaterThan(0);
     expect(body.turns).toHaveLength(2);
     // The temp home is not the default one, so the command names it.
-    expect(body.resumeCommand).toBe(`cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`);
+    expect(body.resumeCommand).toBe(`cd '/Users/dev/proj' && MLX_AGENT_HOME='${home}' mlx agent --resume ${P}`);
   });
 
-  it('names the absolute home when the dashboard got a relative GROK_HOME', async () => {
+  it('names the absolute home when the dashboard got a relative agent home', async () => {
     const rel = relative(process.cwd(), home);
     expect(rel.startsWith('/')).toBe(false);
     const relRuntime = createDashboardRuntime({
@@ -239,7 +241,7 @@ describe('GET /api/sessions/:id', () => {
       expect(relRuntime.agentHome).toBe(home);
       const res = await relRuntime.call({ method: 'GET', path: `/api/sessions/${P}` });
       expect(res.ok ? (res.body as { resumeCommand: string }).resumeCommand : res).toBe(
-        `cd '/Users/dev/proj' && GROK_HOME='${home}' mlx agent --resume ${P}`,
+        `cd '/Users/dev/proj' && MLX_AGENT_HOME='${home}' mlx agent --resume ${P}`,
       );
     } finally {
       await relRuntime.close();
@@ -342,7 +344,10 @@ describe('GET /api/sessions/:id/timeline', () => {
     expect(detail.body.transcript.filter((e) => e.kind === 'wake')).toEqual([
       expect.objectContaining({
         cause: 'workflow',
-        workflow: { name: 'deep-research', status: 'complete' },
+        workflow: expect.objectContaining({
+          name: 'deep-research',
+          snapshot: expect.objectContaining({ status: 'complete' }),
+        }),
         text: HIDDEN_TEXT,
       }),
     ]);
@@ -417,6 +422,83 @@ describe('GET /api/sessions/:id/timeline', () => {
       const res = await createTestClient(client).fetch(`/api/sessions/${P}/timeline?turn=1`);
       expect(res.status).toBe(200);
       expect(((await res.json()) as Timeline).lanes).toHaveLength(3);
+    } finally {
+      client.close();
+      dispose();
+    }
+  });
+});
+
+describe('GET /api/sessions/:id/pictures/:call/:n', () => {
+  const PIC = id(0x30);
+  const T0 = 1_800_000_000_000;
+  const ODD = 'toolu_"odd/../call';
+  const b64 = (text: string) => Buffer.from(text).toString('base64');
+  const image = (data: string, mimeType: string) => ({ type: 'content', content: { type: 'image', data, mimeType } });
+  const read = (at: number, call: string, blocks: unknown[]) => ({
+    at,
+    update: { sessionUpdate: 'tool_call_update', toolCallId: call, status: 'completed', content: blocks },
+  });
+  const picture = (sid: string, call: string, n: string | number) =>
+    json<{ mediaType?: string; data?: string; error?: string }>(
+      `/api/sessions/${encodeURIComponent(sid)}/pictures/${encodeURIComponent(call)}/${n}`,
+    );
+  const write = (agentHome: string, lines: ReturnType<typeof read | typeof userLine>[]) =>
+    writeSession(agentHome, { id: PIC, cwd: '/Users/dev/proj', lines });
+
+  it('serves the n-th image block of the call; 404 for an unknown session, call or index; 400 for a bad index', async () => {
+    write(home, [
+      userLine(T0, 'look', 0),
+      read(T0 + 1, 'call_png', [image(b64('png-1'), 'image/png')]),
+      read(T0 + 2, ODD, [image(b64('page-4'), 'image/jpeg'), image(b64('page-5'), 'image/JPEG')]),
+    ]);
+    expect(await picture(PIC, 'call_png', 0)).toEqual({
+      status: 200,
+      body: { mediaType: 'image/png', data: b64('png-1') },
+    });
+    expect((await picture(PIC, ODD, 1)).body).toEqual({ mediaType: 'image/jpeg', data: b64('page-5') });
+    expect((await picture(PIC, ODD, 2)).status).toBe(404);
+    expect((await picture(PIC, 'call_none', 0)).status).toBe(404);
+    expect((await picture(GONE, 'call_png', 0)).status).toBe(404);
+    for (const bad of ['x', '-1', '1.5', '1234567']) expect((await picture(PIC, 'call_png', bad)).status).toBe(400);
+  });
+
+  it('415 for a picture type other than png, jpeg, webp or gif; 413 past 4 MiB', async () => {
+    write(home, [
+      userLine(T0, 'look', 0),
+      read(T0 + 1, 'call_svg', [image(b64('<svg onload="x()"/>'), 'image/svg+xml')]),
+      read(T0 + 2, 'call_big', [image('A'.repeat((4 * 1024 * 1024 * 4) / 3 + 8), 'image/png')]),
+      read(T0 + 3, 'call_gif', [image(b64('GIF89a'), 'image/gif'), image(b64('RIFF'), 'image/webp')]),
+    ]);
+    expect((await picture(PIC, 'call_svg', 0)).status).toBe(415);
+    expect((await picture(PIC, 'call_big', 0)).status).toBe(413);
+    expect((await picture(PIC, 'call_gif', 0)).status).toBe(200);
+    expect((await picture(PIC, 'call_gif', 1)).body.mediaType).toBe('image/webp');
+  });
+
+  it('404 for a call a rewind removed', async () => {
+    write(home, [
+      userLine(T0, 'look', 0),
+      read(T0 + 1, 'call_png', [image(b64('png-1'), 'image/png')]),
+      { at: T0 + 2, xai: true, update: { sessionUpdate: 'rewind_marker', target_prompt_index: 0 } },
+    ]);
+    expect((await picture(PIC, 'call_png', 0)).status).toBe(404);
+  });
+
+  it('serves a session of the Chat agent home, on the worker, also over the RPC port', async () => {
+    write(join(base, 'chat', 'chat-agent'), [
+      userLine(T0, 'look', 0),
+      read(T0 + 1, 'call_png', [image(b64('chat-png'), 'image/png')]),
+    ]);
+    expect((await picture(PIC, 'call_png', 0)).body).toEqual({ mediaType: 'image/png', data: b64('chat-png') });
+    expect(routeThreadFor('GET', `/api/sessions/${PIC}/pictures/call_png/0`)).toBe('worker');
+    const { port1, port2 } = new MessageChannel();
+    const dispose = serveRuntimeOverPort(runtime, bindEventTargetPort(port2));
+    const client = createRpcClient(bindEventTargetPort(port1));
+    try {
+      const res = await createTestClient(client).fetch(`/api/sessions/${PIC}/pictures/call_png/0`);
+      expect(res.status).toBe(200);
+      expect(((await res.json()) as { data: string }).data).toBe(b64('chat-png'));
     } finally {
       client.close();
       dispose();

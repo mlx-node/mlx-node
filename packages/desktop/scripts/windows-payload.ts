@@ -194,7 +194,7 @@ export function readPackagedWindowsApp(appPath: string): { version: string; runt
   const manifestPath = join(appPath, 'resources', 'app', 'package.json');
   if (!existsSync(join(appPath, 'mlx-node.exe')) || !existsSync(manifestPath)) {
     throw new PayloadError(
-      `${appPath} is not a packaged mlx-node Windows app`,
+      `${appPath} is not a packaged Portato Windows app`,
       'run package-windows.ts and pass its appPath output',
     );
   }

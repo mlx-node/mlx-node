@@ -3,6 +3,7 @@
 import type { ChatConfig, ChatMessage, ToolDefinition } from '@mlx-node/core';
 
 import { decodeBase64Strict, isAllowedImageMediaType, MAX_REQUEST_IMAGES } from '../base64.js';
+import { thinkingFor } from '../host/thinking-levels.js';
 import { MAX_STOP_SEQUENCE_CHARACTERS, MAX_STOP_SEQUENCES } from '../stop-sequence-buffer.js';
 import type {
   AnthropicContentBlock,
@@ -144,8 +145,14 @@ function mapTool(tool: AnthropicToolDefinition): ToolDefinition {
   };
 }
 
+/**
+ * `levelsFamily`: on a server with `thinkingLevels`, the family of the request's model. A level it lists maps
+ * `extra_body.reasoning_effort` through its row (`host/thinking-levels.ts`); any other value maps as without it.
+ * `output_config.effort` is never read.
+ */
 export function mapAnthropicRequest(
   req: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+  levelsFamily?: string,
 ): MappedAnthropicRequest {
   // Enforce the 64-image request cap before decoding any base64 payload, naming
   // the oldest image block path (Splash `dialects/anthropic.py` parity).
@@ -461,7 +468,13 @@ export function mapAnthropicRequest(
     if (typeof effort !== 'string' || !VALID_REASONING_EFFORTS.has(effort)) {
       throw new Error('Invalid extra_body.reasoning_effort');
     }
-    config.reasoningEffort = effort as ChatConfig['reasoningEffort'];
+    const level = levelsFamily === undefined ? null : thinkingFor(levelsFamily, effort);
+    if (level === null) {
+      config.reasoningEffort = effort as ChatConfig['reasoningEffort'];
+    } else {
+      if (level.reasoningEffort !== undefined) config.reasoningEffort = level.reasoningEffort;
+      if (level.thinkingTokenBudget !== undefined) config.thinkingTokenBudget = level.thinkingTokenBudget;
+    }
   }
   applyAnthropicThinking(config, req.thinking);
   const thinkingBudget = req.extra_body?.thinking_budget;

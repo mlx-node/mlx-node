@@ -1,12 +1,32 @@
 import { motion } from 'motion/react';
-import { useLayoutEffect, useRef, useState, type CSSProperties, type KeyboardEvent, type ReactElement } from 'react';
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent,
+  type ReactElement,
+  type ReactNode,
+} from 'react';
 
 import { cn } from '../../../lib/cn';
-import { formatTps } from '../../../lib/format';
+import { formatTps, NO_VALUE } from '../../../lib/format';
 import { LIVE_GAP_MS } from '../../../lib/live-history';
+import { Tooltip } from '../../arc/tooltip/tooltip';
+import {
+  formatLanes,
+  stackAxisMax,
+  stackLaneMs,
+  stackPeak,
+  stackPointAt,
+  stackSteps,
+  type StackBand,
+  type StackPoint,
+} from '../activity-strip/phase-stack';
 import { ChartFrame, plotWidthOf, type ScrubSpec } from '../chart/chart-frame';
-import { ChartTooltip } from '../chart/chart-tooltip';
-import { areaPath, linePath, type XY } from '../chart/paths';
+import { ChartLegend } from '../chart/chart-legend';
+import { ChartTooltip, type TooltipRow } from '../chart/chart-tooltip';
+import { areaPath, linePath, stepStackPaths, type XY } from '../chart/paths';
 import { linearScale, niceTicks } from '../chart/scale';
 import { useChartSize } from '../chart/use-chart-size';
 import { withUnit } from '../chart/value-format';
@@ -20,10 +40,37 @@ export interface LiveStreamPoint {
   value: number | null;
 }
 
-export interface LiveStreamProps {
-  /** "Output rate" */
+/** One fixed value above the plot. It keeps its slot whatever the value is. */
+export interface LiveStreamReadout {
+  key: string;
   label: string;
-  /** "tok/s" */
+  /** Formatted; null -> "—". */
+  value: string | null;
+  unit?: string;
+  /** The definition, in a tooltip on the label. */
+  tip?: string;
+  /** No lane is in this phase now, so the value is the last window and not this instant: drawn in the secondary color. */
+  quiet?: boolean;
+}
+
+/** Lanes by phase under the line: stacked steps on the same x. */
+export interface LiveStreamStack {
+  /** Name of the stack, before its legend. */
+  label: string;
+  /** Unit of the band values in the hidden table. */
+  unit: string;
+  /** Plot height of the stack, default 40. */
+  height?: number;
+  /** Bottom to top. */
+  bands: readonly StackBand[];
+  /** Ascending t0, on the same clock as `points`. */
+  points: readonly StackPoint[];
+}
+
+export interface LiveStreamProps {
+  /** Name of the line: the figure, the scrub, the tooltip and the table column. */
+  label: string;
+  /** Unit of the line. */
   unit: string;
   /** Ascending t, ≤ 600. */
   points: readonly LiveStreamPoint[];
@@ -33,13 +80,16 @@ export interface LiveStreamProps {
   windowMs?: number;
   /** False = the source stopped (no running process). */
   live: boolean;
-  /** Text under the value when live is false or the value is 0: "Idle", "Not running". */
-  status?: string;
+  /** Fixed values above the plot, left to right. */
+  readouts?: readonly LiveStreamReadout[];
+  /** Before the readouts: the engine state badge. */
+  state?: ReactNode;
+  stack?: LiveStreamStack;
   /** Default formatTps. */
   formatValue?: (value: number) => string;
-  /** Y tick text; default formatValue. */
+  /** Y tick text of the line; default formatValue. */
   formatTick?: (value: number) => string;
-  /** Plot height, default 160. */
+  /** Height of both plots and the gap between them, default 160. */
   height?: number;
   /** Default var(--series-1). */
   color?: string;
@@ -51,6 +101,10 @@ export interface LiveStreamProps {
 const TABLE_STEP_MS = 10_000;
 const TABLE_ROWS = 60;
 const MAX_SLIDE_MS = 1000;
+const STACK_HEIGHT = 40;
+/** Room between the line plot and the stack, so the line's 0 tick and the stack's top tick do not touch. */
+const STACK_GAP_PX = 14;
+const MIN_LINE_HEIGHT = 24;
 
 function agoText(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
@@ -78,18 +132,46 @@ function relativeTicks(windowMs: number): Array<{ ago: number; text: string }> {
   return ticks;
 }
 
-/** Last value in each 10 s step, newest first, at most 60 rows. */
-function tableRows(points: readonly LiveStreamPoint[], now: number): Array<{ ago: number; value: number | null }> {
-  const rows: Array<{ ago: number; value: number | null }> = [];
-  let bucket = -1;
-  for (let i = points.length - 1; i >= 0 && rows.length < TABLE_ROWS; i -= 1) {
-    const point = points[i];
-    const step = Math.floor(Math.max(0, now - point.t) / TABLE_STEP_MS);
-    if (step === bucket) continue;
-    bucket = step;
-    rows.push({ ago: now - point.t, value: point.value });
+interface TableRow {
+  ago: number;
+  /** undefined: no line sample in the step. */
+  value: number | null | undefined;
+  /** Mean lanes per band over the covered part of the step; null when no interval covers it. */
+  bands: Record<string, number> | null;
+}
+
+/** One row per 10 s step that holds a sample, newest first, at most 60: the last line value and the mean lanes. */
+function tableRows(
+  points: readonly LiveStreamPoint[],
+  stack: readonly StackPoint[],
+  keys: readonly string[],
+  now: number,
+): TableRow[] {
+  const newest = new Map<number, { t: number; value: number | null | undefined }>();
+  const stepOf = (t: number): number => Math.floor(Math.max(0, now - t) / TABLE_STEP_MS);
+  for (let i = points.length - 1; i >= 0; i -= 1) {
+    const step = stepOf(points[i].t);
+    if (step < TABLE_ROWS && !newest.has(step)) newest.set(step, { t: points[i].t, value: points[i].value });
   }
-  return rows;
+  for (const point of stack) {
+    const step = stepOf(point.t1);
+    if (step >= TABLE_ROWS) continue;
+    const seen = newest.get(step);
+    if (seen === undefined) newest.set(step, { t: point.t1, value: undefined });
+    else if (point.t1 > seen.t) newest.set(step, { ...seen, t: point.t1 });
+  }
+  return [...newest.entries()]
+    .sort((a, b) => a[0] - b[0])
+    .map(([step, row]) => {
+      const to = now - step * TABLE_STEP_MS;
+      const sums = stackLaneMs(stack, keys, to - TABLE_STEP_MS, to);
+      let bands: Record<string, number> | null = null;
+      if (sums.coveredMs > 0) {
+        bands = {};
+        for (const key of keys) bands[key] = sums.laneMs[key] / sums.coveredMs;
+      }
+      return { ago: now - row.t, value: row.value, bands };
+    });
 }
 
 /** Points in [now − window, now] as plot coordinates, null between two samples further apart than `gapMs`. */
@@ -134,7 +216,43 @@ function PillLabel({ text }: { text: string }): ReactElement {
   );
 }
 
-/** One live measure: a big current value and a line that slides left as time passes. */
+function Readout({ readout }: { readout: LiveStreamReadout }): ReactElement {
+  const quiet = readout.quiet === true;
+  return (
+    <div role="group" aria-label={readout.label} className={styles.readout} data-quiet={quiet ? '' : undefined}>
+      <span className={styles.readoutLabel}>
+        {readout.tip !== undefined ? (
+          <Tooltip content={readout.tip}>
+            <span className={styles.tip} tabIndex={0}>
+              {readout.label}
+            </span>
+          </Tooltip>
+        ) : (
+          readout.label
+        )}
+      </span>
+      <span className={cn(styles.readoutLine, quiet && styles.quiet)} data-stat-value="">
+        <NumberValue text={readout.value} countUp={false} className={styles.readoutValue} />
+        {readout.value !== null && readout.unit !== undefined ? (
+          <>
+            {' '}
+            <span className={styles.unit}>{readout.unit}</span>
+          </>
+        ) : null}
+      </span>
+    </div>
+  );
+}
+
+interface Frozen {
+  now: number;
+  points: readonly LiveStreamPoint[];
+  stack: readonly StackPoint[];
+  readouts: readonly LiveStreamReadout[];
+  state: ReactNode;
+}
+
+/** The live panel: fixed readouts, a line that slides left as time passes and, under it, lanes by phase. */
 export function LiveStream(props: LiveStreamProps): ReactElement {
   const figureRef = useRef<HTMLElement | null>(null);
   const plotRef = useRef<HTMLElement | null>(null);
@@ -142,35 +260,69 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
   const rich = useRichMotion();
   const windowMs = props.windowMs ?? 600_000;
   const gapMs = props.gapMs ?? LIVE_GAP_MS;
-  const height = props.height ?? 160;
   const format = props.formatValue ?? ((value: number) => formatTps(value));
-  const [paused, setPaused] = useState<{ now: number; points: readonly LiveStreamPoint[] } | null>(null);
+  const [paused, setPaused] = useState<Frozen | null>(null);
   const now = paused?.now ?? props.nowMs;
   const points = paused?.points ?? props.points;
+  const stack = props.stack;
+  const stackPoints = paused?.stack ?? stack?.points ?? [];
+  const readouts = paused?.readouts ?? props.readouts ?? [];
+  const stateNode = paused === null ? props.state : paused.state;
   const fresh = paused === null ? 0 : props.points.filter((point) => point.t > paused.now).length;
   const state = !props.live ? 'stopped' : paused !== null ? 'paused' : 'live';
+  const lineColor = props.color ?? 'var(--series-1)';
 
-  let newest: LiveStreamPoint | null = null;
-  for (let i = points.length - 1; i >= 0 && newest === null; i -= 1) if (points[i].value !== null) newest = points[i];
-  const valueText = props.live && newest !== null && newest.value !== null ? format(newest.value) : null;
-  const showStatus = props.status !== undefined && (!props.live || newest?.value === 0);
+  const height = props.height ?? 160;
+  const stackHeight = stack === undefined ? 0 : (stack.height ?? STACK_HEIGHT);
+  const lineHeight = stack === undefined ? height : Math.max(MIN_LINE_HEIGHT, height - stackHeight - STACK_GAP_PX);
+  const plotHeight = stack === undefined ? height : lineHeight + STACK_GAP_PX + stackHeight;
 
   const plotWidth = plotWidthOf(width, 6);
   const inWindow = points.filter((point) => point.t >= now - windowMs && point.t <= now);
   let peak = 0;
   for (const point of inWindow) if (point.value !== null) peak = Math.max(peak, point.value);
   const axis = niceTicks(0, peak > 0 ? peak : 1);
-  const y = linearScale([axis.min, axis.max], [height, 0]);
+  const y = linearScale([axis.min, axis.max], [lineHeight, 0]);
   const x = (t: number): number => plotWidth * (1 - (now - t) / windowMs);
   const drawn = plotPoints(points, now, windowMs, gapMs, x, y);
   const path = linePath(drawn, 'monotone');
-  const area = areaPath(drawn, height, 'monotone');
+  const area = areaPath(drawn, lineHeight, 'monotone');
   let end: XY | null = null;
   for (let i = drawn.length - 1; i >= 0 && end === null; i -= 1) end = drawn[i] ?? null;
-  const enough = inWindow.length >= 2;
+
+  const bands = stack?.bands ?? [];
+  const keys = bands.map((band) => band.key);
+  const stackTop = stackAxisMax(stackPeak(stackPoints, keys, now - windowMs, now));
+  const stackY = linearScale([0, stackTop], [plotHeight, plotHeight - stackHeight]);
+  const stackPaths =
+    stack === undefined ? [] : stepStackPaths(stackSteps(stackPoints, keys, now - windowMs - gapMs, now, x), stackY);
+  const stackInWindow = stackPoints.some((point) => point.t1 > now - windowMs && point.t0 < now);
+  const enough = inWindow.length >= 2 || (stack !== undefined && stackInWindow);
+
+  // One axis for both plots: the stack's two ticks first so their indices stay put while the line's ticks change.
+  const lineTick = props.formatTick ?? ((value: number) => format(value));
+  const ticks: Array<{ px: number; text: string }> = [
+    ...(stack === undefined
+      ? []
+      : [
+          { px: stackY(stackTop), text: String(stackTop) },
+          { px: stackY(0), text: '0' },
+        ]),
+    ...axis.ticks.map((tick) => ({ px: y(tick), text: lineTick(tick) })),
+  ];
 
   const togglePause = (): void => {
-    setPaused((current) => (current === null ? { now: props.nowMs, points: props.points } : null));
+    setPaused((current) =>
+      current === null
+        ? {
+            now: props.nowMs,
+            points: props.points,
+            stack: props.stack?.points ?? [],
+            readouts: props.readouts ?? [],
+            state: props.state,
+          }
+        : null,
+    );
   };
 
   const slideRef = useRef<HTMLDivElement | null>(null);
@@ -201,15 +353,26 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
     }
   });
 
-  const scrubPoints = inWindow.filter((point) => point.value !== null);
+  const lineAt = new Map<number, number | null>();
+  for (const point of inWindow) lineAt.set(point.t, point.value);
+  const times = new Set<number>(lineAt.keys());
+  if (stack !== undefined)
+    for (const point of stackPoints) if (point.t1 >= now - windowMs && point.t1 <= now) times.add(point.t1);
+  const positions = [...times].sort((a, b) => a - b);
+  const lineText = (t: number): string | null => {
+    const value = lineAt.get(t);
+    return value === undefined || value === null ? null : withUnit(format(value), props.unit);
+  };
+  const bandsAt = (t: number): StackPoint | null => (stack === undefined ? null : stackPointAt(stackPoints, t));
+
   const scrub: ScrubSpec = {
-    count: scrubPoints.length,
-    anchor: (index) => ({ x: x(scrubPoints[index]?.t ?? now), y: null }),
+    count: positions.length,
+    anchor: (index) => ({ x: x(positions[index] ?? now), y: null }),
     nearest: (px) => {
       let best: number | null = null;
       let bestDistance = Infinity;
-      scrubPoints.forEach((point, index) => {
-        const distance = Math.abs(x(point.t) - px);
+      positions.forEach((t, index) => {
+        const distance = Math.abs(x(t) - px);
         if (distance < bestDistance) {
           bestDistance = distance;
           best = index;
@@ -218,22 +381,35 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
       return best;
     },
     reading: (index) => {
-      const point = scrubPoints[index];
-      if (point === undefined || point.value === null) return 'no data';
-      return `${withUnit(format(point.value), props.unit)}, ${agoText(now - point.t)}`;
+      const t = positions[index];
+      if (t === undefined) return 'no data';
+      const parts = [lineText(t) ?? 'no data'];
+      const at = bandsAt(t);
+      if (at !== null)
+        parts.push(bands.map((band) => `${band.label} ${formatLanes(at.values[band.key] ?? 0)}`).join(', '));
+      parts.push(agoText(now - t));
+      return parts.join('; ');
     },
     tooltip: (index) => {
-      const point = scrubPoints[index];
-      if (point === undefined || point.value === null) return null;
-      return (
-        <ChartTooltip
-          title={clockAgo(now - point.t)}
-          rows={[{ key: 'value', label: props.label, value: withUnit(format(point.value), props.unit) }]}
-        />
-      );
+      const t = positions[index];
+      if (t === undefined) return null;
+      const at = bandsAt(t);
+      const text = lineText(t);
+      if (text === null && at === null) return null;
+      const rows: TooltipRow[] = [
+        { key: 'line', label: props.label, value: text ?? NO_VALUE, kind: 'line', color: lineColor },
+        ...bands.map((band) => ({
+          key: band.key,
+          label: band.label,
+          value: at === null ? NO_VALUE : formatLanes(at.values[band.key] ?? 0),
+          kind: 'square' as const,
+          color: band.color,
+        })),
+      ];
+      return <ChartTooltip title={clockAgo(now - t)} rows={rows} />;
     },
     crosshair: true,
-    rest: scrubPoints.length > 0 ? scrubPoints.length - 1 : null,
+    rest: positions.length > 0 ? positions.length - 1 : null,
     emptyReading: 'Collecting live samples',
     onKey: (event: KeyboardEvent<HTMLDivElement>) => {
       if (event.key !== ' ') return false;
@@ -242,15 +418,20 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
     },
   };
 
-  const rows = tableRows(points, now);
+  const rows = tableRows(points, stack === undefined ? [] : stackPoints, keys, now);
+  const head = [
+    'Time',
+    `${props.label} (${props.unit})`,
+    ...(stack === undefined ? [] : bands.map((band) => `${band.label} (${stack.unit})`)),
+  ];
   const xLabels = relativeTicks(windowMs).map((tick) => ({ key: tick.text, x: x(now - tick.ago), text: tick.text }));
   const empty = !enough
-    ? !props.live && points.length === 0
-      ? (props.status ?? 'Not running')
+    ? !props.live && points.length === 0 && stackPoints.length === 0
+      ? 'Not running'
       : 'Collecting live samples…'
     : null;
   const pillLabel = paused === null ? 'Live' : fresh > 0 ? `Paused, ${String(fresh)} new` : 'Paused';
-  const colorStyle = { '--c': props.color ?? 'var(--series-1)' } as CSSProperties;
+  const colorStyle = { '--c': lineColor } as CSSProperties;
 
   return (
     <figure
@@ -264,17 +445,11 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
       style={colorStyle}
     >
       <div className={styles.head}>
-        <div className={styles.reading}>
-          <span className={styles.valueLine} data-stat-value="">
-            <NumberValue text={valueText} className={styles.value} />
-            {valueText !== null ? (
-              <>
-                {' '}
-                <span className={styles.unit}>{props.unit}</span>
-              </>
-            ) : null}
-          </span>
-          {showStatus ? <span className={styles.status}>{props.status}</span> : null}
+        <div className={styles.lead}>
+          {stateNode !== undefined && stateNode !== null ? <div className={styles.state}>{stateNode}</div> : null}
+          {readouts.map((readout) => (
+            <Readout key={readout.key} readout={readout} />
+          ))}
         </div>
         {props.live ? (
           <button type="button" className={styles.pill} aria-pressed={paused !== null} onClick={togglePause}>
@@ -289,16 +464,26 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
         bare
         label={props.label}
         unit={props.unit}
-        height={height}
+        height={plotHeight}
         plotWidth={plotWidth}
         rightPad={6}
-        yAxis={{ ticks: axis.ticks, y, format: props.formatTick ?? ((value) => format(value)) }}
+        yAxis={{
+          ticks: ticks.map((_, index) => index),
+          y: (index) => ticks[index]?.px ?? 0,
+          format: (index) => ticks[index]?.text ?? '',
+        }}
         xLabels={xLabels}
         table={{
-          head: ['Time', `${props.label} (${props.unit})`],
+          head,
           rows: rows.map((row) => ({
             key: String(row.ago),
-            cells: [agoText(row.ago), row.value === null ? 'no data' : format(row.value)],
+            cells: [
+              agoText(row.ago),
+              row.value === null || row.value === undefined ? 'no data' : format(row.value),
+              ...(stack === undefined
+                ? []
+                : keys.map((key) => (row.bands === null ? 'no data' : formatLanes(row.bands[key] ?? 0)))),
+            ],
           })),
         }}
         scrub={empty === null ? scrub : null}
@@ -307,25 +492,49 @@ export function LiveStream(props: LiveStreamProps): ReactElement {
           <>
             <div className={styles.clip}>
               <div ref={slideRef} className={styles.slide}>
-                <svg className={styles.marks} width={plotWidth} height={height} aria-hidden="true">
+                <svg className={styles.marks} width={plotWidth} height={plotHeight} aria-hidden="true">
                   <g className={styles.trace} data-entrance-last={end === null ? '' : undefined}>
                     <path className={styles.area} d={area} />
                     <path className={styles.line} d={path.d} />
                     {path.lone.map((point) => (
                       <circle key={String(point.x)} className={styles.lone} cx={point.x} cy={point.y} r={2} />
                     ))}
+                    {stack !== undefined ? (
+                      <g data-stack="">
+                        {bands.map((band, index) =>
+                          stackPaths[index] === undefined || stackPaths[index] === '' ? null : (
+                            <path
+                              key={band.key}
+                              className={styles.band}
+                              d={stackPaths[index]}
+                              style={{ '--band': band.color } as CSSProperties}
+                              data-band={band.key}
+                            />
+                          ),
+                        )}
+                      </g>
+                    ) : null}
                   </g>
                 </svg>
               </div>
             </div>
             {end !== null ? (
-              <svg className={styles.endLayer} width={plotWidth + 6} height={height} aria-hidden="true">
+              <svg className={styles.endLayer} width={plotWidth + 6} height={plotHeight} aria-hidden="true">
                 <circle ref={dotRef} className={styles.dot} cx={end.x} cy={end.y} r={4} data-entrance-last="" />
               </svg>
             ) : null}
           </>
         )}
       />
+      {stack !== undefined ? (
+        <div className={styles.legendRow}>
+          <span className={styles.legendTitle}>{stack.label}</span>
+          <ChartLegend
+            label={stack.label}
+            items={bands.map((band) => ({ key: band.key, label: band.label, color: band.color, kind: 'square' }))}
+          />
+        </div>
+      ) : null}
     </figure>
   );
 }

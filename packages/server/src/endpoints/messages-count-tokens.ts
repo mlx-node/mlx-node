@@ -23,6 +23,7 @@ function endJson(res: ServerResponse, body: AnthropicCountTokensResponse): void 
   res.end(stringifyStrictJson(body));
 }
 
+/** `levelsFamily`: as `ServerThinking.levelsFamily` of `/v1/messages`, so the count renders the prompt it renders. */
 export async function handleCountMessageTokens(
   res: ServerResponse,
   body: AnthropicCountTokensRequest,
@@ -31,6 +32,7 @@ export async function handleCountMessageTokens(
   resolveModel?: (name: string) => Promise<void>,
   modelWorkCoordinator?: ModelWorkCoordinator,
   bindLoadedModel?: (name: string) => boolean,
+  levelsFamily?: (model: string) => string | undefined,
 ): Promise<void> {
   if (body == null || typeof body !== 'object') {
     sendAnthropicBadRequest(res, 'Request body must be a JSON object');
@@ -54,7 +56,7 @@ export async function handleCountMessageTokens(
 
   let mapped: ReturnType<typeof mapAnthropicRequest>;
   try {
-    mapped = mapAnthropicRequest(body);
+    mapped = mapAnthropicRequest(body, levelsFamily?.(body.model));
   } catch (err) {
     sendAnthropicBadRequest(res, err instanceof Error ? err.message : 'Invalid request');
     return;

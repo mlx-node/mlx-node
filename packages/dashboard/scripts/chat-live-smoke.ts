@@ -1,7 +1,8 @@
 /**
  * The live Chat smoke: a real `mlx-agent` and a real model, on a throwaway home, one trial per row, one PASS / FAIL /
  * INFO / SKIP line per row. Opt-in, never part of a test run. This file holds the rows that need no search provider
- * key. The packaged-build rows run only with `--app` (the executable inside a packaged `.app`) and `--finder-path` (the
+ * key; the address-ledger rows run on a loopback provider with a throwaway key (`__test__/helpers/loopback-web.ts`,
+ * proven by `chat-live-smoke-ledger.test.ts`). The packaged-build rows run only with `--app` (the executable inside a packaged `.app`) and `--finder-path` (the
  * `PATH` of an app started from Finder, `/usr/bin:/bin:/usr/sbin:/sbin` on macOS); without them they print SKIP. U16
  * gives Work that `PATH`, zsh and a `~/.zshenv` that puts a stub `firecrawl` first, and passes when the `PATH` a Work
  * command prints holds the `PATH` the app's check predicted (`workCommandPath`) and that `PATH` finds the stub.
@@ -19,6 +20,7 @@ import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSy
 import { homedir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 
+import { startLoopbackWeb } from '../__test__/helpers/loopback-web.js';
 import { RECENT_WRITE_MS } from '../src/agent-sessions/liveness.js';
 import { AgentSessionsReader } from '../src/agent-sessions/reader.js';
 import type { TranscriptEntry, TurnMetric } from '../src/agent-sessions/types.js';
@@ -140,12 +142,17 @@ interface TurnView {
 }
 
 /** What a Work turn does with each card the agent opens. */
-type CardAnswer = { optionId: string } | { decision: 'approved' | 'rejected'; feedback?: string };
+type CardAnswer =
+  | { optionId: string }
+  | { decision: 'approved' | 'rejected'; feedback?: string }
+  | { reply: 'skip' }
+  | { mcp: 'decline' };
 
 /**
  * The only commands the smoke ever allows, by exact shown text: `ls`, `ls -la`, `ls -a`, `ls .`, `pwd`, and the three
  * `ls` forms with the work folder (as given or real path, bare or quoted) as the only argument. Every other card, every
- * edit included, is denied once; a plan is rejected. "Always" is never chosen.
+ * edit included, is denied once; a plan is rejected; a question is skipped; an MCP request is declined. "Always" is
+ * never chosen.
  */
 function allowList(folder: string): Set<string> {
   const out = new Set(['ls', 'ls -la', 'ls -a', 'ls .', 'pwd']);
@@ -159,6 +166,8 @@ function allowList(folder: string): Set<string> {
 function answerByList(card: Interaction, allow: ReadonlySet<string>): CardAnswer {
   let answer: CardAnswer;
   if (card.kind === 'plan') answer = { decision: 'rejected', feedback: 'Stop here.' };
+  else if (card.kind === 'question') answer = { reply: 'skip' };
+  else if (card.kind === 'mcp-input') answer = { mcp: 'decline' };
   else if (
     card.access === 'bash' &&
     card.command !== null &&
@@ -170,15 +179,19 @@ function answerByList(card: Interaction, allow: ReadonlySet<string>): CardAnswer
   const text =
     card.kind === 'plan'
       ? { kind: 'plan', plan: card.plan }
-      : {
-          access: card.access,
-          toolName: card.toolName,
-          title: card.title,
-          command: card.command,
-          path: card.path,
-          options: card.options.map((o) => `${o.optionId}/${o.kind}/${o.name}`),
-          flags: card.flags,
-        };
+      : card.kind === 'question'
+        ? { kind: 'question', questions: card.questions.map((q) => q.text) }
+        : card.kind === 'mcp-input'
+          ? { kind: 'mcp-input', server: card.server, mode: card.mode }
+          : {
+              access: card.access,
+              toolName: card.toolName,
+              title: card.title,
+              command: card.command,
+              path: card.path,
+              options: card.options.map((o) => `${o.optionId}/${o.kind}/${o.name}`),
+              flags: card.flags,
+            };
   row('INFO', 'Work card', `${JSON.stringify(text)} → ${JSON.stringify(answer)}`);
   return answer;
 }
@@ -224,8 +237,8 @@ async function runTurn(
       take(event.interactions);
     } else if (event.type === 'interaction') {
       take([event.interaction]);
-    } else if (event.type === 'ops') {
-      for (const op of event.ops) applyOp(view.entries, view.turns, op);
+    } else if (event.type === 'ops' || event.type === 'runs') {
+      for (const op of event.ops ?? []) applyOp(view.entries, view.turns, op);
     } else if (event.type === 'turn' && event.turn === null) {
       view.outcome = event.outcome;
       view.failure = event.failure;
@@ -327,7 +340,15 @@ async function main(): Promise<void> {
     GROK_TELEMETRY_TRACE_UPLOAD: 'false',
     ...over,
   });
-  const make = (webServer?: { command: string; script: string }, base = workEnv()): ChatService =>
+  const make = (
+    webServer?: { command: string; script: string },
+    base = workEnv(),
+    providers = new ProvidersService({
+      paths,
+      secrets: new MemorySecretStore(),
+      workPath: () => workCommandPath(base, userHome),
+    }),
+  ): ChatService =>
     new ChatService({
       paths,
       readEndpoint: async () => ({ version: 1, pid: process.pid, url: args.url, token: args.token, models }),
@@ -337,15 +358,10 @@ async function main(): Promise<void> {
         tag: null,
       }),
       readSession: async (id) => reader.detail(id),
-      providers: new ProvidersService({
-        paths,
-        secrets: new MemorySecretStore(),
-        workPath: () => workCommandPath(base, userHome),
-      }),
+      providers,
       clientVersion: '0.0.0-smoke',
       webServer: webServer ?? { command: process.execPath, script: webServerScript() },
       baseEnv: base,
-      agentHome: join(args.home, 'work-agent'),
       workAgentHome: join(args.home, 'work-agent'),
       homeDir: userHome,
       tempRoots: [],
@@ -476,25 +492,51 @@ async function main(): Promise<void> {
       );
     }
 
-    // Address ledger: a user address is fetched, an invented one is refused.
-    const listed = `https://example.com/${marker.toLowerCase()}`;
-    const fetchListed = await prompt(first.id, `Read the page ${listed} with web_fetch and tell me what it says.`);
-    check(
-      fetchListed.outcome !== 'address-refused' && toolsOf(fetchListed).some((t) => isWebCall(t, 'web_fetch')),
-      'web_fetch of an address from the user message is made (§3.9 row 5)',
-      `outcome ${fetchListed.outcome ?? 'none'}`,
-    );
-    const fetchOther = await prompt(
-      first.id,
-      'Use web_fetch on the official Rust documentation home page (you know its address) and summarise it.',
-    );
-    if (toolsOf(fetchOther).some((t) => isWebCall(t, 'web_fetch'))) {
+    // Address ledger, on a loopback provider with a throwaway key: a user address reaches the provider; an invented one
+    // is the blocked tool error, never reaches it, and the answer goes on.
+    await service.close();
+    const web = await startLoopbackWeb(paths, () => workCommandPath(workEnv(), userHome));
+    service = make(web.webServer, workEnv(), web.providers);
+    try {
+      const own = (url: string): boolean => url.toLowerCase().includes(marker.toLowerCase());
+      const listed = `https://example.com/${marker.toLowerCase()}`;
+      const fetchListed = await prompt(first.id, `Read the page ${listed} with web_fetch and tell me what it says.`);
+      const listedReads = toolsOf(fetchListed).filter((t) => isWebCall(t, 'web_fetch'));
+      const reached = web.fetched();
       check(
-        fetchOther.outcome === 'address-refused',
-        'web_fetch of an unlisted address ends address-refused (§3.9 row 5)',
+        listedReads.some((t) => parseWebResultText(t.output ?? '')?.kind === 'page') &&
+          reached.length > 0 &&
+          reached.every(own),
+        'web_fetch of an address from the user message reaches the provider',
+        `outcome ${fetchListed.outcome ?? 'none'}, provider reads ${reached.length}`,
       );
-    } else {
-      row('INFO', 'web_fetch of an unlisted address', 'the model did not call web_fetch; nothing to judge');
+      const before = web.fetched().length;
+      const fetchOther = await prompt(
+        first.id,
+        'Use web_fetch on the official Rust documentation home page (you know its address) and summarise it.',
+      );
+      const otherReads = toolsOf(fetchOther).filter((t) => isWebCall(t, 'web_fetch'));
+      if (otherReads.length > 0) {
+        const blocked = otherReads.some((t) => {
+          const result = parseWebResultText(t.output ?? '');
+          return result?.kind === 'error' && result.code === 'blocked';
+        });
+        const leaked = web
+          .fetched()
+          .slice(before)
+          .filter((url) => !own(url));
+        check(
+          blocked && leaked.length === 0 && fetchOther.outcome === 'completed',
+          'web_fetch of an unlisted address gets the blocked tool error, never reaches the provider, and the turn completes',
+          `outcome ${fetchOther.outcome ?? 'none'}, unlisted provider reads ${leaked.length}`,
+        );
+      } else {
+        row('INFO', 'web_fetch of an unlisted address', 'the model did not call web_fetch; nothing to judge');
+      }
+    } finally {
+      await service.close();
+      await web.close();
+      service = make();
     }
 
     // Slash text never reaches the agent.

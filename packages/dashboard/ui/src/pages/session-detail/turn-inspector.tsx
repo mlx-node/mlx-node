@@ -4,11 +4,12 @@ import { Link } from 'react-router-dom';
 
 import { IconButton } from '../../components/arc-x/icon-button/icon-button';
 import { KeyValue, type KeyValueItem } from '../../components/arc-x/key-value/key-value';
-import { ModelBadge } from '../../components/arc-x/model-badge/model-badge';
 import { LiveLabel } from '../../components/arc-x/live-label/live-label';
+import { ModelBadge } from '../../components/arc-x/model-badge/model-badge';
 import { Panel } from '../../components/arc-x/panel/panel';
 import { Badge, type BadgeTone } from '../../components/arc/badge/badge';
 import { formatClock, formatCount, formatDuration, formatNumber, formatRate, formatTps } from '../../lib/format';
+import { METRIC } from '../../lib/metric-strings';
 import { PREFILL_UNDER_TEXT } from '../../lib/prefill';
 import { turnPrefill, type TurnGroup } from '../../lib/sessions';
 import type { TurnMetric } from '../../lib/types';
@@ -40,7 +41,7 @@ function figures(metric: TurnMetric): KeyValueItem[] {
     { key: 'duration', label: 'Duration', value: formatDuration(metric.elapsedMs), numeric: true },
     {
       key: 'ttft',
-      label: 'First token',
+      label: METRIC.firstToken.label,
       value: formatDuration(metric.ttftMs),
       hint:
         metric.modelCalls !== null && metric.modelCalls > 1

@@ -31,10 +31,15 @@ import {
   settingsPrints,
   SETTINGS_KEYS,
   shownPath,
+  storedServer,
   type PermissionLine,
   type SettingsPrints,
   type ShownLine,
 } from '../src/chat/permission-log.js';
+import type { PermissionMark } from '../src/chat/types.js';
+import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
+import { deniedWord, mcpLine, placeMarks, rewindRule, subagentDeniedText } from '../ui/src/lib/permission-text.js';
+import type { TranscriptEntry } from '../ui/src/lib/types.js';
 
 const PRINT = 'a'.repeat(64);
 const PRINTS = Object.fromEntries(SETTINGS_KEYS.map((k) => [k, PRINT])) as SettingsPrints;
@@ -106,6 +111,47 @@ describe('the lines', () => {
     ]);
   });
 
+  it("the child key is written last on a helper's allowed line, read back and kept on the mark; a line without it still reads", async () => {
+    const log = new PermissionLog(join(root, 'permission'));
+    const child = '01a20d98-cc9b-7833-95a9-46637f8506d6';
+    const lines: PermissionLine[] = [
+      { kind: 'allowed', at: 1, mode: 'bypass', toolCallId: 'call_1', access: 'bash', child },
+      { kind: 'allowed', at: 2, mode: 'auto', toolCallId: 'call_2', access: 'edit', temp: true, child },
+      { kind: 'allowed', at: 3, mode: 'bypass', toolCallId: 'call_3', access: 'bash' },
+      { kind: 'allowed', at: 4, mode: 'bypass', toolCallId: 'call_4', access: 'bash', child: 'not a safe id' },
+    ];
+    for (const line of lines) await log.append('conv-c', line);
+    const text = readFileSync(join(root, 'permission', 'conv-c.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    expect(text.map((l) => Object.keys(JSON.parse(l) as object).join(','))).toEqual([
+      'kind,at,mode,toolCallId,access,child',
+      'kind,at,mode,toolCallId,access,temp,child',
+      'kind,at,mode,toolCallId,access',
+      'kind,at,mode,toolCallId,access',
+    ]);
+    const unsafe: PermissionLine = { kind: 'allowed', at: 4, mode: 'bypass', toolCallId: 'call_4', access: 'bash' };
+    expect(text.map(readPermissionLine)).toEqual([...lines.slice(0, 3), unsafe]);
+    expect(readPermissionLine('{"kind":"allowed","at":5,"mode":"bypass","toolCallId":"c","access":"bash"}')).toEqual({
+      kind: 'allowed',
+      at: 5,
+      mode: 'bypass',
+      toolCallId: 'c',
+      access: 'bash',
+    });
+    const place = { home: root, agentHome: root, cwd: root };
+    expect(markOf(lines[0] as ShownLine, place)).toEqual({
+      kind: 'allowed',
+      at: 1,
+      mode: 'bypass',
+      toolCallId: 'call_1',
+      access: 'bash',
+      card: null,
+      child,
+    });
+    expect(markOf(lines[2] as ShownLine, place)).not.toHaveProperty('child');
+  });
+
   it('withdrawn drops the last earlier allowed line with its id and at === of; another of drops nothing', () => {
     const allowed = (at: number, id: string): string =>
       JSON.stringify({ kind: 'allowed', at, mode: 'bypass', toolCallId: id, access: 'bash' });
@@ -157,6 +203,15 @@ describe('the lines', () => {
     ['temp on a Bypass line', '{"kind":"allowed","at":1,"mode":"bypass","toolCallId":"c","access":"bash","temp":true}'],
     ['temp that is not true', '{"kind":"allowed","at":1,"mode":"auto","toolCallId":"c","access":"bash","temp":false}'],
     ['temp on a withdrawn line', '{"kind":"withdrawn","at":1,"of":1,"toolCallId":"c","temp":true}'],
+    [
+      'a child that is not text',
+      '{"kind":"allowed","at":1,"mode":"bypass","toolCallId":"c","access":"bash","child":7}',
+    ],
+    [
+      'a child that is not a safe id',
+      '{"kind":"allowed","at":1,"mode":"bypass","toolCallId":"c","access":"bash","child":"../x"}',
+    ],
+    ['a child on a withdrawn line', '{"kind":"withdrawn","at":1,"of":1,"toolCallId":"c","child":"s1"}'],
     [
       'temp on a settings line',
       `{"kind":"settings","at":1,"prints":${PRINTS_TEXT},"changed":["home:.claude.json"],"temp":true}`,
@@ -266,5 +321,412 @@ describe('the settings prints', () => {
     expect((await settingsPrints(place))['folder:.claude/settings.json']).toBe(large['folder:.claude/settings.json']);
     utimesSync(big, 2_000, 2_000);
     expect(changedSettings(large, await settingsPrints(place))).toEqual(['folder:.claude/settings.json']);
+  });
+});
+
+describe('denied lines: a call denied with a note', () => {
+  it('is written with its fields in order, read back, and becomes a mark with no card; never with the note', async () => {
+    const log = new PermissionLog(join(root, 'permission'));
+    const child = '01a20d98-cc9b-7833-95a9-46637f8506d6';
+    const lines: PermissionLine[] = [
+      { kind: 'denied', at: 1, toolCallId: 'call_1', access: 'bash', by: 'note' },
+      { kind: 'denied', at: 2, toolCallId: 'call_2', access: 'edit', by: 'note', child },
+    ];
+    for (const line of lines) await log.append('conv-d', line);
+    const text = readFileSync(join(root, 'permission', 'conv-d.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    expect(text.map((l) => Object.keys(JSON.parse(l) as object).join(','))).toEqual([
+      'kind,at,toolCallId,access,by',
+      'kind,at,toolCallId,access,by,child',
+    ]);
+    expect(await log.read('conv-d')).toEqual(lines);
+    const place = { home: root, agentHome: root, cwd: root };
+    expect(lines.map((l) => markOf(l as ShownLine, place))).toEqual([
+      { kind: 'denied', at: 1, toolCallId: 'call_1', access: 'bash', by: 'note', card: null },
+      { kind: 'denied', at: 2, toolCallId: 'call_2', access: 'edit', by: 'note', card: null, child },
+    ]);
+  });
+
+  it.each<[string, string]>([
+    ['an unknown by', '{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"rule"}'],
+    ['no by', '{"kind":"denied","at":1,"toolCallId":"c","access":"bash"}'],
+    ['the note text', '{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"note","note":"use pnpm"}'],
+    ['an unknown access', '{"kind":"denied","at":1,"toolCallId":"c","access":"shell","by":"note"}'],
+    [
+      'a child that is not a safe id',
+      '{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"note","child":"../x"}',
+    ],
+  ])('%s is skipped', (_name, text) => {
+    expect(readPermissionLine(text)).toBeNull();
+  });
+});
+
+describe('denied lines: a call a never-allow rule denied', () => {
+  const RULE = `n_${'ab'.repeat(16)}`;
+
+  it('holds the rule id, never its words; the mark reads the words the rule file holds now', async () => {
+    const log = new PermissionLog(join(root, 'permission'));
+    const child = '01a20d98-cc9b-7833-95a9-46637f8506d6';
+    const lines: PermissionLine[] = [
+      { kind: 'denied', at: 1, toolCallId: 'call_1', access: 'bash', by: 'rule', ruleId: RULE },
+      { kind: 'denied', at: 2, toolCallId: 'call_2', access: 'bash', by: 'rule', ruleId: RULE, child },
+    ];
+    for (const line of lines) await log.append('conv-r', line);
+    const text = readFileSync(join(root, 'permission', 'conv-r.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    expect(text.map((l) => Object.keys(JSON.parse(l) as object).join(','))).toEqual([
+      'kind,at,toolCallId,access,by,ruleId',
+      'kind,at,toolCallId,access,by,ruleId,child',
+    ]);
+    expect(await log.read('conv-r')).toEqual(lines);
+    const place = { home: root, agentHome: root, cwd: root };
+    const kept = (id: string): string | null => (id === RULE ? 'git push' : null);
+    expect(lines.map((l) => markOf(l as ShownLine, place, kept))).toEqual([
+      {
+        kind: 'denied',
+        at: 1,
+        toolCallId: 'call_1',
+        access: 'bash',
+        by: 'rule',
+        ruleId: RULE,
+        words: 'git push',
+        card: null,
+      },
+      {
+        kind: 'denied',
+        at: 2,
+        toolCallId: 'call_2',
+        access: 'bash',
+        by: 'rule',
+        ruleId: RULE,
+        words: 'git push',
+        card: null,
+        child,
+      },
+    ]);
+    expect(markOf(lines[0] as ShownLine, place)).toMatchObject({ ruleId: RULE, words: null });
+  });
+
+  it.each<[string, string]>([
+    ['a rule with no id', '{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"rule"}'],
+    [
+      'a rule id that is not a safe id',
+      '{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"rule","ruleId":"../x"}',
+    ],
+    [
+      'a note with a rule id',
+      `{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"note","ruleId":"${RULE}"}`,
+    ],
+    [
+      'the rule words',
+      `{"kind":"denied","at":1,"toolCallId":"c","access":"bash","by":"rule","ruleId":"${RULE}","words":"git push"}`,
+    ],
+  ])('%s is skipped', (_name, text) => {
+    expect(readPermissionLine(text)).toBeNull();
+  });
+
+  it('the row word: the note, the rule, or a rule that is gone', () => {
+    const base = { kind: 'denied', at: 1, toolCallId: 'c', access: 'bash', card: null } as const;
+    expect(deniedWord({ ...base, by: 'note' })).toBe(CHAT.permission.deniedNote);
+    expect(deniedWord({ ...base, by: 'rule', ruleId: RULE, words: 'git push' })).toBe(
+      fill(CHAT.never.row, { words: 'git push' }),
+    );
+    expect(deniedWord({ ...base, by: 'rule', ruleId: RULE, words: null })).toBe(CHAT.never.rowGone);
+    expect(deniedWord({ ...base, by: 'rule', words: null })).toBe(CHAT.never.rowGone);
+  });
+
+  it('a rule mark goes on its tool row like a note mark', () => {
+    const entries: TranscriptEntry[] = [
+      { kind: 'user', ts: 10, text: 'go', promptIndex: 0 },
+      { kind: 'tool', ts: 30, id: 'c1', name: 'run_terminal_command', title: 'git push', status: 'failed', endTs: 35 },
+    ];
+    const mark: PermissionMark = {
+      kind: 'denied',
+      at: 31,
+      toolCallId: 'c1',
+      access: 'bash',
+      by: 'rule',
+      ruleId: RULE,
+      words: 'git push',
+      card: null,
+    };
+    expect(placeMarks(entries, [mark]).denied).toEqual(new Map([['c1', mark]]));
+  });
+});
+
+describe('placeMarks: denied marks', () => {
+  const tool = (id: string, ts: number): TranscriptEntry => ({
+    kind: 'tool',
+    ts,
+    id,
+    name: 'run_terminal_command',
+    title: 'npm install left-pad',
+    status: 'failed',
+    input: '{"command":"npm install left-pad"}',
+    endTs: ts + 5,
+  });
+  const denied = (at: number, toolCallId: string, child?: string): PermissionMark => ({
+    kind: 'denied',
+    at,
+    toolCallId,
+    access: 'bash',
+    by: 'note',
+    card: null,
+    ...(child === undefined ? {} : { child }),
+  });
+
+  // Mutation: place no denied mark by its row → it becomes a loose line.
+  it("marks its own tool row, a helper's row, and is a line when neither is in the thread", () => {
+    const spawn: TranscriptEntry = {
+      kind: 'subagent',
+      ts: 20,
+      childId: 's1',
+      type: 'general-purpose',
+      description: 'd',
+    };
+    const entries: TranscriptEntry[] = [
+      { kind: 'user', ts: 10, text: 'go', promptIndex: 0 },
+      spawn,
+      tool('c1', 30),
+      { kind: 'assistant', ts: 50, text: 'ok' },
+    ];
+    const own = denied(31, 'c1');
+    const helper = denied(25, 'h1', 's1');
+    const same = denied(35, 'c1', 's1');
+    const loose = denied(40, 'h2', 'gone');
+    const placed = placeMarks(entries, [own, helper, same, loose]);
+    expect(placed.denied).toEqual(new Map([['c1', own]]));
+    expect(placed.deniedBySubagent).toEqual(new Map([['s1', [helper, same]]]));
+    expect(placed.before.get(3)).toEqual([loose]);
+    expect(placed.allowed.size).toBe(0);
+    expect(placed.bySubagent.size).toBe(0);
+  });
+
+  it('the fact of a helper row counts its denied calls', () => {
+    expect(subagentDeniedText(1)).toBe(CHAT.permission.subagentDeniedOne);
+    expect(subagentDeniedText(3)).toBe(fill(CHAT.permission.subagentDenied, { n: 3 }));
+  });
+});
+
+describe('rewind lines: the rule a rewind leaves', () => {
+  // Mutation: write the rewind line with a `path` → the key order check fails.
+  it('is written with its fields in order, read back, and becomes a mark; never with a path or a text', async () => {
+    const log = new PermissionLog(join(root, 'permission'));
+    const lines: PermissionLine[] = [
+      { kind: 'allowed', at: 5, mode: 'bypass', toolCallId: 'call_1', access: 'bash' },
+      { kind: 'rewind', at: 9, mode: 'conversation', files: 0, from: 4 },
+      { kind: 'rewind', at: 12, mode: 'files', files: 3 },
+    ];
+    for (const line of lines) await log.append('conv-r', line);
+    const text = readFileSync(join(root, 'permission', 'conv-r.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    expect(text.slice(1).map((l) => Object.keys(JSON.parse(l) as object).join(','))).toEqual([
+      'kind,at,mode,files,from',
+      'kind,at,mode,files',
+    ]);
+    expect(await log.read('conv-r')).toEqual(lines);
+    const place = { home: root, agentHome: root, cwd: root };
+    expect(lines.slice(1).map((l) => markOf(l as ShownLine, place))).toEqual([
+      { kind: 'rewind', at: 9, mode: 'conversation', files: 0, from: 4 },
+      { kind: 'rewind', at: 12, mode: 'files', files: 3 },
+    ]);
+  });
+
+  it.each<[string, string]>([
+    ['an unknown mode', '{"kind":"rewind","at":1,"mode":"conversation_only","files":0}'],
+    ['no files', '{"kind":"rewind","at":1,"mode":"conversation"}'],
+    ['a negative count', '{"kind":"rewind","at":1,"mode":"all","files":-1}'],
+    ['a count that is not whole', '{"kind":"rewind","at":1,"mode":"all","files":1.5}'],
+    ['a from that is not a time', '{"kind":"rewind","at":1,"mode":"all","files":0,"from":"x"}'],
+    ['a path', '{"kind":"rewind","at":1,"mode":"files","files":1,"path":"/etc/hosts"}'],
+  ])('%s is skipped', (_name, text) => {
+    expect(readPermissionLine(text)).toBeNull();
+  });
+});
+
+describe('placeMarks: rewind rules', () => {
+  const tool = (id: string, ts: number): TranscriptEntry => ({
+    kind: 'tool',
+    ts,
+    id,
+    name: 'run_terminal_command',
+    title: 'ls',
+    status: 'completed',
+    endTs: ts + 1,
+  });
+
+  // Mutation: drop the span check → the rewound allowed mark comes back as a loose line.
+  it('the rule is a line where the rewind happened; an allowed or denied call the rewind removed is not drawn', () => {
+    const entries: TranscriptEntry[] = [
+      { kind: 'user', ts: 10, text: 'go', promptIndex: 0 },
+      tool('c1', 12),
+      { kind: 'assistant', ts: 14, text: 'ok' },
+      { kind: 'user', ts: 40, text: 'again', promptIndex: 1 },
+    ];
+    const kept: PermissionMark = {
+      kind: 'allowed',
+      at: 13,
+      mode: 'bypass',
+      toolCallId: 'c1',
+      access: 'bash',
+      card: null,
+    };
+    const gone: PermissionMark = {
+      kind: 'allowed',
+      at: 22,
+      mode: 'bypass',
+      toolCallId: 'c9',
+      access: 'bash',
+      card: null,
+    };
+    const goneDenied: PermissionMark = {
+      kind: 'denied',
+      at: 24,
+      toolCallId: 'c8',
+      access: 'edit',
+      by: 'note',
+      card: null,
+    };
+    const after: PermissionMark = {
+      kind: 'allowed',
+      at: 35,
+      mode: 'bypass',
+      toolCallId: 'c7',
+      access: 'bash',
+      card: null,
+    };
+    const rule: PermissionMark = { kind: 'rewind', at: 30, mode: 'conversation', files: 0, from: 20 };
+    const files: PermissionMark = { kind: 'rewind', at: 50, mode: 'files', files: 2 };
+    const placed = placeMarks(entries, [kept, gone, goneDenied, rule, after, files]);
+    expect(placed.allowed).toEqual(new Map([['c1', kept]]));
+    expect(placed.before.get(3)).toEqual([rule, after]);
+    expect(placed.end).toEqual([files]);
+    expect(placed.denied.size).toBe(0);
+  });
+
+  it('the rule words follow the mode and the count of files', () => {
+    expect(rewindRule({ kind: 'rewind', at: 1, mode: 'conversation', files: 0 })).toBe(CHAT.history.rule);
+    expect(rewindRule({ kind: 'rewind', at: 1, mode: 'all', files: 2 })).toBe(
+      fill(CHAT.history.ruleFiles, { files: fill(CHAT.history.nFiles, { n: 2 }) }),
+    );
+    expect(rewindRule({ kind: 'rewind', at: 1, mode: 'all', files: 0 })).toBe(CHAT.history.rule);
+    expect(rewindRule({ kind: 'rewind', at: 1, mode: 'files', files: 1 })).toBe(
+      fill(CHAT.history.ruleFilesOnly, { files: CHAT.history.oneFile }),
+    );
+    expect(rewindRule({ kind: 'rewind', at: 1, mode: 'files', files: 3 })).toBe(
+      fill(CHAT.history.ruleFilesOnly, { files: fill(CHAT.history.nFiles, { n: 3 }) }),
+    );
+  });
+});
+
+describe('MCP lines: a server asked for input', () => {
+  it('is written with its fields in order, read back, and becomes the same mark; never a typed value', async () => {
+    const log = new PermissionLog(join(root, 'permission'));
+    const lines: PermissionLine[] = [
+      { kind: 'mcp', at: 1, server: 'github', mode: 'form', outcome: 'accept' },
+      { kind: 'mcp', at: 2, server: 'github', mode: 'form', outcome: 'decline' },
+      { kind: 'mcp', at: 3, server: 'linear', mode: 'url', outcome: 'cancel' },
+      { kind: 'mcp', at: 4, server: 'linear', mode: 'form', outcome: 'expired' },
+      { kind: 'mcp', at: 5, server: 'github', mode: 'url', outcome: 'accept' },
+      { kind: 'mcp', at: 6, server: 'github', mode: 'url', outcome: 'completed' },
+    ];
+    for (const line of lines) await log.append('conv-m', line);
+    const text = readFileSync(join(root, 'permission', 'conv-m.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l !== '');
+    expect(text.map((l) => Object.keys(JSON.parse(l) as object).join(','))).toEqual(
+      lines.map(() => 'kind,at,server,mode,outcome'),
+    );
+    expect(await log.read('conv-m')).toEqual(lines);
+    const place = { home: root, agentHome: root, cwd: root };
+    expect(lines.map((l) => markOf(l as ShownLine, place))).toEqual(lines);
+  });
+
+  it('keeps the server name printable and at most 64 characters', async () => {
+    expect(storedServer('git\u202Ehub\nx')).toBe('git\\u{202E}hub x');
+    expect(storedServer('s'.repeat(70))).toBe('s'.repeat(64));
+    const log = new PermissionLog(join(root, 'permission'));
+    await log.append('conv-s', {
+      kind: 'mcp',
+      at: 1,
+      server: `bad\u0007${'n'.repeat(80)}`,
+      mode: 'form',
+      outcome: 'accept',
+    });
+    const [line] = await log.read('conv-s');
+    expect(line).toEqual({
+      kind: 'mcp',
+      at: 1,
+      server: storedServer(`bad\u0007${'n'.repeat(80)}`),
+      mode: 'form',
+      outcome: 'accept',
+    });
+  });
+
+  it.each<[string, string]>([
+    ['an unknown outcome', '{"kind":"mcp","at":1,"server":"github","mode":"url","outcome":"opened"}'],
+    [
+      'a form that finished in the browser',
+      '{"kind":"mcp","at":1,"server":"github","mode":"form","outcome":"completed"}',
+    ],
+    ['an unknown mode', '{"kind":"mcp","at":1,"server":"github","mode":"link","outcome":"accept"}'],
+    ['no server', '{"kind":"mcp","at":1,"mode":"form","outcome":"accept"}'],
+    [
+      'a server over 64 characters',
+      `{"kind":"mcp","at":1,"server":"${'s'.repeat(65)}","mode":"form","outcome":"accept"}`,
+    ],
+    [
+      'a control character in the server',
+      '{"kind":"mcp","at":1,"server":"a\\u0007b","mode":"form","outcome":"accept"}',
+    ],
+    [
+      'a typed value',
+      '{"kind":"mcp","at":1,"server":"github","mode":"form","outcome":"accept","content":{"title":"x"}}',
+    ],
+  ])('%s is skipped', (_name, text) => {
+    expect(readPermissionLine(text)).toBeNull();
+  });
+
+  it('the line words: the server, its mode, how it ended', () => {
+    const mark = (mode: 'form' | 'url', outcome: 'accept' | 'decline' | 'cancel' | 'expired') =>
+      mcpLine({ kind: 'mcp', at: 1, server: 'github', mode, outcome });
+    expect(mark('form', 'accept')).toEqual({
+      label: fill(CHAT.mcp.line.form, { server: 'github' }),
+      outcome: CHAT.mcp.line.accept,
+    });
+    expect(mark('form', 'decline').outcome).toBe(CHAT.mcp.line.decline);
+    expect(mark('form', 'cancel').outcome).toBe(CHAT.mcp.line.cancel);
+    expect(mark('form', 'expired').outcome).toBe(CHAT.mcp.line.expired);
+    expect(mark('url', 'accept')).toEqual({
+      label: fill(CHAT.mcp.line.link, { server: 'github' }),
+      outcome: CHAT.mcp.line.opened,
+    });
+    expect(mark('url', 'decline').outcome).toBe(CHAT.mcp.line.decline);
+    expect(mcpLine({ kind: 'mcp', at: 1, server: 'github', mode: 'url', outcome: 'completed' })).toEqual({
+      label: 'github',
+      outcome: CHAT.mcp.line.completed,
+    });
+  });
+});
+
+describe('placeMarks: MCP lines', () => {
+  // Mutation: drop 'mcp' from the span check → the rewound line comes back.
+  it('is a line placed by its time; one inside a rewound span is not drawn', () => {
+    const entries: TranscriptEntry[] = [
+      { kind: 'user', ts: 10, text: 'go', promptIndex: 0 },
+      { kind: 'assistant', ts: 14, text: 'ok' },
+      { kind: 'user', ts: 40, text: 'again', promptIndex: 1 },
+    ];
+    const kept: PermissionMark = { kind: 'mcp', at: 12, server: 'github', mode: 'form', outcome: 'accept' };
+    const gone: PermissionMark = { kind: 'mcp', at: 22, server: 'github', mode: 'form', outcome: 'decline' };
+    const late: PermissionMark = { kind: 'mcp', at: 45, server: 'github', mode: 'form', outcome: 'expired' };
+    const rule: PermissionMark = { kind: 'rewind', at: 30, mode: 'conversation', files: 0, from: 20 };
+    const placed = placeMarks(entries, [kept, gone, rule, late]);
+    expect(placed.before.get(1)).toEqual([kept]);
+    expect(placed.before.get(2)).toEqual([rule]);
+    expect(placed.end).toEqual([late]);
   });
 });

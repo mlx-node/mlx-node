@@ -63,10 +63,11 @@
 
 .panel.panel {
   --picker-row: 44px;
+  --picker-level-row: 36px;
   box-sizing: border-box;
   display: flex;
   width: 545px;
-  max-width: calc(100vw - 20px);
+  max-width: calc(100vw - 32px);
   max-height: var(--radix-popover-content-available-height, 100vh);
   flex-direction: column;
   padding: var(--space-1);
@@ -80,10 +81,59 @@
   grid-template-columns: minmax(0, 300fr) minmax(0, 237fr);
 }
 
+/* The Thinking effort column to the right. The width is THIRD_WIDTH in model-picker.tsx. */
+.panel.panel[data-third] {
+  width: 713px;
+}
+
+.columns[data-third] {
+  grid-template-columns: minmax(0, 300fr) minmax(0, 237fr) minmax(0, 168fr);
+}
+
 .column {
   display: grid;
   min-height: 0;
   grid-template-rows: auto minmax(0, 1fr);
+}
+
+.column[data-back] {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+/* The levels in place of the quantizations: the row back to them, above the heading. */
+.back {
+  display: flex;
+  min-width: 0;
+  height: var(--control-height-sm);
+  align-items: center;
+  gap: var(--space-1);
+  border: 0;
+  border-radius: var(--radius-inset);
+  padding: 0 var(--space-2);
+  background: transparent;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  transition:
+    background-color var(--duration-fast) var(--ease-standard),
+    color var(--duration-fast) var(--ease-standard);
+}
+
+.back:hover {
+  background: var(--row-hover);
+  color: var(--foreground);
+}
+
+.back > svg {
+  flex: none;
+}
+
+.info {
+  display: inline-flex;
+  margin-inline-start: var(--space-1);
+  color: var(--text-secondary);
 }
 
 .quants {
@@ -149,8 +199,21 @@
   background: var(--row-active);
 }
 
-.baseRow {
+.baseRow,
+.variantNext {
   grid-template-columns: minmax(0, 1fr) auto 14px;
+}
+
+.levelRow {
+  min-height: var(--picker-level-row);
+}
+
+.levelName {
+  overflow: hidden;
+  color: var(--foreground);
+  font-size: var(--text-sm);
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .chev,
@@ -170,6 +233,15 @@
   white-space: nowrap;
 }
 
+/* A base with one quantization and levels: the quantization, then the chevron of its next column. */
+.endNext {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 2px;
+  color: var(--text-secondary);
+}
+
 .swap {
   animation: picker-swap var(--duration-fast) var(--ease-enter) both;
 }
@@ -179,12 +251,24 @@
   min-width: 0;
 }
 
+/* One line: a level that has no room beside the name wraps to a clipped second line before the name shortens. */
 .rowName {
   display: flex;
   min-width: 0;
+  max-height: 1lh;
+  flex-wrap: wrap;
+  column-gap: var(--space-1-5);
+  overflow: hidden;
   color: var(--foreground);
   font-size: var(--text-sm);
   font-weight: 500;
+}
+
+.rowLevel {
+  flex: none;
+  color: var(--text-secondary);
+  font-weight: 400;
+  white-space: nowrap;
 }
 
 .rowFacts {
@@ -253,6 +337,16 @@
   color: var(--warning);
 }
 
+/* The dot beside the level in the chip's badge. */
+.levelWarn {
+  display: inline-block;
+  margin-inline-start: var(--space-1);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--warning);
+}
+
 /* Work: a badge with no room beside the name wraps to a clipped second line, so it goes before the name shortens. */
 .trigger[data-crowded] .name {
   align-self: stretch;
@@ -281,7 +375,8 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .trigger {
+  .trigger,
+  .back {
     transition: none;
   }
 

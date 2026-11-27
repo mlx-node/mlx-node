@@ -1,0 +1,98 @@
+.panel {
+  position: absolute;
+  z-index: 3;
+  right: 0;
+  bottom: calc(100% + var(--space-1-5));
+  left: 0;
+  box-sizing: border-box;
+  display: grid;
+  max-height: min(20rem, 50vh);
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+  padding: var(--space-1);
+  background: var(--surface-raised);
+  color: var(--foreground);
+  box-shadow: var(--shadow-floating);
+}
+
+.list {
+  display: grid;
+}
+
+.group {
+  display: grid;
+}
+
+.heading {
+  padding: var(--space-1-5) var(--space-2-5) var(--space-1);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  line-height: var(--leading-body);
+}
+
+.row {
+  box-sizing: border-box;
+  display: flex;
+  min-width: 0;
+  min-height: var(--control-height-md);
+  align-items: center;
+  gap: var(--space-3);
+  border-radius: var(--radius-inset);
+  padding: var(--space-1) var(--space-2-5);
+  font-size: var(--text-sm);
+  line-height: var(--leading-body);
+  cursor: pointer;
+}
+
+.row[aria-selected='true'] {
+  background: var(--row-hover);
+}
+
+.name {
+  flex: none;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.about {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.words {
+  max-width: 40%;
+  flex: none;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.later {
+  padding: var(--space-1) var(--space-2-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  line-height: var(--leading-body);
+}
+
+.srOnly {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+@container composer (width < 520px) {
+  .words {
+    display: none;
+  }
+}

@@ -1,7 +1,7 @@
 /**
  * Work workflows on the real agent binary (`MLX_AGENT_E2E_BIN`) with a scripted engine and no model: the child's
  * tools and prompt, its guarded ask with the requester, the report and the wake, Stop run, the Chat switch, the
- * session header, the context count, and an auto compaction. Skipped without the variable.
+ * session header, the context count, an auto compaction, and a deny with a note. Skipped without the variable.
  * `MLX_AGENT_E2E_RECORD` (a folder) keeps each case's raw wire, engine requests and host events there.
  */
 
@@ -12,14 +12,18 @@ import { join } from 'node:path';
 
 import { describe, expect, it } from 'vite-plus/test';
 
-import { TranscriptReducer, type UpdateLine } from '../src/agent-sessions/transcript.js';
+import { parseUpdates, TranscriptReducer, type UpdateLine } from '../src/agent-sessions/transcript.js';
 import type { TranscriptEntry } from '../src/agent-sessions/types.js';
 import { spawnAgent, type SpawnAgent } from '../src/chat/acp/process.js';
+import { type RuleDeny } from '../src/chat/agent/agent-host.js';
+import { neverNote, NeverRules } from '../src/chat/agent/never-rules.js';
 import { AGENT_ARGS, WORK_RULES, workGuardHookName } from '../src/chat/agent/profiles.js';
+import { applyOp } from '../src/chat/conversation.js';
 import type { PermissionInteraction } from '../src/chat/types.js';
 import { CHAT, fill } from '../ui/src/lib/chat-strings.js';
 import { compactionText } from '../ui/src/lib/chat-turns.js';
 import { formatCount } from '../ui/src/lib/format.js';
+import { neverNoteWords } from '../ui/src/lib/permission-text.js';
 import { fakeHost, noProviders, until, type FakeHost, type FakeHostOptions, type Json } from './helpers/chat-fake.js';
 import {
   DEFAULT_INPUT_TOKENS,
@@ -336,6 +340,7 @@ describe.skipIf(BIN === undefined)('Work workflows on the real agent', () => {
       for (const tool of ['workflow', 'spawn_subagent', 'scheduler_create']) expect(child.tools).not.toContain(tool);
       expect(child.system).toContain('<human_rules>');
       expect(child.system).toContain(WORK_RULES.split('\n')[0]!);
+      expect(child.system).toContain('SUBAGENT RULES (if you are a subagent or a workflow helper, follow them):');
       notes.skillInChildFirstRequest = {
         system: child.system.includes(r.skill),
         messages: JSON.stringify(child.messages).includes(r.skill),
@@ -395,7 +400,9 @@ describe.skipIf(BIN === undefined)('Work workflows on the real agent', () => {
         reduce(parentLines.slice(0, wakeEnd))
           .snapshot()
           .entries.filter((e) => e.kind === 'wake'),
-      ).toMatchObject([{ kind: 'wake', cause: 'workflow', workflow: { name: 'probe', status: 'complete' } }]);
+      ).toMatchObject([
+        { kind: 'wake', cause: 'workflow', workflow: { name: 'probe', snapshot: { status: 'complete' } } },
+      ]);
       const stored = listFiles(fake.agentHome).find((f) => f.includes(id) && f.endsWith('updates.jsonl'));
       notes.storedWakePrompts =
         stored === undefined
@@ -464,7 +471,7 @@ describe.skipIf(BIN === undefined)('Work workflows on the real agent', () => {
       ).toEqual([]);
       expect(r.engine.modelRequests.filter(isParent)).toHaveLength(parentCalls);
       expect(fake.events.turns.some((t) => t.turn?.origin === 'wake')).toBe(false);
-      expect(fake.host.runs(id)).toEqual([]);
+      expect(fake.host.runs(id)).toMatchObject([{ runId, live: false, status: 'cancelled', by: 'you' }]);
       notes.terminalUpdate = xaiUpdates(wire, 'workflow_updated').find((u) => u.status === 'cancelled');
       notes.sleepersAfterStop = sleepers();
     } finally {
@@ -483,6 +490,268 @@ describe.skipIf(BIN === undefined)('Work workflows on the real agent', () => {
       }
       if (RECORD !== undefined)
         writeFileSync(join(RECORD, 'step3-sleepers.json'), `${JSON.stringify(notes, null, 2)}\n`);
+    }
+  }, 120_000);
+
+  /**
+   * The pin of the note rules: the agent sends no user chunk live (the host draws the note itself) and stores each
+   * note as bare user chunks, 2 at v0.3.4 (one direct write, one through the event pipeline); the reducer folds them
+   * into one note row. When an agent stores one, this count fails and the pair rule goes.
+   */
+  it('a deny with a note: the turn goes on, no user chunk comes live, the stored note is 2 bare chunks', async () => {
+    const NOTE = 'NOTE-PROBE: use pnpm, not npm';
+    const COMMAND = 'npm install left-pad';
+    const r = await rig((q) => {
+      if (isTitle(q)) return TITLE_REPLY;
+      if (JSON.stringify(q.messages).includes(NOTE)) return { blocks: [{ type: 'text', text: 'Using pnpm.' }] };
+      return {
+        blocks: [{ type: 'tool_use', name: 'run_terminal_command', input: { command: COMMAND, description: 'add' } }],
+      };
+    });
+    const notes: Json = {};
+    try {
+      const { fake, engine, wire } = r;
+      const id = await session(fake);
+      const turn = start(fake, id, 'NOTE-PROBE: add left-pad.');
+      const card = await nthCard(fake, 1);
+      expect(card.command).toBe(COMMAND);
+      expect(fake.host.answer(id, card.id, 'reject-once', NOTE)).not.toBeNull();
+      expect((await turn.done).outcome).toBe('completed');
+      expect(engine.modelRequests.some((q) => !isTitle(q) && JSON.stringify(q.messages).includes(NOTE))).toBe(true);
+      const echoes = wire.out.filter(
+        (m) =>
+          m.method === 'session/update' && ((m.params as Json).update as Json).sessionUpdate === 'user_message_chunk',
+      );
+      notes.liveUserChunks = echoes;
+      expect(echoes).toEqual([]);
+      const tool = entriesOf(fake, id).find((e) => e.kind === 'tool' && e.id === card.toolCallId);
+      expect(tool?.kind === 'tool' ? tool.status : null).toBe('failed');
+      const stored = listFiles(fake.agentHome).find((f) => f.includes(id) && f.endsWith('updates.jsonl'));
+      expect(stored).toBeDefined();
+      const text = readFileSync(join(fake.agentHome, stored!), 'utf8');
+      const bare = text
+        .split('\n')
+        .filter((l) => l.includes(NOTE) && l.includes('"user_message_chunk"') && !l.includes('promptIndex'));
+      notes.storedNoteChunks = bare;
+      expect(bare).toHaveLength(2);
+      const users = parseUpdates(text).transcript.filter((e) => e.kind === 'user');
+      expect(
+        users.filter((e) => e.kind === 'user' && e.note === true).map((e) => (e.kind === 'user' ? e.text : '')),
+      ).toEqual([NOTE]);
+      expect(users.filter((e) => e.kind === 'user' && e.note !== true)).toHaveLength(1);
+      const live = new TranscriptReducer();
+      live.note(NOTE);
+      const storedNote = users.find((e) => e.kind === 'user' && e.note === true)!;
+      expect({ ...storedNote, ts: 0 }).toEqual({ ...live.snapshot().entries[0], ts: 0 });
+    } finally {
+      await finish('step8-deny-note', r, { notes });
+    }
+  }, 120_000);
+
+  /**
+   * Never allow on the real agent: a rule denies the agent's own shell request with no card, even in Bypass, and
+   * its note keeps the turn going; the stored note reads as the live "Your rule" row. A model that keeps trying gets a
+   * plain deny on the 4th hit, and the agent's PermissionRejected end reads `never-loop`.
+   */
+  it('a never-allow rule: no card in Bypass, the note keeps the turn going; the 4th hit ends never-loop', async () => {
+    const rulesDir = realpathSync(mkdtempSync(join(tmpdir(), 'mlx-e2e-never-')));
+    const never = new NeverRules(join(rulesDir, 'never-allow.json'));
+    await never.ready();
+    const denied: RuleDeny[] = [];
+    const NOTE = neverNote('git push');
+    let loops = 0;
+    const r = await rig(
+      (q) => {
+        if (isTitle(q)) return TITLE_REPLY;
+        const text = JSON.stringify(q.messages);
+        if (text.includes('LOOP-PROBE')) {
+          loops += 1;
+          const command = `git push origin try${loops}`;
+          return { blocks: [{ type: 'tool_use', name: 'run_terminal_command', input: { command, description: 'p' } }] };
+        }
+        if (text.includes(NOTE)) return { blocks: [{ type: 'text', text: 'Not pushing.' }] };
+        return {
+          blocks: [
+            {
+              type: 'tool_use',
+              name: 'run_terminal_command',
+              input: { command: 'git push origin main', description: 'p' },
+            },
+          ],
+        };
+      },
+      {
+        host: {
+          permission: { modeOf: () => 'bypass', watched: () => true },
+          onModeAllowed: async () => true,
+          never,
+          onRuleDenied: (_id, deny) => denied.push(deny),
+        },
+      },
+    );
+    const notes: Json = {};
+    try {
+      const { fake, engine, wire } = r;
+      const created = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+      const id = created.sessionId;
+      expect(await never.add(created.cwd, ['git', 'push']).saved).toBe(true);
+      const ruleId = never.rulesOf(created.cwd)[0]!.id;
+      const replies = (): Json[] =>
+        wire.in.filter(
+          (m) => m.method === undefined && typeof m.result === 'object' && 'outcome' in (m.result as Json),
+        );
+
+      expect((await start(fake, id, 'NEVER-PROBE: push it.').done).outcome).toBe('completed');
+      expect(fake.events.interactions).toHaveLength(0);
+      notes.firstReplies = replies();
+      expect(replies().map((m) => m.result)).toEqual([
+        { outcome: { outcome: 'selected', optionId: 'reject-once' }, _meta: { followup_message: NOTE } },
+      ]);
+      expect(denied).toEqual([expect.objectContaining({ ruleId, words: 'git push', noted: true, access: 'bash' })]);
+      expect(engine.modelRequests.some((q) => !isTitle(q) && JSON.stringify(q.messages).includes(NOTE))).toBe(true);
+      const tool = entriesOf(fake, id).find((e) => e.kind === 'tool' && e.id === denied[0]!.toolCallId);
+      expect(tool?.kind === 'tool' ? tool.status : null).toBe('failed');
+      const stored = listFiles(fake.agentHome).find((f) => f.includes(id) && f.endsWith('updates.jsonl'));
+      const disk = parseUpdates(readFileSync(join(fake.agentHome, stored!), 'utf8')).transcript.filter(
+        (e) => e.kind === 'user' && e.note === true,
+      );
+      expect(disk.map((e) => (e.kind === 'user' ? neverNoteWords(e.text) : null))).toEqual(['git push']);
+      const live = new TranscriptReducer();
+      live.note(NOTE);
+      expect({ ...disk[0]!, ts: 0 }).toEqual({ ...live.snapshot().entries[0], ts: 0 });
+
+      expect((await start(fake, id, 'LOOP-PROBE: push again.').done).outcome).toBe('never-loop');
+      expect(fake.events.interactions).toHaveLength(0);
+      notes.loopReplies = replies().slice(1);
+      expect(
+        replies()
+          .slice(1)
+          .map((m) => m.result),
+      ).toEqual([
+        ...[1, 2, 3].map(() => ({
+          outcome: { outcome: 'selected', optionId: 'reject-once' },
+          _meta: { followup_message: NOTE },
+        })),
+        { outcome: { outcome: 'selected', optionId: 'reject-once' } },
+      ]);
+      expect(denied.slice(1).map((d) => d.noted)).toEqual([true, true, true, false]);
+      expect(loops).toBe(4);
+    } finally {
+      await finish('ak6-never-allow', r, { notes });
+      rmSync(rulesDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  /** v0.3.4's `monitor` runs its `command` in the background terminal: a rule denies it as it denies a command. */
+  it('a never-allow rule denies a monitor whose command it matches, in Bypass: the command never runs', async () => {
+    const rulesDir = realpathSync(mkdtempSync(join(tmpdir(), 'mlx-e2e-never-')));
+    const never = new NeverRules(join(rulesDir, 'never-allow.json'));
+    await never.ready();
+    const denied: RuleDeny[] = [];
+    const NOTE = neverNote('touch');
+    const MARK = 'never-monitor-ran';
+    const r = await rig(
+      (q) => {
+        if (isTitle(q)) return TITLE_REPLY;
+        if (JSON.stringify(q.messages).includes(NOTE)) return { blocks: [{ type: 'text', text: 'Not watching.' }] };
+        return {
+          blocks: [
+            {
+              type: 'tool_use',
+              name: 'monitor',
+              input: { command: `touch ${MARK} && echo started && sleep 30`, description: 'Watch the probe' },
+            },
+          ],
+        };
+      },
+      {
+        host: {
+          permission: { modeOf: () => 'bypass', watched: () => true },
+          onModeAllowed: async () => true,
+          never,
+          onRuleDenied: (_id, deny) => denied.push(deny),
+        },
+      },
+    );
+    const notes: Json = {};
+    try {
+      const { fake, wire } = r;
+      const created = await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+      const id = created.sessionId;
+      expect(await never.add(created.cwd, ['touch']).saved).toBe(true);
+      const ruleId = never.rulesOf(created.cwd)[0]!.id;
+
+      expect((await start(fake, id, 'MONITOR-PROBE: watch it.').done).outcome).toBe('completed');
+      const asked = wire.out.filter((m) => m.method === 'session/request_permission');
+      notes.asked = asked;
+      expect(asked).toHaveLength(1);
+      const call = (asked[0]!.params as Json).toolCall as Json;
+      expect((call._meta as Json)['x.ai/tool']).toMatchObject({ name: 'monitor' });
+      expect(call.rawInput).toMatchObject({ variant: 'Monitor', command: `touch ${MARK} && echo started && sleep 30` });
+      expect(fake.events.interactions).toHaveLength(0);
+      const replies = wire.in.filter(
+        (m) => m.method === undefined && typeof m.result === 'object' && 'outcome' in (m.result as Json),
+      );
+      expect(replies.map((m) => m.result)).toEqual([
+        { outcome: { outcome: 'selected', optionId: 'reject-once' }, _meta: { followup_message: NOTE } },
+      ]);
+      expect(denied).toEqual([expect.objectContaining({ ruleId, words: 'touch', noted: true, access: 'other' })]);
+      expect(fake.host.liveActivity(id).tasks).toEqual([]);
+      expect(readdirSync(created.cwd)).not.toContain(MARK);
+    } finally {
+      await finish('ak6-never-monitor', r, { notes });
+      rmSync(rulesDir, { recursive: true, force: true });
+    }
+  }, 120_000);
+
+  it('plan mode: `_meta.mode` moves the agent; the live entries equal a disk read of the session', async () => {
+    const r = await rig((q) => (isTitle(q) ? TITLE_REPLY : { blocks: [{ type: 'text', text: 'PLAN-PROBE reply.' }] }));
+    const notes: Json = {};
+    try {
+      const { fake, wire } = r;
+      const id = await session(fake);
+      const turns: Array<[string, boolean]> = [
+        ['PLAN-PROBE: plan the cache.', true],
+        ['PLAN-PROBE: build it.', false],
+      ];
+      const live = new TranscriptReducer();
+      const entries: TranscriptEntry[] = [];
+      let seen = 0;
+      for (const [text, plan] of turns) {
+        for (const op of live.userPrompt(text, [], Date.now())) applyOp(entries, [], op);
+        const turn = fake.host.startTurn(id, text, { modelId: MODEL, cwd: fake.project }, [], { plan });
+        expect((await turn.done).outcome).toBe('completed');
+        const lines = linesOf(fake, id);
+        for (const line of lines.slice(seen)) for (const op of live.apply(line)) applyOp(entries, [], op);
+        seen = lines.length;
+      }
+      const modes = wire.out
+        .filter((m) => m.method === 'session/update')
+        .map((m) => (m.params as Json).update as Json)
+        .filter((u) => u.sessionUpdate === 'current_mode_update')
+        .map((u) => u.currentModeId);
+      notes.liveModes = modes;
+      expect(modes).toEqual(['plan', 'default']);
+      expect(
+        wire.in.filter((m) => m.method === 'session/prompt').map((m) => ((m.params as Json)._meta as Json).mode),
+      ).toEqual(['plan', 'agent']);
+      const stored = listFiles(fake.agentHome).find((f) => f.includes(id) && f.endsWith('updates.jsonl'));
+      expect(stored).toBeDefined();
+      // The second turn's stored end can land after its reply.
+      const ends = (): number =>
+        readFileSync(join(fake.agentHome, stored!), 'utf8').split('"turn_completed"').length - 1;
+      await until(() => ends() === turns.length, AGENT_WAIT_MS);
+      const disk = parseUpdates(readFileSync(join(fake.agentHome, stored!), 'utf8')).transcript;
+      const bare = (list: readonly TranscriptEntry[]) =>
+        list.map((e) => (e.kind === 'user' ? { ...e, ts: 0, promptIndex: null } : { ...e, ts: 0 }));
+      notes.disk = disk;
+      expect(disk.filter((e) => e.kind === 'plan-mode').map((e) => (e.kind === 'plan-mode' ? e.mode : null))).toEqual([
+        'plan',
+        'default',
+      ]);
+      expect(bare(entries)).toEqual(bare(disk));
+    } finally {
+      await finish('co1-plan-mode', r, { notes });
     }
   }, 120_000);
 

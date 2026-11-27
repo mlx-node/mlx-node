@@ -20,6 +20,7 @@ import {
   formatRate,
   formatTps,
 } from '../../lib/format';
+import { METRIC } from '../../lib/metric-strings';
 import {
   isOutcomeFilter,
   outcomeText,
@@ -173,7 +174,7 @@ export function TurnsTab(): ReactElement {
     { id: 'output', header: 'Output', align: 'end', width: 64, cell: (row) => formatCount(row.outputTokens) },
     {
       id: 'ttft',
-      header: 'First token',
+      header: METRIC.firstToken.label,
       align: 'end',
       width: 88,
       minTableWidth: 640,

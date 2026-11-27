@@ -70,6 +70,41 @@ export interface ReasoningEffortOption {
   readonly default?: true;
 }
 
+/** The thinking levels an engine host offers, least thinking first; never `minimal`, which the agent cannot send. */
+export const THINKING_LEVELS = ['none', 'low', 'medium', 'high', 'max'] as const;
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/** What a level sets on a Messages request; `'default'` sets nothing, so the model runs as with no level. */
+export type FamilyThinkingLevel =
+  | 'default'
+  | { readonly reasoningEffort?: ThinkingLevel; readonly thinkingTokenBudget?: number };
+
+/** A chat family's thinking levels, exactly one of them `'default'`; empty when it offers none. */
+export type FamilyThinkingLevels = Readonly<Partial<Record<ThinkingLevel, FamilyThinkingLevel>>>;
+
+/** Template on/off with the budget from the request (`ThinkingPolicy::TemplateHonoring`). */
+const BUDGET_THINKING_LEVELS: FamilyThinkingLevels = {
+  none: { reasoningEffort: 'none' },
+  low: { thinkingTokenBudget: 1024 },
+  medium: { thinkingTokenBudget: 4096 },
+  high: 'default',
+};
+
+/**
+ * As {@link BUDGET_THINKING_LEVELS}, for a family with a checkpoint template that reads `reasoning_effort` (Qwen3.8:
+ * `low`, `medium`, default `xhigh`; DeepSeek-V4.1: its effort score). Without the word, a small budget would run
+ * under the template's default effort; a template that reads no effort renders the same prompt with it.
+ */
+const BUDGET_EFFORT_THINKING_LEVELS: FamilyThinkingLevels = {
+  none: { reasoningEffort: 'none' },
+  low: { reasoningEffort: 'low', thinkingTokenBudget: 1024 },
+  medium: { reasoningEffort: 'medium', thinkingTokenBudget: 4096 },
+  high: 'default',
+};
+
+/** Native derives this budget from `low` only when the request sets none, and a host budget would be one. */
+const ALWAYS_ON_LOW: FamilyThinkingLevel = { reasoningEffort: 'low', thinkingTokenBudget: 256 };
+
 export interface FamilyTraits {
   /**
    * Whether the family emits `<think>` reasoning (drives the agent's thinking
@@ -90,6 +125,11 @@ export interface FamilyTraits {
    * does not expose user-selectable reasoning effort controls.
    */
   readonly reasoningEfforts?: readonly ReasoningEffortOption[];
+  /**
+   * The levels a server with `thinkingLevels` lists on `/v1/models` and maps
+   * `extra_body.reasoning_effort` through (`@mlx-node/server` `host/thinking-levels.ts`).
+   */
+  readonly thinkingLevels: FamilyThinkingLevels;
   /**
    * Context-window fallback when `config.json` carries no
    * `max_position_embeddings` at either nesting level.
@@ -559,6 +599,7 @@ export const MODEL_FAMILY_DATA = [
         high: 'high',
       },
       reasoningEfforts: BINARY_THINKING_EFFORTS,
+      thinkingLevels: {},
       fallbackContextWindow: 131072,
     },
     launchPreset: {
@@ -580,6 +621,7 @@ export const MODEL_FAMILY_DATA = [
     traits: {
       reasoning: true,
       reasoningEfforts: BUDGET_THINKING_EFFORTS,
+      thinkingLevels: { low: ALWAYS_ON_LOW, high: 'default' },
       fallbackContextWindow: 131072,
     },
     launchPreset: {
@@ -616,7 +658,12 @@ export const MODEL_FAMILY_DATA = [
      * `applyChatTemplate`; it retains the native tokenizer-backed method.
      */
     streamOpts: { recordModelPath: true, applyTemplate: false },
-    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 40960 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: BINARY_THINKING_EFFORTS,
+      thinkingLevels: BUDGET_THINKING_LEVELS,
+      fallbackContextWindow: 40960,
+    },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 38912,
@@ -638,7 +685,12 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen35'],
     ggufDiscovery: { variants: 'qwen35-xl', split: true },
-    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 262144 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: BINARY_THINKING_EFFORTS,
+      thinkingLevels: BUDGET_EFFORT_THINKING_LEVELS,
+      fallbackContextWindow: 262144,
+    },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 81920,
@@ -660,7 +712,12 @@ export const MODEL_FAMILY_DATA = [
     acceptsCacheDisk: true,
     publishesGovernorStateDisk: true,
     streamOpts: { recordModelPath: true },
-    traits: { reasoning: true, reasoningEfforts: BINARY_THINKING_EFFORTS, fallbackContextWindow: 262144 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: BINARY_THINKING_EFFORTS,
+      thinkingLevels: BUDGET_THINKING_LEVELS,
+      fallbackContextWindow: 262144,
+    },
     launchPreset: {
       sampling: QWEN_SAMPLING_DEFAULTS.thinkingCoding,
       maxOutputTokens: 81920,
@@ -681,7 +738,12 @@ export const MODEL_FAMILY_DATA = [
     streamOpts: { recordModelPath: true },
     ggufArchitectures: ['qwen4exp'],
     ggufDiscovery: { variants: 'all', split: true },
-    traits: { reasoning: true, reasoningEfforts: FIVE_LEVEL_XHIGH_DEFAULT_EFFORTS, fallbackContextWindow: 262144 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: FIVE_LEVEL_XHIGH_DEFAULT_EFFORTS,
+      thinkingLevels: BUDGET_EFFORT_THINKING_LEVELS,
+      fallbackContextWindow: 262144,
+    },
     launchPreset: { sampling: QWEN4_EXP_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
@@ -697,7 +759,12 @@ export const MODEL_FAMILY_DATA = [
     ggufArchitectures: ['deepseek41'],
     ggufDiscovery: { variants: 'all', split: true },
     /** v1 context limit (min(GGUF context, 16384)). */
-    traits: { reasoning: true, reasoningEfforts: FOUR_LEVEL_MAX_EFFORTS, fallbackContextWindow: 16384 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: FOUR_LEVEL_MAX_EFFORTS,
+      thinkingLevels: BUDGET_EFFORT_THINKING_LEVELS,
+      fallbackContextWindow: 16384,
+    },
     launchPreset: { sampling: DEEPSEEK_V41_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
   },
   {
@@ -727,6 +794,12 @@ export const MODEL_FAMILY_DATA = [
         max: 'max',
       },
       reasoningEfforts: FOUR_LEVEL_MAX_EFFORTS,
+      thinkingLevels: {
+        none: { reasoningEffort: 'none' },
+        low: { reasoningEffort: 'low' },
+        high: 'default',
+        max: { reasoningEffort: 'max' },
+      },
       fallbackContextWindow: 262144,
     },
     launchPreset: { sampling: HY_V4_FLASH_SAMPLING_DEFAULTS, maxOutputTokens: 8192 },
@@ -778,7 +851,17 @@ export const MODEL_FAMILY_DATA = [
      * instead of installing the factory's path-backed Jinja tokenizer.
      */
     streamOpts: { recordModelPath: false, applyTemplate: false },
-    traits: { reasoning: true, reasoningEfforts: FIVE_LEVEL_HIGH_DEFAULT_EFFORTS, fallbackContextWindow: 1048576 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: FIVE_LEVEL_HIGH_DEFAULT_EFFORTS,
+      thinkingLevels: {
+        none: { reasoningEffort: 'none' },
+        low: { reasoningEffort: 'low' },
+        medium: { reasoningEffort: 'medium' },
+        high: 'default',
+      },
+      fallbackContextWindow: 1048576,
+    },
     launchPreset: {
       sampling: INKLING2_SAMPLING_DEFAULTS,
       maxOutputTokens: 32768,
@@ -794,7 +877,12 @@ export const MODEL_FAMILY_DATA = [
      * through the shared `Lfm2Model` wrapper, so the flag lives once, here.
      */
     streamOpts: { recordModelPath: true, replayAssistantRawText: true },
-    traits: { reasoning: true, reasoningEfforts: BUDGET_THINKING_EFFORTS, fallbackContextWindow: 128000 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: BUDGET_THINKING_EFFORTS,
+      thinkingLevels: { low: ALWAYS_ON_LOW, high: 'default' },
+      fallbackContextWindow: 128000,
+    },
     launchPreset: {
       sampling: LFM2_SAMPLING_DEFAULTS,
       maxOutputTokens: 8192,
@@ -805,7 +893,12 @@ export const MODEL_FAMILY_DATA = [
     kind: 'loadable',
     match: { rawModelTypes: ['lfm2_moe'] },
     coldRestoreEligible: true,
-    traits: { reasoning: true, reasoningEfforts: BUDGET_THINKING_EFFORTS, fallbackContextWindow: 128000 },
+    traits: {
+      reasoning: true,
+      reasoningEfforts: BUDGET_THINKING_EFFORTS,
+      thinkingLevels: { low: ALWAYS_ON_LOW, high: 'default' },
+      fallbackContextWindow: 128000,
+    },
     /**
      * LFM2.5-8B-A1B: LiquidAI's MoE card recommends temperature 0.2 / top_k 80
      * — deliberately NOT the dense `lfm2` values (0.05 / 50).
@@ -833,6 +926,7 @@ export const MODEL_FAMILY_DATA = [
     traits: {
       reasoning: true,
       reasoningEfforts: BINARY_THINKING_EFFORTS,
+      thinkingLevels: BUDGET_THINKING_LEVELS,
       fallbackContextWindow: 1048576,
     },
     launchPreset: {
@@ -867,6 +961,7 @@ export const MODEL_FAMILY_DATA = [
         max: null,
       },
       reasoningEfforts: K2_THINKING_EFFORTS,
+      thinkingLevels: { low: ALWAYS_ON_LOW, medium: { reasoningEffort: 'medium' }, high: 'default' },
       fallbackContextWindow: 524288,
     },
     launchPreset: {

@@ -75,7 +75,7 @@ immediately; omitting it adds no explicit cap for Qwen models. The overall outpu
 limit still includes reasoning and answer tokens.
 
 The default output is the agent's text answer. `--mode json` emits its JSON event
-stream. Sessions appear in the desktop Sessions page and can be resumed with
+stream. Sessions appear in Portato's Sessions page and can be resumed with
 `--session`; `--no-session` opts out as it does for `mlx agent`. Each process owns
 its model, just like `mlx agent`; it does not reuse the desktop inference host.
 There is no separate 16-step limit, 120-second request timeout, or JSON action loop.
@@ -101,7 +101,7 @@ cannot silently turn ordinary command failures into success.
 
 Outside a recognized Codex invocation, approval-requiring tools still need an
 explicit caller opt-in: pass `--caller-approved` after the calling agent approves
-this bounded task and its tool execution. The desktop installs this invocation for
+this bounded task and its tool execution. Portato installs this invocation for
 Claude Code, Codex, and Grok; existing directives without the flag are offered an
 update. This flag applies only to the current worker, does not set global approval
 variables, and does not copy another agent's tool approval rules or grant OS access.
@@ -110,7 +110,7 @@ caller or opt-in, the worker returns an immediate handoff. The existing explicit
 `MLX_AGENT_AUTO_APPROVE=1` opt-in remains supported. Normal `mlx agent` permissions
 remain unchanged.
 
-The desktop **Coding Agents** page can add the short routing instruction to a
+Portato's **Coding Agents** page can add the short routing instruction to a
 global agent file. It writes the instruction between
 `<!-- portato managed instructions: begin -->` and
 `<!-- portato managed instructions: end -->` markers, finds it by those markers,

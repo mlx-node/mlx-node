@@ -120,7 +120,7 @@ describe('Overview engine panel', () => {
       (text) => text.includes('in flight ·'),
     );
     const text = engineText(page);
-    expect(text).toContain('desktop · :52114 · up');
+    expect(text).toContain('Portato · :52114 · up');
     expect(text).toContain('42.7');
     const rate = byRole(page.container, 'region', 'Engine')?.querySelector('[data-stat-value]');
     const reserved = [...(rate?.querySelectorAll('[style]') ?? [])].filter((node) =>
@@ -144,7 +144,10 @@ describe('Overview engine panel', () => {
 
   it('says idle and when the last turn ended', async () => {
     const page = await mountOverview();
-    await push(live({ processes: [process({ turns: [], decodeTps: 0 })] }), (text) => text.includes('Idle.'));
+    await push(
+      live({ processes: [process({ turns: [], rates: { windowMs: 10_000, outputTps: null, prefillTps: null } })] }),
+      (text) => text.includes('Idle.'),
+    );
     expect(page.text()).toContain('Idle. Last turn finished 1m ago.');
   });
 

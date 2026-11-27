@@ -1,0 +1,130 @@
+{
+  "version": 4,
+  "state": {
+    "run_id": "wf_01a2168534c27fd1a477edb6fad7b0a4",
+    "revision": 26,
+    "name": "research-advisory",
+    "objective": "Research a GitHub security advisory against the local checkout: verify the fix commit, the advisory's claims, and remaining holes",
+    "status": "complete",
+    "phases": [
+      {
+        "title": "Recon",
+        "detail": "four independent read-only tracks"
+      },
+      {
+        "title": "Verify",
+        "detail": "adversarial checks of the key claims"
+      },
+      {
+        "title": "Synthesize",
+        "detail": "final maintainer-ready report"
+      }
+    ],
+    "current_phase": "Synthesize",
+    "agent_budget": 128,
+    "agents_used": 7,
+    "agent_usage_incomplete": false,
+    "elapsed_ms_floor": 2323877,
+    "history": [
+      {
+        "event": "workflow_started",
+        "at": "2026-11-26T06:22:38.292908+00:00"
+      },
+      {
+        "event": "phase_entered",
+        "detail": "Recon",
+        "at": "2026-11-26T06:22:38.302374+00:00"
+      },
+      {
+        "event": "log",
+        "detail": "Recon: 4 read-only tracks over GHSA-0000-0000-0000",
+        "at": "2026-11-26T06:22:38.302464+00:00"
+      },
+      {
+        "event": "phase_entered",
+        "detail": "Verify",
+        "at": "2026-11-26T06:36:43.800950+00:00"
+      },
+      {
+        "event": "log",
+        "detail": "Verify: adversarial checks of the two key claims",
+        "at": "2026-11-26T06:36:43.801062+00:00"
+      },
+      {
+        "event": "phase_entered",
+        "detail": "Synthesize",
+        "at": "2026-11-26T06:55:55.702090+00:00"
+      },
+      {
+        "event": "log",
+        "detail": "Synthesize: final maintainer-ready report",
+        "at": "2026-11-26T06:55:55.702146+00:00"
+      },
+      {
+        "event": "workflow_completed",
+        "at": "2026-11-26T07:01:22.188539+00:00"
+      }
+    ],
+    "journal_path": "workflows/wf_01a2168534c27fd1a477edb6fad7b0a4/journal.jsonl",
+    "result_summary": "# Advisory research\n\nThe fix holds for the reported path; one more path needs a guard.\n",
+    "agents": [
+      {
+        "agent_id": "01a21685-34e7-71a3-8869-363c095bd8bb",
+        "label": "track:fix-reality",
+        "phase": "Recon",
+        "state": "done",
+        "tokens_used": 1937982,
+        "duration_ms": 789628
+      },
+      {
+        "agent_id": "01a21685-34f1-7d63-8879-906ef6740323",
+        "label": "track:claims-check",
+        "phase": "Recon",
+        "state": "done",
+        "tokens_used": 187449,
+        "duration_ms": 362029
+      },
+      {
+        "agent_id": "01a21685-34f1-7d63-8879-9082ad01fcaa",
+        "label": "track:holes",
+        "phase": "Recon",
+        "state": "done",
+        "tokens_used": 3997846,
+        "duration_ms": 845266
+      },
+      {
+        "agent_id": "01a21688-13f5-7b32-873d-247e85ca5c3f",
+        "label": "track:process",
+        "phase": "Recon",
+        "state": "done",
+        "tokens_used": 188922,
+        "duration_ms": 308450
+      },
+      {
+        "agent_id": "01a21692-1ba4-7483-bf3b-41ef24bdb263",
+        "label": "verify:fix-vectors",
+        "phase": "Verify",
+        "state": "done",
+        "tokens_used": 6375290,
+        "duration_ms": 1151578
+      },
+      {
+        "agent_id": "01a21692-1ba4-7483-bf3b-41f727579131",
+        "label": "verify:claims",
+        "phase": "Verify",
+        "state": "done",
+        "tokens_used": 617797,
+        "duration_ms": 323204
+      },
+      {
+        "agent_id": "01a216a3-af41-7f12-b3b6-941942c5c890",
+        "label": "synthesize",
+        "phase": "Synthesize",
+        "state": "done",
+        "tokens_used": 1615475,
+        "duration_ms": 326096
+      }
+    ]
+  },
+  "script_revision": 0
+}

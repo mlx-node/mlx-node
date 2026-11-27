@@ -25,6 +25,7 @@ import { toast } from '../../../lib/toast';
 import { providerName } from '../../../lib/web-tools';
 import { conversationPath } from '../conversation-actions';
 import { folderTooLong } from '../drafts';
+import { NeverChipRow, NeverRules, type NeverRulesControl } from './never';
 import { CARD_ARM_MS } from './permission';
 import styles from './permission-mode.module.css';
 
@@ -99,8 +100,7 @@ export function folderReason(
   problem: CwdProblem | undefined,
 ): string | undefined {
   if (!isNew) return problem === undefined ? undefined : CHAT.cwdProblems[problem];
-  if (folder === null) return CHAT.folderNeeded;
-  return folderTooLong(folder) ? CHAT.folderTooLong : undefined;
+  return folder !== null && folderTooLong(folder) ? CHAT.folderTooLong : undefined;
 }
 
 /** Providers whose key the Work agent gets: the selected search provider, and Firecrawl when its Work skills are ready. */
@@ -158,8 +158,10 @@ export function permissionModeName(mode: PermissionMode, folder: string | null, 
   return fill(p.nameOf, { mode: p.modes[mode], note: modeNote(mode, folder, temp) });
 }
 
-/** What the mode is set on: an open Work conversation, or the New Work screen's draft and its folder. */
-export type PermissionSubject = { kind: 'conversation'; id: string } | { kind: 'draft'; id: string; cwd: string };
+/** What the mode is set on: an open Work conversation, or the New Work screen's draft and its folder (null: none). */
+export type PermissionSubject =
+  | { kind: 'conversation'; id: string }
+  | { kind: 'draft'; id: string; cwd: string | null };
 
 function modePath(subject: PermissionSubject): string {
   return subject.kind === 'draft'
@@ -169,28 +171,32 @@ function modePath(subject: PermissionSubject): string {
 
 /** The New screen's draft ends with a raised mode shown: its pick goes back to Ask. */
 export function clearDraftMode(id: string): void {
-  mutate('POST', modePath({ kind: 'draft', id, cwd: '' }), { mode: 'ask', up: false }).catch(() => undefined);
+  mutate('POST', modePath({ kind: 'draft', id, cwd: null }), { mode: 'ask', up: false }).catch(() => undefined);
 }
 
-/** Whether the user has tool hooks for `cwd`, read once per folder; null until it answers or with no folder. */
-export function useWorkHooks(cwd: string | null): boolean | null {
-  const [read, setRead] = useState<{ cwd: string; hooks: boolean } | null>(null);
+/**
+ * Whether the user has tool hooks for a draft's place, read once per place: a folder, or none (`cwd` null). Null
+ * until it answers, or when `read` is false.
+ */
+export function useWorkHooks(read: boolean, cwd: string | null): boolean | null {
+  const query = !read ? null : cwd === null ? 'noFolder=1' : `cwd=${encodeURIComponent(cwd)}`;
+  const [answer, setAnswer] = useState<{ query: string; hooks: boolean } | null>(null);
   useEffect(() => {
-    if (cwd === null) return;
+    if (query === null) return;
     let active = true;
-    getJson<{ userHooks: boolean }>(`/chat/work/hooks?cwd=${encodeURIComponent(cwd)}`).then(
+    getJson<{ userHooks: boolean }>(`/chat/work/hooks?${query}`).then(
       (body) => {
-        if (active) setRead({ cwd, hooks: body.userHooks });
+        if (active) setAnswer({ query, hooks: body.userHooks });
       },
       () => {
-        if (active) setRead({ cwd, hooks: true });
+        if (active) setAnswer({ query, hooks: true });
       },
     );
     return () => {
       active = false;
     };
-  }, [cwd]);
-  return read !== null && read.cwd === cwd ? read.hooks : null;
+  }, [query]);
+  return answer !== null && answer.query === query ? answer.hooks : null;
 }
 
 /**
@@ -215,6 +221,7 @@ export function usePermissionMode(
     told.current = on;
   });
   const id = subject?.id ?? null;
+  const draft = subject?.kind === 'draft';
   const cwd = subject?.kind === 'draft' ? subject.cwd : null;
   const set = useCallback(
     async (target: PermissionMode, up: boolean, temp: string | null = null): Promise<boolean> => {
@@ -230,8 +237,8 @@ export function usePermissionMode(
       }
       try {
         const named = up && target === 'auto' && temp !== null ? { temp } : {};
-        const folder = up && cwd !== null ? { cwd } : {};
-        const path = modePath(cwd === null ? { kind: 'conversation', id } : { kind: 'draft', id, cwd });
+        const folder = !up || !draft ? {} : cwd === null ? { noFolder: true } : { cwd };
+        const path = modePath(draft ? { kind: 'draft', id, cwd } : { kind: 'conversation', id });
         const reply = await mutate<{ mode: PermissionMode }>('POST', path, { mode: target, up, ...folder, ...named });
         told.current.onMode?.(reply.mode);
         return true;
@@ -242,7 +249,7 @@ export function usePermissionMode(
         if (up) flight(false);
       }
     },
-    [id, cwd],
+    [id, draft, cwd],
   );
   return { pending: id !== null && raising.has(id), set };
 }
@@ -269,7 +276,7 @@ function ConfirmView(props: {
   const place = placeWords(facts.folder, temp);
   const keys = useWorkKeys(true, props.providers);
   const key = keySentence(keys, target);
-  const read = useWorkHooks(facts.draft ? facts.folder : null);
+  const read = useWorkHooks(facts.draft, facts.folder);
   const userHooks = facts.draft ? read : facts.userHooks;
   const hooks = userHooks === true ? p[target].hooks : null;
   const known = userHooks !== null;
@@ -354,6 +361,8 @@ export interface PermissionModeChipProps {
   /** A move up is in flight. */
   pending: boolean;
   onSet: (target: PermissionMode, up: boolean, temp?: string | null) => Promise<boolean>;
+  /** Work: the never-allow rules of the conversation's folder: a row under the modes and a view of their own. */
+  never?: NeverRulesControl;
 }
 
 /**
@@ -365,8 +374,12 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
   const p = CHAT.permission;
   const [open, setOpen] = useState(false);
   const [confirm, setConfirm] = useState<{ target: Raised; from: PermissionMode } | null>(null);
+  const [rulesOpen, setRulesOpen] = useState(false);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const textRef = useRef<HTMLDivElement | null>(null);
+  const rulesBack = useRef<HTMLButtonElement | null>(null);
+  const rulesRow = useRef(false);
+  const never = props.never;
   const backTo = useRef<Raised | null>(null);
   const chipBlocked = block.chip !== null;
   const isOpen = open && !chipBlocked;
@@ -383,9 +396,19 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
   useEffect(() => {
     if (confirm !== null && shown === null) setConfirm(null);
   }, [confirm, shown]);
+  const rules = shown === null && rulesOpen && never !== undefined;
   const focusView = (): void => {
     if (shown !== null) {
       textRef.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (rules) {
+      rulesBack.current?.focus({ preventScroll: true });
+      return;
+    }
+    if (rulesRow.current) {
+      rulesRow.current = false;
+      contentRef.current?.querySelector<HTMLElement>('[data-never-chip-row]')?.focus({ preventScroll: true });
       return;
     }
     const radios = contentRef.current?.querySelectorAll<HTMLElement>('[role="radio"]');
@@ -397,7 +420,7 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
   useLayoutEffect(() => {
     focusRef.current = focusView;
   });
-  const view = shown === null ? null : shown.target;
+  const view = shown === null ? (rules ? 'rules' : null) : shown.target;
   useEffect(() => {
     if (isOpen) focusRef.current();
   }, [isOpen, view]);
@@ -438,6 +461,7 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
           if (shown !== null && props.pending) void props.onSet(shown.from, false);
           setOpen(false);
           setConfirm(null);
+          setRulesOpen(false);
         }
       }}
     >
@@ -457,6 +481,7 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
               event.preventDefault();
               if (chipBlocked) return;
               setConfirm(null);
+              setRulesOpen(false);
               setOpen((current) => !current);
             }}
           />
@@ -466,16 +491,32 @@ export function PermissionModeChip(props: PermissionModeChipProps): ReactElement
         ref={contentRef}
         side={header ? 'bottom' : 'top'}
         align={header ? 'end' : 'start'}
-        aria-label={shown === null ? p.name : p[shown.target].title}
+        aria-label={
+          shown !== null
+            ? p[shown.target].title
+            : rules
+              ? fill(CHAT.never.listTitle, { folder: folderName(never.folder) })
+              : p.name
+        }
         className={styles.popover}
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           focusView();
         }}
       >
-        {shown === null ? (
+        {rules ? (
+          <NeverRules
+            control={never}
+            backRef={rulesBack}
+            onBack={() => {
+              rulesRow.current = true;
+              setRulesOpen(false);
+            }}
+          />
+        ) : shown === null ? (
           <div className={styles.menu}>
             <OptionList label={p.name} value={mode} onValueChange={pick} options={options} wrap />
+            {never === undefined ? null : <NeverChipRow count={never.count} onOpen={() => setRulesOpen(true)} />}
             <p className={styles.foot}>{props.facts.draft ? p.draftFoot : p.menuFoot}</p>
           </div>
         ) : (

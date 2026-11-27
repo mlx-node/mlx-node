@@ -3,9 +3,12 @@
  * agent: each must be refused before any prompt reaches the agent.
  */
 
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+
 import { describe, expect, it } from 'vite-plus/test';
 
-import { readInitialize } from '../src/chat/acp/messages.js';
+import { readInitialize, readSessionInfo } from '../src/chat/acp/messages.js';
 import { AgentHostError } from '../src/chat/agent/agent-host.js';
 import { categoryCount, checkSession, leadingInteger, selfCheck, type GuardInput } from '../src/chat/agent/guard.js';
 import { fakeHost, until } from './helpers/chat-fake.js';
@@ -22,12 +25,19 @@ const goodInfo = {
     { label: 'Workflows', detail: '1 workflow' },
     { label: 'MCP servers', detail: '1 server' },
   ],
+  used: null,
+  total: null,
+  messageTokens: null,
+  freeTokens: null,
+  compactionCount: null,
+  autoCompactThresholdPercent: null,
+  turnIndex: null,
 };
 
 function input(over: Partial<GuardInput> = {}): GuardInput {
   return {
     mode: 'chat',
-    reply: { sessionId: 's', currentModelId: 'm', cwd: '/w' },
+    reply: { sessionId: 's', currentModelId: 'm', cwd: '/w', efforts: null, effort: null },
     info: goodInfo,
     mcpReady: true,
     requestedModelId: 'm',
@@ -43,6 +53,52 @@ describe('leadingInteger', () => {
     expect(leadingInteger('skill')).toBeNull();
     expect(leadingInteger('')).toBeNull();
     expect(categoryCount({ ...goodInfo, usageCategories: [] }, 'Skills')).toBe(0);
+  });
+});
+
+describe('readSessionInfo: the Context panel numbers', () => {
+  /** The first `_x.ai/session/info` reply of a recorded real Chat run (agent load, then a turn). */
+  function recorded(): unknown {
+    const file = join(import.meta.dirname, 'fixtures/chat-scenarios/recorded/f-u12-new-and-load.jsonl');
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (line === '') continue;
+      const row = JSON.parse(line) as { dir: string; msg: { result?: { result?: { context?: unknown } } } };
+      if (row.dir === 'in' && row.msg.result?.result?.context !== undefined) return row.msg.result;
+    }
+    throw new Error('no session info reply recorded');
+  }
+
+  it('reads the numbers of a recorded reply', () => {
+    expect(readSessionInfo(recorded())).toMatchObject({
+      used: 503,
+      total: 262144,
+      systemPromptTokens: 4,
+      toolDefinitionsCount: 2,
+      toolDefinitionsTokens: 261,
+      messageTokens: 499,
+      freeTokens: 261641,
+      compactionCount: 0,
+      autoCompactThresholdPercent: 85,
+      turnIndex: 1,
+    });
+  });
+
+  it('a reply with no context (the session is not loaded) gives null numbers, not zeros', () => {
+    const info = readSessionInfo({ result: {} })!;
+    expect([
+      info.used,
+      info.total,
+      info.messageTokens,
+      info.freeTokens,
+      info.compactionCount,
+      info.autoCompactThresholdPercent,
+      info.turnIndex,
+      info.systemPromptTokens,
+    ]).toEqual([null, null, null, null, null, null, null, null]);
+    const odd = readSessionInfo({
+      result: { turnIndex: -1, context: { used: 1.5, total: '9', autoCompactThresholdPercent: 101 } },
+    })!;
+    expect([odd.used, odd.total, odd.autoCompactThresholdPercent, odd.turnIndex]).toEqual([null, null, null, null]);
   });
 });
 

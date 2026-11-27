@@ -1,0 +1,99 @@
+.frame {
+  container: goal-strip / inline-size;
+  min-width: 0;
+}
+
+.box {
+  box-sizing: border-box;
+  display: grid;
+  min-width: 0;
+  gap: var(--space-0-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 0 var(--space-1) 0 var(--space-2-5);
+  background: var(--surface-raised);
+  color: var(--foreground);
+  font-size: var(--text-sm);
+}
+
+.line {
+  display: flex;
+  min-height: var(--control-height-md);
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.label {
+  flex: none;
+  font-weight: 500;
+}
+
+.objective {
+  min-width: 0;
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.state {
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame[data-state='blocked'] .state,
+.frame[data-state='budget'] .state {
+  color: var(--warning);
+}
+
+.clock,
+.tokens {
+  flex: none;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.clock::before,
+.tokens::before {
+  content: '· ';
+}
+
+.actions {
+  display: flex;
+  flex: none;
+  gap: var(--space-1);
+}
+
+.reason {
+  padding-bottom: var(--space-1-5);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+@container goal-strip (max-width: 519px) {
+  .tokens {
+    display: none;
+  }
+}
+
+@container goal-strip (max-width: 399px) {
+  .label,
+  .box[data-running] .state {
+    display: none;
+  }
+
+  .box[data-running] .clock::before {
+    content: none;
+  }
+}

@@ -65,6 +65,24 @@ describe('composerCanSend and sendFace', () => {
     expect(sendFace('running', false)).toMatchObject({ glyph: 'stop', enabled: true, name: 'Stop' });
     expect(sendFace('cancelling', false)).toMatchObject({ enabled: false, name: 'Stopping' });
   });
+
+  it('an op (fork, rewind, recap): with text the button queues, with none it is a still ring; never Stop', () => {
+    const queueing = { enabled: true, onQueue: () => undefined };
+    expect(sendFace('op', false, undefined, queueing)).toMatchObject({
+      glyph: 'send',
+      action: 'queue',
+      enabled: true,
+      name: CHAT.queue.add,
+      tip: CHAT.queue.addTipOp,
+    });
+    expect(sendFace('op', false)).toMatchObject({
+      glyph: 'ring',
+      action: 'none',
+      enabled: false,
+      name: CHAT.opBusy,
+      tip: CHAT.opBusyTip,
+    });
+  });
 });
 
 describe('Composer', () => {
@@ -99,6 +117,26 @@ describe('Composer', () => {
     act(() => byRole(container, 'button', 'Stop')!.click());
     expect(onStop).toHaveBeenCalledTimes(2);
     expect(onSend).not.toHaveBeenCalled();
+  });
+
+  // Mutation: leave `op` out of the queueing phases → Enter does nothing while a fork runs.
+  it('while an op runs Enter queues, the round button is Queue, there is no Stop and Esc stops nothing', () => {
+    const onQueue = vi.fn();
+    const onStop = vi.fn();
+    const onSend = vi.fn();
+    const container = mount(createElement(Composer, props({ value: 'next', phase: 'op', onQueue, onStop, onSend })));
+    const area = byRole(container, 'textbox', 'Message')!;
+    key(area, { key: 'Enter' });
+    expect(onQueue).toHaveBeenCalledTimes(1);
+    expect(byRole(container, 'button', CHAT.queue.add)).not.toBeNull();
+    expect(byRole(container, 'button', CHAT.stop)).toBeNull();
+    key(area, { key: 'Escape' });
+    expect(onStop).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    rerender(createElement(Composer, props({ value: '', phase: 'op', onQueue, onStop, onSend })));
+    const ring = byRole(container, 'button', CHAT.opBusy) as HTMLButtonElement;
+    expect(ring.disabled).toBe(true);
+    expect(byRole(container, 'button', CHAT.stop)).toBeNull();
   });
 
   it('Esc stops once: a held key repeats nothing, an IME composition stops nothing', () => {
@@ -358,15 +396,17 @@ describe('Composer context ring', () => {
   const arc = (container: HTMLElement): string | null =>
     ring(container)?.querySelectorAll('circle')[1]?.getAttribute('stroke-dasharray') ?? null;
 
-  it('the sentence: whole numbers with separators and a whole percent, <1% for a tiny share, 100% past the window', () => {
-    expect(contextText({ used: 11_971, window: 262_144 })).toBe('Context: 11,971 of 262,144 tokens (5%)');
-    expect(contextText({ used: 1, window: 262_144 })).toBe('Context: 1 of 262,144 tokens (<1%)');
-    expect(contextText({ used: 300_000, window: 262_144 })).toBe('Context: 300,000 of 262,144 tokens (100%)');
+  it('the sentence: sizes in base-1024 K and M, a whole percent, <1% for a tiny share, 100% past the window', () => {
+    expect(contextText({ used: 11_971, window: 262_144 })).toBe('Context: 11.7K of 256K tokens (5%)');
+    expect(contextText({ used: 1, window: 262_144 })).toBe('Context: 1 of 256K tokens (<1%)');
+    expect(contextText({ used: 300_000, window: 262_144 })).toBe('Context: 293K of 256K tokens (100%)');
+    expect(contextText({ used: 34_958, window: 1_048_576 })).toBe('Context: 34.1K of 1M tokens (3%)');
+    expect(contextText({ used: 1_600_000, window: 2_097_152 })).toBe('Context: 1.5M of 2M tokens (76%)');
   });
 
   it('a ring with no text: the numbers are only in its name, and it takes keyboard focus for its tooltip', () => {
     const container = mount(createElement(Composer, props({ context: { used: 11_971, window: 262_144 } })));
-    const hint = byRole(container, 'img', 'Context: 11,971 of 262,144 tokens (5%)')!;
+    const hint = byRole(container, 'img', 'Context: 11.7K of 256K tokens (5%)')!;
     expect(hint).not.toBeNull();
     expect(hint.tabIndex).toBe(0);
     expect(hint.querySelector('svg')!.getAttribute('aria-hidden')).toBe('true');
@@ -381,7 +421,7 @@ describe('Composer context ring', () => {
     expect(document.body.textContent).not.toContain('11,971');
     act(() => hint.focus());
     expect(document.activeElement).toBe(hint);
-    expect(document.body.textContent).toContain('Context: 11,971 of 262,144 tokens (5%)');
+    expect(document.body.textContent).toContain('Context: 11.7K of 256K tokens (5%)');
   });
 
   it('the arc covers the used share, never less than a small minimum above 0, and stops at full', () => {
@@ -432,6 +472,28 @@ describe('Composer context ring', () => {
     expect(ring(container)).not.toBeNull();
   });
 
+  it('is the Context panel button only with the panel; without it, an image with no press', () => {
+    const context = { used: 11_971, window: 262_144 };
+    const name = 'Context: 11.7K of 256K tokens (5%)';
+    const onOpenChange = vi.fn();
+    const container = mount(createElement(Composer, props({ context })));
+    expect(byRole(container, 'button', name)).toBeNull();
+    expect(byRole(container, 'img', name)).not.toBeNull();
+    rerender(
+      createElement(Composer, props({ context, contextPanel: { open: false, onOpenChange, content: 'PANEL' } })),
+    );
+    expect(byRole(container, 'img', name)).toBeNull();
+    const button = byRole(container, 'button', name)!;
+    expect([button.getAttribute('type'), button.getAttribute('aria-haspopup')]).toEqual(['button', 'dialog']);
+    expect(button.getAttribute('aria-expanded')).toBe('false');
+    expect(button.querySelector('svg')!.getAttribute('aria-hidden')).toBe('true');
+    act(() => button.click());
+    expect(onOpenChange).toHaveBeenCalledWith(true);
+    rerender(createElement(Composer, props({ context, contextPanel: { open: true, onOpenChange, content: 'PANEL' } })));
+    expect(byRole(container, 'button', name)!.getAttribute('aria-expanded')).toBe('true');
+    expect(value('.contextButton', 'cursor')).toBe('pointer');
+  });
+
   it('is not drawn under 320 px of composer width', () => {
     const source = readFileSync(
       join(import.meta.dirname, '../ui/src/components/arc-x/composer/composer.module.css'),
@@ -454,5 +516,169 @@ describe('Composer context ring', () => {
     expect(narrow.map((rule) => rule.decls.get('display'))).toEqual(['none']);
     expect(source.slice(open, end).includes('.context {')).toBe(true);
     expect(value('.context', 'display')).toBe('inline-flex');
+  });
+});
+
+describe('Composer queue', () => {
+  const buttons = (container: Element): string[] =>
+    Array.from(container.querySelectorAll('form > div:last-child button')).map(
+      (b) => b.getAttribute('aria-label') ?? '',
+    );
+
+  it('the button table: idle Send; an answer with text: small Stop, then Queue; with no text: Stop; stopping: Stop off', () => {
+    const onQueue = vi.fn();
+    const container = mount(createElement(Composer, props({ value: 'next', phase: 'idle', onQueue })));
+    expect(buttons(container)).toEqual([CHAT.send]);
+    for (const phase of ['starting', 'running'] as const) {
+      rerender(createElement(Composer, props({ value: 'next', phase, onQueue })));
+      expect(buttons(container)).toEqual([CHAT.stop, CHAT.queue.add]);
+      const queue = byRole(container, 'button', CHAT.queue.add) as HTMLButtonElement;
+      expect(queue.disabled).toBe(false);
+      expect(queue.getAttribute('aria-keyshortcuts')).toBe('Enter');
+    }
+    rerender(createElement(Composer, props({ value: '  ', phase: 'running', onQueue })));
+    expect(buttons(container)).toEqual([CHAT.stop]);
+    rerender(createElement(Composer, props({ value: 'next', phase: 'cancelling', onQueue })));
+    expect(buttons(container)).toEqual([CHAT.stopping]);
+    expect((byRole(container, 'button', CHAT.stopping) as HTMLButtonElement).disabled).toBe(true);
+    rerender(createElement(Composer, props({ value: 'next', phase: 'running' })));
+    expect(buttons(container)).toEqual([CHAT.stop]);
+  });
+
+  it('while an answer runs Enter and ⌘Enter queue and never stop; the small Stop and Esc stop', () => {
+    const onQueue = vi.fn();
+    const onStop = vi.fn();
+    const onSend = vi.fn();
+    const container = mount(
+      createElement(Composer, props({ value: 'later', phase: 'running', onQueue, onStop, onSend })),
+    );
+    const area = byRole(container, 'textbox', 'Message')!;
+    key(area, { key: 'Enter' });
+    key(area, { key: 'Enter', metaKey: true });
+    key(area, { key: 'Enter', shiftKey: true });
+    expect(onQueue).toHaveBeenCalledTimes(2);
+    act(() => byRole(container, 'button', CHAT.queue.add)!.click());
+    expect(onQueue).toHaveBeenCalledTimes(3);
+    expect(onStop).not.toHaveBeenCalled();
+    act(() => byRole(container, 'button', CHAT.stop)!.click());
+    key(area, { key: 'Escape' });
+    expect(onStop).toHaveBeenCalledTimes(2);
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('Work: ⌘Enter (or Ctrl+Enter) sends now while Queue is on; Enter still queues; idle ⌘Enter sends', () => {
+    const onQueue = vi.fn();
+    const onSendNow = vi.fn();
+    const onSend = vi.fn();
+    const container = mount(
+      createElement(Composer, props({ value: 'use pnpm', phase: 'running', onQueue, onSendNow, onSend })),
+    );
+    const area = (): Element => byRole(container, 'textbox', 'Message')!;
+    key(area(), { key: 'Enter', metaKey: true });
+    key(area(), { key: 'Enter', ctrlKey: true });
+    key(area(), { key: 'Enter' });
+    expect(onSendNow).toHaveBeenCalledTimes(2);
+    expect(onQueue).toHaveBeenCalledTimes(1);
+    key(area(), { key: 'Enter', metaKey: true, shiftKey: true });
+    expect(onSendNow).toHaveBeenCalledTimes(2);
+    rerender(
+      createElement(Composer, props({ value: 'use pnpm', phase: 'running', onQueue, onSendNow, blocked: 'no' })),
+    );
+    key(area(), { key: 'Enter', metaKey: true });
+    expect(onSendNow).toHaveBeenCalledTimes(2);
+    rerender(createElement(Composer, props({ value: 'use pnpm', phase: 'idle', onQueue, onSendNow, onSend })));
+    key(area(), { key: 'Enter', metaKey: true });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onSendNow).toHaveBeenCalledTimes(2);
+  });
+
+  // Mutation: gate ⌘Enter on `canQueue` again → a full list turns Send now off too.
+  it('Work, the list full (`queueOff`): Queue is off and says why; ⌘Enter still sends now', () => {
+    const onQueue = vi.fn();
+    const onSendNow = vi.fn();
+    const full = CHAT.queue.full;
+    const container = mount(
+      createElement(Composer, props({ value: 'use pnpm', phase: 'running', onQueue, onSendNow, queueOff: full })),
+    );
+    const area = (): Element => byRole(container, 'textbox', 'Message')!;
+    key(area(), { key: 'Enter' });
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(container.textContent).toContain(full);
+    expect((byRole(container, 'button', CHAT.queue.add) as HTMLButtonElement).disabled).toBe(true);
+    key(area(), { key: 'Enter', metaKey: true });
+    expect(onSendNow).toHaveBeenCalledTimes(1);
+    expect(onQueue).not.toHaveBeenCalled();
+    rerender(createElement(Composer, props({ value: 'use pnpm', phase: 'running', onQueue, queueOff: full })));
+    key(area(), { key: 'Enter', metaKey: true });
+    expect(onQueue).not.toHaveBeenCalled();
+  });
+
+  it('stopping keeps the text: Enter does nothing until the agent is idle, then it sends', () => {
+    const onQueue = vi.fn();
+    const onSend = vi.fn();
+    const container = mount(createElement(Composer, props({ value: 'keep me', phase: 'cancelling', onQueue, onSend })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'Enter' });
+    expect(onQueue).not.toHaveBeenCalled();
+    expect(onSend).not.toHaveBeenCalled();
+    expect((byRole(container, 'textbox', 'Message') as HTMLTextAreaElement).value).toBe('keep me');
+    rerender(createElement(Composer, props({ value: 'keep me', phase: 'idle', onQueue, onSend })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'Enter' });
+    expect(onSend).toHaveBeenCalledTimes(1);
+    expect(onQueue).not.toHaveBeenCalled();
+  });
+
+  it('a full queue: the reason shows and Queue is off; the queue slot sits above the attachments', () => {
+    const onQueue = vi.fn();
+    const container = mount(
+      createElement(
+        Composer,
+        props({
+          value: 'sixth',
+          phase: 'running',
+          onQueue,
+          blocked: CHAT.queue.full,
+          queue: createElement('div', { 'data-testid': 'queue' }),
+          attachments: createElement('div', { 'data-testid': 'files' }),
+        }),
+      ),
+    );
+    expect(container.textContent).toContain(CHAT.queue.full);
+    const queue = byRole(container, 'button', CHAT.queue.add) as HTMLButtonElement;
+    expect(queue.disabled).toBe(true);
+    key(byRole(container, 'textbox', 'Message')!, { key: 'Enter' });
+    expect(onQueue).not.toHaveBeenCalled();
+    const form = container.querySelector('form')!;
+    const order = Array.from(form.children).map((child) => child.getAttribute('data-testid'));
+    expect(order.indexOf('queue')).toBeLessThan(order.indexOf('files'));
+    expect(sendFace('running', false, CHAT.queue.full, { enabled: false, onQueue })).toMatchObject({
+      name: CHAT.queue.add,
+      enabled: false,
+      tip: CHAT.queue.full,
+    });
+    expect(sendFace('running', false, undefined, { enabled: true, onQueue }).tip).toBe(CHAT.queue.addTip);
+  });
+
+  it('Esc closes an open row edit first; only the next Esc stops the answer', () => {
+    const onCancelEdit = vi.fn();
+    const onStop = vi.fn();
+    const container = mount(createElement(Composer, props({ value: 'x', phase: 'running', onStop, onCancelEdit })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'Escape' });
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
+    expect(onStop).not.toHaveBeenCalled();
+    rerender(createElement(Composer, props({ value: 'x', phase: 'running', onStop })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'Escape' });
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onCancelEdit).toHaveBeenCalledTimes(1);
+  });
+
+  it('Alt+↑ in an empty box opens the last queued row; with text it does nothing', () => {
+    const onEditLast = vi.fn();
+    const container = mount(createElement(Composer, props({ value: '', phase: 'running', onEditLast })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'ArrowUp', altKey: true });
+    expect(onEditLast).toHaveBeenCalledTimes(1);
+    rerender(createElement(Composer, props({ value: 'x', phase: 'running', onEditLast })));
+    key(byRole(container, 'textbox', 'Message')!, { key: 'ArrowUp', altKey: true });
+    key(byRole(container, 'textbox', 'Message')!, { key: 'ArrowUp' });
+    expect(onEditLast).toHaveBeenCalledTimes(1);
   });
 });

@@ -48,6 +48,7 @@ import {
   type RuntimeSchedRecord,
 } from '../runtime-trace.js';
 import { setTurnEdgeListener, turnCounters, type LiveTurn, type TurnCounters } from '../turn-trace.js';
+import { WORK, type LoadSpan, type WorkLedger, type WorkRates, type WorkTotals } from '../work-ledger.js';
 import type { ColdCaptureBudget } from './persist-cache.js';
 import { isProcessAlive } from './temp-root.js';
 
@@ -56,9 +57,6 @@ export const HEARTBEAT_IDLE_MS = 5000;
 export const SAMPLE_BUSY_MS = 5000;
 export const SAMPLE_IDLE_MS = 60_000;
 export const EDGE_COALESCE_MS = 250;
-export const RATE_WINDOW_MS = 5000;
-const RATE_MIN_DT_MS = 500;
-const PRE_DECODE_PHASES: ReadonlySet<string> = new Set(['queued', 'slot', 'prepare', 'prefill']);
 const MODEL_META_REFRESH_MS = SAMPLE_BUSY_MS;
 export const SCHED_IDLE_SETTLE_MS = 500;
 export const LIVE_TURNS_MAX = 32;
@@ -97,6 +95,8 @@ export interface RuntimeSamplerDeps {
   loadProgress?: (path: string) => LoadProgress | null;
   /** Process-wide pipeline counter; defaults to the native addon. Null while the counter is off. */
   pipelineStats?: () => PipelineStats | null;
+  /** Lane time ledger the sampler advances; defaults to the process-wide one the traced turns credit. */
+  work?: WorkLedger;
 }
 
 /** What {@link RuntimeSampler.timedLoad} records about one load. */
@@ -167,6 +167,49 @@ function finiteOr0(value: unknown): number {
 
 function roundedOrNull(value: unknown): number | null {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? Math.round(value) : null;
+}
+
+function roundedWorkMs(ms: WorkTotals['ms']): WorkTotals['ms'] {
+  return {
+    loading: Math.round(ms.loading),
+    waiting: Math.round(ms.waiting),
+    prepare: Math.round(ms.prepare),
+    prefill: Math.round(ms.prefill),
+    decode: Math.round(ms.decode),
+    running: Math.round(ms.running),
+  };
+}
+
+/** Rounded `now - prev`, taken on the rounded totals so the deltas of all samples sum to the rounded total. */
+function workDeltas(
+  now: WorkTotals,
+  prev: WorkTotals,
+): Pick<
+  RuntimeSampleRecord,
+  | 'loadingMs'
+  | 'waitingMs'
+  | 'prepareMs'
+  | 'prefillMs'
+  | 'decodeMs'
+  | 'runningMs'
+  | 'rateOutTokens'
+  | 'rateOutMs'
+  | 'ratePrefillTokens'
+  | 'ratePrefillMs'
+> {
+  const d = (a: number, b: number): number => Math.round(a) - Math.round(b);
+  return {
+    loadingMs: d(now.ms.loading, prev.ms.loading),
+    waitingMs: d(now.ms.waiting, prev.ms.waiting),
+    prepareMs: d(now.ms.prepare, prev.ms.prepare),
+    prefillMs: d(now.ms.prefill, prev.ms.prefill),
+    decodeMs: d(now.ms.decode, prev.ms.decode),
+    runningMs: d(now.ms.running, prev.ms.running),
+    rateOutTokens: d(now.outTokens, prev.outTokens),
+    rateOutMs: d(now.outMs, prev.outMs),
+    ratePrefillTokens: d(now.prefillTokens, prev.prefillTokens),
+    ratePrefillMs: d(now.prefillMs, prev.prefillMs),
+  };
 }
 
 function livePhase(value: unknown): RuntimeLiveTurn['phase'] {
@@ -344,16 +387,10 @@ interface TickSnapshot {
   counters: TurnCounters;
   inFlight: number;
   queued: number;
-  allPreDecode: boolean;
   mem?: { activeBytes: number; peakBytes: number; cacheBytes: number };
   rss?: number;
   rejected?: number;
   health?: SamplerHealth | null;
-}
-
-interface RatePoint {
-  ts: number;
-  tokens: number;
 }
 
 interface BindingView {
@@ -381,6 +418,8 @@ class Sampler implements RuntimeSampler {
   private busy = false;
   private busySince: number | null = null;
   private busyAccumMs = 0;
+  /** Busy since the last sample, also when no tick saw it: a burst between two ticks still gets its sample. */
+  private busySinceSample = false;
 
   private lastSampleAt: number | null = null;
   private lastSampleBusy = false;
@@ -390,6 +429,8 @@ class Sampler implements RuntimeSampler {
 
   /** One entry per load in flight; two loads of one model or one path keep their own entries. */
   private readonly loading = new Set<{ model: string; startedAt: number; path: string }>();
+  /** Loads that ended since the last ledger advance, which still folds their time. */
+  private readonly endedLoads: LoadSpan[] = [];
   private loads = 0;
   private readonly loaded = new Map<string, { loadedAt: number; loadMs: number }>();
 
@@ -400,7 +441,9 @@ class Sampler implements RuntimeSampler {
 
   private liveWrite: Promise<void> | null = null;
   private liveDirReady = false;
-  private rateWindow: RatePoint[] = [];
+  private readonly work: WorkLedger;
+  /** Ledger totals at the previous sample. */
+  private prevWork: WorkTotals;
 
   constructor(private readonly deps: RuntimeSamplerDeps) {
     this.now = deps.now ?? Date.now;
@@ -430,6 +473,8 @@ class Sampler implements RuntimeSampler {
       });
     this.prevCounters = turnCounters();
     this.prevRejected = queueRejections();
+    this.work = deps.work ?? WORK;
+    this.prevWork = this.work.totals();
   }
 
   start(): void {
@@ -504,6 +549,7 @@ class Sampler implements RuntimeSampler {
   }
 
   private noteBusy(now: number, busy: boolean): void {
+    if (busy) this.busySinceSample = true;
     if (busy && !this.busy) this.busySince = now;
     else if (!busy && this.busy && this.busySince !== null) {
       this.busyAccumMs += now - this.busySince;
@@ -563,25 +609,19 @@ class Sampler implements RuntimeSampler {
   private snapshotTick(views: BindingView[]): TickSnapshot {
     let inFlight = 0;
     let queued = 0;
-    let chatTurns = 0;
-    let decisionActive = 0;
-    let everyPreDecode = true;
     for (const view of views) {
-      if (view.entry.kind === 'decision') {
-        inFlight += view.active;
-        decisionActive += view.active;
-      } else {
-        inFlight += view.turns.length;
-        chatTurns += view.turns.length;
-        for (const turn of view.turns) {
-          const phase = turn.progress?.phase;
-          if (phase === undefined || !PRE_DECODE_PHASES.has(phase)) everyPreDecode = false;
-        }
-      }
+      inFlight += view.entry.kind === 'decision' ? view.active : view.turns.length;
       queued += view.queued;
     }
-    const allPreDecode = chatTurns > 0 && decisionActive === 0 && everyPreDecode;
-    return { counters: turnCounters(), inFlight, queued, allPreDecode };
+    return { counters: turnCounters(), inFlight, queued };
+  }
+
+  /** Fold the ledger up to `now`. The views were collected first: that read credits each live turn's progress. */
+  private advanceWork(now: number): WorkTotals {
+    const loads: LoadSpan[] = [...this.endedLoads];
+    for (const load of this.loading) loads.push({ startedAt: load.startedAt, endedAt: null });
+    this.endedLoads.length = 0;
+    return this.work.advance(now, loads);
   }
 
   private memOf(snap: TickSnapshot): { activeBytes: number; peakBytes: number; cacheBytes: number } {
@@ -610,59 +650,6 @@ class Sampler implements RuntimeSampler {
     return snap.health;
   }
 
-  /**
-   * Sliding-window decode throughput (tokens/s) over `RATE_WINDOW_MS`.
-   * Returns null when idle, while all in-flight turns are prefilling (no tokens
-   * advancing in the window), or before at least `RATE_MIN_DT_MS` has elapsed.
-   */
-  private sampleDecodeTps(now: number, inFlight: number, streamedTokens: number, allPreDecode: boolean): number | null {
-    if (inFlight <= 0) {
-      this.rateWindow.length = 0;
-      return null;
-    }
-    if (allPreDecode) {
-      // Every in-flight turn is pre-decode (queued/slot/prepare/prefill): drop any
-      // prior turn's decode samples and advance the baseline to now so prefill time
-      // neither leaks a finished turn's rate nor dilutes the next decode burst.
-      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
-      return null;
-    }
-    const len = this.rateWindow.length;
-    if (len === 0) {
-      this.rateWindow.push({ ts: now, tokens: streamedTokens });
-      return null;
-    }
-    const last = this.rateWindow[len - 1]!;
-    if (now < last.ts || streamedTokens < last.tokens) {
-      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
-      return null;
-    }
-    if (now === last.ts) {
-      last.tokens = streamedTokens;
-    } else {
-      this.rateWindow.push({ ts: now, tokens: streamedTokens });
-    }
-    const cutoff = now - RATE_WINDOW_MS;
-    while (this.rateWindow.length >= 2 && this.rateWindow[1]!.ts <= cutoff) {
-      this.rateWindow.shift();
-    }
-    if (this.rateWindow.length >= 2 && now - this.rateWindow[0]!.ts > RATE_WINDOW_MS * 2) {
-      this.rateWindow.shift();
-    }
-    const anchor = this.rateWindow[0]!;
-    const dTokens = streamedTokens - anchor.tokens;
-    if (dTokens <= 0) {
-      // Turns are in flight but no tokens advanced (e.g. prefill); move the
-      // baseline forward so prefill time does not dilute decode speed once tokens flow.
-      this.rateWindow = [{ ts: now, tokens: streamedTokens }];
-      return null;
-    }
-    const dt = now - anchor.ts;
-    if (dt < RATE_MIN_DT_MS) return null;
-    const rate = (dTokens * 1000) / dt;
-    return Number.isFinite(rate) && rate > 0 ? Math.round(rate * 100) / 100 : null;
-  }
-
   private tick(): void {
     if (this.stopped) return;
     let busy = this.busy;
@@ -673,17 +660,19 @@ class Sampler implements RuntimeSampler {
       busy = this.computeBusy(views);
       this.noteBusy(now, busy);
       const snap = this.snapshotTick(views);
-      const decodeTps = this.sampleDecodeTps(now, snap.inFlight, snap.counters.streamedTokens, snap.allPreDecode);
-      this.writeLive(now, views, busy, snap, decodeTps);
+      const work = this.advanceWork(now);
+      const rates = this.work.rates(now);
+      this.writeLive(now, views, busy, snap, work, rates);
       const residentKey = views.map((v) => this.modelKey(v.entry.model as object)).join(',');
       const interval = busy ? SAMPLE_BUSY_MS : SAMPLE_IDLE_MS;
       if (
         this.lastSampleAt === null ||
         now - this.lastSampleAt >= interval ||
         busy !== this.lastSampleBusy ||
+        (!busy && this.busySinceSample) ||
         residentKey !== this.lastResidentKey
       ) {
-        this.writeSample(now, views, busy, snap);
+        this.writeSample(now, views, busy, snap, work);
         this.lastResidentKey = residentKey;
       }
       this.snapshotSchedulers(now, views);
@@ -698,12 +687,7 @@ class Sampler implements RuntimeSampler {
     }
   }
 
-  private writeSample(
-    now: number,
-    views: BindingView[],
-    busy: boolean,
-    snap: TickSnapshot = this.snapshotTick(views),
-  ): void {
+  private writeSample(now: number, views: BindingView[], busy: boolean, snap: TickSnapshot, work: WorkTotals): void {
     const mem = this.memOf(snap);
     const counters = snap.counters;
     const rejected = this.rejectedOf(snap);
@@ -732,6 +716,7 @@ class Sampler implements RuntimeSampler {
       dCancelled: counters.cancelled - this.prevCounters.cancelled,
       dOutTokens: counters.outputTokens - this.prevCounters.outputTokens,
       dRejected: rejected - this.prevRejected,
+      ...workDeltas(work, this.prevWork),
     };
     const dropped = this.trace.takeDropped();
     if (dropped > 0) rec.dropped = dropped;
@@ -739,8 +724,10 @@ class Sampler implements RuntimeSampler {
     if (pipelines !== null) rec.pipelinesCreatedWhileServing = pipelines.createdServing;
     this.prevCounters = counters;
     this.prevRejected = rejected;
+    this.prevWork = work;
     this.lastSampleAt = now;
     this.lastSampleBusy = busy;
+    this.busySinceSample = busy;
     this.trace.append(rec);
   }
 
@@ -919,6 +906,8 @@ class Sampler implements RuntimeSampler {
         waitMs: roundedOrNull(p?.waitMs),
         slotMs: roundedOrNull(p?.slotMs),
         prepareMs: roundedOrNull(p?.prepareMs),
+        prefillElapsedMs: roundedOrNull(p?.prefillElapsedMs),
+        decodeElapsedMs: roundedOrNull(p?.decodeElapsedMs),
         promptTokens: cached !== null && prefillTotal !== null ? cached + prefillTotal : null,
         cachedTokens: cached,
         prefillTotal,
@@ -934,14 +923,15 @@ class Sampler implements RuntimeSampler {
     views: BindingView[],
     busy: boolean,
     snap: TickSnapshot,
-    decodeTps: number | null,
+    work: WorkTotals,
+    rates: WorkRates,
   ): RuntimeLiveFile {
     const mem = this.memOf(snap);
     const counters = snap.counters;
     const health = this.healthOf(snap);
     const models = views.map((view) => this.liveModel(view, now, busy));
     return {
-      v: 2,
+      v: 3,
       pid: process.pid,
       startedAt: this.startedAt,
       ts: now,
@@ -966,7 +956,8 @@ class Sampler implements RuntimeSampler {
         wiredLimit: this.wiredLimit,
         rss: this.rssOf(snap),
       },
-      decodeTps,
+      work: { ms: roundedWorkMs(work.ms) },
+      rates: { windowMs: rates.windowMs, outputTps: rates.outputTps, prefillTps: rates.prefillTps },
       loading: this.liveLoads(),
       counters: {
         ok: counters.ok,
@@ -1015,10 +1006,11 @@ class Sampler implements RuntimeSampler {
     views: BindingView[],
     busy: boolean,
     snap: TickSnapshot,
-    decodeTps: number | null,
+    work: WorkTotals,
+    rates: WorkRates,
   ): void {
     if (this.liveWrite !== null || !this.trace.enabled) return;
-    const body = JSON.stringify(this.buildLive(now, views, busy, snap, decodeTps));
+    const body = JSON.stringify(this.buildLive(now, views, busy, snap, work, rates));
     const path = this.livePath();
     const tmp = `${path}.tmp`;
     this.liveWrite = (async () => {
@@ -1065,6 +1057,7 @@ class Sampler implements RuntimeSampler {
       const end = this.now();
       const ms = Math.max(0, end - startedAt);
       this.loading.delete(entry);
+      if (!this.stopped) this.endedLoads.push({ startedAt, endedAt: end });
       this.loads += 1;
       if (ok) this.loaded.set(info.model, { loadedAt: end, loadMs: ms });
       if (!this.stopped) {
@@ -1100,7 +1093,8 @@ class Sampler implements RuntimeSampler {
         const views = this.collect();
         const busy = this.computeBusy(views);
         this.noteBusy(now, busy);
-        this.writeSample(now, views, busy);
+        const snap = this.snapshotTick(views);
+        this.writeSample(now, views, busy, snap, this.advanceWork(now));
       } catch {
         // The exit record still goes out.
       }

@@ -31,6 +31,8 @@ export interface DbWorkerBootstrap {
   chatAgentHome: string;
   /** `conversations.json`, the Work index. Read only here. */
   chatIndexPath: string;
+  /** `scratch-folders.json`, the folders Work without a folder made. Read only here. */
+  scratchFolders: string;
 }
 
 /**

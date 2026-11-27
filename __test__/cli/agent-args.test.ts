@@ -1291,17 +1291,17 @@ describe('run() argv routing', () => {
       }
     });
 
-    it('resolves the agent dir from GROK_HOME when no dir is passed', async () => {
+    it('resolves the agent dir from MLX_AGENT_HOME when no dir is passed', async () => {
       await withTempAgentDir('default = "model-b"\n', (agentDir) => {
-        const prev = process.env.GROK_HOME;
-        process.env.GROK_HOME = agentDir;
+        const prev = process.env.MLX_AGENT_HOME;
+        process.env.MLX_AGENT_HOME = agentDir;
         try {
           expect(readPersistedDefaultModel()).toEqual({ modelId: 'model-b' });
         } finally {
           if (prev === undefined) {
-            delete process.env.GROK_HOME;
+            delete process.env.MLX_AGENT_HOME;
           } else {
-            process.env.GROK_HOME = prev;
+            process.env.MLX_AGENT_HOME = prev;
           }
         }
       });

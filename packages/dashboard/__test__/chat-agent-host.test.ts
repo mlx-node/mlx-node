@@ -3,12 +3,27 @@
  * refusals that end a turn, crash and reopen, idle stop, stale restart, and a Work session.
  */
 
-import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it, vi } from 'vite-plus/test';
+import { afterEach, describe, expect, it, vi } from 'vite-plus/test';
 
+import { spawnAgent } from '../src/chat/acp/process.js';
 import { AgentHostError, launchFromProbe } from '../src/chat/agent/agent-host.js';
+import { LAUNCHD_PATH } from '../src/chat/agent/login-path.js';
 import { CHAT_CONFIG_TOML, CHAT_REQUIREMENTS_TOML, promptParams } from '../src/chat/agent/profiles.js';
 import type { AttachmentInput } from '../src/chat/attachment-rule.js';
 import { REDACTED } from '../src/chat/redact.js';
@@ -23,8 +38,13 @@ import {
   type Json,
 } from './helpers/chat-fake.js';
 import { gate } from './helpers/fake-engine.js';
+import { runView } from './helpers/run-views.js';
 
 const MODEL = 'qwen3.5-4b';
+/** The agent's own lines for a Stop of one workflow agent (mlx-agent v0.3.6, recorded). */
+const STOP_RECORD = JSON.parse(
+  readFileSync(fileURLToPath(new URL('./fixtures/workflow-agent-stop.json', import.meta.url)), 'utf8'),
+) as { lines: Array<{ params?: { update?: Json } }> };
 const FILE: AttachmentInput = { kind: 'file', name: 'notes.md', text: '# notes\n' };
 const PICTURE: AttachmentInput = { kind: 'image', mediaType: 'image/png', data: 'iVBORw0KGgoAAAANSUhEUg==' };
 
@@ -62,6 +82,21 @@ function permissionAnswers(fake: FakeHost): unknown[] {
     .map((m) => (m.result as Json).outcome);
 }
 
+/** The `MLX_WEB_LEDGER` path of every `session/new` and `session/load` the fake agent received, in order. */
+function ledgerPaths(fake: FakeHost): string[] {
+  return fake
+    .sent()
+    .filter((m) => m.method === 'session/new' || m.method === 'session/load')
+    .map((m) => {
+      const servers = (m.params as Json).mcpServers as Array<{ env: Array<{ name: string; value: string }> }>;
+      return servers[0]!.env.find((e) => e.name === 'MLX_WEB_LEDGER')!.value;
+    });
+}
+
+function ledgerFile(path: string): unknown {
+  return JSON.parse(readFileSync(path, 'utf8'));
+}
+
 function texts(fake: FakeHost): string {
   return fake.events.updates
     .map((u) => {
@@ -85,11 +120,15 @@ describe('launchFromProbe', () => {
     ).toEqual({
       failure: 'agent-too-old',
     });
-    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.4' })).toEqual({
+    // Mutation: the minimum left at v0.3.5 → Work starts an agent that has no `GROK_CLAUDE_PLUGINS_ENABLED`.
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.5' })).toEqual({
+      failure: 'agent-too-old',
+    });
+    expect(launchFromProbe({ source: 'managed', path: '/m', effectiveTag: 'mlx-agent-v0.3.6' })).toEqual({
       command: '/m',
       args: ['--disable-web-search', 'agent', '--no-leader', 'stdio'],
       source: 'managed',
-      tag: 'mlx-agent-v0.3.4',
+      tag: 'mlx-agent-v0.3.6',
       versionVerified: true,
     });
     expect(launchFromProbe({ source: 'env', path: '/e' })).toMatchObject({
@@ -113,6 +152,7 @@ describe('Chat host', () => {
           'DISABLE_TELEMETRY',
           'GROK_CLAUDE_HOOKS_ENABLED',
           'GROK_CLAUDE_MCPS_ENABLED',
+          'GROK_CLAUDE_PLUGINS_ENABLED',
           'GROK_CLAUDE_SKILLS_ENABLED',
           'GROK_CLI_CHAT_PROXY_BASE_URL',
           'GROK_CODEX_HOOKS_ENABLED',
@@ -126,6 +166,7 @@ describe('Chat host', () => {
           'GROK_HOME',
           'GROK_IMAGE_EDIT',
           'GROK_IMAGE_GEN',
+          'GROK_LOOPBACK_CONNECT_MAX_ATTEMPTS',
           'GROK_MODELS_BASE_URL',
           'GROK_SESSION_SEARCH',
           'GROK_TELEMETRY_ENABLED',
@@ -158,6 +199,26 @@ describe('Chat host', () => {
       expect(fake.events.updates.some((u) => u.line.update.sessionUpdate === 'model_changed')).toBe(false);
       expect(fake.events.turns.map((t) => t.turn?.phase ?? null)).toEqual(['starting', 'running', null]);
     });
+  });
+
+  // Mutation: the login PATH awaited or applied in both modes → the Chat start hangs on the pending one, or its sealed
+  // PATH changes.
+  it('never waits for the login PATH and keeps its sealed PATH', async () => {
+    const envs: Array<Record<string, string>> = [];
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        expect((await turn(fake, 'hello there')).result.outcome).toBe('completed');
+        expect(envs.map((env) => env.PATH)).toEqual([LAUNCHD_PATH]);
+      },
+      {
+        loginPath: new Promise<string | null>(() => {}),
+        spawn: (command) => {
+          envs.push(command.env);
+          return spawnAgent(command);
+        },
+      },
+    );
   });
 
   it('writes the deny-rule files and removes the search index and prompt history before the spawn', async () => {
@@ -220,16 +281,85 @@ describe('Chat host', () => {
     });
   });
 
-  it('chat-fetch-unlisted-url: rejected, the turn ends address-refused', async () => {
+  it('chat-fetch-unlisted-url: approved; the blocked error of the server goes to the model and the turn goes on', async () => {
     await withFake('chat-fetch-unlisted-url', async (fake) => {
-      const { result } = await turn(fake, 'what is new in rust');
-      expect(result.outcome).toBe('address-refused');
+      const { id, result } = await turn(fake, 'what is new in rust');
+      expect(result.outcome).toBe('completed');
       expect(permissionAnswers(fake)).toEqual([
         { outcome: 'selected', optionId: 'allow-once' },
-        { outcome: 'selected', optionId: 'reject-once' },
+        { outcome: 'selected', optionId: 'allow-once' },
       ]);
-      expect(texts(fake)).not.toContain('never sent');
+      expect(texts(fake)).toContain('FCHK-AFTER-BLOCKED');
+      const [path] = ledgerPaths(fake);
+      expect(path!.startsWith(`${fake.paths.webLedger}/`)).toBe(true);
+      expect(statSync(path!).mode & 0o777).toBe(0o600);
+      expect(ledgerFile(path!)).toEqual([
+        'https://blog.rust-lang.org/2026/11/01/Rust-1.99.0.html',
+        'https://releases.rs',
+      ]);
+      expect(fake.host.ledger(id)?.has('https://attacker.example/?d=secret-conversation')).toBe(false);
     });
+  });
+
+  it('a link in the text of a page read joins the ledger and its file; the file goes with the session', async () => {
+    const LINK = 'https://thinkingmachines.ai/news/inkling-2-mini/';
+    await withFake(
+      'chat-fetch-listed-url',
+      async (fake) => {
+        const { id, result } = await turn(fake, 'Read https://example.com/docs/ and the rust releases.');
+        expect(result.outcome).toBe('completed');
+        expect(fake.host.ledger(id)?.has(LINK)).toBe(true);
+        const [path] = ledgerPaths(fake);
+        expect(ledgerFile(path!)).toEqual([
+          'https://example.com/docs',
+          'https://thinkingmachines.ai/news/inkling-2-mini/).',
+          'https://thinkingmachines.ai/news/inkling-2-mini',
+          'https://blog.rust-lang.org/2026/11/01/Rust-1.99.0.html',
+          'https://releases.rs',
+        ]);
+        expect(readdirSync(fake.paths.webLedger)).toEqual([path!.slice(fake.paths.webLedger.length + 1)]);
+        await fake.host.deleteSession(id, realpathSync(fake.paths.chatWorkspace));
+        expect(existsSync(path!)).toBe(false);
+      },
+      {
+        mutate: (s) => {
+          const steps = (s.prompts as Json[])[0]!.steps as Json[];
+          (steps[0]!.onAllow as Json).okayOutput =
+            `WEB_PAGE provider=exa url=https://example.com/docs/\ntitle: canned\n\nThe official report: [Inkling 2 mini](${LINK}).`;
+        },
+      },
+    );
+  });
+
+  it('a ledger write that failed is written again before the next web_fetch is approved', async () => {
+    await withFake(
+      'chat-fetch-listed-url',
+      async (fake) => {
+        const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+        const [path] = ledgerPaths(fake);
+        expect(ledgerFile(path!)).toEqual([]);
+        chmodSync(fake.paths.webLedger, 0o500);
+        let started: ReturnType<typeof fake.host.startTurn>;
+        try {
+          started = fake.host.startTurn(sessionId, 'Read https://example.com/docs/', { modelId: MODEL });
+          await until(() => fake.sent().some((m) => m.method === 'session/prompt'));
+          expect(ledgerFile(path!)).toEqual([]);
+        } finally {
+          chmodSync(fake.paths.webLedger, 0o700);
+        }
+        expect((await started.done).outcome).toBe('completed');
+        expect(permissionAnswers(fake)).toEqual([{ outcome: 'selected', optionId: 'allow-once' }]);
+        expect(ledgerFile(path!)).toEqual(['https://example.com/docs']);
+      },
+      {
+        mutate: (s) => {
+          const prompt = (s.prompts as Json[])[0]!;
+          const steps = prompt.steps as Json[];
+          (steps[0]!.onAllow as Json).okayOutput = 'not a web result';
+          prompt.steps = [{ sleepMs: 200 }, steps[0]!, ...steps.slice(3)];
+        },
+      },
+    );
   });
 
   it('chat-web-bad-input: an input text no reader can make an object of is approved; the tool error goes to the model', async () => {
@@ -262,17 +392,16 @@ describe('Chat host', () => {
     });
   });
 
-  it('chat-web-bad-input: a clean input text is checked against the ledger with the address the tool receives', async () => {
+  it('chat-web-bad-input: a clean input text is approved whatever its address; the server checks it', async () => {
     await withFake('chat-web-bad-input', async (fake) => {
       const { id, result } = await turn(fake, 'clean read stranger');
-      expect(result.outcome).toBe('address-refused');
+      expect(result.outcome).toBe('completed');
       const listed = await turn(fake, 'clean read listed https://example.com/docs/', id);
       expect(listed.result.outcome).toBe('completed');
-      expect(permissionAnswers(fake)).toEqual([
-        { outcome: 'selected', optionId: 'reject-once' },
-        { outcome: 'selected', optionId: 'allow-once' },
-      ]);
+      expect(permissionAnswers(fake)).toEqual(Array(2).fill({ outcome: 'selected', optionId: 'allow-once' }));
+      expect(texts(fake)).toContain('FCHK-AFTER-STRANGER');
       expect(texts(fake)).toContain('FCHK-AFTER-LISTED');
+      expect(ledgerFile(ledgerPaths(fake)[0]!)).toEqual(['https://example.com/docs']);
     });
   });
 
@@ -409,15 +538,46 @@ describe('Chat host', () => {
     );
   });
 
-  it('seeds the ledger of a cold conversation from its disk entries', async () => {
+  it('seeds the ledger of a cold conversation from its disk entries, page links too, and sweeps stale files', async () => {
     await withFake('chat-fetch-listed-url', async (fake) => {
+      mkdirSync(fake.paths.webLedger, { recursive: true });
+      writeFileSync(join(fake.paths.webLedger, 'stale.json'), '["https://old.example"]');
       const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+      expect(existsSync(join(fake.paths.webLedger, 'stale.json'))).toBe(false);
       await fake.host.restart();
+      const page = 'WEB_PAGE provider=exa url=https://example.com/docs\ntitle: t\n\nsee https://linked.example/report.';
+      const search = 'WEB_SEARCH provider=exa results=1\n[1] T https://title.example\nhttps://found.example/a\nsnippet';
       const started = fake.host.startTurn(sessionId, 'again', {
         modelId: MODEL,
-        entries: [{ kind: 'user', ts: 1, text: 'see https://example.com/docs', promptIndex: 0 }],
+        entries: [
+          { kind: 'user', ts: 1, text: 'see https://example.com/docs', promptIndex: 0 },
+          { kind: 'tool', ts: 2, id: 't1', name: 'mlx_web__web_fetch', title: 'f', status: 'completed', output: page },
+          { kind: 'tool', ts: 3, id: 't2', name: 'use_tool', title: 's', status: 'completed', output: search },
+          {
+            kind: 'tool',
+            ts: 4,
+            id: 't3',
+            name: 'other',
+            title: 'o',
+            status: 'completed',
+            output: page.replace('linked', 'other'),
+          },
+        ],
       });
       expect((await started.done).outcome).toBe('completed');
+      const paths = ledgerPaths(fake);
+      expect(paths).toHaveLength(2);
+      expect(paths[1]).toBe(paths[0]);
+      expect(ledgerFile(paths[0]!)).toEqual([
+        'https://example.com/docs',
+        'https://linked.example/report.',
+        'https://linked.example/report',
+        'https://found.example/a',
+        'https://blog.rust-lang.org/2026/11/01/Rust-1.99.0.html',
+        'https://releases.rs',
+      ]);
+      await fake.host.close();
+      expect(existsSync(paths[0]!)).toBe(false);
     });
   });
 
@@ -828,6 +988,9 @@ describe('Work host', () => {
           expect.arrayContaining(['GROK_HOME', 'HOME', 'PATH', 'XAI_API_KEY', 'GROK_RESUME_COMMAND']),
         );
         expect(start.envNames).not.toContain('ELECTRON_RUN_AS_NODE');
+        // Mutation: the process started in the user's home again (its `.grok` is grok-build's) → red.
+        expect(realpathSync(start.cwd as string)).toBe(realpathSync(fake.paths.workProcess));
+        expect(readdirSync(fake.paths.workProcess)).toEqual([]);
         const started = fake.host.startTurn(created.sessionId, 'list files', { modelId: MODEL, cwd: fake.project });
         await until(() => fake.events.interactions.length === 1);
         const { interaction } = fake.events.interactions[0]!;
@@ -843,6 +1006,58 @@ describe('Work host', () => {
         expect(fake.events.closed).toEqual([{ sessionId: created.sessionId, id: interaction.id, reason: 'answered' }]);
       },
       work,
+    );
+  });
+
+  // Mutations: the login PATH not awaited (the agent starts with launchd's PATH, so a hook's `node` is not found), or
+  // put after the inherited entries.
+  it('waits for the pending login PATH and starts the agent with its entries first', async () => {
+    let answer: (path: string | null) => void = () => {};
+    const loginPath = new Promise<string | null>((resolve) => {
+      answer = resolve;
+    });
+    const envs: Array<Record<string, string>> = [];
+    await withFake(
+      'work-plan',
+      async (fake) => {
+        const created = fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+        await new Promise((resolve) => setTimeout(resolve, 100));
+        expect(envs).toEqual([]);
+        answer('/Users/dev/.vite-plus/bin:/usr/bin:/opt/homebrew/bin');
+        await created;
+        expect(envs.map((env) => env.PATH)).toEqual([
+          `/Users/dev/.vite-plus/bin:/usr/bin:/opt/homebrew/bin:/bin:/usr/sbin:/sbin`,
+        ]);
+      },
+      {
+        ...work,
+        env: { PATH: LAUNCHD_PATH },
+        loginPath,
+        spawn: (command) => {
+          envs.push(command.env);
+          return spawnAgent(command);
+        },
+      },
+    );
+  });
+
+  it('a login PATH that failed leaves the inherited PATH as it is', async () => {
+    const envs: Array<Record<string, string>> = [];
+    await withFake(
+      'work-plan',
+      async (fake) => {
+        await fake.host.createSession({ modelId: MODEL, cwd: fake.project });
+        expect(envs.map((env) => env.PATH)).toEqual([LAUNCHD_PATH]);
+      },
+      {
+        ...work,
+        env: { PATH: LAUNCHD_PATH },
+        loginPath: Promise.resolve(null),
+        spawn: (command) => {
+          envs.push(command.env);
+          return spawnAgent(command);
+        },
+      },
     );
   });
 
@@ -978,7 +1193,7 @@ describe('Work host: the length stop', () => {
         const started = fake.host.startTurn(id, 'fix it', { modelId: MODEL, cwd: fake.project }, [FILE]);
         expect(await started.done).toMatchObject({ outcome: 'completed', continues: 1 });
         expect(prompts(fake).map((m) => m.params)).toEqual([
-          promptParams(id, 'fix it', [FILE]),
+          promptParams(id, 'fix it', [FILE], { mode: 'agent' }),
           { sessionId: id, prompt: [{ type: 'text', text: CONTINUE_PROMPT }] },
         ]);
       },
@@ -1313,6 +1528,978 @@ describe('compaction state', () => {
         expect(order).toEqual(['compaction start', 'compaction end', 'cold', 'turn end']);
       },
       { mutate: compacting({ outcome: 'none' }, [{ exit: 9 }]) },
+    );
+  }, 20_000);
+});
+
+describe('model_auto_switched (#16): taken by the host, carried on the turn end', () => {
+  const BLOCKED = 'Model "qwen3.5-4b" is not on the allowed list of this agent.';
+  const switches = (fake: FakeHost) =>
+    fake.events.updates.filter((u) => u.line.update.sessionUpdate === 'model_auto_switched');
+  const prompts = (fake: FakeHost) => fake.sent().filter((m) => m.method === 'session/prompt');
+
+  // Mutation: drop `turn.recorded = 'no-model'` → the blocked prompt ends `completed` with no line.
+  it('a blocked prompt (both ids empty) ends no-model; the reason rides the end with null ids; no update', async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { id, turnId, result } = await turn(fake, 'nomodel here');
+        expect(result).toEqual({
+          turnId,
+          outcome: 'no-model',
+          model: { previous: null, next: null, reason: BLOCKED },
+        });
+        expect(fake.events.ends).toEqual([{ sessionId: id, result }]);
+        expect(switches(fake)).toEqual([]);
+        // The next prompt runs as before.
+        expect((await turn(fake, 'hi', id)).result).toEqual({ turnId: expect.any(String), outcome: 'completed' });
+      },
+      {
+        mutate: (scenario) => {
+          scenario.prompts = [{ match: 'nomodel', noModel: BLOCKED, steps: [] }, ...(scenario.prompts as Json[])];
+        },
+      },
+    );
+  });
+
+  it('the reason is cut at 300 characters', async () => {
+    const long = `${'r'.repeat(320)}`;
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { result } = await turn(fake, 'nomodel here');
+        expect(result.model?.reason).toBe(`${'r'.repeat(300)}…`);
+      },
+      {
+        mutate: (scenario) => {
+          scenario.prompts = [{ match: 'nomodel', noModel: long, steps: [] }, ...(scenario.prompts as Json[])];
+        },
+      },
+    );
+  });
+
+  it('one for a session the host does not know is dropped; model_changed still passes', async () => {
+    await withFake(
+      'model-switch-in-turn',
+      async (fake) => {
+        const { result } = await turn(fake, 'switch');
+        expect(result).toEqual({ turnId: expect.any(String), outcome: 'completed' });
+        expect(switches(fake)).toEqual([]);
+        const changed = fake.events.updates.filter((u) => u.line.update.sessionUpdate === 'model_changed');
+        expect(changed.map((u) => u.line.update.model_id)).toEqual(['qwen3.5-9b']);
+      },
+      {
+        mutate: (scenario) => {
+          const script = (scenario.prompts as Json[])[0]!;
+          script.steps = [
+            {
+              notify: {
+                method: '_x.ai/session_notification',
+                params: {
+                  sessionId: '01a20000-0000-7000-8000-00000000dead',
+                  update: {
+                    sessionUpdate: 'model_auto_switched',
+                    previous_model_id: '',
+                    new_model_id: '',
+                    reason: 'x',
+                  },
+                },
+              },
+            },
+            ...(script.steps as Json[]),
+          ];
+        },
+      },
+    );
+  });
+
+  it('a load whose stored model is gone with no fallback ends no-model unsent; later prompts stay blocked', async () => {
+    const gone = 'Model "qwen3.5-4b" is no longer available. Please start a new session.';
+    await withFake(
+      'new-and-load-model-changed',
+      async (fake) => {
+        const { id } = await turn(fake, 'first');
+        await until(() => fake.events.cold.length > 0);
+        const second = fake.host.startTurn(id, 'second', { modelId: MODEL });
+        expect(await second.done).toEqual({
+          turnId: second.turnId,
+          outcome: 'no-model',
+          unsent: true,
+          model: { previous: MODEL, next: null, reason: gone },
+        });
+        expect(prompts(fake)).toHaveLength(1);
+        const third = await turn(fake, 'third', id);
+        expect(third.result).toMatchObject({ outcome: 'no-model', model: { previous: null, next: null } });
+        expect(switches(fake)).toEqual([]);
+      },
+      {
+        timings: { idleStopMs: 50 },
+        mutate: (scenario) => {
+          (scenario.session as Json).modelGoneOnLoad = { reason: gone };
+        },
+      },
+    );
+  });
+
+  it('a load the agent moved to another model is refused as before, with what it wanted on the end', async () => {
+    const swapped = 'Model "qwen3.5-4b" is no longer available for your account.';
+    await withFake(
+      'new-and-load-model-changed',
+      async (fake) => {
+        const { id } = await turn(fake, 'first');
+        await until(() => fake.events.cold.length > 0);
+        const second = fake.host.startTurn(id, 'second', { modelId: MODEL });
+        expect(await second.done).toMatchObject({
+          outcome: 'refused',
+          failure: { code: 'model-unavailable' },
+          unsent: true,
+          model: { previous: MODEL, next: 'qwen3.5-9b', reason: swapped },
+        });
+        expect(prompts(fake)).toHaveLength(1);
+      },
+      {
+        timings: { idleStopMs: 50 },
+        mutate: (scenario) => {
+          (scenario.session as Json).modelGoneOnLoad = { next: 'qwen3.5-9b', reason: swapped };
+        },
+      },
+    );
+  });
+});
+
+describe('hook_run_started (#11): taken by the host, ended by its batch, the next words, the turn end or the exit', () => {
+  const STOP = { event_name: 'stop', prompt_id: true, count: 2 };
+  const LINT_FAILED = {
+    event_name: 'stop',
+    prompt_id: true,
+    runs: [
+      { name: 'global/lint:stop[0].hooks[0]', status: { status: 'failed', error: 'exit code 1', elapsed_ms: 900 } },
+    ],
+  };
+  const hooking =
+    (steps: Json[]) =>
+    (scenario: Json): void => {
+      scenario.prompts = [{ match: '', steps }];
+    };
+  const hookOrder = (fake: FakeHost) =>
+    fake.events.timeline.filter(
+      (k) => k === 'hook start' || k === 'hook end' || k === 'turn end' || k === 'cold' || k.startsWith('compaction'),
+    );
+  const started = (fake: FakeHost) =>
+    fake.events.updates.filter((u) => u.line.update.sessionUpdate === 'hook_run_started');
+
+  // Mutation: pass `hook_run_started` on (no `return`) → the update list holds it. Ignore the prompt id in
+  // `hookRunEnds` → the other turn's line ends it.
+  it("sets the state and never reaches the reducer; another turn's batch keeps it; its own hook_execution ends it", async () => {
+    const gateFile = join(realpathSync(process.env.TMPDIR ?? '/tmp'), `th5-hook-${process.pid}-${Date.now()}`);
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { sessionId } = await fake.host.createSession({ modelId: MODEL });
+        const run = fake.host.startTurn(sessionId, 'go', { modelId: MODEL });
+        await until(() => fake.host.hookRun(sessionId) !== null, 5_000);
+        expect(fake.host.hookRun(sessionId)).toEqual({ event: 'stop', count: 2, startedAt: expect.any(Number) });
+        expect(fake.events.hookRuns).toEqual([
+          { sessionId, hookRun: { event: 'stop', count: 2, startedAt: expect.any(Number) } },
+        ]);
+        writeFileSync(gateFile, '');
+        expect((await run.done).outcome).toBe('completed');
+        expect(fake.host.hookRun(sessionId)).toBeNull();
+        expect(started(fake)).toEqual([]);
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'turn end']);
+        const executions = fake.events.timeline.flatMap((k, i) => (k === 'hook_execution' ? [i] : []));
+        expect(executions).toHaveLength(2);
+        expect(fake.events.timeline.indexOf('hook end')).toBe(executions[1]! - 1);
+      },
+      {
+        mutate: hooking([
+          { text: 'Done.', chunk: 5 },
+          { hookStarted: STOP },
+          {
+            hook: {
+              event_name: 'stop',
+              prompt_id: 'an-earlier-turn',
+              runs: [{ name: 'global/lint:stop[0].hooks[0]', status: { status: 'success', elapsed_ms: 30 } }],
+            },
+          },
+          { holdOn: gateFile },
+          { hook: LINT_FAILED },
+          { end: { stopReason: 'end_turn' } },
+        ]),
+      },
+    ).finally(() => rmSync(gateFile, { force: true }));
+  }, 20_000);
+
+  it('the tool hook carries its tool; another batch, a tool line and a chunk stamped before it keep it; a later chunk ends it', async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { id, result } = await turn(fake, 'go');
+        expect(result.outcome).toBe('completed');
+        expect(fake.events.hookRuns.map((h) => h.hookRun)).toEqual([
+          { event: 'pre_tool_use', tool: 'run_terminal_command', count: 1, startedAt: expect.any(Number) },
+          null,
+        ]);
+        const kinds = fake.events.timeline.filter((k) => k !== 'session_info_update');
+        const start = kinds.indexOf('hook start');
+        expect(kinds.slice(start, kinds.indexOf('hook end') + 2)).toEqual([
+          'hook start',
+          'hook_execution',
+          'tool_call',
+          'tool_call_update',
+          'agent_message_chunk',
+          'hook end',
+          'agent_message_chunk',
+        ]);
+        expect(fake.host.hookRun(id)).toBeNull();
+      },
+      {
+        mutate: hooking([
+          { hookStarted: { event_name: 'pre_tool_use', tool_name: 'run_terminal_command' } },
+          {
+            hook: {
+              event_name: 'pre_tool_use',
+              tool_name: 'read_file',
+              runs: [{ name: 'global/audit:pre_tool_use[0].hooks[0]', status: { status: 'success', elapsed_ms: 12 } }],
+            },
+          },
+          { tool: { toolName: 'read_file', rawInput: { path: 'a.txt' }, output: 'a' } },
+          {
+            notify: {
+              method: 'session/update',
+              params: {
+                update: { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'made before. ' } },
+                _meta: { agentTimestampMs: 1 },
+              },
+            },
+          },
+          { sleepMs: 20 },
+          { text: 'Now.', chunk: 4 },
+          { end: { stopReason: 'end_turn' } },
+        ]),
+      },
+    );
+  }, 20_000);
+
+  it("the turn's end line ends a batch with no outcome; so does a compaction start", async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        await turn(fake, 'go');
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'turn end']);
+        const end = fake.events.timeline.indexOf('hook end');
+        expect(fake.events.timeline[end + 1]).toBe('turn_completed');
+      },
+      { mutate: hooking([{ hookStarted: STOP }, { turnCompleted: {} }, { end: { stopReason: 'end_turn' } }]) },
+    );
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        await turn(fake, 'go');
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'compaction start', 'compaction end', 'turn end']);
+      },
+      {
+        mutate: hooking([
+          { hookStarted: { event_name: 'pre_compact', count: 1 } },
+          { compact: { ms: 50 } },
+          { end: { stopReason: 'end_turn' } },
+        ]),
+      },
+    );
+  }, 20_000);
+
+  it("the agent's exit ends it before the turn ends; the reply ends one the agent never closed", async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { result } = await turn(fake, 'go');
+        expect(result.outcome).toBe('agent-crashed');
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'cold', 'turn end']);
+      },
+      { mutate: hooking([{ hookStarted: STOP }, { exit: 9 }]) },
+    );
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { id } = await turn(fake, 'go');
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'turn end']);
+        expect(fake.host.hookRun(id)).toBeNull();
+      },
+      { mutate: hooking([{ hookStarted: STOP }, { end: { stopReason: 'end_turn' } }]) },
+    );
+  }, 20_000);
+
+  // Mutation: drop the `HookDenied` branch of `turnOutcome` → the turn ends `interrupted`.
+  it('a prompt a hook blocked ends hook-stopped; its hook lines and the stored end go to the reducer', async () => {
+    await withFake(
+      'chat-basic',
+      async (fake) => {
+        const { id, result } = await turn(fake, 'deploy to prod');
+        expect(result).toEqual({ turnId: expect.any(String), outcome: 'hook-stopped' });
+        const lines = fake.events.updates.filter((u) => u.sessionId === id).map((u) => u.line);
+        expect(lines.map((l) => l.update.sessionUpdate)).toEqual([
+          'hook_execution',
+          'hook_annotation',
+          'turn_completed',
+        ]);
+        expect(lines[2]!.meta).toMatchObject({ cancellationCategory: 'HookDenied' });
+        expect(hookOrder(fake)).toEqual(['hook start', 'hook end', 'turn end']);
+        // A plain agent cancel with no category stays interrupted.
+        expect((await turn(fake, 'agent-stop', id)).result.outcome).not.toBe('hook-stopped');
+      },
+      {
+        mutate: (scenario) => {
+          scenario.prompts = [
+            {
+              match: 'deploy',
+              promptBlocked: { hook: 'global/policy:user_prompt_submit[0].hooks[0]', reason: 'no deploys on Friday' },
+              steps: [],
+            },
+            ...(scenario.prompts as Json[]),
+          ];
+        },
+      },
+    );
+  }, 20_000);
+});
+
+describe('Work host: workflow runs that left active', () => {
+  const dirs: string[] = [];
+  afterEach(() => {
+    for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  /** Paths in a fresh folder; the fake agent waits for each to exist. */
+  function gateFiles() {
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-wf-ended-'));
+    dirs.push(dir);
+    const at = (name: string) => join(dir, name);
+    return { child: at('child'), complete: at('complete'), drain: at('drain'), wakeOn: at('wake'), wakeEnd: at('end') };
+  }
+
+  /** A Work host on `work-workflow-run` with the run's options merged in; `more` adds prompts after the first. */
+  function work(
+    run: Json,
+    more: Json[] = [],
+    extra: Parameters<typeof fakeHost>[1] = {},
+  ): Parameters<typeof fakeHost>[1] {
+    return {
+      mode: 'work',
+      providers: noProviders(),
+      ...extra,
+      mutate: (scenario) => {
+        const prompts = scenario.prompts as Json[];
+        const steps = prompts[0]!.steps as Json[];
+        steps[1] = { workflow: { ...(steps[1]!.workflow as Json), ...run } };
+        scenario.prompts = [{ ...prompts[0], match: 'p1' }, ...more];
+      },
+    };
+  }
+
+  /** The main agent's turn `p2`: its `workflow` call pauses or stops the run, then the turn ends. */
+  function control(call: Json, end: Json = {}): Json {
+    return { match: 'p2', steps: [{ runControl: call }, { end: { stopReason: 'end_turn', ...end } }] };
+  }
+
+  async function session(fake: FakeHost): Promise<string> {
+    return (await fake.host.createSession({ modelId: MODEL, cwd: fake.project })).sessionId;
+  }
+
+  function start(fake: FakeHost, id: string, text: string) {
+    return fake.host.startTurn(id, text, { modelId: MODEL, cwd: fake.project });
+  }
+
+  /** Turn p1 to its end with the `workflow` start allowed; the run is live after it. */
+  async function startRun(fake: FakeHost, id: string): Promise<void> {
+    const turn = start(fake, id, 'p1');
+    await until(() => fake.events.interactions.length === 1);
+    fake.host.answer(id, fake.events.interactions[0]!.interaction.id, 'allow-once');
+    expect((await turn.done).outcome).toBe('completed');
+    expect(fake.host.runs(id)).toEqual([runView('wf_1')]);
+  }
+
+  const first = (fake: FakeHost, id: string) => fake.host.runs(id)[0];
+
+  // Mutation: keep a run that left `active` in `session.runs` → its late ask opens a card, and it still reads live.
+  it('a run that ends moves to the ended list; a late ask of it opens no card', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.records().some((r) => r.kind === 'child-answer'));
+        // No wake turn comes in this scenario: the run's wake stays due.
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'complete', wakeDue: true })]);
+        expect(fake.records().find((r) => r.kind === 'child-answer')?.answer).toBeNull();
+        expect(fake.events.interactions).toHaveLength(1);
+        expect(fake.host.modeState().background).toBe(0);
+      },
+      work({ completeOn: g.complete, askAfterEnd: true, wake: false }),
+    );
+  }, 20_000);
+
+  // Mutation: count only live runs in the idle hold → the idle stop ends the process under a paused run, which no
+  // later process can resume.
+  it("a run its script paused holds the idle stop until the main agent's stop of it; a failed run holds nothing", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => first(fake, id)?.live === false);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'user_paused', waiting: true })]);
+        await sleep(800);
+        expect(fake.host.modeState().state).toBe('ready');
+        expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'cancelled', by: 'main-agent' })]);
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        expect(fake.events.turns.some((t) => t.turn?.origin === 'wake')).toBe(false);
+      },
+      work({ ask: false, completeOn: g.complete, status: 'user_paused' }, [control({ verb: 'stop' })], {
+        timings: { idleStopMs: 300 },
+      }),
+    );
+    const failed = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(failed.complete, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'failed' })]);
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+      },
+      work({ ask: false, completeOn: failed.complete, status: 'failed', wakeEndAfterMs: 0 }, [], {
+        timings: { idleStopMs: 300 },
+      }),
+    );
+  }, 30_000);
+
+  // Mutation: drop `emitRuns` when the wake starts → the page's run still says its wake is due, so the block says
+  // "Writing up the result" after the wake row came.
+  it("a run's end makes its wake due on its view; the wake's start clears it and tells the page", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.sessionId === id && t.turn?.origin === 'wake'));
+        const sent = fake.events.runs.filter((e) => e.sessionId === id).map((e) => e.runs[0]);
+        expect(sent.some((run) => run?.status === 'complete' && run.wakeDue)).toBe(true);
+        expect(sent.at(-1)).toEqual(runView('wf_1', { live: false, status: 'complete' }));
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'complete' })]);
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+      },
+      work({ completeOn: g.complete, ask: false, wakeEndOn: g.wakeEnd }),
+    );
+  }, 20_000);
+
+  // Mutation: make a wake due for the main agent's own stop (`wakeAfter('cancelled', false)`) → the wake stays due,
+  // and the next wake, which names no run, is titled as this run.
+  it("the main agent's own stop of a run makes no wake due; the next wake is not titled as the run", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+        expect(fake.host.wakeDue(id)).toBe(false);
+        await until(() => first(fake, id)?.live === false);
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'cancelled', by: 'main-agent' });
+        const hidden = () =>
+          fake.events.updates.filter((u) => u.sessionId === id && u.line.update.sessionUpdate === 'user_message_chunk');
+        writeFileSync(g.wakeOn, '');
+        await until(() => hidden().length === 1);
+        expect(hidden()[0]!.line.update._meta).toEqual({ hideFromScrollback: true });
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.events.ends.length === 3, 5_000);
+      },
+      work({ childOn: g.child }, [control({ verb: 'stop' }, { wake: { startOn: g.wakeOn, endOn: g.wakeEnd } })]),
+    );
+  }, 20_000);
+
+  // Mutation: drop the clear at the call's end → the wake the run's update made due stays, though none comes.
+  it('a stop whose input comes only with its end clears the wake its update made due, and names the main agent', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+        expect(fake.host.wakeDue(id)).toBe(false);
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'cancelled', by: 'main-agent' });
+      },
+      work({ childOn: g.child }, [control({ verb: 'stop', key: 'wf_1', inputLate: true })]),
+    );
+  }, 20_000);
+
+  // Mutation: drop the typed `/workflow` rule → the person's own stop reads as no one's.
+  it('a typed /workflow stop names you, and its wake stays due: the agent wakes for it', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, '/workflow stop deep-research').done).outcome).toBe('completed');
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'cancelled', by: 'you', stopping: false });
+        expect(fake.host.wakeDue(id)).toBe(true);
+      },
+      work({ childOn: g.child, wake: false }),
+    );
+  }, 20_000);
+
+  // Mutation: drop the rule for a stop of a run that waits → its wake reads due for good: the run's watcher ended with
+  // its helpers, and the agent's stop from there sends only the update.
+  it('a typed /workflow stop of a paused run whose helpers ended makes no wake due', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, '/workflow pause deep-research').done).outcome).toBe('completed');
+        await until(() =>
+          fake.events.updates.some((u) => u.sessionId === id && u.line.update.sessionUpdate === 'subagent_finished'),
+        );
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'user_paused', by: 'you' });
+        expect((await start(fake, id, '/workflow stop deep-research').done).outcome).toBe('completed');
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'cancelled', by: 'you', wakeDue: false });
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ childOn: g.child }),
+    );
+  }, 20_000);
+
+  // Mutation: make no wake due for every stop of a run that waits → a stop during a pause's drain reads no wake, though
+  // the run's watcher reports it once the helpers end.
+  it("a typed /workflow stop during a pause's drain keeps its wake; the agent sends it once the helpers end", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, '/workflow pause deep-research').done).outcome).toBe('completed');
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'user_paused', by: 'you' });
+        expect((await start(fake, id, '/workflow stop deep-research').done).outcome).toBe('completed');
+        expect(first(fake, id)).toMatchObject({ live: false, status: 'cancelled', by: 'you', wakeDue: true });
+        writeFileSync(g.drain, '');
+        await until(() => fake.events.turns.some((t) => t.sessionId === id && t.turn?.origin === 'wake'));
+        expect(first(fake, id)?.wakeDue).toBe(false);
+        const ended = fake.events.ends.length;
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.events.ends.length === ended + 1, 5_000);
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ childOn: g.child, pauseDrainOn: g.drain, wakeEndOn: g.wakeEnd }),
+    );
+  }, 20_000);
+
+  // Mutation: send the cancel with the id the press named (the first attempt's) → the agent answers already_finished:
+  // the Stop reads not-live and the retry runs on.
+  it('Stop on a retried agent reaches its newest attempt: it ends stopped by you, and the run goes on (T41)', async () => {
+    const g = gateFiles();
+    const FIRST = 'run-agent-1';
+    const RETRY = `${FIRST}-retry`;
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(fake.host.liveActivity(id).agents).toEqual([
+          { childId: RETRY, run: 'wf_1', attempts: [FIRST, RETRY], stopping: false, messages: 'no-address' },
+        ]);
+        expect(await fake.host.stopSubagent(id, FIRST)).toBe('stopped');
+        const cancels = fake.sent().filter((m) => m.method === '_x.ai/subagent/cancel');
+        expect(cancels.map((m) => m.params)).toEqual([{ subagentId: RETRY }]);
+        await until(() => fake.host.liveActivity(id).agents.length === 0, 5_000);
+        // The fake's lines are the agent's (recorded): the end line's fields, and the roster says failed.
+        const [, , realEnd, realRoster] = STOP_RECORD.lines.map((l) => l.params?.update as Json);
+        const lines = () => fake.events.updates.filter((u) => u.sessionId === id).map((u) => u.line.update as Json);
+        const rowOf = (u: Json) => (u.agents as Json[] | undefined)?.find((a) => a.agent_id === RETRY);
+        const isEnd = (u: Json) => u.sessionUpdate === 'subagent_finished' && u.subagent_id === RETRY;
+        // As recorded: the roster update right after the end line.
+        const rosterAfter = () => {
+          const all = lines();
+          const at = all.findIndex(isEnd);
+          return at < 0 ? undefined : all.slice(at + 1).find((u) => u.sessionUpdate === 'workflow_updated');
+        };
+        await until(() => rosterAfter() !== undefined);
+        const end = lines().find(isEnd)!;
+        expect(Object.keys(end).sort()).toEqual(Object.keys(realEnd!).sort());
+        expect([end.status, end.error, end.will_wake]).toEqual([realEnd!.status, realEnd!.error, realEnd!.will_wake]);
+        const row = rowOf(rosterAfter()!)!;
+        const realRow = (realRoster!.agents as Json[]).find((a) => a.agent_id === realEnd!.subagent_id)!;
+        expect(Object.keys(row)).toEqual(expect.arrayContaining(Object.keys(realRow)));
+        expect(row.state).toBe(realRow.state);
+        expect(fake.host.liveActivity(id).stoppedByYou).toEqual([RETRY]);
+        expect(first(fake, id)).toMatchObject({ live: true, status: 'active', stopping: false });
+        writeFileSync(g.complete, '');
+        await until(() => first(fake, id)?.status === 'complete', 5_000);
+        expect(fake.host.liveActivity(id).stoppedByYou).toEqual([RETRY]);
+      },
+      work({ ask: false, retry: true, childSessionId: FIRST, completeOn: g.complete, wake: false }),
+    );
+  }, 20_000);
+
+  // Mutation: drop by the pressed id alone → the agent's already_finished for the first attempt ends the retry's row
+  // while the retry still runs.
+  it('a Stop that reaches the first attempt after its end leaves the retry that took its row running', async () => {
+    const g = gateFiles();
+    const FIRST = 'run-agent-1';
+    const RETRY = `${FIRST}-retry`;
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(fake.host.liveActivity(id).agents.map((a) => a.childId)).toEqual([FIRST]);
+        expect(await fake.host.stopSubagent(id, FIRST)).toBe('not-live');
+        const cancels = fake.sent().filter((m) => m.method === '_x.ai/subagent/cancel');
+        expect(cancels.map((m) => m.params)).toEqual([{ subagentId: FIRST }]);
+        expect(fake.host.liveActivity(id).agents).toEqual([
+          { childId: RETRY, run: 'wf_1', attempts: [FIRST, RETRY], stopping: false, messages: 'no-address' },
+        ]);
+        expect(fake.host.liveActivity(id).stoppedByYou).toEqual([]);
+        expect(await fake.host.stopSubagent(id, FIRST)).toBe('stopped');
+        expect(
+          fake
+            .sent()
+            .filter((m) => m.method === '_x.ai/subagent/cancel')
+            .map((m) => m.params),
+        ).toEqual([{ subagentId: FIRST }, { subagentId: RETRY }]);
+      },
+      work({ ask: false, retry: 'on-cancel', childSessionId: FIRST, childOn: g.child, wake: false }),
+    );
+  }, 20_000);
+
+  // Mutation: refuse a run that left active in `stopRunAs` → the Stop of a paused run reads not-live, nothing is sent.
+  // Mutation: end `stopping` only at a drain update → the stopped paused run reads stopping until the cap (no drain
+  // update follows: its script no longer runs).
+  it('Stop run of a paused run: the stop is sent and the run reads stopped by you; a budget-limited run is not stopped', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => first(fake, id)?.status === 'user_paused');
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
+        await until(() => first(fake, id)?.status === 'cancelled');
+        await until(() => first(fake, id)?.stopping === false, 3_000);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'cancelled', by: 'you' })]);
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ ask: false, completeOn: g.complete, status: 'user_paused' }, [], { timings: { stopDrainMs: 60_000 } }),
+    );
+    const budget = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(budget.complete, '');
+        await until(() => first(fake, id)?.status === 'budget_limited');
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('not-live');
+        expect(fake.sent().filter((m) => m.method === '_x.ai/workflows/stop')).toEqual([]);
+      },
+      work({ ask: false, completeOn: budget.complete, status: 'budget_limited', wake: false }),
+    );
+  }, 30_000);
+
+  // Mutation: end `stopping` at the `cancelled` status → the run reads stopped while its agents still drain.
+  it('Stop run: the run reads stopping until its drain update, then stopped by you, with no wake due', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
+        await until(() => first(fake, id)?.live === false);
+        const stopped = { live: false, status: 'cancelled', by: 'you' } as const;
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { ...stopped, stopping: true })]);
+        await sleep(200);
+        expect(first(fake, id)?.stopping).toBe(true);
+        writeFileSync(g.drain, '');
+        await until(() => first(fake, id)?.stopping === false);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', stopped)]);
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ childOn: g.child, drainOn: g.drain }),
+    );
+  }, 20_000);
+
+  // Mutation: end `stopping` only at the drain update → a run that cannot resume reads stopping until the cap.
+  it('a drain too slow turns the stopped run interrupted: not stopping, not waiting, nothing due', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
+        await until(() => first(fake, id)?.status === 'interrupted');
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'interrupted', by: 'you' })]);
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ childOn: g.child, drainStatus: 'interrupted' }),
+    );
+  }, 20_000);
+
+  // Mutation: no cap → a run whose drain update never comes reads stopping for good.
+  it('a drain update that never comes ends stopping at the cap', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect(await fake.host.stopRun(id, 'wf_1')).toBe('stopped');
+        await until(() => first(fake, id)?.live === false);
+        expect(first(fake, id)?.stopping).toBe(true);
+        await until(() => first(fake, id)?.stopping === false, 3_000);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'cancelled', by: 'you' })]);
+      },
+      work({ childOn: g.child, drainOn: g.drain }, [], { timings: { stopDrainMs: 400 } }),
+    );
+  }, 20_000);
+
+  // Mutation: make a run's wake due for every reportable status → a run that ends while the goal loop runs reads
+  // "writing up" for good: the agent starts no wake then (`run_loop.rs`, `goal_loop_active`).
+  it('a run that ends while the goal loop runs makes no wake due', async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        expect((await start(fake, id, 'p2').done).outcome).toBe('completed');
+        writeFileSync(g.complete, '');
+        await until(() => first(fake, id)?.live === false);
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'complete' })]);
+        expect(fake.host.wakeDue(id)).toBe(false);
+      },
+      work({ completeOn: g.complete, ask: false, wake: false }, [
+        { match: 'p2', goal: { objective: 'Keep the tree green.' }, steps: [{ end: { stopReason: 'end_turn' } }] },
+      ]),
+    );
+  }, 20_000);
+
+  // Mutation: make a run's wake due for every reportable status → the second run takes the due from the first, whose
+  // wake the agent did queue (it queues one run wake at a time: `run_loop.rs`, `workflow_wake_queued`).
+  it("a run that ends while another run's wake is queued gets none; the first keeps its own", async () => {
+    const g = gateFiles();
+    const second = `${g.complete}-2`;
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        const turn = start(fake, id, 'p1');
+        await until(() => fake.events.interactions.length === 1);
+        fake.host.answer(id, fake.events.interactions[0]!.interaction.id, 'allow-once');
+        expect((await turn.done).outcome).toBe('completed');
+        expect(fake.host.runs(id).map((run) => run.runId)).toEqual(['wf_1', 'wf_2']);
+        const view = (runId: string) => fake.host.runs(id).find((run) => run.runId === runId);
+        writeFileSync(g.complete, '');
+        await until(() => view('wf_1')?.live === false);
+        expect(view('wf_1')?.wakeDue).toBe(true);
+        writeFileSync(second, '');
+        await until(() => view('wf_2')?.live === false);
+        expect(fake.host.runs(id)).toEqual([
+          runView('wf_1', { live: false, status: 'complete', wakeDue: true }),
+          runView('wf_2', { name: 'second-look', live: false, status: 'complete' }),
+        ]);
+      },
+      {
+        mode: 'work',
+        providers: noProviders(),
+        mutate: (scenario) => {
+          const prompts = scenario.prompts as Json[];
+          const steps = prompts[0]!.steps as Json[];
+          const run = { ...(steps[1]!.workflow as Json), ask: false, wake: false };
+          steps[1] = { workflow: { ...run, completeOn: g.complete } };
+          steps.splice(2, 0, {
+            workflow: { ...run, runId: 'wf_2', name: 'second-look', label: 'researcher-1', completeOn: second },
+          });
+          scenario.prompts = [{ ...prompts[0], match: 'p1' }];
+        },
+      },
+    );
+  }, 20_000);
+
+  // Mutation: keep a queued run wake through every later turn → a run that a later turn reported (its start drains the
+  // run's end: `drain_between_turn_completions`) reads "writing up" for good.
+  // Mutation: drop it at any turn's end → the turn that ran when the run ended takes the wake away.
+  it("the first turn that starts after a run's end and is not its wake drops the wake; the turn running then does not", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        const running = start(fake, id, 'p2');
+        await until(() => fake.sent().some((m) => m.method === 'session/prompt' && JSON.stringify(m).includes('"p2"')));
+        await sleep(50);
+        writeFileSync(g.complete, '');
+        await until(() => first(fake, id)?.live === false);
+        expect(fake.host.wakeDue(id)).toBe(true);
+        writeFileSync(g.wakeEnd, '');
+        expect((await running.done).outcome).toBe('completed');
+        expect(first(fake, id)?.wakeDue).toBe(true);
+        await sleep(50);
+        expect((await start(fake, id, 'p3').done).outcome).toBe('completed');
+        expect(fake.host.runs(id)).toEqual([runView('wf_1', { live: false, status: 'complete' })]);
+        expect(fake.host.wakeDue(id)).toBe(false);
+        expect(fake.events.runs.at(-1)?.runs).toEqual([runView('wf_1', { live: false, status: 'complete' })]);
+      },
+      work({ completeOn: g.complete, ask: false, wake: false }, [
+        {
+          match: 'p2',
+          steps: [{ holdOn: g.wakeEnd }, { turnCompleted: { elapsed: 'turn' } }, { end: { stopReason: 'end_turn' } }],
+        },
+        { match: 'p3', steps: [{ turnCompleted: { elapsed: 'turn' } }, { end: { stopReason: 'end_turn' } }] },
+      ]),
+    );
+  }, 20_000);
+
+  // Mutation: send the runs event before the wake row (as `startWake` did) → for one flush the page holds the run's
+  // report with no wake due and no row, and draws it in the block before it moves to the end row.
+  it("the runs event that ends a run's due wake comes after the wake row; the run's end comes before its due", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.turns.some((t) => t.sessionId === id && t.turn?.origin === 'wake'));
+        await until(() => fake.host.runs(id)[0]?.wakeDue === false);
+        const order = fake.events.order.filter((e) => e.sessionId === id);
+        const ended = order.findIndex(
+          (e) =>
+            e.kind === 'update' &&
+            e.line.update.sessionUpdate === 'workflow_updated' &&
+            e.line.update.status === 'complete',
+        );
+        const end = order[ended];
+        const revision = end?.kind === 'update' ? end.line.update.revision : null;
+        const due = order.findIndex((e) => e.kind === 'runs' && e.runs[0]?.wakeDue === true);
+        const row = order.findIndex(
+          (e) =>
+            e.kind === 'update' &&
+            e.line.update.sessionUpdate === 'user_message_chunk' &&
+            (e.line.update._meta as Json | undefined)?.mlxWakePromptId ===
+              `workflow-completed-wf_1-${String(revision)}`,
+        );
+        const cleared = order.findIndex((e, n) => n > due && e.kind === 'runs' && e.runs[0]?.wakeDue === false);
+        expect(ended).toBeGreaterThan(-1);
+        expect(due).toBe(ended + 1);
+        expect(row).toBeGreaterThan(due);
+        expect(cleared).toBeGreaterThan(row);
+        writeFileSync(g.wakeEnd, '');
+        await until(() => fake.events.ends.length === 2, 5_000);
+      },
+      work({ completeOn: g.complete, ask: false, wakeEndOn: g.wakeEnd }),
+    );
+  }, 20_000);
+
+  // Mutation: read on each new revision with no wait → the launch's two updates give two reads.
+  // Mutation: no read → the thread never gets the run's history or its steps' details.
+  it("a run's new revisions read its state.json once after the wait: a burst gives one read, with history and details", async () => {
+    const g = gateFiles();
+    const dir = mkdtempSync(join(tmpdir(), 'mlx-wf-state-'));
+    dirs.push(dir);
+    mkdirSync(join(dir, 'workflows', 'wf_1'), { recursive: true });
+    const at = new Date().toISOString();
+    writeFileSync(
+      join(dir, 'workflows', 'wf_1', 'state.json'),
+      JSON.stringify({
+        version: 4,
+        state: {
+          run_id: 'wf_1',
+          revision: 1,
+          name: 'deep-research',
+          status: 'active',
+          phases: [
+            { title: 'Plan', detail: 'Read the question.' },
+            { title: 'Research', detail: 'Find the files.' },
+          ],
+          current_phase: 'Research',
+          agents: [],
+          history: [
+            { event: 'phase_entered', detail: 'Research', at },
+            { event: 'log', detail: 'Searching the tree.', at },
+          ],
+        },
+      }),
+    );
+    const reads: string[] = [];
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        const launched = Date.now();
+        await until(() => fake.events.runStates.length > 0, 3_000);
+        expect(Date.now() - launched).toBeGreaterThanOrEqual(150);
+        await sleep(400);
+        expect(reads).toEqual([id]);
+        const read = fake.events.runStates[0]!;
+        expect(read.sessionId).toBe(id);
+        expect(read.state.history.map((line) => [line.event, line.detail])).toEqual([
+          ['phase_entered', 'Research'],
+          ['log', 'Searching the tree.'],
+        ]);
+        expect([...read.state.details]).toEqual([
+          ['Plan', 'Read the question.'],
+          ['Research', 'Find the files.'],
+        ]);
+        writeFileSync(g.complete, '');
+        await until(() => fake.events.runStates.length > 1, 3_000);
+        await sleep(400);
+        expect(reads).toEqual([id, id]);
+      },
+      work({ completeOn: g.complete, ask: false, wake: false }, [], {
+        timings: { runStateMs: 300 },
+        sessionDir: (sessionId) => {
+          reads.push(sessionId);
+          return dir;
+        },
+      }),
+    );
+  }, 20_000);
+
+  // Mutation: the endpoint change's stop as the user's → a run the person never stopped reads stopped by you.
+  it("an endpoint change stops the run as the engine's", async () => {
+    const g = gateFiles();
+    await withFake(
+      'work-workflow-run',
+      async (fake) => {
+        const id = await session(fake);
+        await startRun(fake, id);
+        fake.endpoint.current = { ...fake.endpoint.current!, url: 'http://127.0.0.1:9' };
+        await fake.host.checkEndpoint();
+        await until(() => fake.host.modeState().state === 'stopped', 5_000);
+        const ended = fake.events.runs.flatMap((e) => e.runs).filter((r) => !r.live);
+        expect(ended.map((r) => [r.status, r.by])).toContainEqual(['cancelled', 'engine']);
+        expect(ended.some((r) => r.by === 'you')).toBe(false);
+        expect(fake.host.runs(id)).toEqual([]);
+      },
+      work({ childOn: g.child }),
     );
   }, 20_000);
 });

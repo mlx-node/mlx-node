@@ -4,6 +4,7 @@ import {
   useCallback,
   useId,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type ClipboardEvent,
@@ -15,10 +16,13 @@ import {
   type Ref,
 } from 'react';
 
+import { slashToken } from '../../../lib/chat-input';
 import { CHAT, fill } from '../../../lib/chat-strings';
 import { formatNumber } from '../../../lib/format';
 import { hasNonWhitespace } from '../../../lib/text-scan';
 import { Button } from '../../arc/button/button';
+import { CommandMenu, commandOrder, typedInFull, type CommandRow } from '../command-menu/command-menu';
+import { ContextPopover } from '../context-panel/context-popover';
 import { LiveLabel } from '../live-label/live-label';
 import { motionX } from '../motion/motion';
 import { useStaticMotion } from '../motion/use-static-motion';
@@ -26,12 +30,14 @@ import styles from './composer.module.css';
 import { ContextRing, type ContextUse } from './context-ring';
 import { SendButton, type ComposerPhase } from './send-button';
 
-export { SendButton, sendFace, type ComposerPhase, type SendButtonProps } from './send-button';
+export { SendButton, sendFace, type ComposerPhase, type Queueing, type SendButtonProps } from './send-button';
 export { contextText, type ContextUse } from './context-ring';
 
 export interface ComposerNotice {
   tone: 'neutral' | 'warning' | 'danger';
   text: string;
+  /** The whole sentence when `text` is the short one: the strip's hover title. */
+  title?: string;
   /** The text shimmers (work in progress). */
   working?: boolean;
   action?: { label: string; onSelect: () => void };
@@ -45,13 +51,41 @@ export interface ComposerProps {
   phase: ComposerPhase;
   onSend: () => void;
   onStop: () => void;
-  /** Why Send is off although there is text. Undefined: Send is on when `value` is not blank. */
+  /**
+   * While an answer starts or runs, or an op runs: Enter and the round button queue the text (the button reads Queue
+   * and, for an answer, Stop moves to a small square before it). Without it the box only sends while idle.
+   */
+  onQueue?: () => void;
+  /** ⌘Enter (Ctrl+Enter) while an answer starts or runs: the text goes into it. Without it ⌘Enter queues. */
+  onSendNow?: () => void;
+  /** Why Send (or Queue) is off although there is text. Undefined: Send is on when `value` is not blank. */
   blocked?: string;
+  /** Why Queue alone is off (the list is full); ⌘Enter still goes to `onSendNow`, which needs no place in the list. */
+  queueOff?: string;
+  /** Words in the reason slot that leave Send on (a command's words, "Enter to run"); the ring gives way to them. */
+  hint?: string;
+  /**
+   * The `/` command list: open while the text starts with `/` and the caret is in that first word; it never takes
+   * focus. ↑ ↓ move (wrapping), Enter or Tab fills `/name `, Enter on a name typed in full runs it, Esc closes the
+   * list only. `later`: a muted last line, more commands come once the conversation is loaded.
+   */
+  commands?: { rows: readonly CommandRow[]; later: boolean };
   notice?: ComposerNotice;
+  /** The queued messages, under the notice strip and above the attachments. */
+  queue?: ReactNode;
+  /** Alt+↑ in an empty box: open the last queued message for edit. */
+  onEditLast?: () => void;
+  /** Set while a queued message is open for edit: Esc in the box closes that edit, and only the next Esc stops. */
+  onCancelEdit?: () => void;
   /** Model picker and chips. */
   tools: ReactNode;
   /** How full the context window is: a ring at the end of the tools row while no reason or counter shows. */
   context?: ContextUse;
+  /**
+   * The Context panel: the ring becomes its button and the panel opens upward from it; while the ring is not drawn the
+   * panel hangs from the end of the tools row.
+   */
+  contextPanel?: { open: boolean; onOpenChange: (open: boolean) => void; content: ReactNode };
   /** Default 100_000. */
   maxLength?: number;
   /** Accessible name of the textarea. Default 'Message'. */
@@ -74,6 +108,21 @@ export function composerCanSend(
   max: number,
 ): boolean {
   return phase === 'idle' && blocked === undefined && hasNonWhitespace(value) && value.length <= max;
+}
+
+/** Queue is on: an answer starts or runs or an op runs, text that is not blank, nothing blocks it, not too long. */
+export function composerCanQueue(
+  value: string,
+  phase: ComposerPhase,
+  blocked: string | undefined,
+  max: number,
+): boolean {
+  return (
+    (phase === 'starting' || phase === 'running' || phase === 'op') &&
+    blocked === undefined &&
+    hasNonWhitespace(value) &&
+    value.length <= max
+  );
 }
 
 function setRef<T>(ref: Ref<T> | undefined, value: T | null): void {
@@ -107,7 +156,12 @@ function NoticeStrip({ notice }: { notice: ComposerNotice }): ReactElement {
       animate={{ height: 'auto' }}
       transition={staticMotion ? INSTANT : motionX.spring.expand}
     >
-      <div className={styles.notice} data-tone={notice.tone} role={notice.tone === 'danger' ? 'alert' : 'status'}>
+      <div
+        className={styles.notice}
+        data-tone={notice.tone}
+        role={notice.tone === 'danger' ? 'alert' : 'status'}
+        title={notice.title}
+      >
         <Icon className={styles.noticeIcon} size={14} strokeWidth={1.75} aria-hidden="true" />
         <LiveLabel active={notice.working === true} className={styles.noticeText}>
           {notice.text}
@@ -134,17 +188,65 @@ export function Composer(props: ComposerProps): ReactElement {
   const area = useRef<HTMLTextAreaElement | null>(null);
   const fit = useRef<HTMLDivElement | null>(null);
   const fitWatch = useRef<ResizeObserver | null>(null);
+  const ring = useRef<HTMLElement | null>(null);
+  const end = useRef<HTMLDivElement | null>(null);
   const tooLong = props.value.length > max;
   const canSend = composerCanSend(props.value, props.phase, props.blocked, max);
+  const queueable = composerCanQueue(props.value, props.phase, props.blocked, max);
+  const canQueue = props.onQueue !== undefined && queueable && props.queueOff === undefined;
+  const canSendNow = props.onSendNow !== undefined && queueable;
   const blank = !hasNonWhitespace(props.value);
-  const reason = props.blocked ?? (tooLong ? CHAT.tooLong : undefined);
+  const onQueue = props.onQueue;
+  const queueing =
+    onQueue !== undefined && !blank && (props.phase === 'starting' || props.phase === 'running' || props.phase === 'op')
+      ? { enabled: canQueue, onQueue }
+      : undefined;
+  const reason = props.blocked ?? (tooLong ? CHAT.tooLong : props.queueOff);
   const counter =
     props.value.length >= max * 0.9 && !tooLong
       ? fill(CHAT.counter, { length: formatNumber(props.value.length), max: formatNumber(max) })
       : null;
   const sideId = useId();
   const reasonShown = reason !== undefined && !blank;
-  const side = reasonShown ? 'reason' : counter !== null ? 'count' : 'none';
+  const hintShown = !reasonShown && counter === null && props.hint !== undefined && !blank;
+  const side = reasonShown ? 'reason' : counter !== null ? 'count' : hintShown ? 'hint' : 'none';
+
+  const listId = useId();
+  const optionId = useCallback((index: number) => `${listId}-${index}`, [listId]);
+  const [focused, setFocused] = useState(false);
+  const [caret, setCaret] = useState<number | null>(null);
+  const [closedAt, setClosedAt] = useState<string | null>(null);
+  const [picked, setPicked] = useState({ typed: '', index: 0 });
+  const nextCaret = useRef<number | null>(null);
+  const commandRows = props.commands?.rows;
+  const token = commandRows === undefined ? null : slashToken(props.value);
+  const typed = token?.typed ?? '';
+  const shownRows = useMemo(
+    () => (commandRows === undefined || token === null ? [] : commandOrder(commandRows, typed)),
+    [commandRows, token, typed],
+  );
+  const at = caret ?? props.value.length;
+  const tokenKey = token === null ? null : `${token.start}:${typed}`;
+  const menuOpen =
+    token !== null && focused && at > token.start && at <= token.end && closedAt !== tokenKey && shownRows.length > 0;
+  const active = picked.typed === typed ? Math.min(picked.index, shownRows.length - 1) : 0;
+
+  const fillRow = (index: number): void => {
+    const row = shownRows[index];
+    if (token === null || row === undefined) return;
+    const rest = props.value.slice(token.end);
+    const tail = rest.startsWith(' ') ? rest : ` ${rest}`;
+    const text = `${props.value.slice(0, token.start)}/${row.name}${tail}`;
+    const want = token.start + row.name.length + 2;
+    // The same text does not change the value, so the caret effect would not run and the request would stay pending.
+    if (text === props.value) {
+      area.current?.setSelectionRange(want, want);
+      setCaret(want);
+      return;
+    }
+    nextCaret.current = want;
+    props.onValueChange(text);
+  };
 
   const attach = useCallback(
     (node: HTMLTextAreaElement | null) => {
@@ -180,6 +282,15 @@ export function Composer(props: ComposerProps): ReactElement {
 
   useLayoutEffect(() => {
     const node = area.current;
+    const want = nextCaret.current;
+    if (node === null || want === null) return;
+    nextCaret.current = null;
+    node.setSelectionRange(want, want);
+    setCaret(want);
+  }, [props.value]);
+
+  useLayoutEffect(() => {
+    const node = area.current;
     if (node === null) return;
     node.style.height = 'auto';
     const height = node.scrollHeight;
@@ -192,14 +303,50 @@ export function Composer(props: ComposerProps): ReactElement {
   const submit = (event: FormEvent<HTMLFormElement>): void => {
     event.preventDefault();
     if (canSend) props.onSend();
+    else if (canQueue) props.onQueue?.();
   };
 
   const onKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>): void => {
     const native = event.nativeEvent;
     if (native.isComposing || native.keyCode === 229) return;
+    if (menuOpen && !event.altKey && !event.metaKey && !event.ctrlKey) {
+      const count = shownRows.length;
+      if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && !event.shiftKey) {
+        event.preventDefault();
+        setPicked({ typed, index: (active + (event.key === 'ArrowDown' ? 1 : count - 1)) % count });
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setClosedAt(tokenKey);
+        return;
+      }
+      if (event.key === 'Tab' && !event.shiftKey) {
+        event.preventDefault();
+        fillRow(active);
+        return;
+      }
+      if (event.key === 'Enter' && !event.shiftKey && !typedInFull(shownRows[active], typed)) {
+        event.preventDefault();
+        fillRow(active);
+        return;
+      }
+    }
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       if (canSend) props.onSend();
+      else if (canSendNow && (event.metaKey || event.ctrlKey)) props.onSendNow?.();
+      else if (canQueue) props.onQueue?.();
+      return;
+    }
+    if (event.key === 'ArrowUp' && event.altKey && props.value === '' && props.onEditLast !== undefined) {
+      event.preventDefault();
+      props.onEditLast();
+      return;
+    }
+    if (event.key === 'Escape' && !event.repeat && props.onCancelEdit !== undefined) {
+      event.preventDefault();
+      props.onCancelEdit();
       return;
     }
     if (event.key === 'Escape' && !event.repeat && (props.phase === 'starting' || props.phase === 'running')) {
@@ -260,7 +407,19 @@ export function Composer(props: ComposerProps): ReactElement {
       onDragLeave={onDragLeave}
       onDrop={onDrop}
     >
+      {menuOpen && props.commands !== undefined ? (
+        <CommandMenu
+          id={listId}
+          rows={shownRows}
+          active={active}
+          optionId={optionId}
+          later={props.commands.later}
+          onPick={(index) => fillRow(index)}
+          onHover={(index) => setPicked({ typed, index })}
+        />
+      ) : null}
       {props.notice !== undefined ? <NoticeStrip notice={props.notice} /> : null}
+      {props.queue}
       {props.attachments}
       <div className={styles.field}>
         <textarea
@@ -270,9 +429,22 @@ export function Composer(props: ComposerProps): ReactElement {
           value={props.value}
           placeholder={props.placeholder}
           aria-label={label}
-          aria-describedby={reasonShown ? sideId : undefined}
+          aria-describedby={reasonShown || hintShown ? sideId : undefined}
+          aria-autocomplete={props.commands === undefined ? undefined : 'list'}
+          aria-expanded={props.commands === undefined ? undefined : menuOpen}
+          aria-controls={menuOpen ? listId : undefined}
+          aria-activedescendant={menuOpen ? optionId(active) : undefined}
           spellCheck
-          onChange={(event) => props.onValueChange(event.target.value)}
+          onChange={(event) => {
+            setCaret(event.target.selectionStart);
+            props.onValueChange(event.target.value);
+          }}
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
+          onFocus={(event) => {
+            setFocused(true);
+            setCaret(event.currentTarget.selectionStart);
+          }}
+          onBlur={() => setFocused(false)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
           onDragOver={ignoreFiles}
@@ -297,16 +469,43 @@ export function Composer(props: ComposerProps): ReactElement {
             <span id={sideId} className={styles.reason}>
               {reason}
             </span>
+          ) : side === 'hint' ? (
+            <span id={sideId} className={styles.reason} data-hint="">
+              {props.hint}
+            </span>
           ) : side === 'count' ? (
             <span className={styles.count}>{counter}</span>
           ) : null}
         </div>
-        <div className={styles.end}>
-          {props.context !== undefined && side === 'none' ? <ContextRing context={props.context} /> : null}
+        <div ref={end} className={styles.end}>
+          {props.context !== undefined && side === 'none' ? (
+            <ContextRing
+              ref={ring}
+              context={props.context}
+              onOpen={
+                props.contextPanel === undefined
+                  ? undefined
+                  : () => props.contextPanel?.onOpenChange(!props.contextPanel.open)
+              }
+              expanded={props.contextPanel?.open === true}
+            />
+          ) : null}
+          {props.contextPanel !== undefined ? (
+            <ContextPopover
+              open={props.contextPanel.open}
+              onOpenChange={props.contextPanel.onOpenChange}
+              ring={ring}
+              fallback={end}
+              focusFallback={() => area.current?.focus()}
+            >
+              {props.contextPanel.content}
+            </ContextPopover>
+          ) : null}
           <SendButton
             phase={props.phase}
             canSend={canSend}
             reason={blank ? undefined : reason}
+            queueing={queueing}
             onSend={props.onSend}
             onStop={props.onStop}
           />

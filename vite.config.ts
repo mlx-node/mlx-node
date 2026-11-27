@@ -110,6 +110,10 @@ export default defineConfig({
       '/crates/mlx-core/vendor',
       // Generated converter outputs; parity tests compare their raw bytes.
       '/crates/mlx-core/src/utils/testdata/gguf_import_golden',
+      // Shipped skill files are pinned by sha256 in the manifest; formatting one fails its install check.
+      'packages/dashboard/skills/own/**',
+      'packages/dashboard/skills/vendor/**',
+      'packages/dashboard/skills/manifest.json',
       '**/*.metal.inc',
       // Vendored Arc files stay byte-comparable with upstream (PROVENANCE.md lists every local change).
       'packages/dashboard/ui/src/components/arc/**',

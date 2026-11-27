@@ -1,0 +1,124 @@
+.root {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: var(--space-2);
+  container-type: inline-size;
+}
+
+.chips {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  gap: var(--space-1-5);
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+
+.slot {
+  display: inline-flex;
+  flex: none;
+}
+
+.chip {
+  position: relative;
+  display: inline-flex;
+  min-height: var(--control-height-sm);
+  flex: none;
+  align-items: center;
+  gap: var(--space-1-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  padding: 0 var(--space-2-5);
+  background: var(--surface);
+  color: var(--foreground);
+  font-size: var(--text-xs);
+  cursor: pointer;
+  transition: border-color var(--duration-fast) var(--ease-standard);
+}
+
+.chip:hover {
+  border-color: var(--border-strong);
+}
+
+.chip[aria-pressed='true'] {
+  border-color: var(--accent);
+}
+
+.highlight {
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: color-mix(in oklab, var(--accent) 12%, transparent);
+}
+
+.mark,
+.title,
+.count {
+  position: relative;
+}
+
+.mark {
+  display: inline-grid;
+  width: 12px;
+  height: 12px;
+  place-items: center;
+  color: var(--text-muted);
+}
+
+.chip[data-mark='done'] .mark {
+  color: var(--success);
+}
+
+.chip[data-mark='failed'] .mark {
+  color: var(--danger);
+}
+
+.chip[data-mark='paused'] .mark {
+  color: var(--warning);
+}
+
+.title {
+  white-space: nowrap;
+}
+
+.count {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.stepWords {
+  display: none;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Narrower still: the chips are dots, the step's words beside them. */
+@container (max-width: 419px) {
+  .chips {
+    flex: none;
+  }
+
+  .chip {
+    padding: 0 var(--space-1-5);
+  }
+
+  .title,
+  .count {
+    display: none;
+  }
+
+  .stepWords {
+    display: block;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chip {
+    transition: none;
+  }
+}

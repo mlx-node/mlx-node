@@ -119,7 +119,7 @@ export interface ParsedAppxManifest {
 }
 
 export interface BuildWindowsMsixOptions {
-  /** Packaged Electron Windows app directory (e.g. `out/mlx-node-win32-arm64`). */
+  /** Packaged Electron Windows app directory (e.g. `out/Portato-win32-arm64`). */
   appPath: string;
   /** Destination `.msix` archive path. */
   msixPath: string;

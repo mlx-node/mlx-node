@@ -208,6 +208,7 @@ describe('the readiness handshake', () => {
     expect(options.thinkingTokenBudget).toBe(AGENT_HOST_THINKING.tokenBudget);
     expect(options.thinkingCycleGuard).toBe(true);
     expect(options.thinkingEndText).toBe(AGENT_HOST_THINKING.endText);
+    expect(options.thinkingLevels).toBe(true);
   });
 
   it('asks for the whole-prompt capture of the cold tier families', () => {

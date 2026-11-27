@@ -103,7 +103,7 @@ function lastExitText(supervisor: SupervisorLive): string | null {
 
 export function SupervisorPanel({ supervisor }: { supervisor: SupervisorLive }): ReactElement {
   return (
-    <Panel title="Supervisor" description="The desktop app starts and watches this process.">
+    <Panel title="Supervisor" description="Portato starts and watches this process.">
       <div className="grid gap-3">
         <KeyValue
           layout="grid"
