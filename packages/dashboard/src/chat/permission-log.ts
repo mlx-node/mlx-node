@@ -31,7 +31,7 @@ export const SETTINGS_KEYS = [
   'home:.claude/settings.local.json',
   'home:.claude.json',
   'home:.cursor/hooks.json',
-  'folder:.grok/config.toml',
+  'folder:.mlx-agent/config.toml',
   'folder:.claude/settings.json',
   'folder:.claude/settings.local.json',
   'folder:.mcp.json',

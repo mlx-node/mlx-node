@@ -114,7 +114,7 @@ describe('the launch details', () => {
     const launch = CALLS.find((entry) => entry.run?.kind === 'launch')!;
     expect(launchDetails(launch)).toEqual({
       source: 'script_path',
-      value: '/Users/dev/napi-rs/.grok/workflows/research-advisory.rhai',
+      value: '/Users/dev/napi-rs/.mlx-agent/workflows/research-advisory.rhai',
       args: '{\n  "ghsa": "GHSA-0000-0000-0000"\n}',
       budget: null,
     });

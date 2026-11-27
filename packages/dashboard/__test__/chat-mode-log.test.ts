@@ -322,6 +322,21 @@ describe('the settings prints', () => {
     utimesSync(big, 2_000, 2_000);
     expect(changedSettings(large, await settingsPrints(place))).toEqual(['folder:.claude/settings.json']);
   });
+
+  // Mutation: the key left at `folder:.grok/config.toml` → the folder's agent config is never printed.
+  it("the folder's agent config is its `.mlx-agent/config.toml`", async () => {
+    const home = join(root, 'agent-config-home');
+    const cwd = join(home, 'app');
+    mkdirSync(join(cwd, '.mlx-agent'), { recursive: true });
+    mkdirSync(join(cwd, '.grok'), { recursive: true });
+    writeFileSync(join(cwd, '.grok', 'config.toml'), 'old = 1\n');
+    const place = { home, agentHome: join(root, 'agent'), cwd };
+    expect((await settingsPrints(place))['folder:.mlx-agent/config.toml']).toBe('missing');
+    writeFileSync(join(cwd, '.mlx-agent', 'config.toml'), '[plugins]\n');
+    expect((await settingsPrints(place))['folder:.mlx-agent/config.toml']).toBe(
+      createHash('sha256').update('[plugins]\n').digest('hex'),
+    );
+  });
 });
 
 describe('denied lines: a call denied with a note', () => {

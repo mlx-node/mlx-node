@@ -1034,7 +1034,7 @@ describe('Work host', () => {
           expect.arrayContaining(['GROK_HOME', 'HOME', 'PATH', 'XAI_API_KEY', 'GROK_RESUME_COMMAND']),
         );
         expect(start.envNames).not.toContain('ELECTRON_RUN_AS_NODE');
-        // Mutation: the process started in the user's home again (its `.grok` is grok-build's) → red.
+        // Mutation: the process started in the user's home again (the agent reads it as a project) → red.
         expect(realpathSync(start.cwd as string)).toBe(realpathSync(fake.paths.workProcess));
         expect(readdirSync(fake.paths.workProcess)).toEqual([]);
         const started = fake.host.startTurn(created.sessionId, 'list files', { modelId: MODEL, cwd: fake.project });

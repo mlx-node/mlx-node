@@ -51,7 +51,7 @@ const VIEW = [
 ];
 
 function writeSkill(project: string): void {
-  const dir = join(project, '.grok', 'skills', SKILL);
+  const dir = join(project, '.mlx-agent', 'skills', SKILL);
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, 'SKILL.md'),
