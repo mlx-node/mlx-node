@@ -1929,12 +1929,17 @@ describe('the wake row names what ended (H-b)', () => {
     return reducer.snapshot().entries;
   }
 
-  function stored(fake: FakeHost, id: string): TranscriptEntry[] {
-    const files = readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
-      .filter((f) => f.endsWith('updates.jsonl') && f.includes(id))
-      .map((f) => readFileSync(join(fake.root, f), 'utf8'));
-    expect(files).toHaveLength(1);
-    return parseUpdates(files[0]!).transcript;
+  /** The stored transcript once it holds `ends` turn ends. */
+  async function stored(fake: FakeHost, id: string, ends: number): Promise<TranscriptEntry[]> {
+    const files = () =>
+      readdirSync(fake.root, { recursive: true, encoding: 'utf8' })
+        .filter((f) => f.endsWith('updates.jsonl') && f.includes(id))
+        .map((f) => parseUpdates(readFileSync(join(fake.root, f), 'utf8')).transcript);
+    // The agent stores a line after it sends it: the wake's end can reach the host first.
+    await until(() => files().some((t) => t.filter((e) => e.kind === 'turn-end').length === ends), 5_000);
+    const found = files();
+    expect(found).toHaveLength(1);
+    return found[0]!;
   }
 
   /** The host's own wake lines (the agent sends a wake's prompt to disk only). */
@@ -1987,7 +1992,7 @@ describe('the wake row names what ended (H-b)', () => {
           writeFileSync(wakeEnd, '');
           await until(() => fake.events.ends.length === 2, 5_000);
           expect(wakesOf(live(fake, id, word))).toEqual([want]);
-          expect(wakesOf(stored(fake, id))).toEqual([want]);
+          expect(wakesOf(await stored(fake, id, 2))).toEqual([want]);
         },
         { mutate: prompts({ [word]: [step(end, wakeEnd)] }) },
       );
@@ -2019,7 +2024,7 @@ describe('the wake row names what ended (H-b)', () => {
           ],
         };
         expect(wakesOf(live(fake, id, 'ended'))).toEqual([want]);
-        expect(wakesOf(stored(fake, id))).toEqual([want]);
+        expect(wakesOf(await stored(fake, id, 2))).toEqual([want]);
       },
       {
         mutate: prompts({
